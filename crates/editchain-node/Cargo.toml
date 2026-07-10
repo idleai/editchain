@@ -1,0 +1,15 @@
+[package]
+name = "editchain-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+editchain-core = { path = "../editchain-core" }
+editchain-codec = { path = "../editchain-codec" }
+
+[dev-dependencies]
+tempfile = "3"

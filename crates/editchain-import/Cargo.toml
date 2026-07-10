@@ -1,0 +1,11 @@
+[package]
+name = "editchain-import"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+editchain-core = { path = "../editchain-core" }
+editchain-codec = { path = "../editchain-codec" }

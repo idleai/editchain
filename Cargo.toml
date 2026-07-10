@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/editchain-core",
+    "crates/editchain-codec",
+    "crates/editchain-sync",
+    "crates/editchain-node",
+    "crates/editchain-import",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", default-features = false, features = ["derive"] }
+postcard = { version = "1", default-features = false }

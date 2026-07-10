@@ -1,0 +1,13 @@
+[package]
+name = "editchain-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["use-std"]
+use-std = ["serde/std", "postcard/use-std"]
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
