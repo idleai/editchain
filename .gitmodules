@@ -1,0 +1,4 @@
+[submodule "externals/mini-swe-agent"]
+	path = externals/mini-swe-agent
+	url = https://github.com/ambientlight/mini-swe-agent.git
+	branch = v2.4.2_dev

@@ -229,6 +229,18 @@ pub enum ReduceError {
     UnsupportedKind(&'static str),
 }
 
+impl core::fmt::Display for ReduceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ReduceError::UnsupportedKind(kind) => write!(f, "unsupported op kind: {}", kind),
+        }
+    }
+}
+
+#[cfg(feature = "use-std")]
+impl std::error::Error for ReduceError {}
+
+
 /// A reducer processes operations and updates canonical state.
 pub trait Reducer {
     /// Process a single operation and update internal state.

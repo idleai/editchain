@@ -45,7 +45,7 @@ enum Commands {
     },
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -64,31 +64,31 @@ fn main() {
                     version: 2,
                 }),
             };
-            let encoded = encode_op(&start_op).expect("Failed to encode ChainStart");
+            let encoded = encode_op(&start_op)?;
             let mut page = Page::new(0);
             page.add_record(0, encoded);
             // We need a mutable store — re-open
-            let mut store = SegmentStore::open(&path).expect("Failed to open chain directory");
-            store.append_page(&page).expect("Failed to write ChainStart");
+            let mut store = SegmentStore::open(&path)?;
+            store.append_page(&page)?;
             println!("Wrote ChainStart operation.");
         }
         Commands::Append { path, json } => {
-            let op: Op = serde_json::from_str(&json).expect("Invalid JSON operation");
-            let encoded = encode_op(&op).expect("Failed to encode operation");
+            let op: Op = serde_json::from_str(&json)?;
+            let encoded = encode_op(&op)?;
             let mut page = Page::new(0);
             page.add_record(0, encoded);
-            let mut store = SegmentStore::open(&path).expect("Failed to open chain directory");
-            store.append_page(&page).expect("Failed to append operation");
+            let mut store = SegmentStore::open(&path)?;
+            store.append_page(&page)?;
             println!("Appended operation: {}", op.id);
         }
         Commands::Dump { path } => {
-            let store = SegmentStore::open(&path).expect("Failed to open chain directory");
-            let pages = store.read_all().expect("Failed to read segments");
+            let store = SegmentStore::open(&path)?;
+            let pages = store.read_all()?;
             for page in &pages {
                 for record in &page.records {
                     match decode_op(&record.data) {
                         Ok(op) => {
-                            let json = serde_json::to_string(&op).expect("Failed to serialize");
+                            let json = serde_json::to_string(&op)?;
                             println!("{}", json);
                         }
                         Err(e) => {
@@ -99,11 +99,11 @@ fn main() {
             }
         }
         Commands::Merge { chain_a, chain_b } => {
-            let store_a = SegmentStore::open(&chain_a).expect("Failed to open chain A");
-            let store_b = SegmentStore::open(&chain_b).expect("Failed to open chain B");
+            let store_a = SegmentStore::open(&chain_a)?;
+            let store_b = SegmentStore::open(&chain_b)?;
 
-            let pages_a = store_a.read_all().expect("Failed to read chain A");
-            let pages_b = store_b.read_all().expect("Failed to read chain B");
+            let pages_a = store_a.read_all()?;
+            let pages_b = store_b.read_all()?;
 
             // Collect all ops from both chains
             let mut ops_a = Vec::new();
@@ -128,18 +128,18 @@ fn main() {
             // Build OpSets and merge
             let mut state_a = state::ChainState::new();
             for op in &ops_a {
-                let encoded = encode_op(op).expect("Failed to encode");
+                let encoded = encode_op(op)?;
                 state_a.ops.insert(op.id, encoded).ok();
             }
 
             let mut state_b = state::ChainState::new();
             for op in &ops_b {
-                let encoded = encode_op(op).expect("Failed to encode");
+                let encoded = encode_op(op)?;
                 state_b.ops.insert(op.id, encoded).ok();
             }
 
             let (accepted, duplicates, quarantined) =
-                state_a.merge(&state_b).expect("Merge failed");
+                state_a.merge(&state_b)?;
 
             eprintln!(
                 "Merge complete: {} accepted, {} duplicates, {} quarantined",
@@ -150,7 +150,7 @@ fn main() {
             for (id, bytes) in state_a.ops.iter() {
                 match decode_op(bytes) {
                     Ok(op) => {
-                        let json = serde_json::to_string(&op).expect("Failed to serialize");
+                        let json = serde_json::to_string(&op)?;
                         println!("{}", json);
                     }
                     Err(e) => {
@@ -160,4 +160,6 @@ fn main() {
             }
         }
     }
+
+    Ok(())
 }

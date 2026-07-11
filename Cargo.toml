@@ -6,6 +6,7 @@ members = [
     "crates/editchain-sync",
     "crates/editchain-node",
     "crates/editchain-import",
+    "crates/editchain-agent",
 ]
 
 [workspace.package]
