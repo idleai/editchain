@@ -52,8 +52,16 @@ impl SegmentStore {
                 break;
             }
             let bytes = fs::read(&path)?;
-            if let Some(page) = decode_page(&bytes) {
-                pages.push(page);
+            // A segment file may contain multiple concatenated pages.
+            let mut offset = 0;
+            while offset < bytes.len() {
+                if let Some(page) = decode_page(&bytes[offset..]) {
+                    let encoded_len = encoded_page_len(&bytes[offset..]);
+                    pages.push(page);
+                    offset += encoded_len;
+                } else {
+                    break; // partial trailing page (power-loss)
+                }
             }
             seq += 1;
         }
@@ -76,6 +84,26 @@ impl SegmentStore {
         let filename = format!("{:06}.eclog", seq);
         self.chain_dir.join(filename)
     }
+}
+
+/// Compute the encoded length of a page from its bytes.
+/// Reads the magic + page_seq (8 bytes) then scans records.
+fn encoded_page_len(bytes: &[u8]) -> usize {
+    if bytes.len() < 8 {
+        return bytes.len();
+    }
+    let mut offset = 8;
+    while offset + 4 <= bytes.len() {
+        let len = u32::from_le_bytes(
+            bytes[offset..offset + 4].try_into().unwrap_or([0; 4]),
+        ) as usize;
+        offset += 4;
+        if offset + 1 + len > bytes.len() {
+            break;
+        }
+        offset += 1 + len;
+    }
+    offset
 }
 
 /// Find the next available segment sequence number.

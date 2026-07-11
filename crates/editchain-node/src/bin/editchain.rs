@@ -5,6 +5,9 @@ use clap::{Parser, Subcommand};
 use editchain_codec::frame::{decode_op, encode_op};
 use editchain_codec::page::Page;
 use editchain_core::*;
+use editchain_import::import::import_claude_code;
+use editchain_import::model::{DiscoveryRequest, ImportOptions};
+use editchain_import::sink::{MemoryBlobSink, MemoryCursorStore, MemoryOpSink};
 use editchain_node::segment::SegmentStore;
 
 #[derive(Parser)]
@@ -42,6 +45,21 @@ enum Commands {
         chain_a: PathBuf,
         /// Second chain directory
         chain_b: PathBuf,
+    },
+    /// Import Claude Code sessions into the edit chain
+    Import {
+        /// Path to the Claude Code sessions directory
+        #[arg(long, default_value = "")]
+        sessions_dir: String,
+        /// Path to the workspace root
+        #[arg(long, default_value = ".")]
+        workspace: String,
+        /// Path to the output chain directory
+        #[arg(long, default_value = ".editchain")]
+        chain: String,
+        /// Dry run — print ops without writing
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
 }
 
@@ -95,6 +113,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             eprintln!("Warning: failed to decode record: {}", e);
                         }
                     }
+                }
+            }
+        }
+        Commands::Import { sessions_dir, workspace, chain, dry_run } => {
+            let sessions_path = if sessions_dir.is_empty() {
+                // Try to auto-detect the Claude Code project directory.
+                let cwd = std::env::current_dir()?;
+                let cwd_str = cwd.to_string_lossy().to_string();
+                let encoded = cwd_str.replace(['/', '.'], "-");
+                let home = dirs::home_dir().ok_or("no home directory")?;
+                home.join(".claude").join("projects").join(encoded)
+            } else {
+                PathBuf::from(&sessions_dir)
+            };
+
+            let request = DiscoveryRequest {
+                workspace_path: PathBuf::from(&workspace),
+                sessions_dir: sessions_path,
+                chain_dir: PathBuf::from(&chain),
+            };
+
+            let options = ImportOptions::default();
+            let mut ops_sink = MemoryOpSink::new();
+            let mut blobs_sink = MemoryBlobSink::new();
+            let mut cursors = MemoryCursorStore::new();
+
+            let report = import_claude_code(&request, &options, &mut ops_sink, &mut blobs_sink, &mut cursors)?;
+
+            println!("Import complete:");
+            println!("  Files discovered: {}", report.files_discovered);
+            println!("  Files processed: {}", report.files_processed);
+            println!("  Raw ops: {}", report.raw_ops);
+            println!("  Normalized ops: {}", report.normalized_ops);
+            println!("  Duplicates: {}", report.duplicates);
+            println!("  Malformed: {}", report.malformed);
+
+            if !dry_run && !ops_sink.ops.is_empty() {
+                // Write ops to the chain store.
+                let mut store = SegmentStore::open(PathBuf::from(&chain))?;
+                let mut page = Page::new(0);
+                for op in &ops_sink.ops {
+                    let encoded = encode_op(op)?;
+                    page.add_record(0, encoded);
+                }
+                store.append_page(&page)?;
+                println!("Wrote {} operations to chain.", ops_sink.ops.len());
+            }
+
+            if dry_run {
+                println!("\n--- Dry run: first 5 ops ---");
+                for op in ops_sink.ops.iter().take(5) {
+                    let json = serde_json::to_string(op)?;
+                    println!("{}", json);
                 }
             }
         }
