@@ -4,6 +4,7 @@
 **date**: 2026-07-09  
 **spec**: [seed.md](./seed.md) → [seed.gpt55pro.md](./drs/seed.gpt55pro.md)  
 **status**: v0.2 core complete — all 23 tests passing
+**sessions**: [3f7db8b8](../../editchain-sessions-raw/cc/3f7db8b8-73a7-4cea-be8d-3d2d54fedd2c.jsonl), [8215ff1e](../../editchain-sessions-raw/cc/8215ff1e-7af1-4543-8baf-2e9e37770711.jsonl), [d81f9fe2](../../editchain-sessions-raw/cc/d81f9fe2-3be9-4044-bd4a-2e942470e20c.jsonl)
 
 ## Summary
 
