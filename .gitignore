@@ -1,6 +1,7 @@
 # Rust build artifacts
 target/
 logs/
+inputs/
 **/*.rs.bk
 
 # Editor / IDE

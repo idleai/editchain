@@ -6,4 +6,7 @@ license.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+tantivy = "0.22"
+roaring = "0.10"
 editchain-core = { path = "../editchain-core" }
+editchain-query = { path = "../editchain-query" }
