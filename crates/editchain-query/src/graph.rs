@@ -1,4 +1,8 @@
+use std::collections::{HashMap, HashSet};
+
 use editchain_core::{Frontier, NodeId, OpId};
+
+use crate::search::ScoredChunk;
 
 /// A frontier map — `(node, boot) -> max_seq` for fast visibility checks.
 ///
@@ -101,9 +105,177 @@ impl Default for DiversityConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Causal corridor
+// ---------------------------------------------------------------------------
+
+/// A causal corridor — the shortest parent path from a hit to a selected tip.
+///
+/// Used by `retrieve --why` to show how evidence connects to later work.
+#[derive(Debug, Clone)]
+pub struct CausalCorridor {
+    /// The source operation (evidence hit).
+    pub source: OpId,
+    /// The target operation (tip/frontier).
+    pub target: OpId,
+    /// Ordered OpIds along the shortest parent path (source → ... → target).
+    pub path: Vec<OpId>,
+}
+
+impl CausalCorridor {
+    pub fn new(source: OpId, target: OpId) -> Self {
+        Self {
+            source,
+            target,
+            path: Vec::new(),
+        }
+    }
+
+    /// Number of hops in the corridor.
+    pub fn len(&self) -> usize {
+        self.path.len()
+    }
+
+    /// Returns true if the corridor is empty (no path found).
+    pub fn is_empty(&self) -> bool {
+        self.path.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Occurrence collapse
+// ---------------------------------------------------------------------------
+
+/// A logical occurrence — groups physical chunks that share content.
+#[derive(Debug, Clone)]
+pub struct LogicalOccurrence {
+    /// The canonical chunk for this content.
+    pub canonical: ScoredChunk,
+    /// Number of physical occurrences across branches/sessions.
+    pub occurrence_count: usize,
+    /// All source OpIds where this content appears.
+    pub source_op_ids: Vec<OpId>,
+}
+
+/// Collapse duplicate chunks by content similarity and group by logical identity.
+///
+/// Returns deduplicated results with occurrence counts.
+pub fn collapse_occurrences(
+    results: Vec<ScoredChunk>,
+    text_similarity_threshold: f64,
+) -> Vec<LogicalOccurrence> {
+    let mut groups: Vec<LogicalOccurrence> = Vec::new();
+
+    for chunk in results {
+        let mut found = false;
+        for group in &mut groups {
+            // Simple text prefix match as a cheap similarity heuristic.
+            let min_len = group.canonical.text.len().min(chunk.text.len());
+            if min_len > 0 {
+                let matches = group.canonical.text[..min_len]
+                    .chars()
+                    .zip(chunk.text[..min_len].chars())
+                    .filter(|(a, b)| a == b)
+                    .count();
+                let similarity = matches as f64 / min_len as f64;
+                if similarity >= text_similarity_threshold {
+                    group.occurrence_count += 1;
+                    group.source_op_ids.push(chunk.op_id);
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            groups.push(LogicalOccurrence {
+                canonical: chunk,
+                occurrence_count: 1,
+                source_op_ids: Vec::new(),
+            });
+        }
+    }
+
+    groups
+}
+
+// ---------------------------------------------------------------------------
+// Branch diversity MMR
+// ---------------------------------------------------------------------------
+
+/// Apply Maximal Marginal Relevance with graph-aware diversity penalty.
+///
+/// utility = relevance - λ_text * max_similarity - λ_graph * graph_overlap
+pub fn mmr_diverse_rerank(
+    results: &[ScoredChunk],
+    config: &DiversityConfig,
+    top_k: usize,
+) -> Vec<ScoredChunk> {
+    if results.is_empty() {
+        return Vec::new();
+    }
+
+    let mut selected: Vec<ScoredChunk> = Vec::new();
+    let mut candidate_scores: Vec<(usize, f64)> = results
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (i, c.score))
+        .collect();
+
+    while selected.len() < top_k && !candidate_scores.is_empty() {
+        // Find the candidate with highest MMR score.
+        let mut best_idx = 0;
+        let mut best_score = f64::NEG_INFINITY;
+
+        for (pos, &(cand_idx, _)) in candidate_scores.iter().enumerate() {
+            let relevance = results[cand_idx].score;
+
+            // Compute max similarity to already-selected items.
+            let max_sim = selected
+                .iter()
+                .map(|s| text_similarity(&results[cand_idx].text, &s.text))
+                .fold(0.0f64, f64::max);
+
+            // Compute graph overlap penalty (same node = high overlap).
+            let graph_overlap = selected
+                .iter()
+                .filter(|s| s.op_id.node == results[cand_idx].op_id.node)
+                .count() as f64
+                / selected.len().max(1) as f64;
+
+            let mmr = relevance - config.lambda_text * max_sim - config.lambda_graph * graph_overlap;
+
+            if mmr > best_score {
+                best_score = mmr;
+                best_idx = pos;
+            }
+        }
+
+        let (sel_idx, _) = candidate_scores.remove(best_idx);
+        selected.push(results[sel_idx].clone());
+    }
+
+    selected
+}
+
+/// Simple text similarity based on character overlap.
+fn text_similarity(a: &str, b: &str) -> f64 {
+    let min_len = a.len().min(b.len());
+    if min_len == 0 {
+        return 0.0;
+    }
+    let matches = a
+        .chars()
+        .zip(b.chars())
+        .filter(|(x, y)| x == y)
+        .count();
+    matches as f64 / min_len as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::{ChunkId, ChunkMetadata};
+    use editchain_core::{ActorId, NodeId};
 
     #[test]
     fn frontier_visibility() {
@@ -113,7 +285,7 @@ mod tests {
         assert!(map.is_visible(&OpId::new(NodeId(1), 0, 50)));
         assert!(map.is_visible(&OpId::new(NodeId(1), 0, 100)));
         assert!(!map.is_visible(&OpId::new(NodeId(1), 0, 101)));
-        assert!(!map.is_visible(&OpId::new(NodeId(2), 0, 50))); // different node
+        assert!(!map.is_visible(&OpId::new(NodeId(2), 0, 50)));
     }
 
     #[test]
@@ -137,5 +309,87 @@ mod tests {
         cone.descendants.push(OpId::new(NodeId(1), 0, 11));
 
         assert_eq!(cone.total_ops(), 4);
+    }
+
+    #[test]
+    fn causal_corridor_basic() {
+        let source = OpId::new(NodeId(1), 0, 5);
+        let target = OpId::new(NodeId(1), 0, 10);
+        let mut corridor = CausalCorridor::new(source, target);
+        corridor.path.push(OpId::new(NodeId(1), 0, 6));
+        corridor.path.push(OpId::new(NodeId(1), 0, 7));
+        corridor.path.push(OpId::new(NodeId(1), 0, 8));
+
+        assert_eq!(corridor.len(), 3);
+        assert!(!corridor.is_empty());
+    }
+
+    #[test]
+    fn collapse_occurrences_deduplicates() {
+        let op_id = OpId::new(NodeId(1), 0, 1);
+        let chunk = ScoredChunk {
+            chunk_id: ChunkId { op_id, chunk_ordinal: 0 },
+            op_id,
+            score: 1.0,
+            text: "hello world".to_string(),
+            metadata: ChunkMetadata {
+                op_id,
+                chunk_id: ChunkId { op_id, chunk_ordinal: 0 },
+                session_id: None,
+                actor_id: ActorId(0),
+                kind_tags: 0,
+                timestamp_ms: 0,
+                generation: 1,
+            },
+        };
+
+        let results = vec![chunk.clone(), chunk.clone()];
+        let collapsed = collapse_occurrences(results, 0.8);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].occurrence_count, 2);
+    }
+
+    #[test]
+    fn mmr_diverse_rerank_selects_top() {
+        let op_id1 = OpId::new(NodeId(1), 0, 1);
+        let op_id2 = OpId::new(NodeId(2), 0, 2);
+
+        let results = vec![
+            ScoredChunk {
+                chunk_id: ChunkId { op_id: op_id1, chunk_ordinal: 0 },
+                op_id: op_id1,
+                score: 10.0,
+                text: "alpha".to_string(),
+                metadata: ChunkMetadata {
+                    op_id: op_id1,
+                    chunk_id: ChunkId { op_id: op_id1, chunk_ordinal: 0 },
+                    session_id: None,
+                    actor_id: ActorId(0),
+                    kind_tags: 0,
+                    timestamp_ms: 0,
+                    generation: 1,
+                },
+            },
+            ScoredChunk {
+                chunk_id: ChunkId { op_id: op_id2, chunk_ordinal: 0 },
+                op_id: op_id2,
+                score: 5.0,
+                text: "beta".to_string(),
+                metadata: ChunkMetadata {
+                    op_id: op_id2,
+                    chunk_id: ChunkId { op_id: op_id2, chunk_ordinal: 0 },
+                    session_id: None,
+                    actor_id: ActorId(0),
+                    kind_tags: 0,
+                    timestamp_ms: 0,
+                    generation: 1,
+                },
+            },
+        ];
+
+        let reranked = mmr_diverse_rerank(&results, &DiversityConfig::default(), 2);
+        assert_eq!(reranked.len(), 2);
+        // First result should be the highest-relevance item.
+        assert_eq!(reranked[0].op_id.seq, 1);
     }
 }
