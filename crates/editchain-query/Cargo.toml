@@ -1,0 +1,9 @@
+[package]
+name = "editchain-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+editchain-core = { path = "../editchain-core" }
