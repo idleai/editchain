@@ -7,6 +7,9 @@ members = [
     "crates/editchain-node",
     "crates/editchain-import",
     "crates/editchain-agent",
+    "crates/editchain-query",
+    "crates/editchain-index",
+    "crates/editchain-embed",
 ]
 
 [workspace.package]

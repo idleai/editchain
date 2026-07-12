@@ -8,7 +8,7 @@ use crate::claude_code::normalize::{normalize_envelope, NormalizeOptions};
 use crate::claude_code::reader::read_session_file;
 use crate::cursor::check_file_generation;
 use crate::error::ImportError;
-use crate::ids::{derive_node_id, SourceStream};
+use crate::ids::derive_source_stream;
 use crate::model::{DiscoveryRequest, ImportOptions, ImportReport};
 use crate::sink::{BlobSink, CursorStore, OpSink};
 
@@ -19,7 +19,7 @@ pub fn import_claude_code(
     request: &DiscoveryRequest,
     options: &ImportOptions,
     ops: &mut dyn OpSink,
-    _blobs: &mut dyn BlobSink,
+    blobs: &mut dyn BlobSink,
     cursors: &mut dyn CursorStore,
 ) -> Result<ImportReport, ImportError> {
     let mut report = ImportReport::new();
@@ -29,44 +29,52 @@ pub fn import_claude_code(
         .map_err(|e| ImportError::OpSink(e))?;
     report.files_discovered = sessions.len();
 
-    let node_id = derive_node_id(request.workspace_path.to_str().unwrap_or("/workspace"));
-    let mut global_seq: u64 = 0;
+    let workspace_str = request.workspace_path.to_str().unwrap_or("/workspace");
 
     for session in &sessions {
         // Check cursor for idempotency.
         let cursor_key = session.path.to_string_lossy().to_string();
         let existing_cursor = cursors.get_cursor(&cursor_key)?;
 
-        if let Some(ref cursor) = existing_cursor {
+        // Determine boot generation — increment if file was rewritten.
+        let boot = if let Some(ref cursor) = existing_cursor {
             match check_file_generation(&session.path, cursor) {
                 Ok(true) => {
-                    // File unchanged — skip.
+                    // File unchanged — skip entirely.
                     continue;
                 }
                 Ok(false) => {
-                    // File grew — read only new bytes.
+                    // File grew — same boot, read only new bytes.
+                    0
                 }
                 Err(ImportError::SourceGenerationChanged { .. }) => {
-                    // File was rewritten — re-read from start.
+                    // File was rewritten — new boot generation.
+                    1
                 }
                 Err(e) => return Err(e),
             }
-        }
+        } else {
+            0
+        };
 
         report.files_processed += 1;
 
-        // Read session file.
+        // Derive a deterministic source stream per session file.
+        let stream = derive_source_stream(workspace_str, &cursor_key, boot);
+
+        // Read session file (from cursor offset if appending).
         let (lines, _bytes_read, new_cursor) =
             read_session_file(&session.path, existing_cursor.as_ref())?;
 
-        let stream = SourceStream::new(node_id, 0);
         let norm_opts = NormalizeOptions {
             normalize: options.normalize,
             include_thinking: options.include_thinking,
         };
 
-        for line in &lines {
-            global_seq += 1;
+        // Use per-file sequence numbering starting from cursor's last ordinal.
+        let start_seq = existing_cursor.as_ref().map(|c| c.ops_emitted).unwrap_or(0);
+        for (i, line) in lines.iter().enumerate() {
+            let seq = start_seq + i as u64 + 1;
 
             // Parse envelope for normalization.
             let env = parse_envelope(&line.data);
@@ -77,8 +85,9 @@ pub fn import_claude_code(
                     line.hash,
                     &line.data,
                     &stream,
-                    global_seq,
+                    seq,
                     &norm_opts,
+                    blobs,
                 );
 
                 // Emit raw import op.
@@ -92,7 +101,7 @@ pub fn import_claude_code(
                 }
             } else {
                 // Unparseable line — still emit as raw ImportOp.
-                let op_id = stream.op_id(global_seq);
+                let op_id = stream.op_id(seq);
                 let raw_op = Op {
                     id: op_id,
                     parents: editchain_core::parents::ParentSet::None,

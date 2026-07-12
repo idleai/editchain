@@ -9,7 +9,8 @@ use editchain_core::{
 };
 
 use super::envelope::{CcContentBlock, CcEnvelope};
-use crate::ids::{derive_actor_id, derive_session_id, SourceStream};
+use crate::ids::{derive_actor_id, derive_session_id, SourcePosition, SourceStream};
+use crate::sink::{payload_for, BlobSink};
 
 /// Normalize a parsed CC envelope into editchain operations.
 ///
@@ -21,8 +22,10 @@ pub fn normalize_envelope(
     stream: &SourceStream,
     seq: u64,
     options: &NormalizeOptions,
+    blobs: &mut dyn BlobSink,
 ) -> (Op, Vec<Op>) {
-    let op_id = stream.op_id(seq);
+    let raw_pos = SourcePosition::raw(seq);
+    let op_id = stream.op_from_position(raw_pos).unwrap();
     let timestamp = parse_timestamp(&env.timestamp);
     let clock = Clock::UnixMs(timestamp);
     let session_id = derive_session_id(&env.session_id);
@@ -57,11 +60,9 @@ pub fn normalize_envelope(
         scope: ScopeRef::Session(session_id),
         tags: Tags::IMPORT,
         kind: OpKind::Import(ImportOp {
-            raw_ref: if raw_bytes.len() <= 4096 {
-                Payload::Inline(raw_bytes.to_vec())
-            } else {
+            raw_ref: payload_for(raw_bytes, blobs).unwrap_or_else(|_| {
                 Payload::Inline(raw_bytes[..4096].to_vec())
-            },
+            }),
             raw_hash: Some(line_hash),
         }),
     };
@@ -70,9 +71,8 @@ pub fn normalize_envelope(
         return (raw_op, vec![]);
     }
 
-    // Normalized ops.
+    // Normalized ops — use SourcePosition for collision-free ID allocation.
     let mut normalized = Vec::new();
-    let norm_seq = seq * 1000 + 1;
 
     match env.record_type.as_str() {
         "user" => {
@@ -84,7 +84,7 @@ pub fn normalize_envelope(
                     for block in &msg.content {
                         if let CcContentBlock::ToolResult { tool_use_id, content, is_error: _ } = block {
                             let tool_op = Op {
-                                id: stream.op_id(norm_seq + normalized.len() as u64),
+                                id: stream.op_from_position(SourcePosition::derived(seq, (normalized.len() + 1) as u16)).unwrap(),
                                 parents: ParentSet::One(op_id),
                                 actor,
                                 clock,
@@ -106,7 +106,7 @@ pub fn normalize_envelope(
                     let text = extract_text_content(&msg.content);
                     if !text.is_empty() {
                         let msg_op = Op {
-                            id: stream.op_id(norm_seq + normalized.len() as u64),
+                            id: stream.op_from_position(SourcePosition::derived(seq, (normalized.len() + 1) as u16)).unwrap(),
                             parents: ParentSet::One(op_id),
                             actor,
                             clock,
@@ -129,7 +129,7 @@ pub fn normalize_envelope(
                     match block {
                         CcContentBlock::Text { text } if !text.trim().is_empty() => {
                             let msg_op = Op {
-                                id: stream.op_id(norm_seq + normalized.len() as u64),
+                                id: stream.op_from_position(SourcePosition::derived(seq, (normalized.len() + 1) as u16)).unwrap(),
                                 parents: ParentSet::One(op_id),
                                 actor,
                                 clock,
@@ -145,7 +145,7 @@ pub fn normalize_envelope(
                         CcContentBlock::ToolUse { id, name, input } => {
                             let input_str = serde_json::to_string(input).unwrap_or_default();
                             let tool_op = Op {
-                                id: stream.op_id(norm_seq + normalized.len() as u64),
+                                id: stream.op_from_position(SourcePosition::derived(seq, (normalized.len() + 1) as u16)).unwrap(),
                                 parents: ParentSet::One(op_id),
                                 actor,
                                 clock,
@@ -163,7 +163,7 @@ pub fn normalize_envelope(
                             if name == "Bash" || name == "PowerShell" {
                                 let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
                                 let cmd_op = Op {
-                                    id: stream.op_id(norm_seq + normalized.len() as u64),
+                                    id: stream.op_from_position(SourcePosition::derived(seq, (normalized.len() + 1) as u16)).unwrap(),
                                     parents: ParentSet::One(op_id),
                                     actor,
                                     clock,
@@ -182,7 +182,7 @@ pub fn normalize_envelope(
                             if options.include_thinking && !thinking.trim().is_empty() =>
                         {
                             let thinking_op = Op {
-                                id: stream.op_id(norm_seq + normalized.len() as u64),
+                                id: stream.op_from_position(SourcePosition::derived(seq, (normalized.len() + 1) as u16)).unwrap(),
                                 parents: ParentSet::One(op_id),
                                 actor,
                                 clock,
@@ -204,7 +204,7 @@ pub fn normalize_envelope(
         "attachment" => {
             if env.attachment_type == "file" || env.attachment_type == "file_content" {
                 let file_op = Op {
-                    id: stream.op_id(norm_seq + normalized.len() as u64),
+                    id: stream.op_from_position(SourcePosition::derived(seq, (normalized.len() + 1) as u16)).unwrap(),
                     parents: ParentSet::One(op_id),
                     actor,
                     clock,
@@ -225,7 +225,7 @@ pub fn normalize_envelope(
         "system" => match env.subtype.as_str() {
             "compact_boundary" | "away_summary" => {
                 let reflection_op = Op {
-                    id: stream.op_id(norm_seq + normalized.len() as u64),
+                    id: stream.op_from_position(SourcePosition::derived(seq, (normalized.len() + 1) as u16)).unwrap(),
                     parents: ParentSet::One(op_id),
                     actor,
                     clock,
@@ -383,14 +383,16 @@ mod tests {
     #[test]
     fn test_normalize_user_message() {
         use super::super::envelope::{parse_envelope};
+        use crate::sink::MemoryBlobSink;
 
         let json = br#"{"type":"user","uuid":"abc","sessionId":"sess-1","timestamp":"2026-07-09T18:56:19.739Z","message":{"role":"user","content":"hello world"}}"#;
         let env = parse_envelope(json).unwrap();
         let stream = SourceStream::new(crate::ids::derive_node_id("/test"), 0);
         let hash = crate::ids::hash_raw(json);
+        let mut blobs = MemoryBlobSink::new();
 
         let (raw, norm) =
-            normalize_envelope(&env, hash, json, &stream, 1, &NormalizeOptions::default());
+            normalize_envelope(&env, hash, json, &stream, 1, &NormalizeOptions::default(), &mut blobs);
 
         assert!(matches!(raw.kind, OpKind::Import(_)));
         assert!(raw.tags.matches_any(Tags::IMPORT));

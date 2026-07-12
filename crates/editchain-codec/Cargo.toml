@@ -11,4 +11,5 @@ use-std = ["serde/std", "postcard/use-std"]
 [dependencies]
 serde.workspace = true
 postcard.workspace = true
+crc = "3"
 editchain-core = { path = "../editchain-core" }

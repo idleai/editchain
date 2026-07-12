@@ -282,6 +282,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eb8a2a1cd12ab0d987a5d5e825195d372001a4094a0376319d5a0ad71c1ba0d"
+dependencies = [
+ "crc-catalog",
+]
+
+[[package]]
+name = "crc-catalog"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -357,6 +372,7 @@ dependencies = [
 name = "editchain-codec"
 version = "0.1.0"
 dependencies = [
+ "crc",
  "editchain-core",
  "postcard",
  "serde",
@@ -367,6 +383,13 @@ name = "editchain-core"
 version = "0.1.0"
 dependencies = [
  "postcard",
+ "serde",
+]
+
+[[package]]
+name = "editchain-embed"
+version = "0.1.0"
+dependencies = [
  "serde",
 ]
 
@@ -384,6 +407,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "editchain-index"
+version = "0.1.0"
+dependencies = [
+ "editchain-core",
+ "serde",
+]
+
+[[package]]
 name = "editchain-node"
 version = "0.1.0"
 dependencies = [
@@ -395,6 +426,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "editchain-query"
+version = "0.1.0"
+dependencies = [
+ "editchain-core",
+ "serde",
 ]
 
 [[package]]

@@ -1,14 +1,14 @@
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::cursor::split_lines;
 use crate::error::ImportError;
 use crate::ids::hash_raw;
 use crate::sink::CursorValue;
 
 /// Read a session file incrementally, returning complete lines and their hashes.
 ///
-/// Skips partial final lines (power-loss tolerance).
+/// Uses streaming `BufRead::read_until` to avoid loading the entire file into
+/// memory. Skips partial final lines (power-loss tolerance).
 /// Returns (lines_with_hashes, bytes_read, new_cursor_value).
 pub fn read_session_file(
     path: &Path,
@@ -31,43 +31,59 @@ pub fn read_session_file(
         None => (0, [0u8; 32]),
     };
 
-    let mut file = std::fs::File::open(path).map_err(ImportError::Io)?;
+    let file = std::fs::File::open(path).map_err(ImportError::Io)?;
+    let mut reader = BufReader::new(file);
+
     if offset > 0 {
-        file.seek(SeekFrom::Start(offset)).map_err(ImportError::Io)?;
+        reader.seek(SeekFrom::Start(offset)).map_err(ImportError::Io)?;
     }
 
-    let mut raw = Vec::new();
-    file.read_to_end(&mut raw).map_err(ImportError::Io)?;
-
-    let (complete_lines, partial) = split_lines(&raw);
-    let bytes_read = raw.len() - partial.len();
-
-    // Compute cumulative hash.
     let mut hasher = blake3::Hasher::new();
     if prior_hash != [0u8; 32] {
         hasher.update(&prior_hash);
     }
 
     let mut lines = Vec::new();
-    for line_bytes in &complete_lines {
-        hasher.update(line_bytes);
-        let line_hash = hash_raw(line_bytes);
-        lines.push(LineWithHash {
-            data: line_bytes.clone(),
-            hash: line_hash,
-        });
+    let mut bytes_read: u64 = 0;
+    let mut line_buf = Vec::new();
+
+    loop {
+        line_buf.clear();
+        let n = reader
+            .read_until(b'\n', &mut line_buf)
+            .map_err(ImportError::Io)?;
+
+        if n == 0 {
+            // EOF — no partial line to retain.
+            break;
+        }
+
+        // Check if this is a complete line (ends with newline).
+        if line_buf.last() == Some(&b'\n') {
+            hasher.update(&line_buf);
+            let line_hash = hash_raw(&line_buf);
+            lines.push(LineWithHash {
+                data: line_buf.clone(),
+                hash: line_hash,
+            });
+            bytes_read += n as u64;
+        } else {
+            // Partial final line — stop (power-loss tolerance).
+            // Do NOT include it in the hash or byte count.
+            break;
+        }
     }
 
     let content_hash = *hasher.finalize().as_bytes();
 
     let new_cursor = CursorValue {
         file_size,
-        byte_offset: offset + bytes_read as u64,
+        byte_offset: offset + bytes_read,
         ops_emitted: cursor.map(|c| c.ops_emitted).unwrap_or(0) + lines.len() as u64,
         content_hash,
     };
 
-    Ok((lines, bytes_read as u64, new_cursor))
+    Ok((lines, bytes_read, new_cursor))
 }
 
 /// A single JSONL line with its Blake3 hash.
@@ -80,7 +96,6 @@ pub struct LineWithHash {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sink::MemoryCursorStore;
 
     #[test]
     fn read_empty_file() {
