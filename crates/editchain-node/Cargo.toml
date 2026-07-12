@@ -12,6 +12,9 @@ dirs = "6"
 editchain-core = { path = "../editchain-core" }
 editchain-codec = { path = "../editchain-codec" }
 editchain-import = { path = "../editchain-import" }
+editchain-query = { path = "../editchain-query" }
+editchain-index = { path = "../editchain-index" }
+editchain-embed = { path = "../editchain-embed" }
 
 [dev-dependencies]
 tempfile = "3"

@@ -10,6 +10,8 @@ use editchain_import::model::{DiscoveryRequest, ImportOptions};
 use editchain_import::sink::{MemoryBlobSink, MemoryCursorStore, MemoryOpSink};
 use editchain_node::segment::SegmentStore;
 
+use editchain_query::search::{SearchFilters, SearchMode, SearchRequest, TagFilter};
+
 #[derive(Parser)]
 #[command(name = "editchain", version, about = "Editchain CLI — CRDT-based agent edit history")]
 struct Cli {
@@ -45,6 +47,32 @@ enum Commands {
         chain_a: PathBuf,
         /// Second chain directory
         chain_b: PathBuf,
+    },
+    /// Search the edit chain (BM25, vector, or hybrid)
+    Search {
+        /// Query string
+        query: String,
+        /// Search mode: lexical, vector, or hybrid
+        #[arg(long, default_value = "hybrid")]
+        mode: String,
+        /// Number of results
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        /// Filter by kind (message,tool,command,file)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Path to the chain directory
+        #[arg(default_value = ".editchain")]
+        path: PathBuf,
+    },
+    /// Retrieve an operation or chunk by ID
+    Retrieve {
+        /// Operation ID to retrieve
+        #[arg(long)]
+        op: Option<String>,
+        /// Path to the chain directory
+        #[arg(default_value = ".editchain")]
+        path: PathBuf,
     },
     /// Import Claude Code sessions into the edit chain
     Import {
@@ -111,6 +139,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         Err(e) => {
                             eprintln!("Warning: failed to decode record: {}", e);
+                        }
+                    }
+                }
+            }
+        }
+        Commands::Search { query, mode, top, kind, path } => {
+            let store = SegmentStore::open(&path)?;
+            let pages = store.read_all()?;
+
+            // Build a lexical index from the chain.
+            let mut lexical = editchain_index::LexicalIndex::new()?;
+            let mut gen = 0u64;
+            for page in &pages {
+                for record in &page.records {
+                    if let Ok(op) = decode_op(&record.data) {
+                        lexical.index_op(&op, gen)?;
+                        gen += 1;
+                    }
+                }
+            }
+            lexical.commit()?;
+
+            // Parse filters.
+            let mut filters = SearchFilters::default();
+            if let Some(k) = kind {
+                filters.kinds = Some(
+                    k.split(',')
+                        .filter_map(|s| match s.trim() {
+                            "message" => Some(TagFilter::Message),
+                            "tool" => Some(TagFilter::Tool),
+                            "command" => Some(TagFilter::Command),
+                            "file" => Some(TagFilter::File),
+                            _ => None,
+                        })
+                        .collect(),
+                );
+            }
+
+            let search_mode = match mode.as_str() {
+                "lexical" => SearchMode::Lexical,
+                "vector" => SearchMode::Vector,
+                _ => SearchMode::Hybrid,
+            };
+
+            let request = SearchRequest {
+                query,
+                mode: search_mode,
+                top_k: top,
+                filters,
+                ..SearchRequest::default()
+            };
+
+            // For now, use lexical-only search (vector requires embedding model).
+            let results = lexical.search(&request.query, &request.filters, request.top_k)?;
+
+            for result in &results {
+                println!("{} | score={:.4} | op={}", result.text, result.score, result.op_id);
+            }
+            println!("--- {} results ---", results.len());
+        }
+        Commands::Retrieve { op, path } => {
+            if let Some(op_str) = op {
+                let store = SegmentStore::open(&path)?;
+                let pages = store.read_all()?;
+                for page in &pages {
+                    for record in &page.records {
+                        if let Ok(op) = decode_op(&record.data) {
+                            if op.id.to_string() == op_str {
+                                let json = serde_json::to_string_pretty(&op)?;
+                                println!("{}", json);
+                            }
                         }
                     }
                 }
