@@ -530,7 +530,9 @@ name = "editchain-index"
 version = "0.1.0"
 dependencies = [
  "editchain-core",
+ "editchain-embed",
  "editchain-query",
+ "half",
  "roaring",
  "serde",
  "tantivy",
@@ -762,6 +764,17 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "half"
+version = "2.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
+dependencies = [
+ "cfg-if",
+ "crunchy",
+ "zerocopy",
 ]
 
 [[package]]
