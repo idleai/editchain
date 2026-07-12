@@ -10,7 +10,8 @@ use editchain_import::model::{DiscoveryRequest, ImportOptions};
 use editchain_import::sink::{MemoryBlobSink, MemoryCursorStore, MemoryOpSink};
 use editchain_node::segment::SegmentStore;
 
-use editchain_query::search::{SearchFilters, SearchMode, SearchRequest, TagFilter};
+use editchain_query::search::{SearchFilters, SearchMode, SearchRequest, SummarizeRequest, SummarizeStrategy, TagFilter};
+use editchain_query::summarize::{build_extractive_summary, build_timeline_summary};
 
 #[derive(Parser)]
 #[command(name = "editchain", version, about = "Editchain CLI — CRDT-based agent edit history")]
@@ -61,6 +62,32 @@ enum Commands {
         /// Filter by kind (message,tool,command,file)
         #[arg(long)]
         kind: Option<String>,
+        /// Path to the chain directory
+        #[arg(default_value = ".editchain")]
+        path: PathBuf,
+    },
+    /// Summarize the edit chain around a query (extractive)
+    Summarize {
+        /// Query to summarize around
+        query: String,
+        /// Token budget for the summary
+        #[arg(long, default_value_t = 6000)]
+        budget: usize,
+        /// Strategy: extractive, timeline, or context-pack
+        #[arg(long, default_value = "extractive")]
+        strategy: String,
+        /// Path to the chain directory
+        #[arg(default_value = ".editchain")]
+        path: PathBuf,
+    },
+    /// Tail the edit chain (follow new operations)
+    Tail {
+        /// Follow new operations as they are appended
+        #[arg(long, default_value_t = false)]
+        follow: bool,
+        /// Only show operations since this generation
+        #[arg(long)]
+        since: Option<u64>,
         /// Path to the chain directory
         #[arg(default_value = ".editchain")]
         path: PathBuf,
@@ -198,6 +225,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{} | score={:.4} | op={}", result.text, result.score, result.op_id);
             }
             println!("--- {} results ---", results.len());
+        }
+        Commands::Summarize { query, budget, strategy, path } => {
+            let store = SegmentStore::open(&path)?;
+            let pages = store.read_all()?;
+
+            // Build lexical index and search.
+            let mut lexical = editchain_index::LexicalIndex::new()?;
+            let mut gen = 0u64;
+            for page in &pages {
+                for record in &page.records {
+                    if let Ok(op) = decode_op(&record.data) {
+                        lexical.index_op(&op, gen)?;
+                        gen += 1;
+                    }
+                }
+            }
+            lexical.commit()?;
+
+            let results = lexical.search(&query, &SearchFilters::default(), 20)?;
+
+            let strat = match strategy.as_str() {
+                "timeline" => SummarizeStrategy::Timeline,
+                "context-pack" => SummarizeStrategy::ContextPack,
+                _ => SummarizeStrategy::Extractive,
+            };
+
+            let request = SummarizeRequest {
+                query: query.to_string(),
+                budget_tokens: budget,
+                strategy: strat,
+            };
+
+            let summary = match strat {
+                SummarizeStrategy::Timeline => build_timeline_summary(&request, results),
+                _ => build_extractive_summary(&request, results),
+            };
+
+            println!("## Summary: {}", summary.query);
+            println!("Strategy: {:?}", summary.strategy);
+            println!("Total tokens: {}", summary.total_tokens);
+            println!();
+            for (i, snippet) in summary.snippets.iter().enumerate() {
+                println!("[{}.] op={} (score={:.4})", i + 1, snippet.op_id, snippet.score);
+                println!("{}", snippet.text);
+                println!();
+            }
+        }
+        Commands::Tail { follow, since, path } => {
+            let store = SegmentStore::open(&path)?;
+            let pages = store.read_all()?;
+
+            let mut start_gen = since.unwrap_or(0);
+            for page in &pages {
+                for record in &page.records {
+                    if let Ok(op) = decode_op(&record.data) {
+                        if start_gen > 0 {
+                            start_gen -= 1;
+                            continue;
+                        }
+                        let json = serde_json::to_string(&op)?;
+                        println!("{}", json);
+                    }
+                }
+            }
+
+            if follow {
+                eprintln!("Warning: --follow requires daemon mode (not yet implemented)");
+            }
         }
         Commands::Retrieve { op, path } => {
             if let Some(op_str) = op {
