@@ -10,8 +10,9 @@ use tantivy::schema::*;
 use tantivy::tokenizer::RawTokenizer;
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
 
-use editchain_core::{Op, OpId};
+use editchain_core::Op;
 use editchain_query::search::{ChunkId, ChunkMetadata, ScoredChunk, SearchFilters, TagFilter};
+use editchain_query::hybrid::LexicalSearch;
 
 use crate::chunker::{chunk_text, extract_op_text, ChunkRecord, Generation};
 
@@ -89,7 +90,6 @@ fn build_schema() -> (Schema, LexicalFields) {
 
 /// An in-memory Tantivy BM25 index for edit chain operations.
 pub struct LexicalIndex {
-    schema: Schema,
     fields: LexicalFields,
     index: Index,
     writer: IndexWriter,
@@ -113,7 +113,6 @@ impl LexicalIndex {
             .try_into()?;
 
         Ok(Self {
-            schema,
             fields,
             index,
             writer,
@@ -135,7 +134,12 @@ impl LexicalIndex {
         let chunks = chunk_text(&text, op.id, generation, 768, 96);
 
         for chunk in &chunks {
-            let ct = &text[chunk.byte_start as usize..chunk.byte_end as usize];
+            // Adjust byte boundaries to valid UTF-8 char boundaries.
+            let start = chunk.byte_start as usize;
+            let end = (chunk.byte_end as usize).min(text.len());
+            let start = text.floor_char_boundary(start);
+            let end = text.floor_char_boundary(end);
+            let ct = &text[start..end];
             self.index_chunk(op, chunk, ct, generation)?;
         }
 
@@ -179,7 +183,7 @@ impl LexicalIndex {
     }
 
     /// Search the lexical index.
-    pub fn search(
+    pub fn search_internal(
         &self,
         query_str: &str,
         filters: &SearchFilters,
@@ -269,11 +273,18 @@ impl LexicalIndex {
             use editchain_core::{NodeId, OpId};
             let op_id = OpId::new(NodeId(node_val), boot_val as u32, seq_val);
 
+            // Extract stored text from the body field.
+            let body_text = doc
+                .get_first(self.fields.body)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
             results.push(ScoredChunk {
                 chunk_id: ChunkId { op_id, chunk_ordinal: ordinal_val as u32 },
                 op_id,
                 score: score as f64,
-                text: String::new(),
+                text: body_text,
                 metadata: ChunkMetadata {
                     op_id,
                     chunk_id: ChunkId { op_id, chunk_ordinal: ordinal_val as u32 },
@@ -313,6 +324,17 @@ impl LexicalIndex {
 impl Default for LexicalIndex {
     fn default() -> Self {
         Self::new().expect("Failed to create LexicalIndex")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LexicalSearch trait impl
+// ---------------------------------------------------------------------------
+
+impl LexicalSearch for LexicalIndex {
+    fn search(&self, query: &str, filters: &SearchFilters, top_k: usize) -> Vec<ScoredChunk> {
+        self.search_internal(query, filters, top_k)
+            .unwrap_or_default()
     }
 }
 
@@ -393,7 +415,7 @@ mod tests {
         index.commit().unwrap();
 
         let filters = SearchFilters::default();
-        let results = index.search("hello", &filters, 10).unwrap();
+        let results = index.search_internal("hello", &filters, 10).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].op_id.seq, 1);
     }

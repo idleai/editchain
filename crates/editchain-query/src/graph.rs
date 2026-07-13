@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use editchain_core::{Frontier, NodeId, OpId};
 
@@ -10,13 +10,13 @@ use crate::search::ScoredChunk;
 /// traversing the full DAG.
 #[derive(Debug, Clone, Default)]
 pub struct FrontierMap {
-    frontiers: std::collections::HashMap<(u64, u32), u64>,
+    frontiers: HashMap<(u64, u32), u64>,
 }
 
 impl FrontierMap {
     pub fn new() -> Self {
         Self {
-            frontiers: std::collections::HashMap::new(),
+            frontiers: HashMap::new(),
         }
     }
 

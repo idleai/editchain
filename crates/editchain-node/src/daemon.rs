@@ -2,12 +2,10 @@
 //! and Unix-socket IPC for online consistency.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::sync::Arc;
 
-use editchain_index::snapshot::{LexicalSnapshot, QuerySnapshot};
 use editchain_index::chunker::Generation;
+use editchain_index::snapshot::QuerySnapshot;
 
 // ---------------------------------------------------------------------------
 // Append coordinator

@@ -10,8 +10,12 @@ use editchain_import::model::{DiscoveryRequest, ImportOptions};
 use editchain_import::sink::{MemoryBlobSink, MemoryCursorStore, MemoryOpSink};
 use editchain_node::segment::SegmentStore;
 
-use editchain_query::search::{SearchFilters, SearchMode, SearchRequest, SummarizeRequest, SummarizeStrategy, TagFilter};
-use editchain_query::summarize::{build_extractive_summary, build_timeline_summary};
+use editchain_embed::http::HttpEmbedder;
+use editchain_embed::EmbeddingManifest;
+use editchain_index::vector::{VectorIndex, VectorSearchWrapper};
+use editchain_index::LexicalIndex;
+use editchain_query::hybrid::HybridSearch;
+use editchain_query::search::{SearchFilters, SearchMode, SearchRequest, TagFilter};
 
 #[derive(Parser)]
 #[command(name = "editchain", version, about = "Editchain CLI — CRDT-based agent edit history")]
@@ -51,6 +55,8 @@ enum Commands {
     },
     /// Search the edit chain (BM25, vector, or hybrid)
     Search {
+        /// Path to the chain directory
+        path: PathBuf,
         /// Query string
         query: String,
         /// Search mode: lexical, vector, or hybrid
@@ -62,44 +68,25 @@ enum Commands {
         /// Filter by kind (message,tool,command,file)
         #[arg(long)]
         kind: Option<String>,
-        /// Path to the chain directory
-        #[arg(default_value = ".editchain")]
-        path: PathBuf,
-    },
-    /// Summarize the edit chain around a query (extractive)
-    Summarize {
-        /// Query to summarize around
-        query: String,
-        /// Token budget for the summary
-        #[arg(long, default_value_t = 6000)]
-        budget: usize,
-        /// Strategy: extractive, timeline, or context-pack
-        #[arg(long, default_value = "extractive")]
-        strategy: String,
-        /// Path to the chain directory
-        #[arg(default_value = ".editchain")]
-        path: PathBuf,
     },
     /// Tail the edit chain (follow new operations)
     Tail {
+        /// Path to the chain directory
+        path: PathBuf,
         /// Follow new operations as they are appended
         #[arg(long, default_value_t = false)]
         follow: bool,
         /// Only show operations since this generation
         #[arg(long)]
         since: Option<u64>,
-        /// Path to the chain directory
-        #[arg(default_value = ".editchain")]
-        path: PathBuf,
     },
     /// Retrieve an operation or chunk by ID
     Retrieve {
+        /// Path to the chain directory
+        path: PathBuf,
         /// Operation ID to retrieve
         #[arg(long)]
         op: Option<String>,
-        /// Path to the chain directory
-        #[arg(default_value = ".editchain")]
-        path: PathBuf,
     },
     /// Import Claude Code sessions into the edit chain
     Import {
@@ -171,12 +158,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::Search { query, mode, top, kind, path } => {
+        Commands::Search { path, query, mode, top, kind } => {
             let store = SegmentStore::open(&path)?;
             let pages = store.read_all()?;
 
             // Build a lexical index from the chain.
-            let mut lexical = editchain_index::LexicalIndex::new()?;
+            let mut lexical = LexicalIndex::new()?;
             let mut gen = 0u64;
             for page in &pages {
                 for record in &page.records {
@@ -210,6 +197,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => SearchMode::Hybrid,
             };
 
+            // Build the hybrid search engine based on mode.
+            let engine: HybridSearch = match search_mode {
+                SearchMode::Lexical => {
+                    HybridSearch::new(Box::new(lexical), Box::new(EmptyVectorSearch))
+                }
+                SearchMode::Vector | SearchMode::Hybrid => {
+                    let manifest = EmbeddingManifest::qwen3_embedding_0_6b();
+                    let vindex = VectorIndex::new(manifest.clone());
+                    let embedder: Box<dyn editchain_embed::Embedder> = Box::new(HttpEmbedder::new(
+                        manifest,
+                        "http://127.0.0.1:8001".to_string(),
+                    ));
+                    let mut wrapper = VectorSearchWrapper::new(vindex, embedder);
+
+                    // Collect all texts first, then embed in parallel batches.
+                    struct TextEntry {
+                        op_id: editchain_core::OpId,
+                        chunk_ordinal: u32,
+                        text: String,
+                        kind: String,
+                        session_id: Option<u64>,
+                    }
+                    let mut entries: Vec<TextEntry> = Vec::new();
+                    for page in &pages {
+                        for record in &page.records {
+                            if let Ok(op) = decode_op(&record.data) {
+                                if let Some(text) = editchain_index::chunker::extract_op_text(&op, false, false) {
+                                    entries.push(TextEntry {
+                                        op_id: op.id,
+                                        chunk_ordinal: 0,
+                                        text,
+                                        kind: kind_to_string(&op.kind).to_string(),
+                                        session_id: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+
+                    // Split into small batches (server shares GPU with main model).
+                    let batch_size = 16;
+                    let text_batches: Vec<Vec<String>> = entries.chunks(batch_size).map(|chunk| {
+                        chunk.iter().map(|e| e.text.clone()).collect()
+                    }).collect();
+
+                    // Use the embedder's parallel batch method.
+                    let all_vecs = wrapper.embedder_mut().embed_batches(&text_batches)
+                        .map_err(|e| format!("embedding error: {}", e))?;
+
+                    // Flatten and add to vector index.
+                    for (entry, vec) in entries.iter().zip(all_vecs.iter().flat_map(|v| v.iter())) {
+                        let f16v = editchain_index::vector::f32_to_f16_vec(vec);
+                        wrapper.index_mut().add_vector(
+                            entry.op_id,
+                            entry.chunk_ordinal,
+                            &f16v,
+                            &entry.kind,
+                            entry.session_id,
+                            gen,
+                        );
+                    }
+
+                    match search_mode {
+                        SearchMode::Vector => {
+                            HybridSearch::new(Box::new(EmptyLexicalSearch), Box::new(wrapper))
+                        }
+                        _ => HybridSearch::new(Box::new(lexical), Box::new(wrapper)),
+                    }
+                }
+            };
+
             let request = SearchRequest {
                 query,
                 mode: search_mode,
@@ -218,61 +276,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..SearchRequest::default()
             };
 
-            // For now, use lexical-only search (vector requires embedding model).
-            let results = lexical.search(&request.query, &request.filters, request.top_k)?;
+            let result = engine.search(&request);
 
-            for result in &results {
-                println!("{} | score={:.4} | op={}", result.text, result.score, result.op_id);
+            for chunk in &result.results {
+                println!("{} | score={:.4} | op={}", chunk.text, chunk.score, chunk.op_id);
             }
-            println!("--- {} results ---", results.len());
+            println!("--- {} results ---", result.results.len());
         }
-        Commands::Summarize { query, budget, strategy, path } => {
-            let store = SegmentStore::open(&path)?;
-            let pages = store.read_all()?;
-
-            // Build lexical index and search.
-            let mut lexical = editchain_index::LexicalIndex::new()?;
-            let mut gen = 0u64;
-            for page in &pages {
-                for record in &page.records {
-                    if let Ok(op) = decode_op(&record.data) {
-                        lexical.index_op(&op, gen)?;
-                        gen += 1;
-                    }
-                }
-            }
-            lexical.commit()?;
-
-            let results = lexical.search(&query, &SearchFilters::default(), 20)?;
-
-            let strat = match strategy.as_str() {
-                "timeline" => SummarizeStrategy::Timeline,
-                "context-pack" => SummarizeStrategy::ContextPack,
-                _ => SummarizeStrategy::Extractive,
-            };
-
-            let request = SummarizeRequest {
-                query: query.to_string(),
-                budget_tokens: budget,
-                strategy: strat,
-            };
-
-            let summary = match strat {
-                SummarizeStrategy::Timeline => build_timeline_summary(&request, results),
-                _ => build_extractive_summary(&request, results),
-            };
-
-            println!("## Summary: {}", summary.query);
-            println!("Strategy: {:?}", summary.strategy);
-            println!("Total tokens: {}", summary.total_tokens);
-            println!();
-            for (i, snippet) in summary.snippets.iter().enumerate() {
-                println!("[{}.] op={} (score={:.4})", i + 1, snippet.op_id, snippet.score);
-                println!("{}", snippet.text);
-                println!();
-            }
-        }
-        Commands::Tail { follow, since, path } => {
+        Commands::Tail { path, follow, since } => {
             let store = SegmentStore::open(&path)?;
             let pages = store.read_all()?;
 
@@ -294,7 +305,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Warning: --follow requires daemon mode (not yet implemented)");
             }
         }
-        Commands::Retrieve { op, path } => {
+        Commands::Retrieve { path, op } => {
             if let Some(op_str) = op {
                 let store = SegmentStore::open(&path)?;
                 let pages = store.read_all()?;
@@ -427,4 +438,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Empty search stubs for single-mode operation
+// ---------------------------------------------------------------------------
+
+struct EmptyLexicalSearch;
+impl editchain_query::hybrid::LexicalSearch for EmptyLexicalSearch {
+    fn search(&self, _query: &str, _filters: &SearchFilters, _top_k: usize) -> Vec<editchain_query::search::ScoredChunk> {
+        Vec::new()
+    }
+}
+
+struct EmptyVectorSearch;
+impl editchain_query::hybrid::VectorSearch for EmptyVectorSearch {
+    fn search(&self, _query: &str, _filters: &SearchFilters, _top_k: usize) -> Vec<editchain_query::search::ScoredChunk> {
+        Vec::new()
+    }
+}
+
+fn kind_to_string(kind: &editchain_core::op::OpKind) -> &'static str {
+    use editchain_core::op::OpKind;
+    match kind {
+        OpKind::Message(_) => "message",
+        OpKind::Tool(_) => "tool",
+        OpKind::Command(_) => "command",
+        OpKind::File(_) => "file",
+        OpKind::Reflection(_) => "reflection",
+        OpKind::Import(_) => "import",
+        OpKind::Note(_) => "note",
+        OpKind::Error(_) => "error",
+        _ => "unknown",
+    }
 }

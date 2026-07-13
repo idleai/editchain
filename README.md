@@ -20,6 +20,31 @@ cargo run --bin editchain -- append '{"id":{"node":1,"boot":0,"seq":1},"parents"
 cargo run --bin editchain -- dump my-chain
 ```
 
+## Import CC trajectories and query
+
+Import Claude Code session histories (JSONL) into an edit chain, then search, summarize, and retrieve:
+
+```sh
+# Import — discovers JSONL files in the sessions dir, normalizes them into the chain
+cargo run --bin editchain -- import --sessions-dir /path/to/cc-sessions --workspace /path/to/repo --chain ./outputs/cc-chain
+
+# Search — BM25 lexical search across all imported operations
+cargo run --bin editchain -- search ./outputs/cc-chain "mxfp4 nvfp4 conversion" --mode lexical --top 10 --kind message,tool,command
+
+# Search — hybrid (BM25 + vector) with Qwen3-Embedding-0.6B on port 8001
+# Requires: docker run -d --network host --gpus '"device=0"' --name qwen3-embed sglang-embed:v0.5.15-distro python3 -m sglang.launch_server \
+#   --model-path Qwen/Qwen3-Embedding-0.6B --is-embedding --host 0.0.0.0 --port 8001 --tp 1 --mem-fraction-static 0.2 --attention-backend triton
+cargo run --bin editchain -- search ./outputs/cc-chain "mxfp4 nvfp4 conversion" --mode hybrid --top 10
+
+# Retrieve — full operation JSON by op ID
+cargo run --bin editchain -- retrieve ./outputs/cc-chain --op "135985694277297808:0:942866433"
+
+# Tail — stream operations since a generation
+cargo run --bin editchain -- tail ./outputs/cc-chain --since 129500
+```
+
+Each command rebuilds the Tantivy BM25 index from scratch in memory (~2s for 130K ops)
+
 ## Binary size
 
 ```sh
@@ -31,73 +56,6 @@ ls -lh target/release/editchain
 ## Agent spec
 
 See [quests](./quests/)
-
-## SWE-bench evaluation with editchain-agent
-
-The `editchain-agent` crate replicates mini-swe-agent's SWE-bench evaluation loop, recording trajectories as editchain operations.
-
-### Prerequisites
-
-- Docker with SWE-bench images pulled (e.g. `swebench/sweb.eval.x86_64.*`)
-- An OpenAI-compatible model endpoint (tested with sglang at `localhost:8000`)
-- Python `datasets` package for dumping SWE-bench instances
-
-### Dump a dataset
-
-```sh
-# SWE-bench Verified (test) — 500 instances
-python3 crates/editchain-agent/scripts/dump_dataset.py \
-  princeton-nlp/SWE-bench_Verified test /tmp/swebench_verified_test.jsonl
-```
-
-### Run a single instance
-
-```sh
-cargo run -p editchain-agent -- run-single \
-  --config crates/editchain-agent/config/swebench.yaml \
-  --dataset /tmp/swebench_lite_dev.jsonl \
-  --instance-id sqlfluff__sqlfluff-1625 \
-  --output results/
-```
-
-### Run a batch
-
-```sh
-# Verified test (first 50 instances, 4 workers)
-head -50 /tmp/swebench_verified_test.jsonl > /tmp/swebench_verified_50.jsonl
-RUST_LOG=info cargo run -p editchain-agent -- run \
-  --config crates/editchain-agent/config/swebench.yaml \
-  --dataset /tmp/swebench_verified_50.jsonl \
-  --output results/verified \
-  --workers 4
-```
-
-### Evaluate results
-
-```sh
-# Verified
-python3 -m swebench.harness.run_evaluation \
-  --dataset_name princeton-nlp/SWE-bench_Verified \
-  --split test \
-  --predictions_path results/verified/preds.json \
-  --max_workers 16 \
-  --run_id my-run-verified
-```
-
-### Output structure
-
-```
-results/<run>/
-├── preds.json                          # Predictions file for swebench evaluation
-├── <instance_id>/
-│   ├── <instance_id>.traj.json         # Trajectory in editchain ops format
-│   └── ...
-└── ...
-```
-
-### Config
-
-The default config at `crates/editchain-agent/config/swebench.yaml` targets deepseek-v4-flash on localhost:8000 with temperature 0.2, matching the [reference config](https://github.com/ambientlight/rtx-pro-6000-bench/blob/main/evals/swebench-verified/deepseek-v4-flash-2026-06-20/config.yaml). Override any field via a custom YAML file.
 
 ## Models used
 

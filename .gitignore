@@ -2,6 +2,7 @@
 target/
 logs/
 inputs/
+outputs/
 **/*.rs.bk
 
 # Editor / IDE

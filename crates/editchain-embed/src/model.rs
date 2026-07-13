@@ -30,12 +30,12 @@ pub struct EmbeddingManifest {
 }
 
 impl EmbeddingManifest {
-    /// Create a manifest for Qwen3-Embedding-0.6B at 512 dimensions.
+    /// Create a manifest for Qwen3-Embedding-0.6B at 1024 dimensions.
     pub fn qwen3_embedding_0_6b() -> Self {
         Self {
             model_id: "Qwen/Qwen3-Embedding-0.6B".to_string(),
             revision: "main".to_string(),
-            dimensions: 512,
+            dimensions: 1024,
             max_tokens: 32768,
             pooling: Pooling::Mean,
             normalize: true,
@@ -78,6 +78,17 @@ impl EmbeddingManifest {
 pub trait Embedder: Send + Sync {
     /// Embed a batch of texts into normalized vectors.
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError>;
+
+    /// Embed multiple batches concurrently.
+    fn embed_batches(&self, batches: &[Vec<String>]) -> Result<Vec<Vec<Vec<f32>>>, EmbedError> {
+        // Default sequential fallback.
+        let mut all = Vec::new();
+        for batch in batches {
+            let results = self.embed(batch)?;
+            all.push(results);
+        }
+        Ok(all)
+    }
 
     /// Embed a single query text (applies query instruction if configured).
     fn embed_query(&self, query: &str) -> Result<Vec<f32>, EmbedError> {

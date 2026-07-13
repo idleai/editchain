@@ -3,13 +3,12 @@
 //! Uses half-precision (f16) vectors stored row-major in aligned segments.
 //! Filters use RoaringBitmap for fast pre-filtering before dot product scan.
 
-use std::sync::Arc;
-
 use half::f16;
 use roaring::RoaringBitmap;
 
 use editchain_core::{NodeId, OpId};
-use editchain_embed::EmbeddingManifest;
+use editchain_embed::{Embedder, EmbeddingManifest};
+use editchain_query::hybrid::VectorSearch;
 use editchain_query::search::{ChunkId, ChunkMetadata, ScoredChunk, SearchFilters};
 
 use crate::chunker::Generation;
@@ -136,7 +135,7 @@ impl VectorIndex {
         vec: &[f16],
         kind: &str,
         session_id: Option<u64>,
-        generation: Generation,
+        _generation: Generation,
     ) {
         let ordinal = self.next_ordinal;
         self.next_ordinal += 1;
@@ -267,6 +266,61 @@ impl VectorIndex {
 
     pub fn manifest(&self) -> &EmbeddingManifest {
         &self.manifest
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VectorSearch trait impl
+// ---------------------------------------------------------------------------
+
+/// A vector search backend that embeds queries via an `Embedder` and searches
+/// a `VectorIndex`.
+pub struct VectorSearchWrapper {
+    index: VectorIndex,
+    embedder: Box<dyn Embedder>,
+}
+
+impl VectorSearchWrapper {
+    pub fn new(index: VectorIndex, embedder: Box<dyn Embedder>) -> Self {
+        Self { index, embedder }
+    }
+
+    /// Embed a batch of texts and add them to the index.
+    pub fn add_texts(
+        &mut self,
+        texts: &[(OpId, u32, String, String, Option<u64>)],
+        generation: u64,
+    ) -> Result<(), editchain_embed::EmbedError> {
+        let batch: Vec<String> = texts.iter().map(|(_, _, t, _, _)| t.clone()).collect();
+        let vectors = self.embedder.embed(&batch)?;
+        for ((op_id, chunk_ordinal, _, kind, session_id), vec) in texts.iter().zip(vectors.iter()) {
+            let f16v = f32_to_f16_vec(vec);
+            self.index.add_vector(*op_id, *chunk_ordinal, &f16v, &kind, *session_id, generation);
+        }
+        Ok(())
+    }
+}
+
+impl VectorSearchWrapper {
+    /// Access the embedder mutably (for batch embedding).
+    pub fn embedder_mut(&mut self) -> &mut Box<dyn Embedder> {
+        &mut self.embedder
+    }
+
+    /// Access the vector index mutably.
+    pub fn index_mut(&mut self) -> &mut VectorIndex {
+        &mut self.index
+    }
+}
+
+impl VectorSearch for VectorSearchWrapper {
+    fn search(&self, query: &str, filters: &SearchFilters, top_k: usize) -> Vec<ScoredChunk> {
+        let query_vec = match self.embedder.embed_query(query) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        let f16q = f32_to_f16_vec(&query_vec);
+        self.index.search(&f16q, filters, top_k)
     }
 }
 
