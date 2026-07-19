@@ -26,7 +26,7 @@ pub fn import_claude_code(
 
     // Discover session files.
     let sessions = discover_sessions(&request.sessions_dir)
-        .map_err(|e| ImportError::OpSink(e))?;
+        .map_err(ImportError::OpSink)?;
     report.files_discovered = sessions.len();
 
     let workspace_str = request.workspace_path.to_str().unwrap_or("/workspace");

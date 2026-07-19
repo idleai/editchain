@@ -10,6 +10,7 @@ members = [
     "crates/editchain-query",
     "crates/editchain-index",
     "crates/editchain-embed",
+    "crates/editchain-tui",
 ]
 
 [workspace.package]

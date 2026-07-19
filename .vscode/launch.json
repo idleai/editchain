@@ -1,0 +1,31 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Rust: vGDB (interactive) — editchain-node/editchain",
+      "type": "vgdb",
+      "request": "launch",
+
+      "program": "${workspaceFolder}/target/debug/editchain",
+      "cwd": "${workspaceFolder}",
+      "debugger": "gdb",
+
+      "args": ["init"],
+      "env": {
+        "RUST_BACKTRACE": "1"
+      },
+
+      "preLaunchTask": "cargo build (debug): editchain-node/editchain",
+      "externalConsole": false,
+      "stopOnEntry": false,
+      "useAbsoluteFilePaths": true,
+      "debug": "basic",
+
+      "startupCmds": [
+        "set breakpoint pending on",
+        "set pagination off",
+        "set print pretty on"
+      ]
+    }
+  ]
+}

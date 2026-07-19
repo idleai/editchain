@@ -190,7 +190,9 @@ pub enum FileStage {
 
 /// The edit applied to a file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum FileEdit {
+    #[default]
     None,
     ReplaceBytes {
         range: ByteRange,
@@ -200,11 +202,6 @@ pub enum FileEdit {
     Blob(BlobRef),
 }
 
-impl Default for FileEdit {
-    fn default() -> Self {
-        FileEdit::None
-    }
-}
 
 /// A byte range within a file (start offset and length).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

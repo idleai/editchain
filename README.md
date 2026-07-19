@@ -8,6 +8,7 @@ crates/
   editchain-codec/   # postcard binary frames + EC02 page format
   editchain-sync/    # sync state machine (no IO/runtime)
   editchain-node/    # segment files, CLI, JSON export
+  editchain-tui/     # Ratatui terminal UI for DAG visualization (WIP)
 ```
 
 ## Quick start
@@ -44,6 +45,12 @@ cargo run --bin editchain -- tail ./outputs/cc-chain --since 129500
 ```
 
 Each command rebuilds the Tantivy BM25 index from scratch in memory (~2s for 130K ops)
+
+## TUI — DAG visualization (WIP)
+
+```sh
+cargo run -p editchain-tui -- ./outputs/cc-chain
+```
 
 ## Binary size
 

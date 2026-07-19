@@ -118,6 +118,10 @@ impl ContentAddressedBlobSink {
     pub fn len(&self) -> usize {
         self.blobs.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.blobs.is_empty()
+    }
 }
 
 impl BlobSink for ContentAddressedBlobSink {

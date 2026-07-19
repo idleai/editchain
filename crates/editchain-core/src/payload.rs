@@ -23,7 +23,9 @@ pub struct BlobRef {
 
 /// A payload — inline bytes or a blob reference.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum Payload {
+    #[default]
     Empty,
     /// Small inline byte slice.
     Inline(Vec<u8>),
@@ -31,11 +33,6 @@ pub enum Payload {
     Blob(BlobRef),
 }
 
-impl Default for Payload {
-    fn default() -> Self {
-        Payload::Empty
-    }
-}
 
 impl Payload {
     /// Returns true if this payload is empty.

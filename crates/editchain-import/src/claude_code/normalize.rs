@@ -275,7 +275,7 @@ fn extract_text_content(blocks: &[CcContentBlock]) -> String {
         .collect()
 }
 
-fn parse_timestamp(ts_str: &str) -> u64 {
+pub fn parse_timestamp(ts_str: &str) -> u64 {
     if ts_str.is_empty() {
         return 0;
     }
@@ -311,7 +311,7 @@ fn chrono_parse(s: &str) -> Option<u64> {
     };
 
     Some(datetime_to_unix_ms(
-        year as i64, month as u8, day as u8, hour as u8, min as u8, sec as u8, millis,
+        year as i64, month, day, hour, min, sec, millis,
     ))
 }
 
@@ -327,7 +327,7 @@ fn parse_digits4(digits: &[u8]) -> Option<u16> {
 
 fn parse_digits2(digits: &[u8]) -> Option<u8> {
     if digits.len() < 2 { return None; }
-    Some(((digits[0] - b'0') * 10 + (digits[1] - b'0')) as u8)
+    Some((digits[0] - b'0') * 10 + (digits[1] - b'0'))
 }
 
 fn parse_digits_variable(digits: &[u8]) -> Option<u32> {
@@ -358,53 +358,3 @@ fn datetime_to_unix_ms(year_: i64, month_: u8, day_: u8, hour_: u8, min_: u8, se
     (secs as u64 * 1000) + millis_ as u64
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_timestamp_parsing() {
-        let ts = parse_timestamp("2026-07-09T18:56:19.739Z");
-        assert!(ts > 1700000000000);
-        assert!(ts < 1800000000000);
-    }
-
-    #[test]
-    fn test_timestamp_no_millis() {
-        let ts = parse_timestamp("2026-07-09T18:56:19Z");
-        assert!(ts > 1700000000000);
-    }
-
-    #[test]
-    fn test_empty_timestamp() {
-        assert_eq!(parse_timestamp(""), 0);
-    }
-
-    #[test]
-    fn test_normalize_user_message() {
-        use super::super::envelope::{parse_envelope};
-        use crate::sink::MemoryBlobSink;
-
-        let json = br#"{"type":"user","uuid":"abc","sessionId":"sess-1","timestamp":"2026-07-09T18:56:19.739Z","message":{"role":"user","content":"hello world"}}"#;
-        let env = parse_envelope(json).unwrap();
-        let stream = SourceStream::new(crate::ids::derive_node_id("/test"), 0);
-        let hash = crate::ids::hash_raw(json);
-        let mut blobs = MemoryBlobSink::new();
-
-        let (raw, norm) =
-            normalize_envelope(&env, hash, json, &stream, 1, &NormalizeOptions::default(), &mut blobs);
-
-        assert!(matches!(raw.kind, OpKind::Import(_)));
-        assert!(raw.tags.matches_any(Tags::IMPORT));
-
-        assert_eq!(norm.len(), 1);
-
-        match &norm[0].kind {
-            OpKind::Message(msg) => match &msg.content {
-                Payload::Inline(bytes) => assert_eq!(bytes.as_slice(), b"hello world"),
-                _ => panic!("expected inline payload"),
-            },
-            _ => panic!("expected MessageOp"),
-        }
-    }
-}

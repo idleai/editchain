@@ -107,7 +107,7 @@ impl HttpEmbedder {
             if !output.status.success() {
                 let code = output.status.code().unwrap_or(-1);
                 if code == 28 && attempt + 1 < Self::MAX_RETRIES {
-                    last_err = Some(EmbedError::Backend(format!("timeout (exit=28)")));
+                    last_err = Some(EmbedError::Backend("timeout (exit=28)".to_string()));
                     continue;
                 }
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -204,9 +204,9 @@ impl Embedder for HttpEmbedder {
         unordered.sort_by_key(|(i, _)| *i);
         let mut out = Vec::with_capacity(total);
         for (_, result) in unordered {
-            match result {
-                Ok(vecs) => out.push(vecs),
-                Err(e) => return Err(e),
+            {
+                let vecs = result?;
+                out.push(vecs)
             }
         }
         Ok(out)

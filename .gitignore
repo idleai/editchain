@@ -6,7 +6,7 @@ outputs/
 **/*.rs.bk
 
 # Editor / IDE
-.vscode/
+#.vscode/
 .idea/
 *.swp
 *.swo

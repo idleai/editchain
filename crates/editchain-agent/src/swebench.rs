@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ pub struct SwebenchInstance {
 pub async fn run_instance(
     instance: &SwebenchInstance,
     config: &Config,
-    output_dir: &PathBuf,
+    output_dir: &Path,
 ) -> Result<(String, String)> {
     let instance_dir = output_dir.join(&instance.instance_id);
     std::fs::create_dir_all(&instance_dir)?;
@@ -72,7 +72,7 @@ pub async fn run_instance(
 pub async fn run_batch(
     instances: &[SwebenchInstance],
     config: &Config,
-    output_dir: &PathBuf,
+    output_dir: &Path,
     workers: usize,
 ) -> Result<()> {
     use tokio::sync::Semaphore;
@@ -83,7 +83,7 @@ pub async fn run_batch(
     for instance in instances {
         let permit = semaphore.clone().acquire_owned().await?;
         let config = config.clone();
-        let output_dir = output_dir.clone();
+        let output_dir = output_dir.to_path_buf();
         let instance_data = instance.clone();
 
         let handle = tokio::spawn(async move {
@@ -110,7 +110,7 @@ pub async fn run_batch(
     Ok(())
 }
 
-fn update_preds(output_dir: &PathBuf, instance_id: &str, submission: &str) -> Result<()> {
+fn update_preds(output_dir: &Path, instance_id: &str, submission: &str) -> Result<()> {
     let preds_path = output_dir.join("preds.json");
     let mut preds: serde_json::Value = if preds_path.exists() {
         serde_json::from_str(&std::fs::read_to_string(&preds_path)?)?

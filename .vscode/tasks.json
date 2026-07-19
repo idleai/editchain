@@ -1,0 +1,22 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "cargo build (debug): editchain-node/editchain",
+      "type": "process",
+      "command": "cargo",
+      "args": [
+        "build",
+        "-p",
+        "editchain-node",
+        "--bin",
+        "editchain"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "group": "build",
+      "problemMatcher": ["$rustc"]
+    }
+  ]
+}

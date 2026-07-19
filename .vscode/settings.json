@@ -1,0 +1,10 @@
+{
+  // DebugMCP: local-only MCP endpoint used by the local coding agent.
+  "debugmcp.serverPort": 3001,
+  "debugmcp.timeoutInSeconds": 300,
+  "debugmcp.bindHost": ["127.0.0.1", "::1"],
+
+  // vGDB declares C/C++ breakpoint support. This permits Rust source
+  // breakpoints without patching the installed debugger extension.
+  "debug.allowBreakpointsEverywhere": true
+}

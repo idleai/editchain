@@ -1,29 +1,25 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ids::OpId;
-use crate::payload::BlobRef;
 
 /// Parent references for causal ordering.
 ///
 /// Operations reference their causal parents to establish a DAG.
-/// `Many` uses a blob reference for large parent sets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum ParentSet {
     /// No parents (root operation).
+    #[default]
     None,
     /// Single parent.
     One(OpId),
     /// Two parents (e.g. merge of two branches).
     Two(OpId, OpId),
-    /// Many parents stored as an external blob.
-    Many(BlobRef),
+    // /// Many parents stored as an external blob.
+    // /// Commented out — blob resolution layer not yet implemented.
+    // Many(BlobRef),
 }
 
-impl Default for ParentSet {
-    fn default() -> Self {
-        ParentSet::None
-    }
-}
 
 impl ParentSet {
     /// Returns an iterator over all referenced OpIds.
@@ -59,7 +55,6 @@ impl<'a> Iterator for ParentIter<'a> {
                 self.index = 2;
                 Some(b)
             }
-            (ParentSet::Many(_), _) => None, // external blob — not iterated inline
             _ => None,
         }
     }

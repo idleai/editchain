@@ -93,7 +93,7 @@ fn main() {
 
     println!("=== Record Types ===");
     let mut types: Vec<_> = type_counts.into_iter().collect();
-    types.sort_by(|a, b| b.1.cmp(&a.1));
+    types.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
     for (t, c) in &types {
         println!("  {:30}: {}", t, c);
     }
@@ -101,7 +101,7 @@ fn main() {
 
     println!("=== Subtypes ===");
     let mut subtypes: Vec<_> = subtype_counts.into_iter().collect();
-    subtypes.sort_by(|a, b| b.1.cmp(&a.1));
+    subtypes.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
     for (t, c) in &subtypes {
         println!("  {:30}: {}", t, c);
     }

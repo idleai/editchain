@@ -7,7 +7,9 @@ use crate::ids::{ChainId, PathId, SessionId, TurnId};
 /// Operations can be scoped to a chain, session, turn, or file.
 /// `None` means the operation is global or un-scoped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum ScopeRef {
+    #[default]
     None,
     Chain(ChainId),
     Session(SessionId),
@@ -15,11 +17,6 @@ pub enum ScopeRef {
     File(PathId),
 }
 
-impl Default for ScopeRef {
-    fn default() -> Self {
-        ScopeRef::None
-    }
-}
 
 impl ScopeRef {
     /// Returns a u8 discriminant for quick filtering.

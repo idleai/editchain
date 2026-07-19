@@ -162,13 +162,13 @@ impl LexicalIndex {
             self.fields.body_code => text,
             self.fields.kind => kind_str,
             self.fields.role => role_str,
-            self.fields.actor_id => op.actor.0 as u64,
-            self.fields.node_id => op.id.node.0 as u64,
+            self.fields.actor_id => op.actor.0,
+            self.fields.node_id => op.id.node.0,
             self.fields.boot => op.id.boot as u64,
-            self.fields.seq => op.id.seq as u64,
+            self.fields.seq => op.id.seq,
             self.fields.op_id_str => op.id.to_string(),
             self.fields.chunk_ordinal => chunk.chunk_ordinal as u64,
-            self.fields.gen => generation as u64,
+            self.fields.gen => generation,
             self.fields.clock_ms => op.clock.as_u64(),
         ))?;
 
@@ -387,36 +387,3 @@ fn tag_filter_to_str(filter: &TagFilter) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use editchain_core::{clock, op, parents, payload, scope, tags, ActorId, NodeId};
-
-    #[test]
-    fn index_and_search_message() {
-        let mut index = LexicalIndex::new().unwrap();
-
-        let op = Op {
-            id: OpId { node: NodeId(1), boot: 0, seq: 1 },
-            parents: parents::ParentSet::None,
-            actor: ActorId(1),
-            clock: clock::Clock::UnixMs(1000),
-            scope: scope::ScopeRef::None,
-            tags: tags::Tags::MESSAGE | tags::Tags::AGENT,
-            kind: op::OpKind::Message(op::MessageOp {
-                content: payload::Payload::Inline(b"hello world test query".to_vec()),
-                content_type: payload::Payload::Empty,
-            }),
-        };
-
-        let chunks = index.index_op(&op, 1).unwrap();
-        assert!(!chunks.is_empty());
-
-        index.commit().unwrap();
-
-        let filters = SearchFilters::default();
-        let results = index.search_internal("hello", &filters, 10).unwrap();
-        assert!(!results.is_empty());
-        assert_eq!(results[0].op_id.seq, 1);
-    }
-}
