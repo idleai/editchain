@@ -13,6 +13,7 @@ pub struct EvidenceSnippet {
     pub score: f64,
     /// Byte range within the original operation.
     pub byte_start: u32,
+    /// End byte offset within the original operation.
     pub byte_end: u32,
 }
 
@@ -32,6 +33,11 @@ pub struct SummaryResult {
 /// Build an extractive summary from search results.
 ///
 /// Selects top distinct evidence snippets up to the token budget.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "total_bytes accumulation is bounded by budget_bytes; no overflow in practice"
+)]
+#[must_use]
 pub fn build_extractive_summary(
     request: &SummarizeRequest,
     results: Vec<ScoredChunk>,
@@ -48,7 +54,11 @@ pub fn build_extractive_summary(
         .collect();
 
     // Sort by score descending.
-    snippets.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    snippets.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Select snippets up to token budget (rough estimate: 4 bytes per token).
     let budget_bytes = request.budget_tokens.saturating_mul(4);
@@ -74,6 +84,11 @@ pub fn build_extractive_summary(
 }
 
 /// Build a timeline summary — causal/time-ordered excerpts.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "total_bytes accumulation is bounded by budget_bytes; no overflow in practice"
+)]
+#[must_use]
 pub fn build_timeline_summary(
     request: &SummarizeRequest,
     results: Vec<ScoredChunk>,
@@ -113,4 +128,3 @@ pub fn build_timeline_summary(
         total_tokens: total_bytes / 4,
     }
 }
-

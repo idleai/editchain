@@ -1,4 +1,10 @@
 use editchain_core::{Op, OpId};
+// Crate-level dependency markers (used by Cargo for feature resolution).
+use editchain_embed as _;
+use editchain_query as _;
+use half as _;
+use roaring as _;
+use tantivy as _;
 
 /// A generation counter for tracking projection freshness.
 pub type Generation = u64;
@@ -6,23 +12,33 @@ pub type Generation = u64;
 /// A chunk record — a deterministic text segment extracted from an operation.
 #[derive(Debug, Clone)]
 pub struct ChunkRecord {
+    /// Unique identifier for this chunk.
     pub chunk_id: ChunkId,
+    /// The operation this chunk was extracted from.
     pub op_id: OpId,
+    /// Ordinal position of this chunk within the operation's text.
     pub chunk_ordinal: u32,
+    /// Byte offset of the start of this chunk in the original text.
     pub byte_start: u32,
+    /// Byte offset of the end of this chunk in the original text.
     pub byte_end: u32,
+    /// Generation counter for tracking projection freshness.
     pub generation: Generation,
 }
 
 /// A chunk identifier — unique within a chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChunkId {
+    /// The operation this chunk belongs to.
     pub op_id: OpId,
+    /// Ordinal position of this chunk within the operation.
     pub chunk_ordinal: u32,
 }
 
 impl ChunkId {
-    pub fn new(op_id: OpId, chunk_ordinal: u32) -> Self {
+    /// Create a new chunk identifier.
+    #[must_use]
+    pub const fn new(op_id: OpId, chunk_ordinal: u32) -> Self {
         Self {
             op_id,
             chunk_ordinal,
@@ -36,14 +52,20 @@ impl core::fmt::Display for ChunkId {
     }
 }
 
-/// Default chunking parameters.
+/// Default chunking window size in tokens (768).
 pub const DEFAULT_CHUNK_WINDOW_TOKENS: u32 = 768;
+/// Default chunk overlap in tokens (96).
 pub const DEFAULT_CHUNK_OVERLAP_TOKENS: u32 = 96;
 
 /// Extract searchable text from an operation based on its kind.
 ///
 /// Returns `None` for operations that should not be indexed (e.g. private
 /// content when disabled, or raw import ops when raw search is off).
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "Two booleans control indexing behavior; grouped into a config struct would add ceremony"
+)]
+#[must_use]
 pub fn extract_op_text(op: &Op, include_raw: bool, include_private: bool) -> Option<String> {
     use editchain_core::op::OpKind;
 
@@ -56,19 +78,25 @@ pub fn extract_op_text(op: &Op, include_raw: bool, include_private: bool) -> Opt
             editchain_core::payload::Payload::Inline(bytes) => {
                 Some(String::from_utf8_lossy(bytes).to_string())
             }
-            _ => None,
+            editchain_core::payload::Payload::Empty | editchain_core::payload::Payload::Blob(_) => {
+                None
+            }
         },
         OpKind::Tool(tool) => match &tool.content {
             editchain_core::payload::Payload::Inline(bytes) => {
                 Some(String::from_utf8_lossy(bytes).to_string())
             }
-            _ => None,
+            editchain_core::payload::Payload::Empty | editchain_core::payload::Payload::Blob(_) => {
+                None
+            }
         },
         OpKind::Command(cmd) => match &cmd.content {
             editchain_core::payload::Payload::Inline(bytes) => {
                 Some(String::from_utf8_lossy(bytes).to_string())
             }
-            _ => None,
+            editchain_core::payload::Payload::Empty | editchain_core::payload::Payload::Blob(_) => {
+                None
+            }
         },
         OpKind::File(file) => {
             // File ops carry path info but not always text content.
@@ -83,7 +111,12 @@ pub fn extract_op_text(op: &Op, include_raw: bool, include_private: bool) -> Opt
             // Raw import records indexed only when explicitly requested.
             None // Placeholder — raw_ref payload may be blob.
         }
-        _ => None,
+        OpKind::ChainStart(_)
+        | OpKind::Actor(_)
+        | OpKind::Import(_)
+        | OpKind::Note(_)
+        | OpKind::Error(_)
+        | OpKind::Unknown(_) => None,
     }
 }
 
@@ -91,6 +124,13 @@ pub fn extract_op_text(op: &Op, include_raw: bool, include_private: bool) -> Opt
 ///
 /// Uses a simple token estimate (4 bytes per token) for deterministic
 /// chunking without an external tokenizer dependency.
+#[expect(
+    clippy::as_conversions,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    reason = "Token counts are small (<4096); usize/u32 conversions are safe; arithmetic on byte offsets is bounded by text length"
+)]
+#[must_use]
 pub fn chunk_text(
     text: &str,
     op_id: OpId,
@@ -147,4 +187,3 @@ pub fn chunk_text(
 
     chunks
 }
-

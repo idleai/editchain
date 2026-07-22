@@ -1,3 +1,13 @@
+//! Cursor tests for incremental file reading.
+
+use blake3 as _;
+use editchain_core as _;
+use proptest as _;
+use serde as _;
+use serde_json as _;
+use sha2 as _;
+use tempfile as _;
+
 use editchain_import::cursor::split_lines;
 
 #[test]

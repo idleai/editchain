@@ -1,3 +1,27 @@
+<!-- BEGIN QUALITY POLICY -->
+## Lint policy
+
+Before declaring a code task complete, run `./scripts/lint.sh` and report
+its exact result.
+
+Unless a task explicitly authorizes policy work, the agent must not:
+
+- weaken, remove, or reclassify a lint;
+- change complexity, coverage, duplication, or mutation thresholds;
+- rewrite a quality baseline;
+- skip or conditionally bypass a CI quality job;
+- add a coverage, complexity, mutation, or dependency exclusion;
+- add `#[allow(...)]` or crate-wide `#![allow(...)]`;
+- mark a failing test ignored;
+- delete a test solely to pass a gate.
+
+Necessary suppressions must use narrowly scoped `#[expect(..., reason = "...")]`
+and must be called out in the final report.
+
+New code must meet absolute limits, and modified code may not worsen tracked metrics.
+
+<!-- END QUALITY POLICY -->
+
 <!-- BEGIN DEBUGMCP INTERACTIVE DEBUGGING -->
 ## Interactive debugging with DebugMCP
 

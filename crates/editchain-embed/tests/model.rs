@@ -1,3 +1,8 @@
+#![doc = "Embedding manifest identity tests."]
+
+use serde as _;
+use serde_json as _;
+
 use editchain_embed::EmbeddingManifest;
 
 #[test]

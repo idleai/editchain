@@ -1,4 +1,14 @@
+//! Reader tests for session file streaming.
+
+use blake3 as _;
+use editchain_core as _;
+use proptest as _;
+use serde as _;
+use serde_json as _;
+use sha2 as _;
+
 use editchain_import::claude_code::reader::read_session_file;
+use std::io::Write;
 
 #[test]
 fn read_empty_file() {
@@ -50,7 +60,6 @@ fn read_appended_file() {
         .append(true)
         .open(&path)
         .unwrap();
-    use std::io::Write;
     writeln!(f, "line2").unwrap();
     drop(f);
 

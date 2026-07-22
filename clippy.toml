@@ -1,0 +1,5 @@
+too-many-arguments-threshold = 5
+type-complexity-threshold = 200
+max-fn-params-bools = 1
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

@@ -1,3 +1,13 @@
+//! ID derivation tests.
+
+use blake3 as _;
+use editchain_core as _;
+use proptest as _;
+use serde as _;
+use serde_json as _;
+use sha2 as _;
+use tempfile as _;
+
 use editchain_import::ids::{derive_node_id, derive_session_id, hash_raw};
 
 #[test]

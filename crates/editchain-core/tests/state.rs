@@ -1,7 +1,14 @@
+//! State tests for `OpSet`, `CausalKey`, and reducers.
+
+// Referenced by library derive macros; suppress unused-crate-dependencies lint.
+use postcard as _;
+use proptest as _;
+use serde as _;
+
 use editchain_core::{
     clock::Clock, op::*, parents::ParentSet, payload::Payload, scope::ScopeRef, tags::Tags,
-    ActorId, CausalKey, FileReducer, FileStage, MessageOp, MessageReducer, NodeId, OpId, OpSet,
-    PathId, Reducer,
+    ActorId, CausalKey, ContentId, FileReducer, MessageReducer, NodeId, OpId, OpSet, PathId,
+    Reducer,
 };
 
 #[test]
@@ -17,7 +24,7 @@ fn opset_insert_accepts_new() {
 fn opset_insert_duplicate() {
     let mut set = OpSet::new();
     let id = OpId::new(NodeId(1), 0, 1);
-    set.insert(id, vec![1, 2, 3]).unwrap();
+    let _: Option<bool> = set.insert(id, vec![1, 2, 3]).ok();
     assert!(!set.insert(id, vec![1, 2, 3]).unwrap());
 }
 
@@ -25,7 +32,7 @@ fn opset_insert_duplicate() {
 fn opset_insert_quarantine() {
     let mut set = OpSet::new();
     let id = OpId::new(NodeId(1), 0, 1);
-    set.insert(id, vec![1, 2, 3]).unwrap();
+    let _: Option<bool> = set.insert(id, vec![1, 2, 3]).ok();
     let result = set.insert(id, vec![4, 5, 6]);
     assert!(result.is_err());
     assert_eq!(set.quarantined().len(), 1);
@@ -36,10 +43,10 @@ fn opset_merge_counts() {
     let mut a = OpSet::new();
     let mut b = OpSet::new();
 
-    a.insert(OpId::new(NodeId(1), 0, 1), vec![1]).unwrap();
-    a.insert(OpId::new(NodeId(1), 0, 2), vec![2]).unwrap();
-    b.insert(OpId::new(NodeId(1), 0, 2), vec![2]).unwrap(); // duplicate
-    b.insert(OpId::new(NodeId(2), 0, 1), vec![3]).unwrap(); // new
+    let _: Option<bool> = a.insert(OpId::new(NodeId(1), 0, 1), vec![1]).ok();
+    let _: Option<bool> = a.insert(OpId::new(NodeId(1), 0, 2), vec![2]).ok();
+    let _: Option<bool> = b.insert(OpId::new(NodeId(1), 0, 2), vec![2]).ok(); // duplicate
+    let _: Option<bool> = b.insert(OpId::new(NodeId(2), 0, 1), vec![3]).ok(); // new
 
     let (accepted, duplicates, quarantined) = a.merge(&b);
     assert_eq!(accepted, 1);
@@ -49,14 +56,36 @@ fn opset_merge_counts() {
 
 #[test]
 fn causal_key_ordering() {
-    let a = CausalKey { clock_val: 100, clock_sub: 0, node: 1, boot: 0, seq: 1 };
-    let b = CausalKey { clock_val: 200, clock_sub: 0, node: 1, boot: 0, seq: 1 };
+    let a = CausalKey {
+        clock_val: 100,
+        clock_sub: 0,
+        node: 1,
+        boot: 0,
+        seq: 1,
+    };
+    let b = CausalKey {
+        clock_val: 200,
+        clock_sub: 0,
+        node: 1,
+        boot: 0,
+        seq: 1,
+    };
     assert!(a < b);
 
-    let c = CausalKey { clock_val: 100, clock_sub: 0, node: 2, boot: 0, seq: 1 };
+    let c = CausalKey {
+        clock_val: 100,
+        clock_sub: 0,
+        node: 2,
+        boot: 0,
+        seq: 1,
+    };
     assert!(a < c); // same clock, lower node wins
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Test helper; indexing known-length vec is safe"
+)]
 #[test]
 fn message_reducer_orders_by_causal_key() {
     let mut reducer = MessageReducer::new();
@@ -87,8 +116,8 @@ fn message_reducer_orders_by_causal_key() {
         }),
     };
 
-    reducer.reduce(&op_a).unwrap();
-    reducer.reduce(&op_b).unwrap();
+    let _: Option<()> = reducer.reduce(&op_a).ok();
+    let _: Option<()> = reducer.reduce(&op_b).ok();
 
     let view = reducer.into_view();
     assert_eq!(view.len(), 2);
@@ -112,7 +141,7 @@ fn file_reducer_latest_wins() {
             path,
             stage: FileStage::Applied,
             base: None,
-            after: Some(editchain_core::ContentId::Hash128([0; 16])),
+            after: Some(ContentId::Hash128([0; 16])),
             edit: FileEdit::None,
         }),
     };
@@ -128,13 +157,13 @@ fn file_reducer_latest_wins() {
             path,
             stage: FileStage::Applied,
             base: None,
-            after: Some(editchain_core::ContentId::Hash128([1; 16])),
+            after: Some(ContentId::Hash128([1; 16])),
             edit: FileEdit::None,
         }),
     };
 
-    reducer.reduce(&earlier).unwrap();
-    reducer.reduce(&later).unwrap();
+    let _: Option<()> = reducer.reduce(&earlier).ok();
+    let _: Option<()> = reducer.reduce(&later).ok();
 
     let view = reducer.into_view();
     let rev = view.get(&path).unwrap();

@@ -17,9 +17,13 @@ pub struct SessionFile {
 
 /// Discover all Claude Code session files in a directory.
 ///
-/// Scans for `*.jsonl` files (excluding `agent-*.jsonl` subagent files
+/// Scans for `.jsonl` files (excluding `agent-.jsonl` subagent files
 /// which are discovered separately), and also discovers subagent files
 /// within `subagents/` subdirectories.
+///
+/// # Errors
+///
+/// Returns a descriptive error string if the directory cannot be read.
 pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<SessionFile>, String> {
     let mut sessions = Vec::new();
 
@@ -28,15 +32,15 @@ pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<SessionFile>, String
         .map_err(|e| format!("reading {}: {}", sessions_dir.display(), e))?;
 
     for entry in entries {
-        let entry = entry.map_err(|e| format!("entry: {}", e))?;
+        let entry = entry.map_err(|e| format!("entry: {e}"))?;
         let name = entry.file_name().to_string_lossy().to_string();
 
-        if !name.ends_with(".jsonl") || name.starts_with("agent-") {
+        if !name.to_lowercase().ends_with(".jsonl") || name.starts_with("agent-") {
             continue;
         }
 
         let path = entry.path();
-        let metadata = std::fs::metadata(&path).map_err(|e| format!("metadata: {}", e))?;
+        let metadata = std::fs::metadata(&path).map_err(|e| format!("metadata: {e}"))?;
         let session_id = name.trim_end_matches(".jsonl").to_string();
 
         sessions.push(SessionFile {
@@ -48,7 +52,7 @@ pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<SessionFile>, String
         });
 
         // Discover subagents for this session.
-        let subagents = discover_subagents(&path, &session_id)?;
+        let subagents = discover_subagents(&path, &session_id);
         sessions.extend(subagents);
     }
 
@@ -62,10 +66,7 @@ pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<SessionFile>, String
 ///
 /// Claude Code stores subagent transcripts in `subagents/agent-*.jsonl`
 /// relative to the main session file.
-fn discover_subagents(
-    session_path: &Path,
-    parent_session_id: &str,
-) -> Result<Vec<SessionFile>, String> {
+fn discover_subagents(session_path: &Path, parent_session_id: &str) -> Vec<SessionFile> {
     let mut subagents = Vec::new();
 
     // Subagents are stored in a `subagents/` directory next to the session file.
@@ -73,29 +74,26 @@ fn discover_subagents(
     let subagents_dir = parent_dir.join("subagents");
 
     if !subagents_dir.exists() {
-        return Ok(subagents);
+        return subagents;
     }
 
-    let entries = match std::fs::read_dir(&subagents_dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(subagents),
+    let Ok(entries) = std::fs::read_dir(&subagents_dir) else {
+        return subagents;
     };
 
     for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
+        let Ok(entry) = entry else {
+            continue;
         };
         let name = entry.file_name().to_string_lossy().to_string();
 
-        if !name.ends_with(".jsonl") {
+        if !name.to_lowercase().ends_with(".jsonl") {
             continue;
         }
 
         let path = entry.path();
-        let metadata = match std::fs::metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            continue;
         };
 
         // agent-<uuid>.jsonl — strip prefix for session ID.
@@ -114,6 +112,5 @@ fn discover_subagents(
         });
     }
 
-    Ok(subagents)
+    subagents
 }
-

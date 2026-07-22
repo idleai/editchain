@@ -1,8 +1,9 @@
+#[cfg(not(feature = "use-std"))]
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 use crate::clock::Clock;
-use crate::ids::*;
+use crate::ids::{ActorId, NodeId, OpId, PathId};
 use crate::parents::ParentSet;
 use crate::payload::{BlobRef, ContentId, Payload};
 use crate::scope::ScopeRef;
@@ -19,19 +20,30 @@ use crate::tags::Tags;
 /// holds the domain-specific payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Op {
+    /// Globally unique operation identifier.
     pub id: OpId,
+    /// Causal parent references for DAG ordering.
     pub parents: ParentSet,
+    /// Actor that created this operation.
     pub actor: ActorId,
+    /// Clock value for causal ordering.
     pub clock: Clock,
+    /// Scoping reference (chain, session, turn, or file).
     pub scope: ScopeRef,
+    /// Bitflag tags for filtering.
     pub tags: Tags,
+    /// Domain-specific operation payload.
     pub kind: OpKind,
 }
 
 impl Op {
     /// Create a new operation with the given fields.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Op struct has 7 fields; constructor takes all of them"
+    )]
+    #[must_use]
+    pub const fn new(
         id: OpId,
         parents: ParentSet,
         actor: ActorId,
@@ -59,16 +71,27 @@ impl Op {
 /// All supported operation kinds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpKind {
+    /// Chain initialization operation.
     ChainStart(ChainStart),
+    /// Actor registration or metadata update.
     Actor(ActorOp),
+    /// A message in the conversation.
     Message(MessageOp),
+    /// A tool call lifecycle operation.
     Tool(ToolOp),
+    /// A shell command lifecycle operation.
     Command(CommandOp),
+    /// A file revision fact.
     File(FileOp),
+    /// Agent context reflection.
     Reflection(ReflectionOp),
+    /// Imported external record.
     Import(ImportOp),
+    /// Relationship note between operations.
     Note(NoteOp),
+    /// Diagnostic error fact.
     Error(ErrorOp),
+    /// Opaque preserved fact (unrecognized kind).
     Unknown(UnknownOp),
 }
 
@@ -131,8 +154,11 @@ pub struct ToolOp {
 /// Lifecycle stage of a tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolStage {
+    /// Tool call initiated.
     Start,
+    /// Streaming delta output.
     Delta,
+    /// Tool call completed.
     Finish,
 }
 
@@ -154,8 +180,11 @@ pub struct CommandOp {
 /// Lifecycle stage of a command execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandStage {
+    /// Command execution started.
     Start,
+    /// Streaming output from command.
     Output,
+    /// Command execution finished.
     Finish,
 }
 
@@ -181,32 +210,43 @@ pub struct FileOp {
 /// Stage of a file in its lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileStage {
+    /// File was observed (read or stat'd).
     Observed,
+    /// File edit was proposed but not yet applied.
     Proposed,
+    /// File edit was applied to the working copy.
     Applied,
+    /// File was saved/persisted.
     Saved,
+    /// File was deleted.
     Deleted,
 }
 
 /// The edit applied to a file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum FileEdit {
+    /// No edit (observation only).
     #[default]
     None,
+    /// Replace a byte range with new content.
     ReplaceBytes {
+        /// Byte range to replace.
         range: ByteRange,
+        /// Replacement bytes.
         bytes: Payload,
     },
+    /// Unified diff patch payload.
     UnifiedDiff(Payload),
+    /// Reference to an external blob containing the full content.
     Blob(BlobRef),
 }
-
 
 /// A byte range within a file (start offset and length).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ByteRange {
+    /// Start offset in bytes.
     pub start: u64,
+    /// End offset in bytes (exclusive).
     pub end: u64,
 }
 
@@ -225,7 +265,7 @@ pub struct ReflectionOp {
     pub window: WindowRef,
     /// Summary text/content.
     pub summary: Payload,
-    /// Anchored references (OpIds, PathIds, symbols, tasks).
+    /// Anchored references (`OpId`s, `PathId`s, symbols, tasks).
     pub anchors: Payload,
 }
 
@@ -234,7 +274,9 @@ pub struct ReflectionOp {
 pub struct FrontierSet(pub Vec<Frontier>);
 
 impl FrontierSet {
-    pub fn new() -> Self {
+    /// Create an empty frontier set.
+    #[must_use]
+    pub const fn new() -> Self {
         Self(Vec::new())
     }
 }
@@ -248,15 +290,20 @@ impl Default for FrontierSet {
 /// A frontier — the highest known sequence from a given node+boot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Frontier {
+    /// Node identifier.
     pub node: NodeId,
+    /// Boot counter of the node.
     pub boot: u32,
+    /// Maximum sequence number seen from this node+boot.
     pub max_seq: u64,
 }
 
 /// Window reference for sliding-window context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowRef {
+    /// Start sequence number (inclusive).
     pub start_seq: u64,
+    /// End sequence number (exclusive).
     pub end_seq: u64,
 }
 
@@ -291,10 +338,15 @@ pub struct NoteOp {
 /// Relationship kinds for notes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NoteRelationship {
+    /// This note corrects an error in the target operation(s).
     Corrects,
+    /// This note supersedes the target operation(s).
     Supersedes,
+    /// This note rejects the target operation(s).
     Rejects,
+    /// This note redacts information from the target operation(s).
     Redacts,
+    /// This note provides additional explanation for the target operation(s).
     Explains,
 }
 

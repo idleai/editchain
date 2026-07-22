@@ -3,18 +3,27 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use editchain_codec::page::decode_page;
 use editchain_codec::frame::decode_op;
-use editchain_core::*;
+use editchain_codec::page::decode_page;
+use editchain_core::{CommandStage, Op, OpId, OpKind, Payload, ScopeRef, ToolStage};
 
 use crate::data::header::{OpHeader, OpOrdinal};
 use crate::data::snapshot::{ChainStatistics, TuiSnapshot};
 
-/// Load a chain from disk into a TuiSnapshot.
+/// Load a chain from disk into a `TuiSnapshot`.
 ///
 /// Reads all `.eclog` segment files in the given directory,
 /// decodes each record into an Op, and builds compact headers + indexes.
-pub fn load_chain(path: &Path) -> io::Result<TuiSnapshot> {
+#[expect(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing,
+    clippy::manual_let_else,
+    clippy::print_stderr,
+    reason = "TUI chain loader; arithmetic bounded by file sizes; let-else is clearer for early continue"
+)]
+pub(crate) fn load_chain(path: &Path) -> io::Result<TuiSnapshot> {
     if !path.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -103,7 +112,7 @@ pub fn load_chain(path: &Path) -> io::Result<TuiSnapshot> {
                             };
 
                             headers.push(header);
-                            by_id.insert(op.id, ordinal);
+                            let _: Option<OpOrdinal> = by_id.insert(op.id, ordinal);
                             parents.push(parent_ords.clone());
                             children.push(Vec::new());
 
@@ -119,7 +128,7 @@ pub fn load_chain(path: &Path) -> io::Result<TuiSnapshot> {
                         }
                         Err(e) => {
                             // Corrupt record — skip with warning (future: diagnostics popup)
-                            eprintln!("Warning: failed to decode record at offset {}: {}", offset, e);
+                            eprintln!("Warning: failed to decode record at offset {offset}: {e}");
                         }
                     }
                 }
@@ -138,7 +147,7 @@ pub fn load_chain(path: &Path) -> io::Result<TuiSnapshot> {
         by_kind: HashMap::new(),
     };
     for (&kind, ordinals) in &by_kind {
-        statistics.by_kind.insert(kind, ordinals.len());
+        let _: Option<usize> = statistics.by_kind.insert(kind, ordinals.len());
     }
 
     Ok(TuiSnapshot {
@@ -153,15 +162,20 @@ pub fn load_chain(path: &Path) -> io::Result<TuiSnapshot> {
 }
 
 /// Compute the encoded length of a page from its bytes.
+#[expect(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::indexing_slicing,
+    reason = "Binary page parsing; offsets are bounded by buffer length checks"
+)]
 fn encoded_page_len(bytes: &[u8]) -> usize {
     if bytes.len() < 8 {
         return bytes.len();
     }
     let mut offset = 8;
     while offset + 4 <= bytes.len() {
-        let len = u32::from_le_bytes(
-            bytes[offset..offset + 4].try_into().unwrap_or([0; 4]),
-        ) as usize;
+        let len =
+            u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap_or([0; 4])) as usize;
         offset += 4;
         if offset + 1 + len > bytes.len() {
             break;
@@ -171,8 +185,8 @@ fn encoded_page_len(bytes: &[u8]) -> usize {
     offset
 }
 
-/// Map an OpKind to a numeric code.
-fn op_kind_code(kind: &OpKind) -> u8 {
+/// Map an `OpKind` to a numeric code.
+const fn op_kind_code(kind: &OpKind) -> u8 {
     match kind {
         OpKind::ChainStart(_) => 0,
         OpKind::Actor(_) => 1,
@@ -188,8 +202,8 @@ fn op_kind_code(kind: &OpKind) -> u8 {
     }
 }
 
-/// Extract stage code from an OpKind.
-fn op_stage_code(kind: &OpKind) -> Option<u8> {
+/// Extract stage code from an `OpKind`.
+const fn op_stage_code(kind: &OpKind) -> Option<u8> {
     match kind {
         OpKind::Tool(t) => Some(match t.stage {
             ToolStage::Start => 0,
@@ -201,65 +215,59 @@ fn op_stage_code(kind: &OpKind) -> Option<u8> {
             CommandStage::Output => 1,
             CommandStage::Finish => 2,
         }),
-        _ => None,
+        OpKind::ChainStart(_)
+        | OpKind::Actor(_)
+        | OpKind::Message(_)
+        | OpKind::File(_)
+        | OpKind::Reflection(_)
+        | OpKind::Import(_)
+        | OpKind::Note(_)
+        | OpKind::Error(_)
+        | OpKind::Unknown(_) => None,
     }
 }
 
 /// Extract a short preview string from an operation.
+#[expect(
+    clippy::string_slice,
+    reason = "Preview truncation at byte boundary is acceptable for display"
+)]
 fn extract_preview(op: &Op) -> Option<Box<str>> {
     let text = match &op.kind {
-        OpKind::Message(m) => {
-            match &m.content {
-                Payload::Inline(b) => Some(bytes_to_preview(b)),
-                _ => None,
-            }
-        }
-        OpKind::Tool(t) => {
-            match &t.tool_name {
-                Payload::Inline(b) => Some(bytes_to_preview(b)),
-                _ => None,
-            }
-        }
-        OpKind::Command(c) => {
-            match &c.content {
-                Payload::Inline(b) => Some(bytes_to_preview(b)),
-                _ => None,
-            }
-        }
+        OpKind::Message(m) => match &m.content {
+            Payload::Inline(b) => Some(bytes_to_preview(b)),
+            Payload::Empty | Payload::Blob(_) => None,
+        },
+        OpKind::Tool(t) => match &t.tool_name {
+            Payload::Inline(b) => Some(bytes_to_preview(b)),
+            Payload::Empty | Payload::Blob(_) => None,
+        },
+        OpKind::Command(c) => match &c.content {
+            Payload::Inline(b) => Some(bytes_to_preview(b)),
+            Payload::Empty | Payload::Blob(_) => None,
+        },
         OpKind::File(f) => Some(format!("{}", f.path.0).into_boxed_str()),
-        OpKind::Reflection(r) => {
-            match &r.summary {
-                Payload::Inline(b) => Some(bytes_to_preview(b)),
-                _ => None,
-            }
-        }
-        OpKind::Note(n) => {
-            match &n.content {
-                Payload::Inline(b) => Some(bytes_to_preview(b)),
-                _ => None,
-            }
-        }
-        OpKind::Error(e) => {
-            match &e.message {
-                Payload::Inline(b) => Some(bytes_to_preview(b)),
-                _ => None,
-            }
-        }
-        OpKind::ChainStart(cs) => {
-            Some(bytes_to_preview(&cs.name))
-        }
-        OpKind::Actor(a) => {
-            match &a.label {
-                Payload::Inline(b) => Some(bytes_to_preview(b)),
-                _ => None,
-            }
-        }
-        OpKind::Import(i) => {
-            match &i.raw_ref {
-                Payload::Inline(b) => Some(bytes_to_preview(b)),
-                _ => None,
-            }
-        }
+        OpKind::Reflection(r) => match &r.summary {
+            Payload::Inline(b) => Some(bytes_to_preview(b)),
+            Payload::Empty | Payload::Blob(_) => None,
+        },
+        OpKind::Note(n) => match &n.content {
+            Payload::Inline(b) => Some(bytes_to_preview(b)),
+            Payload::Empty | Payload::Blob(_) => None,
+        },
+        OpKind::Error(e) => match &e.message {
+            Payload::Inline(b) => Some(bytes_to_preview(b)),
+            Payload::Empty | Payload::Blob(_) => None,
+        },
+        OpKind::ChainStart(cs) => Some(bytes_to_preview(&cs.name)),
+        OpKind::Actor(a) => match &a.label {
+            Payload::Inline(b) => Some(bytes_to_preview(b)),
+            Payload::Empty | Payload::Blob(_) => None,
+        },
+        OpKind::Import(i) => match &i.raw_ref {
+            Payload::Inline(b) => Some(bytes_to_preview(b)),
+            Payload::Empty | Payload::Blob(_) => None,
+        },
         OpKind::Unknown(u) => {
             Some(format!("unknown kind={}", u.kind_discriminant).into_boxed_str())
         }

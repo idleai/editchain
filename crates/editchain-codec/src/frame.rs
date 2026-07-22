@@ -1,14 +1,28 @@
+// Suppress unused_crate_dependencies warnings for crates consumed by other modules
+// or by derive macros.
+#[cfg(test)]
+use proptest as _;
+#[cfg_attr(not(feature = "use-std"), allow(unused_extern_crates))]
+use serde as _;
+
 use editchain_core::Op;
-use postcard;
 
 use crate::page::PAGE_MAGIC;
 
 /// Encode an operation into a binary frame using postcard.
+///
+/// # Errors
+///
+/// Returns `postcard::Error` if serialization fails.
 pub fn encode_op(op: &Op) -> Result<Vec<u8>, postcard::Error> {
     postcard::to_stdvec(op)
 }
 
 /// Decode an operation from a binary frame.
+///
+/// # Errors
+///
+/// Returns `postcard::Error` if deserialization fails.
 pub fn decode_op(bytes: &[u8]) -> Result<Op, postcard::Error> {
     postcard::from_bytes(bytes)
 }
@@ -41,19 +55,28 @@ pub const EC03_FORMAT_VERSION: u16 = 1;
 /// ```
 #[derive(Debug, Clone)]
 pub struct Ec03Frame {
+    /// Format version number (currently 1).
     pub format_version: u16,
+    /// Header length in bytes (after the `header_len` field itself).
     pub header_len: u16,
+    /// Total frame length in bytes (including magic).
     pub frame_len: u32,
+    /// Number of records in this frame.
     pub record_count: u32,
+    /// Monotonically increasing page sequence number.
     pub page_sequence: u64,
+    /// Commit generation for ordering.
     pub commit_generation: u64,
+    /// Bit-flag field for frame-level metadata.
     pub flags: u32,
+    /// Encoded record payloads.
     pub records: Vec<Vec<u8>>,
 }
 
 impl Ec03Frame {
     /// Create a new EC03 frame.
-    pub fn new(page_sequence: u64, commit_generation: u64) -> Self {
+    #[must_use]
+    pub const fn new(page_sequence: u64, commit_generation: u64) -> Self {
         Self {
             format_version: EC03_FORMAT_VERSION,
             header_len: 0, // computed on encode
@@ -67,6 +90,11 @@ impl Ec03Frame {
     }
 
     /// Add a record to this frame.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::as_conversions,
+        reason = "Record count fits in u32; chain pages are <4 GiB"
+    )]
     pub fn add_record(&mut self, data: Vec<u8>) {
         self.records.push(data);
         self.record_count = self.records.len() as u32;
@@ -74,6 +102,14 @@ impl Ec03Frame {
 }
 
 /// Encode an EC03 frame into bytes.
+#[must_use]
+#[expect(
+    clippy::as_conversions,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing,
+    reason = "Frame encoding uses known-safe offsets; all casts fit in bounds"
+)]
 pub fn encode_ec03(frame: &Ec03Frame) -> Vec<u8> {
     let mut buf = Vec::new();
 
@@ -144,6 +180,13 @@ pub fn encode_ec03(frame: &Ec03Frame) -> Vec<u8> {
 /// Decode an EC03 frame from bytes.
 ///
 /// Returns `None` if the frame is incomplete or corrupt.
+#[must_use]
+#[expect(
+    clippy::as_conversions,
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    reason = "Frame decoding uses bounded offsets; all bounds checked before access"
+)]
 pub fn decode_ec03(bytes: &[u8]) -> Option<Ec03Frame> {
     if bytes.len() < 34 {
         // Minimum frame: magic(4) + version(2) + hdr_len(2) + frame_len(4)
@@ -157,7 +200,7 @@ pub fn decode_ec03(bytes: &[u8]) -> Option<Ec03Frame> {
     }
 
     let format_version = u16::from_le_bytes(bytes[4..6].try_into().ok()?);
-    let _header_len = u16::from_le_bytes(bytes[6..8].try_into().ok()?);
+    let header_len_val = u16::from_le_bytes(bytes[6..8].try_into().ok()?);
     let frame_len = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
 
     // Verify total frame length matches available bytes.
@@ -169,11 +212,11 @@ pub fn decode_ec03(bytes: &[u8]) -> Option<Ec03Frame> {
     let page_sequence = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
     let commit_generation = u64::from_le_bytes(bytes[24..32].try_into().ok()?);
     let flags = u32::from_le_bytes(bytes[32..36].try_into().ok()?);
-    let _header_crc_stored = u32::from_le_bytes(bytes[36..40].try_into().ok()?);
+    let header_crc_stored = u32::from_le_bytes(bytes[36..40].try_into().ok()?);
 
     // Verify header CRC32C.
     let header_crc_computed = crc32c(&bytes[..36]);
-    if header_crc_computed != _header_crc_stored {
+    if header_crc_computed != header_crc_stored {
         return None; // header corruption
     }
 
@@ -212,7 +255,7 @@ pub fn decode_ec03(bytes: &[u8]) -> Option<Ec03Frame> {
 
     Some(Ec03Frame {
         format_version,
-        header_len: _header_len,
+        header_len: header_len_val,
         frame_len,
         record_count,
         page_sequence,
@@ -223,7 +266,7 @@ pub fn decode_ec03(bytes: &[u8]) -> Option<Ec03Frame> {
 }
 
 /// Compute CRC32C (Castagnoli) over bytes.
-fn crc32c(data: &[u8]) -> u32 {
+const fn crc32c(data: &[u8]) -> u32 {
     crc::Crc::<u32>::new(&crc::CRC_32_ISCSI).checksum(data)
 }
 
@@ -234,11 +277,18 @@ fn crc32c(data: &[u8]) -> u32 {
 /// Detect the frame format from magic bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameFormat {
+    /// Legacy EC02 page format.
     Ec02,
+    /// Current EC03 framed format.
     Ec03,
 }
 
 /// Detect the format of a frame from its magic bytes.
+#[must_use]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "bytes.len() >= 4 checked before slicing"
+)]
 pub fn detect_format(bytes: &[u8]) -> Option<FrameFormat> {
     if bytes.len() < 4 {
         return None;
@@ -249,4 +299,3 @@ pub fn detect_format(bytes: &[u8]) -> Option<FrameFormat> {
         _ => None,
     }
 }
-

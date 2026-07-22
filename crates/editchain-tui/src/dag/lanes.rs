@@ -1,35 +1,38 @@
-use editchain_core::OpId;
 use crate::data::header::OpOrdinal;
+use editchain_core::OpId;
 
 /// A single cell in a DAG row — what to draw at one column position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LaneCell {
+pub(crate) enum LaneCell {
     Empty,
     Vertical,
     Node,
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "WIP DAG visualization — will be used for selected node highlighting"
+    )]
     SelectedNode,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "WIP DAG visualization — horizontal connector")]
     Horizontal,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "WIP DAG visualization — branch indicator")]
     BranchLeft,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "WIP DAG visualization — branch indicator")]
     BranchRight,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "WIP DAG visualization — merge indicator")]
     MergeLeft,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "WIP DAG visualization — merge indicator")]
     MergeRight,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "WIP DAG visualization — crossing indicator")]
     Crossing,
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "WIP DAG visualization — many parents indicator")]
     ManyParents,
 }
 
 /// One row in the DAG log — corresponds to one operation.
 #[derive(Debug, Clone)]
-pub struct DagRow {
+pub(crate) struct DagRow {
     /// The ordinal of the operation this row represents.
-    #[allow(dead_code)]
+    #[expect(dead_code, reason = "WIP DAG visualization — op ordinal for this row")]
     pub op: OpOrdinal,
     /// Lane cells for this row (one per active column).
     pub cells: Vec<LaneCell>,
@@ -47,27 +50,33 @@ pub struct DagRow {
 /// 4. Insert parent(s) into lanes.
 /// 5. Draw connecting lines.
 #[derive(Debug, Clone)]
-pub struct LaneState {
-    /// Active lanes — each slot holds the OpId currently occupying that column.
+pub(crate) struct LaneState {
+    /// Active lanes — each slot holds the `OpId` currently occupying that column.
     pub active: Vec<Option<OpId>>,
 }
 
 impl LaneState {
-    pub fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self { active: Vec::new() }
     }
 
     /// Compute DAG rows for a set of operations given their parent relationships.
     ///
     /// `ordinals`: operations in display order (oldest-first).
-    /// `op_id_of`: function to get OpId from an ordinal.
+    /// `op_id_of`: function to get `OpId` from an ordinal.
     /// `parents_of`: function to get parent ordinals for an ordinal.
-    pub fn compute_rows(
+    #[expect(
+        clippy::arithmetic_side_effects,
+        clippy::indexing_slicing,
+        clippy::match_same_arms,
+        reason = "DAG lane computation; indexing is bounds-checked; match arms are structurally similar but semantically distinct"
+    )]
+    pub(crate) fn compute_rows(
         ordinals: &[OpOrdinal],
         op_id_of: impl Fn(OpOrdinal) -> OpId,
         parents_of: impl Fn(OpOrdinal) -> Vec<OpOrdinal>,
     ) -> Vec<DagRow> {
-        let mut state = LaneState::new();
+        let mut state = Self::new();
         let mut rows = Vec::with_capacity(ordinals.len());
 
         // Process newest-first for parent expansion, but build rows oldest-first.
@@ -76,7 +85,8 @@ impl LaneState {
 
         // Step 1: Build a map from ordinal -> lane assignment
         // We process newest -> oldest
-        let mut lane_of_op: std::collections::HashMap<OpId, usize> = std::collections::HashMap::new();
+        let mut lane_of_op: std::collections::HashMap<OpId, usize> =
+            std::collections::HashMap::new();
 
         for &ord in ordinals.iter().rev() {
             let op_id = op_id_of(ord);
@@ -90,7 +100,7 @@ impl LaneState {
                 // Allocate a new lane
                 let idx = state.active.len();
                 state.active.push(Some(op_id));
-                lane_of_op.insert(op_id, idx);
+                let _: Option<usize> = lane_of_op.insert(op_id, idx);
                 idx
             };
 
@@ -105,7 +115,7 @@ impl LaneState {
                     // Single parent — keep in same lane
                     let parent_id = op_id_of(parents[0]);
                     state.active[lane_idx] = Some(parent_id);
-                    lane_of_op.entry(parent_id).or_insert(lane_idx);
+                    let _: &mut usize = lane_of_op.entry(parent_id).or_insert(lane_idx);
                 }
                 2 => {
                     // Two parents — keep one in current lane, allocate another
@@ -113,10 +123,10 @@ impl LaneState {
                     let p1_id = op_id_of(parents[1]);
 
                     state.active[lane_idx] = Some(p0_id);
-                    lane_of_op.entry(p0_id).or_insert(lane_idx);
+                    let _: &mut usize = lane_of_op.entry(p0_id).or_insert(lane_idx);
 
                     // Find or allocate a lane for the second parent
-                    lane_of_op.entry(p1_id).or_insert_with(|| {
+                    let _: &mut usize = lane_of_op.entry(p1_id).or_insert_with(|| {
                         let p1_lane = find_spare_lane(&state.active, lane_idx);
                         if p1_lane < state.active.len() {
                             state.active[p1_lane] = Some(p1_id);
@@ -131,7 +141,7 @@ impl LaneState {
                     if let Some(&p0) = parents.first() {
                         let p0_id = op_id_of(p0);
                         state.active[lane_idx] = Some(p0_id);
-                        lane_of_op.entry(p0_id).or_insert(lane_idx);
+                        let _: &mut usize = lane_of_op.entry(p0_id).or_insert(lane_idx);
                     }
                 }
             }
@@ -144,7 +154,7 @@ impl LaneState {
         // Reset lane state for forward pass
         let mut forward_active: Vec<Option<OpId>> = Vec::new();
 
-        for &ord in ordinals.iter() {
+        for &ord in ordinals {
             let op_id = op_id_of(ord);
             let parents = parents_of(ord);
 
@@ -222,11 +232,15 @@ impl LaneState {
 }
 
 /// Find a spare lane index, preferring one near `preferred`.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "preferred is bounds-checked before indexing"
+)]
 fn find_spare_lane(active: &[Option<OpId>], preferred: usize) -> usize {
     if preferred < active.len() && active[preferred].is_none() {
         return preferred;
     }
-    if let Some(i) = active.iter().position(|slot| slot.is_none()) {
+    if let Some(i) = active.iter().position(Option::is_none) {
         return i;
     }
     active.len() // allocate new

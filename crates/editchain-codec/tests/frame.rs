@@ -1,3 +1,10 @@
+#![doc = "Frame encoding round-trip tests."]
+
+use crc as _;
+use postcard as _;
+use proptest as _;
+use serde as _;
+
 use editchain_codec::frame::{
     decode_ec03, decode_op, detect_format, encode_ec03, encode_op, Ec03Frame, FrameFormat,
     EC03_FORMAT_VERSION,
@@ -5,17 +12,18 @@ use editchain_codec::frame::{
 use editchain_core::*;
 
 #[test]
+#[expect(clippy::panic, reason = "test assertion")]
 fn round_trip_message_op() {
     let op = Op {
         id: OpId::new(NodeId(1), 0, 42),
-        parents: parents::ParentSet::None,
+        parents: ParentSet::None,
         actor: ActorId(1),
-        clock: clock::Clock::UnixMs(1700000000000),
-        scope: scope::ScopeRef::None,
-        tags: tags::Tags::MESSAGE,
-        kind: op::OpKind::Message(op::MessageOp {
-            content: payload::Payload::Inline(b"hello world".to_vec()),
-            content_type: payload::Payload::Empty,
+        clock: Clock::UnixMs(1_700_000_000_000),
+        scope: ScopeRef::None,
+        tags: Tags::MESSAGE,
+        kind: OpKind::Message(MessageOp {
+            content: Payload::Inline(b"hello world".to_vec()),
+            content_type: Payload::Empty,
         }),
     };
 
@@ -28,7 +36,7 @@ fn round_trip_message_op() {
     assert_eq!(op.tags, decoded.tags);
 
     match (&op.kind, &decoded.kind) {
-        (op::OpKind::Message(a), op::OpKind::Message(b)) => {
+        (OpKind::Message(a), OpKind::Message(b)) => {
             assert_eq!(a.content, b.content);
         }
         _ => panic!("kind mismatch"),
@@ -36,20 +44,21 @@ fn round_trip_message_op() {
 }
 
 #[test]
+#[expect(clippy::panic, reason = "test assertion")]
 fn round_trip_file_op() {
     let op = Op {
         id: OpId::new(NodeId(2), 1, 7),
-        parents: parents::ParentSet::None,
+        parents: ParentSet::None,
         actor: ActorId(0),
-        clock: clock::Clock::Lamport(99),
-        scope: scope::ScopeRef::File(ids::PathId(42)),
-        tags: tags::Tags::FILE,
-        kind: op::OpKind::File(op::FileOp {
-            path: ids::PathId(42),
-            stage: op::FileStage::Applied,
+        clock: Clock::Lamport(99),
+        scope: ScopeRef::File(PathId(42)),
+        tags: Tags::FILE,
+        kind: OpKind::File(FileOp {
+            path: PathId(42),
+            stage: FileStage::Applied,
             base: None,
-            after: Some(payload::ContentId::Hash128([0xAB; 16])),
-            edit: op::FileEdit::None,
+            after: Some(ContentId::Hash128([0xAB; 16])),
+            edit: FileEdit::None,
         }),
     };
 
@@ -58,7 +67,7 @@ fn round_trip_file_op() {
 
     assert_eq!(op.id, decoded.id);
     match (&op.kind, &decoded.kind) {
-        (op::OpKind::File(a), op::OpKind::File(b)) => {
+        (OpKind::File(a), OpKind::File(b)) => {
             assert_eq!(a.path, b.path);
             assert_eq!(a.stage, b.stage);
             assert_eq!(a.after, b.after);
@@ -81,6 +90,10 @@ fn ec03_round_trip_empty() {
 }
 
 #[test]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test assertions on known-length vec"
+)]
 fn ec03_round_trip_with_records() {
     let mut frame = Ec03Frame::new(42, 7);
     frame.add_record(vec![1, 2, 3]);

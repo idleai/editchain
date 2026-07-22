@@ -1,3 +1,15 @@
+//! Segment store tests.
+
+use clap as _;
+use dirs as _;
+use editchain_core as _;
+use editchain_embed as _;
+use editchain_import as _;
+use editchain_index as _;
+use editchain_query as _;
+use serde as _;
+use serde_json as _;
+
 use editchain_codec::page::Page;
 use editchain_node::segment::SegmentStore;
 
@@ -8,6 +20,10 @@ fn open_creates_directory() {
     assert!(store.chain_dir.exists());
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Test assertions on known-length vec"
+)]
 #[test]
 fn append_and_read() {
     let dir = tempfile::tempdir().unwrap();
@@ -22,6 +38,10 @@ fn append_and_read() {
     assert_eq!(pages[0].records.len(), 1);
 }
 
+#[expect(
+    clippy::similar_names,
+    reason = "page1/page2/pages are distinct test variables"
+)]
 #[test]
 fn rotate_and_read_multiple() {
     let dir = tempfile::tempdir().unwrap();

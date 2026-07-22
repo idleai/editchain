@@ -1,17 +1,28 @@
+#![expect(missing_docs, reason = "Test file")]
+
 use editchain_core::{ActorId, NodeId, OpId};
-use editchain_query::search::{ChunkId, ChunkMetadata, ScoredChunk, SummarizeRequest, SummarizeStrategy};
+use editchain_query::search::{
+    ChunkId, ChunkMetadata, ScoredChunk, SummarizeRequest, SummarizeStrategy,
+};
 use editchain_query::summarize::{build_extractive_summary, build_timeline_summary};
+use serde as _;
 
 fn make_chunk(seq: u64, text: &str, score: f64) -> ScoredChunk {
     let op_id = OpId::new(NodeId(1), 0, seq);
     ScoredChunk {
-        chunk_id: ChunkId { op_id, chunk_ordinal: 0 },
+        chunk_id: ChunkId {
+            op_id,
+            chunk_ordinal: 0,
+        },
         op_id,
         score,
         text: text.to_string(),
         metadata: ChunkMetadata {
             op_id,
-            chunk_id: ChunkId { op_id, chunk_ordinal: 0 },
+            chunk_id: ChunkId {
+                op_id,
+                chunk_ordinal: 0,
+            },
             session_id: None,
             actor_id: ActorId(0),
             kind_tags: 0,
@@ -22,6 +33,10 @@ fn make_chunk(seq: u64, text: &str, score: f64) -> ScoredChunk {
 }
 
 #[test]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Test assertions on known-length vec"
+)]
 fn extractive_summary_selects_top() {
     let request = SummarizeRequest {
         query: "test".to_string(),
@@ -41,6 +56,10 @@ fn extractive_summary_selects_top() {
 }
 
 #[test]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Test assertions on known-length vec"
+)]
 fn timeline_summary_orders_by_op_id() {
     let request = SummarizeRequest {
         query: "test".to_string(),

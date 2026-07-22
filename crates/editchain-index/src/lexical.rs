@@ -3,16 +3,21 @@
 //! Uses `RamDirectory` for in-memory indexing with near-real-time commit.
 //! Documents are chunked operations with fielded metadata for structured filtering.
 
+// Crate-level dependency markers (used by Cargo for feature resolution).
+use editchain_embed as _;
+use half as _;
+use roaring as _;
+
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::IndexRecordOption;
-use tantivy::schema::*;
+use tantivy::schema::{Field, Schema, Term, Value, INDEXED, STORED, STRING, TEXT};
 use tantivy::tokenizer::RawTokenizer;
 use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument};
 
 use editchain_core::Op;
-use editchain_query::search::{ChunkId, ChunkMetadata, ScoredChunk, SearchFilters, TagFilter};
 use editchain_query::hybrid::LexicalSearch;
+use editchain_query::search::{ChunkId, ChunkMetadata, ScoredChunk, SearchFilters, TagFilter};
 
 use crate::chunker::{chunk_text, extract_op_text, ChunkRecord, Generation};
 
@@ -21,22 +26,39 @@ use crate::chunker::{chunk_text, extract_op_text, ChunkRecord, Generation};
 // ---------------------------------------------------------------------------
 
 /// Fields in the Tantivy schema.
+#[derive(Debug)]
 pub struct LexicalFields {
+    /// Full text body field (TEXT | STORED).
     pub body: Field,
+    /// Code body field (STRING | STORED) for exact matching.
     pub body_code: Field,
+    /// File path text field for fuzzy matching.
     pub path_text: Field,
+    /// File path exact field for literal matching.
     pub path_exact: Field,
+    /// Tool name field.
     pub tool_name: Field,
+    /// Operation kind field (message, tool, command, etc.).
     pub kind: Field,
+    /// Role field (`assistant`, `tool_start`, `tool_result`, etc.).
     pub role: Field,
+    /// Actor ID as a u64 field.
     pub actor_id: Field,
+    /// Session ID as a u64 field.
     pub session_id: Field,
+    /// Node ID as a u64 field.
     pub node_id: Field,
+    /// Boot counter as a u64 field.
     pub boot: Field,
+    /// Sequence number as a u64 field.
     pub seq: Field,
+    /// Op ID string field for exact lookup.
     pub op_id_str: Field,
+    /// Chunk ordinal as a u64 field.
     pub chunk_ordinal: Field,
-    pub gen: Field,
+    /// Generation counter as a u64 field.
+    pub r#gen: Field,
+    /// Clock timestamp in milliseconds as a u64 field.
     pub clock_ms: Field,
 }
 
@@ -58,7 +80,7 @@ fn build_schema() -> (Schema, LexicalFields) {
     let seq = schema_builder.add_u64_field("seq", INDEXED | STORED);
     let op_id_str = schema_builder.add_text_field("op_id_str", STRING | STORED);
     let chunk_ordinal = schema_builder.add_u64_field("chunk_ordinal", INDEXED | STORED);
-    let gen = schema_builder.add_u64_field("generation", INDEXED | STORED);
+    let r#gen = schema_builder.add_u64_field("generation", INDEXED | STORED);
     let clock_ms = schema_builder.add_u64_field("clock_ms", INDEXED | STORED);
 
     let schema = schema_builder.build();
@@ -77,7 +99,7 @@ fn build_schema() -> (Schema, LexicalFields) {
         seq,
         op_id_str,
         chunk_ordinal,
-        gen,
+        r#gen,
         clock_ms,
     };
 
@@ -96,11 +118,29 @@ pub struct LexicalIndex {
     reader: IndexReader,
 }
 
+#[expect(
+    clippy::missing_fields_in_debug,
+    reason = "IndexWriter and IndexReader do not implement Debug; num_docs() is the meaningful runtime state"
+)]
+impl std::fmt::Debug for LexicalIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LexicalIndex")
+            .field("fields", &self.fields)
+            .field("index", &self.index)
+            .field("num_docs", &self.num_docs())
+            .finish()
+    }
+}
+
 impl LexicalIndex {
-    /// Create a new empty lexical index with RamDirectory.
+    /// Create a new empty lexical index with `RamDirectory`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Tantivy index writer or reader cannot be created.
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let (schema, fields) = build_schema();
-        let index = Index::create_in_ram(schema.clone());
+        let index = Index::create_in_ram(schema);
 
         // Register custom tokenizers.
         index.tokenizers().register("code", RawTokenizer::default());
@@ -121,14 +161,22 @@ impl LexicalIndex {
     }
 
     /// Index a single operation's text chunks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Tantivy writer fails to add a document.
+    #[expect(
+        clippy::as_conversions,
+        clippy::string_slice,
+        reason = "byte_start/byte_end are u32 from chunker; text.len() is usize; floor_char_boundary ensures valid UTF-8 slice boundaries"
+    )]
     pub fn index_op(
         &mut self,
         op: &Op,
         generation: Generation,
     ) -> Result<Vec<ChunkRecord>, Box<dyn std::error::Error>> {
-        let text = match extract_op_text(op, false, false) {
-            Some(t) => t,
-            None => return Ok(Vec::new()),
+        let Some(text) = extract_op_text(op, false, false) else {
+            return Ok(Vec::new());
         };
 
         let chunks = chunk_text(&text, op.id, generation, 768, 96);
@@ -157,18 +205,18 @@ impl LexicalIndex {
         let kind_str = kind_to_string(&op.kind);
         let role_str = role_to_string(&op.kind);
 
-        self.writer.add_document(doc!(
+        let _opstamp = self.writer.add_document(doc!(
             self.fields.body => text,
             self.fields.body_code => text,
             self.fields.kind => kind_str,
             self.fields.role => role_str,
             self.fields.actor_id => op.actor.0,
             self.fields.node_id => op.id.node.0,
-            self.fields.boot => op.id.boot as u64,
+            self.fields.boot => u64::from(op.id.boot),
             self.fields.seq => op.id.seq,
             self.fields.op_id_str => op.id.to_string(),
-            self.fields.chunk_ordinal => chunk.chunk_ordinal as u64,
-            self.fields.gen => generation,
+            self.fields.chunk_ordinal => u64::from(chunk.chunk_ordinal),
+            self.fields.r#gen => generation,
             self.fields.clock_ms => op.clock.as_u64(),
         ))?;
 
@@ -176,13 +224,26 @@ impl LexicalIndex {
     }
 
     /// Commit pending documents to the index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Tantivy commit or reader reload fails.
     pub fn commit(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.writer.commit()?;
+        let _opstamp = self.writer.commit()?;
         self.reader.reload()?;
         Ok(())
     }
 
     /// Search the lexical index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Tantivy query parsing or search fails.
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        reason = "Tantivy stores u64 fields; boot/chunk_ordinal are u32 in the schema; truncation is safe because values originate from u32 sources"
+    )]
     pub fn search_internal(
         &self,
         query_str: &str,
@@ -206,9 +267,12 @@ impl LexicalIndex {
             if !kinds.is_empty() {
                 let kind_terms: Vec<(Occur, Box<dyn Query>)> = kinds
                     .iter()
-                    .map(|k| {
+                    .map(|k| -> (Occur, Box<dyn Query>) {
                         let term = Term::from_field_text(self.fields.kind, tag_filter_to_str(k));
-                        (Occur::Should, Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>)
+                        (
+                            Occur::Should,
+                            Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+                        )
                     })
                     .collect();
                 subqueries.push((Occur::Must, Box::new(BooleanQuery::new(kind_terms))));
@@ -220,9 +284,12 @@ impl LexicalIndex {
             if !actors.is_empty() {
                 let actor_terms: Vec<(Occur, Box<dyn Query>)> = actors
                     .iter()
-                    .map(|a| {
+                    .map(|a| -> (Occur, Box<dyn Query>) {
                         let term = Term::from_field_u64(self.fields.actor_id, a.0);
-                        (Occur::Should, Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>)
+                        (
+                            Occur::Should,
+                            Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+                        )
                     })
                     .collect();
                 subqueries.push((Occur::Must, Box::new(BooleanQuery::new(actor_terms))));
@@ -234,9 +301,12 @@ impl LexicalIndex {
             if !sessions.is_empty() {
                 let session_terms: Vec<(Occur, Box<dyn Query>)> = sessions
                     .iter()
-                    .map(|s| {
+                    .map(|s| -> (Occur, Box<dyn Query>) {
                         let term = Term::from_field_u64(self.fields.session_id, s.0);
-                        (Occur::Should, Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>)
+                        (
+                            Occur::Should,
+                            Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+                        )
                     })
                     .collect();
                 subqueries.push((Occur::Must, Box::new(BooleanQuery::new(session_terms))));
@@ -270,8 +340,11 @@ impl LexicalIndex {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
 
-            use editchain_core::{NodeId, OpId};
-            let op_id = OpId::new(NodeId(node_val), boot_val as u32, seq_val);
+            let op_id = editchain_core::OpId::new(
+                editchain_core::NodeId(node_val),
+                boot_val.try_into().unwrap_or(0),
+                seq_val,
+            );
 
             // Extract stored text from the body field.
             let body_text = doc
@@ -281,13 +354,19 @@ impl LexicalIndex {
                 .to_string();
 
             results.push(ScoredChunk {
-                chunk_id: ChunkId { op_id, chunk_ordinal: ordinal_val as u32 },
+                chunk_id: ChunkId {
+                    op_id,
+                    chunk_ordinal: ordinal_val as u32,
+                },
                 op_id,
-                score: score as f64,
+                score: f64::from(score),
                 text: body_text,
                 metadata: ChunkMetadata {
                     op_id,
-                    chunk_id: ChunkId { op_id, chunk_ordinal: ordinal_val as u32 },
+                    chunk_id: ChunkId {
+                        op_id,
+                        chunk_ordinal: ordinal_val as u32,
+                    },
                     session_id: None,
                     actor_id: editchain_core::ActorId(
                         doc.get_first(self.fields.actor_id)
@@ -300,7 +379,7 @@ impl LexicalIndex {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0),
                     generation: doc
-                        .get_first(self.fields.gen)
+                        .get_first(self.fields.r#gen)
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0),
                 },
@@ -311,17 +390,23 @@ impl LexicalIndex {
     }
 
     /// Number of indexed documents.
+    #[must_use]
     pub fn num_docs(&self) -> usize {
-        self.reader.searcher().num_docs() as usize
+        usize::try_from(self.reader.searcher().num_docs()).unwrap_or(usize::MAX)
     }
 
     /// Current generation of the index (max committed generation).
-    pub fn generation(&self) -> Generation {
+    #[must_use]
+    pub const fn generation(&self) -> Generation {
         0
     }
 }
 
 impl Default for LexicalIndex {
+    #[expect(
+        clippy::expect_used,
+        reason = "Default impl panics on failure; caller must use new() for fallible creation"
+    )]
     fn default() -> Self {
         Self::new().expect("Failed to create LexicalIndex")
     }
@@ -342,7 +427,7 @@ impl LexicalSearch for LexicalIndex {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn kind_to_string(kind: &editchain_core::op::OpKind) -> &'static str {
+const fn kind_to_string(kind: &editchain_core::op::OpKind) -> &'static str {
     use editchain_core::op::OpKind;
     match kind {
         OpKind::Message(_) => "message",
@@ -353,11 +438,11 @@ fn kind_to_string(kind: &editchain_core::op::OpKind) -> &'static str {
         OpKind::Import(_) => "import",
         OpKind::Note(_) => "note",
         OpKind::Error(_) => "error",
-        _ => "unknown",
+        OpKind::ChainStart(_) | OpKind::Actor(_) | OpKind::Unknown(_) => "unknown",
     }
 }
 
-fn role_to_string(kind: &editchain_core::op::OpKind) -> &'static str {
+const fn role_to_string(kind: &editchain_core::op::OpKind) -> &'static str {
     use editchain_core::op::OpKind;
     match kind {
         OpKind::Message(_) => "assistant",
@@ -371,11 +456,18 @@ fn role_to_string(kind: &editchain_core::op::OpKind) -> &'static str {
             editchain_core::op::CommandStage::Output => "command_output",
             editchain_core::op::CommandStage::Finish => "command_finish",
         },
-        _ => "",
+        OpKind::File(_)
+        | OpKind::Reflection(_)
+        | OpKind::Import(_)
+        | OpKind::Note(_)
+        | OpKind::Error(_)
+        | OpKind::ChainStart(_)
+        | OpKind::Actor(_)
+        | OpKind::Unknown(_) => "",
     }
 }
 
-fn tag_filter_to_str(filter: &TagFilter) -> &'static str {
+const fn tag_filter_to_str(filter: &TagFilter) -> &'static str {
     match filter {
         TagFilter::Message => "message",
         TagFilter::Tool => "tool",
@@ -386,4 +478,3 @@ fn tag_filter_to_str(filter: &TagFilter) -> &'static str {
         TagFilter::Error => "error",
     }
 }
-

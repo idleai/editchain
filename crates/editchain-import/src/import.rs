@@ -15,6 +15,22 @@ use crate::sink::{BlobSink, CursorStore, OpSink};
 /// Import all Claude Code sessions from a directory into editchain operations.
 ///
 /// This is the main entry point for the import pipeline.
+///
+/// # Errors
+///
+/// Returns `ImportError` if session discovery, reading, or normalization fails.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "counter increments are bounded by file/op counts"
+)]
+#[expect(
+    clippy::as_conversions,
+    reason = "usize to u64 is safe on all supported platforms"
+)]
+#[expect(
+    clippy::let_underscore_untyped,
+    reason = "Result return values are intentionally discarded for side effects"
+)]
 pub fn import_claude_code(
     request: &DiscoveryRequest,
     options: &ImportOptions,
@@ -25,8 +41,7 @@ pub fn import_claude_code(
     let mut report = ImportReport::new();
 
     // Discover session files.
-    let sessions = discover_sessions(&request.sessions_dir)
-        .map_err(ImportError::OpSink)?;
+    let sessions = discover_sessions(&request.sessions_dir).map_err(ImportError::OpSink)?;
     report.files_discovered = sessions.len();
 
     let workspace_str = request.workspace_path.to_str().unwrap_or("/workspace");
@@ -72,7 +87,7 @@ pub fn import_claude_code(
         };
 
         // Use per-file sequence numbering starting from cursor's last ordinal.
-        let start_seq = existing_cursor.as_ref().map(|c| c.ops_emitted).unwrap_or(0);
+        let start_seq = existing_cursor.as_ref().map_or(0, |c| c.ops_emitted);
         for (i, line) in lines.iter().enumerate() {
             let seq = start_seq + i as u64 + 1;
 
@@ -81,22 +96,16 @@ pub fn import_claude_code(
 
             if let Some(ref envelope) = env {
                 let (raw_op, normalized_ops) = normalize_envelope(
-                    envelope,
-                    line.hash,
-                    &line.data,
-                    &stream,
-                    seq,
-                    &norm_opts,
-                    blobs,
+                    envelope, line.hash, &line.data, &stream, seq, &norm_opts, blobs,
                 );
 
                 // Emit raw import op.
-                ops.accept_op(&raw_op)?;
+                let _: bool = ops.accept_op(&raw_op)?;
                 report.raw_ops += 1;
 
                 // Emit normalized ops.
                 for norm_op in &normalized_ops {
-                    ops.accept_op(norm_op)?;
+                    let _ = ops.accept_op(norm_op)?;
                     report.normalized_ops += 1;
                 }
             } else {
@@ -114,7 +123,7 @@ pub fn import_claude_code(
                         raw_hash: Some(line.hash),
                     }),
                 };
-                ops.accept_op(&raw_op)?;
+                let _: bool = ops.accept_op(&raw_op)?;
                 report.raw_ops += 1;
                 report.malformed += 1;
             }

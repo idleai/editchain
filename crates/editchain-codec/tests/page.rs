@@ -1,6 +1,18 @@
+#![doc = "Page format round-trip tests."]
+
+use crc as _;
+use editchain_core as _;
+use postcard as _;
+use proptest as _;
+use serde as _;
+
 use editchain_codec::page::{decode_page, encode_page, Page};
 
 #[test]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test assertions on known-length vec"
+)]
 fn round_trip_page() {
     let mut page = Page::new(0);
     page.add_record(0x01, vec![1, 2, 3]);

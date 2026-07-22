@@ -3,6 +3,14 @@ name = "editchain-codec"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
 
 [features]
 default = ["use-std"]
@@ -13,3 +21,6 @@ serde.workspace = true
 postcard.workspace = true
 crc = "3"
 editchain-core = { path = "../editchain-core" }
+
+[dev-dependencies]
+proptest = "1"

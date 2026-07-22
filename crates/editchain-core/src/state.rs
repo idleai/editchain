@@ -1,11 +1,14 @@
-use alloc::collections::btree_map::Entry;
-use alloc::collections::BTreeMap;
+#[cfg(not(feature = "use-std"))]
+use alloc::collections::{btree_map::Entry, BTreeMap};
+#[cfg(not(feature = "use-std"))]
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "use-std")]
+use std::collections::{btree_map::Entry, BTreeMap};
 
-use crate::ids::*;
-use crate::op::*;
+use crate::ids::{OpId, PathId};
+use crate::op::{FileStage, Op, OpKind};
 use crate::payload::ContentId;
 
 // ---------------------------------------------------------------------------
@@ -25,7 +28,9 @@ pub struct OpSet {
 }
 
 impl OpSet {
-    pub fn new() -> Self {
+    /// Create an empty `OpSet`.
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             ops: BTreeMap::new(),
             quarantined: Vec::new(),
@@ -36,6 +41,15 @@ impl OpSet {
     ///
     /// Returns `Ok(true)` if accepted, `Ok(false)` if duplicate,
     /// `Err((existing, incoming))` if invalid duplicate (quarantined).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err((existing_bytes, incoming_bytes))` if an operation with the
+    /// same `OpId` but different encoded bytes already exists (quarantined).
+    #[expect(
+        clippy::let_underscore_untyped,
+        reason = "Entry::Occupied/Vacant insert returns Option; we intentionally discard it"
+    )]
     pub fn insert(&mut self, id: OpId, encoded: Vec<u8>) -> Result<bool, (Vec<u8>, Vec<u8>)> {
         match self.ops.entry(id) {
             Entry::Occupied(e) => {
@@ -45,51 +59,64 @@ impl OpSet {
                 } else {
                     // Same OpId, different bytes — quarantine.
                     let existing = e.get().clone();
-                    self.quarantined.push((*e.key(), existing.clone(), encoded.clone()));
+                    self.quarantined
+                        .push((*e.key(), existing.clone(), encoded.clone()));
                     Err((existing, encoded))
                 }
             }
             Entry::Vacant(e) => {
-                e.insert(encoded);
+                let _ = e.insert(encoded);
                 Ok(true)
             }
         }
     }
 
-    /// Returns true if the set contains the given OpId.
+    /// Returns true if the set contains the given `OpId`.
+    #[must_use]
     pub fn contains(&self, id: &OpId) -> bool {
         self.ops.contains_key(id)
     }
 
     /// Returns the number of accepted operations.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.ops.len()
     }
 
     /// Returns true if the set is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.ops.is_empty()
     }
 
-    /// Iterate over all accepted (OpId, encoded_bytes) pairs in key order.
+    /// Iterate over all accepted (`OpId`, `encoded_bytes`) pairs in key order.
     pub fn iter(&self) -> impl Iterator<Item = (&OpId, &[u8])> {
         self.ops.iter().map(|(k, v)| (k, v.as_slice()))
     }
 
     /// Returns a reference to the quarantined entries.
+    #[expect(
+        clippy::type_complexity,
+        reason = "Quarantine entries are a fixed 3-tuple; factoring into a type adds noise"
+    )]
+    #[must_use]
     pub fn quarantined(&self) -> &[(OpId, Vec<u8>, Vec<u8>)] {
         &self.quarantined
     }
 
-    /// Merge another OpSet into this one (set-union).
+    /// Merge another `OpSet` into this one (set-union).
     ///
     /// Returns counts: (accepted, duplicates, quarantined).
-    pub fn merge(&mut self, other: &OpSet) -> (usize, usize, usize) {
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "Counting merge results with small bounded integers"
+    )]
+    pub fn merge(&mut self, other: &Self) -> (usize, usize, usize) {
         let mut accepted = 0;
         let mut duplicates = 0;
         let mut quarantined = 0;
 
-        for (id, bytes) in other.ops.iter() {
+        for (id, bytes) in &other.ops {
             match self.insert(*id, bytes.clone()) {
                 Ok(true) => accepted += 1,
                 Ok(false) => duplicates += 1,
@@ -117,34 +144,48 @@ pub struct BlobSet {
     blobs: BTreeMap<ContentIdKey, u32>,
 }
 
-/// Wrapper for using ContentId as a BTreeMap key.
+/// Wrapper for using `ContentId` as a `BTreeMap` key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum ContentIdKey {
+    /// Local content reference (node, seq).
     Local(u64, u64),
+    /// 128-bit hash.
     Hash128([u8; 16]),
+    /// 256-bit hash.
     Hash256([u8; 32]),
 }
 
-impl From<crate::payload::ContentId> for ContentIdKey {
-    fn from(cid: crate::payload::ContentId) -> Self {
+impl From<ContentId> for ContentIdKey {
+    fn from(cid: ContentId) -> Self {
         match cid {
-            crate::payload::ContentId::Local { node, seq } => ContentIdKey::Local(node.0, seq),
-            crate::payload::ContentId::Hash128(h) => ContentIdKey::Hash128(h),
-            crate::payload::ContentId::Hash256(h) => ContentIdKey::Hash256(h),
+            ContentId::Local { node, seq } => Self::Local(node.0, seq),
+            ContentId::Hash128(h) => Self::Hash128(h),
+            ContentId::Hash256(h) => Self::Hash256(h),
         }
     }
 }
 
 impl BlobSet {
-    pub fn new() -> Self {
-        Self { blobs: BTreeMap::new() }
+    /// Create an empty `BlobSet`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            blobs: BTreeMap::new(),
+        }
     }
 
+    /// Insert a blob reference into the set.
+    #[expect(
+        clippy::let_underscore_untyped,
+        reason = "BTreeMap insert returns Option; we intentionally discard it"
+    )]
     pub fn insert(&mut self, id: ContentId, len: u32) {
-        self.blobs.insert(id.into(), len);
+        let _ = self.blobs.insert(id.into(), len);
     }
 
-    pub fn contains(&self, id: &crate::payload::ContentId) -> bool {
+    /// Returns true if the set contains the given `ContentId`.
+    #[must_use]
+    pub fn contains(&self, id: &ContentId) -> bool {
         let key: ContentIdKey = (*id).into();
         self.blobs.contains_key(&key)
     }
@@ -159,15 +200,22 @@ impl BlobSet {
 /// Ordering: ancestry → clock → node → boot → seq
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CausalKey {
+    /// Clock value for primary ordering.
     pub clock_val: u64,
+    /// Clock sub-value for sub-ms ordering (Hybrid clock ctr).
     pub clock_sub: u16,
+    /// Node identifier for tie-breaking.
     pub node: u64,
+    /// Boot counter for tie-breaking.
     pub boot: u32,
+    /// Sequence number for tie-breaking.
     pub seq: u64,
 }
 
 impl CausalKey {
-    pub fn from_op(op: &Op) -> Self {
+    /// Build a `CausalKey` from an operation's clock and identity fields.
+    #[must_use]
+    pub const fn from_op(op: &Op) -> Self {
         Self {
             clock_val: op.clock.as_u64(),
             clock_sub: op.clock.sub(),
@@ -201,22 +249,25 @@ impl PartialOrd for CausalKey {
 
 /// The canonical view is a deterministic reduction over all accepted operations.
 ///
-/// It is recomputed from the OpSet whenever operations are merged.
-/// Every replica with the same OpSet produces the same CanonicalView.
+/// It is recomputed from the `OpSet` whenever operations are merged.
+/// Every replica with the same `OpSet` produces the same `CanonicalView`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CanonicalView {
     /// Messages in canonical causal order.
     pub messages: Vec<OpId>,
-    /// File revisions — latest materializing revision per PathId.
+    /// File revisions — latest materializing revision per `PathId`.
     pub files: BTreeMap<PathId, FileRevision>,
 }
 
 /// The materialized state of a file at a point in the canonical view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileRevision {
+    /// The operation ID that produced this revision.
     pub op_id: OpId,
+    /// The lifecycle stage of this file revision.
     pub stage: FileStage,
-    pub after: Option<crate::payload::ContentId>,
+    /// Content identifier for the file after this revision.
+    pub after: Option<ContentId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -226,13 +277,14 @@ pub struct FileRevision {
 /// Error type for reduction failures.
 #[derive(Debug, Clone)]
 pub enum ReduceError {
+    /// The operation kind is not supported by this reducer.
     UnsupportedKind(&'static str),
 }
 
 impl core::fmt::Display for ReduceError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            ReduceError::UnsupportedKind(kind) => write!(f, "unsupported op kind: {}", kind),
+            Self::UnsupportedKind(kind) => write!(f, "unsupported op kind: {kind}"),
         }
     }
 }
@@ -240,10 +292,14 @@ impl core::fmt::Display for ReduceError {
 #[cfg(feature = "use-std")]
 impl std::error::Error for ReduceError {}
 
-
 /// A reducer processes operations and updates canonical state.
 pub trait Reducer {
     /// Process a single operation and update internal state.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReduceError::UnsupportedKind` if the operation kind is not
+    /// handled by this reducer.
     fn reduce(&mut self, op: &Op) -> Result<(), ReduceError>;
 }
 
@@ -258,10 +314,16 @@ pub struct MessageReducer {
 }
 
 impl MessageReducer {
-    pub fn new() -> Self {
-        Self { messages: Vec::new() }
+    /// Create a new empty `MessageReducer`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            messages: Vec::new(),
+        }
     }
 
+    /// Consume the reducer and return messages in canonical causal order.
+    #[must_use]
     pub fn into_view(self) -> Vec<OpId> {
         let mut sorted = self.messages;
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
@@ -276,6 +338,10 @@ impl Default for MessageReducer {
 }
 
 impl Reducer for MessageReducer {
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "MessageReducer only handles Message ops; all other kinds are silently ignored"
+    )]
     fn reduce(&mut self, op: &Op) -> Result<(), ReduceError> {
         match &op.kind {
             OpKind::Message(_) => {
@@ -291,17 +357,23 @@ impl Reducer for MessageReducer {
 // FileReducer
 // ---------------------------------------------------------------------------
 
-/// Tracks the latest materializing revision per PathId.
+/// Tracks the latest materializing revision per `PathId`.
 #[derive(Debug, Clone)]
 pub struct FileReducer {
     files: BTreeMap<PathId, (CausalKey, FileRevision)>,
 }
 
 impl FileReducer {
-    pub fn new() -> Self {
-        Self { files: BTreeMap::new() }
+    /// Create a new empty `FileReducer`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            files: BTreeMap::new(),
+        }
     }
 
+    /// Consume the reducer and return the latest revision per path.
+    #[must_use]
     pub fn into_view(self) -> BTreeMap<PathId, FileRevision> {
         self.files.into_iter().map(|(k, (_, v))| (k, v)).collect()
     }
@@ -314,6 +386,14 @@ impl Default for FileReducer {
 }
 
 impl Reducer for FileReducer {
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "FileReducer only handles File ops; all other kinds are silently ignored"
+    )]
+    #[expect(
+        clippy::let_underscore_untyped,
+        reason = "BTreeMap entry insert returns Option; we intentionally discard it"
+    )]
     fn reduce(&mut self, op: &Op) -> Result<(), ReduceError> {
         match &op.kind {
             OpKind::File(file_op) => {
@@ -328,11 +408,11 @@ impl Reducer for FileReducer {
                     Entry::Occupied(mut e) => {
                         let (existing_ck, _) = e.get();
                         if ck > *existing_ck {
-                            e.insert((ck, rev));
+                            let _ = e.insert((ck, rev));
                         }
                     }
                     Entry::Vacant(e) => {
-                        e.insert((ck, rev));
+                        let _ = e.insert((ck, rev));
                     }
                 }
                 Ok(())
@@ -348,16 +428,21 @@ impl Reducer for FileReducer {
 
 /// The complete canonical state of an edit chain.
 ///
-/// Contains the grow-only OpSet and a deterministic CanonicalView
+/// Contains the grow-only `OpSet` and a deterministic `CanonicalView`
 /// computed by running all reducers over the accepted operations.
 #[derive(Debug, Clone)]
 pub struct ChainState {
+    /// The grow-only set of accepted operations.
     pub ops: OpSet,
+    /// The content-addressed set of blob references.
     pub blobs: BlobSet,
+    /// The deterministic canonical view (messages + file revisions).
     pub view: CanonicalView,
 }
 
 impl ChainState {
+    /// Create a new empty `ChainState`.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             ops: OpSet::new(),
@@ -367,11 +452,16 @@ impl ChainState {
     }
 
     /// Recompute the canonical view from scratch by running all reducers
-    /// over every accepted operation in OpSet order.
+    /// over every accepted operation in `OpSet` order.
     ///
     /// Note: This requires decoding ops from their stored bytes. The codec
     /// crate provides `postcard::from_bytes` for this. When called from
     /// outside the core crate, pass pre-decoded ops or use the codec layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReduceError::UnsupportedKind` if any operation kind is not
+    /// handled by the registered reducers.
     pub fn recompute_view_from_ops(&mut self, ops: &[Op]) -> Result<(), ReduceError> {
         let mut msg_reducer = MessageReducer::new();
         let mut file_reducer = FileReducer::new();
@@ -388,7 +478,16 @@ impl ChainState {
     }
 
     /// Merge another chain's ops into this one and recompute the view.
-    pub fn merge(&mut self, other: &ChainState) -> Result<(usize, usize, usize), ReduceError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns `ReduceError::UnsupportedKind` if any operation kind is not
+    /// handled by the registered reducers.
+    #[expect(
+        clippy::let_underscore_untyped,
+        reason = "Borrow self.ops to suppress unused field warning; type is &OpSet"
+    )]
+    pub fn merge(&mut self, other: &Self) -> Result<(usize, usize, usize), ReduceError> {
         let counts = self.ops.merge(&other.ops);
         // View recomputation requires decoded ops; see recompute_view_from_ops.
         let _ = &self.ops;
@@ -405,4 +504,3 @@ impl Default for ChainState {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-

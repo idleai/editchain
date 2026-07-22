@@ -1,3 +1,10 @@
+//! Clock ordering tests.
+
+#![expect(
+    unused_crate_dependencies,
+    reason = "Test file; dependencies used by library macros"
+)]
+
 use editchain_core::clock::Clock;
 
 #[test]

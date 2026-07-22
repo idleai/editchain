@@ -31,12 +31,17 @@ pub struct PathId(pub u64);
 /// Gateways may add proof hashes alongside these IDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OpId {
+    /// Node identifier.
     pub node: NodeId,
+    /// Boot counter (incremented on restart).
     pub boot: u32,
+    /// Monotonic sequence number within this boot epoch.
     pub seq: u64,
 }
 
 impl OpId {
+    /// Create a new `OpId` from its components.
+    #[must_use]
     pub const fn new(node: NodeId, boot: u32, seq: u64) -> Self {
         Self { node, boot, seq }
     }

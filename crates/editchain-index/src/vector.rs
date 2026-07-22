@@ -1,7 +1,10 @@
-//! Flat f16 vector index with RoaringBitmap filters and exact scan.
+//! Flat f16 vector index with `RoaringBitmap` filters and exact scan.
 //!
 //! Uses half-precision (f16) vectors stored row-major in aligned segments.
-//! Filters use RoaringBitmap for fast pre-filtering before dot product scan.
+//! Filters use `RoaringBitmap` for fast pre-filtering before dot product scan.
+
+// Crate-level dependency markers (used by Cargo for feature resolution).
+use half as _;
 
 use half::f16;
 use roaring::RoaringBitmap;
@@ -20,18 +23,19 @@ use crate::chunker::Generation;
 /// A sealed segment of f16 vectors with associated doc ordinals.
 #[derive(Debug, Clone)]
 pub struct FlatVectorSegment {
-    /// Generation range this segment covers.
+    /// Generation range this segment covers (start).
     pub generation_start: Generation,
+    /// Generation range this segment covers (end).
     pub generation_end: Generation,
     /// Vector dimensionality.
     pub dimensions: usize,
     /// Doc ordinals in insertion order (maps to external doc IDs).
     pub doc_ordinals: Vec<DocOrdinal>,
-    /// Original OpIds for each vector (same order as doc_ordinals).
+    /// Original `OpIds` for each vector (same order as `doc_ordinals`).
     pub op_ids: Vec<OpId>,
     /// Chunk ordinals for each vector.
     pub chunk_ordinals: Vec<u32>,
-    /// Row-major f16 vectors, length = doc_ordinals.len() * dimensions.
+    /// Row-major f16 vectors, length = `doc_ordinals.len()` * dimensions.
     pub vectors: Vec<f16>,
 }
 
@@ -39,7 +43,9 @@ pub struct FlatVectorSegment {
 pub type DocOrdinal = u32;
 
 impl FlatVectorSegment {
-    pub fn new(dimensions: usize) -> Self {
+    /// Create a new empty vector segment with the given dimensionality.
+    #[must_use]
+    pub const fn new(dimensions: usize) -> Self {
         Self {
             generation_start: 0,
             generation_end: 0,
@@ -51,23 +57,44 @@ impl FlatVectorSegment {
         }
     }
 
-    pub fn len(&self) -> usize {
+    /// Number of vectors in this segment.
+    #[must_use]
+    pub const fn len(&self) -> usize {
         self.doc_ordinals.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    /// Returns `true` if this segment contains no vectors.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.doc_ordinals.is_empty()
     }
 
+    /// Push a vector with an ordinal (without explicit `op_id` / `chunk_ordinal`).
+    #[expect(
+        clippy::missing_assert_message,
+        reason = "debug_assert_eq with just len/dimensions is self-explanatory"
+    )]
     pub fn push(&mut self, ordinal: DocOrdinal, vec: &[f16]) {
         debug_assert_eq!(vec.len(), self.dimensions);
         self.doc_ordinals.push(ordinal);
-        self.op_ids.push(OpId::new(NodeId(0), 0, ordinal as u64));
+        self.op_ids
+            .push(OpId::new(NodeId(0), 0, u64::from(ordinal)));
         self.chunk_ordinals.push(0);
         self.vectors.extend_from_slice(vec);
     }
 
-    pub fn push_with_op(&mut self, ordinal: DocOrdinal, vec: &[f16], op_id: OpId, chunk_ordinal: u32) {
+    /// Push a vector with full metadata (ordinal, `op_id`, `chunk_ordinal`).
+    #[expect(
+        clippy::missing_assert_message,
+        reason = "debug_assert_eq with just len/dimensions is self-explanatory"
+    )]
+    pub fn push_with_op(
+        &mut self,
+        ordinal: DocOrdinal,
+        vec: &[f16],
+        op_id: OpId,
+        chunk_ordinal: u32,
+    ) {
         debug_assert_eq!(vec.len(), self.dimensions);
         self.doc_ordinals.push(ordinal);
         self.op_ids.push(op_id);
@@ -75,6 +102,13 @@ impl FlatVectorSegment {
         self.vectors.extend_from_slice(vec);
     }
 
+    /// Get the vector at the given index, or `None` if out of bounds.
+    #[expect(
+        clippy::arithmetic_side_effects,
+        clippy::indexing_slicing,
+        reason = "Bounds check is performed before arithmetic; dimensions is non-zero for any real index"
+    )]
+    #[must_use]
     pub fn get(&self, index: usize) -> Option<&[f16]> {
         if index >= self.doc_ordinals.len() {
             return None;
@@ -83,7 +117,8 @@ impl FlatVectorSegment {
         Some(&self.vectors[start..start + self.dimensions])
     }
 
-    pub fn seal(&mut self, gen_start: Generation, gen_end: Generation) {
+    /// Seal this segment with a generation range (prevents further pushes).
+    pub const fn seal(&mut self, gen_start: Generation, gen_end: Generation) {
         self.generation_start = gen_start;
         self.generation_end = gen_end;
     }
@@ -93,6 +128,7 @@ impl FlatVectorSegment {
 // VectorIndex
 // ---------------------------------------------------------------------------
 
+/// A flat f16 vector index with `RoaringBitmap` filters and exact scan.
 pub struct VectorIndex {
     manifest: EmbeddingManifest,
     active: FlatVectorSegment,
@@ -101,9 +137,27 @@ pub struct VectorIndex {
     next_ordinal: DocOrdinal,
 }
 
+#[expect(
+    clippy::missing_fields_in_debug,
+    reason = "VectorFilters and sealed segments are large internal state; active_len and next_ordinal are sufficient for debugging"
+)]
+impl std::fmt::Debug for VectorIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectorIndex")
+            .field("manifest", &self.manifest)
+            .field("active_len", &self.active.len())
+            .field("sealed_count", &self.sealed.len())
+            .field("next_ordinal", &self.next_ordinal)
+            .finish()
+    }
+}
+
+/// `RoaringBitmap` filters for vector index pre-filtering.
 #[derive(Debug, Clone)]
 pub struct VectorFilters {
+    /// Bitmaps keyed by operation kind (message, tool, command, etc.).
     pub kind_bitmaps: std::collections::HashMap<String, RoaringBitmap>,
+    /// Bitmaps keyed by session ID.
     pub session_bitmaps: std::collections::HashMap<u64, RoaringBitmap>,
 }
 
@@ -117,6 +171,12 @@ impl VectorFilters {
 }
 
 impl VectorIndex {
+    /// Create a new empty vector index with the given embedding manifest.
+    #[expect(
+        clippy::as_conversions,
+        reason = "manifest.dimensions is u32 from wire format; usize conversion is safe for any realistic dimension count (<65536)"
+    )]
+    #[must_use]
     pub fn new(manifest: EmbeddingManifest) -> Self {
         let dims = manifest.dimensions as usize;
         Self {
@@ -128,6 +188,13 @@ impl VectorIndex {
         }
     }
 
+    /// Add a vector to the active segment with its metadata.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::arithmetic_side_effects,
+        clippy::let_underscore_untyped,
+        reason = "all parameters are required for vector indexing; next_ordinal increment is bounded; bitmap insert discards old value"
+    )]
     pub fn add_vector(
         &mut self,
         op_id: OpId,
@@ -141,14 +208,16 @@ impl VectorIndex {
         self.next_ordinal += 1;
         self.active.push_with_op(ordinal, vec, op_id, chunk_ordinal);
 
-        self.filters
+        let _ = self
+            .filters
             .kind_bitmaps
             .entry(kind.to_string())
             .or_default()
             .insert(ordinal);
 
         if let Some(sid) = session_id {
-            self.filters
+            let _ = self
+                .filters
                 .session_bitmaps
                 .entry(sid)
                 .or_default()
@@ -156,6 +225,11 @@ impl VectorIndex {
         }
     }
 
+    /// Seal the active segment and start a new one at the given generation.
+    #[expect(
+        clippy::as_conversions,
+        reason = "manifest.dimensions is u32 from wire format; usize conversion is safe for any realistic dimension count (<65536)"
+    )]
     pub fn seal_active(&mut self, generation: Generation) {
         if !self.active.is_empty() {
             self.active.seal(self.active.generation_start, generation);
@@ -168,6 +242,8 @@ impl VectorIndex {
         self.active.generation_start = generation;
     }
 
+    /// Search the vector index with the given query vector and filters.
+    #[must_use]
     pub fn search(
         &self,
         query_vec: &[f16],
@@ -177,26 +253,42 @@ impl VectorIndex {
         let filter_mask = self.build_filter_mask(filters);
         let mut candidates = Vec::new();
 
-        self.scan_segment(&self.active, query_vec, &filter_mask, &mut candidates);
+        self.scan_segment(
+            &self.active,
+            query_vec,
+            filter_mask.as_ref(),
+            &mut candidates,
+        );
         for segment in &self.sealed {
-            self.scan_segment(segment, query_vec, &filter_mask, &mut candidates);
+            self.scan_segment(segment, query_vec, filter_mask.as_ref(), &mut candidates);
         }
 
         candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        candidates.into_iter().take(top_k).map(|(_, chunk)| chunk).collect()
+        candidates
+            .into_iter()
+            .take(top_k)
+            .map(|(_, chunk)| chunk)
+            .collect()
     }
 
+    /// Scan a single segment, computing dot products and collecting candidates.
+    #[expect(
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::unused_self,
+        reason = "Segment vectors are guaranteed to be dimension-aligned; i*dims is bounded by segment length; self is retained for future extensibility"
+    )]
     fn scan_segment(
         &self,
         segment: &FlatVectorSegment,
         query_vec: &[f16],
-        filter_mask: &Option<RoaringBitmap>,
+        filter_mask: Option<&RoaringBitmap>,
         results: &mut Vec<(f32, ScoredChunk)>,
     ) {
         let dims = segment.dimensions;
         for i in 0..segment.len() {
             let ordinal = segment.doc_ordinals[i];
-            if let Some(ref mask) = filter_mask {
+            if let Some(mask) = filter_mask {
                 if !mask.contains(ordinal) {
                     continue;
                 }
@@ -212,13 +304,19 @@ impl VectorIndex {
             results.push((
                 score,
                 ScoredChunk {
-                    chunk_id: ChunkId { op_id, chunk_ordinal: chunk_ord },
+                    chunk_id: ChunkId {
+                        op_id,
+                        chunk_ordinal: chunk_ord,
+                    },
                     op_id,
-                    score: score as f64,
+                    score: f64::from(score),
                     text: String::new(),
                     metadata: ChunkMetadata {
                         op_id,
-                        chunk_id: ChunkId { op_id, chunk_ordinal: chunk_ord },
+                        chunk_id: ChunkId {
+                            op_id,
+                            chunk_ordinal: chunk_ord,
+                        },
                         session_id: None,
                         actor_id: editchain_core::ActorId(0),
                         kind_tags: 0,
@@ -230,6 +328,7 @@ impl VectorIndex {
         }
     }
 
+    /// Build a combined filter mask from search filters, intersecting kind bitmaps.
     fn build_filter_mask(&self, filters: &SearchFilters) -> Option<RoaringBitmap> {
         let mut mask: Option<RoaringBitmap> = None;
         if let Some(ref kinds) = filters.kinds {
@@ -245,7 +344,7 @@ impl VectorIndex {
                 };
                 if let Some(bitmap) = self.filters.kind_bitmaps.get(kind_str) {
                     match &mut mask {
-                        Some(ref mut m) => *m &= bitmap.clone(),
+                        Some(m) => *m &= bitmap.clone(),
                         None => mask = Some(bitmap.clone()),
                     }
                 } else {
@@ -256,6 +355,12 @@ impl VectorIndex {
         mask
     }
 
+    /// Number of vectors across all segments (active + sealed).
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "Segment lengths are bounded by memory; addition is safe"
+    )]
+    #[must_use]
     pub fn num_vectors(&self) -> usize {
         let mut count = self.active.len();
         for seg in &self.sealed {
@@ -264,7 +369,9 @@ impl VectorIndex {
         count
     }
 
-    pub fn manifest(&self) -> &EmbeddingManifest {
+    /// The embedding manifest describing vector dimensionality and model.
+    #[must_use]
+    pub const fn manifest(&self) -> &EmbeddingManifest {
         &self.manifest
     }
 }
@@ -280,12 +387,34 @@ pub struct VectorSearchWrapper {
     embedder: Box<dyn Embedder>,
 }
 
+#[expect(
+    clippy::missing_fields_in_debug,
+    reason = "Box<dyn Embedder> does not implement Debug; index state is sufficient for debugging"
+)]
+impl std::fmt::Debug for VectorSearchWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectorSearchWrapper")
+            .field("index", &self.index)
+            .finish()
+    }
+}
+
 impl VectorSearchWrapper {
+    /// Create a new vector search wrapper with the given index and embedder.
+    #[must_use]
     pub fn new(index: VectorIndex, embedder: Box<dyn Embedder>) -> Self {
         Self { index, embedder }
     }
 
     /// Embed a batch of texts and add them to the index.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EmbedError` if the embedder fails to produce embeddings.
+    #[expect(
+        clippy::type_complexity,
+        reason = "tuple is internal to this module and not exposed publicly"
+    )]
     pub fn add_texts(
         &mut self,
         texts: &[(OpId, u32, String, String, Option<u64>)],
@@ -295,29 +424,27 @@ impl VectorSearchWrapper {
         let vectors = self.embedder.embed(&batch)?;
         for ((op_id, chunk_ordinal, _, kind, session_id), vec) in texts.iter().zip(vectors.iter()) {
             let f16v = f32_to_f16_vec(vec);
-            self.index.add_vector(*op_id, *chunk_ordinal, &f16v, kind, *session_id, generation);
+            self.index
+                .add_vector(*op_id, *chunk_ordinal, &f16v, kind, *session_id, generation);
         }
         Ok(())
     }
-}
 
-impl VectorSearchWrapper {
     /// Access the embedder mutably (for batch embedding).
     pub fn embedder_mut(&mut self) -> &mut Box<dyn Embedder> {
         &mut self.embedder
     }
 
     /// Access the vector index mutably.
-    pub fn index_mut(&mut self) -> &mut VectorIndex {
+    pub const fn index_mut(&mut self) -> &mut VectorIndex {
         &mut self.index
     }
 }
 
 impl VectorSearch for VectorSearchWrapper {
     fn search(&self, query: &str, filters: &SearchFilters, top_k: usize) -> Vec<ScoredChunk> {
-        let query_vec = match self.embedder.embed_query(query) {
-            Ok(v) => v,
-            Err(_) => return Vec::new(),
+        let Ok(query_vec) = self.embedder.embed_query(query) else {
+            return Vec::new();
         };
         let f16q = f32_to_f16_vec(&query_vec);
         self.index.search(&f16q, filters, top_k)
@@ -328,15 +455,25 @@ impl VectorSearch for VectorSearchWrapper {
 // Math helpers
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::missing_assert_message,
+    reason = "debug_assert_eq with just len comparison is self-explanatory"
+)]
 fn dot_product_f16(a: &[f16], b: &[f16]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(x, y)| x.to_f32() * y.to_f32()).sum()
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| x.to_f32() * y.to_f32())
+        .sum()
 }
 
+/// Convert a slice of f32 values to a vector of f16 values.
+#[must_use]
 pub fn f32_to_f16_vec(vec: &[f32]) -> Vec<f16> {
     vec.iter().map(|&x| f16::from_f32(x)).collect()
 }
 
+/// Normalize an f32 vector in-place to unit length.
 pub fn normalize_f32(vec: &mut [f32]) {
     let norm_sq: f32 = vec.iter().map(|x| x * x).sum();
     if norm_sq > 0.0 {
@@ -346,4 +483,3 @@ pub fn normalize_f32(vec: &mut [f32]) {
         }
     }
 }
-

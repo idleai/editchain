@@ -1,3 +1,16 @@
+//! Export tests.
+
+use clap as _;
+use dirs as _;
+use editchain_codec as _;
+use editchain_embed as _;
+use editchain_import as _;
+use editchain_index as _;
+use editchain_query as _;
+use serde as _;
+use serde_json as _;
+use tempfile as _;
+
 use editchain_core::*;
 use editchain_node::export::op_to_json;
 
@@ -5,14 +18,14 @@ use editchain_node::export::op_to_json;
 fn export_message_op() {
     let op = Op {
         id: OpId::new(NodeId(1), 0, 1),
-        parents: parents::ParentSet::None,
+        parents: ParentSet::None,
         actor: ActorId(0),
-        clock: clock::Clock::UnixMs(1700000000000),
-        scope: scope::ScopeRef::None,
-        tags: tags::Tags::MESSAGE,
-        kind: op::OpKind::Message(op::MessageOp {
-            content: payload::Payload::Inline(b"hello".to_vec()),
-            content_type: payload::Payload::Empty,
+        clock: Clock::UnixMs(1_700_000_000_000),
+        scope: ScopeRef::None,
+        tags: Tags::MESSAGE,
+        kind: OpKind::Message(MessageOp {
+            content: Payload::Inline(b"hello".to_vec()),
+            content_type: Payload::Empty,
         }),
     };
 

@@ -5,8 +5,7 @@ use crate::ids::OpId;
 /// Parent references for causal ordering.
 ///
 /// Operations reference their causal parents to establish a DAG.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ParentSet {
     /// No parents (root operation).
     #[default]
@@ -15,15 +14,12 @@ pub enum ParentSet {
     One(OpId),
     /// Two parents (e.g. merge of two branches).
     Two(OpId, OpId),
-    // /// Many parents stored as an external blob.
-    // /// Commented out — blob resolution layer not yet implemented.
-    // Many(BlobRef),
 }
 
-
 impl ParentSet {
-    /// Returns an iterator over all referenced OpIds.
-    pub fn iter(&self) -> ParentIter<'_> {
+    /// Returns an iterator over all referenced `OpId`s.
+    #[must_use]
+    pub const fn iter(&self) -> ParentIter<'_> {
         ParentIter {
             set: self,
             index: 0,
@@ -31,7 +27,17 @@ impl ParentSet {
     }
 }
 
-/// Iterator over parent OpIds.
+impl<'a> IntoIterator for &'a ParentSet {
+    type Item = &'a OpId;
+    type IntoIter = ParentIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// Iterator over parent `OpId`s.
+#[derive(Debug)]
 pub struct ParentIter<'a> {
     set: &'a ParentSet,
     index: usize,
@@ -42,12 +48,7 @@ impl<'a> Iterator for ParentIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match (self.set, self.index) {
-            (ParentSet::None, _) => None,
-            (ParentSet::One(a), 0) => {
-                self.index = 1;
-                Some(a)
-            }
-            (ParentSet::Two(a, _b), 0) => {
+            (ParentSet::One(a) | ParentSet::Two(a, _), 0) => {
                 self.index = 1;
                 Some(a)
             }

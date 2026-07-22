@@ -1,15 +1,15 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::action::Action;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Map keyboard events to actions.
-pub fn map_key(event: KeyEvent) -> Action {
+pub(crate) const fn map_key(event: KeyEvent) -> Action {
     match (event.code, event.modifiers) {
         (KeyCode::Char('q'), _) => Action::Quit,
         (KeyCode::Char('?'), _) => Action::OpenHelp,
         (KeyCode::Esc, _) => Action::ClosePopup,
         (KeyCode::Tab, _) => Action::ToggleFocus,
-        (KeyCode::Char('j'), _) | (KeyCode::Down, _) => Action::Down,
-        (KeyCode::Char('k'), _) | (KeyCode::Up, _) => Action::Up,
+        (KeyCode::Char('j') | KeyCode::Down, _) => Action::Down,
+        (KeyCode::Char('k') | KeyCode::Up, _) => Action::Up,
         (KeyCode::Char('g'), _) => Action::Top,
         (KeyCode::Char('G'), _) => Action::Bottom,
         (KeyCode::PageDown, _) => Action::PageDown,

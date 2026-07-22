@@ -11,7 +11,7 @@ pub enum Pooling {
 /// vector identity. Any manifest change forces a vector rebuild.
 #[derive(Debug, Clone)]
 pub struct EmbeddingManifest {
-    /// HuggingFace model ID (e.g. "Qwen/Qwen3-Embedding-0.6B").
+    /// `HuggingFace` model ID (e.g. "Qwen/Qwen3-Embedding-0.6B").
     pub model_id: String,
     /// Model revision (git commit hash or tag).
     pub revision: String,
@@ -23,14 +23,15 @@ pub struct EmbeddingManifest {
     pub pooling: Pooling,
     /// Whether to L2-normalize output vectors.
     pub normalize: bool,
-    /// Optional query instruction prefix (e.g. "search_query:").
+    /// Optional query instruction prefix (e.g. `"search_query:"`).
     pub query_instruction: String,
-    /// Optional document prefix (e.g. "search_document:").
+    /// Optional document prefix (e.g. `"search_document:"`).
     pub document_prefix: String,
 }
 
 impl EmbeddingManifest {
     /// Create a manifest for Qwen3-Embedding-0.6B at 1024 dimensions.
+    #[must_use]
     pub fn qwen3_embedding_0_6b() -> Self {
         Self {
             model_id: "Qwen/Qwen3-Embedding-0.6B".to_string(),
@@ -45,6 +46,7 @@ impl EmbeddingManifest {
     }
 
     /// Create a manifest for Qwen3-Embedding-4B at 512 dimensions.
+    #[must_use]
     pub fn qwen3_embedding_4b() -> Self {
         Self {
             model_id: "Qwen/Qwen3-Embedding-4B".to_string(),
@@ -59,6 +61,7 @@ impl EmbeddingManifest {
     }
 
     /// A stable identity string for this manifest (used to detect changes).
+    #[must_use]
     pub fn identity(&self) -> String {
         format!(
             "{}|{}|{}|{}|{:?}|{}|{}|{}",
@@ -77,9 +80,18 @@ impl EmbeddingManifest {
 /// The embedder trait — implemented by inference backends.
 pub trait Embedder: Send + Sync {
     /// Embed a batch of texts into normalized vectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EmbedError` if the backend is unavailable, the input is too
+    /// long, or a transient failure occurs.
     fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError>;
 
     /// Embed multiple batches concurrently.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EmbedError` if any batch fails.
     fn embed_batches(&self, batches: &[Vec<String>]) -> Result<Vec<Vec<Vec<f32>>>, EmbedError> {
         // Default sequential fallback.
         let mut all = Vec::new();
@@ -91,6 +103,10 @@ pub trait Embedder: Send + Sync {
     }
 
     /// Embed a single query text (applies query instruction if configured).
+    ///
+    /// # Errors
+    ///
+    /// Returns `EmbedError` if the backend is unavailable.
     fn embed_query(&self, query: &str) -> Result<Vec<f32>, EmbedError> {
         let prefixed = if self.manifest().query_instruction.is_empty() {
             query.to_string()
@@ -102,6 +118,10 @@ pub trait Embedder: Send + Sync {
     }
 
     /// Embed a single document text (applies document prefix if configured).
+    ///
+    /// # Errors
+    ///
+    /// Returns `EmbedError` if the backend is unavailable.
     fn embed_document(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
         let prefixed = if self.manifest().document_prefix.is_empty() {
             text.to_string()
@@ -126,8 +146,13 @@ pub trait Embedder: Send + Sync {
 pub enum EmbedError {
     /// Model not loaded or unavailable.
     ModelNotReady(String),
-    /// Input too long for model's max_tokens.
-    InputTooLong { actual: usize, max: usize },
+    /// Input too long for model's `max_tokens`.
+    InputTooLong {
+        /// Actual token count.
+        actual: usize,
+        /// Maximum allowed token count.
+        max: usize,
+    },
     /// Backend-specific error.
     Backend(String),
 }
@@ -135,14 +160,13 @@ pub enum EmbedError {
 impl std::fmt::Display for EmbedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EmbedError::ModelNotReady(msg) => write!(f, "model not ready: {}", msg),
-            EmbedError::InputTooLong { actual, max } => {
-                write!(f, "input too long: {} tokens (max {})", actual, max)
+            Self::ModelNotReady(msg) => write!(f, "model not ready: {msg}"),
+            Self::InputTooLong { actual, max } => {
+                write!(f, "input too long: {actual} tokens (max {max})")
             }
-            EmbedError::Backend(msg) => write!(f, "embedding backend error: {}", msg),
+            Self::Backend(msg) => write!(f, "embedding backend error: {msg}"),
         }
     }
 }
 
 impl std::error::Error for EmbedError {}
-

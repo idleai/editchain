@@ -1,18 +1,30 @@
-use std::sync::Arc;
-use editchain_core::OpId;
 use crate::action::Action;
+use crate::data::filters::FilterExpr;
 use crate::data::header::OpOrdinal;
 use crate::data::snapshot::TuiSnapshot;
-use crate::data::filters::FilterExpr;
+use editchain_core::OpId;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AppMode { Browser, /* LocalGraph — reserved for future use */ FullNode }
+pub(crate) enum AppMode {
+    Browser,
+    /* LocalGraph — reserved for future use */ FullNode,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Focus { DagLog, Inspector, Popup }
+pub(crate) enum Focus {
+    DagLog,
+    Inspector,
+    Popup,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InspectorTab { Summary, Content, Relations, Raw }
+pub(crate) enum InspectorTab {
+    Summary,
+    Content,
+    Relations,
+    Raw,
+}
 
 impl InspectorTab {
     // pub fn next(&self) -> Self {
@@ -42,15 +54,24 @@ impl InspectorTab {
 }
 
 #[derive(Debug, Clone)]
-pub enum Popup { Help, Search, Filters }
+pub(crate) enum Popup {
+    Help,
+    Search,
+    Filters,
+}
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub enum StatusState { Ready, Info(String), Warning(String), Error(String) }
+#[expect(dead_code, reason = "variants used in status bar rendering")]
+pub(crate) enum StatusState {
+    Ready,
+    Info(String),
+    Warning(String),
+    Error(String),
+}
 
-#[allow(dead_code)]
+#[expect(dead_code, reason = "WIP search functionality")]
 #[derive(Debug, Clone, Default)]
-pub struct SearchState {
+pub(crate) struct SearchState {
     pub query: String,
     pub results: Vec<OpOrdinal>,
     pub current_result: Option<usize>,
@@ -59,15 +80,15 @@ pub struct SearchState {
 
 use crate::dag::lanes::DagRow;
 
-#[allow(dead_code)]
-pub struct App {
+#[expect(dead_code, reason = "WIP DAG visualization fields")]
+pub(crate) struct App {
     pub mode: AppMode,
     pub focus: Focus,
     pub snapshot: Option<Arc<TuiSnapshot>>,
     pub visible_rows: Arc<Vec<OpOrdinal>>,
-    /// Cached DAG lane rows — recomputed when visible_rows changes.
+    /// Cached DAG lane rows — recomputed when `visible_rows` changes.
     pub dag_rows: Vec<DagRow>,
-    /// Generation counter bumped when visible_rows changes (for cache invalidation).
+    /// Generation counter bumped when `visible_rows` changes (for cache invalidation).
     pub visible_gen: u64,
     pub selected_visible_index: usize,
     pub selected_op: Option<OpId>,
@@ -85,7 +106,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             mode: AppMode::Browser,
             focus: Focus::DagLog,
@@ -109,11 +130,15 @@ impl App {
         }
     }
 
-    pub fn load_snapshot(&mut self, snapshot: TuiSnapshot) {
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        reason = "TUI snapshot loading; ordinal range is bounded by snapshot size"
+    )]
+    pub(crate) fn load_snapshot(&mut self, snapshot: TuiSnapshot) {
         let stats = snapshot.statistics.clone();
-        let snapshot = Arc::new(snapshot);
         let all_ords: Vec<OpOrdinal> = (0..snapshot.headers.len() as OpOrdinal).collect();
-        self.snapshot = Some(snapshot);
+        self.snapshot = Some(Arc::new(snapshot));
         self.visible_rows = Arc::new(all_ords);
         self.selected_visible_index = 0;
         self.selected_op = None;
@@ -123,7 +148,12 @@ impl App {
     }
 
     /// Recompute cached DAG rows from the current visible set.
-    pub fn recompute_dag_rows(&mut self) {
+    #[expect(
+        clippy::arithmetic_side_effects,
+        clippy::as_conversions,
+        reason = "visible_gen is a bounded counter; ordinal to usize cast is safe"
+    )]
+    pub(crate) fn recompute_dag_rows(&mut self) {
         let snapshot = match &self.snapshot {
             Some(s) => s.clone(),
             None => return,
@@ -135,12 +165,26 @@ impl App {
         }
         self.dag_rows = crate::dag::lanes::LaneState::compute_rows(
             &visible,
-            |ord| snapshot.header_at(ord).map(|h| h.id).unwrap_or(editchain_core::OpId::new(editchain_core::NodeId(0), 0, 0)),
-            |ord| snapshot.parents.get(ord as usize).cloned().unwrap_or_default(),
+            |ord| {
+                snapshot
+                    .header_at(ord)
+                    .map_or(OpId::new(editchain_core::NodeId(0), 0, 0), |h| h.id)
+            },
+            |ord| {
+                snapshot
+                    .parents
+                    .get(ord as usize)
+                    .cloned()
+                    .unwrap_or_default()
+            },
         );
         self.visible_gen += 1;
     }
 
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "selected_visible_index is bounds-checked before indexing"
+    )]
     fn sync_selection(&mut self) {
         if let Some(ref snapshot) = self.snapshot {
             if self.selected_visible_index < self.visible_rows.len() {
@@ -154,6 +198,11 @@ impl App {
         self.selected_op = None;
     }
 
+    #[expect(
+        clippy::arithmetic_side_effects,
+        clippy::as_conversions,
+        reason = "TUI viewport calculations; saturating_sub prevents underflow"
+    )]
     fn ensure_visible(&mut self) {
         let vh = (self.terminal_height.saturating_sub(3) as usize).max(5);
         if self.selected_visible_index < self.scroll_offset {
@@ -187,11 +236,15 @@ impl App {
         #[cfg(target_os = "linux")]
         {
             std::process::Command::new("xclip")
-                .arg("-selection").arg("clipboard")
+                .arg("-selection")
+                .arg("clipboard")
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .and_then(|mut child| {
-                    child.stdin.as_mut().map(|s| s.write_all(text.as_bytes()));
+                    let _: Option<Option<()>> = child
+                        .stdin
+                        .as_mut()
+                        .map(|s| s.write_all(text.as_bytes()).ok());
                     child.wait()
                 })
                 .is_ok()
@@ -202,21 +255,37 @@ impl App {
                 .stdin(std::process::Stdio::piped())
                 .spawn()
                 .and_then(|mut child| {
-                    child.stdin.as_mut().map(|s| s.write_all(text.as_bytes()));
+                    let _: Option<Option<()>> = child
+                        .stdin
+                        .as_mut()
+                        .map(|s| s.write_all(text.as_bytes()).ok());
                     child.wait()
                 })
                 .is_ok()
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        { false }
+        {
+            false
+        }
     }
 
-    pub fn handle_action(&mut self, action: Action) -> bool {
+    #[expect(
+        clippy::arithmetic_side_effects,
+        clippy::as_conversions,
+        reason = "TUI navigation; all arithmetic uses saturating_sub and bounds checks"
+    )]
+    pub(crate) fn handle_action(&mut self, action: Action) -> bool {
         match action {
-            Action::Quit => { self.should_quit = true; true }
+            Action::Quit => {
+                self.should_quit = true;
+                true
+            }
 
             Action::Down => {
-                if self.focus == Focus::DagLog && !self.visible_rows.is_empty() && self.selected_visible_index + 1 < self.visible_rows.len() {
+                if self.focus == Focus::DagLog
+                    && !self.visible_rows.is_empty()
+                    && self.selected_visible_index + 1 < self.visible_rows.len()
+                {
                     self.selected_visible_index += 1;
                     self.sync_selection();
                     self.ensure_visible();
@@ -296,8 +365,12 @@ impl App {
 
             Action::ToggleFocus => {
                 match (self.focus, &self.popup) {
-                    (Focus::DagLog, None) => { self.focus = Focus::Inspector; }
-                    (Focus::Inspector, None) => { self.focus = Focus::DagLog; }
+                    (Focus::DagLog, None) => {
+                        self.focus = Focus::Inspector;
+                    }
+                    (Focus::Inspector, None) => {
+                        self.focus = Focus::DagLog;
+                    }
                     _ => {}
                 }
                 true
@@ -368,7 +441,7 @@ impl App {
                         if let Some(ord) = snapshot.ordinal_of(&op_id) {
                             if let Some(parents) = snapshot.parents.get(ord as usize) {
                                 if let Some(&parent_ord) = parents.first() {
-                                    self.jump_to_ordinal(parent_ord);
+                                    let _: bool = self.jump_to_ordinal(parent_ord);
                                 }
                             }
                         }
@@ -383,7 +456,7 @@ impl App {
                         if let Some(ord) = snapshot.ordinal_of(&op_id) {
                             if let Some(children) = snapshot.children.get(ord as usize) {
                                 if let Some(&child_ord) = children.first() {
-                                    self.jump_to_ordinal(child_ord);
+                                    let _: bool = self.jump_to_ordinal(child_ord);
                                 }
                             }
                         }
@@ -396,7 +469,7 @@ impl App {
                 if let Some(op_id) = self.selected_op {
                     let id_str = op_id.to_string();
                     if Self::copy_to_clipboard(&id_str) {
-                        self.status = StatusState::Info(format!("Copied {}", id_str));
+                        self.status = StatusState::Info(format!("Copied {id_str}"));
                     } else {
                         self.status = StatusState::Info(id_str);
                     }
@@ -406,17 +479,27 @@ impl App {
 
             Action::ToggleRawImports => {
                 self.show_raw_imports = !self.show_raw_imports;
-                self.status = StatusState::Info(format!("Raw imports: {}", if self.show_raw_imports { "shown" } else { "hidden" }));
+                self.status = StatusState::Info(format!(
+                    "Raw imports: {}",
+                    if self.show_raw_imports {
+                        "shown"
+                    } else {
+                        "hidden"
+                    }
+                ));
                 true
             }
 
             Action::TogglePrivate => {
                 self.show_private = !self.show_private;
-                self.status = StatusState::Info(format!("Private records: {}", if self.show_private { "shown" } else { "hidden" }));
+                self.status = StatusState::Info(format!(
+                    "Private records: {}",
+                    if self.show_private { "shown" } else { "hidden" }
+                ));
                 true
             }
 
-            Action::Redraw => { true }
+            Action::Redraw => true,
 
             Action::OpenSearch => {
                 self.popup = Some(Popup::Search);
@@ -430,7 +513,7 @@ impl App {
                 true
             }
 
-            Action::None => { false }
+            Action::None => false,
         }
     }
 }

@@ -11,9 +11,14 @@ use crate::{EmbedError, Embedder, EmbeddingManifest};
 
 static TEMP_COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// HTTP-based embedding backend that calls an OpenAI-compatible embeddings API.
+#[derive(Debug)]
 pub struct HttpEmbedder {
+    /// The embedding model manifest.
     manifest: EmbeddingManifest,
+    /// The API endpoint URL (scheme + host + port).
     endpoint: String,
+    /// The model name sent in API requests.
     model: String,
 }
 
@@ -35,27 +40,49 @@ struct EmbeddingData {
 }
 
 impl HttpEmbedder {
+    /// Create a new HTTP embedder with the given manifest and endpoint URL.
+    #[must_use]
     pub fn new(manifest: EmbeddingManifest, endpoint: String) -> Self {
         let model = manifest.model_id.clone();
-        Self { manifest, endpoint, model }
+        Self {
+            manifest,
+            endpoint,
+            model,
+        }
     }
 
     /// Maximum retries per batch on transient failures.
     const MAX_RETRIES: u32 = 3;
 
-    /// Maximum characters per text — SGLang hangs on certain long sequences
+    /// Maximum characters per text — `SGLang` hangs on certain long sequences
     /// (~6.8K+ tokens with dense tokenization like ANSI codes or JSON arrays).
     const MAX_TEXT_CHARS: usize = 8000;
 
+    /// Embed a batch of texts by calling the HTTP API with retry logic.
+    #[expect(
+        clippy::print_stderr,
+        reason = "Retry logging to stderr is intentional"
+    )]
+    #[expect(
+        clippy::string_slice,
+        reason = "Truncation at MAX_TEXT_CHARS boundary; multi-byte char split is acceptable"
+    )]
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "Retry delay arithmetic with small constants"
+    )]
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbedError> {
         // Truncate texts to avoid SGLang HTTP response hang on long sequences.
-        let truncated: Vec<String> = texts.iter()
-            .map(|t| if t.len() > Self::MAX_TEXT_CHARS {
-                let mut s = t[..Self::MAX_TEXT_CHARS].to_string();
-                s.push_str(" [truncated]");
-                s
-            } else {
-                t.clone()
+        let truncated: Vec<String> = texts
+            .iter()
+            .map(|t| {
+                if t.len() > Self::MAX_TEXT_CHARS {
+                    let mut s = t[..Self::MAX_TEXT_CHARS].to_string();
+                    s.push_str(" [truncated]");
+                    s
+                } else {
+                    t.clone()
+                }
             })
             .collect();
 
@@ -69,11 +96,12 @@ impl HttpEmbedder {
 
         // Write body to a temp file to avoid stdin pipe issues with Rust subprocess.
         let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp_path = format!("/tmp/editchain_embed_{}.json", counter);
+        let tmp_path = format!("/tmp/editchain_embed_{counter}.json");
         let mut tmp_file = std::fs::File::create(&tmp_path)
-            .map_err(|e| EmbedError::Backend(format!("tmpfile create: {}", e)))?;
-        tmp_file.write_all(body.as_bytes())
-            .map_err(|e| EmbedError::Backend(format!("tmpfile write: {}", e)))?;
+            .map_err(|e| EmbedError::Backend(format!("tmpfile create: {e}")))?;
+        tmp_file
+            .write_all(body.as_bytes())
+            .map_err(|e| EmbedError::Backend(format!("tmpfile write: {e}")))?;
         drop(tmp_file);
 
         // Retry loop for transient failures (timeouts, server overload).
@@ -81,14 +109,13 @@ impl HttpEmbedder {
         for attempt in 0..Self::MAX_RETRIES {
             if attempt > 0 {
                 let delay_ms = 500 * (1 << attempt); // 1s, 2s, 4s
-                eprintln!("embed: retry {} after {}ms", attempt, delay_ms);
+                eprintln!("embed: retry {attempt} after {delay_ms}ms");
                 std::thread::sleep(Duration::from_millis(delay_ms));
             }
 
             // Use sh -c to avoid any Rust subprocess pipe lifecycle issues.
             let curl_cmd = format!(
-                "/usr/bin/curl -s --connect-timeout 10 --max-time 180 -H 'Content-Type: application/json' -d '@{}' '{}'",
-                tmp_path, url
+                "/usr/bin/curl -s --connect-timeout 10 --max-time 180 -H 'Content-Type: application/json' -d '@{tmp_path}' '{url}'",
             );
             let output = match Command::new("/bin/sh")
                 .arg("-c")
@@ -99,7 +126,7 @@ impl HttpEmbedder {
             {
                 Ok(o) => o,
                 Err(e) => {
-                    last_err = Some(EmbedError::Backend(format!("curl exec: {}", e)));
+                    last_err = Some(EmbedError::Backend(format!("curl exec: {e}")));
                     continue;
                 }
             };
@@ -112,11 +139,15 @@ impl HttpEmbedder {
                 }
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 // Clean up temp file on failure.
-                let _ = std::fs::remove_file(&tmp_path);
+                drop(std::fs::remove_file(&tmp_path));
                 return Err(EmbedError::Backend(format!(
                     "curl failed (exit={}): {}",
                     code,
-                    if stderr.len() > 200 { &stderr[..200] } else { &stderr },
+                    if stderr.len() > 200 {
+                        &stderr[..200]
+                    } else {
+                        &stderr
+                    },
                 )));
             }
 
@@ -130,7 +161,7 @@ impl HttpEmbedder {
             let parsed: EmbedResponse = match serde_json::from_slice(&output.stdout) {
                 Ok(p) => p,
                 Err(e) => {
-                    last_err = Some(EmbedError::Backend(format!("json parse: {}", e)));
+                    last_err = Some(EmbedError::Backend(format!("json parse: {e}")));
                     continue;
                 }
             };
@@ -145,19 +176,21 @@ impl HttpEmbedder {
                     let norm_sq: f32 = vec.iter().map(|x| x * x).sum();
                     if norm_sq > 0.0 {
                         let norm = norm_sq.sqrt();
-                        for x in &mut vec { *x /= norm; }
+                        for x in &mut vec {
+                            *x /= norm;
+                        }
                     }
                 }
                 results.push(vec);
             }
 
             // Clean up temp file.
-            let _ = std::fs::remove_file(&tmp_path);
+            drop(std::fs::remove_file(&tmp_path));
             return Ok(results);
         }
 
         // Clean up temp file on failure.
-        let _ = std::fs::remove_file(&tmp_path);
+        drop(std::fs::remove_file(&tmp_path));
         Err(last_err.unwrap_or_else(|| EmbedError::Backend("max retries exceeded".to_string())))
     }
 }
@@ -167,6 +200,22 @@ impl Embedder for HttpEmbedder {
         self.embed_batch(texts)
     }
 
+    #[expect(
+        clippy::print_stderr,
+        reason = "Batch progress logging to stderr is intentional"
+    )]
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "Batch index arithmetic with bounded usize values"
+    )]
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "batches[i] is guarded by i < total check"
+    )]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "Mutex poisoning is a panic-anyway scenario"
+    )]
     fn embed_batches(&self, batches: &[Vec<String>]) -> Result<Vec<Vec<Vec<f32>>>, EmbedError> {
         const PARALLELISM: usize = 64;
         let total = batches.len();
@@ -176,13 +225,18 @@ impl Embedder for HttpEmbedder {
         // Use scoped threads so we can borrow &self.
         std::thread::scope(|s| {
             for _ in 0..PARALLELISM {
-                s.spawn(|| {
+                let _unused = s.spawn(|| {
                     loop {
                         let i = next_idx.fetch_add(1, Ordering::Relaxed);
                         if i >= total {
                             break;
                         }
-                        eprintln!("embed: batch {}/{} ({} texts)", i + 1, total, batches[i].len());
+                        eprintln!(
+                            "embed: batch {}/{} ({} texts)",
+                            i + 1,
+                            total,
+                            batches[i].len()
+                        );
                         match self.embed_batch(&batches[i]) {
                             Ok(vecs) => {
                                 results.lock().unwrap().push((i, Ok(vecs)));
@@ -204,10 +258,8 @@ impl Embedder for HttpEmbedder {
         unordered.sort_by_key(|(i, _)| *i);
         let mut out = Vec::with_capacity(total);
         for (_, result) in unordered {
-            {
-                let vecs = result?;
-                out.push(vecs)
-            }
+            let vecs = result?;
+            out.push(vecs);
         }
         Ok(out)
     }

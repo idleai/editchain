@@ -37,21 +37,30 @@ pub struct MetadataSnapshot {
 
 /// A complete query snapshot — all projections at a consistent point.
 ///
-/// Readers load one immutable snapshot for an entire query via ArcSwap.
+/// Readers load one immutable snapshot for an entire query via `ArcSwap`.
 #[derive(Debug, Clone)]
 pub struct QuerySnapshot {
+    /// Generation of the hydrated (text-extracted) data.
     pub hydrated_generation: Generation,
+    /// Generation of the graph projection.
     pub graph_generation: Generation,
+    /// Generation of the lexical (BM25) index.
     pub lexical_generation: Generation,
+    /// Generation of the vector index.
     pub vector_generation: Generation,
+    /// Lexical (BM25) snapshot.
     pub lexical: Arc<LexicalSnapshot>,
+    /// Vector index snapshot.
     pub vectors: Arc<dyn VectorSnapshot>,
+    /// Graph (DAG) snapshot.
     pub graph: Arc<GraphSnapshot>,
+    /// Metadata snapshot (tag/session/actor filter bitmaps).
     pub metadata: Arc<MetadataSnapshot>,
 }
 
 impl QuerySnapshot {
     /// Create a new empty query snapshot.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             hydrated_generation: 0,

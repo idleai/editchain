@@ -1,3 +1,6 @@
+use crate::app::{App, InspectorTab};
+use crate::data::header::OpHeader;
+use crate::theme::Theme;
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Style, Stylize},
@@ -5,50 +8,49 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
-use crate::app::{App, InspectorTab};
-use crate::data::header::OpHeader;
-use crate::theme::Theme;
 
 /// Render the inspector pane (right side of the split).
-pub fn render_inspector(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    let snapshot = match &app.snapshot {
-        Some(s) => s,
-        None => {
-            let empty = Paragraph::new("No chain loaded")
-                .block(Block::default().borders(Borders::ALL).title(" Inspector "));
-            frame.render_widget(empty, area);
-            return;
-        }
+#[expect(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::manual_let_else,
+    reason = "TUI inspector; arithmetic bounded by small tab count; manual let-else is clearer for early return"
+)]
+pub(crate) fn render_inspector(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
+    let snapshot = if let Some(s) = &app.snapshot {
+        s
+    } else {
+        let empty = Paragraph::new("No chain loaded")
+            .block(Block::default().borders(Borders::ALL).title(" Inspector "));
+        frame.render_widget(empty, area);
+        return;
     };
 
-    let selected_op = match app.selected_op {
-        Some(id) => id,
-        None => {
-            let empty = Paragraph::new("No operation selected")
-                .block(Block::default().borders(Borders::ALL).title(" Inspector "));
-            frame.render_widget(empty, area);
-            return;
-        }
+    let selected_op = if let Some(id) = app.selected_op {
+        id
+    } else {
+        let empty = Paragraph::new("No operation selected")
+            .block(Block::default().borders(Borders::ALL).title(" Inspector "));
+        frame.render_widget(empty, area);
+        return;
     };
 
-    let ord = match snapshot.ordinal_of(&selected_op) {
-        Some(o) => o,
-        None => {
-            let empty = Paragraph::new("Operation not found")
-                .block(Block::default().borders(Borders::ALL).title(" Inspector "));
-            frame.render_widget(empty, area);
-            return;
-        }
+    let ord = if let Some(o) = snapshot.ordinal_of(&selected_op) {
+        o
+    } else {
+        let empty = Paragraph::new("Operation not found")
+            .block(Block::default().borders(Borders::ALL).title(" Inspector "));
+        frame.render_widget(empty, area);
+        return;
     };
 
-    let header = match snapshot.header_at(ord) {
-        Some(h) => h,
-        None => {
-            let empty = Paragraph::new("Header not available")
-                .block(Block::default().borders(Borders::ALL).title(" Inspector "));
-            frame.render_widget(empty, area);
-            return;
-        }
+    let header = if let Some(h) = snapshot.header_at(ord) {
+        h
+    } else {
+        let empty = Paragraph::new("Header not available")
+            .block(Block::default().borders(Borders::ALL).title(" Inspector "));
+        frame.render_widget(empty, area);
+        return;
     };
 
     // Tab bar
@@ -63,12 +65,12 @@ pub fn render_inspector(frame: &mut Frame, area: Rect, app: &App, theme: &Theme)
         };
         if is_active {
             tab_spans.push(Span::styled(
-                format!(" {} ", name),
+                format!(" {name} "),
                 Style::default().fg(theme.header_fg).bg(theme.header_bg),
             ));
         } else {
             tab_spans.push(Span::styled(
-                format!(" {} ", name),
+                format!(" {name} "),
                 Style::default().fg(theme.fg),
             ));
         }
@@ -110,13 +112,26 @@ fn render_summary(header: &OpHeader) -> Vec<Line<'_>> {
         Line::from(format!(" Boot:      {}", header.id.boot)),
         Line::from(format!(" Sequence:  {}", header.id.seq)),
         Line::from(format!(" Actor:     {}", header.actor)),
-        Line::from(format!(" Clock:     {} (sub: {})", header.clock_value, header.clock_sub)),
-        Line::from(format!(" Scope:     {} ({})", header.scope_discriminant, header.scope_value)),
+        Line::from(format!(
+            " Clock:     {} (sub: {})",
+            header.clock_value, header.clock_sub
+        )),
+        Line::from(format!(
+            " Scope:     {} ({})",
+            header.scope_discriminant, header.scope_value
+        )),
         Line::from(format!(" Tags:      {:#018b}", header.tags)),
-        Line::from(format!(" Kind:      {} ({})", header.kind_name(), header.kind_code)),
+        Line::from(format!(
+            " Kind:      {} ({})",
+            header.kind_name(),
+            header.kind_code
+        )),
         Line::from(format!(" Stage:     {:?}", header.stage_code)),
         Line::from(format!(" Parents:   {}", header.parent_count)),
-        Line::from(format!(" Preview:   {}", header.preview.as_deref().unwrap_or(""))),
+        Line::from(format!(
+            " Preview:   {}",
+            header.preview.as_deref().unwrap_or("")
+        )),
     ]
 }
 
@@ -143,9 +158,12 @@ fn render_content(header: &OpHeader) -> Vec<Line<'_>> {
             Style::default().bold(),
         )),
         Line::from(String::new()),
-        Line::from(format!(" {}", kind_info)),
+        Line::from(format!(" {kind_info}")),
         Line::from(String::new()),
-        Line::from(format!(" Preview: {}", header.preview.as_deref().unwrap_or(""))),
+        Line::from(format!(
+            " Preview: {}",
+            header.preview.as_deref().unwrap_or("")
+        )),
         Line::from(String::new()),
         Line::from(Span::styled(
             " Full content decoding coming in Milestone 3.",
@@ -155,6 +173,10 @@ fn render_content(header: &OpHeader) -> Vec<Line<'_>> {
 }
 
 /// Render the Relations tab.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "children.len() > 10 check ensures subtraction is safe"
+)]
 fn render_relations(ord: usize, snapshot: &crate::data::snapshot::TuiSnapshot) -> Vec<Line<'_>> {
     let mut lines = Vec::new();
 
@@ -164,7 +186,7 @@ fn render_relations(ord: usize, snapshot: &crate::data::snapshot::TuiSnapshot) -
             lines.push(Line::from(" Parents:   (root operation)"));
         } else {
             lines.push(Line::from(format!(" Parents:   {}", parents.len())));
-            for &p_ord in parents.iter() {
+            for &p_ord in parents {
                 if let Some(h) = snapshot.header_at(p_ord) {
                     lines.push(Line::from(format!("   {}  {}", h.id, h.kind_name())));
                 }
@@ -186,7 +208,10 @@ fn render_relations(ord: usize, snapshot: &crate::data::snapshot::TuiSnapshot) -
                 }
             }
             if children.len() > 10 {
-                lines.push(Line::from(format!("   ... and {} more", children.len() - 10)));
+                lines.push(Line::from(format!(
+                    "   ... and {} more",
+                    children.len() - 10
+                )));
             }
         }
     }

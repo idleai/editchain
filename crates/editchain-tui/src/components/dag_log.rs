@@ -1,3 +1,6 @@
+use crate::app::App;
+use crate::dag::lanes::LaneCell;
+use crate::theme::Theme;
 use ratatui::{
     layout::{Alignment, Constraint, Rect},
     style::Style,
@@ -5,12 +8,18 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Row, Table},
     Frame,
 };
-use crate::app::App;
-use crate::dag::lanes::LaneCell;
-use crate::theme::Theme;
 
 /// Render the DAG log pane (left side of the split).
-pub fn render_dag_log(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+#[expect(
+    clippy::arithmetic_side_effects,
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::indexing_slicing,
+    clippy::manual_let_else,
+    clippy::string_slice,
+    reason = "TUI rendering; arithmetic bounded by viewport size; let-else would be less clear; string slicing on ASCII preview"
+)]
+pub(crate) fn render_dag_log(frame: &mut Frame<'_>, area: Rect, app: &App, theme: &Theme) {
     let snapshot = match &app.snapshot {
         Some(s) => s,
         None => return,
@@ -19,7 +28,9 @@ pub fn render_dag_log(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let visible = &app.visible_rows;
     if visible.is_empty() {
         let empty = Paragraph::new("No operations").block(
-            Block::default().borders(Borders::ALL).title("EditChain DAG"),
+            Block::default()
+                .borders(Borders::ALL)
+                .title("EditChain DAG"),
         );
         frame.render_widget(empty, area);
         return;
@@ -53,7 +64,7 @@ pub fn render_dag_log(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     let header_row = Row::new(vec![Line::from(header_spans)]);
 
     // Build rows — only for visible range
-    let mut rows: Vec<Row> = Vec::with_capacity(end.saturating_sub(scroll));
+    let mut rows: Vec<Row<'_>> = Vec::with_capacity(end.saturating_sub(scroll));
     for i in scroll..end {
         let ord = visible[i];
         let header = match snapshot.header_at(ord) {
@@ -97,11 +108,21 @@ pub fn render_dag_log(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         };
 
         let spans = vec![
-            Span::styled(format!("{:<8} ", clock_str), Style::default().fg(theme.dag_line)),
-            Span::styled(format!("{:<8}", dag_str), if is_selected { theme.dag_node_style() } else { Style::default().fg(theme.dag_line) }),
+            Span::styled(
+                format!("{clock_str:<8} "),
+                Style::default().fg(theme.dag_line),
+            ),
+            Span::styled(
+                format!("{dag_str:<8}"),
+                if is_selected {
+                    theme.dag_node_style()
+                } else {
+                    Style::default().fg(theme.dag_line)
+                },
+            ),
             Span::styled(kind_str, theme.kind_style(header.kind_code)),
             Span::styled(actor_str, Style::default()),
-            Span::styled(format!("{:<12}", tags_str), Style::default()),
+            Span::styled(format!("{tags_str:<12}"), Style::default()),
             Span::styled(preview_truncated, Style::default()),
         ];
 
@@ -115,22 +136,21 @@ pub fn render_dag_log(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         kind_width as u16,
         actor_width as u16,
         tags_width as u16,
-        area.width.saturating_sub(
-            (time_width + dag_width + kind_width + actor_width + tags_width + 2) as u16
-        ).max(10),
+        area.width
+            .saturating_sub(
+                (time_width + dag_width + kind_width + actor_width + tags_width + 2) as u16,
+            )
+            .max(10),
     ];
 
-    let table = Table::new(
-        rows,
-        col_widths.map(Constraint::Length).to_vec(),
-    )
-    .header(header_row)
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" EditChain DAG ")
-            .title_alignment(Alignment::Left),
-    );
+    let table = Table::new(rows, col_widths.map(Constraint::Length).to_vec())
+        .header(header_row)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" EditChain DAG ")
+                .title_alignment(Alignment::Left),
+        );
 
     frame.render_widget(table, area);
 }
@@ -144,13 +164,16 @@ fn format_clock(ms: u64) -> String {
         let h = (secs / 3600) % 24;
         let m = (secs / 60) % 60;
         let s = secs % 60;
-        format!("{:02}:{:02}:{:02}", h, m, s)
+        format!("{h:02}:{m:02}:{s:02}")
     }
 }
 
 /// Render lane cells into a compact string.
 fn render_lane_cells(cells: &[LaneCell]) -> String {
-    use LaneCell::*;
+    use LaneCell::{
+        BranchLeft, BranchRight, Crossing, Empty, Horizontal, ManyParents, MergeLeft, MergeRight,
+        Node, SelectedNode, Vertical,
+    };
     let mut s = String::with_capacity(cells.len());
     for cell in cells {
         match cell {
@@ -173,18 +196,44 @@ fn render_lane_cells(cells: &[LaneCell]) -> String {
 /// Format tag bits into a short string.
 fn format_tags(tags: u64) -> String {
     let mut parts = Vec::new();
-    if tags & (1 << 0) != 0 { parts.push("agent"); }
-    if tags & (1 << 1) != 0 { parts.push("human"); }
-    if tags & (1 << 2) != 0 { parts.push("file"); }
-    if tags & (1 << 3) != 0 { parts.push("msg"); }
-    if tags & (1 << 4) != 0 { parts.push("tool"); }
-    if tags & (1 << 5) != 0 { parts.push("cmd"); }
-    if tags & (1 << 6) != 0 { parts.push("import"); }
-    if tags & (1 << 7) != 0 { parts.push("refl"); }
-    if tags & (1 << 8) != 0 { parts.push("note"); }
-    if tags & (1 << 9) != 0 { parts.push("err"); }
-    if tags & (1 << 10) != 0 { parts.push("priv"); }
-    if tags & (1 << 11) != 0 { parts.push("large"); }
-    if parts.is_empty() { return "-".to_string(); }
+    if tags & (1 << 0) != 0 {
+        parts.push("agent");
+    }
+    if tags & (1 << 1) != 0 {
+        parts.push("human");
+    }
+    if tags & (1 << 2) != 0 {
+        parts.push("file");
+    }
+    if tags & (1 << 3) != 0 {
+        parts.push("msg");
+    }
+    if tags & (1 << 4) != 0 {
+        parts.push("tool");
+    }
+    if tags & (1 << 5) != 0 {
+        parts.push("cmd");
+    }
+    if tags & (1 << 6) != 0 {
+        parts.push("import");
+    }
+    if tags & (1 << 7) != 0 {
+        parts.push("refl");
+    }
+    if tags & (1 << 8) != 0 {
+        parts.push("note");
+    }
+    if tags & (1 << 9) != 0 {
+        parts.push("err");
+    }
+    if tags & (1 << 10) != 0 {
+        parts.push("priv");
+    }
+    if tags & (1 << 11) != 0 {
+        parts.push("large");
+    }
+    if parts.is_empty() {
+        return "-".to_string();
+    }
     parts.join(",")
 }

@@ -1,2 +1,2 @@
-pub mod lanes;
-pub mod row;
+pub(crate) mod lanes;
+pub(crate) mod row;

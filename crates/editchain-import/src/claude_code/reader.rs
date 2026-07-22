@@ -9,7 +9,18 @@ use crate::sink::CursorValue;
 ///
 /// Uses streaming `BufRead::read_until` to avoid loading the entire file into
 /// memory. Skips partial final lines (power-loss tolerance).
-/// Returns (lines_with_hashes, bytes_read, new_cursor_value).
+/// Returns (`lines_with_hashes`, `bytes_read`, `new_cursor_value`).
+///
+/// # Errors
+///
+/// Returns [`ImportError::Io`] if the file cannot be read or seeked.
+/// Returns [`ImportError::SourceGenerationChanged`] if the file was truncated
+/// since the last read.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "byte counts and offsets are bounded by file size"
+)]
+#[expect(clippy::as_conversions, reason = "usize to u64 is safe for file sizes")]
 pub fn read_session_file(
     path: &Path,
     cursor: Option<&CursorValue>,
@@ -35,12 +46,14 @@ pub fn read_session_file(
     let mut reader = BufReader::new(file);
 
     if offset > 0 {
-        reader.seek(SeekFrom::Start(offset)).map_err(ImportError::Io)?;
+        let _: u64 = reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(ImportError::Io)?;
     }
 
     let mut hasher = blake3::Hasher::new();
     if prior_hash != [0u8; 32] {
-        hasher.update(&prior_hash);
+        let _: &mut blake3::Hasher = hasher.update(&prior_hash);
     }
 
     let mut lines = Vec::new();
@@ -60,7 +73,7 @@ pub fn read_session_file(
 
         // Check if this is a complete line (ends with newline).
         if line_buf.last() == Some(&b'\n') {
-            hasher.update(&line_buf);
+            let _: &mut blake3::Hasher = hasher.update(&line_buf);
             let line_hash = hash_raw(&line_buf);
             lines.push(LineWithHash {
                 data: line_buf.clone(),
@@ -79,7 +92,7 @@ pub fn read_session_file(
     let new_cursor = CursorValue {
         file_size,
         byte_offset: offset + bytes_read,
-        ops_emitted: cursor.map(|c| c.ops_emitted).unwrap_or(0) + lines.len() as u64,
+        ops_emitted: cursor.map_or(0, |c| c.ops_emitted) + lines.len() as u64,
         content_hash,
     };
 
@@ -89,7 +102,8 @@ pub fn read_session_file(
 /// A single JSONL line with its Blake3 hash.
 #[derive(Debug, Clone)]
 pub struct LineWithHash {
+    /// The raw JSONL line bytes (including newline).
     pub data: Vec<u8>,
+    /// BLAKE3 hash of the line bytes.
     pub hash: [u8; 32],
 }
-

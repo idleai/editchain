@@ -1,6 +1,17 @@
 //! Claude Code session profiler — analyze corpus structure.
 //!
-//! Usage: cargo run --bin cc_profile -- <sessions_dir>
+//! Usage: cargo run --bin `cc_profile` -- <`sessions_dir`>
+
+use blake3 as _;
+use editchain_core as _;
+use serde as _;
+use serde_json as _;
+use sha2 as _;
+
+#[cfg(test)]
+use proptest as _;
+#[cfg(test)]
+use tempfile as _;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -9,6 +20,13 @@ use editchain_import::claude_code::discover::discover_sessions;
 use editchain_import::claude_code::envelope::parse_envelope;
 use editchain_import::claude_code::reader::read_session_file;
 
+#[expect(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    clippy::print_stderr,
+    clippy::print_stdout,
+    reason = "CLI profiler binary; all output and arithmetic is intentional"
+)]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -20,7 +38,7 @@ fn main() {
     let sessions = match discover_sessions(dir) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Error discovering sessions: {}", e);
+            eprintln!("Error discovering sessions: {e}");
             std::process::exit(1);
         }
     };
@@ -40,16 +58,15 @@ fn main() {
     let mut uuid_overlap: HashMap<String, usize> = HashMap::new();
 
     for session in &sessions {
-        println!("  {} ({} bytes, subagent: {})",
-            session.session_id,
-            session.file_size,
-            session.is_subagent
+        println!(
+            "  {} ({} bytes, subagent: {})",
+            session.session_id, session.file_size, session.is_subagent
         );
 
         let (lines, bytes_read, _cursor) = match read_session_file(&session.path, None) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("    Error: {}", e);
+                eprintln!("    Error: {e}");
                 continue;
             }
         };
@@ -69,7 +86,7 @@ fn main() {
                         *subtype_counts.entry(env.subtype.clone()).or_insert(0) += 1;
                     }
                     if !env.session_id.is_empty() {
-                        session_ids.insert(env.session_id.clone());
+                        let _: bool = session_ids.insert(env.session_id.clone());
                     }
                     if !env.uuid.is_empty() {
                         *uuid_overlap.entry(env.uuid.clone()).or_insert(0) += 1;
@@ -84,10 +101,10 @@ fn main() {
 
     println!();
     println!("=== Summary ===");
-    println!("Total lines: {}", total_lines);
-    println!("Total bytes: {}", total_bytes);
-    println!("Max line length: {} bytes", max_line_len);
-    println!("Malformed lines: {}", malformed_lines);
+    println!("Total lines: {total_lines}");
+    println!("Total bytes: {total_bytes}");
+    println!("Max line length: {max_line_len} bytes");
+    println!("Malformed lines: {malformed_lines}");
     println!("Unique session IDs: {}", session_ids.len());
     println!();
 
@@ -95,7 +112,7 @@ fn main() {
     let mut types: Vec<_> = type_counts.into_iter().collect();
     types.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
     for (t, c) in &types {
-        println!("  {:30}: {}", t, c);
+        println!("  {t:30}: {c}");
     }
     println!();
 
@@ -103,18 +120,18 @@ fn main() {
     let mut subtypes: Vec<_> = subtype_counts.into_iter().collect();
     subtypes.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
     for (t, c) in &subtypes {
-        println!("  {:30}: {}", t, c);
+        println!("  {t:30}: {c}");
     }
     println!();
 
     // UUID overlap analysis
     let overlaps: Vec<_> = uuid_overlap.iter().filter(|(_, c)| **c > 1).collect();
-    if !overlaps.is_empty() {
+    if overlaps.is_empty() {
+        println!("No UUID overlaps detected across files.");
+    } else {
         println!("=== UUID Overlaps ({} total) ===", overlaps.len());
         for (uuid, count) in &overlaps {
-            println!("  {} appears {} times", uuid, count);
+            println!("  {uuid} appears {count} times");
         }
-    } else {
-        println!("No UUID overlaps detected across files.");
     }
 }

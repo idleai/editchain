@@ -14,6 +14,8 @@ pub struct FrontierMap {
 }
 
 impl FrontierMap {
+    /// Create an empty frontier map.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             frontiers: HashMap::new(),
@@ -21,6 +23,7 @@ impl FrontierMap {
     }
 
     /// Build a frontier map from a slice of frontiers.
+    #[must_use]
     pub fn from_frontiers(frontiers: &[Frontier]) -> Self {
         let mut map = Self::new();
         for f in frontiers {
@@ -30,11 +33,16 @@ impl FrontierMap {
     }
 
     /// Insert a frontier entry.
+    #[expect(
+        clippy::let_underscore_untyped,
+        reason = "Discard old value when inserting into frontier map"
+    )]
     pub fn insert(&mut self, node: NodeId, boot: u32, max_seq: u64) {
-        self.frontiers.insert((node.0, boot), max_seq);
+        let _ = self.frontiers.insert((node.0, boot), max_seq);
     }
 
     /// Check if an operation is visible at this frontier.
+    #[must_use]
     pub fn is_visible(&self, op_id: &OpId) -> bool {
         self.frontiers
             .get(&(op_id.node.0, op_id.boot))
@@ -42,16 +50,19 @@ impl FrontierMap {
     }
 
     /// Get the max sequence for a given node and boot.
+    #[must_use]
     pub fn max_seq(&self, node: NodeId, boot: u32) -> Option<u64> {
         self.frontiers.get(&(node.0, boot)).copied()
     }
 
     /// Number of entries in the frontier map.
+    #[must_use]
     pub fn len(&self) -> usize {
         self.frontiers.len()
     }
 
     /// Returns true if the frontier map is empty.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.frontiers.is_empty()
     }
@@ -71,7 +82,9 @@ pub struct CausalCone {
 }
 
 impl CausalCone {
-    pub fn new(seed: OpId) -> Self {
+    /// Create a new causal cone centered on the given seed operation.
+    #[must_use]
+    pub const fn new(seed: OpId) -> Self {
         Self {
             seed,
             ancestors: Vec::new(),
@@ -80,7 +93,12 @@ impl CausalCone {
     }
 
     /// Total number of operations in the cone (including seed).
-    pub fn total_ops(&self) -> usize {
+    #[must_use]
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "usize addition of small counts; no overflow in practice"
+    )]
+    pub const fn total_ops(&self) -> usize {
         1 + self.ancestors.len() + self.descendants.len()
     }
 }
@@ -118,12 +136,14 @@ pub struct CausalCorridor {
     pub source: OpId,
     /// The target operation (tip/frontier).
     pub target: OpId,
-    /// Ordered OpIds along the shortest parent path (source → ... → target).
+    /// Ordered `OpIds` along the shortest parent path (source → ... → target).
     pub path: Vec<OpId>,
 }
 
 impl CausalCorridor {
-    pub fn new(source: OpId, target: OpId) -> Self {
+    /// Create a new causal corridor from source to target.
+    #[must_use]
+    pub const fn new(source: OpId, target: OpId) -> Self {
         Self {
             source,
             target,
@@ -132,12 +152,14 @@ impl CausalCorridor {
     }
 
     /// Number of hops in the corridor.
-    pub fn len(&self) -> usize {
+    #[must_use]
+    pub const fn len(&self) -> usize {
         self.path.len()
     }
 
     /// Returns true if the corridor is empty (no path found).
-    pub fn is_empty(&self) -> bool {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
         self.path.is_empty()
     }
 }
@@ -153,13 +175,21 @@ pub struct LogicalOccurrence {
     pub canonical: ScoredChunk,
     /// Number of physical occurrences across branches/sessions.
     pub occurrence_count: usize,
-    /// All source OpIds where this content appears.
+    /// All source `OpIds` where this content appears.
     pub source_op_ids: Vec<OpId>,
 }
 
 /// Collapse duplicate chunks by content similarity and group by logical identity.
 ///
 /// Returns deduplicated results with occurrence counts.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::string_slice,
+    clippy::as_conversions,
+    clippy::arithmetic_side_effects,
+    reason = "Similarity ratio from small counts; f64 precision is sufficient; string slicing on same-length prefix is safe; cast and increment are intentional"
+)]
+#[must_use]
 pub fn collapse_occurrences(
     results: Vec<ScoredChunk>,
     text_similarity_threshold: f64,
@@ -204,7 +234,13 @@ pub fn collapse_occurrences(
 
 /// Apply Maximal Marginal Relevance with graph-aware diversity penalty.
 ///
-/// utility = relevance - λ_text * max_similarity - λ_graph * graph_overlap
+/// utility = relevance - `λ_text` * `max_similarity` - `λ_graph` * `graph_overlap`
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::indexing_slicing,
+    clippy::as_conversions,
+    reason = "Counts are small (<200); f64 precision is sufficient for MMR scoring; indexing into results vec is safe by construction; cast to f64 for division is intentional"
+)]
 pub fn mmr_diverse_rerank(
     results: &[ScoredChunk],
     config: &DiversityConfig,
@@ -242,7 +278,10 @@ pub fn mmr_diverse_rerank(
                 .count() as f64
                 / selected.len().max(1) as f64;
 
-            let mmr = relevance - config.lambda_text * max_sim - config.lambda_graph * graph_overlap;
+            let mmr = config.lambda_graph.mul_add(
+                -graph_overlap,
+                config.lambda_text.mul_add(-max_sim, relevance),
+            );
 
             if mmr > best_score {
                 best_score = mmr;
@@ -258,16 +297,16 @@ pub fn mmr_diverse_rerank(
 }
 
 /// Simple text similarity based on character overlap.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::as_conversions,
+    reason = "Character count is small; f64 precision is sufficient for similarity; cast to f64 for division is intentional"
+)]
 fn text_similarity(a: &str, b: &str) -> f64 {
     let min_len = a.len().min(b.len());
     if min_len == 0 {
         return 0.0;
     }
-    let matches = a
-        .chars()
-        .zip(b.chars())
-        .filter(|(x, y)| x == y)
-        .count();
+    let matches = a.chars().zip(b.chars()).filter(|(x, y)| x == y).count();
     matches as f64 / min_len as f64
 }
-

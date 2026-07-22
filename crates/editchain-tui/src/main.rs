@@ -1,3 +1,5 @@
+//! Editchain TUI — terminal visualization for edit chains.
+
 mod action;
 mod app;
 mod components;
@@ -7,18 +9,21 @@ mod event;
 mod keymap;
 mod theme;
 
-use std::path::PathBuf;
 use clap::Parser;
+use editchain_node as _;
+use serde as _;
+use serde_json as _;
+use std::path::PathBuf;
 
+use crossterm::{
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     widgets::{Block, Borders, Paragraph},
     Frame, Terminal,
-};
-use crossterm::{
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 
 use crate::app::{App, Popup};
@@ -26,12 +31,19 @@ use crate::components::{dag_log, help_popup, inspector, status_bar};
 use crate::theme::Theme;
 
 #[derive(Parser)]
-#[command(name = "editchain-tui", about = "EditChain TUI — terminal visualization for edit chains")]
+#[command(
+    name = "editchain-tui",
+    about = "EditChain TUI — terminal visualization for edit chains"
+)]
 struct Cli {
     /// Path to the chain directory
     path: PathBuf,
 }
 
+#[expect(
+    clippy::let_underscore_must_use,
+    reason = "TUI draw result is discarded intentionally"
+)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
@@ -45,8 +57,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Install panic hook that restores terminal
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _: Option<()> = disable_raw_mode().ok();
+        let _: Option<()> = execute!(std::io::stdout(), LeaveAlternateScreen).ok();
         original_hook(panic_info);
     }));
 
@@ -55,12 +67,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let theme = Theme::default();
 
     // Load chain from disk
-    match crate::data::loader::load_chain(&cli.path) {
+    match data::loader::load_chain(&cli.path) {
         Ok(snapshot) => {
             app.load_snapshot(snapshot);
         }
         Err(e) => {
-            app.status = app::StatusState::Error(format!("Failed to load chain: {}", e));
+            app.status = app::StatusState::Error(format!("Failed to load chain: {e}"));
         }
     }
 
@@ -73,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Draw
-        terminal.draw(|frame| render(frame, &app, &theme))?;
+        let _: bool = terminal.draw(|frame| render(frame, &app, &theme)).is_ok();
 
         // Handle events — blocks ~100ms waiting for input
         if let Some(action) = event::poll_event(100) {
@@ -92,7 +104,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Render the full UI.
-fn render(frame: &mut Frame, app: &App, theme: &Theme) {
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Layout split returns known-length slices"
+)]
+fn render(frame: &mut Frame<'_>, app: &App, theme: &Theme) {
     let area = frame.area();
 
     // Main layout: split pane + status bar
@@ -153,5 +169,10 @@ fn render(frame: &mut Frame, app: &App, theme: &Theme) {
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
-    Rect { x, y, width: width.min(area.width), height: height.min(area.height) }
+    Rect {
+        x,
+        y,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    }
 }

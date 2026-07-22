@@ -1,3 +1,13 @@
+//! Envelope parsing tests.
+
+use blake3 as _;
+use editchain_core as _;
+use proptest as _;
+use serde as _;
+use serde_json as _;
+use sha2 as _;
+use tempfile as _;
+
 use editchain_import::claude_code::envelope::parse_envelope;
 
 #[test]
@@ -10,6 +20,12 @@ fn parse_user_message() {
     assert_eq!(env.message.unwrap().role, "user");
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::wildcard_enum_match_arm,
+    reason = "test assertions on known-length vec"
+)]
 #[test]
 fn parse_assistant_with_tool_use() {
     let json = br#"{"type":"assistant","uuid":"def-456","message":{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"ls"}}]}}"#;

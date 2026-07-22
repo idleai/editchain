@@ -1,5 +1,18 @@
-use editchain_node::daemon::{AppendCoordinator, ProjectionWatermarks, QueryPlane};
+//! Daemon tests.
+
+use clap as _;
+use dirs as _;
+use editchain_codec as _;
+use editchain_core as _;
+use editchain_embed as _;
+use editchain_import as _;
+use editchain_query as _;
+use serde as _;
+use serde_json as _;
+use tempfile as _;
+
 use editchain_index::snapshot::QuerySnapshot;
+use editchain_node::daemon::{AppendCoordinator, ProjectionWatermarks, QueryPlane};
 
 #[test]
 fn append_coordinator_monotonic() {

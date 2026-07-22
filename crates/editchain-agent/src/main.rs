@@ -1,3 +1,15 @@
+#![doc = "CLI entrypoint for the editchain SWE-bench agent."]
+
+// Suppress unused-crate-dependencies warnings for deps used only by the library.
+use chrono as _;
+use editchain_codec as _;
+use editchain_core as _;
+use minijinja as _;
+use reqwest as _;
+use serde as _;
+use serde_yaml as _;
+use uuid as _;
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -51,8 +63,7 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info"))
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
@@ -70,10 +81,9 @@ async fn main() -> anyhow::Result<()> {
             let instance = instances
                 .iter()
                 .find(|i| i.instance_id == instance_id)
-                .ok_or_else(|| anyhow::anyhow!("Instance {} not found in dataset", instance_id))?;
+                .ok_or_else(|| anyhow::anyhow!("Instance {instance_id} not found in dataset"))?;
 
-            let (exit_status, submission) =
-                run_instance(instance, &config, &output).await?;
+            let (exit_status, submission) = run_instance(instance, &config, &output).await?;
             tracing::info!(
                 "Instance {}: exit_status={}, submission_len={}",
                 instance_id,

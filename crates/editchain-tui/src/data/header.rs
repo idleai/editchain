@@ -1,15 +1,15 @@
 use editchain_core::OpId;
 
 /// Compact ordinal used for UI and graph indexing.
-pub type OpOrdinal = u32;
+pub(crate) type OpOrdinal = u32;
 
 /// Compact header for an operation — stored in the in-memory snapshot.
 ///
 /// This is the lightweight representation used for list rendering and filtering.
 /// Full operation payloads are decoded lazily from storage.
-#[allow(dead_code)]
+#[expect(dead_code, reason = "WIP TUI — header fields used in rendering")]
 #[derive(Debug, Clone)]
-pub struct OpHeader {
+pub(crate) struct OpHeader {
     pub id: OpId,
     pub actor: u64,
     pub clock_value: u64,
@@ -28,19 +28,19 @@ pub struct OpHeader {
 
 impl OpHeader {
     /// Returns true if this operation has any of the given tag bits set.
-    #[allow(dead_code)]
-    pub fn has_any_tag(&self, bits: u64) -> bool {
+    #[expect(dead_code, reason = "WIP TUI — tag filtering")]
+    pub(crate) const fn has_any_tag(&self, bits: u64) -> bool {
         self.tags & bits != 0
     }
 
     /// Returns true if this operation has all of the given tag bits set.
-    #[allow(dead_code)]
-    pub fn has_all_tags(&self, bits: u64) -> bool {
+    #[expect(dead_code, reason = "WIP TUI — tag filtering")]
+    pub(crate) const fn has_all_tags(&self, bits: u64) -> bool {
         self.tags & bits == bits
     }
 
     /// Human-readable kind name.
-    pub fn kind_name(&self) -> &'static str {
+    pub(crate) const fn kind_name(&self) -> &'static str {
         match self.kind_code {
             0 => "ChainStart",
             1 => "Actor",

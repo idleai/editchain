@@ -4,6 +4,19 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use clap as _;
+use dirs as _;
+use editchain_codec as _;
+use editchain_core as _;
+use editchain_embed as _;
+use editchain_import as _;
+use editchain_query as _;
+use serde as _;
+use serde_json as _;
+
+#[cfg(test)]
+use tempfile as _;
+
 use editchain_index::chunker::Generation;
 use editchain_index::snapshot::QuerySnapshot;
 
@@ -15,12 +28,15 @@ use editchain_index::snapshot::QuerySnapshot;
 ///
 /// Ensures monotonic commit generations and provides read-your-writes
 /// consistency by tracking the latest committed generation.
+#[derive(Debug)]
 pub struct AppendCoordinator {
     chain_dir: String,
     next_generation: AtomicU64,
 }
 
 impl AppendCoordinator {
+    /// Create a new append coordinator for the given chain directory.
+    #[must_use]
     pub fn new(chain_dir: &str) -> Self {
         Self {
             chain_dir: chain_dir.to_string(),
@@ -35,9 +51,12 @@ impl AppendCoordinator {
 
     /// Get the current committed generation.
     pub fn current_generation(&self) -> Generation {
-        self.next_generation.load(Ordering::SeqCst).saturating_sub(1)
+        self.next_generation
+            .load(Ordering::SeqCst)
+            .saturating_sub(1)
     }
 
+    /// Get the chain directory path.
     pub fn chain_dir(&self) -> &str {
         &self.chain_dir
     }
@@ -50,15 +69,22 @@ impl AppendCoordinator {
 /// Tracks how current each projection is relative to the append log.
 #[derive(Debug, Clone, Copy)]
 pub struct ProjectionWatermarks {
+    /// Log generation watermark.
     pub log: Generation,
+    /// Hydrated projection watermark.
     pub hydrated: Generation,
+    /// Graph projection watermark.
     pub graph: Generation,
+    /// Lexical index watermark.
     pub lexical: Generation,
+    /// Vector index watermark.
     pub vector: Generation,
 }
 
 impl ProjectionWatermarks {
-    pub fn new() -> Self {
+    /// Create a new projection watermarks with all generations set to 0.
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             log: 0,
             hydrated: 0,
@@ -69,7 +95,8 @@ impl ProjectionWatermarks {
     }
 
     /// Returns true if all projections are caught up to the log.
-    pub fn is_fully_consistent(&self) -> bool {
+    #[must_use]
+    pub const fn is_fully_consistent(&self) -> bool {
         self.hydrated >= self.log
             && self.graph >= self.log
             && self.lexical >= self.log
@@ -77,7 +104,8 @@ impl ProjectionWatermarks {
     }
 
     /// Returns true if lexical and graph are caught up (vector may lag).
-    pub fn is_lexical_consistent(&self) -> bool {
+    #[must_use]
+    pub const fn is_lexical_consistent(&self) -> bool {
         self.hydrated >= self.log && self.graph >= self.log && self.lexical >= self.log
     }
 }
@@ -95,6 +123,7 @@ impl Default for ProjectionWatermarks {
 /// A notification sent when new data is committed to the chain.
 #[derive(Debug, Clone)]
 pub struct CommitNotification {
+    /// The generation that was committed.
     pub generation: Generation,
 }
 
@@ -109,7 +138,17 @@ pub struct ProjectorBus {
     projectors: Vec<Box<dyn Projector>>,
 }
 
+impl std::fmt::Debug for ProjectorBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProjectorBus")
+            .field("projector_count", &self.projectors.len())
+            .finish()
+    }
+}
+
 impl ProjectorBus {
+    /// Create a new empty projector bus.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             projectors: Vec::new(),
@@ -139,12 +178,15 @@ impl Default for ProjectorBus {
 // Query plane — ArcSwap snapshot holder
 // ---------------------------------------------------------------------------
 
-/// Holds the current query snapshot behind an ArcSwap for lock-free reads.
+/// Holds the current query snapshot behind an `ArcSwap` for lock-free reads.
+#[derive(Debug)]
 pub struct QueryPlane {
     snapshot: Arc<std::sync::RwLock<QuerySnapshot>>,
 }
 
 impl QueryPlane {
+    /// Create a new query plane with an empty snapshot.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             snapshot: Arc::new(std::sync::RwLock::new(QuerySnapshot::new())),
@@ -152,11 +194,28 @@ impl QueryPlane {
     }
 
     /// Get the current snapshot (acquires read lock).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the read lock is poisoned (another thread panicked while holding it).
+    #[expect(
+        clippy::unwrap_used,
+        reason = "RwLock poison is a fatal error; unwrap is appropriate"
+    )]
+    #[must_use]
     pub fn snapshot(&self) -> QuerySnapshot {
         self.snapshot.read().unwrap().clone()
     }
 
     /// Update the snapshot (acquires write lock).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the write lock is poisoned (another thread panicked while holding it).
+    #[expect(
+        clippy::unwrap_used,
+        reason = "RwLock poison is a fatal error; unwrap is appropriate"
+    )]
     pub fn update(&self, new_snapshot: QuerySnapshot) {
         *self.snapshot.write().unwrap() = new_snapshot;
     }
@@ -192,4 +251,3 @@ impl Default for DaemonConfig {
         }
     }
 }
-

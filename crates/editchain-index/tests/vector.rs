@@ -1,9 +1,20 @@
+#![doc = "Tests for the vector index module."]
+
+// Crate-level dependency markers (used by Cargo for feature resolution).
+use half as _;
+use roaring as _;
+use tantivy as _;
+
 use editchain_core::{NodeId, OpId};
 use editchain_embed::EmbeddingManifest;
 use editchain_index::vector::{f32_to_f16_vec, normalize_f32, VectorIndex};
 use editchain_query::search::SearchFilters;
 
 #[test]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Test assertions on known-valid indices; panic is acceptable in tests"
+)]
 fn normalize_and_convert() {
     let mut v = vec![3.0, 4.0];
     normalize_f32(&mut v);
@@ -15,6 +26,10 @@ fn normalize_and_convert() {
 }
 
 #[test]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Test assertions on known-valid indices; panic is acceptable in tests"
+)]
 fn vector_index_add_and_search() {
     let mut manifest = EmbeddingManifest::qwen3_embedding_0_6b();
     manifest.dimensions = 2;

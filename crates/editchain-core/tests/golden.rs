@@ -7,13 +7,26 @@
 //! - File revision register (latest materializing revision wins)
 //! - Concurrent operation merge determinism
 
+#![expect(
+    unused_crate_dependencies,
+    reason = "Test file; dependencies used by library macros"
+)]
+
 use editchain_core::*;
 
 fn encode(op: &Op) -> Vec<u8> {
+    #[expect(
+        clippy::expect_used,
+        reason = "Test helper; panic on failure is acceptable"
+    )]
     postcard::to_stdvec(op).expect("encode failed")
 }
 
 fn decode(bytes: &[u8]) -> Op {
+    #[expect(
+        clippy::expect_used,
+        reason = "Test helper; panic on failure is acceptable"
+    )]
     postcard::from_bytes(bytes).expect("decode failed")
 }
 
@@ -32,7 +45,11 @@ fn msg_op(node: u64, boot: u32, seq: u64, ms: u64, text: &[u8]) -> Op {
     }
 }
 
-fn file_op(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Test helper constructing a full Op; all fields are needed"
+)]
+const fn file_op(
     node: u64,
     boot: u32,
     seq: u64,
@@ -61,8 +78,14 @@ fn file_op(
 // Helper to build a CausalKey compactly
 // ---------------------------------------------------------------------------
 
-fn ck(clock_val: u64, clock_sub: u16, node: u64, boot: u32, seq: u64) -> CausalKey {
-    CausalKey { clock_val, clock_sub, node, boot, seq }
+const fn ck(clock_val: u64, clock_sub: u16, node: u64, boot: u32, seq: u64) -> CausalKey {
+    CausalKey {
+        clock_val,
+        clock_sub,
+        node,
+        boot,
+        seq,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +182,7 @@ fn golden_round_trip_all_kinds() {
     for (name, op) in &ops {
         let encoded = encode(op);
         let decoded = decode(&encoded);
-        assert_eq!(*op, decoded, "round-trip failed for {}", name);
+        assert_eq!(*op, decoded, "round-trip failed for {name}");
     }
 }
 
@@ -176,9 +199,9 @@ fn golden_concurrent_merge() {
     let a2 = msg_op(1, 0, 2, 200, b"also from A");
     let b1 = msg_op(2, 0, 1, 150, b"from B");
 
-    state_a.ops.insert(a1.id, encode(&a1)).unwrap();
-    state_a.ops.insert(a2.id, encode(&a2)).unwrap();
-    state_b.ops.insert(b1.id, encode(&b1)).unwrap();
+    let _: Option<bool> = state_a.ops.insert(a1.id, encode(&a1)).ok();
+    let _: Option<bool> = state_a.ops.insert(a2.id, encode(&a2)).ok();
+    let _: Option<bool> = state_b.ops.insert(b1.id, encode(&b1)).ok();
 
     let (accepted, duplicates, quarantined) = state_a.ops.merge(&state_b.ops);
     assert_eq!(accepted, 1);
@@ -191,6 +214,11 @@ fn golden_concurrent_merge() {
 // File revision register
 // ---------------------------------------------------------------------------
 
+#[expect(
+    clippy::let_underscore_must_use,
+    clippy::let_underscore_untyped,
+    reason = "Test helper; discarding reduce result is intentional"
+)]
 #[test]
 fn golden_file_revision_register() {
     let path = PathId(42);
@@ -201,8 +229,8 @@ fn golden_file_revision_register() {
     let later = file_op(1, 0, 2, 200, path, Some(cid_b));
 
     let mut reducer = FileReducer::new();
-    reducer.reduce(&earlier).unwrap();
-    reducer.reduce(&later).unwrap();
+    let _ = reducer.reduce(&earlier);
+    let _ = reducer.reduce(&later);
 
     let view = reducer.into_view();
     let rev = view.get(&path).unwrap();

@@ -1,19 +1,30 @@
+#![expect(missing_docs, reason = "Test file")]
+
 use editchain_core::{ActorId, NodeId, OpId};
 use editchain_query::hybrid::{HybridSearch, LexicalSearch, VectorSearch};
-use editchain_query::search::{ChunkId, ChunkMetadata, ScoredChunk, SearchFilters, SearchMode, SearchRequest};
+use editchain_query::search::{
+    ChunkId, ChunkMetadata, ScoredChunk, SearchFilters, SearchMode, SearchRequest,
+};
+use serde as _;
 
 struct MockLexical;
 impl LexicalSearch for MockLexical {
     fn search(&self, query: &str, _filters: &SearchFilters, _top_k: usize) -> Vec<ScoredChunk> {
         let op_id = OpId::new(NodeId(1), 0, 1);
         vec![ScoredChunk {
-            chunk_id: ChunkId { op_id, chunk_ordinal: 0 },
+            chunk_id: ChunkId {
+                op_id,
+                chunk_ordinal: 0,
+            },
             op_id,
             score: 10.0,
-            text: format!("lexical match for {}", query),
+            text: format!("lexical match for {query}"),
             metadata: ChunkMetadata {
                 op_id,
-                chunk_id: ChunkId { op_id, chunk_ordinal: 0 },
+                chunk_id: ChunkId {
+                    op_id,
+                    chunk_ordinal: 0,
+                },
                 session_id: None,
                 actor_id: ActorId(0),
                 kind_tags: 0,
@@ -29,13 +40,19 @@ impl VectorSearch for MockVector {
     fn search(&self, query: &str, _filters: &SearchFilters, _top_k: usize) -> Vec<ScoredChunk> {
         let op_id = OpId::new(NodeId(1), 0, 2);
         vec![ScoredChunk {
-            chunk_id: ChunkId { op_id, chunk_ordinal: 0 },
+            chunk_id: ChunkId {
+                op_id,
+                chunk_ordinal: 0,
+            },
             op_id,
             score: 8.0,
-            text: format!("vector match for {}", query),
+            text: format!("vector match for {query}"),
             metadata: ChunkMetadata {
                 op_id,
-                chunk_id: ChunkId { op_id, chunk_ordinal: 0 },
+                chunk_id: ChunkId {
+                    op_id,
+                    chunk_ordinal: 0,
+                },
                 session_id: None,
                 actor_id: ActorId(0),
                 kind_tags: 0,
@@ -61,6 +78,10 @@ fn hybrid_fuses_results() {
 }
 
 #[test]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Test assertions on known-length vec"
+)]
 fn lexical_mode_only() {
     let engine = HybridSearch::new(Box::new(MockLexical), Box::new(MockVector));
     let request = SearchRequest {

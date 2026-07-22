@@ -11,19 +11,34 @@ use crate::docker_env::DockerEnvironment;
 /// A single SWE-bench instance from the dataset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwebenchInstance {
+    /// Unique identifier for this SWE-bench instance.
     pub instance_id: String,
+    /// Problem statement / task description.
     pub problem_statement: String,
+    /// Repository name (e.g. "django/django").
     pub repo: Option<String>,
+    /// Base commit hash to checkout before applying the patch.
     pub base_commit: Option<String>,
+    /// Optional hint for solving the task.
     pub hint: Option<String>,
+    /// Timestamp when the instance was created.
     pub created_at: Option<String>,
+    /// Tests that should fail before the patch and pass after.
     pub fail_to_pass: Option<Vec<String>>,
+    /// Tests that should pass both before and after the patch.
     pub pass_to_pass: Option<Vec<String>>,
+    /// Pre-built Docker image name for this instance.
     pub image_name: Option<String>,
+    /// Alternative Docker image specification.
     pub docker_image: Option<String>,
 }
 
 /// Run a single SWE-bench instance.
+///
+/// # Errors
+///
+/// Returns an error if the environment setup, agent execution, or trajectory
+/// saving fails.
 pub async fn run_instance(
     instance: &SwebenchInstance,
     config: &Config,
@@ -38,12 +53,14 @@ pub async fn run_instance(
         .image_name
         .as_deref()
         .or(instance.docker_image.as_deref())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            // Build docker-compatible image name
-            let id_docker = instance.instance_id.replace("__", "_1776_");
-            format!("docker.io/swebench/sweb.eval.x86_64.{}:latest", id_docker).to_lowercase()
-        });
+        .map_or_else(
+            || {
+                // Build docker-compatible image name
+                let id_docker = instance.instance_id.replace("__", "_1776_");
+                format!("docker.io/swebench/sweb.eval.x86_64.{id_docker}:latest").to_lowercase()
+            },
+            ToString::to_string,
+        );
     env_config.image = image_name;
 
     info!("Starting environment for {}", instance.instance_id);
@@ -69,6 +86,10 @@ pub async fn run_instance(
 }
 
 /// Run multiple instances in parallel.
+///
+/// # Errors
+///
+/// Returns an error if any instance fails to run.
 pub async fn run_batch(
     instances: &[SwebenchInstance],
     config: &Config,
@@ -110,6 +131,10 @@ pub async fn run_batch(
     Ok(())
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "preds is a serde_json::Value::Object; indexing by instance_id is intentional"
+)]
 fn update_preds(output_dir: &Path, instance_id: &str, submission: &str) -> Result<()> {
     let preds_path = output_dir.join("preds.json");
     let mut preds: serde_json::Value = if preds_path.exists() {

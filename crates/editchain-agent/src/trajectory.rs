@@ -1,20 +1,28 @@
 use std::path::Path;
 
 use anyhow::Result;
-use editchain_core::*;
+use editchain_core::{clock, op, parents, payload, scope, tags, ActorId, NodeId, Op, OpId};
 use serde_json::Value;
 
 /// Records agent trajectory as editchain operations.
+#[derive(Debug)]
 pub struct TrajectoryRecorder {
     ops: Vec<Op>,
 }
 
 impl TrajectoryRecorder {
-    pub fn new() -> Self {
+    /// Create a new empty trajectory recorder.
+    #[must_use]
+    pub const fn new() -> Self {
         Self { ops: Vec::new() }
     }
 
     /// Record a message as an editchain operation.
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        reason = "u128 as u64 is safe; Unix millis since epoch fit in u64 for centuries"
+    )]
     pub fn record_message(&mut self, role: &str, content: &str) {
         let op = Op {
             id: self.next_id(),
@@ -37,6 +45,11 @@ impl TrajectoryRecorder {
     }
 
     /// Record a tool call.
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        reason = "u128 as u64 is safe; Unix millis since epoch fit in u64 for centuries"
+    )]
     pub fn record_tool_call(&mut self, tool_call_id: &str, tool_name: &str, arguments: &Value) {
         let op = Op {
             id: self.next_id(),
@@ -63,8 +76,13 @@ impl TrajectoryRecorder {
     }
 
     /// Record a command output.
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        reason = "u128 as u64 is safe; Unix millis since epoch fit in u64 for centuries"
+    )]
     pub fn record_command_output(&mut self, command_id: &str, output: &str, returncode: i32) {
-        let content = format!("<returncode>{}</returncode>\n<output>\n{}</output>", returncode, output);
+        let content = format!("<returncode>{returncode}</returncode>\n<output>\n{output}</output>");
         let op = Op {
             id: self.next_id(),
             parents: parents::ParentSet::None,
@@ -87,6 +105,11 @@ impl TrajectoryRecorder {
     }
 
     /// Record exit status and submission.
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_possible_truncation,
+        reason = "u128 as u64 is safe; Unix millis since epoch fit in u64 for centuries"
+    )]
     pub fn record_exit(&mut self, exit_status: &str, submission: &str) {
         let op = Op {
             id: self.next_id(),
@@ -115,13 +138,19 @@ impl TrajectoryRecorder {
     }
 
     /// Save trajectory to a JSON file (editchain ops format).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created or the file cannot be written.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let json_ops: Vec<Value> = self.ops.iter().map(|op| {
-            serde_json::to_value(op).unwrap_or_default()
-        }).collect();
+        let json_ops: Vec<Value> = self
+            .ops
+            .iter()
+            .map(|op| serde_json::to_value(op).unwrap_or_default())
+            .collect();
         let data = serde_json::json!({
             "trajectory_format": "editchain-1.0",
             "ops": json_ops,
@@ -130,7 +159,11 @@ impl TrajectoryRecorder {
         Ok(())
     }
 
-    fn next_id(&self) -> OpId {
+    #[expect(
+        clippy::as_conversions,
+        reason = "ops.len() fits in u64; trajectory is bounded by step limit"
+    )]
+    const fn next_id(&self) -> OpId {
         OpId::new(NodeId(0), 0, self.ops.len() as u64)
     }
 }

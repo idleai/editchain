@@ -1,9 +1,9 @@
 use ratatui::style::{Color, Modifier, Style};
 
-/// Color theme for the EditChain TUI.
-#[allow(dead_code)]
+/// Color theme for the `EditChain` TUI.
+#[expect(dead_code, reason = "WIP TUI — theme fields used in rendering")]
 #[derive(Debug, Clone)]
-pub struct Theme {
+pub(crate) struct Theme {
     pub bg: Color,
     pub fg: Color,
     pub selection_bg: Color,
@@ -35,16 +35,16 @@ impl Default for Theme {
             status_fg: Color::White,
             filter_active: Color::Yellow,
             kind_colors: vec![
-                (0, Color::Green),   // ChainStart
-                (1, Color::Cyan),    // Actor
-                (2, Color::White),   // Message
-                (3, Color::Magenta), // Tool
-                (4, Color::Red),     // Command
-                (5, Color::Yellow),  // File
-                (6, Color::Blue),    // Reflection
-                (7, Color::DarkGray),// Import
-                (8, Color::Cyan),    // Note
-                (9, Color::Red),     // Error
+                (0, Color::Green),    // ChainStart
+                (1, Color::Cyan),     // Actor
+                (2, Color::White),    // Message
+                (3, Color::Magenta),  // Tool
+                (4, Color::Red),      // Command
+                (5, Color::Yellow),   // File
+                (6, Color::Blue),     // Reflection
+                (7, Color::DarkGray), // Import
+                (8, Color::Cyan),     // Note
+                (9, Color::Red),      // Error
             ],
         }
     }
@@ -52,17 +52,17 @@ impl Default for Theme {
 
 impl Theme {
     /// Style for a kind code.
-    pub fn kind_style(&self, kind_code: u8) -> Style {
-        let color = self.kind_colors
+    pub(crate) fn kind_style(&self, kind_code: u8) -> Style {
+        let color = self
+            .kind_colors
             .iter()
             .find(|(k, _)| *k == kind_code)
-            .map(|(_, c)| *c)
-            .unwrap_or(self.fg);
+            .map_or(self.fg, |(_, c)| *c);
         Style::default().fg(color)
     }
 
     /// Style for the selected row.
-    pub fn selection_style(&self) -> Style {
+    pub(crate) fn selection_style(&self) -> Style {
         Style::default()
             .bg(self.selection_bg)
             .fg(self.selection_fg)
@@ -70,8 +70,10 @@ impl Theme {
     }
 
     /// Style for the DAG node marker.
-    pub fn dag_node_style(&self) -> Style {
-        Style::default().fg(self.dag_node).add_modifier(Modifier::BOLD)
+    pub(crate) fn dag_node_style(&self) -> Style {
+        Style::default()
+            .fg(self.dag_node)
+            .add_modifier(Modifier::BOLD)
     }
 
     // /// Style for DAG connecting lines.

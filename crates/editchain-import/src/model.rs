@@ -18,7 +18,7 @@ pub struct DiscoveryRequest {
 /// Options for the import process.
 #[derive(Debug, Clone)]
 pub struct ImportOptions {
-    /// Whether to emit normalized ops alongside raw ImportOps.
+    /// Whether to emit normalized ops alongside raw `ImportOps`.
     pub normalize: bool,
     /// Whether to include thinking content (default: false — private).
     pub include_thinking: bool,
@@ -43,7 +43,7 @@ pub struct ImportReport {
     pub files_discovered: usize,
     /// Number of source files processed.
     pub files_processed: usize,
-    /// Number of raw ImportOps emitted.
+    /// Number of raw `ImportOps` emitted.
     pub raw_ops: usize,
     /// Number of normalized ops emitted.
     pub normalized_ops: usize,
@@ -56,6 +56,8 @@ pub struct ImportReport {
 }
 
 impl ImportReport {
+    /// Create a new empty import report.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -82,9 +84,11 @@ pub enum NormalizedOp {
 }
 
 impl NormalizedOp {
+    /// Convert this normalized op into an editchain `Op`.
+    #[must_use]
     pub fn into_op(self) -> Op {
         match self {
-            NormalizedOp::Op(op) => op,
+            Self::Op(op) => op,
         }
     }
 }

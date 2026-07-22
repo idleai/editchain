@@ -1,6 +1,6 @@
 /// Actions that can be triggered by keyboard input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
+pub(crate) enum Action {
     Quit,
     Down,
     Up,

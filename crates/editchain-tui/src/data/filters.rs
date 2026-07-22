@@ -1,7 +1,7 @@
 /// Filter expression for narrowing the visible operation set.
-#[allow(dead_code)]
+#[expect(dead_code, reason = "WIP TUI — filter functionality")]
 #[derive(Debug, Clone, Default)]
-pub struct FilterExpr {
+pub(crate) struct FilterExpr {
     /// Only show these kind codes (empty = all).
     pub kinds: Vec<u8>,
     /// Tags: any of these bits must be set.
@@ -24,8 +24,8 @@ pub struct FilterExpr {
 
 impl FilterExpr {
     /// Returns true if the given header passes this filter.
-    #[allow(dead_code)]
-    pub fn matches(&self, header: &crate::data::header::OpHeader) -> bool {
+    #[expect(dead_code, reason = "WIP TUI — filter functionality")]
+    pub(crate) fn matches(&self, header: &crate::data::header::OpHeader) -> bool {
         // Kind filter
         if !self.kinds.is_empty() && !self.kinds.contains(&header.kind_code) {
             return false;

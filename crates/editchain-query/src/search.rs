@@ -47,12 +47,19 @@ impl Default for GraphExpansion {
 /// Tag-based filter for operation kinds.
 #[derive(Debug, Clone)]
 pub enum TagFilter {
+    /// A message operation (user or assistant message).
     Message,
+    /// A tool invocation operation.
     Tool,
+    /// A command execution operation.
     Command,
+    /// A file read/write operation.
     File,
+    /// A reflection/thinking operation.
     Reflection,
+    /// An import record operation.
     Import,
+    /// An error operation.
     Error,
 }
 
@@ -116,7 +123,9 @@ impl Default for SearchRequest {
 /// A chunk identifier — unique within a chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChunkId {
+    /// The operation ID this chunk belongs to.
     pub op_id: OpId,
+    /// The ordinal position of this chunk within the operation.
     pub chunk_ordinal: u32,
 }
 
@@ -129,41 +138,58 @@ impl core::fmt::Display for ChunkId {
 /// Metadata attached to a scored chunk in search results.
 #[derive(Debug, Clone)]
 pub struct ChunkMetadata {
+    /// The operation ID this chunk belongs to.
     pub op_id: OpId,
+    /// The chunk identifier.
     pub chunk_id: ChunkId,
+    /// The session this chunk belongs to, if any.
     pub session_id: Option<SessionId>,
+    /// The actor that produced this chunk.
     pub actor_id: ActorId,
+    /// Bitmask of operation kind tags.
     pub kind_tags: u64,
+    /// Timestamp in milliseconds since Unix epoch.
     pub timestamp_ms: u64,
+    /// Generation counter for read-your-writes consistency.
     pub generation: u64,
 }
 
 /// A scored search result chunk.
 #[derive(Debug, Clone)]
 pub struct ScoredChunk {
+    /// The chunk identifier.
     pub chunk_id: ChunkId,
+    /// The operation ID this chunk belongs to.
     pub op_id: OpId,
     /// Fused relevance score (higher = more relevant).
     pub score: f64,
     /// The text content of this chunk.
     pub text: String,
+    /// Metadata associated with this chunk.
     pub metadata: ChunkMetadata,
 }
 
 /// Watermarks showing how current each projection is.
 #[derive(Debug, Clone, Copy)]
 pub struct ProjectionWatermarks {
+    /// Highest log sequence indexed.
     pub log: u64,
+    /// Highest hydrated sequence indexed.
     pub hydrated: u64,
+    /// Highest graph sequence indexed.
     pub graph: u64,
+    /// Highest lexical index sequence indexed.
     pub lexical: u64,
+    /// Highest vector index sequence indexed.
     pub vector: u64,
 }
 
 /// A search response.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
+    /// The scored search result chunks.
     pub results: Vec<ScoredChunk>,
+    /// Watermarks showing index freshness.
     pub watermarks: ProjectionWatermarks,
 }
 

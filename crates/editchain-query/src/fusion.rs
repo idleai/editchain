@@ -2,17 +2,21 @@ use crate::search::ScoredChunk;
 
 /// Reciprocal Rank Fusion — combines multiple ranked result lists into one.
 ///
-/// RRF(d) = Σ 1 / (k + rank_r(d))
+/// RRF(d) = Σ 1 / (k + `rank_r(d)`)
 ///
 /// Where `rank_r(d)` is the position (1-based) of document `d` in result list `r`,
 /// and `k` is a constant (default 60).
 ///
 /// This avoids the problem of combining incompatible raw scores (BM25 vs cosine).
-pub fn rrf_fuse(
-    lists: &[Vec<ScoredChunk>],
-    k: f64,
-    top_k: usize,
-) -> Vec<ScoredChunk> {
+#[expect(
+    clippy::type_complexity,
+    clippy::cast_precision_loss,
+    clippy::as_conversions,
+    clippy::arithmetic_side_effects,
+    reason = "HashMap of (node,boot,seq) -> (score, chunk) is a natural local structure; rank is small (<200), f64 precision sufficient; rank+1 cast and RRF accumulation are intentional"
+)]
+#[must_use]
+pub fn rrf_fuse(lists: &[Vec<ScoredChunk>], k: f64, top_k: usize) -> Vec<ScoredChunk> {
     if lists.is_empty() {
         return Vec::new();
     }
@@ -47,4 +51,3 @@ pub fn rrf_fuse(
         })
         .collect()
 }
-

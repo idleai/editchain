@@ -2,6 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Quality
+
+```sh
+# Run the full lint suite (required before declaring a task complete)
+./scripts/lint.sh
+```
+
 ## Commands
 
 ```sh

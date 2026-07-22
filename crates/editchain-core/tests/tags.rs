@@ -1,3 +1,10 @@
+//! Tag bitflag tests.
+
+// Referenced by library derive macros; suppress unused-crate-dependencies lint.
+use postcard as _;
+use proptest as _;
+use serde as _;
+
 use editchain_core::tags::Tags;
 
 #[test]
@@ -15,7 +22,7 @@ fn tag_display() {
     assert_eq!(format!("{}", Tags::NONE), "none");
     assert_eq!(format!("{}", Tags::AGENT), "agent");
     let t = Tags::AGENT | Tags::FILE;
-    let s = format!("{}", t);
+    let s = format!("{t}");
     assert!(s.contains("agent"));
     assert!(s.contains("file"));
 }

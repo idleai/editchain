@@ -1,3 +1,4 @@
+use crate::theme::Theme;
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Style, Stylize},
@@ -5,10 +6,9 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
-use crate::theme::Theme;
 
 /// Render the help popup overlay.
-pub fn render_help_popup(frame: &mut Frame, area: Rect, _theme: &Theme) {
+pub(crate) fn render_help_popup(frame: &mut Frame<'_>, area: Rect, _theme: &Theme) {
     // Center the popup
     let popup_width = 50.min(area.width.saturating_sub(4));
     let popup_height = 24.min(area.height.saturating_sub(4));
@@ -26,7 +26,10 @@ pub fn render_help_popup(frame: &mut Frame, area: Rect, _theme: &Theme) {
     frame.render_widget(Clear, popup_area);
 
     let help_text = vec![
-        Line::from(Span::styled(" EditChain TUI Help ", Style::default().bold())),
+        Line::from(Span::styled(
+            " EditChain TUI Help ",
+            Style::default().bold(),
+        )),
         Line::from(""),
         Line::from(" Navigation"),
         Line::from("   j / ↓         Move down"),

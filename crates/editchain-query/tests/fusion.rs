@@ -1,17 +1,26 @@
+#![expect(missing_docs, reason = "Test file")]
+
 use editchain_core::{ActorId, NodeId, OpId};
 use editchain_query::fusion::rrf_fuse;
 use editchain_query::search::{ChunkId, ChunkMetadata, ScoredChunk};
+use serde as _;
 
 fn make_chunk(node: u64, seq: u64, score: f64) -> ScoredChunk {
     let op_id = OpId::new(NodeId(node), 0, seq);
     ScoredChunk {
-        chunk_id: ChunkId { op_id, chunk_ordinal: 0 },
+        chunk_id: ChunkId {
+            op_id,
+            chunk_ordinal: 0,
+        },
         op_id,
         score,
-        text: format!("chunk {}/{}", node, seq),
+        text: format!("chunk {node}/{seq}"),
         metadata: ChunkMetadata {
             op_id,
-            chunk_id: ChunkId { op_id, chunk_ordinal: 0 },
+            chunk_id: ChunkId {
+                op_id,
+                chunk_ordinal: 0,
+            },
             session_id: None,
             actor_id: ActorId(0),
             kind_tags: 0,
@@ -28,6 +37,10 @@ fn rrf_empty_lists() {
 }
 
 #[test]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Test assertions on known-length vec"
+)]
 fn rrf_single_list() {
     let list = vec![make_chunk(1, 1, 10.0), make_chunk(1, 2, 5.0)];
     let result = rrf_fuse(&[list], 60.0, 10);
@@ -36,6 +49,10 @@ fn rrf_single_list() {
 }
 
 #[test]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Test assertions on known-length vec"
+)]
 fn rrf_two_lists() {
     let list_a = vec![make_chunk(1, 1, 10.0), make_chunk(1, 2, 5.0)];
     let list_b = vec![make_chunk(1, 2, 8.0), make_chunk(1, 3, 3.0)];

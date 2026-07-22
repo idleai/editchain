@@ -1,8 +1,13 @@
-use editchain_core::{
-    op::OpKind,
-    payload::Payload,
-    tags::Tags,
-};
+//! Normalization tests for Claude Code envelopes.
+
+use blake3 as _;
+use proptest as _;
+use serde as _;
+use serde_json as _;
+use sha2 as _;
+use tempfile as _;
+
+use editchain_core::{op::OpKind, payload::Payload, tags::Tags};
 use editchain_import::claude_code::envelope::parse_envelope;
 use editchain_import::claude_code::normalize::{normalize_envelope, NormalizeOptions};
 use editchain_import::ids::{derive_node_id, hash_raw, SourceStream};
@@ -11,21 +16,30 @@ use editchain_import::sink::MemoryBlobSink;
 #[test]
 fn test_timestamp_parsing() {
     let ts = editchain_import::claude_code::normalize::parse_timestamp("2026-07-09T18:56:19.739Z");
-    assert!(ts > 1700000000000);
-    assert!(ts < 1800000000000);
+    assert!(ts > 1_700_000_000_000);
+    assert!(ts < 1_800_000_000_000);
 }
 
 #[test]
 fn test_timestamp_no_millis() {
     let ts = editchain_import::claude_code::normalize::parse_timestamp("2026-07-09T18:56:19Z");
-    assert!(ts > 1700000000000);
+    assert!(ts > 1_700_000_000_000);
 }
 
 #[test]
 fn test_empty_timestamp() {
-    assert_eq!(editchain_import::claude_code::normalize::parse_timestamp(""), 0);
+    assert_eq!(
+        editchain_import::claude_code::normalize::parse_timestamp(""),
+        0
+    );
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::wildcard_enum_match_arm,
+    reason = "test assertions on known-length vec"
+)]
 #[test]
 fn test_normalize_user_message() {
     let json = br#"{"type":"user","uuid":"abc","sessionId":"sess-1","timestamp":"2026-07-09T18:56:19.739Z","message":{"role":"user","content":"hello world"}}"#;
@@ -34,8 +48,15 @@ fn test_normalize_user_message() {
     let hash = hash_raw(json);
     let mut blobs = MemoryBlobSink::new();
 
-    let (raw, norm) =
-        normalize_envelope(&env, hash, json, &stream, 1, &NormalizeOptions::default(), &mut blobs);
+    let (raw, norm) = normalize_envelope(
+        &env,
+        hash,
+        json,
+        &stream,
+        1,
+        &NormalizeOptions::default(),
+        &mut blobs,
+    );
 
     assert!(matches!(raw.kind, OpKind::Import(_)));
     assert!(raw.tags.matches_any(Tags::IMPORT));
