@@ -2,7 +2,7 @@ use editchain_core::{
     clock::Clock,
     op::{
         CommandOp, CommandStage, FileEdit, FileOp, FileStage, FrontierSet, ImportOp, MessageOp,
-        OpKind, ReflectionOp, ToolOp, ToolStage, WindowRef,
+        NoteOp, NoteRelationship, OpKind, ReflectionOp, ToolOp, ToolStage, WindowRef,
     },
     parents::ParentSet,
     payload::Payload,
@@ -10,6 +10,8 @@ use editchain_core::{
     tags::Tags,
     Op,
 };
+
+use serde_json::Value;
 
 use super::envelope::{CcContentBlock, CcEnvelope};
 use crate::ids::{derive_actor_id, derive_session_id, SourcePosition, SourceStream};
@@ -247,7 +249,7 @@ pub fn normalize_envelope(
                                 normalized.push(cmd_op);
                             }
                         }
-                        CcContentBlock::Thinking { thinking }
+                        CcContentBlock::Thinking { thinking, .. }
                             if options.include_thinking && !thinking.trim().is_empty() =>
                         {
                             let thinking_op = Op {
@@ -278,6 +280,7 @@ pub fn normalize_envelope(
         }
 
         "attachment" => {
+            // File-content attachments surface file contents into the transcript.
             if env.attachment_type == "file" || env.attachment_type == "file_content" {
                 let file_op = Op {
                     id: stream
@@ -300,6 +303,36 @@ pub fn normalize_envelope(
                     }),
                 };
                 normalized.push(file_op);
+            }
+            // IDE/file-context attachments carry a filename worth recording.
+            if matches!(
+                env.attachment_type.as_str(),
+                "opened_file_in_ide"
+                    | "selected_lines_in_ide"
+                    | "already_read_file"
+                    | "plan_mode_reentry"
+            ) {
+                let note_op = Op {
+                    id: stream
+                        .op_from_position(SourcePosition::derived(
+                            seq,
+                            (normalized.len() + 1) as u16,
+                        ))
+                        .unwrap(),
+                    parents: ParentSet::One(op_id),
+                    actor,
+                    clock,
+                    scope: ScopeRef::Session(session_id),
+                    tags: Tags::FILE | Tags::IMPORT | Tags::NOTE,
+                    kind: OpKind::Note(NoteOp {
+                        target_ids: Vec::new(),
+                        relationship: NoteRelationship::Explains,
+                        content: Payload::Inline(
+                            format!("attachment={}", env.attachment_type).into_bytes(),
+                        ),
+                    }),
+                };
+                normalized.push(note_op);
             }
         }
 
@@ -330,8 +363,80 @@ pub fn normalize_envelope(
                 };
                 normalized.push(reflection_op);
             }
+            // API errors and informational system events carry prose worth keeping.
+            "api_error" | "informational" => {
+                if let Some(err) = &env.error {
+                    let text = err.get("message").and_then(Value::as_str).unwrap_or("");
+                    if !text.is_empty() {
+                        let note_op = Op {
+                            id: stream
+                                .op_from_position(SourcePosition::derived(
+                                    seq,
+                                    (normalized.len() + 1) as u16,
+                                ))
+                                .unwrap(),
+                            parents: ParentSet::One(op_id),
+                            actor,
+                            clock,
+                            scope: ScopeRef::Session(session_id),
+                            tags: Tags::ERROR | Tags::IMPORT,
+                            kind: OpKind::Note(NoteOp {
+                                target_ids: Vec::new(),
+                                relationship: NoteRelationship::Explains,
+                                content: Payload::Inline(text.as_bytes().to_vec()),
+                            }),
+                        };
+                        normalized.push(note_op);
+                    }
+                }
+            }
             _ => {}
         },
+
+        // Mode changes (e.g. normal/plan) — record as a note.
+        "mode" => {
+            if !env.mode.is_empty() {
+                let note_op = Op {
+                    id: stream
+                        .op_from_position(SourcePosition::derived(
+                            seq,
+                            (normalized.len() + 1) as u16,
+                        ))
+                        .unwrap(),
+                    parents: ParentSet::One(op_id),
+                    actor,
+                    clock,
+                    scope: ScopeRef::Session(session_id),
+                    tags: Tags::IMPORT | Tags::NOTE,
+                    kind: OpKind::Note(NoteOp {
+                        target_ids: Vec::new(),
+                        relationship: NoteRelationship::Explains,
+                        content: Payload::Inline(format!("mode={}", env.mode).into_bytes()),
+                    }),
+                };
+                normalized.push(note_op);
+            }
+        }
+
+        // AI-generated session titles — record as a note.
+        "ai-title" if !env.ai_title.is_empty() => {
+            let note_op = Op {
+                id: stream
+                    .op_from_position(SourcePosition::derived(seq, (normalized.len() + 1) as u16))
+                    .unwrap(),
+                parents: ParentSet::One(op_id),
+                actor,
+                clock,
+                scope: ScopeRef::Session(session_id),
+                tags: Tags::IMPORT | Tags::NOTE,
+                kind: OpKind::Note(NoteOp {
+                    target_ids: Vec::new(),
+                    relationship: NoteRelationship::Explains,
+                    content: Payload::Inline(env.ai_title.as_bytes().to_vec()),
+                }),
+            };
+            normalized.push(note_op);
+        }
 
         _ => {}
     }

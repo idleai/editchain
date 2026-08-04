@@ -47,3 +47,24 @@ fn discover_ignores_agent_files_at_top_level() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].session_id, "main");
 }
+
+#[test]
+fn discover_subagents_in_session_subdir() {
+    let dir = tempfile::tempdir().unwrap();
+    // Main session file.
+    std::fs::write(dir.path().join("sess-1.jsonl"), "{}\n").unwrap();
+    // Subagents live in <session-id>/subagents/agent-*.jsonl.
+    let sub_dir = dir.path().join("sess-1").join("subagents");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+    std::fs::write(sub_dir.join("agent-aaa.jsonl"), "{}\n").unwrap();
+    std::fs::write(sub_dir.join("agent-bbb.jsonl"), "{}\n").unwrap();
+
+    let sessions = discover_sessions(dir.path()).unwrap();
+    // 1 main + 2 subagents.
+    assert_eq!(sessions.len(), 3);
+    let subagents: Vec<_> = sessions.iter().filter(|s| s.is_subagent).collect();
+    assert_eq!(subagents.len(), 2);
+    assert!(subagents
+        .iter()
+        .all(|s| s.parent_session_id.as_deref() == Some("sess-1")));
+}

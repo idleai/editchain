@@ -71,3 +71,38 @@ fn test_normalize_user_message() {
         _ => panic!("expected MessageOp"),
     }
 }
+
+#[expect(
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::wildcard_enum_match_arm,
+    reason = "test assertions on known-length vec"
+)]
+#[test]
+fn test_normalize_mode_event() {
+    let json = br#"{"type":"mode","mode":"plan","sessionId":"sess-1","timestamp":"2026-07-09T18:56:19.739Z"}"#;
+    let env = parse_envelope(json).unwrap();
+    let stream = SourceStream::new(derive_node_id("/test"), 0);
+    let hash = hash_raw(json);
+    let mut blobs = MemoryBlobSink::new();
+
+    let (raw, norm) = normalize_envelope(
+        &env,
+        hash,
+        json,
+        &stream,
+        1,
+        &NormalizeOptions::default(),
+        &mut blobs,
+    );
+
+    assert!(matches!(raw.kind, OpKind::Import(_)));
+    assert_eq!(norm.len(), 1);
+    match &norm[0].kind {
+        OpKind::Note(note) => match &note.content {
+            Payload::Inline(bytes) => assert_eq!(bytes.as_slice(), b"mode=plan"),
+            _ => panic!("expected inline payload"),
+        },
+        _ => panic!("expected NoteOp for mode event"),
+    }
+}

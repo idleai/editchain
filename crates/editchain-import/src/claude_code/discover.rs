@@ -69,9 +69,11 @@ pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<SessionFile>, String
 fn discover_subagents(session_path: &Path, parent_session_id: &str) -> Vec<SessionFile> {
     let mut subagents = Vec::new();
 
-    // Subagents are stored in a `subagents/` directory next to the session file.
+    // Claude Code stores subagent transcripts in a directory named after the
+    // session ID, containing a `subagents/` subdirectory:
+    //   <encoded-cwd>/<session-id>/subagents/agent-*.jsonl
     let parent_dir = session_path.parent().unwrap_or(Path::new("."));
-    let subagents_dir = parent_dir.join("subagents");
+    let subagents_dir = parent_dir.join(parent_session_id).join("subagents");
 
     if !subagents_dir.exists() {
         return subagents;
