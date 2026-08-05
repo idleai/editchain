@@ -198,6 +198,8 @@ const fn op_kind_code(kind: &OpKind) -> u8 {
         OpKind::Import(_) => 7,
         OpKind::Note(_) => 8,
         OpKind::Error(_) => 9,
+        OpKind::GitCommit(_) => 11,
+        OpKind::GitLink(_) => 12,
         OpKind::Unknown(_) => 10,
     }
 }
@@ -223,6 +225,8 @@ const fn op_stage_code(kind: &OpKind) -> Option<u8> {
         | OpKind::Import(_)
         | OpKind::Note(_)
         | OpKind::Error(_)
+        | OpKind::GitCommit(_)
+        | OpKind::GitLink(_)
         | OpKind::Unknown(_) => None,
     }
 }
@@ -268,6 +272,11 @@ fn extract_preview(op: &Op) -> Option<Box<str>> {
             Payload::Inline(b) => Some(bytes_to_preview(b)),
             Payload::Empty | Payload::Blob(_) => None,
         },
+        OpKind::GitCommit(c) => match &c.message {
+            Payload::Inline(b) => Some(bytes_to_preview(b)),
+            Payload::Empty | Payload::Blob(_) => None,
+        },
+        OpKind::GitLink(l) => Some(format!("git:{}", l.target_oid).into_boxed_str()),
         OpKind::Unknown(u) => {
             Some(format!("unknown kind={}", u.kind_discriminant).into_boxed_str())
         }

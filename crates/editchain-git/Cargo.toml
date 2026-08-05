@@ -1,0 +1,22 @@
+[package]
+name = "editchain-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gix = { version = "0.86", features = ["sha256"] }
+gix-object = "0.63"
+sha2 = "0.10"
+editchain-core = { path = "../editchain-core" }
+
+[dev-dependencies]
+tempfile = "3"

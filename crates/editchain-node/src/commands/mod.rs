@@ -70,6 +70,9 @@ pub enum Commands {
         /// Filter by kind (message,tool,command,file)
         #[arg(long)]
         kind: Option<String>,
+        /// Filter by source (editchain,git)
+        #[arg(long)]
+        source: Option<String>,
     },
     /// Tail the edit chain (follow new operations)
     Tail {
@@ -124,7 +127,8 @@ pub fn dispatch(command: Commands) -> Result<(), Box<dyn std::error::Error>> {
             mode,
             top,
             kind,
-        } => search::run(path, query, mode, top, kind),
+            source,
+        } => search::run(path, query, mode, top, kind, source),
         Commands::Tail {
             path,
             follow,

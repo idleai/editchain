@@ -1,0 +1,28 @@
+[package]
+name = "editchain-vscode-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json = "1"
+gix = "0.86"
+editchain-core = { path = "../editchain-core" }
+editchain-codec = { path = "../editchain-codec" }
+editchain-node = { path = "../editchain-node" }
+editchain-git = { path = "../editchain-git" }
+editchain-project = { path = "../editchain-project" }
+editchain-protocol = { path = "../editchain-protocol" }
+editchain-query = { path = "../editchain-query" }
+editchain-index = { path = "../editchain-index" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -17,7 +17,9 @@ use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocumen
 
 use editchain_core::Op;
 use editchain_query::hybrid::LexicalSearch;
-use editchain_query::search::{ChunkId, ChunkMetadata, ScoredChunk, SearchFilters, TagFilter};
+use editchain_query::search::{
+    ChunkId, ChunkMetadata, ScoredChunk, SearchFilters, Source, TagFilter,
+};
 
 use crate::chunker::{chunk_text, extract_op_text, ChunkRecord, Generation};
 
@@ -40,6 +42,8 @@ pub struct LexicalFields {
     pub tool_name: Field,
     /// Operation kind field (message, tool, command, etc.).
     pub kind: Field,
+    /// Source domain field (`editchain` or `git`).
+    pub source: Field,
     /// Role field (`assistant`, `tool_start`, `tool_result`, etc.).
     pub role: Field,
     /// Actor ID as a u64 field.
@@ -72,6 +76,7 @@ fn build_schema() -> (Schema, LexicalFields) {
     let path_exact = schema_builder.add_text_field("path_exact", STRING);
     let tool_name = schema_builder.add_text_field("tool_name", STRING);
     let kind = schema_builder.add_text_field("kind", STRING | STORED);
+    let source = schema_builder.add_text_field("source", STRING | STORED);
     let role = schema_builder.add_text_field("role", STRING);
     let actor_id = schema_builder.add_u64_field("actor_id", INDEXED | STORED);
     let session_id = schema_builder.add_u64_field("session_id", INDEXED | STORED);
@@ -91,6 +96,7 @@ fn build_schema() -> (Schema, LexicalFields) {
         path_exact,
         tool_name,
         kind,
+        source,
         role,
         actor_id,
         session_id,
@@ -204,11 +210,13 @@ impl LexicalIndex {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let kind_str = kind_to_string(&op.kind);
         let role_str = role_to_string(&op.kind);
+        let source_str = source_to_string(&op.kind);
 
         let _opstamp = self.writer.add_document(doc!(
             self.fields.body => text,
             self.fields.body_code => text,
             self.fields.kind => kind_str,
+            self.fields.source => source_str,
             self.fields.role => role_str,
             self.fields.actor_id => op.actor.0,
             self.fields.node_id => op.id.node.0,
@@ -276,6 +284,23 @@ impl LexicalIndex {
                     })
                     .collect();
                 subqueries.push((Occur::Must, Box::new(BooleanQuery::new(kind_terms))));
+            }
+        }
+
+        // Apply source filters.
+        if let Some(ref sources) = filters.sources {
+            if !sources.is_empty() {
+                let source_terms: Vec<(Occur, Box<dyn Query>)> = sources
+                    .iter()
+                    .map(|s| -> (Occur, Box<dyn Query>) {
+                        let term = Term::from_field_text(self.fields.source, source_to_str(*s));
+                        (
+                            Occur::Should,
+                            Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+                        )
+                    })
+                    .collect();
+                subqueries.push((Occur::Must, Box::new(BooleanQuery::new(source_terms))));
             }
         }
 
@@ -367,6 +392,10 @@ impl LexicalIndex {
                         op_id,
                         chunk_ordinal: ordinal_val as u32,
                     },
+                    source: doc
+                        .get_first(self.fields.source)
+                        .and_then(|v| v.as_str())
+                        .map_or(Source::EditChain, str_to_source),
                     session_id: None,
                     actor_id: editchain_core::ActorId(
                         doc.get_first(self.fields.actor_id)
@@ -438,6 +467,8 @@ const fn kind_to_string(kind: &editchain_core::op::OpKind) -> &'static str {
         OpKind::Import(_) => "import",
         OpKind::Note(_) => "note",
         OpKind::Error(_) => "error",
+        OpKind::GitCommit(_) => "git_commit",
+        OpKind::GitLink(_) => "git_link",
         OpKind::ChainStart(_) | OpKind::Actor(_) | OpKind::Unknown(_) => "unknown",
     }
 }
@@ -461,6 +492,8 @@ const fn role_to_string(kind: &editchain_core::op::OpKind) -> &'static str {
         | OpKind::Import(_)
         | OpKind::Note(_)
         | OpKind::Error(_)
+        | OpKind::GitCommit(_)
+        | OpKind::GitLink(_)
         | OpKind::ChainStart(_)
         | OpKind::Actor(_)
         | OpKind::Unknown(_) => "",
@@ -476,5 +509,40 @@ const fn tag_filter_to_str(filter: &TagFilter) -> &'static str {
         TagFilter::Reflection => "reflection",
         TagFilter::Import => "import",
         TagFilter::Error => "error",
+    }
+}
+
+/// Map an operation kind to its source domain string.
+const fn source_to_string(kind: &editchain_core::op::OpKind) -> &'static str {
+    use editchain_core::op::OpKind;
+    match kind {
+        OpKind::GitCommit(_) | OpKind::GitLink(_) => "git",
+        OpKind::ChainStart(_)
+        | OpKind::Actor(_)
+        | OpKind::Message(_)
+        | OpKind::Tool(_)
+        | OpKind::Command(_)
+        | OpKind::File(_)
+        | OpKind::Reflection(_)
+        | OpKind::Import(_)
+        | OpKind::Note(_)
+        | OpKind::Error(_)
+        | OpKind::Unknown(_) => "editchain",
+    }
+}
+
+/// Map a `Source` filter to its index string.
+const fn source_to_str(source: Source) -> &'static str {
+    match source {
+        Source::EditChain => "editchain",
+        Source::Git => "git",
+    }
+}
+
+/// Map a stored source string back to a `Source`.
+fn str_to_source(s: &str) -> Source {
+    match s {
+        "git" => Source::Git,
+        _ => Source::EditChain,
     }
 }

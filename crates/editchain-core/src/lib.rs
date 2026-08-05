@@ -18,6 +18,8 @@ use proptest as _;
 
 /// Clock types for causal ordering.
 pub mod clock;
+/// Git identity, commit, and explicit-link types.
+pub mod git;
 /// Identifier types (`NodeId`, `ActorId`, `OpId`, etc.).
 pub mod ids;
 /// Operation envelope and all operation kinds.
@@ -35,6 +37,7 @@ pub mod tags;
 
 // Re-exports for convenience.
 pub use clock::*;
+pub use git::*;
 pub use ids::*;
 pub use op::*;
 pub use parents::*;

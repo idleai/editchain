@@ -3,7 +3,7 @@
 use editchain_core::{ActorId, NodeId, OpId};
 use editchain_query::hybrid::{HybridSearch, LexicalSearch, VectorSearch};
 use editchain_query::search::{
-    ChunkId, ChunkMetadata, ScoredChunk, SearchFilters, SearchMode, SearchRequest,
+    ChunkId, ChunkMetadata, ScoredChunk, SearchFilters, SearchMode, SearchRequest, Source,
 };
 use serde as _;
 
@@ -25,6 +25,7 @@ impl LexicalSearch for MockLexical {
                     op_id,
                     chunk_ordinal: 0,
                 },
+                source: Source::EditChain,
                 session_id: None,
                 actor_id: ActorId(0),
                 kind_tags: 0,
@@ -53,6 +54,7 @@ impl VectorSearch for MockVector {
                     op_id,
                     chunk_ordinal: 0,
                 },
+                source: Source::EditChain,
                 session_id: None,
                 actor_id: ActorId(0),
                 kind_tags: 0,

@@ -8,7 +8,7 @@ use tantivy as _;
 use editchain_core::{NodeId, OpId};
 use editchain_embed::EmbeddingManifest;
 use editchain_index::vector::{f32_to_f16_vec, normalize_f32, VectorIndex};
-use editchain_query::search::SearchFilters;
+use editchain_query::search::{SearchFilters, Source};
 
 #[test]
 #[expect(
@@ -39,12 +39,28 @@ fn vector_index_add_and_search() {
     let mut v1 = vec![1.0, 0.0];
     normalize_f32(&mut v1);
     let f16v1 = f32_to_f16_vec(&v1);
-    index.add_vector(OpId::new(NodeId(1), 0, 1), 0, &f16v1, "message", None, 1);
+    index.add_vector(
+        OpId::new(NodeId(1), 0, 1),
+        0,
+        &f16v1,
+        "message",
+        "editchain",
+        None,
+        1,
+    );
 
     let mut v2 = vec![0.0, 1.0];
     normalize_f32(&mut v2);
     let f16v2 = f32_to_f16_vec(&v2);
-    index.add_vector(OpId::new(NodeId(1), 0, 2), 0, &f16v2, "message", None, 1);
+    index.add_vector(
+        OpId::new(NodeId(1), 0, 2),
+        0,
+        &f16v2,
+        "message",
+        "editchain",
+        None,
+        1,
+    );
 
     // Search with query similar to v1
     let mut q = vec![0.9, 0.1];
@@ -54,5 +70,64 @@ fn vector_index_add_and_search() {
     let results = index.search(&f16q, &SearchFilters::default(), 5);
     assert_eq!(results.len(), 2);
     // First result should be v1 (higher dot product)
+    assert_eq!(results[0].op_id.seq, 1);
+}
+
+#[test]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Test assertions on known-valid indices; panic is acceptable in tests"
+)]
+fn vector_index_source_filter() {
+    let mut manifest = EmbeddingManifest::qwen3_embedding_0_6b();
+    manifest.dimensions = 2;
+    let mut index = VectorIndex::new(manifest);
+
+    let mut v1 = vec![1.0, 0.0];
+    normalize_f32(&mut v1);
+    let f16v1 = f32_to_f16_vec(&v1);
+    index.add_vector(
+        OpId::new(NodeId(1), 0, 1),
+        0,
+        &f16v1,
+        "message",
+        "editchain",
+        None,
+        1,
+    );
+
+    let mut v2 = vec![0.0, 1.0];
+    normalize_f32(&mut v2);
+    let f16v2 = f32_to_f16_vec(&v2);
+    index.add_vector(
+        OpId::new(NodeId(1), 0, 2),
+        0,
+        &f16v2,
+        "git_commit",
+        "git",
+        None,
+        1,
+    );
+
+    let mut q = vec![0.9, 0.1];
+    normalize_f32(&mut q);
+    let f16q = f32_to_f16_vec(&q);
+
+    // Filter to git source only — should return just the git commit.
+    let filters = SearchFilters {
+        sources: Some(vec![Source::Git]),
+        ..SearchFilters::default()
+    };
+    let results = index.search(&f16q, &filters, 5);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].op_id.seq, 2);
+
+    // Filter to editchain source only — should return just the message.
+    let filters = SearchFilters {
+        sources: Some(vec![Source::EditChain]),
+        ..SearchFilters::default()
+    };
+    let results = index.search(&f16q, &filters, 5);
+    assert_eq!(results.len(), 1);
     assert_eq!(results[0].op_id.seq, 1);
 }

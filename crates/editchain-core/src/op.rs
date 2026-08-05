@@ -3,6 +3,7 @@ use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 use crate::clock::Clock;
+use crate::git::{GitCommitEntity, GitLink};
 use crate::ids::{ActorId, NodeId, OpId, PathId};
 use crate::parents::ParentSet;
 use crate::payload::{BlobRef, ContentId, Payload};
@@ -91,6 +92,13 @@ pub enum OpKind {
     Note(NoteOp),
     /// Diagnostic error fact.
     Error(ErrorOp),
+    /// A Git commit entity (imported or live).
+    ///
+    /// Boxed to keep the `OpKind` enum small — a commit entity carries several
+    /// variable-length vectors and is much larger than the other variants.
+    GitCommit(Box<GitCommitEntity>),
+    /// An explicit link from an operation to a Git object.
+    GitLink(GitLink),
     /// Opaque preserved fact (unrecognized kind).
     Unknown(UnknownOp),
 }

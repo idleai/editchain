@@ -12,7 +12,7 @@ use roaring::RoaringBitmap;
 use editchain_core::{NodeId, OpId};
 use editchain_embed::{Embedder, EmbeddingManifest};
 use editchain_query::hybrid::VectorSearch;
-use editchain_query::search::{ChunkId, ChunkMetadata, ScoredChunk, SearchFilters};
+use editchain_query::search::{ChunkId, ChunkMetadata, ScoredChunk, SearchFilters, Source};
 
 use crate::chunker::Generation;
 
@@ -159,6 +159,8 @@ pub struct VectorFilters {
     pub kind_bitmaps: std::collections::HashMap<String, RoaringBitmap>,
     /// Bitmaps keyed by session ID.
     pub session_bitmaps: std::collections::HashMap<u64, RoaringBitmap>,
+    /// Bitmaps keyed by source domain (`editchain` or `git`).
+    pub source_bitmaps: std::collections::HashMap<String, RoaringBitmap>,
 }
 
 impl VectorFilters {
@@ -166,6 +168,7 @@ impl VectorFilters {
         Self {
             kind_bitmaps: std::collections::HashMap::new(),
             session_bitmaps: std::collections::HashMap::new(),
+            source_bitmaps: std::collections::HashMap::new(),
         }
     }
 }
@@ -201,6 +204,7 @@ impl VectorIndex {
         chunk_ordinal: u32,
         vec: &[f16],
         kind: &str,
+        source: &str,
         session_id: Option<u64>,
         _generation: Generation,
     ) {
@@ -212,6 +216,13 @@ impl VectorIndex {
             .filters
             .kind_bitmaps
             .entry(kind.to_string())
+            .or_default()
+            .insert(ordinal);
+
+        let _ = self
+            .filters
+            .source_bitmaps
+            .entry(source.to_string())
             .or_default()
             .insert(ordinal);
 
@@ -317,6 +328,7 @@ impl VectorIndex {
                             op_id,
                             chunk_ordinal: chunk_ord,
                         },
+                        source: Source::EditChain,
                         session_id: None,
                         actor_id: editchain_core::ActorId(0),
                         kind_tags: 0,
@@ -328,8 +340,38 @@ impl VectorIndex {
         }
     }
 
-    /// Build a combined filter mask from search filters, intersecting kind bitmaps.
+    /// Build a combined filter mask from search filters, intersecting kind and
+    /// source bitmaps.
     fn build_filter_mask(&self, filters: &SearchFilters) -> Option<RoaringBitmap> {
+        let mut mask: Option<RoaringBitmap> = self.build_kind_mask(filters);
+        if let Some(ref sources) = filters.sources {
+            let mut source_mask: Option<RoaringBitmap> = None;
+            for source in sources {
+                let source_str = match source {
+                    Source::EditChain => "editchain",
+                    Source::Git => "git",
+                };
+                if let Some(bitmap) = self.filters.source_bitmaps.get(source_str) {
+                    match &mut source_mask {
+                        Some(m) => *m |= bitmap.clone(),
+                        None => source_mask = Some(bitmap.clone()),
+                    }
+                } else {
+                    return Some(RoaringBitmap::new());
+                }
+            }
+            if let Some(sm) = source_mask {
+                match &mut mask {
+                    Some(m) => *m &= sm,
+                    None => mask = Some(sm),
+                }
+            }
+        }
+        mask
+    }
+
+    /// Build a filter mask from operation-kind filters.
+    fn build_kind_mask(&self, filters: &SearchFilters) -> Option<RoaringBitmap> {
         let mut mask: Option<RoaringBitmap> = None;
         if let Some(ref kinds) = filters.kinds {
             for kind in kinds {
@@ -417,15 +459,24 @@ impl VectorSearchWrapper {
     )]
     pub fn add_texts(
         &mut self,
-        texts: &[(OpId, u32, String, String, Option<u64>)],
+        texts: &[(OpId, u32, String, String, String, Option<u64>)],
         generation: u64,
     ) -> Result<(), editchain_embed::EmbedError> {
-        let batch: Vec<String> = texts.iter().map(|(_, _, t, _, _)| t.clone()).collect();
+        let batch: Vec<String> = texts.iter().map(|(_, _, t, _, _, _)| t.clone()).collect();
         let vectors = self.embedder.embed(&batch)?;
-        for ((op_id, chunk_ordinal, _, kind, session_id), vec) in texts.iter().zip(vectors.iter()) {
+        for ((op_id, chunk_ordinal, _, kind, source, session_id), vec) in
+            texts.iter().zip(vectors.iter())
+        {
             let f16v = f32_to_f16_vec(vec);
-            self.index
-                .add_vector(*op_id, *chunk_ordinal, &f16v, kind, *session_id, generation);
+            self.index.add_vector(
+                *op_id,
+                *chunk_ordinal,
+                &f16v,
+                kind,
+                source,
+                *session_id,
+                generation,
+            );
         }
         Ok(())
     }

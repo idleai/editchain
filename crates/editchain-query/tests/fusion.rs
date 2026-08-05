@@ -2,7 +2,7 @@
 
 use editchain_core::{ActorId, NodeId, OpId};
 use editchain_query::fusion::rrf_fuse;
-use editchain_query::search::{ChunkId, ChunkMetadata, ScoredChunk};
+use editchain_query::search::{ChunkId, ChunkMetadata, ScoredChunk, Source};
 use serde as _;
 
 fn make_chunk(node: u64, seq: u64, score: f64) -> ScoredChunk {
@@ -21,6 +21,7 @@ fn make_chunk(node: u64, seq: u64, score: f64) -> ScoredChunk {
                 op_id,
                 chunk_ordinal: 0,
             },
+            source: Source::EditChain,
             session_id: None,
             actor_id: ActorId(0),
             kind_tags: 0,

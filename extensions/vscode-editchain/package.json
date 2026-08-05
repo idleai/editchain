@@ -1,0 +1,56 @@
+{
+  "name": "editchain-history",
+  "displayName": "EditChain History",
+  "description": "Unified engineering history explorer — EditChain operations overlaid with live Git history.",
+  "version": "0.1.0",
+  "publisher": "ambientlight",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ambientlight/editchain.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:editchain-history.open"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "editchain-history.open",
+        "title": "EditChain: Open History Explorer"
+      }
+    ],
+    "configuration": {
+      "title": "EditChain History",
+      "properties": {
+        "editchain-history.servicePath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the editchain-vscode-service binary. If empty, the bundled binary is used."
+        },
+        "editchain-history.chainDir": {
+          "type": "string",
+          "default": ".editchain",
+          "description": "Path to the EditChain directory relative to the workspace root."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "@vscode/vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.24.0",
+    "typescript": "^5.4.0"
+  }
+}

@@ -1,7 +1,8 @@
 use editchain_core::{ActorId, OpId, SessionId};
+use serde::{Deserialize, Serialize};
 
 /// Search mode — which index(es) to query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SearchMode {
     /// BM25 only.
     Lexical,
@@ -44,8 +45,17 @@ impl Default for GraphExpansion {
     }
 }
 
+/// The source domain of a searchable document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Source {
+    /// An `EditChain` operation (message, tool, command, file, etc.).
+    EditChain,
+    /// A Git commit or link document.
+    Git,
+}
+
 /// Tag-based filter for operation kinds.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TagFilter {
     /// A message operation (user or assistant message).
     Message,
@@ -64,10 +74,13 @@ pub enum TagFilter {
 }
 
 /// Filters applied to a search query.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SearchFilters {
     /// Only include these operation kinds.
     pub kinds: Option<Vec<TagFilter>>,
+    /// Only include these source domains (`EditChain` and/or `Git`).
+    pub sources: Option<Vec<Source>>,
     /// Only include these sessions.
     pub sessions: Option<Vec<SessionId>>,
     /// Only include these actors.
@@ -121,7 +134,7 @@ impl Default for SearchRequest {
 }
 
 /// A chunk identifier — unique within a chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChunkId {
     /// The operation ID this chunk belongs to.
     pub op_id: OpId,
@@ -136,12 +149,14 @@ impl core::fmt::Display for ChunkId {
 }
 
 /// Metadata attached to a scored chunk in search results.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkMetadata {
     /// The operation ID this chunk belongs to.
     pub op_id: OpId,
     /// The chunk identifier.
     pub chunk_id: ChunkId,
+    /// The source domain (`EditChain` or `Git`).
+    pub source: Source,
     /// The session this chunk belongs to, if any.
     pub session_id: Option<SessionId>,
     /// The actor that produced this chunk.
@@ -155,7 +170,7 @@ pub struct ChunkMetadata {
 }
 
 /// A scored search result chunk.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoredChunk {
     /// The chunk identifier.
     pub chunk_id: ChunkId,

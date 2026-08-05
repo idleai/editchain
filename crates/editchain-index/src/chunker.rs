@@ -111,6 +111,33 @@ pub fn extract_op_text(op: &Op, include_raw: bool, include_private: bool) -> Opt
             // Raw import records indexed only when explicitly requested.
             None // Placeholder — raw_ref payload may be blob.
         }
+        OpKind::GitCommit(commit) => {
+            // Index the commit message, OID, refs, and changed paths as
+            // searchable text. This is the git document surface.
+            let mut parts: Vec<String> = Vec::new();
+            parts.push(commit.oid.to_hex());
+            if let editchain_core::payload::Payload::Inline(msg) = &commit.message {
+                parts.push(String::from_utf8_lossy(msg).to_string());
+            }
+            for r in &commit.imported_refs {
+                if let editchain_core::payload::Payload::Inline(b) = r {
+                    parts.push(String::from_utf8_lossy(b).to_string());
+                }
+            }
+            for r in &commit.live_refs {
+                if let editchain_core::payload::Payload::Inline(b) = r {
+                    parts.push(String::from_utf8_lossy(b).to_string());
+                }
+            }
+            for p in &commit.changed_paths {
+                parts.push(format!("path:{}", p.0));
+            }
+            Some(parts.join("\n"))
+        }
+        OpKind::GitLink(link) => {
+            // Index the target OID and relation kind.
+            Some(format!("git:{} {:?}", link.target_oid, link.kind))
+        }
         OpKind::ChainStart(_)
         | OpKind::Actor(_)
         | OpKind::Import(_)

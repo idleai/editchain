@@ -2,7 +2,7 @@
 
 use editchain_core::{ActorId, NodeId, OpId};
 use editchain_query::search::{
-    ChunkId, ChunkMetadata, ScoredChunk, SummarizeRequest, SummarizeStrategy,
+    ChunkId, ChunkMetadata, ScoredChunk, Source, SummarizeRequest, SummarizeStrategy,
 };
 use editchain_query::summarize::{build_extractive_summary, build_timeline_summary};
 use serde as _;
@@ -23,6 +23,7 @@ fn make_chunk(seq: u64, text: &str, score: f64) -> ScoredChunk {
                 op_id,
                 chunk_ordinal: 0,
             },
+            source: Source::EditChain,
             session_id: None,
             actor_id: ActorId(0),
             kind_tags: 0,

@@ -11,7 +11,7 @@ use editchain_index::chunker::extract_op_text;
 use editchain_index::vector::{f32_to_f16_vec, VectorIndex, VectorSearchWrapper};
 use editchain_index::LexicalIndex;
 use editchain_query::hybrid::{HybridSearch, LexicalSearch, VectorSearch};
-use editchain_query::search::{SearchFilters, SearchMode, SearchRequest, TagFilter};
+use editchain_query::search::{SearchFilters, SearchMode, SearchRequest, Source, TagFilter};
 
 /// Text entry for embedding collection.
 struct TextEntry {
@@ -19,6 +19,7 @@ struct TextEntry {
     chunk_ordinal: u32,
     text: String,
     kind: String,
+    source: String,
     session_id: Option<u64>,
 }
 
@@ -30,6 +31,7 @@ struct TextEntry {
 #[expect(
     clippy::needless_pass_by_value,
     clippy::print_stdout,
+    clippy::too_many_arguments,
     clippy::wildcard_enum_match_arm,
     reason = "CLI command; strings consumed by design; wildcard arm for unknown OpKind variants"
 )]
@@ -39,6 +41,7 @@ pub fn run(
     mode: String,
     top: usize,
     kind: Option<String>,
+    source: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store = SegmentStore::open(&path)?;
     let pages = store.read_all()?;
@@ -66,6 +69,17 @@ pub fn run(
                     "tool" => Some(TagFilter::Tool),
                     "command" => Some(TagFilter::Command),
                     "file" => Some(TagFilter::File),
+                    _ => None,
+                })
+                .collect(),
+        );
+    }
+    if let Some(s) = source {
+        filters.sources = Some(
+            s.split(',')
+                .filter_map(|s| match s.trim() {
+                    "editchain" => Some(Source::EditChain),
+                    "git" => Some(Source::Git),
                     _ => None,
                 })
                 .collect(),
@@ -101,6 +115,7 @@ pub fn run(
                                 chunk_ordinal: 0,
                                 text,
                                 kind: kind_to_string(&op.kind).to_string(),
+                                source: source_to_string(&op.kind).to_string(),
                                 session_id: None,
                             });
                         }
@@ -129,6 +144,7 @@ pub fn run(
                     entry.chunk_ordinal,
                     &f16v,
                     &entry.kind,
+                    &entry.source,
                     entry.session_id,
                     r#gen,
                 );
@@ -176,7 +192,26 @@ const fn kind_to_string(kind: &OpKind) -> &'static str {
         OpKind::Import(_) => "import",
         OpKind::Note(_) => "note",
         OpKind::Error(_) => "error",
+        OpKind::GitCommit(_) => "git_commit",
+        OpKind::GitLink(_) => "git_link",
         OpKind::Unknown(_) => "unknown",
+    }
+}
+
+const fn source_to_string(kind: &OpKind) -> &'static str {
+    match kind {
+        OpKind::GitCommit(_) | OpKind::GitLink(_) => "git",
+        OpKind::ChainStart(_)
+        | OpKind::Actor(_)
+        | OpKind::Message(_)
+        | OpKind::Tool(_)
+        | OpKind::Command(_)
+        | OpKind::File(_)
+        | OpKind::Reflection(_)
+        | OpKind::Import(_)
+        | OpKind::Note(_)
+        | OpKind::Error(_)
+        | OpKind::Unknown(_) => "editchain",
     }
 }
 

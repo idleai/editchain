@@ -10,7 +10,7 @@
       "cwd": "${workspaceFolder}",
       "debugger": "gdb",
 
-      "args": ["init"],
+      "args": ["import", "--workspace", "/mnt/hot/ambientlight/repos/editchain", "--chain", "./outputs/cc-chain"],
       "env": {
         "RUST_BACKTRACE": "1"
       },

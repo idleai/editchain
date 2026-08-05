@@ -5,7 +5,7 @@ use editchain_query::graph::{
     collapse_occurrences, mmr_diverse_rerank, CausalCone, CausalCorridor, DiversityConfig,
     FrontierMap,
 };
-use editchain_query::search::{ChunkId, ChunkMetadata, ScoredChunk};
+use editchain_query::search::{ChunkId, ChunkMetadata, ScoredChunk, Source};
 use serde as _;
 
 #[test]
@@ -84,6 +84,7 @@ fn collapse_occurrences_deduplicates() {
                 op_id,
                 chunk_ordinal: 0,
             },
+            source: Source::EditChain,
             session_id: None,
             actor_id: ActorId(0),
             kind_tags: 0,
@@ -122,6 +123,7 @@ fn mmr_diverse_rerank_selects_top() {
                     op_id: op_id1,
                     chunk_ordinal: 0,
                 },
+                source: Source::EditChain,
                 session_id: None,
                 actor_id: ActorId(0),
                 kind_tags: 0,
@@ -143,6 +145,7 @@ fn mmr_diverse_rerank_selects_top() {
                     op_id: op_id2,
                     chunk_ordinal: 0,
                 },
+                source: Source::EditChain,
                 session_id: None,
                 actor_id: ActorId(0),
                 kind_tags: 0,

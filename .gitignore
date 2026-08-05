@@ -5,8 +5,14 @@ inputs/
 outputs/
 **/*.rs.bk
 
+# VS Code extension build artifacts
+extensions/vscode-editchain/node_modules/
+extensions/vscode-editchain/out/
+extensions/vscode-editchain/*.vsix
+
 # Editor / IDE
 #.vscode/
+.claude/
 .idea/
 *.swp
 *.swo

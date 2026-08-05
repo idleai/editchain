@@ -61,3 +61,69 @@ fn chunk_short_text() {
     assert_eq!(chunks[0].byte_start, 0);
     assert_eq!(chunks[0].byte_end, 5);
 }
+
+#[test]
+fn extract_git_commit_text() {
+    let commit = GitCommitEntity {
+        repository: RepositoryId(7),
+        object_format: GitObjectFormat::Sha1,
+        oid: GitOid::from_sha1([0x01; 20]),
+        imported_record: None,
+        availability: GitAvailability::Resolved,
+        tree: GitOid::from_sha1([0x02; 20]),
+        parents: Vec::new(),
+        author: GitSignature {
+            name: Payload::Inline(b"Alice".to_vec()),
+            email: Payload::Inline(b"alice@example.com".to_vec()),
+            when: 1_700_000_000,
+        },
+        committer: GitSignature {
+            name: Payload::Inline(b"Alice".to_vec()),
+            email: Payload::Inline(b"alice@example.com".to_vec()),
+            when: 1_700_000_100,
+        },
+        authored_at: 1_700_000_000,
+        committed_at: 1_700_000_100,
+        message: Payload::Inline(b"feat: add git support".to_vec()),
+        imported_refs: vec![Payload::Inline(b"refs/heads/main".to_vec())],
+        live_refs: Vec::new(),
+        changed_paths: vec![PathId(9)],
+    };
+
+    let op = Op {
+        id: OpId::new(NodeId(2), 0, 10),
+        parents: ParentSet::None,
+        actor: ActorId(3),
+        clock: Clock::UnixMs(1_700_000_000),
+        scope: ScopeRef::None,
+        tags: Tags::IMPORT,
+        kind: OpKind::GitCommit(Box::new(commit)),
+    };
+
+    let text = extract_op_text(&op, false, false).expect("git commit should be indexed");
+    assert!(text.contains("feat: add git support"));
+    assert!(text.contains("refs/heads/main"));
+}
+
+#[test]
+fn extract_git_link_text() {
+    let link = GitLink {
+        source: OpId::new(NodeId(1), 0, 5),
+        target_repo: RepositoryId(7),
+        target_oid: GitOid::from_sha1([0x01; 20]),
+        kind: GitLinkKind::CommittedAs,
+    };
+
+    let op = Op {
+        id: OpId::new(NodeId(2), 0, 11),
+        parents: ParentSet::None,
+        actor: ActorId(3),
+        clock: Clock::UnixMs(1_700_000_000),
+        scope: ScopeRef::None,
+        tags: Tags::NOTE,
+        kind: OpKind::GitLink(link),
+    };
+
+    let text = extract_op_text(&op, false, false).expect("git link should be indexed");
+    assert!(text.contains("git:"));
+}
