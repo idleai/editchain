@@ -45,6 +45,27 @@ impl OpId {
     pub const fn new(node: NodeId, boot: u32, seq: u64) -> Self {
         Self { node, boot, seq }
     }
+
+    /// Parse an `OpId` from its display form `"node:boot:seq"`.
+    ///
+    /// Returns `None` if the string is not in the expected format. This is used
+    /// to round-trip `OpId`s through JSON as strings, avoiding JavaScript's
+    /// precision loss on u64 values that exceed 2^53.
+    #[must_use]
+    pub fn from_display_str(s: &str) -> Option<Self> {
+        let mut parts = s.split(':');
+        let node = parts.next()?.parse().ok()?;
+        let boot = parts.next()?.parse().ok()?;
+        let seq = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Self {
+            node: NodeId(node),
+            boot,
+            seq,
+        })
+    }
 }
 
 impl Ord for OpId {

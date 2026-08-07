@@ -49,10 +49,7 @@ fn history_window_returns_rows() {
     // Build a projection directly with two ops.
     let ops = vec![msg_op(1, 1, b"first"), msg_op(1, 2, b"second")];
     let projection = editchain_project::HistoryProjection::from_ops(ops);
-    let ws = Workspace {
-        projection,
-        repositories: Vec::new(),
-    };
+    let mut ws = Workspace::from_projection(projection);
     let window = ws.history_window(0, 10, false);
     assert_eq!(window.total, 2);
     assert_eq!(window.rows.len(), 2);

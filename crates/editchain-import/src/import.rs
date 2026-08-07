@@ -8,7 +8,7 @@ use crate::claude_code::normalize::{normalize_envelope, NormalizeOptions};
 use crate::claude_code::reader::read_session_file;
 use crate::cursor::check_file_generation;
 use crate::error::ImportError;
-use crate::ids::derive_source_stream;
+use crate::ids::{derive_source_stream, SourcePosition};
 use crate::model::{DiscoveryRequest, ImportOptions, ImportReport};
 use crate::sink::{BlobSink, CursorStore, OpSink};
 
@@ -88,6 +88,10 @@ pub fn import_claude_code(
 
         // Use per-file sequence numbering starting from cursor's last ordinal.
         let start_seq = existing_cursor.as_ref().map_or(0, |c| c.ops_emitted);
+        // Chain raw import ops into a single linear chain per session file: each
+        // line's raw op parents to the previous line's raw op. This makes a
+        // session read as one continuous chain rather than N disconnected roots.
+        let mut prev_raw_id: Option<editchain_core::OpId> = None;
         for (i, line) in lines.iter().enumerate() {
             let seq = start_seq + i as u64 + 1;
 
@@ -95,13 +99,19 @@ pub fn import_claude_code(
             let env = parse_envelope(&line.data);
 
             if let Some(ref envelope) = env {
-                let (raw_op, normalized_ops) = normalize_envelope(
+                let (mut raw_op, normalized_ops) = normalize_envelope(
                     envelope, line.hash, &line.data, &stream, seq, &norm_opts, blobs,
                 );
+
+                // Chain this raw op to the previous line's raw op.
+                if let Some(prev) = prev_raw_id {
+                    raw_op.parents = editchain_core::parents::ParentSet::One(prev);
+                }
 
                 // Emit raw import op.
                 let _: bool = ops.accept_op(&raw_op)?;
                 report.raw_ops += 1;
+                prev_raw_id = Some(raw_op.id);
 
                 // Emit normalized ops.
                 for norm_op in &normalized_ops {
@@ -109,9 +119,10 @@ pub fn import_claude_code(
                     report.normalized_ops += 1;
                 }
             } else {
-                // Unparseable line — still emit as raw ImportOp.
-                let op_id = stream.op_id(seq);
-                let raw_op = Op {
+                // Unparseable line — still emit as raw ImportOp, chained to the
+                // previous line's raw op using the same ID scheme (seq << 16).
+                let op_id = stream.op_from_position(SourcePosition::raw(seq))?;
+                let mut raw_op = Op {
                     id: op_id,
                     parents: editchain_core::parents::ParentSet::None,
                     actor: editchain_core::ActorId(0),
@@ -123,9 +134,13 @@ pub fn import_claude_code(
                         raw_hash: Some(line.hash),
                     }),
                 };
+                if let Some(prev) = prev_raw_id {
+                    raw_op.parents = editchain_core::parents::ParentSet::One(prev);
+                }
                 let _: bool = ops.accept_op(&raw_op)?;
                 report.raw_ops += 1;
                 report.malformed += 1;
+                prev_raw_id = Some(op_id);
             }
         }
 

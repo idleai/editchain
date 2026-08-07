@@ -7,8 +7,15 @@
 
 /// Deterministic lane layout for graph rendering.
 pub mod layout;
+/// History linking — stitch sessions and git into a single edit chain.
+pub mod link;
+
+use std::collections::HashMap;
 
 use editchain_core::{GitCommitEntity, GitOid, GitProjection, Op, OpId, Payload, RepositoryId};
+
+use crate::layout::{compute_graph_layout, compute_lane_assignment, GraphLayout, GraphRow};
+use crate::link::link_history;
 
 /// A unified history row — either an `EditChain` operation or a `Git` commit.
 #[derive(Debug, Clone)]
@@ -105,10 +112,25 @@ impl HistoryNode {
     }
 
     /// Returns the parent node keys for drawing graph edges.
+    ///
+    /// For `EditChain` ops, this includes both the causal `Op.parents` and any
+    /// explicit git links (whose target OID hex becomes a parent key, so the
+    /// graph draws an edge from the op to that commit).
     #[must_use]
-    pub fn parent_keys(&self) -> Vec<String> {
+    pub fn parent_keys(
+        &self,
+        git_links: &std::collections::BTreeMap<OpId, Vec<editchain_core::GitLink>>,
+    ) -> Vec<String> {
         match self {
-            Self::EditOperation(op) => op.parents.iter().map(ToString::to_string).collect(),
+            Self::EditOperation(op) => {
+                let mut keys: Vec<String> = op.parents.iter().map(ToString::to_string).collect();
+                if let Some(links) = git_links.get(&op.id) {
+                    for link in links {
+                        keys.push(link.target_oid.to_hex());
+                    }
+                }
+                keys
+            }
             Self::GitCommit(commit) => commit.parents.iter().map(GitOid::to_hex).collect(),
         }
     }
@@ -160,29 +182,118 @@ impl HistoryProjection {
 
     /// Returns all history nodes (newest-first).
     ///
-    /// The flattened view: `EditChain` ops first (in reverse causal order),
-    /// then git commits.
+    /// Uses the same canonical topologically-sorted ordering as
+    /// [`Self::graph_layout`], so layout row indices always correspond to
+    /// window row positions.
     #[must_use]
     pub fn nodes(&self) -> Vec<HistoryNode> {
-        let mut nodes = Vec::with_capacity(self.len());
-        // `EditChain` ops, newest-first.
-        for op in self.ops.iter().rev() {
-            nodes.push(HistoryNode::EditOperation(op.clone()));
-        }
-        // `Git` commits (deterministic BTreeMap order).
-        for commit in self.git.commits.values() {
-            nodes.push(HistoryNode::GitCommit(commit.clone()));
-        }
-        nodes
+        self.ordered_nodes()
     }
 
     /// Returns a window of history nodes (newest-first).
     ///
-    /// The window is a flattened view: `EditChain` ops first (in reverse causal
-    /// order), then git commits. `offset`/`limit` provide cursor-based paging.
+    /// The window is a slice of the canonical topologically-sorted ordering,
+    /// matching [`Self::graph_layout`]. `offset`/`limit` provide cursor-based
+    /// paging.
     #[must_use]
     pub fn window(&self, offset: usize, limit: usize) -> Vec<HistoryNode> {
-        self.nodes().into_iter().skip(offset).take(limit).collect()
+        self.ordered_nodes()
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .collect()
+    }
+
+    /// Returns the canonical topologically-sorted node list (newest-first).
+    ///
+    /// Git commits are stored in `BTreeMap` order (by repository + OID), which
+    /// is *not* topological w.r.t. ancestry, so we re-sort them here. This is
+    /// the single source of truth for both the windowed rows and the graph
+    /// layout, guaranteeing they stay in lockstep.
+    #[expect(
+        clippy::arithmetic_side_effects,
+        clippy::let_underscore_untyped,
+        reason = "In-degree counters are bounded by the number of present parents; HashMap insert returns Option which is discarded"
+    )]
+    fn ordered_nodes(&self) -> Vec<HistoryNode> {
+        // Build a unified node list: ops (newest-first) then git commits.
+        let mut nodes: Vec<HistoryNode> = Vec::with_capacity(self.len());
+        for op in self.ops.iter().rev() {
+            nodes.push(HistoryNode::EditOperation(op.clone()));
+        }
+        for commit in self.git.commits.values() {
+            nodes.push(HistoryNode::GitCommit(commit.clone()));
+        }
+
+        // Kahn's algorithm (O(V+E)) for topological sort, oldest-first.
+        //
+        // A parent blocks a node only if it is present in the list; parents
+        // outside the list (e.g. a git commit whose parent wasn't imported) do
+        // not block. We emit parents before children, then reverse the result so
+        // the final list is newest-first — guaranteeing every edge that *can* be
+        // drawn points downward (child above, parent below).
+        let present: std::collections::HashSet<String> =
+            nodes.iter().map(HistoryNode::node_key).collect();
+        let node_by_key: HashMap<String, HistoryNode> =
+            nodes.iter().map(|n| (n.node_key(), n.clone())).collect();
+
+        // Reverse adjacency (parent -> children) and in-degree (count of present
+        // parents still un-emitted).
+        let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
+        let mut indegree: HashMap<String, usize> = HashMap::new();
+        for node in &nodes {
+            let key = node.node_key();
+            let _ = indegree.entry(key.clone()).or_insert(0);
+            for parent in node.parent_keys(&self.git.links) {
+                if present.contains(&parent) {
+                    children_of.entry(parent).or_default().push(key.clone());
+                    *indegree.entry(key.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Seed the queue with nodes that have no present parents.
+        let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        for (key, &deg) in &indegree {
+            if deg == 0 {
+                queue.push_back(key.clone());
+            }
+        }
+
+        let mut sorted_oldest_first: Vec<HistoryNode> = Vec::with_capacity(nodes.len());
+        while let Some(key) = queue.pop_front() {
+            if let Some(node) = node_by_key.get(&key) {
+                sorted_oldest_first.push(node.clone());
+            }
+            if let Some(children) = children_of.get(&key) {
+                for child in children {
+                    if let Some(deg) = indegree.get_mut(child) {
+                        *deg -= 1;
+                        if *deg == 0 {
+                            queue.push_back(child.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // If some nodes remain (a cycle), append them in original order so we
+        // don't drop history. Edges to un-emitted parents simply won't be drawn.
+        if sorted_oldest_first.len() < nodes.len() {
+            let emitted: std::collections::HashSet<String> = sorted_oldest_first
+                .iter()
+                .map(HistoryNode::node_key)
+                .collect();
+            for node in &nodes {
+                if !emitted.contains(&node.node_key()) {
+                    sorted_oldest_first.push(node.clone());
+                }
+            }
+        }
+
+        // Reverse to newest-first.
+        sorted_oldest_first.reverse();
+        sorted_oldest_first
     }
 
     /// Merge resolved git commits into the projection.
@@ -197,6 +308,96 @@ impl HistoryProjection {
                     .insert((commit.repository, commit.oid), commit),
             );
         }
+    }
+
+    /// Stitch sessions and git history into a single edit chain.
+    ///
+    /// Applies session-to-session stitching (mutating `Op.parents`) and creates
+    /// op→git links (stored in `GitProjection.links`). Call after loading all ops
+    /// and git commits, before computing windows or layouts.
+    pub fn link_history(&mut self) {
+        let commits: Vec<GitCommitEntity> = self.git.commits.values().cloned().collect();
+        let result = link_history(&self.ops, &commits);
+        self.ops = result.ops;
+        for link in result.git_links {
+            let entry = self.git.links.entry(link.source).or_default();
+            entry.push(link);
+        }
+    }
+
+    /// Compute the graph layout for rendering unified history.
+    ///
+    /// The layout is computed over the same canonical topologically-sorted node
+    /// list as [`Self::nodes`]/[`Self::window`], so layout row indices always
+    /// correspond to window row positions. Every edge's parent appears below its
+    /// child (newest-first).
+    #[must_use]
+    pub fn graph_layout(&self) -> GraphLayout {
+        self.graph_layout_filtered(&self.ordered_nodes())
+    }
+
+    /// Compute the graph layout over a pre-sorted node list.
+    ///
+    /// `sorted` must be in the same canonical newest-first order as the rows the
+    /// webview renders (i.e. from [`Self::ordered_nodes`], possibly filtered), so
+    /// layout row indices correspond to window row positions. Every edge's parent
+    /// appears below its child.
+    #[must_use]
+    pub fn graph_layout_filtered(&self, sorted: &[HistoryNode]) -> GraphLayout {
+        let keys = Self::layout_keys(sorted);
+        let key_to_node = Self::layout_index(sorted);
+        let links = &self.git.links;
+        let parents_of = |key: &str| -> Vec<String> {
+            key_to_node
+                .get(key)
+                .map_or(Vec::new(), |n| n.parent_keys(links))
+        };
+        compute_graph_layout(&keys, parents_of)
+    }
+
+    /// Compute the lane assignment over a pre-sorted node list (no edges).
+    ///
+    /// This is linear and stable across viewport sizes, so it can be cached and
+    /// reused for many windowed edge computations.
+    #[must_use]
+    pub fn lane_assignment_filtered(&self, sorted: &[HistoryNode]) -> Vec<GraphRow> {
+        let keys = Self::layout_keys(sorted);
+        let key_to_node = Self::layout_index(sorted);
+        let links = &self.git.links;
+        let parents_of = |key: &str| -> Vec<String> {
+            key_to_node
+                .get(key)
+                .map_or(Vec::new(), |n| n.parent_keys(links))
+        };
+        compute_lane_assignment(&keys, &parents_of)
+    }
+
+    /// Build a cached [`layout::LayoutContext`] over a pre-sorted node list.
+    ///
+    /// The context bundles all O(V) derived data (keys, row map, lane map, lane
+    /// assignment) so per-window edge computation is O(window). Build once per
+    /// filter state and reuse across scrolls/resizes.
+    #[must_use]
+    pub fn layout_context(&self, sorted: &[HistoryNode]) -> layout::LayoutContext {
+        let keys = Self::layout_keys(sorted);
+        let key_to_node = Self::layout_index(sorted);
+        let links = &self.git.links;
+        let parents_of = |key: &str| -> Vec<String> {
+            key_to_node
+                .get(key)
+                .map_or(Vec::new(), |n| n.parent_keys(links))
+        };
+        layout::LayoutContext::new(&keys, &parents_of)
+    }
+
+    /// Build the string-keyed node list for layout.
+    fn layout_keys(sorted: &[HistoryNode]) -> Vec<String> {
+        sorted.iter().map(HistoryNode::node_key).collect()
+    }
+
+    /// Build a node-key → node index over a pre-sorted node list.
+    fn layout_index(sorted: &[HistoryNode]) -> HashMap<String, &HistoryNode> {
+        sorted.iter().map(|n| (n.node_key(), n)).collect()
     }
 }
 

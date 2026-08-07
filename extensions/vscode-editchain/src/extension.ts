@@ -89,34 +89,112 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource}; script-src ${cspSource};">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src ${cspSource};">
 <title>EditChain History</title>
 <style>
-body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 12px; }
+body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 12px; box-sizing: border-box; }
 #status { color: var(--vscode-descriptionForeground); margin-bottom: 8px; }
 #controls { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 #search { flex: 1; padding: 6px; box-sizing: border-box; }
 .toggle { display: flex; align-items: center; gap: 4px; color: var(--vscode-descriptionForeground); font-size: 0.9em; white-space: nowrap; }
-#layout { display: flex; gap: 12px; height: calc(100vh - 120px); }
-#rows { flex: 1.6; overflow-y: auto; display: flex; flex-direction: column; }
-#detail { flex: 1; overflow-y: auto; border-left: 1px solid var(--vscode-panel-border); padding-left: 12px; }
-.block-sep { font-weight: 700; color: var(--vscode-descriptionForeground); padding: 8px 4px 4px; border-bottom: 1px solid var(--vscode-panel-border); position: sticky; top: 0; background: var(--vscode-editor-background); z-index: 1; }
-.row { display: grid; align-items: center; cursor: pointer; min-height: 34px; }
-.row:hover { background: var(--vscode-list-hoverBackground); }
-.graph-cell { line-height: 0; }
+#layout { display: flex; gap: 12px; height: calc(100vh - 120px); width: 100%; }
+#rows { flex: 3; overflow-y: auto; position: relative; min-width: 0; }
+/* Detail/inspector pane is hidden until a node is selected, so it doesn't
+   consume fixed width when empty. */
+#detail { flex: 1; overflow-y: auto; border-left: 1px solid var(--vscode-panel-border); padding-left: 12px; min-width: 0; display: none; }
+#layout.has-detail #detail { display: block; }
+
+/* Table wrapper holds the header, rows, and the absolutely-positioned SVG. */
+.table-wrap { position: relative; width: 100%; }
+
+/* Sticky header row (Graph | Content | Date | Author | Commit/ID). */
+.tbl-header {
+  display: grid;
+  grid-template-columns:
+    var(--graph-w, auto) minmax(0,1fr) auto auto auto;
+  width: 100%;
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--vscode-editor-background);
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+.tbl-header .th {
+  font-weight: 700;
+  color: var(--vscode-descriptionForeground);
+  padding: 6px 8px;
+  white-space: nowrap;
+}
+.tbl-header .th.date, .tbl-header .th.author, .tbl-header .th.commit {
+  min-width: 90px;
+}
+
+/* Block separator spans all columns. */
+.block-sep {
+  font-weight: 700;
+  color: var(--vscode-descriptionForeground);
+  padding: 8px 4px 4px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+/* Each history row is a grid with the same column template as the header. */
+.row {
+  display: grid;
+  grid-template-columns:
+    var(--graph-w, auto) minmax(0,1fr) auto auto auto;
+  width: 100%;
+  align-items: center;
+  cursor: pointer;
+}
+.row:hover { background-color: var(--vscode-list-hoverBackground); }
+.graph-cell { line-height: 0; overflow: hidden; }
 .text-cell { padding-left: 8px; overflow: hidden; }
-.row .summary { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.row .meta { color: var(--vscode-descriptionForeground); font-size: 0.85em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.detail-title { font-weight: 700; margin-bottom: 8px; }
-.detail-body { white-space: pre-wrap; font-family: var(--vscode-editor-font-family); font-size: 0.9em; }
-.detail-meta { color: var(--vscode-descriptionForeground); margin-top: 4px; font-size: 0.9em; word-break: break-all; }
+.date-cell, .author-cell, .commit-cell {
+  padding-left: 8px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.85em;
+}
+.date-cell, .author-cell, .commit-cell { white-space: nowrap; }
+.row .summary {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The single graph SVG overlay, positioned over the table-wrap. */
+#graphOverlay {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+#graphOverlay circle.graphDot {
+  /* Dots are decorative; never intercept clicks so they always reach rows below.
+     Hover tooltips are not implemented yet anyway. */
+  pointer-events: none;
+  stroke: var(--vscode-editor-background);
+  stroke-width: 1;
+}
+#graphOverlay path.graphShadow {
+  fill: none;
+  stroke: var(--vscode-editor-background);
+  stroke-width: 4;
+  stroke-opacity: 0.75;
+}
+#graphOverlay path.graphLine {
+  fill: none;
+  stroke: #d0d0d0; /* light grey — visible on dark backgrounds */
+  stroke-width: 2;
+}
 </style>
 </head>
 <body>
 <div id="status">Loading…</div>
 <div id="controls">
 <input id="search" type="text" placeholder="Search history… (Enter to search)">
-<label class="toggle"><input type="checkbox" id="hideSubmodules"> Hide git submodules</label>
+<label class="toggle"><input type="checkbox" id="hideSubmodules"> Show git submodules</label>
 </div>
 <div id="layout">
 <div id="rows"></div>

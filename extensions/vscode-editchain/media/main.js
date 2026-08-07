@@ -1,5 +1,22 @@
 // Webview renderer for the EditChain History explorer.
-// Renders a git-graph-style SVG visualization of unified history.
+// Renders a git-graph-style visualization of unified history using a single
+// full-height SVG overlay (continuous branch lines) over a real table with
+// columns: Graph | Content | Date | Author | Commit/ID.
+//
+// The graph geometry (lanes + edge point paths) is computed server-side by the
+// Rust service (`GetLayout`) and shipped over stdio; this file only draws it.
+// This mirrors vscode-git-graph's architecture: one SVG positioned absolutely
+// over the table container, with pointer-events disabled on the SVG and
+// re-enabled on node dots.
+//
+// Rows are paged via infinite scroll; as more rows load both the table and the
+// SVG grow together. Edges whose parent has not yet been loaded are drawn down
+// to the bottom of the currently-loaded window (they extend further once more
+// rows arrive), matching how vscode-git-graph handles "Load More".
+//
+// Alignment note: block separators shift rows down from a uniform grid, so we
+// measure each rendered row's real `offsetTop` after rendering and use those
+// pixel positions for both node dots and edge paths.
 
 // @ts-ignore — vscode provides this global in webviews.
 const vscode = acquireVsCodeApi();
@@ -8,16 +25,19 @@ const statusEl = document.getElementById('status');
 const rowsEl = document.getElementById('rows');
 const searchEl = document.getElementById('search');
 const detailEl = document.getElementById('detail');
+const layoutEl = document.getElementById('layout');
 const hideSubmodulesEl = document.getElementById('hideSubmodules');
 
 let offset = 0;
-const PAGE = 50;
+const PAGE = 200;
 let total = 0;
 let pending = false;
 let allRows = [];          // accumulated rows across pages
-let nodeIndex = {};        // node_key -> row index in allRows
+let layout = null;         // { rows: [{node,lane}], edges: [{child,parent,points}] }
+let layoutOffset = 0;      // history offset of the first layout row
+let pendingLayoutOffset = 0; // offset requested for the in-flight layout
 
-// Branch colors for the graph lanes.
+// Branch colours for graph lanes (indexed by lane).
 const COLORS = ['#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4', '#46f0f0', '#f032e6', '#bcf60c', '#fabebe'];
 
 const ROW_H = 34;
@@ -44,165 +64,168 @@ function formatDate(ms) {
     ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
 }
 
-/** Assign a lane to each row using a git-log lane algorithm. */
-function computeLanes(rows) {
-  const laneOf = {};
-  const active = []; // lane -> node_key
-  const lanes = [];
-
-  for (let i = rows.length - 1; i >= 0; i--) {
-    const row = rows[i];
-    const key = row.node_key;
-    let lane;
-    if (laneOf[key] !== undefined) {
-      lane = laneOf[key];
-    } else {
-      lane = active.length;
-      active.push(key);
-      laneOf[key] = lane;
-    }
-    active[lane] = null;
-    const parents = row.parents || [];
-    if (parents.length > 0) {
-      active[lane] = parents[0];
-      if (laneOf[parents[0]] === undefined) laneOf[parents[0]] = lane;
-      for (let p = 1; p < parents.length; p++) {
-        if (laneOf[parents[p]] === undefined) {
-          const pl = findSpareLane(active, lane);
-          active[pl] = parents[p];
-          laneOf[parents[p]] = pl;
-        }
-      }
-    }
-    lanes[i] = lane;
-  }
-  return lanes;
-}
-
-function findSpareLane(active, preferred) {
-  if (active[preferred] === null || active[preferred] === undefined) return preferred;
-  for (let i = 0; i < active.length; i++) {
-    if (active[i] === null || active[i] === undefined) return i;
-  }
-  return active.length;
+/** Escape HTML in a string for safe injection into the table. */
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
 }
 
 /**
- * Build the per-row SVG graph cell.
+ * Build the single full-height SVG overlay for the graph.
  *
- * Each row's SVG is ROW_H tall and shows:
- *  - vertical lines for every lane that has a line passing through this row
- *    (i.e. an ancestor relationship spans across this row),
- *  - a horizontal connector from this node's lane to its parent's lane,
- *  - the node dot.
+ * `rowYs` maps visible-row index → pixel y-offset within the table-wrap (the
+ * measured `offsetTop` of each rendered `.row`). `loadedCount` is how many of
+ * those rows are currently shown. Each edge is drawn as one continuous <path>
+ * from its ordered grid points (child → parent), so lines run unbroken across
+ * many rows.
  */
-function buildRowSvg(rows, lanes, i) {
-  const maxLane = lanes.length ? Math.max(...lanes) : 0;
-  const width = (maxLane + 1) * LANE_W + LANE_W;
+function buildGraphSvg(rowYs, rows, maxWidth) {
+  if (!layout || !layout.rows.length || rows.length === 0) return '';
+  const maxLane = Math.max(...layout.rows.map((r) => r.lane), 0);
+  const naturalW = (maxLane + 1) * LANE_W + LANE_W;
+  // Cap the SVG width so lanes beyond the cap are clipped (content stays visible).
+  const width = Math.min(naturalW, maxWidth || naturalW);
+  // Height spans from the first row's top to just below the last row.
+  const height = (rowYs[rows.length - 1] || 0) + ROW_H;
 
-  // Map node_key -> row index.
-  const idx = {};
-  rows.forEach((r, j) => { idx[r.node_key] = j; });
+  // Map node key -> actual row index in the rendered rows.
+  const rowOf = {};
+  for (let i = 0; i < rows.length; i++) {
+    rowOf[rows[i].node_key] = i;
+  }
+  // Map node key -> lane from the windowed layout rows.
+  const laneOf = {};
+  for (const r of layout.rows) {
+    laneOf[r.node] = r.lane;
+  }
 
-  const row = rows[i];
-  const yMid = ROW_H / 2;
-  const x1 = LANE_W / 2 + lanes[i] * LANE_W + LANE_W / 2;
-  const color = COLORS[lanes[i] % COLORS.length];
+  let svg = `<svg id="graphOverlay" width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">`;
 
-  // Determine which lanes have a line passing through this row.
-  // A line passes through row i in lane L if some node at or above i has a
-  // parent at or below i in lane L (i.e. the edge spans across this row).
-  const passThroughLanes = new Set();
-  for (let j = i; j >= 0; j--) {
-    for (const parentKey of (rows[j].parents || [])) {
-      const pi = idx[parentKey];
-      if (pi === undefined || pi >= j) continue; // parent not loaded or not above
-      // Edge from j down to pi spans rows pi..j. It passes through row i if pi <= i <= j.
-      if (pi <= i && i <= j) {
-        passThroughLanes.add(lanes[j]);
-        passThroughLanes.add(lanes[pi]);
-      }
+  // Draw each edge as one continuous path, clipped to the rendered rows.
+  for (const edge of layout.edges) {
+    const childRow = rowOf[edge.child];
+    if (childRow === undefined) continue; // child not yet loaded
+
+    // Collect points that fall within the rendered rows. Edge points are
+    // layout-relative; convert to actual row index by adding layoutOffset.
+    const pts = [];
+    for (const p of edge.points) {
+      const actualRow = p.row + layoutOffset;
+      if (actualRow < rows.length) pts.push({ ...p, row: actualRow });
     }
+    if (!pts.length) continue;
+
+    // If the parent isn't rendered yet, extend the path down to window bottom.
+    const parentLoaded = rowOf[edge.parent] !== undefined;
+    let d = '';
+    for (let i = 0; i < pts.length; i++) {
+      const x = LANE_W / 2 + pts[i].lane * LANE_W + LANE_W / 2;
+      const y = (rowYs[pts[i].row] !== undefined ? rowYs[pts[i].row] : pts[i].row * ROW_H) + ROW_H / 2;
+      d += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
+    }
+    if (!parentLoaded && pts.length) {
+      // Extend vertically from last point down to window bottom.
+      const lastX = LANE_W / 2 + pts[pts.length - 1].lane * LANE_W + LANE_W / 2;
+      d += 'L' + lastX.toFixed(1) + ',' + height.toFixed(1);
+    }
+
+    // Shadow path (thick, background-coloured) for contrast against text.
+    svg += `<path class="graphShadow" d="${d}"/>`;
+    // Line path — colour comes from CSS (.graphLine) so it stays visible on
+    // both light and dark themes.
+    svg += `<path class="graphLine" d="${d}"/>`;
   }
 
-  let svg = `<svg width="${width}" height="${ROW_H}" xmlns="http://www.w3.org/2000/svg">`;
-
-  // Vertical lines for lanes passing through this row.
-  for (const lane of passThroughLanes) {
-    const xc = LANE_W / 2 + lane * LANE_W + LANE_W / 2;
-    svg += `<line x1="${xc}" y1="0" x2="${xc}" y2="${ROW_H}" stroke="${COLORS[lane % COLORS.length]}" stroke-width="2" opacity="0.6"/>`;
+  // Draw node dots at each rendered row's lane centre.
+  for (let i = layoutOffset; i < rows.length; i++) {
+    const key = rows[i].node_key;
+    const lane = laneOf[key];
+    if (lane === undefined) continue;
+    const x = LANE_W / 2 + lane * LANE_W + LANE_W / 2;
+    const y = rowYs[i] + ROW_H / 2;
+    const colour = COLORS[lane % COLORS.length];
+    svg += `<circle class="graphDot" data-row="${i}" cx="${x}" cy="${y}" r="${DOT_R}" fill="${colour}"/>`;
   }
 
-  // Horizontal connector from this node to its parent(s).
-  for (const parentKey of (row.parents || [])) {
-    const pi = idx[parentKey];
-    if (pi === undefined || pi >= i) continue; // parent not loaded or not above
-    const x2 = LANE_W / 2 + lanes[pi] * LANE_W + LANE_W / 2;
-    svg += `<line x1="${x1}" y1="${yMid}" x2="${x2}" y2="${yMid}" stroke="${color}" stroke-width="2" opacity="0.8"/>`;
-    // Draw the dot at the parent's position too (so it's visible at its own row).
-    svg += `<circle cx="${x2}" cy="${yMid}" r="${DOT_R}" fill="${COLORS[lanes[pi] % COLORS.length]}"/>`;
-  }
-
-  // The node dot.
-  svg += `<circle cx="${x1}" cy="${yMid}" r="${DOT_R}" fill="${color}"/>`;
   svg += '</svg>';
   return svg;
 }
 
-/** Render all accumulated rows into a table with graph column + blocks. */
+/** Whether submodules should be hidden (inverted from the "Show" checkbox). */
+function hideSubmodules() {
+  // "Show git submodules" is off by default → submodules hidden by default.
+  return !(hideSubmodulesEl && hideSubmodulesEl.checked);
+}
+
+// Maximum width of the graph column, so the description/content column always
+// stays visible even when there are many concurrent lanes.
+const MAX_GRAPH_W = 320;
+
+/** Render all accumulated rows into a table with graph column + text columns. */
 function renderRows() {
-  // Apply the hide-submodules filter.
-  const hideSubmodules = hideSubmodulesEl && hideSubmodulesEl.checked;
-  const visible = hideSubmodules ? allRows.filter((r) => !r.is_submodule) : allRows;
+  // Apply the submodule filter (hidden unless "Show git submodules" is checked).
+  const visible = hideSubmodules() ? allRows.filter((r) => !r.is_submodule) : allRows;
 
-  const lanes = computeLanes(visible);
-  const maxLane = lanes.length ? Math.max(...lanes) : 0;
-  const graphWidth = (maxLane + 1) * LANE_W + LANE_W;
+  const maxLane = layout && layout.rows.length ? Math.max(...layout.rows.map((r) => r.lane), 0) : 0;
+  const naturalGraphW = (maxLane + 1) * LANE_W + LANE_W;
+  // Cap the graph column so content stays visible; lanes beyond the cap are
+  // clipped by overflow-hidden on the graph cell.
+  const graphWidth = Math.min(naturalGraphW, MAX_GRAPH_W);
 
-  rowsEl.innerHTML = '';
+  // Build the sticky table header.
+  let html =
+    '<div class="tbl-header" style="--graph-w:' + graphWidth + 'px">' +
+      '<div class="th">Graph</div>' +
+      '<div class="th">Content</div>' +
+      '<div class="th date">Date</div>' +
+      '<div class="th author">Author</div>' +
+      '<div class="th commit">Commit/ID</div>' +
+    '</div>';
+
   let lastGroup = null;
 
-  visible.forEach((row, i) => {
-    // Block separator spans both columns.
+  visible.forEach((row) => {
+    // Block separator spans all columns.
     if (row.group !== lastGroup) {
       lastGroup = row.group;
-      const sep = document.createElement('div');
-      sep.className = 'block-sep';
-      sep.textContent = row.group.startsWith('repo:') ? 'Git · repo ' + row.group.slice(5)
+      const label = row.group.startsWith('repo:') ? 'Git · repo ' + row.group.slice(5)
         : row.group.startsWith('session:') ? 'Session ' + row.group.slice(8)
         : 'EditChain ops';
-      rowsEl.appendChild(sep);
+      html += '<div class="block-sep">' + esc(label) + '</div>';
     }
 
-    // Each row is a grid with two columns: graph | text.
-    const div = document.createElement('div');
-    div.className = 'row' + (row.git_oid ? ' git' : '');
-    div.style.gridTemplateColumns = `${graphWidth}px minmax(0,1fr)`;
+    html += '<div class="row" data-key="' + esc(row.node_key) + '" style="--graph-w:' + graphWidth + 'px">' +
+      '<div class="graph-cell"></div>' +
+      '<div class="text-cell"><div class="summary">' + esc(row.summary || '(no summary)') + '</div></div>' +
+      '<div class="date-cell">' + esc(formatDate(row.timestamp_ms)) + '</div>' +
+      '<div class="author-cell">' + esc(row.author || '') + '</div>' +
+      '<div class="commit-cell">' + esc(row.commit_id || '') + '</div>' +
+      '</div>';
+  });
 
-    // Graph cell.
-    const graphCell = document.createElement('div');
-    graphCell.className = 'graph-cell';
-    graphCell.innerHTML = buildRowSvg(allRows, lanes, i);
-    div.appendChild(graphCell);
+  rowsEl.innerHTML =
+    '<div class="table-wrap" style="--graph-w:' + graphWidth + 'px">' +
+      html +
+    '</div>';
 
-    // Text cell.
-    const textCell = document.createElement('div');
-    textCell.className = 'text-cell';
+  // Measure each rendered row's real offsetTop within the table-wrap so block
+  // separators don't misalign the graph overlay.
+  const wrapEl = rowsEl.querySelector('.table-wrap');
+  const rowEls = wrapEl.querySelectorAll('.row');
+  const rowYs = [];
+  rowEls.forEach((el) => { rowYs.push(el.offsetTop); });
 
-    const summaryEl = document.createElement('div');
-    summaryEl.className = 'summary';
-    summaryEl.textContent = row.summary || '(no summary)';
-    textCell.appendChild(summaryEl);
+  // Insert the graph overlay after measuring.
+  wrapEl.insertAdjacentHTML('beforeend', buildGraphSvg(rowYs, visible, graphWidth));
 
-    const metaEl = document.createElement('div');
-    metaEl.className = 'meta';
-    metaEl.textContent = [row.git_oid ? 'git' : 'op', formatDate(row.timestamp_ms)].filter(Boolean).join(' · ');
-    textCell.appendChild(metaEl);
-
-    div.appendChild(textCell);
-
-    div.addEventListener('click', () => inspect(row));
-    rowsEl.appendChild(div);
+  // Attach click handlers to rows.
+  rowEls.forEach((el) => {
+    el.addEventListener('click', () => {
+      const key = el.getAttribute('data-key');
+      const row = allRows.find((r) => r.node_key === key);
+      if (row) inspect(row);
+    });
   });
 }
 
@@ -210,21 +233,64 @@ function renderRows() {
 function loadMore() {
   if (pending || (total > 0 && offset >= total)) return;
   pending = true;
-  send({ GetWindow: { offset, limit: PAGE, hide_submodules: hideSubmodulesEl && hideSubmodulesEl.checked } });
+  send({ GetWindow: { offset, limit: PAGE, hide_submodules: hideSubmodules() } });
+}
+
+/** Load more rows until the content fills the viewport (so scrolling works). */
+function ensureFilled() {
+  if (pending || (total > 0 && offset >= total)) return;
+  const contentH = rowsEl.scrollHeight;
+  const viewH = rowsEl.clientHeight;
+  if (contentH < viewH) {
+    loadMore();
+  }
+}
+
+// Layout window size as a multiple of the visible viewport rows. The graph
+// layout is recomputed dynamically as the user scrolls; a window of K× the
+// viewport gives prefetch headroom so lines extend before the next recompute.
+const WINDOW_MULT = 4;
+
+/** Estimate how many rows fit in the current viewport. */
+function viewportRows() {
+  const h = rowsEl.clientHeight || 600;
+  return Math.max(1, Math.floor(h / ROW_H));
+}
+
+/** Request the graph layout for the current window range. */
+function requestLayout() {
+  const win = layoutWindow();
+  pendingLayoutOffset = win.offset;
+  send({ GetLayout: { hide_submodules: hideSubmodules(), offset: win.offset, limit: win.limit } });
+}
+
+/** Compute the layout window range centered on the current scroll position. */
+function layoutWindow() {
+  const vp = viewportRows();
+  const size = vp * WINDOW_MULT;
+  // Center on the first visible row.
+  const firstVisible = Math.floor(rowsEl.scrollTop / ROW_H);
+  let off = Math.max(0, firstVisible - Math.floor(size / 2));
+  off = Math.min(off, Math.max(0, total - size));
+  return { offset: off, limit: size };
 }
 
 /** Reset to the full history view and reload from the top. */
 function resetHistory() {
   allRows = [];
-  nodeIndex = {};
   offset = 0;
   total = 0;
   pending = false;
+  clearDetail();
   loadMore();
 }
 
 /** Inspect a node's details. */
 function inspect(row) {
+  console.log('[editchain] inspect', row && row.node_key);
+  // Show the detail pane and populate it with the node's details.
+  layoutEl.classList.add('has-detail');
+  detailEl.innerHTML = '<div class="detail-title">Loading…</div>';
   if (row.git_oid) {
     send({ ResolveObject: { repository: row.repository, oid: row.git_oid } });
   } else if (row.op_id) {
@@ -232,33 +298,38 @@ function inspect(row) {
   }
 }
 
+/** Hide the detail pane (e.g. on reset/search). */
+function clearDetail() {
+  layoutEl.classList.remove('has-detail');
+  detailEl.innerHTML = '';
+}
+
 /** Render node details in the inspector pane. */
 function renderDetails(details) {
-  detailEl.innerHTML = '';
-  const titleEl = document.createElement('div');
-  titleEl.className = 'detail-title';
-  titleEl.textContent = details.summary || '(no summary)';
-  detailEl.appendChild(titleEl);
+  try {
+    detailEl.innerHTML = '';
+    const titleEl = document.createElement('div');
+    titleEl.className = 'detail-title';
+    titleEl.textContent = details.summary || '(no summary)';
+    detailEl.appendChild(titleEl);
 
-  if (details.body) {
-    const bodyEl = document.createElement('pre');
-    bodyEl.className = 'detail-body';
-    bodyEl.textContent = details.body;
-    detailEl.appendChild(bodyEl);
-  }
-  if (details.refs && details.refs.length) {
-    const refsEl = document.createElement('div');
-    refsEl.className = 'detail-meta';
-    refsEl.textContent = 'refs: ' + details.refs.join(', ');
-    detailEl.appendChild(refsEl);
-  }
-  if (details.changed_paths && details.changed_paths.length) {
-    const pathsEl = document.createElement('div');
-    pathsEl.className = 'detail-meta';
-    pathsEl.textContent = 'paths: ' + details.changed_paths.join(', ');
-    detailEl.appendChild(pathsEl);
+    if (details.body) {
+      const bodyEl = document.createElement('pre');
+      bodyEl.className = 'detail-body';
+      bodyEl.textContent = details.body;
+      detailEl.appendChild(bodyEl);
+    }
+  } catch (e) {
+    console.error('[editchain] renderDetails error:', e);
+    detailEl.innerHTML = '<div class="detail-title">Error rendering details</div>' +
+      '<pre class="detail-body">' + esc(String(e)) + '</pre>';
   }
 }
+
+// Surface any uncaught exception in the webview so we can diagnose.
+window.addEventListener('error', (e) => {
+  console.error('[editchain] uncaught error:', e.message, e.error);
+});
 
 // Handle messages from the extension host.
 window.addEventListener('message', (event) => {
@@ -269,45 +340,66 @@ window.addEventListener('message', (event) => {
     if (r.ok) {
       statusEl.textContent = `Open: ${r.value.nodes} nodes, ${r.value.repos} repos`;
       allRows = [];
-      nodeIndex = {};
       offset = 0;
       total = r.value.nodes;
       loadMore();
+      requestLayout();
     } else {
       statusEl.textContent = `Error: ${r.error}`;
     }
-  } else if (msg.id === 'ready') {
-    loadMore();
+    return;
   }
 
-  // Response to a GetWindow request.
-  if (r.ok && r.value && Array.isArray(r.value.rows)) {
+  if (!r.ok) {
+    // Show request errors (e.g. timeout) in the detail pane so they're visible.
+    if (layoutEl.classList.contains('has-detail')) {
+      detailEl.innerHTML = '<div class="detail-title">Error</div>' +
+        '<pre class="detail-body">' + esc(r.error || 'unknown error') + '</pre>';
+    }
+    return;
+  }
+  if (!r.value || typeof r.value !== 'object') return;
+
+  // GetLayout response — has both `rows` and `edges` arrays.
+  if (Array.isArray(r.value.edges)) {
+    layout = r.value;
+    layoutOffset = pendingLayoutOffset;
+    renderRows();
+    return;
+  }
+
+  // GetWindow response — has a `rows` array plus `total`.
+  if (Array.isArray(r.value.rows)) {
     total = r.value.total;
     for (const row of r.value.rows) {
       allRows.push(row);
-      nodeIndex[row.node_key] = allRows.length - 1;
     }
     offset += r.value.rows.length;
+    pending = false;
     renderRows();
     statusEl.textContent = `${allRows.length}/${total} nodes`;
-    pending = false;
+    // Keep loading until the content fills the viewport so scrolling works.
+    ensureFilled();
+    return;
   }
-  // Response to a Search request — render results as rows.
-  else if (r.ok && Array.isArray(r.value)) {
-    const results = r.value.map((c) => ({
-      op_id: c.metadata.source === 'EditChain' ? c.metadata.op_id : null,
-      git_oid: c.metadata.source === 'Git' ? c.metadata.op_id : null,
-      repository: null,
-      summary: c.text,
-      timestamp_ms: c.metadata.timestamp_ms,
-      group: c.metadata.source === 'Git' ? 'search:git' : 'search:editchain',
-      node_key: c.metadata.source === 'Git' ? 'git:' + c.metadata.op_id : 'op:' + c.metadata.op_id,
-      parents: [],
-    }));
-    allRows = results;
-    nodeIndex = {};
-    renderRows();
-    statusEl.textContent = `${results.length} search results`;
+
+  // NodeDetails response (GetNodeDetails) — has summary + body.
+  if (typeof r.value.summary === 'string') {
+    console.log('[editchain] got details', r.value.summary.slice(0, 40));
+    renderDetails(r.value);
+    return;
+  }
+  // Git commit response (ResolveObject) — has message + oid.
+  if (r.value && r.value.message !== undefined) {
+    console.log('[editchain] got commit');
+    const msg = typeof r.value.message === 'string' ? r.value.message : '';
+    renderDetails({
+      summary: msg || '(no message)',
+      body: msg,
+      refs: [],
+      changed_paths: [],
+    });
+    return;
   }
 });
 
@@ -330,21 +422,45 @@ searchEl.addEventListener('input', () => {
   }
 });
 
-// Re-fetch when the hide-submodules toggle changes (filtering is server-side).
+// Re-fetch when the show-submodules toggle changes (filtering is server-side).
 if (hideSubmodulesEl) {
   hideSubmodulesEl.addEventListener('change', () => {
     allRows = [];
-    nodeIndex = {};
     offset = 0;
     total = 0;
     pending = false;
+    layout = null;
     loadMore();
+    requestLayout();
   });
 }
 
-// Infinite scroll.
+// Infinite scroll: load more rows near the bottom, and recompute the graph
+// layout dynamically as the user scrolls so lines stay continuous.
 rowsEl.addEventListener('scroll', () => {
   if (rowsEl.scrollTop + rowsEl.clientHeight >= rowsEl.scrollHeight - 40) {
     loadMore();
   }
+  // Recompute layout when the visible window drifts toward the edge of the
+  // current layout window.
+  const win = layoutWindow();
+  const firstVisible = Math.floor(rowsEl.scrollTop / ROW_H);
+  const nearEdge =
+    firstVisible < win.offset + viewportRows() ||
+    firstVisible > win.offset + win.limit - viewportRows() * 2;
+  if (nearEdge && (win.offset !== layoutOffset || !layout)) {
+    requestLayout();
+  }
+});
+
+// Re-render and re-request layout when the webview resizes so columns stretch
+// and the graph window tracks the new viewport size.
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    renderRows();
+    requestLayout();
+    ensureFilled();
+  }, 150);
 });

@@ -20,8 +20,8 @@ use editchain_index::LexicalIndex;
 use editchain_node::segment::SegmentStore;
 use editchain_project::HistoryProjection;
 use editchain_protocol::{
-    HistoryRow, HistoryWindow, NodeDetails, RepositoryInfo, Request, RequestBody, Response,
-    ResponseBody,
+    GraphLayout as ProtocolGraphLayout, HistoryRow, HistoryWindow, LayoutEdge, LayoutPoint,
+    LayoutRow, NodeDetails, RepositoryInfo, Request, RequestBody, Response, ResponseBody,
 };
 
 /// A loaded workspace: chain ops + git repositories.
@@ -31,16 +31,46 @@ pub struct Workspace {
     pub projection: HistoryProjection,
     /// Discovered git repositories.
     pub repositories: Vec<editchain_git::RepositoryDiscovery>,
+    /// Cached canonical node list per `hide_submodules` flag.
+    ///
+    /// The topological sort over the full chain is the expensive part; it is
+    /// computed once per filter state and reused for every window/layout call.
+    sorted_nodes: std::collections::HashMap<bool, Vec<editchain_project::HistoryNode>>,
+    /// Cached layout context per `hide_submodules` flag.
+    ///
+    /// The context bundles all O(V) derived data (keys, row map, lane map, lane
+    /// assignment) so per-window edge computation is O(window). Computed once
+    /// per filter state and reused across scrolls/resizes.
+    contexts: std::collections::HashMap<bool, editchain_project::layout::LayoutContext>,
 }
 
 impl Workspace {
+    /// Create a workspace from an existing projection (used in tests).
+    #[must_use]
+    pub fn from_projection(projection: HistoryProjection) -> Self {
+        Self {
+            projection,
+            repositories: Vec::new(),
+            sorted_nodes: std::collections::HashMap::new(),
+            contexts: std::collections::HashMap::new(),
+        }
+    }
+
     /// Load a workspace from a chain directory and discover git repos.
     ///
     /// # Errors
     ///
     /// Returns an error if the chain cannot be read or repos cannot be discovered.
     pub fn open(workspace_path: &str, chain_dir: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let ops = read_chain_ops(chain_dir)?;
+        // Resolve the chain directory relative to the workspace when it is a
+        // relative path (e.g. ".editchain"). The service process's CWD is not
+        // necessarily the workspace root, so we must join explicitly.
+        let chain_path = if PathBuf::from(chain_dir).is_absolute() {
+            PathBuf::from(chain_dir)
+        } else {
+            PathBuf::from(workspace_path).join(chain_dir)
+        };
+        let ops = read_chain_ops(&chain_path)?;
         let mut projection = HistoryProjection::from_ops(ops);
         let repositories = discover_repositories(&PathBuf::from(workspace_path))?;
         // Walk each discovered repo's history into the projection.
@@ -54,19 +84,69 @@ impl Workspace {
                 projection.merge_git_commits(commits);
             }
         }
+        // Stitch sessions and git history into a single edit chain.
+        projection.link_history();
         Ok(Self {
             projection,
             repositories,
+            sorted_nodes: std::collections::HashMap::new(),
+            contexts: std::collections::HashMap::new(),
         })
     }
 
     /// Get a window of history rows (newest-first).
     #[must_use]
-    pub fn history_window(&self, offset: u64, limit: u64, hide_submodules: bool) -> HistoryWindow {
+    pub fn history_window(
+        &mut self,
+        offset: u64,
+        limit: u64,
+        hide_submodules: bool,
+    ) -> HistoryWindow {
         let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
         let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
 
-        // Build the full node list, optionally filtering out submodules.
+        // Build the node list, optionally filtering out submodules.
+        let filtered = self.filtered_nodes(hide_submodules);
+        let total = filtered.len();
+
+        let rows = filtered
+            .into_iter()
+            .skip(offset_usize)
+            .take(limit_usize)
+            .map(|node| HistoryRow {
+                op_id: node.op_id().map(|id| id.to_string()),
+                git_oid: node.git_oid(),
+                repository: node.repository(),
+                summary: node.summary(),
+                timestamp_ms: node.timestamp_ms(),
+                group: node.group(),
+                node_key: node.node_key(),
+                parents: node.parent_keys(&self.projection.git.links),
+                is_submodule: node
+                    .repository()
+                    .is_some_and(|rid| self.repo_is_submodule(rid)),
+                author: node_author(&node),
+                commit_id: node_commit_id(&node),
+            })
+            .collect();
+        HistoryWindow {
+            rows,
+            total: u64::try_from(total).unwrap_or(u64::MAX),
+            chain_generation: 0,
+        }
+    }
+
+    /// Returns the canonical node list, optionally filtering out submodules.
+    ///
+    /// This is the single source of truth for both [`Self::history_window`] and
+    /// [`Self::graph_layout`], so their row indices stay in lockstep. The result
+    /// is cached per `hide_submodules` so the expensive topological sort runs
+    /// only once per filter state.
+    #[must_use]
+    fn filtered_nodes(&mut self, hide_submodules: bool) -> Vec<editchain_project::HistoryNode> {
+        if let Some(nodes) = self.sorted_nodes.get(&hide_submodules) {
+            return nodes.clone();
+        }
         let all_nodes = self.projection.nodes();
         let filtered: Vec<_> = if hide_submodules {
             all_nodes
@@ -79,30 +159,74 @@ impl Workspace {
         } else {
             all_nodes
         };
-        let total = filtered.len();
+        drop(self.sorted_nodes.insert(hide_submodules, filtered.clone()));
+        filtered
+    }
 
-        let rows = filtered
-            .into_iter()
-            .skip(offset_usize)
-            .take(limit_usize)
-            .map(|node| HistoryRow {
-                op_id: node.op_id(),
-                git_oid: node.git_oid(),
-                repository: node.repository(),
-                summary: node.summary(),
-                timestamp_ms: node.timestamp_ms(),
-                group: node.group(),
-                node_key: node.node_key(),
-                parents: node.parent_keys(),
-                is_submodule: node
-                    .repository()
-                    .is_some_and(|rid| self.repo_is_submodule(rid)),
+    /// Compute the graph layout for a bounded window of rows.
+    ///
+    /// The layout context (all O(V) derived data) is cached per `hide_submodules`
+    /// and computed once; only edges whose child falls inside `[offset,
+    /// offset+limit)` are emitted. This keeps per-scroll cost proportional to the
+    /// visible slice rather than the whole graph.
+    #[must_use]
+    pub fn graph_layout(
+        &mut self,
+        hide_submodules: bool,
+        offset: u64,
+        limit: u64,
+    ) -> ProtocolGraphLayout {
+        // Ensure the context is built (once per filter state), then borrow it.
+        if !self.contexts.contains_key(&hide_submodules) {
+            let sorted = self.filtered_nodes(hide_submodules);
+            let ctx = self.projection.layout_context(&sorted);
+            drop(self.contexts.insert(hide_submodules, ctx));
+        }
+        let Some(ctx) = self.contexts.get(&hide_submodules) else {
+            return ProtocolGraphLayout {
+                rows: Vec::new(),
+                edges: Vec::new(),
+            };
+        };
+        let offset_usize = usize::try_from(offset).unwrap_or(0);
+        let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+
+        let edges = ctx.edges_for_window(offset_usize, limit_usize);
+
+        // Only send the window slice of rows (the webview needs lanes only for
+        // visible rows). Sending all V rows would serialize the whole graph on
+        // every scroll.
+        let row_end = offset_usize
+            .saturating_add(limit_usize)
+            .min(ctx.lanes.len());
+        let rows = ctx
+            .lanes
+            .get(offset_usize..row_end)
+            .unwrap_or(&[])
+            .iter()
+            .map(|r| LayoutRow {
+                node: r.node.clone(),
+                lane: r.lane,
             })
             .collect();
-        HistoryWindow {
+
+        ProtocolGraphLayout {
             rows,
-            total: u64::try_from(total).unwrap_or(u64::MAX),
-            chain_generation: 0,
+            edges: edges
+                .into_iter()
+                .map(|e| LayoutEdge {
+                    child: e.child,
+                    parent: e.parent,
+                    points: e
+                        .points
+                        .into_iter()
+                        .map(|p| LayoutPoint {
+                            row: p.row,
+                            lane: p.lane,
+                        })
+                        .collect(),
+                })
+                .collect(),
         }
     }
 
@@ -110,10 +234,11 @@ impl Workspace {
     #[must_use]
     pub fn node_details(
         &self,
-        op_id: Option<OpId>,
+        op_id: Option<String>,
         git_oid: Option<GitOid>,
     ) -> Option<NodeDetails> {
-        if let Some(op_id) = op_id {
+        if let Some(op_id_str) = op_id {
+            let op_id = OpId::from_display_str(&op_id_str)?;
             let op = self.projection.ops.iter().find(|op| op.id == op_id)?;
             return Some(node_details_from_op(op));
         }
@@ -170,11 +295,38 @@ impl Workspace {
     }
 }
 
+/// Author display name for a history node (git commits only).
+#[must_use]
+fn node_author(node: &editchain_project::HistoryNode) -> String {
+    match node {
+        editchain_project::HistoryNode::EditOperation(_) => String::new(),
+        editchain_project::HistoryNode::GitCommit(commit) => payload_text(&commit.author.name),
+    }
+}
+
+/// Commit/ID display value for a history node.
+///
+/// Git commits show an abbreviated OID; `EditChain` ops show their op id.
+#[must_use]
+fn node_commit_id(node: &editchain_project::HistoryNode) -> String {
+    match node {
+        editchain_project::HistoryNode::EditOperation(op) => op.id.to_string(),
+        editchain_project::HistoryNode::GitCommit(commit) => abbreviate_oid(&commit.oid),
+    }
+}
+
+/// Abbreviate a git OID to its first 7 hex characters.
+#[must_use]
+fn abbreviate_oid(oid: &GitOid) -> String {
+    let hex = oid.to_hex();
+    hex.chars().take(7).collect()
+}
+
 /// Build node details from an `EditChain` operation.
 #[must_use]
 fn node_details_from_op(op: &Op) -> NodeDetails {
     NodeDetails {
-        op_id: Some(op.id),
+        op_id: Some(op.id.to_string()),
         git_oid: None,
         repository: None,
         summary: op_summary(op),
@@ -208,7 +360,7 @@ fn node_details_from_commit(commit: &editchain_core::GitCommitEntity) -> NodeDet
         .map(|p| p.0.to_string())
         .collect();
     NodeDetails {
-        op_id: commit.imported_record,
+        op_id: commit.imported_record.map(|id| id.to_string()),
         git_oid: Some(commit.oid),
         repository: Some(commit.repository),
         summary: body.clone(),
@@ -225,8 +377,8 @@ fn node_details_from_commit(commit: &editchain_core::GitCommitEntity) -> NodeDet
 /// # Errors
 ///
 /// Returns an error if the chain directory cannot be read.
-fn read_chain_ops(chain_dir: &str) -> Result<Vec<Op>, Box<dyn std::error::Error>> {
-    if chain_dir.is_empty() {
+fn read_chain_ops(chain_dir: &PathBuf) -> Result<Vec<Op>, Box<dyn std::error::Error>> {
+    if chain_dir.as_os_str().is_empty() {
         return Ok(Vec::new());
     }
     let store = SegmentStore::open(chain_dir)?;
@@ -352,9 +504,10 @@ impl Server {
         let body = match &request.body {
             RequestBody::Open(req) => {
                 let workspace = Workspace::open(&req.workspace_path, &req.chain_dir)?;
-                let lexical = build_lexical_index(&workspace)?;
+                // The lexical index is built lazily on first Search (it is
+                // expensive for large chains and unnecessary for the graph view).
                 self.workspace = Some(workspace);
-                self.lexical = Some(lexical);
+                self.lexical = None;
                 ResponseBody::Ok(serde_json::json!({
                     "workspace": req.workspace_path,
                     "chain": req.chain_dir,
@@ -363,13 +516,18 @@ impl Server {
                 }))
             }
             RequestBody::GetWindow(req) => {
-                let ws = self.workspace.as_ref().ok_or("no workspace open")?;
+                let ws = self.workspace.as_mut().ok_or("no workspace open")?;
                 let window = ws.history_window(req.offset, req.limit, req.hide_submodules);
                 ResponseBody::Ok(serde_json::to_value(window)?)
             }
+            RequestBody::GetLayout(req) => {
+                let ws = self.workspace.as_mut().ok_or("no workspace open")?;
+                let layout = ws.graph_layout(req.hide_submodules, req.offset, req.limit);
+                ResponseBody::Ok(serde_json::to_value(layout)?)
+            }
             RequestBody::GetNodeDetails(req) => {
                 let ws = self.workspace.as_ref().ok_or("no workspace open")?;
-                match ws.node_details(Some(req.op_id), None) {
+                match ws.node_details(Some(req.op_id.clone()), None) {
                     Some(details) => ResponseBody::Ok(serde_json::to_value(details)?),
                     None => ResponseBody::Error("node not found".to_string()),
                 }
@@ -387,6 +545,11 @@ impl Server {
             }
             RequestBody::SetFilters(_) => ResponseBody::Error("filters not yet wired".to_string()),
             RequestBody::Search(req) => {
+                // Build the lexical index lazily on first search.
+                if self.lexical.is_none() {
+                    let ws = self.workspace.as_ref().ok_or("no workspace open")?;
+                    self.lexical = Some(build_lexical_index(ws)?);
+                }
                 let lexical = self.lexical.as_ref().ok_or("no index built")?;
                 let results = lexical.search_internal(&req.query, &req.filters, req.top_k)?;
                 ResponseBody::Ok(serde_json::to_value(results)?)

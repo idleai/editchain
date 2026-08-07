@@ -74,3 +74,9 @@ impl From<serde_json::Error> for ImportError {
         Self::Json(e)
     }
 }
+
+impl From<crate::ids::IdError> for ImportError {
+    fn from(e: crate::ids::IdError) -> Self {
+        Self::OpSink(e.to_string())
+    }
+}

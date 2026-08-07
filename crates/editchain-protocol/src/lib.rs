@@ -28,6 +28,8 @@ pub enum RequestBody {
     Open(OpenRequest),
     /// Get a window of history rows.
     GetWindow(GetWindowRequest),
+    /// Get the full graph layout (lanes + edge paths) for rendering.
+    GetLayout(GetLayoutRequest),
     /// Get details for a specific node.
     GetNodeDetails(GetNodeDetailsRequest),
     /// Set search filters.
@@ -79,11 +81,66 @@ pub struct GetWindowRequest {
     pub hide_submodules: bool,
 }
 
+/// Get the graph layout for a bounded window of rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetLayoutRequest {
+    /// Skip rows belonging to nested/submodule repositories.
+    #[serde(default)]
+    pub hide_submodules: bool,
+    /// Cursor offset into the history (0 = newest).
+    #[serde(default)]
+    pub offset: u64,
+    /// Number of rows to emit edges for.
+    #[serde(default)]
+    pub limit: u64,
+}
+
+/// A grid point in the graph: a row index and a lane index.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct LayoutPoint {
+    /// Row index (0 = newest).
+    pub row: usize,
+    /// Lane index.
+    pub lane: usize,
+}
+
+/// A single edge in the graph, from a child node down to one of its parents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutEdge {
+    /// The child node key (the newer end of the edge).
+    pub child: String,
+    /// The parent node key (the older end of the edge).
+    pub parent: String,
+    /// Ordered grid points from child to parent.
+    pub points: Vec<LayoutPoint>,
+}
+
+/// A single graph row in the layout.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayoutRow {
+    /// The node key this row represents.
+    pub node: String,
+    /// The lane this node occupies.
+    pub lane: usize,
+}
+
+/// The full graph layout for rendering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphLayout {
+    /// Per-row assignment (row index → node key + lane).
+    pub rows: Vec<LayoutRow>,
+    /// All edges (child → parent), each with its ordered point path.
+    pub edges: Vec<LayoutEdge>,
+}
+
 /// Get details for a specific node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetNodeDetailsRequest {
-    /// The operation ID to inspect.
-    pub op_id: OpId,
+    /// The operation ID to inspect, in display form `"node:boot:seq"`.
+    ///
+    /// Stored as a string so it round-trips through JavaScript without precision
+    /// loss on u64 node values that exceed 2^53.
+    pub op_id: String,
 }
 
 /// Set search filters for subsequent queries.
@@ -118,8 +175,9 @@ pub struct ResolveObjectRequest {
 /// A history row in the unified projection (`EditChain` op or `Git` commit).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryRow {
-    /// The operation ID (for `EditChain` ops) or synthetic id for `Git` commits.
-    pub op_id: Option<OpId>,
+    /// The operation ID (for `EditChain` ops) in display form `"node:boot:seq"`,
+    /// or `None` for git commits. Stored as a string to avoid JS precision loss.
+    pub op_id: Option<String>,
     /// The git commit OID (for git commits).
     pub git_oid: Option<GitOid>,
     /// The repository (for git commits).
@@ -136,6 +194,12 @@ pub struct HistoryRow {
     pub parents: Vec<String>,
     /// Whether this row belongs to a nested/submodule repository.
     pub is_submodule: bool,
+    /// Author display name (git commits only; empty for ops).
+    #[serde(default)]
+    pub author: String,
+    /// Commit/ID display value (abbreviated git OID or op id).
+    #[serde(default)]
+    pub commit_id: String,
 }
 
 /// A window of history rows with generation counters.
@@ -152,8 +216,9 @@ pub struct HistoryWindow {
 /// Details for a single history node (for the inspector).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeDetails {
-    /// The operation ID, if this is an `EditChain` op.
-    pub op_id: Option<OpId>,
+    /// The operation ID (display form `"node:boot:seq"`), if this is an
+    /// `EditChain` op. Stored as a string to avoid JS precision loss.
+    pub op_id: Option<String>,
     /// The git commit OID, if this is a git commit.
     pub git_oid: Option<GitOid>,
     /// The repository, if this is a git commit.
