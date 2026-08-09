@@ -35,6 +35,7 @@ let pending = false;
 let allRows = [];          // accumulated rows across pages
 let layout = null;         // { rows: [{node,lane}], edges: [{child,parent,points}] }
 let layoutOffset = 0;      // history offset of the first layout row
+let layoutLimit = 0;       // number of rows covered by the loaded layout window
 let pendingLayoutOffset = 0; // offset requested for the in-flight layout
 
 // Branch colours for graph lanes (indexed by lane).
@@ -102,30 +103,53 @@ function buildGraphSvg(rowYs, rows, maxWidth) {
 
   let svg = `<svg id="graphOverlay" width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">`;
 
-  // Draw each edge as one continuous path, clipped to the rendered rows.
+  // Draw each edge as one continuous path over all rendered rows. An edge is
+  // never dropped: if its child is offscreen above or its parent offscreen
+  // below, the path extends to the SVG top/bottom so lines stay continuous as
+  // you scroll instead of popping in and out.
+  let drawnEdges = 0;
+  let skippedEdges = 0;
   for (const edge of layout.edges) {
     const childRow = rowOf[edge.child];
-    if (childRow === undefined) continue; // child not yet loaded
+    const parentRow = rowOf[edge.parent];
 
-    // Collect points that fall within the rendered rows. Edge points are
-    // layout-relative; convert to actual row index by adding layoutOffset.
+    // Convert every point to an absolute row index. Points beyond the loaded
+    // rows are kept so we can still extend lines to the SVG bottom; they are
+    // clamped when computing y.
     const pts = [];
     for (const p of edge.points) {
-      const actualRow = p.row + layoutOffset;
-      if (actualRow < rows.length) pts.push({ ...p, row: actualRow });
+      pts.push({ ...p, row: p.row + layoutOffset });
     }
-    if (!pts.length) continue;
+    if (!pts.length) { skippedEdges++; continue; }
 
-    // If the parent isn't rendered yet, extend the path down to window bottom.
-    const parentLoaded = rowOf[edge.parent] !== undefined;
+    const childLoaded = childRow !== undefined;
+    const parentLoaded = parentRow !== undefined;
+
+    // Helper: pixel y for an absolute row, clamped into [0, height].
+    const yOf = (r) => {
+      const raw = (rowYs[r] !== undefined ? rowYs[r] : r * ROW_H) + ROW_H / 2;
+      return Math.max(0, Math.min(height, raw));
+    };
+
     let d = '';
-    for (let i = 0; i < pts.length; i++) {
-      const x = LANE_W / 2 + pts[i].lane * LANE_W + LANE_W / 2;
-      const y = (rowYs[pts[i].row] !== undefined ? rowYs[pts[i].row] : pts[i].row * ROW_H) + ROW_H / 2;
-      d += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
+    if (!childLoaded && pts.length) {
+      // Child is above the rendered rows: start at SVG top on the child's lane,
+      // then follow points downward.
+      const firstX = LANE_W / 2 + pts[0].lane * LANE_W + LANE_W / 2;
+      d += 'M' + firstX.toFixed(1) + ',' + '0';
+      for (let i = 0; i < pts.length; i++) {
+        const x = LANE_W / 2 + pts[i].lane * LANE_W + LANE_W / 2;
+        d += 'L' + x.toFixed(1) + ',' + yOf(pts[i].row).toFixed(1);
+      }
+    } else {
+      for (let i = 0; i < pts.length; i++) {
+        const x = LANE_W / 2 + pts[i].lane * LANE_W + LANE_W / 2;
+        d += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + yOf(pts[i].row).toFixed(1);
+      }
     }
+
     if (!parentLoaded && pts.length) {
-      // Extend vertically from last point down to window bottom.
+      // Parent is below the rendered rows: extend vertically down to SVG bottom.
       const lastX = LANE_W / 2 + pts[pts.length - 1].lane * LANE_W + LANE_W / 2;
       d += 'L' + lastX.toFixed(1) + ',' + height.toFixed(1);
     }
@@ -135,7 +159,10 @@ function buildGraphSvg(rowYs, rows, maxWidth) {
     // Line path — colour comes from CSS (.graphLine) so it stays visible on
     // both light and dark themes.
     svg += `<path class="graphLine" d="${d}"/>`;
+    drawnEdges++;
   }
+  console.log('[editchain] buildGraphSvg layoutOffset=' + layoutOffset +
+    ' edges=' + layout.edges.length + ' drawn=' + drawnEdges + ' skipped=' + skippedEdges);
 
   // Draw node dots at each rendered row's lane centre.
   for (let i = layoutOffset; i < rows.length; i++) {
@@ -158,9 +185,13 @@ function hideSubmodules() {
   return !(hideSubmodulesEl && hideSubmodulesEl.checked);
 }
 
-// Maximum width of the graph column, so the description/content column always
-// stays visible even when there are many concurrent lanes.
+// Maximum width of the graph column when not manually resized, so the
+// description/content column always stays visible even when there are many
+// concurrent lanes.
 const MAX_GRAPH_W = 320;
+// User-dragged graph column width override (null = auto/natural). Dragging can
+// exceed MAX_GRAPH_W so lanes beyond the default cap stay visible.
+let graphWidthOverride = null;
 
 /** Render all accumulated rows into a table with graph column + text columns. */
 function renderRows() {
@@ -170,8 +201,10 @@ function renderRows() {
   const maxLane = layout && layout.rows.length ? Math.max(...layout.rows.map((r) => r.lane), 0) : 0;
   const naturalGraphW = (maxLane + 1) * LANE_W + LANE_W;
   // Cap the graph column so content stays visible; lanes beyond the cap are
-  // clipped by overflow-hidden on the graph cell.
-  const graphWidth = Math.min(naturalGraphW, MAX_GRAPH_W);
+  // clipped by overflow-hidden on the graph cell. A user drag overrides the cap.
+  const graphWidth = graphWidthOverride !== null
+    ? graphWidthOverride
+    : Math.min(naturalGraphW, MAX_GRAPH_W);
 
   // Build the sticky table header.
   let html =
@@ -195,7 +228,17 @@ function renderRows() {
       html += '<div class="block-sep">' + esc(label) + '</div>';
     }
 
-    html += '<div class="row" data-key="' + esc(row.node_key) + '" style="--graph-w:' + graphWidth + 'px">' +
+    // Apply a row-level opacity class based on content: raw-JSON rows (tool
+    // results / import records) are dimmed most (0.3), other non-text rows
+    // (e.g. "tool: NAME") are dimmed moderately (0.7), and text rows
+    // (messages/commands) stay full opacity.
+    const summaryText = row.summary || '';
+    const isJson = summaryText.trim().startsWith('{');
+    const kindClass = isJson ? 'row-tool'
+      : (row.kind === 'message' || row.kind === 'command') ? ''
+      : 'row-dim';
+
+    html += '<div class="row ' + kindClass + '" data-key="' + esc(row.node_key) + '" style="--graph-w:' + graphWidth + 'px">' +
       '<div class="graph-cell"></div>' +
       '<div class="text-cell"><div class="summary">' + esc(row.summary || '(no summary)') + '</div></div>' +
       '<div class="date-cell">' + esc(formatDate(row.timestamp_ms)) + '</div>' +
@@ -204,10 +247,19 @@ function renderRows() {
       '</div>';
   });
 
+  // Preserve the scroll position across the DOM rebuild. Setting innerHTML
+  // destroys and recreates all rows, which would otherwise reset scrollTop to 0
+  // on every layout recompute — snapping the user back to the top and
+  // preventing any further recomputation as they scroll down.
+  const prevScrollTop = rowsEl.scrollTop;
+
   rowsEl.innerHTML =
     '<div class="table-wrap" style="--graph-w:' + graphWidth + 'px">' +
       html +
     '</div>';
+
+  // Restore the scroll position after rebuilding.
+  rowsEl.scrollTop = prevScrollTop;
 
   // Measure each rendered row's real offsetTop within the table-wrap so block
   // separators don't misalign the graph overlay.
@@ -246,33 +298,15 @@ function ensureFilled() {
   }
 }
 
-// Layout window size as a multiple of the visible viewport rows. The graph
-// layout is recomputed dynamically as the user scrolls; a window of K× the
-// viewport gives prefetch headroom so lines extend before the next recompute.
-const WINDOW_MULT = 4;
-
-/** Estimate how many rows fit in the current viewport. */
-function viewportRows() {
-  const h = rowsEl.clientHeight || 600;
-  return Math.max(1, Math.floor(h / ROW_H));
-}
-
-/** Request the graph layout for the current window range. */
+/** Request the graph layout for all currently loaded rows. */
 function requestLayout() {
-  const win = layoutWindow();
-  pendingLayoutOffset = win.offset;
-  send({ GetLayout: { hide_submodules: hideSubmodules(), offset: win.offset, limit: win.limit } });
-}
-
-/** Compute the layout window range centered on the current scroll position. */
-function layoutWindow() {
-  const vp = viewportRows();
-  const size = vp * WINDOW_MULT;
-  // Center on the first visible row.
-  const firstVisible = Math.floor(rowsEl.scrollTop / ROW_H);
-  let off = Math.max(0, firstVisible - Math.floor(size / 2));
-  off = Math.min(off, Math.max(0, total - size));
-  return { offset: off, limit: size };
+  // Request a layout covering everything loaded so far. This keeps the graph
+  // stable as you scroll — lines don't recenter or pop in/out — and only grows
+  // when more rows load.
+  const limit = Math.max(1, allRows.length);
+  pendingLayoutOffset = 0;
+  console.log('[editchain] requestLayout offset=0 limit=' + limit);
+  send({ GetLayout: { hide_submodules: hideSubmodules(), offset: 0, limit } });
 }
 
 /** Reset to the full history view and reload from the top. */
@@ -364,6 +398,7 @@ window.addEventListener('message', (event) => {
   if (Array.isArray(r.value.edges)) {
     layout = r.value;
     layoutOffset = pendingLayoutOffset;
+    layoutLimit = layout.rows.length;
     renderRows();
     return;
   }
@@ -378,6 +413,8 @@ window.addEventListener('message', (event) => {
     pending = false;
     renderRows();
     statusEl.textContent = `${allRows.length}/${total} nodes`;
+    // Recompute the layout to cover the newly loaded rows so lines extend.
+    requestLayout();
     // Keep loading until the content fills the viewport so scrolling works.
     ensureFilled();
     return;
@@ -441,14 +478,10 @@ rowsEl.addEventListener('scroll', () => {
   if (rowsEl.scrollTop + rowsEl.clientHeight >= rowsEl.scrollHeight - 40) {
     loadMore();
   }
-  // Recompute layout when the visible window drifts toward the edge of the
-  // current layout window.
-  const win = layoutWindow();
-  const firstVisible = Math.floor(rowsEl.scrollTop / ROW_H);
-  const nearEdge =
-    firstVisible < win.offset + viewportRows() ||
-    firstVisible > win.offset + win.limit - viewportRows() * 2;
-  if (nearEdge && (win.offset !== layoutOffset || !layout)) {
+  // Recompute layout only when more rows have loaded than the current layout
+  // covers. The layout spans all loaded rows (offset 0), so scrolling alone
+  // never triggers a recompute — lines stay stable.
+  if (!layout || allRows.length > layoutLimit) {
     requestLayout();
   }
 });
@@ -464,3 +497,70 @@ window.addEventListener('resize', () => {
     ensureFilled();
   }, 150);
 });
+
+// --- Draggable graph column width -------------------------------------------
+//
+// A thin vertical handle sits on the right edge of the graph column. Dragging
+// it overrides `--graph-w` (via `graphWidthOverride`) so the user can widen the
+// graph beyond the default cap to reveal more lanes. The handle is re-created
+// on every render because `renderRows` rebuilds the table DOM.
+
+const MIN_GRAPH_W = 40;
+
+/** Create and wire the drag handle on the graph column's right edge. */
+function setupGraphResizeHandle() {
+  const wrapEl = rowsEl.querySelector('.table-wrap');
+  if (!wrapEl) return;
+  // Remove any stale handle from a previous render.
+  const old = wrapEl.querySelector('.graph-resize-handle');
+  if (old) old.remove();
+
+  const handle = document.createElement('div');
+  handle.className = 'graph-resize-handle';
+  handle.title = 'Drag to resize graph column';
+  wrapEl.appendChild(handle);
+
+  let dragging = false;
+  let startX = 0;
+  let startW = 0;
+
+  handle.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragging = true;
+    startX = e.clientX;
+    startW = graphWidthOverride !== null ? graphWidthOverride : currentGraphWidth();
+    document.body.classList.add('graph-resizing');
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp, { once: true });
+  });
+
+  function onMove(e) {
+    if (!dragging) return;
+    const delta = e.clientX - startX;
+    const next = Math.max(MIN_GRAPH_W, startW + delta);
+    graphWidthOverride = next;
+    renderRows();
+  }
+
+  function onUp() {
+    dragging = false;
+    document.body.classList.remove('graph-resizing');
+    window.removeEventListener('mousemove', onMove);
+  }
+}
+
+/** Current effective graph column width (override or natural). */
+function currentGraphWidth() {
+  const maxLane = layout && layout.rows.length ? Math.max(...layout.rows.map((r) => r.lane), 0) : 0;
+  const naturalGraphW = (maxLane + 1) * LANE_W + LANE_W;
+  return graphWidthOverride !== null ? graphWidthOverride : Math.min(naturalGraphW, MAX_GRAPH_W);
+}
+
+// Wire the handle after each render. `renderRows` is called from many places,
+// so hook it here rather than duplicating calls.
+const _origRenderRows = renderRows;
+renderRows = function () {
+  _origRenderRows.apply(this, arguments);
+  setupGraphResizeHandle();
+};

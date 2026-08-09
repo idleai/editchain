@@ -59,8 +59,15 @@ pub fn link_history(ops: &[Op], commits: &[GitCommitEntity]) -> LinkResult {
 
 /// Stitch sessions together chronologically into one linear chain.
 ///
-/// For each session, find its first and last op (by clock). Sort sessions by
-/// first-op timestamp; link session N's first op → session N-1's last op.
+/// For each session, find its first and last op by sequence number (`OpId.seq`,
+/// which matches how the raw import chains each session linearly). Sort
+/// sessions by first-op sequence; link session N's first op → session N-1's
+/// last op.
+///
+/// Sequence numbers are used instead of wall-clock timestamps because clocks
+/// can be inconsistent across imported records (e.g. an unset `UnixMs(0)` on
+/// some ops), which would otherwise order sessions incorrectly and create
+/// backward cross-session edges that close cycles in the graph.
 #[expect(
     clippy::indexing_slicing,
     reason = "indices are guaranteed non-empty per session group"
@@ -74,35 +81,44 @@ fn stitch_sessions(ops: &mut [Op]) {
         }
     }
 
-    // For each session, find first and last op index by clock.
+    // For each session, find first and last op index by sequence number.
     let mut sessions: Vec<(u64, usize, usize)> = Vec::new(); // (sid, first_idx, last_idx)
     for (sid, indices) in by_session {
         let mut first = indices[0];
         let mut last = indices[0];
         for &i in &indices {
-            if op_clock(&ops[i]) < op_clock(&ops[first]) {
+            if op_seq(&ops[i]) < op_seq(&ops[first]) {
                 first = i;
             }
-            if op_clock(&ops[i]) > op_clock(&ops[last]) {
+            if op_seq(&ops[i]) > op_seq(&ops[last]) {
                 last = i;
             }
         }
         sessions.push((sid, first, last));
     }
 
-    // Sort sessions by first-op clock (deterministic tie-break by sid).
+    // Sort sessions by first-op sequence (deterministic tie-break by sid).
     sessions.sort_by(|a, b| {
-        op_clock(&ops[a.1])
-            .cmp(&op_clock(&ops[b.1]))
+        op_seq(&ops[a.1])
+            .cmp(&op_seq(&ops[b.1]))
             .then(a.0.cmp(&b.0))
     });
 
     // Link session N's first op → session N-1's last op.
+    //
+    // Only add the edge when it points forward (the previous session's last op
+    // has a lower sequence than the current session's first op). Session seq
+    // ranges can overlap across sessions (seq is a per-file/per-line counter,
+    // not a global timestamp), so a naive stitch can create a backward edge
+    // that closes a cycle in the graph. Skipping backward stitches keeps the
+    // graph acyclic while still chaining sessions that are genuinely ordered.
     for w in sessions.windows(2) {
         let prev_last = w[0].2;
         let cur_first = w[1].1;
         let prev_id = ops[prev_last].id;
-        add_parent(&mut ops[cur_first], prev_id);
+        if op_seq(&ops[cur_first]) > op_seq(&ops[prev_last]) {
+            add_parent(&mut ops[cur_first], prev_id);
+        }
     }
 }
 
@@ -228,4 +244,9 @@ fn payload_text(payload: &Payload) -> String {
 /// Extract the clock value of an op as u64.
 fn op_clock(op: &Op) -> u64 {
     op.clock.as_u64()
+}
+
+/// Extract the sequence number of an op as u64.
+fn op_seq(op: &Op) -> u64 {
+    op.id.seq
 }

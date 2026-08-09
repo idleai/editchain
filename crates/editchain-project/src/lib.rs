@@ -22,6 +22,20 @@ use crate::link::link_history;
 pub enum HistoryNode {
     /// An `EditChain` operation.
     EditOperation(Op),
+    /// A raw import op collapsed with its normalized children into one node.
+    ///
+    /// The raw import op forms the linear backbone of a session; its normalized
+    /// children (messages, tools, commands) are folded into this single node so
+    /// the graph reads as a clean chain rather than a dense star per line. The
+    /// `summary` is derived from the children's content (not the raw JSONL).
+    CollapsedImport {
+        /// The underlying raw import op (kept for id/clock/parents).
+        op: Op,
+        /// Display summary derived from the normalized children.
+        summary: String,
+        /// Dominant child kind (e.g. "tool", "message", "command") for styling.
+        kind: String,
+    },
     /// A `Git` commit entity.
     GitCommit(GitCommitEntity),
 }
@@ -32,6 +46,7 @@ impl HistoryNode {
     pub fn summary(&self) -> String {
         match self {
             Self::EditOperation(op) => op_summary(op),
+            Self::CollapsedImport { summary, .. } => summary.clone(),
             Self::GitCommit(commit) => match &commit.message {
                 Payload::Inline(b) => String::from_utf8_lossy(b).to_string(),
                 Payload::Empty | Payload::Blob(_) => commit.oid.to_hex(),
@@ -47,7 +62,7 @@ impl HistoryNode {
     #[must_use]
     pub fn timestamp_ms(&self) -> u64 {
         match self {
-            Self::EditOperation(op) => op.clock.as_u64(),
+            Self::EditOperation(op) | Self::CollapsedImport { op, .. } => op.clock.as_u64(),
             Self::GitCommit(commit) => {
                 let secs = u64::try_from(commit.committed_at).unwrap_or(0);
                 secs.saturating_mul(1000)
@@ -59,7 +74,7 @@ impl HistoryNode {
     #[must_use]
     pub fn op_id(&self) -> Option<OpId> {
         match self {
-            Self::EditOperation(op) => Some(op.id),
+            Self::EditOperation(op) | Self::CollapsedImport { op, .. } => Some(op.id),
             Self::GitCommit(_) => None,
         }
     }
@@ -68,7 +83,7 @@ impl HistoryNode {
     #[must_use]
     pub fn git_oid(&self) -> Option<GitOid> {
         match self {
-            Self::EditOperation(_) => None,
+            Self::EditOperation(_) | Self::CollapsedImport { .. } => None,
             Self::GitCommit(commit) => Some(commit.oid),
         }
     }
@@ -77,7 +92,7 @@ impl HistoryNode {
     #[must_use]
     pub fn repository(&self) -> Option<RepositoryId> {
         match self {
-            Self::EditOperation(_) => None,
+            Self::EditOperation(_) | Self::CollapsedImport { .. } => None,
             Self::GitCommit(commit) => Some(commit.repository),
         }
     }
@@ -89,7 +104,7 @@ impl HistoryNode {
     #[must_use]
     pub fn group(&self) -> String {
         match self {
-            Self::EditOperation(op) => match op.scope {
+            Self::EditOperation(op) | Self::CollapsedImport { op, .. } => match op.scope {
                 editchain_core::ScopeRef::Session(sid) => format!("session:{}", sid.0),
                 editchain_core::ScopeRef::None
                 | editchain_core::ScopeRef::Chain(_)
@@ -106,7 +121,7 @@ impl HistoryNode {
     #[must_use]
     pub fn node_key(&self) -> String {
         match self {
-            Self::EditOperation(op) => op.id.to_string(),
+            Self::EditOperation(op) | Self::CollapsedImport { op, .. } => op.id.to_string(),
             Self::GitCommit(commit) => commit.oid.to_hex(),
         }
     }
@@ -122,7 +137,7 @@ impl HistoryNode {
         git_links: &std::collections::BTreeMap<OpId, Vec<editchain_core::GitLink>>,
     ) -> Vec<String> {
         match self {
-            Self::EditOperation(op) => {
+            Self::EditOperation(op) | Self::CollapsedImport { op, .. } => {
                 let mut keys: Vec<String> = op.parents.iter().map(ToString::to_string).collect();
                 if let Some(links) = git_links.get(&op.id) {
                     for link in links {
@@ -132,6 +147,36 @@ impl HistoryNode {
                 keys
             }
             Self::GitCommit(commit) => commit.parents.iter().map(GitOid::to_hex).collect(),
+        }
+    }
+
+    /// Returns a short type tag for this node, used by the viewer to style rows.
+    ///
+    /// `EditChain` ops return their `OpKind` name (lowercased); collapsed imports
+    /// return the dominant child kind; git commits return `"git"`.
+    #[must_use]
+    pub fn kind(&self) -> String {
+        use editchain_core::OpKind;
+        match self {
+            Self::EditOperation(op) => match &op.kind {
+                OpKind::ChainStart(_) => "chainstart".to_string(),
+                OpKind::Actor(_) => "actor".to_string(),
+                OpKind::Message(_) => "message".to_string(),
+                OpKind::Tool(_) => "tool".to_string(),
+                OpKind::Command(_) => "command".to_string(),
+                OpKind::File(_) => "file".to_string(),
+                OpKind::Reflection(_) => "reflection".to_string(),
+                OpKind::Import(_) => "import".to_string(),
+                OpKind::Note(_) => "note".to_string(),
+                OpKind::Error(_) => "error".to_string(),
+                OpKind::GitCommit(_) => "gitcommit".to_string(),
+                OpKind::GitLink(_) => "gitlink".to_string(),
+                OpKind::Unknown(_) => "unknown".to_string(),
+            },
+            // Collapsed imports report their dominant child kind so the viewer
+            // can style tool calls vs messages differently.
+            Self::CollapsedImport { kind, .. } => kind.clone(),
+            Self::GitCommit(_) => "git".to_string(),
         }
     }
 }
@@ -217,9 +262,12 @@ impl HistoryProjection {
     )]
     fn ordered_nodes(&self) -> Vec<HistoryNode> {
         // Build a unified node list: ops (newest-first) then git commits.
+        // Raw import ops are collapsed with their normalized children into a
+        // single node so the graph reads as a clean chain rather than a dense
+        // star per source line.
         let mut nodes: Vec<HistoryNode> = Vec::with_capacity(self.len());
-        for op in self.ops.iter().rev() {
-            nodes.push(HistoryNode::EditOperation(op.clone()));
+        for op in self.collapsed_ops().into_iter().rev() {
+            nodes.push(op);
         }
         for commit in self.git.commits.values() {
             nodes.push(HistoryNode::GitCommit(commit.clone()));
@@ -260,40 +308,141 @@ impl HistoryProjection {
             }
         }
 
+        // Track which keys have not yet been emitted so we can break cycles
+        // deterministically when Kahn stalls.
+        let mut unemitted: std::collections::HashSet<String> = indegree.keys().cloned().collect();
+
         let mut sorted_oldest_first: Vec<HistoryNode> = Vec::with_capacity(nodes.len());
-        while let Some(key) = queue.pop_front() {
-            if let Some(node) = node_by_key.get(&key) {
-                sorted_oldest_first.push(node.clone());
+        while !unemitted.is_empty() {
+            // Normal Kahn step: emit every queued node whose present parents
+            // have all been emitted.
+            while let Some(key) = queue.pop_front() {
+                if !unemitted.contains(&key) {
+                    continue;
+                }
+                if let Some(node) = node_by_key.get(&key) {
+                    sorted_oldest_first.push(node.clone());
+                }
+                let _ = unemitted.remove(&key);
+                if let Some(children) = children_of.get(&key) {
+                    for child in children {
+                        if let Some(deg) = indegree.get_mut(child) {
+                            *deg -= 1;
+                            if *deg == 0 && unemitted.contains(child) {
+                                queue.push_back(child.clone());
+                            }
+                        }
+                    }
+                }
             }
-            if let Some(children) = children_of.get(&key) {
-                for child in children {
-                    if let Some(deg) = indegree.get_mut(child) {
-                        *deg -= 1;
-                        if *deg == 0 {
-                            queue.push_back(child.clone());
+
+            // If nodes remain, we've hit a cycle. Break it deterministically by
+            // emitting the remaining node with the smallest in-degree (fewest
+            // still-blocking present parents), tie-broken by key. Its remaining
+            // parents are treated as dropped (their edges simply won't draw),
+            // which keeps every other edge pointing forward in the final order.
+            if !unemitted.is_empty() {
+                // Pick the remaining node with the smallest in-degree (fewest
+                // still-blocking present parents), tie-broken by key.
+                let pick = unemitted
+                    .iter()
+                    .min_by(|a, b| {
+                        indegree
+                            .get(*a)
+                            .copied()
+                            .unwrap_or(0)
+                            .cmp(&indegree.get(*b).copied().unwrap_or(0))
+                            .then_with(|| a.cmp(b))
+                    })
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(node) = node_by_key.get(&pick) {
+                    sorted_oldest_first.push(node.clone());
+                }
+                let _ = unemitted.remove(&pick);
+                if let Some(children) = children_of.get(&pick) {
+                    for child in children {
+                        if let Some(deg) = indegree.get_mut(child) {
+                            *deg -= 1;
+                            if *deg == 0 && unemitted.contains(child) {
+                                queue.push_back(child.clone());
+                            }
                         }
                     }
                 }
             }
         }
 
-        // If some nodes remain (a cycle), append them in original order so we
-        // don't drop history. Edges to un-emitted parents simply won't be drawn.
-        if sorted_oldest_first.len() < nodes.len() {
-            let emitted: std::collections::HashSet<String> = sorted_oldest_first
-                .iter()
-                .map(HistoryNode::node_key)
-                .collect();
-            for node in &nodes {
-                if !emitted.contains(&node.node_key()) {
-                    sorted_oldest_first.push(node.clone());
+        // Reverse to newest-first.
+        sorted_oldest_first.reverse();
+
+        // Time-sort by default: interleave git commits and ops by timestamp so
+        // newer work (whether a commit or an op) appears higher in the list.
+        // This is a stable sort — nodes with equal or unknown (0) timestamps
+        // keep their topological order, so parent-before-child is preserved for
+        // causally-ordered nodes (whose clocks are monotonic). Time-sorting only
+        // changes which row a node occupies; the lane assignment is computed
+        // separately from topology and is unaffected.
+        sorted_oldest_first.sort_by_key(|n| std::cmp::Reverse(n.timestamp_ms()));
+        sorted_oldest_first
+    }
+
+    /// Collapse raw import ops with their normalized children into single nodes.
+    ///
+    /// Each raw `Import` op is the linear backbone of a session; its normalized
+    /// children (`Message`, `Tool`, `Command`, `File`) branch off it. This folds
+    /// each raw op + its children into one [`HistoryNode::CollapsedImport`] whose
+    /// summary is derived from the children's content, so the graph shows one
+    /// meaningful node per source line instead of a dense star. Non-import ops
+    /// (e.g. `ChainStart`, git-link records) are kept as-is.
+    #[must_use]
+    fn collapsed_ops(&self) -> Vec<HistoryNode> {
+        // Set of raw import op ids (the linear backbone).
+        let import_ids: std::collections::HashSet<OpId> = self
+            .ops
+            .iter()
+            .filter(|op| matches!(op.kind, editchain_core::OpKind::Import(_)))
+            .map(|op| op.id)
+            .collect();
+        // Map raw import op id -> its normalized children (in input order).
+        let mut children_of: HashMap<OpId, Vec<&Op>> = HashMap::new();
+        // Track which non-import ops are folded into an import parent (so they
+        // are dropped), versus standalone ops that must be kept.
+        let mut folded: std::collections::HashSet<OpId> = std::collections::HashSet::new();
+        for op in &self.ops {
+            if matches!(op.kind, editchain_core::OpKind::Import(_)) {
+                continue;
+            }
+            for &parent in &op.parents {
+                if import_ids.contains(&parent) {
+                    let _: bool = folded.insert(op.id);
+                    children_of.entry(parent).or_default().push(op);
                 }
             }
         }
 
-        // Reverse to newest-first.
-        sorted_oldest_first.reverse();
-        sorted_oldest_first
+        self.ops
+            .iter()
+            .filter_map(|op| {
+                if matches!(op.kind, editchain_core::OpKind::Import(_)) {
+                    let children = children_of.get(&op.id);
+                    let summary = collapsed_import_summary(op, children);
+                    let kind = collapsed_import_kind(children);
+                    Some(HistoryNode::CollapsedImport {
+                        op: op.clone(),
+                        summary,
+                        kind,
+                    })
+                } else if folded.contains(&op.id) {
+                    // Drop normalized ops folded into their parent import op.
+                    None
+                } else {
+                    // Standalone op (e.g. ChainStart, or a message not tied to an
+                    // import) — keep as-is.
+                    Some(HistoryNode::EditOperation(op.clone()))
+                }
+            })
+            .collect()
     }
 
     /// Merge resolved git commits into the projection.
@@ -420,6 +569,89 @@ fn op_summary(op: &Op) -> String {
         OpKind::GitLink(l) => format!("git:{}", l.target_oid),
         OpKind::Unknown(u) => format!("unknown kind={}", u.kind_discriminant),
     }
+}
+
+/// Derive a display summary for a collapsed import op from its normalized
+/// children.
+///
+/// Prefers the most meaningful content: a message's text, then a tool's name,
+/// then a command's content. Falls back to the raw import reference when there
+/// are no children (e.g. structural lines like `custom-title`).
+#[must_use]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "Only message/tool/command children contribute to the summary; all other kinds are ignored"
+)]
+fn collapsed_import_summary(op: &Op, children: Option<&Vec<&Op>>) -> String {
+    use editchain_core::OpKind;
+    let mut message = String::new();
+    let mut tool = String::new();
+    let mut command = String::new();
+    if let Some(children) = children {
+        for child in children {
+            match &child.kind {
+                OpKind::Message(m) if message.is_empty() => {
+                    message = payload_text(&m.content);
+                }
+                OpKind::Tool(t) if tool.is_empty() => {
+                    tool = payload_text(&t.tool_name);
+                }
+                OpKind::Command(c) if command.is_empty() => {
+                    command = payload_text(&c.content);
+                }
+                _ => {}
+            }
+        }
+    }
+    if !message.is_empty() {
+        return message;
+    }
+    if !tool.is_empty() {
+        return format!("tool: {tool}");
+    }
+    if !command.is_empty() {
+        return format!("$ {command}");
+    }
+    // No meaningful children — fall back to the raw reference.
+    match &op.kind {
+        OpKind::Import(i) => payload_text(&i.raw_ref),
+        OpKind::ChainStart(cs) => String::from_utf8_lossy(&cs.name).to_string(),
+        OpKind::Actor(a) => payload_text(&a.label),
+        OpKind::Message(m) => payload_text(&m.content),
+        OpKind::Tool(t) => payload_text(&t.tool_name),
+        OpKind::Command(c) => payload_text(&c.content),
+        OpKind::File(f) => format!("file:{}", f.path.0),
+        OpKind::Reflection(r) => payload_text(&r.summary),
+        OpKind::Note(n) => payload_text(&n.content),
+        OpKind::Error(e) => payload_text(&e.message),
+        OpKind::GitCommit(c) => payload_text(&c.message),
+        OpKind::GitLink(l) => format!("git:{}", l.target_oid),
+        OpKind::Unknown(u) => format!("unknown kind={}", u.kind_discriminant),
+    }
+}
+
+/// Determine the dominant child kind for a collapsed import op.
+///
+/// Prefers message, then tool, then command — matching the summary derivation.
+/// Falls back to `"import"` when there are no meaningful children.
+#[must_use]
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "Only message/tool/command children determine the dominant kind; all other kinds fall through"
+)]
+fn collapsed_import_kind(children: Option<&Vec<&Op>>) -> String {
+    use editchain_core::OpKind;
+    if let Some(children) = children {
+        for child in children {
+            match &child.kind {
+                OpKind::Message(_) => return "message".to_string(),
+                OpKind::Tool(_) => return "tool".to_string(),
+                OpKind::Command(_) => return "command".to_string(),
+                _ => {}
+            }
+        }
+    }
+    "import".to_string()
 }
 
 /// Extract text from a payload, or empty string.

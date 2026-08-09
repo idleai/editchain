@@ -2,6 +2,10 @@ import * as vscode from 'vscode';
 import { resolveServicePath, StdioClient } from './stdioClient';
 
 let clientStarted = false;
+// The single history panel. Reused across `open` invocations so we never create
+// two webviews of the same type (which races VS Code's service-worker
+// registration and can throw "Could not register service worker").
+let historyPanel: vscode.WebviewPanel | undefined = undefined;
 
 /**
  * Activate the EditChain History extension.
@@ -28,6 +32,13 @@ export function activate(context: vscode.ExtensionContext): void {
  * Open (or reveal) the history explorer webview panel.
  */
 function openHistoryView(context: vscode.ExtensionContext, client: StdioClient): void {
+  // Reuse an existing panel if one is still open, so we never create two
+  // webviews of the same type (which races service-worker registration).
+  if (historyPanel) {
+    historyPanel.reveal(vscode.ViewColumn.One);
+    return;
+  }
+
   const panel = vscode.window.createWebviewPanel(
     'editchainHistory',
     'EditChain History',
@@ -37,6 +48,14 @@ function openHistoryView(context: vscode.ExtensionContext, client: StdioClient):
       localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media')],
     }
   );
+  historyPanel = panel;
+  // Clear the reference when the panel is closed so a later `open` creates a
+  // fresh one instead of reusing a disposed webview.
+  panel.onDidDispose(() => {
+    if (historyPanel === panel) {
+      historyPanel = undefined;
+    }
+  });
 
   // Start the service if not already running.
   if (!clientStarted) {
@@ -133,6 +152,7 @@ body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); 
 .block-sep {
   font-weight: 700;
   color: var(--vscode-descriptionForeground);
+  opacity: 0.3;
   padding: 8px 4px 4px;
   border-bottom: 1px solid var(--vscode-panel-border);
 }
@@ -147,6 +167,10 @@ body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); 
   cursor: pointer;
 }
 .row:hover { background-color: var(--vscode-list-hoverBackground); }
+/* Row-level opacity by node kind: tool calls dimmed most, other non-text nodes
+   dimmed moderately, text nodes (messages/commands) stay full. */
+.row-tool { opacity: 0.3; }
+.row-dim { opacity: 0.7; }
 .graph-cell { line-height: 0; overflow: hidden; }
 .text-cell { padding-left: 8px; overflow: hidden; }
 .date-cell, .author-cell, .commit-cell {
@@ -187,6 +211,29 @@ body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); 
   fill: none;
   stroke: #d0d0d0; /* light grey — visible on dark backgrounds */
   stroke-width: 2;
+}
+
+/* Draggable handle on the right edge of the graph column. Positioned at the
+   graph column boundary (--graph-w), centered on it. */
+.graph-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  left: calc(var(--graph-w, auto) - 3px);
+  cursor: col-resize;
+  z-index: 4;
+  background: transparent;
+}
+.graph-resize-handle:hover {
+  background: var(--vscode-panel-border);
+}
+body.graph-resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+body.graph-resizing .graph-resize-handle {
+  background: var(--vscode-focusBorder);
 }
 </style>
 </head>

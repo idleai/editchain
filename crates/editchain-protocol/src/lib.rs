@@ -200,6 +200,9 @@ pub struct HistoryRow {
     /// Commit/ID display value (abbreviated git OID or op id).
     #[serde(default)]
     pub commit_id: String,
+    /// Short type tag for styling (e.g. "tool", "message", "command", "git").
+    #[serde(default)]
+    pub kind: String,
 }
 
 /// A window of history rows with generation counters.

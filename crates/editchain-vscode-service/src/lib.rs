@@ -127,6 +127,7 @@ impl Workspace {
                     .is_some_and(|rid| self.repo_is_submodule(rid)),
                 author: node_author(&node),
                 commit_id: node_commit_id(&node),
+                kind: node.kind(),
             })
             .collect();
         HistoryWindow {
@@ -170,6 +171,10 @@ impl Workspace {
     /// offset+limit)` are emitted. This keeps per-scroll cost proportional to the
     /// visible slice rather than the whole graph.
     #[must_use]
+    #[expect(
+        clippy::print_stderr,
+        reason = "Diagnostic logging to the VS Code output pane via service stderr"
+    )]
     pub fn graph_layout(
         &mut self,
         hide_submodules: bool,
@@ -192,6 +197,14 @@ impl Workspace {
         let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
 
         let edges = ctx.edges_for_window(offset_usize, limit_usize);
+        eprintln!(
+            "[layout] GetLayout offset={} limit={} rows={} edges={} max_lane={}",
+            offset_usize,
+            limit_usize,
+            ctx.lanes.len(),
+            edges.len(),
+            ctx.lanes.iter().map(|r| r.lane).max().unwrap_or(0)
+        );
 
         // Only send the window slice of rows (the webview needs lanes only for
         // visible rows). Sending all V rows would serialize the whole graph on
@@ -299,7 +312,8 @@ impl Workspace {
 #[must_use]
 fn node_author(node: &editchain_project::HistoryNode) -> String {
     match node {
-        editchain_project::HistoryNode::EditOperation(_) => String::new(),
+        editchain_project::HistoryNode::EditOperation(_)
+        | editchain_project::HistoryNode::CollapsedImport { .. } => String::new(),
         editchain_project::HistoryNode::GitCommit(commit) => payload_text(&commit.author.name),
     }
 }
@@ -310,7 +324,8 @@ fn node_author(node: &editchain_project::HistoryNode) -> String {
 #[must_use]
 fn node_commit_id(node: &editchain_project::HistoryNode) -> String {
     match node {
-        editchain_project::HistoryNode::EditOperation(op) => op.id.to_string(),
+        editchain_project::HistoryNode::EditOperation(op)
+        | editchain_project::HistoryNode::CollapsedImport { op, .. } => op.id.to_string(),
         editchain_project::HistoryNode::GitCommit(commit) => abbreviate_oid(&commit.oid),
     }
 }

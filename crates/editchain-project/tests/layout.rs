@@ -1,7 +1,7 @@
 //! Tests for the lane layout module.
 
 use editchain_core::{NodeId, OpId};
-use editchain_project::layout::{compute_graph_layout, compute_lanes};
+use editchain_project::layout::{compute_graph_layout, compute_lanes, LayoutContext};
 use editchain_project::HistoryProjection;
 
 fn op(node: u64, seq: u64) -> OpId {
@@ -197,4 +197,53 @@ fn graph_layout_topologically_sorts_git_commits() {
             edge.child
         );
     }
+}
+
+#[test]
+fn graph_layout_breaks_cycles_deterministically() {
+    // A cycle: A -> B -> C -> A (each node's parent is the next in the ring).
+    // `compute_graph_layout` must break the cycle deterministically rather than
+    // dropping nodes or emitting them unsorted, so every node still appears.
+    let nodes = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+    let parents = parents_from(&[("A", &["C"]), ("B", &["A"]), ("C", &["B"])]);
+    let layout = compute_graph_layout(&nodes, parents);
+
+    // All three nodes must be present (none dropped).
+    assert_eq!(layout.rows.len(), 3);
+    // Every node must appear exactly once.
+    let mut seen = std::collections::HashSet::new();
+    for r in &layout.rows {
+        assert!(seen.insert(r.node.clone()), "duplicate node {}", r.node);
+    }
+}
+
+#[test]
+fn edges_for_window_emits_edge_entering_from_above() {
+    // A long edge N0 -> N3 spanning several rows (newest-first: N0..N3).
+    // When scrolling to a window that contains only N3 (the parent) but not N0
+    // (the child above it), the edge must still be emitted so the line enters
+    // from the top of the viewport instead of vanishing.
+    let nodes = vec![
+        "N0".to_string(),
+        "N1".to_string(),
+        "N2".to_string(),
+        "N3".to_string(),
+    ];
+    let parents = parents_from(&[("N0", &["N3"])]);
+    let ctx = LayoutContext::new(&nodes, &parents);
+
+    // Window covering rows 0..1 (N0,N1): child N0 inside -> emitted normally.
+    let edges = ctx.edges_for_window(0, 2);
+    assert!(
+        edges.iter().any(|e| e.child == "N0" && e.parent == "N3"),
+        "edge N0->N3 should be emitted when its child is in the window"
+    );
+
+    // Window covering rows 2..4 (N2,N3): only the PARENT N3 is inside; N0 is
+    // above it. The edge must still be emitted so it enters from offscreen.
+    let edges2 = ctx.edges_for_window(2, 2);
+    assert!(
+        edges2.iter().any(|e| e.child == "N0" && e.parent == "N3"),
+        "edge N0->N3 should be emitted when its parent is in the window even if its child is above"
+    );
 }

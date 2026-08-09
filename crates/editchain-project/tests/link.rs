@@ -107,3 +107,31 @@ fn session_links_to_closest_commit() {
     assert!(!result.git_links.is_empty());
     assert_eq!(result.git_links[0].source, ops[1].id);
 }
+
+#[test]
+fn stitch_skips_backward_edge_when_seq_ranges_overlap() {
+    // Two sessions whose seq ranges overlap (seq is a per-file counter, not a
+    // global timestamp). Session A spans seq 100..200; session B spans seq
+    // 150..250. Sorting by first-op seq puts A before B, but B's last op (250)
+    // has a HIGHER seq than A's first op (100) — a naive stitch would add a
+    // backward edge A.first -> B.last that closes a cycle. The stitch must
+    // skip it.
+    let mut ops = vec![
+        op(1, 100, Some(10), 1000), // session A first
+        op(1, 200, Some(10), 2000), // session A last
+        op(1, 150, Some(20), 3000), // session B first (seq < A.last)
+        op(1, 250, Some(20), 4000), // session B last
+    ];
+    let result = link_history(&ops, &[]);
+    ops = result.ops;
+
+    // Session B's first op (index 2) must NOT gain a parent to session A's last
+    // op (index 1), because that would be a backward edge (150 < 200).
+    let b_first_parents: Vec<_> = ops[2].parents.iter().collect();
+    assert!(
+        !b_first_parents.iter().any(|p| **p == ops[1].id),
+        "stitch must not create a backward edge from seq {} to seq {}",
+        ops[2].id.seq,
+        ops[1].id.seq
+    );
+}
