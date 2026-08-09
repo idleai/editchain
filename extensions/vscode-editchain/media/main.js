@@ -27,9 +27,17 @@ const searchEl = document.getElementById('search');
 const detailEl = document.getElementById('detail');
 const layoutEl = document.getElementById('layout');
 const hideSubmodulesEl = document.getElementById('hideSubmodules');
+const hideSystemEl = document.getElementById('hideSystem');
 
 let offset = 0;
-const PAGE = 200;
+// Rows fetched per request. Larger than the visible viewport so each fetch
+// buffers well ahead of the scroll position, keeping the user from ever
+// waiting on an in-flight fetch.
+const PAGE = 500;
+// How far ahead (in rows) of the current scroll position to keep buffered.
+// The background loader keeps fetching until this much content is loaded past
+// the viewport, so scrolling never blocks on a fetch.
+const PROGRESSIVE_BUFFER = 1000;
 let total = 0;
 let pending = false;
 let allRows = [];          // accumulated rows across pages
@@ -84,7 +92,9 @@ function esc(s) {
 function buildGraphSvg(rowYs, rows, maxWidth) {
   if (!layout || !layout.rows.length || rows.length === 0) return '';
   const maxLane = Math.max(...layout.rows.map((r) => r.lane), 0);
-  const naturalW = (maxLane + 1) * LANE_W + LANE_W;
+  const numLanes = Math.min(maxLane + 1, MAX_GRAPH_LANES);
+  // One extra lane of padding so the last lane's dot isn't clipped.
+  const naturalW = numLanes * LANE_W + LANE_W;
   // Cap the SVG width so lanes beyond the cap are clipped (content stays visible).
   const width = Math.min(naturalW, maxWidth || naturalW);
   // Height spans from the first row's top to just below the last row.
@@ -185,32 +195,68 @@ function hideSubmodules() {
   return !(hideSubmodulesEl && hideSubmodulesEl.checked);
 }
 
-// Maximum width of the graph column when not manually resized, so the
-// description/content column always stays visible even when there are many
-// concurrent lanes.
-const MAX_GRAPH_W = 320;
-// User-dragged graph column width override (null = auto/natural). Dragging can
-// exceed MAX_GRAPH_W so lanes beyond the default cap stay visible.
-let graphWidthOverride = null;
+/** Whether a row is user-facing text (message or command) — the rows kept when
+ * "Show messages only" is checked. */
+function isMessageRow(row) {
+  return row.kind === 'message' || row.kind === 'command';
+}
+
+/** Whether only messages should be shown (from the "Show messages only" checkbox). */
+function showMessagesOnly() {
+  return !!(hideSystemEl && hideSystemEl.checked);
+}
+
+// Maximum number of graph lanes shown before clipping. The graph column's
+// initial width is `numLanes * LANE_W`, capped at this many lanes so the
+// description/content column always stays visible even with many concurrent
+// branches.
+const MAX_GRAPH_LANES = 64;
+// Minimum widths for each resizable column.
+const MIN_COL_W = { graph: 40, content: 60, date: 90, author: 60, commit: 60 };
+// User-dragged per-column width overrides (null = default behavior):
+//   graph   -> natural lane-based width (numLanes * LANE_W, capped at MAX_GRAPH_LANES)
+//   content -> flexible minmax(0,1fr)
+//   date / author / commit -> fixed defaults
+// Dragging can exceed the natural cap so lanes beyond it stay visible.
+const colWidths = { graph: null, content: null, date: null, author: null, commit: null };
+
+// Default (pre-drag) widths for the fixed columns. These are applied from the
+// first render so the layout is stable and left-aligned — without them the
+// date/author/commit tracks are `auto`-sized to content, which cramps them and
+// misaligns rows with the header (whose cells carry a min-width). A user drag
+// overrides these via `colWidths`.
+const DEFAULT_COL_W = { content: 0, date: 140, author: 100, commit: 100 };
+
+/** Build an inline style string carrying every column width as a CSS var.
+ *
+ * Every column gets an explicit width so nothing is auto-sized: the graph uses
+ * its natural/capped lane width, and the fixed columns use their defaults until
+ * the user drags a boundary. The content column stays flexible (`1fr`) unless
+ * dragged, so it absorbs leftover space.
+ */
+function colStyle() {
+  const parts = ['--graph-w:' + currentGraphWidth() + 'px'];
+  if (colWidths.content !== null) parts.push('--content-w:' + colWidths.content + 'px');
+  parts.push('--date-w:' + (colWidths.date !== null ? colWidths.date : DEFAULT_COL_W.date) + 'px');
+  parts.push('--author-w:' + (colWidths.author !== null ? colWidths.author : DEFAULT_COL_W.author) + 'px');
+  parts.push('--commit-w:' + (colWidths.commit !== null ? colWidths.commit : DEFAULT_COL_W.commit) + 'px');
+  return parts.join(';');
+}
 
 /** Render all accumulated rows into a table with graph column + text columns. */
 function renderRows() {
-  // Apply the submodule filter (hidden unless "Show git submodules" is checked).
-  const visible = hideSubmodules() ? allRows.filter((r) => !r.is_submodule) : allRows;
-
-  const maxLane = layout && layout.rows.length ? Math.max(...layout.rows.map((r) => r.lane), 0) : 0;
-  const naturalGraphW = (maxLane + 1) * LANE_W + LANE_W;
-  // Cap the graph column so content stays visible; lanes beyond the cap are
-  // clipped by overflow-hidden on the graph cell. A user drag overrides the cap.
-  const graphWidth = graphWidthOverride !== null
-    ? graphWidthOverride
-    : Math.min(naturalGraphW, MAX_GRAPH_W);
+  // Apply the submodule filter (hidden unless "Show git submodules" is checked)
+  // and the messages-only filter (when "Show messages only" is checked).
+  let visible = hideSubmodules() ? allRows.filter((r) => !r.is_submodule) : allRows;
+  if (showMessagesOnly()) {
+    visible = visible.filter(isMessageRow);
+  }
 
   // Build the sticky table header.
   let html =
-    '<div class="tbl-header" style="--graph-w:' + graphWidth + 'px">' +
-      '<div class="th">Graph</div>' +
-      '<div class="th">Content</div>' +
+    '<div class="tbl-header" style="' + colStyle() + '">' +
+      '<div class="th graph">Graph</div>' +
+      '<div class="th content">Content</div>' +
       '<div class="th date">Date</div>' +
       '<div class="th author">Author</div>' +
       '<div class="th commit">Commit/ID</div>' +
@@ -228,17 +274,17 @@ function renderRows() {
       html += '<div class="block-sep">' + esc(label) + '</div>';
     }
 
-    // Apply a row-level opacity class based on content: raw-JSON rows (tool
-    // results / import records) are dimmed most (0.3), other non-text rows
-    // (e.g. "tool: NAME") are dimmed moderately (0.7), and text rows
-    // (messages/commands) stay full opacity.
-    const summaryText = row.summary || '';
-    const isJson = summaryText.trim().startsWith('{');
-    const kindClass = isJson ? 'row-tool'
+    // Apply a row-level opacity class based on the node's kind (reported by the
+    // service): system nodes (tool results / import records) are dimmed most
+    // (0.3), other non-text rows (e.g. "tool: NAME") are dimmed moderately
+    // (0.7), and text rows (messages/commands) stay full opacity.
+    const kindClass = row.is_system ? 'row-tool'
       : (row.kind === 'message' || row.kind === 'command') ? ''
       : 'row-dim';
+    // Agent-authored text gets extra left padding to read as a distinct voice.
+    const agentClass = row.author === 'agent' ? ' row-agent' : '';
 
-    html += '<div class="row ' + kindClass + '" data-key="' + esc(row.node_key) + '" style="--graph-w:' + graphWidth + 'px">' +
+    html += '<div class="row ' + kindClass + agentClass + '" data-key="' + esc(row.node_key) + '" style="' + colStyle() + '">' +
       '<div class="graph-cell"></div>' +
       '<div class="text-cell"><div class="summary">' + esc(row.summary || '(no summary)') + '</div></div>' +
       '<div class="date-cell">' + esc(formatDate(row.timestamp_ms)) + '</div>' +
@@ -254,7 +300,7 @@ function renderRows() {
   const prevScrollTop = rowsEl.scrollTop;
 
   rowsEl.innerHTML =
-    '<div class="table-wrap" style="--graph-w:' + graphWidth + 'px">' +
+    '<div class="table-wrap" style="' + colStyle() + '">' +
       html +
     '</div>';
 
@@ -269,7 +315,7 @@ function renderRows() {
   rowEls.forEach((el) => { rowYs.push(el.offsetTop); });
 
   // Insert the graph overlay after measuring.
-  wrapEl.insertAdjacentHTML('beforeend', buildGraphSvg(rowYs, visible, graphWidth));
+  wrapEl.insertAdjacentHTML('beforeend', buildGraphSvg(rowYs, visible, currentGraphWidth()));
 
   // Attach click handlers to rows.
   rowEls.forEach((el) => {
@@ -294,6 +340,26 @@ function ensureFilled() {
   const contentH = rowsEl.scrollHeight;
   const viewH = rowsEl.clientHeight;
   if (contentH < viewH) {
+    loadMore();
+  }
+}
+
+/**
+ * Progressively load history ahead of the scroll position so the user never
+ * waits on an in-flight fetch.
+ *
+ * Keeps fetching in the background until either all rows are loaded or there is
+ * at least `PROGRESSIVE_BUFFER` rows of content buffered past the bottom of the
+ * current viewport. Because it is driven by a timer (not by scroll events), it
+ * runs continuously and independently of how fast the user scrolls.
+ */
+function progressiveLoad() {
+  if (pending || (total > 0 && offset >= total)) return;
+  // Rows buffered past the bottom of the viewport.
+  const loadedRows = allRows.length;
+  const visibleRows = Math.ceil(rowsEl.clientHeight / ROW_H);
+  const bufferedAhead = loadedRows - visibleRows - Math.floor(rowsEl.scrollTop / ROW_H);
+  if (bufferedAhead < PROGRESSIVE_BUFFER) {
     loadMore();
   }
 }
@@ -378,6 +444,9 @@ window.addEventListener('message', (event) => {
       total = r.value.nodes;
       loadMore();
       requestLayout();
+      // Start the background progressive loader so history buffers ahead of the
+      // scroll position without waiting for scroll events.
+      startProgressiveLoader();
     } else {
       statusEl.textContent = `Error: ${r.error}`;
     }
@@ -472,8 +541,32 @@ if (hideSubmodulesEl) {
   });
 }
 
+// Re-render when the messages-only toggle changes (filtering is client-side
+// over already-loaded rows, so no refetch is needed). Reset scroll to the top
+// (the visible set changes significantly) and keep loading until the content
+// fills the viewport so scrolling still works.
+if (hideSystemEl) {
+  hideSystemEl.addEventListener('change', () => {
+    rowsEl.scrollTop = 0;
+    renderRows();
+    ensureFilled();
+  });
+}
+
+// Background progressive loader: keeps fetching history ahead of the scroll
+// position on a timer, so the user never waits on an in-flight fetch. It runs
+// continuously and independently of scroll events.
+let progressiveTimer = null;
+function startProgressiveLoader() {
+  if (progressiveTimer) return;
+  progressiveTimer = setInterval(() => {
+    progressiveLoad();
+  }, 300);
+}
+
 // Infinite scroll: load more rows near the bottom, and recompute the graph
-// layout dynamically as the user scrolls so lines stay continuous.
+// layout dynamically as the user scrolls so lines stay continuous. The scroll
+// handler is a fallback; the background loader above is the primary driver.
 rowsEl.addEventListener('scroll', () => {
   if (rowsEl.scrollTop + rowsEl.clientHeight >= rowsEl.scrollHeight - 40) {
     loadMore();
@@ -498,26 +591,48 @@ window.addEventListener('resize', () => {
   }, 150);
 });
 
-// --- Draggable graph column width -------------------------------------------
+// --- Draggable column widths ------------------------------------------------
 //
-// A thin vertical handle sits on the right edge of the graph column. Dragging
-// it overrides `--graph-w` (via `graphWidthOverride`) so the user can widen the
-// graph beyond the default cap to reveal more lanes. The handle is re-created
-// on every render because `renderRows` rebuilds the table DOM.
+// A thin vertical handle sits on the right edge of every resizable column
+// (Graph, Content, Date, Author, Commit/ID). Dragging a handle overrides that
+// column's width via a CSS var (`--graph-w`, `--content-w`, etc.) so the user
+// can adjust any column, not just the graph. Handles are re-created on every
+// render because `renderRows` rebuilds the table DOM.
 
-const MIN_GRAPH_W = 40;
+/** Current effective graph column width (override or natural).
+ *
+ * The natural width is `numLanes * LANE_W` (each lane is a fixed `LANE_W`-wide
+ * column) plus one extra lane of padding, so the last lane's node dot (centred
+ * on the final lane boundary) isn't clipped by the column's overflow. Capped at
+ * `MAX_GRAPH_LANES` lanes so the content column stays visible. A user drag
+ * overrides the natural width entirely.
+ */
+function currentGraphWidth() {
+  const maxLane = layout && layout.rows.length ? Math.max(...layout.rows.map((r) => r.lane), 0) : 0;
+  const numLanes = Math.min(maxLane + 1, MAX_GRAPH_LANES);
+  const naturalGraphW = numLanes * LANE_W + LANE_W;
+  return colWidths.graph !== null ? colWidths.graph : naturalGraphW;
+}
 
-/** Create and wire the drag handle on the graph column's right edge. */
-function setupGraphResizeHandle() {
-  const wrapEl = rowsEl.querySelector('.table-wrap');
-  if (!wrapEl) return;
-  // Remove any stale handle from a previous render.
-  const old = wrapEl.querySelector('.graph-resize-handle');
+/**
+ * Create and wire a drag handle on a column's right edge.
+ *
+ * `col` is one of "graph" | "content" | "date" | "author" | "commit". The
+ * handle is positioned at the column's current right boundary and, while
+ * dragging, updates `colWidths[col]` and re-renders so the grid tracks the
+ * mouse.
+ */
+function setupColumnResizeHandle(wrapEl, col, boundaryX) {
+  // Remove any stale handle for this column from a previous render.
+  const old = wrapEl.querySelector('.col-resize-handle[data-col="' + col + '"]');
   if (old) old.remove();
 
   const handle = document.createElement('div');
-  handle.className = 'graph-resize-handle';
-  handle.title = 'Drag to resize graph column';
+  handle.className = 'col-resize-handle';
+  handle.dataset.col = col;
+  handle.title = 'Drag to resize ' + col + ' column';
+  // Center the 6px handle on the column's right boundary.
+  handle.style.left = (boundaryX - 3) + 'px';
   wrapEl.appendChild(handle);
 
   let dragging = false;
@@ -529,8 +644,8 @@ function setupGraphResizeHandle() {
     e.stopPropagation();
     dragging = true;
     startX = e.clientX;
-    startW = graphWidthOverride !== null ? graphWidthOverride : currentGraphWidth();
-    document.body.classList.add('graph-resizing');
+    startW = currentColumnWidth(col);
+    document.body.classList.add('col-resizing');
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp, { once: true });
   });
@@ -538,29 +653,55 @@ function setupGraphResizeHandle() {
   function onMove(e) {
     if (!dragging) return;
     const delta = e.clientX - startX;
-    const next = Math.max(MIN_GRAPH_W, startW + delta);
-    graphWidthOverride = next;
+    const next = Math.max(MIN_COL_W[col], startW + delta);
+    colWidths[col] = next;
     renderRows();
   }
 
   function onUp() {
     dragging = false;
-    document.body.classList.remove('graph-resizing');
+    document.body.classList.remove('col-resizing');
     window.removeEventListener('mousemove', onMove);
   }
 }
 
-/** Current effective graph column width (override or natural). */
-function currentGraphWidth() {
-  const maxLane = layout && layout.rows.length ? Math.max(...layout.rows.map((r) => r.lane), 0) : 0;
-  const naturalGraphW = (maxLane + 1) * LANE_W + LANE_W;
-  return graphWidthOverride !== null ? graphWidthOverride : Math.min(naturalGraphW, MAX_GRAPH_W);
+/** Current effective width of a resizable column.
+ *
+ * For the graph column this is computed from the lane count (or the user's
+ * override). For every other column it is measured from the rendered header
+ * cell so a drag starts from the column's real on-screen width.
+ */
+function currentColumnWidth(col) {
+  if (col === 'graph') return currentGraphWidth();
+  if (colWidths[col] !== null) return colWidths[col];
+  const th = rowsEl.querySelector('.tbl-header .th.' + col);
+  return th ? th.offsetWidth : MIN_COL_W[col];
 }
 
-// Wire the handle after each render. `renderRows` is called from many places,
+/** Create and wire drag handles for every resizable column.
+ *
+ * Each handle is positioned at the right edge of its header cell. The header
+ * cells are laid out by the same grid template as the rows, so measuring their
+ * `offsetLeft + offsetWidth` gives the exact column boundary regardless of
+ * flexible/auto track sizing.
+ */
+function setupColumnResizeHandles() {
+  const wrapEl = rowsEl.querySelector('.table-wrap');
+  if (!wrapEl) return;
+  const header = wrapEl.querySelector('.tbl-header');
+  if (!header) return;
+  const cols = ['graph', 'content', 'date', 'author', 'commit'];
+  for (const col of cols) {
+    const th = header.querySelector('.th.' + col);
+    if (!th) continue;
+    setupColumnResizeHandle(wrapEl, col, th.offsetLeft + th.offsetWidth);
+  }
+}
+
+// Wire the handles after each render. `renderRows` is called from many places,
 // so hook it here rather than duplicating calls.
 const _origRenderRows = renderRows;
 renderRows = function () {
   _origRenderRows.apply(this, arguments);
-  setupGraphResizeHandle();
+  setupColumnResizeHandles();
 };

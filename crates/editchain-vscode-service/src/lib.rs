@@ -125,6 +125,7 @@ impl Workspace {
                 is_submodule: node
                     .repository()
                     .is_some_and(|rid| self.repo_is_submodule(rid)),
+                is_system: node_is_system(&node),
                 author: node_author(&node),
                 commit_id: node_commit_id(&node),
                 kind: node.kind(),
@@ -308,26 +309,82 @@ impl Workspace {
     }
 }
 
-/// Author display name for a history node (git commits only).
+/// Whether a history node is a system-generated artifact (tool results, raw
+/// import records) rather than user-facing text.
+///
+/// The viewer uses this to dim or hide such rows. It is derived from the node's
+/// kind — not from sniffing the summary text — so it stays correct regardless
+/// of content.
+#[must_use]
+fn node_is_system(node: &editchain_project::HistoryNode) -> bool {
+    match node {
+        editchain_project::HistoryNode::EditOperation(op) => {
+            matches!(op.kind, OpKind::Tool(_) | OpKind::Import(_))
+        }
+        // Collapsed imports fold a raw import + its children into one node; the
+        // dominant child kind tells us whether it is user-facing text or a
+        // system artifact.
+        editchain_project::HistoryNode::CollapsedImport { kind, .. } => {
+            kind == "tool" || kind == "import"
+        }
+        editchain_project::HistoryNode::GitCommit(_) => false,
+    }
+}
+
+/// Author display value for a history node.
+///
+/// Git commits show the commit author's name. `EditChain` ops have no stored
+/// author name (their actor is a derived hash), so they show a tag-derived
+/// label (`human` / `agent` / `system`) so the Author column reads uniformly
+/// across both row types instead of being blank for ops.
 #[must_use]
 fn node_author(node: &editchain_project::HistoryNode) -> String {
     match node {
-        editchain_project::HistoryNode::EditOperation(_)
-        | editchain_project::HistoryNode::CollapsedImport { .. } => String::new(),
+        editchain_project::HistoryNode::EditOperation(op) => op_author_label(op.tags),
+        // Collapsed imports carry their author label directly (derived from the
+        // children's tags in the projection), since the raw import op's own tags
+        // only carry `IMPORT`.
+        editchain_project::HistoryNode::CollapsedImport { author, .. } => author.clone(),
         editchain_project::HistoryNode::GitCommit(commit) => payload_text(&commit.author.name),
+    }
+}
+
+/// Derive a short author label from an op's tags.
+///
+/// Prefers the actor role tags (`HUMAN` / `AGENT`); falls back to `system` for
+/// anything else (imports, tools, commands, etc.).
+#[must_use]
+fn op_author_label(tags: Tags) -> String {
+    if tags.matches_any(Tags::HUMAN) {
+        "human".to_string()
+    } else if tags.matches_any(Tags::AGENT) {
+        "agent".to_string()
+    } else {
+        "system".to_string()
     }
 }
 
 /// Commit/ID display value for a history node.
 ///
-/// Git commits show an abbreviated OID; `EditChain` ops show their op id.
+/// Git commits show an abbreviated OID; `EditChain` ops show an abbreviated
+/// op id (`node:seq`, dropping the boot counter) so both row types read as a
+/// short, uniform identifier in this column.
 #[must_use]
 fn node_commit_id(node: &editchain_project::HistoryNode) -> String {
     match node {
         editchain_project::HistoryNode::EditOperation(op)
-        | editchain_project::HistoryNode::CollapsedImport { op, .. } => op.id.to_string(),
+        | editchain_project::HistoryNode::CollapsedImport { op, .. } => abbreviate_op_id(&op.id),
         editchain_project::HistoryNode::GitCommit(commit) => abbreviate_oid(&commit.oid),
     }
+}
+
+/// Abbreviate an op id (`node:boot:seq`) to a short `node:seq` form.
+///
+/// The boot counter is almost always 0 and adds noise; dropping it keeps the
+/// column compact while preserving the distinguishing sequence number.
+#[must_use]
+fn abbreviate_op_id(id: &OpId) -> String {
+    format!("{}:{}", id.node.0, id.seq)
 }
 
 /// Abbreviate a git OID to its first 7 hex characters.

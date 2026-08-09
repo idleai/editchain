@@ -1,5 +1,10 @@
 //! Tests for collapsing raw import ops with their normalized children.
 
+#![expect(
+    clippy::panic,
+    reason = "Tests assert on enum variants with explicit panic arms"
+)]
+
 use editchain_core::{
     ActorId, Clock, GitAvailability, GitCommitEntity, GitObjectFormat, GitOid, ImportOp, MessageOp,
     NodeId, Op, OpId, OpKind, ParentSet, Payload, ScopeRef, SessionId, Tags, ToolOp, ToolStage,
@@ -100,6 +105,42 @@ fn collapse_tool_summary_prefixes_tool() {
     let nodes = projection.nodes();
     assert_eq!(nodes.len(), 1);
     assert_eq!(nodes.first().unwrap().summary(), "tool: Bash");
+}
+
+#[test]
+fn collapse_author_derived_from_children_tags() {
+    // A raw import op whose child is a HUMAN message should collapse to a node
+    // with author "human" (not "system", which the raw import's IMPORT-only tags
+    // would otherwise produce).
+    let op1 = import_op(1, 1);
+    let msg = message_op(1, 3, op1.id, "hello world");
+    let projection = HistoryProjection::from_ops(vec![op1.clone(), msg]);
+    let nodes = projection.nodes();
+    assert_eq!(nodes.len(), 1);
+    let author = match nodes.first().unwrap() {
+        editchain_project::HistoryNode::CollapsedImport { author, .. } => author,
+        editchain_project::HistoryNode::EditOperation(_)
+        | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
+    };
+    assert_eq!(author, "human");
+}
+
+#[test]
+fn collapse_author_prefers_human_over_agent() {
+    // A raw import op with both a HUMAN message and an AGENT tool child should
+    // report "human" (HUMAN takes precedence).
+    let op1 = import_op(1, 1);
+    let msg = message_op(1, 3, op1.id, "hello world");
+    let tool = tool_op(1, 4, op1.id, "Bash");
+    let projection = HistoryProjection::from_ops(vec![op1.clone(), msg, tool]);
+    let nodes = projection.nodes();
+    assert_eq!(nodes.len(), 1);
+    let author = match nodes.first().unwrap() {
+        editchain_project::HistoryNode::CollapsedImport { author, .. } => author,
+        editchain_project::HistoryNode::EditOperation(_)
+        | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
+    };
+    assert_eq!(author, "human");
 }
 
 #[test]

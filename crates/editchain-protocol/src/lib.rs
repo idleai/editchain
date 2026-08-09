@@ -194,6 +194,11 @@ pub struct HistoryRow {
     pub parents: Vec<String>,
     /// Whether this row belongs to a nested/submodule repository.
     pub is_submodule: bool,
+    /// Whether this is a system-generated node (tool results, raw import
+    /// records) rather than user-facing text. The viewer uses this to dim or
+    /// hide such rows.
+    #[serde(default)]
+    pub is_system: bool,
     /// Author display name (git commits only; empty for ops).
     #[serde(default)]
     pub author: String,

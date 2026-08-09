@@ -35,6 +35,11 @@ pub enum HistoryNode {
         summary: String,
         /// Dominant child kind (e.g. "tool", "message", "command") for styling.
         kind: String,
+        /// Author label derived from the children's tags (`human` / `agent` /
+        /// `system`). The raw import op's own tags only carry `IMPORT`, so the
+        /// role must come from the normalized children that carry `HUMAN` /
+        /// `AGENT`.
+        author: String,
     },
     /// A `Git` commit entity.
     GitCommit(GitCommitEntity),
@@ -428,10 +433,12 @@ impl HistoryProjection {
                     let children = children_of.get(&op.id);
                     let summary = collapsed_import_summary(op, children);
                     let kind = collapsed_import_kind(children);
+                    let author = collapsed_import_author(children);
                     Some(HistoryNode::CollapsedImport {
                         op: op.clone(),
                         summary,
                         kind,
+                        author,
                     })
                 } else if folded.contains(&op.id) {
                     // Drop normalized ops folded into their parent import op.
@@ -652,6 +659,30 @@ fn collapsed_import_kind(children: Option<&Vec<&Op>>) -> String {
         }
     }
     "import".to_string()
+}
+
+/// Determine the author label for a collapsed import op from its children's
+/// tags.
+///
+/// The raw import op's tags only carry `IMPORT`; the role (`HUMAN` / `AGENT`)
+/// lives on the normalized children. Prefers `human`, then `agent`, and falls
+/// back to `system` when no child carries a role tag.
+#[must_use]
+fn collapsed_import_author(children: Option<&Vec<&Op>>) -> String {
+    use editchain_core::Tags;
+    if let Some(children) = children {
+        for child in children {
+            if child.tags.matches_any(Tags::HUMAN) {
+                return "human".to_string();
+            }
+        }
+        for child in children {
+            if child.tags.matches_any(Tags::AGENT) {
+                return "agent".to_string();
+            }
+        }
+    }
+    "system".to_string()
 }
 
 /// Extract text from a payload, or empty string.

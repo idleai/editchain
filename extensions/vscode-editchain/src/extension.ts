@@ -114,7 +114,27 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 12px; box-sizing: border-box; }
 #status { color: var(--vscode-descriptionForeground); margin-bottom: 8px; }
 #controls { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-#search { flex: 1; padding: 6px; box-sizing: border-box; }
+/* Search input styled like a native VS Code input: dark background, subtle
+   border, and a focus ring that matches the theme. */
+#search {
+  flex: 1;
+  box-sizing: border-box;
+  padding: 4px 8px;
+  color: var(--vscode-input-foreground);
+  background-color: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: 2px;
+  outline: none;
+}
+#search::placeholder {
+  color: var(--vscode-input-placeholderForeground);
+}
+#search:hover {
+  border-color: var(--vscode-input-border, var(--vscode-focusBorder));
+}
+#search:focus {
+  border-color: var(--vscode-focusBorder);
+}
 .toggle { display: flex; align-items: center; gap: 4px; color: var(--vscode-descriptionForeground); font-size: 0.9em; white-space: nowrap; }
 #layout { display: flex; gap: 12px; height: calc(100vh - 120px); width: 100%; }
 #rows { flex: 3; overflow-y: auto; position: relative; min-width: 0; }
@@ -130,7 +150,8 @@ body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); 
 .tbl-header {
   display: grid;
   grid-template-columns:
-    var(--graph-w, auto) minmax(0,1fr) auto auto auto;
+    var(--graph-w, auto) var(--content-w, minmax(0,1fr))
+    var(--date-w, auto) var(--author-w, auto) var(--commit-w, auto);
   width: 100%;
   position: sticky;
   top: 0;
@@ -143,6 +164,7 @@ body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); 
   color: var(--vscode-descriptionForeground);
   padding: 6px 8px;
   white-space: nowrap;
+  text-align: left;
 }
 .tbl-header .th.date, .tbl-header .th.author, .tbl-header .th.commit {
   min-width: 90px;
@@ -161,7 +183,8 @@ body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); 
 .row {
   display: grid;
   grid-template-columns:
-    var(--graph-w, auto) minmax(0,1fr) auto auto auto;
+    var(--graph-w, auto) var(--content-w, minmax(0,1fr))
+    var(--date-w, auto) var(--author-w, auto) var(--commit-w, auto);
   width: 100%;
   align-items: center;
   cursor: pointer;
@@ -172,11 +195,15 @@ body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); 
 .row-tool { opacity: 0.3; }
 .row-dim { opacity: 0.7; }
 .graph-cell { line-height: 0; overflow: hidden; }
-.text-cell { padding-left: 8px; overflow: hidden; }
+.text-cell { padding-left: 8px; overflow: hidden; text-align: left; }
+/* Agent-authored text is offset with extra left padding so it reads as a
+   distinct voice from human/system rows. */
+.row-agent .text-cell { padding-left: 32px; }
 .date-cell, .author-cell, .commit-cell {
   padding-left: 8px;
   color: var(--vscode-descriptionForeground);
   font-size: 0.85em;
+  text-align: left;
 }
 .date-cell, .author-cell, .commit-cell { white-space: nowrap; }
 .row .summary {
@@ -213,26 +240,26 @@ body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); 
   stroke-width: 2;
 }
 
-/* Draggable handle on the right edge of the graph column. Positioned at the
-   graph column boundary (--graph-w), centered on it. */
-.graph-resize-handle {
+/* Draggable handle on the right edge of each resizable column. Its horizontal
+   position is set in JS (measured from the rendered header cells) because the
+   grid uses flexible/auto tracks that CSS calc() cannot resolve. */
+.col-resize-handle {
   position: absolute;
   top: 0;
   bottom: 0;
   width: 6px;
-  left: calc(var(--graph-w, auto) - 3px);
   cursor: col-resize;
   z-index: 4;
   background: transparent;
 }
-.graph-resize-handle:hover {
+.col-resize-handle:hover {
   background: var(--vscode-panel-border);
 }
-body.graph-resizing {
+body.col-resizing {
   cursor: col-resize;
   user-select: none;
 }
-body.graph-resizing .graph-resize-handle {
+body.col-resizing .col-resize-handle {
   background: var(--vscode-focusBorder);
 }
 </style>
@@ -242,6 +269,7 @@ body.graph-resizing .graph-resize-handle {
 <div id="controls">
 <input id="search" type="text" placeholder="Search history… (Enter to search)">
 <label class="toggle"><input type="checkbox" id="hideSubmodules"> Show git submodules</label>
+<label class="toggle"><input type="checkbox" id="hideSystem"> Show messages only</label>
 </div>
 <div id="layout">
 <div id="rows"></div>

@@ -6,6 +6,7 @@ outputs/
 **/*.rs.bk
 
 # VS Code extension build artifacts
+node_modules/
 extensions/vscode-editchain/node_modules/
 extensions/vscode-editchain/out/
 extensions/vscode-editchain/*.vsix
