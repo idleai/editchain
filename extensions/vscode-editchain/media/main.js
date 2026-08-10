@@ -21,7 +21,6 @@
 // @ts-ignore — vscode provides this global in webviews.
 const vscode = acquireVsCodeApi();
 
-const statusEl = document.getElementById('status');
 const rowsEl = document.getElementById('rows');
 const searchEl = document.getElementById('search');
 const detailEl = document.getElementById('detail');
@@ -45,6 +44,43 @@ let layout = null;         // { rows: [{node,lane}], edges: [{child,parent,point
 let layoutOffset = 0;      // history offset of the first layout row
 let layoutLimit = 0;       // number of rows covered by the loaded layout window
 let pendingLayoutOffset = 0; // offset requested for the in-flight layout
+
+// Persist webview state across recreations (e.g. when the user navigates to a
+// JSON editor and back). Without this, the webview is recreated from scratch on
+// every reveal and shows "Loading…" until it refetches.
+function saveState() {
+  // Cap the persisted rows to a reasonable window so we stay under VS Code's
+  // webview state size limit (setState fails silently if exceeded). Persisting
+  // the full loaded history can blow past it for large chains.
+  const MAX_SAVED_ROWS = 2000;
+  const savedRows = allRows.slice(0, MAX_SAVED_ROWS);
+  vscode.setState({
+    allRows: savedRows,
+    offset: Math.min(offset, savedRows.length),
+    total,
+    layout,
+    layoutOffset,
+    layoutLimit,
+    pendingLayoutOffset,
+  });
+  console.log('[editchain] saveState: ' + savedRows.length + ' rows');
+}
+
+function restoreState() {
+  const s = vscode.getState();
+  console.log('[editchain] restoreState: ' + (s && Array.isArray(s.allRows) ? s.allRows.length : 'none'));
+  if (s && Array.isArray(s.allRows) && s.allRows.length) {
+    allRows = s.allRows;
+    offset = s.offset || 0;
+    total = s.total || 0;
+    layout = s.layout || null;
+    layoutOffset = s.layoutOffset || 0;
+    layoutLimit = s.layoutLimit || 0;
+    pendingLayoutOffset = s.pendingLayoutOffset || 0;
+    return true;
+  }
+  return false;
+}
 
 // Branch colours for graph lanes (indexed by lane).
 const COLORS = ['#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4', '#46f0f0', '#f032e6', '#bcf60c', '#fabebe'];
@@ -385,16 +421,14 @@ function resetHistory() {
   loadMore();
 }
 
-/** Inspect a node's details. */
+/** Inspect a node's details — opens a read-only JSON editor in VS Code. */
 function inspect(row) {
   console.log('[editchain] inspect', row && row.node_key);
-  // Show the detail pane and populate it with the node's details.
-  layoutEl.classList.add('has-detail');
-  detailEl.innerHTML = '<div class="detail-title">Loading…</div>';
+  // Ask the extension host to open a read-only JSON editor for this node.
   if (row.git_oid) {
-    send({ ResolveObject: { repository: row.repository, oid: row.git_oid } });
+    vscode.postMessage({ type: 'openJson', git_oid: row.git_oid, repository: row.repository });
   } else if (row.op_id) {
-    send({ GetNodeDetails: { op_id: row.op_id } });
+    vscode.postMessage({ type: 'openJson', op_id: row.op_id });
   }
 }
 
@@ -438,17 +472,55 @@ window.addEventListener('message', (event) => {
 
   if (msg.id === 'open') {
     if (r.ok) {
-      statusEl.textContent = `Open: ${r.value.nodes} nodes, ${r.value.repos} repos`;
-      allRows = [];
-      offset = 0;
-      total = r.value.nodes;
-      loadMore();
-      requestLayout();
+      vscode.postMessage({ type: 'log', text: `open: ${r.value.nodes} nodes, ${r.value.repos} repos` });
+      // Restore previously cached rows if this webview was recreated (e.g. after
+      // navigating to a JSON editor and back), so history renders immediately
+      // instead of showing "Loading…" until a refetch.
+      if (!restoreState()) {
+        allRows = [];
+        offset = 0;
+        total = r.value.nodes;
+        loadMore();
+        requestLayout();
+      } else {
+        // The webview was just recreated; its viewport height (`100vh`) and DOM
+        // layout are not settled yet. Render synchronously first (the data is
+        // already in memory), then re-render on a timer so columns and rows get
+        // settled dimensions. A timer is used instead of requestAnimationFrame
+        // because rAF may not fire until the webview is painted/visible, which
+        // would leave the view blank until the user interacts.
+        console.log('[editchain] restore: ' + allRows.length + ' rows, layout=' + (layout ? layout.rows.length : 0));
+        renderRows();
+        ensureFilled();
+        setTimeout(() => {
+          renderRows();
+          ensureFilled();
+        }, 100);
+      }
       // Start the background progressive loader so history buffers ahead of the
       // scroll position without waiting for scroll events.
       startProgressiveLoader();
     } else {
-      statusEl.textContent = `Error: ${r.error}`;
+      vscode.postMessage({ type: 'log', text: `open error: ${r.error}` });
+    }
+    return;
+  }
+
+  // The panel was revealed again (e.g. after navigating to a JSON editor and
+  // back). The webview's JS context is reset when hidden (allRows=0), so restore
+  // the persisted state from vscode.setState before rendering. A short delay
+  // lets the webview finish transitioning from hidden to visible so it has real
+  // dimensions to measure.
+  if (msg.id === 'reveal') {
+    // The webview's JS context is reset when hidden (allRows=0), so restore the
+    // persisted state from vscode.setState before rendering.
+    const restored = restoreState();
+    vscode.postMessage({ type: 'log', text: 'reveal: restored=' + restored + ' allRows=' + allRows.length + ' layout=' + (layout ? layout.rows.length : 0) });
+    if (allRows.length) {
+      setTimeout(() => {
+        renderRows();
+        ensureFilled();
+      }, 50);
     }
     return;
   }
@@ -469,6 +541,7 @@ window.addEventListener('message', (event) => {
     layoutOffset = pendingLayoutOffset;
     layoutLimit = layout.rows.length;
     renderRows();
+    saveState();
     return;
   }
 
@@ -481,7 +554,9 @@ window.addEventListener('message', (event) => {
     offset += r.value.rows.length;
     pending = false;
     renderRows();
-    statusEl.textContent = `${allRows.length}/${total} nodes`;
+    vscode.postMessage({ type: 'log', text: `loaded ${allRows.length}/${total} nodes` });
+    // Persist the loaded rows so a recreated webview can restore them.
+    saveState();
     // Recompute the layout to cover the newly loaded rows so lines extend.
     requestLayout();
     // Keep loading until the content fills the viewport so scrolling works.
