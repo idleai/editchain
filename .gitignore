@@ -13,7 +13,10 @@ extensions/vscode-editchain/*.vsix
 
 # Editor / IDE
 #.vscode/
-.claude/
+.claude/*
+# Allow checking in local Claude skills (everything else under .claude stays ignored).
+!.claude/skills/
+!.claude/skills/**
 .idea/
 *.swp
 *.swo

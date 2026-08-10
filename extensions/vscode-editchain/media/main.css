@@ -1,0 +1,184 @@
+/* EditChain History webview stylesheet.
+ *
+ * Shared by two hosts:
+ *   - VS Code webview (linked via webview.asWebviewUri in extension.ts)
+ *   - the standalone Puppeteer harness (test/harness/index.html)
+ *
+ * Theme variables come from VS Code's --vscode-* custom properties. The harness
+ * injects equivalent tokens so both hosts render identically.
+ */
+
+body {
+  font-family: var(--vscode-font-family);
+  color: var(--vscode-foreground);
+  /* Reset the default browser body margin (8px) which would otherwise add a
+     gap at the bottom of the viewport. */
+  margin: 0;
+  /* Top padding only — no horizontal or bottom padding, so the grid fills the
+     full width and flush to the bottom of the viewport. */
+  padding: 12px 0 0;
+  box-sizing: border-box;
+  /* Column layout so #layout can fill the remaining viewport height exactly,
+     instead of guessing with a hardcoded calc() subtraction that leaves a
+     bottom margin. */
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+#controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  /* Horizontal padding lives on the controls container (searchbar + toggles),
+     not on the body, so the grid below spans edge-to-edge. */
+  padding: 0 12px;
+}
+/* Search input styled like a native VS Code input: dark background, subtle
+   border, and a focus ring that matches the theme. */
+#search {
+  flex: 1;
+  box-sizing: border-box;
+  padding: 4px 8px;
+  color: var(--vscode-input-foreground);
+  background-color: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: 2px;
+  outline: none;
+}
+#search::placeholder {
+  color: var(--vscode-input-placeholderForeground);
+}
+#search:hover {
+  border-color: var(--vscode-input-border, var(--vscode-focusBorder));
+}
+#search:focus {
+  border-color: var(--vscode-focusBorder);
+}
+.toggle { display: flex; align-items: center; gap: 4px; color: var(--vscode-descriptionForeground); font-size: 0.9em; white-space: nowrap; }
+#layout { display: flex; gap: 12px; flex: 1; min-height: 0; width: 100%; }
+#rows { flex: 3; overflow-y: auto; position: relative; min-width: 0; }
+/* Detail/inspector pane is hidden until a node is selected, so it doesn't
+   consume fixed width when empty. */
+#detail { flex: 1; overflow-y: auto; border-left: 1px solid var(--vscode-panel-border); padding-left: 12px; min-width: 0; display: none; }
+#layout.has-detail #detail { display: block; }
+
+/* Table wrapper holds the header, rows, and the absolutely-positioned SVG. */
+.table-wrap { position: relative; width: 100%; }
+
+/* Sticky header row (Graph | Content | Date | Author | Commit/ID). */
+.tbl-header {
+  display: grid;
+  grid-template-columns:
+    var(--graph-w, auto) var(--content-w, minmax(0,1fr))
+    var(--date-w, auto) var(--author-w, auto) var(--commit-w, auto);
+  width: 100%;
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--vscode-editor-background);
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+.tbl-header .th {
+  font-weight: 700;
+  color: var(--vscode-descriptionForeground);
+  padding: 6px 8px;
+  white-space: nowrap;
+  text-align: left;
+}
+.tbl-header .th.date, .tbl-header .th.author, .tbl-header .th.commit {
+  min-width: 90px;
+}
+
+/* Block separator spans all columns. */
+.block-sep {
+  font-weight: 700;
+  color: var(--vscode-descriptionForeground);
+  opacity: 0.3;
+  padding: 8px 4px 4px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+/* Each history row is a grid with the same column template as the header. */
+.row {
+  display: grid;
+  grid-template-columns:
+    var(--graph-w, auto) var(--content-w, minmax(0,1fr))
+    var(--date-w, auto) var(--author-w, auto) var(--commit-w, auto);
+  width: 100%;
+  align-items: center;
+  cursor: pointer;
+}
+.row:hover { background-color: var(--vscode-list-hoverBackground); }
+/* Row-level opacity by node kind: tool calls dimmed most, other non-text nodes
+   dimmed moderately, text nodes (messages/commands) stay full. */
+.row-tool { opacity: 0.3; }
+.row-dim { opacity: 0.7; }
+.graph-cell { line-height: 0; overflow: hidden; }
+.text-cell { padding-left: 8px; overflow: hidden; text-align: left; }
+/* Agent-authored text is offset with extra left padding so it reads as a
+   distinct voice from human/system rows. */
+.row-agent .text-cell { padding-left: 32px; }
+.date-cell, .author-cell, .commit-cell {
+  padding-left: 8px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.85em;
+  text-align: left;
+}
+.date-cell, .author-cell, .commit-cell { white-space: nowrap; }
+.row .summary {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The single graph SVG overlay, positioned over the table-wrap. */
+#graphOverlay {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+#graphOverlay circle.graphDot {
+  /* Dots are decorative; never intercept clicks so they always reach rows below.
+     Hover tooltips are not implemented yet anyway. */
+  pointer-events: none;
+  stroke: var(--vscode-editor-background);
+  stroke-width: 1;
+}
+#graphOverlay path.graphShadow {
+  fill: none;
+  stroke: var(--vscode-editor-background);
+  stroke-width: 4;
+  stroke-opacity: 0.75;
+}
+#graphOverlay path.graphLine {
+  fill: none;
+  stroke: #d0d0d0; /* light grey — visible on dark backgrounds */
+  stroke-width: 2;
+}
+
+/* Draggable handle on the right edge of each resizable column. Its horizontal
+   position is set in JS (measured from the rendered header cells) because the
+   grid uses flexible/auto tracks that CSS calc() cannot resolve. */
+.col-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 4;
+  background: transparent;
+}
+.col-resize-handle:hover {
+  background: var(--vscode-panel-border);
+}
+body.col-resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+body.col-resizing .col-resize-handle {
+  background: var(--vscode-focusBorder);
+}

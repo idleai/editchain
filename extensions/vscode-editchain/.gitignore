@@ -1,0 +1,7 @@
+# Harness output (textual layout dumps)
+.ui-out/
+
+# WebdriverIO real-VS-Code harness
+# Downloaded VS Code + Chromedriver binaries (1GB+) and test trace output.
+.wdio-vscode-service/
+trace/

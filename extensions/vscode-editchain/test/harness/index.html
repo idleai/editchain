@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EditChain History — Harness</title>
+<!-- Same stylesheet the VS Code webview uses (media/main.css). -->
+<link rel="stylesheet" href="../../media/main.css">
+<style>
+  /* Harness-only chrome: a status bar so the agent can see scenario/state.
+     This is NOT part of the production webview. */
+  #harness-status {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 22px;
+    background: #1e1e1e;
+    color: #9cdcfe;
+    font: 11px/22px monospace;
+    padding: 0 8px;
+    z-index: 100;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+</style>
+</head>
+<body>
+<div id="controls">
+<input id="search" type="text" placeholder="Search history… (Enter to search)">
+<label class="toggle"><input type="checkbox" id="hideSubmodules"> Show git submodules</label>
+<label class="toggle"><input type="checkbox" id="hideSystem"> Show messages only</label>
+</div>
+<div id="layout">
+<div id="rows"></div>
+<div id="detail"></div>
+</div>
+
+<!-- Theme tokens the VS Code webview normally gets from the workbench. -->
+<script>
+  (function () {
+    var root = document.documentElement;
+    root.style.setProperty('--vscode-font-family', 'system-ui, sans-serif');
+    root.style.setProperty('--vscode-foreground', '#cccccc');
+    root.style.setProperty('--vscode-editor-background', '#1e1e1e');
+    root.style.setProperty('--vscode-input-background', '#3c3c3c');
+    root.style.setProperty('--vscode-input-foreground', '#cccccc');
+    root.style.setProperty('--vscode-input-border', '#3c3c3c');
+    root.style.setProperty('--vscode-input-placeholderForeground', '#a0a0a0');
+    root.style.setProperty('--vscode-focusBorder', '#007fd4');
+    root.style.setProperty('--vscode-descriptionForeground', '#9d9d9d');
+    root.style.setProperty('--vscode-panel-border', '#2b2b2b');
+    root.style.setProperty('--vscode-list-hoverBackground', '#2a2d2e');
+  })();
+</script>
+
+<!-- Harness scaffolding: fixtures + fixture bridge (defines window.vscode).
+     In service mode (?bridge=service) the service bridge is loaded instead,
+     which drives the real Rust service. -->
+<script src="./fixtures.js"></script>
+<script>
+  // Choose bridge before main.js runs so the renderer captures the right one.
+  var bridge = new URLSearchParams(location.search).get('bridge') || 'fixture';
+  document.write('<script src="./' + bridge + 'Bridge.js"><\/script>');
+</script>
+
+<!-- The REAL production renderer. It calls acquireVsCodeApi() and renders into
+     #rows/#detail exactly as it does inside VS Code. -->
+<script src="../../media/main.js"></script>
+
+<!-- Text-only layout probe (harness-only). -->
+<script src="./layoutProbe.js"></script>
+
+<div id="harness-status">EditChain harness — idle</div>
+</body>
+</html>
