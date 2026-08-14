@@ -163,10 +163,13 @@
       let start = null, end = null;
       try { start = p.getPointAtLength(0); } catch (e) {}
       try { end = p.getPointAtLength(len); } catch (e) {}
+      // Observed stroke colour from the computed style (CSS may theme it).
+      const stroke = getComputedStyle(p).stroke;
       out.edges.push({
         len: Math.round(len * 100) / 100,
         start: start ? { x: Math.round(start.x), y: Math.round(start.y) } : null,
         end: end ? { x: Math.round(end.x), y: Math.round(end.y) } : null,
+        stroke,
       });
     }
     return out;
@@ -233,20 +236,24 @@
       });
     }
 
-    // Check 3: every row has a matching graph dot centered on its lane.
+    // Check 3: every rendered row has a matching graph dot centered on its lane.
+    // Rows carry an ABSOLUTE `data-row` index (the viewport renders a slice of
+    // the full history), so we match dots by that absolute index rather than by
+    // contiguous position.
     if (wrapEl) {
       const rowEls = wrapEl.querySelectorAll('.row');
       let dotsOk = true;
       let firstFail = null;
-      rowEls.forEach((row, i) => {
-        const dot = wrapEl.querySelector('#graphOverlay circle.graphDot[data-row="' + i + '"]');
-        if (!dot) { dotsOk = false; firstFail = firstFail || { rowIdx:i, reason:'no dot' }; return; }
+      rowEls.forEach((row) => {
+        const absIdx = row.getAttribute('data-row');
+        const dot = wrapEl.querySelector('#graphOverlay circle.graphDot[data-row="' + absIdx + '"]');
+        if (!dot) { dotsOk = false; firstFail = firstFail || { rowIdx:absIdx, reason:'no dot' }; return; }
         const rowBox = row.getBoundingClientRect();
         const wrapBox = wrapEl.getBoundingClientRect();
         const dotCy = +dot.getAttribute('cy') + wrapBox.top; // dot cy is relative to svg/wrap
         const rowCenterY = rowBox.top + rowBox.height / 2;
         const deltaY = Math.abs(dotCy - rowCenterY);
-        if (deltaY > 1.5) { dotsOk = false; firstFail = firstFail || { rowIdx:i, deltaY }; }
+        if (deltaY > 1.5) { dotsOk = false; firstFail = firstFail || { rowIdx:absIdx, deltaY }; }
       });
       checks.push({
         name:'DOT_ROW_ALIGNMENT',

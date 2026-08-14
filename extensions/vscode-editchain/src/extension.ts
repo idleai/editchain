@@ -8,6 +8,8 @@ let clientStarted = false;
 let historyPanel: vscode.WebviewPanel | undefined = undefined;
 // Output channel for debugging the service bridge and panel lifecycle.
 let output: vscode.OutputChannel | undefined = undefined;
+// Status bar item showing how many history nodes are loaded vs total.
+let statusItem: vscode.StatusBarItem | undefined = undefined;
 
 /**
  * Activate the EditChain History extension.
@@ -37,6 +39,29 @@ export function activate(context: vscode.ExtensionContext): void {
     openHistoryView(context, client, jsonProvider);
   });
   context.subscriptions.push(openCommand);
+
+  // Status bar item for the loaded/total node count. Created once and shown only
+  // while the history viewer is open; hidden when the panel closes.
+  statusItem = vscode.window.createStatusBarItem(
+    vscode.StatusBarAlignment.Left,
+    100
+  );
+  statusItem.command = 'editchain-history.open';
+  statusItem.tooltip = 'EditChain History — loaded / total nodes';
+  context.subscriptions.push(statusItem);
+}
+
+/**
+ * Update the status bar with the current loaded/total node counts.
+ *
+ * Called from the webview whenever rows load or the total changes. The item is
+ * shown only while the history viewer is open; it is hidden when the panel
+ * closes so it doesn't linger after the viewer is gone.
+ */
+function updateStatusBar(loaded: number, total: number): void {
+  if (!statusItem) return;
+  statusItem.text = `$(list-ordered) ${loaded} / ${total} nodes`;
+  statusItem.show();
 }
 
 /**
@@ -73,6 +98,8 @@ function openHistoryView(
     if (historyPanel === panel) {
       historyPanel = undefined;
     }
+    // Hide the status bar item once the viewer is gone.
+    statusItem?.hide();
   });
 
   // When the panel becomes visible again (e.g. after navigating to a JSON
@@ -104,6 +131,12 @@ function openHistoryView(
     }
     if (msg.type === 'log') {
       output?.appendLine('[webview] ' + msg.text);
+      return;
+    }
+    // The webview reports its loaded/total node counts; surface them in the
+    // status bar.
+    if (msg.type === 'status') {
+      updateStatusBar(msg.loaded, msg.total);
       return;
     }
     try {
@@ -267,6 +300,8 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 <body>
 <div id="controls">
 <input id="search" type="text" placeholder="Search history… (Enter to search)">
+<input id="filter" type="text" placeholder="Filter chain… (regex, Enter to apply)">
+<label class="toggle"><input type="checkbox" id="hideUndated"> Hide undated</label>
 <label class="toggle"><input type="checkbox" id="hideSubmodules"> Show git submodules</label>
 <label class="toggle"><input type="checkbox" id="hideSystem"> Show messages only</label>
 </div>

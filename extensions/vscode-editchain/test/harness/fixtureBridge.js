@@ -17,6 +17,19 @@
 
   // --- request dispatch ------------------------------------------------------
 
+  // Apply a chain filter to a row list (mirrors the service's server-side
+  // filtering for the harness). Returns { rows, hiddenKeys }.
+  function applyFilter(rows, filter) {
+    if (!filter) return { rows, hiddenKeys: new Set() };
+    const hiddenKeys = new Set();
+    const kept = rows.filter((r) => {
+      if (filter.hide_undated && !r.timestamp_ms) return false;
+      if (filter.summary_pattern && !String(r.summary || '').includes(filter.summary_pattern)) return false;
+      return true;
+    });
+    return { rows: kept, hiddenKeys };
+  }
+
   // Slice a full dataset into a GetWindow response.
   function windowResponse(fixture, req) {
     const offset = req.offset || 0;
@@ -24,6 +37,8 @@
     const hideSub = !!req.hide_submodules;
     let rows = fixture.rows || [];
     if (hideSub) rows = rows.filter((r) => !r.is_submodule);
+    const filtered = applyFilter(rows, req.filter);
+    rows = filtered.rows;
     const total = fixture.total !== undefined && fixture.total >= 0
       ? fixture.total
       : rows.length;
@@ -41,6 +56,11 @@
         fixture.rows.filter((r) => r.is_submodule).map((r) => r.node_key)
       );
       rows = rows.filter((r) => !hidden.has(r.node));
+    }
+    if (req.filter && fixture.rows) {
+      const filtered = applyFilter(fixture.rows, req.filter);
+      const hiddenKeys = filtered.hiddenKeys;
+      rows = rows.filter((r) => !hiddenKeys.has(r.node));
     }
     const rowSlice = rows.slice(offset, offset + limit);
     // Edges whose child falls inside [offset, offset+limit).

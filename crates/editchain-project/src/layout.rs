@@ -192,8 +192,9 @@ pub struct GraphLayout {
 pub fn compute_graph_layout(
     nodes: &[String],
     parents_of: impl Fn(&str) -> Vec<String>,
+    is_git: &impl Fn(&str) -> bool,
 ) -> GraphLayout {
-    let ctx = LayoutContext::new(nodes, &parents_of);
+    let ctx = LayoutContext::new(nodes, &parents_of, is_git);
     let edges = ctx.edges_for_window(0, nodes.len());
     GraphLayout {
         rows: ctx.lanes,
@@ -243,13 +244,20 @@ pub struct LayoutContext {
 impl LayoutContext {
     /// Build a context from a node list and a parents closure.
     #[must_use]
-    pub fn new(nodes: &[String], parents_of: &impl Fn(&str) -> Vec<String>) -> Self {
+    pub fn new(
+        nodes: &[String],
+        parents_of: &impl Fn(&str) -> Vec<String>,
+        is_git: &impl Fn(&str) -> bool,
+    ) -> Self {
         // Compute lanes from a TOPOLOGICAL ordering of the nodes (parents before
         // children), so each causal chain gets contiguous lanes regardless of the
         // row order. This decouples lane assignment from time-sorting: time-sort
         // only changes which row a node occupies, never its lane.
-        let topo = topological_order(nodes, parents_of);
-        let lane_of = compute_lane_map(&topo, parents_of);
+        // Assign lanes with freed-lane reuse so disconnected sequential chains
+        // (e.g. separate sessions) share columns instead of each claiming a
+        // permanent fresh lane. `nodes` are newest-first, which is the display
+        // order the reuse algorithm needs to detect non-overlapping intervals.
+        let lane_of = compute_lane_map_reuse(nodes, parents_of, is_git);
         // Per-row lanes in the given (possibly time-sorted) node order.
         let lanes: Vec<GraphRow> = nodes
             .iter()
@@ -367,6 +375,7 @@ impl LayoutContext {
 pub fn compute_lane_assignment(
     nodes: &[String],
     parents_of: &impl Fn(&str) -> Vec<String>,
+    is_git: &impl Fn(&str) -> bool,
 ) -> Vec<GraphRow> {
     // Map each node key to its assigned lane.
     let mut lane_of: HashMap<String, usize> = HashMap::new();
@@ -400,6 +409,19 @@ pub fn compute_lane_assignment(
                     active.push(Some(parent.clone()));
                 }
                 let _ = lane_of.insert(parent.clone(), pl);
+            }
+        }
+    }
+
+    // Git-leftmost post-pass: if any git node exists, shift every non-git lane
+    // up by 1 and pin git nodes to lane 0. This keeps git commits on the
+    // leftmost column regardless of the base assignment.
+    if nodes.iter().any(|k| is_git(k)) {
+        for (key, l) in &mut lane_of {
+            if is_git(key) {
+                *l = 0;
+            } else {
+                *l = l.saturating_add(1);
             }
         }
     }
@@ -576,4 +598,209 @@ fn find_spare_lane_str(active: &[Option<String>]) -> usize {
         return i;
     }
     active.len()
+}
+
+// ---------------------------------------------------------------------------
+// Lane reuse across disconnected chains
+// ---------------------------------------------------------------------------
+
+/// Compute a node-key → lane map with **freed-lane reuse** across disconnected
+/// chains.
+///
+/// Unlike [`compute_lane_map`], which gives every root node its own permanent
+/// fresh lane, this assigns lanes so two disconnected chains whose display-row
+/// ranges do *not* overlap share one base lane instead of consuming separate
+/// permanent ones. This keeps long histories readable when many sequential,
+/// non-overlapping sessions would otherwise each claim their own column.
+///
+/// The approach treats each connected component of the graph as an *interval*
+/// over display rows (`nodes` are newest-first; row 0 is newest). Components are
+/// greedily colored by interval so overlapping components get distinct base
+/// colors while non-overlapping ones may share — this is exactly git-log-style
+/// column packing and yields minimal base columns for sequential sessions.
+/// Within each component the existing branch logic runs unchanged relative to
+/// that base color (`compute_lane_map` semantics), so merges still span extra
+/// lanes above their base column.
+///
+/// Because same-color components have disjoint row intervals by construction,
+/// their internal branch activity never temporally overlaps another same-color
+/// component's region — reused columns never carry crossing edges.
+#[must_use]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::let_underscore_untyped,
+    reason = "Lane indices are bounds-checked against the active vector length"
+)]
+fn compute_lane_map_reuse(
+    nodes_newest_first: &[String],
+    parents_of: &impl Fn(&str) -> Vec<String>,
+    is_git: &impl Fn(&str) -> bool,
+) -> HashMap<String, usize> {
+    use std::collections::{HashSet, VecDeque};
+
+    // --- Phase 0/1: connected components over undirected edges ------------------
+    // Build undirected adjacency so we can flood-fill components regardless of
+    // edge direction.
+    let mut adj_undirected: HashMap<String, Vec<String>> = HashMap::new();
+    for key in nodes_newest_first {
+        let _: &mut Vec<String> = adj_undirected.entry(key.clone()).or_default();
+        for parent in parents_of(key) {
+            let _: &mut Vec<String> = adj_undirected.entry(parent.clone()).or_default();
+            if let Some(neighbors) = adj_undirected.get_mut(&parent) {
+                neighbors.push(key.clone());
+            }
+            let _: &mut Vec<String> = adj_undirected.entry(key.clone()).or_default();
+            if let Some(neighbors) = adj_undirected.get_mut(key) {
+                neighbors.push(parent.clone());
+            }
+        }
+    }
+
+    // Row index per key within `nodes_newest_first`.
+    let mut row_of_key: HashMap<String, usize> = HashMap::with_capacity(nodes_newest_first.len());
+    for (i, k) in nodes_newest_first.iter().enumerate() {
+        let _ = row_of_key.insert(k.clone(), i);
+    }
+
+    // Flood-fill components; record each component's [start,end] row span where
+    // start = smallest row index (= newest member), end = largest (= oldest).
+    // Also record whether each component contains any git node, so git commits
+    // can be pinned to the leftmost lane (0).
+    let mut comp_id_of_key: HashMap<String, usize> = HashMap::new();
+    let mut comp_start_end: Vec<(usize, usize)> = Vec::new(); // per comp id -> span
+    let mut comp_is_git: Vec<bool> = Vec::new(); // per comp id -> contains a git node
+    let mut seen_keys: HashSet<String> = HashSet::with_capacity(nodes_newest_first.len());
+    for seed in nodes_newest_first {
+        if seen_keys.contains(seed) {
+            continue;
+        }
+        let _: bool = seen_keys.insert(seed.clone());
+        let mut queue_local: VecDeque<String> = VecDeque::from([seed.clone()]);
+        let mut members_start_end = (
+            *row_of_key.get(seed).unwrap_or(&usize::MAX),
+            *row_of_key.get(seed).unwrap_or(&usize::MAX),
+        );
+        let mut any_git = is_git(seed);
+        while let Some(k) = queue_local.pop_front() {
+            members_start_end = fold_span(
+                members_start_end,
+                *row_of_key.get(&k).unwrap_or(&usize::MAX),
+            );
+            if is_git(&k) {
+                any_git = true;
+            }
+            let _ = comp_id_of_key.insert(k.clone(), comp_start_end.len());
+            if let Some(neighbors) = adj_undirected.get(&k) {
+                for nbr in neighbors {
+                    if !seen_keys.contains(nbr) {
+                        let _: bool = seen_keys.insert(nbr.clone());
+                        queue_local.push_back(nbr.clone());
+                    }
+                }
+            }
+        }
+        comp_start_end.push(members_start_end);
+        comp_is_git.push(any_git);
+    }
+
+    // --- Phase 2/3: greedy interval coloring --------------------------------------
+    // Sort component ids by start row ascending so non-overlapping intervals get
+    // colored greedily; release colors when an interval ends so later disjoint
+    // intervals can reuse them.
+    //
+    // Git components are pinned to lane 0 (the leftmost column) so git commits
+    // always render on the far-left lane. Op components are colored greedily but
+    // offset by +1 (when git is present) so they never collide with the git lane.
+    let git_present = comp_is_git.iter().any(|&g| g);
+    let mut comp_ids_sorted_by_start: Vec<usize> = comp_start_end
+        .iter()
+        .enumerate()
+        .map(|(id, _)| id)
+        .collect();
+    comp_ids_sorted_by_start.sort_by_key(|&id| comp_start_end[id]);
+
+    // Per-color list of currently-open component ids ending latest; used to know
+    // when a color becomes reusable again. Index 0 is reserved for git when any
+    // git component exists.
+    let mut color_open_end_max: Vec<usize> = Vec::new(); // color -> max end among open comps
+    let mut comp_color_by_id: Vec<usize> = vec![usize::MAX; comp_start_end.len()]; // comp id -> base color/lane
+
+    for &cid in &comp_ids_sorted_by_start {
+        let start = comp_start_end[cid].0;
+        let end = comp_start_end[cid].1;
+        if comp_is_git[cid] {
+            // Git components always occupy lane 0 (leftmost). They are disjoint
+            // in time (a git chain), so they share the column.
+            if color_open_end_max.is_empty() {
+                color_open_end_max.push(end);
+            }
+            comp_color_by_id[cid] = 0;
+            color_open_end_max[0] = color_open_end_max[0].max(end);
+            continue;
+        }
+        // Op components: find a reusable column. When git is present, skip lane
+        // 0 (reserved for git); otherwise start from lane 0 as before.
+        let skip = usize::from(git_present);
+        let mut chosen_color = None;
+        for (c, &open_end) in color_open_end_max.iter().enumerate().skip(skip) {
+            if open_end < start {
+                chosen_color = Some(c);
+                break;
+            }
+        }
+        let color = chosen_color.unwrap_or_else(|| {
+            // New column: its open interval ends at this component's end.
+            color_open_end_max.push(end);
+            color_open_end_max.len().saturating_sub(1)
+        });
+        comp_color_by_id[cid] = color;
+        // Track the latest end among components currently open on this column.
+        color_open_end_max[color] = color_open_end_max[color].max(end);
+    }
+
+    // --- Phase 4: assign lanes within each component -----------------------------
+    // Run the existing branch-aware lane assignment per component, offset by the
+    // component's base color so different components never collide on a column.
+    // We reuse `compute_lane_map` on the component's own topological order, then
+    // shift every lane by `base`.
+    let mut lane_of: HashMap<String, usize> = HashMap::with_capacity(nodes_newest_first.len());
+    for (cid, &base) in comp_color_by_id.iter().enumerate() {
+        // Collect this component's members.
+        let members: Vec<String> = comp_id_of_key
+            .iter()
+            .filter(|&(_, &c)| c == cid)
+            .map(|(k, _)| k.clone())
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        // Topological order of just this component (parents before children).
+        let topo = topological_order(&members, parents_of);
+        let local = compute_lane_map(&topo, parents_of);
+        for (key, l) in local {
+            let _ = lane_of.insert(key, base.saturating_add(l));
+        }
+    }
+
+    // Git-leftmost global remap: force every git node onto lane 0 and shift all
+    // op lanes up by 1. This guarantees git commits always render on the
+    // leftmost column, even inside mixed components (git linked to ops). Ops
+    // shift uniformly so their relative lane reuse is preserved; no collision
+    // occurs because ops move off lane 0 while git takes it.
+    if git_present {
+        for (key, l) in &mut lane_of {
+            if is_git(key) {
+                *l = 0;
+            } else {
+                *l = l.saturating_add(1);
+            }
+        }
+    }
+
+    lane_of
+}
+
+/// Fold a row index into a running `(min, max)` span.
+fn fold_span(span: (usize, usize), row: usize) -> (usize, usize) {
+    (span.0.min(row), span.1.max(row))
 }

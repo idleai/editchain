@@ -117,6 +117,49 @@ impl core::fmt::Display for GitOid {
     }
 }
 
+impl GitOid {
+    /// Parse a `GitOid` from its lowercase hex representation.
+    ///
+    /// Accepts 40 hex chars (SHA-1) or 64 hex chars (SHA-256). Returns `None`
+    /// for any other length or a non-hex character.
+    #[must_use]
+    #[expect(
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        reason = "Byte index is bounded by the validated hex length; nibble math on u8 is safe"
+    )]
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        let bytes = hex.as_bytes();
+        let format = match bytes.len() {
+            40 => GitObjectFormat::Sha1,
+            64 => GitObjectFormat::Sha256,
+            _ => return None,
+        };
+        let mut out = [0u8; 32];
+        for i in 0..bytes.len() / 2 {
+            let hi = hex_nibble(bytes[i * 2])?;
+            let lo = hex_nibble(bytes[i * 2 + 1])?;
+            out[i] = (hi << 4) | lo;
+        }
+        Some(Self { format, bytes: out })
+    }
+}
+
+/// Decode a single ASCII hex nibble into its 0–15 value.
+#[must_use]
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "Nibble arithmetic on validated ASCII hex digits is bounded to 0..=15"
+)]
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// A Git author or committer signature.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitSignature {

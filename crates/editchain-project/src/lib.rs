@@ -5,6 +5,11 @@
 //! intentionally free of filesystem and process dependencies so it can later
 //! target WASM.
 
+// Crate-level dependency marker (used by Cargo for feature resolution).
+use regex as _;
+
+/// General chain filtering with truncation.
+pub mod filter;
 /// Deterministic lane layout for graph rendering.
 pub mod layout;
 /// History linking — stitch sessions and git into a single edit chain.
@@ -12,7 +17,9 @@ pub mod link;
 
 use std::collections::HashMap;
 
-use editchain_core::{GitCommitEntity, GitOid, GitProjection, Op, OpId, Payload, RepositoryId};
+use editchain_core::{
+    Clock, GitCommitEntity, GitOid, GitProjection, Op, OpId, Payload, RepositoryId,
+};
 
 use crate::layout::{compute_graph_layout, compute_lane_assignment, GraphLayout, GraphRow};
 use crate::link::link_history;
@@ -71,6 +78,24 @@ impl HistoryNode {
             Self::GitCommit(commit) => {
                 let secs = u64::try_from(commit.committed_at).unwrap_or(0);
                 secs.saturating_mul(1000)
+            }
+        }
+    }
+
+    /// Set an effective timestamp (Unix ms) on a node that lacks one.
+    ///
+    /// Used to give timestamp-less nodes the date of the first dated node that
+    /// follows them, so they interleave correctly instead of clustering at the
+    /// top of the history (which would otherwise inflate the lane count). For
+    /// ops this sets the clock; for git commits it sets `committed_at` (seconds).
+    pub fn set_effective_timestamp(&mut self, ms: u64) {
+        match self {
+            Self::EditOperation(op) | Self::CollapsedImport { op, .. } => {
+                op.clock = Clock::UnixMs(ms);
+            }
+            Self::GitCommit(commit) => {
+                let secs = i64::try_from(ms / 1000).unwrap_or(i64::MAX);
+                commit.committed_at = secs;
             }
         }
     }
@@ -152,6 +177,40 @@ impl HistoryNode {
                 keys
             }
             Self::GitCommit(commit) => commit.parents.iter().map(GitOid::to_hex).collect(),
+        }
+    }
+
+    /// Rewrite this node's causal parents to a new set of parent keys.
+    ///
+    /// Used by chain filtering to splice edges across hidden intermediate nodes.
+    /// Op parents are parsed from `"node:boot:seq"` display strings; git parents
+    /// are parsed from OID hex. Keys that fail to parse are dropped.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "ids[0]/ids[1] are guarded by the match on ids.len()"
+    )]
+    pub fn set_parent_keys(&mut self, keys: &[String]) {
+        match self {
+            Self::EditOperation(op) | Self::CollapsedImport { op, .. } => {
+                let mut ids: Vec<OpId> = keys
+                    .iter()
+                    .filter_map(|k| OpId::from_display_str(k))
+                    .collect();
+                ids.sort_unstable();
+                ids.dedup();
+                op.parents = match ids.len() {
+                    0 => editchain_core::parents::ParentSet::None,
+                    1 => editchain_core::parents::ParentSet::One(ids[0]),
+                    _ => editchain_core::parents::ParentSet::Two(ids[0], ids[1]),
+                };
+            }
+            Self::GitCommit(commit) => {
+                let mut oids: Vec<GitOid> =
+                    keys.iter().filter_map(|k| GitOid::from_hex(k)).collect();
+                oids.sort_unstable();
+                oids.dedup();
+                commit.parents = oids;
+            }
         }
     }
 
@@ -238,6 +297,18 @@ impl HistoryProjection {
     #[must_use]
     pub fn nodes(&self) -> Vec<HistoryNode> {
         self.ordered_nodes()
+    }
+
+    /// Returns history nodes (newest-first) with a [`filter::ChainFilter`] applied.
+    ///
+    /// Hidden intermediate nodes are removed and (when the filter splices) their
+    /// causal edges are reconnected to the nearest kept ancestors. The result is
+    /// in the same canonical order as [`Self::nodes`], so layout row indices stay
+    /// in lockstep with window row positions.
+    #[must_use]
+    pub fn filtered_nodes(&self, filter: &filter::ChainFilter) -> Vec<HistoryNode> {
+        let nodes = self.ordered_nodes();
+        filter::apply(&nodes, &self.git.links, filter)
     }
 
     /// Returns a window of history nodes (newest-first).
@@ -381,6 +452,34 @@ impl HistoryProjection {
         // Reverse to newest-first.
         sorted_oldest_first.reverse();
 
+        // Assign effective timestamps to nodes that lack one (timestamp_ms() == 0).
+        // Each such node gets the timestamp of the next OP in the chain that has
+        // a real date, minus a small offset (1 minute) so it sits just before
+        // that dated neighbor. This pulls undated nodes out of the "top cluster"
+        // (where they'd otherwise all sort newest and occupy lanes) and lets
+        // them interleave with dated work, so their components can reuse freed
+        // lanes instead of each claiming a fresh column.
+        //
+        // Only dated OPS are used as dating sources — git commits are skipped.
+        // Git commits can carry genuinely old dates (e.g. vendored/external repo
+        // history predating this repo), and we don't want an undated import op
+        // to inherit a pre-repo date from one.
+        //
+        // Walk newest → oldest, remembering the most recent dated op's
+        // timestamp; every undated node before it gets that date minus 1 minute.
+        let mut next_dated_ts = 0u64;
+        for node in &mut sorted_oldest_first {
+            if node.timestamp_ms() == 0 {
+                if next_dated_ts != 0 {
+                    node.set_effective_timestamp(next_dated_ts.saturating_sub(60_000));
+                }
+            } else if node.git_oid().is_none() {
+                // A dated op — use it as the dating source for undated nodes.
+                next_dated_ts = node.timestamp_ms();
+            }
+            // Git commits are skipped as dating sources.
+        }
+
         // Time-sort by default: interleave git commits and ops by timestamp so
         // newer work (whether a commit or an op) appears higher in the list.
         // This is a stable sort — nodes with equal or unknown (0) timestamps
@@ -508,7 +607,9 @@ impl HistoryProjection {
                 .get(key)
                 .map_or(Vec::new(), |n| n.parent_keys(links))
         };
-        compute_graph_layout(&keys, parents_of)
+        let is_git =
+            |key: &str| -> bool { key_to_node.get(key).is_some_and(|n| n.git_oid().is_some()) };
+        compute_graph_layout(&keys, parents_of, &is_git)
     }
 
     /// Compute the lane assignment over a pre-sorted node list (no edges).
@@ -525,7 +626,9 @@ impl HistoryProjection {
                 .get(key)
                 .map_or(Vec::new(), |n| n.parent_keys(links))
         };
-        compute_lane_assignment(&keys, &parents_of)
+        let is_git =
+            |key: &str| -> bool { key_to_node.get(key).is_some_and(|n| n.git_oid().is_some()) };
+        compute_lane_assignment(&keys, &parents_of, &is_git)
     }
 
     /// Build a cached [`layout::LayoutContext`] over a pre-sorted node list.
@@ -543,7 +646,9 @@ impl HistoryProjection {
                 .get(key)
                 .map_or(Vec::new(), |n| n.parent_keys(links))
         };
-        layout::LayoutContext::new(&keys, &parents_of)
+        let is_git =
+            |key: &str| -> bool { key_to_node.get(key).is_some_and(|n| n.git_oid().is_some()) };
+        layout::LayoutContext::new(&keys, &parents_of, &is_git)
     }
 
     /// Build the string-keyed node list for layout.

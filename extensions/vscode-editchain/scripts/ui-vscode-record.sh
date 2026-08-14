@@ -3,7 +3,11 @@
 # to an MP4 via ffmpeg's x11grab.
 #
 # Usage:
-#   ./scripts/ui-vscode-record.sh [out.mp4]
+#   ./scripts/ui-vscode-record.sh [out.mp4] [wdio-config]
+#
+#   out.mp4      output video path (default .ui-out/vscode-session.mp4)
+#   wdio-config   wdio config to run (default ./test/vscode/wdio.conf.ts).
+#                Use ./test/vscode/wdio.q6.conf.ts to validate the q6 chain.
 #
 # Requires: xvfb, ffmpeg. The wdio suite must target the same DISPLAY we start.
 
@@ -11,6 +15,7 @@ set -euo pipefail
 
 EXT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$EXT_ROOT/.ui-out/vscode-session.mp4}"
+CONFIG="${2:-./test/vscode/wdio.conf.ts}"
 DISPLAY_NUM="${DISPLAY_NUM:-99}"
 RES="${RES:-1440x900}"
 
@@ -36,9 +41,9 @@ ffmpeg -y -hide_banner -loglevel error \
 FFMPEG_PID=$!
 trap 'kill $FFMPEG_PID $XVFB_PID 2>/dev/null || true' EXIT
 
-echo "==> Running wdio suite on DISPLAY=:$DISPLAY_NUM"
+echo "==> Running wdio suite ($CONFIG) on DISPLAY=:$DISPLAY_NUM"
 cd "$EXT_ROOT"
-DISPLAY=":$DISPLAY_NUM" npx wdio run ./test/vscode/wdio.conf.ts
+DISPLAY=":$DISPLAY_NUM" npx wdio run "$CONFIG"
 
 echo "==> Stopping ffmpeg"
 sleep 1

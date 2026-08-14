@@ -2,7 +2,7 @@
 
 use editchain_core::Op;
 
-use crate::claude_code::discover::discover_sessions;
+use crate::claude_code::discover::{discover_sessions, SessionFile};
 use crate::claude_code::envelope::parse_envelope;
 use crate::claude_code::normalize::{normalize_envelope, NormalizeOptions};
 use crate::claude_code::reader::read_session_file;
@@ -10,7 +10,8 @@ use crate::cursor::check_file_generation;
 use crate::error::ImportError;
 use crate::ids::{derive_source_stream, SourcePosition};
 use crate::model::{DiscoveryRequest, ImportOptions, ImportReport};
-use crate::sink::{BlobSink, CursorStore, OpSink};
+use crate::sink::{BlobSink, CursorStore, MemoryOpSink, OpSink};
+use crate::subagent::{link_subagents, SubagentMeta};
 
 /// Import all Claude Code sessions from a directory into editchain operations.
 ///
@@ -43,6 +44,13 @@ pub fn import_claude_code(
     // Discover session files.
     let sessions = discover_sessions(&request.sessions_dir).map_err(ImportError::OpSink)?;
     report.files_discovered = sessions.len();
+
+    // Collect subagent metadata for post-import branch/reconnect linking.
+    let subagent_meta: Vec<SubagentMeta> = sessions
+        .iter()
+        .filter(|s| s.is_subagent)
+        .filter_map(subagent_meta_from)
+        .collect();
 
     let workspace_str = request.workspace_path.to_str().unwrap_or("/workspace");
 
@@ -148,5 +156,38 @@ pub fn import_claude_code(
         cursors.set_cursor(&cursor_key, &new_cursor)?;
     }
 
+    // Post-pass: link subagent sessions into their parent chains. This mutates
+    // the ops already emitted into the sink (branch/reconnect edges), so it must
+    // run after all sessions are imported. It is a no-op for in-memory sinks
+    // that expose their op vec; for streaming sinks it has no effect.
+    link_emitted_subagents(ops, &subagent_meta);
+
     Ok(report)
+}
+
+/// Convert a discovered subagent `SessionFile` into linking metadata.
+fn subagent_meta_from(session: &SessionFile) -> Option<SubagentMeta> {
+    let tool_use_id = session.tool_use_id.clone()?;
+    let parent_session_id = session.parent_session_id.clone()?;
+    Some(SubagentMeta {
+        subagent_session_id: session.session_id.clone(),
+        parent_session_id,
+        tool_use_id,
+    })
+}
+
+/// Run subagent linking over the ops already emitted into a sink.
+///
+/// The `OpSink` trait is streaming and opaque, so we can only link when the sink
+/// exposes its collected ops as a mutable slice. `MemoryOpSink` does; other sinks
+/// are left untouched (linking is best-effort and idempotent).
+fn link_emitted_subagents(ops: &mut dyn OpSink, meta: &[SubagentMeta]) {
+    // Downcast to MemoryOpSink to mutate its collected ops in place.
+    if let Some(mem) = ops
+        .as_any_mut()
+        .and_then(|o| o.downcast_mut::<MemoryOpSink>())
+    {
+        // The count of added edges is informational; linking is best-effort.
+        let _linked: usize = link_subagents(&mut mem.ops, meta);
+    }
 }

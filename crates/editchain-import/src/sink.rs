@@ -12,6 +12,15 @@ pub trait OpSink {
     ///
     /// Returns [`ImportError`] if the operation cannot be stored.
     fn accept_op(&mut self, op: &Op) -> Result<bool, ImportError>;
+
+    /// Downcast this sink to a concrete type for post-import mutation.
+    ///
+    /// Used by the import orchestrator to run subagent linking over the ops a
+    /// [`MemoryOpSink`] has collected. Returns `None` for sinks that do not
+    /// expose their op vec (linking is then skipped).
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
 }
 
 /// A sink for accepting large blob payloads.
@@ -112,6 +121,10 @@ impl OpSink for MemoryOpSink {
     fn accept_op(&mut self, op: &Op) -> Result<bool, ImportError> {
         self.ops.push(op.clone());
         Ok(true)
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 }
 

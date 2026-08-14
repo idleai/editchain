@@ -55,6 +55,27 @@ body {
 #search:focus {
   border-color: var(--vscode-focusBorder);
 }
+/* Chain-filter input styled like the search input, but fixed-width so it sits
+   between the search bar and the toggles without competing for flex space. */
+#filter {
+  box-sizing: border-box;
+  padding: 4px 8px;
+  color: var(--vscode-input-foreground);
+  background-color: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: 2px;
+  outline: none;
+  width: 180px;
+}
+#filter::placeholder {
+  color: var(--vscode-input-placeholderForeground);
+}
+#filter:hover {
+  border-color: var(--vscode-input-border, var(--vscode-focusBorder));
+}
+#filter:focus {
+  border-color: var(--vscode-focusBorder);
+}
 .toggle { display: flex; align-items: center; gap: 4px; color: var(--vscode-descriptionForeground); font-size: 0.9em; white-space: nowrap; }
 #layout { display: flex; gap: 12px; flex: 1; min-height: 0; width: 100%; }
 #rows { flex: 3; overflow-y: auto; position: relative; min-width: 0; }
@@ -63,8 +84,14 @@ body {
 #detail { flex: 1; overflow-y: auto; border-left: 1px solid var(--vscode-panel-border); padding-left: 12px; min-width: 0; display: none; }
 #layout.has-detail #detail { display: block; }
 
-/* Table wrapper holds the header, rows, and the absolutely-positioned SVG. */
-.table-wrap { position: relative; width: 100%; }
+/* Scroll spacer gives #rows a scrollbar spanning the FULL history height even
+   though only a viewport slice is rendered. The rendered slice (table-wrap) is
+   absolutely positioned inside it at the slice's top offset. */
+.scroll-spacer { position: relative; width: 100%; }
+
+/* Table wrapper holds the header, rows, and the absolutely-positioned SVG.
+   Positioned absolutely within the scroll-spacer at the rendered slice's top. */
+.table-wrap { position: absolute; left: 0; top: 0; width: 100%; }
 
 /* Sticky header row (Graph | Content | Date | Author | Commit/ID). */
 .tbl-header {
@@ -99,13 +126,16 @@ body {
   border-bottom: 1px solid var(--vscode-panel-border);
 }
 
-/* Each history row is a grid with the same column template as the header. */
+/* Each history row is a grid with the same column template as the header.
+   Height is fixed to ROW_H (34px) in main.js so the graph overlay's dot/edge
+   y-positions and the scroll-spacer math stay consistent with real row height. */
 .row {
   display: grid;
   grid-template-columns:
     var(--graph-w, auto) var(--content-w, minmax(0,1fr))
     var(--date-w, auto) var(--author-w, auto) var(--commit-w, auto);
   width: 100%;
+  height: 34px;
   align-items: center;
   cursor: pointer;
 }

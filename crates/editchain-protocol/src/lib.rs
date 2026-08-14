@@ -79,6 +79,9 @@ pub struct GetWindowRequest {
     /// Skip rows belonging to nested/submodule repositories.
     #[serde(default)]
     pub hide_submodules: bool,
+    /// Optional chain filter to apply before windowing.
+    #[serde(default)]
+    pub filter: Option<ChainFilterDto>,
 }
 
 /// Get the graph layout for a bounded window of rows.
@@ -93,6 +96,30 @@ pub struct GetLayoutRequest {
     /// Number of rows to emit edges for.
     #[serde(default)]
     pub limit: u64,
+    /// Optional chain filter to apply before computing the layout.
+    #[serde(default)]
+    pub filter: Option<ChainFilterDto>,
+}
+
+/// A chain filter carried over the protocol.
+///
+/// Mirrors [`editchain_project::filter::ChainFilter`] as a plain serializable
+/// DTO so the webview can request keyword/regex/undated filtering without
+/// depending on the Rust projection crate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChainFilterDto {
+    /// Regex/literal pattern matched against each node's display summary.
+    #[serde(default)]
+    pub summary_pattern: String,
+    /// Regex/literal pattern matched against each node's kind tag.
+    #[serde(default)]
+    pub kind_pattern: String,
+    /// Hide nodes with no real timestamp (`timestamp_ms() == 0`).
+    #[serde(default)]
+    pub hide_undated: bool,
+    /// Reconnect causal edges across hidden intermediate nodes.
+    #[serde(default)]
+    pub splice: bool,
 }
 
 /// A grid point in the graph: a row index and a lane index.
@@ -131,6 +158,11 @@ pub struct GraphLayout {
     pub rows: Vec<LayoutRow>,
     /// All edges (child → parent), each with its ordered point path.
     pub edges: Vec<LayoutEdge>,
+    /// The maximum lane index across ALL rows (not just this window). The
+    /// webview uses this to size the graph column stably regardless of which
+    /// window is loaded, so lanes don't jump as the user scrolls.
+    #[serde(default)]
+    pub max_lane: usize,
 }
 
 /// Get details for a specific node.

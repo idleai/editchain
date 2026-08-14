@@ -189,6 +189,22 @@
       return g;
     },
 
+    undated() {
+      // A chain with some undated (timestamp_ms == 0) rows, so the "Hide
+      // undated" filter can be exercised.
+      const rows = [
+        opRow('node:u:1', 'dated newest', { ts: NOW - 1000 }),
+        opRow('node:u:2', 'undated middle', { ts: 0 }),
+        opRow('node:u:3', 'dated oldest', { ts: NOW - 2000 }),
+      ];
+      const layoutRows = rows.map((r) => ({ node: r.node_key, lane: 0 }));
+      const edges = [
+        { child:'node:u:1', parent:'node:u:2', points:[{row:0,lane:0},{row:1,lane:0}] },
+        { child:'node:u:2', parent:'node:u:3', points:[{row:1,lane:0},{row:2,lane:0}] },
+      ];
+      return { rows, layoutRows, edges };
+    },
+
     error() {
       return { openError:'service unavailable' };
     },

@@ -24,6 +24,8 @@ pub mod import;
 pub mod model;
 /// Pluggable output sinks (ops, blobs, cursors).
 pub mod sink;
+/// Subagent branch/reconnect linking.
+pub mod subagent;
 
 /// Claude Code session import pipeline.
 pub mod claude_code;

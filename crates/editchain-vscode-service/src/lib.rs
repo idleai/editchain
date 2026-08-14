@@ -18,10 +18,12 @@ use editchain_core::{
 use editchain_git::{discover_repositories, resolve_commit, walk_history, RepositoryHandle};
 use editchain_index::LexicalIndex;
 use editchain_node::segment::SegmentStore;
+use editchain_project::filter::ChainFilter;
 use editchain_project::HistoryProjection;
 use editchain_protocol::{
-    GraphLayout as ProtocolGraphLayout, HistoryRow, HistoryWindow, LayoutEdge, LayoutPoint,
-    LayoutRow, NodeDetails, RepositoryInfo, Request, RequestBody, Response, ResponseBody,
+    ChainFilterDto, GraphLayout as ProtocolGraphLayout, HistoryRow, HistoryWindow, LayoutEdge,
+    LayoutPoint, LayoutRow, NodeDetails, RepositoryInfo, Request, RequestBody, Response,
+    ResponseBody,
 };
 
 /// A loaded workspace: chain ops + git repositories.
@@ -31,17 +33,23 @@ pub struct Workspace {
     pub projection: HistoryProjection,
     /// Discovered git repositories.
     pub repositories: Vec<editchain_git::RepositoryDiscovery>,
-    /// Cached canonical node list per `hide_submodules` flag.
+    /// Cached canonical node list per `(hide_submodules, filter)` state.
     ///
     /// The topological sort over the full chain is the expensive part; it is
     /// computed once per filter state and reused for every window/layout call.
-    sorted_nodes: std::collections::HashMap<bool, Vec<editchain_project::HistoryNode>>,
-    /// Cached layout context per `hide_submodules` flag.
+    sorted_nodes: std::collections::HashMap<
+        (bool, editchain_project::filter::ChainFilterKey),
+        Vec<editchain_project::HistoryNode>,
+    >,
+    /// Cached layout context per `(hide_submodules, filter)` state.
     ///
     /// The context bundles all O(V) derived data (keys, row map, lane map, lane
     /// assignment) so per-window edge computation is O(window). Computed once
     /// per filter state and reused across scrolls/resizes.
-    contexts: std::collections::HashMap<bool, editchain_project::layout::LayoutContext>,
+    contexts: std::collections::HashMap<
+        (bool, editchain_project::filter::ChainFilterKey),
+        editchain_project::layout::LayoutContext,
+    >,
 }
 
 impl Workspace {
@@ -101,12 +109,14 @@ impl Workspace {
         offset: u64,
         limit: u64,
         hide_submodules: bool,
+        filter: &ChainFilter,
     ) -> HistoryWindow {
         let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
         let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
 
-        // Build the node list, optionally filtering out submodules.
-        let filtered = self.filtered_nodes(hide_submodules);
+        // Build the node list, optionally filtering out submodules and applying
+        // the chain filter.
+        let filtered = self.filtered_nodes(hide_submodules, filter);
         let total = filtered.len();
 
         let rows = filtered
@@ -138,18 +148,24 @@ impl Workspace {
         }
     }
 
-    /// Returns the canonical node list, optionally filtering out submodules.
+    /// Returns the canonical node list, optionally filtering out submodules and
+    /// applying a chain filter.
     ///
     /// This is the single source of truth for both [`Self::history_window`] and
     /// [`Self::graph_layout`], so their row indices stay in lockstep. The result
-    /// is cached per `hide_submodules` so the expensive topological sort runs
-    /// only once per filter state.
+    /// is cached per `(hide_submodules, filter)` so the expensive topological
+    /// sort runs only once per filter state.
     #[must_use]
-    fn filtered_nodes(&mut self, hide_submodules: bool) -> Vec<editchain_project::HistoryNode> {
-        if let Some(nodes) = self.sorted_nodes.get(&hide_submodules) {
+    fn filtered_nodes(
+        &mut self,
+        hide_submodules: bool,
+        filter: &ChainFilter,
+    ) -> Vec<editchain_project::HistoryNode> {
+        let key = (hide_submodules, filter.key());
+        if let Some(nodes) = self.sorted_nodes.get(&key) {
             return nodes.clone();
         }
-        let all_nodes = self.projection.nodes();
+        let all_nodes = self.projection.filtered_nodes(filter);
         let filtered: Vec<_> = if hide_submodules {
             all_nodes
                 .into_iter()
@@ -161,7 +177,7 @@ impl Workspace {
         } else {
             all_nodes
         };
-        drop(self.sorted_nodes.insert(hide_submodules, filtered.clone()));
+        drop(self.sorted_nodes.insert(key, filtered.clone()));
         filtered
     }
 
@@ -181,17 +197,20 @@ impl Workspace {
         hide_submodules: bool,
         offset: u64,
         limit: u64,
+        filter: &ChainFilter,
     ) -> ProtocolGraphLayout {
         // Ensure the context is built (once per filter state), then borrow it.
-        if !self.contexts.contains_key(&hide_submodules) {
-            let sorted = self.filtered_nodes(hide_submodules);
+        let key = (hide_submodules, filter.key());
+        if !self.contexts.contains_key(&key) {
+            let sorted = self.filtered_nodes(hide_submodules, filter);
             let ctx = self.projection.layout_context(&sorted);
-            drop(self.contexts.insert(hide_submodules, ctx));
+            drop(self.contexts.insert(key.clone(), ctx));
         }
-        let Some(ctx) = self.contexts.get(&hide_submodules) else {
+        let Some(ctx) = self.contexts.get(&key) else {
             return ProtocolGraphLayout {
                 rows: Vec::new(),
                 edges: Vec::new(),
+                max_lane: 0,
             };
         };
         let offset_usize = usize::try_from(offset).unwrap_or(0);
@@ -224,6 +243,10 @@ impl Workspace {
             })
             .collect();
 
+        // Global max lane across ALL rows (not just this window), so the client
+        // can size the graph column stably regardless of which window is loaded.
+        let max_lane = ctx.lanes.iter().map(|r| r.lane).max().unwrap_or(0);
+
         ProtocolGraphLayout {
             rows,
             edges: edges
@@ -241,6 +264,7 @@ impl Workspace {
                         .collect(),
                 })
                 .collect(),
+            max_lane,
         }
     }
 
@@ -306,6 +330,24 @@ impl Workspace {
         self.repositories
             .iter()
             .any(|d| d.id == repository_id && self.is_submodule(d))
+    }
+}
+
+/// Convert an optional protocol filter DTO into a [`ChainFilter`].
+///
+/// A `None` DTO yields the default filter (hide undated, splice on), matching
+/// the webview's default behavior. An empty DTO yields an empty filter that
+/// hides nothing.
+#[must_use]
+fn chain_filter_from_dto(dto: Option<&ChainFilterDto>) -> ChainFilter {
+    match dto {
+        Some(d) => ChainFilter::new(
+            d.summary_pattern.clone(),
+            d.kind_pattern.clone(),
+            d.hide_undated,
+            d.splice,
+        ),
+        None => ChainFilter::default(),
     }
 }
 
@@ -589,12 +631,14 @@ impl Server {
             }
             RequestBody::GetWindow(req) => {
                 let ws = self.workspace.as_mut().ok_or("no workspace open")?;
-                let window = ws.history_window(req.offset, req.limit, req.hide_submodules);
+                let filter = chain_filter_from_dto(req.filter.as_ref());
+                let window = ws.history_window(req.offset, req.limit, req.hide_submodules, &filter);
                 ResponseBody::Ok(serde_json::to_value(window)?)
             }
             RequestBody::GetLayout(req) => {
                 let ws = self.workspace.as_mut().ok_or("no workspace open")?;
-                let layout = ws.graph_layout(req.hide_submodules, req.offset, req.limit);
+                let filter = chain_filter_from_dto(req.filter.as_ref());
+                let layout = ws.graph_layout(req.hide_submodules, req.offset, req.limit, &filter);
                 ResponseBody::Ok(serde_json::to_value(layout)?)
             }
             RequestBody::GetNodeDetails(req) => {

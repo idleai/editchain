@@ -4,6 +4,8 @@
     clippy::panic,
     reason = "Tests assert on enum variants with explicit panic arms"
 )]
+// Crate-level dependency marker (used by Cargo for feature resolution).
+use regex as _;
 
 use editchain_core::{
     ActorId, Clock, GitAvailability, GitCommitEntity, GitObjectFormat, GitOid, ImportOp, MessageOp,

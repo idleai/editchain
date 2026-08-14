@@ -1,5 +1,8 @@
 //! Tests for the lane layout module.
 
+// Crate-level dependency marker (used by Cargo for feature resolution).
+use regex as _;
+
 use editchain_core::{NodeId, OpId};
 use editchain_project::layout::{compute_graph_layout, compute_lanes, LayoutContext};
 use editchain_project::HistoryProjection;
@@ -18,6 +21,11 @@ fn parents_from<'a>(map: &'a [(&'a str, &'a [&'a str])]) -> impl Fn(&str) -> Vec
         }
         Vec::new()
     }
+}
+
+/// An `is_git` predicate that reports no git nodes (used by op-only tests).
+fn no_git(_: &str) -> bool {
+    false
 }
 
 #[test]
@@ -62,7 +70,7 @@ fn graph_layout_linear_single_lane() {
     // C -> B -> A (newest-first: C, B, A), all on one lane.
     let nodes = vec!["C".to_string(), "B".to_string(), "A".to_string()];
     let parents = parents_from(&[("C", &["B"]), ("B", &["A"])]);
-    let layout = compute_graph_layout(&nodes, parents);
+    let layout = compute_graph_layout(&nodes, parents, &no_git);
     assert_eq!(layout.rows.len(), 3);
     assert!(layout.rows.iter().all(|r| r.lane == 0));
     // Two edges: C→B and B→A.
@@ -74,7 +82,7 @@ fn graph_layout_merge_two_lanes() {
     // C (merge of A and B) -> A, B (newest-first: C, B, A).
     let nodes = vec!["C".to_string(), "B".to_string(), "A".to_string()];
     let parents = parents_from(&[("C", &["B", "A"])]);
-    let layout = compute_graph_layout(&nodes, parents);
+    let layout = compute_graph_layout(&nodes, parents, &no_git);
     assert_eq!(layout.rows.len(), 3);
     // Merge node and its two parents occupy distinct lanes.
     let lanes: std::collections::HashSet<usize> = layout.rows.iter().map(|r| r.lane).collect();
@@ -94,7 +102,7 @@ fn graph_layout_edge_points_are_continuous() {
         "A".to_string(),
     ];
     let parents = parents_from(&[("E", &["D"]), ("D", &["C"]), ("C", &["B"]), ("B", &["A"])]);
-    let layout = compute_graph_layout(&nodes, parents);
+    let layout = compute_graph_layout(&nodes, parents, &no_git);
 
     // Every edge's points must be contiguous: consecutive points differ by
     // exactly one row step, and the path starts at the child's row and ends at
@@ -199,6 +207,37 @@ fn graph_layout_topologically_sorts_git_commits() {
     }
 }
 
+/// Git commits must always occupy the leftmost lane (0), even when interleaved
+/// with op chains.
+#[test]
+fn git_commits_occupy_leftmost_lane() {
+    // Newest-first: G2 (git), O2 (op), G1 (git), O1 (op). Git nodes G1/G2 form
+    // one component; ops O1/O2 form another. Git must land on lane 0, ops on
+    // lane >= 1.
+    let nodes = vec![
+        "G2".to_string(),
+        "O2".to_string(),
+        "G1".to_string(),
+        "O1".to_string(),
+    ];
+    let parents = parents_from(&[("G2", &["G1"]), ("O2", &["O1"])]);
+    let is_git = |k: &str| -> bool { k.starts_with('G') };
+    let layout = compute_graph_layout(&nodes, parents, &is_git);
+    let lane_of = |k: &str| layout.rows.iter().find(|r| r.node == k).unwrap().lane;
+    assert_eq!(lane_of("G2"), 0, "git commit should be on lane 0");
+    assert_eq!(lane_of("G1"), 0, "git commit should be on lane 0");
+    assert_ne!(
+        lane_of("O2"),
+        0,
+        "op chain should not collide with git lane"
+    );
+    assert_ne!(
+        lane_of("O1"),
+        0,
+        "op chain should not collide with git lane"
+    );
+}
+
 #[test]
 fn graph_layout_breaks_cycles_deterministically() {
     // A cycle: A -> B -> C -> A (each node's parent is the next in the ring).
@@ -206,7 +245,7 @@ fn graph_layout_breaks_cycles_deterministically() {
     // dropping nodes or emitting them unsorted, so every node still appears.
     let nodes = vec!["A".to_string(), "B".to_string(), "C".to_string()];
     let parents = parents_from(&[("A", &["C"]), ("B", &["A"]), ("C", &["B"])]);
-    let layout = compute_graph_layout(&nodes, parents);
+    let layout = compute_graph_layout(&nodes, parents, &no_git);
 
     // All three nodes must be present (none dropped).
     assert_eq!(layout.rows.len(), 3);
@@ -230,7 +269,7 @@ fn edges_for_window_emits_edge_entering_from_above() {
         "N3".to_string(),
     ];
     let parents = parents_from(&[("N0", &["N3"])]);
-    let ctx = LayoutContext::new(&nodes, &parents);
+    let ctx = LayoutContext::new(&nodes, &parents, &no_git);
 
     // Window covering rows 0..1 (N0,N1): child N0 inside -> emitted normally.
     let edges = ctx.edges_for_window(0, 2);
@@ -245,5 +284,113 @@ fn edges_for_window_emits_edge_entering_from_above() {
     assert!(
         edges2.iter().any(|e| e.child == "N0" && e.parent == "N3"),
         "edge N0->N3 should be emitted when its parent is in the window even if its child is above"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Lane reuse across disconnected chains
+// ---------------------------------------------------------------------------
+
+/// Two disconnected linear chains that never overlap in time share one lane.
+///
+/// Chain A: A1 -> A2 (rows 2..3). Chain B: B1 -> B2 (rows 0..1, newest).
+/// Newest-first display order: B2, B1, A2, A1. Because A's rows (2..3) and B's
+/// rows (0..1) are disjoint, both chains should land on the same base lane.
+#[test]
+fn disconnected_non_overlapping_chains_share_lane() {
+    let nodes = vec![
+        "B2".to_string(),
+        "B1".to_string(),
+        "A2".to_string(),
+        "A1".to_string(),
+    ];
+    let parents = parents_from(&[("B2", &["B1"]), ("A2", &["A1"])]);
+    let layout = compute_graph_layout(&nodes, parents, &no_git);
+    let lane_of = |k: &str| layout.rows.iter().find(|r| r.node == k).unwrap().lane;
+    assert_eq!(
+        lane_of("B2"),
+        lane_of("A2"),
+        "disjoint chains should share a lane"
+    );
+    assert_eq!(lane_of("B1"), lane_of("A1"));
+}
+
+/// Two disconnected chains that overlap in time get different lanes.
+///
+/// Interleaved newest-first rows: A2(0), B2(1), A1(2), B1(3). Chain A spans
+/// rows 0..2 and chain B spans rows 1..3 — they overlap in the middle, so they
+/// must NOT share a lane.
+#[test]
+fn disconnected_overlapping_chains_get_distinct_lanes() {
+    let nodes = vec![
+        "A2".to_string(),
+        "B2".to_string(),
+        "A1".to_string(),
+        "B1".to_string(),
+    ];
+    let parents = parents_from(&[("A2", &["A1"]), ("B2", &["B1"])]);
+    let layout = compute_graph_layout(&nodes, parents, &no_git);
+    let lane_of = |k: &str| layout.rows.iter().find(|r| r.node == k).unwrap().lane;
+    assert_ne!(
+        lane_of("A2"),
+        lane_of("B2"),
+        "overlapping chains need distinct lanes"
+    );
+}
+
+/// Three sequential chains that each fully end before the next begins all
+/// reuse a single freed lane rather than each claiming a fresh column.
+///
+/// Newest-first rows: C(0..1), B(2..3), A(4..5). All three intervals are
+/// disjoint, so greedy interval coloring packs them onto one base column —
+/// this is exactly the "reuse freed lanes" behavior for sequential sessions.
+#[test]
+fn ended_chain_lane_is_reused_by_later_chain() {
+    let nodes = vec![
+        "C2".to_string(),
+        "C1".to_string(),
+        "B2".to_string(),
+        "B1".to_string(),
+        "A2".to_string(),
+        "A1".to_string(),
+    ];
+    let parents = parents_from(&[("C2", &["C1"]), ("B2", &["B1"]), ("A2", &["A1"])]);
+    let layout = compute_graph_layout(&nodes, parents, &no_git);
+    let lane_of = |k: &str| layout.rows.iter().find(|r| r.node == k).unwrap().lane;
+    // All three disjoint chains pack onto a single base column.
+    assert_eq!(
+        lane_of("A2"),
+        lane_of("C2"),
+        "A and C should reuse the same lane"
+    );
+    assert_eq!(lane_of("B2"), lane_of("A2"), "B also reuses the freed lane");
+    // And no chain takes a fresh second column.
+    let distinct: std::collections::HashSet<usize> = layout.rows.iter().map(|r| r.lane).collect();
+    assert_eq!(
+        distinct.len(),
+        1,
+        "all three disjoint chains share one column"
+    );
+}
+
+/// Reuse must not break merges: a merge node's two parents still get distinct
+/// lanes even when the merge component shares a base column with another chain.
+#[test]
+fn reuse_preserves_merge_two_lanes() {
+    // Merge component M (merge of X and Y) at rows 0..1; disjoint chain Z at
+    // rows 3..4. M's parents X and Y must occupy distinct lanes.
+    let nodes = vec![
+        "M".to_string(),
+        "Y".to_string(),
+        "X".to_string(),
+        "Z".to_string(),
+    ];
+    let parents = parents_from(&[("M", &["X", "Y"])]);
+    let layout = compute_graph_layout(&nodes, parents, &no_git);
+    let lane_of = |k: &str| layout.rows.iter().find(|r| r.node == k).unwrap().lane;
+    assert_ne!(
+        lane_of("X"),
+        lane_of("Y"),
+        "merge parents need distinct lanes"
     );
 }

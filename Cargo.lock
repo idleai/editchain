@@ -802,6 +802,7 @@ name = "editchain-project"
 version = "0.1.0"
 dependencies = [
  "editchain-core",
+ "regex",
 ]
 
 [[package]]

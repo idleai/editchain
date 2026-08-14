@@ -13,6 +13,10 @@ pub struct SessionFile {
     pub is_subagent: bool,
     /// Parent session UUID (for subagents).
     pub parent_session_id: Option<String>,
+    /// The parent's `Agent` `tool_use` id that spawned this subagent (from the
+    /// sibling `<name>.meta.json`'s `toolUseId`). This is the branch anchor used
+    /// to link the subagent back into its parent's chain.
+    pub tool_use_id: Option<String>,
 }
 
 /// Discover all Claude Code session files in a directory.
@@ -49,6 +53,7 @@ pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<SessionFile>, String
             file_size: metadata.len(),
             is_subagent: false,
             parent_session_id: None,
+            tool_use_id: None,
         });
 
         // Discover subagents for this session.
@@ -105,14 +110,38 @@ fn discover_subagents(session_path: &Path, parent_session_id: &str) -> Vec<Sessi
             .unwrap_or(&name)
             .to_string();
 
+        // Read the sibling `<name>.meta.json` for the parent's `Agent` tool_use
+        // id (`toolUseId`), which anchors this subagent's branch point.
+        let tool_use_id = read_tool_use_id(&path);
+
         subagents.push(SessionFile {
             path,
             session_id: agent_id,
             file_size: metadata.len(),
             is_subagent: true,
             parent_session_id: Some(parent_session_id.to_string()),
+            tool_use_id,
         });
     }
 
     subagents
+}
+
+/// Read the parent's `Agent` `tool_use` id from a subagent's sibling meta file.
+///
+/// Claude Code writes `<name>.meta.json` beside each `agent-*.jsonl` transcript
+/// carrying `{"toolUseId": "...", "parentAgentId": "...", ...}`. The `toolUseId`
+/// is the id of the parent session's `Agent` `tool_use` that spawned this
+/// subagent — the branch anchor for linking. Returns `None` if the meta file is
+/// missing or unparseable (the subagent then stays an unlinked branch).
+///
+/// The `Agent` `tool_use` is the parent's tool call that launched the subagent.
+fn read_tool_use_id(subagent_jsonl_path: &Path) -> Option<String> {
+    let meta_path = subagent_jsonl_path.with_extension("meta.json");
+    let bytes = std::fs::read(&meta_path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("toolUseId")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
 }

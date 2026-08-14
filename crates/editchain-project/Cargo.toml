@@ -14,3 +14,4 @@ workspace = true
 
 [dependencies]
 editchain-core = { path = "../editchain-core" }
+regex.workspace = true

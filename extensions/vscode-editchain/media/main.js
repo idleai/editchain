@@ -5,14 +5,16 @@
 //
 // The graph geometry (lanes + edge point paths) is computed server-side by the
 // Rust service (`GetLayout`) and shipped over stdio; this file only draws it.
-// This mirrors vscode-git-graph's architecture: one SVG positioned absolutely
-// over the table container, with pointer-events disabled on the SVG and
-// re-enabled on node dots.
 //
-// Rows are paged via infinite scroll; as more rows load both the table and the
-// SVG grow together. Edges whose parent has not yet been loaded are drawn down
-// to the bottom of the currently-loaded window (they extend further once more
-// rows arrive), matching how vscode-git-graph handles "Load More".
+// The webview is a THIN VIEWPORT over a server-owned graph. It renders only the
+// visible slice of rows plus a buffer on each side, and requests windowed
+// layouts around the scroll position. It does NOT accumulate the whole history:
+// far-offscreen windows are evicted from a sparse cache. This keeps DOM size,
+// JS heap, and per-scroll serialization bounded regardless of chain size (the
+// design target is ~1M nodes).
+//
+// Edge points from `GetLayout` are ABSOLUTE canonical row indices (not relative
+// to the requested offset), so they map directly onto absolute row positions.
 //
 // Alignment note: block separators shift rows down from a uniform grid, so we
 // measure each rendered row's real `offsetTop` after rendering and use those
@@ -25,58 +27,73 @@ const rowsEl = document.getElementById('rows');
 const searchEl = document.getElementById('search');
 const detailEl = document.getElementById('detail');
 const layoutEl = document.getElementById('layout');
+const filterEl = document.getElementById('filter');
+const hideUndatedEl = document.getElementById('hideUndated');
 const hideSubmodulesEl = document.getElementById('hideSubmodules');
 const hideSystemEl = document.getElementById('hideSystem');
 
-let offset = 0;
 // Rows fetched per request. Larger than the visible viewport so each fetch
-// buffers well ahead of the scroll position, keeping the user from ever
-// waiting on an in-flight fetch.
+// buffers well ahead of the scroll position.
 const PAGE = 500;
-// How far ahead (in rows) of the current scroll position to keep buffered.
-// The background loader keeps fetching until this much content is loaded past
-// the viewport, so scrolling never blocks on a fetch.
-const PROGRESSIVE_BUFFER = 1000;
-let total = 0;
-let pending = false;
-let allRows = [];          // accumulated rows across pages
-let layout = null;         // { rows: [{node,lane}], edges: [{child,parent,points}] }
-let layoutOffset = 0;      // history offset of the first layout row
-let layoutLimit = 0;       // number of rows covered by the loaded layout window
-let pendingLayoutOffset = 0; // offset requested for the in-flight layout
+// How many rows to keep rendered past each edge of the viewport. The rendered
+// DOM stays bounded at roughly `viewport + 2*BUFFER` rows regardless of total.
+const BUFFER = 400;
+let total = 0;             // global row count (server-reported)
+let pendingWindow = false; // a GetWindow request is in flight
+let pendingWindowOffset = 0; // absolute offset of the in-flight GetWindow
+let pendingLayoutId = 0;   // monotonically increasing id for in-flight GetLayout
 
-// Persist webview state across recreations (e.g. when the user navigates to a
-// JSON editor and back). Without this, the webview is recreated from scratch on
-// every reveal and shows "Loading…" until it refetches.
+// Sparse window cache: absolute row index -> HistoryRow. Only windows near the
+// scroll position are retained; far-offscreen windows are evicted.
+let cache = new Map();
+// Monotonic count of distinct rows ever fetched (across all windows), so the
+// status bar shows how much history the user has actually loaded — not just the
+// bounded viewport cache size.
+let totalFetched = 0;
+
+let layout = null;         // { rows: [{node,lane}], edges: [{child,parent,points}] }
+let layoutLo = Infinity;   // absolute row index of first layout row
+let layoutHi = -1;         // absolute row index of last layout row
+let lastRenderKey = '';    // cache key of the last rendered slice (avoid redundant rebuilds)
+
+const ROW_H = 34;
+
+/** Absolute row index of the top of the viewport, clamped to [0, total-1] so
+ * overscrolling below the bottom never reports a depth beyond the chain. */
+function viewportTopRow() {
+  return Math.max(0, Math.min(total - 1, Math.floor(rowsEl.scrollTop / ROW_H)));
+}
+
+/** Absolute row index just below the bottom of the viewport. */
+function viewportBottomRow() {
+  return Math.min(total - 1, Math.ceil((rowsEl.scrollTop + rowsEl.clientHeight) / ROW_H));
+}
+
+/** Persist only viewport state across recreations. We never persist row payloads:
+ * they can blow past VS Code's webview state size limit for large chains, and a
+ * recreated webview can refetch its window cheaply. */
 function saveState() {
-  // Cap the persisted rows to a reasonable window so we stay under VS Code's
-  // webview state size limit (setState fails silently if exceeded). Persisting
-  // the full loaded history can blow past it for large chains.
-  const MAX_SAVED_ROWS = 2000;
-  const savedRows = allRows.slice(0, MAX_SAVED_ROWS);
   vscode.setState({
-    allRows: savedRows,
-    offset: Math.min(offset, savedRows.length),
     total,
-    layout,
-    layoutOffset,
-    layoutLimit,
-    pendingLayoutOffset,
+    scrollTop: rowsEl.scrollTop,
+    hideSubmodules: hideSubmodules(),
+    showMessagesOnly: showMessagesOnly(),
+    hideUndated: hideUndated(),
+    filterPattern: filterEl ? filterEl.value : '',
   });
-  console.log('[editchain] saveState: ' + savedRows.length + ' rows');
 }
 
 function restoreState() {
   const s = vscode.getState();
-  console.log('[editchain] restoreState: ' + (s && Array.isArray(s.allRows) ? s.allRows.length : 'none'));
-  if (s && Array.isArray(s.allRows) && s.allRows.length) {
-    allRows = s.allRows;
-    offset = s.offset || 0;
+  if (s && typeof s.total === 'number') {
     total = s.total || 0;
-    layout = s.layout || null;
-    layoutOffset = s.layoutOffset || 0;
-    layoutLimit = s.layoutLimit || 0;
-    pendingLayoutOffset = s.pendingLayoutOffset || 0;
+    if (typeof s.scrollTop === 'number') rowsEl.scrollTop = s.scrollTop;
+    if (hideUndatedEl && typeof s.hideUndated === 'boolean') {
+      hideUndatedEl.checked = s.hideUndated;
+    }
+    if (filterEl && typeof s.filterPattern === 'string') {
+      filterEl.value = s.filterPattern;
+    }
     return true;
   }
   return false;
@@ -85,13 +102,21 @@ function restoreState() {
 // Branch colours for graph lanes (indexed by lane).
 const COLORS = ['#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4', '#46f0f0', '#f032e6', '#bcf60c', '#fabebe'];
 
-const ROW_H = 34;
 const LANE_W = 18;
 const DOT_R = 4;
 
 /** Send a request body to the extension host. */
 function send(body) {
   vscode.postMessage({ body });
+}
+
+/** Report the current scroll depth / total node counts to the extension host so
+ * it can update the status bar. `depth` is the absolute row index at the top of
+ * the viewport — how deep into the chain the user currently is (0 = newest,
+ * growing toward `total` = inception). This reflects scroll position, not how
+ * many rows have been fetched. */
+function reportStatus() {
+  vscode.postMessage({ type: 'status', loaded: viewportTopRow(), total });
 }
 
 /** Unwrap a service response body ({ Ok: v } | { Error: msg }). */
@@ -119,15 +144,21 @@ function esc(s) {
 /**
  * Build the single full-height SVG overlay for the graph.
  *
- * `rowYs` maps visible-row index → pixel y-offset within the table-wrap (the
- * measured `offsetTop` of each rendered `.row`). `loadedCount` is how many of
- * those rows are currently shown. Each edge is drawn as one continuous <path>
- * from its ordered grid points (child → parent), so lines run unbroken across
- * many rows.
+ * `rowYs` maps rendered-row position → pixel y-offset within the table-wrap
+ * (the measured `offsetTop` of each rendered `.row`). `rows` is the array of
+ * rows currently rendered (a viewport slice). `absToPos` maps each rendered
+ * row's ABSOLUTE canonical index → its position in `rows`, so we can translate
+ * absolute edge-point indices to pixel positions even when cached rows have
+ * gaps. Each edge is drawn as one continuous <path> from its ordered grid
+ * points (child → parent), so lines run unbroken across many rows.
+ *
+ * Edge points are ABSOLUTE canonical row indices.
  */
-function buildGraphSvg(rowYs, rows, maxWidth) {
+function buildGraphSvg(rowYs, rows, absToPos, maxWidth) {
   if (!layout || !layout.rows.length || rows.length === 0) return '';
-  const maxLane = Math.max(...layout.rows.map((r) => r.lane), 0);
+  // Use the GLOBAL max lane (reported by the server) so the graph column width
+  // is stable regardless of which window is loaded — lanes don't jump on scroll.
+  const maxLane = layout.max_lane || 0;
   const numLanes = Math.min(maxLane + 1, MAX_GRAPH_LANES);
   // One extra lane of padding so the last lane's dot isn't clipped.
   const naturalW = numLanes * LANE_W + LANE_W;
@@ -136,7 +167,7 @@ function buildGraphSvg(rowYs, rows, maxWidth) {
   // Height spans from the first row's top to just below the last row.
   const height = (rowYs[rows.length - 1] || 0) + ROW_H;
 
-  // Map node key -> actual row index in the rendered rows.
+  // Map node key -> rendered-row position in `rows`.
   const rowOf = {};
   for (let i = 0; i < rows.length; i++) {
     rowOf[rows[i].node_key] = i;
@@ -156,25 +187,24 @@ function buildGraphSvg(rowYs, rows, maxWidth) {
   let drawnEdges = 0;
   let skippedEdges = 0;
   for (const edge of layout.edges) {
-    const childRow = rowOf[edge.child];
-    const parentRow = rowOf[edge.parent];
+    const childPos = rowOf[edge.child];
+    const parentPos = rowOf[edge.parent];
 
-    // Convert every point to an absolute row index. Points beyond the loaded
-    // rows are kept so we can still extend lines to the SVG bottom; they are
-    // clamped when computing y.
-    const pts = [];
-    for (const p of edge.points) {
-      pts.push({ ...p, row: p.row + layoutOffset });
-    }
+    // Points are absolute canonical row indices already.
+    const pts = edge.points;
     if (!pts.length) { skippedEdges++; continue; }
 
-    const childLoaded = childRow !== undefined;
-    const parentLoaded = parentRow !== undefined;
+    const childLoaded = childPos !== undefined;
+    const parentLoaded = parentPos !== undefined;
 
     // Helper: pixel y for an absolute row, clamped into [0, height].
-    const yOf = (r) => {
-      const raw = (rowYs[r] !== undefined ? rowYs[r] : r * ROW_H) + ROW_H / 2;
-      return Math.max(0, Math.min(height, raw));
+    const yOfAbs = (r) => {
+      const pos = absToPos[r];
+      const raw =
+        (pos !== undefined && pos < rowYs.length && rowYs[pos] !== undefined)
+          ? rowYs[pos]
+          : r * ROW_H;
+      return Math.max(0, Math.min(height, raw + ROW_H / 2));
     };
 
     let d = '';
@@ -185,12 +215,12 @@ function buildGraphSvg(rowYs, rows, maxWidth) {
       d += 'M' + firstX.toFixed(1) + ',' + '0';
       for (let i = 0; i < pts.length; i++) {
         const x = LANE_W / 2 + pts[i].lane * LANE_W + LANE_W / 2;
-        d += 'L' + x.toFixed(1) + ',' + yOf(pts[i].row).toFixed(1);
+        d += 'L' + x.toFixed(1) + ',' + yOfAbs(pts[i].row).toFixed(1);
       }
     } else {
       for (let i = 0; i < pts.length; i++) {
         const x = LANE_W / 2 + pts[i].lane * LANE_W + LANE_W / 2;
-        d += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + yOf(pts[i].row).toFixed(1);
+        d += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + yOfAbs(pts[i].row).toFixed(1);
       }
     }
 
@@ -200,25 +230,29 @@ function buildGraphSvg(rowYs, rows, maxWidth) {
       d += 'L' + lastX.toFixed(1) + ',' + height.toFixed(1);
     }
 
+    // Colour each edge by its child's lane so lines match their node dots.
+    const colour = COLORS[pts[0].lane % COLORS.length];
     // Shadow path (thick, background-coloured) for contrast against text.
     svg += `<path class="graphShadow" d="${d}"/>`;
-    // Line path — colour comes from CSS (.graphLine) so it stays visible on
-    // both light and dark themes.
-    svg += `<path class="graphLine" d="${d}"/>`;
+    // Line path — stroke set via inline style so it overrides the CSS rule
+    // (a presentation attribute would lose to the stylesheet).
+    svg += `<path class="graphLine" d="${d}" style="stroke:${colour}"/>`;
     drawnEdges++;
   }
-  console.log('[editchain] buildGraphSvg layoutOffset=' + layoutOffset +
-    ' edges=' + layout.edges.length + ' drawn=' + drawnEdges + ' skipped=' + skippedEdges);
+  console.log('[editchain] buildGraphSvg edges=' + layout.edges.length +
+    ' drawn=' + drawnEdges + ' skipped=' + skippedEdges);
 
-  // Draw node dots at each rendered row's lane centre.
-  for (let i = layoutOffset; i < rows.length; i++) {
-    const key = rows[i].node_key;
-    const lane = laneOf[key];
+  // Draw node dots at each rendered row's lane centre. Dots are only drawn for
+  // rows that fall inside the loaded layout window AND are currently rendered.
+  for (let pos = 0; pos < rows.length; pos++) {
+    const absIdx = rows[pos]._absIndex;
+    if (absIdx === undefined || absIdx < layoutLo || absIdx > layoutHi) continue;
+    const lane = laneOf[rows[pos].node_key];
     if (lane === undefined) continue;
     const x = LANE_W / 2 + lane * LANE_W + LANE_W / 2;
-    const y = rowYs[i] + ROW_H / 2;
+    const y = rowYs[pos] + ROW_H / 2;
     const colour = COLORS[lane % COLORS.length];
-    svg += `<circle class="graphDot" data-row="${i}" cx="${x}" cy="${y}" r="${DOT_R}" fill="${colour}"/>`;
+    svg += `<circle class="graphDot" data-row="${absIdx}" cx="${x}" cy="${y}" r="${DOT_R}" fill="${colour}"/>`;
   }
 
   svg += '</svg>';
@@ -229,6 +263,28 @@ function buildGraphSvg(rowYs, rows, maxWidth) {
 function hideSubmodules() {
   // "Show git submodules" is off by default → submodules hidden by default.
   return !(hideSubmodulesEl && hideSubmodulesEl.checked);
+}
+
+/** Whether undated nodes should be hidden (from the "Hide undated" checkbox). */
+function hideUndated() {
+  return !!(hideUndatedEl && hideUndatedEl.checked);
+}
+
+/** The current chain-filter payload to send with window/layout requests.
+ *
+ * `null` when no filtering is active, so the service skips the filter entirely.
+ * The filter pattern is treated as a regex server-side (with literal fallback).
+ */
+function filterPayload() {
+  const pattern = (filterEl && filterEl.value.trim()) || '';
+  const undated = hideUndated();
+  if (!pattern && !undated) return null;
+  return {
+    summary_pattern: pattern,
+    kind_pattern: '',
+    hide_undated: undated,
+    splice: true,
+  };
 }
 
 /** Whether a row is user-facing text (message or command) — the rows kept when
@@ -279,16 +335,81 @@ function colStyle() {
   return parts.join(';');
 }
 
-/** Render all accumulated rows into a table with graph column + text columns. */
+/** The absolute index range we want cached: viewport plus BUFFER on each side. */
+function desiredCacheRange() {
+  const top = Math.max(0, viewportTopRow() - BUFFER);
+  const bottom = Math.min(total - 1, viewportBottomRow() + BUFFER);
+  return { top, bottom };
+}
+
+/**
+ * Fetch a window of rows around an absolute offset into the cacheable range.
+ *
+ * Random-access: we request whatever slice of `[top,bottom]` is missing from
+ * `cache`, rather than appending sequentially from offset 0. This lets deep
+ * scrolls jump straight to their target without loading everything before it.
+ */
+function fetchWindow() {
+  if (pendingWindow || total <= 0) return;
+  const { top, bottom } = desiredCacheRange();
+  if (top > bottom) return;
+
+  // Find the first missing row inside [top,bottom] to fetch next. The range is
+  // bounded by BUFFER on each side of the viewport, so this scan is cheap.
+  let start = -1;
+  for (let i = top; i <= bottom; i++) {
+    if (!cache.has(i)) { start = i; break; }
+  }
+  if (start === -1) return; // everything we want is already cached
+
+  const limit = Math.min(PAGE, bottom - start + 1);
+  pendingWindow = true;
+  pendingWindowOffset = start;
+  send({ GetWindow: { offset: start, limit, hide_submodules: hideSubmodules(), filter: filterPayload() } });
+}
+
+/** Evict cached rows far outside the desired range so memory stays bounded. */
+function evictFarWindows() {
+  const { top, bottom } = desiredCacheRange();
+  for (const key of cache.keys()) {
+    if (key < top - BUFFER || key > bottom + BUFFER) {
+      cache.delete(key);
+    }
+    if (cache.size > PAGE * 4) break; // hard cap on retained rows
+  }
+}
+
+/**
+ * Render only the viewport slice plus BUFFER on each side into a table with
+ * graph column + text columns. Rows outside this slice are not in the DOM, so
+ * DOM size stays bounded regardless of chain size.
+ */
 function renderRows() {
-  // Apply the submodule filter (hidden unless "Show git submodules" is checked)
-  // and the messages-only filter (when "Show messages only" is checked).
-  let visible = hideSubmodules() ? allRows.filter((r) => !r.is_submodule) : allRows;
-  if (showMessagesOnly()) {
-    visible = visible.filter(isMessageRow);
+  const { top, bottom } = desiredCacheRange();
+
+  // Count how many rows in [top,bottom] are actually cached, so a window that
+  // fills gaps within an unchanged range still triggers a re-render.
+  let cachedInRange = 0;
+  if (top <= bottom && total > 0) {
+    for (let i = top; i <= bottom; i++) {
+      if (cache.has(i)) cachedInRange++;
+    }
   }
 
-  // Build the sticky table header.
+  // Skip a redundant rebuild when neither the visible slice content nor the
+  // layout has changed. This avoids the double-render (window response + layout
+  // response) that otherwise causes a visible flicker/bounce while scrolling.
+  // Column widths are included so a column resize (which mutates `colWidths`)
+  // forces a rebuild instead of being swallowed by the early return.
+  const renderKey =
+    `${top}:${bottom}:${cachedInRange}:${layoutLo}:${layoutHi}:${layout ? layout.max_lane : -1}` +
+    `:${colWidths.graph}:${colWidths.content}:${colWidths.date}:${colWidths.author}:${colWidths.commit}`;
+  if (renderKey === lastRenderKey) return;
+  lastRenderKey = renderKey;
+
+  // Build the sticky table header (fixed at the top of #rows, outside the
+  // scroll-spacer so it stays visible while scrolling). Always rendered so the
+  // column labels show even when no rows are loaded yet.
   let html =
     '<div class="tbl-header" style="' + colStyle() + '">' +
       '<div class="th graph">Graph</div>' +
@@ -297,6 +418,24 @@ function renderRows() {
       '<div class="th author">Author</div>' +
       '<div class="th commit">Commit/ID</div>' +
     '</div>';
+
+  // Build the rendered slice from cached rows in absolute order. Each row is
+  // tagged with its absolute index (used for graph wiring and click handling).
+  const visible = [];
+  if (top <= bottom && total > 0) {
+    for (let i = top; i <= bottom; i++) {
+      const row = cache.get(i);
+      if (!row) continue; // gap — will be filled by fetchWindow
+      visible.push(row);
+      visible[visible.length - 1]._absIndex = i;
+    }
+  }
+
+  // Map absolute index -> rendered position, for translating edge points.
+  const absToPos = {};
+  for (let pos = 0; pos < visible.length; pos++) {
+    absToPos[visible[pos]._absIndex] = pos;
+  }
 
   let lastGroup = null;
 
@@ -320,7 +459,8 @@ function renderRows() {
     // Agent-authored text gets extra left padding to read as a distinct voice.
     const agentClass = row.author === 'agent' ? ' row-agent' : '';
 
-    html += '<div class="row ' + kindClass + agentClass + '" data-key="' + esc(row.node_key) + '" style="' + colStyle() + '">' +
+    html += '<div class="row ' + kindClass + agentClass + '" data-key="' + esc(row.node_key) +
+      '" data-row="' + row._absIndex + '" style="' + colStyle() + '">' +
       '<div class="graph-cell"></div>' +
       '<div class="text-cell"><div class="summary">' + esc(row.summary || '(no summary)') + '</div></div>' +
       '<div class="date-cell">' + esc(formatDate(row.timestamp_ms)) + '</div>' +
@@ -330,17 +470,23 @@ function renderRows() {
   });
 
   // Preserve the scroll position across the DOM rebuild. Setting innerHTML
-  // destroys and recreates all rows, which would otherwise reset scrollTop to 0
-  // on every layout recompute — snapping the user back to the top and
-  // preventing any further recomputation as they scroll down.
+  // destroys and recreates all rows, which would otherwise reset scrollTop to
+  // snap back to wherever it was — but since we render a window anchored at the
+  // current scroll position, we must restore it exactly.
   const prevScrollTop = rowsEl.scrollTop;
 
+  // The scroll-spacer sets #rows's scrollHeight to the FULL history height
+  // (total * ROW_H), so the scrollbar spans the whole chain even though only a
+  // slice is rendered. The table-wrap is positioned at the slice's top offset.
+  const spacerH = Math.max(1, total * ROW_H);
   rowsEl.innerHTML =
-    '<div class="table-wrap" style="' + colStyle() + '">' +
-      html +
+    '<div class="tbl-header" style="' + colStyle() + '"></div>' +
+    '<div class="scroll-spacer" style="height:' + spacerH + 'px">' +
+      '<div class="table-wrap" style="top:' + (top * ROW_H) + 'px;' + colStyle() + '">' +
+        html +
+      '</div>' +
     '</div>';
 
-  // Restore the scroll position after rebuilding.
   rowsEl.scrollTop = prevScrollTop;
 
   // Measure each rendered row's real offsetTop within the table-wrap so block
@@ -351,74 +497,61 @@ function renderRows() {
   rowEls.forEach((el) => { rowYs.push(el.offsetTop); });
 
   // Insert the graph overlay after measuring.
-  wrapEl.insertAdjacentHTML('beforeend', buildGraphSvg(rowYs, visible, currentGraphWidth()));
+  wrapEl.insertAdjacentHTML('beforeend', buildGraphSvg(rowYs, visible, absToPos, currentGraphWidth()));
 
   // Attach click handlers to rows.
   rowEls.forEach((el) => {
     el.addEventListener('click', () => {
       const key = el.getAttribute('data-key');
-      const row = allRows.find((r) => r.node_key === key);
+      const absIdx = parseInt(el.getAttribute('data-row'), 10);
+      const row = cache.get(absIdx);
       if (row) inspect(row);
     });
   });
 }
 
-/** Load the next window of history. */
-function loadMore() {
-  if (pending || (total > 0 && offset >= total)) return;
-  pending = true;
-  send({ GetWindow: { offset, limit: PAGE, hide_submodules: hideSubmodules() } });
-}
-
 /** Load more rows until the content fills the viewport (so scrolling works). */
 function ensureFilled() {
-  if (pending || (total > 0 && offset >= total)) return;
-  const contentH = rowsEl.scrollHeight;
-  const viewH = rowsEl.clientHeight;
-  if (contentH < viewH) {
-    loadMore();
-  }
+  fetchWindow();
 }
 
 /**
  * Progressively load history ahead of the scroll position so the user never
  * waits on an in-flight fetch.
  *
- * Keeps fetching in the background until either all rows are loaded or there is
- * at least `PROGRESSIVE_BUFFER` rows of content buffered past the bottom of the
+ * Keeps fetching in the background until either all desired rows are cached or
+ * there is at least `BUFFER` rows of content buffered past each edge of the
  * current viewport. Because it is driven by a timer (not by scroll events), it
  * runs continuously and independently of how fast the user scrolls.
  */
 function progressiveLoad() {
-  if (pending || (total > 0 && offset >= total)) return;
-  // Rows buffered past the bottom of the viewport.
-  const loadedRows = allRows.length;
-  const visibleRows = Math.ceil(rowsEl.clientHeight / ROW_H);
-  const bufferedAhead = loadedRows - visibleRows - Math.floor(rowsEl.scrollTop / ROW_H);
-  if (bufferedAhead < PROGRESSIVE_BUFFER) {
-    loadMore();
-  }
+  fetchWindow();
 }
 
-/** Request the graph layout for all currently loaded rows. */
+/**
+ * Request a windowed graph layout around the current scroll position.
+ *
+ * Sends `GetLayout{offset≈viewportTop−BUFFER, limit≈viewport+2*BUFFER}` so only
+ * lanes/edges near what's on screen are serialized — not everything loaded so
+ * far. Debounced so rapid scrolling doesn't spam requests; only one layout is
+ * in flight at a time (`pendingLayoutId`).
+ */
+let layoutTimer = null;
 function requestLayout() {
-  // Request a layout covering everything loaded so far. This keeps the graph
-  // stable as you scroll — lines don't recenter or pop in/out — and only grows
-  // when more rows load.
-  const limit = Math.max(1, allRows.length);
-  pendingLayoutOffset = 0;
-  console.log('[editchain] requestLayout offset=0 limit=' + limit);
-  send({ GetLayout: { hide_submodules: hideSubmodules(), offset: 0, limit } });
+  clearTimeout(layoutTimer);
+  layoutTimer = setTimeout(requestLayoutNow, 80);
 }
 
-/** Reset to the full history view and reload from the top. */
-function resetHistory() {
-  allRows = [];
-  offset = 0;
-  total = 0;
-  pending = false;
-  clearDetail();
-  loadMore();
+/** Send the windowed layout request immediately (no debounce). */
+function requestLayoutNow() {
+  const { top, bottom } = desiredCacheRange();
+  if (top > bottom || total <= 0) return;
+  const offset = Math.max(0, top);
+  const limit = Math.max(1, bottom - top + 1);
+  pendingLayoutId++;
+  pendingLayoutOffset = offset;
+  console.log('[editchain] requestLayout offset=' + offset + ' limit=' + limit);
+  send({ GetLayout: { hide_submodules: hideSubmodules(), offset, limit, filter: filterPayload() } });
 }
 
 /** Inspect a node's details — opens a read-only JSON editor in VS Code. */
@@ -473,33 +606,20 @@ window.addEventListener('message', (event) => {
   if (msg.id === 'open') {
     if (r.ok) {
       vscode.postMessage({ type: 'log', text: `open: ${r.value.nodes} nodes, ${r.value.repos} repos` });
-      // Restore previously cached rows if this webview was recreated (e.g. after
-      // navigating to a JSON editor and back), so history renders immediately
-      // instead of showing "Loading…" until a refetch.
-      if (!restoreState()) {
-        allRows = [];
-        offset = 0;
-        total = r.value.nodes;
-        loadMore();
-        requestLayout();
-      } else {
-        // The webview was just recreated; its viewport height (`100vh`) and DOM
-        // layout are not settled yet. Render synchronously first (the data is
-        // already in memory), then re-render on a timer so columns and rows get
-        // settled dimensions. A timer is used instead of requestAnimationFrame
-        // because rAF may not fire until the webview is painted/visible, which
-        // would leave the view blank until the user interacts.
-        console.log('[editchain] restore: ' + allRows.length + ' rows, layout=' + (layout ? layout.rows.length : 0));
-        renderRows();
-        ensureFilled();
-        setTimeout(() => {
-          renderRows();
-          ensureFilled();
-        }, 100);
+      total = r.value.nodes;
+      const restored = restoreState();
+      if (!restored) {
+        rowsEl.scrollTop = 0;
       }
+      // Fetch the window around the current scroll position and request its
+      // layout. The webview is a thin viewport; it never accumulates history.
+      fetchWindow();
+      requestLayoutNow();
+      renderRows();
       // Start the background progressive loader so history buffers ahead of the
       // scroll position without waiting for scroll events.
       startProgressiveLoader();
+      reportStatus();
     } else {
       vscode.postMessage({ type: 'log', text: `open error: ${r.error}` });
     }
@@ -507,21 +627,19 @@ window.addEventListener('message', (event) => {
   }
 
   // The panel was revealed again (e.g. after navigating to a JSON editor and
-  // back). The webview's JS context is reset when hidden (allRows=0), so restore
-  // the persisted state from vscode.setState before rendering. A short delay
-  // lets the webview finish transitioning from hidden to visible so it has real
-  // dimensions to measure.
+  // back). The webview's JS context is reset when hidden, so restore the
+  // persisted viewport state from vscode.setState before rendering. A short
+  // delay lets the webview finish transitioning from hidden to visible so it
+  // has real dimensions to measure.
   if (msg.id === 'reveal') {
-    // The webview's JS context is reset when hidden (allRows=0), so restore the
-    // persisted state from vscode.setState before rendering.
     const restored = restoreState();
-    vscode.postMessage({ type: 'log', text: 'reveal: restored=' + restored + ' allRows=' + allRows.length + ' layout=' + (layout ? layout.rows.length : 0) });
-    if (allRows.length) {
-      setTimeout(() => {
-        renderRows();
-        ensureFilled();
-      }, 50);
-    }
+    vscode.postMessage({ type: 'log', text: 'reveal: restored=' + restored + ' total=' + total });
+    setTimeout(() => {
+      fetchWindow();
+      requestLayoutNow();
+      renderRows();
+      startProgressiveLoader();
+    }, 50);
     return;
   }
 
@@ -538,8 +656,10 @@ window.addEventListener('message', (event) => {
   // GetLayout response — has both `rows` and `edges` arrays.
   if (Array.isArray(r.value.edges)) {
     layout = r.value;
-    layoutOffset = pendingLayoutOffset;
-    layoutLimit = layout.rows.length;
+    // The server's LayoutRow has only {node,lane}; row index is implicit by
+    // position, starting at the offset we requested.
+    layoutLo = pendingLayoutOffset;
+    layoutHi = pendingLayoutOffset + layout.rows.length - 1;
     renderRows();
     saveState();
     return;
@@ -548,19 +668,22 @@ window.addEventListener('message', (event) => {
   // GetWindow response — has a `rows` array plus `total`.
   if (Array.isArray(r.value.rows)) {
     total = r.value.total;
-    for (const row of r.value.rows) {
-      allRows.push(row);
+    const base = pendingWindowOffset;
+    for (let i = 0; i < r.value.rows.length; i++) {
+      const absIdx = base + i;
+      if (!cache.has(absIdx)) totalFetched++;
+      cache.set(absIdx, r.value.rows[i]);
     }
-    offset += r.value.rows.length;
-    pending = false;
+    pendingWindow = false;
+    evictFarWindows();
     renderRows();
-    vscode.postMessage({ type: 'log', text: `loaded ${allRows.length}/${total} nodes` });
-    // Persist the loaded rows so a recreated webview can restore them.
+    vscode.postMessage({ type: 'log', text: `cached ${cache.size}/${total} nodes (fetched ${totalFetched})` });
+    reportStatus();
     saveState();
     // Recompute the layout to cover the newly loaded rows so lines extend.
-    requestLayout();
+    requestLayoutNow();
     // Keep loading until the content fills the viewport so scrolling works.
-    ensureFilled();
+    fetchWindow();
     return;
   }
 
@@ -584,6 +707,36 @@ window.addEventListener('message', (event) => {
   }
 });
 
+/** Reset to the full history view and reload from the top. */
+function resetHistory() {
+  cache.clear();
+  totalFetched = 0;
+  lastRenderKey = '';
+  layout = null;
+  layoutLo = Infinity;
+  layoutHi = -1;
+  pendingWindow = false;
+  rowsEl.scrollTop = 0;
+  clearDetail();
+  fetchWindow();
+  requestLayoutNow();
+}
+
+/** Clear cached rows/layout and refetch from the top (used when the chain
+ * filter changes, since filtering is server-side). */
+function resetAndRefetch() {
+  cache.clear();
+  totalFetched = 0;
+  lastRenderKey = '';
+  layout = null;
+  layoutLo = Infinity;
+  layoutHi = -1;
+  pendingWindow = false;
+  rowsEl.scrollTop = 0;
+  fetchWindow();
+  requestLayoutNow();
+}
+
 // Search on Enter; empty query resets back to the full history.
 searchEl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
@@ -603,16 +756,26 @@ searchEl.addEventListener('input', () => {
   }
 });
 
+// Apply the chain filter on Enter; clearing it resets to the full history.
+if (filterEl) {
+  filterEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      resetAndRefetch();
+    }
+  });
+}
+
+// Re-fetch when the hide-undated toggle changes (filtering is server-side).
+if (hideUndatedEl) {
+  hideUndatedEl.addEventListener('change', () => {
+    resetAndRefetch();
+  });
+}
+
 // Re-fetch when the show-submodules toggle changes (filtering is server-side).
 if (hideSubmodulesEl) {
   hideSubmodulesEl.addEventListener('change', () => {
-    allRows = [];
-    offset = 0;
-    total = 0;
-    pending = false;
-    layout = null;
-    loadMore();
-    requestLayout();
+    resetAndRefetch();
   });
 }
 
@@ -639,19 +802,14 @@ function startProgressiveLoader() {
   }, 300);
 }
 
-// Infinite scroll: load more rows near the bottom, and recompute the graph
-// layout dynamically as the user scrolls so lines stay continuous. The scroll
-// handler is a fallback; the background loader above is the primary driver.
+// Infinite scroll: fetch windows around the cursor and recompute the graph
+// layout as the user scrolls so lines stay continuous. The scroll handler is a
+// fallback; the background loader above is the primary driver.
 rowsEl.addEventListener('scroll', () => {
-  if (rowsEl.scrollTop + rowsEl.clientHeight >= rowsEl.scrollHeight - 40) {
-    loadMore();
-  }
-  // Recompute layout only when more rows have loaded than the current layout
-  // covers. The layout spans all loaded rows (offset 0), so scrolling alone
-  // never triggers a recompute — lines stay stable.
-  if (!layout || allRows.length > layoutLimit) {
-    requestLayout();
-  }
+  fetchWindow();
+  requestLayout();
+  // Update the status bar depth as the user scrolls.
+  reportStatus();
 });
 
 // Re-render and re-request layout when the webview resizes so columns stretch
@@ -683,7 +841,9 @@ window.addEventListener('resize', () => {
  * overrides the natural width entirely.
  */
 function currentGraphWidth() {
-  const maxLane = layout && layout.rows.length ? Math.max(...layout.rows.map((r) => r.lane), 0) : 0;
+  // Use the GLOBAL max lane (reported by the server) so the graph column width
+  // is stable regardless of which window is loaded — lanes don't jump on scroll.
+  const maxLane = layout ? (layout.max_lane || 0) : 0;
   const numLanes = Math.min(maxLane + 1, MAX_GRAPH_LANES);
   const naturalGraphW = numLanes * LANE_W + LANE_W;
   return colWidths.graph !== null ? colWidths.graph : naturalGraphW;
@@ -763,6 +923,9 @@ function currentColumnWidth(col) {
 function setupColumnResizeHandles() {
   const wrapEl = rowsEl.querySelector('.table-wrap');
   if (!wrapEl) return;
+  // The column headers live inside the table-wrap (the outer `.tbl-header`
+  // directly under #rows is an empty sticky spacer). Look up the header that
+  // actually holds the `.th` cells so handle positions match column boundaries.
   const header = wrapEl.querySelector('.tbl-header');
   if (!header) return;
   const cols = ['graph', 'content', 'date', 'author', 'commit'];

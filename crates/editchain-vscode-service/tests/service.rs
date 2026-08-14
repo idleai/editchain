@@ -21,7 +21,14 @@ use editchain_core::{
     ActorId, Clock, MessageOp, NodeId, Op, OpId, OpKind, ParentSet, Payload, ScopeRef, Tags,
     ToolOp, ToolStage,
 };
+use editchain_project::filter::ChainFilter;
 use editchain_vscode_service::Workspace;
+
+/// An empty filter that hides nothing (used to keep existing tests focused on
+/// windowing rather than filtering).
+fn no_filter() -> ChainFilter {
+    ChainFilter::new(String::new(), String::new(), false, false)
+}
 
 fn msg_op(node: u64, seq: u64, text: &[u8]) -> Op {
     Op {
@@ -52,7 +59,7 @@ fn history_window_returns_rows() {
     let ops = vec![msg_op(1, 1, b"first"), msg_op(1, 2, b"second")];
     let projection = editchain_project::HistoryProjection::from_ops(ops);
     let mut ws = Workspace::from_projection(projection);
-    let window = ws.history_window(0, 10, false);
+    let window = ws.history_window(0, 10, false, &no_filter());
     assert_eq!(window.total, 2);
     assert_eq!(window.rows.len(), 2);
 }
@@ -65,7 +72,7 @@ fn op_rows_have_uniform_author_and_short_commit_id() {
     let ops = vec![msg_op(7, 42, b"hello")];
     let projection = editchain_project::HistoryProjection::from_ops(ops);
     let mut ws = Workspace::from_projection(projection);
-    let window = ws.history_window(0, 10, false);
+    let window = ws.history_window(0, 10, false, &no_filter());
     let row = &window.rows[0];
     assert_eq!(row.author, "system");
     assert_eq!(row.commit_id, "7:42");
@@ -91,7 +98,7 @@ fn system_flag_marks_tool_and_import_ops() {
     let msg = msg_op(1, 2, b"hello");
     let projection = editchain_project::HistoryProjection::from_ops(vec![tool, msg]);
     let mut ws = Workspace::from_projection(projection);
-    let window = ws.history_window(0, 10, false);
+    let window = ws.history_window(0, 10, false, &no_filter());
     // Rows are newest-first; find by kind.
     let tool_row = window
         .rows

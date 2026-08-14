@@ -1,3 +1,6 @@
 node_modules/**
 repro*.js
 *.vsix
+.ui-out/**
+.wdio-vscode-service/**
+trace/**

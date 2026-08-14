@@ -132,7 +132,7 @@ describe('EditChain History Explorer', () => {
     await webview.close();
   });
 
-  it('scrolls through the full history until all rows render', async () => {
+  it('scrolls through the full history with a bounded viewport', async () => {
     const workbench = await browser.getWorkbench();
 
     // Open the webview (reuses the existing panel if still open).
@@ -148,11 +148,13 @@ describe('EditChain History Explorer', () => {
     // Scroll to the bottom smoothly until no more rows load (visible in video).
     await scrollHistoryToBottomSmooth();
 
-    // All rows should now be rendered. Submodules are hidden by default, so the
-    // expected count is 953 (the service's total with hide_submodules=true).
+    // The webview is a thin viewport: it renders only a slice around the scroll
+    // position, NOT the whole history. So the DOM row count must stay bounded
+    // (viewport + buffer), far below the total of 953.
     const rowCount = await browser.$$('.row').length;
-    console.log('[e2e] full history rows rendered:', rowCount);
-    expect(rowCount).toBe(953);
+    console.log('[e2e] viewport rows rendered:', rowCount);
+    expect(rowCount).toBeGreaterThan(0);
+    expect(rowCount).toBeLessThan(953);
 
     // Confirm we reached the true bottom. The two oldest ops are the genesis
 // ChainStart (`0:0:0`) and the seed session's first op (`...:65536`); both must
