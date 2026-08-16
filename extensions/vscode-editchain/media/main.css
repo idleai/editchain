@@ -194,9 +194,6 @@ body {
 .row-dim .text-cell, .row-dim .date-cell, .row-dim .author-cell, .row-dim .commit-cell { opacity: 0.7; }
 .graph-cell { line-height: 0; overflow: hidden; }
 .text-cell { padding-left: 8px; overflow: hidden; text-align: left; }
-/* Agent-authored text is offset with extra left padding so it reads as a
-   distinct voice from human/system rows. */
-.row-agent .text-cell { padding-left: 32px; }
 .date-cell, .author-cell, .commit-cell {
   padding-left: 8px;
   color: var(--vscode-descriptionForeground);
@@ -205,10 +202,50 @@ body {
 }
 .date-cell, .author-cell, .commit-cell { white-space: nowrap; }
 .row .summary {
-  font-weight: 600;
+  font-weight: 400;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* Human message turns render bold; all other rows (agent, system, tool) stay
+   at normal weight. */
+.row-human .summary {
+  font-weight: 700;
+}
+
+/* Chevron affordance on rows that carry bundled metadata sub-ops. Revealed on
+   click in the detail pane (git-graph style). Inline so it never affects row
+   height or column layout — virtual scroll keeps every row exactly ROW_H. */
+.subop-chevron {
+  display: inline-block;
+  width: 14px;
+  margin-right: 4px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.85em;
+  cursor: pointer;
+}
+
+/* Bundled metadata sub-op list in the detail pane. */
+.subop-list {
+  margin-top: 8px;
+}
+.subop-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--row-border);
+  cursor: pointer;
+}
+.subop-item:hover {
+  background-color: var(--vscode-list-hoverBackground);
+}
+.subop-kind {
+  font-weight: 600;
+}
+.subop-date {
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.85em;
 }
 
 /* Per-row graph cells (one small SVG per row). Each cell draws the node's dot,

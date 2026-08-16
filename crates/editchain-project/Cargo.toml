@@ -15,3 +15,4 @@ workspace = true
 [dependencies]
 editchain-core = { path = "../editchain-core" }
 regex.workspace = true
+serde_json = "1"

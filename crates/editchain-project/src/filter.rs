@@ -243,7 +243,7 @@ pub fn apply(
 /// hidden (or a cycle is encountered), those paths contribute nothing so the
 /// node becomes effectively rootless along them.
 #[must_use]
-fn nearest_kept_ancestors(
+pub(crate) fn nearest_kept_ancestors(
     key: &str,
     parents_of_key: &HashMap<String, Vec<String>>,
     hidden: &HashSet<String>,

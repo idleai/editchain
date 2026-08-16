@@ -4,8 +4,9 @@
     clippy::indexing_slicing,
     reason = "Test fixtures use fixed small vectors; indices are known to be in bounds"
 )]
-// Crate-level dependency marker (used by Cargo for feature resolution).
+// Crate-level dependency markers (used by Cargo for feature resolution).
 use regex as _;
+use serde_json as _;
 
 use editchain_core::{
     ActorId, Clock, GitAvailability, GitCommitEntity, GitObjectFormat, GitOid, GitSignature,

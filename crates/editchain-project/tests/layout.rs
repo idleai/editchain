@@ -1,7 +1,8 @@
 //! Tests for the lane layout module.
 
-// Crate-level dependency marker (used by Cargo for feature resolution).
+// Crate-level dependency markers (used by Cargo for feature resolution).
 use regex as _;
+use serde_json as _;
 
 use editchain_core::{NodeId, OpId};
 use editchain_project::layout::{compute_graph_layout, compute_lanes, LayoutContext};

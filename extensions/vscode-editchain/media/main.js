@@ -357,7 +357,18 @@ function buildGraphCell(row) {
   return s;
 }
 
-/** Build one row's HTML from its cached HistoryRow. `absIdx` is its absolute index. */
+/** Whether a row carries bundled metadata sub-ops (revealed on click). */
+function hasSubOps(row) {
+  return !!(row.sub_ops && row.sub_ops.length);
+}
+
+/** Build one row's HTML from its cached HistoryRow. `absIdx` is its absolute index.
+ *
+ * Rows carrying bundled metadata sub-ops get a chevron affordance in their
+ * content cell; clicking reveals those sub-ops in the detail pane (git-graph
+ * style). Sub-ops are NOT rendered as extra grid rows — every `.row` stays
+ * exactly ROW_H tall so virtual-scroll math is undisturbed.
+ */
 function buildRowHtml(row, absIdx, isGroupStart) {
   const groupClass = isGroupStart ? ' row-group-start' : '';
   const groupLabel = isGroupStart
@@ -366,12 +377,16 @@ function buildRowHtml(row, absIdx, isGroupStart) {
   const kindClass = row.is_system ? 'row-tool'
     : (row.kind === 'message' || row.kind === 'command') ? ''
     : 'row-dim';
-  const agentClass = row.author === 'agent' ? ' row-agent' : '';
-  return '<div class="row ' + kindClass + agentClass + groupClass + '" data-key="' + esc(row.node_key) +
+  const humanClass = row.author === 'human' ? ' row-human' : '';
+  const chevron = hasSubOps(row)
+    ? '<span class="subop-chevron" title="Reveal metadata records">▸</span>'
+    : '';
+  return '<div class="row ' + kindClass + humanClass + groupClass + '" data-key="' + esc(row.node_key) +
     '" data-row="' + absIdx + '" style="' + colStyle() + '">' +
     groupLabel +
     '<div class="graph-cell">' + buildGraphCell(row) + '</div>' +
-    '<div class="text-cell"><div class="summary">' + esc(row.summary || '(no summary)') + '</div></div>' +
+    '<div class="text-cell"><div class="summary">' + chevron +
+      esc(row.summary || '(no summary)') + '</div></div>' +
     '<div class="date-cell">' + esc(formatDate(row.timestamp_ms)) + '</div>' +
     '<div class="author-cell">' + esc(row.author || '') + '</div>' +
     '<div class="commit-cell">' + esc(row.commit_id || '') + '</div>' +
@@ -646,12 +661,55 @@ function progressiveLoad() {
 
 function inspect(row) {
   console.log('[editchain] inspect', row && row.node_key);
+  // Rows carrying bundled metadata sub-ops reveal them in the detail pane
+  // (git-graph style) instead of opening a JSON editor.
+  if (hasSubOps(row)) {
+    renderSubOps(row);
+    return;
+  }
   // Ask the extension host to open a read-only JSON editor for this node.
   if (row.git_oid) {
     vscode.postMessage({ type: 'openJson', git_oid: row.git_oid, repository: row.repository });
   } else if (row.op_id) {
     vscode.postMessage({ type: 'openJson', op_id: row.op_id });
   }
+}
+
+/** Render a row's bundled metadata sub-ops in the detail pane.
+ *
+ * Shows the parent summary as the title, then an indented list of each sub-op
+ * (record type + timestamp), like git-graph commit detail expansion. Clicking
+ * a sub-op opens its raw JSON editor.
+ */
+function renderSubOps(row) {
+  layoutEl.classList.add('has-detail');
+  detailEl.innerHTML = '';
+  const titleEl = document.createElement('div');
+  titleEl.className = 'detail-title';
+  titleEl.textContent = (row.summary || '(no summary)') +
+    ' — ' + row.sub_ops.length + ' metadata record' + (row.sub_ops.length === 1 ? '' : 's');
+  detailEl.appendChild(titleEl);
+
+  const listEl = document.createElement('div');
+  listEl.className = 'subop-list';
+  for (const sub of row.sub_ops) {
+    const item = document.createElement('div');
+    item.className = 'subop-item';
+    item.title = 'Open raw record';
+    const kindEl = document.createElement('span');
+    kindEl.className = 'subop-kind';
+    kindEl.textContent = sub.kind || 'meta';
+    const dateEl = document.createElement('span');
+    dateEl.className = 'subop-date';
+    dateEl.textContent = formatDate(sub.timestamp_ms);
+    item.appendChild(kindEl);
+    item.appendChild(dateEl);
+    item.addEventListener('click', () => {
+      vscode.postMessage({ type: 'openJson', op_id: sub.op_id });
+    });
+    listEl.appendChild(item);
+  }
+  detailEl.appendChild(listEl);
 }
 
 /** Hide the detail pane (e.g. on reset/search). */

@@ -121,6 +121,7 @@
   function mixedHistory() {
     const rows = [
       opRow('node:s1:a', 'Agent message one', { group:'session:s1', kind:'message', author:'agent' }),
+      opRow('node:s1:h', 'Human message one', { group:'session:s1', kind:'message', author:'human' }),
       opRow('node:s1:b', 'Tool call result',   { group:'session:s1', kind:'tool', is_system:true }),
       opRow('node:s2:c', 'Second session note',{ group:'session:s2', kind:'command' }),
       gitRow('git:x', 'repo commit x', { group:'repo:x' }),
@@ -211,6 +212,18 @@
 
     large() {
       return largeHistory();
+    },
+
+    longsummary() {
+      // A row whose summary is ~1024 chars, to exercise the ellipsis/truncation
+      // behaviour when the content column is resized.
+      const long = 'word '.repeat(200); // ~1000 chars
+      const rows = [
+        opRow('node:l:1', long, { group:'session:s1', kind:'message', author:'human' }),
+        opRow('node:l:2', 'short row', { group:'session:s1', kind:'message' }),
+      ];
+      const layoutRows = rows.map((r) => ({ node: r.node_key, lane: 0 }));
+      return { rows, layoutRows, edges: [] };
     },
   };
 

@@ -17,6 +17,94 @@ use super::envelope::{CcContentBlock, CcEnvelope};
 use crate::ids::{derive_actor_id, derive_session_id, SourcePosition, SourceStream};
 use crate::sink::{payload_for, BlobSink};
 
+/// Whether a Claude Code record carries only metadata (no user-facing content).
+///
+/// Metadata records (e.g. `last-prompt`, `permission-mode`, `custom-title`,
+/// `mode`, `agent-name`, `file-history-snapshot`, `queue-operation`, and
+/// telemetry `system` subtypes) are bundled as sub-ops of a real turn/tool node
+/// rather than occupying their own graph row/lane. They are tagged `META` so the
+/// projection can group them without re-parsing the raw JSONL.
+///
+/// This also covers whitespace-only assistant turns — streaming artifacts where
+/// the model emitted only newlines before a tool call. They carry no user-facing
+/// content and are bundled like metadata.
+#[must_use]
+pub fn is_metadata_record(env: &CcEnvelope) -> bool {
+    match env.record_type.as_str() {
+        "last-prompt"
+        | "permission-mode"
+        | "custom-title"
+        | "mode"
+        | "agent-name"
+        | "file-history-snapshot"
+        | "queue-operation"
+        | "ai-title" => true,
+        // Telemetry / informational system records carry no user-facing prose.
+        "system" => matches!(
+            env.subtype.as_str(),
+            "turn_duration"
+                | "away_summary"
+                | "local_command"
+                | "scheduled_task_fire"
+                | "informational"
+        ),
+        // A whitespace-only assistant turn (no tool call, no meaningful text) is
+        // a streaming artifact with no content — bundle it like metadata.
+        "assistant" => is_whitespace_only_assistant(env),
+        // Attachment records that carry environment/listing metadata rather than
+        // user-facing content (agent/skill/MCP listings, reminders, plan-mode
+        // transitions, diagnostics) — bundle them like metadata.
+        "attachment" => matches!(
+            env.attachment_type.as_str(),
+            "task_reminder"
+                | "skill_listing"
+                | "agent_listing_delta"
+                | "mcp_instructions_delta"
+                | "deferred_tools_delta"
+                | "command_permissions"
+                | "date_change"
+                | "nested_memory"
+                | "read_truncation_notice"
+                | "plan_mode"
+                | "plan_mode_exit"
+                | "diagnostics"
+        ),
+        _ => false,
+    }
+}
+
+/// Whether an assistant record is a whitespace-only streaming artifact.
+///
+/// Claude Code splits an assistant turn that ends in a tool call into two
+/// records: a text record (possibly whitespace-only) and a `tool_use` record.
+/// When the model emits only newlines before calling the tool, the text record
+/// carries no user-facing content. Returns true when the message has text blocks
+/// that are all whitespace and no `tool_use` block.
+#[must_use]
+fn is_whitespace_only_assistant(env: &CcEnvelope) -> bool {
+    let Some(msg) = &env.message else {
+        return false;
+    };
+    let mut has_text = false;
+    for block in &msg.content {
+        match block {
+            CcContentBlock::Text { text } => {
+                if !text.trim().is_empty() {
+                    // Meaningful prose — not a whitespace artifact.
+                    return false;
+                }
+                has_text = true;
+            }
+            CcContentBlock::ToolUse { .. } => {
+                // A real tool call — not a degenerate preamble.
+                return false;
+            }
+            CcContentBlock::ToolResult { .. } | CcContentBlock::Thinking { .. } => {}
+        }
+    }
+    has_text
+}
+
 /// Normalize a parsed CC envelope into editchain operations.
 ///
 /// Returns (`raw_import_op`, `optional_normalized_ops`).
@@ -87,13 +175,17 @@ pub fn normalize_envelope(
     };
 
     // Raw import op.
+    let mut raw_tags = Tags::IMPORT;
+    if is_metadata_record(env) {
+        raw_tags |= Tags::META;
+    }
     let raw_op = Op {
         id: op_id,
         parents: ParentSet::None,
         actor,
         clock,
         scope: ScopeRef::Session(session_id),
-        tags: Tags::IMPORT,
+        tags: raw_tags,
         kind: OpKind::Import(ImportOp {
             raw_ref: payload_for(raw_bytes, blobs)
                 .unwrap_or_else(|_| Payload::Inline(raw_bytes[..4096].to_vec())),

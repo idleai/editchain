@@ -4,8 +4,9 @@
     clippy::indexing_slicing,
     reason = "Tests index into known-length parent vectors"
 )]
-// Crate-level dependency marker (used by Cargo for feature resolution).
+// Crate-level dependency markers (used by Cargo for feature resolution).
 use regex as _;
+use serde_json as _;
 
 use editchain_core::{
     ActorId, Clock, MessageOp, NodeId, Op, OpId, OpKind, ParentSet, Payload, ScopeRef, Tags,

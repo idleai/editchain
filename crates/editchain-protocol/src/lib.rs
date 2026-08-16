@@ -256,6 +256,27 @@ pub struct HistoryRow {
     /// connectors (per-row graph cells).
     #[serde(default)]
     pub transitions: Vec<(usize, usize)>,
+    /// Bundled metadata sub-ops attached to this row (revealed on click).
+    #[serde(default)]
+    pub sub_ops: Vec<SubOpSummary>,
+}
+
+/// A bundled metadata sub-op attached to a history row.
+///
+/// Metadata-only records (e.g. `last-prompt`, `permission-mode`, `custom-title`,
+/// `mode`) carry no user-facing content and are bundled as sub-ops of a real
+/// turn/tool node rather than occupying their own graph row/lane. The viewer
+/// reveals them on click, like git-graph commit detail expansion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubOpSummary {
+    /// The operation ID (display form `"node:boot:seq"`).
+    pub op_id: String,
+    /// Display summary (e.g. the record type or a short label).
+    pub summary: String,
+    /// Short type tag (e.g. "last-prompt", "mode", "permission-mode").
+    pub kind: String,
+    /// Timestamp in Unix ms (0 if unknown).
+    pub timestamp_ms: u64,
 }
 
 /// A window of history rows with generation counters.

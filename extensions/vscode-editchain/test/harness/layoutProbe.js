@@ -285,6 +285,25 @@
       });
     }
 
+    // Check 5: human message turns render bold; all other rows normal weight;
+    // no extra left padding on non-human (agent) rows.
+    if (wrapEl) {
+      const humanRow = wrapEl.querySelector('.row.row-human .summary');
+      const agentRow = wrapEl.querySelector('.row[data-key^="node:s1:a"] .summary');
+      const humanBold = humanRow ? getComputedStyle(humanRow).fontWeight === '700' : false;
+      const agentNormal = agentRow ? getComputedStyle(agentRow).fontWeight === '400' : false;
+      // No extra padding: agent text-cell left padding equals the base 8px.
+      const agentCell = wrapEl.querySelector('.row[data-key^="node:s1:a"] .text-cell');
+      const agentPad = agentCell ? parseFloat(getComputedStyle(agentCell).paddingLeft) : null;
+      const noExtraPad = agentPad === null || agentPad <= 8.5;
+      checks.push({
+        name:'HUMAN_BOLD_NO_AGENT_PAD',
+        pass:humanBold && agentNormal && noExtraPad,
+        detail:'humanBold=' + humanBold + ' agentNormal=' + agentNormal +
+          ' agentPad=' + agentPad,
+      });
+    }
+
     return checks;
   }
 

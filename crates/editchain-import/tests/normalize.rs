@@ -9,7 +9,9 @@ use tempfile as _;
 
 use editchain_core::{op::OpKind, payload::Payload, tags::Tags};
 use editchain_import::claude_code::envelope::parse_envelope;
-use editchain_import::claude_code::normalize::{normalize_envelope, NormalizeOptions};
+use editchain_import::claude_code::normalize::{
+    is_metadata_record, normalize_envelope, NormalizeOptions,
+};
 use editchain_import::ids::{derive_node_id, hash_raw, SourceStream};
 use editchain_import::sink::MemoryBlobSink;
 
@@ -32,6 +34,31 @@ fn test_empty_timestamp() {
         editchain_import::claude_code::normalize::parse_timestamp(""),
         0
     );
+}
+
+#[test]
+fn test_whitespace_only_assistant_is_metadata() {
+    // An assistant turn with only whitespace text (no tool call) is a streaming
+    // artifact — classified as metadata so it bundles into a real node.
+    let json = br#"{"type":"assistant","uuid":"abc","sessionId":"sess-1","timestamp":"2026-07-09T18:56:19.739Z","message":{"role":"assistant","content":[{"type":"text","text":"\n\n\n"}]}}"#;
+    let env = parse_envelope(json).unwrap();
+    assert!(is_metadata_record(&env));
+}
+
+#[test]
+fn test_assistant_with_text_is_not_metadata() {
+    // An assistant turn with real prose is NOT metadata.
+    let json = br#"{"type":"assistant","uuid":"abc","sessionId":"sess-1","timestamp":"2026-07-09T18:56:19.739Z","message":{"role":"assistant","content":[{"type":"text","text":"hello world"}]}}"#;
+    let env = parse_envelope(json).unwrap();
+    assert!(!is_metadata_record(&env));
+}
+
+#[test]
+fn test_assistant_with_tool_use_is_not_metadata() {
+    // An assistant turn with a tool call is NOT metadata (even if text is empty).
+    let json = br#"{"type":"assistant","uuid":"abc","sessionId":"sess-1","timestamp":"2026-07-09T18:56:19.739Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"Bash","input":{}}]}}"#;
+    let env = parse_envelope(json).unwrap();
+    assert!(!is_metadata_record(&env));
 }
 
 #[expect(

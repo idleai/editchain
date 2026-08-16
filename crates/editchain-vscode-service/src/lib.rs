@@ -166,6 +166,7 @@ impl Workspace {
                     above,
                     below,
                     transitions,
+                    sub_ops: sub_op_summaries(node.sub_ops()),
                 }
             })
             .collect();
@@ -419,6 +420,97 @@ fn node_author(node: &editchain_project::HistoryNode) -> String {
         editchain_project::HistoryNode::CollapsedImport { author, .. } => author.clone(),
         editchain_project::HistoryNode::GitCommit(commit) => payload_text(&commit.author.name),
     }
+}
+
+/// Build the bundled sub-op summaries for a row from its attached metadata ops.
+///
+/// Each bundled sub-op is a raw `Import` op tagged `META`. Its summary is the
+/// record type (derived from the raw JSONL's `type` field when parseable, else
+/// the raw reference text), so the viewer can label each revealed sub-row.
+#[must_use]
+fn sub_op_summaries(sub_ops: &[Op]) -> Vec<editchain_protocol::SubOpSummary> {
+    sub_ops
+        .iter()
+        .map(|op| {
+            let (summary, kind) = sub_op_label(op);
+            editchain_protocol::SubOpSummary {
+                op_id: op.id.to_string(),
+                summary,
+                kind,
+                timestamp_ms: op.clock.as_u64(),
+            }
+        })
+        .collect()
+}
+
+/// Derive a display label for a bundled sub-op.
+///
+/// Metadata sub-ops are raw Import ops — parse the JSONL record type. Tool-result
+/// sub-ops are `Tool` ops with `stage: Finish` — render a content preview.
+#[must_use]
+fn sub_op_label(op: &Op) -> (String, String) {
+    // A tool-result sub-op (grouped under its tool call): show a content preview.
+    if let OpKind::Tool(t) = &op.kind {
+        if matches!(t.stage, editchain_core::op::ToolStage::Finish) {
+            let preview = tool_result_preview(&payload_text(&t.content));
+            return (preview, "tool_result".to_string());
+        }
+    }
+    let raw = match &op.kind {
+        OpKind::Import(i) => match &i.raw_ref {
+            Payload::Inline(b) => String::from_utf8_lossy(b).to_string(),
+            Payload::Empty | Payload::Blob(_) => String::new(),
+        },
+        OpKind::ChainStart(_)
+        | OpKind::Actor(_)
+        | OpKind::Message(_)
+        | OpKind::Tool(_)
+        | OpKind::Command(_)
+        | OpKind::File(_)
+        | OpKind::Reflection(_)
+        | OpKind::Note(_)
+        | OpKind::Error(_)
+        | OpKind::GitCommit(_)
+        | OpKind::GitLink(_)
+        | OpKind::Unknown(_) => String::new(),
+    };
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+        if let Some(record_type) = value.get("type").and_then(serde_json::Value::as_str) {
+            return (record_type.to_string(), record_type.to_string());
+        }
+    }
+    (raw, "meta".to_string())
+}
+
+/// Produce a pretty-printed, truncated preview of a tool result's content.
+///
+/// Strips leading `<digits>\t` line-number prefixes, collapses to the first
+/// non-empty line, and truncates to ~1024 chars. Mirrors the projection's
+/// `tool_result_summary` so sub-op previews match the main-pane summaries.
+#[must_use]
+fn tool_result_preview(content: &str) -> String {
+    const MAX: usize = 1024;
+    let stripped: String = content
+        .lines()
+        .map(|l| {
+            let trimmed = l.trim_start();
+            let after_digits = trimmed.trim_start_matches(|c: char| c.is_ascii_digit());
+            after_digits.strip_prefix('\t').map_or(l, |rest| rest)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut line = stripped
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if line.chars().count() > MAX {
+        let mut cut = line.chars().take(MAX).collect::<String>();
+        cut.push('…');
+        line = cut;
+    }
+    line
 }
 
 /// Derive a short author label from an op's tags.
@@ -757,5 +849,104 @@ fn payload_text(payload: &Payload) -> String {
     match payload {
         Payload::Inline(b) => String::from_utf8_lossy(b).to_string(),
         Payload::Empty | Payload::Blob(_) => String::new(),
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Tests index into vectors whose length is asserted immediately before"
+)]
+mod tests {
+    use super::*;
+    use editchain_core::{ImportOp, MessageOp, SessionId};
+
+    /// Build a raw import op.
+    fn import_op(node: u64, seq: u64, meta: bool) -> Op {
+        let mut tags = Tags::IMPORT;
+        if meta {
+            tags |= Tags::META;
+        }
+        Op {
+            id: OpId::new(NodeId(node), 0, seq),
+            parents: ParentSet::None,
+            actor: ActorId(1),
+            clock: Clock::UnixMs(seq),
+            scope: ScopeRef::Session(SessionId(10)),
+            tags,
+            kind: OpKind::Import(ImportOp {
+                raw_ref: Payload::Inline(
+                    format!(r#"{{"type":"last-prompt","seq":{seq}}}"#).into_bytes(),
+                ),
+                raw_hash: None,
+            }),
+        }
+    }
+
+    /// Build a normalized message op whose parent is `parent`.
+    fn message_op(node: u64, seq: u64, parent: OpId) -> Op {
+        Op {
+            id: OpId::new(NodeId(node), 0, seq),
+            parents: ParentSet::One(parent),
+            actor: ActorId(1),
+            clock: Clock::UnixMs(seq),
+            scope: ScopeRef::Session(SessionId(10)),
+            tags: Tags::HUMAN | Tags::MESSAGE,
+            kind: OpKind::Message(MessageOp {
+                content: Payload::Inline(b"hello world".to_vec()),
+                content_type: Payload::Empty,
+            }),
+        }
+    }
+
+    #[test]
+    fn history_window_bundles_meta_subops() {
+        // A real turn (import + message), then a META import. The META import
+        // must bundle into the turn's row as a sub-op, not appear as its own row.
+        let turn = import_op(1, 1, false);
+        let msg = message_op(1, 2, turn.id);
+        let meta = import_op(1, 3, true);
+
+        let projection = HistoryProjection::from_ops(vec![turn.clone(), msg, meta.clone()]);
+        let mut ws = Workspace::from_projection(projection);
+        let filter = ChainFilter::default();
+        let window = ws.history_window(0, 100, false, &filter);
+
+        // One row (the turn); the META import is bundled.
+        assert_eq!(window.rows.len(), 1);
+        assert_eq!(window.rows[0].sub_ops.len(), 1);
+        assert_eq!(window.rows[0].sub_ops[0].op_id, meta.id.to_string());
+        // The sub-op label derives the record type from the raw JSONL.
+        assert_eq!(window.rows[0].sub_ops[0].kind, "last-prompt");
+    }
+
+    #[test]
+    fn sub_op_label_parses_record_type() {
+        let op = import_op(1, 1, true);
+        let (summary, kind) = sub_op_label(&op);
+        assert_eq!(summary, "last-prompt");
+        assert_eq!(kind, "last-prompt");
+    }
+
+    #[test]
+    fn sub_op_label_renders_tool_result_preview() {
+        // A tool-result sub-op (Tool, Finish) should render a content preview.
+        let op = Op {
+            id: OpId::new(NodeId(1), 0, 1),
+            parents: ParentSet::None,
+            actor: ActorId(1),
+            clock: Clock::UnixMs(1),
+            scope: ScopeRef::Session(SessionId(10)),
+            tags: Tags::TOOL,
+            kind: OpKind::Tool(editchain_core::op::ToolOp {
+                tool_call_id: Payload::Empty,
+                tool_name: Payload::Empty,
+                stage: editchain_core::op::ToolStage::Finish,
+                content: Payload::Inline(b"1\tline one\n2\tline two".to_vec()),
+            }),
+        };
+        let (summary, kind) = sub_op_label(&op);
+        assert_eq!(summary, "line one");
+        assert_eq!(kind, "tool_result");
     }
 }

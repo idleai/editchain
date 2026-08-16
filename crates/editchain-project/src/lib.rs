@@ -47,6 +47,11 @@ pub enum HistoryNode {
         /// role must come from the normalized children that carry `HUMAN` /
         /// `AGENT`.
         author: String,
+        /// Bundled metadata-only sub-ops attached to this node (revealed on
+        /// click). These are raw Import ops tagged `META` that carry no
+        /// user-facing content; they hang off this real turn/tool node rather
+        /// than occupying their own graph row/lane.
+        sub_ops: Vec<Op>,
     },
     /// A `Git` commit entity.
     GitCommit(GitCommitEntity),
@@ -54,11 +59,18 @@ pub enum HistoryNode {
 
 impl HistoryNode {
     /// Returns a display summary for this node.
+    ///
+    /// For collapsed imports, the summary is the row's own content combined with
+    /// the content of any bundled sub-ops (metadata records, tool results), so a
+    /// row that would otherwise show `(no summary)` still carries meaningful
+    /// text. The combined result is truncated to ~200 chars.
     #[must_use]
     pub fn summary(&self) -> String {
         match self {
             Self::EditOperation(op) => op_summary(op),
-            Self::CollapsedImport { summary, .. } => summary.clone(),
+            Self::CollapsedImport {
+                summary, sub_ops, ..
+            } => combined_summary(summary, sub_ops),
             Self::GitCommit(commit) => match &commit.message {
                 Payload::Inline(b) => String::from_utf8_lossy(b).to_string(),
                 Payload::Empty | Payload::Blob(_) => commit.oid.to_hex(),
@@ -211,6 +223,17 @@ impl HistoryNode {
                 oids.dedup();
                 commit.parents = oids;
             }
+        }
+    }
+
+    /// Returns the bundled metadata sub-ops attached to this node (empty for
+    /// nodes without any). These are raw `Import` ops tagged `META` that carry
+    /// no user-facing content; the viewer reveals them on click.
+    #[must_use]
+    pub fn sub_ops(&self) -> &[Op] {
+        match self {
+            Self::CollapsedImport { sub_ops, .. } => sub_ops,
+            Self::EditOperation(_) | Self::GitCommit(_) => &[],
         }
     }
 
@@ -499,6 +522,11 @@ impl HistoryProjection {
     /// summary is derived from the children's content, so the graph shows one
     /// meaningful node per source line instead of a dense star. Non-import ops
     /// (e.g. `ChainStart`, git-link records) are kept as-is.
+    ///
+    /// Metadata-only raw imports (tagged `META`) are **bundled** as sub-ops of
+    /// the nearest preceding real turn/tool node rather than occupying their own
+    /// row/lane. They are attached to that node's `sub_ops` and dropped from the
+    /// top-level node list, so they don't inflate the lane count.
     #[must_use]
     fn collapsed_ops(&self) -> Vec<HistoryNode> {
         // Set of raw import op ids (the linear backbone).
@@ -525,30 +553,260 @@ impl HistoryProjection {
             }
         }
 
-        self.ops
-            .iter()
-            .filter_map(|op| {
-                if matches!(op.kind, editchain_core::OpKind::Import(_)) {
-                    let children = children_of.get(&op.id);
-                    let summary = collapsed_import_summary(op, children);
-                    let kind = collapsed_import_kind(children);
-                    let author = collapsed_import_author(children);
-                    Some(HistoryNode::CollapsedImport {
-                        op: op.clone(),
-                        summary,
-                        kind,
-                        author,
-                    })
-                } else if folded.contains(&op.id) {
-                    // Drop normalized ops folded into their parent import op.
-                    None
-                } else {
-                    // Standalone op (e.g. ChainStart, or a message not tied to an
-                    // import) — keep as-is.
-                    Some(HistoryNode::EditOperation(op.clone()))
+        // Build top-level nodes in input order, bundling META imports into the
+        // nearest preceding real turn/tool node.
+        //
+        // A "real" node is a non-META import (a turn/tool with content) or a
+        // standalone non-import op. META imports attach to the most recent real
+        // node seen so far; if none exists yet (metadata before any turn), they
+        // stay standalone so the session header records aren't lost.
+        //
+        // When a META import is bundled (dropped from the top-level list), its
+        // CHILDREN must be re-parented to the node it bundled into — otherwise a
+        // child that pointed at the dropped META op dangles and severs the chain.
+        // We record each bundled META op id -> its replacement parent id, then
+        // splice children's parents in a second pass.
+        let mut result: Vec<HistoryNode> = Vec::with_capacity(self.ops.len());
+        // Index of the most recent real node in `result` that can accept sub-ops.
+        let mut last_real: Option<usize> = None;
+        // Bundled META op id -> the id of the real node it was folded into.
+        let mut meta_replacement: HashMap<OpId, OpId> = HashMap::new();
+        for op in &self.ops {
+            if matches!(op.kind, editchain_core::OpKind::Import(_)) {
+                let is_meta = op.tags.matches_any(editchain_core::Tags::META);
+                if is_meta {
+                    // Bundle into the nearest preceding real node if one exists.
+                    if let Some(idx) = last_real {
+                        if let Some(HistoryNode::CollapsedImport {
+                            op: parent_op,
+                            sub_ops,
+                            ..
+                        }) = result.get_mut(idx)
+                        {
+                            sub_ops.push(op.clone());
+                            let _: Option<OpId> = meta_replacement.insert(op.id, parent_op.id);
+                        }
+                        continue;
+                    }
+                    // No real parent yet — fall through to standalone below.
                 }
+                let children = children_of.get(&op.id);
+                let summary = collapsed_import_summary(op, children);
+                let kind = collapsed_import_kind(children);
+                let author = collapsed_import_author(children);
+                let idx = result.len();
+                result.push(HistoryNode::CollapsedImport {
+                    op: op.clone(),
+                    summary,
+                    kind,
+                    author,
+                    sub_ops: Vec::new(),
+                });
+                last_real = Some(idx);
+            } else if folded.contains(&op.id) {
+                // Drop normalized ops folded into their parent import op.
+            } else {
+                // Standalone op (e.g. ChainStart, or a message not tied to an
+                // import) — keep as-is.
+                let idx = result.len();
+                result.push(HistoryNode::EditOperation(op.clone()));
+                last_real = Some(idx);
+            }
+        }
+
+        // Splice pass: re-parent any node whose parent was a bundled META op so
+        // it points at the real node that absorbed that META op. This keeps each
+        // chain continuous across dropped metadata records.
+        if !meta_replacement.is_empty() {
+            for node in &mut result {
+                let keys = node.parent_keys(&self.git.links);
+                let mut spliced: Vec<String> = keys
+                    .iter()
+                    .map(|k| {
+                        OpId::from_display_str(k)
+                            .and_then(|id| meta_replacement.get(&id).copied())
+                            .map_or_else(|| k.clone(), |repl| repl.to_string())
+                    })
+                    .collect();
+                spliced.sort_unstable();
+                spliced.dedup();
+                node.set_parent_keys(&spliced);
+            }
+        }
+
+        // Tool-grouping pass: fold each tool RESULT into its tool CALL's sub-ops
+        // so a call + its result render as one row (the result revealed on click).
+        //
+        // A tool result is a CollapsedImport whose dominant Tool child is
+        // `stage: Finish` with an empty name; its parent is the tool call's raw
+        // import op. We attach the result's Tool op to the call's `sub_ops` and
+        // drop the result from the top-level list, splicing its children to the
+        // call (same technique as META bundling) so chain continuity holds.
+        self.group_tool_results(&mut result, &children_of);
+
+        result
+    }
+
+    /// Fold tool-result nodes into their tool-call parents' sub-ops.
+    ///
+    /// Mutates `result` in place: tool-result nodes whose parent is a tool-call
+    /// node are removed from the top-level list and their Tool op is appended to
+    /// the call's `sub_ops`. Children of a dropped result are re-parented to the
+    /// call so the chain stays continuous.
+    fn group_tool_results(
+        &self,
+        result: &mut Vec<HistoryNode>,
+        children_of: &HashMap<OpId, Vec<&Op>>,
+    ) {
+        // Map node key -> index in `result`.
+        let mut index_of: HashMap<String, usize> = HashMap::with_capacity(result.len());
+        for (i, n) in result.iter().enumerate() {
+            let _: Option<usize> = index_of.insert(n.node_key(), i);
+        }
+
+        // Identify which nodes are tool results and which are tool calls.
+        let mut is_result: Vec<bool> = Vec::with_capacity(result.len());
+        for n in result.iter() {
+            is_result.push(Self::node_is_tool_result(n, children_of));
+        }
+
+        // For each tool-result node, find its parent; if the parent is a tool
+        // call, fold the result into it. Collect decisions first (no mutation of
+        // `result` during iteration), then apply.
+        let mut replacement: HashMap<OpId, OpId> = HashMap::new();
+        let mut drop_idx: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        // parent index -> tool-result ops to attach as sub-ops.
+        let mut attach: HashMap<usize, Vec<Op>> = HashMap::new();
+        for (i, n) in result.iter().enumerate() {
+            if !is_result.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(parent_key) = n.parent_keys(&self.git.links).first().cloned() else {
+                continue;
+            };
+            let Some(&parent_idx) = index_of.get(&parent_key) else {
+                continue;
+            };
+            let parent_is_call = !is_result.get(parent_idx).copied().unwrap_or(false)
+                && result
+                    .get(parent_idx)
+                    .is_some_and(|pn| Self::node_is_tool_call(pn, children_of));
+            if parent_is_call {
+                if let Some(tool_op) = Self::tool_result_op(n, children_of) {
+                    attach.entry(parent_idx).or_default().push(tool_op);
+                }
+                if let HistoryNode::CollapsedImport { op, .. } = n {
+                    if let Some(parent_id) = OpId::from_display_str(&parent_key) {
+                        let _: Option<OpId> = replacement.insert(op.id, parent_id);
+                    }
+                    let _: bool = drop_idx.insert(i);
+                }
+            }
+        }
+
+        // Attach collected tool-result ops to their call's sub-ops.
+        for (parent_idx, ops) in &attach {
+            if let Some(HistoryNode::CollapsedImport { sub_ops, .. }) = result.get_mut(*parent_idx)
+            {
+                sub_ops.extend(ops.iter().cloned());
+            }
+        }
+
+        // Remove dropped results and splice their children to the call.
+        if !drop_idx.is_empty() {
+            let mut kept: Vec<HistoryNode> = Vec::with_capacity(result.len());
+            for (i, n) in result.drain(..).enumerate() {
+                if drop_idx.contains(&i) {
+                    continue;
+                }
+                kept.push(n);
+            }
+            *result = kept;
+            for node in result.iter_mut() {
+                let keys = node.parent_keys(&self.git.links);
+                let mut spliced: Vec<String> = keys
+                    .iter()
+                    .map(|k| {
+                        OpId::from_display_str(k)
+                            .and_then(|id| replacement.get(&id).copied())
+                            .map_or_else(|| k.clone(), |repl| repl.to_string())
+                    })
+                    .collect();
+                spliced.sort_unstable();
+                spliced.dedup();
+                node.set_parent_keys(&spliced);
+            }
+        }
+    }
+
+    /// Whether a collapsed-import node is a tool RESULT (Finish stage, empty name).
+    fn node_is_tool_result(node: &HistoryNode, children_of: &HashMap<OpId, Vec<&Op>>) -> bool {
+        let HistoryNode::CollapsedImport { op, .. } = node else {
+            return false;
+        };
+        Self::tool_child(op.id, children_of).is_some_and(|t| {
+            matches!(t.stage, editchain_core::op::ToolStage::Finish)
+                && payload_text(&t.tool_name).is_empty()
+        })
+    }
+
+    /// Whether a collapsed-import node is a tool CALL (Start stage, named).
+    fn node_is_tool_call(node: &HistoryNode, children_of: &HashMap<OpId, Vec<&Op>>) -> bool {
+        let HistoryNode::CollapsedImport { op, .. } = node else {
+            return false;
+        };
+        Self::tool_child(op.id, children_of).is_some_and(|t| {
+            matches!(t.stage, editchain_core::op::ToolStage::Start)
+                && !payload_text(&t.tool_name).is_empty()
+        })
+    }
+
+    /// The first Tool child of a raw import op, if any.
+    fn tool_child<'a>(
+        import_id: OpId,
+        children_of: &'a HashMap<OpId, Vec<&'a Op>>,
+    ) -> Option<&'a editchain_core::op::ToolOp> {
+        children_of.get(&import_id).and_then(|children| {
+            children.iter().find_map(|c| match &c.kind {
+                editchain_core::OpKind::Tool(t) => Some(t),
+                editchain_core::OpKind::ChainStart(_)
+                | editchain_core::OpKind::Actor(_)
+                | editchain_core::OpKind::Message(_)
+                | editchain_core::OpKind::Command(_)
+                | editchain_core::OpKind::File(_)
+                | editchain_core::OpKind::Reflection(_)
+                | editchain_core::OpKind::Import(_)
+                | editchain_core::OpKind::Note(_)
+                | editchain_core::OpKind::Error(_)
+                | editchain_core::OpKind::GitCommit(_)
+                | editchain_core::OpKind::GitLink(_)
+                | editchain_core::OpKind::Unknown(_) => None,
             })
-            .collect()
+        })
+    }
+
+    /// The normalized Tool op of a tool-result node (for attaching as a sub-op).
+    fn tool_result_op(node: &HistoryNode, children_of: &HashMap<OpId, Vec<&Op>>) -> Option<Op> {
+        let HistoryNode::CollapsedImport { op, .. } = node else {
+            return None;
+        };
+        children_of.get(&op.id).and_then(|children| {
+            children.iter().find_map(|c| match &c.kind {
+                editchain_core::OpKind::Tool(_) => Some((*c).clone()),
+                editchain_core::OpKind::ChainStart(_)
+                | editchain_core::OpKind::Actor(_)
+                | editchain_core::OpKind::Message(_)
+                | editchain_core::OpKind::Command(_)
+                | editchain_core::OpKind::File(_)
+                | editchain_core::OpKind::Reflection(_)
+                | editchain_core::OpKind::Import(_)
+                | editchain_core::OpKind::Note(_)
+                | editchain_core::OpKind::Error(_)
+                | editchain_core::OpKind::GitCommit(_)
+                | editchain_core::OpKind::GitLink(_)
+                | editchain_core::OpKind::Unknown(_) => None,
+            })
+        })
     }
 
     /// Merge resolved git commits into the projection.
@@ -667,7 +925,16 @@ impl HistoryProjection {
 fn op_summary(op: &Op) -> String {
     use editchain_core::OpKind;
     match &op.kind {
-        OpKind::Message(m) => payload_text(&m.content),
+        OpKind::Message(m) => message_summary(&payload_text(&m.content)),
+        // A tool_result (stage Finish, empty tool_name) carries its result in
+        // `content`; show a pretty-printed, truncated preview of it rather than
+        // the empty tool_name.
+        OpKind::Tool(t)
+            if matches!(t.stage, editchain_core::op::ToolStage::Finish)
+                && payload_text(&t.tool_name).is_empty() =>
+        {
+            tool_result_summary(&payload_text(&t.content))
+        }
         OpKind::Tool(t) => payload_text(&t.tool_name),
         OpKind::Command(c) => payload_text(&c.content),
         OpKind::File(f) => format!("file:{}", f.path.0),
@@ -681,6 +948,53 @@ fn op_summary(op: &Op) -> String {
         OpKind::GitLink(l) => format!("git:{}", l.target_oid),
         OpKind::Unknown(u) => format!("unknown kind={}", u.kind_discriminant),
     }
+}
+
+/// Produce a pretty-printed, truncated preview of a tool result's content.
+///
+/// Tool results are raw text (file contents, JSON, error messages). This:
+/// 1. strips leading line-number prefixes (`N\t`) that Claude Code adds to
+///    file reads;
+/// 2. collapses to the first non-empty line;
+/// 3. truncates to ~90 chars with an ellipsis.
+///
+/// The result is a single-line preview suitable for the main-pane summary cell.
+#[must_use]
+fn tool_result_summary(content: &str) -> String {
+    const MAX: usize = 1024;
+    // Strip leading `<digits>\t` line-number prefixes from every line so both
+    // plain text and JSON blobs are readable.
+    let stripped: String = content
+        .lines()
+        .map(|l| {
+            // Strip a leading `<digits>\t` line-number prefix ONLY when the
+            // digits are followed by a tab — otherwise a JSON line that happens
+            // to start with a digit (e.g. an array element `5,`) would be mangled.
+            let trimmed = l.trim_start();
+            let after_digits = trimmed.trim_start_matches(|c: char| c.is_ascii_digit());
+            after_digits.strip_prefix('\t').map_or(l, |rest| rest)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // If the result is a JSON blob (e.g. a debugger status dump), pull a short
+    // label from it instead of dumping the whole JSON.
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&stripped) {
+        if let Some(label) = json_status_label(&value) {
+            return label;
+        }
+    }
+    let mut line = stripped
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if line.chars().count() > MAX {
+        let mut cut = line.chars().take(MAX).collect::<String>();
+        cut.push('…');
+        line = cut;
+    }
+    line
 }
 
 /// Derive a display summary for a collapsed import op from its normalized
@@ -698,15 +1012,27 @@ fn collapsed_import_summary(op: &Op, children: Option<&Vec<&Op>>) -> String {
     use editchain_core::OpKind;
     let mut message = String::new();
     let mut tool = String::new();
+    // Whether the tool child is a result (Finish, empty name) — its summary is
+    // the content preview, shown WITHOUT the `tool: ` prefix.
+    let mut tool_is_result = false;
     let mut command = String::new();
     if let Some(children) = children {
         for child in children {
             match &child.kind {
                 OpKind::Message(m) if message.is_empty() => {
-                    message = payload_text(&m.content);
+                    message = message_summary(&payload_text(&m.content));
                 }
                 OpKind::Tool(t) if tool.is_empty() => {
-                    tool = payload_text(&t.tool_name);
+                    // A tool_result (Finish, empty name) previews its content;
+                    // a tool call shows its name.
+                    if matches!(t.stage, editchain_core::op::ToolStage::Finish)
+                        && payload_text(&t.tool_name).is_empty()
+                    {
+                        tool = tool_result_summary(&payload_text(&t.content));
+                        tool_is_result = true;
+                    } else {
+                        tool = payload_text(&t.tool_name);
+                    }
                 }
                 OpKind::Command(c) if command.is_empty() => {
                     command = payload_text(&c.content);
@@ -719,14 +1045,18 @@ fn collapsed_import_summary(op: &Op, children: Option<&Vec<&Op>>) -> String {
         return message;
     }
     if !tool.is_empty() {
-        return format!("tool: {tool}");
+        return if tool_is_result {
+            tool
+        } else {
+            format!("tool: {tool}")
+        };
     }
     if !command.is_empty() {
         return format!("$ {command}");
     }
-    // No meaningful children — fall back to the raw reference.
+    // No meaningful children — fall back to a label derived from the raw record.
     match &op.kind {
-        OpKind::Import(i) => payload_text(&i.raw_ref),
+        OpKind::Import(i) => raw_import_label(i),
         OpKind::ChainStart(cs) => String::from_utf8_lossy(&cs.name).to_string(),
         OpKind::Actor(a) => payload_text(&a.label),
         OpKind::Message(m) => payload_text(&m.content),
@@ -739,6 +1069,269 @@ fn collapsed_import_summary(op: &Op, children: Option<&Vec<&Op>>) -> String {
         OpKind::GitCommit(c) => payload_text(&c.message),
         OpKind::GitLink(l) => format!("git:{}", l.target_oid),
         OpKind::Unknown(u) => format!("unknown kind={}", u.kind_discriminant),
+    }
+}
+
+/// Produce a meaningful display label for a raw import record.
+///
+/// The raw import's `raw_ref` is the original JSONL line. When it parses as
+/// JSON, derive a human-readable label from the record's `type` and structured
+/// fields (e.g. attachment filename, queued command prompt). Falls back to the
+/// raw text when it isn't parseable JSON.
+#[must_use]
+fn raw_import_label(import: &editchain_core::op::ImportOp) -> String {
+    let raw = match &import.raw_ref {
+        Payload::Inline(b) => String::from_utf8_lossy(b).to_string(),
+        Payload::Empty | Payload::Blob(_) => String::new(),
+    };
+    if raw.is_empty() {
+        return String::new();
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return raw;
+    };
+    let record_type = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    match record_type {
+        // Attachment records carry a structured `attachment` object.
+        "attachment" => {
+            let att = value.get("attachment");
+            let att_type = att
+                .and_then(|a| a.get("type"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let filename = att
+                .and_then(|a| a.get("filename"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .rsplit('/')
+                .next()
+                .unwrap_or("");
+            let path = att
+                .and_then(|a| a.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let prompt = att
+                .and_then(|a| a.get("prompt"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            match att_type {
+                "file"
+                | "edited_text_file"
+                | "opened_file_in_ide"
+                | "already_read_file"
+                | "selected_lines_in_ide"
+                    if !filename.is_empty() =>
+                {
+                    format!("{att_type}: {filename}")
+                }
+                "directory" if !path.is_empty() => format!("directory: {path}"),
+                "queued_command" if !prompt.is_empty() => {
+                    format!("queued command: {}", truncate_line(prompt))
+                }
+                _ if !att_type.is_empty() => format!("attachment: {att_type}"),
+                _ => "attachment".to_string(),
+            }
+        }
+        // User records with nested content (e.g. debugger status JSON).
+        "user" => {
+            if let Some(text) = nested_user_text(&value) {
+                // If the extracted text is itself a JSON blob (e.g. a debugger
+                // session-status dump), pull a short label from it instead of
+                // dumping the whole JSON.
+                if let Ok(inner) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(label) = json_status_label(&inner) {
+                        return label;
+                    }
+                }
+                truncate_line(&text)
+            } else {
+                raw
+            }
+        }
+        _ if !record_type.is_empty() => record_type.to_string(),
+        _ => raw,
+    }
+}
+
+/// Extract text from a user record's possibly-nested content blocks.
+///
+/// Some user records nest text under `message.content[].content[].text` (e.g.
+/// debugger status messages). Flatten any `text` blocks found at any depth.
+#[must_use]
+fn nested_user_text(value: &serde_json::Value) -> Option<String> {
+    fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                if let Some(text) = map.get("text").and_then(serde_json::Value::as_str) {
+                    if !text.trim().is_empty() {
+                        out.push(text.to_string());
+                    }
+                }
+                for val in map.values() {
+                    walk(val, out);
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for val in arr {
+                    walk(val, out);
+                }
+            }
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => {}
+        }
+    }
+    let mut texts = Vec::new();
+    walk(value, &mut texts);
+    texts.first().cloned()
+}
+
+/// Produce a short label for a JSON status blob (e.g. a debugger session dump).
+///
+/// Prefers a `configurationName` or `name` field; falls back to a compact
+/// `{key: value, ...}` summary of the top-level fields. Returns `None` when the
+/// value has no useful scalar fields.
+#[must_use]
+fn json_status_label(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    if let Some(name) = obj
+        .get("configurationName")
+        .or_else(|| obj.get("name"))
+        .and_then(serde_json::Value::as_str)
+    {
+        if !name.is_empty() {
+            return Some(truncate_line(name));
+        }
+    }
+    // Fall back to a compact summary of scalar fields.
+    let mut parts = Vec::new();
+    for (k, v) in obj {
+        if let Some(s) = v.as_str() {
+            if !s.is_empty() {
+                parts.push(format!("{k}={}", truncate_line(s)));
+            }
+        } else if let Some(n) = v.as_i64() {
+            parts.push(format!("{k}={n}"));
+        } else if let Some(b) = v.as_bool() {
+            parts.push(format!("{k}={b}"));
+        }
+        if parts.len() >= 3 {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+/// Produce a display summary for a message's content.
+///
+/// If the content is itself a JSON blob (e.g. a debugger session-status dump),
+/// pull a short label from it instead of dumping the whole JSON. Otherwise
+/// truncate the plain text.
+#[must_use]
+fn message_summary(content: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+        if let Some(label) = json_status_label(&value) {
+            return label;
+        }
+    }
+    truncate_line(content)
+}
+
+/// Truncate a string to ~1024 chars with an ellipsis.
+#[must_use]
+fn truncate_line(s: &str) -> String {
+    const MAX: usize = 1024;
+    let trimmed = s.trim();
+    if trimmed.chars().count() > MAX {
+        let mut cut = trimmed.chars().take(MAX).collect::<String>();
+        cut.push('…');
+        cut
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Build a display summary for a collapsed import from its own content plus its
+/// bundled sub-ops' content.
+///
+/// The row's own summary is combined with each sub-op's meaningful content
+/// (tool-result previews, metadata labels), joined with spaces, and truncated to
+/// ~1024 chars. If the row has no own content and no sub-op content, falls back
+/// to `(no summary)`.
+#[must_use]
+fn combined_summary(row_summary: &str, sub_ops: &[Op]) -> String {
+    const MAX: usize = 1024;
+    let mut parts: Vec<String> = Vec::new();
+    let own = row_summary.trim();
+    if !own.is_empty() && own != "(no summary)" {
+        parts.push(own.to_string());
+    }
+    for op in sub_ops {
+        if let Some(content) = sub_op_content(op) {
+            if !content.is_empty() {
+                parts.push(content);
+            }
+        }
+    }
+    if parts.is_empty() {
+        return "(no summary)".to_string();
+    }
+    let joined = parts.join(" ");
+    if joined.chars().count() > MAX {
+        let mut cut = joined.chars().take(MAX).collect::<String>();
+        cut.push('…');
+        cut
+    } else {
+        joined
+    }
+}
+
+/// Extract meaningful display content from a bundled sub-op.
+///
+/// Tool-result sub-ops (Tool, Finish) contribute their content preview; metadata
+/// Import sub-ops contribute a short label derived from the raw record. Returns
+/// `None` for sub-ops with no useful text.
+#[must_use]
+fn sub_op_content(op: &Op) -> Option<String> {
+    match &op.kind {
+        editchain_core::OpKind::Tool(t)
+            if matches!(t.stage, editchain_core::op::ToolStage::Finish) =>
+        {
+            let preview = tool_result_summary(&payload_text(&t.content));
+            if preview.is_empty() {
+                None
+            } else {
+                Some(preview)
+            }
+        }
+        editchain_core::OpKind::Import(i) => {
+            let label = raw_import_label(i);
+            if label.is_empty() || label.starts_with('{') {
+                None
+            } else {
+                Some(label)
+            }
+        }
+        editchain_core::OpKind::ChainStart(_)
+        | editchain_core::OpKind::Actor(_)
+        | editchain_core::OpKind::Message(_)
+        | editchain_core::OpKind::Tool(_)
+        | editchain_core::OpKind::Command(_)
+        | editchain_core::OpKind::File(_)
+        | editchain_core::OpKind::Reflection(_)
+        | editchain_core::OpKind::Note(_)
+        | editchain_core::OpKind::Error(_)
+        | editchain_core::OpKind::GitCommit(_)
+        | editchain_core::OpKind::GitLink(_)
+        | editchain_core::OpKind::Unknown(_) => None,
     }
 }
 

@@ -35,6 +35,9 @@ impl Tags {
     pub const PRIVATE: Self = Self(1 << 10);
     /// Operation with a large payload (stored externally).
     pub const LARGE_PAYLOAD: Self = Self(1 << 11);
+    /// Metadata-only record (no user-facing content) — bundled as a sub-op of
+    /// a real turn/tool node rather than occupying its own graph row/lane.
+    pub const META: Self = Self(1 << 12);
 
     /// Returns true if any of the given tags are set.
     #[must_use]
@@ -78,6 +81,7 @@ impl core::fmt::Display for Tags {
             (Self::ERROR, "error"),
             (Self::PRIVATE, "private"),
             (Self::LARGE_PAYLOAD, "large_payload"),
+            (Self::META, "meta"),
         ];
         for (tag, name) in &pairs {
             if self.matches_any(*tag) {
