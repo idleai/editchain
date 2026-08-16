@@ -119,32 +119,62 @@ impl Workspace {
         let filtered = self.filtered_nodes(hide_submodules, filter);
         let total = filtered.len();
 
+        // Build/access the cached layout context so each row can carry its graph
+        // geometry (lane + active lanes + transitions) for per-row rendering.
+        let key = (hide_submodules, filter.key());
+        if !self.contexts.contains_key(&key) {
+            let sorted = self.filtered_nodes(hide_submodules, filter);
+            let ctx = self.projection.layout_context(&sorted);
+            drop(self.contexts.insert(key.clone(), ctx));
+        }
+        let ctx = self.contexts.get(&key);
+
         let rows = filtered
             .into_iter()
+            .enumerate()
             .skip(offset_usize)
             .take(limit_usize)
-            .map(|node| HistoryRow {
-                op_id: node.op_id().map(|id| id.to_string()),
-                git_oid: node.git_oid(),
-                repository: node.repository(),
-                summary: node.summary(),
-                timestamp_ms: node.timestamp_ms(),
-                group: node.group(),
-                node_key: node.node_key(),
-                parents: node.parent_keys(&self.projection.git.links),
-                is_submodule: node
-                    .repository()
-                    .is_some_and(|rid| self.repo_is_submodule(rid)),
-                is_system: node_is_system(&node),
-                author: node_author(&node),
-                commit_id: node_commit_id(&node),
-                kind: node.kind(),
+            .map(|(abs_idx, node)| {
+                // Per-row graph geometry from the layout context (absolute row
+                // index into the full sorted list).
+                let (lane, above, below, transitions) =
+                    ctx.map_or((0, Vec::new(), Vec::new(), Vec::new()), |c| {
+                        (
+                            c.lanes.get(abs_idx).map_or(0, |r| r.lane),
+                            c.row_above.get(abs_idx).cloned().unwrap_or_default(),
+                            c.row_below.get(abs_idx).cloned().unwrap_or_default(),
+                            c.row_transitions.get(abs_idx).cloned().unwrap_or_default(),
+                        )
+                    });
+                HistoryRow {
+                    op_id: node.op_id().map(|id| id.to_string()),
+                    git_oid: node.git_oid(),
+                    repository: node.repository(),
+                    summary: node.summary(),
+                    timestamp_ms: node.timestamp_ms(),
+                    group: node.group(),
+                    node_key: node.node_key(),
+                    parents: node.parent_keys(&self.projection.git.links),
+                    is_submodule: node
+                        .repository()
+                        .is_some_and(|rid| self.repo_is_submodule(rid)),
+                    is_system: node_is_system(&node),
+                    author: node_author(&node),
+                    commit_id: node_commit_id(&node),
+                    kind: node.kind(),
+                    lane,
+                    above,
+                    below,
+                    transitions,
+                }
             })
             .collect();
+        let max_lane = ctx.map_or(0, |c| c.lanes.iter().map(|r| r.lane).max().unwrap_or(0));
         HistoryWindow {
             rows,
             total: u64::try_from(total).unwrap_or(u64::MAX),
             chain_generation: 0,
+            max_lane,
         }
     }
 

@@ -240,6 +240,22 @@ pub struct HistoryRow {
     /// Short type tag for styling (e.g. "tool", "message", "command", "git").
     #[serde(default)]
     pub kind: String,
+    /// The graph lane this row's node occupies (for per-row graph rendering).
+    #[serde(default)]
+    pub lane: usize,
+    /// Lanes with a vertical segment in the TOP half of this row's cell (lines
+    /// entering from above). Tips (newest nodes) have none here — no line above
+    /// their dot.
+    #[serde(default)]
+    pub above: Vec<usize>,
+    /// Lanes with a vertical segment in the BOTTOM half of this row's cell (lines
+    /// leaving downward). Roots (no parents) have none here — no line below.
+    #[serde(default)]
+    pub below: Vec<usize>,
+    /// Horizontal lane-jog segments at this row: `(from_lane, to_lane)` merge
+    /// connectors (per-row graph cells).
+    #[serde(default)]
+    pub transitions: Vec<(usize, usize)>,
 }
 
 /// A window of history rows with generation counters.
@@ -251,6 +267,10 @@ pub struct HistoryWindow {
     pub total: u64,
     /// Chain generation at snapshot time.
     pub chain_generation: u64,
+    /// The maximum graph lane across ALL rows (global), so the client can size
+    /// the graph column stably regardless of which window is loaded.
+    #[serde(default)]
+    pub max_lane: usize,
 }
 
 /// Details for a single history node (for the inspector).

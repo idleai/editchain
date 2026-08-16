@@ -117,13 +117,26 @@ body {
   min-width: 90px;
 }
 
-/* Block separator spans all columns. */
-.block-sep {
+/* Group separator drawn INSIDE the first row of each group so every row stays
+   exactly ROW_H tall (the uniform-grid math depends on it). A top border marks
+   the boundary; the label is a small absolutely-positioned chip so it never
+   affects row height or column layout. */
+.row-group-start {
+  box-sizing: border-box;
+  border-top: 1px solid var(--vscode-panel-border);
+}
+.group-label {
+  position: absolute;
+  top: -1px;
+  left: 0;
+  z-index: 1;
   font-weight: 700;
+  font-size: 0.8em;
   color: var(--vscode-descriptionForeground);
-  opacity: 0.3;
-  padding: 8px 4px 4px;
-  border-bottom: 1px solid var(--vscode-panel-border);
+  opacity: 0.5;
+  background: var(--vscode-editor-background);
+  padding: 0 6px;
+  line-height: 14px;
 }
 
 /* Each history row is a grid with the same column template as the header.
@@ -136,14 +149,19 @@ body {
     var(--date-w, auto) var(--author-w, auto) var(--commit-w, auto);
   width: 100%;
   height: 34px;
+  /* Anchors the absolutely-positioned .group-label chip to this row. */
+  position: relative;
   align-items: center;
   cursor: pointer;
 }
 .row:hover { background-color: var(--vscode-list-hoverBackground); }
-/* Row-level opacity by node kind: tool calls dimmed most, other non-text nodes
-   dimmed moderately, text nodes (messages/commands) stay full. */
-.row-tool { opacity: 0.3; }
-.row-dim { opacity: 0.7; }
+/* Row-level dimming by node kind: tool calls dimmed most, other non-text nodes
+   dimmed moderately, text nodes (messages/commands) stay full. Opacity is
+   applied to the TEXT cells only — NOT the graph cell — because a parent's
+   opacity is multiplicative and cannot be overridden by childrencars. The SVG
+   lanes/dots must always render at full (100%) opacity regardless of row kind. */
+.row-tool .text-cell, .row-tool .date-cell, .row-tool .author-cell, .row-tool .commit-cell { opacity: 0.3; }
+.row-dim .text-cell, .row-dim .date-cell, .row-dim .author-cell, .row-dim .commit-cell { opacity: 0.7; }
 .graph-cell { line-height: 0; overflow: hidden; }
 .text-cell { padding-left: 8px; overflow: hidden; text-align: left; }
 /* Agent-authored text is offset with extra left padding so it reads as a
@@ -163,30 +181,26 @@ body {
   text-overflow: ellipsis;
 }
 
-/* The single graph SVG overlay, positioned over the table-wrap. */
-#graphOverlay {
-  position: absolute;
-  left: 0;
-  top: 0;
-  z-index: 2;
+/* Per-row graph cells (one small SVG per row). Each cell draws the node's dot,
+   vertical line segments for active lanes, and horizontal merge connectors. */
+.graph-cell svg.graphCell {
+  display: block;
   pointer-events: none;
+  /* The graph must NOT inherit the row's dimming opacity (`.row-tool`/`.row-dim`
+     dim the text content, but the chain lines/dots stay full-strength so the
+     graph reads clearly regardless of node kind). */
+  opacity: 1;
 }
-#graphOverlay circle.graphDot {
+.graph-cell circle.graphDot {
   /* Dots are decorative; never intercept clicks so they always reach rows below.
      Hover tooltips are not implemented yet anyway. */
   pointer-events: none;
   stroke: var(--vscode-editor-background);
   stroke-width: 1;
 }
-#graphOverlay path.graphShadow {
-  fill: none;
-  stroke: var(--vscode-editor-background);
-  stroke-width: 4;
-  stroke-opacity: 0.75;
-}
-#graphOverlay path.graphLine {
-  fill: none;
-  stroke: #d0d0d0; /* light grey — visible on dark backgrounds */
+.graph-cell line.graphLine {
+  /* Stroke colour is set inline per-lane (each chain's own colour); this rule
+     only sets the width. */
   stroke-width: 2;
 }
 

@@ -41,7 +41,6 @@ const BUFFER = 400;
 let total = 0;             // global row count (server-reported)
 let pendingWindow = false; // a GetWindow request is in flight
 let pendingWindowOffset = 0; // absolute offset of the in-flight GetWindow
-let pendingLayoutId = 0;   // monotonically increasing id for in-flight GetLayout
 
 // Sparse window cache: absolute row index -> HistoryRow. Only windows near the
 // scroll position are retained; far-offscreen windows are evicted.
@@ -51,10 +50,19 @@ let cache = new Map();
 // bounded viewport cache size.
 let totalFetched = 0;
 
-let layout = null;         // { rows: [{node,lane}], edges: [{child,parent,points}] }
-let layoutLo = Infinity;   // absolute row index of first layout row
-let layoutHi = -1;         // absolute row index of last layout row
 let lastRenderKey = '';    // cache key of the last rendered slice (avoid redundant rebuilds)
+// Global maximum graph lane across ALL rows, reported by the server with each
+// GetWindow response. Used to size the graph column stably regardless of which
+// window is loaded (lanes don't jump on scroll).
+let maxLane = 0;
+
+// Additive (UIKit-style) window state. The DOM always holds a CONTIGUOUS run of
+// rows [renderTop, renderBottom] (inclusive), in order, with no gaps. The
+// .table-wrap is positioned at `renderTop * ROW_H`. Scrolling extends/trims this
+// window at its edges and shifts the wrap by exact multiples of ROW_H — existing
+// nodes are never rebuilt during a scroll-through-loaded-content.
+let renderTop = 0;         // absolute row index of first rendered row
+let renderBottom = -1;     // absolute row index of last rendered row (inclusive); -1 = empty
 
 const ROW_H = 34;
 
@@ -141,123 +149,6 @@ function esc(s) {
   }[c]));
 }
 
-/**
- * Build the single full-height SVG overlay for the graph.
- *
- * `rowYs` maps rendered-row position → pixel y-offset within the table-wrap
- * (the measured `offsetTop` of each rendered `.row`). `rows` is the array of
- * rows currently rendered (a viewport slice). `absToPos` maps each rendered
- * row's ABSOLUTE canonical index → its position in `rows`, so we can translate
- * absolute edge-point indices to pixel positions even when cached rows have
- * gaps. Each edge is drawn as one continuous <path> from its ordered grid
- * points (child → parent), so lines run unbroken across many rows.
- *
- * Edge points are ABSOLUTE canonical row indices.
- */
-function buildGraphSvg(rowYs, rows, absToPos, maxWidth) {
-  if (!layout || !layout.rows.length || rows.length === 0) return '';
-  // Use the GLOBAL max lane (reported by the server) so the graph column width
-  // is stable regardless of which window is loaded — lanes don't jump on scroll.
-  const maxLane = layout.max_lane || 0;
-  const numLanes = Math.min(maxLane + 1, MAX_GRAPH_LANES);
-  // One extra lane of padding so the last lane's dot isn't clipped.
-  const naturalW = numLanes * LANE_W + LANE_W;
-  // Cap the SVG width so lanes beyond the cap are clipped (content stays visible).
-  const width = Math.min(naturalW, maxWidth || naturalW);
-  // Height spans from the first row's top to just below the last row.
-  const height = (rowYs[rows.length - 1] || 0) + ROW_H;
-
-  // Map node key -> rendered-row position in `rows`.
-  const rowOf = {};
-  for (let i = 0; i < rows.length; i++) {
-    rowOf[rows[i].node_key] = i;
-  }
-  // Map node key -> lane from the windowed layout rows.
-  const laneOf = {};
-  for (const r of layout.rows) {
-    laneOf[r.node] = r.lane;
-  }
-
-  let svg = `<svg id="graphOverlay" width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">`;
-
-  // Draw each edge as one continuous path over all rendered rows. An edge is
-  // never dropped: if its child is offscreen above or its parent offscreen
-  // below, the path extends to the SVG top/bottom so lines stay continuous as
-  // you scroll instead of popping in and out.
-  let drawnEdges = 0;
-  let skippedEdges = 0;
-  for (const edge of layout.edges) {
-    const childPos = rowOf[edge.child];
-    const parentPos = rowOf[edge.parent];
-
-    // Points are absolute canonical row indices already.
-    const pts = edge.points;
-    if (!pts.length) { skippedEdges++; continue; }
-
-    const childLoaded = childPos !== undefined;
-    const parentLoaded = parentPos !== undefined;
-
-    // Helper: pixel y for an absolute row, clamped into [0, height].
-    const yOfAbs = (r) => {
-      const pos = absToPos[r];
-      const raw =
-        (pos !== undefined && pos < rowYs.length && rowYs[pos] !== undefined)
-          ? rowYs[pos]
-          : r * ROW_H;
-      return Math.max(0, Math.min(height, raw + ROW_H / 2));
-    };
-
-    let d = '';
-    if (!childLoaded && pts.length) {
-      // Child is above the rendered rows: start at SVG top on the child's lane,
-      // then follow points downward.
-      const firstX = LANE_W / 2 + pts[0].lane * LANE_W + LANE_W / 2;
-      d += 'M' + firstX.toFixed(1) + ',' + '0';
-      for (let i = 0; i < pts.length; i++) {
-        const x = LANE_W / 2 + pts[i].lane * LANE_W + LANE_W / 2;
-        d += 'L' + x.toFixed(1) + ',' + yOfAbs(pts[i].row).toFixed(1);
-      }
-    } else {
-      for (let i = 0; i < pts.length; i++) {
-        const x = LANE_W / 2 + pts[i].lane * LANE_W + LANE_W / 2;
-        d += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + yOfAbs(pts[i].row).toFixed(1);
-      }
-    }
-
-    if (!parentLoaded && pts.length) {
-      // Parent is below the rendered rows: extend vertically down to SVG bottom.
-      const lastX = LANE_W / 2 + pts[pts.length - 1].lane * LANE_W + LANE_W / 2;
-      d += 'L' + lastX.toFixed(1) + ',' + height.toFixed(1);
-    }
-
-    // Colour each edge by its child's lane so lines match their node dots.
-    const colour = COLORS[pts[0].lane % COLORS.length];
-    // Shadow path (thick, background-coloured) for contrast against text.
-    svg += `<path class="graphShadow" d="${d}"/>`;
-    // Line path — stroke set via inline style so it overrides the CSS rule
-    // (a presentation attribute would lose to the stylesheet).
-    svg += `<path class="graphLine" d="${d}" style="stroke:${colour}"/>`;
-    drawnEdges++;
-  }
-  console.log('[editchain] buildGraphSvg edges=' + layout.edges.length +
-    ' drawn=' + drawnEdges + ' skipped=' + skippedEdges);
-
-  // Draw node dots at each rendered row's lane centre. Dots are only drawn for
-  // rows that fall inside the loaded layout window AND are currently rendered.
-  for (let pos = 0; pos < rows.length; pos++) {
-    const absIdx = rows[pos]._absIndex;
-    if (absIdx === undefined || absIdx < layoutLo || absIdx > layoutHi) continue;
-    const lane = laneOf[rows[pos].node_key];
-    if (lane === undefined) continue;
-    const x = LANE_W / 2 + lane * LANE_W + LANE_W / 2;
-    const y = rowYs[pos] + ROW_H / 2;
-    const colour = COLORS[lane % COLORS.length];
-    svg += `<circle class="graphDot" data-row="${absIdx}" cx="${x}" cy="${y}" r="${DOT_R}" fill="${colour}"/>`;
-  }
-
-  svg += '</svg>';
-  return svg;
-}
 
 /** Whether submodules should be hidden (inverted from the "Show" checkbox). */
 function hideSubmodules() {
@@ -296,6 +187,17 @@ function isMessageRow(row) {
 /** Whether only messages should be shown (from the "Show messages only" checkbox). */
 function showMessagesOnly() {
   return !!(hideSystemEl && hideSystemEl.checked);
+}
+
+/** Human-readable label for a block-separator group key.
+ *
+ * `repo:*` groups are git repositories; `session:*` groups are Claude Code
+ * sessions; anything else falls back to "EditChain ops".
+ */
+function groupLabelText(group) {
+  return group.startsWith('repo:') ? 'Git · repo ' + group.slice(5)
+    : group.startsWith('session:') ? 'Session ' + group.slice(8)
+    : 'EditChain ops';
 }
 
 // Maximum number of graph lanes shown before clipping. The graph column's
@@ -380,37 +282,130 @@ function evictFarWindows() {
 }
 
 /**
- * Render only the viewport slice plus BUFFER on each side into a table with
- * graph column + text columns. Rows outside this slice are not in the DOM, so
- * DOM size stays bounded regardless of chain size.
+ * Additive (UIKit-style) virtual scroll.
+ *
+ * The DOM holds a CONTIGUOUS run of rows [renderTop, renderBottom] inside a
+ * .table-wrap positioned at `renderTop * ROW_H`. Scrolling extends/trims this
+ * window at its edges and shifts the wrap by exact multiples of ROW_H — existing
+ * nodes are never rebuilt during a scroll-through-loaded-content, so there is no
+ * re-anchor moment and no layout jump. Full rebuilds happen only when content
+ * genuinely changes (initial load, far jump, column resize, filter).
+ *
+ * Because every row is exactly ROW_H tall, shifting .table-wrap.top by `n*ROW_H`
+ * moves content by exactly n rows with zero sub-pixel drift, and the fixed-height
+ * .scroll-spacer keeps the scrollbar stable.
  */
-function renderRows() {
-  const { top, bottom } = desiredCacheRange();
 
-  // Count how many rows in [top,bottom] are actually cached, so a window that
-  // fills gaps within an unchanged range still triggers a re-render.
-  let cachedInRange = 0;
-  if (top <= bottom && total > 0) {
-    for (let i = top; i <= bottom; i++) {
-      if (cache.has(i)) cachedInRange++;
-    }
+/** X pixel position of a lane's centre within the graph column. */
+function laneX(lane) {
+  return LANE_W / 2 + lane * LANE_W + LANE_W / 2;
+}
+
+/**
+ * Build one row's graph cell: a small inline SVG drawing the node's dot, the
+ * vertical line segments for lanes entering from above and leaving below, and
+ * any horizontal merge connectors at this row.
+ *
+ * This is the per-row replacement for the old full-height SVG overlay. Because
+ * each row carries its own graph geometry (lane, above, below, transitions)
+ * shipped with its GetWindow data, scrolling = moving rows = moving their cells
+ * together — there is no separate overlay to reconcile, so no flash/jump/blank.
+ *
+ * Vertical segments are split into a TOP half (lanes in `above`, entering from
+ * above) and a BOTTOM half (lanes in `below`, leaving downward). Adjacent rows'
+ * halves meet at cell boundaries into continuous lines. A TIP (newest node, no
+ * children) has no `above` lanes → no line above its dot; a ROOT (no parents)
+ * has no `below` lanes → no line below. The dot sits at the row's own lane,
+ * vertically centred.
+ */
+function buildGraphCell(row) {
+  const width = currentGraphWidth();
+  const height = ROW_H;
+  const midY = ROW_H / 2;
+  let s = `<svg class="graphCell" width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">`;
+  // Top-half vertical segments: lanes entering from above (y=0 → midY).
+  const above = row.above || [];
+  for (const lane of above) {
+    const x = laneX(lane);
+    const colour = COLORS[lane % COLORS.length];
+    s += `<line class="graphLine" x1="${x}" y1="0" x2="${x}" y2="${midY}" style="stroke:${colour}"/>`;
   }
+  // Bottom-half vertical segments: lanes leaving downward (midY → height).
+  const below = row.below || [];
+  for (const lane of below) {
+    const x = laneX(lane);
+    const colour = COLORS[lane % COLORS.length];
+    s += `<line class="graphLine" x1="${x}" y1="${midY}" x2="${x}" y2="${height}" style="stroke:${colour}"/>`;
+  }
+  // Horizontal merge connectors at this row. Colour by the FROM lane (the chain
+  // the connector originates from).
+  const transitions = row.transitions || [];
+  for (const [fromLane, toLane] of transitions) {
+    const x1 = laneX(fromLane);
+    const x2 = laneX(toLane);
+    const colour = COLORS[fromLane % COLORS.length];
+    s += `<line class="graphLine" x1="${x1}" y1="${midY}" x2="${x2}" y2="${midY}" style="stroke:${colour}"/>`;
+  }
+  // The node's own dot at its lane.
+  const lane = row.lane || 0;
+  const colour = COLORS[lane % COLORS.length];
+  s += `<circle class="graphDot" cx="${laneX(lane)}" cy="${midY}" r="${DOT_R}" fill="${colour}"/>`;
+  s += '</svg>';
+  return s;
+}
 
-  // Skip a redundant rebuild when neither the visible slice content nor the
-  // layout has changed. This avoids the double-render (window response + layout
-  // response) that otherwise causes a visible flicker/bounce while scrolling.
-  // Column widths are included so a column resize (which mutates `colWidths`)
-  // forces a rebuild instead of being swallowed by the early return.
-  const renderKey =
-    `${top}:${bottom}:${cachedInRange}:${layoutLo}:${layoutHi}:${layout ? layout.max_lane : -1}` +
-    `:${colWidths.graph}:${colWidths.content}:${colWidths.date}:${colWidths.author}:${colWidths.commit}`;
-  if (renderKey === lastRenderKey) return;
-  lastRenderKey = renderKey;
+/** Build one row's HTML from its cached HistoryRow. `absIdx` is its absolute index. */
+function buildRowHtml(row, absIdx, isGroupStart) {
+  const groupClass = isGroupStart ? ' row-group-start' : '';
+  const groupLabel = isGroupStart
+    ? '<div class="group-label">' + esc(groupLabelText(row.group)) + '</div>'
+    : '';
+  const kindClass = row.is_system ? 'row-tool'
+    : (row.kind === 'message' || row.kind === 'command') ? ''
+    : 'row-dim';
+  const agentClass = row.author === 'agent' ? ' row-agent' : '';
+  return '<div class="row ' + kindClass + agentClass + groupClass + '" data-key="' + esc(row.node_key) +
+    '" data-row="' + absIdx + '" style="' + colStyle() + '">' +
+    groupLabel +
+    '<div class="graph-cell">' + buildGraphCell(row) + '</div>' +
+    '<div class="text-cell"><div class="summary">' + esc(row.summary || '(no summary)') + '</div></div>' +
+    '<div class="date-cell">' + esc(formatDate(row.timestamp_ms)) + '</div>' +
+    '<div class="author-cell">' + esc(row.author || '') + '</div>' +
+    '<div class="commit-cell">' + esc(row.commit_id || '') + '</div>' +
+    '</div>';
+}
 
-  // Build the sticky table header (fixed at the top of #rows, outside the
-  // scroll-spacer so it stays visible while scrolling). Always rendered so the
-  // column labels show even when no rows are loaded yet.
-  let html =
+/** The .table-wrap element currently in #rows, or null if not built yet. */
+function wrapEl() {
+  return rowsEl.querySelector('.table-wrap');
+}
+
+/** Set .table-wrap.top to position it at absolute row `top`. */
+function setWrapTop(top) {
+  const w = wrapEl();
+  if (w) w.style.top = (top * ROW_H) + 'px';
+}
+
+/** Rebuild the entire window from cache in one pass. Used for initial load,
+ * far jumps, column resize, and filter changes — NOT for normal scrolling. */
+function reanchorTo(top, bottom) {
+  renderTop = top; renderBottom = bottom;
+  let html = '';
+  let lastGroup = null;
+  for (let i = top; i <= bottom; i++) {
+    const row = cache.get(i);
+    if (!row) { html += '<div class="row row-placeholder" data-row="' + i + '"></div>'; continue; }
+    const isGroupStart = row.group !== lastGroup;
+    if (isGroupStart) lastGroup = row.group;
+    html += buildRowHtml(row, i, isGroupStart);
+  }
+  // Build the sticky header + spacer + wrap in one innerHTML pass. There is a
+  // SINGLE header, a direct child of #rows, so its `position: sticky; top: 0`
+  // sticks to the #rows viewport and stays at the top while scrolling. It must
+  // NOT live inside .table-wrap (which is positioned at renderTop*ROW_H and moves
+  // with scroll) — a header there would scroll with content and appear mid-table.
+  const spacerH = Math.max(1, total * ROW_H);
+  const headerHtml =
     '<div class="tbl-header" style="' + colStyle() + '">' +
       '<div class="th graph">Graph</div>' +
       '<div class="th content">Content</div>' +
@@ -418,89 +413,26 @@ function renderRows() {
       '<div class="th author">Author</div>' +
       '<div class="th commit">Commit/ID</div>' +
     '</div>';
-
-  // Build the rendered slice from cached rows in absolute order. Each row is
-  // tagged with its absolute index (used for graph wiring and click handling).
-  const visible = [];
-  if (top <= bottom && total > 0) {
-    for (let i = top; i <= bottom; i++) {
-      const row = cache.get(i);
-      if (!row) continue; // gap — will be filled by fetchWindow
-      visible.push(row);
-      visible[visible.length - 1]._absIndex = i;
-    }
-  }
-
-  // Map absolute index -> rendered position, for translating edge points.
-  const absToPos = {};
-  for (let pos = 0; pos < visible.length; pos++) {
-    absToPos[visible[pos]._absIndex] = pos;
-  }
-
-  let lastGroup = null;
-
-  visible.forEach((row) => {
-    // Block separator spans all columns.
-    if (row.group !== lastGroup) {
-      lastGroup = row.group;
-      const label = row.group.startsWith('repo:') ? 'Git · repo ' + row.group.slice(5)
-        : row.group.startsWith('session:') ? 'Session ' + row.group.slice(8)
-        : 'EditChain ops';
-      html += '<div class="block-sep">' + esc(label) + '</div>';
-    }
-
-    // Apply a row-level opacity class based on the node's kind (reported by the
-    // service): system nodes (tool results / import records) are dimmed most
-    // (0.3), other non-text rows (e.g. "tool: NAME") are dimmed moderately
-    // (0.7), and text rows (messages/commands) stay full opacity.
-    const kindClass = row.is_system ? 'row-tool'
-      : (row.kind === 'message' || row.kind === 'command') ? ''
-      : 'row-dim';
-    // Agent-authored text gets extra left padding to read as a distinct voice.
-    const agentClass = row.author === 'agent' ? ' row-agent' : '';
-
-    html += '<div class="row ' + kindClass + agentClass + '" data-key="' + esc(row.node_key) +
-      '" data-row="' + row._absIndex + '" style="' + colStyle() + '">' +
-      '<div class="graph-cell"></div>' +
-      '<div class="text-cell"><div class="summary">' + esc(row.summary || '(no summary)') + '</div></div>' +
-      '<div class="date-cell">' + esc(formatDate(row.timestamp_ms)) + '</div>' +
-      '<div class="author-cell">' + esc(row.author || '') + '</div>' +
-      '<div class="commit-cell">' + esc(row.commit_id || '') + '</div>' +
-      '</div>';
-  });
-
-  // Preserve the scroll position across the DOM rebuild. Setting innerHTML
-  // destroys and recreates all rows, which would otherwise reset scrollTop to
-  // snap back to wherever it was — but since we render a window anchored at the
-  // current scroll position, we must restore it exactly.
+  // Preserve the scroll position across the DOM rebuild (setting innerHTML
+  // resets scrollTop to 0).
   const prevScrollTop = rowsEl.scrollTop;
-
-  // The scroll-spacer sets #rows's scrollHeight to the FULL history height
-  // (total * ROW_H), so the scrollbar spans the whole chain even though only a
-  // slice is rendered. The table-wrap is positioned at the slice's top offset.
-  const spacerH = Math.max(1, total * ROW_H);
   rowsEl.innerHTML =
-    '<div class="tbl-header" style="' + colStyle() + '"></div>' +
+    headerHtml +
     '<div class="scroll-spacer" style="height:' + spacerH + 'px">' +
       '<div class="table-wrap" style="top:' + (top * ROW_H) + 'px;' + colStyle() + '">' +
         html +
       '</div>' +
     '</div>';
-
   rowsEl.scrollTop = prevScrollTop;
+  // No graph refresh needed: each row's graph cell is built into its HTML, so
+  // the rebuilt DOM already contains the correct per-row graph.
+  attachRowClicks();
+}
 
-  // Measure each rendered row's real offsetTop within the table-wrap so block
-  // separators don't misalign the graph overlay.
-  const wrapEl = rowsEl.querySelector('.table-wrap');
-  const rowEls = wrapEl.querySelectorAll('.row');
-  const rowYs = [];
-  rowEls.forEach((el) => { rowYs.push(el.offsetTop); });
-
-  // Insert the graph overlay after measuring.
-  wrapEl.insertAdjacentHTML('beforeend', buildGraphSvg(rowYs, visible, absToPos, currentGraphWidth()));
-
-  // Attach click handlers to rows.
-  rowEls.forEach((el) => {
+function attachRowClicks() {
+  const w = wrapEl();
+  if (!w) return;
+  w.querySelectorAll('.row').forEach((el) => {
     el.addEventListener('click', () => {
       const key = el.getAttribute('data-key');
       const absIdx = parseInt(el.getAttribute('data-row'), 10);
@@ -508,6 +440,168 @@ function renderRows() {
       if (row) inspect(row);
     });
   });
+}
+
+/** Append rows [renderBottom+1, renderBottom+n] to the bottom of the window.
+ * Only extends CONTIGUOUSLY: if the immediate next row isn't cached yet, nothing
+ * is appended (fetchWindow will deliver it and syncWindow will retry). This keeps
+ * the DOM gap-free. */
+function appendRowsBelow(n) {
+  if (n <= 0 || renderBottom >= total - 1) return;
+  const w = wrapEl();
+  if (!w) return;
+  // Only extend if the edge row is cached (contiguity).
+  if (!cache.has(renderBottom + 1)) return;
+  let html = '';
+  let lastGroup = null;
+  // Group continuity from the last currently-rendered row.
+  const lastRowEl = w.querySelector('.row:last-child');
+  if (lastRowEl) {
+    const lastAbs = parseInt(lastRowEl.getAttribute('data-row'), 10);
+    const lastRow = cache.get(lastAbs);
+    if (lastRow) lastGroup = lastRow.group;
+  }
+  let added = 0;
+  for (let i = renderBottom + 1; i <= Math.min(renderBottom + n, total - 1); i++) {
+    const row = cache.get(i);
+    if (!row) break; // stop at first gap — keep contiguous
+    const isGroupStart = row.group !== lastGroup;
+    if (isGroupStart) lastGroup = row.group;
+    html += buildRowHtml(row, i, isGroupStart);
+    added++;
+    renderBottom++;
+  }
+  if (added && html) {
+    w.insertAdjacentHTML('beforeend', html);
+    attachRowClicks();
+  }
+}
+
+/** Prepend rows [renderTop-n, renderTop-1] to the top of the window, shifting
+ * .table-wrap.top down by the number of rows actually added. Only extends
+ * CONTIGUOUSLY from the edge. */
+function prependRowsAbove(n) {
+  if (n <= 0 || renderTop <= 0) return;
+  const w = wrapEl();
+  if (!w) return;
+  // Only extend if the edge row above is cached (contiguity).
+  if (!cache.has(renderTop - 1)) return;
+  // Build bottom-up so group-start detection matches reanchorTo/appendRowsBelow:
+  // a row is a group-start if its group differs from the row ABOVE it.
+  let prevGroup = null;
+  // Group continuity from the first currently-rendered row (the row just below
+  // the new topmost prepended row).
+  const firstRowEl = w.querySelector('.row:first-child');
+  if (firstRowEl) {
+    const firstAbs = parseInt(firstRowEl.getAttribute('data-row'), 10);
+    const firstRow = cache.get(firstAbs);
+    if (firstRow) prevGroup = firstRow.group;
+  }
+  let html = '';
+  let added = 0;
+  for (let i = renderTop - 1; i >= Math.max(0, renderTop - n); i--) {
+    const row = cache.get(i);
+    if (!row) break; // stop at first gap — keep contiguous
+    const isGroupStart = prevGroup === null || row.group !== prevGroup;
+    html += buildRowHtml(row, i, isGroupStart);
+    added++;
+    prevGroup = row.group;
+    renderTop--;
+  }
+  if (added && html) {
+    w.insertAdjacentHTML('afterbegin', html);
+    // Shift the wrap down by the number of rows added so content stays put.
+    setWrapTop(renderTop);
+    attachRowClicks();
+  }
+}
+
+/** Replace any `.row-placeholder` elements with real row HTML once their data
+ * arrives in cache. Called after GetWindow delivers rows that reanchorTo had
+ * rendered as placeholders (because they weren't cached yet). */
+function fillPlaceholders() {
+  const w = wrapEl();
+  if (!w) return;
+  const placeholders = w.querySelectorAll('.row-placeholder');
+  if (!placeholders.length) return;
+  let changed = false;
+  placeholders.forEach((el) => {
+    const absIdx = parseInt(el.getAttribute('data-row'), 10);
+    const row = cache.get(absIdx);
+    if (!row) return;
+    // Group-start: compare to the row above (previous sibling).
+    const prevEl = el.previousElementSibling;
+    const prevRow = prevEl ? cache.get(parseInt(prevEl.getAttribute('data-row'), 10)) : null;
+    const isGroupStart = !prevRow || row.group !== prevRow.group;
+    el.outerHTML = buildRowHtml(row, absIdx, isGroupStart);
+    changed = true;
+  });
+  if (changed) {
+    attachRowClicks();
+  }
+}
+
+/** Remove rows above `keepTop` from the top of the window, shifting .table-wrap.top
+ * up by the number removed so remaining content stays put. */
+function trimTop(keepTop) {
+  const w = wrapEl();
+  if (!w || renderTop >= keepTop) return;
+  let removed = Math.min(keepTop - renderTop, renderBottom - renderTop + 1);
+  for (let i = renderTop; i < renderTop + removed; i++) {
+    const el = w.querySelector('.row[data-row="' + i + '"]');
+    if (el) el.remove();
+  }
+  renderTop += removed;
+  setWrapTop(renderTop);
+}
+
+/** Remove rows below `keepBottom` from the bottom of the window. */
+function trimBottom(keepBottom) {
+  const w = wrapEl();
+  if (!w || renderBottom <= keepBottom) return;
+  let removed = Math.min(renderBottom - keepBottom, renderBottom - renderTop + 1);
+  for (let i = renderBottom; i > renderBottom - removed; i--) {
+    const el = w.querySelector('.row[data-row="' + i + '"]');
+    if (el) el.remove();
+  }
+  renderBottom -= removed;
+}
+
+/**
+ * Sync the rendered window to the current scroll position — the additive scroll
+ * driver. Extends/trims at the edges so content follows the cursor without a
+ * full rebuild. Scrolling into unfilled territory just waits for fetchWindow to
+ * deliver rows (a quick render penalty), never blanking or re-anchoring.
+ */
+function syncWindow() {
+  if (total <= 0) return;
+  const { top: wantTop, bottom: wantBottom } = desiredCacheRange();
+  // If the window is empty or no longer covers the viewport (e.g. after a fast
+  // fling evicted rows and we've scrolled back into them), reanchor cleanly from
+  // cache rather than trying to incrementally patch a misaligned window. This is
+  // the accepted "quick render penalty" for scrolling into unfilled territory.
+  const coversViewport =
+    renderTop <= viewportTopRow() && renderBottom >= viewportBottomRow();
+  if (renderBottom < renderTop || !coversViewport) {
+    reanchorTo(wantTop, wantBottom);
+    fetchWindow();
+    return;
+  }
+  // Window covers the viewport — extend/trim incrementally at the edges so
+  // content follows the cursor without a full rebuild.
+  if (renderBottom < wantBottom) {
+    appendRowsBelow(wantBottom - renderBottom);
+    fetchWindow(); // request more below
+  }
+  if (renderTop > wantTop || cache.has(renderTop - 1)) {
+    prependRowsAbove(Math.max(1, renderTop - wantTop));
+    fetchWindow(); // request more above
+  }
+  // Trim rows that have drifted far offscreen so the DOM stays bounded.
+  trimTop(wantTop);
+  trimBottom(wantBottom);
+  // Replace any placeholders whose data has now arrived.
+  fillPlaceholders();
 }
 
 /** Load more rows until the content fills the viewport (so scrolling works). */
@@ -526,35 +620,10 @@ function ensureFilled() {
  */
 function progressiveLoad() {
   fetchWindow();
+  // Sync the window so newly-fetched rows appear even without a scroll event.
+  syncWindow();
 }
 
-/**
- * Request a windowed graph layout around the current scroll position.
- *
- * Sends `GetLayout{offset≈viewportTop−BUFFER, limit≈viewport+2*BUFFER}` so only
- * lanes/edges near what's on screen are serialized — not everything loaded so
- * far. Debounced so rapid scrolling doesn't spam requests; only one layout is
- * in flight at a time (`pendingLayoutId`).
- */
-let layoutTimer = null;
-function requestLayout() {
-  clearTimeout(layoutTimer);
-  layoutTimer = setTimeout(requestLayoutNow, 80);
-}
-
-/** Send the windowed layout request immediately (no debounce). */
-function requestLayoutNow() {
-  const { top, bottom } = desiredCacheRange();
-  if (top > bottom || total <= 0) return;
-  const offset = Math.max(0, top);
-  const limit = Math.max(1, bottom - top + 1);
-  pendingLayoutId++;
-  pendingLayoutOffset = offset;
-  console.log('[editchain] requestLayout offset=' + offset + ' limit=' + limit);
-  send({ GetLayout: { hide_submodules: hideSubmodules(), offset, limit, filter: filterPayload() } });
-}
-
-/** Inspect a node's details — opens a read-only JSON editor in VS Code. */
 function inspect(row) {
   console.log('[editchain] inspect', row && row.node_key);
   // Ask the extension host to open a read-only JSON editor for this node.
@@ -611,11 +680,12 @@ window.addEventListener('message', (event) => {
       if (!restored) {
         rowsEl.scrollTop = 0;
       }
-      // Fetch the window around the current scroll position and request its
-      // layout. The webview is a thin viewport; it never accumulates history.
+      // Fetch the window around the current scroll position. The webview is a thin
+      // viewport; it never accumulates history.
       fetchWindow();
-      requestLayoutNow();
-      renderRows();
+      // Reanchor to the current viewport window (rows may not be cached yet —
+      // GetWindow responses will append them in).
+      reanchorTo(desiredCacheRange().top, desiredCacheRange().bottom);
       // Start the background progressive loader so history buffers ahead of the
       // scroll position without waiting for scroll events.
       startProgressiveLoader();
@@ -636,8 +706,7 @@ window.addEventListener('message', (event) => {
     vscode.postMessage({ type: 'log', text: 'reveal: restored=' + restored + ' total=' + total });
     setTimeout(() => {
       fetchWindow();
-      requestLayoutNow();
-      renderRows();
+      reanchorTo(desiredCacheRange().top, desiredCacheRange().bottom);
       startProgressiveLoader();
     }, 50);
     return;
@@ -653,21 +722,11 @@ window.addEventListener('message', (event) => {
   }
   if (!r.value || typeof r.value !== 'object') return;
 
-  // GetLayout response — has both `rows` and `edges` arrays.
-  if (Array.isArray(r.value.edges)) {
-    layout = r.value;
-    // The server's LayoutRow has only {node,lane}; row index is implicit by
-    // position, starting at the offset we requested.
-    layoutLo = pendingLayoutOffset;
-    layoutHi = pendingLayoutOffset + layout.rows.length - 1;
-    renderRows();
-    saveState();
-    return;
-  }
-
   // GetWindow response — has a `rows` array plus `total`.
   if (Array.isArray(r.value.rows)) {
     total = r.value.total;
+    // Global max lane for stable graph-column width (per-row graph cells).
+    if (typeof r.value.max_lane === 'number') maxLane = r.value.max_lane;
     const base = pendingWindowOffset;
     for (let i = 0; i < r.value.rows.length; i++) {
       const absIdx = base + i;
@@ -676,12 +735,13 @@ window.addEventListener('message', (event) => {
     }
     pendingWindow = false;
     evictFarWindows();
-    renderRows();
+    // Newly cached rows may extend the rendered window at either edge. Sync the
+    // window to the current viewport so newly-loaded rows appear without a full
+    // rebuild.
+    syncWindow();
     vscode.postMessage({ type: 'log', text: `cached ${cache.size}/${total} nodes (fetched ${totalFetched})` });
     reportStatus();
     saveState();
-    // Recompute the layout to cover the newly loaded rows so lines extend.
-    requestLayoutNow();
     // Keep loading until the content fills the viewport so scrolling works.
     fetchWindow();
     return;
@@ -712,14 +772,12 @@ function resetHistory() {
   cache.clear();
   totalFetched = 0;
   lastRenderKey = '';
-  layout = null;
-  layoutLo = Infinity;
-  layoutHi = -1;
   pendingWindow = false;
+  renderTop = 0;
+  renderBottom = -1;
   rowsEl.scrollTop = 0;
   clearDetail();
   fetchWindow();
-  requestLayoutNow();
 }
 
 /** Clear cached rows/layout and refetch from the top (used when the chain
@@ -728,13 +786,11 @@ function resetAndRefetch() {
   cache.clear();
   totalFetched = 0;
   lastRenderKey = '';
-  layout = null;
-  layoutLo = Infinity;
-  layoutHi = -1;
   pendingWindow = false;
+  renderTop = 0;
+  renderBottom = -1;
   rowsEl.scrollTop = 0;
   fetchWindow();
-  requestLayoutNow();
 }
 
 // Search on Enter; empty query resets back to the full history.
@@ -786,7 +842,7 @@ if (hideSubmodulesEl) {
 if (hideSystemEl) {
   hideSystemEl.addEventListener('change', () => {
     rowsEl.scrollTop = 0;
-    renderRows();
+    reanchorTo(desiredCacheRange().top, desiredCacheRange().bottom);
     ensureFilled();
   });
 }
@@ -802,24 +858,25 @@ function startProgressiveLoader() {
   }, 300);
 }
 
-// Infinite scroll: fetch windows around the cursor and recompute the graph
-// layout as the user scrolls so lines stay continuous. The scroll handler is a
-// fallback; the background loader above is the primary driver.
+// Infinite scroll: extend/trim the rendered window at its edges so content
+// follows the cursor in both directions without a full rebuild. Throttled to a
+// frame so we don't run syncWindow on every scroll event.
+let syncTimer = null;
 rowsEl.addEventListener('scroll', () => {
   fetchWindow();
-  requestLayout();
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(syncWindow, 0);
   // Update the status bar depth as the user scrolls.
   reportStatus();
 });
 
-// Re-render and re-request layout when the webview resizes so columns stretch
-// and the graph window tracks the new viewport size.
+// Re-render when the webview resizes so columns stretch and the graph cells
+// track the new viewport size.
 let resizeTimer = null;
 window.addEventListener('resize', () => {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(() => {
-    renderRows();
-    requestLayout();
+    syncWindow();
     ensureFilled();
   }, 150);
 });
@@ -830,7 +887,7 @@ window.addEventListener('resize', () => {
 // (Graph, Content, Date, Author, Commit/ID). Dragging a handle overrides that
 // column's width via a CSS var (`--graph-w`, `--content-w`, etc.) so the user
 // can adjust any column, not just the graph. Handles are re-created on every
-// render because `renderRows` rebuilds the table DOM.
+// full rebuild because `reanchorTo` rebuilds the table DOM.
 
 /** Current effective graph column width (override or natural).
  *
@@ -843,7 +900,6 @@ window.addEventListener('resize', () => {
 function currentGraphWidth() {
   // Use the GLOBAL max lane (reported by the server) so the graph column width
   // is stable regardless of which window is loaded — lanes don't jump on scroll.
-  const maxLane = layout ? (layout.max_lane || 0) : 0;
   const numLanes = Math.min(maxLane + 1, MAX_GRAPH_LANES);
   const naturalGraphW = numLanes * LANE_W + LANE_W;
   return colWidths.graph !== null ? colWidths.graph : naturalGraphW;
@@ -890,7 +946,8 @@ function setupColumnResizeHandle(wrapEl, col, boundaryX) {
     const delta = e.clientX - startX;
     const next = Math.max(MIN_COL_W[col], startW + delta);
     colWidths[col] = next;
-    renderRows();
+    // Column width changed — full rebuild so the grid tracks the mouse.
+    reanchorTo(renderTop, renderBottom);
   }
 
   function onUp() {
@@ -923,10 +980,10 @@ function currentColumnWidth(col) {
 function setupColumnResizeHandles() {
   const wrapEl = rowsEl.querySelector('.table-wrap');
   if (!wrapEl) return;
-  // The column headers live inside the table-wrap (the outer `.tbl-header`
-  // directly under #rows is an empty sticky spacer). Look up the header that
-  // actually holds the `.th` cells so handle positions match column boundaries.
-  const header = wrapEl.querySelector('.tbl-header');
+  // The single sticky header is a direct child of #rows (it must NOT live inside
+  // .table-wrap, or it would scroll with content). Measure cell positions from
+  // it so handle positions match column boundaries.
+  const header = rowsEl.querySelector('.tbl-header');
   if (!header) return;
   const cols = ['graph', 'content', 'date', 'author', 'commit'];
   for (const col of cols) {
@@ -936,10 +993,23 @@ function setupColumnResizeHandles() {
   }
 }
 
-// Wire the handles after each render. `renderRows` is called from many places,
-// so hook it here rather than duplicating calls.
-const _origRenderRows = renderRows;
-renderRows = function () {
-  _origRenderRows.apply(this, arguments);
+// Wire the handles after each full rebuild. Column resize mutates `colWidths`
+// and needs a full rebuild (row widths change), so hook `reanchorTo` here rather
+// than duplicating calls. Incremental append/prepend don't change column widths,
+// so they don't need handle re-wiring.
+const _origReanchorTo = reanchorTo;
+reanchorTo = function () {
+  _origReanchorTo.apply(this, arguments);
   setupColumnResizeHandles();
+};
+
+// Harness-only debug hook: expose render state so a text-only probe can sample
+// the per-row graph cells across a scroll. This is NOT part of the production
+// webview behaviour.
+window.__editchainGraphState = function () {
+  return {
+    renderTop, renderBottom,
+    maxLane,
+    graphWidth: currentGraphWidth(),
+  };
 };

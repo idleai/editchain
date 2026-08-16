@@ -140,38 +140,34 @@
     return d;
   }
 
-  // Collect SVG geometry (dots + edges).
+  // Collect per-row graph geometry (dots + line segments). Each row carries its
+  // own small SVG cell, so we aggregate across all rendered rows.
   function describeSvg() {
-    const svg = document.getElementById('graphOverlay');
-    if (!svg) return { present: false };
-    const out = { present: true, box: box(svg), dots: [], edges: [] };
-    for (const dot of svg.querySelectorAll('circle.graphDot')) {
-      out.dots.push({
-        row: dot.getAttribute('data-row'),
-        cx: +dot.getAttribute('cx'),
-        cy: +dot.getAttribute('cy'),
-        r: +dot.getAttribute('r'),
-        fill: dot.getAttribute('fill'),
-      });
-    }
-    // Edge paths are drawn as <path class="graphLine">. We can't recover the
-    // child/parent keys from the path alone, but we report endpoints via
-    // getPointAtLength and total length.
-    for (const p of svg.querySelectorAll('path.graphLine')) {
-      let len = 0;
-      try { len = p.getTotalLength(); } catch (e) { len = -1; }
-      let start = null, end = null;
-      try { start = p.getPointAtLength(0); } catch (e) {}
-      try { end = p.getPointAtLength(len); } catch (e) {}
-      // Observed stroke colour from the computed style (CSS may theme it).
-      const stroke = getComputedStyle(p).stroke;
-      out.edges.push({
-        len: Math.round(len * 100) / 100,
-        start: start ? { x: Math.round(start.x), y: Math.round(start.y) } : null,
-        end: end ? { x: Math.round(end.x), y: Math.round(end.y) } : null,
-        stroke,
-      });
-    }
+    const cells = document.querySelectorAll('.graph-cell svg.graphCell');
+    if (!cells.length) return { present: false };
+    const out = { present: true, cells: cells.length, dots: [], lines: [] };
+    cells.forEach((cellSvg) => {
+      const rowEl = cellSvg.closest('.row');
+      const absIdx = rowEl ? rowEl.getAttribute('data-row') : null;
+      for (const dot of cellSvg.querySelectorAll('circle.graphDot')) {
+        out.dots.push({
+          row: absIdx,
+          cx: +dot.getAttribute('cx'),
+          cy: +dot.getAttribute('cy'),
+          r: +dot.getAttribute('r'),
+          fill: dot.getAttribute('fill'),
+        });
+      }
+      for (const line of cellSvg.querySelectorAll('line.graphLine')) {
+        out.lines.push({
+          row: absIdx,
+          x1: +line.getAttribute('x1'),
+          y1: +line.getAttribute('y1'),
+          x2: +line.getAttribute('x2'),
+          y2: +line.getAttribute('y2'),
+        });
+      }
+    });
     return out;
   }
 
@@ -208,7 +204,9 @@
     const checks = [];
     const rowsEl = document.getElementById('rows');
     const wrapEl = rowsEl && rowsEl.querySelector('.table-wrap');
-    const headerEl = wrapEl && wrapEl.querySelector('.tbl-header');
+    // The single sticky header is a direct child of #rows (it must NOT live
+    // inside .table-wrap, or it would scroll with content and appear mid-table).
+    const headerEl = rowsEl && rowsEl.querySelector('.tbl-header');
 
     // Check 1: header present.
     checks.push({
@@ -246,11 +244,13 @@
       let firstFail = null;
       rowEls.forEach((row) => {
         const absIdx = row.getAttribute('data-row');
-        const dot = wrapEl.querySelector('#graphOverlay circle.graphDot[data-row="' + absIdx + '"]');
+        const cellSvg = row.querySelector('.graph-cell svg.graphCell');
+        const dot = cellSvg && cellSvg.querySelector('circle.graphDot');
         if (!dot) { dotsOk = false; firstFail = firstFail || { rowIdx:absIdx, reason:'no dot' }; return; }
         const rowBox = row.getBoundingClientRect();
-        const wrapBox = wrapEl.getBoundingClientRect();
-        const dotCy = +dot.getAttribute('cy') + wrapBox.top; // dot cy is relative to svg/wrap
+        // dot cy is relative to the cell svg, which sits at the row's top.
+        const cellTop = cellSvg.getBoundingClientRect().top;
+        const dotCy = cellTop + (+dot.getAttribute('cy'));
         const rowCenterY = rowBox.top + rowBox.height / 2;
         const deltaY = Math.abs(dotCy - rowCenterY);
         if (deltaY > 1.5) { dotsOk = false; firstFail = firstFail || { rowIdx:absIdx, deltaY }; }

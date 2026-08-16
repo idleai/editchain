@@ -239,6 +239,32 @@ pub struct LayoutContext {
     /// whose child lies above the window so lines entering from offscreen above
     /// are still drawn through the visible slice.
     pub children_of: HashMap<String, Vec<String>>,
+    /// Node key → connected-component id. Used to detect open chains that span
+    /// across a query window so pass-through edges are still drawn.
+    pub comp_id: HashMap<String, usize>,
+    /// Node key → minimum row index among all members of its component.
+    pub comp_min: HashMap<String, usize>,
+    /// Node key → maximum row index among all members of its component.
+    pub comp_max: HashMap<String, usize>,
+    /// Lane → sorted list of `(component id, min, max)` row spans during which
+    /// that lane is actually OCCUPIED by a node of that component (not just
+    /// touched by the component). Lets us find open chains spanning a query
+    /// window even when none of their nodes fall inside it (sparse chains),
+    /// without iterating window rows — while still refusing to draw a line on a
+    /// lane that has no node in the window.
+    pub lane_spans: HashMap<usize, Vec<(usize, usize, usize)>>,
+    /// Per-row lanes with a vertical segment in the TOP half of that row's cell
+    /// (lines entering from above). Splitting above/below lets tips (newest nodes,
+    /// no children) draw no line above their dot and roots (no parents) draw no
+    /// line below — no dangling segments. Static, shipped per row.
+    pub row_above: Vec<Vec<usize>>,
+    /// Per-row lanes with a vertical segment in the BOTTOM half of that row's cell
+    /// (lines leaving downward). See [`Self::row_above`].
+    pub row_below: Vec<Vec<usize>>,
+    /// Per-row horizontal lane-jog segments: for each row index, the list of
+    /// `(from_lane, to_lane)` transitions that occur at that row (merge
+    /// connectors). Also static and shipped per row.
+    pub row_transitions: Vec<Vec<(usize, usize)>>,
 }
 
 impl LayoutContext {
@@ -277,6 +303,118 @@ impl LayoutContext {
                 children_of.entry(p.clone()).or_default().push(key.clone());
             }
         }
+        // Precompute connected components so open chains that span across a query
+        // window (pass-through edges) can be detected without iterating window rows.
+        let (comp_id, comp_min, comp_max, _) = compute_components(nodes, &row_of, &parents);
+        // Build per-lane OCCUPANCY intervals keyed by component: for each lane,
+        // record every component that occupies it and that component's min/max row
+        // ON THAT LANE specifically.
+        //
+        // A component may touch several lanes (merges), but a lane is only "open"
+        // where a node of the component sits on it. Recording the component's full
+        // [min,max] span under every lane it touches would draw a pass-through line
+        // on lanes that have no node in the window (e.g. a merge branch that only
+        // exists far below the viewport). Conversely recording only contiguous runs
+        // of rows would miss genuinely sparse chains whose nodes are far apart on
+        // one lane. Keying by component captures both: a pass-through line on a
+        // lane is valid iff ONE component occupies that lane both above `offset`
+        // and below `end`.
+        let mut lane_spans: HashMap<usize, Vec<(usize, usize, usize)>> = HashMap::new();
+        for (row, key) in nodes.iter().enumerate() {
+            let lane = *lane_at.get(key).unwrap_or(&0);
+            let cid = *comp_id.get(key).unwrap_or(&usize::MAX);
+            let list = lane_spans.entry(lane).or_default();
+            if let Some(entry) = list.iter_mut().find(|e| e.0 == cid) {
+                entry.1 = entry.1.min(row);
+                entry.2 = entry.2.max(row);
+            } else {
+                list.push((cid, row, row));
+            }
+        }
+        for list in lane_spans.values_mut() {
+            list.sort_unstable();
+        }
+
+        // Compute per-row ABOVE/BELOW lanes and horizontal TRANSITIONS by walking every
+        // edge's geometry. An edge from (child_row, child_lane) to (parent_row,
+        // parent_lane):
+        //   - same lane: vertical on child_lane from child down to parent;
+        //   - different lanes: vertical on child_lane down to parent_row-1, a
+        //     horizontal jog child_lane→parent_lane at parent_row-1, then vertical
+        //     on parent_lane down to parent.
+        // Splitting into above/below halves means a TIP (newest node, no children)
+        // draws no line above its dot and a ROOT (no parents) draws no line below —
+        // no dangling segments. All static, shipped per row.
+        let mut row_above: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+        let mut row_below: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+        let mut row_transitions: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nodes.len()];
+        for (row, key) in nodes.iter().enumerate() {
+            let my_lane = *lane_at.get(key).unwrap_or(&0);
+            let node_parents = parents.get(key).map_or(&[][..], Vec::as_slice);
+            for parent in node_parents {
+                let Some(parent_row) = row_of.get(parent).copied() else {
+                    continue;
+                };
+                if parent_row <= row {
+                    continue; // parent above or same row — not a downward edge
+                }
+                let p_lane = *lane_at.get(parent).unwrap_or(&my_lane);
+                if my_lane == p_lane {
+                    // Same-lane edge: vertical on my_lane from `row` down to
+                    // `parent_row`. Bottom half at the child's own row, top half at
+                    // the parent's row, both halves in between.
+                    if let Some(below) = row_below.get_mut(row) {
+                        add_unique(below, my_lane);
+                    }
+                    if let Some(above) = row_above.get_mut(parent_row) {
+                        add_unique(above, my_lane);
+                    }
+                    for r in (row.saturating_add(1))..parent_row {
+                        if let Some(above) = row_above.get_mut(r) {
+                            add_unique(above, my_lane);
+                        }
+                        if let Some(below) = row_below.get_mut(r) {
+                            add_unique(below, my_lane);
+                        }
+                    }
+                } else {
+                    // Different-lane edge: vertical on my_lane down to parent_row-1,
+                    // jog to p_lane at parent_row-1, then vertical on p_lane down to
+                    // parent_row.
+                    if let Some(below) = row_below.get_mut(row) {
+                        add_unique(below, my_lane);
+                    }
+                    for r in (row.saturating_add(1))..parent_row.saturating_sub(1) {
+                        if let Some(above) = row_above.get_mut(r) {
+                            add_unique(above, my_lane);
+                        }
+                        if let Some(below) = row_below.get_mut(r) {
+                            add_unique(below, my_lane);
+                        }
+                    }
+                    let jog_row = parent_row.saturating_sub(1);
+                    if let Some(above) = row_above.get_mut(jog_row) {
+                        add_unique(above, my_lane);
+                    }
+                    if let Some(transitions) = row_transitions.get_mut(jog_row) {
+                        add_unique(transitions, (my_lane, p_lane));
+                    }
+                    if let Some(below) = row_below.get_mut(jog_row) {
+                        add_unique(below, p_lane);
+                    }
+                    if let Some(above) = row_above.get_mut(parent_row) {
+                        add_unique(above, p_lane);
+                    }
+                }
+            }
+        }
+        for list in &mut row_above {
+            list.sort_unstable();
+        }
+        for list in &mut row_below {
+            list.sort_unstable();
+        }
+
         Self {
             keys: nodes.to_vec(),
             row_of,
@@ -284,6 +422,13 @@ impl LayoutContext {
             lanes,
             parents,
             children_of,
+            comp_id,
+            comp_min,
+            comp_max,
+            lane_spans,
+            row_above,
+            row_below,
+            row_transitions,
         }
     }
 
@@ -355,8 +500,143 @@ impl LayoutContext {
             }
         }
 
+        // Emit PASS-THROUGH edges: open chains whose component spans across the
+        // window — nodes both above `offset` and below `end` — even when none of
+        // their nodes fall inside `[offset,end)`. The two loops above only emit
+        // edges with an endpoint in the window, so a sparse chain with a gap in
+        // the visible slice would otherwise flicker in/out as you scroll. We use
+        // the precomputed per-lane OCCUPANCY spans so a chain is detected even
+        // when it has NO node inside the window. Emit one vertical line per
+        // affected lane from window top to bottom so every open chain stays
+        // continuous.
+        //
+        // A lane qualifies only if it is OCCUPIED both above `offset` and below
+        // `end` — i.e. some node of the chain sits on that lane on each side of
+        // the window. This is what keeps a merge branch that only exists far
+        // below (or above) the viewport from drawing a spurious line through an
+        // otherwise-empty lane.
+        let mut pass_through_lanes: Vec<usize> = Vec::new();
+        for (lane, spans) in &self.lane_spans {
+            // Spans are sorted by min; find any span covering [offset,end). Each
+            // span is (component id, lo, hi) where [lo,hi] is that component's
+            // occupancy on THIS lane — so a lane qualifies only when one component
+            // occupies it both above `offset` and below `end`.
+            let covers = spans.iter().any(|&(_, lo, hi)| lo < offset && hi >= end);
+            if covers && !pass_through_lanes.contains(lane) {
+                pass_through_lanes.push(*lane);
+            }
+        }
+        for lane in pass_through_lanes {
+            edges.push(LaneEdge {
+                child: format!("__pass_through_{lane}"),
+                parent: format!("__pass_through_{lane}"),
+                points: vec![
+                    GridPoint { row: offset, lane },
+                    GridPoint {
+                        row: end.saturating_sub(1),
+                        lane,
+                    },
+                ],
+            });
+        }
+
         edges
     }
+}
+
+/// Compute connected components over undirected edges (parents + children).
+///
+/// Returns:
+///   - `comp_id`: node key → connected-component id,
+///   - `comp_min`: node key → minimum row index among its component's members,
+///   - `comp_max`: node key → maximum row index among its component's members,
+///   - `lane_spans`: lane → sorted list of `(min,max)` row spans of the
+///     components occupying that lane. Used to detect open chains that span
+///     across a query window even when none of their nodes fall inside it.
+type ComponentData = (
+    HashMap<String, usize>,
+    HashMap<String, usize>,
+    HashMap<String, usize>,
+    HashMap<usize, Vec<(usize, usize)>>,
+);
+
+/// Add an undirected edge between two nodes (both directions).
+fn add_undirected_edge(adj: &mut HashMap<String, Vec<String>>, a: &str, b: &str) {
+    adj.entry(a.to_string()).or_default().push(b.to_string());
+    adj.entry(b.to_string()).or_default().push(a.to_string());
+}
+
+/// A component whose span covers `[offset,end)` is an "open chain" passing
+/// through that window even when none of its nodes fall inside it — so we can
+/// draw continuous vertical lines for it regardless of how sparse its nodes are.
+#[must_use]
+#[expect(
+    clippy::let_underscore_untyped,
+    reason = "HashMap insert returns Option which is discarded"
+)]
+fn compute_components(
+    keys: &[String],
+    row_of: &HashMap<String, usize>,
+    parents: &HashMap<String, Vec<String>>,
+) -> ComponentData {
+    use std::collections::{HashSet, VecDeque};
+
+    // Undirected adjacency.
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for key in keys {
+        let _ = adj.entry(key.clone()).or_default();
+        if let Some(ps) = parents.get(key) {
+            for p in ps {
+                add_undirected_edge(&mut adj, key, p);
+            }
+        }
+    }
+
+    // Flood-fill components; record each component's [lo,hi] row span.
+    let mut comp_id: HashMap<String, usize> = HashMap::with_capacity(keys.len());
+    let mut comp_span: Vec<(usize, usize)> = Vec::new(); // per comp id -> (lo,hi)
+    let mut seen: HashSet<String> = HashSet::with_capacity(keys.len());
+    for seed in keys {
+        if seen.contains(seed) {
+            continue;
+        }
+        let _ = seen.insert(seed.clone());
+        let mut queue: VecDeque<String> = VecDeque::from([seed.clone()]);
+        let mut lo = *row_of.get(seed).unwrap_or(&usize::MAX);
+        let mut hi = *row_of.get(seed).unwrap_or(&0);
+        while let Some(k) = queue.pop_front() {
+            lo = lo.min(*row_of.get(&k).unwrap_or(&usize::MAX));
+            hi = hi.max(*row_of.get(&k).unwrap_or(&0));
+            let _ = comp_id.insert(k.clone(), comp_span.len());
+            if let Some(nbrs) = adj.get(&k) {
+                for nbr in nbrs {
+                    if !seen.contains(nbr) {
+                        let _ = seen.insert(nbr.clone());
+                        queue.push_back(nbr.clone());
+                    }
+                }
+            }
+        }
+        comp_span.push((lo, hi));
+    }
+
+    // Expand spans to per-node maps.
+    let mut comp_min: HashMap<String, usize> = HashMap::with_capacity(keys.len());
+    let mut comp_max: HashMap<String, usize> = HashMap::with_capacity(keys.len());
+    for key in keys {
+        let cid = *comp_id.get(key).unwrap_or(&0);
+        if let Some((lo, hi)) = comp_span.get(cid) {
+            let _ = comp_min.insert(key.clone(), *lo);
+            let _ = comp_max.insert(key.clone(), *hi);
+        }
+    }
+
+    // Build per-lane sorted list of component spans. A component may occupy
+    // several lanes (merges); record its span under each lane it touches.
+    // We need lane info per node — recover from the caller's lane_at via keys.
+    // To avoid threading lane_at through here, we build lane_spans from the
+    // caller by scanning keys; see LayoutContext::new.
+    (comp_id, comp_min, comp_max, HashMap::new())
 }
 
 /// Compute the per-row lane assignment (no edges).
@@ -803,4 +1083,11 @@ fn compute_lane_map_reuse(
 /// Fold a row index into a running `(min, max)` span.
 fn fold_span(span: (usize, usize), row: usize) -> (usize, usize) {
     (span.0.min(row), span.1.max(row))
+}
+
+/// Push `v` into `list` if not already present (dedup for per-row lane sets).
+fn add_unique<T: PartialEq>(list: &mut Vec<T>, v: T) {
+    if !list.contains(&v) {
+        list.push(v);
+    }
 }

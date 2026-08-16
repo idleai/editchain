@@ -394,3 +394,164 @@ fn reuse_preserves_merge_two_lanes() {
         "merge parents need distinct lanes"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Pass-through edges: open chains spanning a window
+// ---------------------------------------------------------------------------
+
+/// A merge branch that only exists far below the viewport must NOT draw a
+/// pass-through line on its lane through an otherwise-empty window.
+///
+/// Trunk N5..N1 down to merge M of two roots A (on the trunk lane) and B (on a
+/// second lane). B sits only at the bottom row. Viewing a window that contains
+/// no node on B's lane must not emit a line there — that was the bug where
+/// scrolling filled in lanes for chains that shouldn't be present.
+#[test]
+fn pass_through_skips_lane_with_no_node_in_window() {
+    let nodes = vec![
+        "N5".to_string(),
+        "N4".to_string(),
+        "N3".to_string(),
+        "N2".to_string(),
+        "N1".to_string(),
+        "M".to_string(),
+        "A".to_string(),
+        "B".to_string(),
+    ];
+    let parents = parents_from(&[
+        ("N5", &["N4"]),
+        ("N4", &["N3"]),
+        ("N3", &["N2"]),
+        ("N2", &["N1"]),
+        ("N1", &["M"]),
+        ("M", &["A", "B"]),
+    ]);
+    let ctx = LayoutContext::new(&nodes, &parents, &no_git);
+    // Window rows 2..6 = N3,N2,N1,M,A. Lane 0 (B's lane) has no node inside.
+    let edges = ctx.edges_for_window(2, 5);
+    // The trunk edges are present.
+    assert!(edges.iter().any(|e| e.child == "N3" && e.parent == "N2"));
+    assert!(edges.iter().any(|e| e.child == "N1" && e.parent == "M"));
+    // No pass-through line on lane 0: B is at row 7, below the window.
+    assert!(
+        !edges
+            .iter()
+            .any(|e| e.child.starts_with("__pass_through_0")),
+        "must not draw a pass-through line on lane 0 (B is below the window)"
+    );
+}
+
+/// A genuinely sparse chain — one component occupying a lane both above and
+/// below the window, with no node inside it — must still draw a pass-through
+/// line so the chain stays continuous while scrolling.
+#[test]
+fn pass_through_draws_sparse_chain_across_window() {
+    // One component: N0 (row 0) -> ... -> N9 (row 9), all on one lane. View a
+    // middle window with no node inside it; the line must still be drawn.
+    let nodes: Vec<String> = (0..10).map(|i| format!("N{i}")).collect();
+    let parents = parents_from(&[
+        ("N0", &["N1"]),
+        ("N1", &["N2"]),
+        ("N2", &["N3"]),
+        ("N3", &["N4"]),
+        ("N4", &["N5"]),
+        ("N5", &["N6"]),
+        ("N6", &["N7"]),
+        ("N7", &["N8"]),
+        ("N8", &["N9"]),
+    ]);
+    let ctx = LayoutContext::new(&nodes, &parents, &no_git);
+    // Window rows 3..7 has no node inside it (all nodes are at rows 0..9).
+    let edges = ctx.edges_for_window(3, 4);
+    assert!(
+        edges.iter().any(|e| e.child.starts_with("__pass_through_")),
+        "sparse chain spanning the window must draw a pass-through line"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-row graph geometry (lane + active lanes + transitions)
+// ---------------------------------------------------------------------------
+
+/// Per-row active lanes and transitions must be computed correctly for a merge.
+///
+/// Trunk N5..N1 down to merge M of two roots A (lane 0) and B (lane 1). The
+/// vertical line on lane 0 passes through every trunk row; the merge jog from
+/// lane 0 to lane 1 happens at the row just above B.
+#[test]
+fn per_row_active_lanes_and_transitions_for_merge() {
+    let nodes = vec![
+        "N5".to_string(),
+        "N4".to_string(),
+        "N3".to_string(),
+        "N2".to_string(),
+        "N1".to_string(),
+        "M".to_string(),
+        "A".to_string(),
+        "B".to_string(),
+    ];
+    let parents = parents_from(&[
+        ("N5", &["N4"]),
+        ("N4", &["N3"]),
+        ("N3", &["N2"]),
+        ("N2", &["N1"]),
+        ("N1", &["M"]),
+        ("M", &["A", "B"]),
+    ]);
+    let ctx = LayoutContext::new(&nodes, &parents, &no_git);
+
+    // Lane assignment: trunk + A share one lane, B is on a different lane.
+    // (Absolute lane numbers are nondeterministic due to HashMap iteration order
+    // in the reuse algorithm, so assert the RELATIVE structure.)
+    let lane_of = |k: &str| ctx.lanes.iter().find(|r| r.node == k).unwrap().lane;
+    let trunk_lane = lane_of("N5");
+    assert_eq!(lane_of("A"), trunk_lane, "A shares the trunk lane");
+    assert_ne!(lane_of("B"), trunk_lane, "B is on a distinct lane");
+
+    // The vertical line on the trunk lane: below-half on rows 0..5 (N5..M, leaving
+    // each node downward) and above-half on rows 1..6 (N4..A, entering each node
+    // from above). Row 6 is A, where the trunk line enters from above.
+    for row in 0..6 {
+        assert!(
+            ctx.row_below
+                .get(row)
+                .is_some_and(|b| b.contains(&trunk_lane)),
+            "row {row} should have the trunk lane in below"
+        );
+    }
+    for row in 1..7 {
+        assert!(
+            ctx.row_above
+                .get(row)
+                .is_some_and(|a| a.contains(&trunk_lane)),
+            "row {row} should have the trunk lane in above"
+        );
+    }
+    // Row 0 is the TIP (newest, no children): no line above its dot.
+    assert!(
+        !ctx.row_above
+            .first()
+            .is_some_and(|a| a.contains(&trunk_lane)),
+        "tip row 0 should have no line above"
+    );
+    // Row 7 (B) has its own lane entering from above.
+    assert!(ctx
+        .row_above
+        .get(7)
+        .is_some_and(|a| a.contains(&lane_of("B"))));
+    // Row 7 is a ROOT (no parents): no line below its dot.
+    assert!(
+        !ctx.row_below
+            .get(7)
+            .is_some_and(|b| b.contains(&lane_of("B"))),
+        "root row 7 should have no line below"
+    );
+
+    // The merge jog from the trunk lane to B's lane happens at row 6 (just above B).
+    assert!(
+        ctx.row_transitions
+            .get(6)
+            .is_some_and(|t| t.contains(&(trunk_lane, lane_of("B")))),
+        "row 6 should have a trunk->B transition"
+    );
+}
