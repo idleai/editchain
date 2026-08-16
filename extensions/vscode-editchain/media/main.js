@@ -54,7 +54,10 @@ let lastRenderKey = '';    // cache key of the last rendered slice (avoid redund
 // Global maximum graph lane across ALL rows, reported by the server with each
 // GetWindow response. Used to size the graph column stably regardless of which
 // window is loaded (lanes don't jump on scroll).
-let maxLane = 0;
+// Initial lane count used before the first GetWindow response arrives. Set to
+// a small non-zero default (3 lanes) so the sticky header's graph column isn't
+// collapsed on open — it snaps to the real lane count once max_lane is known.
+let maxLane = 2;
 
 // Additive (UIKit-style) window state. The DOM always holds a CONTIGUOUS run of
 // rows [renderTop, renderBottom] (inclusive), in order, with no gaps. The
@@ -386,6 +389,30 @@ function setWrapTop(top) {
   if (w) w.style.top = (top * ROW_H) + 'px';
 }
 
+/** Build the sticky header row HTML. The graph column's width is derived from
+ * the current `maxLane`, so this must be re-run whenever `maxLane` changes
+ * (e.g. when the first GetWindow response arrives after `open`). */
+function buildHeaderHtml() {
+  return '<div class="tbl-header" style="' + colStyle() + '">' +
+    '<div class="th graph">Graph</div>' +
+    '<div class="th content">Content</div>' +
+    '<div class="th date">Date</div>' +
+    '<div class="th author">Author</div>' +
+    '<div class="th commit">Commit/ID</div>' +
+    '</div>';
+}
+
+/** Rebuild just the sticky header in place (no row rebuild) so its column
+ * widths track a changed `maxLane`. The header is a direct child of #rows and
+ * must NOT be rebuilt by touching .table-wrap. Re-wires resize handles since
+ * their positions depend on header cell boundaries. */
+function refreshHeader() {
+  const header = rowsEl.querySelector('.tbl-header');
+  if (!header) return;
+  header.outerHTML = buildHeaderHtml();
+  setupColumnResizeHandles();
+}
+
 /** Rebuild the entire window from cache in one pass. Used for initial load,
  * far jumps, column resize, and filter changes — NOT for normal scrolling. */
 function reanchorTo(top, bottom) {
@@ -405,14 +432,7 @@ function reanchorTo(top, bottom) {
   // NOT live inside .table-wrap (which is positioned at renderTop*ROW_H and moves
   // with scroll) — a header there would scroll with content and appear mid-table.
   const spacerH = Math.max(1, total * ROW_H);
-  const headerHtml =
-    '<div class="tbl-header" style="' + colStyle() + '">' +
-      '<div class="th graph">Graph</div>' +
-      '<div class="th content">Content</div>' +
-      '<div class="th date">Date</div>' +
-      '<div class="th author">Author</div>' +
-      '<div class="th commit">Commit/ID</div>' +
-    '</div>';
+  const headerHtml = buildHeaderHtml();
   // Preserve the scroll position across the DOM rebuild (setting innerHTML
   // resets scrollTop to 0).
   const prevScrollTop = rowsEl.scrollTop;
@@ -726,7 +746,14 @@ window.addEventListener('message', (event) => {
   if (Array.isArray(r.value.rows)) {
     total = r.value.total;
     // Global max lane for stable graph-column width (per-row graph cells).
-    if (typeof r.value.max_lane === 'number') maxLane = r.value.max_lane;
+    if (typeof r.value.max_lane === 'number' && r.value.max_lane !== maxLane) {
+      maxLane = r.value.max_lane;
+      // The header's graph-column width derives from maxLane. On `open` the
+      // header is built before the first GetWindow response, so it starts
+      // collapsed; refresh it now that the real lane count is known, or the
+      // sticky header stays narrower than the rows it labels.
+      refreshHeader();
+    }
     const base = pendingWindowOffset;
     for (let i = 0; i < r.value.rows.length; i++) {
       const absIdx = base + i;
