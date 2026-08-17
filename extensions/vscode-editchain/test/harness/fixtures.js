@@ -136,6 +136,30 @@
     return { rows, layoutRows, edges };
   }
 
+  // A combined op carrying bundled metadata sub-ops (the exact list from the
+  // request), to exercise inline reveal. The server emits the parent + one row
+  // per sub-op as a fixed fully-expanded flat list.
+  function combinedOp() {
+    const parent = opRow('node:c:1', 'Agent turn with metadata', {
+      group: 'session:s1', kind: 'message', author: 'agent',
+    });
+    const subKinds = [
+      'system', 'last-prompt', 'custom-title', 'agent-name',
+      'mode', 'permission-mode', 'file-history-snapshot',
+    ];
+    parent.sub_ops = subKinds.map((k, i) => ({
+      op_id: 'node:c:1::sub:' + i,
+      summary: k,
+      kind: k,
+      timestamp_ms: NOW - i * 1000,
+    }));
+    // A second plain row after it, so expansion shifts it down.
+    const after = opRow('node:c:2', 'Plain row after', { group: 'session:s1', kind: 'message' });
+    const rows = [parent, after];
+    const layoutRows = rows.map((r) => ({ node: r.node_key, lane: 0 }));
+    return { rows, layoutRows, edges: [], subOpCounts: [parent.sub_ops.length, 0] };
+  }
+
   // A large virtual history window (600 rows) for scroll/overflow checks.
   function largeHistory() {
     const keys = [];
@@ -224,6 +248,10 @@
       ];
       const layoutRows = rows.map((r) => ({ node: r.node_key, lane: 0 }));
       return { rows, layoutRows, edges: [] };
+    },
+
+    combined() {
+      return combinedOp();
     },
   };
 

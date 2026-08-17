@@ -30,6 +30,54 @@
     return { rows: kept, hiddenKeys };
   }
 
+  // Expand a top-level row's bundled sub_ops into a fixed fully-expanded flat
+  // list (parent + one row per sub-op), mirroring the service. Each sub-op row
+  // is flagged is_subop and draws every lane passing straight through its region
+  // as a full-height line (above == below), with no dot.
+  function expandSubOps(rows) {
+    const out = [];
+    for (let ri = 0; ri < rows.length; ri++) {
+      const row = rows[ri];
+      out.push(row);
+      const subs = row.sub_ops || [];
+      if (!subs.length) continue;
+      // Lanes passing through this region = intersect(row_below[parent],
+      // row_above[next]). The next top-level row's `above` lists lanes entering
+      // it from above; the parent's `below` lists lanes leaving it downward.
+      const nextRow = rows[ri + 1];
+      const belowParent = row.below || [];
+      const aboveNext = nextRow ? (nextRow.above || []) : [];
+      const regionLanes = belowParent.filter((l) => aboveNext.includes(l));
+      for (let i = 0; i < subs.length; i++) {
+        const sub = subs[i];
+        out.push({
+          op_id: sub.op_id,
+          git_oid: null,
+          repository: null,
+          summary: sub.summary,
+          timestamp_ms: sub.timestamp_ms,
+          group: row.group,
+          node_key: row.node_key + '::sub:' + i,
+          parents: [],
+          is_submodule: false,
+          is_system: true,
+          author: '',
+          commit_id: '',
+          kind: sub.kind,
+          lane: row.lane || 0,
+          above: regionLanes.slice(),
+          below: regionLanes.slice(),
+          transitions: [],
+          sub_ops: [],
+          is_subop: true,
+          parent_row: out.length - 1 - subs.length + i,
+          subop_kind: sub.kind,
+        });
+      }
+    }
+    return out;
+  }
+
   // Slice a full dataset into a GetWindow response.
   function windowResponse(fixture, req) {
     const offset = req.offset || 0;
@@ -39,11 +87,20 @@
     if (hideSub) rows = rows.filter((r) => !r.is_submodule);
     const filtered = applyFilter(rows, req.filter);
     rows = filtered.rows;
+    // Global per-node sub-op counts (for prefix sums), shipped with every window
+    // so a deep jump doesn't depend on the offset==0 window having been fetched.
+    const subOpCounts = (fixture.subOpCounts || rows.map((r) => (r.sub_ops || []).length));
+    const expanded = expandSubOps(rows);
     const total = fixture.total !== undefined && fixture.total >= 0
       ? fixture.total
-      : rows.length;
-    const slice = rows.slice(offset, offset + limit);
-    return { rows: slice, total, chain_generation: 0 };
+      : expanded.length;
+    const slice = expanded.slice(offset, offset + limit);
+    return {
+      rows: slice,
+      total,
+      chain_generation: 0,
+      sub_op_counts: subOpCounts,
+    };
   }
 
   // Slice a full dataset into a GetLayout response.

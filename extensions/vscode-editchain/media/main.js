@@ -69,15 +69,130 @@ let renderBottom = -1;     // absolute row index of last rendered row (inclusive
 
 const ROW_H = 34;
 
-/** Absolute row index of the top of the viewport, clamped to [0, total-1] so
- * overscrolling below the bottom never reports a depth beyond the chain. */
-function viewportTopRow() {
-  return Math.max(0, Math.min(total - 1, Math.floor(rowsEl.scrollTop / ROW_H)));
+// --- Inline sub-op reveal ---------------------------------------------------
+//
+// The server emits a FIXED fully-expanded flat list (`total` = fully-expanded
+// count): every combined op always occupies its stable 1+N absolute slots
+// (parent + one per bundled sub-op), so fetch/cache indices never move.
+// Collapse/expand is purely a rendering decision driven by reveal state below.
+//
+// Virtual scroll therefore operates in TWO spaces:
+//   - CACHE & FETCH use ABSOLUTE indices (server returns stable windows).
+//   - RENDER & SCROLL & SPACER use VISIBLE indices — how many uniform ROW_H
+//     slots are actually drawn after collapsing hidden sub-op slots.
+//
+// Mapping between them uses prefix sums over per-node sub-op counts (`subOpCounts`,
+// shipped once per filter state from the server when offset==0).
+
+/** Number of bundled sub-ops per top-level node (global; empty until received). */
+let subOpCounts = [];
+/** Absolute start slot of each top-level node's block (= parent row index). */
+let blockStarts = [];
+/** Top-level node indices currently expanded (reveal state). Default all collapsed. */
+const expandedBlocks = new Set();
+/** Prefix sum over blocks of "hidden contribution" — recomputed on toggle/counts change.
+ * contrib[b] = count[b] if block b is collapsed else 0; prefixContrib[k] = sum_{b<k} contrib[b]. */
+let prefixContrib = [];
+
+/** Recompute blockStarts + prefixContrib from subOpCounts + expandedBlocks.
+ * Call whenever either changes so all mapping helpers stay consistent. */
+function recomputeExpansion() {
+  const n = subOpCounts.length;
+  const starts = new Array(n);
+  let acc = 0;
+  for (let i = 0; i < n; i++) {
+    starts[i] = acc;
+    acc += 1 + subOpCounts[i];
+  }
+  blockStarts = starts;
+  const contrib = new Array(n);
+  let pacc = 0;
+  for (let i = 0; i < n; i++) {
+    contrib[i] = pacc;
+    pacc += expandedBlocks.has(i) ? 0 : subOpCounts[i];
+  }
+  prefixContrib = contrib;
 }
 
-/** Absolute row index just below the bottom of the viewport. */
-function viewportBottomRow() {
-  return Math.min(total - 1, Math.ceil((rowsEl.scrollTop + rowsEl.clientHeight) / ROW_H));
+/** Number of hidden slots strictly before any slot inside block b.
+ * For a VISIBLE slot of block b this equals prefixContrib[b]. */
+function hiddenBeforeBlock(b) {
+  return b < prefixContrib.length ? prefixContrib[b] : 0;
+}
+
+/** Total number of VISIBLE rows given current reveal state (= spacer height / ROW_H). */
+function visibleTotal() {
+  let hidden = 0;
+  for (let i = 0; i < subOpCounts.length; i++) {
+    if (!expandedBlocks.has(i)) hidden += subOpCounts[i];
+  }
+  return Math.max(1, total - hidden);
+}
+
+/** Map a VISIBLE index back to its ABSOLUTE slot index.
+ * Returns null if vis is out of range or lands on nothing drawable.
+ *
+ * Before the first GetWindow response arrives, `subOpCounts`/`blockStarts` are
+ * empty and no sub-op expansion is known yet — the mapping is identity (every
+ * absolute slot is its own visible slot). This keeps the initial `reanchorTo`
+ * from rendering a blank grid while the offset==0 window is in flight.
+ */
+function absIndexForVisible(vis) {
+  if (!blockStarts.length) return vis; // no expansion known yet — identity
+  // Binary search blocks by their VISIBLE start (= start[b] - hiddenBeforeBlock(b)).
+  let lo = 0;
+  let hi = blockStarts.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    const vStartMid = blockStarts[mid] - hiddenBeforeBlock(mid);
+    if (vStartMid <= vis) lo = mid + 1;
+    else hi = mid;
+  }
+  const b = lo - 1;
+  if (b < 0 || b >= blockStarts.length) return null;
+  const vStartB = blockStarts[b] - hiddenBeforeBlock(b);
+  const offInBlockVis = vis - vStartB;
+  const countB = b < subOpCounts.length ? subOpCounts[b] : 0;
+  if (!expandedBlocks.has(b)) {
+    // Collapsed: only one visible slot → parent row.
+    return offInBlockVis === 0 ? blockStarts[b] : null;
+  }
+  if (offInBlockVis > countB) return null;
+  return blockStarts[b] + offInBlockVis;
+}
+
+/** Toggle expansion of a top-level node by its ABSOLUTE parent-row index.
+ * Returns true if anything changed. */
+function toggleExpanded(absParentRow) {
+  const b = blockIndexOfAbs(absParentRow);
+  if (b < 0 || b >= subOpCounts.length || !subOpCounts[b]) return false;
+  if (expandedBlocks.has(b)) expandedBlocks.delete(b);
+  else expandedBlocks.add(b);
+  recomputeExpansion();
+  return true;
+}
+
+/** Index of the top-level node whose block starts at `absParentRow`, else -1. */
+function blockIndexOfAbs(absParentRow) {
+  let lo = 0;
+  let hi = blockStarts.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (blockStarts[mid] <= absParentRow) lo = mid + 1;
+    else hi = mid;
+  }
+  const b = lo - 1;
+  return b >= 0 && b < blockStarts.length && blockStarts[b] === absParentRow ? b : -1;
+}
+
+/** Visible row index of the top of the viewport (= floor(scrollTop / ROW_H)). */
+function viewportVisibleTop() {
+  return Math.max(0, Math.floor(rowsEl.scrollTop / ROW_H));
+}
+
+/** Visible row index just below the bottom of the viewport. */
+function viewportVisibleBottom() {
+  return Math.min(visibleTotal() - 1, Math.max(viewportVisibleTop(), Math.floor((rowsEl.scrollTop + rowsEl.clientHeight) / ROW_H)));
 }
 
 /** Persist only viewport state across recreations. We never persist row payloads:
@@ -127,7 +242,7 @@ function send(body) {
  * growing toward `total` = inception). This reflects scroll position, not how
  * many rows have been fetched. */
 function reportStatus() {
-  vscode.postMessage({ type: 'status', loaded: viewportTopRow(), total });
+  vscode.postMessage({ type: 'status', loaded: viewportVisibleTop(), total: visibleTotal() });
 }
 
 /** Unwrap a service response body ({ Ok: v } | { Error: msg }). */
@@ -240,11 +355,28 @@ function colStyle() {
   return parts.join(';');
 }
 
-/** The absolute index range we want cached: viewport plus BUFFER on each side. */
+/** The ABSOLUTE index range we want cached: the visible viewport (plus BUFFER on
+ * each side) mapped back to absolute slots. Fetch/cache always use absolute
+ * indices; only render/scroll/spacer use visible indices. */
 function desiredCacheRange() {
-  const top = Math.max(0, viewportTopRow() - BUFFER);
-  const bottom = Math.min(total - 1, viewportBottomRow() + BUFFER);
-  return { top, bottom };
+  const vTop = Math.max(0, viewportVisibleTop() - BUFFER);
+  const vBottom = Math.min(visibleTotal() - 1, viewportVisibleBottom() + BUFFER);
+  const topAbs = absIndexForVisible(vTop);
+  const bottomAbs = absIndexForVisible(vBottom);
+  return {
+    top: topAbs === null ? 0 : topAbs,
+    bottom: bottomAbs === null ? total - 1 : bottomAbs,
+  };
+}
+
+/** The VISIBLE index range we want rendered: the viewport plus BUFFER on each
+ * side, in visible space. Render functions (reanchorTo/trim/append/prepend)
+ * consume VISIBLE indices; only fetch/evict use absolute indices. */
+function desiredVisibleRange() {
+  return {
+    top: Math.max(0, viewportVisibleTop() - BUFFER),
+    bottom: Math.min(visibleTotal() - 1, viewportVisibleBottom() + BUFFER),
+  };
 }
 
 /**
@@ -349,10 +481,15 @@ function buildGraphCell(row) {
     const colour = COLORS[fromLane % COLORS.length];
     s += `<line class="graphLine" x1="${x1}" y1="${midY}" x2="${x2}" y2="${midY}" style="stroke:${colour}"/>`;
   }
-  // The node's own dot at its lane.
-  const lane = row.lane || 0;
-  const colour = COLORS[lane % COLORS.length];
-  s += `<circle class="graphDot" cx="${laneX(lane)}" cy="${midY}" r="${DOT_R}" fill="${colour}"/>`;
+  // A sub-op row draws NO dot — it is not a graph node. Its `above`/`below` are
+  // the pass-through lanes spanning this region, drawn as full-height straight
+  // lines (both halves meet at midY). Only top-level rows get a node dot.
+  if (!row.is_subop) {
+    // The node's own dot at its lane.
+    const lane = row.lane || 0;
+    const colour = COLORS[lane % COLORS.length];
+    s += `<circle class="graphDot" cx="${laneX(lane)}" cy="${midY}" r="${DOT_R}" fill="${colour}"/>`;
+  }
   s += '</svg>';
   return s;
 }
@@ -362,12 +499,32 @@ function hasSubOps(row) {
   return !!(row.sub_ops && row.sub_ops.length);
 }
 
+/** Map a sub-op semantic class to a VS Code Codicon glyph name.
+ *
+ * Codicons are injected into VS Code webviews automatically (no font file).
+ * In the standalone harness they render as empty glyphs but never break text or
+ * geometry checks. Falls back to a generic glyph for unknown classes.
+ */
+function subopIcon(subopKind) {
+  switch (subopKind) {
+    case 'edit': return 'edit';
+    case 'msg': return 'comment';
+    case 'tool_result': return 'output';
+    case 'meta':
+    default: return 'info';
+  }
+}
+
 /** Build one row's HTML from its cached HistoryRow. `absIdx` is its absolute index.
  *
- * Rows carrying bundled metadata sub-ops get a chevron affordance in their
- * content cell; clicking reveals those sub-ops in the detail pane (git-graph
- * style). Sub-ops are NOT rendered as extra grid rows — every `.row` stays
- * exactly ROW_H tall so virtual-scroll math is undisturbed.
+ * Two kinds of rows:
+ *   - Top-level rows carrying bundled sub-ops get a chevron affordance in their
+ *     content cell; clicking toggles inline expansion (revealing one uniform
+ *     ROW_H row per sub-op directly below).
+ *   - Sub-op rows (`row.is_subop`) render indented with a small Codicon; clicking
+ *     opens their JSON editor.
+ *
+ * Every `.row` stays exactly ROW_H tall so virtual-scroll math is undisturbed.
  */
 function buildRowHtml(row, absIdx, isGroupStart) {
   const groupClass = isGroupStart ? ' row-group-start' : '';
@@ -378,15 +535,28 @@ function buildRowHtml(row, absIdx, isGroupStart) {
     : (row.kind === 'message' || row.kind === 'command') ? ''
     : 'row-dim';
   const humanClass = row.author === 'human' ? ' row-human' : '';
-  const chevron = hasSubOps(row)
-    ? '<span class="subop-chevron" title="Reveal metadata records">▸</span>'
-    : '';
-  return '<div class="row ' + kindClass + humanClass + groupClass + '" data-key="' + esc(row.node_key) +
+  const subopClass = row.is_subop ? ' row-subop' : '';
+  let content;
+  if (row.is_subop) {
+    // A bundled sub-op expanded inline: small Codicon + indented summary.
+    const icon = subopIcon(row.subop_kind);
+    content = '<span class="subop-icon codicon codicon-' + icon + '" aria-hidden="true"></span>' +
+      '<span class="subop-summary">' + esc(row.summary || '(no summary)') + '</span>';
+  } else if (hasSubOps(row)) {
+    // Top-level combined op: chevron toggles inline expansion.
+    const expanded = expandedBlocks.has(blockIndexOfAbs(absIdx));
+    const chevron = expanded ? '▾' : '▸';
+    content = '<span class="subop-chevron" title="Expand metadata records">' + chevron + '</span>' +
+      esc(row.summary || '(no summary)');
+  } else {
+    content = esc(row.summary || '(no summary)');
+  }
+  return '<div class="row ' + kindClass + humanClass + subopClass + groupClass +
+    '" data-key="' + esc(row.node_key) +
     '" data-row="' + absIdx + '" style="' + colStyle() + '">' +
     groupLabel +
     '<div class="graph-cell">' + buildGraphCell(row) + '</div>' +
-    '<div class="text-cell"><div class="summary">' + chevron +
-      esc(row.summary || '(no summary)') + '</div></div>' +
+    '<div class="text-cell"><div class="summary">' + content + '</div></div>' +
     '<div class="date-cell">' + esc(formatDate(row.timestamp_ms)) + '</div>' +
     '<div class="author-cell">' + esc(row.author || '') + '</div>' +
     '<div class="commit-cell">' + esc(row.commit_id || '') + '</div>' +
@@ -398,7 +568,7 @@ function wrapEl() {
   return rowsEl.querySelector('.table-wrap');
 }
 
-/** Set .table-wrap.top to position it at absolute row `top`. */
+/** Set .table-wrap.top to position it at VISIBLE row `top`. */
 function setWrapTop(top) {
   const w = wrapEl();
   if (w) w.style.top = (top * ROW_H) + 'px';
@@ -429,24 +599,29 @@ function refreshHeader() {
 }
 
 /** Rebuild the entire window from cache in one pass. Used for initial load,
- * far jumps, column resize, and filter changes — NOT for normal scrolling. */
+ * far jumps, column resize, filter changes, and reveal toggles — NOT for normal
+ * scrolling. `top`/`bottom` are VISIBLE indices; each maps to an absolute slot,
+ * and hidden (collapsed sub-op) slots are skipped so only drawable rows appear.
+ */
 function reanchorTo(top, bottom) {
   renderTop = top; renderBottom = bottom;
   let html = '';
   let lastGroup = null;
-  for (let i = top; i <= bottom; i++) {
-    const row = cache.get(i);
-    if (!row) { html += '<div class="row row-placeholder" data-row="' + i + '"></div>'; continue; }
+  for (let vis = top; vis <= bottom; vis++) {
+    const absIdx = absIndexForVisible(vis);
+    if (absIdx === null) continue; // hidden slot — skip entirely
+    const row = cache.get(absIdx);
+    if (!row) { html += '<div class="row row-placeholder" data-row="' + absIdx + '"></div>'; continue; }
     const isGroupStart = row.group !== lastGroup;
     if (isGroupStart) lastGroup = row.group;
-    html += buildRowHtml(row, i, isGroupStart);
+    html += buildRowHtml(row, absIdx, isGroupStart);
   }
   // Build the sticky header + spacer + wrap in one innerHTML pass. There is a
   // SINGLE header, a direct child of #rows, so its `position: sticky; top: 0`
   // sticks to the #rows viewport and stays at the top while scrolling. It must
   // NOT live inside .table-wrap (which is positioned at renderTop*ROW_H and moves
   // with scroll) — a header there would scroll with content and appear mid-table.
-  const spacerH = Math.max(1, total * ROW_H);
+  const spacerH = Math.max(1, visibleTotal() * ROW_H);
   const headerHtml = buildHeaderHtml();
   // Preserve the scroll position across the DOM rebuild (setting innerHTML
   // resets scrollTop to 0).
@@ -472,21 +647,19 @@ function attachRowClicks() {
       const key = el.getAttribute('data-key');
       const absIdx = parseInt(el.getAttribute('data-row'), 10);
       const row = cache.get(absIdx);
-      if (row) inspect(row);
+      if (row) inspect(row, absIdx);
     });
   });
 }
 
 /** Append rows [renderBottom+1, renderBottom+n] to the bottom of the window.
- * Only extends CONTIGUOUSLY: if the immediate next row isn't cached yet, nothing
- * is appended (fetchWindow will deliver it and syncWindow will retry). This keeps
- * the DOM gap-free. */
+ * Only extends CONTIGUOUSLY: if the immediate next VISIBLE row isn't cached yet,
+ * nothing is appended (fetchWindow will deliver it and syncWindow will retry).
+ * This keeps the DOM gap-free. */
 function appendRowsBelow(n) {
-  if (n <= 0 || renderBottom >= total - 1) return;
+  if (n <= 0 || renderBottom >= visibleTotal() - 1) return;
   const w = wrapEl();
   if (!w) return;
-  // Only extend if the edge row is cached (contiguity).
-  if (!cache.has(renderBottom + 1)) return;
   let html = '';
   let lastGroup = null;
   // Group continuity from the last currently-rendered row.
@@ -497,12 +670,14 @@ function appendRowsBelow(n) {
     if (lastRow) lastGroup = lastRow.group;
   }
   let added = 0;
-  for (let i = renderBottom + 1; i <= Math.min(renderBottom + n, total - 1); i++) {
-    const row = cache.get(i);
+  for (let vis = renderBottom + 1; vis <= Math.min(renderBottom + n, visibleTotal() - 1); vis++) {
+    const absIdx = absIndexForVisible(vis);
+    if (absIdx === null) continue; // hidden slot — skip
+    const row = cache.get(absIdx);
     if (!row) break; // stop at first gap — keep contiguous
     const isGroupStart = row.group !== lastGroup;
     if (isGroupStart) lastGroup = row.group;
-    html += buildRowHtml(row, i, isGroupStart);
+    html += buildRowHtml(row, absIdx, isGroupStart);
     added++;
     renderBottom++;
   }
@@ -519,8 +694,6 @@ function prependRowsAbove(n) {
   if (n <= 0 || renderTop <= 0) return;
   const w = wrapEl();
   if (!w) return;
-  // Only extend if the edge row above is cached (contiguity).
-  if (!cache.has(renderTop - 1)) return;
   // Build bottom-up so group-start detection matches reanchorTo/appendRowsBelow:
   // a row is a group-start if its group differs from the row ABOVE it.
   let prevGroup = null;
@@ -534,11 +707,13 @@ function prependRowsAbove(n) {
   }
   let html = '';
   let added = 0;
-  for (let i = renderTop - 1; i >= Math.max(0, renderTop - n); i--) {
-    const row = cache.get(i);
+  for (let vis = renderTop - 1; vis >= Math.max(0, renderTop - n); vis--) {
+    const absIdx = absIndexForVisible(vis);
+    if (absIdx === null) continue; // hidden slot — skip
+    const row = cache.get(absIdx);
     if (!row) break; // stop at first gap — keep contiguous
     const isGroupStart = prevGroup === null || row.group !== prevGroup;
-    html += buildRowHtml(row, i, isGroupStart);
+    html += buildRowHtml(row, absIdx, isGroupStart);
     added++;
     prevGroup = row.group;
     renderTop--;
@@ -577,26 +752,32 @@ function fillPlaceholders() {
 }
 
 /** Remove rows above `keepTop` from the top of the window, shifting .table-wrap.top
- * up by the number removed so remaining content stays put. */
+ * up by the number removed so remaining content stays put. `keepTop` is a VISIBLE
+ * index. */
 function trimTop(keepTop) {
   const w = wrapEl();
   if (!w || renderTop >= keepTop) return;
   let removed = Math.min(keepTop - renderTop, renderBottom - renderTop + 1);
   for (let i = renderTop; i < renderTop + removed; i++) {
-    const el = w.querySelector('.row[data-row="' + i + '"]');
+    const absIdx = absIndexForVisible(i);
+    if (absIdx === null) continue;
+    const el = w.querySelector('.row[data-row="' + absIdx + '"]');
     if (el) el.remove();
   }
   renderTop += removed;
   setWrapTop(renderTop);
 }
 
-/** Remove rows below `keepBottom` from the bottom of the window. */
+/** Remove rows below `keepBottom` from the bottom of the window. `keepBottom` is a
+ * VISIBLE index. */
 function trimBottom(keepBottom) {
   const w = wrapEl();
   if (!w || renderBottom <= keepBottom) return;
   let removed = Math.min(renderBottom - keepBottom, renderBottom - renderTop + 1);
   for (let i = renderBottom; i > renderBottom - removed; i--) {
-    const el = w.querySelector('.row[data-row="' + i + '"]');
+    const absIdx = absIndexForVisible(i);
+    if (absIdx === null) continue;
+    const el = w.querySelector('.row[data-row="' + absIdx + '"]');
     if (el) el.remove();
   }
   renderBottom -= removed;
@@ -610,13 +791,13 @@ function trimBottom(keepBottom) {
  */
 function syncWindow() {
   if (total <= 0) return;
-  const { top: wantTop, bottom: wantBottom } = desiredCacheRange();
+  const { top: wantTop, bottom: wantBottom } = desiredVisibleRange();
   // If the window is empty or no longer covers the viewport (e.g. after a fast
   // fling evicted rows and we've scrolled back into them), reanchor cleanly from
   // cache rather than trying to incrementally patch a misaligned window. This is
   // the accepted "quick render penalty" for scrolling into unfilled territory.
   const coversViewport =
-    renderTop <= viewportTopRow() && renderBottom >= viewportBottomRow();
+    renderTop <= viewportVisibleTop() && renderBottom >= viewportVisibleBottom();
   if (renderBottom < renderTop || !coversViewport) {
     reanchorTo(wantTop, wantBottom);
     fetchWindow();
@@ -628,7 +809,7 @@ function syncWindow() {
     appendRowsBelow(wantBottom - renderBottom);
     fetchWindow(); // request more below
   }
-  if (renderTop > wantTop || cache.has(renderTop - 1)) {
+  if (renderTop > wantTop || cache.has(absIndexForVisible(renderTop - 1))) {
     prependRowsAbove(Math.max(1, renderTop - wantTop));
     fetchWindow(); // request more above
   }
@@ -659,12 +840,21 @@ function progressiveLoad() {
   syncWindow();
 }
 
-function inspect(row) {
+function inspect(row, absIdx) {
   console.log('[editchain] inspect', row && row.node_key);
-  // Rows carrying bundled metadata sub-ops reveal them in the detail pane
-  // (git-graph style) instead of opening a JSON editor.
+  // A sub-op row opens its JSON editor directly.
+  if (row.is_subop) {
+    if (row.op_id) vscode.postMessage({ type: 'openJson', op_id: row.op_id });
+    return;
+  }
+  // A top-level combined op toggles inline expansion (revealing one uniform
+  // ROW_H row per bundled sub-op directly below).
   if (hasSubOps(row)) {
-    renderSubOps(row);
+    if (toggleExpanded(absIdx)) {
+      // Reveal state changed — rebuild the window so hidden/visible slots shift.
+      reanchorTo(renderTop, renderBottom);
+      ensureFilled();
+    }
     return;
   }
   // Ask the extension host to open a read-only JSON editor for this node.
@@ -673,43 +863,6 @@ function inspect(row) {
   } else if (row.op_id) {
     vscode.postMessage({ type: 'openJson', op_id: row.op_id });
   }
-}
-
-/** Render a row's bundled metadata sub-ops in the detail pane.
- *
- * Shows the parent summary as the title, then an indented list of each sub-op
- * (record type + timestamp), like git-graph commit detail expansion. Clicking
- * a sub-op opens its raw JSON editor.
- */
-function renderSubOps(row) {
-  layoutEl.classList.add('has-detail');
-  detailEl.innerHTML = '';
-  const titleEl = document.createElement('div');
-  titleEl.className = 'detail-title';
-  titleEl.textContent = (row.summary || '(no summary)') +
-    ' — ' + row.sub_ops.length + ' metadata record' + (row.sub_ops.length === 1 ? '' : 's');
-  detailEl.appendChild(titleEl);
-
-  const listEl = document.createElement('div');
-  listEl.className = 'subop-list';
-  for (const sub of row.sub_ops) {
-    const item = document.createElement('div');
-    item.className = 'subop-item';
-    item.title = 'Open raw record';
-    const kindEl = document.createElement('span');
-    kindEl.className = 'subop-kind';
-    kindEl.textContent = sub.kind || 'meta';
-    const dateEl = document.createElement('span');
-    dateEl.className = 'subop-date';
-    dateEl.textContent = formatDate(sub.timestamp_ms);
-    item.appendChild(kindEl);
-    item.appendChild(dateEl);
-    item.addEventListener('click', () => {
-      vscode.postMessage({ type: 'openJson', op_id: sub.op_id });
-    });
-    listEl.appendChild(item);
-  }
-  detailEl.appendChild(listEl);
 }
 
 /** Hide the detail pane (e.g. on reset/search). */
@@ -763,7 +916,7 @@ window.addEventListener('message', (event) => {
       fetchWindow();
       // Reanchor to the current viewport window (rows may not be cached yet —
       // GetWindow responses will append them in).
-      reanchorTo(desiredCacheRange().top, desiredCacheRange().bottom);
+      reanchorTo(desiredVisibleRange().top, desiredVisibleRange().bottom);
       // Start the background progressive loader so history buffers ahead of the
       // scroll position without waiting for scroll events.
       startProgressiveLoader();
@@ -784,7 +937,7 @@ window.addEventListener('message', (event) => {
     vscode.postMessage({ type: 'log', text: 'reveal: restored=' + restored + ' total=' + total });
     setTimeout(() => {
       fetchWindow();
-      reanchorTo(desiredCacheRange().top, desiredCacheRange().bottom);
+      reanchorTo(desiredVisibleRange().top, desiredVisibleRange().bottom);
       startProgressiveLoader();
     }, 50);
     return;
@@ -811,6 +964,16 @@ window.addEventListener('message', (event) => {
       // collapsed; refresh it now that the real lane count is known, or the
       // sticky header stays narrower than the rows it labels.
       refreshHeader();
+    }
+    // Global per-node sub-op counts arrive once per filter state (offset==0).
+    // Rebuild prefix sums so visible/absolute index mapping stays consistent.
+    if (Array.isArray(r.value.sub_op_counts)) {
+      subOpCounts = r.value.sub_op_counts;
+      recomputeExpansion();
+      // The initial `open` render used identity mapping (counts not yet known),
+      // so its rows/spacer are stale once real counts arrive. Force a re-render
+      // so hidden sub-op slots collapse and the spacer height is correct.
+      reanchorTo(renderTop, renderBottom);
     }
     const base = pendingWindowOffset;
     for (let i = 0; i < r.value.rows.length; i++) {
@@ -875,6 +1038,11 @@ function resetAndRefetch() {
   renderTop = 0;
   renderBottom = -1;
   rowsEl.scrollTop = 0;
+  // Reveal state and global counts are filter-specific — reset them so the
+  // next offset==0 GetWindow response rebuilds prefix sums cleanly.
+  expandedBlocks.clear();
+  subOpCounts = [];
+  recomputeExpansion();
   fetchWindow();
 }
 
@@ -927,7 +1095,7 @@ if (hideSubmodulesEl) {
 if (hideSystemEl) {
   hideSystemEl.addEventListener('change', () => {
     rowsEl.scrollTop = 0;
-    reanchorTo(desiredCacheRange().top, desiredCacheRange().bottom);
+    reanchorTo(desiredVisibleRange().top, desiredVisibleRange().bottom);
     ensureFilled();
   });
 }

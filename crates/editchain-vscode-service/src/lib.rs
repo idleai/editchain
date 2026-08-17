@@ -104,6 +104,12 @@ impl Workspace {
 
     /// Get a window of history rows (newest-first).
     #[must_use]
+    #[expect(
+        clippy::arithmetic_side_effects,
+        clippy::indexing_slicing,
+        clippy::needless_borrow,
+        reason = "expanded-slot prefix sums are bounded by node count; indexing is bounds-checked by partition_point; node is a &HistoryNode reference"
+    )]
     pub fn history_window(
         &mut self,
         offset: u64,
@@ -117,7 +123,6 @@ impl Workspace {
         // Build the node list, optionally filtering out submodules and applying
         // the chain filter.
         let filtered = self.filtered_nodes(hide_submodules, filter);
-        let total = filtered.len();
 
         // Build/access the cached layout context so each row can carry its graph
         // geometry (lane + active lanes + transitions) for per-row rendering.
@@ -129,24 +134,47 @@ impl Workspace {
         }
         let ctx = self.contexts.get(&key);
 
-        let rows = filtered
-            .into_iter()
-            .enumerate()
-            .skip(offset_usize)
-            .take(limit_usize)
-            .map(|(abs_idx, node)| {
-                // Per-row graph geometry from the layout context (absolute row
-                // index into the full sorted list).
-                let (lane, above, below, transitions) =
-                    ctx.map_or((0, Vec::new(), Vec::new(), Vec::new()), |c| {
-                        (
-                            c.lanes.get(abs_idx).map_or(0, |r| r.lane),
-                            c.row_above.get(abs_idx).cloned().unwrap_or_default(),
-                            c.row_below.get(abs_idx).cloned().unwrap_or_default(),
-                            c.row_transitions.get(abs_idx).cloned().unwrap_or_default(),
-                        )
-                    });
-                HistoryRow {
+        // The service emits a FIXED fully-expanded flat list: every combined op
+        // always occupies its stable 1+N absolute slots (parent + one per bundled
+        // sub-op), so fetch/cache indices never move regardless of reveal state.
+        // Collapse/expand is purely a client rendering decision; scroll offsets are
+        // derived from how many slots are currently visible via prefix sums over
+        // per-node sub-op counts.
+        let sub_op_counts: Vec<usize> = filtered.iter().map(|n| n.sub_ops().len()).collect();
+        // Prefix sum of expanded slot starts: slot index where each top-level node's
+        // block begins (parent row). Length = filtered.len() + 1; last entry is total.
+        let mut starts = Vec::with_capacity(filtered.len() + 1);
+        starts.push(0usize);
+        for &c in &sub_op_counts {
+            starts.push(*starts.last().unwrap_or(&0) + 1 + c);
+        }
+        let expanded_total = *starts.last().unwrap_or(&0);
+
+        // Find the first top-level node whose expanded block overlaps [offset, end).
+        let end_usize = offset_usize.saturating_add(limit_usize);
+        let first_node = starts.partition_point(|&s| s < offset_usize);
+        let mut rows: Vec<HistoryRow> = Vec::new();
+        for abs_idx in first_node..filtered.len() {
+            if starts[abs_idx] >= end_usize {
+                break;
+            }
+            let node = &filtered[abs_idx];
+            let block_start = starts[abs_idx];
+            // Per-row graph geometry from the layout context (absolute row index
+            // into the full sorted list).
+            let (lane, above, below, transitions) =
+                ctx.map_or((0, Vec::new(), Vec::new(), Vec::new()), |c| {
+                    (
+                        c.lanes.get(abs_idx).map_or(0, |r| r.lane),
+                        c.row_above.get(abs_idx).cloned().unwrap_or_default(),
+                        c.row_below.get(abs_idx).cloned().unwrap_or_default(),
+                        c.row_transitions.get(abs_idx).cloned().unwrap_or_default(),
+                    )
+                });
+            let parent_row = block_start;
+            // Emit the parent row if it falls inside the window.
+            if block_start >= offset_usize && block_start < end_usize {
+                rows.push(HistoryRow {
                     op_id: node.op_id().map(|id| id.to_string()),
                     git_oid: node.git_oid(),
                     repository: node.repository(),
@@ -167,15 +195,68 @@ impl Workspace {
                     below,
                     transitions,
                     sub_ops: sub_op_summaries(node.sub_ops()),
+                    is_subop: false,
+                    parent_row: None,
+                    subop_kind: None,
+                });
+            }
+            // Emit each bundled sub-op as its own row immediately after its parent.
+            let summaries = sub_op_summaries(node.sub_ops());
+            // Lanes passing straight through this sub-op region (between this
+            // parent and the next top-level node): any lane with a vertical line
+            // leaving this parent downward AND entering the next node from above
+            // spans the whole region continuously. Sub-op rows draw these as
+            // full-height straight lines with no dot.
+            let region_lanes = ctx.map_or(Vec::new(), |c| {
+                let below_parent = c.row_below.get(abs_idx).map_or(&[][..], Vec::as_slice);
+                let above_next = c.row_above.get(abs_idx + 1).map_or(&[][..], Vec::as_slice);
+                intersect_sorted(below_parent, above_next)
+            });
+            for (i, sub) in summaries.iter().enumerate() {
+                let slot = block_start + 1 + i;
+                if slot < offset_usize || slot >= end_usize {
+                    continue;
                 }
-            })
-            .collect();
+                rows.push(HistoryRow {
+                    op_id: Some(sub.op_id.clone()),
+                    git_oid: None,
+                    repository: None,
+                    summary: sub.summary.clone(),
+                    timestamp_ms: sub.timestamp_ms,
+                    group: node.group(),
+                    // Sub-op rows are not graph nodes; key them under their parent so
+                    // group-start detection and click routing stay unambiguous.
+                    node_key: format!("{}::sub:{i}", node.node_key()),
+                    parents: Vec::new(),
+                    is_submodule: false,
+                    is_system: true,
+                    author: String::new(),
+                    commit_id: String::new(),
+                    kind: sub.kind.clone(),
+                    // No dot of its own — draw every pass-through lane as a
+                    // full-height straight line (both halves meet at midY).
+                    lane,
+                    above: region_lanes.clone(),
+                    below: region_lanes.clone(),
+                    transitions: Vec::new(),
+                    sub_ops: Vec::new(),
+                    is_subop: true,
+                    parent_row: Some(parent_row),
+                    subop_kind: Some(subop_semantic_class(&sub.kind)),
+                });
+            }
+        }
         let max_lane = ctx.map_or(0, |c| c.lanes.iter().map(|r| r.lane).max().unwrap_or(0));
         HistoryWindow {
             rows,
-            total: u64::try_from(total).unwrap_or(u64::MAX),
+            total: u64::try_from(expanded_total).unwrap_or(u64::MAX),
             chain_generation: 0,
             max_lane,
+            // Ship the global per-node sub-op counts with EVERY window so the
+            // client can build prefix sums for visible/absolute index mapping
+            // regardless of where it jumps (a deep jump must not depend on the
+            // offset==0 window having been fetched first).
+            sub_op_counts: Some(sub_op_counts.clone()),
         }
     }
 
@@ -480,6 +561,54 @@ fn sub_op_label(op: &Op) -> (String, String) {
         }
     }
     (raw, "meta".to_string())
+}
+
+/// Map a sub-op's kind tag to a coarse semantic class used to pick its icon.
+///
+/// The class is intentionally coarse (a handful of buckets) so the client can
+/// map it to a small set of Codicons without enumerating every record type.
+#[must_use]
+fn subop_semantic_class(kind: &str) -> String {
+    match kind {
+        "tool_result" => "tool_result".to_string(),
+        // File-history snapshots and file edits are "edit"-like records.
+        "file-history-snapshot" | "edited_text_file" | "file" | "opened_file_in_ide" => {
+            "edit".to_string()
+        }
+        // User-facing text records.
+        "message" | "command" | "last-prompt" => "msg".to_string(),
+        // Everything else is metadata (mode, permission-mode, custom-title,
+        // agent-name, telemetry system subtypes, etc.).
+        _ => "meta".to_string(),
+    }
+}
+
+/// Intersect two sorted lane lists, returning the shared lanes in order.
+///
+/// Used to find which lanes pass straight through a sub-op region: a lane with a
+/// vertical line leaving the parent downward AND entering the next node from
+/// above spans the whole region continuously.
+#[must_use]
+#[expect(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    reason = "two-pointer intersection; indices are bounds-checked by the loop condition"
+)]
+fn intersect_sorted(a: &[usize], b: &[usize]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Produce a pretty-printed, truncated preview of a tool result's content.
@@ -902,7 +1031,8 @@ mod tests {
     #[test]
     fn history_window_bundles_meta_subops() {
         // A real turn (import + message), then a META import. The META import
-        // must bundle into the turn's row as a sub-op, not appear as its own row.
+        // bundles into the turn's row as a sub-op; the service emits it as its
+        // own expanded row immediately after the parent.
         let turn = import_op(1, 1, false);
         let msg = message_op(1, 2, turn.id);
         let meta = import_op(1, 3, true);
@@ -912,12 +1042,63 @@ mod tests {
         let filter = ChainFilter::default();
         let window = ws.history_window(0, 100, false, &filter);
 
-        // One row (the turn); the META import is bundled.
-        assert_eq!(window.rows.len(), 1);
+        // Parent row + one expanded sub-op row.
+        assert_eq!(window.rows.len(), 2);
+        assert_eq!(window.total, 2);
+        // Parent carries the bundled sub-op summary (for the collapsed chevron).
         assert_eq!(window.rows[0].sub_ops.len(), 1);
         assert_eq!(window.rows[0].sub_ops[0].op_id, meta.id.to_string());
-        // The sub-op label derives the record type from the raw JSONL.
         assert_eq!(window.rows[0].sub_ops[0].kind, "last-prompt");
+        assert!(!window.rows[0].is_subop);
+        assert_eq!(window.rows[0].parent_row, None);
+        // The expanded sub-op row follows its parent and inherits its lane.
+        assert!(window.rows[1].is_subop);
+        assert_eq!(window.rows[1].parent_row, Some(0));
+        assert_eq!(
+            window.rows[1].op_id.as_deref(),
+            Some(meta.id.to_string().as_str())
+        );
+        assert_eq!(window.rows[1].subop_kind.as_deref(), Some("msg"));
+    }
+
+    #[test]
+    fn sub_op_rows_draw_pass_through_lanes() {
+        // A linear chain where a middle turn carries a bundled META sub-op and
+        // has both a child above and a parent below on its own lane. The sub-op
+        // row must carry that lane as pass-through (above == below), so the
+        // client draws it as a full-height straight line with no dot.
+        //
+        // Build newest-first by clock:
+        //   child (seq high) -> turn+meta (middle) -> parent (low).
+        let parent = message_op(5, 4, OpId::new(NodeId(5), 0, 3));
+        let turn = import_op(5, 5, false);
+        let turn_with_parent = Op {
+            parents: ParentSet::One(parent.id),
+            ..turn.clone()
+        };
+        let msg = message_op(5, 6, turn.id); // child of turn
+        let meta = import_op(5, 7, true); // bundled under turn
+
+        let projection = HistoryProjection::from_ops(vec![
+            msg.clone(),
+            turn_with_parent.clone(),
+            meta.clone(),
+            parent.clone(),
+        ]);
+        let mut ws = Workspace::from_projection(projection);
+        let filter = ChainFilter::default();
+        let window = ws.history_window(0, 100, false, &filter);
+
+        // Find the sub-op row (is_subop).
+        let sub = window
+            .rows
+            .iter()
+            .find(|r| r.is_subop)
+            .expect("sub-op row present");
+        // The sub-op row must have at least one pass-through lane (its own
+        // parent's lane), and above == below so the client draws a full line.
+        assert!(!sub.above.is_empty());
+        assert_eq!(sub.above, sub.below);
     }
 
     #[test]

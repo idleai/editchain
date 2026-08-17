@@ -243,6 +243,9 @@
       let dotsOk = true;
       let firstFail = null;
       rowEls.forEach((row) => {
+        // Sub-op rows intentionally draw NO dot (they are not graph nodes), so
+        // skip them — only top-level rows must have a centered dot.
+        if (row.classList.contains('row-subop')) return;
         const absIdx = row.getAttribute('data-row');
         const cellSvg = row.querySelector('.graph-cell svg.graphCell');
         const dot = cellSvg && cellSvg.querySelector('circle.graphDot');
@@ -302,6 +305,49 @@
         detail:'humanBold=' + humanBold + ' agentNormal=' + agentNormal +
           ' agentPad=' + agentPad,
       });
+    }
+
+    // Check 6: every rendered row is exactly ROW_H tall (uniform grid), even
+    // when sub-op rows are present. Virtual scroll depends on this.
+    if (wrapEl) {
+      const rowEls = wrapEl.querySelectorAll('.row');
+      let uniform = true;
+      let firstBad = null;
+      rowEls.forEach((row) => {
+        const h = row.getBoundingClientRect().height;
+        if (Math.abs(h - 34) > 0.5) { uniform = false; firstBad = firstBad || { key: row.getAttribute('data-key'), h }; }
+      });
+      checks.push({
+        name:'UNIFORM_ROW_HEIGHT',
+        pass:uniform,
+        detail:uniform ? 'all rows exactly ROW_H' : 'first bad=' + JSON.stringify(firstBad),
+      });
+    }
+
+    // Check 7: expanded sub-op rows render with a Codicon and are indented under
+    // their parent (only meaningful in the combined scenario).
+    if (wrapEl) {
+      const subopRows = wrapEl.querySelectorAll('.row.row-subop');
+      if (subopRows.length) {
+        let iconsOk = true;
+        let indentOk = true;
+        subopRows.forEach((r) => {
+          if (!r.querySelector('.subop-icon')) iconsOk = false;
+          const pad = parseFloat(getComputedStyle(r.querySelector('.text-cell')).paddingLeft);
+          if (!(pad >= 24)) indentOk = false;
+        });
+        checks.push({
+          name:'SUBOP_ICON_INDENT',
+          pass:iconsOk && indentOk,
+          detail:'subopRows=' + subopRows.length + ' iconsOk=' + iconsOk + ' indentOk=' + indentOk,
+        });
+      } else {
+        checks.push({
+          name:'SUBOP_ICON_INDENT',
+          pass:true,
+          detail:'no sub-op rows in this scenario (skipped)',
+        });
+      }
     }
 
     return checks;

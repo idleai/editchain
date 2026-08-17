@@ -259,6 +259,19 @@ pub struct HistoryRow {
     /// Bundled metadata sub-ops attached to this row (revealed on click).
     #[serde(default)]
     pub sub_ops: Vec<SubOpSummary>,
+    /// Whether this row is a bundled sub-op expanded inline under its parent
+    /// (rather than a top-level node). Sub-op rows carry no graph dot of their
+    /// own; they inherit the parent's lane for a continuation line.
+    #[serde(default)]
+    pub is_subop: bool,
+    /// Absolute row index of the parent's collapsed row, for sub-op rows.
+    /// `None` on top-level rows.
+    #[serde(default)]
+    pub parent_row: Option<usize>,
+    /// Semantic class for the sub-op's icon (e.g. `"meta"`, `"edit"`, `"msg"`,
+    /// `"tool_result"`). `None` on top-level rows.
+    #[serde(default)]
+    pub subop_kind: Option<String>,
 }
 
 /// A bundled metadata sub-op attached to a history row.
@@ -292,6 +305,12 @@ pub struct HistoryWindow {
     /// the graph column stably regardless of which window is loaded.
     #[serde(default)]
     pub max_lane: usize,
+    /// Global per-top-level-node bundled sub-op counts for THIS filter state,
+    /// shipped with every window. The client uses these prefix sums to map between
+    /// absolute slot indices and visible indices under inline reveal, so a deep
+    /// jump must not depend on the offset==0 window having been fetched first.
+    #[serde(default)]
+    pub sub_op_counts: Option<Vec<usize>>,
 }
 
 /// Details for a single history node (for the inspector).

@@ -213,9 +213,10 @@ body {
   font-weight: 700;
 }
 
-/* Chevron affordance on rows that carry bundled metadata sub-ops. Revealed on
-   click in the detail pane (git-graph style). Inline so it never affects row
-   height or column layout — virtual scroll keeps every row exactly ROW_H. */
+/* Chevron affordance on rows that carry bundled metadata sub-ops. Clicking
+   toggles inline expansion (revealing one uniform ROW_H row per sub-op directly
+   below). Inline so it never affects row height or column layout — virtual
+   scroll keeps every row exactly ROW_H. */
 .subop-chevron {
   display: inline-block;
   width: 14px;
@@ -225,27 +226,28 @@ body {
   cursor: pointer;
 }
 
-/* Bundled metadata sub-op list in the detail pane. */
-.subop-list {
-  margin-top: 8px;
+/* Expanded sub-op rows render indented under their parent with a small Codicon.
+   Dimmed slightly so they read as secondary to the parent row. The indent is
+   applied to the text cell only, so the graph cell (continuation line) stays
+   aligned with the parent's lane. */
+.row-subop .text-cell {
+  padding-left: 24px;
 }
-.subop-item {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 4px 6px;
-  border-bottom: 1px solid var(--row-border);
-  cursor: pointer;
+.row-subop .text-cell,
+.row-subop .date-cell,
+.row-subop .author-cell,
+.row-subop .commit-cell {
+  opacity: 0.7;
 }
-.subop-item:hover {
-  background-color: var(--vscode-list-hoverBackground);
-}
-.subop-kind {
-  font-weight: 600;
-}
-.subop-date {
+/* Small semantic icon for each expanded sub-op (VS Code Codicon glyph). */
+.subop-icon {
+  font-family: codicon, monospace;
+  font-size: 0.9em;
+  margin-right: 4px;
   color: var(--vscode-descriptionForeground);
-  font-size: 0.85em;
+}
+.subop-summary {
+  white-space: nowrap;
 }
 
 /* Per-row graph cells (one small SVG per row). Each cell draws the node's dot,
