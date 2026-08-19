@@ -2,6 +2,7 @@
 
 use blake3 as _;
 use editchain_core as _;
+use editchain_project as _;
 use proptest as _;
 use serde as _;
 use serde_json as _;

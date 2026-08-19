@@ -1,14 +1,18 @@
-//! Tests for subagent branch/reconnect linking.
+//! Tests for subagent branch/reconnect relationship-note emission.
 
 #![expect(
     clippy::indexing_slicing,
     clippy::too_many_arguments,
     clippy::doc_markdown,
-    reason = "Test fixtures use fixed small vectors; indices are known in bounds"
+    clippy::manual_let_else,
+    clippy::panic,
+    clippy::wildcard_enum_match_arm,
+    reason = "Test fixtures use fixed small vectors; indices are known in bounds and the panic/fall-through arms are deliberate in tests"
 )]
 
 use blake3 as _;
 use editchain_core as _;
+use editchain_project as _;
 use proptest as _;
 use serde as _;
 use serde_json as _;
@@ -16,12 +20,12 @@ use sha2 as _;
 use tempfile as _;
 
 use editchain_core::{
-    op::{OpKind, ToolOp, ToolStage},
+    op::{NoteOp, NoteRelationship, OpKind, ToolOp, ToolStage},
     payload::Payload,
     ActorId, Clock, NodeId, Op, OpId, ParentSet, ScopeRef, SessionId, Tags,
 };
 use editchain_import::ids::derive_session_id;
-use editchain_import::subagent::{link_subagents, SubagentMeta};
+use editchain_import::subagent::{emit_subagent_notes_from, SubagentMeta};
 
 /// A realistic parent session UUID; ops scope is derived from it.
 const PARENT_UUID: &str = "016bbaad-23ec-425d-b53d-3f212a11ce4b";
@@ -105,12 +109,23 @@ fn task_stop_completed(session: u64, agent_id: &str) -> Op {
     tool_op(1, 200, session, "", agent_id, ToolStage::Finish, &content)
 }
 
+/// Extract the relationship notes from an emitted note vec.
+fn relationships(notes: &[Op]) -> Vec<NoteRelationship> {
+    notes
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Note(n) => Some(n.relationship),
+            _ => None,
+        })
+        .collect()
+}
+
 #[test]
 fn subagent_branches_from_parent_agent_call() {
     // Parent session (node 1): Agent call at seq 100. Subagent chain (node 2):
-    // first op at seq 10. After linking, sub-first gains a parent to the Agent
-    // call.
-    let mut ops = vec![
+    // first op at seq 10. After linking, a SubagentOf note is emitted whose
+    // causal parent is sub-first and whose target is the Agent call.
+    let ops = vec![
         agent_call(parent_sid(), "call_abc"),
         msg_op(2, 10, parent_sid()), // subagent first op
         msg_op(2, 11, parent_sid()), // subagent last op
@@ -120,25 +135,28 @@ fn subagent_branches_from_parent_agent_call() {
         parent_session_id: PARENT_UUID.to_string(),
         tool_use_id: "call_abc".to_string(),
     }];
-    let linked = link_subagents(&mut ops, &meta);
-    // Only the branch edge is added (no TaskOutput result present).
-    assert_eq!(linked, 1);
+    let notes = emit_subagent_notes_from(&ops, &meta);
+    // Only the branch note is emitted (no TaskOutput result present).
+    assert_eq!(notes.len(), 1);
+    assert_eq!(relationships(&notes), vec![NoteRelationship::SubagentOf]);
 
-    // sub-first (index 1) has the Agent call as a parent.
-    let sub_first_parents: Vec<_> = ops[1].parents.iter().collect();
-    assert!(
-        sub_first_parents.iter().any(|p| **p == ops[0].id),
-        "sub-first should branch from the Agent call"
-    );
+    // The note's causal parent is sub-first; its target is the Agent call.
+    let note = &notes[0];
+    let NoteOp { target_ids, .. } = match &note.kind {
+        OpKind::Note(n) => n,
+        _ => panic!("expected a Note op"),
+    };
+    assert_eq!(note.parents.iter().collect::<Vec<_>>(), vec![&ops[1].id]);
+    assert_eq!(target_ids, &vec![ops[0].id]);
 }
 
 #[test]
 fn subagent_reconnects_to_task_output_success() {
     // Parent session (node 1): Agent call + TaskOutput success. Subagent chain
     // (node 2). After linking:
-    // - sub-first.parents includes Agent call
-    // - TaskOutput.parents includes sub-last (reconnect)
-    let mut ops = vec![
+    // - a SubagentOf note (sub-first -> Agent call)
+    // - a ReconnectsTo note (TaskOutput -> sub-last)
+    let ops = vec![
         agent_call(parent_sid(), "call_abc"),
         msg_op(2, 10, parent_sid()), // sub-first
         msg_op(2, 11, parent_sid()), // sub-last
@@ -149,28 +167,15 @@ fn subagent_reconnects_to_task_output_success() {
         parent_session_id: PARENT_UUID.to_string(),
         tool_use_id: "call_abc".to_string(),
     }];
-    let linked = link_subagents(&mut ops, &meta);
-    assert_eq!(linked, 2);
-
-    // sub-first (index 1) has the Agent call as a parent.
-    let sub_first_parents: Vec<_> = ops[1].parents.iter().collect();
-    assert!(
-        sub_first_parents.iter().any(|p| **p == ops[0].id),
-        "sub-first should branch from the Agent call"
-    );
-    // TaskOutput (index 3) has sub-last (index 2) as a parent.
-    let task_parents: Vec<_> = ops[3].parents.iter().collect();
-    assert!(
-        task_parents.iter().any(|p| **p == ops[2].id),
-        "TaskOutput should reconnect to the subagent's last op"
-    );
+    let notes = emit_subagent_notes_from(&ops, &meta);
+    assert_eq!(notes.len(), 2);
 }
 
 #[test]
 fn subagent_without_success_stays_branched_no_reconnect() {
     // Parent has an Agent call but NO TaskOutput success result. The subagent
     // should still branch from the Agent call but NOT reconnect.
-    let mut ops = vec![
+    let ops = vec![
         agent_call(parent_sid(), "call_abc"),
         msg_op(2, 10, parent_sid()), // sub-first
         msg_op(2, 11, parent_sid()), // sub-last
@@ -180,15 +185,9 @@ fn subagent_without_success_stays_branched_no_reconnect() {
         parent_session_id: PARENT_UUID.to_string(),
         tool_use_id: "call_abc".to_string(),
     }];
-    let linked = link_subagents(&mut ops, &meta);
-    assert_eq!(linked, 1);
-
-    // Branch edge present.
-    let sub_first_parents: Vec<_> = ops[1].parents.iter().collect();
-    assert!(
-        sub_first_parents.iter().any(|p| **p == ops[0].id),
-        "sub-first should branch from the Agent call"
-    );
+    let notes = emit_subagent_notes_from(&ops, &meta);
+    assert_eq!(notes.len(), 1);
+    assert_eq!(relationships(&notes), vec![NoteRelationship::SubagentOf]);
 }
 
 #[test]
@@ -196,7 +195,7 @@ fn subagent_reconnects_via_task_stop_not_running() {
     // Parent session (node 1): Agent call + a TaskStop/late-check result that
     // reports the subagent as already completed ("not running (status:
     // completed)"). The subagent should branch AND reconnect.
-    let mut ops = vec![
+    let ops = vec![
         agent_call(parent_sid(), "call_abc"),
         msg_op(2, 10, parent_sid()), // sub-first
         msg_op(2, 11, parent_sid()), // sub-last
@@ -207,40 +206,25 @@ fn subagent_reconnects_via_task_stop_not_running() {
         parent_session_id: PARENT_UUID.to_string(),
         tool_use_id: "call_abc".to_string(),
     }];
-    let linked = link_subagents(&mut ops, &meta);
-    assert_eq!(linked, 2);
-
-    // sub-first (index 1) has the Agent call as a parent.
-    let sub_first_parents: Vec<_> = ops[1].parents.iter().collect();
-    assert!(
-        sub_first_parents.iter().any(|p| **p == ops[0].id),
-        "sub-first should branch from the Agent call"
-    );
-    // The TaskStop result (index 3) has sub-last (index 2) as a parent.
-    let stop_parents: Vec<_> = ops[3].parents.iter().collect();
-    assert!(
-        stop_parents.iter().any(|p| **p == ops[2].id),
-        "TaskStop result should reconnect to the subagent's last op"
-    );
+    let notes = emit_subagent_notes_from(&ops, &meta);
+    assert_eq!(notes.len(), 2);
 }
 
 #[test]
-fn parent_set_capacity_respected() {
-    // Sub-first already has two parents; the branch edge must be skipped.
-    let mut ops = vec![
+fn input_ops_not_mutated() {
+    // Emitting notes must never mutate the input op set.
+    let ops = vec![
         agent_call(parent_sid(), "call_abc"),
         msg_op(2, 10, parent_sid()), // sub-first
         msg_op(2, 11, parent_sid()), // sub-last
         task_output_success(parent_sid(), "sub-1"),
     ];
-    // Give sub-first two existing parents.
-    ops[1].parents = ParentSet::Two(OpId::new(NodeId(9), 0, 1), OpId::new(NodeId(9), 0, 2));
+    let before = ops.clone();
     let meta = vec![SubagentMeta {
         subagent_session_id: "sub-1".to_string(),
         parent_session_id: PARENT_UUID.to_string(),
         tool_use_id: "call_abc".to_string(),
     }];
-    let linked = link_subagents(&mut ops, &meta);
-    // Only the reconnect edge is added (branch skipped at capacity).
-    assert_eq!(linked, 1);
+    let _notes = emit_subagent_notes_from(&ops, &meta);
+    assert_eq!(ops, before);
 }

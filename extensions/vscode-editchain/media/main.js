@@ -201,7 +201,12 @@ function viewportVisibleBottom() {
 function saveState() {
   vscode.setState({
     total,
-    scrollTop: rowsEl.scrollTop,
+    // Persist the visible TOP ROW INDEX, not raw pixel scrollTop: the webview
+    // JS context is destroyed when hidden behind an editor preview, and on
+    // restore the spacer/scaffold doesn't exist until after `reanchorTo`, so a
+    // raw pixel offset is meaningless (it clamps to 0). A row index survives
+    // expansion differences and is reapplied as `topRow * ROW_H` once rows load.
+    topRow: viewportVisibleTop(),
     hideSubmodules: hideSubmodules(),
     showMessagesOnly: showMessagesOnly(),
     hideUndated: hideUndated(),
@@ -209,20 +214,35 @@ function saveState() {
   });
 }
 
+/** Restore filter checkboxes/input from state; return the saved top row index
+ * (or -1 if none) WITHOUT touching scrollTop — the spacer isn't built yet here,
+ * so applying scroll must wait until the open/reveal handler has reanchored. */
 function restoreState() {
   const s = vscode.getState();
-  if (s && typeof s.total === 'number') {
-    total = s.total || 0;
-    if (typeof s.scrollTop === 'number') rowsEl.scrollTop = s.scrollTop;
+  let topRow = -1;
+  if (s && (typeof s.topRow === 'number' || s.filterPattern || s.hideUndated)) {
+    // Do NOT restore `total` here — the chain may have been reimported since the
+    // last session, so the persisted node count can be stale. The server's
+    // `total` is authoritative and is applied by the open handler before this
+    // runs. Only the top row index and filter state survive a session.
+    if (typeof s.topRow === 'number' && s.topRow > 0) topRow = s.topRow;
     if (hideUndatedEl && typeof s.hideUndated === 'boolean') {
       hideUndatedEl.checked = s.hideUndated;
     }
     if (filterEl && typeof s.filterPattern === 'string') {
       filterEl.value = s.filterPattern;
     }
-    return true;
   }
-  return false;
+  return topRow;
+}
+
+/** Apply a restored visible top row index as a pixel scroll offset. Must be
+ * called AFTER the scaffold (`.scroll-spacer`) is in place so the scroll range
+ * is real; clamp to the bottom so an old deep offset never over-scrolls. */
+function restoreScrollTop(rowIndex) {
+  const target = rowIndex * ROW_H;
+  const maxScroll = Math.max(0, rowsEl.scrollHeight - rowsEl.clientHeight);
+  rowsEl.scrollTop = Math.min(target, maxScroll);
 }
 
 // Branch colours for graph lanes (indexed by lane).
@@ -906,17 +926,26 @@ window.addEventListener('message', (event) => {
   if (msg.id === 'open') {
     if (r.ok) {
       vscode.postMessage({ type: 'log', text: `open: ${r.value.nodes} nodes, ${r.value.repos} repos` });
+      // The server's node count is authoritative. The persisted `total` from a
+      // previous session can go stale whenever the chain is reimported or
+      // regenerated (node count changes), so never let `restoreState` override
+      // this fresh value — otherwise the first window maps to stale offsets and
+      // renders placeholders (the "newly generated chain doesn't render" bug).
       total = r.value.nodes;
-      const restored = restoreState();
-      if (!restored) {
+      const restoredTopRow = restoreState();
+      // Reanchor to the viewport window for the CURRENT (un-scrolled) position
+      // first, so the spacer exists and has real height. Rows may not be cached
+      // yet — GetWindow responses will append them in.
+      fetchWindow();
+      reanchorTo(desiredVisibleRange().top, desiredVisibleRange().bottom);
+      // Now that the scaffold is built, restore the persisted scroll offset
+      // (previously this set scrollTop before reanchor — before the spacer
+      // existed — so it clamped to 0 and the position was lost).
+      if (restoredTopRow > 0) {
+        restoreScrollTop(restoredTopRow);
+      } else {
         rowsEl.scrollTop = 0;
       }
-      // Fetch the window around the current scroll position. The webview is a thin
-      // viewport; it never accumulates history.
-      fetchWindow();
-      // Reanchor to the current viewport window (rows may not be cached yet —
-      // GetWindow responses will append them in).
-      reanchorTo(desiredVisibleRange().top, desiredVisibleRange().bottom);
       // Start the background progressive loader so history buffers ahead of the
       // scroll position without waiting for scroll events.
       startProgressiveLoader();
@@ -933,11 +962,16 @@ window.addEventListener('message', (event) => {
   // delay lets the webview finish transitioning from hidden to visible so it
   // has real dimensions to measure.
   if (msg.id === 'reveal') {
-    const restored = restoreState();
-    vscode.postMessage({ type: 'log', text: 'reveal: restored=' + restored + ' total=' + total });
+    const restoredTopRow = restoreState();
+    vscode.postMessage({ type: 'log', text: 'reveal: topRow=' + restoredTopRow + ' total=' + total });
     setTimeout(() => {
       fetchWindow();
       reanchorTo(desiredVisibleRange().top, desiredVisibleRange().bottom);
+      // Restore the persisted scroll offset after the scaffold is rebuilt so the
+      // scroll range is real (same fix as the open handler).
+      if (restoredTopRow > 0) {
+        restoreScrollTop(restoredTopRow);
+      }
       startProgressiveLoader();
     }, 50);
     return;

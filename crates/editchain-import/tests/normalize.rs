@@ -1,6 +1,7 @@
 //! Normalization tests for Claude Code envelopes.
 
 use blake3 as _;
+use editchain_project as _;
 use proptest as _;
 use serde as _;
 use serde_json as _;
@@ -83,6 +84,7 @@ fn test_normalize_user_message() {
         1,
         &NormalizeOptions::default(),
         &mut blobs,
+        "sess-1",
     );
 
     assert!(matches!(raw.kind, OpKind::Import(_)));
@@ -121,6 +123,7 @@ fn test_normalize_mode_event() {
         1,
         &NormalizeOptions::default(),
         &mut blobs,
+        "sess-1",
     );
 
     assert!(matches!(raw.kind, OpKind::Import(_)));
@@ -131,5 +134,59 @@ fn test_normalize_mode_event() {
             _ => panic!("expected inline payload"),
         },
         _ => panic!("expected NoteOp for mode event"),
+    }
+}
+
+/// Regression: a metadata record with no `sessionId`/`session_id` must scope to
+/// the owning source file's session, NOT `derive_session_id("")` (a constant that
+/// would cause every session's snapshots to share one synthetic scope and stitch
+/// unrelated sessions together).
+#[expect(
+    clippy::panic,
+    clippy::wildcard_enum_match_arm,
+    reason = "test asserts exact scope variant"
+)]
+#[test]
+fn test_metadata_without_session_id_falls_back_to_owning_session() {
+    // A file-history-snapshot record carries no sessionId field.
+    let json = br#"{"type":"file-history-snapshot","messageId":"m1","snapshot":{"trackedFileBackups":{}},"isSnapshotUpdate":false,"timestamp":"2026-07-09T18:56:19.739Z"}"#;
+    let env = parse_envelope(json).expect("parse snapshot");
+    assert!(
+        env.session_id.is_empty(),
+        "snapshot should have no sessionId"
+    );
+    assert!(is_metadata_record(&env));
+
+    let stream = SourceStream::new(derive_node_id("/test"), 0);
+    let hash = hash_raw(json);
+    let mut blobs = MemoryBlobSink::new();
+
+    // Pass a fallback session id ("sess-A"). The raw op must scope to that
+    // session, not to derive_session_id("") (a constant), and not to "sess-B".
+    let (raw, _norm) = normalize_envelope(
+        &env,
+        hash,
+        json,
+        &stream,
+        1,
+        &NormalizeOptions::default(),
+        &mut blobs,
+        "sess-A",
+    );
+
+    let expected = editchain_import::ids::derive_session_id("sess-A").0;
+    let wrong_constant = editchain_import::ids::derive_session_id("").0;
+    match raw.scope {
+        editchain_core::scope::ScopeRef::Session(sid) => {
+            assert_eq!(
+                sid.0, expected,
+                "snapshot must scope to owning session, not the empty-session constant"
+            );
+            assert_ne!(
+                sid.0, wrong_constant,
+                "must not use the derive_session_id(\"\") constant (synthetic stitch scope)"
+            );
+        }
+        _ => panic!("expected Session scope"),
     }
 }

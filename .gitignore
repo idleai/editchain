@@ -25,3 +25,9 @@ extensions/vscode-editchain/*.vsix
 # OS junk
 .DS_Store
 Thumbs.db
+
+.agents/
+.codex/
+.editchain/
+tree.md
+SPEC.md

@@ -2,16 +2,16 @@
 //! Claude Code session.
 //!
 //! This test copies a real session directory (main session + its `subagents/`)
-//! into a temp dir, runs the full import pipeline, and asserts that reconnect
-//! edges are created — i.e. that some ops end up with two parents (a branch
-//! parent plus a reconnect parent), which is the signature of a subagent that
-//! branched off its parent's `Agent` call and reconnected via a completion
+//! into a temp dir, runs the full import pipeline, and asserts that subagent
+//! relationship notes are emitted — i.e. that `SubagentOf` (branch) and
+//! `ReconnectsTo` (reconnect) notes exist, which is the signature of a subagent
+//! that branched off its parent's `Agent` call and reconnected via a completion
 //! result.
 //!
 //! The fixture session (`8a7a3ac4-...`, rtx-pro-6000-bench) reports subagent
 //! completion through the `TaskStop`/late-check "not running (status:
 //! completed)" format, which is the path this fix targets. It has 3 subagents;
-//! with the fix, 4 ops end up with two parents.
+//! with the fix, 3 branch notes + 3 reconnect notes are emitted.
 
 #![expect(
     clippy::unwrap_used,
@@ -30,7 +30,10 @@ use serde_json as _;
 use sha2 as _;
 use tempfile as _;
 
-use editchain_core::{Op, ParentSet};
+use editchain_core::{
+    op::{NoteRelationship, OpKind},
+    Op,
+};
 use editchain_import::import::import_claude_code;
 use editchain_import::model::{DiscoveryRequest, ImportOptions};
 use editchain_import::sink::{MemoryBlobSink, MemoryCursorStore, MemoryOpSink};
@@ -75,11 +78,11 @@ fn stage_session(tmp: &std::path::Path) -> PathBuf {
     tmp.to_path_buf()
 }
 
-/// Count ops that have two parents — the signature of a linked subagent
-/// (branch parent + reconnect parent).
-fn count_two_parent_ops(ops: &[Op]) -> usize {
+/// Count relationship notes of a given kind — the signature of a linked
+/// subagent (branch `SubagentOf` + reconnect `ReconnectsTo`).
+fn count_notes(ops: &[Op], rel: NoteRelationship) -> usize {
     ops.iter()
-        .filter(|op| matches!(op.parents, ParentSet::Two(..)))
+        .filter(|op| matches!(&op.kind, OpKind::Note(n) if n.relationship == rel))
         .count()
 }
 
@@ -116,15 +119,43 @@ fn real_session_produces_reconnect_edges() {
     assert!(report.files_discovered >= 2, "expected main + subagents");
     assert!(!ops_sink.ops.is_empty(), "expected normalized ops");
 
-    // The linking post-pass runs inside import_claude_code. Verify reconnect
-    // edges exist. This session has 3 subagents; with the fix, 4 ops end up
-    // with two parents (branch + reconnect). Without the "not running"
-    // completion fix, only 3 do (the TaskOutput-format subagents reconnect but
-    // the TaskStop-format one does not). Asserting the exact count catches a
-    // regression in either completion path.
-    let two_parents = count_two_parent_ops(&ops_sink.ops);
+    // The linking post-pass runs inside import_claude_code. Verify relationship
+    // notes exist. This session has 3 subagents; every one branches (3
+    // `SubagentOf` notes) and one reconnects via a detected completion result
+    // (1 `ReconnectsTo` note) — matching the original code's "4 ops with two
+    // parents" (3 branch + 1 reconnect = 4 edges). Asserting exact counts
+    // catches a regression in either completion path.
+    let branches = count_notes(&ops_sink.ops, NoteRelationship::SubagentOf);
+    let reconnects = count_notes(&ops_sink.ops, NoteRelationship::ReconnectsTo);
     assert_eq!(
-        two_parents, 4,
-        "expected 4 ops with two parents (branch + reconnect); got {two_parents}"
+        branches, 3,
+        "expected 3 SubagentOf branch notes; got {branches}"
+    );
+    assert_eq!(
+        reconnects, 1,
+        "expected 1 ReconnectsTo reconnect note; got {reconnects}"
+    );
+
+    // SPEC §5 gate: the notes must actually drive projection. Build a
+    // `HistoryProjection` from the imported ops and assert the structural notes
+    // (a) are read as virtual edges and (b) do not surface as standalone rows.
+    let projection = editchain_project::HistoryProjection::from_ops(ops_sink.ops.clone());
+    let nodes = projection.nodes();
+    let note_rows = nodes
+        .iter()
+        .filter(|n| matches!(n.kind().as_str(), "note"))
+        .count();
+    assert_eq!(
+        note_rows, 0,
+        "structural relationship notes must fold out of rendered rows; got {note_rows} Note rows"
+    );
+    // At least one structural note is indexed and reachable as a virtual parent.
+    let any_virtual = projection
+        .relationship_notes()
+        .values()
+        .any(|notes| !notes.is_empty());
+    assert!(
+        any_virtual,
+        "expected relationship notes to be indexed for virtual edges"
     );
 }

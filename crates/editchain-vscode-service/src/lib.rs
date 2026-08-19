@@ -20,6 +20,8 @@ use editchain_index::LexicalIndex;
 use editchain_node::segment::SegmentStore;
 use editchain_project::filter::ChainFilter;
 use editchain_project::HistoryProjection;
+#[cfg(test)]
+use editchain_project::META_BUNDLE_ENABLED;
 use editchain_protocol::{
     ChainFilterDto, GraphLayout as ProtocolGraphLayout, HistoryRow, HistoryWindow, LayoutEdge,
     LayoutPoint, LayoutRow, NodeDetails, RepositoryInfo, Request, RequestBody, Response,
@@ -182,7 +184,10 @@ impl Workspace {
                     timestamp_ms: node.timestamp_ms(),
                     group: node.group(),
                     node_key: node.node_key(),
-                    parents: node.parent_keys(&self.projection.git.links),
+                    parents: node.parent_keys(
+                        &self.projection.git.links,
+                        self.projection.relationship_notes(),
+                    ),
                     is_submodule: node
                         .repository()
                         .is_some_and(|rid| self.repo_is_submodule(rid)),
@@ -1037,10 +1042,18 @@ mod tests {
         let msg = message_op(1, 2, turn.id);
         let meta = import_op(1, 3, true);
 
+        // Hold the test gate so our toggle flip serializes against the other
+        // bundling test running in parallel in this same test binary.
+        let _gate = editchain_project::META_BUNDLE_TEST_GATE.lock().unwrap();
+
+        // This test exercises the sub-op bundling path, which is off by default
+        // now; flip the override on (restored after to keep test isolation).
+        META_BUNDLE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
         let projection = HistoryProjection::from_ops(vec![turn.clone(), msg, meta.clone()]);
         let mut ws = Workspace::from_projection(projection);
         let filter = ChainFilter::default();
         let window = ws.history_window(0, 100, false, &filter);
+        META_BUNDLE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
 
         // Parent row + one expanded sub-op row.
         assert_eq!(window.rows.len(), 2);
@@ -1059,6 +1072,55 @@ mod tests {
             Some(meta.id.to_string().as_str())
         );
         assert_eq!(window.rows[1].subop_kind.as_deref(), Some("msg"));
+    }
+
+    #[test]
+    fn meta_bundle_default_standalone_opt_in_bundles() {
+        // META imports render standalone by default (no cross-session grouping).
+        // Only when META bundling is re-enabled do they collapse into the nearest
+        // preceding real node as an expanded sub-op row.
+        let turn = import_op(1, 1, false);
+        let msg = message_op(1, 2, turn.id);
+        let meta = import_op(1, 3, true);
+
+        // Hold the test gate so our toggle flips serialize against the other
+        // bundling test running in parallel in this same test binary.
+        let _gate = editchain_project::META_BUNDLE_TEST_GATE.lock().unwrap();
+
+        // Default (bundling off): META is a standalone top-level row.
+        let projection_off =
+            HistoryProjection::from_ops(vec![turn.clone(), msg.clone(), meta.clone()]);
+        let mut ws_off = Workspace::from_projection(projection_off);
+        let filter = ChainFilter::default();
+        let window_off = ws_off.history_window(0, 100, false, &filter);
+        let meta_default = window_off
+            .rows
+            .iter()
+            .find(|r| r.op_id.as_deref() == Some(meta.id.to_string().as_str()));
+        assert!(
+            meta_default.is_some(),
+            "META import must appear as a row by default"
+        );
+        assert!(
+            !meta_default.unwrap().is_subop,
+            "META import must be a standalone top-level row by default (not a sub-op)"
+        );
+
+        // Opt-in (bundling on, fresh projection so the per-filter node cache is
+        // not reused): the same META op renders as an expanded sub-op row.
+        META_BUNDLE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let projection_on = HistoryProjection::from_ops(vec![turn.clone(), msg, meta.clone()]);
+        let mut ws_on = Workspace::from_projection(projection_on);
+        let window_on = ws_on.history_window(0, 100, false, &filter);
+        META_BUNDLE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let meta_on = window_on
+            .rows
+            .iter()
+            .find(|r| r.op_id.as_deref() == Some(meta.id.to_string().as_str()));
+        assert!(
+            meta_on.is_some_and(|r| r.is_subop),
+            "META import must be an expanded sub-op row when bundling is enabled"
+        );
     }
 
     #[test]

@@ -350,6 +350,40 @@
       }
     }
 
+    // Check 8 (fork / subagent-reconnect scenario only): the graph must render
+    // distinct lanes for the two fork branches AND a cross-lane merge connector
+    // where the completion result reconnects into the subagent branch.
+    //   - dots occupy at least two distinct x positions (two lanes);
+    //   - there is at least one horizontal `graphLine` (y1 == y2) spanning the
+    //     two lanes (= the reconnect merge jog).
+    if (wrapEl && window.__editchainScenarioName === 'fork') {
+      const cells = wrapEl.querySelectorAll('.graph-cell svg.graphCell');
+      // Distinct dot x-centres == distinct lanes.
+      const dotXs = new Set(Array.from(cells).map((cell) => {
+        const dot = cell.querySelector('circle.graphDot');
+        return dot ? +dot.getAttribute('cx') : null;
+      }).filter((x) => x !== null));
+      let horizontal = false;
+      cells.forEach((cell) => {
+        cell.querySelectorAll('line.graphLine').forEach((l) => {
+          const y1 = +l.getAttribute('y1'), y2 = +l.getAttribute('y2');
+          if (Math.abs(y1 - y2) <= 0.5 && Math.abs(+l.getAttribute('x1') - +l.getAttribute('x2')) > 1) {
+            horizontal = true; // a horizontal connector across lanes
+          }
+        });
+      });
+      checks.push({
+        name:'FORK_DISTINCT_LANES',
+        pass:dotXs.size >= 2,
+        detail:'distinct lanes (x in px) = ' + JSON.stringify(Array.from(dotXs)),
+      });
+      checks.push({
+        name:'FORK_RECONNECT_MERGE',
+        pass:horizontal,
+        detail: horizontal ? 'cross-lane merge connector present' : 'no horizontal connector found',
+      });
+    }
+
     return checks;
   }
 

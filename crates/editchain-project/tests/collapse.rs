@@ -162,6 +162,8 @@ fn meta_imports_bundle_into_nearest_real_turn() {
     // A real turn (import + message child), then two META imports, then another
     // real turn. The META imports must bundle into the nearest preceding real
     // turn and not appear as their own nodes.
+    // META bundling is off by default; enable it for this test and restore after.
+    editchain_project::META_BUNDLE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
     let turn1 = import_op(1, 1);
     let msg = message_op(1, 2, turn1.id, "hello world");
     let meta1 = meta_import_op(1, 3);
@@ -178,6 +180,7 @@ fn meta_imports_bundle_into_nearest_real_turn() {
         tool,
     ]);
     let nodes = projection.nodes();
+    editchain_project::META_BUNDLE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
 
     // Two real turns only — the META imports are bundled, not separate nodes.
     assert_eq!(nodes.len(), 2);
@@ -200,6 +203,8 @@ fn meta_bundle_splices_children_to_keep_chain_continuous() {
     // A META import sits on the backbone between two real turns. When it is
     // bundled (dropped from the top-level list), the second turn's parent must
     // be re-pointed at the first turn — otherwise the chain severs.
+    // META bundling is off by default; enable it for this test and restore after.
+    editchain_project::META_BUNDLE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
     let turn1 = import_op(1, 1);
     let msg = message_op(1, 2, turn1.id, "hello world");
     let meta = meta_import_op(1, 3);
@@ -210,6 +215,7 @@ fn meta_bundle_splices_children_to_keep_chain_continuous() {
     let projection =
         HistoryProjection::from_ops(vec![turn1.clone(), msg, meta.clone(), turn2.clone()]);
     let nodes = projection.nodes();
+    editchain_project::META_BUNDLE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
 
     // Two real turns only (the META import is bundled into turn1).
     assert_eq!(nodes.len(), 2);
@@ -217,7 +223,10 @@ fn meta_bundle_splices_children_to_keep_chain_continuous() {
     // at the dropped META op — so the chain stays continuous.
     let newer = &nodes[0];
     let older_key = nodes[1].node_key();
-    let newer_parents = newer.parent_keys(&std::collections::BTreeMap::new());
+    let newer_parents = newer.parent_keys(
+        &std::collections::BTreeMap::new(),
+        &std::collections::HashMap::new(),
+    );
     assert!(
         newer_parents.contains(&older_key),
         "newer turn should parent to older turn, got {newer_parents:?}"

@@ -8,10 +8,11 @@ use crate::claude_code::normalize::{normalize_envelope, NormalizeOptions};
 use crate::claude_code::reader::read_session_file;
 use crate::cursor::check_file_generation;
 use crate::error::ImportError;
+use crate::fork::emit_fork_notes;
 use crate::ids::{derive_source_stream, SourcePosition};
 use crate::model::{DiscoveryRequest, ImportOptions, ImportReport};
 use crate::sink::{BlobSink, CursorStore, MemoryOpSink, OpSink};
-use crate::subagent::{link_subagents, SubagentMeta};
+use crate::subagent::{emit_subagent_notes_from, SubagentMeta};
 
 /// Import all Claude Code sessions from a directory into editchain operations.
 ///
@@ -108,7 +109,14 @@ pub fn import_claude_code(
 
             if let Some(ref envelope) = env {
                 let (mut raw_op, normalized_ops) = normalize_envelope(
-                    envelope, line.hash, &line.data, &stream, seq, &norm_opts, blobs,
+                    envelope,
+                    line.hash,
+                    &line.data,
+                    &stream,
+                    seq,
+                    &norm_opts,
+                    blobs,
+                    &session.session_id,
                 );
 
                 // Chain this raw op to the previous line's raw op.
@@ -156,11 +164,24 @@ pub fn import_claude_code(
         cursors.set_cursor(&cursor_key, &new_cursor)?;
     }
 
-    // Post-pass: link subagent sessions into their parent chains. This mutates
-    // the ops already emitted into the sink (branch/reconnect edges), so it must
-    // run after all sessions are imported. It is a no-op for in-memory sinks
-    // that expose their op vec; for streaming sinks it has no effect.
-    link_emitted_subagents(ops, &subagent_meta);
+    // Post-pass: emit subagent branch/reconnect relationship notes. These are
+    // new ops appended to the sink (not mutations of existing ops), so they work
+    // for any sink that can accept ops — not just in-memory ones. They must run
+    // after all sessions are imported because they need cross-session view.
+    let subagent_notes = emit_subagent_notes(ops, &subagent_meta);
+    for note in &subagent_notes {
+        let _: bool = ops.accept_op(note)?;
+        report.normalized_ops += 1;
+    }
+
+    // Post-pass: emit ForkOf relationship notes linking sessions that are forks
+    // of one original session (shared parentUuid chain) so they render as a fork
+    // rather than duplicated chains.
+    let fork_notes = emit_fork_notes_from(ops);
+    for note in &fork_notes {
+        let _: bool = ops.accept_op(note)?;
+        report.normalized_ops += 1;
+    }
 
     Ok(report)
 }
@@ -176,18 +197,34 @@ fn subagent_meta_from(session: &SessionFile) -> Option<SubagentMeta> {
     })
 }
 
-/// Run subagent linking over the ops already emitted into a sink.
+/// Emit subagent branch/reconnect relationship notes over the ops already
+/// emitted into a sink.
 ///
-/// The `OpSink` trait is streaming and opaque, so we can only link when the sink
-/// exposes its collected ops as a mutable slice. `MemoryOpSink` does; other sinks
-/// are left untouched (linking is best-effort and idempotent).
-fn link_emitted_subagents(ops: &mut dyn OpSink, meta: &[SubagentMeta]) {
-    // Downcast to MemoryOpSink to mutate its collected ops in place.
+/// Reads the collected ops from a [`MemoryOpSink`] (which exposes them as a
+/// slice) and returns the new relationship notes to append. For sinks that do
+/// not expose their op vec, returns an empty vec (linking is best-effort).
+fn emit_subagent_notes(ops: &mut dyn OpSink, meta: &[SubagentMeta]) -> Vec<Op> {
     if let Some(mem) = ops
         .as_any_mut()
         .and_then(|o| o.downcast_mut::<MemoryOpSink>())
     {
-        // The count of added edges is informational; linking is best-effort.
-        let _linked: usize = link_subagents(&mut mem.ops, meta);
+        emit_subagent_notes_from(&mem.ops, meta)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Emit `ForkOf` relationship notes over the ops already emitted into a sink.
+///
+/// Reads the collected ops from a [`MemoryOpSink`] and returns the new notes to
+/// append. For sinks that do not expose their op vec, returns an empty vec.
+fn emit_fork_notes_from(ops: &mut dyn OpSink) -> Vec<Op> {
+    if let Some(mem) = ops
+        .as_any_mut()
+        .and_then(|o| o.downcast_mut::<MemoryOpSink>())
+    {
+        emit_fork_notes(&mem.ops)
+    } else {
+        Vec::new()
     }
 }

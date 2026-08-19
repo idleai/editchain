@@ -8,6 +8,18 @@
 // Crate-level dependency marker (used by Cargo for feature resolution).
 use regex as _;
 
+/// Override to re-enable META-op sub-option bundling for the cross-session
+/// verification hook. Default is `false` — META imports render standalone.
+/// When set (env `EDITCHAIN_META_BUNDLE=1` or this flag flipped by a test),
+/// META imports collapse into the nearest preceding real node as sub-ops.
+pub static META_BUNDLE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Serializes tests that flip [`META_BUNDLE_ENABLED`] so parallel test threads
+/// in a single unittest binary cannot read a stale toggle mid-flip. Acquire
+/// this guard around any read or write of the toggle in tests.
+pub static META_BUNDLE_TEST_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// General chain filtering with truncation.
 pub mod filter;
 /// Deterministic lane layout for graph rendering.
@@ -17,6 +29,7 @@ pub mod link;
 
 use std::collections::HashMap;
 
+use editchain_core::op::NoteRelationship;
 use editchain_core::{
     Clock, GitCommitEntity, GitOid, GitProjection, Op, OpId, Payload, RepositoryId,
 };
@@ -170,13 +183,19 @@ impl HistoryNode {
 
     /// Returns the parent node keys for drawing graph edges.
     ///
-    /// For `EditChain` ops, this includes both the causal `Op.parents` and any
+    /// For `EditChain` ops, this includes both the causal `Op.parents`, any
     /// explicit git links (whose target OID hex becomes a parent key, so the
-    /// graph draws an edge from the op to that commit).
+    /// graph draws an edge from the op to that commit), and — when `notes`
+    /// annotates this op as the causal parent of a structural relationship
+    /// note — the note's target as a *virtual* parent. Virtual parents let
+    /// fork/subagent branches render without mutating stored causality (SPEC
+    /// §1.1, §5). `notes` maps a causal parent op id to the structural notes
+    /// that annotate it.
     #[must_use]
     pub fn parent_keys(
         &self,
         git_links: &std::collections::BTreeMap<OpId, Vec<editchain_core::GitLink>>,
+        notes: &HashMap<OpId, Vec<Op>>,
     ) -> Vec<String> {
         match self {
             Self::EditOperation(op) | Self::CollapsedImport { op, .. } => {
@@ -184,6 +203,15 @@ impl HistoryNode {
                 if let Some(links) = git_links.get(&op.id) {
                     for link in links {
                         keys.push(link.target_oid.to_hex());
+                    }
+                }
+                // Virtual parents: this op is the causal parent a structural
+                // note annotates, so the note's target becomes a parent edge.
+                if let Some(notes) = notes.get(&op.id) {
+                    for note in notes {
+                        if let editchain_core::OpKind::Note(n) = &note.kind {
+                            keys.extend(n.target_ids.iter().map(ToString::to_string));
+                        }
                     }
                 }
                 keys
@@ -275,29 +303,58 @@ pub struct HistoryProjection {
     pub ops: Vec<Op>,
     /// `Git` commits keyed by `(RepositoryId, GitOid)`.
     pub git: GitProjection,
+    /// Structural relationship notes (`ForkOf`, `SubagentOf`, `ReconnectsTo`)
+    /// keyed by the causal parent they annotate. The layout reads these as
+    /// virtual edges so fork/subagent branches render without mutating stored
+    /// `Op.parents` (SPEC §1.1, §5).
+    relationship_notes: HashMap<OpId, Vec<Op>>,
 }
 
 impl HistoryProjection {
     /// Create an empty projection.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             ops: Vec::new(),
             git: GitProjection::new(),
+            relationship_notes: HashMap::new(),
         }
     }
 
     /// Build a projection from a set of operations.
     ///
     /// Operations are stored in input order; git commits are projected into
-    /// the `GitProjection` keyed by `(RepositoryId, GitOid)`.
+    /// the `GitProjection` keyed by `(RepositoryId, GitOid)`. Structural
+    /// relationship notes are indexed by their causal parent for later use as
+    /// virtual graph edges.
     #[must_use]
     pub fn from_ops(ops: Vec<Op>) -> Self {
         let mut git = GitProjection::new();
+        let mut relationship_notes: HashMap<OpId, Vec<Op>> = HashMap::new();
         for op in &ops {
             git.reduce(op);
+            if is_structural_note(op) {
+                if let Some(parent) = op.parents.iter().next() {
+                    relationship_notes
+                        .entry(*parent)
+                        .or_default()
+                        .push(op.clone());
+                }
+            }
         }
-        Self { ops, git }
+        Self {
+            ops,
+            git,
+            relationship_notes,
+        }
+    }
+
+    /// Returns the structural relationship notes indexed by the causal parent
+    /// they annotate (used by [`HistoryNode::parent_keys`] to draw virtual
+    /// fork/subagent edges). Borrowed by consumers that project rows directly.
+    #[must_use]
+    pub fn relationship_notes(&self) -> &HashMap<OpId, Vec<Op>> {
+        &self.relationship_notes
     }
 
     /// Returns the number of history nodes (ops + git commits).
@@ -331,7 +388,7 @@ impl HistoryProjection {
     #[must_use]
     pub fn filtered_nodes(&self, filter: &filter::ChainFilter) -> Vec<HistoryNode> {
         let nodes = self.ordered_nodes();
-        filter::apply(&nodes, &self.git.links, filter)
+        filter::apply(&nodes, &self.git.links, &self.relationship_notes, filter)
     }
 
     /// Returns a window of history nodes (newest-first).
@@ -391,7 +448,7 @@ impl HistoryProjection {
         for node in &nodes {
             let key = node.node_key();
             let _ = indegree.entry(key.clone()).or_insert(0);
-            for parent in node.parent_keys(&self.git.links) {
+            for parent in node.parent_keys(&self.git.links, &self.relationship_notes) {
                 if present.contains(&parent) {
                     children_of.entry(parent).or_default().push(key.clone());
                     *indegree.entry(key.clone()).or_insert(0) += 1;
@@ -476,31 +533,44 @@ impl HistoryProjection {
         sorted_oldest_first.reverse();
 
         // Assign effective timestamps to nodes that lack one (timestamp_ms() == 0).
-        // Each such node gets the timestamp of the next OP in the chain that has
-        // a real date, minus a small offset (1 minute) so it sits just before
-        // that dated neighbor. This pulls undated nodes out of the "top cluster"
-        // (where they'd otherwise all sort newest and occupy lanes) and lets
-        // them interleave with dated work, so their components can reuse freed
-        // lanes instead of each claiming a fresh column.
+        // Undated nodes (metadata headers like `custom-title`, `mode`, and
+        // `file-history-snapshot`) are anchored to their OWN session's dated
+        // range, not to the global-newest date. The old global walk gave every
+        // undated node the most-recently-seen dated op across ALL sessions, so an
+        // old session's header (e.g. seed-d0's `custom-title`, a Jul 10 record)
+        // inherited the newest corpus date (Aug 5) and floated to the top of the
+        // timeline — visually mixing an old session into the newest cluster.
         //
-        // Only dated OPS are used as dating sources — git commits are skipped.
-        // Git commits can carry genuinely old dates (e.g. vendored/external repo
-        // history predating this repo), and we don't want an undated import op
-        // to inherit a pre-repo date from one.
-        //
-        // Walk newest → oldest, remembering the most recent dated op's
-        // timestamp; every undated node before it gets that date minus 1 minute.
-        let mut next_dated_ts = 0u64;
-        for node in &mut sorted_oldest_first {
-            if node.timestamp_ms() == 0 {
-                if next_dated_ts != 0 {
-                    node.set_effective_timestamp(next_dated_ts.saturating_sub(60_000));
-                }
-            } else if node.git_oid().is_none() {
-                // A dated op — use it as the dating source for undated nodes.
-                next_dated_ts = node.timestamp_ms();
+        // Fix: an undated node is given its session's OLDEST dated timestamp (the
+        // start of its own session's timeline), so it stays with its session.
+        // Sessions with no dated ops stay undated. Git commits and unscoped ops
+        // are not re-dated (git dates can be genuinely old, and unscoped ops have
+        // no session to anchor to).
+        let mut session_first_ts: HashMap<String, u64> = HashMap::new();
+        for node in &sorted_oldest_first {
+            if node.timestamp_ms() == 0 || node.git_oid().is_some() {
+                continue;
             }
-            // Git commits are skipped as dating sources.
+            if node.group().starts_with("session:") {
+                let entry = session_first_ts.entry(node.group()).or_insert(u64::MAX);
+                *entry = (*entry).min(node.timestamp_ms());
+            }
+        }
+        // Anchor undated nodes. Every session-scoped undated node is given its
+        // session's oldest dated timestamp, so all of a session's metadata headers
+        // sit with their own session rather than floating to the global newest.
+        // Sessions with no dated ops stay undated (there is nothing to anchor to).
+        for node in &mut sorted_oldest_first {
+            if node.timestamp_ms() != 0 {
+                continue;
+            }
+            let group = node.group();
+            if group.starts_with("session:")
+                && session_first_ts.get(&group).copied().unwrap_or(0) != 0
+            {
+                let anchor = session_first_ts.get(&group).copied().unwrap_or(0);
+                node.set_effective_timestamp(anchor);
+            }
         }
 
         // Time-sort by default: interleave git commits and ops by timestamp so
@@ -523,10 +593,12 @@ impl HistoryProjection {
     /// meaningful node per source line instead of a dense star. Non-import ops
     /// (e.g. `ChainStart`, git-link records) are kept as-is.
     ///
-    /// Metadata-only raw imports (tagged `META`) are **bundled** as sub-ops of
-    /// the nearest preceding real turn/tool node rather than occupying their own
-    /// row/lane. They are attached to that node's `sub_ops` and dropped from the
-    /// top-level node list, so they don't inflate the lane count.
+    /// Metadata-only raw imports (tagged `META`) render as their own top-level
+    /// nodes by default so unrelated chains never group together. When META
+    /// bundling is explicitly re-enabled (`EDITCHAIN_META_BUNDLE=1` or the
+    /// `META_BUNDLE_ENABLED` override), they are instead bundled as sub-ops of
+    /// the nearest preceding real turn/tool node (attached to that node's
+    /// `sub_ops` and dropped from the top-level list).
     #[must_use]
     fn collapsed_ops(&self) -> Vec<HistoryNode> {
         // Set of raw import op ids (the linear backbone).
@@ -572,9 +644,22 @@ impl HistoryProjection {
         // Bundled META op id -> the id of the real node it was folded into.
         let mut meta_replacement: HashMap<OpId, OpId> = HashMap::new();
         for op in &self.ops {
+            // Structural relationship notes (ForkOf/SubagentOf/ReconnectsTo) are
+            // pure edge bookkeeping — they never render as rows themselves, only
+            // their virtual edges do. They remain addressable in the OpSet and
+            // indexed in `relationship_notes`.
+            if is_structural_note(op) {
+                continue;
+            }
             if matches!(op.kind, editchain_core::OpKind::Import(_)) {
                 let is_meta = op.tags.matches_any(editchain_core::Tags::META);
-                if is_meta {
+                // META bundling is OFF by default so unrelated chains never group
+                // together in the viewer (a cross-session META op bundled into a
+                // real node of a different session). Only re-enabled explicitly via
+                // `EDITCHAIN_META_BUNDLE=1` or the test override.
+                let enable_bundle = std::env::var_os("EDITCHAIN_META_BUNDLE").is_some()
+                    || META_BUNDLE_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+                if is_meta && enable_bundle {
                     // Bundle into the nearest preceding real node if one exists.
                     if let Some(idx) = last_real {
                         if let Some(HistoryNode::CollapsedImport {
@@ -619,7 +704,9 @@ impl HistoryProjection {
         // chain continuous across dropped metadata records.
         if !meta_replacement.is_empty() {
             for node in &mut result {
-                let keys = node.parent_keys(&self.git.links);
+                // The splice maps causal parents (incl. virtual note targets) that
+                // pointed at a bundled META op onto the real node that absorbed it.
+                let keys = node.parent_keys(&self.git.links, &self.relationship_notes);
                 let mut spliced: Vec<String> = keys
                     .iter()
                     .map(|k| {
@@ -644,7 +731,111 @@ impl HistoryProjection {
         // call (same technique as META bundling) so chain continuity holds.
         self.group_tool_results(&mut result, &children_of);
 
+        // Fork-prologue fold: a session that FORKS off a trunk carries its own
+        // copy of the shared prologue (the backlog before the divergence point).
+        // A `ForkOf` note anchors the branch at the divergence boundary, so we
+        // elide the branch's pre-boundary prologue from the rows — the shared
+        // messages already render on the trunk. This is the "branch at the
+        // divergence point, don't duplicate the root chain" requirement: the
+        // branch node draws its edge off the trunk at the split, and the
+        // duplicated prologue never appears twice.
+        self.fold_fork_prologues(&mut result);
+
         result
+    }
+
+    /// Fold each fork branch's pre-boundary prologue into the trunk it branches
+    /// from, so shared messages never render twice.
+    ///
+    /// A `ForkOf` note has a causal parent `P` (the branch's op at the divergence
+    /// boundary) and a target `T` (the trunk's op at that same boundary). The
+    /// branch's own chain before `P` — the prologue — duplicates the trunk's
+    /// earlier messages and must be elided. We drop those nodes from `result`,
+    /// splice `P`'s causal parent onto `T`, and re-parent any surviving children
+    /// of a dropped prologue node onto the boundary `P`, so chain continuity holds
+    /// and the branch renders as a single edge off the trunk at the split.
+    fn fold_fork_prologues(&self, result: &mut Vec<HistoryNode>) {
+        // Collect (branch_boundary, trunk_boundary) pairs from ForkOf notes. The
+        // branch boundary is the note's causal parent; the trunk boundary is its
+        // targethare. The branch renders off the trunk at this split via the note's
+        // virtual edge (see [`HistoryNode::parent_keys`]), so we need only ELIDE
+        // the branch's duplicated prologue from the rows — no causal parent
+        // mutation (SPEC §1.1).
+        let mut boundary_pairs: Vec<(OpId, OpId)> = Vec::new();
+        for notes in self.relationship_notes.values() {
+            for note in notes {
+                let editchain_core::OpKind::Note(n) = &note.kind else {
+                    continue;
+                };
+                if n.relationship != NoteRelationship::ForkOf {
+                    continue;
+                }
+                if let (Some(parent), Some(target)) =
+                    (note.parents.iter().next(), n.target_ids.first())
+                {
+                    boundary_pairs.push((*parent, *target));
+                }
+            }
+        }
+        if boundary_pairs.is_empty() {
+            return;
+        }
+
+        // Group ops by session scope, each as (op id, seq), so we can find, for each
+        // branch boundary, the session it lives in and thus the prologue (all
+        // lower-seq ops in that same session). We include every op kind (not just
+        // imports) so the fold works uniformly over collapsed-import and
+        // standalone message nodes in tests and real chains alike.
+        let mut by_session: HashMap<u64, Vec<(OpId, u64)>> = HashMap::new();
+        for op in &self.ops {
+            if let editchain_core::ScopeRef::Session(sid) = op.scope {
+                by_session
+                    .entry(sid.0)
+                    .or_default()
+                    .push((op.id, op.id.seq));
+            }
+        }
+
+        // Mark the prologue: for each branch boundary, every op in the same
+        // session with a strictly smaller seq (the shared backlog before the
+        // split) is a duplicated prologue node to elide.
+        let mut prologue: std::collections::HashSet<OpId> = std::collections::HashSet::new();
+        for (branch_boundary, _trunk_boundary) in &boundary_pairs {
+            for vec in by_session.values() {
+                if vec.iter().any(|(id, _)| id == branch_boundary) {
+                    let boundary_seq = branch_boundary.seq;
+                    for &(op_id, seq) in vec {
+                        if op_id != *branch_boundary && seq < boundary_seq {
+                            let _: bool = prologue.insert(op_id);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        if prologue.is_empty() {
+            return;
+        }
+
+        // Drop the prologue nodes from the rendered rows. The branch's boundary
+        // node and everything after it stay; their causal edge to the (now
+        // removed) prologue simply won't draw, and the ForkOf virtual edge keeps
+        // the branch attached to the trunk at the split.
+        let mut drop_idx: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for (i, n) in result.iter().enumerate() {
+            if let Some(op_id) = n.op_id() {
+                if prologue.contains(&op_id) {
+                    let _: bool = drop_idx.insert(i);
+                }
+            }
+        }
+        let mut kept: Vec<HistoryNode> = Vec::with_capacity(result.len());
+        for (i, n) in result.drain(..).enumerate() {
+            if !drop_idx.contains(&i) {
+                kept.push(n);
+            }
+        }
+        *result = kept;
     }
 
     /// Fold tool-result nodes into their tool-call parents' sub-ops.
@@ -681,7 +872,11 @@ impl HistoryProjection {
             if !is_result.get(i).copied().unwrap_or(false) {
                 continue;
             }
-            let Some(parent_key) = n.parent_keys(&self.git.links).first().cloned() else {
+            let Some(parent_key) = n
+                .parent_keys(&self.git.links, &self.relationship_notes)
+                .first()
+                .cloned()
+            else {
                 continue;
             };
             let Some(&parent_idx) = index_of.get(&parent_key) else {
@@ -723,7 +918,7 @@ impl HistoryProjection {
             }
             *result = kept;
             for node in result.iter_mut() {
-                let keys = node.parent_keys(&self.git.links);
+                let keys = node.parent_keys(&self.git.links, &self.relationship_notes);
                 let mut spliced: Vec<String> = keys
                     .iter()
                     .map(|k| {
@@ -861,9 +1056,9 @@ impl HistoryProjection {
         let key_to_node = Self::layout_index(sorted);
         let links = &self.git.links;
         let parents_of = |key: &str| -> Vec<String> {
-            key_to_node
-                .get(key)
-                .map_or(Vec::new(), |n| n.parent_keys(links))
+            key_to_node.get(key).map_or(Vec::new(), |n| {
+                n.parent_keys(links, &self.relationship_notes)
+            })
         };
         let is_git =
             |key: &str| -> bool { key_to_node.get(key).is_some_and(|n| n.git_oid().is_some()) };
@@ -880,9 +1075,9 @@ impl HistoryProjection {
         let key_to_node = Self::layout_index(sorted);
         let links = &self.git.links;
         let parents_of = |key: &str| -> Vec<String> {
-            key_to_node
-                .get(key)
-                .map_or(Vec::new(), |n| n.parent_keys(links))
+            key_to_node.get(key).map_or(Vec::new(), |n| {
+                n.parent_keys(links, &self.relationship_notes)
+            })
         };
         let is_git =
             |key: &str| -> bool { key_to_node.get(key).is_some_and(|n| n.git_oid().is_some()) };
@@ -900,9 +1095,9 @@ impl HistoryProjection {
         let key_to_node = Self::layout_index(sorted);
         let links = &self.git.links;
         let parents_of = |key: &str| -> Vec<String> {
-            key_to_node
-                .get(key)
-                .map_or(Vec::new(), |n| n.parent_keys(links))
+            key_to_node.get(key).map_or(Vec::new(), |n| {
+                n.parent_keys(links, &self.relationship_notes)
+            })
         };
         let is_git =
             |key: &str| -> bool { key_to_node.get(key).is_some_and(|n| n.git_oid().is_some()) };
@@ -948,6 +1143,24 @@ fn op_summary(op: &Op) -> String {
         OpKind::GitLink(l) => format!("git:{}", l.target_oid),
         OpKind::Unknown(u) => format!("unknown kind={}", u.kind_discriminant),
     }
+}
+
+/// Whether an op is a *structural* relationship note — one that drives a virtual
+/// graph edge (fork/subagent branch or reconnect) rather than carrying prose.
+///
+/// Structural notes are indexed for edge drawing and folded out of rendered rows;
+/// non-structural notes (`Explains`, `Corrects`, etc.) keep their display path.
+fn is_structural_note(op: &Op) -> bool {
+    matches!(
+        &op.kind,
+        editchain_core::OpKind::Note(n)
+            if matches!(
+                n.relationship,
+                NoteRelationship::ForkOf
+                    | NoteRelationship::SubagentOf
+                    | NoteRelationship::ReconnectsTo
+            )
+    )
 }
 
 /// Produce a pretty-printed, truncated preview of a tool result's content.

@@ -1,4 +1,4 @@
-//! Tests for history linking — stitching sessions and git into one chain.
+//! Tests for history linking — git/commit links; sessions stay separate chains.
 
 #![expect(
     clippy::indexing_slicing,
@@ -63,9 +63,12 @@ fn git_commit(oid_byte: u8, committed_at: i64) -> GitCommitEntity {
 }
 
 #[test]
-fn sessions_stitch_into_one_chain() {
-    // Two sessions, each with two ops. After linking, session 2's first op
-    // should parent to session 1's last op.
+fn sessions_stay_as_separate_chains_not_stitched() {
+    // Two unrelated sessions. There is NO blanket session-to-session stitching:
+    // each source session is its own chain (the chain count maps 1:1 to source
+    // sessions). Session B's first op must NOT gain a parent to session A's last
+    // op just because they're adjacent. Cross-session linkage comes only from
+    // explicit fork/subagent relationship notes and op→git links.
     let mut ops = vec![
         op(1, 1, Some(10), 1000), // session A, op 1
         op(1, 2, Some(10), 2000), // session A, op 2 (last)
@@ -75,9 +78,9 @@ fn sessions_stitch_into_one_chain() {
     let result = link_history(&ops, &[]);
     ops = result.ops;
 
-    // Session B's first op (index 2) should now have a parent = session A's last op.
-    assert_eq!(ops[2].parents.iter().count(), 1);
-    assert_eq!(ops[2].parents.iter().next(), Some(&ops[1].id));
+    // Session B's first op stays rootless (no parent added by stitching).
+    assert_eq!(ops[2].parents.iter().count(), 0);
+    assert!(result.git_links.is_empty());
 }
 
 #[test]
@@ -112,13 +115,11 @@ fn session_links_to_closest_commit() {
 }
 
 #[test]
-fn stitch_skips_backward_edge_when_seq_ranges_overlap() {
-    // Two sessions whose seq ranges overlap (seq is a per-file counter, not a
-    // global timestamp). Session A spans seq 100..200; session B spans seq
-    // 150..250. Sorting by first-op seq puts A before B, but B's last op (250)
-    // has a HIGHER seq than A's first op (100) — a naive stitch would add a
-    // backward edge A.first -> B.last that closes a cycle. The stitch must
-    // skip it.
+fn sessions_are_never_force_stitched() {
+    // Sessions are never stitched together by sequence number. Even two sessions
+    // whose seq ranges overlap (seq is a per-file counter, not a global
+    // timestamp) must NOT be parent-linked: session B's first op stays rootless.
+    // This guards against regressions reintroducing blanket session stitching.
     let mut ops = vec![
         op(1, 100, Some(10), 1000), // session A first
         op(1, 200, Some(10), 2000), // session A last
@@ -129,11 +130,11 @@ fn stitch_skips_backward_edge_when_seq_ranges_overlap() {
     ops = result.ops;
 
     // Session B's first op (index 2) must NOT gain a parent to session A's last
-    // op (index 1), because that would be a backward edge (150 < 200).
+    // op (index 1) — sessions are their own chains.
     let b_first_parents: Vec<_> = ops[2].parents.iter().collect();
     assert!(
-        !b_first_parents.iter().any(|p| **p == ops[1].id),
-        "stitch must not create a backward edge from seq {} to seq {}",
+        b_first_parents.iter().all(|p| **p != ops[1].id),
+        "sessions must not be force-stitched (seq {} has a parent to {})",
         ops[2].id.seq,
         ops[1].id.seq
     );

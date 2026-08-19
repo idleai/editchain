@@ -8,6 +8,8 @@
 use serde as _;
 
 #[cfg(test)]
+use editchain_project as _;
+#[cfg(test)]
 use proptest as _;
 #[cfg(test)]
 use tempfile as _;
@@ -16,6 +18,8 @@ use tempfile as _;
 pub mod cursor;
 /// Import error types.
 pub mod error;
+/// Fork linking — link sessions that are forks of one original session.
+pub mod fork;
 /// Deterministic ID derivation for import.
 pub mod ids;
 /// Main import orchestrator.

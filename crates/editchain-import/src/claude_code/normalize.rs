@@ -146,30 +146,43 @@ pub fn normalize_envelope(
     seq: u64,
     options: &NormalizeOptions,
     blobs: &mut dyn BlobSink,
+    fallback_session_id: &str,
 ) -> (Op, Vec<Op>) {
     let raw_pos = SourcePosition::raw(seq);
     let op_id = stream.op_from_position(raw_pos).unwrap();
     let timestamp = parse_timestamp(&env.timestamp);
     let clock = Clock::UnixMs(timestamp);
-    let session_id = derive_session_id(&env.session_id);
+
+    // Some metadata records (e.g. `file-history-snapshot`, `mode`, `agent-name`)
+    // carry no `sessionId`/`session_id` field. Without a fallback they would all
+    // derive `derive_session_id("")` to one constant scope, collapsing every
+    // session's snapshots into a single synthetic session that causally stitches
+    // unrelated sessions together. Fall back to the owning source file's session
+    // so these records scope to their true session.
+    let effective_session_id = if env.session_id.is_empty() {
+        fallback_session_id
+    } else {
+        &env.session_id
+    };
+    let session_id = derive_session_id(effective_session_id);
 
     // Derive actor.
     let (actor, _tags) = match env.record_type.as_str() {
         "user" => {
-            let actor_key = format!("human:{}", env.session_id);
+            let actor_key = format!("human:{effective_session_id}");
             (derive_actor_id(&actor_key), Tags::HUMAN | Tags::MESSAGE)
         }
         "assistant" => {
             let model = env.message.as_ref().map_or("", |m| m.model.as_str());
             let actor_key = if env.agent_id.is_empty() {
-                format!("model:{}:{}", env.session_id, model)
+                format!("model:{effective_session_id}:{model}")
             } else {
-                format!("agent:{}:{}", env.session_id, env.agent_id)
+                format!("agent:{effective_session_id}:{}", env.agent_id)
             };
             (derive_actor_id(&actor_key), Tags::AGENT | Tags::MESSAGE)
         }
         _ => {
-            let actor_key = format!("system:{}", env.session_id);
+            let actor_key = format!("system:{effective_session_id}");
             (derive_actor_id(&actor_key), Tags::IMPORT)
         }
     };

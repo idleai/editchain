@@ -9,6 +9,8 @@ use serde_json as _;
 use sha2 as _;
 
 #[cfg(test)]
+use editchain_project as _;
+#[cfg(test)]
 use proptest as _;
 #[cfg(test)]
 use tempfile as _;

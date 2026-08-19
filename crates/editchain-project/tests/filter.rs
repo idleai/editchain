@@ -63,7 +63,12 @@ fn hide_undated_removes_clock_zero_nodes() {
         .iter()
         .find(|n| n.summary() == "gamma")
         .expect("gamma kept");
-    assert_eq!(c_node.parent_keys(&projection.git.links).len(), 1);
+    assert_eq!(
+        c_node
+            .parent_keys(&projection.git.links, projection.relationship_notes())
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -84,7 +89,7 @@ fn hide_undated_with_splice_reconnects_edges() {
         .iter()
         .find(|n| n.summary() == "gamma")
         .expect("gamma kept");
-    let parents = c_node.parent_keys(&projection.git.links);
+    let parents = c_node.parent_keys(&projection.git.links, projection.relationship_notes());
     assert_eq!(parents.len(), 1);
     assert_eq!(parents[0], a_id.to_string());
 }
@@ -117,7 +122,7 @@ fn summary_pattern_hides_matching_intermediate_nodes() {
         .find(|n| n.summary() == "gamma")
         .expect("gamma kept");
     assert_eq!(
-        gamma.parent_keys(&projection.git.links),
+        gamma.parent_keys(&projection.git.links, projection.relationship_notes()),
         vec![projection.ops[0].id.to_string()]
     );
 }

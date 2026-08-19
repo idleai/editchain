@@ -103,13 +103,25 @@ function openHistoryView(
   });
 
   // When the panel becomes visible again (e.g. after navigating to a JSON
-  // editor and back), ask the webview to re-render. The webview's JS state is
-  // preserved across backgrounding, but its DOM can be stale/cleared while
-  // hidden, so it needs a fresh render pass on reveal.
+  // editor and back), ask the webview to re-render. An editor preview in the
+  // SAME column destroys the webview's JS context (main.js's `total`, `cache`,
+  // etc. reset to empty) unless `retainContextWhenHidden` is set. `reveal` alone
+  // can't repopulate those — the webview needs the authoritative `open` body to
+  // restore `total` before it can fetch a window. So on reveal, replay the same
+  // `open` + `ready` sequence as first load. The webview then re-applies the
+  // persisted top row from `setState` to restore scroll position. Harmless if
+  // the JS context actually survived (it just re-establishes the same state).
+  const lastOpen: { body: any } = { body: null };
   panel.onDidChangeViewState((e) => {
     output?.appendLine('[panel] view state changed, active=' + e.webviewPanel.active);
     if (e.webviewPanel.active) {
-      panel.webview.postMessage({ id: 'reveal' });
+      if (lastOpen.body !== null) {
+        output?.appendLine('[panel] reveal: re-sending open body');
+        panel.webview.postMessage({ id: 'open', body: lastOpen.body });
+        panel.webview.postMessage({ id: 'ready' });
+      } else {
+        panel.webview.postMessage({ id: 'reveal' });
+      }
     }
   });
 
@@ -164,6 +176,10 @@ function openHistoryView(
     Open: { workspace_path: workspacePath, chain_dir: chainDir },
   }).then((resp) => {
     output?.appendLine('[openHistoryView] sending open message');
+    // Hold the last open body so a later reveal (e.g. back from a JSON editor
+    // preview, which destroys the webview's JS context) can replay it and
+    // restore the authoritative node count before fetching a window.
+    lastOpen.body = resp;
     panel.webview.postMessage({ id: 'open', body: resp });
     // After open succeeds, ask the webview to fetch the first window.
     panel.webview.postMessage({ id: 'ready' });

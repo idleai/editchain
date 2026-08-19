@@ -2,8 +2,9 @@
 //!
 //! Claude Code runs subagents as background sessions that branch off the
 //! parent's `Agent` tool_use and (on success) reconnect when the parent's
-//! `TaskOutput` tool_result reports completion. This module augments operation
-//! parents so the unified history graph shows those branch and reconnect edges.
+//! `TaskOutput` tool_result reports completion. This module emits typed
+//! relationship notes so the unified history graph shows those branch and
+//! reconnect edges without mutating causal parents (SPEC §1.1).
 //!
 //! The linking is a pure function over the already-normalized op set plus the
 //! subagent metadata captured during discovery. It runs as a post-pass after all
@@ -14,22 +15,24 @@
 //! Ops are displayed newest-first, so chronological order maps to *descending*
 //! rows: `[TaskOutput] [sub-last] ... [sub-first] [Agent-call]`. To keep every
 //! edge pointing downward (child above parent) — which the topological sort and
-//! lane layout require — we add:
+//! lane layout require — we emit:
 //!
-//! - **Branch**: `sub-first.parents += Agent-call` (a downward edge from the
-//!   subagent's first op to the parent's `Agent` tool_use).
-//! - **Reconnect**: `TaskOutput.parents += sub-last` (a downward merge edge from
-//!   the parent's `TaskOutput` result down to the subagent's last op). This is
-//!   the geometric inverse of "subagent reconnects into the parent": the parent's
-//!   completion result visually merges back into the subagent chain that produced
-//!   it, which is what reads correctly in a newest-first graph.
+//! - **Branch**: a [`NoteRelationship::SubagentOf`] note whose causal parent is
+//!   the subagent's first op and whose target is the parent's `Agent` tool_use.
+//!   The layout reads it as a downward edge from sub-first to Agent-call.
+//! - **Reconnect**: a [`NoteRelationship::ReconnectsTo`] note whose causal parent
+//!   is the parent's `TaskOutput` result and whose target is the subagent's last
+//!   op. The layout reads it as a downward merge edge from TaskOutput to sub-last.
 
 use std::collections::HashMap;
 
 use editchain_core::{
-    op::{OpKind, ToolOp, ToolStage},
+    clock::Clock,
+    op::{NoteOp, NoteRelationship, OpKind, ToolOp, ToolStage},
     payload::Payload,
-    Op, OpId, ParentSet,
+    scope::ScopeRef,
+    tags::Tags,
+    ActorId, Op, OpId, SessionId,
 };
 
 /// Metadata describing one subagent session, captured during discovery.
@@ -43,22 +46,19 @@ pub struct SubagentMeta {
     pub tool_use_id: String,
 }
 
-/// Link subagent sessions into their parent's chain via branch/reconnect edges.
+/// Emit subagent branch/reconnect relationship notes over an op set.
 ///
-/// Mutates `ops` in place, adding parents:
-/// - each subagent's first op gains a parent to the parent session's matching
-///   `Agent` `tool_use` (a `ToolOp` with `tool_name == "Agent"`, `stage: Start`,
-///   and `tool_call_id` equal to `meta.tool_use_id`);
-/// - the parent session's matching `TaskOutput` result (a `ToolOp` with
-///   `tool_name == "TaskOutput"`, `stage: Finish`, whose content reports a
-///   success status) gains a parent to that subagent's last op.
-///
-/// Both edges respect [`ParentSet`] capacity (max 2 parents): if a target op
-/// already has two parents, the edge is skipped rather than dropped.
+/// Does not mutate `ops`. Returns new [`Op`]s:
+/// - a [`NoteRelationship::SubagentOf`] note per subagent whose causal parent is
+///   the subagent's first op and whose target is the parent's matching `Agent`
+///   `tool_use`;
+/// - a [`NoteRelationship::ReconnectsTo`] note per completed subagent whose
+///   causal parent is the parent's matching `TaskOutput` result and whose target
+///   is the subagent's last op.
 #[must_use]
-pub fn link_subagents(ops: &mut [Op], meta: &[SubagentMeta]) -> usize {
+pub fn emit_subagent_notes_from(ops: &[Op], meta: &[SubagentMeta]) -> Vec<Op> {
     if meta.is_empty() {
-        return 0;
+        return Vec::new();
     }
 
     // Index ops by session scope so we can find each session's ops quickly.
@@ -67,12 +67,12 @@ pub fn link_subagents(ops: &mut [Op], meta: &[SubagentMeta]) -> usize {
     // tool_call_id / content rather than scope grouping.
     let mut ops_by_session: HashMap<u64, Vec<usize>> = HashMap::new();
     for (i, op) in ops.iter().enumerate() {
-        if let editchain_core::ScopeRef::Session(sid) = op.scope {
+        if let ScopeRef::Session(sid) = op.scope {
             ops_by_session.entry(sid.0).or_default().push(i);
         }
     }
 
-    let mut linked = 0usize;
+    let mut notes = Vec::new();
     for m in meta {
         // Resolve the parent session id to its numeric scope.
         let Some(parent_sid) = resolve_session_id(ops, &m.parent_session_id) else {
@@ -94,46 +94,87 @@ pub fn link_subagents(ops: &mut [Op], meta: &[SubagentMeta]) -> usize {
             continue;
         };
 
-        // Branch: sub-first.parents += Agent-call. Independent of whether a
-        // TaskOutput result exists — a subagent always branches from its spawn.
+        // Branch note: SubagentOf, parent = sub-first, target = Agent-call.
+        // Independent of whether a TaskOutput result exists — a subagent always
+        // branches from its spawn.
         if let Some(agent_call_idx) = find_agent_tool_use(ops, parent_indices, &m.tool_use_id) {
-            if let Some(agent_call_id) = ops.get(agent_call_idx).map(|op| op.id) {
-                if let Some(sub_first_op) = ops.get_mut(sub_first_idx) {
-                    if add_parent(sub_first_op, agent_call_id) {
-                        linked = linked.saturating_add(1);
-                    }
+            if let Some(sub_first_op) = ops.get(sub_first_idx) {
+                if let Some(agent_call_id) = ops.get(agent_call_idx).map(|op| op.id) {
+                    notes.push(subagent_note(
+                        sub_first_op,
+                        agent_call_id,
+                        NoteRelationship::SubagentOf,
+                    ));
                 }
             }
         }
 
-        // Reconnect: completion-result.parents += sub-last. Only when the parent
-        // reports this subagent as completed (via TaskOutput polling or a
-        // TaskStop/late-check "not running (status: completed)" result).
+        // Reconnect note: ReconnectsTo, parent = completion-result, target =
+        // sub-last. Only when the parent reports this subagent as completed (via
+        // TaskOutput polling or a TaskStop/late-check "not running (status:
+        // completed)" result).
         if let Some(completion_idx) =
             find_subagent_completion(ops, parent_indices, &m.subagent_session_id)
         {
-            if let Some(sub_last_id) = ops.get(sub_last_idx).map(|op| op.id) {
-                if let Some(completion_op) = ops.get_mut(completion_idx) {
-                    if add_parent(completion_op, sub_last_id) {
-                        linked = linked.saturating_add(1);
-                    }
+            if let Some(sub_last_op) = ops.get(sub_last_idx) {
+                if let Some(completion_op) = ops.get(completion_idx) {
+                    notes.push(subagent_note(
+                        completion_op,
+                        sub_last_op.id,
+                        NoteRelationship::ReconnectsTo,
+                    ));
                 }
             }
         }
     }
-    linked
+    notes
+}
+
+/// Reserved high derived-ordinal used for subagent relationship note IDs.
+///
+/// Normalization allocates derived ordinals sequentially starting at 1 per
+/// source record; these reserved values sit far above any realistic content-block
+/// count so they never collide with normalized children on the same stream.
+const SUBAGENT_NOTE_DISC: u16 = 0xFFFD;
+
+/// Build a relationship note whose causal parent is `parent_op` and whose target
+/// is `target_id`.
+fn subagent_note(parent_op: &Op, target_id: OpId, relationship: NoteRelationship) -> Op {
+    // The note's ID derives from the parent op's stream + a reserved high
+    // derived-ordinal, so it is deterministic and collision-free with normalized
+    // children on the same stream.
+    let stream = crate::ids::SourceStream::new(parent_op.id.node, parent_op.id.boot);
+    let note_id = stream
+        .op_from_position(crate::ids::SourcePosition::derived(
+            parent_op.id.seq >> 16,
+            SUBAGENT_NOTE_DISC,
+        ))
+        .unwrap_or(parent_op.id);
+    Op {
+        id: note_id,
+        parents: editchain_core::parents::ParentSet::One(parent_op.id),
+        actor: ActorId(0),
+        clock: Clock::None,
+        scope: parent_op.scope,
+        tags: Tags::META | Tags::IMPORT,
+        kind: OpKind::Note(NoteOp {
+            target_ids: vec![target_id],
+            relationship,
+            content: Payload::Empty,
+        }),
+    }
 }
 
 /// Resolve a session id string to its numeric scope value by scanning ops.
 fn resolve_session_id(ops: &[Op], session_id: &str) -> Option<u64> {
-    let target = editchain_core::SessionId(crate::ids::derive_session_id(session_id).0);
+    let target = SessionId(crate::ids::derive_session_id(session_id).0);
     ops.iter().find_map(|op| match op.scope {
-        editchain_core::ScopeRef::Session(sid) if sid == target => Some(sid.0),
-        editchain_core::ScopeRef::Session(_)
-        | editchain_core::ScopeRef::None
-        | editchain_core::ScopeRef::Chain(_)
-        | editchain_core::ScopeRef::Turn(_)
-        | editchain_core::ScopeRef::File(_) => None,
+        ScopeRef::Session(sid) if sid == target => Some(sid.0),
+        ScopeRef::Session(_)
+        | ScopeRef::None
+        | ScopeRef::Chain(_)
+        | ScopeRef::Turn(_)
+        | ScopeRef::File(_) => None,
     })
 }
 
@@ -244,28 +285,6 @@ fn find_subagent_extent(
     match (first, last) {
         (Some(f), Some(l)) => Some((f, l)),
         _ => None,
-    }
-}
-
-/// Add a parent to an op, respecting `ParentSet` capacity (max 2).
-///
-/// Returns true if the edge was added; false if it was skipped (already present
-/// or at capacity).
-fn add_parent(op: &mut Op, parent: OpId) -> bool {
-    match op.parents {
-        ParentSet::None => {
-            op.parents = ParentSet::One(parent);
-            true
-        }
-        ParentSet::One(existing) => {
-            if existing == parent {
-                false
-            } else {
-                op.parents = ParentSet::Two(existing, parent);
-                true
-            }
-        }
-        ParentSet::Two(..) => false,
     }
 }
 

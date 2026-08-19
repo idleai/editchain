@@ -356,6 +356,25 @@ pub enum NoteRelationship {
     Redacts,
     /// This note provides additional explanation for the target operation(s).
     Explains,
+    /// This note records that the source session is a fork of the target session.
+    ///
+    /// The causal parent is the fork branch's op at its divergence boundary and
+    /// the target is the trunk session's message at that same boundary, so the
+    /// branch renders off the trunk at the split (its shared prologue is folded
+    /// in by the projection — never duplicated). Emitted during import instead of
+    /// mutating the fork session's causal parents, so stored causality stays
+    /// immutable (SPEC §1.1).
+    ForkOf,
+    /// This note records that the source op was authored by a subagent spawned
+    /// by the target op (the parent's `Agent` `tool_use`).
+    ///
+    /// Emitted during import instead of mutating the subagent's first-op parents.
+    SubagentOf,
+    /// This note records that the source op (the parent's completion result)
+    /// reconnects to the target op (the subagent's last op).
+    ///
+    /// Emitted during import instead of mutating the completion result's parents.
+    ReconnectsTo,
 }
 
 // ---------------------------------------------------------------------------

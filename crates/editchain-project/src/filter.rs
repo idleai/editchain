@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use editchain_core::OpId;
+use editchain_core::{Op, OpId};
 
 use crate::HistoryNode;
 
@@ -162,9 +162,14 @@ pub struct ChainFilterKey {
 /// Pattern-based truncation preserves endpoints (no parent / no child in the
 /// full graph) so a filtered chain keeps its anchors.
 #[must_use]
+#[expect(
+    clippy::implicit_hasher,
+    reason = "The relationship-note map keeps the default RandomState hasher, consistent with the projection's field; not worth generalizing for a read-only traversal."
+)]
 pub fn apply(
     nodes: &[HistoryNode],
     links: &std::collections::BTreeMap<OpId, Vec<editchain_core::GitLink>>,
+    note_map: &HashMap<OpId, Vec<Op>>,
     filter: &ChainFilter,
 ) -> Vec<HistoryNode> {
     if filter.is_empty() || nodes.is_empty() {
@@ -177,7 +182,7 @@ pub fn apply(
     let mut children_of_key = HashMap::with_capacity(nodes.len());
     for n in nodes {
         let key = n.node_key();
-        let ps = n.parent_keys(links);
+        let ps = n.parent_keys(links, note_map);
         drop(parents_of_key.insert(key.clone(), ps.clone()));
         for p in ps {
             children_of_key
@@ -228,7 +233,7 @@ pub fn apply(
         let spliced = if filter.splice && !hidden.is_empty() {
             nearest_kept_ancestors(&key, &parents_of_key, &hidden)
         } else {
-            n.parent_keys(links)
+            n.parent_keys(links, note_map)
         };
         out.set_parent_keys(&spliced);
         result.push(out);

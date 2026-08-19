@@ -1,28 +1,29 @@
-//! History linking — stitch disconnected session chains and git history into a
-//! single edit chain.
+//! History linking — relate sessions and git commits into the unified graph.
 //!
 //! The import produces per-session linear chains (`ParentSet::One(prev_op)`),
-//! and git commits are a separate disconnected component. This module augments
-//! operation parents so the whole history reads as one continuous chain:
+//! and git commits are a separate disconnected component. This module does NOT
+//! force all sessions into one linear trunk: each source Claude Code session is
+//! its own chain (the chain count maps 1:1 to imported sessions). Cross-session
+//! relationships come from typed `ForkOf` / `SubagentOf` relationship notes
+//! (read as virtual edges by the projection), never from forced stitching of
+//! unrelated sessions.
 //!
-//! 1. **Session-to-session stitching** — link each session's first op to the
-//!    previous session's last op (chronological order).
-//! 2. **Git-command detection** — link ops that ran git commit/push commands to
+//! What this module does:
+//!
+//! 1. **Git-command detection** — link ops that ran git commit/push commands to
 //!    the commit with the closest timestamp.
-//! 3. **Session-to-closest-commit** — for sessions still unlinked to git, link
+//! 2. **Session-to-closest-commit** — for sessions still unlinked to git, link
 //!    their last op to the closest commit (weak linkage).
 //!
-//! Session stitching mutates `Op.parents` (both ends are `OpId`). Op→git links
-//! are returned as [`GitLink`] records (the existing mechanism for op→git
-//! edges), which the projection stores in `GitProjection.links`.
+//! Op→git links are returned as [`GitLink`] records (the existing mechanism for
+//! op→git edges), which the projection stores in `GitProjection.links`.
 //!
 //! All linking is deterministic (stable sort by timestamp, tie-break by `OpId`).
 
 use std::collections::HashMap;
 
 use editchain_core::{
-    GitCommitEntity, GitLink, GitLinkKind, GitOid, Op, OpId, ParentSet, Payload, RepositoryId,
-    ScopeRef,
+    GitCommitEntity, GitLink, GitLinkKind, GitOid, Op, Payload, RepositoryId, ScopeRef,
 };
 
 /// The result of linking: session-stitched ops plus the op→git links created.
@@ -34,9 +35,11 @@ pub struct LinkResult {
     pub git_links: Vec<GitLink>,
 }
 
-/// Link a set of operations and git commits into a single edit chain.
+/// Link a set of operations and git commits into the unified projection graph.
 ///
-/// Returns session-stitched ops and the op→git links to store in the projection.
+/// Sessions are left as their own chains (no forced stitching); only op→git
+/// links are added. Returns the ops (unchanged in parents) and the op→git links
+/// to store in the projection.
 #[must_use]
 pub fn link_history(ops: &[Op], commits: &[GitCommitEntity]) -> LinkResult {
     let mut ops = ops.to_vec();
@@ -45,81 +48,20 @@ pub fn link_history(ops: &[Op], commits: &[GitCommitEntity]) -> LinkResult {
     let commit_times: Vec<(i64, GitOid)> =
         commits.iter().map(|c| (c.committed_at, c.oid)).collect();
 
-    // 1. Session-to-session stitching.
-    stitch_sessions(&mut ops);
+    // Note: No blanket session-to-session stitching. Each Claude Code session is
+    // its own chain (the chain count maps 1:1 to imported source sessions). Cross-
+    // session relationships are represented explicitly by typed `ForkOf` /
+    // `SubagentOf` relationship notes and op→git links, never by forced linear
+    // chaining of unrelated sessions. A forced trunk here is what made a short
+    // first session appear to "spawn" an entire month of later activity.
 
-    // 2. Git-command detection: link ops that ran git commands to commits.
+    // 1. Git-command detection: link ops that ran git commands to commits.
     let mut git_links = link_git_commands(&mut ops, &commit_times);
 
-    // 3. Session-to-closest-commit fallback for sessions still unlinked.
+    // 2. Session-to-closest-commit fallback for sessions still unlinked.
     git_links.extend(link_sessions_to_commits(&ops, &commit_times));
 
     LinkResult { ops, git_links }
-}
-
-/// Stitch sessions together chronologically into one linear chain.
-///
-/// For each session, find its first and last op by sequence number (`OpId.seq`,
-/// which matches how the raw import chains each session linearly). Sort
-/// sessions by first-op sequence; link session N's first op → session N-1's
-/// last op.
-///
-/// Sequence numbers are used instead of wall-clock timestamps because clocks
-/// can be inconsistent across imported records (e.g. an unset `UnixMs(0)` on
-/// some ops), which would otherwise order sessions incorrectly and create
-/// backward cross-session edges that close cycles in the graph.
-#[expect(
-    clippy::indexing_slicing,
-    reason = "indices are guaranteed non-empty per session group"
-)]
-fn stitch_sessions(ops: &mut [Op]) {
-    // Group ops by session id.
-    let mut by_session: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (i, op) in ops.iter().enumerate() {
-        if let ScopeRef::Session(sid) = op.scope {
-            by_session.entry(sid.0).or_default().push(i);
-        }
-    }
-
-    // For each session, find first and last op index by sequence number.
-    let mut sessions: Vec<(u64, usize, usize)> = Vec::new(); // (sid, first_idx, last_idx)
-    for (sid, indices) in by_session {
-        let mut first = indices[0];
-        let mut last = indices[0];
-        for &i in &indices {
-            if op_seq(&ops[i]) < op_seq(&ops[first]) {
-                first = i;
-            }
-            if op_seq(&ops[i]) > op_seq(&ops[last]) {
-                last = i;
-            }
-        }
-        sessions.push((sid, first, last));
-    }
-
-    // Sort sessions by first-op sequence (deterministic tie-break by sid).
-    sessions.sort_by(|a, b| {
-        op_seq(&ops[a.1])
-            .cmp(&op_seq(&ops[b.1]))
-            .then(a.0.cmp(&b.0))
-    });
-
-    // Link session N's first op → session N-1's last op.
-    //
-    // Only add the edge when it points forward (the previous session's last op
-    // has a lower sequence than the current session's first op). Session seq
-    // ranges can overlap across sessions (seq is a per-file/per-line counter,
-    // not a global timestamp), so a naive stitch can create a backward edge
-    // that closes a cycle in the graph. Skipping backward stitches keeps the
-    // graph acyclic while still chaining sessions that are genuinely ordered.
-    for w in sessions.windows(2) {
-        let prev_last = w[0].2;
-        let cur_first = w[1].1;
-        let prev_id = ops[prev_last].id;
-        if op_seq(&ops[cur_first]) > op_seq(&ops[prev_last]) {
-            add_parent(&mut ops[cur_first], prev_id);
-        }
-    }
 }
 
 /// Link ops that ran git commit/push commands to the commit with the closest
@@ -211,19 +153,6 @@ fn op_is_git_command(op: &Op) -> bool {
     }
 }
 
-/// Add a parent to an op, respecting `ParentSet` capacity (max 2).
-fn add_parent(op: &mut Op, parent: OpId) {
-    match op.parents {
-        ParentSet::None => op.parents = ParentSet::One(parent),
-        ParentSet::One(existing) => {
-            if existing != parent {
-                op.parents = ParentSet::Two(existing, parent);
-            }
-        }
-        ParentSet::Two(..) => {}
-    }
-}
-
 /// Find the commit whose timestamp is closest to `ts`.
 fn closest_commit(commit_times: &[(i64, GitOid)], ts: u64) -> Option<(i64, GitOid)> {
     let ts_i64 = i64::try_from(ts).unwrap_or(i64::MAX);
@@ -244,9 +173,4 @@ fn payload_text(payload: &Payload) -> String {
 /// Extract the clock value of an op as u64.
 fn op_clock(op: &Op) -> u64 {
     op.clock.as_u64()
-}
-
-/// Extract the sequence number of an op as u64.
-fn op_seq(op: &Op) -> u64 {
-    op.id.seq
 }

@@ -787,14 +787,35 @@ fn compute_lane_map(
     let mut lane_of: HashMap<String, usize> = HashMap::new();
     // Track which lanes are currently occupied (by a node awaiting its parent).
     let mut active: Vec<Option<String>> = Vec::new();
+    // Track, per parent, the lanes already taken by its children. Used to give
+    // a fork's sibling branches distinct lanes (branch-out), so they don't all
+    // collapse onto the shared parent's column.
+    let mut child_lanes: HashMap<String, Vec<usize>> = HashMap::new();
     for key in topo {
         let parents = parents_of(key);
         // Inherit the first parent's lane if it already has one; otherwise take
-        // a fresh lane.
+        // a fresh lane. If the first parent already has another child on that
+        // lane (a fork), take a fresh spare lane instead so the branches stay
+        // on distinct columns.
         let my_lane = if let Some(&l) = lane_of.get(key) {
             l
         } else if let Some(first_parent) = parents.first() {
-            *lane_of.get(first_parent).unwrap_or(&0)
+            let inherited = *lane_of.get(first_parent).unwrap_or(&0);
+            if child_lanes
+                .get(first_parent)
+                .is_some_and(|ls| ls.contains(&inherited))
+            {
+                // The parent already has a child on this lane — fork branch.
+                let pl = find_spare_lane_str(&active);
+                if pl < active.len() {
+                    active[pl] = Some(key.clone());
+                } else {
+                    active.push(Some(key.clone()));
+                }
+                pl
+            } else {
+                inherited
+            }
         } else {
             let l = active.len();
             active.push(Some(key.clone()));
@@ -803,9 +824,26 @@ fn compute_lane_map(
         };
         // Record this node's lane.
         let _: Option<usize> = lane_of.insert(key.clone(), my_lane);
+        // Record that this node occupies `my_lane` as a child of its first parent.
+        if let Some(first_parent) = parents.first() {
+            let ls = child_lanes.entry(first_parent.clone()).or_default();
+            if !ls.contains(&my_lane) {
+                ls.push(my_lane);
+            }
+        }
         // Secondary parents get fresh lanes (for merges).
+        //
+        // A secondary parent needs its own lane whenever it does not yet have
+        // one, OR when its existing lane collides with this node's own lane
+        // (the first parent's lane). The collision case is a fork-then-merge
+        // diamond: two branches (B and C) both inherit the same root's lane,
+        // so without reassignment they'd share one column and the merge would
+        // be invisible. Reassigning the second branch to a fresh spare lane
+        // keeps the two incoming edges on distinct columns so the merge jog
+        // renders.
         for parent in parents.iter().skip(1) {
-            if !lane_of.contains_key(parent) {
+            let existing = lane_of.get(parent).copied();
+            if existing.is_none() || existing == Some(my_lane) {
                 let pl = find_spare_lane_str(&active);
                 if pl < active.len() {
                     active[pl] = Some(parent.clone());

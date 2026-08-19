@@ -253,6 +253,53 @@
     combined() {
       return combinedOp();
     },
+
+    // A fork + subagent-reconnect graph, mirroring the geometry the importer
+    // emits via ForkOf/SubagentOf/ReconnectsTo relationship notes (SPEC §1.1):
+    // a shared root forks into two continuations on distinct lanes, and the
+    // parent's completion result reconnects into the subagent branch — a
+    // cross-lane merge at the top. Each window row carries explicit lane /
+    // above / below / transitions (the shape the renderer's per-row graph
+    // cells read directly), so the fork draws two diverging columns and the
+    // reconnection draws a horizontal merge connector.
+    fork() {
+      // Newest-first rows. n:0 is the reconnected completion result (on lane 0,
+      // with a cross-lane merge connector to the subagent branch on lane 1).
+      const local = [
+        // completion result reconnecting to the subagent's last op (lane 1)
+        [0, 'node:f:0', 'completion result', { above: [0, 1], below: [0, 1], transitions: [[1, 0]] }],
+        // subagent's last op — the subagent branch, lane 1
+        [1, 'node:f:1', 'subagent last op', { above: [1], below: [1] }],
+        // subagent's first op — forks off the shared root
+        [1, 'node:f:2', 'subagent first op', { above: [0, 1], below: [1] }],
+        // Agent tool_use call — the parent's spawn point, lane 0
+        [0, 'node:f:3', 'Agent tool call', { above: [0], below: [0, 1] }],
+        // shared root on lane 0 (both branches descend from it)
+        [0, 'node:f:4', 'shared root', { above: [], below: [0] }],
+      ];
+      const rows = local.map(([lane, key, summary, geo], i) => {
+        const r = opRow(key, summary, { group: 'session:s1', kind: 'message' });
+        r.lane = geo.lane !== undefined ? geo.lane : lane;
+        r.above = geo.above;
+        r.below = geo.below;
+        r.transitions = geo.transitions || [];
+        return r;
+      });
+      const layoutRows = local.map(([lane, key, ,], i) => ({ node: key, lane }));
+      // Edge point paths (absolute row indices, newest-first) for the two
+      // branches plus the reconnect.
+      const edges = [
+        { child: 'node:f:0', parent: 'node:f:1', points: [{ row: 0, lane: 1 }, { row: 1, lane: 1 }] },
+        { child: 'node:f:1', parent: 'node:f:2', points: [{ row: 1, lane: 1 }, { row: 2, lane: 1 }] },
+        { child: 'node:f:2', parent: 'node:f:4', points: [{ row: 2, lane: 1 }, { row: 4, lane: 0 }] },
+        { child: 'node:f:3', parent: 'node:f:4', points: [{ row: 3, lane: 0 }, { row: 4, lane: 0 }] },
+      ];
+      return {
+        rows, layoutRows, edges,
+        max_lane: 1,
+        subOpCounts: rows.map(() => 0),
+      };
+    },
   };
 
   window.__editchainFixtures = scenarios;
