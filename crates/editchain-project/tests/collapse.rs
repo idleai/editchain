@@ -133,7 +133,7 @@ fn collapse_author_derived_from_children_tags() {
     assert_eq!(nodes.len(), 1);
     let author = match nodes.first().unwrap() {
         editchain_project::HistoryNode::CollapsedImport { author, .. } => author,
-        editchain_project::HistoryNode::EditOperation(_)
+        editchain_project::HistoryNode::EditOperation { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     };
     assert_eq!(author, "human");
@@ -151,7 +151,7 @@ fn collapse_author_prefers_human_over_agent() {
     assert_eq!(nodes.len(), 1);
     let author = match nodes.first().unwrap() {
         editchain_project::HistoryNode::CollapsedImport { author, .. } => author,
-        editchain_project::HistoryNode::EditOperation(_)
+        editchain_project::HistoryNode::EditOperation { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     };
     assert_eq!(author, "human");
@@ -162,8 +162,9 @@ fn meta_imports_bundle_into_nearest_real_turn() {
     // A real turn (import + message child), then two META imports, then another
     // real turn. The META imports must bundle into the nearest preceding real
     // turn and not appear as their own nodes.
-    // META bundling is off by default; enable it for this test and restore after.
-    editchain_project::META_BUNDLE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
     let turn1 = import_op(1, 1);
     let msg = message_op(1, 2, turn1.id, "hello world");
     let meta1 = meta_import_op(1, 3);
@@ -171,16 +172,18 @@ fn meta_imports_bundle_into_nearest_real_turn() {
     let turn2 = import_op(1, 5);
     let tool = tool_op(1, 6, turn2.id, "Bash");
 
-    let projection = HistoryProjection::from_ops(vec![
-        turn1.clone(),
-        msg,
-        meta1.clone(),
-        meta2.clone(),
-        turn2.clone(),
-        tool,
-    ]);
+    let projection = HistoryProjection::from_ops_with(
+        vec![
+            turn1.clone(),
+            msg,
+            meta1.clone(),
+            meta2.clone(),
+            turn2.clone(),
+            tool,
+        ],
+        opts,
+    );
     let nodes = projection.nodes();
-    editchain_project::META_BUNDLE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
 
     // Two real turns only — the META imports are bundled, not separate nodes.
     assert_eq!(nodes.len(), 2);
@@ -193,18 +196,21 @@ fn meta_imports_bundle_into_nearest_real_turn() {
             assert_eq!(sub_ops[0].id, meta1.id);
             assert_eq!(sub_ops[1].id, meta2.id);
         }
-        editchain_project::HistoryNode::EditOperation(_)
+        editchain_project::HistoryNode::EditOperation { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     }
 }
 
 #[test]
-fn meta_bundle_splices_children_to_keep_chain_continuous() {
-    // A META import sits on the backbone between two real turns. When it is
-    // bundled (dropped from the top-level list), the second turn's parent must
-    // be re-pointed at the first turn — otherwise the chain severs.
-    // META bundling is off by default; enable it for this test and restore after.
-    editchain_project::META_BUNDLE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+fn meta_bundle_keeps_parents_unchanged() {
+    // A META import sits on the backbone between two real turns. It is bundled
+    // (dropped from the top-level list) into turn1. The second turn's causal
+    // parent is the META op. q6 Phase-1 contract: bundling MUST NOT rewrite
+    // stored parents/clocks — turn2 keeps pointing at the META op; chain
+    // continuity is preserved through the representative map, not a parent splice.
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
     let turn1 = import_op(1, 1);
     let msg = message_op(1, 2, turn1.id, "hello world");
     let meta = meta_import_op(1, 3);
@@ -212,24 +218,38 @@ fn meta_bundle_splices_children_to_keep_chain_continuous() {
     let mut turn2 = import_op(1, 4);
     turn2.parents = ParentSet::One(meta.id);
 
-    let projection =
-        HistoryProjection::from_ops(vec![turn1.clone(), msg, meta.clone(), turn2.clone()]);
+    let projection = HistoryProjection::from_ops_with(
+        vec![turn1.clone(), msg, meta.clone(), turn2.clone()],
+        opts,
+    );
     let nodes = projection.nodes();
-    editchain_project::META_BUNDLE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
 
     // Two real turns only (the META import is bundled into turn1).
     assert_eq!(nodes.len(), 2);
-    // The newer turn (nodes[0]) must point at the older turn (nodes[1]) — NOT
-    // at the dropped META op — so the chain stays continuous.
+    // The META op is bundled under turn1 (the older node, nodes[1]).
+    let older = &nodes[1];
+    match older {
+        editchain_project::HistoryNode::CollapsedImport { sub_ops, .. } => {
+            assert_eq!(sub_ops.len(), 1, "META op should bundle under turn1");
+            assert_eq!(sub_ops[0].id, meta.id);
+        }
+        editchain_project::HistoryNode::EditOperation { .. }
+        | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
+    }
+
+    // Storage parents are NOT rewritten: turn2 still points at the bundled META
+    // op (never the absorbing turn1). Layout resolves it through the
+    // representative map instead.
     let newer = &nodes[0];
-    let older_key = nodes[1].node_key();
+    let meta_key = meta.id.to_string();
     let newer_parents = newer.parent_keys(
         &std::collections::BTreeMap::new(),
         &std::collections::HashMap::new(),
     );
     assert!(
-        newer_parents.contains(&older_key),
-        "newer turn should parent to older turn, got {newer_parents:?}"
+        newer_parents.contains(&meta_key),
+        "bundling must NOT rewrite causal parents; turn2 should still parent to \
+         the bundled META op, got {newer_parents:?}"
     );
 }
 
@@ -436,4 +456,288 @@ fn collapse_keeps_git_commits() {
     assert!(nodes
         .iter()
         .any(|n| matches!(n, editchain_project::HistoryNode::GitCommit(_))));
+}
+
+/// q6 Phase-1 gate: META records must never bundle across source chains.
+///
+/// Two chains (different `node` -> distinct `(OpId.node, OpId.boot)` keys).
+/// Chain A has a real anchor then a META record (bundles into A). Chain B has a
+/// META record with **no** real anchor in B — it must stay standalone, NOT
+/// attach to chain A's anchor.
+#[test]
+fn no_cross_chain_meta_bundling() {
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    // Chain A: node 1, turn + META.
+    let a_turn = import_op(1, 1);
+    let a_msg = message_op(1, 2, a_turn.id, "hello");
+    let a_meta = meta_import_op(1, 3);
+    // Chain B: node 2, only a META record (no real anchor in B).
+    let b_meta = meta_import_op(2, 1);
+
+    let projection = HistoryProjection::from_ops_with(
+        vec![a_turn.clone(), a_msg, a_meta.clone(), b_meta.clone()],
+        opts,
+    );
+    let nodes = projection.nodes();
+
+    // Chain A's META bundles under A's turn -> A contributes 1 node.
+    let a_key = a_turn.id.to_string();
+    let a_node = nodes.iter().find(|n| n.node_key() == a_key).unwrap();
+    match a_node {
+        editchain_project::HistoryNode::CollapsedImport { sub_ops, .. } => {
+            assert_eq!(sub_ops.len(), 1, "chain A's META must bundle into A's turn");
+            assert_eq!(sub_ops[0].id, a_meta.id);
+        }
+        editchain_project::HistoryNode::EditOperation { .. }
+        | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
+    }
+
+    // Chain B's META has no anchor in B -> must stay standalone (never attach to A).
+    let b_key = b_meta.id.to_string();
+    assert!(
+        nodes.iter().any(|n| n.node_key() == b_key),
+        "chain B's META must remain a standalone row, not bundle across to chain A"
+    );
+    // Exactly the A turn + the B META row (A's META is bundled away).
+    assert_eq!(
+        nodes.len(),
+        2,
+        "expected A turn + B standalone META, got {nodes:?}"
+    );
+}
+
+/// q6 Phase-1 gate: metadata after a standalone (content) op is NOT dropped.
+///
+/// A META record that follows a dated content-bearing import bundles under it
+/// when bundling is on; a META record after a standalone non-import op is still
+/// anchored by that op. Neither is silently dropped.
+#[test]
+fn metadata_after_standalone_not_dropped() {
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    // A standalone op (a message not tied to an import), then a META op.
+    let standalone = Op {
+        id: OpId::new(NodeId(1), 0, 1),
+        parents: ParentSet::None,
+        actor: ActorId(1),
+        clock: Clock::UnixMs(1),
+        scope: ScopeRef::Session(SessionId(10)),
+        tags: Tags::AGENT | Tags::MESSAGE,
+        kind: OpKind::Message(MessageOp {
+            content: Payload::Inline(b"standalone content".to_vec()),
+            content_type: Payload::Empty,
+        }),
+    };
+    let meta = meta_import_op(1, 2);
+
+    let projection = HistoryProjection::from_ops_with(vec![standalone.clone(), meta.clone()], opts);
+    let nodes = projection.nodes();
+
+    // The META record must survive (its occurrence is never dropped), rendered as
+    // its own row — not attached forward, not silently removed.
+    let s_node = nodes
+        .iter()
+        .find(|n| n.node_key() == standalone.id.to_string())
+        .expect("standalone op must remain a row");
+    assert!(
+        matches!(s_node, editchain_project::HistoryNode::EditOperation { .. }),
+        "standalone content op must be an EditOperation row"
+    );
+    let meta_key = meta.id.to_string();
+    let meta_node = nodes.iter().find(|n| n.node_key() == meta_key);
+    assert!(
+        meta_node.is_some(),
+        "metadata after a standalone op must NOT be dropped (q6 ruling)"
+    );
+}
+
+/// q6 Phase-1 gate: options are per-projection, not global.
+///
+/// The same ops projected with bundling off and on produce different row sets,
+/// chosen purely by the option — no process-global state, so tests can run in
+/// any order without a mutex.
+#[test]
+fn bundle_options_are_per_projection() {
+    let turn1 = import_op(1, 1);
+    let msg = message_op(1, 2, turn1.id, "hi");
+    let meta = meta_import_op(1, 3);
+    let ops = vec![turn1.clone(), msg, meta.clone()];
+
+    let opts_off = editchain_project::ProjectionOptions {
+        bundle_metadata: false,
+    };
+    let opts_on = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let off = HistoryProjection::from_ops_with(ops.clone(), opts_off).nodes();
+    let on = HistoryProjection::from_ops_with(ops, opts_on).nodes();
+
+    // Off: turn + META both top-level.
+    assert!(off.iter().any(|n| n.node_key() == meta.id.to_string()));
+    // On: META bundled under turn -> only the turn node remains.
+    assert!(!on.iter().any(|n| n.node_key() == meta.id.to_string()));
+    assert_eq!(on.len(), 1);
+}
+
+/// q6 Phase-1 regression: a child whose PARENT is a bundled META op must stay
+/// connected to its source chain, NOT fragment into its own independent chain.
+///
+/// Simulates a producer-side sequence where a META record sits on the backbone
+/// (its own META import), a real turn follows it, and a later real turn's causal
+/// parent is the bundled META op (a `parent_keys` producer would see this across
+/// the backbone). After bundling, the META op is a sub-op of the first anchor; the
+/// later turn's stored parent still names the META op. Layout must lift that edge
+/// onto the anchor so the two real turns share one chain.
+#[test]
+fn child_parented_to_bundled_meta_stays_connected() {
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    // turn0 is the anchor; meta is bundled under it; turn1's parent is `meta`.
+    let turn0 = import_op(1, 1);
+    let msg0 = message_op(1, 2, turn0.id, "first");
+    let meta = meta_import_op(1, 3);
+    let mut turn1 = import_op(1, 5);
+    turn1.parents = ParentSet::One(meta.id);
+
+    let projection = HistoryProjection::from_ops_with(
+        vec![turn0.clone(), msg0, meta.clone(), turn1.clone()],
+        opts,
+    );
+    let nodes = projection.nodes();
+
+    // The META op is bundled (not a top-level row) — exactly two real rows.
+    assert!(!nodes.iter().any(|n| n.node_key() == meta.id.to_string()));
+    assert_eq!(nodes.len(), 2);
+
+    // Its stored parent is still `meta` (never rewritten): the DR/immutability
+    // contract that bundling does not splice parents.
+    let turn1_node = nodes
+        .iter()
+        .find(|n| n.node_key() == turn1.id.to_string())
+        .expect("turn1 present");
+    let parents = turn1_node.parent_keys(
+        &std::collections::BTreeMap::new(),
+        &std::collections::HashMap::new(),
+    );
+    assert!(
+        parents.contains(&meta.id.to_string()),
+        "stored parent of turn1 must remain the bundled META op, got {parents:?}"
+    );
+
+    // The two real turns are ONE connected chain, demonstrated via the same
+    // representative lift the projection's own layout/ordering uses: turn1 is
+    // not an independent root. This is the exact "no fragmented small chains"
+    // property the viewer needs.
+    assert_eq!(
+        projection.independent_chains(),
+        1,
+        "bundling must not fragment two real turns into independent chains"
+    );
+}
+
+/// Reproduce the real q6 backbone pattern at small scale: a single stream with
+/// alternating real turns and (source-time-unknown) META records. Each real turn
+/// parents to the preceding META record. Bundling must keep the WHOLE chain as
+/// one connected chain, not fragment it per turn.
+#[test]
+fn long_linear_chain_with_meta_breaks_stays_one_chain() {
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let mut entries: Vec<Op> = Vec::new();
+    let mut prev: Option<OpId> = None;
+    // Sequence: t1 (real), m2 (meta), t3 (real), m4 (meta), t5 (real), m6 (meta),
+    // t7 (real). Each record parents to the previous line (the real importer's
+    // linear backbone), so real turns parent to the preceding META record.
+    for seq in 1..=7u64 {
+        let is_meta = seq % 2 == 0;
+        let id = OpId::new(NodeId(1), 0, seq);
+        let mut record = Op {
+            id,
+            parents: prev.map_or(ParentSet::None, ParentSet::One),
+            actor: ActorId(1),
+            clock: Clock::UnixMs(seq),
+            scope: ScopeRef::Session(SessionId(10)),
+            tags: Tags::IMPORT,
+            kind: OpKind::Import(ImportOp {
+                raw_ref: Payload::Inline(format!("raw {seq}").into_bytes()),
+                raw_hash: None,
+            }),
+        };
+        if is_meta {
+            record.tags |= Tags::META | Tags::SOURCE_TIME_UNKNOWN;
+        }
+        prev = Some(id);
+        entries.push(record);
+    }
+    let projection = HistoryProjection::from_ops_with(entries, opts);
+    // Exactly the 4 real turns remain (3 meta bundled away).
+    let nodes = projection.nodes();
+    assert_eq!(nodes.len(), 4);
+    assert_eq!(
+        projection.independent_chains(),
+        1,
+        "a single stream alternating real turns and bundled meta must be ONE chain, \
+         got {} chains",
+        projection.independent_chains()
+    );
+}
+
+/// q6 Phase-1 regression: META that bundles into a tool-RESULT row must stay
+/// connected after `group_tool_results` folds that result row into its call.
+///
+/// Reproduces the real q6 fragmentation: a META op anchors under a tool-result
+/// row; `group_tool_results` then folds the result row away into the call, so a
+/// later turn parented to that META would lose its edge. The representative map
+/// must be re-pointed to the call so the chain stays one chain.
+#[test]
+fn meta_under_tool_result_stays_connected_after_grouping() {
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let call_import = import_op(1, 1);
+    let call = tool_op(1, 2, call_import.id, "Bash"); // Start call
+                                                      // Tool-result row (Finish, empty name), parented to the call's raw import.
+    let mut result_import = import_op(1, 3);
+    result_import.parents = ParentSet::One(call_import.id);
+    let mut result_tool = tool_op(1, 4, result_import.id, "");
+    if let OpKind::Tool(t) = &mut result_tool.kind {
+        t.stage = ToolStage::Finish;
+    }
+    // A META op that bundles under the tool-result row.
+    let mut meta = meta_import_op(1, 5);
+    meta.parents = ParentSet::One(result_import.id);
+    // A later real turn parented to that META (the linear backbone).
+    let mut next_turn = import_op(1, 6);
+    next_turn.parents = ParentSet::One(meta.id);
+
+    let projection = HistoryProjection::from_ops_with(
+        vec![
+            call_import.clone(),
+            call,
+            result_import.clone(),
+            result_tool,
+            meta.clone(),
+            next_turn.clone(),
+        ],
+        opts,
+    );
+    let nodes = projection.nodes();
+    // The tool-result row and the META are both folded away -> rows = call + turn.
+    assert!(!nodes.iter().any(|n| n.node_key() == meta.id.to_string()));
+    assert!(!nodes
+        .iter()
+        .any(|n| n.node_key() == result_import.id.to_string()));
+    assert_eq!(nodes.len(), 2);
+    // The call + next_turn remain ONE connected chain, even though next_turn's
+    // parent is the META that anchored under the folded tool result.
+    assert_eq!(
+        projection.independent_chains(),
+        1,
+        "META under a (then-grouped) tool result must not fragment the chain"
+    );
 }

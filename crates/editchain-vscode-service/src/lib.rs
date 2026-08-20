@@ -20,8 +20,6 @@ use editchain_index::LexicalIndex;
 use editchain_node::segment::SegmentStore;
 use editchain_project::filter::ChainFilter;
 use editchain_project::HistoryProjection;
-#[cfg(test)]
-use editchain_project::META_BUNDLE_ENABLED;
 use editchain_protocol::{
     ChainFilterDto, GraphLayout as ProtocolGraphLayout, HistoryRow, HistoryWindow, LayoutEdge,
     LayoutPoint, LayoutRow, NodeDetails, RepositoryInfo, Request, RequestBody, Response,
@@ -81,7 +79,13 @@ impl Workspace {
             PathBuf::from(workspace_path).join(chain_dir)
         };
         let ops = read_chain_ops(&chain_path)?;
-        let mut projection = HistoryProjection::from_ops(ops);
+        // q6 Phase-1: enable per-source-chain META bundling by default in the live
+        // viewer. `ProjectionOptions` is passed explicitly so the behavior is
+        // deterministic and a real cache key, never a process-global toggle.
+        let options = editchain_project::ProjectionOptions {
+            bundle_metadata: true,
+        };
+        let mut projection = HistoryProjection::from_ops_with(ops, options);
         let repositories = discover_repositories(&PathBuf::from(workspace_path))?;
         // Walk each discovered repo's history into the projection.
         for discovery in &repositories {
@@ -184,10 +188,7 @@ impl Workspace {
                     timestamp_ms: node.timestamp_ms(),
                     group: node.group(),
                     node_key: node.node_key(),
-                    parents: node.parent_keys(
-                        &self.projection.git.links,
-                        self.projection.relationship_notes(),
-                    ),
+                    parents: self.projection.lifted_parent_keys(&node),
                     is_submodule: node
                         .repository()
                         .is_some_and(|rid| self.repo_is_submodule(rid)),
@@ -477,7 +478,7 @@ fn chain_filter_from_dto(dto: Option<&ChainFilterDto>) -> ChainFilter {
 #[must_use]
 fn node_is_system(node: &editchain_project::HistoryNode) -> bool {
     match node {
-        editchain_project::HistoryNode::EditOperation(op) => {
+        editchain_project::HistoryNode::EditOperation { op, .. } => {
             matches!(op.kind, OpKind::Tool(_) | OpKind::Import(_))
         }
         // Collapsed imports fold a raw import + its children into one node; the
@@ -499,7 +500,7 @@ fn node_is_system(node: &editchain_project::HistoryNode) -> bool {
 #[must_use]
 fn node_author(node: &editchain_project::HistoryNode) -> String {
     match node {
-        editchain_project::HistoryNode::EditOperation(op) => op_author_label(op.tags),
+        editchain_project::HistoryNode::EditOperation { op, .. } => op_author_label(op.tags),
         // Collapsed imports carry their author label directly (derived from the
         // children's tags in the projection), since the raw import op's own tags
         // only carry `IMPORT`.
@@ -670,7 +671,7 @@ fn op_author_label(tags: Tags) -> String {
 #[must_use]
 fn node_commit_id(node: &editchain_project::HistoryNode) -> String {
     match node {
-        editchain_project::HistoryNode::EditOperation(op)
+        editchain_project::HistoryNode::EditOperation { op, .. }
         | editchain_project::HistoryNode::CollapsedImport { op, .. } => abbreviate_op_id(&op.id),
         editchain_project::HistoryNode::GitCommit(commit) => abbreviate_oid(&commit.oid),
     }
@@ -1042,18 +1043,16 @@ mod tests {
         let msg = message_op(1, 2, turn.id);
         let meta = import_op(1, 3, true);
 
-        // Hold the test gate so our toggle flip serializes against the other
-        // bundling test running in parallel in this same test binary.
-        let _gate = editchain_project::META_BUNDLE_TEST_GATE.lock().unwrap();
-
-        // This test exercises the sub-op bundling path, which is off by default
-        // now; flip the override on (restored after to keep test isolation).
-        META_BUNDLE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-        let projection = HistoryProjection::from_ops(vec![turn.clone(), msg, meta.clone()]);
+        // q6 Phase-1: bundling is driven by explicit ProjectionOptions, not a global
+        // toggle — no mutex needed; each projection is independently configured.
+        let opts = editchain_project::ProjectionOptions {
+            bundle_metadata: true,
+        };
+        let projection =
+            HistoryProjection::from_ops_with(vec![turn.clone(), msg, meta.clone()], opts);
         let mut ws = Workspace::from_projection(projection);
         let filter = ChainFilter::default();
         let window = ws.history_window(0, 100, false, &filter);
-        META_BUNDLE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
 
         // Parent row + one expanded sub-op row.
         assert_eq!(window.rows.len(), 2);
@@ -1083,10 +1082,6 @@ mod tests {
         let msg = message_op(1, 2, turn.id);
         let meta = import_op(1, 3, true);
 
-        // Hold the test gate so our toggle flips serialize against the other
-        // bundling test running in parallel in this same test binary.
-        let _gate = editchain_project::META_BUNDLE_TEST_GATE.lock().unwrap();
-
         // Default (bundling off): META is a standalone top-level row.
         let projection_off =
             HistoryProjection::from_ops(vec![turn.clone(), msg.clone(), meta.clone()]);
@@ -1108,11 +1103,13 @@ mod tests {
 
         // Opt-in (bundling on, fresh projection so the per-filter node cache is
         // not reused): the same META op renders as an expanded sub-op row.
-        META_BUNDLE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-        let projection_on = HistoryProjection::from_ops(vec![turn.clone(), msg, meta.clone()]);
+        let opts_on = editchain_project::ProjectionOptions {
+            bundle_metadata: true,
+        };
+        let projection_on =
+            HistoryProjection::from_ops_with(vec![turn.clone(), msg, meta.clone()], opts_on);
         let mut ws_on = Workspace::from_projection(projection_on);
         let window_on = ws_on.history_window(0, 100, false, &filter);
-        META_BUNDLE_ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
         let meta_on = window_on
             .rows
             .iter()
@@ -1141,12 +1138,18 @@ mod tests {
         let msg = message_op(5, 6, turn.id); // child of turn
         let meta = import_op(5, 7, true); // bundled under turn
 
-        let projection = HistoryProjection::from_ops(vec![
-            msg.clone(),
-            turn_with_parent.clone(),
-            meta.clone(),
-            parent.clone(),
-        ]);
+        let opts = editchain_project::ProjectionOptions {
+            bundle_metadata: true,
+        };
+        let projection = HistoryProjection::from_ops_with(
+            vec![
+                msg.clone(),
+                turn_with_parent.clone(),
+                meta.clone(),
+                parent.clone(),
+            ],
+            opts,
+        );
         let mut ws = Workspace::from_projection(projection);
         let filter = ChainFilter::default();
         let window = ws.history_window(0, 100, false, &filter);
@@ -1191,5 +1194,100 @@ mod tests {
         let (summary, kind) = sub_op_label(&op);
         assert_eq!(summary, "line one");
         assert_eq!(kind, "tool_result");
+    }
+
+    /// Diagnostic (not run in CI): load a real chain and report how many
+    /// independent chains the projection produces, comparing raw source chains
+    /// (`(OpId.node, OpId.boot)` streams) vs the bundled projection's own
+    /// connected-root count against `metadata` on/off.
+    #[test]
+    #[ignore = "manual diagnostics against a real chain"]
+    #[expect(
+        clippy::print_stderr,
+        reason = "manual diagnostics deliberately print raw chain-level counts to stderr"
+    )]
+    fn diag_chain_counts() {
+        let ops = read_chain_ops(&PathBuf::from(
+            "/mnt/hot/ambientlight/repos/editchain/.editchain",
+        ))
+        .unwrap();
+        eprintln!("\n=== chain diag: {} ops ===", ops.len());
+
+        // Raw source chains = distinct (node, boot) streams among Import ops.
+        let meta_imports = ops
+            .iter()
+            .filter(|o| matches!(o.kind, OpKind::Import(_)))
+            .filter(|o| o.tags.matches_any(Tags::META))
+            .count();
+        eprintln!("meta-tagged raw imports: {meta_imports}");
+        // Show the import tag bitmask distribution so we can see what the old
+        // importer actually stamped (META may be encoded differently or absent).
+        let mut tag_hist: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+        for o in ops.iter().filter(|o| matches!(o.kind, OpKind::Import(_))) {
+            *tag_hist.entry(o.tags.0).or_default() += 1;
+        }
+        let mut sorted_tags: Vec<(u64, usize)> = tag_hist.into_iter().collect();
+        sorted_tags.sort_by_key(|(t, _)| *t);
+        for (t, c) in sorted_tags.iter().take(12) {
+            eprintln!("  import tags {t:#016b} x{c}");
+        }
+
+        let sources: std::collections::HashSet<(u64, u32)> = ops
+            .iter()
+            .filter(|o| matches!(o.kind, OpKind::Import(_)))
+            .map(|o| (o.id.node.0, o.id.boot))
+            .collect();
+        eprintln!(
+            "raw source streams (node,boot) among import ops: {}",
+            sources.len()
+        );
+
+        // Distinct raw import roots (SnapshotTopology: count nodes with no parent
+        // present among import ops) — how many chains the importer actually made.
+        let import_ids: std::collections::HashSet<OpId> = ops
+            .iter()
+            .filter(|o| matches!(o.kind, OpKind::Import(_)))
+            .map(|o| o.id)
+            .collect();
+        let import_roots = ops
+            .iter()
+            .filter(|o| matches!(o.kind, OpKind::Import(_)))
+            .filter(|o| {
+                o.parents.iter().all(|p| !import_ids.contains(p)) // no import parent present => root
+            })
+            .count();
+        eprintln!("raw import roots (no import parent): {import_roots}");
+
+        // Projection counts.
+        for (label, bundle) in [("meta OFF", false), ("meta ON", true)] {
+            let proj = HistoryProjection::from_ops_with(
+                ops.clone(),
+                editchain_project::ProjectionOptions {
+                    bundle_metadata: bundle,
+                },
+            );
+            let rows = proj.nodes().len();
+            let chains = proj.independent_chains();
+            eprintln!("{label}: top_rows={rows} chains={chains}");
+            if bundle {
+                // Client-view root count over one shared meta-ON projection: how
+                // many top-level rows have NO parent that resolves to a present
+                // row, using the SAME lifted `parents` the service emits in
+                // HistoryRow. This is what actually renders as a distinct chain.
+                let nodes = proj.nodes();
+                let present: std::collections::HashSet<String> = nodes
+                    .iter()
+                    .map(editchain_project::HistoryNode::node_key)
+                    .collect();
+                let mut client_roots = 0usize;
+                for node in &nodes {
+                    let lifted = proj.lifted_parent_keys(node);
+                    if lifted.iter().all(|p| !present.contains(p)) {
+                        client_roots += 1;
+                    }
+                }
+                eprintln!("meta ON client-view roots (lifted parents): {client_roots}");
+            }
+        }
     }
 }

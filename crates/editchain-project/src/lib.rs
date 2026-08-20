@@ -8,18 +8,6 @@
 // Crate-level dependency marker (used by Cargo for feature resolution).
 use regex as _;
 
-/// Override to re-enable META-op sub-option bundling for the cross-session
-/// verification hook. Default is `false` — META imports render standalone.
-/// When set (env `EDITCHAIN_META_BUNDLE=1` or this flag flipped by a test),
-/// META imports collapse into the nearest preceding real node as sub-ops.
-pub static META_BUNDLE_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Serializes tests that flip [`META_BUNDLE_ENABLED`] so parallel test threads
-/// in a single unittest binary cannot read a stale toggle mid-flip. Acquire
-/// this guard around any read or write of the toggle in tests.
-pub static META_BUNDLE_TEST_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// General chain filtering with truncation.
 pub mod filter;
 /// Deterministic lane layout for graph rendering.
@@ -31,17 +19,37 @@ use std::collections::HashMap;
 
 use editchain_core::op::NoteRelationship;
 use editchain_core::{
-    Clock, GitCommitEntity, GitOid, GitProjection, Op, OpId, Payload, RepositoryId,
+    Clock, GitCommitEntity, GitOid, GitProjection, NodeId, Op, OpId, Payload, RepositoryId,
 };
 
 use crate::layout::{compute_graph_layout, compute_lane_assignment, GraphLayout, GraphRow};
 use crate::link::link_history;
 
+/// Provenance of a node's effective display time.
+///
+/// q6 Phase-1: source time is nullable and immutable; the projection must never
+/// fabricate a borrowed timestamp for a node whose source time is absent. Display
+/// order may use `Observed` times; `BundleAnchor` never re-orders across chains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveTime {
+    /// A real, valid source timestamp.
+    Observed(u64),
+    /// Inherited from a bundling anchor (metadata sub-op). Never re-sorts across chains.
+    BundleAnchor(u64),
+    /// The source carried no usable timestamp.
+    Unknown,
+}
+
 /// A unified history row — either an `EditChain` operation or a `Git` commit.
 #[derive(Debug, Clone)]
 pub enum HistoryNode {
     /// An `EditChain` operation.
-    EditOperation(Op),
+    EditOperation {
+        /// The underlying operation.
+        op: Op,
+        /// Source time of this record; `Unknown` when the source had none.
+        source_time: EffectiveTime,
+    },
     /// A raw import op collapsed with its normalized children into one node.
     ///
     /// The raw import op forms the linear backbone of a session; its normalized
@@ -51,7 +59,9 @@ pub enum HistoryNode {
     CollapsedImport {
         /// The underlying raw import op (kept for id/clock/parents).
         op: Op,
-        /// Display summary derived from the normalized children.
+        /// Source time of this record; `Unknown` when the source had none.
+        source_time: EffectiveTime,
+        /// Display summary derived from the normalization children.
         summary: String,
         /// Dominant child kind (e.g. "tool", "message", "command") for styling.
         kind: String,
@@ -80,7 +90,7 @@ impl HistoryNode {
     #[must_use]
     pub fn summary(&self) -> String {
         match self {
-            Self::EditOperation(op) => op_summary(op),
+            Self::EditOperation { op, .. } => op_summary(op),
             Self::CollapsedImport {
                 summary, sub_ops, ..
             } => combined_summary(summary, sub_ops),
@@ -96,13 +106,32 @@ impl HistoryNode {
     /// Git commits store `committed_at` in Unix **seconds**; `EditChain` ops
     /// store their clock in Unix **milliseconds**. This converts git seconds
     /// to milliseconds so both render as correct dates.
+    ///
+    /// This returns the *effective* display time (see [`Self::effective_time`]);
+    /// a node whose source time is absent falls back to its bundle-anchor time,
+    /// else 0. The stored `op.clock` is never mutated.
     #[must_use]
     pub fn timestamp_ms(&self) -> u64 {
+        match self.effective_time() {
+            EffectiveTime::Observed(ms) | EffectiveTime::BundleAnchor(ms) => ms,
+            EffectiveTime::Unknown => 0,
+        }
+    }
+
+    /// Returns the effective display time with provenance.
+    ///
+    /// `Observed` is a real source timestamp; `Unknown` means the source had no
+    /// usable time (the projection must not fabricate one); `BundleAnchor` is an
+    /// inherited time on a bundled sub-op and never re-orders across chains.
+    #[must_use]
+    pub fn effective_time(&self) -> EffectiveTime {
         match self {
-            Self::EditOperation(op) | Self::CollapsedImport { op, .. } => op.clock.as_u64(),
+            Self::EditOperation { source_time, .. } | Self::CollapsedImport { source_time, .. } => {
+                *source_time
+            }
             Self::GitCommit(commit) => {
                 let secs = u64::try_from(commit.committed_at).unwrap_or(0);
-                secs.saturating_mul(1000)
+                EffectiveTime::Observed(secs.saturating_mul(1000))
             }
         }
     }
@@ -113,10 +142,14 @@ impl HistoryNode {
     /// follows them, so they interleave correctly instead of clustering at the
     /// top of the history (which would otherwise inflate the lane count). For
     /// ops this sets the clock; for git commits it sets `committed_at` (seconds).
-    pub fn set_effective_timestamp(&mut self, ms: u64) {
+    /// Set a display-only `BundleAnchor` time on an undated node.
+    ///
+    /// Does **not** mutate the stored `op.clock` — provenance only, so the raw op
+    /// never carries a fabricated timestamp (DR invariant 8).
+    pub fn set_bundle_anchor(&mut self, ms: u64) {
         match self {
-            Self::EditOperation(op) | Self::CollapsedImport { op, .. } => {
-                op.clock = Clock::UnixMs(ms);
+            Self::EditOperation { source_time, .. } | Self::CollapsedImport { source_time, .. } => {
+                *source_time = EffectiveTime::BundleAnchor(ms);
             }
             Self::GitCommit(commit) => {
                 let secs = i64::try_from(ms / 1000).unwrap_or(i64::MAX);
@@ -129,7 +162,7 @@ impl HistoryNode {
     #[must_use]
     pub fn op_id(&self) -> Option<OpId> {
         match self {
-            Self::EditOperation(op) | Self::CollapsedImport { op, .. } => Some(op.id),
+            Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => Some(op.id),
             Self::GitCommit(_) => None,
         }
     }
@@ -138,7 +171,7 @@ impl HistoryNode {
     #[must_use]
     pub fn git_oid(&self) -> Option<GitOid> {
         match self {
-            Self::EditOperation(_) | Self::CollapsedImport { .. } => None,
+            Self::EditOperation { .. } | Self::CollapsedImport { .. } => None,
             Self::GitCommit(commit) => Some(commit.oid),
         }
     }
@@ -147,7 +180,7 @@ impl HistoryNode {
     #[must_use]
     pub fn repository(&self) -> Option<RepositoryId> {
         match self {
-            Self::EditOperation(_) | Self::CollapsedImport { .. } => None,
+            Self::EditOperation { .. } | Self::CollapsedImport { .. } => None,
             Self::GitCommit(commit) => Some(commit.repository),
         }
     }
@@ -159,7 +192,7 @@ impl HistoryNode {
     #[must_use]
     pub fn group(&self) -> String {
         match self {
-            Self::EditOperation(op) | Self::CollapsedImport { op, .. } => match op.scope {
+            Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => match op.scope {
                 editchain_core::ScopeRef::Session(sid) => format!("session:{}", sid.0),
                 editchain_core::ScopeRef::None
                 | editchain_core::ScopeRef::Chain(_)
@@ -176,7 +209,7 @@ impl HistoryNode {
     #[must_use]
     pub fn node_key(&self) -> String {
         match self {
-            Self::EditOperation(op) | Self::CollapsedImport { op, .. } => op.id.to_string(),
+            Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => op.id.to_string(),
             Self::GitCommit(commit) => commit.oid.to_hex(),
         }
     }
@@ -198,7 +231,7 @@ impl HistoryNode {
         notes: &HashMap<OpId, Vec<Op>>,
     ) -> Vec<String> {
         match self {
-            Self::EditOperation(op) | Self::CollapsedImport { op, .. } => {
+            Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => {
                 let mut keys: Vec<String> = op.parents.iter().map(ToString::to_string).collect();
                 if let Some(links) = git_links.get(&op.id) {
                     for link in links {
@@ -231,7 +264,7 @@ impl HistoryNode {
     )]
     pub fn set_parent_keys(&mut self, keys: &[String]) {
         match self {
-            Self::EditOperation(op) | Self::CollapsedImport { op, .. } => {
+            Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => {
                 let mut ids: Vec<OpId> = keys
                     .iter()
                     .filter_map(|k| OpId::from_display_str(k))
@@ -261,7 +294,7 @@ impl HistoryNode {
     pub fn sub_ops(&self) -> &[Op] {
         match self {
             Self::CollapsedImport { sub_ops, .. } => sub_ops,
-            Self::EditOperation(_) | Self::GitCommit(_) => &[],
+            Self::EditOperation { .. } | Self::GitCommit(_) => &[],
         }
     }
 
@@ -273,7 +306,7 @@ impl HistoryNode {
     pub fn kind(&self) -> String {
         use editchain_core::OpKind;
         match self {
-            Self::EditOperation(op) => match &op.kind {
+            Self::EditOperation { op, .. } => match &op.kind {
                 OpKind::ChainStart(_) => "chainstart".to_string(),
                 OpKind::Actor(_) => "actor".to_string(),
                 OpKind::Message(_) => "message".to_string(),
@@ -308,20 +341,64 @@ pub struct HistoryProjection {
     /// virtual edges so fork/subagent branches render without mutating stored
     /// `Op.parents` (SPEC §1.1, §5).
     relationship_notes: HashMap<OpId, Vec<Op>>,
+    /// Explicit projection options (bundling policy, etc.). Threaded through so
+    /// projection behavior is deterministic and a real cache key — never global.
+    options: ProjectionOptions,
+    /// Cached collapsed (top-level-row) projection. Computed lazily because it is
+    /// expensive (~linear in op count) and called from several per-row paths
+    /// (`ordered_nodes`, `independent_chains`, `lifted_parent_keys`, layout).
+    /// Recomputed and re-cached on the few mutation points (`link_history`). A
+    /// `CollapsedProjection` is cheaper to clone than to rebuild, so per-node
+    /// callers can `clone()` it instead of recomputing. `RefCell` lets the
+    /// memoized `collapsed()` accessor populate it from `&self` without forcing
+    /// every caller to be `&mut self`. An all-empty `Default` value marks "not
+    /// yet built"; a real chain always has at least one node.
+    collapsed: std::cell::RefCell<CollapsedProjection>,
+}
+
+/// Result of collapsing raw imports into top-level history rows.
+///
+/// Alongside the rows carries the reversible bundle membership maps so layout/filter
+/// can preserve chain continuity when a child's parent is a bundled META op — without
+/// ever rewriting stored `Op.parents`.
+#[derive(Debug, Clone, Default)]
+struct CollapsedProjection {
+    /// Top-level rows (raw imports collapsed; META records bundled away).
+    nodes: Vec<HistoryNode>,
+    /// Bundled META op id -> its anchor op id (lift a missing parent onto the row).
+    representative: HashMap<OpId, OpId>,
+    /// Precomputed `node_key` set of every top-level row (the "present" rows
+    /// used to decide whether a lifted/raw parent resolves to a rendered row).
+    /// Built once here so per-row paths (lift/layout) don't rebuild it each call.
+    present: std::collections::HashSet<String>,
+}
+
+/// Explicit, versionable options controlling projection behavior.
+///
+/// q6 Phase-1: replaces the process-global `META_BUNDLE_ENABLED` toggle. Bundling
+/// stays OFF by default; when enabled it is scoped per source chain and never
+/// touches stored `Op.parents`/clocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProjectionOptions {
+    /// Whether metadata-only raw imports bundle as sub-ops of their own source
+    /// chain's nearest eligible dated content row. Default `false`.
+    pub bundle_metadata: bool,
 }
 
 impl HistoryProjection {
-    /// Create an empty projection.
+    /// Create an empty projection with default options.
     #[must_use]
     pub fn new() -> Self {
         Self {
             ops: Vec::new(),
             git: GitProjection::new(),
             relationship_notes: HashMap::new(),
+            options: ProjectionOptions::default(),
+            collapsed: std::cell::RefCell::new(CollapsedProjection::default()),
         }
     }
 
-    /// Build a projection from a set of operations.
+    /// Build a projection from a set of operations with default options.
     ///
     /// Operations are stored in input order; git commits are projected into
     /// the `GitProjection` keyed by `(RepositoryId, GitOid)`. Structural
@@ -329,6 +406,15 @@ impl HistoryProjection {
     /// virtual graph edges.
     #[must_use]
     pub fn from_ops(ops: Vec<Op>) -> Self {
+        Self::from_ops_with(ops, ProjectionOptions::default())
+    }
+
+    /// Build a projection from a set of operations with explicit options.
+    ///
+    /// Options are a cache key: two projections built from the same ops with
+    /// different options may render differently but only per that option.
+    #[must_use]
+    pub fn from_ops_with(ops: Vec<Op>, options: ProjectionOptions) -> Self {
         let mut git = GitProjection::new();
         let mut relationship_notes: HashMap<OpId, Vec<Op>> = HashMap::new();
         for op in &ops {
@@ -346,6 +432,8 @@ impl HistoryProjection {
             ops,
             git,
             relationship_notes,
+            options,
+            collapsed: std::cell::RefCell::new(CollapsedProjection::default()),
         }
     }
 
@@ -391,6 +479,41 @@ impl HistoryProjection {
         filter::apply(&nodes, &self.git.links, &self.relationship_notes, filter)
     }
 
+    /// Returns the number of independent (disconnected) chains among the top-level
+    /// rows, matching how the source Claude Code sessions/streams are expected to
+    /// break down.
+    ///
+    /// IMPORTANT: a child whose stored parent is a bundled META op is counted as
+    /// connected to the META op's anchor (same lift as [`Self::ordered_nodes`]), so
+    /// bundling metadata does NOT fragment a source chain into extra roots.
+    #[must_use]
+    pub fn independent_chains(&self) -> usize {
+        let guard = self.collapsed();
+        let collapsed: CollapsedProjection = (*guard).clone();
+        let mut nodes: Vec<HistoryNode> = collapsed.nodes;
+        for commit in self.git.commits.values() {
+            nodes.push(HistoryNode::GitCommit(commit.clone()));
+        }
+        let present: std::collections::HashSet<String> =
+            nodes.iter().map(HistoryNode::node_key).collect();
+        let roots: Vec<&HistoryNode> = nodes
+            .iter()
+            .filter(|node| {
+                node.parent_keys(&self.git.links, &self.relationship_notes)
+                    .into_iter()
+                    .all(|parent| {
+                        // A parent only makes this node non-root if it resolves to a
+                        // present row (directly or via a bundled-META representative).
+                        let resolved = OpId::from_display_str(&parent)
+                            .and_then(|pid| collapsed.representative.get(&pid).copied())
+                            .map_or_else(|| parent.clone(), |rep| rep.to_string());
+                        !present.contains(&resolved)
+                    })
+            })
+            .collect();
+        roots.len()
+    }
+
     /// Returns a window of history nodes (newest-first).
     ///
     /// The window is a slice of the canonical topologically-sorted ordering,
@@ -421,8 +544,10 @@ impl HistoryProjection {
         // Raw import ops are collapsed with their normalized children into a
         // single node so the graph reads as a clean chain rather than a dense
         // star per source line.
+        let guard = self.collapsed();
+        let collapsed: CollapsedProjection = (*guard).clone();
         let mut nodes: Vec<HistoryNode> = Vec::with_capacity(self.len());
-        for op in self.collapsed_ops().into_iter().rev() {
+        for op in collapsed.nodes.into_iter().rev() {
             nodes.push(op);
         }
         for commit in self.git.commits.values() {
@@ -436,6 +561,12 @@ impl HistoryProjection {
         // not block. We emit parents before children, then reverse the result so
         // the final list is newest-first — guaranteeing every edge that *can* be
         // drawn points downward (child above, parent below).
+        //
+        // Chain continuity after META bundling: a child may have a causal parent
+        // that is a bundled META op (not present in `nodes`). Resolve that parent
+        // through `representative` to the absorbing anchor row, so the child stays
+        // connected to its source chain instead of fragmenting into a new root.
+        // This lifts the edge WITHOUT rewriting stored `Op.parents`.
         let present: std::collections::HashSet<String> =
             nodes.iter().map(HistoryNode::node_key).collect();
         let node_by_key: HashMap<String, HistoryNode> =
@@ -449,8 +580,12 @@ impl HistoryProjection {
             let key = node.node_key();
             let _ = indegree.entry(key.clone()).or_insert(0);
             for parent in node.parent_keys(&self.git.links, &self.relationship_notes) {
-                if present.contains(&parent) {
-                    children_of.entry(parent).or_default().push(key.clone());
+                // Resolve a parent that was bundled away to its anchor row's id.
+                let resolved = OpId::from_display_str(&parent)
+                    .and_then(|pid| collapsed.representative.get(&pid).copied())
+                    .map_or_else(|| parent.clone(), |rep| rep.to_string());
+                if present.contains(&resolved) {
+                    children_of.entry(resolved).or_default().push(key.clone());
                     *indegree.entry(key.clone()).or_insert(0) += 1;
                 }
             }
@@ -532,7 +667,7 @@ impl HistoryProjection {
         // Reverse to newest-first.
         sorted_oldest_first.reverse();
 
-        // Assign effective timestamps to nodes that lack one (timestamp_ms() == 0).
+        // Assign BLOCK-ORDER display anchors to nodes whose source time is unknown.
         // Undated nodes (metadata headers like `custom-title`, `mode`, and
         // `file-history-snapshot`) are anchored to their OWN session's dated
         // range, not to the global-newest date. The old global walk gave every
@@ -541,14 +676,15 @@ impl HistoryProjection {
         // inherited the newest corpus date (Aug 5) and floated to the top of the
         // timeline — visually mixing an old session into the newest cluster.
         //
-        // Fix: an undated node is given its session's OLDEST dated timestamp (the
-        // start of its own session's timeline), so it stays with its session.
-        // Sessions with no dated ops stay undated. Git commits and unscoped ops
-        // are not re-dated (git dates can be genuinely old, and unscoped ops have
-        // no session to anchor to).
+        // q6 Phase-1 change: this records a `BundleAnchor` display time instead of
+        // rewriting the stored `op.clock` (DR: never rewrite clocks; time stays
+        // nullable and immutable with provenance). `BundleAnchor` participates in
+        // display order but never re-orders across chains, and the raw op keeps no
+        // fabricated timestamp. Sessions with no dated ops stay undated (`Unknown`).
+        // Git commits and unscoped ops are not re-dated.
         let mut session_first_ts: HashMap<String, u64> = HashMap::new();
         for node in &sorted_oldest_first {
-            if node.timestamp_ms() == 0 || node.git_oid().is_some() {
+            if matches!(node.effective_time(), EffectiveTime::Unknown) || node.git_oid().is_some() {
                 continue;
             }
             if node.group().starts_with("session:") {
@@ -556,12 +692,8 @@ impl HistoryProjection {
                 *entry = (*entry).min(node.timestamp_ms());
             }
         }
-        // Anchor undated nodes. Every session-scoped undated node is given its
-        // session's oldest dated timestamp, so all of a session's metadata headers
-        // sit with their own session rather than floating to the global newest.
-        // Sessions with no dated ops stay undated (there is nothing to anchor to).
         for node in &mut sorted_oldest_first {
-            if node.timestamp_ms() != 0 {
+            if !matches!(node.effective_time(), EffectiveTime::Unknown) {
                 continue;
             }
             let group = node.group();
@@ -569,7 +701,9 @@ impl HistoryProjection {
                 && session_first_ts.get(&group).copied().unwrap_or(0) != 0
             {
                 let anchor = session_first_ts.get(&group).copied().unwrap_or(0);
-                node.set_effective_timestamp(anchor);
+                // Record as a BundleAnchor display time — clone is a display-only
+                // provenance, not a clock mutation.
+                node.set_bundle_anchor(anchor);
             }
         }
 
@@ -594,13 +728,15 @@ impl HistoryProjection {
     /// (e.g. `ChainStart`, git-link records) are kept as-is.
     ///
     /// Metadata-only raw imports (tagged `META`) render as their own top-level
-    /// nodes by default so unrelated chains never group together. When META
-    /// bundling is explicitly re-enabled (`EDITCHAIN_META_BUNDLE=1` or the
-    /// `META_BUNDLE_ENABLED` override), they are instead bundled as sub-ops of
-    /// the nearest preceding real turn/tool node (attached to that node's
-    /// `sub_ops` and dropped from the top-level list).
+    /// nodes by default so unrelated chains never group together. When
+    /// [`ProjectionOptions::bundle_metadata`] is enabled they are instead
+    /// bundled as sub-ops of the nearest preceding real turn/tool node **within
+    /// the same `(OpId.node, OpId.boot)` source chain** — never across sessions
+    /// — attached to that node's `sub_ops` and dropped from the top-level list.
+    /// Bundling never rewrites stored `Op.parents` or clocks; chain continuity
+    /// through a bundled op is resolved by the representative map.
     #[must_use]
-    fn collapsed_ops(&self) -> Vec<HistoryNode> {
+    fn collapsed_ops(&self) -> CollapsedProjection {
         // Set of raw import op ids (the linear backbone).
         let import_ids: std::collections::HashSet<OpId> = self
             .ops
@@ -626,23 +762,25 @@ impl HistoryProjection {
         }
 
         // Build top-level nodes in input order, bundling META imports into the
-        // nearest preceding real turn/tool node.
+        // nearest preceding real turn/tool row **within the same source chain**.
         //
-        // A "real" node is a non-META import (a turn/tool with content) or a
-        // standalone non-import op. META imports attach to the most recent real
-        // node seen so far; if none exists yet (metadata before any turn), they
-        // stay standalone so the session header records aren't lost.
+        // The per-chain key is `(OpId.node, OpId.boot)` — the DR "immediate safe
+        // milestone" (q6 §6). A single global cursor is the bug that cross-bundled
+        // unrelated sessions; a chain-scoped cursor never does. Branch or
+        // concurrent-writer ambiguity stays standalone until full execution/path
+        // resolution (Phase 3).
         //
-        // When a META import is bundled (dropped from the top-level list), its
-        // CHILDREN must be re-parented to the node it bundled into — otherwise a
-        // child that pointed at the dropped META op dangles and severs the chain.
-        // We record each bundled META op id -> its replacement parent id, then
-        // splice children's parents in a second pass.
+        // A META record bundles only if its own chain already has an anchor; it is
+        // attached as a sub-op of that anchor and recorded in the membership map.
+        // Storage `Op.parents` and `Clock` are NEVER rewritten (DR: bundling must
+        // not splice parents or clocks). A child that points at a bundled META op
+        // keeps pointing at it; layout resolves it through `bundle_representative`.
         let mut result: Vec<HistoryNode> = Vec::with_capacity(self.ops.len());
-        // Index of the most recent real node in `result` that can accept sub-ops.
-        let mut last_real: Option<usize> = None;
-        // Bundled META op id -> the id of the real node it was folded into.
-        let mut meta_replacement: HashMap<OpId, OpId> = HashMap::new();
+        // Per (node, boot) chain: index in `result` of the last eligible anchor.
+        let mut anchors: HashMap<(NodeId, u32), usize> = HashMap::new();
+        // Entity(op id) -> anchor OP ID (stable, not a row index) so layout can
+        // lift edges whose parent is a bundled META op onto the absorbing row.
+        let mut representative: HashMap<OpId, OpId> = HashMap::new();
         for op in &self.ops {
             // Structural relationship notes (ForkOf/SubagentOf/ReconnectsTo) are
             // pure edge bookkeeping — they never render as rows themselves, only
@@ -652,72 +790,64 @@ impl HistoryProjection {
                 continue;
             }
             if matches!(op.kind, editchain_core::OpKind::Import(_)) {
+                let chain = (op.id.node, op.id.boot);
                 let is_meta = op.tags.matches_any(editchain_core::Tags::META);
-                // META bundling is OFF by default so unrelated chains never group
-                // together in the viewer (a cross-session META op bundled into a
-                // real node of a different session). Only re-enabled explicitly via
-                // `EDITCHAIN_META_BUNDLE=1` or the test override.
-                let enable_bundle = std::env::var_os("EDITCHAIN_META_BUNDLE").is_some()
-                    || META_BUNDLE_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
-                if is_meta && enable_bundle {
-                    // Bundle into the nearest preceding real node if one exists.
-                    if let Some(idx) = last_real {
+                let is_structural = op.tags.matches_any(editchain_core::Tags::STRUCTURAL);
+                // Only bundling metadata bundles; structural/diagnostic/unknown and
+                // ordinary content records are their own rows.
+                if is_meta && self.options.bundle_metadata {
+                    // Bundle only into THIS chain's anchor, if one exists.
+                    if let Some(idx) = anchors.get(&chain).copied() {
                         if let Some(HistoryNode::CollapsedImport {
-                            op: parent_op,
+                            op: anchor,
                             sub_ops,
                             ..
                         }) = result.get_mut(idx)
                         {
                             sub_ops.push(op.clone());
-                            let _: Option<OpId> = meta_replacement.insert(op.id, parent_op.id);
+                            let _: Option<OpId> = representative.insert(op.id, anchor.id);
+                            // Never an anchor itself (metadata is never an anchor).
+                            continue;
                         }
-                        continue;
                     }
-                    // No real parent yet — fall through to standalone below.
+                    // Leading metadata with no anchor in THIS chain: render
+                    // standalone on its own chain (a same-chain preamble) — never
+                    // forward-attached and never cross-chain. It is NOT an anchor.
                 }
                 let children = children_of.get(&op.id);
                 let summary = collapsed_import_summary(op, children);
                 let kind = collapsed_import_kind(children);
                 let author = collapsed_import_author(children);
+                // A META/structural record that falls through is standalone and is
+                // NOT an anchor. Only a dated content-bearing import becomes one.
+                let source_time = source_time_of(op);
+                let is_anchor_eligible = !is_meta && !is_structural;
                 let idx = result.len();
                 result.push(HistoryNode::CollapsedImport {
                     op: op.clone(),
+                    source_time,
                     summary,
                     kind,
                     author,
                     sub_ops: Vec::new(),
                 });
-                last_real = Some(idx);
+                if is_anchor_eligible {
+                    let _: Option<usize> = anchors.insert(chain, idx);
+                }
             } else if folded.contains(&op.id) {
                 // Drop normalized ops folded into their parent import op.
             } else {
                 // Standalone op (e.g. ChainStart, or a message not tied to an
-                // import) — keep as-is.
+                // import) — keep as-is. It is a content/structural row and anchors
+                // its chain for subsequent metadata.
+                let source_time = source_time_of(op);
                 let idx = result.len();
-                result.push(HistoryNode::EditOperation(op.clone()));
-                last_real = Some(idx);
-            }
-        }
-
-        // Splice pass: re-parent any node whose parent was a bundled META op so
-        // it points at the real node that absorbed that META op. This keeps each
-        // chain continuous across dropped metadata records.
-        if !meta_replacement.is_empty() {
-            for node in &mut result {
-                // The splice maps causal parents (incl. virtual note targets) that
-                // pointed at a bundled META op onto the real node that absorbed it.
-                let keys = node.parent_keys(&self.git.links, &self.relationship_notes);
-                let mut spliced: Vec<String> = keys
-                    .iter()
-                    .map(|k| {
-                        OpId::from_display_str(k)
-                            .and_then(|id| meta_replacement.get(&id).copied())
-                            .map_or_else(|| k.clone(), |repl| repl.to_string())
-                    })
-                    .collect();
-                spliced.sort_unstable();
-                spliced.dedup();
-                node.set_parent_keys(&spliced);
+                result.push(HistoryNode::EditOperation {
+                    op: op.clone(),
+                    source_time,
+                });
+                let chain = (op.id.node, op.id.boot);
+                let _: Option<usize> = anchors.insert(chain, idx);
             }
         }
 
@@ -729,7 +859,7 @@ impl HistoryProjection {
         // import op. We attach the result's Tool op to the call's `sub_ops` and
         // drop the result from the top-level list, splicing its children to the
         // call (same technique as META bundling) so chain continuity holds.
-        self.group_tool_results(&mut result, &children_of);
+        self.group_tool_results(&mut result, &children_of, &mut representative);
 
         // Fork-prologue fold: a session that FORKS off a trunk carries its own
         // copy of the shared prologue (the backlog before the divergence point).
@@ -741,7 +871,28 @@ impl HistoryProjection {
         // duplicated prologue never appears twice.
         self.fold_fork_prologues(&mut result);
 
-        result
+        CollapsedProjection {
+            present: row_node_keys(&result),
+            nodes: result,
+            representative,
+        }
+    }
+
+    /// Memoized collapsed projection.
+    ///
+    /// Computes `collapsed_ops()` once and reuses it across the many callers that
+    /// otherwise rebuilt it per row/query. Callers may `clone()` the returned
+    /// value only when they need owned rows; call sites that need just the lift
+    /// maps or the "present" key set should take a reference (cheaper, no alloc).
+    /// Invalidated by `link_history` (which edits `self.ops`).
+    fn collapsed(&self) -> std::cell::Ref<'_, CollapsedProjection> {
+        // Cheap check against an empty placeholder so we only rebuild when never
+        // built (or after `link_history` invalidation). `nodes` is always
+        // non-empty for a real chain; a `len()==0` placeholder marks "not built".
+        if self.collapsed.borrow().nodes.is_empty() {
+            *self.collapsed.borrow_mut() = self.collapsed_ops();
+        }
+        self.collapsed.borrow()
     }
 
     /// Fold each fork branch's pre-boundary prologue into the trunk it branches
@@ -848,6 +999,7 @@ impl HistoryProjection {
         &self,
         result: &mut Vec<HistoryNode>,
         children_of: &HashMap<OpId, Vec<&Op>>,
+        representative: &mut HashMap<OpId, OpId>,
     ) {
         // Map node key -> index in `result`.
         let mut index_of: HashMap<String, usize> = HashMap::with_capacity(result.len());
@@ -896,6 +1048,15 @@ impl HistoryProjection {
                     }
                     let _: bool = drop_idx.insert(i);
                 }
+            }
+        }
+
+        // If any META op bundled into a tool-result row that is now being folded into
+        // its call, re-point the representative to the call so the lift in
+        // `ordered_nodes`/`independent_chains` still reaches a present row.
+        for value in representative.values_mut() {
+            if let Some(repl) = replacement.get(value) {
+                *value = *repl;
             }
         }
 
@@ -1031,6 +1192,8 @@ impl HistoryProjection {
             let entry = self.git.links.entry(link.source).or_default();
             entry.push(link);
         }
+        // `self.ops` changed (stitching) — the collapsed cache is now stale.
+        self.collapsed = std::cell::RefCell::new(CollapsedProjection::default());
     }
 
     /// Compute the graph layout for rendering unified history.
@@ -1055,9 +1218,16 @@ impl HistoryProjection {
         let keys = Self::layout_keys(sorted);
         let key_to_node = Self::layout_index(sorted);
         let links = &self.git.links;
+        let collapsed = self.collapsed();
+        let present = row_node_keys(&collapsed.nodes);
+        let representative = &collapsed.representative;
         let parents_of = |key: &str| -> Vec<String> {
             key_to_node.get(key).map_or(Vec::new(), |n| {
-                n.parent_keys(links, &self.relationship_notes)
+                lift_parents(
+                    n.parent_keys(links, &self.relationship_notes),
+                    representative,
+                    &present,
+                )
             })
         };
         let is_git =
@@ -1094,9 +1264,16 @@ impl HistoryProjection {
         let keys = Self::layout_keys(sorted);
         let key_to_node = Self::layout_index(sorted);
         let links = &self.git.links;
+        let collapsed = self.collapsed();
+        let present = row_node_keys(&collapsed.nodes);
+        let representative = &collapsed.representative;
         let parents_of = |key: &str| -> Vec<String> {
             key_to_node.get(key).map_or(Vec::new(), |n| {
-                n.parent_keys(links, &self.relationship_notes)
+                lift_parents(
+                    n.parent_keys(links, &self.relationship_notes),
+                    representative,
+                    &present,
+                )
             })
         };
         let is_git =
@@ -1113,6 +1290,48 @@ impl HistoryProjection {
     fn layout_index(sorted: &[HistoryNode]) -> HashMap<String, &HistoryNode> {
         sorted.iter().map(|n| (n.node_key(), n)).collect()
     }
+
+    /// Return this node's parent keys resolved through the META-bundle lift, so a
+    /// parent that was bundled away is redirected to its present anchor row.
+    ///
+    /// Used by the service when emitting `HistoryRow::parents` so the client's
+    /// chain assembly sees connected chains, not dangling bundled-META parents.
+    pub fn lifted_parent_keys(&self, node: &HistoryNode) -> Vec<String> {
+        let collapsed = self.collapsed();
+        lift_parents(
+            node.parent_keys(&self.git.links, &self.relationship_notes),
+            &collapsed.representative,
+            &collapsed.present,
+        )
+    }
+}
+
+/// Collect the node keys of collapsed top-level rows (the "present" set used to
+/// decide whether a parent resolves to a rendered row).
+fn row_node_keys(nodes: &[HistoryNode]) -> std::collections::HashSet<String> {
+    nodes.iter().map(HistoryNode::node_key).collect()
+}
+
+/// Resolve each parent key through the META-bundle representative map: a parent
+/// that was bundled away (a META sub-op not present as a row) is redirected to
+/// its anchor row's op id. Parents that remain absent (external/unresolved) are
+/// kept as-is — the caller drops them via row lookup. This never rewrites stored
+/// `Op.parents`; it is a layout-time lift only.
+fn lift_parents(
+    parents: Vec<String>,
+    representative: &HashMap<OpId, OpId>,
+    present: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    parents
+        .into_iter()
+        .map(|parent| {
+            let lifted = OpId::from_display_str(&parent)
+                .and_then(|pid| representative.get(&pid).copied())
+                .map(|rep| rep.to_string())
+                .filter(|rep| present.contains(rep));
+            lifted.unwrap_or(parent)
+        })
+        .collect()
 }
 
 /// Produce a short summary for an `EditChain` operation.
@@ -1208,6 +1427,26 @@ fn tool_result_summary(content: &str) -> String {
         line = cut;
     }
     line
+}
+
+/// Decode the effective source time of an op, distinguishing `Observed` from
+/// `Unknown`.
+///
+/// A record is `Unknown` when either the importer tagged `SOURCE_TIME_UNKNOWN`
+/// (absent/invalid source timestamp) or the op carries no usable clock value
+/// (`Clock::None`, or `UnixMs(0)` — the legacy "undated" marker). The stored
+/// `Clock` is never rewritten; this only records provenance.
+fn source_time_of(op: &Op) -> EffectiveTime {
+    let unknown = op
+        .tags
+        .matches_any(editchain_core::Tags::SOURCE_TIME_UNKNOWN)
+        || matches!(op.clock, Clock::None)
+        || op.clock.as_u64() == 0;
+    if unknown {
+        EffectiveTime::Unknown
+    } else {
+        EffectiveTime::Observed(op.clock.as_u64())
+    }
 }
 
 /// Derive a display summary for a collapsed import op from its normalized

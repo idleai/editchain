@@ -38,6 +38,16 @@ impl Tags {
     /// Metadata-only record (no user-facing content) — bundled as a sub-op of
     /// a real turn/tool node rather than occupying its own graph row/lane.
     pub const META: Self = Self(1 << 12);
+    /// Structural/pointer record (e.g. `compact_boundary`, checkpoint) that
+    /// shapes the graph but carries no prose to read. It is NOT bundling
+    /// metadata — it stays visible top-level.
+    pub const STRUCTURAL: Self = Self(1 << 13);
+    /// Diagnostic record (e.g. `api_error`, `informational` system events) that
+    /// stays visible so nothing content-bearing is hidden by metadata folding.
+    pub const DIAGNOSTIC: Self = Self(1 << 14);
+    /// The raw source record carried no usable timestamp (absent or unparseable).
+    /// Distinct from `Clock::UnixMs(0)`, which we treat as confident "epoch".
+    pub const SOURCE_TIME_UNKNOWN: Self = Self(1 << 15);
 
     /// Returns true if any of the given tags are set.
     #[must_use]
@@ -82,6 +92,9 @@ impl core::fmt::Display for Tags {
             (Self::PRIVATE, "private"),
             (Self::LARGE_PAYLOAD, "large_payload"),
             (Self::META, "meta"),
+            (Self::STRUCTURAL, "structural"),
+            (Self::DIAGNOSTIC, "diagnostic"),
+            (Self::SOURCE_TIME_UNKNOWN, "source_time_unknown"),
         ];
         for (tag, name) in &pairs {
             if self.matches_any(*tag) {

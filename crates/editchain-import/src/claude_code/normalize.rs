@@ -17,19 +17,37 @@ use super::envelope::{CcContentBlock, CcEnvelope};
 use crate::ids::{derive_actor_id, derive_session_id, SourcePosition, SourceStream};
 use crate::sink::{payload_for, BlobSink};
 
-/// Whether a Claude Code record carries only metadata (no user-facing content).
+/// Semantic class of a Claude Code record, replacing a single `META` boolean so
+/// the projection can distinguish content (must stay visible) from bundling
+/// metadata (folds under a real turn), structural pointers (visible, graph-
+/// shaping), diagnostics (visible), and unknown records (visible standalone).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RecordClass {
+    /// User-facing content: user/assistant messages with prose, `tool_use`,
+    /// `tool_result`, file content, reflection/boundary that users read.
+    Content,
+    /// Metadata that belongs beneath a real turn — bundled as a sub-op. Never a
+    /// layout anchor on its own.
+    BundleMetadata,
+    /// Pointer/sidecar records that shape the graph but carry no prose to read.
+    StructuralMetadata,
+    /// Records that stay visible but are not user turns (errors, informational).
+    Diagnostic,
+    /// Record type not recognized. Defaults to visible standalone.
+    Unknown,
+}
+
+/// Classify a Claude Code envelope into a [`RecordClass`].
 ///
-/// Metadata records (e.g. `last-prompt`, `permission-mode`, `custom-title`,
-/// `mode`, `agent-name`, `file-history-snapshot`, `queue-operation`, and
-/// telemetry `system` subtypes) are bundled as sub-ops of a real turn/tool node
-/// rather than occupying their own graph row/lane. They are tagged `META` so the
-/// projection can group them without re-parsing the raw JSONL.
-///
-/// This also covers whitespace-only assistant turns — streaming artifacts where
-/// the model emitted only newlines before a tool call. They carry no user-facing
-/// content and are bundled like metadata.
+/// `BundleMetadata` records (e.g. `last-prompt`, `permission-mode`,
+/// `custom-title`, `mode`, `agent-name`, `file-history-snapshot`,
+/// `queue-operation`, telemetry `system` subtypes, whitespace-only assistant
+/// streaming artifacts, and environment/listing attachments) are bundled as
+/// sub-ops of a real turn/tool node rather than occupying their own graph
+/// row/lane. They are tagged `META` so the projection can group them without
+/// re-parsing the raw JSONL.
 #[must_use]
-pub fn is_metadata_record(env: &CcEnvelope) -> bool {
+pub fn record_class(env: &CcEnvelope) -> RecordClass {
     match env.record_type.as_str() {
         "last-prompt"
         | "permission-mode"
@@ -38,22 +56,23 @@ pub fn is_metadata_record(env: &CcEnvelope) -> bool {
         | "agent-name"
         | "file-history-snapshot"
         | "queue-operation"
-        | "ai-title" => true,
-        // Telemetry / informational system records carry no user-facing prose.
-        "system" => matches!(
-            env.subtype.as_str(),
-            "turn_duration"
-                | "away_summary"
-                | "local_command"
-                | "scheduled_task_fire"
-                | "informational"
-        ),
+        | "ai-title" => RecordClass::BundleMetadata,
+        // Telemetry system records carry no user-facing prose — bundle.
+        "system" => match env.subtype.as_str() {
+            "turn_duration" | "local_command" | "scheduled_task_fire" => {
+                RecordClass::BundleMetadata
+            }
+            // API errors and informational events carry prose worth keeping — visible.
+            "api_error" | "informational" => RecordClass::Diagnostic,
+            // Compaction/checkpoint boundaries shape the graph but aren't content.
+            "compact_boundary" | "away_summary" => RecordClass::StructuralMetadata,
+            _ => RecordClass::Unknown,
+        },
         // A whitespace-only assistant turn (no tool call, no meaningful text) is
         // a streaming artifact with no content — bundle it like metadata.
-        "assistant" => is_whitespace_only_assistant(env),
+        "assistant" if is_whitespace_only_assistant(env) => RecordClass::BundleMetadata,
         // Attachment records that carry environment/listing metadata rather than
-        // user-facing content (agent/skill/MCP listings, reminders, plan-mode
-        // transitions, diagnostics) — bundle them like metadata.
+        // user-facing content — bundle them like metadata.
         "attachment" => matches!(
             env.attachment_type.as_str(),
             "task_reminder"
@@ -67,10 +86,26 @@ pub fn is_metadata_record(env: &CcEnvelope) -> bool {
                 | "read_truncation_notice"
                 | "plan_mode"
                 | "plan_mode_exit"
-                | "diagnostics"
-        ),
-        _ => false,
+        )
+        .then(|| RecordClass::BundleMetadata)
+        .unwrap_or(if env.attachment_type == "diagnostics" {
+            RecordClass::Diagnostic
+        } else {
+            RecordClass::Content
+        }),
+        // Legacy `is_metadata_record` entry point.
+        _ => RecordClass::Content,
     }
+}
+
+/// Whether a Claude Code record carries only metadata (no user-facing content).
+///
+/// Retained as a convenience over [`record_class`] so existing callers/tests
+/// keep working. Metadata records are bundled as sub-ops of a real turn/tool
+/// node rather than occupying their own graph row/lane.
+#[must_use]
+pub fn is_metadata_record(env: &CcEnvelope) -> bool {
+    record_class(env) == RecordClass::BundleMetadata
 }
 
 /// Whether an assistant record is a whitespace-only streaming artifact.
@@ -150,8 +185,13 @@ pub fn normalize_envelope(
 ) -> (Op, Vec<Op>) {
     let raw_pos = SourcePosition::raw(seq);
     let op_id = stream.op_from_position(raw_pos).unwrap();
-    let timestamp = parse_timestamp(&env.timestamp);
-    let clock = Clock::UnixMs(timestamp);
+    let timestamp = parse_source_time(&env.timestamp);
+    // `parse_source_time` returns `None` when the source timestamp is absent or
+    // unparseable. Keep `Clock::UnixMs(0)` for codec/ordering compatibility but
+    // set `Tags::SOURCE_TIME_UNKNOWN` so the projection can distinguish "absent"
+    // from a confident epoch and never fabricate a borrowed time.
+    let clock = Clock::UnixMs(timestamp.unwrap_or(0));
+    let source_time_unknown = timestamp.is_none();
 
     // Some metadata records (e.g. `file-history-snapshot`, `mode`, `agent-name`)
     // carry no `sessionId`/`session_id` field. Without a fallback they would all
@@ -189,8 +229,14 @@ pub fn normalize_envelope(
 
     // Raw import op.
     let mut raw_tags = Tags::IMPORT;
-    if is_metadata_record(env) {
-        raw_tags |= Tags::META;
+    if source_time_unknown {
+        raw_tags |= Tags::SOURCE_TIME_UNKNOWN;
+    }
+    match record_class(env) {
+        RecordClass::BundleMetadata => raw_tags |= Tags::META,
+        RecordClass::StructuralMetadata => raw_tags |= Tags::STRUCTURAL,
+        RecordClass::Diagnostic => raw_tags |= Tags::DIAGNOSTIC,
+        RecordClass::Content | RecordClass::Unknown => {}
     }
     let raw_op = Op {
         id: op_id,
@@ -581,13 +627,25 @@ fn extract_text_content(blocks: &[CcContentBlock]) -> String {
 
 /// Parse a timestamp string into Unix milliseconds.
 ///
-/// Returns 0 if the string is empty or unparseable.
+/// Returns 0 if the string is empty or unparseable (legacy behavior — callers
+/// that need to distinguish "absent/invalid" from a confident epoch should use
+/// [`parse_source_time`] instead).
 #[must_use]
 pub fn parse_timestamp(ts_str: &str) -> u64 {
+    parse_source_time(ts_str).unwrap_or(0)
+}
+
+/// Parse a source timestamp string into Unix milliseconds, returning `None`
+/// when the timestamp is absent or unparseable (nullable source time).
+///
+/// This is the q6 Phase-1 entry point: invalid or absent time stays `None` and
+/// the projection records it as `Unknown`, never fabricating a borrowed time.
+#[must_use]
+pub fn parse_source_time(ts_str: &str) -> Option<u64> {
     if ts_str.is_empty() {
-        return 0;
+        return None;
     }
-    chrono_parse(ts_str).unwrap_or(0)
+    chrono_parse(ts_str)
 }
 
 #[expect(
