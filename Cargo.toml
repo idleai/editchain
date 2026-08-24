@@ -6,7 +6,6 @@ members = [
     "crates/editchain-sync",
     "crates/editchain-node",
     "crates/editchain-import",
-    "crates/editchain-agent",
     "crates/editchain-query",
     "crates/editchain-index",
     "crates/editchain-embed",
@@ -14,7 +13,6 @@ members = [
     "crates/editchain-project",
     "crates/editchain-protocol",
     "crates/editchain-vscode-service",
-    "crates/editchain-tui",
 ]
 
 [workspace.package]
