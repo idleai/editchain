@@ -6,8 +6,6 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 ignore = [
     # `instant` is unmaintained but only a transitive dep via `tantivy`; no direct use.
     "RUSTSEC-2024-0384",
-    # `paste` is unmaintained but only a transitive dep via `ratatui`; no direct use.
-    "RUSTSEC-2024-0436",
 ]
 
 [licenses]

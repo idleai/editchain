@@ -1,12 +1,25 @@
 # editchain
 
-CRDT-based editchain constructed from cc history with a minimal raw **VS Code viewer** for debugging. WIP / experiment.
+CRDT-based edit chain built from Claude Code history, browsed through the **EditChain History** VS Code extension. WIP / experiment.
 
 ## VS Code extension
 
-Under [`extensions/vscode-editchain/`](./extensions/vscode-editchain/)
+The primary UI lives in [`extensions/vscode-editchain/`](./extensions/vscode-editchain/): a read-only unified history explorer that overlays EditChain operations with live Git history.
 
-## Quick start (CLI)
+Build the native service and the extension:
+
+```sh
+cargo build -p editchain-vscode-service
+cd extensions/vscode-editchain
+npm install
+npm run compile
+```
+
+Then open the folder in VS Code and press F5, or package a `.vsix` — full instructions in [`extensions/vscode-editchain/README.md`](./extensions/vscode-editchain/README.md). Open the viewer via the command palette → **"EditChain: Open History Explorer"**.
+
+## CLI
+
+The native CLI initializes chains and imports/searches history:
 
 ```sh
 cargo build
