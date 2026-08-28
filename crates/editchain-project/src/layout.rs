@@ -479,10 +479,12 @@ impl LayoutContext {
 
         // Emit edges whose PARENT is inside the window but whose child is above
         // it (already scrolled past). These lines enter from offscreen above and
-        // must still be drawn through the visible slice. Only when the parent is
-        // strictly below the window top (row > offset) so the clamped start
-        // point stays above the parent.
-        for row in offset.saturating_add(1)..end {
+        // must still be drawn through the visible slice. This includes a parent
+        // exactly on the window top row (`row == offset`) whose child sits
+        // immediately above the window (`child_row == offset - 1`): the child
+        // and parent collapse onto the same visible row once clamped, so the
+        // path degenerates to the top-row jog.
+        for row in offset..end {
             let key = &self.keys[row];
             let my_lane = *self.lane_at.get(key).unwrap_or(&0);
             // Find children of this node that appear above the window.
@@ -493,10 +495,30 @@ impl LayoutContext {
                             let c_lane = *self.lane_at.get(child).unwrap_or(&my_lane);
                             // Clamp to window top; webview extends up from here.
                             let draw_from = offset;
+                            let points = if row == offset {
+                                // Parent on the clamp line: the clamped start
+                                // lands on the parent's own row, so the visible
+                                // path is just the jog onto the parent's lane at
+                                // the window top (single point when lanes match).
+                                let mut pts = Vec::with_capacity(2);
+                                pts.push(GridPoint {
+                                    row: offset,
+                                    lane: c_lane,
+                                });
+                                if c_lane != my_lane {
+                                    pts.push(GridPoint {
+                                        row: offset,
+                                        lane: my_lane,
+                                    });
+                                }
+                                pts
+                            } else {
+                                build_edge_points(draw_from, c_lane, row, my_lane)
+                            };
                             edges.push(LaneEdge {
                                 child: child.clone(),
                                 parent: key.clone(),
-                                points: build_edge_points(draw_from, c_lane, row, my_lane),
+                                points,
                             });
                         }
                         _ => {}

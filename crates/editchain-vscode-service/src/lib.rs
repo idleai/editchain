@@ -27,8 +27,9 @@ use editchain_project::filter::ChainFilter;
 use editchain_project::HistoryProjection;
 use editchain_protocol::{
     ChainFilterDto, GraphLayout as ProtocolGraphLayout, HistoryRow, HistoryWindow, LayoutEdge,
-    LayoutPoint, LayoutRow, NodeDetails, RepositoryInfo, Request, RequestBody, ResolvedObject,
-    Response, ResponseBody, SearchFiltersDto, SearchHit, SearchResponse,
+    LayoutPoint, LayoutRow, NodeDetails, ParentRelationDto, ParentRelationKind, RepositoryInfo,
+    Request, RequestBody, ResolvedObject, Response, ResponseBody, SearchFiltersDto, SearchHit,
+    SearchResponse,
 };
 use editchain_query::search::{SearchFilters, Source};
 
@@ -495,6 +496,26 @@ impl Workspace {
             let parent_row = block_start;
             // Emit the parent row if it falls inside the window.
             if block_start >= offset_usize && block_start < end_usize {
+                // Parents come from the cached LayoutContext for THIS exact
+                // filtered snapshot (not the full projection), so a parent
+                // that resolves to a row hidden by the filter is never
+                // emitted as a dangling key. Relations are derived by the
+                // projection from these same final parent keys, so every
+                // relation's parent is guaranteed to be a rendered parent.
+                let parents = ctx
+                    .parents
+                    .get(&node.node_key())
+                    .cloned()
+                    .unwrap_or_default();
+                let parent_relations = self
+                    .projection
+                    .parent_relations_for(&node, &parents)
+                    .into_iter()
+                    .map(|r| ParentRelationDto {
+                        parent: r.parent,
+                        kind: protocol_relation_kind(r.kind),
+                    })
+                    .collect();
                 rows.push(HistoryRow {
                     op_id: node.op_id().map(|id| id.to_string()),
                     git_oid: node.git_oid().map(|oid| oid.to_hex()),
@@ -503,7 +524,8 @@ impl Workspace {
                     timestamp_ms: node.timestamp_ms(),
                     group: node.group(),
                     node_key: node.node_key(),
-                    parents: self.projection.lifted_parent_keys(&node),
+                    parents,
+                    parent_relations,
                     is_submodule: node
                         .repository()
                         .is_some_and(|rid| self.repo_is_submodule(rid)),
@@ -550,6 +572,7 @@ impl Workspace {
                     // group-start detection and click routing stay unambiguous.
                     node_key: format!("{}::sub:{i}", node.node_key()),
                     parents: Vec::new(),
+                    parent_relations: Vec::new(),
                     is_submodule: false,
                     is_system: true,
                     author: String::new(),
@@ -944,6 +967,20 @@ fn sub_op_summaries(sub_ops: &[Op]) -> Vec<editchain_protocol::SubOpSummary> {
             }
         })
         .collect()
+}
+
+/// Map the projection's provider-neutral relation kind to the protocol enum.
+///
+/// The projection derives kinds from `SubagentOf` / `ReconnectsTo` / `ForkOf`
+/// structural notes; the protocol enum has exactly those three variants plus a
+/// forward-compatible `Unknown` (never produced by this service today).
+#[must_use]
+fn protocol_relation_kind(kind: editchain_project::RelationKind) -> ParentRelationKind {
+    match kind {
+        editchain_project::RelationKind::Subagent => ParentRelationKind::Subagent,
+        editchain_project::RelationKind::Reconnect => ParentRelationKind::Reconnect,
+        editchain_project::RelationKind::Fork => ParentRelationKind::Fork,
+    }
 }
 
 /// Derive a display label for a bundled sub-op.
@@ -1616,6 +1653,254 @@ mod tests {
                 content_type: Payload::Empty,
             }),
         }
+    }
+
+    /// Build a structural relationship note (the shape `emit_codex_relationship_notes`
+    /// produces): causal parent `parent`, targets `targets`, META-tagged so the
+    /// projection folds it out of rendered rows and reads it as a virtual edge.
+    fn structural_note(
+        id: OpId,
+        parent: OpId,
+        targets: Vec<OpId>,
+        relationship: editchain_core::NoteRelationship,
+        session: u64,
+    ) -> Op {
+        Op {
+            id,
+            parents: ParentSet::One(parent),
+            actor: ActorId(0),
+            clock: Clock::None,
+            scope: ScopeRef::Session(SessionId(session)),
+            tags: Tags::META | Tags::IMPORT,
+            kind: OpKind::Note(editchain_core::op::NoteOp {
+                target_ids: targets,
+                relationship,
+                content: Payload::Empty,
+            }),
+        }
+    }
+
+    #[test]
+    fn history_window_exposes_structural_relationship_kinds() {
+        // A parent thread (node 1) spawns a subagent thread (node 2) and
+        // reconnects into it; a third thread (node 3) forks off the parent.
+        // The structural notes drive untyped virtual edges in the projection;
+        // the service must tag those edges with their provider-neutral kinds.
+        let trunk = import_op(1, 1, false);
+        let spawn_marker = message_op(1, 3, trunk.id);
+        let sub_first = import_op(2, 1, false);
+        let sub_last = message_op(2, 5, sub_first.id);
+        let completion = message_op(1, 7, spawn_marker.id);
+        let branch_first = import_op(3, 1, false);
+
+        let ops = vec![
+            trunk.clone(),
+            spawn_marker.clone(),
+            sub_first.clone(),
+            sub_last.clone(),
+            completion.clone(),
+            branch_first.clone(),
+            structural_note(
+                OpId::new(NodeId(1), 0, 0xFFFC),
+                sub_first.id,
+                vec![spawn_marker.id],
+                editchain_core::NoteRelationship::SubagentOf,
+                2,
+            ),
+            structural_note(
+                OpId::new(NodeId(1), 0, 0xFFFB),
+                completion.id,
+                vec![sub_last.id],
+                editchain_core::NoteRelationship::ReconnectsTo,
+                1,
+            ),
+            structural_note(
+                OpId::new(NodeId(1), 0, 0xFFFA),
+                branch_first.id,
+                vec![trunk.id],
+                editchain_core::NoteRelationship::ForkOf,
+                3,
+            ),
+        ];
+        let options = editchain_project::ProjectionOptions {
+            bundle_metadata: true,
+        };
+        let projection = HistoryProjection::from_ops_with(ops, options);
+        let mut ws = Workspace::from_projection(projection);
+        let filter = ChainFilter::default();
+        let window = ws.history_window(0, 100, false, &filter);
+
+        // SubagentOf: the subagent thread's first op carries a "subagent"
+        // relation to the CANONICAL spawn anchor. The raw target (the folded
+        // spawn marker op) resolves through the representative map to the
+        // trunk's visible import row, which is the parent the row actually
+        // renders.
+        let sub_row = window
+            .rows
+            .iter()
+            .find(|r| r.op_id.as_deref() == Some(sub_first.id.to_string().as_str()))
+            .expect("subagent first op row");
+        assert_eq!(sub_row.parents, vec![trunk.id.to_string()]);
+        assert_eq!(
+            sub_row.parent_relations,
+            vec![ParentRelationDto {
+                parent: trunk.id.to_string(),
+                kind: ParentRelationKind::Subagent,
+            }]
+        );
+
+        // ReconnectsTo: the parent thread's completion row (a standalone
+        // message row on the trunk) carries a "reconnect" relation back into
+        // the subagent's last op — again resolved to the visible subagent
+        // import row. Its stored parent (the folded spawn marker) lifts to the
+        // trunk row, so both parent keys are canonical visible rows.
+        let completion_row = window
+            .rows
+            .iter()
+            .find(|r| r.op_id.as_deref() == Some(completion.id.to_string().as_str()))
+            .expect("completion row");
+        assert_eq!(
+            completion_row.parents,
+            vec![trunk.id.to_string(), sub_first.id.to_string()]
+        );
+        assert_eq!(
+            completion_row.parent_relations,
+            vec![ParentRelationDto {
+                parent: sub_first.id.to_string(),
+                kind: ParentRelationKind::Reconnect,
+            }]
+        );
+
+        // ForkOf: the fork thread's first op carries a "fork" relation to the
+        // trunk op it branches off.
+        let fork_row = window
+            .rows
+            .iter()
+            .find(|r| r.op_id.as_deref() == Some(branch_first.id.to_string().as_str()))
+            .expect("fork first op row");
+        assert_eq!(fork_row.parents, vec![trunk.id.to_string()]);
+        assert_eq!(
+            fork_row.parent_relations,
+            vec![ParentRelationDto {
+                parent: trunk.id.to_string(),
+                kind: ParentRelationKind::Fork,
+            }]
+        );
+
+        // The trunk row itself carries no structural relations (no note is
+        // anchored on it), the structural notes never render as rows, and no
+        // row carries a stale relation to a folded op id.
+        let trunk_row = window
+            .rows
+            .iter()
+            .find(|r| r.op_id.as_deref() == Some(trunk.id.to_string().as_str()))
+            .expect("trunk row");
+        assert!(trunk_row.parents.is_empty());
+        assert!(trunk_row.parent_relations.is_empty());
+        assert!(
+            window.rows.iter().all(|r| r.kind != "note"),
+            "structural notes must never render as rows"
+        );
+        for row in &window.rows {
+            for rel in &row.parent_relations {
+                assert!(
+                    row.parents.contains(&rel.parent),
+                    "relation.parent {} must be one of the row's parents {:?}",
+                    rel.parent,
+                    row.parents
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn include_kind_filter_preserves_structural_anchor_and_target_rows() {
+        // "Messages only" is an INCLUSIVE kind constraint: ordinary non-message
+        // rows are excluded. Structural relation anchors and targets are
+        // graph-topology-critical, so their rows must survive even
+        // when their kind (tool) matches the exclusion — otherwise the
+        // branch/reconnect geometry disappears. Here a parent thread's spawn
+        // marker (a Tool op) and the subagent's first op (also a Tool op) are
+        // both preserved, the SubagentOf edge still renders, and the relation
+        // parent is one of the row's final parents.
+        let spawn = op_envelope(
+            1,
+            1,
+            OpKind::Tool(editchain_core::ToolOp {
+                tool_call_id: Payload::Empty,
+                tool_name: Payload::Inline(b"Task".to_vec()),
+                stage: editchain_core::ToolStage::Start,
+                content: Payload::Empty,
+            }),
+        );
+        let sub_first = op_envelope(
+            2,
+            1,
+            OpKind::Tool(editchain_core::ToolOp {
+                tool_call_id: Payload::Empty,
+                tool_name: Payload::Inline(b"Bash".to_vec()),
+                stage: editchain_core::ToolStage::Start,
+                content: Payload::Empty,
+            }),
+        );
+        let ops = vec![
+            spawn.clone(),
+            sub_first.clone(),
+            structural_note(
+                OpId::new(NodeId(9), 0, 1),
+                sub_first.id,
+                vec![spawn.id],
+                editchain_core::NoteRelationship::SubagentOf,
+                10,
+            ),
+        ];
+        let projection = HistoryProjection::from_ops(ops);
+        let mut ws = Workspace::from_projection(projection);
+        let filter = ChainFilter::new(
+            String::new(),
+            String::new(),
+            "^message$".to_string(),
+            false,
+            true,
+        );
+        let window = ws.history_window(0, 100, false, &filter);
+
+        // Both tool-kind rows are preserved because they are a structural
+        // anchor/target pair; every other row kind is excluded.
+        let sub_row = window
+            .rows
+            .iter()
+            .find(|r| r.op_id.as_deref() == Some(sub_first.id.to_string().as_str()))
+            .expect("subagent first op row preserved");
+        let spawn_row = window
+            .rows
+            .iter()
+            .find(|r| r.op_id.as_deref() == Some(spawn.id.to_string().as_str()))
+            .expect("spawn marker row preserved");
+        assert_eq!(sub_row.parents, vec![spawn.id.to_string()]);
+        assert_eq!(
+            sub_row.parent_relations,
+            vec![ParentRelationDto {
+                parent: spawn.id.to_string(),
+                kind: ParentRelationKind::Subagent,
+            }]
+        );
+        assert!(spawn_row.parent_relations.is_empty());
+
+        // The layout for the SAME filtered view still draws the SubagentOf
+        // edge between the two visible rows.
+        let layout = ws.graph_layout(false, 0, 100, &filter);
+        assert!(
+            layout.edges.iter().any(|e| {
+                e.child == sub_first.id.to_string() && e.parent == spawn.id.to_string()
+            }),
+            "filtered layout must draw the SubagentOf edge; got {:#?}",
+            layout
+                .edges
+                .iter()
+                .map(|e| (e.child.as_str(), e.parent.as_str()))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -948,6 +948,88 @@
         pass:horizontal,
         detail: horizontal ? 'cross-lane merge connector present' : 'no horizontal connector found',
       });
+
+      // Check 8c: the service's structural relationship kinds must render as
+      // compact badges on the rows that start/return/fork branches — the
+      // completion result row carries "return" (ReconnectsTo), the subagent's
+      // first op row carries "subagent" (SubagentOf) and "fork" (ForkOf) —
+      // and every badge must correspond to an ACTUAL drawn parent edge:
+      //   - the badge's parent key is one of that row's final parents as
+      //     delivered to the renderer (read back through __editchainRowAt);
+      //   - the fixture's drawn edge list contains (child -> parent) for it;
+      //   - no unrelated rows are badged (the badged row set is EXACTLY the
+      //     expected set, with the expected badge count);
+      //   - badges never inherit the tool/dim row's opacity dimming (the
+      //     completion-result row is a tool-kind system row, so this verifies
+      //     the .row-has-badges opacity override end-to-end).
+      // Badges are provider-neutral (no raw provider JSON in the webview).
+      const expectedBadges = [
+        { key: 'node:f:0', cls: 'rel-reconnect', kind: 'reconnect', parent: 'node:f:1' },
+        { key: 'node:f:2', cls: 'rel-subagent', kind: 'subagent', parent: 'node:f:3' },
+        { key: 'node:f:2', cls: 'rel-fork', kind: 'fork', parent: 'node:f:4' },
+      ];
+      const problems = [];
+      const badgeEls = Array.from(wrapEl.querySelectorAll('.rel-badge'));
+      const badgeRows = new Set(Array.from(wrapEl.querySelectorAll('.row')).filter((r) =>
+        r.querySelector('.rel-badge')).map((r) => r.getAttribute('data-key')));
+      const expectedBadgeRows = new Set(expectedBadges.map((b) => b.key));
+      // Ground truth for the drawn parent edges: use the fixture's explicit
+      // GetLayout edge list, not the row parent metadata under test.
+      const drawnEdges = new Set();
+      const fixtureEdges = (window.__editchainFixture && window.__editchainFixture.edges) || [];
+      for (const edge of fixtureEdges) {
+        if (edge && edge.child && edge.parent) {
+          drawnEdges.add(edge.child + '->' + edge.parent);
+        }
+      }
+      for (const b of expectedBadges) {
+        const row = wrapEl.querySelector('.row[data-key="' + b.key + '"]');
+        if (!row) { problems.push('missing row ' + b.key); continue; }
+        if (!row.querySelector('.' + b.cls)) {
+          problems.push('missing badge ' + b.cls + ' on ' + b.key);
+        }
+        const cached = window.__editchainRowAt
+          ? window.__editchainRowAt(parseInt(row.getAttribute('data-row'), 10))
+          : null;
+        if (!cached || cached.node_key !== b.key) {
+          problems.push('no cached row for ' + b.key);
+          continue;
+        }
+        const rels = cached.parent_relations || [];
+        if (!rels.some((rel) => rel && rel.parent === b.parent && rel.kind === b.kind)) {
+          problems.push(b.key + ' cache lacks relation ' +
+            JSON.stringify({ parent: b.parent, kind: b.kind }) + ' in ' + JSON.stringify(rels));
+        }
+        if (!Array.isArray(cached.parents) || cached.parents.indexOf(b.parent) === -1) {
+          problems.push(b.key + ' parents ' + JSON.stringify(cached.parents) +
+            ' lack relation parent ' + b.parent);
+        }
+        if (!drawnEdges.has(b.key + '->' + b.parent)) {
+          problems.push(b.key + ' has no drawn parent edge to ' + b.parent);
+        }
+        if (!badgeRows.has(b.key)) {
+          problems.push('badge row set lacks ' + b.key);
+        }
+      }
+      for (const key of badgeRows) {
+        if (!expectedBadgeRows.has(key)) problems.push('unexpected badge row ' + key);
+      }
+      if (badgeEls.length !== expectedBadges.length) {
+        problems.push('badge count ' + badgeEls.length + ' != expected ' + expectedBadges.length);
+      }
+      const dimmedBadges = badgeEls.filter((el) => cumulativeOpacity(el, document.body) < 0.99);
+      if (dimmedBadges.length) {
+        problems.push(dimmedBadges.length + ' badge(s) rendered below full opacity');
+      }
+      const badgesOk = problems.length === 0;
+      checks.push({
+        name:'FORK_RELATION_BADGES',
+        pass:badgesOk,
+        detail: badgesOk
+          ? 'badges=' + badgeEls.length + ' on rows=' + JSON.stringify(Array.from(badgeRows)) +
+            ' parents/edges match, all full-opacity'
+          : problems.join('; '),
+      });
     }
 
     // Check 8b (highLanes scenario only): every service lane must be drawn

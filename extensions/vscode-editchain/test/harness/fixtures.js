@@ -307,23 +307,64 @@
         // shared root on lane 0 (both branches descend from it)
         [0, 'node:f:4', 'shared root', { above: [], below: [0] }],
       ];
+      // Drawn parent edges (child -> parent), the single source of truth for
+      // the fork geometry: the reconnect, the subagent chain, the SubagentOf
+      // spawn edge (subagent first op -> spawn point), the fork edge (subagent
+      // first op -> shared root), and the trunk chain. Each row's `parents`
+      // below is derived from this list so badges can never reference a parent
+      // edge the layout does not draw.
+      const edges = [
+        { child: 'node:f:0', parent: 'node:f:1', points: [{ row: 0, lane: 1 }, { row: 1, lane: 1 }] },
+        { child: 'node:f:1', parent: 'node:f:2', points: [{ row: 1, lane: 1 }, { row: 2, lane: 1 }] },
+        { child: 'node:f:2', parent: 'node:f:3', points: [{ row: 2, lane: 1 }, { row: 3, lane: 0 }] },
+        { child: 'node:f:2', parent: 'node:f:4', points: [{ row: 2, lane: 1 }, { row: 4, lane: 0 }] },
+        { child: 'node:f:3', parent: 'node:f:4', points: [{ row: 3, lane: 0 }, { row: 4, lane: 0 }] },
+      ];
+      const parentsByKey = new Map();
+      for (const e of edges) {
+        const ps = parentsByKey.get(e.child) || [];
+        ps.push(e.parent);
+        parentsByKey.set(e.child, ps);
+      }
       const rows = local.map(([lane, key, summary, geo], i) => {
-        const r = opRow(key, summary, { group: 'session:s1', kind: 'message' });
+        // The completion result is a tool-kind system row (like the collab
+        // tool call the service derives ReconnectsTo from), so the badge
+        // probe can verify badges never inherit the tool row's dimmed opacity.
+        const r = opRow(key, summary, {
+          group: 'session:s1',
+          kind: key === 'node:f:0' ? 'tool' : 'message',
+          is_system: key === 'node:f:0',
+        });
         r.lane = geo.lane !== undefined ? geo.lane : lane;
         r.above = geo.above;
         r.below = geo.below;
         r.transitions = geo.transitions || [];
+        r.parents = parentsByKey.get(key) || [];
         return r;
       });
+      // Structural parent relations mirroring what the service derives from
+      // SubagentOf / ReconnectsTo / ForkOf notes: the completion result row
+      // RETURNS into the subagent branch (reconnect), the subagent's first op
+      // row STARTS the branch off the spawn marker (subagent) and forks off
+      // the shared root (fork). Every relation's parent is one of the row's
+      // `parents` (and therefore one of the drawn edges above). The renderer
+      // must badge these rows without parsing any provider JSON.
+      const relsByKey = {
+        'node:f:0': [
+          { parent: 'node:f:1', kind: 'reconnect' },
+          // Prototype-property wire values must be ignored by the viewer's
+          // own-property whitelist (and never become a garbage badge).
+          { parent: 'node:f:1', kind: 'constructor' },
+        ],
+        'node:f:2': [
+          { parent: 'node:f:3', kind: 'subagent' },
+          { parent: 'node:f:4', kind: 'fork' },
+        ],
+      };
+      for (const r of rows) {
+        r.parent_relations = relsByKey[r.node_key] || [];
+      }
       const layoutRows = local.map(([lane, key, ,], i) => ({ node: key, lane }));
-      // Edge point paths (absolute row indices, newest-first) for the two
-      // branches plus the reconnect.
-      const edges = [
-        { child: 'node:f:0', parent: 'node:f:1', points: [{ row: 0, lane: 1 }, { row: 1, lane: 1 }] },
-        { child: 'node:f:1', parent: 'node:f:2', points: [{ row: 1, lane: 1 }, { row: 2, lane: 1 }] },
-        { child: 'node:f:2', parent: 'node:f:4', points: [{ row: 2, lane: 1 }, { row: 4, lane: 0 }] },
-        { child: 'node:f:3', parent: 'node:f:4', points: [{ row: 3, lane: 0 }, { row: 4, lane: 0 }] },
-      ];
       return {
         rows, layoutRows, edges,
         max_lane: 1,

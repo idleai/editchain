@@ -133,9 +133,10 @@ pub struct ChainFilterDto {
     pub kind_pattern: String,
     /// Inclusive kind constraint: when non-empty, ONLY nodes whose kind tag
     /// matches this regex/literal pattern are kept. Non-matching kinds are
-    /// excluded deterministically (no endpoint preservation), so the webview
-    /// can express "Show messages only" server-side without client-side sparse
-    /// offsets or unsupported regex lookahead. Empty means no inclusion
+    /// excluded without ordinary endpoint preservation; structural relationship
+    /// anchors/targets remain so branch and reconnect edges stay visible. This
+    /// lets the webview express "Show messages only" server-side without sparse
+    /// client offsets or unsupported regex lookahead. Empty means no inclusion
     /// constraint.
     #[serde(default)]
     pub include_kind_pattern: String,
@@ -330,6 +331,28 @@ pub struct HistoryRow {
     pub node_key: String,
     /// Parent node keys (for drawing graph edges).
     pub parents: Vec<String>,
+    /// Provider-neutral relationship kinds for the edges in [`Self::parents`].
+    ///
+    /// Each entry pairs one drawn parent with the semantic kind of the edge,
+    /// so the viewer can annotate compact branch/start and return/completion
+    /// semantics without parsing provider-specific raw JSON:
+    ///
+    /// - `"subagent"` — the parent edge is a `SubagentOf` structural note:
+    ///   this row starts a subagent branch spawned by the target row.
+    /// - `"reconnect"` — the parent edge is a `ReconnectsTo` structural note:
+    ///   this row is the parent thread's completion result returning into the
+    ///   target row (the subagent's last op).
+    /// - `"fork"` — the parent edge is a `ForkOf` structural note: this row
+    ///   branches off the target row at a fork divergence boundary.
+    ///
+    /// One entry is listed per parent key in [`Self::parents`] whose edge is
+    /// structural (the row's final lifted parents after filtering/splicing),
+    /// so the client can match relations to the parent keys it renders and
+    /// annotate the row itself — a `"subagent"` relation marks this row as a
+    /// branch start, `"reconnect"` as a return/completion row. Absent on older
+    /// services or plain edges — the list is empty then, never `null`.
+    #[serde(default)]
+    pub parent_relations: Vec<ParentRelationDto>,
     /// Whether this row belongs to a nested/submodule repository.
     pub is_submodule: bool,
     /// Whether this is a system-generated node (tool results, raw import
@@ -378,6 +401,44 @@ pub struct HistoryRow {
     /// `"tool_result"`). `None` on top-level rows.
     #[serde(default)]
     pub subop_kind: Option<String>,
+}
+
+/// One typed parent edge on a history row.
+///
+/// `parent` is a node key from [`HistoryRow::parents`]; `kind` is a
+/// provider-neutral relationship kind (see [`ParentRelationKind`]). Unknown
+/// kinds deserialize to [`ParentRelationKind::Unknown`], so a newer service
+/// never breaks an older viewer (forward compatibility with new structural
+/// relationships).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentRelationDto {
+    /// The parent node key this relation applies to (matches a key in
+    /// [`HistoryRow::parents`]).
+    pub parent: String,
+    /// Provider-neutral relationship kind of this parent edge.
+    pub kind: ParentRelationKind,
+}
+
+/// Provider-neutral relationship kinds for a structural parent edge.
+///
+/// Serialized as lowercase strings (`"subagent"`, `"reconnect"`, `"fork"`).
+/// Unknown strings deserialize to [`Self::Unknown`] so clients tolerate new
+/// structural relationships from newer services; the viewer ignores unknown
+/// kinds instead of breaking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParentRelationKind {
+    /// The row starts a subagent branch spawned by the target row.
+    Subagent,
+    /// The row is the parent thread's completion result returning into the
+    /// subagent branch (the target row is the subagent's last op).
+    Reconnect,
+    /// The row branches off the target row at a fork divergence boundary.
+    Fork,
+    /// A relationship kind this client does not recognize (forward
+    /// compatibility).
+    #[serde(other)]
+    Unknown,
 }
 
 /// A bundled metadata sub-op attached to a history row.
@@ -559,6 +620,10 @@ mod tests {
             group: "repo:big".to_string(),
             node_key: big_op_id().to_string(),
             parents: vec![big_op_id().to_string()],
+            parent_relations: vec![ParentRelationDto {
+                parent: big_op_id().to_string(),
+                kind: ParentRelationKind::Subagent,
+            }],
             is_submodule: false,
             is_system: false,
             author: String::new(),
@@ -578,11 +643,48 @@ mod tests {
         assert_eq!(json["git_oid"], big_oid_hex());
         assert_eq!(json["repository"], "9007199254740993");
         assert_eq!(json["parents"][0], "9007199254740993:7:42");
+        assert_eq!(
+            json["parent_relations"][0]["parent"],
+            "9007199254740993:7:42"
+        );
+        assert_eq!(json["parent_relations"][0]["kind"], "subagent");
         assert_eq!(json["timestamp_ms"], 1_700_000_000_000u64);
         // Exact round-trip through deserialization.
         let back: HistoryRow = serde_json::from_value(json).expect("deserialize");
         assert_eq!(back.repository.as_deref(), Some("9007199254740993"));
         assert_eq!(back.git_oid.as_deref(), Some(big_oid_hex().as_str()));
+        assert_eq!(back.parent_relations[0].kind, ParentRelationKind::Subagent);
+    }
+
+    #[test]
+    fn history_row_parent_relations_default_to_empty_for_sparse_payloads() {
+        // Older services / fixture rows omit `parent_relations` entirely; it
+        // must deserialize to an empty list (never `null` or an error), so the
+        // viewer can iterate it unconditionally.
+        let sparse: HistoryRow = serde_json::from_value(serde_json::json!({
+            "op_id": null,
+            "git_oid": null,
+            "repository": null,
+            "summary": "row",
+            "timestamp_ms": 0,
+            "group": "session:1",
+            "node_key": "1:0:1",
+            "parents": ["1:0:0"],
+            "is_submodule": false,
+        }))
+        .expect("sparse HistoryRow without parent_relations");
+        assert!(sparse.parent_relations.is_empty());
+        // Unknown relationship kinds deserialize to the forward-compatible
+        // Unknown variant (and re-serialize as a string), so a newer service
+        // never breaks an older viewer.
+        let unknown: ParentRelationDto = serde_json::from_value(serde_json::json!({
+            "parent": "1:0:1",
+            "kind": "supercedes",
+        }))
+        .expect("unknown kind tolerated");
+        assert_eq!(unknown.kind, ParentRelationKind::Unknown);
+        let reserialized = serde_json::to_string(&unknown).expect("serialize unknown kind");
+        assert!(reserialized.contains("\"unknown\""), "got {reserialized}");
     }
 
     #[test]

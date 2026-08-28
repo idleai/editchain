@@ -6,6 +6,8 @@
 // Usage:
 //   node scripts/ui-real.mjs [--workspace DIR] [--chain-dir .editchain]
 //                            [--viewport WxH] [--out DIR] [--selector Q]
+//                            [--top-row N] [--messages-only] [--filter PATTERN]
+//                            [--expand-visible]
 //
 // The service binary path comes from SERVICE_PATH or defaults to
 // <workspace>/target/debug/editchain-vscode-service.
@@ -26,7 +28,8 @@ const CHROME = process.env.CHROME_PATH ||
 function parseArgs(argv) {
   const args = {
     workspace: null, chainDir: '.editchain', viewport: '1440x900', out: null,
-    selector: null, shot: null,
+    selector: null, shot: null, topRow: null, messagesOnly: false, filter: null,
+    expandVisible: false,
     // Row-ready deadline. The real service can take >20s to Open + deliver the
     // first window on a large chain, so this must be long and configurable —
     // the outer runner (CI/timeout wrapper) bounds the whole run instead.
@@ -40,6 +43,10 @@ function parseArgs(argv) {
     else if (a === '--out') args.out = argv[++i];
     else if (a === '--selector') args.selector = argv[++i];
     else if (a === '--shot') args.shot = argv[++i];
+    else if (a === '--top-row') args.topRow = parseInt(argv[++i], 10);
+    else if (a === '--messages-only') args.messagesOnly = true;
+    else if (a === '--filter') args.filter = argv[++i];
+    else if (a === '--expand-visible') args.expandVisible = true;
     else if (a === '--row-timeout') args.rowTimeoutMs = parseInt(argv[++i], 10) || args.rowTimeoutMs;
   }
   if (!args.workspace) args.workspace = '/mnt/hot/ambientlight/repos/editchain';
@@ -218,6 +225,22 @@ async function main() {
 
   // Start the handshake.
   console.log('STEP start handshake...');
+  // Preload persisted VS Code webview state before the handshake, so the
+  // renderer's restoreState() opens around the requested visible top row and
+  // with the messages-only checkbox / chain-filter pattern already applied to
+  // the first window fetch. Absent flags leave the state untouched (default).
+  const preloadState = {};
+  if (args.topRow !== null && Number.isFinite(args.topRow)) preloadState.topRow = args.topRow;
+  if (args.messagesOnly) preloadState.showMessagesOnly = true;
+  if (args.filter !== null) preloadState.filterPattern = args.filter;
+  if (Object.keys(preloadState).length) {
+    console.log('STEP preload state: ' + JSON.stringify(preloadState));
+    await page.evaluate((state) => {
+      if (window.vscode && typeof window.vscode.setState === 'function') {
+        window.vscode.setState(state);
+      }
+    }, preloadState);
+  }
   await page.evaluate(() => window.__editchainStart());
 
   // Wait for rows to actually render (the real service round-trips async; the
@@ -264,9 +287,46 @@ async function main() {
   await page.evaluate((timeoutMs) => window.__editchainDebug.whenIdle(timeoutMs), args.rowTimeoutMs);
   console.log('STEP idle done');
 
+  // Optionally expand every currently visible top-level subop chevron: click
+  // each one (the renderer rebuilds the DOM per toggle), wait for the UI to
+  // settle between clicks, then settle once more before artifacts are captured.
+  let expandCount = 0;
+  if (args.expandVisible) {
+    console.log('STEP expand visible chevrons...');
+    const MAX_EXPAND_PASSES = 2000;
+    let lastRow = null;
+    for (let pass = 0; pass < MAX_EXPAND_PASSES; pass++) {
+      const res = await page.evaluate(() => {
+        const vh = window.innerHeight;
+        const visibleCollapsed = Array.from(document.querySelectorAll('.subop-chevron'))
+          .filter((c) => (c.textContent || '').trim() === '▸')
+          .filter((c) => {
+            const r = c.getBoundingClientRect();
+            return r.top < vh && r.bottom > 0;
+          });
+        if (!visibleCollapsed.length) return { clicked: false, row: null };
+        const rowEl = visibleCollapsed[0].closest('.row');
+        const row = rowEl ? rowEl.getAttribute('data-row') : null;
+        visibleCollapsed[0].click();
+        return { clicked: true, row };
+      });
+      if (!res.clicked) break;
+      if (res.row !== null && res.row === lastRow) break; // no progress — stop
+      lastRow = res.row;
+      expandCount++;
+      await page.evaluate((t) => window.__editchainDebug.whenIdle(t), args.rowTimeoutMs);
+    }
+    await page.evaluate((t) => window.__editchainDebug.whenIdle(t), args.rowTimeoutMs);
+    console.log('STEP expand done: ' + expandCount + ' chevrons expanded');
+  }
+
   // Collect artifacts.
   const layout = await page.evaluate(() => window.__editchainDebug.dumpLayout());
   const metrics = await page.evaluate(() => window.__editchainDebug.getMetrics());
+  const graphState = await page.evaluate(() =>
+    typeof window.__editchainGraphState === 'function'
+      ? window.__editchainGraphState()
+      : null);
   const assertion = await page.evaluate(() => window.__editchainDebug.assertLayout());
 
   // Deterministic screenshot: taken only after whenIdle + assertions, so the
@@ -322,6 +382,7 @@ async function main() {
   // Write artifacts.
   fs.writeFileSync(path.join(outDir, 'layout.json'), JSON.stringify(layout, null, 2));
   fs.writeFileSync(path.join(outDir, 'metrics.json'), JSON.stringify(metrics, null, 2));
+  fs.writeFileSync(path.join(outDir, 'graph-state.json'), JSON.stringify(graphState, null, 2));
   fs.writeFileSync(path.join(outDir, 'console.txt'), consoleLines.join('\n'));
   fs.writeFileSync(path.join(outDir, 'dom.json'), JSON.stringify(domTree, null, 2));
   fs.writeFileSync(path.join(outDir, 'dom.txt'), formatDomText(domTree));
@@ -329,14 +390,21 @@ async function main() {
 
   // Summary.
   const failedChecks = assertion.checks.filter((c) => !c.pass);
+  const settings = [];
+  if (args.topRow !== null) settings.push('topRow=' + args.topRow);
+  if (args.messagesOnly) settings.push('showMessagesOnly=true');
+  if (args.filter !== null) settings.push('filterPattern=' + JSON.stringify(args.filter));
+  if (args.expandVisible) settings.push('expandVisible=true' + (expandCount ? ' (expanded ' + expandCount + ' chevrons)' : ''));
   const summary = [
     '# EditChain real UI dump',
     '',
     '- workspace: ' + args.workspace,
     '- chain dir: ' + args.chainDir,
+    '- settings: ' + (settings.length ? settings.join(', ') : '_none_'),
     '- open response: ' + JSON.stringify(openResp),
     '- viewport: ' + args.viewport,
     '- state: ' + JSON.stringify(layout.state),
+    '- graph state: ' + JSON.stringify(graphState),
     '- rows rendered: ' + layout.state.rowsRendered,
     '- svg dots: ' + (layout.svg && layout.svg.dots ? layout.svg.dots.length : 0),
     '- svg edges: ' + (layout.svg && layout.svg.edges ? layout.svg.edges.length : 0),
@@ -354,6 +422,9 @@ async function main() {
 
   // Console output.
   console.log('state=' + JSON.stringify(layout.state));
+  console.log('graph state=' + JSON.stringify(graphState));
+  console.log('settings: ' + (settings.length ? settings.join(', ') : 'none'));
+  if (args.expandVisible) console.log('expanded chevrons=' + expandCount);
   console.log('svg dots=' + (layout.svg && layout.svg.dots ? layout.svg.dots.length : 0) +
     ' edges=' + (layout.svg && layout.svg.edges ? layout.svg.edges.length : 0));
   console.log('checks pass=' + assertion.passCount + ' fail=' + assertion.failCount);

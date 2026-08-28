@@ -354,6 +354,11 @@ impl HistoryNode {
     }
 }
 
+/// A fork-branch source chain key: `(OpId.node, OpId.boot)`. Fork-prologue
+/// detection is scoped to the branch's exact chain so rows on other chains that
+/// share a session id are never elided or rewired.
+type SourceChainKey = (u64, u32);
+
 /// A unified history projection over `EditChain` ops and `Git` commits.
 #[derive(Debug, Clone, Default)]
 pub struct HistoryProjection {
@@ -362,23 +367,23 @@ pub struct HistoryProjection {
     /// `Git` commits keyed by `(RepositoryId, GitOid)`.
     pub git: GitProjection,
     /// Structural relationship notes (`ForkOf`, `SubagentOf`, `ReconnectsTo`)
-    /// keyed by the causal parent they annotate. The layout reads these as
-    /// virtual edges so fork/subagent branches render without mutating stored
-    /// `Op.parents` (SPEC §1.1, §5).
+    /// keyed by the RAW causal parent they annotate, as stored in `Op.parents`.
+    /// This is the construction-time index: the collapse reads it to fold fork
+    /// prologues and to canonicalize anchors/targets into the visible-row map
+    /// exposed by [`Self::relationship_notes`]. Keeping the raw index here means
+    /// collapse-time logic never needs the canonical map before it exists.
     relationship_notes: HashMap<OpId, Vec<Op>>,
     /// Explicit projection options (bundling policy, etc.). Threaded through so
     /// projection behavior is deterministic and a real cache key — never global.
     options: ProjectionOptions,
-    /// Cached collapsed (top-level-row) projection. Computed lazily because it is
-    /// expensive (~linear in op count) and called from several per-row paths
-    /// (`ordered_nodes`, `independent_chains`, `lifted_parent_keys`, layout).
-    /// Recomputed and re-cached on the few mutation points (`link_history`). A
-    /// `CollapsedProjection` is cheaper to clone than to rebuild, so per-node
-    /// callers can `clone()` it instead of recomputing. `RefCell` lets the
-    /// memoized `collapsed()` accessor populate it from `&self` without forcing
-    /// every caller to be `&mut self`. An all-empty `Default` value marks "not
-    /// yet built"; a real chain always has at least one node.
-    collapsed: std::cell::RefCell<CollapsedProjection>,
+    /// Cached collapsed (top-level-row) projection with its canonical
+    /// representative map and canonicalized relationship notes. Computed once at
+    /// construction (and again after the few mutation points, i.e. `link_history`)
+    /// so every per-row path (`ordered_nodes`, `independent_chains`,
+    /// `lifted_parent_keys`, layout, filtering, windowed edges) reads a stable
+    /// canonical view without rebuilding it per row. The collapse is ~linear in
+    /// op count and cheap relative to the per-row consumers that reuse it.
+    collapsed_projection: CollapsedProjection,
 }
 
 /// Result of collapsing raw imports into top-level history rows.
@@ -386,12 +391,43 @@ pub struct HistoryProjection {
 /// Alongside the rows carries the reversible bundle membership maps so layout/filter
 /// can preserve chain continuity when a child's parent is a bundled META op — without
 /// ever rewriting stored `Op.parents`.
+///
+/// The central invariant of the semantic collapse: **every source operation that
+/// participates in a collapsed bundle resolves deterministically to a visible
+/// projected row**. `representative` maps each op that does not render as its own
+/// row (a normalized child folded into its raw import parent, a bundled META
+/// sub-op, a tool result folded into its call, a structural relationship note
+/// folded out of rendering, or a fork prologue elided as a trunk duplicate) to the
+/// op id of the visible row that represents it. Relationship anchors and targets
+/// are canonicalized through this map before any parent-key construction, lane
+/// allocation, filtering, or windowed edge geometry runs, so a folded endpoint can
+/// never dangle or draw a phantom interval.
 #[derive(Debug, Clone, Default)]
 struct CollapsedProjection {
     /// Top-level rows (raw imports collapsed; META records bundled away).
     nodes: Vec<HistoryNode>,
-    /// Bundled META op id -> its anchor op id (lift a missing parent onto the row).
+    /// Canonical representative map: op id -> the op id of the visible row that
+    /// represents it.
+    ///
+    /// Invariant: for every op in the projection's op set, either the op renders
+    /// as its own row (its id is a key in `present`) or `representative` maps its
+    /// id — possibly through a chain of representatives — to an op id that is a
+    /// key in `present`. Covers normalized children folded into their raw import
+    /// parent, META sub-ops bundled into an anchor, tool results folded into their
+    /// call, structural relationship notes folded out of rendering (mapped to
+    /// their anchor's visible row), and fork prologues elided as trunk duplicates
+    /// (mapped to the trunk boundary at the split).
     representative: HashMap<OpId, OpId>,
+    /// Structural relationship notes re-keyed for edge drawing: keyed by the
+    /// CANONICAL visible anchor (the representative of the note's stored causal
+    /// parent), so a note whose anchor was folded into a bundle is still reachable
+    /// from the visible row that represents it. Each note's `target_ids` stay as
+    /// stored (raw, possibly folded op ids); every edge-construction path lifts
+    /// them through `representative` via [`canonicalize_parents`] and drops any
+    /// target that cannot be resolved to a visible row, so a virtual edge never
+    /// reaches lane allocation or windowed edge geometry with a phantom key. Built
+    /// once per collapse so per-row paths (layout/filter/order) don't re-derive it.
+    canonical_notes: HashMap<OpId, Vec<Op>>,
     /// Precomputed `node_key` set of every top-level row (the "present" rows
     /// used to decide whether a lifted/raw parent resolves to a rendered row).
     /// Built once here so per-row paths (lift/layout) don't rebuild it each call.
@@ -419,7 +455,7 @@ impl HistoryProjection {
             git: GitProjection::new(),
             relationship_notes: HashMap::new(),
             options: ProjectionOptions::default(),
-            collapsed: std::cell::RefCell::new(CollapsedProjection::default()),
+            collapsed_projection: CollapsedProjection::default(),
         }
     }
 
@@ -453,21 +489,30 @@ impl HistoryProjection {
                 }
             }
         }
-        Self {
+        let mut projection = Self {
             ops,
             git,
             relationship_notes,
             options,
-            collapsed: std::cell::RefCell::new(CollapsedProjection::default()),
-        }
+            collapsed_projection: CollapsedProjection::default(),
+        };
+        // Build the canonical collapse eagerly so `relationship_notes` and every
+        // layout/filter/order path see a stable canonical view from the start
+        // (recomputed by `link_history`, the one sanctioned ops mutation point).
+        projection.collapsed_projection = projection.collapsed_ops();
+        projection
     }
 
-    /// Returns the structural relationship notes indexed by the causal parent
-    /// they annotate (used by [`HistoryNode::parent_keys`] to draw virtual
-    /// fork/subagent edges). Borrowed by consumers that project rows directly.
+    /// Returns the structural relationship notes re-keyed for edge drawing: keyed
+    /// by the CANONICAL visible anchor (the representative of the note's stored
+    /// causal parent) with each note's `target_ids` kept as stored. Used by
+    /// [`HistoryNode::parent_keys`] so virtual fork/subagent/reconnect edges are
+    /// reachable from rendered rows even when their source ops were folded into a
+    /// collapsed bundle; the raw targets are lifted to visible rows (or dropped)
+    /// by every layout/filter/order path through the canonical representative map.
     #[must_use]
     pub fn relationship_notes(&self) -> &HashMap<OpId, Vec<Op>> {
-        &self.relationship_notes
+        &self.collapsed_projection.canonical_notes
     }
 
     /// Returns the number of history nodes (ops + git commits).
@@ -501,7 +546,13 @@ impl HistoryProjection {
     #[must_use]
     pub fn filtered_nodes(&self, filter: &filter::ChainFilter) -> Vec<HistoryNode> {
         let nodes = self.ordered_nodes();
-        filter::apply(&nodes, &self.git.links, &self.relationship_notes, filter)
+        filter::apply(
+            &nodes,
+            &self.git.links,
+            self.relationship_notes(),
+            &self.collapsed_projection.representative,
+            filter,
+        )
     }
 
     /// Returns the number of independent (disconnected) chains among the top-level
@@ -513,9 +564,7 @@ impl HistoryProjection {
     /// bundling metadata does NOT fragment a source chain into extra roots.
     #[must_use]
     pub fn independent_chains(&self) -> usize {
-        let guard = self.collapsed();
-        let collapsed: CollapsedProjection = (*guard).clone();
-        let mut nodes: Vec<HistoryNode> = collapsed.nodes;
+        let mut nodes: Vec<HistoryNode> = self.collapsed_projection.nodes.clone();
         for commit in self.git.commits.values() {
             nodes.push(HistoryNode::GitCommit(commit.clone()));
         }
@@ -524,16 +573,17 @@ impl HistoryProjection {
         let roots: Vec<&HistoryNode> = nodes
             .iter()
             .filter(|node| {
-                node.parent_keys(&self.git.links, &self.relationship_notes)
-                    .into_iter()
-                    .all(|parent| {
-                        // A parent only makes this node non-root if it resolves to a
-                        // present row (directly or via a bundled-META representative).
-                        let resolved = OpId::from_display_str(&parent)
-                            .and_then(|pid| collapsed.representative.get(&pid).copied())
-                            .map_or_else(|| parent.clone(), |rep| rep.to_string());
-                        !present.contains(&resolved)
-                    })
+                // A node is a root only when none of its parents resolve to a
+                // present row — directly, or through a folded-op representative
+                // (bundled META op, normalized child, tool result, structural note,
+                // fork prologue, ...). Unresolved parents are dropped, so they can
+                // never fragment a source chain into an extra root.
+                canonicalize_parents(
+                    node.parent_keys(&self.git.links, self.relationship_notes()),
+                    &self.collapsed_projection.representative,
+                    &present,
+                )
+                .is_empty()
             })
             .collect();
         roots.len()
@@ -559,6 +609,19 @@ impl HistoryProjection {
     /// is *not* topological w.r.t. ancestry, so we re-sort them here. This is
     /// the single source of truth for both the windowed rows and the graph
     /// layout, guaranteeing they stay in lockstep.
+    ///
+    /// Ordering contract: every present parent appears BELOW its child (all
+    /// drawn edges point downward), and among causally independent (eligible)
+    /// nodes the list is newest-first by effective time so git commits and ops
+    /// interleave chronologically. No global timestamp sort is applied after
+    /// the schedule: a plain `Reverse(timestamp_ms)` stable sort can violate
+    /// edges when causal clocks across sessions are inconsistent (a child can
+    /// carry an older timestamp than its parent). Instead the schedule itself
+    /// is topology-preserving chronological scheduling — Kahn's algorithm
+    /// emits parents before children (oldest-first), at each step choosing the
+    /// eligible node with the smallest effective time (ties broken by input
+    /// order), and the result is reversed so children render above parents
+    /// while independent chains stay interleaved newest-first.
     #[expect(
         clippy::arithmetic_side_effects,
         clippy::let_underscore_untyped,
@@ -569,17 +632,60 @@ impl HistoryProjection {
         // Raw import ops are collapsed with their normalized children into a
         // single node so the graph reads as a clean chain rather than a dense
         // star per source line.
-        let guard = self.collapsed();
-        let collapsed: CollapsedProjection = (*guard).clone();
         let mut nodes: Vec<HistoryNode> = Vec::with_capacity(self.len());
-        for op in collapsed.nodes.into_iter().rev() {
-            nodes.push(op);
+        for op in self.collapsed_projection.nodes.iter().rev() {
+            nodes.push(op.clone());
         }
         for commit in self.git.commits.values() {
             nodes.push(HistoryNode::GitCommit(commit.clone()));
         }
 
-        // Kahn's algorithm (O(V+E)) for topological sort, oldest-first.
+        // Assign BLOCK-ORDER display anchors to nodes whose source time is unknown.
+        // Undated nodes (metadata headers like `custom-title`, `mode`, and
+        // `file-history-snapshot`) are anchored to their OWN session's dated
+        // range, not to the global-newest date. The old global walk gave every
+        // undated node the most-recently-seen dated op across ALL sessions, so an
+        // old session's header (e.g. seed-d0's `custom-title`, a Jul 10 record)
+        // inherited the newest corpus date (Aug 5) and floated to the top of the
+        // timeline — visually mixing an old session into the newest cluster.
+        //
+        // q6 Phase-1 change: this records a `BundleAnchor` display time instead of
+        // rewriting the stored `op.clock` (DR: never rewrite clocks; time stays
+        // nullable and immutable with provenance). `BundleAnchor` participates in
+        // display order but never re-orders across chains, and the raw op keeps no
+        // fabricated timestamp. Sessions with no dated ops stay undated (`Unknown`).
+        // Git commits and unscoped ops are not re-dated. Anchors are assigned
+        // BEFORE scheduling because the anchor is the effective time the
+        // chronological tie-break reads; the values themselves are order-free
+        // (per-session minimum observed timestamp).
+        let mut session_first_ts: HashMap<String, u64> = HashMap::new();
+        for node in &nodes {
+            if matches!(node.effective_time(), EffectiveTime::Unknown) || node.git_oid().is_some() {
+                continue;
+            }
+            if node.group().starts_with("session:") {
+                let entry = session_first_ts.entry(node.group()).or_insert(u64::MAX);
+                *entry = (*entry).min(node.timestamp_ms());
+            }
+        }
+        for node in &mut nodes {
+            if !matches!(node.effective_time(), EffectiveTime::Unknown) {
+                continue;
+            }
+            let group = node.group();
+            if group.starts_with("session:")
+                && session_first_ts.get(&group).copied().unwrap_or(0) != 0
+            {
+                let anchor = session_first_ts.get(&group).copied().unwrap_or(0);
+                // Record as a BundleAnchor display time — clone is a display-only
+                // provenance, not a clock mutation.
+                node.set_bundle_anchor(anchor);
+            }
+        }
+
+        // Timestamp-prioritized Kahn scheduling, oldest-first. The acyclic path
+        // is O(V + E + V log V); the deterministic malformed-cycle fallback may
+        // additionally scan the remaining nodes for each cycle break.
         //
         // A parent blocks a node only if it is present in the list; parents
         // outside the list (e.g. a git commit whose parent wasn't imported) do
@@ -596,7 +702,15 @@ impl HistoryProjection {
             nodes.iter().map(HistoryNode::node_key).collect();
         let node_by_key: HashMap<String, HistoryNode> =
             nodes.iter().map(|n| (n.node_key(), n.clone())).collect();
-
+        // Input index per key: the deterministic tie-break for equal effective
+        // times. `nodes` is built from collapsed rows in reverse input order
+        // (newest-first), then BTreeMap-ordered git commits, so the index is
+        // stable across processes.
+        let index_of: HashMap<String, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.node_key(), i))
+            .collect();
         // Reverse adjacency (parent -> children) and in-degree (count of present
         // parents still un-emitted).
         let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
@@ -604,28 +718,34 @@ impl HistoryProjection {
         for node in &nodes {
             let key = node.node_key();
             let _ = indegree.entry(key.clone()).or_insert(0);
-            for parent in node.parent_keys(&self.git.links, &self.relationship_notes) {
-                // Resolve a parent that was bundled away to its anchor row's id.
-                let resolved = OpId::from_display_str(&parent)
-                    .and_then(|pid| collapsed.representative.get(&pid).copied())
-                    .map_or_else(|| parent.clone(), |rep| rep.to_string());
-                if present.contains(&resolved) {
-                    children_of.entry(resolved).or_default().push(key.clone());
-                    *indegree.entry(key.clone()).or_insert(0) += 1;
-                }
+            // Resolve every parent to a canonical visible row: bundled-away META
+            // ops, folded children, tool results, structural notes, and fork
+            // prologues all lift to the row that represents them. Parents that
+            // fail to resolve are dropped so a phantom can never block the sort.
+            for parent in canonicalize_parents(
+                node.parent_keys(&self.git.links, self.relationship_notes()),
+                &self.collapsed_projection.representative,
+                &present,
+            ) {
+                children_of.entry(parent).or_default().push(key.clone());
+                *indegree.entry(key.clone()).or_insert(0) += 1;
             }
         }
 
-        // Seed the queue with nodes that have no present parents, in `nodes`
-        // input order (not HashMap iteration order, which is seeded per
-        // process): the queue order is the tie-break between independent roots,
-        // so it must be stable across processes for identical row ordering
-        // (e.g. ops sharing a timestamp keep a reproducible order).
-        let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-        for node in &nodes {
+        // Seed the schedule with nodes that have no present parents. The
+        // priority queue is keyed by (effective time, input index): among
+        // eligible nodes the OLDEST is emitted first (oldest-first topological
+        // order), so after the final reversal the newest eligible node renders
+        // at the top and independent chains interleave chronologically. Equal
+        // timestamps break by input index — never HashMap iteration order — and
+        // the final reversal also reverses that equal-time tie order. This makes
+        // ties reproducible without claiming recency when their clocks are equal.
+        let mut queue: std::collections::BinaryHeap<std::cmp::Reverse<(u64, usize, String)>> =
+            std::collections::BinaryHeap::with_capacity(nodes.len());
+        for (input_index, node) in nodes.iter().enumerate() {
             let key = node.node_key();
             if indegree.get(&key).copied() == Some(0) {
-                queue.push_back(key);
+                queue.push(std::cmp::Reverse((node.timestamp_ms(), input_index, key)));
             }
         }
 
@@ -635,9 +755,9 @@ impl HistoryProjection {
 
         let mut sorted_oldest_first: Vec<HistoryNode> = Vec::with_capacity(nodes.len());
         while !unemitted.is_empty() {
-            // Normal Kahn step: emit every queued node whose present parents
-            // have all been emitted.
-            while let Some(key) = queue.pop_front() {
+            // Normal Kahn step: emit every node whose present parents have all
+            // been emitted, oldest-eligible first (chronological interleave).
+            while let Some(std::cmp::Reverse((_, _, key))) = queue.pop() {
                 if !unemitted.contains(&key) {
                     continue;
                 }
@@ -650,7 +770,10 @@ impl HistoryProjection {
                         if let Some(deg) = indegree.get_mut(child) {
                             *deg -= 1;
                             if *deg == 0 && unemitted.contains(child) {
-                                queue.push_back(child.clone());
+                                let input_index = index_of.get(child).copied().unwrap_or(0);
+                                let ts =
+                                    node_by_key.get(child).map_or(0, HistoryNode::timestamp_ms);
+                                queue.push(std::cmp::Reverse((ts, input_index, child.clone())));
                             }
                         }
                     }
@@ -686,7 +809,10 @@ impl HistoryProjection {
                         if let Some(deg) = indegree.get_mut(child) {
                             *deg -= 1;
                             if *deg == 0 && unemitted.contains(child) {
-                                queue.push_back(child.clone());
+                                let input_index = index_of.get(child).copied().unwrap_or(0);
+                                let ts =
+                                    node_by_key.get(child).map_or(0, HistoryNode::timestamp_ms);
+                                queue.push(std::cmp::Reverse((ts, input_index, child.clone())));
                             }
                         }
                     }
@@ -694,57 +820,10 @@ impl HistoryProjection {
             }
         }
 
-        // Reverse to newest-first.
+        // Reverse to newest-first. This reversal (never a timestamp re-sort) is
+        // what makes the final list newest-first: every edge still points
+        // downward regardless of how inconsistent the source clocks are.
         sorted_oldest_first.reverse();
-
-        // Assign BLOCK-ORDER display anchors to nodes whose source time is unknown.
-        // Undated nodes (metadata headers like `custom-title`, `mode`, and
-        // `file-history-snapshot`) are anchored to their OWN session's dated
-        // range, not to the global-newest date. The old global walk gave every
-        // undated node the most-recently-seen dated op across ALL sessions, so an
-        // old session's header (e.g. seed-d0's `custom-title`, a Jul 10 record)
-        // inherited the newest corpus date (Aug 5) and floated to the top of the
-        // timeline — visually mixing an old session into the newest cluster.
-        //
-        // q6 Phase-1 change: this records a `BundleAnchor` display time instead of
-        // rewriting the stored `op.clock` (DR: never rewrite clocks; time stays
-        // nullable and immutable with provenance). `BundleAnchor` participates in
-        // display order but never re-orders across chains, and the raw op keeps no
-        // fabricated timestamp. Sessions with no dated ops stay undated (`Unknown`).
-        // Git commits and unscoped ops are not re-dated.
-        let mut session_first_ts: HashMap<String, u64> = HashMap::new();
-        for node in &sorted_oldest_first {
-            if matches!(node.effective_time(), EffectiveTime::Unknown) || node.git_oid().is_some() {
-                continue;
-            }
-            if node.group().starts_with("session:") {
-                let entry = session_first_ts.entry(node.group()).or_insert(u64::MAX);
-                *entry = (*entry).min(node.timestamp_ms());
-            }
-        }
-        for node in &mut sorted_oldest_first {
-            if !matches!(node.effective_time(), EffectiveTime::Unknown) {
-                continue;
-            }
-            let group = node.group();
-            if group.starts_with("session:")
-                && session_first_ts.get(&group).copied().unwrap_or(0) != 0
-            {
-                let anchor = session_first_ts.get(&group).copied().unwrap_or(0);
-                // Record as a BundleAnchor display time — clone is a display-only
-                // provenance, not a clock mutation.
-                node.set_bundle_anchor(anchor);
-            }
-        }
-
-        // Time-sort by default: interleave git commits and ops by timestamp so
-        // newer work (whether a commit or an op) appears higher in the list.
-        // This is a stable sort — nodes with equal or unknown (0) timestamps
-        // keep their topological order, so parent-before-child is preserved for
-        // causally-ordered nodes (whose clocks are monotonic). Time-sorting only
-        // changes which row a node occupies; the lane assignment is computed
-        // separately from topology and is unaffected.
-        sorted_oldest_first.sort_by_key(|n| std::cmp::Reverse(n.timestamp_ms()));
         sorted_oldest_first
     }
 
@@ -776,6 +855,10 @@ impl HistoryProjection {
             .collect();
         // Map raw import op id -> its normalized children (in input order).
         let mut children_of: HashMap<OpId, Vec<&Op>> = HashMap::new();
+        // Map folded child op id -> the raw import op id it folds into. Every
+        // folded child must resolve to that import's visible row through the
+        // canonical representative map (the semantic-collapse invariant).
+        let mut parent_import_of: HashMap<OpId, OpId> = HashMap::new();
         // Track which non-import ops are folded into an import parent (so they
         // are dropped), versus standalone ops that must be kept.
         let mut folded: std::collections::HashSet<OpId> = std::collections::HashSet::new();
@@ -787,6 +870,7 @@ impl HistoryProjection {
                 if import_ids.contains(&parent) {
                     let _: bool = folded.insert(op.id);
                     children_of.entry(parent).or_default().push(op);
+                    let _: &mut OpId = parent_import_of.entry(op.id).or_insert(parent);
                 }
             }
         }
@@ -808,8 +892,10 @@ impl HistoryProjection {
         let mut result: Vec<HistoryNode> = Vec::with_capacity(self.ops.len());
         // Per (node, boot) chain: index in `result` of the last eligible anchor.
         let mut anchors: HashMap<(NodeId, u32), usize> = HashMap::new();
-        // Entity(op id) -> anchor OP ID (stable, not a row index) so layout can
-        // lift edges whose parent is a bundled META op onto the absorbing row.
+        // Canonical representative map (op id -> visible row op id). This is the
+        // semantic-collapse invariant: every op that does not render as its own
+        // row resolves deterministically to the visible row that represents it.
+        // Layout/filter/order lift parents and relationship endpoints through it.
         let mut representative: HashMap<OpId, OpId> = HashMap::new();
         for op in &self.ops {
             // Structural relationship notes (ForkOf/SubagentOf/ReconnectsTo) are
@@ -865,7 +951,13 @@ impl HistoryProjection {
                     let _: Option<usize> = anchors.insert(chain, idx);
                 }
             } else if folded.contains(&op.id) {
-                // Drop normalized ops folded into their parent import op.
+                // Drop normalized ops folded into their parent import op, and
+                // record the fold so any parent/target that references this op
+                // (relationship notes, causal parents of surviving rows) resolves
+                // to the import's visible row instead of dangling.
+                if let Some(import_id) = parent_import_of.get(&op.id).copied() {
+                    let _: Option<OpId> = representative.insert(op.id, import_id);
+                }
             } else {
                 // Standalone op (e.g. ChainStart, or a message not tied to an
                 // import) — keep as-is. It is a content/structural row and anchors
@@ -899,30 +991,99 @@ impl HistoryProjection {
         // divergence point, don't duplicate the root chain" requirement: the
         // branch node draws its edge off the trunk at the split, and the
         // duplicated prologue never appears twice.
-        self.fold_fork_prologues(&mut result);
+        self.fold_fork_prologues(&mut result, &mut representative);
+
+        // The present row set is final once every fold pass has run. Any op id
+        // that is neither a row nor resolvable to a row here is genuinely
+        // external and must be dropped from edges — never fed to layout.
+        let present = row_node_keys(&result);
+
+        // Structural relationship notes are folded out of rendering entirely; give
+        // each one a canonical representative (its anchor's visible row, falling
+        // back to its first target's visible row) so the invariant holds even if
+        // some op ever references a note id directly.
+        for op in &self.ops {
+            if !is_structural_note(op) || representative.contains_key(&op.id) {
+                continue;
+            }
+            let endpoint = op.parents.iter().next().copied().or_else(|| {
+                if let editchain_core::OpKind::Note(n) = &op.kind {
+                    n.target_ids.first().copied()
+                } else {
+                    None
+                }
+            });
+            if let Some(rep) =
+                endpoint.and_then(|id| canonical_op_id(id, &representative, &present))
+            {
+                let _: Option<OpId> = representative.insert(op.id, rep);
+            }
+        }
+
+        // Re-key relationship notes by their canonical visible anchor so a folded
+        // anchor (e.g. a ReconnectsTo on a collab Tool op) is still reachable
+        // from the visible row that represents it. Targets stay as stored —
+        // every edge-construction path lifts them through the representative map
+        // via `canonicalize_parents`, so a folded target resolves at layout time
+        // and an unresolvable one is dropped before it can reach lane allocation
+        // or windowed edge geometry.
+        let canonical_notes = self.canonicalize_relationship_notes(&representative, &present);
+
+        // Semantic-collapse invariant, checked once per collapse: every ordinary
+        // op either renders as a row or resolves through the representative map
+        // to a row. A structural note with no resolvable endpoint is inert and is
+        // deliberately dropped, so it is the sole exception.
+        debug_assert!(
+            self.ops.iter().all(|op| {
+                let key = op.id.to_string();
+                present.contains(&key)
+                    || representative.contains_key(&op.id)
+                    || is_structural_note(op)
+            }),
+            "every ordinary op must render as a row or resolve through the canonical representative map"
+        );
 
         CollapsedProjection {
-            present: row_node_keys(&result),
+            present,
             nodes: result,
             representative,
+            canonical_notes,
         }
     }
 
-    /// Memoized collapsed projection.
+    /// Canonicalize structural relationship notes for edge drawing.
     ///
-    /// Computes `collapsed_ops()` once and reuses it across the many callers that
-    /// otherwise rebuilt it per row/query. Callers may `clone()` the returned
-    /// value only when they need owned rows; call sites that need just the lift
-    /// maps or the "present" key set should take a reference (cheaper, no alloc).
-    /// Invalidated by `link_history` (which edits `self.ops`).
-    fn collapsed(&self) -> std::cell::Ref<'_, CollapsedProjection> {
-        // Cheap check against an empty placeholder so we only rebuild when never
-        // built (or after `link_history` invalidation). `nodes` is always
-        // non-empty for a real chain; a `len()==0` placeholder marks "not built".
-        if self.collapsed.borrow().nodes.is_empty() {
-            *self.collapsed.borrow_mut() = self.collapsed_ops();
+    /// The raw [`Self::relationship_notes`] index is keyed by each note's stored
+    /// causal parent — which may itself be a folded op (e.g. a `ReconnectsTo`
+    /// anchored on a Tool op folded into its import, or a `SubagentOf` anchored on
+    /// a subagent's first message). This re-keys every note by the canonical
+    /// visible anchor (the representative of its stored parent), so the virtual
+    /// edge is reachable from the row that represents the note's anchor. The
+    /// note's `target_ids` are left exactly as stored — the raw ids may name
+    /// folded ops (e.g. a `SubagentOf` target that is a folded structural start
+    /// marker); every edge-construction path resolves them through the canonical
+    /// representative map, dropping any target that cannot be lifted to a visible
+    /// row. A note whose anchor cannot be resolved to a visible row is dropped.
+    fn canonicalize_relationship_notes(
+        &self,
+        representative: &HashMap<OpId, OpId>,
+        present: &std::collections::HashSet<String>,
+    ) -> HashMap<OpId, Vec<Op>> {
+        let mut out: HashMap<OpId, Vec<Op>> = HashMap::new();
+        for (stored_anchor, notes) in &self.relationship_notes {
+            let Some(anchor) = canonical_op_id(*stored_anchor, representative, present) else {
+                continue;
+            };
+            for note in notes.iter().cloned() {
+                out.entry(anchor).or_default().push(note);
+            }
         }
-        self.collapsed.borrow()
+        // Deterministic order per anchor (HashMap iteration order is
+        // process-random; parent_keys emits virtual targets in list order).
+        for notes in out.values_mut() {
+            notes.sort_unstable_by_key(|n| (n.id.node.0, n.id.boot, n.id.seq));
+        }
+        out
     }
 
     /// Fold each fork branch's pre-boundary prologue into the trunk it branches
@@ -931,17 +1092,32 @@ impl HistoryProjection {
     /// A `ForkOf` note has a causal parent `P` (the branch's op at the divergence
     /// boundary) and a target `T` (the trunk's op at that same boundary). The
     /// branch's own chain before `P` — the prologue — duplicates the trunk's
-    /// earlier messages and must be elided. We drop those nodes from `result`,
-    /// splice `P`'s causal parent onto `T`, and re-parent any surviving children
-    /// of a dropped prologue node onto the boundary `P`, so chain continuity holds
-    /// and the branch renders as a single edge off the trunk at the split.
-    fn fold_fork_prologues(&self, result: &mut Vec<HistoryNode>) {
+    /// earlier messages and must be elided. We drop those nodes from `result` and
+    /// record each dropped row in the canonical representative map, mapped to the
+    /// trunk boundary at the split, so a surviving child's edge to a dropped
+    /// prologue node resolves to a visible row instead of a phantom. The `ForkOf`
+    /// virtual edge keeps the branch attached to the trunk at the split — no
+    /// stored `Op.parents` mutation (SPEC §1.1).
+    ///
+    /// Prologue detection and the representative rewiring are restricted to the
+    /// fork boundary's exact source chain `(OpId.node, OpId.boot)`: a session can
+    /// hold several source chains at once (the branch, the trunk it forked from,
+    /// and unrelated chains), and lower-seq rows on those other chains must never
+    /// be elided or redirected just because they share the session id with the
+    /// branch.
+    fn fold_fork_prologues(
+        &self,
+        result: &mut Vec<HistoryNode>,
+        representative: &mut HashMap<OpId, OpId>,
+    ) {
         // Collect (branch_boundary, trunk_boundary) pairs from ForkOf notes. The
         // branch boundary is the note's causal parent; the trunk boundary is its
-        // targethare. The branch renders off the trunk at this split via the note's
+        // target. The branch renders off the trunk at this split via the note's
         // virtual edge (see [`HistoryNode::parent_keys`]), so we need only ELIDE
         // the branch's duplicated prologue from the rows — no causal parent
         // mutation (SPEC §1.1).
+        // Sorted (HashMap iteration order is process-random) so the later
+        // representative assignment for dropped prologue rows is deterministic.
         let mut boundary_pairs: Vec<(OpId, OpId)> = Vec::new();
         for notes in self.relationship_notes.values() {
             for note in notes {
@@ -958,39 +1134,38 @@ impl HistoryProjection {
                 }
             }
         }
+        boundary_pairs.sort_unstable_by_key(|(p, _)| (p.node.0, p.boot, p.seq));
         if boundary_pairs.is_empty() {
             return;
         }
 
-        // Group ops by session scope, each as (op id, seq), so we can find, for each
-        // branch boundary, the session it lives in and thus the prologue (all
-        // lower-seq ops in that same session). We include every op kind (not just
-        // imports) so the fold works uniformly over collapsed-import and
-        // standalone message nodes in tests and real chains alike.
-        let mut by_session: HashMap<u64, Vec<(OpId, u64)>> = HashMap::new();
+        // Group ops by source chain (node, boot), each as (op id, seq), so we can
+        // find, for each branch boundary, the chain it lives in and thus the
+        // prologue (all lower-seq ops on that exact chain). Sessions may carry
+        // several chains at once — a fork branch plus an unrelated or trunk chain
+        // sharing the same session id — so grouping by session alone would elide
+        // and rewire rows that merely share the session. We include every op kind
+        // (not just imports) so the fold works uniformly over collapsed-import
+        // and standalone message nodes in tests and real chains alike.
+        let mut by_chain: HashMap<SourceChainKey, Vec<(OpId, u64)>> = HashMap::new();
         for op in &self.ops {
-            if let editchain_core::ScopeRef::Session(sid) = op.scope {
-                by_session
-                    .entry(sid.0)
-                    .or_default()
-                    .push((op.id, op.id.seq));
-            }
+            by_chain
+                .entry((op.id.node.0, op.id.boot))
+                .or_default()
+                .push((op.id, op.id.seq));
         }
 
-        // Mark the prologue: for each branch boundary, every op in the same
-        // session with a strictly smaller seq (the shared backlog before the
-        // split) is a duplicated prologue node to elide.
+        // Mark the prologue: for each branch boundary, every op on the branch
+        // boundary's exact source chain with a strictly smaller seq (the shared
+        // backlog before the split) is a duplicated prologue node to elide.
         let mut prologue: std::collections::HashSet<OpId> = std::collections::HashSet::new();
         for (branch_boundary, _trunk_boundary) in &boundary_pairs {
-            for vec in by_session.values() {
-                if vec.iter().any(|(id, _)| id == branch_boundary) {
-                    let boundary_seq = branch_boundary.seq;
-                    for &(op_id, seq) in vec {
-                        if op_id != *branch_boundary && seq < boundary_seq {
-                            let _: bool = prologue.insert(op_id);
-                        }
+            if let Some(vec) = by_chain.get(&(branch_boundary.node.0, branch_boundary.boot)) {
+                let boundary_seq = branch_boundary.seq;
+                for &(op_id, seq) in vec {
+                    if op_id != *branch_boundary && seq < boundary_seq {
+                        let _: bool = prologue.insert(op_id);
                     }
-                    break;
                 }
             }
         }
@@ -1000,13 +1175,16 @@ impl HistoryProjection {
 
         // Drop the prologue nodes from the rendered rows. The branch's boundary
         // node and everything after it stay; their causal edge to the (now
-        // removed) prologue simply won't draw, and the ForkOf virtual edge keeps
-        // the branch attached to the trunk at the split.
+        // removed) prologue resolves through the representative map to the trunk
+        // boundary at the split, and the ForkOf virtual edge keeps the branch
+        // attached to the trunk.
         let mut drop_idx: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut dropped_ids: Vec<OpId> = Vec::new();
         for (i, n) in result.iter().enumerate() {
             if let Some(op_id) = n.op_id() {
                 if prologue.contains(&op_id) {
                     let _: bool = drop_idx.insert(i);
+                    dropped_ids.push(op_id);
                 }
             }
         }
@@ -1017,6 +1195,32 @@ impl HistoryProjection {
             }
         }
         *result = kept;
+
+        // Canonicalize each dropped prologue row onto its branch's trunk boundary:
+        // a surviving branch node whose stored parent is a dropped prologue row
+        // then resolves to the visible trunk row at the split (falling back to the
+        // branch boundary itself), so the elision never leaves a dangling parent
+        // that would inflate lanes or draw a phantom interval.
+        if dropped_ids.is_empty() {
+            return;
+        }
+        let present = row_node_keys(result);
+        for dropped_id in dropped_ids {
+            let rep = boundary_pairs
+                .iter()
+                .find_map(|(branch_boundary, trunk_boundary)| {
+                    let same_source_chain = branch_boundary.node == dropped_id.node
+                        && branch_boundary.boot == dropped_id.boot;
+                    if !same_source_chain || dropped_id.seq >= branch_boundary.seq {
+                        return None;
+                    }
+                    canonical_op_id(*trunk_boundary, representative, &present)
+                        .or_else(|| canonical_op_id(*branch_boundary, representative, &present))
+                });
+            if let Some(rep) = rep {
+                let _: Option<OpId> = representative.insert(dropped_id, rep);
+            }
+        }
     }
 
     /// Fold tool-result nodes into their tool-call parents' sub-ops.
@@ -1088,6 +1292,14 @@ impl HistoryProjection {
             if let Some(repl) = replacement.get(value) {
                 *value = *repl;
             }
+        }
+
+        // The dropped tool-result rows are folded bundles too: map each one to the
+        // call that absorbed it (semantic-collapse invariant), so its folded
+        // children, relationship notes, or later causal parents that reference the
+        // result id resolve to the call's visible row instead of dangling.
+        for (&dropped, &call) in &replacement {
+            let _: &mut OpId = representative.entry(dropped).or_insert(call);
         }
 
         // Attach collected tool-result ops to their call's sub-ops.
@@ -1222,8 +1434,10 @@ impl HistoryProjection {
             let entry = self.git.links.entry(link.source).or_default();
             entry.push(link);
         }
-        // `self.ops` changed (stitching) — the collapsed cache is now stale.
-        self.collapsed = std::cell::RefCell::new(CollapsedProjection::default());
+        // `self.ops` changed (stitching) — rebuild the canonical collapse so the
+        // representative map and canonicalized relationship notes reflect the
+        // stitched parents.
+        self.collapsed_projection = self.collapsed_ops();
     }
 
     /// Compute the graph layout for rendering unified history.
@@ -1248,13 +1462,14 @@ impl HistoryProjection {
         let keys = Self::layout_keys(sorted);
         let key_to_node = Self::layout_index(sorted);
         let links = &self.git.links;
-        let collapsed = self.collapsed();
-        let present = row_node_keys(&collapsed.nodes);
-        let representative = &collapsed.representative;
+        // The visible rows are the rows being laid out (possibly filtered), so a
+        // parent resolves only when it is present in THIS layout.
+        let present = row_node_keys(sorted);
+        let representative = &self.collapsed_projection.representative;
         let parents_of = |key: &str| -> Vec<String> {
             key_to_node.get(key).map_or(Vec::new(), |n| {
-                lift_parents(
-                    n.parent_keys(links, &self.relationship_notes),
+                canonicalize_parents(
+                    n.parent_keys(links, self.relationship_notes()),
                     representative,
                     &present,
                 )
@@ -1274,9 +1489,15 @@ impl HistoryProjection {
         let keys = Self::layout_keys(sorted);
         let key_to_node = Self::layout_index(sorted);
         let links = &self.git.links;
+        let present = row_node_keys(sorted);
+        let representative = &self.collapsed_projection.representative;
         let parents_of = |key: &str| -> Vec<String> {
             key_to_node.get(key).map_or(Vec::new(), |n| {
-                n.parent_keys(links, &self.relationship_notes)
+                canonicalize_parents(
+                    n.parent_keys(links, self.relationship_notes()),
+                    representative,
+                    &present,
+                )
             })
         };
         let is_git =
@@ -1294,13 +1515,14 @@ impl HistoryProjection {
         let keys = Self::layout_keys(sorted);
         let key_to_node = Self::layout_index(sorted);
         let links = &self.git.links;
-        let collapsed = self.collapsed();
-        let present = row_node_keys(&collapsed.nodes);
-        let representative = &collapsed.representative;
+        // The visible rows are the rows being laid out (possibly filtered), so a
+        // parent resolves only when it is present in THIS layout.
+        let present = row_node_keys(sorted);
+        let representative = &self.collapsed_projection.representative;
         let parents_of = |key: &str| -> Vec<String> {
             key_to_node.get(key).map_or(Vec::new(), |n| {
-                lift_parents(
-                    n.parent_keys(links, &self.relationship_notes),
+                canonicalize_parents(
+                    n.parent_keys(links, self.relationship_notes()),
                     representative,
                     &present,
                 )
@@ -1321,19 +1543,127 @@ impl HistoryProjection {
         sorted.iter().map(|n| (n.node_key(), n)).collect()
     }
 
-    /// Return this node's parent keys resolved through the META-bundle lift, so a
-    /// parent that was bundled away is redirected to its present anchor row.
+    /// Return this node's parent keys resolved to their canonical visible rows, so
+    /// a parent that was folded away (bundled META op, normalized child, tool
+    /// result, structural note, fork prologue, ...) is redirected to the row that
+    /// represents it. Unresolvable op parents are dropped.
     ///
     /// Used by the service when emitting `HistoryRow::parents` so the client's
-    /// chain assembly sees connected chains, not dangling bundled-META parents.
+    /// chain assembly sees connected chains, not dangling folded-op parents.
+    #[must_use]
     pub fn lifted_parent_keys(&self, node: &HistoryNode) -> Vec<String> {
-        let collapsed = self.collapsed();
-        lift_parents(
-            node.parent_keys(&self.git.links, &self.relationship_notes),
-            &collapsed.representative,
-            &collapsed.present,
+        // This public helper accepts either op or git rows. The collapsed cache's
+        // `present` set contains op rows only, so include projected commit keys
+        // here; otherwise a git parent OID would be mistaken for an absent
+        // external anchor and dropped.
+        let mut present = self.collapsed_projection.present.clone();
+        present.extend(self.git.commits.values().map(|commit| commit.oid.to_hex()));
+        canonicalize_parents(
+            node.parent_keys(&self.git.links, self.relationship_notes()),
+            &self.collapsed_projection.representative,
+            &present,
         )
     }
+
+    /// Returns the provider-neutral structural relations for one row in a view.
+    ///
+    /// `parents` must be the row's FINAL parent keys for that view — the exact
+    /// keys the view renders (e.g. [`layout::LayoutContext::parents`] for the
+    /// filtered snapshot), NOT the raw stored keys. Each structural note's raw
+    /// (possibly folded) targets are canonicalized to their visible rows, and a
+    /// relation is returned only when that visible row is one of the supplied
+    /// parent keys — so a folded target whose representative row is hidden in
+    /// the view never produces a stale relation. Every distinct `(parent, kind)`
+    /// match is emitted (a canonical edge can carry several structural kinds at
+    /// once, e.g. Subagent + Fork), deduplicating exact duplicates while keeping
+    /// parent order deterministic.
+    #[must_use]
+    pub fn parent_relations_for(
+        &self,
+        node: &HistoryNode,
+        parents: &[String],
+    ) -> Vec<ParentRelation> {
+        let Some(anchor_id) = node.op_id() else {
+            return Vec::new();
+        };
+        let Some(notes) = self.relationship_notes().get(&anchor_id) else {
+            return Vec::new();
+        };
+        let representative = &self.collapsed_projection.representative;
+        let present = &self.collapsed_projection.present;
+        let mut out: Vec<ParentRelation> = Vec::new();
+        for parent in parents {
+            for note in notes {
+                let editchain_core::OpKind::Note(n) = &note.kind else {
+                    continue;
+                };
+                let matches = n.target_ids.iter().any(|target| {
+                    canonical_parent_key(&target.to_string(), representative, present).as_deref()
+                        == Some(parent.as_str())
+                });
+                if !matches {
+                    continue;
+                }
+                if let Some(kind) = relation_kind(n.relationship) {
+                    let relation = ParentRelation {
+                        parent: parent.clone(),
+                        kind,
+                    };
+                    // Emit every distinct (parent, kind) pair rather than stopping
+                    // at the first note kind that matches a canonical parent; skip
+                    // exact duplicates deterministically (parent/note iteration
+                    // order is stable).
+                    if !out.contains(&relation) {
+                        out.push(relation);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Map a structural note relationship to its provider-neutral kind, or `None`
+/// for non-structural relationships (the projection only indexes structural
+/// notes, but unknown/future kinds must degrade gracefully rather than invent
+/// labels).
+fn relation_kind(relationship: NoteRelationship) -> Option<RelationKind> {
+    match relationship {
+        NoteRelationship::SubagentOf => Some(RelationKind::Subagent),
+        NoteRelationship::ReconnectsTo => Some(RelationKind::Reconnect),
+        NoteRelationship::ForkOf => Some(RelationKind::Fork),
+        NoteRelationship::Corrects
+        | NoteRelationship::Supersedes
+        | NoteRelationship::Rejects
+        | NoteRelationship::Redacts
+        | NoteRelationship::Explains => None,
+    }
+}
+
+/// A provider-neutral structural parent edge on one visible history row.
+///
+/// Returned by [`HistoryProjection::parent_relations_for`] for the row's FINAL
+/// parent keys in a view; `parent` is always one of those keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParentRelation {
+    /// The canonical visible parent row key this relation applies to — one of
+    /// the row's final parent keys in the view that supplied them.
+    pub parent: String,
+    /// The provider-neutral relationship kind of this edge.
+    pub kind: RelationKind,
+}
+
+/// Provider-neutral structural relationship kinds, derived from the
+/// `SubagentOf` / `ReconnectsTo` / `ForkOf` structural notes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationKind {
+    /// The row starts a subagent branch spawned by the target row.
+    Subagent,
+    /// The row is the parent thread's completion result returning into the
+    /// subagent branch (the target row is the subagent's last op).
+    Reconnect,
+    /// The row branches off the target row at a fork divergence boundary.
+    Fork,
 }
 
 /// Collect the node keys of collapsed top-level rows (the "present" set used to
@@ -1342,26 +1672,71 @@ fn row_node_keys(nodes: &[HistoryNode]) -> std::collections::HashSet<String> {
     nodes.iter().map(HistoryNode::node_key).collect()
 }
 
-/// Resolve each parent key through the META-bundle representative map: a parent
-/// that was bundled away (a META sub-op not present as a row) is redirected to
-/// its anchor row's op id. Parents that remain absent (external/unresolved) are
-/// kept as-is — the caller drops them via row lookup. This never rewrites stored
-/// `Op.parents`; it is a layout-time lift only.
-fn lift_parents(
+/// Resolve each parent key to its canonical visible row key through the
+/// representative map, dropping keys that cannot be resolved to a rendered row.
+///
+/// A parent that was folded into a bundle (a META sub-op, a normalized child, a
+/// tool result, a fork prologue, a structural note) is redirected to the visible
+/// row that represents it. A key that still fails to resolve — an op id absent
+/// from the projection with no representative — is dropped so it can never reach
+/// lane allocation or windowed edge geometry as a phantom. Non-op keys (git OID
+/// hex) are external anchors and are kept for the caller's row lookup. The
+/// result is deduplicated preserving first-occurrence order. This never rewrites
+/// stored `Op.parents`; it is a layout/filter-time lift only.
+fn canonicalize_parents(
     parents: Vec<String>,
     representative: &HashMap<OpId, OpId>,
     present: &std::collections::HashSet<String>,
 ) -> Vec<String> {
-    parents
-        .into_iter()
-        .map(|parent| {
-            let lifted = OpId::from_display_str(&parent)
-                .and_then(|pid| representative.get(&pid).copied())
-                .map(|rep| rep.to_string())
-                .filter(|rep| present.contains(rep));
-            lifted.unwrap_or(parent)
-        })
-        .collect()
+    let mut out: Vec<String> = Vec::with_capacity(parents.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for parent in parents {
+        if let Some(key) = canonical_parent_key(&parent, representative, present) {
+            if seen.insert(key.clone()) {
+                out.push(key);
+            }
+        }
+    }
+    out
+}
+
+/// Resolve a single parent key to its canonical visible row key.
+///
+/// Returns `None` when the key is an op id that is neither a rendered row nor
+/// represented by one (genuinely unresolved). Non-op keys (git OID hex) survive
+/// only when they name a row in `present`; absent external anchors are dropped
+/// before layout just like absent op parents.
+fn canonical_parent_key(
+    parent: &str,
+    representative: &HashMap<OpId, OpId>,
+    present: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if present.contains(parent) {
+        return Some(parent.to_string());
+    }
+    let pid = OpId::from_display_str(parent)?;
+    canonical_op_id(pid, representative, present).map(|id| id.to_string())
+}
+
+/// Chase an `OpId` through the representative map until it reaches a visible row.
+///
+/// Returns `None` when the id is neither a row nor mapped (directly or through a
+/// chain) to a row — the caller drops such ids instead of emitting phantom keys.
+fn canonical_op_id(
+    id: OpId,
+    representative: &HashMap<OpId, OpId>,
+    present: &std::collections::HashSet<String>,
+) -> Option<OpId> {
+    let mut cur = id;
+    loop {
+        if present.contains(&cur.to_string()) {
+            return Some(cur);
+        }
+        match representative.get(&cur).copied() {
+            Some(next) if next != cur => cur = next,
+            _ => return None,
+        }
+    }
 }
 
 /// Produce a short summary for an `EditChain` operation.

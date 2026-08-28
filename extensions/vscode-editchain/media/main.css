@@ -213,13 +213,13 @@ body {
   box-sizing: border-box;
   min-width: 0;
 }
-/* Row-level dimming by node kind: tool calls dimmed most, other non-text nodes
-   dimmed moderately, text nodes (messages/commands) stay full. Opacity is
+/* Row-level dimming by node kind: secondary rows are softened while preserving
+   readable contrast, and text nodes (messages/commands) stay full. Opacity is
    applied to the TEXT cells only — NOT the graph cell — because a parent's
-   opacity is multiplicative and cannot be overridden by childrencars. The SVG
+   opacity is multiplicative and cannot be overridden by children. The SVG
    lanes/dots must always render at full (100%) opacity regardless of row kind. */
-.row-tool .text-cell, .row-tool .date-cell, .row-tool .author-cell, .row-tool .commit-cell { opacity: 0.3; }
-.row-dim .text-cell, .row-dim .date-cell, .row-dim .author-cell, .row-dim .commit-cell { opacity: 0.7; }
+.row-tool .text-cell, .row-tool .date-cell, .row-tool .author-cell, .row-tool .commit-cell { opacity: 0.85; }
+.row-dim .text-cell, .row-dim .date-cell, .row-dim .author-cell, .row-dim .commit-cell { opacity: 0.85; }
 .graph-cell { line-height: 0; overflow: hidden; }
 .text-cell { padding-left: 8px; overflow: hidden; text-align: left; }
 .date-cell, .author-cell, .commit-cell {
@@ -258,6 +258,40 @@ body {
   cursor: pointer;
 }
 
+/* Compact semantic badges for structural parent relations (subagent branch
+   start, completion return, fork). Inline so they never affect row height —
+   virtual scroll keeps every row exactly ROW_H; the content cell clips
+   overflow, so badges sit at the start of the summary and stay visible even
+   when the summary text is long. Badges are always rendered at full opacity
+   themselves; rows carrying them additionally lift their text cells out of
+   the tool/dim dimming (see .row-has-badges below) so a badge on a tool-kind
+   branch/return row stays fully legible. */
+.rel-badge {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 5px;
+  border: 1px solid var(--vscode-descriptionForeground);
+  border-radius: 8px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.72em;
+  line-height: 16px;
+  vertical-align: middle;
+  white-space: nowrap;
+  opacity: 1;
+}
+
+/* Rows carrying structural relation badges are graph-topology-critical: lift
+   their text cells out of the `.row-tool` / `.row-dim` opacity dimming so the
+   badge (and its label text) stay readable at full strength. Declared after
+   the dim rules so the equal-specificity override wins. Only opacity changes —
+   row height and layout are untouched. */
+.row-has-badges .text-cell,
+.row-has-badges .date-cell,
+.row-has-badges .author-cell,
+.row-has-badges .commit-cell {
+  opacity: 1;
+}
+
 /* Expanded sub-op rows render indented under their parent with a small Codicon.
    Dimmed slightly so they read as secondary to the parent row. The indent is
    applied to the text cell only, so the graph cell (continuation line) stays
@@ -269,7 +303,7 @@ body {
 .row-subop .date-cell,
 .row-subop .author-cell,
 .row-subop .commit-cell {
-  opacity: 0.7;
+  opacity: 0.85;
 }
 /* Small semantic icon for each expanded sub-op (VS Code Codicon glyph). */
 .subop-icon {

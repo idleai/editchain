@@ -461,8 +461,9 @@ function hideUndated() {
  * treated as a regex server-side (with literal fallback) and HIDES matching
  * rows (the service preserves chain endpoints, so the pattern never removes
  * the oldest root or newest leaf); "Show messages only" maps to an INCLUSIVE
- * kind pattern that keeps only message/command rows server-side, so the
- * window, layout, and sub-op counts stay coherent with the filtered row set.
+ * kind pattern that keeps message/command rows plus structural branch/reconnect
+ * anchors required for continuity, so the window, layout, and sub-op counts
+ * stay coherent with the filtered row set.
  */
 function filterPayload() {
   const pattern = (filterEl && filterEl.value.trim()) || '';
@@ -479,10 +480,10 @@ function filterPayload() {
  *
  * Filtering is server-side: the checkbox maps to an `include_kind_pattern`
  * (an inclusive constraint, not a hide pattern) so the service re-windows the
- * filtered set (and re-emits per-filter sub-op counts) and deterministically
- * excludes every non-message/non-command row, including endpoints. This keeps
- * the visible/absolute index mapping coherent instead of hiding rows
- * client-side after they were fetched.
+ * filtered set (and re-emits per-filter sub-op counts). Non-message rows are
+ * excluded except structural branch/reconnect anchors required to keep the
+ * graph connected. This keeps the visible/absolute index mapping coherent
+ * instead of hiding rows client-side after they were fetched.
  */
 function showMessagesOnly() {
   return !!(hideSystemEl && hideSystemEl.checked);
@@ -796,6 +797,56 @@ function subopIcon(subopKind) {
   }
 }
 
+/** Labels for the provider-neutral structural relationship kinds.
+ *
+ * The service tags a row's parent edges with the kinds the projection derives
+ * from `SubagentOf` / `ReconnectsTo` / `ForkOf` structural notes (see
+ * crates/editchain-protocol — `HistoryRow.parent_relations`). A badge marks
+ * the row itself: a row that STARTS a subagent branch, a row that RETURNS
+ * into a subagent branch (completion result), or a row that forks off a
+ * trunk.
+ *
+ * Every rendered attribute (CSS class, glyph, text, title) comes from the
+ * constant labels below — the wire value is only used as a lookup key — so an
+ * unknown or hostile kind can never inject a class name or markup. Unknown
+ * kinds (the protocol's forward-compatible `Unknown` variant) are ignored.
+ * Glyphs are basic-block arrows (U+2190–U+21FF) so they render in the
+ * webview's default font stack across platforms.
+ */
+const REL_LABELS = {
+  subagent: { cls: 'rel-subagent', glyph: '↳', text: 'subagent', title: 'Starts a subagent branch' },
+  reconnect: { cls: 'rel-reconnect', glyph: '↩', text: 'return', title: 'Completion returns into the subagent branch' },
+  fork: { cls: 'rel-fork', glyph: '⇉', text: 'fork', title: 'Branches off the target row at a fork boundary' },
+};
+
+/** Compact badges for a row's structural parent relations, or ''.
+ *
+ * Rendered inline in the content cell so the branch/start and return/completion
+ * semantics survive semantic collapsing. Inline (not block) so badges never
+ * affect row height — virtual scroll keeps every row exactly ROW_H and the
+ * content cell clips overflow, so long summaries simply ellipsize past the
+ * badges. Each badge carries a hover title and an aria-label for assistive
+ * tech.
+ */
+function relationBadges(row) {
+  const rels = Array.isArray(row.parent_relations) ? row.parent_relations : [];
+  if (!rels.length) return '';
+  const seen = new Set();
+  let html = '';
+  for (const rel of rels) {
+    const kind = rel && typeof rel.kind === 'string' ? rel.kind : '';
+    const label = Object.prototype.hasOwnProperty.call(REL_LABELS, kind)
+      ? REL_LABELS[kind]
+      : null;
+    if (!label || seen.has(kind)) continue;
+    seen.add(kind);
+    html += '<span class="rel-badge ' + label.cls + '" title="' + esc(label.title) +
+      '" aria-label="' + esc(label.title) + '">' +
+      label.glyph + ' ' + label.text + '</span>';
+  }
+  return html;
+}
+
 /** Build one row's HTML from its cached HistoryRow. `absIdx` is its absolute index.
  *
  * Two kinds of rows:
@@ -817,6 +868,11 @@ function buildRowHtml(row, absIdx, isGroupStart) {
     : 'row-dim';
   const humanClass = row.author === 'human' ? ' row-human' : '';
   const subopClass = row.is_subop ? ' row-subop' : '';
+  const badges = relationBadges(row);
+  // Badge rows are graph-topology-critical; the CSS override lifts their text
+  // cells out of the tool/dim opacity dimming so the badge stays readable at
+  // full strength (row height is untouched — the class only affects opacity).
+  const relClass = badges ? ' row-has-badges' : '';
   let content;
   if (row.is_subop) {
     // A bundled sub-op expanded inline: small Codicon + indented summary.
@@ -828,11 +884,11 @@ function buildRowHtml(row, absIdx, isGroupStart) {
     const expanded = expandedBlocks.has(blockIndexOfAbs(absIdx));
     const chevron = expanded ? '▾' : '▸';
     content = '<span class="subop-chevron" title="Expand metadata records">' + chevron + '</span>' +
-      esc(row.summary || '(no summary)');
+      badges + esc(row.summary || '(no summary)');
   } else {
-    content = esc(row.summary || '(no summary)');
+    content = badges + esc(row.summary || '(no summary)');
   }
-  return '<div class="row ' + kindClass + humanClass + subopClass + groupClass +
+  return '<div class="row ' + kindClass + humanClass + subopClass + relClass + groupClass +
     '" data-key="' + esc(row.node_key) +
     '" data-row="' + absIdx + '" style="' + colStyle() + '">' +
     groupLabel +

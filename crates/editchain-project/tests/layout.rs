@@ -5,7 +5,9 @@ use regex as _;
 use serde_json as _;
 
 use editchain_core::{NodeId, OpId};
-use editchain_project::layout::{compute_graph_layout, compute_lanes, LaneEdge, LayoutContext};
+use editchain_project::layout::{
+    compute_graph_layout, compute_lanes, GridPoint, LaneEdge, LayoutContext,
+};
 use editchain_project::{HistoryNode, HistoryProjection};
 
 fn op(node: u64, seq: u64) -> OpId {
@@ -325,6 +327,57 @@ fn edges_for_window_emits_edge_entering_from_above() {
     assert!(
         edges2.iter().any(|e| e.child == "N0" && e.parent == "N3"),
         "edge N0->N3 should be emitted when its parent is in the window even if its child is above"
+    );
+}
+
+#[test]
+fn edges_for_window_emits_edge_for_parent_at_window_top() {
+    // The exact scroll boundary: a merge child M sits immediately above the
+    // window (row `offset - 1`) and its parent Y is the first visible row
+    // (row `offset`). The parent-emitting pass used to start at `offset + 1`,
+    // so a parent on the window-top row never had its offscreen child's edge
+    // emitted and the line entering from above vanished at that boundary.
+    //
+    // Newest-first rows: M(0), Y(1), X(2). M merges X (base lane) and Y (extra
+    // lane), so the M->Y edge jogs lanes.
+    let nodes = vec!["M".to_string(), "Y".to_string(), "X".to_string()];
+    let parents = parents_from(&[("M", &["X", "Y"])]);
+    let ctx = LayoutContext::new(&nodes, &parents, &no_git);
+    let m_lane = *ctx.lane_at.get("M").expect("merge child lane");
+    let y_lane = *ctx.lane_at.get("Y").expect("merge parent lane");
+    assert_ne!(
+        m_lane, y_lane,
+        "merge child and its extra parent must occupy distinct lanes"
+    );
+
+    // Window covering exactly row 1 (Y, the first visible row): M is one row
+    // above it, so the edge must still be emitted, entering from offscreen.
+    let edges = ctx.edges_for_window(1, 1);
+    let boundary: Vec<_> = edges
+        .iter()
+        .filter(|e| e.child == "M" && e.parent == "Y")
+        .collect();
+    assert_eq!(
+        boundary.len(),
+        1,
+        "edge M->Y must be emitted exactly once for the boundary window"
+    );
+    assert_eq!(
+        boundary
+            .first()
+            .expect("boundary edge emitted exactly once")
+            .points,
+        vec![
+            GridPoint {
+                row: 1,
+                lane: m_lane
+            },
+            GridPoint {
+                row: 1,
+                lane: y_lane
+            },
+        ],
+        "clamped edge must enter at the window top and jog onto the parent's lane"
     );
 }
 

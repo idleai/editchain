@@ -60,14 +60,15 @@ impl Matcher {
 /// - [`Self::summary_pattern`] hides nodes whose display summary matches;
 /// - [`Self::kind_pattern`] hides nodes whose kind tag matches.
 /// - [`Self::include_kind_pattern`] is an INCLUSIVE constraint: when non-empty,
-///   only nodes whose kind tag matches are kept — every non-matching kind is
-///   excluded unconditionally (no endpoint preservation), so "Show messages
-///   only" can be expressed server-side without unsupported regex lookahead or
-///   client-side sparse offsets.
+///   only nodes whose kind tag matches are kept — except structural relationship
+///   anchors/targets required to preserve branch and reconnect geometry. This
+///   lets "Show messages only" stay server-side without severing the execution
+///   topology.
 ///
 /// Chain endpoints (nodes with no parent or no child in the full graph) are
-/// always preserved regardless of *hide* predicate matches; the unconditional
-/// `hide_undated` and `include_kind_pattern` exclusions are not endpoint-aware.
+/// always preserved regardless of *hide* predicate matches. `hide_undated` and
+/// `include_kind_pattern` are not ordinarily endpoint-aware; structural
+/// relationship anchors/targets are the topology-preserving exception.
 #[derive(Debug)]
 pub struct ChainFilter {
     /// Regex/literal pattern matched against each node's display summary.
@@ -174,10 +175,14 @@ pub struct ChainFilterKey {
 /// every kept child points at its nearest kept ancestor through any run of
 /// hidden intermediate nodes.
 ///
-/// `hide_undated` hides every undated node unconditionally (including leaves).
-/// `include_kind_pattern` keeps only matching kinds unconditionally (including
-/// leaves). Pattern-based hide truncation preserves endpoints (no parent / no
-/// child in the full graph) so a filtered chain keeps its anchors.
+/// `hide_undated` hides every ordinary undated node (including leaves).
+/// `include_kind_pattern` keeps only ordinary matching kinds (including leaves).
+/// Pattern-based hide truncation preserves endpoints (no parent / no child in
+/// the full graph) so a filtered chain keeps its anchors. Structural
+/// relationship anchor and target rows (the rows that carry or point at a
+/// `ForkOf` / `SubagentOf` / `ReconnectsTo` note) are preserved from every
+/// hide predicate so branch/reconnect geometry stays visible even when their
+/// kind (e.g. a tool-kind spawn marker) would be excluded by "messages only".
 #[must_use]
 #[expect(
     clippy::implicit_hasher,
@@ -187,10 +192,41 @@ pub fn apply(
     nodes: &[HistoryNode],
     links: &std::collections::BTreeMap<OpId, Vec<editchain_core::GitLink>>,
     note_map: &HashMap<OpId, Vec<Op>>,
+    representative: &HashMap<OpId, OpId>,
     filter: &ChainFilter,
 ) -> Vec<HistoryNode> {
     if filter.is_empty() || nodes.is_empty() {
         return nodes.to_vec();
+    }
+    // The visible rows of THIS filtered list: a spliced/kept parent is only kept
+    // when it resolves to one of them (directly or via a folded representative).
+    let present = crate::row_node_keys(nodes);
+
+    // Structural relationship anchor/target rows are graph-topology-critical:
+    // hiding them (e.g. "messages only" excluding a tool-kind spawn marker, or
+    // a pattern that matches a branch row) would sever the virtual
+    // fork/subagent/reconnect edges. Like chain endpoints, they are preserved
+    // from every hide predicate below — a filtered view keeps branch/reconnect
+    // geometry visible. Anchors are the canonical (visible) note-map keys;
+    // targets are each note's raw ids lifted to their visible rows.
+    let mut structural_keys = HashSet::with_capacity(note_map.len());
+    for (anchor, notes) in note_map {
+        if let Some(key) =
+            crate::canonical_parent_key(&anchor.to_string(), representative, &present)
+        {
+            let _: bool = structural_keys.insert(key);
+        }
+        for note in notes {
+            if let editchain_core::OpKind::Note(n) = &note.kind {
+                for target in &n.target_ids {
+                    if let Some(key) =
+                        crate::canonical_parent_key(&target.to_string(), representative, &present)
+                    {
+                        let _: bool = structural_keys.insert(key);
+                    }
+                }
+            }
+        }
     }
 
     // Original parent keys per key (op ids + git oid hex).
@@ -199,7 +235,8 @@ pub fn apply(
     let mut children_of_key = HashMap::with_capacity(nodes.len());
     for n in nodes {
         let key = n.node_key();
-        let ps = n.parent_keys(links, note_map);
+        let ps =
+            crate::canonicalize_parents(n.parent_keys(links, note_map), representative, &present);
         drop(parents_of_key.insert(key.clone(), ps.clone()));
         for p in ps {
             children_of_key
@@ -222,12 +259,18 @@ pub fn apply(
     // Pattern-based hide truncation (summary/kind) instead preserves endpoints
     // (nodes with no parent or no child in the full graph) so a filtered chain
     // keeps its anchors — the oldest root and newest leaf stay visible even
-    // when they match. The inclusive-kind constraint is NOT endpoint-aware:
-    // "messages only" must deterministically exclude every non-message kind,
-    // including lone leaves that would otherwise survive as anchors.
+    // when they match. The inclusive-kind constraint is NOT ordinarily
+    // endpoint-aware: "messages only" excludes non-message kinds, including
+    // lone leaves that would otherwise survive as anchors. Structural relation
+    // anchors/targets are the explicit exception handled below.
     let mut hidden = HashSet::with_capacity(nodes.len());
     for n in nodes {
         let key = n.node_key();
+        // Structural relation anchors/targets are never hidden: their rows
+        // carry the virtual edges that keep branch/reconnect geometry visible.
+        if structural_keys.contains(&key) {
+            continue;
+        }
         if filter.hide_undated && n.timestamp_ms() == 0 {
             let _: bool = hidden.insert(key);
             continue;
@@ -261,7 +304,11 @@ pub fn apply(
         } else {
             n.parent_keys(links, note_map)
         };
-        out.set_parent_keys(&spliced);
+        out.set_parent_keys(&crate::canonicalize_parents(
+            spliced,
+            representative,
+            &present,
+        ));
         result.push(out);
     }
     result
