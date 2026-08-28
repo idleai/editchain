@@ -24,7 +24,14 @@ const CHROME = process.env.CHROME_PATH ||
   '/mnt/hot/ambientlight/.cache/puppeteer/chrome/linux-151.0.7922.71/chrome-linux64/chrome';
 
 function parseArgs(argv) {
-  const args = { workspace: null, chainDir: '.editchain', viewport: '1440x900', out: null, selector: null };
+  const args = {
+    workspace: null, chainDir: '.editchain', viewport: '1440x900', out: null,
+    selector: null, shot: null,
+    // Row-ready deadline. The real service can take >20s to Open + deliver the
+    // first window on a large chain, so this must be long and configurable —
+    // the outer runner (CI/timeout wrapper) bounds the whole run instead.
+    rowTimeoutMs: 120000,
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--workspace') args.workspace = argv[++i];
@@ -32,8 +39,14 @@ function parseArgs(argv) {
     else if (a === '--viewport') args.viewport = argv[++i];
     else if (a === '--out') args.out = argv[++i];
     else if (a === '--selector') args.selector = argv[++i];
+    else if (a === '--shot') args.shot = argv[++i];
+    else if (a === '--row-timeout') args.rowTimeoutMs = parseInt(argv[++i], 10) || args.rowTimeoutMs;
   }
   if (!args.workspace) args.workspace = '/mnt/hot/ambientlight/repos/editchain';
+  if (process.env.ROW_TIMEOUT) {
+    const parsed = parseInt(process.env.ROW_TIMEOUT, 10);
+    if (parsed > 0) args.rowTimeoutMs = parsed;
+  }
   return args;
 }
 
@@ -51,6 +64,32 @@ function makeServiceClient(binaryPath) {
   let nextId = 1;
   const pending = new Map();
   const stderrLines = [];
+  // Bounded default for requests that don't opt out explicitly. Open passes 0
+  // (no deadline — it can legitimately take minutes), everything else gets a
+  // finite cap so a hung service can never stall the harness forever.
+  const DEFAULT_TIMEOUT_MS = 30_000;
+
+  // Reject every outstanding request with `reason`. Used when the process
+  // errors, exits, is killed, or its stdin dies — without this a pending
+  // request (especially an unbounded Open) would never settle.
+  function failPending(reason) {
+    const err = new Error(reason);
+    for (const [id, entry] of pending) {
+      pending.delete(id);
+      if (entry.timer) clearTimeout(entry.timer);
+      entry.reject(err);
+    }
+  }
+
+  proc.on('error', (err) => failPending('service process error: ' + err.message));
+  proc.on('exit', (code) => {
+    failPending(code === null || code === 0
+      ? 'service process exited unexpectedly'
+      : 'service process exited with code ' + code);
+  });
+  // A write to a dead process surfaces as an 'error' on the stdin stream; with
+  // no listener it would be an uncaught 'error' event that crashes the runner.
+  proc.stdin.on('error', (err) => failPending('service stdin error: ' + err.message));
 
   proc.stderr.on('data', (c) => stderrLines.push(c.toString()));
 
@@ -64,9 +103,10 @@ function makeServiceClient(binaryPath) {
       let msg;
       try { msg = JSON.parse(payload); } catch { continue; }
       if (msg.id !== undefined && pending.has(msg.id)) {
-        const resolve = pending.get(msg.id);
+        const entry = pending.get(msg.id);
         pending.delete(msg.id);
-        resolve(msg.body);
+        if (entry.timer) clearTimeout(entry.timer);
+        entry.resolve(msg.body);
       }
     }
   });
@@ -75,19 +115,37 @@ function makeServiceClient(binaryPath) {
     send(body, timeoutMs) {
       const id = nextId++;
       return new Promise((resolve, reject) => {
-        const t = setTimeout(() => {
-          pending.delete(id);
-          reject(new Error('service request timed out: ' + JSON.stringify(body).slice(0, 80)));
-        }, timeoutMs || 15000);
-        pending.set(id, (body) => { clearTimeout(t); resolve(body); });
+        // An explicit 0 means "no deadline" (used for Open, which can take
+        // minutes on a large workspace); the request still settles when the
+        // service errors/exits or the process is killed (see failPending).
+        // Undefined/null falls back to a bounded default so nothing hangs.
+        const effective = typeof timeoutMs === 'number' ? timeoutMs : DEFAULT_TIMEOUT_MS;
+        const t = effective > 0
+          ? setTimeout(() => {
+              pending.delete(id);
+              reject(new Error('service request timed out after ' + effective + 'ms: ' +
+                JSON.stringify(body).slice(0, 80)));
+            }, effective)
+          : null;
+        pending.set(id, { resolve, reject, timer: t });
         const payload = Buffer.from(JSON.stringify({ id, body }), 'utf8');
         const header = Buffer.alloc(4);
         header.writeUInt32LE(payload.length, 0);
-        proc.stdin.write(Buffer.concat([header, payload]));
+        try {
+          proc.stdin.write(Buffer.concat([header, payload]));
+        } catch (e) {
+          if (pending.delete(id)) {
+            if (t) clearTimeout(t);
+            reject(new Error('service write failed: ' + e.message));
+          }
+        }
       });
     },
     stderr() { return stderrLines.join(''); },
-    kill() { proc.kill(); },
+    kill() {
+      failPending('service process killed');
+      proc.kill();
+    },
   };
 }
 
@@ -110,7 +168,8 @@ async function main() {
 
   // Open the workspace first to confirm it loads.
   console.log('STEP open...');
-  const openResp = await svc.send({ Open: { workspace_path: args.workspace, chain_dir: args.chainDir } });
+  // No fixed deadline: opening a workspace can take minutes on large chains.
+  const openResp = await svc.send({ Open: { workspace_path: args.workspace, chain_dir: args.chainDir } }, 0);
   console.log('OPEN:', JSON.stringify(openResp));
 
   console.log('STEP launch browser...');
@@ -136,8 +195,10 @@ async function main() {
     window.__editchainWorkspace = workspace;
     window.__editchainChainDir = chainDir;
     window.__editchainService = {
-      send(body) {
-        return window.__editchainServiceSend(body);
+      // Forward the caller's optional timeout (Open passes 0 = no deadline);
+      // undefined falls through to the bounded default in makeServiceClient.
+      send(body, timeoutMs) {
+        return window.__editchainServiceSend(body, timeoutMs);
       },
     };
   }, args.workspace, args.chainDir);
@@ -145,7 +206,8 @@ async function main() {
   // Bridge Node-side send into the page (must be exposed before goto so the
   // page's __editchainService.send can call it).
   console.log('STEP exposeFunction...');
-  await page.exposeFunction('__editchainServiceSend', (body) => svc.send(body));
+  // Pass the caller's timeout preference through (Open uses 0 = no deadline).
+  await page.exposeFunction('__editchainServiceSend', (body, timeoutMs) => svc.send(body, timeoutMs));
 
   await page.goto(HARNESS, { waitUntil: 'networkidle0' });
 
@@ -158,21 +220,61 @@ async function main() {
   console.log('STEP start handshake...');
   await page.evaluate(() => window.__editchainStart());
 
-  // Wait for rows to actually render (the real service round-trips async).
+  // Wait for rows to actually render (the real service round-trips async; the
+  // deadline is long/configurable — never a fixed service deadline).
   console.log('STEP wait for rows...');
-  await page.waitForFunction(() => document.querySelectorAll('.row').length > 0,
-    { timeout: 20000 });
+  let waitError = null;
+  try {
+    await page.waitForFunction(() => document.querySelectorAll('.row').length > 0,
+      { timeout: args.rowTimeoutMs });
+  } catch (e) {
+    waitError = e;
+  }
+  if (waitError) {
+    // Failure diagnostics: page status + console + service stderr, never a
+    // bare Puppeteer timeout.
+    const diag = await page.evaluate(() => {
+      const msg = document.querySelector('.view-message');
+      return {
+        bodyText: (document.body.textContent || '').trim().slice(0, 400),
+        viewMessage: msg ? (msg.textContent || '').trim().slice(0, 200) : null,
+        dataReady: window.__editchainDataReady === true,
+        rows: document.querySelectorAll('.row').length,
+        scenario: window.__editchainScenarioName || null,
+      };
+    }).catch(() => ({ evaluateFailed: true }));
+    const detail = {
+      waitError: String(waitError && waitError.message || waitError),
+      page: diag,
+      pageErrors,
+      consoleLines: consoleLines.slice(-30),
+      serviceStderr: svc.stderr().slice(-2000),
+    };
+    fs.writeFileSync(path.join(outDir, 'wait-failure.json'), JSON.stringify(detail, null, 2));
+    console.error('WAIT FAILED: rows did not render within ' + args.rowTimeoutMs + 'ms');
+    console.error(JSON.stringify(detail, null, 2));
+    await browser.close();
+    svc.kill();
+    process.exit(1);
+  }
   console.log('STEP rows present');
 
   // Wait for the UI to settle deterministically.
   console.log('STEP whenIdle...');
-  await page.evaluate(() => window.__editchainDebug.whenIdle(8000));
+  await page.evaluate((timeoutMs) => window.__editchainDebug.whenIdle(timeoutMs), args.rowTimeoutMs);
   console.log('STEP idle done');
 
   // Collect artifacts.
   const layout = await page.evaluate(() => window.__editchainDebug.dumpLayout());
   const metrics = await page.evaluate(() => window.__editchainDebug.getMetrics());
   const assertion = await page.evaluate(() => window.__editchainDebug.assertLayout());
+
+  // Deterministic screenshot: taken only after whenIdle + assertions, so the
+  // capture shows a settled real-data table (never the loading state or
+  // placeholder-filled DOM).
+  if (args.shot) {
+    await page.screenshot({ path: args.shot });
+  }
 
   // Full DOM tree with computed styles — the user's request.
   const domTree = await page.evaluate((selector) => {
@@ -257,6 +359,7 @@ async function main() {
   console.log('checks pass=' + assertion.passCount + ' fail=' + assertion.failCount);
   failedChecks.forEach((c) => console.log('FAIL ' + c.name + ': ' + c.detail));
   if (pageErrors.length) console.log('PAGE ERRORS:', pageErrors.length);
+  if (args.shot) console.log('shot -> ' + args.shot);
   console.log('artifacts -> ' + outDir);
 
   await browser.close();

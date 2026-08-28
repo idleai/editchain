@@ -1,0 +1,36 @@
+[package]
+name = "codex-session-exporter"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.97"
+description = "Isolated Codex rollout JSONL -> editchain-v1 NDJSON projection bridge"
+publish = false
+
+# Isolated mini-workspace: this tool must never join the EditChain workspace or
+# link its crates. The root package is an implicit member of this empty table.
+[workspace]
+resolver = "2"
+
+[dependencies]
+codex-app-server-protocol = { path = "../../../codex/codex-rs/app-server-protocol" }
+codex-protocol = { path = "../../../codex/codex-rs/protocol" }
+codex-rollout = { path = "../../../codex/codex-rs/rollout" }
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The codex-network-proxy crate (transitively pulled by app-server-protocol)
+# uses rama-core 0.3.0-alpha.4, which is not source-compatible with the stable
+# 0.3.0 rama-error/rama-macros/rama-utils crates. Pin the same prerelease
+# versions the sibling Codex workspace resolves in its Cargo.lock.
+rama-error = "=0.3.0-alpha.4"
+rama-macros = "=0.3.0-alpha.4"
+rama-utils = "=0.3.0-alpha.4"
+
+# Mirrors the sibling Codex checkout's [patch.crates-io] entries so this
+# isolated workspace resolves the same forked crates when they appear in the
+# dependency graph (rmcp/transport). Unused patch entries are inert.
+[patch.crates-io]
+crossterm = { git = "https://github.com/openai-oss-forks/crossterm", rev = "45fecb9508105988f42fe6ff0441783ed3717f92" }
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }

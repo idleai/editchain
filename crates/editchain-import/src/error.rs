@@ -31,6 +31,33 @@ pub enum ImportError {
         /// Hash of the incoming content.
         incoming_hash: [u8; 32],
     },
+    /// The Codex helper process could not be spawned.
+    HelperSpawn {
+        /// Helper program path.
+        program: String,
+        /// Underlying spawn error.
+        source: std::io::Error,
+    },
+    /// The Codex helper process exited unsuccessfully (or was killed).
+    HelperFailed {
+        /// Rollout file being processed.
+        path: PathBuf,
+        /// Helper program path.
+        program: String,
+        /// Exit code (`None` when terminated by a signal).
+        exit_code: Option<i32>,
+        /// Captured stderr from the helper.
+        stderr: String,
+    },
+    /// The helper emitted a projection record that violates the editchain-v1
+    /// schema, or the projection stream is structurally inconsistent with the
+    /// raw rollout file.
+    ProjectionProtocol {
+        /// Rollout file being processed.
+        path: PathBuf,
+        /// Human-readable description of the violation.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for ImportError {
@@ -56,6 +83,28 @@ impl std::fmt::Display for ImportError {
             Self::BlobSink(msg) => write!(f, "blob sink: {msg}"),
             Self::UuidCollision { uuid, .. } => {
                 write!(f, "UUID collision for {uuid}: different content")
+            }
+            Self::HelperSpawn { program, source } => {
+                write!(f, "codex helper {program:?} could not be spawned: {source}")
+            }
+            Self::HelperFailed {
+                path,
+                program,
+                exit_code,
+                stderr,
+            } => {
+                write!(
+                    f,
+                    "codex helper {program:?} failed for {} (exit {exit_code:?}): {stderr}",
+                    path.display()
+                )
+            }
+            Self::ProjectionProtocol { path, detail } => {
+                write!(
+                    f,
+                    "editchain-v1 projection error for {}: {detail}",
+                    path.display()
+                )
             }
         }
     }

@@ -93,11 +93,23 @@ pub enum Commands {
         #[arg(long)]
         op: Option<String>,
     },
-    /// Import Claude Code sessions into the edit chain
+    /// Import agent sessions (Claude Code or Codex) into the edit chain
     Import {
-        /// Path to the Claude Code sessions directory
+        /// Sessions directory — auto-detected when empty (Claude:
+        /// `~/.claude/projects/<encoded-cwd>`; Codex: `~/.codex/sessions`)
         #[arg(long, default_value = "")]
         sessions_dir: String,
+        /// Session provider to import from
+        #[arg(long, value_enum, default_value_t = Provider::Claude)]
+        provider: Provider,
+        /// Helper program that projects Codex rollouts (default:
+        /// `codex-session-exporter` on PATH); requires `--provider codex`
+        #[arg(long)]
+        codex_helper: Option<String>,
+        /// Fixed prefix argument passed to the Codex helper before the rollout
+        /// path (repeatable); requires `--provider codex`
+        #[arg(long, action = clap::ArgAction::Append, allow_hyphen_values = true)]
+        codex_helper_arg: Vec<String>,
         /// Path to the workspace root
         #[arg(long, default_value = ".")]
         workspace: String,
@@ -108,6 +120,15 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+}
+
+/// Session provider to import from.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    /// Claude Code sessions (`~/.claude/projects`).
+    Claude,
+    /// Codex rollouts (`~/.codex/sessions`).
+    Codex,
 }
 
 /// Dispatch a command to its handler.
@@ -140,6 +161,17 @@ pub fn dispatch(command: Commands) -> Result<(), Box<dyn std::error::Error>> {
             workspace,
             chain,
             dry_run,
-        } => import::run(sessions_dir, workspace, chain, dry_run),
+            provider,
+            codex_helper,
+            codex_helper_arg,
+        } => import::run(
+            sessions_dir,
+            workspace,
+            chain,
+            dry_run,
+            provider,
+            codex_helper,
+            codex_helper_arg,
+        ),
     }
 }

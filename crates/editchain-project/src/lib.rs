@@ -224,6 +224,12 @@ impl HistoryNode {
     /// fork/subagent branches render without mutating stored causality (SPEC
     /// §1.1, §5). `notes` maps a causal parent op id to the structural notes
     /// that annotate it.
+    ///
+    /// Keys are deduplicated preserving first-occurrence order (stored causal
+    /// parents, then git-link targets, then virtual note targets), so a target
+    /// shared between any of the three sources is emitted exactly once. This
+    /// keeps parent keys deterministic and duplicate-free even when a filtered
+    /// clone has materialized a virtual target into its stored `Op.parents`.
     #[must_use]
     pub fn parent_keys(
         &self,
@@ -232,18 +238,37 @@ impl HistoryNode {
     ) -> Vec<String> {
         match self {
             Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => {
-                let mut keys: Vec<String> = op.parents.iter().map(ToString::to_string).collect();
+                let mut keys: Vec<String> = Vec::new();
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for parent in &op.parents {
+                    let key = parent.to_string();
+                    if seen.insert(key.clone()) {
+                        keys.push(key);
+                    }
+                }
                 if let Some(links) = git_links.get(&op.id) {
                     for link in links {
-                        keys.push(link.target_oid.to_hex());
+                        let key = link.target_oid.to_hex();
+                        if seen.insert(key.clone()) {
+                            keys.push(key);
+                        }
                     }
                 }
                 // Virtual parents: this op is the causal parent a structural
                 // note annotates, so the note's target becomes a parent edge.
+                // Deduplicate against stored/git parents: the hide-undated
+                // filter materializes virtual targets into the cloned op's
+                // `Op.parents`, so a later read would otherwise repeat the same
+                // edge even though the chain holds one note per child.
                 if let Some(notes) = notes.get(&op.id) {
                     for note in notes {
                         if let editchain_core::OpKind::Note(n) = &note.kind {
-                            keys.extend(n.target_ids.iter().map(ToString::to_string));
+                            for target in &n.target_ids {
+                                let key = target.to_string();
+                                if seen.insert(key.clone()) {
+                                    keys.push(key);
+                                }
+                            }
                         }
                     }
                 }
@@ -591,11 +616,16 @@ impl HistoryProjection {
             }
         }
 
-        // Seed the queue with nodes that have no present parents.
+        // Seed the queue with nodes that have no present parents, in `nodes`
+        // input order (not HashMap iteration order, which is seeded per
+        // process): the queue order is the tie-break between independent roots,
+        // so it must be stable across processes for identical row ordering
+        // (e.g. ops sharing a timestamp keep a reproducible order).
         let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-        for (key, &deg) in &indegree {
-            if deg == 0 {
-                queue.push_back(key.clone());
+        for node in &nodes {
+            let key = node.node_key();
+            if indegree.get(&key).copied() == Some(0) {
+                queue.push_back(key);
             }
         }
 
@@ -1468,6 +1498,7 @@ fn collapsed_import_summary(op: &Op, children: Option<&Vec<&Op>>) -> String {
     // the content preview, shown WITHOUT the `tool: ` prefix.
     let mut tool_is_result = false;
     let mut command = String::new();
+    let mut file = String::new();
     if let Some(children) = children {
         for child in children {
             match &child.kind {
@@ -1489,6 +1520,11 @@ fn collapsed_import_summary(op: &Op, children: Option<&Vec<&Op>>) -> String {
                 OpKind::Command(c) if command.is_empty() => {
                     command = payload_text(&c.content);
                 }
+                OpKind::File(_) if file.is_empty() => {
+                    if let Some(path) = annotated_file_path(child, Some(children)) {
+                        file = format!("file: {path}");
+                    }
+                }
                 _ => {}
             }
         }
@@ -1506,6 +1542,9 @@ fn collapsed_import_summary(op: &Op, children: Option<&Vec<&Op>>) -> String {
     if !command.is_empty() {
         return format!("$ {command}");
     }
+    if !file.is_empty() {
+        return file;
+    }
     // No meaningful children — fall back to a label derived from the raw record.
     match &op.kind {
         OpKind::Import(i) => raw_import_label(i),
@@ -1522,6 +1561,31 @@ fn collapsed_import_summary(op: &Op, children: Option<&Vec<&Op>>) -> String {
         OpKind::GitLink(l) => format!("git:{}", l.target_oid),
         OpKind::Unknown(u) => format!("unknown kind={}", u.kind_discriminant),
     }
+}
+
+/// Resolve a collapsed File row's display path.
+///
+/// The core [`FileOp`] stores only a hashed `PathId`; the provider-neutral
+/// path text is carried by an explicit `Explains` note targeting the file op
+/// (the Codex importer emits one per file item). Rows without such an
+/// annotation — e.g. Claude attachment rows, which carry no file path — fall
+/// through to the raw-record label, preserving existing Claude behavior.
+#[must_use]
+fn annotated_file_path(file_op: &Op, children: Option<&Vec<&Op>>) -> Option<String> {
+    let children = children?;
+    for child in children {
+        if let editchain_core::OpKind::Note(note) = &child.kind {
+            if note.relationship == NoteRelationship::Explains
+                && note.target_ids.contains(&file_op.id)
+            {
+                let text = payload_text(&note.content);
+                if !text.is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Produce a meaningful display label for a raw import record.

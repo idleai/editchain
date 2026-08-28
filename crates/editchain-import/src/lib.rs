@@ -1,9 +1,9 @@
-//! Editchain import adapters — Claude Code history parsers.
+//! Editchain import adapters — Claude Code and Codex history importers.
 //!
 //! This crate provides deterministic, idempotent import of Claude Code session
-//! files into editchain operations. Every physical JSONL line is preserved as
-//! a raw `ImportOp`; normalized operations (messages, tools, commands, files)
-//! are derived alongside.
+//! files and Codex rollout files into editchain operations. Every physical
+//! JSONL line is preserved as a raw `ImportOp`; normalized operations
+//! (messages, tools, commands, files) are derived alongside.
 
 use serde as _;
 
@@ -33,6 +33,8 @@ pub mod subagent;
 
 /// Claude Code session import pipeline.
 pub mod claude_code;
+/// Codex (OpenAI) session import pipeline.
+pub mod codex;
 
 pub use cursor::*;
 pub use error::*;

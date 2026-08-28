@@ -59,15 +59,24 @@ impl Matcher {
 /// - [`Self::hide_undated`] hides nodes whose clock is unknown (`timestamp_ms() == 0`);
 /// - [`Self::summary_pattern`] hides nodes whose display summary matches;
 /// - [`Self::kind_pattern`] hides nodes whose kind tag matches.
+/// - [`Self::include_kind_pattern`] is an INCLUSIVE constraint: when non-empty,
+///   only nodes whose kind tag matches are kept — every non-matching kind is
+///   excluded unconditionally (no endpoint preservation), so "Show messages
+///   only" can be expressed server-side without unsupported regex lookahead or
+///   client-side sparse offsets.
 ///
 /// Chain endpoints (nodes with no parent or no child in the full graph) are
-/// always preserved regardless of predicate matches.
+/// always preserved regardless of *hide* predicate matches; the unconditional
+/// `hide_undated` and `include_kind_pattern` exclusions are not endpoint-aware.
 #[derive(Debug)]
 pub struct ChainFilter {
     /// Regex/literal pattern matched against each node's display summary.
     pub summary_pattern: String,
     /// Regex/literal pattern matched against each node's kind tag.
     pub kind_pattern: String,
+    /// Inclusive kind constraint: when non-empty, only nodes whose kind tag
+    /// matches are kept. Empty means no inclusion constraint.
+    pub include_kind_pattern: String,
     /// Hide nodes with no real timestamp (`timestamp_ms() == 0`).
     pub hide_undated: bool,
     /// Reconnect causal edges across hidden intermediate nodes so chains stay
@@ -75,11 +84,12 @@ pub struct ChainFilter {
     pub splice: bool,
     summary_matcher: Matcher,
     kind_matcher: Matcher,
+    include_kind_matcher: Matcher,
 }
 
 impl Default for ChainFilter {
     fn default() -> Self {
-        Self::new(String::new(), String::new(), true, true)
+        Self::new(String::new(), String::new(), String::new(), true, true)
     }
 }
 
@@ -93,14 +103,17 @@ impl ChainFilter {
     pub fn new(
         summary_pattern: String,
         kind_pattern: String,
+        include_kind_pattern: String,
         hide_undated: bool,
         splice: bool,
     ) -> Self {
         Self {
             summary_matcher: Matcher::new(&summary_pattern),
             kind_matcher: Matcher::new(&kind_pattern),
+            include_kind_matcher: Matcher::new(&include_kind_pattern),
             summary_pattern,
             kind_pattern,
+            include_kind_pattern,
             hide_undated,
             splice,
         }
@@ -109,15 +122,15 @@ impl ChainFilter {
     /// Whether this filter would hide nothing at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        !self.hide_undated && self.summary_pattern.is_empty() && self.kind_pattern.is_empty()
+        !self.hide_undated
+            && self.summary_pattern.is_empty()
+            && self.kind_pattern.is_empty()
+            && self.include_kind_pattern.is_empty()
     }
 
-    /// Whether a single node matches any active predicate.
+    /// Whether a single node matches any active pattern-based HIDE predicate.
     #[must_use]
-    fn matches(&self, node: &HistoryNode) -> bool {
-        if self.hide_undated && node.timestamp_ms() == 0 {
-            return true;
-        }
+    fn matches_hide_pattern(&self, node: &HistoryNode) -> bool {
         if self.summary_matcher.matches(&node.summary()) {
             return true;
         }
@@ -133,6 +146,7 @@ impl ChainFilter {
         ChainFilterKey {
             summary_pattern: self.summary_pattern.clone(),
             kind_pattern: self.kind_pattern.clone(),
+            include_kind_pattern: self.include_kind_pattern.clone(),
             hide_undated: self.hide_undated,
             splice: self.splice,
         }
@@ -146,6 +160,8 @@ pub struct ChainFilterKey {
     pub summary_pattern: String,
     /// Kind pattern string.
     pub kind_pattern: String,
+    /// Inclusive kind pattern string (empty = no inclusion constraint).
+    pub include_kind_pattern: String,
     /// Hide undated flag.
     pub hide_undated: bool,
     /// Splice flag.
@@ -159,8 +175,9 @@ pub struct ChainFilterKey {
 /// hidden intermediate nodes.
 ///
 /// `hide_undated` hides every undated node unconditionally (including leaves).
-/// Pattern-based truncation preserves endpoints (no parent / no child in the
-/// full graph) so a filtered chain keeps its anchors.
+/// `include_kind_pattern` keeps only matching kinds unconditionally (including
+/// leaves). Pattern-based hide truncation preserves endpoints (no parent / no
+/// child in the full graph) so a filtered chain keeps its anchors.
 #[must_use]
 #[expect(
     clippy::implicit_hasher,
@@ -202,9 +219,12 @@ pub fn apply(
     // with no meaningful chain position, so a lone undated leaf is junk and must
     // not survive just because it happens to be an endpoint.
     //
-    // Pattern-based truncation (summary/kind) instead preserves endpoints (nodes
-    // with no parent or no child in the full graph) so a filtered chain keeps its
-    // anchors — the oldest root and newest leaf stay visible even when they match.
+    // Pattern-based hide truncation (summary/kind) instead preserves endpoints
+    // (nodes with no parent or no child in the full graph) so a filtered chain
+    // keeps its anchors — the oldest root and newest leaf stay visible even
+    // when they match. The inclusive-kind constraint is NOT endpoint-aware:
+    // "messages only" must deterministically exclude every non-message kind,
+    // including lone leaves that would otherwise survive as anchors.
     let mut hidden = HashSet::with_capacity(nodes.len());
     for n in nodes {
         let key = n.node_key();
@@ -212,11 +232,17 @@ pub fn apply(
             let _: bool = hidden.insert(key);
             continue;
         }
+        if !filter.include_kind_pattern.is_empty()
+            && !filter.include_kind_matcher.matches(&n.kind())
+        {
+            let _: bool = hidden.insert(key);
+            continue;
+        }
         if !filter.summary_pattern.is_empty() || !filter.kind_pattern.is_empty() {
             let has_parent = !parents_of_key.get(&key).is_none_or(Vec::is_empty);
             let has_child = !children_of_key.get(&key).is_none_or(Vec::is_empty);
             let is_endpoint = !has_parent || !has_child;
-            if !is_endpoint && filter.matches(n) {
+            if !is_endpoint && filter.matches_hide_pattern(n) {
                 let _: bool = hidden.insert(key);
             }
         }

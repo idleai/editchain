@@ -5,7 +5,7 @@ use regex as _;
 use serde_json as _;
 
 use editchain_core::{NodeId, OpId};
-use editchain_project::layout::{compute_graph_layout, compute_lanes, LayoutContext};
+use editchain_project::layout::{compute_graph_layout, compute_lanes, LaneEdge, LayoutContext};
 use editchain_project::{HistoryNode, HistoryProjection};
 
 fn op(node: u64, seq: u64) -> OpId {
@@ -434,6 +434,128 @@ fn reuse_preserves_merge_two_lanes() {
         lane_of("Y"),
         "merge parents need distinct lanes"
     );
+}
+
+/// A full, comparable snapshot of a layout's lane geometry (lanes, per-row
+/// above/below/transitions, and every edge's point path).
+fn geometry_snapshot(ctx: &LayoutContext, edges: &[LaneEdge]) -> String {
+    let mut parts = Vec::new();
+    for (row, r) in ctx.lanes.iter().enumerate() {
+        parts.push(format!(
+            "{}:{} a={:?} b={:?} t={:?}",
+            r.node,
+            r.lane,
+            ctx.row_above.get(row).unwrap_or(&Vec::new()),
+            ctx.row_below.get(row).unwrap_or(&Vec::new()),
+            ctx.row_transitions.get(row).unwrap_or(&Vec::new()),
+        ));
+    }
+    parts.push("edges:".to_string());
+    for e in edges {
+        parts.push(format!("{}->{} {:?}", e.child, e.parent, e.points));
+    }
+    parts.join("\n")
+}
+
+/// Regression: lane geometry must be a pure function of node order + parent
+/// edges — byte-identical across every rebuild and every process.
+///
+/// The lane-reuse algorithm used to collect each component's members (and seed
+/// the topological-order BFS queue) by iterating `HashMap`s. `RandomState`
+/// seeds every fresh map (and every fresh process) differently, so the same
+/// graph could render with different lanes in two service processes, or even in
+/// two rebuilds of the same process. This graph is deliberately
+/// hash-order-sensitive: component {M, B, A} is a merge of two rootless
+/// branches (two zero-in-degree roots, so queue order decides which root owns
+/// the base lane), and the E/F chains are disconnected but overlap in time so
+/// interval coloring allocates distinct base columns too. Every rebuild must
+/// produce identical geometry, and the tie-break is pinned exactly.
+#[test]
+fn lane_geometry_is_identical_across_repeated_builds() {
+    // Newest-first rows: M(0) merges roots A and B; E2->E1 spans rows 3..5;
+    // F2->F1 spans rows 4..6 and overlaps E so the two get distinct bases.
+    let nodes = vec![
+        "M".to_string(),
+        "B".to_string(),
+        "A".to_string(),
+        "E2".to_string(),
+        "F2".to_string(),
+        "E1".to_string(),
+        "F1".to_string(),
+    ];
+    let parents = parents_from(&[("M", &["A", "B"]), ("E2", &["E1"]), ("F2", &["F1"])]);
+
+    let build = || {
+        let ctx = LayoutContext::new(&nodes, &parents, &no_git);
+        let layout = compute_graph_layout(&nodes, &parents, &no_git);
+        geometry_snapshot(&ctx, &layout.edges)
+    };
+    let first = build();
+    for round in 1..32 {
+        assert_eq!(
+            first,
+            build(),
+            "layout round {round} differs from round 0: HashMap iteration order leaked into lane geometry"
+        );
+    }
+
+    // Deterministic tie-break canary: the per-component topological queue seeds
+    // from display order, so the newer root B owns the base lane and the merge
+    // M inherits the older root A's second lane.
+    let ctx = LayoutContext::new(&nodes, &parents, &no_git);
+    let lane_of = |k: &str| {
+        ctx.lanes
+            .iter()
+            .find(|r| r.node == k)
+            .expect("node in rows")
+            .lane
+    };
+    assert_eq!(lane_of("M"), 1, "merge inherits the older root's lane");
+    assert_eq!(lane_of("A"), 1, "older root owns the second lane");
+    assert_eq!(lane_of("B"), 0, "newer root owns the base lane");
+    assert_eq!(lane_of("E2"), 0, "E chain reuses the base column");
+    assert_eq!(lane_of("E1"), 0, "E chain reuses the base column");
+    assert_eq!(lane_of("F2"), 1, "overlapping F chain gets its own base");
+    assert_eq!(lane_of("F1"), 1, "overlapping F chain gets its own base");
+
+    assert_eq!(
+        ctx.row_transitions.first().map_or(&[][..], Vec::as_slice),
+        &[(1, 0)][..],
+        "merge jog from lane 1 to lane 0 happens at the merge row"
+    );
+    assert_eq!(
+        ctx.row_above.first().map_or(&[][..], Vec::as_slice),
+        &[1][..]
+    );
+    assert_eq!(
+        ctx.row_below.first().map_or(&[][..], Vec::as_slice),
+        &[0, 1][..]
+    );
+    assert_eq!(
+        ctx.row_above.get(5).map_or(&[][..], Vec::as_slice),
+        &[0, 1][..]
+    );
+    assert_eq!(
+        ctx.row_below.get(4).map_or(&[][..], Vec::as_slice),
+        &[0, 1][..]
+    );
+
+    let layout = compute_graph_layout(&nodes, &parents, &no_git);
+    let edge_points = |child: &str, parent: &str| -> Vec<(usize, usize)> {
+        layout
+            .edges
+            .iter()
+            .find(|e| e.child == child && e.parent == parent)
+            .expect("edge in layout")
+            .points
+            .iter()
+            .map(|p| (p.row, p.lane))
+            .collect()
+    };
+    assert_eq!(edge_points("M", "A"), vec![(0, 1), (2, 1)]);
+    assert_eq!(edge_points("M", "B"), vec![(0, 1), (0, 1), (0, 0), (1, 0)]);
+    assert_eq!(edge_points("E2", "E1"), vec![(3, 0), (5, 0)]);
+    assert_eq!(edge_points("F2", "F1"), vec![(4, 1), (6, 1)]);
 }
 
 // ---------------------------------------------------------------------------

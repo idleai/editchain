@@ -7,18 +7,30 @@
 // Row shape (HistoryRow): op_id?, git_oid?, repository?, summary, timestamp_ms,
 //   group, node_key, parents[], is_submodule, is_system, author, commit_id, kind
 // Layout shape (GraphLayout): { rows:[{node,lane}], edges:[{child,parent,points:[{row,lane}]}] }
+//
+// Identifier contract (editchain-protocol): op_id is "node:boot:seq", git_oid
+// is lowercase hex, and repository is an exact DECIMAL RepositoryId string.
+// u64 identifiers above 2^53 (e.g. 9007199254740993) must never be numbers in
+// protocol payloads — JavaScript doubles would round them. Fixture git rows
+// use a large exact repository string below so every git row click exercises
+// the exact-string navigation path.
 
 (function () {
   'use strict';
 
-  const NOW = Date.now();
+  // Fixed deterministic clock (2026-01-15T12:00:00Z). Fixture timestamps must
+  // be stable across runs and hosts so harness assertions never depend on the
+  // wall clock. Date rendering still depends on the host timezone/locale — the
+  // layout probe computes expectations with explicit Intl options instead of
+  // hardcoding a timezone-specific string.
+  const NOW = Date.UTC(2026, 0, 15, 12, 0, 0);
 
   function gitRow(key, summary, opts) {
     opts = opts || {};
     return {
       op_id: null,
       git_oid: key,
-      repository: opts.repository !== undefined ? opts.repository : 0,
+      repository: opts.repository !== undefined ? opts.repository : '9007199254740993',
       summary,
       timestamp_ms: opts.ts !== undefined ? opts.ts : NOW - key.length * 1000,
       group: opts.group !== undefined ? opts.group : 'repo:0',
@@ -207,7 +219,8 @@
     },
 
     filtered() {
-      // Submodule + system rows present; "messages only" hides them client-side.
+      // Submodule + system rows present; "messages only" (an INCLUSIVE kind
+      // constraint) and hide-submodules are applied server-side by the bridge.
       const g = mergeGraph();
       g.rows[2].is_submodule = true; // feature branch as a submodule
       g.rows[3].is_system = true;
@@ -232,6 +245,23 @@
 
     error() {
       return { openError:'service unavailable' };
+    },
+
+    warned() {
+      // A healthy chain whose Open response also reports data-integrity issues
+      // (missing blob payloads). Rows must still render below a non-blocking
+      // warning banner — the warning must never be silently discarded.
+      const g = mergeGraph();
+      return {
+        rows: g.rows,
+        layoutRows: g.layoutRows,
+        edges: g.edges,
+        openWarnings: ['6131 blob payload(s) missing from the durable store'],
+        diagnostics: {
+          blobs: { corrupt: 0, hydrated: 0, missing: 6131, unresolved: 0 },
+          chain: { accepted: 118601, duplicates: 0, quarantined: 0, records: 118601 },
+        },
+      };
     },
 
     large() {
@@ -297,6 +327,31 @@
       return {
         rows, layoutRows, edges,
         max_lane: 1,
+        subOpCounts: rows.map(() => 0),
+      };
+    },
+
+    // A chain with MORE concurrent lanes than the former 128-lane clipping cap.
+    // Every lane must still be drawn inside the graph column (lane spacing
+    // compresses, then lane centres distribute proportionally across the graph
+    // budget), so the renderer never drops or clips a service lane.
+    highLanes() {
+      const N = 200; // lanes 0..199 — exceeds 128
+      const rows = [];
+      const layoutRows = [];
+      for (let i = 0; i < N; i++) {
+        const key = 'git:lane:' + i;
+        const r = gitRow(key, 'lane row ' + i, { ts: NOW - i * 1000 });
+        r.lane = i;
+        r.above = [];
+        r.below = [];
+        r.transitions = [];
+        rows.push(r);
+        layoutRows.push({ node: key, lane: i });
+      }
+      return {
+        rows, layoutRows, edges: [],
+        max_lane: N - 1,
         subOpCounts: rows.map(() => 0),
       };
     },

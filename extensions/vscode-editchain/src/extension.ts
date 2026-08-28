@@ -1,7 +1,6 @@
 import * as vscode from 'vscode';
 import { resolveServicePath, StdioClient } from './stdioClient';
 
-let clientStarted = false;
 // The single history panel. Reused across `open` invocations so we never create
 // two webviews of the same type (which races VS Code's service-worker
 // registration and can throw "Could not register service worker").
@@ -10,6 +9,32 @@ let historyPanel: vscode.WebviewPanel | undefined = undefined;
 let output: vscode.OutputChannel | undefined = undefined;
 // Status bar item showing how many history nodes are loaded vs total.
 let statusItem: vscode.StatusBarItem | undefined = undefined;
+// The last successful Open response body. Held so a reveal or a command reuse
+// can replay the authoritative `open` + `ready` handshake to a webview whose
+// JS context was destroyed (hidden behind an editor preview) or whose bridge
+// died with the service process.
+let lastOpenBody: any = null;
+// True while an Open request is in flight. While set, a reveal must NOT replay
+// the previous workspace's open body: a new (authoritative) Open is pending and
+// its response will deliver the real state. The stale body is cleared before
+// the pending Open is issued, so the replay path is doubly safe.
+let openPending = false;
+// Monotonic ownership token for Open requests and the CURRENT panel. Bumped on
+// every startOpen and on every disposal of the current panel. An async Open
+// response captures the epoch it was issued under and only mutates the shared
+// cache/pending state or posts to the webview while that epoch is still
+// current: a late response from a superseded Open (its panel was disposed or a
+// newer Open was issued) is dropped entirely, so it can never clear a newer
+// Open's pending state or install a stale workspace body for replay.
+let openEpoch = 0;
+
+// Generous finite deadline for NON-Open service requests (window fetches,
+// search, details). The measured first-window time on a large chain is close to
+// a minute, so 120s is a generous bound; Open itself stays UNBOUNDED (it can
+// build the chain + git graph for minutes). A timed-out window/search surfaces
+// a visible error in the webview and suspends the progressive loader until the
+// user explicitly retries or re-opens.
+const NON_OPEN_TIMEOUT_MS = 120_000;
 
 /**
  * Activate the EditChain History extension.
@@ -74,9 +99,28 @@ function openHistoryView(
 ): void {
   // Reuse an existing panel if one is still open, so we never create two
   // webviews of the same type (which races service-worker registration).
+  // Reuse must also RECOVER: the service process may have crashed or been
+  // killed since the last open, leaving the panel holding a dead bridge or a
+  // visible error. ensureStarted restarts it and the full open handshake
+  // re-runs against the fresh process — never just reveal a stale view.
   if (historyPanel) {
     output?.appendLine('[openHistoryView] reusing existing panel');
+    const wasRunning = client.isRunning();
+    client.ensureStarted(resolveServicePath());
     historyPanel.reveal(vscode.ViewColumn.One);
+    // Re-run the Open handshake when the service process was dead OR when the
+    // last Open never produced a successful body (e.g. it returned an Error),
+    // so command reuse always ends up with an authoritative view. Skipped while
+    // an Open is already pending to avoid issuing duplicate Opens.
+    if ((!wasRunning || lastOpenBody === null) && !openPending) {
+      output?.appendLine('[openHistoryView] service was not running or no successful open — re-opening chain');
+      // A restart Open supersedes any previously cached body: drop it BEFORE
+      // the pending Open is issued so the view-state handler cannot replay
+      // stale data while the fresh Open is in flight (startOpen clears
+      // defensively too).
+      lastOpenBody = null;
+      startOpen(client, historyPanel);
+    }
     return;
   }
   output?.appendLine('[openHistoryView] creating new panel');
@@ -91,15 +135,28 @@ function openHistoryView(
     }
   );
   historyPanel = panel;
+  // A fresh panel is a fresh JS context: never let a body cached from a
+  // previous panel/workspace leak into it (e.g. via a view-state event fired
+  // while the first Open is still pending).
+  lastOpenBody = null;
+  openPending = false;
   // Clear the reference when the panel is closed so a later `open` creates a
   // fresh one instead of reusing a disposed webview.
   panel.onDidDispose(() => {
     output?.appendLine('[panel] disposed');
     if (historyPanel === panel) {
       historyPanel = undefined;
+      // Disposing the CURRENT panel invalidates any outstanding Open for it:
+      // its response must not be delivered to a dead webview or mutate state
+      // for a panel that no longer exists. A stale dispose of a panel that is
+      // no longer current must not clear a newer panel's state, so the bump
+      // and clears happen only while this panel still owns the globals.
+      openEpoch++;
+      lastOpenBody = null;
+      openPending = false;
+      // Hide the status bar item once the viewer is gone.
+      statusItem?.hide();
     }
-    // Hide the status bar item once the viewer is gone.
-    statusItem?.hide();
   });
 
   // When the panel becomes visible again (e.g. after navigating to a JSON
@@ -111,25 +168,28 @@ function openHistoryView(
   // `open` + `ready` sequence as first load. The webview then re-applies the
   // persisted top row from `setState` to restore scroll position. Harmless if
   // the JS context actually survived (it just re-establishes the same state).
-  const lastOpen: { body: any } = { body: null };
   panel.onDidChangeViewState((e) => {
     output?.appendLine('[panel] view state changed, active=' + e.webviewPanel.active);
     if (e.webviewPanel.active) {
-      if (lastOpen.body !== null) {
+      if (lastOpenBody !== null && !openPending) {
         output?.appendLine('[panel] reveal: re-sending open body');
-        panel.webview.postMessage({ id: 'open', body: lastOpen.body });
+        panel.webview.postMessage({ id: 'open', body: lastOpenBody });
         panel.webview.postMessage({ id: 'ready' });
+      } else if (openPending) {
+        // A new Open is in flight; its authoritative response will be delivered
+        // when it lands. Replaying the stale body now would race it.
+        output?.appendLine('[panel] view active while Open pending — waiting for authoritative body');
       } else {
         panel.webview.postMessage({ id: 'reveal' });
       }
     }
   });
 
-  // Start the service if not already running.
-  if (!clientStarted) {
-    client.start(resolveServicePath());
-    clientStarted = true;
-  }
+  // Start (or restart) the service. The process may have exited since the last
+  // open (e.g. it crashed or the user killed it), so re-check liveness instead
+  // of trusting a one-time "already started" flag. In-flight requests from a
+  // dead process are rejected by the client, so a restart is always safe.
+  client.ensureStarted(resolveServicePath());
 
   // Forward webview -> service.
   panel.webview.onDidReceiveMessage(async (msg) => {
@@ -152,10 +212,14 @@ function openHistoryView(
       return;
     }
     try {
-      const resp = await client.request(msg.body);
+      // Non-Open calls get a generous finite deadline (see NON_OPEN_TIMEOUT_MS):
+      // a hung window/search surfaces visibly in the webview (which suspends
+      // retries until explicit recovery) instead of spinning forever. Open
+      // itself stays unbounded — it can legitimately take minutes.
+      const resp = await client.request(msg.body, { timeoutMs: NON_OPEN_TIMEOUT_MS });
       panel.webview.postMessage({ id: msg.id, body: resp });
     } catch (e) {
-      panel.webview.postMessage({ id: msg.id, body: { error: String(e) } });
+      panel.webview.postMessage({ id: msg.id, body: { Error: String(e) } });
     }
   });
 
@@ -167,25 +231,91 @@ function openHistoryView(
   panel.webview.html = getHtml(context, panel.webview);
 
   // Open the workspace on load, THEN tell the webview to load its first window.
-  const workspacePath =
-    vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
-  const chainDir = vscode.workspace
+  startOpen(client, panel);
+}
+
+/** The workspace root the extension opens (first workspace folder, if any). */
+function workspacePath(): string {
+  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+}
+
+/** The configured chain directory, relative to the workspace root. */
+function chainDir(): string {
+  return vscode.workspace
     .getConfiguration('editchain-history')
     .get<string>('chainDir', '.editchain');
-  client.request({
-    Open: { workspace_path: workspacePath, chain_dir: chainDir },
-  }).then((resp) => {
-    output?.appendLine('[openHistoryView] sending open message');
+}
+
+/**
+ * Run the Open request against the service and push the handshake to the
+ * webview (open body, then `ready` to fetch the first window).
+ *
+ * Open is intentionally UNBOUNDED (timeoutMs: 0): building the chain + git
+ * graph can take minutes on a large workspace, and the request still settles
+ * when the service exits or is stopped, so it can never hang forever. Used on
+ * first load AND on command reuse after a service crash (recovery).
+ */
+function startOpen(client: StdioClient, panel: vscode.WebviewPanel): void {
+  // Claim ownership of the Open lifecycle: this Open (and this panel) is now
+  // authoritative, and any older in-flight Open becomes a no-op. A response is
+  // honored only while this epoch is still current — a newer startOpen or a
+  // disposal of the current panel bumps the epoch and invalidates it.
+  const epoch = ++openEpoch;
+  // Never replay a stale open body while this Open is pending, and never let a
+  // previous workspace's body survive a restart that may fail.
+  openPending = true;
+  lastOpenBody = null;
+  // Opening a workspace builds the chain + git graph and can take minutes on a
+  // large repo — never apply the request timeout to it. The request is rejected
+  // if the service exits or is stopped, so it cannot hang indefinitely.
+  client.request(
+    { Open: { workspace_path: workspacePath(), chain_dir: chainDir() } },
+    { timeoutMs: 0 }
+  ).then((resp) => {
+    // Late response from a superseded Open: drop it entirely. It must neither
+    // mutate the shared cache/pending state (a newer Open may still be in
+    // flight, or the panel may be gone) nor post into a dead or stale webview.
+    if (epoch !== openEpoch || panel !== historyPanel) {
+      output?.appendLine(
+        `[startOpen] dropping stale open response (epoch ${epoch}, current ${openEpoch})`
+      );
+      return;
+    }
+    // Only a successful Open { Ok } is authoritative: it is the ONLY body ever
+    // cached/replayed, and it is the only path that sends `ready` (which makes
+    // the webview fetch its first window). An Open Error surfaces visibly and
+    // leaves lastOpenBody null so command reuse retries.
+    if (!resp || resp.Ok === undefined || resp.Ok === null) {
+      const errText = resp && resp.Error !== undefined
+        ? String(resp.Error)
+        : String(resp);
+      output?.appendLine('[startOpen] open returned an error: ' + errText);
+      lastOpenBody = null;
+      openPending = false;
+      panel.webview.postMessage({ id: 'open', body: { Error: errText } });
+      return;
+    }
+    output?.appendLine('[startOpen] sending open message');
     // Hold the last open body so a later reveal (e.g. back from a JSON editor
     // preview, which destroys the webview's JS context) can replay it and
     // restore the authoritative node count before fetching a window.
-    lastOpen.body = resp;
+    lastOpenBody = resp;
+    openPending = false;
     panel.webview.postMessage({ id: 'open', body: resp });
     // After open succeeds, ask the webview to fetch the first window.
     panel.webview.postMessage({ id: 'ready' });
   }).catch((e) => {
-    output?.appendLine('[openHistoryView] open failed: ' + String(e));
-    panel.webview.postMessage({ id: 'open', body: { error: String(e) } });
+    if (epoch !== openEpoch || panel !== historyPanel) {
+      output?.appendLine(
+        `[startOpen] dropping stale open failure (epoch ${epoch}, current ${openEpoch})`
+      );
+      return;
+    }
+    output?.appendLine('[startOpen] open failed: ' + String(e));
+    // A failed open must not be replayed as an authoritative body later.
+    lastOpenBody = null;
+    openPending = false;
+    panel.webview.postMessage({ id: 'open', body: { Error: String(e) } });
   });
 }
 
@@ -199,18 +329,26 @@ function openHistoryView(
 async function openJsonEditor(
   client: StdioClient,
   jsonProvider: JsonContentProvider,
-  msg: { op_id?: string; git_oid?: string; repository?: number }
+  msg: { op_id?: string; git_oid?: string; repository?: string }
 ): Promise<void> {
   try {
     // Fetch the node details from the service.
     let details: any;
     if (msg.git_oid) {
-      const resp = await client.request({
-        ResolveObject: { repository: msg.repository, oid: msg.git_oid },
-      });
+      const resp = await client.request(
+        { ResolveObject: { repository: msg.repository, oid: msg.git_oid } },
+        { timeoutMs: NON_OPEN_TIMEOUT_MS }
+      );
+      // A service Error envelope must SURFACE as an error, never be opened as
+      // a JSON document of the error object.
+      if (resp && resp.Error !== undefined) throw new Error(String(resp.Error));
       details = resp?.Ok ?? resp;
     } else if (msg.op_id) {
-      const resp = await client.request({ GetNodeDetails: { op_id: msg.op_id } });
+      const resp = await client.request(
+        { GetNodeDetails: { op_id: msg.op_id } },
+        { timeoutMs: NON_OPEN_TIMEOUT_MS }
+      );
+      if (resp && resp.Error !== undefined) throw new Error(String(resp.Error));
       details = resp?.Ok ?? resp;
     } else {
       return;
@@ -316,7 +454,7 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 <body>
 <div id="controls">
 <input id="search" type="text" placeholder="Search history… (Enter to search)">
-<input id="filter" type="text" placeholder="Filter chain… (regex, Enter to apply)">
+<input id="filter" type="text" placeholder="Hide matching rows… (regex, Enter to apply)">
 <label class="toggle"><input type="checkbox" id="hideUndated"> Hide undated</label>
 <label class="toggle"><input type="checkbox" id="hideSubmodules"> Show git submodules</label>
 <label class="toggle"><input type="checkbox" id="hideSystem"> Show messages only</label>
