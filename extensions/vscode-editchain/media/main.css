@@ -100,7 +100,7 @@ body {
    absolutely positioned inside it at the slice's top offset. */
 .scroll-spacer { position: relative; width: 100%; }
 
-/* Table wrapper holds the header, rows, and the absolutely-positioned SVG.
+/* Table wrapper holds the sticky header and the per-row SVG graph cells.
    Positioned absolutely within the scroll-spacer at the rendered slice's top. */
 .table-wrap { position: absolute; left: 0; top: 0; width: 100%; }
 
@@ -182,7 +182,7 @@ body {
 }
 
 /* Each history row is a grid with the same column template as the header.
-   Height is fixed to ROW_H (34px) in main.js so the graph overlay's dot/edge
+   Height is fixed to ROW_H (34px) in main.js so the graph cells' dot/edge
    y-positions and the scroll-spacer math stay consistent with real row height.
    Every row carries its own raw separator (a bottom border) so rows read as
    distinct lines even within a session group; box-sizing must stay border-box
@@ -317,7 +317,8 @@ body {
 }
 
 /* Per-row graph cells (one small SVG per row). Each cell draws the node's dot,
-   vertical line segments for active lanes, and horizontal merge connectors. */
+   vertical line segments for active lanes, and rounded cross-lane transition
+   paths. */
 .graph-cell svg.graphCell {
   display: block;
   pointer-events: none;
@@ -337,6 +338,16 @@ body {
   /* Stroke colour is set inline per-lane (each chain's own colour); this rule
      only sets the width. */
   stroke-width: 2;
+}
+.graph-cell path.graphTransition {
+  /* Stroke colour is set inline per half (source-lane colour through the row
+     midpoint, destination-lane colour after). Caps are explicitly butt so
+     the two halves tile exactly at their shared midpoint seam — no gap, no
+     overlap. */
+  stroke-width: 2;
+  stroke-linecap: butt;
+  stroke-linejoin: round;
+  fill: none;
 }
 
 /* Draggable handle on the right edge of each resizable column. Its horizontal

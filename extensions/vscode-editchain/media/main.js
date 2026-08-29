@@ -1,10 +1,12 @@
 // Webview renderer for the EditChain History explorer.
-// Renders a git-graph-style visualization of unified history using a single
-// full-height SVG overlay (continuous branch lines) over a real table with
-// columns: Graph | Content | Date | Author | Commit/ID.
+// Renders a git-graph-style visualization of unified history as one small SVG
+// per row (the node dot, vertical lane segments, and rounded cross-lane
+// transition paths) over a real table with columns: Graph | Content | Date |
+// Author | Commit/ID.
 //
-// The graph geometry (lanes + edge point paths) is computed server-side by the
-// Rust service (`GetLayout`) and shipped over stdio; this file only draws it.
+// The per-row graph geometry (lane, above, below, transitions) is computed
+// server-side by the Rust service and shipped over stdio with each `GetWindow`
+// response; this file only draws it.
 //
 // The webview is a THIN VIEWPORT over a server-owned graph. It renders only the
 // visible slice of rows plus a buffer on each side, and requests windowed
@@ -13,12 +15,6 @@
 // JS heap, and per-scroll serialization bounded regardless of chain size (the
 // design target is ~1M nodes).
 //
-// Edge points from `GetLayout` are ABSOLUTE canonical row indices (not relative
-// to the requested offset), so they map directly onto absolute row positions.
-//
-// Alignment note: block separators shift rows down from a uniform grid, so we
-// measure each rendered row's real `offsetTop` after rendering and use those
-// pixel positions for both node dots and edge paths.
 
 // @ts-ignore — vscode provides this global in webviews.
 const vscode = acquireVsCodeApi();
@@ -311,6 +307,13 @@ const COLORS = ['#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4'
 
 const LANE_W = 18;
 const DOT_R = 4;
+// Corner radius (px) for rounded cross-lane transition elbows. Clamped by the
+// lane distance and row geometry at draw time (see buildTransitionPaths).
+const TRANSITION_R = 6;
+// Lane-centre distance (px) below which a transition's rounded corner would be
+// sub-pixel: at extreme compressed spacing the renderer falls back to a
+// straight orthogonal jog instead of a degenerate curve.
+const TRANSITION_MIN_DX = 1;
 
 /** Send a request body to the extension host, correlating the response.
  *
@@ -721,7 +724,7 @@ function laneX(lane) {
 /**
  * Build one row's graph cell: a small inline SVG drawing the node's dot, the
  * vertical line segments for lanes entering from above and leaving below, and
- * any horizontal merge connectors at this row.
+ * any rounded cross-lane transition paths at this row.
  *
  * This is the per-row replacement for the old full-height SVG overlay. Because
  * each row carries its own graph geometry (lane, above, below, transitions)
@@ -734,34 +737,88 @@ function laneX(lane) {
  * children) has no `above` lanes → no line above its dot; a ROOT (no parents)
  * has no `below` lanes → no line below. The dot sits at the row's own lane,
  * vertically centred.
+ *
+ * A cross-lane transition replaces the old hard three-line jog (source-lane
+ * vertical half + horizontal connector + destination-lane vertical half) with
+ * one rounded orthogonal path split into two exact halves: the source half
+ * (source-lane colour) runs down the from-lane from the row boundary, rounds
+ * onto the row midpoint, and ends at the geometric midpoint between the two
+ * lanes; the destination half (destination-lane colour) continues from that
+ * exact shared seam through the destination elbow and exits down the to-lane
+ * at the row boundary. Each side is anchored to whatever actually connects it:
+ *
+ *   - a transition whose child node lives on THIS row (`row.lane === fromLane`)
+ *     begins exactly at the node dot (xFrom, midY) — never at y=0, which would
+ *     leave an open top stub; any legitimate `above` line on that lane is a
+ *     separate edge and is still drawn into the dot;
+ *   - otherwise it begins at y=0 on the from-lane ONLY when `above` lists that
+ *     lane (the child's lane ran down from the row above, and this path owns
+ *     that top half);
+ *   - a transition whose parent node lives on THIS row (`row.lane === toLane`,
+ *     and `below` does not list the lane) ends exactly at the node dot;
+ *   - otherwise it ends at y=height on the to-lane only when `below` lists
+ *     that lane (the parent's lane continues into the row below, and this path
+ *     owns that bottom half).
+ *
+ * A transition whose endpoint would be neither a dot nor a connected boundary
+ * is a dangling stub and is not drawn. Generic vertical halves are skipped
+ * exactly when a rendered path owns them, so dot-anchored transitions never
+ * suppress the neighbouring legitimate segment (the path would not cover it).
  */
 function buildGraphCell(row) {
   const width = currentGraphWidth();
   const height = ROW_H;
   const midY = ROW_H / 2;
-  let s = `<svg class="graphCell" width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">`;
-  // Top-half vertical segments: lanes entering from above (y=0 → midY).
+  // Decorative graph marks — never exposed to the accessibility tree.
+  let s = `<svg class="graphCell" width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">`;
+  // `transitions` entries are (from_lane, to_lane) = production's
+  // (child_lane, parent_lane) order.
+  const transitions = row.transitions || [];
+  const below = row.below || [];
   const above = row.above || [];
+  // Resolve each transition's real anchors before drawing anything. A side is
+  // DOT-anchored when the transition starts/ends on this row's own node; a
+  // BOUNDARY-anchored side must be backed by the adjacent row's geometry
+  // (`above` for a top start, `below` for a bottom end). Any other combination
+  // would leave an open stub, so the transition is dropped.
+  const rendered = [];
+  for (const [fromLane, toLane] of transitions) {
+    const startAtDot = row.lane === fromLane;
+    const endAtBoundary = below.indexOf(toLane) !== -1;
+    const endAtDot = !endAtBoundary && row.lane === toLane;
+    const startConnected = startAtDot || above.indexOf(fromLane) !== -1;
+    if (!startConnected || (!endAtBoundary && !endAtDot)) continue;
+    rendered.push({ fromLane, toLane, startAtDot, endAtDot });
+  }
+  // The halves a rendered transition path actually covers: the from-lane's top
+  // half (only when the path begins at the boundary) and the to-lane's bottom
+  // half (only when the path ends at the boundary). Dot-anchored sides leave
+  // the neighbouring generic half in place — e.g. a legitimate `above` line
+  // continuing into the dot.
+  const ownsTop = new Set();
+  const ownsBottom = new Set();
+  for (const t of rendered) {
+    if (!t.startAtDot) ownsTop.add(t.fromLane);
+    if (!t.endAtDot) ownsBottom.add(t.toLane);
+  }
+  // Top-half vertical segments: lanes entering from above (y=0 → midY).
   for (const lane of above) {
+    if (ownsTop.has(lane)) continue;
     const x = laneX(lane);
     const colour = COLORS[lane % COLORS.length];
     s += `<line class="graphLine" x1="${x}" y1="0" x2="${x}" y2="${midY}" style="stroke:${colour}"/>`;
   }
   // Bottom-half vertical segments: lanes leaving downward (midY → height).
-  const below = row.below || [];
   for (const lane of below) {
+    if (ownsBottom.has(lane)) continue;
     const x = laneX(lane);
     const colour = COLORS[lane % COLORS.length];
     s += `<line class="graphLine" x1="${x}" y1="${midY}" x2="${x}" y2="${height}" style="stroke:${colour}"/>`;
   }
-  // Horizontal merge connectors at this row. Colour by the FROM lane (the chain
-  // the connector originates from).
-  const transitions = row.transitions || [];
-  for (const [fromLane, toLane] of transitions) {
-    const x1 = laneX(fromLane);
-    const x2 = laneX(toLane);
-    const colour = COLORS[fromLane % COLORS.length];
-    s += `<line class="graphLine" x1="${x1}" y1="${midY}" x2="${x2}" y2="${midY}" style="stroke:${colour}"/>`;
+  // Rounded cross-lane transition paths at this row (drawn after the verticals
+  // so the elbows sit on top; the node dot is still painted last).
+  for (const t of rendered) {
+    s += buildTransitionPaths(t.fromLane, t.toLane, height, t.startAtDot, t.endAtDot);
   }
   // A sub-op row draws NO dot — it is not a graph node. Its `above`/`below` are
   // the pass-through lanes spanning this region, drawn as full-height straight
@@ -774,6 +831,91 @@ function buildGraphCell(row) {
   }
   s += '</svg>';
   return s;
+}
+
+/** Format a coordinate for SVG path output (keeps `d` compact and stable). */
+function fmt(v) {
+  return Math.round(v * 100) / 100;
+}
+
+/**
+ * Build the two exact path halves for one cross-lane transition.
+ *
+ * The transition runs from `fromLane` (production's child lane) to `toLane`
+ * (production's parent lane) inside one row cell. Each side is anchored by
+ * `buildGraphCell`: either at the row's own node dot (the dot sits on the row
+ * midpoint, so that side runs straight along it — there is no vertical run to
+ * round) or at the row boundary (y=0 / y=height), where the path owns the
+ * vertical half and rounds onto the row midpoint. The path is split at the
+ * geometric midpoint between the two lane centres on the row midpoint:
+ *
+ *   source half  — source-lane colour, from the source anchor through the
+ *                  source elbow (boundary starts) to the shared seam;
+ *   destination half — destination-lane colour, from the shared seam through
+ *                  the destination elbow (boundary ends) to the destination
+ *                  anchor.
+ *
+ * Both halves reuse the exact same formatted seam coordinates (butt caps, no
+ * gradients/defs), so the colour handoff is sharp and seam/gap-free. The
+ * quadratic corner radius is clamped by the lane distance (the horizontal run
+ * must never collapse) and by the row geometry (the vertical runs stay
+ * non-empty on boundary-anchored sides; dot-anchored sides have no vertical
+ * run at all and stay straight); below `TRANSITION_MIN_DX` of lane distance the
+ * corner would be sub-pixel, so a straight orthogonal jog is drawn instead.
+ */
+function buildTransitionPaths(fromLane, toLane, height, startAtDot, endAtDot) {
+  const x1 = laneX(fromLane);
+  const x2 = laneX(toLane);
+  const midY = height / 2;
+  const dx = Math.abs(x2 - x1);
+  // Each side rounds independently, clamped by ITS vertical run (zero for a
+  // dot-anchored side — no elbow, straight along the row midpoint) and by half
+  // the lane distance.
+  const srcR = startAtDot ? 0 : Math.min(TRANSITION_R, dx / 2, midY);
+  const dstR = endAtDot ? 0 : Math.min(TRANSITION_R, dx / 2, height - midY);
+  const srcRounded = !startAtDot && dx >= TRANSITION_MIN_DX && srcR > 0;
+  const dstRounded = !endAtDot && dx >= TRANSITION_MIN_DX && dstR > 0;
+  const sgn = x2 >= x1 ? 1 : -1;
+  const srcColour = COLORS[fromLane % COLORS.length];
+  const dstColour = COLORS[toLane % COLORS.length];
+  // Geometric midpoint of the two lane centres at the row midpoint — the exact
+  // shared seam (identical formatted numbers in both halves).
+  const xm = (x1 + x2) / 2;
+  let srcD;
+  let dstD;
+  if (startAtDot) {
+    // The transition's child node is this row's dot: begin exactly at the dot
+    // and run straight along the row midpoint to the shared seam.
+    srcD = 'M ' + fmt(x1) + ' ' + fmt(midY) + ' L ' + fmt(xm) + ' ' + fmt(midY);
+  } else if (srcRounded) {
+    srcD = 'M ' + fmt(x1) + ' 0' +
+      ' L ' + fmt(x1) + ' ' + fmt(midY - srcR) +
+      ' Q ' + fmt(x1) + ' ' + fmt(midY) + ' ' + fmt(x1 + sgn * srcR) + ' ' + fmt(midY) +
+      ' L ' + fmt(xm) + ' ' + fmt(midY);
+  } else {
+    // Safe straight/near-straight fallback for extreme compressed spacing.
+    srcD = 'M ' + fmt(x1) + ' 0' +
+      ' L ' + fmt(x1) + ' ' + fmt(midY) +
+      ' L ' + fmt(xm) + ' ' + fmt(midY);
+  }
+  if (endAtDot) {
+    // The transition's parent node is this row's dot: run straight along the
+    // row midpoint from the shared seam and end exactly at the dot.
+    dstD = 'M ' + fmt(xm) + ' ' + fmt(midY) + ' L ' + fmt(x2) + ' ' + fmt(midY);
+  } else if (dstRounded) {
+    dstD = 'M ' + fmt(xm) + ' ' + fmt(midY) +
+      ' L ' + fmt(x2 - sgn * dstR) + ' ' + fmt(midY) +
+      ' Q ' + fmt(x2) + ' ' + fmt(midY) + ' ' + fmt(x2) + ' ' + fmt(midY + dstR) +
+      ' L ' + fmt(x2) + ' ' + fmt(height);
+  } else {
+    dstD = 'M ' + fmt(xm) + ' ' + fmt(midY) +
+      ' L ' + fmt(x2) + ' ' + fmt(midY) +
+      ' L ' + fmt(x2) + ' ' + fmt(height);
+  }
+  return '<path class="graphTransition graphTransitionSrc" d="' + srcD +
+    '" style="stroke:' + srcColour + '"/>' +
+    '<path class="graphTransition graphTransitionDst" d="' + dstD +
+    '" style="stroke:' + dstColour + '"/>';
 }
 
 /** Whether a row carries bundled metadata sub-ops (revealed on click). */

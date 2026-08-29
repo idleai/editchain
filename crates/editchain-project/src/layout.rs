@@ -382,10 +382,28 @@ impl LayoutContext {
                             add_unique(below, my_lane);
                         }
                     }
+                } else if parent_row == row.saturating_add(1) {
+                    // Adjacent cross-lane edge: the jog originates at the child
+                    // node's own midpoint, so the edge has NO source-lane run.
+                    // Adding a source-lane top/bottom half at the child row
+                    // would create a dangling boundary stub; the transition
+                    // starts at the child node itself instead.
+                    // Emit the transition at the child row plus the two
+                    // destination-lane halves only; any source-lane halves at
+                    // this row come from other edges.
+                    if let Some(transitions) = row_transitions.get_mut(row) {
+                        add_unique(transitions, (my_lane, p_lane));
+                    }
+                    if let Some(below) = row_below.get_mut(row) {
+                        add_unique(below, p_lane);
+                    }
+                    if let Some(above) = row_above.get_mut(parent_row) {
+                        add_unique(above, p_lane);
+                    }
                 } else {
-                    // Different-lane edge: vertical on my_lane down to parent_row-1,
-                    // jog to p_lane at parent_row-1, then vertical on p_lane down to
-                    // parent_row.
+                    // Non-adjacent different-lane edge: vertical on my_lane down
+                    // to parent_row-1, jog to p_lane at parent_row-1, then
+                    // vertical on p_lane down to parent_row.
                     if let Some(below) = row_below.get_mut(row) {
                         add_unique(below, my_lane);
                     }
@@ -925,11 +943,16 @@ fn build_edge_points(
     }
 
     // If lanes differ, jog horizontally onto the parent's lane just above it.
+    // For an ADJACENT cross-lane edge (`parent_row == child_row + 1`) the jog
+    // begins at the child's own row, so its source-lane point would duplicate
+    // the child start point — skip it and keep a single transition point.
     if child_lane != parent_lane {
-        points.push(GridPoint {
-            row: run_end,
-            lane: child_lane,
-        });
+        if run_end > child_row {
+            points.push(GridPoint {
+                row: run_end,
+                lane: child_lane,
+            });
+        }
         points.push(GridPoint {
             row: run_end,
             lane: parent_lane,

@@ -288,24 +288,38 @@
     // emits via ForkOf/SubagentOf/ReconnectsTo relationship notes (SPEC §1.1):
     // a shared root forks into two continuations on distinct lanes, and the
     // parent's completion result reconnects into the subagent branch — a
-    // cross-lane merge at the top. Each window row carries explicit lane /
+    // cross-lane transition at the top. Each window row carries explicit lane /
     // above / below / transitions (the shape the renderer's per-row graph
     // cells read directly), so the fork draws two diverging columns and the
-    // reconnection draws a horizontal merge connector.
+    // reconnection draws a rounded cross-lane transition.
+    //
+    // The per-row geometry below is exactly what the production layout emits
+    // for the edge list that follows (see LayoutContext::new): for each edge
+    // (child_row, child_lane) -> (parent_row, parent_lane), the child lane runs
+    // vertically down to parent_row-1, jogs onto the parent lane at that row,
+    // and the parent lane runs down to the parent row. Transitions are
+    // (child_lane, parent_lane) order, so the reconnect at row 0 jogs FROM the
+    // completion lane (0) TO the subagent lane (1), and the fork jogs at rows 2
+    // and 3 go FROM the subagent lane (1) TO lane 0.
     fork() {
       // Newest-first rows. n:0 is the reconnected completion result (on lane 0,
-      // with a cross-lane merge connector to the subagent branch on lane 1).
+      // with a cross-lane transition to the subagent branch on lane 1).
       const local = [
-        // completion result reconnecting to the subagent's last op (lane 1)
-        [0, 'node:f:0', 'completion result', { above: [0, 1], below: [0, 1], transitions: [[1, 0]] }],
+        // completion result reconnecting to the subagent's last op (lane 1):
+        // the 0 -> 1 transition begins at THIS row's own dot (the child node
+        // lives here — no synthetic top half above the dot and no source-lane
+        // bottom stub) and ends on lane 1 at the row boundary, where row 1's
+        // above=[1] continues the line into the next dot.
+        [0, 'node:f:0', 'completion result', { above: [], below: [1], transitions: [[0, 1]] }],
         // subagent's last op — the subagent branch, lane 1
         [1, 'node:f:1', 'subagent last op', { above: [1], below: [1] }],
-        // subagent's first op — forks off the shared root
-        [1, 'node:f:2', 'subagent first op', { above: [0, 1], below: [1] }],
+        // subagent's first op — forks off the spawn point (lane 0, next row)
+        // and off the shared root (lane 0, two rows below); both jogs go 1 -> 0
+        [1, 'node:f:2', 'subagent first op', { above: [1], below: [0, 1], transitions: [[1, 0]] }],
         // Agent tool_use call — the parent's spawn point, lane 0
-        [0, 'node:f:3', 'Agent tool call', { above: [0], below: [0, 1] }],
+        [0, 'node:f:3', 'Agent tool call', { above: [0, 1], below: [0], transitions: [[1, 0]] }],
         // shared root on lane 0 (both branches descend from it)
-        [0, 'node:f:4', 'shared root', { above: [], below: [0] }],
+        [0, 'node:f:4', 'shared root', { above: [0], below: [] }],
       ];
       // Drawn parent edges (child -> parent), the single source of truth for
       // the fork geometry: the reconnect, the subagent chain, the SubagentOf
@@ -314,10 +328,10 @@
       // below is derived from this list so badges can never reference a parent
       // edge the layout does not draw.
       const edges = [
-        { child: 'node:f:0', parent: 'node:f:1', points: [{ row: 0, lane: 1 }, { row: 1, lane: 1 }] },
+        { child: 'node:f:0', parent: 'node:f:1', points: [{ row: 0, lane: 0 }, { row: 0, lane: 1 }, { row: 1, lane: 1 }] },
         { child: 'node:f:1', parent: 'node:f:2', points: [{ row: 1, lane: 1 }, { row: 2, lane: 1 }] },
-        { child: 'node:f:2', parent: 'node:f:3', points: [{ row: 2, lane: 1 }, { row: 3, lane: 0 }] },
-        { child: 'node:f:2', parent: 'node:f:4', points: [{ row: 2, lane: 1 }, { row: 4, lane: 0 }] },
+        { child: 'node:f:2', parent: 'node:f:3', points: [{ row: 2, lane: 1 }, { row: 2, lane: 0 }, { row: 3, lane: 0 }] },
+        { child: 'node:f:2', parent: 'node:f:4', points: [{ row: 2, lane: 1 }, { row: 3, lane: 1 }, { row: 3, lane: 0 }, { row: 4, lane: 0 }] },
         { child: 'node:f:3', parent: 'node:f:4', points: [{ row: 3, lane: 0 }, { row: 4, lane: 0 }] },
       ];
       const parentsByKey = new Map();
@@ -375,20 +389,36 @@
     // A chain with MORE concurrent lanes than the former 128-lane clipping cap.
     // Every lane must still be drawn inside the graph column (lane spacing
     // compresses, then lane centres distribute proportionally across the graph
-    // budget), so the renderer never drops or clips a service lane.
+    // budget), so the renderer never drops or clips a service lane. The first
+    // five rows form a connected production-like zigzag — consecutive nodes on
+    // alternating lanes (0,1,0,1,0) with an adjacent transition at each row,
+    // exactly as LayoutContext::new emits for a chain that weaves across two
+    // lanes: each transition begins at its row's own dot, ends on the next
+    // lane at the row boundary, and the following row's `above` continues it.
+    // This exercises the rounded transition paths under heavy compression,
+    // where the corner radius clamps to the lane distance (and, at extreme
+    // spacing, the renderer falls back to a straight orthogonal jog).
     highLanes() {
       const N = 200; // lanes 0..199 — exceeds 128
       const rows = [];
       const layoutRows = [];
+      const zigzag = [
+        { lane: 0, above: [], below: [1], transitions: [[0, 1]] },
+        { lane: 1, above: [1], below: [0], transitions: [[1, 0]] },
+        { lane: 0, above: [0], below: [1], transitions: [[0, 1]] },
+        { lane: 1, above: [1], below: [0], transitions: [[1, 0]] },
+        { lane: 0, above: [0], below: [], transitions: [] },
+      ];
       for (let i = 0; i < N; i++) {
         const key = 'git:lane:' + i;
         const r = gitRow(key, 'lane row ' + i, { ts: NOW - i * 1000 });
-        r.lane = i;
-        r.above = [];
-        r.below = [];
-        r.transitions = [];
+        const z = zigzag[i];
+        r.lane = z ? z.lane : i;
+        r.above = z ? z.above : [];
+        r.below = z ? z.below : [];
+        r.transitions = z ? z.transitions : [];
         rows.push(r);
-        layoutRows.push({ node: key, lane: i });
+        layoutRows.push({ node: key, lane: r.lane });
       }
       return {
         rows, layoutRows, edges: [],
