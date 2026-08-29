@@ -18,6 +18,9 @@ function parseArgs(argv) {
     warmOffset: 75_000,
     timeoutMs: 120_000,
     out: null,
+    requireSnapshot: false,
+    maxFirstRowsMs: null,
+    maxLayoutMs: null,
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -27,6 +30,9 @@ function parseArgs(argv) {
     else if (arg === '--warm-offset') args.warmOffset = Number(argv[++i]) || 0;
     else if (arg === '--timeout') args.timeoutMs = Number(argv[++i]) || args.timeoutMs;
     else if (arg === '--out') args.out = argv[++i];
+    else if (arg === '--require-snapshot') args.requireSnapshot = true;
+    else if (arg === '--max-first-rows-ms') args.maxFirstRowsMs = Number(argv[++i]);
+    else if (arg === '--max-layout-ms') args.maxLayoutMs = Number(argv[++i]);
   }
   return args;
 }
@@ -174,22 +180,28 @@ async function main() {
     const provisionalKeys = provisional.rows.map((row) => row.node_key);
     const laidOutKeys = laidOut.rows.map((row) => row.node_key);
     const release = path.join(args.workspace, 'target', 'release', 'editchain-vscode-service');
+    const firstRowsMs = phases.open.elapsed_ms + phases.first_rows.elapsed_ms;
+    const layoutCompleteMs = firstRowsMs + phases.layout.elapsed_ms;
     const checks = {
       release_preferred_when_available: !fs.existsSync(release) || binary === release,
+      snapshot_hit_when_required: !args.requireSnapshot || opened.render_snapshot === 'hit',
       rows_before_layout: provisional.rows.length > 0 && provisional.layout_ready === false,
       layout_completes: laidOut.rows.length > 0 && laidOut.layout_ready === true,
       row_identity_stable: JSON.stringify(provisionalKeys) === JSON.stringify(laidOutKeys),
+      first_rows_within_budget: args.maxFirstRowsMs === null || firstRowsMs <= args.maxFirstRowsMs,
+      layout_within_budget: args.maxLayoutMs === null || layoutCompleteMs <= args.maxLayoutMs,
     };
     const report = {
       binary,
       workspace: args.workspace,
       chain_dir: args.chainDir,
       chain_generation: opened.chain_generation,
+      render_snapshot: opened.render_snapshot || 'unknown',
       diagnostics: opened.diagnostics,
       phases,
       totals: {
-        first_rows_ms: Math.round((phases.open.elapsed_ms + phases.first_rows.elapsed_ms) * 10) / 10,
-        layout_complete_ms: Math.round((phases.open.elapsed_ms + phases.first_rows.elapsed_ms + phases.layout.elapsed_ms) * 10) / 10,
+        first_rows_ms: Math.round(firstRowsMs * 10) / 10,
+        layout_complete_ms: Math.round(layoutCompleteMs * 10) / 10,
       },
       checks,
       pass: Object.values(checks).every(Boolean),

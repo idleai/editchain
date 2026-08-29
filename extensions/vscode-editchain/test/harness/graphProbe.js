@@ -66,29 +66,20 @@
   // Exact renderer request construction (mirrors media/main.js)
   // --------------------------------------------------------------------------
 
-  // The renderer's ChainFilter payload — an explicit filter is ALWAYS sent
-  // (default hide_undated:false makes the checkbox authoritative). Read the
-  // live controls exactly like filterPayload() in main.js so a preloaded
-  // harness state pages the same view the renderer shows.
+  // The renderer's temporary fixed filter while the filtering UI is absent.
   function filterPayload() {
-    const filterEl = document.getElementById('filter');
-    const hideSystemEl = document.getElementById('hideSystem');
-    const hideUndatedEl = document.getElementById('hideUndated');
-    const pattern = (filterEl && filterEl.value.trim()) || '';
     return {
-      summary_pattern: pattern,
+      summary_pattern: '',
       kind_pattern: '',
-      include_kind_pattern: (hideSystemEl && hideSystemEl.checked) ? '^(message|command)$' : '',
-      hide_undated: !!(hideUndatedEl && hideUndatedEl.checked),
+      include_kind_pattern: '',
+      hide_undated: false,
       splice: true,
     };
   }
 
-  // "Show git submodules" is OFF by default -> hide_submodules: true, exactly
-  // like hideSubmodules() in main.js.
+  // Nested Git repositories/submodules are hidden in the temporary fixed view.
   function hideSubmodules() {
-    const el = document.getElementById('hideSubmodules');
-    return !(el && el.checked);
+    return true;
   }
 
   // --------------------------------------------------------------------------

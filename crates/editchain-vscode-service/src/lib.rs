@@ -6,17 +6,22 @@
 #[cfg(test)]
 use tempfile as _;
 
+mod snapshot;
+
+pub use snapshot::RenderSnapshotReport;
+
 // Crate-level dependency markers (used by Cargo for feature resolution).
 use editchain_import as _;
 use editchain_query as _;
 use serde as _;
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{self, Read as _};
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::io::{self, Read as _, Seek as _, SeekFrom};
+use std::path::{Path, PathBuf};
 
 use editchain_codec::frame::decode_op;
+use editchain_codec::page::PAGE_MAGIC;
 use editchain_core::{
     ActorId, BlobRef, Clock, ContentId, GitOid, NodeId, Op, OpId, OpKind, OpSet, ParentSet,
     Payload, RepositoryId, ScopeRef, SessionId, Tags,
@@ -24,7 +29,6 @@ use editchain_core::{
 use editchain_git::{discover_repositories, resolve_commit, walk_history, RepositoryHandle};
 use editchain_import::{hash_raw, FsBlobSink};
 use editchain_index::LexicalIndex;
-use editchain_node::segment::SegmentStore;
 use editchain_project::filter::ChainFilter;
 use editchain_project::HistoryProjection;
 use editchain_protocol::{
@@ -34,6 +38,8 @@ use editchain_protocol::{
     SearchResponse,
 };
 use editchain_query::search::{SearchFilters, Source};
+
+use snapshot::{RenderSnapshot, SnapshotBuilder, SnapshotIdentity, SnapshotManifestData};
 
 /// A loaded workspace: chain ops + git repositories.
 #[derive(Debug)]
@@ -46,6 +52,9 @@ pub struct Workspace {
     source_ops: Vec<Op>,
     /// Constant-time lookup into `source_ops` for detail requests.
     source_op_index: HashMap<OpId, usize>,
+    /// Accepted operation ids and exact segment-record locations. This is
+    /// persisted into render snapshots so details remain lazy on the fast path.
+    source_op_locations: Vec<SnapshotOpLocator>,
     /// Read-only durable blob store used by on-demand details/search hydration.
     blob_resolver: Option<BlobResolver>,
     /// Discovered git repositories.
@@ -53,6 +62,15 @@ pub struct Workspace {
     /// Diagnostics for this open: chain canonicalization and bounded blob
     /// preview/deferred-hydration outcomes.
     pub diagnostics: OpenDiagnostics,
+    /// Absolute workspace root used if a non-default request must lazily load
+    /// the complete projection after a snapshot-backed Open.
+    root_path: PathBuf,
+    /// Absolute authoritative chain directory.
+    chain_path: PathBuf,
+    /// Valid immutable render snapshot for the fixed default view, if present.
+    snapshot: Option<RenderSnapshot>,
+    /// Whether `projection`/`source_ops` contain the authoritative live model.
+    projection_loaded: bool,
     /// The single currently cached filtered snapshot, keyed by
     /// `(hide_submodules, filter)`.
     ///
@@ -104,7 +122,7 @@ struct ViewSnapshot {
 /// Records are admitted through [`OpSet`], which ignores exact replays of an
 /// accepted op and quarantines same-id records with conflicting bytes, so a
 /// crash-replayed import page never double-counts or silently mutates an op.
-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct ChainReadStats {
     /// Successfully decoded records handed to the `OpSet`.
     pub records: usize,
@@ -116,8 +134,28 @@ pub struct ChainReadStats {
     pub quarantined: usize,
 }
 
+/// Exact location of one encoded operation inside an append-only segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpRecordLocation {
+    /// Numeric sequence from `<sequence>.eclog`.
+    pub(crate) segment_seq: u32,
+    /// Absolute byte offset of the encoded operation (after length + flags).
+    pub(crate) data_offset: u64,
+    /// Encoded operation length in bytes.
+    pub(crate) data_len: u32,
+}
+
+/// Accepted operation identity paired with its authoritative record location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SnapshotOpLocator {
+    /// Canonical operation identity.
+    pub(crate) id: OpId,
+    /// First accepted record carrying this identity.
+    pub(crate) location: OpRecordLocation,
+}
+
 /// Blob access outcome for payloads decoded at open or explicitly hydrated.
-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct BlobHydrationStats {
     /// Blob payloads replaced with verified inline content by an explicit full
     /// hydration pass. Workspace open leaves this at zero.
@@ -138,7 +176,7 @@ pub struct BlobHydrationStats {
 }
 
 /// Diagnostics reported when a workspace opens.
-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct OpenDiagnostics {
     /// Chain record canonicalization (dedup/quarantine) counts.
     pub chain: ChainReadStats,
@@ -217,7 +255,7 @@ impl BlobResolver {
     /// # Errors
     ///
     /// Returns an IO error if `chain_dir/blobs` exists but cannot be read.
-    pub fn open(chain_dir: &std::path::Path) -> io::Result<Self> {
+    pub fn open(chain_dir: &Path) -> io::Result<Self> {
         Ok(Self {
             sink: FsBlobSink::open_read_only(chain_dir.join("blobs"))?,
         })
@@ -258,7 +296,7 @@ impl BlobResolver {
             return BlobPreviewResolution::Missing;
         };
         let path = sink.path_for(&hash);
-        let Ok(metadata) = std::fs::metadata(&path) else {
+        let Ok(metadata) = fs::metadata(&path) else {
             return if path.exists() {
                 BlobPreviewResolution::Corrupt
             } else {
@@ -747,9 +785,14 @@ impl Workspace {
             projection,
             source_ops,
             source_op_index,
+            source_op_locations: Vec::new(),
             blob_resolver: None,
             repositories: Vec::new(),
             diagnostics: OpenDiagnostics::default(),
+            root_path: PathBuf::new(),
+            chain_path: PathBuf::new(),
+            snapshot: None,
+            projection_loaded: true,
             current_view: None,
         }
     }
@@ -768,7 +811,37 @@ impl Workspace {
         } else {
             PathBuf::from(workspace_path).join(chain_dir)
         };
-        let (source_ops, chain_stats) = read_chain_ops(&chain_path)?;
+        let workspace_path = PathBuf::from(workspace_path);
+        let repositories = discover_repositories(&workspace_path)?;
+        if let Ok(identity) = SnapshotIdentity::capture(&chain_path, &repositories) {
+            if let Ok(Some(snapshot)) = RenderSnapshot::open(&chain_path, &identity) {
+                let diagnostics = snapshot.diagnostics();
+                return Ok(Self {
+                    projection: HistoryProjection::from_ops_with(Vec::new(), projection_options()),
+                    source_ops: Vec::new(),
+                    source_op_index: HashMap::new(),
+                    source_op_locations: Vec::new(),
+                    blob_resolver: Some(BlobResolver::open(&chain_path)?),
+                    repositories,
+                    diagnostics,
+                    root_path: workspace_path,
+                    chain_path,
+                    snapshot: Some(snapshot),
+                    projection_loaded: false,
+                    current_view: None,
+                });
+            }
+        }
+        Self::open_projection(workspace_path, chain_path, repositories)
+    }
+
+    /// Load the authoritative projection, bypassing any derived render cache.
+    fn open_projection(
+        workspace_path: PathBuf,
+        chain_path: PathBuf,
+        repositories: Vec<editchain_git::RepositoryDiscovery>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let (source_ops, chain_stats, source_op_locations) = read_chain_ops(&chain_path)?;
         // Keep durable references in the canonical source corpus. The graph
         // projection receives only bounded display previews, preventing large
         // payload bytes from being multiplied by collapse/filter/layout clones.
@@ -782,11 +855,7 @@ impl Workspace {
         // q6 Phase-1: enable per-source-chain META bundling by default in the live
         // viewer. `ProjectionOptions` is passed explicitly so the behavior is
         // deterministic and a real cache key, never a process-global toggle.
-        let options = editchain_project::ProjectionOptions {
-            bundle_metadata: true,
-        };
-        let mut projection = HistoryProjection::from_ops_with(projection_ops, options);
-        let repositories = discover_repositories(&PathBuf::from(workspace_path))?;
+        let mut projection = HistoryProjection::from_ops_with(projection_ops, projection_options());
         // Walk each discovered repo's history into the projection.
         for discovery in &repositories {
             let opened = open_repository_handle(discovery);
@@ -809,14 +878,107 @@ impl Workspace {
             projection,
             source_ops,
             source_op_index,
+            source_op_locations,
             blob_resolver: Some(resolver),
             repositories,
             diagnostics,
+            root_path: workspace_path,
+            chain_path,
+            snapshot: None,
+            projection_loaded: true,
             current_view: None,
         })
     }
 
+    /// Materialize the complete projection only for compatibility requests
+    /// that cannot be served by the fixed-view snapshot.
+    fn ensure_projection_loaded(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.projection_loaded {
+            return Ok(());
+        }
+        let loaded = Self::open_projection(
+            self.root_path.clone(),
+            self.chain_path.clone(),
+            self.repositories.clone(),
+        )?;
+        self.projection = loaded.projection;
+        self.source_ops = loaded.source_ops;
+        self.source_op_index = loaded.source_op_index;
+        self.source_op_locations = loaded.source_op_locations;
+        self.blob_resolver = loaded.blob_resolver;
+        self.diagnostics = loaded.diagnostics;
+        self.projection_loaded = true;
+        self.current_view = None;
+        Ok(())
+    }
+
+    /// Whether this request matches the pregenerated temporary default view.
+    fn snapshot_supports_view(&self, hide_submodules: bool, filter: &ChainFilter) -> bool {
+        self.snapshot.is_some()
+            && hide_submodules == fixed_view_hide_submodules()
+            && filter.key() == fixed_view_filter().key()
+    }
+
+    /// Node count for the Open handshake, independent of backend.
+    fn node_count(&self) -> u64 {
+        self.snapshot.as_ref().map_or_else(
+            || u64::try_from(self.projection.len()).unwrap_or(u64::MAX),
+            RenderSnapshot::projection_nodes,
+        )
+    }
+
+    /// Accepted chain generation for the Open handshake, independent of backend.
+    fn chain_generation(&self) -> u64 {
+        self.snapshot.as_ref().map_or_else(
+            || u64::try_from(self.projection.ops.len()).unwrap_or(u64::MAX),
+            RenderSnapshot::chain_generation,
+        )
+    }
+
+    /// Human-readable render-cache status for diagnostics and performance tests.
+    const fn render_snapshot_status(&self) -> &'static str {
+        if self.snapshot.is_some() {
+            "hit"
+        } else {
+            "miss"
+        }
+    }
+
     /// Get a window of history rows (newest-first).
+    #[must_use]
+    pub fn history_window(&mut self, options: HistoryWindowOptions<'_>) -> HistoryWindow {
+        let offset = options.offset;
+        let include_layout = options.include_layout;
+        match self.try_history_window(options) {
+            Ok(window) => window,
+            Err(_) => HistoryWindow {
+                rows: Vec::new(),
+                total: 0,
+                chain_generation: self.chain_generation(),
+                max_lane: 0,
+                sub_op_counts: (offset == 0).then(Vec::new),
+                layout_ready: include_layout,
+            },
+        }
+    }
+
+    /// Fallible history-window path used by the protocol server and snapshot builder.
+    fn try_history_window(
+        &mut self,
+        options: HistoryWindowOptions<'_>,
+    ) -> Result<HistoryWindow, Box<dyn std::error::Error>> {
+        if self.snapshot_supports_view(options.hide_submodules, options.filter) {
+            let snapshot = self
+                .snapshot
+                .as_mut()
+                .ok_or("render snapshot disappeared during request")?;
+            return snapshot.history_window(options.offset, options.limit, options.include_layout);
+        }
+        self.ensure_projection_loaded()?;
+        Ok(self.projection_history_window(options))
+    }
+
+    /// Compute a history window from the complete in-memory projection.
     #[must_use]
     #[expect(
         clippy::arithmetic_side_effects,
@@ -824,7 +986,7 @@ impl Workspace {
         clippy::needless_borrow,
         reason = "expanded-slot prefix sums are bounded by node count; indexing is bounds-checked by partition_point; node is a &HistoryNode reference"
     )]
-    pub fn history_window(&mut self, options: HistoryWindowOptions<'_>) -> HistoryWindow {
+    fn projection_history_window(&mut self, options: HistoryWindowOptions<'_>) -> HistoryWindow {
         let HistoryWindowOptions {
             offset,
             limit,
@@ -1071,6 +1233,18 @@ impl Workspace {
         snapshot.context = Some(context);
     }
 
+    /// Fallible compatibility path that materializes projection state as needed.
+    fn try_graph_layout(
+        &mut self,
+        hide_submodules: bool,
+        offset: u64,
+        limit: u64,
+        filter: &ChainFilter,
+    ) -> Result<ProtocolGraphLayout, Box<dyn std::error::Error>> {
+        self.ensure_projection_loaded()?;
+        Ok(self.graph_layout(hide_submodules, offset, limit, filter))
+    }
+
     /// Compute the graph layout for a bounded window of rows.
     ///
     /// The layout context (all O(V) derived data) is cached per `hide_submodules`
@@ -1167,8 +1341,17 @@ impl Workspace {
     ) -> Option<NodeDetails> {
         if let Some(op_id_str) = op_id {
             let op_id = OpId::from_display_str(&op_id_str)?;
-            let index = self.source_op_index.get(&op_id).copied()?;
-            let mut op = self.source_ops.get(index)?.clone();
+            let mut op = if let Some(index) = self.source_op_index.get(&op_id).copied() {
+                self.source_ops.get(index)?.clone()
+            } else {
+                let snapshot = self.snapshot.as_ref()?;
+                let location = snapshot.op_location(op_id)?;
+                let decoded = read_op_at(snapshot.chain_dir(), location).ok()?;
+                if decoded.id != op_id {
+                    return None;
+                }
+                decoded
+            };
             if let Some(resolver) = &self.blob_resolver {
                 let mut stats = BlobHydrationStats::default();
                 hydrate_kind(&mut op.kind, resolver, &mut stats);
@@ -1228,6 +1411,91 @@ impl Workspace {
     }
 }
 
+/// Pregenerate the immutable fixed-view render snapshot used by the extension.
+///
+/// The source segment log and Git HEADs are fingerprinted before and after the
+/// build. A concurrent append or checkout therefore aborts publication instead
+/// of exposing rows derived from a mixed source generation.
+///
+/// # Errors
+///
+/// Returns an error when the chain/projection cannot be read, the source
+/// changes during generation, or the snapshot cannot be written durably.
+pub fn prepare_render_snapshot(
+    workspace_path: &Path,
+    chain_dir: &Path,
+) -> Result<RenderSnapshotReport, Box<dyn std::error::Error>> {
+    let chain_path = if chain_dir.is_absolute() {
+        chain_dir.to_path_buf()
+    } else {
+        workspace_path.join(chain_dir)
+    };
+    let repositories = discover_repositories(workspace_path)?;
+    let identity = SnapshotIdentity::capture(&chain_path, &repositories)?;
+    if let Ok(Some(snapshot)) = RenderSnapshot::open(&chain_path, &identity) {
+        return snapshot.report();
+    }
+
+    let mut workspace = Workspace::open_projection(
+        workspace_path.to_path_buf(),
+        chain_path.clone(),
+        repositories.clone(),
+    )?;
+    let filter = fixed_view_filter();
+    let page_limit = 4_096u64;
+    let first = workspace.try_history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: page_limit,
+        hide_submodules: fixed_view_hide_submodules(),
+        filter: &filter,
+        include_layout: true,
+    })?;
+    let sub_op_counts = first
+        .sub_op_counts
+        .clone()
+        .ok_or("snapshot first window omitted expansion index")?;
+    let total = first.total;
+    let max_lane = first.max_lane;
+    let mut builder = SnapshotBuilder::new(&chain_path, identity.clone())?;
+    builder.write_rows(&first.rows)?;
+    let mut offset = u64::try_from(first.rows.len())?;
+    while offset < total {
+        let window = workspace.try_history_window(HistoryWindowOptions {
+            offset,
+            limit: page_limit,
+            hide_submodules: fixed_view_hide_submodules(),
+            filter: &filter,
+            include_layout: true,
+        })?;
+        if window.rows.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "render snapshot projection ended before its declared total",
+            )
+            .into());
+        }
+        builder.write_rows(&window.rows)?;
+        offset = offset.saturating_add(u64::try_from(window.rows.len())?);
+    }
+
+    let final_identity = SnapshotIdentity::capture(&chain_path, &repositories)?;
+    if final_identity != identity {
+        return Err(
+            io::Error::other("chain or Git HEAD changed while preparing render snapshot").into(),
+        );
+    }
+    builder.finish(
+        SnapshotManifestData {
+            projection_nodes: u64::try_from(workspace.projection.len()).unwrap_or(u64::MAX),
+            chain_generation: u64::try_from(workspace.projection.ops.len()).unwrap_or(u64::MAX),
+            max_lane,
+            diagnostics: workspace.diagnostics,
+        },
+        &sub_op_counts,
+        &workspace.source_op_locations,
+    )
+}
+
 /// Convert an optional protocol filter DTO into a [`ChainFilter`].
 ///
 /// A `None` DTO yields the default filter (hide undated, splice on), matching
@@ -1245,6 +1513,23 @@ fn chain_filter_from_dto(dto: Option<&ChainFilterDto>) -> ChainFilter {
         ),
         None => ChainFilter::default(),
     }
+}
+
+/// Projection options shared by live computation and pregeneration.
+const fn projection_options() -> editchain_project::ProjectionOptions {
+    editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    }
+}
+
+/// Temporary fixed viewer filter while the filtering UI is being redesigned.
+fn fixed_view_filter() -> ChainFilter {
+    ChainFilter::new(String::new(), String::new(), String::new(), false, true)
+}
+
+/// The temporary fixed viewer hides nested Git repositories/submodules.
+const fn fixed_view_hide_submodules() -> bool {
+    true
 }
 
 /// Parse an exact decimal `RepositoryId` string, rejecting anything else.
@@ -1667,7 +1952,15 @@ fn resolved_object_from_commit(commit: &editchain_core::GitCommitEntity) -> Reso
 }
 
 /// Result of [`read_chain_ops`]: accepted ops plus canonicalization stats.
-type ChainReadResult = Result<(Vec<Op>, ChainReadStats), Box<dyn std::error::Error>>;
+type ChainReadResult =
+    Result<(Vec<Op>, ChainReadStats, Vec<SnapshotOpLocator>), Box<dyn std::error::Error>>;
+
+/// Encoded chain record paired with its exact durable location.
+#[derive(Debug)]
+struct LocatedChainRecord {
+    data: Vec<u8>,
+    location: OpRecordLocation,
+}
 
 /// Read all decoded operations from a chain directory, canonicalized through
 /// [`OpSet`].
@@ -1681,35 +1974,117 @@ type ChainReadResult = Result<(Vec<Op>, ChainReadStats), Box<dyn std::error::Err
 /// # Errors
 ///
 /// Returns an error if the chain directory cannot be read.
-fn read_chain_ops(chain_dir: &PathBuf) -> ChainReadResult {
+fn read_chain_ops(chain_dir: &Path) -> ChainReadResult {
     if chain_dir.as_os_str().is_empty() {
-        return Ok((Vec::new(), ChainReadStats::default()));
+        return Ok((Vec::new(), ChainReadStats::default(), Vec::new()));
     }
-    let store = SegmentStore::open(chain_dir)?;
-    let pages = store.read_all()?;
+    let records = read_chain_records(chain_dir)?;
     let mut opset = OpSet::new();
-    let mut accepted: Vec<Op> = Vec::new();
+    let mut accepted: Vec<(Op, SnapshotOpLocator)> = Vec::new();
     let mut stats = ChainReadStats::default();
-    for page in pages {
-        for record in page.records {
-            let Ok(op) = decode_op(&record.data) else {
-                continue;
-            };
-            stats.records = stats.records.saturating_add(1);
-            match opset.insert(op.id, record.data) {
-                Ok(true) => {
-                    stats.accepted = stats.accepted.saturating_add(1);
-                    accepted.push(op);
-                }
-                Ok(false) => stats.duplicates = stats.duplicates.saturating_add(1),
-                Err(_) => stats.quarantined = stats.quarantined.saturating_add(1),
+    for record in records {
+        let Ok(op) = decode_op(&record.data) else {
+            continue;
+        };
+        stats.records = stats.records.saturating_add(1);
+        match opset.insert(op.id, record.data) {
+            Ok(true) => {
+                stats.accepted = stats.accepted.saturating_add(1);
+                let id = op.id;
+                accepted.push((
+                    op,
+                    SnapshotOpLocator {
+                        id,
+                        location: record.location,
+                    },
+                ));
             }
+            Ok(false) => stats.duplicates = stats.duplicates.saturating_add(1),
+            Err(_) => stats.quarantined = stats.quarantined.saturating_add(1),
         }
     }
     // Match the OpSet's canonical `OpId` key order without a second decode
     // pass — decoding 100k+ records twice is the dominant Open cost in debug.
-    accepted.sort_by_key(|op| op.id);
-    Ok((accepted, stats))
+    accepted.sort_by_key(|(op, _)| op.id);
+    let (ops, locations) = accepted.into_iter().unzip();
+    Ok((ops, stats, locations))
+}
+
+/// Scan every complete segment record while retaining byte offsets.
+fn read_chain_records(chain_dir: &Path) -> io::Result<Vec<LocatedChainRecord>> {
+    let mut records = Vec::new();
+    let mut segment_seq = 0u32;
+    loop {
+        let path = chain_dir.join(format!("{segment_seq:06}.eclog"));
+        if !path.exists() {
+            break;
+        }
+        scan_segment_records(segment_seq, &fs::read(path)?, &mut records)?;
+        segment_seq = segment_seq.saturating_add(1);
+    }
+    Ok(records)
+}
+
+/// Scan complete pages and records from one segment, ignoring a partial tail.
+fn scan_segment_records(
+    segment_seq: u32,
+    bytes: &[u8],
+    records: &mut Vec<LocatedChainRecord>,
+) -> io::Result<()> {
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let Some(magic) = bytes.get(offset..offset.saturating_add(4)) else {
+            break;
+        };
+        if magic != PAGE_MAGIC {
+            break;
+        }
+        if bytes.get(offset..offset.saturating_add(8)).is_none() {
+            break;
+        }
+        offset = offset.saturating_add(8);
+        loop {
+            let Some(length_bytes) = bytes.get(offset..offset.saturating_add(4)) else {
+                return Ok(());
+            };
+            if length_bytes == PAGE_MAGIC {
+                break;
+            }
+            let length_array: [u8; 4] = length_bytes.try_into().map_err(|_error| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid record length")
+            })?;
+            let data_len = u32::from_le_bytes(length_array);
+            let data_offset = offset.saturating_add(5);
+            let data_end =
+                data_offset.saturating_add(usize::try_from(data_len).unwrap_or(usize::MAX));
+            let Some(data) = bytes.get(data_offset..data_end) else {
+                return Ok(());
+            };
+            records.push(LocatedChainRecord {
+                data: data.to_vec(),
+                location: OpRecordLocation {
+                    segment_seq,
+                    data_offset: u64::try_from(data_offset).unwrap_or(u64::MAX),
+                    data_len,
+                },
+            });
+            offset = data_end;
+        }
+    }
+    Ok(())
+}
+
+/// Decode one operation directly from its indexed segment-record location.
+fn read_op_at(
+    chain_dir: &Path,
+    location: OpRecordLocation,
+) -> Result<Op, Box<dyn std::error::Error>> {
+    let path = chain_dir.join(format!("{:06}.eclog", location.segment_seq));
+    let mut file = File::open(path)?;
+    let _: u64 = file.seek(SeekFrom::Start(location.data_offset))?;
+    let mut encoded = vec![0u8; usize::try_from(location.data_len)?];
+    file.read_exact(&mut encoded)?;
+    decode_op(&encoded).map_err(Into::into)
 }
 
 /// Deterministic git identity for a synthetic search-indexed op.
@@ -1880,8 +2255,9 @@ impl Server {
                     "workspace": req.workspace_path,
                     "chain": req.chain_dir,
                     "repos": self.workspace.as_ref().map_or(0, |w| w.repositories.len()),
-                    "nodes": self.workspace.as_ref().map_or(0, |w| w.projection.len()),
-                    "chain_generation": self.workspace.as_ref().map_or(0, |w| w.projection.ops.len()),
+                    "nodes": self.workspace.as_ref().map_or(0, Workspace::node_count),
+                    "chain_generation": self.workspace.as_ref().map_or(0, Workspace::chain_generation),
+                    "render_snapshot": self.workspace.as_ref().map_or("miss", Workspace::render_snapshot_status),
                     // Canonicalization + lazy blob access outcomes for this open.
                     // New keys: backward-compatible; older clients ignore them.
                     "diagnostics": serde_json::to_value(diagnostics)?,
@@ -1891,19 +2267,20 @@ impl Server {
             RequestBody::GetWindow(req) => {
                 let ws = self.workspace.as_mut().ok_or("no workspace open")?;
                 let filter = chain_filter_from_dto(req.filter.as_ref());
-                let window = ws.history_window(HistoryWindowOptions {
+                let window = ws.try_history_window(HistoryWindowOptions {
                     offset: req.offset,
                     limit: req.limit,
                     hide_submodules: req.hide_submodules,
                     filter: &filter,
                     include_layout: req.include_layout,
-                });
+                })?;
                 ResponseBody::Ok(serde_json::to_value(window)?)
             }
             RequestBody::GetLayout(req) => {
                 let ws = self.workspace.as_mut().ok_or("no workspace open")?;
                 let filter = chain_filter_from_dto(req.filter.as_ref());
-                let layout = ws.graph_layout(req.hide_submodules, req.offset, req.limit, &filter);
+                let layout =
+                    ws.try_graph_layout(req.hide_submodules, req.offset, req.limit, &filter)?;
                 ResponseBody::Ok(serde_json::to_value(layout)?)
             }
             RequestBody::GetNodeDetails(req) => {
@@ -1947,7 +2324,8 @@ impl Server {
                 };
                 // Build the lexical index lazily on first search.
                 if self.lexical.is_none() {
-                    let ws = self.workspace.as_ref().ok_or("no workspace open")?;
+                    let ws = self.workspace.as_mut().ok_or("no workspace open")?;
+                    ws.ensure_projection_loaded()?;
                     self.lexical = Some(build_lexical_index(ws)?);
                 }
                 let lexical = self.lexical.as_ref().ok_or("no index built")?;
@@ -2030,7 +2408,7 @@ fn payload_text(payload: &Payload) -> String {
 mod tests {
     use super::*;
     use editchain_codec::frame::encode_op;
-    use editchain_codec::page::Page;
+    use editchain_codec::page::{encode_page, Page};
     use editchain_core::{ImportOp, MessageOp, PathId};
     use editchain_import::BlobSink as _;
 
@@ -2038,17 +2416,17 @@ mod tests {
     const OVER_2_53: u64 = 9_007_199_254_740_993;
 
     /// Write ops into a chain directory as a single segment page.
-    fn write_chain(chain_dir: &std::path::Path, ops: &[Op]) {
-        let mut store = SegmentStore::open(chain_dir).unwrap();
+    fn write_chain(chain_dir: &Path, ops: &[Op]) {
         let mut page = Page::new(0);
         for op in ops {
             page.add_record(0, encode_op(op).unwrap());
         }
-        store.append_page(&page).unwrap();
+        fs::create_dir_all(chain_dir).unwrap();
+        fs::write(chain_dir.join("000000.eclog"), encode_page(&page)).unwrap();
     }
 
     /// Store a blob in a chain's durable blob store, returning its reference.
-    fn store_blob(chain_dir: &std::path::Path, data: &[u8]) -> BlobRef {
+    fn store_blob(chain_dir: &Path, data: &[u8]) -> BlobRef {
         let mut blobs = FsBlobSink::new(chain_dir.join("blobs")).unwrap();
         blobs.put(data).unwrap()
     }
@@ -2595,7 +2973,7 @@ mod tests {
         reason = "manual diagnostics deliberately print raw chain-level counts to stderr"
     )]
     fn diag_chain_counts() {
-        let (ops, _stats) = read_chain_ops(&PathBuf::from(
+        let (ops, _stats, _locations) = read_chain_ops(&PathBuf::from(
             "/mnt/hot/ambientlight/repos/editchain/.editchain",
         ))
         .unwrap();
@@ -2683,7 +3061,7 @@ mod tests {
     fn open_previews_blobs_and_hydrates_details_and_search_on_demand() {
         let dir = tempfile::tempdir().unwrap();
         let workspace_path = dir.path().join("workspace");
-        std::fs::create_dir_all(&workspace_path).unwrap();
+        fs::create_dir_all(&workspace_path).unwrap();
         let chain_dir = workspace_path.join(".editchain");
 
         // Payloads well past INLINE_LIMIT (4096) so the importer would spill
@@ -2848,7 +3226,7 @@ mod tests {
     fn open_preserves_missing_and_corrupt_blob_refs_and_reports() {
         let dir = tempfile::tempdir().unwrap();
         let workspace_path = dir.path().join("workspace");
-        std::fs::create_dir_all(&workspace_path).unwrap();
+        fs::create_dir_all(&workspace_path).unwrap();
         let chain_dir = workspace_path.join(".editchain");
 
         // Missing: the reference is never stored.
@@ -2866,7 +3244,7 @@ mod tests {
             len: u32::try_from(corrupt_data.len()).unwrap(),
         };
         let sink = FsBlobSink::new(chain_dir.join("blobs")).unwrap();
-        std::fs::write(sink.path_for(&corrupt_hash), b"corrupted bytes").unwrap();
+        fs::write(sink.path_for(&corrupt_hash), b"corrupted bytes").unwrap();
 
         // Corrupt by length: correct bytes but a lying declared length.
         let len_data = b"valid-length-content".to_vec();
@@ -2970,7 +3348,7 @@ mod tests {
     fn open_canonicalizes_replays_and_quarantines_conflicts() {
         let dir = tempfile::tempdir().unwrap();
         let workspace_path = dir.path().join("workspace");
-        std::fs::create_dir_all(&workspace_path).unwrap();
+        fs::create_dir_all(&workspace_path).unwrap();
         let chain_dir = workspace_path.join(".editchain");
 
         let first = op_envelope(
@@ -3268,9 +3646,14 @@ mod tests {
             projection,
             source_ops: vec![source.clone()],
             source_op_index,
+            source_op_locations: Vec::new(),
             blob_resolver: Some(resolver),
             repositories: Vec::new(),
             diagnostics: OpenDiagnostics::default(),
+            root_path: PathBuf::new(),
+            chain_path: tmp.path().to_path_buf(),
+            snapshot: None,
+            projection_loaded: true,
             current_view: None,
         };
         let details = ws

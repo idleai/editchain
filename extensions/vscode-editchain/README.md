@@ -13,7 +13,7 @@ from Claude Code and Codex, overlaid with live Git history from the workspace's
 
 ```sh
 # 1. Build the native Rust service (from the editchain repo root)
-cargo build -p editchain-vscode-service
+cargo build --release -p editchain-vscode-service
 
 # 2. Build the extension
 cd extensions/vscode-editchain
@@ -30,25 +30,23 @@ code --install-extension editchain-history-0.1.0.vsix
 ### Configure the service path
 
 Set `editchain-history.servicePath` to the Rust binary, or leave it empty to
-auto-detect `<workspace>/target/debug/editchain-vscode-service`.
+prefer `<workspace>/target/release/editchain-vscode-service` with the debug
+build as a fallback.
 
 ### Open the viewer
 
 Command palette (`Ctrl+Shift+P`) → **"EditChain: Open History Explorer"**.
 
 The viewer shows a unified, paged history list (EditChain ops + git commits),
-lexical search, and a click-to-inspect detail view. Search carries the active
-view semantics (messages-only → an inclusive kind filter and a `Message`/
-`Command` search-kind filter; hide-undated → time bound; the chain-filter
-pattern HIDES matching rows server-side and is enforced on search hits by
-REMOVING matches client-side, because the search protocol cannot carry a
-summary regex). Git search hits carry their real identity (`git_oid` lowercase
-hex, exact decimal `repository`, `kind: "git"`, `is_submodule`), so clicking a
-git result navigates by `ResolveObject` — never by the synthetic index-only
-`op_id` — and submodule-aware search filtering applies to real scored hits.
-Rapid consecutive searches are latest-query-wins. Panel state (scroll row,
-hide-undated, messages-only, submodules, chain filter) is restored across
-sessions.
+lexical search, and a click-to-inspect detail view. The old filtering controls
+are intentionally absent while their replacement is designed. The temporary
+fixed view shows all operation kinds and undated rows, hides nested Git
+repositories/submodules, applies no summary/kind pattern, and splices hidden
+intermediates for graph continuity. Git search hits carry their real identity
+(`git_oid` lowercase hex, exact decimal `repository`, `kind: "git"`,
+`is_submodule`), so clicking a git result navigates by `ResolveObject` — never
+by the synthetic index-only `op_id`. Rapid consecutive searches are
+latest-query-wins. Only the viewport row is restored across recreated panels.
 
 All viewer-facing identifiers round-trip as exact JSON strings: op ids are
 `node:boot:seq`, git OIDs are lowercase hex, and repository/session/actor ids
@@ -67,7 +65,7 @@ numbers or byte-array ID structures.
 
 | Setting | Default | Description |
 |---|---|---|
-| `editchain-history.servicePath` | `""` | Path to the Rust service binary. Empty = auto-detect from workspace `target/debug`. |
+| `editchain-history.servicePath` | `""` | Path to the Rust service binary. Empty = prefer the workspace release build, then fall back to debug. |
 | `editchain-history.chainDir` | `.editchain` | Path to the EditChain directory relative to the workspace root. |
 
 ## Harness testing (text-first layout debugging)
@@ -92,23 +90,13 @@ Scenarios: `empty`, `linear`, `merge`, `mixed`, `filtered`, `undated`, `error`,
 is **test-blocking**: it exits non-zero when any layout check fails or the page
 reports errors.
 
-Two scenario interactions are exercised automatically and block `check` mode:
+Scenario interactions exercised by the harness block `check` mode:
 
 - `combined` — clicks the combined op and verifies ALL bundled sub-ops reveal
   inline (not just the first one).
-- `linear` / `mixed` — drive the real chain-filter controls and assert the
-  filter DIRECTION matches the service: the pattern HIDES matching rows
-  (endpoints preserved), clearing restores the window, and "Show messages
-  only" is an INCLUSIVE kind constraint that keeps only message/command rows
-  (tool/git rows are excluded even when they are endpoints).
 - `--search "query"` — runs the renderer's real search path (input → Enter →
   result list → click) and verifies the results render and navigate to the JSON
   editor, e.g. `npm run ui:check -- --scenario mixed --search message`.
-- `--stale-race` — with `--scenario undated`, races a held (controlled-release)
-  GetWindow response against a filter reset and verifies the stale response is
-  rejected (view-generation correlation), so the table always reflects the
-  current filter state. The response is released explicitly — no sleep-based
-  timing.
 - `--search-race` — with `--scenario merge`, issues two rapid searches with the
   first response held, and verifies the LATEST query wins (search-epoch
   correlation): releasing the older query's late response must not replace the
@@ -123,7 +111,7 @@ Two scenario interactions are exercised automatically and block `check` mode:
 
 Artifacts are written to `.ui-out/<scenario>/` (`summary.md`, `layout.txt`,
 `layout.json`, `svg.json`, `console.txt`, `metrics.json`, `aria.yml`,
-`expansion.json`, `search.json`, `stale.json`, `search-race.json`,
+`expansion.json`, `search.json`, `search-race.json`,
 `resize.json`).
 
 `--shot PATH` captures a PNG only after the UI is settled (`whenIdle` resolves:
@@ -154,7 +142,7 @@ as well as readiness checks, which is important for large imported chains.
 
 ### Graph harness (real service, structural checks)
 
-The graph harness pages the **entire** filtered dataset through the real
+The graph harness pages the **entire** rendered dataset through the real
 service bridge using the exact `GetWindow` DTOs the renderer sends, then runs
 structural checks over the data **and** the rendered DOM — built for ~150k-row
 chains without accumulating full row DTOs:
@@ -171,7 +159,8 @@ default): a hung service fails the run after the configured bound instead of
 the old hardcoded 120s. `Open` remains explicitly unbounded (0 deadline) —
 building the chain + git graph can take minutes on a large workspace. The
 service binary comes from `SERVICE_PATH` or
-`<workspace>/target/debug/editchain-vscode-service`.
+`<workspace>/target/release/editchain-vscode-service`, with the debug build as
+a fallback.
 
 The probe's own failure detection is verified without a service via simulated
 fixtures:

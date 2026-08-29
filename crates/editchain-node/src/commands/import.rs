@@ -128,6 +128,32 @@ pub fn run(
         // ops, and that checkpoint must survive the restart so a later
         // regrowth continues at the correct boot generation.
         cursors.commit()?;
+
+        // Render rows, expansion offsets, graph geometry, and operation lookup
+        // locations are deterministic derived data. Build them only after the
+        // append and cursor checkpoint are durable; a failed build leaves the
+        // authoritative import intact and can be retried with `prepare-view`.
+        let workspace_path = PathBuf::from(&workspace);
+        let snapshot_chain_path = if chain_path.is_absolute() {
+            chain_path.clone()
+        } else {
+            std::env::current_dir()?.join(&chain_path)
+        };
+        let snapshot = editchain_vscode_service::prepare_render_snapshot(
+            &workspace_path,
+            &snapshot_chain_path,
+        );
+        match snapshot {
+            Ok(snapshot) => println!(
+                "Render snapshot {}: {} rows at {}",
+                if snapshot.reused { "reused" } else { "generated" },
+                snapshot.rows,
+                snapshot.path.display()
+            ),
+            Err(error) => println!(
+                "Render snapshot preparation failed (import remains durable; run prepare-view to retry): {error}"
+            ),
+        }
     }
 
     if dry_run {
@@ -269,7 +295,8 @@ mod tests {
             | Commands::Merge { .. }
             | Commands::Search { .. }
             | Commands::Tail { .. }
-            | Commands::Retrieve { .. } => None,
+            | Commands::Retrieve { .. }
+            | Commands::PrepareView { .. } => None,
         }
     }
 

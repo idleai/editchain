@@ -34,7 +34,7 @@ const CHROME = process.env.CHROME_PATH ||
 const SCENARIOS = ['empty', 'linear', 'merge', 'mixed', 'filtered', 'undated', 'error', 'warned', 'large', 'longsummary', 'combined', 'fork', 'highLanes'];
 
 function parseArgs(argv) {
-  const args = { cmd: argv[0], scenario: 'merge', viewport: '1440x900', out: null, selector: null, search: null, staleRace: false, searchRace: false, resize: false, deferredLayout: false, shot: null };
+  const args = { cmd: argv[0], scenario: 'merge', viewport: '1440x900', out: null, selector: null, search: null, searchRace: false, resize: false, deferredLayout: false, shot: null };
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--scenario') args.scenario = argv[++i];
@@ -42,7 +42,6 @@ function parseArgs(argv) {
     else if (a === '--out') args.out = argv[++i];
     else if (a === '--selector') args.selector = argv[++i];
     else if (a === '--search') args.search = argv[++i];
-    else if (a === '--stale-race') args.staleRace = true;
     else if (a === '--search-race') args.searchRace = true;
     else if (a === '--resize') args.resize = true;
     else if (a === '--deferred-layout') args.deferredLayout = true;
@@ -162,14 +161,6 @@ async function main() {
     searchResult = await page.evaluate((q) => window.__editchainDebug.runSearch(q, 5000), args.search);
   }
 
-  // Stale-response race (scenario must be `undated`): a GetWindow issued
-  // before a filter reset lands after it and must be rejected via the view
-  // generation, leaving the table on the current filter's rows.
-  let staleRace = null;
-  if (args.staleRace) {
-    staleRace = await page.evaluate(() => window.__editchainDebug.runStaleResponseRace());
-  }
-
   // Reversed-search race (scenario must be `merge`): two rapid searches share
   // a view generation; the LATEST issued query must win regardless of response
   // order (latest-query-wins via search-epoch correlation).
@@ -212,7 +203,6 @@ async function main() {
   fs.writeFileSync(path.join(outDir, 'aria.yml'), formatAria(page));
   if (expansion) fs.writeFileSync(path.join(outDir, 'expansion.json'), JSON.stringify(expansion, null, 2));
   if (searchResult) fs.writeFileSync(path.join(outDir, 'search.json'), JSON.stringify(searchResult, null, 2));
-  if (staleRace) fs.writeFileSync(path.join(outDir, 'stale.json'), JSON.stringify(staleRace, null, 2));
   if (searchRace) fs.writeFileSync(path.join(outDir, 'search-race.json'), JSON.stringify(searchRace, null, 2));
   if (resizeResult) fs.writeFileSync(path.join(outDir, 'resize.json'), JSON.stringify(resizeResult, null, 2));
   if (deferredLayout) fs.writeFileSync(path.join(outDir, 'deferred-layout.json'), JSON.stringify(deferredLayout, null, 2));
@@ -245,13 +235,6 @@ async function main() {
     summary.push('- search "' + args.search + '": results=' + searchResult.resultRows +
       ' banner="' + searchResult.bannerText + '" navigated=' + searchResult.navigated +
       ' (' + (searchOk ? 'OK' : 'FAIL') + ')');
-  }
-  if (staleRace) {
-    const step = staleRace.steps[0];
-    const raceOk = step && step.staleRejected === true;
-    summary.push('- stale-response race: total=' + step.total +
-      ' keys=' + JSON.stringify(step.keys) +
-      ' (' + (raceOk ? 'OK — stale response rejected' : 'FAIL — stale response applied') + ')');
   }
   if (searchRace) {
     const step = searchRace.steps[0];
@@ -293,7 +276,6 @@ async function main() {
     (expansion !== null && !(expansion.subopRows === 7 && expansion.rowsRendered >= 9)) ||
     (searchResult !== null && !(searchResult.resultRows > 0 &&
       (searchResult.navigated || searchResult.firstRowChevron))) ||
-    (staleRace !== null && !(staleRace.steps[0] && staleRace.steps[0].staleRejected === true)) ||
     (searchRace !== null && !(searchRace.steps[0] && searchRace.steps[0].latestWins === true)) ||
     (resizeResult !== null && resizeResult.pass !== true) ||
     (deferredLayout !== null && deferredLayout.pass !== true);
@@ -316,8 +298,6 @@ async function main() {
     ' rowsRendered=' + expansion.rowsRendered);
   if (searchResult) console.log('search results=' + searchResult.resultRows +
     ' navigated=' + searchResult.navigated);
-  if (staleRace) console.log('stale-race total=' + staleRace.steps[0].total +
-    ' staleRejected=' + staleRace.steps[0].staleRejected);
   if (searchRace) console.log('search-race latestWins=' + searchRace.steps[0].latestWins);
   if (resizeResult) console.log('resize pass=' + resizeResult.pass +
     ' detail=' + JSON.stringify(resizeResult.detail));
@@ -381,8 +361,6 @@ function formatAria(page) {
     '# Accessibility tree',
     '',
     '- search input: #search',
-    '- toggle "Show git submodules": #hideSubmodules',
-    '- toggle "Show messages only": #hideSystem',
     '- rows container: #rows',
     '- detail pane: #detail',
     '',

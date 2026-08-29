@@ -165,50 +165,6 @@
     };
   }
 
-  // Drive the real renderer's chain-filter controls and capture the resulting
-  // row keys. In the fixture harness the bridge responds synchronously inside
-  // postMessage, so each step settles before the next read; a microtask tick
-  // keeps the reads deterministic regardless of harness timing.
-  async function runFilterProbe() {
-    const out = { steps: [] };
-    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-    const rowKeys = () => Array.from(document.querySelectorAll('.row[data-key]'))
-      .map((r) => r.getAttribute('data-key'));
-    const filterInput = document.getElementById('filter');
-    const messagesToggle = document.getElementById('hideSystem');
-
-    // 1. Chain-filter pattern HIDES matching rows (endpoints preserved).
-    const beforeHide = rowKeys();
-    filterInput.value = 'commit ';
-    filterInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-    await sleep(0);
-    const hideKeys = rowKeys();
-    out.steps.push({ name: 'hide-pattern', beforeHide, hideKeys });
-
-    // 2. Clearing the filter restores the full window.
-    filterInput.value = '';
-    filterInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-    await sleep(0);
-    const restoredKeys = rowKeys();
-    out.steps.push({ name: 'restore', restoredKeys });
-
-    // 3. "Show messages only" is an INCLUSIVE kind constraint: every
-    //    non-message/non-command row is excluded, including endpoints.
-    const beforeMessagesOnly = rowKeys();
-    if (messagesToggle) {
-      messagesToggle.checked = true;
-      messagesToggle.dispatchEvent(new Event('change', { bubbles: true }));
-      await sleep(0);
-      const messagesOnlyKeys = rowKeys();
-      out.steps.push({ name: 'messages-only', beforeMessagesOnly, messagesOnlyKeys });
-      messagesToggle.checked = false;
-      messagesToggle.dispatchEvent(new Event('change', { bubbles: true }));
-      await sleep(0);
-      out.steps.push({ name: 'messages-only-restored', keys: rowKeys() });
-    }
-    return out;
-  }
-
   // --- readiness -------------------------------------------------------------
 
   // Track in-flight requests by hooking the bridge's dispatch. The renderer
@@ -241,57 +197,6 @@
     return typeof window.__editchainInFlightCount === 'function'
       ? window.__editchainInFlightCount()
       : 0;
-  }
-
-  // Deterministic stale-response race: the `undated` fixture (3 rows) is loaded
-  // with the loader paused and the FIRST GetWindow response HELD (controlled
-  // completion — no sleep-based timing). Before it is released, "Hide undated"
-  // is toggled (a new view generation). The held response belongs to the OLD
-  // view; releasing it after the toggle must leave it rejected so the table
-  // shows only the filtered rows (u1, u3) once the current view's window
-  // arrives. Without stale-response rejection the old 3-row window would be
-  // applied and displayed under the new filter state (cache/total poisoning).
-  async function runStaleResponseRace() {
-    const out = { steps: [] };
-    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-    window.__editchainPauseLoader = true;
-    // Hold the first GetWindow response; release it explicitly below.
-    window.__editchainHoldWindow = {};
-    // Start a fresh view fetch. `resetAndRefetch` clears the renderer cache
-    // and issues the offset-0 window immediately, so the FIRST window of the
-    // new view is the held one (a replayed `open` would leave the previous
-    // load's cache in place and fetchWindow would find nothing missing).
-    resetAndRefetch();
-    const holdDeadline = Date.now() + 3000;
-    while (!window.__editchainHoldWindow.release) {
-      if (Date.now() > holdDeadline) throw new Error('stale-race: window response was never held');
-      await sleep(5);
-    }
-    const releaseStale = window.__editchainHoldWindow.release;
-    window.__editchainHoldWindow = null;
-    // Toggle the filter while the window is still in flight (new view gen).
-    const toggle = document.getElementById('hideUndated');
-    toggle.checked = true;
-    toggle.dispatchEvent(new Event('change', { bubbles: true }));
-    // Release the stale response, then wait for the current view's replacement
-    // window to arrive and render (controlled completion — no fixed sleeps).
-    releaseStale();
-    await whenIdle(3000);
-    const keys = Array.from(document.querySelectorAll('.row[data-key]'))
-      .map((r) => r.getAttribute('data-key'));
-    const total = window.__editchainGetTotal ? window.__editchainGetTotal() : -1;
-    const clean = keys.length === 2 &&
-      keys.indexOf('node:u:1') !== -1 &&
-      keys.indexOf('node:u:3') !== -1 &&
-      total === 2;
-    out.steps.push({
-      keys,
-      total,
-      dataReady: dataReady(),
-      staleRejected: clean,
-    });
-    window.__editchainPauseLoader = false;
-    return out;
   }
 
   // Deterministic reversed-search race: two rapid searches must be
@@ -1514,74 +1419,6 @@
       });
     }
 
-    // Check 5e3 (linear scenario only): the chain-filter input HIDES matching
-    // rows server-side (endpoints preserved). "commit " matches every row in
-    // the 4-commit chain; the two intermediates are hidden while the newest
-    // root and oldest leaf stay. Clearing the input restores the full window.
-    if (window.__editchainScenarioName === 'linear') {
-      const filterInput = document.getElementById('filter');
-      const rowKeys = () => Array.from(document.querySelectorAll('.row[data-key]'))
-        .map((r) => r.getAttribute('data-key'));
-      const before = rowKeys();
-      filterInput.value = 'commit ';
-      filterInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-      const hidden = rowKeys();
-      const hideDirection =
-        before.length === 4 &&
-        hidden.length === 2 &&
-        hidden.indexOf('git:d') !== -1 &&
-        hidden.indexOf('git:a') !== -1 &&
-        hidden.indexOf('git:c') === -1 &&
-        hidden.indexOf('git:b') === -1;
-      checks.push({
-        name: 'FILTER_HIDE_DIRECTION',
-        pass: hideDirection,
-        detail: hideDirection
-          ? 'endpoints git:d/git:a kept, intermediates hidden'
-          : 'before=' + JSON.stringify(before) + ' after=' + JSON.stringify(hidden),
-      });
-      filterInput.value = '';
-      filterInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-      const restored = rowKeys();
-      checks.push({
-        name: 'FILTER_CLEAR_RESTORES',
-        pass: restored.length === 4 && restored.every((k) => before.indexOf(k) !== -1),
-        detail: restored.length === 4
-          ? 'full window restored'
-          : 'restored=' + JSON.stringify(restored),
-      });
-    }
-
-    // Check 5e4 (mixed scenario only): "Show messages only" is an INCLUSIVE
-    // kind constraint (include_kind_pattern) — the tool and git rows are
-    // excluded even though they are endpoints, and only message/command rows
-    // survive. The toggle is restored immediately so the rest of the checks
-    // run against the full window.
-    if (window.__editchainScenarioName === 'mixed') {
-      const messagesToggle = document.getElementById('hideSystem');
-      const rowKeys = () => Array.from(document.querySelectorAll('.row[data-key]'))
-        .map((r) => r.getAttribute('data-key'));
-      messagesToggle.checked = true;
-      messagesToggle.dispatchEvent(new Event('change', { bubbles: true }));
-      const keys = rowKeys();
-      const messagesOnly =
-        keys.length === 3 &&
-        keys.indexOf('node:s1:a') !== -1 &&
-        keys.indexOf('node:s1:h') !== -1 &&
-        keys.indexOf('node:s2:c') !== -1 &&
-        keys.indexOf('node:s1:b') === -1 &&
-        keys.indexOf('git:x') === -1;
-      checks.push({
-        name: 'MESSAGES_ONLY_INCLUSIVE_KIND',
-        pass: messagesOnly,
-        detail: messagesOnly
-          ? 'only message/command rows kept: ' + JSON.stringify(keys)
-          : 'unexpected keys=' + JSON.stringify(keys),
-      });
-      messagesToggle.checked = false;
-      messagesToggle.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-
     return checks;
   }
 
@@ -1600,7 +1437,7 @@
       domNodes: document.querySelectorAll('*').length,
       listenersApprox:
         document.querySelectorAll('[onclick], [onmousedown], [onkeydown]').length +
-        4 /* search keydown/input + toggle change handlers */ +
+        2 /* search keydown/input */ +
         2 /* rows scroll + window resize */ +
         1 /* progressive timer */ +
         1 /* uncaught error */ ,
@@ -1677,8 +1514,6 @@
     assertLayout,
     getMetrics,
     runSearch,
-    runFilterProbe,
-    runStaleResponseRace,
     runReversedSearchRace,
     captureResizeMetrics,
     evaluateResizeAssert,

@@ -6,8 +6,7 @@
 // Usage:
 //   node scripts/ui-real.mjs [--workspace DIR] [--chain-dir .editchain]
 //                            [--viewport WxH] [--out DIR] [--selector Q]
-//                            [--top-row N] [--messages-only] [--filter PATTERN]
-//                            [--scroll-row N] [--expand-visible]
+//                            [--top-row N] [--scroll-row N] [--expand-visible]
 //
 // The service binary path comes from SERVICE_PATH or prefers the workspace's
 // release build, falling back to debug when release has not been built.
@@ -28,8 +27,8 @@ const CHROME = process.env.CHROME_PATH ||
 function parseArgs(argv) {
   const args = {
     workspace: null, chainDir: '.editchain', viewport: '1440x900', out: null,
-    selector: null, shot: null, topRow: null, messagesOnly: false, filter: null,
-    scrollRow: null, expandVisible: false,
+    selector: null, shot: null, topRow: null, scrollRow: null,
+    expandVisible: false,
     // Row-ready deadline. The real service can take >20s to Open + deliver the
     // first window on a large chain, so this must be long and configurable —
     // the outer runner (CI/timeout wrapper) bounds the whole run instead.
@@ -45,8 +44,6 @@ function parseArgs(argv) {
     else if (a === '--shot') args.shot = argv[++i];
     else if (a === '--top-row') args.topRow = parseInt(argv[++i], 10);
     else if (a === '--scroll-row') args.scrollRow = parseInt(argv[++i], 10);
-    else if (a === '--messages-only') args.messagesOnly = true;
-    else if (a === '--filter') args.filter = argv[++i];
     else if (a === '--expand-visible') args.expandVisible = true;
     else if (a === '--row-timeout') args.rowTimeoutMs = parseInt(argv[++i], 10) || args.rowTimeoutMs;
   }
@@ -243,13 +240,9 @@ async function main() {
   // Start the handshake.
   console.log('STEP start handshake...');
   // Preload persisted VS Code webview state before the handshake, so the
-  // renderer's restoreState() opens around the requested visible top row and
-  // with the messages-only checkbox / chain-filter pattern already applied to
-  // the first window fetch. Absent flags leave the state untouched (default).
+  // renderer's restoreState() opens around the requested visible top row.
   const preloadState = {};
   if (args.topRow !== null && Number.isFinite(args.topRow)) preloadState.topRow = args.topRow;
-  if (args.messagesOnly) preloadState.showMessagesOnly = true;
-  if (args.filter !== null) preloadState.filterPattern = args.filter;
   if (Object.keys(preloadState).length) {
     console.log('STEP preload state: ' + JSON.stringify(preloadState));
     await page.evaluate((state) => {
@@ -500,8 +493,6 @@ async function main() {
   const settings = [];
   if (args.topRow !== null) settings.push('topRow=' + args.topRow);
   if (args.scrollRow !== null) settings.push('scrollRow=' + args.scrollRow);
-  if (args.messagesOnly) settings.push('showMessagesOnly=true');
-  if (args.filter !== null) settings.push('filterPattern=' + JSON.stringify(args.filter));
   if (args.expandVisible) settings.push('expandVisible=true' + (expandCount ? ' (expanded ' + expandCount + ' chevrons)' : ''));
   const summary = [
     '# EditChain real UI dump',

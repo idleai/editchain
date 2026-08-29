@@ -28,10 +28,16 @@ const rowsEl = document.getElementById('rows');
 const searchEl = document.getElementById('search');
 const detailEl = document.getElementById('detail');
 const layoutEl = document.getElementById('layout');
-const filterEl = document.getElementById('filter');
-const hideUndatedEl = document.getElementById('hideUndated');
-const hideSubmodulesEl = document.getElementById('hideSubmodules');
-const hideSystemEl = document.getElementById('hideSystem');
+
+// Temporary fixed view while the filtering experience is redesigned.
+const FIXED_HIDE_SUBMODULES = true;
+const FIXED_FILTER = Object.freeze({
+  summary_pattern: '',
+  kind_pattern: '',
+  include_kind_pattern: '',
+  hide_undated: false,
+  splice: true,
+});
 
 // Show an explicit loading state until the extension host finishes `Open` and
 // the first window arrives (or surfaces the open error).
@@ -88,15 +94,15 @@ let currentSearchEpoch = -1;  // epoch of the latest issued search; -1 = none
 // Every service request carries a client-generated id, and the extension host
 // echoes that id back with the response. Responses are correlated by id (not by
 // response shape), and tagged with the VIEW GENERATION they were issued under.
-// When the view changes (open, filter reset, search, clear), the generation
+// When the view changes (open, history reset, search, clear), the generation
 // increments; any in-flight response from an older generation is dropped so it
-// can never poison cache/total/filter state (e.g. a GetWindow issued before a
-// resetAndRefetch landing after it, or a search overlapping an in-flight
+// can never poison cache/total/view state (e.g. a GetWindow issued before a
+// history reset landing after it, or a search overlapping an in-flight
 // window).
 let nextReqId = 1;
 const inFlight = new Map();
 let viewGen = 0;
-// Whether the per-filter expansion snapshot (sub_op_counts) has been received
+// Whether the current view's expansion snapshot (sub_op_counts) has been received
 // for the CURRENT view generation. The service ships it only with the offset-0
 // window, so a deep jump must first fetch offset 0 to establish visible/absolute
 // index mapping before paging the deep window.
@@ -139,7 +145,7 @@ const ROW_H = 34;
 //     slots are actually drawn after collapsing hidden sub-op slots.
 //
 // Mapping between them uses prefix sums over per-node sub-op counts (`subOpCounts`,
-// shipped once per filter state from the server when offset==0).
+// shipped once per view generation from the server when offset==0).
 
 /** Number of bundled sub-ops per top-level node (global; empty until received). */
 let subOpCounts = [];
@@ -264,40 +270,21 @@ function saveState() {
     // so a raw pixel offset clamps to 0. A row index survives expansion
     // differences and is reapplied as `topRow * ROW_H` once rows load.
     topRow: viewportVisibleTop(),
-    hideSubmodules: hideSubmodules(),
-    showMessagesOnly: showMessagesOnly(),
-    hideUndated: hideUndated(),
-    filterPattern: filterEl ? filterEl.value : '',
   });
 }
 
-/** Restore filter checkboxes/input from state; return the saved top row index
- * (or -1 if none) WITHOUT touching scrollTop — the spacer isn't built yet here,
- * so applying scroll must wait until the open/reveal handler has reanchored. */
+/** Return the saved top row index (or -1 if none) WITHOUT touching scrollTop —
+ * the spacer isn't built yet here, so applying scroll must wait until the
+ * open/reveal handler has reanchored. Legacy persisted filter keys are ignored. */
 function restoreState() {
   const s = vscode.getState();
   let topRow = -1;
-  if (s && (typeof s.topRow === 'number' || s.filterPattern || s.hideUndated ||
-      s.showMessagesOnly || typeof s.hideSubmodules === 'boolean')) {
+  if (s && typeof s.topRow === 'number') {
     // Do NOT restore `total` here — the chain may have been reimported since the
     // last session, so the persisted node count can be stale. The server's
     // `total` is authoritative and is applied by the open handler before this
-    // runs. Only the top row index and filter state survive a session.
-    if (typeof s.topRow === 'number' && s.topRow > 0) topRow = s.topRow;
-    if (hideSubmodulesEl && typeof s.hideSubmodules === 'boolean') {
-      // saveState stores the "hide submodules" boolean (inverted from the
-      // "Show git submodules" checkbox); restore the checkbox to match.
-      hideSubmodulesEl.checked = !s.hideSubmodules;
-    }
-    if (hideUndatedEl && typeof s.hideUndated === 'boolean') {
-      hideUndatedEl.checked = s.hideUndated;
-    }
-    if (hideSystemEl && typeof s.showMessagesOnly === 'boolean') {
-      hideSystemEl.checked = s.showMessagesOnly;
-    }
-    if (filterEl && typeof s.filterPattern === 'string') {
-      filterEl.value = s.filterPattern;
-    }
+    // runs. Only the top row index survives a recreated webview.
+    if (s.topRow > 0) topRow = s.topRow;
   }
   return topRow;
 }
@@ -453,92 +440,19 @@ function esc(s) {
 }
 
 
-/** Whether submodules should be hidden (inverted from the "Show" checkbox). */
+/** Whether nested Git repositories/submodules are hidden in the fixed view. */
 function hideSubmodules() {
-  // "Show git submodules" is off by default → submodules hidden by default.
-  return !(hideSubmodulesEl && hideSubmodulesEl.checked);
+  return FIXED_HIDE_SUBMODULES;
 }
 
-/** Whether undated nodes should be hidden (from the "Hide undated" checkbox). */
-function hideUndated() {
-  return !!(hideUndatedEl && hideUndatedEl.checked);
-}
-
-/** The current chain-filter payload to send with window/layout requests.
- *
- * ALWAYS sends an explicit filter: the service's `ChainFilter::default()`
- * hides undated nodes, so sending no filter at all would silently keep hiding
- * them even when "Hide undated" is unchecked. An explicit `hide_undated: false`
- * makes the checkbox authoritative in both directions. The filter pattern is
- * treated as a regex server-side (with literal fallback) and HIDES matching
- * rows (the service preserves chain endpoints, so the pattern never removes
- * the oldest root or newest leaf); "Show messages only" maps to an INCLUSIVE
- * kind pattern that keeps message/command rows plus structural branch/reconnect
- * anchors required for continuity, so the window, layout, and sub-op counts
- * stay coherent with the filtered row set.
- */
+/** Explicit fixed filter sent to avoid the service's legacy implicit default. */
 function filterPayload() {
-  const pattern = (filterEl && filterEl.value.trim()) || '';
-  return {
-    summary_pattern: pattern,
-    kind_pattern: '',
-    include_kind_pattern: showMessagesOnly() ? '^(message|command)$' : '',
-    hide_undated: hideUndated(),
-    splice: true,
-  };
+  return { ...FIXED_FILTER };
 }
 
-/** Whether only messages should be shown (from the "Show messages only" checkbox).
- *
- * Filtering is server-side: the checkbox maps to an `include_kind_pattern`
- * (an inclusive constraint, not a hide pattern) so the service re-windows the
- * filtered set (and re-emits per-filter sub-op counts). Non-message rows are
- * excluded except structural branch/reconnect anchors required to keep the
- * graph connected. This keeps the visible/absolute index mapping coherent
- * instead of hiding rows client-side after they were fetched.
- */
-function showMessagesOnly() {
-  return !!(hideSystemEl && hideSystemEl.checked);
-}
-
-/** Whether a search hit's summary matches the active chain-filter HIDE regex.
- *
- * The chain-filter input is a regex with a literal fallback (same matching as
- * the service's ChainFilter matcher). SearchFilters cannot carry a summary
- * pattern, so the active chain filter is enforced client-side on search hits
- * to keep search results consistent with the visible chain window. The chain
- * filter HIDES matches (with server-side endpoint preservation), so a flat
- * search result list REMOVES hits whose summary matches. An empty pattern
- * never matches (nothing is hidden).
- */
-function matchesActiveChainFilter(text) {
-  const pattern = (filterEl && filterEl.value.trim()) || '';
-  if (!pattern) return false;
-  try {
-    return new RegExp(pattern).test(String(text));
-  } catch {
-    return String(text).indexOf(pattern) !== -1;
-  }
-}
-
-/** Build the SearchFilters payload for a Search request from the active UI.
- *
- * The service's SearchFilters covers kinds / sources / actors / paths / time —
- * not submodules or a summary regex. Map what it CAN express:
- *   - "Show messages only" -> kind tags (Message, Command);
- *   - "Hide undated"       -> earliest-timestamp bound (undated rows have 0).
- * Submodule hiding and the chain-filter pattern are enforced client-side on
- * the result list (see renderSearchResults), which matches the visible chain.
- */
+/** Search currently applies no kind, actor, path, or timestamp filters. */
 function searchFiltersPayload() {
-  const filters = {};
-  if (showMessagesOnly()) {
-    filters.kinds = ['Message', 'Command'];
-  }
-  if (hideUndated()) {
-    filters.after = 1; // undated nodes carry timestamp_ms == 0
-  }
-  return filters;
+  return {};
 }
 
 /** Human-readable label for a block-separator group key.
@@ -617,7 +531,7 @@ function desiredVisibleRange() {
  */
 function fetchWindow() {
   // total === 0 means the server reported an empty result for the CURRENT
-  // view (nothing to fetch); a reset (history/filter/search clear) marks the
+  // view (nothing to fetch); a history/search reset marks the
   // total as unknown (-1) so a fresh window is requested under the new view.
   if (searchMode || pendingWindowReqId !== -1 || total === 0) return;
   const { top, bottom } = desiredCacheRange();
@@ -671,7 +585,7 @@ function evictFarWindows() {
  * window at its edges and shifts the wrap by exact multiples of ROW_H — existing
  * nodes are never rebuilt during a scroll-through-loaded-content, so there is no
  * re-anchor moment and no layout jump. Full rebuilds happen only when content
- * genuinely changes (initial load, far jump, column resize, filter).
+ * genuinely changes (initial load, far jump, column resize, or search reset).
  *
  * Because every row is exactly ROW_H tall, shifting .table-wrap.top by `n*ROW_H`
  * moves content by exactly n rows with zero sub-pixel drift, and the fixed-height
@@ -1093,7 +1007,7 @@ function refreshHeader() {
 }
 
 /** Rebuild the entire window from cache in one pass. Used for initial load,
- * far jumps, column resize, filter changes, and reveal toggles — NOT for normal
+ * far jumps, column resize, view changes, and reveal toggles — NOT for normal
  * scrolling. `top`/`bottom` are VISIBLE indices; each maps to an absolute slot,
  * and hidden (collapsed sub-op) slots are skipped so only drawable rows appear.
  */
@@ -1504,8 +1418,8 @@ window.addEventListener('message', (event) => {
   if (msg.id === 'reveal') {
     const restoredTopRow = restoreState();
     // The revealed webview is a fresh context, but be safe: start a new view
-    // generation and force the offset-0 snapshot so the restored filter state's
-    // expansion counts are established before any deep restore window loads.
+    // generation and force the offset-0 snapshot so expansion counts are
+    // established before any deep restore window loads.
     viewGen++;
     snapshotEstablished = false;
     subOpCounts = [];
@@ -1534,7 +1448,7 @@ window.addEventListener('message', (event) => {
   if (wasPendingWindow) pendingWindowReqId = -1;
 
   // Stale-view rejection: the response was issued under an older view
-  // generation (open/filter/search changed while it was in flight). Applying it
+  // generation (open/history/search changed while it was in flight). Applying it
   // would cache rows/totals from the old view into the new one, so drop it. If
   // it was the in-flight window, immediately request the current view's window
   // so the UI self-heals without waiting for the progressive loader.
@@ -1568,7 +1482,7 @@ window.addEventListener('message', (event) => {
     // state change. Show a full-pane error with an explicit Retry action.
     if (wasPendingWindow || reqBody.GetWindow !== undefined) {
       showRequestError('Failed to load history rows: ' + errText, () => {
-        resetAndRefetch();
+        resetHistory();
       });
       return;
     }
@@ -1659,9 +1573,8 @@ window.addEventListener('message', (event) => {
     // so "idle" never means a placeholder-filled DOM.
     window.__editchainDataReady = true;
     if (cache.size === 0 && total === 0) {
-      // A filter matched nothing (e.g. messages-only with no message rows).
       // Replace the unfillable placeholder with an explicit empty state.
-      showViewMessage('No rows match the current filter', false);
+      showViewMessage('No history rows', false);
     }
     vscode.postMessage({ type: 'log', text: `cached ${cache.size}/${total} nodes (fetched ${totalFetched})` });
     reportStatus();
@@ -1767,22 +1680,11 @@ function normalizeSearchHit(hit, index) {
  */
 function renderSearchResults(hits) {
   searchMode = true;
-  // SearchFilters cannot express submodule exclusion, so enforce the active
-  // "Show git submodules" setting client-side (mirrors GetWindow's server-side
-  // hide_submodules) to keep search consistent with the visible chain. The
-  // active chain-filter regex is enforced the same way, and it HIDES matches
-  // (the service preserves chain endpoints for the window; a flat result list
-  // simply REMOVES matching hits — see matchesActiveChainFilter). Git hits
-  // carry is_submodule from the service's identity map, so this filter applies
-  // to real scored search results too.
+  // SearchFilters cannot express submodule exclusion, so apply the same fixed
+  // default client-side. Git hits carry `is_submodule` from the service.
   if (hideSubmodules()) {
     hits = hits.filter((h) => !h.is_submodule);
   }
-  // The chain-filter pattern HIDES matching rows; a flat search result list
-  // therefore REMOVES matches (no endpoint preservation in search results).
-  // No-op when the input is empty (matchesActiveChainFilter accepts
-  // everything), so this only ever narrows results.
-  hits = hits.filter((h) => !matchesActiveChainFilter(h.summary || h.text || ''));
   // Search replaces the view: bump the generation so any in-flight history
   // window response is rejected as stale instead of clobbering the result list,
   // and release the window slot (the result list is fully local).
@@ -1842,38 +1744,6 @@ function resetHistory() {
   fetchWindow();
 }
 
-/** Clear cached rows/layout and refetch from the top (used when the chain
- * filter changes, since filtering is server-side). */
-function resetAndRefetch() {
-  searchMode = false;
-  searchQuery = '';
-  currentSearchEpoch = -1;
-  // A previous filter may have matched nothing (total === 0). The new filter
-  // state must re-request its own window instead of being blocked by the old
-  // empty total.
-  total = -1;
-  // Filter changes are a new view: responses issued under the previous filter
-  // state are stale once this runs and must be dropped (see the message
-  // handler's generation check). The offset-0 snapshot is re-established by the
-  // next fetch.
-  viewGen++;
-  snapshotEstablished = false;
-  layoutReady = false;
-  cache.clear();
-  totalFetched = 0;
-  lastRenderKey = '';
-  pendingWindowReqId = -1;
-  renderTop = 0;
-  renderBottom = -1;
-  rowsEl.scrollTop = 0;
-  // Reveal state and global counts are filter-specific — reset them so the
-  // next offset==0 GetWindow response rebuilds prefix sums cleanly.
-  expandedBlocks.clear();
-  subOpCounts = [];
-  recomputeExpansion();
-  fetchWindow();
-}
-
 // Search on Enter; empty query resets back to the full history.
 searchEl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
@@ -1883,8 +1753,7 @@ searchEl.addEventListener('keydown', (e) => {
       // Latest-query-wins: tag this search with a fresh epoch so its response
       // is rendered even if an earlier search's (older-epoch) response lands
       // first, and so a late older response can never overwrite it. Results
-      // render/navigate as a flat list on the Search response; the filters
-      // carry the active chain/hide-undated/messages-only semantics.
+      // render/navigate as a flat list on the Search response.
       currentSearchEpoch = ++searchEpoch;
       sendSearch(
         { Search: { query: q, mode: 'Lexical', top_k: 50, filters: searchFiltersPayload() } },
@@ -1902,38 +1771,6 @@ searchEl.addEventListener('input', () => {
     resetHistory();
   }
 });
-
-// Apply the chain filter on Enter; clearing it resets to the full history.
-if (filterEl) {
-  filterEl.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      resetAndRefetch();
-    }
-  });
-}
-
-// Re-fetch when the hide-undated toggle changes (filtering is server-side).
-if (hideUndatedEl) {
-  hideUndatedEl.addEventListener('change', () => {
-    resetAndRefetch();
-  });
-}
-
-// Re-fetch when the show-submodules toggle changes (filtering is server-side).
-if (hideSubmodulesEl) {
-  hideSubmodulesEl.addEventListener('change', () => {
-    resetAndRefetch();
-  });
-}
-
-// Re-fetch when the messages-only toggle changes. Filtering is server-side
-// (kind_pattern in the filter payload), so the window, layout, and sub-op
-// counts all stay coherent with the filtered row set.
-if (hideSystemEl) {
-  hideSystemEl.addEventListener('change', () => {
-    resetAndRefetch();
-  });
-}
 
 // Background progressive loader: keeps fetching history ahead of the scroll
 // position on a timer, so the user never waits on an in-flight fetch. It runs

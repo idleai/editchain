@@ -504,10 +504,6 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 <body>
 <div id="controls">
 <input id="search" type="text" placeholder="Search history… (Enter to search)">
-<input id="filter" type="text" placeholder="Hide matching rows… (regex, Enter to apply)">
-<label class="toggle"><input type="checkbox" id="hideUndated"> Hide undated</label>
-<label class="toggle"><input type="checkbox" id="hideSubmodules"> Show git submodules</label>
-<label class="toggle"><input type="checkbox" id="hideSystem"> Show messages only</label>
 </div>
 <div id="layout">
 <div id="rows"></div>

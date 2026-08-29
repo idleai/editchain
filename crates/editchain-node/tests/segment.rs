@@ -7,6 +7,7 @@ use editchain_embed as _;
 use editchain_import as _;
 use editchain_index as _;
 use editchain_query as _;
+use editchain_vscode_service as _;
 use serde as _;
 use serde_json as _;
 
