@@ -119,9 +119,25 @@ Module._resolveFilename = function (request, ...rest) {
   return origResolveFilename.call(this, request, ...rest);
 };
 
-const { StdioClient } = require(path.join(__dirname, '..', '..', 'out', 'stdioClient.js'));
+const {
+  StdioClient,
+  resolveDefaultServicePath,
+} = require(path.join(__dirname, '..', '..', 'out', 'stdioClient.js'));
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test('default service path prefers an existing release build', () => {
+  const root = path.join(tmpDir, 'workspace');
+  const release = path.join(root, 'target', 'release', 'editchain-vscode-service');
+  const resolved = resolveDefaultServicePath(root, (candidate) => candidate === release);
+  assert.equal(resolved, release);
+});
+
+test('default service path falls back to debug when release is absent', () => {
+  const root = path.join(tmpDir, 'workspace');
+  const debug = path.join(root, 'target', 'debug', 'editchain-vscode-service');
+  assert.equal(resolveDefaultServicePath(root, () => false), debug);
+});
 
 test('killed child\'s late exit event cannot tear down a replacement process', async (t) => {
   const client = new StdioClient();

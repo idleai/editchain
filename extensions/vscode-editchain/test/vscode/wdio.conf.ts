@@ -25,7 +25,7 @@ export const config: Options.Testrunner = {
         userSettings: {
           // Point the extension at the built Rust service binary.
           'editchain-history.servicePath':
-            '/mnt/hot/ambientlight/repos/editchain/target/debug/editchain-vscode-service',
+            '/mnt/hot/ambientlight/repos/editchain/target/release/editchain-vscode-service',
           'editchain-history.chainDir': '.editchain',
         },
       },

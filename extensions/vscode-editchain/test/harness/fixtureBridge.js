@@ -198,13 +198,24 @@
     const maxLane = fixture.max_lane !== undefined
       ? fixture.max_lane
       : (fixture.layoutRows || []).reduce((m, r) => Math.max(m, r.lane || 0), 0);
-    const slice = expanded.slice(offset, offset + limit);
+    const includeLayout = req.include_layout !== false;
+    const slice = expanded.slice(offset, offset + limit).map((row) => {
+      if (includeLayout) return row;
+      return {
+        ...row,
+        lane: 0,
+        above: [],
+        below: [],
+        transitions: [],
+      };
+    });
     return {
       rows: slice,
       total,
       chain_generation: 0,
-      max_lane: maxLane,
+      max_lane: includeLayout ? maxLane : 0,
       sub_op_counts: subOpCounts,
+      layout_ready: includeLayout,
     };
   }
 
@@ -298,6 +309,16 @@
       }
       case 'GetWindow': {
         const respondNow = () => respond(id, { Ok: windowResponse(fixture, body.GetWindow) });
+        // Controlled two-stage paint hook: hold the first layout-enabled
+        // GetWindow while allowing the preceding row-only window through. The
+        // browser harness can then prove content is visible before global lane
+        // geometry completes, without timing sleeps.
+        const layoutHold = window.__editchainHoldLayoutWindow;
+        if (body.GetWindow.include_layout === true && layoutHold && !layoutHold.taken) {
+          layoutHold.taken = true;
+          layoutHold.release = respondNow;
+          return;
+        }
         // Controlled-release hook: the stale-response race holds the FIRST
         // GetWindow response and releases it explicitly (no sleep-based
         // timing), so the test is deterministic.

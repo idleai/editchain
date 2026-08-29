@@ -32,7 +32,7 @@
         "editchain-history.servicePath": {
           "type": "string",
           "default": "",
-          "description": "Path to the editchain-vscode-service binary. If empty, the bundled binary is used."
+          "description": "Path to the editchain-vscode-service binary. If empty, the workspace release build is preferred, with debug as a fallback."
         },
         "editchain-history.chainDir": {
           "type": "string",
@@ -45,12 +45,13 @@
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "@vscode/vsce package",
+    "package": "vsce package",
     "ui:dump": "node scripts/ui-dump.mjs dump",
     "ui:inspect": "node scripts/ui-dump.mjs inspect",
     "ui:check": "node scripts/ui-dump.mjs check",
     "ui:real": "node scripts/ui-real.mjs",
     "ui:graph": "node scripts/ui-graph.mjs",
+    "perf:service": "node scripts/service-perf.mjs",
     "ui:vscode": "xvfb-run -a npx wdio run ./test/vscode/wdio.conf.ts"
   },
   "devDependencies": {

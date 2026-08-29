@@ -631,6 +631,9 @@
     const rootEl = document.querySelector(scope);
     const rowsEl = document.getElementById('rows');
     const layoutEl = document.getElementById('layout');
+    const graphState = typeof window.__editchainGraphState === 'function'
+      ? window.__editchainGraphState()
+      : null;
     return {
       viewport: { w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio },
       state: {
@@ -639,6 +642,7 @@
         generation,
         dataReady: dataReady(),
         placeholders: hasPlaceholders(),
+        layoutReady: graphState ? graphState.layoutReady : undefined,
         rowsRendered: document.querySelectorAll('.row').length,
         totalRowsLoaded: window.__editchainLoadedRows || undefined,
       },

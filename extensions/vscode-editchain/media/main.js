@@ -18,6 +18,11 @@
 
 // @ts-ignore — vscode provides this global in webviews.
 const vscode = acquireVsCodeApi();
+// Distinguishes this concrete main.js context from an older one owned by the
+// same WebviewPanel. The host uses it to replay Open only after this instance's
+// message listener is installed, never during an ordinary retained reveal.
+const rendererInstanceId = Date.now().toString(36) + '-' +
+  Math.random().toString(36).slice(2);
 
 const rowsEl = document.getElementById('rows');
 const searchEl = document.getElementById('search');
@@ -47,6 +52,10 @@ const PAGE = 500;
 const BUFFER = 400;
 let total = 0;             // global row count (server-reported)
 let pendingWindowReqId = -1; // request id of the in-flight GetWindow, or -1
+// Whether the service has built global lane geometry for the current view.
+// The first page deliberately requests row data without it, paints, then
+// repeats the same page with layout enabled.
+let layoutReady = false;
 
 // Sparse window cache: absolute row index -> HistoryRow. Only windows near the
 // scroll position are retained; far-offscreen windows are evicted.
@@ -243,17 +252,17 @@ function viewportVisibleBottom() {
   return Math.min(visibleTotal() - 1, Math.max(viewportVisibleTop(), Math.floor((rowsEl.scrollTop + rowsEl.clientHeight) / ROW_H)));
 }
 
-/** Persist only viewport state across recreations. We never persist row payloads:
- * they can blow past VS Code's webview state size limit for large chains, and a
- * recreated webview can refetch its window cheaply. */
+/** Persist only viewport state for genuine context recreation. Ordinary
+ * detail navigation retains the live bounded cache. We never serialize row
+ * payloads: they can exceed VS Code's webview-state size limit, and a recreated
+ * webview can refetch its bounded window cheaply. */
 function saveState() {
   vscode.setState({
     total,
-    // Persist the visible TOP ROW INDEX, not raw pixel scrollTop: the webview
-    // JS context is destroyed when hidden behind an editor preview, and on
-    // restore the spacer/scaffold doesn't exist until after `reanchorTo`, so a
-    // raw pixel offset is meaningless (it clamps to 0). A row index survives
-    // expansion differences and is reapplied as `topRow * ROW_H` once rows load.
+    // Persist the visible TOP ROW INDEX, not raw pixel scrollTop: after a real
+    // context recreation the spacer/scaffold doesn't exist until `reanchorTo`,
+    // so a raw pixel offset clamps to 0. A row index survives expansion
+    // differences and is reapplied as `topRow * ROW_H` once rows load.
     topRow: viewportVisibleTop(),
     hideSubmodules: hideSubmodules(),
     showMessagesOnly: showMessagesOnly(),
@@ -633,7 +642,13 @@ function fetchWindow() {
 
   const limit = Math.min(PAGE, rangeBottom - start + 1);
   pendingWindowReqId = send({
-    GetWindow: { offset: start, limit, hide_submodules: hideSubmodules(), filter: filterPayload() },
+    GetWindow: {
+      offset: start,
+      limit,
+      hide_submodules: hideSubmodules(),
+      filter: filterPayload(),
+      include_layout: layoutReady,
+    },
   });
 }
 
@@ -1426,6 +1441,7 @@ window.addEventListener('message', (event) => {
       cache.clear();
       totalFetched = 0;
       pendingWindowReqId = -1;
+      layoutReady = false;
       currentSearchEpoch = -1;
       snapshotEstablished = false;
       subOpCounts = [];
@@ -1482,11 +1498,9 @@ window.addEventListener('message', (event) => {
     return;
   }
 
-  // The panel was revealed again (e.g. after navigating to a JSON editor and
-  // back). The webview's JS context is reset when hidden, so restore the
-  // persisted viewport state from vscode.setState before rendering. A short
-  // delay lets the webview finish transitioning from hidden to visible so it
-  // has real dimensions to measure.
+  // Compatibility path for older extension hosts that send `reveal` after a
+  // recreated context. Current hosts retain ordinary hidden contexts and use
+  // the instance-aware `webviewReady` handshake for genuine recreation.
   if (msg.id === 'reveal') {
     const restoredTopRow = restoreState();
     // The revealed webview is a fresh context, but be safe: start a new view
@@ -1596,9 +1610,13 @@ window.addEventListener('message', (event) => {
   // happens to be pending now), so a response can only ever write to the
   // absolute indices it asked for.
   if (Array.isArray(r.value.rows)) {
+    const responseLayoutReady = r.value.layout_ready !== false;
+    if (responseLayoutReady) {
+      layoutReady = true;
+    }
     total = r.value.total;
     // Global max lane for stable graph-column width (per-row graph cells).
-    if (typeof r.value.max_lane === 'number' && r.value.max_lane !== maxLane) {
+    if (responseLayoutReady && typeof r.value.max_lane === 'number' && r.value.max_lane !== maxLane) {
       maxLane = r.value.max_lane;
       // The header's graph-column width derives from maxLane. On `open` the
       // header is built before the first GetWindow response, so it starts
@@ -1625,6 +1643,12 @@ window.addEventListener('message', (event) => {
       if (!cache.has(absIdx)) totalFetched++;
       cache.set(absIdx, r.value.rows[i]);
     }
+    // The layout hydration response overwrites already-rendered provisional
+    // rows. Rebuild the bounded visible window once so lane SVGs update; the
+    // initial row-only response has already delivered the first paint.
+    if (responseLayoutReady && req.body.GetWindow.include_layout === true) {
+      reanchorTo(renderTop, renderBottom);
+    }
     evictFarWindows();
     // Newly cached rows may extend the rendered window at either edge. Sync the
     // window to the current viewport so newly-loaded rows appear without a full
@@ -1642,6 +1666,20 @@ window.addEventListener('message', (event) => {
     vscode.postMessage({ type: 'log', text: `cached ${cache.size}/${total} nodes (fetched ${totalFetched})` });
     reportStatus();
     saveState();
+    if (!responseLayoutReady && req.body.GetWindow.include_layout === false) {
+      // Paint is complete. Now ask the service to perform the O(V) geometry
+      // pass and replace exactly this bounded page when it returns.
+      pendingWindowReqId = send({
+        GetWindow: {
+          offset: req.body.GetWindow.offset,
+          limit: req.body.GetWindow.limit,
+          hide_submodules: req.body.GetWindow.hide_submodules,
+          filter: req.body.GetWindow.filter,
+          include_layout: true,
+        },
+      });
+      return;
+    }
     // Keep loading until the content fills the viewport so scrolling works.
     fetchWindow();
     return;
@@ -1666,6 +1704,11 @@ window.addEventListener('message', (event) => {
     return;
   }
 });
+
+// Announce readiness only after the host-message listener above exists. This
+// closes the race where a recreated webview could miss the reveal replay and
+// remain permanently on its initial "Loading history…" message.
+vscode.postMessage({ type: 'webviewReady', instanceId: rendererInstanceId });
 
 /** Normalize one search hit into a renderable HistoryRow.
  *
@@ -1746,6 +1789,7 @@ function renderSearchResults(hits) {
   viewGen++;
   pendingWindowReqId = -1;
   snapshotEstablished = false;
+  layoutReady = false;
   currentSearchEpoch = -1;
   const rows = hits.map(normalizeSearchHit);
   // Search results are a flat list: drop any sub-op expansion mapping from the
@@ -1784,6 +1828,7 @@ function resetHistory() {
   // (e.g. a Search issued before the clear) are rejected via the generation.
   viewGen++;
   snapshotEstablished = false;
+  layoutReady = false;
   subOpCounts = [];
   recomputeExpansion();
   pendingWindowReqId = -1;
@@ -1813,6 +1858,7 @@ function resetAndRefetch() {
   // next fetch.
   viewGen++;
   snapshotEstablished = false;
+  layoutReady = false;
   cache.clear();
   totalFetched = 0;
   lastRenderKey = '';
@@ -2087,9 +2133,13 @@ window.__editchainGraphState = function () {
   return {
     renderTop, renderBottom,
     maxLane,
+    layoutReady,
     graphWidth: currentGraphWidth(),
   };
 };
+// Lets the real-VS-Code lifecycle test prove that detail -> Back reused the
+// same retained JS context rather than recreating a fast-looking replacement.
+window.__editchainRendererInstanceId = rendererInstanceId;
 
 // Harness-only debug hooks (not production behaviour): expose the cached row at
 // an absolute index and the current authoritative total so a text-only probe can

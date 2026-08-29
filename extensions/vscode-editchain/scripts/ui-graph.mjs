@@ -29,8 +29,8 @@
 //                             [--row-timeout MS]
 //   node scripts/ui-graph.mjs --self-test [--out DIR]
 //
-// The service binary path comes from SERVICE_PATH or defaults to
-// <workspace>/target/debug/editchain-vscode-service.
+// The service binary path comes from SERVICE_PATH or prefers the workspace's
+// release build, falling back to debug when release has not been built.
 
 import puppeteer from 'puppeteer-core';
 import { spawn } from 'child_process';
@@ -218,8 +218,20 @@ async function main() {
     process.exit(0);
   }
 
+  const releaseServicePath = path.join(
+    args.workspace,
+    'target',
+    'release',
+    'editchain-vscode-service'
+  );
+  const debugServicePath = path.join(
+    args.workspace,
+    'target',
+    'debug',
+    'editchain-vscode-service'
+  );
   const servicePath = process.env.SERVICE_PATH ||
-    path.join(args.workspace, 'target', 'debug', 'editchain-vscode-service');
+    (fs.existsSync(releaseServicePath) ? releaseServicePath : debugServicePath);
   if (!fs.existsSync(servicePath)) {
     console.error('service binary not found at ' + servicePath);
     process.exit(1);

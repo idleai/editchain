@@ -11,7 +11,9 @@ use editchain_import as _;
 use editchain_query as _;
 use serde as _;
 
-use std::io;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, Read as _};
 use std::path::PathBuf;
 
 use editchain_codec::frame::decode_op;
@@ -38,9 +40,18 @@ use editchain_query::search::{SearchFilters, Source};
 pub struct Workspace {
     /// The unified history projection.
     pub projection: HistoryProjection,
+    /// Canonical decoded operations with durable blob references preserved.
+    /// Full payload bytes are materialized from this corpus only for details or
+    /// the lazy search index, never for graph projection/layout.
+    source_ops: Vec<Op>,
+    /// Constant-time lookup into `source_ops` for detail requests.
+    source_op_index: HashMap<OpId, usize>,
+    /// Read-only durable blob store used by on-demand details/search hydration.
+    blob_resolver: Option<BlobResolver>,
     /// Discovered git repositories.
     pub repositories: Vec<editchain_git::RepositoryDiscovery>,
-    /// Diagnostics for this open: chain canonicalization and blob hydration.
+    /// Diagnostics for this open: chain canonicalization and bounded blob
+    /// preview/deferred-hydration outcomes.
     pub diagnostics: OpenDiagnostics,
     /// The single currently cached filtered snapshot, keyed by
     /// `(hide_submodules, filter)`.
@@ -55,13 +66,29 @@ pub struct Workspace {
 /// Cache key for one filtered history snapshot.
 type ViewKey = (bool, editchain_project::filter::ChainFilterKey);
 
+/// Parameters for one history-window read.
+#[derive(Debug, Clone, Copy)]
+pub struct HistoryWindowOptions<'a> {
+    /// Expanded-row offset (zero is newest).
+    pub offset: u64,
+    /// Maximum expanded rows to return.
+    pub limit: u64,
+    /// Exclude rows from nested repositories.
+    pub hide_submodules: bool,
+    /// Active graph/content filter.
+    pub filter: &'a ChainFilter,
+    /// Compute and attach global lane geometry before returning.
+    pub include_layout: bool,
+}
+
 /// Immutable per-filter projection consumed by both history and layout paging.
 #[derive(Debug)]
 struct ViewSnapshot {
     /// Canonical top-level rows in display order.
     nodes: Vec<editchain_project::HistoryNode>,
-    /// Graph geometry over `nodes`.
-    context: editchain_project::layout::LayoutContext,
+    /// Graph geometry over `nodes`, built only after the first row window has
+    /// painted. `None` is a valid provisional row-only snapshot.
+    context: Option<editchain_project::layout::LayoutContext>,
     /// Number of expandable children attached to each top-level row.
     sub_op_counts: Vec<usize>,
     /// Expanded absolute slot where each top-level row starts, plus a sentinel.
@@ -89,11 +116,16 @@ pub struct ChainReadStats {
     pub quarantined: usize,
 }
 
-/// Blob hydration outcome for the payloads decoded at open.
+/// Blob access outcome for payloads decoded at open or explicitly hydrated.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct BlobHydrationStats {
-    /// Blob payloads replaced with verified inline content.
+    /// Blob payloads replaced with verified inline content by an explicit full
+    /// hydration pass. Workspace open leaves this at zero.
     pub hydrated: usize,
+    /// Blob payloads whose bounded display prefix was read for row summaries.
+    pub previewed: usize,
+    /// Blob payloads retained as durable references for on-demand full reads.
+    pub deferred: usize,
     /// Blob refs validated against the store but preserved as refs (no inline
     /// representation exists — e.g. `FileEdit::Blob` full-result content).
     pub verified_refs: usize,
@@ -115,7 +147,7 @@ pub struct OpenDiagnostics {
 }
 
 impl OpenDiagnostics {
-    /// Human-readable warnings for anything that could not be fully hydrated.
+    /// Human-readable warnings for integrity gaps discovered during open.
     #[must_use]
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
@@ -170,9 +202,10 @@ pub enum BlobResolution {
 ///
 /// Lookup and filename derivation are delegated to [`FsBlobSink`] so the
 /// `<chain>/blobs/<lowercase blake3 hex>` naming convention stays in exactly
-/// one place; this wrapper only validates the declared length and BLAKE3 hash
-/// before a payload is hydrated inline.
-#[derive(Debug)]
+/// one place. Full resolution validates declared length and BLAKE3; bounded
+/// row previews validate file length and defer full hashing until content is
+/// explicitly requested.
+#[derive(Debug, Clone)]
 pub struct BlobResolver {
     /// The durable store; `None` when the chain has no `blobs/` directory.
     sink: Option<FsBlobSink>,
@@ -209,6 +242,55 @@ impl BlobResolver {
             None => BlobResolution::Missing,
         }
     }
+
+    /// Read at most `limit` bytes for a display preview without hydrating or
+    /// hashing the complete payload.
+    ///
+    /// File length is checked against the reference up front. Full BLAKE3
+    /// validation remains deferred to [`Self::resolve`] when details/search
+    /// actually request the complete payload.
+    #[must_use]
+    fn preview(&self, blob: &BlobRef, limit: usize) -> BlobPreviewResolution {
+        let Some(hash) = addressable_hash(blob.id) else {
+            return BlobPreviewResolution::Unresolvable;
+        };
+        let Some(sink) = self.sink.as_ref() else {
+            return BlobPreviewResolution::Missing;
+        };
+        let path = sink.path_for(&hash);
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            return if path.exists() {
+                BlobPreviewResolution::Corrupt
+            } else {
+                BlobPreviewResolution::Missing
+            };
+        };
+        if metadata.len() != u64::from(blob.len) {
+            return BlobPreviewResolution::Corrupt;
+        }
+        let Ok(file) = File::open(path) else {
+            return BlobPreviewResolution::Corrupt;
+        };
+        let mut bytes = Vec::with_capacity(limit);
+        let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
+        if file.take(limit_u64).read_to_end(&mut bytes).is_err() {
+            return BlobPreviewResolution::Corrupt;
+        }
+        BlobPreviewResolution::Found(bytes)
+    }
+}
+
+/// Outcome of a bounded, length-checked preview read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlobPreviewResolution {
+    /// Prefix bytes found (possibly the complete short blob).
+    Found(Vec<u8>),
+    /// No blob file exists for the reference.
+    Missing,
+    /// The file exists but its metadata/read failed validation.
+    Corrupt,
+    /// The reference cannot be addressed by the durable store.
+    Unresolvable,
 }
 
 /// The full BLAKE3 hash the durable store can address, if the id uses one.
@@ -364,12 +446,308 @@ fn count_blob_ref(blob_ref: &BlobRef, resolver: &BlobResolver, stats: &mut BlobH
     }
 }
 
+/// Maximum bytes read from a durable payload while preparing graph rows.
+const DISPLAY_PREVIEW_READ_LIMIT: usize = 4096;
+/// Maximum characters retained in any projection payload.
+const DISPLAY_PREVIEW_CHAR_LIMIT: usize = 1024;
+
+/// Build a payload-bounded operation corpus for projection and row summaries.
+///
+/// The source operations retain their original inline bytes/blob references.
+/// Projection clones contain at most a short text preview per payload, so the
+/// projection's necessary topology/collapse clones cannot multiply hundreds of
+/// megabytes of tool output.
+#[must_use]
+fn projection_ops_with_previews(
+    source_ops: &[Op],
+    resolver: &BlobResolver,
+) -> (Vec<Op>, BlobHydrationStats) {
+    let mut stats = BlobHydrationStats::default();
+    let ops = source_ops
+        .iter()
+        .map(|source| {
+            let mut op = source.clone();
+            compact_kind_for_projection(&mut op.kind, resolver, &mut stats);
+            op
+        })
+        .collect();
+    (ops, stats)
+}
+
+/// Replace payloads in one projected operation with bounded display previews.
+fn compact_kind_for_projection(
+    kind: &mut OpKind,
+    resolver: &BlobResolver,
+    stats: &mut BlobHydrationStats,
+) {
+    match kind {
+        OpKind::ChainStart(start) => compact_inline_bytes(&mut start.name),
+        OpKind::Actor(actor) => {
+            compact_payload(&mut actor.label, resolver, stats);
+            compact_payload(&mut actor.role, resolver, stats);
+        }
+        OpKind::Message(message) => {
+            compact_payload(&mut message.content, resolver, stats);
+            compact_payload(&mut message.content_type, resolver, stats);
+        }
+        OpKind::Tool(tool) => {
+            compact_payload(&mut tool.tool_call_id, resolver, stats);
+            compact_payload(&mut tool.tool_name, resolver, stats);
+            compact_payload(&mut tool.content, resolver, stats);
+        }
+        OpKind::Command(command) => {
+            compact_payload(&mut command.command_id, resolver, stats);
+            compact_payload(&mut command.content, resolver, stats);
+        }
+        OpKind::File(file) => match &mut file.edit {
+            editchain_core::op::FileEdit::None => {}
+            editchain_core::op::FileEdit::ReplaceBytes { bytes, .. }
+            | editchain_core::op::FileEdit::UnifiedDiff(bytes) => {
+                compact_payload(bytes, resolver, stats);
+            }
+            editchain_core::op::FileEdit::Blob(blob_ref) => {
+                defer_blob_ref(blob_ref, resolver, stats);
+            }
+        },
+        OpKind::Reflection(reflection) => {
+            compact_payload(&mut reflection.summary, resolver, stats);
+            compact_payload(&mut reflection.anchors, resolver, stats);
+        }
+        OpKind::Import(import) => {
+            compact_import_payload(&mut import.raw_ref, resolver, stats);
+        }
+        OpKind::Note(note) => compact_payload(&mut note.content, resolver, stats),
+        OpKind::Error(error) => {
+            compact_payload(&mut error.code, resolver, stats);
+            compact_payload(&mut error.message, resolver, stats);
+        }
+        OpKind::GitCommit(commit) => {
+            compact_signature(&mut commit.author, resolver, stats);
+            compact_signature(&mut commit.committer, resolver, stats);
+            compact_payload(&mut commit.message, resolver, stats);
+            for reference in &mut commit.imported_refs {
+                compact_payload(reference, resolver, stats);
+            }
+            for reference in &mut commit.live_refs {
+                compact_payload(reference, resolver, stats);
+            }
+        }
+        OpKind::GitLink(link) => {
+            if let editchain_core::GitLinkKind::Custom(payload) = &mut link.kind {
+                compact_payload(payload, resolver, stats);
+            }
+        }
+        OpKind::Unknown(unknown) => compact_payload(&mut unknown.raw_bytes, resolver, stats),
+    }
+}
+
+/// Compact both text fields of a projected Git signature.
+fn compact_signature(
+    signature: &mut editchain_core::GitSignature,
+    resolver: &BlobResolver,
+    stats: &mut BlobHydrationStats,
+) {
+    compact_payload(&mut signature.name, resolver, stats);
+    compact_payload(&mut signature.email, resolver, stats);
+}
+
+/// Materialize at most a prefix of one payload for projection.
+fn compact_payload(payload: &mut Payload, resolver: &BlobResolver, stats: &mut BlobHydrationStats) {
+    match payload {
+        Payload::Inline(bytes) => compact_inline_bytes(bytes),
+        Payload::Blob(blob_ref) => {
+            stats.deferred = stats.deferred.saturating_add(1);
+            match resolver.preview(blob_ref, DISPLAY_PREVIEW_READ_LIMIT) {
+                BlobPreviewResolution::Found(mut bytes) => {
+                    compact_inline_bytes(&mut bytes);
+                    *payload = Payload::Inline(bytes);
+                    stats.previewed = stats.previewed.saturating_add(1);
+                }
+                BlobPreviewResolution::Missing => {
+                    stats.missing = stats.missing.saturating_add(1);
+                }
+                BlobPreviewResolution::Corrupt => {
+                    stats.corrupt = stats.corrupt.saturating_add(1);
+                }
+                BlobPreviewResolution::Unresolvable => {
+                    stats.unresolved = stats.unresolved.saturating_add(1);
+                }
+            }
+        }
+        Payload::Empty => {}
+    }
+}
+
+/// Preserve a compact, parseable import discriminator instead of raw JSONL.
+fn compact_import_payload(
+    payload: &mut Payload,
+    resolver: &BlobResolver,
+    stats: &mut BlobHydrationStats,
+) {
+    let preview = match payload {
+        Payload::Inline(bytes) => Some(bytes.clone()),
+        Payload::Blob(blob_ref) => {
+            stats.deferred = stats.deferred.saturating_add(1);
+            match resolver.preview(blob_ref, DISPLAY_PREVIEW_READ_LIMIT) {
+                BlobPreviewResolution::Found(bytes) => {
+                    stats.previewed = stats.previewed.saturating_add(1);
+                    Some(bytes)
+                }
+                BlobPreviewResolution::Missing => {
+                    stats.missing = stats.missing.saturating_add(1);
+                    None
+                }
+                BlobPreviewResolution::Corrupt => {
+                    stats.corrupt = stats.corrupt.saturating_add(1);
+                    None
+                }
+                BlobPreviewResolution::Unresolvable => {
+                    stats.unresolved = stats.unresolved.saturating_add(1);
+                    None
+                }
+            }
+        }
+        Payload::Empty => None,
+    };
+    if let Some(bytes) = preview {
+        *payload = Payload::Inline(compact_import_record(&bytes));
+    }
+}
+
+/// Convert raw JSONL to the minimal fields used by row/sub-op labeling.
+fn compact_import_record(bytes: &[u8]) -> Vec<u8> {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        let record_type = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if !record_type.is_empty() {
+            let compact = match record_type {
+                "event_msg" => serde_json::json!({
+                    "type": record_type,
+                    "payload": {
+                        "type": value
+                            .get("payload")
+                            .and_then(|payload| payload.get("type"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                    }
+                }),
+                "attachment" => serde_json::json!({
+                    "type": record_type,
+                    "attachment": value.get("attachment").cloned().unwrap_or_default()
+                }),
+                "user" => serde_json::json!({
+                    "type": record_type,
+                    "text": first_nested_json_text(&value).unwrap_or_default()
+                }),
+                _ => serde_json::json!({ "type": record_type }),
+            };
+            return serde_json::to_vec(&compact).unwrap_or_default();
+        }
+    }
+
+    // Large blob JSON is intentionally read only as a prefix, so a complete
+    // serde parse can end at EOF. Discriminators are near the envelope start;
+    // recover those simple string fields without reading the full record.
+    let raw = String::from_utf8_lossy(bytes);
+    if let Some(record_type) = json_string_field(&raw, "type", 0) {
+        let compact = if record_type == "event_msg" {
+            let payload_start = raw.find("\"payload\"").unwrap_or(0);
+            let event_type = json_string_field(&raw, "type", payload_start).unwrap_or("");
+            serde_json::json!({
+                "type": record_type,
+                "payload": { "type": event_type }
+            })
+        } else {
+            serde_json::json!({ "type": record_type })
+        };
+        return serde_json::to_vec(&compact).unwrap_or_default();
+    }
+
+    compact_text_bytes(bytes)
+}
+
+/// Find the first non-empty nested JSON `text` field.
+fn first_nested_json_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(serde_json::Value::as_str) {
+                if !text.trim().is_empty() {
+                    return Some(compact_text(text));
+                }
+            }
+            map.values().find_map(first_nested_json_text)
+        }
+        serde_json::Value::Array(values) => values.iter().find_map(first_nested_json_text),
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => None,
+    }
+}
+
+/// Extract one simple JSON string field from a prefix.
+fn json_string_field<'a>(raw: &'a str, field: &str, start: usize) -> Option<&'a str> {
+    let tail = raw.get(start..)?;
+    let needle = format!("\"{field}\"");
+    let field_offset = tail.find(&needle)?.saturating_add(needle.len());
+    let after_field = tail.get(field_offset..)?;
+    let colon = after_field.find(':')?;
+    let value = after_field.get(colon.saturating_add(1)..)?.trim_start();
+    let quoted = value.strip_prefix('"')?;
+    let end = quoted.find('"')?;
+    quoted.get(..end)
+}
+
+/// Bound one inline byte vector as UTF-8 display text.
+fn compact_inline_bytes(bytes: &mut Vec<u8>) {
+    *bytes = compact_text_bytes(bytes);
+}
+
+/// Bound arbitrary bytes as lossy UTF-8 display text.
+fn compact_text_bytes(bytes: &[u8]) -> Vec<u8> {
+    compact_text(&String::from_utf8_lossy(bytes)).into_bytes()
+}
+
+/// Bound display text by Unicode scalar count, appending an ellipsis on cut.
+fn compact_text(text: &str) -> String {
+    let mut chars = text.chars();
+    let mut compact: String = chars.by_ref().take(DISPLAY_PREVIEW_CHAR_LIMIT).collect();
+    if chars.next().is_some() {
+        compact.push('…');
+    }
+    compact
+}
+
+/// Record a blob-backed field whose operation shape has no inline payload slot.
+fn defer_blob_ref(blob_ref: &BlobRef, resolver: &BlobResolver, stats: &mut BlobHydrationStats) {
+    stats.deferred = stats.deferred.saturating_add(1);
+    match resolver.preview(blob_ref, 0) {
+        BlobPreviewResolution::Found(_) => {}
+        BlobPreviewResolution::Missing => stats.missing = stats.missing.saturating_add(1),
+        BlobPreviewResolution::Corrupt => stats.corrupt = stats.corrupt.saturating_add(1),
+        BlobPreviewResolution::Unresolvable => {
+            stats.unresolved = stats.unresolved.saturating_add(1);
+        }
+    }
+}
+
 impl Workspace {
     /// Create a workspace from an existing projection (used in tests).
     #[must_use]
     pub fn from_projection(projection: HistoryProjection) -> Self {
+        let source_ops = projection.ops.clone();
+        let source_op_index = source_ops
+            .iter()
+            .enumerate()
+            .map(|(index, op)| (op.id, index))
+            .collect();
         Self {
             projection,
+            source_ops,
+            source_op_index,
+            blob_resolver: None,
             repositories: Vec::new(),
             diagnostics: OpenDiagnostics::default(),
             current_view: None,
@@ -390,12 +768,13 @@ impl Workspace {
         } else {
             PathBuf::from(workspace_path).join(chain_dir)
         };
-        let (mut ops, chain_stats) = read_chain_ops(&chain_path)?;
-        // Resolve durable blobs before projection and lexical indexing so
-        // summaries, details, and search see actual content. Missing/corrupt
-        // blobs stay references and are reported in `diagnostics`.
+        let (source_ops, chain_stats) = read_chain_ops(&chain_path)?;
+        // Keep durable references in the canonical source corpus. The graph
+        // projection receives only bounded display previews, preventing large
+        // payload bytes from being multiplied by collapse/filter/layout clones.
+        // Details and search hydrate a single source op at a time on demand.
         let resolver = BlobResolver::open(&chain_path)?;
-        let blob_stats = hydrate_blob_payloads(&mut ops, &resolver);
+        let (projection_ops, blob_stats) = projection_ops_with_previews(&source_ops, &resolver);
         let diagnostics = OpenDiagnostics {
             chain: chain_stats,
             blobs: blob_stats,
@@ -406,7 +785,7 @@ impl Workspace {
         let options = editchain_project::ProjectionOptions {
             bundle_metadata: true,
         };
-        let mut projection = HistoryProjection::from_ops_with(ops, options);
+        let mut projection = HistoryProjection::from_ops_with(projection_ops, options);
         let repositories = discover_repositories(&PathBuf::from(workspace_path))?;
         // Walk each discovered repo's history into the projection.
         for discovery in &repositories {
@@ -421,8 +800,16 @@ impl Workspace {
         }
         // Stitch sessions and git history into a single edit chain.
         projection.link_history();
+        let source_op_index = source_ops
+            .iter()
+            .enumerate()
+            .map(|(index, op)| (op.id, index))
+            .collect();
         Ok(Self {
             projection,
+            source_ops,
+            source_op_index,
+            blob_resolver: Some(resolver),
             repositories,
             diagnostics,
             current_view: None,
@@ -437,17 +824,21 @@ impl Workspace {
         clippy::needless_borrow,
         reason = "expanded-slot prefix sums are bounded by node count; indexing is bounds-checked by partition_point; node is a &HistoryNode reference"
     )]
-    pub fn history_window(
-        &mut self,
-        offset: u64,
-        limit: u64,
-        hide_submodules: bool,
-        filter: &ChainFilter,
-    ) -> HistoryWindow {
+    pub fn history_window(&mut self, options: HistoryWindowOptions<'_>) -> HistoryWindow {
+        let HistoryWindowOptions {
+            offset,
+            limit,
+            hide_submodules,
+            filter,
+            include_layout,
+        } = options;
         let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
         let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
 
         self.ensure_view_snapshot(hide_submodules, filter);
+        if include_layout {
+            self.ensure_view_layout();
+        }
         let Some((_, snapshot)) = self.current_view.as_ref() else {
             return HistoryWindow {
                 rows: Vec::new(),
@@ -455,10 +846,11 @@ impl Workspace {
                 chain_generation: u64::try_from(self.projection.ops.len()).unwrap_or(u64::MAX),
                 max_lane: 0,
                 sub_op_counts: (offset == 0).then(Vec::new),
+                layout_ready: include_layout,
             };
         };
         let filtered = &snapshot.nodes;
-        let ctx = &snapshot.context;
+        let ctx = snapshot.context.as_ref();
 
         // The service emits a FIXED fully-expanded flat list: every combined op
         // always occupies its stable 1+N absolute slots (parent + one per bundled
@@ -484,14 +876,20 @@ impl Workspace {
             let block_start = starts[abs_idx];
             // Per-row graph geometry from the layout context (absolute row index
             // into the full sorted list).
-            let (lane, above, below, transitions) = (
-                ctx.lanes.get(abs_idx).map_or(0, |r| r.lane),
-                ctx.row_above.get(abs_idx).cloned().unwrap_or_default(),
-                ctx.row_below.get(abs_idx).cloned().unwrap_or_default(),
-                ctx.row_transitions
-                    .get(abs_idx)
-                    .cloned()
-                    .unwrap_or_default(),
+            let (lane, above, below, transitions) = ctx.map_or_else(
+                || (0, Vec::new(), Vec::new(), Vec::new()),
+                |layout| {
+                    (
+                        layout.lanes.get(abs_idx).map_or(0, |row| row.lane),
+                        layout.row_above.get(abs_idx).cloned().unwrap_or_default(),
+                        layout.row_below.get(abs_idx).cloned().unwrap_or_default(),
+                        layout
+                            .row_transitions
+                            .get(abs_idx)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                },
             );
             let parent_row = block_start;
             // Emit the parent row if it falls inside the window.
@@ -502,11 +900,16 @@ impl Workspace {
                 // emitted as a dangling key. Relations are derived by the
                 // projection from these same final parent keys, so every
                 // relation's parent is guaranteed to be a rendered parent.
-                let parents = ctx
-                    .parents
-                    .get(&node.node_key())
-                    .cloned()
-                    .unwrap_or_default();
+                let parents = ctx.map_or_else(
+                    || self.projection.lifted_parent_keys(node),
+                    |layout| {
+                        layout
+                            .parents
+                            .get(&node.node_key())
+                            .cloned()
+                            .unwrap_or_default()
+                    },
+                );
                 let parent_relations = self
                     .projection
                     .parent_relations_for(&node, &parents)
@@ -550,10 +953,11 @@ impl Workspace {
             // leaving this parent downward AND entering the next node from above
             // spans the whole region continuously. Sub-op rows draw these as
             // full-height straight lines with no dot.
-            let below_parent = ctx.row_below.get(abs_idx).map_or(&[][..], Vec::as_slice);
+            let below_parent = ctx
+                .and_then(|layout| layout.row_below.get(abs_idx))
+                .map_or(&[][..], Vec::as_slice);
             let above_next = ctx
-                .row_above
-                .get(abs_idx + 1)
+                .and_then(|layout| layout.row_above.get(abs_idx + 1))
                 .map_or(&[][..], Vec::as_slice);
             let region_lanes = intersect_sorted(below_parent, above_next);
             for (i, sub) in summaries.iter().enumerate() {
@@ -600,6 +1004,7 @@ impl Workspace {
             // ship the O(V) expansion index once for that snapshot, not with
             // every O(window) page.
             sub_op_counts: (offset == 0).then(|| snapshot.sub_op_counts.clone()),
+            layout_ready: snapshot.context.is_some(),
         }
     }
 
@@ -625,7 +1030,6 @@ impl Workspace {
         } else {
             all_nodes
         };
-        let context = self.projection.layout_context(&nodes);
         let sub_op_counts: Vec<usize> = nodes.iter().map(|node| node.sub_ops().len()).collect();
         let mut starts = Vec::with_capacity(nodes.len().saturating_add(1));
         starts.push(0usize);
@@ -640,18 +1044,31 @@ impl Workspace {
             );
         }
         let expanded_total = starts.last().copied().unwrap_or(0);
-        let max_lane = context.lanes.iter().map(|row| row.lane).max().unwrap_or(0);
         self.current_view = Some((
             key,
             ViewSnapshot {
                 nodes,
-                context,
+                context: None,
                 sub_op_counts,
                 starts,
                 expanded_total,
-                max_lane,
+                max_lane: 0,
             },
         ));
+    }
+
+    /// Build global graph geometry for the current row snapshot on demand.
+    fn ensure_view_layout(&mut self) {
+        let projection = &self.projection;
+        let Some((_, snapshot)) = self.current_view.as_mut() else {
+            return;
+        };
+        if snapshot.context.is_some() {
+            return;
+        }
+        let context = projection.layout_context(&snapshot.nodes);
+        snapshot.max_lane = context.lanes.iter().map(|row| row.lane).max().unwrap_or(0);
+        snapshot.context = Some(context);
     }
 
     /// Compute the graph layout for a bounded window of rows.
@@ -673,6 +1090,7 @@ impl Workspace {
         filter: &ChainFilter,
     ) -> ProtocolGraphLayout {
         self.ensure_view_snapshot(hide_submodules, filter);
+        self.ensure_view_layout();
         let Some((_, snapshot)) = self.current_view.as_ref() else {
             return ProtocolGraphLayout {
                 rows: Vec::new(),
@@ -680,7 +1098,13 @@ impl Workspace {
                 max_lane: 0,
             };
         };
-        let ctx = &snapshot.context;
+        let Some(ctx) = snapshot.context.as_ref() else {
+            return ProtocolGraphLayout {
+                rows: Vec::new(),
+                edges: Vec::new(),
+                max_lane: 0,
+            };
+        };
         let offset_usize = usize::try_from(offset).unwrap_or(0);
         let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
 
@@ -743,8 +1167,13 @@ impl Workspace {
     ) -> Option<NodeDetails> {
         if let Some(op_id_str) = op_id {
             let op_id = OpId::from_display_str(&op_id_str)?;
-            let op = self.projection.ops.iter().find(|op| op.id == op_id)?;
-            return Some(node_details_from_op(op));
+            let index = self.source_op_index.get(&op_id).copied()?;
+            let mut op = self.source_ops.get(index)?.clone();
+            if let Some(resolver) = &self.blob_resolver {
+                let mut stats = BlobHydrationStats::default();
+                hydrate_kind(&mut op.kind, resolver, &mut stats);
+            }
+            return Some(node_details_from_op(&op));
         }
         if let Some(oid) = git_oid {
             let commit = self
@@ -954,7 +1383,7 @@ fn node_author(node: &editchain_project::HistoryNode) -> String {
 /// record type (derived from the raw JSONL's `type` field when parseable, else
 /// the raw reference text), so the viewer can label each revealed sub-row.
 #[must_use]
-fn sub_op_summaries(sub_ops: &[Op]) -> Vec<editchain_protocol::SubOpSummary> {
+fn sub_op_summaries(sub_ops: &[std::sync::Arc<Op>]) -> Vec<editchain_protocol::SubOpSummary> {
     sub_ops
         .iter()
         .map(|op| {
@@ -1261,13 +1690,13 @@ fn read_chain_ops(chain_dir: &PathBuf) -> ChainReadResult {
     let mut opset = OpSet::new();
     let mut accepted: Vec<Op> = Vec::new();
     let mut stats = ChainReadStats::default();
-    for page in &pages {
-        for record in &page.records {
+    for page in pages {
+        for record in page.records {
             let Ok(op) = decode_op(&record.data) else {
                 continue;
             };
             stats.records = stats.records.saturating_add(1);
-            match opset.insert(op.id, record.data.clone()) {
+            match opset.insert(op.id, record.data) {
                 Ok(true) => {
                     stats.accepted = stats.accepted.saturating_add(1);
                     accepted.push(op);
@@ -1324,8 +1753,13 @@ pub fn build_lexical_index(
     let mut index = LexicalIndex::new()?;
     let mut git_identities = std::collections::BTreeMap::new();
     let mut generation = 0u64;
-    for op in &workspace.projection.ops {
-        drop(index.index_op(op, generation)?);
+    for source in &workspace.source_ops {
+        let mut op = source.clone();
+        if let Some(resolver) = &workspace.blob_resolver {
+            let mut stats = BlobHydrationStats::default();
+            hydrate_kind(&mut op.kind, resolver, &mut stats);
+        }
+        drop(index.index_op(&op, generation)?);
         generation += 1;
     }
     // Index git commits as synthetic ops, recording the deterministic mapping
@@ -1448,7 +1882,7 @@ impl Server {
                     "repos": self.workspace.as_ref().map_or(0, |w| w.repositories.len()),
                     "nodes": self.workspace.as_ref().map_or(0, |w| w.projection.len()),
                     "chain_generation": self.workspace.as_ref().map_or(0, |w| w.projection.ops.len()),
-                    // Canonicalization + blob hydration outcomes for this open.
+                    // Canonicalization + lazy blob access outcomes for this open.
                     // New keys: backward-compatible; older clients ignore them.
                     "diagnostics": serde_json::to_value(diagnostics)?,
                     "warnings": warnings,
@@ -1457,7 +1891,13 @@ impl Server {
             RequestBody::GetWindow(req) => {
                 let ws = self.workspace.as_mut().ok_or("no workspace open")?;
                 let filter = chain_filter_from_dto(req.filter.as_ref());
-                let window = ws.history_window(req.offset, req.limit, req.hide_submodules, &filter);
+                let window = ws.history_window(HistoryWindowOptions {
+                    offset: req.offset,
+                    limit: req.limit,
+                    hide_submodules: req.hide_submodules,
+                    filter: &filter,
+                    include_layout: req.include_layout,
+                });
                 ResponseBody::Ok(serde_json::to_value(window)?)
             }
             RequestBody::GetLayout(req) => {
@@ -1593,7 +2033,6 @@ mod tests {
     use editchain_codec::page::Page;
     use editchain_core::{ImportOp, MessageOp, PathId};
     use editchain_import::BlobSink as _;
-    use std::collections::HashMap;
 
     /// 2^53 + 1 — the first integer JavaScript's IEEE-754 doubles round.
     const OVER_2_53: u64 = 9_007_199_254_740_993;
@@ -1738,7 +2177,13 @@ mod tests {
         let projection = HistoryProjection::from_ops_with(ops, options);
         let mut ws = Workspace::from_projection(projection);
         let filter = ChainFilter::default();
-        let window = ws.history_window(0, 100, false, &filter);
+        let window = ws.history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            hide_submodules: false,
+            filter: &filter,
+            include_layout: true,
+        });
 
         // SubagentOf: the subagent thread's first op carries a "subagent"
         // relation to the CANONICAL spawn anchor. The raw target (the folded
@@ -1873,7 +2318,13 @@ mod tests {
             false,
             true,
         );
-        let window = ws.history_window(0, 100, false, &filter);
+        let window = ws.history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            hide_submodules: false,
+            filter: &filter,
+            include_layout: true,
+        });
 
         // Both tool-kind rows are preserved because they are a structural
         // anchor/target pair; every other row kind is excluded.
@@ -1931,7 +2382,13 @@ mod tests {
             HistoryProjection::from_ops_with(vec![turn.clone(), msg, meta.clone()], opts);
         let mut ws = Workspace::from_projection(projection);
         let filter = ChainFilter::default();
-        let window = ws.history_window(0, 100, false, &filter);
+        let window = ws.history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            hide_submodules: false,
+            filter: &filter,
+            include_layout: true,
+        });
 
         // Parent row + one expanded sub-op row.
         assert_eq!(window.rows.len(), 2);
@@ -1956,7 +2413,13 @@ mod tests {
         // A page beginning inside an expanded block must still resolve the
         // owning top-level node. Global expansion metadata is sent only on the
         // offset-zero page and retained by the client for later windows.
-        let deep = ws.history_window(1, 1, false, &filter);
+        let deep = ws.history_window(HistoryWindowOptions {
+            offset: 1,
+            limit: 1,
+            hide_submodules: false,
+            filter: &filter,
+            include_layout: true,
+        });
         assert_eq!(deep.rows.len(), 1);
         assert!(deep.rows[0].is_subop);
         assert_eq!(deep.rows[0].op_id, Some(meta.id.to_string()));
@@ -1977,7 +2440,13 @@ mod tests {
             HistoryProjection::from_ops(vec![turn.clone(), msg.clone(), meta.clone()]);
         let mut ws_off = Workspace::from_projection(projection_off);
         let filter = ChainFilter::default();
-        let window_off = ws_off.history_window(0, 100, false, &filter);
+        let window_off = ws_off.history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            hide_submodules: false,
+            filter: &filter,
+            include_layout: true,
+        });
         let meta_default = window_off
             .rows
             .iter()
@@ -1999,7 +2468,13 @@ mod tests {
         let projection_on =
             HistoryProjection::from_ops_with(vec![turn.clone(), msg, meta.clone()], opts_on);
         let mut ws_on = Workspace::from_projection(projection_on);
-        let window_on = ws_on.history_window(0, 100, false, &filter);
+        let window_on = ws_on.history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            hide_submodules: false,
+            filter: &filter,
+            include_layout: true,
+        });
         let meta_on = window_on
             .rows
             .iter()
@@ -2042,7 +2517,13 @@ mod tests {
         );
         let mut ws = Workspace::from_projection(projection);
         let filter = ChainFilter::default();
-        let window = ws.history_window(0, 100, false, &filter);
+        let window = ws.history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            hide_submodules: false,
+            filter: &filter,
+            include_layout: true,
+        });
 
         // Find the sub-op row (is_subop).
         let sub = window
@@ -2199,7 +2680,7 @@ mod tests {
     }
 
     #[test]
-    fn open_hydrates_durable_blobs_and_indexes_content() {
+    fn open_previews_blobs_and_hydrates_details_and_search_on_demand() {
         let dir = tempfile::tempdir().unwrap();
         let workspace_path = dir.path().join("workspace");
         std::fs::create_dir_all(&workspace_path).unwrap();
@@ -2246,12 +2727,14 @@ mod tests {
         let ws = Workspace::open(workspace_path.to_str().unwrap(), ".editchain").unwrap();
         assert_eq!(ws.diagnostics.chain.records, 3);
         assert_eq!(ws.diagnostics.chain.accepted, 3);
-        assert_eq!(ws.diagnostics.blobs.hydrated, 3);
+        assert_eq!(ws.diagnostics.blobs.hydrated, 0);
+        assert_eq!(ws.diagnostics.blobs.previewed, 3);
+        assert_eq!(ws.diagnostics.blobs.deferred, 3);
         assert_eq!(ws.diagnostics.blobs.missing, 0);
         assert_eq!(ws.diagnostics.blobs.corrupt, 0);
         assert!(ws.diagnostics.warnings().is_empty());
 
-        // NodeDetails sees the hydrated content.
+        // NodeDetails hydrates the requested source operation on demand.
         let details = ws.node_details(Some(msg.id.to_string()), None).unwrap();
         assert!(details.body.contains("needle-hydrated-message"));
         let tool_details = ws.node_details(Some(tool.id.to_string()), None).unwrap();
@@ -2259,7 +2742,7 @@ mod tests {
         let raw_details = ws.node_details(Some(raw.id.to_string()), None).unwrap();
         assert!(raw_details.summary.contains("needle-hydrated-raw"));
 
-        // Search sees the hydrated content too.
+        // Search hydrates each source operation while lazily building its index.
         let state = build_lexical_index(&ws).unwrap();
         let filters = SearchFilters {
             kinds: None,
@@ -2740,6 +3223,107 @@ mod tests {
     }
 
     #[test]
+    fn projection_previews_defer_full_blob_until_details() {
+        let tmp = tempfile::tempdir().unwrap();
+        let full_text = "large payload ".repeat(2_000);
+        let blob_ref = store_blob(tmp.path(), full_text.as_bytes());
+        let source = op_envelope(
+            9,
+            1,
+            OpKind::Message(MessageOp {
+                content: Payload::Blob(blob_ref),
+                content_type: Payload::Empty,
+            }),
+        );
+        let resolver = BlobResolver::open(tmp.path()).unwrap();
+        let (projection_ops, stats) =
+            projection_ops_with_previews(std::slice::from_ref(&source), &resolver);
+
+        assert_eq!(stats.hydrated, 0);
+        assert_eq!(stats.previewed, 1);
+        assert_eq!(stats.deferred, 1);
+        assert!(matches!(
+            &source.kind,
+            OpKind::Message(MessageOp {
+                content: Payload::Blob(found),
+                ..
+            }) if found == &blob_ref
+        ));
+        let preview_len = if let OpKind::Message(MessageOp {
+            content: Payload::Inline(bytes),
+            ..
+        }) = &projection_ops[0].kind
+        {
+            String::from_utf8_lossy(bytes).chars().count()
+        } else {
+            0
+        };
+        assert_ne!(preview_len, 0, "expected inline projection preview");
+        assert!(preview_len <= DISPLAY_PREVIEW_CHAR_LIMIT.saturating_add(1));
+
+        let projection = HistoryProjection::from_ops(projection_ops);
+        let mut source_op_index = HashMap::new();
+        let _: Option<usize> = source_op_index.insert(source.id, 0);
+        let ws = Workspace {
+            projection,
+            source_ops: vec![source.clone()],
+            source_op_index,
+            blob_resolver: Some(resolver),
+            repositories: Vec::new(),
+            diagnostics: OpenDiagnostics::default(),
+            current_view: None,
+        };
+        let details = ws
+            .node_details(Some(source.id.to_string()), None)
+            .expect("details");
+        assert_eq!(details.body, full_text);
+    }
+
+    #[test]
+    fn row_first_window_precedes_global_layout() {
+        let first = message_op(1, 1, OpId::new(NodeId(0), 0, 0));
+        let second = message_op(1, 2, first.id);
+        let projection = HistoryProjection::from_ops(vec![first, second]);
+        let mut ws = Workspace::from_projection(projection);
+        let filter = ChainFilter::new(String::new(), String::new(), String::new(), false, false);
+
+        let provisional = ws.history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 10,
+            hide_submodules: false,
+            filter: &filter,
+            include_layout: false,
+        });
+        assert!(!provisional.layout_ready);
+        assert!(!provisional.rows.is_empty());
+        assert!(provisional.rows.iter().all(|row| {
+            row.lane == 0
+                && row.above.is_empty()
+                && row.below.is_empty()
+                && row.transitions.is_empty()
+        }));
+        assert!(ws
+            .current_view
+            .as_ref()
+            .is_some_and(|(_, snapshot)| snapshot.context.is_none()));
+
+        let laid_out = ws.history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 10,
+            hide_submodules: false,
+            filter: &filter,
+            include_layout: true,
+        });
+        assert!(laid_out.layout_ready);
+        assert_eq!(laid_out.rows.len(), provisional.rows.len());
+        assert_eq!(laid_out.rows[0].node_key, provisional.rows[0].node_key);
+        assert!(ws
+            .current_view
+            .as_ref()
+            .is_some_and(|(_, snapshot)| snapshot.context.is_some()));
+    }
+
+    #[test]
     fn view_cache_stays_bounded_across_filter_changes() {
         let ops = vec![
             message_op(1, 1, OpId::new(NodeId(0), 0, 0)),
@@ -2759,7 +3343,13 @@ mod tests {
             })
             .collect();
         for filter in &filters {
-            drop(ws.history_window(0, 10, false, filter));
+            drop(ws.history_window(HistoryWindowOptions {
+                offset: 0,
+                limit: 10,
+                hide_submodules: false,
+                filter,
+                include_layout: true,
+            }));
             drop(ws.graph_layout(false, 0, 10, filter));
         }
         // The cache keeps a single active slot: after eight distinct filters
@@ -2767,7 +3357,13 @@ mod tests {
         let cached_key = ws.current_view.as_ref().map(|(key, _)| key.clone());
         assert_eq!(cached_key, Some((false, filters.last().unwrap().key())));
         // Same-key reuse between GetWindow and GetLayout keeps the snapshot.
-        drop(ws.history_window(0, 10, false, filters.last().unwrap()));
+        drop(ws.history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 10,
+            hide_submodules: false,
+            filter: filters.last().unwrap(),
+            include_layout: true,
+        }));
         assert_eq!(
             ws.current_view.as_ref().map(|(key, _)| key.clone()),
             Some((false, filters.last().unwrap().key()))

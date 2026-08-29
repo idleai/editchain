@@ -27,7 +27,9 @@ use editchain_core::{
 };
 use editchain_project::filter::ChainFilter;
 use editchain_protocol::{Request, RequestBody, ResponseBody, SearchFiltersDto};
-use editchain_vscode_service::{parse_git_oid, parse_repository_id, resolve_git_commit, Workspace};
+use editchain_vscode_service::{
+    parse_git_oid, parse_repository_id, resolve_git_commit, HistoryWindowOptions, Workspace,
+};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
@@ -95,7 +97,14 @@ fn op_identifiers_above_2_53_round_trip_exactly_through_window_details_and_searc
 
     // History window: the op id must be the exact decimal string, never a
     // number that JavaScript could round.
-    let window = ws.history_window(0, 10, false, &no_filter());
+    let filter = no_filter();
+    let window = ws.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 10,
+        hide_submodules: false,
+        filter: &filter,
+        include_layout: true,
+    });
     let row = window
         .rows
         .iter()
@@ -198,7 +207,14 @@ fn git_resolve_uses_exact_string_ids_and_rejects_invalid_input() {
     // Open the workspace: git rows carry hex oid + decimal repository strings.
     let mut ws = Workspace::open(tmp.path().to_str().expect("utf8"), "").expect("open");
     assert!(!ws.repositories.is_empty(), "repo should be discovered");
-    let window = ws.history_window(0, 10, false, &no_filter());
+    let filter = no_filter();
+    let window = ws.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 10,
+        hide_submodules: false,
+        filter: &filter,
+        include_layout: true,
+    });
     let row = window
         .rows
         .iter()
@@ -476,7 +492,14 @@ fn history_window_returns_rows() {
     let ops = vec![msg_op(1, 1, b"first"), msg_op(1, 2, b"second")];
     let projection = editchain_project::HistoryProjection::from_ops(ops);
     let mut ws = Workspace::from_projection(projection);
-    let window = ws.history_window(0, 10, false, &no_filter());
+    let filter = no_filter();
+    let window = ws.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 10,
+        hide_submodules: false,
+        filter: &filter,
+        include_layout: true,
+    });
     assert_eq!(window.total, 2);
     assert_eq!(window.rows.len(), 2);
 }
@@ -489,7 +512,14 @@ fn op_rows_have_uniform_author_and_short_commit_id() {
     let ops = vec![msg_op(7, 42, b"hello")];
     let projection = editchain_project::HistoryProjection::from_ops(ops);
     let mut ws = Workspace::from_projection(projection);
-    let window = ws.history_window(0, 10, false, &no_filter());
+    let filter = no_filter();
+    let window = ws.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 10,
+        hide_submodules: false,
+        filter: &filter,
+        include_layout: true,
+    });
     let row = &window.rows[0];
     assert_eq!(row.author, "system");
     assert_eq!(row.commit_id, "7:42");
@@ -515,7 +545,14 @@ fn system_flag_marks_tool_and_import_ops() {
     let msg = msg_op(1, 2, b"hello");
     let projection = editchain_project::HistoryProjection::from_ops(vec![tool, msg]);
     let mut ws = Workspace::from_projection(projection);
-    let window = ws.history_window(0, 10, false, &no_filter());
+    let filter = no_filter();
+    let window = ws.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 10,
+        hide_submodules: false,
+        filter: &filter,
+        include_layout: true,
+    });
     // Rows are newest-first; find by kind.
     let tool_row = window
         .rows

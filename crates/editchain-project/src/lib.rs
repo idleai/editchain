@@ -16,6 +16,7 @@ pub mod layout;
 pub mod link;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use editchain_core::op::NoteRelationship;
 use editchain_core::{
@@ -23,7 +24,7 @@ use editchain_core::{
 };
 
 use crate::layout::{compute_graph_layout, compute_lane_assignment, GraphLayout, GraphRow};
-use crate::link::link_history;
+use crate::link::link_history_links;
 
 /// Provenance of a node's effective display time.
 ///
@@ -46,7 +47,7 @@ pub enum HistoryNode {
     /// An `EditChain` operation.
     EditOperation {
         /// The underlying operation.
-        op: Op,
+        op: Arc<Op>,
         /// Source time of this record; `Unknown` when the source had none.
         source_time: EffectiveTime,
     },
@@ -58,7 +59,7 @@ pub enum HistoryNode {
     /// `summary` is derived from the children's content (not the raw JSONL).
     CollapsedImport {
         /// The underlying raw import op (kept for id/clock/parents).
-        op: Op,
+        op: Arc<Op>,
         /// Source time of this record; `Unknown` when the source had none.
         source_time: EffectiveTime,
         /// Display summary derived from the normalization children.
@@ -74,10 +75,10 @@ pub enum HistoryNode {
         /// click). These are raw Import ops tagged `META` that carry no
         /// user-facing content; they hang off this real turn/tool node rather
         /// than occupying their own graph row/lane.
-        sub_ops: Vec<Op>,
+        sub_ops: Vec<Arc<Op>>,
     },
     /// A `Git` commit entity.
-    GitCommit(GitCommitEntity),
+    GitCommit(Box<GitCommitEntity>),
 }
 
 impl HistoryNode {
@@ -308,7 +309,7 @@ impl HistoryNode {
                     .collect();
                 ids.sort_unstable();
                 ids.dedup();
-                op.parents = match ids.len() {
+                Arc::make_mut(op).parents = match ids.len() {
                     0 => editchain_core::parents::ParentSet::None,
                     1 => editchain_core::parents::ParentSet::One(ids[0]),
                     _ => editchain_core::parents::ParentSet::Two(ids[0], ids[1]),
@@ -328,7 +329,7 @@ impl HistoryNode {
     /// nodes without any). These are raw `Import` ops tagged `META` that carry
     /// no user-facing content; the viewer reveals them on click.
     #[must_use]
-    pub fn sub_ops(&self) -> &[Op] {
+    pub fn sub_ops(&self) -> &[Arc<Op>] {
         match self {
             Self::CollapsedImport { sub_ops, .. } => sub_ops,
             Self::EditOperation { .. } | Self::GitCommit(_) => &[],
@@ -558,8 +559,8 @@ impl HistoryProjection {
     #[must_use]
     pub fn filtered_nodes(&self, filter: &filter::ChainFilter) -> Vec<HistoryNode> {
         let nodes = self.ordered_nodes();
-        filter::apply(
-            &nodes,
+        filter::apply_owned(
+            nodes,
             &self.git.links,
             self.relationship_notes(),
             &self.collapsed_projection.representative,
@@ -578,7 +579,7 @@ impl HistoryProjection {
     pub fn independent_chains(&self) -> usize {
         let mut nodes: Vec<HistoryNode> = self.collapsed_projection.nodes.clone();
         for commit in self.git.commits.values() {
-            nodes.push(HistoryNode::GitCommit(commit.clone()));
+            nodes.push(HistoryNode::GitCommit(Box::new(commit.clone())));
         }
         let present: std::collections::HashSet<String> =
             nodes.iter().map(HistoryNode::node_key).collect();
@@ -636,8 +637,8 @@ impl HistoryProjection {
     /// while independent chains stay interleaved newest-first.
     #[expect(
         clippy::arithmetic_side_effects,
-        clippy::let_underscore_untyped,
-        reason = "In-degree counters are bounded by the number of present parents; HashMap insert returns Option which is discarded"
+        clippy::indexing_slicing,
+        reason = "Scheduler indices originate from these equally sized node/adjacency vectors; in-degree increments/decrements are bounded by discovered edges"
     )]
     fn ordered_nodes(&self) -> Vec<HistoryNode> {
         // Build a unified node list: ops (newest-first) then git commits.
@@ -649,7 +650,7 @@ impl HistoryProjection {
             nodes.push(op.clone());
         }
         for commit in self.git.commits.values() {
-            nodes.push(HistoryNode::GitCommit(commit.clone()));
+            nodes.push(HistoryNode::GitCommit(Box::new(commit.clone())));
         }
 
         // Assign BLOCK-ORDER display anchors to nodes whose source time is unknown.
@@ -670,13 +671,25 @@ impl HistoryProjection {
         // BEFORE scheduling because the anchor is the effective time the
         // chronological tie-break reads; the values themselves are order-free
         // (per-session minimum observed timestamp).
-        let mut session_first_ts: HashMap<String, u64> = HashMap::new();
+        let mut session_first_ts: HashMap<u64, u64> = HashMap::new();
         for node in &nodes {
             if matches!(node.effective_time(), EffectiveTime::Unknown) || node.git_oid().is_some() {
                 continue;
             }
-            if node.group().starts_with("session:") {
-                let entry = session_first_ts.entry(node.group()).or_insert(u64::MAX);
+            let session = match node {
+                HistoryNode::EditOperation { op, .. } | HistoryNode::CollapsedImport { op, .. } => {
+                    match op.scope {
+                        editchain_core::ScopeRef::Session(session) => Some(session.0),
+                        editchain_core::ScopeRef::None
+                        | editchain_core::ScopeRef::Chain(_)
+                        | editchain_core::ScopeRef::Turn(_)
+                        | editchain_core::ScopeRef::File(_) => None,
+                    }
+                }
+                HistoryNode::GitCommit(_) => None,
+            };
+            if let Some(session) = session {
+                let entry = session_first_ts.entry(session).or_insert(u64::MAX);
                 *entry = (*entry).min(node.timestamp_ms());
             }
         }
@@ -684,11 +697,22 @@ impl HistoryProjection {
             if !matches!(node.effective_time(), EffectiveTime::Unknown) {
                 continue;
             }
-            let group = node.group();
-            if group.starts_with("session:")
-                && session_first_ts.get(&group).copied().unwrap_or(0) != 0
-            {
-                let anchor = session_first_ts.get(&group).copied().unwrap_or(0);
+            let session = match node {
+                HistoryNode::EditOperation { op, .. } | HistoryNode::CollapsedImport { op, .. } => {
+                    match op.scope {
+                        editchain_core::ScopeRef::Session(session) => Some(session.0),
+                        editchain_core::ScopeRef::None
+                        | editchain_core::ScopeRef::Chain(_)
+                        | editchain_core::ScopeRef::Turn(_)
+                        | editchain_core::ScopeRef::File(_) => None,
+                    }
+                }
+                HistoryNode::GitCommit(_) => None,
+            };
+            if let Some(anchor) = session.and_then(|id| session_first_ts.get(&id).copied()) {
+                if anchor == 0 {
+                    continue;
+                }
                 // Record as a BundleAnchor display time — clone is a display-only
                 // provenance, not a clock mutation.
                 node.set_bundle_anchor(anchor);
@@ -710,37 +734,35 @@ impl HistoryProjection {
         // through `representative` to the absorbing anchor row, so the child stays
         // connected to its source chain instead of fragmenting into a new root.
         // This lifts the edge WITHOUT rewriting stored `Op.parents`.
-        let present: std::collections::HashSet<String> =
-            nodes.iter().map(HistoryNode::node_key).collect();
-        let node_by_key: HashMap<String, HistoryNode> =
-            nodes.iter().map(|n| (n.node_key(), n.clone())).collect();
-        // Input index per key: the deterministic tie-break for equal effective
-        // times. `nodes` is built from collapsed rows in reverse input order
-        // (newest-first), then BTreeMap-ordered git commits, so the index is
-        // stable across processes.
-        let index_of: HashMap<String, usize> = nodes
+        let keys: Vec<OrderingKey> = nodes.iter().map(ordering_key).collect();
+        let present: std::collections::HashSet<OrderingKey> = keys.iter().copied().collect();
+        // Use typed Copy keys while scheduling, avoiding repeated OpId string
+        // formatting, allocation, and hashing on the first large-chain window.
+        let index_of: HashMap<OrderingKey, usize> = keys
             .iter()
             .enumerate()
-            .map(|(i, n)| (n.node_key(), i))
+            .map(|(index, key)| (*key, index))
             .collect();
-        // Reverse adjacency (parent -> children) and in-degree (count of present
-        // parents still un-emitted).
-        let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
-        let mut indegree: HashMap<String, usize> = HashMap::new();
-        for node in &nodes {
-            let key = node.node_key();
-            let _ = indegree.entry(key.clone()).or_insert(0);
+        // Reverse adjacency (parent index -> child indices) and in-degree
+        // (count of present parents still un-emitted).
+        let mut children_of: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+        let mut indegree: Vec<usize> = vec![0; nodes.len()];
+        for (child_index, node) in nodes.iter().enumerate() {
             // Resolve every parent to a canonical visible row: bundled-away META
             // ops, folded children, tool results, structural notes, and fork
             // prologues all lift to the row that represents them. Parents that
             // fail to resolve are dropped so a phantom can never block the sort.
-            for parent in canonicalize_parents(
-                node.parent_keys(&self.git.links, self.relationship_notes()),
+            for parent in ordering_parent_keys(
+                node,
+                &self.git.links,
+                self.relationship_notes(),
                 &self.collapsed_projection.representative,
                 &present,
             ) {
-                children_of.entry(parent).or_default().push(key.clone());
-                *indegree.entry(key.clone()).or_insert(0) += 1;
+                if let Some(parent_index) = index_of.get(&parent).copied() {
+                    children_of[parent_index].push(child_index);
+                    indegree[child_index] += 1;
+                }
             }
         }
 
@@ -752,42 +774,34 @@ impl HistoryProjection {
         // timestamps break by input index — never HashMap iteration order — and
         // the final reversal also reverses that equal-time tie order. This makes
         // ties reproducible without claiming recency when their clocks are equal.
-        let mut queue: std::collections::BinaryHeap<std::cmp::Reverse<(u64, usize, String)>> =
+        let mut queue: std::collections::BinaryHeap<std::cmp::Reverse<(u64, usize)>> =
             std::collections::BinaryHeap::with_capacity(nodes.len());
         for (input_index, node) in nodes.iter().enumerate() {
-            let key = node.node_key();
-            if indegree.get(&key).copied() == Some(0) {
-                queue.push(std::cmp::Reverse((node.timestamp_ms(), input_index, key)));
+            if indegree[input_index] == 0 {
+                queue.push(std::cmp::Reverse((node.timestamp_ms(), input_index)));
             }
         }
 
-        // Track which keys have not yet been emitted so we can break cycles
+        // Track which indices have not yet been emitted so we can break cycles
         // deterministically when Kahn stalls.
-        let mut unemitted: std::collections::HashSet<String> = indegree.keys().cloned().collect();
+        let mut unemitted = vec![true; nodes.len()];
+        let mut remaining = nodes.len();
 
-        let mut sorted_oldest_first: Vec<HistoryNode> = Vec::with_capacity(nodes.len());
-        while !unemitted.is_empty() {
+        let mut sorted_oldest_first: Vec<usize> = Vec::with_capacity(nodes.len());
+        while remaining > 0 {
             // Normal Kahn step: emit every node whose present parents have all
             // been emitted, oldest-eligible first (chronological interleave).
-            while let Some(std::cmp::Reverse((_, _, key))) = queue.pop() {
-                if !unemitted.contains(&key) {
+            while let Some(std::cmp::Reverse((_, index))) = queue.pop() {
+                if !unemitted[index] {
                     continue;
                 }
-                if let Some(node) = node_by_key.get(&key) {
-                    sorted_oldest_first.push(node.clone());
-                }
-                let _ = unemitted.remove(&key);
-                if let Some(children) = children_of.get(&key) {
-                    for child in children {
-                        if let Some(deg) = indegree.get_mut(child) {
-                            *deg -= 1;
-                            if *deg == 0 && unemitted.contains(child) {
-                                let input_index = index_of.get(child).copied().unwrap_or(0);
-                                let ts =
-                                    node_by_key.get(child).map_or(0, HistoryNode::timestamp_ms);
-                                queue.push(std::cmp::Reverse((ts, input_index, child.clone())));
-                            }
-                        }
+                sorted_oldest_first.push(index);
+                unemitted[index] = false;
+                remaining -= 1;
+                for &child in &children_of[index] {
+                    indegree[child] -= 1;
+                    if indegree[child] == 0 && unemitted[child] {
+                        queue.push(std::cmp::Reverse((nodes[child].timestamp_ms(), child)));
                     }
                 }
             }
@@ -797,46 +811,39 @@ impl HistoryProjection {
             // still-blocking present parents), tie-broken by key. Its remaining
             // parents are treated as dropped (their edges simply won't draw),
             // which keeps every other edge pointing forward in the final order.
-            if !unemitted.is_empty() {
-                // Pick the remaining node with the smallest in-degree (fewest
-                // still-blocking present parents), tie-broken by key.
-                let pick = unemitted
-                    .iter()
-                    .min_by(|a, b| {
-                        indegree
-                            .get(*a)
-                            .copied()
-                            .unwrap_or(0)
-                            .cmp(&indegree.get(*b).copied().unwrap_or(0))
-                            .then_with(|| a.cmp(b))
+            if remaining > 0 {
+                let pick = (0..nodes.len())
+                    .filter(|&index| unemitted[index])
+                    .min_by(|&a, &b| {
+                        indegree[a]
+                            .cmp(&indegree[b])
+                            // Cycles are malformed and rare. Preserve the old
+                            // display-string tie-break exactly on that fallback
+                            // path without paying String allocation per node on
+                            // every healthy schedule.
+                            .then_with(|| nodes[a].node_key().cmp(&nodes[b].node_key()))
                     })
-                    .cloned()
-                    .unwrap_or_default();
-                if let Some(node) = node_by_key.get(&pick) {
-                    sorted_oldest_first.push(node.clone());
-                }
-                let _ = unemitted.remove(&pick);
-                if let Some(children) = children_of.get(&pick) {
-                    for child in children {
-                        if let Some(deg) = indegree.get_mut(child) {
-                            *deg -= 1;
-                            if *deg == 0 && unemitted.contains(child) {
-                                let input_index = index_of.get(child).copied().unwrap_or(0);
-                                let ts =
-                                    node_by_key.get(child).map_or(0, HistoryNode::timestamp_ms);
-                                queue.push(std::cmp::Reverse((ts, input_index, child.clone())));
-                            }
-                        }
+                    .unwrap_or(0);
+                sorted_oldest_first.push(pick);
+                unemitted[pick] = false;
+                remaining -= 1;
+                for &child in &children_of[pick] {
+                    indegree[child] -= 1;
+                    if indegree[child] == 0 && unemitted[child] {
+                        queue.push(std::cmp::Reverse((nodes[child].timestamp_ms(), child)));
                     }
                 }
             }
         }
 
-        // Reverse to newest-first. This reversal (never a timestamp re-sort) is
-        // what makes the final list newest-first: every edge still points
-        // downward regardless of how inconsistent the source clocks are.
+        // Reverse to newest-first. Move each node out of its input slot so the
+        // ordered result does not clone payloads a second or third time.
         sorted_oldest_first.reverse();
+        let mut slots: Vec<Option<HistoryNode>> = nodes.into_iter().map(Some).collect();
         sorted_oldest_first
+            .into_iter()
+            .filter_map(|index| slots[index].take())
+            .collect()
     }
 
     /// Collapse raw import ops with their normalized children into single nodes.
@@ -932,7 +939,7 @@ impl HistoryProjection {
                             ..
                         }) = result.get_mut(idx)
                         {
-                            sub_ops.push(op.clone());
+                            sub_ops.push(Arc::new(op.clone()));
                             let _: Option<OpId> = representative.insert(op.id, anchor.id);
                             // Never an anchor itself (metadata is never an anchor).
                             continue;
@@ -952,7 +959,7 @@ impl HistoryProjection {
                 let is_anchor_eligible = !is_meta && !is_structural;
                 let idx = result.len();
                 result.push(HistoryNode::CollapsedImport {
-                    op: op.clone(),
+                    op: Arc::new(op.clone()),
                     source_time,
                     summary,
                     kind,
@@ -977,7 +984,7 @@ impl HistoryProjection {
                 let source_time = source_time_of(op);
                 let idx = result.len();
                 result.push(HistoryNode::EditOperation {
-                    op: op.clone(),
+                    op: Arc::new(op.clone()),
                     source_time,
                 });
                 let chain = (op.id.node, op.id.boot);
@@ -1266,7 +1273,7 @@ impl HistoryProjection {
         let mut replacement: HashMap<OpId, OpId> = HashMap::new();
         let mut drop_idx: std::collections::HashSet<usize> = std::collections::HashSet::new();
         // parent index -> tool-result ops to attach as sub-ops.
-        let mut attach: HashMap<usize, Vec<Op>> = HashMap::new();
+        let mut attach: HashMap<usize, Vec<Arc<Op>>> = HashMap::new();
         for (i, n) in result.iter().enumerate() {
             if !is_result.get(i).copied().unwrap_or(false) {
                 continue;
@@ -1404,13 +1411,16 @@ impl HistoryProjection {
     }
 
     /// The normalized Tool op of a tool-result node (for attaching as a sub-op).
-    fn tool_result_op(node: &HistoryNode, children_of: &HashMap<OpId, Vec<&Op>>) -> Option<Op> {
+    fn tool_result_op(
+        node: &HistoryNode,
+        children_of: &HashMap<OpId, Vec<&Op>>,
+    ) -> Option<Arc<Op>> {
         let HistoryNode::CollapsedImport { op, .. } = node else {
             return None;
         };
         children_of.get(&op.id).and_then(|children| {
             children.iter().find_map(|c| match &c.kind {
-                editchain_core::OpKind::Tool(_) => Some((*c).clone()),
+                editchain_core::OpKind::Tool(_) => Some(Arc::new((*c).clone())),
                 editchain_core::OpKind::ChainStart(_)
                 | editchain_core::OpKind::Actor(_)
                 | editchain_core::OpKind::Message(_)
@@ -1449,15 +1459,10 @@ impl HistoryProjection {
     /// computing windows or layouts.
     pub fn link_history(&mut self) {
         let commits: Vec<GitCommitEntity> = self.git.commits.values().cloned().collect();
-        let result = link_history(&self.ops, &commits);
-        self.ops = result.ops;
-        for link in result.git_links {
+        for link in link_history_links(&self.ops, &commits) {
             let entry = self.git.links.entry(link.source).or_default();
             entry.push(link);
         }
-        // Rebuild the canonical collapse so the representative map and
-        // canonicalized relationship notes reflect the linked projection.
-        self.collapsed_projection = self.collapsed_ops();
     }
 
     /// Compute the graph layout for rendering unified history.
@@ -1684,6 +1689,96 @@ pub enum RelationKind {
     Reconnect,
     /// The row branches off the target row at a fork divergence boundary.
     Fork,
+}
+
+/// Allocation-free identity used only by the topological scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum OrderingKey {
+    /// `EditChain` operation identity.
+    Op(OpId),
+    /// Git commit identity.
+    Git(GitOid),
+}
+
+/// Return the typed scheduler key for one visible row.
+fn ordering_key(node: &HistoryNode) -> OrderingKey {
+    match node {
+        HistoryNode::EditOperation { op, .. } | HistoryNode::CollapsedImport { op, .. } => {
+            OrderingKey::Op(op.id)
+        }
+        HistoryNode::GitCommit(commit) => OrderingKey::Git(commit.oid),
+    }
+}
+
+/// Resolve one operation id through folded representatives for scheduling.
+fn canonical_ordering_op(
+    mut id: OpId,
+    representative: &HashMap<OpId, OpId>,
+    present: &std::collections::HashSet<OrderingKey>,
+) -> Option<OrderingKey> {
+    loop {
+        let key = OrderingKey::Op(id);
+        if present.contains(&key) {
+            return Some(key);
+        }
+        match representative.get(&id).copied() {
+            Some(next) if next != id => id = next,
+            Some(_) | None => return None,
+        }
+    }
+}
+
+/// Build canonical typed parents without formatting IDs as strings.
+fn ordering_parent_keys(
+    node: &HistoryNode,
+    git_links: &std::collections::BTreeMap<OpId, Vec<editchain_core::GitLink>>,
+    notes: &HashMap<OpId, Vec<Op>>,
+    representative: &HashMap<OpId, OpId>,
+    present: &std::collections::HashSet<OrderingKey>,
+) -> Vec<OrderingKey> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |candidate: Option<OrderingKey>| {
+        if let Some(key) = candidate {
+            if seen.insert(key) {
+                out.push(key);
+            }
+        }
+    };
+    match node {
+        HistoryNode::EditOperation { op, .. } | HistoryNode::CollapsedImport { op, .. } => {
+            for parent in &op.parents {
+                push(canonical_ordering_op(*parent, representative, present));
+            }
+            for source in std::iter::once(op).chain(node.sub_ops()) {
+                if let Some(links) = git_links.get(&source.id) {
+                    for link in links {
+                        if matches!(link.kind, editchain_core::GitLinkKind::BasedOn) {
+                            continue;
+                        }
+                        let key = OrderingKey::Git(link.target_oid);
+                        push(present.contains(&key).then_some(key));
+                    }
+                }
+            }
+            if let Some(relationship_notes) = notes.get(&op.id) {
+                for note in relationship_notes {
+                    if let editchain_core::OpKind::Note(note) = &note.kind {
+                        for target in &note.target_ids {
+                            push(canonical_ordering_op(*target, representative, present));
+                        }
+                    }
+                }
+            }
+        }
+        HistoryNode::GitCommit(commit) => {
+            for parent in &commit.parents {
+                let key = OrderingKey::Git(*parent);
+                push(present.contains(&key).then_some(key));
+            }
+        }
+    }
+    out
 }
 
 /// Collect the node keys of collapsed top-level rows (the "present" set used to
@@ -2188,7 +2283,7 @@ fn truncate_line(s: &str) -> String {
 /// ~1024 chars. If the row has no own content and no sub-op content, falls back
 /// to `(no summary)`.
 #[must_use]
-fn combined_summary(row_summary: &str, sub_ops: &[Op]) -> String {
+fn combined_summary(row_summary: &str, sub_ops: &[Arc<Op>]) -> String {
     const MAX: usize = 1024;
     let mut parts: Vec<String> = Vec::new();
     let own = row_summary.trim();

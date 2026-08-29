@@ -44,8 +44,21 @@ pub struct LinkResult {
 /// to store in the projection.
 #[must_use]
 pub fn link_history(ops: &[Op], commits: &[GitCommitEntity]) -> LinkResult {
-    let mut ops = ops.to_vec();
+    let git_links = link_history_links(ops, commits);
+    LinkResult {
+        ops: ops.to_vec(),
+        git_links,
+    }
+}
 
+/// Compute only the Git links for a set of operations and commits.
+///
+/// Unlike [`link_history`], this does not clone the operation corpus. The
+/// projection uses this path because linking never mutates operation parents;
+/// retaining the legacy [`LinkResult::ops`] API would otherwise duplicate every
+/// payload during workspace open.
+#[must_use]
+pub fn link_history_links(ops: &[Op], commits: &[GitCommitEntity]) -> Vec<GitLink> {
     // Git stores Unix seconds while operation clocks store Unix milliseconds.
     // Keep the source unit explicit here; `closest_commit` normalizes before
     // comparing so every session does not accidentally select the newest commit.
@@ -60,22 +73,21 @@ pub fn link_history(ops: &[Op], commits: &[GitCommitEntity]) -> LinkResult {
     // first session appear to "spawn" an entire month of later activity.
 
     // 1. Git-command detection: link ops that ran git commands to commits.
-    let mut git_links = link_git_commands(&mut ops, &commit_times_seconds);
+    let mut git_links = link_git_commands(ops, &commit_times_seconds);
 
     // 2. Weak session-to-closest-commit provenance fallback.
-    git_links.extend(link_sessions_to_commits(&ops, &commit_times_seconds));
-
-    LinkResult { ops, git_links }
+    git_links.extend(link_sessions_to_commits(ops, &commit_times_seconds));
+    git_links
 }
 
 /// Link ops that ran git commit/push commands to the commit with the closest
 /// timestamp. Returns the created links.
-fn link_git_commands(ops: &mut [Op], commit_times_seconds: &[(i64, GitOid)]) -> Vec<GitLink> {
+fn link_git_commands(ops: &[Op], commit_times_seconds: &[(i64, GitOid)]) -> Vec<GitLink> {
     if commit_times_seconds.is_empty() {
         return Vec::new();
     }
     let mut links = Vec::new();
-    for op in ops.iter() {
+    for op in ops {
         if !op_is_git_command(op) {
             continue;
         }
