@@ -741,3 +741,66 @@ fn meta_under_tool_result_stays_connected_after_grouping() {
         "META under a (then-grouped) tool result must not fragment the chain"
     );
 }
+
+#[test]
+fn file_row_summary_uses_annotated_path_note() {
+    // A Codex file item persists its provider-neutral path text as an explicit
+    // `Explains` note targeting the file op; the collapsed row renders it as
+    // `file: <path>` instead of the hashed `PathId` or a raw event label.
+    let op1 = import_op(1, 1);
+    let file = Op {
+        id: OpId::new(NodeId(1), 0, 2),
+        parents: ParentSet::One(op1.id),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(2),
+        scope: ScopeRef::Session(SessionId(10)),
+        tags: Tags::FILE,
+        kind: OpKind::File(editchain_core::op::FileOp {
+            path: editchain_core::PathId(42),
+            stage: editchain_core::op::FileStage::Applied,
+            base: None,
+            after: None,
+            edit: editchain_core::op::FileEdit::None,
+        }),
+    };
+    let mut path_note = Op {
+        id: OpId::new(NodeId(1), 0, 3),
+        parents: ParentSet::One(op1.id),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(2),
+        scope: ScopeRef::Session(SessionId(10)),
+        tags: Tags::NOTE,
+        kind: OpKind::Note(editchain_core::op::NoteOp {
+            target_ids: vec![file.id],
+            relationship: editchain_core::op::NoteRelationship::Explains,
+            content: Payload::Inline(b"/tmp/x.txt".to_vec()),
+        }),
+    };
+    let projection =
+        HistoryProjection::from_ops(vec![op1.clone(), file.clone(), path_note.clone()]);
+    let nodes = projection.nodes();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes.first().unwrap().summary(), "file: /tmp/x.txt");
+
+    // The annotation must resolve regardless of input order: the note can
+    // precede the file op in the collapsed row's children, so a hash-ordered
+    // importer emission cannot flip the summary between the annotated path and
+    // the raw-record fallback.
+    let projection =
+        HistoryProjection::from_ops(vec![path_note.clone(), file.clone(), op1.clone()]);
+    let nodes = projection.nodes();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes.first().unwrap().summary(), "file: /tmp/x.txt");
+
+    // Without the annotation (e.g. Claude attachment rows) the raw-record label
+    // wins, so existing behavior is preserved.
+    path_note.kind = OpKind::Note(editchain_core::op::NoteOp {
+        target_ids: vec![],
+        relationship: editchain_core::op::NoteRelationship::Explains,
+        content: Payload::Inline(b"attachment=file".to_vec()),
+    });
+    let projection =
+        HistoryProjection::from_ops(vec![op1.clone(), file.clone(), path_note.clone()]);
+    let nodes = projection.nodes();
+    assert_eq!(nodes.first().unwrap().summary(), "raw line 1");
+}

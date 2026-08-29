@@ -1,8 +1,8 @@
 # EditChain History — VS Code Extension
 
-A read-only unified engineering history explorer: EditChain operations (imported
-from Claude Code) overlaid with live Git history from the workspace's `.git`
-repositories.
+A read-only unified engineering history explorer: EditChain operations imported
+from Claude Code and Codex, overlaid with live Git history from the workspace's
+`.git` repositories.
 
 ## Prerequisites
 
@@ -37,7 +37,31 @@ auto-detect `<workspace>/target/debug/editchain-vscode-service`.
 Command palette (`Ctrl+Shift+P`) → **"EditChain: Open History Explorer"**.
 
 The viewer shows a unified, paged history list (EditChain ops + git commits),
-lexical search, and a click-to-inspect detail view.
+lexical search, and a click-to-inspect detail view. Search carries the active
+view semantics (messages-only → an inclusive kind filter and a `Message`/
+`Command` search-kind filter; hide-undated → time bound; the chain-filter
+pattern HIDES matching rows server-side and is enforced on search hits by
+REMOVING matches client-side, because the search protocol cannot carry a
+summary regex). Git search hits carry their real identity (`git_oid` lowercase
+hex, exact decimal `repository`, `kind: "git"`, `is_submodule`), so clicking a
+git result navigates by `ResolveObject` — never by the synthetic index-only
+`op_id` — and submodule-aware search filtering applies to real scored hits.
+Rapid consecutive searches are latest-query-wins. Panel state (scroll row,
+hide-undated, messages-only, submodules, chain filter) is restored across
+sessions.
+
+All viewer-facing identifiers round-trip as exact JSON strings: op ids are
+`node:boot:seq`, git OIDs are lowercase hex, and repository/session/actor ids
+are exact decimal `u64` strings — never JSON numbers, so values above 2^53 are
+not rounded by JavaScript. The service parses and validates these strings and
+returns an `Error` envelope for invalid ids. Search responses use a flat
+`SearchHit` DTO (`op_id`, `chunk_id`, `session_id`, `actor_id`, plus git
+`git_oid`/`repository` as strings) with timestamps/counts kept numeric. The
+read-only JSON editor's `ResolveObject` Ok payload is a typed `ResolvedObject`
+DTO under the same rule: `repository` and `changed_paths` are exact decimal
+strings, `oid`/`tree`/`parents` are lowercase hex strings, and
+`imported_record` is a `node:boot:seq` string when present — never raw u64
+numbers or byte-array ID structures.
 
 ## Configuration
 
@@ -46,12 +70,12 @@ lexical search, and a click-to-inspect detail view.
 | `editchain-history.servicePath` | `""` | Path to the Rust service binary. Empty = auto-detect from workspace `target/debug`. |
 | `editchain-history.chainDir` | `.editchain` | Path to the EditChain directory relative to the workspace root. |
 
-## Harness testing (text-only layout debugging)
+## Harness testing (text-first layout debugging)
 
 The webview renderer (`media/main.js`) can be driven headlessly in Chromium so a
 text-only agent can inspect the rendered layout without opening VS Code. The
-harness loads the **same** renderer + stylesheet and reports geometry as text —
-no screenshots.
+harness loads the **same** renderer + stylesheet and reports geometry as text
+first; settled screenshots are also supported via `--shot` (see below).
 
 ### Fixture mode (deterministic scenarios)
 
@@ -59,11 +83,55 @@ no screenshots.
 npm run ui:dump    -- --scenario merge --viewport 1440x900   # full layout dump
 npm run ui:inspect -- --scenario merge --selector ".row"     # one element's geometry
 npm run ui:check   -- --scenario merge                       # textual checks only
+npm run ui:check   -- --scenario merge --shot shot.png       # ...plus a settled screenshot
 ```
 
-Scenarios: `empty`, `linear`, `merge`, `mixed`, `filtered`, `error`, `large`.
+Scenarios: `empty`, `linear`, `merge`, `mixed`, `filtered`, `undated`, `error`,
+`warned`, `large`, `longsummary`, `combined` (expansion), `fork` (lanes), and
+`highLanes` (200 concurrent lanes — proves no 128-lane clipping). `check` mode
+is **test-blocking**: it exits non-zero when any layout check fails or the page
+reports errors.
+
+Two scenario interactions are exercised automatically and block `check` mode:
+
+- `combined` — clicks the combined op and verifies ALL bundled sub-ops reveal
+  inline (not just the first one).
+- `linear` / `mixed` — drive the real chain-filter controls and assert the
+  filter DIRECTION matches the service: the pattern HIDES matching rows
+  (endpoints preserved), clearing restores the window, and "Show messages
+  only" is an INCLUSIVE kind constraint that keeps only message/command rows
+  (tool/git rows are excluded even when they are endpoints).
+- `--search "query"` — runs the renderer's real search path (input → Enter →
+  result list → click) and verifies the results render and navigate to the JSON
+  editor, e.g. `npm run ui:check -- --scenario mixed --search message`.
+- `--stale-race` — with `--scenario undated`, races a held (controlled-release)
+  GetWindow response against a filter reset and verifies the stale response is
+  rejected (view-generation correlation), so the table always reflects the
+  current filter state. The response is released explicitly — no sleep-based
+  timing.
+- `--search-race` — with `--scenario merge`, issues two rapid searches with the
+  first response held, and verifies the LATEST query wins (search-epoch
+  correlation): releasing the older query's late response must not replace the
+  newer query's results.
+- `--resize` — resizes the viewport and asserts the renderer RECOMPUTES graph
+  geometry (header, lane compression, SVG cell widths, rows) instead of just
+  stretching the DOM, with lane dots staying inside their cells.
+- `warned` — Open responses carrying `warnings`/`diagnostics` (e.g. missing
+  blob payloads) render a non-blocking banner above the table while rows still
+  load; `OPEN_WARNINGS_VISIBLE` asserts the warning is surfaced, never silently
+  discarded.
+
 Artifacts are written to `.ui-out/<scenario>/` (`summary.md`, `layout.txt`,
-`layout.json`, `svg.json`, `console.txt`, `metrics.json`, `aria.yml`).
+`layout.json`, `svg.json`, `console.txt`, `metrics.json`, `aria.yml`,
+`expansion.json`, `search.json`, `stale.json`, `search-race.json`,
+`resize.json`).
+
+`--shot PATH` captures a PNG only after the UI is settled (`whenIdle` resolves:
+no in-flight requests, no placeholder rows, fonts loaded), so screenshots are
+deterministic and never capture the loading state. The probe also asserts
+visible nonzero-width Content/Date/Author/Commit cells (`CELL_GEOMETRY`) and
+readable text contrast (`CONTRAST_READABLE`) at every viewport width, so the
+visual acceptance criteria are checked numerically in `check` mode.
 
 ### Real-data mode (live Rust service)
 
@@ -73,7 +141,9 @@ npm run ui:real -- --workspace /path/to/repo --chain-dir .editchain
 
 Spawns the actual `editchain-vscode-service`, opens the workspace, and renders
 the real chain. Writes a full DOM tree with computed styles to `.ui-out/real/`
-(`dom.json`, `dom.txt`, plus the same artifacts as fixture mode).
+(`dom.json`, `dom.txt`, plus the same artifacts as fixture mode). Add
+`--shot out.png` to capture a settled screenshot after `whenIdle` (same
+deterministic readiness gate as fixture mode).
 
 ### Real VS Code harness (WebdriverIO)
 
@@ -124,3 +194,9 @@ session, including the scroll-through-history test.
   EditChain storage.
 - Search is **lexical-only** by default (no embedding server required). Vector
   search can be added later.
+- `Open` is unbounded: building the chain + git graph can take minutes on a
+  large workspace. All other service calls carry a generous finite deadline
+  (120s, ≥ the measured near-minute first window on large chains); a timed-out
+  window/search shows a visible error and suspends background retries until the
+  user clicks **Retry** or re-runs the open command (which restarts a crashed
+  service and re-opens the chain).

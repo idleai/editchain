@@ -1,3 +1,71 @@
+<!-- BEGIN MAIN-AGENT ORCHESTRATION -->
+## Main-agent orchestration policy
+
+When multi-agent tools are available, the top-level agent should operate primarily as the
+coordinator, integrator, and final reviewer. Delegate every substantive exploration,
+implementation, debugging, testing, review, or documentation work item to a subagent by default.
+The main agent should normally perform only control-plane work:
+
+- understand the request well enough to decompose it;
+- define task boundaries, dependencies, constraints, and acceptance criteria;
+- assign one clear owner to each task and avoid concurrent edits to overlapping files;
+- monitor progress, answer subagent questions, and coordinate handoffs;
+- inspect and integrate completed work, resolve conflicts, and run final repository-level checks;
+- communicate status, risks, decisions, and the final result to the user.
+
+Use the project-configured default subagent profile. Omit explicit model or profile overrides unless
+the user requests a different route or the task has a concrete model-specific requirement.
+Do not request `max` reasoning effort for routine delegation. Omit the reasoning override so the
+project profile supplies its `high` default. Use a different effort only when the user requests it
+or the task has a specific, stated reason for matching another effort level.
+
+### Give subagents room to work
+
+- Give each subagent enough context to act autonomously: the objective, exact scope, relevant paths,
+  constraints, expected deliverables, and required verification.
+- Prefer end-to-end task ownership over fragmented command-by-command delegation. A subagent that
+  owns an implementation should normally inspect, edit, test, and report on that implementation.
+- Do not duplicate a subagent's assigned investigation or implementation while it is running.
+- Parallelize independent tasks, but serialize tasks that touch the same files or depend on the same
+  unresolved design decision.
+- Treat slow progress as normal. Use long, patient waits and status checks instead of interrupting
+  an agent merely because it has not responded quickly.
+- Never send "hurry up," "stop exploring," "return now," or equivalent instructions merely because
+  a few minutes have elapsed or one or more wait calls timed out. A wait timeout is not evidence that
+  the subagent is stuck.
+- Before nudging a running subagent, require objective evidence of a problem: an explicit error, a
+  request for help, repeated identical failed actions without new evidence, or a user-imposed
+  deadline. If the agent is still making progress, leave it alone.
+
+### Recovery and intervention
+
+When there is objective evidence that a subagent is struggling, preserve its ownership when
+practical and recover in this order. Do not enter this recovery sequence based on elapsed time alone:
+
+1. Send a focused follow-up with the missing evidence, corrected constraint, or narrower objective.
+2. Ask the same subagent to stop broad exploration and complete the smallest useful result.
+3. Assign a replacement or specialist subagent when the original agent is genuinely stuck or the
+   task needs an independent approach.
+4. Have the main agent take over implementation only when repeated recovery attempts fail, when an
+   integration issue spans multiple delegated tasks, or when immediate intervention is needed for
+   safety or correctness.
+
+The main agent may intervene sooner for destructive or externally visible actions, permission or
+credential boundaries, ambiguous user intent, shared-workspace conflicts, and final integration.
+It remains responsible for reviewing the actual diff and evidence; a subagent's success report is
+not by itself proof that the overall request is complete.
+
+### Child-agent behavior
+
+A spawned subagent should execute its assigned task directly and own it through verification. It
+should not delegate again by default, because recursive delegation obscures ownership and can create
+unbounded agent trees. A child may delegate only when its assignment explicitly calls for parallel
+work or when it first tells the parent why another agent is necessary. Stay within the assigned
+scope, preserve unrelated workspace changes, and return concrete findings, changed paths, tests, and
+remaining risks.
+
+<!-- END MAIN-AGENT ORCHESTRATION -->
+
 <!-- BEGIN QUALITY POLICY -->
 ## Lint policy
 

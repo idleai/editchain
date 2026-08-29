@@ -11,6 +11,11 @@
 body {
   font-family: var(--vscode-font-family);
   color: var(--vscode-foreground);
+  /* Explicitly match the editor background: the standalone harness does not
+     get VS Code's injected webview background, and relying on it would render
+     rows on a white page with light text (unreadable captures). VS Code's own
+     background is identical, so this is a no-op inside the workbench. */
+  background-color: var(--vscode-editor-background);
   /* Reset the default browser body margin (8px) which would otherwise add a
      gap at the bottom of the viewport. */
   margin: 0;
@@ -28,6 +33,7 @@ body {
 #controls {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 8px;
   /* Horizontal padding lives on the controls container (searchbar + toggles),
@@ -37,7 +43,10 @@ body {
 /* Search input styled like a native VS Code input: dark background, subtle
    border, and a focus ring that matches the theme. */
 #search {
-  flex: 1;
+  flex: 1 1 auto;
+  /* Keep the input usable on narrow panels; the wrap on #controls moves the
+     toggles to a second line instead of clipping them. */
+  min-width: 140px;
   box-sizing: border-box;
   padding: 4px 8px;
   color: var(--vscode-input-foreground);
@@ -65,7 +74,9 @@ body {
   border: 1px solid var(--vscode-input-border, transparent);
   border-radius: 2px;
   outline: none;
-  width: 180px;
+  /* Allow the filter to shrink on narrow panels (wraps when it can't). */
+  flex: 0 1 180px;
+  min-width: 100px;
 }
 #filter::placeholder {
   color: var(--vscode-input-placeholderForeground);
@@ -76,7 +87,7 @@ body {
 #filter:focus {
   border-color: var(--vscode-focusBorder);
 }
-.toggle { display: flex; align-items: center; gap: 4px; color: var(--vscode-descriptionForeground); font-size: 0.9em; white-space: nowrap; }
+.toggle { display: flex; align-items: center; gap: 4px; color: var(--vscode-descriptionForeground); font-size: 0.9em; white-space: nowrap; flex-shrink: 0; }
 #layout { display: flex; gap: 12px; flex: 1; min-height: 0; width: 100%; }
 #rows { flex: 3; overflow-y: auto; position: relative; min-width: 0; }
 /* Detail/inspector pane is hidden until a node is selected, so it doesn't
@@ -89,7 +100,7 @@ body {
    absolutely positioned inside it at the slice's top offset. */
 .scroll-spacer { position: relative; width: 100%; }
 
-/* Table wrapper holds the header, rows, and the absolutely-positioned SVG.
+/* Table wrapper holds the sticky header and the per-row SVG graph cells.
    Positioned absolutely within the scroll-spacer at the rendered slice's top. */
 .table-wrap { position: absolute; left: 0; top: 0; width: 100%; }
 
@@ -110,7 +121,15 @@ body {
   font-weight: 700;
   color: var(--vscode-descriptionForeground);
   padding: 6px 8px;
+  /* Keep each header cell inside its grid track: content-box padding would
+     overflow the track to the right (spilling past the viewport edge and
+     misaligning header/row columns). */
+  box-sizing: border-box;
   white-space: nowrap;
+  /* A squeezed track must ellipsize its label instead of letting the text
+     collide with the next column (e.g. "Content" bleeding into "Date"). */
+  overflow: hidden;
+  text-overflow: ellipsis;
   text-align: left;
 }
 .tbl-header .th.date, .tbl-header .th.author, .tbl-header .th.commit {
@@ -163,7 +182,7 @@ body {
 }
 
 /* Each history row is a grid with the same column template as the header.
-   Height is fixed to ROW_H (34px) in main.js so the graph overlay's dot/edge
+   Height is fixed to ROW_H (34px) in main.js so the graph cells' dot/edge
    y-positions and the scroll-spacer math stay consistent with real row height.
    Every row carries its own raw separator (a bottom border) so rows read as
    distinct lines even within a session group; box-sizing must stay border-box
@@ -185,13 +204,22 @@ body {
   cursor: pointer;
 }
 .row:hover { background-color: var(--vscode-list-hoverBackground); }
-/* Row-level dimming by node kind: tool calls dimmed most, other non-text nodes
-   dimmed moderately, text nodes (messages/commands) stay full. Opacity is
+/* Grid cells must not overflow their tracks (same rationale as the header). */
+.row .graph-cell,
+.row .text-cell,
+.row .date-cell,
+.row .author-cell,
+.row .commit-cell {
+  box-sizing: border-box;
+  min-width: 0;
+}
+/* Row-level dimming by node kind: secondary rows are softened while preserving
+   readable contrast, and text nodes (messages/commands) stay full. Opacity is
    applied to the TEXT cells only — NOT the graph cell — because a parent's
-   opacity is multiplicative and cannot be overridden by childrencars. The SVG
+   opacity is multiplicative and cannot be overridden by children. The SVG
    lanes/dots must always render at full (100%) opacity regardless of row kind. */
-.row-tool .text-cell, .row-tool .date-cell, .row-tool .author-cell, .row-tool .commit-cell { opacity: 0.3; }
-.row-dim .text-cell, .row-dim .date-cell, .row-dim .author-cell, .row-dim .commit-cell { opacity: 0.7; }
+.row-tool .text-cell, .row-tool .date-cell, .row-tool .author-cell, .row-tool .commit-cell { opacity: 0.85; }
+.row-dim .text-cell, .row-dim .date-cell, .row-dim .author-cell, .row-dim .commit-cell { opacity: 0.85; }
 .graph-cell { line-height: 0; overflow: hidden; }
 .text-cell { padding-left: 8px; overflow: hidden; text-align: left; }
 .date-cell, .author-cell, .commit-cell {
@@ -200,7 +228,11 @@ body {
   font-size: 0.85em;
   text-align: left;
 }
-.date-cell, .author-cell, .commit-cell { white-space: nowrap; }
+.date-cell, .author-cell, .commit-cell {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .row .summary {
   font-weight: 400;
   white-space: nowrap;
@@ -226,6 +258,40 @@ body {
   cursor: pointer;
 }
 
+/* Compact semantic badges for structural parent relations (subagent branch
+   start, completion return, fork). Inline so they never affect row height —
+   virtual scroll keeps every row exactly ROW_H; the content cell clips
+   overflow, so badges sit at the start of the summary and stay visible even
+   when the summary text is long. Badges are always rendered at full opacity
+   themselves; rows carrying them additionally lift their text cells out of
+   the tool/dim dimming (see .row-has-badges below) so a badge on a tool-kind
+   branch/return row stays fully legible. */
+.rel-badge {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 5px;
+  border: 1px solid var(--vscode-descriptionForeground);
+  border-radius: 8px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.72em;
+  line-height: 16px;
+  vertical-align: middle;
+  white-space: nowrap;
+  opacity: 1;
+}
+
+/* Rows carrying structural relation badges are graph-topology-critical: lift
+   their text cells out of the `.row-tool` / `.row-dim` opacity dimming so the
+   badge (and its label text) stay readable at full strength. Declared after
+   the dim rules so the equal-specificity override wins. Only opacity changes —
+   row height and layout are untouched. */
+.row-has-badges .text-cell,
+.row-has-badges .date-cell,
+.row-has-badges .author-cell,
+.row-has-badges .commit-cell {
+  opacity: 1;
+}
+
 /* Expanded sub-op rows render indented under their parent with a small Codicon.
    Dimmed slightly so they read as secondary to the parent row. The indent is
    applied to the text cell only, so the graph cell (continuation line) stays
@@ -237,7 +303,7 @@ body {
 .row-subop .date-cell,
 .row-subop .author-cell,
 .row-subop .commit-cell {
-  opacity: 0.7;
+  opacity: 0.85;
 }
 /* Small semantic icon for each expanded sub-op (VS Code Codicon glyph). */
 .subop-icon {
@@ -251,7 +317,8 @@ body {
 }
 
 /* Per-row graph cells (one small SVG per row). Each cell draws the node's dot,
-   vertical line segments for active lanes, and horizontal merge connectors. */
+   vertical line segments for active lanes, and rounded cross-lane transition
+   paths. */
 .graph-cell svg.graphCell {
   display: block;
   pointer-events: none;
@@ -271,6 +338,16 @@ body {
   /* Stroke colour is set inline per-lane (each chain's own colour); this rule
      only sets the width. */
   stroke-width: 2;
+}
+.graph-cell path.graphTransition {
+  /* Stroke colour is set inline per half (source-lane colour through the row
+     midpoint, destination-lane colour after). Caps are explicitly butt so
+     the two halves tile exactly at their shared midpoint seam — no gap, no
+     overlap. */
+  stroke-width: 2;
+  stroke-linecap: butt;
+  stroke-linejoin: round;
+  fill: none;
 }
 
 /* Draggable handle on the right edge of each resizable column. Its horizontal
@@ -294,4 +371,88 @@ body.col-resizing {
 }
 body.col-resizing .col-resize-handle {
   background: var(--vscode-focusBorder);
+}
+
+/* Full-pane status messages (loading, open errors). */
+.view-message {
+  padding: 14px 16px;
+  font-size: 1.05em;
+  color: var(--vscode-descriptionForeground);
+}
+.view-message.error {
+  color: #f48771;
+}
+
+/* Explicit Retry action on terminal request errors (dead/hung service). The
+   loader is suspended until the user clicks this — recovery is never
+   automatic. */
+.view-message .retry-btn {
+  display: inline-block;
+  margin: 10px 0 0;
+  padding: 4px 14px;
+  font: inherit;
+  color: var(--vscode-button-foreground, #ffffff);
+  background: var(--vscode-button-background, #0e639c);
+  border: 1px solid transparent;
+  border-radius: 2px;
+  cursor: pointer;
+}
+.view-message .retry-btn:hover {
+  background: var(--vscode-button-hoverBackground, #1177bb);
+}
+.view-message .request-error-text {
+  overflow-wrap: anywhere;
+}
+
+/* Compact banner shown above search results so the flat result list is
+   distinguishable from the full history window. */
+.search-banner {
+  box-sizing: border-box;
+  padding: 6px 12px;
+  font-size: 0.9em;
+  color: var(--vscode-descriptionForeground);
+  background: var(--vscode-editor-background);
+  border-bottom: 1px solid var(--vscode-panel-border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Non-blocking chain-data warning banner (Open `warnings`/`diagnostics`).
+   Rendered above the table while rows still load below it. */
+.open-warning {
+  box-sizing: border-box;
+  padding: 6px 12px;
+  font-size: 0.9em;
+  line-height: 1.35;
+  color: var(--vscode-editorWarning-foreground, #d7ba7d);
+  background: var(--vscode-editorWarning-background, color-mix(in srgb, #d7ba7d 12%, var(--vscode-editor-background)));
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+.open-warning-line {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* Narrow panels: let the fixed date/author/commit tracks shrink (via minmax)
+   so the grid never clips, while the graph column keeps its lane-based width
+   so the graph stays visible. The inline `--*` vars from main.js still size
+   the tracks at their defaults when space allows. */
+@media (max-width: 720px) {
+  .tbl-header,
+  .row {
+    grid-template-columns:
+      var(--graph-w, auto) minmax(0, 1fr)
+      minmax(0, var(--date-w, 140px))
+      minmax(0, var(--author-w, 100px))
+      minmax(0, var(--commit-w, 100px));
+  }
+  .tbl-header .th.date,
+  .tbl-header .th.author,
+  .tbl-header .th.commit {
+    min-width: 0;
+  }
+  #layout {
+    gap: 8px;
+  }
 }

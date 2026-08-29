@@ -54,14 +54,30 @@ impl SegmentStore {
     /// # Errors
     ///
     /// Returns an IO error if the segment file cannot be opened or written.
+    ///
+    /// # Durability
+    ///
+    /// The appended bytes are flushed to stable storage (`sync_all`) before
+    /// this returns. When the append creates a brand-new segment file, the
+    /// chain directory is synced as well, so the new segment's directory
+    /// entry is durable before this returns — callers may then safely advance
+    /// durable cursors (the import command commits its staged cursors here).
     pub fn append_page(&mut self, page: &Page) -> io::Result<()> {
         let path = self.current_segment_path();
         let encoded = encode_page(page);
+        // A new segment file needs its directory entry persisted, not just its
+        // bytes: a crash could otherwise lose the entry while a cursor commit
+        // that follows this append has already been made durable.
+        let newly_created = !path.exists();
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?;
         file.write_all(&encoded)?;
+        file.sync_all()?;
+        if newly_created {
+            sync_parent_dir(&self.chain_dir)?;
+        }
         Ok(())
     }
 
@@ -177,4 +193,121 @@ fn find_next_segment(dir: &Path) -> io::Result<u32> {
     }
 
     Ok(max_seq)
+}
+
+/// Fsync a directory so a file created or renamed inside it survives a crash.
+///
+/// On Unix the directory is opened read-only and fsynced. On Windows opening a
+/// directory requires `FILE_FLAG_BACKUP_SEMANTICS`. On other platforms
+/// directory fsync is not available portably and the call degrades to a no-op
+/// (best-effort durability).
+///
+/// # Errors
+///
+/// Returns an IO error if the directory cannot be opened or synced.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+/// Windows variant of [`sync_parent_dir`].
+#[cfg(windows)]
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(0x0200_0000)
+        .open(path)?
+        .sync_all()
+}
+
+/// Fallback for platforms without directory fsync: best-effort no-op.
+#[cfg(not(any(unix, windows)))]
+fn sync_parent_dir(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_page_creates_and_persists_a_new_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SegmentStore::open(dir.path().join("chain")).unwrap();
+
+        let mut page = Page::new(0);
+        page.add_record(0, vec![1, 2, 3]);
+        store.append_page(&page).unwrap();
+
+        // The new segment file exists on disk with a durable directory entry.
+        let seg_path = dir.path().join("chain/000000.eclog");
+        assert!(seg_path.is_file());
+        let bytes = fs::read(&seg_path).unwrap();
+        let decoded = decode_page(&bytes).unwrap();
+        assert_eq!(decoded.records.len(), 1);
+        assert_eq!(decoded.records.first().unwrap().data, vec![1, 2, 3]);
+
+        let stored_pages = store.read_all().unwrap();
+        assert_eq!(stored_pages.len(), 1);
+        assert_eq!(
+            stored_pages.first().unwrap().records.first().unwrap().data,
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn rotated_segments_read_back_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SegmentStore::open(dir.path().join("chain")).unwrap();
+
+        let mut first_page = Page::new(0);
+        first_page.add_record(0, vec![9]);
+        store.append_page(&first_page).unwrap();
+        store.rotate().unwrap();
+
+        let mut second_page = Page::new(0);
+        second_page.add_record(0, vec![8, 8]);
+        store.append_page(&second_page).unwrap();
+
+        // Two segments, both created through the new-segment sync path.
+        assert!(dir.path().join("chain/000000.eclog").is_file());
+        assert!(dir.path().join("chain/000001.eclog").is_file());
+
+        let stored_pages = store.read_all().unwrap();
+        assert_eq!(stored_pages.len(), 2);
+        assert_eq!(
+            stored_pages.first().unwrap().records.first().unwrap().data,
+            vec![9]
+        );
+        assert_eq!(
+            stored_pages.get(1).unwrap().records.first().unwrap().data,
+            vec![8, 8]
+        );
+
+        // A fresh store over the same directory restores both segments in order.
+        let reopened = SegmentStore::open(dir.path().join("chain")).unwrap();
+        let restored_pages = reopened.read_all().unwrap();
+        assert_eq!(restored_pages.len(), 2);
+        assert_eq!(
+            restored_pages
+                .first()
+                .unwrap()
+                .records
+                .first()
+                .unwrap()
+                .data,
+            vec![9]
+        );
+        assert_eq!(
+            restored_pages.get(1).unwrap().records.first().unwrap().data,
+            vec![8, 8]
+        );
+    }
+
+    #[test]
+    fn sync_parent_dir_accepts_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        sync_parent_dir(dir.path()).unwrap();
+    }
 }

@@ -59,15 +59,25 @@ impl Matcher {
 /// - [`Self::hide_undated`] hides nodes whose clock is unknown (`timestamp_ms() == 0`);
 /// - [`Self::summary_pattern`] hides nodes whose display summary matches;
 /// - [`Self::kind_pattern`] hides nodes whose kind tag matches.
+/// - [`Self::include_kind_pattern`] is an INCLUSIVE constraint: when non-empty,
+///   only nodes whose kind tag matches are kept — except structural relationship
+///   anchors/targets required to preserve branch and reconnect geometry. This
+///   lets "Show messages only" stay server-side without severing the execution
+///   topology.
 ///
 /// Chain endpoints (nodes with no parent or no child in the full graph) are
-/// always preserved regardless of predicate matches.
+/// always preserved regardless of *hide* predicate matches. `hide_undated` and
+/// `include_kind_pattern` are not ordinarily endpoint-aware; structural
+/// relationship anchors/targets are the topology-preserving exception.
 #[derive(Debug)]
 pub struct ChainFilter {
     /// Regex/literal pattern matched against each node's display summary.
     pub summary_pattern: String,
     /// Regex/literal pattern matched against each node's kind tag.
     pub kind_pattern: String,
+    /// Inclusive kind constraint: when non-empty, only nodes whose kind tag
+    /// matches are kept. Empty means no inclusion constraint.
+    pub include_kind_pattern: String,
     /// Hide nodes with no real timestamp (`timestamp_ms() == 0`).
     pub hide_undated: bool,
     /// Reconnect causal edges across hidden intermediate nodes so chains stay
@@ -75,11 +85,12 @@ pub struct ChainFilter {
     pub splice: bool,
     summary_matcher: Matcher,
     kind_matcher: Matcher,
+    include_kind_matcher: Matcher,
 }
 
 impl Default for ChainFilter {
     fn default() -> Self {
-        Self::new(String::new(), String::new(), true, true)
+        Self::new(String::new(), String::new(), String::new(), true, true)
     }
 }
 
@@ -93,14 +104,17 @@ impl ChainFilter {
     pub fn new(
         summary_pattern: String,
         kind_pattern: String,
+        include_kind_pattern: String,
         hide_undated: bool,
         splice: bool,
     ) -> Self {
         Self {
             summary_matcher: Matcher::new(&summary_pattern),
             kind_matcher: Matcher::new(&kind_pattern),
+            include_kind_matcher: Matcher::new(&include_kind_pattern),
             summary_pattern,
             kind_pattern,
+            include_kind_pattern,
             hide_undated,
             splice,
         }
@@ -109,15 +123,15 @@ impl ChainFilter {
     /// Whether this filter would hide nothing at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        !self.hide_undated && self.summary_pattern.is_empty() && self.kind_pattern.is_empty()
+        !self.hide_undated
+            && self.summary_pattern.is_empty()
+            && self.kind_pattern.is_empty()
+            && self.include_kind_pattern.is_empty()
     }
 
-    /// Whether a single node matches any active predicate.
+    /// Whether a single node matches any active pattern-based HIDE predicate.
     #[must_use]
-    fn matches(&self, node: &HistoryNode) -> bool {
-        if self.hide_undated && node.timestamp_ms() == 0 {
-            return true;
-        }
+    fn matches_hide_pattern(&self, node: &HistoryNode) -> bool {
         if self.summary_matcher.matches(&node.summary()) {
             return true;
         }
@@ -133,6 +147,7 @@ impl ChainFilter {
         ChainFilterKey {
             summary_pattern: self.summary_pattern.clone(),
             kind_pattern: self.kind_pattern.clone(),
+            include_kind_pattern: self.include_kind_pattern.clone(),
             hide_undated: self.hide_undated,
             splice: self.splice,
         }
@@ -146,6 +161,8 @@ pub struct ChainFilterKey {
     pub summary_pattern: String,
     /// Kind pattern string.
     pub kind_pattern: String,
+    /// Inclusive kind pattern string (empty = no inclusion constraint).
+    pub include_kind_pattern: String,
     /// Hide undated flag.
     pub hide_undated: bool,
     /// Splice flag.
@@ -158,9 +175,14 @@ pub struct ChainFilterKey {
 /// every kept child points at its nearest kept ancestor through any run of
 /// hidden intermediate nodes.
 ///
-/// `hide_undated` hides every undated node unconditionally (including leaves).
-/// Pattern-based truncation preserves endpoints (no parent / no child in the
-/// full graph) so a filtered chain keeps its anchors.
+/// `hide_undated` hides every ordinary undated node (including leaves).
+/// `include_kind_pattern` keeps only ordinary matching kinds (including leaves).
+/// Pattern-based hide truncation preserves endpoints (no parent / no child in
+/// the full graph) so a filtered chain keeps its anchors. Structural
+/// relationship anchor and target rows (the rows that carry or point at a
+/// `ForkOf` / `SubagentOf` / `ReconnectsTo` note) are preserved from every
+/// hide predicate so branch/reconnect geometry stays visible even when their
+/// kind (e.g. a tool-kind spawn marker) would be excluded by "messages only".
 #[must_use]
 #[expect(
     clippy::implicit_hasher,
@@ -170,10 +192,41 @@ pub fn apply(
     nodes: &[HistoryNode],
     links: &std::collections::BTreeMap<OpId, Vec<editchain_core::GitLink>>,
     note_map: &HashMap<OpId, Vec<Op>>,
+    representative: &HashMap<OpId, OpId>,
     filter: &ChainFilter,
 ) -> Vec<HistoryNode> {
     if filter.is_empty() || nodes.is_empty() {
         return nodes.to_vec();
+    }
+    // The visible rows of THIS filtered list: a spliced/kept parent is only kept
+    // when it resolves to one of them (directly or via a folded representative).
+    let present = crate::row_node_keys(nodes);
+
+    // Structural relationship anchor/target rows are graph-topology-critical:
+    // hiding them (e.g. "messages only" excluding a tool-kind spawn marker, or
+    // a pattern that matches a branch row) would sever the virtual
+    // fork/subagent/reconnect edges. Like chain endpoints, they are preserved
+    // from every hide predicate below — a filtered view keeps branch/reconnect
+    // geometry visible. Anchors are the canonical (visible) note-map keys;
+    // targets are each note's raw ids lifted to their visible rows.
+    let mut structural_keys = HashSet::with_capacity(note_map.len());
+    for (anchor, notes) in note_map {
+        if let Some(key) =
+            crate::canonical_parent_key(&anchor.to_string(), representative, &present)
+        {
+            let _: bool = structural_keys.insert(key);
+        }
+        for note in notes {
+            if let editchain_core::OpKind::Note(n) = &note.kind {
+                for target in &n.target_ids {
+                    if let Some(key) =
+                        crate::canonical_parent_key(&target.to_string(), representative, &present)
+                    {
+                        let _: bool = structural_keys.insert(key);
+                    }
+                }
+            }
+        }
     }
 
     // Original parent keys per key (op ids + git oid hex).
@@ -182,7 +235,8 @@ pub fn apply(
     let mut children_of_key = HashMap::with_capacity(nodes.len());
     for n in nodes {
         let key = n.node_key();
-        let ps = n.parent_keys(links, note_map);
+        let ps =
+            crate::canonicalize_parents(n.parent_keys(links, note_map), representative, &present);
         drop(parents_of_key.insert(key.clone(), ps.clone()));
         for p in ps {
             children_of_key
@@ -202,13 +256,28 @@ pub fn apply(
     // with no meaningful chain position, so a lone undated leaf is junk and must
     // not survive just because it happens to be an endpoint.
     //
-    // Pattern-based truncation (summary/kind) instead preserves endpoints (nodes
-    // with no parent or no child in the full graph) so a filtered chain keeps its
-    // anchors — the oldest root and newest leaf stay visible even when they match.
+    // Pattern-based hide truncation (summary/kind) instead preserves endpoints
+    // (nodes with no parent or no child in the full graph) so a filtered chain
+    // keeps its anchors — the oldest root and newest leaf stay visible even
+    // when they match. The inclusive-kind constraint is NOT ordinarily
+    // endpoint-aware: "messages only" excludes non-message kinds, including
+    // lone leaves that would otherwise survive as anchors. Structural relation
+    // anchors/targets are the explicit exception handled below.
     let mut hidden = HashSet::with_capacity(nodes.len());
     for n in nodes {
         let key = n.node_key();
+        // Structural relation anchors/targets are never hidden: their rows
+        // carry the virtual edges that keep branch/reconnect geometry visible.
+        if structural_keys.contains(&key) {
+            continue;
+        }
         if filter.hide_undated && n.timestamp_ms() == 0 {
+            let _: bool = hidden.insert(key);
+            continue;
+        }
+        if !filter.include_kind_pattern.is_empty()
+            && !filter.include_kind_matcher.matches(&n.kind())
+        {
             let _: bool = hidden.insert(key);
             continue;
         }
@@ -216,7 +285,7 @@ pub fn apply(
             let has_parent = !parents_of_key.get(&key).is_none_or(Vec::is_empty);
             let has_child = !children_of_key.get(&key).is_none_or(Vec::is_empty);
             let is_endpoint = !has_parent || !has_child;
-            if !is_endpoint && filter.matches(n) {
+            if !is_endpoint && filter.matches_hide_pattern(n) {
                 let _: bool = hidden.insert(key);
             }
         }
@@ -235,7 +304,11 @@ pub fn apply(
         } else {
             n.parent_keys(links, note_map)
         };
-        out.set_parent_keys(&spliced);
+        out.set_parent_keys(&crate::canonicalize_parents(
+            spliced,
+            representative,
+            &present,
+        ));
         result.push(out);
     }
     result

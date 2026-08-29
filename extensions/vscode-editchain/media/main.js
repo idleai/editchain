@@ -1,10 +1,12 @@
 // Webview renderer for the EditChain History explorer.
-// Renders a git-graph-style visualization of unified history using a single
-// full-height SVG overlay (continuous branch lines) over a real table with
-// columns: Graph | Content | Date | Author | Commit/ID.
+// Renders a git-graph-style visualization of unified history as one small SVG
+// per row (the node dot, vertical lane segments, and rounded cross-lane
+// transition paths) over a real table with columns: Graph | Content | Date |
+// Author | Commit/ID.
 //
-// The graph geometry (lanes + edge point paths) is computed server-side by the
-// Rust service (`GetLayout`) and shipped over stdio; this file only draws it.
+// The per-row graph geometry (lane, above, below, transitions) is computed
+// server-side by the Rust service and shipped over stdio with each `GetWindow`
+// response; this file only draws it.
 //
 // The webview is a THIN VIEWPORT over a server-owned graph. It renders only the
 // visible slice of rows plus a buffer on each side, and requests windowed
@@ -13,12 +15,6 @@
 // JS heap, and per-scroll serialization bounded regardless of chain size (the
 // design target is ~1M nodes).
 //
-// Edge points from `GetLayout` are ABSOLUTE canonical row indices (not relative
-// to the requested offset), so they map directly onto absolute row positions.
-//
-// Alignment note: block separators shift rows down from a uniform grid, so we
-// measure each rendered row's real `offsetTop` after rendering and use those
-// pixel positions for both node dots and edge paths.
 
 // @ts-ignore — vscode provides this global in webviews.
 const vscode = acquireVsCodeApi();
@@ -32,6 +28,17 @@ const hideUndatedEl = document.getElementById('hideUndated');
 const hideSubmodulesEl = document.getElementById('hideSubmodules');
 const hideSystemEl = document.getElementById('hideSystem');
 
+// Show an explicit loading state until the extension host finishes `Open` and
+// the first window arrives (or surfaces the open error).
+showViewMessage('Loading history…', false);
+
+// Harness data-readiness signal. Set to `true` only once the webview has
+// processed a terminal event correlated with actual content: an `open` error,
+// a GetWindow response, or search results. The layout probe waits on this plus
+// the absence of placeholder rows, so "idle" never means a DOM full of
+// placeholders waiting on an in-flight fetch.
+window.__editchainDataReady = false;
+
 // Rows fetched per request. Larger than the visible viewport so each fetch
 // buffers well ahead of the scroll position.
 const PAGE = 500;
@@ -39,8 +46,7 @@ const PAGE = 500;
 // DOM stays bounded at roughly `viewport + 2*BUFFER` rows regardless of total.
 const BUFFER = 400;
 let total = 0;             // global row count (server-reported)
-let pendingWindow = false; // a GetWindow request is in flight
-let pendingWindowOffset = 0; // absolute offset of the in-flight GetWindow
+let pendingWindowReqId = -1; // request id of the in-flight GetWindow, or -1
 
 // Sparse window cache: absolute row index -> HistoryRow. Only windows near the
 // scroll position are retained; far-offscreen windows are evicted.
@@ -49,6 +55,48 @@ let cache = new Map();
 // status bar shows how much history the user has actually loaded — not just the
 // bounded viewport cache size.
 let totalFetched = 0;
+
+// Search-result view mode. While active, #rows renders a flat list of search
+// hits (from the service's lexical index) instead of the virtual-scrolled
+// history window; fetch/scroll/progressive-load machinery is suspended.
+let searchMode = false;
+let searchQuery = '';
+
+// Latest-query-wins correlation for search. A search response is rendered ONLY
+// if it carries the CURRENT epoch. Two rapid searches share the same view
+// generation (rendering a search bumps viewGen to reject stale history
+// windows), so generation alone cannot tell which response belongs to the
+// latest query: without a per-query epoch, the first response to arrive bumps
+// the generation and the second query's response is dropped as "stale" — the
+// UI then shows query B's input with query A's results (or, if B lands first,
+// A's late response overwrites B). The epoch makes the LATEST issued query win
+// regardless of response order.
+let searchEpoch = 0;          // monotonically increasing issue counter
+let currentSearchEpoch = -1;  // epoch of the latest issued search; -1 = none
+
+// --- Request correlation ----------------------------------------------------
+//
+// Every service request carries a client-generated id, and the extension host
+// echoes that id back with the response. Responses are correlated by id (not by
+// response shape), and tagged with the VIEW GENERATION they were issued under.
+// When the view changes (open, filter reset, search, clear), the generation
+// increments; any in-flight response from an older generation is dropped so it
+// can never poison cache/total/filter state (e.g. a GetWindow issued before a
+// resetAndRefetch landing after it, or a search overlapping an in-flight
+// window).
+let nextReqId = 1;
+const inFlight = new Map();
+let viewGen = 0;
+// Whether the per-filter expansion snapshot (sub_op_counts) has been received
+// for the CURRENT view generation. The service ships it only with the offset-0
+// window, so a deep jump must first fetch offset 0 to establish visible/absolute
+// index mapping before paging the deep window.
+let snapshotEstablished = false;
+
+// Non-blocking chain-data warnings surfaced from the Open response (e.g. blob
+// payloads missing from the durable store). Shown as a banner above the table
+// while rows still render; never silently discarded.
+let openWarnings = [];
 
 let lastRenderKey = '';    // cache key of the last rendered slice (avoid redundant rebuilds)
 // Global maximum graph lane across ALL rows, reported by the server with each
@@ -220,14 +268,23 @@ function saveState() {
 function restoreState() {
   const s = vscode.getState();
   let topRow = -1;
-  if (s && (typeof s.topRow === 'number' || s.filterPattern || s.hideUndated)) {
+  if (s && (typeof s.topRow === 'number' || s.filterPattern || s.hideUndated ||
+      s.showMessagesOnly || typeof s.hideSubmodules === 'boolean')) {
     // Do NOT restore `total` here — the chain may have been reimported since the
     // last session, so the persisted node count can be stale. The server's
     // `total` is authoritative and is applied by the open handler before this
     // runs. Only the top row index and filter state survive a session.
     if (typeof s.topRow === 'number' && s.topRow > 0) topRow = s.topRow;
+    if (hideSubmodulesEl && typeof s.hideSubmodules === 'boolean') {
+      // saveState stores the "hide submodules" boolean (inverted from the
+      // "Show git submodules" checkbox); restore the checkbox to match.
+      hideSubmodulesEl.checked = !s.hideSubmodules;
+    }
     if (hideUndatedEl && typeof s.hideUndated === 'boolean') {
       hideUndatedEl.checked = s.hideUndated;
+    }
+    if (hideSystemEl && typeof s.showMessagesOnly === 'boolean') {
+      hideSystemEl.checked = s.showMessagesOnly;
     }
     if (filterEl && typeof s.filterPattern === 'string') {
       filterEl.value = s.filterPattern;
@@ -250,10 +307,105 @@ const COLORS = ['#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4'
 
 const LANE_W = 18;
 const DOT_R = 4;
+// Corner radius (px) for rounded cross-lane transition elbows. Clamped by the
+// lane distance and row geometry at draw time (see buildTransitionPaths).
+const TRANSITION_R = 6;
+// Lane-centre distance (px) below which a transition's rounded corner would be
+// sub-pixel: at extreme compressed spacing the renderer falls back to a
+// straight orthogonal jog instead of a degenerate curve.
+const TRANSITION_MIN_DX = 1;
 
-/** Send a request body to the extension host. */
+/** Send a request body to the extension host, correlating the response.
+ *
+ * Returns the request id. The extension host echoes `{ id, body }` back; the
+ * message handler matches responses to requests by id and drops responses whose
+ * view generation no longer matches.
+ */
 function send(body) {
-  vscode.postMessage({ body });
+  const id = nextReqId++;
+  inFlight.set(id, { body, gen: viewGen });
+  vscode.postMessage({ id, body });
+  return id;
+}
+
+/** Send a request tagged with the current search epoch (search requests only). */
+function sendSearch(body, epoch) {
+  const id = nextReqId++;
+  inFlight.set(id, { body, gen: viewGen, searchEpoch: epoch });
+  vscode.postMessage({ id, body });
+  return id;
+}
+
+/** Render a full-pane message (loading, open error) into #rows. */
+function showViewMessage(text, isError) {
+  clearDetail();
+  rowsEl.innerHTML = '<div class="view-message' + (isError ? ' error' : '') + '">' +
+    esc(text) + '</div>';
+}
+
+/** Show a full-pane, user-visible request error with an explicit Retry action.
+ *
+ * Terminal GetWindow/Search failures (dead service, timed-out request) used to
+ * land only in the detail pane — invisible when no inspector was open — while
+ * the progressive loader retried the dead service forever. This replaces the
+ * table with the error, SUSPENDS the progressive loader, and requires an
+ * explicit recovery: the Retry button (or re-running the open command, which
+ * re-establishes the service) re-runs the failed operation.
+ */
+function showRequestError(text, retryAction) {
+  stopProgressiveLoader();
+  clearDetail();
+  rowsEl.innerHTML =
+    '<div class="view-message error">' +
+      '<div class="request-error-text">' + esc(text) + '</div>' +
+      '<button class="retry-btn" type="button">Retry</button>' +
+    '</div>';
+  const btn = rowsEl.querySelector('.retry-btn');
+  if (btn) {
+    btn.addEventListener('click', () => {
+      // Explicit recovery: clear the error state and re-run the failed op.
+      window.__editchainDataReady = false;
+      retryAction();
+      startProgressiveLoader();
+    });
+  }
+  window.__editchainDataReady = true;
+  vscode.postMessage({ type: 'log', text: 'request error shown; loader suspended until explicit recovery' });
+}
+
+/** Collect user-facing chain warnings from an Open response.
+ *
+ * The service reports integrity issues in `warnings` (strings) and as
+ * structured `diagnostics` (missing/corrupt/unresolved blob payloads). Both
+ * are surfaced so data-integrity problems are never silently discarded.
+ */
+function collectOpenWarnings(value) {
+  const out = [];
+  if (!value || typeof value !== 'object') return out;
+  if (Array.isArray(value.warnings)) {
+    for (const w of value.warnings) {
+      if (typeof w === 'string' && w.trim()) out.push(w.trim());
+    }
+  }
+  const d = value.diagnostics;
+  if (d && typeof d === 'object') {
+    const blobs = d.blobs;
+    if (blobs && typeof blobs === 'object') {
+      const missing = Number(blobs.missing) || 0;
+      const corrupt = Number(blobs.corrupt) || 0;
+      const unresolved = Number(blobs.unresolved) || 0;
+      const summary = (missing ? missing + ' missing' : '') +
+        (missing && (corrupt || unresolved) ? ', ' : '') +
+        (corrupt ? corrupt + ' corrupt' : '') +
+        (corrupt && unresolved ? ', ' : '') +
+        (unresolved ? unresolved + ' unresolved' : '');
+      if (summary) {
+        const already = out.some((w) => w.includes(String(Math.max(missing, corrupt, unresolved))));
+        if (!already) out.push('Chain data integrity: ' + summary + ' blob payload(s) in the durable store');
+      }
+    }
+  }
+  return out;
 }
 
 /** Report the current scroll depth / total node counts to the extension host so
@@ -269,6 +421,10 @@ function reportStatus() {
 function unwrap(body) {
   if (body && body.Ok !== undefined) return { ok: true, value: body.Ok };
   if (body && body.Error !== undefined) return { ok: false, error: body.Error };
+  // Legacy lowercase envelope: older extension-host builds posted transport
+  // exceptions as { error: ... }. Treat it as an error too so failures still
+  // surface instead of being rendered as data.
+  if (body && body.error !== undefined) return { ok: false, error: body.error };
   return { ok: true, value: body };
 }
 
@@ -301,30 +457,79 @@ function hideUndated() {
 
 /** The current chain-filter payload to send with window/layout requests.
  *
- * `null` when no filtering is active, so the service skips the filter entirely.
- * The filter pattern is treated as a regex server-side (with literal fallback).
+ * ALWAYS sends an explicit filter: the service's `ChainFilter::default()`
+ * hides undated nodes, so sending no filter at all would silently keep hiding
+ * them even when "Hide undated" is unchecked. An explicit `hide_undated: false`
+ * makes the checkbox authoritative in both directions. The filter pattern is
+ * treated as a regex server-side (with literal fallback) and HIDES matching
+ * rows (the service preserves chain endpoints, so the pattern never removes
+ * the oldest root or newest leaf); "Show messages only" maps to an INCLUSIVE
+ * kind pattern that keeps message/command rows plus structural branch/reconnect
+ * anchors required for continuity, so the window, layout, and sub-op counts
+ * stay coherent with the filtered row set.
  */
 function filterPayload() {
   const pattern = (filterEl && filterEl.value.trim()) || '';
-  const undated = hideUndated();
-  if (!pattern && !undated) return null;
   return {
     summary_pattern: pattern,
     kind_pattern: '',
-    hide_undated: undated,
+    include_kind_pattern: showMessagesOnly() ? '^(message|command)$' : '',
+    hide_undated: hideUndated(),
     splice: true,
   };
 }
 
-/** Whether a row is user-facing text (message or command) — the rows kept when
- * "Show messages only" is checked. */
-function isMessageRow(row) {
-  return row.kind === 'message' || row.kind === 'command';
-}
-
-/** Whether only messages should be shown (from the "Show messages only" checkbox). */
+/** Whether only messages should be shown (from the "Show messages only" checkbox).
+ *
+ * Filtering is server-side: the checkbox maps to an `include_kind_pattern`
+ * (an inclusive constraint, not a hide pattern) so the service re-windows the
+ * filtered set (and re-emits per-filter sub-op counts). Non-message rows are
+ * excluded except structural branch/reconnect anchors required to keep the
+ * graph connected. This keeps the visible/absolute index mapping coherent
+ * instead of hiding rows client-side after they were fetched.
+ */
 function showMessagesOnly() {
   return !!(hideSystemEl && hideSystemEl.checked);
+}
+
+/** Whether a search hit's summary matches the active chain-filter HIDE regex.
+ *
+ * The chain-filter input is a regex with a literal fallback (same matching as
+ * the service's ChainFilter matcher). SearchFilters cannot carry a summary
+ * pattern, so the active chain filter is enforced client-side on search hits
+ * to keep search results consistent with the visible chain window. The chain
+ * filter HIDES matches (with server-side endpoint preservation), so a flat
+ * search result list REMOVES hits whose summary matches. An empty pattern
+ * never matches (nothing is hidden).
+ */
+function matchesActiveChainFilter(text) {
+  const pattern = (filterEl && filterEl.value.trim()) || '';
+  if (!pattern) return false;
+  try {
+    return new RegExp(pattern).test(String(text));
+  } catch {
+    return String(text).indexOf(pattern) !== -1;
+  }
+}
+
+/** Build the SearchFilters payload for a Search request from the active UI.
+ *
+ * The service's SearchFilters covers kinds / sources / actors / paths / time —
+ * not submodules or a summary regex. Map what it CAN express:
+ *   - "Show messages only" -> kind tags (Message, Command);
+ *   - "Hide undated"       -> earliest-timestamp bound (undated rows have 0).
+ * Submodule hiding and the chain-filter pattern are enforced client-side on
+ * the result list (see renderSearchResults), which matches the visible chain.
+ */
+function searchFiltersPayload() {
+  const filters = {};
+  if (showMessagesOnly()) {
+    filters.kinds = ['Message', 'Command'];
+  }
+  if (hideUndated()) {
+    filters.after = 1; // undated nodes carry timestamp_ms == 0
+  }
+  return filters;
 }
 
 /** Human-readable label for a block-separator group key.
@@ -338,15 +543,10 @@ function groupLabelText(group) {
     : 'EditChain ops';
 }
 
-// Maximum number of graph lanes shown before clipping. The graph column's
-// initial width is `numLanes * LANE_W`, capped at this many lanes so the
-// description/content column always stays visible even with many concurrent
-// branches.
-const MAX_GRAPH_LANES = 64;
 // Minimum widths for each resizable column.
 const MIN_COL_W = { graph: 40, content: 60, date: 90, author: 60, commit: 60 };
 // User-dragged per-column width overrides (null = default behavior):
-//   graph   -> natural lane-based width (numLanes * LANE_W, capped at MAX_GRAPH_LANES)
+//   graph   -> natural lane-based width (numLanes * LANE_W, bounded by budget)
 //   content -> flexible minmax(0,1fr)
 //   date / author / commit -> fixed defaults
 // Dragging can exceed the natural cap so lanes beyond it stay visible.
@@ -407,22 +607,34 @@ function desiredVisibleRange() {
  * scrolls jump straight to their target without loading everything before it.
  */
 function fetchWindow() {
-  if (pendingWindow || total <= 0) return;
+  // total === 0 means the server reported an empty result for the CURRENT
+  // view (nothing to fetch); a reset (history/filter/search clear) marks the
+  // total as unknown (-1) so a fresh window is requested under the new view.
+  if (searchMode || pendingWindowReqId !== -1 || total === 0) return;
   const { top, bottom } = desiredCacheRange();
   if (top > bottom) return;
+
+  // The service ships the expansion snapshot (sub_op_counts) only with the
+  // offset-0 window. Until that arrives for the current view generation, force
+  // the first page to start at offset 0 so visible/absolute index mapping is
+  // established before any deep window is requested (deep restore included).
+  const forceSnapshot = !snapshotEstablished;
+  const rangeTop = forceSnapshot ? 0 : top;
+  const rangeBottom = forceSnapshot ? Math.min(PAGE - 1, bottom) : bottom;
+  if (rangeTop > rangeBottom) return;
 
   // Find the first missing row inside [top,bottom] to fetch next. The range is
   // bounded by BUFFER on each side of the viewport, so this scan is cheap.
   let start = -1;
-  for (let i = top; i <= bottom; i++) {
+  for (let i = rangeTop; i <= rangeBottom; i++) {
     if (!cache.has(i)) { start = i; break; }
   }
   if (start === -1) return; // everything we want is already cached
 
-  const limit = Math.min(PAGE, bottom - start + 1);
-  pendingWindow = true;
-  pendingWindowOffset = start;
-  send({ GetWindow: { offset: start, limit, hide_submodules: hideSubmodules(), filter: filterPayload() } });
+  const limit = Math.min(PAGE, rangeBottom - start + 1);
+  pendingWindowReqId = send({
+    GetWindow: { offset: start, limit, hide_submodules: hideSubmodules(), filter: filterPayload() },
+  });
 }
 
 /** Evict cached rows far outside the desired range so memory stays bounded. */
@@ -451,15 +663,68 @@ function evictFarWindows() {
  * .scroll-spacer keeps the scrollbar stable.
  */
 
-/** X pixel position of a lane's centre within the graph column. */
+// Minimum width for the content (summary) column: wide enough for the
+// "Content" header and a readable run of summary text at any viewport.
+const MIN_CONTENT_W = 160;
+// The graph column never exceeds this fraction of the viewport, so the
+// Content/Date/Author/Commit columns always stay visible at desktop and narrow
+// widths (with many concurrent lanes, lane X positions compress into this
+// capped region instead of the graph hogging the table).
+const GRAPH_MAX_FRACTION = 0.5;
+// Lane-spacing floor in px when lane count exceeds the natural budget.
+const MIN_LANE_W = 1.5;
+
+/** Pixel budget for the graph column.
+ *
+ * Fixed columns (date/author/commit) and a readable content column are
+ * reserved first; the graph gets the remainder, capped at `GRAPH_MAX_FRACTION`
+ * of the viewport. High-lane real chains therefore compress lane positions
+ * into a bounded region (see `graphLaneWidth`) instead of pushing the fixed
+ * columns off-screen.
+ */
+function graphWidthBudget() {
+  const fixedW = DEFAULT_COL_W.date + DEFAULT_COL_W.author + DEFAULT_COL_W.commit;
+  const rowsW = Math.max(1, rowsEl.clientWidth);
+  const graphCap = Math.max(MIN_COL_W.graph, Math.floor(rowsW * GRAPH_MAX_FRACTION));
+  const avail = Math.max(MIN_COL_W.graph, rowsW - fixedW - MIN_CONTENT_W);
+  return Math.min(graphCap, avail);
+}
+
+/** Effective per-lane pixel width.
+ *
+ * Normally `LANE_W`; when the lane count would exceed the graph budget, lanes
+ * compress (down to `MIN_LANE_W`). There is NO hard lane-count cap: every
+ * service lane is drawn, with spacing compressing inside the graph budget
+ * (and, beyond the compression floor, laneX distributes centres proportionally
+ * across the full column so no lane is ever clipped). User-dragged graph
+ * widths are unaffected.
+ */
+function graphLaneWidth() {
+  const numLanes = maxLane + 1;
+  return Math.max(MIN_LANE_W, Math.min(LANE_W, graphWidthBudget() / (numLanes + 1)));
+}
+
+/** X pixel position of a lane's centre within the graph column.
+ *
+ * Natural placement for ordinary lane counts. If the lane count exceeds what
+ * the column can fit at `MIN_LANE_W` (extreme chains), every lane centre is
+ * distributed proportionally across the full column width instead — distinct
+ * lanes stay monotonic and no lane is drawn outside the graph cell.
+ */
 function laneX(lane) {
-  return LANE_W / 2 + lane * LANE_W + LANE_W / 2;
+  const w = graphLaneWidth();
+  const width = currentGraphWidth();
+  const numLanes = maxLane + 1;
+  if (numLanes * w <= width) {
+    return w / 2 + lane * w + w / 2;
+  }
+  return (lane + 0.5) * (width / numLanes);
 }
 
 /**
  * Build one row's graph cell: a small inline SVG drawing the node's dot, the
  * vertical line segments for lanes entering from above and leaving below, and
- * any horizontal merge connectors at this row.
+ * any rounded cross-lane transition paths at this row.
  *
  * This is the per-row replacement for the old full-height SVG overlay. Because
  * each row carries its own graph geometry (lane, above, below, transitions)
@@ -472,34 +737,88 @@ function laneX(lane) {
  * children) has no `above` lanes → no line above its dot; a ROOT (no parents)
  * has no `below` lanes → no line below. The dot sits at the row's own lane,
  * vertically centred.
+ *
+ * A cross-lane transition replaces the old hard three-line jog (source-lane
+ * vertical half + horizontal connector + destination-lane vertical half) with
+ * one rounded orthogonal path split into two exact halves: the source half
+ * (source-lane colour) runs down the from-lane from the row boundary, rounds
+ * onto the row midpoint, and ends at the geometric midpoint between the two
+ * lanes; the destination half (destination-lane colour) continues from that
+ * exact shared seam through the destination elbow and exits down the to-lane
+ * at the row boundary. Each side is anchored to whatever actually connects it:
+ *
+ *   - a transition whose child node lives on THIS row (`row.lane === fromLane`)
+ *     begins exactly at the node dot (xFrom, midY) — never at y=0, which would
+ *     leave an open top stub; any legitimate `above` line on that lane is a
+ *     separate edge and is still drawn into the dot;
+ *   - otherwise it begins at y=0 on the from-lane ONLY when `above` lists that
+ *     lane (the child's lane ran down from the row above, and this path owns
+ *     that top half);
+ *   - a transition whose parent node lives on THIS row (`row.lane === toLane`,
+ *     and `below` does not list the lane) ends exactly at the node dot;
+ *   - otherwise it ends at y=height on the to-lane only when `below` lists
+ *     that lane (the parent's lane continues into the row below, and this path
+ *     owns that bottom half).
+ *
+ * A transition whose endpoint would be neither a dot nor a connected boundary
+ * is a dangling stub and is not drawn. Generic vertical halves are skipped
+ * exactly when a rendered path owns them, so dot-anchored transitions never
+ * suppress the neighbouring legitimate segment (the path would not cover it).
  */
 function buildGraphCell(row) {
   const width = currentGraphWidth();
   const height = ROW_H;
   const midY = ROW_H / 2;
-  let s = `<svg class="graphCell" width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">`;
-  // Top-half vertical segments: lanes entering from above (y=0 → midY).
+  // Decorative graph marks — never exposed to the accessibility tree.
+  let s = `<svg class="graphCell" width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">`;
+  // `transitions` entries are (from_lane, to_lane) = production's
+  // (child_lane, parent_lane) order.
+  const transitions = row.transitions || [];
+  const below = row.below || [];
   const above = row.above || [];
+  // Resolve each transition's real anchors before drawing anything. A side is
+  // DOT-anchored when the transition starts/ends on this row's own node; a
+  // BOUNDARY-anchored side must be backed by the adjacent row's geometry
+  // (`above` for a top start, `below` for a bottom end). Any other combination
+  // would leave an open stub, so the transition is dropped.
+  const rendered = [];
+  for (const [fromLane, toLane] of transitions) {
+    const startAtDot = row.lane === fromLane;
+    const endAtBoundary = below.indexOf(toLane) !== -1;
+    const endAtDot = !endAtBoundary && row.lane === toLane;
+    const startConnected = startAtDot || above.indexOf(fromLane) !== -1;
+    if (!startConnected || (!endAtBoundary && !endAtDot)) continue;
+    rendered.push({ fromLane, toLane, startAtDot, endAtDot });
+  }
+  // The halves a rendered transition path actually covers: the from-lane's top
+  // half (only when the path begins at the boundary) and the to-lane's bottom
+  // half (only when the path ends at the boundary). Dot-anchored sides leave
+  // the neighbouring generic half in place — e.g. a legitimate `above` line
+  // continuing into the dot.
+  const ownsTop = new Set();
+  const ownsBottom = new Set();
+  for (const t of rendered) {
+    if (!t.startAtDot) ownsTop.add(t.fromLane);
+    if (!t.endAtDot) ownsBottom.add(t.toLane);
+  }
+  // Top-half vertical segments: lanes entering from above (y=0 → midY).
   for (const lane of above) {
+    if (ownsTop.has(lane)) continue;
     const x = laneX(lane);
     const colour = COLORS[lane % COLORS.length];
     s += `<line class="graphLine" x1="${x}" y1="0" x2="${x}" y2="${midY}" style="stroke:${colour}"/>`;
   }
   // Bottom-half vertical segments: lanes leaving downward (midY → height).
-  const below = row.below || [];
   for (const lane of below) {
+    if (ownsBottom.has(lane)) continue;
     const x = laneX(lane);
     const colour = COLORS[lane % COLORS.length];
     s += `<line class="graphLine" x1="${x}" y1="${midY}" x2="${x}" y2="${height}" style="stroke:${colour}"/>`;
   }
-  // Horizontal merge connectors at this row. Colour by the FROM lane (the chain
-  // the connector originates from).
-  const transitions = row.transitions || [];
-  for (const [fromLane, toLane] of transitions) {
-    const x1 = laneX(fromLane);
-    const x2 = laneX(toLane);
-    const colour = COLORS[fromLane % COLORS.length];
-    s += `<line class="graphLine" x1="${x1}" y1="${midY}" x2="${x2}" y2="${midY}" style="stroke:${colour}"/>`;
+  // Rounded cross-lane transition paths at this row (drawn after the verticals
+  // so the elbows sit on top; the node dot is still painted last).
+  for (const t of rendered) {
+    s += buildTransitionPaths(t.fromLane, t.toLane, height, t.startAtDot, t.endAtDot);
   }
   // A sub-op row draws NO dot — it is not a graph node. Its `above`/`below` are
   // the pass-through lanes spanning this region, drawn as full-height straight
@@ -512,6 +831,91 @@ function buildGraphCell(row) {
   }
   s += '</svg>';
   return s;
+}
+
+/** Format a coordinate for SVG path output (keeps `d` compact and stable). */
+function fmt(v) {
+  return Math.round(v * 100) / 100;
+}
+
+/**
+ * Build the two exact path halves for one cross-lane transition.
+ *
+ * The transition runs from `fromLane` (production's child lane) to `toLane`
+ * (production's parent lane) inside one row cell. Each side is anchored by
+ * `buildGraphCell`: either at the row's own node dot (the dot sits on the row
+ * midpoint, so that side runs straight along it — there is no vertical run to
+ * round) or at the row boundary (y=0 / y=height), where the path owns the
+ * vertical half and rounds onto the row midpoint. The path is split at the
+ * geometric midpoint between the two lane centres on the row midpoint:
+ *
+ *   source half  — source-lane colour, from the source anchor through the
+ *                  source elbow (boundary starts) to the shared seam;
+ *   destination half — destination-lane colour, from the shared seam through
+ *                  the destination elbow (boundary ends) to the destination
+ *                  anchor.
+ *
+ * Both halves reuse the exact same formatted seam coordinates (butt caps, no
+ * gradients/defs), so the colour handoff is sharp and seam/gap-free. The
+ * quadratic corner radius is clamped by the lane distance (the horizontal run
+ * must never collapse) and by the row geometry (the vertical runs stay
+ * non-empty on boundary-anchored sides; dot-anchored sides have no vertical
+ * run at all and stay straight); below `TRANSITION_MIN_DX` of lane distance the
+ * corner would be sub-pixel, so a straight orthogonal jog is drawn instead.
+ */
+function buildTransitionPaths(fromLane, toLane, height, startAtDot, endAtDot) {
+  const x1 = laneX(fromLane);
+  const x2 = laneX(toLane);
+  const midY = height / 2;
+  const dx = Math.abs(x2 - x1);
+  // Each side rounds independently, clamped by ITS vertical run (zero for a
+  // dot-anchored side — no elbow, straight along the row midpoint) and by half
+  // the lane distance.
+  const srcR = startAtDot ? 0 : Math.min(TRANSITION_R, dx / 2, midY);
+  const dstR = endAtDot ? 0 : Math.min(TRANSITION_R, dx / 2, height - midY);
+  const srcRounded = !startAtDot && dx >= TRANSITION_MIN_DX && srcR > 0;
+  const dstRounded = !endAtDot && dx >= TRANSITION_MIN_DX && dstR > 0;
+  const sgn = x2 >= x1 ? 1 : -1;
+  const srcColour = COLORS[fromLane % COLORS.length];
+  const dstColour = COLORS[toLane % COLORS.length];
+  // Geometric midpoint of the two lane centres at the row midpoint — the exact
+  // shared seam (identical formatted numbers in both halves).
+  const xm = (x1 + x2) / 2;
+  let srcD;
+  let dstD;
+  if (startAtDot) {
+    // The transition's child node is this row's dot: begin exactly at the dot
+    // and run straight along the row midpoint to the shared seam.
+    srcD = 'M ' + fmt(x1) + ' ' + fmt(midY) + ' L ' + fmt(xm) + ' ' + fmt(midY);
+  } else if (srcRounded) {
+    srcD = 'M ' + fmt(x1) + ' 0' +
+      ' L ' + fmt(x1) + ' ' + fmt(midY - srcR) +
+      ' Q ' + fmt(x1) + ' ' + fmt(midY) + ' ' + fmt(x1 + sgn * srcR) + ' ' + fmt(midY) +
+      ' L ' + fmt(xm) + ' ' + fmt(midY);
+  } else {
+    // Safe straight/near-straight fallback for extreme compressed spacing.
+    srcD = 'M ' + fmt(x1) + ' 0' +
+      ' L ' + fmt(x1) + ' ' + fmt(midY) +
+      ' L ' + fmt(xm) + ' ' + fmt(midY);
+  }
+  if (endAtDot) {
+    // The transition's parent node is this row's dot: run straight along the
+    // row midpoint from the shared seam and end exactly at the dot.
+    dstD = 'M ' + fmt(xm) + ' ' + fmt(midY) + ' L ' + fmt(x2) + ' ' + fmt(midY);
+  } else if (dstRounded) {
+    dstD = 'M ' + fmt(xm) + ' ' + fmt(midY) +
+      ' L ' + fmt(x2 - sgn * dstR) + ' ' + fmt(midY) +
+      ' Q ' + fmt(x2) + ' ' + fmt(midY) + ' ' + fmt(x2) + ' ' + fmt(midY + dstR) +
+      ' L ' + fmt(x2) + ' ' + fmt(height);
+  } else {
+    dstD = 'M ' + fmt(xm) + ' ' + fmt(midY) +
+      ' L ' + fmt(x2) + ' ' + fmt(midY) +
+      ' L ' + fmt(x2) + ' ' + fmt(height);
+  }
+  return '<path class="graphTransition graphTransitionSrc" d="' + srcD +
+    '" style="stroke:' + srcColour + '"/>' +
+    '<path class="graphTransition graphTransitionDst" d="' + dstD +
+    '" style="stroke:' + dstColour + '"/>';
 }
 
 /** Whether a row carries bundled metadata sub-ops (revealed on click). */
@@ -535,6 +939,56 @@ function subopIcon(subopKind) {
   }
 }
 
+/** Labels for the provider-neutral structural relationship kinds.
+ *
+ * The service tags a row's parent edges with the kinds the projection derives
+ * from `SubagentOf` / `ReconnectsTo` / `ForkOf` structural notes (see
+ * crates/editchain-protocol — `HistoryRow.parent_relations`). A badge marks
+ * the row itself: a row that STARTS a subagent branch, a row that RETURNS
+ * into a subagent branch (completion result), or a row that forks off a
+ * trunk.
+ *
+ * Every rendered attribute (CSS class, glyph, text, title) comes from the
+ * constant labels below — the wire value is only used as a lookup key — so an
+ * unknown or hostile kind can never inject a class name or markup. Unknown
+ * kinds (the protocol's forward-compatible `Unknown` variant) are ignored.
+ * Glyphs are basic-block arrows (U+2190–U+21FF) so they render in the
+ * webview's default font stack across platforms.
+ */
+const REL_LABELS = {
+  subagent: { cls: 'rel-subagent', glyph: '↳', text: 'subagent', title: 'Starts a subagent branch' },
+  reconnect: { cls: 'rel-reconnect', glyph: '↩', text: 'return', title: 'Completion returns into the subagent branch' },
+  fork: { cls: 'rel-fork', glyph: '⇉', text: 'fork', title: 'Branches off the target row at a fork boundary' },
+};
+
+/** Compact badges for a row's structural parent relations, or ''.
+ *
+ * Rendered inline in the content cell so the branch/start and return/completion
+ * semantics survive semantic collapsing. Inline (not block) so badges never
+ * affect row height — virtual scroll keeps every row exactly ROW_H and the
+ * content cell clips overflow, so long summaries simply ellipsize past the
+ * badges. Each badge carries a hover title and an aria-label for assistive
+ * tech.
+ */
+function relationBadges(row) {
+  const rels = Array.isArray(row.parent_relations) ? row.parent_relations : [];
+  if (!rels.length) return '';
+  const seen = new Set();
+  let html = '';
+  for (const rel of rels) {
+    const kind = rel && typeof rel.kind === 'string' ? rel.kind : '';
+    const label = Object.prototype.hasOwnProperty.call(REL_LABELS, kind)
+      ? REL_LABELS[kind]
+      : null;
+    if (!label || seen.has(kind)) continue;
+    seen.add(kind);
+    html += '<span class="rel-badge ' + label.cls + '" title="' + esc(label.title) +
+      '" aria-label="' + esc(label.title) + '">' +
+      label.glyph + ' ' + label.text + '</span>';
+  }
+  return html;
+}
+
 /** Build one row's HTML from its cached HistoryRow. `absIdx` is its absolute index.
  *
  * Two kinds of rows:
@@ -556,6 +1010,11 @@ function buildRowHtml(row, absIdx, isGroupStart) {
     : 'row-dim';
   const humanClass = row.author === 'human' ? ' row-human' : '';
   const subopClass = row.is_subop ? ' row-subop' : '';
+  const badges = relationBadges(row);
+  // Badge rows are graph-topology-critical; the CSS override lifts their text
+  // cells out of the tool/dim opacity dimming so the badge stays readable at
+  // full strength (row height is untouched — the class only affects opacity).
+  const relClass = badges ? ' row-has-badges' : '';
   let content;
   if (row.is_subop) {
     // A bundled sub-op expanded inline: small Codicon + indented summary.
@@ -567,11 +1026,11 @@ function buildRowHtml(row, absIdx, isGroupStart) {
     const expanded = expandedBlocks.has(blockIndexOfAbs(absIdx));
     const chevron = expanded ? '▾' : '▸';
     content = '<span class="subop-chevron" title="Expand metadata records">' + chevron + '</span>' +
-      esc(row.summary || '(no summary)');
+      badges + esc(row.summary || '(no summary)');
   } else {
-    content = esc(row.summary || '(no summary)');
+    content = badges + esc(row.summary || '(no summary)');
   }
-  return '<div class="row ' + kindClass + humanClass + subopClass + groupClass +
+  return '<div class="row ' + kindClass + humanClass + subopClass + relClass + groupClass +
     '" data-key="' + esc(row.node_key) +
     '" data-row="' + absIdx + '" style="' + colStyle() + '">' +
     groupLabel +
@@ -643,10 +1102,24 @@ function reanchorTo(top, bottom) {
   // with scroll) — a header there would scroll with content and appear mid-table.
   const spacerH = Math.max(1, visibleTotal() * ROW_H);
   const headerHtml = buildHeaderHtml();
+  // Non-blocking chain-data warnings (Open response) sit above the table.
+  const warningHtml = (!searchMode && openWarnings.length)
+    ? '<div class="open-warning" role="status">' +
+      openWarnings.map((w) => '<div class="open-warning-line">' + esc(w) + '</div>').join('') +
+      '</div>'
+    : '';
+  // Search results get a compact banner so the mode is explicit and the user
+  // can tell the flat result list apart from the full history window.
+  const bannerHtml = searchMode
+    ? '<div class="search-banner">' + esc(String(total)) + ' result' +
+      (total === 1 ? '' : 's') + ' for "' + esc(searchQuery) + '"</div>'
+    : '';
   // Preserve the scroll position across the DOM rebuild (setting innerHTML
   // resets scrollTop to 0).
   const prevScrollTop = rowsEl.scrollTop;
   rowsEl.innerHTML =
+    warningHtml +
+    bannerHtml +
     headerHtml +
     '<div class="scroll-spacer" style="height:' + spacerH + 'px">' +
       '<div class="table-wrap" style="top:' + (top * ROW_H) + 'px;' + colStyle() + '">' +
@@ -810,7 +1283,7 @@ function trimBottom(keepBottom) {
  * deliver rows (a quick render penalty), never blanking or re-anchoring.
  */
 function syncWindow() {
-  if (total <= 0) return;
+  if (searchMode || total <= 0) return;
   const { top: wantTop, bottom: wantBottom } = desiredVisibleRange();
   // If the window is empty or no longer covers the viewport (e.g. after a fast
   // fling evicted rows and we've scrolled back into them), reanchor cleanly from
@@ -855,6 +1328,9 @@ function ensureFilled() {
  * runs continuously and independently of how fast the user scrolls.
  */
 function progressiveLoad() {
+  // Harness-only pause switch: lets the stale-response race test hold the
+  // loader while a delayed (stale) window response lands.
+  if (window.__editchainPauseLoader === true) return;
   fetchWindow();
   // Sync the window so newly-fetched rows appear even without a scroll event.
   syncWindow();
@@ -871,8 +1347,13 @@ function inspect(row, absIdx) {
   // ROW_H row per bundled sub-op directly below).
   if (hasSubOps(row)) {
     if (toggleExpanded(absIdx)) {
-      // Reveal state changed — rebuild the window so hidden/visible slots shift.
-      reanchorTo(renderTop, renderBottom);
+      // Reveal state changed — rebuild the FULL desired visible window. Using
+      // the old [renderTop, renderBottom] here only re-renders the pre-expansion
+      // slice, so just the first sub-op slot(s) appear and the rest of the
+      // viewport stays blank (ensureFilled finds nothing to fetch — the rows
+      // are already cached). The desired range is in visible space, so it
+      // expands to cover every newly revealed sub-op row.
+      reanchorTo(desiredVisibleRange().top, desiredVisibleRange().bottom);
       ensureFilled();
     }
     return;
@@ -924,7 +1405,37 @@ window.addEventListener('message', (event) => {
   const r = unwrap(msg.body);
 
   if (msg.id === 'open') {
-    if (r.ok) {
+    if (msg.body === null || msg.body === undefined) {
+      // Explicit loading signal (e.g. the extension hasn't finished opening the
+      // workspace yet). Keep the loading message on screen.
+      showViewMessage('Loading history…', false);
+      return;
+    }
+    if (r.ok && r.value) {
+      window.__editchainDataReady = false;
+      searchMode = false;
+      searchQuery = '';
+      // A fresh chain is a new view: drop any responses from a previous chain
+      // (or a replayed open into a surviving context) and re-establish the
+      // offset-0 expansion snapshot. The cache is cleared too: a replayed open
+      // into a SURVIVING JS context must refetch against the authoritative
+      // open body (otherwise fetchWindow sees every row cached and skips the
+      // request, leaving stale rows under a possibly-changed total).
+      viewGen++;
+      inFlight.clear();
+      cache.clear();
+      totalFetched = 0;
+      pendingWindowReqId = -1;
+      currentSearchEpoch = -1;
+      snapshotEstablished = false;
+      subOpCounts = [];
+      recomputeExpansion();
+      // Surface integrity warnings (e.g. missing blob payloads) as a
+      // non-blocking banner — rows still render below it.
+      openWarnings = collectOpenWarnings(r.value);
+      if (openWarnings.length) {
+        vscode.postMessage({ type: 'log', text: 'open warnings: ' + openWarnings.join(' | ') });
+      }
       vscode.postMessage({ type: 'log', text: `open: ${r.value.nodes} nodes, ${r.value.repos} repos` });
       // The server's node count is authoritative. The persisted `total` from a
       // previous session can go stale whenever the chain is reimported or
@@ -932,6 +1443,13 @@ window.addEventListener('message', (event) => {
       // this fresh value — otherwise the first window maps to stale offsets and
       // renders placeholders (the "newly generated chain doesn't render" bug).
       total = r.value.nodes;
+      if (total === 0) {
+        // Nothing to load: show an explicit empty state instead of a single
+        // unfilled placeholder row that the loader can never populate.
+        window.__editchainDataReady = true;
+        showViewMessage('No history found in this workspace', false);
+        return;
+      }
       const restoredTopRow = restoreState();
       // Reanchor to the viewport window for the CURRENT (un-scrolled) position
       // first, so the spacer exists and has real height. Rows may not be cached
@@ -951,7 +1469,15 @@ window.addEventListener('message', (event) => {
       startProgressiveLoader();
       reportStatus();
     } else {
-      vscode.postMessage({ type: 'log', text: `open error: ${r.error}` });
+      // Explicit, visible open error (spawn failure, bad chain dir, timeout,
+      // service crash) — never a silent blank panel.
+      const errText = String(r.error || 'unknown error');
+      vscode.postMessage({ type: 'log', text: `open error: ${errText}` });
+      window.__editchainDataReady = true;
+      // showViewMessage escapes its text once; do NOT escape again here or the
+      // message renders with literal entities (e.g. `&lt;`) for any error text
+      // containing HTML characters.
+      showViewMessage('Failed to open history: ' + errText, true);
     }
     return;
   }
@@ -963,6 +1489,13 @@ window.addEventListener('message', (event) => {
   // has real dimensions to measure.
   if (msg.id === 'reveal') {
     const restoredTopRow = restoreState();
+    // The revealed webview is a fresh context, but be safe: start a new view
+    // generation and force the offset-0 snapshot so the restored filter state's
+    // expansion counts are established before any deep restore window loads.
+    viewGen++;
+    snapshotEstablished = false;
+    subOpCounts = [];
+    recomputeExpansion();
     vscode.postMessage({ type: 'log', text: 'reveal: topRow=' + restoredTopRow + ' total=' + total });
     setTimeout(() => {
       fetchWindow();
@@ -977,17 +1510,91 @@ window.addEventListener('message', (event) => {
     return;
   }
 
+  // Every other message is the correlated response to a request issued via
+  // send(). Match by id; unknown ids (e.g. responses from a replayed open)
+  // are dropped.
+  const req = typeof msg.id === 'number' ? inFlight.get(msg.id) : undefined;
+  if (!req) return;
+  inFlight.delete(msg.id);
+  const wasPendingWindow = msg.id === pendingWindowReqId;
+  if (wasPendingWindow) pendingWindowReqId = -1;
+
+  // Stale-view rejection: the response was issued under an older view
+  // generation (open/filter/search changed while it was in flight). Applying it
+  // would cache rows/totals from the old view into the new one, so drop it. If
+  // it was the in-flight window, immediately request the current view's window
+  // so the UI self-heals without waiting for the progressive loader.
+  if (req.gen !== viewGen) {
+    if (wasPendingWindow) fetchWindow();
+    return;
+  }
+
+  // Latest-query-wins for search: the response is only rendered if it carries
+  // the CURRENT search epoch. Both rapid searches share a view generation
+  // (rendering a search bumps it), so without this check an older query's late
+  // response would be treated as current — or, when the newer response lands
+  // first, the older one would clobber it. A stale-epoch response is dropped
+  // before any state (error rendering included) is applied.
+  if (req.searchEpoch !== undefined && req.searchEpoch !== currentSearchEpoch) {
+    vscode.postMessage({
+      type: 'log',
+      text: 'dropping stale search response (epoch ' + req.searchEpoch +
+        ' of ' + currentSearchEpoch + ')',
+    });
+    return;
+  }
+
   if (!r.ok) {
-    // Show request errors (e.g. timeout) in the detail pane so they're visible.
+    const errText = String(r.error || 'unknown error');
+    vscode.postMessage({ type: 'log', text: 'request error: ' + errText });
+    const reqBody = req.body || {};
+    // Terminal GetWindow/Search failures (dead service, hung request that
+    // timed out) must be VISIBLE and must suspend retries: the 300ms
+    // progressive loader retrying a dead service spins forever with no visible
+    // state change. Show a full-pane error with an explicit Retry action.
+    if (wasPendingWindow || reqBody.GetWindow !== undefined) {
+      showRequestError('Failed to load history rows: ' + errText, () => {
+        resetAndRefetch();
+      });
+      return;
+    }
+    if (reqBody.Search !== undefined) {
+      showRequestError('Search failed: ' + errText, () => {
+        // Re-issue the current query with a fresh epoch (explicit recovery).
+        const q = searchQuery;
+        currentSearchEpoch = ++searchEpoch;
+        sendSearch(
+          { Search: { query: q, mode: 'Lexical', top_k: 50, filters: searchFiltersPayload() } },
+          currentSearchEpoch
+        );
+      });
+      return;
+    }
+    // Non-window/non-search request errors (e.g. detail fetches) keep the
+    // detail-pane behaviour.
     if (layoutEl.classList.contains('has-detail')) {
       detailEl.innerHTML = '<div class="detail-title">Error</div>' +
-        '<pre class="detail-body">' + esc(r.error || 'unknown error') + '</pre>';
+        '<pre class="detail-body">' + esc(errText) + '</pre>';
     }
     return;
   }
   if (!r.value || typeof r.value !== 'object') return;
 
-  // GetWindow response — has a `rows` array plus `total`.
+  // Search response — a bare array of hits (harness fixtures) or the service's
+  // `{ results: [...] }` envelope of scored chunks. Rendered as a flat result
+  // list that navigates to the JSON editor on click.
+  const searchHits = Array.isArray(r.value)
+    ? r.value
+    : (Array.isArray(r.value.results) ? r.value.results : null);
+  if (searchHits !== null) {
+    renderSearchResults(searchHits);
+    return;
+  }
+
+  // GetWindow response — has a `rows` array plus `total`. Rows are placed at the
+  // offset THIS request was issued with (never a global, never the request that
+  // happens to be pending now), so a response can only ever write to the
+  // absolute indices it asked for.
   if (Array.isArray(r.value.rows)) {
     total = r.value.total;
     // Global max lane for stable graph-column width (per-row graph cells).
@@ -999,28 +1606,39 @@ window.addEventListener('message', (event) => {
       // sticky header stays narrower than the rows it labels.
       refreshHeader();
     }
-    // Global per-node sub-op counts arrive once per filter state (offset==0).
-    // Rebuild prefix sums so visible/absolute index mapping stays consistent.
+    // The service ships the expansion snapshot (sub_op_counts) only with the
+    // offset-0 window. Rebuild prefix sums so visible/absolute index mapping
+    // stays consistent; until this arrives for the current view, the renderer
+    // keeps requesting offset 0 first (see fetchWindow).
     if (Array.isArray(r.value.sub_op_counts)) {
       subOpCounts = r.value.sub_op_counts;
+      snapshotEstablished = true;
       recomputeExpansion();
       // The initial `open` render used identity mapping (counts not yet known),
       // so its rows/spacer are stale once real counts arrive. Force a re-render
       // so hidden sub-op slots collapse and the spacer height is correct.
       reanchorTo(renderTop, renderBottom);
     }
-    const base = pendingWindowOffset;
+    const base = req.body.GetWindow.offset;
     for (let i = 0; i < r.value.rows.length; i++) {
       const absIdx = base + i;
       if (!cache.has(absIdx)) totalFetched++;
       cache.set(absIdx, r.value.rows[i]);
     }
-    pendingWindow = false;
     evictFarWindows();
     // Newly cached rows may extend the rendered window at either edge. Sync the
     // window to the current viewport so newly-loaded rows appear without a full
     // rebuild.
     syncWindow();
+    // Correlated data-ready: rows for the requested window have arrived and
+    // been rendered (placeholders replaced). The harness waits on this signal
+    // so "idle" never means a placeholder-filled DOM.
+    window.__editchainDataReady = true;
+    if (cache.size === 0 && total === 0) {
+      // A filter matched nothing (e.g. messages-only with no message rows).
+      // Replace the unfillable placeholder with an explicit empty state.
+      showViewMessage('No rows match the current filter', false);
+    }
     vscode.postMessage({ type: 'log', text: `cached ${cache.size}/${total} nodes (fetched ${totalFetched})` });
     reportStatus();
     saveState();
@@ -1049,12 +1667,129 @@ window.addEventListener('message', (event) => {
   }
 });
 
-/** Reset to the full history view and reload from the top. */
-function resetHistory() {
+/** Normalize one search hit into a renderable HistoryRow.
+ *
+ * The service returns protocol `SearchHit` objects (flat, JSON-safe:
+ * `{ op_id, chunk_id, score, text, source, session_id, actor_id, git_oid,
+ * repository, kind, is_submodule, ... }` with every identifier an exact
+ * string); the harness fixture bridge returns the same shape. HistoryRow-shaped
+ * fixture rows are still accepted as passthrough.
+ */
+function normalizeSearchHit(hit, index) {
+  if (hit && typeof hit === 'object' && typeof hit.text === 'string') {
+    // Real Git hits are identified by (git_oid, repository): the service
+    // indexes git commits as synthetic ops whose op_id (`0:0:generation`)
+    // exists ONLY inside the search index — it is not a projection node, so
+    // GetNodeDetails can never resolve it. Prefer the git identity for every
+    // Git hit and drop the synthetic op_id so clicks form ResolveObject, not
+    // GetNodeDetails. EditChain hits keep their exact op_id navigation.
+    const isGit = hit.source === 'Git' || hit.kind === 'git' || !!hit.git_oid;
+    return {
+      op_id: isGit ? null : (hit.op_id || null),
+      git_oid: isGit ? (hit.git_oid || null) : null,
+      repository: isGit ? (hit.repository || null) : null,
+      summary: hit.text,
+      timestamp_ms: typeof hit.timestamp_ms === 'number' ? hit.timestamp_ms : 0,
+      group: hit.session_id
+        ? 'session:' + hit.session_id
+        : (isGit
+            ? (hit.repository ? 'repo:' + hit.repository : 'repo:search')
+            : 'search'),
+      node_key: isGit
+        ? (hit.git_oid || ('search:' + index))
+        : (hit.op_id || ('search:' + index)),
+      parents: [],
+      is_submodule: !!hit.is_submodule,
+      is_system: false,
+      author: typeof hit.actor_id === 'string' ? hit.actor_id : '',
+      commit_id: '',
+      kind: hit.kind || (isGit ? 'git' : 'message'),
+      lane: 0,
+      above: [],
+      below: [],
+      transitions: [],
+      sub_ops: [],
+      is_subop: false,
+    };
+  }
+  return hit;
+}
+
+/** Render search hits as a flat, navigable result list in #rows.
+ *
+ * Suspends the virtual-scroll machinery (fetch/sync/progressive loader) — the
+ * result set is small and fully local. Clicking a result opens its JSON editor
+ * via the extension host. Clearing the search input restores the full history
+ * window.
+ */
+function renderSearchResults(hits) {
+  searchMode = true;
+  // SearchFilters cannot express submodule exclusion, so enforce the active
+  // "Show git submodules" setting client-side (mirrors GetWindow's server-side
+  // hide_submodules) to keep search consistent with the visible chain. The
+  // active chain-filter regex is enforced the same way, and it HIDES matches
+  // (the service preserves chain endpoints for the window; a flat result list
+  // simply REMOVES matching hits — see matchesActiveChainFilter). Git hits
+  // carry is_submodule from the service's identity map, so this filter applies
+  // to real scored search results too.
+  if (hideSubmodules()) {
+    hits = hits.filter((h) => !h.is_submodule);
+  }
+  // The chain-filter pattern HIDES matching rows; a flat search result list
+  // therefore REMOVES matches (no endpoint preservation in search results).
+  // No-op when the input is empty (matchesActiveChainFilter accepts
+  // everything), so this only ever narrows results.
+  hits = hits.filter((h) => !matchesActiveChainFilter(h.summary || h.text || ''));
+  // Search replaces the view: bump the generation so any in-flight history
+  // window response is rejected as stale instead of clobbering the result list,
+  // and release the window slot (the result list is fully local).
+  viewGen++;
+  pendingWindowReqId = -1;
+  snapshotEstablished = false;
+  currentSearchEpoch = -1;
+  const rows = hits.map(normalizeSearchHit);
+  // Search results are a flat list: drop any sub-op expansion mapping from the
+  // history view so visible/absolute indices are identity.
+  subOpCounts = [];
+  expandedBlocks.clear();
+  recomputeExpansion();
   cache.clear();
   totalFetched = 0;
   lastRenderKey = '';
-  pendingWindow = false;
+  total = Math.max(0, rows.length);
+  rows.forEach((row, i) => cache.set(i, row));
+  renderTop = 0;
+  renderBottom = -1;
+  rowsEl.scrollTop = 0;
+  clearDetail();
+  if (total === 0) {
+    showViewMessage('No results for "' + esc(searchQuery) + '"', false);
+  } else {
+    reanchorTo(0, Math.max(0, total - 1));
+  }
+  window.__editchainDataReady = true;
+  vscode.postMessage({ type: 'log', text: `search: ${total} result(s)` });
+  reportStatus();
+}
+
+/** Reset to the full history view and reload from the top. */
+function resetHistory() {
+  searchMode = false;
+  searchQuery = '';
+  currentSearchEpoch = -1;
+  // The previous view (e.g. a 0-result search) may have left `total` at 0;
+  // the full-history window must be re-requested, not treated as empty.
+  total = -1;
+  // Returning to the full history is a new view: stale in-flight responses
+  // (e.g. a Search issued before the clear) are rejected via the generation.
+  viewGen++;
+  snapshotEstablished = false;
+  subOpCounts = [];
+  recomputeExpansion();
+  pendingWindowReqId = -1;
+  cache.clear();
+  totalFetched = 0;
+  lastRenderKey = '';
   renderTop = 0;
   renderBottom = -1;
   rowsEl.scrollTop = 0;
@@ -1065,10 +1800,23 @@ function resetHistory() {
 /** Clear cached rows/layout and refetch from the top (used when the chain
  * filter changes, since filtering is server-side). */
 function resetAndRefetch() {
+  searchMode = false;
+  searchQuery = '';
+  currentSearchEpoch = -1;
+  // A previous filter may have matched nothing (total === 0). The new filter
+  // state must re-request its own window instead of being blocked by the old
+  // empty total.
+  total = -1;
+  // Filter changes are a new view: responses issued under the previous filter
+  // state are stale once this runs and must be dropped (see the message
+  // handler's generation check). The offset-0 snapshot is re-established by the
+  // next fetch.
+  viewGen++;
+  snapshotEstablished = false;
   cache.clear();
   totalFetched = 0;
   lastRenderKey = '';
-  pendingWindow = false;
+  pendingWindowReqId = -1;
   renderTop = 0;
   renderBottom = -1;
   rowsEl.scrollTop = 0;
@@ -1085,7 +1833,17 @@ searchEl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
     const q = searchEl.value.trim();
     if (q) {
-      send({ Search: { query: q, mode: 'Lexical', top_k: 20, filters: {} } });
+      searchQuery = q;
+      // Latest-query-wins: tag this search with a fresh epoch so its response
+      // is rendered even if an earlier search's (older-epoch) response lands
+      // first, and so a late older response can never overwrite it. Results
+      // render/navigate as a flat list on the Search response; the filters
+      // carry the active chain/hide-undated/messages-only semantics.
+      currentSearchEpoch = ++searchEpoch;
+      sendSearch(
+        { Search: { query: q, mode: 'Lexical', top_k: 50, filters: searchFiltersPayload() } },
+        currentSearchEpoch
+      );
     } else {
       resetHistory();
     }
@@ -1122,15 +1880,12 @@ if (hideSubmodulesEl) {
   });
 }
 
-// Re-render when the messages-only toggle changes (filtering is client-side
-// over already-loaded rows, so no refetch is needed). Reset scroll to the top
-// (the visible set changes significantly) and keep loading until the content
-// fills the viewport so scrolling still works.
+// Re-fetch when the messages-only toggle changes. Filtering is server-side
+// (kind_pattern in the filter payload), so the window, layout, and sub-op
+// counts all stay coherent with the filtered row set.
 if (hideSystemEl) {
   hideSystemEl.addEventListener('change', () => {
-    rowsEl.scrollTop = 0;
-    reanchorTo(desiredVisibleRange().top, desiredVisibleRange().bottom);
-    ensureFilled();
+    resetAndRefetch();
   });
 }
 
@@ -1143,6 +1898,14 @@ function startProgressiveLoader() {
   progressiveTimer = setInterval(() => {
     progressiveLoad();
   }, 300);
+  window.__editchainProgressiveTimerActive = true;
+}
+function stopProgressiveLoader() {
+  if (progressiveTimer) {
+    clearInterval(progressiveTimer);
+    progressiveTimer = null;
+  }
+  window.__editchainProgressiveTimerActive = false;
 }
 
 // Infinite scroll: extend/trim the rendered window at its edges so content
@@ -1150,6 +1913,10 @@ function startProgressiveLoader() {
 // frame so we don't run syncWindow on every scroll event.
 let syncTimer = null;
 rowsEl.addEventListener('scroll', () => {
+  if (searchMode) {
+    reportStatus();
+    return;
+  }
   fetchWindow();
   clearTimeout(syncTimer);
   syncTimer = setTimeout(syncWindow, 0);
@@ -1162,11 +1929,29 @@ rowsEl.addEventListener('scroll', () => {
 let resizeTimer = null;
 window.addEventListener('resize', () => {
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => {
-    syncWindow();
-    ensureFilled();
-  }, 150);
+  resizeTimer = setTimeout(onViewportResize, 150);
 });
+
+/** Rebuild the layout after a viewport resize.
+ *
+ * Every piece of graph geometry derives from the viewport width: the graph
+ * column's pixel budget (graphWidthBudget), the per-lane compression
+ * (graphLaneWidth), each row SVG cell's width (buildGraphCell), and the
+ * header's track widths (buildHeaderHtml). syncWindow only trims/appends rows
+ * — it never rebuilds cells with new widths — so a resize must re-render the
+ * current window (and the header, which reanchorTo rebuilds).
+ */
+function onViewportResize() {
+  if (total <= 0) return;
+  if (searchMode) {
+    // Search results are a flat local list: re-render with the new widths.
+    reanchorTo(0, Math.max(0, total - 1));
+    return;
+  }
+  reanchorTo(renderTop, renderBottom);
+  syncWindow();
+  ensureFilled();
+}
 
 // --- Draggable column widths ------------------------------------------------
 //
@@ -1180,16 +1965,21 @@ window.addEventListener('resize', () => {
  *
  * The natural width is `numLanes * LANE_W` (each lane is a fixed `LANE_W`-wide
  * column) plus one extra lane of padding, so the last lane's node dot (centred
- * on the final lane boundary) isn't clipped by the column's overflow. Capped at
- * `MAX_GRAPH_LANES` lanes so the content column stays visible. A user drag
- * overrides the natural width entirely.
+ * on the final lane boundary) isn't clipped by the column's overflow. The
+ * column never exceeds the viewport graph budget (GRAPH_MAX_FRACTION): lanes
+ * compress (graphLaneWidth) and, beyond the compression floor, distribute
+ * proportionally inside the budget (laneX) — so NO lane count is ever clipped
+ * or allowed to push the content column off-screen. A user drag overrides the
+ * natural width entirely.
  */
 function currentGraphWidth() {
   // Use the GLOBAL max lane (reported by the server) so the graph column width
   // is stable regardless of which window is loaded — lanes don't jump on scroll.
-  const numLanes = Math.min(maxLane + 1, MAX_GRAPH_LANES);
-  const naturalGraphW = numLanes * LANE_W + LANE_W;
-  return colWidths.graph !== null ? colWidths.graph : naturalGraphW;
+  if (colWidths.graph !== null) return colWidths.graph;
+  const numLanes = maxLane + 1;
+  const w = graphLaneWidth();
+  const natural = (numLanes + 1) * w;
+  return Math.round(Math.min(natural, graphWidthBudget()) * 100) / 100;
 }
 
 /**
@@ -1300,3 +2090,23 @@ window.__editchainGraphState = function () {
     graphWidth: currentGraphWidth(),
   };
 };
+
+// Harness-only debug hooks (not production behaviour): expose the cached row at
+// an absolute index and the current authoritative total so a text-only probe can
+// assert on real row payloads (e.g. deterministic date rendering).
+window.__editchainRowAt = function (absIdx) {
+  return cache.get(absIdx) || null;
+};
+window.__editchainGetTotal = function () {
+  return total;
+};
+
+// Harness-only debug hooks (not production behaviour): expose the renderer's
+// REAL in-flight request count and progressive-loader state so the layout
+// probe's whenIdle can wait on actual renderer state even in real VS Code
+// (where `window.vscode` is not exposed and the probe's own postMessage hook
+// is a no-op).
+window.__editchainInFlightCount = function () {
+  return inFlight.size;
+};
+window.__editchainProgressiveTimerActive = false;

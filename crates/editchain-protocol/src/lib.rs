@@ -6,8 +6,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use editchain_core::{GitOid, OpId, RepositoryId};
-use editchain_query::search::{SearchFilters, SearchMode};
+// Crate-level dependency marker (used by Cargo for feature resolution; the
+// types are exercised by the protocol round-trip tests).
+use editchain_core as _;
+use editchain_core::{GitAvailability, GitObjectFormat, GitSignature, Payload};
+use editchain_query::search::{SearchMode, Source, TagFilter};
 
 /// Protocol version for the framed stdio channel.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -61,6 +64,20 @@ pub enum ResponseBody {
 }
 
 /// Open a workspace and load its chain + git repositories.
+///
+/// The `Open` response is a JSON object with `workspace`, `chain`, `repos`,
+/// `nodes`, and `chain_generation` keys, plus two backward-compatible
+/// additions that describe what the open had to reconcile:
+///
+/// - `diagnostics` — `chain` (records decoded, accepted, exact `OpId` replays
+///   ignored, and same-id conflicts quarantined through the core `OpSet`) and
+///   `blobs` (durable blob payloads hydrated, refs verified and preserved,
+///   missing, corrupt, or not addressable by the store).
+/// - `warnings` — human-readable strings for any non-zero diagnostic count
+///   (duplicates, quarantines, missing/corrupt blobs), so a client can surface
+///   hydration gaps without silently treating preserved `BlobRef`s as content.
+///
+/// Older clients ignore both keys; they are never required to open a chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenRequest {
     /// Path to the workspace root.
@@ -114,6 +131,15 @@ pub struct ChainFilterDto {
     /// Regex/literal pattern matched against each node's kind tag.
     #[serde(default)]
     pub kind_pattern: String,
+    /// Inclusive kind constraint: when non-empty, ONLY nodes whose kind tag
+    /// matches this regex/literal pattern are kept. Non-matching kinds are
+    /// excluded without ordinary endpoint preservation; structural relationship
+    /// anchors/targets remain so branch and reconnect edges stay visible. This
+    /// lets the webview express "Show messages only" server-side without sparse
+    /// client offsets or unsupported regex lookahead. Empty means no inclusion
+    /// constraint.
+    #[serde(default)]
+    pub include_kind_pattern: String,
     /// Hide nodes with no real timestamp (`timestamp_ms() == 0`).
     #[serde(default)]
     pub hide_undated: bool,
@@ -179,7 +205,7 @@ pub struct GetNodeDetailsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetFiltersRequest {
     /// The filters to apply.
-    pub filters: SearchFilters,
+    pub filters: SearchFiltersDto,
 }
 
 /// Run a unified search across `EditChain` and `Git` history.
@@ -192,16 +218,95 @@ pub struct SearchRequest {
     /// Number of results to return.
     pub top_k: usize,
     /// Optional filters.
-    pub filters: SearchFilters,
+    pub filters: SearchFiltersDto,
+}
+
+/// Search filters carried over the protocol.
+///
+/// Mirrors [`editchain_query::search::SearchFilters`] as a JSON-safe DTO.
+/// Session and actor identifiers are exact decimal strings so u64 values above
+/// 2^53 round-trip through JavaScript without precision loss; the service
+/// parses and validates them, returning an `Error` response on invalid IDs.
+/// Timestamps and counts stay numeric where safe.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchFiltersDto {
+    /// Only include these operation kinds.
+    pub kinds: Option<Vec<TagFilter>>,
+    /// Only include these source domains (`EditChain` and/or `Git`).
+    pub sources: Option<Vec<Source>>,
+    /// Only include these sessions (exact decimal `SessionId` strings).
+    pub sessions: Option<Vec<String>>,
+    /// Only include these actors (exact decimal `ActorId` strings).
+    pub actors: Option<Vec<String>>,
+    /// Glob patterns for file paths.
+    pub paths: Option<Vec<String>>,
+    /// Earliest timestamp (Unix ms).
+    pub after: Option<u64>,
+    /// Latest timestamp (Unix ms).
+    pub before: Option<u64>,
+    /// Include raw import records in results.
+    pub include_raw: bool,
+    /// Include private/thinking content.
+    pub include_private: bool,
 }
 
 /// Resolve a git object by OID in a repository.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolveObjectRequest {
-    /// Repository identity.
-    pub repository: RepositoryId,
-    /// Object OID to resolve.
-    pub oid: GitOid,
+    /// Repository identity as an exact decimal `RepositoryId` string (u64
+    /// values above 2^53 must not be rounded by JavaScript).
+    pub repository: String,
+    /// Object OID to resolve, as lowercase hex (40 chars SHA-1 / 64 SHA-256).
+    pub oid: String,
+}
+
+/// The full resolved git commit, JSON-safe for the read-only JSON editor.
+///
+/// This mirrors [`editchain_core::GitCommitEntity`] with every identity
+/// carried as an exact string so u64 values above 2^53 round-trip through
+/// JavaScript without precision loss:
+///
+/// - `repository` is an exact decimal `RepositoryId` string;
+/// - `oid`, `tree`, and `parents` are lowercase hex `GitOid` strings;
+/// - `imported_record` is the `"node:boot:seq"` display form, when present;
+/// - `changed_paths` are exact decimal `PathId` strings.
+///
+/// Safe enums (`object_format`, `availability`), timestamps, signatures, and
+/// payloads retain their native types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedObject {
+    /// Repository identity as an exact decimal `RepositoryId` string.
+    pub repository: String,
+    /// Object format of the repository.
+    pub object_format: GitObjectFormat,
+    /// Full commit OID as lowercase hex.
+    pub oid: String,
+    /// `EditChain` operation that imported this commit, if any, in display
+    /// form `"node:boot:seq"`.
+    pub imported_record: Option<String>,
+    /// Availability of the underlying object data.
+    pub availability: GitAvailability,
+    /// Tree OID referenced by this commit, as lowercase hex.
+    pub tree: String,
+    /// Parent commit OIDs (ancestry), as lowercase hex.
+    pub parents: Vec<String>,
+    /// Author signature.
+    pub author: GitSignature,
+    /// Committer signature.
+    pub committer: GitSignature,
+    /// Author timestamp (Unix seconds).
+    pub authored_at: i64,
+    /// Commit timestamp (Unix seconds).
+    pub committed_at: i64,
+    /// Commit message (subject + body).
+    pub message: Payload,
+    /// Refs observed at import time (snapshot).
+    pub imported_refs: Vec<Payload>,
+    /// Refs observed live (snapshot; may change).
+    pub live_refs: Vec<Payload>,
+    /// Paths changed by this commit, as exact decimal `PathId` strings.
+    pub changed_paths: Vec<String>,
 }
 
 /// A history row in the unified projection (`EditChain` op or `Git` commit).
@@ -210,10 +315,12 @@ pub struct HistoryRow {
     /// The operation ID (for `EditChain` ops) in display form `"node:boot:seq"`,
     /// or `None` for git commits. Stored as a string to avoid JS precision loss.
     pub op_id: Option<String>,
-    /// The git commit OID (for git commits).
-    pub git_oid: Option<GitOid>,
-    /// The repository (for git commits).
-    pub repository: Option<RepositoryId>,
+    /// The git commit OID (for git commits) as lowercase hex — a string so it
+    /// round-trips exactly through JavaScript.
+    pub git_oid: Option<String>,
+    /// The repository (for git commits) as an exact decimal `RepositoryId`
+    /// string — a string so u64 values above 2^53 round-trip exactly.
+    pub repository: Option<String>,
     /// Display summary text.
     pub summary: String,
     /// Timestamp in Unix ms (0 if unknown).
@@ -224,6 +331,28 @@ pub struct HistoryRow {
     pub node_key: String,
     /// Parent node keys (for drawing graph edges).
     pub parents: Vec<String>,
+    /// Provider-neutral relationship kinds for the edges in [`Self::parents`].
+    ///
+    /// Each entry pairs one drawn parent with the semantic kind of the edge,
+    /// so the viewer can annotate compact branch/start and return/completion
+    /// semantics without parsing provider-specific raw JSON:
+    ///
+    /// - `"subagent"` — the parent edge is a `SubagentOf` structural note:
+    ///   this row starts a subagent branch spawned by the target row.
+    /// - `"reconnect"` — the parent edge is a `ReconnectsTo` structural note:
+    ///   this row is the parent thread's completion result returning into the
+    ///   target row (the subagent's last op).
+    /// - `"fork"` — the parent edge is a `ForkOf` structural note: this row
+    ///   branches off the target row at a fork divergence boundary.
+    ///
+    /// One entry is listed per parent key in [`Self::parents`] whose edge is
+    /// structural (the row's final lifted parents after filtering/splicing),
+    /// so the client can match relations to the parent keys it renders and
+    /// annotate the row itself — a `"subagent"` relation marks this row as a
+    /// branch start, `"reconnect"` as a return/completion row. Absent on older
+    /// services or plain edges — the list is empty then, never `null`.
+    #[serde(default)]
+    pub parent_relations: Vec<ParentRelationDto>,
     /// Whether this row belongs to a nested/submodule repository.
     pub is_submodule: bool,
     /// Whether this is a system-generated node (tool results, raw import
@@ -274,6 +403,44 @@ pub struct HistoryRow {
     pub subop_kind: Option<String>,
 }
 
+/// One typed parent edge on a history row.
+///
+/// `parent` is a node key from [`HistoryRow::parents`]; `kind` is a
+/// provider-neutral relationship kind (see [`ParentRelationKind`]). Unknown
+/// kinds deserialize to [`ParentRelationKind::Unknown`], so a newer service
+/// never breaks an older viewer (forward compatibility with new structural
+/// relationships).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentRelationDto {
+    /// The parent node key this relation applies to (matches a key in
+    /// [`HistoryRow::parents`]).
+    pub parent: String,
+    /// Provider-neutral relationship kind of this parent edge.
+    pub kind: ParentRelationKind,
+}
+
+/// Provider-neutral relationship kinds for a structural parent edge.
+///
+/// Serialized as lowercase strings (`"subagent"`, `"reconnect"`, `"fork"`).
+/// Unknown strings deserialize to [`Self::Unknown`] so clients tolerate new
+/// structural relationships from newer services; the viewer ignores unknown
+/// kinds instead of breaking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ParentRelationKind {
+    /// The row starts a subagent branch spawned by the target row.
+    Subagent,
+    /// The row is the parent thread's completion result returning into the
+    /// subagent branch (the target row is the subagent's last op).
+    Reconnect,
+    /// The row branches off the target row at a fork divergence boundary.
+    Fork,
+    /// A relationship kind this client does not recognize (forward
+    /// compatibility).
+    #[serde(other)]
+    Unknown,
+}
+
 /// A bundled metadata sub-op attached to a history row.
 ///
 /// Metadata-only records (e.g. `last-prompt`, `permission-mode`, `custom-title`,
@@ -305,10 +472,10 @@ pub struct HistoryWindow {
     /// the graph column stably regardless of which window is loaded.
     #[serde(default)]
     pub max_lane: usize,
-    /// Global per-top-level-node bundled sub-op counts for THIS filter state,
-    /// shipped with every window. The client uses these prefix sums to map between
-    /// absolute slot indices and visible indices under inline reveal, so a deep
-    /// jump must not depend on the offset==0 window having been fetched first.
+    /// Global per-top-level-node bundled sub-op counts for this filter state.
+    /// Present on the offset-zero window that establishes a snapshot and omitted
+    /// from subsequent pages so response size remains proportional to `limit`.
+    /// The client retains these prefix sums for visible/absolute index mapping.
     #[serde(default)]
     pub sub_op_counts: Option<Vec<usize>>,
 }
@@ -319,33 +486,458 @@ pub struct NodeDetails {
     /// The operation ID (display form `"node:boot:seq"`), if this is an
     /// `EditChain` op. Stored as a string to avoid JS precision loss.
     pub op_id: Option<String>,
-    /// The git commit OID, if this is a git commit.
-    pub git_oid: Option<GitOid>,
-    /// The repository, if this is a git commit.
-    pub repository: Option<RepositoryId>,
+    /// The git commit OID (for git commits) as lowercase hex — a string so it
+    /// round-trips exactly through JavaScript.
+    pub git_oid: Option<String>,
+    /// The repository (for git commits) as an exact decimal `RepositoryId`
+    /// string — a string so u64 values above 2^53 round-trip exactly.
+    pub repository: Option<String>,
     /// Display summary.
     pub summary: String,
     /// Full payload text (message/content), if available.
     pub body: String,
-    /// Parent operation IDs (for `EditChain` ops).
-    pub parents: Vec<OpId>,
-    /// Parent commit OIDs (for git commits).
-    pub git_parents: Vec<GitOid>,
+    /// Parent operation IDs (for `EditChain` ops) as exact `"node:boot:seq"`
+    /// strings.
+    pub parents: Vec<String>,
+    /// Parent commit OIDs (for git commits) as lowercase hex strings.
+    pub git_parents: Vec<String>,
     /// Refs pointing at this commit (for git commits).
     pub refs: Vec<String>,
     /// Changed paths (for git commits).
     pub changed_paths: Vec<String>,
 }
 
+/// A scored search result over the protocol.
+///
+/// Every identifier (`op_id`, `chunk_id`, `session_id`, `actor_id`) is an exact
+/// string so u64 components above 2^53 round-trip through JavaScript without
+/// precision loss. Git hits additionally carry the real commit identity
+/// (`git_oid` lowercase hex, `repository` exact decimal, `kind` `"git"`,
+/// `is_submodule`) so the renderer navigates by `ResolveObject` instead of the
+/// synthetic index-only `op_id`. Scores, timestamps, and counts stay numeric
+/// where safe.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchHit {
+    /// The operation ID this chunk belongs to (`"node:boot:seq"`).
+    ///
+    /// For `Git` hits this is a synthetic id used only inside the search index
+    /// (`0:0:generation`); it is NOT a projection node and must never be used
+    /// for `GetNodeDetails` navigation.
+    pub op_id: String,
+    /// The chunk identifier (`"node:boot:seq:ordinal"`).
+    pub chunk_id: String,
+    /// Fused relevance score (higher = more relevant).
+    pub score: f64,
+    /// The text content of this chunk.
+    pub text: String,
+    /// The source domain (`EditChain` or `Git`).
+    pub source: Source,
+    /// The session this chunk belongs to, if any (exact decimal `SessionId`
+    /// string; `None` for git commits, which have no session scope).
+    pub session_id: Option<String>,
+    /// The actor that produced this chunk (exact decimal `ActorId` string).
+    pub actor_id: String,
+    /// Bitmask of operation kind tags (numeric count of tag bits).
+    pub kind_tags: u64,
+    /// Timestamp in milliseconds since Unix epoch.
+    pub timestamp_ms: u64,
+    /// Generation counter for read-your-writes consistency.
+    pub generation: u64,
+    /// The git commit OID (for `Git` hits) as lowercase hex — `None` for
+    /// `EditChain` hits. A string so it round-trips exactly through JavaScript.
+    #[serde(default)]
+    pub git_oid: Option<String>,
+    /// The repository (for `Git` hits) as an exact decimal `RepositoryId`
+    /// string — `None` for `EditChain` hits.
+    #[serde(default)]
+    pub repository: Option<String>,
+    /// Discriminated identity tag: `"git"` for real git commits, or the
+    /// `EditChain` op kind (`"message"`, `"tool"`, ...) when known.
+    #[serde(default)]
+    pub kind: String,
+    /// Whether a `Git` hit belongs to a nested/submodule repository.
+    #[serde(default)]
+    pub is_submodule: bool,
+}
+
+/// A search response over the protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResponse {
+    /// The scored search result chunks.
+    pub results: Vec<SearchHit>,
+}
+
 /// Information about a discovered git repository.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryInfo {
-    /// Repository identity.
-    pub id: RepositoryId,
+    /// Repository identity as an exact decimal `RepositoryId` string (u64
+    /// values above 2^53 must not be rounded by JavaScript).
+    pub id: String,
     /// Path to the repository root.
     pub path: String,
     /// Whether this is a linked worktree.
     pub is_worktree: bool,
     /// Whether this is a nested/submodule repository (not the workspace root).
     pub is_submodule: bool,
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Tests index into freshly constructed serde_json::Value trees"
+)]
+mod tests {
+    use super::*;
+    use editchain_core::{GitOid, NodeId, OpId};
+
+    /// 2^53 + 1 — the first integer JavaScript's IEEE-754 doubles round.
+    const OVER_2_53: u64 = 9_007_199_254_740_993;
+
+    fn big_op_id() -> OpId {
+        OpId::new(NodeId(OVER_2_53), 7, 42)
+    }
+
+    fn big_oid() -> GitOid {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0xde;
+        bytes[1] = 0xad;
+        GitOid::new(GitObjectFormat::Sha1, bytes)
+    }
+
+    /// The 40-char SHA-1 hex form of [`big_oid`].
+    fn big_oid_hex() -> String {
+        format!("dead{}", "0".repeat(36))
+    }
+
+    #[test]
+    fn history_row_identifiers_serialize_as_exact_strings() {
+        let row = HistoryRow {
+            op_id: Some(big_op_id().to_string()),
+            git_oid: Some(big_oid().to_hex()),
+            repository: Some(OVER_2_53.to_string()),
+            summary: "row".to_string(),
+            timestamp_ms: 1_700_000_000_000,
+            group: "repo:big".to_string(),
+            node_key: big_op_id().to_string(),
+            parents: vec![big_op_id().to_string()],
+            parent_relations: vec![ParentRelationDto {
+                parent: big_op_id().to_string(),
+                kind: ParentRelationKind::Subagent,
+            }],
+            is_submodule: false,
+            is_system: false,
+            author: String::new(),
+            commit_id: String::new(),
+            kind: "git".to_string(),
+            lane: 0,
+            above: Vec::new(),
+            below: Vec::new(),
+            transitions: Vec::new(),
+            sub_ops: Vec::new(),
+            is_subop: false,
+            parent_row: None,
+            subop_kind: None,
+        };
+        let json = serde_json::to_value(&row).expect("serialize");
+        assert_eq!(json["op_id"], "9007199254740993:7:42");
+        assert_eq!(json["git_oid"], big_oid_hex());
+        assert_eq!(json["repository"], "9007199254740993");
+        assert_eq!(json["parents"][0], "9007199254740993:7:42");
+        assert_eq!(
+            json["parent_relations"][0]["parent"],
+            "9007199254740993:7:42"
+        );
+        assert_eq!(json["parent_relations"][0]["kind"], "subagent");
+        assert_eq!(json["timestamp_ms"], 1_700_000_000_000u64);
+        // Exact round-trip through deserialization.
+        let back: HistoryRow = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.repository.as_deref(), Some("9007199254740993"));
+        assert_eq!(back.git_oid.as_deref(), Some(big_oid_hex().as_str()));
+        assert_eq!(back.parent_relations[0].kind, ParentRelationKind::Subagent);
+    }
+
+    #[test]
+    fn history_row_parent_relations_default_to_empty_for_sparse_payloads() {
+        // Older services / fixture rows omit `parent_relations` entirely; it
+        // must deserialize to an empty list (never `null` or an error), so the
+        // viewer can iterate it unconditionally.
+        let sparse: HistoryRow = serde_json::from_value(serde_json::json!({
+            "op_id": null,
+            "git_oid": null,
+            "repository": null,
+            "summary": "row",
+            "timestamp_ms": 0,
+            "group": "session:1",
+            "node_key": "1:0:1",
+            "parents": ["1:0:0"],
+            "is_submodule": false,
+        }))
+        .expect("sparse HistoryRow without parent_relations");
+        assert!(sparse.parent_relations.is_empty());
+        // Unknown relationship kinds deserialize to the forward-compatible
+        // Unknown variant (and re-serialize as a string), so a newer service
+        // never breaks an older viewer.
+        let unknown: ParentRelationDto = serde_json::from_value(serde_json::json!({
+            "parent": "1:0:1",
+            "kind": "supercedes",
+        }))
+        .expect("unknown kind tolerated");
+        assert_eq!(unknown.kind, ParentRelationKind::Unknown);
+        let reserialized = serde_json::to_string(&unknown).expect("serialize unknown kind");
+        assert!(reserialized.contains("\"unknown\""), "got {reserialized}");
+    }
+
+    #[test]
+    fn node_details_identifiers_serialize_as_exact_strings() {
+        let details = NodeDetails {
+            op_id: Some(big_op_id().to_string()),
+            git_oid: Some(big_oid().to_hex()),
+            repository: Some(OVER_2_53.to_string()),
+            summary: "details".to_string(),
+            body: String::new(),
+            parents: vec![big_op_id().to_string()],
+            git_parents: vec![big_oid().to_hex()],
+            refs: Vec::new(),
+            changed_paths: Vec::new(),
+        };
+        let json = serde_json::to_value(&details).expect("serialize");
+        assert_eq!(json["git_oid"], big_oid_hex());
+        assert_eq!(json["repository"], "9007199254740993");
+        assert_eq!(json["parents"][0], "9007199254740993:7:42");
+        assert_eq!(json["git_parents"][0], big_oid_hex());
+    }
+
+    #[test]
+    fn repository_info_id_serializes_as_exact_string() {
+        let info = RepositoryInfo {
+            id: OVER_2_53.to_string(),
+            path: "/tmp/repo".to_string(),
+            is_worktree: false,
+            is_submodule: true,
+        };
+        let json = serde_json::to_value(&info).expect("serialize");
+        assert_eq!(json["id"], "9007199254740993");
+        assert!(
+            !json["id"].is_number(),
+            "id must never serialize as a number"
+        );
+    }
+
+    #[test]
+    fn resolve_object_request_round_trips_exact_strings() {
+        let req = ResolveObjectRequest {
+            repository: OVER_2_53.to_string(),
+            oid: big_oid().to_hex(),
+        };
+        let json = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(json["repository"], "9007199254740993");
+        assert_eq!(json["oid"], big_oid_hex());
+        let back: ResolveObjectRequest = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.repository, OVER_2_53.to_string());
+        assert_eq!(back.oid, big_oid_hex());
+    }
+
+    #[test]
+    fn resolved_object_serializes_identities_as_exact_strings() {
+        let signature = GitSignature {
+            name: Payload::Inline(b"Alice".to_vec()),
+            email: Payload::Inline(b"alice@example.com".to_vec()),
+            when: 1_700_000_000,
+        };
+        let resolved = ResolvedObject {
+            repository: OVER_2_53.to_string(),
+            object_format: GitObjectFormat::Sha1,
+            oid: big_oid_hex(),
+            imported_record: Some(big_op_id().to_string()),
+            availability: GitAvailability::Resolved,
+            tree: big_oid_hex(),
+            parents: vec![big_oid_hex()],
+            author: signature.clone(),
+            committer: signature,
+            authored_at: 1_700_000_000,
+            committed_at: 1_700_000_001,
+            message: Payload::Inline(b"initial commit".to_vec()),
+            imported_refs: vec![Payload::Inline(b"refs/heads/main".to_vec())],
+            live_refs: vec![Payload::Inline(b"refs/heads/main".to_vec())],
+            changed_paths: vec![OVER_2_53.to_string()],
+        };
+        let json = serde_json::to_value(&resolved).expect("serialize");
+        assert_eq!(json["repository"], "9007199254740993");
+        assert_eq!(json["oid"], big_oid_hex());
+        assert_eq!(json["tree"], big_oid_hex());
+        assert_eq!(json["parents"][0], big_oid_hex());
+        assert_eq!(json["imported_record"], "9007199254740993:7:42");
+        assert_eq!(json["changed_paths"][0], "9007199254740993");
+        assert_eq!(json["object_format"], "Sha1");
+        assert_eq!(json["availability"], "Resolved");
+        assert_eq!(json["authored_at"], 1_700_000_000i64);
+        // Every identity must be an exact string, never a number or a raw
+        // structural ID object (the pre-DTO wire form leaked repository u64,
+        // GitOid bytes arrays, and OpId node/boot/seq numbers).
+        for key in ["repository", "oid", "tree", "imported_record"] {
+            assert!(
+                json[key].is_string(),
+                "{key} must serialize as a string: {json}"
+            );
+        }
+        assert!(json["parents"][0].is_string());
+        assert!(json["changed_paths"][0].is_string());
+        assert!(!json["repository"].is_number());
+        assert!(json["oid"]["bytes"].is_null(), "oid must not leak bytes");
+        assert!(
+            json["imported_record"]["node"].is_null(),
+            "imported_record must not leak node"
+        );
+        // Exact round-trip through deserialization.
+        let back: ResolvedObject = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.repository, OVER_2_53.to_string());
+        assert_eq!(
+            back.imported_record.as_deref(),
+            Some("9007199254740993:7:42")
+        );
+        assert_eq!(back.changed_paths, vec![OVER_2_53.to_string()]);
+        assert_eq!(back.parents, vec![big_oid_hex()]);
+        assert_eq!(back.tree, big_oid_hex());
+        assert_eq!(back.author.when, 1_700_000_000);
+    }
+
+    #[test]
+    fn search_response_identifiers_serialize_as_exact_strings() {
+        let hit = SearchHit {
+            op_id: big_op_id().to_string(),
+            chunk_id: format!("{}:3", big_op_id()),
+            score: 0.5,
+            text: "chunk text".to_string(),
+            source: Source::EditChain,
+            session_id: Some(OVER_2_53.to_string()),
+            actor_id: OVER_2_53.to_string(),
+            kind_tags: 3,
+            timestamp_ms: 1_700_000_000_000,
+            generation: 12,
+            git_oid: None,
+            repository: None,
+            kind: String::new(),
+            is_submodule: false,
+        };
+        let response = SearchResponse { results: vec![hit] };
+        let json = serde_json::to_value(&response).expect("serialize");
+        let hit_json = &json["results"][0];
+        assert_eq!(hit_json["op_id"], "9007199254740993:7:42");
+        assert_eq!(hit_json["chunk_id"], "9007199254740993:7:42:3");
+        assert_eq!(hit_json["session_id"], "9007199254740993");
+        assert_eq!(hit_json["actor_id"], "9007199254740993");
+        assert_eq!(hit_json["timestamp_ms"], 1_700_000_000_000u64);
+        assert_eq!(hit_json["kind_tags"], 3u64);
+        assert_eq!(hit_json["generation"], 12u64);
+        assert!(
+            hit_json["git_oid"].is_null(),
+            "EditChain hit has no git_oid"
+        );
+        assert!(
+            hit_json["repository"].is_null(),
+            "EditChain hit has no repository"
+        );
+        // All identifiers must be JSON strings, never numbers.
+        for key in ["op_id", "chunk_id", "session_id", "actor_id"] {
+            assert!(
+                hit_json[key].is_string(),
+                "{key} must serialize as a string: {hit_json}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_search_hit_serializes_real_identity_as_exact_strings() {
+        let hit = SearchHit {
+            // Synthetic index-only op id: present but never navigable.
+            op_id: "0:0:42".to_string(),
+            chunk_id: "0:0:42:0".to_string(),
+            score: 0.75,
+            text: "initial commit".to_string(),
+            source: Source::Git,
+            session_id: None,
+            actor_id: "1".to_string(),
+            kind_tags: 0,
+            timestamp_ms: 1_700_000_000_000,
+            generation: 42,
+            git_oid: Some(big_oid_hex()),
+            repository: Some(OVER_2_53.to_string()),
+            kind: "git".to_string(),
+            is_submodule: true,
+        };
+        let json = serde_json::to_value(&hit).expect("serialize");
+        assert_eq!(json["git_oid"], big_oid_hex());
+        assert_eq!(json["repository"], "9007199254740993");
+        assert_eq!(json["kind"], "git");
+        assert_eq!(json["is_submodule"], true);
+        assert_eq!(json["op_id"], "0:0:42");
+        // Git identity must round-trip as exact strings, never numbers.
+        let back: SearchHit = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.git_oid.as_deref(), Some(big_oid_hex().as_str()));
+        assert_eq!(back.repository.as_deref(), Some("9007199254740993"));
+        assert_eq!(back.kind, "git");
+        assert!(back.is_submodule);
+        // Sparse payloads (older clients) default the new fields safely.
+        let sparse: SearchHit = serde_json::from_value(serde_json::json!({
+            "op_id": "1:0:1",
+            "chunk_id": "1:0:1:0",
+            "score": 1.0,
+            "text": "row",
+            "source": "EditChain",
+            "session_id": null,
+            "actor_id": "1",
+            "kind_tags": 0,
+            "timestamp_ms": 0,
+            "generation": 0,
+        }))
+        .expect("deserialize sparse hit");
+        assert!(sparse.git_oid.is_none());
+        assert!(sparse.repository.is_none());
+        assert_eq!(sparse.kind, "");
+        assert!(!sparse.is_submodule);
+    }
+
+    #[test]
+    fn search_filters_dto_round_trips_string_ids_and_numeric_ranges() {
+        let filters = SearchFiltersDto {
+            kinds: Some(vec![TagFilter::Message, TagFilter::Command]),
+            sources: Some(vec![Source::EditChain]),
+            sessions: Some(vec![OVER_2_53.to_string()]),
+            actors: Some(vec![OVER_2_53.to_string()]),
+            paths: Some(vec!["src/**".to_string()]),
+            after: Some(1),
+            before: Some(1_700_000_000_000),
+            include_raw: false,
+            include_private: false,
+        };
+        let json = serde_json::to_value(&filters).expect("serialize");
+        assert_eq!(json["sessions"][0], "9007199254740993");
+        assert_eq!(json["actors"][0], "9007199254740993");
+        assert_eq!(json["kinds"][0], "Message");
+        assert_eq!(json["after"], 1u64);
+        assert_eq!(json["before"], 1_700_000_000_000u64);
+        let back: SearchFiltersDto = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.sessions.as_deref(), Some(&[OVER_2_53.to_string()][..]));
+        assert_eq!(back.actors.as_deref(), Some(&[OVER_2_53.to_string()][..]));
+    }
+
+    #[test]
+    fn chain_filter_dto_round_trips_include_kind_pattern() {
+        let dto = ChainFilterDto {
+            summary_pattern: String::new(),
+            kind_pattern: String::new(),
+            include_kind_pattern: "^(message|command)$".to_string(),
+            hide_undated: true,
+            splice: true,
+        };
+        let json = serde_json::to_value(&dto).expect("serialize");
+        assert_eq!(json["include_kind_pattern"], "^(message|command)$");
+        let back: ChainFilterDto = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.include_kind_pattern, "^(message|command)$");
+        // Absent field defaults to empty (no inclusion constraint).
+        let sparse: ChainFilterDto =
+            serde_json::from_value(serde_json::json!({ "splice": true })).expect("deserialize");
+        assert_eq!(sparse.include_kind_pattern, "");
+        assert!(sparse.splice);
+    }
 }

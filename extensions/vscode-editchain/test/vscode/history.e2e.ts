@@ -99,8 +99,10 @@ describe('EditChain History Explorer', () => {
     const webview = await workbench.getWebviewByTitle('EditChain History');
     await webview.open();
 
-    // Wait for rows to render (the real service round-trips async).
-    await browser.$('.row').waitForExist({ timeout: 20000 });
+    // Wait for rows to render. Opening the 119k-node chain can take 20s+ (the
+    // service builds blobs/diagnostics on Open), so the deadline is long — the
+    // outer mocha timeout bounds the run, not a fixed service deadline.
+    await browser.$('.row').waitForExist({ timeout: 120000 });
 
     const rowCount = await browser.$$('.row').length;
     console.log('[e2e] rows rendered:', rowCount);
@@ -114,7 +116,7 @@ describe('EditChain History Explorer', () => {
     }, PROBE_SRC);
 
     // Wait for the UI to settle deterministically, then run textual checks.
-    const idle = await browser.execute(() => window.__editchainDebug.whenIdle(8000));
+    const idle = await browser.execute(() => window.__editchainDebug.whenIdle(60000));
     console.log('[e2e] idle:', JSON.stringify(idle));
 
     const assertion = await browser.execute(() => window.__editchainDebug.assertLayout());
@@ -122,11 +124,19 @@ describe('EditChain History Explorer', () => {
     assertion.checks.forEach((c) =>
       console.log('[e2e]   ' + c.name + ' ' + (c.pass ? 'PASS' : 'FAIL') + ' — ' + c.detail));
 
-    // The probe must have executed and produced a well-formed result. We do NOT
-    // assert zero failures here: known layout bugs (overflow, dot alignment) are
-    // surfaced as FAIL checks for the agent to fix, not as test blockers.
+    // The probe must have executed and produced a well-formed result, and every
+    // layout check must pass. The harness checks were corrected so scenario
+    // gaps are skipped rather than false-failing, and per-scenario checks are
+    // now test-blocking: a layout regression fails the e2e run instead of being
+    // recorded for later.
     expect(typeof assertion.passCount).toBe('number');
-    expect(typeof assertion.failCount).toBe('number');
+    expect(assertion.failCount).toBe(0);
+
+    // Deterministic capture for the visual reviewer: taken only after whenIdle
+    // + passing checks, so the screenshot shows a settled, rendered table.
+    const shotPath = path.join(__dirname, '..', '..', 'trace', 'e2e-history.png');
+    await browser.saveScreenshot(shotPath);
+    console.log('[e2e] screenshot ->', shotPath);
 
     // Leave the webview context.
     await webview.close();
@@ -142,24 +152,30 @@ describe('EditChain History Explorer', () => {
     const webview = await workbench.getWebviewByTitle('EditChain History');
     await webview.open();
 
-    // Wait for the first window to render.
-    await browser.$('.row').waitForExist({ timeout: 20000 });
+    // Wait for the first window to render (long deadline — see above).
+    await browser.$('.row').waitForExist({ timeout: 120000 });
 
     // Scroll to the bottom smoothly until no more rows load (visible in video).
     await scrollHistoryToBottomSmooth();
 
     // The webview is a thin viewport: it renders only a slice around the scroll
     // position, NOT the whole history. So the DOM row count must stay bounded
-    // (viewport + buffer), far below the total of 953.
+    // (viewport + buffer) and far below the server-reported total. The total
+    // comes from the renderer (chain-agnostic) rather than a hardcoded chain
+    // size, so the assertion holds for any workspace.
     const rowCount = await browser.$$('.row').length;
+    const total = await browser.execute(() =>
+      typeof window.__editchainGetTotal === 'function' ? window.__editchainGetTotal() : -1);
     console.log('[e2e] viewport rows rendered:', rowCount);
+    console.log('[e2e] server total:', total);
     expect(rowCount).toBeGreaterThan(0);
-    expect(rowCount).toBeLessThan(953);
+    expect(total).toBeGreaterThan(0);
+    expect(rowCount).toBeLessThan(total);
 
-    // Confirm we reached the true bottom. The two oldest ops are the genesis
-// ChainStart (`0:0:0`) and the seed session's first op (`...:65536`); both must
-// be present at the bottom. Their relative order is racy under progressive
-// loading, so we assert presence, not strict order.
+    // Confirm we reached the true bottom. The exact genesis node id depends on
+    // the imported session (reimports renumber it), so assert chain-agnostically:
+    // the scroll position must reach maxScroll and the deepest rendered slice
+    // must contain real (non-placeholder) rows — no hardcoded id or chain size.
     const bottom = await browser.execute(() => {
       const rows = document.querySelectorAll('.row');
       const keys = Array.from(rows).slice(-5).map((r) => r.getAttribute('data-key'));
@@ -170,11 +186,15 @@ describe('EditChain History Explorer', () => {
         scrollHeight: rowsEl.scrollHeight,
         clientHeight: rowsEl.clientHeight,
         rowCount: rows.length,
+        placeholders: document.querySelectorAll('.row-placeholder').length,
       };
     });
     console.log('[e2e] bottom state:', JSON.stringify(bottom));
-    expect(bottom.keys).toContain('0:0:0');
-    expect(bottom.keys.some((k) => k.includes(':65536'))).toBe(true);
+    // The viewport must have reached the true bottom (within one viewport of
+    // maxScroll), and the deepest slice must be fully hydrated.
+    expect(bottom.scrollHeight - bottom.scrollTop).toBeLessThanOrEqual(bottom.clientHeight + 5);
+    expect(bottom.rowCount).toBeGreaterThan(0);
+    expect(bottom.placeholders).toBe(0);
 
     // Leave the webview context.
     await webview.close();

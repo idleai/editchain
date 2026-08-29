@@ -7,18 +7,30 @@
 // Row shape (HistoryRow): op_id?, git_oid?, repository?, summary, timestamp_ms,
 //   group, node_key, parents[], is_submodule, is_system, author, commit_id, kind
 // Layout shape (GraphLayout): { rows:[{node,lane}], edges:[{child,parent,points:[{row,lane}]}] }
+//
+// Identifier contract (editchain-protocol): op_id is "node:boot:seq", git_oid
+// is lowercase hex, and repository is an exact DECIMAL RepositoryId string.
+// u64 identifiers above 2^53 (e.g. 9007199254740993) must never be numbers in
+// protocol payloads — JavaScript doubles would round them. Fixture git rows
+// use a large exact repository string below so every git row click exercises
+// the exact-string navigation path.
 
 (function () {
   'use strict';
 
-  const NOW = Date.now();
+  // Fixed deterministic clock (2026-01-15T12:00:00Z). Fixture timestamps must
+  // be stable across runs and hosts so harness assertions never depend on the
+  // wall clock. Date rendering still depends on the host timezone/locale — the
+  // layout probe computes expectations with explicit Intl options instead of
+  // hardcoding a timezone-specific string.
+  const NOW = Date.UTC(2026, 0, 15, 12, 0, 0);
 
   function gitRow(key, summary, opts) {
     opts = opts || {};
     return {
       op_id: null,
       git_oid: key,
-      repository: opts.repository !== undefined ? opts.repository : 0,
+      repository: opts.repository !== undefined ? opts.repository : '9007199254740993',
       summary,
       timestamp_ms: opts.ts !== undefined ? opts.ts : NOW - key.length * 1000,
       group: opts.group !== undefined ? opts.group : 'repo:0',
@@ -207,7 +219,8 @@
     },
 
     filtered() {
-      // Submodule + system rows present; "messages only" hides them client-side.
+      // Submodule + system rows present; "messages only" (an INCLUSIVE kind
+      // constraint) and hide-submodules are applied server-side by the bridge.
       const g = mergeGraph();
       g.rows[2].is_submodule = true; // feature branch as a submodule
       g.rows[3].is_system = true;
@@ -234,6 +247,23 @@
       return { openError:'service unavailable' };
     },
 
+    warned() {
+      // A healthy chain whose Open response also reports data-integrity issues
+      // (missing blob payloads). Rows must still render below a non-blocking
+      // warning banner — the warning must never be silently discarded.
+      const g = mergeGraph();
+      return {
+        rows: g.rows,
+        layoutRows: g.layoutRows,
+        edges: g.edges,
+        openWarnings: ['6131 blob payload(s) missing from the durable store'],
+        diagnostics: {
+          blobs: { corrupt: 0, hydrated: 0, missing: 6131, unresolved: 0 },
+          chain: { accepted: 118601, duplicates: 0, quarantined: 0, records: 118601 },
+        },
+      };
+    },
+
     large() {
       return largeHistory();
     },
@@ -258,45 +288,141 @@
     // emits via ForkOf/SubagentOf/ReconnectsTo relationship notes (SPEC §1.1):
     // a shared root forks into two continuations on distinct lanes, and the
     // parent's completion result reconnects into the subagent branch — a
-    // cross-lane merge at the top. Each window row carries explicit lane /
+    // cross-lane transition at the top. Each window row carries explicit lane /
     // above / below / transitions (the shape the renderer's per-row graph
     // cells read directly), so the fork draws two diverging columns and the
-    // reconnection draws a horizontal merge connector.
+    // reconnection draws a rounded cross-lane transition.
+    //
+    // The per-row geometry below is exactly what the production layout emits
+    // for the edge list that follows (see LayoutContext::new): for each edge
+    // (child_row, child_lane) -> (parent_row, parent_lane), the child lane runs
+    // vertically down to parent_row-1, jogs onto the parent lane at that row,
+    // and the parent lane runs down to the parent row. Transitions are
+    // (child_lane, parent_lane) order, so the reconnect at row 0 jogs FROM the
+    // completion lane (0) TO the subagent lane (1), and the fork jogs at rows 2
+    // and 3 go FROM the subagent lane (1) TO lane 0.
     fork() {
       // Newest-first rows. n:0 is the reconnected completion result (on lane 0,
-      // with a cross-lane merge connector to the subagent branch on lane 1).
+      // with a cross-lane transition to the subagent branch on lane 1).
       const local = [
-        // completion result reconnecting to the subagent's last op (lane 1)
-        [0, 'node:f:0', 'completion result', { above: [0, 1], below: [0, 1], transitions: [[1, 0]] }],
+        // completion result reconnecting to the subagent's last op (lane 1):
+        // the 0 -> 1 transition begins at THIS row's own dot (the child node
+        // lives here — no synthetic top half above the dot and no source-lane
+        // bottom stub) and ends on lane 1 at the row boundary, where row 1's
+        // above=[1] continues the line into the next dot.
+        [0, 'node:f:0', 'completion result', { above: [], below: [1], transitions: [[0, 1]] }],
         // subagent's last op — the subagent branch, lane 1
         [1, 'node:f:1', 'subagent last op', { above: [1], below: [1] }],
-        // subagent's first op — forks off the shared root
-        [1, 'node:f:2', 'subagent first op', { above: [0, 1], below: [1] }],
+        // subagent's first op — forks off the spawn point (lane 0, next row)
+        // and off the shared root (lane 0, two rows below); both jogs go 1 -> 0
+        [1, 'node:f:2', 'subagent first op', { above: [1], below: [0, 1], transitions: [[1, 0]] }],
         // Agent tool_use call — the parent's spawn point, lane 0
-        [0, 'node:f:3', 'Agent tool call', { above: [0], below: [0, 1] }],
+        [0, 'node:f:3', 'Agent tool call', { above: [0, 1], below: [0], transitions: [[1, 0]] }],
         // shared root on lane 0 (both branches descend from it)
-        [0, 'node:f:4', 'shared root', { above: [], below: [0] }],
+        [0, 'node:f:4', 'shared root', { above: [0], below: [] }],
       ];
+      // Drawn parent edges (child -> parent), the single source of truth for
+      // the fork geometry: the reconnect, the subagent chain, the SubagentOf
+      // spawn edge (subagent first op -> spawn point), the fork edge (subagent
+      // first op -> shared root), and the trunk chain. Each row's `parents`
+      // below is derived from this list so badges can never reference a parent
+      // edge the layout does not draw.
+      const edges = [
+        { child: 'node:f:0', parent: 'node:f:1', points: [{ row: 0, lane: 0 }, { row: 0, lane: 1 }, { row: 1, lane: 1 }] },
+        { child: 'node:f:1', parent: 'node:f:2', points: [{ row: 1, lane: 1 }, { row: 2, lane: 1 }] },
+        { child: 'node:f:2', parent: 'node:f:3', points: [{ row: 2, lane: 1 }, { row: 2, lane: 0 }, { row: 3, lane: 0 }] },
+        { child: 'node:f:2', parent: 'node:f:4', points: [{ row: 2, lane: 1 }, { row: 3, lane: 1 }, { row: 3, lane: 0 }, { row: 4, lane: 0 }] },
+        { child: 'node:f:3', parent: 'node:f:4', points: [{ row: 3, lane: 0 }, { row: 4, lane: 0 }] },
+      ];
+      const parentsByKey = new Map();
+      for (const e of edges) {
+        const ps = parentsByKey.get(e.child) || [];
+        ps.push(e.parent);
+        parentsByKey.set(e.child, ps);
+      }
       const rows = local.map(([lane, key, summary, geo], i) => {
-        const r = opRow(key, summary, { group: 'session:s1', kind: 'message' });
+        // The completion result is a tool-kind system row (like the collab
+        // tool call the service derives ReconnectsTo from), so the badge
+        // probe can verify badges never inherit the tool row's dimmed opacity.
+        const r = opRow(key, summary, {
+          group: 'session:s1',
+          kind: key === 'node:f:0' ? 'tool' : 'message',
+          is_system: key === 'node:f:0',
+        });
         r.lane = geo.lane !== undefined ? geo.lane : lane;
         r.above = geo.above;
         r.below = geo.below;
         r.transitions = geo.transitions || [];
+        r.parents = parentsByKey.get(key) || [];
         return r;
       });
+      // Structural parent relations mirroring what the service derives from
+      // SubagentOf / ReconnectsTo / ForkOf notes: the completion result row
+      // RETURNS into the subagent branch (reconnect), the subagent's first op
+      // row STARTS the branch off the spawn marker (subagent) and forks off
+      // the shared root (fork). Every relation's parent is one of the row's
+      // `parents` (and therefore one of the drawn edges above). The renderer
+      // must badge these rows without parsing any provider JSON.
+      const relsByKey = {
+        'node:f:0': [
+          { parent: 'node:f:1', kind: 'reconnect' },
+          // Prototype-property wire values must be ignored by the viewer's
+          // own-property whitelist (and never become a garbage badge).
+          { parent: 'node:f:1', kind: 'constructor' },
+        ],
+        'node:f:2': [
+          { parent: 'node:f:3', kind: 'subagent' },
+          { parent: 'node:f:4', kind: 'fork' },
+        ],
+      };
+      for (const r of rows) {
+        r.parent_relations = relsByKey[r.node_key] || [];
+      }
       const layoutRows = local.map(([lane, key, ,], i) => ({ node: key, lane }));
-      // Edge point paths (absolute row indices, newest-first) for the two
-      // branches plus the reconnect.
-      const edges = [
-        { child: 'node:f:0', parent: 'node:f:1', points: [{ row: 0, lane: 1 }, { row: 1, lane: 1 }] },
-        { child: 'node:f:1', parent: 'node:f:2', points: [{ row: 1, lane: 1 }, { row: 2, lane: 1 }] },
-        { child: 'node:f:2', parent: 'node:f:4', points: [{ row: 2, lane: 1 }, { row: 4, lane: 0 }] },
-        { child: 'node:f:3', parent: 'node:f:4', points: [{ row: 3, lane: 0 }, { row: 4, lane: 0 }] },
-      ];
       return {
         rows, layoutRows, edges,
         max_lane: 1,
+        subOpCounts: rows.map(() => 0),
+      };
+    },
+
+    // A chain with MORE concurrent lanes than the former 128-lane clipping cap.
+    // Every lane must still be drawn inside the graph column (lane spacing
+    // compresses, then lane centres distribute proportionally across the graph
+    // budget), so the renderer never drops or clips a service lane. The first
+    // five rows form a connected production-like zigzag — consecutive nodes on
+    // alternating lanes (0,1,0,1,0) with an adjacent transition at each row,
+    // exactly as LayoutContext::new emits for a chain that weaves across two
+    // lanes: each transition begins at its row's own dot, ends on the next
+    // lane at the row boundary, and the following row's `above` continues it.
+    // This exercises the rounded transition paths under heavy compression,
+    // where the corner radius clamps to the lane distance (and, at extreme
+    // spacing, the renderer falls back to a straight orthogonal jog).
+    highLanes() {
+      const N = 200; // lanes 0..199 — exceeds 128
+      const rows = [];
+      const layoutRows = [];
+      const zigzag = [
+        { lane: 0, above: [], below: [1], transitions: [[0, 1]] },
+        { lane: 1, above: [1], below: [0], transitions: [[1, 0]] },
+        { lane: 0, above: [0], below: [1], transitions: [[0, 1]] },
+        { lane: 1, above: [1], below: [0], transitions: [[1, 0]] },
+        { lane: 0, above: [0], below: [], transitions: [] },
+      ];
+      for (let i = 0; i < N; i++) {
+        const key = 'git:lane:' + i;
+        const r = gitRow(key, 'lane row ' + i, { ts: NOW - i * 1000 });
+        const z = zigzag[i];
+        r.lane = z ? z.lane : i;
+        r.above = z ? z.above : [];
+        r.below = z ? z.below : [];
+        r.transitions = z ? z.transitions : [];
+        rows.push(r);
+        layoutRows.push({ node: key, lane: r.lane });
+      }
+      return {
+        rows, layoutRows, edges: [],
+        max_lane: N - 1,
         subOpCounts: rows.map(() => 0),
       };
     },

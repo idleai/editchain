@@ -297,10 +297,15 @@ impl LayoutContext {
         let parents: HashMap<String, Vec<String>> =
             nodes.iter().map(|k| (k.clone(), parents_of(k))).collect();
         // Build reverse adjacency (parent -> children) for boundary-edge lookup.
+        // Iterate `nodes` (canonical display order) rather than the `parents`
+        // HashMap: HashMap iteration order is process-random, so children must
+        // be pushed in a stable order for identical edge emission across runs.
         let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
-        for (key, ps) in &parents {
-            for p in ps {
-                children_of.entry(p.clone()).or_default().push(key.clone());
+        for key in nodes {
+            if let Some(ps) = parents.get(key) {
+                for p in ps {
+                    children_of.entry(p.clone()).or_default().push(key.clone());
+                }
             }
         }
         // Precompute connected components so open chains that span across a query
@@ -377,10 +382,28 @@ impl LayoutContext {
                             add_unique(below, my_lane);
                         }
                     }
+                } else if parent_row == row.saturating_add(1) {
+                    // Adjacent cross-lane edge: the jog originates at the child
+                    // node's own midpoint, so the edge has NO source-lane run.
+                    // Adding a source-lane top/bottom half at the child row
+                    // would create a dangling boundary stub; the transition
+                    // starts at the child node itself instead.
+                    // Emit the transition at the child row plus the two
+                    // destination-lane halves only; any source-lane halves at
+                    // this row come from other edges.
+                    if let Some(transitions) = row_transitions.get_mut(row) {
+                        add_unique(transitions, (my_lane, p_lane));
+                    }
+                    if let Some(below) = row_below.get_mut(row) {
+                        add_unique(below, p_lane);
+                    }
+                    if let Some(above) = row_above.get_mut(parent_row) {
+                        add_unique(above, p_lane);
+                    }
                 } else {
-                    // Different-lane edge: vertical on my_lane down to parent_row-1,
-                    // jog to p_lane at parent_row-1, then vertical on p_lane down to
-                    // parent_row.
+                    // Non-adjacent different-lane edge: vertical on my_lane down
+                    // to parent_row-1, jog to p_lane at parent_row-1, then
+                    // vertical on p_lane down to parent_row.
                     if let Some(below) = row_below.get_mut(row) {
                         add_unique(below, my_lane);
                     }
@@ -474,10 +497,12 @@ impl LayoutContext {
 
         // Emit edges whose PARENT is inside the window but whose child is above
         // it (already scrolled past). These lines enter from offscreen above and
-        // must still be drawn through the visible slice. Only when the parent is
-        // strictly below the window top (row > offset) so the clamped start
-        // point stays above the parent.
-        for row in offset.saturating_add(1)..end {
+        // must still be drawn through the visible slice. This includes a parent
+        // exactly on the window top row (`row == offset`) whose child sits
+        // immediately above the window (`child_row == offset - 1`): the child
+        // and parent collapse onto the same visible row once clamped, so the
+        // path degenerates to the top-row jog.
+        for row in offset..end {
             let key = &self.keys[row];
             let my_lane = *self.lane_at.get(key).unwrap_or(&0);
             // Find children of this node that appear above the window.
@@ -488,10 +513,30 @@ impl LayoutContext {
                             let c_lane = *self.lane_at.get(child).unwrap_or(&my_lane);
                             // Clamp to window top; webview extends up from here.
                             let draw_from = offset;
+                            let points = if row == offset {
+                                // Parent on the clamp line: the clamped start
+                                // lands on the parent's own row, so the visible
+                                // path is just the jog onto the parent's lane at
+                                // the window top (single point when lanes match).
+                                let mut pts = Vec::with_capacity(2);
+                                pts.push(GridPoint {
+                                    row: offset,
+                                    lane: c_lane,
+                                });
+                                if c_lane != my_lane {
+                                    pts.push(GridPoint {
+                                        row: offset,
+                                        lane: my_lane,
+                                    });
+                                }
+                                pts
+                            } else {
+                                build_edge_points(draw_from, c_lane, row, my_lane)
+                            };
                             edges.push(LaneEdge {
                                 child: child.clone(),
                                 parent: key.clone(),
-                                points: build_edge_points(draw_from, c_lane, row, my_lane),
+                                points,
                             });
                         }
                         _ => {}
@@ -515,6 +560,8 @@ impl LayoutContext {
         // the window. This is what keeps a merge branch that only exists far
         // below (or above) the viewport from drawing a spurious line through an
         // otherwise-empty lane.
+        // Collect candidate lanes in sorted order so edge emission is stable
+        // across processes (HashMap iteration order is process-random).
         let mut pass_through_lanes: Vec<usize> = Vec::new();
         for (lane, spans) in &self.lane_spans {
             // Spans are sorted by min; find any span covering [offset,end). Each
@@ -526,6 +573,7 @@ impl LayoutContext {
                 pass_through_lanes.push(*lane);
             }
         }
+        pass_through_lanes.sort_unstable();
         for lane in pass_through_lanes {
             edges.push(LaneEdge {
                 child: format!("__pass_through_{lane}"),
@@ -741,10 +789,14 @@ fn topological_order(nodes: &[String], parents_of: &impl Fn(&str) -> Vec<String>
             }
         }
     }
-    let mut queue: VecDeque<String> = indegree
+    // Seed the BFS queue from `nodes` in input order (not HashMap iteration
+    // order, which is process-random): roots are then emitted in a stable,
+    // meaningful tie-break (newest-first) and the whole ordering is
+    // reproducible across processes.
+    let mut queue: VecDeque<String> = nodes
         .iter()
-        .filter(|(_, deg)| **deg == 0)
-        .map(|(k, _)| k.clone())
+        .filter(|key| indegree.get(*key) == Some(&0))
+        .cloned()
         .collect();
     let mut order: Vec<String> = Vec::with_capacity(nodes.len());
     while let Some(key) = queue.pop_front() {
@@ -891,11 +943,16 @@ fn build_edge_points(
     }
 
     // If lanes differ, jog horizontally onto the parent's lane just above it.
+    // For an ADJACENT cross-lane edge (`parent_row == child_row + 1`) the jog
+    // begins at the child's own row, so its source-lane point would duplicate
+    // the child start point — skip it and keep a single transition point.
     if child_lane != parent_lane {
-        points.push(GridPoint {
-            row: run_end,
-            lane: child_lane,
-        });
+        if run_end > child_row {
+            points.push(GridPoint {
+                row: run_end,
+                lane: child_lane,
+            });
+        }
         points.push(GridPoint {
             row: run_end,
             lane: parent_lane,
@@ -1083,11 +1140,14 @@ fn compute_lane_map_reuse(
     // shift every lane by `base`.
     let mut lane_of: HashMap<String, usize> = HashMap::with_capacity(nodes_newest_first.len());
     for (cid, &base) in comp_color_by_id.iter().enumerate() {
-        // Collect this component's members.
-        let members: Vec<String> = comp_id_of_key
+        // Collect this component's members in canonical newest-first display
+        // order: HashMap iteration order is process-random and would make the
+        // per-component topological order (and thus lane geometry) differ
+        // between processes.
+        let members: Vec<String> = nodes_newest_first
             .iter()
-            .filter(|&(_, &c)| c == cid)
-            .map(|(k, _)| k.clone())
+            .filter(|key| comp_id_of_key.get(*key).copied() == Some(cid))
+            .cloned()
             .collect();
         if members.is_empty() {
             continue;
