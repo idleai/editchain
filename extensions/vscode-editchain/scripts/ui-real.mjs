@@ -6,11 +6,10 @@
 // Usage:
 //   node scripts/ui-real.mjs [--workspace DIR] [--chain-dir .editchain]
 //                            [--viewport WxH] [--out DIR] [--selector Q]
-//                            [--top-row N] [--messages-only] [--filter PATTERN]
-//                            [--expand-visible]
+//                            [--top-row N] [--scroll-row N] [--expand-visible]
 //
-// The service binary path comes from SERVICE_PATH or defaults to
-// <workspace>/target/debug/editchain-vscode-service.
+// The service binary path comes from SERVICE_PATH or prefers the workspace's
+// release build, falling back to debug when release has not been built.
 
 import puppeteer from 'puppeteer-core';
 import { spawn } from 'child_process';
@@ -28,7 +27,7 @@ const CHROME = process.env.CHROME_PATH ||
 function parseArgs(argv) {
   const args = {
     workspace: null, chainDir: '.editchain', viewport: '1440x900', out: null,
-    selector: null, shot: null, topRow: null, messagesOnly: false, filter: null,
+    selector: null, shot: null, topRow: null, scrollRow: null,
     expandVisible: false,
     // Row-ready deadline. The real service can take >20s to Open + deliver the
     // first window on a large chain, so this must be long and configurable —
@@ -44,8 +43,7 @@ function parseArgs(argv) {
     else if (a === '--selector') args.selector = argv[++i];
     else if (a === '--shot') args.shot = argv[++i];
     else if (a === '--top-row') args.topRow = parseInt(argv[++i], 10);
-    else if (a === '--messages-only') args.messagesOnly = true;
-    else if (a === '--filter') args.filter = argv[++i];
+    else if (a === '--scroll-row') args.scrollRow = parseInt(argv[++i], 10);
     else if (a === '--expand-visible') args.expandVisible = true;
     else if (a === '--row-timeout') args.rowTimeoutMs = parseInt(argv[++i], 10) || args.rowTimeoutMs;
   }
@@ -65,7 +63,7 @@ function parseViewport(vp) {
 
 // --- framed stdio client for the Rust service --------------------------------
 
-function makeServiceClient(binaryPath) {
+function makeServiceClient(binaryPath, defaultTimeoutMs) {
   const proc = spawn(binaryPath, [], { stdio: ['pipe', 'pipe', 'pipe'] });
   let buf = Buffer.alloc(0);
   let nextId = 1;
@@ -74,7 +72,9 @@ function makeServiceClient(binaryPath) {
   // Bounded default for requests that don't opt out explicitly. Open passes 0
   // (no deadline — it can legitimately take minutes), everything else gets a
   // finite cap so a hung service can never stall the harness forever.
-  const DEFAULT_TIMEOUT_MS = 30_000;
+  const DEFAULT_TIMEOUT_MS = Number.isFinite(defaultTimeoutMs) && defaultTimeoutMs > 0
+    ? defaultTimeoutMs
+    : 30_000;
 
   // Reject every outstanding request with `reason`. Used when the process
   // errors, exits, is killed, or its stdin dies — without this a pending
@@ -161,8 +161,20 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const vp = parseViewport(args.viewport);
 
+  const releaseServicePath = path.join(
+    args.workspace,
+    'target',
+    'release',
+    'editchain-vscode-service'
+  );
+  const debugServicePath = path.join(
+    args.workspace,
+    'target',
+    'debug',
+    'editchain-vscode-service'
+  );
   const servicePath = process.env.SERVICE_PATH ||
-    path.join(args.workspace, 'target', 'debug', 'editchain-vscode-service');
+    (fs.existsSync(releaseServicePath) ? releaseServicePath : debugServicePath);
   if (!fs.existsSync(servicePath)) {
     console.error('service binary not found at ' + servicePath);
     process.exit(1);
@@ -171,7 +183,9 @@ async function main() {
   const outDir = args.out || path.join(EXT_ROOT, '.ui-out', 'real');
   fs.mkdirSync(outDir, { recursive: true });
 
-  const svc = makeServiceClient(servicePath);
+  // Apply the configured large-chain row deadline to renderer-originated
+  // GetWindow calls too. Open still opts out explicitly with timeout 0 below.
+  const svc = makeServiceClient(servicePath, args.rowTimeoutMs);
 
   // Open the workspace first to confirm it loads.
   console.log('STEP open...');
@@ -226,13 +240,9 @@ async function main() {
   // Start the handshake.
   console.log('STEP start handshake...');
   // Preload persisted VS Code webview state before the handshake, so the
-  // renderer's restoreState() opens around the requested visible top row and
-  // with the messages-only checkbox / chain-filter pattern already applied to
-  // the first window fetch. Absent flags leave the state untouched (default).
+  // renderer's restoreState() opens around the requested visible top row.
   const preloadState = {};
   if (args.topRow !== null && Number.isFinite(args.topRow)) preloadState.topRow = args.topRow;
-  if (args.messagesOnly) preloadState.showMessagesOnly = true;
-  if (args.filter !== null) preloadState.filterPattern = args.filter;
   if (Object.keys(preloadState).length) {
     console.log('STEP preload state: ' + JSON.stringify(preloadState));
     await page.evaluate((state) => {
@@ -286,6 +296,96 @@ async function main() {
   console.log('STEP whenIdle...');
   await page.evaluate((timeoutMs) => window.__editchainDebug.whenIdle(timeoutMs), args.rowTimeoutMs);
   console.log('STEP idle done');
+
+  // `--top-row` exercises persisted-state restoration during startup. For a
+  // smoke test that must inspect a specific part of an already-loaded virtual
+  // history, jump after the first window has settled and require the renderer
+  // to cover that absolute visible-row index before collecting artifacts.
+  // This avoids mistaking a preload-state value for an actual scroll sample.
+  let scrollSample = null;
+  if (args.scrollRow !== null && Number.isFinite(args.scrollRow)) {
+    const requestedRow = Math.max(0, Math.floor(args.scrollRow));
+    console.log('STEP scroll to visible row ' + requestedRow + '...');
+    const preScroll = await page.evaluate(() => {
+      const rows = document.getElementById('rows');
+      const spacer = rows && rows.querySelector('.scroll-spacer');
+      const state = typeof window.__editchainGraphState === 'function'
+        ? window.__editchainGraphState()
+        : null;
+      return {
+        total: typeof window.__editchainGetTotal === 'function'
+          ? window.__editchainGetTotal()
+          : null,
+        scrollHeight: rows ? rows.scrollHeight : null,
+        clientHeight: rows ? rows.clientHeight : null,
+        spacerHeight: spacer ? spacer.style.height : null,
+        graphState: state,
+      };
+    });
+    console.log('STEP scroll precondition: ' + JSON.stringify(preScroll));
+    // A GetWindow response can make real rows available just before the
+    // renderer installs its virtual-scroll spacer. Wait for that scaffold;
+    // otherwise assigning scrollTop is silently clamped to zero and a
+    // purported deep-position smoke still captures the first viewport. A
+    // short, non-scrollable chain still has a one-pixel spacer and remains a
+    // valid target when the requested row is already in the first viewport.
+    await page.waitForFunction(() => {
+      const rows = document.getElementById('rows');
+      const spacer = rows && rows.querySelector('.scroll-spacer');
+      return rows && spacer && parseFloat(spacer.style.height) >= 1;
+    }, { timeout: args.rowTimeoutMs });
+    const applied = await page.evaluate((row) => {
+      const rows = document.getElementById('rows');
+      if (!rows) throw new Error('#rows is unavailable');
+      const firstRow = rows.querySelector('.row');
+      const rowHeight = firstRow ? firstRow.getBoundingClientRect().height : 34;
+      const maxScroll = Math.max(0, rows.scrollHeight - rows.clientHeight);
+      rows.scrollTop = Math.min(row * rowHeight, maxScroll);
+      rows.dispatchEvent(new Event('scroll'));
+      return { rowHeight, scrollTop: rows.scrollTop, maxScroll };
+    }, requestedRow);
+    console.log('STEP scroll applied: ' + JSON.stringify(applied));
+    await page.evaluate((timeoutMs) => window.__editchainDebug.whenIdle(timeoutMs), args.rowTimeoutMs);
+    const postIdle = await page.evaluate((rowHeight) => {
+      const rows = document.getElementById('rows');
+      const state = window.__editchainGraphState();
+      const rendered = Array.from(document.querySelectorAll('#rows .row'));
+      return {
+        visibleTop: Math.floor(rows.scrollTop / rowHeight),
+        scrollTop: rows.scrollTop,
+        scrollHeight: rows.scrollHeight,
+        clientHeight: rows.clientHeight,
+        renderTop: state.renderTop,
+        renderBottom: state.renderBottom,
+        firstDataRow: rendered[0] ? rendered[0].getAttribute('data-row') : null,
+        lastDataRow: rendered.length ? rendered[rendered.length - 1].getAttribute('data-row') : null,
+        placeholders: document.querySelectorAll('#rows .row-placeholder').length,
+      };
+    }, applied.rowHeight);
+    console.log('STEP scroll post-idle: ' + JSON.stringify(postIdle));
+    await page.waitForFunction((row) => {
+      const state = typeof window.__editchainGraphState === 'function'
+        ? window.__editchainGraphState()
+        : null;
+      return state && state.renderTop <= row && state.renderBottom >= row &&
+        !document.querySelector('#rows .row-placeholder');
+    }, { timeout: args.rowTimeoutMs }, requestedRow);
+    await page.evaluate((timeoutMs) => window.__editchainDebug.whenIdle(timeoutMs), args.rowTimeoutMs);
+    scrollSample = await page.evaluate((row, initial) => {
+      const rows = document.getElementById('rows');
+      const state = window.__editchainGraphState();
+      return {
+        requestedRow: row,
+        visibleTop: Math.floor(rows.scrollTop / initial.rowHeight),
+        scrollTop: rows.scrollTop,
+        rowHeight: initial.rowHeight,
+        maxScroll: initial.maxScroll,
+        renderTop: state.renderTop,
+        renderBottom: state.renderBottom,
+      };
+    }, requestedRow, applied);
+    console.log('STEP scroll done: ' + JSON.stringify(scrollSample));
+  }
 
   // Optionally expand every currently visible top-level subop chevron: click
   // each one (the renderer rebuilds the DOM per toggle), wait for the UI to
@@ -392,8 +492,7 @@ async function main() {
   const failedChecks = assertion.checks.filter((c) => !c.pass);
   const settings = [];
   if (args.topRow !== null) settings.push('topRow=' + args.topRow);
-  if (args.messagesOnly) settings.push('showMessagesOnly=true');
-  if (args.filter !== null) settings.push('filterPattern=' + JSON.stringify(args.filter));
+  if (args.scrollRow !== null) settings.push('scrollRow=' + args.scrollRow);
   if (args.expandVisible) settings.push('expandVisible=true' + (expandCount ? ' (expanded ' + expandCount + ' chevrons)' : ''));
   const summary = [
     '# EditChain real UI dump',
@@ -405,6 +504,7 @@ async function main() {
     '- viewport: ' + args.viewport,
     '- state: ' + JSON.stringify(layout.state),
     '- graph state: ' + JSON.stringify(graphState),
+    '- scroll sample: ' + JSON.stringify(scrollSample),
     '- rows rendered: ' + layout.state.rowsRendered,
     '- svg dots: ' + (layout.svg && layout.svg.dots ? layout.svg.dots.length : 0),
     '- svg edges: ' + (layout.svg && layout.svg.edges ? layout.svg.edges.length : 0),

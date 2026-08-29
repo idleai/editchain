@@ -9,11 +9,14 @@ let historyPanel: vscode.WebviewPanel | undefined = undefined;
 let output: vscode.OutputChannel | undefined = undefined;
 // Status bar item showing how many history nodes are loaded vs total.
 let statusItem: vscode.StatusBarItem | undefined = undefined;
-// The last successful Open response body. Held so a reveal or a command reuse
-// can replay the authoritative `open` + `ready` handshake to a webview whose
-// JS context was destroyed (hidden behind an editor preview) or whose bridge
-// died with the service process.
+// The last successful Open response body. Held so command reuse or a genuinely
+// recreated main.js instance can receive the authoritative `open` + `ready`
+// handshake without rebuilding the workspace.
 let lastOpenBody: any = null;
+// The most recent terminal Open error. Successful bodies and errors are kept
+// separately because only a success permits command reuse without another
+// Open, while a recreated renderer still needs the current error replayed.
+let lastOpenError: string | null = null;
 // True while an Open request is in flight. While set, a reveal must NOT replay
 // the previous workspace's open body: a new (authoritative) Open is pending and
 // its response will deliver the real state. The stale body is cleared before
@@ -27,6 +30,12 @@ let openPending = false;
 // newer Open was issued) is dropped entirely, so it can never clear a newer
 // Open's pending state or install a stale workspace body for replay.
 let openEpoch = 0;
+// Identity of the currently loaded main.js context and the context that has
+// already received the latest Open result. `retainContextWhenHidden` keeps the
+// normal detail -> back path alive; this handshake is the fallback for a real
+// context recreation (window reload, renderer recovery, or memory pressure).
+let rendererInstanceId: string | null = null;
+let openDeliveredToRenderer: string | null = null;
 
 // Generous finite deadline for NON-Open service requests (window fetches,
 // search, details). The measured first-window time on a large chain is close to
@@ -131,6 +140,11 @@ function openHistoryView(
     vscode.ViewColumn.One,
     {
       enableScripts: true,
+      // The renderer retains only a bounded viewport cache, so preserving its
+      // context while a read-only detail editor covers the panel is cheap and
+      // makes Back instantaneous: the existing DOM, scroll position, and rows
+      // are shown instead of booting into "Loading history…" again.
+      retainContextWhenHidden: true,
       localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media')],
     }
   );
@@ -139,7 +153,10 @@ function openHistoryView(
   // previous panel/workspace leak into it (e.g. via a view-state event fired
   // while the first Open is still pending).
   lastOpenBody = null;
+  lastOpenError = null;
   openPending = false;
+  rendererInstanceId = null;
+  openDeliveredToRenderer = null;
   // Clear the reference when the panel is closed so a later `open` creates a
   // fresh one instead of reusing a disposed webview.
   panel.onDidDispose(() => {
@@ -153,35 +170,24 @@ function openHistoryView(
       // and clears happen only while this panel still owns the globals.
       openEpoch++;
       lastOpenBody = null;
+      lastOpenError = null;
       openPending = false;
+      rendererInstanceId = null;
+      openDeliveredToRenderer = null;
       // Hide the status bar item once the viewer is gone.
       statusItem?.hide();
     }
   });
 
-  // When the panel becomes visible again (e.g. after navigating to a JSON
-  // editor and back), ask the webview to re-render. An editor preview in the
-  // SAME column destroys the webview's JS context (main.js's `total`, `cache`,
-  // etc. reset to empty) unless `retainContextWhenHidden` is set. `reveal` alone
-  // can't repopulate those — the webview needs the authoritative `open` body to
-  // restore `total` before it can fetch a window. So on reveal, replay the same
-  // `open` + `ready` sequence as first load. The webview then re-applies the
-  // persisted top row from `setState` to restore scroll position. Harmless if
-  // the JS context actually survived (it just re-establishes the same state).
+  // A normal detail -> Back navigation retains the renderer context, including
+  // its bounded row cache and DOM. Do not replay Open on reveal: Open is an
+  // authoritative reset and would throw that cache away. If VS Code genuinely
+  // recreates main.js, its `webviewReady` message below carries a new instance
+  // id and receives the last Open state only after its listener is installed.
   panel.onDidChangeViewState((e) => {
     output?.appendLine('[panel] view state changed, active=' + e.webviewPanel.active);
-    if (e.webviewPanel.active) {
-      if (lastOpenBody !== null && !openPending) {
-        output?.appendLine('[panel] reveal: re-sending open body');
-        panel.webview.postMessage({ id: 'open', body: lastOpenBody });
-        panel.webview.postMessage({ id: 'ready' });
-      } else if (openPending) {
-        // A new Open is in flight; its authoritative response will be delivered
-        // when it lands. Replaying the stale body now would race it.
-        output?.appendLine('[panel] view active while Open pending — waiting for authoritative body');
-      } else {
-        panel.webview.postMessage({ id: 'reveal' });
-      }
+    if (e.webviewPanel.active && openPending) {
+      output?.appendLine('[panel] retained view active while Open is pending');
     }
   });
 
@@ -193,6 +199,21 @@ function openHistoryView(
 
   // Forward webview -> service.
   panel.webview.onDidReceiveMessage(async (msg) => {
+    // main.js sends this only after installing its host-message listener. A new
+    // id means VS Code recreated the JS context; replay the cached Open result
+    // to that instance exactly once. The retained detail -> Back path sends no
+    // new handshake and therefore performs no reset or network request.
+    if (msg.type === 'webviewReady') {
+      const instanceId = typeof msg.instanceId === 'string' ? msg.instanceId : '';
+      if (!instanceId) return;
+      if (rendererInstanceId !== instanceId) {
+        rendererInstanceId = instanceId;
+        openDeliveredToRenderer = null;
+        output?.appendLine('[webview] renderer ready: ' + instanceId);
+      }
+      deliverOpenState(panel);
+      return;
+    }
     // Intercept the "open JSON editor" request from the webview: fetch the
     // node's details from the service and open a read-only JSON editor instead
     // of forwarding to the service and rendering in the webview.
@@ -265,6 +286,8 @@ function startOpen(client: StdioClient, panel: vscode.WebviewPanel): void {
   // previous workspace's body survive a restart that may fail.
   openPending = true;
   lastOpenBody = null;
+  lastOpenError = null;
+  openDeliveredToRenderer = null;
   // Opening a workspace builds the chain + git graph and can take minutes on a
   // large repo — never apply the request timeout to it. The request is rejected
   // if the service exits or is stopped, so it cannot hang indefinitely.
@@ -291,19 +314,19 @@ function startOpen(client: StdioClient, panel: vscode.WebviewPanel): void {
         : String(resp);
       output?.appendLine('[startOpen] open returned an error: ' + errText);
       lastOpenBody = null;
+      lastOpenError = errText;
       openPending = false;
-      panel.webview.postMessage({ id: 'open', body: { Error: errText } });
+      deliverOpenState(panel);
       return;
     }
     output?.appendLine('[startOpen] sending open message');
-    // Hold the last open body so a later reveal (e.g. back from a JSON editor
-    // preview, which destroys the webview's JS context) can replay it and
-    // restore the authoritative node count before fetching a window.
+    // Hold the last open body so a genuinely recreated renderer can replay it
+    // after its readiness handshake. Ordinary detail navigation retains the
+    // original context and does not enter this path.
     lastOpenBody = resp;
+    lastOpenError = null;
     openPending = false;
-    panel.webview.postMessage({ id: 'open', body: resp });
-    // After open succeeds, ask the webview to fetch the first window.
-    panel.webview.postMessage({ id: 'ready' });
+    deliverOpenState(panel);
   }).catch((e) => {
     if (epoch !== openEpoch || panel !== historyPanel) {
       output?.appendLine(
@@ -314,9 +337,36 @@ function startOpen(client: StdioClient, panel: vscode.WebviewPanel): void {
     output?.appendLine('[startOpen] open failed: ' + String(e));
     // A failed open must not be replayed as an authoritative body later.
     lastOpenBody = null;
+    lastOpenError = String(e);
     openPending = false;
-    panel.webview.postMessage({ id: 'open', body: { Error: String(e) } });
+    deliverOpenState(panel);
   });
+}
+
+/** Deliver the latest terminal Open state to the current main.js instance. */
+function deliverOpenState(panel: vscode.WebviewPanel): void {
+  if (
+    panel !== historyPanel ||
+    openPending ||
+    rendererInstanceId === null ||
+    openDeliveredToRenderer === rendererInstanceId
+  ) {
+    return;
+  }
+
+  if (lastOpenBody !== null) {
+    openDeliveredToRenderer = rendererInstanceId;
+    panel.webview.postMessage({ id: 'open', body: lastOpenBody });
+    // Kept for protocol compatibility with older renderers. The current
+    // renderer begins its first window from `open` itself.
+    panel.webview.postMessage({ id: 'ready' });
+    return;
+  }
+
+  if (lastOpenError !== null) {
+    openDeliveredToRenderer = rendererInstanceId;
+    panel.webview.postMessage({ id: 'open', body: { Error: lastOpenError } });
+  }
 }
 
 /**
@@ -454,10 +504,6 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 <body>
 <div id="controls">
 <input id="search" type="text" placeholder="Search history… (Enter to search)">
-<input id="filter" type="text" placeholder="Hide matching rows… (regex, Enter to apply)">
-<label class="toggle"><input type="checkbox" id="hideUndated"> Hide undated</label>
-<label class="toggle"><input type="checkbox" id="hideSubmodules"> Show git submodules</label>
-<label class="toggle"><input type="checkbox" id="hideSystem"> Show messages only</label>
 </div>
 <div id="layout">
 <div id="rows"></div>

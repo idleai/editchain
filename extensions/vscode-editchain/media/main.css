@@ -36,7 +36,7 @@ body {
   flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 8px;
-  /* Horizontal padding lives on the controls container (searchbar + toggles),
+  /* Horizontal padding lives on the controls container (search bar),
      not on the body, so the grid below spans edge-to-edge. */
   padding: 0 12px;
 }
@@ -44,8 +44,7 @@ body {
    border, and a focus ring that matches the theme. */
 #search {
   flex: 1 1 auto;
-  /* Keep the input usable on narrow panels; the wrap on #controls moves the
-     toggles to a second line instead of clipping them. */
+  /* Keep the input usable on narrow panels. */
   min-width: 140px;
   box-sizing: border-box;
   padding: 4px 8px;
@@ -64,30 +63,6 @@ body {
 #search:focus {
   border-color: var(--vscode-focusBorder);
 }
-/* Chain-filter input styled like the search input, but fixed-width so it sits
-   between the search bar and the toggles without competing for flex space. */
-#filter {
-  box-sizing: border-box;
-  padding: 4px 8px;
-  color: var(--vscode-input-foreground);
-  background-color: var(--vscode-input-background);
-  border: 1px solid var(--vscode-input-border, transparent);
-  border-radius: 2px;
-  outline: none;
-  /* Allow the filter to shrink on narrow panels (wraps when it can't). */
-  flex: 0 1 180px;
-  min-width: 100px;
-}
-#filter::placeholder {
-  color: var(--vscode-input-placeholderForeground);
-}
-#filter:hover {
-  border-color: var(--vscode-input-border, var(--vscode-focusBorder));
-}
-#filter:focus {
-  border-color: var(--vscode-focusBorder);
-}
-.toggle { display: flex; align-items: center; gap: 4px; color: var(--vscode-descriptionForeground); font-size: 0.9em; white-space: nowrap; flex-shrink: 0; }
 #layout { display: flex; gap: 12px; flex: 1; min-height: 0; width: 100%; }
 #rows { flex: 3; overflow-y: auto; position: relative; min-width: 0; }
 /* Detail/inspector pane is hidden until a node is selected, so it doesn't

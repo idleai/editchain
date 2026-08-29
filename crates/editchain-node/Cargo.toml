@@ -23,6 +23,7 @@ editchain-import = { path = "../editchain-import" }
 editchain-query = { path = "../editchain-query" }
 editchain-index = { path = "../editchain-index" }
 editchain-embed = { path = "../editchain-embed" }
+editchain-vscode-service = { path = "../editchain-vscode-service" }
 
 [dev-dependencies]
 tempfile = "3"

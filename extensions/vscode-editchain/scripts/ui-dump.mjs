@@ -34,7 +34,7 @@ const CHROME = process.env.CHROME_PATH ||
 const SCENARIOS = ['empty', 'linear', 'merge', 'mixed', 'filtered', 'undated', 'error', 'warned', 'large', 'longsummary', 'combined', 'fork', 'highLanes'];
 
 function parseArgs(argv) {
-  const args = { cmd: argv[0], scenario: 'merge', viewport: '1440x900', out: null, selector: null, search: null, staleRace: false, searchRace: false, resize: false, shot: null };
+  const args = { cmd: argv[0], scenario: 'merge', viewport: '1440x900', out: null, selector: null, search: null, searchRace: false, resize: false, deferredLayout: false, shot: null };
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--scenario') args.scenario = argv[++i];
@@ -42,9 +42,9 @@ function parseArgs(argv) {
     else if (a === '--out') args.out = argv[++i];
     else if (a === '--selector') args.selector = argv[++i];
     else if (a === '--search') args.search = argv[++i];
-    else if (a === '--stale-race') args.staleRace = true;
     else if (a === '--search-race') args.searchRace = true;
     else if (a === '--resize') args.resize = true;
+    else if (a === '--deferred-layout') args.deferredLayout = true;
     else if (a === '--shot') args.shot = argv[++i];
   }
   return args;
@@ -85,13 +85,53 @@ async function main() {
   page.on('pageerror', (e) => pageErrors.push(e.message));
 
   await page.goto(HARNESS, { waitUntil: 'networkidle0' });
-  await page.evaluate((scenario) => {
+  await page.evaluate((scenario, deferredLayout) => {
     window.__editchainSetScenario(scenario);
+    if (deferredLayout) {
+      window.__editchainHoldLayoutWindow = { taken: false, release: null };
+    }
     window.__editchainStart();
-  }, args.scenario);
+  }, args.scenario, args.deferredLayout);
 
-  // Wait for the UI to settle deterministically (no arbitrary sleep).
-  await page.evaluate(() => window.__editchainDebug.whenIdle(5000));
+  // Optional controlled two-stage assertion: the row-only response must paint
+  // while the layout-enabled response is held, then settle with real geometry
+  // after the harness explicitly releases it.
+  let deferredLayout = null;
+  if (args.deferredLayout) {
+    await page.waitForFunction(() => {
+      const hold = window.__editchainHoldLayoutWindow;
+      const state = typeof window.__editchainGraphState === 'function'
+        ? window.__editchainGraphState()
+        : null;
+      return document.querySelectorAll('.row:not(.row-placeholder)').length > 0 &&
+        state && state.layoutReady === false && hold && typeof hold.release === 'function';
+    }, { timeout: 5000 });
+    const provisional = await page.evaluate(() => ({
+      rows: document.querySelectorAll('.row:not(.row-placeholder)').length,
+      graphState: window.__editchainGraphState(),
+      rendererInFlight: window.__editchainInFlightCount(),
+    }));
+    await page.evaluate(() => window.__editchainHoldLayoutWindow.release());
+    await page.evaluate(() => window.__editchainDebug.whenIdle(5000));
+    const complete = await page.evaluate(() => ({
+      rows: document.querySelectorAll('.row:not(.row-placeholder)').length,
+      graphState: window.__editchainGraphState(),
+      rendererInFlight: window.__editchainInFlightCount(),
+    }));
+    deferredLayout = {
+      provisional,
+      complete,
+      pass: provisional.rows > 0 &&
+        provisional.graphState.layoutReady === false &&
+        provisional.rendererInFlight > 0 &&
+        complete.rows > 0 &&
+        complete.graphState.layoutReady === true &&
+        complete.rendererInFlight === 0,
+    };
+  } else {
+    // Wait for the UI to settle deterministically (no arbitrary sleep).
+    await page.evaluate(() => window.__editchainDebug.whenIdle(5000));
+  }
 
   // Collect artifacts.
   const layout = await page.evaluate(() => window.__editchainDebug.dumpLayout());
@@ -119,14 +159,6 @@ async function main() {
   let searchResult = null;
   if (args.search) {
     searchResult = await page.evaluate((q) => window.__editchainDebug.runSearch(q, 5000), args.search);
-  }
-
-  // Stale-response race (scenario must be `undated`): a GetWindow issued
-  // before a filter reset lands after it and must be rejected via the view
-  // generation, leaving the table on the current filter's rows.
-  let staleRace = null;
-  if (args.staleRace) {
-    staleRace = await page.evaluate(() => window.__editchainDebug.runStaleResponseRace());
   }
 
   // Reversed-search race (scenario must be `merge`): two rapid searches share
@@ -171,9 +203,9 @@ async function main() {
   fs.writeFileSync(path.join(outDir, 'aria.yml'), formatAria(page));
   if (expansion) fs.writeFileSync(path.join(outDir, 'expansion.json'), JSON.stringify(expansion, null, 2));
   if (searchResult) fs.writeFileSync(path.join(outDir, 'search.json'), JSON.stringify(searchResult, null, 2));
-  if (staleRace) fs.writeFileSync(path.join(outDir, 'stale.json'), JSON.stringify(staleRace, null, 2));
   if (searchRace) fs.writeFileSync(path.join(outDir, 'search-race.json'), JSON.stringify(searchRace, null, 2));
   if (resizeResult) fs.writeFileSync(path.join(outDir, 'resize.json'), JSON.stringify(resizeResult, null, 2));
+  if (deferredLayout) fs.writeFileSync(path.join(outDir, 'deferred-layout.json'), JSON.stringify(deferredLayout, null, 2));
 
   // Summary.
   const failedChecks = assertion.checks.filter((c) => !c.pass);
@@ -204,13 +236,6 @@ async function main() {
       ' banner="' + searchResult.bannerText + '" navigated=' + searchResult.navigated +
       ' (' + (searchOk ? 'OK' : 'FAIL') + ')');
   }
-  if (staleRace) {
-    const step = staleRace.steps[0];
-    const raceOk = step && step.staleRejected === true;
-    summary.push('- stale-response race: total=' + step.total +
-      ' keys=' + JSON.stringify(step.keys) +
-      ' (' + (raceOk ? 'OK — stale response rejected' : 'FAIL — stale response applied') + ')');
-  }
   if (searchRace) {
     const step = searchRace.steps[0];
     const raceOk = step && step.latestWins === true;
@@ -223,6 +248,12 @@ async function main() {
       ' headerAligned=' + resizeResult.detail.headerAligned +
       ' dotsInside=' + resizeResult.detail.dotsInside +
       ' (' + (resizeResult.pass ? 'OK — geometry recomputed' : 'FAIL') + ')');
+  }
+  if (deferredLayout) {
+    summary.push('- deferred layout: provisionalRows=' + deferredLayout.provisional.rows +
+      ' provisionalReady=' + deferredLayout.provisional.graphState.layoutReady +
+      ' completeReady=' + deferredLayout.complete.graphState.layoutReady +
+      ' (' + (deferredLayout.pass ? 'OK — rows painted before layout' : 'FAIL') + ')');
   }
   summary.push(
     '## Failed checks',
@@ -245,9 +276,9 @@ async function main() {
     (expansion !== null && !(expansion.subopRows === 7 && expansion.rowsRendered >= 9)) ||
     (searchResult !== null && !(searchResult.resultRows > 0 &&
       (searchResult.navigated || searchResult.firstRowChevron))) ||
-    (staleRace !== null && !(staleRace.steps[0] && staleRace.steps[0].staleRejected === true)) ||
     (searchRace !== null && !(searchRace.steps[0] && searchRace.steps[0].latestWins === true)) ||
-    (resizeResult !== null && resizeResult.pass !== true);
+    (resizeResult !== null && resizeResult.pass !== true) ||
+    (deferredLayout !== null && deferredLayout.pass !== true);
   if (args.cmd === 'check' && (failedChecks.length > 0 || pageErrors.length > 0 || interactionFailed)) {
     console.error('CHECK FAILED: ' + failedChecks.length + ' layout check(s), ' +
       pageErrors.length + ' page error(s), interactionFailed=' + interactionFailed);
@@ -267,11 +298,12 @@ async function main() {
     ' rowsRendered=' + expansion.rowsRendered);
   if (searchResult) console.log('search results=' + searchResult.resultRows +
     ' navigated=' + searchResult.navigated);
-  if (staleRace) console.log('stale-race total=' + staleRace.steps[0].total +
-    ' staleRejected=' + staleRace.steps[0].staleRejected);
   if (searchRace) console.log('search-race latestWins=' + searchRace.steps[0].latestWins);
   if (resizeResult) console.log('resize pass=' + resizeResult.pass +
     ' detail=' + JSON.stringify(resizeResult.detail));
+  if (deferredLayout) console.log('deferred-layout pass=' + deferredLayout.pass +
+    ' provisional=' + JSON.stringify(deferredLayout.provisional) +
+    ' complete=' + JSON.stringify(deferredLayout.complete));
   if (args.shot) console.log('shot -> ' + args.shot);
   console.log('artifacts -> ' + outDir);
 
@@ -329,8 +361,6 @@ function formatAria(page) {
     '# Accessibility tree',
     '',
     '- search input: #search',
-    '- toggle "Show git submodules": #hideSubmodules',
-    '- toggle "Show messages only": #hideSystem',
     '- rows container: #rows',
     '- detail pane: #detail',
     '',

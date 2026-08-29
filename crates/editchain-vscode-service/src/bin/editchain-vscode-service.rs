@@ -20,7 +20,6 @@ use editchain_core as _;
 use editchain_git as _;
 use editchain_import as _;
 use editchain_index as _;
-use editchain_node as _;
 use editchain_project as _;
 use editchain_query as _;
 use gix as _;

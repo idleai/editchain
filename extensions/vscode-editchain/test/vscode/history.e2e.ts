@@ -142,6 +142,91 @@ describe('EditChain History Explorer', () => {
     await webview.close();
   });
 
+  it('returns from node details to the retained cached history page', async () => {
+    const workbench = await browser.getWorkbench();
+
+    await browser.executeWorkbench((vscode) => {
+      vscode.commands.executeCommand('editchain-history.open');
+    });
+    const webview = await workbench.getWebviewByTitle('EditChain History');
+    await webview.open();
+    await browser.$('.row').waitForExist({ timeout: 120000 });
+
+    // Move away from the initial viewport so the assertion covers cached row
+    // identity and scroll restoration, not merely a coincidentally identical
+    // top-of-chain render.
+    await browser.execute(() => {
+      const rows = document.getElementById('rows');
+      rows.scrollTop = Math.min(3_400, Math.max(0, rows.scrollHeight - rows.clientHeight));
+    });
+    await browser.waitUntil(async () => {
+      return browser.execute(() => {
+        const rows = document.getElementById('rows');
+        return rows.scrollTop > 0 && document.querySelectorAll('.row-placeholder').length === 0;
+      });
+    }, { timeout: 30000, interval: 100 });
+
+    const before = await browser.execute(() => {
+      const rows = document.getElementById('rows');
+      const rendered = Array.from(document.querySelectorAll('.row'));
+      const candidate = rendered.find((element) => {
+        const abs = Number(element.getAttribute('data-row'));
+        const row = window.__editchainRowAt?.(abs);
+        return row && !row.is_subop && !(row.sub_ops && row.sub_ops.length) &&
+          (row.op_id || row.git_oid);
+      });
+      if (!candidate) throw new Error('no rendered detail-capable row');
+      const keys = rendered.slice(0, 8).map((row) => row.getAttribute('data-key'));
+      const result = {
+        rendererInstanceId: window.__editchainRendererInstanceId,
+        scrollTop: rows.scrollTop,
+        keys,
+        clickedKey: candidate.getAttribute('data-key'),
+      };
+      candidate.click();
+      return result;
+    });
+    expect(before.rendererInstanceId).toBeTruthy();
+
+    // Leave the iframe after its click asks the extension host to show the
+    // read-only JSON editor, then wait until that editor replaces the panel.
+    await webview.close();
+    await browser.waitUntil(async () => {
+      const tab = await workbench.getEditorView().getActiveTab();
+      return !!tab && (await tab.getTitle()) !== 'EditChain History';
+    }, { timeout: 30000, interval: 100 });
+
+    await browser.executeWorkbench(async (vscode) => {
+      await vscode.commands.executeCommand('workbench.action.navigateBack');
+    });
+
+    // Inspect the first frame presented after Back. No wait-for-row is used
+    // here: a retained page must already contain its rows and must never expose
+    // the renderer's initial Loading message.
+    const restoredWebview = await workbench.getWebviewByTitle('EditChain History');
+    await restoredWebview.open();
+    const after = await browser.execute(() => {
+      const rows = document.getElementById('rows');
+      return {
+        rendererInstanceId: window.__editchainRendererInstanceId,
+        scrollTop: rows.scrollTop,
+        keys: Array.from(document.querySelectorAll('.row')).slice(0, 8)
+          .map((row) => row.getAttribute('data-key')),
+        rowCount: document.querySelectorAll('.row').length,
+        message: document.querySelector('.view-message')?.textContent || '',
+      };
+    });
+
+    console.log('[e2e] detail/back before:', JSON.stringify(before));
+    console.log('[e2e] detail/back after:', JSON.stringify(after));
+    expect(after.rendererInstanceId).toBe(before.rendererInstanceId);
+    expect(after.scrollTop).toBe(before.scrollTop);
+    expect(after.keys).toEqual(before.keys);
+    expect(after.rowCount).toBeGreaterThan(0);
+    expect(after.message).not.toContain('Loading');
+    await restoredWebview.close();
+  });
+
   it('scrolls through the full history with a bounded viewport', async () => {
     const workbench = await browser.getWorkbench();
 

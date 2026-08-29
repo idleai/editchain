@@ -13,7 +13,6 @@ use editchain_codec as _;
 use editchain_git as _;
 use editchain_import as _;
 use editchain_index as _;
-use editchain_node as _;
 use editchain_project as _;
 use editchain_protocol as _;
 use editchain_query as _;
@@ -27,9 +26,117 @@ use editchain_core::{
 };
 use editchain_project::filter::ChainFilter;
 use editchain_protocol::{Request, RequestBody, ResponseBody, SearchFiltersDto};
-use editchain_vscode_service::{parse_git_oid, parse_repository_id, resolve_git_commit, Workspace};
+use editchain_vscode_service::{
+    parse_git_oid, parse_repository_id, prepare_render_snapshot, resolve_git_commit,
+    HistoryWindowOptions, Workspace,
+};
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
+
+fn write_page(chain_dir: &Path, page: &editchain_codec::page::Page) {
+    write_page_sequence(chain_dir, 0, page);
+}
+
+fn write_page_sequence(chain_dir: &Path, sequence: u32, page: &editchain_codec::page::Page) {
+    std::fs::create_dir_all(chain_dir).expect("create chain dir");
+    std::fs::write(
+        chain_dir.join(format!("{sequence:06}.eclog")),
+        editchain_codec::page::encode_page(page),
+    )
+    .expect("write segment");
+}
+
+#[test]
+fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let chain_dir = tmp.path().join(".editchain");
+    let first = msg_op(41, 1, b"snapshot first");
+    let second = msg_op(41, 2, b"snapshot second");
+    let mut page = editchain_codec::page::Page::new(0);
+    page.add_record(0, editchain_codec::frame::encode_op(&first).unwrap());
+    page.add_record(0, editchain_codec::frame::encode_op(&second).unwrap());
+    write_page(&chain_dir, &page);
+
+    let filter = ChainFilter::new(String::new(), String::new(), String::new(), false, true);
+    let mut live = Workspace::open(tmp.path().to_str().unwrap(), ".editchain").unwrap();
+    let expected = live.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 100,
+        hide_submodules: true,
+        filter: &filter,
+        include_layout: true,
+    });
+    let expected_details = live
+        .node_details(Some(first.id.to_string()), None)
+        .expect("live details");
+
+    let report =
+        prepare_render_snapshot(tmp.path(), Path::new(".editchain")).expect("prepare snapshot");
+    assert!(!report.reused);
+    assert_eq!(report.rows, expected.total);
+    assert!(report.bytes > 0);
+    let reused =
+        prepare_render_snapshot(tmp.path(), Path::new(".editchain")).expect("reuse snapshot");
+    assert!(reused.reused);
+    assert_eq!(reused.path, report.path);
+
+    let mut cached = Workspace::open(tmp.path().to_str().unwrap(), ".editchain").unwrap();
+    let actual = cached.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 100,
+        hide_submodules: true,
+        filter: &filter,
+        include_layout: true,
+    });
+    assert_eq!(
+        serde_json::to_value(actual).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(
+            cached
+                .node_details(Some(first.id.to_string()), None)
+                .expect("snapshot details")
+        )
+        .unwrap(),
+        serde_json::to_value(expected_details).unwrap()
+    );
+
+    let mut server = editchain_vscode_service::Server::new();
+    let open = server
+        .handle(&Request {
+            id: 1,
+            body: RequestBody::Open(editchain_protocol::OpenRequest {
+                workspace_path: tmp.path().to_string_lossy().into_owned(),
+                chain_dir: ".editchain".to_string(),
+            }),
+        })
+        .expect("snapshot open");
+    let ResponseBody::Ok(open_body) = open.body else {
+        panic!("snapshot open failed");
+    };
+    assert_eq!(open_body["render_snapshot"], "hit");
+
+    let third = msg_op(41, 3, b"snapshot invalidation");
+    let mut appended = editchain_codec::page::Page::new(1);
+    appended.add_record(0, editchain_codec::frame::encode_op(&third).unwrap());
+    write_page_sequence(&chain_dir, 1, &appended);
+    let stale_open = server
+        .handle(&Request {
+            id: 2,
+            body: RequestBody::Open(editchain_protocol::OpenRequest {
+                workspace_path: tmp.path().to_string_lossy().into_owned(),
+                chain_dir: ".editchain".to_string(),
+            }),
+        })
+        .expect("stale snapshot fallback");
+    let ResponseBody::Ok(stale_body) = stale_open.body else {
+        panic!("stale snapshot open failed");
+    };
+    assert_eq!(stale_body["render_snapshot"], "miss");
+    assert_eq!(stale_body["chain_generation"], 3);
+}
 
 /// An empty filter that hides nothing (used to keep existing tests focused on
 /// windowing rather than filtering).
@@ -56,7 +163,7 @@ fn msg_op(node: u64, seq: u64, text: &[u8]) -> Op {
 const OVER_2_53: u64 = 9_007_199_254_740_993;
 
 /// Create a temporary git repository with one commit and return its path.
-fn make_git_repo(dir: &std::path::Path) -> std::path::PathBuf {
+fn make_git_repo(dir: &Path) -> std::path::PathBuf {
     let repo = dir.join("repo");
     std::fs::create_dir_all(&repo).expect("create repo dir");
     run(&repo, &["init", "-q"]);
@@ -78,7 +185,7 @@ fn make_git_repo(dir: &std::path::Path) -> std::path::PathBuf {
     repo
 }
 
-fn run(dir: &std::path::Path, args: &[&str]) {
+fn run(dir: &Path, args: &[&str]) {
     let status = Command::new("git")
         .current_dir(dir)
         .args(args)
@@ -95,7 +202,14 @@ fn op_identifiers_above_2_53_round_trip_exactly_through_window_details_and_searc
 
     // History window: the op id must be the exact decimal string, never a
     // number that JavaScript could round.
-    let window = ws.history_window(0, 10, false, &no_filter());
+    let filter = no_filter();
+    let window = ws.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 10,
+        hide_submodules: false,
+        filter: &filter,
+        include_layout: true,
+    });
     let row = window
         .rows
         .iter()
@@ -157,10 +271,9 @@ fn op_identifiers_above_2_53_round_trip_exactly_through_window_details_and_searc
     // return the same exact strings inside an Ok envelope.
     let tmp = tempfile::tempdir().expect("tempdir");
     let chain_dir = tmp.path().join(".editchain");
-    let mut store = editchain_node::segment::SegmentStore::open(&chain_dir).unwrap();
     let mut page = editchain_codec::page::Page::new(0);
     page.add_record(0, editchain_codec::frame::encode_op(&big_op).unwrap());
-    store.append_page(&page).unwrap();
+    write_page(&chain_dir, &page);
     let mut server = editchain_vscode_service::Server::new();
     let open = server
         .handle(&Request {
@@ -198,7 +311,14 @@ fn git_resolve_uses_exact_string_ids_and_rejects_invalid_input() {
     // Open the workspace: git rows carry hex oid + decimal repository strings.
     let mut ws = Workspace::open(tmp.path().to_str().expect("utf8"), "").expect("open");
     assert!(!ws.repositories.is_empty(), "repo should be discovered");
-    let window = ws.history_window(0, 10, false, &no_filter());
+    let filter = no_filter();
+    let window = ws.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 10,
+        hide_submodules: false,
+        filter: &filter,
+        include_layout: true,
+    });
     let row = window
         .rows
         .iter()
@@ -476,7 +596,14 @@ fn history_window_returns_rows() {
     let ops = vec![msg_op(1, 1, b"first"), msg_op(1, 2, b"second")];
     let projection = editchain_project::HistoryProjection::from_ops(ops);
     let mut ws = Workspace::from_projection(projection);
-    let window = ws.history_window(0, 10, false, &no_filter());
+    let filter = no_filter();
+    let window = ws.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 10,
+        hide_submodules: false,
+        filter: &filter,
+        include_layout: true,
+    });
     assert_eq!(window.total, 2);
     assert_eq!(window.rows.len(), 2);
 }
@@ -489,7 +616,14 @@ fn op_rows_have_uniform_author_and_short_commit_id() {
     let ops = vec![msg_op(7, 42, b"hello")];
     let projection = editchain_project::HistoryProjection::from_ops(ops);
     let mut ws = Workspace::from_projection(projection);
-    let window = ws.history_window(0, 10, false, &no_filter());
+    let filter = no_filter();
+    let window = ws.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 10,
+        hide_submodules: false,
+        filter: &filter,
+        include_layout: true,
+    });
     let row = &window.rows[0];
     assert_eq!(row.author, "system");
     assert_eq!(row.commit_id, "7:42");
@@ -515,7 +649,14 @@ fn system_flag_marks_tool_and_import_ops() {
     let msg = msg_op(1, 2, b"hello");
     let projection = editchain_project::HistoryProjection::from_ops(vec![tool, msg]);
     let mut ws = Workspace::from_projection(projection);
-    let window = ws.history_window(0, 10, false, &no_filter());
+    let filter = no_filter();
+    let window = ws.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 10,
+        hide_submodules: false,
+        filter: &filter,
+        include_layout: true,
+    });
     // Rows are newest-first; find by kind.
     let tool_row = window
         .rows
@@ -606,7 +747,6 @@ fn read_frame(reader: &mut impl Read) -> Vec<u8> {
 fn get_window_geometry_identical_across_independent_processes() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let chain_dir = tmp.path().join("chain");
-    let mut store = editchain_node::segment::SegmentStore::open(&chain_dir).expect("open store");
     let mut page = editchain_codec::page::Page::new(0);
     for op in sensitive_chain_ops() {
         page.add_record(
@@ -614,7 +754,7 @@ fn get_window_geometry_identical_across_independent_processes() {
             editchain_codec::frame::encode_op(&op).expect("encode op"),
         );
     }
-    store.append_page(&page).expect("append page");
+    write_page(&chain_dir, &page);
 
     let exe = env!("CARGO_BIN_EXE_editchain-vscode-service");
     let workspace = tmp.path().to_str().expect("utf8 workspace");

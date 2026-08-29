@@ -71,8 +71,9 @@ pub enum ResponseBody {
 ///
 /// - `diagnostics` — `chain` (records decoded, accepted, exact `OpId` replays
 ///   ignored, and same-id conflicts quarantined through the core `OpSet`) and
-///   `blobs` (durable blob payloads hydrated, refs verified and preserved,
-///   missing, corrupt, or not addressable by the store).
+///   `blobs` (bounded row previews read, full payloads deferred, explicit
+///   hydrations/verified refs, and refs missing, corrupt, or not addressable by
+///   the store).
 /// - `warnings` — human-readable strings for any non-zero diagnostic count
 ///   (duplicates, quarantines, missing/corrupt blobs), so a client can surface
 ///   hydration gaps without silently treating preserved `BlobRef`s as content.
@@ -99,6 +100,18 @@ pub struct GetWindowRequest {
     /// Optional chain filter to apply before windowing.
     #[serde(default)]
     pub filter: Option<ChainFilterDto>,
+    /// Include globally stable lane/edge geometry in this response.
+    ///
+    /// The production viewer sends `false` for its first page so content rows
+    /// can paint before O(V) layout, then repeats that window with `true`.
+    /// Omitted by older clients/harnesses means `true` for compatibility.
+    #[serde(default = "default_true")]
+    pub include_layout: bool,
+}
+
+/// Serde default for backward-compatible opt-out flags.
+const fn default_true() -> bool {
+    true
 }
 
 /// Get the graph layout for a bounded window of rows.
@@ -478,6 +491,10 @@ pub struct HistoryWindow {
     /// The client retains these prefix sums for visible/absolute index mapping.
     #[serde(default)]
     pub sub_op_counts: Option<Vec<usize>>,
+    /// Whether lane/connector fields contain the globally computed layout.
+    /// `false` denotes a row-complete provisional first paint.
+    #[serde(default)]
+    pub layout_ready: bool,
 }
 
 /// Details for a single history node (for the inspector).
@@ -939,5 +956,23 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "splice": true })).expect("deserialize");
         assert_eq!(sparse.include_kind_pattern, "");
         assert!(sparse.splice);
+    }
+
+    #[test]
+    fn get_window_layout_defaults_on_for_older_clients() {
+        let legacy: GetWindowRequest = serde_json::from_value(serde_json::json!({
+            "offset": 0,
+            "limit": 500
+        }))
+        .expect("deserialize legacy request");
+        assert!(legacy.include_layout);
+
+        let provisional: GetWindowRequest = serde_json::from_value(serde_json::json!({
+            "offset": 0,
+            "limit": 500,
+            "include_layout": false
+        }))
+        .expect("deserialize provisional request");
+        assert!(!provisional.include_layout);
     }
 }

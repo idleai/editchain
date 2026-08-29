@@ -22,7 +22,7 @@ export const config: Options.Testrunner = {
         workspacePath: '/mnt/hot/ambientlight/repos/editchain',
         userSettings: {
           'editchain-history.servicePath':
-            '/mnt/hot/ambientlight/repos/editchain/target/debug/editchain-vscode-service',
+            '/mnt/hot/ambientlight/repos/editchain/target/release/editchain-vscode-service',
           // Point at the q6 import chain (lane reuse + subagent edges).
           'editchain-history.chainDir': 'outputs/cc-chain-q6',
         },

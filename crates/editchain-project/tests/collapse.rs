@@ -13,8 +13,9 @@ use regex as _;
 use serde_json as _;
 
 use editchain_core::{
-    ActorId, Clock, GitAvailability, GitCommitEntity, GitObjectFormat, GitOid, ImportOp, MessageOp,
-    NodeId, Op, OpId, OpKind, ParentSet, Payload, ScopeRef, SessionId, Tags, ToolOp, ToolStage,
+    ActorId, Clock, GitAvailability, GitCommitEntity, GitLink, GitLinkKind, GitObjectFormat,
+    GitOid, ImportOp, MessageOp, NodeId, Op, OpId, OpKind, ParentSet, Payload, RepositoryId,
+    ScopeRef, SessionId, Tags, ToolOp, ToolStage,
 };
 
 /// Build a metadata-only raw import op (tagged META).
@@ -254,6 +255,78 @@ fn meta_bundle_keeps_parents_unchanged() {
 }
 
 #[test]
+fn bundled_meta_graph_git_link_is_inherited_by_visible_anchor() {
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let turn = import_op(1, 1);
+    let msg = message_op(1, 2, turn.id, "hello world");
+    let meta = meta_import_op(1, 3);
+    let projection = HistoryProjection::from_ops_with(vec![turn.clone(), msg, meta.clone()], opts);
+    let node = projection
+        .nodes()
+        .into_iter()
+        .find(|node| node.node_key() == turn.id.to_string())
+        .unwrap();
+
+    let mut bytes = [0u8; 32];
+    bytes[0] = 7;
+    let target_oid = GitOid::new(GitObjectFormat::Sha1, bytes);
+    let mut links = std::collections::BTreeMap::new();
+    drop(links.insert(
+        meta.id,
+        vec![GitLink {
+            source: meta.id,
+            target_repo: RepositoryId(1),
+            target_oid,
+            kind: GitLinkKind::ProducedBy,
+        }],
+    ));
+
+    assert_eq!(
+        node.parent_keys(&links, &std::collections::HashMap::new()),
+        vec![target_oid.to_hex()],
+        "an explicit Git edge sourced from folded metadata must remain on its visible turn"
+    );
+}
+
+#[test]
+fn bundled_meta_based_on_link_stays_provenance_not_parent() {
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let turn = import_op(1, 1);
+    let msg = message_op(1, 2, turn.id, "hello world");
+    let meta = meta_import_op(1, 3);
+    let projection = HistoryProjection::from_ops_with(vec![turn.clone(), msg, meta.clone()], opts);
+    let node = projection
+        .nodes()
+        .into_iter()
+        .find(|node| node.node_key() == turn.id.to_string())
+        .unwrap();
+
+    let mut bytes = [0u8; 32];
+    bytes[0] = 8;
+    let target_oid = GitOid::new(GitObjectFormat::Sha1, bytes);
+    let mut links = std::collections::BTreeMap::new();
+    drop(links.insert(
+        meta.id,
+        vec![GitLink {
+            source: meta.id,
+            target_repo: RepositoryId(1),
+            target_oid,
+            kind: GitLinkKind::BasedOn,
+        }],
+    ));
+
+    assert!(
+        node.parent_keys(&links, &std::collections::HashMap::new())
+            .is_empty(),
+        "weak BasedOn provenance must not become a causal graph parent"
+    );
+}
+
+#[test]
 fn tool_result_summary_previews_content() {
     // A tool_result (Finish, empty tool_name) should preview its content, not
     // show an empty summary.
@@ -426,7 +499,7 @@ fn collapse_keeps_git_commits() {
     let mut bytes = [0u8; 32];
     bytes[0] = 9;
     projection.merge_git_commits(vec![GitCommitEntity {
-        repository: editchain_core::RepositoryId(1),
+        repository: RepositoryId(1),
         object_format: GitObjectFormat::Sha1,
         oid: GitOid::new(GitObjectFormat::Sha1, bytes),
         imported_record: None,
@@ -708,6 +781,7 @@ fn meta_under_tool_result_stays_connected_after_grouping() {
     if let OpKind::Tool(t) = &mut result_tool.kind {
         t.stage = ToolStage::Finish;
     }
+    let result_tool_id = result_tool.id;
     // A META op that bundles under the tool-result row.
     let mut meta = meta_import_op(1, 5);
     meta.parents = ParentSet::One(result_import.id);
@@ -733,6 +807,16 @@ fn meta_under_tool_result_stays_connected_after_grouping() {
         .iter()
         .any(|n| n.node_key() == result_import.id.to_string()));
     assert_eq!(nodes.len(), 2);
+    let call_node = nodes
+        .iter()
+        .find(|node| node.node_key() == call_import.id.to_string())
+        .unwrap();
+    let sub_op_ids: Vec<_> = call_node.sub_ops().iter().map(|op| op.id).collect();
+    assert_eq!(
+        sub_op_ids,
+        vec![result_tool_id, meta.id],
+        "metadata bundled beneath a grouped tool result must move with it"
+    );
     // The call + next_turn remain ONE connected chain, even though next_turn's
     // parent is the META that anchored under the folded tool result.
     assert_eq!(

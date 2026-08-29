@@ -5,6 +5,7 @@ pub mod dump;
 pub mod import;
 pub mod init;
 pub mod merge;
+pub mod prepare_view;
 pub mod retrieve;
 pub mod search;
 pub mod tail;
@@ -120,6 +121,15 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+    /// Pregenerate the fixed-view VS Code render snapshot
+    PrepareView {
+        /// Path to the workspace root
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+        /// Path to the `EditChain` directory, relative to the workspace root
+        #[arg(long, default_value = ".editchain")]
+        chain: PathBuf,
+    },
 }
 
 /// Session provider to import from.
@@ -173,5 +183,6 @@ pub fn dispatch(command: Commands) -> Result<(), Box<dyn std::error::Error>> {
             codex_helper,
             codex_helper_arg,
         ),
+        Commands::PrepareView { workspace, chain } => prepare_view::run(workspace, chain),
     }
 }

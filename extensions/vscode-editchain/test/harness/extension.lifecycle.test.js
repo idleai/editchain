@@ -119,7 +119,7 @@ function fakePanel(index, registeredCommands) {
       html: '',
       cspSource: 'vscode-webview://csp',
       asWebviewUri: (u) => uri('vscode-resource://' + u.toString()),
-      onDidReceiveMessage: () => ({ dispose() {} }),
+      onDidReceiveMessage: (cb) => { handlers.message = cb; return { dispose() {} }; },
     },
     reveal() {},
     onDidDispose: (cb) => { handlers.dispose = cb; return { dispose() {} }; },
@@ -127,6 +127,12 @@ function fakePanel(index, registeredCommands) {
     handlers,
   };
   return panel;
+}
+
+/** Announce that one concrete main.js context has installed its listener. */
+async function rendererReady(panel, instanceId = 'renderer-' + panel.index) {
+  await panel.handlers.message({ type: 'webviewReady', instanceId });
+  await flush();
 }
 
 // Install stubs, load the compiled extension fresh (module globals reset per
@@ -154,6 +160,7 @@ function loadExtension() {
   const fakeVscode = require(fakeVscodePath);
   fakeVscode.window.createWebviewPanel = (type, title, column, options) => {
     const panel = fakePanel(panels.length, registeredCommands);
+    panel.options = options;
     panels.push(panel);
     return panel;
   };
@@ -183,6 +190,7 @@ test('late Open response from a superseded panel is dropped', async () => {
   assert.equal(env.panels.length, 1);
   const panelA = env.panels[0];
   const openA = env.client.openRequests[0];
+  await rendererReady(panelA);
 
   // Panel A is disposed, then panel B is created and starts its own Open.
   panelA.handlers.dispose();
@@ -190,6 +198,7 @@ test('late Open response from a superseded panel is dropped', async () => {
   assert.equal(env.panels.length, 2);
   const panelB = env.panels[1];
   const openB = env.client.openRequests[1];
+  await rendererReady(panelB);
 
   // A's response lands LATE, after B's Open is already pending. It must be
   // dropped: it may not post into A (dead) or B, and must not cache A's body.
@@ -210,8 +219,15 @@ test('late Open response from a superseded panel is dropped', async () => {
   assert.deepEqual(panelB.webview.messages[1], { id: 'ready' });
 
   panelB.handlers.viewState({ webviewPanel: { active: true } });
+  assert.equal(panelB.webview.messages.length, 2, 'retained reveal must not reset cached rows');
+
+  // A genuinely recreated main.js context announces a NEW identity after its
+  // listener exists and gets the authoritative state exactly once.
+  await rendererReady(panelB, 'renderer-B-recreated');
   assert.deepEqual(panelB.webview.messages[2], { id: 'open', body: { Ok: { workspace: 'B' } } });
   assert.deepEqual(panelB.webview.messages[3], { id: 'ready' });
+  await rendererReady(panelB, 'renderer-B-recreated');
+  assert.equal(panelB.webview.messages.length, 4, 'same renderer identity is not replayed twice');
 });
 
 test('stale dispose and stale error must not clear a newer panel state', async () => {
@@ -220,6 +236,7 @@ test('stale dispose and stale error must not clear a newer panel state', async (
   env.open(); // panel A, Open A pending
   const panelA = env.panels[0];
   const openA = env.client.openRequests[0];
+  await rendererReady(panelA);
 
   // A is disposed while current, then B is created and starts its Open.
   panelA.handlers.dispose();
@@ -227,6 +244,7 @@ test('stale dispose and stale error must not clear a newer panel state', async (
   env.open();
   const panelB = env.panels[1];
   const openB = env.client.openRequests[1];
+  await rendererReady(panelB);
 
   // A duplicate/late dispose delivery for the STALE panel A must be a no-op:
   // it must not clear B's in-flight state nor hide B's status item.
@@ -264,6 +282,7 @@ test('disposing the current panel invalidates its in-flight Open', async () => {
   env.open(); // panel A, Open A pending
   const panelA = env.panels[0];
   const openA = env.client.openRequests[0];
+  await rendererReady(panelA);
 
   // Disposing the CURRENT panel invalidates its outstanding Open: a late Ok
   // response must not be cached for replay by a later panel.
@@ -276,6 +295,7 @@ test('disposing the current panel invalidates its in-flight Open', async () => {
   env.open();
   const panelB = env.panels[1];
   const openB = env.client.openRequests[1];
+  await rendererReady(panelB);
   panelB.handlers.viewState({ webviewPanel: { active: true } });
   assert.equal(panelB.webview.messages.length, 0, 'new panel must not replay the disposed panel body');
 
@@ -291,6 +311,7 @@ test('Open Error surfaces without ready and command reuse retries', async () => 
   env.open(); // panel A, Open A pending
   const panelA = env.panels[0];
   const openA = env.client.openRequests[0];
+  await rendererReady(panelA);
 
   // Error on the CURRENT Open: surfaced to the webview, no `ready`, no body
   // cached (so command reuse retries instead of replaying).
@@ -305,4 +326,26 @@ test('Open Error surfaces without ready and command reuse retries', async () => 
   await flush();
   assert.deepEqual(panelA.webview.messages[1], { id: 'open', body: { Ok: { workspace: 'A' } } });
   assert.deepEqual(panelA.webview.messages[2], { id: 'ready' });
+});
+
+test('history panel retains its bounded renderer context across detail navigation', async () => {
+  const env = loadExtension();
+
+  env.open();
+  const panel = env.panels[0];
+  assert.equal(
+    panel.options.retainContextWhenHidden,
+    true,
+    'VS Code must preserve the cached history DOM while a detail editor covers it'
+  );
+
+  await rendererReady(panel);
+  env.client.openRequests[0].resolve({ Ok: { workspace: 'A' } });
+  await flush();
+  assert.equal(panel.webview.messages.length, 2);
+
+  panel.handlers.viewState({ webviewPanel: { active: false } });
+  panel.handlers.viewState({ webviewPanel: { active: true } });
+  assert.equal(panel.webview.messages.length, 2, 'Back must display retained rows without replaying Open');
+  assert.equal(env.client.openRequests.length, 1, 'Back must not rebuild the workspace');
 });

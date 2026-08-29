@@ -80,6 +80,15 @@ fn event_line(token: &str) -> String {
     )
 }
 
+fn lifecycle_event_line(event_type: &str) -> String {
+    serde_json::json!({
+        "timestamp": "2026-08-26T12:00:02.000Z",
+        "type": "event_msg",
+        "payload": {"type": event_type},
+    })
+    .to_string()
+}
+
 /// Serialize one `editchain-v1` line record built from typed values.
 fn line_record(
     ordinal: u64,
@@ -187,6 +196,75 @@ fn full_import_preserves_raw_bytes_and_spills_blobs() {
             other => panic!("expected message op, got {other:?}"),
         }
     }
+}
+
+#[test]
+fn terminal_event_messages_fold_into_the_last_semantic_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw_lines = [
+        session_meta_line("thread-1", "s"),
+        event_line("SEMANTIC"),
+        lifecycle_event_line("token_count"),
+        lifecycle_event_line("task_complete"),
+        lifecycle_event_line("turn_aborted"),
+        lifecycle_event_line("task_started"),
+    ];
+    write_rollout(dir.path(), "rollout-1.jsonl", &raw_lines);
+
+    let projection = projection_bytes(&[
+        line_record(
+            1,
+            Vec::new(),
+            Some(serde_json::json!({"sessionId": "s", "threadId": "thread-1"})),
+        ),
+        line_record(
+            2,
+            vec![serde_json::json!({
+                "turnId": "turn-1",
+                "item": {"kind": "agentMessage", "id": "item-2", "text": "done"},
+            })],
+            None,
+        ),
+        line_record(3, Vec::new(), None),
+        line_record(4, Vec::new(), None),
+        line_record(5, Vec::new(), None),
+        line_record(6, Vec::new(), None),
+    ]);
+    let harness = import(dir.path(), &fixed_helper(&dir, &projection));
+
+    assert_eq!(harness.report.raw_ops, 6);
+    assert_eq!(harness.report.normalized_ops, 1);
+    let raw = &harness.ops.ops[..6];
+    assert!(!raw[1].tags.matches_any(Tags::META));
+    for op in &raw[2..5] {
+        assert!(
+            op.tags.matches_all(Tags::IMPORT | Tags::META),
+            "terminal lifecycle event must be foldable metadata: {op:?}"
+        );
+    }
+    assert!(
+        !raw[5].tags.matches_any(Tags::META),
+        "task_started is a turn prologue and must not fold backward"
+    );
+
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let history =
+        editchain_project::HistoryProjection::from_ops_with(harness.ops.ops.clone(), opts);
+    let semantic_key = raw[1].id.to_string();
+    let semantic = history
+        .nodes()
+        .into_iter()
+        .find(|node| node.node_key() == semantic_key)
+        .expect("semantic turn row");
+    let bundled_ids: Vec<_> = semantic.sub_ops().iter().map(|op| op.id).collect();
+    assert_eq!(bundled_ids, vec![raw[2].id, raw[3].id, raw[4].id]);
+    assert_eq!(
+        history.nodes().len(),
+        3,
+        "session metadata, semantic turn, and task_started should remain top-level"
+    );
 }
 
 #[test]

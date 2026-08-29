@@ -195,12 +195,32 @@ pub fn apply(
     representative: &HashMap<OpId, OpId>,
     filter: &ChainFilter,
 ) -> Vec<HistoryNode> {
+    apply_owned(nodes.to_vec(), links, note_map, representative, filter)
+}
+
+/// Apply a [`ChainFilter`] while consuming an already-owned node list.
+///
+/// Projection ordering naturally produces an owned vector. Consuming it here
+/// avoids cloning every operation payload a second time merely to rewrite the
+/// parent set of retained rows.
+#[must_use]
+#[expect(
+    clippy::implicit_hasher,
+    reason = "The relationship-note map keeps the default RandomState hasher, consistent with the projection's field; not worth generalizing for a read-only traversal."
+)]
+pub fn apply_owned(
+    nodes: Vec<HistoryNode>,
+    links: &std::collections::BTreeMap<OpId, Vec<editchain_core::GitLink>>,
+    note_map: &HashMap<OpId, Vec<Op>>,
+    representative: &HashMap<OpId, OpId>,
+    filter: &ChainFilter,
+) -> Vec<HistoryNode> {
     if filter.is_empty() || nodes.is_empty() {
-        return nodes.to_vec();
+        return nodes;
     }
     // The visible rows of THIS filtered list: a spliced/kept parent is only kept
     // when it resolves to one of them (directly or via a folded representative).
-    let present = crate::row_node_keys(nodes);
+    let present = crate::row_node_keys(&nodes);
 
     // Structural relationship anchor/target rows are graph-topology-critical:
     // hiding them (e.g. "messages only" excluding a tool-kind spawn marker, or
@@ -233,7 +253,7 @@ pub fn apply(
     let mut parents_of_key = HashMap::with_capacity(nodes.len());
     // Reverse adjacency for endpoint detection.
     let mut children_of_key = HashMap::with_capacity(nodes.len());
-    for n in nodes {
+    for n in &nodes {
         let key = n.node_key();
         let ps =
             crate::canonicalize_parents(n.parent_keys(links, note_map), representative, &present);
@@ -264,7 +284,7 @@ pub fn apply(
     // lone leaves that would otherwise survive as anchors. Structural relation
     // anchors/targets are the explicit exception handled below.
     let mut hidden = HashSet::with_capacity(nodes.len());
-    for n in nodes {
+    for n in &nodes {
         let key = n.node_key();
         // Structural relation anchors/targets are never hidden: their rows
         // carry the virtual edges that keep branch/reconnect geometry visible.
@@ -293,23 +313,22 @@ pub fn apply(
 
     // Rewrite each kept node's parents to its nearest kept ancestors.
     let mut result = Vec::with_capacity(nodes.len());
-    for n in nodes {
+    for mut n in nodes {
         let key = n.node_key();
         if hidden.contains(&key) {
             continue;
         }
-        let mut out = n.clone();
         let spliced = if filter.splice && !hidden.is_empty() {
             nearest_kept_ancestors(&key, &parents_of_key, &hidden)
         } else {
             n.parent_keys(links, note_map)
         };
-        out.set_parent_keys(&crate::canonicalize_parents(
+        n.set_parent_keys(&crate::canonicalize_parents(
             spliced,
             representative,
             &present,
         ));
-        result.push(out);
+        result.push(n);
     }
     result
 }

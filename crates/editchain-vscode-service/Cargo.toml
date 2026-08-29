@@ -19,7 +19,6 @@ gix = "0.86"
 editchain-core = { path = "../editchain-core" }
 editchain-codec = { path = "../editchain-codec" }
 editchain-import = { path = "../editchain-import" }
-editchain-node = { path = "../editchain-node" }
 editchain-git = { path = "../editchain-git" }
 editchain-project = { path = "../editchain-project" }
 editchain-protocol = { path = "../editchain-protocol" }

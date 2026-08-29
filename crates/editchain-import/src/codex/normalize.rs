@@ -21,14 +21,18 @@ use std::collections::HashMap;
 
 /// Minimal top-level metadata extracted from a raw Codex JSONL line.
 ///
-/// Only the top-level `type` and `timestamp` fields are read; all message/tool/
-/// turn semantics come from the helper projection, never from raw parsing.
+/// Only the top-level `type`/`timestamp` and nested `payload.type` discriminator
+/// are read; all message/tool/turn content comes from the helper projection,
+/// never from raw parsing. The nested discriminator is used only to classify
+/// lifecycle-only `event_msg` records as foldable metadata.
 #[derive(Debug, Clone, Default)]
 pub struct RawLineMeta {
     /// Top-level record type (e.g. `session_meta`, `event_msg`, `response_item`).
     pub raw_type: String,
     /// Top-level `timestamp` string, when present.
     pub timestamp: Option<String>,
+    /// Nested `payload.type` discriminator, when present.
+    pub event_type: Option<String>,
 }
 
 /// Extract the minimal top-level metadata from a raw Codex JSONL line.
@@ -47,6 +51,11 @@ pub fn parse_raw_line_meta(data: &[u8]) -> RawLineMeta {
             .to_string(),
         timestamp: obj
             .and_then(|o| o.get("timestamp"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        event_type: obj
+            .and_then(|o| o.get("payload"))
+            .and_then(|payload| payload.get("type"))
             .and_then(Value::as_str)
             .map(ToString::to_string),
     }
@@ -92,6 +101,28 @@ pub fn raw_type_tags(raw_type: &str) -> Tags {
         "compacted" => Tags::STRUCTURAL,
         _ => Tags::NONE,
     }
+}
+
+/// Extra raw-lane tags derived from the minimal Codex record envelope.
+///
+/// Terminal lifecycle `event_msg` records contain no independent conversational
+/// content. They remain byte-exact raw imports, but carry `META` so the history
+/// projection can fold them into the nearest preceding semantic turn in the
+/// same source stream. Other event messages (including `task_started` and
+/// user/agent messages) remain ordinary rows because backward bundling would
+/// otherwise associate a turn prologue with the previous turn or hide content.
+#[must_use]
+pub fn raw_line_tags(meta: &RawLineMeta) -> Tags {
+    let mut tags = raw_type_tags(&meta.raw_type);
+    if meta.raw_type == "event_msg"
+        && matches!(
+            meta.event_type.as_deref(),
+            Some("task_complete" | "token_count" | "turn_aborted")
+        )
+    {
+        tags |= Tags::META;
+    }
+    tags
 }
 
 /// Deterministic actor key for a raw lane op, derived from the top-level type
@@ -146,7 +177,7 @@ pub fn build_raw_op(
     let op_id = stream.op_from_position(SourcePosition::raw(seq))?;
     let meta = parse_raw_line_meta(data);
     let (clock, source_time_unknown) = raw_clock(meta.timestamp.as_deref());
-    let mut tags = Tags::IMPORT | raw_type_tags(&meta.raw_type);
+    let mut tags = Tags::IMPORT | raw_line_tags(&meta);
     if source_time_unknown {
         tags |= Tags::SOURCE_TIME_UNKNOWN;
     }

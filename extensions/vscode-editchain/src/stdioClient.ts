@@ -1,4 +1,6 @@
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
+import { existsSync } from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
 
 /**
@@ -292,11 +294,18 @@ export function resolveServicePath(): string {
   if (configured) {
     return configured;
   }
-  // Fall back to a debug build path relative to the workspace.
-  return vscode.Uri.joinPath(
-    vscode.workspace.workspaceFolders?.[0]?.uri ?? vscode.Uri.file('.'),
-    'target',
-    'debug',
-    'editchain-vscode-service'
-  ).fsPath;
+  const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '.';
+  return resolveDefaultServicePath(workspacePath);
+}
+
+/** Prefer the optimized service build, retaining debug as a dev fallback. */
+export function resolveDefaultServicePath(
+  workspacePath: string,
+  pathExists: (candidate: string) => boolean = existsSync
+): string {
+  const release = path.join(workspacePath, 'target', 'release', 'editchain-vscode-service');
+  if (pathExists(release)) {
+    return release;
+  }
+  return path.join(workspacePath, 'target', 'debug', 'editchain-vscode-service');
 }

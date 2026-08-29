@@ -35,12 +35,15 @@ use std::path::Path;
 use editchain_core::op::{NoteRelationship, OpKind};
 use editchain_core::parents::ParentSet;
 use editchain_core::payload::Payload;
+use editchain_core::scope::ScopeRef;
 use editchain_core::{Op, OpId};
 use editchain_import::codex::HelperCommand;
-use editchain_import::ids::{derive_source_stream, SourcePosition, SourceStream};
+use editchain_import::ids::{
+    derive_session_id, derive_source_stream, SourcePosition, SourceStream,
+};
 use editchain_project::{HistoryNode, HistoryProjection};
 
-use common::{import, sh_helper, write_dispatching_helper, write_rollout};
+use common::{import, raw_bytes, sh_helper, write_dispatching_helper, write_rollout};
 
 /// (child index, parent spawn-line ordinal, thread id, agent path).
 const CHILDREN: [(u32, u64, &str, &str); 3] = [
@@ -175,6 +178,28 @@ fn child_session_meta(thread: &str, path: &str) -> serde_json::Value {
         "threadId": thread,
         "parentThreadId": "parent-1",
         "forkedFromId": "parent-1",
+        "agentPath": path,
+        "cwd": "/workspace",
+    })
+}
+
+/// Bridge `sessionMeta` for a standalone main thread (workspace cwd).
+fn main_session_meta(session: &str, thread: &str) -> serde_json::Value {
+    serde_json::json!({
+        "sessionId": session,
+        "threadId": thread,
+        "cwd": "/workspace",
+    })
+}
+
+/// Bridge `sessionMeta` for a subagent thread: copied-subagent metadata with
+/// explicit `parentThreadId` + `agentPath` provenance (suppresses `ForkOf`).
+fn sub_session_meta(session: &str, thread: &str, parent: &str, path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "sessionId": session,
+        "threadId": thread,
+        "parentThreadId": parent,
+        "forkedFromId": parent,
         "agentPath": path,
         "cwd": "/workspace",
     })
@@ -658,4 +683,341 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
         "EXPECTED semantics for the collapsed parent/subagent projection:\n- {}",
         gaps.join("\n- ")
     );
+}
+
+#[test]
+#[expect(
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::wildcard_enum_match_arm,
+    reason = "this marker-less fixture asserts directly on deterministic, known-shape data"
+)]
+fn markerless_subagents_attach_at_clock_bounded_parent_anchors() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Marker-less parent: 5 raw lines (meta + 4 events) with strictly
+    // increasing timestamps and no spawn-marker items in the projection.
+    write_rollout(
+        dir.path(),
+        "rollout-parent-ml.jsonl",
+        &[
+            session_meta_line("2026-08-28T12:00:00.000Z", "parent-ml", "sess-parent-ml"),
+            event_line("2026-08-28T12:00:05.000Z", "P_T1"),
+            event_line("2026-08-28T12:00:10.000Z", "P_T2"),
+            event_line("2026-08-28T12:00:15.000Z", "P_T3"),
+            event_line("2026-08-28T12:00:20.000Z", "P_T4"),
+        ],
+    );
+    let parent_projection = projection_bytes(&[
+        line_record(
+            1,
+            Vec::new(),
+            Some(main_session_meta("sess-parent-ml", "parent-ml")),
+            None,
+        ),
+        line_record(2, Vec::new(), None, None),
+        line_record(3, Vec::new(), None, None),
+        line_record(4, Vec::new(), None, None),
+        line_record(5, Vec::new(), None, None),
+    ]);
+
+    // Children start between parent events (clock anchors at parent ordinals
+    // 2..=5), plus one child whose meta carries no timestamp (no reliable
+    // clock — deterministic fallback to the parent's first op, ordinal 1).
+    let children: Vec<(&str, &str, Option<&str>, u64)> = vec![
+        (
+            "rollout-ml-child-1.jsonl",
+            "ml-child-1",
+            Some("2026-08-28T12:00:06.000Z"),
+            2,
+        ),
+        (
+            "rollout-ml-child-2.jsonl",
+            "ml-child-2",
+            Some("2026-08-28T12:00:11.000Z"),
+            3,
+        ),
+        (
+            "rollout-ml-child-3.jsonl",
+            "ml-child-3",
+            Some("2026-08-28T12:00:16.000Z"),
+            4,
+        ),
+        (
+            "rollout-ml-child-4.jsonl",
+            "ml-child-4",
+            Some("2026-08-28T12:00:21.000Z"),
+            5,
+        ),
+        (
+            "rollout-ml-child-noclock.jsonl",
+            "ml-child-noclock",
+            None,
+            1,
+        ),
+    ];
+
+    let mut projections: Vec<Vec<u8>> = vec![parent_projection];
+    for (file, thread, ts, _ordinal) in &children {
+        let mut raw_lines = Vec::new();
+        match ts {
+            Some(ts) => {
+                raw_lines.push(session_meta_line(ts, thread, &format!("sess-{thread}")));
+            }
+            None => {
+                raw_lines.push(format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"sess-{thread}\",\"id\":\"{thread}\",\"cwd\":\"/workspace\"}}}}"
+                ));
+            }
+        }
+        raw_lines.push(event_line(
+            "2026-08-28T12:30:00.000Z",
+            &format!("{thread}_WORK"),
+        ));
+        write_rollout(dir.path(), file, &raw_lines);
+        projections.push(projection_bytes(&[
+            line_record(
+                1,
+                Vec::new(),
+                Some(sub_session_meta(
+                    &format!("sess-{thread}"),
+                    thread,
+                    "parent-ml",
+                    &format!("/root/{thread}"),
+                )),
+                None,
+            ),
+            line_record(2, vec![child_message_item(thread)], None, None),
+        ]));
+    }
+    let mut dispatch: Vec<(&str, &[u8])> = Vec::with_capacity(projections.len());
+    dispatch.push(("rollout-parent-ml.jsonl", &projections[0]));
+    for (index, (file, _, _, _)) in children.iter().enumerate() {
+        dispatch.push((file, &projections[index + 1]));
+    }
+    let helper = sh_helper(
+        &write_dispatching_helper(dir.path(), "dispatch-helper-ml.sh", &dispatch),
+        &[],
+    );
+    let harness = import(dir.path(), &helper);
+
+    assert_eq!(
+        harness.report.files_discovered, 6,
+        "one parent + five children"
+    );
+    assert_eq!(harness.report.files_processed, 6, "every rollout processed");
+    assert_eq!(harness.report.raw_ops, 15, "5 parent lines + 2 per child");
+    assert_eq!(
+        harness.report.normalized_ops, 10,
+        "5 child messages + 5 SubagentOf notes"
+    );
+    assert_eq!(harness.report.malformed, 0, "no bridge decode errors");
+
+    let parent = stream_for(dir.path(), "rollout-parent-ml.jsonl");
+    let subagent_of: Vec<&Op> = harness
+        .ops
+        .ops
+        .iter()
+        .filter(|o| is_note(o, NoteRelationship::SubagentOf))
+        .collect();
+    assert_eq!(subagent_of.len(), 5, "one SubagentOf note per child");
+    assert!(
+        !harness
+            .ops
+            .ops
+            .iter()
+            .any(|o| is_note(o, NoteRelationship::ForkOf)),
+        "no fork geometry"
+    );
+    assert!(
+        !harness
+            .ops
+            .ops
+            .iter()
+            .any(|o| is_note(o, NoteRelationship::ReconnectsTo)),
+        "no completion evidence in this fixture"
+    );
+
+    // Each child attaches at the newest eligible parent op at or before its
+    // first reliable clock, so the clocked children spread across the parent's
+    // history (distinct anchors), and the clock-less child deterministically
+    // falls back to the parent's first op.
+    let mut targets: HashSet<OpId> = HashSet::new();
+    for (file, thread, _ts, ordinal) in &children {
+        let child_stream = stream_for(dir.path(), file);
+        let expected_parent = child_stream
+            .op_from_position(SourcePosition::raw(1))
+            .unwrap();
+        let note = subagent_of
+            .iter()
+            .find(|note| note.parents == ParentSet::One(expected_parent))
+            .unwrap_or_else(|| panic!("missing SubagentOf note for {thread}"));
+        let expected_target = parent
+            .op_from_position(SourcePosition::raw(*ordinal))
+            .unwrap();
+        match &note.kind {
+            OpKind::Note(note) => assert_eq!(
+                note.target_ids,
+                vec![expected_target],
+                "marker-less child {thread} anchors at parent ordinal {ordinal}"
+            ),
+            _ => panic!("expected a note op"),
+        }
+        let _: bool = targets.insert(expected_target);
+    }
+    assert_eq!(
+        targets.len(),
+        5,
+        "clocked children spread to distinct parent anchors; unknown-clock child uses the first-op fallback"
+    );
+}
+
+#[test]
+#[expect(
+    clippy::panic,
+    clippy::wildcard_enum_match_arm,
+    reason = "this embedded-meta fixture asserts directly on deterministic, known-shape data"
+)]
+fn embedded_parent_session_meta_does_not_hijack_child_identity_or_scope() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Marker-less parent: meta at 12:00:00, one event at 12:00:05.
+    write_rollout(
+        dir.path(),
+        "rollout-emb-parent.jsonl",
+        &[
+            session_meta_line("2026-08-28T12:00:00.000Z", "parent-emb", "sess-parent-emb"),
+            event_line("2026-08-28T12:00:05.000Z", "P_WORK"),
+        ],
+    );
+    let parent_projection = projection_bytes(&[
+        line_record(
+            1,
+            Vec::new(),
+            Some(main_session_meta("sess-parent-emb", "parent-emb")),
+            None,
+        ),
+        line_record(2, Vec::new(), None, None),
+    ]);
+
+    // Child: own meta first, then the parent's session_meta embedded as a
+    // later raw line (real Codex subagent files carry the parent's meta), then
+    // one work event. The bridge still projects the embedded meta on its own
+    // line; the importer keeps the FIRST sessionMeta, so it must not hijack
+    // the child's owning thread or session scope.
+    let parent_meta_line =
+        session_meta_line("2026-08-28T12:00:06.500Z", "parent-emb", "sess-parent-emb");
+    write_rollout(
+        dir.path(),
+        "rollout-emb-child.jsonl",
+        &[
+            session_meta_line("2026-08-28T12:00:06.000Z", "emb-child", "sess-emb-child"),
+            parent_meta_line.clone(),
+            event_line("2026-08-28T12:00:07.000Z", "EMB_WORK"),
+        ],
+    );
+    let child_projection = projection_bytes(&[
+        line_record(
+            1,
+            Vec::new(),
+            Some(sub_session_meta(
+                "sess-emb-child",
+                "emb-child",
+                "parent-emb",
+                "/root/emb",
+            )),
+            None,
+        ),
+        line_record(
+            2,
+            Vec::new(),
+            Some(main_session_meta("sess-parent-emb", "parent-emb")),
+            None,
+        ),
+        line_record(3, vec![child_message_item("emb-child")], None, None),
+    ]);
+    let helper = sh_helper(
+        &write_dispatching_helper(
+            dir.path(),
+            "dispatch-helper-emb.sh",
+            &[
+                ("rollout-emb-parent.jsonl", &parent_projection),
+                ("rollout-emb-child.jsonl", &child_projection),
+            ],
+        ),
+        &[],
+    );
+    let harness = import(dir.path(), &helper);
+
+    assert_eq!(harness.report.files_discovered, 2);
+    assert_eq!(harness.report.files_processed, 2);
+    assert_eq!(harness.report.raw_ops, 5, "2 parent lines + 3 child lines");
+    assert_eq!(harness.report.malformed, 0);
+
+    let parent = stream_for(dir.path(), "rollout-emb-parent.jsonl");
+    let child = stream_for(dir.path(), "rollout-emb-child.jsonl");
+    let child_session = ScopeRef::Session(derive_session_id("emb-child"));
+    let parent_session = ScopeRef::Session(derive_session_id("parent-emb"));
+    let child_first = child.op_from_position(SourcePosition::raw(1)).unwrap();
+    let child_embedded_meta = child.op_from_position(SourcePosition::raw(2)).unwrap();
+
+    // Every op emitted from the child file (same node) stays in the child's
+    // session scope; the raw lane is never hijacked by the embedded parent
+    // meta, and no child op leaks into the parent session.
+    let child_node = child_first.node;
+    let child_ops: Vec<&Op> = harness
+        .ops
+        .ops
+        .iter()
+        .filter(|o| o.id.node == child_node)
+        .collect();
+    assert_eq!(child_ops.len(), 5, "3 raw + 1 message + 1 SubagentOf note");
+    for op in &child_ops {
+        assert_ne!(
+            op.scope, parent_session,
+            "child file ops never leak into the parent session"
+        );
+        if matches!(op.kind, OpKind::Import(_)) {
+            assert_eq!(
+                op.scope, child_session,
+                "child raw lane stays scoped to the child's own session"
+            );
+        }
+    }
+
+    // The embedded parent meta is preserved byte-exact in the child's raw lane.
+    let embedded = harness
+        .ops
+        .ops
+        .iter()
+        .find(|o| o.id == child_embedded_meta)
+        .expect("embedded parent meta raw op");
+    assert_eq!(
+        raw_bytes(embedded, &harness.blobs),
+        format!("{parent_meta_line}\n").as_bytes(),
+        "embedded parent meta is preserved byte-exact (with its newline) in the child's raw lane"
+    );
+
+    // SubagentOf: causal parent = the child's first raw op; target = the
+    // clock-bounded anchor in the PARENT session (the parent's event at
+    // 12:00:05, ordinal 2) — never the embedded copy in the child's lane.
+    let note = harness
+        .ops
+        .ops
+        .iter()
+        .find(|o| is_note(o, NoteRelationship::SubagentOf))
+        .expect("SubagentOf note");
+    assert_eq!(note.parents, ParentSet::One(child_first));
+    assert_eq!(
+        note.scope, child_session,
+        "relationship note is child-scoped"
+    );
+    match &note.kind {
+        OpKind::Note(note) => assert_eq!(
+            note.target_ids,
+            vec![parent.op_from_position(SourcePosition::raw(2)).unwrap()],
+            "target is the parent-session anchor, not the embedded parent meta"
+        ),
+        _ => panic!("expected a note op"),
+    }
 }
