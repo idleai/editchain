@@ -216,20 +216,27 @@ impl HistoryNode {
 
     /// Returns the parent node keys for drawing graph edges.
     ///
-    /// For `EditChain` ops, this includes both the causal `Op.parents`, any
-    /// explicit git links (whose target OID hex becomes a parent key, so the
-    /// graph draws an edge from the op to that commit), and — when `notes`
-    /// annotates this op as the causal parent of a structural relationship
-    /// note — the note's target as a *virtual* parent. Virtual parents let
-    /// fork/subagent branches render without mutating stored causality (SPEC
-    /// §1.1, §5). `notes` maps a causal parent op id to the structural notes
-    /// that annotate it.
+    /// For `EditChain` ops, this includes the causal `Op.parents`, graph-bearing
+    /// git links (whose target OID hex becomes a parent key), and — when `notes`
+    /// annotates this op as the causal parent of a structural relationship note
+    /// — the note's target as a *virtual* parent. Inferred `BasedOn` links are
+    /// intentionally excluded: they remain provenance in [`GitProjection`] but
+    /// must not turn unrelated sessions into sibling causal branches or hold a
+    /// render lane open until a shared commit. Virtual parents let fork/subagent
+    /// branches render without mutating stored causality (SPEC §1.1, §5).
+    /// `notes` maps a causal parent op id to the structural notes that annotate
+    /// it.
+    ///
+    /// A collapsed row also inherits graph-bearing links whose source is one of
+    /// its bundled sub-ops. This preserves an explicit session-to-Git edge when
+    /// its source record is folded into a visible semantic turn.
     ///
     /// Keys are deduplicated preserving first-occurrence order (stored causal
-    /// parents, then git-link targets, then virtual note targets), so a target
-    /// shared between any of the three sources is emitted exactly once. This
-    /// keeps parent keys deterministic and duplicate-free even when a filtered
-    /// clone has materialized a virtual target into its stored `Op.parents`.
+    /// parents, then git-link targets from the row and its sub-ops, then virtual
+    /// note targets), so a target shared between any of the three sources is
+    /// emitted exactly once. This keeps parent keys deterministic and
+    /// duplicate-free even when a filtered clone has materialized a virtual
+    /// target into its stored `Op.parents`.
     #[must_use]
     pub fn parent_keys(
         &self,
@@ -246,11 +253,16 @@ impl HistoryNode {
                         keys.push(key);
                     }
                 }
-                if let Some(links) = git_links.get(&op.id) {
-                    for link in links {
-                        let key = link.target_oid.to_hex();
-                        if seen.insert(key.clone()) {
-                            keys.push(key);
+                for source in std::iter::once(op).chain(self.sub_ops()) {
+                    if let Some(links) = git_links.get(&source.id) {
+                        for link in links {
+                            if matches!(&link.kind, editchain_core::GitLinkKind::BasedOn) {
+                                continue;
+                            }
+                            let key = link.target_oid.to_hex();
+                            if seen.insert(key.clone()) {
+                                keys.push(key);
+                            }
                         }
                     }
                 }
@@ -1226,9 +1238,10 @@ impl HistoryProjection {
     /// Fold tool-result nodes into their tool-call parents' sub-ops.
     ///
     /// Mutates `result` in place: tool-result nodes whose parent is a tool-call
-    /// node are removed from the top-level list and their Tool op is appended to
-    /// the call's `sub_ops`. Children of a dropped result are re-parented to the
-    /// call so the chain stays continuous.
+    /// node are removed from the top-level list and their Tool op plus any
+    /// metadata already bundled beneath the result are appended to the call's
+    /// `sub_ops`. Children of a dropped result are re-parented to the call so the
+    /// chain stays continuous.
     fn group_tool_results(
         &self,
         result: &mut Vec<HistoryNode>,
@@ -1273,9 +1286,15 @@ impl HistoryProjection {
                     .get(parent_idx)
                     .is_some_and(|pn| Self::node_is_tool_call(pn, children_of));
             if parent_is_call {
+                let attached = attach.entry(parent_idx).or_default();
                 if let Some(tool_op) = Self::tool_result_op(n, children_of) {
-                    attach.entry(parent_idx).or_default().push(tool_op);
+                    attached.push(tool_op);
                 }
+                // META records are bundled before tool-result grouping. If the
+                // result row is then absorbed into its call, move those records
+                // with it; otherwise they remain in storage but disappear from
+                // the expanded renderer/debug view.
+                attached.extend(n.sub_ops().iter().cloned());
                 if let HistoryNode::CollapsedImport { op, .. } = n {
                     if let Some(parent_id) = OpId::from_display_str(&parent_key) {
                         let _: Option<OpId> = replacement.insert(op.id, parent_id);
@@ -1302,7 +1321,8 @@ impl HistoryProjection {
             let _: &mut OpId = representative.entry(dropped).or_insert(call);
         }
 
-        // Attach collected tool-result ops to their call's sub-ops.
+        // Attach collected tool-result ops and their bundled metadata to the
+        // call's sub-ops.
         for (parent_idx, ops) in &attach {
             if let Some(HistoryNode::CollapsedImport { sub_ops, .. }) = result.get_mut(*parent_idx)
             {
@@ -1421,11 +1441,12 @@ impl HistoryProjection {
         }
     }
 
-    /// Stitch sessions and git history into a single edit chain.
+    /// Relate session operations to Git history without stitching sessions.
     ///
-    /// Applies session-to-session stitching (mutating `Op.parents`) and creates
-    /// op→git links (stored in `GitProjection.links`). Call after loading all ops
-    /// and git commits, before computing windows or layouts.
+    /// Leaves unrelated session parents unchanged and creates op→git links in
+    /// `GitProjection.links`. Inferred `BasedOn` links remain provenance rather
+    /// than graph parents. Call after loading all ops and git commits, before
+    /// computing windows or layouts.
     pub fn link_history(&mut self) {
         let commits: Vec<GitCommitEntity> = self.git.commits.values().cloned().collect();
         let result = link_history(&self.ops, &commits);
@@ -1434,9 +1455,8 @@ impl HistoryProjection {
             let entry = self.git.links.entry(link.source).or_default();
             entry.push(link);
         }
-        // `self.ops` changed (stitching) — rebuild the canonical collapse so the
-        // representative map and canonicalized relationship notes reflect the
-        // stitched parents.
+        // Rebuild the canonical collapse so the representative map and
+        // canonicalized relationship notes reflect the linked projection.
         self.collapsed_projection = self.collapsed_ops();
     }
 
@@ -1986,6 +2006,16 @@ fn raw_import_label(import: &editchain_core::op::ImportOp) -> String {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("");
     match record_type {
+        // Codex event envelopes put the meaningful lifecycle discriminator in
+        // `payload.type`; showing it avoids a wall of indistinguishable
+        // `event_msg` labels when a leading/unbundled record is visible.
+        "event_msg" => value
+            .get("payload")
+            .and_then(|payload| payload.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|event_type| !event_type.is_empty())
+            .unwrap_or(record_type)
+            .to_string(),
         // Attachment records carry a structured `attachment` object.
         "attachment" => {
             let att = value.get("attachment");

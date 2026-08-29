@@ -9,8 +9,9 @@ use regex as _;
 use serde_json as _;
 
 use editchain_core::{
-    ActorId, Clock, GitAvailability, GitCommitEntity, GitObjectFormat, GitOid, GitSignature,
-    MessageOp, NodeId, Op, OpId, OpKind, ParentSet, Payload, ScopeRef, SessionId, Tags,
+    ActorId, Clock, GitAvailability, GitCommitEntity, GitLinkKind, GitObjectFormat, GitOid,
+    GitSignature, MessageOp, NodeId, Op, OpId, OpKind, ParentSet, Payload, ScopeRef, SessionId,
+    Tags,
 };
 use editchain_project::link::link_history;
 
@@ -84,10 +85,12 @@ fn sessions_stay_as_separate_chains_not_stitched() {
 }
 
 #[test]
-fn git_command_links_to_closest_commit() {
-    // A commit at t=5000. An op at t=5100 running a git command should link to it.
-    let commits = vec![git_commit(1, 5000)];
-    let mut ops = vec![op(1, 1, Some(10), 5100)];
+fn git_command_links_to_closest_commit_across_timestamp_units() {
+    // Git timestamps are seconds while operation clocks are milliseconds. The
+    // op is 100ms after commit 1 and almost 1,000s before commit 2, so commit 1
+    // must win. Comparing the raw numbers incorrectly picks the newest commit 2.
+    let commits = vec![git_commit(1, 1_000), git_commit(2, 2_000)];
+    let mut ops = vec![op(1, 1, Some(10), 1_000_100)];
     // Make it a git command op.
     ops[0].kind = OpKind::Command(editchain_core::CommandOp {
         command_id: Payload::Empty,
@@ -96,22 +99,50 @@ fn git_command_links_to_closest_commit() {
     });
 
     let result = link_history(&ops, &commits);
-    assert!(!result.git_links.is_empty());
-    assert_eq!(result.git_links[0].source, ops[0].id);
+    let produced = result
+        .git_links
+        .iter()
+        .find(|link| matches!(&link.kind, GitLinkKind::ProducedBy))
+        .expect("git command must produce a Git link");
+    assert_eq!(produced.source, ops[0].id);
+    assert_eq!(produced.target_oid, commits[0].oid);
 }
 
 #[test]
-fn session_links_to_closest_commit() {
-    // A commit at t=5000. A session with no git command should link its last op
-    // to the closest commit.
-    let commits = vec![git_commit(1, 5000)];
+fn session_links_to_closest_commit_across_timestamp_units() {
+    // The session's final operation is 100ms after commit 1. The weak fallback
+    // must normalize Git seconds to operation milliseconds before matching.
+    let commits = vec![git_commit(1, 1_000), git_commit(2, 2_000)];
     let ops = vec![
-        op(1, 1, Some(10), 4000),
-        op(1, 2, Some(10), 6000), // last op
+        op(1, 1, Some(10), 900_000),
+        op(1, 2, Some(10), 1_000_100), // last op
     ];
     let result = link_history(&ops, &commits);
-    assert!(!result.git_links.is_empty());
-    assert_eq!(result.git_links[0].source, ops[1].id);
+    let based_on = result
+        .git_links
+        .iter()
+        .find(|link| matches!(&link.kind, GitLinkKind::BasedOn))
+        .expect("session must retain weak Git provenance");
+    assert_eq!(based_on.source, ops[1].id);
+    assert_eq!(based_on.target_oid, commits[0].oid);
+}
+
+#[test]
+fn non_wall_clock_ops_do_not_infer_git_links() {
+    let commits = vec![git_commit(1, 1_000)];
+    let mut logical = op(1, 1, Some(10), 0);
+    logical.clock = Clock::Lamport(1_000_100);
+    logical.kind = OpKind::Command(editchain_core::CommandOp {
+        command_id: Payload::Empty,
+        content: Payload::Inline(b"git commit -m x".to_vec()),
+        stage: editchain_core::CommandStage::Finish,
+    });
+
+    let result = link_history(&[logical], &commits);
+    assert!(
+        result.git_links.is_empty(),
+        "Lamport clocks cannot be compared to Git wall-clock timestamps"
+    );
 }
 
 #[test]

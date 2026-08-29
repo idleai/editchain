@@ -311,33 +311,82 @@ impl LayoutContext {
         // Precompute connected components so open chains that span across a query
         // window (pass-through edges) can be detected without iterating window rows.
         let (comp_id, comp_min, comp_max, _) = compute_components(nodes, &row_of, &parents);
-        // Build per-lane OCCUPANCY intervals keyed by component: for each lane,
-        // record every component that occupies it and that component's min/max row
-        // ON THAT LANE specifically.
+        // Build per-lane OCCUPANCY RUNS keyed by component: for each lane,
+        // record every CONTIGUOUS run of rows where that component actually has
+        // geometry on that lane — node dots plus the exact edge runs
+        // `build_edge_points` emits (same-lane runs, adjacent cross-lane jog
+        // halves, non-adjacent cross-lane source/destination runs).
         //
-        // A component may touch several lanes (merges), but a lane is only "open"
-        // where a node of the component sits on it. Recording the component's full
-        // [min,max] span under every lane it touches would draw a pass-through line
-        // on lanes that have no node in the window (e.g. a merge branch that only
-        // exists far below the viewport). Conversely recording only contiguous runs
-        // of rows would miss genuinely sparse chains whose nodes are far apart on
-        // one lane. Keying by component captures both: a pass-through line on a
-        // lane is valid iff ONE component occupies that lane both above `offset`
-        // and below `end`.
+        // A component may touch several lanes (merges), but a lane is only
+        // "open" where the component's geometry actually crosses it. Tracking
+        // exact runs (instead of a per-component min/max) matters because
+        // in-component lane compaction merges DISJOINT branch runs onto one
+        // lane: the merged lane then has real segments on both sides of a
+        // window with nothing inside it, and a single [min,max] span would
+        // draw a false pass-through line through that gap. Keying by component
+        // and merging touching runs still catches genuinely sparse chains —
+        // nodes far apart on one lane whose same-lane edges cross the whole
+        // window — because those edges produce one continuous run.
         let mut lane_spans: HashMap<usize, Vec<(usize, usize, usize)>> = HashMap::new();
         for (row, key) in nodes.iter().enumerate() {
             let lane = *lane_at.get(key).unwrap_or(&0);
             let cid = *comp_id.get(key).unwrap_or(&usize::MAX);
-            let list = lane_spans.entry(lane).or_default();
-            if let Some(entry) = list.iter_mut().find(|e| e.0 == cid) {
-                entry.1 = entry.1.min(row);
-                entry.2 = entry.2.max(row);
-            } else {
-                list.push((cid, row, row));
+            lane_spans.entry(lane).or_default().push((cid, row, row));
+            let node_parents = parents.get(key).map_or(&[][..], Vec::as_slice);
+            for parent in node_parents {
+                let Some(parent_row) = row_of.get(parent).copied() else {
+                    continue;
+                };
+                if parent_row <= row {
+                    continue; // not a downward edge
+                }
+                let p_lane = *lane_at.get(parent).unwrap_or(&lane);
+                if lane == p_lane {
+                    lane_spans
+                        .entry(lane)
+                        .or_default()
+                        .push((cid, row, parent_row));
+                } else if parent_row == row.saturating_add(1) {
+                    // Adjacent cross-lane: the jog starts at the child's
+                    // midpoint, so the destination lane carries the two
+                    // endpoint halves only.
+                    lane_spans
+                        .entry(p_lane)
+                        .or_default()
+                        .push((cid, row, parent_row));
+                } else {
+                    // Non-adjacent cross-lane: source run down to parent_row -
+                    // 1, jog, then destination run parent_row - 1..=parent_row.
+                    lane_spans.entry(lane).or_default().push((
+                        cid,
+                        row,
+                        parent_row.saturating_sub(1),
+                    ));
+                    lane_spans.entry(p_lane).or_default().push((
+                        cid,
+                        parent_row.saturating_sub(1),
+                        parent_row,
+                    ));
+                }
             }
         }
+        // Merge overlapping or touching intervals of the SAME component on a
+        // lane into maximal contiguous runs, so the pass-through check sees one
+        // span per real continuous segment (deterministic: sorted by (cid, lo,
+        // hi), never HashMap iteration order).
         for list in lane_spans.values_mut() {
             list.sort_unstable();
+            let mut merged: Vec<(usize, usize, usize)> = Vec::with_capacity(list.len());
+            for &(cid, lo, hi) in list.iter() {
+                if let Some(last) = merged.last_mut() {
+                    if last.0 == cid && lo <= last.2.saturating_add(1) {
+                        last.2 = last.2.max(hi);
+                        continue;
+                    }
+                }
+                merged.push((cid, lo, hi));
+            }
+            *list = merged;
         }
 
         // Compute per-row ABOVE/BELOW lanes and horizontal TRANSITIONS by walking every
@@ -556,18 +605,22 @@ impl LayoutContext {
         // continuous.
         //
         // A lane qualifies only if it is OCCUPIED both above `offset` and below
-        // `end` — i.e. some node of the chain sits on that lane on each side of
-        // the window. This is what keeps a merge branch that only exists far
-        // below (or above) the viewport from drawing a spurious line through an
-        // otherwise-empty lane.
+        // `end` — i.e. ONE contiguous run of the chain's geometry sits on that
+        // lane, crossing the whole window without interruption. A window inside
+        // a gap between two compaction-merged runs therefore draws nothing,
+        // while a sparse chain whose same-lane edges cross the window still
+        // draws its line. This is what keeps a merge branch that only exists
+        // far below (or above) the viewport from drawing a spurious line
+        // through an otherwise-empty lane.
         // Collect candidate lanes in sorted order so edge emission is stable
         // across processes (HashMap iteration order is process-random).
         let mut pass_through_lanes: Vec<usize> = Vec::new();
         for (lane, spans) in &self.lane_spans {
-            // Spans are sorted by min; find any span covering [offset,end). Each
-            // span is (component id, lo, hi) where [lo,hi] is that component's
-            // occupancy on THIS lane — so a lane qualifies only when one component
-            // occupies it both above `offset` and below `end`.
+            // Spans are sorted and merged into contiguous runs; find any run
+            // covering [offset,end). Each run is (component id, lo, hi) where
+            // [lo,hi] is a continuous segment of that component's geometry on
+            // THIS lane — so a lane qualifies only when one component's real
+            // segment crosses from above `offset` to below `end` without a gap.
             let covers = spans.iter().any(|&(_, lo, hi)| lo < offset && hi >= end);
             if covers && !pass_through_lanes.contains(lane) {
                 pass_through_lanes.push(*lane);
@@ -1078,15 +1131,60 @@ fn compute_lane_map_reuse(
         comp_is_git.push(any_git);
     }
 
-    // --- Phase 2/3: greedy interval coloring --------------------------------------
-    // Sort component ids by start row ascending so non-overlapping intervals get
-    // colored greedily; release colors when an interval ends so later disjoint
-    // intervals can reuse them.
-    //
-    // Git components are pinned to lane 0 (the leftmost column) so git commits
-    // always render on the far-left lane. Op components are colored greedily but
-    // offset by +1 (when git is present) so they never collide with the git lane.
+    // --- Phase 2: compute each component's compact local geometry -----------------
+    // Local geometry must be known BEFORE global interval coloring: a component
+    // with an active fork occupies more than its base lane. Coloring only bases
+    // lets a later disconnected component collide with that still-live branch.
     let git_present = comp_is_git.iter().any(|&g| g);
+    let mut members_by_component: Vec<Vec<String>> = vec![Vec::new(); comp_start_end.len()];
+    for key in nodes_newest_first {
+        if let Some(cid) = comp_id_of_key.get(key).copied() {
+            members_by_component[cid].push(key.clone());
+        }
+    }
+
+    let mut local_lanes_by_component: Vec<HashMap<String, usize>> =
+        Vec::with_capacity(comp_start_end.len());
+    let mut op_lane_rank_by_component: Vec<HashMap<usize, usize>> =
+        Vec::with_capacity(comp_start_end.len());
+    let mut comp_op_width: Vec<usize> = Vec::with_capacity(comp_start_end.len());
+    for members in &members_by_component {
+        let local = if members.is_empty() {
+            HashMap::new()
+        } else {
+            let topo = topological_order(members, parents_of);
+            let uncompacted = compute_lane_map(&topo, parents_of);
+            // `compute_lane_map` never frees a lane, so sequential branches
+            // inside one component would each keep a permanent column. Compact
+            // only disjoint geometry; overlapping branches remain distinct.
+            compact_component_lanes(members, &uncompacted, parents_of, &row_of_key)
+        };
+
+        // Git is globally remapped to lane 0. Rank only the operation lanes so
+        // every component's operation block is dense even when a local lane was
+        // occupied solely by Git.
+        let mut op_local_lanes: Vec<usize> = members
+            .iter()
+            .filter(|key| !is_git(key))
+            .filter_map(|key| local.get(key).copied())
+            .collect();
+        op_local_lanes.sort_unstable();
+        op_local_lanes.dedup();
+        let mut rank_by_lane = HashMap::with_capacity(op_local_lanes.len());
+        for (rank, lane) in op_local_lanes.iter().copied().enumerate() {
+            let _: Option<usize> = rank_by_lane.insert(lane, rank);
+        }
+        comp_op_width.push(op_local_lanes.len());
+        op_lane_rank_by_component.push(rank_by_lane);
+        local_lanes_by_component.push(local);
+    }
+
+    // --- Phase 3: width-aware greedy interval coloring ----------------------------
+    // Components are inclusive display-row intervals. Allocate each active
+    // component's entire dense operation-lane block, releasing the block only
+    // after its last row. This permits exact reuse for sequential sessions while
+    // preventing a narrow component from landing on an active component's fork
+    // lane. Git itself is pinned separately to final lane 0.
     let mut comp_ids_sorted_by_start: Vec<usize> = comp_start_end
         .iter()
         .enumerate()
@@ -1094,88 +1192,180 @@ fn compute_lane_map_reuse(
         .collect();
     comp_ids_sorted_by_start.sort_by_key(|&id| comp_start_end[id]);
 
-    // Per-color list of currently-open component ids ending latest; used to know
-    // when a color becomes reusable again. Index 0 is reserved for git when any
-    // git component exists.
-    let mut color_open_end_max: Vec<usize> = Vec::new(); // color -> max end among open comps
-    let mut comp_color_by_id: Vec<usize> = vec![usize::MAX; comp_start_end.len()]; // comp id -> base color/lane
+    // Active blocks are `(inclusive_end_row, base_lane, width)` in final lane
+    // space. Lane 0 is reserved exactly once when Git is present.
+    let minimum_op_lane = usize::from(git_present);
+    let mut active_blocks: Vec<(usize, usize, usize)> = Vec::new();
+    let mut comp_base_lane: Vec<usize> = vec![minimum_op_lane; comp_start_end.len()];
 
     for &cid in &comp_ids_sorted_by_start {
         let start = comp_start_end[cid].0;
         let end = comp_start_end[cid].1;
-        if comp_is_git[cid] {
-            // Git components always occupy lane 0 (leftmost). They are disjoint
-            // in time (a git chain), so they share the column.
-            if color_open_end_max.is_empty() {
-                color_open_end_max.push(end);
-            }
-            comp_color_by_id[cid] = 0;
-            color_open_end_max[0] = color_open_end_max[0].max(end);
+        active_blocks.retain(|(active_end, _, _)| *active_end >= start);
+
+        let width = comp_op_width[cid];
+        if width == 0 {
             continue;
         }
-        // Op components: find a reusable column. When git is present, skip lane
-        // 0 (reserved for git); otherwise start from lane 0 as before.
-        let skip = usize::from(git_present);
-        let mut chosen_color = None;
-        for (c, &open_end) in color_open_end_max.iter().enumerate().skip(skip) {
-            if open_end < start {
-                chosen_color = Some(c);
+
+        let mut occupied: Vec<(usize, usize)> = active_blocks
+            .iter()
+            .map(|(_, base, active_width)| (*base, base.saturating_add(*active_width)))
+            .collect();
+        occupied.sort_unstable();
+        let mut base = minimum_op_lane;
+        for (occupied_start, occupied_end) in occupied {
+            if base.saturating_add(width) <= occupied_start {
                 break;
             }
+            if base < occupied_end {
+                base = occupied_end;
+            }
         }
-        let color = chosen_color.unwrap_or_else(|| {
-            // New column: its open interval ends at this component's end.
-            color_open_end_max.push(end);
-            color_open_end_max.len().saturating_sub(1)
-        });
-        comp_color_by_id[cid] = color;
-        // Track the latest end among components currently open on this column.
-        color_open_end_max[color] = color_open_end_max[color].max(end);
+        comp_base_lane[cid] = base;
+        active_blocks.push((end, base, width));
     }
 
-    // --- Phase 4: assign lanes within each component -----------------------------
-    // Run the existing branch-aware lane assignment per component, offset by the
-    // component's base color so different components never collide on a column.
-    // We reuse `compute_lane_map` on the component's own topological order, then
-    // shift every lane by `base`.
+    // --- Phase 4: map compact local lanes into their allocated global blocks -------
     let mut lane_of: HashMap<String, usize> = HashMap::with_capacity(nodes_newest_first.len());
-    for (cid, &base) in comp_color_by_id.iter().enumerate() {
-        // Collect this component's members in canonical newest-first display
-        // order: HashMap iteration order is process-random and would make the
-        // per-component topological order (and thus lane geometry) differ
-        // between processes.
-        let members: Vec<String> = nodes_newest_first
-            .iter()
-            .filter(|key| comp_id_of_key.get(*key).copied() == Some(cid))
-            .cloned()
-            .collect();
-        if members.is_empty() {
-            continue;
-        }
-        // Topological order of just this component (parents before children).
-        let topo = topological_order(&members, parents_of);
-        let local = compute_lane_map(&topo, parents_of);
-        for (key, l) in local {
-            let _ = lane_of.insert(key, base.saturating_add(l));
-        }
-    }
-
-    // Git-leftmost global remap: force every git node onto lane 0 and shift all
-    // op lanes up by 1. This guarantees git commits always render on the
-    // leftmost column, even inside mixed components (git linked to ops). Ops
-    // shift uniformly so their relative lane reuse is preserved; no collision
-    // occurs because ops move off lane 0 while git takes it.
-    if git_present {
-        for (key, l) in &mut lane_of {
+    for (cid, members) in members_by_component.iter().enumerate() {
+        let local = &local_lanes_by_component[cid];
+        let rank_by_lane = &op_lane_rank_by_component[cid];
+        let base = comp_base_lane[cid];
+        for key in members {
             if is_git(key) {
-                *l = 0;
+                let _ = lane_of.insert(key.clone(), 0);
             } else {
-                *l = l.saturating_add(1);
+                let local_lane = *local.get(key).unwrap_or(&0);
+                let rank = *rank_by_lane.get(&local_lane).unwrap_or(&0);
+                let _ = lane_of.insert(key.clone(), base.saturating_add(rank));
             }
         }
     }
 
     lane_of
+}
+
+/// Merge lanes inside ONE component whose rendered row usage never overlaps.
+///
+/// [`compute_lane_map`] gives every root, fork branch, and colliding merge
+/// parent its own fresh lane and never frees them, so sequential branches in a
+/// single component — branches joined by explicit Git links, repeated fork
+/// diamonds, sequential subagent forks — each claim a permanent column even
+/// though their vertical segments occupy disjoint display rows. This pass
+/// computes each lane's exact rendered row usage (node dots plus edge runs,
+/// mirroring the above/below/transition geometry rules)
+/// and collapses a lane into the first earlier lane whose usage-row span is
+/// strictly disjoint, so a finished branch's lane becomes reusable.
+///
+/// The merge check is conservative and exact: two lanes merge only when their
+/// usage-row spans are disjoint, so a merged column never carries two different
+/// branches' segments at the same row (no crossing lines on one lane). Fork
+/// siblings and merge parents whose branches overlap in time stay on distinct
+/// lanes. After merging, the surviving lanes are renumbered in ascending
+/// survivor order so the compacted local lane ids are contiguous (0..=width-1)
+/// instead of leaving a gap at every collapsed lane. When no lane can merge,
+/// every lane survives in order, so the assignment is byte-identical to the
+/// uncompacted one.
+///
+/// Deterministic: `members` is the component in canonical newest-first display
+/// order, spans are folded from fixed edges, and merging walks lane indices in
+/// ascending order — no `HashMap` iteration order leaks into the mapping.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "lane indices are bounded by the component's lane/row counts"
+)]
+fn compact_component_lanes(
+    members: &[String],
+    lane_of: &HashMap<String, usize>,
+    parents_of: &impl Fn(&str) -> Vec<String>,
+    row_of_key: &HashMap<String, usize>,
+) -> HashMap<String, usize> {
+    // Per-lane used-row span (lo, hi): initialize one entry per lane in use.
+    let mut lane_spans: Vec<(usize, usize)> = Vec::new();
+    for key in members {
+        let lane = *lane_of.get(key).unwrap_or(&0);
+        while lane_spans.len() <= lane {
+            lane_spans.push((usize::MAX, 0));
+        }
+    }
+    // Fold node dots and every edge run into the lanes they touch, using the
+    // same geometry `LayoutContext` emits (same-lane run, adjacent cross-lane
+    // jog with no source run, non-adjacent cross-lane jog at parent_row - 1).
+    for key in members {
+        let my_lane = *lane_of.get(key).unwrap_or(&0);
+        let Some(child_row) = row_of_key.get(key).copied() else {
+            continue;
+        };
+        lane_spans[my_lane] = fold_span(lane_spans[my_lane], child_row);
+        for parent in parents_of(key) {
+            let Some(parent_row) = row_of_key.get(&parent).copied() else {
+                continue;
+            };
+            if parent_row <= child_row {
+                continue; // not a downward edge
+            }
+            let p_lane = *lane_of.get(&parent).unwrap_or(&my_lane);
+            if my_lane == p_lane {
+                lane_spans[my_lane] = fold_span(lane_spans[my_lane], parent_row);
+            } else if parent_row == child_row.saturating_add(1) {
+                // Adjacent cross-lane: the jog starts at the child's midpoint,
+                // so the source lane carries no run; the destination lane gets
+                // the two endpoint halves only.
+                lane_spans[p_lane] = fold_span(lane_spans[p_lane], child_row);
+                lane_spans[p_lane] = fold_span(lane_spans[p_lane], parent_row);
+            } else {
+                // Non-adjacent cross-lane: source run down to parent_row - 1,
+                // jog, then destination run parent_row - 1..=parent_row.
+                lane_spans[my_lane] = fold_span(lane_spans[my_lane], parent_row.saturating_sub(1));
+                lane_spans[p_lane] = fold_span(lane_spans[p_lane], parent_row.saturating_sub(1));
+                lane_spans[p_lane] = fold_span(lane_spans[p_lane], parent_row);
+            }
+        }
+    }
+
+    // Merge in ascending lane order: a lane collapses into the first earlier
+    // lane whose accumulated usage span is strictly disjoint, extending that
+    // target's span so later lanes check against everything merged so far.
+    let mut remap: Vec<usize> = (0..lane_spans.len()).collect();
+    for lane in 1..lane_spans.len() {
+        let (lo, hi) = lane_spans[lane];
+        for earlier in 0..lane {
+            let target = remap[earlier];
+            let (elo, ehi) = lane_spans[target];
+            if hi < elo || ehi < lo {
+                lane_spans[target] = fold_span(lane_spans[target], lo);
+                lane_spans[target] = fold_span(lane_spans[target], hi);
+                remap[lane] = target;
+                break;
+            }
+        }
+    }
+
+    // Densify the survivors: merging collapses lanes onto earlier targets, so
+    // the surviving target ids are ascending but sparse (every collapsed lane
+    // leaves a gap). Renumber the survivors in ascending order to 0..=width-1
+    // so the compacted local lane ids are contiguous again. This is a pure
+    // relabeling — relative lane order, overlap disjointness, and the merged
+    // spans are unchanged.
+    let mut survivors: Vec<usize> = remap.clone();
+    survivors.sort_unstable();
+    survivors.dedup();
+    let mut dense_of_survivor: HashMap<usize, usize> = HashMap::with_capacity(survivors.len());
+    for (dense, survivor) in survivors.iter().copied().enumerate() {
+        let _: Option<usize> = dense_of_survivor.insert(survivor, dense);
+    }
+
+    members
+        .iter()
+        .map(|key| {
+            let lane = *lane_of.get(key).unwrap_or(&0);
+            (
+                key.clone(),
+                *dense_of_survivor.get(&remap[lane]).unwrap_or(&0),
+            )
+        })
+        .collect()
 }
 
 /// Fold a row index into a running `(min, max)` span.

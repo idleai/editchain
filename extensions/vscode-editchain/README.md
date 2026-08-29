@@ -145,6 +145,91 @@ the real chain. Writes a full DOM tree with computed styles to `.ui-out/real/`
 `--shot out.png` to capture a settled screenshot after `whenIdle` (same
 deterministic readiness gate as fixture mode).
 
+Use `--scroll-row N` to jump to a specific visible history row after the
+full-height virtual-scroll spacer is ready. The run fails unless the settled
+renderer window actually contains that row, and records the requested row,
+pixel offset, and resulting `renderTop`/`renderBottom` in `summary.md`.
+`--row-timeout MS` applies to the renderer's real `GetWindow` transport calls
+as well as readiness checks, which is important for large imported chains.
+
+### Graph harness (real service, structural checks)
+
+The graph harness pages the **entire** filtered dataset through the real
+service bridge using the exact `GetWindow` DTOs the renderer sends, then runs
+structural checks over the data **and** the rendered DOM — built for ~150k-row
+chains without accumulating full row DTOs:
+
+```sh
+npm run ui:graph -- --workspace /path/to/repo --chain-dir .editchain
+```
+
+Options: `--out DIR` (default `.ui-out/graph`), `--limit N` (probe page size,
+default 2000; the renderer uses 500), `--viewport WxH`, `--row-timeout MS`.
+`--row-timeout` is threaded through **every** page-side `GetWindow` request
+(probe pages and the renderer's own scroll fetches, via the service transport
+default): a hung service fails the run after the configured bound instead of
+the old hardcoded 120s. `Open` remains explicitly unbounded (0 deadline) —
+building the chain + git graph can take minutes on a large workspace. The
+service binary comes from `SERVICE_PATH` or
+`<workspace>/target/debug/editchain-vscode-service`.
+
+The probe's own failure detection is verified without a service via simulated
+fixtures:
+
+```sh
+npm run ui:graph -- --self-test
+```
+
+`--self-test` runs an in-page simulated service and asserts that a
+`chain_generation` change mid-scan is detected (the run fails with
+`CHAIN_GENERATION_STABLE`) and that a hung `GetWindow` rejects after the
+configured timeout instead of hanging. Artifacts land in `.ui-out/graph-self-test/`.
+
+Checks (all exit non-zero on failure):
+
+- Paging: page totals stable, paged rows match the reported total, and
+  `chain_generation` is **identical across every paged response** — a change
+  mid-scan (the chain was rewritten while being read) fails the run.
+- Node keys: non-empty and unique across top-level and sub-op rows.
+- Sub-ops: `<parent>::sub:<i>` key format, `parent_row`/expanded-slot layout,
+  and the offset-0 `sub_op_counts` snapshot agree.
+- Parents: every parent key resolves to a top-level node; no self/repeated
+  parents.
+- Relations: `parent_relations` reference drawn parents, carry a known kind,
+  and are not duplicated — plus a per-kind count report (never hardcoded).
+- Diagnostics: Open duplicate/quarantine counts are consistent
+  (`records = accepted + duplicates + quarantined`) and their rates are
+  reported.
+- Lanes: all lane references within `[0, max_lane]`, vertical segments meet at
+  every row boundary (page boundaries included), no lane reuse without a
+  parent edge, tip/root boundaries clean, sub-op lanes inherit their parent,
+  transitions anchored by dots or boundary geometry.
+- Rendered rows: `data-row`/`data-key` integrity, uniform `ROW_H`, bounded DOM,
+  one in-cell dot per top-level row, lane-consistent monotonic dot positions,
+  and render/data coherence (rendered keys match the dataset at the same
+  absolute slot; renderer `total`/`max_lane` match the dataset). Coherence is
+  sampled at the initial viewport **and** after scrolling to the top, middle,
+  and bottom of the chain (plus a top re-anchor after the full traversal),
+  waiting for idle after each jump — a scroll path that leaks DOM rows or
+  fails to re-anchor fails the run (`SCROLL_*` checks).
+
+Artifacts (`--out`, default `.ui-out/graph/`):
+
+- `graph.json` — aggregates: totals, relation-kind counts, duplicate rates,
+  kind/lane histograms, paging summary.
+- `dataset.ndjson` — one compact row per line (probe fields only; streamed in
+  chunks so the full dataset is never materialized as a single blob).
+- `checks.json` / `render.json` / `open.json` — checks, rendered DOM slice +
+  renderer state + scroll samples, and the Open response (diagnostics).
+- `summary.md` / `console.txt` / `service-stderr.txt`.
+
+The harness reuses the real `editchain-vscode-service`, `serviceBridge.js`,
+production `media/main.js`, and `media/main.css` — no simulated renderer. The
+probe pages through the same bridge the renderer uses, so a structural failure
+reflects what the viewer would actually draw. Run against a small chain first
+(e.g. a scratch workspace); the harness is memory-conscious but a full scan of
+a very large chain still pages every row.
+
 ### Real VS Code harness (WebdriverIO)
 
 Launches **real VS Code** (Extension Development Host) with the extension and
@@ -196,7 +281,8 @@ session, including the scroll-through-history test.
   search can be added later.
 - `Open` is unbounded: building the chain + git graph can take minutes on a
   large workspace. All other service calls carry a generous finite deadline
-  (120s, ≥ the measured near-minute first window on large chains); a timed-out
+  (120s by default, ≥ the measured near-minute first window on large chains;
+  the graph harness's `--row-timeout` overrides this default); a timed-out
   window/search shows a visible error and suspends background retries until the
   user clicks **Retry** or re-runs the open command (which restarts a crashed
   service and re-opens the chain).

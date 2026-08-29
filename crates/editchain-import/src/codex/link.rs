@@ -14,8 +14,12 @@
 //! - **SubagentOf** — causal parent is the subagent thread's first op; target
 //!   is the parent thread's *earliest real `started`* subagent-activity marker
 //!   for that child when the parent file was imported in the same run, else
-//!   the parent thread's first op. `interacted`/`interrupted` markers are
-//!   never spawn targets.
+//!   the parent thread's newest eligible raw op at or before the child's first
+//!   reliable clock (the same clock-bounded divergence anchor `ForkOf` uses,
+//!   so marker-less parents still spread children across their history), else
+//!   the parent thread's first op when no reliable child clock or eligible
+//!   parent op exists. `interacted`/`interrupted` markers are never spawn
+//!   targets.
 //! - **ReconnectsTo** — emitted only from *explicit per-child completion
 //!   evidence*: a `collabToolCall` item's `agentsStates` entry whose status is
 //!   `completed`, or a legacy `collaboration.list_agents` tool result whose
@@ -125,6 +129,38 @@ pub struct ThreadTopology {
     pub legacy_completions: Vec<LegacyCompletionEvidence>,
 }
 
+/// Newest eligible raw op in `thread` at or before `clock_ms`.
+///
+/// Eligible ops are raw `Import` records with a reliable source clock:
+/// normalized lanes carry `Clock::None` and would otherwise win the seq max at
+/// the same ordinal, and `SOURCE_TIME_UNKNOWN` raw ops have no usable time.
+/// This is the clock-bounded divergence anchor shared by `ForkOf` and the
+/// marker-less `SubagentOf` fallback, so branches attach to the source
+/// thread's activity that actually preceded the child/fork start. Newest means
+/// the highest reliable source clock, with the later file-order seq as a
+/// deterministic tie-break when eligible ops share a clock — not merely the
+/// max file-order seq, which would win whenever an earlier op's timestamp is
+/// newer than a later op's.
+fn newest_raw_op_at_or_before(
+    ops_by_thread: &HashMap<u64, Vec<usize>>,
+    thread: &str,
+    ops: &[Op],
+    clock_ms: u64,
+) -> Option<OpId> {
+    let sid = SessionId(derive_session_id(thread).0);
+    let indices = ops_by_thread.get(&sid.0)?;
+    indices
+        .iter()
+        .filter_map(|&i| ops.get(i))
+        .filter(|op| {
+            matches!(op.kind, OpKind::Import(_))
+                && !op.tags.matches_any(Tags::SOURCE_TIME_UNKNOWN)
+                && op.clock.as_u64() <= clock_ms
+        })
+        .max_by_key(|op| (op.clock.as_u64(), op.id.seq))
+        .map(|op| op.id)
+}
+
 /// Emit structural relationship notes over the ops of one import run.
 ///
 /// Does not mutate `ops` and never infers topology: relationship evidence comes
@@ -176,9 +212,11 @@ pub fn emit_codex_relationship_notes(ops: &[Op], topology: &[ThreadTopology]) ->
     let mut pending: Vec<PendingNote> = Vec::new();
 
     // SubagentOf: this thread declares a parent thread. Target is the parent's
-    // earliest real `started` marker for this child; fall back to the parent
-    // thread's first op when the marker is missing or the parent file was not
-    // imported in this run.
+    // earliest real `started` marker for this child; marker-less parents fall
+    // back to the parent thread's newest eligible raw op at or before the
+    // child's first reliable clock (spreading children across parent history),
+    // then to the parent thread's first op when the child clock is unknown or
+    // no eligible parent op precedes it.
     for topo in topology {
         let Some(parent_thread) = topo.parent_thread_id.as_deref() else {
             continue;
@@ -194,6 +232,17 @@ pub fn emit_codex_relationship_notes(ops: &[Op], topology: &[ThreadTopology]) ->
                     .iter()
                     .find(|m| m.agent_thread_id == topo.thread_id && m.started)
                     .map(|m| m.op_id)
+            })
+            .or_else(|| {
+                if sub_first.tags.matches_any(Tags::SOURCE_TIME_UNKNOWN) {
+                    return None;
+                }
+                newest_raw_op_at_or_before(
+                    &ops_by_thread,
+                    parent_thread,
+                    ops,
+                    sub_first.clock.as_u64(),
+                )
             })
             .or_else(|| first_op(&ops_by_thread, parent_thread, ops).map(|op| op.id));
         if let Some(target) = target {
@@ -301,25 +350,12 @@ pub fn emit_codex_relationship_notes(ops: &[Op], topology: &[ThreadTopology]) ->
         if fork_first.tags.matches_any(Tags::SOURCE_TIME_UNKNOWN) {
             continue;
         }
-        let fork_clock = fork_first.clock.as_u64();
-        let source_indices = {
-            let sid = SessionId(derive_session_id(source_thread).0);
-            ops_by_thread.get(&sid.0)
-        };
-        let target = source_indices.and_then(|indices| {
-            indices
-                .iter()
-                .filter_map(|&i| ops.get(i))
-                // Raw source records only: normalized lanes carry `Clock::None`
-                // and would otherwise win the seq max at the same ordinal.
-                .filter(|op| {
-                    matches!(op.kind, OpKind::Import(_))
-                        && !op.tags.matches_any(Tags::SOURCE_TIME_UNKNOWN)
-                        && op.clock.as_u64() <= fork_clock
-                })
-                .max_by_key(|op| op.id.seq)
-                .map(|op| op.id)
-        });
+        let target = newest_raw_op_at_or_before(
+            &ops_by_thread,
+            source_thread,
+            ops,
+            fork_first.clock.as_u64(),
+        );
         if let Some(target) = target {
             pending.push(PendingNote {
                 parent: fork_first.id,
@@ -616,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_of_falls_back_to_parent_first_op_without_marker() {
+    fn subagent_of_attaches_to_parent_anchor_without_marker() {
         let parent_stream = SourceStream::new(NodeId(1), 0);
         let sub_stream = SourceStream::new(NodeId(2), 0);
         let mut ops = vec![raw(&parent_stream, 1, 1000), raw(&sub_stream, 1, 2000)];
@@ -636,12 +672,285 @@ mod tests {
         match &notes[0].kind {
             OpKind::Note(note) => {
                 assert_eq!(note.relationship, NoteRelationship::SubagentOf);
+                // The single eligible parent op (clock 1000 <= child 2000) is
+                // selected by the clock-bounded anchor; with no other parent
+                // ops the anchor and the first-op fallback coincide.
                 assert_eq!(
                     note.target_ids,
                     vec![parent_stream
                         .op_from_position(SourcePosition::raw(1))
                         .unwrap()]
                 );
+            }
+            _ => panic!("expected note op"),
+        }
+    }
+
+    #[test]
+    fn subagent_of_clock_anchor_attaches_to_newest_parent_op_before_child() {
+        let parent_stream = SourceStream::new(NodeId(1), 0);
+        let sub_stream = SourceStream::new(NodeId(2), 0);
+        // Parent activity at 1000, 2000, 3000; the marker-less child starts at
+        // 2500, so the branch attaches to the parent op at 2000 — not the
+        // parent's first op.
+        let mut ops = vec![
+            raw(&parent_stream, 1, 1000),
+            raw(&parent_stream, 2, 2000),
+            raw(&parent_stream, 3, 3000),
+            raw(&sub_stream, 1, 2500),
+        ];
+        ops[0].scope = scope("parent-1");
+        ops[1].scope = scope("parent-1");
+        ops[2].scope = scope("parent-1");
+        ops[3].scope = scope("sub-1");
+        let topology = vec![ThreadTopology {
+            thread_id: "sub-1".to_string(),
+            parent_thread_id: Some("parent-1".to_string()),
+            forked_from_id: None,
+            agent_path: None,
+            markers: Vec::new(),
+            completions: Vec::new(),
+            legacy_completions: Vec::new(),
+        }];
+        let notes = emit_codex_relationship_notes(&ops, &topology);
+        assert_eq!(notes.len(), 1);
+        match &notes[0].kind {
+            OpKind::Note(note) => {
+                assert_eq!(note.relationship, NoteRelationship::SubagentOf);
+                assert_eq!(
+                    note.target_ids,
+                    vec![parent_stream
+                        .op_from_position(SourcePosition::raw(2))
+                        .unwrap()]
+                );
+            }
+            _ => panic!("expected note op"),
+        }
+    }
+
+    #[test]
+    fn subagent_of_clock_anchor_skips_unknown_parent_ops() {
+        let parent_stream = SourceStream::new(NodeId(1), 0);
+        let sub_stream = SourceStream::new(NodeId(2), 0);
+        // Parent ops at 1000 (known), 2000 (unknown clock), 3000 (known); the
+        // child starts at 1500, so the anchor must skip the unknown-clock op
+        // and the future op, landing on the parent's first op.
+        let mut ops = vec![
+            raw(&parent_stream, 1, 1000),
+            raw_unknown_clock(&parent_stream, 2),
+            raw(&parent_stream, 3, 3000),
+            raw(&sub_stream, 1, 1500),
+        ];
+        ops[0].scope = scope("parent-1");
+        ops[1].scope = scope("parent-1");
+        ops[2].scope = scope("parent-1");
+        ops[3].scope = scope("sub-1");
+        let topology = vec![ThreadTopology {
+            thread_id: "sub-1".to_string(),
+            parent_thread_id: Some("parent-1".to_string()),
+            forked_from_id: None,
+            agent_path: None,
+            markers: Vec::new(),
+            completions: Vec::new(),
+            legacy_completions: Vec::new(),
+        }];
+        let notes = emit_codex_relationship_notes(&ops, &topology);
+        assert_eq!(notes.len(), 1);
+        match &notes[0].kind {
+            OpKind::Note(note) => {
+                assert_eq!(
+                    note.target_ids,
+                    vec![parent_stream
+                        .op_from_position(SourcePosition::raw(1))
+                        .unwrap()]
+                );
+            }
+            _ => panic!("expected note op"),
+        }
+    }
+
+    #[test]
+    fn subagent_of_clock_anchor_prefers_time_nearest_parent_op_over_file_order() {
+        let parent_stream = SourceStream::new(NodeId(1), 0);
+        let sub_stream = SourceStream::new(NodeId(2), 0);
+        // Parent raw ops are out of time order in file order: seq 1 is the
+        // newest (2000), seq 2 older (1500), seq 3 older still (1000), and a
+        // later unknown-clock op must stay filtered. The marker-less child
+        // starts at 2500, so the clock-bounded anchor must land on seq 1 —
+        // the time-nearest eligible op — not the max file-order seq 3.
+        let mut ops = vec![
+            raw(&parent_stream, 1, 2000),
+            raw(&parent_stream, 2, 1500),
+            raw(&parent_stream, 3, 1000),
+            raw_unknown_clock(&parent_stream, 4),
+            raw(&sub_stream, 1, 2500),
+        ];
+        ops[0].scope = scope("parent-1");
+        ops[1].scope = scope("parent-1");
+        ops[2].scope = scope("parent-1");
+        ops[3].scope = scope("parent-1");
+        ops[4].scope = scope("sub-1");
+        let topology = vec![ThreadTopology {
+            thread_id: "sub-1".to_string(),
+            parent_thread_id: Some("parent-1".to_string()),
+            forked_from_id: None,
+            agent_path: None,
+            markers: Vec::new(),
+            completions: Vec::new(),
+            legacy_completions: Vec::new(),
+        }];
+        let notes = emit_codex_relationship_notes(&ops, &topology);
+        assert_eq!(notes.len(), 1);
+        match &notes[0].kind {
+            OpKind::Note(note) => {
+                assert_eq!(note.relationship, NoteRelationship::SubagentOf);
+                assert_eq!(
+                    note.target_ids,
+                    vec![parent_stream
+                        .op_from_position(SourcePosition::raw(1))
+                        .unwrap()],
+                    "time-nearest eligible parent op wins over max file-order seq"
+                );
+            }
+            _ => panic!("expected note op"),
+        }
+    }
+
+    #[test]
+    fn subagent_of_clock_anchor_tie_breaks_same_clock_by_seq() {
+        let parent_stream = SourceStream::new(NodeId(1), 0);
+        let sub_stream = SourceStream::new(NodeId(2), 0);
+        // Two eligible parent ops share the same clock; the anchor must
+        // deterministically pick the later file-order op (seq 2), not the
+        // first one encountered.
+        let mut ops = vec![
+            raw(&parent_stream, 1, 2000),
+            raw(&parent_stream, 2, 2000),
+            raw(&sub_stream, 1, 3000),
+        ];
+        ops[0].scope = scope("parent-1");
+        ops[1].scope = scope("parent-1");
+        ops[2].scope = scope("sub-1");
+        let topology = vec![ThreadTopology {
+            thread_id: "sub-1".to_string(),
+            parent_thread_id: Some("parent-1".to_string()),
+            forked_from_id: None,
+            agent_path: None,
+            markers: Vec::new(),
+            completions: Vec::new(),
+            legacy_completions: Vec::new(),
+        }];
+        let notes = emit_codex_relationship_notes(&ops, &topology);
+        assert_eq!(notes.len(), 1);
+        let expected = parent_stream
+            .op_from_position(SourcePosition::raw(2))
+            .unwrap();
+        match &notes[0].kind {
+            OpKind::Note(note) => {
+                assert_eq!(note.relationship, NoteRelationship::SubagentOf);
+                assert_eq!(
+                    note.target_ids,
+                    vec![expected],
+                    "same-clock tie resolves deterministically to the later seq"
+                );
+            }
+            _ => panic!("expected note op"),
+        }
+        // Re-running produces the same anchor: the tie-break is stable.
+        let again = emit_codex_relationship_notes(&ops, &topology);
+        match &again[0].kind {
+            OpKind::Note(note) => assert_eq!(note.target_ids, vec![expected]),
+            _ => panic!("expected note op"),
+        }
+    }
+
+    #[test]
+    fn subagent_of_unknown_child_clock_falls_back_to_parent_first_op() {
+        let parent_stream = SourceStream::new(NodeId(1), 0);
+        let sub_stream = SourceStream::new(NodeId(2), 0);
+        // The child's first op has no reliable source clock, so no divergence
+        // boundary exists: fall back to the parent thread's first op.
+        let mut ops = vec![
+            raw(&parent_stream, 1, 1000),
+            raw(&parent_stream, 2, 2000),
+            raw_unknown_clock(&sub_stream, 1),
+        ];
+        ops[0].scope = scope("parent-1");
+        ops[1].scope = scope("parent-1");
+        ops[2].scope = scope("sub-1");
+        let topology = vec![ThreadTopology {
+            thread_id: "sub-1".to_string(),
+            parent_thread_id: Some("parent-1".to_string()),
+            forked_from_id: None,
+            agent_path: None,
+            markers: Vec::new(),
+            completions: Vec::new(),
+            legacy_completions: Vec::new(),
+        }];
+        let notes = emit_codex_relationship_notes(&ops, &topology);
+        assert_eq!(notes.len(), 1);
+        match &notes[0].kind {
+            OpKind::Note(note) => {
+                assert_eq!(
+                    note.target_ids,
+                    vec![parent_stream
+                        .op_from_position(SourcePosition::raw(1))
+                        .unwrap()]
+                );
+            }
+            _ => panic!("expected note op"),
+        }
+    }
+
+    #[test]
+    fn subagent_of_started_marker_wins_over_clock_anchor() {
+        let parent_stream = SourceStream::new(NodeId(1), 0);
+        let sub_stream = SourceStream::new(NodeId(2), 0);
+        let parent_session = SessionId(derive_session_id("parent-1").0);
+        let spawn = marker(&parent_stream, 2, parent_session);
+        // Parent ops at 1000, 2000 (spawn marker at ordinal 2); the child
+        // starts at 2500 — the clock anchor would land on the parent op at
+        // 2000, but the explicit `started` marker must win.
+        let mut ops = vec![
+            raw(&parent_stream, 1, 1000),
+            raw(&parent_stream, 2, 2000),
+            spawn.clone(),
+            raw(&sub_stream, 1, 2500),
+        ];
+        ops[0].scope = scope("parent-1");
+        ops[1].scope = scope("parent-1");
+        ops[3].scope = scope("sub-1");
+        let topology = vec![
+            ThreadTopology {
+                thread_id: "parent-1".to_string(),
+                parent_thread_id: None,
+                forked_from_id: None,
+                agent_path: None,
+                markers: vec![ActivityMarker {
+                    agent_thread_id: "sub-1".to_string(),
+                    agent_path: Some("/root/sub".to_string()),
+                    op_id: spawn.id,
+                    started: true,
+                }],
+                completions: Vec::new(),
+                legacy_completions: Vec::new(),
+            },
+            ThreadTopology {
+                thread_id: "sub-1".to_string(),
+                parent_thread_id: Some("parent-1".to_string()),
+                forked_from_id: None,
+                agent_path: Some("/root/sub".to_string()),
+                markers: Vec::new(),
+                completions: Vec::new(),
+                legacy_completions: Vec::new(),
+            },
+        ];
+        let notes = emit_codex_relationship_notes(&ops, &topology);
+        assert_eq!(notes.len(), 1);
+        match &notes[0].kind {
+            OpKind::Note(note) => {
+                assert_eq!(note.relationship, NoteRelationship::SubagentOf);
+                assert_eq!(note.target_ids, vec![spawn.id]);
             }
             _ => panic!("expected note op"),
         }

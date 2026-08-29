@@ -1016,7 +1016,17 @@ fn sub_op_label(op: &Op) -> (String, String) {
     };
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
         if let Some(record_type) = value.get("type").and_then(serde_json::Value::as_str) {
-            return (record_type.to_string(), record_type.to_string());
+            let label = if record_type == "event_msg" {
+                value
+                    .get("payload")
+                    .and_then(|payload| payload.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|event_type| !event_type.is_empty())
+                    .unwrap_or(record_type)
+            } else {
+                record_type
+            };
+            return (label.to_string(), label.to_string());
         }
     }
     (raw, "meta".to_string())
@@ -2052,6 +2062,23 @@ mod tests {
         let (summary, kind) = sub_op_label(&op);
         assert_eq!(summary, "last-prompt");
         assert_eq!(kind, "last-prompt");
+    }
+
+    #[test]
+    fn sub_op_label_uses_event_payload_type() {
+        let op = op_envelope(
+            1,
+            1,
+            OpKind::Import(ImportOp {
+                raw_ref: Payload::Inline(
+                    br#"{"type":"event_msg","payload":{"type":"task_complete"}}"#.to_vec(),
+                ),
+                raw_hash: None,
+            }),
+        );
+        let (summary, kind) = sub_op_label(&op);
+        assert_eq!(summary, "task_complete");
+        assert_eq!(kind, "task_complete");
     }
 
     #[test]

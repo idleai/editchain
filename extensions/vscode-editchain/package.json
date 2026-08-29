@@ -50,6 +50,7 @@
     "ui:inspect": "node scripts/ui-dump.mjs inspect",
     "ui:check": "node scripts/ui-dump.mjs check",
     "ui:real": "node scripts/ui-real.mjs",
+    "ui:graph": "node scripts/ui-graph.mjs",
     "ui:vscode": "xvfb-run -a npx wdio run ./test/vscode/wdio.conf.ts"
   },
   "devDependencies": {

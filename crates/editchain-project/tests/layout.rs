@@ -31,6 +31,18 @@ fn no_git(_: &str) -> bool {
     false
 }
 
+/// Assert that a set of lane ids is contiguous: exactly `0..=max` are used.
+/// Compaction must never leave a hole at a collapsed lane index.
+fn assert_lanes_are_dense(lanes: &[usize]) {
+    let max = lanes.iter().copied().max().unwrap_or(0);
+    let used: std::collections::HashSet<usize> = lanes.iter().copied().collect();
+    assert_eq!(
+        used.len(),
+        max.saturating_add(1),
+        "lane ids must be dense from 0..={max}: used={used:?}"
+    );
+}
+
 #[test]
 fn linear_history_single_lane() {
     // A -> B -> C (newest-first: C, B, A)
@@ -425,10 +437,54 @@ fn disconnected_overlapping_chains_get_distinct_lanes() {
     let parents = parents_from(&[("A2", &["A1"]), ("B2", &["B1"])]);
     let layout = compute_graph_layout(&nodes, parents, &no_git);
     let lane_of = |k: &str| layout.rows.iter().find(|r| r.node == k).unwrap().lane;
+    let lanes: Vec<usize> = layout.rows.iter().map(|r| r.lane).collect();
     assert_ne!(
         lane_of("A2"),
         lane_of("B2"),
         "overlapping chains need distinct lanes"
+    );
+    assert_lanes_are_dense(&lanes);
+}
+
+/// A disconnected component must reserve the full width of an active fork,
+/// not only its base lane. The short B chain renders while A's two-lane diamond
+/// is still open; B therefore needs a third lane instead of colliding with A's
+/// branch lane.
+#[test]
+fn overlapping_component_does_not_collide_with_active_fork_lane() {
+    // Newest-first rows:
+    //   M(0), right(1), B2(2), B1(3), left(4), root(5)
+    // A is the diamond M -> [right, left] -> root and spans rows 0..5.
+    // B is disconnected but lies inside that span at rows 2..3.
+    let nodes = vec![
+        "M".to_string(),
+        "right".to_string(),
+        "B2".to_string(),
+        "B1".to_string(),
+        "left".to_string(),
+        "root".to_string(),
+    ];
+    let parents = parents_from(&[
+        ("M", &["right", "left"]),
+        ("right", &["root"]),
+        ("left", &["root"]),
+        ("B2", &["B1"]),
+    ]);
+    let layout = compute_graph_layout(&nodes, parents, &no_git);
+    let lane_of = |key: &str| layout.rows.iter().find(|row| row.node == key).unwrap().lane;
+    let fork_lanes: std::collections::HashSet<usize> =
+        [lane_of("right"), lane_of("left")].into_iter().collect();
+
+    assert_eq!(fork_lanes.len(), 2, "diamond branches need two lanes");
+    assert!(
+        !fork_lanes.contains(&lane_of("B2")),
+        "the nested disconnected chain must not reuse an active fork lane"
+    );
+    assert_eq!(lane_of("B2"), lane_of("B1"));
+    assert_eq!(
+        layout.rows.iter().map(|row| row.lane).max(),
+        Some(2),
+        "two active fork lanes plus one disconnected chain lane"
     );
 }
 
@@ -487,6 +543,389 @@ fn reuse_preserves_merge_two_lanes() {
         lane_of("Y"),
         "merge parents need distinct lanes"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Lane reuse inside ONE connected component
+// ---------------------------------------------------------------------------
+
+/// N sequential operation branches explicitly linked to successive commits in
+/// one Git chain still reuse lanes after each branch ends. Without in-component
+/// compaction, every branch root claims a permanent fresh lane and `max_lane`
+/// grows linearly with the branch count.
+#[test]
+fn sequential_explicit_git_links_reuse_operation_lanes() {
+    let n = 8usize;
+    let mut nodes: Vec<String> = Vec::new();
+    let mut parents: Vec<(String, Vec<String>)> = Vec::new();
+    // Newest-first display order: each branch's newest op sits directly above
+    // its linked commit, with the commit chain below the oldest session.
+    for s in (0..n).rev() {
+        let b = format!("s{s}b"); // newest op of session s, linked to git
+        let g = format!("g{s}");
+        let a = format!("s{s}a"); // oldest op of session s
+        nodes.push(b.clone());
+        nodes.push(g.clone());
+        nodes.push(a.clone());
+        parents.push((b.clone(), vec![a.clone(), g.clone()]));
+        parents.push((
+            g.clone(),
+            if s == 0 {
+                Vec::new()
+            } else {
+                vec![format!("g{}", s - 1)]
+            },
+        ));
+        parents.push((a.clone(), Vec::new()));
+    }
+    let is_git = |k: &str| -> bool { k.starts_with('g') };
+    let parents_of = |k: &str| -> Vec<String> {
+        parents
+            .iter()
+            .find(|(c, _)| c == k)
+            .map(|(_, ps)| ps.clone())
+            .unwrap_or_default()
+    };
+    let ctx = LayoutContext::new(&nodes, &parents_of, &is_git);
+    let lane_of = |k: &str| ctx.lanes.iter().find(|r| r.node == k).unwrap().lane;
+    let max_lane = ctx.lanes.iter().map(|r| r.lane).max().unwrap_or(0);
+    let lanes: Vec<usize> = ctx.lanes.iter().map(|r| r.lane).collect();
+    // Everything is one component (each branch reaches the shared Git chain),
+    // yet the sequential branches must pack onto one reusable op lane.
+    assert_eq!(
+        max_lane, 1,
+        "sequential branches linked to a shared Git chain must reuse one op lane"
+    );
+    assert_lanes_are_dense(&lanes);
+    for key in &nodes {
+        let expected = usize::from(!is_git(key));
+        assert_eq!(
+            lane_of(key),
+            expected,
+            "{key} must land on the expected lane (git=0, ops=1)"
+        );
+    }
+}
+
+/// Real-corpus shape: many wall-clock-sequential sessions all retain the same
+/// weak inferred `BasedOn` commit. That provenance must not become 167 live
+/// causal edges or force one permanent operation lane per imported session.
+#[test]
+fn sequential_sessions_sharing_inferred_base_reuse_single_op_lane() {
+    const SESSION_COUNT: usize = 167;
+    let mut ops = Vec::with_capacity(SESSION_COUNT.saturating_mul(2));
+    for session in 0..SESSION_COUNT {
+        let ordinal = u64::try_from(session).unwrap().saturating_add(1);
+        let first_ms = 1_000_000_u64.saturating_add(ordinal.saturating_mul(10_000));
+        let first = msg(ordinal, first_ms, ordinal, None);
+        let second = msg(
+            ordinal,
+            first_ms.saturating_add(1_000),
+            ordinal,
+            Some(first.id),
+        );
+        ops.push(first);
+        ops.push(second);
+    }
+
+    let mut shared_base = git_commit(42, &[]);
+    shared_base.author.when = 1_000;
+    shared_base.committer.when = 1_000;
+    shared_base.authored_at = 1_000;
+    shared_base.committed_at = 1_000;
+    let shared_base_key = shared_base.oid.to_hex();
+
+    let mut projection = HistoryProjection::from_ops(ops);
+    projection.merge_git_commits(vec![shared_base]);
+    projection.link_history();
+
+    let based_on_count = projection
+        .git
+        .links
+        .values()
+        .flatten()
+        .filter(|link| matches!(&link.kind, GitLinkKind::BasedOn))
+        .count();
+    assert_eq!(
+        based_on_count, SESSION_COUNT,
+        "every session must retain its weak Git provenance metadata"
+    );
+
+    let nodes = projection.nodes();
+    for node in &nodes {
+        if node.git_oid().is_none() {
+            assert!(
+                !projection
+                    .lifted_parent_keys(node)
+                    .contains(&shared_base_key),
+                "BasedOn provenance must not appear in causal parent keys"
+            );
+        }
+    }
+
+    let layout = projection.graph_layout();
+    let max_lane = layout.rows.iter().map(|row| row.lane).max().unwrap_or(0);
+    assert_eq!(
+        max_lane, 1,
+        "git lane 0 plus one lane reused by all sequential sessions"
+    );
+    for row in &layout.rows {
+        let expected_lane = usize::from(row.node != shared_base_key);
+        assert_eq!(
+            row.lane, expected_lane,
+            "Git must remain on lane 0 and every sequential session on lane 1"
+        );
+    }
+    assert!(
+        layout
+            .edges
+            .iter()
+            .all(|edge| edge.parent != shared_base_key),
+        "weak BasedOn metadata must not emit operation-to-Git graph edges"
+    );
+}
+
+/// Repeated sequential fork diamonds inside one session reuse the freed branch
+/// lane: diamond k's branches render on the same two columns as diamond 0's
+/// instead of claiming a fresh lane per diamond.
+#[test]
+fn sequential_fork_diamonds_reuse_the_freed_branch_lane() {
+    let diamonds = 10usize;
+    let mut nodes: Vec<String> = Vec::new();
+    let mut parents: Vec<(String, Vec<String>)> = Vec::new();
+    for d in (0..diamonds).rev() {
+        let c1 = format!("d{d}c1");
+        let c2 = format!("d{d}c2");
+        let m = format!("d{d}m");
+        // Diamond d forks off m_{d-1} (or R) and merges back at m_d. The first
+        // parent of the merge is the trunk branch so the merge returns to the
+        // trunk lane; the fork branch is the secondary parent.
+        let fork = if d == 0 {
+            "R".to_string()
+        } else {
+            format!("d{}m", d - 1)
+        };
+        parents.push((c1.clone(), vec![fork.clone()]));
+        parents.push((c2.clone(), vec![fork]));
+        parents.push((m.clone(), vec![c2.clone(), c1.clone()]));
+        // Newest-first display order: the merge row, then its two branches,
+        // then the previous merge below.
+        nodes.push(m.clone());
+        nodes.push(c2.clone());
+        nodes.push(c1.clone());
+    }
+    nodes.push("R".to_string());
+    parents.push(("R".to_string(), Vec::new()));
+    let parents_of = |k: &str| -> Vec<String> {
+        parents
+            .iter()
+            .find(|(c, _)| c == k)
+            .map(|(_, ps)| ps.clone())
+            .unwrap_or_default()
+    };
+    let ctx = LayoutContext::new(&nodes, &parents_of, &no_git);
+    let lane_of = |k: &str| ctx.lanes.iter().find(|r| r.node == k).unwrap().lane;
+    let max_lane = ctx.lanes.iter().map(|r| r.lane).max().unwrap_or(0);
+    let lanes_used: std::collections::HashSet<usize> = ctx.lanes.iter().map(|r| r.lane).collect();
+    let lanes: Vec<usize> = ctx.lanes.iter().map(|r| r.lane).collect();
+    assert_eq!(
+        max_lane, 1,
+        "sequential fork diamonds must reuse one branch lane, not one per diamond"
+    );
+    assert_eq!(
+        lanes_used.len(),
+        2,
+        "exactly two columns: the trunk lane and one reused fork lane"
+    );
+    assert_lanes_are_dense(&lanes);
+    for d in 0..diamonds {
+        let c1 = format!("d{d}c1");
+        let c2 = format!("d{d}c2");
+        let m = format!("d{d}m");
+        // The two concurrent branches of EVERY diamond still render on distinct
+        // lanes (overlapping branch activity never collapses onto one lane).
+        assert_ne!(
+            lane_of(&c1),
+            lane_of(&c2),
+            "diamond {d} branches must stay on distinct lanes"
+        );
+        // And the merge returns to the trunk lane.
+        assert_eq!(
+            lane_of(&m),
+            lane_of(&c2),
+            "diamond {d} merge must return to the trunk lane"
+        );
+    }
+}
+
+/// Compaction must renumber the surviving lanes densely even when an
+/// INTERMEDIATE lane merges while a later lane cannot. Three sessions (A, B,
+/// C) linked to one git chain: A's op lane (rows 0..2) and B's op lane (rows
+/// 4..6) are disjoint in time, so B merges into A's lane; C's op lane spans
+/// rows 1..7 and overlaps the merged span, so C cannot merge. The survivors
+/// would be lanes {0, 2, 3} (a gap at 1) unless they are renumbered — and the
+/// git-leftmost shift would then leave an even wider hole.
+///
+/// Newest-first rows: A2(0), C2(1), A1(2), G2(3), B2(4), B1(5), C1(6), G1(7),
+/// G0(8). Sessions: A2 -> [A1, G2], B2 -> [B1, G1], C2 -> [C1, G0]; git chain
+/// G2 -> G1 -> G0.
+#[test]
+fn intermediate_lane_merges_but_later_lane_cannot_densifies_survivors() {
+    let nodes = vec![
+        "A2".to_string(),
+        "C2".to_string(),
+        "A1".to_string(),
+        "G2".to_string(),
+        "B2".to_string(),
+        "B1".to_string(),
+        "C1".to_string(),
+        "G1".to_string(),
+        "G0".to_string(),
+    ];
+    let parents_of = parents_from(&[
+        ("A2", &["A1", "G2"]),
+        ("A1", &[]),
+        ("B2", &["B1", "G1"]),
+        ("B1", &[]),
+        ("C2", &["C1", "G0"]),
+        ("C1", &[]),
+        ("G2", &["G1"]),
+        ("G1", &["G0"]),
+        ("G0", &[]),
+    ]);
+    let is_git = |k: &str| -> bool { k.starts_with('G') };
+    let ctx = LayoutContext::new(&nodes, &parents_of, &is_git);
+    let lane_of = |k: &str| ctx.lanes.iter().find(|r| r.node == k).unwrap().lane;
+    let max_lane = ctx.lanes.iter().map(|r| r.lane).max().unwrap_or(0);
+    let lanes: Vec<usize> = ctx.lanes.iter().map(|r| r.lane).collect();
+    // A and B merged onto one reusable op lane; C (overlapping B) kept its own.
+    assert_eq!(
+        lane_of("B1"),
+        lane_of("A1"),
+        "B's disjoint op lane must merge into A's lane"
+    );
+    assert_ne!(
+        lane_of("C1"),
+        lane_of("A1"),
+        "C's overlapping op lane must stay distinct"
+    );
+    assert_eq!(max_lane, 2, "git=0 plus two dense op lanes");
+    assert_lanes_are_dense(&lanes);
+    assert_eq!(lane_of("A1"), 1);
+    assert_eq!(lane_of("B1"), 1);
+    assert_eq!(lane_of("C1"), 2);
+    assert_eq!(lane_of("G0"), 0);
+    assert_eq!(lane_of("G2"), 0);
+}
+
+/// Pass-through must reflect EXACT geometry runs, not per-component min/max
+/// occupancy: after compaction merges two disjoint branch runs onto one lane,
+/// a window inside the gap between them must NOT draw a false vertical line,
+/// while a genuinely continuous segment crossing the window still draws one.
+///
+/// Uses the same three-session graph as
+/// `intermediate_lane_merges_but_later_lane_cannot_densifies_survivors`:
+/// final lanes are git=0, merged ops A+B=1, op C=2. Lane 1 has real segments
+/// at rows 0..2 and 4..6 with a gap at row 3; lane 0 carries the continuous
+/// git chain G2(3) -> G1(7) spanning rows 3..7.
+#[test]
+fn pass_through_skips_gap_between_merged_lane_runs_but_crosses_real_segment() {
+    let nodes = vec![
+        "A2".to_string(),
+        "C2".to_string(),
+        "A1".to_string(),
+        "G2".to_string(),
+        "B2".to_string(),
+        "B1".to_string(),
+        "C1".to_string(),
+        "G1".to_string(),
+        "G0".to_string(),
+    ];
+    let parents_of = parents_from(&[
+        ("A2", &["A1", "G2"]),
+        ("A1", &[]),
+        ("B2", &["B1", "G1"]),
+        ("B1", &[]),
+        ("C2", &["C1", "G0"]),
+        ("C1", &[]),
+        ("G2", &["G1"]),
+        ("G1", &["G0"]),
+        ("G0", &[]),
+    ]);
+    let is_git = |k: &str| -> bool { k.starts_with('G') };
+    let ctx = LayoutContext::new(&nodes, &parents_of, &is_git);
+    // Window at row 3: the gap between lane 1's merged runs [0,2] and [4,6].
+    let edges = ctx.edges_for_window(3, 1);
+    assert!(
+        !edges
+            .iter()
+            .any(|e| e.child.starts_with("__pass_through_1")),
+        "must not draw a pass-through line inside the merged lane's gap"
+    );
+    // Window rows 4..5: the git chain's continuous same-lane run [2,8] crosses
+    // with no git node inside the window — the sparse-chain line must still be
+    // drawn (and the merged op lane has its nodes inside, so no second line).
+    let edges = ctx.edges_for_window(4, 2);
+    assert!(
+        edges
+            .iter()
+            .any(|e| e.child.starts_with("__pass_through_0")),
+        "continuous segment crossing the window must draw a pass-through line"
+    );
+    assert!(
+        !edges
+            .iter()
+            .any(|e| e.child.starts_with("__pass_through_1")),
+        "no pass-through on the op lane whose nodes are inside the window"
+    );
+}
+
+/// A lane must NEVER be reused across overlapping branch activity: a fork
+/// branch that is still live while a later sibling branch renders keeps its own
+/// column even though the first branch started earlier. This guards the
+/// compaction's row-span disjointness invariant against unsafe merges.
+#[test]
+fn concurrent_branch_overlap_never_reuses_a_lane() {
+    // Newest-first: Y(0), M(1), X(2), C2(3), C1(4), R(5).
+    //   R forks into trunk C1 and long branch C2 -> X; C1 forks again into M
+    //   (merging X back) and Y, whose edge to C1 overlaps the C2/X branch rows.
+    let nodes = vec![
+        "Y".to_string(),
+        "M".to_string(),
+        "X".to_string(),
+        "C2".to_string(),
+        "C1".to_string(),
+        "R".to_string(),
+    ];
+    let parents = parents_from(&[
+        ("C1", &["R"]),
+        ("C2", &["R"]),
+        ("X", &["C2"]),
+        ("M", &["C1", "X"]),
+        ("Y", &["C1"]),
+    ]);
+    let ctx = LayoutContext::new(&nodes, &parents, &no_git);
+    let lane_of = |k: &str| ctx.lanes.iter().find(|r| r.node == k).unwrap().lane;
+    // The long C2->X branch and the Y/M branch overlap in display rows, so they
+    // must NOT be merged onto one lane even though both reuse compaction.
+    assert_ne!(
+        lane_of("X"),
+        lane_of("Y"),
+        "overlapping branches must not share a lane"
+    );
+    assert_ne!(
+        lane_of("X"),
+        lane_of("M"),
+        "overlapping branches must not share a lane"
+    );
+    // M forks off C1 (Y already occupies C1's lane), so M and Y are two
+    // concurrent children of C1 whose edges overlap rows — they stay distinct.
+    assert_ne!(
+        lane_of("M"),
+        lane_of("Y"),
+        "concurrent children of C1 with overlapping edges must stay distinct"
+    );
+    assert_ne!(lane_of("C1"), lane_of("X"));
 }
 
 /// A full, comparable snapshot of a layout's lane geometry (lanes, per-row
@@ -1144,8 +1583,8 @@ fn adjacent_cross_lane_edge_points_have_no_duplicate_open_start() {
 // ---------------------------------------------------------------------------
 
 use editchain_core::{
-    ActorId, Clock, MessageOp, NoteOp, NoteRelationship, Op, OpKind, ParentSet, Payload, ScopeRef,
-    SessionId, Tags,
+    ActorId, Clock, GitLinkKind, MessageOp, NoteOp, NoteRelationship, Op, OpKind, ParentSet,
+    Payload, ScopeRef, SessionId, Tags,
 };
 
 /// A standalone message op, scoped to a session, with a causal parent.
