@@ -226,6 +226,13 @@ function openHistoryView(
       output?.appendLine('[webview] ' + msg.text);
       return;
     }
+    if (msg.type === 'statusText') {
+      // Assistive-tech/live-region announcements (profile switches, load
+      // progress). Mirrored to the output channel for diagnostics; the status
+      // bar count remains driven by the `status` message below.
+      output?.appendLine('[webview] status: ' + msg.text);
+      return;
+    }
     // The webview reports its loaded/total node counts; surface them in the
     // status bar.
     if (msg.type === 'status') {
@@ -492,6 +499,10 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
     vscode.Uri.joinPath(context.extensionUri, 'media', 'main.css')
   );
   const cspSource = webview.cspSource;
+  // The segmented Activity/Raw control switches the chain filter's hide_trace
+  // flag (Activity = hide trace records, Raw = show everything). The search
+  // input is labelled for assistive tech, and the status region announces
+  // search/results/load progress without stealing focus.
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -502,13 +513,19 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 <link rel="stylesheet" href="${styleUri}">
 </head>
 <body>
-<div id="controls">
+<div id="controls" role="group" aria-label="History controls">
+<div id="profile-control" class="segmented" role="group" aria-label="History profile">
+<button type="button" id="profile-activity" class="segmented-btn active" aria-pressed="true">Activity</button>
+<button type="button" id="profile-raw" class="segmented-btn" aria-pressed="false">Raw</button>
+</div>
+<label class="visually-hidden" for="search">Search history</label>
 <input id="search" type="text" placeholder="Search history… (Enter to search)">
 </div>
 <div id="layout">
 <div id="rows"></div>
 <div id="detail"></div>
 </div>
+<div id="status-live" class="visually-hidden" role="status" aria-live="polite"></div>
 <script src="${scriptUri}"></script>
 </body>
 </html>`;

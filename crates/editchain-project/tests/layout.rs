@@ -2,6 +2,7 @@
 
 // Crate-level dependency markers (used by Cargo for feature resolution).
 use regex as _;
+use serde as _;
 use serde_json as _;
 
 use editchain_core::{NodeId, OpId};

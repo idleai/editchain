@@ -31,10 +31,10 @@ const HARNESS = 'file://' + path.join(EXT_ROOT, 'test', 'harness', 'index.html')
 const CHROME = process.env.CHROME_PATH ||
   '/mnt/hot/ambientlight/.cache/puppeteer/chrome/linux-151.0.7922.71/chrome-linux64/chrome';
 
-const SCENARIOS = ['empty', 'linear', 'merge', 'mixed', 'filtered', 'undated', 'error', 'warned', 'large', 'longsummary', 'combined', 'fork', 'highLanes'];
+const SCENARIOS = ['empty', 'linear', 'merge', 'mixed', 'filtered', 'undated', 'error', 'warned', 'large', 'longsummary', 'combined', 'traced', 'badges', 'fork', 'highLanes'];
 
 function parseArgs(argv) {
-  const args = { cmd: argv[0], scenario: 'merge', viewport: '1440x900', out: null, selector: null, search: null, searchRace: false, resize: false, deferredLayout: false, shot: null };
+  const args = { cmd: argv[0], scenario: 'merge', viewport: '1440x900', out: null, selector: null, search: null, searchRace: false, resize: false, deferredLayout: false, shot: null, profile: null, profileSwitch: false, inspector: false, keyboard: false, restore: false };
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--scenario') args.scenario = argv[++i];
@@ -46,6 +46,11 @@ function parseArgs(argv) {
     else if (a === '--resize') args.resize = true;
     else if (a === '--deferred-layout') args.deferredLayout = true;
     else if (a === '--shot') args.shot = argv[++i];
+    else if (a === '--profile') args.profile = argv[++i];
+    else if (a === '--profile-switch') args.profileSwitch = true;
+    else if (a === '--inspector') args.inspector = true;
+    else if (a === '--keyboard') args.keyboard = true;
+    else if (a === '--restore') args.restore = true;
   }
   return args;
 }
@@ -93,6 +98,17 @@ async function main() {
     window.__editchainStart();
   }, args.scenario, args.deferredLayout);
 
+  // Optional initial profile (default Activity): switch through the REAL
+  // control path BEFORE the checks run, so a `--profile raw` run asserts the
+  // Raw view (trace rows visible, hide_trace=false on the wire).
+  if (args.profile === 'activity' || args.profile === 'raw') {
+    await page.waitForFunction(() =>
+      typeof window.__editchainSetProfile === 'function' &&
+      window.__editchainDataReady === true, { timeout: 15000 });
+    await page.evaluate((name) => window.__editchainSetProfile(name), args.profile);
+    await page.evaluate(() => window.__editchainDebug.whenIdle(10000));
+  }
+
   // Optional controlled two-stage assertion: the row-only response must paint
   // while the layout-enabled response is held, then settle with real geometry
   // after the harness explicitly releases it.
@@ -138,13 +154,18 @@ async function main() {
   const metrics = await page.evaluate(() => window.__editchainDebug.getMetrics());
   const assertion = await page.evaluate(() => window.__editchainDebug.assertLayout());
 
-  // Combined scenario: click the combined op and verify ALL bundled sub-ops
-  // reveal inline (the "only the first sub-op appears" regression).
+  // Combined scenario: click the combined op's CHEVRON (the only control that
+  // toggles bundled sub-ops — a plain row click selects in the inspector now)
+  // and verify ALL bundled sub-ops reveal inline (the "only the first sub-op
+  // appears" regression).
   let expansion = null;
   if (args.scenario === 'combined') {
     await page.evaluate(() => {
       const row = document.querySelector('.row[data-key="node:c:1"]');
-      if (row) row.click();
+      if (row) {
+        const chevron = row.querySelector('.subop-chevron');
+        if (chevron) chevron.click();
+      }
     });
     await page.evaluate(() => window.__editchainDebug.whenIdle(5000));
     expansion = await page.evaluate(() => ({
@@ -159,6 +180,52 @@ async function main() {
   let searchResult = null;
   if (args.search) {
     searchResult = await page.evaluate((q) => window.__editchainDebug.runSearch(q, 5000), args.search);
+  }
+
+  // Profile-switch interaction (scenario must be `traced`): Activity -> Raw ->
+  // Activity + search-exit, asserting hide_trace DTOs, offset-0 refetch,
+  // coherent cache/expansion reset, and trace-row visibility.
+  let profileSwitch = null;
+  if (args.profileSwitch) {
+    profileSwitch = await page.evaluate(() => window.__editchainDebug.runProfileSwitch(10000));
+  }
+
+  // Inspector-vs-chevron routing interaction: row click opens the inspector
+  // (no editor tab); only the chevron toggles bundled sub-ops; Close clears.
+  let inspector = null;
+  if (args.inspector) {
+    inspector = await page.evaluate(() => window.__editchainDebug.runInspectorRouting(10000));
+  }
+
+  // Inspector geometry across wide + narrow viewports: open/close at ~1440 and
+  // ~400/617 must RECOMPUTE the table geometry (flex width, graph column, inline
+  // column widths, hidden columns, overflow) rather than leaving stale widths.
+  // Each viewport change resizes #rows (window resize -> debounced recompute),
+  // and the probe settles to the new width before capturing its baseline.
+  let inspectorGeometry = null;
+  if (args.inspector) {
+    inspectorGeometry = { viewports: [] };
+    for (const w of [1440, 617, 400]) {
+      await page.setViewport({ width: w, height: vp.height });
+      const geom = await page.evaluate(() => window.__editchainDebug.runInspectorGeometry(10000));
+      inspectorGeometry.viewports.push({ width: w, ...geom });
+    }
+  }
+
+  // Persisted-viewport restore regression (scenario must render enough rows,
+  // e.g. `large`): replaying open into a surviving context must restore the
+  // saved scroll position AND persist it back (never a transient 0 written
+  // before restoreScrollTop had run).
+  let restoreResult = null;
+  if (args.restore) {
+    await page.setViewport({ width: vp.width, height: vp.height });
+    restoreResult = await page.evaluate(() => window.__editchainDebug.runRestoreStateProbe(10000));
+  }
+
+  // Keyboard probe: Enter activates, Space expands (where applicable).
+  let keyboard = null;
+  if (args.keyboard) {
+    keyboard = await page.evaluate(() => window.__editchainDebug.runKeyboardProbe(10000));
   }
 
   // Reversed-search race (scenario must be `merge`): two rapid searches share
@@ -203,6 +270,11 @@ async function main() {
   fs.writeFileSync(path.join(outDir, 'aria.yml'), formatAria(page));
   if (expansion) fs.writeFileSync(path.join(outDir, 'expansion.json'), JSON.stringify(expansion, null, 2));
   if (searchResult) fs.writeFileSync(path.join(outDir, 'search.json'), JSON.stringify(searchResult, null, 2));
+  if (profileSwitch) fs.writeFileSync(path.join(outDir, 'profile-switch.json'), JSON.stringify(profileSwitch, null, 2));
+  if (inspector) fs.writeFileSync(path.join(outDir, 'inspector.json'), JSON.stringify(inspector, null, 2));
+  if (keyboard) fs.writeFileSync(path.join(outDir, 'keyboard.json'), JSON.stringify(keyboard, null, 2));
+  if (inspectorGeometry) fs.writeFileSync(path.join(outDir, 'inspector-geometry.json'), JSON.stringify(inspectorGeometry, null, 2));
+  if (restoreResult) fs.writeFileSync(path.join(outDir, 'restore.json'), JSON.stringify(restoreResult, null, 2));
   if (searchRace) fs.writeFileSync(path.join(outDir, 'search-race.json'), JSON.stringify(searchRace, null, 2));
   if (resizeResult) fs.writeFileSync(path.join(outDir, 'resize.json'), JSON.stringify(resizeResult, null, 2));
   if (deferredLayout) fs.writeFileSync(path.join(outDir, 'deferred-layout.json'), JSON.stringify(deferredLayout, null, 2));
@@ -231,10 +303,36 @@ async function main() {
   }
   if (searchResult) {
     const searchOk = searchResult.resultRows > 0 &&
+      searchResult.inspectorOpened === true &&
       (searchResult.navigated || searchResult.firstRowChevron);
     summary.push('- search "' + args.search + '": results=' + searchResult.resultRows +
-      ' banner="' + searchResult.bannerText + '" navigated=' + searchResult.navigated +
+      ' banner="' + searchResult.bannerText + '" inspectorOpened=' + searchResult.inspectorOpened +
+      ' navigated=' + searchResult.navigated +
       ' (' + (searchOk ? 'OK' : 'FAIL') + ')');
+  }
+  if (profileSwitch) {
+    summary.push('- profile switch: pass=' + profileSwitch.pass +
+      ' steps=' + JSON.stringify(profileSwitch.steps));
+  }
+  if (inspector) {
+    summary.push('- inspector routing: pass=' + inspector.pass +
+      ' steps=' + JSON.stringify(inspector.steps));
+  }
+  if (keyboard) {
+    summary.push('- keyboard probe: pass=' + keyboard.pass +
+      ' steps=' + JSON.stringify(keyboard.steps));
+  }
+  if (inspectorGeometry) {
+    summary.push('- inspector geometry: ' + inspectorGeometry.viewports.map((v) =>
+      v.width + 'px pass=' + v.pass +
+      ' graphW=' + JSON.stringify(v.detail && v.detail.graphSvgW) +
+      ' rowsW=' + JSON.stringify(v.detail && v.detail.rowsW)).join(' | '));
+  }
+  if (restoreResult) {
+    summary.push('- restore probe: pass=' + restoreResult.pass +
+      ' scrollTop=' + JSON.stringify(restoreResult.detail && restoreResult.detail.actualScrollTop) +
+      ' (expected ' + JSON.stringify(restoreResult.detail && restoreResult.detail.expectedScrollTop) + ')' +
+      ' persisted=' + JSON.stringify(restoreResult.detail && restoreResult.detail.persistedAfter));
   }
   if (searchRace) {
     const step = searchRace.steps[0];
@@ -275,10 +373,16 @@ async function main() {
   const interactionFailed =
     (expansion !== null && !(expansion.subopRows === 7 && expansion.rowsRendered >= 9)) ||
     (searchResult !== null && !(searchResult.resultRows > 0 &&
+      searchResult.inspectorOpened === true &&
       (searchResult.navigated || searchResult.firstRowChevron))) ||
     (searchRace !== null && !(searchRace.steps[0] && searchRace.steps[0].latestWins === true)) ||
     (resizeResult !== null && resizeResult.pass !== true) ||
-    (deferredLayout !== null && deferredLayout.pass !== true);
+    (deferredLayout !== null && deferredLayout.pass !== true) ||
+    (profileSwitch !== null && profileSwitch.pass !== true) ||
+    (inspector !== null && inspector.pass !== true) ||
+    (keyboard !== null && keyboard.pass !== true) ||
+    (inspectorGeometry !== null && inspectorGeometry.viewports.some((v) => v.pass !== true)) ||
+    (restoreResult !== null && restoreResult.pass !== true);
   if (args.cmd === 'check' && (failedChecks.length > 0 || pageErrors.length > 0 || interactionFailed)) {
     console.error('CHECK FAILED: ' + failedChecks.length + ' layout check(s), ' +
       pageErrors.length + ' page error(s), interactionFailed=' + interactionFailed);
@@ -297,7 +401,21 @@ async function main() {
   if (expansion) console.log('combined expansion subopRows=' + expansion.subopRows +
     ' rowsRendered=' + expansion.rowsRendered);
   if (searchResult) console.log('search results=' + searchResult.resultRows +
+    ' inspectorOpened=' + searchResult.inspectorOpened +
     ' navigated=' + searchResult.navigated);
+  if (profileSwitch) console.log('profile-switch pass=' + profileSwitch.pass +
+    ' steps=' + profileSwitch.steps.length);
+  if (inspector) console.log('inspector pass=' + inspector.pass +
+    ' steps=' + inspector.steps.length);
+  if (keyboard) console.log('keyboard pass=' + keyboard.pass +
+    ' steps=' + keyboard.steps.length);
+  if (inspectorGeometry) console.log('inspector geometry: ' + inspectorGeometry.viewports.map((v) =>
+    'viewport=' + v.width + ' pass=' + v.pass +
+    ' rowsW=' + JSON.stringify(v.detail && v.detail.rowsW) +
+    ' graphSvgW=' + JSON.stringify(v.detail && v.detail.graphSvgW)).join('; '));
+  if (restoreResult) console.log('restore pass=' + restoreResult.pass +
+    ' scrollTop=' + JSON.stringify(restoreResult.detail && restoreResult.detail.actualScrollTop) +
+    ' persisted=' + JSON.stringify(restoreResult.detail && restoreResult.detail.persistedAfter));
   if (searchRace) console.log('search-race latestWins=' + searchRace.steps[0].latestWins);
   if (resizeResult) console.log('resize pass=' + resizeResult.pass +
     ' detail=' + JSON.stringify(resizeResult.detail));

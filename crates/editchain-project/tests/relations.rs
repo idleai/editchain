@@ -6,6 +6,7 @@
 
 // Crate-level dependency markers (used by Cargo for feature resolution).
 use regex as _;
+use serde as _;
 use serde_json as _;
 
 use editchain_core::{
@@ -550,6 +551,7 @@ fn filtered_layout_resolves_folded_relationship_endpoints() {
         String::new(),
         false,
         true,
+        false,
     );
     let nodes = projection.filtered_nodes(&filter);
     let keys: Vec<String> = nodes
@@ -623,6 +625,7 @@ fn include_kind_filter_preserves_structural_anchor_and_target_rows() {
         "^message$".to_string(),
         false,
         true,
+        false,
     );
     let nodes = projection.filtered_nodes(&filter);
     let keys: Vec<String> = nodes

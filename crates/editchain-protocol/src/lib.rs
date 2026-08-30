@@ -156,6 +156,14 @@ pub struct ChainFilterDto {
     /// Hide nodes with no real timestamp (`timestamp_ms() == 0`).
     #[serde(default)]
     pub hide_undated: bool,
+    /// Hide trace rows (duplicate/echo/transport envelopes classified as
+    /// `Visibility::Trace`) unconditionally, splicing causal edges across them.
+    ///
+    /// Backward compatible: older clients omit the field and deserialize it as
+    /// `false` (the raw view), while the fixed pregenerated/default viewer
+    /// sends `true` so Activity mode can be served from the render snapshot.
+    #[serde(default)]
+    pub hide_trace: bool,
     /// Reconnect causal edges across hidden intermediate nodes.
     #[serde(default)]
     pub splice: bool,
@@ -414,6 +422,29 @@ pub struct HistoryRow {
     /// `"tool_result"`). `None` on top-level rows.
     #[serde(default)]
     pub subop_kind: Option<String>,
+    /// Provider-neutral record role (narrative/action/result/artifact/
+    /// lifecycle/echo/unknown). Serialized as a lowercase `snake_case` string;
+    /// unknown values deserialize to `Unknown` for forward compatibility.
+    #[serde(default)]
+    pub record_role: editchain_project::taxonomy::RecordRole,
+    /// Provider-neutral activity kind (conversation/plan/execute/change/...).
+    /// Serialized as a lowercase `snake_case` string; unknown values deserialize
+    /// to `Unknown` for forward compatibility.
+    #[serde(default)]
+    pub activity_kind: editchain_project::taxonomy::ActivityKind,
+    /// Render prominence (primary/supporting/trace). Trace rows are hidden by
+    /// the `hide_trace` chain filter.
+    #[serde(default)]
+    pub visibility: editchain_project::taxonomy::Visibility,
+    /// Concluded outcome (success/warning/failure/cancelled/unknown). Unknown
+    /// is the default — success is never inferred without structured evidence.
+    #[serde(default)]
+    pub outcome: editchain_project::taxonomy::Outcome,
+    /// Provider-neutral turn identity as an exact decimal string (u64 values
+    /// above 2^53 round-trip through JavaScript without precision loss).
+    /// `None` when the row is not turn-scoped.
+    #[serde(default)]
+    pub turn_id: Option<String>,
 }
 
 /// One typed parent edge on a history row.
@@ -654,6 +685,11 @@ mod tests {
             is_subop: false,
             parent_row: None,
             subop_kind: None,
+            record_role: editchain_project::taxonomy::RecordRole::Artifact,
+            activity_kind: editchain_project::taxonomy::ActivityKind::SourceControl,
+            visibility: editchain_project::taxonomy::Visibility::Primary,
+            outcome: editchain_project::taxonomy::Outcome::Success,
+            turn_id: Some(OVER_2_53.to_string()),
         };
         let json = serde_json::to_value(&row).expect("serialize");
         assert_eq!(json["op_id"], "9007199254740993:7:42");
@@ -671,6 +707,19 @@ mod tests {
         assert_eq!(back.repository.as_deref(), Some("9007199254740993"));
         assert_eq!(back.git_oid.as_deref(), Some(big_oid_hex().as_str()));
         assert_eq!(back.parent_relations[0].kind, ParentRelationKind::Subagent);
+        // Taxonomy values serialize as stable lowercase `snake_case` strings and
+        // turn identity round-trips as an exact decimal string above 2^53.
+        let round_trip = serde_json::to_value(&back).expect("re-serialize");
+        assert_eq!(round_trip["record_role"], "artifact");
+        assert_eq!(round_trip["activity_kind"], "source_control");
+        assert_eq!(round_trip["visibility"], "primary");
+        assert_eq!(round_trip["outcome"], "success");
+        assert_eq!(round_trip["turn_id"], "9007199254740993");
+        assert_eq!(
+            back.record_role,
+            editchain_project::taxonomy::RecordRole::Artifact
+        );
+        assert_eq!(back.turn_id.as_deref(), Some("9007199254740993"));
     }
 
     #[test]
@@ -691,6 +740,24 @@ mod tests {
         }))
         .expect("sparse HistoryRow without parent_relations");
         assert!(sparse.parent_relations.is_empty());
+        // Newer provider-neutral fields default safely on sparse payloads.
+        assert_eq!(
+            sparse.record_role,
+            editchain_project::taxonomy::RecordRole::Unknown
+        );
+        assert_eq!(
+            sparse.activity_kind,
+            editchain_project::taxonomy::ActivityKind::Unknown
+        );
+        assert_eq!(
+            sparse.visibility,
+            editchain_project::taxonomy::Visibility::Unknown
+        );
+        assert_eq!(
+            sparse.outcome,
+            editchain_project::taxonomy::Outcome::Unknown
+        );
+        assert!(sparse.turn_id.is_none());
         // Unknown relationship kinds deserialize to the forward-compatible
         // Unknown variant (and re-serialize as a string), so a newer service
         // never breaks an older viewer.
@@ -945,17 +1012,64 @@ mod tests {
             kind_pattern: String::new(),
             include_kind_pattern: "^(message|command)$".to_string(),
             hide_undated: true,
+            hide_trace: true,
             splice: true,
         };
         let json = serde_json::to_value(&dto).expect("serialize");
         assert_eq!(json["include_kind_pattern"], "^(message|command)$");
+        assert_eq!(json["hide_trace"], true);
         let back: ChainFilterDto = serde_json::from_value(json).expect("deserialize");
         assert_eq!(back.include_kind_pattern, "^(message|command)$");
-        // Absent field defaults to empty (no inclusion constraint).
+        assert!(back.hide_trace);
+        // Absent field defaults to empty (no inclusion constraint); the
+        // backward-compatible hide_trace default is `false` (raw view).
         let sparse: ChainFilterDto =
             serde_json::from_value(serde_json::json!({ "splice": true })).expect("deserialize");
         assert_eq!(sparse.include_kind_pattern, "");
         assert!(sparse.splice);
+        assert!(!sparse.hide_trace);
+    }
+
+    #[test]
+    fn history_row_taxonomy_unknowns_round_trip_and_unknown_strings_fall_back() {
+        // Unknown taxonomy strings from a newer service deserialize to the
+        // forward-compatible Unknown variants and re-serialize as "unknown".
+        let row: HistoryRow = serde_json::from_value(serde_json::json!({
+            "op_id": null,
+            "git_oid": null,
+            "repository": null,
+            "summary": "row",
+            "timestamp_ms": 0,
+            "group": "session:1",
+            "node_key": "1:0:1",
+            "parents": [],
+            "is_submodule": false,
+            "record_role": "curated_note",
+            "activity_kind": "gardening",
+            "visibility": "spotlight",
+            "outcome": "heroic",
+            "turn_id": "9007199254740993",
+        }))
+        .expect("unknown taxonomy tolerated");
+        assert_eq!(
+            row.record_role,
+            editchain_project::taxonomy::RecordRole::Unknown
+        );
+        assert_eq!(
+            row.activity_kind,
+            editchain_project::taxonomy::ActivityKind::Unknown
+        );
+        assert_eq!(
+            row.visibility,
+            editchain_project::taxonomy::Visibility::Unknown
+        );
+        assert_eq!(row.outcome, editchain_project::taxonomy::Outcome::Unknown);
+        assert_eq!(row.turn_id.as_deref(), Some("9007199254740993"));
+        let reserialized = serde_json::to_string(&row).expect("serialize row");
+        assert!(reserialized.contains("\"record_role\":\"unknown\""));
+        assert!(reserialized.contains("\"activity_kind\":\"unknown\""));
+        assert!(reserialized.contains("\"visibility\":\"unknown\""));
+        assert!(reserialized.contains("\"outcome\":\"unknown\""));
     }
 
     #[test]

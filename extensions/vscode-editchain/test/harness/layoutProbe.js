@@ -125,10 +125,10 @@
 
   // Run a search through the real renderer path: fill the search input, press
   // Enter, wait for the result list to settle, then click the first result and
-  // verify it requests a JSON editor (navigation coherence). Captures the
-  // openJson postMessage the renderer emits on click and reports which identity
-  // it navigated with: a Git hit must click by (git_oid, repository) — never by
-  // its synthetic index-only op_id.
+  // verify it opens the INSPECTOR (an ordinary click never opens an editor
+  // tab), then use the inspector's explicit "Open raw JSON" action and verify
+  // it requests a JSON editor with the right identity: a Git hit must navigate
+  // by (git_oid, repository) — never by its synthetic index-only op_id.
   async function runSearch(query, timeoutMs) {
     const searchInput = document.getElementById('search');
     const captured = [];
@@ -147,11 +147,18 @@
     const firstRowChevron = !!(firstRow && firstRow.querySelector('.subop-chevron'));
     if (firstRow) firstRow.click();
     await whenIdle(timeoutMs || 5000);
+    const layoutEl = document.getElementById('layout');
+    const inspectorOpened = !!(layoutEl && layoutEl.classList.contains('has-detail'));
+    // Explicit raw-JSON action (the ONLY editor path).
+    const openBtn = document.querySelector('#detail .detail-btn:last-child');
+    if (openBtn && !openBtn.disabled) openBtn.click();
+    await whenIdle(timeoutMs || 5000);
     window.vscode.postMessage = origPost;
     const clicked = captured.length ? captured[0] : null;
     return {
       resultRows,
       bannerText,
+      inspectorOpened,
       navigated: captured.length > 0,
       navigatedGit: !!(clicked && clicked.git_oid && !clicked.op_id),
       navigatedOp: !!(clicked && clicked.op_id && !clicked.git_oid),
@@ -594,8 +601,8 @@
     }
 
     // Check 2: no horizontal overflow on #rows (content should not spill).
-    // Resize handles are intentionally positioned at column boundaries and may
-    // extend past the viewport edge; exclude them from this check.
+    // Resize handles are clamped inside the container, so raw scrollWidth is
+    // authoritative; handles are still excluded defensively.
     if (rowsEl) {
       const contentOverflow = Array.from(rowsEl.querySelectorAll('*')).some((el) => {
         if (el.classList && el.classList.contains('col-resize-handle')) return false;
@@ -787,14 +794,22 @@
       });
     }
 
-    // Check 5f: every data column must be visible with a nonzero width and sit
-    // inside the rows container (no clipping, no collapsed tracks) — at any
-    // viewport width, including the narrow ~617px webview. This is the
-    // screenshot acceptance: Content/Date/Author/Commit must actually render.
+    // Check 5f: column visibility follows the narrow-width priority contract.
+    // Every column the CSS grid keeps at this width must have a nonzero width
+    // and sit inside the rows container (no clipping, no collapsed tracks);
+    // columns dropped at narrow widths (Commit <=617, Author <=480, Date
+    // <=400) must be hidden — NOT squeezed to a sliver — so Content keeps its
+    // readable width. The visible set must match the renderer's own
+    // hiddenColumns() view of the breakpoints.
     if (wrapEl && !viewMessage) {
       const firstRow = wrapEl.querySelector('.row:not(.row-placeholder)');
       if (firstRow) {
         const rowsBox = rowsEl.getBoundingClientRect();
+        const innerW = window.innerWidth || rowsEl.clientWidth || 0;
+        const hidden = new Set();
+        if (innerW <= 617) hidden.add('commit');
+        if (innerW <= 480) hidden.add('author');
+        if (innerW <= 400) hidden.add('date');
         const cols = [
           { name: 'content', cls: 'text-cell' },
           { name: 'date', cls: 'date-cell' },
@@ -809,7 +824,13 @@
           const r = cell ? cell.getBoundingClientRect() : null;
           const w = r ? r.width : 0;
           geo[name] = Math.round(w * 100) / 100;
-          if (!r || w <= 0.5 || r.right > rowsBox.right + 1 || r.left < rowsBox.left - 1) {
+          if (hidden.has(name)) {
+            // Dropped at this width: the cell must be genuinely hidden.
+            if (!r || w > 0.5 || getComputedStyle(cell).display !== 'none') {
+              geoOk = false;
+              firstBad = firstBad || { col: name, expectedHidden: true, w: Math.round(w * 100) / 100 };
+            }
+          } else if (!r || w <= 0.5 || r.right > rowsBox.right + 1 || r.left < rowsBox.left - 1) {
             geoOk = false;
             firstBad = firstBad || { col: name, w: Math.round(w * 100) / 100 };
           }
@@ -818,7 +839,7 @@
           name: 'CELL_GEOMETRY',
           pass: geoOk,
           detail: geoOk
-            ? 'visible widths=' + JSON.stringify(geo) + 'px'
+            ? 'widths=' + JSON.stringify(geo) + 'px hidden=' + Array.from(hidden).join(',') + ' (priority order)'
             : 'first bad=' + JSON.stringify(firstBad),
         });
       }
@@ -906,19 +927,25 @@
       let boxesOk = true;
       let textOk = true;
       let firstBad = null;
-      for (let i = 0; i < ths.length; i++) {
-        const r = ths[i].getBoundingClientRect();
+      // Columns dropped at narrow widths (commit/author/date priority) are
+      // display:none — their zero-size rects must not count as overlaps.
+      const visibleThs = ths.filter((th) => {
+        const r = th.getBoundingClientRect();
+        return r.width > 0.5 && getComputedStyle(th).display !== 'none';
+      });
+      for (let i = 0; i < visibleThs.length; i++) {
+        const r = visibleThs[i].getBoundingClientRect();
         if (i > 0) {
-          const prev = ths[i - 1].getBoundingClientRect();
+          const prev = visibleThs[i - 1].getBoundingClientRect();
           if (r.left < prev.right - 0.5) {
             boxesOk = false;
             firstBad = firstBad || { kind: 'overlap', i, left: r.left, prevRight: prev.right };
           }
         }
-        const cs = getComputedStyle(ths[i]);
-        if (ths[i].scrollWidth > ths[i].clientWidth + 1 && cs.textOverflow !== 'ellipsis') {
+        const cs = getComputedStyle(visibleThs[i]);
+        if (visibleThs[i].scrollWidth > visibleThs[i].clientWidth + 1 && cs.textOverflow !== 'ellipsis') {
           textOk = false;
-          firstBad = firstBad || { kind: 'text-spill', i, label: (ths[i].textContent || '').trim().slice(0, 12) };
+          firstBad = firstBad || { kind: 'text-spill', i, label: (visibleThs[i].textContent || '').trim().slice(0, 12) };
         }
       }
       checks.push({
@@ -927,6 +954,274 @@
         detail: (boxesOk && textOk)
           ? 'header cells non-overlapping; labels fit or ellipsize'
           : 'first bad=' + JSON.stringify(firstBad),
+      });
+    }
+
+    // Check 5k: the Activity/Raw profile segmented control exists, is
+    // labelled, and reflects the ACTIVE profile (Activity by default — the
+    // pregenerated hide_trace=true view; Raw when a `--profile raw` run
+    // switched through the real control path beforehand).
+    const profileControl = document.getElementById('profile-control');
+    const profileActivityBtn = document.getElementById('profile-activity');
+    const profileRawBtn = document.getElementById('profile-raw');
+    const activeProfile = typeof window.__editchainGetProfile === 'function'
+      ? window.__editchainGetProfile()
+      : 'activity';
+    if (profileControl && profileActivityBtn && profileRawBtn) {
+      const controlMatches =
+        activeProfile === 'activity'
+          ? profileActivityBtn.classList.contains('active') &&
+            profileActivityBtn.getAttribute('aria-pressed') === 'true' &&
+            profileRawBtn.getAttribute('aria-pressed') === 'false'
+          : profileRawBtn.classList.contains('active') &&
+            profileRawBtn.getAttribute('aria-pressed') === 'true' &&
+            profileActivityBtn.getAttribute('aria-pressed') === 'false';
+      const labeled = profileControl.getAttribute('aria-label');
+      checks.push({
+        name: 'PROFILE_CONTROL_PRESENT',
+        pass: !!labeled && controlMatches,
+        detail: controlMatches
+          ? 'segmented control present, labelled "' + labeled + '", profile=' + activeProfile
+          : 'control does not match profile ' + activeProfile + ' (aria-pressed activity=' +
+            profileActivityBtn.getAttribute('aria-pressed') + ')',
+      });
+    } else {
+      checks.push({
+        name: 'PROFILE_CONTROL_PRESENT',
+        pass: false,
+        detail: 'segmented control missing from #controls',
+      });
+    }
+
+    // Check 5l: rows expose keyboard/grid semantics so the list is operable
+    // without a mouse. The contract is now the r4 a11y structure: ONE labelled
+    // role=grid wrapper owns BOTH the sticky header row (its columnheaders must
+    // live inside the grid, never orphaned) and the data rows; every row
+    // carries role=row + aria-selected; and exactly ONE rendered row is in the
+    // tab order (roving tabindex — Tab enters/exits the grid as a unit instead
+    // of tabbing through every virtualized row; ArrowUp/Down move within it).
+    if (wrapEl) {
+      const rowEls = wrapEl.querySelectorAll('.row:not(.row-placeholder)');
+      const grids = Array.from(document.querySelectorAll('[role="grid"]'));
+      const grid = document.querySelector('.tbl-grid');
+      const header = rowsEl.querySelector('.tbl-header');
+      const labelled = !!grid && grid.getAttribute('aria-label') === 'History rows';
+      const headerInside = !!header && !!grid && grid.contains(header);
+      const colHeadersInside = !!header &&
+        header.querySelectorAll('[role="columnheader"]').length === 5;
+      const gridOwnsRows = grids.length === 1 && !!grid &&
+        !!wrapEl.closest('.tbl-grid');
+      let rowsOk = rowEls.length > 0;
+      rowEls.forEach((r) => {
+        if (r.getAttribute('role') !== 'row') rowsOk = false;
+        const sel = r.getAttribute('aria-selected');
+        if (sel !== 'true' && sel !== 'false') rowsOk = false;
+        if (r.getAttribute('data-row') === null) rowsOk = false;
+      });
+      const tabbableCount = Array.from(wrapEl.querySelectorAll('.row'))
+        .filter((r) => r.tabIndex === 0).length;
+      const roving = tabbableCount === 1;
+      const pass = gridOwnsRows && labelled && headerInside && colHeadersInside &&
+        rowsOk && roving;
+      checks.push({
+        name: 'GRID_KEYBOARD_SEMANTICS',
+        pass,
+        detail: pass
+          ? 'labelled role=grid owns header row + ' + rowEls.length + ' rows; ' +
+            tabbableCount + ' tab stop (roving)'
+          : 'gridOwnsRows=' + gridOwnsRows + ' labelled=' + labelled +
+            ' headerInside=' + headerInside + ' colHeadersInside=' + colHeadersInside +
+            ' rowsOk=' + rowsOk + ' roving=' + roving,
+      });
+    }
+
+    // Check 5m: group boundary labels are VISIBLE (not hover-only) and show a
+    // SHORT id — never a full raw 64-bit identifier string. The contract is
+    // shortId()'s: the rendered id portion is at most 12 chars. Real chains
+    // use long decimal repo/session ids, so the shortened tail can itself be
+    // all digits — the check is about LENGTH, not digit shape.
+    if (wrapEl && !viewMessage) {
+      const labelEl = wrapEl.querySelector('.group-label');
+      const computed = labelEl ? getComputedStyle(labelEl) : null;
+      const opacity = computed ? parseFloat(computed.opacity) : 0;
+      const labelText = labelEl ? (labelEl.textContent || '').trim() : '';
+      const idPart = (labelText.match(/(?:repo|session)\s+(\S+)$/) || [])[1] || '';
+      const longId = idPart.length > 12;
+      checks.push({
+        name: 'GROUP_LABEL_VISIBLE_SHORT',
+        pass: !labelEl || (opacity >= 0.5 && !longId),
+        detail: labelEl
+          ? 'label "' + labelText + '" opacity=' + opacity +
+            (longId ? ' ID-PART-' + idPart.length + 'ch (>12)' : '')
+          : 'no group boundary rows in this scenario (skipped)',
+      });
+    }
+
+    // Check 5n: the Commit/ID column shows a SHORT display id — op ids are
+    // removed from the default visual priority and raw 64-bit strings never
+    // render as the visible value.
+    if (wrapEl && !viewMessage) {
+      const firstRow = wrapEl.querySelector('.row:not(.row-placeholder)');
+      const commitCell = firstRow && firstRow.querySelector('.commit-cell');
+      const commitText = commitCell ? (commitCell.textContent || '').trim() : '';
+      const cached = firstRow ? window.__editchainRowAt(parseInt(firstRow.getAttribute('data-row'), 10)) : null;
+      let shortOk = true;
+      if (cached && !cached.git_oid && cached.op_id && cached.op_id.length > 12) {
+        // Op rows must never show the full raw op id in the visible column.
+        shortOk = commitText.length <= 12 && commitText !== cached.op_id;
+      }
+      checks.push({
+        name: 'SHORT_COMMIT_ID',
+        pass: shortOk,
+        detail: shortOk
+          ? 'commit cell "' + commitText + '" (short display id)'
+          : 'commit cell "' + commitText + '" leaks the full op id',
+      });
+    }
+
+    // Check 5o (traced scenario only): the ACTIVE profile drives hide_trace
+    // end-to-end — Activity (the default) hides every visibility==="trace"
+    // row (hide_trace=true is sent on the first GetWindow) and renders 3
+    // rows; Raw sends hide_trace=false and renders all 5 rows. Conversation
+    // rows stay badge-free, and the exact Rust taxonomy badges render
+    // (execute "run" + success "ok").
+    if (window.__editchainScenarioName === 'traced') {
+      const keys = Array.from(wrapEl ? wrapEl.querySelectorAll('.row[data-key]') : [])
+        .map((r) => r.getAttribute('data-key'));
+      const traceKeys = keys.filter((k) => /^node:t:(1|3)$/.test(k));
+      const activityKeys = keys.filter((k) => /^node:t:(0|2|4)$/.test(k));
+      const traceHidden = traceKeys.length === 0;
+      const windows = (window.__editchainRequestLog || []).filter(
+        (b) => b && b.GetWindow !== undefined
+      );
+      // The FIRST window reflects the default profile (Activity hides trace);
+      // the LAST window reflects the ACTIVE profile after any `--profile raw`
+      // switch (Raw sends hide_trace=false on the refetch).
+      const firstWindowFilter = windows.length ? windows[0].GetWindow.filter : null;
+      const lastWindowFilter = windows.length ? windows[windows.length - 1].GetWindow.filter : null;
+      const rawProfile = activeProfile === 'raw';
+      const hideTraceSent = firstWindowFilter && firstWindowFilter.hide_trace === true;
+      const hideTraceFlagOk = rawProfile
+        ? !!lastWindowFilter && lastWindowFilter.hide_trace === false
+        : hideTraceSent;
+      const traceOk = rawProfile
+        ? traceKeys.length === 2 && activityKeys.length === 3 && keys.length === 5
+        : traceHidden && activityKeys.length === 3;
+      const rowByKey = (k) => wrapEl && wrapEl.querySelector('.row[data-key="' + k + '"]');
+      const t0 = rowByKey('node:t:0'); // conversation turn, outcome success
+      const t2 = rowByKey('node:t:2'); // execute activity, outcome unknown
+      const t0Outcome = t0 && t0.querySelector('.out-badge.outcome-success');
+      const t0ActCount = t0 ? t0.querySelectorAll('.act-badge').length : -1;
+      const t2Act = t2 && t2.querySelector('.act-badge.act-execute');
+      const t2ActText = t2Act ? (t2Act.textContent || '').trim() : '';
+      const badgeOk = !!t0Outcome && t0ActCount === 0 && !!t2Act && t2ActText === 'run';
+      checks.push({
+        name: 'ACTIVITY_DEFAULT_HIDES_TRACE',
+        pass: traceOk && hideTraceFlagOk,
+        detail: traceOk && hideTraceFlagOk
+          ? (rawProfile
+              ? 'raw profile renders trace rows; last GetWindow hide_trace=false'
+              : 'trace rows hidden in Activity; first GetWindow hide_trace=' +
+                (firstWindowFilter ? firstWindowFilter.hide_trace : 'MISSING') +
+                '; activity rows=' + activityKeys.length)
+          : (rawProfile
+              ? 'raw profile trace rows=' + traceKeys.length +
+                ' expected 2; hide_trace=' + (lastWindowFilter ? lastWindowFilter.hide_trace : 'MISSING')
+              : 'trace rows RENDERED in Activity view: ' + JSON.stringify(traceKeys) +
+                ' hide_trace=' + (firstWindowFilter ? firstWindowFilter.hide_trace : 'MISSING')),
+      });
+      checks.push({
+        name: 'BADGES_EXACT_TAXONOMY',
+        pass: !!badgeOk,
+        detail: badgeOk
+          ? 'conversation row badge-free; success "ok" + execute "run" badges rendered'
+          : 'badges: t0 outcome=' + (t0Outcome ? 'ok' : 'MISSING') +
+            ' t0 act-badges=' + t0ActCount + ' t2 execute=' +
+            (t2Act ? '"' + t2ActText + '"' : 'MISSING'),
+      });
+    }
+
+    // Check 5p (badges scenario only): the EXACT Rust wire taxonomy renders
+    // through the renderer whitelists — every activity_kind (except
+    // conversation, badge-free by design) and every outcome carries its exact
+    // badge class/text — and the legacy tool_call/command/edit/commit/review
+    // + error/interrupted vocabulary never leaks back in. Outcome colors must
+    // track VS Code theme tokens (proven by temporarily overriding the
+    // harness token and requiring the badge to follow), never fixed colors
+    // alone.
+    if (window.__editchainScenarioName === 'badges') {
+      const expected = {
+        'node:b:exec': { act: ['act-execute', 'run'], out: ['outcome-failure', 'fail'] },
+        'git:b:sc': { act: ['act-source-control', 'git'], out: ['outcome-success', 'ok'] },
+        'node:b:chg': { act: ['act-change', 'change'], out: ['outcome-warning', 'warn'] },
+        'node:b:plan': { act: ['act-plan', 'plan'], out: ['outcome-neutral', 'cancelled'] },
+        'node:b:exp': { act: ['act-explore', 'explore'], out: null },
+        'node:b:ver': { act: ['act-verify', 'verify'], out: null },
+        'node:b:diag': { act: ['act-diagnose', 'diagnose'], out: ['outcome-failure', 'fail'] },
+        'node:b:coord': { act: ['act-coordinate', 'coordinate'], out: null },
+        'node:b:ext': { act: ['act-external', 'external'], out: null },
+        'node:b:sys': { act: ['act-system', 'system'], out: null },
+      };
+      const problems = [];
+      const legacyClasses = ['.act-tool', '.act-command', '.act-edit', '.act-commit',
+        '.act-review', '.outcome-error'];
+      for (const sel of legacyClasses) {
+        if (wrapEl && wrapEl.querySelector(sel)) problems.push('legacy badge class present: ' + sel);
+      }
+      for (const [key, exp] of Object.entries(expected)) {
+        const row = wrapEl && wrapEl.querySelector('.row[data-key="' + key + '"]');
+        if (!row) { problems.push('missing row ' + key); continue; }
+        const actBadge = row.querySelector('.act-badge');
+        const outBadge = row.querySelector('.out-badge');
+        const actText = actBadge ? (actBadge.textContent || '').trim() : '';
+        if (!actBadge || !actBadge.classList.contains(exp.act[0]) || actText !== exp.act[1]) {
+          problems.push(key + ' activity badge != ' + exp.act[0] + ' "' + exp.act[1] + '" got ' +
+            (actBadge ? actBadge.className + ' "' + actText + '"' : 'none'));
+        }
+        if (exp.out) {
+          const outText = outBadge ? (outBadge.textContent || '').trim() : '';
+          if (!outBadge || !outBadge.classList.contains(exp.out[0]) || outText !== exp.out[1]) {
+            problems.push(key + ' outcome badge != ' + exp.out[0] + ' "' + exp.out[1] + '" got ' +
+              (outBadge ? outBadge.className + ' "' + outText + '"' : 'none'));
+          }
+        } else if (outBadge) {
+          problems.push(key + ' has unexpected outcome badge ' + outBadge.className);
+        }
+      }
+      const convRow = wrapEl && wrapEl.querySelector('.row[data-key="node:b:conv"]');
+      if (convRow && convRow.querySelector('.act-badge')) {
+        problems.push('conversation row must stay badge-free');
+      }
+      // Theme-token regression: override each harness token with a sentinel and
+      // require the badge color to follow. A stylesheet that hardcoded fixed
+      // colors would ignore the override and fail here.
+      const rootStyle = document.documentElement.style;
+      const rgbClose = (a, b) => !!a && !!b &&
+        Math.abs(a[0] - b[0]) <= 1 && Math.abs(a[1] - b[1]) <= 1 && Math.abs(a[2] - b[2]) <= 1;
+      const probeTokenDriven = (varName, cls, sentinel) => {
+        const prev = rootStyle.getPropertyValue(varName);
+        rootStyle.setProperty(varName, sentinel);
+        let driven = false;
+        const el = wrapEl && wrapEl.querySelector(cls);
+        if (el) {
+          driven = rgbClose(parseRgb(getComputedStyle(el).color), parseRgb(sentinel));
+        }
+        rootStyle.setProperty(varName, prev);
+        return driven;
+      };
+      const themeTokensOk =
+        probeTokenDriven('--vscode-testing-iconPassed', '.out-badge.outcome-success', '#00ff00') &&
+        probeTokenDriven('--vscode-editorWarning-foreground', '.out-badge.outcome-warning', '#00ff00') &&
+        probeTokenDriven('--vscode-editorError-foreground', '.out-badge.outcome-failure', '#00ff00');
+      if (!themeTokensOk) {
+        problems.push('outcome badge colors are not driven by VS Code theme tokens');
+      }
+      checks.push({
+        name: 'BADGE_VOCABULARY_COVERAGE',
+        pass: problems.length === 0,
+        detail: problems.length === 0
+          ? '10/10 activity kinds + 4/4 outcomes exact, conversation badge-free, theme-token colors'
+          : problems.join('; '),
       });
     }
 
@@ -1419,6 +1714,29 @@
       });
     }
 
+    // 400px geometry contract: at exactly 400px the history table must fit the
+    // viewport with zero phantom horizontal scroll (the last visible column's
+    // resize handle is clamped inside the container, so scrollW === clientW),
+    // and the Graph columnheader must stay accessible without clipped visual
+    // text — either the label fits its track, or it is rendered as
+    // visually-hidden text (a "G…" ellipsis is never shown).
+    if (rowsEl && !viewMessage && window.innerWidth === 400) {
+      const graphTh = headerEl && headerEl.querySelector('.th.graph');
+      const hidden = graphTh && graphTh.querySelector('.visually-hidden');
+      const hiddenOk = !!hidden && (hidden.textContent || '').trim() === 'Graph';
+      const fits = !!graphTh && graphTh.scrollWidth <= graphTh.clientWidth + 1;
+      const accessible = !!graphTh && (hiddenOk || (graphTh.textContent || '').trim() === 'Graph');
+      const delta = rowsEl.scrollWidth - rowsEl.clientWidth;
+      checks.push({
+        name: 'GEOMETRY_400',
+        pass: delta === 0 && accessible && (fits || hiddenOk),
+        detail: 'scrollW=' + rowsEl.scrollWidth + ' clientW=' + rowsEl.clientWidth +
+          ' delta=' + delta +
+          ' graphCol=' + Math.round(graphTh ? graphTh.getBoundingClientRect().width : 0) +
+          'px labelFits=' + !!fits + ' visuallyHidden=' + hiddenOk,
+      });
+    }
+
     return checks;
   }
 
@@ -1506,6 +1824,630 @@
     };
   }
 
+  // --- profile switching ----------------------------------------------------
+
+  // Exercise the Activity -> Raw -> Activity profile switch through the REAL
+  // control path (button clicks), asserting the coherent-reset contract:
+  //   - the request log shows hide_trace flipping false/true on every
+  //     GetWindow/layout follow-up (raw = false, activity = true);
+  //   - switching resets to offset 0 (the first window after each switch is
+  //     requested at offset 0) and rebuilds the expansion snapshot/cache
+  //     (sub_op_counts arrives again, rows re-render);
+  //   - search mode exits: a switch during search results returns to the full
+  //     history view under the new profile;
+  //   - scroll returns to the top (refetch from offset 0);
+  //   - Raw renders trace rows; Activity hides them (traced scenario).
+  async function runProfileSwitch(timeoutMs) {
+    const out = { steps: [] };
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const clickProfile = (name) => {
+      const btn = document.getElementById('profile-' + name);
+      if (!btn) throw new Error('profile button missing: ' + name);
+      btn.click();
+    };
+    const requestLog = () => window.__editchainRequestLog || [];
+    const windowFilters = () => requestLog()
+      .filter((b) => b && b.GetWindow !== undefined)
+      .map((b) => b.GetWindow.filter);
+    const firstWindowOffset = () => {
+      const ws = requestLog().filter((b) => b && b.GetWindow !== undefined);
+      return ws.length ? ws[0].GetWindow.offset : -1;
+    };
+    // Baseline: Activity (default). The FIRST GetWindow must carry
+    // hide_trace=true and start at offset 0.
+    await whenIdle(timeoutMs || 5000);
+    const activityBefore = {
+      profile: window.__editchainGetProfile ? window.__editchainGetProfile() : null,
+      firstFilter: windowFilters()[0] || null,
+      firstOffset: firstWindowOffset(),
+      traceRows: document.querySelectorAll('.row[data-key^="node:t:"][data-key$=":1"], .row[data-key="node:t:1"], .row[data-key="node:t:3"]').length,
+    };
+    out.steps.push({ name: 'activity-default', ...activityBefore });
+
+    // Switch to Raw: hide_trace must flip to false, offset 0 refetch happens,
+    // trace rows appear (traced scenario), scroll resets to the top.
+    window.__editchainClearRequestLog();
+    clickProfile('raw');
+    await whenIdle(timeoutMs || 5000);
+    const rawAfter = {
+      profile: window.__editchainGetProfile ? window.__editchainGetProfile() : null,
+      lastFilter: windowFilters().length ? windowFilters()[windowFilters().length - 1] : null,
+      // The switch REFETCHES from offset 0: the first window issued after the
+      // switch must start at 0 (the progressive loader then pages deeper).
+      firstOffset: firstWindowOffset(),
+      scrollTop: document.getElementById('rows').scrollTop,
+      traceRows: document.querySelectorAll('.row[data-key="node:t:1"], .row[data-key="node:t:3"]').length,
+    };
+    out.steps.push({ name: 'raw', ...rawAfter });
+
+    // Switch back to Activity: hide_trace=true again, trace rows hidden.
+    window.__editchainClearRequestLog();
+    clickProfile('activity');
+    await whenIdle(timeoutMs || 5000);
+    const activityBack = {
+      profile: window.__editchainGetProfile ? window.__editchainGetProfile() : null,
+      lastFilter: windowFilters().length ? windowFilters()[windowFilters().length - 1] : null,
+      firstOffset: firstWindowOffset(),
+      traceRows: document.querySelectorAll('.row[data-key="node:t:1"], .row[data-key="node:t:3"]').length,
+    };
+    out.steps.push({ name: 'activity-back', ...activityBack });
+
+    // A profile switch during SEARCH MODE must exit search and refetch history
+    // under the new profile (search is explicitly unprofiled).
+    const searchInput = document.getElementById('search');
+    searchInput.value = 'tool result';
+    searchInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    await whenIdle(timeoutMs || 5000);
+    const inSearch = !!document.querySelector('.search-banner');
+    window.__editchainClearRequestLog();
+    clickProfile('raw');
+    await whenIdle(timeoutMs || 5000);
+    const afterSearchSwitch = {
+      inSearch,
+      bannerAfter: !!(document.querySelector('.search-banner')),
+      profile: window.__editchainGetProfile ? window.__editchainGetProfile() : null,
+      windowsIssued: requestLog().filter((b) => b && b.GetWindow !== undefined).length,
+      traceRows: document.querySelectorAll('.row[data-key="node:t:1"], .row[data-key="node:t:3"]').length,
+    };
+    out.steps.push({ name: 'search-exit-on-switch', ...afterSearchSwitch });
+
+    const s1 = out.steps[0];
+    const s2 = out.steps[1];
+    const s3 = out.steps[2];
+    const s4 = out.steps[3];
+    const pass =
+      s1.profile === 'activity' &&
+      s1.firstFilter && s1.firstFilter.hide_trace === true &&
+      s1.firstOffset === 0 &&
+      s1.traceRows === 0 &&
+      s2.profile === 'raw' &&
+      s2.lastFilter && s2.lastFilter.hide_trace === false &&
+      s2.firstOffset === 0 &&
+      s2.scrollTop === 0 &&
+      s2.traceRows === 2 &&
+      s3.profile === 'activity' &&
+      s3.lastFilter && s3.lastFilter.hide_trace === true &&
+      s3.firstOffset === 0 &&
+      s3.traceRows === 0 &&
+      s4.inSearch === true &&
+      s4.bannerAfter === false &&
+      s4.windowsIssued > 0 &&
+      s4.traceRows === 2;
+    out.pass = pass;
+    return out;
+  }
+
+  // --- inspector vs chevron routing ----------------------------------------
+
+  // A row click must SELECT the row and open the inspector (GetNodeDetails /
+  // ResolveObject request) WITHOUT opening an editor tab; ONLY the chevron
+  // toggles bundled sub-ops. Also exercises the Close action.
+  async function runInspectorRouting(timeoutMs) {
+    const out = { steps: [] };
+    const captured = [];
+    const origPost = window.vscode.postMessage.bind(window.vscode);
+    window.vscode.postMessage = function (msg) {
+      if (msg && msg.type === 'openJson') captured.push(msg);
+      return origPost(msg);
+    };
+    await whenIdle(timeoutMs || 5000);
+    const rowEls = Array.from(document.querySelectorAll('.row:not(.row-placeholder)'));
+    const detailCapable = rowEls.find((el) => {
+      const abs = Number(el.getAttribute('data-row'));
+      const row = window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
+      return row && (row.op_id || row.git_oid);
+    });
+    if (!detailCapable) throw new Error('no detail-capable rendered row');
+    const key = detailCapable.getAttribute('data-key');
+    const absIdx = Number(detailCapable.getAttribute('data-row'));
+    const row = window.__editchainRowAt(absIdx);
+    const detailReqBefore = (window.__editchainRequestLog || [])
+      .filter((b) => b && (b.GetNodeDetails !== undefined || b.ResolveObject !== undefined)).length;
+    detailCapable.click();
+    await whenIdle(timeoutMs || 5000);
+    const layoutEl = document.getElementById('layout');
+    const detailReqs = (window.__editchainRequestLog || [])
+      .filter((b) => b && (b.GetNodeDetails !== undefined || b.ResolveObject !== undefined));
+    const isGit = !!(row && row.git_oid);
+    const expectedReq = isGit
+      ? (detailReqs[detailReqs.length - 1] || {}).ResolveObject
+      : (detailReqs[detailReqs.length - 1] || {}).GetNodeDetails;
+    const inspectorOpened = !!(layoutEl && layoutEl.classList.contains('has-detail'));
+    const editorOpened = captured.length > 0;
+    const selected = document.querySelector('.row.row-selected');
+    out.steps.push({
+      name: 'row-click',
+      key,
+      inspectorOpened,
+      editorOpened,
+      requestIssued: !!expectedReq,
+      requestIdentity: expectedReq
+        ? (isGit ? expectedReq.oid : expectedReq.op_id)
+        : null,
+      selectedKey: selected ? selected.getAttribute('data-key') : null,
+    });
+
+    // Chevron routing: on a combined row, chevron click must NOT open the
+    // inspector — it only toggles expansion. Re-query the DOM fresh around
+    // each interaction because expansion REBUILDS the rows (stale elements
+    // never reflect the new aria-expanded state).
+    const chevronBtn = document.querySelector('.row .subop-chevron');
+    if (chevronBtn) {
+      const chevronRow = chevronBtn.closest('.row');
+      const abs = Number(chevronRow.getAttribute('data-row'));
+      const cRow = window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
+      const hadSubops = !!cRow && (cRow.sub_ops || []).length > 0;
+      const expandedBefore = chevronRow.getAttribute('aria-expanded');
+      const chevronKey = chevronRow.getAttribute('data-key');
+      const inspectorBeforeChevron = !!(layoutEl && layoutEl.classList.contains('has-detail'));
+      chevronBtn.click();
+      await whenIdle(timeoutMs || 5000);
+      const freshRow = Array.from(document.querySelectorAll('.row')).find(
+        (r) => r.getAttribute('data-key') === chevronKey
+      );
+      const expandedAfter = freshRow ? freshRow.getAttribute('aria-expanded') : null;
+      const subopRows = document.querySelectorAll('.row.row-subop').length;
+      out.steps.push({
+        name: 'chevron-only',
+        hadSubops,
+        expandedBefore,
+        expandedAfter,
+        subopRows,
+        inspectorBeforeChevron,
+        inspectorAfterChevron: !!(layoutEl && layoutEl.classList.contains('has-detail')),
+        toggled: hadSubops && expandedBefore !== expandedAfter,
+      });
+    } else {
+      out.steps.push({
+        name: 'chevron-only',
+        skipped: true,
+        detail: 'no combined row rendered in this scenario (skipped)',
+      });
+    }
+
+    // Close action hides the inspector and clears selection.
+    const closeBtn = document.querySelector('#detail .detail-btn:first-child');
+    if (closeBtn) closeBtn.click();
+    await whenIdle(timeoutMs || 5000);
+    out.steps.push({
+      name: 'close',
+      inspectorClosed: !(layoutEl && layoutEl.classList.contains('has-detail')),
+      selectionCleared: !document.querySelector('.row.row-selected'),
+    });
+    window.vscode.postMessage = origPost;
+
+    const s1 = out.steps[0];
+    const s2 = out.steps[1];
+    const s3 = out.steps[2];
+    out.pass =
+      s1.inspectorOpened === true &&
+      s1.editorOpened === false &&
+      s1.requestIssued === true &&
+      s1.selectedKey === s1.key &&
+      (s2.skipped || (s2.toggled === true &&
+        s2.inspectorAfterChevron === s2.inspectorBeforeChevron)) &&
+      s3.inspectorClosed === true &&
+      s3.selectionCleared === true;
+    return out;
+  }
+
+  // --- keyboard activation --------------------------------------------------
+
+  // Enter on a focused row selects/inspects it; Space on a combined row toggles
+  // its bundled sub-ops; the chevron button itself stays natively operable.
+  async function runKeyboardProbe(timeoutMs) {
+    const out = { steps: [] };
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    await whenIdle(timeoutMs || 5000);
+    const layoutEl = document.getElementById('layout');
+    const wrap = document.querySelector('.table-wrap');
+    const header = document.querySelector('.tbl-header');
+    const rowEls = Array.from(document.querySelectorAll('.row:not(.row-placeholder)'));
+
+    // a11y structure: ONE labelled grid wrapper owns the sticky header row
+    // (its columnheaders must be INSIDE role=grid, not orphaned) and the data
+    // rows; exactly one row carries tabindex=0 (roving tabindex), so Tab
+    // enters/exits the grid as a unit instead of tabbing every virtualized row.
+    const grids = Array.from(document.querySelectorAll('[role="grid"]'));
+    const grid = document.querySelector('.tbl-grid');
+    const gridOk = grids.length === 1 &&
+      grid === wrap.closest('.tbl-grid') &&
+      header && grid && grid.contains(header) &&
+      grid.getAttribute('aria-label') === 'History rows' &&
+      Number(grid.getAttribute('aria-rowcount')) >= 0;
+    const tabbable = rowEls.filter((el) => el.tabIndex === 0);
+    const allRowsTabbable = rowEls.filter((el) => el.tabIndex === 0).length;
+    out.steps.push({
+      name: 'grid-structure',
+      gridCount: grids.length,
+      gridOk,
+      rovingRows: tabbable.length,
+      allRowsTabbable,
+    });
+
+    const rovingRow = tabbable[0] || rowEls[0];
+    const detailCapable = (el) => {
+      const abs = Number(el.getAttribute('data-row'));
+      const row = window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
+      return row && (row.op_id || row.git_oid);
+    };
+    const target = detailCapable(rovingRow) ? rovingRow : rowEls.find(detailCapable);
+    if (!target) throw new Error('no keyboard-capable rendered row');
+
+    target.focus();
+    target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    // Opening the inspector shrinks #rows -> the debounced width recompute
+    // rebuilds the rows; settle deterministically so later steps never operate
+    // on pre-rebuild (detached) elements.
+    await whenIdle(timeoutMs || 5000);
+    await settleGeometry(timeoutMs || 4000);
+    const enterInspected = !!(layoutEl && layoutEl.classList.contains('has-detail'));
+    const enterSelected = !!document.querySelector('.row.row-selected');
+    out.steps.push({ name: 'enter-activates', enterInspected, enterSelected });
+
+    const closeBtn = document.querySelector('#detail .detail-btn:first-child');
+    if (closeBtn) closeBtn.click();
+    await whenIdle(timeoutMs || 5000);
+    await settleGeometry(timeoutMs || 4000);
+
+    // Roving navigation: ArrowDown must move focus to the NEXT rendered row and
+    // re-pin the single tab stop to it (the previous row drops to -1). The
+    // inspector-open steps above trigger the debounced width recompute, which
+    // REBUILDS the rows — so re-query the roving row fresh here (stale
+    // elements from before a rebuild are detached and can't receive focus).
+    const allRows = Array.from(document.querySelectorAll('.table-wrap .row'));
+    const rovingNow = allRows.find((r) => r.tabIndex === 0) || allRows[0];
+    const rovingIdx = rovingNow ? allRows.indexOf(rovingNow) : -1;
+    const nextRow = rovingIdx >= 0 && rovingIdx + 1 < allRows.length ? allRows[rovingIdx + 1] : null;
+    if (nextRow && rovingNow) {
+      rovingNow.focus();
+      rovingNow.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+      await sleep(200);
+      // Compare by data-row, not element identity: a pending debounced width
+      // recompute may rebuild the rows during the wait (focus is preserved by
+      // the renderer, but the element object is replaced).
+      const focused = document.activeElement;
+      const focusedIsRow = focused && focused.classList && focused.classList.contains('row');
+      const rovingAfter = Array.from(document.querySelectorAll('.row')).filter((r) => r.tabIndex === 0);
+      const moved = focusedIsRow &&
+        focused.getAttribute('data-row') === nextRow.getAttribute('data-row') &&
+        rovingAfter.length === 1;
+      out.steps.push({
+        name: 'arrow-down-roves',
+        moved,
+        focusedRow: focusedIsRow ? focused.getAttribute('data-row') : null,
+        expectedRow: nextRow.getAttribute('data-row'),
+        rovingAfter: rovingAfter.length,
+      });
+    } else {
+      out.steps.push({ name: 'arrow-down-roves', skipped: true });
+    }
+
+    const chevronBtn = document.querySelector('.row .subop-chevron');
+    if (chevronBtn) {
+      const chevronRow = chevronBtn.closest('.row');
+      const chevronKey = chevronRow.getAttribute('data-key');
+      const expandedBefore = chevronRow.getAttribute('aria-expanded');
+      chevronRow.focus();
+      chevronRow.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true }));
+      await sleep(200);
+      const freshRow = Array.from(document.querySelectorAll('.row')).find(
+        (r) => r.getAttribute('data-key') === chevronKey
+      );
+      const expandedAfter = freshRow ? freshRow.getAttribute('aria-expanded') : null;
+      out.steps.push({
+        name: 'space-expands',
+        expandedBefore,
+        expandedAfter,
+        toggled: expandedBefore !== expandedAfter,
+      });
+    } else {
+      out.steps.push({ name: 'space-expands', skipped: true });
+    }
+
+    // Sticky header inside the labelled grid wrapper: the a11y restructure
+    // moved the header row under .tbl-grid — it must STILL pin to the top of
+    // the #rows scrollport while the table scrolls.
+    const rowsEl = document.getElementById('rows');
+    const rowsTop = rowsEl ? rowsEl.getBoundingClientRect().top : 0;
+    const scrollable = rowsEl && rowsEl.scrollHeight > rowsEl.clientHeight + 100;
+    if (scrollable) {
+      rowsEl.scrollTop = Math.min(2000, rowsEl.scrollHeight - rowsEl.clientHeight);
+      await sleep(200);
+      // Re-query the header AFTER scrolling: scroll-driven syncWindow (or a
+      // still-pending debounced width recompute) can rebuild the table, which
+      // replaces the header element (the sticky CONTRACT — pinned to the
+      // #rows scrollport — is what's under test, not a specific element).
+      const headerNow = document.querySelector('.tbl-header');
+      const headerTop = headerNow ? headerNow.getBoundingClientRect().top : NaN;
+      const pinned = Math.abs(headerTop - rowsTop) <= 1;
+      out.steps.push({
+        name: 'sticky-header',
+        pinned,
+        headerTop: Math.round(headerTop * 10) / 10,
+        rowsTop: Math.round(rowsTop * 10) / 10,
+      });
+      rowsEl.scrollTop = 0;
+      await sleep(200);
+    } else {
+      out.steps.push({ name: 'sticky-header', skipped: true });
+    }
+
+    const s0 = out.steps[0];
+    const s1 = out.steps[1];
+    const s2 = out.steps[2];
+    const s3 = out.steps[3];
+    const s4 = out.steps[4];
+    out.pass =
+      s0.gridOk === true &&
+      s0.rovingRows === 1 &&
+      s1.enterInspected === true &&
+      s1.enterSelected === true &&
+      (s2.skipped || s2.moved === true) &&
+      (s3.skipped || s3.toggled === true) &&
+      (s4.skipped || s4.pinned === true);
+    return out;
+  }
+
+  // --- inspector geometry across open/close ---------------------------------
+
+  // Extract the inline column-width CSS vars (`--graph-w`, `--date-w`, ...)
+  // from an element's style attribute so the probe can assert the renderer
+  // re-applied widths rather than leaving stale inline values behind.
+  function inlineColVars(styleAttr) {
+    const vars = {};
+    const re = /(--(?:graph|content|date|author|commit)-w):\s*([^;]+)/g;
+    let m;
+    while ((m = re.exec(styleAttr || '')) !== null) vars[m[1]] = m[2].trim();
+    return vars;
+  }
+
+  // Snapshot the table geometry the renderer is responsible for recomputing
+  // when #rows' width changes (inspector open/close): the flex width itself,
+  // the graph column (in-memory budget width vs rendered SVG/header widths),
+  // the inline column-width vars, the hidden fixed columns, and horizontal
+  // overflow. `generation` is the probe's own DOM-mutation counter.
+  function captureInspectorGeometry() {
+    const rowsEl = document.getElementById('rows');
+    const layoutEl = document.getElementById('layout');
+    const header = document.querySelector('.tbl-header');
+    const firstRow = document.querySelector('.row:not(.row-placeholder)');
+    const graphCell = firstRow && firstRow.querySelector('.graph-cell svg.graphCell');
+    const graphState = typeof window.__editchainGraphState === 'function'
+      ? window.__editchainGraphState() : null;
+    const dots = firstRow
+      ? Array.from(firstRow.querySelectorAll('circle.graphDot')).map((d) => +d.getAttribute('cx'))
+      : [];
+    const hiddenCols = [];
+    for (const col of ['date', 'author', 'commit']) {
+      const cell = document.querySelector('.row .' + col + '-cell');
+      if (cell && getComputedStyle(cell).display === 'none') hiddenCols.push(col);
+    }
+    return {
+      viewportW: window.innerWidth,
+      rowsW: rowsEl ? rowsEl.clientWidth : 0,
+      hasDetail: !!(layoutEl && layoutEl.classList.contains('has-detail')),
+      graphWidth: graphState ? graphState.graphWidth : null,
+      graphSvgW: graphCell ? +graphCell.getAttribute('width') : 0,
+      graphColW: graphCell ? Math.round(graphCell.getBoundingClientRect().width * 100) / 100 : 0,
+      headerGraphW: header
+        ? Math.round(header.querySelector('.th.graph').getBoundingClientRect().width * 100) / 100
+        : 0,
+      headerVars: header ? inlineColVars(header.getAttribute('style') || '') : null,
+      rowVars: firstRow ? inlineColVars(firstRow.getAttribute('style') || '') : null,
+      firstDotX: dots.length ? dots[0] : null,
+      lastDotX: dots.length ? dots[dots.length - 1] : null,
+      dotCount: dots.length,
+      hiddenCols,
+      // Content spill measured like the NO_HORIZONTAL_OVERFLOW layout check
+      // (bounding rects; handles are clamped inside the container but stay
+      // excluded defensively).
+      overflowDelta: (() => {
+        if (!rowsEl) return 0;
+        const rowsBox = rowsEl.getBoundingClientRect();
+        let maxSpill = 0;
+        for (const el of rowsEl.querySelectorAll('*')) {
+          if (el.classList && el.classList.contains('col-resize-handle')) continue;
+          const r = el.getBoundingClientRect();
+          const spill = r.right - rowsBox.right;
+          if (spill > maxSpill) maxSpill = spill;
+        }
+        return Math.round(maxSpill * 100) / 100;
+      })(),
+      generation,
+    };
+  }
+
+  // Deterministic geometry settle: poll until the rendered graph cell width
+  // equals the freshly computed in-memory graph width for two consecutive
+  // frames. The renderer recomputes ~150ms after #rows' width changes (the
+  // debounced onViewportResize), so polling is exact for cases where geometry
+  // MUST change (budget-bound graph at wide viewports) and terminates fast when
+  // the width legitimately cannot change (narrow overlay).
+  async function settleGeometry(timeoutMs) {
+    const deadline = Date.now() + (timeoutMs || 4000);
+    return new Promise((resolve) => {
+      const tick = () => {
+        const graphState = typeof window.__editchainGraphState === 'function'
+          ? window.__editchainGraphState() : null;
+        const firstRow = document.querySelector('.row:not(.row-placeholder) .graph-cell svg.graphCell');
+        const domW = firstRow ? +firstRow.getAttribute('width') : -1;
+        const converged = graphState !== null && firstRow !== null &&
+          Math.abs(domW - graphState.graphWidth) <= 1.5;
+        if (converged) return resolve(true);
+        if (Date.now() >= deadline) return resolve(false);
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    });
+  }
+
+  // Exercise the REAL open/close controls and verify the table geometry is
+  // recomputed, not stale: flex width, graph column (SVG + header + inline
+  // vars), hidden columns, and overflow must be coherent BEFORE, WITH, and
+  // AFTER the inspector at the current viewport.
+  async function runInspectorGeometry(timeoutMs) {
+    const out = { captures: [], pass: false, detail: null };
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    await whenIdle(timeoutMs || 5000);
+    // Ensure the table has settled to the CURRENT viewport width before the
+    // baseline capture (the host may have just resized the page).
+    await settleGeometry(timeoutMs || 4000);
+    const rowEls = Array.from(document.querySelectorAll('.row:not(.row-placeholder)'));
+    const target = rowEls.find((el) => {
+      const abs = Number(el.getAttribute('data-row'));
+      const row = window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
+      return row && (row.op_id || row.git_oid);
+    });
+    if (!target) throw new Error('no detail-capable rendered row for inspector geometry probe');
+
+    const before = captureInspectorGeometry();
+    target.click();
+    await whenIdle(timeoutMs || 5000);
+    await settleGeometry(timeoutMs || 4000);
+    const opened = captureInspectorGeometry();
+
+    const closeBtn = document.querySelector('#detail .detail-btn:first-child');
+    if (closeBtn) closeBtn.click();
+    await whenIdle(timeoutMs || 5000);
+    await settleGeometry(timeoutMs || 4000);
+    const closed = captureInspectorGeometry();
+
+    out.captures.push({ name: 'before-open', state: before });
+    out.captures.push({ name: opened.hasDetail ? 'opened' : 'open-failed', state: opened });
+    out.captures.push({ name: closed.hasDetail ? 'close-failed' : 'closed', state: closed });
+
+    const b = before, o = opened, c = closed;
+    // Wide viewports split the flex budget (inspector open shrinks #rows);
+    // narrow viewports overlay the inspector so #rows keeps its width.
+    const wide = b.viewportW > 617;
+    const flexSplit = wide &&
+      o.rowsW < b.rowsW - 20 && o.hasDetail === true &&
+      c.rowsW === b.rowsW;
+    const overlayKeptWidth = !wide &&
+      o.rowsW === b.rowsW && c.rowsW === b.rowsW;
+    // Recompute evidence: the RENDERED graph column must match the freshly
+    // computed in-memory graph width in every state (a stale layout leaves the
+    // DOM sized for the pre-open width while graphWidth tracks the live one).
+    const domMatchesLive =
+      Math.abs(b.graphSvgW - b.graphWidth) <= 1.5 &&
+      Math.abs(o.graphSvgW - o.graphWidth) <= 1.5 &&
+      Math.abs(c.graphSvgW - c.graphWidth) <= 1.5;
+    // Header stays aligned with the rows and inline vars agree across header
+    // and rows after open/close.
+    const headerAligned =
+      Math.abs(b.headerGraphW - b.graphSvgW) <= 1.5 &&
+      Math.abs(o.headerGraphW - o.graphSvgW) <= 1.5 &&
+      Math.abs(c.headerGraphW - c.graphSvgW) <= 1.5;
+    const varsAgree = o.headerVars && o.rowVars && c.headerVars && c.rowVars &&
+      JSON.stringify(o.headerVars) === JSON.stringify(o.rowVars) &&
+      JSON.stringify(c.headerVars) === JSON.stringify(c.rowVars);
+    // Hidden fixed columns depend on VIEWPORT width (unchanged by open/close).
+    const hiddenStable =
+      JSON.stringify(o.hiddenCols) === JSON.stringify(b.hiddenCols) &&
+      JSON.stringify(c.hiddenCols) === JSON.stringify(b.hiddenCols);
+    const noOverflow =
+      b.overflowDelta <= 1 && o.overflowDelta <= 1 && c.overflowDelta <= 1;
+    const closedRestored = c.hasDetail === false && c.rowsW === b.rowsW;
+
+    out.pass =
+      o.hasDetail === true &&
+      closedRestored &&
+      domMatchesLive &&
+      headerAligned &&
+      varsAgree &&
+      hiddenStable &&
+      noOverflow &&
+      (wide ? flexSplit : overlayKeptWidth);
+    out.detail = {
+      wide,
+      flexSplit: wide ? flexSplit : undefined,
+      overlayKeptWidth: !wide ? overlayKeptWidth : undefined,
+      domMatchesLive,
+      headerAligned,
+      varsAgree,
+      hiddenStable,
+      noOverflow,
+      rowsW: { before: b.rowsW, opened: o.rowsW, closed: c.rowsW },
+      graphWidth: { before: b.graphWidth, opened: o.graphWidth, closed: c.graphWidth },
+      graphSvgW: { before: b.graphSvgW, opened: o.graphSvgW, closed: c.graphSvgW },
+      hiddenCols: { before: b.hiddenCols, opened: o.hiddenCols, closed: c.hiddenCols },
+    };
+    return out;
+  }
+
+  // --- persisted-viewport restore regression ---------------------------------
+
+  // Replayed open/reveal into a SURVIVING context must restore the persisted
+  // scroll position without first clobbering the persisted topRow with a
+  // transient 0. open() used to call setProfile(restored.profile,
+  // { reset:false }), which persisted saveState() with scrollTop still 0 — BEFORE
+  // restoreScrollTop(restored.topRow) ran — so a real context recreation lost
+  // the saved position to the transient write. The open/reveal handlers now
+  // persist the profile with `persist:false` during restore and saveState()
+  // once the restored position is actually applied.
+  async function runRestoreStateProbe(timeoutMs) {
+    const out = { steps: [], pass: false, detail: null };
+    const SAVE_TOP_ROW = 40; // must be within the fixture's visible row range
+    const ROW_H = 34;
+    const expectedScrollTop = SAVE_TOP_ROW * ROW_H;
+    await whenIdle(timeoutMs || 5000);
+    const rowsEl = document.getElementById('rows');
+
+    out.steps.push({
+      name: 'seed',
+      persistedBefore: window.vscode.getState(),
+      totalVisibleBefore: document.querySelectorAll('.row').length,
+    });
+    // Emulate a recreated context carrying a saved viewport: seed persisted
+    // state exactly as saveState() writes it, then replay the extension
+    // host's open + ready handshake.
+    window.vscode.setState({ profile: 'activity', topRow: SAVE_TOP_ROW });
+    window.__editchainClearRequestLog();
+    window.__editchainStart();
+    await whenIdle(timeoutMs || 10000);
+
+    const persistedAfter = window.vscode.getState();
+    out.steps.push({
+      name: 'after-reopen',
+      scrollTop: rowsEl ? rowsEl.scrollTop : -1,
+      persistedAfter,
+      rowsRendered: document.querySelectorAll('.row:not(.row-placeholder)').length,
+    });
+
+    const s2 = out.steps[1];
+    const restoredNotZero = s2.persistedAfter && s2.persistedAfter.topRow === SAVE_TOP_ROW;
+    const scrollApplied = s2.scrollTop === expectedScrollTop;
+    out.pass = restoredNotZero && scrollApplied &&
+      (s2.persistedAfter && s2.persistedAfter.profile === 'activity');
+    out.detail = {
+      expectedScrollTop,
+      actualScrollTop: s2.scrollTop,
+      persistedAfter: JSON.stringify(s2.persistedAfter),
+    };
+    return out;
+  }
+
   // --- expose ----------------------------------------------------------------
 
   window.__editchainDebug = {
@@ -1515,6 +2457,11 @@
     getMetrics,
     runSearch,
     runReversedSearchRace,
+    runProfileSwitch,
+    runInspectorRouting,
+    runInspectorGeometry,
+    runKeyboardProbe,
+    runRestoreStateProbe,
     captureResizeMetrics,
     evaluateResizeAssert,
   };

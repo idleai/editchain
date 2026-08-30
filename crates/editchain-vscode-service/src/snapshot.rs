@@ -22,7 +22,18 @@ use crate::{OpRecordLocation, OpenDiagnostics, SnapshotOpLocator};
 /// On-disk schema for the immutable render snapshot.
 pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Revision of projection/default-view semantics represented by this schema.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 1;
+///
+/// Bumped when the fixed default view's semantics change so stale snapshots
+/// (which would otherwise silently serve the old default) live under a
+/// different identity hash and are rebuilt from the live projection.
+///
+/// Revision 6: compacted import JSON now carries an explicit
+/// `payload.echo_text_truncated` flag whenever a record's echo message text
+/// was truncated by the display budget, so truncated texts never participate
+/// in cross-record duplicate pairing; the projection also recovers
+/// payload-level `exitCode` evidence from truncated previews and decodes
+/// complete JSON string escapes recovered from a bounded prefix.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 6;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

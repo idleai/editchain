@@ -49,11 +49,16 @@ function fixtureRows() {
   const base = { lane: 0, above: [], below: [], transitions: [], sub_ops: [] };
   // A 4-row chain, newest first: n:1 -> n:2 -> n:3 -> n:4 (n:1 is the newest
   // root, n:4 the oldest leaf). n:2 is the only tool row; n:4 is a submodule.
+  // Every row carries the additive r4 taxonomy with EXACT Rust wire values.
   return [
-    { ...base, node_key: 'n:1', summary: 'dated newest', kind: 'message', timestamp_ms: 3000, parents: ['n:2'] },
-    { ...base, node_key: 'n:2', summary: 'undated middle', kind: 'tool', timestamp_ms: 0, lane: 1, parents: ['n:3'] },
-    { ...base, node_key: 'n:3', summary: 'dated oldest', kind: 'message', timestamp_ms: 1000, parents: ['n:4'] },
-    { ...base, node_key: 'n:4', summary: 'submodule note', kind: 'message', timestamp_ms: 2000, is_submodule: true, parents: [] },
+    { ...base, node_key: 'n:1', summary: 'dated newest', kind: 'message', timestamp_ms: 3000, parents: ['n:2'],
+      record_role: 'narrative', activity_kind: 'conversation', visibility: 'primary', outcome: 'unknown', turn_id: 'n:1' },
+    { ...base, node_key: 'n:2', summary: 'undated middle', kind: 'tool', timestamp_ms: 0, lane: 1, parents: ['n:3'],
+      record_role: 'result', activity_kind: 'execute', visibility: 'primary', outcome: 'unknown', turn_id: 'n:2' },
+    { ...base, node_key: 'n:3', summary: 'dated oldest', kind: 'message', timestamp_ms: 1000, parents: ['n:4'],
+      record_role: 'narrative', activity_kind: 'conversation', visibility: 'primary', outcome: 'unknown', turn_id: 'n:3' },
+    { ...base, node_key: 'n:4', summary: 'submodule note', kind: 'message', timestamp_ms: 2000, is_submodule: true, parents: [],
+      record_role: 'narrative', activity_kind: 'conversation', visibility: 'primary', outcome: 'unknown', turn_id: 'n:4' },
   ];
 }
 
@@ -323,4 +328,196 @@ test('Search git hits carry synthetic op_id plus real git identity (navigable)',
   assert.equal(opHit.git_oid, null);
   assert.equal(opHit.repository, null);
   assert.equal(typeof opHit.op_id, 'string');
+});
+
+// --- r4: Activity/Raw profile (hide_trace) + additive HistoryRow fields -----
+
+test('hide_trace=true filters visibility "trace" rows from window AND layout', () => {
+  // A 5-row chain with two trace-VISIBILITY records (t:1, t:3). Activity
+  // (hide_trace=true) must remove them unconditionally from both GetWindow
+  // and GetLayout, and splice the kept parents so edges never reference a
+  // hidden row. All taxonomy values are the exact Rust wire enums.
+  const rows = [
+    { ...fixtureRows()[0], node_key: 't:0', summary: 'agent reply', kind: 'message', record_role: 'narrative', activity_kind: 'conversation', visibility: 'primary', parents: ['t:1'] },
+    { ...fixtureRows()[1], node_key: 't:1', summary: 'tool result one', kind: 'tool', record_role: 'result', activity_kind: 'execute', visibility: 'trace', parents: ['t:2'] },
+    { ...fixtureRows()[2], node_key: 't:2', summary: 'run tests', kind: 'command', record_role: 'action', activity_kind: 'execute', visibility: 'primary', parents: ['t:3'] },
+    { ...fixtureRows()[3], node_key: 't:3', summary: 'tool result two', kind: 'tool', record_role: 'result', activity_kind: 'execute', visibility: 'trace', parents: ['t:4'] },
+    { ...fixtureRows()[0], node_key: 't:4', summary: 'user asks', kind: 'message', record_role: 'narrative', activity_kind: 'conversation', visibility: 'primary', parents: [] },
+  ];
+  window.__editchainFixture = {
+    rows,
+    layoutRows: rows.map((r) => ({ node: r.node_key, lane: 0 })),
+    edges: [
+      { child: 't:0', parent: 't:1', points: [{ row: 0, lane: 0 }, { row: 1, lane: 0 }] },
+      { child: 't:1', parent: 't:2', points: [{ row: 1, lane: 0 }, { row: 2, lane: 0 }] },
+      { child: 't:2', parent: 't:3', points: [{ row: 2, lane: 0 }, { row: 3, lane: 0 }] },
+      { child: 't:3', parent: 't:4', points: [{ row: 3, lane: 0 }, { row: 4, lane: 0 }] },
+    ],
+  };
+  const filter = {
+    summary_pattern: '',
+    kind_pattern: '',
+    include_kind_pattern: '',
+    hide_undated: false,
+    splice: true,
+    hide_trace: true,
+  };
+  const windowResp = request({ GetWindow: { offset: 0, limit: 100, filter } });
+  const layoutResp = request({ GetLayout: { offset: 0, limit: 100, filter } });
+  // Kept: t:0, t:2, t:4 — trace-VISIBILITY records vanish entirely (no
+  // endpoint keeping). Regression guard: hiding is driven by VISIBILITY —
+  // record_role has no "trace" variant, so a non-trace-visibility row is
+  // never filtered by this flag.
+  assert.deepEqual(windowKeys(windowResp), ['t:0', 't:2', 't:4']);
+  for (const kept of windowResp.Ok.rows) {
+    assert.notEqual(kept.visibility, 'trace', 'kept row must not be trace-visibility');
+    assert.ok(['narrative', 'action'].includes(kept.record_role),
+      'kept record_role is exact Rust value: ' + kept.record_role);
+    assert.ok(['conversation', 'execute'].includes(kept.activity_kind),
+      'kept activity_kind is exact Rust value: ' + kept.activity_kind);
+  }
+  assert.equal(windowResp.Ok.total, 3);
+  // Splice: t:0 has no kept parent; t:2's nearest kept ancestor is t:4.
+  const t2 = windowResp.Ok.rows.find((r) => r.node_key === 't:2');
+  assert.deepEqual(t2.parents, ['t:4']);
+  assert.deepEqual(layoutNodes(layoutResp), ['t:0', 't:2', 't:4']);
+  const edges = edgeKeys(layoutResp);
+  // t:0's only parent (t:1) is hidden, so it splices to the nearest kept
+  // ancestor (t:2); t:2 splices to t:4. No edge may reference a hidden row.
+  assert.deepEqual(edges, ['t:0->t:2', 't:2->t:4']);
+  for (const e of layoutResp.Ok.edges) {
+    assert.notEqual(e.child, 't:1');
+    assert.notEqual(e.parent, 't:1');
+    assert.notEqual(e.child, 't:3');
+    assert.notEqual(e.parent, 't:3');
+  }
+});
+
+test('hide_trace=false (or omitted) keeps trace-visibility rows (Raw view)', () => {
+  const rows = [
+    { ...fixtureRows()[0], node_key: 't:0', summary: 'agent reply', record_role: 'narrative', activity_kind: 'conversation', visibility: 'primary', parents: ['t:1'] },
+    { ...fixtureRows()[1], node_key: 't:1', summary: 'tool result', kind: 'tool', record_role: 'result', activity_kind: 'execute', visibility: 'trace', parents: [] },
+  ];
+  window.__editchainFixture = {
+    rows,
+    layoutRows: rows.map((r) => ({ node: r.node_key, lane: 0 })),
+    edges: [{ child: 't:0', parent: 't:1', points: [{ row: 0, lane: 0 }, { row: 1, lane: 0 }] }],
+  };
+  // Explicit hide_trace:false (Raw profile) keeps everything.
+  const raw = request({
+    GetWindow: { offset: 0, limit: 100, filter: { splice: true, hide_trace: false } },
+  });
+  assert.deepEqual(windowKeys(raw), ['t:0', 't:1']);
+  // Omitted hide_trace means false (ChainFilterDto serde default) — same view.
+  const omitted = request({
+    GetWindow: { offset: 0, limit: 100, filter: { splice: true } },
+  });
+  assert.deepEqual(windowKeys(omitted), ['t:0', 't:1']);
+});
+
+test('additive HistoryRow fields pass through GetWindow unchanged (exact Rust values)', () => {
+  const rows = [
+    {
+      ...fixtureRows()[0],
+      node_key: 't:0',
+      summary: 'agent reply',
+      kind: 'message',
+      record_role: 'narrative',
+      activity_kind: 'conversation',
+      visibility: 'primary',
+      outcome: 'success',
+      turn_id: 'turn-42',
+    },
+  ];
+  window.__editchainFixture = {
+    rows,
+    layoutRows: rows.map((r) => ({ node: r.node_key, lane: 0 })),
+    edges: [],
+  };
+  const resp = request({ GetWindow: { offset: 0, limit: 100, filter: { splice: true } } });
+  const row = resp.Ok.rows[0];
+  assert.equal(row.record_role, 'narrative');
+  assert.equal(row.activity_kind, 'conversation');
+  assert.equal(row.visibility, 'primary');
+  assert.equal(row.outcome, 'success');
+  assert.equal(row.turn_id, 'turn-42');
+});
+
+test('wire taxonomy is restricted to the exact Rust enum values', () => {
+  // Regression guard: the fixture rows must never carry the legacy
+  // tool_call/command/edit/commit/review, error/interrupted, record_role
+  // "turn"/"tool"/"trace", or visibility "hidden"/"visible" vocabulary that
+  // drifted from the Rust wire enums.
+  const rows = fixtureRows();
+  const roles = new Set(['narrative', 'action', 'result', 'artifact', 'lifecycle', 'echo', 'unknown']);
+  const kinds = new Set(['conversation', 'plan', 'explore', 'execute', 'change', 'verify',
+    'diagnose', 'coordinate', 'source_control', 'external', 'system', 'unknown']);
+  const visibilities = new Set(['primary', 'supporting', 'trace', 'unknown']);
+  const outcomes = new Set(['success', 'warning', 'failure', 'cancelled', 'unknown']);
+  const legacyByField = {
+    record_role: ['turn', 'tool', 'trace', 'commit', 'message', 'error'],
+    activity_kind: ['tool_call', 'command', 'edit', 'commit', 'review',
+      'error', 'interrupted', 'tool_result', 'message', 'turn'],
+    visibility: ['visible', 'hidden'],
+    outcome: ['error', 'interrupted', 'successful', 'failed'],
+  };
+  for (const r of rows) {
+    for (const [field, allowed] of [['record_role', roles], ['activity_kind', kinds],
+      ['visibility', visibilities], ['outcome', outcomes]]) {
+      assert.ok(allowed.has(r[field]),
+        r.node_key + ' ' + field + '="' + r[field] + '" not in Rust enum ' + JSON.stringify([...allowed]));
+    }
+    for (const [field, legacy] of Object.entries(legacyByField)) {
+      assert.ok(!legacy.includes(r[field]),
+        r.node_key + ' ' + field + ' uses legacy value "' + r[field] + '"');
+    }
+  }
+});
+
+test('GetNodeDetails resolves bundled sub-op records by their op_id', () => {
+  const rows = [
+    {
+      ...fixtureRows()[0],
+      node_key: 'n:c:1',
+      summary: 'combined op',
+      kind: 'message',
+      sub_ops: [
+        { op_id: 'n:c:1::sub:0', summary: 'mode', kind: 'mode' },
+      ],
+    },
+  ];
+  window.__editchainFixture = {
+    rows,
+    layoutRows: rows.map((r) => ({ node: r.node_key, lane: 0 })),
+    edges: [],
+    subOpCounts: [1],
+  };
+  const resp = request({ GetNodeDetails: { op_id: 'n:c:1::sub:0' } });
+  assert.equal(resp.Ok.summary, 'mode');
+});
+
+test('ResolveObject returns the git commit identity and message', () => {
+  const rows = [
+    {
+      ...fixtureRows()[3],
+      node_key: 'git:deadbeef',
+      git_oid: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+      repository: '9007199254740993',
+      summary: 'git needle commit',
+      author: 'ambientlight',
+      timestamp_ms: 2000,
+    },
+  ];
+  window.__editchainFixture = {
+    rows,
+    layoutRows: rows.map((r) => ({ node: r.node_key, lane: 0 })),
+    edges: [],
+  };
+  const resp = request({
+    ResolveObject: { repository: '9007199254740993', oid: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' },
+  });
+  assert.equal(resp.Ok.oid, 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef');
+  assert.equal(resp.Ok.repository, '9007199254740993');
+  assert.equal(resp.Ok.message, 'git needle commit');
+  assert.equal(resp.Ok.author, 'ambientlight');
 });

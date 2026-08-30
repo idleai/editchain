@@ -142,7 +142,7 @@ describe('EditChain History Explorer', () => {
     await webview.close();
   });
 
-  it('returns from node details to the retained cached history page', async () => {
+  it('selects rows in the inspector; only explicit actions open an editor tab', async () => {
     const workbench = await browser.getWorkbench();
 
     await browser.executeWorkbench((vscode) => {
@@ -172,8 +172,7 @@ describe('EditChain History Explorer', () => {
       const candidate = rendered.find((element) => {
         const abs = Number(element.getAttribute('data-row'));
         const row = window.__editchainRowAt?.(abs);
-        return row && !row.is_subop && !(row.sub_ops && row.sub_ops.length) &&
-          (row.op_id || row.git_oid);
+        return row && !row.is_subop && (row.op_id || row.git_oid);
       });
       if (!candidate) throw new Error('no rendered detail-capable row');
       const keys = rendered.slice(0, 8).map((row) => row.getAttribute('data-key'));
@@ -188,8 +187,36 @@ describe('EditChain History Explorer', () => {
     });
     expect(before.rendererInstanceId).toBeTruthy();
 
-    // Leave the iframe after its click asks the extension host to show the
-    // read-only JSON editor, then wait until that editor replaces the panel.
+    // An ORDINARY row click must open the inspector — never an editor tab.
+    const inspector = await browser.execute(() => {
+      const detailEl = document.getElementById('detail');
+      return {
+        hasDetail: document.getElementById('layout').classList.contains('has-detail'),
+        selected: !!document.querySelector('.row.row-selected'),
+        title: detailEl.querySelector('.detail-title')?.textContent || '',
+        hasActions: detailEl.querySelectorAll('.detail-btn').length > 0,
+      };
+    });
+    console.log('[e2e] inspector after row click:', JSON.stringify(inspector));
+    expect(inspector.hasDetail).toBe(true);
+    expect(inspector.selected).toBe(true);
+    // The details must have resolved (title rendered, actions present), not
+    // left on the loading state.
+    await browser.waitUntil(async () => browser.execute(() => {
+      const detailEl = document.getElementById('detail');
+      return detailEl.querySelectorAll('.detail-btn').length > 0;
+    }), { timeout: 30000, interval: 100 });
+
+    // The ONLY editor path is the inspector's explicit "Open raw JSON" action.
+    await browser.execute(() => {
+      const btns = Array.from(document.querySelectorAll('#detail .detail-btn'));
+      const openBtn = btns.find((b) => b.textContent.includes('Open raw JSON'));
+      if (!openBtn || openBtn.disabled) throw new Error('no enabled Open raw JSON action');
+      openBtn.click();
+    });
+
+    // Leave the iframe after the explicit action asks the extension host to
+    // show the read-only JSON editor, then wait until that editor is active.
     await webview.close();
     await browser.waitUntil(async () => {
       const tab = await workbench.getEditorView().getActiveTab();
@@ -217,14 +244,148 @@ describe('EditChain History Explorer', () => {
       };
     });
 
-    console.log('[e2e] detail/back before:', JSON.stringify(before));
-    console.log('[e2e] detail/back after:', JSON.stringify(after));
+    console.log('[e2e] inspector/back before:', JSON.stringify(before));
+    console.log('[e2e] inspector/back after:', JSON.stringify(after));
     expect(after.rendererInstanceId).toBe(before.rendererInstanceId);
     expect(after.scrollTop).toBe(before.scrollTop);
     expect(after.keys).toEqual(before.keys);
     expect(after.rowCount).toBeGreaterThan(0);
     expect(after.message).not.toContain('Loading');
     await restoredWebview.close();
+  });
+
+  it('switches Activity/Raw profiles and supports keyboard activation', async () => {
+    const workbench = await browser.getWorkbench();
+
+    await browser.executeWorkbench((vscode) => {
+      vscode.commands.executeCommand('editchain-history.open');
+    });
+    const webview = await workbench.getWebviewByTitle('EditChain History');
+    await webview.open();
+    await browser.$('.row').waitForExist({ timeout: 120000 });
+
+    // The segmented control exists and defaults to Activity.
+    const defaults = await browser.execute(() => ({
+      activityPressed: document.getElementById('profile-activity')?.getAttribute('aria-pressed'),
+      rawPressed: document.getElementById('profile-raw')?.getAttribute('aria-pressed'),
+      profile: typeof window.__editchainGetProfile === 'function'
+        ? window.__editchainGetProfile() : null,
+      hasControl: !!document.getElementById('profile-control'),
+    }));
+    console.log('[e2e] profile defaults:', JSON.stringify(defaults));
+    expect(defaults.hasControl).toBe(true);
+    expect(defaults.activityPressed).toBe('true');
+    expect(defaults.rawPressed).toBe('false');
+
+    // Switch to Raw: the control updates and the view resets coherently
+    // (scroll to the top, rows re-render under the new profile). The real
+    // service may ignore hide_trace until the r4 backend lands, so the
+    // assertions are chain-agnostic: control state, profile, scroll reset,
+    // and a re-rendered bounded window.
+    await browser.execute(() => {
+      document.getElementById('profile-raw').click();
+    });
+    // The reset must clear readiness and drop the stale grid SYNCHRONOUSLY —
+    // before the new profile's window arrives. This is the product fix for the
+    // stale-DOM race (Raw -> Activity left old rows interactive and
+    // readiness-satisfying; Enter then hit a stale row whose abs index was
+    // absent from the cleared cache and the inspector never opened).
+    const resetState = await browser.execute(() => ({
+      dataReady: window.__editchainDataReady,
+      rowCount: document.querySelectorAll('.row').length,
+      loading: (document.querySelector('.view-message')?.textContent || ''),
+      profile: window.__editchainGetProfile(),
+    }));
+    console.log('[e2e] raw reset state:', JSON.stringify(resetState));
+    expect(resetState.dataReady).toBe(false);
+    expect(resetState.rowCount).toBe(0);
+    expect(resetState.loading).toContain('Loading');
+    expect(resetState.profile).toBe('raw');
+    // Wait for the NEW generation on authoritative readiness + current-profile
+    // cache only: every rendered row must be backed by the cache, so a stale
+    // DOM can never satisfy the wait while the new window is in flight.
+    await browser.waitUntil(async () => browser.execute(() => {
+      const rows = Array.from(document.querySelectorAll('.row'));
+      return window.__editchainDataReady === true &&
+        document.getElementById('rows').scrollTop === 0 &&
+        rows.length > 0 &&
+        rows.every((r) => {
+          const abs = Number(r.getAttribute('data-row'));
+          return Number.isFinite(abs) && window.__editchainRowAt(abs) != null;
+        });
+    }), { timeout: 30000, interval: 100 });
+    const rawState = await browser.execute(() => ({
+      profile: typeof window.__editchainGetProfile === 'function'
+        ? window.__editchainGetProfile() : null,
+      activityPressed: document.getElementById('profile-activity')?.getAttribute('aria-pressed'),
+      rawPressed: document.getElementById('profile-raw')?.getAttribute('aria-pressed'),
+      rowCount: document.querySelectorAll('.row').length,
+      scrollTop: document.getElementById('rows').scrollTop,
+    }));
+    console.log('[e2e] raw state:', JSON.stringify(rawState));
+    expect(rawState.profile).toBe('raw');
+    expect(rawState.activityPressed).toBe('false');
+    expect(rawState.rawPressed).toBe('true');
+    expect(rawState.rowCount).toBeGreaterThan(0);
+    expect(rawState.scrollTop).toBe(0);
+
+    // Switch back to Activity through the control.
+    await browser.execute(() => {
+      document.getElementById('profile-activity').click();
+    });
+    await browser.waitUntil(async () => browser.execute(() => {
+      const rows = Array.from(document.querySelectorAll('.row'));
+      return window.__editchainDataReady === true &&
+        document.getElementById('rows').scrollTop === 0 &&
+        rows.length > 0 &&
+        rows.every((r) => {
+          const abs = Number(r.getAttribute('data-row'));
+          return Number.isFinite(abs) && window.__editchainRowAt(abs) != null;
+        });
+    }), { timeout: 30000, interval: 100 });
+    const activityState = await browser.execute(() => ({
+      profile: window.__editchainGetProfile ? window.__editchainGetProfile() : null,
+      rowCount: document.querySelectorAll('.row').length,
+    }));
+    console.log('[e2e] activity state:', JSON.stringify(activityState));
+    expect(activityState.profile).toBe('activity');
+    expect(activityState.rowCount).toBeGreaterThan(0);
+
+    // Keyboard: Enter on a focused row opens the inspector; the Close action
+    // hides it and clears selection.
+    const keyboard = await browser.execute(() => {
+      const row = document.querySelector('.row:not(.row-placeholder)');
+      if (!row) throw new Error('no rendered row for keyboard probe');
+      const abs = Number(row.getAttribute('data-row'));
+      row.focus();
+      row.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      return {
+        focused: document.activeElement === row,
+        abs,
+        cacheBacked: window.__editchainRowAt(abs) != null,
+      };
+    });
+    expect(keyboard.focused).toBe(true);
+    // Enter must target a CACHE-BACKED row — the stale-DOM race delivered Enter
+    // to an old row whose abs index was absent from the cleared cache, and the
+    // inspector never opened.
+    expect(keyboard.cacheBacked).toBe(true);
+    await browser.waitUntil(async () => browser.execute(() => {
+      const sel = document.querySelector('.row.row-selected');
+      return document.getElementById('layout').classList.contains('has-detail') &&
+        !!sel &&
+        window.__editchainRowAt(Number(sel.getAttribute('data-row'))) != null;
+    }), { timeout: 30000, interval: 100 });
+    await browser.execute(() => {
+      const closeBtn = document.querySelector('#detail .detail-btn:first-child');
+      if (closeBtn) closeBtn.click();
+    });
+    await browser.waitUntil(async () => browser.execute(() => {
+      return !document.getElementById('layout').classList.contains('has-detail') &&
+        !document.querySelector('.row.row-selected');
+    }), { timeout: 30000, interval: 100 });
+
+    await webview.close();
   });
 
   it('scrolls through the full history with a bounded viewport', async () => {

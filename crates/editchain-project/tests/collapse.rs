@@ -10,6 +10,7 @@
 )]
 // Crate-level dependency markers (used by Cargo for feature resolution).
 use regex as _;
+use serde as _;
 use serde_json as _;
 
 use editchain_core::{
@@ -74,6 +75,49 @@ fn tool_op(node: u64, seq: u64, parent: OpId, name: &str) -> Op {
             content: Payload::Empty,
         }),
     }
+}
+
+/// Build a normalized tool-result import whose raw JSON carries a structured
+/// `status`, so its derived outcome is `Success`/`Failure`/`Cancelled` rather
+/// than `Unknown`.
+fn status_result_import(node: u64, seq: u64, parent: OpId, status: &str) -> Op {
+    let mut op = import_op(node, seq);
+    op.parents = ParentSet::One(parent);
+    if let OpKind::Import(import) = &mut op.kind {
+        import.raw_ref = Payload::Inline(
+            serde_json::json!({
+                "type": "response_item",
+                "payload": { "item": { "status": status } }
+            })
+            .to_string()
+            .into_bytes(),
+        );
+    }
+    op
+}
+
+/// Build a tool-result import (with an optional structured `status`) plus its
+/// Finish-stage tool child, parented to the given call import.
+fn tool_result_pair(
+    node: u64,
+    seq: u64,
+    tool_seq: u64,
+    parent: OpId,
+    status: Option<&str>,
+) -> (Op, Op) {
+    let import = if let Some(status) = status {
+        status_result_import(node, seq, parent, status)
+    } else {
+        let mut op = import_op(node, seq);
+        op.parents = ParentSet::One(parent);
+        op
+    };
+    let mut tool = tool_op(node, tool_seq, import.id, "");
+    if let OpKind::Tool(t) = &mut tool.kind {
+        t.stage = ToolStage::Finish;
+        t.content = Payload::Inline(b"output".to_vec());
+    }
+    (import, tool)
 }
 
 #[test]
@@ -429,6 +473,70 @@ fn tool_result_groups_into_tool_call() {
     // The combined summary includes the call name plus the result preview.
     assert_eq!(node.summary(), "tool: Bash line one");
     assert_eq!(node.sub_ops().len(), 1);
+}
+
+#[test]
+fn grouped_tool_results_keep_failure_over_later_success() {
+    // Two tool-result rows fold into one call: a Failure followed by a later
+    // Success. Last-wins folding would let the later Success mask the earlier
+    // Failure and render a misleading success badge; the merge must keep the
+    // Failure as the combined visible outcome.
+    let call_import = import_op(1, 1);
+    let call = tool_op(1, 2, call_import.id, "Bash");
+    let mut ops = vec![call_import.clone(), call];
+    for (node, seq, tool_seq, status) in [
+        (1u64, 3u64, 4u64, Some("failed")),
+        (1, 5, 6, Some("completed")),
+    ] {
+        let (import, tool) = tool_result_pair(node, seq, tool_seq, call_import.id, status);
+        ops.push(import);
+        ops.push(tool);
+    }
+
+    let projection = HistoryProjection::from_ops(ops);
+    let nodes = projection.nodes();
+
+    // One visible row (the call); both results are folded into its sub-ops.
+    assert_eq!(nodes.len(), 1);
+    let node = &nodes[0];
+    assert_eq!(node.node_key(), call_import.id.to_string());
+    assert_eq!(
+        node.outcome(),
+        editchain_project::taxonomy::Outcome::Failure,
+        "a later Success must not erase the earlier Failure"
+    );
+}
+
+#[test]
+fn grouped_tool_results_keep_success_when_all_succeed() {
+    // Two successful results plus one unknown-status result fold into one call;
+    // the combined outcome stays Success, and the unknown result never
+    // downgrades known evidence.
+    let call_import = import_op(1, 1);
+    let call = tool_op(1, 2, call_import.id, "Bash");
+    let mut ops = vec![call_import.clone(), call];
+    // The last entry carries no structured status -> derived outcome Unknown.
+    for (node, seq, tool_seq, status) in [
+        (1u64, 3u64, 4u64, Some("completed")),
+        (1, 5, 6, Some("succeeded")),
+        (1, 7, 8, None),
+    ] {
+        let (import, tool) = tool_result_pair(node, seq, tool_seq, call_import.id, status);
+        ops.push(import);
+        ops.push(tool);
+    }
+
+    let projection = HistoryProjection::from_ops(ops);
+    let nodes = projection.nodes();
+
+    assert_eq!(nodes.len(), 1);
+    let node = &nodes[0];
+    assert_eq!(node.node_key(), call_import.id.to_string());
+    assert_eq!(
+        node.outcome(),
+        editchain_project::taxonomy::Outcome::Success,
+        "unknown must not erase known success evidence"
+    );
 }
 
 #[test]

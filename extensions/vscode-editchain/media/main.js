@@ -28,8 +28,16 @@ const rowsEl = document.getElementById('rows');
 const searchEl = document.getElementById('search');
 const detailEl = document.getElementById('detail');
 const layoutEl = document.getElementById('layout');
+const statusLiveEl = document.getElementById('status-live');
+const profileActivityBtn = document.getElementById('profile-activity');
+const profileRawBtn = document.getElementById('profile-raw');
 
-// Temporary fixed view while the filtering experience is redesigned.
+// Temporary fixed view while the filtering experience is redesigned. The
+// Activity/Raw profile control toggles `hide_trace`: Activity (the default
+// pregenerated view) hides internal trace records server-side; Raw shows the
+// complete record stream. The flag rides inside the chain filter on every
+// GetWindow/layout follow-up so the whole view (rows + geometry) stays
+// coherent under the active profile.
 const FIXED_HIDE_SUBMODULES = true;
 const FIXED_FILTER = Object.freeze({
   summary_pattern: '',
@@ -37,11 +45,18 @@ const FIXED_FILTER = Object.freeze({
   include_kind_pattern: '',
   hide_undated: false,
   splice: true,
+  hide_trace: true,
 });
 
-// Show an explicit loading state until the extension host finishes `Open` and
-// the first window arrives (or surfaces the open error).
-showViewMessage('Loading history…', false);
+// Active profile: 'activity' (hide_trace=true) or 'raw' (hide_trace=false).
+let profile = 'activity';
+function profileLabel() {
+  return profile === 'activity' ? 'Activity' : 'Raw';
+}
+/** Whether the current view profile hides trace records. */
+function hideTrace() {
+  return profile === 'activity';
+}
 
 // Harness data-readiness signal. Set to `true` only once the webview has
 // processed a terminal event correlated with actual content: an `open` error,
@@ -76,6 +91,29 @@ let totalFetched = 0;
 // history window; fetch/scroll/progressive-load machinery is suspended.
 let searchMode = false;
 let searchQuery = '';
+
+// Inspector (master-detail) state: the selected row's node key, the row being
+// inspected, and an epoch guard so only the LATEST detail response renders
+// (rapid row clicks must never let an older response overwrite a newer one).
+let selectedRowKey = null;
+// Roving-tabindex anchor: the ABSOLUTE index of the single tabbable row in the
+// rendered window. Only that row is in the tab order (Tab enters/exits the
+// grid as a unit); ArrowUp/Down move focus between rendered rows instead of
+// tabbing through every virtualized row. Falls back to the first rendered row
+// whenever the anchor is trimmed away by virtual scrolling (applyRovingTabindex).
+let rovingAbs = -1;
+let detailRow = null;
+let detailEpoch = 0;
+// request id -> detail epoch for in-flight GetNodeDetails/ResolveObject calls.
+const detailReqs = new Map();
+// Announced the initial history load once (aria-live), not on every page.
+let announcedInitialLoad = false;
+
+// Show an explicit loading state until the extension host finishes `Open` and
+// the first window arrives (or surfaces the open error). Runs after the state
+// declarations above so the inspector helpers clearDetail() touches are
+// initialized.
+showViewMessage('Loading history…', false);
 
 // Latest-query-wins correlation for search. A search response is rendered ONLY
 // if it carries the CURRENT epoch. Two rapid searches share the same view
@@ -258,13 +296,16 @@ function viewportVisibleBottom() {
   return Math.min(visibleTotal() - 1, Math.max(viewportVisibleTop(), Math.floor((rowsEl.scrollTop + rowsEl.clientHeight) / ROW_H)));
 }
 
-/** Persist only viewport state for genuine context recreation. Ordinary
- * detail navigation retains the live bounded cache. We never serialize row
- * payloads: they can exceed VS Code's webview-state size limit, and a recreated
- * webview can refetch its bounded window cheaply. */
+/** Persist only safe profile + viewport state for genuine context recreation.
+ * Ordinary detail navigation retains the live bounded cache. We never
+ * serialize row payloads, search state, filters, or totals: they can exceed
+ * VS Code's webview-state size limit or go stale when the chain is reimported,
+ * and a recreated webview can refetch its bounded window cheaply. The profile
+ * choice is safe (it only changes which filter flag the first fetch sends) and
+ * the visible TOP ROW INDEX survives expansion differences as `topRow * ROW_H`. */
 function saveState() {
   vscode.setState({
-    total,
+    profile,
     // Persist the visible TOP ROW INDEX, not raw pixel scrollTop: after a real
     // context recreation the spacer/scaffold doesn't exist until `reanchorTo`,
     // so a raw pixel offset clamps to 0. A row index survives expansion
@@ -273,9 +314,10 @@ function saveState() {
   });
 }
 
-/** Return the saved top row index (or -1 if none) WITHOUT touching scrollTop —
- * the spacer isn't built yet here, so applying scroll must wait until the
- * open/reveal handler has reanchored. Legacy persisted filter keys are ignored. */
+/** Return the saved `{ topRow, profile }` WITHOUT touching scrollTop — the
+ * spacer isn't built yet here, so applying scroll must wait until the
+ * open/reveal handler has reanchored. Legacy persisted filter/total keys are
+ * ignored; an absent or unknown profile defaults to Activity. */
 function restoreState() {
   const s = vscode.getState();
   let topRow = -1;
@@ -286,7 +328,8 @@ function restoreState() {
     // runs. Only the top row index survives a recreated webview.
     if (s.topRow > 0) topRow = s.topRow;
   }
-  return topRow;
+  const savedProfile = s && s.profile === 'raw' ? 'raw' : 'activity';
+  return { topRow, profile: savedProfile };
 }
 
 /** Apply a restored visible top row index as a pixel scroll offset. Must be
@@ -324,6 +367,40 @@ function send(body) {
   return id;
 }
 
+/** Send a detail fetch with its epoch registered BEFORE posting.
+ *
+ * The harness fixture bridge responds synchronously inside postMessage, so a
+ * mapping registered after `send` returns would be set only after the response
+ * was already processed (and dropped). Registering the request id -> epoch
+ * mapping up front keeps the response routing correct in both the synchronous
+ * harness and the asynchronous real service.
+ */
+function sendDetail(body, epoch) {
+  const id = nextReqId++;
+  inFlight.set(id, { body, gen: viewGen });
+  detailReqs.set(id, epoch);
+  vscode.postMessage({ id, body });
+  return id;
+}
+
+/** Send a GetWindow request and mark it as the in-flight window BEFORE posting.
+ *
+ * Same synchronous-bridge discipline as sendDetail: the fixture bridge responds
+ * inside postMessage, so `pendingWindowReqId = send(...)` would be assigned only
+ * after the response had already been processed re-entrantly — the response's
+ * `wasPendingWindow` correlation would miss, and the late assignment would leave
+ * a PHANTOM pending id that blocks every later fetchWindow (the harness scroll
+ * race). Registering the id up front keeps `wasPendingWindow` correct in both
+ * the synchronous harness and the asynchronous real service.
+ */
+function sendWindow(body) {
+  const id = nextReqId++;
+  inFlight.set(id, { body, gen: viewGen });
+  pendingWindowReqId = id;
+  vscode.postMessage({ id, body });
+  return id;
+}
+
 /** Send a request tagged with the current search epoch (search requests only). */
 function sendSearch(body, epoch) {
   const id = nextReqId++;
@@ -335,7 +412,8 @@ function sendSearch(body, epoch) {
 /** Render a full-pane message (loading, open error) into #rows. */
 function showViewMessage(text, isError) {
   clearDetail();
-  rowsEl.innerHTML = '<div class="view-message' + (isError ? ' error' : '') + '">' +
+  rowsEl.innerHTML = '<div class="view-message' + (isError ? ' error' : '') + '" role="' +
+    (isError ? 'alert' : 'status') + '">' +
     esc(text) + '</div>';
 }
 
@@ -447,22 +525,92 @@ function hideSubmodules() {
 
 /** Explicit fixed filter sent to avoid the service's legacy implicit default. */
 function filterPayload() {
-  return { ...FIXED_FILTER };
+  return { ...FIXED_FILTER, hide_trace: hideTrace() };
 }
 
-/** Search currently applies no kind, actor, path, or timestamp filters. */
+/** Search is explicitly UNPROFILED: the Search DTO has no hide_trace field and
+ * the service's search index is profile-agnostic, so search results never
+ * carry a profile. A profile switch therefore exits search mode and resets to
+ * the full history view under the new profile (see setProfile), so results can
+ * never silently mix profile semantics. */
 function searchFiltersPayload() {
   return {};
+}
+
+/** Announce a status change to assistive tech (and the status bar) without
+ * stealing focus. Best-effort: the live region may be absent in embedded
+ * contexts, which is fine. */
+function announce(text) {
+  if (statusLiveEl) {
+    statusLiveEl.textContent = text;
+  }
+  if (typeof vscode.postMessage === 'function') {
+    vscode.postMessage({ type: 'statusText', text });
+  }
+}
+
+/** Update the segmented control UI to reflect the active profile. */
+function syncProfileButtons() {
+  const active = profile === 'activity';
+  if (profileActivityBtn && profileRawBtn) {
+    profileActivityBtn.classList.toggle('active', active);
+    profileRawBtn.classList.toggle('active', !active);
+    profileActivityBtn.setAttribute('aria-pressed', String(active));
+    profileRawBtn.setAttribute('aria-pressed', String(!active));
+  }
+}
+
+/** Switch the Activity/Raw profile.
+ *
+ * With `reset` (user action), the view resets coherently: search mode exits,
+ * the view generation bumps (in-flight windows from the old profile are
+ * rejected), the expansion snapshot and cache are dropped, and history
+ * refetches from offset 0 under the new profile. `reset:false` only updates
+ * the in-memory profile + control (used on open/reveal before the first
+ * fetch so the initial window already carries the persisted profile).
+ */
+function setProfile(next, opts) {
+  opts = opts || {};
+  if (next !== 'activity' && next !== 'raw') return;
+  if (profile === next && !opts.force) return;
+  profile = next;
+  syncProfileButtons();
+  if (opts.reset) {
+    announce('Showing ' + profileLabel() + ' history');
+    // Persist the profile immediately; the viewport index is saved once the
+    // first window of the new profile arrives.
+    vscode.setState({ profile, topRow: 0 });
+    resetHistory();
+  } else if (opts.persist !== false) {
+    // Restore paths pass `persist:false`: at that point the scaffold isn't
+    // built yet, so saveState() would write the pre-restore scrollTop (0)
+    // and clobber the persisted topRow a real context recreation is about to
+    // restore. The caller persists once the restored position is applied.
+    saveState();
+  }
+}
+
+/** Shorten a raw 64-bit identifier for display (never show the full string).
+ *
+ * Protocol identifiers (op ids, repository ids, oids) are exact strings that
+ * can exceed 64 bits; showing them raw makes rows unreadable. Keeps the tail
+ * so the short form still disambiguates within a session.
+ */
+function shortId(id) {
+  if (!id) return '';
+  const s = String(id);
+  return s.length <= 12 ? s : s.slice(-12);
 }
 
 /** Human-readable label for a block-separator group key.
  *
  * `repo:*` groups are git repositories; `session:*` groups are Claude Code
- * sessions; anything else falls back to "EditChain ops".
+ * sessions; anything else falls back to "EditChain ops". Identifiers are
+ * shortened — never the full raw 64-bit string.
  */
 function groupLabelText(group) {
-  return group.startsWith('repo:') ? 'Git · repo ' + group.slice(5)
-    : group.startsWith('session:') ? 'Session ' + group.slice(8)
+  return group.startsWith('repo:') ? 'Git · repo ' + shortId(group.slice(5))
+    : group.startsWith('session:') ? 'Session ' + shortId(group.slice(8))
     : 'EditChain ops';
 }
 
@@ -482,6 +630,29 @@ const colWidths = { graph: null, content: null, date: null, author: null, commit
 // overrides these via `colWidths`.
 const DEFAULT_COL_W = { content: 0, date: 140, author: 100, commit: 100 };
 
+// Narrow-width media-query breakpoints (must match media/main.css). Below each
+// threshold a fixed column is DROPPED from the grid in priority order (commit,
+// author, date) so Content keeps its readable width before it is ever
+// squeezed. These drive the JS width math (graph budget, inline vars, resize
+// handles) so it agrees with the CSS grid.
+const HIDE_COMMIT_MAX = 617;
+const HIDE_AUTHOR_MAX = 480;
+const HIDE_DATE_MAX = 400;
+
+/** Fixed columns hidden at the current viewport width. */
+function hiddenColumns() {
+  const w = window.innerWidth || rowsEl.clientWidth || 0;
+  const hidden = new Set();
+  if (w <= HIDE_COMMIT_MAX) hidden.add('commit');
+  if (w <= HIDE_AUTHOR_MAX) hidden.add('author');
+  if (w <= HIDE_DATE_MAX) hidden.add('date');
+  return hidden;
+}
+
+function isColumnHidden(col) {
+  return hiddenColumns().has(col);
+}
+
 /** Build an inline style string carrying every column width as a CSS var.
  *
  * Every column gets an explicit width so nothing is auto-sized: the graph uses
@@ -492,9 +663,10 @@ const DEFAULT_COL_W = { content: 0, date: 140, author: 100, commit: 100 };
 function colStyle() {
   const parts = ['--graph-w:' + currentGraphWidth() + 'px'];
   if (colWidths.content !== null) parts.push('--content-w:' + colWidths.content + 'px');
-  parts.push('--date-w:' + (colWidths.date !== null ? colWidths.date : DEFAULT_COL_W.date) + 'px');
-  parts.push('--author-w:' + (colWidths.author !== null ? colWidths.author : DEFAULT_COL_W.author) + 'px');
-  parts.push('--commit-w:' + (colWidths.commit !== null ? colWidths.commit : DEFAULT_COL_W.commit) + 'px');
+  for (const col of ['date', 'author', 'commit']) {
+    if (isColumnHidden(col)) continue;
+    parts.push('--' + col + '-w:' + (colWidths[col] !== null ? colWidths[col] : DEFAULT_COL_W[col]) + 'px');
+  }
   return parts.join(';');
 }
 
@@ -555,7 +727,7 @@ function fetchWindow() {
   if (start === -1) return; // everything we want is already cached
 
   const limit = Math.min(PAGE, rangeBottom - start + 1);
-  pendingWindowReqId = send({
+  sendWindow({
     GetWindow: {
       offset: start,
       limit,
@@ -612,11 +784,31 @@ const MIN_LANE_W = 1.5;
  * columns off-screen.
  */
 function graphWidthBudget() {
-  const fixedW = DEFAULT_COL_W.date + DEFAULT_COL_W.author + DEFAULT_COL_W.commit;
+  // Only count fixed columns still visible at this width: at narrow viewports
+  // the CSS grid drops commit/author/date (priority order), freeing their
+  // budget for the graph rail and Content instead of reserving phantom tracks.
+  const hidden = hiddenColumns();
+  let fixedW = 0;
+  for (const col of ['date', 'author', 'commit']) {
+    if (hidden.has(col)) continue;
+    fixedW += colWidths[col] !== null ? colWidths[col] : DEFAULT_COL_W[col];
+  }
   const rowsW = Math.max(1, rowsEl.clientWidth);
   const graphCap = Math.max(MIN_COL_W.graph, Math.floor(rowsW * GRAPH_MAX_FRACTION));
   const avail = Math.max(MIN_COL_W.graph, rowsW - fixedW - MIN_CONTENT_W);
   return Math.min(graphCap, avail);
+}
+
+/** Node-dot radius, compressed when the graph rail is dense.
+ *
+ * High-lane chains shrink lane spacing inside the fixed graph budget; the dot
+ * shrinks with it (down to a readable floor) so 20+ lanes read as a compact
+ * rail of distinct marks instead of an overlapping smear. Topology is
+ * untouched — lane centres still distribute monotonically across the column.
+ */
+function dotRadius() {
+  const spacing = graphLaneWidth();
+  return Math.max(1.5, Math.min(DOT_R, spacing / 2));
 }
 
 /** Effective per-lane pixel width.
@@ -756,7 +948,7 @@ function buildGraphCell(row) {
     // The node's own dot at its lane.
     const lane = row.lane || 0;
     const colour = COLORS[lane % COLORS.length];
-    s += `<circle class="graphDot" cx="${laneX(lane)}" cy="${midY}" r="${DOT_R}" fill="${colour}"/>`;
+    s += `<circle class="graphDot" cx="${laneX(lane)}" cy="${midY}" r="${dotRadius()}" fill="${colour}"/>`;
   }
   s += '</svg>';
   return s;
@@ -918,56 +1110,152 @@ function relationBadges(row) {
   return html;
 }
 
+/** Whitelisted concise labels for the `activity_kind` field.
+ *
+ * Keys are EXACTLY the Rust wire enum (crates/editchain-project/taxonomy.rs):
+ * conversation/plan/explore/execute/change/verify/diagnose/coordinate/
+ * source_control/external/system/unknown. `conversation` is the default
+ * activity and gets NO badge (keeps the content cell clean); `unknown` and
+ * any unrecognized wire value are ignored. Every rendered attribute (CSS
+ * class, text, title) comes from these constant labels — the wire value is
+ * only a lookup key — so an unknown or hostile activity_kind can never inject
+ * a class name or markup.
+ */
+const ACTIVITY_LABELS = {
+  plan: { cls: 'act-plan', text: 'plan' },
+  explore: { cls: 'act-explore', text: 'explore' },
+  execute: { cls: 'act-execute', text: 'run' },
+  change: { cls: 'act-change', text: 'change' },
+  verify: { cls: 'act-verify', text: 'verify' },
+  diagnose: { cls: 'act-diagnose', text: 'diagnose' },
+  coordinate: { cls: 'act-coordinate', text: 'coordinate' },
+  source_control: { cls: 'act-source-control', text: 'git' },
+  external: { cls: 'act-external', text: 'external' },
+  system: { cls: 'act-system', text: 'system' },
+};
+
+/** Whitelisted concise labels for the `outcome` field.
+ *
+ * Keys are EXACTLY the Rust wire enum: success/warning/failure/cancelled/
+ * unknown. `unknown` and any unrecognized wire value are ignored (never
+ * inferred from absence of evidence).
+ */
+const OUTCOME_LABELS = {
+  success: { cls: 'outcome-success', text: 'ok' },
+  warning: { cls: 'outcome-warning', text: 'warn' },
+  failure: { cls: 'outcome-failure', text: 'fail' },
+  cancelled: { cls: 'outcome-neutral', text: 'cancelled' },
+};
+
+/** Compact semantic activity badge ('' when the row is a plain message). */
+function activityBadge(row) {
+  const kind = row.activity_kind;
+  const label = Object.prototype.hasOwnProperty.call(ACTIVITY_LABELS, kind)
+    ? ACTIVITY_LABELS[kind]
+    : null;
+  if (!label) return '';
+  return '<span class="act-badge ' + label.cls + '" title="activity: ' + esc(kind) +
+    '" aria-label="activity: ' + esc(label.text) + '">' + esc(label.text) + '</span>';
+}
+
+/** Compact semantic outcome badge ('' when the row has no reported outcome). */
+function outcomeBadge(row) {
+  const outcome = row.outcome;
+  const label = Object.prototype.hasOwnProperty.call(OUTCOME_LABELS, outcome)
+    ? OUTCOME_LABELS[outcome]
+    : null;
+  if (!label) return '';
+  return '<span class="out-badge ' + label.cls + '" title="outcome: ' + esc(outcome) +
+    '" aria-label="outcome: ' + esc(label.text) + '">' + esc(label.text) + '</span>';
+}
+
+/** Short commit/ID display value for the Commit/ID column.
+ *
+ * Op IDs are removed from the default visual priority: an op row shows only a
+ * short turn id (or the tail of its op id) instead of the full raw string, so
+ * the Content column carries the visual weight. Git rows keep their
+ * abbreviated OID (already short).
+ */
+function shortCommitId(row) {
+  if (row.git_oid) return shortId(row.commit_id || row.git_oid);
+  if (row.is_subop) return shortId(row.op_id);
+  if (row.turn_id) return shortId(row.turn_id);
+  return shortId(row.commit_id || row.op_id);
+}
+
 /** Build one row's HTML from its cached HistoryRow. `absIdx` is its absolute index.
  *
  * Two kinds of rows:
- *   - Top-level rows carrying bundled sub-ops get a chevron affordance in their
- *     content cell; clicking toggles inline expansion (revealing one uniform
- *     ROW_H row per sub-op directly below).
+ *   - Top-level rows carrying bundled sub-ops get a chevron BUTTON in their
+ *     content cell; only that button toggles inline expansion (revealing one
+ *     uniform ROW_H row per sub-op directly below). Clicking the row itself
+ *     selects it in the inspector instead.
  *   - Sub-op rows (`row.is_subop`) render indented with a small Codicon; clicking
- *     opens their JSON editor.
+ *     selects them in the inspector.
  *
- * Every `.row` stays exactly ROW_H tall so virtual-scroll math is undisturbed.
+ * Accessibility: rows are focusable grid rows with aria-selected/aria-expanded,
+ * the chevron is a labelled button, truncated cells carry title tooltips, and
+ * the group boundary label is a visible (non-hover) short-ID chip. Every `.row`
+ * stays exactly ROW_H tall so virtual-scroll math is undisturbed.
  */
 function buildRowHtml(row, absIdx, isGroupStart) {
   const groupClass = isGroupStart ? ' row-group-start' : '';
   const groupLabel = isGroupStart
-    ? '<div class="group-label">' + esc(groupLabelText(row.group)) + '</div>'
+    ? '<div class="group-label" aria-hidden="true">' + esc(groupLabelText(row.group)) + '</div>'
     : '';
   const kindClass = row.is_system ? 'row-tool'
     : (row.kind === 'message' || row.kind === 'command') ? ''
     : 'row-dim';
   const humanClass = row.author === 'human' ? ' row-human' : '';
   const subopClass = row.is_subop ? ' row-subop' : '';
-  const badges = relationBadges(row);
+  const badges = relationBadges(row) + activityBadge(row) + outcomeBadge(row);
   // Badge rows are graph-topology-critical; the CSS override lifts their text
   // cells out of the tool/dim opacity dimming so the badge stays readable at
   // full strength (row height is untouched — the class only affects opacity).
   const relClass = badges ? ' row-has-badges' : '';
+  const selectedClass = row.node_key === selectedRowKey ? ' row-selected' : '';
+  const summaryText = row.summary || '(no summary)';
+  const hasSubs = !row.is_subop && hasSubOps(row);
+  const expanded = hasSubs && expandedBlocks.has(blockIndexOfAbs(absIdx));
+  const expandableAttr = hasSubs
+    ? ' aria-expanded="' + (expanded ? 'true' : 'false') + '"'
+    : '';
   let content;
   if (row.is_subop) {
     // A bundled sub-op expanded inline: small Codicon + indented summary.
     const icon = subopIcon(row.subop_kind);
     content = '<span class="subop-icon codicon codicon-' + icon + '" aria-hidden="true"></span>' +
-      '<span class="subop-summary">' + esc(row.summary || '(no summary)') + '</span>';
-  } else if (hasSubOps(row)) {
-    // Top-level combined op: chevron toggles inline expansion.
-    const expanded = expandedBlocks.has(blockIndexOfAbs(absIdx));
+      '<span class="subop-summary">' + esc(summaryText) + '</span>';
+  } else if (hasSubs) {
+    // Top-level combined op: the chevron BUTTON toggles inline expansion; the
+    // row itself is a normal inspector selection target.
     const chevron = expanded ? '▾' : '▸';
-    content = '<span class="subop-chevron" title="Expand metadata records">' + chevron + '</span>' +
-      badges + esc(row.summary || '(no summary)');
+    content = '<button type="button" class="subop-chevron" title="' +
+      (expanded ? 'Collapse bundled metadata records' : 'Expand bundled metadata records') +
+      '" aria-label="' + (expanded ? 'Collapse bundled metadata records' : 'Expand bundled metadata records') +
+      '"' + expandableAttr + '>' + chevron + '</button>' +
+      badges + esc(summaryText);
   } else {
-    content = badges + esc(row.summary || '(no summary)');
+    content = badges + esc(summaryText);
   }
-  return '<div class="row ' + kindClass + humanClass + subopClass + relClass + groupClass +
-    '" data-key="' + esc(row.node_key) +
+  const dateText = formatDate(row.timestamp_ms);
+  const authorText = row.author || '';
+  // Roving tabindex: exactly one row per rendered window is tabbable (the rest
+  // are focusable-but-not-tabbable so keyboard users step through the grid as
+  // a unit; see applyRovingTabindex and the ArrowUp/Down handling).
+  const rovingTab = absIdx === rovingAbs ? '0' : '-1';
+  return '<div class="row ' + kindClass + humanClass + subopClass + relClass + selectedClass + groupClass +
+    '" role="row" tabindex="' + rovingTab + '" aria-selected="' + (row.node_key === selectedRowKey ? 'true' : 'false') + '"' +
+    expandableAttr +
+    ' aria-label="' + esc(summaryText) + '" title="' + esc(summaryText) + '"' +
+    ' data-key="' + esc(row.node_key) +
     '" data-row="' + absIdx + '" style="' + colStyle() + '">' +
     groupLabel +
-    '<div class="graph-cell">' + buildGraphCell(row) + '</div>' +
-    '<div class="text-cell"><div class="summary">' + content + '</div></div>' +
-    '<div class="date-cell">' + esc(formatDate(row.timestamp_ms)) + '</div>' +
-    '<div class="author-cell">' + esc(row.author || '') + '</div>' +
-    '<div class="commit-cell">' + esc(row.commit_id || '') + '</div>' +
+    '<div class="graph-cell" role="gridcell">' + buildGraphCell(row) + '</div>' +
+    '<div class="text-cell" role="gridcell"><div class="summary" title="' + esc(summaryText) + '">' + content + '</div></div>' +
+    '<div class="date-cell" role="gridcell"' + (dateText ? ' title="' + esc(dateText) + '"' : '') + '>' + esc(dateText) + '</div>' +
+    '<div class="author-cell" role="gridcell"' + (authorText ? ' title="' + esc(authorText) + '"' : '') + '>' + esc(authorText) + '</div>' +
+    '<div class="commit-cell" role="gridcell" title="' + esc(row.commit_id || row.op_id || '') + '">' + esc(shortCommitId(row)) + '</div>' +
     '</div>';
 }
 
@@ -982,17 +1270,63 @@ function setWrapTop(top) {
   if (w) w.style.top = (top * ROW_H) + 'px';
 }
 
+/** Sync an existing row element's group-start chip (class + label) with
+ * `isGroupStart`, matching what buildRowHtml would produce. */
+function setGroupStart(el, row, isGroupStart) {
+  if (!el || !row) return;
+  const has = el.classList.contains('row-group-start');
+  if (isGroupStart && !has) {
+    el.classList.add('row-group-start');
+    const label = document.createElement('div');
+    label.className = 'group-label';
+    label.setAttribute('aria-hidden', 'true');
+    label.textContent = groupLabelText(row.group);
+    el.insertBefore(label, el.firstChild);
+  } else if (!isGroupStart && has) {
+    el.classList.remove('row-group-start');
+    const label = el.querySelector('.group-label');
+    if (label) label.remove();
+  }
+}
+
 /** Build the sticky header row HTML. The graph column's width is derived from
  * the current `maxLane`, so this must be re-run whenever `maxLane` changes
  * (e.g. when the first GetWindow response arrives after `open`). */
 function buildHeaderHtml() {
-  return '<div class="tbl-header" style="' + colStyle() + '">' +
-    '<div class="th graph">Graph</div>' +
-    '<div class="th content">Content</div>' +
-    '<div class="th date">Date</div>' +
-    '<div class="th author">Author</div>' +
-    '<div class="th commit">Commit/ID</div>' +
+  return '<div class="tbl-header" role="row" style="' + colStyle() + '">' +
+    '<div class="th graph" role="columnheader">' + graphColumnHeaderLabel() + '</div>' +
+    '<div class="th content" role="columnheader">Content</div>' +
+    '<div class="th date" role="columnheader">Date</div>' +
+    '<div class="th author" role="columnheader">Author</div>' +
+    '<div class="th commit" role="columnheader">Commit/ID</div>' +
     '</div>';
+}
+
+// Smallest graph-column width that renders the "Graph" columnheader label
+// without ellipsizing. Measured once from the first rendered header (after
+// fonts are loaded) so the threshold tracks the real webview font instead of a
+// hardcoded pixel guess.
+let graphLabelMinW = null;
+function graphColumnHeaderLabel() {
+  if (graphLabelMinW === null) {
+    const probe = document.createElement('div');
+    probe.className = 'th graph';
+    probe.style.cssText = 'position:absolute;visibility:hidden;left:-9999px;top:0;width:auto;';
+    probe.textContent = 'Graph';
+    document.body.appendChild(probe);
+    // scrollWidth includes the cell's horizontal padding, so it equals the
+    // smallest column width that shows the label unclipped.
+    graphLabelMinW = probe.scrollWidth;
+    probe.remove();
+  }
+  return currentGraphWidth() >= graphLabelMinW
+    ? 'Graph'
+    // A lane-narrow graph rail cannot fit the label (a 2-lane column renders
+    // ~36px while bold "Graph" needs ~65px); the text would clip to "G…".
+    // Render it as visually-hidden text instead so the columnheader keeps its
+    // accessible name with zero clipped visual text; once lanes widen the
+    // header rebuilds (maxLane change / viewport resize) and the label returns.
+    : '<span class="visually-hidden">Graph</span>';
 }
 
 /** Rebuild just the sticky header in place (no row rebuild) so its column
@@ -1024,11 +1358,12 @@ function reanchorTo(top, bottom) {
     if (isGroupStart) lastGroup = row.group;
     html += buildRowHtml(row, absIdx, isGroupStart);
   }
-  // Build the sticky header + spacer + wrap in one innerHTML pass. There is a
-  // SINGLE header, a direct child of #rows, so its `position: sticky; top: 0`
-  // sticks to the #rows viewport and stays at the top while scrolling. It must
-  // NOT live inside .table-wrap (which is positioned at renderTop*ROW_H and moves
-  // with scroll) — a header there would scroll with content and appear mid-table.
+  // Build the grid wrapper (sticky header + spacer + wrap) in one innerHTML
+  // pass. There is a SINGLE header, inside the labelled .tbl-grid wrapper but
+  // OUTSIDE .table-wrap, so `position: sticky; top: 0` still sticks to the
+  // #rows viewport and stays at the top while scrolling. It must NOT live
+  // inside .table-wrap (which is positioned at renderTop*ROW_H and moves with
+  // scroll) — a header there would scroll with content and appear mid-table.
   const spacerH = Math.max(1, visibleTotal() * ROW_H);
   const headerHtml = buildHeaderHtml();
   // Non-blocking chain-data warnings (Open response) sit above the table.
@@ -1040,39 +1375,185 @@ function reanchorTo(top, bottom) {
   // Search results get a compact banner so the mode is explicit and the user
   // can tell the flat result list apart from the full history window.
   const bannerHtml = searchMode
-    ? '<div class="search-banner">' + esc(String(total)) + ' result' +
+    ? '<div class="search-banner" role="status" aria-live="polite">' + esc(String(total)) + ' result' +
       (total === 1 ? '' : 's') + ' for "' + esc(searchQuery) + '"</div>'
     : '';
+  // The table is ONE labelled grid containing BOTH the sticky header row (its
+  // columnheaders must live inside the same role=grid as the data rows —
+  // ARIA forbids orphaned row/columnheader roles) and the virtualized rows.
+  // The header stays a sibling of the scroll spacer inside the grid wrapper so
+  // position:sticky keeps working exactly as before, and .table-wrap is demoted
+  // to role=presentation (pure positioning layer between the grid and its rows).
+  const gridHtml =
+    '<div class="tbl-grid" role="grid" aria-label="History rows" aria-rowcount="' +
+      visibleTotal() + '">' +
+      headerHtml +
+      '<div class="scroll-spacer" role="presentation" style="height:' + spacerH + 'px">' +
+        '<div class="table-wrap" role="presentation" style="top:' + (top * ROW_H) + 'px;' + colStyle() + '">' +
+          html +
+        '</div>' +
+      '</div>' +
+    '</div>';
   // Preserve the scroll position across the DOM rebuild (setting innerHTML
   // resets scrollTop to 0).
   const prevScrollTop = rowsEl.scrollTop;
+  // Preserve focus too: rebuilds happen not only on jumps but on the debounced
+  // width recompute (inspector open/close resizes #rows), and silently
+  // blurring the focused row mid-interaction is a keyboard-UX regression. If a
+  // row (or a control inside it) had focus, restore focus to the rebuilt row
+  // at the same absolute index; a scrolled-away or absent row is skipped
+  // (applyRovingTabindex re-arms the anchor to the first rendered row).
+  const activeEl = document.activeElement;
+  const activeRowEl = activeEl && activeEl.closest ? activeEl.closest('.row') : null;
+  const focusedAbs = activeRowEl && rowsEl.contains(activeRowEl)
+    ? parseInt(activeRowEl.getAttribute('data-row'), 10)
+    : null;
   rowsEl.innerHTML =
     warningHtml +
     bannerHtml +
-    headerHtml +
-    '<div class="scroll-spacer" style="height:' + spacerH + 'px">' +
-      '<div class="table-wrap" style="top:' + (top * ROW_H) + 'px;' + colStyle() + '">' +
-        html +
-      '</div>' +
-    '</div>';
+    gridHtml;
   rowsEl.scrollTop = prevScrollTop;
+  // Rows were just (re)built from scratch — re-apply the single-tabbable-row
+  // invariant, restore focus to the previously-focused row when it is still
+  // rendered, then wire the new DOM's row interactions.
+  applyRovingTabindex();
+  if (focusedAbs !== null) {
+    const restored = rowsEl.querySelector('.row[data-row="' + focusedAbs + '"]');
+    if (restored) {
+      rovingAbs = focusedAbs;
+      applyRovingTabindex();
+      // preventScroll: this is a REBUILD, not navigation — restoring focus to
+      // the previously-focused row must never scroll it into view (that would
+      // yank the user's scroll position on an inspector open/close resize).
+      restored.focus({ preventScroll: true });
+    }
+  }
   // No graph refresh needed: each row's graph cell is built into its HTML, so
   // the rebuilt DOM already contains the correct per-row graph.
   attachRowClicks();
+}
+
+/** Enforce the roving-tabindex invariant over the currently rendered window:
+ * exactly one row is tabbable, all others are focusable but skipped in tab
+ * order (tabindex -1). Runs after every render mutation so the invariant
+ * survives virtualization (reanchorTo rebuilds the whole window, the additive
+ * append/prepend/trim helpers mutate its edges, and far jumps replace it).
+ *
+ * The anchor is tracked by ABSOLUTE row index (it must survive DOM rebuilds).
+ * When the anchor isn't rendered — the very first render, or after virtual
+ * scrolling trimmed/scrolled it away — it falls back to the first rendered row
+ * so the grid always has exactly one tab stop to land on.
+ */
+function applyRovingTabindex() {
+  const w = wrapEl();
+  if (!w) return;
+  const rows = Array.from(w.querySelectorAll('.row'));
+  if (!rows.length) return;
+  let current = rows.find((r) => parseInt(r.getAttribute('data-row'), 10) === rovingAbs);
+  if (!current) {
+    current = rows[0];
+    rovingAbs = parseInt(current.getAttribute('data-row'), 10);
+  }
+  for (const r of rows) {
+    const absIdx = parseInt(r.getAttribute('data-row'), 10);
+    r.tabIndex = absIdx === rovingAbs ? 0 : -1;
+  }
+}
+
+/** Toggle inline sub-op expansion for a top-level combined row, rebuilding the
+ * bounded visible window so newly revealed sub-op slots fill the viewport. */
+function toggleExpandFor(row, absIdx) {
+  if (row.is_subop || !hasSubOps(row)) return;
+  if (toggleExpanded(absIdx)) {
+    // Reveal state changed — rebuild the FULL desired visible window. Using
+    // the old [renderTop, renderBottom] here only re-renders the pre-expansion
+    // slice, so just the first sub-op slot(s) appear and the rest of the
+    // viewport stays blank (ensureFilled finds nothing to fetch — the rows
+    // are already cached). The desired range is in visible space, so it
+    // expands to cover every newly revealed sub-op row.
+    reanchorTo(desiredVisibleRange().top, desiredVisibleRange().bottom);
+    ensureFilled();
+  }
 }
 
 function attachRowClicks() {
   const w = wrapEl();
   if (!w) return;
   w.querySelectorAll('.row').forEach((el) => {
+    // The chevron is the ONLY control that toggles bundled sub-ops; an
+    // ordinary row click selects the row in the inspector instead.
+    const chevron = el.querySelector('.subop-chevron');
+    if (chevron) {
+      chevron.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const absIdx = parseInt(el.getAttribute('data-row'), 10);
+        const row = cache.get(absIdx);
+        if (row) toggleExpandFor(row, absIdx);
+      });
+    }
     el.addEventListener('click', () => {
-      const key = el.getAttribute('data-key');
       const absIdx = parseInt(el.getAttribute('data-row'), 10);
       const row = cache.get(absIdx);
       if (row) inspect(row, absIdx);
     });
   });
 }
+
+// Keyboard activation: ArrowUp/Down move focus between rendered rows (roving
+// tabindex — only the current row is in the tab order, so Tab enters/exits the
+// grid as a unit instead of tabbing through every virtualized row); Enter
+// selects/inspects the focused row; Space toggles bundled sub-ops when the row
+// has them (chevron behaviour), else selects. The chevron button handles its
+// own Enter/Space via native button activation (we skip events originating
+// inside it to avoid a double toggle).
+rowsEl.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    // Move the roving focus to the adjacent rendered row. Stops at the rendered
+    // window edge (no wrap/auto-scroll): scrolling beyond it re-arms the roving
+    // anchor via applyRovingTabindex, so large-list navigation is unchanged.
+    const w = wrapEl();
+    if (!w) return;
+    const rows = Array.from(w.querySelectorAll('.row'));
+    if (!rows.length) return;
+    const cur = e.target.closest('.row');
+    const curIdx = cur ? rows.indexOf(cur) : -1;
+    const nextIdx = e.key === 'ArrowDown' ? curIdx + 1 : curIdx - 1;
+    if (nextIdx < 0 || nextIdx >= rows.length) return;
+    e.preventDefault();
+    const target = rows[nextIdx];
+    rovingAbs = parseInt(target.getAttribute('data-row'), 10);
+    applyRovingTabindex();
+    target.focus();
+    return;
+  }
+  if (e.key !== 'Enter' && e.key !== ' ') return;
+  if (e.target.closest('button')) return; // native button activation handles it
+  const el = e.target.closest('.row');
+  if (!el) return;
+  e.preventDefault();
+  const absIdx = parseInt(el.getAttribute('data-row'), 10);
+  const row = cache.get(absIdx);
+  if (!row) return;
+  if (e.key === ' ' && hasSubOps(row) && !row.is_subop) {
+    toggleExpandFor(row, absIdx);
+    return;
+  }
+  inspect(row, absIdx);
+});
+
+// Any row that receives focus (Tab entry, programmatic focus, pointer) becomes
+// the roving anchor: re-pin the single tab stop to it so the invariant tracks
+// where the user actually is in the virtualized list.
+rowsEl.addEventListener('focusin', (e) => {
+  const el = e.target.closest ? e.target.closest('.row') : null;
+  if (!el) return;
+  const absIdx = parseInt(el.getAttribute('data-row'), 10);
+  if (Number.isFinite(absIdx) && absIdx !== rovingAbs) {
+    rovingAbs = absIdx;
+    applyRovingTabindex();
+  }
+});
 
 /** Append rows [renderBottom+1, renderBottom+n] to the bottom of the window.
  * Only extends CONTIGUOUSLY: if the immediate next VISIBLE row isn't cached yet,
@@ -1085,7 +1566,12 @@ function appendRowsBelow(n) {
   let html = '';
   let lastGroup = null;
   // Group continuity from the last currently-rendered row.
-  const lastRowEl = w.querySelector('.row:last-child');
+  // NOTE: `.row:last-child` is NOT reliable here — .table-wrap's last children
+  // are the absolutely-positioned column-resize handles, so a row is never the
+  // last child and the lookup returns null (making the first appended row look
+  // like a group start). Take the last element that is actually a row instead.
+  const rowEls = w.querySelectorAll('.row');
+  const lastRowEl = rowEls.length ? rowEls[rowEls.length - 1] : null;
   if (lastRowEl) {
     const lastAbs = parseInt(lastRowEl.getAttribute('data-row'), 10);
     const lastRow = cache.get(lastAbs);
@@ -1105,6 +1591,7 @@ function appendRowsBelow(n) {
   }
   if (added && html) {
     w.insertAdjacentHTML('beforeend', html);
+    applyRovingTabindex();
     attachRowClicks();
   }
 }
@@ -1116,20 +1603,20 @@ function prependRowsAbove(n) {
   if (n <= 0 || renderTop <= 0) return;
   const w = wrapEl();
   if (!w) return;
-  // Build bottom-up so group-start detection matches reanchorTo/appendRowsBelow:
-  // a row is a group-start if its group differs from the row ABOVE it.
+  // Build TOP-DOWN, exactly like reanchorTo: a row is a group-start when its
+  // group differs from the row ABOVE it, so the chip lands on the FIRST
+  // (newest) row of a run. Iterating bottom-up instead made the chip stick to
+  // the run's LAST (oldest) row — prepending across a boundary moved a group's
+  // label from its true start (e.g. row 100) down to the row below it (99).
+  // The topmost prepended row is marked unconditionally (prevGroup starts
+  // null), matching reanchorTo's "first rendered row of the window" rule, so
+  // chip positions are identical before/after a full rebuild.
   let prevGroup = null;
-  // Group continuity from the first currently-rendered row (the row just below
-  // the new topmost prepended row).
-  const firstRowEl = w.querySelector('.row:first-child');
-  if (firstRowEl) {
-    const firstAbs = parseInt(firstRowEl.getAttribute('data-row'), 10);
-    const firstRow = cache.get(firstAbs);
-    if (firstRow) prevGroup = firstRow.group;
-  }
   let html = '';
   let added = 0;
-  for (let vis = renderTop - 1; vis >= Math.max(0, renderTop - n); vis--) {
+  const oldTop = renderTop;
+  const topVis = renderTop - 1;
+  for (let vis = Math.max(0, topVis - n + 1); vis <= topVis; vis++) {
     const absIdx = absIndexForVisible(vis);
     if (absIdx === null) continue; // hidden slot — skip
     const row = cache.get(absIdx);
@@ -1144,6 +1631,22 @@ function prependRowsAbove(n) {
     w.insertAdjacentHTML('afterbegin', html);
     // Shift the wrap down by the number of rows added so content stays put.
     setWrapTop(renderTop);
+    // The row that used to be the window's FIRST rendered row may carry a
+    // group-start chip that was only justified by the old window edge (a
+    // mid-group reanchor marks the top row unconditionally). With real rows
+    // now above it, re-evaluate that chip against its new previous sibling so
+    // prepending same-group rows never leaves a duplicate stale boundary.
+    const boundaryAbs = absIndexForVisible(oldTop);
+    const boundaryEl = w.querySelector('.row[data-row="' + boundaryAbs + '"]');
+    if (boundaryEl) {
+      const prevEl = boundaryEl.previousElementSibling;
+      const prevRow = prevEl ? cache.get(parseInt(prevEl.getAttribute('data-row'), 10)) : null;
+      const boundaryRow = cache.get(boundaryAbs);
+      if (prevRow && boundaryRow) {
+        setGroupStart(boundaryEl, boundaryRow, boundaryRow.group !== prevRow.group);
+      }
+    }
+    applyRovingTabindex();
     attachRowClicks();
   }
 }
@@ -1169,6 +1672,7 @@ function fillPlaceholders() {
     changed = true;
   });
   if (changed) {
+    applyRovingTabindex();
     attachRowClicks();
   }
 }
@@ -1188,6 +1692,7 @@ function trimTop(keepTop) {
   }
   renderTop += removed;
   setWrapTop(renderTop);
+  applyRovingTabindex();
 }
 
 /** Remove rows below `keepBottom` from the bottom of the window. `keepBottom` is a
@@ -1203,6 +1708,7 @@ function trimBottom(keepBottom) {
     if (el) el.remove();
   }
   renderBottom -= removed;
+  applyRovingTabindex();
 }
 
 /**
@@ -1265,52 +1771,148 @@ function progressiveLoad() {
   syncWindow();
 }
 
+/** Mark the row as the inspector selection (DOM + state). Rows are rebuilt by
+ * virtual scroll, so `buildRowHtml` also re-applies the selected class from
+ * `selectedRowKey` on every render. */
+function selectRow(row, absIdx) {
+  const w = wrapEl();
+  if (w) {
+    const prev = w.querySelector('.row-selected');
+    if (prev && prev !== w.querySelector('.row[data-row="' + absIdx + '"]')) {
+      prev.classList.remove('row-selected');
+      prev.setAttribute('aria-selected', 'false');
+    }
+    const cur = w.querySelector('.row[data-row="' + absIdx + '"]');
+    if (cur) {
+      cur.classList.add('row-selected');
+      cur.setAttribute('aria-selected', 'true');
+    }
+  }
+  selectedRowKey = row.node_key;
+}
+
+/** Inspect a row in the master-detail inspector.
+ *
+ * An ordinary row click selects the row and requests its details
+ * (GetNodeDetails for ops, ResolveObject for git commits) into the inspector
+ * pane — it NEVER opens an editor tab. Bundled sub-ops are toggled only by the
+ * chevron button (or Space on the row). Sub-op rows have no graph node of
+ * their own; they render their local summary and offer explicit raw-JSON
+ * navigation.
+ */
 function inspect(row, absIdx) {
   console.log('[editchain] inspect', row && row.node_key);
-  // A sub-op row opens its JSON editor directly.
-  if (row.is_subop) {
-    if (row.op_id) vscode.postMessage({ type: 'openJson', op_id: row.op_id });
-    return;
-  }
-  // A top-level combined op toggles inline expansion (revealing one uniform
-  // ROW_H row per bundled sub-op directly below).
-  if (hasSubOps(row)) {
-    if (toggleExpanded(absIdx)) {
-      // Reveal state changed — rebuild the FULL desired visible window. Using
-      // the old [renderTop, renderBottom] here only re-renders the pre-expansion
-      // slice, so just the first sub-op slot(s) appear and the rest of the
-      // viewport stays blank (ensureFilled finds nothing to fetch — the rows
-      // are already cached). The desired range is in visible space, so it
-      // expands to cover every newly revealed sub-op row.
-      reanchorTo(desiredVisibleRange().top, desiredVisibleRange().bottom);
-      ensureFilled();
-    }
-    return;
-  }
-  // Ask the extension host to open a read-only JSON editor for this node.
+  selectRow(row, absIdx);
+  detailRow = row;
+  detailEpoch++;
+  const epoch = detailEpoch;
+  showDetailLoading(row);
   if (row.git_oid) {
-    vscode.postMessage({ type: 'openJson', git_oid: row.git_oid, repository: row.repository });
+    sendDetail({ ResolveObject: { repository: row.repository, oid: row.git_oid } }, epoch);
   } else if (row.op_id) {
-    vscode.postMessage({ type: 'openJson', op_id: row.op_id });
+    sendDetail({ GetNodeDetails: { op_id: row.op_id } }, epoch);
+  } else {
+    renderDetails({ summary: row.summary || '', body: '' }, row);
   }
 }
 
-/** Hide the detail pane (e.g. on reset/search). */
+/** Hide the detail pane (e.g. on reset/search/close) and clear selection. */
 function clearDetail() {
+  detailEpoch++;
+  detailReqs.clear();
   layoutEl.classList.remove('has-detail');
   detailEl.innerHTML = '';
+  selectedRowKey = null;
+  detailRow = null;
+  const w = wrapEl();
+  if (w) {
+    const prev = w.querySelector('.row-selected');
+    if (prev) {
+      prev.classList.remove('row-selected');
+      prev.setAttribute('aria-selected', 'false');
+    }
+  }
 }
 
-/** Render node details in the inspector pane. */
-function renderDetails(details) {
+/** Show the inspector loading state with the row's own summary as title. */
+function showDetailLoading(row) {
+  layoutEl.classList.add('has-detail');
+  detailEl.innerHTML = '';
+  const titleEl = document.createElement('div');
+  titleEl.className = 'detail-title';
+  titleEl.textContent = (row && row.summary) || '(no summary)';
+  detailEl.appendChild(titleEl);
+  const loading = document.createElement('div');
+  loading.className = 'detail-loading';
+  loading.setAttribute('role', 'status');
+  loading.textContent = 'Loading details…';
+  detailEl.appendChild(loading);
+}
+
+/** Render a detail error into the open inspector. */
+function renderDetailError(text) {
+  if (layoutEl.classList.contains('has-detail')) {
+    detailEl.innerHTML = '<div class="detail-title">Error</div>' +
+      '<pre class="detail-body">' + esc(text) + '</pre>';
+  }
+}
+
+/** Render node details in the inspector pane with Close + raw-JSON actions. */
+function renderDetails(details, row) {
   try {
     detailEl.innerHTML = '';
+    const rowForActions = row || detailRow;
+    const head = document.createElement('div');
+    head.className = 'detail-head';
     const titleEl = document.createElement('div');
     titleEl.className = 'detail-title';
-    titleEl.textContent = details.summary || '(no summary)';
-    detailEl.appendChild(titleEl);
+    titleEl.textContent = (details && details.summary) ||
+      (rowForActions && rowForActions.summary) || '(no summary)';
+    head.appendChild(titleEl);
+    const metaEl = document.createElement('div');
+    metaEl.className = 'detail-meta';
+    const parts = [];
+    if (rowForActions) {
+      if (rowForActions.git_oid) {
+        parts.push('commit ' + shortCommitId(rowForActions));
+      } else if (rowForActions.op_id) {
+        parts.push('op ' + shortId(rowForActions.op_id));
+      }
+      if (rowForActions.activity_kind) parts.push(String(rowForActions.activity_kind));
+      if (rowForActions.record_role) parts.push(String(rowForActions.record_role));
+      if (rowForActions.outcome) parts.push(String(rowForActions.outcome));
+      if (rowForActions.turn_id) parts.push('turn ' + shortId(rowForActions.turn_id));
+      if (rowForActions.timestamp_ms) parts.push(formatDate(rowForActions.timestamp_ms));
+    }
+    metaEl.textContent = parts.join(' · ');
+    head.appendChild(metaEl);
+    detailEl.appendChild(head);
 
-    if (details.body) {
+    const actions = document.createElement('div');
+    actions.className = 'detail-actions';
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'detail-btn';
+    closeBtn.textContent = 'Close';
+    closeBtn.addEventListener('click', () => clearDetail());
+    actions.appendChild(closeBtn);
+    const openBtn = document.createElement('button');
+    openBtn.type = 'button';
+    openBtn.className = 'detail-btn';
+    openBtn.textContent = 'Open raw JSON';
+    openBtn.disabled = !rowForActions || (!rowForActions.op_id && !rowForActions.git_oid);
+    openBtn.addEventListener('click', () => {
+      // The ONLY path that opens an editor tab: an explicit user action.
+      if (rowForActions.git_oid) {
+        vscode.postMessage({ type: 'openJson', git_oid: rowForActions.git_oid, repository: rowForActions.repository });
+      } else if (rowForActions.op_id) {
+        vscode.postMessage({ type: 'openJson', op_id: rowForActions.op_id });
+      }
+    });
+    actions.appendChild(openBtn);
+    detailEl.appendChild(actions);
+
+    if (details && details.body) {
       const bodyEl = document.createElement('pre');
       bodyEl.className = 'detail-body';
       bodyEl.textContent = details.body;
@@ -1380,7 +1982,14 @@ window.addEventListener('message', (event) => {
         showViewMessage('No history found in this workspace', false);
         return;
       }
-      const restoredTopRow = restoreState();
+      const restored = restoreState();
+      // Apply the persisted profile (Activity/Raw) BEFORE the first fetch so
+      // the offset-0 window is requested with the right hide_trace flag.
+      // `persist:false` keeps this from writing the still-unrestored viewport
+      // (scrollTop is 0 here — the spacer isn't built yet), which would
+      // clobber the persisted topRow this restore is about to apply. The
+      // actually-restored position is persisted right after restoreScrollTop.
+      setProfile(restored.profile, { reset: false, persist: false });
       // Reanchor to the viewport window for the CURRENT (un-scrolled) position
       // first, so the spacer exists and has real height. Rows may not be cached
       // yet — GetWindow responses will append them in.
@@ -1389,11 +1998,16 @@ window.addEventListener('message', (event) => {
       // Now that the scaffold is built, restore the persisted scroll offset
       // (previously this set scrollTop before reanchor — before the spacer
       // existed — so it clamped to 0 and the position was lost).
-      if (restoredTopRow > 0) {
-        restoreScrollTop(restoredTopRow);
+      if (restored.topRow > 0) {
+        restoreScrollTop(restored.topRow);
       } else {
         rowsEl.scrollTop = 0;
       }
+      // Persist the actually-restored viewport now that the scaffold is real.
+      // This is the ONLY open-path save: any earlier saveState() would write
+      // the pre-restore scrollTop (0) and lose the saved position on a real
+      // context recreation.
+      saveState();
       // Start the background progressive loader so history buffers ahead of the
       // scroll position without waiting for scroll events.
       startProgressiveLoader();
@@ -1416,7 +2030,10 @@ window.addEventListener('message', (event) => {
   // recreated context. Current hosts retain ordinary hidden contexts and use
   // the instance-aware `webviewReady` handshake for genuine recreation.
   if (msg.id === 'reveal') {
-    const restoredTopRow = restoreState();
+    const restored = restoreState();
+    // persist:false — same contract as the open handler (never write the
+    // pre-restore viewport into persisted state during initialization).
+    setProfile(restored.profile, { reset: false, persist: false });
     // The revealed webview is a fresh context, but be safe: start a new view
     // generation and force the offset-0 snapshot so expansion counts are
     // established before any deep restore window loads.
@@ -1424,15 +2041,19 @@ window.addEventListener('message', (event) => {
     snapshotEstablished = false;
     subOpCounts = [];
     recomputeExpansion();
-    vscode.postMessage({ type: 'log', text: 'reveal: topRow=' + restoredTopRow + ' total=' + total });
+    vscode.postMessage({ type: 'log', text: 'reveal: topRow=' + restored.topRow + ' total=' + total });
     setTimeout(() => {
       fetchWindow();
       reanchorTo(desiredVisibleRange().top, desiredVisibleRange().bottom);
       // Restore the persisted scroll offset after the scaffold is rebuilt so the
-      // scroll range is real (same fix as the open handler).
-      if (restoredTopRow > 0) {
-        restoreScrollTop(restoredTopRow);
+      // scroll range is real (same fix as the open handler), then persist the
+      // actually-restored viewport.
+      if (restored.topRow > 0) {
+        restoreScrollTop(restored.topRow);
+      } else {
+        rowsEl.scrollTop = 0;
       }
+      saveState();
       startProgressiveLoader();
     }, 50);
     return;
@@ -1498,11 +2119,18 @@ window.addEventListener('message', (event) => {
       });
       return;
     }
-    // Non-window/non-search request errors (e.g. detail fetches) keep the
-    // detail-pane behaviour.
+    // Detail-fetch errors are epoch-guarded like their responses: a stale
+    // error from an earlier row click must never overwrite the current row's
+    // inspector.
+    const detailEpochForReq = detailReqs.get(msg.id);
+    if (detailEpochForReq !== undefined) {
+      detailReqs.delete(msg.id);
+      if (detailEpochForReq === detailEpoch) renderDetailError(errText);
+      return;
+    }
+    // Non-window/non-search request errors keep the detail-pane behaviour.
     if (layoutEl.classList.contains('has-detail')) {
-      detailEl.innerHTML = '<div class="detail-title">Error</div>' +
-        '<pre class="detail-body">' + esc(errText) + '</pre>';
+      renderDetailError(errText);
     }
     return;
   }
@@ -1572,6 +2200,10 @@ window.addEventListener('message', (event) => {
     // been rendered (placeholders replaced). The harness waits on this signal
     // so "idle" never means a placeholder-filled DOM.
     window.__editchainDataReady = true;
+    if (!announcedInitialLoad && total > 0) {
+      announcedInitialLoad = true;
+      announce('Loaded ' + visibleTotal() + ' history rows');
+    }
     if (cache.size === 0 && total === 0) {
       // Replace the unfillable placeholder with an explicit empty state.
       showViewMessage('No history rows', false);
@@ -1582,7 +2214,7 @@ window.addEventListener('message', (event) => {
     if (!responseLayoutReady && req.body.GetWindow.include_layout === false) {
       // Paint is complete. Now ask the service to perform the O(V) geometry
       // pass and replace exactly this bounded page when it returns.
-      pendingWindowReqId = send({
+      sendWindow({
         GetWindow: {
           offset: req.body.GetWindow.offset,
           limit: req.body.GetWindow.limit,
@@ -1598,22 +2230,23 @@ window.addEventListener('message', (event) => {
     return;
   }
 
-  // NodeDetails response (GetNodeDetails) — has summary + body.
-  if (typeof r.value.summary === 'string') {
-    console.log('[editchain] got details', r.value.summary.slice(0, 40));
-    renderDetails(r.value);
-    return;
-  }
-  // Git commit response (ResolveObject) — has message + oid.
-  if (r.value && r.value.message !== undefined) {
-    console.log('[editchain] got commit');
-    const msg = typeof r.value.message === 'string' ? r.value.message : '';
-    renderDetails({
-      summary: msg || '(no message)',
-      body: msg,
-      refs: [],
-      changed_paths: [],
-    });
+  // Detail responses (GetNodeDetails / ResolveObject) are routed by request id
+  // to the row they were requested for; only the LATEST detail epoch renders,
+  // so rapid row clicks can never let an older response overwrite a newer one.
+  const detailEpochForReq = detailReqs.get(msg.id);
+  if (detailEpochForReq !== undefined) {
+    detailReqs.delete(msg.id);
+    if (detailEpochForReq !== detailEpoch) return; // stale (rapid clicks)
+    if (typeof r.value.summary === 'string') {
+      console.log('[editchain] got details', r.value.summary.slice(0, 40));
+      renderDetails(r.value, detailRow);
+    } else if (r.value && r.value.message !== undefined) {
+      console.log('[editchain] got commit');
+      const msgText = typeof r.value.message === 'string' ? r.value.message : '';
+      renderDetails({ summary: msgText || '(no message)', body: msgText }, detailRow);
+    } else {
+      renderDetails(r.value, detailRow);
+    }
     return;
   }
 });
@@ -1713,6 +2346,7 @@ function renderSearchResults(hits) {
   } else {
     reanchorTo(0, Math.max(0, total - 1));
   }
+  announce(String(total) + ' result' + (total === 1 ? '' : 's') + ' for "' + searchQuery + '"');
   window.__editchainDataReady = true;
   vscode.postMessage({ type: 'log', text: `search: ${total} result(s)` });
   reportStatus();
@@ -1741,6 +2375,18 @@ function resetHistory() {
   renderBottom = -1;
   rowsEl.scrollTop = 0;
   clearDetail();
+  // The previous view's DOM rows belong to the OLD generation: leaving them in
+  // place until the new window arrives would let them stay interactive (and
+  // satisfy harness/e2e readiness) while the cache/total no longer back them —
+  // e.g. a profile switch with a delayed GetWindow: readiness sees rows with no
+  // placeholders, then Enter targets a stale `.row` whose absolute index is
+  // absent from the cleared cache and the inspector never opens. Drop the grid
+  // for an explicit loading state and clear readiness BEFORE the new fetch, so
+  // no stale row is visible, focusable, or selectable while the new view is in
+  // flight.
+  window.__editchainDataReady = false;
+  rovingAbs = -1;
+  showViewMessage('Loading history…', false);
   fetchWindow();
 }
 
@@ -1771,6 +2417,30 @@ searchEl.addEventListener('input', () => {
     resetHistory();
   }
 });
+
+// Activity/Raw profile control. Switching resets the view coherently: the
+// search exits, the view generation bumps (stale windows from the old profile
+// are rejected), the expansion snapshot and cache drop, and history refetches
+// from offset 0 under the new hide_trace flag.
+if (profileActivityBtn) {
+  profileActivityBtn.addEventListener('click', () => setProfile('activity', { reset: true }));
+}
+if (profileRawBtn) {
+  profileRawBtn.addEventListener('click', () => setProfile('raw', { reset: true }));
+}
+syncProfileButtons();
+
+// Harness-only debug hooks (not production behaviour): let probes/e2e switch
+// the profile through the real control path and read the active profile.
+window.__editchainSetProfile = function (name) {
+  setProfile(name, { reset: true });
+};
+window.__editchainGetProfile = function () {
+  return profile;
+};
+window.__editchainHideTrace = function () {
+  return hideTrace();
+};
 
 // Background progressive loader: keeps fetching history ahead of the scroll
 // position on a timer, so the user never waits on an in-flight fetch. It runs
@@ -1814,6 +2484,27 @@ window.addEventListener('resize', () => {
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(onViewportResize, 150);
 });
+
+// The detail/inspector pane is a flex sibling of #rows: opening or closing it
+// resizes #rows WITHOUT a window resize event, so the window listener alone
+// would leave the graph column and inline widths sized for the pre-open width
+// (stale geometry). Observe #rows' content-box width and re-run the same
+// debounced recompute whenever it changes. Height-only notifications are
+// ignored: the rows viewport height is flex-fixed, and re-rendering on height
+// changes would loop (reanchorTo rebuilds the spacer, which can alter
+// scrollbar presence, which can in turn nudge clientWidth once — that one
+// real width change is exactly what we want to react to).
+let lastRowsWidth = rowsEl.clientWidth;
+if (typeof ResizeObserver === 'function') {
+  new ResizeObserver((entries) => {
+    const entry = entries && entries[0];
+    const w = entry ? entry.contentRect.width : rowsEl.clientWidth;
+    if (Math.abs(w - lastRowsWidth) < 0.5) return;
+    lastRowsWidth = w;
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(onViewportResize, 150);
+  }).observe(rowsEl);
+}
 
 /** Rebuild the layout after a viewport resize.
  *
@@ -1882,8 +2573,15 @@ function setupColumnResizeHandle(wrapEl, col, boundaryX) {
   handle.className = 'col-resize-handle';
   handle.dataset.col = col;
   handle.title = 'Drag to resize ' + col + ' column';
-  // Center the 6px handle on the column's right boundary.
-  handle.style.left = (boundaryX - 3) + 'px';
+  // Center the 6px handle on the column's right boundary, but never let it
+  // extend past the container's right edge: the last visible column's boundary
+  // sits exactly at the container edge, so centering there would hang 3px past
+  // it and add phantom horizontal scroll (scrollW = clientW + 3) with no real
+  // overflow. When the boundary is BEYOND the container (a column dragged wider
+  // than the viewport), the handle pins to the edge while the columns keep
+  // their genuine overflow — nothing is masked.
+  const wrapW = wrapEl.clientWidth;
+  handle.style.left = Math.min(boundaryX - 3, Math.max(0, wrapW - 6)) + 'px';
   wrapEl.appendChild(handle);
 
   let dragging = false;
@@ -1947,6 +2645,9 @@ function setupColumnResizeHandles() {
   if (!header) return;
   const cols = ['graph', 'content', 'date', 'author', 'commit'];
   for (const col of cols) {
+    // Columns dropped at narrow widths have no visible boundary — a handle
+    // there would pile onto the adjacent column's edge and mislead the drag.
+    if (isColumnHidden(col)) continue;
     const th = header.querySelector('.th.' + col);
     if (!th) continue;
     setupColumnResizeHandle(wrapEl, col, th.offsetLeft + th.offsetWidth);
@@ -1995,5 +2696,15 @@ window.__editchainGetTotal = function () {
 // is a no-op).
 window.__editchainInFlightCount = function () {
   return inFlight.size;
+};
+window.__editchainViewGen = function () {
+  return viewGen;
+};
+window.__editchainDetailState = function () {
+  return {
+    detailEpoch,
+    detailRowKey: detailRow ? detailRow.node_key : null,
+    pendingDetailReqs: Array.from(detailReqs.entries()),
+  };
 };
 window.__editchainProgressiveTimerActive = false;

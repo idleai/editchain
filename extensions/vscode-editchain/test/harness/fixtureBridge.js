@@ -31,6 +31,8 @@
   // server-side filtering for the harness). Returns { rows, hiddenKeys }.
   //
   // Semantics are exactly the service's ChainFilter:
+  //   - hide_trace hides every row whose visibility is "trace" unconditionally
+  //     (internal trace records disappear entirely — no endpoint preservation);
   //   - hide_undated hides every undated row unconditionally (including leaves);
   //   - include_kind_pattern is an INCLUSIVE constraint: when set, only rows
   //     whose kind matches are kept — every non-matching kind is excluded
@@ -70,6 +72,10 @@
       // Clone before any splice mutation: applyFilter must be idempotent —
       // GetWindow and GetLayout each run their own pass over the same rows.
       const row = { ...r, parents: Array.isArray(r.parents) ? r.parents.slice() : [] };
+      if (filter.hide_trace && r.visibility === 'trace') {
+        hide(r);
+        continue;
+      }
       if (filter.hide_undated && !r.timestamp_ms) {
         hide(r);
         continue;
@@ -289,6 +295,9 @@
   function handleRequest(id, body) {
     const fixture = window.__editchainFixture || {};
     if (!body || typeof body !== 'object') return;
+    // Harness-only request log: probes/e2e assert on the exact DTOs the
+    // renderer sends (e.g. hide_trace riding inside every GetWindow filter).
+    window.__editchainRequestLog.push(body);
 
     switch (body.Open !== undefined ? 'Open' : Object.keys(body)[0]) {
       case 'Open': {
@@ -337,13 +346,33 @@
       }
       case 'GetNodeDetails': {
         const opId = body.GetNodeDetails.op_id;
-        const row = (fixture.rows || []).find((r) => r.node_key === opId);
+        // Resolve against top-level rows AND their expanded bundled sub-ops
+        // (sub-op rows carry the bundled record's real op_id), mirroring the
+        // service's ability to inspect bundled records.
+        const expanded = expandSubOps(fixture.rows || []);
+        const row = (fixture.rows || []).find((r) => r.node_key === opId) ||
+          expanded.find((r) => r.op_id === opId);
         if (row) {
           respond(id, { Ok: { op_id: opId, git_oid: null, repository: null,
             summary: row.summary, body: row.summary, parents: [], git_parents: [],
             refs: [], changed_paths: [] } });
         } else {
           respond(id, { Error: 'node not found' });
+        }
+        return;
+      }
+      case 'ResolveObject': {
+        const oid = body.ResolveObject.oid;
+        const repo = body.ResolveObject.repository;
+        const row = (fixture.rows || []).find(
+          (r) => r.git_oid === oid && (repo === undefined || r.repository === repo)
+        );
+        if (row) {
+          respond(id, { Ok: { oid, repository: repo || row.repository,
+            message: row.summary, author: row.author || '',
+            timestamp_ms: row.timestamp_ms || 0, refs: [], changed_paths: [] } });
+        } else {
+          respond(id, { Error: 'object not found' });
         }
         return;
       }
@@ -432,6 +461,11 @@
   };
 
   window.__editchainReqId = 0;
+  // Harness-only request log (see handleRequest). Reset per scenario.
+  window.__editchainRequestLog = [];
+  window.__editchainClearRequestLog = function () {
+    window.__editchainRequestLog = [];
+  };
   // Controlled-release hooks for the deterministic race tests (see
   // layoutProbe). The first GetWindow / Search request after a hook is set is
   // captured as `{ taken:false }` and only responds when the test calls
@@ -447,6 +481,7 @@
     window.__editchainFixture = all[name]();
     window.__editchainScenarioName = name;
     persistedState = undefined;
+    window.__editchainRequestLog = [];
   };
 
   // Emulate the extension host's startup handshake (see extension.ts

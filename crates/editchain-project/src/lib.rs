@@ -5,8 +5,9 @@
 //! intentionally free of filesystem and process dependencies so it can later
 //! target WASM.
 
-// Crate-level dependency marker (used by Cargo for feature resolution).
+// Crate-level dependency markers (used by Cargo for feature resolution).
 use regex as _;
+use serde as _;
 
 /// General chain filtering with truncation.
 pub mod filter;
@@ -14,6 +15,10 @@ pub mod filter;
 pub mod layout;
 /// History linking — stitch sessions and git into a single edit chain.
 pub mod link;
+/// Deterministic semantic metadata for projected history rows.
+pub mod meta;
+/// Provider-neutral readability taxonomy shared with the protocol layer.
+pub mod taxonomy;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -25,6 +30,8 @@ use editchain_core::{
 
 use crate::layout::{compute_graph_layout, compute_lane_assignment, GraphLayout, GraphRow};
 use crate::link::link_history_links;
+use crate::meta::NodeMeta;
+use crate::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility as RowVisibility};
 
 /// Provenance of a node's effective display time.
 ///
@@ -76,6 +83,9 @@ pub enum HistoryNode {
         /// user-facing content; they hang off this real turn/tool node rather
         /// than occupying their own graph row/lane.
         sub_ops: Vec<Arc<Op>>,
+        /// Deterministic semantic readability metadata derived from the raw
+        /// envelope and normalized children (see [`crate::meta`]).
+        meta: NodeMeta,
     },
     /// A `Git` commit entity.
     GitCommit(Box<GitCommitEntity>),
@@ -364,6 +374,51 @@ impl HistoryNode {
             Self::CollapsedImport { kind, .. } => kind.clone(),
             Self::GitCommit(_) => "git".to_string(),
         }
+    }
+
+    /// Returns the deterministic semantic readability metadata for this row.
+    ///
+    /// Collapsed imports carry metadata derived at collapse time from their raw
+    /// envelope and normalized children; standalone ops and git commits derive
+    /// it on demand from their envelope/scope.
+    #[must_use]
+    pub fn record_meta(&self) -> NodeMeta {
+        match self {
+            Self::CollapsedImport { meta, .. } => *meta,
+            Self::EditOperation { op, .. } => meta::for_edit_operation(op),
+            Self::GitCommit(_) => meta::for_git_commit(),
+        }
+    }
+
+    /// The provider-neutral record role of this row.
+    #[must_use]
+    pub fn record_role(&self) -> RecordRole {
+        self.record_meta().record_role
+    }
+
+    /// The provider-neutral activity kind of this row.
+    #[must_use]
+    pub fn activity_kind(&self) -> ActivityKind {
+        self.record_meta().activity_kind
+    }
+
+    /// The render prominence of this row (`Trace` rows are hidden by
+    /// `hide_trace` chain filtering).
+    #[must_use]
+    pub fn visibility(&self) -> RowVisibility {
+        self.record_meta().visibility
+    }
+
+    /// The concluded outcome of this row, when structured evidence exists.
+    #[must_use]
+    pub fn outcome(&self) -> Outcome {
+        self.record_meta().outcome
+    }
+
+    /// The owning turn identity of this row, if turn-scoped.
+    #[must_use]
+    pub fn turn_id(&self) -> Option<editchain_core::TurnId> {
+        self.record_meta().turn_id
     }
 }
 
@@ -865,6 +920,11 @@ impl HistoryProjection {
     /// through a bundled op is resolved by the representative map.
     #[must_use]
     fn collapsed_ops(&self) -> CollapsedProjection {
+        // One-to-one cross-record duplicate-pair state for the response_item /
+        // event_msg echo family, computed once in a single O(n) pass over the
+        // ops. Response_item rows consume one pair slot per matching event_msg
+        // row as the main loop reaches them in input order.
+        let mut echo_pairs = meta::EchoPairState::from_ops(&self.ops);
         // Set of raw import op ids (the linear backbone).
         let import_ids: std::collections::HashSet<OpId> = self
             .ops
@@ -953,6 +1013,15 @@ impl HistoryProjection {
                 let summary = collapsed_import_summary(op, children);
                 let kind = collapsed_import_kind(children);
                 let author = collapsed_import_author(children);
+                // Semantic readability metadata is derived deterministically
+                // here, where the raw envelope and its normalized children are
+                // both available.
+                let duplicate_of_event_msg = echo_pairs.is_paired_response_item(op);
+                let meta = meta::for_collapsed_import(
+                    op,
+                    children.map(Vec::as_slice),
+                    duplicate_of_event_msg,
+                );
                 // A META/structural record that falls through is standalone and is
                 // NOT an anchor. Only a dated content-bearing import becomes one.
                 let source_time = source_time_of(op);
@@ -965,6 +1034,7 @@ impl HistoryProjection {
                     kind,
                     author,
                     sub_ops: Vec::new(),
+                    meta,
                 });
                 if is_anchor_eligible {
                     let _: Option<usize> = anchors.insert(chain, idx);
@@ -1274,6 +1344,8 @@ impl HistoryProjection {
         let mut drop_idx: std::collections::HashSet<usize> = std::collections::HashSet::new();
         // parent index -> tool-result ops to attach as sub-ops.
         let mut attach: HashMap<usize, Vec<Arc<Op>>> = HashMap::new();
+        // parent index -> structured outcome carried by the absorbed result row.
+        let mut outcome_fold: HashMap<usize, Outcome> = HashMap::new();
         for (i, n) in result.iter().enumerate() {
             if !is_result.get(i).copied().unwrap_or(false) {
                 continue;
@@ -1296,6 +1368,17 @@ impl HistoryProjection {
                 let attached = attach.entry(parent_idx).or_default();
                 if let Some(tool_op) = Self::tool_result_op(n, children_of) {
                     attached.push(tool_op);
+                }
+                // The absorbed result row's structured outcome (derived from
+                // its raw `status`/`errorMessage`/`exitCode`) carries over to
+                // the visible call row, so the combined call+result keeps its
+                // evidence-based outcome instead of degrading to unknown.
+                let result_outcome = n.record_meta().outcome;
+                if result_outcome != Outcome::Unknown {
+                    let _: &mut Outcome = outcome_fold
+                        .entry(parent_idx)
+                        .and_modify(|acc| *acc = merge_outcome(*acc, result_outcome))
+                        .or_insert(result_outcome);
                 }
                 // META records are bundled before tool-result grouping. If the
                 // result row is then absorbed into its call, move those records
@@ -1329,11 +1412,16 @@ impl HistoryProjection {
         }
 
         // Attach collected tool-result ops and their bundled metadata to the
-        // call's sub-ops.
+        // call's sub-ops, folding the absorbed result's structured outcome
+        // into the call row's metadata.
         for (parent_idx, ops) in &attach {
-            if let Some(HistoryNode::CollapsedImport { sub_ops, .. }) = result.get_mut(*parent_idx)
+            if let Some(HistoryNode::CollapsedImport { sub_ops, meta, .. }) =
+                result.get_mut(*parent_idx)
             {
                 sub_ops.extend(ops.iter().cloned());
+                if let Some(outcome) = outcome_fold.get(parent_idx).copied() {
+                    meta.outcome = outcome;
+                }
             }
         }
 
@@ -2111,6 +2199,39 @@ fn raw_import_label(import: &editchain_core::op::ImportOp) -> String {
             .filter(|event_type| !event_type.is_empty())
             .unwrap_or(record_type)
             .to_string(),
+        // Codex response items put the meaningful label in `payload.type` and
+        // its content: reasoning items expose a `summary` array of
+        // summary-text blocks, message items carry a `content` array. Showing
+        // the payload type (or its text) avoids a wall of indistinguishable
+        // `response_item` labels when a leading/unbundled record is visible.
+        "response_item" => {
+            let Some(payload) = value.get("payload") else {
+                return record_type.to_string();
+            };
+            let payload_type = payload
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            match payload_type {
+                "reasoning" => {
+                    if let Some(text) = first_response_summary_text(payload) {
+                        return truncate_line(&text);
+                    }
+                    if let Some(text) = first_response_content_text(payload) {
+                        return truncate_line(&text);
+                    }
+                    "reasoning".to_string()
+                }
+                "message" => {
+                    if let Some(text) = first_response_content_text(payload) {
+                        return truncate_line(&text);
+                    }
+                    "message".to_string()
+                }
+                _ if !payload_type.is_empty() => payload_type.to_string(),
+                _ => record_type.to_string(),
+            }
+        }
         // Attachment records carry a structured `attachment` object.
         "attachment" => {
             let att = value.get("attachment");
@@ -2170,6 +2291,91 @@ fn raw_import_label(import: &editchain_core::op::ImportOp) -> String {
         _ if !record_type.is_empty() => record_type.to_string(),
         _ => raw,
     }
+}
+
+/// Extract the first non-empty summary text from a response-item payload.
+///
+/// Reasoning items carry a `summary` array of `summary-text` blocks (and the
+/// compacted projection keeps the same shape); a plain string summary is
+/// accepted too. Returns `None` when there is no text, so callers can fall
+/// back to content text.
+#[must_use]
+fn first_response_summary_text(payload: &serde_json::Value) -> Option<String> {
+    let summary = payload.get("summary")?;
+    let items = match summary {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::String(text) if !text.trim().is_empty() => {
+            return Some(text.clone());
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_)
+        | serde_json::Value::Object(_) => return None,
+    };
+    for item in items {
+        match item {
+            serde_json::Value::Object(map) => {
+                if let Some(text) = map.get("text").and_then(serde_json::Value::as_str) {
+                    if !text.trim().is_empty() {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+            serde_json::Value::String(text) if !text.trim().is_empty() => {
+                return Some(text.clone());
+            }
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::Array(_)
+            | serde_json::Value::String(_) => {}
+        }
+    }
+    None
+}
+
+/// Extract the first non-empty content text from a response-item payload.
+///
+/// Content blocks are `{type, text|input_text|output_text}` records; the
+/// compacted projection keeps the same shape. Returns `None` when there is
+/// no text.
+#[must_use]
+fn first_response_content_text(payload: &serde_json::Value) -> Option<String> {
+    let content = payload.get("content")?;
+    let items = match content {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::String(text) if !text.trim().is_empty() => {
+            return Some(text.clone());
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_)
+        | serde_json::Value::Object(_) => return None,
+    };
+    for item in items {
+        match item {
+            serde_json::Value::Object(map) => {
+                for key in ["text", "input_text", "output_text"] {
+                    if let Some(text) = map.get(key).and_then(serde_json::Value::as_str) {
+                        if !text.trim().is_empty() {
+                            return Some(text.to_string());
+                        }
+                    }
+                }
+            }
+            serde_json::Value::String(text) if !text.trim().is_empty() => {
+                return Some(text.clone());
+            }
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::Array(_)
+            | serde_json::Value::String(_) => {}
+        }
+    }
+    None
 }
 
 /// Extract text from a user record's possibly-nested content blocks.
@@ -2405,5 +2611,34 @@ fn payload_text(payload: &Payload) -> String {
     match payload {
         Payload::Inline(b) => String::from_utf8_lossy(b).to_string(),
         Payload::Empty | Payload::Blob(_) => String::new(),
+    }
+}
+
+/// Conservative merge precedence for folded outcomes.
+///
+/// When multiple tool-result rows fold into one call, the combined outcome is
+/// the most severe concluded outcome among them, so a later milder result can
+/// never mask earlier evidence of a problem: `Failure` > `Cancelled` >
+/// `Warning` > `Success`. `Unknown` ranks lowest; callers exclude it before
+/// merging so it can never erase known evidence.
+#[must_use]
+fn outcome_severity(outcome: Outcome) -> u8 {
+    match outcome {
+        Outcome::Failure => 4,
+        Outcome::Cancelled => 3,
+        Outcome::Warning => 2,
+        Outcome::Success => 1,
+        Outcome::Unknown => 0,
+    }
+}
+
+/// Deterministic fold of two concluded outcomes: the more severe wins; ties
+/// keep the existing (earlier) outcome.
+#[must_use]
+fn merge_outcome(acc: Outcome, next: Outcome) -> Outcome {
+    if outcome_severity(next) > outcome_severity(acc) {
+        next
+    } else {
+        acc
     }
 }

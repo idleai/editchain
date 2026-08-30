@@ -41,6 +41,14 @@
       author: opts.author || 'ambientlight',
       commit_id: key.slice(0, 7),
       kind: opts.kind || 'git',
+      // Additive r4 contract fields (HistoryRow): EXACT Rust wire taxonomy
+      // (crates/editchain-project/taxonomy.rs) — lowercase snake_case,
+      // defaulted to the conservative values the service emits.
+      record_role: opts.record_role || 'artifact',
+      activity_kind: opts.activity_kind || 'source_control',
+      visibility: opts.visibility || 'primary',
+      outcome: opts.outcome || 'unknown',
+      turn_id: opts.turn_id || '',
     };
   }
 
@@ -60,6 +68,19 @@
       author: opts.author || '',
       commit_id: key,
       kind: opts.kind || 'message',
+      // Additive r4 contract fields (HistoryRow): EXACT Rust wire taxonomy
+      // (crates/editchain-project/taxonomy.rs). Ops default by kind: messages
+      // are narrative/conversation turns; tool and command rows are execute
+      // activity (tool = result, command = action). Trace VISIBILITY marks
+      // internal bookkeeping rows hidden by hide_trace — record_role has no
+      // "trace" variant.
+      record_role: opts.record_role !== undefined ? opts.record_role
+        : (opts.kind === 'tool' ? 'result' : opts.kind === 'command' ? 'action' : 'narrative'),
+      activity_kind: opts.activity_kind !== undefined ? opts.activity_kind
+        : (opts.kind === 'tool' || opts.kind === 'command') ? 'execute' : 'conversation',
+      visibility: opts.visibility || 'primary',
+      outcome: opts.outcome || 'unknown',
+      turn_id: opts.turn_id !== undefined ? opts.turn_id : key,
     };
   }
 
@@ -268,6 +289,51 @@
       return largeHistory();
     },
 
+    // A long virtual window with three explicit group runs at KNOWN absolute
+    // boundaries (rows 0..99 = repo:a, 100..199 = repo:b, 200+ = session:s1).
+    // The deterministic prepend regression scrolls down past the boundary and
+    // back up, so prependRowsAbove rebuilds the rows above a boundary; the
+    // group-start chip must land on the FIRST row of each run (0, 100, 200)
+    // before AND after a full reanchor rebuild.
+    multigroup() {
+      const rows = [];
+      for (let i = 0; i < 600; i++) {
+        const k = 'git:G' + String(i).padStart(4, '0');
+        if (i < 200) {
+          rows.push(gitRow(k, 'multi-group commit #' + i, {
+            group: i < 100 ? 'repo:a' : 'repo:b',
+            parents: i > 0 ? [rows[i - 1].node_key] : [],
+            ts: NOW - i * 1000,
+          }));
+        } else {
+          rows.push(opRow('node:G' + String(i).padStart(4, '0'), 'multi-group op #' + i, {
+            group: 'session:s1',
+            kind: i % 2 ? 'message' : 'command',
+            parents: [rows[i - 1].node_key],
+            ts: NOW - i * 1000,
+          }));
+        }
+      }
+      const layoutRows = rows.map((r) => ({ node: r.node_key, lane: 0 }));
+      const edges = [];
+      for (let i = 0; i < rows.length - 1; i++) {
+        edges.push({
+          child: rows[i].node_key,
+          parent: rows[i + 1].node_key,
+          points: [
+            { row: i, lane: 0 },
+            { row: i + 1, lane: 0 },
+          ],
+        });
+      }
+      return {
+        rows,
+        layoutRows,
+        edges,
+        subOpCounts: rows.map(() => 0),
+      };
+    },
+
     longsummary() {
       // A row whose summary is ~1024 chars, to exercise the ellipsis/truncation
       // behaviour when the content column is resized.
@@ -282,6 +348,153 @@
 
     combined() {
       return combinedOp();
+    },
+
+    // A turn + tool chain with internal trace-VISIBILITY records (the r4
+    // Activity/Raw profile contract). Activity (hide_trace=true, the default)
+    // removes every visibility==="trace" row via the server-side chain
+    // filter; Raw (hide_trace=false) shows the full stream. The bridge
+    // mirrors the filter for both GetWindow and GetLayout, so switching
+    // profiles must refetch a coherent, smaller/larger view with the same
+    // single-lane topology. All taxonomy fields use the exact Rust wire
+    // values.
+    traced() {
+      const rows = [
+        opRow('node:t:0', 'Agent reply (build fixed)', {
+          group: 'session:s1', kind: 'message', author: 'agent',
+          record_role: 'narrative', activity_kind: 'conversation',
+          visibility: 'primary', outcome: 'success', turn_id: 't1',
+        }),
+        opRow('node:t:1', 'tool result: 3 files updated', {
+          group: 'session:s1', kind: 'tool', is_system: true,
+          record_role: 'result', activity_kind: 'execute',
+          visibility: 'trace', outcome: 'success', turn_id: 't1',
+        }),
+        opRow('node:t:2', 'Run tests', {
+          group: 'session:s1', kind: 'command',
+          record_role: 'action', activity_kind: 'execute',
+          visibility: 'primary', outcome: 'unknown', turn_id: 't0',
+        }),
+        opRow('node:t:3', 'tool result: 42 passed', {
+          group: 'session:s1', kind: 'tool', is_system: true,
+          record_role: 'result', activity_kind: 'execute',
+          visibility: 'trace', outcome: 'success', turn_id: 't0',
+        }),
+        opRow('node:t:4', 'User asks to fix the build', {
+          group: 'session:s1', kind: 'message', author: 'human',
+          record_role: 'narrative', activity_kind: 'conversation',
+          visibility: 'primary', outcome: 'unknown', turn_id: 't0',
+        }),
+      ];
+      rows[0].parents = ['node:t:1'];
+      rows[1].parents = ['node:t:2'];
+      rows[2].parents = ['node:t:3'];
+      rows[3].parents = ['node:t:4'];
+      const layoutRows = rows.map((r) => ({ node: r.node_key, lane: 0 }));
+      const edges = [];
+      for (let i = 0; i < rows.length - 1; i++) {
+        edges.push({
+          child: rows[i].node_key,
+          parent: rows[i + 1].node_key,
+          points: [
+            { row: i, lane: 0 },
+            { row: i + 1, lane: 0 },
+          ],
+        });
+      }
+      return {
+        rows,
+        layoutRows,
+        edges,
+        subOpCounts: rows.map(() => 0),
+      };
+    },
+
+    // A full-coverage scenario for the EXACT r4 taxonomy (Rust wire enums).
+    // Every whitelisted activity_kind and outcome appears so the badge probe
+    // can assert the exact labels render — execute/source_control/failure in
+    // particular — and that conversation rows stay badge-free. The legacy
+    // tool_call/command/edit/commit/review and error/interrupted vocabulary
+    // must never leak back into badges.
+    badges() {
+      const rows = [
+        opRow('node:b:exec', 'Run the test suite', {
+          group: 'session:s1', kind: 'command',
+          record_role: 'action', activity_kind: 'execute',
+          visibility: 'primary', outcome: 'failure', turn_id: 't0',
+        }),
+        gitRow('git:b:sc', 'fix layout regression', {
+          group: 'repo:x',
+          record_role: 'artifact', activity_kind: 'source_control',
+          visibility: 'primary', outcome: 'success',
+        }),
+        opRow('node:b:chg', 'Update main.css', {
+          group: 'session:s1', kind: 'file',
+          record_role: 'artifact', activity_kind: 'change',
+          visibility: 'primary', outcome: 'warning', turn_id: 't1',
+        }),
+        opRow('node:b:plan', 'Stop the plan run', {
+          group: 'session:s1', kind: 'reflection',
+          record_role: 'narrative', activity_kind: 'plan',
+          visibility: 'primary', outcome: 'cancelled', turn_id: 't2',
+        }),
+        opRow('node:b:exp', 'Search the workspace', {
+          group: 'session:s1', kind: 'tool',
+          record_role: 'action', activity_kind: 'explore',
+          visibility: 'primary', outcome: 'unknown', turn_id: 't3',
+        }),
+        opRow('node:b:ver', 'Check test results', {
+          group: 'session:s1', kind: 'tool',
+          record_role: 'result', activity_kind: 'verify',
+          visibility: 'primary', outcome: 'unknown', turn_id: 't3',
+        }),
+        opRow('node:b:diag', 'Investigate the failure', {
+          group: 'session:s1', kind: 'error',
+          record_role: 'result', activity_kind: 'diagnose',
+          visibility: 'primary', outcome: 'failure', turn_id: 't4',
+        }),
+        opRow('node:b:coord', 'Delegate to a subagent', {
+          group: 'session:s1', kind: 'message', author: 'agent',
+          record_role: 'narrative', activity_kind: 'coordinate',
+          visibility: 'primary', outcome: 'unknown', turn_id: 't5',
+        }),
+        opRow('node:b:ext', 'External agent echo', {
+          group: 'session:s1', kind: 'message', is_system: true,
+          record_role: 'echo', activity_kind: 'external',
+          visibility: 'primary', outcome: 'unknown', turn_id: 't6',
+        }),
+        opRow('node:b:sys', 'Chain transport record', {
+          group: 'session:s1', kind: 'note', is_system: true,
+          record_role: 'lifecycle', activity_kind: 'system',
+          visibility: 'primary', outcome: 'unknown', turn_id: 't6',
+        }),
+        opRow('node:b:conv', 'User asks a question', {
+          group: 'session:s1', kind: 'message', author: 'human',
+          record_role: 'narrative', activity_kind: 'conversation',
+          visibility: 'primary', outcome: 'unknown', turn_id: 't7',
+        }),
+      ];
+      for (let i = 0; i < rows.length - 1; i++) {
+        rows[i].parents = [rows[i + 1].node_key];
+      }
+      const layoutRows = rows.map((r) => ({ node: r.node_key, lane: 0 }));
+      const edges = [];
+      for (let i = 0; i < rows.length - 1; i++) {
+        edges.push({
+          child: rows[i].node_key,
+          parent: rows[i + 1].node_key,
+          points: [
+            { row: i, lane: 0 },
+            { row: i + 1, lane: 0 },
+          ],
+        });
+      }
+      return {
+        rows,
+        layoutRows,
+        edges,
+        subOpCounts: rows.map(() => 0),
+      };
     },
 
     // A fork + subagent-reconnect graph, mirroring the geometry the importer
