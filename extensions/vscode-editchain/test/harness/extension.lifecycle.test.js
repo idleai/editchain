@@ -328,7 +328,7 @@ test('Open Error surfaces without ready and command reuse retries', async () => 
   assert.deepEqual(panelA.webview.messages[2], { id: 'ready' });
 });
 
-test('history panel retains its bounded renderer context across detail navigation', async () => {
+test('history panel retains its bounded renderer context across raw JSON navigation', async () => {
   const env = loadExtension();
 
   env.open();
@@ -336,7 +336,7 @@ test('history panel retains its bounded renderer context across detail navigatio
   assert.equal(
     panel.options.retainContextWhenHidden,
     true,
-    'VS Code must preserve the cached history DOM while a detail editor covers it'
+    'VS Code must preserve the cached history DOM while a raw JSON editor covers it'
   );
 
   await rendererReady(panel);

@@ -109,65 +109,8 @@ body {
 #search:focus {
   border-color: var(--vscode-focusBorder);
 }
-#layout { display: flex; gap: 12px; flex: 1; min-height: 0; width: 100%; }
-#rows { flex: 3; overflow-y: auto; position: relative; min-width: 0; }
-/* Detail/inspector pane is hidden until a node is selected, so it doesn't
-   consume fixed width when empty. */
-#detail { flex: 1; overflow-y: auto; border-left: 1px solid var(--vscode-panel-border); padding-left: 12px; min-width: 0; display: none; }
-#layout.has-detail #detail { display: block; }
-/* Inspector header: title + meta + Close / Open raw JSON actions. */
-.detail-head {
-  padding: 8px 12px 0 0;
-}
-.detail-title {
-  font-weight: 700;
-  overflow-wrap: anywhere;
-}
-.detail-meta {
-  margin-top: 4px;
-  font-size: 0.85em;
-  color: var(--vscode-descriptionForeground);
-  overflow-wrap: anywhere;
-}
-.detail-actions {
-  display: flex;
-  gap: 8px;
-  margin: 8px 0;
-}
-.detail-btn {
-  font: inherit;
-  font-size: 0.9em;
-  padding: 3px 10px;
-  color: var(--vscode-button-foreground, #ffffff);
-  background: var(--vscode-button-background, #0e639c);
-  border: 1px solid transparent;
-  border-radius: 2px;
-  cursor: pointer;
-}
-.detail-btn:hover:not(:disabled) {
-  background: var(--vscode-button-hoverBackground, #1177bb);
-}
-.detail-btn:disabled {
-  opacity: 0.6;
-  cursor: default;
-}
-.detail-btn:focus-visible {
-  outline: 1px solid var(--vscode-focusBorder);
-  outline-offset: -1px;
-}
-.detail-loading {
-  font-size: 0.9em;
-  color: var(--vscode-descriptionForeground);
-  padding: 8px 0;
-}
-.detail-body {
-  font-family: var(--vscode-editor-font-family, monospace);
-  font-size: 0.85em;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  padding: 0 12px 12px 0;
-  color: var(--vscode-foreground);
-}
+#layout { display: flex; flex: 1; min-height: 0; width: 100%; }
+#rows { flex: 1; overflow-y: auto; position: relative; min-width: 0; }
 
 /* Scroll spacer gives #rows a scrollbar spanning the FULL history height even
    though only a viewport slice is rendered. The rendered slice (table-wrap) is
@@ -276,7 +219,7 @@ body {
   outline: 1px solid var(--vscode-focusBorder);
   outline-offset: -1px;
 }
-/* Selected (inspector) row highlight: a soft accent that stays clearly visible
+/* Inline selected-row highlight: a soft accent that stays clearly visible
    on top of the hover colour without hard-coded theme assumptions. */
 .row.row-selected {
   background-color: color-mix(in srgb, var(--vscode-focusBorder) 18%, var(--vscode-editor-background));
@@ -337,6 +280,17 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* A single restrained metadata cluster precedes prose. Keeping it in one
+   shrinkable wrapper gives the content compositor a predictable visual budget
+   instead of making every semantic label compete independently with text. */
+.row-meta {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
 /* Human message turns render bold; all other rows (agent, system, tool) stay
    at normal weight. */
 .row-human .summary {
@@ -345,7 +299,7 @@ body {
 
 /* Chevron BUTTON on rows that carry bundled metadata sub-ops. This is the ONLY
    control that toggles inline expansion (revealing one uniform ROW_H row per
-   sub-op directly below); clicking the row itself selects it in the inspector.
+   sub-op directly below); clicking the row itself selects it inline.
    Inline so it never affects row height or column layout — virtual scroll keeps
    every row exactly ROW_H. */
 .subop-chevron {
@@ -508,6 +462,13 @@ body {
   white-space: nowrap;
   overflow: hidden;
 }
+.row-work-unit-start .summary.work-unit-block.work-unit-title-only {
+  display: flex;
+  align-items: center;
+}
+.work-unit-title-only .work-unit-ribbon-line {
+  width: 100%;
+}
 .work-unit-ribbon-line {
   display: flex;
   align-items: center;
@@ -550,10 +511,8 @@ body {
   white-space: nowrap;
 }
 
-/* Execute-run bundle chrome (Activity only): a compact count pill built from
-   the DTO's member_count plus neutral/success outcome wording. Inline like a
-   badge, so it never affects row height or column layout — virtual scroll
-   keeps every row exactly ROW_H. */
+/* Execute-run bundle chrome (Activity only): one compact typed count label and
+   an optional structured-success check. Unknown outcome stays visually quiet. */
 .bundle-count,
 .bundle-status {
   display: inline-block;
@@ -781,22 +740,6 @@ body.col-resizing .col-resize-handle {
   .commit-cell {
     display: none;
   }
-  /* The inspector overlays the rows at narrow widths instead of splitting the
-     already-tight horizontal budget, so the history keeps its full width. */
-  #layout {
-    position: relative;
-  }
-  #layout.has-detail #detail {
-    position: absolute;
-    right: 0;
-    top: 0;
-    bottom: 0;
-    width: min(78%, 300px);
-    z-index: 5;
-    background: var(--vscode-editor-background);
-    box-shadow: -2px 0 6px rgba(0, 0, 0, 0.35);
-    border-left: 1px solid var(--vscode-panel-border);
-  }
 }
 @media (max-width: 480px) {
   /* At <=480px the JS width math caps the graph rail at GRAPH_MAX_W_NARROW
@@ -829,5 +772,595 @@ body.col-resizing .col-resize-handle {
   }
   #controls {
     padding: 0 8px;
+  }
+}
+
+/* -------------------------------------------------------------------------
+ * Pulse presentation system
+ * -------------------------------------------------------------------------
+ * Narrative-first and deliberately restrained: topology remains a continuous
+ * reading rail, but prose and semantic grouping lead. Fixed row geometry,
+ * keyboard semantics, and Activity/Raw behaviour remain unchanged.
+ */
+
+:root {
+  --ec-void: #080b10;
+  --ec-shell: #0c1016;
+  --ec-surface: #10161d;
+  --ec-surface-raised: #141b23;
+  --ec-ink: #d9e4e2;
+  --ec-ink-strong: #edf4f3;
+  --ec-muted: #8f9da1;
+  --ec-faint: #68777c;
+  --ec-hairline: rgba(145, 164, 168, 0.12);
+  --ec-hairline-strong: rgba(103, 201, 187, 0.22);
+  --ec-cyan: #67c9bb;
+  --ec-violet: #9589c2;
+  --ec-green: #79c79b;
+  --ec-amber: #d9b66d;
+  --ec-red: #df7d8c;
+}
+
+body {
+  --row-border: var(--ec-hairline);
+  color-scheme: dark;
+  color: var(--ec-ink);
+  background:
+    radial-gradient(circle at 84% -18%, rgba(149, 137, 194, 0.045), transparent 38%),
+    var(--ec-void);
+  padding-top: 0;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+#controls {
+  flex: none;
+  gap: 9px;
+  min-height: 42px;
+  margin: 0;
+  padding: 6px 10px;
+  background: rgba(12, 16, 22, 0.97);
+  border-bottom: 1px solid var(--ec-hairline);
+}
+
+.segmented {
+  flex: none;
+  background: var(--ec-surface);
+  border-color: var(--ec-hairline);
+  border-radius: 4px;
+}
+
+.segmented-btn {
+  color: var(--ec-muted);
+  padding: 4px 10px;
+  font-size: 12px;
+  line-height: 17px;
+  letter-spacing: 0.005em;
+}
+
+.segmented-btn + .segmented-btn {
+  border-left-color: var(--ec-hairline);
+}
+
+.segmented-btn:hover:not(.active) {
+  color: var(--ec-ink);
+  background: rgba(103, 201, 187, 0.045);
+}
+
+#profile-control .segmented-btn.active {
+  color: var(--ec-ink-strong);
+  background: rgba(103, 201, 187, 0.11);
+  box-shadow: inset 0 -1px 0 rgba(103, 201, 187, 0.48);
+}
+
+#search {
+  min-height: 27px;
+  padding: 4px 10px;
+  color: var(--ec-ink);
+  background: var(--ec-surface);
+  border-color: var(--ec-hairline);
+  border-radius: 4px;
+  font-family: var(--vscode-font-family, sans-serif);
+  font-size: 12.5px;
+  line-height: 17px;
+}
+
+#search::placeholder {
+  color: var(--ec-faint);
+}
+
+#search:hover {
+  border-color: rgba(103, 201, 187, 0.25);
+}
+
+#search:focus {
+  border-color: rgba(103, 201, 187, 0.7);
+  box-shadow: 0 0 0 1px rgba(103, 201, 187, 0.08);
+}
+
+#layout {
+  gap: 0;
+  background: var(--ec-void);
+}
+
+#rows {
+  background: rgba(8, 11, 16, 0.82);
+}
+
+.tbl-header,
+.row {
+  grid-template-columns:
+    var(--graph-w, auto) minmax(0, 1fr) minmax(0, var(--date-w, 140px));
+}
+
+.th.author,
+.author-cell,
+.th.commit,
+.commit-cell {
+  display: none;
+}
+
+.tbl-header {
+  color: var(--ec-muted);
+  background: rgba(12, 16, 22, 0.98);
+  border-bottom-color: var(--ec-hairline-strong);
+}
+
+.tbl-header .th {
+  padding-top: 7px;
+  padding-bottom: 7px;
+  color: var(--ec-muted);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.075em;
+  text-transform: uppercase;
+}
+
+.row {
+  color: var(--ec-ink);
+  border-bottom-color: var(--ec-hairline);
+  transition: background-color 90ms ease, box-shadow 90ms ease;
+}
+
+.row:hover {
+  background-color: rgba(103, 201, 187, 0.035);
+}
+
+.row:focus-visible {
+  outline-color: rgba(103, 201, 187, 0.78);
+}
+
+.row.row-selected {
+  background: linear-gradient(90deg, rgba(103, 201, 187, 0.085), rgba(103, 201, 187, 0.018));
+  box-shadow: inset 2px 0 0 rgba(103, 201, 187, 0.72);
+}
+
+.graph-cell {
+  opacity: 0.66;
+  border-right: 1px solid rgba(145, 164, 168, 0.065);
+}
+
+.row:hover .graph-cell,
+.row-selected .graph-cell,
+.row-promoted .graph-cell {
+  opacity: 0.88;
+}
+
+.text-cell {
+  padding-left: 10px;
+}
+
+.row .summary {
+  color: var(--ec-ink);
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.summary-text,
+.subop-summary {
+  display: flex;
+  align-items: center;
+  line-height: 18px;
+}
+
+.row-human .summary {
+  color: var(--ec-ink-strong);
+  font-weight: 550;
+}
+
+/* The provider-neutral role owns text hierarchy. Legacy kind/is_system classes
+   remain as compatibility hooks, but no longer dim whole cells and everything
+   inside them indiscriminately. */
+.row-tool .text-cell,
+.row-tool .date-cell,
+.row-dim .text-cell,
+.row-dim .date-cell {
+  opacity: 1;
+}
+
+.row-role-result .summary,
+.row-role-lifecycle .summary,
+.row-role-echo .summary {
+  color: var(--ec-muted);
+}
+
+.row-role-artifact .summary,
+.row-role-action .summary {
+  color: color-mix(in srgb, var(--ec-ink) 90%, var(--ec-muted));
+}
+
+.date-cell,
+.author-cell,
+.commit-cell {
+  color: var(--ec-faint);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.date-cell,
+.tbl-header .th.date {
+  opacity: 0.72;
+}
+
+.group-label {
+  color: var(--ec-muted);
+  background: rgba(12, 16, 22, 0.94);
+  border-radius: 0 0 3px 0;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.025em;
+  line-height: 13px;
+}
+
+.row-group-start {
+  border-top-color: rgba(149, 137, 194, 0.2);
+}
+
+.rel-badge,
+.act-badge,
+.out-badge,
+.bundle-count,
+.bundle-status,
+.work-unit-count {
+  border-radius: 3px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 10px;
+  letter-spacing: 0.015em;
+}
+
+.row-meta {
+  gap: 5px;
+  max-width: 46%;
+  margin-right: 7px;
+}
+
+.row-activity-bundle .row-meta {
+  max-width: 100%;
+  margin-right: 0;
+}
+
+/* Activity is a quiet kicker, relations are topology annotations, and outcome
+   is the only lozenge-like state. This prevents every signal from becoming an
+   equally loud outlined chip. */
+.rel-badge,
+.act-badge,
+.out-badge {
+  margin: 0;
+  border: 0;
+  line-height: 15px;
+}
+
+.rel-badge,
+.act-badge {
+  padding: 0;
+  background: transparent;
+}
+
+.rel-badge {
+  color: color-mix(in srgb, var(--ec-violet) 82%, var(--ec-muted));
+}
+
+.act-badge {
+  color: var(--ec-faint);
+}
+
+.out-badge {
+  padding: 0 4px;
+  background: color-mix(in srgb, currentColor 9%, transparent);
+}
+
+.out-badge.outcome-success,
+.out-badge.outcome-warning,
+.out-badge.outcome-failure,
+.out-badge.outcome-neutral {
+  border: 0;
+}
+
+.bundle-count {
+  color: var(--ec-ink);
+  margin: 0;
+  padding: 0 5px;
+  background: rgba(103, 201, 187, 0.065);
+  border-color: rgba(103, 201, 187, 0.16);
+}
+
+.bundle-status {
+  flex: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: var(--vscode-testing-iconPassed, var(--ec-green));
+  background: transparent;
+  font-family: var(--vscode-font-family, sans-serif);
+  font-size: 11px;
+}
+
+.row-activity-bundle {
+  background: rgba(103, 201, 187, 0.012);
+}
+
+.row-work-unit-start {
+  background: linear-gradient(90deg, rgba(103, 201, 187, 0.045), transparent 62%);
+  border-top-color: rgba(103, 201, 187, 0.22);
+  box-shadow: inset 2px 0 0 rgba(103, 201, 187, 0.34);
+}
+
+.row-work-unit-end {
+  border-bottom-color: rgba(145, 164, 168, 0.22);
+}
+
+.work-unit-ribbon {
+  color: color-mix(in srgb, var(--ec-cyan) 72%, var(--ec-muted));
+  font-family: var(--vscode-font-family, sans-serif);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.work-unit-count {
+  padding: 0;
+  color: var(--ec-faint);
+  background: transparent;
+  font-size: 9.5px;
+}
+
+.work-unit-count::before {
+  content: '· ';
+}
+
+.subop-chevron {
+  color: var(--ec-cyan);
+}
+
+.subop-icon,
+.subop-summary {
+  color: var(--ec-muted);
+}
+
+.subop-summary {
+  font-size: 12px;
+}
+
+.row-promoted-rail {
+  box-shadow: inset 2px 0 0 rgba(143, 157, 161, 0.24);
+}
+
+.row-promoted-change {
+  box-shadow: inset 2px 0 0 rgba(103, 201, 187, 0.72);
+  background: linear-gradient(90deg, rgba(103, 201, 187, 0.055), transparent 50%);
+}
+
+.graph-cell circle.graphDot,
+.graph-cell rect.graphBundleCapsule,
+.graph-cell circle.graphBundleTerminal {
+  stroke: var(--ec-void);
+}
+
+.graph-cell line.graphLine,
+.graph-cell path.graphTransition {
+  stroke-width: 1.4;
+}
+
+.search-banner,
+.view-message {
+  color: var(--ec-muted);
+  background: rgba(12, 16, 22, 0.97);
+}
+
+.search-banner {
+  border-bottom-color: var(--ec-hairline);
+  font-family: var(--vscode-font-family, sans-serif);
+  font-size: 12px;
+}
+
+/* Safe one-line Markdown semantics. The row stays nowrap/ellipsized; these
+   spans restore hierarchy without turning a history entry into a document. */
+.md-line {
+  display: inline-flex;
+  align-items: baseline;
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.md-line:only-child {
+  flex: 1 1 auto;
+}
+
+.md-line > *,
+.md-strong > *,
+.md-em > *,
+.md-link > *,
+.md-image > *,
+.md-strike > * {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.md-text {
+  display: inline;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.md-heading,
+.md-strong {
+  color: var(--ec-ink-strong);
+  font-weight: 600;
+}
+
+.md-strong,
+.md-em,
+.md-link,
+.md-image,
+.md-strike {
+  display: inline-flex;
+  align-items: baseline;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.md-heading {
+  letter-spacing: -0.005em;
+}
+
+.md-em {
+  color: color-mix(in srgb, var(--ec-ink) 88%, var(--ec-cyan));
+  font-style: italic;
+}
+
+.md-code {
+  display: inline;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin: 0 1px;
+  padding: 0 1px;
+  color: #bddbd6;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.92em;
+  font-style: normal;
+}
+
+.md-link {
+  color: var(--ec-cyan);
+  text-decoration: underline;
+  text-decoration-color: rgba(103, 201, 187, 0.38);
+  text-underline-offset: 2px;
+}
+
+.md-image {
+  color: var(--ec-muted);
+}
+
+.md-marker {
+  display: inline-block;
+  min-width: 12px;
+  margin-right: 3px;
+  color: var(--ec-cyan);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.md-task-done {
+  color: var(--ec-muted);
+}
+
+.md-empty {
+  color: var(--ec-faint);
+  font-style: italic;
+}
+
+.md-quote {
+  color: color-mix(in srgb, var(--ec-ink) 80%, var(--ec-muted));
+  font-style: italic;
+}
+
+.md-callout {
+  display: inline-block;
+  margin-right: 5px;
+  padding: 0;
+  color: var(--ec-cyan);
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 9.5px;
+  font-style: normal;
+  line-height: 14px;
+  text-transform: uppercase;
+}
+
+.md-strike {
+  color: var(--ec-muted);
+  text-decoration: line-through;
+}
+
+.md-break {
+  flex: none;
+  padding: 0 4px;
+  color: var(--ec-faint);
+}
+
+.md-more {
+  flex: none;
+  margin-left: 7px;
+  padding: 0;
+  color: var(--ec-faint);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 10px;
+}
+
+.md-more::before {
+  content: '· ';
+}
+
+@media (max-width: 480px) {
+  #controls {
+    gap: 6px;
+    padding: 6px 8px;
+  }
+
+  .segmented-btn {
+    padding-right: 8px;
+    padding-left: 8px;
+  }
+
+  #search {
+    flex-basis: 100%;
+  }
+
+  .tbl-header,
+  .row {
+    grid-template-columns:
+      var(--graph-w, auto) minmax(0, 1fr) minmax(0, var(--date-w, 140px));
+  }
+}
+
+@media (max-width: 400px) {
+  .tbl-header,
+  .row {
+    grid-template-columns: var(--graph-w, auto) minmax(0, 1fr);
   }
 }

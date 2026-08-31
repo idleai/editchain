@@ -6,7 +6,8 @@
 // the rendered layout as text/number artifacts — no screenshots.
 //
 // Usage:
-//   node scripts/ui-dump.mjs dump    --scenario merge --viewport 1440x900 [--out DIR]
+//   node scripts/ui-dump.mjs dump    --scenario merge --viewport 1440x900
+//                                    [--single-pane] [--out DIR]
 //   node scripts/ui-dump.mjs inspect --scenario merge --selector ".row" [--out DIR]
 //   node scripts/ui-dump.mjs check   --scenario merge [--out DIR]
 //
@@ -34,7 +35,7 @@ const CHROME = process.env.CHROME_PATH ||
 const SCENARIOS = ['empty', 'linear', 'merge', 'mixed', 'filtered', 'undated', 'error', 'warned', 'large', 'longsummary', 'combined', 'traced', 'badges', 'fork', 'highLanes', 'workUnits', 'workUnitsDeep'];
 
 function parseArgs(argv) {
-  const args = { cmd: argv[0], scenario: 'merge', viewport: '1440x900', out: null, selector: null, search: null, searchRace: false, resize: false, deferredLayout: false, shot: null, profile: null, profileSwitch: false, inspector: false, keyboard: false, restore: false, workUnit: false };
+  const args = { cmd: argv[0], scenario: 'merge', viewport: '1440x900', out: null, selector: null, search: null, searchRace: false, resize: false, deferredLayout: false, shot: null, profile: null, profileSwitch: false, singlePane: false, keyboard: false, restore: false, workUnit: false };
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--scenario') args.scenario = argv[++i];
@@ -48,7 +49,7 @@ function parseArgs(argv) {
     else if (a === '--shot') args.shot = argv[++i];
     else if (a === '--profile') args.profile = argv[++i];
     else if (a === '--profile-switch') args.profileSwitch = true;
-    else if (a === '--inspector') args.inspector = true;
+    else if (a === '--single-pane') args.singlePane = true;
     else if (a === '--keyboard') args.keyboard = true;
     else if (a === '--restore') args.restore = true;
     else if (a === '--work-unit') args.workUnit = true;
@@ -72,7 +73,6 @@ async function main() {
     console.error('unknown scenario "' + args.scenario + '" — choose from: ' + SCENARIOS.join(', '));
     process.exit(1);
   }
-
   const vp = parseViewport(args.viewport);
   const outDir = args.out || path.join(EXT_ROOT, '.ui-out', args.scenario);
   fs.mkdirSync(outDir, { recursive: true });
@@ -156,7 +156,7 @@ async function main() {
   const assertion = await page.evaluate(() => window.__editchainDebug.assertLayout());
 
   // Combined scenario: click the combined op's CHEVRON (the only control that
-  // toggles bundled sub-ops — a plain row click selects in the inspector now)
+  // toggles bundled sub-ops — a plain row click only selects inline)
   // and verify ALL bundled sub-ops reveal inline (the "only the first sub-op
   // appears" regression).
   let expansion = null;
@@ -191,26 +191,11 @@ async function main() {
     profileSwitch = await page.evaluate(() => window.__editchainDebug.runProfileSwitch(10000));
   }
 
-  // Inspector-vs-chevron routing interaction: row click opens the inspector
-  // (no editor tab); only the chevron toggles bundled sub-ops; Close clears.
-  let inspector = null;
-  if (args.inspector) {
-    inspector = await page.evaluate(() => window.__editchainDebug.runInspectorRouting(10000));
-  }
-
-  // Inspector geometry across wide + narrow viewports: open/close at ~1440 and
-  // ~400/617 must RECOMPUTE the table geometry (flex width, graph column, inline
-  // column widths, hidden columns, overflow) rather than leaving stale widths.
-  // Each viewport change resizes #rows (window resize -> debounced recompute),
-  // and the probe settles to the new width before capturing its baseline.
-  let inspectorGeometry = null;
-  if (args.inspector) {
-    inspectorGeometry = { viewports: [] };
-    for (const w of [1440, 617, 400]) {
-      await page.setViewport({ width: w, height: vp.height });
-      const geom = await page.evaluate(() => window.__editchainDebug.runInspectorGeometry(10000));
-      inspectorGeometry.viewports.push({ width: w, ...geom });
-    }
+  // Single-pane routing interaction: click selects inline, double-click opens
+  // raw JSON, and the chevron only toggles bundled sub-ops.
+  let singlePane = null;
+  if (args.singlePane) {
+    singlePane = await page.evaluate(() => window.__editchainDebug.runSinglePaneRouting(10000));
   }
 
   // Persisted-viewport restore regression (scenario must render enough rows,
@@ -280,10 +265,9 @@ async function main() {
   if (expansion) fs.writeFileSync(path.join(outDir, 'expansion.json'), JSON.stringify(expansion, null, 2));
   if (searchResult) fs.writeFileSync(path.join(outDir, 'search.json'), JSON.stringify(searchResult, null, 2));
   if (profileSwitch) fs.writeFileSync(path.join(outDir, 'profile-switch.json'), JSON.stringify(profileSwitch, null, 2));
-  if (inspector) fs.writeFileSync(path.join(outDir, 'inspector.json'), JSON.stringify(inspector, null, 2));
+  if (singlePane) fs.writeFileSync(path.join(outDir, 'single-pane.json'), JSON.stringify(singlePane, null, 2));
   if (keyboard) fs.writeFileSync(path.join(outDir, 'keyboard.json'), JSON.stringify(keyboard, null, 2));
   if (workUnit) fs.writeFileSync(path.join(outDir, 'work-unit.json'), JSON.stringify(workUnit, null, 2));
-  if (inspectorGeometry) fs.writeFileSync(path.join(outDir, 'inspector-geometry.json'), JSON.stringify(inspectorGeometry, null, 2));
   if (restoreResult) fs.writeFileSync(path.join(outDir, 'restore.json'), JSON.stringify(restoreResult, null, 2));
   if (searchRace) fs.writeFileSync(path.join(outDir, 'search-race.json'), JSON.stringify(searchRace, null, 2));
   if (resizeResult) fs.writeFileSync(path.join(outDir, 'resize.json'), JSON.stringify(resizeResult, null, 2));
@@ -296,6 +280,7 @@ async function main() {
     '',
     '- scenario: ' + args.scenario,
     '- viewport: ' + args.viewport,
+    '- treatment: pulse',
     '- state: ' + JSON.stringify(layout.state),
     '- rows rendered: ' + layout.state.rowsRendered,
     '- svg dots: ' + (layout.svg && layout.svg.dots ? layout.svg.dots.length : 0),
@@ -313,10 +298,11 @@ async function main() {
   }
   if (searchResult) {
     const searchOk = searchResult.resultRows > 0 &&
-      searchResult.inspectorOpened === true &&
+      searchResult.secondaryPane === false &&
+      searchResult.selected === true &&
       (searchResult.navigated || searchResult.firstRowChevron);
     summary.push('- search "' + args.search + '": results=' + searchResult.resultRows +
-      ' banner="' + searchResult.bannerText + '" inspectorOpened=' + searchResult.inspectorOpened +
+      ' banner="' + searchResult.bannerText + '" secondaryPane=' + searchResult.secondaryPane +
       ' navigated=' + searchResult.navigated +
       ' (' + (searchOk ? 'OK' : 'FAIL') + ')');
   }
@@ -324,9 +310,9 @@ async function main() {
     summary.push('- profile switch: pass=' + profileSwitch.pass +
       ' steps=' + JSON.stringify(profileSwitch.steps));
   }
-  if (inspector) {
-    summary.push('- inspector routing: pass=' + inspector.pass +
-      ' steps=' + JSON.stringify(inspector.steps));
+  if (singlePane) {
+    summary.push('- single-pane routing: pass=' + singlePane.pass +
+      ' steps=' + JSON.stringify(singlePane.steps));
   }
   if (keyboard) {
     summary.push('- keyboard probe: pass=' + keyboard.pass +
@@ -338,12 +324,6 @@ async function main() {
       ' steps=' + JSON.stringify(workUnit.steps.map((s) => ({
         name: s.name, aria: s.bundleAria, subops: s.subopRows, roving: s.rovingTabs,
       }))));
-  }
-  if (inspectorGeometry) {
-    summary.push('- inspector geometry: ' + inspectorGeometry.viewports.map((v) =>
-      v.width + 'px pass=' + v.pass +
-      ' graphW=' + JSON.stringify(v.detail && v.detail.graphSvgW) +
-      ' rowsW=' + JSON.stringify(v.detail && v.detail.rowsW)).join(' | '));
   }
   if (restoreResult) {
     summary.push('- restore probe: pass=' + restoreResult.pass +
@@ -390,16 +370,16 @@ async function main() {
   const interactionFailed =
     (expansion !== null && !(expansion.subopRows === 7 && expansion.rowsRendered >= 9)) ||
     (searchResult !== null && !(searchResult.resultRows > 0 &&
-      searchResult.inspectorOpened === true &&
+      searchResult.secondaryPane === false &&
+      searchResult.selected === true &&
       (searchResult.navigated || searchResult.firstRowChevron))) ||
     (searchRace !== null && !(searchRace.steps[0] && searchRace.steps[0].latestWins === true)) ||
     (resizeResult !== null && resizeResult.pass !== true) ||
     (deferredLayout !== null && deferredLayout.pass !== true) ||
     (profileSwitch !== null && profileSwitch.pass !== true) ||
-    (inspector !== null && inspector.pass !== true) ||
+    (singlePane !== null && singlePane.pass !== true) ||
     (keyboard !== null && keyboard.pass !== true) ||
     (workUnit !== null && workUnit.pass !== true) ||
-    (inspectorGeometry !== null && inspectorGeometry.viewports.some((v) => v.pass !== true)) ||
     (restoreResult !== null && restoreResult.pass !== true);
   if (args.cmd === 'check' && (failedChecks.length > 0 || pageErrors.length > 0 || interactionFailed)) {
     console.error('CHECK FAILED: ' + failedChecks.length + ' layout check(s), ' +
@@ -420,21 +400,17 @@ async function main() {
   if (expansion) console.log('combined expansion subopRows=' + expansion.subopRows +
     ' rowsRendered=' + expansion.rowsRendered);
   if (searchResult) console.log('search results=' + searchResult.resultRows +
-    ' inspectorOpened=' + searchResult.inspectorOpened +
+    ' secondaryPane=' + searchResult.secondaryPane +
     ' navigated=' + searchResult.navigated);
   if (profileSwitch) console.log('profile-switch pass=' + profileSwitch.pass +
     ' steps=' + profileSwitch.steps.length);
-  if (inspector) console.log('inspector pass=' + inspector.pass +
-    ' steps=' + inspector.steps.length);
+  if (singlePane) console.log('single-pane pass=' + singlePane.pass +
+    ' steps=' + singlePane.steps.length);
   if (keyboard) console.log('keyboard pass=' + keyboard.pass +
     ' steps=' + keyboard.steps.length);
   if (workUnit) console.log('work-unit probe pass=' + workUnit.pass +
     ' skipped=' + workUnit.skipped +
     ' steps=' + workUnit.steps.map((s) => s.name).join(','));
-  if (inspectorGeometry) console.log('inspector geometry: ' + inspectorGeometry.viewports.map((v) =>
-    'viewport=' + v.width + ' pass=' + v.pass +
-    ' rowsW=' + JSON.stringify(v.detail && v.detail.rowsW) +
-    ' graphSvgW=' + JSON.stringify(v.detail && v.detail.graphSvgW)).join('; '));
   if (restoreResult) console.log('restore pass=' + restoreResult.pass +
     ' scrollTop=' + JSON.stringify(restoreResult.detail && restoreResult.detail.actualScrollTop) +
     ' persisted=' + JSON.stringify(restoreResult.detail && restoreResult.detail.persistedAfter));
@@ -507,7 +483,7 @@ function formatAria(page) {
     '',
     '- search input: #search',
     '- rows container: #rows',
-    '- detail pane: #detail',
+    '- secondary pane: none (single history surface)',
     '',
     '_Full ARIA snapshot requires Playwright; this is a structural summary._',
     '',

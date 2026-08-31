@@ -26,8 +26,6 @@ const rendererInstanceId = Date.now().toString(36) + '-' +
 
 const rowsEl = document.getElementById('rows');
 const searchEl = document.getElementById('search');
-const detailEl = document.getElementById('detail');
-const layoutEl = document.getElementById('layout');
 const statusLiveEl = document.getElementById('status-live');
 const profileActivityBtn = document.getElementById('profile-activity');
 const profileRawBtn = document.getElementById('profile-raw');
@@ -92,9 +90,9 @@ let totalFetched = 0;
 let searchMode = false;
 let searchQuery = '';
 
-// Inspector (master-detail) state: the selected row's node key, the row being
-// inspected, and an epoch guard so only the LATEST detail response renders
-// (rapid row clicks must never let an older response overwrite a newer one).
+// Inline selection state. The history remains a single surface: selecting a
+// row never opens a secondary pane. Enter or double-click is the explicit path
+// to the existing read-only raw JSON editor.
 let selectedRowKey = null;
 // Roving-tabindex anchor: the ABSOLUTE index of the single tabbable row in the
 // rendered window. Only that row is in the tab order (Tab enters/exits the
@@ -102,17 +100,12 @@ let selectedRowKey = null;
 // tabbing through every virtualized row. Falls back to the first rendered row
 // whenever the anchor is trimmed away by virtual scrolling (applyRovingTabindex).
 let rovingAbs = -1;
-let detailRow = null;
-let detailEpoch = 0;
-// request id -> detail epoch for in-flight GetNodeDetails/ResolveObject calls.
-const detailReqs = new Map();
 // Announced the initial history load once (aria-live), not on every page.
 let announcedInitialLoad = false;
 
 // Show an explicit loading state until the extension host finishes `Open` and
 // the first window arrives (or surfaces the open error). Runs after the state
-// declarations above so the inspector helpers clearDetail() touches are
-// initialized.
+// declarations above are initialized.
 showViewMessage('Loading history…', false);
 
 // Latest-query-wins correlation for search. A search response is rendered ONLY
@@ -297,7 +290,7 @@ function viewportVisibleBottom() {
 }
 
 /** Persist only safe profile + viewport state for genuine context recreation.
- * Ordinary detail navigation retains the live bounded cache. We never
+ * Raw JSON editor navigation retains the live bounded cache. We never
  * serialize row payloads, search state, filters, or totals: they can exceed
  * VS Code's webview-state size limit or go stale when the chain is reimported,
  * and a recreated webview can refetch its bounded window cheaply. The profile
@@ -342,7 +335,7 @@ function restoreScrollTop(rowIndex) {
 }
 
 // Branch colours for graph lanes (indexed by lane).
-const COLORS = ['#e6194b', '#3cb44b', '#ffe119', '#4363d8', '#f58231', '#911eb4', '#46f0f0', '#f032e6', '#bcf60c', '#fabebe'];
+const COLORS = ['#48f1dc', '#a18aff', '#6ee7a2', '#5ca8ff', '#ffc86a', '#ff70a6', '#72ddf7', '#c77dff', '#64dfdf', '#ff8fa3'];
 
 const LANE_W = 18;
 const DOT_R = 4;
@@ -365,40 +358,11 @@ const BUNDLE_TERMINAL_RATIO = 0.75;
 const BUNDLE_HALF_SPAN = 7;
 const BUNDLE_CAPSULE_MARGIN = 1;
 
-/** Send a request body to the extension host, correlating the response.
- *
- * Returns the request id. The extension host echoes `{ id, body }` back; the
- * message handler matches responses to requests by id and drops responses whose
- * view generation no longer matches.
- */
-function send(body) {
-  const id = nextReqId++;
-  inFlight.set(id, { body, gen: viewGen });
-  vscode.postMessage({ id, body });
-  return id;
-}
-
-/** Send a detail fetch with its epoch registered BEFORE posting.
- *
- * The harness fixture bridge responds synchronously inside postMessage, so a
- * mapping registered after `send` returns would be set only after the response
- * was already processed (and dropped). Registering the request id -> epoch
- * mapping up front keeps the response routing correct in both the synchronous
- * harness and the asynchronous real service.
- */
-function sendDetail(body, epoch) {
-  const id = nextReqId++;
-  inFlight.set(id, { body, gen: viewGen });
-  detailReqs.set(id, epoch);
-  vscode.postMessage({ id, body });
-  return id;
-}
-
 /** Send a GetWindow request and mark it as the in-flight window BEFORE posting.
  *
- * Same synchronous-bridge discipline as sendDetail: the fixture bridge responds
- * inside postMessage, so `pendingWindowReqId = send(...)` would be assigned only
- * after the response had already been processed re-entrantly — the response's
+ * The fixture bridge responds inside postMessage, so assigning the pending id
+ * only after posting would happen after the response had already been processed
+ * re-entrantly — the response's
  * `wasPendingWindow` correlation would miss, and the late assignment would leave
  * a PHANTOM pending id that blocks every later fetchWindow (the harness scroll
  * race). Registering the id up front keeps `wasPendingWindow` correct in both
@@ -422,7 +386,7 @@ function sendSearch(body, epoch) {
 
 /** Render a full-pane message (loading, open error) into #rows. */
 function showViewMessage(text, isError) {
-  clearDetail();
+  clearSelection();
   rowsEl.innerHTML = '<div class="view-message' + (isError ? ' error' : '') + '" role="' +
     (isError ? 'alert' : 'status') + '">' +
     esc(text) + '</div>';
@@ -430,16 +394,14 @@ function showViewMessage(text, isError) {
 
 /** Show a full-pane, user-visible request error with an explicit Retry action.
  *
- * Terminal GetWindow/Search failures (dead service, timed-out request) used to
- * land only in the detail pane — invisible when no inspector was open — while
- * the progressive loader retried the dead service forever. This replaces the
- * table with the error, SUSPENDS the progressive loader, and requires an
+ * Terminal GetWindow/Search failures (dead service, timed-out request) replace
+ * the table with an explicit error, SUSPEND the progressive loader, and require
  * explicit recovery: the Retry button (or re-running the open command, which
  * re-establishes the service) re-runs the failed operation.
  */
 function showRequestError(text, retryAction) {
   stopProgressiveLoader();
-  clearDetail();
+  clearSelection();
   rowsEl.innerHTML =
     '<div class="view-message error">' +
       '<div class="request-error-text">' + esc(text) + '</div>' +
@@ -526,6 +488,352 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
   }[c]));
+}
+
+/** Remove Markdown decoration while preserving the readable label text.
+ *
+ * This is intentionally small and display-oriented rather than a second full
+ * Markdown parser. It is used for tooltips, accessible names, and semantic
+ * headings such as work-unit titles, where literal `**`, backticks, link
+ * destinations, or raw HTML would add noise. Inline code keeps its contents,
+ * links keep their labels, escaped punctuation is restored, and imported HTML
+ * is omitted rather than interpreted inside the privileged webview. */
+function markdownPlainInline(value) {
+  let source = String(value);
+  source = source.replace(/\\([\\`*_[\]{}()#+\-.!~>])/g, '$1');
+  source = source.replace(/!\[([^\]\n]*)\]\([^\n)]*\)/g, '$1');
+  source = source.replace(/\[([^\]\n]+)\]\([^\n)]*\)/g, '$1');
+  source = source.replace(/`+([^`\n]*?)`+/g, '$1');
+  source = source.replace(/\*\*([^*\n]+)\*\*/g, '$1');
+  source = source.replace(/__([^_\n]+)__/g, '$1');
+  source = source.replace(/~~([^~\n]+)~~/g, '$1');
+  source = source.replace(/(^|[\s([{<:;,.!?-])\*([^*\n]+)\*(?=$|[\s)\]}>:;,.!?-])/g, '$1$2');
+  source = source.replace(/(^|[\s([{<:;,.!?-])_([^_\n]+)_(?=$|[\s)\]}>:;,.!?-])/g, '$1$2');
+  source = source.replace(/<\/?[A-Za-z][^>\n]*>/g, '');
+  // Unmatched decoration runs are never useful in a compact display label.
+  // Preserve single `*` / `_` characters so commands and identifiers are not
+  // mangled, but remove unmistakable Markdown delimiter runs and backticks.
+  source = source.replace(/\*{2,}|~{2,}|`+/g, '');
+  return source.replace(/\s+/g, ' ').trim();
+}
+
+/** Plain-text form of one Markdown source line. Block prefixes are presentation
+ * syntax, so headings/lists/tasks/quotes/fences lose their punctuation while
+ * retaining the actual sentence. */
+function markdownPlainLine(value) {
+  let line = String(value).trim();
+  line = line.replace(/^#{1,6}\s+/, '');
+  line = line.replace(/^[-+*]\s+\[[ xX]\]\s+/, '');
+  line = line.replace(/^[-+*]\s+/, '');
+  line = line.replace(/^\d+[.)]\s+/, '');
+  line = line.replace(/^>\s*/, '');
+  line = line.replace(/^\[![A-Za-z]+\]\s*/, '');
+  line = line.replace(/^`{3,}\s*[A-Za-z0-9_+.-]*\s*/, '');
+  return markdownPlainInline(line);
+}
+
+/** Readable plain-text summary for tooltips/ARIA. Unlike the visible preview,
+ * this keeps every meaningful source line so truncation never removes context. */
+function markdownPlainSummary(value) {
+  return String(value).replace(/\r\n?/g, '\n').split('\n')
+    .map(markdownPlainLine).filter(Boolean).join(' · ');
+}
+
+/** Text-bearing fields commonly found in provider-neutral structured tool
+ * envelopes. Ordering matters: prose/output wins over request metadata. */
+const TOOL_PAYLOAD_TEXT_KEYS = [
+  'text', 'output_text', 'input_text', 'message', 'summary', 'output',
+  'content', 'status', 'completed', 'failed', 'error',
+  'cmd', 'command', 'query', 'path',
+];
+
+/** Find the first useful string in a parsed tool envelope without displaying
+ * serializer fields such as `type: input_text`. The small visit budget keeps
+ * imported, unexpectedly deep payloads from monopolizing the webview. */
+function firstToolPayloadText(value) {
+  const pending = [value];
+  let visits = 0;
+  while (pending.length && visits < 48) {
+    const current = pending.shift();
+    visits++;
+    if (typeof current === 'string' && current.trim()) return current;
+    if (Array.isArray(current)) {
+      pending.push(...current);
+      continue;
+    }
+    if (!current || typeof current !== 'object') continue;
+    TOOL_PAYLOAD_TEXT_KEYS.forEach((key) => {
+      if (Object.prototype.hasOwnProperty.call(current, key)) pending.push(current[key]);
+    });
+  }
+  return '';
+}
+
+/** Decode a JSON tool payload, with a narrow recovery path for summaries that
+ * were truncated after serialization. Raw source is still retained in the row
+ * tooltip and the JSON editor; this only chooses the visible preview text. */
+function decodedToolPayloadText(value) {
+  const source = String(value).trim();
+  try {
+    let parsed = JSON.parse(source);
+    // Some adapters serialize a JSON envelope as a JSON string. Unwrap at most
+    // once so malformed or recursive input cannot create unbounded work.
+    if (typeof parsed === 'string' && /^(?:\[\s*(?:\{|"|\])|\{\s*(?:"|\}))/.test(parsed.trim())) {
+      parsed = JSON.parse(parsed);
+    }
+    return firstToolPayloadText(parsed);
+  } catch (_) {
+    const textField = /"(?:text|output_text|input_text|message|summary|output|completed|failed|error|cmd|command)"\s*:\s*"((?:\\.|[^"\\])*)/.exec(source);
+    if (!textField) return '';
+    const encoded = textField[1].replace(/\\$/, '');
+    try {
+      return JSON.parse('"' + encoded + '"');
+    } catch (_) {
+      // A summary may be cut in the middle of a JSON string. Recover only the
+      // harmless display escapes needed by the first-line preview.
+      return encoded.replace(/\\r\\n|\\n|\\r/g, '\n')
+        .replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+    }
+  }
+}
+
+/** Reduce multi-line execution envelopes to their meaningful first status or
+ * output line. Standard script lifecycle wording is normalized so wall time,
+ * cell IDs, and serializer details do not become the row's primary content. */
+function conciseToolText(value) {
+  const lines = String(value).replace(/\r\n?/g, '\n').split('\n')
+    .map((line) => line.trim()).filter(Boolean);
+  const status = lines.find((line) => /^Script\s+(?:completed|failed|running)\b/i.test(line));
+  if (/^Script\s+completed\b/i.test(status || '')) return 'Script completed';
+  if (/^Script\s+failed\b/i.test(status || '')) return 'Script failed';
+  if (/^Script\s+running\b/i.test(status || '')) return 'Script running';
+  return lines.length ? lines[0].replace(/\s+/g, ' ') : '';
+}
+
+/** Presentation-only compaction for action/result payloads. Human narrative is
+ * left untouched for Markdown rendering. Obvious JSON/tool wrappers become a
+ * readable line; undecodable structured payloads receive a calm generic label
+ * instead of leaking brackets, escaped newlines, and serializer field names. */
+function displaySummaryForRow(row, value) {
+  const source = String(value);
+  const toolishRow = row && (row.record_role === 'action' || row.record_role === 'result' ||
+    row.kind === 'tool' || row.kind === 'command') &&
+    (row.activity_kind === 'execute' || row.is_system || row.kind === 'tool' || row.kind === 'command');
+  const trimmed = source.trim();
+  const container = /^<[A-Za-z][A-Za-z0-9_.:-]*>\s*/.exec(trimmed);
+  // Service summaries can be length-capped before an outer notification's
+  // closing tag. Removing only a leading, inert container is enough to detect
+  // the JSON body while leaving ordinary wrapped prose on its original path.
+  const candidate = container ? trimmed.slice(container[0].length).trim() : trimmed;
+  const wrapper = /^tool:\s*[A-Za-z0-9_.:-]+(?:\s+|$)/i.exec(candidate);
+  const payload = wrapper ? candidate.slice(wrapper[0].length).trim() : candidate;
+  const jsonish = /^(?:\[\s*(?:\{|"|\])|\{\s*(?:"|\})|")/.test(payload);
+  if (!toolishRow && !jsonish) return source;
+  if (toolishRow && !wrapper && !jsonish) return source;
+
+  const decoded = jsonish ? decodedToolPayloadText(payload) : payload;
+  const concise = conciseToolText(decoded);
+  if (concise) return concise;
+  // A narrative JSON sample with no recognized text-bearing envelope remains
+  // authored content. Generic fallback labels are reserved for operational
+  // rows whose payload is known to be presentation metadata.
+  if (!toolishRow) return source;
+  if (row.outcome === 'success') return 'Completed';
+  if (row.outcome === 'failure') return 'Failed';
+  if (row.outcome === 'warning') return 'Completed with warnings';
+  if (row.outcome === 'cancelled') return 'Cancelled';
+  if (row.record_role === 'action' || row.kind === 'command') return 'Tool request';
+  return 'Tool result';
+}
+
+/** Find an unescaped closing Markdown delimiter. */
+function markdownClosing(source, delimiter, start) {
+  let at = source.indexOf(delimiter, start);
+  while (at >= 0) {
+    if (source[at - 1] !== '\\' && at > start) return at;
+    at = source.indexOf(delimiter, at + delimiter.length);
+  }
+  return -1;
+}
+
+/** Render the small inline Markdown subset that can remain legible in one
+ * fixed-height history row. Raw HTML is never accepted: every text fragment
+ * and tooltip is escaped, and Markdown links are visual spans rather than
+ * navigable anchors. This keeps imported session content inert inside the
+ * privileged VS Code webview while preserving its reading hierarchy. */
+function renderMarkdownInline(value, depth) {
+  const source = String(value);
+  const level = depth || 0;
+  if (level > 4) return '<span class="md-text">' + esc(markdownPlainInline(source)) + '</span>';
+
+  let html = '';
+  let plain = '';
+  const flushPlain = () => {
+    if (!plain) return;
+    const cleaned = markdownPlainInline(plain);
+    if (cleaned) {
+      // markdownPlainInline trims labels by design. Restore one collapsed edge
+      // space for an inline fragment so `text **strong** text` does not become
+      // `textstrongtext` when separate FLEX items meet in the DOM. Non-breaking
+      // spaces survive flex-item boundary whitespace trimming.
+      const leading = /^\s/.test(plain) ? '\u00a0' : '';
+      const trailing = /\s$/.test(plain) ? '\u00a0' : '';
+      html += '<span class="md-text">' + esc(leading + cleaned + trailing) + '</span>';
+    } else if (/\s/.test(plain)) {
+      // A whitespace-only fragment can sit between adjacent formatted spans.
+      html += '<span class="md-space" aria-hidden="true">\u00a0</span>';
+    }
+    plain = '';
+  };
+  let i = 0;
+  while (i < source.length) {
+    // Markdown escapes: show the escaped punctuation without the backslash.
+    if (source[i] === '\\' && i + 1 < source.length && /[\\`*_[\]{}()#+\-.!~>]/.test(source[i + 1])) {
+      plain += source[i + 1];
+      i += 2;
+      continue;
+    }
+
+    // Images and links stay non-navigable in the dense row. The destination is
+    // available as an escaped tooltip, while the label keeps inline emphasis.
+    const link = /^(!?)\[([^\]\n]+)\]\(([^)\n]+)\)/.exec(source.slice(i));
+    if (link) {
+      flushPlain();
+      const image = link[1] === '!';
+      const label = renderMarkdownInline(link[2], level + 1);
+      const target = link[3].trim();
+      html += '<span class="' + (image ? 'md-image' : 'md-link') + '" title="' +
+        esc(target) + '">' + (image ? '<span aria-hidden="true">image · </span>' : '') + label + '</span>';
+      i += link[0].length;
+      continue;
+    }
+
+    // Code spans are literal: no Markdown is interpreted inside them.
+    if (source[i] === '`') {
+      const run = /^`+/.exec(source.slice(i))[0];
+      const close = markdownClosing(source, run, i + run.length);
+      if (close >= 0) {
+        flushPlain();
+        const code = source.slice(i + run.length, close).replace(/^ | $/g, '');
+        html += '<code class="md-code">' + esc(code) + '</code>';
+        i = close + run.length;
+        continue;
+      }
+    }
+
+    const paired = [
+      { delimiter: '**', open: '<strong class="md-strong">', close: '</strong>' },
+      { delimiter: '__', open: '<strong class="md-strong">', close: '</strong>' },
+      { delimiter: '~~', open: '<span class="md-strike">', close: '</span>' },
+    ].find((token) => source.startsWith(token.delimiter, i));
+    if (paired) {
+      const close = markdownClosing(source, paired.delimiter, i + paired.delimiter.length);
+      if (close >= 0) {
+        flushPlain();
+        html += paired.open + renderMarkdownInline(
+          source.slice(i + paired.delimiter.length, close), level + 1
+        ) + paired.close;
+        i = close + paired.delimiter.length;
+        continue;
+      }
+    }
+
+    // Conservative single-emphasis handling avoids treating identifiers such
+    // as `work_unit_id` as italics while still respecting prose emphasis.
+    if (source[i] === '*' || source[i] === '_') {
+      const delimiter = source[i];
+      const previous = i > 0 ? source[i - 1] : '';
+      const next = source[i + 1] || '';
+      const boundaryBefore = i === 0 || /[\s([{<:;,.!?-]/.test(previous);
+      const close = markdownClosing(source, delimiter, i + 1);
+      const after = close >= 0 ? source[close + 1] || '' : '';
+      const boundaryAfter = close >= 0 && (!after || /[\s)\]}>:;,.!?-]/.test(after));
+      if (boundaryBefore && next && !/\s/.test(next) && boundaryAfter) {
+        flushPlain();
+        html += '<em class="md-em">' + renderMarkdownInline(source.slice(i + 1, close), level + 1) + '</em>';
+        i = close + 1;
+        continue;
+      }
+    }
+
+    plain += source[i];
+    i++;
+  }
+  flushPlain();
+  return html;
+}
+
+/** Render one Markdown source line with a compact semantic prefix. */
+function renderMarkdownLine(value) {
+  const line = String(value).trim();
+  if (!line) return '';
+
+  const heading = /^(#{1,6})\s+(.+?)\s*#*$/.exec(line);
+  if (heading) {
+    return '<span class="md-line md-heading md-h' + heading[1].length + '">' +
+      renderMarkdownInline(heading[2]) + '</span>';
+  }
+
+  const task = /^[-+*]\s+\[([ xX])\]\s+(.+)$/.exec(line);
+  if (task) {
+    const done = task[1].toLowerCase() === 'x';
+    return '<span class="md-line md-list md-task' + (done ? ' md-task-done' : '') + '">' +
+      '<span class="md-marker" aria-hidden="true">' + (done ? '✓' : '○') + '</span>' +
+      renderMarkdownInline(task[2]) + '</span>';
+  }
+
+  const unordered = /^[-+*]\s+(.+)$/.exec(line);
+  if (unordered) {
+    return '<span class="md-line md-list"><span class="md-marker" aria-hidden="true">•</span>' +
+      renderMarkdownInline(unordered[1]) + '</span>';
+  }
+
+  const ordered = /^(\d+[.)])\s+(.+)$/.exec(line);
+  if (ordered) {
+    return '<span class="md-line md-list"><span class="md-marker" aria-hidden="true">' +
+      esc(ordered[1]) + '</span>' + renderMarkdownInline(ordered[2]) + '</span>';
+  }
+
+  const quote = /^>\s*(.+)$/.exec(line);
+  if (quote) {
+    const callout = /^\[!([A-Za-z]+)\]\s*(.*)$/.exec(quote[1]);
+    if (callout) {
+      return '<span class="md-line md-quote"><span class="md-callout">' + esc(callout[1]) + '</span>' +
+        renderMarkdownInline(callout[2]) + '</span>';
+    }
+    return '<span class="md-line md-quote"><span class="md-marker" aria-hidden="true">›</span>' +
+      renderMarkdownInline(quote[1]) + '</span>';
+  }
+
+  const fence = /^`{3,}\s*([A-Za-z0-9_+.-]*)\s*(.*)$/.exec(line);
+  if (fence) {
+    const language = fence[1] || 'code';
+    return '<span class="md-line md-fence"><span class="md-callout">' + esc(language) + '</span>' +
+      renderMarkdownInline(fence[2]) + '</span>';
+  }
+
+  return '<span class="md-line">' + renderMarkdownInline(line) + '</span>';
+}
+
+/** Convert Markdown into a safe, restrained one-line read-through.
+ *
+ * A fixed-height history row is a preview, not a document viewport. Render the
+ * first meaningful source line with simple Markdown semantics and summarize
+ * the remainder as a quiet `+N lines` tail. This avoids the previous horizontal
+ * parade of three miniature paragraphs while preserving the full plain source
+ * in the row tooltip and accessible name. */
+function renderMarkdownSummary(value) {
+  const lines = String(value).replace(/\r\n?/g, '\n').split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line && markdownPlainLine(line));
+  const rendered = lines.length ? renderMarkdownLine(lines[0]) : '';
+  if (!rendered) return '<span class="md-line md-empty">Structured content</span>';
+  if (lines.length > 1) {
+    const hidden = lines.length - 1;
+    return rendered + '<span class="md-more" aria-hidden="true">+' + hidden +
+      (hidden === 1 ? ' line' : ' lines') + '</span>';
+  }
+  return rendered;
 }
 
 
@@ -653,7 +961,10 @@ const HIDE_DATE_MAX = 400;
 /** Fixed columns hidden at the current viewport width. */
 function hiddenColumns() {
   const w = window.innerWidth || rowsEl.clientWidth || 0;
-  const hidden = new Set();
+  // Pulse is narrative-first: author and exact identity stay available through
+  // explicit raw JSON activation instead of competing with Content. Date is
+  // retained until the narrowest breakpoint so the read-through stays temporal.
+  const hidden = new Set(['author', 'commit']);
   if (w <= HIDE_COMMIT_MAX) hidden.add('commit');
   if (w <= HIDE_AUTHOR_MAX) hidden.add('author');
   if (w <= HIDE_DATE_MAX) hidden.add('date');
@@ -858,7 +1169,13 @@ function bundleTerminalRadius() {
  */
 function graphLaneWidth() {
   const numLanes = maxLane + 1;
-  return Math.max(MIN_LANE_W, Math.min(LANE_W, graphWidthBudget() / (numLanes + 1)));
+  // Pulse compresses topology into a quiet navigation rail. A manually resized
+  // Graph column remains authoritative and therefore uses normal lane spacing.
+  const pulseScale = colWidths.graph !== null ? 1 : 0.82;
+  return Math.max(
+    MIN_LANE_W,
+    Math.min(LANE_W * pulseScale, graphWidthBudget() / (numLanes + 1))
+  );
 }
 
 /** X pixel position of a lane's centre within the graph column.
@@ -1304,7 +1621,11 @@ function workUnitOf(row) {
  * never the full opaque unit id as primary text. */
 function workUnitTitle(row) {
   const wu = workUnitOf(row);
-  if (wu && typeof wu.title === 'string' && wu.title) return wu.title;
+  if (wu && typeof wu.title === 'string' && wu.title) {
+    const title = wu.title.replace(/\r\n?/g, '\n').split('\n')
+      .map(markdownPlainLine).find(Boolean);
+    if (title) return title;
+  }
   const fallback = WORK_UNIT_FALLBACK_LABELS[row.activity_kind];
   if (fallback) return fallback;
   if (row.kind === 'message' || row.kind === 'command') return 'Request';
@@ -1351,24 +1672,53 @@ function promotedClasses(row) {
   return ' row-promoted row-promoted-rail';
 }
 
-/** Compact count/status chrome for an execute-run bundle row. The count comes
- * ONLY from the DTO's `member_count` (never parsed from the summary or the
- * flattened sub-op count); success wording + badge appear only when the row
- * reports a success outcome, otherwise the wording stays neutral. */
+/** One concise label for an execute-run bundle row. The count comes ONLY from
+ * the DTO's `member_count` (never parsed from the summary or flattened sub-op
+ * count). A quiet check appears only when structured success evidence exists;
+ * unknown outcome adds no pessimistic "outcome unknown" label. */
 function bundleChrome(row) {
   const bundle = row.activity_bundle;
   const mc = bundle ? bundle.member_count : undefined;
-  const countText = typeof mc === 'number'
-    ? mc + (mc === 1 ? ' step' : ' steps')
-    : '';
+  if (typeof mc !== 'number') return '';
+  const command = row.kind === 'command';
+  const countText = mc + (command
+    ? (mc === 1 ? ' command' : ' commands')
+    : (mc === 1 ? ' tool step' : ' tool steps'));
   const success = row.outcome === 'success';
-  const statusText = success ? 'completed' : 'outcome unknown';
-  return (countText
-      ? '<span class="bundle-count" title="' + esc(countText) + '">' + esc(countText) + '</span>'
-      : '') +
-    '<span class="bundle-status' + (success ? ' bundle-status-success' : '') + '">' +
-    esc(statusText) + '</span>';
+  const title = countText + (success ? ', completed' : '');
+  return '<span class="bundle-count" title="' + esc(title) + '">' + esc(countText) + '</span>' +
+    (success
+      ? '<span class="bundle-status bundle-status-success" title="completed" aria-label="completed">✓</span>'
+      : '');
 }
+
+/** Restrained leading metadata for one row.
+ *
+ * Typed bundles own their complete compact label, so they never repeat `run`,
+ * `ok`, and a synthetic summary beside the same count. Structural relations
+ * outrank generic activity; when one exists, only a negative/cancelled outcome
+ * may accompany it. Routine successful conversation rows remain pure prose. */
+function rowSemanticChrome(row, isBundle) {
+  if (isBundle) return bundleChrome(row);
+  const relations = relationBadges(row);
+  if (relations) {
+    const consequential = row.outcome === 'warning' || row.outcome === 'failure' ||
+      row.outcome === 'cancelled';
+    return relations + (consequential ? outcomeBadge(row) : '');
+  }
+  const activity = activityBadge(row);
+  const routineNarrativeSuccess = row.record_role === 'narrative' &&
+    row.activity_kind === 'conversation' && row.outcome === 'success';
+  const routineToolSuccess = (row.record_role === 'action' || row.record_role === 'result') &&
+    row.activity_kind === 'execute' && row.outcome === 'success';
+  return activity + (routineNarrativeSuccess || routineToolSuccess ? '' : outcomeBadge(row));
+}
+
+/** Whitelisted record-role class used for typographic hierarchy. Older rows
+ * without the provider-neutral field keep the existing kind-based fallback. */
+const RECORD_ROLE_CLASSES = new Set([
+  'narrative', 'action', 'result', 'artifact', 'lifecycle', 'echo', 'unknown',
+]);
 
 /** Short commit/ID display value for the Commit/ID column.
  *
@@ -1389,15 +1739,15 @@ function shortCommitId(row) {
  * Two kinds of rows:
  *   - Top-level rows carrying bundled sub-ops get a chevron BUTTON in their
  *     content cell; only that button toggles inline expansion (revealing one
- *     uniform ROW_H row per sub-op directly below). Clicking the row itself
- *     selects it in the inspector instead.
+ *     uniform ROW_H row per sub-op directly below). Clicking the row selects it
+ *     inline; double-click opens its raw JSON editor.
  *   - Sub-op rows (`row.is_subop`) render indented with a small Codicon; clicking
- *     selects them in the inspector.
+ *     selects them inline.
  *
  * The Activity profile additionally layers stable semantic chrome over the flat
  * row (see the work-unit/bundle/promotion helpers above): work-unit starts get
  * a compact two-line unit header inside the SAME fixed ROW_H (never the opaque
- * unit id as primary text), execute-run bundles get count/status chrome plus
+ * unit id as primary text), execute-run bundles get one count/status label plus
  * disclosure semantics, and promoted rows get a quiet rail (restrained
  * narrative) or a strong accent (failure/warning/cancelled and change/verify).
  * Raw renders the exact flat row with none of it.
@@ -1424,13 +1774,20 @@ function buildRowHtml(row, absIdx, isGroupStart) {
     : 'row-dim';
   const humanClass = row.author === 'human' ? ' row-human' : '';
   const subopClass = row.is_subop ? ' row-subop' : '';
-  const badges = relationBadges(row) + activityBadge(row) + outcomeBadge(row);
+  const roleClass = RECORD_ROLE_CLASSES.has(row.record_role)
+    ? ' row-role-' + row.record_role
+    : '';
+  const semanticChrome = rowSemanticChrome(row, isBundle);
   // Badge rows are graph-topology-critical; the CSS override lifts their text
   // cells out of the tool/dim opacity dimming so the badge stays readable at
   // full strength (row height is untouched — the class only affects opacity).
-  const relClass = badges ? ' row-has-badges' : '';
+  const relClass = semanticChrome ? ' row-has-badges' : '';
   const selectedClass = row.node_key === selectedRowKey ? ' row-selected' : '';
   const summaryText = row.summary || '(no summary)';
+  const displaySummary = displaySummaryForRow(row, summaryText);
+  const plainSummary = markdownPlainSummary(displaySummary) || '(no summary)';
+  const detailSummary = markdownPlainSummary(summaryText) || '(no summary)';
+  const unitTitle = isWuStart ? workUnitTitle(row) : '';
   const hasSubs = !row.is_subop && hasSubOps(row);
   const expanded = hasSubs && expandedBlocks.has(blockIndexOfAbs(absIdx));
   // Bundle rows are expandable disclosures: they always expose aria-expanded
@@ -1447,50 +1804,55 @@ function buildRowHtml(row, absIdx, isGroupStart) {
       '" aria-label="' + (expanded ? 'Collapse bundled metadata records' : 'Expand bundled metadata records') +
       '"' + expandableAttr + '>' + chevron + '</button>'
     : '';
-  const bundleHtml = isBundle ? bundleChrome(row) : '';
+  const semanticHtml = semanticChrome
+    ? '<span class="row-meta">' + semanticChrome + '</span>'
+    : '';
   let content;
+  let workUnitTitleOnly = false;
   if (row.is_subop) {
     // A bundled sub-op expanded inline: small Codicon + indented summary.
     const icon = subopIcon(row.subop_kind);
     content = '<span class="subop-icon codicon codicon-' + icon + '" aria-hidden="true"></span>' +
-      '<span class="subop-summary">' + esc(summaryText) + '</span>';
+      '<span class="subop-summary">' + renderMarkdownSummary(displaySummary) + '</span>';
   } else {
     // Top-level row: the chevron BUTTON toggles inline expansion (the only
-    // control that does); the row itself is a normal inspector selection
-    // target. Bundle chrome sits between the chevron and the badges/summary.
-    // The summary text is wrapped in a flex-ellipsizing span so the inline
-    // chrome (chevron/badges/bundle pills) and the text share one constrained
-    // flex line: at narrow widths the chips shrink/ellipsize instead of laying
-    // out beyond the content cell (NO_HORIZONTAL_OVERFLOW contract).
-    content = chevronHtml + bundleHtml + badges +
-      '<span class="summary-text">' + esc(summaryText) + '</span>';
+    // control that does); the row itself is a normal inline-selection
+    // target. Typed bundles use their one structured label as the whole compact
+    // summary; their generated `N tool steps (success)` string is deliberately
+    // not repeated. Ordinary rows keep at most the restrained semantic prefix
+    // followed by a flexible, safely rendered Markdown preview.
+    content = chevronHtml + semanticHtml + (isBundle
+      ? ''
+      : '<span class="summary-text">' + renderMarkdownSummary(displaySummary) + '</span>');
   }
   if (isWuStart) {
     // Compact two-line unit header inside the fixed ROW_H: the unit title +
-    // count pill sit above the row's own summary. Content cell height is
-    // untouched (still 34px) — only the block's internal layout changes.
-    const title = workUnitTitle(row);
+    // count sit above the row's own summary. When the initiating request is
+    // itself the start row, the title and summary are identical; render it once
+    // and vertically center the header instead of duplicating the sentence.
+    workUnitTitleOnly = unitTitle === plainSummary;
     const countHtml = typeof wu.count === 'number'
       ? '<span class="work-unit-count" title="' + esc(workUnitCountText(wu.count)) + '">' +
         esc(workUnitCountText(wu.count)) + '</span>'
       : '';
     content = '<span class="work-unit-ribbon-line">' +
-      '<span class="work-unit-ribbon" title="' + esc(title) + '">' + esc(title) + '</span>' +
-      countHtml + '</span>' +
-      '<span class="work-unit-row-line">' + content + '</span>';
+      '<span class="work-unit-ribbon" title="' + esc(unitTitle) + '">' + esc(unitTitle) + '</span>' +
+      countHtml + '</span>' + (workUnitTitleOnly
+      ? ''
+      : '<span class="work-unit-row-line">' + content + '</span>');
   }
   const dateText = formatDate(row.timestamp_ms);
   const authorText = row.author || '';
   // Descriptive accessible name: bundle rows read as disclosures ("5-step
   // execute run: summary"); work-unit starts lead with their unit header.
-  let ariaLabel = summaryText;
+  let ariaLabel = plainSummary;
   if (isBundle) {
     const mc = row.activity_bundle.member_count;
     ariaLabel = 'Execute run' +
       (typeof mc === 'number' ? ', ' + mc + (mc === 1 ? ' step' : ' steps') : '') +
-      ': ' + summaryText;
+      (row.outcome === 'success' ? ', completed' : '');
   } else if (isWuStart) {
-    ariaLabel = workUnitTitle(row) + ': ' + summaryText;
+    ariaLabel = workUnitTitleOnly ? unitTitle : unitTitle + ': ' + plainSummary;
   }
   // Roving tabindex: exactly one row per rendered window is tabbable (the rest
   // are focusable-but-not-tabbable so keyboard users step through the grid as
@@ -1505,16 +1867,19 @@ function buildRowHtml(row, absIdx, isGroupStart) {
         ? ' data-bundle-count="' + row.activity_bundle.member_count + '"'
         : '')
     : '';
-  return '<div class="row ' + kindClass + humanClass + subopClass + relClass + selectedClass + groupClass +
+  return '<div class="row ' + kindClass + humanClass + subopClass + roleClass + relClass + selectedClass + groupClass +
     workUnitClasses(row) + (isBundle ? ' row-activity-bundle' : '') + promotedCls +
     '" role="row" tabindex="' + rovingTab + '" aria-selected="' + (row.node_key === selectedRowKey ? 'true' : 'false') + '"' +
     expandableAttr +
-    ' aria-label="' + esc(ariaLabel) + '" title="' + esc(summaryText) + '"' +
+    ' aria-label="' + esc(ariaLabel) + '" title="' + esc(detailSummary) + '"' +
     ' data-key="' + esc(row.node_key) +
     '" data-row="' + absIdx + '"' + wuAttrs + bundleAttrs + ' style="' + colStyle() + '">' +
     groupLabel +
     '<div class="graph-cell" role="gridcell">' + buildGraphCell(row) + '</div>' +
-    '<div class="text-cell" role="gridcell"><div class="summary' + (isWuStart ? ' work-unit-block' : '') + '" title="' + esc(summaryText) + '">' + content + '</div></div>' +
+    '<div class="text-cell" role="gridcell"><div class="summary' +
+      (isWuStart ? ' work-unit-block' : '') +
+      (workUnitTitleOnly ? ' work-unit-title-only' : '') +
+      '" title="' + esc(detailSummary) + '">' + content + '</div></div>' +
     '<div class="date-cell" role="gridcell"' + (dateText ? ' title="' + esc(dateText) + '"' : '') + '>' + esc(dateText) + '</div>' +
     '<div class="author-cell" role="gridcell"' + (authorText ? ' title="' + esc(authorText) + '"' : '') + '>' + esc(authorText) + '</div>' +
     '<div class="commit-cell" role="gridcell" title="' + esc(row.commit_id || row.op_id || '') + '">' + esc(shortCommitId(row)) + '</div>' +
@@ -1671,7 +2036,7 @@ function reanchorTo(top, bottom) {
   // resets scrollTop to 0).
   const prevScrollTop = rowsEl.scrollTop;
   // Preserve focus too: rebuilds happen not only on jumps but on the debounced
-  // width recompute (inspector open/close resizes #rows), and silently
+  // width recompute (host layout changes can resize #rows), and silently
   // blurring the focused row mid-interaction is a keyboard-UX regression. If a
   // row (or a control inside it) had focus, restore focus to the rebuilt row
   // at the same absolute index; a scrolled-away or absent row is skipped
@@ -1697,7 +2062,7 @@ function reanchorTo(top, bottom) {
       applyRovingTabindex();
       // preventScroll: this is a REBUILD, not navigation — restoring focus to
       // the previously-focused row must never scroll it into view (that would
-      // yank the user's scroll position on an inspector open/close resize).
+      // yank the user's scroll position during a host resize).
       restored.focus({ preventScroll: true });
     }
   }
@@ -1765,8 +2130,9 @@ function attachRowClicks() {
   const w = wrapEl();
   if (!w) return;
   w.querySelectorAll('.row').forEach((el) => {
-    // The chevron is the ONLY control that toggles bundled sub-ops; an
-    // ordinary row click selects the row in the inspector instead.
+    // The chevron is the ONLY pointer control that toggles bundled sub-ops.
+    // A normal click is deliberately local to this single-pane surface;
+    // double-click is the explicit pointer gesture for raw JSON.
     const chevron = el.querySelector('.subop-chevron');
     if (chevron) {
       chevron.addEventListener('click', (e) => {
@@ -1780,16 +2146,24 @@ function attachRowClicks() {
     el.addEventListener('click', () => {
       const absIdx = parseInt(el.getAttribute('data-row'), 10);
       const row = cache.get(absIdx);
-      if (row) inspect(row, absIdx);
+      if (row) selectRow(row, absIdx);
+    });
+    el.addEventListener('dblclick', (e) => {
+      if (e.target.closest && e.target.closest('button')) return;
+      const absIdx = parseInt(el.getAttribute('data-row'), 10);
+      const row = cache.get(absIdx);
+      if (!row) return;
+      selectRow(row, absIdx);
+      openRawJson(row);
     });
   });
 }
 
 // Keyboard activation: ArrowUp/Down move focus between rendered rows (roving
 // tabindex — only the current row is in the tab order, so Tab enters/exits the
-// grid as a unit instead of tabbing through every virtualized row); Enter
-// selects/inspects the focused row; Space toggles bundled sub-ops when the row
-// has them (chevron behaviour), else selects. The chevron button handles its
+// grid as a unit instead of tabbing through every virtualized row); Enter opens
+// raw JSON for an ordinary row; Space selects, or toggles bundled sub-ops when
+// the row has them (chevron behaviour). The chevron button handles its
 // own Enter/Space via native button activation (we skip events originating
 // inside it to avoid a double toggle).
 rowsEl.addEventListener('keydown', (e) => {
@@ -1848,7 +2222,8 @@ rowsEl.addEventListener('keydown', (e) => {
     toggleExpandFor(row, absIdx);
     return;
   }
-  inspect(row, absIdx);
+  selectRow(row, absIdx);
+  if (e.key === 'Enter') openRawJson(row);
 });
 
 // Any row that receives focus (Tab entry, programmatic focus, pointer) becomes
@@ -2080,9 +2455,10 @@ function progressiveLoad() {
   syncWindow();
 }
 
-/** Mark the row as the inspector selection (DOM + state). Rows are rebuilt by
+/** Mark a row as the inline selection (DOM + state). Rows are rebuilt by
  * virtual scroll, so `buildRowHtml` also re-applies the selected class from
- * `selectedRowKey` on every render. */
+ * `selectedRowKey` on every render. Selection never changes the table width or
+ * opens a secondary surface. */
 function selectRow(row, absIdx) {
   const w = wrapEl();
   if (w) {
@@ -2100,39 +2476,23 @@ function selectRow(row, absIdx) {
   selectedRowKey = row.node_key;
 }
 
-/** Inspect a row in the master-detail inspector.
- *
- * An ordinary row click selects the row and requests its details
- * (GetNodeDetails for ops, ResolveObject for git commits) into the inspector
- * pane — it NEVER opens an editor tab. Bundled sub-ops are toggled only by the
- * chevron button (or Space on the row). Sub-op rows have no graph node of
- * their own; they render their local summary and offer explicit raw-JSON
- * navigation.
- */
-function inspect(row, absIdx) {
-  console.log('[editchain] inspect', row && row.node_key);
-  selectRow(row, absIdx);
-  detailRow = row;
-  detailEpoch++;
-  const epoch = detailEpoch;
-  showDetailLoading(row);
+/** Open the selected record in the existing read-only JSON editor. This is an
+ * explicit activation only (Enter or double-click); ordinary reading and row
+ * selection stay entirely inside the single history surface. */
+function openRawJson(row) {
+  if (!row) return;
   if (row.git_oid) {
-    sendDetail({ ResolveObject: { repository: row.repository, oid: row.git_oid } }, epoch);
+    vscode.postMessage({ type: 'openJson', git_oid: row.git_oid, repository: row.repository });
   } else if (row.op_id) {
-    sendDetail({ GetNodeDetails: { op_id: row.op_id } }, epoch);
+    vscode.postMessage({ type: 'openJson', op_id: row.op_id });
   } else {
-    renderDetails({ summary: row.summary || '', body: '' }, row);
+    announce('No raw record is available for this row');
   }
 }
 
-/** Hide the detail pane (e.g. on reset/search/close) and clear selection. */
-function clearDetail() {
-  detailEpoch++;
-  detailReqs.clear();
-  layoutEl.classList.remove('has-detail');
-  detailEl.innerHTML = '';
+/** Clear the inline selection when replacing or resetting the history view. */
+function clearSelection() {
   selectedRowKey = null;
-  detailRow = null;
   const w = wrapEl();
   if (w) {
     const prev = w.querySelector('.row-selected');
@@ -2140,97 +2500,6 @@ function clearDetail() {
       prev.classList.remove('row-selected');
       prev.setAttribute('aria-selected', 'false');
     }
-  }
-}
-
-/** Show the inspector loading state with the row's own summary as title. */
-function showDetailLoading(row) {
-  layoutEl.classList.add('has-detail');
-  detailEl.innerHTML = '';
-  const titleEl = document.createElement('div');
-  titleEl.className = 'detail-title';
-  titleEl.textContent = (row && row.summary) || '(no summary)';
-  detailEl.appendChild(titleEl);
-  const loading = document.createElement('div');
-  loading.className = 'detail-loading';
-  loading.setAttribute('role', 'status');
-  loading.textContent = 'Loading details…';
-  detailEl.appendChild(loading);
-}
-
-/** Render a detail error into the open inspector. */
-function renderDetailError(text) {
-  if (layoutEl.classList.contains('has-detail')) {
-    detailEl.innerHTML = '<div class="detail-title">Error</div>' +
-      '<pre class="detail-body">' + esc(text) + '</pre>';
-  }
-}
-
-/** Render node details in the inspector pane with Close + raw-JSON actions. */
-function renderDetails(details, row) {
-  try {
-    detailEl.innerHTML = '';
-    const rowForActions = row || detailRow;
-    const head = document.createElement('div');
-    head.className = 'detail-head';
-    const titleEl = document.createElement('div');
-    titleEl.className = 'detail-title';
-    titleEl.textContent = (details && details.summary) ||
-      (rowForActions && rowForActions.summary) || '(no summary)';
-    head.appendChild(titleEl);
-    const metaEl = document.createElement('div');
-    metaEl.className = 'detail-meta';
-    const parts = [];
-    if (rowForActions) {
-      if (rowForActions.git_oid) {
-        parts.push('commit ' + shortCommitId(rowForActions));
-      } else if (rowForActions.op_id) {
-        parts.push('op ' + shortId(rowForActions.op_id));
-      }
-      if (rowForActions.activity_kind) parts.push(String(rowForActions.activity_kind));
-      if (rowForActions.record_role) parts.push(String(rowForActions.record_role));
-      if (rowForActions.outcome) parts.push(String(rowForActions.outcome));
-      if (rowForActions.turn_id) parts.push('turn ' + shortId(rowForActions.turn_id));
-      if (rowForActions.timestamp_ms) parts.push(formatDate(rowForActions.timestamp_ms));
-    }
-    metaEl.textContent = parts.join(' · ');
-    head.appendChild(metaEl);
-    detailEl.appendChild(head);
-
-    const actions = document.createElement('div');
-    actions.className = 'detail-actions';
-    const closeBtn = document.createElement('button');
-    closeBtn.type = 'button';
-    closeBtn.className = 'detail-btn';
-    closeBtn.textContent = 'Close';
-    closeBtn.addEventListener('click', () => clearDetail());
-    actions.appendChild(closeBtn);
-    const openBtn = document.createElement('button');
-    openBtn.type = 'button';
-    openBtn.className = 'detail-btn';
-    openBtn.textContent = 'Open raw JSON';
-    openBtn.disabled = !rowForActions || (!rowForActions.op_id && !rowForActions.git_oid);
-    openBtn.addEventListener('click', () => {
-      // The ONLY path that opens an editor tab: an explicit user action.
-      if (rowForActions.git_oid) {
-        vscode.postMessage({ type: 'openJson', git_oid: rowForActions.git_oid, repository: rowForActions.repository });
-      } else if (rowForActions.op_id) {
-        vscode.postMessage({ type: 'openJson', op_id: rowForActions.op_id });
-      }
-    });
-    actions.appendChild(openBtn);
-    detailEl.appendChild(actions);
-
-    if (details && details.body) {
-      const bodyEl = document.createElement('pre');
-      bodyEl.className = 'detail-body';
-      bodyEl.textContent = details.body;
-      detailEl.appendChild(bodyEl);
-    }
-  } catch (e) {
-    console.error('[editchain] renderDetails error:', e);
-    detailEl.innerHTML = '<div class="detail-title">Error rendering details</div>' +
-      '<pre class="detail-body">' + esc(String(e)) + '</pre>';
   }
 }
 
@@ -2369,7 +2638,7 @@ window.addEventListener('message', (event) => {
   }
 
   // Every other message is the correlated response to a request issued via
-  // send(). Match by id; unknown ids (e.g. responses from a replayed open)
+  // Match by id; unknown ids (e.g. responses from a replayed open)
   // are dropped.
   const req = typeof msg.id === 'number' ? inFlight.get(msg.id) : undefined;
   if (!req) return;
@@ -2427,19 +2696,6 @@ window.addEventListener('message', (event) => {
         );
       });
       return;
-    }
-    // Detail-fetch errors are epoch-guarded like their responses: a stale
-    // error from an earlier row click must never overwrite the current row's
-    // inspector.
-    const detailEpochForReq = detailReqs.get(msg.id);
-    if (detailEpochForReq !== undefined) {
-      detailReqs.delete(msg.id);
-      if (detailEpochForReq === detailEpoch) renderDetailError(errText);
-      return;
-    }
-    // Non-window/non-search request errors keep the detail-pane behaviour.
-    if (layoutEl.classList.contains('has-detail')) {
-      renderDetailError(errText);
     }
     return;
   }
@@ -2539,25 +2795,6 @@ window.addEventListener('message', (event) => {
     return;
   }
 
-  // Detail responses (GetNodeDetails / ResolveObject) are routed by request id
-  // to the row they were requested for; only the LATEST detail epoch renders,
-  // so rapid row clicks can never let an older response overwrite a newer one.
-  const detailEpochForReq = detailReqs.get(msg.id);
-  if (detailEpochForReq !== undefined) {
-    detailReqs.delete(msg.id);
-    if (detailEpochForReq !== detailEpoch) return; // stale (rapid clicks)
-    if (typeof r.value.summary === 'string') {
-      console.log('[editchain] got details', r.value.summary.slice(0, 40));
-      renderDetails(r.value, detailRow);
-    } else if (r.value && r.value.message !== undefined) {
-      console.log('[editchain] got commit');
-      const msgText = typeof r.value.message === 'string' ? r.value.message : '';
-      renderDetails({ summary: msgText || '(no message)', body: msgText }, detailRow);
-    } else {
-      renderDetails(r.value, detailRow);
-    }
-    return;
-  }
 });
 
 // Announce readiness only after the host-message listener above exists. This
@@ -2649,7 +2886,7 @@ function renderSearchResults(hits) {
   renderTop = 0;
   renderBottom = -1;
   rowsEl.scrollTop = 0;
-  clearDetail();
+  clearSelection();
   if (total === 0) {
     showViewMessage('No results for "' + esc(searchQuery) + '"', false);
   } else {
@@ -2683,13 +2920,13 @@ function resetHistory() {
   renderTop = 0;
   renderBottom = -1;
   rowsEl.scrollTop = 0;
-  clearDetail();
+  clearSelection();
   // The previous view's DOM rows belong to the OLD generation: leaving them in
   // place until the new window arrives would let them stay interactive (and
   // satisfy harness/e2e readiness) while the cache/total no longer back them —
   // e.g. a profile switch with a delayed GetWindow: readiness sees rows with no
   // placeholders, then Enter targets a stale `.row` whose absolute index is
-  // absent from the cleared cache and the inspector never opens. Drop the grid
+  // absent from the cleared cache and raw activation is swallowed. Drop the grid
   // for an explicit loading state and clear readiness BEFORE the new fetch, so
   // no stale row is visible, focusable, or selectable while the new view is in
   // flight.
@@ -2794,14 +3031,12 @@ window.addEventListener('resize', () => {
   resizeTimer = setTimeout(onViewportResize, 150);
 });
 
-// The detail/inspector pane is a flex sibling of #rows: opening or closing it
-// resizes #rows WITHOUT a window resize event, so the window listener alone
-// would leave the graph column and inline widths sized for the pre-open width
-// (stale geometry). Observe #rows' content-box width and re-run the same
-// debounced recompute whenever it changes. Height-only notifications are
-// ignored: the rows viewport height is flex-fixed, and re-rendering on height
-// changes would loop (reanchorTo rebuilds the spacer, which can alter
-// scrollbar presence, which can in turn nudge clientWidth once — that one
+// Host layout changes can resize #rows without a window resize event. Observe
+// its content-box width and re-run the same debounced recompute whenever it
+// changes so graph and inline column widths cannot go stale. Height-only
+// notifications are ignored: the rows viewport height is flex-fixed, and
+// re-rendering on height changes would loop (reanchorTo rebuilds the spacer,
+// which can alter scrollbar presence and nudge clientWidth once — that one
 // real width change is exactly what we want to react to).
 let lastRowsWidth = rowsEl.clientWidth;
 if (typeof ResizeObserver === 'function') {
@@ -2862,7 +3097,9 @@ function currentGraphWidth() {
   const numLanes = maxLane + 1;
   const w = graphLaneWidth();
   const natural = (numLanes + 1) * w;
-  return Math.round(Math.min(natural, graphWidthBudget()) * 100) / 100;
+  // Keep even Pulse's compressed one-lane rail visibly present at narrow
+  // widths (the layout contract treats topology as quiet, never absent).
+  return Math.round(Math.min(Math.max(32, natural), graphWidthBudget()) * 100) / 100;
 }
 
 /**
@@ -2984,7 +3221,7 @@ window.__editchainGraphState = function () {
     graphWidth: currentGraphWidth(),
   };
 };
-// Lets the real-VS-Code lifecycle test prove that detail -> Back reused the
+// Lets the real-VS-Code lifecycle test prove that raw JSON -> Back reused the
 // same retained JS context rather than recreating a fast-looking replacement.
 window.__editchainRendererInstanceId = rendererInstanceId;
 
@@ -3008,12 +3245,5 @@ window.__editchainInFlightCount = function () {
 };
 window.__editchainViewGen = function () {
   return viewGen;
-};
-window.__editchainDetailState = function () {
-  return {
-    detailEpoch,
-    detailRowKey: detailRow ? detailRow.node_key : null,
-    pendingDetailReqs: Array.from(detailReqs.entries()),
-  };
 };
 window.__editchainProgressiveTimerActive = false;

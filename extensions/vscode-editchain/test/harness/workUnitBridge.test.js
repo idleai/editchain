@@ -98,14 +98,15 @@ test('fixture view-wide invariants: one start/end per unit id, exact counts, tit
       : { 'session:s1/turn:t1': 11, 'session:s1/turn:t2': 5, 'repo:ops': 2 };
     assert.deepEqual(Object.fromEntries(counts), expected, label + ' per-unit counts');
   }
-  // Titled units carry the oldest narrative summary; the fallback ops unit
-  // (no narrative evidence) has title null in BOTH views.
+  // Titled units carry the oldest narrative summary verbatim on the wire
+  // (Markdown cleanup is a renderer concern); the fallback ops unit with no
+  // narrative evidence has title null in BOTH views.
   for (const rows of [fixture.rows, fixture.rawRows]) {
     const title = (id) => {
       const r = rows.find((x) => x.work_unit.id === id);
       return r && r.work_unit.title;
     };
-    assert.equal(title('session:s1/turn:t1'), 'User asks to fix the build');
+    assert.equal(title('session:s1/turn:t1'), '**User asks** to fix `the build`');
     assert.equal(title('session:s1/turn:t2'), 'User asks to check the result');
     assert.equal(title('repo:ops'), null);
   }
@@ -169,7 +170,7 @@ test('bridge PASSES THROUGH authored work_unit/promoted/activity_bundle in GetWi
     id: 'session:s1/turn:t1',
     is_start: true,
     is_end: false,
-    title: 'User asks to fix the build',
+    title: '**User asks** to fix `the build`',
     count: 6,
   });
   assert.equal(req1.promoted, true);

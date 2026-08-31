@@ -32,13 +32,14 @@ let openPending = false;
 let openEpoch = 0;
 // Identity of the currently loaded main.js context and the context that has
 // already received the latest Open result. `retainContextWhenHidden` keeps the
-// normal detail -> back path alive; this handshake is the fallback for a real
+// normal raw-JSON -> Back path alive; this handshake is the fallback for a real
 // context recreation (window reload, renderer recovery, or memory pressure).
 let rendererInstanceId: string | null = null;
 let openDeliveredToRenderer: string | null = null;
 
 // Generous finite deadline for NON-Open service requests (window fetches,
-// search, details). The measured first-window time on a large chain is close to
+// search and object resolution). The measured first-window time on a large
+// chain is close to
 // a minute, so 120s is a generous bound; Open itself stays UNBOUNDED (it can
 // build the chain + git graph for minutes). A timed-out window/search surfaces
 // a visible error in the webview and suspends the progressive loader until the
@@ -63,7 +64,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Read-only JSON content provider: documents opened under the
   // `editchain-json:` scheme are read-only by default (content providers cannot
-  // be edited), which is exactly what we want for node detail views.
+  // be edited), which is exactly what we want for raw node views.
   const jsonProvider = new JsonContentProvider();
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider('editchain-json', jsonProvider)
@@ -141,7 +142,7 @@ function openHistoryView(
     {
       enableScripts: true,
       // The renderer retains only a bounded viewport cache, so preserving its
-      // context while a read-only detail editor covers the panel is cheap and
+      // context while a read-only raw JSON editor covers the panel is cheap and
       // makes Back instantaneous: the existing DOM, scroll position, and rows
       // are shown instead of booting into "Loading history…" again.
       retainContextWhenHidden: true,
@@ -179,7 +180,7 @@ function openHistoryView(
     }
   });
 
-  // A normal detail -> Back navigation retains the renderer context, including
+  // A normal raw-JSON -> Back navigation retains the renderer context, including
   // its bounded row cache and DOM. Do not replay Open on reveal: Open is an
   // authoritative reset and would throw that cache away. If VS Code genuinely
   // recreates main.js, its `webviewReady` message below carries a new instance
@@ -201,7 +202,7 @@ function openHistoryView(
   panel.webview.onDidReceiveMessage(async (msg) => {
     // main.js sends this only after installing its host-message listener. A new
     // id means VS Code recreated the JS context; replay the cached Open result
-    // to that instance exactly once. The retained detail -> Back path sends no
+    // to that instance exactly once. The retained raw-JSON -> Back path sends no
     // new handshake and therefore performs no reset or network request.
     if (msg.type === 'webviewReady') {
       const instanceId = typeof msg.instanceId === 'string' ? msg.instanceId : '';
@@ -328,7 +329,7 @@ function startOpen(client: StdioClient, panel: vscode.WebviewPanel): void {
     }
     output?.appendLine('[startOpen] sending open message');
     // Hold the last open body so a genuinely recreated renderer can replay it
-    // after its readiness handshake. Ordinary detail navigation retains the
+    // after its readiness handshake. Ordinary raw-JSON navigation retains the
     // original context and does not enter this path.
     lastOpenBody = resp;
     lastOpenError = null;
@@ -499,10 +500,10 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
     vscode.Uri.joinPath(context.extensionUri, 'media', 'main.css')
   );
   const cspSource = webview.cspSource;
-  // The segmented Activity/Raw control switches the chain filter's hide_trace
-  // flag (Activity = hide trace records, Raw = show everything). The search
-  // input is labelled for assistive tech, and the status region announces
-  // search/results/load progress without stealing focus.
+  // Pulse is the single narrative-first presentation. The Activity/Raw control
+  // independently switches the chain filter's hide_trace flag (Activity = hide
+  // trace records, Raw = show everything). Search is labelled for assistive
+  // tech, and the status region announces changes without stealing focus.
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -512,7 +513,7 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 <title>EditChain History</title>
 <link rel="stylesheet" href="${styleUri}">
 </head>
-<body>
+<body data-treatment="pulse">
 <div id="controls" role="group" aria-label="History controls">
 <div id="profile-control" class="segmented" role="group" aria-label="History profile">
 <button type="button" id="profile-activity" class="segmented-btn active" aria-pressed="true">Activity</button>
@@ -523,7 +524,6 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 </div>
 <div id="layout">
 <div id="rows"></div>
-<div id="detail"></div>
 </div>
 <div id="status-live" class="visually-hidden" role="status" aria-live="polite"></div>
 <script src="${scriptUri}"></script>

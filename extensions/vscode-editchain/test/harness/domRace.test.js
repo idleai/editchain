@@ -7,8 +7,8 @@
 //  1. Profile-reset race: Raw -> Activity (via setProfile/resetHistory) with a
 //     HELD GetWindow must clear the stale DOM grid, clear data-readiness, and
 //     leave nothing interactive until the new generation's rows arrive; once
-//     released, keyboard Enter on a focused CACHE-BACKED row must open the
-//     inspector (the stale-row race used to swallow Enter because the abs
+//     released, keyboard Enter on a focused CACHE-BACKED row must request its
+//     raw JSON editor (the stale-row race used to swallow Enter because the abs
 //     index was absent from the cleared cache).
 //
 //  2. Group-chip prepend semantics: upward incremental scrolling that
@@ -67,7 +67,141 @@ async function bootScenario(page, scenario) {
   await page.evaluate(() => window.__editchainDebug.whenIdle(20000));
 }
 
-test('profile switch with a held GetWindow clears stale rows; Enter then opens the inspector on a cache-backed row', async () => {
+test('Pulse is the sole narrative-first, single-pane presentation', async () => {
+  const { page, errors } = await newPage();
+  try {
+    await bootScenario(page, 'workUnits');
+
+    const state = await page.evaluate(() => {
+      const graph = document.querySelector('.row .graph-cell');
+      const summary = document.querySelector('.row .summary');
+      const date = document.querySelector('.row .date-cell');
+      return {
+        treatment: document.body.dataset.treatment,
+        treatmentControl: !!document.getElementById('treatment-control'),
+        treatmentButtons: document.querySelectorAll('.treatment-btn').length,
+        productMark: !!document.getElementById('product-mark'),
+        graphWidth: graph ? graph.getBoundingClientRect().width : 0,
+        summaryFont: summary ? getComputedStyle(summary).fontSize : '',
+        dateFont: date ? getComputedStyle(date).fontSize : '',
+        visibleColumns: Array.from(document.querySelectorAll('.tbl-header .th'))
+          .filter((cell) => getComputedStyle(cell).display !== 'none' &&
+            cell.getBoundingClientRect().width > 0.5)
+          .map((cell) => (cell.textContent || '').trim()),
+        secondaryPane: !!document.getElementById('detail') ||
+          document.getElementById('layout').classList.contains('has-detail'),
+      };
+    });
+
+    assert.equal(state.treatment, 'pulse');
+    assert.equal(state.treatmentControl, false, 'the prototype treatment switch must be removed');
+    assert.equal(state.treatmentButtons, 0);
+    assert.equal(state.productMark, false, 'the toolbar must not repeat the EditChain product sign');
+    assert.ok(state.graphWidth > 0, 'Pulse retains a visible topology rail');
+    assert.equal(state.summaryFont, '13px', 'row prose uses the normalized readable type size');
+    assert.equal(state.dateFont, '11px', 'metadata uses the normalized secondary type size');
+    assert.deepEqual(state.visibleColumns, ['Graph', 'Content', 'Date']);
+    assert.equal(state.secondaryPane, false, 'Pulse remains a single-pane history surface');
+    assert.deepEqual(errors, [], 'no uncaught page errors: ' + errors.join(' | '));
+  } finally {
+    await page.close();
+  }
+});
+
+test('Markdown summaries render semantic inline content without executing imported HTML', async () => {
+  const { page, errors } = await newPage();
+  try {
+    await bootScenario(page, 'longsummary');
+
+    const rendered = await page.evaluate(() => {
+      const row = document.querySelector('.row[data-key="node:l:1"]');
+      const summary = row && row.querySelector('.summary-text');
+      const taskSummary = document.querySelector('.row[data-key="node:l:2"] .summary-text');
+      const quoteSummary = document.querySelector('.row[data-key="node:l:3"] .summary-text');
+      const fallbackSummary = document.querySelector('.row[data-key="node:l:4"] .summary-text');
+      const completedRow = document.querySelector('.row[data-key="node:l:5"]');
+      const completedSummary = completedRow?.querySelector('.summary-text');
+      const failedSummary = document.querySelector('.row[data-key="node:l:6"] .summary-text');
+      const workerRow = document.querySelector('.row[data-key="node:l:7"]');
+      const workerSummary = workerRow?.querySelector('.summary-text');
+      const truncatedWorkerSummary = document.querySelector(
+        '.row[data-key="node:l:8"] .summary-text'
+      );
+      const summaries = Array.from(document.querySelectorAll('.summary-text'));
+      return {
+        rowHeight: row ? row.getBoundingClientRect().height : 0,
+        text: summaries.map((el) => el.textContent || '').join(' | '),
+        heading: !!summary?.querySelector('.md-heading'),
+        task: !!taskSummary?.querySelector('.md-task.md-task-done'),
+        strong: !!summary?.querySelector('.md-strong'),
+        code: !!summary?.querySelector('.md-code'),
+        link: !!summary?.querySelector('.md-link'),
+        quote: !!quoteSummary?.querySelector('.md-quote'),
+        callout: quoteSummary?.querySelector('.md-callout')?.textContent || '',
+        strike: !!quoteSummary?.querySelector('.md-strike'),
+        more: summary?.querySelector('.md-more')?.textContent || '',
+        breaks: summary ? summary.querySelectorAll('.md-break').length : 0,
+        anchors: document.querySelectorAll('.summary-text a').length,
+        images: document.querySelectorAll('.summary-text img').length,
+        injected: window.__markdownInjected === true,
+        html: summaries.map((el) => el.innerHTML).join(' | '),
+        title: row ? row.getAttribute('title') || '' : '',
+        fallback: fallbackSummary ? fallbackSummary.textContent || '' : '',
+        toolResults: [completedSummary?.textContent || '', failedSummary?.textContent || ''],
+        toolHtml: [completedSummary?.innerHTML || '', failedSummary?.innerHTML || ''].join(' | '),
+        toolDetail: completedRow?.getAttribute('title') || '',
+        workerResult: workerSummary?.textContent || '',
+        workerStrong: !!workerSummary?.querySelector('.md-strong'),
+        workerDetail: workerRow?.getAttribute('title') || '',
+        truncatedWorker: truncatedWorkerSummary?.textContent || '',
+        completedOk: !!completedRow?.querySelector('.outcome-success'),
+      };
+    });
+
+    assert.equal(rendered.rowHeight, 34, 'Markdown must not disturb virtual-row geometry');
+    assert.equal(rendered.heading, true);
+    assert.equal(rendered.task, true);
+    assert.equal(rendered.strong, true);
+    assert.equal(rendered.code, true);
+    assert.equal(rendered.link, true);
+    assert.equal(rendered.quote, true);
+    assert.equal(rendered.callout, 'NOTE');
+    assert.equal(rendered.strike, true);
+    assert.equal(rendered.more, '+3 lines');
+    assert.equal(rendered.breaks, 0, 'the preview renders one calm semantic line, not horizontal paragraphs');
+    assert.equal(rendered.anchors, 0, 'imported links stay inert inside the webview');
+    assert.equal(rendered.images, 0, 'raw HTML must be omitted rather than injected');
+    assert.equal(rendered.injected, false);
+    assert.doesNotMatch(rendered.html, /<img|&lt;img/i, 'raw HTML is omitted from the compact preview');
+    assert.doesNotMatch(rendered.text, /\*\*|`|^# |\[!NOTE\]|~~/,
+      'Markdown punctuation must not leak into displayed prose');
+    assert.doesNotMatch(rendered.title, /\*\*|`|^# |\[!NOTE\]|~~/,
+      'tooltips use readable plain Markdown text too');
+    assert.equal(rendered.fallback, 'Readable fallback',
+      'markup-only leading lines are skipped instead of producing an empty +N row');
+    assert.deepEqual(rendered.toolResults, ['Script completed', 'Script failed'],
+      'structured tool envelopes collapse to one readable lifecycle line');
+    assert.doesNotMatch(rendered.toolHtml, /[{}\[\]]|input_text|\\n/,
+      'serialized payload syntax must not leak into visible tool content');
+    assert.match(rendered.toolDetail, /Wall time 0\.2 seconds/,
+      'the complete plain payload remains available as non-primary detail');
+    assert.equal(rendered.workerResult, 'Verification complete.',
+      'recognized worker status envelopes show their narrative instead of raw JSON');
+    assert.equal(rendered.workerStrong, true,
+      'Markdown inside a decoded status message receives the same restrained renderer');
+    assert.match(rendered.workerDetail, /agent_path/,
+      'the serialized worker envelope remains available as non-primary detail');
+    assert.equal(rendered.truncatedWorker, 'Recovered preview.',
+      'truncated structured envelopes still recover a clean first-line preview');
+    assert.equal(rendered.completedOk, false,
+      'successful tool prose does not repeat the same state in an ok chip');
+    assert.deepEqual(errors, [], 'no uncaught page errors: ' + errors.join(' | '));
+  } finally {
+    await page.close();
+  }
+});
+
+test('profile switch clears stale rows; Enter activates raw JSON on a cache-backed row without a side pane', async () => {
   const { page, errors } = await newPage();
   try {
     await bootScenario(page, 'large');
@@ -143,41 +277,37 @@ test('profile switch with a held GetWindow clears stale rows; Enter then opens t
     assert.equal(after.dataReady, true);
     assert.equal(after.profile, 'raw');
 
-    // Keyboard Enter on a focused, cache-backed row must open the inspector —
+    // Keyboard Enter on a focused, cache-backed row must request raw JSON —
     // the exact interaction the stale-row race broke (Enter was delivered to a
     // stale .row whose abs index was absent from the cleared cache).
     const key = await page.evaluate(() => {
       const row = document.querySelector('.row:not(.row-placeholder)');
       if (!row) return { error: 'no rendered row for keyboard probe' };
       const abs = Number(row.getAttribute('data-row'));
+      const captured = [];
+      const originalPost = window.vscode.postMessage.bind(window.vscode);
+      window.vscode.postMessage = (message) => {
+        if (message && message.type === 'openJson') captured.push(message);
+        return originalPost(message);
+      };
       row.focus();
       row.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-      return { abs, cacheBacked: window.__editchainRowAt(abs) != null };
+      window.vscode.postMessage = originalPost;
+      return {
+        abs,
+        cacheBacked: window.__editchainRowAt(abs) != null,
+        captured,
+        selectedAbs: Number(document.querySelector('.row.row-selected')?.getAttribute('data-row')),
+        hasDetailClass: document.getElementById('layout').classList.contains('has-detail'),
+        secondaryElement: !!document.getElementById('detail'),
+      };
     });
     assert.equal(key.error, undefined);
     assert.equal(key.cacheBacked, true, 'Enter must target a cache-backed row');
-    await page.waitForFunction(() => {
-      const layoutEl = document.getElementById('layout');
-      return layoutEl.classList.contains('has-detail') &&
-        !!document.querySelector('.row.row-selected');
-    }, { timeout: 10000, polling: 50 });
-
-    const inspector = await page.evaluate((abs) => {
-      const layoutEl = document.getElementById('layout');
-      const sel = document.querySelector('.row.row-selected');
-      const detail = document.getElementById('detail');
-      return {
-        hasDetail: layoutEl.classList.contains('has-detail'),
-        selectedAbs: sel ? Number(sel.getAttribute('data-row')) : null,
-        selectedCacheBacked: sel ? window.__editchainRowAt(Number(sel.getAttribute('data-row'))) != null : false,
-        detailActions: detail.querySelectorAll('.detail-btn').length,
-        detailTitle: (detail.querySelector('.detail-title') || {}).textContent || '',
-      };
-    }, key.abs);
-    assert.equal(inspector.hasDetail, true, 'Enter must open the inspector');
-    assert.equal(inspector.selectedAbs, key.abs, 'the inspected row must be the focused row');
-    assert.equal(inspector.selectedCacheBacked, true);
-    assert.ok(inspector.detailActions > 0, 'details must resolve, not hang on the loading state');
+    assert.equal(key.selectedAbs, key.abs, 'Enter must select the focused row inline');
+    assert.equal(key.captured.length, 1, 'Enter must issue one explicit raw JSON activation');
+    assert.equal(key.hasDetailClass, false, 'activation must never split the history surface');
+    assert.equal(key.secondaryElement, false, 'the webview must not render a secondary detail pane');
 
     assert.deepEqual(errors, [], 'no uncaught page errors: ' + errors.join(' | '));
   } finally {
@@ -376,6 +506,10 @@ test('profile switch with a held window clears work-unit/bundle grouping; raw st
       rows: document.querySelectorAll('.row').length,
       dataReady: window.__editchainDataReady,
       total: window.__editchainGetTotal(),
+      workUnitTitle: (document.querySelector('.row[data-key="wu:req1"] .work-unit-ribbon') || {}).textContent || '',
+      bundleText: (document.querySelector('.row[data-key="wu:run1"] .summary') || {}).textContent || '',
+      unknownBundleStatus: !!document.querySelector('.row[data-key="wu:run1"] .bundle-status'),
+      successfulBundleStatus: (document.querySelector('.row[data-key="wu:run2"] .bundle-status') || {}).textContent || '',
     }));
     assert.equal(baseline.rows, 12, 'activity view renders the 12 authored rows');
     assert.equal(baseline.total, 23, 'window total includes expandable bundle member sub-ops');
@@ -383,11 +517,20 @@ test('profile switch with a held window clears work-unit/bundle grouping; raw st
     assert.equal(baseline.state.any, true,
       'Activity must render the work-unit/bundle/promotion contract');
     assert.ok(baseline.state.markers.workUnit >= 12, 'work-unit markers rendered in Activity');
-    assert.ok(baseline.state.markers.bundle >= 6, 'bundle markers rendered in Activity');
+    assert.ok(baseline.state.markers.bundle >= 4, 'bundle rows and concise labels rendered in Activity');
     assert.ok(baseline.state.markers.promoted === 5, 'promotion rails rendered in Activity');
     assert.ok(baseline.state.markers.capsule >= 6,
       'execute-run capsule glyphs (1 rect + 2 terminals per typed row) rendered in Activity');
     assert.equal(baseline.state.cacheHasMetadata, true);
+    assert.equal(baseline.workUnitTitle, 'User asks to fix the build',
+      'work-unit titles must strip Markdown punctuation');
+    assert.doesNotMatch(baseline.workUnitTitle, /\*\*|`/);
+    assert.equal(baseline.bundleText.trim(), '▸3 commands',
+      'typed bundles render one concise structured label without summary/activity/outcome repetition');
+    assert.equal(baseline.unknownBundleStatus, false,
+      'unknown bundle outcome adds no noisy status label');
+    assert.equal(baseline.successfulBundleStatus.trim(), '✓',
+      'structured success is a quiet check instead of a second wording chip');
 
     // Hold the Raw profile's first GetWindow; click Raw through the REAL
     // control path. The reset must clear the grouping DOM synchronously.
@@ -533,7 +676,9 @@ test('deep scroll/prepend/trim across the virtual window never invents duplicate
     }
 
     const layout = await page.evaluate(() => window.__editchainDebug.assertLayout());
-    assert.equal(layout.failCount, 0, 'all layout checks pass after deep scroll/prepend/trim');
+    const failedLayout = layout.checks.filter((check) => !check.pass);
+    assert.equal(layout.failCount, 0,
+      'all layout checks pass after deep scroll/prepend/trim: ' + JSON.stringify(failedLayout));
 
     assert.deepEqual(errors, [], 'no uncaught page errors: ' + errors.join(' | '));
   } finally {

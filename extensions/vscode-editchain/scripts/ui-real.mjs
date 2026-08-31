@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Render the REAL EditChain data from a chain dir through the harness, using
 // the actual Rust service over framed stdio. Dumps the full DOM tree + styles
-// as text artifacts — no screenshots.
+// as text artifacts, with an optional deterministic screenshot.
 //
 // Usage:
 //   node scripts/ui-real.mjs [--workspace DIR] [--chain-dir .editchain]

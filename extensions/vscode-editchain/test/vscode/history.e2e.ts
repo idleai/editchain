@@ -90,9 +90,14 @@ describe('EditChain History Explorer', () => {
   it('opens the history explorer webview and renders rows', async () => {
     const workbench = await browser.getWorkbench();
 
-    // Run inside VS Code: invoke the extension's command.
-    await browser.executeWorkbench((vscode) => {
-      vscode.commands.executeCommand('editchain-history.open');
+    // Keep the editor area dedicated to the history capture: VS Code can open
+    // Agent/Chat in the auxiliary bar by default, but that is workbench chrome,
+    // not part of the extension. Close it before opening the webview.
+    await browser.executeWorkbench(async (vscode) => {
+      await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
+      await vscode.commands.executeCommand('notifications.clearAll');
+      await vscode.commands.executeCommand('notifications.hideToasts');
+      await vscode.commands.executeCommand('editchain-history.open');
     });
 
     // Find the webview panel and switch into its iframe.
@@ -132,17 +137,53 @@ describe('EditChain History Explorer', () => {
     expect(typeof assertion.passCount).toBe('number');
     expect(assertion.failCount).toBe(0);
 
-    // Deterministic capture for the visual reviewer: taken only after whenIdle
-    // + passing checks, so the screenshot shows a settled, rendered table.
-    const shotPath = path.join(__dirname, '..', '..', 'trace', 'e2e-history.png');
-    await browser.saveScreenshot(shotPath);
-    console.log('[e2e] screenshot ->', shotPath);
+    // Deterministic Pulse capture from the REAL VS Code webview. Pulse is now
+    // the production presentation: no prototype treatment switch and no side
+    // panel, just one uninterrupted history surface.
+    const presentation = await browser.execute(() => ({
+      treatment: document.body.dataset.treatment,
+      treatmentControl: !!document.getElementById('treatment-control'),
+      productMark: !!document.getElementById('product-mark'),
+      singlePane: !document.getElementById('detail') &&
+        !document.getElementById('layout').classList.contains('has-detail'),
+    }));
+    expect(presentation.treatment).toBe('pulse');
+    expect(presentation.treatmentControl).toBe(false);
+    expect(presentation.productMark).toBe(false);
+    expect(presentation.singlePane).toBe(true);
+
+    // Clear any startup notifications that arrived while the service loaded,
+    // and assert the right auxiliary bar is physically absent from the frame
+    // before taking the full-workbench screenshot.
+    await webview.close();
+    await browser.executeWorkbench(async (vscode) => {
+      await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
+      await vscode.commands.executeCommand('notifications.clearAll');
+      await vscode.commands.executeCommand('notifications.hideToasts');
+    });
+    const auxiliaryBarHidden = await browser.execute(() => {
+      const auxiliary = document.querySelector('.part.auxiliarybar');
+      return !auxiliary || getComputedStyle(auxiliary).display === 'none' ||
+        auxiliary.getBoundingClientRect().width < 1;
+    });
+    expect(auxiliaryBarHidden).toBe(true);
+    await webview.open();
+    await browser.$('.row').waitForExist({ timeout: 10000 });
+
+    const fullShot = path.join(__dirname, '..', '..', 'trace', 'e2e-history-pulse.png');
+    const paneShot = path.join(__dirname, '..', '..', 'trace', 'e2e-history-pulse-webview.png');
+    const canonicalShot = path.join(__dirname, '..', '..', 'trace', 'e2e-history.png');
+    await browser.saveScreenshot(fullShot);
+    await browser.$('body').saveScreenshot(paneShot);
+    await browser.saveScreenshot(canonicalShot);
+    console.log('[e2e] screenshot ->', fullShot);
+    console.log('[e2e] webview screenshot ->', paneShot);
 
     // Leave the webview context.
     await webview.close();
   });
 
-  it('selects rows in the inspector; only explicit actions open an editor tab', async () => {
+  it('keeps row selection inline; double-click explicitly opens raw JSON', async () => {
     const workbench = await browser.getWorkbench();
 
     await browser.executeWorkbench((vscode) => {
@@ -174,7 +215,7 @@ describe('EditChain History Explorer', () => {
         const row = window.__editchainRowAt?.(abs);
         return row && !row.is_subop && (row.op_id || row.git_oid);
       });
-      if (!candidate) throw new Error('no rendered detail-capable row');
+      if (!candidate) throw new Error('no rendered raw-JSON-capable row');
       const keys = rendered.slice(0, 8).map((row) => row.getAttribute('data-key'));
       const result = {
         rendererInstanceId: window.__editchainRendererInstanceId,
@@ -187,32 +228,24 @@ describe('EditChain History Explorer', () => {
     });
     expect(before.rendererInstanceId).toBeTruthy();
 
-    // An ORDINARY row click must open the inspector — never an editor tab.
-    const inspector = await browser.execute(() => {
-      const detailEl = document.getElementById('detail');
+    // An ordinary row click only selects within the history surface.
+    const inline = await browser.execute(() => {
       return {
-        hasDetail: document.getElementById('layout').classList.contains('has-detail'),
+        secondaryPane: !!document.getElementById('detail') ||
+          document.getElementById('layout').classList.contains('has-detail'),
         selected: !!document.querySelector('.row.row-selected'),
-        title: detailEl.querySelector('.detail-title')?.textContent || '',
-        hasActions: detailEl.querySelectorAll('.detail-btn').length > 0,
       };
     });
-    console.log('[e2e] inspector after row click:', JSON.stringify(inspector));
-    expect(inspector.hasDetail).toBe(true);
-    expect(inspector.selected).toBe(true);
-    // The details must have resolved (title rendered, actions present), not
-    // left on the loading state.
-    await browser.waitUntil(async () => browser.execute(() => {
-      const detailEl = document.getElementById('detail');
-      return detailEl.querySelectorAll('.detail-btn').length > 0;
-    }), { timeout: 30000, interval: 100 });
+    console.log('[e2e] inline selection after row click:', JSON.stringify(inline));
+    expect(inline.secondaryPane).toBe(false);
+    expect(inline.selected).toBe(true);
 
-    // The ONLY editor path is the inspector's explicit "Open raw JSON" action.
+    // Double-click is the explicit pointer path to the read-only raw JSON
+    // editor; no secondary pane is introduced inside the webview.
     await browser.execute(() => {
-      const btns = Array.from(document.querySelectorAll('#detail .detail-btn'));
-      const openBtn = btns.find((b) => b.textContent.includes('Open raw JSON'));
-      if (!openBtn || openBtn.disabled) throw new Error('no enabled Open raw JSON action');
-      openBtn.click();
+      const selected = document.querySelector('.row.row-selected');
+      if (!selected) throw new Error('no inline-selected row for raw JSON activation');
+      selected.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
     });
 
     // Leave the iframe after the explicit action asks the extension host to
@@ -244,8 +277,8 @@ describe('EditChain History Explorer', () => {
       };
     });
 
-    console.log('[e2e] inspector/back before:', JSON.stringify(before));
-    console.log('[e2e] inspector/back after:', JSON.stringify(after));
+    console.log('[e2e] raw-json/back before:', JSON.stringify(before));
+    console.log('[e2e] raw-json/back after:', JSON.stringify(after));
     expect(after.rendererInstanceId).toBe(before.rendererInstanceId);
     expect(after.scrollTop).toBe(before.scrollTop);
     expect(after.keys).toEqual(before.keys);
@@ -289,7 +322,7 @@ describe('EditChain History Explorer', () => {
     // before the new profile's window arrives. This is the product fix for the
     // stale-DOM race (Raw -> Activity left old rows interactive and
     // readiness-satisfying; Enter then hit a stale row whose abs index was
-    // absent from the cleared cache and the inspector never opened).
+    // absent from the cleared cache and raw activation was swallowed).
     const resetState = await browser.execute(() => ({
       dataReady: window.__editchainDataReady,
       rowCount: document.querySelectorAll('.row').length,
@@ -351,8 +384,7 @@ describe('EditChain History Explorer', () => {
     expect(activityState.profile).toBe('activity');
     expect(activityState.rowCount).toBeGreaterThan(0);
 
-    // Keyboard: Enter on a focused row opens the inspector; the Close action
-    // hides it and clears selection.
+    // Keyboard: Enter selects inline and explicitly opens the raw JSON editor.
     const keyboard = await browser.execute(() => {
       const row = document.querySelector('.row:not(.row-placeholder)');
       if (!row) throw new Error('no rendered row for keyboard probe');
@@ -363,29 +395,33 @@ describe('EditChain History Explorer', () => {
         focused: document.activeElement === row,
         abs,
         cacheBacked: window.__editchainRowAt(abs) != null,
+        selected: row.classList.contains('row-selected'),
+        secondaryPane: !!document.getElementById('detail') ||
+          document.getElementById('layout').classList.contains('has-detail'),
       };
     });
     expect(keyboard.focused).toBe(true);
     // Enter must target a CACHE-BACKED row — the stale-DOM race delivered Enter
     // to an old row whose abs index was absent from the cleared cache, and the
-    // inspector never opened.
+    // activation was swallowed.
     expect(keyboard.cacheBacked).toBe(true);
-    await browser.waitUntil(async () => browser.execute(() => {
-      const sel = document.querySelector('.row.row-selected');
-      return document.getElementById('layout').classList.contains('has-detail') &&
-        !!sel &&
-        window.__editchainRowAt(Number(sel.getAttribute('data-row'))) != null;
-    }), { timeout: 30000, interval: 100 });
-    await browser.execute(() => {
-      const closeBtn = document.querySelector('#detail .detail-btn:first-child');
-      if (closeBtn) closeBtn.click();
-    });
-    await browser.waitUntil(async () => browser.execute(() => {
-      return !document.getElementById('layout').classList.contains('has-detail') &&
-        !document.querySelector('.row.row-selected');
-    }), { timeout: 30000, interval: 100 });
-
+    expect(keyboard.selected).toBe(true);
+    expect(keyboard.secondaryPane).toBe(false);
     await webview.close();
+    await browser.waitUntil(async () => {
+      const tab = await workbench.getEditorView().getActiveTab();
+      return !!tab && (await tab.getTitle()) !== 'EditChain History';
+    }, { timeout: 30000, interval: 100 });
+    await browser.executeWorkbench(async (vscode) => {
+      await vscode.commands.executeCommand('workbench.action.navigateBack');
+    });
+    const restoredWebview = await workbench.getWebviewByTitle('EditChain History');
+    await restoredWebview.open();
+    const restoredSinglePane = await browser.execute(() =>
+      !document.getElementById('detail') &&
+      !document.getElementById('layout').classList.contains('has-detail'));
+    expect(restoredSinglePane).toBe(true);
+    await restoredWebview.close();
   });
 
   it('scrolls through the full history with a bounded viewport', async () => {
@@ -513,9 +549,15 @@ describe('EditChain History Explorer', () => {
           if (!countEl || Number(/^\d+/.exec(text)?.[0]) !== row.activity_bundle.member_count) {
             problems.push('bundle-count text mismatch on ' + abs);
           }
-          if (!el.querySelector('.bundle-status') ||
-              !(el.querySelector('.bundle-status').textContent || '').trim()) {
-            problems.push('typed bundle missing status on ' + abs);
+          const statusEl = el.querySelector('.bundle-status');
+          const statusText = statusEl ? (statusEl.textContent || '').trim() : '';
+          if (row.outcome === 'success') {
+            if (!statusEl || statusText !== '✓' ||
+                !statusEl.classList.contains('bundle-status-success')) {
+              problems.push('successful bundle missing quiet success check on ' + abs);
+            }
+          } else if (statusEl) {
+            problems.push('unknown-outcome bundle renders noisy status on ' + abs);
           }
         } else if (row.activity_bundle) {
           // Forward-compatible unknown bundle kind: never styled as execute-run.

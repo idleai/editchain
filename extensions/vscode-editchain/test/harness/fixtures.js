@@ -335,12 +335,31 @@
     },
 
     longsummary() {
-      // A row whose summary is ~1024 chars, to exercise the ellipsis/truncation
-      // behaviour when the content column is resized.
-      const long = 'word '.repeat(200); // ~1000 chars
+      // A multiline Markdown row whose summary is ~1024 chars. It exercises
+      // safe semantic rendering plus ellipsis/truncation when Content resizes.
+      const long = [
+        '# Markdown **read-through** uses `inline code` and [design notes](https://example.com/design)',
+        '- [x] **Grouped decision** uses `renderMarkdownSummary` and [design notes](https://example.com/design)',
+        '> [!NOTE] _Mild treatment_ keeps ~~loud neon~~ quiet contrast; escaped <img src=x onerror="window.__markdownInjected=true">',
+        'word '.repeat(170),
+      ].join('\n');
       const rows = [
         opRow('node:l:1', long, { group:'session:s1', kind:'message', author:'human' }),
-        opRow('node:l:2', 'short row', { group:'session:s1', kind:'message' }),
+        opRow('node:l:2', '- [x] **Grouped decision** is complete', { group:'session:s1', kind:'message' }),
+        opRow('node:l:3', '> [!NOTE] _Mild treatment_ keeps ~~loud neon~~ quiet <img src=x onerror="window.__markdownInjected=true">', { group:'session:s1', kind:'message' }),
+        opRow('node:l:4', '<metadata>\n**Readable fallback**', { group:'session:s1', kind:'message' }),
+        opRow('node:l:5', '[{"text":"Script completed\\nWall time 0.2 seconds\\nOutput:\\nM main.js","type":"input_text"}]', {
+          group:'session:s1', kind:'tool', is_system:true, outcome:'success',
+        }),
+        opRow('node:l:6', 'tool: exec [{"text":"Script failed\\nWall time 0.1 seconds\\nOutput:\\ncompile error","type":"input_text"}]', {
+          group:'session:s1', kind:'tool', is_system:true, outcome:'failure',
+        }),
+        opRow('node:l:7', '<worker_notification>\n{"agent_path":"worker-1","status":{"completed":"**Verification complete.**\\nAll checks passed."}}\n</worker_notification>', {
+          group:'session:s1', kind:'message', author:'human', outcome:'success',
+        }),
+        opRow('node:l:8', '<worker_notification>\n{"agent_path":"worker-2","status":{"completed":"**Recovered preview.**\\nTruncated detail', {
+          group:'session:s1', kind:'message', author:'human', outcome:'success',
+        }),
       ];
       const layoutRows = rows.map((r) => ({ node: r.node_key, lane: 0 }));
       return { rows, layoutRows, edges: [] };
@@ -684,7 +703,7 @@
       // text below — the renderer must style from activity_bundle, never the
       // summary).
       const SUMMARY = {
-        'wu:req1': 'User asks to fix the build',
+        'wu:req1': '**User asks** to fix `the build`',
         'wu:req2': 'User asks to check the result',
         'wu:a1': 'tool result: apply patch 1',
         'wu:a2': 'tool result: apply patch 2',
@@ -700,7 +719,7 @@
         'wu:x3': 'tool result: unknown bundle member 3',
         'wu:x4': 'tool result: unknown bundle member 4',
         'wu:ops1': 'chore: ops one',
-        'wu:req1b': 'User asks to fix the build',
+        'wu:req1b': '**User asks** to fix `the build`',
         'wu:ops2': 'chore: ops two',
       };
       // Bundle folds, in display order: [bundleKey, kind, [memberKeys], tsOffset]

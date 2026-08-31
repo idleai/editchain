@@ -26,7 +26,7 @@
   }
 </style>
 </head>
-<body>
+<body data-treatment="pulse">
 <div id="controls" role="group" aria-label="History controls">
 <div id="profile-control" class="segmented" role="group" aria-label="History profile">
 <button type="button" id="profile-activity" class="segmented-btn active" aria-pressed="true">Activity</button>
@@ -37,7 +37,6 @@
 </div>
 <div id="layout">
 <div id="rows"></div>
-<div id="detail"></div>
 </div>
 <div id="status-live" class="visually-hidden" role="status" aria-live="polite"></div>
 
@@ -73,7 +72,7 @@
 </script>
 
 <!-- The REAL production renderer. It calls acquireVsCodeApi() and renders into
-     #rows/#detail exactly as it does inside VS Code. -->
+     the same single-pane #rows surface used inside VS Code. -->
 <script src="../../media/main.js"></script>
 
 <!-- Text-only layout probe (harness-only). -->
