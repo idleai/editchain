@@ -1,0 +1,958 @@
+//! Tests for the Activity-view work-unit markers, promotion, and execute-run
+//! bundling semantics.
+
+#![expect(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::too_many_arguments,
+    reason = "Test helpers and assertions; panics/indexing are acceptable in tests"
+)]
+
+// Crate-level dependency markers (used by Cargo for feature resolution).
+use regex as _;
+use serde as _;
+use serde_json as _;
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+
+use editchain_core::{
+    ActorId, Clock, FileEdit, FileOp, FileStage, ImportOp, MessageOp, NodeId, Op, OpId, OpKind,
+    ParentSet, PathId, Payload, ScopeRef, SessionId, Tags, ToolOp, ToolStage, TurnId,
+};
+use editchain_project::activity::{
+    annotate_activity_rows, bundle_activity_execute_runs, ActivityRowAnnotation,
+};
+use editchain_project::filter::ChainFilter;
+use editchain_project::meta::NodeMeta;
+use editchain_project::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility};
+use editchain_project::{EffectiveTime, HistoryNode, HistoryProjection, ProjectionOptions};
+
+/// The Activity view filter the service uses for its fixed default profile.
+fn activity_filter() -> ChainFilter {
+    ChainFilter::new(
+        String::new(),
+        String::new(),
+        String::new(),
+        false,
+        true,
+        true,
+    )
+}
+
+/// Raw JSONL for an import row with an optional structured tool/command status.
+fn raw_line(status: Option<&str>) -> String {
+    match status {
+        Some(status) => serde_json::json!({
+            "type": "response_item",
+            "payload": { "item": { "status": status } }
+        })
+        .to_string(),
+        None => r#"{"type":"response_item","payload":{}}"#.to_string(),
+    }
+}
+
+/// A raw import op (session-scoped, IMPORT tag) with optional parent/status.
+fn import_op(node: u64, seq: u64, parent: Option<OpId>, status: Option<&str>) -> Op {
+    Op {
+        id: OpId::new(NodeId(node), 0, seq),
+        parents: parent.map_or(ParentSet::None, ParentSet::One),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(seq * 1_000),
+        scope: ScopeRef::Session(SessionId(10)),
+        tags: Tags::IMPORT,
+        kind: OpKind::Import(ImportOp {
+            raw_ref: Payload::Inline(raw_line(status).into_bytes()),
+            raw_hash: None,
+        }),
+    }
+}
+
+/// A META raw import op carrying a `world_state` record (sub-op fodder), kept
+/// on the same source chain so the projection bundles it onto an anchor row.
+fn world_state_import_op(node: u64, seq: u64, parent: OpId) -> Op {
+    let mut op = Op {
+        id: OpId::new(NodeId(node), 0, seq),
+        parents: ParentSet::One(parent),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(seq * 1_000),
+        scope: ScopeRef::Session(SessionId(10)),
+        tags: Tags::IMPORT | Tags::META,
+        kind: OpKind::Import(ImportOp {
+            raw_ref: Payload::Inline(br#"{"type":"world_state","payload":{}}"#.to_vec()),
+            raw_hash: None,
+        }),
+    };
+    op.tags |= Tags::META;
+    op
+}
+
+/// A turn-scoped normalized tool child of `parent`.
+fn tool_child(node: u64, seq: u64, parent: OpId, name: &str, turn: u64) -> Op {
+    Op {
+        id: OpId::new(NodeId(node), 0, seq),
+        parents: ParentSet::One(parent),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(seq * 1_000),
+        scope: ScopeRef::Turn(TurnId(turn)),
+        tags: Tags::AGENT | Tags::TOOL,
+        kind: OpKind::Tool(ToolOp {
+            tool_call_id: Payload::Empty,
+            tool_name: Payload::Inline(name.as_bytes().to_vec()),
+            stage: ToolStage::Start,
+            content: Payload::Empty,
+        }),
+    }
+}
+
+/// A turn-scoped normalized message child of `parent`.
+fn message_child(node: u64, seq: u64, parent: OpId, text: &str, turn: u64) -> Op {
+    Op {
+        id: OpId::new(NodeId(node), 0, seq),
+        parents: ParentSet::One(parent),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(seq * 1_000),
+        scope: ScopeRef::Turn(TurnId(turn)),
+        tags: Tags::HUMAN | Tags::MESSAGE,
+        kind: OpKind::Message(MessageOp {
+            content: Payload::Inline(text.as_bytes().to_vec()),
+            content_type: Payload::Empty,
+        }),
+    }
+}
+
+/// A turn-scoped normalized file child of `parent` (Change activity evidence).
+fn file_child(node: u64, seq: u64, parent: OpId, turn: u64) -> Op {
+    Op {
+        id: OpId::new(NodeId(node), 0, seq),
+        parents: ParentSet::One(parent),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(seq * 1_000),
+        scope: ScopeRef::Turn(TurnId(turn)),
+        tags: Tags::AGENT | Tags::FILE,
+        kind: OpKind::File(FileOp {
+            path: PathId(42),
+            stage: FileStage::Applied,
+            base: None,
+            after: None,
+            edit: FileEdit::None,
+        }),
+    }
+}
+
+/// One linear session chain row descriptor (causal order oldest -> newest).
+#[derive(Clone, Copy)]
+struct RowSpec {
+    node: u64,
+    seq: u64,
+    kind: &'static str,
+    status: Option<&'static str>,
+    turn: u64,
+}
+
+const fn row_spec(
+    node: u64,
+    seq: u64,
+    kind: &'static str,
+    status: Option<&'static str>,
+    turn: u64,
+) -> RowSpec {
+    RowSpec {
+        node,
+        seq,
+        kind,
+        status,
+        turn,
+    }
+}
+
+/// Build a linear session chain: a user-message root import followed by the
+/// given row imports (each parented to the previous import, oldest causal
+/// first), plus the turn-scoped normalized child that classifies each row.
+fn linear_chain(root_seq: u64, root_text: &str, rows: &[RowSpec]) -> Vec<Op> {
+    let mut ops = Vec::new();
+    let first_turn = rows.first().map_or(1, |row| row.turn);
+    let root_import = import_op(1, root_seq, None, None);
+    ops.push(root_import.clone());
+    ops.push(message_child(
+        101,
+        root_seq + 100,
+        root_import.id,
+        root_text,
+        first_turn,
+    ));
+    let mut previous_import = root_import;
+    for row in rows {
+        let seq = row.seq.saturating_mul(10);
+        let current_import = import_op(row.node, seq, Some(previous_import.id), row.status);
+        ops.push(current_import.clone());
+        let child_seq = seq.saturating_add(500);
+        let child = match row.kind {
+            "message" => message_child(
+                row.node + 200,
+                child_seq,
+                current_import.id,
+                "text",
+                row.turn,
+            ),
+            "tool" => tool_child(
+                row.node + 200,
+                child_seq,
+                current_import.id,
+                "Bash",
+                row.turn,
+            ),
+            "file" => file_child(row.node + 200, child_seq, current_import.id, row.turn),
+            other => panic!("unknown row kind {other}"),
+        };
+        ops.push(child);
+        previous_import = current_import;
+    }
+    ops
+}
+
+/// Project ops and return the Activity-filtered node list + annotations.
+fn activity_view(ops: Vec<Op>) -> (Vec<HistoryNode>, Vec<ActivityRowAnnotation>) {
+    let projection = HistoryProjection::from_ops(ops);
+    let nodes = projection.filtered_nodes(&activity_filter());
+    let annotations = annotate_activity_rows(&nodes);
+    (nodes, annotations)
+}
+
+/// Run the Activity bundling pass over a node list with fresh annotations.
+fn bundle(nodes: Vec<HistoryNode>) -> Vec<HistoryNode> {
+    let annotations = annotate_activity_rows(&nodes);
+    bundle_activity_execute_runs(nodes, &annotations, &HashSet::new())
+}
+
+/// Unwrap an execute-run bundle from a node list.
+fn unwrap_bundle(nodes: &[HistoryNode]) -> &HistoryNode {
+    nodes
+        .iter()
+        .find(|node| matches!(node, HistoryNode::ExecuteBundle { .. }))
+        .unwrap_or_else(|| panic!("expected an ExecuteBundle row"))
+}
+
+/// Build a manually classified collapsed row (used where display-order or
+/// metadata control is needed beyond what the projection emits).
+fn manual_collapsed(
+    op: Op,
+    activity_kind: ActivityKind,
+    record_role: RecordRole,
+    outcome: Outcome,
+    turn: Option<TurnId>,
+    summary: &str,
+    kind: &str,
+) -> HistoryNode {
+    HistoryNode::CollapsedImport {
+        op: Arc::new(op),
+        source_time: EffectiveTime::Observed(0),
+        summary: summary.to_string(),
+        kind: kind.to_string(),
+        author: "agent".to_string(),
+        sub_ops: Vec::new(),
+        meta: NodeMeta {
+            record_role,
+            activity_kind,
+            visibility: Visibility::Primary,
+            outcome,
+            turn_id: turn,
+        },
+    }
+}
+
+#[test]
+fn bundles_maximal_run_of_three_tool_rows_into_one_expandable_node() {
+    // user request -> tool ok -> tool ok -> tool ok -> agent answer (one turn).
+    let ops = linear_chain(
+        1,
+        "user request",
+        &[
+            row_spec(2, 2, "tool", Some("completed"), 1),
+            row_spec(3, 3, "tool", Some("completed"), 1),
+            row_spec(4, 4, "tool", Some("completed"), 1),
+            row_spec(5, 5, "message", None, 1),
+        ],
+    );
+    let (nodes, _) = activity_view(ops);
+    assert_eq!(nodes.len(), 5);
+    let bundled = bundle(nodes);
+    assert_eq!(bundled.len(), 3);
+    assert_eq!(bundled[0].activity_kind(), ActivityKind::Conversation);
+    assert_eq!(bundled[2].activity_kind(), ActivityKind::Conversation);
+    let bundle_node = unwrap_bundle(&bundled);
+    assert_eq!(bundle_node.activity_kind(), ActivityKind::Execute);
+    assert_eq!(bundle_node.visibility(), Visibility::Primary);
+    assert_eq!(bundle_node.record_role(), RecordRole::Action);
+    assert_eq!(bundle_node.outcome(), Outcome::Success);
+    let HistoryNode::ExecuteBundle {
+        member_nodes,
+        members,
+        anchor,
+        summary,
+        ..
+    } = bundle_node
+    else {
+        panic!("expected ExecuteBundle");
+    };
+    // All members structured-successful -> success label; every original row stays
+    // retrievable through the existing sub-ops model, newest-first.
+    assert_eq!(summary, "3 tool steps (success)");
+    assert_eq!(members.len(), 3);
+    assert_eq!(member_nodes.len(), 3);
+    assert_eq!(bundle_node.sub_ops().len(), 3);
+    assert_eq!(bundle_node.node_key(), anchor.id.to_string());
+    let member_keys: Vec<String> = bundle_node
+        .sub_ops()
+        .iter()
+        .map(|op| op.id.to_string())
+        .collect();
+    assert_eq!(member_keys, vec!["4:0:40", "3:0:30", "2:0:20"]);
+    assert_eq!(member_keys[0], bundle_node.node_key());
+}
+
+#[test]
+fn singletons_never_bundle_and_messages_split_runs() {
+    // tool -> message -> tool -> message -> tool (same turn): every execute row
+    // is a display singleton, so nothing folds and the profile stays flat.
+    let ops = linear_chain(
+        1,
+        "request",
+        &[
+            row_spec(2, 2, "tool", Some("completed"), 1),
+            row_spec(3, 3, "message", None, 1),
+            row_spec(4, 4, "tool", Some("completed"), 1),
+            row_spec(5, 5, "message", None, 1),
+            row_spec(6, 6, "tool", Some("completed"), 1),
+        ],
+    );
+    let (nodes, _) = activity_view(ops);
+    assert_eq!(nodes.len(), 6);
+    let bundled = bundle(nodes);
+    assert!(
+        bundled
+            .iter()
+            .all(|node| !matches!(node, HistoryNode::ExecuteBundle { .. })),
+        "singleton execute rows never bundle"
+    );
+    assert_eq!(bundled.len(), 6);
+}
+
+#[test]
+fn bundles_two_adjacent_runs_without_gathering_across_messages() {
+    // tool, tool, message, tool, tool (same turn, contiguous display runs of
+    // two on each side of the message).
+    let ops = linear_chain(
+        1,
+        "request",
+        &[
+            row_spec(2, 2, "tool", Some("completed"), 1),
+            row_spec(3, 3, "tool", Some("completed"), 1),
+            row_spec(4, 4, "message", None, 1),
+            row_spec(5, 5, "tool", Some("completed"), 1),
+            row_spec(6, 6, "tool", Some("completed"), 1),
+        ],
+    );
+    let (nodes, _) = activity_view(ops);
+    assert_eq!(nodes.len(), 6);
+    let bundled = bundle(nodes);
+    assert_eq!(bundled.len(), 4);
+    let first_bundle = unwrap_bundle(&bundled);
+    assert_eq!(first_bundle.sub_ops().len(), 2);
+}
+
+#[test]
+fn never_bundles_across_turn_boundaries() {
+    // Two turns in one session chain: turn 2 rows render above turn 1 rows, so
+    // each turn forms its own maximal run and no bundle mixes members from
+    // different turns.
+    let ops = linear_chain(
+        1,
+        "request",
+        &[
+            row_spec(2, 2, "tool", Some("completed"), 1),
+            row_spec(3, 3, "tool", Some("completed"), 1),
+            row_spec(4, 4, "message", None, 1),
+            row_spec(5, 5, "message", None, 2),
+            row_spec(6, 6, "tool", Some("completed"), 2),
+            row_spec(7, 7, "tool", Some("completed"), 2),
+            row_spec(8, 8, "message", None, 2),
+        ],
+    );
+    let (nodes, _) = activity_view(ops);
+    let bundled = bundle(nodes);
+    let bundle_nodes: Vec<&HistoryNode> = bundled
+        .iter()
+        .filter(|node| matches!(node, HistoryNode::ExecuteBundle { .. }))
+        .collect();
+    assert_eq!(bundle_nodes.len(), 2);
+    // display order newest-first: turn 2's run renders first, turn 1's second.
+    let turn_ids: Vec<u64> = bundle_nodes
+        .iter()
+        .map(|node| node.turn_id().map_or(0, |turn_id| turn_id.0))
+        .collect();
+    assert_eq!(turn_ids, vec![2, 1]);
+}
+
+#[test]
+fn interleaved_turn_rows_are_not_gathered_across_display_rows() {
+    // Two independent same-session chains with interleaved clocks: display order
+    // alternates turn A / turn B rows, so same-turn execute rows are never
+    // adjacent and nothing bundles.
+    let a_root = import_op(1, 1, None, None);
+    let b_root = import_op(3, 3, None, None);
+    let a_tool = import_op(2, 2, Some(a_root.id), Some("completed"));
+    let b_tool = import_op(4, 4, Some(b_root.id), Some("completed"));
+    let ops = vec![
+        a_root.clone(),
+        message_child(101, 1010, a_root.id, "a request", 1),
+        a_tool.clone(),
+        tool_child(201, 1020, a_tool.id, "Bash", 1),
+        b_root.clone(),
+        message_child(301, 1030, b_root.id, "b request", 2),
+        b_tool.clone(),
+        tool_child(401, 1040, b_tool.id, "Bash", 2),
+    ];
+    let (nodes, _) = activity_view(ops);
+    assert_eq!(nodes.len(), 4);
+    let bundled = bundle(nodes);
+    assert!(
+        bundled
+            .iter()
+            .all(|node| !matches!(node, HistoryNode::ExecuteBundle { .. })),
+        "non-contiguous same-turn rows are never gathered"
+    );
+    assert_eq!(bundled.len(), 4);
+    let kinds: Vec<ActivityKind> = bundled.iter().map(HistoryNode::activity_kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ActivityKind::Execute,
+            ActivityKind::Conversation,
+            ActivityKind::Execute,
+            ActivityKind::Conversation,
+        ]
+    );
+}
+
+#[test]
+fn failure_rows_stay_visible_and_split_runs_into_clean_sides() {
+    // tool ok, tool ok, tool error, tool ok, tool ok (same turn, contiguous).
+    let ops = linear_chain(
+        1,
+        "request",
+        &[
+            row_spec(2, 2, "tool", Some("completed"), 1),
+            row_spec(3, 3, "tool", Some("completed"), 1),
+            row_spec(4, 4, "tool", Some("error"), 1),
+            row_spec(5, 5, "tool", Some("completed"), 1),
+            row_spec(6, 6, "tool", Some("completed"), 1),
+        ],
+    );
+    let (nodes, _) = activity_view(ops);
+    assert_eq!(nodes.len(), 6);
+    let bundled = bundle(nodes);
+    // The failure row is never folded; the two clean pairs either side bundle.
+    assert_eq!(bundled.len(), 4);
+    let failure = bundled
+        .iter()
+        .find(|node| node.outcome() == Outcome::Failure)
+        .unwrap_or_else(|| panic!("failure row must remain visible"));
+    assert_eq!(failure.node_key(), "4:0:40");
+    let clean_bundles: Vec<&HistoryNode> = bundled
+        .iter()
+        .filter(|node| matches!(node, HistoryNode::ExecuteBundle { .. }))
+        .collect();
+    assert_eq!(clean_bundles.len(), 2);
+    for node in clean_bundles {
+        assert_eq!(node.sub_ops().len(), 2);
+    }
+}
+
+#[test]
+fn unknown_outcome_runs_are_eligible_and_labeled_neutrally() {
+    // No structured status at all: Outcome::Unknown rows are still eligible
+    // ("clean/no negative evidence"), and the bundle summary never claims
+    // success.
+    let ops = linear_chain(
+        1,
+        "request",
+        &[
+            row_spec(2, 2, "tool", None, 1),
+            row_spec(3, 3, "tool", None, 1),
+            row_spec(4, 4, "tool", None, 1),
+        ],
+    );
+    let (nodes, _) = activity_view(ops);
+    let bundled = bundle(nodes);
+    let bundle_node = unwrap_bundle(&bundled);
+    let HistoryNode::ExecuteBundle { summary, .. } = bundle_node else {
+        panic!("expected ExecuteBundle");
+    };
+    assert_eq!(summary, "3 tool steps");
+    assert_eq!(bundle_node.outcome(), Outcome::Unknown);
+
+    // Mixed structured success + unknown: still not labeled success.
+    let mixed = linear_chain(
+        1,
+        "request",
+        &[
+            row_spec(2, 2, "tool", Some("completed"), 1),
+            row_spec(3, 3, "tool", None, 1),
+            row_spec(4, 4, "tool", Some("completed"), 1),
+        ],
+    );
+    let (mixed_nodes, _) = activity_view(mixed);
+    let mixed_bundled = bundle(mixed_nodes);
+    let mixed_bundle = unwrap_bundle(&mixed_bundled);
+    let HistoryNode::ExecuteBundle { summary, .. } = mixed_bundle else {
+        panic!("expected ExecuteBundle");
+    };
+    assert_eq!(summary, "3 tool steps");
+    assert_eq!(mixed_bundle.outcome(), Outcome::Unknown);
+}
+
+#[test]
+fn change_adjacency_blocks_bundling() {
+    // tool, tool, change, tool, tool (same turn): both runs sit immediately
+    // adjacent to the change row, so neither bundles.
+    let ops = linear_chain(
+        1,
+        "request",
+        &[
+            row_spec(2, 2, "tool", Some("completed"), 1),
+            row_spec(3, 3, "tool", Some("completed"), 1),
+            row_spec(4, 4, "file", None, 1),
+            row_spec(5, 5, "tool", Some("completed"), 1),
+            row_spec(6, 6, "tool", Some("completed"), 1),
+        ],
+    );
+    let (nodes, _) = activity_view(ops);
+    assert_eq!(nodes.len(), 6);
+    let bundled = bundle(nodes);
+    assert_eq!(bundled.len(), 6);
+    let change_row = bundled
+        .iter()
+        .find(|node| node.activity_kind() == ActivityKind::Change)
+        .unwrap_or_else(|| panic!("change row must remain visible"));
+    assert_eq!(change_row.node_key(), "4:0:40");
+    assert!(
+        bundled
+            .iter()
+            .all(|node| !matches!(node, HistoryNode::ExecuteBundle { .. })),
+        "runs adjacent to a change row never bundle"
+    );
+}
+
+#[test]
+fn change_separated_by_messages_does_not_block_bundling() {
+    // tool, tool, message, change, message, tool, tool (same turn): change rows
+    // never fold, and runs not adjacent to them bundle normally.
+    let ops = linear_chain(
+        1,
+        "request",
+        &[
+            row_spec(2, 2, "tool", Some("completed"), 1),
+            row_spec(3, 3, "tool", Some("completed"), 1),
+            row_spec(4, 4, "message", None, 1),
+            row_spec(5, 5, "file", None, 1),
+            row_spec(6, 6, "message", None, 1),
+            row_spec(7, 7, "tool", Some("completed"), 1),
+            row_spec(8, 8, "tool", Some("completed"), 1),
+        ],
+    );
+    let (nodes, _) = activity_view(ops);
+    let bundled = bundle(nodes);
+    assert_eq!(bundled.len(), 6);
+    assert_eq!(
+        bundled
+            .iter()
+            .filter(|node| matches!(node, HistoryNode::ExecuteBundle { .. }))
+            .count(),
+        2
+    );
+    assert!(
+        bundled
+            .iter()
+            .any(|node| node.activity_kind() == ActivityKind::Change),
+        "change evidence stays visible between bundles"
+    );
+}
+
+#[test]
+fn world_state_subop_member_breaks_runs() {
+    // tool rows with a world_state META sub-op attached to the newest member
+    // must not fold that member away; the clean pair around it still bundles.
+    let a_root = import_op(2, 1, None, Some("completed"));
+    let a_tool = import_op(3, 2, Some(a_root.id), Some("completed"));
+    let a_stateful = import_op(4, 3, Some(a_tool.id), Some("completed"));
+    let meta = world_state_import_op(4, 4, a_stateful.id);
+    let ops = vec![
+        a_root.clone(),
+        tool_child(202, 1010, a_root.id, "Bash", 1),
+        a_tool.clone(),
+        tool_child(302, 1020, a_tool.id, "Bash", 1),
+        a_stateful.clone(),
+        tool_child(402, 1030, a_stateful.id, "Bash", 1),
+        meta.clone(),
+    ];
+    let projection = HistoryProjection::from_ops_with(
+        ops,
+        ProjectionOptions {
+            bundle_metadata: true,
+        },
+    );
+    let nodes = projection.filtered_nodes(&activity_filter());
+    assert_eq!(nodes.len(), 3);
+    let bundled = bundle(nodes);
+    let stateful_row = bundled
+        .iter()
+        .find(|node| node.node_key() == a_stateful.id.to_string())
+        .unwrap_or_else(|| panic!("world_state owner must remain a top-level row"));
+    assert_eq!(stateful_row.sub_ops().len(), 1);
+    let clean_bundle = unwrap_bundle(&bundled);
+    assert_eq!(clean_bundle.sub_ops().len(), 2);
+}
+
+#[test]
+fn promotion_marks_negative_change_and_unit_final_narrative() {
+    // user request, tool ok, tool error, change, agent answer (one turn).
+    let ops = linear_chain(
+        1,
+        "user request",
+        &[
+            row_spec(2, 2, "tool", Some("completed"), 1),
+            row_spec(3, 3, "tool", Some("error"), 1),
+            row_spec(4, 4, "file", None, 1),
+            row_spec(5, 5, "message", None, 1),
+        ],
+    );
+    let (nodes, annotations) = activity_view(ops);
+    // display newest-first: agent answer(0), change(1), failure tool(2), ok
+    // tool(3), user request(4).
+    assert_eq!(nodes.len(), 5);
+    assert!(annotations[0].promoted, "unit-final narrative promoted");
+    assert!(annotations[1].promoted, "change row promoted");
+    assert!(annotations[2].promoted, "failure row promoted");
+    assert!(
+        !annotations[3].promoted,
+        "clean tool run member not promoted"
+    );
+    assert!(
+        !annotations[4].promoted,
+        "unit-opening request not promoted"
+    );
+    assert_eq!(annotations[0].work_unit.count, 5);
+    assert!(annotations[0].work_unit.is_start);
+    assert!(annotations[4].work_unit.is_end);
+    assert_eq!(
+        annotations[4].work_unit.title.as_deref(),
+        Some("user request"),
+        "unit title is the oldest primary narrative"
+    );
+}
+
+#[test]
+fn bundle_inherits_the_runs_external_parent_edges() {
+    // user request -> tool -> tool -> tool -> agent answer: the bundle replaces
+    // the run's display slots, so its parent_keys must carry the run's incoming
+    // edge (the user request), not the intra-run member edges, and the kept
+    // agent answer must keep pointing at the bundle key.
+    let ops = linear_chain(
+        1,
+        "user request",
+        &[
+            row_spec(2, 2, "tool", Some("completed"), 1),
+            row_spec(3, 3, "tool", Some("completed"), 1),
+            row_spec(4, 4, "tool", Some("completed"), 1),
+            row_spec(5, 5, "message", None, 1),
+        ],
+    );
+    let (nodes, _) = activity_view(ops);
+    let bundled = bundle(nodes);
+    assert_eq!(bundled.len(), 3);
+    let bundle_node = unwrap_bundle(&bundled);
+    let empty_links = BTreeMap::new();
+    let empty_notes = HashMap::new();
+    let external_parents = bundle_node.parent_keys(&empty_links, &empty_notes);
+    assert_eq!(
+        external_parents,
+        vec!["1:0:1"],
+        "run inherits the incoming edge"
+    );
+    let kept_answer = &bundled[0];
+    assert_eq!(kept_answer.node_key(), "5:0:50");
+    let HistoryNode::CollapsedImport { op, .. } = kept_answer else {
+        panic!("expected kept agent answer row");
+    };
+    let parents: Vec<String> = op.parents.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        parents,
+        vec![bundle_node.node_key()],
+        "kept child resolves to the bundle key"
+    );
+}
+
+#[test]
+fn promotion_prevents_bundling() {
+    // A three-tool run where the newest row is promoted must keep that row
+    // top-level while the remaining contiguous pair still bundles.
+    let ops = linear_chain(
+        1,
+        "request",
+        &[
+            row_spec(2, 2, "tool", Some("completed"), 1),
+            row_spec(3, 3, "tool", Some("completed"), 1),
+            row_spec(4, 4, "tool", Some("completed"), 1),
+        ],
+    );
+    let (nodes, mut annotations) = activity_view(ops);
+    assert_eq!(nodes.len(), 4);
+    // display newest-first: tool@seq4(0), tool@seq3, tool@seq2, user request.
+    annotations[0].promoted = true;
+    let bundled = bundle_activity_execute_runs(nodes, &annotations, &HashSet::new());
+    assert_eq!(bundled.len(), 3);
+    let promoted_row = &bundled[0];
+    assert_eq!(promoted_row.node_key(), "4:0:40");
+    let clean_bundle = unwrap_bundle(&bundled);
+    assert_eq!(clean_bundle.sub_ops().len(), 2);
+}
+
+#[test]
+fn work_unit_markers_are_stable_across_turns_and_paging() {
+    // Two turns in one session chain; annotations are computed over the FULL
+    // view so boundaries/counts never depend on window size or offset.
+    let ops = linear_chain(
+        1,
+        "request",
+        &[
+            row_spec(2, 2, "tool", Some("completed"), 1),
+            row_spec(3, 3, "tool", Some("completed"), 1),
+            row_spec(4, 4, "message", None, 1),
+            row_spec(5, 5, "message", None, 2),
+            row_spec(6, 6, "tool", Some("completed"), 2),
+            row_spec(7, 7, "message", None, 2),
+        ],
+    );
+    let (_nodes, annotations) = activity_view(ops);
+    assert_eq!(annotations.len(), 7);
+    let turn_two_id = "session:10/turn:2".to_string();
+    let turn_one_id = "session:10/turn:1".to_string();
+    for annotation in annotations.iter().take(3) {
+        assert_eq!(annotation.work_unit.id, turn_two_id);
+        assert_eq!(annotation.work_unit.count, 3);
+    }
+    assert!(annotations[0].work_unit.is_start);
+    assert!(!annotations[1].work_unit.is_start);
+    assert!(annotations[2].work_unit.is_end);
+    for annotation in annotations.iter().skip(3) {
+        assert_eq!(annotation.work_unit.id, turn_one_id);
+        assert_eq!(annotation.work_unit.count, 4);
+    }
+    assert!(annotations[3].work_unit.is_start);
+    assert!(annotations[6].work_unit.is_end);
+}
+
+#[test]
+fn work_unit_markers_are_view_wide_for_interleaved_units() {
+    // Display order (newest-first) interleaves two units as A/B/A/B/A/B, so no
+    // id is display-contiguous. Each logical unit must still yield exactly one
+    // boundary pair, a full-view count, a whole-unit title (its oldest
+    // narrative), and exactly one unit-final narrative promotion — never one
+    // per segment — and rows must only be annotated, never reordered.
+    let a3 = import_op(11, 11, None, None);
+    let b3 = import_op(12, 12, None, None);
+    let a2 = import_op(13, 13, Some(a3.id), Some("completed"));
+    let b2 = import_op(14, 14, Some(b3.id), Some("completed"));
+    let a1 = import_op(15, 15, Some(a2.id), Some("completed"));
+    let b1 = import_op(16, 16, Some(b2.id), Some("completed"));
+    let nodes = vec![
+        manual_collapsed(
+            a3,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            Some(TurnId(1)),
+            "a3",
+            "message",
+        ),
+        manual_collapsed(
+            b3,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            Some(TurnId(2)),
+            "b3",
+            "message",
+        ),
+        manual_collapsed(
+            a2,
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            Some(TurnId(1)),
+            "a2",
+            "tool",
+        ),
+        manual_collapsed(
+            b2,
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            Some(TurnId(2)),
+            "b2",
+            "tool",
+        ),
+        manual_collapsed(
+            a1,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            Some(TurnId(1)),
+            "a1",
+            "message",
+        ),
+        manual_collapsed(
+            b1,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            Some(TurnId(2)),
+            "b1",
+            "message",
+        ),
+    ];
+    let annotations = annotate_activity_rows(&nodes);
+    assert_eq!(annotations.len(), 6);
+    let ids: Vec<&str> = annotations
+        .iter()
+        .map(|annotation| annotation.work_unit.id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![
+            "session:10/turn:1",
+            "session:10/turn:2",
+            "session:10/turn:1",
+            "session:10/turn:2",
+            "session:10/turn:1",
+            "session:10/turn:2",
+        ],
+        "rows are only annotated, never reordered or gathered"
+    );
+    let starts: Vec<bool> = annotations
+        .iter()
+        .map(|annotation| annotation.work_unit.is_start)
+        .collect();
+    assert_eq!(
+        starts,
+        vec![true, true, false, false, false, false],
+        "exactly one is_start at each id's first display-order occurrence"
+    );
+    let ends: Vec<bool> = annotations
+        .iter()
+        .map(|annotation| annotation.work_unit.is_end)
+        .collect();
+    assert_eq!(
+        ends,
+        vec![false, false, false, false, true, true],
+        "exactly one is_end at each id's last display-order occurrence"
+    );
+    for annotation in &annotations {
+        assert_eq!(
+            annotation.work_unit.count, 3,
+            "count totals every top-level row of the id across the full view"
+        );
+    }
+    for index in [0usize, 2, 4] {
+        assert_eq!(
+            annotations[index].work_unit.title.as_deref(),
+            Some("a1"),
+            "unit A title is its oldest narrative across the whole interleaved unit"
+        );
+    }
+    for index in [1usize, 3, 5] {
+        assert_eq!(
+            annotations[index].work_unit.title.as_deref(),
+            Some("b1"),
+            "unit B title is its oldest narrative across the whole interleaved unit"
+        );
+    }
+    let promoted: Vec<bool> = annotations
+        .iter()
+        .map(|annotation| annotation.promoted)
+        .collect();
+    assert_eq!(
+        promoted,
+        vec![true, true, false, false, false, false],
+        "unit-final/newest narrative promotion happens exactly once per id"
+    );
+    let keys: Vec<String> = nodes.iter().map(HistoryNode::node_key).collect();
+    assert_eq!(
+        keys,
+        vec!["11:0:11", "12:0:12", "13:0:13", "14:0:14", "15:0:15", "16:0:16"]
+    );
+}
+
+#[test]
+fn bundle_parents_rewire_to_the_anchor_key() {
+    // A kept row whose stored parent is a folded member must resolve to the
+    // bundle key so layout stays connected after contraction.
+    let tool_op_2 = import_op(2, 2, None, Some("completed"));
+    let tool_op_3 = import_op(3, 3, Some(tool_op_2.id), Some("completed"));
+    let tool_op_4 = import_op(4, 4, Some(tool_op_3.id), Some("completed"));
+    let mut message_op_5 = import_op(5, 5, Some(tool_op_3.id), None);
+    message_op_5.tags = Tags::MESSAGE;
+    let nodes = vec![
+        manual_collapsed(
+            tool_op_4.clone(),
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            Some(TurnId(1)),
+            "tool 4",
+            "tool",
+        ),
+        manual_collapsed(
+            tool_op_3.clone(),
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            Some(TurnId(1)),
+            "tool 3",
+            "tool",
+        ),
+        manual_collapsed(
+            tool_op_2.clone(),
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            Some(TurnId(1)),
+            "tool 2",
+            "tool",
+        ),
+        manual_collapsed(
+            message_op_5,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            Some(TurnId(1)),
+            "text",
+            "message",
+        ),
+    ];
+    let annotations = annotate_activity_rows(&nodes);
+    let structural = HashSet::new();
+    let bundled = bundle_activity_execute_runs(nodes, &annotations, &structural);
+    assert_eq!(bundled.len(), 2);
+    let kept_message = &bundled[1];
+    let HistoryNode::CollapsedImport { op, .. } = kept_message else {
+        panic!("expected kept CollapsedImport message row");
+    };
+    let parent_keys: Vec<String> = op.parents.iter().map(ToString::to_string).collect();
+    assert_eq!(parent_keys, vec![tool_op_4.id.to_string()]);
+    let HistoryNode::ExecuteBundle { .. } = &bundled[0] else {
+        panic!("expected ExecuteBundle at the run slot");
+    };
+}

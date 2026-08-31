@@ -221,6 +221,20 @@ fn git_commit(oid_byte: u8, parent_bytes: &[u8]) -> editchain_core::GitCommitEnt
     }
 }
 
+/// Wrap a git commit entity as an imported op so `from_ops` projects it
+/// directly (the path `merge_git_commits` is designed to skip).
+fn git_commit_op(node: u64, seq: u64, commit: editchain_core::GitCommitEntity) -> Op {
+    Op {
+        id: OpId::new(NodeId(node), 0, seq),
+        parents: ParentSet::None,
+        actor: ActorId(0),
+        clock: Clock::None,
+        scope: ScopeRef::None,
+        tags: Tags::IMPORT,
+        kind: OpKind::GitCommit(Box::new(commit)),
+    }
+}
+
 #[test]
 fn graph_layout_topologically_sorts_git_commits() {
     // Three commits in a chain: C (oid 3) -> B (oid 2) -> A (oid 1).
@@ -261,6 +275,35 @@ fn graph_layout_topologically_sorts_git_commits() {
             edge.child
         );
     }
+}
+
+/// A projection built directly from ops must keep valid Git parent edges in
+/// `lifted_parent_keys` without any prior `merge_git_commits` call.
+#[test]
+fn lifted_git_parent_edge_survives_direct_from_ops_projection() {
+    // Child (oid 3) -> parent (oid 2). Both commits are supplied as ops, so
+    // `from_ops` reduces them into `git.commits` at construction time.
+    let parent_commit = git_commit(2, &[]);
+    let child_commit = git_commit(3, &[2]);
+    let parent_key = parent_commit.oid.to_hex();
+    let child_key = child_commit.oid.to_hex();
+
+    let projection = HistoryProjection::from_ops(vec![
+        git_commit_op(1, 1, child_commit),
+        git_commit_op(2, 1, parent_commit),
+    ]);
+
+    let child_node = projection
+        .nodes()
+        .into_iter()
+        .find(|node| node.node_key() == child_key)
+        .expect("child commit node is projected");
+    assert_eq!(
+        projection.lifted_parent_keys(&child_node),
+        vec![parent_key],
+        "a valid Git parent edge must survive a direct from_ops projection \
+         without a merge_git_commits call"
+    );
 }
 
 /// Git commits must always occupy the leftmost lane (0), even when interleaved

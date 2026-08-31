@@ -311,10 +311,31 @@ body {
   text-overflow: ellipsis;
 }
 .row .summary {
+  /* One constrained flex line: the inline chrome (chevron, badges, bundle
+     pills) and the summary text share the content cell, and every item can
+     shrink/ellipsize (min-width:0) so nothing ever lays out beyond the cell —
+     at narrow widths the NO_HORIZONTAL_OVERFLOW contract keeps descendants
+     inside their grid track instead of clipping them invisibly. Height is
+     untouched (still the row's own line); virtual scroll keeps ROW_H. */
+  display: flex;
+  align-items: center;
+  min-width: 0;
   font-weight: 400;
   white-space: nowrap;
   overflow: hidden;
+}
+/* The summary text itself is the flexible tail of the flex line: it absorbs
+   the leftover space and ellipsizes, while chips stay at natural size unless
+   the line is overfull (then they shrink too, see the badge/pill rules). */
+.summary-text {
+  /* A zero flex basis makes the prose absorb remaining space after semantic
+     chips take their natural width. Chips only shrink when they alone exceed
+     the track, instead of long prose needlessly collapsing their labels. */
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 /* Human message turns render bold; all other rows (agent, system, tool) stay
    at normal weight. */
@@ -329,6 +350,7 @@ body {
    every row exactly ROW_H. */
 .subop-chevron {
   display: inline-block;
+  flex: none;
   width: 14px;
   margin-right: 4px;
   padding: 0;
@@ -359,6 +381,13 @@ body {
    branch/return row stays fully legible. */
 .rel-badge {
   display: inline-block;
+  /* Flex-shrinkable chip: at narrow widths an overfull content line shrinks
+     the chips (ellipsizing their labels) instead of laying them out beyond
+     the content cell — same containment contract as .summary-text. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   margin-right: 6px;
   padding: 0 5px;
   border: 1px solid var(--vscode-descriptionForeground);
@@ -379,6 +408,10 @@ body {
 .act-badge,
 .out-badge {
   display: inline-block;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   margin-right: 6px;
   padding: 0 5px;
   border-radius: 8px;
@@ -440,9 +473,143 @@ body {
   font-size: 0.9em;
   margin-right: 4px;
   color: var(--vscode-descriptionForeground);
+  flex: none;
 }
 .subop-summary {
   white-space: nowrap;
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Activity-profile work-unit layer (Raw renders none of this — the classes
+   below only exist on rows the renderer marks in the Activity view). A
+   work-unit start opens a unit section: a stronger top separator plus a
+   compact two-line unit header INSIDE the fixed 34px row (unit title + count
+   pill above the row's own summary — never the opaque unit id as primary
+   text). The unit's last row closes with a slightly stronger bottom
+   separator only — no extra row, no height change. */
+.row-work-unit-start {
+  border-top: 1px solid var(--vscode-panel-border);
+  background-color: color-mix(in srgb, var(--vscode-panel-border) 5%, transparent);
+}
+.row-work-unit-end {
+  border-bottom-color: var(--vscode-panel-border);
+}
+/* The content cell's summary block becomes a fixed 2-line grid sized to the
+   unchanged 34px row: line 1 = ribbon (title + count pill), line 2 = the
+   row's own summary. Row height and virtual-scroll math are untouched. */
+.row-work-unit-start .summary.work-unit-block {
+  display: grid;
+  grid-template-rows: 13px 16px;
+  height: 29px;
+  box-sizing: border-box;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.work-unit-ribbon-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.work-unit-ribbon {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.72em;
+  font-weight: 600;
+  line-height: 12px;
+  letter-spacing: 0.01em;
+  color: var(--vscode-descriptionForeground);
+}
+.work-unit-count {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 6px;
+  font-size: 0.68em;
+  line-height: 12px;
+  color: var(--vscode-foreground);
+  background-color: color-mix(in srgb, var(--vscode-panel-border) 18%, transparent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.work-unit-row-line {
+  /* Same constrained flex line as .summary: chips + summary text shrink to
+     fit the fixed 16px grid row instead of overflowing the content cell. */
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* Execute-run bundle chrome (Activity only): a compact count pill built from
+   the DTO's member_count plus neutral/success outcome wording. Inline like a
+   badge, so it never affects row height or column layout — virtual scroll
+   keeps every row exactly ROW_H. */
+.bundle-count,
+.bundle-status {
+  display: inline-block;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-right: 6px;
+  padding: 0 6px;
+  border-radius: 7px;
+  font-size: 0.7em;
+  line-height: 14px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.bundle-count {
+  border: 1px solid var(--vscode-panel-border);
+  color: var(--vscode-foreground);
+  background-color: color-mix(in srgb, var(--vscode-panel-border) 14%, transparent);
+}
+.bundle-status {
+  border: 1px solid transparent;
+  color: var(--vscode-descriptionForeground);
+}
+.bundle-status.bundle-status-success {
+  border-color: var(--vscode-testing-iconPassed, #89d185);
+  color: var(--vscode-testing-iconPassed, #89d185);
+}
+
+/* Promoted rows (Activity only): conservative significance marker — these
+   rows never fold into bundles, and the rail makes that legible. No badge per
+   promoted row: failure/warning/cancelled outcomes and change/verify activity
+   get a strong accent rail + whisper tint; promoted narrative gets only a
+   restrained quiet rail. */
+.row-promoted-rail {
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--vscode-panel-border) 78%, transparent);
+}
+.row-promoted-failure {
+  box-shadow: inset 2px 0 0 var(--vscode-editorError-foreground, #f48771);
+  background-color: color-mix(in srgb, var(--vscode-editorError-foreground, #f48771) 6%, transparent);
+}
+.row-promoted-warning {
+  box-shadow: inset 2px 0 0 var(--vscode-editorWarning-foreground, #cca700);
+  background-color: color-mix(in srgb, var(--vscode-editorWarning-foreground, #cca700) 6%, transparent);
+}
+.row-promoted-cancelled {
+  box-shadow: inset 2px 0 0 var(--vscode-descriptionForeground);
+  background-color: color-mix(in srgb, var(--vscode-descriptionForeground) 4%, transparent);
+}
+.row-promoted-change {
+  box-shadow: inset 2px 0 0 var(--vscode-focusBorder, #007fd4);
+  background-color: color-mix(in srgb, var(--vscode-focusBorder, #007fd4) 5%, transparent);
+}
+.row-promoted-verify {
+  box-shadow: inset 2px 0 0 var(--vscode-testing-iconPassed, #89d185);
+  background-color: color-mix(in srgb, var(--vscode-testing-iconPassed, #89d185) 5%, transparent);
 }
 
 /* Per-row graph cells (one small SVG per row). Each cell draws the node's dot,
@@ -622,6 +789,10 @@ body.col-resizing .col-resize-handle {
   }
 }
 @media (max-width: 480px) {
+  /* At <=480px the JS width math caps the graph rail at GRAPH_MAX_W_NARROW
+     (see graphWidthBudget in media/main.js), so the CSS grid here just keeps
+     the --graph-w var authoritative. The rail stays VISIBLE — lanes compress
+     into the compact track instead of being hidden or smearing Content. */
   .tbl-header,
   .row {
     grid-template-columns:
@@ -631,6 +802,9 @@ body.col-resizing .col-resize-handle {
   .th.author,
   .author-cell {
     display: none;
+  }
+  .text-cell {
+    padding-right: 8px;
   }
 }
 @media (max-width: 400px) {

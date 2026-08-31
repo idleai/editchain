@@ -345,3 +345,193 @@ test('prepending same-group rows removes a stale chip left by a mid-group reanch
     await page.close();
   }
 });
+
+// --- Round-two parallel contract: work-unit/bundle grouping races ----------
+//
+// The Activity profile's work-unit/bundle/promotion DOM layer must follow the
+// same deterministic races as the plain grid:
+//   - a profile switch with a HELD window clears grouping/promotion DOM
+//     synchronously (no stale ribbons/bundles/rails left interactive), and
+//     the released raw view renders ZERO grouping DOM even though its cached
+//     rows carry the wire metadata (Activity vs Raw gating);
+//   - deep scroll + one-row prepends/trims across the virtual window never
+//     invent a duplicate work-unit start (per-id uniqueness in every slice);
+//   - bundle expand/collapse (ArrowRight/ArrowLeft/Space/Enter) and roving
+//     focus stay stable across the DOM rebuilds they cause.
+//
+// These DOM-level assertions are mandatory now that the renderer contract is
+// part of this change: missing marker classes fail the race tests. The
+// cache/wire-level behaviour is independently covered by
+// workUnitBridge.test.js.
+'use strict';
+
+test('profile switch with a held window clears work-unit/bundle grouping; raw stays gated; keyboard stays stable', async () => {
+  const { page, errors } = await newPage();
+  try {
+    await bootScenario(page, 'workUnits');
+
+    const baseline = await page.evaluate(() => ({
+      state: window.__editchainDebug.workUnitContractState(),
+      rows: document.querySelectorAll('.row').length,
+      dataReady: window.__editchainDataReady,
+      total: window.__editchainGetTotal(),
+    }));
+    assert.equal(baseline.rows, 12, 'activity view renders the 12 authored rows');
+    assert.equal(baseline.total, 23, 'window total includes expandable bundle member sub-ops');
+    assert.equal(baseline.dataReady, true);
+    assert.equal(baseline.state.any, true,
+      'Activity must render the work-unit/bundle/promotion contract');
+    assert.ok(baseline.state.markers.workUnit >= 12, 'work-unit markers rendered in Activity');
+    assert.ok(baseline.state.markers.bundle >= 6, 'bundle markers rendered in Activity');
+    assert.ok(baseline.state.markers.promoted === 5, 'promotion rails rendered in Activity');
+    assert.equal(baseline.state.cacheHasMetadata, true);
+
+    // Hold the Raw profile's first GetWindow; click Raw through the REAL
+    // control path. The reset must clear the grouping DOM synchronously.
+    await page.evaluate(() => {
+      window.__editchainPauseLoader = true;
+      window.__editchainHoldWindow = {};
+      document.getElementById('profile-raw').click();
+    });
+    const held = await page.evaluate(() => {
+      const hold = window.__editchainHoldWindow;
+      const state = window.__editchainDebug.workUnitContractState();
+      return {
+        held: !!hold && typeof hold.release === 'function',
+        rows: document.querySelectorAll('.row').length,
+        dataReady: window.__editchainDataReady,
+        profile: state.profile,
+        total: window.__editchainGetTotal(),
+        markers: state.markers,
+        message: (document.querySelector('.view-message') || {}).textContent || '',
+      };
+    });
+    assert.equal(held.held, true, 'the reset GetWindow must be captured by the hold hook');
+    assert.equal(held.rows, 0, 'stale rows must disappear while the new window is in flight');
+    assert.equal(held.dataReady, false, 'readiness must be cleared during the reset');
+    assert.equal(held.profile, 'raw', 'the new profile must be active immediately');
+    assert.equal(held.total, -1, 'total must be unknown until the new window arrives');
+    assert.deepEqual(held.markers, { workUnit: 0, bundle: 0, promoted: 0 },
+      'no grouping/promotion DOM may survive into the reset');
+    assert.match(held.message, /Loading/);
+
+    // Release: the raw view must render fully, be cache-backed, and keep
+    // zero grouping DOM while its cached rows still carry wire metadata.
+    await page.evaluate(() => {
+      const release = window.__editchainHoldWindow.release;
+      window.__editchainHoldWindow = null;
+      release();
+    });
+    await page.evaluate(() => window.__editchainDebug.whenIdle(20000));
+    const raw = await page.evaluate(() => {
+      const rows = Array.from(document.querySelectorAll('.row'));
+      return {
+        rows: rows.length,
+        cacheBacked: rows.every((r) => {
+          const abs = Number(r.getAttribute('data-row'));
+          return Number.isFinite(abs) && window.__editchainRowAt(abs) != null;
+        }),
+        state: window.__editchainDebug.workUnitContractState(),
+        checks: window.__editchainDebug.assertLayout(),
+      };
+    });
+    assert.equal(raw.rows, 18, 'raw profile serves the unbundled 18-row stream');
+    assert.equal(raw.cacheBacked, true, 'every raw row must be cache-backed');
+    assert.deepEqual(raw.state.markers, { workUnit: 0, bundle: 0, promoted: 0 },
+      'raw renders none of the grouping/promotion DOM');
+    assert.equal(raw.state.cacheHasMetadata, true,
+      'raw rows must still carry work_unit/promoted wire metadata (gating, not dropping)');
+    const rawGated = raw.checks.checks.find((c) => c.name === 'RAW_PROFILE_GATED');
+    assert.ok(rawGated && rawGated.pass, 'RAW_PROFILE_GATED layout check must pass');
+
+    // Back to Activity: grouping returns and the ARIA/keyboard behaviour is
+    // stable across the bundle expand/collapse DOM rebuilds.
+    await page.evaluate(() => {
+      window.__editchainHoldWindow = null;
+      document.getElementById('profile-activity').click();
+    });
+    await page.evaluate(() => window.__editchainDebug.whenIdle(20000));
+    const activity = await page.evaluate(() => window.__editchainDebug.workUnitContractState());
+    assert.equal(activity.profile, 'activity');
+    assert.ok(activity.any, 'grouping markers must return in Activity');
+
+    const probe = await page.evaluate(() => window.__editchainDebug.runWorkUnitProbe(20000));
+    console.log('[domRace] work-unit probe:', JSON.stringify(probe.detail));
+    assert.equal(probe.pass, true, 'bundle expand/collapse + roving focus must stay stable');
+
+    assert.deepEqual(errors, [], 'no uncaught page errors: ' + errors.join(' | '));
+  } finally {
+    await page.close();
+  }
+});
+
+test('deep scroll/prepend/trim across the virtual window never invents duplicate work-unit starts', async () => {
+  const { page, errors } = await newPage();
+  try {
+    await bootScenario(page, 'workUnitsDeep');
+
+    const state = await page.evaluate(() => window.__editchainDebug.workUnitContractState());
+    assert.equal(state.any, true,
+      'Activity must render the work-unit/bundle/promotion contract');
+
+    const setScroll = (vis) => page.evaluate((v) => {
+      document.getElementById('rows').scrollTop = v * 34;
+    }, vis);
+    const snapshot = () => page.evaluate(() => {
+      const rows = Array.from(document.querySelectorAll('.row'));
+      const byId = new Map();
+      for (const el of rows) {
+        if (!el.classList.contains('row-work-unit-start')) continue;
+        const abs = Number(el.getAttribute('data-row'));
+        const row = window.__editchainRowAt(abs);
+        if (!row || !row.work_unit) continue;
+        const agg = byId.get(row.work_unit.id) || { starts: 0, keys: [] };
+        agg.starts++;
+        agg.keys.push(row.node_key);
+        byId.set(row.work_unit.id, agg);
+      }
+      const g = window.__editchainGraphState();
+      return {
+        renderTop: g.renderTop,
+        renderBottom: g.renderBottom,
+        rows: rows.length,
+        starts: byId.size,
+        dupStarts: Array.from(byId.values()).filter((a) => a.starts > 1).length,
+      };
+    });
+
+    // Scroll down through the whole dataset: the DOM stays windowed
+    // (viewport + buffer) and every slice keeps per-id start uniqueness.
+    const downSnaps = [];
+    for (const vis of [200, 400, 600, 800, 900, 1000, 1100]) {
+      await setScroll(vis);
+      await page.evaluate(() => window.__editchainDebug.whenIdle(20000));
+      downSnaps.push(await snapshot());
+    }
+    for (const s of downSnaps) {
+      assert.equal(s.dupStarts, 0, 'no duplicate work-unit starts in a deep-scroll slice');
+      assert.ok(s.rows > 0 && s.rows <= 850, 'DOM must stay windowed (viewport + 2*BUFFER): ' + s.rows);
+    }
+    assert.ok(downSnaps[downSnaps.length - 1].renderTop >= 700,
+      'virtualization must actually advance the rendered window');
+
+    // One-row prepends while scrolling back up: renderTop tracks the scroll
+    // and no stale/duplicate start appears at the re-anchored top edge.
+    await setScroll(1050);
+    await page.evaluate(() => window.__editchainDebug.whenIdle(20000));
+    for (const vis of [1049, 1048, 1047, 1046, 1045]) {
+      await setScroll(vis);
+      await page.evaluate(() => window.__editchainDebug.whenIdle(20000));
+      const s = await snapshot();
+      assert.equal(s.dupStarts, 0, 'one-row prepends must not accumulate duplicate starts at ' + vis);
+      assert.equal(s.renderTop, vis - 400, 'one-row prepends must extend the window top');
+    }
+
+    const layout = await page.evaluate(() => window.__editchainDebug.assertLayout());
+    assert.equal(layout.failCount, 0, 'all layout checks pass after deep scroll/prepend/trim');
+
+    assert.deepEqual(errors, [], 'no uncaught page errors: ' + errors.join(' | '));
+  } finally {
+    await page.close();
+  }
+});

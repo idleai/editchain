@@ -772,6 +772,13 @@ const MIN_CONTENT_W = 160;
 // widths (with many concurrent lanes, lane X positions compress into this
 // capped region instead of the graph hogging the table).
 const GRAPH_MAX_FRACTION = 0.5;
+// Compact graph-rail cap for narrow panels (must match the <=480px CSS media
+// query that drops the Author column). Below this width the rail switches to a
+// fixed compact width instead of taking half the viewport, so Content keeps a
+// readable budget — every service lane is still drawn (laneX distributes lane
+// centres across the full column, see graphLaneWidth/laneX). The rail is
+// SHRUNK, never hidden: it stays >= MIN_COL_W.graph at all widths.
+const GRAPH_MAX_W_NARROW = 120;
 // Lane-spacing floor in px when lane count exceeds the natural budget.
 const MIN_LANE_W = 1.5;
 
@@ -796,7 +803,14 @@ function graphWidthBudget() {
   const rowsW = Math.max(1, rowsEl.clientWidth);
   const graphCap = Math.max(MIN_COL_W.graph, Math.floor(rowsW * GRAPH_MAX_FRACTION));
   const avail = Math.max(MIN_COL_W.graph, rowsW - fixedW - MIN_CONTENT_W);
-  return Math.min(graphCap, avail);
+  const budget = Math.min(graphCap, avail);
+  // Compact fixed-width rail at <=480px: the CSS media query drops the Author
+  // column there, and the graph stops competing with Content for the freed
+  // space. All lanes still compress inside this cap (graphLaneWidth/laneX).
+  if ((window.innerWidth || rowsEl.clientWidth || 0) <= 480) {
+    return Math.min(budget, GRAPH_MAX_W_NARROW);
+  }
+  return budget;
 }
 
 /** Node-dot radius, compressed when the graph rail is dense.
@@ -1169,6 +1183,115 @@ function outcomeBadge(row) {
     '" aria-label="outcome: ' + esc(label.text) + '">' + esc(label.text) + '</span>';
 }
 
+// --- Activity work-unit / bundle / promotion layer --------------------------
+//
+// The Activity profile renders a stable, additive semantic layer over the flat
+// row list: work-unit section headers, execute-run bundle chrome, and
+// conservative promotion rails. Raw stays the exact flat UI — every helper
+// below no-ops outside `profile === 'activity'`, so Raw rows never carry the
+// classes/descendants/data attributes the semantic layer introduces.
+
+/** Short human fallback labels for work-unit headers with no narrative title.
+ * Keys are whitelisted activity kinds; unknown kinds fall back to type/group
+ * labels. The opaque unit id is NEVER used as visible primary text. */
+const WORK_UNIT_FALLBACK_LABELS = {
+  execute: 'Run',
+  change: 'Change',
+  verify: 'Verify',
+  plan: 'Plan',
+  explore: 'Explore',
+  diagnose: 'Diagnose',
+  coordinate: 'Coordinate',
+  source_control: 'Git',
+  external: 'External',
+  system: 'System',
+};
+
+/** Whether the Activity profile is active (Raw renders none of the semantic
+ * work-unit/bundle/promotion layer). */
+function activityView() {
+  return profile === 'activity';
+}
+
+/** The row's Activity work-unit payload, or null outside the Activity profile
+ * or on sub-op rows (the service ships `None` there; sub-ops never carry a
+ * unit header of their own). */
+function workUnitOf(row) {
+  if (!activityView() || !row || row.is_subop || !row.work_unit) return null;
+  return row.work_unit;
+}
+
+/** Title for a work-unit header: the DTO title when present, else a short
+ * human label derived from the row's activity kind, then type, then group —
+ * never the full opaque unit id as primary text. */
+function workUnitTitle(row) {
+  const wu = workUnitOf(row);
+  if (wu && typeof wu.title === 'string' && wu.title) return wu.title;
+  const fallback = WORK_UNIT_FALLBACK_LABELS[row.activity_kind];
+  if (fallback) return fallback;
+  if (row.kind === 'message' || row.kind === 'command') return 'Request';
+  return groupLabelText(row.group);
+}
+
+/** Human count text for a work-unit header, from the exact DTO count. */
+function workUnitCountText(count) {
+  return String(count) + (count === 1 ? ' record' : ' records');
+}
+
+/** CSS classes for a row's work-unit boundary role: start (unit header),
+ * subtle end closure, or none. */
+function workUnitClasses(row) {
+  const wu = workUnitOf(row);
+  if (!wu) return '';
+  if (wu.is_start) return ' row-work-unit-start';
+  if (wu.is_end) return ' row-work-unit-end';
+  return '';
+}
+
+/** Whether a row is a top-level Activity execute-run bundle. Only the typed
+ * `execute-run` kind qualifies — unknown/new bundle kinds stay flat. */
+function isExecuteRunBundle(row) {
+  return !!(activityView() && row && !row.is_subop && row.activity_bundle &&
+    row.activity_bundle.kind === 'execute-run');
+}
+
+/** Whether a row is promoted in the Activity view (sub-ops are never). */
+function isPromotedRow(row) {
+  return !!(activityView() && row && !row.is_subop && row.promoted === true);
+}
+
+/** CSS classes for a promoted row: a strong accent for failure/warning/
+ * cancelled outcomes and change/verify activity; a quiet rail for promoted
+ * narrative. No badge is added — the rail carries the signal. */
+function promotedClasses(row) {
+  if (row.outcome === 'failure' || row.outcome === 'warning' || row.outcome === 'cancelled') {
+    return ' row-promoted row-promoted-' + row.outcome;
+  }
+  if (row.activity_kind === 'change' || row.activity_kind === 'verify') {
+    return ' row-promoted row-promoted-' + row.activity_kind;
+  }
+  return ' row-promoted row-promoted-rail';
+}
+
+/** Compact count/status chrome for an execute-run bundle row. The count comes
+ * ONLY from the DTO's `member_count` (never parsed from the summary or the
+ * flattened sub-op count); success wording + badge appear only when the row
+ * reports a success outcome, otherwise the wording stays neutral. */
+function bundleChrome(row) {
+  const bundle = row.activity_bundle;
+  const mc = bundle ? bundle.member_count : undefined;
+  const countText = typeof mc === 'number'
+    ? mc + (mc === 1 ? ' step' : ' steps')
+    : '';
+  const success = row.outcome === 'success';
+  const statusText = success ? 'completed' : 'outcome unknown';
+  return (countText
+      ? '<span class="bundle-count" title="' + esc(countText) + '">' + esc(countText) + '</span>'
+      : '') +
+    '<span class="bundle-status' + (success ? ' bundle-status-success' : '') + '">' +
+    esc(statusText) + '</span>';
+}
+
 /** Short commit/ID display value for the Commit/ID column.
  *
  * Op IDs are removed from the default visual priority: an op row shows only a
@@ -1193,14 +1316,29 @@ function shortCommitId(row) {
  *   - Sub-op rows (`row.is_subop`) render indented with a small Codicon; clicking
  *     selects them in the inspector.
  *
+ * The Activity profile additionally layers stable semantic chrome over the flat
+ * row (see the work-unit/bundle/promotion helpers above): work-unit starts get
+ * a compact two-line unit header inside the SAME fixed ROW_H (never the opaque
+ * unit id as primary text), execute-run bundles get count/status chrome plus
+ * disclosure semantics, and promoted rows get a quiet rail (restrained
+ * narrative) or a strong accent (failure/warning/cancelled and change/verify).
+ * Raw renders the exact flat row with none of it.
+ *
  * Accessibility: rows are focusable grid rows with aria-selected/aria-expanded,
  * the chevron is a labelled button, truncated cells carry title tooltips, and
  * the group boundary label is a visible (non-hover) short-ID chip. Every `.row`
  * stays exactly ROW_H tall so virtual-scroll math is undisturbed.
  */
 function buildRowHtml(row, absIdx, isGroupStart) {
-  const groupClass = isGroupStart ? ' row-group-start' : '';
-  const groupLabel = isGroupStart
+  const wu = workUnitOf(row);
+  const isWuStart = !!wu && !!wu.is_start;
+  const isWuEnd = !!wu && !!wu.is_end;
+  const isBundle = isExecuteRunBundle(row);
+  const promotedCls = isPromotedRow(row) ? promotedClasses(row) : '';
+  const groupClass = isGroupStart && !isWuStart ? ' row-group-start' : '';
+  // Work-unit starts render their own unit header; suppress the group chip on
+  // those rows so labels never stack (the separator border stays).
+  const groupLabel = isGroupStart && !isWuStart
     ? '<div class="group-label" aria-hidden="true">' + esc(groupLabelText(row.group)) + '</div>'
     : '';
   const kindClass = row.is_system ? 'row-tool'
@@ -1217,42 +1355,88 @@ function buildRowHtml(row, absIdx, isGroupStart) {
   const summaryText = row.summary || '(no summary)';
   const hasSubs = !row.is_subop && hasSubOps(row);
   const expanded = hasSubs && expandedBlocks.has(blockIndexOfAbs(absIdx));
-  const expandableAttr = hasSubs
+  // Bundle rows are expandable disclosures: they always expose aria-expanded
+  // reflecting the current reveal state (the service ships their folded
+  // members as sub_ops, so toggling reveals them).
+  const expandable = hasSubs || isBundle;
+  const expandableAttr = expandable
     ? ' aria-expanded="' + (expanded ? 'true' : 'false') + '"'
     : '';
+  const chevron = expanded ? '▾' : '▸';
+  const chevronHtml = hasSubs
+    ? '<button type="button" class="subop-chevron" title="' +
+      (expanded ? 'Collapse bundled metadata records' : 'Expand bundled metadata records') +
+      '" aria-label="' + (expanded ? 'Collapse bundled metadata records' : 'Expand bundled metadata records') +
+      '"' + expandableAttr + '>' + chevron + '</button>'
+    : '';
+  const bundleHtml = isBundle ? bundleChrome(row) : '';
   let content;
   if (row.is_subop) {
     // A bundled sub-op expanded inline: small Codicon + indented summary.
     const icon = subopIcon(row.subop_kind);
     content = '<span class="subop-icon codicon codicon-' + icon + '" aria-hidden="true"></span>' +
       '<span class="subop-summary">' + esc(summaryText) + '</span>';
-  } else if (hasSubs) {
-    // Top-level combined op: the chevron BUTTON toggles inline expansion; the
-    // row itself is a normal inspector selection target.
-    const chevron = expanded ? '▾' : '▸';
-    content = '<button type="button" class="subop-chevron" title="' +
-      (expanded ? 'Collapse bundled metadata records' : 'Expand bundled metadata records') +
-      '" aria-label="' + (expanded ? 'Collapse bundled metadata records' : 'Expand bundled metadata records') +
-      '"' + expandableAttr + '>' + chevron + '</button>' +
-      badges + esc(summaryText);
   } else {
-    content = badges + esc(summaryText);
+    // Top-level row: the chevron BUTTON toggles inline expansion (the only
+    // control that does); the row itself is a normal inspector selection
+    // target. Bundle chrome sits between the chevron and the badges/summary.
+    // The summary text is wrapped in a flex-ellipsizing span so the inline
+    // chrome (chevron/badges/bundle pills) and the text share one constrained
+    // flex line: at narrow widths the chips shrink/ellipsize instead of laying
+    // out beyond the content cell (NO_HORIZONTAL_OVERFLOW contract).
+    content = chevronHtml + bundleHtml + badges +
+      '<span class="summary-text">' + esc(summaryText) + '</span>';
+  }
+  if (isWuStart) {
+    // Compact two-line unit header inside the fixed ROW_H: the unit title +
+    // count pill sit above the row's own summary. Content cell height is
+    // untouched (still 34px) — only the block's internal layout changes.
+    const title = workUnitTitle(row);
+    const countHtml = typeof wu.count === 'number'
+      ? '<span class="work-unit-count" title="' + esc(workUnitCountText(wu.count)) + '">' +
+        esc(workUnitCountText(wu.count)) + '</span>'
+      : '';
+    content = '<span class="work-unit-ribbon-line">' +
+      '<span class="work-unit-ribbon" title="' + esc(title) + '">' + esc(title) + '</span>' +
+      countHtml + '</span>' +
+      '<span class="work-unit-row-line">' + content + '</span>';
   }
   const dateText = formatDate(row.timestamp_ms);
   const authorText = row.author || '';
+  // Descriptive accessible name: bundle rows read as disclosures ("5-step
+  // execute run: summary"); work-unit starts lead with their unit header.
+  let ariaLabel = summaryText;
+  if (isBundle) {
+    const mc = row.activity_bundle.member_count;
+    ariaLabel = 'Execute run' +
+      (typeof mc === 'number' ? ', ' + mc + (mc === 1 ? ' step' : ' steps') : '') +
+      ': ' + summaryText;
+  } else if (isWuStart) {
+    ariaLabel = workUnitTitle(row) + ': ' + summaryText;
+  }
   // Roving tabindex: exactly one row per rendered window is tabbable (the rest
   // are focusable-but-not-tabbable so keyboard users step through the grid as
   // a unit; see applyRovingTabindex and the ArrowUp/Down handling).
   const rovingTab = absIdx === rovingAbs ? '0' : '-1';
+  const wuAttrs = isWuStart
+    ? ' data-work-unit-id="' + esc(wu.id) + '"'
+    : '';
+  const bundleAttrs = isBundle
+    ? ' data-activity-bundle="execute-run"' +
+      (typeof row.activity_bundle.member_count === 'number'
+        ? ' data-bundle-count="' + row.activity_bundle.member_count + '"'
+        : '')
+    : '';
   return '<div class="row ' + kindClass + humanClass + subopClass + relClass + selectedClass + groupClass +
+    workUnitClasses(row) + (isBundle ? ' row-activity-bundle' : '') + promotedCls +
     '" role="row" tabindex="' + rovingTab + '" aria-selected="' + (row.node_key === selectedRowKey ? 'true' : 'false') + '"' +
     expandableAttr +
-    ' aria-label="' + esc(summaryText) + '" title="' + esc(summaryText) + '"' +
+    ' aria-label="' + esc(ariaLabel) + '" title="' + esc(summaryText) + '"' +
     ' data-key="' + esc(row.node_key) +
-    '" data-row="' + absIdx + '" style="' + colStyle() + '">' +
+    '" data-row="' + absIdx + '"' + wuAttrs + bundleAttrs + ' style="' + colStyle() + '">' +
     groupLabel +
     '<div class="graph-cell" role="gridcell">' + buildGraphCell(row) + '</div>' +
-    '<div class="text-cell" role="gridcell"><div class="summary" title="' + esc(summaryText) + '">' + content + '</div></div>' +
+    '<div class="text-cell" role="gridcell"><div class="summary' + (isWuStart ? ' work-unit-block' : '') + '" title="' + esc(summaryText) + '">' + content + '</div></div>' +
     '<div class="date-cell" role="gridcell"' + (dateText ? ' title="' + esc(dateText) + '"' : '') + '>' + esc(dateText) + '</div>' +
     '<div class="author-cell" role="gridcell"' + (authorText ? ' title="' + esc(authorText) + '"' : '') + '>' + esc(authorText) + '</div>' +
     '<div class="commit-cell" role="gridcell" title="' + esc(row.commit_id || row.op_id || '') + '">' + esc(shortCommitId(row)) + '</div>' +
@@ -1274,15 +1458,20 @@ function setWrapTop(top) {
  * `isGroupStart`, matching what buildRowHtml would produce. */
 function setGroupStart(el, row, isGroupStart) {
   if (!el || !row) return;
+  // Work-unit starts render their own unit header and separator — never stack
+  // a group chip or retain the separate group-boundary class on top of it
+  // (matches buildRowHtml's suppression).
+  const wu = workUnitOf(row);
+  const suppressChip = !!(wu && wu.is_start);
   const has = el.classList.contains('row-group-start');
-  if (isGroupStart && !has) {
+  if (isGroupStart && !suppressChip && !has) {
     el.classList.add('row-group-start');
     const label = document.createElement('div');
     label.className = 'group-label';
     label.setAttribute('aria-hidden', 'true');
     label.textContent = groupLabelText(row.group);
     el.insertBefore(label, el.firstChild);
-  } else if (!isGroupStart && has) {
+  } else if ((!isGroupStart || suppressChip) && has) {
     el.classList.remove('row-group-start');
     const label = el.querySelector('.group-label');
     if (label) label.remove();
@@ -1311,7 +1500,13 @@ function graphColumnHeaderLabel() {
   if (graphLabelMinW === null) {
     const probe = document.createElement('div');
     probe.className = 'th graph';
-    probe.style.cssText = 'position:absolute;visibility:hidden;left:-9999px;top:0;width:auto;';
+    probe.style.cssText = 'position:absolute;visibility:hidden;left:-9999px;top:0;width:auto;' +
+      // Mirror .tbl-header .th exactly: a detached probe outside .tbl-header
+      // misses the cell padding, under-measures the label, and leaves the
+      // real narrow track clipping "Graph" to "G…" (scrollWidth includes the
+      // cell's horizontal padding, so it equals the smallest column width
+      // that shows the label unclipped).
+      'padding:6px 8px;box-sizing:border-box;font-weight:700;white-space:nowrap;';
     probe.textContent = 'Graph';
     document.body.appendChild(probe);
     // scrollWidth includes the cell's horizontal padding, so it equals the
@@ -1476,6 +1671,18 @@ function toggleExpandFor(row, absIdx) {
   }
 }
 
+/** Keyboard toggle of a bundle row's reveal state (disclosure semantics).
+ * After the reanchor rebuilds the window, re-focus the fresh bundle row so
+ * keyboard focus survives the DOM replacement. */
+function toggleBundleKeyboard(row, absIdx) {
+  toggleExpandFor(row, absIdx);
+  const w = wrapEl();
+  if (w) {
+    const fresh = w.querySelector('.row[data-row="' + absIdx + '"]');
+    if (fresh) fresh.focus();
+  }
+}
+
 function attachRowClicks() {
   const w = wrapEl();
   if (!w) return;
@@ -1527,6 +1734,24 @@ rowsEl.addEventListener('keydown', (e) => {
     target.focus();
     return;
   }
+  if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+    // Bundle rows are expandable disclosures: ArrowRight expands a collapsed
+    // run, ArrowLeft collapses an expanded one. Only bundle rows respond —
+    // ordinary rows keep ArrowUp/Down roving navigation only.
+    const el = e.target.closest('.row');
+    if (!el) return;
+    const absIdx = parseInt(el.getAttribute('data-row'), 10);
+    const row = cache.get(absIdx);
+    if (!row || !isExecuteRunBundle(row)) return;
+    const expanded = expandedBlocks.has(blockIndexOfAbs(absIdx));
+    const wantsToggle = (e.key === 'ArrowRight' && !expanded) ||
+      (e.key === 'ArrowLeft' && expanded);
+    if (wantsToggle) {
+      e.preventDefault();
+      toggleBundleKeyboard(row, absIdx);
+    }
+    return;
+  }
   if (e.key !== 'Enter' && e.key !== ' ') return;
   if (e.target.closest('button')) return; // native button activation handles it
   const el = e.target.closest('.row');
@@ -1535,6 +1760,12 @@ rowsEl.addEventListener('keydown', (e) => {
   const absIdx = parseInt(el.getAttribute('data-row'), 10);
   const row = cache.get(absIdx);
   if (!row) return;
+  if (isExecuteRunBundle(row)) {
+    // Enter/Space toggle the run's reveal state (disclosure semantics) and
+    // re-focus the rebuilt row so focus survives the reanchor.
+    toggleBundleKeyboard(row, absIdx);
+    return;
+  }
   if (e.key === ' ' && hasSubOps(row) && !row.is_subop) {
     toggleExpandFor(row, absIdx);
     return;

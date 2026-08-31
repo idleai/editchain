@@ -179,6 +179,7 @@ fn collapse_author_derived_from_children_tags() {
     let author = match nodes.first().unwrap() {
         editchain_project::HistoryNode::CollapsedImport { author, .. } => author,
         editchain_project::HistoryNode::EditOperation { .. }
+        | editchain_project::HistoryNode::ExecuteBundle { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     };
     assert_eq!(author, "human");
@@ -197,6 +198,7 @@ fn collapse_author_prefers_human_over_agent() {
     let author = match nodes.first().unwrap() {
         editchain_project::HistoryNode::CollapsedImport { author, .. } => author,
         editchain_project::HistoryNode::EditOperation { .. }
+        | editchain_project::HistoryNode::ExecuteBundle { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     };
     assert_eq!(author, "human");
@@ -242,6 +244,7 @@ fn meta_imports_bundle_into_nearest_real_turn() {
             assert_eq!(sub_ops[1].id, meta2.id);
         }
         editchain_project::HistoryNode::EditOperation { .. }
+        | editchain_project::HistoryNode::ExecuteBundle { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     }
 }
@@ -279,6 +282,7 @@ fn meta_bundle_keeps_parents_unchanged() {
             assert_eq!(sub_ops[0].id, meta.id);
         }
         editchain_project::HistoryNode::EditOperation { .. }
+        | editchain_project::HistoryNode::ExecuteBundle { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     }
 
@@ -672,6 +676,7 @@ fn no_cross_chain_meta_bundling() {
             assert_eq!(sub_ops[0].id, a_meta.id);
         }
         editchain_project::HistoryNode::EditOperation { .. }
+        | editchain_project::HistoryNode::ExecuteBundle { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     }
 

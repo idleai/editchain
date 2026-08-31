@@ -576,6 +576,23 @@ fn is_item_completed(record_type: Option<&str>, event_type: Option<&str>) -> boo
     record_type == Some("item_completed") || event_type == Some("item_completed")
 }
 
+/// Whether a bundled metadata sub-op is a heavy per-turn state record
+/// (`world_state` or `turn_context`) that must keep its own row anchor.
+///
+/// Used by the Activity view's execute-run bundling: a member owning such a
+/// sub-op is never eligible, so its state dump stays attached to the visible
+/// row that carries it instead of being buried inside a folded run.
+#[must_use]
+pub(crate) fn sub_op_is_world_state_or_turn_context(op: &Op) -> bool {
+    let Some(value) = raw_import_json(op) else {
+        return false;
+    };
+    matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("world_state" | "turn_context")
+    )
+}
+
 /// Parse the raw JSONL of an import op, if it is inline JSON.
 #[must_use]
 fn raw_import_json(op: &Op) -> Option<Value> {

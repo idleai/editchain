@@ -29,6 +29,7 @@ use editchain_core::{
 use editchain_git::{discover_repositories, resolve_commit, walk_history, RepositoryHandle};
 use editchain_import::{hash_raw, FsBlobSink};
 use editchain_index::LexicalIndex;
+use editchain_project::activity::{ActivityRowAnnotation, WorkUnitMarker};
 use editchain_project::filter::ChainFilter;
 use editchain_project::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
@@ -36,7 +37,7 @@ use editchain_protocol::{
     ChainFilterDto, GraphLayout as ProtocolGraphLayout, HistoryRow, HistoryWindow, LayoutEdge,
     LayoutPoint, LayoutRow, NodeDetails, ParentRelationDto, ParentRelationKind, RepositoryInfo,
     Request, RequestBody, ResolvedObject, Response, ResponseBody, SearchFiltersDto, SearchHit,
-    SearchResponse,
+    SearchResponse, WorkUnitDto,
 };
 use editchain_query::search::{SearchFilters, Source};
 
@@ -105,6 +106,9 @@ pub struct HistoryWindowOptions<'a> {
 struct ViewSnapshot {
     /// Canonical top-level rows in display order.
     nodes: Vec<editchain_project::HistoryNode>,
+    /// Per-row Activity-view annotations (work-unit markers + promotion),
+    /// parallel to `nodes` 1:1.
+    annotations: Vec<ActivityRowAnnotation>,
     /// Graph geometry over `nodes`, built only after the first row window has
     /// painted. `None` is a valid provisional row-only snapshot.
     context: Option<editchain_project::layout::LayoutContext>,
@@ -1686,10 +1690,19 @@ impl Workspace {
                     visibility: node.visibility(),
                     outcome: node.outcome(),
                     turn_id: node.turn_id().map(|id| id.0.to_string()),
+                    work_unit: snapshot
+                        .annotations
+                        .get(abs_idx)
+                        .map(|annotation| work_unit_dto(&annotation.work_unit)),
+                    promoted: snapshot
+                        .annotations
+                        .get(abs_idx)
+                        .is_some_and(|annotation| annotation.promoted),
+                    activity_bundle: node_activity_bundle(node),
                 });
             }
             // Emit each bundled sub-op as its own row immediately after its parent.
-            let summaries = sub_op_summaries(node.sub_ops());
+            let summaries = node_sub_op_summaries(node);
             // Lanes passing straight through this sub-op region (between this
             // parent and the next top-level node): any lane with a vertical line
             // leaving this parent downward AND entering the next node from above
@@ -1702,6 +1715,10 @@ impl Workspace {
                 .and_then(|layout| layout.row_above.get(abs_idx + 1))
                 .map_or(&[][..], Vec::as_slice);
             let region_lanes = intersect_sorted(below_parent, above_next);
+            // Per-bundle member meta lookup, built once so sub-op row metadata
+            // stays O(1) per row instead of scanning the bundle's members.
+            let member_meta: HashMap<String, (RecordRole, ActivityKind)> =
+                node_sub_op_meta_index(node);
             for (i, sub) in summaries.iter().enumerate() {
                 let slot = block_start + 1 + i;
                 if slot < offset_usize || slot >= end_usize {
@@ -1711,7 +1728,7 @@ impl Workspace {
                     .sub_ops()
                     .get(i)
                     .map_or((RecordRole::Unknown, ActivityKind::Unknown), |op| {
-                        sub_op_meta(op.as_ref())
+                        node_sub_op_meta(op.as_ref(), &member_meta)
                     });
                 rows.push(HistoryRow {
                     op_id: Some(sub.op_id.clone()),
@@ -1746,6 +1763,9 @@ impl Workspace {
                     visibility: Visibility::Supporting,
                     outcome: Outcome::Unknown,
                     turn_id: node.turn_id().map(|id| id.0.to_string()),
+                    work_unit: None,
+                    promoted: false,
+                    activity_bundle: None,
                 });
             }
         }
@@ -1784,6 +1804,23 @@ impl Workspace {
         } else {
             all_nodes
         };
+        // Activity-view semantics: every view gets deterministic work-unit and
+        // promotion annotations; the fixed Activity view additionally folds
+        // safe low-signal execute runs (never the raw profile, which must stay
+        // exact and ordered). Annotations are recomputed on the final list so
+        // bundle rows carry their own unit markers.
+        let mut annotations = editchain_project::activity::annotate_activity_rows(&nodes);
+        let nodes = if filter.key() == fixed_view_filter().key() {
+            let structural = self.projection.structural_row_keys(&nodes);
+            editchain_project::activity::bundle_activity_execute_runs(
+                nodes,
+                &annotations,
+                &structural,
+            )
+        } else {
+            nodes
+        };
+        annotations = editchain_project::activity::annotate_activity_rows(&nodes);
         let sub_op_counts: Vec<usize> = nodes.iter().map(|node| node.sub_ops().len()).collect();
         let mut starts = Vec::with_capacity(nodes.len().saturating_add(1));
         starts.push(0usize);
@@ -1802,6 +1839,7 @@ impl Workspace {
             key,
             ViewSnapshot {
                 nodes,
+                annotations,
                 context: None,
                 sub_op_counts,
                 starts,
@@ -2242,6 +2280,9 @@ fn node_is_system(node: &editchain_project::HistoryNode) -> bool {
         editchain_project::HistoryNode::CollapsedImport { kind, .. } => {
             kind == "tool" || kind == "import"
         }
+        // Execute-run bundles summarize tool/command rows: dim them like the
+        // individual tool rows they fold.
+        editchain_project::HistoryNode::ExecuteBundle { .. } => true,
         editchain_project::HistoryNode::GitCommit(_) => false,
     }
 }
@@ -2259,7 +2300,8 @@ fn node_author(node: &editchain_project::HistoryNode) -> String {
         // Collapsed imports carry their author label directly (derived from the
         // children's tags in the projection), since the raw import op's own tags
         // only carry `IMPORT`.
-        editchain_project::HistoryNode::CollapsedImport { author, .. } => author.clone(),
+        editchain_project::HistoryNode::CollapsedImport { author, .. }
+        | editchain_project::HistoryNode::ExecuteBundle { author, .. } => author.clone(),
         editchain_project::HistoryNode::GitCommit(commit) => payload_text(&commit.author.name),
     }
 }
@@ -2310,6 +2352,135 @@ fn sub_op_summaries(sub_ops: &[std::sync::Arc<Op>]) -> Vec<editchain_protocol::S
             }
         })
         .collect()
+}
+
+/// Convert a row's Activity annotation into the protocol's wire DTO.
+#[must_use]
+fn work_unit_dto(marker: &WorkUnitMarker) -> WorkUnitDto {
+    WorkUnitDto {
+        id: marker.id.clone(),
+        is_start: marker.is_start,
+        is_end: marker.is_end,
+        title: marker.title.clone(),
+        count: marker.count,
+    }
+}
+
+/// Typed Activity-view bundle metadata for a top-level row.
+///
+/// `Some` only for synthetic execute-run bundles, carrying the ORIGINAL
+/// top-level run member count (`member_nodes.len()`, never the flattened
+/// metadata-subop count) so the viewer can render faithful bundle labels from
+/// structured data without parsing the summary string. `None` for every
+/// ordinary and sub-op row, including the raw (unbundled) profile.
+#[must_use]
+fn node_activity_bundle(
+    node: &editchain_project::HistoryNode,
+) -> Option<editchain_protocol::ActivityBundleDto> {
+    if let editchain_project::HistoryNode::ExecuteBundle { member_nodes, .. } = node {
+        Some(editchain_protocol::ActivityBundleDto {
+            kind: editchain_protocol::ActivityBundleKind::ExecuteRun,
+            member_count: u64::try_from(member_nodes.len()).unwrap_or(u64::MAX),
+        })
+    } else {
+        None
+    }
+}
+
+/// Build the expanded sub-op summaries for a top-level node.
+///
+/// Execute-run bundles expose their folded member rows, so each member renders
+/// with its ORIGINAL row's summary/kind (faithful labels) while the member's
+/// own metadata sub-ops keep the generic op-derived labels. All other nodes
+/// use the generic op-derived path unchanged.
+#[must_use]
+fn node_sub_op_summaries(
+    node: &editchain_project::HistoryNode,
+) -> Vec<editchain_protocol::SubOpSummary> {
+    if let editchain_project::HistoryNode::ExecuteBundle {
+        member_nodes,
+        members,
+        ..
+    } = node
+    {
+        member_sub_op_summaries(members, member_nodes)
+    } else {
+        sub_op_summaries(node.sub_ops())
+    }
+}
+
+/// Sub-op summaries for one bundle's flattened member ops.
+///
+/// Each entry is the member's anchor op (labels come from the original row) or
+/// one of the member's own bundled metadata ops (generic labels), preserving
+/// reveal order.
+#[must_use]
+fn member_sub_op_summaries(
+    members: &[std::sync::Arc<Op>],
+    member_nodes: &[editchain_project::HistoryNode],
+) -> Vec<editchain_protocol::SubOpSummary> {
+    let key_to_node: HashMap<String, &editchain_project::HistoryNode> = member_nodes
+        .iter()
+        .map(|node| (node.node_key(), node))
+        .collect();
+    members
+        .iter()
+        .map(|op| {
+            let op_key = op.id.to_string();
+            if let Some(member) = key_to_node.get(&op_key) {
+                editchain_protocol::SubOpSummary {
+                    op_id: op_key,
+                    summary: member.summary(),
+                    kind: member.kind(),
+                    timestamp_ms: op.clock.as_u64(),
+                }
+            } else {
+                let (summary, kind) = sub_op_label(op);
+                editchain_protocol::SubOpSummary {
+                    op_id: op_key,
+                    summary,
+                    kind,
+                    timestamp_ms: op.clock.as_u64(),
+                }
+            }
+        })
+        .collect()
+}
+
+/// Per-bundle op-key -> member metadata index for expanded sub-op rows.
+///
+/// Built once per bundle node; entries cover only the folded member rows (their
+/// own metadata sub-ops fall through to the generic op-derived classifier).
+#[must_use]
+fn node_sub_op_meta_index(
+    node: &editchain_project::HistoryNode,
+) -> HashMap<String, (RecordRole, ActivityKind)> {
+    if let editchain_project::HistoryNode::ExecuteBundle { member_nodes, .. } = node {
+        member_nodes
+            .iter()
+            .map(|member| {
+                (
+                    member.node_key(),
+                    (member.record_role(), member.activity_kind()),
+                )
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    }
+}
+
+/// Semantic role/activity for one expanded sub-op row, using the bundle's
+/// precomputed member metadata when the op is a folded member row.
+#[must_use]
+fn node_sub_op_meta(
+    op: &Op,
+    member_meta: &HashMap<String, (RecordRole, ActivityKind)>,
+) -> (RecordRole, ActivityKind) {
+    member_meta
+        .get(&op.id.to_string())
+        .copied()
+        .unwrap_or_else(|| sub_op_meta(op))
 }
 
 /// Map the projection's provider-neutral relation kind to the protocol enum.
@@ -2479,6 +2650,9 @@ fn node_commit_id(node: &editchain_project::HistoryNode) -> String {
     match node {
         editchain_project::HistoryNode::EditOperation { op, .. }
         | editchain_project::HistoryNode::CollapsedImport { op, .. } => abbreviate_op_id(&op.id),
+        editchain_project::HistoryNode::ExecuteBundle { anchor, .. } => {
+            abbreviate_op_id(&anchor.id)
+        }
         editchain_project::HistoryNode::GitCommit(commit) => abbreviate_oid(&commit.oid),
     }
 }

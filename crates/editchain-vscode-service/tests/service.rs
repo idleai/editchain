@@ -28,7 +28,9 @@ use editchain_import::BlobSink as _;
 use editchain_project::filter::ChainFilter;
 use editchain_project::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
-use editchain_protocol::{Request, RequestBody, ResponseBody, SearchFiltersDto};
+use editchain_protocol::{
+    ActivityBundleKind, HistoryRow, Request, RequestBody, ResponseBody, SearchFiltersDto,
+};
 use editchain_vscode_service::{
     parse_git_oid, parse_repository_id, prepare_render_snapshot, resolve_git_commit,
     HistoryWindowOptions, Workspace,
@@ -875,6 +877,80 @@ fn raw_message_child(node: u64, seq: u64, parent: OpId, clock_ms: u64, text: &st
     }
 }
 
+/// Build one linear turn-scoped chain: user message root, then the given rows
+/// (each parented to the previous import), with turn-scoped normalized children
+/// so the projection classifies tool rows as Execute and message rows as
+/// Conversation inside `turn`.
+fn turn_chain_ops(rows: &[(&str, Option<&str>)], turn: u64) -> Vec<Op> {
+    let mut ops = Vec::new();
+    let root = raw_import_op(
+        1,
+        1,
+        1_000,
+        None,
+        r#"{"type":"response_item","payload":{}}"#,
+    );
+    ops.push(root.clone());
+    ops.push(turn_message_child(101, 2, root.id, turn, "user request"));
+    let mut previous = root;
+    for (index, (kind, status)) in rows.iter().enumerate() {
+        let node = u64::try_from(index + 2).unwrap_or(u64::MAX);
+        let seq = u64::try_from(index + 2).unwrap_or(u64::MAX);
+        let raw = match status {
+            Some(status) => serde_json::json!({
+                "type": "response_item",
+                "payload": { "item": { "status": status } }
+            })
+            .to_string(),
+            None => r#"{"type":"response_item","payload":{}}"#.to_string(),
+        };
+        let import = raw_import_op(node, seq, seq * 1_000, Some(previous.id), &raw);
+        ops.push(import.clone());
+        let child = match *kind {
+            "tool" => turn_tool_child(node, seq + 100, import.id, turn),
+            "message" => turn_message_child(node, seq + 100, import.id, turn, "agent text"),
+            other => panic!("unknown kind {other}"),
+        };
+        ops.push(child);
+        previous = import;
+    }
+    ops
+}
+
+/// A turn-scoped normalized message child of `parent`.
+fn turn_message_child(node: u64, seq: u64, parent: OpId, turn: u64, text: &str) -> Op {
+    Op {
+        id: OpId::new(NodeId(node), 0, seq),
+        parents: ParentSet::One(parent),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(seq * 1_000),
+        scope: ScopeRef::Turn(editchain_core::TurnId(turn)),
+        tags: Tags::HUMAN | Tags::MESSAGE,
+        kind: OpKind::Message(MessageOp {
+            content: Payload::Inline(text.as_bytes().to_vec()),
+            content_type: Payload::Empty,
+        }),
+    }
+}
+
+/// A turn-scoped normalized tool child of `parent`.
+fn turn_tool_child(node: u64, seq: u64, parent: OpId, turn: u64) -> Op {
+    Op {
+        id: OpId::new(NodeId(node), 0, seq),
+        parents: ParentSet::One(parent),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(seq * 1_000),
+        scope: ScopeRef::Turn(editchain_core::TurnId(turn)),
+        tags: Tags::AGENT | Tags::TOOL,
+        kind: OpKind::Tool(ToolOp {
+            tool_call_id: Payload::Empty,
+            tool_name: Payload::Inline(b"Bash".to_vec()),
+            stage: ToolStage::Start,
+            content: Payload::Empty,
+        }),
+    }
+}
+
 /// Store a blob in a chain's durable blob store, returning its reference.
 fn store_blob(chain_dir: &Path, data: &[u8]) -> editchain_core::payload::BlobRef {
     let mut blobs = editchain_import::FsBlobSink::new(chain_dir.join("blobs")).expect("blob sink");
@@ -962,7 +1038,7 @@ fn trace_rows_hidden_by_fixed_filter_kept_in_raw_mode_and_taxonomy_flows() {
     assert_eq!(trace_row.visibility, Visibility::Trace);
     assert_eq!(trace_row.record_role, RecordRole::Lifecycle);
     assert_eq!(trace_row.activity_kind, ActivityKind::System);
-    let message_rows: Vec<&editchain_protocol::HistoryRow> = raw_window
+    let message_rows: Vec<&HistoryRow> = raw_window
         .rows
         .iter()
         .filter(|r| r.visibility == Visibility::Primary)
@@ -1677,12 +1753,13 @@ fn service_path_truncated_echo_texts_never_pair_but_untruncated_exact_pairs_do()
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_six() {
+fn prepared_snapshot_manifest_records_projection_revision_seven() {
     // Stale snapshots from earlier projection revisions (pre-hide_trace,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
-    // duplicate-pair exclusion, and pre prefix-string escape decoding) must not be served
-    // silently: the revision participates in the snapshot identity hash.
+    // duplicate-pair exclusion, pre prefix-string escape decoding, and pre
+    // Activity work-unit/promotion/execute-run-bundling semantics) must not be
+    // served silently: the revision participates in the snapshot identity hash.
     let tmp = tempfile::tempdir().expect("tempdir");
     let chain_dir = tmp.path().join(".editchain");
     let first = msg_op(41, 1, b"snapshot first");
@@ -1697,5 +1774,234 @@ fn prepared_snapshot_manifest_records_projection_revision_six() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 6u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 7u64);
+}
+
+#[test]
+fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() {
+    // One turn: user request, three successful tools, agent answer. The fixed
+    // Activity view folds the three tool rows into one expandable summary row;
+    // the raw profile must keep every row, in the same order, un-bundled.
+    let ops = turn_chain_ops(
+        &[
+            ("tool", Some("completed")),
+            ("tool", Some("completed")),
+            ("tool", Some("completed")),
+            ("message", None),
+        ],
+        1,
+    );
+    let projection = HistoryProjection::from_ops(ops);
+    let mut ws = Workspace::from_projection(projection);
+    let fixed = ChainFilter::new(
+        String::new(),
+        String::new(),
+        String::new(),
+        false,
+        true,
+        true,
+    );
+    let raw = no_filter();
+    let activity_window = ws.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 100,
+        hide_submodules: true,
+        filter: &fixed,
+        include_layout: false,
+    });
+    let raw_window = ws.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 100,
+        hide_submodules: true,
+        filter: &raw,
+        include_layout: false,
+    });
+
+    // Raw profile: exact and ordered — five top-level rows, newest-first, no
+    // synthetic bundle anywhere.
+    assert_eq!(raw_window.rows.len(), 5);
+    let raw_kinds: Vec<&str> = raw_window
+        .rows
+        .iter()
+        .map(|row| row.kind.as_str())
+        .collect();
+    assert_eq!(
+        raw_kinds,
+        vec!["message", "tool", "tool", "tool", "message"]
+    );
+    assert!(
+        raw_window
+            .rows
+            .iter()
+            .all(|row| !row.is_subop && row.summary != "3 tool steps (success)"),
+        "raw profile never bundles"
+    );
+    assert!(
+        raw_window
+            .rows
+            .iter()
+            .all(|row| row.activity_bundle.is_none()),
+        "raw (unbundled) rows never carry activity-bundle metadata"
+    );
+    // Raw rows still carry the additive work-unit/promotion wire fields.
+    let raw_value = serde_json::to_value(&raw_window.rows[0]).expect("serialize raw row");
+    assert_eq!(raw_value["work_unit"]["id"], "session:1/turn:1");
+    assert_eq!(raw_value["work_unit"]["count"], 5u64);
+    assert_eq!(raw_value["work_unit"]["is_start"], true);
+    assert_eq!(raw_value["promoted"], true);
+
+    // Activity view: three top-level rows plus the bundle's three expandable
+    // member rows, with the original op ids retrievable.
+    assert_eq!(activity_window.total, 6);
+    assert_eq!(activity_window.rows.len(), 6);
+    let bundle = activity_window
+        .rows
+        .iter()
+        .find(|row| row.summary == "3 tool steps (success)")
+        .expect("activity view has the execute-run bundle");
+    assert_eq!(bundle.activity_kind, ActivityKind::Execute);
+    assert_eq!(bundle.visibility, Visibility::Primary);
+    assert_eq!(bundle.outcome, Outcome::Success);
+    assert!(bundle.is_system);
+    assert_eq!(
+        bundle.activity_bundle.as_ref().map(|meta| meta.kind),
+        Some(ActivityBundleKind::ExecuteRun)
+    );
+    assert_eq!(
+        bundle
+            .activity_bundle
+            .as_ref()
+            .map(|meta| meta.member_count),
+        Some(3u64),
+        "member count is the ORIGINAL top-level run size, not the flattened subop count"
+    );
+    let bundle_value = serde_json::to_value(bundle).expect("serialize bundle row");
+    assert_eq!(bundle_value["activity_bundle"]["kind"], "execute-run");
+    assert_eq!(bundle_value["activity_bundle"]["member_count"], 3u64);
+    assert_eq!(
+        bundle.work_unit.as_ref().map(|unit| unit.id.as_str()),
+        Some("session:1/turn:1")
+    );
+    assert_eq!(bundle.work_unit.as_ref().map(|unit| unit.count), Some(3u64));
+    let bundle_index = activity_window
+        .rows
+        .iter()
+        .position(|row| row.node_key == bundle.node_key)
+        .unwrap_or(0);
+    let member_rows: Vec<&HistoryRow> = activity_window
+        .rows
+        .iter()
+        .filter(|row| row.is_subop && row.parent_row == Some(bundle_index))
+        .collect();
+    assert_eq!(member_rows.len(), 3);
+    assert!(member_rows[0].op_id.is_some());
+    assert!(member_rows[1].op_id.is_some());
+    assert!(member_rows[2].op_id.is_some());
+    assert!(
+        member_rows.iter().all(|row| row.activity_bundle.is_none()),
+        "expanded member (sub-op) rows never carry activity-bundle metadata"
+    );
+    // The member rows are the original tool rows: ids 2..=4 as raw imports.
+    let member_ids: Vec<String> = member_rows
+        .iter()
+        .map(|row| row.op_id.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(member_ids, vec!["4:0:4", "3:0:3", "2:0:2"]);
+    // Expansion index ships once for the snapshot window.
+    assert_eq!(
+        activity_window.sub_op_counts.as_deref(),
+        Some(&[0usize, 3, 0][..])
+    );
+    // Top-level order is preserved: agent answer, bundle, user request.
+    let top_level: Vec<&HistoryRow> = activity_window
+        .rows
+        .iter()
+        .filter(|row| !row.is_subop)
+        .collect();
+    assert_eq!(top_level.len(), 3);
+    assert_eq!(top_level[0].activity_kind, ActivityKind::Conversation);
+    assert_eq!(top_level[1].node_key, bundle.node_key);
+    assert_eq!(top_level[2].activity_kind, ActivityKind::Conversation);
+    assert!(
+        top_level
+            .iter()
+            .filter(|row| row.node_key != bundle.node_key)
+            .all(|row| row.activity_bundle.is_none()),
+        "ordinary top-level rows never carry activity-bundle metadata"
+    );
+}
+
+#[test]
+fn prepared_snapshot_serves_bundled_activity_view_and_records_revision_seven() {
+    // The pregenerated render snapshot must serve the SAME bundled Activity
+    // rows as the live projection (work-unit/promotion/bundling parity) and
+    // record the bumped projection revision in its identity.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let chain_dir = tmp.path().join(".editchain");
+    let ops = turn_chain_ops(
+        &[
+            ("tool", Some("completed")),
+            ("tool", Some("completed")),
+            ("tool", Some("completed")),
+            ("message", None),
+        ],
+        1,
+    );
+    let mut page = editchain_codec::page::Page::new(0);
+    for op in &ops {
+        page.add_record(0, editchain_codec::frame::encode_op(op).expect("encode op"));
+    }
+    write_page(&chain_dir, &page);
+
+    let filter = ChainFilter::new(
+        String::new(),
+        String::new(),
+        String::new(),
+        false,
+        true,
+        true,
+    );
+    let mut live = Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("live open");
+    let expected = live.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 100,
+        hide_submodules: true,
+        filter: &filter,
+        include_layout: true,
+    });
+    assert_eq!(
+        expected.total, 6,
+        "activity view bundles 5 rows into 3 + 3 members"
+    );
+    assert!(
+        expected
+            .rows
+            .iter()
+            .any(|row| row.summary == "3 tool steps (success)"),
+        "live activity view contains the bundle"
+    );
+
+    let report =
+        prepare_render_snapshot(tmp.path(), Path::new(".editchain")).expect("prepare snapshot");
+    assert_eq!(report.rows, expected.total);
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
+    )
+    .expect("parse manifest");
+    assert_eq!(manifest["identity"]["projection_revision"], 7u64);
+
+    let mut cached =
+        Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");
+    let actual = cached.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 100,
+        hide_submodules: true,
+        filter: &filter,
+        include_layout: true,
+    });
+    assert_eq!(
+        serde_json::to_value(&actual).expect("serialize actual"),
+        serde_json::to_value(&expected).expect("serialize expected"),
+        "snapshot rows must match the live bundled Activity projection byte-for-byte"
+    );
 }

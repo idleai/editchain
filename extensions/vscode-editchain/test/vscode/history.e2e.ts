@@ -445,4 +445,147 @@ describe('EditChain History Explorer', () => {
     // Leave the webview context.
     await webview.close();
   });
+
+  it('keeps the Activity work-unit/bundle/promotion layer coherent with the wire and gates it off in Raw', async () => {
+    const workbench = await browser.getWorkbench();
+
+    await browser.executeWorkbench((vscode) => {
+      vscode.commands.executeCommand('editchain-history.open');
+    });
+    const webview = await workbench.getWebviewByTitle('EditChain History');
+    await webview.open();
+    await browser.$('.row').waitForExist({ timeout: 120000 });
+
+    // Inject the text-only layout probe so its contract helpers + textual
+    // checks run inside real VS Code (same probe the harness uses).
+    await browser.execute((src) => {
+      // eslint-disable-next-line no-eval
+      (0, eval)(src);
+      return typeof window.__editchainDebug;
+    }, PROBE_SRC);
+    await browser.execute(() => window.__editchainDebug.whenIdle(60000));
+
+    // Deterministic, chain-agnostic invariants over REAL rows: wherever a
+    // rendered row carries work_unit / promoted / activity_bundle wire
+    // metadata, the DOM layer must agree exactly (class + data attrs + count
+    // text). No opaque ids are asserted — the chain's content is irrelevant,
+    // only the wire-to-DOM correspondence.
+    const activity = await browser.execute(() => {
+      const rows = Array.from(document.querySelectorAll('.row:not(.row-placeholder)'));
+      const problems = [];
+      let typedBundles = 0;
+      let startRows = 0;
+      for (const el of rows) {
+        const abs = Number(el.getAttribute('data-row'));
+        const row = window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
+        if (!row) continue;
+        if (row.work_unit) {
+          const startDom = el.classList.contains('row-work-unit-start');
+          // A single-row unit is BOTH is_start and is_end; the renderer's
+          // end marker is optional and yields to the start header, so the
+          // DOM expectation is `is_end && !is_start`.
+          const endDom = el.classList.contains('row-work-unit-end');
+          if (startDom !== row.work_unit.is_start) {
+            problems.push('work_unit.is_start mismatch on ' + abs);
+          }
+          if (endDom !== (row.work_unit.is_end && !row.work_unit.is_start)) {
+            problems.push('work_unit.is_end mismatch on ' + abs);
+          }
+          if (row.work_unit.is_start) {
+            startRows++;
+            const countEl = el.querySelector('.work-unit-count');
+            const text = countEl ? (countEl.textContent || '').trim() : '';
+            if (!countEl || !/^\d+/.test(text) || Number(/^\d+/.exec(text)[0]) !== row.work_unit.count) {
+              problems.push('work-unit count text "' + text + '" != ' + row.work_unit.count + ' on ' + abs);
+            }
+          }
+        }
+        if (row.activity_bundle && row.activity_bundle.kind === 'execute-run') {
+          typedBundles++;
+          if (el.getAttribute('data-activity-bundle') !== 'execute-run') {
+            problems.push('typed bundle missing data-activity-bundle=execute-run on ' + abs);
+          }
+          if (el.getAttribute('data-bundle-count') !== String(row.activity_bundle.member_count)) {
+            problems.push('data-bundle-count mismatch on ' + abs);
+          }
+          const countEl = el.querySelector('.bundle-count');
+          const text = countEl ? (countEl.textContent || '').trim() : '';
+          if (!countEl || Number(/^\d+/.exec(text)?.[0]) !== row.activity_bundle.member_count) {
+            problems.push('bundle-count text mismatch on ' + abs);
+          }
+          if (!el.querySelector('.bundle-status') ||
+              !(el.querySelector('.bundle-status').textContent || '').trim()) {
+            problems.push('typed bundle missing status on ' + abs);
+          }
+        } else if (row.activity_bundle) {
+          // Forward-compatible unknown bundle kind: never styled as execute-run.
+          if (el.getAttribute('data-activity-bundle') !== null ||
+              el.classList.contains('row-activity-bundle')) {
+            problems.push('unknown-kind bundle styled on ' + abs);
+          }
+        }
+        if (row.promoted === true && !el.classList.contains('row-promoted')) {
+          problems.push('promoted row missing .row-promoted on ' + abs);
+        }
+        if (row.promoted === false && el.classList.contains('row-promoted')) {
+          problems.push('non-promoted row has .row-promoted on ' + abs);
+        }
+      }
+      return {
+        problems,
+        rowsChecked: rows.length,
+        startRows,
+        typedBundles,
+        profile: typeof window.__editchainGetProfile === 'function'
+          ? window.__editchainGetProfile() : null,
+      };
+    });
+    console.log('[e2e] activity wire/DOM coherence:', JSON.stringify(activity));
+    expect(activity.profile).toBe('activity');
+    expect(activity.rowsChecked).toBeGreaterThan(0);
+    expect(activity.startRows).toBeGreaterThan(0);
+    expect(activity.problems).toEqual([]);
+
+    // Raw gating: after switching through the REAL control path, no rendered
+    // row may carry any grouping/promotion class, descendant, or data attr —
+    // even when its cached row still carries the wire metadata.
+    await browser.execute(() => {
+      document.getElementById('profile-raw').click();
+    });
+    await browser.waitUntil(async () => browser.execute(() => {
+      return document.querySelectorAll('.row:not(.row-placeholder)').length > 0 &&
+        window.__editchainDataReady === true;
+    }), { timeout: 60000, interval: 200 });
+    const raw = await browser.execute(() => {
+      const rows = Array.from(document.querySelectorAll('.row:not(.row-placeholder)'));
+      const groupingSel = '.row-work-unit-start, .row-work-unit-end, .work-unit-ribbon, ' +
+        '.work-unit-count, .row-activity-bundle, .bundle-count, .bundle-status, ' +
+        '.row-promoted, [data-activity-bundle], [data-bundle-count]';
+      const leakRows = rows.filter((el) =>
+        el.querySelector(groupingSel) !== null || el.matches(groupingSel));
+      const cacheHasMetadata = rows.some((el) => {
+        const abs = Number(el.getAttribute('data-row'));
+        const row = window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
+        return row && (!!row.work_unit || row.promoted || row.activity_bundle);
+      });
+      return {
+        profile: typeof window.__editchainGetProfile === 'function'
+          ? window.__editchainGetProfile() : null,
+        rows: rows.length,
+        leakRows: leakRows.length,
+        cacheHasMetadata,
+      };
+    });
+    console.log('[e2e] raw gating:', JSON.stringify(raw));
+    expect(raw.profile).toBe('raw');
+    expect(raw.rows).toBeGreaterThan(0);
+    expect(raw.leakRows).toBe(0);
+    // Raw may legitimately lack metadata (older service), but when it is
+    // present the gating must hold — never rendered.
+    if (raw.cacheHasMetadata) {
+      expect(raw.leakRows).toBe(0);
+    }
+
+    await webview.close();
+  });
 });

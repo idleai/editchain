@@ -31,10 +31,10 @@ const HARNESS = 'file://' + path.join(EXT_ROOT, 'test', 'harness', 'index.html')
 const CHROME = process.env.CHROME_PATH ||
   '/mnt/hot/ambientlight/.cache/puppeteer/chrome/linux-151.0.7922.71/chrome-linux64/chrome';
 
-const SCENARIOS = ['empty', 'linear', 'merge', 'mixed', 'filtered', 'undated', 'error', 'warned', 'large', 'longsummary', 'combined', 'traced', 'badges', 'fork', 'highLanes'];
+const SCENARIOS = ['empty', 'linear', 'merge', 'mixed', 'filtered', 'undated', 'error', 'warned', 'large', 'longsummary', 'combined', 'traced', 'badges', 'fork', 'highLanes', 'workUnits', 'workUnitsDeep'];
 
 function parseArgs(argv) {
-  const args = { cmd: argv[0], scenario: 'merge', viewport: '1440x900', out: null, selector: null, search: null, searchRace: false, resize: false, deferredLayout: false, shot: null, profile: null, profileSwitch: false, inspector: false, keyboard: false, restore: false };
+  const args = { cmd: argv[0], scenario: 'merge', viewport: '1440x900', out: null, selector: null, search: null, searchRace: false, resize: false, deferredLayout: false, shot: null, profile: null, profileSwitch: false, inspector: false, keyboard: false, restore: false, workUnit: false };
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--scenario') args.scenario = argv[++i];
@@ -51,6 +51,7 @@ function parseArgs(argv) {
     else if (a === '--inspector') args.inspector = true;
     else if (a === '--keyboard') args.keyboard = true;
     else if (a === '--restore') args.restore = true;
+    else if (a === '--work-unit') args.workUnit = true;
   }
   return args;
 }
@@ -228,6 +229,14 @@ async function main() {
     keyboard = await page.evaluate(() => window.__editchainDebug.runKeyboardProbe(10000));
   }
 
+  // Round-two work-unit/bundle interaction probe (scenario `workUnits`):
+  // ArrowRight/Space/Enter expand a typed execute-run bundle, ArrowLeft
+  // collapses it, and Up/Down roving focus stays stable across the rebuilds.
+  let workUnit = null;
+  if (args.workUnit) {
+    workUnit = await page.evaluate(() => window.__editchainDebug.runWorkUnitProbe(10000));
+  }
+
   // Reversed-search race (scenario must be `merge`): two rapid searches share
   // a view generation; the LATEST issued query must win regardless of response
   // order (latest-query-wins via search-epoch correlation).
@@ -273,6 +282,7 @@ async function main() {
   if (profileSwitch) fs.writeFileSync(path.join(outDir, 'profile-switch.json'), JSON.stringify(profileSwitch, null, 2));
   if (inspector) fs.writeFileSync(path.join(outDir, 'inspector.json'), JSON.stringify(inspector, null, 2));
   if (keyboard) fs.writeFileSync(path.join(outDir, 'keyboard.json'), JSON.stringify(keyboard, null, 2));
+  if (workUnit) fs.writeFileSync(path.join(outDir, 'work-unit.json'), JSON.stringify(workUnit, null, 2));
   if (inspectorGeometry) fs.writeFileSync(path.join(outDir, 'inspector-geometry.json'), JSON.stringify(inspectorGeometry, null, 2));
   if (restoreResult) fs.writeFileSync(path.join(outDir, 'restore.json'), JSON.stringify(restoreResult, null, 2));
   if (searchRace) fs.writeFileSync(path.join(outDir, 'search-race.json'), JSON.stringify(searchRace, null, 2));
@@ -321,6 +331,13 @@ async function main() {
   if (keyboard) {
     summary.push('- keyboard probe: pass=' + keyboard.pass +
       ' steps=' + JSON.stringify(keyboard.steps));
+  }
+  if (workUnit) {
+    summary.push('- work-unit probe: pass=' + workUnit.pass +
+      ' skipped=' + workUnit.skipped +
+      ' steps=' + JSON.stringify(workUnit.steps.map((s) => ({
+        name: s.name, aria: s.bundleAria, subops: s.subopRows, roving: s.rovingTabs,
+      }))));
   }
   if (inspectorGeometry) {
     summary.push('- inspector geometry: ' + inspectorGeometry.viewports.map((v) =>
@@ -381,6 +398,7 @@ async function main() {
     (profileSwitch !== null && profileSwitch.pass !== true) ||
     (inspector !== null && inspector.pass !== true) ||
     (keyboard !== null && keyboard.pass !== true) ||
+    (workUnit !== null && workUnit.pass !== true) ||
     (inspectorGeometry !== null && inspectorGeometry.viewports.some((v) => v.pass !== true)) ||
     (restoreResult !== null && restoreResult.pass !== true);
   if (args.cmd === 'check' && (failedChecks.length > 0 || pageErrors.length > 0 || interactionFailed)) {
@@ -409,6 +427,9 @@ async function main() {
     ' steps=' + inspector.steps.length);
   if (keyboard) console.log('keyboard pass=' + keyboard.pass +
     ' steps=' + keyboard.steps.length);
+  if (workUnit) console.log('work-unit probe pass=' + workUnit.pass +
+    ' skipped=' + workUnit.skipped +
+    ' steps=' + workUnit.steps.map((s) => s.name).join(','));
   if (inspectorGeometry) console.log('inspector geometry: ' + inspectorGeometry.viewports.map((v) =>
     'viewport=' + v.width + ' pass=' + v.pass +
     ' rowsW=' + JSON.stringify(v.detail && v.detail.rowsW) +

@@ -1737,6 +1737,451 @@
       });
     }
 
+    // Narrow-rail contract at <=480px: the graph column must switch to the
+    // compact fixed-width rail (GRAPH_MAX_W_NARROW in media/main.js) — still
+    // VISIBLE (never hidden), but never taking ~half the viewport — so the
+    // Content track keeps a readable budget. All service lanes still render
+    // inside the rail (laneX compresses/distributes them across the column).
+    if (rowsEl && !viewMessage && window.innerWidth > 0 && window.innerWidth <= 480) {
+      const graphTh = headerEl && headerEl.querySelector('.th.graph');
+      const firstRow = wrapEl && wrapEl.querySelector('.row:not(.row-placeholder)');
+      const contentCell = firstRow && firstRow.querySelector('.text-cell');
+      const graphCol = graphTh ? graphTh.getBoundingClientRect().width : 0;
+      const contentW = contentCell ? contentCell.getBoundingClientRect().width : 0;
+      // GRAPH_MAX_W_NARROW=120 + layout tolerance; a 1-lane rail is naturally
+      // 36px (2 lanes 54px) so the floor only proves the rail is RENDERED,
+      // never display:none; content >= 200px locks the legibility gain over
+      // the old ~160-200px squeeze (and holds with Date visible at 480px).
+      const compact = graphCol > 0 && graphCol <= 140;
+      const visible = graphCol >= 30;
+      const contentReadable = contentW >= 200;
+      checks.push({
+        name: 'GRAPH_RAIL_NARROW',
+        pass: compact && visible && contentReadable,
+        detail: 'graphCol=' + Math.round(graphCol) + 'px (compact rail <= 140px, ' +
+          'still visible >= 30px) contentW=' + Math.round(contentW) +
+          'px (>= 200px readable)',
+      });
+    }
+
+    // --- Round-two parallel Activity-view contract (workUnits scenarios) ----
+    // The renderer DOM classes land in a parallel change to media/main.js;
+    // the fixtures/bridge already model the full wire contract (see
+    // workUnitBridge.test.js). Family checks retain explicit diagnostics when
+    // one marker family is absent, but the mandatory contract-presence check
+    // below fails the Activity scenario unless ALL three renderer families are
+    // present. This prevents a reverted renderer from turning feature checks
+    // into silent skips. Cache-side wire facts are always asserted as well.
+    if (window.__editchainScenarioName === 'workUnits' ||
+        window.__editchainScenarioName === 'workUnitsDeep') {
+      const activeProfile = typeof window.__editchainGetProfile === 'function'
+        ? window.__editchainGetProfile() : 'activity';
+      // The small fixture renders its full 12-row Activity view, so its checks
+      // assert EXACT global counts; the tall deep fixture renders a
+      // virtualized window slice (viewport + 2*BUFFER rows), so its checks
+      // assert per-row wire-vs-DOM fidelity plus window-level uniqueness
+      // (exact global counts are not reachable from a slice).
+      const isSmall = window.__editchainScenarioName === 'workUnits';
+      const cachedRow = (el) => {
+        const abs = Number(el.getAttribute('data-row'));
+        return window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
+      };
+      const rowEls = wrapEl
+        ? Array.from(wrapEl.querySelectorAll('.row:not(.row-placeholder)'))
+        : [];
+      const countMarkers = (sel) => document.querySelectorAll(sel).length;
+      const caps = {
+        any: false, workUnit: false, bundle: false, promoted: false,
+      };
+      caps.workUnit = countMarkers(
+        '.row-work-unit-start, .row-work-unit-end, .work-unit-ribbon, .work-unit-count') > 0;
+      caps.bundle = countMarkers(
+        '.row-activity-bundle, .bundle-count, .bundle-status, [data-activity-bundle], [data-bundle-count]') > 0;
+      caps.promoted = countMarkers('.row-promoted') > 0;
+      caps.any = caps.workUnit || caps.bundle || caps.promoted;
+      const contractAbsent = (family) =>
+        'renderer contract not present (no ' + family +
+        ' DOM markers rendered; wire metadata verified cache-side)';
+
+      if (activeProfile === 'activity') {
+        const present = caps.workUnit && caps.bundle && caps.promoted;
+        checks.push({
+          name: 'ROUND_TWO_RENDERER_CONTRACT_PRESENT',
+          pass: present,
+          detail: 'workUnit=' + caps.workUnit + ' bundle=' + caps.bundle +
+            ' promoted=' + caps.promoted,
+        });
+      }
+
+      // Check A: work-unit boundary markers match the wire metadata exactly
+      // (one start/end per id) in the Activity profile.
+      if (activeProfile === 'activity') {
+        if (!caps.workUnit) {
+          checks.push({ name: 'WORK_UNIT_BOUNDARIES_EXACT', pass: true, detail: contractAbsent('work-unit') });
+        } else {
+          const problems = [];
+          for (const el of rowEls) {
+            const row = cachedRow(el);
+            if (!row || !row.work_unit) {
+              problems.push((el.getAttribute('data-key') || '?') + ': no cached work_unit');
+              continue;
+            }
+            const startDom = el.classList.contains('row-work-unit-start');
+            // Single-row units are both is_start and is_end; the renderer's
+            // optional end marker yields to the start header, so the DOM
+            // expectation is `is_end && !is_start`.
+            const endDom = el.classList.contains('row-work-unit-end');
+            if (startDom !== row.work_unit.is_start) {
+              problems.push(row.node_key + ': start DOM=' + startDom + ' wire=' + row.work_unit.is_start);
+            }
+            if (endDom !== (row.work_unit.is_end && !row.work_unit.is_start)) {
+              problems.push(row.node_key + ': end DOM=' + endDom + ' wire=' + row.work_unit.is_end);
+            }
+          }
+          if (isSmall && countMarkers('.row-work-unit-start') !== 3) {
+            problems.push('expected 3 unit-start rows, got ' + countMarkers('.row-work-unit-start'));
+          }
+          if (isSmall && countMarkers('.row-work-unit-end') !== 3) {
+            problems.push('expected 3 unit-end rows, got ' + countMarkers('.row-work-unit-end'));
+          }
+          checks.push({
+            name: 'WORK_UNIT_BOUNDARIES_EXACT',
+            pass: problems.length === 0,
+            detail: problems.length === 0
+              ? '3/3 unit starts + ends match the wire metadata'
+              : problems.join('; '),
+          });
+        }
+      }
+
+      // Check B: unit ribbons are SPARSE (start rows only, exactly one per
+      // row) and carry the exact view-wide count in .work-unit-count.
+      if (activeProfile === 'activity') {
+        if (!caps.workUnit) {
+          checks.push({ name: 'WORK_UNIT_RIBBON_SPARSE_COUNTED', pass: true, detail: contractAbsent('work-unit ribbon/count') });
+        } else {
+          const problems = [];
+          let ribbons = 0;
+          const parseCount = (text) => {
+            const m = /^(\d+)/.exec((text || '').trim());
+            return m ? Number(m[1]) : NaN;
+          };
+          for (const el of rowEls) {
+            const row = cachedRow(el);
+            const ribbonEls = el.querySelectorAll('.work-unit-ribbon');
+            if (ribbonEls.length > 1) problems.push(row.node_key + ': ' + ribbonEls.length + ' ribbons on one row');
+            const hasRibbon = ribbonEls.length === 1;
+            const countEl = el.querySelector('.work-unit-count');
+            const expectedRibbon = !!(row && row.work_unit && row.work_unit.is_start);
+            if (hasRibbon !== expectedRibbon) {
+              problems.push(row.node_key + ': ribbon DOM=' + hasRibbon + ' expected(is_start)=' + expectedRibbon);
+            }
+            if (hasRibbon) {
+              ribbons++;
+              if (!countEl) {
+                problems.push(row.node_key + ': start row lacks .work-unit-count');
+              } else {
+                const text = (countEl.textContent || '').trim();
+                if (parseCount(text) !== row.work_unit.count) {
+                  problems.push(row.node_key + ': count text "' + text + '" != wire ' + row.work_unit.count);
+                }
+              }
+              // The ribbon leads with the unit title: the DTO title when
+              // present (t1/t2), else the renderer's short fallback label
+              // (ops -> "Git") — never the raw opaque unit id.
+              const ribbonText = (ribbonEls[0].textContent || '').trim();
+              const expectedTitle = row.work_unit.title ||
+                (row.activity_kind === 'source_control' ? 'Git' : null);
+              if (expectedTitle && ribbonText !== expectedTitle) {
+                problems.push(row.node_key + ': ribbon title "' + ribbonText + '" != "' + expectedTitle + '"');
+              }
+            } else if (countEl) {
+              problems.push(row.node_key + ': count element without a ribbon (non-start rows stay sparse)');
+            }
+          }
+          if (isSmall && ribbons !== 3) problems.push('expected exactly 3 ribbons, got ' + ribbons);
+          checks.push({
+            name: 'WORK_UNIT_RIBBON_SPARSE_COUNTED',
+            pass: problems.length === 0,
+            detail: problems.length === 0
+              ? '3 ribbons with exact counts; non-start rows bare'
+              : problems.join('; '),
+          });
+        }
+      }
+
+      // Check C: no duplicate/stacked boundary labels — a rendered window
+      // never shows MORE than one start or one end per unit id (and the small
+      // fixture's full view shows exactly one of each); no row carries more
+      // than one ribbon or group chip; and a ribbon + chip on the same row
+      // never overlap visually (stacked labels). Virtualized deep slices may
+      // legitimately cut a unit (start without end), so slice-level checks
+      // assert uniqueness, not completeness.
+      {
+        const problems = [];
+        const perId = new Map();
+        for (const el of rowEls) {
+          const row = cachedRow(el);
+          if (!row || !row.work_unit) { problems.push('row lacks work_unit in cache'); continue; }
+          const agg = perId.get(row.work_unit.id) || { starts: 0, ends: 0 };
+          if (row.work_unit.is_start) agg.starts++;
+          if (row.work_unit.is_end) agg.ends++;
+          perId.set(row.work_unit.id, agg);
+          const ribbons = el.querySelectorAll('.work-unit-ribbon').length;
+          const chips = el.querySelectorAll('.group-label').length;
+          if (ribbons > 1) problems.push(row.node_key + ': duplicate ribbon');
+          if (chips > 1) problems.push(row.node_key + ': duplicate/stacked group label');
+          if (chips >= 1 && ribbons >= 1) {
+            const chip = el.querySelector('.group-label').getBoundingClientRect();
+            const ribbon = el.querySelector('.work-unit-ribbon').getBoundingClientRect();
+            const overlap = chip.width > 0 && ribbon.width > 0 &&
+              chip.left < ribbon.right - 0.5 && ribbon.left < chip.right - 0.5 &&
+              chip.top < ribbon.bottom - 0.5 && ribbon.top < chip.bottom - 0.5;
+            if (overlap) problems.push(row.node_key + ': group chip overlaps the work-unit ribbon (stacked)');
+          }
+        }
+        for (const [id, agg] of perId) {
+          if (agg.starts > 1) problems.push('unit ' + id + ': ' + agg.starts + ' starts in one window');
+          if (agg.ends > 1) problems.push('unit ' + id + ': ' + agg.ends + ' ends in one window');
+          if (isSmall) {
+            if (agg.starts !== 1) problems.push('unit ' + id + ': ' + agg.starts + ' starts');
+            if (agg.ends !== 1) problems.push('unit ' + id + ': ' + agg.ends + ' ends');
+          }
+        }
+        const domSkipped = !caps.workUnit;
+        checks.push({
+          name: 'WORK_UNIT_NO_DUPLICATE_BOUNDARY_PER_ID',
+          pass: problems.length === 0,
+          detail: problems.length === 0
+            ? 'per-id boundaries unique per window' +
+              (isSmall ? ' (and exact in the full view)' : ' (deep slice: uniqueness only)') +
+              '; labels sparse, never stacked' +
+              (domSkipped ? ' — DOM label checks skipped (renderer contract not present)' : '')
+            : problems.join('; '),
+        });
+      }
+
+      // Check D: ONLY typed execute-run rows render bundle styling, with the
+      // exact typed member count (data attr + .bundle-count text) and a
+      // non-empty status chip; ordinary and unknown-kind rows stay bare.
+      if (activeProfile === 'activity') {
+        if (!caps.bundle) {
+          checks.push({ name: 'BUNDLE_TYPED_EXACT', pass: true, detail: contractAbsent('bundle') });
+        } else {
+          const problems = [];
+          let typed = 0;
+          const parseCount = (text) => {
+            const m = /^(\d+)/.exec((text || '').trim());
+            return m ? Number(m[1]) : NaN;
+          };
+          for (const el of rowEls) {
+            const row = cachedRow(el);
+            const b = row ? row.activity_bundle : null;
+            const styled = el.classList.contains('row-activity-bundle');
+            const styledAttr = el.getAttribute('data-activity-bundle');
+            const countAttr = el.getAttribute('data-bundle-count');
+            const countEl = el.querySelector('.bundle-count');
+            const statusEl = el.querySelector('.bundle-status');
+            if (b && b.kind === 'execute-run') {
+              typed++;
+              if (!styled) problems.push(row.node_key + ': typed execute-run row missing .row-activity-bundle');
+              if (styledAttr !== 'execute-run') problems.push(row.node_key + ': data-activity-bundle="' + styledAttr + '" != execute-run');
+              if (countAttr !== String(b.member_count)) problems.push(row.node_key + ': data-bundle-count="' + countAttr + '" != ' + b.member_count);
+              if (!countEl || parseCount(countEl.textContent) !== b.member_count) {
+                problems.push(row.node_key + ': .bundle-count text mismatch (expected member_count ' + b.member_count + ')');
+              }
+              const expectedStatus = row.outcome === 'success' ? 'completed' : 'outcome unknown';
+              const statusText = statusEl ? (statusEl.textContent || '').trim() : '';
+              if (!statusEl || statusText !== expectedStatus) {
+                problems.push(row.node_key + ': .bundle-status "' + statusText + '" != "' + expectedStatus + '"');
+              }
+              if (row.outcome === 'success') {
+                if (!statusEl.classList.contains('bundle-status-success')) {
+                  problems.push(row.node_key + ': all-success bundle missing .bundle-status-success');
+                }
+              } else if (statusEl && statusEl.classList.contains('bundle-status-success')) {
+                problems.push(row.node_key + ': unknown-outcome bundle wrongly shows .bundle-status-success');
+              }
+            } else {
+              if (styled) problems.push(row.node_key + ': unstyled row has .row-activity-bundle');
+              if (styledAttr !== null || countAttr !== null || countEl || statusEl) {
+                problems.push(row.node_key + ': unstyled row leaks bundle markup/attrs');
+              }
+            }
+          }
+          if (isSmall && typed !== 2) problems.push('expected exactly 2 typed execute-run bundles, got ' + typed);
+          checks.push({
+            name: 'BUNDLE_TYPED_EXACT',
+            pass: problems.length === 0,
+            detail: problems.length === 0
+              ? '2/2 typed execute-run bundles styled with exact member_count/status; ordinary + unknown-kind rows bare'
+              : problems.join('; '),
+          });
+        }
+      }
+
+      // Check E: styling never comes from parsing the display summary — the
+      // ordinary execute-with-subops row and the unknown-kind bundle row BOTH
+      // read like execute runs, yet must render zero bundle styling.
+      if (activeProfile === 'activity') {
+        if (!caps.bundle) {
+          checks.push({ name: 'BUNDLE_NO_SUMMARY_PARSE', pass: true, detail: contractAbsent('bundle') });
+        } else {
+          const problems = [];
+          // The deep fixture repeats the pattern per block with qualified keys
+          // ('wud:0:wu:execsub', ...) — match by suffix so both fixtures hit
+          // the same look-alike rows.
+          for (const key of ['wu:execsub', 'wu:xbundle']) {
+            const el = Array.from(wrapEl.querySelectorAll('.row')).find((r) =>
+              (r.getAttribute('data-key') || '').endsWith(key));
+            if (!el) { problems.push('missing row ' + key); continue; }
+            if (el.classList.contains('row-activity-bundle') ||
+                el.hasAttribute('data-activity-bundle') ||
+                el.hasAttribute('data-bundle-count') ||
+                el.querySelector('.bundle-count, .bundle-status')) {
+              problems.push(key + ': styled despite summary-only similarity (typed metadata: ' +
+                JSON.stringify(cachedRow(el).activity_bundle) + ')');
+            }
+          }
+          checks.push({
+            name: 'BUNDLE_NO_SUMMARY_PARSE',
+            pass: problems.length === 0,
+            detail: problems.length === 0
+              ? 'summary look-alikes render no bundle styling (typed metadata only)'
+              : problems.join('; '),
+          });
+        }
+      }
+
+      // Check F: promotion DOM matches the wire flag exactly (Activity
+      // profile; the cache-side count always runs).
+      if (activeProfile === 'activity') {
+        const problems = [];
+        let promotedCount = 0;
+        for (const el of rowEls) {
+          const row = cachedRow(el);
+          const dom = el.classList.contains('row-promoted');
+          const wire = !!(row && row.promoted);
+          if (dom !== wire) problems.push(row.node_key + ': promoted DOM=' + dom + ' wire=' + wire);
+          if (dom) promotedCount++;
+        }
+        if (isSmall && promotedCount !== 5) problems.push('expected 5 promoted rows, got ' + promotedCount);
+        if (!caps.promoted) {
+          checks.push({
+            name: 'PROMOTED_EXACT',
+            pass: true,
+            detail: contractAbsent('promoted') + ' (cache rows: ' + promotedCount + '/5 promoted)' +
+              (problems.length ? ' cache-vs-fixture mismatch: ' + problems.join('; ') : ''),
+          });
+        } else {
+          checks.push({
+            name: 'PROMOTED_EXACT',
+            pass: problems.length === 0,
+            detail: problems.length === 0 ? '5/5 promoted rows match the wire flag' : problems.join('; '),
+          });
+        }
+      }
+
+      // Check G: Activity vs Raw gating — the Raw profile renders NONE of the
+      // grouping/promotion classes/descendants/data attrs even though its
+      // cached rows carry the wire metadata; the Activity profile renders
+      // them whenever the contract is present.
+      {
+        const rowHasGrouping = (el) =>
+          el.classList.contains('row-work-unit-start') ||
+          el.classList.contains('row-work-unit-end') ||
+          el.classList.contains('row-activity-bundle') ||
+          el.classList.contains('row-promoted') ||
+          el.querySelector('.work-unit-ribbon, .work-unit-count, .bundle-count, .bundle-status') !== null ||
+          el.hasAttribute('data-activity-bundle') ||
+          el.hasAttribute('data-bundle-count');
+        if (activeProfile === 'raw') {
+          const groupingRows = rowEls.filter(rowHasGrouping).length;
+          const cacheHasMetadata = rowEls.some((el) => {
+            const row = cachedRow(el);
+            return row && (!!row.work_unit || row.promoted || row.activity_bundle);
+          });
+          const rawGated = groupingRows === 0 && cacheHasMetadata;
+          checks.push({
+            name: 'RAW_PROFILE_GATED',
+            pass: rawGated,
+            detail: rawGated
+              ? 'raw rows carry wire metadata but zero grouping/promotion DOM'
+              : 'raw profile leaked grouping DOM: ' + groupingRows +
+                ' rows; cacheHasMetadata=' + cacheHasMetadata,
+          });
+        } else {
+          const markerRows = rowEls.filter(rowHasGrouping).length;
+          checks.push({
+            name: 'ACTIVITY_PROFILE_GROUPING_PRESENT',
+            pass: caps.any ? markerRows > 0 : true,
+            detail: caps.any
+              ? markerRows + ' rows carry grouping/promotion markers'
+              : contractAbsent('grouping/promotion'),
+          });
+        }
+      }
+
+      // Check H: bounded DOM — the virtualized window stays at roughly
+      // viewport + 2*BUFFER rows regardless of the dataset (the renderer's
+      // documented contract), so ribbons/bundles/expansion never explode the
+      // node count.
+      {
+        const domTotal = document.querySelectorAll('*').length;
+        const rendered = rowEls.length;
+        const total = window.__editchainGetTotal ? window.__editchainGetTotal() : -1;
+        const viewportRows = Math.ceil((rowsEl ? rowsEl.clientHeight : 0) / 34);
+        const maxRows = Math.min(total >= 0 ? total : Infinity, viewportRows + 800 + 5);
+        const bounded = rendered > 0 && rendered <= maxRows && domTotal < 12000;
+        checks.push({
+          name: 'WORK_UNITS_DOM_BOUNDED',
+          pass: bounded,
+          detail: 'rows=' + rendered + '/max=' + maxRows + ' domNodes=' + domTotal +
+            (bounded ? ' (bounded)' : ' (over budget)'),
+        });
+      }
+
+      // Check I: narrow-width content containment — at <=480px every summary
+      // descendant (chevron, bundle pills, badges, text) must lay out INSIDE
+      // its row's content track. The chips are flex-shrinkable so a crowded
+      // line ellipsizes instead of crossing the content-cell boundary (the
+      // round-two regression: bundle/outcome chips crossed the track even
+      // when the viewport-level NO_HORIZONTAL_OVERFLOW check could not see
+      // it because the track ends before the viewport edge).
+      if (rowEls.length && window.innerWidth > 0 && window.innerWidth <= 480) {
+        const problems = [];
+        for (const el of rowEls) {
+          const cell = el.querySelector('.text-cell');
+          const summaries = el.querySelectorAll('.summary');
+          if (!cell) { problems.push('row ' + el.getAttribute('data-row') + ': no .text-cell'); continue; }
+          const cellR = cell.getBoundingClientRect();
+          for (const s of summaries) {
+            const sR = s.getBoundingClientRect();
+            if (sR.right > cellR.right + 1) {
+              problems.push('row ' + el.getAttribute('data-row') + ': summary crosses content track');
+              continue;
+            }
+            for (const d of s.querySelectorAll('*')) {
+              const r = d.getBoundingClientRect();
+              if (r.right > cellR.right + 1 || r.left < cellR.left - 1) {
+                problems.push('row ' + el.getAttribute('data-row') + ': <' +
+                  (d.className && typeof d.className === 'string' ? d.className.split(/\s+/).join('.') : d.tagName) +
+                  '> crosses content track');
+                break;
+              }
+            }
+          }
+        }
+        checks.push({
+          name: 'WORK_UNITS_NARROW_CONTAINED',
+          pass: problems.length === 0,
+          detail: problems.length === 0
+            ? 'all summary descendants inside their content cell at ' + window.innerWidth + 'px'
+            : problems.slice(0, 4).join('; '),
+        });
+      }
+    }
+
     return checks;
   }
 
@@ -2450,6 +2895,186 @@
 
   // --- expose ----------------------------------------------------------------
 
+  // Compact capability + gating state for the parallel renderer contract
+  // (domRace / ui-dump / e2e arm or skip DOM assertions from this
+  // deterministically). Marker counts are read from the CURRENT profile's
+  // DOM; call while the Activity profile is active to probe capability.
+  function workUnitContractState() {
+    const profile = typeof window.__editchainGetProfile === 'function'
+      ? window.__editchainGetProfile() : 'activity';
+    const sel = (s) => document.querySelectorAll(s).length;
+    const workUnit = sel('.row-work-unit-start, .row-work-unit-end, .work-unit-ribbon, .work-unit-count');
+    const bundle = sel('.row-activity-bundle, .bundle-count, .bundle-status, [data-activity-bundle], [data-bundle-count]');
+    const promoted = sel('.row-promoted');
+    const rowEls = Array.from(document.querySelectorAll('.row:not(.row-placeholder)'));
+    const cacheHasMetadata = rowEls.some((el) => {
+      const abs = Number(el.getAttribute('data-row'));
+      const row = window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
+      return row && (!!row.work_unit || row.promoted || row.activity_bundle);
+    });
+    return {
+      profile,
+      markers: { workUnit, bundle, promoted },
+      any: workUnit + bundle + promoted > 0,
+      rowsRendered: rowEls.length,
+      cacheHasMetadata,
+    };
+  }
+
+  // Round-two work-unit/bundle interaction probe: drives the REAL DOM with
+  // keyboard events (no synthetic renderer calls) and asserts the parallel
+  // contract's expand/collapse + roving-focus behaviour:
+  //   - baseline: exactly one roving tab stop; the typed bundle row renders
+  //     collapsed (aria-expanded="false") and un-expanded (no member rows);
+  //   - ArrowRight on the collapsed bundle row EXPANDS it (aria-expanded
+  //     "true", member sub-op rows appear) and the single roving tab stop
+  //     survives the DOM rebuild;
+  //   - ArrowLeft COLLAPSES it (members removed, aria-expanded "false");
+  //   - Space and Enter on the bundle row toggle expansion per the ARIA
+  //     pattern instead of opening the inspector;
+  //   - ArrowUp/Down keep roving focus moving row-to-row without touching
+  //     expansion state or opening the inspector.
+  // When the renderer has not landed the contract, returns pass:true with
+  // skipped evidence (no markers to drive deterministically yet).
+  async function runWorkUnitProbe(timeoutMs) {
+    const out = { steps: [], pass: false, skipped: false, detail: null };
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    await whenIdle(timeoutMs || 5000);
+    const layoutEl = document.getElementById('layout');
+    const BUNDLE_KEY = 'wu:run1';
+    const rowByKey = (key) =>
+      Array.from(document.querySelectorAll('.row')).find((r) => r.getAttribute('data-key') === key);
+    const rovingCount = () =>
+      Array.from(document.querySelectorAll('.row')).filter((r) => r.tabIndex === 0).length;
+    const subopCount = () => document.querySelectorAll('.row.row-subop').length;
+    const press = (el, key) => {
+      el.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
+    };
+    const activeKey = () => {
+      const a = document.activeElement;
+      return a && a.closest && a.closest('.row')
+        ? a.closest('.row').getAttribute('data-key') : null;
+    };
+
+    const baseline = (() => {
+      const bundleRow = rowByKey(BUNDLE_KEY);
+      return {
+        contractPresent: !!bundleRow && bundleRow.hasAttribute('data-activity-bundle'),
+        bundleAria: bundleRow ? bundleRow.getAttribute('aria-expanded') : null,
+        rovingTabs: rovingCount(),
+        subopRows: subopCount(),
+        rowsRendered: document.querySelectorAll('.row').length,
+      };
+    })();
+    out.steps.push({ name: 'baseline', ...baseline });
+    if (!baseline.contractPresent) {
+      out.skipped = true;
+      out.detail = 'renderer contract not present: no typed bundle row with data-activity-bundle rendered (deferred until media/main.js lands the parallel contract)';
+      out.pass = true;
+      return out;
+    }
+
+    // ArrowRight expands the collapsed bundle row.
+    let bundleRow = rowByKey(BUNDLE_KEY);
+    bundleRow.focus();
+    press(bundleRow, 'ArrowRight');
+    await whenIdle(timeoutMs || 5000);
+    bundleRow = rowByKey(BUNDLE_KEY);
+    out.steps.push({
+      name: 'arrow-right-expands',
+      bundleAria: bundleRow ? bundleRow.getAttribute('aria-expanded') : null,
+      subopRows: subopCount(),
+      rovingTabs: rovingCount(),
+      inspectorOpened: !!(layoutEl && layoutEl.classList.contains('has-detail')),
+    });
+
+    // ArrowLeft collapses.
+    bundleRow.focus();
+    press(bundleRow, 'ArrowLeft');
+    await whenIdle(timeoutMs || 5000);
+    bundleRow = rowByKey(BUNDLE_KEY);
+    out.steps.push({
+      name: 'arrow-left-collapses',
+      bundleAria: bundleRow ? bundleRow.getAttribute('aria-expanded') : null,
+      subopRows: subopCount(),
+      rovingTabs: rovingCount(),
+    });
+
+    // Space expands (ARIA toggle) without opening the inspector.
+    bundleRow.focus();
+    press(bundleRow, ' ');
+    await whenIdle(timeoutMs || 5000);
+    bundleRow = rowByKey(BUNDLE_KEY);
+    out.steps.push({
+      name: 'space-expands',
+      bundleAria: bundleRow ? bundleRow.getAttribute('aria-expanded') : null,
+      subopRows: subopCount(),
+      inspectorOpened: !!(layoutEl && layoutEl.classList.contains('has-detail')),
+    });
+
+    // Enter on the collapsed bundle row also expands it (never inspects).
+    bundleRow.focus();
+    press(bundleRow, 'ArrowLeft'); // ensure collapsed before the Enter case
+    await whenIdle(timeoutMs || 5000);
+    bundleRow = rowByKey(BUNDLE_KEY);
+    bundleRow.focus();
+    press(bundleRow, 'Enter');
+    await whenIdle(timeoutMs || 5000);
+    bundleRow = rowByKey(BUNDLE_KEY);
+    out.steps.push({
+      name: 'enter-expands',
+      bundleAria: bundleRow ? bundleRow.getAttribute('aria-expanded') : null,
+      subopRows: subopCount(),
+      inspectorOpened: !!(layoutEl && layoutEl.classList.contains('has-detail')),
+    });
+
+    // ArrowUp/Down roving stays stable: focus moves row-to-row, expansion
+    // state is untouched, and no inspector opens. Collapse the bundle first so
+    // the adjacent rows are the plain top-level rows (wu:req2 idx 1 -> bundle
+    // idx 2 -> wu:run2 idx 3), then verify the arrow moves land exactly there.
+    bundleRow.focus();
+    press(bundleRow, 'ArrowLeft');
+    await whenIdle(timeoutMs || 5000);
+    bundleRow = rowByKey(BUNDLE_KEY);
+    const ariaBeforeRove = bundleRow ? bundleRow.getAttribute('aria-expanded') : null;
+    const upTarget = rowByKey('wu:req2');
+    upTarget.focus();
+    press(upTarget, 'ArrowDown');
+    const movedToBundle = activeKey() === BUNDLE_KEY;
+    press(document.activeElement.closest('.row'), 'ArrowDown');
+    const movedPast = activeKey() === 'wu:run2';
+    out.steps.push({
+      name: 'roving-focus-stable',
+      movedToBundle,
+      movedPast,
+      activeKey: activeKey(),
+      bundleAriaBefore: ariaBeforeRove,
+      bundleAriaAfter: rowByKey(BUNDLE_KEY) ? rowByKey(BUNDLE_KEY).getAttribute('aria-expanded') : null,
+      rovingTabs: rovingCount(),
+      inspectorOpened: !!(layoutEl && layoutEl.classList.contains('has-detail')),
+    });
+
+    const s = out.steps;
+    const s1 = s[1], s2 = s[2], s3 = s[3], s4 = s[4], s5 = s[5];
+    const expandedOk = s1.bundleAria === 'true' && s1.subopRows > 0 &&
+      s1.rovingTabs === 1 && s1.inspectorOpened === false;
+    const collapsedOk = s2.bundleAria === 'false' && s2.subopRows === 0 &&
+      s2.rovingTabs === 1;
+    const spaceOk = s3.bundleAria === 'true' && s3.subopRows > 0 &&
+      s3.inspectorOpened === false;
+    const enterOk = s4.bundleAria === 'true' && s4.subopRows > 0 &&
+      s4.inspectorOpened === false;
+    const roveOk = s5.movedToBundle === true && s5.movedPast === true &&
+      s5.rovingTabs === 1 && s5.inspectorOpened === false &&
+      s5.bundleAriaBefore === s5.bundleAriaAfter;
+    out.pass = expandedOk && collapsedOk && spaceOk && enterOk && roveOk;
+    out.detail = {
+      expandedOk, collapsedOk, spaceOk, enterOk, roveOk,
+      steps: out.steps.map((x) => ({ name: x.name, bundleAria: x.bundleAria, subopRows: x.subopRows })),
+    };
+    return out;
+  }
+
   window.__editchainDebug = {
     whenIdle,
     dumpLayout,
@@ -2462,6 +3087,8 @@
     runInspectorGeometry,
     runKeyboardProbe,
     runRestoreStateProbe,
+    runWorkUnitProbe,
+    workUnitContractState,
     captureResizeMetrics,
     evaluateResizeAssert,
   };

@@ -33,7 +33,13 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// in cross-record duplicate pairing; the projection also recovers
 /// payload-level `exitCode` evidence from truncated previews and decodes
 /// complete JSON string escapes recovered from a bounded prefix.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 6;
+///
+/// Revision 7: the fixed Activity view gains deterministic work-unit metadata
+/// (`work_unit` markers), a conservative promotion flag, and execute-run
+/// bundling (maximal runs of safe low-signal execute rows collapse into one
+/// synthetic expandable node), so stale revision-6 snapshots must not serve
+/// the old flat Activity profile.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 7;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.
