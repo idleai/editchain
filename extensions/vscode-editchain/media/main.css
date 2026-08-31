@@ -630,6 +630,16 @@ body {
   stroke: var(--vscode-editor-background);
   stroke-width: 1;
 }
+.graph-cell rect.graphBundleCapsule,
+.graph-cell circle.graphBundleTerminal {
+  /* Execute-run bundle glyphs are decorative like the dots: the capsule and
+     its entry/exit terminals never intercept clicks (rows below stay
+     interactive) and get the same background hairline so they read against
+     the chain lines passing behind them. */
+  pointer-events: none;
+  stroke: var(--vscode-editor-background);
+  stroke-width: 1;
+}
 .graph-cell line.graphLine {
   /* Stroke colour is set inline per-lane (each chain's own colour); this rule
      only sets the width. */

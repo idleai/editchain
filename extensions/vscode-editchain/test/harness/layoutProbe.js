@@ -488,7 +488,7 @@
   function describeSvg() {
     const cells = document.querySelectorAll('.graph-cell svg.graphCell');
     if (!cells.length) return { present: false };
-    const out = { present: true, cells: cells.length, dots: [], lines: [], transitions: [] };
+    const out = { present: true, cells: cells.length, dots: [], capsules: [], lines: [], transitions: [] };
     cells.forEach((cellSvg) => {
       const rowEl = cellSvg.closest('.row');
       const absIdx = rowEl ? rowEl.getAttribute('data-row') : null;
@@ -499,6 +499,29 @@
           cy: +dot.getAttribute('cy'),
           r: +dot.getAttribute('r'),
           fill: dot.getAttribute('fill'),
+        });
+      }
+      // Activity execute-run bundles render a capsule + two terminals instead
+      // of a node dot; report them so dumps/artifacts count the row's graph
+      // node even when it has no graphDot.
+      for (const cap of cellSvg.querySelectorAll('rect.graphBundleCapsule')) {
+        const terminal = (cls) => {
+          const t = Array.from(cellSvg.querySelectorAll('circle.graphBundleTerminal'))
+            .find((el) => el.classList.contains(cls));
+          return t ? {
+            cx: +t.getAttribute('cx'),
+            cy: +t.getAttribute('cy'),
+            r: +t.getAttribute('r'),
+          } : null;
+        };
+        out.capsules.push({
+          row: absIdx,
+          x: +cap.getAttribute('x'),
+          y: +cap.getAttribute('y'),
+          w: +cap.getAttribute('width'),
+          h: +cap.getAttribute('height'),
+          entry: terminal('graphBundleEntry'),
+          exit: terminal('graphBundleExit'),
         });
       }
       for (const line of cellSvg.querySelectorAll('line.graphLine')) {
@@ -619,34 +642,51 @@
       });
     }
 
-    // Check 3: every rendered row has a matching graph dot centered on its lane.
-    // Rows carry an ABSOLUTE `data-row` index (the viewport renders a slice of
-    // the full history), so we match dots by that absolute index rather than by
-    // contiguous position.
+    // Check 3: every rendered row has a graph node centered on its row. The
+    // node is normally the lane `graphDot`; a typed Activity execute-run
+    // bundle row replaces it with a `graphBundleCapsule` (the enclosing
+    // capsule's centre sits on the same row midpoint). Rows carry an ABSOLUTE
+    // `data-row` index (the viewport renders a slice of the full history), so
+    // we match by that absolute index rather than by contiguous position.
     if (wrapEl) {
       const rowEls = wrapEl.querySelectorAll('.row');
       let dotsOk = true;
       let firstFail = null;
       rowEls.forEach((row) => {
         // Sub-op rows intentionally draw NO dot (they are not graph nodes), so
-        // skip them — only top-level rows must have a centered dot.
+        // skip them — only top-level rows must have a centered node.
         if (row.classList.contains('row-subop')) return;
         const absIdx = row.getAttribute('data-row');
         const cellSvg = row.querySelector('.graph-cell svg.graphCell');
         const dot = cellSvg && cellSvg.querySelector('circle.graphDot');
-        if (!dot) { dotsOk = false; firstFail = firstFail || { rowIdx:absIdx, reason:'no dot' }; return; }
+        const capsule = cellSvg && cellSvg.querySelector('rect.graphBundleCapsule');
+        // A bundle capsule counts as this row's graph node; a row with
+        // neither would break the graph topology.
+        const node = dot
+          ? { kind: 'dot', cy: +dot.getAttribute('cy') }
+          : capsule
+            ? {
+                kind: 'capsule',
+                cy: +capsule.getAttribute('y') + (+capsule.getAttribute('height')) / 2,
+              }
+            : null;
+        if (!node) {
+          dotsOk = false;
+          firstFail = firstFail || { rowIdx: absIdx, reason: 'no graph node (dot nor bundle capsule)' };
+          return;
+        }
         const rowBox = row.getBoundingClientRect();
-        // dot cy is relative to the cell svg, which sits at the row's top.
+        // node cy is relative to the cell svg, which sits at the row's top.
         const cellTop = cellSvg.getBoundingClientRect().top;
-        const dotCy = cellTop + (+dot.getAttribute('cy'));
+        const nodeCy = cellTop + node.cy;
         const rowCenterY = rowBox.top + rowBox.height / 2;
-        const deltaY = Math.abs(dotCy - rowCenterY);
-        if (deltaY > 1.5) { dotsOk = false; firstFail = firstFail || { rowIdx:absIdx, deltaY }; }
+        const deltaY = Math.abs(nodeCy - rowCenterY);
+        if (deltaY > 1.5) { dotsOk = false; firstFail = firstFail || { rowIdx: absIdx, kind: node.kind, deltaY }; }
       });
       checks.push({
         name:'DOT_ROW_ALIGNMENT',
         pass:dotsOk,
-        detail:dotsOk ? 'all dots centered on their rows'
+        detail:dotsOk ? 'all graph nodes centered on their rows'
           : 'first fail=' + JSON.stringify(firstFail),
       });
     }
@@ -1769,9 +1809,11 @@
     // the fixtures/bridge already model the full wire contract (see
     // workUnitBridge.test.js). Family checks retain explicit diagnostics when
     // one marker family is absent, but the mandatory contract-presence check
-    // below fails the Activity scenario unless ALL three renderer families are
-    // present. This prevents a reverted renderer from turning feature checks
-    // into silent skips. Cache-side wire facts are always asserted as well.
+    // below fails the Activity scenario unless ALL four renderer families are
+    // present (work-unit boundaries, bundle styling, promotion rails, and the
+    // execute-run capsule glyph). This prevents a reverted renderer from
+    // turning feature checks into silent skips. Cache-side wire facts are
+    // always asserted as well.
     if (window.__editchainScenarioName === 'workUnits' ||
         window.__editchainScenarioName === 'workUnitsDeep') {
       const activeProfile = typeof window.__editchainGetProfile === 'function'
@@ -1791,25 +1833,27 @@
         : [];
       const countMarkers = (sel) => document.querySelectorAll(sel).length;
       const caps = {
-        any: false, workUnit: false, bundle: false, promoted: false,
+        any: false, workUnit: false, bundle: false, promoted: false, capsule: false,
       };
       caps.workUnit = countMarkers(
         '.row-work-unit-start, .row-work-unit-end, .work-unit-ribbon, .work-unit-count') > 0;
       caps.bundle = countMarkers(
         '.row-activity-bundle, .bundle-count, .bundle-status, [data-activity-bundle], [data-bundle-count]') > 0;
       caps.promoted = countMarkers('.row-promoted') > 0;
-      caps.any = caps.workUnit || caps.bundle || caps.promoted;
+      caps.capsule = countMarkers(
+        '.graph-cell rect.graphBundleCapsule, .graph-cell circle.graphBundleTerminal') > 0;
+      caps.any = caps.workUnit || caps.bundle || caps.promoted || caps.capsule;
       const contractAbsent = (family) =>
         'renderer contract not present (no ' + family +
         ' DOM markers rendered; wire metadata verified cache-side)';
 
       if (activeProfile === 'activity') {
-        const present = caps.workUnit && caps.bundle && caps.promoted;
+        const present = caps.workUnit && caps.bundle && caps.promoted && caps.capsule;
         checks.push({
           name: 'ROUND_TWO_RENDERER_CONTRACT_PRESENT',
           pass: present,
           detail: 'workUnit=' + caps.workUnit + ' bundle=' + caps.bundle +
-            ' promoted=' + caps.promoted,
+            ' promoted=' + caps.promoted + ' capsule=' + caps.capsule,
         });
       }
 
@@ -2053,6 +2097,232 @@
         }
       }
 
+      // Check E2: execute-run capsule gating is driven by the TYPED metadata
+      // exactly. Only rows whose cached activity_bundle.kind === 'execute-run'
+      // render the capsule glyph set: exactly one rect.graphBundleCapsule,
+      // exactly two circle.graphBundleTerminal (one .graphBundleEntry, one
+      // .graphBundleExit), and NO circle.graphDot. The unknown-kind bundle row
+      // (coerced to 'unknown' on the wire), the summary look-alike execsub
+      // row, and every ordinary row stay bare.
+      if (activeProfile === 'activity') {
+        if (!caps.capsule) {
+          checks.push({ name: 'BUNDLE_CAPSULE_TYPED_EXACT', pass: true, detail: contractAbsent('capsule') });
+        } else {
+          const problems = [];
+          let typedRows = 0;
+          for (const el of rowEls) {
+            const row = cachedRow(el);
+            const b = row ? row.activity_bundle : null;
+            const svg = el.querySelector('.graph-cell svg.graphCell');
+            const rects = svg ? svg.querySelectorAll('rect.graphBundleCapsule') : [];
+            const terms = svg ? svg.querySelectorAll('circle.graphBundleTerminal') : [];
+            const typed = !!(b && b.kind === 'execute-run');
+            if (typed) {
+              typedRows++;
+              if (rects.length !== 1) {
+                problems.push(row.node_key + ': typed execute-run row must render exactly 1 capsule rect, got ' + rects.length);
+              }
+              if (terms.length !== 2) {
+                problems.push(row.node_key + ': typed execute-run row must render exactly 2 terminals, got ' + terms.length);
+              } else {
+                const entry = Array.from(terms).filter((t) => t.classList.contains('graphBundleEntry')).length;
+                const exit = Array.from(terms).filter((t) => t.classList.contains('graphBundleExit')).length;
+                if (entry !== 1) problems.push(row.node_key + ': expected 1 .graphBundleEntry terminal, got ' + entry);
+                if (exit !== 1) problems.push(row.node_key + ': expected 1 .graphBundleExit terminal, got ' + exit);
+              }
+              if (svg && svg.querySelector('circle.graphDot')) {
+                problems.push(row.node_key + ': typed execute-run row must not render a graphDot');
+              }
+            } else if (rects.length || terms.length) {
+              problems.push(row.node_key + ': untyped row leaks capsule markup (rects=' + rects.length +
+                ' terminals=' + terms.length + ' typed metadata: ' + JSON.stringify(b) + ')');
+            }
+          }
+          if (isSmall && typedRows !== 2) {
+            problems.push('expected exactly 2 typed execute-run capsule rows, got ' + typedRows);
+          }
+          checks.push({
+            name: 'BUNDLE_CAPSULE_TYPED_EXACT',
+            pass: problems.length === 0,
+            detail: problems.length === 0
+              ? (isSmall ? '2/2 ' : '') +
+                'typed execute-run rows carry one capsule + entry/exit terminals and no dot; unknown-kind + ordinary rows bare'
+              : problems.join('; '),
+          });
+        }
+      }
+
+      // Check E3: capsule geometry. Both terminals sit on the row's lane x
+      // (the same x the neighbouring ordinary rows' dots use for that lane);
+      // the entry terminal is above the row midpoint and the exit terminal
+      // below it (entry y < HALF_H < exit y); the capsule rect encloses both
+      // terminal circles.
+      if (activeProfile === 'activity') {
+        if (!caps.capsule) {
+          checks.push({ name: 'BUNDLE_CAPSULE_GEOMETRY', pass: true, detail: contractAbsent('capsule') });
+        } else {
+          const ROW_H = 34;
+          const HALF_H = ROW_H / 2;
+          const near = (a, b) => Math.abs(a - b) <= 0.01;
+          // Lane x anchors come from ordinary rows' node dots (a bundle row
+          // carries terminals instead, so its lane x must equal the dots of
+          // other rows in the same lane).
+          const laneDotX = new Map();
+          for (const el of rowEls) {
+            const row = cachedRow(el);
+            const dot = el.querySelector('.graph-cell svg.graphCell circle.graphDot');
+            if (row && dot) laneDotX.set(row.lane, +dot.getAttribute('cx'));
+          }
+          const problems = [];
+          for (const el of rowEls) {
+            const row = cachedRow(el);
+            const b = row ? row.activity_bundle : null;
+            if (!(b && b.kind === 'execute-run')) continue;
+            const svg = el.querySelector('.graph-cell svg.graphCell');
+            const rect = svg && svg.querySelector('rect.graphBundleCapsule');
+            const entry = svg && svg.querySelector('circle.graphBundleTerminal.graphBundleEntry');
+            const exit = svg && svg.querySelector('circle.graphBundleTerminal.graphBundleExit');
+            if (!rect || !entry || !exit) {
+              problems.push(row.node_key + ': capsule geometry missing (rect/entry/exit)');
+              continue;
+            }
+            const x = +rect.getAttribute('x');
+            const y = +rect.getAttribute('y');
+            const w = +rect.getAttribute('width');
+            const h = +rect.getAttribute('height');
+            const eCx = +entry.getAttribute('cx');
+            const eCy = +entry.getAttribute('cy');
+            const eR = +entry.getAttribute('r');
+            const xCx = +exit.getAttribute('cx');
+            const xCy = +exit.getAttribute('cy');
+            const xR = +exit.getAttribute('r');
+            if (!near(eCx, xCx)) {
+              problems.push(row.node_key + ': terminals do not share the row lane x (' + eCx + ' vs ' + xCx + ')');
+            }
+            const laneX = laneDotX.get(row.lane);
+            if (laneX !== undefined && (!near(eCx, laneX) || !near(xCx, laneX))) {
+              problems.push(row.node_key + ': terminal x=' + eCx + ' != lane x=' + laneX + ' (lane ' + row.lane + ')');
+            }
+            if (!(eCy < HALF_H && xCy > HALF_H)) {
+              problems.push(row.node_key + ': entry y=' + eCy + ' must be < HALF_H and exit y=' + xCy + ' must be > HALF_H');
+            }
+            const encloses = (cx, cy, r) =>
+              x - 0.01 <= cx - r && cx + r <= x + w + 0.01 &&
+              y - 0.01 <= cy - r && cy + r <= y + h + 0.01;
+            if (!encloses(eCx, eCy, eR) || !encloses(xCx, xCy, xR)) {
+              problems.push(row.node_key + ': capsule (' + x + ',' + y + ',' + w + 'x' + h +
+                ') does not enclose terminals (' + eCx + ',' + eCy + ') and (' + xCx + ',' + xCy + ')');
+            }
+          }
+          checks.push({
+            name: 'BUNDLE_CAPSULE_GEOMETRY',
+            pass: problems.length === 0,
+            detail: problems.length === 0
+              ? 'terminals share the lane x, entry < HALF_H < exit, capsule encloses both'
+              : problems.join('; '),
+          });
+        }
+      }
+
+      // Check E4: ordinary-row exclusion — every top-level row that is NOT a
+      // typed execute-run bundle keeps its graphDot and renders zero capsule
+      // markup (sub-op rows draw no node at all, as always).
+      if (activeProfile === 'activity') {
+        const problems = [];
+        for (const el of rowEls) {
+          if (el.classList.contains('row-subop')) continue;
+          const row = cachedRow(el);
+          const b = row ? row.activity_bundle : null;
+          if (b && b.kind === 'execute-run') continue;
+          const svg = el.querySelector('.graph-cell svg.graphCell');
+          const dot = svg && svg.querySelector('circle.graphDot');
+          if (!dot) problems.push(row.node_key + ': ordinary row lost its graphDot');
+          if (svg && (svg.querySelector('rect.graphBundleCapsule') ||
+                      svg.querySelector('circle.graphBundleTerminal'))) {
+            problems.push(row.node_key + ': ordinary row leaks capsule markup');
+          }
+        }
+        checks.push({
+          name: 'BUNDLE_CAPSULE_ORDINARY_EXCLUDED',
+          pass: problems.length === 0,
+          detail: problems.length === 0
+            ? 'ordinary + unknown-kind rows keep their graphDot and carry zero capsule glyphs'
+            : problems.join('; '),
+        });
+      }
+
+      // Check E4b: bounded 34px row geometry — the capsule rect and both
+      // terminals stay inside their 34px SVG cell (no glyph escapes the row's
+      // vertical band or the graph column), and the bundle row itself stays
+      // exactly ROW_H tall like every other row.
+      if (activeProfile === 'activity') {
+        const ROW_H = 34;
+        const problems = [];
+        for (const el of rowEls) {
+          const row = cachedRow(el);
+          const b = row ? row.activity_bundle : null;
+          if (!(b && b.kind === 'execute-run')) continue;
+          const rowH = el.getBoundingClientRect().height;
+          if (Math.abs(rowH - ROW_H) > 0.5) {
+            problems.push(row.node_key + ': bundle row height ' + rowH + ' != ' + ROW_H);
+          }
+          const svg = el.querySelector('.graph-cell svg.graphCell');
+          if (!svg) { problems.push(row.node_key + ': bundle row has no graph cell'); continue; }
+          const cellW = +svg.getAttribute('width');
+          const cellH = +svg.getAttribute('height');
+          if (Math.abs(cellH - ROW_H) > 0.01) {
+            problems.push(row.node_key + ': graph cell height ' + cellH + ' != ' + ROW_H);
+          }
+          const rect = svg.querySelector('rect.graphBundleCapsule');
+          if (rect) {
+            const x = +rect.getAttribute('x');
+            const y = +rect.getAttribute('y');
+            const w = +rect.getAttribute('width');
+            const h = +rect.getAttribute('height');
+            if (y < -0.01 || y + h > ROW_H + 0.01) {
+              problems.push(row.node_key + ': capsule escapes the 34px cell vertically (y=' + y + ' h=' + h + ')');
+            }
+            if (x < -0.01 || x + w > cellW + 0.01) {
+              problems.push(row.node_key + ': capsule escapes the graph column (x=' + x + ' w=' + w + ' cellW=' + cellW + ')');
+            }
+          }
+          svg.querySelectorAll('circle.graphBundleTerminal').forEach((t) => {
+            const cy = +t.getAttribute('cy');
+            const cx = +t.getAttribute('cx');
+            if (cy < -0.01 || cy > ROW_H + 0.01) {
+              problems.push(row.node_key + ': terminal escapes the 34px cell vertically (cy=' + cy + ')');
+            }
+            if (cx < -0.01 || cx > cellW + 0.01) {
+              problems.push(row.node_key + ': terminal escapes the graph column (cx=' + cx + ' cellW=' + cellW + ')');
+            }
+          });
+        }
+        checks.push({
+          name: 'BUNDLE_ROW_GEOMETRY_BOUNDED',
+          pass: problems.length === 0,
+          detail: problems.length === 0
+            ? 'capsule + terminals bounded inside the 34px cell; bundle rows stay 34px tall'
+            : problems.join('; '),
+        });
+      }
+
+      // Check E5: Raw zero leakage — the Raw profile renders NONE of the
+      // capsule glyphs anywhere even though its cached rows carry the wire
+      // metadata; raw rows keep their graph dots.
+      if (activeProfile === 'raw') {
+        const capsules = countMarkers('.graph-cell rect.graphBundleCapsule');
+        const terminals = countMarkers('.graph-cell circle.graphBundleTerminal');
+        const dots = countMarkers('.graph-cell circle.graphDot');
+        const leakFree = capsules === 0 && terminals === 0 && dots >= 1;
+        checks.push({
+          name: 'BUNDLE_CAPSULE_RAW_ZERO_LEAKAGE',
+          pass: leakFree,
+          detail: leakFree
+            ? 'raw renders zero capsule/terminal glyphs (' + dots + ' dots kept)'
+            : 'raw leaked capsule DOM: capsules=' + capsules + ' terminals=' + terminals + ' dots=' + dots,
+        });
+      }
+
       // Check F: promotion DOM matches the wire flag exactly (Activity
       // profile; the cache-side count always runs).
       if (activeProfile === 'activity') {
@@ -2093,6 +2363,7 @@
           el.classList.contains('row-activity-bundle') ||
           el.classList.contains('row-promoted') ||
           el.querySelector('.work-unit-ribbon, .work-unit-count, .bundle-count, .bundle-status') !== null ||
+          el.querySelector('.graph-cell rect.graphBundleCapsule, .graph-cell circle.graphBundleTerminal') !== null ||
           el.hasAttribute('data-activity-bundle') ||
           el.hasAttribute('data-bundle-count');
         if (activeProfile === 'raw') {
@@ -2906,6 +3177,7 @@
     const workUnit = sel('.row-work-unit-start, .row-work-unit-end, .work-unit-ribbon, .work-unit-count');
     const bundle = sel('.row-activity-bundle, .bundle-count, .bundle-status, [data-activity-bundle], [data-bundle-count]');
     const promoted = sel('.row-promoted');
+    const capsule = sel('.graph-cell rect.graphBundleCapsule, .graph-cell circle.graphBundleTerminal');
     const rowEls = Array.from(document.querySelectorAll('.row:not(.row-placeholder)'));
     const cacheHasMetadata = rowEls.some((el) => {
       const abs = Number(el.getAttribute('data-row'));
@@ -2914,8 +3186,8 @@
     });
     return {
       profile,
-      markers: { workUnit, bundle, promoted },
-      any: workUnit + bundle + promoted > 0,
+      markers: { workUnit, bundle, promoted, capsule },
+      any: workUnit + bundle + promoted + capsule > 0,
       rowsRendered: rowEls.length,
       cacheHasMetadata,
     };

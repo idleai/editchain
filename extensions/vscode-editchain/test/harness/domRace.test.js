@@ -348,12 +348,13 @@ test('prepending same-group rows removes a stale chip left by a mid-group reanch
 
 // --- Round-two parallel contract: work-unit/bundle grouping races ----------
 //
-// The Activity profile's work-unit/bundle/promotion DOM layer must follow the
-// same deterministic races as the plain grid:
+// The Activity profile's work-unit/bundle/promotion/capsule DOM layer must
+// follow the same deterministic races as the plain grid:
 //   - a profile switch with a HELD window clears grouping/promotion DOM
-//     synchronously (no stale ribbons/bundles/rails left interactive), and
-//     the released raw view renders ZERO grouping DOM even though its cached
-//     rows carry the wire metadata (Activity vs Raw gating);
+//     synchronously (no stale ribbons/bundles/rails/capsules left
+//     interactive), and the released raw view renders ZERO grouping DOM even
+//     though its cached rows carry the wire metadata (Activity vs Raw
+//     gating);
 //   - deep scroll + one-row prepends/trims across the virtual window never
 //     invent a duplicate work-unit start (per-id uniqueness in every slice);
 //   - bundle expand/collapse (ArrowRight/ArrowLeft/Space/Enter) and roving
@@ -384,6 +385,8 @@ test('profile switch with a held window clears work-unit/bundle grouping; raw st
     assert.ok(baseline.state.markers.workUnit >= 12, 'work-unit markers rendered in Activity');
     assert.ok(baseline.state.markers.bundle >= 6, 'bundle markers rendered in Activity');
     assert.ok(baseline.state.markers.promoted === 5, 'promotion rails rendered in Activity');
+    assert.ok(baseline.state.markers.capsule >= 6,
+      'execute-run capsule glyphs (1 rect + 2 terminals per typed row) rendered in Activity');
     assert.equal(baseline.state.cacheHasMetadata, true);
 
     // Hold the Raw profile's first GetWindow; click Raw through the REAL
@@ -411,8 +414,8 @@ test('profile switch with a held window clears work-unit/bundle grouping; raw st
     assert.equal(held.dataReady, false, 'readiness must be cleared during the reset');
     assert.equal(held.profile, 'raw', 'the new profile must be active immediately');
     assert.equal(held.total, -1, 'total must be unknown until the new window arrives');
-    assert.deepEqual(held.markers, { workUnit: 0, bundle: 0, promoted: 0 },
-      'no grouping/promotion DOM may survive into the reset');
+    assert.deepEqual(held.markers, { workUnit: 0, bundle: 0, promoted: 0, capsule: 0 },
+      'no grouping/promotion/capsule DOM may survive into the reset');
     assert.match(held.message, /Loading/);
 
     // Release: the raw view must render fully, be cache-backed, and keep
@@ -437,8 +440,8 @@ test('profile switch with a held window clears work-unit/bundle grouping; raw st
     });
     assert.equal(raw.rows, 18, 'raw profile serves the unbundled 18-row stream');
     assert.equal(raw.cacheBacked, true, 'every raw row must be cache-backed');
-    assert.deepEqual(raw.state.markers, { workUnit: 0, bundle: 0, promoted: 0 },
-      'raw renders none of the grouping/promotion DOM');
+    assert.deepEqual(raw.state.markers, { workUnit: 0, bundle: 0, promoted: 0, capsule: 0 },
+      'raw renders none of the grouping/promotion/capsule DOM');
     assert.equal(raw.state.cacheHasMetadata, true,
       'raw rows must still carry work_unit/promoted wire metadata (gating, not dropping)');
     const rawGated = raw.checks.checks.find((c) => c.name === 'RAW_PROFILE_GATED');
@@ -454,6 +457,8 @@ test('profile switch with a held window clears work-unit/bundle grouping; raw st
     const activity = await page.evaluate(() => window.__editchainDebug.workUnitContractState());
     assert.equal(activity.profile, 'activity');
     assert.ok(activity.any, 'grouping markers must return in Activity');
+    assert.ok(activity.markers.capsule > 0,
+      'execute-run capsule glyphs must return in Activity after the reset');
 
     const probe = await page.evaluate(() => window.__editchainDebug.runWorkUnitProbe(20000));
     console.log('[domRace] work-unit probe:', JSON.stringify(probe.detail));

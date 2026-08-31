@@ -353,6 +353,17 @@ const TRANSITION_R = 6;
 // sub-pixel: at extreme compressed spacing the renderer falls back to a
 // straight orthogonal jog instead of a degenerate curve.
 const TRANSITION_MIN_DX = 1;
+// Execute-run bundle node glyph: typed Activity bundle rows replace the
+// ordinary single graph dot with a compact vertical capsule with separate
+// entry (above the row midpoint) and exit (below it) terminals. The terminal
+// radius follows the dot radius so dense lane compression shrinks the whole
+// glyph proportionally; the half-span (terminal distance from the row
+// midpoint) is fixed so the glyph keeps a stable compact footprint inside the
+// 34px row. The capsule is `BUNDLE_CAPSULE_MARGIN` px wider than the terminal
+// diameter on each side.
+const BUNDLE_TERMINAL_RATIO = 0.75;
+const BUNDLE_HALF_SPAN = 7;
+const BUNDLE_CAPSULE_MARGIN = 1;
 
 /** Send a request body to the extension host, correlating the response.
  *
@@ -825,6 +836,17 @@ function dotRadius() {
   return Math.max(1.5, Math.min(DOT_R, spacing / 2));
 }
 
+/** Terminal radius for the execute-run bundle glyph.
+ *
+ * Scales with the dot radius (which already compresses with dense lanes) so
+ * the bundle glyph shrinks proportionally on crowded rails, down to the same
+ * readable floor as ordinary dots. Terminals stay slightly smaller than the
+ * node dot so the capsule reads as a distinct mark, not a double dot.
+ */
+function bundleTerminalRadius() {
+  return Math.max(1.5, dotRadius() * BUNDLE_TERMINAL_RATIO);
+}
+
 /** Effective per-lane pixel width.
  *
  * Normally `LANE_W`; when the lane count would exceed the graph budget, lanes
@@ -899,11 +921,30 @@ function laneX(lane) {
  * is a dangling stub and is not drawn. Generic vertical halves are skipped
  * exactly when a rendered path owns them, so dot-anchored transitions never
  * suppress the neighbouring legitimate segment (the path would not cover it).
+ *
+ * Typed Activity execute-run bundle rows (`activity_bundle.kind ===
+ * 'execute-run'`) render a compact vertical capsule instead of the node dot:
+ * the entry terminal sits above the row midpoint and the exit terminal below
+ * it, both on the node lane, and the capsule spans between them. Incoming
+ * geometry on the node lane terminates at the entry terminal and outgoing
+ * geometry starts at the exit terminal; other pass-through lanes keep the
+ * ordinary midpoint geometry. Transitions touching the node lane re-anchor
+ * their dot-anchored side to the matching terminal (the shared seam moves
+ * with it); transitions that do not touch the node lane are unchanged.
  */
 function buildGraphCell(row) {
   const width = currentGraphWidth();
   const height = ROW_H;
   const midY = ROW_H / 2;
+  const nodeLane = row.lane || 0;
+  const isBundle = isExecuteRunBundle(row);
+  const bundle = isBundle
+    ? {
+        termR: bundleTerminalRadius(),
+        entryY: midY - BUNDLE_HALF_SPAN,
+        exitY: midY + BUNDLE_HALF_SPAN,
+      }
+    : null;
   // Decorative graph marks — never exposed to the accessibility tree.
   let s = `<svg class="graphCell" width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">`;
   // `transitions` entries are (from_lane, to_lane) = production's
@@ -936,33 +977,53 @@ function buildGraphCell(row) {
     if (!t.startAtDot) ownsTop.add(t.fromLane);
     if (!t.endAtDot) ownsBottom.add(t.toLane);
   }
-  // Top-half vertical segments: lanes entering from above (y=0 → midY).
+  // Top-half vertical segments: lanes entering from above (y=0 → midY). On a
+  // bundle row the node lane's incoming line terminates at the ENTRY terminal
+  // instead of running on to the row midpoint.
   for (const lane of above) {
     if (ownsTop.has(lane)) continue;
     const x = laneX(lane);
     const colour = COLORS[lane % COLORS.length];
-    s += `<line class="graphLine" x1="${x}" y1="0" x2="${x}" y2="${midY}" style="stroke:${colour}"/>`;
+    const endY = bundle && lane === nodeLane ? bundle.entryY : midY;
+    s += `<line class="graphLine" x1="${x}" y1="0" x2="${x}" y2="${endY}" style="stroke:${colour}"/>`;
   }
-  // Bottom-half vertical segments: lanes leaving downward (midY → height).
+  // Bottom-half vertical segments: lanes leaving downward (midY → height). On
+  // a bundle row the node lane's outgoing line starts at the EXIT terminal
+  // instead of the row midpoint.
   for (const lane of below) {
     if (ownsBottom.has(lane)) continue;
     const x = laneX(lane);
     const colour = COLORS[lane % COLORS.length];
-    s += `<line class="graphLine" x1="${x}" y1="${midY}" x2="${x}" y2="${height}" style="stroke:${colour}"/>`;
+    const startY = bundle && lane === nodeLane ? bundle.exitY : midY;
+    s += `<line class="graphLine" x1="${x}" y1="${startY}" x2="${x}" y2="${height}" style="stroke:${colour}"/>`;
   }
   // Rounded cross-lane transition paths at this row (drawn after the verticals
   // so the elbows sit on top; the node dot is still painted last).
   for (const t of rendered) {
-    s += buildTransitionPaths(t.fromLane, t.toLane, height, t.startAtDot, t.endAtDot);
+    s += buildTransitionPaths(t.fromLane, t.toLane, height, t.startAtDot, t.endAtDot, bundle);
   }
-  // A sub-op row draws NO dot — it is not a graph node. Its `above`/`below` are
-  // the pass-through lanes spanning this region, drawn as full-height straight
-  // lines (both halves meet at midY). Only top-level rows get a node dot.
+  // A sub-op row draws NO node — it is not a graph node. Its `above`/`below`
+  // are the pass-through lanes spanning this region, drawn as full-height
+  // straight lines (both halves meet at midY). Only top-level rows get a node
+  // mark: the ordinary dot, or — on a typed execute-run bundle row — the
+  // capsule with its entry/exit terminals.
   if (!row.is_subop) {
-    // The node's own dot at its lane.
-    const lane = row.lane || 0;
-    const colour = COLORS[lane % COLORS.length];
-    s += `<circle class="graphDot" cx="${laneX(lane)}" cy="${midY}" r="${dotRadius()}" fill="${colour}"/>`;
+    const colour = COLORS[nodeLane % COLORS.length];
+    if (bundle) {
+      // The bundle glyph: one capsule spanning the entry/exit terminals, which
+      // share the node lane x and sit symmetrically around the row midpoint.
+      const x = laneX(nodeLane);
+      const { termR, entryY, exitY } = bundle;
+      const capW = termR * 2 + BUNDLE_CAPSULE_MARGIN * 2;
+      const capH = (exitY - entryY) + termR * 2;
+      s += `<rect class="graphBundleCapsule" x="${fmt(x - capW / 2)}" y="${fmt(entryY - termR)}"` +
+        ` width="${fmt(capW)}" height="${fmt(capH)}" rx="${fmt(capW / 2)}" fill="${colour}"/>` +
+        `<circle class="graphBundleTerminal graphBundleEntry" cx="${fmt(x)}" cy="${fmt(entryY)}" r="${fmt(termR)}" fill="${colour}"/>` +
+        `<circle class="graphBundleTerminal graphBundleExit" cx="${fmt(x)}" cy="${fmt(exitY)}" r="${fmt(termR)}" fill="${colour}"/>`;
+    } else {
+      // The node's own dot at its lane.
+      s += `<circle class="graphDot" cx="${laneX(nodeLane)}" cy="${midY}" r="${dotRadius()}" fill="${colour}"/>`;
+    }
   }
   s += '</svg>';
   return s;
@@ -997,54 +1058,71 @@ function fmt(v) {
  * non-empty on boundary-anchored sides; dot-anchored sides have no vertical
  * run at all and stay straight); below `TRANSITION_MIN_DX` of lane distance the
  * corner would be sub-pixel, so a straight orthogonal jog is drawn instead.
+ *
+ * On a typed execute-run bundle row (`bundle` is non-null) the node spans
+ * from the entry terminal (above the row midpoint) to the exit terminal
+ * (below it), so a dot-anchored side is re-anchored to the matching terminal
+ * and the shared seam moves with it: an outgoing (child) side starts at the
+ * exit terminal, an incoming (parent) side ends at the entry terminal. Sides
+ * that do not touch the bundle node keep the ordinary row-midpoint seam.
  */
-function buildTransitionPaths(fromLane, toLane, height, startAtDot, endAtDot) {
+function buildTransitionPaths(fromLane, toLane, height, startAtDot, endAtDot, bundle) {
   const x1 = laneX(fromLane);
   const x2 = laneX(toLane);
   const midY = height / 2;
+  // The vertical level of the shared seam: the row midpoint on ordinary rows;
+  // on a bundle row it moves to the exit terminal for an outgoing (child)
+  // anchor and to the entry terminal for an incoming (parent) anchor.
+  const seamY = startAtDot
+    ? (bundle ? bundle.exitY : midY)
+    : endAtDot
+      ? (bundle ? bundle.entryY : midY)
+      : midY;
   const dx = Math.abs(x2 - x1);
   // Each side rounds independently, clamped by ITS vertical run (zero for a
-  // dot-anchored side — no elbow, straight along the row midpoint) and by half
-  // the lane distance.
-  const srcR = startAtDot ? 0 : Math.min(TRANSITION_R, dx / 2, midY);
-  const dstR = endAtDot ? 0 : Math.min(TRANSITION_R, dx / 2, height - midY);
+  // dot-anchored side — no elbow, straight along the seam) and by half the
+  // lane distance.
+  const srcR = startAtDot ? 0 : Math.min(TRANSITION_R, dx / 2, seamY);
+  const dstR = endAtDot ? 0 : Math.min(TRANSITION_R, dx / 2, height - seamY);
   const srcRounded = !startAtDot && dx >= TRANSITION_MIN_DX && srcR > 0;
   const dstRounded = !endAtDot && dx >= TRANSITION_MIN_DX && dstR > 0;
   const sgn = x2 >= x1 ? 1 : -1;
   const srcColour = COLORS[fromLane % COLORS.length];
   const dstColour = COLORS[toLane % COLORS.length];
-  // Geometric midpoint of the two lane centres at the row midpoint — the exact
+  // Geometric midpoint of the two lane centres at the seam level — the exact
   // shared seam (identical formatted numbers in both halves).
   const xm = (x1 + x2) / 2;
   let srcD;
   let dstD;
   if (startAtDot) {
-    // The transition's child node is this row's dot: begin exactly at the dot
-    // and run straight along the row midpoint to the shared seam.
-    srcD = 'M ' + fmt(x1) + ' ' + fmt(midY) + ' L ' + fmt(xm) + ' ' + fmt(midY);
+    // The transition's child node is this row's node mark (the dot, or — on a
+    // bundle row — the exit terminal): begin exactly at the node and run
+    // straight along the seam to the shared seam point.
+    srcD = 'M ' + fmt(x1) + ' ' + fmt(seamY) + ' L ' + fmt(xm) + ' ' + fmt(seamY);
   } else if (srcRounded) {
     srcD = 'M ' + fmt(x1) + ' 0' +
-      ' L ' + fmt(x1) + ' ' + fmt(midY - srcR) +
-      ' Q ' + fmt(x1) + ' ' + fmt(midY) + ' ' + fmt(x1 + sgn * srcR) + ' ' + fmt(midY) +
-      ' L ' + fmt(xm) + ' ' + fmt(midY);
+      ' L ' + fmt(x1) + ' ' + fmt(seamY - srcR) +
+      ' Q ' + fmt(x1) + ' ' + fmt(seamY) + ' ' + fmt(x1 + sgn * srcR) + ' ' + fmt(seamY) +
+      ' L ' + fmt(xm) + ' ' + fmt(seamY);
   } else {
     // Safe straight/near-straight fallback for extreme compressed spacing.
     srcD = 'M ' + fmt(x1) + ' 0' +
-      ' L ' + fmt(x1) + ' ' + fmt(midY) +
-      ' L ' + fmt(xm) + ' ' + fmt(midY);
+      ' L ' + fmt(x1) + ' ' + fmt(seamY) +
+      ' L ' + fmt(xm) + ' ' + fmt(seamY);
   }
   if (endAtDot) {
-    // The transition's parent node is this row's dot: run straight along the
-    // row midpoint from the shared seam and end exactly at the dot.
-    dstD = 'M ' + fmt(xm) + ' ' + fmt(midY) + ' L ' + fmt(x2) + ' ' + fmt(midY);
+    // The transition's parent node is this row's node mark (the dot, or — on a
+    // bundle row — the entry terminal): run straight along the seam from the
+    // shared seam point and end exactly at the node.
+    dstD = 'M ' + fmt(xm) + ' ' + fmt(seamY) + ' L ' + fmt(x2) + ' ' + fmt(seamY);
   } else if (dstRounded) {
-    dstD = 'M ' + fmt(xm) + ' ' + fmt(midY) +
-      ' L ' + fmt(x2 - sgn * dstR) + ' ' + fmt(midY) +
-      ' Q ' + fmt(x2) + ' ' + fmt(midY) + ' ' + fmt(x2) + ' ' + fmt(midY + dstR) +
+    dstD = 'M ' + fmt(xm) + ' ' + fmt(seamY) +
+      ' L ' + fmt(x2 - sgn * dstR) + ' ' + fmt(seamY) +
+      ' Q ' + fmt(x2) + ' ' + fmt(seamY) + ' ' + fmt(x2) + ' ' + fmt(seamY + dstR) +
       ' L ' + fmt(x2) + ' ' + fmt(height);
   } else {
-    dstD = 'M ' + fmt(xm) + ' ' + fmt(midY) +
-      ' L ' + fmt(x2) + ' ' + fmt(midY) +
+    dstD = 'M ' + fmt(xm) + ' ' + fmt(seamY) +
+      ' L ' + fmt(x2) + ' ' + fmt(seamY) +
       ' L ' + fmt(x2) + ' ' + fmt(height);
   }
   return '<path class="graphTransition graphTransitionSrc" d="' + srcD +

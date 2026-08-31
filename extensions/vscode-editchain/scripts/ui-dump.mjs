@@ -412,6 +412,7 @@ async function main() {
   console.log('scenario=' + args.scenario + ' viewport=' + args.viewport);
   console.log('state=' + JSON.stringify(layout.state));
   console.log('svg dots=' + (layout.svg && layout.svg.dots ? layout.svg.dots.length : 0) +
+    ' capsules=' + (layout.svg && layout.svg.capsules ? layout.svg.capsules.length : 0) +
     ' edges=' + (layout.svg && layout.svg.edges ? layout.svg.edges.length : 0));
   console.log('checks pass=' + assertion.passCount + ' fail=' + assertion.failCount);
   failedChecks.forEach((c) => console.log('FAIL ' + c.name + ': ' + c.detail));
@@ -480,6 +481,11 @@ function formatLayoutText(layout) {
     (svg.present ? ' box=' + fmtBox(svg.box) : ''));
   for (const d of (svg.dots || [])) {
     lines.push('dot row=' + d.row + ' center=(' + d.cx + ',' + d.cy + ') r=' + d.r);
+  }
+  for (const c of (svg.capsules || [])) {
+    lines.push('capsule row=' + c.row + ' box=(' + c.x + ',' + c.y + ',' + c.w + ',' + c.h + ')' +
+      (c.entry ? (' entry=(' + c.entry.cx + ',' + c.entry.cy + ')') : '') +
+      (c.exit ? (' exit=(' + c.exit.cx + ',' + c.exit.cy + ')') : ''));
   }
   for (const e of (svg.edges || [])) {
     lines.push('edge len=' + e.len +
