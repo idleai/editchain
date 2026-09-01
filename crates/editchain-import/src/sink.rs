@@ -147,6 +147,10 @@ pub struct CursorValue {
     pub ops_emitted: u64,
     /// Blake3 hash of all content up to `byte_offset` (for integrity).
     pub content_hash: [u8; 32],
+    /// Importer-owned normalized projection version applied to this source.
+    /// Older cursor JSON omits this field and therefore upgrades from zero.
+    #[serde(default)]
+    pub normalization_version: u32,
 }
 
 /// A memory-backed op sink for testing.
@@ -656,6 +660,15 @@ mod tests {
     use tempfile as _;
 
     #[test]
+    fn legacy_cursor_json_defaults_normalization_version_to_zero() {
+        let cursor: CursorValue = serde_json::from_str(
+            r#"{"file_size":42,"byte_offset":40,"ops_emitted":7,"content_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#,
+        )
+        .unwrap();
+        assert_eq!(cursor.normalization_version, 0);
+    }
+
+    #[test]
     fn fs_blob_sink_roundtrips_and_deduplicates() {
         let dir = tempfile::tempdir().unwrap();
         let mut blobs = FsBlobSink::new(dir.path().join("chain/blobs")).unwrap();
@@ -700,6 +713,7 @@ mod tests {
             byte_offset: 40,
             ops_emitted: 7,
             content_hash: [7u8; 32],
+            normalization_version: 0,
         };
 
         {
@@ -755,6 +769,7 @@ mod tests {
             byte_offset: 40,
             ops_emitted: 7,
             content_hash: [7u8; 32],
+            normalization_version: 0,
         };
 
         {

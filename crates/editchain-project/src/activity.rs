@@ -1,8 +1,12 @@
 //! Deterministic Activity-view semantics on top of the canonical projection.
 //!
-//! This module owns the three fixed-view behaviors the unified history service
+//! This module owns the four fixed-view behaviors the unified history service
 //! emits for its Activity profile (and only for that profile):
 //!
+//! - **Inline context checkpoints**
+//!   ([`inline_context_compaction_checkpoints`]): a raw Codex context-compaction
+//!   row remains visible but is inserted into its source stream's existing
+//!   path when legacy/imported topology stored it beside the continuation.
 //! - **Work-unit markers** ([`annotate_activity_rows`]): every row carries an
 //!   opaque unit id plus view-stable `is_start`/`is_end`/`count`/`title`, so a
 //!   client renders unit boundaries without inferring across paged windows.
@@ -32,9 +36,113 @@ use editchain_core::{
     Clock, NodeId, Op, OpId, OpKind, ParentSet, ScopeRef, Tags, TurnId, UnknownOp,
 };
 
-use crate::meta::{sub_op_is_world_state_or_turn_context, NodeMeta};
+use crate::meta::{is_context_compaction_import, sub_op_is_world_state_or_turn_context, NodeMeta};
 use crate::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility};
 use crate::{EffectiveTime, HistoryNode};
+
+/// Keep raw context-compaction checkpoints visible while making them inline in
+/// the Activity view's source-stream path.
+///
+/// Some previously imported Codex histories store a `type: "compacted"` raw
+/// row and the next raw row as siblings of one causal parent. That exact shape
+/// makes a context checkpoint look like a one-row fork even though it records
+/// no execution branch. This Activity-only pass rewrites the next visible raw
+/// row to point through the checkpoint when all of these structural facts hold:
+///
+/// - the checkpoint is identified by its raw JSON envelope, never its summary;
+/// - it and the immediately following visible raw row have the same source
+///   `(node, boot)`, session scope, and sole stored parent;
+/// - the checkpoint does not already have a stored child; and
+/// - neither endpoint participates in a fork/subagent/reconnect relationship.
+///
+/// Already-linear checkpoints and ambiguous/structural shapes are unchanged.
+/// The caller supplies cloned Activity rows, so canonical/Raw topology remains
+/// byte-faithful.
+#[must_use]
+pub fn inline_context_compaction_checkpoints<S: std::hash::BuildHasher>(
+    mut nodes: Vec<HistoryNode>,
+    structural_keys: &HashSet<String, S>,
+) -> Vec<HistoryNode> {
+    let mut streams: HashMap<(u64, u32), Vec<RawRowFacts>> = HashMap::new();
+    let mut stored_parents = HashSet::new();
+    for (index, node) in nodes.iter().enumerate() {
+        if let Some(op) = node_anchor_op(node) {
+            stored_parents.extend(op.parents.iter().copied());
+        }
+        if let Some(facts) = raw_row_facts(node, index) {
+            streams
+                .entry((facts.id.node.0, facts.id.boot))
+                .or_default()
+                .push(facts);
+        }
+    }
+
+    let mut rewrites = Vec::new();
+    for stream in streams.values_mut() {
+        stream.sort_unstable_by_key(|facts| facts.id.seq);
+        for pair in stream.windows(2) {
+            let [checkpoint, continuation] = pair else {
+                continue;
+            };
+            if !checkpoint.is_compaction
+                || checkpoint.scope != continuation.scope
+                || checkpoint.sole_parent.is_none()
+                || checkpoint.sole_parent != continuation.sole_parent
+                || stored_parents.contains(&checkpoint.id)
+                || structural_keys.contains(&checkpoint.id.to_string())
+                || structural_keys.contains(&continuation.id.to_string())
+            {
+                continue;
+            }
+            let Some(parent) = checkpoint.sole_parent else {
+                continue;
+            };
+            if parent.node != checkpoint.id.node || parent.boot != checkpoint.id.boot {
+                continue;
+            }
+            rewrites.push((continuation.index, checkpoint.id));
+        }
+    }
+
+    for (index, checkpoint) in rewrites {
+        if let Some(continuation) = nodes.get_mut(index) {
+            continuation.set_parent_keys(&[checkpoint.to_string()]);
+        }
+    }
+    nodes
+}
+
+/// Exact source-stream facts needed by context-checkpoint inlining.
+#[derive(Debug, Clone, Copy)]
+struct RawRowFacts {
+    index: usize,
+    id: OpId,
+    scope: ScopeRef,
+    sole_parent: Option<OpId>,
+    is_compaction: bool,
+}
+
+/// Extract facts only from raw import rows; normalized or synthetic rows can
+/// never become a context-checkpoint continuation.
+#[must_use]
+fn raw_row_facts(node: &HistoryNode, index: usize) -> Option<RawRowFacts> {
+    let HistoryNode::CollapsedImport { op, .. } = node else {
+        return None;
+    };
+    if !matches!(&op.kind, OpKind::Import(_)) {
+        return None;
+    }
+    let mut parents = op.parents.iter().copied();
+    let first_parent = parents.next();
+    let sole_parent = first_parent.filter(|_| parents.next().is_none());
+    Some(RawRowFacts {
+        index,
+        id: op.id,
+        scope: op.scope,
+        sole_parent,
+        is_compaction: is_context_compaction_import(op.as_ref()),
+    })
+}
 
 /// Stable metadata for the work unit one view row belongs to.
 ///

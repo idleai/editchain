@@ -213,7 +213,8 @@ describe('EditChain History Explorer', () => {
       const candidate = rendered.find((element) => {
         const abs = Number(element.getAttribute('data-row'));
         const row = window.__editchainRowAt?.(abs);
-        return row && !row.is_subop && (row.op_id || row.git_oid);
+        return row && !row.is_subop && !(row.sub_ops || []).length &&
+          (row.op_id || row.git_oid);
       });
       if (!candidate) throw new Error('no rendered raw-JSON-capable row');
       const keys = rendered.slice(0, 8).map((row) => row.getAttribute('data-key'));
@@ -531,8 +532,14 @@ describe('EditChain History Explorer', () => {
             startRows++;
             const countEl = el.querySelector('.work-unit-count');
             const text = countEl ? (countEl.textContent || '').trim() : '';
-            if (!countEl || !/^\d+/.test(text) || Number(/^\d+/.exec(text)[0]) !== row.work_unit.count) {
-              problems.push('work-unit count text "' + text + '" != ' + row.work_unit.count + ' on ' + abs);
+            const expectsCount = row.activity_kind !== 'source_control' &&
+              row.work_unit.count > 1;
+            if (!!countEl !== expectsCount) {
+              problems.push('work-unit count visibility mismatch on ' + abs);
+            } else if (countEl && (!/^\d+/.test(text) ||
+                Number(/^\d+/.exec(text)![0]) !== row.work_unit.count ||
+                !/entr(?:y|ies)$/.test(text))) {
+              problems.push('work-unit entry count text "' + text + '" != ' + row.work_unit.count + ' on ' + abs);
             }
           }
         }

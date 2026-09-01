@@ -22,7 +22,8 @@ use editchain_core::{
     ParentSet, PathId, Payload, ScopeRef, SessionId, Tags, ToolOp, ToolStage, TurnId,
 };
 use editchain_project::activity::{
-    annotate_activity_rows, bundle_activity_execute_runs, ActivityRowAnnotation,
+    annotate_activity_rows, bundle_activity_execute_runs, inline_context_compaction_checkpoints,
+    ActivityRowAnnotation,
 };
 use editchain_project::filter::ChainFilter;
 use editchain_project::meta::NodeMeta;
@@ -218,6 +219,105 @@ fn activity_view(ops: Vec<Op>) -> (Vec<HistoryNode>, Vec<ActivityRowAnnotation>)
     let nodes = projection.filtered_nodes(&activity_filter());
     let annotations = annotate_activity_rows(&nodes);
     (nodes, annotations)
+}
+
+#[test]
+fn context_compaction_stays_visible_and_is_inlined_without_changing_raw() {
+    // Legacy shape: root has two children in one physical source stream — the
+    // compaction checkpoint and the immediately following continuation. Raw
+    // retains those exact siblings; Activity routes continuation through the
+    // visible checkpoint so all three render on one lane.
+    let root = import_op(7, 1, None, None);
+    let root_message = message_child(107, 101, root.id, "request", 1);
+    let mut compacted = import_op(7, 2, Some(root.id), None);
+    compacted.tags |= Tags::STRUCTURAL;
+    compacted.kind = OpKind::Import(ImportOp {
+        raw_ref: Payload::Inline(
+            br#"{"type":"compacted","payload":{"message":"","replacement_history":[]}}"#.to_vec(),
+        ),
+        raw_hash: None,
+    });
+    let continuation = import_op(7, 3, Some(root.id), None);
+    let continuation_message = message_child(207, 103, continuation.id, "continued", 1);
+    let projection = HistoryProjection::from_ops(vec![
+        root.clone(),
+        root_message,
+        compacted.clone(),
+        continuation.clone(),
+        continuation_message,
+    ]);
+
+    let raw = projection.nodes();
+    let raw_continuation = raw
+        .iter()
+        .find(|node| node.node_key() == continuation.id.to_string())
+        .unwrap_or_else(|| panic!("raw continuation missing"));
+    assert_eq!(
+        raw_continuation.parent_keys(&projection.git.links, projection.relationship_notes()),
+        vec![root.id.to_string()],
+        "Raw keeps the imported sibling topology"
+    );
+
+    let filtered = projection.filtered_nodes(&activity_filter());
+    let structural = projection.structural_row_keys(&filtered);
+    let activity = inline_context_compaction_checkpoints(filtered, &structural);
+    assert_eq!(activity.len(), 3, "the checkpoint remains a visible row");
+    let checkpoint = activity
+        .iter()
+        .find(|node| node.node_key() == compacted.id.to_string())
+        .unwrap_or_else(|| panic!("Activity checkpoint missing"));
+    assert_eq!(checkpoint.visibility(), Visibility::Primary);
+    assert_eq!(checkpoint.activity_kind(), ActivityKind::Plan);
+    assert_eq!(
+        checkpoint.parent_keys(&projection.git.links, projection.relationship_notes()),
+        vec![root.id.to_string()]
+    );
+    let activity_continuation = activity
+        .iter()
+        .find(|node| node.node_key() == continuation.id.to_string())
+        .unwrap_or_else(|| panic!("Activity continuation missing"));
+    assert_eq!(
+        activity_continuation.parent_keys(&projection.git.links, projection.relationship_notes()),
+        vec![compacted.id.to_string()],
+        "Activity inserts the continuation after the visible checkpoint"
+    );
+    let layout = projection.graph_layout_filtered(&activity);
+    assert!(
+        layout.rows.iter().all(|row| row.lane == 0),
+        "an inline checkpoint must not allocate a branch lane"
+    );
+}
+
+#[test]
+fn context_compaction_does_not_rewire_a_structural_continuation() {
+    let root = import_op(8, 1, None, None);
+    let root_message = message_child(108, 101, root.id, "request", 1);
+    let mut compacted = import_op(8, 2, Some(root.id), None);
+    compacted.kind = OpKind::Import(ImportOp {
+        raw_ref: Payload::Inline(br#"{"type":"compacted","payload":{"message":""}}"#.to_vec()),
+        raw_hash: None,
+    });
+    let continuation = import_op(8, 3, Some(root.id), None);
+    let continuation_message = message_child(208, 103, continuation.id, "continued", 1);
+    let projection = HistoryProjection::from_ops(vec![
+        root.clone(),
+        root_message,
+        compacted,
+        continuation.clone(),
+        continuation_message,
+    ]);
+    let filtered = projection.filtered_nodes(&activity_filter());
+    let structural = HashSet::from([continuation.id.to_string()]);
+    let activity = inline_context_compaction_checkpoints(filtered, &structural);
+    let kept = activity
+        .iter()
+        .find(|node| node.node_key() == continuation.id.to_string())
+        .unwrap_or_else(|| panic!("structural continuation missing"));
+    assert_eq!(
+        kept.parent_keys(&projection.git.links, projection.relationship_notes()),
+        vec![root.id.to_string()],
+        "structural fork/subagent/reconnect endpoints are never rewritten"
+    );
 }
 
 /// Run the Activity bundling pass over a node list with fresh annotations.

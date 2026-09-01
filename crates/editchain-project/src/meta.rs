@@ -34,10 +34,10 @@
 //!    non-narrative normalized content (Tool/Command/File/Reflection/Error
 //!    child) stays visible because the event row cannot canonically replace
 //!    that content.
-//!
 //! Outcomes are only ever `Success`/`Failure`/`Cancelled` when the raw JSON
-//! carries structured evidence (`status`, `errorMessage`, `exitCode`); absent
-//! evidence always yields `Outcome::Unknown`.
+//! carries structured evidence (`status`, `errorMessage`, `exitCode`, or the
+//! canonical Codex execution-result envelope); absent evidence always yields
+//! `Outcome::Unknown`.
 
 use std::collections::HashMap;
 
@@ -710,6 +710,9 @@ fn raw_status_outcome(raw: Option<&Value>) -> Option<Outcome> {
             Some(Outcome::Failure)
         };
     }
+    if let Some(outcome) = codex_exec_output_outcome(value) {
+        return Some(outcome);
+    }
     let status = value
         .pointer("/payload/item/status")
         .or_else(|| value.pointer("/payload/status"))
@@ -718,6 +721,44 @@ fn raw_status_outcome(raw: Option<&Value>) -> Option<Outcome> {
         Some("completed" | "success" | "succeeded" | "ok") => Some(Outcome::Success),
         Some("error" | "failed" | "failure") => Some(Outcome::Failure),
         Some("cancelled" | "canceled" | "aborted") => Some(Outcome::Cancelled),
+        _ => None,
+    }
+}
+
+/// Read the concluded state from Codex's canonical custom-exec result header.
+///
+/// Codex persists `exec` results as a `custom_tool_call_output` whose first
+/// typed text block is a small machine-generated envelope:
+/// `Script completed|failed`, `Wall time … seconds`, then `Output:`. The raw
+/// record does not carry an `exitCode` or separate failure boolean, so this
+/// exact envelope is its only durable status field. Requiring the record type,
+/// payload type, block type, and all three header lines avoids classifying
+/// arbitrary narrative text or a display summary.
+#[must_use]
+fn codex_exec_output_outcome(value: &Value) -> Option<Outcome> {
+    if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    if payload.get("type").and_then(Value::as_str) != Some("custom_tool_call_output") {
+        return None;
+    }
+    let first = payload.get("output")?.as_array()?.first()?;
+    if first.get("type").and_then(Value::as_str) != Some("input_text") {
+        return None;
+    }
+    let mut lines = first.get("text")?.as_str()?.lines();
+    let status = lines.next()?;
+    let wall_time = lines.next()?;
+    if !wall_time.starts_with("Wall time ")
+        || !wall_time.ends_with(" seconds")
+        || lines.next() != Some("Output:")
+    {
+        return None;
+    }
+    match status {
+        "Script completed" => Some(Outcome::Success),
+        "Script failed" => Some(Outcome::Failure),
         _ => None,
     }
 }
@@ -793,6 +834,17 @@ fn raw_payload_meta(raw: Option<&Value>, turn_id: Option<TurnId>) -> NodeMeta {
         outcome: Outcome::Unknown,
         turn_id,
     }
+}
+
+/// Whether an op is the raw Codex context-compaction checkpoint envelope.
+///
+/// Activity topology uses this exact provider structure rather than display
+/// summaries, tags, timestamps, or text matching. Other providers and future
+/// structural records therefore cannot be mistaken for a compaction.
+#[must_use]
+pub(crate) fn is_context_compaction_import(op: &Op) -> bool {
+    raw_import_json(op)
+        .is_some_and(|value| value.get("type").and_then(Value::as_str) == Some("compacted"))
 }
 
 /// The turn identity of a turn-scoped op, if any.

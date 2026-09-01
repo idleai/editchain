@@ -21,8 +21,8 @@ use serde as _;
 use serde_json as _;
 
 use editchain_core::{
-    ActorId, Clock, ImportOp, MessageOp, NodeId, Op, OpId, OpKind, ParentSet, Payload, ScopeRef,
-    SessionId, Tags, ToolOp, ToolStage,
+    ActorId, Clock, GitLink, GitLinkKind, GitOid, ImportOp, MessageOp, NodeId, Op, OpId, OpKind,
+    ParentSet, Payload, ScopeRef, SessionId, Tags, ToolOp, ToolStage,
 };
 use editchain_import::BlobSink as _;
 use editchain_project::filter::ChainFilter;
@@ -213,6 +213,100 @@ fn run(dir: &Path, args: &[&str]) {
         .status()
         .expect("run git");
     assert!(status.success(), "git {args:?} failed");
+}
+
+fn git_stdout(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(output.status.success(), "git {args:?} failed");
+    String::from_utf8(output.stdout)
+        .expect("git stdout is UTF-8")
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn open_resolves_exact_session_base_outside_current_head_history() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = make_git_repo(tmp.path());
+    let session_base_hex = git_stdout(&repo, &["rev-parse", "HEAD"]);
+
+    run(&repo, &["checkout", "-q", "--orphan", "other"]);
+    std::fs::write(repo.join("file.txt"), b"unrelated branch\n").expect("write branch file");
+    run(&repo, &["add", "file.txt"]);
+    run(
+        &repo,
+        &[
+            "-c",
+            "user.name=Alice",
+            "-c",
+            "user.email=alice@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "unrelated head",
+        ],
+    );
+    assert_ne!(session_base_hex, git_stdout(&repo, &["rev-parse", "HEAD"]));
+
+    let repository = editchain_git::repository_id_from_path(&repo.join(".git"));
+    let session_base = GitOid::from_hex(&session_base_hex).expect("full commit oid");
+    let source = Op {
+        id: OpId::new(NodeId(44), 0, 1),
+        parents: ParentSet::None,
+        actor: ActorId(1),
+        clock: Clock::UnixMs(1),
+        scope: ScopeRef::Session(SessionId(44)),
+        tags: Tags::IMPORT,
+        kind: OpKind::Import(ImportOp {
+            raw_ref: Payload::Inline(b"session_meta".to_vec()),
+            raw_hash: None,
+        }),
+    };
+    let link_record = Op {
+        id: OpId::new(NodeId(44), 0, 2),
+        parents: ParentSet::One(source.id),
+        actor: ActorId(1),
+        clock: Clock::None,
+        scope: source.scope,
+        tags: Tags::IMPORT | Tags::META,
+        kind: OpKind::GitLink(GitLink {
+            source: source.id,
+            target_repo: repository,
+            target_oid: session_base,
+            kind: GitLinkKind::BasedOn,
+        }),
+    };
+    let mut page = editchain_codec::page::Page::new(0);
+    page.add_record(0, editchain_codec::frame::encode_op(&source).unwrap());
+    page.add_record(0, editchain_codec::frame::encode_op(&link_record).unwrap());
+    write_page(&repo.join(".editchain"), &page);
+
+    let workspace = Workspace::open(repo.to_str().unwrap(), ".editchain").unwrap();
+    assert!(
+        workspace
+            .projection
+            .git
+            .commit(repository, &session_base)
+            .is_some(),
+        "the exact durable target must load even when HEAD cannot reach it"
+    );
+    let session_node = workspace
+        .projection
+        .nodes()
+        .into_iter()
+        .find(|node| node.node_key() == source.id.to_string())
+        .expect("session start node");
+    assert!(
+        workspace
+            .projection
+            .lifted_parent_keys(&session_node)
+            .contains(&session_base.to_hex()),
+        "the exact BasedOn relation must branch the session from its start commit"
+    );
 }
 
 #[test]
@@ -1753,13 +1847,14 @@ fn service_path_truncated_echo_texts_never_pair_but_untruncated_exact_pairs_do()
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_seven() {
+fn prepared_snapshot_manifest_records_projection_revision_nine() {
     // Stale snapshots from earlier projection revisions (pre-hide_trace,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
     // duplicate-pair exclusion, pre prefix-string escape decoding, and pre
-    // Activity work-unit/promotion/execute-run-bundling semantics) must not be
-    // served silently: the revision participates in the snapshot identity hash.
+    // Activity work-unit/promotion/execute-run-bundling and inline-compaction
+    // semantics) must not be served silently: the revision participates in the
+    // snapshot identity hash.
     let tmp = tempfile::tempdir().expect("tempdir");
     let chain_dir = tmp.path().join(".editchain");
     let first = msg_op(41, 1, b"snapshot first");
@@ -1774,7 +1869,109 @@ fn prepared_snapshot_manifest_records_projection_revision_seven() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 7u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 9u64);
+}
+
+#[test]
+fn activity_keeps_context_compaction_visible_and_inline_while_raw_stays_exact() {
+    let root = raw_import_op(
+        9,
+        1,
+        1_000,
+        None,
+        r#"{"type":"response_item","payload":{"type":"message"}}"#,
+    );
+    let root_message = turn_message_child(109, 101, root.id, 1, "request");
+    let mut compacted = raw_import_op(
+        9,
+        2,
+        2_000,
+        Some(root.id),
+        r#"{"type":"compacted","payload":{"message":"","replacement_history":[]}}"#,
+    );
+    compacted.tags |= Tags::STRUCTURAL;
+    let continuation = raw_import_op(
+        9,
+        3,
+        3_000,
+        Some(root.id),
+        r#"{"type":"response_item","payload":{"type":"message"}}"#,
+    );
+    let continuation_message = turn_message_child(209, 103, continuation.id, 1, "continued");
+    let projection = HistoryProjection::from_ops(vec![
+        root.clone(),
+        root_message,
+        compacted.clone(),
+        continuation.clone(),
+        continuation_message,
+    ]);
+    let mut ws = Workspace::from_projection(projection);
+    let fixed = ChainFilter::new(
+        String::new(),
+        String::new(),
+        String::new(),
+        false,
+        true,
+        true,
+    );
+
+    let activity = ws.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 100,
+        hide_submodules: true,
+        filter: &fixed,
+        include_layout: true,
+    });
+    let activity_rows: Vec<&HistoryRow> =
+        activity.rows.iter().filter(|row| !row.is_subop).collect();
+    assert_eq!(activity_rows.len(), 3);
+    let activity_checkpoint = activity_rows
+        .iter()
+        .copied()
+        .find(|row| row.node_key == compacted.id.to_string())
+        .expect("Activity keeps the compaction checkpoint");
+    assert_eq!(activity_checkpoint.visibility, Visibility::Primary);
+    assert_eq!(activity_checkpoint.activity_kind, ActivityKind::Plan);
+    assert_eq!(activity_checkpoint.parents, vec![root.id.to_string()]);
+    let activity_continuation = activity_rows
+        .iter()
+        .copied()
+        .find(|row| row.node_key == continuation.id.to_string())
+        .expect("Activity continuation");
+    assert_eq!(
+        activity_continuation.parents,
+        vec![compacted.id.to_string()]
+    );
+    assert!(
+        activity_rows
+            .iter()
+            .all(|row| row.lane == activity_checkpoint.lane),
+        "checkpoint and continuation stay on the session lane"
+    );
+
+    let raw = ws.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 100,
+        hide_submodules: true,
+        filter: &no_filter(),
+        include_layout: true,
+    });
+    let raw_checkpoint = raw
+        .rows
+        .iter()
+        .find(|row| row.node_key == compacted.id.to_string())
+        .expect("Raw keeps the compaction checkpoint");
+    assert_eq!(raw_checkpoint.visibility, Visibility::Primary);
+    let raw_continuation = raw
+        .rows
+        .iter()
+        .find(|row| row.node_key == continuation.id.to_string())
+        .expect("Raw continuation");
+    assert_eq!(
+        raw_continuation.parents,
+        vec![root.id.to_string()],
+        "Raw preserves the imported sibling topology"
+    );
 }
 
 #[test]
@@ -1932,7 +2129,7 @@ fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() 
 }
 
 #[test]
-fn prepared_snapshot_serves_bundled_activity_view_and_records_revision_seven() {
+fn prepared_snapshot_serves_bundled_activity_view_and_records_revision_nine() {
     // The pregenerated render snapshot must serve the SAME bundled Activity
     // rows as the live projection (work-unit/promotion/bundling parity) and
     // record the bumped projection revision in its identity.
@@ -1988,7 +2185,7 @@ fn prepared_snapshot_serves_bundled_activity_view_and_records_revision_seven() {
         &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["identity"]["projection_revision"], 7u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 9u64);
 
     let mut cached =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");

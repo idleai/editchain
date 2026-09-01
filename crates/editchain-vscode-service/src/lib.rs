@@ -37,7 +37,7 @@ use editchain_protocol::{
     ChainFilterDto, GraphLayout as ProtocolGraphLayout, HistoryRow, HistoryWindow, LayoutEdge,
     LayoutPoint, LayoutRow, NodeDetails, ParentRelationDto, ParentRelationKind, RepositoryInfo,
     Request, RequestBody, ResolvedObject, Response, ResponseBody, SearchFiltersDto, SearchHit,
-    SearchResponse, WorkUnitDto,
+    SearchResponse, SessionMetaDto, WorkUnitDto,
 };
 use editchain_query::search::{SearchFilters, Source};
 
@@ -54,6 +54,9 @@ pub struct Workspace {
     source_ops: Vec<Op>,
     /// Constant-time lookup into `source_ops` for detail requests.
     source_op_index: HashMap<OpId, usize>,
+    /// Small session provenance labels keyed by the same `session:<id>` group
+    /// strings used by projected history rows.
+    session_metadata: HashMap<String, SessionMetaDto>,
     /// Accepted operation ids and exact segment-record locations. This is
     /// persisted into render snapshots so details remain lazy on the fast path.
     source_op_locations: Vec<SnapshotOpLocator>,
@@ -667,9 +670,10 @@ fn compact_import_payload(
 /// bounded structural/content signal for tool-payload carriers
 /// (`arguments`/`input`/`parameters`), and structured outcome evidence
 /// (`status`, `exitCode`, `errorMessage` at `payload` or `payload.item`
-/// level). Large outputs stay bounded to the display preview
-/// limits, and blob-backed imports pass through the same bounded preview
-/// path, so the full record is never copied into the projection.
+/// level, plus the canonical three-line Codex execution-result header).
+/// Large outputs stay bounded to the display preview limits, and blob-backed
+/// imports pass through the same bounded preview path, so the full record is
+/// never copied into the projection.
 #[must_use]
 fn compact_import_record(bytes: &[u8]) -> Vec<u8> {
     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
@@ -689,7 +693,15 @@ fn compact_import_record(bytes: &[u8]) -> Vec<u8> {
         "type".to_string(),
         serde_json::Value::String(record_type.to_string()),
     ));
-    if record_type == "event_msg" || record_type == "response_item" {
+    if record_type == "session_meta" {
+        let payload_start = raw.find("\"payload\"").unwrap_or(0);
+        let mut payload = serde_json::Map::new();
+        let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "model_provider");
+        let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "agent_nickname");
+        if !payload.is_empty() {
+            drop(compact.insert("payload".to_string(), serde_json::Value::Object(payload)));
+        }
+    } else if record_type == "event_msg" || record_type == "response_item" {
         let payload_start = raw.find("\"payload\"").unwrap_or(0);
         let mut payload = serde_json::Map::new();
         // Whether the echo message text (`payload.message` on an
@@ -725,6 +737,7 @@ fn compact_import_record(bytes: &[u8]) -> Vec<u8> {
         let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "parameters");
         copy_preview_structured(&raw, payload_start, &mut payload, "parameters");
         let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "output");
+        copy_codex_exec_output_header_from_prefix(&raw, payload_start, &mut payload);
         if let Some(content_start) = raw
             .get(payload_start..)
             .and_then(|tail| tail.find("\"content\""))
@@ -824,6 +837,10 @@ fn compact_import_value(value: &serde_json::Value) -> serde_json::Value {
         // so the classifier is told explicitly instead of guessing from the
         // ellipsis.
         let mut echo_text_truncated = false;
+        if record_type == "session_meta" {
+            let _: bool = copy_bounded_field(payload, &mut compact_payload, "model_provider");
+            let _: bool = copy_bounded_field(payload, &mut compact_payload, "agent_nickname");
+        }
         copy_string_field(payload, &mut compact_payload, "type");
         copy_string_field(payload, &mut compact_payload, "role");
         echo_text_truncated |= copy_bounded_field(payload, &mut compact_payload, "message");
@@ -832,6 +849,7 @@ fn compact_import_value(value: &serde_json::Value) -> serde_json::Value {
         copy_structured_payload_field(payload, &mut compact_payload, "input");
         copy_structured_payload_field(payload, &mut compact_payload, "parameters");
         let _: bool = copy_bounded_field(payload, &mut compact_payload, "output");
+        copy_codex_exec_output_header(payload, &mut compact_payload);
         let _: bool = copy_bounded_field(payload, &mut compact_payload, "status");
         let _: bool = copy_bounded_field(payload, &mut compact_payload, "errorMessage");
         copy_i64_field(payload, &mut compact_payload, "exitCode");
@@ -910,6 +928,90 @@ fn copy_bounded_field(
     let (compact, truncated) = compact_text_with_signal(value);
     drop(out.insert(key.to_string(), serde_json::Value::String(compact)));
     truncated
+}
+
+/// Retain only the canonical three-line status header from a fully parsed
+/// Codex custom-exec output array.
+///
+/// The normalized Tool child keeps the complete bounded result preview. This
+/// small raw-envelope copy exists solely so projection outcome classification
+/// does not lose its structured evidence during service compaction.
+fn copy_codex_exec_output_header(
+    payload: &serde_json::Value,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if payload.get("type").and_then(serde_json::Value::as_str) != Some("custom_tool_call_output") {
+        return;
+    }
+    let Some(first) = payload
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|blocks| blocks.first())
+    else {
+        return;
+    };
+    if first.get("type").and_then(serde_json::Value::as_str) != Some("input_text") {
+        return;
+    }
+    let Some(header) = first
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .and_then(codex_exec_output_header)
+    else {
+        return;
+    };
+    drop(out.insert(
+        "output".to_string(),
+        serde_json::json!([{ "type": "input_text", "text": header }]),
+    ));
+}
+
+/// Recover the same canonical header when a blob preview ends before the raw
+/// JSON record closes and therefore cannot be fully parsed.
+fn copy_codex_exec_output_header_from_prefix(
+    raw: &str,
+    payload_start: usize,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if out.get("type").and_then(serde_json::Value::as_str) != Some("custom_tool_call_output") {
+        return;
+    }
+    let Some(output_rel) = raw
+        .get(payload_start..)
+        .and_then(|tail| tail.find("\"output\""))
+    else {
+        return;
+    };
+    let output_start = payload_start.saturating_add(output_rel);
+    let Some((encoded, _)) = json_string_field_preview(raw, "text", output_start) else {
+        return;
+    };
+    let decoded = decode_json_string_preview(encoded);
+    let Some(header) = codex_exec_output_header(&decoded) else {
+        return;
+    };
+    drop(out.insert(
+        "output".to_string(),
+        serde_json::json!([{ "type": "input_text", "text": header }]),
+    ));
+}
+
+/// Validate and bound Codex's machine-generated execution-result header.
+#[must_use]
+fn codex_exec_output_header(text: &str) -> Option<String> {
+    let mut lines = text.lines();
+    let status = lines.next()?;
+    if !matches!(status, "Script completed" | "Script failed") {
+        return None;
+    }
+    let wall_time = lines.next()?;
+    if !wall_time.starts_with("Wall time ")
+        || !wall_time.ends_with(" seconds")
+        || lines.next() != Some("Output:")
+    {
+        return None;
+    }
+    Some(format!("{status}\n{wall_time}\nOutput:"))
 }
 
 /// Copy one structured tool-payload carrier (`arguments`/`input`/
@@ -1355,6 +1457,7 @@ impl Workspace {
     #[must_use]
     pub fn from_projection(projection: HistoryProjection) -> Self {
         let source_ops = projection.ops.clone();
+        let session_metadata = session_metadata_index(&projection.ops);
         let source_op_index = source_ops
             .iter()
             .enumerate()
@@ -1364,6 +1467,7 @@ impl Workspace {
             projection,
             source_ops,
             source_op_index,
+            session_metadata,
             source_op_locations: Vec::new(),
             blob_resolver: None,
             repositories: Vec::new(),
@@ -1399,6 +1503,7 @@ impl Workspace {
                     projection: HistoryProjection::from_ops_with(Vec::new(), projection_options()),
                     source_ops: Vec::new(),
                     source_op_index: HashMap::new(),
+                    session_metadata: HashMap::new(),
                     source_op_locations: Vec::new(),
                     blob_resolver: Some(BlobResolver::open(&chain_path)?),
                     repositories,
@@ -1446,17 +1551,21 @@ impl Workspace {
                 projection.merge_git_commits(commits);
             }
         }
-        // Stitch sessions and git history into a single edit chain.
-        projection.link_history();
+        // A session may have started on a commit that is no longer reachable
+        // from the repository's current HEAD. Resolve only the exact OIDs
+        // carried by durable GitLink ops; never guess from timestamps or text.
+        merge_exact_git_link_targets(&mut projection, &repositories);
         let source_op_index = source_ops
             .iter()
             .enumerate()
             .map(|(index, op)| (op.id, index))
             .collect();
+        let session_metadata = session_metadata_index(&projection.ops);
         Ok(Self {
             projection,
             source_ops,
             source_op_index,
+            session_metadata,
             source_op_locations,
             blob_resolver: Some(resolver),
             repositories,
@@ -1483,6 +1592,7 @@ impl Workspace {
         self.projection = loaded.projection;
         self.source_ops = loaded.source_ops;
         self.source_op_index = loaded.source_op_index;
+        self.session_metadata = loaded.session_metadata;
         self.source_op_locations = loaded.source_op_locations;
         self.blob_resolver = loaded.blob_resolver;
         self.diagnostics = loaded.diagnostics;
@@ -1633,6 +1743,8 @@ impl Workspace {
                 },
             );
             let parent_row = block_start;
+            let group = node.group();
+            let session_meta = self.session_metadata.get(&group).cloned();
             // Emit the parent row if it falls inside the window.
             if block_start >= offset_usize && block_start < end_usize {
                 // Parents come from the cached LayoutContext for THIS exact
@@ -1666,7 +1778,7 @@ impl Workspace {
                     repository: node.repository().map(|rid| rid.0.to_string()),
                     summary: node.summary(),
                     timestamp_ms: node.timestamp_ms(),
-                    group: node.group(),
+                    group: group.clone(),
                     node_key: node.node_key(),
                     parents,
                     parent_relations,
@@ -1690,6 +1802,7 @@ impl Workspace {
                     visibility: node.visibility(),
                     outcome: node.outcome(),
                     turn_id: node.turn_id().map(|id| id.0.to_string()),
+                    session_meta: session_meta.clone(),
                     work_unit: snapshot
                         .annotations
                         .get(abs_idx)
@@ -1736,7 +1849,7 @@ impl Workspace {
                     repository: None,
                     summary: sub.summary.clone(),
                     timestamp_ms: sub.timestamp_ms,
-                    group: node.group(),
+                    group: group.clone(),
                     // Sub-op rows are not graph nodes; key them under their parent so
                     // group-start detection and click routing stay unambiguous.
                     node_key: format!("{}::sub:{i}", node.node_key()),
@@ -1763,6 +1876,7 @@ impl Workspace {
                     visibility: Visibility::Supporting,
                     outcome: Outcome::Unknown,
                     turn_id: node.turn_id().map(|id| id.0.to_string()),
+                    session_meta: session_meta.clone(),
                     work_unit: None,
                     promoted: false,
                     activity_bundle: None,
@@ -1805,17 +1919,24 @@ impl Workspace {
             all_nodes
         };
         // Activity-view semantics: every view gets deterministic work-unit and
-        // promotion annotations; the fixed Activity view additionally folds
-        // safe low-signal execute runs (never the raw profile, which must stay
-        // exact and ordered). Annotations are recomputed on the final list so
-        // bundle rows carry their own unit markers.
+        // promotion annotations. The fixed Activity view additionally keeps
+        // context-compaction checkpoints inline and folds safe low-signal
+        // execute runs (never the Raw profile, whose topology stays exact).
+        // Annotations are recomputed on the final list so bundle rows carry
+        // their own unit markers.
+        let is_activity = filter.key() == fixed_view_filter().key();
+        let structural = is_activity.then(|| self.projection.structural_row_keys(&nodes));
+        let nodes = if let Some(structural) = structural.as_ref() {
+            editchain_project::activity::inline_context_compaction_checkpoints(nodes, structural)
+        } else {
+            nodes
+        };
         let mut annotations = editchain_project::activity::annotate_activity_rows(&nodes);
-        let nodes = if filter.key() == fixed_view_filter().key() {
-            let structural = self.projection.structural_row_keys(&nodes);
+        let nodes = if let Some(structural) = structural.as_ref() {
             editchain_project::activity::bundle_activity_execute_runs(
                 nodes,
                 &annotations,
-                &structural,
+                structural,
             )
         } else {
             nodes
@@ -2364,6 +2485,61 @@ fn work_unit_dto(marker: &WorkUnitMarker) -> WorkUnitDto {
         title: marker.title.clone(),
         count: marker.count,
     }
+}
+
+/// Collect the two session-provenance labels the history UI is allowed to
+/// surface. Raw `session_meta` records remain authoritative; this index only
+/// avoids making the webview parse provider JSON or repeat large payloads.
+#[must_use]
+fn session_metadata_index(ops: &[Op]) -> HashMap<String, SessionMetaDto> {
+    let mut by_group = HashMap::<String, SessionMetaDto>::new();
+    for op in ops {
+        let ScopeRef::Session(session_id) = op.scope else {
+            continue;
+        };
+        let Some(found) = session_metadata_from_op(op) else {
+            continue;
+        };
+        let entry = by_group
+            .entry(format!("session:{}", session_id.0))
+            .or_default();
+        if entry.model_provider.is_none() {
+            entry.model_provider = found.model_provider;
+        }
+        if entry.agent_nickname.is_none() {
+            entry.agent_nickname = found.agent_nickname;
+        }
+    }
+    by_group
+}
+
+/// Parse the bounded projection copy of one raw Codex `session_meta` import.
+#[must_use]
+fn session_metadata_from_op(op: &Op) -> Option<SessionMetaDto> {
+    let OpKind::Import(import) = &op.kind else {
+        return None;
+    };
+    let Payload::Inline(raw) = &import.raw_ref else {
+        return None;
+    };
+    let value = serde_json::from_slice::<serde_json::Value>(raw).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    let display_field = |name: &str| {
+        payload
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    };
+    let metadata = SessionMetaDto {
+        model_provider: display_field("model_provider"),
+        agent_nickname: display_field("agent_nickname"),
+    };
+    (metadata.model_provider.is_some() || metadata.agent_nickname.is_some()).then_some(metadata)
 }
 
 /// Typed Activity-view bundle metadata for a top-level row.
@@ -3016,6 +3192,44 @@ fn open_repository_handle(
         repo,
         discovery: discovery.clone(),
     })
+}
+
+/// Resolve exact durable Git-link targets that the current HEAD walk did not
+/// include (for example, a session started on a branch that was later switched).
+fn merge_exact_git_link_targets(
+    projection: &mut HistoryProjection,
+    repositories: &[editchain_git::RepositoryDiscovery],
+) {
+    let targets: std::collections::BTreeSet<(RepositoryId, GitOid)> = projection
+        .git
+        .links
+        .values()
+        .flatten()
+        .map(|link| (link.target_repo, link.target_oid))
+        .filter(|target| !projection.git.commits.contains_key(target))
+        .collect();
+
+    for discovery in repositories {
+        let repository_targets: Vec<GitOid> = targets
+            .iter()
+            .filter_map(|(repository, oid)| (*repository == discovery.id).then_some(*oid))
+            .collect();
+        if repository_targets.is_empty() {
+            continue;
+        }
+        let Ok(handle) = open_repository_handle(discovery) else {
+            continue;
+        };
+        let commits: Vec<_> = repository_targets
+            .iter()
+            .filter_map(|oid| {
+                resolve_commit(&handle, oid)
+                    .ok()
+                    .map(|result| result.commit)
+            })
+            .collect();
+        projection.merge_git_commits(commits);
+    }
 }
 
 /// A stateful server that owns a loaded workspace across requests.
@@ -4450,6 +4664,7 @@ mod tests {
             projection,
             source_ops: vec![source.clone()],
             source_op_index,
+            session_metadata: HashMap::new(),
             source_op_locations: Vec::new(),
             blob_resolver: Some(resolver),
             repositories: Vec::new(),
@@ -4499,6 +4714,36 @@ mod tests {
             "[external_agent_tool_result] done"
         );
 
+        // Session provenance is the only `session_meta` payload copied into
+        // the display projection. It survives both complete JSON and the
+        // prefix-only path used for large blob-backed records.
+        let session = compact_import_record(
+            br#"{"type":"session_meta","payload":{"model_provider":"sglang_dsv4","agent_nickname":"Harvey","base_instructions":"large private field"}}"#,
+        );
+        let session: serde_json::Value = serde_json::from_slice(&session).unwrap();
+        assert_eq!(session["payload"]["model_provider"], "sglang_dsv4");
+        assert_eq!(session["payload"]["agent_nickname"], "Harvey");
+        assert!(session["payload"].get("base_instructions").is_none());
+        let session_op = op_envelope(
+            90,
+            1,
+            OpKind::Import(ImportOp {
+                raw_ref: Payload::Inline(serde_json::to_vec(&session).unwrap()),
+                raw_hash: None,
+            }),
+        );
+        let metadata = session_metadata_index(std::slice::from_ref(&session_op));
+        let metadata = metadata.get("session:10").expect("session metadata");
+        assert_eq!(metadata.model_provider.as_deref(), Some("sglang_dsv4"));
+        assert_eq!(metadata.agent_nickname.as_deref(), Some("Harvey"));
+
+        let session_prefix = compact_import_record(
+            br#"{"type":"session_meta","payload":{"model_provider":"sglang_dsv4","agent_nickname":"Harvey","base_instructions":"unterminated"#,
+        );
+        let session_prefix: serde_json::Value = serde_json::from_slice(&session_prefix).unwrap();
+        assert_eq!(session_prefix["payload"]["model_provider"], "sglang_dsv4");
+        assert_eq!(session_prefix["payload"]["agent_nickname"], "Harvey");
+
         // Large outputs are bounded, never copied into the projection.
         let huge = format!(
             r#"{{"type":"response_item","payload":{{"type":"function_call_output","output":"{}"}}}}"#,
@@ -4525,6 +4770,30 @@ mod tests {
                 .unwrap_or_default()
                 .starts_with("[external_agent_tool_result]"),
             "marker recovered from truncated blob preview"
+        );
+    }
+
+    #[test]
+    fn compact_import_record_preserves_canonical_codex_exec_outcome_header() {
+        let raw = format!(
+            r#"{{"type":"response_item","payload":{{"type":"custom_tool_call_output","output":[{{"type":"input_text","text":"Script failed\nWall time 0.0 seconds\nOutput:\n"}},{{"type":"input_text","text":"{}"}}]}}}}"#,
+            "x".repeat(DISPLAY_PREVIEW_READ_LIMIT.saturating_mul(2)),
+        );
+
+        let compacted = compact_import_record(raw.as_bytes());
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert_eq!(
+            compacted["payload"]["output"][0]["text"],
+            "Script failed\nWall time 0.0 seconds\nOutput:"
+        );
+
+        // A truncated blob preview takes the prefix parser but must retain the
+        // identical status evidence near the start of the envelope.
+        let compacted = compact_import_record(&raw.as_bytes()[..DISPLAY_PREVIEW_READ_LIMIT]);
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert_eq!(
+            compacted["payload"]["output"][0]["text"],
+            "Script failed\nWall time 0.0 seconds\nOutput:"
         );
     }
 

@@ -169,6 +169,165 @@
     return { rows, layoutRows, edges };
   }
 
+  // A Codex session branching from an older Git commit. Six commits have
+  // landed on the repository trunk since the session ran, so the exact
+  // session-start anchor appears well below HEAD instead of looking like a
+  // branch created at the history tip. The trunk continues through the
+  // session rows on lane 0 while the session occupies lane 1; both converge
+  // at the captured session_meta.git.commit_hash commit.
+  function sessionBranchHistory() {
+    const gitGroup = 'repo:editchain';
+    const sessionGroup = 'session:refactor-4';
+    const oid = (pair) => pair.repeat(20);
+    const commits = [
+      [oid('f6'), 'polish Markdown content rendering', 0],
+      [oid('e5'), 'group execution traces into readable work units', 5],
+      [oid('d4'), 'normalize history typography and spacing', 10],
+      [oid('c3'), 'stabilize virtual-scroll restoration', 15],
+      [oid('b2'), 'add relationship badges for agent branches', 20],
+      [oid('a1'), 'introduce the Pulse history presentation', 25],
+      [oid('90'), 'persist unified Git and session graph identities', 480],
+      [oid('7e'), 'add deterministic graph lane layout', 1_440],
+      [oid('5c'), 'introduce the EditChain history service', 2_880],
+      [oid('3a'), 'initial repository history', 4_320],
+    ];
+    const gitRows = commits.map(([key, summary, minutes], i) =>
+      gitRow(key, summary, {
+        group: gitGroup,
+        parents: i + 1 < commits.length ? [commits[i + 1][0]] : [],
+        ts: NOW - minutes * 60_000,
+        outcome: 'success',
+      })
+    );
+
+    const sessionRows = [
+      opRow('node:branch:6', 'Implemented exact session-start Git anchoring and removed heuristic linking.', {
+        group: sessionGroup, kind: 'message', author: 'agent',
+        ts: NOW - 60 * 60_000, outcome: 'success',
+      }),
+      opRow('node:branch:5', 'Run the full repository quality gate', {
+        group: sessionGroup, kind: 'command',
+        record_role: 'action', activity_kind: 'verify',
+        ts: NOW - 65 * 60_000, outcome: 'success',
+      }),
+      opRow('node:branch:4', 'All checks passed: fmt, check, clippy, tests, docs, and deny.', {
+        group: sessionGroup, kind: 'tool', is_system: true,
+        record_role: 'result', activity_kind: 'verify',
+        ts: NOW - 70 * 60_000, outcome: 'success',
+      }),
+      opRow('node:branch:3', 'Resolve exact linked commits outside the current HEAD history', {
+        group: sessionGroup, kind: 'file',
+        record_role: 'artifact', activity_kind: 'change',
+        ts: NOW - 75 * 60_000, outcome: 'success',
+      }),
+      opRow('node:branch:2', '**Decision:** use one deterministic `BasedOn` edge from session start.', {
+        group: sessionGroup, kind: 'message', author: 'agent',
+        record_role: 'narrative', activity_kind: 'plan',
+        ts: NOW - 80 * 60_000,
+      }),
+      opRow('node:branch:1', 'Inspect `session_meta.git.commit_hash` in the Codex rollout', {
+        group: sessionGroup, kind: 'tool',
+        record_role: 'result', activity_kind: 'explore',
+        ts: NOW - 85 * 60_000, outcome: 'success',
+      }),
+      opRow('node:branch:0', '**Replace per-turn Git anchoring** with the existing Codex session start.', {
+        group: sessionGroup, kind: 'message', author: 'human',
+        ts: NOW - 90 * 60_000,
+      }),
+    ];
+    for (let i = 0; i < sessionRows.length; i++) {
+      sessionRows[i].parents = [
+        i + 1 < sessionRows.length ? sessionRows[i + 1].node_key : commits[6][0],
+      ];
+    }
+
+    // Newest first: post-session Git work, the historical session branch,
+    // then its exact start commit and the older repository trunk.
+    const rows = [
+      ...gitRows.slice(0, 6),
+      ...sessionRows,
+      ...gitRows.slice(6),
+    ];
+    const anchorRow = 13;
+    rows.forEach((row, index) => {
+      row.lane = index >= 6 && index <= 12 ? 1 : 0;
+      row.transitions = [];
+      if (index === 0) {
+        row.above = [];
+        row.below = [0];
+      } else if (index <= 5) {
+        row.above = [0];
+        row.below = [0];
+      } else if (index === 6) {
+        row.above = [0];
+        row.below = [0, 1];
+      } else if (index < 12) {
+        row.above = [0, 1];
+        row.below = [0, 1];
+      } else if (index === 12) {
+        row.above = [0, 1];
+        row.below = [0, 1];
+      } else if (index === anchorRow) {
+        // The right-hand session lane enters from ABOVE and curves into the
+        // anchor dot in this row. This is the bottom-right fork orientation;
+        // lane 0 then continues independently below the anchor.
+        row.above = [0, 1];
+        row.below = [0];
+        row.transitions = [[1, 0]];
+      } else if (index < rows.length - 1) {
+        row.above = [0];
+        row.below = [0];
+      } else {
+        row.above = [0];
+        row.below = [];
+      }
+    });
+
+    const rowIndex = new Map(rows.map((row, index) => [row.node_key, index]));
+    const edges = [];
+    for (let i = 0; i + 1 < gitRows.length; i++) {
+      const child = gitRows[i].node_key;
+      const parent = gitRows[i + 1].node_key;
+      edges.push({
+        child,
+        parent,
+        points: [
+          { row: rowIndex.get(child), lane: 0 },
+          { row: rowIndex.get(parent), lane: 0 },
+        ],
+      });
+    }
+    for (let i = 0; i + 1 < sessionRows.length; i++) {
+      const child = sessionRows[i].node_key;
+      const parent = sessionRows[i + 1].node_key;
+      edges.push({
+        child,
+        parent,
+        points: [
+          { row: rowIndex.get(child), lane: 1 },
+          { row: rowIndex.get(parent), lane: 1 },
+        ],
+      });
+    }
+    edges.push({
+      child: sessionRows[sessionRows.length - 1].node_key,
+      parent: gitRows[6].node_key,
+      points: [
+        { row: 12, lane: 1 },
+        { row: anchorRow, lane: 1 },
+        { row: anchorRow, lane: 0 },
+      ],
+    });
+
+    return {
+      rows,
+      layoutRows: rows.map((row) => ({ node: row.node_key, lane: row.lane })),
+      edges,
+      max_lane: 1,
+      subOpCounts: rows.map(() => 0),
+    };
+  }
+
   // A combined op carrying bundled metadata sub-ops (the exact list from the
   // request), to exercise inline reveal. The server emits the parent + one row
   // per sub-op as a fixed fully-expanded flat list.
@@ -237,6 +396,10 @@
 
     mixed() {
       return mixedHistory();
+    },
+
+    sessionBranch() {
+      return sessionBranchHistory();
     },
 
     filtered() {
@@ -523,16 +686,14 @@
     // cross-lane transition at the top. Each window row carries explicit lane /
     // above / below / transitions (the shape the renderer's per-row graph
     // cells read directly), so the fork draws two diverging columns and the
-    // reconnection draws a rounded cross-lane transition.
+    // reconnection draws a smooth convex cross-lane transition.
     //
     // The per-row geometry below is exactly what the production layout emits
-    // for the edge list that follows (see LayoutContext::new): for each edge
-    // (child_row, child_lane) -> (parent_row, parent_lane), the child lane runs
-    // vertically down to parent_row-1, jogs onto the parent lane at that row,
-    // and the parent lane runs down to the parent row. Transitions are
-    // (child_lane, parent_lane) order, so the reconnect at row 0 jogs FROM the
-    // completion lane (0) TO the subagent lane (1), and the fork jogs at rows 2
-    // and 3 go FROM the subagent lane (1) TO lane 0.
+    // for the edge list that follows (see LayoutContext::new). Merge/reconnect
+    // edges bend from their child row toward a parent lane. A true fork stays
+    // vertical on its branch lane through the shared parent's row, then bends
+    // into that parent dot, producing the requested bottom-right curve. All
+    // transitions retain (child_lane, parent_lane) direction.
     fork() {
       // Newest-first rows. n:0 is the reconnected completion result (on lane 0,
       // with a cross-lane transition to the subagent branch on lane 1).
@@ -548,10 +709,12 @@
         // subagent's first op — forks off the spawn point (lane 0, next row)
         // and off the shared root (lane 0, two rows below); both jogs go 1 -> 0
         [1, 'node:f:2', 'subagent first op', { above: [1], below: [0, 1], transitions: [[1, 0]] }],
-        // Agent tool_use call — the parent's spawn point, lane 0
-        [0, 'node:f:3', 'Agent tool call', { above: [0, 1], below: [0], transitions: [[1, 0]] }],
-        // shared root on lane 0 (both branches descend from it)
-        [0, 'node:f:4', 'shared root', { above: [0], below: [] }],
+        // Agent tool_use call — the parent's spawn point, lane 0. The fork lane
+        // passes straight through this row; it does not turn early here.
+        [0, 'node:f:3', 'Agent tool call', { above: [0, 1], below: [0, 1] }],
+        // Shared root on lane 0. The lane entering from above-right bends into
+        // this dot, while the lane-0 trunk independently enters from above.
+        [0, 'node:f:4', 'shared root', { above: [0, 1], below: [], transitions: [[1, 0]] }],
       ];
       // Drawn parent edges (child -> parent), the single source of truth for
       // the fork geometry: the reconnect, the subagent chain, the SubagentOf
@@ -563,7 +726,7 @@
         { child: 'node:f:0', parent: 'node:f:1', points: [{ row: 0, lane: 0 }, { row: 0, lane: 1 }, { row: 1, lane: 1 }] },
         { child: 'node:f:1', parent: 'node:f:2', points: [{ row: 1, lane: 1 }, { row: 2, lane: 1 }] },
         { child: 'node:f:2', parent: 'node:f:3', points: [{ row: 2, lane: 1 }, { row: 2, lane: 0 }, { row: 3, lane: 0 }] },
-        { child: 'node:f:2', parent: 'node:f:4', points: [{ row: 2, lane: 1 }, { row: 3, lane: 1 }, { row: 3, lane: 0 }, { row: 4, lane: 0 }] },
+        { child: 'node:f:2', parent: 'node:f:4', points: [{ row: 2, lane: 1 }, { row: 3, lane: 1 }, { row: 4, lane: 1 }, { row: 4, lane: 0 }] },
         { child: 'node:f:3', parent: 'node:f:4', points: [{ row: 3, lane: 0 }, { row: 4, lane: 0 }] },
       ];
       const parentsByKey = new Map();
@@ -627,9 +790,9 @@
     // exactly as LayoutContext::new emits for a chain that weaves across two
     // lanes: each transition begins at its row's own dot, ends on the next
     // lane at the row boundary, and the following row's `above` continues it.
-    // This exercises the rounded transition paths under heavy compression,
-    // where the corner radius clamps to the lane distance (and, at extreme
-    // spacing, the renderer falls back to a straight orthogonal jog).
+    // This exercises the convex Bézier transition paths under heavy
+    // compression, where the same curve contract holds without a separate
+    // corner-radius or orthogonal fallback mode.
     highLanes() {
       const N = 200; // lanes 0..199 — exceeds 128
       const rows = [];
@@ -720,7 +883,7 @@
         'wu:x4': 'tool result: unknown bundle member 4',
         'wu:ops1': 'chore: ops one',
         'wu:req1b': '**User asks** to fix `the build`',
-        'wu:ops2': 'chore: ops two',
+        'wu:ops2': 'ops two without a prefix',
       };
       // Bundle folds, in display order: [bundleKey, kind, [memberKeys], tsOffset]
       const bundles = [
@@ -768,6 +931,12 @@
         row.record_role = isGit ? 'artifact' : recordRoleFor(kind, activity);
         row.visibility = 'primary';
         row.turn_id = unit === 'ops' ? '' : unit;
+        if (group === SESSION) {
+          row.session_meta = {
+            model_provider: 'sglang_dsv4',
+            agent_nickname: 'Harvey',
+          };
+        }
         raw.push(row);
       }
       // Chain parents (newest -> older) so the layout stays connected.

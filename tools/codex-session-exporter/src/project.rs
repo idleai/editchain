@@ -1237,6 +1237,11 @@ fn enrich_projection(projection: &mut ProjectionRecord, item: &RolloutItem) {
                 cwd: Some(meta.cwd.to_string_lossy().into_owned()),
                 cli_version: Some(meta.cli_version.clone()),
                 timestamp: Some(meta.timestamp.clone()),
+                git: meta_line.git.as_ref().map(|git| SessionGitProjection {
+                    commit_hash: git.commit_hash.as_ref().map(|sha| sha.0.clone()),
+                    branch: git.branch.clone(),
+                    repository_url: git.repository_url.clone(),
+                }),
             });
         }
         RolloutItem::InterAgentCommunication(com) => {
@@ -1610,6 +1615,28 @@ mod tests {
             Some("33333333-3333-7333-8333-333333333333")
         );
         assert_eq!(meta.source, Some(json!("vscode")));
+        assert_eq!(meta.git, None);
+    }
+
+    #[test]
+    fn session_meta_projects_exact_start_git_state() {
+        let raw = r#"{"timestamp":"2026-08-17T03:25:48.584Z","type":"session_meta","payload":{"session_id":"11111111-1111-7111-8111-111111111111","id":"22222222-2222-7222-8222-222222222222","timestamp":"t","cwd":"/tmp","originator":"test","cli_version":"1.0","source":"vscode","git":{"commit_hash":"0123456789abcdef0123456789abcdef01234567","branch":"r4","repository_url":"https://github.com/idleai/editchain.git"}}}"#;
+        let record = project_line(raw);
+        let git = record
+            .projection
+            .session_meta
+            .expect("session meta")
+            .git
+            .expect("session git");
+        assert_eq!(
+            git.commit_hash.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(git.branch.as_deref(), Some("r4"));
+        assert_eq!(
+            git.repository_url.as_deref(),
+            Some("https://github.com/idleai/editchain.git")
+        );
     }
 
     #[test]

@@ -32,7 +32,7 @@ const HARNESS = 'file://' + path.join(EXT_ROOT, 'test', 'harness', 'index.html')
 const CHROME = process.env.CHROME_PATH ||
   '/mnt/hot/ambientlight/.cache/puppeteer/chrome/linux-151.0.7922.71/chrome-linux64/chrome';
 
-const SCENARIOS = ['empty', 'linear', 'merge', 'mixed', 'filtered', 'undated', 'error', 'warned', 'large', 'longsummary', 'combined', 'traced', 'badges', 'fork', 'highLanes', 'workUnits', 'workUnitsDeep'];
+const SCENARIOS = ['empty', 'linear', 'merge', 'mixed', 'sessionBranch', 'filtered', 'undated', 'error', 'warned', 'large', 'longsummary', 'combined', 'traced', 'badges', 'fork', 'highLanes', 'workUnits', 'workUnitsDeep'];
 
 function parseArgs(argv) {
   const args = { cmd: argv[0], scenario: 'merge', viewport: '1440x900', out: null, selector: null, search: null, searchRace: false, resize: false, deferredLayout: false, shot: null, profile: null, profileSwitch: false, singlePane: false, keyboard: false, restore: false, workUnit: false };

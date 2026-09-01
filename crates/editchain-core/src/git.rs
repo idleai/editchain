@@ -231,9 +231,8 @@ pub struct GitCommitEntity {
 // ---------------------------------------------------------------------------
 
 /// The relation an explicit link records between an `EditChain` operation and a
-/// Git object. The viewer displays this relation without strengthening or
-/// reinterpreting it — a link never becomes a causal parent merely because
-/// both appear in one view.
+/// Git object. The viewer may draw this stored relation as a graph edge, but
+/// it never rewrites the operation's durable causal [`crate::ParentSet`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GitLinkKind {
     /// The operation was based on this commit's state.

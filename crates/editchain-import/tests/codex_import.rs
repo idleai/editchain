@@ -17,7 +17,7 @@ use editchain_project as _;
 use proptest as _;
 use serde as _;
 use serde_json as _;
-use sha2 as _;
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::Path;
 use tempfile as _;
@@ -118,6 +118,141 @@ fn projection_bytes(records: &[serde_json::Value]) -> Vec<u8> {
         out.push(b'\n');
     }
     out
+}
+
+#[test]
+fn session_start_git_metadata_emits_one_exact_based_on_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    let git_marker = workspace.join(".git");
+    std::fs::create_dir_all(&git_marker).unwrap();
+    let rollouts = dir.path().join("rollouts");
+    std::fs::create_dir_all(&rollouts).unwrap();
+    write_rollout(
+        &rollouts,
+        "rollout-thread-1.jsonl",
+        &[session_meta_line("thread-1", "s")],
+    );
+
+    let commit_hash = "0123456789abcdef0123456789abcdef01234567";
+    let projection = projection_bytes(&[line_record(
+        1,
+        Vec::new(),
+        Some(serde_json::json!({
+            "sessionId": "s",
+            "threadId": "thread-1",
+            "cwd": workspace.to_string_lossy(),
+            "git": {
+                "commitHash": commit_hash,
+                "branch": "r4",
+                "repositoryUrl": "https://github.com/idleai/editchain.git"
+            }
+        })),
+    )]);
+    let helper = fixed_helper(&dir, &projection);
+    let imported = import_workspace(&rollouts, &workspace, &helper);
+
+    let links: Vec<_> = imported
+        .ops
+        .ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::GitLink(link) => Some((op, link)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(links.len(), 1, "one session gets one Git base relation");
+    let (link_op, link) = links[0];
+    let stream = derive_source_stream(
+        workspace.to_str().unwrap(),
+        &rollouts.join("rollout-thread-1.jsonl").to_string_lossy(),
+        0,
+    );
+    let session_start = stream.op_from_position(SourcePosition::raw(1)).unwrap();
+    assert_eq!(link.source, session_start);
+    assert_eq!(link_op.parents, ParentSet::One(session_start));
+    assert_eq!(
+        link.target_oid,
+        editchain_core::GitOid::from_hex(commit_hash).unwrap()
+    );
+    assert!(matches!(link.kind, editchain_core::GitLinkKind::BasedOn));
+
+    let canonical_marker = git_marker.canonicalize().unwrap();
+    let digest = Sha256::digest(canonical_marker.to_string_lossy().as_bytes());
+    let mut repository_bytes = [0u8; 8];
+    repository_bytes.copy_from_slice(&digest[..8]);
+    assert_eq!(
+        link.target_repo,
+        editchain_core::RepositoryId(u64::from_le_bytes(repository_bytes))
+    );
+    assert_eq!(imported.report.raw_ops, 1);
+    assert_eq!(imported.report.normalized_ops, 1);
+}
+
+#[test]
+fn legacy_cursor_backfills_session_git_link_once_without_replaying_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(workspace.join(".git")).unwrap();
+    let rollouts = dir.path().join("rollouts");
+    std::fs::create_dir_all(&rollouts).unwrap();
+    let rollout = rollouts.join("rollout-thread-1.jsonl");
+    write_rollout(
+        &rollouts,
+        "rollout-thread-1.jsonl",
+        &[session_meta_line("thread-1", "s")],
+    );
+    let projection = projection_bytes(&[line_record(
+        1,
+        Vec::new(),
+        Some(serde_json::json!({
+            "sessionId": "s",
+            "threadId": "thread-1",
+            "cwd": workspace.to_string_lossy(),
+            "git": {
+                "commitHash": "0123456789abcdef0123456789abcdef01234567"
+            }
+        })),
+    )]);
+    let helper = fixed_helper(&dir, &projection);
+    let options = ImportOptions::default();
+    let mut cursors = MemoryCursorStore::new();
+
+    let initial =
+        import_workspace_into(&rollouts, &workspace, &helper, &options, &mut cursors).unwrap();
+    assert_eq!(initial.report.raw_ops, 1);
+    let cursor_key = rollout.to_string_lossy();
+    let mut legacy = cursors.get_cursor(&cursor_key).unwrap().unwrap();
+    legacy.normalization_version = 0;
+    cursors.set_cursor(&cursor_key, &legacy).unwrap();
+
+    let backfill =
+        import_workspace_into(&rollouts, &workspace, &helper, &options, &mut cursors).unwrap();
+    assert_eq!(backfill.report.files_processed, 1);
+    assert_eq!(backfill.report.raw_ops, 0);
+    assert_eq!(backfill.report.normalized_ops, 1);
+    assert_eq!(
+        backfill
+            .ops
+            .ops
+            .iter()
+            .filter(|op| matches!(op.kind, OpKind::GitLink(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        cursors
+            .get_cursor(&cursor_key)
+            .unwrap()
+            .unwrap()
+            .normalization_version,
+        1
+    );
+
+    let current =
+        import_workspace_into(&rollouts, &workspace, &helper, &options, &mut cursors).unwrap();
+    assert_eq!(current.report.files_processed, 0);
+    assert!(current.ops.ops.is_empty());
 }
 
 #[test]

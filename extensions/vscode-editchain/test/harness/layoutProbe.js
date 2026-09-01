@@ -475,14 +475,85 @@
     const toLane = trans[1];
     const startAtDot = lane === fromLane;
     const startAtBoundary = !startAtDot && above.indexOf(fromLane) !== -1;
-    const endAtBoundary = below.indexOf(toLane) !== -1;
-    const endAtDot = !endAtBoundary && lane === toLane;
+    const endAtDot = lane === toLane;
+    const endAtBoundary = !endAtDot && below.indexOf(toLane) !== -1;
     if (!startAtDot && !startAtBoundary) return null;
     if (!endAtBoundary && !endAtDot) return null;
     return { fromLane, toLane, startAtDot, startAtBoundary, endAtDot, endAtBoundary };
   }
 
-  // Collect per-row graph geometry (dots, vertical line segments, and rounded
+  // Return the single quadratic segment emitted for one transition colour
+  // half, or null if the renderer regressed to a multi-segment elbow/jog.
+  function quadraticSegment(cmds) {
+    if (!cmds || cmds.length !== 2 || cmds[0].cmd !== 'M' || cmds[1].cmd !== 'Q') return null;
+    return {
+      start: cmds[0].args,
+      control: cmds[1].args.slice(0, 2),
+      end: cmds[1].args.slice(2, 4),
+    };
+  }
+
+  // Validate the shape contract independently of lane direction: every half
+  // is one convex quadratic, the colour seam is exact and tangent-continuous,
+  // external tangents match the connected dot/boundary, and a transition with
+  // a node endpoint is one globally non-inflecting convex bow. The bounding
+  // box guard rejects outward overshoot/inward hooks.
+  function smoothTransitionProblems(srcCmds, dstCmds, anchors) {
+    const problems = [];
+    const near = (a, b) => Math.abs(a - b) <= 0.02;
+    const src = quadraticSegment(srcCmds);
+    const dst = quadraticSegment(dstCmds);
+    if (!src || !dst) return ['halves must each be one quadratic Bézier'];
+    if (src.end[0] !== dst.start[0] || src.end[1] !== dst.start[1]) {
+      problems.push('halves must share one exact seam');
+      return problems;
+    }
+    const incoming = [src.end[0] - src.control[0], src.end[1] - src.control[1]];
+    const outgoing = [dst.control[0] - dst.start[0], dst.control[1] - dst.start[1]];
+    const cross = incoming[0] * outgoing[1] - incoming[1] * outgoing[0];
+    const dot = incoming[0] * outgoing[0] + incoming[1] * outgoing[1];
+    const scale = Math.max(1,
+      Math.hypot(incoming[0], incoming[1]) * Math.hypot(outgoing[0], outgoing[1]));
+    if (Math.abs(cross) > scale * 0.01 || dot <= 0) {
+      problems.push('colour seam must be tangent-continuous');
+    }
+    if (anchors.startAtDot && !near(src.start[1], src.control[1])) {
+      problems.push('node source must leave on a smooth horizontal tangent');
+    }
+    if (anchors.startAtBoundary && !near(src.start[0], src.control[0])) {
+      problems.push('boundary source must enter on a smooth vertical tangent');
+    }
+    if (anchors.endAtDot && !near(dst.control[1], dst.end[1])) {
+      problems.push('node destination must enter on a smooth horizontal tangent');
+    }
+    if (anchors.endAtBoundary && !near(dst.control[0], dst.end[0])) {
+      problems.push('boundary destination must leave on a smooth vertical tangent');
+    }
+    const all = [src.start, src.control, src.end, dst.control, dst.end];
+    const minX = Math.min(src.start[0], dst.end[0]) - 0.02;
+    const maxX = Math.max(src.start[0], dst.end[0]) + 0.02;
+    const minY = Math.min(src.start[1], dst.end[1]) - 0.02;
+    const maxY = Math.max(src.start[1], dst.end[1]) + 0.02;
+    if (all.some((p) => p[0] < minX || p[0] > maxX || p[1] < minY || p[1] > maxY)) {
+      problems.push('curve must stay inside its convex endpoint bounds');
+    }
+    // A quadratic has constant-sign curvature. When one endpoint is a node,
+    // both emitted halves are subdivisions of ONE quadratic and therefore must
+    // keep the same turn sign (no inflection / concave hook).
+    if (anchors.startAtDot !== anchors.endAtDot) {
+      const turn = (q) => {
+        const a = [q.control[0] - q.start[0], q.control[1] - q.start[1]];
+        const b = [q.end[0] - q.control[0], q.end[1] - q.control[1]];
+        return a[0] * b[1] - a[1] * b[0];
+      };
+      const srcTurn = turn(src);
+      const dstTurn = turn(dst);
+      if (srcTurn * dstTurn < -0.01) problems.push('node transition must be one convex bow');
+    }
+    return problems;
+  }
+
+  // Collect per-row graph geometry (dots, vertical line segments, and smooth
   // transition paths). Each row carries its own small SVG cell, so we
   // aggregate across all rendered rows.
   function describeSvg() {
@@ -1106,6 +1177,24 @@
             (longId ? ' ID-PART-' + idPart.length + 'ch (>12)' : '')
           : 'no group boundary rows in this scenario (skipped)',
       });
+
+      // The section label is background chrome. Its opaque/translucent chip
+      // must never mask a lane segment or dot: the graph cell owns the higher
+      // stacking layer while the label remains visible beneath it.
+      const labelRow = labelEl ? labelEl.closest('.row') : null;
+      const graphCell = labelRow ? labelRow.querySelector('.graph-cell') : null;
+      const labelZ = computed ? parseInt(computed.zIndex, 10) : 0;
+      const graphStyle = graphCell ? getComputedStyle(graphCell) : null;
+      const graphZ = graphStyle ? parseInt(graphStyle.zIndex, 10) : 0;
+      const graphPositioned = !!graphStyle && graphStyle.position !== 'static';
+      checks.push({
+        name: 'GROUP_LABEL_BEHIND_GRAPH',
+        pass: !labelEl || (!!graphCell && graphPositioned && graphZ > labelZ),
+        detail: labelEl
+          ? 'label z=' + labelZ + '; graph z=' + graphZ +
+            '; graph position=' + (graphStyle ? graphStyle.position : 'missing')
+          : 'no group boundary rows in this scenario (skipped)',
+      });
     }
 
     // Check 5n: the Commit/ID column shows a SHORT display id — op ids are
@@ -1193,22 +1282,21 @@
     }
 
     // Check 5p (badges scenario only): the EXACT Rust wire taxonomy renders
-    // through the renderer whitelists — every activity_kind (except
-    // conversation, badge-free by design) and every outcome carries its exact
-    // badge class/text — and the legacy tool_call/command/edit/commit/review
-    // + error/interrupted vocabulary never leaks back in. Outcome colors must
-    // track VS Code theme tokens (proven by temporarily overriding the
-    // harness token and requiring the badge to follow), never fixed colors
-    // alone.
+    // through the renderer whitelists. Common source_control ("git") and
+    // success ("ok") badges are retained as code options but default OFF;
+    // every other meaningful activity/outcome carries its exact class/text.
+    // Legacy tool_call/command/edit/commit/review + error/interrupted vocabulary
+    // must never leak back in. Visible outcome colors must track VS Code theme
+    // tokens, never fixed colors alone.
     if (window.__editchainScenarioName === 'badges') {
       const expected = {
-        'node:b:exec': { act: ['act-execute', 'run'], out: ['outcome-failure', 'fail'] },
-        'git:b:sc': { act: ['act-source-control', 'git'], out: ['outcome-success', 'ok'] },
+        'node:b:exec': { act: ['act-execute', 'run'], out: ['outcome-failure', '✕'] },
+        'git:b:sc': { act: null, out: null },
         'node:b:chg': { act: ['act-change', 'change'], out: ['outcome-warning', 'warn'] },
         'node:b:plan': { act: ['act-plan', 'plan'], out: ['outcome-neutral', 'cancelled'] },
         'node:b:exp': { act: ['act-explore', 'explore'], out: null },
         'node:b:ver': { act: ['act-verify', 'verify'], out: null },
-        'node:b:diag': { act: ['act-diagnose', 'diagnose'], out: ['outcome-failure', 'fail'] },
+        'node:b:diag': { act: ['act-diagnose', 'diagnose'], out: ['outcome-failure', '✕'] },
         'node:b:coord': { act: ['act-coordinate', 'coordinate'], out: null },
         'node:b:ext': { act: ['act-external', 'external'], out: null },
         'node:b:sys': { act: ['act-system', 'system'], out: null },
@@ -1224,10 +1312,14 @@
         if (!row) { problems.push('missing row ' + key); continue; }
         const actBadge = row.querySelector('.act-badge');
         const outBadge = row.querySelector('.out-badge');
-        const actText = actBadge ? (actBadge.textContent || '').trim() : '';
-        if (!actBadge || !actBadge.classList.contains(exp.act[0]) || actText !== exp.act[1]) {
-          problems.push(key + ' activity badge != ' + exp.act[0] + ' "' + exp.act[1] + '" got ' +
-            (actBadge ? actBadge.className + ' "' + actText + '"' : 'none'));
+        if (exp.act) {
+          const actText = actBadge ? (actBadge.textContent || '').trim() : '';
+          if (!actBadge || !actBadge.classList.contains(exp.act[0]) || actText !== exp.act[1]) {
+            problems.push(key + ' activity badge != ' + exp.act[0] + ' "' + exp.act[1] + '" got ' +
+              (actBadge ? actBadge.className + ' "' + actText + '"' : 'none'));
+          }
+        } else if (actBadge) {
+          problems.push(key + ' has unexpected activity badge ' + actBadge.className);
         }
         if (exp.out) {
           const outText = outBadge ? (outBadge.textContent || '').trim() : '';
@@ -1261,7 +1353,6 @@
         return driven;
       };
       const themeTokensOk =
-        probeTokenDriven('--vscode-testing-iconPassed', '.out-badge.outcome-success', '#00ff00') &&
         probeTokenDriven('--vscode-editorWarning-foreground', '.out-badge.outcome-warning', '#00ff00') &&
         probeTokenDriven('--vscode-editorError-foreground', '.out-badge.outcome-failure', '#00ff00');
       if (!themeTokensOk) {
@@ -1271,7 +1362,57 @@
         name: 'BADGE_VOCABULARY_COVERAGE',
         pass: problems.length === 0,
         detail: problems.length === 0
-          ? '10/10 activity kinds + 4/4 outcomes exact, conversation badge-free, theme-token colors'
+          ? '9 uncommon activity kinds + 3 exceptional outcomes exact; git/ok default off; theme-token colors'
+          : problems.join('; '),
+      });
+    }
+
+    // Check 5q: common clean-state chrome is globally quiet by default. This
+    // intentionally excludes aggregate bundle completion checks, which occur
+    // once per collapsed run rather than repeating on every row.
+    if (wrapEl && !viewMessage) {
+      const commonBadges = Array.from(wrapEl.querySelectorAll(
+        '.act-badge.act-source-control, .out-badge.outcome-success'));
+      checks.push({
+        name: 'COMMON_ROW_BADGES_DEFAULT_OFF',
+        pass: commonBadges.length === 0,
+        detail: commonBadges.length === 0
+          ? 'no repeated git/ok row badges'
+          : commonBadges.length + ' repeated git/ok row badge(s)',
+      });
+    }
+
+    // Check 5r: Git text before the first colon becomes one exact chip and the
+    // delimiter disappears. A Git summary without a colon remains chip-free.
+    if (wrapEl && !viewMessage) {
+      const problems = [];
+      let prefixed = 0;
+      let plain = 0;
+      for (const el of wrapEl.querySelectorAll('.row')) {
+        const abs = Number(el.getAttribute('data-row'));
+        const row = window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
+        if (!row || !row.git_oid) continue;
+        const source = String(row.summary || '');
+        const colon = source.indexOf(':');
+        const expectedPrefix = colon > 0 ? source.slice(0, colon).trim() : '';
+        const chip = el.querySelector('.git-prefix-chip');
+        if (expectedPrefix) {
+          prefixed++;
+          if (!chip || chip.textContent.trim() !== expectedPrefix) {
+            problems.push(row.node_key + ': Git prefix chip mismatch');
+          } else if ((chip.parentElement.textContent || '').includes(expectedPrefix + ':')) {
+            problems.push(row.node_key + ': Git prefix delimiter is still visible');
+          }
+        } else {
+          plain++;
+          if (chip) problems.push(row.node_key + ': colon-free Git summary gained a chip');
+        }
+      }
+      checks.push({
+        name: 'GIT_PREFIX_CHIP_FIRST_COLON',
+        pass: problems.length === 0,
+        detail: problems.length === 0
+          ? prefixed + ' prefixed and ' + plain + ' plain Git rows render correctly'
           : problems.join('; '),
       });
     }
@@ -1320,16 +1461,16 @@
     }
 
     // Check 8 (fork / subagent-reconnect scenario only): the graph must render
-    // distinct lanes for the two fork branches AND rounded cross-lane
+    // distinct lanes for the two fork branches AND smooth convex cross-lane
     // transitions whose endpoints are ALL connected — every transition anchor
     // must be either this row's node dot or a cell boundary the adjacent row's
     // geometry continues at the same lane x. The production direction is
     // (child_lane, parent_lane), so row 0's reconnect transition runs 0 -> 1
-    // (completion lane -> subagent lane) and the fork jogs at rows 2/3 run
-    // 1 -> 0. Assertions:
+    // (completion lane -> subagent lane), row 2's merge-side transition runs
+    // 1 -> 0, and the true fork bends 1 -> 0 in its parent row 4. Assertions:
     //   - dots occupy at least two distinct x positions (two lanes);
-    //   - each transition row renders exactly two exact path halves sharing the
-    //     geometric midpoint seam (identical formatted coordinates);
+    //   - each transition row renders exactly two quadratic path halves sharing
+    //     an exact tangent-continuous colour seam;
     //   - the source half begins at the row's own dot when `lane === fromLane`
     //     (row 0's reconnect starts AT the lane-0 dot — explicitly no source
     //     stub: it never begins at y=0 and row 0 keeps no dangling lane-0
@@ -1341,10 +1482,8 @@
     //     same x), or at the row's own dot when `lane === toLane`;
     //   - each half is stroked in its lane's colour (sharp categorical handoff
     //     at the seam);
-    //   - quadratic corner controls sit on the lane centres at the row
-    //     midpoint for boundary-anchored sides (rounded onto the row midpoint);
-    //     dot-anchored sides have no vertical run and stay straight along the
-    //     row midpoint;
+    //   - dot-to-boundary transitions form one non-inflecting convex bow;
+    //     pass-through transitions use two convex halves with one smooth seam;
     //   - no hard horizontal `graphLine` remains (the old three-line jog is
     //     gone).
     if (wrapEl && window.__editchainScenarioName === 'fork') {
@@ -1370,7 +1509,7 @@
       // dot, the subagent lane (lane 1) is row 1's dot.
       const lane0 = dotAt(0);
       const lane1 = dotAt(1);
-      const transitionRows = [0, 2, 3];
+      const transitionRows = [0, 2, 4];
       const transitionProblems = [];
       // Lane x / fill lookups from the rendered dots (each lane's dot x is
       // uniform across its rows).
@@ -1413,10 +1552,7 @@
             transitionProblems.push('row ' + row + ' missing lane x/fill references');
             continue;
           }
-          const seamX = (fromX + toX) / 2;
           const srcStart = pathStart(t.src.cmds);
-          const srcEnd = pathEnd(t.src.cmds);
-          const dstStart = pathStart(t.dst.cmds);
           const dstEnd = pathEnd(t.dst.cmds);
           // Source anchor: the row's own dot, or the top boundary ONLY when
           // `above` lists the from-lane (the path owns that top half).
@@ -1450,25 +1586,8 @@
                 ' is not continued by row ' + (row + 1) + '\'s top geometry');
             }
           }
-          const sharedSeam = srcEnd && dstStart &&
-            srcEnd[0] === dstStart[0] && srcEnd[1] === dstStart[1] &&
-            near(srcEnd[0], seamX) && near(srcEnd[1], MID_Y);
-          if (!sharedSeam) {
-            transitionProblems.push('row ' + row + ' halves must share the exact midpoint seam');
-          }
-          const srcQ = t.src.cmds.find((c) => c.cmd === 'Q');
-          const dstQ = t.dst.cmds.find((c) => c.cmd === 'Q');
-          // Boundary-anchored sides round onto the row midpoint (quadratic
-          // control on the lane centre); dot-anchored sides have no vertical
-          // run and must stay straight along the row midpoint.
-          const srcElbowOk = anchors.startAtBoundary
-            ? (!!srcQ && near(srcQ.args[0], fromX) && near(srcQ.args[1], MID_Y))
-            : !srcQ;
-          const dstElbowOk = anchors.endAtBoundary
-            ? (!!dstQ && near(dstQ.args[0], toX) && near(dstQ.args[1], MID_Y))
-            : !dstQ;
-          if (!srcElbowOk || !dstElbowOk) {
-            transitionProblems.push('row ' + row + ' elbows must match their anchors');
+          for (const problem of smoothTransitionProblems(t.src.cmds, t.dst.cmds, anchors)) {
+            transitionProblems.push('row ' + row + ' ' + problem);
           }
           if (t.src.stroke !== srcColour || t.dst.stroke !== dstColour) {
             transitionProblems.push('row ' + row + ' colour handoff mismatch');
@@ -1494,7 +1613,7 @@
         }
       }
       // The old hard three-line jog rendered a horizontal connector; the
-      // rounded transition replaces it, so every remaining graphLine must be
+      // smooth transition replaces it, so every remaining graphLine must be
       // a vertical segment.
       Array.from(geometry.values()).forEach((g) => {
         g.lines.forEach((l) => {
@@ -1504,10 +1623,10 @@
         });
       });
       checks.push({
-        name:'FORK_ROUNDED_TRANSITIONS',
+        name:'FORK_SMOOTH_CONVEX_TRANSITIONS',
         pass:transitionProblems.length === 0,
         detail: transitionProblems.length === 0
-          ? '3 connected transitions: dot/boundary anchors, exact shared seams, per-lane colours'
+          ? '3 connected transitions: convex Béziers, smooth seams, connected anchors, per-lane colours'
           : transitionProblems.join('; '),
       });
 
@@ -1594,16 +1713,52 @@
       });
     }
 
+    // Deep session branch: the fork belongs in the anchor commit's own row,
+    // entering from the lane ABOVE-RIGHT and terminating at the anchor dot.
+    // This pins the requested bottom-right corner orientation; placing the
+    // transition one row earlier produces the visually reversed curve even
+    // though the same two lanes remain connected.
+    if (wrapEl && window.__editchainScenarioName === 'sessionBranch') {
+      const cells = wrapEl.querySelectorAll('.graph-cell svg.graphCell');
+      const geometry = collectRowGeometry(cells);
+      const anchorRow = 13;
+      const prior = geometry.get(anchorRow - 1);
+      const anchor = geometry.get(anchorRow);
+      const cached = window.__editchainRowAt ? window.__editchainRowAt(anchorRow) : null;
+      const anchors = cached ? transitionAnchors(cached) : null;
+      const src = anchor && anchor.src ? quadraticSegment(anchor.src.cmds) : null;
+      const dst = anchor && anchor.dst ? quadraticSegment(anchor.dst.cmds) : null;
+      const noEarlyCurve = !!prior && !prior.src && !prior.dst;
+      const bottomRight = !!(anchor && anchor.dot && anchors && src && dst &&
+        anchors.startAtBoundary && anchors.endAtDot &&
+        src.start[0] > anchor.dot.x &&
+        Math.abs(src.start[1]) <= 0.01 &&
+        Math.abs(src.control[0] - src.start[0]) <= 0.02 &&
+        Math.abs(dst.end[0] - anchor.dot.x) <= 0.02 &&
+        Math.abs(dst.end[1] - anchor.dot.y) <= 0.02 &&
+        Math.abs(dst.control[1] - dst.end[1]) <= 0.02);
+      const shapeProblems = anchors && anchor && anchor.src && anchor.dst
+        ? smoothTransitionProblems(anchor.src.cmds, anchor.dst.cmds, anchors)
+        : ['anchor transition missing'];
+      checks.push({
+        name: 'SESSION_BRANCH_BOTTOM_RIGHT',
+        pass: noEarlyCurve && bottomRight && shapeProblems.length === 0,
+        detail: noEarlyCurve && bottomRight && shapeProblems.length === 0
+          ? 'lane above-right curves smoothly into the anchor dot; trunk continues below'
+          : 'noEarlyCurve=' + noEarlyCurve + ' bottomRight=' + bottomRight +
+            ' shape=' + shapeProblems.join(', '),
+      });
+    }
+
     // Check 8b (highLanes scenario only): every service lane must be drawn
     // INSIDE the graph column — no 128-lane clipping. The fixture has 200
     // lanes (> the former cap): all dot centres must land within their SVG
     // cell's width and more than 128 distinct lane x positions must render.
     //
     // Rows 0..4 form a connected production-like zigzag (lanes 0,1,0,1,0 with
-    // adjacent transitions 0->1, 1->0, ...), so the rounded paths are exercised
-    // under heavy compression: the corner radius clamps to the lane distance,
-    // and at extreme spacing the renderer falls back to a straight orthogonal
-    // jog. Every transition begins at its row's own dot (no synthetic top
+    // adjacent transitions 0->1, 1->0, ...), so the convex Bézier paths are
+    // exercised under heavy compression without a radius/fallback mode. Every
+    // transition begins at its row's own dot (no synthetic top
     // half), ends at the next lane's bottom boundary — continued by the
     // following row's `above` at the same x — and must keep two exact halves
     // sharing the midpoint seam, per-lane colours, and all coordinates inside
@@ -1672,11 +1827,7 @@
           transitionProblems.push('row ' + row + ' missing lane x references');
           continue;
         }
-        const dx = toX - fromX;
-        const seamX = (fromX + toX) / 2;
         const srcStart = pathStart(t.src.cmds);
-        const srcEnd = pathEnd(t.src.cmds);
-        const dstStart = pathStart(t.dst.cmds);
         const dstEnd = pathEnd(t.dst.cmds);
         // Source anchor: the row's own dot, or the top boundary ONLY when
         // `above` lists the from-lane.
@@ -1710,44 +1861,11 @@
               ' is not continued by row ' + (row + 1) + '\'s top geometry');
           }
         }
-        if (!srcEnd || !dstStart ||
-            srcEnd[0] !== dstStart[0] || srcEnd[1] !== dstStart[1] ||
-            !near(srcEnd[0], seamX) || !near(srcEnd[1], MID_Y)) {
-          transitionProblems.push('row ' + row + ' halves must share the exact midpoint seam');
+        for (const problem of smoothTransitionProblems(t.src.cmds, t.dst.cmds, anchors)) {
+          transitionProblems.push('row ' + row + ' ' + problem);
         }
         if (t.src.stroke !== laneFills.get(fromLane) || t.dst.stroke !== laneFills.get(toLane)) {
           transitionProblems.push('row ' + row + ' colour handoff mismatch');
-        }
-        // Dot-anchored sides have no vertical run and must stay straight (no
-        // Q). Boundary-anchored sides round onto the row midpoint with the
-        // corner radius (midY - cornerStartY) clamped by the lane distance;
-        // straight mode (no Q) is the sanctioned fallback under compression.
-        const srcQ = t.src.cmds.find((c) => c.cmd === 'Q');
-        const dstQ = t.dst.cmds.find((c) => c.cmd === 'Q');
-        if (startAtDot && srcQ) {
-          transitionProblems.push('row ' + row + ' dot-anchored src must stay straight');
-        }
-        if (endAtDot && dstQ) {
-          transitionProblems.push('row ' + row + ' dot-anchored dst must stay straight');
-        }
-        const clampOk = (q, cmds, laneX, isSrc) => {
-          if (!q) return true; // straight fallback is sanctioned
-          const idx = cmds.indexOf(q);
-          const cornerStart = cmds[idx - 1];
-          if (!cornerStart || cornerStart.cmd !== 'L') return false;
-          // Source elbows start their corner at midY - r (vertical run x is the
-          // from-lane); destination elbows end their corner at midY + r (the Q
-          // end x is the to-lane).
-          const radius = isSrc ? MID_Y - cornerStart.args[1] : q.args[3] - MID_Y;
-          const verticalX = isSrc ? cornerStart.args[0] : q.args[2];
-          return near(verticalX, laneX) &&
-            radius <= Math.abs(dx) / 2 + 0.01 && radius >= -0.01;
-        };
-        if (startAtBoundary && !clampOk(srcQ, t.src.cmds, fromX, true)) {
-          transitionProblems.push('row ' + row + ' src corner radius not clamped by lane distance');
-        }
-        if (endAtBoundary && !clampOk(dstQ, t.dst.cmds, toX, false)) {
-          transitionProblems.push('row ' + row + ' dst corner radius not clamped by lane distance');
         }
         // All path coordinates must stay inside the cell (compression never
         // clips a transition).
@@ -1760,7 +1878,7 @@
         name: 'HIGH_LANES_TRANSITIONS',
         pass: transitionProblems.length === 0,
         detail: transitionProblems.length === 0
-          ? transitionRows + ' compressed zigzag transitions valid (clamped radius / fallback, seams, colours, connected endpoints)'
+          ? transitionRows + ' compressed zigzag transitions valid (convex Béziers, smooth seams, colours, connected endpoints)'
           : transitionProblems.join('; '),
       });
     }
@@ -1910,7 +2028,8 @@
       }
 
       // Check B: unit ribbons are SPARSE (start rows only, exactly one per
-      // row) and carry the exact view-wide count in .work-unit-count.
+      // row). Multi-entry non-Git activities carry the exact view-wide count;
+      // Git and single-entry units follow VS Code's native count-free header.
       if (activeProfile === 'activity') {
         if (!caps.workUnit) {
           checks.push({ name: 'WORK_UNIT_RIBBON_SPARSE_COUNTED', pass: true, detail: contractAbsent('work-unit ribbon/count') });
@@ -1933,12 +2052,18 @@
             }
             if (hasRibbon) {
               ribbons++;
-              if (!countEl) {
-                problems.push(row.node_key + ': start row lacks .work-unit-count');
-              } else {
+              const expectsCount = row.activity_kind !== 'source_control' &&
+                row.work_unit.count > 1;
+              if (!!countEl !== expectsCount) {
+                problems.push(row.node_key + ': count DOM=' + !!countEl +
+                  ' expected=' + expectsCount);
+              } else if (countEl) {
                 const text = (countEl.textContent || '').trim();
                 if (parseCount(text) !== row.work_unit.count) {
                   problems.push(row.node_key + ': count text "' + text + '" != wire ' + row.work_unit.count);
+                }
+                if (!/entr(?:y|ies)$/.test(text)) {
+                  problems.push(row.node_key + ': count is not labelled as entries: "' + text + '"');
                 }
               }
               // The ribbon leads with the unit title: the DTO title when
@@ -2018,6 +2143,44 @@
               (isSmall ? ' (and exact in the full view)' : ' (deep slice: uniqueness only)') +
               '; labels sparse, never stacked' +
               (domSkipped ? ' — DOM label checks skipped (renderer contract not present)' : '')
+            : problems.join('; '),
+        });
+      }
+
+      // Check C2: model and agent provenance render once per visible session
+      // run, with exact labels from the typed `session_meta` DTO. Rows inside
+      // the run keep an empty slot so virtualization can promote a new window
+      // boundary without reconstructing the row compositor.
+      {
+        const problems = [];
+        let previousGroup = null;
+        for (const el of rowEls) {
+          const row = cachedRow(el);
+          if (!row) continue;
+          const meta = row.session_meta || null;
+          const atBoundary = previousGroup === null || row.group !== previousGroup;
+          const expects = !!meta && !row.is_subop && atBoundary;
+          const model = el.querySelector('.session-chip-model');
+          const agent = el.querySelector('.session-chip-agent');
+          if (!!model !== (expects && !!meta.model_provider)) {
+            problems.push(row.node_key + ': model chip boundary mismatch');
+          }
+          if (!!agent !== (expects && !!meta.agent_nickname)) {
+            problems.push(row.node_key + ': agent chip boundary mismatch');
+          }
+          if (model && model.textContent.trim() !== meta.model_provider) {
+            problems.push(row.node_key + ': model chip text mismatch');
+          }
+          if (agent && agent.textContent.trim() !== meta.agent_nickname) {
+            problems.push(row.node_key + ': agent chip text mismatch');
+          }
+          previousGroup = row.group;
+        }
+        checks.push({
+          name: 'SESSION_META_CHIPS_AT_BOUNDARY',
+          pass: problems.length === 0,
+          detail: problems.length === 0
+            ? 'model and agent chips are exact and boundary-sparse'
             : problems.join('; '),
         });
       }
@@ -2668,11 +2831,11 @@
     return out;
   }
 
-  // --- single-pane activation vs chevron routing ---------------------------
+  // --- single-pane activation vs disclosure routing ------------------------
 
   // A row click must SELECT inline without fetching details or opening another
-  // surface. Double-click is the explicit raw-JSON editor activation; ONLY the
-  // chevron toggles bundled sub-ops.
+  // surface. Double-click is the explicit raw-JSON editor activation; both the
+  // explicit chevron and its full parent row toggle bundled sub-ops.
   async function runSinglePaneRouting(timeoutMs) {
     const out = { steps: [] };
     const captured = [];
@@ -2686,7 +2849,7 @@
     const rawCapable = rowEls.find((el) => {
       const abs = Number(el.getAttribute('data-row'));
       const row = window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
-      return row && (row.op_id || row.git_oid);
+      return row && (row.op_id || row.git_oid) && !(row.sub_ops || []).length;
     });
     if (!rawCapable) throw new Error('no raw-JSON-capable rendered row');
     const key = rawCapable.getAttribute('data-key');
@@ -2724,10 +2887,9 @@
         !!(layoutEl && layoutEl.classList.contains('has-detail')),
     });
 
-    // Chevron routing: on a combined row, chevron click must NOT open the
-    // raw editor or another pane — it only toggles expansion. Re-query the DOM fresh around
-    // each interaction because expansion REBUILDS the rows (stale elements
-    // never reflect the new aria-expanded state).
+    // Disclosure routing: on a combined row, chevron and full-row clicks must
+    // toggle without opening raw JSON or another pane. Re-query around each
+    // interaction because expansion rebuilds the rows.
     const chevronBtn = document.querySelector('.row .subop-chevron');
     if (chevronBtn) {
       const chevronRow = chevronBtn.closest('.row');
@@ -2747,8 +2909,16 @@
       const activationsBeforeDoubleClick = captured.length;
       const freshChevron = freshRow && freshRow.querySelector('.subop-chevron');
       if (freshChevron) freshChevron.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+      if (freshRow) freshRow.click();
+      await whenIdle(timeoutMs || 5000);
+      const afterRowClick = Array.from(document.querySelectorAll('.row')).find(
+        (r) => r.getAttribute('data-key') === chevronKey
+      );
+      const expandedAfterRowClick = afterRowClick
+        ? afterRowClick.getAttribute('aria-expanded')
+        : null;
       out.steps.push({
-        name: 'chevron-only',
+        name: 'disclosure-routing',
         hadSubops,
         expandedBefore,
         expandedAfter,
@@ -2758,10 +2928,11 @@
         secondaryPane: !!document.getElementById('detail') ||
           !!(layoutEl && layoutEl.classList.contains('has-detail')),
         toggled: hadSubops && expandedBefore !== expandedAfter,
+        rowToggled: expandedAfter !== expandedAfterRowClick,
       });
     } else {
       out.steps.push({
-        name: 'chevron-only',
+        name: 'disclosure-routing',
         skipped: true,
         detail: 'no combined row rendered in this scenario (skipped)',
       });
@@ -2781,6 +2952,7 @@
       s2.identityMatches === true &&
       s2.secondaryPane === false &&
       (s3.skipped || (s3.toggled === true &&
+        s3.rowToggled === true &&
         s3.rawActivationChanged === false &&
         s3.chevronDoubleClickOpenedRaw === false && s3.secondaryPane === false));
     return out;
@@ -2830,7 +3002,7 @@
     const rawCapable = (el) => {
       const abs = Number(el.getAttribute('data-row'));
       const row = window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
-      return row && (row.op_id || row.git_oid);
+      return row && (row.op_id || row.git_oid) && !(row.sub_ops || []).length;
     };
     const target = rawCapable(rovingRow) ? rovingRow : rowEls.find(rawCapable);
     if (!target) throw new Error('no keyboard-capable rendered row');

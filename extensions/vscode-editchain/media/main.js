@@ -1,6 +1,6 @@
 // Webview renderer for the EditChain History explorer.
 // Renders a git-graph-style visualization of unified history as one small SVG
-// per row (the node dot, vertical lane segments, and rounded cross-lane
+// per row (the node dot, vertical lane segments, and smooth cross-lane
 // transition paths) over a real table with columns: Graph | Content | Date |
 // Author | Commit/ID.
 //
@@ -339,13 +339,6 @@ const COLORS = ['#48f1dc', '#a18aff', '#6ee7a2', '#5ca8ff', '#ffc86a', '#ff70a6'
 
 const LANE_W = 18;
 const DOT_R = 4;
-// Corner radius (px) for rounded cross-lane transition elbows. Clamped by the
-// lane distance and row geometry at draw time (see buildTransitionPaths).
-const TRANSITION_R = 6;
-// Lane-centre distance (px) below which a transition's rounded corner would be
-// sub-pixel: at extreme compressed spacing the renderer falls back to a
-// straight orthogonal jog instead of a degenerate curve.
-const TRANSITION_MIN_DX = 1;
 // Execute-run bundle node glyph: typed Activity bundle rows replace the
 // ordinary single graph dot with a compact vertical capsule with separate
 // entry (above the row midpoint) and exit (below it) terminals. The terminal
@@ -644,6 +637,45 @@ function displaySummaryForRow(row, value) {
   if (row.outcome === 'cancelled') return 'Cancelled';
   if (row.record_role === 'action' || row.kind === 'command') return 'Tool request';
   return 'Tool result';
+}
+
+/** Split a Git conventional prefix from the first colon. This is presentation
+ * only: the service summary and raw commit message retain their exact bytes. */
+function gitSummaryParts(row, value) {
+  if (!row || !row.git_oid) return null;
+  const source = String(value);
+  const colon = source.indexOf(':');
+  if (colon <= 0) return null;
+  const prefix = source.slice(0, colon).trim();
+  if (!prefix) return null;
+  return {
+    prefix,
+    content: source.slice(colon + 1).trimStart(),
+  };
+}
+
+/** Render Git's leading prefix as a chip and omit the delimiter. Ordinary
+ * summaries keep the same Markdown-safe compositor. */
+function renderRowSummary(row, value) {
+  const git = gitSummaryParts(row, value);
+  if (!git) {
+    return '<span class="summary-text">' + renderMarkdownSummary(value) + '</span>';
+  }
+  const content = git.content
+    ? '<span class="summary-text git-summary-text">' +
+      renderMarkdownSummary(git.content) + '</span>'
+    : '';
+  return '<span class="git-prefix-chip" title="' + esc('Commit prefix: ' + git.prefix) +
+    '" aria-label="' + esc('Commit prefix: ' + git.prefix) + '">' +
+    esc(git.prefix) + '</span>' + content;
+}
+
+/** Plain-text equivalent of [`renderRowSummary`] for labels and de-duplication
+ * comparisons. The visible colon is intentionally absent here too. */
+function plainRowSummary(row, value) {
+  const git = gitSummaryParts(row, value);
+  if (!git) return markdownPlainSummary(value);
+  return markdownPlainSummary(git.prefix + (git.content ? ' ' + git.content : ''));
 }
 
 /** Find an unescaped closing Markdown delimiter. */
@@ -1198,7 +1230,7 @@ function laneX(lane) {
 /**
  * Build one row's graph cell: a small inline SVG drawing the node's dot, the
  * vertical line segments for lanes entering from above and leaving below, and
- * any rounded cross-lane transition paths at this row.
+ * any smooth cross-lane transition paths at this row.
  *
  * This is the per-row replacement for the old full-height SVG overlay. Because
  * each row carries its own graph geometry (lane, above, below, transitions)
@@ -1214,12 +1246,13 @@ function laneX(lane) {
  *
  * A cross-lane transition replaces the old hard three-line jog (source-lane
  * vertical half + horizontal connector + destination-lane vertical half) with
- * one rounded orthogonal path split into two exact halves: the source half
- * (source-lane colour) runs down the from-lane from the row boundary, rounds
- * onto the row midpoint, and ends at the geometric midpoint between the two
- * lanes; the destination half (destination-lane colour) continues from that
- * exact shared seam through the destination elbow and exits down the to-lane
- * at the row boundary. Each side is anchored to whatever actually connects it:
+ * a tangent-continuous Bézier curve split into two exact colour halves. When
+ * this row owns either endpoint node, the complete transition is one convex
+ * quadratic: it leaves or enters the node smoothly and bows outward toward the
+ * other lane without an inward hook. A boundary-to-boundary transition uses
+ * two convex quadratic halves sharing one horizontal tangent, so a long edge
+ * remains smooth while preserving vertical continuity with adjacent rows.
+ * Each side is anchored to whatever actually connects it:
  *
  *   - a transition whose child node lives on THIS row (`row.lane === fromLane`)
  *     begins exactly at the node dot (xFrom, midY) — never at y=0, which would
@@ -1277,8 +1310,13 @@ function buildGraphCell(row) {
   const rendered = [];
   for (const [fromLane, toLane] of transitions) {
     const startAtDot = row.lane === fromLane;
-    const endAtBoundary = below.indexOf(toLane) !== -1;
-    const endAtDot = !endAtBoundary && row.lane === toLane;
+    // Prefer the destination node when this row owns it, even if another edge
+    // continues down the same lane. The transition then enters the node on a
+    // smooth bottom-right/bottom-left curve while the ordinary `below` segment
+    // independently leaves the dot toward its own parent. Choosing the bottom
+    // boundary first made forks render from the opposite corner.
+    const endAtDot = row.lane === toLane;
+    const endAtBoundary = !endAtDot && below.indexOf(toLane) !== -1;
     const startConnected = startAtDot || above.indexOf(fromLane) !== -1;
     if (!startConnected || (!endAtBoundary && !endAtDot)) continue;
     rendered.push({ fromLane, toLane, startAtDot, endAtDot });
@@ -1314,8 +1352,8 @@ function buildGraphCell(row) {
     const startY = bundle && lane === nodeLane ? bundle.exitY : midY;
     s += `<line class="graphLine" x1="${x}" y1="${startY}" x2="${x}" y2="${height}" style="stroke:${colour}"/>`;
   }
-  // Rounded cross-lane transition paths at this row (drawn after the verticals
-  // so the elbows sit on top; the node dot is still painted last).
+  // Smooth cross-lane transition paths at this row (drawn after the verticals
+  // so the curves sit on top; the node dot is still painted last).
   for (const t of rendered) {
     s += buildTransitionPaths(t.fromLane, t.toLane, height, t.startAtDot, t.endAtDot, bundle);
   }
@@ -1356,25 +1394,17 @@ function fmt(v) {
  *
  * The transition runs from `fromLane` (production's child lane) to `toLane`
  * (production's parent lane) inside one row cell. Each side is anchored by
- * `buildGraphCell`: either at the row's own node dot (the dot sits on the row
- * midpoint, so that side runs straight along it — there is no vertical run to
- * round) or at the row boundary (y=0 / y=height), where the path owns the
- * vertical half and rounds onto the row midpoint. The path is split at the
- * geometric midpoint between the two lane centres on the row midpoint:
- *
- *   source half  — source-lane colour, from the source anchor through the
- *                  source elbow (boundary starts) to the shared seam;
- *   destination half — destination-lane colour, from the shared seam through
- *                  the destination elbow (boundary ends) to the destination
- *                  anchor.
+ * `buildGraphCell`: either at the row's own node dot or at the row boundary
+ * (y=0 / y=height). A node-to-boundary transition is one convex quadratic
+ * Bézier, split at t=0.5 with de Casteljau subdivision. The two emitted path
+ * halves therefore reproduce exactly the same curve and share the same tangent
+ * at their colour seam. A boundary-to-boundary transition cannot be globally
+ * convex while retaining vertical tangents at both ends, so it uses two convex
+ * quadratics that meet at the lane midpoint with one shared horizontal tangent.
+ * There are no straight elbows, corner-radius fallbacks, or concave hooks.
  *
  * Both halves reuse the exact same formatted seam coordinates (butt caps, no
- * gradients/defs), so the colour handoff is sharp and seam/gap-free. The
- * quadratic corner radius is clamped by the lane distance (the horizontal run
- * must never collapse) and by the row geometry (the vertical runs stay
- * non-empty on boundary-anchored sides; dot-anchored sides have no vertical
- * run at all and stay straight); below `TRANSITION_MIN_DX` of lane distance the
- * corner would be sub-pixel, so a straight orthogonal jog is drawn instead.
+ * gradients/defs), so the categorical colour handoff is sharp and gap-free.
  *
  * On a typed execute-run bundle row (`bundle` is non-null) the node spans
  * from the entry terminal (above the row midpoint) to the exit terminal
@@ -1387,65 +1417,56 @@ function buildTransitionPaths(fromLane, toLane, height, startAtDot, endAtDot, bu
   const x1 = laneX(fromLane);
   const x2 = laneX(toLane);
   const midY = height / 2;
-  // The vertical level of the shared seam: the row midpoint on ordinary rows;
-  // on a bundle row it moves to the exit terminal for an outgoing (child)
-  // anchor and to the entry terminal for an incoming (parent) anchor.
-  const seamY = startAtDot
-    ? (bundle ? bundle.exitY : midY)
-    : endAtDot
-      ? (bundle ? bundle.entryY : midY)
-      : midY;
-  const dx = Math.abs(x2 - x1);
-  // Each side rounds independently, clamped by ITS vertical run (zero for a
-  // dot-anchored side — no elbow, straight along the seam) and by half the
-  // lane distance.
-  const srcR = startAtDot ? 0 : Math.min(TRANSITION_R, dx / 2, seamY);
-  const dstR = endAtDot ? 0 : Math.min(TRANSITION_R, dx / 2, height - seamY);
-  const srcRounded = !startAtDot && dx >= TRANSITION_MIN_DX && srcR > 0;
-  const dstRounded = !endAtDot && dx >= TRANSITION_MIN_DX && dstR > 0;
-  const sgn = x2 >= x1 ? 1 : -1;
+  const start = [x1, startAtDot ? (bundle ? bundle.exitY : midY) : 0];
+  const end = [x2, endAtDot ? (bundle ? bundle.entryY : midY) : height];
   const srcColour = COLORS[fromLane % COLORS.length];
   const dstColour = COLORS[toLane % COLORS.length];
-  // Geometric midpoint of the two lane centres at the seam level — the exact
-  // shared seam (identical formatted numbers in both halves).
-  const xm = (x1 + x2) / 2;
-  let srcD;
-  let dstD;
-  if (startAtDot) {
-    // The transition's child node is this row's node mark (the dot, or — on a
-    // bundle row — the exit terminal): begin exactly at the node and run
-    // straight along the seam to the shared seam point.
-    srcD = 'M ' + fmt(x1) + ' ' + fmt(seamY) + ' L ' + fmt(xm) + ' ' + fmt(seamY);
-  } else if (srcRounded) {
-    srcD = 'M ' + fmt(x1) + ' 0' +
-      ' L ' + fmt(x1) + ' ' + fmt(seamY - srcR) +
-      ' Q ' + fmt(x1) + ' ' + fmt(seamY) + ' ' + fmt(x1 + sgn * srcR) + ' ' + fmt(seamY) +
-      ' L ' + fmt(xm) + ' ' + fmt(seamY);
+  let srcControl;
+  let dstControl;
+  let seam;
+
+  if (startAtDot !== endAtDot) {
+    // One endpoint is the row's node: construct a single convex quadratic and
+    // split it at t=0.5. The control point gives the boundary endpoint a
+    // vertical tangent and the node endpoint an outward horizontal tangent.
+    const control = startAtDot ? [x2, start[1]] : [x1, end[1]];
+    srcControl = midpoint(start, control);
+    dstControl = midpoint(control, end);
+    seam = midpoint(srcControl, dstControl);
+  } else if (!startAtDot) {
+    // Both endpoints are row boundaries. Two convex halves meet with an exact
+    // horizontal tangent at the geometric centre; adjacent row lines remain
+    // vertical at both external anchors.
+    seam = [(x1 + x2) / 2, (start[1] + end[1]) / 2];
+    srcControl = [x1, seam[1]];
+    dstControl = [x2, seam[1]];
   } else {
-    // Safe straight/near-straight fallback for extreme compressed spacing.
-    srcD = 'M ' + fmt(x1) + ' 0' +
-      ' L ' + fmt(x1) + ' ' + fmt(seamY) +
-      ' L ' + fmt(xm) + ' ' + fmt(seamY);
+    // Defensive fallback for the impossible ordinary-row case where both
+    // different lanes claim the same node: retain a smooth straight quadratic.
+    const control = midpoint(start, end);
+    srcControl = midpoint(start, control);
+    dstControl = midpoint(control, end);
+    seam = midpoint(srcControl, dstControl);
   }
-  if (endAtDot) {
-    // The transition's parent node is this row's node mark (the dot, or — on a
-    // bundle row — the entry terminal): run straight along the seam from the
-    // shared seam point and end exactly at the node.
-    dstD = 'M ' + fmt(xm) + ' ' + fmt(seamY) + ' L ' + fmt(x2) + ' ' + fmt(seamY);
-  } else if (dstRounded) {
-    dstD = 'M ' + fmt(xm) + ' ' + fmt(seamY) +
-      ' L ' + fmt(x2 - sgn * dstR) + ' ' + fmt(seamY) +
-      ' Q ' + fmt(x2) + ' ' + fmt(seamY) + ' ' + fmt(x2) + ' ' + fmt(seamY + dstR) +
-      ' L ' + fmt(x2) + ' ' + fmt(height);
-  } else {
-    dstD = 'M ' + fmt(xm) + ' ' + fmt(seamY) +
-      ' L ' + fmt(x2) + ' ' + fmt(seamY) +
-      ' L ' + fmt(x2) + ' ' + fmt(height);
-  }
+
+  const srcD = quadraticPath(start, srcControl, seam);
+  const dstD = quadraticPath(seam, dstControl, end);
   return '<path class="graphTransition graphTransitionSrc" d="' + srcD +
     '" style="stroke:' + srcColour + '"/>' +
     '<path class="graphTransition graphTransitionDst" d="' + dstD +
     '" style="stroke:' + dstColour + '"/>';
+}
+
+/** Midpoint of two SVG coordinates. */
+function midpoint(a, b) {
+  return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+}
+
+/** One compact quadratic SVG path with stable two-decimal coordinates. */
+function quadraticPath(start, control, end) {
+  return 'M ' + fmt(start[0]) + ' ' + fmt(start[1]) +
+    ' Q ' + fmt(control[0]) + ' ' + fmt(control[1]) +
+    ' ' + fmt(end[0]) + ' ' + fmt(end[1]);
 }
 
 /** Whether a row carries bundled metadata sub-ops (revealed on click). */
@@ -1543,6 +1564,16 @@ const ACTIVITY_LABELS = {
   system: { cls: 'act-system', text: 'system' },
 };
 
+/** Central visibility switches for deliberately optional, high-frequency row
+ * chrome. Keep the label/style implementations available, but default common
+ * success and source-control signals off so they do not repeat on every clean
+ * Git/tool row. Exceptional outcomes and all other meaningful activities stay
+ * visible. */
+const ROW_BADGE_OPTIONS = Object.freeze({
+  showSuccessOutcome: false,
+  showSourceControlActivity: false,
+});
+
 /** Whitelisted concise labels for the `outcome` field.
  *
  * Keys are EXACTLY the Rust wire enum: success/warning/failure/cancelled/
@@ -1552,13 +1583,14 @@ const ACTIVITY_LABELS = {
 const OUTCOME_LABELS = {
   success: { cls: 'outcome-success', text: 'ok' },
   warning: { cls: 'outcome-warning', text: 'warn' },
-  failure: { cls: 'outcome-failure', text: 'fail' },
+  failure: { cls: 'outcome-failure', text: '✕', aria: 'failed' },
   cancelled: { cls: 'outcome-neutral', text: 'cancelled' },
 };
 
 /** Compact semantic activity badge ('' when the row is a plain message). */
 function activityBadge(row) {
   const kind = row.activity_kind;
+  if (kind === 'source_control' && !ROW_BADGE_OPTIONS.showSourceControlActivity) return '';
   const label = Object.prototype.hasOwnProperty.call(ACTIVITY_LABELS, kind)
     ? ACTIVITY_LABELS[kind]
     : null;
@@ -1570,12 +1602,13 @@ function activityBadge(row) {
 /** Compact semantic outcome badge ('' when the row has no reported outcome). */
 function outcomeBadge(row) {
   const outcome = row.outcome;
+  if (outcome === 'success' && !ROW_BADGE_OPTIONS.showSuccessOutcome) return '';
   const label = Object.prototype.hasOwnProperty.call(OUTCOME_LABELS, outcome)
     ? OUTCOME_LABELS[outcome]
     : null;
   if (!label) return '';
   return '<span class="out-badge ' + label.cls + '" title="outcome: ' + esc(outcome) +
-    '" aria-label="outcome: ' + esc(label.text) + '">' + esc(label.text) + '</span>';
+    '" aria-label="outcome: ' + esc(label.aria || label.text) + '">' + esc(label.text) + '</span>';
 }
 
 // --- Activity work-unit / bundle / promotion layer --------------------------
@@ -1632,9 +1665,52 @@ function workUnitTitle(row) {
   return groupLabelText(row.group);
 }
 
-/** Human count text for a work-unit header, from the exact DTO count. */
+/** Human count text for a work-unit header, from the exact DTO count. "Entry"
+ * describes what is actually counted without exposing the wire-level record
+ * vocabulary in the UI. */
 function workUnitCountText(count) {
-  return String(count) + (count === 1 ? ' record' : ' records');
+  return String(count) + (count === 1 ? ' entry' : ' entries');
+}
+
+/** Keep grouping counts sparse. A source-control section already reads as a
+ * Git history and the native VS Code graph does not append a commit count to
+ * its section title; single-entry units likewise need no annotation. */
+function showWorkUnitCount(row, wu) {
+  return !!wu && Number.isFinite(wu.count) && wu.count > 1 &&
+    row.activity_kind !== 'source_control';
+}
+
+/** Tooltip explaining exactly what a work-unit count measures. */
+function workUnitCountTitle(count) {
+  return workUnitCountText(count) + ' grouped in this activity';
+}
+
+/** The small, display-safe session provenance supplied by the service. */
+function sessionMetaValues(row) {
+  const meta = row && row.session_meta;
+  if (!meta || typeof meta !== 'object') return [];
+  const values = [];
+  if (typeof meta.model_provider === 'string' && meta.model_provider.trim()) {
+    values.push({ cls: 'session-chip-model', label: meta.model_provider.trim(), title: 'Model provider' });
+  }
+  if (typeof meta.agent_nickname === 'string' && meta.agent_nickname.trim()) {
+    values.push({ cls: 'session-chip-agent', label: meta.agent_nickname.trim(), title: 'Agent' });
+  }
+  return values;
+}
+
+/** Session chips are inserted only at a rendered session boundary, matching
+ * native Git ref labels instead of repeating the same provenance on every row. */
+function sessionMetaChips(row) {
+  return sessionMetaValues(row).map((item) =>
+    '<span class="session-chip ' + item.cls + '" title="' + esc(item.title + ': ' + item.label) +
+    '" aria-label="' + esc(item.title + ': ' + item.label) + '">' + esc(item.label) + '</span>'
+  ).join('');
+}
+
+/** Accessible prose corresponding to the visible session chips. */
+function sessionMetaDescription(row) {
+  return sessionMetaValues(row).map((item) => item.title + ' ' + item.label).join(', ');
 }
 
 /** CSS classes for a row's work-unit boundary role: start (unit header),
@@ -1676,14 +1752,19 @@ function promotedClasses(row) {
  * the DTO's `member_count` (never parsed from the summary or flattened sub-op
  * count). A quiet check appears only when structured success evidence exists;
  * unknown outcome adds no pessimistic "outcome unknown" label. */
-function bundleChrome(row) {
+function bundleCountText(row) {
   const bundle = row.activity_bundle;
   const mc = bundle ? bundle.member_count : undefined;
   if (typeof mc !== 'number') return '';
   const command = row.kind === 'command';
-  const countText = mc + (command
+  return mc + (command
     ? (mc === 1 ? ' command' : ' commands')
     : (mc === 1 ? ' tool step' : ' tool steps'));
+}
+
+function bundleChrome(row) {
+  const countText = bundleCountText(row);
+  if (!countText) return '';
   const success = row.outcome === 'success';
   const title = countText + (success ? ', completed' : '');
   return '<span class="bundle-count" title="' + esc(title) + '">' + esc(countText) + '</span>' +
@@ -1697,7 +1778,8 @@ function bundleChrome(row) {
  * Typed bundles own their complete compact label, so they never repeat `run`,
  * `ok`, and a synthetic summary beside the same count. Structural relations
  * outrank generic activity; when one exists, only a negative/cancelled outcome
- * may accompany it. Routine successful conversation rows remain pure prose. */
+ * may accompany it. Common success and source-control chips are governed by
+ * `ROW_BADGE_OPTIONS` and default off. */
 function rowSemanticChrome(row, isBundle) {
   if (isBundle) return bundleChrome(row);
   const relations = relationBadges(row);
@@ -1707,11 +1789,7 @@ function rowSemanticChrome(row, isBundle) {
     return relations + (consequential ? outcomeBadge(row) : '');
   }
   const activity = activityBadge(row);
-  const routineNarrativeSuccess = row.record_role === 'narrative' &&
-    row.activity_kind === 'conversation' && row.outcome === 'success';
-  const routineToolSuccess = (row.record_role === 'action' || row.record_role === 'result') &&
-    row.activity_kind === 'execute' && row.outcome === 'success';
-  return activity + (routineNarrativeSuccess || routineToolSuccess ? '' : outcomeBadge(row));
+  return activity + outcomeBadge(row);
 }
 
 /** Whitelisted record-role class used for typographic hierarchy. Older rows
@@ -1737,10 +1815,10 @@ function shortCommitId(row) {
 /** Build one row's HTML from its cached HistoryRow. `absIdx` is its absolute index.
  *
  * Two kinds of rows:
- *   - Top-level rows carrying bundled sub-ops get a chevron BUTTON in their
- *     content cell; only that button toggles inline expansion (revealing one
- *     uniform ROW_H row per sub-op directly below). Clicking the row selects it
- *     inline; double-click opens its raw JSON editor.
+ *   - Top-level rows carrying bundled sub-ops get a native-style disclosure
+ *     chevron. The whole row is the disclosure target (revealing one uniform
+ *     ROW_H row per sub-op directly below), while double-click still opens its
+ *     raw JSON editor.
  *   - Sub-op rows (`row.is_subop`) render indented with a small Codicon; clicking
  *     selects them inline.
  *
@@ -1778,30 +1856,39 @@ function buildRowHtml(row, absIdx, isGroupStart) {
     ? ' row-role-' + row.record_role
     : '';
   const semanticChrome = rowSemanticChrome(row, isBundle);
+  const hasSessionMeta = !row.is_subop && sessionMetaValues(row).length > 0;
+  const sessionChrome = hasSessionMeta && isGroupStart ? sessionMetaChips(row) : '';
+  const sessionSlot = hasSessionMeta
+    ? '<span class="session-meta-slot">' + sessionChrome + '</span>'
+    : '';
   // Badge rows are graph-topology-critical; the CSS override lifts their text
   // cells out of the tool/dim opacity dimming so the badge stays readable at
   // full strength (row height is untouched — the class only affects opacity).
-  const relClass = semanticChrome ? ' row-has-badges' : '';
+  const relClass = semanticChrome || sessionChrome ? ' row-has-badges' : '';
   const selectedClass = row.node_key === selectedRowKey ? ' row-selected' : '';
   const summaryText = row.summary || '(no summary)';
   const displaySummary = displaySummaryForRow(row, summaryText);
-  const plainSummary = markdownPlainSummary(displaySummary) || '(no summary)';
+  const plainSummary = plainRowSummary(row, displaySummary) || '(no summary)';
   const detailSummary = markdownPlainSummary(summaryText) || '(no summary)';
   const unitTitle = isWuStart ? workUnitTitle(row) : '';
   const hasSubs = !row.is_subop && hasSubOps(row);
+  const subOpCount = Array.isArray(row.sub_ops) ? row.sub_ops.length : 0;
   const expanded = hasSubs && expandedBlocks.has(blockIndexOfAbs(absIdx));
-  // Bundle rows are expandable disclosures: they always expose aria-expanded
-  // reflecting the current reveal state (the service ships their folded
-  // members as sub_ops, so toggling reveals them).
-  const expandable = hasSubs || isBundle;
+  // Every row with children is one full-width disclosure target. Typed bundles
+  // normally carry children; `hasSubs` remains authoritative if a partial or
+  // forward-compatible payload arrives without them.
+  const expandable = hasSubs;
   const expandableAttr = expandable
     ? ' aria-expanded="' + (expanded ? 'true' : 'false') + '"'
     : '';
   const chevron = expanded ? '▾' : '▸';
+  const childLabel = isBundle && bundleCountText(row)
+    ? bundleCountText(row)
+    : String(subOpCount) + (subOpCount === 1 ? ' detail' : ' details');
+  const disclosureLabel = (expanded ? 'Collapse ' : 'Expand ') + childLabel;
   const chevronHtml = hasSubs
-    ? '<button type="button" class="subop-chevron" title="' +
-      (expanded ? 'Collapse bundled metadata records' : 'Expand bundled metadata records') +
-      '" aria-label="' + (expanded ? 'Collapse bundled metadata records' : 'Expand bundled metadata records') +
+    ? '<button type="button" class="subop-chevron" title="' + esc(disclosureLabel) +
+      '" aria-label="' + esc(disclosureLabel) +
       '"' + expandableAttr + '>' + chevron + '</button>'
     : '';
   const semanticHtml = semanticChrome
@@ -1815,15 +1902,13 @@ function buildRowHtml(row, absIdx, isGroupStart) {
     content = '<span class="subop-icon codicon codicon-' + icon + '" aria-hidden="true"></span>' +
       '<span class="subop-summary">' + renderMarkdownSummary(displaySummary) + '</span>';
   } else {
-    // Top-level row: the chevron BUTTON toggles inline expansion (the only
-    // control that does); the row itself is a normal inline-selection
-    // target. Typed bundles use their one structured label as the whole compact
-    // summary; their generated `N tool steps (success)` string is deliberately
-    // not repeated. Ordinary rows keep at most the restrained semantic prefix
-    // followed by a flexible, safely rendered Markdown preview.
-    content = chevronHtml + semanticHtml + (isBundle
+    // Top-level row: the chevron makes disclosure obvious and the whole row
+    // toggles it. Typed bundles use their one structured label as the whole
+    // compact summary; their generated `N tool steps (success)` string is not
+    // repeated. Session chips appear once at the session boundary.
+    content = chevronHtml + (isWuStart ? '' : sessionSlot) + semanticHtml + (isBundle
       ? ''
-      : '<span class="summary-text">' + renderMarkdownSummary(displaySummary) + '</span>');
+      : renderRowSummary(row, displaySummary));
   }
   if (isWuStart) {
     // Compact two-line unit header inside the fixed ROW_H: the unit title +
@@ -1831,12 +1916,13 @@ function buildRowHtml(row, absIdx, isGroupStart) {
     // itself the start row, the title and summary are identical; render it once
     // and vertically center the header instead of duplicating the sentence.
     workUnitTitleOnly = unitTitle === plainSummary;
-    const countHtml = typeof wu.count === 'number'
-      ? '<span class="work-unit-count" title="' + esc(workUnitCountText(wu.count)) + '">' +
+    const countHtml = showWorkUnitCount(row, wu)
+      ? '<span class="work-unit-count" title="' + esc(workUnitCountTitle(wu.count)) + '">' +
         esc(workUnitCountText(wu.count)) + '</span>'
       : '';
     content = '<span class="work-unit-ribbon-line">' +
       '<span class="work-unit-ribbon" title="' + esc(unitTitle) + '">' + esc(unitTitle) + '</span>' +
+      sessionSlot +
       countHtml + '</span>' + (workUnitTitleOnly
       ? ''
       : '<span class="work-unit-row-line">' + content + '</span>');
@@ -1854,6 +1940,10 @@ function buildRowHtml(row, absIdx, isGroupStart) {
   } else if (isWuStart) {
     ariaLabel = workUnitTitleOnly ? unitTitle : unitTitle + ': ' + plainSummary;
   }
+  const baseAriaLabel = ariaLabel;
+  if (isGroupStart && hasSessionMeta) {
+    ariaLabel += ', ' + sessionMetaDescription(row);
+  }
   // Roving tabindex: exactly one row per rendered window is tabbable (the rest
   // are focusable-but-not-tabbable so keyboard users step through the grid as
   // a unit; see applyRovingTabindex and the ArrowUp/Down handling).
@@ -1868,10 +1958,12 @@ function buildRowHtml(row, absIdx, isGroupStart) {
         : '')
     : '';
   return '<div class="row ' + kindClass + humanClass + subopClass + roleClass + relClass + selectedClass + groupClass +
-    workUnitClasses(row) + (isBundle ? ' row-activity-bundle' : '') + promotedCls +
+    workUnitClasses(row) + (isBundle ? ' row-activity-bundle' : '') +
+    (expandable ? ' row-expandable' : '') + promotedCls +
     '" role="row" tabindex="' + rovingTab + '" aria-selected="' + (row.node_key === selectedRowKey ? 'true' : 'false') + '"' +
     expandableAttr +
     ' aria-label="' + esc(ariaLabel) + '" title="' + esc(detailSummary) + '"' +
+    ' data-base-aria-label="' + esc(baseAriaLabel) + '"' +
     ' data-key="' + esc(row.node_key) +
     '" data-row="' + absIdx + '"' + wuAttrs + bundleAttrs + ' style="' + colStyle() + '">' +
     groupLabel +
@@ -1918,6 +2010,15 @@ function setGroupStart(el, row, isGroupStart) {
     el.classList.remove('row-group-start');
     const label = el.querySelector('.group-label');
     if (label) label.remove();
+  }
+  const sessionSlot = el.querySelector('.session-meta-slot');
+  if (sessionSlot) {
+    sessionSlot.innerHTML = isGroupStart ? sessionMetaChips(row) : '';
+    const hasOtherBadges = !!el.querySelector('.row-meta');
+    el.classList.toggle('row-has-badges', isGroupStart || hasOtherBadges);
+    const baseAria = el.getAttribute('data-base-aria-label') || '';
+    const sessionDescription = isGroupStart ? sessionMetaDescription(row) : '';
+    el.setAttribute('aria-label', baseAria + (sessionDescription ? ', ' + sessionDescription : ''));
   }
 }
 
@@ -2114,10 +2215,10 @@ function toggleExpandFor(row, absIdx) {
   }
 }
 
-/** Keyboard toggle of a bundle row's reveal state (disclosure semantics).
- * After the reanchor rebuilds the window, re-focus the fresh bundle row so
+/** Keyboard toggle of a row's reveal state (disclosure semantics).
+ * After the reanchor rebuilds the window, re-focus the fresh parent row so
  * keyboard focus survives the DOM replacement. */
-function toggleBundleKeyboard(row, absIdx) {
+function toggleDisclosureKeyboard(row, absIdx) {
   toggleExpandFor(row, absIdx);
   const w = wrapEl();
   if (w) {
@@ -2130,9 +2231,9 @@ function attachRowClicks() {
   const w = wrapEl();
   if (!w) return;
   w.querySelectorAll('.row').forEach((el) => {
-    // The chevron is the ONLY pointer control that toggles bundled sub-ops.
-    // A normal click is deliberately local to this single-pane surface;
-    // double-click is the explicit pointer gesture for raw JSON.
+    // The chevron remains the explicit disclosure affordance, but the complete
+    // parent row is the click target, matching VS Code's native Git graph.
+    // Double-click remains the explicit pointer gesture for raw JSON.
     const chevron = el.querySelector('.subop-chevron');
     if (chevron) {
       chevron.addEventListener('click', (e) => {
@@ -2140,13 +2241,23 @@ function attachRowClicks() {
         e.stopPropagation();
         const absIdx = parseInt(el.getAttribute('data-row'), 10);
         const row = cache.get(absIdx);
-        if (row) toggleExpandFor(row, absIdx);
+        if (row) {
+          selectRow(row, absIdx);
+          toggleExpandFor(row, absIdx);
+        }
       });
     }
-    el.addEventListener('click', () => {
+    el.addEventListener('click', (e) => {
+      if (e.target.closest && e.target.closest('button')) return;
+      // A real double-click emits two click events first. Let the first one
+      // toggle once, but ignore the second so the disclosure does not snap
+      // closed again immediately before raw JSON opens.
+      if (e.detail > 1) return;
       const absIdx = parseInt(el.getAttribute('data-row'), 10);
       const row = cache.get(absIdx);
-      if (row) selectRow(row, absIdx);
+      if (!row) return;
+      selectRow(row, absIdx);
+      if (!row.is_subop && hasSubOps(row)) toggleExpandFor(row, absIdx);
     });
     el.addEventListener('dblclick', (e) => {
       if (e.target.closest && e.target.closest('button')) return;
@@ -2162,8 +2273,8 @@ function attachRowClicks() {
 // Keyboard activation: ArrowUp/Down move focus between rendered rows (roving
 // tabindex — only the current row is in the tab order, so Tab enters/exits the
 // grid as a unit instead of tabbing through every virtualized row); Enter opens
-// raw JSON for an ordinary row; Space selects, or toggles bundled sub-ops when
-// the row has them (chevron behaviour). The chevron button handles its
+// raw JSON for an ordinary row; Enter/Space toggle any row with children. The
+// chevron button handles its
 // own Enter/Space via native button activation (we skip events originating
 // inside it to avoid a double toggle).
 rowsEl.addEventListener('keydown', (e) => {
@@ -2187,20 +2298,19 @@ rowsEl.addEventListener('keydown', (e) => {
     return;
   }
   if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
-    // Bundle rows are expandable disclosures: ArrowRight expands a collapsed
-    // run, ArrowLeft collapses an expanded one. Only bundle rows respond —
-    // ordinary rows keep ArrowUp/Down roving navigation only.
+    // Expandable rows use standard tree semantics: ArrowRight expands a
+    // collapsed row and ArrowLeft collapses an expanded one.
     const el = e.target.closest('.row');
     if (!el) return;
     const absIdx = parseInt(el.getAttribute('data-row'), 10);
     const row = cache.get(absIdx);
-    if (!row || !isExecuteRunBundle(row)) return;
+    if (!row || row.is_subop || !hasSubOps(row)) return;
     const expanded = expandedBlocks.has(blockIndexOfAbs(absIdx));
     const wantsToggle = (e.key === 'ArrowRight' && !expanded) ||
       (e.key === 'ArrowLeft' && expanded);
     if (wantsToggle) {
       e.preventDefault();
-      toggleBundleKeyboard(row, absIdx);
+      toggleDisclosureKeyboard(row, absIdx);
     }
     return;
   }
@@ -2212,14 +2322,10 @@ rowsEl.addEventListener('keydown', (e) => {
   const absIdx = parseInt(el.getAttribute('data-row'), 10);
   const row = cache.get(absIdx);
   if (!row) return;
-  if (isExecuteRunBundle(row)) {
-    // Enter/Space toggle the run's reveal state (disclosure semantics) and
+  if (!row.is_subop && hasSubOps(row)) {
+    // Enter/Space toggle the row's reveal state (disclosure semantics) and
     // re-focus the rebuilt row so focus survives the reanchor.
-    toggleBundleKeyboard(row, absIdx);
-    return;
-  }
-  if (e.key === ' ' && hasSubOps(row) && !row.is_subop) {
-    toggleExpandFor(row, absIdx);
+    toggleDisclosureKeyboard(row, absIdx);
     return;
   }
   selectRow(row, absIdx);

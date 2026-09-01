@@ -366,6 +366,25 @@ pub struct SessionMetaProjection {
     pub cli_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
+    /// Git state captured by Codex when the session started. This is a
+    /// session-level snapshot, never per-turn state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git: Option<SessionGitProjection>,
+}
+
+/// Git state recorded on the Codex `session_meta` line.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionGitProjection {
+    /// Exact commit checked out when the session started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_hash: Option<String>,
+    /// Branch name observed at session start (provenance only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Repository remote URL observed at session start (provenance only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]

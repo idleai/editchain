@@ -94,6 +94,7 @@ pub fn read_session_file(
         byte_offset: offset + bytes_read,
         ops_emitted: cursor.map_or(0, |c| c.ops_emitted) + lines.len() as u64,
         content_hash,
+        normalization_version: cursor.map_or(0, |c| c.normalization_version),
     };
 
     Ok((lines, bytes_read, new_cursor))

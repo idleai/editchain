@@ -651,84 +651,6 @@ fn sequential_explicit_git_links_reuse_operation_lanes() {
     }
 }
 
-/// Real-corpus shape: many wall-clock-sequential sessions all retain the same
-/// weak inferred `BasedOn` commit. That provenance must not become 167 live
-/// causal edges or force one permanent operation lane per imported session.
-#[test]
-fn sequential_sessions_sharing_inferred_base_reuse_single_op_lane() {
-    const SESSION_COUNT: usize = 167;
-    let mut ops = Vec::with_capacity(SESSION_COUNT.saturating_mul(2));
-    for session in 0..SESSION_COUNT {
-        let ordinal = u64::try_from(session).unwrap().saturating_add(1);
-        let first_ms = 1_000_000_u64.saturating_add(ordinal.saturating_mul(10_000));
-        let first = msg(ordinal, first_ms, ordinal, None);
-        let second = msg(
-            ordinal,
-            first_ms.saturating_add(1_000),
-            ordinal,
-            Some(first.id),
-        );
-        ops.push(first);
-        ops.push(second);
-    }
-
-    let mut shared_base = git_commit(42, &[]);
-    shared_base.author.when = 1_000;
-    shared_base.committer.when = 1_000;
-    shared_base.authored_at = 1_000;
-    shared_base.committed_at = 1_000;
-    let shared_base_key = shared_base.oid.to_hex();
-
-    let mut projection = HistoryProjection::from_ops(ops);
-    projection.merge_git_commits(vec![shared_base]);
-    projection.link_history();
-
-    let based_on_count = projection
-        .git
-        .links
-        .values()
-        .flatten()
-        .filter(|link| matches!(&link.kind, GitLinkKind::BasedOn))
-        .count();
-    assert_eq!(
-        based_on_count, SESSION_COUNT,
-        "every session must retain its weak Git provenance metadata"
-    );
-
-    let nodes = projection.nodes();
-    for node in &nodes {
-        if node.git_oid().is_none() {
-            assert!(
-                !projection
-                    .lifted_parent_keys(node)
-                    .contains(&shared_base_key),
-                "BasedOn provenance must not appear in causal parent keys"
-            );
-        }
-    }
-
-    let layout = projection.graph_layout();
-    let max_lane = layout.rows.iter().map(|row| row.lane).max().unwrap_or(0);
-    assert_eq!(
-        max_lane, 1,
-        "git lane 0 plus one lane reused by all sequential sessions"
-    );
-    for row in &layout.rows {
-        let expected_lane = usize::from(row.node != shared_base_key);
-        assert_eq!(
-            row.lane, expected_lane,
-            "Git must remain on lane 0 and every sequential session on lane 1"
-        );
-    }
-    assert!(
-        layout
-            .edges
-            .iter()
-            .all(|edge| edge.parent != shared_base_key),
-        "weak BasedOn metadata must not emit operation-to-Git graph edges"
-    );
-}
-
 /// Repeated sequential fork diamonds inside one session reuse the freed branch
 /// lane: diamond k's branches render on the same two columns as diamond 0's
 /// instead of claiming a fresh lane per diamond.
@@ -1299,8 +1221,10 @@ fn per_row_transitions_for_fork_then_merge_diamond() {
 }
 
 // ---------------------------------------------------------------------------
-// Adjacent cross-lane edges: the jog originates at the child's own midpoint,
-// so no source-lane halves may be emitted at the child row.
+// Adjacent merge-only cross-lane edges: the jog originates at the child's own
+// midpoint, so no source-lane halves may be emitted at the child row. True
+// forks and operation→Git session anchors are covered separately below and
+// bend in the parent row.
 // ---------------------------------------------------------------------------
 
 /// Adjacent cross-lane transition direction and exact halves.
@@ -1371,15 +1295,14 @@ fn adjacent_cross_lane_transition_direction_and_exact_halves() {
     );
 }
 
-/// A lone adjacent cross-lane edge must not create dangling source halves.
+/// A lone adjacent fork must bend in the parent row without dangling halves.
 ///
 /// Fork: A (row 2) has children C (row 0, first, same lane) and B (row 1,
-/// second, distinct lane). B->A is a LONE adjacent cross-lane edge: nothing
-/// else touches B's lane at B's row, so B's lane must appear in NEITHER the
-/// top nor the bottom half at row 1. The destination lane's halves stay (the
-/// same-lane C->A edge also passes through row 1 on A's lane).
+/// second, distinct lane). B->A is a true fork edge, so B's lane leaves its dot
+/// downward, enters A's row from above, and curves into A's dot there. The
+/// same-lane C->A trunk continues independently on A's lane.
 #[test]
-fn lone_adjacent_cross_lane_edge_has_no_dangling_source_halves() {
+fn lone_adjacent_fork_anchors_transition_at_parent() {
     let nodes = vec!["C".to_string(), "B".to_string(), "A".to_string()];
     let parents = parents_from(&[("B", &["A"]), ("C", &["A"])]);
     let ctx = LayoutContext::new(&nodes, &parents, &no_git);
@@ -1394,20 +1317,31 @@ fn lone_adjacent_cross_lane_edge_has_no_dangling_source_halves() {
     assert_eq!(row_of("B"), 1, "B is immediately above A");
     assert_eq!(row_of("A"), 2, "A is the parent row");
 
-    // The adjacent jog happens at B's own row, directed B -> A.
+    // The fork transition belongs to A's own row, directed B -> A. This gives
+    // the webview the top-right source + destination-dot anchors required for
+    // a smooth bottom-right curve.
     assert_eq!(
-        ctx.row_transitions.get(1).map_or(&[][..], Vec::as_slice),
+        ctx.row_transitions.get(2).map_or(&[][..], Vec::as_slice),
         &[(b_lane, a_lane)][..],
-        "lone adjacent edge must transition at the child row"
+        "lone adjacent fork must transition at the parent row"
     );
-    // B's lane appears in neither half at B's own row — no dangling stubs.
+    assert!(
+        ctx.row_transitions.get(1).is_some_and(Vec::is_empty),
+        "child row must not carry the reversed-side transition"
+    );
+    // B is a branch tip: no line enters above its dot; its own lane leaves
+    // downward and is continued into the top half of A's row.
     assert!(
         !ctx.row_above.get(1).is_some_and(|a| a.contains(&b_lane)),
-        "no source-lane top half for a lone adjacent edge"
+        "no source-lane top half above the branch tip"
     );
     assert!(
-        !ctx.row_below.get(1).is_some_and(|b| b.contains(&b_lane)),
-        "no source-lane bottom half for a lone adjacent edge"
+        ctx.row_below.get(1).is_some_and(|b| b.contains(&b_lane)),
+        "branch lane must leave the child dot downward"
+    );
+    assert!(
+        ctx.row_above.get(2).is_some_and(|a| a.contains(&b_lane)),
+        "branch lane must enter the anchor row from above"
     );
     // The destination lane keeps its halves at row 1 (C->A passes through A's
     // lane here too) and enters the parent row from above.
@@ -1421,7 +1355,7 @@ fn lone_adjacent_cross_lane_edge_has_no_dangling_source_halves() {
     );
     assert!(
         ctx.row_above.get(2).is_some_and(|a| a.contains(&a_lane)),
-        "destination lane enters the parent row from above"
+        "same-lane trunk independently enters the parent row from above"
     );
     // A is a root: no line leaves it downward, and no other transitions exist.
     let no_lanes: &[usize] = &[];
@@ -1433,6 +1367,91 @@ fn lone_adjacent_cross_lane_edge_has_no_dangling_source_halves() {
     assert!(
         ctx.row_transitions.first().is_some_and(Vec::is_empty),
         "same-lane C->A edge emits no transition"
+    );
+}
+
+/// An exact session→Git anchor uses the same parent-row orientation even when
+/// the commit has no second visible child yet.
+#[test]
+fn session_git_anchor_curves_into_git_parent_row() {
+    let nodes = vec!["session".to_string(), "git".to_string()];
+    let parents = parents_from(&[("session", &["git"])]);
+    let is_git = |key: &str| key == "git";
+    let ctx = LayoutContext::new(&nodes, &parents, &is_git);
+    let lane_of = |key: &str| ctx.lanes.iter().find(|row| row.node == key).unwrap().lane;
+    let session_lane = lane_of("session");
+    let git_lane = lane_of("git");
+    assert_ne!(session_lane, git_lane, "session and Git use distinct lanes");
+    assert!(
+        ctx.row_transitions.first().is_some_and(Vec::is_empty),
+        "the child row must not render the reversed-side curve"
+    );
+    assert_eq!(
+        ctx.row_transitions.get(1).map_or(&[][..], Vec::as_slice),
+        &[(session_lane, git_lane)],
+        "the curve belongs in the Git anchor row"
+    );
+    assert_eq!(
+        ctx.row_below.first().map_or(&[][..], Vec::as_slice),
+        &[session_lane],
+        "the session lane leaves its node downward"
+    );
+    assert_eq!(
+        ctx.row_above.get(1).map_or(&[][..], Vec::as_slice),
+        &[session_lane],
+        "the session lane enters the Git row from above"
+    );
+
+    let layout = compute_graph_layout(&nodes, &parents, &is_git);
+    assert_eq!(layout.edges.len(), 1);
+    let edge = layout.edges.first().expect("session-to-Git edge");
+    assert_eq!(
+        edge.points
+            .iter()
+            .map(|point| (point.row, point.lane))
+            .collect::<Vec<_>>(),
+        vec![(0, session_lane), (1, session_lane), (1, git_lane)],
+        "edge points must turn in the Git parent row"
+    );
+}
+
+/// A parent-row bend must not be pulled upward to the viewport boundary when
+/// the Git anchor itself is still below the visible window.
+#[test]
+fn session_git_anchor_stays_vertical_until_parent_row_is_visible() {
+    let nodes = vec![
+        "session".to_string(),
+        "filler".to_string(),
+        "git".to_string(),
+    ];
+    let parents = parents_from(&[("session", &["git"])]);
+    let is_git = |key: &str| key == "git";
+    let ctx = LayoutContext::new(&nodes, &parents, &is_git);
+    let session_lane = *ctx.lane_at.get("session").expect("session lane");
+    let git_lane = *ctx.lane_at.get("git").expect("Git lane");
+    assert_ne!(session_lane, git_lane);
+
+    // Only the session row is visible. Row 1 is the lower viewport boundary;
+    // the real curve belongs at the Git parent on row 2, so this slice must be
+    // a straight continuation of the session lane.
+    let edge = ctx
+        .edges_for_window(0, 1)
+        .into_iter()
+        .find(|edge| edge.child == "session" && edge.parent == "git")
+        .expect("session-to-Git edge");
+    assert_eq!(
+        edge.points,
+        vec![
+            GridPoint {
+                row: 0,
+                lane: session_lane,
+            },
+            GridPoint {
+                row: 1,
+                lane: session_lane,
+            },
+        ],
+        "an offscreen Git anchor must not create an early boundary curve"
     );
 }
 
@@ -1627,8 +1646,8 @@ fn adjacent_cross_lane_edge_points_have_no_duplicate_open_start() {
 // ---------------------------------------------------------------------------
 
 use editchain_core::{
-    ActorId, Clock, GitLinkKind, MessageOp, NoteOp, NoteRelationship, Op, OpKind, ParentSet,
-    Payload, ScopeRef, SessionId, Tags,
+    ActorId, Clock, MessageOp, NoteOp, NoteRelationship, Op, OpKind, ParentSet, Payload, ScopeRef,
+    SessionId, Tags,
 };
 
 /// A standalone message op, scoped to a session, with a causal parent.

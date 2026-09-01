@@ -516,7 +516,8 @@ test('profile switch with a held window clears work-unit/bundle grouping; raw st
     assert.equal(baseline.dataReady, true);
     assert.equal(baseline.state.any, true,
       'Activity must render the work-unit/bundle/promotion contract');
-    assert.ok(baseline.state.markers.workUnit >= 12, 'work-unit markers rendered in Activity');
+    assert.ok(baseline.state.markers.workUnit >= 11,
+      'work-unit markers render with the Git section count intentionally suppressed');
     assert.ok(baseline.state.markers.bundle >= 4, 'bundle rows and concise labels rendered in Activity');
     assert.ok(baseline.state.markers.promoted === 5, 'promotion rails rendered in Activity');
     assert.ok(baseline.state.markers.capsule >= 6,

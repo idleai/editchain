@@ -286,6 +286,41 @@ fn duplicate_item_completed_envelope_is_trace_lifecycle() {
 }
 
 #[test]
+fn compacted_checkpoint_stays_primary_plan_content() {
+    // Compaction is a user-visible context checkpoint. Its Activity topology
+    // is normalized separately; semantic filtering must not erase the row.
+    let compacted = raw_import(
+        1,
+        2,
+        2_000,
+        None,
+        r#"{"type":"compacted","payload":{"message":"","replacement_history":[]}}"#,
+    );
+    let compacted_id = compacted.id;
+    let projection = HistoryProjection::from_ops(vec![compacted]);
+
+    let raw_nodes = projection.nodes();
+    let checkpoint = raw_nodes
+        .iter()
+        .find(|node| node.node_key() == compacted_id.to_string())
+        .expect("Raw mode keeps context checkpoint");
+    assert_eq!(checkpoint.visibility(), Visibility::Primary);
+    assert_eq!(checkpoint.record_role(), RecordRole::Narrative);
+    assert_eq!(checkpoint.activity_kind(), ActivityKind::Plan);
+
+    let activity_nodes = projection.filtered_nodes(&ChainFilter::new(
+        String::new(),
+        String::new(),
+        String::new(),
+        false,
+        true,
+        true,
+    ));
+    assert_eq!(activity_nodes.len(), 1);
+    assert_eq!(activity_nodes[0].node_key(), compacted_id.to_string());
+}
+
+#[test]
 fn item_completed_with_tool_result_child_is_primary_result_success() {
     // A tool item first materialized on its completion line carries real content
     // children — it is an action/result row, never trace noise.
@@ -318,6 +353,38 @@ fn outcome_failure_comes_from_exit_code() {
     let tool = child(2, 1, raw.id, tool_finish_op());
     let node = sole_node(vec![raw, tool]);
     assert_eq!(node.outcome(), Outcome::Failure);
+}
+
+#[test]
+fn outcome_failure_comes_from_canonical_codex_exec_result() {
+    // Codex custom exec results do not persist an exitCode. Their first typed
+    // output block is the durable execution-status envelope.
+    let raw = raw_import(
+        1,
+        1,
+        1_000,
+        None,
+        r#"{"type":"response_item","payload":{"type":"custom_tool_call_output","output":[{"type":"input_text","text":"Script failed\nWall time 0.0 seconds\nOutput:\n"},{"type":"input_text","text":"Script error:\ncommand rejected"}]}}"#,
+    );
+    let tool = child(2, 1, raw.id, tool_finish_op());
+    let node = sole_node(vec![raw, tool]);
+    assert_eq!(node.record_role(), RecordRole::Result);
+    assert_eq!(node.outcome(), Outcome::Failure);
+}
+
+#[test]
+fn outcome_ignores_script_failed_outside_canonical_exec_result() {
+    // Display text is not outcome evidence. Even the same words stay unknown
+    // unless they occur in the complete typed Codex execution envelope.
+    let raw = raw_import(
+        1,
+        1,
+        1_000,
+        None,
+        r#"{"type":"response_item","payload":{"type":"custom_tool_call_output","output":[{"type":"input_text","text":"The script failed during an earlier attempt."}]}}"#,
+    );
+    let tool = child(2, 1, raw.id, tool_finish_op());
+    assert_eq!(sole_node(vec![raw, tool]).outcome(), Outcome::Unknown);
 }
 
 #[test]

@@ -166,8 +166,9 @@ body {
    glance (short IDs only — never full raw 64-bit strings). Absolutely
    positioned so its appearance never shifts row height or column layout —
    virtual scroll keeps every row exactly ROW_H regardless of chip state. The
-   translucent background keeps the label legible over the graph rail without
-   a hard-edged box. */
+   translucent background keeps the label legible without a hard-edged box.
+   The graph cell is explicitly stacked above this background label so lane
+   geometry remains uninterrupted through section headers. */
 .group-label {
   position: absolute;
   top: -1px;
@@ -240,7 +241,12 @@ body {
    lanes/dots must always render at full (100%) opacity regardless of row kind. */
 .row-tool .text-cell, .row-tool .date-cell, .row-tool .author-cell, .row-tool .commit-cell { opacity: 0.85; }
 .row-dim .text-cell, .row-dim .date-cell, .row-dim .author-cell, .row-dim .commit-cell { opacity: 0.85; }
-.graph-cell { line-height: 0; overflow: hidden; }
+.graph-cell {
+  position: relative;
+  z-index: 2;
+  line-height: 0;
+  overflow: hidden;
+}
 .text-cell { padding-left: 8px; overflow: hidden; text-align: left; }
 .date-cell, .author-cell, .commit-cell {
   padding-left: 8px;
@@ -297,11 +303,9 @@ body {
   font-weight: 700;
 }
 
-/* Chevron BUTTON on rows that carry bundled metadata sub-ops. This is the ONLY
-   control that toggles inline expansion (revealing one uniform ROW_H row per
-   sub-op directly below); clicking the row itself selects it inline.
-   Inline so it never affects row height or column layout — virtual scroll keeps
-   every row exactly ROW_H. */
+/* Chevron on rows that carry bundled sub-ops. It provides an explicit native
+   disclosure affordance while the whole parent row remains the generous click
+   target. Inline sizing never affects ROW_H or virtual-scroll geometry. */
 .subop-chevron {
   display: inline-block;
   flex: none;
@@ -572,7 +576,7 @@ body {
 }
 
 /* Per-row graph cells (one small SVG per row). Each cell draws the node's dot,
-   vertical line segments for active lanes, and rounded cross-lane transition
+   vertical line segments for active lanes, and smooth cross-lane transition
    paths. */
 .graph-cell svg.graphCell {
   display: block;
@@ -606,9 +610,9 @@ body {
 }
 .graph-cell path.graphTransition {
   /* Stroke colour is set inline per half (source-lane colour through the row
-     midpoint, destination-lane colour after). Caps are explicitly butt so
-     the two halves tile exactly at their shared midpoint seam — no gap, no
-     overlap. */
+     transition, destination-lane colour after). Caps are explicitly butt so
+     the two tangent-continuous Bézier halves tile exactly at their shared seam
+     — no gap or overlap. */
   stroke-width: 2;
   stroke-linecap: butt;
   stroke-linejoin: round;
@@ -784,30 +788,31 @@ body.col-resizing .col-resize-handle {
  */
 
 :root {
-  --ec-void: #080b10;
-  --ec-shell: #0c1016;
-  --ec-surface: #10161d;
-  --ec-surface-raised: #141b23;
-  --ec-ink: #d9e4e2;
-  --ec-ink-strong: #edf4f3;
-  --ec-muted: #8f9da1;
-  --ec-faint: #68777c;
-  --ec-hairline: rgba(145, 164, 168, 0.12);
-  --ec-hairline-strong: rgba(103, 201, 187, 0.22);
-  --ec-cyan: #67c9bb;
-  --ec-violet: #9589c2;
-  --ec-green: #79c79b;
-  --ec-amber: #d9b66d;
-  --ec-red: #df7d8c;
+  --ec-void: var(--vscode-editor-background);
+  --ec-shell: var(--vscode-editor-background);
+  --ec-surface: var(--vscode-input-background, var(--vscode-editor-background));
+  --ec-surface-raised: var(--vscode-list-hoverBackground, var(--vscode-editor-background));
+  --ec-ink: var(--vscode-foreground);
+  --ec-ink-strong: var(--vscode-foreground);
+  --ec-muted: var(--vscode-descriptionForeground, var(--vscode-foreground));
+  --ec-faint: var(--vscode-descriptionForeground, var(--vscode-foreground));
+  --ec-hairline: color-mix(
+    in srgb,
+    var(--vscode-panel-border, var(--vscode-editor-background)) 58%,
+    var(--vscode-editor-background)
+  );
+  --ec-hairline-strong: var(--vscode-panel-border, var(--ec-hairline));
+  --ec-cyan: var(--vscode-focusBorder, var(--vscode-foreground));
+  --ec-violet: var(--vscode-symbolIcon-classForeground, var(--ec-muted));
+  --ec-green: var(--vscode-testing-iconPassed, var(--ec-muted));
+  --ec-amber: var(--vscode-editorWarning-foreground, var(--ec-muted));
+  --ec-red: var(--vscode-editorError-foreground, var(--ec-muted));
 }
 
 body {
   --row-border: var(--ec-hairline);
-  color-scheme: dark;
   color: var(--ec-ink);
-  background:
-    radial-gradient(circle at 84% -18%, rgba(149, 137, 194, 0.045), transparent 38%),
-    var(--ec-void);
+  background: var(--vscode-editor-background);
   padding-top: 0;
   font-size: 13px;
   line-height: 1.35;
@@ -819,8 +824,8 @@ body {
   min-height: 42px;
   margin: 0;
   padding: 6px 10px;
-  background: rgba(12, 16, 22, 0.97);
-  border-bottom: 1px solid var(--ec-hairline);
+  background: var(--vscode-editor-background);
+  border-bottom: 1px solid var(--ec-hairline-strong);
 }
 
 .segmented {
@@ -844,13 +849,16 @@ body {
 
 .segmented-btn:hover:not(.active) {
   color: var(--ec-ink);
-  background: rgba(103, 201, 187, 0.045);
+  background: var(--vscode-list-hoverBackground, var(--ec-surface-raised));
 }
 
 #profile-control .segmented-btn.active {
-  color: var(--ec-ink-strong);
-  background: rgba(103, 201, 187, 0.11);
-  box-shadow: inset 0 -1px 0 rgba(103, 201, 187, 0.48);
+  color: var(--vscode-button-foreground, var(--ec-ink-strong));
+  background: var(
+    --vscode-button-background,
+    var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder))
+  );
+  box-shadow: none;
 }
 
 #search {
@@ -870,12 +878,12 @@ body {
 }
 
 #search:hover {
-  border-color: rgba(103, 201, 187, 0.25);
+  border-color: var(--vscode-input-border, var(--vscode-focusBorder));
 }
 
 #search:focus {
-  border-color: rgba(103, 201, 187, 0.7);
-  box-shadow: 0 0 0 1px rgba(103, 201, 187, 0.08);
+  border-color: var(--vscode-focusBorder);
+  box-shadow: 0 0 0 1px var(--vscode-focusBorder);
 }
 
 #layout {
@@ -884,7 +892,7 @@ body {
 }
 
 #rows {
-  background: rgba(8, 11, 16, 0.82);
+  background: var(--vscode-editor-background);
 }
 
 .tbl-header,
@@ -902,7 +910,7 @@ body {
 
 .tbl-header {
   color: var(--ec-muted);
-  background: rgba(12, 16, 22, 0.98);
+  background: var(--vscode-editor-background);
   border-bottom-color: var(--ec-hairline-strong);
 }
 
@@ -920,31 +928,36 @@ body {
 .row {
   color: var(--ec-ink);
   border-bottom-color: var(--ec-hairline);
-  transition: background-color 90ms ease, box-shadow 90ms ease;
+  user-select: none;
+  transition: background-color 70ms ease;
 }
 
 .row:hover {
-  background-color: rgba(103, 201, 187, 0.035);
+  background-color: var(--vscode-list-hoverBackground, var(--ec-surface-raised));
 }
 
 .row:focus-visible {
-  outline-color: rgba(103, 201, 187, 0.78);
+  outline-color: var(--vscode-focusBorder);
 }
 
 .row.row-selected {
-  background: linear-gradient(90deg, rgba(103, 201, 187, 0.085), rgba(103, 201, 187, 0.018));
-  box-shadow: inset 2px 0 0 rgba(103, 201, 187, 0.72);
+  color: var(--vscode-list-activeSelectionForeground, var(--ec-ink-strong));
+  background: var(
+    --vscode-list-activeSelectionBackground,
+    color-mix(in srgb, var(--vscode-focusBorder) 24%, var(--vscode-editor-background))
+  );
+  box-shadow: none;
 }
 
 .graph-cell {
-  opacity: 0.66;
-  border-right: 1px solid rgba(145, 164, 168, 0.065);
+  opacity: 1;
+  border-right: 0;
 }
 
 .row:hover .graph-cell,
 .row-selected .graph-cell,
 .row-promoted .graph-cell {
-  opacity: 0.88;
+  opacity: 1;
 }
 
 .text-cell {
@@ -1006,7 +1019,7 @@ body {
 
 .group-label {
   color: var(--ec-muted);
-  background: rgba(12, 16, 22, 0.94);
+  background: color-mix(in srgb, var(--vscode-editor-background) 92%, transparent);
   border-radius: 0 0 3px 0;
   font-family: var(--vscode-editor-font-family, monospace);
   font-size: 10px;
@@ -1016,7 +1029,7 @@ body {
 }
 
 .row-group-start {
-  border-top-color: rgba(149, 137, 194, 0.2);
+  border-top-color: var(--ec-hairline-strong);
 }
 
 .rel-badge,
@@ -1072,6 +1085,16 @@ body {
   background: color-mix(in srgb, currentColor 9%, transparent);
 }
 
+.out-badge.outcome-failure {
+  min-width: 15px;
+  padding: 0 2px;
+  color: var(--vscode-editorError-foreground, var(--ec-red));
+  font-family: var(--vscode-font-family, sans-serif);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
+}
+
 .out-badge.outcome-success,
 .out-badge.outcome-warning,
 .out-badge.outcome-failure,
@@ -1083,8 +1106,11 @@ body {
   color: var(--ec-ink);
   margin: 0;
   padding: 0 5px;
-  background: rgba(103, 201, 187, 0.065);
-  border-color: rgba(103, 201, 187, 0.16);
+  background: var(
+    --vscode-badge-background,
+    color-mix(in srgb, var(--vscode-panel-border) 22%, transparent)
+  );
+  border-color: var(--ec-hairline-strong);
 }
 
 .bundle-status {
@@ -1099,21 +1125,22 @@ body {
 }
 
 .row-activity-bundle {
-  background: rgba(103, 201, 187, 0.012);
+  background: transparent;
 }
 
 .row-work-unit-start {
-  background: linear-gradient(90deg, rgba(103, 201, 187, 0.045), transparent 62%);
-  border-top-color: rgba(103, 201, 187, 0.22);
-  box-shadow: inset 2px 0 0 rgba(103, 201, 187, 0.34);
+  background: transparent;
+  border-top-color: var(--ec-hairline-strong);
+  box-shadow: none;
 }
 
 .row-work-unit-end {
-  border-bottom-color: rgba(145, 164, 168, 0.22);
+  border-bottom-color: var(--ec-hairline-strong);
 }
 
 .work-unit-ribbon {
-  color: color-mix(in srgb, var(--ec-cyan) 72%, var(--ec-muted));
+  flex: 0 1 auto;
+  color: var(--ec-muted);
   font-family: var(--vscode-font-family, sans-serif);
   font-size: 10.5px;
   font-weight: 600;
@@ -1122,6 +1149,7 @@ body {
 }
 
 .work-unit-count {
+  flex: 0 1 auto;
   padding: 0;
   color: var(--ec-faint);
   background: transparent;
@@ -1133,7 +1161,84 @@ body {
 }
 
 .subop-chevron {
-  color: var(--ec-cyan);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-right: 2px;
+  margin-left: -4px;
+  color: var(--vscode-foreground);
+  font-size: 11px;
+  border-radius: 3px;
+}
+
+.row-expandable:hover .subop-chevron {
+  background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
+}
+
+.session-meta-slot {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  gap: 4px;
+  min-width: 0;
+}
+
+.session-meta-slot:empty {
+  display: none;
+}
+
+.session-chip {
+  display: inline-block;
+  min-width: 0;
+  max-width: 140px;
+  padding: 0 5px;
+  overflow: hidden;
+  color: var(--vscode-badge-foreground, var(--vscode-foreground));
+  background: var(
+    --vscode-badge-background,
+    color-mix(in srgb, var(--vscode-panel-border) 36%, transparent)
+  );
+  border-radius: 3px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 9.5px;
+  font-weight: 500;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-chip-agent {
+  color: var(--vscode-symbolIcon-classForeground, var(--vscode-badge-foreground, var(--ec-ink)));
+}
+
+.git-prefix-chip {
+  display: inline-block;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 42%;
+  box-sizing: border-box;
+  margin-right: 6px;
+  padding: 0 6px;
+  overflow: hidden;
+  color: var(--vscode-keybindingLabel-foreground, var(--ec-ink));
+  background: var(
+    --vscode-keybindingLabel-background,
+    color-mix(in srgb, var(--vscode-panel-border) 42%, transparent)
+  );
+  border: 1px solid var(--vscode-keybindingLabel-border, transparent);
+  border-radius: 3px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-summary-text {
+  min-width: 0;
 }
 
 .subop-icon,
@@ -1146,12 +1251,20 @@ body {
 }
 
 .row-promoted-rail {
-  box-shadow: inset 2px 0 0 rgba(143, 157, 161, 0.24);
+  box-shadow: inset 2px 0 0 var(--ec-hairline-strong);
 }
 
 .row-promoted-change {
-  box-shadow: inset 2px 0 0 rgba(103, 201, 187, 0.72);
-  background: linear-gradient(90deg, rgba(103, 201, 187, 0.055), transparent 50%);
+  box-shadow: inset 2px 0 0 var(--vscode-focusBorder);
+  background: color-mix(in srgb, var(--vscode-focusBorder) 5%, transparent);
+}
+
+.row.row-selected .summary,
+.row.row-selected .date-cell,
+.row.row-selected .subop-summary,
+.row.row-selected .work-unit-ribbon,
+.row.row-selected .work-unit-count {
+  color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
 }
 
 .graph-cell circle.graphDot,
@@ -1168,7 +1281,7 @@ body {
 .search-banner,
 .view-message {
   color: var(--ec-muted);
-  background: rgba(12, 16, 22, 0.97);
+  background: var(--vscode-editor-background);
 }
 
 .search-banner {
@@ -1253,7 +1366,7 @@ body {
   white-space: nowrap;
   margin: 0 1px;
   padding: 0 1px;
-  color: #bddbd6;
+  color: var(--vscode-textPreformat-foreground, var(--ec-ink));
   background: transparent;
   border: 0;
   border-radius: 0;
@@ -1265,7 +1378,7 @@ body {
 .md-link {
   color: var(--ec-cyan);
   text-decoration: underline;
-  text-decoration-color: rgba(103, 201, 187, 0.38);
+  text-decoration-color: color-mix(in srgb, var(--ec-cyan) 45%, transparent);
   text-underline-offset: 2px;
 }
 

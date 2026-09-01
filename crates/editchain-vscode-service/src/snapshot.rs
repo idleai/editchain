@@ -39,7 +39,16 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// bundling (maximal runs of safe low-signal execute rows collapse into one
 /// synthetic expandable node), so stale revision-6 snapshots must not serve
 /// the old flat Activity profile.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 7;
+///
+/// Revision 8 preserves canonical Codex custom-exec outcome headers through
+/// bounded import compaction and keeps context-compaction checkpoints visible
+/// but inline in the Activity path, so stale revision-7 snapshots must not
+/// retain misleading success states or one-row compaction branches.
+///
+/// Revision 9 adds the bounded model-provider and agent-nickname subset from
+/// Codex `session_meta` to history rows, so stale revision-8 snapshots must not
+/// silently omit session provenance chips.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 9;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

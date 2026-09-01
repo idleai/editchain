@@ -22,6 +22,11 @@ use super::normalize::{
     owning_thread_from_raw_line, ItemAnchor, NormalizeContext,
 };
 use super::projection::{parse_projection, ProjectionKind};
+use super::session_git::session_git_link_op;
+
+/// Current Codex normalized-projection schema applied to a source cursor.
+/// Version 1 adds the exact session-start Git link.
+const CODEX_NORMALIZATION_VERSION: u32 = 1;
 
 /// Configuration for a Codex rollout discovery/import request.
 #[derive(Debug, Clone)]
@@ -41,7 +46,8 @@ pub struct CodexDiscoveryRequest {
 /// [`ReadState::Fresh`] and [`ReadState::Rewritten`] re-read the whole file
 /// from byte 0 (a "full read": the exact non-blank line set is known and the
 /// projection record count is enforced); [`ReadState::Append`] reads only the
-/// bytes past the persisted cursor.
+/// bytes past the persisted cursor; [`ReadState::Reproject`] reads no raw bytes
+/// and upgrades only deterministic normalized metadata.
 enum ReadState {
     /// First import (or a reset re-import) of the source.
     Fresh {
@@ -63,6 +69,16 @@ enum ReadState {
         /// Cursor covering the old plus new bytes.
         new_cursor: crate::sink::CursorValue,
     },
+    /// Source bytes are unchanged, but an older normalized projection needs a
+    /// deterministic metadata-only upgrade. No raw/content rows are replayed.
+    Reproject {
+        /// Existing boot generation of the source stream.
+        boot: u32,
+        /// Number of raw records already emitted for this source.
+        start_seq: u64,
+        /// Unchanged source cursor, upgraded only after projection succeeds.
+        new_cursor: crate::sink::CursorValue,
+    },
     /// The source was truncated/rewritten; bumped to a new generation and
     /// re-read whole from byte 0.
     Rewritten {
@@ -81,8 +97,9 @@ enum ReadState {
 /// [`crate::import::import_claude_code`]. For every physical `rollout-*.jsonl`
 /// file it:
 ///
-/// 1. Checks the cursor — unchanged files are skipped (idempotent); grown
-///    files are read incrementally via the shared reader machinery;
+/// 1. Checks the cursor — unchanged files at the current normalization version
+///    are skipped; older projections run a metadata-only upgrade; grown files
+///    are read incrementally via the shared reader machinery;
 /// 2. Detects truncation/rewrite from a persisted cursor and re-imports the
 ///    whole changed file under a new deterministic boot generation (bumped
 ///    and persisted per source by the [`CursorStore`]), so rewritten sources
@@ -98,7 +115,8 @@ enum ReadState {
 ///    the per-file raw chain;
 /// 6. Folds the projection's upsert/remove records to final logical items and
 ///    emits one normalized op per final item first seen in this batch;
-/// 7. Persists the cursor only after the whole file succeeded.
+/// 7. Persists the cursor and normalization version only after the whole file
+///    succeeded.
 ///
 /// Session scope is the owning thread id: bridge metadata first, then raw
 /// `session_meta.payload.id`, then the rollout filename stem. `payload
@@ -160,6 +178,10 @@ pub fn import_codex(
     for rollout in &rollouts {
         let cursor_key = rollout.path.to_string_lossy().to_string();
         let existing_cursor = cursors.get_cursor(&cursor_key)?;
+        let needs_normalization_upgrade = options.normalize
+            && existing_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.normalization_version < CODEX_NORMALIZATION_VERSION);
 
         // Decide how to read this rollout. A persisted cursor whose source was
         // truncated or rewritten is NOT fatal: the file is bumped to a new
@@ -172,8 +194,16 @@ pub fn import_codex(
         let read = if let Some(cursor) = &existing_cursor {
             match check_file_generation(&rollout.path, cursor) {
                 Ok(true) => {
-                    // Unchanged — idempotent skip.
-                    continue;
+                    if needs_normalization_upgrade {
+                        ReadState::Reproject {
+                            boot: cursors.get_generation(&cursor_key)?,
+                            start_seq: cursor.ops_emitted,
+                            new_cursor: cursor.clone(),
+                        }
+                    } else {
+                        // Unchanged and current — idempotent skip.
+                        continue;
+                    }
                 }
                 Ok(false) => {
                     // Grew — incremental append on the current generation's stream.
@@ -214,7 +244,7 @@ pub fn import_codex(
             }
         };
 
-        let (boot, start_seq, full_read, lines, new_cursor) = match read {
+        let (boot, start_seq, full_read, lines, mut new_cursor) = match read {
             ReadState::Fresh {
                 boot,
                 lines,
@@ -231,6 +261,11 @@ pub fn import_codex(
                 lines,
                 new_cursor,
             } => (boot, start_seq, false, lines, new_cursor),
+            ReadState::Reproject {
+                boot,
+                start_seq,
+                new_cursor,
+            } => (boot, start_seq, false, Vec::new(), new_cursor),
         };
 
         // Deterministic source stream per physical file (the file path is the
@@ -246,6 +281,11 @@ pub fn import_codex(
         if expected_total == 0 {
             // Empty file — nothing to project or emit; still checkpoint.
             report.files_processed += 1;
+            if options.normalize {
+                new_cursor.normalization_version = new_cursor
+                    .normalization_version
+                    .max(CODEX_NORMALIZATION_VERSION);
+            }
             cursors.set_cursor(&cursor_key, &new_cursor)?;
             continue;
         }
@@ -350,6 +390,34 @@ pub fn import_codex(
             let _: bool = ops.accept_op(&op)?;
             report.raw_ops += 1;
             prev_raw_id = Some(op.id);
+        }
+
+        // Codex records one exact Git snapshot on `session_meta`. Materialize
+        // that fact once, at the source record that starts the session. There
+        // is deliberately no command-text or timestamp inference here: an
+        // absent/invalid hash or an unresolvable local repository yields no
+        // link. Appends do not replay the deterministic session-start link.
+        if options.normalize && (start_seq == 0 || needs_normalization_upgrade) {
+            let raw_batch_end = u64::try_from(lines.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(start_seq);
+            if let (Some(meta), Some(source_ordinal)) = (
+                projection.session_meta.as_ref(),
+                projection.session_meta_source_ordinal,
+            ) {
+                if source_ordinal <= raw_batch_end {
+                    if let Some(op) = session_git_link_op(
+                        &request.workspace_path,
+                        meta,
+                        source_ordinal,
+                        &stream,
+                        session_id,
+                    )? {
+                        let _: bool = ops.accept_op(&op)?;
+                        report.normalized_ops += 1;
+                    }
+                }
+            }
         }
 
         // Emit normalized ops: fresh items (first seen after the cursor)
@@ -542,7 +610,14 @@ pub fn import_codex(
             }
         }
 
-        // Only persist the cursor after the whole file succeeded.
+        // Only persist the cursor after the whole file succeeded. The version
+        // checkpoint makes metadata-only upgrades one-shot while preserving a
+        // future version written by a newer importer.
+        if options.normalize {
+            new_cursor.normalization_version = new_cursor
+                .normalization_version
+                .max(CODEX_NORMALIZATION_VERSION);
+        }
         cursors.set_cursor(&cursor_key, &new_cursor)?;
         topology.push(topo);
     }

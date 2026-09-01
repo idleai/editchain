@@ -449,6 +449,13 @@ pub struct HistoryRow {
     /// `None` when the row is not turn-scoped.
     #[serde(default)]
     pub turn_id: Option<String>,
+    /// Small display-safe subset of the owning Codex session metadata.
+    ///
+    /// The service attaches this to session-scoped rows so clients can label a
+    /// session boundary without parsing raw import JSON. Both members are
+    /// optional because older providers and older imports may omit either one.
+    #[serde(default)]
+    pub session_meta: Option<SessionMetaDto>,
     /// Stable, additive work-unit metadata for boundary/header rendering.
     ///
     /// Every row in a window carries its opaque work-unit id plus view-stable
@@ -475,6 +482,22 @@ pub struct HistoryRow {
     /// `None`.
     #[serde(default)]
     pub activity_bundle: Option<ActivityBundleDto>,
+}
+
+/// Display-safe provenance copied from a session's `session_meta` record.
+///
+/// This deliberately remains a tiny subset of the provider payload: model and
+/// agent labels are useful history chrome, while instructions, environment,
+/// and other large or sensitive session fields stay in the raw record only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMetaDto {
+    /// Model/provider label recorded by the session (for example
+    /// `sglang_dsv4`).
+    #[serde(default)]
+    pub model_provider: Option<String>,
+    /// Human-friendly agent nickname, when the provider assigned one.
+    #[serde(default)]
+    pub agent_nickname: Option<String>,
 }
 
 /// Stable metadata for the work unit one history row belongs to.
@@ -786,6 +809,7 @@ mod tests {
             visibility: editchain_project::taxonomy::Visibility::Primary,
             outcome: editchain_project::taxonomy::Outcome::Success,
             turn_id: Some(OVER_2_53.to_string()),
+            session_meta: None,
             work_unit: None,
             promoted: false,
             activity_bundle: None,
@@ -1189,6 +1213,7 @@ mod tests {
         }))
         .expect("legacy row deserializes");
         assert_eq!(legacy.work_unit, None);
+        assert_eq!(legacy.session_meta, None);
         assert!(!legacy.promoted);
         assert_eq!(legacy.activity_bundle, None);
 
@@ -1221,6 +1246,10 @@ mod tests {
             visibility: editchain_project::taxonomy::Visibility::Primary,
             outcome: editchain_project::taxonomy::Outcome::Success,
             turn_id: Some(OVER_2_53.to_string()),
+            session_meta: Some(SessionMetaDto {
+                model_provider: Some("sglang_dsv4".to_string()),
+                agent_nickname: Some("Harvey".to_string()),
+            }),
             work_unit: Some(WorkUnitDto {
                 id: format!("session:1/turn:{OVER_2_53}"),
                 is_start: true,
@@ -1243,6 +1272,8 @@ mod tests {
         assert_eq!(json["work_unit"]["title"], "request");
         assert_eq!(json["work_unit"]["count"], 12u64);
         assert_eq!(json["promoted"], true);
+        assert_eq!(json["session_meta"]["model_provider"], "sglang_dsv4");
+        assert_eq!(json["session_meta"]["agent_nickname"], "Harvey");
         assert_eq!(json["activity_bundle"]["kind"], "execute-run");
         assert_eq!(json["activity_bundle"]["member_count"], 3u64);
         let back: HistoryRow = serde_json::from_value(json).expect("deserialize row");
@@ -1255,6 +1286,12 @@ mod tests {
             .as_ref()
             .is_some_and(|w| w.is_start && !w.is_end));
         assert!(back.promoted);
+        assert_eq!(
+            back.session_meta
+                .as_ref()
+                .and_then(|meta| meta.model_provider.as_deref()),
+            Some("sglang_dsv4")
+        );
         assert_eq!(
             back.activity_bundle.as_ref().map(|bundle| bundle.kind),
             Some(ActivityBundleKind::ExecuteRun)

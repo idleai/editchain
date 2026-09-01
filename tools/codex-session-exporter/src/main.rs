@@ -18,6 +18,7 @@ const SCHEMA_DOCUMENT: &str = r#"{
     "changedItems are lifecycle upserts keyed by deterministic item id; the --final record is a deduplicated per-turn snapshot with firstSeenOrdinal/lastSeenOrdinal/seenLineCount including response-derived items.",
     "Response-item messages and reasoning are projected as stable sourcePath-scoped semantic items with full text using Codex typed ids (msg_/rs_/fc_/fco_) or a deterministic response-<ordinal> fallback; legacy event_msg/response_item echoes fold to one logical item via typed ids plus turn context plus content correlation (contentHash (FNV-1a 64) is one signal, never the sole dedup key).",
     "Unknown or future Codex item kinds degrade to kind=opaque with a diagnostic typeName; unknown line shapes produce decode.status=error with the raw type discriminant preserved as kind.",
+    "sessionMeta.git carries Codex's optional session-start commitHash, branch, and repositoryUrl snapshot; it is never synthesized per turn.",
     "The projection carries typed content for neutral Message/Tool/Command/File/Reflection/Note ops: message text, reasoning summaries and content, command output and secret-redacted command strings, file diffs, tool arguments/results/errors, and plan/review/inter-agent text. Only genuinely non-text payloads (encrypted content, image/audio data URIs, session base instructions as raw values) remain length/presence-only.",
     "Files are projected independently; scope item identity by sourcePath to keep physical files distinct."
   ]

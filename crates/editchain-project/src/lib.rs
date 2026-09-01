@@ -14,8 +14,6 @@ pub mod activity;
 pub mod filter;
 /// Deterministic lane layout for graph rendering.
 pub mod layout;
-/// History linking — stitch sessions and git into a single edit chain.
-pub mod link;
 /// Deterministic semantic metadata for projected history rows.
 pub mod meta;
 /// Provider-neutral readability taxonomy shared with the protocol layer.
@@ -30,7 +28,6 @@ use editchain_core::{
 };
 
 use crate::layout::{compute_graph_layout, compute_lane_assignment, GraphLayout, GraphRow};
-use crate::link::link_history_links;
 use crate::meta::NodeMeta;
 use crate::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility as RowVisibility};
 
@@ -274,13 +271,12 @@ impl HistoryNode {
     /// Returns the parent node keys for drawing graph edges.
     ///
     /// For `EditChain` ops, this includes the causal `Op.parents`, graph-bearing
-    /// git links (whose target OID hex becomes a parent key), and — when `notes`
+    /// explicit git links (whose target OID hex becomes a parent key), and — when `notes`
     /// annotates this op as the causal parent of a structural relationship note
-    /// — the note's target as a *virtual* parent. Inferred `BasedOn` links are
-    /// intentionally excluded: they remain provenance in [`GitProjection`] but
-    /// must not turn unrelated sessions into sibling causal branches or hold a
-    /// render lane open until a shared commit. Virtual parents let fork/subagent
-    /// branches render without mutating stored causality (SPEC §1.1, §5).
+    /// — the note's target as a *virtual* parent. Git links are explicit stored
+    /// relations; no timestamp/text inference is performed by this projection.
+    /// Virtual parents let fork/subagent branches render without mutating stored
+    /// causality (SPEC §1.1, §5).
     /// `notes` maps a causal parent op id to the structural notes that annotate
     /// it.
     ///
@@ -313,9 +309,6 @@ impl HistoryNode {
                 for source in std::iter::once(op).chain(self.sub_ops()) {
                     if let Some(links) = git_links.get(&source.id) {
                         for link in links {
-                            if matches!(&link.kind, editchain_core::GitLinkKind::BasedOn) {
-                                continue;
-                            }
                             let key = link.target_oid.to_hex();
                             if seen.insert(key.clone()) {
                                 keys.push(key);
@@ -552,8 +545,7 @@ pub struct HistoryProjection {
     git_present: std::collections::HashSet<String>,
     /// Cached collapsed (top-level-row) projection with its canonical
     /// representative map and canonicalized relationship notes. Computed once at
-    /// construction (and again after the few mutation points, i.e. `link_history`)
-    /// so every per-row path (`ordered_nodes`, `independent_chains`,
+    /// construction so every per-row path (`ordered_nodes`, `independent_chains`,
     /// `lifted_parent_keys`, layout, filtering, windowed edges) reads a stable
     /// canonical view without rebuilding it per row. The collapse is ~linear in
     /// op count and cheap relative to the per-row consumers that reuse it.
@@ -676,7 +668,7 @@ impl HistoryProjection {
         };
         // Build the canonical collapse eagerly so `relationship_notes` and every
         // layout/filter/order path see a stable canonical view from the start
-        // (recomputed by `link_history`, the one sanctioned ops mutation point).
+        // and reused by every row/layout path.
         projection.collapsed_projection = projection.collapsed_ops();
         projection
     }
@@ -1665,20 +1657,6 @@ impl HistoryProjection {
         }
     }
 
-    /// Relate session operations to Git history without stitching sessions.
-    ///
-    /// Leaves unrelated session parents unchanged and creates op→git links in
-    /// `GitProjection.links`. Inferred `BasedOn` links remain provenance rather
-    /// than graph parents. Call after loading all ops and git commits, before
-    /// computing windows or layouts.
-    pub fn link_history(&mut self) {
-        let commits: Vec<GitCommitEntity> = self.git.commits.values().cloned().collect();
-        for link in link_history_links(&self.ops, &commits) {
-            let entry = self.git.links.entry(link.source).or_default();
-            entry.push(link);
-        }
-    }
-
     /// Compute the graph layout for rendering unified history.
     ///
     /// The layout is computed over the same canonical topologically-sorted node
@@ -2022,9 +2000,6 @@ fn ordering_parent_keys(
             for source in std::iter::once(op).chain(node.sub_ops()) {
                 if let Some(links) = git_links.get(&source.id) {
                     for link in links {
-                        if matches!(link.kind, editchain_core::GitLinkKind::BasedOn) {
-                            continue;
-                        }
                         let key = OrderingKey::Git(link.target_oid);
                         push(present.contains(&key).then_some(key));
                     }
