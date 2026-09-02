@@ -22,8 +22,8 @@ use editchain_core::{
     ParentSet, PathId, Payload, ScopeRef, SessionId, Tags, ToolOp, ToolStage, TurnId,
 };
 use editchain_project::activity::{
-    annotate_activity_rows, bundle_activity_execute_runs, inline_context_compaction_checkpoints,
-    ActivityRowAnnotation,
+    annotate_activity_rows, bundle_activity_execute_runs, bundle_activity_plan_repeats,
+    inline_context_compaction_checkpoints, ActivityRowAnnotation,
 };
 use editchain_project::filter::ChainFilter;
 use editchain_project::meta::NodeMeta;
@@ -360,6 +360,164 @@ fn manual_collapsed(
             turn_id: turn,
         },
     }
+}
+
+#[test]
+fn adjacent_repeated_plan_headings_form_one_expandable_linear_bundle() {
+    let root = import_op(20, 1, None, None);
+    let plan_oldest = import_op(20, 2, Some(root.id), None);
+    let plan_middle = import_op(20, 3, Some(plan_oldest.id), None);
+    let plan_newest = import_op(20, 4, Some(plan_middle.id), None);
+    let continuation = import_op(20, 5, Some(plan_newest.id), None);
+    let nodes = vec![
+        manual_collapsed(
+            continuation.clone(),
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "continuing",
+            "message",
+        ),
+        manual_collapsed(
+            plan_newest.clone(),
+            ActivityKind::Plan,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "**Planning build and dry-run import steps**",
+            "reflection",
+        ),
+        manual_collapsed(
+            plan_middle.clone(),
+            ActivityKind::Plan,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "Planning   build and dry-run import steps",
+            "reflection",
+        ),
+        manual_collapsed(
+            plan_oldest.clone(),
+            ActivityKind::Plan,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "__Planning build and dry-run import steps__",
+            "reflection",
+        ),
+        manual_collapsed(
+            root.clone(),
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "request",
+            "message",
+        ),
+    ];
+
+    let grouped = bundle_activity_plan_repeats(nodes, &HashSet::new());
+    assert_eq!(grouped.len(), 3, "three Plan rows contract to one slot");
+    let HistoryNode::PlanBundle {
+        anchor,
+        member_nodes,
+        members,
+        summary,
+        ..
+    } = &grouped[1]
+    else {
+        panic!("expected a PlanBundle in the repeated-heading slot");
+    };
+    assert_eq!(anchor.id, plan_newest.id);
+    assert_eq!(summary, "**Planning build and dry-run import steps**");
+    assert_eq!(member_nodes.len(), 3);
+    assert_eq!(members.len(), 3);
+    assert_eq!(grouped[1].record_role(), RecordRole::Narrative);
+    assert_eq!(grouped[1].activity_kind(), ActivityKind::Plan);
+    assert_eq!(grouped[1].outcome(), Outcome::Unknown);
+    assert_eq!(
+        members.iter().map(|op| op.id).collect::<Vec<_>>(),
+        vec![plan_newest.id, plan_middle.id, plan_oldest.id],
+        "every real reasoning operation remains expandable in display order"
+    );
+    assert_eq!(
+        grouped[0].parent_keys(&BTreeMap::new(), &HashMap::new()),
+        vec![grouped[1].node_key()],
+        "the newer continuation still points at the bundle anchor"
+    );
+    assert_eq!(
+        grouped[1].parent_keys(&BTreeMap::new(), &HashMap::new()),
+        vec![root.id.to_string()],
+        "the bundle inherits only the run's external parent"
+    );
+}
+
+#[test]
+fn plan_repeat_grouping_never_crosses_content_group_or_structural_boundaries() {
+    let first = import_op(21, 1, None, None);
+    let second = import_op(21, 2, Some(first.id), None);
+    let separator = import_op(21, 3, Some(second.id), None);
+    let third = import_op(21, 4, Some(separator.id), None);
+    let plan = |op, summary: &str| {
+        manual_collapsed(
+            op,
+            ActivityKind::Plan,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            summary,
+            "reflection",
+        )
+    };
+    let nodes = vec![
+        plan(third, "Same heading"),
+        manual_collapsed(
+            separator,
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool",
+            "tool",
+        ),
+        plan(second.clone(), "Same heading"),
+        plan(first, "Different heading"),
+    ];
+    let grouped = bundle_activity_plan_repeats(nodes, &HashSet::new());
+    assert!(
+        grouped
+            .iter()
+            .all(|node| !matches!(node, HistoryNode::PlanBundle { .. })),
+        "an intervening row and a different heading both break a run"
+    );
+
+    let structural_pair = vec![
+        plan(import_op(22, 2, None, None), "Structural heading"),
+        plan(import_op(22, 1, None, None), "Structural heading"),
+    ];
+    let structural = HashSet::from([structural_pair[0].node_key()]);
+    let preserved = bundle_activity_plan_repeats(structural_pair, &structural);
+    assert!(
+        preserved
+            .iter()
+            .all(|node| !matches!(node, HistoryNode::PlanBundle { .. })),
+        "a structural endpoint remains an independent graph row"
+    );
+
+    let mut other_session = import_op(23, 1, None, None);
+    other_session.scope = ScopeRef::Session(SessionId(11));
+    let cross_session = vec![
+        plan(import_op(23, 2, None, None), "Session heading"),
+        plan(other_session, "Session heading"),
+    ];
+    let preserved = bundle_activity_plan_repeats(cross_session, &HashSet::new());
+    assert!(
+        preserved
+            .iter()
+            .all(|node| !matches!(node, HistoryNode::PlanBundle { .. })),
+        "identical headings in different sessions never group"
+    );
 }
 
 #[test]

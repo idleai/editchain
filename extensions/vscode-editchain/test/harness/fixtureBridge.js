@@ -159,8 +159,9 @@
   // Mirror the HistoryRow serde defaults for the additive activity fields
   // (work_unit -> None, promoted -> false, activity_bundle -> None — see
   // crates/editchain-protocol) and the ActivityBundleKind enum round trip:
-  // only the typed "execute-run" string survives; every other kind maps to the protocol's
-  // forward-compatible Unknown variant ("unknown"), exactly like serde's
+  // the typed "execute-run" and "plan-repeat" strings survive; every other
+  // kind maps to the protocol's forward-compatible Unknown variant
+  // ("unknown"), exactly like serde's
   // #[serde(other)] deserialization. Hand-written fixture JSON and older
   // payloads both exercise the same defaulting the real service applies, so
   // clients can rely on the normalized shape.
@@ -173,7 +174,7 @@
     if (b && typeof b === 'object') {
       out.activity_bundle = {
         ...b,
-        kind: b.kind === 'execute-run' ? 'execute-run' : 'unknown',
+        kind: b.kind === 'execute-run' || b.kind === 'plan-repeat' ? b.kind : 'unknown',
       };
     }
     return out;

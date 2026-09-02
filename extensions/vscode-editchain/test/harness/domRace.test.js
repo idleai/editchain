@@ -508,11 +508,12 @@ test('profile switch with a held window clears work-unit/bundle grouping; raw st
       total: window.__editchainGetTotal(),
       workUnitTitle: (document.querySelector('.row[data-key="wu:req1"] .work-unit-ribbon') || {}).textContent || '',
       bundleText: (document.querySelector('.row[data-key="wu:run1"] .summary') || {}).textContent || '',
+      planText: (document.querySelector('.row[data-key="wu:plans"] .summary') || {}).textContent || '',
       unknownBundleStatus: !!document.querySelector('.row[data-key="wu:run1"] .bundle-status'),
       successfulBundleStatus: (document.querySelector('.row[data-key="wu:run2"] .bundle-status') || {}).textContent || '',
     }));
-    assert.equal(baseline.rows, 12, 'activity view renders the 12 authored rows');
-    assert.equal(baseline.total, 23, 'window total includes expandable bundle member sub-ops');
+    assert.equal(baseline.rows, 13, 'activity view renders the 13 authored rows');
+    assert.equal(baseline.total, 27, 'window total includes expandable bundle member sub-ops');
     assert.equal(baseline.dataReady, true);
     assert.equal(baseline.state.any, true,
       'Activity must render the work-unit/bundle/promotion contract');
@@ -520,14 +521,18 @@ test('profile switch with a held window clears work-unit/bundle grouping; raw st
       'work-unit markers render with the Git section count intentionally suppressed');
     assert.ok(baseline.state.markers.bundle >= 4, 'bundle rows and concise labels rendered in Activity');
     assert.ok(baseline.state.markers.promoted === 5, 'promotion rails rendered in Activity');
-    assert.ok(baseline.state.markers.capsule >= 6,
-      'execute-run capsule glyphs (1 rect + 2 terminals per typed row) rendered in Activity');
+    assert.ok(baseline.state.markers.capsule >= 9,
+      'recognized Activity-bundle capsule glyphs render in Activity');
     assert.equal(baseline.state.cacheHasMetadata, true);
     assert.equal(baseline.workUnitTitle, 'User asks to fix the build',
       'work-unit titles must strip Markdown punctuation');
     assert.doesNotMatch(baseline.workUnitTitle, /\*\*|`/);
     assert.equal(baseline.bundleText.trim(), '▸3 commands',
       'typed bundles render one concise structured label without summary/activity/outcome repetition');
+    assert.equal(baseline.planText.trim(), '▸3 updatesPlanning build and dry-run import steps',
+      'Plan bundle keeps its clean heading beside an updates chip');
+    assert.doesNotMatch(baseline.planText, /\*\*|__/,
+      'Plan bundle heading renders Markdown instead of exposing punctuation');
     assert.equal(baseline.unknownBundleStatus, false,
       'unknown bundle outcome adds no noisy status label');
     assert.equal(baseline.successfulBundleStatus.trim(), '✓',
@@ -582,7 +587,7 @@ test('profile switch with a held window clears work-unit/bundle grouping; raw st
         checks: window.__editchainDebug.assertLayout(),
       };
     });
-    assert.equal(raw.rows, 18, 'raw profile serves the unbundled 18-row stream');
+    assert.equal(raw.rows, 21, 'raw profile serves the unbundled 21-row stream');
     assert.equal(raw.cacheBacked, true, 'every raw row must be cache-backed');
     assert.deepEqual(raw.state.markers, { workUnit: 0, bundle: 0, promoted: 0, capsule: 0 },
       'raw renders none of the grouping/promotion/capsule DOM');
@@ -602,7 +607,7 @@ test('profile switch with a held window clears work-unit/bundle grouping; raw st
     assert.equal(activity.profile, 'activity');
     assert.ok(activity.any, 'grouping markers must return in Activity');
     assert.ok(activity.markers.capsule > 0,
-      'execute-run capsule glyphs must return in Activity after the reset');
+      'Activity-bundle capsule glyphs must return after the reset');
 
     const probe = await page.evaluate(() => window.__editchainDebug.runWorkUnitProbe(20000));
     console.log('[domRace] work-unit probe:', JSON.stringify(probe.detail));

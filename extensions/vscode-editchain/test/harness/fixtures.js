@@ -823,7 +823,7 @@
     },
 
     // Round-two Activity-view wire contract: deterministic work-unit markers
-    // (`work_unit`), conservative promotion (`promoted`), and typed execute-run
+    // (`work_unit`), conservative promotion (`promoted`), and typed Activity
     // bundles (`activity_bundle`) modelled as the SERVICE's projection output
     // (crates/editchain-project/src/activity.rs + editchain-vscode-service),
     // newest first in each list:
@@ -840,8 +840,8 @@
     //               activity_view_bundles_execute_runs..._raw_profile... test).
     //
     // Three logical units interleave in display order so the client must rely
-    // on the explicit markers, never on adjacency: unit `t1` (titled, count 6
-    // in Activity / 11 in Raw), unit `t2` (titled, count 4 / 5), and the
+    // on the explicit markers, never on adjacency: unit `t1` (titled, count 7
+    // in Activity / 14 in Raw), unit `t2` (titled, count 4 / 5), and the
     // fallback `ops` unit (group-key id, NO narrative evidence -> title null,
     // count 2 / 2). Each id has exactly one is_start and one is_end.
     //
@@ -850,6 +850,8 @@
     // WITHOUT parsing summaries:
     //   - a clean unknown-outcome execute-run bundle (member_count 3);
     //   - an all-success execute-run bundle (member_count 2);
+    //   - an adjacent repeated-Plan bundle (member_count 3) whose heading
+    //     remains visible beside its `N updates` chip;
     //   - an ordinary execute row WITH sub-ops but NO activity_bundle (its
     //     summary deliberately reads like an execute run);
     //   - one activity_bundle with a forward-compatible unknown kind
@@ -873,6 +875,9 @@
         'wu:a3': 'tool result: apply patch 3',
         'wu:b1': 'tool result: run tests 1',
         'wu:b2': 'tool result: run tests 2',
+        'wu:p1': '**Planning build and dry-run import steps**',
+        'wu:p2': 'Planning   build and dry-run import steps',
+        'wu:p3': '__Planning build and dry-run import steps__',
         'wu:fail': 'Run the test suite',
         'wu:chg': 'Update main.css',
         'wu:ver': 'Check test results',
@@ -889,6 +894,7 @@
       const bundles = [
         ['wu:run1', 'execute-run', ['a1', 'a2', 'a3'], 10],
         ['wu:run2', 'execute-run', ['b1', 'b2'], 25],
+        ['wu:plans', 'plan-repeat', ['p1', 'p2', 'p3'], 32],
         ['wu:xbundle', 'checkpoint', ['x1', 'x2', 'x3', 'x4'], 55],
       ];
       // --- Raw stream (newest first): the exact unbundled service output ---
@@ -901,6 +907,9 @@
         ['wu:a3', 't1', SESSION, 20, 'tool', 'execute', 'unknown', false],
         ['wu:b1', 't2', SESSION, 25, 'tool', 'execute', 'success', false],
         ['wu:b2', 't2', SESSION, 30, 'tool', 'execute', 'success', false],
+        ['wu:p1', 't1', SESSION, 32, 'reflection', 'plan', 'unknown', false],
+        ['wu:p2', 't1', SESSION, 33, 'reflection', 'plan', 'unknown', false],
+        ['wu:p3', 't1', SESSION, 34, 'reflection', 'plan', 'unknown', false],
         ['wu:fail', 't1', SESSION, 35, 'command', 'execute', 'failure', true],
         ['wu:chg', 't2', SESSION, 40, 'file', 'change', 'warning', true],
         ['wu:ver', 't2', SESSION, 45, 'tool', 'verify', 'success', true],
@@ -975,20 +984,23 @@
           const anchor = rawByKey.get('wu:' + memberKeys[0]);
           const memberRows = memberKeys.map((m) => rawByKey.get('wu:' + m));
           const allSuccess = memberRows.every((m) => m.outcome === 'success');
+          const isPlanRepeat = kind === 'plan-repeat';
           act.push({
             ...anchor,
             op_id: 'node:' + bundleKey,
             git_oid: null,
             repository: null,
-            summary: 'tool result: execute run (' + memberRows.length + ' steps)',
+            summary: isPlanRepeat
+              ? anchor.summary
+              : 'tool result: execute run (' + memberRows.length + ' steps)',
             timestamp_ms: NOW - off * 1000,
             node_key: bundleKey,
-            is_system: true,
-            author: '',
+            is_system: !isPlanRepeat,
+            author: isPlanRepeat ? 'agent' : '',
             commit_id: bundleKey,
-            kind: 'command',
-            record_role: 'action',
-            activity_kind: 'execute',
+            kind: isPlanRepeat ? 'reflection' : 'command',
+            record_role: isPlanRepeat ? 'narrative' : 'action',
+            activity_kind: isPlanRepeat ? 'plan' : 'execute',
             visibility: 'primary',
             outcome: allSuccess ? 'success' : 'unknown',
             promoted: false,
@@ -1000,7 +1012,7 @@
             sub_ops: memberRows.map((m) => ({
               op_id: m.op_id,
               summary: m.summary,
-              kind: 'tool',
+              kind: isPlanRepeat ? 'reflection' : 'tool',
               timestamp_ms: m.timestamp_ms,
             })),
           });
@@ -1094,15 +1106,15 @@
 
     // A tall version of the workUnits scenario (96 repeated blocks) so the
     // virtual-scroll prepend/trim paths run against work-unit boundaries.
-    // Each block repeats the exact 12-row unit structure (one start/end per
-    // id, titled + fallback units, typed execute-run + unknown-kind bundles,
+    // Each block repeats the exact 13-row unit structure (one start/end per
+    // id, titled + fallback units, typed Activity + unknown-kind bundles,
     // promoted rows) with BLOCK-SCOPED unit ids, so any rendered window slice
     // sees complete units: prepending rows above or trimming rows below can
-    // never invent a duplicate start. Activity = 1,152 top-level rows, Raw =
-    // 1,728 top-level rows.
+    // never invent a duplicate start. Activity = 1,248 top-level rows, Raw =
+    // 2,016 top-level rows.
     workUnitsDeep() {
       const small = window.__editchainFixtures.workUnits();
-      const BLOCKS = 96; // 1152 activity rows — larger than viewport + 2*BUFFER, so prepend/trim engage
+      const BLOCKS = 96; // 1248 activity rows — larger than viewport + 2*BUFFER, so prepend/trim engage
       const actRows = [];
       const rawRows = [];
       const clone = (r, b) => {

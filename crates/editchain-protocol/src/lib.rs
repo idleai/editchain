@@ -552,7 +552,7 @@ pub struct ActivityBundleDto {
 
 /// Provider-neutral kinds for an activity bundle row.
 ///
-/// Serialized as kebab-case strings (`"execute-run"`). Unknown strings
+/// Serialized as kebab-case strings (`"execute-run"`, `"plan-repeat"`). Unknown strings
 /// deserialize to [`Self::Unknown`] so older clients tolerate new bundle kinds
 /// from newer services (forward compatibility).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -561,6 +561,9 @@ pub enum ActivityBundleKind {
     /// A synthetic Activity-view summary node folding a maximal contiguous
     /// run of low-signal execute rows into one expandable run.
     ExecuteRun,
+    /// Adjacent primary Plan narratives that repeat the same normalized
+    /// heading, retained as expandable original reasoning records.
+    PlanRepeat,
     /// A bundle kind this client does not recognize (forward compatibility).
     #[serde(other)]
     Unknown,
@@ -1302,6 +1305,17 @@ mod tests {
                 .map(|bundle| bundle.member_count),
             Some(3u64)
         );
+
+        let plan_repeat = ActivityBundleDto {
+            kind: ActivityBundleKind::PlanRepeat,
+            member_count: 3,
+        };
+        let plan_json = serde_json::to_value(&plan_repeat).expect("serialize Plan repeat");
+        assert_eq!(plan_json["kind"], "plan-repeat");
+        let plan_back: ActivityBundleDto =
+            serde_json::from_value(plan_json).expect("deserialize Plan repeat");
+        assert_eq!(plan_back.kind, ActivityBundleKind::PlanRepeat);
+        assert_eq!(plan_back.member_count, 3);
 
         // A missing `activity_bundle` member defaults to None, keeping older
         // payloads additive-compatible with the new field.

@@ -1,6 +1,6 @@
 //! Deterministic Activity-view semantics on top of the canonical projection.
 //!
-//! This module owns the four fixed-view behaviors the unified history service
+//! This module owns the five fixed-view behaviors the unified history service
 //! emits for its Activity profile (and only for that profile):
 //!
 //! - **Inline context checkpoints**
@@ -17,6 +17,10 @@
 //!   negative-outcome rows, change/verify rows, and each unit's deterministically
 //!   known newest narrative row are flagged as significant; promoted rows are
 //!   never folded away by bundling.
+//! - **Plan-repeat bundling** ([`bundle_activity_plan_repeats`]): adjacent Plan
+//!   narrative rows with the same normalized heading collapse into one
+//!   expandable [`HistoryNode::PlanBundle`]. This is presentation grouping,
+//!   not source deduplication: every reasoning record remains inspectable.
 //! - **Execute-run bundling** ([`bundle_activity_execute_runs`]): maximal
 //!   contiguous runs of at least two safe low-signal execute rows collapse into
 //!   one synthetic [`HistoryNode::ExecuteBundle`] whose members stay expandable
@@ -332,7 +336,78 @@ pub fn bundle_activity_execute_runs(
         }
         idx = end.saturating_add(1);
     }
-    contract_runs(nodes, runs)
+    contract_runs(nodes, runs, build_execute_bundle)
+}
+
+/// Collapse maximal contiguous runs of at least two Plan narrative rows that
+/// repeat the same normalized heading into [`HistoryNode::PlanBundle`] nodes.
+///
+/// Grouping is deliberately conservative and display-local: members must be
+/// adjacent, belong to the same group and optional turn, be primary narrative
+/// Plan rows, carry no negative outcome, and participate in no structural
+/// fork/subagent/reconnect edge. Heading comparison only removes paired
+/// Markdown emphasis and normalizes whitespace; it remains case-sensitive and
+/// never gathers across an intervening row. Every original row and bundled
+/// metadata sub-op stays expandable through [`HistoryNode::sub_ops`].
+#[must_use]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "run scan indices are bounds-checked by the while conditions against nodes.len()"
+)]
+pub fn bundle_activity_plan_repeats<S: std::hash::BuildHasher>(
+    nodes: Vec<HistoryNode>,
+    structural_keys: &HashSet<String, S>,
+) -> Vec<HistoryNode> {
+    let facts: Vec<PlanMemberFacts> = nodes
+        .iter()
+        .map(|node| PlanMemberFacts {
+            key: node.node_key(),
+            group: node.group(),
+            turn: node.turn_id(),
+            heading: normalized_plan_heading(&node.summary()),
+        })
+        .collect();
+    let eligible: Vec<bool> = nodes
+        .iter()
+        .zip(&facts)
+        .map(|(node, fact)| {
+            node.activity_kind() == ActivityKind::Plan
+                && node.record_role() == RecordRole::Narrative
+                && node.visibility() == Visibility::Primary
+                && !matches!(
+                    node.outcome(),
+                    Outcome::Warning | Outcome::Failure | Outcome::Cancelled
+                )
+                && fact.heading.is_some()
+                && !structural_keys.contains(&fact.key)
+                && node_anchor_op(node).is_some()
+        })
+        .collect();
+    let mut runs = Vec::new();
+    let mut idx = 0usize;
+    while idx < nodes.len() {
+        if !eligible[idx] {
+            idx = idx.saturating_add(1);
+            continue;
+        }
+        let group = facts[idx].group.as_str();
+        let turn = facts[idx].turn;
+        let heading = facts[idx].heading.as_deref();
+        let mut end = idx;
+        while end.saturating_add(1) < nodes.len()
+            && eligible[end.saturating_add(1)]
+            && facts[end.saturating_add(1)].group == group
+            && facts[end.saturating_add(1)].turn == turn
+            && facts[end.saturating_add(1)].heading.as_deref() == heading
+        {
+            end = end.saturating_add(1);
+        }
+        if end.saturating_sub(idx).saturating_add(1) >= 2 {
+            runs.push((idx, end));
+        }
+        idx = end.saturating_add(1);
+    }
+    contract_runs(nodes, runs, build_plan_bundle)
 }
 
 /// Per-node facts precomputed once for the run scan, so membership checks do
@@ -348,6 +423,14 @@ struct MemberFacts {
     owns_state_subop: bool,
 }
 
+/// Precomputed identity and heading facts for one Plan-repeat candidate.
+struct PlanMemberFacts {
+    key: String,
+    group: String,
+    turn: Option<TurnId>,
+    heading: Option<String>,
+}
+
 /// Rewire parents after contraction and rebuild the node list.
 ///
 /// `nodes` is consumed slot-by-slot so members move into the bundle and kept
@@ -358,7 +441,11 @@ struct MemberFacts {
     clippy::indexing_slicing,
     reason = "slot indices come from run spans bounded by slots.len(); slicing is range-checked by the loop over the full list"
 )]
-fn contract_runs(nodes: Vec<HistoryNode>, runs: Vec<(usize, usize)>) -> Vec<HistoryNode> {
+fn contract_runs(
+    nodes: Vec<HistoryNode>,
+    runs: Vec<(usize, usize)>,
+    build: fn(Vec<HistoryNode>) -> HistoryNode,
+) -> Vec<HistoryNode> {
     if runs.is_empty() {
         return nodes;
     }
@@ -378,7 +465,7 @@ fn contract_runs(nodes: Vec<HistoryNode>, runs: Vec<(usize, usize)>) -> Vec<Hist
             for member in &members {
                 drop(bundle_of_member.insert(member.node_key(), bundle_key.clone()));
             }
-            result.push(build_bundle(members));
+            result.push(build(members));
         } else if let Some(node) = slots[idx].take() {
             result.push(node);
         }
@@ -390,7 +477,9 @@ fn contract_runs(nodes: Vec<HistoryNode>, runs: Vec<(usize, usize)>) -> Vec<Hist
             // rows need the rewrite.
             if matches!(
                 node,
-                HistoryNode::ExecuteBundle { .. } | HistoryNode::GitCommit(_)
+                HistoryNode::ExecuteBundle { .. }
+                    | HistoryNode::PlanBundle { .. }
+                    | HistoryNode::GitCommit(_)
             ) {
                 continue;
             }
@@ -424,13 +513,15 @@ fn stored_parent_keys(node: &HistoryNode) -> Vec<String> {
         HistoryNode::EditOperation { op, .. } | HistoryNode::CollapsedImport { op, .. } => {
             op.parents.iter().map(ToString::to_string).collect()
         }
-        HistoryNode::ExecuteBundle { .. } | HistoryNode::GitCommit(_) => Vec::new(),
+        HistoryNode::ExecuteBundle { .. }
+        | HistoryNode::PlanBundle { .. }
+        | HistoryNode::GitCommit(_) => Vec::new(),
     }
 }
 
 /// Build one synthetic summary node from a run's member rows (newest-first).
 #[must_use]
-fn build_bundle(members: Vec<HistoryNode>) -> HistoryNode {
+fn build_execute_bundle(members: Vec<HistoryNode>) -> HistoryNode {
     let newest = members.first();
     let anchor = newest
         .and_then(node_anchor_op)
@@ -440,16 +531,7 @@ fn build_bundle(members: Vec<HistoryNode>) -> HistoryNode {
     let author = newest.map_or_else(|| "system".to_string(), member_author_label);
     let kind = dominant_member_kind(&members).to_string();
     let meta = bundle_meta(&members);
-    let mut sub_ops: Vec<std::sync::Arc<Op>> = Vec::new();
-    for member in &members {
-        let op = std::sync::Arc::new(
-            node_anchor_op(member)
-                .cloned()
-                .unwrap_or_else(empty_anchor_op),
-        );
-        sub_ops.push(op.clone());
-        sub_ops.extend(member.sub_ops().iter().cloned());
-    }
+    let sub_ops = flattened_bundle_members(&members);
     let count = members.len();
     let noun = if kind == "command" {
         "commands"
@@ -474,6 +556,82 @@ fn build_bundle(members: Vec<HistoryNode>) -> HistoryNode {
         author,
         meta,
     }
+}
+
+/// Build one Plan-repeat summary node from adjacent members (newest-first).
+#[must_use]
+fn build_plan_bundle(members: Vec<HistoryNode>) -> HistoryNode {
+    let newest = members.first();
+    let anchor = newest
+        .and_then(node_anchor_op)
+        .cloned()
+        .unwrap_or_else(empty_anchor_op);
+    let source_time = newest.map_or(EffectiveTime::Unknown, HistoryNode::effective_time);
+    let author = newest.map_or_else(|| "system".to_string(), member_author_label);
+    let summary = newest.map_or_else(String::new, HistoryNode::summary);
+    let kind = newest.map_or_else(|| "reflection".to_string(), HistoryNode::kind);
+    let meta = NodeMeta {
+        record_role: RecordRole::Narrative,
+        activity_kind: ActivityKind::Plan,
+        visibility: Visibility::Primary,
+        outcome: Outcome::Unknown,
+        turn_id: newest.and_then(HistoryNode::turn_id),
+    };
+    let sub_ops = flattened_bundle_members(&members);
+    HistoryNode::PlanBundle {
+        anchor: std::sync::Arc::new(anchor),
+        source_time,
+        member_nodes: members,
+        members: sub_ops,
+        summary,
+        kind,
+        author,
+        meta,
+    }
+}
+
+/// Flatten each original bundle member's anchor op and attached metadata ops.
+#[must_use]
+fn flattened_bundle_members(members: &[HistoryNode]) -> Vec<std::sync::Arc<Op>> {
+    let mut sub_ops = Vec::new();
+    for member in members {
+        let op = std::sync::Arc::new(
+            node_anchor_op(member)
+                .cloned()
+                .unwrap_or_else(empty_anchor_op),
+        );
+        sub_ops.push(op);
+        sub_ops.extend(member.sub_ops().iter().cloned());
+    }
+    sub_ops
+}
+
+/// Normalize only presentation-equivalent Plan headings. Semantic differences
+/// (including case and punctuation) remain distinct.
+#[must_use]
+fn normalized_plan_heading(summary: &str) -> Option<String> {
+    let mut heading = summary.trim();
+    loop {
+        let stripped = if heading.len() >= 4
+            && ((heading.starts_with("**") && heading.ends_with("**"))
+                || (heading.starts_with("__") && heading.ends_with("__")))
+        {
+            heading.get(2..heading.len().saturating_sub(2))
+        } else if heading.len() >= 2
+            && ((heading.starts_with('*') && heading.ends_with('*'))
+                || (heading.starts_with('_') && heading.ends_with('_')))
+        {
+            heading.get(1..heading.len().saturating_sub(1))
+        } else {
+            None
+        };
+        let Some(stripped) = stripped else {
+            break;
+        };
+        heading = stripped.trim();
+    }
+    let normalized = heading.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 /// A defensive no-op anchor for a bundle that somehow has no op member (never
@@ -501,7 +659,9 @@ fn node_anchor_op(node: &HistoryNode) -> Option<&Op> {
         HistoryNode::EditOperation { op, .. } | HistoryNode::CollapsedImport { op, .. } => {
             Some(op.as_ref())
         }
-        HistoryNode::ExecuteBundle { .. } | HistoryNode::GitCommit(_) => None,
+        HistoryNode::ExecuteBundle { .. }
+        | HistoryNode::PlanBundle { .. }
+        | HistoryNode::GitCommit(_) => None,
     }
 }
 
@@ -561,7 +721,9 @@ fn member_author_label(node: &HistoryNode) -> String {
                 "system".to_string()
             }
         }
-        HistoryNode::ExecuteBundle { .. } | HistoryNode::GitCommit(_) => "system".to_string(),
+        HistoryNode::ExecuteBundle { .. }
+        | HistoryNode::PlanBundle { .. }
+        | HistoryNode::GitCommit(_) => "system".to_string(),
     }
 }
 

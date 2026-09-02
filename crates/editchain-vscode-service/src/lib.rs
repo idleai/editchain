@@ -1920,14 +1920,23 @@ impl Workspace {
         };
         // Activity-view semantics: every view gets deterministic work-unit and
         // promotion annotations. The fixed Activity view additionally keeps
-        // context-compaction checkpoints inline and folds safe low-signal
-        // execute runs (never the Raw profile, whose topology stays exact).
+        // context-compaction checkpoints inline, groups adjacent repeated Plan
+        // headings, and folds safe low-signal execute runs (never the Raw
+        // profile, whose topology stays exact).
         // Annotations are recomputed on the final list so bundle rows carry
         // their own unit markers.
         let is_activity = filter.key() == fixed_view_filter().key();
         let structural = is_activity.then(|| self.projection.structural_row_keys(&nodes));
         let nodes = if let Some(structural) = structural.as_ref() {
             editchain_project::activity::inline_context_compaction_checkpoints(nodes, structural)
+        } else {
+            nodes
+        };
+        // Plan repeats group before promotion is computed: the newest member
+        // may itself be the unit-final narrative, and the resulting bundle —
+        // not an arbitrary duplicate member — should carry that significance.
+        let nodes = if let Some(structural) = structural.as_ref() {
+            editchain_project::activity::bundle_activity_plan_repeats(nodes, structural)
         } else {
             nodes
         };
@@ -2404,7 +2413,10 @@ fn node_is_system(node: &editchain_project::HistoryNode) -> bool {
         // Execute-run bundles summarize tool/command rows: dim them like the
         // individual tool rows they fold.
         editchain_project::HistoryNode::ExecuteBundle { .. } => true,
-        editchain_project::HistoryNode::GitCommit(_) => false,
+        // Plan-repeat bundles remain prose-first narrative rows; Git rows are
+        // likewise user-facing source history rather than system artifacts.
+        editchain_project::HistoryNode::PlanBundle { .. }
+        | editchain_project::HistoryNode::GitCommit(_) => false,
     }
 }
 
@@ -2422,7 +2434,8 @@ fn node_author(node: &editchain_project::HistoryNode) -> String {
         // children's tags in the projection), since the raw import op's own tags
         // only carry `IMPORT`.
         editchain_project::HistoryNode::CollapsedImport { author, .. }
-        | editchain_project::HistoryNode::ExecuteBundle { author, .. } => author.clone(),
+        | editchain_project::HistoryNode::ExecuteBundle { author, .. }
+        | editchain_project::HistoryNode::PlanBundle { author, .. } => author.clone(),
         editchain_project::HistoryNode::GitCommit(commit) => payload_text(&commit.author.name),
     }
 }
@@ -2544,8 +2557,8 @@ fn session_metadata_from_op(op: &Op) -> Option<SessionMetaDto> {
 
 /// Typed Activity-view bundle metadata for a top-level row.
 ///
-/// `Some` only for synthetic execute-run bundles, carrying the ORIGINAL
-/// top-level run member count (`member_nodes.len()`, never the flattened
+/// `Some` only for synthetic Activity bundles, carrying the ORIGINAL top-level
+/// member count (`member_nodes.len()`, never the flattened
 /// metadata-subop count) so the viewer can render faithful bundle labels from
 /// structured data without parsing the summary string. `None` for every
 /// ordinary and sub-op row, including the raw (unbundled) profile.
@@ -2553,19 +2566,28 @@ fn session_metadata_from_op(op: &Op) -> Option<SessionMetaDto> {
 fn node_activity_bundle(
     node: &editchain_project::HistoryNode,
 ) -> Option<editchain_protocol::ActivityBundleDto> {
-    if let editchain_project::HistoryNode::ExecuteBundle { member_nodes, .. } = node {
-        Some(editchain_protocol::ActivityBundleDto {
-            kind: editchain_protocol::ActivityBundleKind::ExecuteRun,
-            member_count: u64::try_from(member_nodes.len()).unwrap_or(u64::MAX),
-        })
-    } else {
-        None
+    match node {
+        editchain_project::HistoryNode::ExecuteBundle { member_nodes, .. } => {
+            Some(editchain_protocol::ActivityBundleDto {
+                kind: editchain_protocol::ActivityBundleKind::ExecuteRun,
+                member_count: u64::try_from(member_nodes.len()).unwrap_or(u64::MAX),
+            })
+        }
+        editchain_project::HistoryNode::PlanBundle { member_nodes, .. } => {
+            Some(editchain_protocol::ActivityBundleDto {
+                kind: editchain_protocol::ActivityBundleKind::PlanRepeat,
+                member_count: u64::try_from(member_nodes.len()).unwrap_or(u64::MAX),
+            })
+        }
+        editchain_project::HistoryNode::EditOperation { .. }
+        | editchain_project::HistoryNode::CollapsedImport { .. }
+        | editchain_project::HistoryNode::GitCommit(_) => None,
     }
 }
 
 /// Build the expanded sub-op summaries for a top-level node.
 ///
-/// Execute-run bundles expose their folded member rows, so each member renders
+/// Activity bundles expose their folded member rows, so each member renders
 /// with its ORIGINAL row's summary/kind (faithful labels) while the member's
 /// own metadata sub-ops keep the generic op-derived labels. All other nodes
 /// use the generic op-derived path unchanged.
@@ -2574,6 +2596,11 @@ fn node_sub_op_summaries(
     node: &editchain_project::HistoryNode,
 ) -> Vec<editchain_protocol::SubOpSummary> {
     if let editchain_project::HistoryNode::ExecuteBundle {
+        member_nodes,
+        members,
+        ..
+    }
+    | editchain_project::HistoryNode::PlanBundle {
         member_nodes,
         members,
         ..
@@ -2631,8 +2658,9 @@ fn member_sub_op_summaries(
 fn node_sub_op_meta_index(
     node: &editchain_project::HistoryNode,
 ) -> HashMap<String, (RecordRole, ActivityKind)> {
-    if let editchain_project::HistoryNode::ExecuteBundle { member_nodes, .. } = node {
-        member_nodes
+    match node {
+        editchain_project::HistoryNode::ExecuteBundle { member_nodes, .. }
+        | editchain_project::HistoryNode::PlanBundle { member_nodes, .. } => member_nodes
             .iter()
             .map(|member| {
                 (
@@ -2640,9 +2668,10 @@ fn node_sub_op_meta_index(
                     (member.record_role(), member.activity_kind()),
                 )
             })
-            .collect()
-    } else {
-        HashMap::new()
+            .collect(),
+        editchain_project::HistoryNode::EditOperation { .. }
+        | editchain_project::HistoryNode::CollapsedImport { .. }
+        | editchain_project::HistoryNode::GitCommit(_) => HashMap::new(),
     }
 }
 
@@ -2826,9 +2855,8 @@ fn node_commit_id(node: &editchain_project::HistoryNode) -> String {
     match node {
         editchain_project::HistoryNode::EditOperation { op, .. }
         | editchain_project::HistoryNode::CollapsedImport { op, .. } => abbreviate_op_id(&op.id),
-        editchain_project::HistoryNode::ExecuteBundle { anchor, .. } => {
-            abbreviate_op_id(&anchor.id)
-        }
+        editchain_project::HistoryNode::ExecuteBundle { anchor, .. }
+        | editchain_project::HistoryNode::PlanBundle { anchor, .. } => abbreviate_op_id(&anchor.id),
         editchain_project::HistoryNode::GitCommit(commit) => abbreviate_oid(&commit.oid),
     }
 }

@@ -22,7 +22,7 @@ use serde_json as _;
 
 use editchain_core::{
     ActorId, Clock, GitLink, GitLinkKind, GitOid, ImportOp, MessageOp, NodeId, Op, OpId, OpKind,
-    ParentSet, Payload, ScopeRef, SessionId, Tags, ToolOp, ToolStage,
+    ParentSet, Payload, ReflectionOp, ScopeRef, SessionId, Tags, ToolOp, ToolStage,
 };
 use editchain_import::BlobSink as _;
 use editchain_project::filter::ChainFilter;
@@ -1045,6 +1045,83 @@ fn turn_tool_child(node: u64, seq: u64, parent: OpId, turn: u64) -> Op {
     }
 }
 
+/// A normalized Plan reflection child anchored at a raw import op.
+fn turn_plan_child(node: u64, seq: u64, parent: OpId, turn: u64, summary: &str) -> Op {
+    let scope = ScopeRef::Turn(editchain_core::TurnId(turn));
+    Op {
+        id: OpId::new(NodeId(node), 0, seq),
+        parents: ParentSet::One(parent),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(seq * 1_000),
+        scope,
+        tags: Tags::AGENT | Tags::REFLECTION,
+        kind: OpKind::Reflection(ReflectionOp {
+            scope,
+            covers: editchain_core::FrontierSet::new(),
+            window: editchain_core::WindowRef {
+                start_seq: 0,
+                end_seq: 0,
+            },
+            summary: Payload::Inline(summary.as_bytes().to_vec()),
+            anchors: Payload::Empty,
+        }),
+    }
+}
+
+/// One linear session with three distinct source reasoning records whose
+/// projected first heading is identical, followed by an agent continuation.
+fn repeated_plan_chain_ops() -> Vec<Op> {
+    let mut ops = Vec::new();
+    let root = raw_import_op(
+        30,
+        1,
+        1_000,
+        None,
+        r#"{"type":"response_item","payload":{}}"#,
+    );
+    ops.push(root.clone());
+    ops.push(turn_message_child(130, 101, root.id, 7, "user request"));
+    let mut previous = root;
+    for (index, summary) in [
+        "**Planning build and dry-run import steps**",
+        "Planning   build and dry-run import steps",
+        "__Planning build and dry-run import steps__",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let seq = u64::try_from(index + 2).unwrap_or(u64::MAX);
+        let raw_json = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "summary": [{ "type": "summary_text", "text": summary }]
+            }
+        })
+        .to_string();
+        let raw = raw_import_op(30, seq, seq * 1_000, Some(previous.id), &raw_json);
+        ops.push(raw.clone());
+        ops.push(turn_plan_child(130, seq + 101, raw.id, 7, summary));
+        previous = raw;
+    }
+    let continuation = raw_import_op(
+        30,
+        5,
+        5_000,
+        Some(previous.id),
+        r#"{"type":"response_item","payload":{}}"#,
+    );
+    ops.push(continuation.clone());
+    ops.push(turn_message_child(
+        130,
+        105,
+        continuation.id,
+        7,
+        "agent continuation",
+    ));
+    ops
+}
+
 /// Store a blob in a chain's durable blob store, returning its reference.
 fn store_blob(chain_dir: &Path, data: &[u8]) -> editchain_core::payload::BlobRef {
     let mut blobs = editchain_import::FsBlobSink::new(chain_dir.join("blobs")).expect("blob sink");
@@ -1847,14 +1924,14 @@ fn service_path_truncated_echo_texts_never_pair_but_untruncated_exact_pairs_do()
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_nine() {
+fn prepared_snapshot_manifest_records_projection_revision_ten() {
     // Stale snapshots from earlier projection revisions (pre-hide_trace,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
     // duplicate-pair exclusion, pre prefix-string escape decoding, and pre
-    // Activity work-unit/promotion/execute-run-bundling and inline-compaction
-    // semantics) must not be served silently: the revision participates in the
-    // snapshot identity hash.
+    // Activity work-unit/promotion/execute-run/Plan-repeat bundling and
+    // inline-compaction semantics) must not be served silently: the revision
+    // participates in the snapshot identity hash.
     let tmp = tempfile::tempdir().expect("tempdir");
     let chain_dir = tmp.path().join(".editchain");
     let first = msg_op(41, 1, b"snapshot first");
@@ -1869,7 +1946,7 @@ fn prepared_snapshot_manifest_records_projection_revision_nine() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 9u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 10u64);
 }
 
 #[test]
@@ -2129,7 +2206,110 @@ fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() 
 }
 
 #[test]
-fn prepared_snapshot_serves_bundled_activity_view_and_records_revision_nine() {
+fn activity_view_groups_repeated_plans_as_expandable_linear_updates() {
+    let projection = HistoryProjection::from_ops(repeated_plan_chain_ops());
+    let mut ws = Workspace::from_projection(projection);
+    let fixed = ChainFilter::new(
+        String::new(),
+        String::new(),
+        String::new(),
+        false,
+        true,
+        true,
+    );
+    let activity = ws.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 100,
+        hide_submodules: true,
+        filter: &fixed,
+        include_layout: true,
+    });
+    let raw = ws.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 100,
+        hide_submodules: true,
+        filter: &no_filter(),
+        include_layout: true,
+    });
+
+    let bundle = activity
+        .rows
+        .iter()
+        .find(|row| {
+            row.activity_bundle
+                .as_ref()
+                .is_some_and(|bundle| bundle.kind == ActivityBundleKind::PlanRepeat)
+        })
+        .expect("Activity has one typed Plan-repeat bundle");
+    assert_eq!(
+        bundle.summary,
+        "__Planning build and dry-run import steps__"
+    );
+    assert_eq!(bundle.record_role, RecordRole::Narrative);
+    assert_eq!(bundle.activity_kind, ActivityKind::Plan);
+    assert_eq!(bundle.outcome, Outcome::Unknown);
+    assert_eq!(
+        bundle
+            .activity_bundle
+            .as_ref()
+            .map(|metadata| metadata.member_count),
+        Some(3)
+    );
+    let wire = serde_json::to_value(bundle).expect("serialize Plan bundle");
+    assert_eq!(wire["activity_bundle"]["kind"], "plan-repeat");
+
+    let bundle_index = activity
+        .rows
+        .iter()
+        .position(|row| row.node_key == bundle.node_key)
+        .expect("bundle row index");
+    let members: Vec<&HistoryRow> = activity
+        .rows
+        .iter()
+        .filter(|row| row.is_subop && row.parent_row == Some(bundle_index))
+        .collect();
+    assert_eq!(members.len(), 3);
+    assert_eq!(
+        members
+            .iter()
+            .map(|row| row.summary.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "__Planning build and dry-run import steps__",
+            "Planning   build and dry-run import steps",
+            "**Planning build and dry-run import steps**",
+        ],
+        "expansion retains every original Plan presentation and order"
+    );
+    assert!(members.iter().all(|row| row.op_id.is_some()));
+
+    let top_level: Vec<&HistoryRow> = activity.rows.iter().filter(|row| !row.is_subop).collect();
+    assert_eq!(top_level.len(), 3);
+    assert!(top_level.iter().all(|row| row.lane == 0));
+    assert_eq!(top_level[0].parents, vec![bundle.node_key.clone()]);
+    assert_eq!(bundle.parents, vec![top_level[2].node_key.clone()]);
+    assert_eq!(
+        activity.max_lane, 0,
+        "grouping does not allocate a branch lane"
+    );
+
+    let raw_top_level: Vec<&HistoryRow> = raw.rows.iter().filter(|row| !row.is_subop).collect();
+    assert_eq!(raw_top_level.len(), 5);
+    assert_eq!(
+        raw_top_level
+            .iter()
+            .filter(|row| row.activity_kind == ActivityKind::Plan)
+            .count(),
+        3
+    );
+    assert!(
+        raw.rows.iter().all(|row| row.activity_bundle.is_none()),
+        "Raw remains an exact ungrouped source view"
+    );
+}
+
+#[test]
+fn prepared_snapshot_serves_bundled_activity_view_and_records_revision_ten() {
     // The pregenerated render snapshot must serve the SAME bundled Activity
     // rows as the live projection (work-unit/promotion/bundling parity) and
     // record the bumped projection revision in its identity.
@@ -2185,7 +2365,7 @@ fn prepared_snapshot_serves_bundled_activity_view_and_records_revision_nine() {
         &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["identity"]["projection_revision"], 9u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 10u64);
 
     let mut cached =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");

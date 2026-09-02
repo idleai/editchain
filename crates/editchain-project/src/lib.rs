@@ -117,6 +117,34 @@ pub enum HistoryNode {
         /// conservatively `Unknown`).
         meta: NodeMeta,
     },
+    /// A synthetic Activity-view summary node folding adjacent Plan rows that
+    /// repeat the same normalized heading (see
+    /// [`crate::activity::bundle_activity_plan_repeats`]).
+    ///
+    /// This is a display-only contraction, not importer deduplication. Every
+    /// original reasoning record remains an expandable member with its real op
+    /// id, timestamp, raw details, and causal position. The node key is the
+    /// newest member's op id so the bundle occupies one point on the existing
+    /// linear path instead of introducing a branch.
+    PlanBundle {
+        /// The newest member's op (identity/time/group anchor).
+        anchor: Arc<Op>,
+        /// Effective display time of the anchor member.
+        source_time: EffectiveTime,
+        /// Original top-level Plan rows, newest-first (display order).
+        member_nodes: Vec<HistoryNode>,
+        /// Flat expandable ops: every member's op followed by its own bundled
+        /// metadata sub-ops, newest-first.
+        members: Vec<Arc<Op>>,
+        /// The repeated heading, preserving the newest member's presentation.
+        summary: String,
+        /// Dominant member kind tag (normally `"reflection"`).
+        kind: String,
+        /// Author label derived from the members.
+        author: String,
+        /// Deterministic semantic metadata (Narrative / Plan / Primary).
+        meta: NodeMeta,
+    },
     /// A `Git` commit entity.
     GitCommit(Box<GitCommitEntity>),
 }
@@ -135,7 +163,9 @@ impl HistoryNode {
             Self::CollapsedImport {
                 summary, sub_ops, ..
             } => combined_summary(summary, sub_ops),
-            Self::ExecuteBundle { summary, .. } => summary.clone(),
+            Self::ExecuteBundle { summary, .. } | Self::PlanBundle { summary, .. } => {
+                summary.clone()
+            }
             Self::GitCommit(commit) => match &commit.message {
                 Payload::Inline(b) => String::from_utf8_lossy(b).to_string(),
                 Payload::Empty | Payload::Blob(_) => commit.oid.to_hex(),
@@ -168,10 +198,10 @@ impl HistoryNode {
     #[must_use]
     pub fn effective_time(&self) -> EffectiveTime {
         match self {
-            Self::EditOperation { source_time, .. } | Self::CollapsedImport { source_time, .. } => {
-                *source_time
-            }
-            Self::ExecuteBundle { source_time, .. } => *source_time,
+            Self::EditOperation { source_time, .. }
+            | Self::CollapsedImport { source_time, .. }
+            | Self::ExecuteBundle { source_time, .. }
+            | Self::PlanBundle { source_time, .. } => *source_time,
             Self::GitCommit(commit) => {
                 let secs = u64::try_from(commit.committed_at).unwrap_or(0);
                 EffectiveTime::Observed(secs.saturating_mul(1000))
@@ -193,7 +223,8 @@ impl HistoryNode {
         match self {
             Self::EditOperation { source_time, .. }
             | Self::CollapsedImport { source_time, .. }
-            | Self::ExecuteBundle { source_time, .. } => {
+            | Self::ExecuteBundle { source_time, .. }
+            | Self::PlanBundle { source_time, .. } => {
                 *source_time = EffectiveTime::BundleAnchor(ms);
             }
             Self::GitCommit(commit) => {
@@ -208,7 +239,7 @@ impl HistoryNode {
     pub fn op_id(&self) -> Option<OpId> {
         match self {
             Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => Some(op.id),
-            Self::ExecuteBundle { anchor, .. } => Some(anchor.id),
+            Self::ExecuteBundle { anchor, .. } | Self::PlanBundle { anchor, .. } => Some(anchor.id),
             Self::GitCommit(_) => None,
         }
     }
@@ -219,7 +250,8 @@ impl HistoryNode {
         match self {
             Self::EditOperation { .. }
             | Self::CollapsedImport { .. }
-            | Self::ExecuteBundle { .. } => None,
+            | Self::ExecuteBundle { .. }
+            | Self::PlanBundle { .. } => None,
             Self::GitCommit(commit) => Some(commit.oid),
         }
     }
@@ -230,7 +262,8 @@ impl HistoryNode {
         match self {
             Self::EditOperation { .. }
             | Self::CollapsedImport { .. }
-            | Self::ExecuteBundle { .. } => None,
+            | Self::ExecuteBundle { .. }
+            | Self::PlanBundle { .. } => None,
             Self::GitCommit(commit) => Some(commit.repository),
         }
     }
@@ -249,7 +282,9 @@ impl HistoryNode {
                 | editchain_core::ScopeRef::Turn(_)
                 | editchain_core::ScopeRef::File(_) => "ops".to_string(),
             },
-            Self::ExecuteBundle { anchor, .. } => bundle_group(anchor),
+            Self::ExecuteBundle { anchor, .. } | Self::PlanBundle { anchor, .. } => {
+                bundle_group(anchor)
+            }
             Self::GitCommit(commit) => format!("repo:{}", commit.repository.0),
         }
     }
@@ -263,7 +298,9 @@ impl HistoryNode {
             Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => op.id.to_string(),
             // The bundle contracts into its newest member's display slot, so its
             // key IS the anchor's real op id: causal children keep resolving.
-            Self::ExecuteBundle { anchor, .. } => anchor.id.to_string(),
+            Self::ExecuteBundle { anchor, .. } | Self::PlanBundle { anchor, .. } => {
+                anchor.id.to_string()
+            }
             Self::GitCommit(commit) => commit.oid.to_hex(),
         }
     }
@@ -340,6 +377,11 @@ impl HistoryNode {
                 member_nodes,
                 members,
                 ..
+            }
+            | Self::PlanBundle {
+                member_nodes,
+                members,
+                ..
             } => {
                 // The bundle contracts a whole run, so it inherits the union of
                 // every member's EXTERNAL parent keys (stored causal parents,
@@ -392,7 +434,7 @@ impl HistoryNode {
                     _ => editchain_core::parents::ParentSet::Two(ids[0], ids[1]),
                 };
             }
-            Self::ExecuteBundle { anchor, .. } => {
+            Self::ExecuteBundle { anchor, .. } | Self::PlanBundle { anchor, .. } => {
                 let mut ids: Vec<OpId> = keys
                     .iter()
                     .filter_map(|k| OpId::from_display_str(k))
@@ -422,7 +464,7 @@ impl HistoryNode {
     pub fn sub_ops(&self) -> &[Arc<Op>] {
         match self {
             Self::CollapsedImport { sub_ops, .. } => sub_ops,
-            Self::ExecuteBundle { members, .. } => members,
+            Self::ExecuteBundle { members, .. } | Self::PlanBundle { members, .. } => members,
             Self::EditOperation { .. } | Self::GitCommit(_) => &[],
         }
     }
@@ -452,7 +494,9 @@ impl HistoryNode {
             },
             // Collapsed imports report their dominant child kind so the viewer
             // can style tool calls vs messages differently.
-            Self::CollapsedImport { kind, .. } | Self::ExecuteBundle { kind, .. } => kind.clone(),
+            Self::CollapsedImport { kind, .. }
+            | Self::ExecuteBundle { kind, .. }
+            | Self::PlanBundle { kind, .. } => kind.clone(),
             Self::GitCommit(_) => "git".to_string(),
         }
     }
@@ -465,7 +509,9 @@ impl HistoryNode {
     #[must_use]
     pub fn record_meta(&self) -> NodeMeta {
         match self {
-            Self::CollapsedImport { meta, .. } | Self::ExecuteBundle { meta, .. } => *meta,
+            Self::CollapsedImport { meta, .. }
+            | Self::ExecuteBundle { meta, .. }
+            | Self::PlanBundle { meta, .. } => *meta,
             Self::EditOperation { op, .. } => meta::for_edit_operation(op),
             Self::GitCommit(_) => meta::for_git_commit(),
         }
@@ -843,7 +889,8 @@ impl HistoryProjection {
                         | editchain_core::ScopeRef::File(_) => None,
                     }
                 }
-                HistoryNode::ExecuteBundle { anchor, .. } => match anchor.scope {
+                HistoryNode::ExecuteBundle { anchor, .. }
+                | HistoryNode::PlanBundle { anchor, .. } => match anchor.scope {
                     editchain_core::ScopeRef::Session(session) => Some(session.0),
                     editchain_core::ScopeRef::None
                     | editchain_core::ScopeRef::Chain(_)
@@ -871,7 +918,8 @@ impl HistoryProjection {
                         | editchain_core::ScopeRef::File(_) => None,
                     }
                 }
-                HistoryNode::ExecuteBundle { anchor, .. } => match anchor.scope {
+                HistoryNode::ExecuteBundle { anchor, .. }
+                | HistoryNode::PlanBundle { anchor, .. } => match anchor.scope {
                     editchain_core::ScopeRef::Session(session) => Some(session.0),
                     editchain_core::ScopeRef::None
                     | editchain_core::ScopeRef::Chain(_)
@@ -1952,7 +2000,9 @@ fn ordering_key(node: &HistoryNode) -> OrderingKey {
         HistoryNode::EditOperation { op, .. } | HistoryNode::CollapsedImport { op, .. } => {
             OrderingKey::Op(op.id)
         }
-        HistoryNode::ExecuteBundle { anchor, .. } => OrderingKey::Op(anchor.id),
+        HistoryNode::ExecuteBundle { anchor, .. } | HistoryNode::PlanBundle { anchor, .. } => {
+            OrderingKey::Op(anchor.id)
+        }
         HistoryNode::GitCommit(commit) => OrderingKey::Git(commit.oid),
     }
 }
@@ -2015,7 +2065,7 @@ fn ordering_parent_keys(
                 }
             }
         }
-        HistoryNode::ExecuteBundle { anchor, .. } => {
+        HistoryNode::ExecuteBundle { anchor, .. } | HistoryNode::PlanBundle { anchor, .. } => {
             for parent in &anchor.parents {
                 push(canonical_ordering_op(*parent, representative, present));
             }

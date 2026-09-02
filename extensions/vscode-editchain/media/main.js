@@ -1179,7 +1179,7 @@ function dotRadius() {
   return Math.max(1.5, Math.min(DOT_R, spacing / 2));
 }
 
-/** Terminal radius for the execute-run bundle glyph.
+/** Terminal radius for the typed Activity-bundle glyph.
  *
  * Scales with the dot radius (which already compresses with dense lanes) so
  * the bundle glyph shrinks proportionally on crowded rails, down to the same
@@ -1272,8 +1272,8 @@ function laneX(lane) {
  * exactly when a rendered path owns them, so dot-anchored transitions never
  * suppress the neighbouring legitimate segment (the path would not cover it).
  *
- * Typed Activity execute-run bundle rows (`activity_bundle.kind ===
- * 'execute-run'`) render a compact vertical capsule instead of the node dot:
+ * Recognized typed Activity bundle rows (`execute-run` and `plan-repeat`)
+ * render a compact vertical capsule instead of the node dot:
  * the entry terminal sits above the row midpoint and the exit terminal below
  * it, both on the node lane, and the capsule spans between them. Incoming
  * geometry on the node lane terminates at the entry terminal and outgoing
@@ -1287,7 +1287,7 @@ function buildGraphCell(row) {
   const height = ROW_H;
   const midY = ROW_H / 2;
   const nodeLane = row.lane || 0;
-  const isBundle = isExecuteRunBundle(row);
+  const isBundle = isActivityBundle(row);
   const bundle = isBundle
     ? {
         termR: bundleTerminalRadius(),
@@ -1360,7 +1360,7 @@ function buildGraphCell(row) {
   // A sub-op row draws NO node — it is not a graph node. Its `above`/`below`
   // are the pass-through lanes spanning this region, drawn as full-height
   // straight lines (both halves meet at midY). Only top-level rows get a node
-  // mark: the ordinary dot, or — on a typed execute-run bundle row — the
+  // mark: the ordinary dot, or — on a recognized typed bundle row — the
   // capsule with its entry/exit terminals.
   if (!row.is_subop) {
     const colour = COLORS[nodeLane % COLORS.length];
@@ -1406,7 +1406,7 @@ function fmt(v) {
  * Both halves reuse the exact same formatted seam coordinates (butt caps, no
  * gradients/defs), so the categorical colour handoff is sharp and gap-free.
  *
- * On a typed execute-run bundle row (`bundle` is non-null) the node spans
+ * On a recognized typed bundle row (`bundle` is non-null) the node spans
  * from the entry terminal (above the row midpoint) to the exit terminal
  * (below it), so a dot-anchored side is re-anchored to the matching terminal
  * and the shared seam moves with it: an outgoing (child) side starts at the
@@ -1614,7 +1614,7 @@ function outcomeBadge(row) {
 // --- Activity work-unit / bundle / promotion layer --------------------------
 //
 // The Activity profile renders a stable, additive semantic layer over the flat
-// row list: work-unit section headers, execute-run bundle chrome, and
+// row list: work-unit section headers, typed Activity-bundle chrome, and
 // conservative promotion rails. Raw stays the exact flat UI — every helper
 // below no-ops outside `profile === 'activity'`, so Raw rows never carry the
 // classes/descendants/data attributes the semantic layer introduces.
@@ -1723,11 +1723,27 @@ function workUnitClasses(row) {
   return '';
 }
 
-/** Whether a row is a top-level Activity execute-run bundle. Only the typed
- * `execute-run` kind qualifies — unknown/new bundle kinds stay flat. */
+/** The recognized typed bundle kind for one top-level Activity row. Unknown
+ * and future kinds deliberately return an empty string and stay flat. */
+function activityBundleKind(row) {
+  if (!activityView() || !row || row.is_subop || !row.activity_bundle) return '';
+  const kind = row.activity_bundle.kind;
+  return kind === 'execute-run' || kind === 'plan-repeat' ? kind : '';
+}
+
+/** Whether a row is any bundle kind this renderer understands. */
+function isActivityBundle(row) {
+  return activityBundleKind(row) !== '';
+}
+
+/** Whether a row is a top-level Activity execute-run bundle. */
 function isExecuteRunBundle(row) {
-  return !!(activityView() && row && !row.is_subop && row.activity_bundle &&
-    row.activity_bundle.kind === 'execute-run');
+  return activityBundleKind(row) === 'execute-run';
+}
+
+/** Whether a row is an adjacent repeated-Plan bundle. */
+function isPlanRepeatBundle(row) {
+  return activityBundleKind(row) === 'plan-repeat';
 }
 
 /** Whether a row is promoted in the Activity view (sub-ops are never). */
@@ -1748,14 +1764,16 @@ function promotedClasses(row) {
   return ' row-promoted row-promoted-rail';
 }
 
-/** One concise label for an execute-run bundle row. The count comes ONLY from
+/** One concise label for a typed bundle row. The count comes ONLY from
  * the DTO's `member_count` (never parsed from the summary or flattened sub-op
- * count). A quiet check appears only when structured success evidence exists;
- * unknown outcome adds no pessimistic "outcome unknown" label. */
+ * count). */
 function bundleCountText(row) {
   const bundle = row.activity_bundle;
   const mc = bundle ? bundle.member_count : undefined;
   if (typeof mc !== 'number') return '';
+  if (isPlanRepeatBundle(row)) {
+    return mc + (mc === 1 ? ' update' : ' updates');
+  }
   const command = row.kind === 'command';
   return mc + (command
     ? (mc === 1 ? ' command' : ' commands')
@@ -1765,7 +1783,9 @@ function bundleCountText(row) {
 function bundleChrome(row) {
   const countText = bundleCountText(row);
   if (!countText) return '';
-  const success = row.outcome === 'success';
+  // A check is execute-specific structured outcome evidence. Plan-repeat
+  // bundles are narrative updates and intentionally carry no status glyph.
+  const success = isExecuteRunBundle(row) && row.outcome === 'success';
   const title = countText + (success ? ', completed' : '');
   return '<span class="bundle-count" title="' + esc(title) + '">' + esc(countText) + '</span>' +
     (success
@@ -1775,8 +1795,8 @@ function bundleChrome(row) {
 
 /** Restrained leading metadata for one row.
  *
- * Typed bundles own their complete compact label, so they never repeat `run`,
- * `ok`, and a synthetic summary beside the same count. Structural relations
+ * Execute bundles own their complete compact label; Plan bundles keep their
+ * narrative heading beside the updates count. Structural relations
  * outrank generic activity; when one exists, only a negative/cancelled outcome
  * may accompany it. Common success and source-control chips are governed by
  * `ROW_BADGE_OPTIONS` and default off. */
@@ -1825,7 +1845,7 @@ function shortCommitId(row) {
  * The Activity profile additionally layers stable semantic chrome over the flat
  * row (see the work-unit/bundle/promotion helpers above): work-unit starts get
  * a compact two-line unit header inside the SAME fixed ROW_H (never the opaque
- * unit id as primary text), execute-run bundles get one count/status label plus
+ * unit id as primary text), typed bundles get one count label plus
  * disclosure semantics, and promoted rows get a quiet rail (restrained
  * narrative) or a strong accent (failure/warning/cancelled and change/verify).
  * Raw renders the exact flat row with none of it.
@@ -1839,7 +1859,7 @@ function buildRowHtml(row, absIdx, isGroupStart) {
   const wu = workUnitOf(row);
   const isWuStart = !!wu && !!wu.is_start;
   const isWuEnd = !!wu && !!wu.is_end;
-  const isBundle = isExecuteRunBundle(row);
+  const isBundle = isActivityBundle(row);
   const promotedCls = isPromotedRow(row) ? promotedClasses(row) : '';
   const groupClass = isGroupStart && !isWuStart ? ' row-group-start' : '';
   // Work-unit starts render their own unit header; suppress the group chip on
@@ -1903,12 +1923,11 @@ function buildRowHtml(row, absIdx, isGroupStart) {
       '<span class="subop-summary">' + renderMarkdownSummary(displaySummary) + '</span>';
   } else {
     // Top-level row: the chevron makes disclosure obvious and the whole row
-    // toggles it. Typed bundles use their one structured label as the whole
-    // compact summary; their generated `N tool steps (success)` string is not
-    // repeated. Session chips appear once at the session boundary.
-    content = chevronHtml + (isWuStart ? '' : sessionSlot) + semanticHtml + (isBundle
-      ? ''
-      : renderRowSummary(row, displaySummary));
+    // toggles it. Execute bundles use their one structured label as the whole
+    // compact summary; Plan bundles retain their narrative heading. Session
+    // chips appear once at the session boundary.
+    content = chevronHtml + (isWuStart ? '' : sessionSlot) + semanticHtml +
+      (isExecuteRunBundle(row) ? '' : renderRowSummary(row, displaySummary));
   }
   if (isWuStart) {
     // Compact two-line unit header inside the fixed ROW_H: the unit title +
@@ -1934,9 +1953,13 @@ function buildRowHtml(row, absIdx, isGroupStart) {
   let ariaLabel = plainSummary;
   if (isBundle) {
     const mc = row.activity_bundle.member_count;
-    ariaLabel = 'Execute run' +
-      (typeof mc === 'number' ? ', ' + mc + (mc === 1 ? ' step' : ' steps') : '') +
-      (row.outcome === 'success' ? ', completed' : '');
+    const memberNoun = isPlanRepeatBundle(row)
+      ? (mc === 1 ? ' update' : ' updates')
+      : (mc === 1 ? ' step' : ' steps');
+    ariaLabel = (isPlanRepeatBundle(row) ? 'Plan group' : 'Execute run') +
+      (typeof mc === 'number' ? ', ' + mc + memberNoun : '') +
+      (isExecuteRunBundle(row) && row.outcome === 'success' ? ', completed' : '') +
+      (isPlanRepeatBundle(row) ? ': ' + plainSummary : '');
   } else if (isWuStart) {
     ariaLabel = workUnitTitleOnly ? unitTitle : unitTitle + ': ' + plainSummary;
   }
@@ -1952,7 +1975,7 @@ function buildRowHtml(row, absIdx, isGroupStart) {
     ? ' data-work-unit-id="' + esc(wu.id) + '"'
     : '';
   const bundleAttrs = isBundle
-    ? ' data-activity-bundle="execute-run"' +
+    ? ' data-activity-bundle="' + activityBundleKind(row) + '"' +
       (typeof row.activity_bundle.member_count === 'number'
         ? ' data-bundle-count="' + row.activity_bundle.member_count + '"'
         : '')

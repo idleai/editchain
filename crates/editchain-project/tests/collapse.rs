@@ -213,6 +213,7 @@ fn collapse_author_derived_from_children_tags() {
         editchain_project::HistoryNode::CollapsedImport { author, .. } => author,
         editchain_project::HistoryNode::EditOperation { .. }
         | editchain_project::HistoryNode::ExecuteBundle { .. }
+        | editchain_project::HistoryNode::PlanBundle { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     };
     assert_eq!(author, "human");
@@ -232,6 +233,7 @@ fn collapse_author_prefers_human_over_agent() {
         editchain_project::HistoryNode::CollapsedImport { author, .. } => author,
         editchain_project::HistoryNode::EditOperation { .. }
         | editchain_project::HistoryNode::ExecuteBundle { .. }
+        | editchain_project::HistoryNode::PlanBundle { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     };
     assert_eq!(author, "human");
@@ -278,6 +280,7 @@ fn meta_imports_bundle_into_nearest_real_turn() {
         }
         editchain_project::HistoryNode::EditOperation { .. }
         | editchain_project::HistoryNode::ExecuteBundle { .. }
+        | editchain_project::HistoryNode::PlanBundle { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     }
 }
@@ -316,6 +319,7 @@ fn meta_bundle_keeps_parents_unchanged() {
         }
         editchain_project::HistoryNode::EditOperation { .. }
         | editchain_project::HistoryNode::ExecuteBundle { .. }
+        | editchain_project::HistoryNode::PlanBundle { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     }
 
@@ -774,6 +778,7 @@ fn no_cross_chain_meta_bundling() {
         }
         editchain_project::HistoryNode::EditOperation { .. }
         | editchain_project::HistoryNode::ExecuteBundle { .. }
+        | editchain_project::HistoryNode::PlanBundle { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     }
 

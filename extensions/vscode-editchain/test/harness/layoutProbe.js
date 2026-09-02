@@ -1947,7 +1947,7 @@
         window.__editchainScenarioName === 'workUnitsDeep') {
       const activeProfile = typeof window.__editchainGetProfile === 'function'
         ? window.__editchainGetProfile() : 'activity';
-      // The small fixture renders its full 12-row Activity view, so its checks
+      // The small fixture renders its full 13-row Activity view, so its checks
       // assert EXACT global counts; the tall deep fixture renders a
       // virtualized window slice (viewport + 2*BUFFER rows), so its checks
       // assert per-row wire-vs-DOM fidelity plus window-level uniqueness
@@ -1957,6 +1957,8 @@
         const abs = Number(el.getAttribute('data-row'));
         return window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
       };
+      const recognizedBundle = (bundle) => !!bundle &&
+        (bundle.kind === 'execute-run' || bundle.kind === 'plan-repeat');
       const rowEls = wrapEl
         ? Array.from(wrapEl.querySelectorAll('.row:not(.row-placeholder)'))
         : [];
@@ -2185,7 +2187,7 @@
         });
       }
 
-      // Check D: ONLY typed execute-run rows render bundle styling, with the
+      // Check D: ONLY recognized typed bundle rows render bundle styling, with the
       // exact typed member count (data attr + .bundle-count text). Structured
       // success gets one quiet check; unknown outcome gets no status wording.
       // Ordinary and unknown-kind rows stay bare.
@@ -2207,16 +2209,25 @@
             const countAttr = el.getAttribute('data-bundle-count');
             const countEl = el.querySelector('.bundle-count');
             const statusEl = el.querySelector('.bundle-status');
-            if (b && b.kind === 'execute-run') {
+            if (recognizedBundle(b)) {
               typed++;
-              if (!styled) problems.push(row.node_key + ': typed execute-run row missing .row-activity-bundle');
-              if (styledAttr !== 'execute-run') problems.push(row.node_key + ': data-activity-bundle="' + styledAttr + '" != execute-run');
+              if (!styled) problems.push(row.node_key + ': typed bundle row missing .row-activity-bundle');
+              if (styledAttr !== b.kind) problems.push(row.node_key + ': data-activity-bundle="' + styledAttr + '" != ' + b.kind);
               if (countAttr !== String(b.member_count)) problems.push(row.node_key + ': data-bundle-count="' + countAttr + '" != ' + b.member_count);
               if (!countEl || parseCount(countEl.textContent) !== b.member_count) {
                 problems.push(row.node_key + ': .bundle-count text mismatch (expected member_count ' + b.member_count + ')');
               }
               const statusText = statusEl ? (statusEl.textContent || '').trim() : '';
-              if (row.outcome === 'success') {
+              if (b.kind === 'plan-repeat') {
+                if (!countEl || countEl.textContent.trim() !== b.member_count + ' updates') {
+                  problems.push(row.node_key + ': Plan bundle must label member_count as updates');
+                }
+                const summary = el.querySelector('.summary-text');
+                if (!summary || summary.textContent.trim() !== 'Planning build and dry-run import steps') {
+                  problems.push(row.node_key + ': Plan bundle must retain its rendered heading');
+                }
+                if (statusEl) problems.push(row.node_key + ': Plan bundle must not render execute status');
+              } else if (row.outcome === 'success') {
                 if (!statusEl || statusText !== '✓' ||
                     !statusEl.classList.contains('bundle-status-success')) {
                   problems.push(row.node_key + ': all-success bundle missing .bundle-status-success');
@@ -2231,12 +2242,12 @@
               }
             }
           }
-          if (isSmall && typed !== 2) problems.push('expected exactly 2 typed execute-run bundles, got ' + typed);
+          if (isSmall && typed !== 3) problems.push('expected exactly 3 recognized typed bundles, got ' + typed);
           checks.push({
             name: 'BUNDLE_TYPED_EXACT',
             pass: problems.length === 0,
             detail: problems.length === 0
-              ? '2/2 typed execute-run bundles styled with exact member_count/status; ordinary + unknown-kind rows bare'
+              ? '3/3 recognized bundles styled with exact count/content/status; ordinary + unknown-kind rows bare'
               : problems.join('; '),
           });
         }
@@ -2275,8 +2286,8 @@
         }
       }
 
-      // Check E2: execute-run capsule gating is driven by the TYPED metadata
-      // exactly. Only rows whose cached activity_bundle.kind === 'execute-run'
+      // Check E2: Activity-bundle capsule gating is driven by TYPED metadata
+      // exactly. Only rows whose cached kind is recognized
       // render the capsule glyph set: exactly one rect.graphBundleCapsule,
       // exactly two circle.graphBundleTerminal (one .graphBundleEntry, one
       // .graphBundleExit), and NO circle.graphDot. The unknown-kind bundle row
@@ -2294,14 +2305,14 @@
             const svg = el.querySelector('.graph-cell svg.graphCell');
             const rects = svg ? svg.querySelectorAll('rect.graphBundleCapsule') : [];
             const terms = svg ? svg.querySelectorAll('circle.graphBundleTerminal') : [];
-            const typed = !!(b && b.kind === 'execute-run');
+            const typed = recognizedBundle(b);
             if (typed) {
               typedRows++;
               if (rects.length !== 1) {
-                problems.push(row.node_key + ': typed execute-run row must render exactly 1 capsule rect, got ' + rects.length);
+                problems.push(row.node_key + ': typed bundle row must render exactly 1 capsule rect, got ' + rects.length);
               }
               if (terms.length !== 2) {
-                problems.push(row.node_key + ': typed execute-run row must render exactly 2 terminals, got ' + terms.length);
+                problems.push(row.node_key + ': typed bundle row must render exactly 2 terminals, got ' + terms.length);
               } else {
                 const entry = Array.from(terms).filter((t) => t.classList.contains('graphBundleEntry')).length;
                 const exit = Array.from(terms).filter((t) => t.classList.contains('graphBundleExit')).length;
@@ -2309,22 +2320,22 @@
                 if (exit !== 1) problems.push(row.node_key + ': expected 1 .graphBundleExit terminal, got ' + exit);
               }
               if (svg && svg.querySelector('circle.graphDot')) {
-                problems.push(row.node_key + ': typed execute-run row must not render a graphDot');
+                problems.push(row.node_key + ': typed bundle row must not render a graphDot');
               }
             } else if (rects.length || terms.length) {
               problems.push(row.node_key + ': untyped row leaks capsule markup (rects=' + rects.length +
                 ' terminals=' + terms.length + ' typed metadata: ' + JSON.stringify(b) + ')');
             }
           }
-          if (isSmall && typedRows !== 2) {
-            problems.push('expected exactly 2 typed execute-run capsule rows, got ' + typedRows);
+          if (isSmall && typedRows !== 3) {
+            problems.push('expected exactly 3 typed bundle capsule rows, got ' + typedRows);
           }
           checks.push({
             name: 'BUNDLE_CAPSULE_TYPED_EXACT',
             pass: problems.length === 0,
             detail: problems.length === 0
-              ? (isSmall ? '2/2 ' : '') +
-                'typed execute-run rows carry one capsule + entry/exit terminals and no dot; unknown-kind + ordinary rows bare'
+              ? (isSmall ? '3/3 ' : '') +
+                'recognized bundle rows carry one capsule + entry/exit terminals and no dot; unknown-kind + ordinary rows bare'
               : problems.join('; '),
           });
         }
@@ -2355,7 +2366,7 @@
           for (const el of rowEls) {
             const row = cachedRow(el);
             const b = row ? row.activity_bundle : null;
-            if (!(b && b.kind === 'execute-run')) continue;
+            if (!recognizedBundle(b)) continue;
             const svg = el.querySelector('.graph-cell svg.graphCell');
             const rect = svg && svg.querySelector('rect.graphBundleCapsule');
             const entry = svg && svg.querySelector('circle.graphBundleTerminal.graphBundleEntry');
@@ -2403,7 +2414,7 @@
       }
 
       // Check E4: ordinary-row exclusion — every top-level row that is NOT a
-      // typed execute-run bundle keeps its graphDot and renders zero capsule
+      // recognized typed bundle keeps its graphDot and renders zero capsule
       // markup (sub-op rows draw no node at all, as always).
       if (activeProfile === 'activity') {
         const problems = [];
@@ -2411,7 +2422,7 @@
           if (el.classList.contains('row-subop')) continue;
           const row = cachedRow(el);
           const b = row ? row.activity_bundle : null;
-          if (b && b.kind === 'execute-run') continue;
+          if (recognizedBundle(b)) continue;
           const svg = el.querySelector('.graph-cell svg.graphCell');
           const dot = svg && svg.querySelector('circle.graphDot');
           if (!dot) problems.push(row.node_key + ': ordinary row lost its graphDot');
@@ -2439,7 +2450,7 @@
         for (const el of rowEls) {
           const row = cachedRow(el);
           const b = row ? row.activity_bundle : null;
-          if (!(b && b.kind === 'execute-run')) continue;
+          if (!recognizedBundle(b)) continue;
           const rowH = el.getBoundingClientRect().height;
           if (Math.abs(rowH - ROW_H) > 0.5) {
             problems.push(row.node_key + ': bundle row height ' + rowH + ' != ' + ROW_H);

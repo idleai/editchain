@@ -48,7 +48,12 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Revision 9 adds the bounded model-provider and agent-nickname subset from
 /// Codex `session_meta` to history rows, so stale revision-8 snapshots must not
 /// silently omit session provenance chips.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 9;
+///
+/// Revision 10 groups adjacent repeated Plan headings into typed expandable
+/// Activity bundles while preserving every original reasoning record and the
+/// linear graph path, so stale revision-9 snapshots must not serve duplicate
+/// flat Plan rows.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 10;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

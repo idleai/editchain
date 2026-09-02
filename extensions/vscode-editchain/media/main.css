@@ -1055,6 +1055,12 @@ body {
   margin-right: 0;
 }
 
+/* Plan-repeat bundles retain their narrative heading after the count chip;
+   execute-run bundles use the count as their entire compact label. */
+.row-activity-bundle[data-activity-bundle='plan-repeat'] .row-meta {
+  margin-right: 7px;
+}
+
 /* Activity is a quiet kicker, relations are topology annotations, and outcome
    is the only lozenge-like state. This prevents every signal from becoming an
    equally loud outlined chip. */
