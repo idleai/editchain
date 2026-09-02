@@ -940,34 +940,41 @@ function normalizeFindMatch(m) {
 }
 
 /** Render the adjacent find counter. Every state is compact and none replaces
- * the chain: pending "…", settled "i of N" (or "N+" when the response was
- * truncated), "0 of 0", and a styled "error" with the reason as a tooltip. */
+ * the chain: pending is a spinner-only busy state (no visible text; the
+ * .search-counter-pending pseudo-element draws the ring, aria-label keeps the
+ * "Searching…" announcement, aria-busy marks the region busy), settled is
+ * "i of N" (or "N+" when the response was truncated), plus "0 of 0" and a
+ * styled "error" with the reason as a tooltip. */
 function updateFindCounter(state, detail) {
   if (!searchCounterEl) return;
   searchCounterEl.classList.remove(
     'search-counter-pending', 'search-counter-zero', 'search-counter-error');
   let text = '';
   if (state === 'pending') {
-    text = '…';
     searchCounterEl.classList.add('search-counter-pending');
     searchCounterEl.setAttribute('aria-label', 'Searching…');
+    searchCounterEl.setAttribute('aria-busy', 'true');
     searchCounterEl.removeAttribute('title');
   } else if (state === 'zero') {
     text = '0 of 0';
     searchCounterEl.classList.add('search-counter-zero');
     searchCounterEl.removeAttribute('aria-label');
+    searchCounterEl.removeAttribute('aria-busy');
     searchCounterEl.removeAttribute('title');
   } else if (state === 'error') {
     text = 'error';
     searchCounterEl.classList.add('search-counter-error');
     searchCounterEl.setAttribute('aria-label', 'Find failed' + (detail ? ': ' + detail : ''));
+    searchCounterEl.removeAttribute('aria-busy');
     searchCounterEl.title = detail || '';
   } else if (state === 'settled') {
     text = (findIndex + 1) + ' of ' + findTotal + (findMore ? '+' : '');
     searchCounterEl.removeAttribute('aria-label');
+    searchCounterEl.removeAttribute('aria-busy');
     searchCounterEl.removeAttribute('title');
   } else {
     searchCounterEl.removeAttribute('aria-label');
+    searchCounterEl.removeAttribute('aria-busy');
     searchCounterEl.removeAttribute('title');
   }
   searchCounterEl.textContent = text;

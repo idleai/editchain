@@ -8,7 +8,7 @@
 // or layout. Navigation keeps focus in the search input (ArrowDown/ArrowUp
 // move next/previous and wrap; same-query Enter advances, Shift+Enter steps
 // back), and the adjacent counter reports "i of N" ("1 of N+" when truncated),
-// "…" pending, "0 of 0", or "error".
+// an animated spinner while pending (no visible text), "0 of 0", or "error".
 //
 //  1. history row keys/graph stay real and unchanged through search
 //  2. initial auto-jump + "1 of N"; next/prev/wrap; same-query Enter/Shift+Enter
@@ -143,6 +143,9 @@ async function contract(page) {
       rowCount: rows.length,
       total: window.__editchainGetTotal ? window.__editchainGetTotal() : -1,
       counter: counter ? (counter.textContent || '').trim() : '',
+      counterClass: counter ? (counter.className || '') : '',
+      counterBusy: counter ? (counter.getAttribute('aria-busy') || '') : '',
+      counterLabel: counter ? (counter.getAttribute('aria-label') || '') : '',
       counterTitle: counter ? (counter.getAttribute('title') || '') : '',
       focusedIsInput: document.activeElement === input,
       scrollTop: rowsEl.scrollTop,
@@ -218,6 +221,28 @@ async function searchControlLayout(page) {
       inputOutlineStyle: inputStyle.outlineStyle,
       counterDivider: counterStyle.borderLeftWidth,
       prevDivider: prevStyle.borderLeftWidth,
+    };
+  });
+}
+
+/** Snapshot the pending spinner pseudo-element (.search-counter-pending
+ * ::before) as computed styles: whether it exists, is visible, and animates. */
+async function pendingSpinner(page) {
+  return page.evaluate(() => {
+    const counter = document.getElementById('search-counter');
+    if (!counter) return null;
+    const s = getComputedStyle(counter, '::before');
+    return {
+      content: s.content,
+      display: s.display,
+      width: s.width,
+      height: s.height,
+      borderTopWidth: s.borderTopWidth,
+      borderTopColor: s.borderTopColor,
+      borderRadius: s.borderRadius,
+      animationName: s.animationName,
+      animationDuration: s.animationDuration,
+      animationIterationCount: s.animationIterationCount,
     };
   });
 }
@@ -818,6 +843,7 @@ test('absolute->visible mapping respects expansion state; expansion and profile 
     await page.evaluate(() => window.__editchainDebug.whenIdle(20000));
     let switched = await contract(page);
     assert.equal(switched.counter, '', 'a profile switch clears the find counter');
+    assert.equal(switched.counterBusy, '', 'a profile switch clears the busy state');
     assert.equal(switched.prevDisabled, true, 'a profile switch disables prev');
     assert.equal(switched.nextDisabled, true, 'a profile switch disables next');
     assert.equal(switched.navVisible, false, 'a profile switch hides result navigation');
@@ -855,6 +881,7 @@ test('clearing the input or Escape clears find state without refetching or movin
     await page.evaluate(() => window.__editchainDebug.whenIdle(20000));
     let cleared = await contract(page);
     assert.equal(cleared.counter, '', 'clearing the input clears the counter');
+    assert.equal(cleared.counterBusy, '', 'clearing the input clears the busy state');
     assert.equal(cleared.selectedRow, null, 'clearing the input clears the highlight');
     assert.equal(cleared.scrollTop, settled.scrollTop, 'the resulting scroll position is preserved');
     assert.equal(cleared.rowCount, settled.rowCount, 'the rendered window is untouched');
@@ -874,6 +901,7 @@ test('clearing the input or Escape clears find state without refetching or movin
     await page.evaluate(() => window.__editchainDebug.whenIdle(20000));
     cleared = await contract(page);
     assert.equal(cleared.counter, '', 'Escape clears the counter');
+    assert.equal(cleared.counterBusy, '', 'Escape clears the busy state');
     assert.equal(cleared.selectedRow, null, 'Escape clears the highlight');
     assert.equal(cleared.scrollTop, researched.scrollTop, 'Escape preserves the scroll position');
     assert.equal(cleared.inputValue, 'multi-group op #599', 'Escape keeps the typed query');
@@ -966,11 +994,37 @@ test('edited-but-unsubmitted text and in-flight replacements never navigate stal
     });
     assert.equal(held, true, 'the replacement find response is held');
     state = await contract(page);
-    assert.equal(state.counter, '…', 'pending state is compact');
+    assert.equal(state.counter, '', 'pending shows no visible text');
+    assert.equal(state.counterClass.includes('search-counter-pending'), true,
+      'pending exposes the spinner state class');
+    assert.equal(state.counterBusy, 'true', 'pending marks the counter busy');
+    assert.equal(state.counterLabel, 'Searching…', 'pending keeps the accessible label');
+    assert.equal(state.counterTitle, '', 'pending carries no tooltip');
     assert.equal(state.selectedRow, null, 'the old highlight is cleared while the new search is pending');
     assert.equal(state.prevDisabled, true, 'a pending replacement disables prev');
     assert.equal(state.nextDisabled, true, 'a pending replacement disables next');
     assert.equal(state.navVisible, false, 'pending results hide both arrows');
+    let spinner = await pendingSpinner(page);
+    assert.ok(spinner && spinner.content !== 'none', 'the pending spinner pseudo-element exists');
+    assert.notEqual(spinner.display, 'none', 'the pending spinner is displayed');
+    assert.ok(parseFloat(spinner.width) > 0 && parseFloat(spinner.height) > 0,
+      'the pending spinner has visible size');
+    assert.notEqual(spinner.borderTopWidth, '0px', 'the pending spinner draws its ring');
+    assert.notEqual(spinner.borderRadius, '0px', 'the pending spinner ring is round');
+    assert.equal(spinner.animationName, 'ec-search-spin', 'the pending spinner animates under normal motion');
+    assert.notEqual(spinner.animationDuration, '0s', 'the pending spinner has a real rotation period');
+    assert.equal(spinner.animationIterationCount, 'infinite', 'the pending spinner loops');
+    // Reduced motion: the ring stays visible but never rotates.
+    await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
+    spinner = await pendingSpinner(page);
+    assert.equal(spinner.animationName, 'none', 'reduced motion disables the spinner animation');
+    assert.ok(parseFloat(spinner.width) > 0 && parseFloat(spinner.height) > 0,
+      'reduced motion keeps the ring visible');
+    assert.notEqual(spinner.borderTopColor, 'rgba(0, 0, 0, 0)',
+      'reduced motion closes the ring into a full visible glyph');
+    await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'no-preference' }]);
+    spinner = await pendingSpinner(page);
+    assert.equal(spinner.animationName, 'ec-search-spin', 'normal motion restores the spinner animation');
     await focusInput(page);
     await pressInput(page, 'ArrowDown');
     state = await contract(page);
@@ -987,6 +1041,12 @@ test('edited-but-unsubmitted text and in-flight replacements never navigate stal
     await page.evaluate(() => window.__editchainDebug.whenIdle(20000));
     state = await contract(page);
     assert.equal(state.counter, '1 of 2', 'the settled replacement reports its own count');
+    assert.equal(state.counterClass.includes('search-counter-pending'), false,
+      'settled results clear the pending spinner class');
+    assert.equal(state.counterBusy, '', 'settled results clear the busy state');
+    assert.equal(state.counterLabel, '', 'settled results clear the pending label');
+    spinner = await pendingSpinner(page);
+    assert.equal(spinner.content, 'none', 'settled results remove the spinner pseudo-element');
     assert.equal(state.selectedKey, 'node:b:exec');
     assert.equal(state.nextDisabled, false, 'the settled replacement re-enables the buttons');
     assert.equal(state.navVisible, true, 'the arrows return only after replacement results settle');
@@ -1011,6 +1071,10 @@ test('zero-result and error searches stay compact and never replace the chain', 
     await runSearch(page, 'zzz-no-match');
     let state = await contract(page);
     assert.equal(state.counter, '0 of 0');
+    assert.equal(state.counterBusy, '', 'zero results clear the busy state');
+    assert.equal(state.counterLabel, '', 'zero results clear the pending label');
+    assert.equal(state.counterClass.includes('search-counter-pending'), false,
+      'zero results clear the spinner class');
     assert.equal(state.selectedRow, null);
     assert.equal(state.findCurrentRow, null);
     assert.deepEqual(state.rowKeys, before.rowKeys, 'the chain rows are unchanged');
@@ -1029,6 +1093,8 @@ test('zero-result and error searches stay compact and never replace the chain', 
     await runSearch(page, 'the');
     state = await contract(page);
     assert.equal(state.counter, 'error', 'error state is compact');
+    assert.equal(state.counterBusy, '', 'an error clears the busy state');
+    assert.equal(state.counterLabel, 'Find failed: index unavailable', 'the reason stays accessible');
     assert.equal(state.counterTitle, 'index unavailable', 'the reason rides as a tooltip');
     assert.equal(state.selectedRow, null, 'no stale highlight after an error');
     assert.deepEqual(state.rowKeys, before.rowKeys, 'an error never replaces the chain DOM');

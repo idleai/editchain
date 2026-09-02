@@ -128,9 +128,9 @@ body {
   color: var(--vscode-input-placeholderForeground);
 }
 /* Adjacent find-in-chain counter: "1 of N", "1 of N+" when the response was
-   truncated (more), "…" while a search is pending, "0 of 0" for no matches,
-   and a compact "error" state. It sits beside the search input inside the
-   composite and never replaces the history surface. */
+   truncated (more), an animated spinner while a search is pending, "0 of 0"
+   for no matches, and a compact "error" state. It sits beside the search
+   input inside the composite and never replaces the history surface. */
 .search-counter {
   flex: 0 0 auto;
   min-width: 56px;
@@ -145,6 +145,33 @@ body {
   text-align: center;
   white-space: nowrap;
   border-left: 1px solid var(--vscode-input-border, transparent);
+}
+.search-counter-pending::before {
+  /* Spinner-only pending state: the counter's text is empty, so this
+     pseudo-element is the only visible content — a centered ring with a
+     transparent top segment that rotates to signal work. No external asset
+     and no markup change; the counter keeps its compact width and dividers. */
+  content: '';
+  width: 12px;
+  height: 12px;
+  box-sizing: border-box;
+  border: 2px solid var(--vscode-input-placeholderForeground, currentColor);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: ec-search-spin 0.8s linear infinite;
+}
+@keyframes ec-search-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+/* Respect reduced motion: keep a clearly visible static ring (all border
+   segments opaque) but never rotate it. */
+@media (prefers-reduced-motion: reduce) {
+  .search-counter-pending::before {
+    animation: none;
+    border-top-color: var(--vscode-input-placeholderForeground, currentColor);
+  }
 }
 .search-counter-error {
   color: var(--vscode-editorError-foreground, #f48771);
