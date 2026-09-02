@@ -39,6 +39,14 @@ pub enum RequestBody {
     SetFilters(SetFiltersRequest),
     /// Run a unified search.
     Search(SearchRequest),
+    /// Find ranked lexical hits resolved to visible top-level history rows.
+    ///
+    /// This is the Find-in-Chain backend: unlike [`Search`](Self::Search),
+    /// which returns raw scored chunks, every match is resolved to the real
+    /// visible top-level row (and its absolute expanded-history parent-row
+    /// offset) under the exact active chain filter/profile, so the viewer can
+    /// cycle matches with arrow keys without auto-expanding or scanning rows.
+    FindInHistory(FindInHistoryRequest),
     /// List discovered git repositories.
     GetRepositories,
     /// Resolve a git object by OID.
@@ -240,6 +248,44 @@ pub struct SearchRequest {
     pub top_k: usize,
     /// Optional filters.
     pub filters: SearchFiltersDto,
+}
+
+/// Find ranked lexical hits resolved to visible top-level history rows.
+///
+/// The service runs a BM25 lexical search, resolves every scored chunk to the
+/// top-level history row that actually renders it under the **exact** chain
+/// filter/profile of the active view, deduplicates multiple chunks/children
+/// that map to the same row (keeping the best score), and filters out hits with
+/// no row in that view. It never auto-expands or changes expansion state: each
+/// match carries the stable real `node_key` of its top-level row plus the
+/// absolute expanded-history parent-row offset (0 = newest) that matches
+/// `GetWindow` offsets and the `ViewSnapshot.starts` prefix sums the viewer
+/// already retains.
+///
+/// The request carries the exact [`ChainFilterDto`] and `hide_submodules` value
+/// the client used for `GetWindow`/`GetLayout`, so resolution runs against the
+/// same cached snapshot (filter key `(hide_submodules, filter)`), never a
+/// rebuilt O(V) view per arrow press.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindInHistoryRequest {
+    /// The query string (BM25 lexical search only).
+    pub query: String,
+    /// Number of candidate chunks to retrieve from the index before row
+    /// resolution and deduplication. When the candidate list hits this cap the
+    /// response reports `more: true` — it never claims an exact total.
+    pub top_k: usize,
+    /// Optional search filters (kinds, sources, sessions, actors, paths, times).
+    #[serde(default)]
+    pub filters: SearchFiltersDto,
+    /// The exact chain filter of the active view (same DTO as
+    /// `GetWindow`/`GetLayout`). Omit only for the fixed default Activity
+    /// profile, which maps to the same filter as a `None` DTO on those requests.
+    #[serde(default)]
+    pub filter: Option<ChainFilterDto>,
+    /// Whether the active view hides nested/submodule repositories (same value
+    /// as `GetWindow`/`GetLayout`).
+    #[serde(default)]
+    pub hide_submodules: bool,
 }
 
 /// Search filters carried over the protocol.
@@ -737,6 +783,85 @@ pub struct SearchResponse {
     pub results: Vec<SearchHit>,
 }
 
+/// A Find-in-Chain match: one distinct visible top-level history row.
+///
+/// Multiple scored chunks and folded children that resolve to the same visible
+/// row are deduplicated into one match, keeping the best (highest) BM25 score.
+/// `row` is the absolute expanded-history parent-row offset of the containing
+/// top-level row — the same coordinate the viewer derives from its
+/// `sub_op_counts` prefix sums and the `parent_row` values in `GetWindow`
+/// responses, so arrow-key navigation never needs to auto-expand anything.
+///
+/// Identity fields mirror [`SearchHit`] so the viewer can route clicks with the
+/// existing logic: `op_id` for `EditChain` hits, `(git_oid, repository)` for
+/// `Git` hits (the synthetic index-only op id is never a projection node).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindInHistoryMatch {
+    /// The stable real node key of the visible top-level row that renders this
+    /// hit (`"node:boot:seq"` for `EditChain` rows, lowercase OID hex for git).
+    pub node_key: String,
+    /// Absolute expanded-history parent-row offset (0 = newest) of the
+    /// containing top-level row, compatible with `GetWindow` offsets and
+    /// `ViewSnapshot.starts`.
+    pub row: u64,
+    /// Display summary of the containing top-level row.
+    #[serde(default)]
+    pub summary: String,
+    /// Best (highest) BM25 score among the chunks deduplicated into this row.
+    pub score: f64,
+    /// The operation ID of the best-scoring chunk (`"node:boot:seq"`).
+    pub op_id: String,
+    /// The chunk identifier of the best-scoring chunk.
+    pub chunk_id: String,
+    /// The text content of the best-scoring chunk.
+    pub text: String,
+    /// The source domain (`EditChain` or `Git`).
+    pub source: Source,
+    /// The session this chunk belongs to, if any (exact decimal `SessionId`
+    /// string; `None` for git commits).
+    pub session_id: Option<String>,
+    /// The actor that produced this chunk (exact decimal `ActorId` string).
+    pub actor_id: String,
+    /// Bitmask of operation kind tags (numeric count of tag bits).
+    pub kind_tags: u64,
+    /// Timestamp in milliseconds since Unix epoch.
+    pub timestamp_ms: u64,
+    /// Generation counter for read-your-writes consistency.
+    pub generation: u64,
+    /// The git commit OID (for `Git` hits) as lowercase hex — `None` for
+    /// `EditChain` hits. A string so it round-trips exactly through JavaScript.
+    #[serde(default)]
+    pub git_oid: Option<String>,
+    /// The repository (for `Git` hits) as an exact decimal `RepositoryId`
+    /// string — `None` for `EditChain` hits.
+    #[serde(default)]
+    pub repository: Option<String>,
+    /// Discriminated identity tag: `"git"` for real git commits, or the
+    /// `EditChain` op kind (`"message"`, `"tool"`, ...) when known.
+    #[serde(default)]
+    pub kind: String,
+    /// Whether a `Git` hit belongs to a nested/submodule repository.
+    #[serde(default)]
+    pub is_submodule: bool,
+}
+
+/// A Find-in-Chain response.
+///
+/// `returned` is the exact number of distinct visible matches in `matches`;
+/// `more` reports whether additional matches **may** exist because the
+/// `candidate/top_k` limit truncated retrieval. When `more` is `true` the
+/// response never claims an exact total.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindInHistoryResponse {
+    /// Distinct visible matches, one per top-level history row, ranked by best
+    /// BM25 score (highest first; ties broken by newest row first).
+    pub matches: Vec<FindInHistoryMatch>,
+    /// Exact number of returned distinct visible matches.
+    pub returned: usize,
+    /// Whether more matches may exist due to `candidate/top_k` truncation.
+    pub more: bool,
+}
+
 /// Information about a discovered git repository.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryInfo {
@@ -1105,6 +1230,123 @@ mod tests {
         assert!(sparse.repository.is_none());
         assert_eq!(sparse.kind, "");
         assert!(!sparse.is_submodule);
+    }
+
+    #[test]
+    fn find_in_history_match_serializes_exact_identifiers_and_offsets() {
+        let m = FindInHistoryMatch {
+            node_key: big_op_id().to_string(),
+            row: 900_719_925_474_099,
+            summary: "needle row".to_string(),
+            score: 0.5,
+            op_id: big_op_id().to_string(),
+            chunk_id: format!("{}:3", big_op_id()),
+            text: "chunk text".to_string(),
+            source: Source::EditChain,
+            session_id: Some(OVER_2_53.to_string()),
+            actor_id: OVER_2_53.to_string(),
+            kind_tags: 3,
+            timestamp_ms: 1_700_000_000_000,
+            generation: 12,
+            git_oid: None,
+            repository: None,
+            kind: "message".to_string(),
+            is_submodule: false,
+        };
+        let response = FindInHistoryResponse {
+            matches: vec![m],
+            returned: 1,
+            more: false,
+        };
+        let json = serde_json::to_value(&response).expect("serialize");
+        assert_eq!(json["returned"], 1usize);
+        assert_eq!(json["more"], false);
+        let match_json = &json["matches"][0];
+        assert_eq!(match_json["node_key"], "9007199254740993:7:42");
+        assert_eq!(match_json["row"], 900_719_925_474_099u64);
+        assert_eq!(match_json["summary"], "needle row");
+        assert_eq!(match_json["op_id"], "9007199254740993:7:42");
+        assert_eq!(match_json["chunk_id"], "9007199254740993:7:42:3");
+        assert_eq!(match_json["session_id"], "9007199254740993");
+        assert_eq!(match_json["actor_id"], "9007199254740993");
+        assert_eq!(match_json["kind"], "message");
+        assert!(
+            match_json["git_oid"].is_null(),
+            "EditChain match has no git_oid"
+        );
+        assert!(
+            match_json["repository"].is_null(),
+            "EditChain match has no repository"
+        );
+        // Identifiers must be JSON strings and row offsets numeric, never rounded.
+        for key in ["node_key", "op_id", "chunk_id", "session_id", "actor_id"] {
+            assert!(
+                match_json[key].is_string(),
+                "{key} must serialize as a string: {match_json}"
+            );
+        }
+        let back: FindInHistoryResponse = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(back.returned, 1);
+        assert!(!back.more);
+        assert_eq!(back.matches[0].node_key, big_op_id().to_string());
+        assert_eq!(back.matches[0].row, 900_719_925_474_099);
+        assert_eq!(
+            back.matches[0].session_id.as_deref(),
+            Some(OVER_2_53.to_string().as_str())
+        );
+        assert_eq!(back.matches[0].actor_id, OVER_2_53.to_string());
+        assert_eq!(back.matches[0].kind, "message");
+    }
+
+    #[test]
+    fn find_in_history_request_defaults_view_fields_and_round_trips() {
+        // Sparse payload (older/newer clients) defaults the view/profile fields:
+        // filters, filter (None), and hide_submodules (false).
+        let sparse: FindInHistoryRequest = serde_json::from_value(serde_json::json!({
+            "query": "needle",
+            "top_k": 50,
+        }))
+        .expect("deserialize sparse request");
+        assert_eq!(sparse.query, "needle");
+        assert_eq!(sparse.top_k, 50);
+        assert!(!sparse.filters.include_private);
+        assert!(sparse.filter.is_none());
+        assert!(!sparse.hide_submodules);
+
+        // A git match identity round-trips as exact strings inside the full body.
+        let request = FindInHistoryRequest {
+            query: "needle".to_string(),
+            top_k: 25,
+            filters: SearchFiltersDto {
+                sources: Some(vec![Source::Git]),
+                ..SearchFiltersDto::default()
+            },
+            filter: Some(ChainFilterDto {
+                summary_pattern: String::new(),
+                kind_pattern: String::new(),
+                include_kind_pattern: String::new(),
+                hide_undated: true,
+                hide_trace: true,
+                splice: true,
+            }),
+            hide_submodules: true,
+        };
+        let body = RequestBody::FindInHistory(request);
+        let json = serde_json::to_value(&body).expect("serialize");
+        assert_eq!(json["FindInHistory"]["top_k"], 25usize);
+        assert_eq!(json["FindInHistory"]["hide_submodules"], true);
+        assert_eq!(json["FindInHistory"]["filters"]["sources"][0], "Git");
+        assert_eq!(json["FindInHistory"]["filter"]["hide_undated"], true);
+        assert_eq!(json["FindInHistory"]["filter"]["hide_trace"], true);
+        assert_eq!(json["FindInHistory"]["filter"]["splice"], true);
+        let back: FindInHistoryRequest =
+            serde_json::from_value(json["FindInHistory"].clone()).expect("deserialize");
+        assert_eq!(back.query, "needle");
+        assert_eq!(back.top_k, 25);
+        assert!(back.hide_submodules);
+        assert_eq!(back.filters.sources, Some(vec![Source::Git]));
+        let filter = back.filter.expect("chain filter DTO");
+        assert!(filter.hide_undated && filter.hide_trace && filter.splice);
     }
 
     #[test]

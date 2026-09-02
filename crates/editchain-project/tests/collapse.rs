@@ -1103,3 +1103,48 @@ fn file_row_summary_uses_annotated_path_note() {
     let nodes = projection.nodes();
     assert_eq!(nodes.first().unwrap().summary(), "raw line 1");
 }
+
+#[test]
+fn visible_op_id_resolves_folded_ops_to_their_rendered_row() {
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let turn = import_op(1, 1);
+    let msg = message_op(1, 2, turn.id, "hello world");
+    let meta = meta_import_op(1, 3);
+    // A tool call import with a Start tool child, plus a folded result pair.
+    let call_import = import_op(2, 4);
+    let call_tool = tool_op(2, 5, call_import.id, "Bash");
+    let (result_import, result_tool) = tool_result_pair(2, 6, 7, call_import.id, Some("success"));
+    let projection = HistoryProjection::from_ops_with(
+        vec![
+            turn.clone(),
+            msg.clone(),
+            meta.clone(),
+            call_import.clone(),
+            call_tool,
+            result_import.clone(),
+            result_tool,
+        ],
+        opts,
+    );
+
+    // Top-level rows resolve to themselves.
+    assert_eq!(projection.visible_op_id(turn.id), Some(turn.id));
+    assert_eq!(
+        projection.visible_op_id(call_import.id),
+        Some(call_import.id)
+    );
+    // A normalized child folded into its raw import resolves to the import row.
+    assert_eq!(projection.visible_op_id(msg.id), Some(turn.id));
+    // A bundled META sub-op resolves to its anchor row.
+    assert_eq!(projection.visible_op_id(meta.id), Some(turn.id));
+    // A tool-result import folded into its call resolves to the call row.
+    assert_eq!(
+        projection.visible_op_id(result_import.id),
+        Some(call_import.id)
+    );
+    // Op ids absent from the projection resolve to nothing (never a phantom).
+    let unknown = OpId::new(NodeId(99), 0, 99);
+    assert_eq!(projection.visible_op_id(unknown), None);
+}

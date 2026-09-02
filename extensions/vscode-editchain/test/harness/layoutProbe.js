@@ -123,42 +123,48 @@
     return opacity;
   }
 
-  // Run a search through the real renderer path: fill the search input, press
-  // Enter, wait for the result list to settle, then single-click the first
-  // result to verify selection stays inline. Double-click explicitly requests
-  // its JSON editor with the right identity: a Git hit must navigate by
+  // Run an in-place find through the real renderer path: fill the search
+  // input, press Enter (FindInHistory), wait for the jump to settle, then
+  // verify the chain DOM is UNCHANGED (same keys, same rows) and the counter
+  // reports "i of N". Double-click the highlighted row explicitly requests its
+  // JSON editor with the right identity: a Git hit must navigate by
   // (git_oid, repository) — never by its synthetic index-only op_id.
   async function runSearch(query, timeoutMs) {
     const searchInput = document.getElementById('search');
+    const rowsEl = document.getElementById('rows');
     const captured = [];
     const origPost = window.vscode.postMessage.bind(window.vscode);
     window.vscode.postMessage = function (msg) {
       if (msg && msg.type === 'openJson') captured.push(msg);
       return origPost(msg);
     };
+    const keysBefore = Array.from(document.querySelectorAll('.row[data-key]'))
+      .map((r) => r.getAttribute('data-key'));
+    const scrollBefore = rowsEl.scrollTop;
     searchInput.value = query;
     searchInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
     await whenIdle(timeoutMs || 5000);
-    const resultRows = document.querySelectorAll('.row').length;
-    const banner = document.querySelector('.search-banner');
-    const bannerText = banner ? (banner.textContent || '').trim() : '';
-    const firstRow = document.querySelector('.row');
-    const firstRowChevron = !!(firstRow && firstRow.querySelector('.subop-chevron'));
-    if (firstRow) firstRow.click();
-    await whenIdle(timeoutMs || 5000);
-    const layoutEl = document.getElementById('layout');
-    const secondaryPane = !!document.getElementById('detail') ||
-      !!(layoutEl && layoutEl.classList.contains('has-detail'));
-    const selected = !!document.querySelector('.row.row-selected');
-    if (firstRow) firstRow.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+    const counter = document.querySelector('#search-counter');
+    const counterText = counter ? (counter.textContent || '').trim() : '';
+    const selected = document.querySelector('.row.row-selected');
+    const selectedKey = selected ? selected.getAttribute('data-key') : null;
+    const keysAfter = Array.from(document.querySelectorAll('.row[data-key]'))
+      .map((r) => r.getAttribute('data-key'));
+    const chainPreserved = keysAfter.length === keysBefore.length &&
+      keysAfter.every((k, i) => k === keysBefore[i]);
+    const scrollAfter = rowsEl.scrollTop;
+    const focusedRow = document.activeElement === searchInput;
+    if (selected) selected.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
     await whenIdle(timeoutMs || 5000);
     window.vscode.postMessage = origPost;
     const clicked = captured.length ? captured[0] : null;
     return {
-      resultRows,
-      bannerText,
-      secondaryPane,
-      selected,
+      counterText,
+      selectedKey,
+      chainPreserved,
+      focusStaysInInput: focusedRow,
+      scrollBefore,
+      scrollAfter,
       navigated: captured.length > 0,
       navigatedGit: !!(clicked && clicked.git_oid && !clicked.op_id),
       navigatedOp: !!(clicked && clicked.op_id && !clicked.git_oid),
@@ -166,7 +172,6 @@
         ? { op_id: clicked.op_id || null, git_oid: clicked.git_oid || null,
             repository: clicked.repository !== undefined ? clicked.repository : null }
         : null,
-      firstRowChevron,
       captured,
       dataReady: dataReady(),
     };
@@ -209,63 +214,68 @@
   // Deterministic reversed-search race: two rapid searches must be
   // latest-query-wins. Search A ("commit") is HELD; while it is in flight,
   // search B ("feature") is issued and its (fast) response lands FIRST. B's
-  // results must be shown, and releasing A's late response must NOT replace
-  // them (both searches shared a view generation — without the search epoch
-  // correlation, the first response to render bumps the generation and drops
-  // B, leaving query B's banner over query A's results).
+  // matches must be shown, and releasing A's late response must NOT replace
+  // them (both searches share a view generation — without the search epoch
+  // correlation, the first response to land would clobber B). The in-place
+  // find keeps the chain DOM untouched, so the race is asserted through the
+  // counter ("1 of 2") and the highlighted row's node key (B's first match is
+  // git:m3; A's would be git:m2).
   async function runReversedSearchRace() {
     const out = { steps: [] };
     const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
     const searchInput = document.getElementById('search');
+    const selectedKey = () => {
+      const el = document.querySelector('.row.row-selected');
+      return el ? el.getAttribute('data-key') : null;
+    };
+    const counterText = () => {
+      const el = document.querySelector('#search-counter');
+      return el ? (el.textContent || '').trim() : '';
+    };
     const enter = (q) => {
       searchInput.value = q;
       searchInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
     };
-    // Hold the first Search response (query A = "commit").
-    window.__editchainHoldSearch = {};
+    // End any prior find session (e.g. a --search run before this probe) so
+    // Enter actually SUBMITS query A instead of navigating the old matches.
+    searchInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    // Hold the first FindInHistory response (query A = "commit").
+    window.__editchainHoldFind = {};
     enter('commit');
     const holdDeadline = Date.now() + 3000;
-    while (!window.__editchainHoldSearch.release) {
-      if (Date.now() > holdDeadline) throw new Error('search-race: search response was never held');
+    while (!window.__editchainHoldFind.release) {
+      if (Date.now() > holdDeadline) throw new Error('search-race: find response was never held');
       await sleep(5);
     }
-    const releaseA = window.__editchainHoldSearch.release;
-    window.__editchainHoldSearch = null;
+    const releaseA = window.__editchainHoldFind.release;
+    window.__editchainHoldFind = null;
     // Issue query B ("feature") while A is in flight — B must win.
     enter('feature');
     // B's response renders synchronously, but query A is still HELD — its
     // outstanding request keeps the in-flight counters nonzero, so wait for
-    // B's result list directly instead of whenIdle (which requires zero
+    // B's highlight directly instead of whenIdle (which requires zero
     // in-flight requests and would time out until A is released).
     const renderDeadline = Date.now() + 3000;
     for (;;) {
-      const banner = document.querySelector('.search-banner');
-      const rowCount = document.querySelectorAll('.row').length;
-      if (banner && rowCount === 2 && /feature/.test(banner.textContent || '')) break;
+      if (counterText() === '1 of 2' && selectedKey() === 'git:m3') break;
       if (Date.now() > renderDeadline) throw new Error('search-race: query B results never rendered');
       await sleep(5);
     }
-    const banner = document.querySelector('.search-banner');
-    const keys = Array.from(document.querySelectorAll('.row[data-key]'))
-      .map((r) => r.getAttribute('data-key'));
     const beforeRelease = {
-      banner: banner ? (banner.textContent || '').trim() : '',
-      keys,
+      counter: counterText(),
+      selectedKey: selectedKey(),
     };
     // Release query A's late response: it must be dropped, not rendered.
     releaseA();
     await sleep(100);
-    const keysAfter = Array.from(document.querySelectorAll('.row[data-key]'))
-      .map((r) => r.getAttribute('data-key'));
     const latestWins =
-      keys.length === 2 &&
-      keys.indexOf('git:m3') !== -1 &&
-      keys.indexOf('git:f1') !== -1 &&
-      keys.indexOf('git:m0') === -1 &&
-      /feature/.test(beforeRelease.banner);
+      beforeRelease.counter === '1 of 2' &&
+      beforeRelease.selectedKey === 'git:m3' &&
+      counterText() === '1 of 2' &&
+      selectedKey() === 'git:m3';
     out.steps.push({
       beforeRelease,
-      keysAfter,
+      afterRelease: { counter: counterText(), selectedKey: selectedKey() },
       latestWins,
     });
     return out;
@@ -2797,24 +2807,71 @@
     };
     out.steps.push({ name: 'activity-back', ...activityBack });
 
-    // A profile switch during SEARCH MODE must exit search and refetch history
-    // under the new profile (search is explicitly unprofiled).
+    // A profile switch during an ACTIVE find must exit the find and refetch
+    // history under the new profile; a find response still in flight across
+    // the switch belongs to the OLD view generation and must be dropped, never
+    // applied. The in-place find never replaces the chain (and renders no legacy
+    // .search-banner flat list): before the switch the session is live — counter
+    // text plus the current-match marker on a real row — and after it the counter
+    // is empty, nothing is highlighted, and the chain refetches under the new
+    // profile.
     const searchInput = document.getElementById('search');
-    searchInput.value = 'tool result';
+    const counterEl = document.getElementById('search-counter');
+    const counterText = () => counterEl ? (counterEl.textContent || '').trim() : '';
+    const highlighted = () => !!document.querySelector('.row.row-find-current');
+    // Settle a find in the Activity view ('build' matches node:t:0 and node:t:4;
+    // the trace rows are hidden in this profile).
+    searchInput.value = 'build';
     searchInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
     await whenIdle(timeoutMs || 5000);
-    const inSearch = !!document.querySelector('.search-banner');
+    const settledBefore = {
+      counter: counterText(),
+      highlighted: highlighted(),
+    };
+    // Hold the NEXT find response ('fix' also matches node:t:4): it is issued
+    // just before the switch and released just after, so the probe can prove
+    // the switch drops the stale response instead of applying it.
+    window.__editchainHoldFind = {};
+    searchInput.value = 'fix';
+    searchInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    const holdDeadline = Date.now() + 3000;
+    while (!window.__editchainHoldFind.release) {
+      if (Date.now() > holdDeadline) throw new Error('profile-switch: find response was never held');
+      await sleep(5);
+    }
+    const releaseFind = window.__editchainHoldFind.release;
+    window.__editchainHoldFind = null;
+    const pendingBefore = {
+      counter: counterText(),
+      highlighted: highlighted(),
+    };
     window.__editchainClearRequestLog();
     clickProfile('raw');
-    await whenIdle(timeoutMs || 5000);
-    const afterSearchSwitch = {
-      inSearch,
-      bannerAfter: !!(document.querySelector('.search-banner')),
+    // The reset view cannot settle while the held find keeps the renderer's
+    // in-flight count nonzero, so poll for the raw window directly, then
+    // release the stale response and let whenIdle confirm the final state.
+    const switchDeadline = Date.now() + 5000;
+    for (;;) {
+      if (window.__editchainGetProfile && window.__editchainGetProfile() === 'raw' &&
+          document.querySelectorAll('.row[data-key="node:t:1"]').length === 1) break;
+      if (Date.now() > switchDeadline) throw new Error('profile-switch: raw window never rendered');
+      await sleep(5);
+    }
+    const afterSwitch = {
+      counter: counterText(),
+      highlighted: highlighted(),
       profile: window.__editchainGetProfile ? window.__editchainGetProfile() : null,
       windowsIssued: requestLog().filter((b) => b && b.GetWindow !== undefined).length,
       traceRows: document.querySelectorAll('.row[data-key="node:t:1"], .row[data-key="node:t:3"]').length,
     };
-    out.steps.push({ name: 'search-exit-on-switch', ...afterSearchSwitch });
+    releaseFind();
+    await whenIdle(timeoutMs || 5000);
+    const afterRelease = {
+      counter: counterText(),
+      highlighted: highlighted(),
+      traceRows: document.querySelectorAll('.row[data-key="node:t:1"], .row[data-key="node:t:3"]').length,
+    };
+    out.steps.push({ name: 'find-exit-on-switch', settledBefore, pendingBefore, afterSwitch, afterRelease });
 
     const s1 = out.steps[0];
     const s2 = out.steps[1];
@@ -2834,10 +2891,17 @@
       s3.lastFilter && s3.lastFilter.hide_trace === true &&
       s3.firstOffset === 0 &&
       s3.traceRows === 0 &&
-      s4.inSearch === true &&
-      s4.bannerAfter === false &&
-      s4.windowsIssued > 0 &&
-      s4.traceRows === 2;
+      s4.settledBefore.counter !== '' &&
+      s4.settledBefore.highlighted === true &&
+      s4.pendingBefore.counter === '…' &&
+      s4.afterSwitch.counter === '' &&
+      s4.afterSwitch.highlighted === false &&
+      s4.afterSwitch.profile === 'raw' &&
+      s4.afterSwitch.windowsIssued > 0 &&
+      s4.afterSwitch.traceRows === 2 &&
+      s4.afterRelease.counter === '' &&
+      s4.afterRelease.highlighted === false &&
+      s4.afterRelease.traceRows === 2;
     out.pass = pass;
     return out;
   }

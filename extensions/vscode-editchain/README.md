@@ -37,29 +37,56 @@ build as a fallback.
 
 Command palette (`Ctrl+Shift+P`) → **"EditChain: Open History Explorer"**.
 
-The viewer shows a unified, paged history list (EditChain ops + git commits),
-lexical search, and a click-to-inspect detail view. The old filtering controls
-are intentionally absent while their replacement is designed. The temporary
-fixed view shows all operation kinds and undated rows, hides nested Git
-repositories/submodules, applies no summary/kind pattern, and splices hidden
-intermediates for graph continuity. Git search hits carry their real identity
-(`git_oid` lowercase hex, exact decimal `repository`, `kind: "git"`,
-`is_submodule`), so clicking a git result navigates by `ResolveObject` — never
-by the synthetic index-only `op_id`. Rapid consecutive searches are
-latest-query-wins. Only the viewport row is restored across recreated panels.
+The viewer shows a unified, paged history list (EditChain ops + git commits)
+with in-place **Find-in-Chain** search over the real history view, plus an
+explicit read-only raw JSON editor (Enter or double-click on a selected row).
+The old filtering controls are intentionally absent while their replacement is
+designed. The temporary fixed view shows all operation kinds and undated rows,
+hides nested Git repositories/submodules, applies no summary/kind pattern, and
+splices hidden intermediates for graph continuity.
+
+Find-in-Chain is in-place: the service runs a Tantivy **BM25 lexical** search
+and maps/dedupes every scored chunk to the real top-level row that renders it
+under the **exact** active chain filter/profile (the same `hide_submodules` +
+`ChainFilterDto` the view was fetched with), so the history DOM, profile,
+expansion, cache, and layout are never replaced — the find only scrolls and
+highlights. A settled search auto-jumps to and highlights match 1, shows an
+adjacent `i of N` counter (`N+` when the candidate cap truncated retrieval),
+and keeps focus in the input: `ArrowDown`/`ArrowUp` and `Enter`/`Shift+Enter`
+cycle next/previous with wrap, scrolling to reveal each current match. `Escape`
+or emptying the input clears the session without refetching, leaving the scroll
+where the last match was revealed. Folded/bundled hits map to their containing
+top-level row without auto-expanding anything. Git hits carry their real
+identity (`git_oid` lowercase hex, exact decimal `repository`, `kind: "git"`,
+`is_submodule`), so opening a git match resolves by `ResolveObject` — never by
+the synthetic index-only `op_id`. Rapid consecutive searches are
+latest-query-wins. Only the profile and viewport row are restored across
+recreated panels; switching the Activity/Raw profile exits the find and
+refetches from offset 0.
+
+The result counter and **Previous/Next** chevrons are embedded inside the same
+bordered search field, matching VS Code's built-in find controls. The chevrons
+appear only after a non-empty result set has settled, and disappear for
+pending, empty, error, cleared, or edited-query states. Each click steps through
+the exact same wrap-around matches (`ArrowUp`/`ArrowDown` and
+`Shift+Enter`/`Enter` are the keyboard equivalents) without ever stealing focus
+from the search input or replacing the history chain.
 
 All viewer-facing identifiers round-trip as exact JSON strings: op ids are
 `node:boot:seq`, git OIDs are lowercase hex, and repository/session/actor ids
 are exact decimal `u64` strings — never JSON numbers, so values above 2^53 are
 not rounded by JavaScript. The service parses and validates these strings and
-returns an `Error` envelope for invalid ids. Search responses use a flat
-`SearchHit` DTO (`op_id`, `chunk_id`, `session_id`, `actor_id`, plus git
+returns an `Error` envelope for invalid ids. Find-in-Chain responses use a
+`FindInHistoryMatch` DTO — one per distinct visible top-level row (`node_key`,
+absolute expanded-history `row` offset, best `score`, plus the `SearchHit`
+identity fields `op_id`/`chunk_id`/`session_id`/`actor_id` and git
 `git_oid`/`repository` as strings) with timestamps/counts kept numeric. The
-read-only JSON editor's `ResolveObject` Ok payload is a typed `ResolvedObject`
-DTO under the same rule: `repository` and `changed_paths` are exact decimal
-strings, `oid`/`tree`/`parents` are lowercase hex strings, and
-`imported_record` is a `node:boot:seq` string when present — never raw u64
-numbers or byte-array ID structures.
+flat `SearchHit` DTO remains only for the legacy `Search` request, which
+production no longer issues. The read-only JSON editor's `ResolveObject` Ok
+payload is a typed `ResolvedObject` DTO under the same rule: `repository` and
+`changed_paths` are exact decimal strings, `oid`/`tree`/`parents` are lowercase
+hex strings, and `imported_record` is a `node:boot:seq` string when present —
+never raw u64 numbers or byte-array ID structures.
 
 ## Configuration
 
@@ -95,13 +122,17 @@ Scenario interactions exercised by the harness block `check` mode:
 
 - `combined` — clicks the combined op and verifies ALL bundled sub-ops reveal
   inline (not just the first one).
-- `--search "query"` — runs the renderer's real search path (input → Enter →
-  result list → click) and verifies the results render and navigate to the JSON
-  editor, e.g. `npm run ui:check -- --scenario mixed --search message`.
+- `--search "query"` — runs the renderer's real Find-in-Chain path (input →
+  Enter → in-place jump) and verifies the chain DOM is preserved, the counter
+  reports `i of N` (e.g. `1 of 4`), focus stays in the search input, and
+  double-clicking the highlighted row navigates to the JSON editor with the
+  match's real identity (git hits by `git_oid`/`repository`, never the
+  synthetic index-only `op_id`), e.g.
+  `npm run ui:check -- --scenario mixed --search message`.
 - `--search-race` — with `--scenario merge`, issues two rapid searches with the
   first response held, and verifies the LATEST query wins (search-epoch
   correlation): releasing the older query's late response must not replace the
-  newer query's results.
+  newer query's matches.
 - `--resize` — resizes the viewport and asserts the renderer RECOMPUTES graph
   geometry (header, lane compression, SVG cell widths, rows) instead of just
   stretching the DOM, with lane dots staying inside their cells.
@@ -109,6 +140,13 @@ Scenario interactions exercised by the harness block `check` mode:
   blob payloads) render a non-blocking banner above the table while rows still
   load; `OPEN_WARNINGS_VISIBLE` asserts the warning is surfaced, never silently
   discarded.
+
+Find-in-chain keyboard behaviour (ArrowDown/Up + Enter/Shift+Enter wrap with
+focus retained, Escape/empty clearing without refetch — the revealed scroll
+position is preserved — stale in-flight/edited queries never navigating,
+expansion/profile preserved, and the legacy flat-list `Search` path still
+rendering) is covered by `node --test test/harness/searchKeyboard.test.js`
+against the same harness page.
 
 Artifacts are written to `.ui-out/<scenario>/` (`summary.md`, `layout.txt`,
 `layout.json`, `svg.json`, `console.txt`, `metrics.json`, `aria.yml`,
@@ -236,7 +274,13 @@ npm run ui:vscode   # requires xvfb on headless servers (wrapped automatically)
   `workbench.getWebviewByTitle('EditChain History')`, switches into its iframe,
   asserts rows render, then **injects the same `window.__editchainDebug` probe**
   (`test/harness/layoutProbe.js`) into the webview and runs the identical textual
-  checks inside real VS Code.
+  checks inside real VS Code. It also exercises inline selection/raw JSON,
+  Activity/Raw profile switching, scroll-through-history, and Find-in-Chain
+  against the native service. The find test verifies the preserved real chain,
+  counter, highlighted row, input focus, the visible Previous/Next chevron
+  buttons (labels, enabled state, and real mouse clicks navigating forward,
+  back, and wrapping around), then captures `e2e-find-in-chain-*.png`
+  screenshots under `trace/`.
 - Downloads VS Code + Chromedriver on first run into `.wdio-vscode-service/`
   (gitignored).
 
@@ -267,8 +311,11 @@ session, including the scroll-through-history test.
 
 - The viewer is **read-only**: it never mutates Git, the worktree, or canonical
   EditChain storage.
-- Search is **lexical-only** by default (no embedding server required). Vector
-  search can be added later.
+- Find-in-Chain is **BM25 lexical** (a Tantivy index built lazily on first
+  search; no embedding server required). Semantic vector/hybrid search exists
+  in `editchain-query` and the `editchain-node` CLI but is not wired to the VS
+  Code service; the legacy flat-list `Search` request remains for compatibility
+  only.
 - `Open` is unbounded: building the chain + git graph can take minutes on a
   large workspace. All other service calls carry a generous finite deadline
   (120s by default, ≥ the measured near-minute first window on large chains;
