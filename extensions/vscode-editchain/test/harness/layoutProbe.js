@@ -124,11 +124,10 @@
   }
 
   // Run a search through the real renderer path: fill the search input, press
-  // Enter, wait for the result list to settle, then click the first result and
-  // verify it requests a JSON editor (navigation coherence). Captures the
-  // openJson postMessage the renderer emits on click and reports which identity
-  // it navigated with: a Git hit must click by (git_oid, repository) — never by
-  // its synthetic index-only op_id.
+  // Enter, wait for the result list to settle, then single-click the first
+  // result to verify selection stays inline. Double-click explicitly requests
+  // its JSON editor with the right identity: a Git hit must navigate by
+  // (git_oid, repository) — never by its synthetic index-only op_id.
   async function runSearch(query, timeoutMs) {
     const searchInput = document.getElementById('search');
     const captured = [];
@@ -147,11 +146,19 @@
     const firstRowChevron = !!(firstRow && firstRow.querySelector('.subop-chevron'));
     if (firstRow) firstRow.click();
     await whenIdle(timeoutMs || 5000);
+    const layoutEl = document.getElementById('layout');
+    const secondaryPane = !!document.getElementById('detail') ||
+      !!(layoutEl && layoutEl.classList.contains('has-detail'));
+    const selected = !!document.querySelector('.row.row-selected');
+    if (firstRow) firstRow.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+    await whenIdle(timeoutMs || 5000);
     window.vscode.postMessage = origPost;
     const clicked = captured.length ? captured[0] : null;
     return {
       resultRows,
       bannerText,
+      secondaryPane,
+      selected,
       navigated: captured.length > 0,
       navigatedGit: !!(clicked && clicked.git_oid && !clicked.op_id),
       navigatedOp: !!(clicked && clicked.op_id && !clicked.git_oid),
@@ -468,20 +475,91 @@
     const toLane = trans[1];
     const startAtDot = lane === fromLane;
     const startAtBoundary = !startAtDot && above.indexOf(fromLane) !== -1;
-    const endAtBoundary = below.indexOf(toLane) !== -1;
-    const endAtDot = !endAtBoundary && lane === toLane;
+    const endAtDot = lane === toLane;
+    const endAtBoundary = !endAtDot && below.indexOf(toLane) !== -1;
     if (!startAtDot && !startAtBoundary) return null;
     if (!endAtBoundary && !endAtDot) return null;
     return { fromLane, toLane, startAtDot, startAtBoundary, endAtDot, endAtBoundary };
   }
 
-  // Collect per-row graph geometry (dots, vertical line segments, and rounded
+  // Return the single quadratic segment emitted for one transition colour
+  // half, or null if the renderer regressed to a multi-segment elbow/jog.
+  function quadraticSegment(cmds) {
+    if (!cmds || cmds.length !== 2 || cmds[0].cmd !== 'M' || cmds[1].cmd !== 'Q') return null;
+    return {
+      start: cmds[0].args,
+      control: cmds[1].args.slice(0, 2),
+      end: cmds[1].args.slice(2, 4),
+    };
+  }
+
+  // Validate the shape contract independently of lane direction: every half
+  // is one convex quadratic, the colour seam is exact and tangent-continuous,
+  // external tangents match the connected dot/boundary, and a transition with
+  // a node endpoint is one globally non-inflecting convex bow. The bounding
+  // box guard rejects outward overshoot/inward hooks.
+  function smoothTransitionProblems(srcCmds, dstCmds, anchors) {
+    const problems = [];
+    const near = (a, b) => Math.abs(a - b) <= 0.02;
+    const src = quadraticSegment(srcCmds);
+    const dst = quadraticSegment(dstCmds);
+    if (!src || !dst) return ['halves must each be one quadratic Bézier'];
+    if (src.end[0] !== dst.start[0] || src.end[1] !== dst.start[1]) {
+      problems.push('halves must share one exact seam');
+      return problems;
+    }
+    const incoming = [src.end[0] - src.control[0], src.end[1] - src.control[1]];
+    const outgoing = [dst.control[0] - dst.start[0], dst.control[1] - dst.start[1]];
+    const cross = incoming[0] * outgoing[1] - incoming[1] * outgoing[0];
+    const dot = incoming[0] * outgoing[0] + incoming[1] * outgoing[1];
+    const scale = Math.max(1,
+      Math.hypot(incoming[0], incoming[1]) * Math.hypot(outgoing[0], outgoing[1]));
+    if (Math.abs(cross) > scale * 0.01 || dot <= 0) {
+      problems.push('colour seam must be tangent-continuous');
+    }
+    if (anchors.startAtDot && !near(src.start[1], src.control[1])) {
+      problems.push('node source must leave on a smooth horizontal tangent');
+    }
+    if (anchors.startAtBoundary && !near(src.start[0], src.control[0])) {
+      problems.push('boundary source must enter on a smooth vertical tangent');
+    }
+    if (anchors.endAtDot && !near(dst.control[1], dst.end[1])) {
+      problems.push('node destination must enter on a smooth horizontal tangent');
+    }
+    if (anchors.endAtBoundary && !near(dst.control[0], dst.end[0])) {
+      problems.push('boundary destination must leave on a smooth vertical tangent');
+    }
+    const all = [src.start, src.control, src.end, dst.control, dst.end];
+    const minX = Math.min(src.start[0], dst.end[0]) - 0.02;
+    const maxX = Math.max(src.start[0], dst.end[0]) + 0.02;
+    const minY = Math.min(src.start[1], dst.end[1]) - 0.02;
+    const maxY = Math.max(src.start[1], dst.end[1]) + 0.02;
+    if (all.some((p) => p[0] < minX || p[0] > maxX || p[1] < minY || p[1] > maxY)) {
+      problems.push('curve must stay inside its convex endpoint bounds');
+    }
+    // A quadratic has constant-sign curvature. When one endpoint is a node,
+    // both emitted halves are subdivisions of ONE quadratic and therefore must
+    // keep the same turn sign (no inflection / concave hook).
+    if (anchors.startAtDot !== anchors.endAtDot) {
+      const turn = (q) => {
+        const a = [q.control[0] - q.start[0], q.control[1] - q.start[1]];
+        const b = [q.end[0] - q.control[0], q.end[1] - q.control[1]];
+        return a[0] * b[1] - a[1] * b[0];
+      };
+      const srcTurn = turn(src);
+      const dstTurn = turn(dst);
+      if (srcTurn * dstTurn < -0.01) problems.push('node transition must be one convex bow');
+    }
+    return problems;
+  }
+
+  // Collect per-row graph geometry (dots, vertical line segments, and smooth
   // transition paths). Each row carries its own small SVG cell, so we
   // aggregate across all rendered rows.
   function describeSvg() {
     const cells = document.querySelectorAll('.graph-cell svg.graphCell');
     if (!cells.length) return { present: false };
-    const out = { present: true, cells: cells.length, dots: [], lines: [], transitions: [] };
+    const out = { present: true, cells: cells.length, dots: [], capsules: [], lines: [], transitions: [] };
     cells.forEach((cellSvg) => {
       const rowEl = cellSvg.closest('.row');
       const absIdx = rowEl ? rowEl.getAttribute('data-row') : null;
@@ -492,6 +570,29 @@
           cy: +dot.getAttribute('cy'),
           r: +dot.getAttribute('r'),
           fill: dot.getAttribute('fill'),
+        });
+      }
+      // Activity execute-run bundles render a capsule + two terminals instead
+      // of a node dot; report them so dumps/artifacts count the row's graph
+      // node even when it has no graphDot.
+      for (const cap of cellSvg.querySelectorAll('rect.graphBundleCapsule')) {
+        const terminal = (cls) => {
+          const t = Array.from(cellSvg.querySelectorAll('circle.graphBundleTerminal'))
+            .find((el) => el.classList.contains(cls));
+          return t ? {
+            cx: +t.getAttribute('cx'),
+            cy: +t.getAttribute('cy'),
+            r: +t.getAttribute('r'),
+          } : null;
+        };
+        out.capsules.push({
+          row: absIdx,
+          x: +cap.getAttribute('x'),
+          y: +cap.getAttribute('y'),
+          w: +cap.getAttribute('width'),
+          h: +cap.getAttribute('height'),
+          entry: terminal('graphBundleEntry'),
+          exit: terminal('graphBundleExit'),
         });
       }
       for (const line of cellSvg.querySelectorAll('line.graphLine')) {
@@ -554,7 +655,8 @@
       layoutBoxes: {
         rowsEl: rowsEl ? box(rowsEl) : null,
         layoutEl: layoutEl ? box(layoutEl) : null,
-        detailVisible: layoutEl ? layoutEl.classList.contains('has-detail') : false,
+        secondaryPanePresent: !!document.getElementById('detail') ||
+          !!(layoutEl && layoutEl.classList.contains('has-detail')),
       },
       treeRootExists: !!rootEl,
       treeRootBox: rootEl ? box(rootEl) : null,
@@ -569,6 +671,7 @@
   function runChecks() {
     const checks = [];
     const rowsEl = document.getElementById('rows');
+    const layoutEl = document.getElementById('layout');
     const wrapEl = rowsEl && rowsEl.querySelector('.table-wrap');
     // The single sticky header is a direct child of #rows (it must NOT live
     // inside .table-wrap, or it would scroll with content and appear mid-table).
@@ -593,9 +696,21 @@
       });
     }
 
+    // Check 1b: the history is one uninterrupted reading surface. Treatments
+    // may change hierarchy, never introduce a secondary sibling surface.
+    const secondaryPane = document.getElementById('detail');
+    const hasSplitState = !!(layoutEl && layoutEl.classList.contains('has-detail'));
+    checks.push({
+      name: 'SINGLE_PANE_HISTORY',
+      pass: !secondaryPane && !hasSplitState,
+      detail: !secondaryPane && !hasSplitState
+        ? 'no secondary detail pane or split-layout state'
+        : 'secondaryElement=' + !!secondaryPane + ' splitState=' + hasSplitState,
+    });
+
     // Check 2: no horizontal overflow on #rows (content should not spill).
-    // Resize handles are intentionally positioned at column boundaries and may
-    // extend past the viewport edge; exclude them from this check.
+    // Resize handles are clamped inside the container, so raw scrollWidth is
+    // authoritative; handles are still excluded defensively.
     if (rowsEl) {
       const contentOverflow = Array.from(rowsEl.querySelectorAll('*')).some((el) => {
         if (el.classList && el.classList.contains('col-resize-handle')) return false;
@@ -612,34 +727,51 @@
       });
     }
 
-    // Check 3: every rendered row has a matching graph dot centered on its lane.
-    // Rows carry an ABSOLUTE `data-row` index (the viewport renders a slice of
-    // the full history), so we match dots by that absolute index rather than by
-    // contiguous position.
+    // Check 3: every rendered row has a graph node centered on its row. The
+    // node is normally the lane `graphDot`; a typed Activity execute-run
+    // bundle row replaces it with a `graphBundleCapsule` (the enclosing
+    // capsule's centre sits on the same row midpoint). Rows carry an ABSOLUTE
+    // `data-row` index (the viewport renders a slice of the full history), so
+    // we match by that absolute index rather than by contiguous position.
     if (wrapEl) {
       const rowEls = wrapEl.querySelectorAll('.row');
       let dotsOk = true;
       let firstFail = null;
       rowEls.forEach((row) => {
         // Sub-op rows intentionally draw NO dot (they are not graph nodes), so
-        // skip them — only top-level rows must have a centered dot.
+        // skip them — only top-level rows must have a centered node.
         if (row.classList.contains('row-subop')) return;
         const absIdx = row.getAttribute('data-row');
         const cellSvg = row.querySelector('.graph-cell svg.graphCell');
         const dot = cellSvg && cellSvg.querySelector('circle.graphDot');
-        if (!dot) { dotsOk = false; firstFail = firstFail || { rowIdx:absIdx, reason:'no dot' }; return; }
+        const capsule = cellSvg && cellSvg.querySelector('rect.graphBundleCapsule');
+        // A bundle capsule counts as this row's graph node; a row with
+        // neither would break the graph topology.
+        const node = dot
+          ? { kind: 'dot', cy: +dot.getAttribute('cy') }
+          : capsule
+            ? {
+                kind: 'capsule',
+                cy: +capsule.getAttribute('y') + (+capsule.getAttribute('height')) / 2,
+              }
+            : null;
+        if (!node) {
+          dotsOk = false;
+          firstFail = firstFail || { rowIdx: absIdx, reason: 'no graph node (dot nor bundle capsule)' };
+          return;
+        }
         const rowBox = row.getBoundingClientRect();
-        // dot cy is relative to the cell svg, which sits at the row's top.
+        // node cy is relative to the cell svg, which sits at the row's top.
         const cellTop = cellSvg.getBoundingClientRect().top;
-        const dotCy = cellTop + (+dot.getAttribute('cy'));
+        const nodeCy = cellTop + node.cy;
         const rowCenterY = rowBox.top + rowBox.height / 2;
-        const deltaY = Math.abs(dotCy - rowCenterY);
-        if (deltaY > 1.5) { dotsOk = false; firstFail = firstFail || { rowIdx:absIdx, deltaY }; }
+        const deltaY = Math.abs(nodeCy - rowCenterY);
+        if (deltaY > 1.5) { dotsOk = false; firstFail = firstFail || { rowIdx: absIdx, kind: node.kind, deltaY }; }
       });
       checks.push({
         name:'DOT_ROW_ALIGNMENT',
         pass:dotsOk,
-        detail:dotsOk ? 'all dots centered on their rows'
+        detail:dotsOk ? 'all graph nodes centered on their rows'
           : 'first fail=' + JSON.stringify(firstFail),
       });
     }
@@ -787,14 +919,19 @@
       });
     }
 
-    // Check 5f: every data column must be visible with a nonzero width and sit
-    // inside the rows container (no clipping, no collapsed tracks) — at any
-    // viewport width, including the narrow ~617px webview. This is the
-    // screenshot acceptance: Content/Date/Author/Commit must actually render.
+    // Check 5f: Pulse keeps narrative + date and leaves Author/Commit behind
+    // explicit raw activation. Date drops at <=400px so Content keeps readable
+    // width. Every visible column must have nonzero width and stay inside #rows;
+    // hidden columns must be display:none, never squeezed to a sliver.
     if (wrapEl && !viewMessage) {
       const firstRow = wrapEl.querySelector('.row:not(.row-placeholder)');
       if (firstRow) {
         const rowsBox = rowsEl.getBoundingClientRect();
+        const innerW = window.innerWidth || rowsEl.clientWidth || 0;
+        const hidden = new Set(['author', 'commit']);
+        if (innerW <= 617) hidden.add('commit');
+        if (innerW <= 480) hidden.add('author');
+        if (innerW <= 400) hidden.add('date');
         const cols = [
           { name: 'content', cls: 'text-cell' },
           { name: 'date', cls: 'date-cell' },
@@ -809,7 +946,13 @@
           const r = cell ? cell.getBoundingClientRect() : null;
           const w = r ? r.width : 0;
           geo[name] = Math.round(w * 100) / 100;
-          if (!r || w <= 0.5 || r.right > rowsBox.right + 1 || r.left < rowsBox.left - 1) {
+          if (hidden.has(name)) {
+            // Dropped at this width: the cell must be genuinely hidden.
+            if (!r || w > 0.5 || getComputedStyle(cell).display !== 'none') {
+              geoOk = false;
+              firstBad = firstBad || { col: name, expectedHidden: true, w: Math.round(w * 100) / 100 };
+            }
+          } else if (!r || w <= 0.5 || r.right > rowsBox.right + 1 || r.left < rowsBox.left - 1) {
             geoOk = false;
             firstBad = firstBad || { col: name, w: Math.round(w * 100) / 100 };
           }
@@ -818,7 +961,7 @@
           name: 'CELL_GEOMETRY',
           pass: geoOk,
           detail: geoOk
-            ? 'visible widths=' + JSON.stringify(geo) + 'px'
+            ? 'widths=' + JSON.stringify(geo) + 'px hidden=' + Array.from(hidden).join(',') + ' (priority order)'
             : 'first bad=' + JSON.stringify(firstBad),
         });
       }
@@ -906,19 +1049,25 @@
       let boxesOk = true;
       let textOk = true;
       let firstBad = null;
-      for (let i = 0; i < ths.length; i++) {
-        const r = ths[i].getBoundingClientRect();
+      // Columns dropped at narrow widths (commit/author/date priority) are
+      // display:none — their zero-size rects must not count as overlaps.
+      const visibleThs = ths.filter((th) => {
+        const r = th.getBoundingClientRect();
+        return r.width > 0.5 && getComputedStyle(th).display !== 'none';
+      });
+      for (let i = 0; i < visibleThs.length; i++) {
+        const r = visibleThs[i].getBoundingClientRect();
         if (i > 0) {
-          const prev = ths[i - 1].getBoundingClientRect();
+          const prev = visibleThs[i - 1].getBoundingClientRect();
           if (r.left < prev.right - 0.5) {
             boxesOk = false;
             firstBad = firstBad || { kind: 'overlap', i, left: r.left, prevRight: prev.right };
           }
         }
-        const cs = getComputedStyle(ths[i]);
-        if (ths[i].scrollWidth > ths[i].clientWidth + 1 && cs.textOverflow !== 'ellipsis') {
+        const cs = getComputedStyle(visibleThs[i]);
+        if (visibleThs[i].scrollWidth > visibleThs[i].clientWidth + 1 && cs.textOverflow !== 'ellipsis') {
           textOk = false;
-          firstBad = firstBad || { kind: 'text-spill', i, label: (ths[i].textContent || '').trim().slice(0, 12) };
+          firstBad = firstBad || { kind: 'text-spill', i, label: (visibleThs[i].textContent || '').trim().slice(0, 12) };
         }
       }
       checks.push({
@@ -927,6 +1076,344 @@
         detail: (boxesOk && textOk)
           ? 'header cells non-overlapping; labels fit or ellipsize'
           : 'first bad=' + JSON.stringify(firstBad),
+      });
+    }
+
+    // Check 5k: the Activity/Raw profile segmented control exists, is
+    // labelled, and reflects the ACTIVE profile (Activity by default — the
+    // pregenerated hide_trace=true view; Raw when a `--profile raw` run
+    // switched through the real control path beforehand).
+    const profileControl = document.getElementById('profile-control');
+    const profileActivityBtn = document.getElementById('profile-activity');
+    const profileRawBtn = document.getElementById('profile-raw');
+    const activeProfile = typeof window.__editchainGetProfile === 'function'
+      ? window.__editchainGetProfile()
+      : 'activity';
+    if (profileControl && profileActivityBtn && profileRawBtn) {
+      const controlMatches =
+        activeProfile === 'activity'
+          ? profileActivityBtn.classList.contains('active') &&
+            profileActivityBtn.getAttribute('aria-pressed') === 'true' &&
+            profileRawBtn.getAttribute('aria-pressed') === 'false'
+          : profileRawBtn.classList.contains('active') &&
+            profileRawBtn.getAttribute('aria-pressed') === 'true' &&
+            profileActivityBtn.getAttribute('aria-pressed') === 'false';
+      const labeled = profileControl.getAttribute('aria-label');
+      checks.push({
+        name: 'PROFILE_CONTROL_PRESENT',
+        pass: !!labeled && controlMatches,
+        detail: controlMatches
+          ? 'segmented control present, labelled "' + labeled + '", profile=' + activeProfile
+          : 'control does not match profile ' + activeProfile + ' (aria-pressed activity=' +
+            profileActivityBtn.getAttribute('aria-pressed') + ')',
+      });
+    } else {
+      checks.push({
+        name: 'PROFILE_CONTROL_PRESENT',
+        pass: false,
+        detail: 'segmented control missing from #controls',
+      });
+    }
+
+    // Check 5l: rows expose keyboard/grid semantics so the list is operable
+    // without a mouse. The contract is now the r4 a11y structure: ONE labelled
+    // role=grid wrapper owns BOTH the sticky header row (its columnheaders must
+    // live inside the grid, never orphaned) and the data rows; every row
+    // carries role=row + aria-selected; and exactly ONE rendered row is in the
+    // tab order (roving tabindex — Tab enters/exits the grid as a unit instead
+    // of tabbing through every virtualized row; ArrowUp/Down move within it).
+    if (wrapEl) {
+      const rowEls = wrapEl.querySelectorAll('.row:not(.row-placeholder)');
+      const grids = Array.from(document.querySelectorAll('[role="grid"]'));
+      const grid = document.querySelector('.tbl-grid');
+      const header = rowsEl.querySelector('.tbl-header');
+      const labelled = !!grid && grid.getAttribute('aria-label') === 'History rows';
+      const headerInside = !!header && !!grid && grid.contains(header);
+      const colHeadersInside = !!header &&
+        header.querySelectorAll('[role="columnheader"]').length === 5;
+      const gridOwnsRows = grids.length === 1 && !!grid &&
+        !!wrapEl.closest('.tbl-grid');
+      let rowsOk = rowEls.length > 0;
+      rowEls.forEach((r) => {
+        if (r.getAttribute('role') !== 'row') rowsOk = false;
+        const sel = r.getAttribute('aria-selected');
+        if (sel !== 'true' && sel !== 'false') rowsOk = false;
+        if (r.getAttribute('data-row') === null) rowsOk = false;
+      });
+      const tabbableCount = Array.from(wrapEl.querySelectorAll('.row'))
+        .filter((r) => r.tabIndex === 0).length;
+      const roving = tabbableCount === 1;
+      const pass = gridOwnsRows && labelled && headerInside && colHeadersInside &&
+        rowsOk && roving;
+      checks.push({
+        name: 'GRID_KEYBOARD_SEMANTICS',
+        pass,
+        detail: pass
+          ? 'labelled role=grid owns header row + ' + rowEls.length + ' rows; ' +
+            tabbableCount + ' tab stop (roving)'
+          : 'gridOwnsRows=' + gridOwnsRows + ' labelled=' + labelled +
+            ' headerInside=' + headerInside + ' colHeadersInside=' + colHeadersInside +
+            ' rowsOk=' + rowsOk + ' roving=' + roving,
+      });
+    }
+
+    // Check 5m: group boundary labels are VISIBLE (not hover-only) and show a
+    // SHORT id — never a full raw 64-bit identifier string. The contract is
+    // shortId()'s: the rendered id portion is at most 12 chars. Real chains
+    // use long decimal repo/session ids, so the shortened tail can itself be
+    // all digits — the check is about LENGTH, not digit shape.
+    if (wrapEl && !viewMessage) {
+      const labelEl = wrapEl.querySelector('.group-label');
+      const computed = labelEl ? getComputedStyle(labelEl) : null;
+      const opacity = computed ? parseFloat(computed.opacity) : 0;
+      const labelText = labelEl ? (labelEl.textContent || '').trim() : '';
+      const idPart = (labelText.match(/(?:repo|session)\s+(\S+)$/) || [])[1] || '';
+      const longId = idPart.length > 12;
+      checks.push({
+        name: 'GROUP_LABEL_VISIBLE_SHORT',
+        pass: !labelEl || (opacity >= 0.5 && !longId),
+        detail: labelEl
+          ? 'label "' + labelText + '" opacity=' + opacity +
+            (longId ? ' ID-PART-' + idPart.length + 'ch (>12)' : '')
+          : 'no group boundary rows in this scenario (skipped)',
+      });
+
+      // The section label is background chrome. Its opaque/translucent chip
+      // must never mask a lane segment or dot: the graph cell owns the higher
+      // stacking layer while the label remains visible beneath it.
+      const labelRow = labelEl ? labelEl.closest('.row') : null;
+      const graphCell = labelRow ? labelRow.querySelector('.graph-cell') : null;
+      const labelZ = computed ? parseInt(computed.zIndex, 10) : 0;
+      const graphStyle = graphCell ? getComputedStyle(graphCell) : null;
+      const graphZ = graphStyle ? parseInt(graphStyle.zIndex, 10) : 0;
+      const graphPositioned = !!graphStyle && graphStyle.position !== 'static';
+      checks.push({
+        name: 'GROUP_LABEL_BEHIND_GRAPH',
+        pass: !labelEl || (!!graphCell && graphPositioned && graphZ > labelZ),
+        detail: labelEl
+          ? 'label z=' + labelZ + '; graph z=' + graphZ +
+            '; graph position=' + (graphStyle ? graphStyle.position : 'missing')
+          : 'no group boundary rows in this scenario (skipped)',
+      });
+    }
+
+    // Check 5n: the Commit/ID column shows a SHORT display id — op ids are
+    // removed from the default visual priority and raw 64-bit strings never
+    // render as the visible value.
+    if (wrapEl && !viewMessage) {
+      const firstRow = wrapEl.querySelector('.row:not(.row-placeholder)');
+      const commitCell = firstRow && firstRow.querySelector('.commit-cell');
+      const commitText = commitCell ? (commitCell.textContent || '').trim() : '';
+      const cached = firstRow ? window.__editchainRowAt(parseInt(firstRow.getAttribute('data-row'), 10)) : null;
+      let shortOk = true;
+      if (cached && !cached.git_oid && cached.op_id && cached.op_id.length > 12) {
+        // Op rows must never show the full raw op id in the visible column.
+        shortOk = commitText.length <= 12 && commitText !== cached.op_id;
+      }
+      checks.push({
+        name: 'SHORT_COMMIT_ID',
+        pass: shortOk,
+        detail: shortOk
+          ? 'commit cell "' + commitText + '" (short display id)'
+          : 'commit cell "' + commitText + '" leaks the full op id',
+      });
+    }
+
+    // Check 5o (traced scenario only): the ACTIVE profile drives hide_trace
+    // end-to-end — Activity (the default) hides every visibility==="trace"
+    // row (hide_trace=true is sent on the first GetWindow) and renders 3
+    // rows; Raw sends hide_trace=false and renders all 5 rows. Routine
+    // successful conversation stays pure prose, while execute activity keeps
+    // its quiet semantic "run" kicker.
+    if (window.__editchainScenarioName === 'traced') {
+      const keys = Array.from(wrapEl ? wrapEl.querySelectorAll('.row[data-key]') : [])
+        .map((r) => r.getAttribute('data-key'));
+      const traceKeys = keys.filter((k) => /^node:t:(1|3)$/.test(k));
+      const activityKeys = keys.filter((k) => /^node:t:(0|2|4)$/.test(k));
+      const traceHidden = traceKeys.length === 0;
+      const windows = (window.__editchainRequestLog || []).filter(
+        (b) => b && b.GetWindow !== undefined
+      );
+      // The FIRST window reflects the default profile (Activity hides trace);
+      // the LAST window reflects the ACTIVE profile after any `--profile raw`
+      // switch (Raw sends hide_trace=false on the refetch).
+      const firstWindowFilter = windows.length ? windows[0].GetWindow.filter : null;
+      const lastWindowFilter = windows.length ? windows[windows.length - 1].GetWindow.filter : null;
+      const rawProfile = activeProfile === 'raw';
+      const hideTraceSent = firstWindowFilter && firstWindowFilter.hide_trace === true;
+      const hideTraceFlagOk = rawProfile
+        ? !!lastWindowFilter && lastWindowFilter.hide_trace === false
+        : hideTraceSent;
+      const traceOk = rawProfile
+        ? traceKeys.length === 2 && activityKeys.length === 3 && keys.length === 5
+        : traceHidden && activityKeys.length === 3;
+      const rowByKey = (k) => wrapEl && wrapEl.querySelector('.row[data-key="' + k + '"]');
+      const t0 = rowByKey('node:t:0'); // conversation turn, outcome success
+      const t2 = rowByKey('node:t:2'); // execute activity, outcome unknown
+      const t0Outcome = t0 && t0.querySelector('.out-badge.outcome-success');
+      const t0ActCount = t0 ? t0.querySelectorAll('.act-badge').length : -1;
+      const t2Act = t2 && t2.querySelector('.act-badge.act-execute');
+      const t2ActText = t2Act ? (t2Act.textContent || '').trim() : '';
+      const badgeOk = !t0Outcome && t0ActCount === 0 && !!t2Act && t2ActText === 'run';
+      checks.push({
+        name: 'ACTIVITY_DEFAULT_HIDES_TRACE',
+        pass: traceOk && hideTraceFlagOk,
+        detail: traceOk && hideTraceFlagOk
+          ? (rawProfile
+              ? 'raw profile renders trace rows; last GetWindow hide_trace=false'
+              : 'trace rows hidden in Activity; first GetWindow hide_trace=' +
+                (firstWindowFilter ? firstWindowFilter.hide_trace : 'MISSING') +
+                '; activity rows=' + activityKeys.length)
+          : (rawProfile
+              ? 'raw profile trace rows=' + traceKeys.length +
+                ' expected 2; hide_trace=' + (lastWindowFilter ? lastWindowFilter.hide_trace : 'MISSING')
+              : 'trace rows RENDERED in Activity view: ' + JSON.stringify(traceKeys) +
+                ' hide_trace=' + (firstWindowFilter ? firstWindowFilter.hide_trace : 'MISSING')),
+      });
+      checks.push({
+        name: 'BADGES_EXACT_TAXONOMY',
+        pass: !!badgeOk,
+        detail: badgeOk
+          ? 'routine conversation is pure prose; execute "run" kicker rendered'
+          : 'badges: t0 outcome=' + (t0Outcome ? 'UNEXPECTED' : 'none') +
+            ' t0 act-badges=' + t0ActCount + ' t2 execute=' +
+            (t2Act ? '"' + t2ActText + '"' : 'MISSING'),
+      });
+    }
+
+    // Check 5p (badges scenario only): the EXACT Rust wire taxonomy renders
+    // through the renderer whitelists. Common source_control ("git") and
+    // success ("ok") badges are retained as code options but default OFF;
+    // every other meaningful activity/outcome carries its exact class/text.
+    // Legacy tool_call/command/edit/commit/review + error/interrupted vocabulary
+    // must never leak back in. Visible outcome colors must track VS Code theme
+    // tokens, never fixed colors alone.
+    if (window.__editchainScenarioName === 'badges') {
+      const expected = {
+        'node:b:exec': { act: ['act-execute', 'run'], out: ['outcome-failure', '✕'] },
+        'git:b:sc': { act: null, out: null },
+        'node:b:chg': { act: ['act-change', 'change'], out: ['outcome-warning', 'warn'] },
+        'node:b:plan': { act: ['act-plan', 'plan'], out: ['outcome-neutral', 'cancelled'] },
+        'node:b:exp': { act: ['act-explore', 'explore'], out: null },
+        'node:b:ver': { act: ['act-verify', 'verify'], out: null },
+        'node:b:diag': { act: ['act-diagnose', 'diagnose'], out: ['outcome-failure', '✕'] },
+        'node:b:coord': { act: ['act-coordinate', 'coordinate'], out: null },
+        'node:b:ext': { act: ['act-external', 'external'], out: null },
+        'node:b:sys': { act: ['act-system', 'system'], out: null },
+      };
+      const problems = [];
+      const legacyClasses = ['.act-tool', '.act-command', '.act-edit', '.act-commit',
+        '.act-review', '.outcome-error'];
+      for (const sel of legacyClasses) {
+        if (wrapEl && wrapEl.querySelector(sel)) problems.push('legacy badge class present: ' + sel);
+      }
+      for (const [key, exp] of Object.entries(expected)) {
+        const row = wrapEl && wrapEl.querySelector('.row[data-key="' + key + '"]');
+        if (!row) { problems.push('missing row ' + key); continue; }
+        const actBadge = row.querySelector('.act-badge');
+        const outBadge = row.querySelector('.out-badge');
+        if (exp.act) {
+          const actText = actBadge ? (actBadge.textContent || '').trim() : '';
+          if (!actBadge || !actBadge.classList.contains(exp.act[0]) || actText !== exp.act[1]) {
+            problems.push(key + ' activity badge != ' + exp.act[0] + ' "' + exp.act[1] + '" got ' +
+              (actBadge ? actBadge.className + ' "' + actText + '"' : 'none'));
+          }
+        } else if (actBadge) {
+          problems.push(key + ' has unexpected activity badge ' + actBadge.className);
+        }
+        if (exp.out) {
+          const outText = outBadge ? (outBadge.textContent || '').trim() : '';
+          if (!outBadge || !outBadge.classList.contains(exp.out[0]) || outText !== exp.out[1]) {
+            problems.push(key + ' outcome badge != ' + exp.out[0] + ' "' + exp.out[1] + '" got ' +
+              (outBadge ? outBadge.className + ' "' + outText + '"' : 'none'));
+          }
+        } else if (outBadge) {
+          problems.push(key + ' has unexpected outcome badge ' + outBadge.className);
+        }
+      }
+      const convRow = wrapEl && wrapEl.querySelector('.row[data-key="node:b:conv"]');
+      if (convRow && convRow.querySelector('.act-badge')) {
+        problems.push('conversation row must stay badge-free');
+      }
+      // Theme-token regression: override each harness token with a sentinel and
+      // require the badge color to follow. A stylesheet that hardcoded fixed
+      // colors would ignore the override and fail here.
+      const rootStyle = document.documentElement.style;
+      const rgbClose = (a, b) => !!a && !!b &&
+        Math.abs(a[0] - b[0]) <= 1 && Math.abs(a[1] - b[1]) <= 1 && Math.abs(a[2] - b[2]) <= 1;
+      const probeTokenDriven = (varName, cls, sentinel) => {
+        const prev = rootStyle.getPropertyValue(varName);
+        rootStyle.setProperty(varName, sentinel);
+        let driven = false;
+        const el = wrapEl && wrapEl.querySelector(cls);
+        if (el) {
+          driven = rgbClose(parseRgb(getComputedStyle(el).color), parseRgb(sentinel));
+        }
+        rootStyle.setProperty(varName, prev);
+        return driven;
+      };
+      const themeTokensOk =
+        probeTokenDriven('--vscode-editorWarning-foreground', '.out-badge.outcome-warning', '#00ff00') &&
+        probeTokenDriven('--vscode-editorError-foreground', '.out-badge.outcome-failure', '#00ff00');
+      if (!themeTokensOk) {
+        problems.push('outcome badge colors are not driven by VS Code theme tokens');
+      }
+      checks.push({
+        name: 'BADGE_VOCABULARY_COVERAGE',
+        pass: problems.length === 0,
+        detail: problems.length === 0
+          ? '9 uncommon activity kinds + 3 exceptional outcomes exact; git/ok default off; theme-token colors'
+          : problems.join('; '),
+      });
+    }
+
+    // Check 5q: common clean-state chrome is globally quiet by default. This
+    // intentionally excludes aggregate bundle completion checks, which occur
+    // once per collapsed run rather than repeating on every row.
+    if (wrapEl && !viewMessage) {
+      const commonBadges = Array.from(wrapEl.querySelectorAll(
+        '.act-badge.act-source-control, .out-badge.outcome-success'));
+      checks.push({
+        name: 'COMMON_ROW_BADGES_DEFAULT_OFF',
+        pass: commonBadges.length === 0,
+        detail: commonBadges.length === 0
+          ? 'no repeated git/ok row badges'
+          : commonBadges.length + ' repeated git/ok row badge(s)',
+      });
+    }
+
+    // Check 5r: Git text before the first colon becomes one exact chip and the
+    // delimiter disappears. A Git summary without a colon remains chip-free.
+    if (wrapEl && !viewMessage) {
+      const problems = [];
+      let prefixed = 0;
+      let plain = 0;
+      for (const el of wrapEl.querySelectorAll('.row')) {
+        const abs = Number(el.getAttribute('data-row'));
+        const row = window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
+        if (!row || !row.git_oid) continue;
+        const source = String(row.summary || '');
+        const colon = source.indexOf(':');
+        const expectedPrefix = colon > 0 ? source.slice(0, colon).trim() : '';
+        const chip = el.querySelector('.git-prefix-chip');
+        if (expectedPrefix) {
+          prefixed++;
+          if (!chip || chip.textContent.trim() !== expectedPrefix) {
+            problems.push(row.node_key + ': Git prefix chip mismatch');
+          } else if ((chip.parentElement.textContent || '').includes(expectedPrefix + ':')) {
+            problems.push(row.node_key + ': Git prefix delimiter is still visible');
+          }
+        } else {
+          plain++;
+          if (chip) problems.push(row.node_key + ': colon-free Git summary gained a chip');
+        }
+      }
+      checks.push({
+        name: 'GIT_PREFIX_CHIP_FIRST_COLON',
+        pass: problems.length === 0,
+        detail: problems.length === 0
+          ? prefixed + ' prefixed and ' + plain + ' plain Git rows render correctly'
+          : problems.join('; '),
       });
     }
 
@@ -974,16 +1461,16 @@
     }
 
     // Check 8 (fork / subagent-reconnect scenario only): the graph must render
-    // distinct lanes for the two fork branches AND rounded cross-lane
+    // distinct lanes for the two fork branches AND smooth convex cross-lane
     // transitions whose endpoints are ALL connected — every transition anchor
     // must be either this row's node dot or a cell boundary the adjacent row's
     // geometry continues at the same lane x. The production direction is
     // (child_lane, parent_lane), so row 0's reconnect transition runs 0 -> 1
-    // (completion lane -> subagent lane) and the fork jogs at rows 2/3 run
-    // 1 -> 0. Assertions:
+    // (completion lane -> subagent lane), row 2's merge-side transition runs
+    // 1 -> 0, and the true fork bends 1 -> 0 in its parent row 4. Assertions:
     //   - dots occupy at least two distinct x positions (two lanes);
-    //   - each transition row renders exactly two exact path halves sharing the
-    //     geometric midpoint seam (identical formatted coordinates);
+    //   - each transition row renders exactly two quadratic path halves sharing
+    //     an exact tangent-continuous colour seam;
     //   - the source half begins at the row's own dot when `lane === fromLane`
     //     (row 0's reconnect starts AT the lane-0 dot — explicitly no source
     //     stub: it never begins at y=0 and row 0 keeps no dangling lane-0
@@ -995,10 +1482,8 @@
     //     same x), or at the row's own dot when `lane === toLane`;
     //   - each half is stroked in its lane's colour (sharp categorical handoff
     //     at the seam);
-    //   - quadratic corner controls sit on the lane centres at the row
-    //     midpoint for boundary-anchored sides (rounded onto the row midpoint);
-    //     dot-anchored sides have no vertical run and stay straight along the
-    //     row midpoint;
+    //   - dot-to-boundary transitions form one non-inflecting convex bow;
+    //     pass-through transitions use two convex halves with one smooth seam;
     //   - no hard horizontal `graphLine` remains (the old three-line jog is
     //     gone).
     if (wrapEl && window.__editchainScenarioName === 'fork') {
@@ -1024,7 +1509,7 @@
       // dot, the subagent lane (lane 1) is row 1's dot.
       const lane0 = dotAt(0);
       const lane1 = dotAt(1);
-      const transitionRows = [0, 2, 3];
+      const transitionRows = [0, 2, 4];
       const transitionProblems = [];
       // Lane x / fill lookups from the rendered dots (each lane's dot x is
       // uniform across its rows).
@@ -1067,10 +1552,7 @@
             transitionProblems.push('row ' + row + ' missing lane x/fill references');
             continue;
           }
-          const seamX = (fromX + toX) / 2;
           const srcStart = pathStart(t.src.cmds);
-          const srcEnd = pathEnd(t.src.cmds);
-          const dstStart = pathStart(t.dst.cmds);
           const dstEnd = pathEnd(t.dst.cmds);
           // Source anchor: the row's own dot, or the top boundary ONLY when
           // `above` lists the from-lane (the path owns that top half).
@@ -1104,25 +1586,8 @@
                 ' is not continued by row ' + (row + 1) + '\'s top geometry');
             }
           }
-          const sharedSeam = srcEnd && dstStart &&
-            srcEnd[0] === dstStart[0] && srcEnd[1] === dstStart[1] &&
-            near(srcEnd[0], seamX) && near(srcEnd[1], MID_Y);
-          if (!sharedSeam) {
-            transitionProblems.push('row ' + row + ' halves must share the exact midpoint seam');
-          }
-          const srcQ = t.src.cmds.find((c) => c.cmd === 'Q');
-          const dstQ = t.dst.cmds.find((c) => c.cmd === 'Q');
-          // Boundary-anchored sides round onto the row midpoint (quadratic
-          // control on the lane centre); dot-anchored sides have no vertical
-          // run and must stay straight along the row midpoint.
-          const srcElbowOk = anchors.startAtBoundary
-            ? (!!srcQ && near(srcQ.args[0], fromX) && near(srcQ.args[1], MID_Y))
-            : !srcQ;
-          const dstElbowOk = anchors.endAtBoundary
-            ? (!!dstQ && near(dstQ.args[0], toX) && near(dstQ.args[1], MID_Y))
-            : !dstQ;
-          if (!srcElbowOk || !dstElbowOk) {
-            transitionProblems.push('row ' + row + ' elbows must match their anchors');
+          for (const problem of smoothTransitionProblems(t.src.cmds, t.dst.cmds, anchors)) {
+            transitionProblems.push('row ' + row + ' ' + problem);
           }
           if (t.src.stroke !== srcColour || t.dst.stroke !== dstColour) {
             transitionProblems.push('row ' + row + ' colour handoff mismatch');
@@ -1148,7 +1613,7 @@
         }
       }
       // The old hard three-line jog rendered a horizontal connector; the
-      // rounded transition replaces it, so every remaining graphLine must be
+      // smooth transition replaces it, so every remaining graphLine must be
       // a vertical segment.
       Array.from(geometry.values()).forEach((g) => {
         g.lines.forEach((l) => {
@@ -1158,10 +1623,10 @@
         });
       });
       checks.push({
-        name:'FORK_ROUNDED_TRANSITIONS',
+        name:'FORK_SMOOTH_CONVEX_TRANSITIONS',
         pass:transitionProblems.length === 0,
         detail: transitionProblems.length === 0
-          ? '3 connected transitions: dot/boundary anchors, exact shared seams, per-lane colours'
+          ? '3 connected transitions: convex Béziers, smooth seams, connected anchors, per-lane colours'
           : transitionProblems.join('; '),
       });
 
@@ -1248,16 +1713,52 @@
       });
     }
 
+    // Deep session branch: the fork belongs in the anchor commit's own row,
+    // entering from the lane ABOVE-RIGHT and terminating at the anchor dot.
+    // This pins the requested bottom-right corner orientation; placing the
+    // transition one row earlier produces the visually reversed curve even
+    // though the same two lanes remain connected.
+    if (wrapEl && window.__editchainScenarioName === 'sessionBranch') {
+      const cells = wrapEl.querySelectorAll('.graph-cell svg.graphCell');
+      const geometry = collectRowGeometry(cells);
+      const anchorRow = 13;
+      const prior = geometry.get(anchorRow - 1);
+      const anchor = geometry.get(anchorRow);
+      const cached = window.__editchainRowAt ? window.__editchainRowAt(anchorRow) : null;
+      const anchors = cached ? transitionAnchors(cached) : null;
+      const src = anchor && anchor.src ? quadraticSegment(anchor.src.cmds) : null;
+      const dst = anchor && anchor.dst ? quadraticSegment(anchor.dst.cmds) : null;
+      const noEarlyCurve = !!prior && !prior.src && !prior.dst;
+      const bottomRight = !!(anchor && anchor.dot && anchors && src && dst &&
+        anchors.startAtBoundary && anchors.endAtDot &&
+        src.start[0] > anchor.dot.x &&
+        Math.abs(src.start[1]) <= 0.01 &&
+        Math.abs(src.control[0] - src.start[0]) <= 0.02 &&
+        Math.abs(dst.end[0] - anchor.dot.x) <= 0.02 &&
+        Math.abs(dst.end[1] - anchor.dot.y) <= 0.02 &&
+        Math.abs(dst.control[1] - dst.end[1]) <= 0.02);
+      const shapeProblems = anchors && anchor && anchor.src && anchor.dst
+        ? smoothTransitionProblems(anchor.src.cmds, anchor.dst.cmds, anchors)
+        : ['anchor transition missing'];
+      checks.push({
+        name: 'SESSION_BRANCH_BOTTOM_RIGHT',
+        pass: noEarlyCurve && bottomRight && shapeProblems.length === 0,
+        detail: noEarlyCurve && bottomRight && shapeProblems.length === 0
+          ? 'lane above-right curves smoothly into the anchor dot; trunk continues below'
+          : 'noEarlyCurve=' + noEarlyCurve + ' bottomRight=' + bottomRight +
+            ' shape=' + shapeProblems.join(', '),
+      });
+    }
+
     // Check 8b (highLanes scenario only): every service lane must be drawn
     // INSIDE the graph column — no 128-lane clipping. The fixture has 200
     // lanes (> the former cap): all dot centres must land within their SVG
     // cell's width and more than 128 distinct lane x positions must render.
     //
     // Rows 0..4 form a connected production-like zigzag (lanes 0,1,0,1,0 with
-    // adjacent transitions 0->1, 1->0, ...), so the rounded paths are exercised
-    // under heavy compression: the corner radius clamps to the lane distance,
-    // and at extreme spacing the renderer falls back to a straight orthogonal
-    // jog. Every transition begins at its row's own dot (no synthetic top
+    // adjacent transitions 0->1, 1->0, ...), so the convex Bézier paths are
+    // exercised under heavy compression without a radius/fallback mode. Every
+    // transition begins at its row's own dot (no synthetic top
     // half), ends at the next lane's bottom boundary — continued by the
     // following row's `above` at the same x — and must keep two exact halves
     // sharing the midpoint seam, per-lane colours, and all coordinates inside
@@ -1326,11 +1827,7 @@
           transitionProblems.push('row ' + row + ' missing lane x references');
           continue;
         }
-        const dx = toX - fromX;
-        const seamX = (fromX + toX) / 2;
         const srcStart = pathStart(t.src.cmds);
-        const srcEnd = pathEnd(t.src.cmds);
-        const dstStart = pathStart(t.dst.cmds);
         const dstEnd = pathEnd(t.dst.cmds);
         // Source anchor: the row's own dot, or the top boundary ONLY when
         // `above` lists the from-lane.
@@ -1364,44 +1861,11 @@
               ' is not continued by row ' + (row + 1) + '\'s top geometry');
           }
         }
-        if (!srcEnd || !dstStart ||
-            srcEnd[0] !== dstStart[0] || srcEnd[1] !== dstStart[1] ||
-            !near(srcEnd[0], seamX) || !near(srcEnd[1], MID_Y)) {
-          transitionProblems.push('row ' + row + ' halves must share the exact midpoint seam');
+        for (const problem of smoothTransitionProblems(t.src.cmds, t.dst.cmds, anchors)) {
+          transitionProblems.push('row ' + row + ' ' + problem);
         }
         if (t.src.stroke !== laneFills.get(fromLane) || t.dst.stroke !== laneFills.get(toLane)) {
           transitionProblems.push('row ' + row + ' colour handoff mismatch');
-        }
-        // Dot-anchored sides have no vertical run and must stay straight (no
-        // Q). Boundary-anchored sides round onto the row midpoint with the
-        // corner radius (midY - cornerStartY) clamped by the lane distance;
-        // straight mode (no Q) is the sanctioned fallback under compression.
-        const srcQ = t.src.cmds.find((c) => c.cmd === 'Q');
-        const dstQ = t.dst.cmds.find((c) => c.cmd === 'Q');
-        if (startAtDot && srcQ) {
-          transitionProblems.push('row ' + row + ' dot-anchored src must stay straight');
-        }
-        if (endAtDot && dstQ) {
-          transitionProblems.push('row ' + row + ' dot-anchored dst must stay straight');
-        }
-        const clampOk = (q, cmds, laneX, isSrc) => {
-          if (!q) return true; // straight fallback is sanctioned
-          const idx = cmds.indexOf(q);
-          const cornerStart = cmds[idx - 1];
-          if (!cornerStart || cornerStart.cmd !== 'L') return false;
-          // Source elbows start their corner at midY - r (vertical run x is the
-          // from-lane); destination elbows end their corner at midY + r (the Q
-          // end x is the to-lane).
-          const radius = isSrc ? MID_Y - cornerStart.args[1] : q.args[3] - MID_Y;
-          const verticalX = isSrc ? cornerStart.args[0] : q.args[2];
-          return near(verticalX, laneX) &&
-            radius <= Math.abs(dx) / 2 + 0.01 && radius >= -0.01;
-        };
-        if (startAtBoundary && !clampOk(srcQ, t.src.cmds, fromX, true)) {
-          transitionProblems.push('row ' + row + ' src corner radius not clamped by lane distance');
-        }
-        if (endAtBoundary && !clampOk(dstQ, t.dst.cmds, toX, false)) {
-          transitionProblems.push('row ' + row + ' dst corner radius not clamped by lane distance');
         }
         // All path coordinates must stay inside the cell (compression never
         // clips a transition).
@@ -1414,9 +1878,768 @@
         name: 'HIGH_LANES_TRANSITIONS',
         pass: transitionProblems.length === 0,
         detail: transitionProblems.length === 0
-          ? transitionRows + ' compressed zigzag transitions valid (clamped radius / fallback, seams, colours, connected endpoints)'
+          ? transitionRows + ' compressed zigzag transitions valid (convex Béziers, smooth seams, colours, connected endpoints)'
           : transitionProblems.join('; '),
       });
+    }
+
+    // 400px geometry contract: at exactly 400px the history table must fit the
+    // viewport with zero phantom horizontal scroll (the last visible column's
+    // resize handle is clamped inside the container, so scrollW === clientW),
+    // and the Graph columnheader must stay accessible without clipped visual
+    // text — either the label fits its track, or it is rendered as
+    // visually-hidden text (a "G…" ellipsis is never shown).
+    if (rowsEl && !viewMessage && window.innerWidth === 400) {
+      const graphTh = headerEl && headerEl.querySelector('.th.graph');
+      const hidden = graphTh && graphTh.querySelector('.visually-hidden');
+      const hiddenOk = !!hidden && (hidden.textContent || '').trim() === 'Graph';
+      const fits = !!graphTh && graphTh.scrollWidth <= graphTh.clientWidth + 1;
+      const accessible = !!graphTh && (hiddenOk || (graphTh.textContent || '').trim() === 'Graph');
+      const delta = rowsEl.scrollWidth - rowsEl.clientWidth;
+      checks.push({
+        name: 'GEOMETRY_400',
+        pass: delta === 0 && accessible && (fits || hiddenOk),
+        detail: 'scrollW=' + rowsEl.scrollWidth + ' clientW=' + rowsEl.clientWidth +
+          ' delta=' + delta +
+          ' graphCol=' + Math.round(graphTh ? graphTh.getBoundingClientRect().width : 0) +
+          'px labelFits=' + !!fits + ' visuallyHidden=' + hiddenOk,
+      });
+    }
+
+    // Narrow-rail contract at <=480px: the graph column must switch to the
+    // compact fixed-width rail (GRAPH_MAX_W_NARROW in media/main.js) — still
+    // VISIBLE (never hidden), but never taking ~half the viewport — so the
+    // Content track keeps a readable budget. All service lanes still render
+    // inside the rail (laneX compresses/distributes them across the column).
+    if (rowsEl && !viewMessage && window.innerWidth > 0 && window.innerWidth <= 480) {
+      const graphTh = headerEl && headerEl.querySelector('.th.graph');
+      const firstRow = wrapEl && wrapEl.querySelector('.row:not(.row-placeholder)');
+      const contentCell = firstRow && firstRow.querySelector('.text-cell');
+      const graphCol = graphTh ? graphTh.getBoundingClientRect().width : 0;
+      const contentW = contentCell ? contentCell.getBoundingClientRect().width : 0;
+      // GRAPH_MAX_W_NARROW=120 + layout tolerance; a 1-lane rail is naturally
+      // 36px (2 lanes 54px) so the floor only proves the rail is RENDERED,
+      // never display:none; content >= 200px locks the legibility gain over
+      // the old ~160-200px squeeze (and holds with Date visible at 480px).
+      const compact = graphCol > 0 && graphCol <= 140;
+      const visible = graphCol >= 30;
+      const contentReadable = contentW >= 200;
+      checks.push({
+        name: 'GRAPH_RAIL_NARROW',
+        pass: compact && visible && contentReadable,
+        detail: 'graphCol=' + Math.round(graphCol) + 'px (compact rail <= 140px, ' +
+          'still visible >= 30px) contentW=' + Math.round(contentW) +
+          'px (>= 200px readable)',
+      });
+    }
+
+    // --- Round-two parallel Activity-view contract (workUnits scenarios) ----
+    // The renderer DOM classes land in a parallel change to media/main.js;
+    // the fixtures/bridge already model the full wire contract (see
+    // workUnitBridge.test.js). Family checks retain explicit diagnostics when
+    // one marker family is absent, but the mandatory contract-presence check
+    // below fails the Activity scenario unless ALL four renderer families are
+    // present (work-unit boundaries, bundle styling, promotion rails, and the
+    // execute-run capsule glyph). This prevents a reverted renderer from
+    // turning feature checks into silent skips. Cache-side wire facts are
+    // always asserted as well.
+    if (window.__editchainScenarioName === 'workUnits' ||
+        window.__editchainScenarioName === 'workUnitsDeep') {
+      const activeProfile = typeof window.__editchainGetProfile === 'function'
+        ? window.__editchainGetProfile() : 'activity';
+      // The small fixture renders its full 13-row Activity view, so its checks
+      // assert EXACT global counts; the tall deep fixture renders a
+      // virtualized window slice (viewport + 2*BUFFER rows), so its checks
+      // assert per-row wire-vs-DOM fidelity plus window-level uniqueness
+      // (exact global counts are not reachable from a slice).
+      const isSmall = window.__editchainScenarioName === 'workUnits';
+      const cachedRow = (el) => {
+        const abs = Number(el.getAttribute('data-row'));
+        return window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
+      };
+      const recognizedBundle = (bundle) => !!bundle &&
+        (bundle.kind === 'execute-run' || bundle.kind === 'plan-repeat');
+      const rowEls = wrapEl
+        ? Array.from(wrapEl.querySelectorAll('.row:not(.row-placeholder)'))
+        : [];
+      const countMarkers = (sel) => document.querySelectorAll(sel).length;
+      const caps = {
+        any: false, workUnit: false, bundle: false, promoted: false, capsule: false,
+      };
+      caps.workUnit = countMarkers(
+        '.row-work-unit-start, .row-work-unit-end, .work-unit-ribbon, .work-unit-count') > 0;
+      caps.bundle = countMarkers(
+        '.row-activity-bundle, .bundle-count, .bundle-status, [data-activity-bundle], [data-bundle-count]') > 0;
+      caps.promoted = countMarkers('.row-promoted') > 0;
+      caps.capsule = countMarkers(
+        '.graph-cell rect.graphBundleCapsule, .graph-cell circle.graphBundleTerminal') > 0;
+      caps.any = caps.workUnit || caps.bundle || caps.promoted || caps.capsule;
+      const contractAbsent = (family) =>
+        'renderer contract not present (no ' + family +
+        ' DOM markers rendered; wire metadata verified cache-side)';
+
+      if (activeProfile === 'activity') {
+        const present = caps.workUnit && caps.bundle && caps.promoted && caps.capsule;
+        checks.push({
+          name: 'ROUND_TWO_RENDERER_CONTRACT_PRESENT',
+          pass: present,
+          detail: 'workUnit=' + caps.workUnit + ' bundle=' + caps.bundle +
+            ' promoted=' + caps.promoted + ' capsule=' + caps.capsule,
+        });
+      }
+
+      // Check A: work-unit boundary markers match the wire metadata exactly
+      // (one start/end per id) in the Activity profile.
+      if (activeProfile === 'activity') {
+        if (!caps.workUnit) {
+          checks.push({ name: 'WORK_UNIT_BOUNDARIES_EXACT', pass: true, detail: contractAbsent('work-unit') });
+        } else {
+          const problems = [];
+          for (const el of rowEls) {
+            const row = cachedRow(el);
+            if (!row || !row.work_unit) {
+              problems.push((el.getAttribute('data-key') || '?') + ': no cached work_unit');
+              continue;
+            }
+            const startDom = el.classList.contains('row-work-unit-start');
+            // Single-row units are both is_start and is_end; the renderer's
+            // optional end marker yields to the start header, so the DOM
+            // expectation is `is_end && !is_start`.
+            const endDom = el.classList.contains('row-work-unit-end');
+            if (startDom !== row.work_unit.is_start) {
+              problems.push(row.node_key + ': start DOM=' + startDom + ' wire=' + row.work_unit.is_start);
+            }
+            if (endDom !== (row.work_unit.is_end && !row.work_unit.is_start)) {
+              problems.push(row.node_key + ': end DOM=' + endDom + ' wire=' + row.work_unit.is_end);
+            }
+          }
+          if (isSmall && countMarkers('.row-work-unit-start') !== 3) {
+            problems.push('expected 3 unit-start rows, got ' + countMarkers('.row-work-unit-start'));
+          }
+          if (isSmall && countMarkers('.row-work-unit-end') !== 3) {
+            problems.push('expected 3 unit-end rows, got ' + countMarkers('.row-work-unit-end'));
+          }
+          checks.push({
+            name: 'WORK_UNIT_BOUNDARIES_EXACT',
+            pass: problems.length === 0,
+            detail: problems.length === 0
+              ? '3/3 unit starts + ends match the wire metadata'
+              : problems.join('; '),
+          });
+        }
+      }
+
+      // Check B: unit ribbons are SPARSE (start rows only, exactly one per
+      // row). Multi-entry non-Git activities carry the exact view-wide count;
+      // Git and single-entry units follow VS Code's native count-free header.
+      if (activeProfile === 'activity') {
+        if (!caps.workUnit) {
+          checks.push({ name: 'WORK_UNIT_RIBBON_SPARSE_COUNTED', pass: true, detail: contractAbsent('work-unit ribbon/count') });
+        } else {
+          const problems = [];
+          let ribbons = 0;
+          const parseCount = (text) => {
+            const m = /^(\d+)/.exec((text || '').trim());
+            return m ? Number(m[1]) : NaN;
+          };
+          for (const el of rowEls) {
+            const row = cachedRow(el);
+            const ribbonEls = el.querySelectorAll('.work-unit-ribbon');
+            if (ribbonEls.length > 1) problems.push(row.node_key + ': ' + ribbonEls.length + ' ribbons on one row');
+            const hasRibbon = ribbonEls.length === 1;
+            const countEl = el.querySelector('.work-unit-count');
+            const expectedRibbon = !!(row && row.work_unit && row.work_unit.is_start);
+            if (hasRibbon !== expectedRibbon) {
+              problems.push(row.node_key + ': ribbon DOM=' + hasRibbon + ' expected(is_start)=' + expectedRibbon);
+            }
+            if (hasRibbon) {
+              ribbons++;
+              const expectsCount = row.activity_kind !== 'source_control' &&
+                row.work_unit.count > 1;
+              if (!!countEl !== expectsCount) {
+                problems.push(row.node_key + ': count DOM=' + !!countEl +
+                  ' expected=' + expectsCount);
+              } else if (countEl) {
+                const text = (countEl.textContent || '').trim();
+                if (parseCount(text) !== row.work_unit.count) {
+                  problems.push(row.node_key + ': count text "' + text + '" != wire ' + row.work_unit.count);
+                }
+                if (!/entr(?:y|ies)$/.test(text)) {
+                  problems.push(row.node_key + ': count is not labelled as entries: "' + text + '"');
+                }
+              }
+              // The ribbon leads with the unit title: the DTO title when
+              // present (t1/t2), else the renderer's short fallback label
+              // (ops -> "Git") — never the raw opaque unit id.
+              const ribbonText = (ribbonEls[0].textContent || '').trim();
+              const expectedTitle = row.work_unit.title
+                ? row.work_unit.title
+                  .replace(/`+([^`]+)`+/g, '$1')
+                  .replace(/\*\*([^*]+)\*\*/g, '$1')
+                  .replace(/__([^_]+)__/g, '$1')
+                  .replace(/~~([^~]+)~~/g, '$1')
+                  .trim()
+                : (row.activity_kind === 'source_control' ? 'Git' : null);
+              if (expectedTitle && ribbonText !== expectedTitle) {
+                problems.push(row.node_key + ': ribbon title "' + ribbonText + '" != "' + expectedTitle + '"');
+              }
+            } else if (countEl) {
+              problems.push(row.node_key + ': count element without a ribbon (non-start rows stay sparse)');
+            }
+          }
+          if (isSmall && ribbons !== 3) problems.push('expected exactly 3 ribbons, got ' + ribbons);
+          checks.push({
+            name: 'WORK_UNIT_RIBBON_SPARSE_COUNTED',
+            pass: problems.length === 0,
+            detail: problems.length === 0
+              ? '3 ribbons with exact counts; non-start rows bare'
+              : problems.join('; '),
+          });
+        }
+      }
+
+      // Check C: no duplicate/stacked boundary labels — a rendered window
+      // never shows MORE than one start or one end per unit id (and the small
+      // fixture's full view shows exactly one of each); no row carries more
+      // than one ribbon or group chip; and a ribbon + chip on the same row
+      // never overlap visually (stacked labels). Virtualized deep slices may
+      // legitimately cut a unit (start without end), so slice-level checks
+      // assert uniqueness, not completeness.
+      {
+        const problems = [];
+        const perId = new Map();
+        for (const el of rowEls) {
+          const row = cachedRow(el);
+          if (!row || !row.work_unit) { problems.push('row lacks work_unit in cache'); continue; }
+          const agg = perId.get(row.work_unit.id) || { starts: 0, ends: 0 };
+          if (row.work_unit.is_start) agg.starts++;
+          if (row.work_unit.is_end) agg.ends++;
+          perId.set(row.work_unit.id, agg);
+          const ribbons = el.querySelectorAll('.work-unit-ribbon').length;
+          const chips = el.querySelectorAll('.group-label').length;
+          if (ribbons > 1) problems.push(row.node_key + ': duplicate ribbon');
+          if (chips > 1) problems.push(row.node_key + ': duplicate/stacked group label');
+          if (chips >= 1 && ribbons >= 1) {
+            const chip = el.querySelector('.group-label').getBoundingClientRect();
+            const ribbon = el.querySelector('.work-unit-ribbon').getBoundingClientRect();
+            const overlap = chip.width > 0 && ribbon.width > 0 &&
+              chip.left < ribbon.right - 0.5 && ribbon.left < chip.right - 0.5 &&
+              chip.top < ribbon.bottom - 0.5 && ribbon.top < chip.bottom - 0.5;
+            if (overlap) problems.push(row.node_key + ': group chip overlaps the work-unit ribbon (stacked)');
+          }
+        }
+        for (const [id, agg] of perId) {
+          if (agg.starts > 1) problems.push('unit ' + id + ': ' + agg.starts + ' starts in one window');
+          if (agg.ends > 1) problems.push('unit ' + id + ': ' + agg.ends + ' ends in one window');
+          if (isSmall) {
+            if (agg.starts !== 1) problems.push('unit ' + id + ': ' + agg.starts + ' starts');
+            if (agg.ends !== 1) problems.push('unit ' + id + ': ' + agg.ends + ' ends');
+          }
+        }
+        const domSkipped = !caps.workUnit;
+        checks.push({
+          name: 'WORK_UNIT_NO_DUPLICATE_BOUNDARY_PER_ID',
+          pass: problems.length === 0,
+          detail: problems.length === 0
+            ? 'per-id boundaries unique per window' +
+              (isSmall ? ' (and exact in the full view)' : ' (deep slice: uniqueness only)') +
+              '; labels sparse, never stacked' +
+              (domSkipped ? ' — DOM label checks skipped (renderer contract not present)' : '')
+            : problems.join('; '),
+        });
+      }
+
+      // Check C2: model and agent provenance render once per visible session
+      // run, with exact labels from the typed `session_meta` DTO. Rows inside
+      // the run keep an empty slot so virtualization can promote a new window
+      // boundary without reconstructing the row compositor.
+      {
+        const problems = [];
+        let previousGroup = null;
+        for (const el of rowEls) {
+          const row = cachedRow(el);
+          if (!row) continue;
+          const meta = row.session_meta || null;
+          const atBoundary = previousGroup === null || row.group !== previousGroup;
+          const expects = !!meta && !row.is_subop && atBoundary;
+          const model = el.querySelector('.session-chip-model');
+          const agent = el.querySelector('.session-chip-agent');
+          if (!!model !== (expects && !!meta.model_provider)) {
+            problems.push(row.node_key + ': model chip boundary mismatch');
+          }
+          if (!!agent !== (expects && !!meta.agent_nickname)) {
+            problems.push(row.node_key + ': agent chip boundary mismatch');
+          }
+          if (model && model.textContent.trim() !== meta.model_provider) {
+            problems.push(row.node_key + ': model chip text mismatch');
+          }
+          if (agent && agent.textContent.trim() !== meta.agent_nickname) {
+            problems.push(row.node_key + ': agent chip text mismatch');
+          }
+          previousGroup = row.group;
+        }
+        checks.push({
+          name: 'SESSION_META_CHIPS_AT_BOUNDARY',
+          pass: problems.length === 0,
+          detail: problems.length === 0
+            ? 'model and agent chips are exact and boundary-sparse'
+            : problems.join('; '),
+        });
+      }
+
+      // Check D: ONLY recognized typed bundle rows render bundle styling, with the
+      // exact typed member count (data attr + .bundle-count text). Structured
+      // success gets one quiet check; unknown outcome gets no status wording.
+      // Ordinary and unknown-kind rows stay bare.
+      if (activeProfile === 'activity') {
+        if (!caps.bundle) {
+          checks.push({ name: 'BUNDLE_TYPED_EXACT', pass: true, detail: contractAbsent('bundle') });
+        } else {
+          const problems = [];
+          let typed = 0;
+          const parseCount = (text) => {
+            const m = /^(\d+)/.exec((text || '').trim());
+            return m ? Number(m[1]) : NaN;
+          };
+          for (const el of rowEls) {
+            const row = cachedRow(el);
+            const b = row ? row.activity_bundle : null;
+            const styled = el.classList.contains('row-activity-bundle');
+            const styledAttr = el.getAttribute('data-activity-bundle');
+            const countAttr = el.getAttribute('data-bundle-count');
+            const countEl = el.querySelector('.bundle-count');
+            const statusEl = el.querySelector('.bundle-status');
+            if (recognizedBundle(b)) {
+              typed++;
+              if (!styled) problems.push(row.node_key + ': typed bundle row missing .row-activity-bundle');
+              if (styledAttr !== b.kind) problems.push(row.node_key + ': data-activity-bundle="' + styledAttr + '" != ' + b.kind);
+              if (countAttr !== String(b.member_count)) problems.push(row.node_key + ': data-bundle-count="' + countAttr + '" != ' + b.member_count);
+              if (!countEl || parseCount(countEl.textContent) !== b.member_count) {
+                problems.push(row.node_key + ': .bundle-count text mismatch (expected member_count ' + b.member_count + ')');
+              }
+              const statusText = statusEl ? (statusEl.textContent || '').trim() : '';
+              if (b.kind === 'plan-repeat') {
+                if (!countEl || countEl.textContent.trim() !== b.member_count + ' updates') {
+                  problems.push(row.node_key + ': Plan bundle must label member_count as updates');
+                }
+                const summary = el.querySelector('.summary-text');
+                if (!summary || summary.textContent.trim() !== 'Planning build and dry-run import steps') {
+                  problems.push(row.node_key + ': Plan bundle must retain its rendered heading');
+                }
+                if (statusEl) problems.push(row.node_key + ': Plan bundle must not render execute status');
+              } else if (row.outcome === 'success') {
+                if (!statusEl || statusText !== '✓' ||
+                    !statusEl.classList.contains('bundle-status-success')) {
+                  problems.push(row.node_key + ': all-success bundle missing .bundle-status-success');
+                }
+              } else if (statusEl) {
+                problems.push(row.node_key + ': unknown-outcome bundle must not render status wording');
+              }
+            } else {
+              if (styled) problems.push(row.node_key + ': unstyled row has .row-activity-bundle');
+              if (styledAttr !== null || countAttr !== null || countEl || statusEl) {
+                problems.push(row.node_key + ': unstyled row leaks bundle markup/attrs');
+              }
+            }
+          }
+          if (isSmall && typed !== 3) problems.push('expected exactly 3 recognized typed bundles, got ' + typed);
+          checks.push({
+            name: 'BUNDLE_TYPED_EXACT',
+            pass: problems.length === 0,
+            detail: problems.length === 0
+              ? '3/3 recognized bundles styled with exact count/content/status; ordinary + unknown-kind rows bare'
+              : problems.join('; '),
+          });
+        }
+      }
+
+      // Check E: styling never comes from parsing the display summary — the
+      // ordinary execute-with-subops row and the unknown-kind bundle row BOTH
+      // read like execute runs, yet must render zero bundle styling.
+      if (activeProfile === 'activity') {
+        if (!caps.bundle) {
+          checks.push({ name: 'BUNDLE_NO_SUMMARY_PARSE', pass: true, detail: contractAbsent('bundle') });
+        } else {
+          const problems = [];
+          // The deep fixture repeats the pattern per block with qualified keys
+          // ('wud:0:wu:execsub', ...) — match by suffix so both fixtures hit
+          // the same look-alike rows.
+          for (const key of ['wu:execsub', 'wu:xbundle']) {
+            const el = Array.from(wrapEl.querySelectorAll('.row')).find((r) =>
+              (r.getAttribute('data-key') || '').endsWith(key));
+            if (!el) { problems.push('missing row ' + key); continue; }
+            if (el.classList.contains('row-activity-bundle') ||
+                el.hasAttribute('data-activity-bundle') ||
+                el.hasAttribute('data-bundle-count') ||
+                el.querySelector('.bundle-count, .bundle-status')) {
+              problems.push(key + ': styled despite summary-only similarity (typed metadata: ' +
+                JSON.stringify(cachedRow(el).activity_bundle) + ')');
+            }
+          }
+          checks.push({
+            name: 'BUNDLE_NO_SUMMARY_PARSE',
+            pass: problems.length === 0,
+            detail: problems.length === 0
+              ? 'summary look-alikes render no bundle styling (typed metadata only)'
+              : problems.join('; '),
+          });
+        }
+      }
+
+      // Check E2: Activity-bundle capsule gating is driven by TYPED metadata
+      // exactly. Only rows whose cached kind is recognized
+      // render the capsule glyph set: exactly one rect.graphBundleCapsule,
+      // exactly two circle.graphBundleTerminal (one .graphBundleEntry, one
+      // .graphBundleExit), and NO circle.graphDot. The unknown-kind bundle row
+      // (coerced to 'unknown' on the wire), the summary look-alike execsub
+      // row, and every ordinary row stay bare.
+      if (activeProfile === 'activity') {
+        if (!caps.capsule) {
+          checks.push({ name: 'BUNDLE_CAPSULE_TYPED_EXACT', pass: true, detail: contractAbsent('capsule') });
+        } else {
+          const problems = [];
+          let typedRows = 0;
+          for (const el of rowEls) {
+            const row = cachedRow(el);
+            const b = row ? row.activity_bundle : null;
+            const svg = el.querySelector('.graph-cell svg.graphCell');
+            const rects = svg ? svg.querySelectorAll('rect.graphBundleCapsule') : [];
+            const terms = svg ? svg.querySelectorAll('circle.graphBundleTerminal') : [];
+            const typed = recognizedBundle(b);
+            if (typed) {
+              typedRows++;
+              if (rects.length !== 1) {
+                problems.push(row.node_key + ': typed bundle row must render exactly 1 capsule rect, got ' + rects.length);
+              }
+              if (terms.length !== 2) {
+                problems.push(row.node_key + ': typed bundle row must render exactly 2 terminals, got ' + terms.length);
+              } else {
+                const entry = Array.from(terms).filter((t) => t.classList.contains('graphBundleEntry')).length;
+                const exit = Array.from(terms).filter((t) => t.classList.contains('graphBundleExit')).length;
+                if (entry !== 1) problems.push(row.node_key + ': expected 1 .graphBundleEntry terminal, got ' + entry);
+                if (exit !== 1) problems.push(row.node_key + ': expected 1 .graphBundleExit terminal, got ' + exit);
+              }
+              if (svg && svg.querySelector('circle.graphDot')) {
+                problems.push(row.node_key + ': typed bundle row must not render a graphDot');
+              }
+            } else if (rects.length || terms.length) {
+              problems.push(row.node_key + ': untyped row leaks capsule markup (rects=' + rects.length +
+                ' terminals=' + terms.length + ' typed metadata: ' + JSON.stringify(b) + ')');
+            }
+          }
+          if (isSmall && typedRows !== 3) {
+            problems.push('expected exactly 3 typed bundle capsule rows, got ' + typedRows);
+          }
+          checks.push({
+            name: 'BUNDLE_CAPSULE_TYPED_EXACT',
+            pass: problems.length === 0,
+            detail: problems.length === 0
+              ? (isSmall ? '3/3 ' : '') +
+                'recognized bundle rows carry one capsule + entry/exit terminals and no dot; unknown-kind + ordinary rows bare'
+              : problems.join('; '),
+          });
+        }
+      }
+
+      // Check E3: capsule geometry. Both terminals sit on the row's lane x
+      // (the same x the neighbouring ordinary rows' dots use for that lane);
+      // the entry terminal is above the row midpoint and the exit terminal
+      // below it (entry y < HALF_H < exit y); the capsule rect encloses both
+      // terminal circles.
+      if (activeProfile === 'activity') {
+        if (!caps.capsule) {
+          checks.push({ name: 'BUNDLE_CAPSULE_GEOMETRY', pass: true, detail: contractAbsent('capsule') });
+        } else {
+          const ROW_H = 34;
+          const HALF_H = ROW_H / 2;
+          const near = (a, b) => Math.abs(a - b) <= 0.01;
+          // Lane x anchors come from ordinary rows' node dots (a bundle row
+          // carries terminals instead, so its lane x must equal the dots of
+          // other rows in the same lane).
+          const laneDotX = new Map();
+          for (const el of rowEls) {
+            const row = cachedRow(el);
+            const dot = el.querySelector('.graph-cell svg.graphCell circle.graphDot');
+            if (row && dot) laneDotX.set(row.lane, +dot.getAttribute('cx'));
+          }
+          const problems = [];
+          for (const el of rowEls) {
+            const row = cachedRow(el);
+            const b = row ? row.activity_bundle : null;
+            if (!recognizedBundle(b)) continue;
+            const svg = el.querySelector('.graph-cell svg.graphCell');
+            const rect = svg && svg.querySelector('rect.graphBundleCapsule');
+            const entry = svg && svg.querySelector('circle.graphBundleTerminal.graphBundleEntry');
+            const exit = svg && svg.querySelector('circle.graphBundleTerminal.graphBundleExit');
+            if (!rect || !entry || !exit) {
+              problems.push(row.node_key + ': capsule geometry missing (rect/entry/exit)');
+              continue;
+            }
+            const x = +rect.getAttribute('x');
+            const y = +rect.getAttribute('y');
+            const w = +rect.getAttribute('width');
+            const h = +rect.getAttribute('height');
+            const eCx = +entry.getAttribute('cx');
+            const eCy = +entry.getAttribute('cy');
+            const eR = +entry.getAttribute('r');
+            const xCx = +exit.getAttribute('cx');
+            const xCy = +exit.getAttribute('cy');
+            const xR = +exit.getAttribute('r');
+            if (!near(eCx, xCx)) {
+              problems.push(row.node_key + ': terminals do not share the row lane x (' + eCx + ' vs ' + xCx + ')');
+            }
+            const laneX = laneDotX.get(row.lane);
+            if (laneX !== undefined && (!near(eCx, laneX) || !near(xCx, laneX))) {
+              problems.push(row.node_key + ': terminal x=' + eCx + ' != lane x=' + laneX + ' (lane ' + row.lane + ')');
+            }
+            if (!(eCy < HALF_H && xCy > HALF_H)) {
+              problems.push(row.node_key + ': entry y=' + eCy + ' must be < HALF_H and exit y=' + xCy + ' must be > HALF_H');
+            }
+            const encloses = (cx, cy, r) =>
+              x - 0.01 <= cx - r && cx + r <= x + w + 0.01 &&
+              y - 0.01 <= cy - r && cy + r <= y + h + 0.01;
+            if (!encloses(eCx, eCy, eR) || !encloses(xCx, xCy, xR)) {
+              problems.push(row.node_key + ': capsule (' + x + ',' + y + ',' + w + 'x' + h +
+                ') does not enclose terminals (' + eCx + ',' + eCy + ') and (' + xCx + ',' + xCy + ')');
+            }
+          }
+          checks.push({
+            name: 'BUNDLE_CAPSULE_GEOMETRY',
+            pass: problems.length === 0,
+            detail: problems.length === 0
+              ? 'terminals share the lane x, entry < HALF_H < exit, capsule encloses both'
+              : problems.join('; '),
+          });
+        }
+      }
+
+      // Check E4: ordinary-row exclusion — every top-level row that is NOT a
+      // recognized typed bundle keeps its graphDot and renders zero capsule
+      // markup (sub-op rows draw no node at all, as always).
+      if (activeProfile === 'activity') {
+        const problems = [];
+        for (const el of rowEls) {
+          if (el.classList.contains('row-subop')) continue;
+          const row = cachedRow(el);
+          const b = row ? row.activity_bundle : null;
+          if (recognizedBundle(b)) continue;
+          const svg = el.querySelector('.graph-cell svg.graphCell');
+          const dot = svg && svg.querySelector('circle.graphDot');
+          if (!dot) problems.push(row.node_key + ': ordinary row lost its graphDot');
+          if (svg && (svg.querySelector('rect.graphBundleCapsule') ||
+                      svg.querySelector('circle.graphBundleTerminal'))) {
+            problems.push(row.node_key + ': ordinary row leaks capsule markup');
+          }
+        }
+        checks.push({
+          name: 'BUNDLE_CAPSULE_ORDINARY_EXCLUDED',
+          pass: problems.length === 0,
+          detail: problems.length === 0
+            ? 'ordinary + unknown-kind rows keep their graphDot and carry zero capsule glyphs'
+            : problems.join('; '),
+        });
+      }
+
+      // Check E4b: bounded 34px row geometry — the capsule rect and both
+      // terminals stay inside their 34px SVG cell (no glyph escapes the row's
+      // vertical band or the graph column), and the bundle row itself stays
+      // exactly ROW_H tall like every other row.
+      if (activeProfile === 'activity') {
+        const ROW_H = 34;
+        const problems = [];
+        for (const el of rowEls) {
+          const row = cachedRow(el);
+          const b = row ? row.activity_bundle : null;
+          if (!recognizedBundle(b)) continue;
+          const rowH = el.getBoundingClientRect().height;
+          if (Math.abs(rowH - ROW_H) > 0.5) {
+            problems.push(row.node_key + ': bundle row height ' + rowH + ' != ' + ROW_H);
+          }
+          const svg = el.querySelector('.graph-cell svg.graphCell');
+          if (!svg) { problems.push(row.node_key + ': bundle row has no graph cell'); continue; }
+          const cellW = +svg.getAttribute('width');
+          const cellH = +svg.getAttribute('height');
+          if (Math.abs(cellH - ROW_H) > 0.01) {
+            problems.push(row.node_key + ': graph cell height ' + cellH + ' != ' + ROW_H);
+          }
+          const rect = svg.querySelector('rect.graphBundleCapsule');
+          if (rect) {
+            const x = +rect.getAttribute('x');
+            const y = +rect.getAttribute('y');
+            const w = +rect.getAttribute('width');
+            const h = +rect.getAttribute('height');
+            if (y < -0.01 || y + h > ROW_H + 0.01) {
+              problems.push(row.node_key + ': capsule escapes the 34px cell vertically (y=' + y + ' h=' + h + ')');
+            }
+            if (x < -0.01 || x + w > cellW + 0.01) {
+              problems.push(row.node_key + ': capsule escapes the graph column (x=' + x + ' w=' + w + ' cellW=' + cellW + ')');
+            }
+          }
+          svg.querySelectorAll('circle.graphBundleTerminal').forEach((t) => {
+            const cy = +t.getAttribute('cy');
+            const cx = +t.getAttribute('cx');
+            if (cy < -0.01 || cy > ROW_H + 0.01) {
+              problems.push(row.node_key + ': terminal escapes the 34px cell vertically (cy=' + cy + ')');
+            }
+            if (cx < -0.01 || cx > cellW + 0.01) {
+              problems.push(row.node_key + ': terminal escapes the graph column (cx=' + cx + ' cellW=' + cellW + ')');
+            }
+          });
+        }
+        checks.push({
+          name: 'BUNDLE_ROW_GEOMETRY_BOUNDED',
+          pass: problems.length === 0,
+          detail: problems.length === 0
+            ? 'capsule + terminals bounded inside the 34px cell; bundle rows stay 34px tall'
+            : problems.join('; '),
+        });
+      }
+
+      // Check E5: Raw zero leakage — the Raw profile renders NONE of the
+      // capsule glyphs anywhere even though its cached rows carry the wire
+      // metadata; raw rows keep their graph dots.
+      if (activeProfile === 'raw') {
+        const capsules = countMarkers('.graph-cell rect.graphBundleCapsule');
+        const terminals = countMarkers('.graph-cell circle.graphBundleTerminal');
+        const dots = countMarkers('.graph-cell circle.graphDot');
+        const leakFree = capsules === 0 && terminals === 0 && dots >= 1;
+        checks.push({
+          name: 'BUNDLE_CAPSULE_RAW_ZERO_LEAKAGE',
+          pass: leakFree,
+          detail: leakFree
+            ? 'raw renders zero capsule/terminal glyphs (' + dots + ' dots kept)'
+            : 'raw leaked capsule DOM: capsules=' + capsules + ' terminals=' + terminals + ' dots=' + dots,
+        });
+      }
+
+      // Check F: promotion DOM matches the wire flag exactly (Activity
+      // profile; the cache-side count always runs).
+      if (activeProfile === 'activity') {
+        const problems = [];
+        let promotedCount = 0;
+        for (const el of rowEls) {
+          const row = cachedRow(el);
+          const dom = el.classList.contains('row-promoted');
+          const wire = !!(row && row.promoted);
+          if (dom !== wire) problems.push(row.node_key + ': promoted DOM=' + dom + ' wire=' + wire);
+          if (dom) promotedCount++;
+        }
+        if (isSmall && promotedCount !== 5) problems.push('expected 5 promoted rows, got ' + promotedCount);
+        if (!caps.promoted) {
+          checks.push({
+            name: 'PROMOTED_EXACT',
+            pass: true,
+            detail: contractAbsent('promoted') + ' (cache rows: ' + promotedCount + '/5 promoted)' +
+              (problems.length ? ' cache-vs-fixture mismatch: ' + problems.join('; ') : ''),
+          });
+        } else {
+          checks.push({
+            name: 'PROMOTED_EXACT',
+            pass: problems.length === 0,
+            detail: problems.length === 0 ? '5/5 promoted rows match the wire flag' : problems.join('; '),
+          });
+        }
+      }
+
+      // Check G: Activity vs Raw gating — the Raw profile renders NONE of the
+      // grouping/promotion classes/descendants/data attrs even though its
+      // cached rows carry the wire metadata; the Activity profile renders
+      // them whenever the contract is present.
+      {
+        const rowHasGrouping = (el) =>
+          el.classList.contains('row-work-unit-start') ||
+          el.classList.contains('row-work-unit-end') ||
+          el.classList.contains('row-activity-bundle') ||
+          el.classList.contains('row-promoted') ||
+          el.querySelector('.work-unit-ribbon, .work-unit-count, .bundle-count, .bundle-status') !== null ||
+          el.querySelector('.graph-cell rect.graphBundleCapsule, .graph-cell circle.graphBundleTerminal') !== null ||
+          el.hasAttribute('data-activity-bundle') ||
+          el.hasAttribute('data-bundle-count');
+        if (activeProfile === 'raw') {
+          const groupingRows = rowEls.filter(rowHasGrouping).length;
+          const cacheHasMetadata = rowEls.some((el) => {
+            const row = cachedRow(el);
+            return row && (!!row.work_unit || row.promoted || row.activity_bundle);
+          });
+          const rawGated = groupingRows === 0 && cacheHasMetadata;
+          checks.push({
+            name: 'RAW_PROFILE_GATED',
+            pass: rawGated,
+            detail: rawGated
+              ? 'raw rows carry wire metadata but zero grouping/promotion DOM'
+              : 'raw profile leaked grouping DOM: ' + groupingRows +
+                ' rows; cacheHasMetadata=' + cacheHasMetadata,
+          });
+        } else {
+          const markerRows = rowEls.filter(rowHasGrouping).length;
+          checks.push({
+            name: 'ACTIVITY_PROFILE_GROUPING_PRESENT',
+            pass: caps.any ? markerRows > 0 : true,
+            detail: caps.any
+              ? markerRows + ' rows carry grouping/promotion markers'
+              : contractAbsent('grouping/promotion'),
+          });
+        }
+      }
+
+      // Check H: bounded DOM — the virtualized window stays at roughly
+      // viewport + 2*BUFFER rows regardless of the dataset (the renderer's
+      // documented contract), so ribbons/bundles/expansion never explode the
+      // node count.
+      {
+        const domTotal = document.querySelectorAll('*').length;
+        const rendered = rowEls.length;
+        const total = window.__editchainGetTotal ? window.__editchainGetTotal() : -1;
+        const viewportRows = Math.ceil((rowsEl ? rowsEl.clientHeight : 0) / 34);
+        const maxRows = Math.min(total >= 0 ? total : Infinity, viewportRows + 800 + 5);
+        const bounded = rendered > 0 && rendered <= maxRows && domTotal < 12000;
+        checks.push({
+          name: 'WORK_UNITS_DOM_BOUNDED',
+          pass: bounded,
+          detail: 'rows=' + rendered + '/max=' + maxRows + ' domNodes=' + domTotal +
+            (bounded ? ' (bounded)' : ' (over budget)'),
+        });
+      }
+
+      // Check I: narrow-width content containment — at <=480px every summary
+      // descendant (chevron, bundle pills, badges, text) must lay out INSIDE
+      // its row's content track. The chips are flex-shrinkable so a crowded
+      // line ellipsizes instead of crossing the content-cell boundary (the
+      // round-two regression: bundle/outcome chips crossed the track even
+      // when the viewport-level NO_HORIZONTAL_OVERFLOW check could not see
+      // it because the track ends before the viewport edge).
+      if (rowEls.length && window.innerWidth > 0 && window.innerWidth <= 480) {
+        const problems = [];
+        for (const el of rowEls) {
+          const cell = el.querySelector('.text-cell');
+          const summaries = el.querySelectorAll('.summary');
+          if (!cell) { problems.push('row ' + el.getAttribute('data-row') + ': no .text-cell'); continue; }
+          const cellR = cell.getBoundingClientRect();
+          for (const s of summaries) {
+            const sR = s.getBoundingClientRect();
+            if (sR.right > cellR.right + 1) {
+              problems.push('row ' + el.getAttribute('data-row') + ': summary crosses content track');
+              continue;
+            }
+            for (const d of s.querySelectorAll('*')) {
+              const r = d.getBoundingClientRect();
+              if (r.right > cellR.right + 1 || r.left < cellR.left - 1) {
+                problems.push('row ' + el.getAttribute('data-row') + ': <' +
+                  (d.className && typeof d.className === 'string' ? d.className.split(/\s+/).join('.') : d.tagName) +
+                  '> crosses content track');
+                break;
+              }
+            }
+          }
+        }
+        checks.push({
+          name: 'WORK_UNITS_NARROW_CONTAINED',
+          pass: problems.length === 0,
+          detail: problems.length === 0
+            ? 'all summary descendants inside their content cell at ' + window.innerWidth + 'px'
+            : problems.slice(0, 4).join('; '),
+        });
+      }
     }
 
     return checks;
@@ -1506,7 +2729,638 @@
     };
   }
 
+  // --- profile switching ----------------------------------------------------
+
+  // Exercise the Activity -> Raw -> Activity profile switch through the REAL
+  // control path (button clicks), asserting the coherent-reset contract:
+  //   - the request log shows hide_trace flipping false/true on every
+  //     GetWindow/layout follow-up (raw = false, activity = true);
+  //   - switching resets to offset 0 (the first window after each switch is
+  //     requested at offset 0) and rebuilds the expansion snapshot/cache
+  //     (sub_op_counts arrives again, rows re-render);
+  //   - search mode exits: a switch during search results returns to the full
+  //     history view under the new profile;
+  //   - scroll returns to the top (refetch from offset 0);
+  //   - Raw renders trace rows; Activity hides them (traced scenario).
+  async function runProfileSwitch(timeoutMs) {
+    const out = { steps: [] };
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const clickProfile = (name) => {
+      const btn = document.getElementById('profile-' + name);
+      if (!btn) throw new Error('profile button missing: ' + name);
+      btn.click();
+    };
+    const requestLog = () => window.__editchainRequestLog || [];
+    const windowFilters = () => requestLog()
+      .filter((b) => b && b.GetWindow !== undefined)
+      .map((b) => b.GetWindow.filter);
+    const firstWindowOffset = () => {
+      const ws = requestLog().filter((b) => b && b.GetWindow !== undefined);
+      return ws.length ? ws[0].GetWindow.offset : -1;
+    };
+    // Baseline: Activity (default). The FIRST GetWindow must carry
+    // hide_trace=true and start at offset 0.
+    await whenIdle(timeoutMs || 5000);
+    const activityBefore = {
+      profile: window.__editchainGetProfile ? window.__editchainGetProfile() : null,
+      firstFilter: windowFilters()[0] || null,
+      firstOffset: firstWindowOffset(),
+      traceRows: document.querySelectorAll('.row[data-key^="node:t:"][data-key$=":1"], .row[data-key="node:t:1"], .row[data-key="node:t:3"]').length,
+    };
+    out.steps.push({ name: 'activity-default', ...activityBefore });
+
+    // Switch to Raw: hide_trace must flip to false, offset 0 refetch happens,
+    // trace rows appear (traced scenario), scroll resets to the top.
+    window.__editchainClearRequestLog();
+    clickProfile('raw');
+    await whenIdle(timeoutMs || 5000);
+    const rawAfter = {
+      profile: window.__editchainGetProfile ? window.__editchainGetProfile() : null,
+      lastFilter: windowFilters().length ? windowFilters()[windowFilters().length - 1] : null,
+      // The switch REFETCHES from offset 0: the first window issued after the
+      // switch must start at 0 (the progressive loader then pages deeper).
+      firstOffset: firstWindowOffset(),
+      scrollTop: document.getElementById('rows').scrollTop,
+      traceRows: document.querySelectorAll('.row[data-key="node:t:1"], .row[data-key="node:t:3"]').length,
+    };
+    out.steps.push({ name: 'raw', ...rawAfter });
+
+    // Switch back to Activity: hide_trace=true again, trace rows hidden.
+    window.__editchainClearRequestLog();
+    clickProfile('activity');
+    await whenIdle(timeoutMs || 5000);
+    const activityBack = {
+      profile: window.__editchainGetProfile ? window.__editchainGetProfile() : null,
+      lastFilter: windowFilters().length ? windowFilters()[windowFilters().length - 1] : null,
+      firstOffset: firstWindowOffset(),
+      traceRows: document.querySelectorAll('.row[data-key="node:t:1"], .row[data-key="node:t:3"]').length,
+    };
+    out.steps.push({ name: 'activity-back', ...activityBack });
+
+    // A profile switch during SEARCH MODE must exit search and refetch history
+    // under the new profile (search is explicitly unprofiled).
+    const searchInput = document.getElementById('search');
+    searchInput.value = 'tool result';
+    searchInput.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    await whenIdle(timeoutMs || 5000);
+    const inSearch = !!document.querySelector('.search-banner');
+    window.__editchainClearRequestLog();
+    clickProfile('raw');
+    await whenIdle(timeoutMs || 5000);
+    const afterSearchSwitch = {
+      inSearch,
+      bannerAfter: !!(document.querySelector('.search-banner')),
+      profile: window.__editchainGetProfile ? window.__editchainGetProfile() : null,
+      windowsIssued: requestLog().filter((b) => b && b.GetWindow !== undefined).length,
+      traceRows: document.querySelectorAll('.row[data-key="node:t:1"], .row[data-key="node:t:3"]').length,
+    };
+    out.steps.push({ name: 'search-exit-on-switch', ...afterSearchSwitch });
+
+    const s1 = out.steps[0];
+    const s2 = out.steps[1];
+    const s3 = out.steps[2];
+    const s4 = out.steps[3];
+    const pass =
+      s1.profile === 'activity' &&
+      s1.firstFilter && s1.firstFilter.hide_trace === true &&
+      s1.firstOffset === 0 &&
+      s1.traceRows === 0 &&
+      s2.profile === 'raw' &&
+      s2.lastFilter && s2.lastFilter.hide_trace === false &&
+      s2.firstOffset === 0 &&
+      s2.scrollTop === 0 &&
+      s2.traceRows === 2 &&
+      s3.profile === 'activity' &&
+      s3.lastFilter && s3.lastFilter.hide_trace === true &&
+      s3.firstOffset === 0 &&
+      s3.traceRows === 0 &&
+      s4.inSearch === true &&
+      s4.bannerAfter === false &&
+      s4.windowsIssued > 0 &&
+      s4.traceRows === 2;
+    out.pass = pass;
+    return out;
+  }
+
+  // --- single-pane activation vs disclosure routing ------------------------
+
+  // A row click must SELECT inline without fetching details or opening another
+  // surface. Double-click is the explicit raw-JSON editor activation; both the
+  // explicit chevron and its full parent row toggle bundled sub-ops.
+  async function runSinglePaneRouting(timeoutMs) {
+    const out = { steps: [] };
+    const captured = [];
+    const origPost = window.vscode.postMessage.bind(window.vscode);
+    window.vscode.postMessage = function (msg) {
+      if (msg && msg.type === 'openJson') captured.push(msg);
+      return origPost(msg);
+    };
+    await whenIdle(timeoutMs || 5000);
+    const rowEls = Array.from(document.querySelectorAll('.row:not(.row-placeholder)'));
+    const rawCapable = rowEls.find((el) => {
+      const abs = Number(el.getAttribute('data-row'));
+      const row = window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
+      return row && (row.op_id || row.git_oid) && !(row.sub_ops || []).length;
+    });
+    if (!rawCapable) throw new Error('no raw-JSON-capable rendered row');
+    const key = rawCapable.getAttribute('data-key');
+    const absIdx = Number(rawCapable.getAttribute('data-row'));
+    const row = window.__editchainRowAt(absIdx);
+    const objectReqBefore = (window.__editchainRequestLog || [])
+      .filter((b) => b && (b.GetNodeDetails !== undefined || b.ResolveObject !== undefined)).length;
+    rawCapable.click();
+    await whenIdle(timeoutMs || 5000);
+    const layoutEl = document.getElementById('layout');
+    const objectReqAfterClick = (window.__editchainRequestLog || [])
+      .filter((b) => b && (b.GetNodeDetails !== undefined || b.ResolveObject !== undefined));
+    const selected = document.querySelector('.row.row-selected');
+    out.steps.push({
+      name: 'row-click',
+      key,
+      secondaryPane: !!document.getElementById('detail') ||
+        !!(layoutEl && layoutEl.classList.contains('has-detail')),
+      editorOpened: captured.length > 0,
+      objectRequestIssued: objectReqAfterClick.length > objectReqBefore,
+      selectedKey: selected ? selected.getAttribute('data-key') : null,
+    });
+
+    rawCapable.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+    await whenIdle(timeoutMs || 5000);
+    const activation = captured[captured.length - 1] || null;
+    const isGit = !!(row && row.git_oid);
+    out.steps.push({
+      name: 'double-click-raw',
+      editorOpened: captured.length === 1,
+      identityMatches: !!activation && (isGit
+        ? activation.git_oid === row.git_oid && activation.repository === row.repository && !activation.op_id
+        : activation.op_id === row.op_id && !activation.git_oid),
+      secondaryPane: !!document.getElementById('detail') ||
+        !!(layoutEl && layoutEl.classList.contains('has-detail')),
+    });
+
+    // Disclosure routing: on a combined row, chevron and full-row clicks must
+    // toggle without opening raw JSON or another pane. Re-query around each
+    // interaction because expansion rebuilds the rows.
+    const chevronBtn = document.querySelector('.row .subop-chevron');
+    if (chevronBtn) {
+      const chevronRow = chevronBtn.closest('.row');
+      const abs = Number(chevronRow.getAttribute('data-row'));
+      const cRow = window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
+      const hadSubops = !!cRow && (cRow.sub_ops || []).length > 0;
+      const expandedBefore = chevronRow.getAttribute('aria-expanded');
+      const chevronKey = chevronRow.getAttribute('data-key');
+      const activationsBeforeChevron = captured.length;
+      chevronBtn.click();
+      await whenIdle(timeoutMs || 5000);
+      const freshRow = Array.from(document.querySelectorAll('.row')).find(
+        (r) => r.getAttribute('data-key') === chevronKey
+      );
+      const expandedAfter = freshRow ? freshRow.getAttribute('aria-expanded') : null;
+      const subopRows = document.querySelectorAll('.row.row-subop').length;
+      const activationsBeforeDoubleClick = captured.length;
+      const freshChevron = freshRow && freshRow.querySelector('.subop-chevron');
+      if (freshChevron) freshChevron.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+      if (freshRow) freshRow.click();
+      await whenIdle(timeoutMs || 5000);
+      const afterRowClick = Array.from(document.querySelectorAll('.row')).find(
+        (r) => r.getAttribute('data-key') === chevronKey
+      );
+      const expandedAfterRowClick = afterRowClick
+        ? afterRowClick.getAttribute('aria-expanded')
+        : null;
+      out.steps.push({
+        name: 'disclosure-routing',
+        hadSubops,
+        expandedBefore,
+        expandedAfter,
+        subopRows,
+        rawActivationChanged: captured.length !== activationsBeforeChevron,
+        chevronDoubleClickOpenedRaw: captured.length !== activationsBeforeDoubleClick,
+        secondaryPane: !!document.getElementById('detail') ||
+          !!(layoutEl && layoutEl.classList.contains('has-detail')),
+        toggled: hadSubops && expandedBefore !== expandedAfter,
+        rowToggled: expandedAfter !== expandedAfterRowClick,
+      });
+    } else {
+      out.steps.push({
+        name: 'disclosure-routing',
+        skipped: true,
+        detail: 'no combined row rendered in this scenario (skipped)',
+      });
+    }
+
+    window.vscode.postMessage = origPost;
+
+    const s1 = out.steps[0];
+    const s2 = out.steps[1];
+    const s3 = out.steps[2];
+    out.pass =
+      s1.secondaryPane === false &&
+      s1.editorOpened === false &&
+      s1.objectRequestIssued === false &&
+      s1.selectedKey === s1.key &&
+      s2.editorOpened === true &&
+      s2.identityMatches === true &&
+      s2.secondaryPane === false &&
+      (s3.skipped || (s3.toggled === true &&
+        s3.rowToggled === true &&
+        s3.rawActivationChanged === false &&
+        s3.chevronDoubleClickOpenedRaw === false && s3.secondaryPane === false));
+    return out;
+  }
+
+  // --- keyboard activation --------------------------------------------------
+
+  // Enter on a focused ordinary row opens raw JSON; Space on a combined row
+  // toggles its bundled sub-ops; the chevron button stays natively operable.
+  async function runKeyboardProbe(timeoutMs) {
+    const out = { steps: [] };
+    const captured = [];
+    const origPost = window.vscode.postMessage.bind(window.vscode);
+    window.vscode.postMessage = function (msg) {
+      if (msg && msg.type === 'openJson') captured.push(msg);
+      return origPost(msg);
+    };
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    await whenIdle(timeoutMs || 5000);
+    const layoutEl = document.getElementById('layout');
+    const wrap = document.querySelector('.table-wrap');
+    const header = document.querySelector('.tbl-header');
+    const rowEls = Array.from(document.querySelectorAll('.row:not(.row-placeholder)'));
+
+    // a11y structure: ONE labelled grid wrapper owns the sticky header row
+    // (its columnheaders must be INSIDE role=grid, not orphaned) and the data
+    // rows; exactly one row carries tabindex=0 (roving tabindex), so Tab
+    // enters/exits the grid as a unit instead of tabbing every virtualized row.
+    const grids = Array.from(document.querySelectorAll('[role="grid"]'));
+    const grid = document.querySelector('.tbl-grid');
+    const gridOk = grids.length === 1 &&
+      grid === wrap.closest('.tbl-grid') &&
+      header && grid && grid.contains(header) &&
+      grid.getAttribute('aria-label') === 'History rows' &&
+      Number(grid.getAttribute('aria-rowcount')) >= 0;
+    const tabbable = rowEls.filter((el) => el.tabIndex === 0);
+    const allRowsTabbable = rowEls.filter((el) => el.tabIndex === 0).length;
+    out.steps.push({
+      name: 'grid-structure',
+      gridCount: grids.length,
+      gridOk,
+      rovingRows: tabbable.length,
+      allRowsTabbable,
+    });
+
+    const rovingRow = tabbable[0] || rowEls[0];
+    const rawCapable = (el) => {
+      const abs = Number(el.getAttribute('data-row'));
+      const row = window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
+      return row && (row.op_id || row.git_oid) && !(row.sub_ops || []).length;
+    };
+    const target = rawCapable(rovingRow) ? rovingRow : rowEls.find(rawCapable);
+    if (!target) throw new Error('no keyboard-capable rendered row');
+
+    target.focus();
+    target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    await whenIdle(timeoutMs || 5000);
+    const enterActivated = captured.length === 1;
+    const enterSelected = !!document.querySelector('.row.row-selected');
+    const secondaryPane = !!document.getElementById('detail') ||
+      !!(layoutEl && layoutEl.classList.contains('has-detail'));
+    out.steps.push({ name: 'enter-activates', enterActivated, enterSelected, secondaryPane });
+
+    // Roving navigation: ArrowDown must move focus to the NEXT rendered row and
+    // re-pin the single tab stop to it (the previous row drops to -1).
+    const allRows = Array.from(document.querySelectorAll('.table-wrap .row'));
+    const rovingNow = allRows.find((r) => r.tabIndex === 0) || allRows[0];
+    const rovingIdx = rovingNow ? allRows.indexOf(rovingNow) : -1;
+    const nextRow = rovingIdx >= 0 && rovingIdx + 1 < allRows.length ? allRows[rovingIdx + 1] : null;
+    if (nextRow && rovingNow) {
+      rovingNow.focus();
+      rovingNow.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+      await sleep(200);
+      // Compare by data-row, not element identity: a pending debounced width
+      // recompute may rebuild the rows during the wait (focus is preserved by
+      // the renderer, but the element object is replaced).
+      const focused = document.activeElement;
+      const focusedIsRow = focused && focused.classList && focused.classList.contains('row');
+      const rovingAfter = Array.from(document.querySelectorAll('.row')).filter((r) => r.tabIndex === 0);
+      const moved = focusedIsRow &&
+        focused.getAttribute('data-row') === nextRow.getAttribute('data-row') &&
+        rovingAfter.length === 1;
+      out.steps.push({
+        name: 'arrow-down-roves',
+        moved,
+        focusedRow: focusedIsRow ? focused.getAttribute('data-row') : null,
+        expectedRow: nextRow.getAttribute('data-row'),
+        rovingAfter: rovingAfter.length,
+      });
+    } else {
+      out.steps.push({ name: 'arrow-down-roves', skipped: true });
+    }
+
+    const chevronBtn = document.querySelector('.row .subop-chevron');
+    if (chevronBtn) {
+      const chevronRow = chevronBtn.closest('.row');
+      const chevronKey = chevronRow.getAttribute('data-key');
+      const expandedBefore = chevronRow.getAttribute('aria-expanded');
+      chevronRow.focus();
+      chevronRow.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true }));
+      await sleep(200);
+      const freshRow = Array.from(document.querySelectorAll('.row')).find(
+        (r) => r.getAttribute('data-key') === chevronKey
+      );
+      const expandedAfter = freshRow ? freshRow.getAttribute('aria-expanded') : null;
+      out.steps.push({
+        name: 'space-expands',
+        expandedBefore,
+        expandedAfter,
+        toggled: expandedBefore !== expandedAfter,
+      });
+    } else {
+      out.steps.push({ name: 'space-expands', skipped: true });
+    }
+
+    // Sticky header inside the labelled grid wrapper: the a11y restructure
+    // moved the header row under .tbl-grid — it must STILL pin to the top of
+    // the #rows scrollport while the table scrolls.
+    const rowsEl = document.getElementById('rows');
+    const rowsTop = rowsEl ? rowsEl.getBoundingClientRect().top : 0;
+    const scrollable = rowsEl && rowsEl.scrollHeight > rowsEl.clientHeight + 100;
+    if (scrollable) {
+      rowsEl.scrollTop = Math.min(2000, rowsEl.scrollHeight - rowsEl.clientHeight);
+      await sleep(200);
+      // Re-query the header AFTER scrolling: scroll-driven syncWindow (or a
+      // still-pending debounced width recompute) can rebuild the table, which
+      // replaces the header element (the sticky CONTRACT — pinned to the
+      // #rows scrollport — is what's under test, not a specific element).
+      const headerNow = document.querySelector('.tbl-header');
+      const headerTop = headerNow ? headerNow.getBoundingClientRect().top : NaN;
+      const pinned = Math.abs(headerTop - rowsTop) <= 1;
+      out.steps.push({
+        name: 'sticky-header',
+        pinned,
+        headerTop: Math.round(headerTop * 10) / 10,
+        rowsTop: Math.round(rowsTop * 10) / 10,
+      });
+      rowsEl.scrollTop = 0;
+      await sleep(200);
+    } else {
+      out.steps.push({ name: 'sticky-header', skipped: true });
+    }
+
+    const s0 = out.steps[0];
+    const s1 = out.steps[1];
+    const s2 = out.steps[2];
+    const s3 = out.steps[3];
+    const s4 = out.steps[4];
+    window.vscode.postMessage = origPost;
+    out.pass =
+      s0.gridOk === true &&
+      s0.rovingRows === 1 &&
+      s1.enterActivated === true &&
+      s1.enterSelected === true &&
+      s1.secondaryPane === false &&
+      (s2.skipped || s2.moved === true) &&
+      (s3.skipped || s3.toggled === true) &&
+      (s4.skipped || s4.pinned === true);
+    return out;
+  }
+
+  // --- persisted-viewport restore regression ---------------------------------
+
+  // Replayed open/reveal into a SURVIVING context must restore the persisted
+  // scroll position without first clobbering the persisted topRow with a
+  // transient 0. open() used to call setProfile(restored.profile,
+  // { reset:false }), which persisted saveState() with scrollTop still 0 — BEFORE
+  // restoreScrollTop(restored.topRow) ran — so a real context recreation lost
+  // the saved position to the transient write. The open/reveal handlers now
+  // persist the profile with `persist:false` during restore and saveState()
+  // once the restored position is actually applied.
+  async function runRestoreStateProbe(timeoutMs) {
+    const out = { steps: [], pass: false, detail: null };
+    const SAVE_TOP_ROW = 40; // must be within the fixture's visible row range
+    const ROW_H = 34;
+    const expectedScrollTop = SAVE_TOP_ROW * ROW_H;
+    await whenIdle(timeoutMs || 5000);
+    const rowsEl = document.getElementById('rows');
+
+    out.steps.push({
+      name: 'seed',
+      persistedBefore: window.vscode.getState(),
+      totalVisibleBefore: document.querySelectorAll('.row').length,
+    });
+    // Emulate a recreated context carrying a saved viewport: seed persisted
+    // state exactly as saveState() writes it, then replay the extension
+    // host's open + ready handshake.
+    window.vscode.setState({ profile: 'activity', topRow: SAVE_TOP_ROW });
+    window.__editchainClearRequestLog();
+    window.__editchainStart();
+    await whenIdle(timeoutMs || 10000);
+
+    const persistedAfter = window.vscode.getState();
+    out.steps.push({
+      name: 'after-reopen',
+      scrollTop: rowsEl ? rowsEl.scrollTop : -1,
+      persistedAfter,
+      rowsRendered: document.querySelectorAll('.row:not(.row-placeholder)').length,
+    });
+
+    const s2 = out.steps[1];
+    const restoredNotZero = s2.persistedAfter && s2.persistedAfter.topRow === SAVE_TOP_ROW;
+    const scrollApplied = s2.scrollTop === expectedScrollTop;
+    out.pass = restoredNotZero && scrollApplied &&
+      (s2.persistedAfter && s2.persistedAfter.profile === 'activity');
+    out.detail = {
+      expectedScrollTop,
+      actualScrollTop: s2.scrollTop,
+      persistedAfter: JSON.stringify(s2.persistedAfter),
+    };
+    return out;
+  }
+
   // --- expose ----------------------------------------------------------------
+
+  // Compact capability + gating state for the parallel renderer contract
+  // (domRace / ui-dump / e2e arm or skip DOM assertions from this
+  // deterministically). Marker counts are read from the CURRENT profile's
+  // DOM; call while the Activity profile is active to probe capability.
+  function workUnitContractState() {
+    const profile = typeof window.__editchainGetProfile === 'function'
+      ? window.__editchainGetProfile() : 'activity';
+    const sel = (s) => document.querySelectorAll(s).length;
+    const workUnit = sel('.row-work-unit-start, .row-work-unit-end, .work-unit-ribbon, .work-unit-count');
+    const bundle = sel('.row-activity-bundle, .bundle-count, .bundle-status, [data-activity-bundle], [data-bundle-count]');
+    const promoted = sel('.row-promoted');
+    const capsule = sel('.graph-cell rect.graphBundleCapsule, .graph-cell circle.graphBundleTerminal');
+    const rowEls = Array.from(document.querySelectorAll('.row:not(.row-placeholder)'));
+    const cacheHasMetadata = rowEls.some((el) => {
+      const abs = Number(el.getAttribute('data-row'));
+      const row = window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
+      return row && (!!row.work_unit || row.promoted || row.activity_bundle);
+    });
+    return {
+      profile,
+      markers: { workUnit, bundle, promoted, capsule },
+      any: workUnit + bundle + promoted + capsule > 0,
+      rowsRendered: rowEls.length,
+      cacheHasMetadata,
+    };
+  }
+
+  // Round-two work-unit/bundle interaction probe: drives the REAL DOM with
+  // keyboard events (no synthetic renderer calls) and asserts the parallel
+  // contract's expand/collapse + roving-focus behaviour:
+  //   - baseline: exactly one roving tab stop; the typed bundle row renders
+  //     collapsed (aria-expanded="false") and un-expanded (no member rows);
+  //   - ArrowRight on the collapsed bundle row EXPANDS it (aria-expanded
+  //     "true", member sub-op rows appear) and the single roving tab stop
+  //     survives the DOM rebuild;
+  //   - ArrowLeft COLLAPSES it (members removed, aria-expanded "false");
+  //   - Space and Enter on the bundle row toggle expansion per the ARIA
+  //     pattern instead of opening another surface;
+  //   - ArrowUp/Down keep roving focus moving row-to-row without touching
+  //     expansion state or opening another surface.
+  // When the renderer has not landed the contract, returns pass:true with
+  // skipped evidence (no markers to drive deterministically yet).
+  async function runWorkUnitProbe(timeoutMs) {
+    const out = { steps: [], pass: false, skipped: false, detail: null };
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    await whenIdle(timeoutMs || 5000);
+    const layoutEl = document.getElementById('layout');
+    const secondaryPanePresent = () => !!document.getElementById('detail') ||
+      !!(layoutEl && layoutEl.classList.contains('has-detail'));
+    const BUNDLE_KEY = 'wu:run1';
+    const rowByKey = (key) =>
+      Array.from(document.querySelectorAll('.row')).find((r) => r.getAttribute('data-key') === key);
+    const rovingCount = () =>
+      Array.from(document.querySelectorAll('.row')).filter((r) => r.tabIndex === 0).length;
+    const subopCount = () => document.querySelectorAll('.row.row-subop').length;
+    const press = (el, key) => {
+      el.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
+    };
+    const activeKey = () => {
+      const a = document.activeElement;
+      return a && a.closest && a.closest('.row')
+        ? a.closest('.row').getAttribute('data-key') : null;
+    };
+
+    const baseline = (() => {
+      const bundleRow = rowByKey(BUNDLE_KEY);
+      return {
+        contractPresent: !!bundleRow && bundleRow.hasAttribute('data-activity-bundle'),
+        bundleAria: bundleRow ? bundleRow.getAttribute('aria-expanded') : null,
+        rovingTabs: rovingCount(),
+        subopRows: subopCount(),
+        rowsRendered: document.querySelectorAll('.row').length,
+      };
+    })();
+    out.steps.push({ name: 'baseline', ...baseline });
+    if (!baseline.contractPresent) {
+      out.skipped = true;
+      out.detail = 'renderer contract not present: no typed bundle row with data-activity-bundle rendered (deferred until media/main.js lands the parallel contract)';
+      out.pass = true;
+      return out;
+    }
+
+    // ArrowRight expands the collapsed bundle row.
+    let bundleRow = rowByKey(BUNDLE_KEY);
+    bundleRow.focus();
+    press(bundleRow, 'ArrowRight');
+    await whenIdle(timeoutMs || 5000);
+    bundleRow = rowByKey(BUNDLE_KEY);
+    out.steps.push({
+      name: 'arrow-right-expands',
+      bundleAria: bundleRow ? bundleRow.getAttribute('aria-expanded') : null,
+      subopRows: subopCount(),
+      rovingTabs: rovingCount(),
+      secondaryPane: secondaryPanePresent(),
+    });
+
+    // ArrowLeft collapses.
+    bundleRow.focus();
+    press(bundleRow, 'ArrowLeft');
+    await whenIdle(timeoutMs || 5000);
+    bundleRow = rowByKey(BUNDLE_KEY);
+    out.steps.push({
+      name: 'arrow-left-collapses',
+      bundleAria: bundleRow ? bundleRow.getAttribute('aria-expanded') : null,
+      subopRows: subopCount(),
+      rovingTabs: rovingCount(),
+    });
+
+    // Space expands (ARIA toggle) without opening another surface.
+    bundleRow.focus();
+    press(bundleRow, ' ');
+    await whenIdle(timeoutMs || 5000);
+    bundleRow = rowByKey(BUNDLE_KEY);
+    out.steps.push({
+      name: 'space-expands',
+      bundleAria: bundleRow ? bundleRow.getAttribute('aria-expanded') : null,
+      subopRows: subopCount(),
+      secondaryPane: secondaryPanePresent(),
+    });
+
+    // Enter on the collapsed bundle row also expands it inline.
+    bundleRow.focus();
+    press(bundleRow, 'ArrowLeft'); // ensure collapsed before the Enter case
+    await whenIdle(timeoutMs || 5000);
+    bundleRow = rowByKey(BUNDLE_KEY);
+    bundleRow.focus();
+    press(bundleRow, 'Enter');
+    await whenIdle(timeoutMs || 5000);
+    bundleRow = rowByKey(BUNDLE_KEY);
+    out.steps.push({
+      name: 'enter-expands',
+      bundleAria: bundleRow ? bundleRow.getAttribute('aria-expanded') : null,
+      subopRows: subopCount(),
+      secondaryPane: secondaryPanePresent(),
+    });
+
+    // ArrowUp/Down roving stays stable: focus moves row-to-row, expansion
+    // state is untouched, and no secondary surface opens. Collapse the bundle first so
+    // the adjacent rows are the plain top-level rows (wu:req2 idx 1 -> bundle
+    // idx 2 -> wu:run2 idx 3), then verify the arrow moves land exactly there.
+    bundleRow.focus();
+    press(bundleRow, 'ArrowLeft');
+    await whenIdle(timeoutMs || 5000);
+    bundleRow = rowByKey(BUNDLE_KEY);
+    const ariaBeforeRove = bundleRow ? bundleRow.getAttribute('aria-expanded') : null;
+    const upTarget = rowByKey('wu:req2');
+    upTarget.focus();
+    press(upTarget, 'ArrowDown');
+    const movedToBundle = activeKey() === BUNDLE_KEY;
+    press(document.activeElement.closest('.row'), 'ArrowDown');
+    const movedPast = activeKey() === 'wu:run2';
+    out.steps.push({
+      name: 'roving-focus-stable',
+      movedToBundle,
+      movedPast,
+      activeKey: activeKey(),
+      bundleAriaBefore: ariaBeforeRove,
+      bundleAriaAfter: rowByKey(BUNDLE_KEY) ? rowByKey(BUNDLE_KEY).getAttribute('aria-expanded') : null,
+      rovingTabs: rovingCount(),
+      secondaryPane: secondaryPanePresent(),
+    });
+
+    const s = out.steps;
+    const s1 = s[1], s2 = s[2], s3 = s[3], s4 = s[4], s5 = s[5];
+    const expandedOk = s1.bundleAria === 'true' && s1.subopRows > 0 &&
+      s1.rovingTabs === 1 && s1.secondaryPane === false;
+    const collapsedOk = s2.bundleAria === 'false' && s2.subopRows === 0 &&
+      s2.rovingTabs === 1;
+    const spaceOk = s3.bundleAria === 'true' && s3.subopRows > 0 &&
+      s3.secondaryPane === false;
+    const enterOk = s4.bundleAria === 'true' && s4.subopRows > 0 &&
+      s4.secondaryPane === false;
+    const roveOk = s5.movedToBundle === true && s5.movedPast === true &&
+      s5.rovingTabs === 1 && s5.secondaryPane === false &&
+      s5.bundleAriaBefore === s5.bundleAriaAfter;
+    out.pass = expandedOk && collapsedOk && spaceOk && enterOk && roveOk;
+    out.detail = {
+      expandedOk, collapsedOk, spaceOk, enterOk, roveOk,
+      steps: out.steps.map((x) => ({ name: x.name, bundleAria: x.bundleAria, subopRows: x.subopRows })),
+    };
+    return out;
+  }
 
   window.__editchainDebug = {
     whenIdle,
@@ -1515,6 +3369,12 @@
     getMetrics,
     runSearch,
     runReversedSearchRace,
+    runProfileSwitch,
+    runSinglePaneRouting,
+    runKeyboardProbe,
+    runRestoreStateProbe,
+    runWorkUnitProbe,
+    workUnitContractState,
     captureResizeMetrics,
     evaluateResizeAssert,
   };

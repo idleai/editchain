@@ -119,6 +119,18 @@
 //! Large values spill to blob storage through [`crate::sink::payload_for`]
 //! exactly like the raw lane. Unknown or future item kinds stay raw-only.
 //!
+//! ## Session Git base
+//!
+//! Codex's `session_meta.git.commit_hash` is the sole source of session-to-Git
+//! anchoring. When that value is a full SHA-1/SHA-256 OID and the projected
+//! `sessionMeta.cwd` resolves to an actual repository marker inside the
+//! workspace, the importer emits one durable `GitLinkKind::BasedOn` relation
+//! from the raw `session_meta` op to that exact commit. Missing/invalid metadata
+//! yields no relation. Command text, operation timestamps, and later turns are
+//! never inspected or matched to commits. A versioned cursor checkpoint runs
+//! this as a metadata-only one-time backfill for already-imported rollouts,
+//! without replaying their raw or conversational rows.
+//!
 //! ## Structural topology
 //!
 //! Relationship edges are never inferred from raw records — they come only
@@ -167,6 +179,8 @@ pub mod link;
 pub mod normalize;
 /// Projection parsing, validation, and item folding.
 pub mod projection;
+/// Exact session-start Git anchoring from Codex metadata.
+mod session_git;
 
 pub use discover::{discover_rollouts, RolloutFile};
 pub use helper::HelperCommand;
@@ -179,5 +193,5 @@ pub use normalize::{
 };
 pub use projection::{
     parse_projection, CompactedLine, FinalItem, InterAgentLine, Projection, ProjectionError,
-    ProjectionItem, ProjectionKind, SessionMeta, TurnMeta,
+    ProjectionItem, ProjectionKind, SessionGitMeta, SessionMeta, TurnMeta,
 };

@@ -5,15 +5,19 @@
 //! intentionally free of filesystem and process dependencies so it can later
 //! target WASM.
 
-// Crate-level dependency marker (used by Cargo for feature resolution).
+// Crate-level dependency markers (used by Cargo for feature resolution).
 use regex as _;
+use serde as _;
 
 /// General chain filtering with truncation.
+pub mod activity;
 pub mod filter;
 /// Deterministic lane layout for graph rendering.
 pub mod layout;
-/// History linking — stitch sessions and git into a single edit chain.
-pub mod link;
+/// Deterministic semantic metadata for projected history rows.
+pub mod meta;
+/// Provider-neutral readability taxonomy shared with the protocol layer.
+pub mod taxonomy;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,7 +28,8 @@ use editchain_core::{
 };
 
 use crate::layout::{compute_graph_layout, compute_lane_assignment, GraphLayout, GraphRow};
-use crate::link::link_history_links;
+use crate::meta::NodeMeta;
+use crate::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility as RowVisibility};
 
 /// Provenance of a node's effective display time.
 ///
@@ -76,6 +81,69 @@ pub enum HistoryNode {
         /// user-facing content; they hang off this real turn/tool node rather
         /// than occupying their own graph row/lane.
         sub_ops: Vec<Arc<Op>>,
+        /// Deterministic semantic readability metadata derived from the raw
+        /// envelope and normalized children (see [`crate::meta`]).
+        meta: NodeMeta,
+    },
+    /// A synthetic Activity-view summary node folding a maximal contiguous run
+    /// of low-signal execute rows (see [`crate::activity::bundle_activity_execute_runs`]).
+    ///
+    /// The original rows are preserved as expandable members (backing
+    /// [`HistoryNode::sub_ops`]), so the client's existing sub-op expansion and
+    /// `sub_op_counts` virtualization work unchanged and every folded record
+    /// stays retrievable/inspectable by its real op id. The node key is the
+    /// newest member's op id, so the bundle contracts into the run's newest
+    /// display slot and causal children keep pointing at a real present key.
+    ExecuteBundle {
+        /// The newest member's op (identity/time/group anchor).
+        anchor: Arc<Op>,
+        /// Effective display time of the anchor member.
+        source_time: EffectiveTime,
+        /// The original top-level member rows, newest-first (display order).
+        /// Used to render faithful expandable sub-op labels.
+        member_nodes: Vec<HistoryNode>,
+        /// Flat expandable sub-op ops: every member's op followed by its own
+        /// bundled metadata sub-ops, newest-first. Backs [`HistoryNode::sub_ops`]
+        /// so expansion counts and paging indices work unchanged.
+        members: Vec<Arc<Op>>,
+        /// Synthetic display summary ("N tool steps" / "N commands").
+        summary: String,
+        /// Dominant member kind tag (e.g. "tool", "command").
+        kind: String,
+        /// Author label derived from the members (`human` / `agent` / `system`).
+        author: String,
+        /// Deterministic semantic metadata (Execute / Primary; outcome is
+        /// `Success` only when every member is structured-successful, else
+        /// conservatively `Unknown`).
+        meta: NodeMeta,
+    },
+    /// A synthetic Activity-view summary node folding adjacent Plan rows that
+    /// repeat the same normalized heading (see
+    /// [`crate::activity::bundle_activity_plan_repeats`]).
+    ///
+    /// This is a display-only contraction, not importer deduplication. Every
+    /// original reasoning record remains an expandable member with its real op
+    /// id, timestamp, raw details, and causal position. The node key is the
+    /// newest member's op id so the bundle occupies one point on the existing
+    /// linear path instead of introducing a branch.
+    PlanBundle {
+        /// The newest member's op (identity/time/group anchor).
+        anchor: Arc<Op>,
+        /// Effective display time of the anchor member.
+        source_time: EffectiveTime,
+        /// Original top-level Plan rows, newest-first (display order).
+        member_nodes: Vec<HistoryNode>,
+        /// Flat expandable ops: every member's op followed by its own bundled
+        /// metadata sub-ops, newest-first.
+        members: Vec<Arc<Op>>,
+        /// The repeated heading, preserving the newest member's presentation.
+        summary: String,
+        /// Dominant member kind tag (normally `"reflection"`).
+        kind: String,
+        /// Author label derived from the members.
+        author: String,
+        /// Deterministic semantic metadata (Narrative / Plan / Primary).
+        meta: NodeMeta,
     },
     /// A `Git` commit entity.
     GitCommit(Box<GitCommitEntity>),
@@ -95,6 +163,9 @@ impl HistoryNode {
             Self::CollapsedImport {
                 summary, sub_ops, ..
             } => combined_summary(summary, sub_ops),
+            Self::ExecuteBundle { summary, .. } | Self::PlanBundle { summary, .. } => {
+                summary.clone()
+            }
             Self::GitCommit(commit) => match &commit.message {
                 Payload::Inline(b) => String::from_utf8_lossy(b).to_string(),
                 Payload::Empty | Payload::Blob(_) => commit.oid.to_hex(),
@@ -127,9 +198,10 @@ impl HistoryNode {
     #[must_use]
     pub fn effective_time(&self) -> EffectiveTime {
         match self {
-            Self::EditOperation { source_time, .. } | Self::CollapsedImport { source_time, .. } => {
-                *source_time
-            }
+            Self::EditOperation { source_time, .. }
+            | Self::CollapsedImport { source_time, .. }
+            | Self::ExecuteBundle { source_time, .. }
+            | Self::PlanBundle { source_time, .. } => *source_time,
             Self::GitCommit(commit) => {
                 let secs = u64::try_from(commit.committed_at).unwrap_or(0);
                 EffectiveTime::Observed(secs.saturating_mul(1000))
@@ -149,7 +221,10 @@ impl HistoryNode {
     /// never carries a fabricated timestamp (DR invariant 8).
     pub fn set_bundle_anchor(&mut self, ms: u64) {
         match self {
-            Self::EditOperation { source_time, .. } | Self::CollapsedImport { source_time, .. } => {
+            Self::EditOperation { source_time, .. }
+            | Self::CollapsedImport { source_time, .. }
+            | Self::ExecuteBundle { source_time, .. }
+            | Self::PlanBundle { source_time, .. } => {
                 *source_time = EffectiveTime::BundleAnchor(ms);
             }
             Self::GitCommit(commit) => {
@@ -164,6 +239,7 @@ impl HistoryNode {
     pub fn op_id(&self) -> Option<OpId> {
         match self {
             Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => Some(op.id),
+            Self::ExecuteBundle { anchor, .. } | Self::PlanBundle { anchor, .. } => Some(anchor.id),
             Self::GitCommit(_) => None,
         }
     }
@@ -172,7 +248,10 @@ impl HistoryNode {
     #[must_use]
     pub fn git_oid(&self) -> Option<GitOid> {
         match self {
-            Self::EditOperation { .. } | Self::CollapsedImport { .. } => None,
+            Self::EditOperation { .. }
+            | Self::CollapsedImport { .. }
+            | Self::ExecuteBundle { .. }
+            | Self::PlanBundle { .. } => None,
             Self::GitCommit(commit) => Some(commit.oid),
         }
     }
@@ -181,7 +260,10 @@ impl HistoryNode {
     #[must_use]
     pub fn repository(&self) -> Option<RepositoryId> {
         match self {
-            Self::EditOperation { .. } | Self::CollapsedImport { .. } => None,
+            Self::EditOperation { .. }
+            | Self::CollapsedImport { .. }
+            | Self::ExecuteBundle { .. }
+            | Self::PlanBundle { .. } => None,
             Self::GitCommit(commit) => Some(commit.repository),
         }
     }
@@ -200,6 +282,9 @@ impl HistoryNode {
                 | editchain_core::ScopeRef::Turn(_)
                 | editchain_core::ScopeRef::File(_) => "ops".to_string(),
             },
+            Self::ExecuteBundle { anchor, .. } | Self::PlanBundle { anchor, .. } => {
+                bundle_group(anchor)
+            }
             Self::GitCommit(commit) => format!("repo:{}", commit.repository.0),
         }
     }
@@ -211,6 +296,11 @@ impl HistoryNode {
     pub fn node_key(&self) -> String {
         match self {
             Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => op.id.to_string(),
+            // The bundle contracts into its newest member's display slot, so its
+            // key IS the anchor's real op id: causal children keep resolving.
+            Self::ExecuteBundle { anchor, .. } | Self::PlanBundle { anchor, .. } => {
+                anchor.id.to_string()
+            }
             Self::GitCommit(commit) => commit.oid.to_hex(),
         }
     }
@@ -218,13 +308,12 @@ impl HistoryNode {
     /// Returns the parent node keys for drawing graph edges.
     ///
     /// For `EditChain` ops, this includes the causal `Op.parents`, graph-bearing
-    /// git links (whose target OID hex becomes a parent key), and — when `notes`
+    /// explicit git links (whose target OID hex becomes a parent key), and — when `notes`
     /// annotates this op as the causal parent of a structural relationship note
-    /// — the note's target as a *virtual* parent. Inferred `BasedOn` links are
-    /// intentionally excluded: they remain provenance in [`GitProjection`] but
-    /// must not turn unrelated sessions into sibling causal branches or hold a
-    /// render lane open until a shared commit. Virtual parents let fork/subagent
-    /// branches render without mutating stored causality (SPEC §1.1, §5).
+    /// — the note's target as a *virtual* parent. Git links are explicit stored
+    /// relations; no timestamp/text inference is performed by this projection.
+    /// Virtual parents let fork/subagent branches render without mutating stored
+    /// causality (SPEC §1.1, §5).
     /// `notes` maps a causal parent op id to the structural notes that annotate
     /// it.
     ///
@@ -257,9 +346,6 @@ impl HistoryNode {
                 for source in std::iter::once(op).chain(self.sub_ops()) {
                     if let Some(links) = git_links.get(&source.id) {
                         for link in links {
-                            if matches!(&link.kind, editchain_core::GitLinkKind::BasedOn) {
-                                continue;
-                            }
                             let key = link.target_oid.to_hex();
                             if seen.insert(key.clone()) {
                                 keys.push(key);
@@ -282,6 +368,39 @@ impl HistoryNode {
                                     keys.push(key);
                                 }
                             }
+                        }
+                    }
+                }
+                keys
+            }
+            Self::ExecuteBundle {
+                member_nodes,
+                members,
+                ..
+            }
+            | Self::PlanBundle {
+                member_nodes,
+                members,
+                ..
+            } => {
+                // The bundle contracts a whole run, so it inherits the union of
+                // every member's EXTERNAL parent keys (stored causal parents,
+                // git-link targets, and virtual note targets, each already
+                // deduplicated per member). Intra-run member keys are dropped:
+                // those slots no longer render. In a linear chain the anchor's
+                // own parents are intra-run, so this union — not just the
+                // anchor's parents — is what keeps the run's incoming edges.
+                let member_keys: std::collections::HashSet<String> =
+                    members.iter().map(|m| m.id.to_string()).collect();
+                let mut keys: Vec<String> = Vec::new();
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for member in member_nodes {
+                    for parent in member.parent_keys(git_links, notes) {
+                        if member_keys.contains(&parent) {
+                            continue;
+                        }
+                        if seen.insert(parent.clone()) {
+                            keys.push(parent);
                         }
                     }
                 }
@@ -315,6 +434,19 @@ impl HistoryNode {
                     _ => editchain_core::parents::ParentSet::Two(ids[0], ids[1]),
                 };
             }
+            Self::ExecuteBundle { anchor, .. } | Self::PlanBundle { anchor, .. } => {
+                let mut ids: Vec<OpId> = keys
+                    .iter()
+                    .filter_map(|k| OpId::from_display_str(k))
+                    .collect();
+                ids.sort_unstable();
+                ids.dedup();
+                Arc::make_mut(anchor).parents = match ids.len() {
+                    0 => editchain_core::parents::ParentSet::None,
+                    1 => editchain_core::parents::ParentSet::One(ids[0]),
+                    _ => editchain_core::parents::ParentSet::Two(ids[0], ids[1]),
+                };
+            }
             Self::GitCommit(commit) => {
                 let mut oids: Vec<GitOid> =
                     keys.iter().filter_map(|k| GitOid::from_hex(k)).collect();
@@ -332,6 +464,7 @@ impl HistoryNode {
     pub fn sub_ops(&self) -> &[Arc<Op>] {
         match self {
             Self::CollapsedImport { sub_ops, .. } => sub_ops,
+            Self::ExecuteBundle { members, .. } | Self::PlanBundle { members, .. } => members,
             Self::EditOperation { .. } | Self::GitCommit(_) => &[],
         }
     }
@@ -361,9 +494,72 @@ impl HistoryNode {
             },
             // Collapsed imports report their dominant child kind so the viewer
             // can style tool calls vs messages differently.
-            Self::CollapsedImport { kind, .. } => kind.clone(),
+            Self::CollapsedImport { kind, .. }
+            | Self::ExecuteBundle { kind, .. }
+            | Self::PlanBundle { kind, .. } => kind.clone(),
             Self::GitCommit(_) => "git".to_string(),
         }
+    }
+
+    /// Returns the deterministic semantic readability metadata for this row.
+    ///
+    /// Collapsed imports carry metadata derived at collapse time from their raw
+    /// envelope and normalized children; standalone ops and git commits derive
+    /// it on demand from their envelope/scope.
+    #[must_use]
+    pub fn record_meta(&self) -> NodeMeta {
+        match self {
+            Self::CollapsedImport { meta, .. }
+            | Self::ExecuteBundle { meta, .. }
+            | Self::PlanBundle { meta, .. } => *meta,
+            Self::EditOperation { op, .. } => meta::for_edit_operation(op),
+            Self::GitCommit(_) => meta::for_git_commit(),
+        }
+    }
+
+    /// The provider-neutral record role of this row.
+    #[must_use]
+    pub fn record_role(&self) -> RecordRole {
+        self.record_meta().record_role
+    }
+
+    /// The provider-neutral activity kind of this row.
+    #[must_use]
+    pub fn activity_kind(&self) -> ActivityKind {
+        self.record_meta().activity_kind
+    }
+
+    /// The render prominence of this row (`Trace` rows are hidden by
+    /// `hide_trace` chain filtering).
+    #[must_use]
+    pub fn visibility(&self) -> RowVisibility {
+        self.record_meta().visibility
+    }
+
+    /// The concluded outcome of this row, when structured evidence exists.
+    #[must_use]
+    pub fn outcome(&self) -> Outcome {
+        self.record_meta().outcome
+    }
+
+    /// The owning turn identity of this row, if turn-scoped.
+    #[must_use]
+    pub fn turn_id(&self) -> Option<editchain_core::TurnId> {
+        self.record_meta().turn_id
+    }
+}
+
+/// Grouping key for an execute-run bundle: the anchor op's session scope
+/// (same rule as `EditOperation`/`CollapsedImport` rows, so a bundle never
+/// crosses a group boundary).
+#[must_use]
+fn bundle_group(anchor: &Op) -> String {
+    match anchor.scope {
+        editchain_core::ScopeRef::Session(sid) => format!("session:{}", sid.0),
+        editchain_core::ScopeRef::None
+        | editchain_core::ScopeRef::Chain(_)
+        | editchain_core::ScopeRef::Turn(_)
+        | editchain_core::ScopeRef::File(_) => "ops".to_string(),
     }
 }
 
@@ -389,10 +585,13 @@ pub struct HistoryProjection {
     /// Explicit projection options (bundling policy, etc.). Threaded through so
     /// projection behavior is deterministic and a real cache key — never global.
     options: ProjectionOptions,
+    /// Git commit OID hexes of the currently projected commits, cached so
+    /// per-row parent lifting stays O(parents) instead of cloning the full
+    /// present set (or scanning every commit) for each windowed row.
+    git_present: std::collections::HashSet<String>,
     /// Cached collapsed (top-level-row) projection with its canonical
     /// representative map and canonicalized relationship notes. Computed once at
-    /// construction (and again after the few mutation points, i.e. `link_history`)
-    /// so every per-row path (`ordered_nodes`, `independent_chains`,
+    /// construction so every per-row path (`ordered_nodes`, `independent_chains`,
     /// `lifted_parent_keys`, layout, filtering, windowed edges) reads a stable
     /// canonical view without rebuilding it per row. The collapse is ~linear in
     /// op count and cheap relative to the per-row consumers that reuse it.
@@ -468,6 +667,7 @@ impl HistoryProjection {
             git: GitProjection::new(),
             relationship_notes: HashMap::new(),
             options: ProjectionOptions::default(),
+            git_present: std::collections::HashSet::new(),
             collapsed_projection: CollapsedProjection::default(),
         }
     }
@@ -502,16 +702,19 @@ impl HistoryProjection {
                 }
             }
         }
+        let git_present: std::collections::HashSet<String> =
+            git.commits.keys().map(|(_, oid)| oid.to_hex()).collect();
         let mut projection = Self {
             ops,
             git,
             relationship_notes,
             options,
+            git_present,
             collapsed_projection: CollapsedProjection::default(),
         };
         // Build the canonical collapse eagerly so `relationship_notes` and every
         // layout/filter/order path see a stable canonical view from the start
-        // (recomputed by `link_history`, the one sanctioned ops mutation point).
+        // and reused by every row/layout path.
         projection.collapsed_projection = projection.collapsed_ops();
         projection
     }
@@ -686,6 +889,14 @@ impl HistoryProjection {
                         | editchain_core::ScopeRef::File(_) => None,
                     }
                 }
+                HistoryNode::ExecuteBundle { anchor, .. }
+                | HistoryNode::PlanBundle { anchor, .. } => match anchor.scope {
+                    editchain_core::ScopeRef::Session(session) => Some(session.0),
+                    editchain_core::ScopeRef::None
+                    | editchain_core::ScopeRef::Chain(_)
+                    | editchain_core::ScopeRef::Turn(_)
+                    | editchain_core::ScopeRef::File(_) => None,
+                },
                 HistoryNode::GitCommit(_) => None,
             };
             if let Some(session) = session {
@@ -707,6 +918,14 @@ impl HistoryProjection {
                         | editchain_core::ScopeRef::File(_) => None,
                     }
                 }
+                HistoryNode::ExecuteBundle { anchor, .. }
+                | HistoryNode::PlanBundle { anchor, .. } => match anchor.scope {
+                    editchain_core::ScopeRef::Session(session) => Some(session.0),
+                    editchain_core::ScopeRef::None
+                    | editchain_core::ScopeRef::Chain(_)
+                    | editchain_core::ScopeRef::Turn(_)
+                    | editchain_core::ScopeRef::File(_) => None,
+                },
                 HistoryNode::GitCommit(_) => None,
             };
             if let Some(anchor) = session.and_then(|id| session_first_ts.get(&id).copied()) {
@@ -865,6 +1084,11 @@ impl HistoryProjection {
     /// through a bundled op is resolved by the representative map.
     #[must_use]
     fn collapsed_ops(&self) -> CollapsedProjection {
+        // One-to-one cross-record duplicate-pair state for the response_item /
+        // event_msg echo family, computed once in a single O(n) pass over the
+        // ops. Response_item rows consume one pair slot per matching event_msg
+        // row as the main loop reaches them in input order.
+        let mut echo_pairs = meta::EchoPairState::from_ops(&self.ops);
         // Set of raw import op ids (the linear backbone).
         let import_ids: std::collections::HashSet<OpId> = self
             .ops
@@ -953,6 +1177,15 @@ impl HistoryProjection {
                 let summary = collapsed_import_summary(op, children);
                 let kind = collapsed_import_kind(children);
                 let author = collapsed_import_author(children);
+                // Semantic readability metadata is derived deterministically
+                // here, where the raw envelope and its normalized children are
+                // both available.
+                let duplicate_of_event_msg = echo_pairs.is_paired_response_item(op);
+                let meta = meta::for_collapsed_import(
+                    op,
+                    children.map(Vec::as_slice),
+                    duplicate_of_event_msg,
+                );
                 // A META/structural record that falls through is standalone and is
                 // NOT an anchor. Only a dated content-bearing import becomes one.
                 let source_time = source_time_of(op);
@@ -965,6 +1198,7 @@ impl HistoryProjection {
                     kind,
                     author,
                     sub_ops: Vec::new(),
+                    meta,
                 });
                 if is_anchor_eligible {
                     let _: Option<usize> = anchors.insert(chain, idx);
@@ -1274,6 +1508,8 @@ impl HistoryProjection {
         let mut drop_idx: std::collections::HashSet<usize> = std::collections::HashSet::new();
         // parent index -> tool-result ops to attach as sub-ops.
         let mut attach: HashMap<usize, Vec<Arc<Op>>> = HashMap::new();
+        // parent index -> structured outcome carried by the absorbed result row.
+        let mut outcome_fold: HashMap<usize, Outcome> = HashMap::new();
         for (i, n) in result.iter().enumerate() {
             if !is_result.get(i).copied().unwrap_or(false) {
                 continue;
@@ -1296,6 +1532,17 @@ impl HistoryProjection {
                 let attached = attach.entry(parent_idx).or_default();
                 if let Some(tool_op) = Self::tool_result_op(n, children_of) {
                     attached.push(tool_op);
+                }
+                // The absorbed result row's structured outcome (derived from
+                // its raw `status`/`errorMessage`/`exitCode`) carries over to
+                // the visible call row, so the combined call+result keeps its
+                // evidence-based outcome instead of degrading to unknown.
+                let result_outcome = n.record_meta().outcome;
+                if result_outcome != Outcome::Unknown {
+                    let _: &mut Outcome = outcome_fold
+                        .entry(parent_idx)
+                        .and_modify(|acc| *acc = merge_outcome(*acc, result_outcome))
+                        .or_insert(result_outcome);
                 }
                 // META records are bundled before tool-result grouping. If the
                 // result row is then absorbed into its call, move those records
@@ -1329,11 +1576,16 @@ impl HistoryProjection {
         }
 
         // Attach collected tool-result ops and their bundled metadata to the
-        // call's sub-ops.
+        // call's sub-ops, folding the absorbed result's structured outcome
+        // into the call row's metadata.
         for (parent_idx, ops) in &attach {
-            if let Some(HistoryNode::CollapsedImport { sub_ops, .. }) = result.get_mut(*parent_idx)
+            if let Some(HistoryNode::CollapsedImport { sub_ops, meta, .. }) =
+                result.get_mut(*parent_idx)
             {
                 sub_ops.extend(ops.iter().cloned());
+                if let Some(outcome) = outcome_fold.get(parent_idx).copied() {
+                    meta.outcome = outcome;
+                }
             }
         }
 
@@ -1443,25 +1695,13 @@ impl HistoryProjection {
     /// same key replaces an earlier one.
     pub fn merge_git_commits(&mut self, commits: Vec<GitCommitEntity>) {
         for commit in commits {
+            let hex = commit.oid.to_hex();
             drop(
                 self.git
                     .commits
                     .insert((commit.repository, commit.oid), commit),
             );
-        }
-    }
-
-    /// Relate session operations to Git history without stitching sessions.
-    ///
-    /// Leaves unrelated session parents unchanged and creates op→git links in
-    /// `GitProjection.links`. Inferred `BasedOn` links remain provenance rather
-    /// than graph parents. Call after loading all ops and git commits, before
-    /// computing windows or layouts.
-    pub fn link_history(&mut self) {
-        let commits: Vec<GitCommitEntity> = self.git.commits.values().cloned().collect();
-        for link in link_history_links(&self.ops, &commits) {
-            let entry = self.git.links.entry(link.source).or_default();
-            entry.push(link);
+            let _: bool = self.git_present.insert(hex);
         }
     }
 
@@ -1578,16 +1818,32 @@ impl HistoryProjection {
     #[must_use]
     pub fn lifted_parent_keys(&self, node: &HistoryNode) -> Vec<String> {
         // This public helper accepts either op or git rows. The collapsed cache's
-        // `present` set contains op rows only, so include projected commit keys
-        // here; otherwise a git parent OID would be mistaken for an absent
-        // external anchor and dropped.
-        let mut present = self.collapsed_projection.present.clone();
-        present.extend(self.git.commits.values().map(|commit| commit.oid.to_hex()));
-        canonicalize_parents(
-            node.parent_keys(&self.git.links, self.relationship_notes()),
-            &self.collapsed_projection.representative,
-            &present,
-        )
+        // `present` set contains op rows only, so projected commit keys are
+        // checked against the cached [`Self::git_present`] set instead of
+        // cloning the full present set per row: the window emission calls this
+        // once per top-level row, so a per-row O(V) clone would make window
+        // materialization superlinear.
+        let representative = &self.collapsed_projection.representative;
+        let present = &self.collapsed_projection.present;
+        let mut out: Vec<String> = Vec::with_capacity(4);
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for parent in node.parent_keys(&self.git.links, self.relationship_notes()) {
+            let resolved = if present.contains(&parent) {
+                Some(parent)
+            } else if let Some(pid) = OpId::from_display_str(&parent) {
+                canonical_op_id(pid, representative, present).map(|id| id.to_string())
+            } else if self.git_present.contains(&parent) {
+                Some(parent)
+            } else {
+                None
+            };
+            if let Some(key) = resolved {
+                if seen.insert(key.clone()) {
+                    out.push(key);
+                }
+            }
+        }
+        out
     }
 
     /// Returns the provider-neutral structural relations for one row in a view.
@@ -1645,6 +1901,44 @@ impl HistoryProjection {
             }
         }
         out
+    }
+
+    /// Returns the node keys of rows that participate in structural topology
+    /// (`ForkOf` / `SubagentOf` / `ReconnectsTo` anchors or targets).
+    ///
+    /// Structural rows carry virtual edges, so a view must never fold them away:
+    /// the Activity execute-run bundling excludes them exactly like the chain
+    /// filter preserves them from every hide predicate. Targets are lifted to
+    /// their canonical visible rows (or dropped when unresolvable in this view).
+    #[must_use]
+    pub fn structural_row_keys(&self, nodes: &[HistoryNode]) -> std::collections::HashSet<String> {
+        let mut keys = std::collections::HashSet::new();
+        let note_map = self.relationship_notes();
+        let representative = &self.collapsed_projection.representative;
+        let present = row_node_keys(nodes);
+        for node in nodes {
+            let Some(anchor_id) = node.op_id() else {
+                continue;
+            };
+            if note_map.contains_key(&anchor_id) {
+                let _: bool = keys.insert(node.node_key());
+            }
+            if let Some(anchor_notes) = note_map.get(&anchor_id) {
+                for note in anchor_notes {
+                    let editchain_core::OpKind::Note(n) = &note.kind else {
+                        continue;
+                    };
+                    for target in &n.target_ids {
+                        if let Some(key) =
+                            canonical_parent_key(&target.to_string(), representative, &present)
+                        {
+                            let _: bool = keys.insert(key);
+                        }
+                    }
+                }
+            }
+        }
+        keys
     }
 }
 
@@ -1706,6 +2000,9 @@ fn ordering_key(node: &HistoryNode) -> OrderingKey {
         HistoryNode::EditOperation { op, .. } | HistoryNode::CollapsedImport { op, .. } => {
             OrderingKey::Op(op.id)
         }
+        HistoryNode::ExecuteBundle { anchor, .. } | HistoryNode::PlanBundle { anchor, .. } => {
+            OrderingKey::Op(anchor.id)
+        }
         HistoryNode::GitCommit(commit) => OrderingKey::Git(commit.oid),
     }
 }
@@ -1753,9 +2050,6 @@ fn ordering_parent_keys(
             for source in std::iter::once(op).chain(node.sub_ops()) {
                 if let Some(links) = git_links.get(&source.id) {
                     for link in links {
-                        if matches!(link.kind, editchain_core::GitLinkKind::BasedOn) {
-                            continue;
-                        }
                         let key = OrderingKey::Git(link.target_oid);
                         push(present.contains(&key).then_some(key));
                     }
@@ -1769,6 +2063,11 @@ fn ordering_parent_keys(
                         }
                     }
                 }
+            }
+        }
+        HistoryNode::ExecuteBundle { anchor, .. } | HistoryNode::PlanBundle { anchor, .. } => {
+            for parent in &anchor.parents {
+                push(canonical_ordering_op(*parent, representative, present));
             }
         }
         HistoryNode::GitCommit(commit) => {
@@ -2111,6 +2410,39 @@ fn raw_import_label(import: &editchain_core::op::ImportOp) -> String {
             .filter(|event_type| !event_type.is_empty())
             .unwrap_or(record_type)
             .to_string(),
+        // Codex response items put the meaningful label in `payload.type` and
+        // its content: reasoning items expose a `summary` array of
+        // summary-text blocks, message items carry a `content` array. Showing
+        // the payload type (or its text) avoids a wall of indistinguishable
+        // `response_item` labels when a leading/unbundled record is visible.
+        "response_item" => {
+            let Some(payload) = value.get("payload") else {
+                return record_type.to_string();
+            };
+            let payload_type = payload
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            match payload_type {
+                "reasoning" => {
+                    if let Some(text) = first_response_summary_text(payload) {
+                        return truncate_line(&text);
+                    }
+                    if let Some(text) = first_response_content_text(payload) {
+                        return truncate_line(&text);
+                    }
+                    "reasoning".to_string()
+                }
+                "message" => {
+                    if let Some(text) = first_response_content_text(payload) {
+                        return truncate_line(&text);
+                    }
+                    "message".to_string()
+                }
+                _ if !payload_type.is_empty() => payload_type.to_string(),
+                _ => record_type.to_string(),
+            }
+        }
         // Attachment records carry a structured `attachment` object.
         "attachment" => {
             let att = value.get("attachment");
@@ -2170,6 +2502,91 @@ fn raw_import_label(import: &editchain_core::op::ImportOp) -> String {
         _ if !record_type.is_empty() => record_type.to_string(),
         _ => raw,
     }
+}
+
+/// Extract the first non-empty summary text from a response-item payload.
+///
+/// Reasoning items carry a `summary` array of `summary-text` blocks (and the
+/// compacted projection keeps the same shape); a plain string summary is
+/// accepted too. Returns `None` when there is no text, so callers can fall
+/// back to content text.
+#[must_use]
+fn first_response_summary_text(payload: &serde_json::Value) -> Option<String> {
+    let summary = payload.get("summary")?;
+    let items = match summary {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::String(text) if !text.trim().is_empty() => {
+            return Some(text.clone());
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_)
+        | serde_json::Value::Object(_) => return None,
+    };
+    for item in items {
+        match item {
+            serde_json::Value::Object(map) => {
+                if let Some(text) = map.get("text").and_then(serde_json::Value::as_str) {
+                    if !text.trim().is_empty() {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+            serde_json::Value::String(text) if !text.trim().is_empty() => {
+                return Some(text.clone());
+            }
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::Array(_)
+            | serde_json::Value::String(_) => {}
+        }
+    }
+    None
+}
+
+/// Extract the first non-empty content text from a response-item payload.
+///
+/// Content blocks are `{type, text|input_text|output_text}` records; the
+/// compacted projection keeps the same shape. Returns `None` when there is
+/// no text.
+#[must_use]
+fn first_response_content_text(payload: &serde_json::Value) -> Option<String> {
+    let content = payload.get("content")?;
+    let items = match content {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::String(text) if !text.trim().is_empty() => {
+            return Some(text.clone());
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_)
+        | serde_json::Value::Object(_) => return None,
+    };
+    for item in items {
+        match item {
+            serde_json::Value::Object(map) => {
+                for key in ["text", "input_text", "output_text"] {
+                    if let Some(text) = map.get(key).and_then(serde_json::Value::as_str) {
+                        if !text.trim().is_empty() {
+                            return Some(text.to_string());
+                        }
+                    }
+                }
+            }
+            serde_json::Value::String(text) if !text.trim().is_empty() => {
+                return Some(text.clone());
+            }
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::Array(_)
+            | serde_json::Value::String(_) => {}
+        }
+    }
+    None
 }
 
 /// Extract text from a user record's possibly-nested content blocks.
@@ -2405,5 +2822,34 @@ fn payload_text(payload: &Payload) -> String {
     match payload {
         Payload::Inline(b) => String::from_utf8_lossy(b).to_string(),
         Payload::Empty | Payload::Blob(_) => String::new(),
+    }
+}
+
+/// Conservative merge precedence for folded outcomes.
+///
+/// When multiple tool-result rows fold into one call, the combined outcome is
+/// the most severe concluded outcome among them, so a later milder result can
+/// never mask earlier evidence of a problem: `Failure` > `Cancelled` >
+/// `Warning` > `Success`. `Unknown` ranks lowest; callers exclude it before
+/// merging so it can never erase known evidence.
+#[must_use]
+fn outcome_severity(outcome: Outcome) -> u8 {
+    match outcome {
+        Outcome::Failure => 4,
+        Outcome::Cancelled => 3,
+        Outcome::Warning => 2,
+        Outcome::Success => 1,
+        Outcome::Unknown => 0,
+    }
+}
+
+/// Deterministic fold of two concluded outcomes: the more severe wins; ties
+/// keep the existing (earlier) outcome.
+#[must_use]
+fn merge_outcome(acc: Outcome, next: Outcome) -> Outcome {
+    if outcome_severity(next) > outcome_severity(acc) {
+        next
+    } else {
+        acc
     }
 }

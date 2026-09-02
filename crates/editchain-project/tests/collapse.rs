@@ -10,12 +10,13 @@
 )]
 // Crate-level dependency markers (used by Cargo for feature resolution).
 use regex as _;
+use serde as _;
 use serde_json as _;
 
 use editchain_core::{
-    ActorId, Clock, GitAvailability, GitCommitEntity, GitLink, GitLinkKind, GitObjectFormat,
-    GitOid, ImportOp, MessageOp, NodeId, Op, OpId, OpKind, ParentSet, Payload, RepositoryId,
-    ScopeRef, SessionId, Tags, ToolOp, ToolStage,
+    ActorId, Clock, CommandOp, CommandStage, GitAvailability, GitCommitEntity, GitLink,
+    GitLinkKind, GitObjectFormat, GitOid, ImportOp, MessageOp, NodeId, Op, OpId, OpKind, ParentSet,
+    Payload, RepositoryId, ScopeRef, SessionId, Tags, ToolOp, ToolStage,
 };
 
 /// Build a metadata-only raw import op (tagged META).
@@ -25,6 +26,39 @@ fn meta_import_op(node: u64, seq: u64) -> Op {
     op
 }
 use editchain_project::HistoryProjection;
+
+fn git_commit(oid_byte: u8, committed_at: i64) -> GitCommitEntity {
+    let oid = |byte: u8| {
+        let mut bytes = [0u8; 32];
+        bytes[0] = byte;
+        GitOid::new(GitObjectFormat::Sha1, bytes)
+    };
+    GitCommitEntity {
+        repository: RepositoryId(1),
+        object_format: GitObjectFormat::Sha1,
+        oid: oid(oid_byte),
+        imported_record: None,
+        availability: GitAvailability::Resolved,
+        tree: oid(0),
+        parents: Vec::new(),
+        author: editchain_core::GitSignature {
+            name: Payload::Empty,
+            email: Payload::Empty,
+            when: committed_at,
+        },
+        committer: editchain_core::GitSignature {
+            name: Payload::Empty,
+            email: Payload::Empty,
+            when: committed_at,
+        },
+        authored_at: committed_at,
+        committed_at,
+        message: Payload::Empty,
+        imported_refs: Vec::new(),
+        live_refs: Vec::new(),
+        changed_paths: Vec::new(),
+    }
+}
 
 /// Build a raw import op.
 fn import_op(node: u64, seq: u64) -> Op {
@@ -74,6 +108,49 @@ fn tool_op(node: u64, seq: u64, parent: OpId, name: &str) -> Op {
             content: Payload::Empty,
         }),
     }
+}
+
+/// Build a normalized tool-result import whose raw JSON carries a structured
+/// `status`, so its derived outcome is `Success`/`Failure`/`Cancelled` rather
+/// than `Unknown`.
+fn status_result_import(node: u64, seq: u64, parent: OpId, status: &str) -> Op {
+    let mut op = import_op(node, seq);
+    op.parents = ParentSet::One(parent);
+    if let OpKind::Import(import) = &mut op.kind {
+        import.raw_ref = Payload::Inline(
+            serde_json::json!({
+                "type": "response_item",
+                "payload": { "item": { "status": status } }
+            })
+            .to_string()
+            .into_bytes(),
+        );
+    }
+    op
+}
+
+/// Build a tool-result import (with an optional structured `status`) plus its
+/// Finish-stage tool child, parented to the given call import.
+fn tool_result_pair(
+    node: u64,
+    seq: u64,
+    tool_seq: u64,
+    parent: OpId,
+    status: Option<&str>,
+) -> (Op, Op) {
+    let import = if let Some(status) = status {
+        status_result_import(node, seq, parent, status)
+    } else {
+        let mut op = import_op(node, seq);
+        op.parents = ParentSet::One(parent);
+        op
+    };
+    let mut tool = tool_op(node, tool_seq, import.id, "");
+    if let OpKind::Tool(t) = &mut tool.kind {
+        t.stage = ToolStage::Finish;
+        t.content = Payload::Inline(b"output".to_vec());
+    }
+    (import, tool)
 }
 
 #[test]
@@ -135,6 +212,8 @@ fn collapse_author_derived_from_children_tags() {
     let author = match nodes.first().unwrap() {
         editchain_project::HistoryNode::CollapsedImport { author, .. } => author,
         editchain_project::HistoryNode::EditOperation { .. }
+        | editchain_project::HistoryNode::ExecuteBundle { .. }
+        | editchain_project::HistoryNode::PlanBundle { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     };
     assert_eq!(author, "human");
@@ -153,6 +232,8 @@ fn collapse_author_prefers_human_over_agent() {
     let author = match nodes.first().unwrap() {
         editchain_project::HistoryNode::CollapsedImport { author, .. } => author,
         editchain_project::HistoryNode::EditOperation { .. }
+        | editchain_project::HistoryNode::ExecuteBundle { .. }
+        | editchain_project::HistoryNode::PlanBundle { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     };
     assert_eq!(author, "human");
@@ -198,6 +279,8 @@ fn meta_imports_bundle_into_nearest_real_turn() {
             assert_eq!(sub_ops[1].id, meta2.id);
         }
         editchain_project::HistoryNode::EditOperation { .. }
+        | editchain_project::HistoryNode::ExecuteBundle { .. }
+        | editchain_project::HistoryNode::PlanBundle { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     }
 }
@@ -235,6 +318,8 @@ fn meta_bundle_keeps_parents_unchanged() {
             assert_eq!(sub_ops[0].id, meta.id);
         }
         editchain_project::HistoryNode::EditOperation { .. }
+        | editchain_project::HistoryNode::ExecuteBundle { .. }
+        | editchain_project::HistoryNode::PlanBundle { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     }
 
@@ -291,7 +376,7 @@ fn bundled_meta_graph_git_link_is_inherited_by_visible_anchor() {
 }
 
 #[test]
-fn bundled_meta_based_on_link_stays_provenance_not_parent() {
+fn bundled_meta_based_on_link_is_inherited_by_visible_anchor() {
     let opts = editchain_project::ProjectionOptions {
         bundle_metadata: true,
     };
@@ -319,10 +404,37 @@ fn bundled_meta_based_on_link_stays_provenance_not_parent() {
         }],
     ));
 
+    assert_eq!(
+        node.parent_keys(&links, &std::collections::HashMap::new()),
+        vec![target_oid.to_hex()],
+        "an exact session-start BasedOn relation must remain on its visible turn"
+    );
+}
+
+#[test]
+fn projection_does_not_infer_links_from_git_command_text_or_timestamps() {
+    let command = Op {
+        id: OpId::new(NodeId(1), 0, 1),
+        parents: ParentSet::None,
+        actor: ActorId(1),
+        clock: Clock::UnixMs(1_000_100),
+        scope: ScopeRef::Session(SessionId(10)),
+        tags: Tags::COMMAND,
+        kind: OpKind::Command(CommandOp {
+            command_id: Payload::Empty,
+            content: Payload::Inline(b"git commit -m inferred-before-refactor".to_vec()),
+            stage: CommandStage::Finish,
+        }),
+    };
+    let mut commit = git_commit(9, 1_000);
+    commit.repository = RepositoryId(1);
+
+    let mut projection = HistoryProjection::from_ops(vec![command]);
+    projection.merge_git_commits(vec![commit]);
+
     assert!(
-        node.parent_keys(&links, &std::collections::HashMap::new())
-            .is_empty(),
-        "weak BasedOn provenance must not become a causal graph parent"
+        projection.git.links.is_empty(),
+        "only durable GitLink ops may connect sessions to Git"
     );
 }
 
@@ -429,6 +541,107 @@ fn tool_result_groups_into_tool_call() {
     // The combined summary includes the call name plus the result preview.
     assert_eq!(node.summary(), "tool: Bash line one");
     assert_eq!(node.sub_ops().len(), 1);
+}
+
+#[test]
+fn grouped_codex_exec_failure_overrides_completed_call_envelope() {
+    // The call's `status: completed` only concludes its lifecycle. The
+    // attached custom-exec result is the authoritative execution outcome and
+    // must make the single visible call+result row a failure.
+    let mut call_import = import_op(1, 1);
+    if let OpKind::Import(import) = &mut call_import.kind {
+        import.raw_ref = Payload::Inline(
+            br#"{"type":"response_item","payload":{"type":"custom_tool_call","status":"completed","name":"exec"}}"#
+                .to_vec(),
+        );
+    }
+    let call = tool_op(1, 2, call_import.id, "exec");
+    let mut result_import = import_op(1, 3);
+    result_import.parents = ParentSet::One(call_import.id);
+    if let OpKind::Import(import) = &mut result_import.kind {
+        import.raw_ref = Payload::Inline(
+            br#"{"type":"response_item","payload":{"type":"custom_tool_call_output","output":[{"type":"input_text","text":"Script failed\nWall time 0.0 seconds\nOutput:\n"},{"type":"input_text","text":"Script error:\ncommand rejected"}]}}"#
+                .to_vec(),
+        );
+    }
+    let mut result = tool_op(1, 4, result_import.id, "");
+    if let OpKind::Tool(tool) = &mut result.kind {
+        tool.stage = ToolStage::Finish;
+        tool.content = Payload::Inline(b"Script failed".to_vec());
+    }
+
+    let nodes = HistoryProjection::from_ops(vec![call_import, call, result_import, result]).nodes();
+
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(
+        nodes[0].outcome(),
+        editchain_project::taxonomy::Outcome::Failure
+    );
+    assert_eq!(nodes[0].sub_ops().len(), 1);
+}
+
+#[test]
+fn grouped_tool_results_keep_failure_over_later_success() {
+    // Two tool-result rows fold into one call: a Failure followed by a later
+    // Success. Last-wins folding would let the later Success mask the earlier
+    // Failure and render a misleading success badge; the merge must keep the
+    // Failure as the combined visible outcome.
+    let call_import = import_op(1, 1);
+    let call = tool_op(1, 2, call_import.id, "Bash");
+    let mut ops = vec![call_import.clone(), call];
+    for (node, seq, tool_seq, status) in [
+        (1u64, 3u64, 4u64, Some("failed")),
+        (1, 5, 6, Some("completed")),
+    ] {
+        let (import, tool) = tool_result_pair(node, seq, tool_seq, call_import.id, status);
+        ops.push(import);
+        ops.push(tool);
+    }
+
+    let projection = HistoryProjection::from_ops(ops);
+    let nodes = projection.nodes();
+
+    // One visible row (the call); both results are folded into its sub-ops.
+    assert_eq!(nodes.len(), 1);
+    let node = &nodes[0];
+    assert_eq!(node.node_key(), call_import.id.to_string());
+    assert_eq!(
+        node.outcome(),
+        editchain_project::taxonomy::Outcome::Failure,
+        "a later Success must not erase the earlier Failure"
+    );
+}
+
+#[test]
+fn grouped_tool_results_keep_success_when_all_succeed() {
+    // Two successful results plus one unknown-status result fold into one call;
+    // the combined outcome stays Success, and the unknown result never
+    // downgrades known evidence.
+    let call_import = import_op(1, 1);
+    let call = tool_op(1, 2, call_import.id, "Bash");
+    let mut ops = vec![call_import.clone(), call];
+    // The last entry carries no structured status -> derived outcome Unknown.
+    for (node, seq, tool_seq, status) in [
+        (1u64, 3u64, 4u64, Some("completed")),
+        (1, 5, 6, Some("succeeded")),
+        (1, 7, 8, None),
+    ] {
+        let (import, tool) = tool_result_pair(node, seq, tool_seq, call_import.id, status);
+        ops.push(import);
+        ops.push(tool);
+    }
+
+    let projection = HistoryProjection::from_ops(ops);
+    let nodes = projection.nodes();
+
+    assert_eq!(nodes.len(), 1);
+    let node = &nodes[0];
+    assert_eq!(node.node_key(), call_import.id.to_string());
+    assert_eq!(
+        node.outcome(),
+        editchain_project::taxonomy::Outcome::Success,
+        "unknown must not erase known success evidence"
+    );
 }
 
 #[test]
@@ -564,6 +777,8 @@ fn no_cross_chain_meta_bundling() {
             assert_eq!(sub_ops[0].id, a_meta.id);
         }
         editchain_project::HistoryNode::EditOperation { .. }
+        | editchain_project::HistoryNode::ExecuteBundle { .. }
+        | editchain_project::HistoryNode::PlanBundle { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     }
 

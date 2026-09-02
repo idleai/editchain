@@ -451,12 +451,14 @@ fn commit_persists_generation_before_cursors_on_write_error() {
         byte_offset: 40,
         ops_emitted: 7,
         content_hash: [7u8; 32],
+        normalization_version: 0,
     };
     let new_cursor = CursorValue {
         file_size: 9,
         byte_offset: 8,
         ops_emitted: 2,
         content_hash: [9u8; 32],
+        normalization_version: 0,
     };
 
     // Durable baseline: a generation-0 cursor covering the pre-rewrite read.

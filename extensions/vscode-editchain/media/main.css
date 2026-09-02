@@ -40,6 +40,52 @@ body {
      not on the body, so the grid below spans edge-to-edge. */
   padding: 0 12px;
 }
+/* Activity/Raw profile segmented control. The active segment is filled like a
+   VS Code radio/segmented control; both remain keyboard-focusable buttons with
+   aria-pressed state. */
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--vscode-input-background);
+}
+.segmented-btn {
+  font: inherit;
+  color: var(--vscode-input-foreground);
+  background: transparent;
+  border: 0;
+  padding: 4px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.segmented-btn + .segmented-btn {
+  border-left: 1px solid var(--vscode-input-border, transparent);
+}
+.segmented-btn.active {
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, #ffffff);
+}
+.segmented-btn:hover:not(.active) {
+  background: var(--vscode-list-hoverBackground);
+}
+.segmented-btn:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+/* Screen-reader-only utility: the search label and the aria-live status region
+   stay in the accessibility tree but never take visual space. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
 /* Search input styled like a native VS Code input: dark background, subtle
    border, and a focus ring that matches the theme. */
 #search {
@@ -63,12 +109,8 @@ body {
 #search:focus {
   border-color: var(--vscode-focusBorder);
 }
-#layout { display: flex; gap: 12px; flex: 1; min-height: 0; width: 100%; }
-#rows { flex: 3; overflow-y: auto; position: relative; min-width: 0; }
-/* Detail/inspector pane is hidden until a node is selected, so it doesn't
-   consume fixed width when empty. */
-#detail { flex: 1; overflow-y: auto; border-left: 1px solid var(--vscode-panel-border); padding-left: 12px; min-width: 0; display: none; }
-#layout.has-detail #detail { display: block; }
+#layout { display: flex; flex: 1; min-height: 0; width: 100%; }
+#rows { flex: 1; overflow-y: auto; position: relative; min-width: 0; }
 
 /* Scroll spacer gives #rows a scrollbar spanning the FULL history height even
    though only a viewport slice is rendered. The rendered slice (table-wrap) is
@@ -120,32 +162,27 @@ body {
   box-sizing: border-box;
   border-top: 1px solid var(--row-border);
 }
-/* Session/group title chip. Hidden by default so rows stay clean; revealed only
-   while hovering its row (or the chip itself). Absolutely positioned so its
-   appearance never shifts row height or column layout — virtual scroll keeps
-   every row exactly ROW_H regardless of hover state. The background is fully
-   transparent so the label floats over the row without a hard-edged chip. */
+/* Session/group title chip. ALWAYS visible so group boundaries read at a
+   glance (short IDs only — never full raw 64-bit strings). Absolutely
+   positioned so its appearance never shifts row height or column layout —
+   virtual scroll keeps every row exactly ROW_H regardless of chip state. The
+   translucent background keeps the label legible without a hard-edged box.
+   The graph cell is explicitly stacked above this background label so lane
+   geometry remains uninterrupted through section headers. */
 .group-label {
   position: absolute;
   top: -1px;
   left: 0;
   z-index: 1;
-  font-weight: 700;
-  /* Bigger header face for session titles (vs the small dimmed chip before). */
-  font-size: 1em;
+  font-weight: 600;
+  font-size: 0.78em;
   color: var(--vscode-descriptionForeground);
-  opacity: 0; /* hidden until hover */
-  background: transparent;
-  padding: 0 6px;
+  opacity: 0.9;
+  background: color-mix(in srgb, var(--vscode-editor-background) 88%, transparent);
+  border-radius: 3px;
+  padding: 0 8px;
   line-height: 14px;
-  /* Fades in on hover and back out on unhover (transition on the base state
-     covers both directions). Slower reveal so the title eases in gently. */
-  transition: opacity 250ms ease;
-}
-.row-group-start:hover .group-label,
-.group-label:hover {
-  /* Revealed at half opacity — a subtle header, not a loud chip. */
-  opacity: 0.5;
+  pointer-events: none;
 }
 
 /* Softened row separator colour: the panel border blended ~55% toward the
@@ -179,6 +216,15 @@ body {
   cursor: pointer;
 }
 .row:hover { background-color: var(--vscode-list-hoverBackground); }
+.row:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+/* Inline selected-row highlight: a soft accent that stays clearly visible
+   on top of the hover colour without hard-coded theme assumptions. */
+.row.row-selected {
+  background-color: color-mix(in srgb, var(--vscode-focusBorder) 18%, var(--vscode-editor-background));
+}
 /* Grid cells must not overflow their tracks (same rationale as the header). */
 .row .graph-cell,
 .row .text-cell,
@@ -195,7 +241,12 @@ body {
    lanes/dots must always render at full (100%) opacity regardless of row kind. */
 .row-tool .text-cell, .row-tool .date-cell, .row-tool .author-cell, .row-tool .commit-cell { opacity: 0.85; }
 .row-dim .text-cell, .row-dim .date-cell, .row-dim .author-cell, .row-dim .commit-cell { opacity: 0.85; }
-.graph-cell { line-height: 0; overflow: hidden; }
+.graph-cell {
+  position: relative;
+  z-index: 2;
+  line-height: 0;
+  overflow: hidden;
+}
 .text-cell { padding-left: 8px; overflow: hidden; text-align: left; }
 .date-cell, .author-cell, .commit-cell {
   padding-left: 8px;
@@ -209,10 +260,42 @@ body {
   text-overflow: ellipsis;
 }
 .row .summary {
+  /* One constrained flex line: the inline chrome (chevron, badges, bundle
+     pills) and the summary text share the content cell, and every item can
+     shrink/ellipsize (min-width:0) so nothing ever lays out beyond the cell —
+     at narrow widths the NO_HORIZONTAL_OVERFLOW contract keeps descendants
+     inside their grid track instead of clipping them invisibly. Height is
+     untouched (still the row's own line); virtual scroll keeps ROW_H. */
+  display: flex;
+  align-items: center;
+  min-width: 0;
   font-weight: 400;
   white-space: nowrap;
   overflow: hidden;
+}
+/* The summary text itself is the flexible tail of the flex line: it absorbs
+   the leftover space and ellipsizes, while chips stay at natural size unless
+   the line is overfull (then they shrink too, see the badge/pill rules). */
+.summary-text {
+  /* A zero flex basis makes the prose absorb remaining space after semantic
+     chips take their natural width. Chips only shrink when they alone exceed
+     the track, instead of long prose needlessly collapsing their labels. */
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A single restrained metadata cluster precedes prose. Keeping it in one
+   shrinkable wrapper gives the content compositor a predictable visual budget
+   instead of making every semantic label compete independently with text. */
+.row-meta {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
 }
 /* Human message turns render bold; all other rows (agent, system, tool) stay
    at normal weight. */
@@ -220,17 +303,30 @@ body {
   font-weight: 700;
 }
 
-/* Chevron affordance on rows that carry bundled metadata sub-ops. Clicking
-   toggles inline expansion (revealing one uniform ROW_H row per sub-op directly
-   below). Inline so it never affects row height or column layout — virtual
-   scroll keeps every row exactly ROW_H. */
+/* Chevron on rows that carry bundled sub-ops. It provides an explicit native
+   disclosure affordance while the whole parent row remains the generous click
+   target. Inline sizing never affects ROW_H or virtual-scroll geometry. */
 .subop-chevron {
   display: inline-block;
+  flex: none;
   width: 14px;
   margin-right: 4px;
+  padding: 0;
   color: var(--vscode-descriptionForeground);
   font-size: 0.85em;
+  line-height: 16px;
+  vertical-align: middle;
   cursor: pointer;
+  background: transparent;
+  border: 0;
+  font-family: inherit;
+}
+.subop-chevron:hover {
+  color: var(--vscode-foreground);
+}
+.subop-chevron:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
 }
 
 /* Compact semantic badges for structural parent relations (subagent branch
@@ -243,6 +339,13 @@ body {
    branch/return row stays fully legible. */
 .rel-badge {
   display: inline-block;
+  /* Flex-shrinkable chip: at narrow widths an overfull content line shrinks
+     the chips (ellipsizing their labels) instead of laying them out beyond
+     the content cell — same containment contract as .summary-text. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   margin-right: 6px;
   padding: 0 5px;
   border: 1px solid var(--vscode-descriptionForeground);
@@ -253,6 +356,48 @@ body {
   vertical-align: middle;
   white-space: nowrap;
   opacity: 1;
+}
+
+/* Concise semantic activity + outcome badges (Activity/Raw profile content).
+   Same inline, height-neutral pattern as the relation badges: they sit at the
+   start of the summary and clip past it on long text. Text comes from the
+   renderer's whitelists (activity_kind / outcome lookup keys), never raw wire
+   values. */
+.act-badge,
+.out-badge {
+  display: inline-block;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-right: 6px;
+  padding: 0 5px;
+  border-radius: 8px;
+  font-size: 0.72em;
+  line-height: 16px;
+  vertical-align: middle;
+  white-space: nowrap;
+  opacity: 1;
+}
+.act-badge {
+  border: 1px solid var(--vscode-descriptionForeground);
+  color: var(--vscode-descriptionForeground);
+}
+.out-badge.outcome-success {
+  border: 1px solid var(--vscode-testing-iconPassed, #89d185);
+  color: var(--vscode-testing-iconPassed, #89d185);
+}
+.out-badge.outcome-warning {
+  border: 1px solid var(--vscode-editorWarning-foreground, #cca700);
+  color: var(--vscode-editorWarning-foreground, #cca700);
+}
+.out-badge.outcome-failure {
+  border: 1px solid var(--vscode-editorError-foreground, #f48771);
+  color: var(--vscode-editorError-foreground, #f48771);
+}
+.out-badge.outcome-neutral {
+  border: 1px solid var(--vscode-descriptionForeground);
+  color: var(--vscode-descriptionForeground);
 }
 
 /* Rows carrying structural relation badges are graph-topology-critical: lift
@@ -286,13 +431,152 @@ body {
   font-size: 0.9em;
   margin-right: 4px;
   color: var(--vscode-descriptionForeground);
+  flex: none;
 }
 .subop-summary {
   white-space: nowrap;
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Activity-profile work-unit layer (Raw renders none of this — the classes
+   below only exist on rows the renderer marks in the Activity view). A
+   work-unit start opens a unit section: a stronger top separator plus a
+   compact two-line unit header INSIDE the fixed 34px row (unit title + count
+   pill above the row's own summary — never the opaque unit id as primary
+   text). The unit's last row closes with a slightly stronger bottom
+   separator only — no extra row, no height change. */
+.row-work-unit-start {
+  border-top: 1px solid var(--vscode-panel-border);
+  background-color: color-mix(in srgb, var(--vscode-panel-border) 5%, transparent);
+}
+.row-work-unit-end {
+  border-bottom-color: var(--vscode-panel-border);
+}
+/* The content cell's summary block becomes a fixed 2-line grid sized to the
+   unchanged 34px row: line 1 = ribbon (title + count pill), line 2 = the
+   row's own summary. Row height and virtual-scroll math are untouched. */
+.row-work-unit-start .summary.work-unit-block {
+  display: grid;
+  grid-template-rows: 13px 16px;
+  height: 29px;
+  box-sizing: border-box;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.row-work-unit-start .summary.work-unit-block.work-unit-title-only {
+  display: flex;
+  align-items: center;
+}
+.work-unit-title-only .work-unit-ribbon-line {
+  width: 100%;
+}
+.work-unit-ribbon-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.work-unit-ribbon {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.72em;
+  font-weight: 600;
+  line-height: 12px;
+  letter-spacing: 0.01em;
+  color: var(--vscode-descriptionForeground);
+}
+.work-unit-count {
+  flex: none;
+  padding: 0 6px;
+  border-radius: 6px;
+  font-size: 0.68em;
+  line-height: 12px;
+  color: var(--vscode-foreground);
+  background-color: color-mix(in srgb, var(--vscode-panel-border) 18%, transparent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.work-unit-row-line {
+  /* Same constrained flex line as .summary: chips + summary text shrink to
+     fit the fixed 16px grid row instead of overflowing the content cell. */
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* Execute-run bundle chrome (Activity only): one compact typed count label and
+   an optional structured-success check. Unknown outcome stays visually quiet. */
+.bundle-count,
+.bundle-status {
+  display: inline-block;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-right: 6px;
+  padding: 0 6px;
+  border-radius: 7px;
+  font-size: 0.7em;
+  line-height: 14px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.bundle-count {
+  border: 1px solid var(--vscode-panel-border);
+  color: var(--vscode-foreground);
+  background-color: color-mix(in srgb, var(--vscode-panel-border) 14%, transparent);
+}
+.bundle-status {
+  border: 1px solid transparent;
+  color: var(--vscode-descriptionForeground);
+}
+.bundle-status.bundle-status-success {
+  border-color: var(--vscode-testing-iconPassed, #89d185);
+  color: var(--vscode-testing-iconPassed, #89d185);
+}
+
+/* Promoted rows (Activity only): conservative significance marker — these
+   rows never fold into bundles, and the rail makes that legible. No badge per
+   promoted row: failure/warning/cancelled outcomes and change/verify activity
+   get a strong accent rail + whisper tint; promoted narrative gets only a
+   restrained quiet rail. */
+.row-promoted-rail {
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--vscode-panel-border) 78%, transparent);
+}
+.row-promoted-failure {
+  box-shadow: inset 2px 0 0 var(--vscode-editorError-foreground, #f48771);
+  background-color: color-mix(in srgb, var(--vscode-editorError-foreground, #f48771) 6%, transparent);
+}
+.row-promoted-warning {
+  box-shadow: inset 2px 0 0 var(--vscode-editorWarning-foreground, #cca700);
+  background-color: color-mix(in srgb, var(--vscode-editorWarning-foreground, #cca700) 6%, transparent);
+}
+.row-promoted-cancelled {
+  box-shadow: inset 2px 0 0 var(--vscode-descriptionForeground);
+  background-color: color-mix(in srgb, var(--vscode-descriptionForeground) 4%, transparent);
+}
+.row-promoted-change {
+  box-shadow: inset 2px 0 0 var(--vscode-focusBorder, #007fd4);
+  background-color: color-mix(in srgb, var(--vscode-focusBorder, #007fd4) 5%, transparent);
+}
+.row-promoted-verify {
+  box-shadow: inset 2px 0 0 var(--vscode-testing-iconPassed, #89d185);
+  background-color: color-mix(in srgb, var(--vscode-testing-iconPassed, #89d185) 5%, transparent);
 }
 
 /* Per-row graph cells (one small SVG per row). Each cell draws the node's dot,
-   vertical line segments for active lanes, and rounded cross-lane transition
+   vertical line segments for active lanes, and smooth cross-lane transition
    paths. */
 .graph-cell svg.graphCell {
   display: block;
@@ -309,6 +593,16 @@ body {
   stroke: var(--vscode-editor-background);
   stroke-width: 1;
 }
+.graph-cell rect.graphBundleCapsule,
+.graph-cell circle.graphBundleTerminal {
+  /* Execute-run bundle glyphs are decorative like the dots: the capsule and
+     its entry/exit terminals never intercept clicks (rows below stay
+     interactive) and get the same background hairline so they read against
+     the chain lines passing behind them. */
+  pointer-events: none;
+  stroke: var(--vscode-editor-background);
+  stroke-width: 1;
+}
 .graph-cell line.graphLine {
   /* Stroke colour is set inline per-lane (each chain's own colour); this rule
      only sets the width. */
@@ -316,9 +610,9 @@ body {
 }
 .graph-cell path.graphTransition {
   /* Stroke colour is set inline per half (source-lane colour through the row
-     midpoint, destination-lane colour after). Caps are explicitly butt so
-     the two halves tile exactly at their shared midpoint seam — no gap, no
-     overlap. */
+     transition, destination-lane colour after). Caps are explicitly butt so
+     the two tangent-continuous Bézier halves tile exactly at their shared seam
+     — no gap or overlap. */
   stroke-width: 2;
   stroke-linecap: butt;
   stroke-linejoin: round;
@@ -355,7 +649,7 @@ body.col-resizing .col-resize-handle {
   color: var(--vscode-descriptionForeground);
 }
 .view-message.error {
-  color: #f48771;
+  color: var(--vscode-editorError-foreground, #f48771);
 }
 
 /* Explicit Retry action on terminal request errors (dead/hung service). The
@@ -429,5 +723,763 @@ body.col-resizing .col-resize-handle {
   }
   #layout {
     gap: 8px;
+  }
+}
+
+/* Below ~617px the Commit/ID column drops first, then Author (~480px), then
+   Date (~400px) — fixed columns are HIDDEN in priority order so Content keeps
+   its readable width before it is ever squeezed, and the graph rail keeps the
+   space it needs to stay compact instead of smearing. Breakpoints must match
+   the `hiddenColumns()` constants in media/main.js (the JS width math counts
+   only visible tracks). */
+@media (max-width: 617px) {
+  .tbl-header,
+  .row {
+    grid-template-columns:
+      var(--graph-w, auto) minmax(0, 1fr)
+      minmax(0, var(--date-w, 140px))
+      minmax(0, var(--author-w, 100px));
+  }
+  .th.commit,
+  .commit-cell {
+    display: none;
+  }
+}
+@media (max-width: 480px) {
+  /* At <=480px the JS width math caps the graph rail at GRAPH_MAX_W_NARROW
+     (see graphWidthBudget in media/main.js), so the CSS grid here just keeps
+     the --graph-w var authoritative. The rail stays VISIBLE — lanes compress
+     into the compact track instead of being hidden or smearing Content. */
+  .tbl-header,
+  .row {
+    grid-template-columns:
+      var(--graph-w, auto) minmax(0, 1fr)
+      minmax(0, var(--date-w, 140px));
+  }
+  .th.author,
+  .author-cell {
+    display: none;
+  }
+  .text-cell {
+    padding-right: 8px;
+  }
+}
+@media (max-width: 400px) {
+  .tbl-header,
+  .row {
+    grid-template-columns:
+      var(--graph-w, auto) minmax(0, 1fr);
+  }
+  .th.date,
+  .date-cell {
+    display: none;
+  }
+  #controls {
+    padding: 0 8px;
+  }
+}
+
+/* -------------------------------------------------------------------------
+ * Pulse presentation system
+ * -------------------------------------------------------------------------
+ * Narrative-first and deliberately restrained: topology remains a continuous
+ * reading rail, but prose and semantic grouping lead. Fixed row geometry,
+ * keyboard semantics, and Activity/Raw behaviour remain unchanged.
+ */
+
+:root {
+  --ec-void: var(--vscode-editor-background);
+  --ec-shell: var(--vscode-editor-background);
+  --ec-surface: var(--vscode-input-background, var(--vscode-editor-background));
+  --ec-surface-raised: var(--vscode-list-hoverBackground, var(--vscode-editor-background));
+  --ec-ink: var(--vscode-foreground);
+  --ec-ink-strong: var(--vscode-foreground);
+  --ec-muted: var(--vscode-descriptionForeground, var(--vscode-foreground));
+  --ec-faint: var(--vscode-descriptionForeground, var(--vscode-foreground));
+  --ec-hairline: color-mix(
+    in srgb,
+    var(--vscode-panel-border, var(--vscode-editor-background)) 58%,
+    var(--vscode-editor-background)
+  );
+  --ec-hairline-strong: var(--vscode-panel-border, var(--ec-hairline));
+  --ec-cyan: var(--vscode-focusBorder, var(--vscode-foreground));
+  --ec-violet: var(--vscode-symbolIcon-classForeground, var(--ec-muted));
+  --ec-green: var(--vscode-testing-iconPassed, var(--ec-muted));
+  --ec-amber: var(--vscode-editorWarning-foreground, var(--ec-muted));
+  --ec-red: var(--vscode-editorError-foreground, var(--ec-muted));
+}
+
+body {
+  --row-border: var(--ec-hairline);
+  color: var(--ec-ink);
+  background: var(--vscode-editor-background);
+  padding-top: 0;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+#controls {
+  flex: none;
+  gap: 9px;
+  min-height: 42px;
+  margin: 0;
+  padding: 6px 10px;
+  background: var(--vscode-editor-background);
+  border-bottom: 1px solid var(--ec-hairline-strong);
+}
+
+.segmented {
+  flex: none;
+  background: var(--ec-surface);
+  border-color: var(--ec-hairline);
+  border-radius: 4px;
+}
+
+.segmented-btn {
+  color: var(--ec-muted);
+  padding: 4px 10px;
+  font-size: 12px;
+  line-height: 17px;
+  letter-spacing: 0.005em;
+}
+
+.segmented-btn + .segmented-btn {
+  border-left-color: var(--ec-hairline);
+}
+
+.segmented-btn:hover:not(.active) {
+  color: var(--ec-ink);
+  background: var(--vscode-list-hoverBackground, var(--ec-surface-raised));
+}
+
+#profile-control .segmented-btn.active {
+  color: var(--vscode-button-foreground, var(--ec-ink-strong));
+  background: var(
+    --vscode-button-background,
+    var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder))
+  );
+  box-shadow: none;
+}
+
+#search {
+  min-height: 27px;
+  padding: 4px 10px;
+  color: var(--ec-ink);
+  background: var(--ec-surface);
+  border-color: var(--ec-hairline);
+  border-radius: 4px;
+  font-family: var(--vscode-font-family, sans-serif);
+  font-size: 12.5px;
+  line-height: 17px;
+}
+
+#search::placeholder {
+  color: var(--ec-faint);
+}
+
+#search:hover {
+  border-color: var(--vscode-input-border, var(--vscode-focusBorder));
+}
+
+#search:focus {
+  border-color: var(--vscode-focusBorder);
+  box-shadow: 0 0 0 1px var(--vscode-focusBorder);
+}
+
+#layout {
+  gap: 0;
+  background: var(--ec-void);
+}
+
+#rows {
+  background: var(--vscode-editor-background);
+}
+
+.tbl-header,
+.row {
+  grid-template-columns:
+    var(--graph-w, auto) minmax(0, 1fr) minmax(0, var(--date-w, 140px));
+}
+
+.th.author,
+.author-cell,
+.th.commit,
+.commit-cell {
+  display: none;
+}
+
+.tbl-header {
+  color: var(--ec-muted);
+  background: var(--vscode-editor-background);
+  border-bottom-color: var(--ec-hairline-strong);
+}
+
+.tbl-header .th {
+  padding-top: 7px;
+  padding-bottom: 7px;
+  color: var(--ec-muted);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.075em;
+  text-transform: uppercase;
+}
+
+.row {
+  color: var(--ec-ink);
+  border-bottom-color: var(--ec-hairline);
+  user-select: none;
+  transition: background-color 70ms ease;
+}
+
+.row:hover {
+  background-color: var(--vscode-list-hoverBackground, var(--ec-surface-raised));
+}
+
+.row:focus-visible {
+  outline-color: var(--vscode-focusBorder);
+}
+
+.row.row-selected {
+  color: var(--vscode-list-activeSelectionForeground, var(--ec-ink-strong));
+  background: var(
+    --vscode-list-activeSelectionBackground,
+    color-mix(in srgb, var(--vscode-focusBorder) 24%, var(--vscode-editor-background))
+  );
+  box-shadow: none;
+}
+
+.graph-cell {
+  opacity: 1;
+  border-right: 0;
+}
+
+.row:hover .graph-cell,
+.row-selected .graph-cell,
+.row-promoted .graph-cell {
+  opacity: 1;
+}
+
+.text-cell {
+  padding-left: 10px;
+}
+
+.row .summary {
+  color: var(--ec-ink);
+  font-size: 13px;
+  line-height: 18px;
+}
+
+.summary-text,
+.subop-summary {
+  display: flex;
+  align-items: center;
+  line-height: 18px;
+}
+
+.row-human .summary {
+  color: var(--ec-ink-strong);
+  font-weight: 550;
+}
+
+/* The provider-neutral role owns text hierarchy. Legacy kind/is_system classes
+   remain as compatibility hooks, but no longer dim whole cells and everything
+   inside them indiscriminately. */
+.row-tool .text-cell,
+.row-tool .date-cell,
+.row-dim .text-cell,
+.row-dim .date-cell {
+  opacity: 1;
+}
+
+.row-role-result .summary,
+.row-role-lifecycle .summary,
+.row-role-echo .summary {
+  color: var(--ec-muted);
+}
+
+.row-role-artifact .summary,
+.row-role-action .summary {
+  color: color-mix(in srgb, var(--ec-ink) 90%, var(--ec-muted));
+}
+
+.date-cell,
+.author-cell,
+.commit-cell {
+  color: var(--ec-faint);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.date-cell,
+.tbl-header .th.date {
+  opacity: 0.72;
+}
+
+.group-label {
+  color: var(--ec-muted);
+  background: color-mix(in srgb, var(--vscode-editor-background) 92%, transparent);
+  border-radius: 0 0 3px 0;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.025em;
+  line-height: 13px;
+}
+
+.row-group-start {
+  border-top-color: var(--ec-hairline-strong);
+}
+
+.rel-badge,
+.act-badge,
+.out-badge,
+.bundle-count,
+.bundle-status,
+.work-unit-count {
+  border-radius: 3px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 10px;
+  letter-spacing: 0.015em;
+}
+
+.row-meta {
+  gap: 5px;
+  max-width: 46%;
+  margin-right: 7px;
+}
+
+.row-activity-bundle .row-meta {
+  max-width: 100%;
+  margin-right: 0;
+}
+
+/* Plan-repeat bundles retain their narrative heading after the count chip;
+   execute-run bundles use the count as their entire compact label. */
+.row-activity-bundle[data-activity-bundle='plan-repeat'] .row-meta {
+  margin-right: 7px;
+}
+
+/* Activity is a quiet kicker, relations are topology annotations, and outcome
+   is the only lozenge-like state. This prevents every signal from becoming an
+   equally loud outlined chip. */
+.rel-badge,
+.act-badge,
+.out-badge {
+  margin: 0;
+  border: 0;
+  line-height: 15px;
+}
+
+.rel-badge,
+.act-badge {
+  padding: 0;
+  background: transparent;
+}
+
+.rel-badge {
+  color: color-mix(in srgb, var(--ec-violet) 82%, var(--ec-muted));
+}
+
+.act-badge {
+  color: var(--ec-faint);
+}
+
+.out-badge {
+  padding: 0 4px;
+  background: color-mix(in srgb, currentColor 9%, transparent);
+}
+
+.out-badge.outcome-failure {
+  min-width: 15px;
+  padding: 0 2px;
+  color: var(--vscode-editorError-foreground, var(--ec-red));
+  font-family: var(--vscode-font-family, sans-serif);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.out-badge.outcome-success,
+.out-badge.outcome-warning,
+.out-badge.outcome-failure,
+.out-badge.outcome-neutral {
+  border: 0;
+}
+
+.bundle-count {
+  color: var(--ec-ink);
+  margin: 0;
+  padding: 0 5px;
+  background: var(
+    --vscode-badge-background,
+    color-mix(in srgb, var(--vscode-panel-border) 22%, transparent)
+  );
+  border-color: var(--ec-hairline-strong);
+}
+
+.bundle-status {
+  flex: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  color: var(--vscode-testing-iconPassed, var(--ec-green));
+  background: transparent;
+  font-family: var(--vscode-font-family, sans-serif);
+  font-size: 11px;
+}
+
+.row-activity-bundle {
+  background: transparent;
+}
+
+.row-work-unit-start {
+  background: transparent;
+  border-top-color: var(--ec-hairline-strong);
+  box-shadow: none;
+}
+
+.row-work-unit-end {
+  border-bottom-color: var(--ec-hairline-strong);
+}
+
+.work-unit-ribbon {
+  flex: 0 1 auto;
+  color: var(--ec-muted);
+  font-family: var(--vscode-font-family, sans-serif);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.work-unit-count {
+  flex: 0 1 auto;
+  padding: 0;
+  color: var(--ec-faint);
+  background: transparent;
+  font-size: 9.5px;
+}
+
+.work-unit-count::before {
+  content: '· ';
+}
+
+.subop-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin-right: 2px;
+  margin-left: -4px;
+  color: var(--vscode-foreground);
+  font-size: 11px;
+  border-radius: 3px;
+}
+
+.row-expandable:hover .subop-chevron {
+  background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
+}
+
+.session-meta-slot {
+  display: inline-flex;
+  align-items: center;
+  flex: none;
+  gap: 4px;
+  min-width: 0;
+}
+
+.session-meta-slot:empty {
+  display: none;
+}
+
+.session-chip {
+  display: inline-block;
+  min-width: 0;
+  max-width: 140px;
+  padding: 0 5px;
+  overflow: hidden;
+  color: var(--vscode-badge-foreground, var(--vscode-foreground));
+  background: var(
+    --vscode-badge-background,
+    color-mix(in srgb, var(--vscode-panel-border) 36%, transparent)
+  );
+  border-radius: 3px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 9.5px;
+  font-weight: 500;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-chip-agent {
+  color: var(--vscode-symbolIcon-classForeground, var(--vscode-badge-foreground, var(--ec-ink)));
+}
+
+.git-prefix-chip {
+  display: inline-block;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 42%;
+  box-sizing: border-box;
+  margin-right: 6px;
+  padding: 0 6px;
+  overflow: hidden;
+  color: var(--vscode-keybindingLabel-foreground, var(--ec-ink));
+  background: var(
+    --vscode-keybindingLabel-background,
+    color-mix(in srgb, var(--vscode-panel-border) 42%, transparent)
+  );
+  border: 1px solid var(--vscode-keybindingLabel-border, transparent);
+  border-radius: 3px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.git-summary-text {
+  min-width: 0;
+}
+
+.subop-icon,
+.subop-summary {
+  color: var(--ec-muted);
+}
+
+.subop-summary {
+  font-size: 12px;
+}
+
+.row-promoted-rail {
+  box-shadow: inset 2px 0 0 var(--ec-hairline-strong);
+}
+
+.row-promoted-change {
+  box-shadow: inset 2px 0 0 var(--vscode-focusBorder);
+  background: color-mix(in srgb, var(--vscode-focusBorder) 5%, transparent);
+}
+
+.row.row-selected .summary,
+.row.row-selected .date-cell,
+.row.row-selected .subop-summary,
+.row.row-selected .work-unit-ribbon,
+.row.row-selected .work-unit-count {
+  color: var(--vscode-list-activeSelectionForeground, var(--vscode-foreground));
+}
+
+.graph-cell circle.graphDot,
+.graph-cell rect.graphBundleCapsule,
+.graph-cell circle.graphBundleTerminal {
+  stroke: var(--ec-void);
+}
+
+.graph-cell line.graphLine,
+.graph-cell path.graphTransition {
+  stroke-width: 1.4;
+}
+
+.search-banner,
+.view-message {
+  color: var(--ec-muted);
+  background: var(--vscode-editor-background);
+}
+
+.search-banner {
+  border-bottom-color: var(--ec-hairline);
+  font-family: var(--vscode-font-family, sans-serif);
+  font-size: 12px;
+}
+
+/* Safe one-line Markdown semantics. The row stays nowrap/ellipsized; these
+   spans restore hierarchy without turning a history entry into a document. */
+.md-line {
+  display: inline-flex;
+  align-items: baseline;
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.md-line:only-child {
+  flex: 1 1 auto;
+}
+
+.md-line > *,
+.md-strong > *,
+.md-em > *,
+.md-link > *,
+.md-image > *,
+.md-strike > * {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.md-text {
+  display: inline;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.md-heading,
+.md-strong {
+  color: var(--ec-ink-strong);
+  font-weight: 600;
+}
+
+.md-strong,
+.md-em,
+.md-link,
+.md-image,
+.md-strike {
+  display: inline-flex;
+  align-items: baseline;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.md-heading {
+  letter-spacing: -0.005em;
+}
+
+.md-em {
+  color: color-mix(in srgb, var(--ec-ink) 88%, var(--ec-cyan));
+  font-style: italic;
+}
+
+.md-code {
+  display: inline;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin: 0 1px;
+  padding: 0 1px;
+  color: var(--vscode-textPreformat-foreground, var(--ec-ink));
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.92em;
+  font-style: normal;
+}
+
+.md-link {
+  color: var(--ec-cyan);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--ec-cyan) 45%, transparent);
+  text-underline-offset: 2px;
+}
+
+.md-image {
+  color: var(--ec-muted);
+}
+
+.md-marker {
+  display: inline-block;
+  min-width: 12px;
+  margin-right: 3px;
+  color: var(--ec-cyan);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.md-task-done {
+  color: var(--ec-muted);
+}
+
+.md-empty {
+  color: var(--ec-faint);
+  font-style: italic;
+}
+
+.md-quote {
+  color: color-mix(in srgb, var(--ec-ink) 80%, var(--ec-muted));
+  font-style: italic;
+}
+
+.md-callout {
+  display: inline-block;
+  margin-right: 5px;
+  padding: 0;
+  color: var(--ec-cyan);
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 9.5px;
+  font-style: normal;
+  line-height: 14px;
+  text-transform: uppercase;
+}
+
+.md-strike {
+  color: var(--ec-muted);
+  text-decoration: line-through;
+}
+
+.md-break {
+  flex: none;
+  padding: 0 4px;
+  color: var(--ec-faint);
+}
+
+.md-more {
+  flex: none;
+  margin-left: 7px;
+  padding: 0;
+  color: var(--ec-faint);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 10px;
+}
+
+.md-more::before {
+  content: '· ';
+}
+
+@media (max-width: 480px) {
+  #controls {
+    gap: 6px;
+    padding: 6px 8px;
+  }
+
+  .segmented-btn {
+    padding-right: 8px;
+    padding-left: 8px;
+  }
+
+  #search {
+    flex-basis: 100%;
+  }
+
+  .tbl-header,
+  .row {
+    grid-template-columns:
+      var(--graph-w, auto) minmax(0, 1fr) minmax(0, var(--date-w, 140px));
+  }
+}
+
+@media (max-width: 400px) {
+  .tbl-header,
+  .row {
+    grid-template-columns: var(--graph-w, auto) minmax(0, 1fr);
   }
 }

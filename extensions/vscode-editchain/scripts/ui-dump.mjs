@@ -6,7 +6,8 @@
 // the rendered layout as text/number artifacts — no screenshots.
 //
 // Usage:
-//   node scripts/ui-dump.mjs dump    --scenario merge --viewport 1440x900 [--out DIR]
+//   node scripts/ui-dump.mjs dump    --scenario merge --viewport 1440x900
+//                                    [--single-pane] [--out DIR]
 //   node scripts/ui-dump.mjs inspect --scenario merge --selector ".row" [--out DIR]
 //   node scripts/ui-dump.mjs check   --scenario merge [--out DIR]
 //
@@ -31,10 +32,10 @@ const HARNESS = 'file://' + path.join(EXT_ROOT, 'test', 'harness', 'index.html')
 const CHROME = process.env.CHROME_PATH ||
   '/mnt/hot/ambientlight/.cache/puppeteer/chrome/linux-151.0.7922.71/chrome-linux64/chrome';
 
-const SCENARIOS = ['empty', 'linear', 'merge', 'mixed', 'filtered', 'undated', 'error', 'warned', 'large', 'longsummary', 'combined', 'fork', 'highLanes'];
+const SCENARIOS = ['empty', 'linear', 'merge', 'mixed', 'sessionBranch', 'filtered', 'undated', 'error', 'warned', 'large', 'longsummary', 'combined', 'traced', 'badges', 'fork', 'highLanes', 'workUnits', 'workUnitsDeep'];
 
 function parseArgs(argv) {
-  const args = { cmd: argv[0], scenario: 'merge', viewport: '1440x900', out: null, selector: null, search: null, searchRace: false, resize: false, deferredLayout: false, shot: null };
+  const args = { cmd: argv[0], scenario: 'merge', viewport: '1440x900', out: null, selector: null, search: null, searchRace: false, resize: false, deferredLayout: false, shot: null, profile: null, profileSwitch: false, singlePane: false, keyboard: false, restore: false, workUnit: false };
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--scenario') args.scenario = argv[++i];
@@ -46,6 +47,12 @@ function parseArgs(argv) {
     else if (a === '--resize') args.resize = true;
     else if (a === '--deferred-layout') args.deferredLayout = true;
     else if (a === '--shot') args.shot = argv[++i];
+    else if (a === '--profile') args.profile = argv[++i];
+    else if (a === '--profile-switch') args.profileSwitch = true;
+    else if (a === '--single-pane') args.singlePane = true;
+    else if (a === '--keyboard') args.keyboard = true;
+    else if (a === '--restore') args.restore = true;
+    else if (a === '--work-unit') args.workUnit = true;
   }
   return args;
 }
@@ -66,7 +73,6 @@ async function main() {
     console.error('unknown scenario "' + args.scenario + '" — choose from: ' + SCENARIOS.join(', '));
     process.exit(1);
   }
-
   const vp = parseViewport(args.viewport);
   const outDir = args.out || path.join(EXT_ROOT, '.ui-out', args.scenario);
   fs.mkdirSync(outDir, { recursive: true });
@@ -92,6 +98,17 @@ async function main() {
     }
     window.__editchainStart();
   }, args.scenario, args.deferredLayout);
+
+  // Optional initial profile (default Activity): switch through the REAL
+  // control path BEFORE the checks run, so a `--profile raw` run asserts the
+  // Raw view (trace rows visible, hide_trace=false on the wire).
+  if (args.profile === 'activity' || args.profile === 'raw') {
+    await page.waitForFunction(() =>
+      typeof window.__editchainSetProfile === 'function' &&
+      window.__editchainDataReady === true, { timeout: 15000 });
+    await page.evaluate((name) => window.__editchainSetProfile(name), args.profile);
+    await page.evaluate(() => window.__editchainDebug.whenIdle(10000));
+  }
 
   // Optional controlled two-stage assertion: the row-only response must paint
   // while the layout-enabled response is held, then settle with real geometry
@@ -138,13 +155,18 @@ async function main() {
   const metrics = await page.evaluate(() => window.__editchainDebug.getMetrics());
   const assertion = await page.evaluate(() => window.__editchainDebug.assertLayout());
 
-  // Combined scenario: click the combined op and verify ALL bundled sub-ops
-  // reveal inline (the "only the first sub-op appears" regression).
+  // Combined scenario: click the combined op's CHEVRON (the only control that
+  // toggles bundled sub-ops — a plain row click only selects inline)
+  // and verify ALL bundled sub-ops reveal inline (the "only the first sub-op
+  // appears" regression).
   let expansion = null;
   if (args.scenario === 'combined') {
     await page.evaluate(() => {
       const row = document.querySelector('.row[data-key="node:c:1"]');
-      if (row) row.click();
+      if (row) {
+        const chevron = row.querySelector('.subop-chevron');
+        if (chevron) chevron.click();
+      }
     });
     await page.evaluate(() => window.__editchainDebug.whenIdle(5000));
     expansion = await page.evaluate(() => ({
@@ -159,6 +181,45 @@ async function main() {
   let searchResult = null;
   if (args.search) {
     searchResult = await page.evaluate((q) => window.__editchainDebug.runSearch(q, 5000), args.search);
+  }
+
+  // Profile-switch interaction (scenario must be `traced`): Activity -> Raw ->
+  // Activity + search-exit, asserting hide_trace DTOs, offset-0 refetch,
+  // coherent cache/expansion reset, and trace-row visibility.
+  let profileSwitch = null;
+  if (args.profileSwitch) {
+    profileSwitch = await page.evaluate(() => window.__editchainDebug.runProfileSwitch(10000));
+  }
+
+  // Single-pane routing interaction: click selects inline, double-click opens
+  // raw JSON, and the chevron only toggles bundled sub-ops.
+  let singlePane = null;
+  if (args.singlePane) {
+    singlePane = await page.evaluate(() => window.__editchainDebug.runSinglePaneRouting(10000));
+  }
+
+  // Persisted-viewport restore regression (scenario must render enough rows,
+  // e.g. `large`): replaying open into a surviving context must restore the
+  // saved scroll position AND persist it back (never a transient 0 written
+  // before restoreScrollTop had run).
+  let restoreResult = null;
+  if (args.restore) {
+    await page.setViewport({ width: vp.width, height: vp.height });
+    restoreResult = await page.evaluate(() => window.__editchainDebug.runRestoreStateProbe(10000));
+  }
+
+  // Keyboard probe: Enter activates, Space expands (where applicable).
+  let keyboard = null;
+  if (args.keyboard) {
+    keyboard = await page.evaluate(() => window.__editchainDebug.runKeyboardProbe(10000));
+  }
+
+  // Round-two work-unit/bundle interaction probe (scenario `workUnits`):
+  // ArrowRight/Space/Enter expand a typed execute-run bundle, ArrowLeft
+  // collapses it, and Up/Down roving focus stays stable across the rebuilds.
+  let workUnit = null;
+  if (args.workUnit) {
+    workUnit = await page.evaluate(() => window.__editchainDebug.runWorkUnitProbe(10000));
   }
 
   // Reversed-search race (scenario must be `merge`): two rapid searches share
@@ -203,6 +264,11 @@ async function main() {
   fs.writeFileSync(path.join(outDir, 'aria.yml'), formatAria(page));
   if (expansion) fs.writeFileSync(path.join(outDir, 'expansion.json'), JSON.stringify(expansion, null, 2));
   if (searchResult) fs.writeFileSync(path.join(outDir, 'search.json'), JSON.stringify(searchResult, null, 2));
+  if (profileSwitch) fs.writeFileSync(path.join(outDir, 'profile-switch.json'), JSON.stringify(profileSwitch, null, 2));
+  if (singlePane) fs.writeFileSync(path.join(outDir, 'single-pane.json'), JSON.stringify(singlePane, null, 2));
+  if (keyboard) fs.writeFileSync(path.join(outDir, 'keyboard.json'), JSON.stringify(keyboard, null, 2));
+  if (workUnit) fs.writeFileSync(path.join(outDir, 'work-unit.json'), JSON.stringify(workUnit, null, 2));
+  if (restoreResult) fs.writeFileSync(path.join(outDir, 'restore.json'), JSON.stringify(restoreResult, null, 2));
   if (searchRace) fs.writeFileSync(path.join(outDir, 'search-race.json'), JSON.stringify(searchRace, null, 2));
   if (resizeResult) fs.writeFileSync(path.join(outDir, 'resize.json'), JSON.stringify(resizeResult, null, 2));
   if (deferredLayout) fs.writeFileSync(path.join(outDir, 'deferred-layout.json'), JSON.stringify(deferredLayout, null, 2));
@@ -214,6 +280,7 @@ async function main() {
     '',
     '- scenario: ' + args.scenario,
     '- viewport: ' + args.viewport,
+    '- treatment: pulse',
     '- state: ' + JSON.stringify(layout.state),
     '- rows rendered: ' + layout.state.rowsRendered,
     '- svg dots: ' + (layout.svg && layout.svg.dots ? layout.svg.dots.length : 0),
@@ -231,10 +298,38 @@ async function main() {
   }
   if (searchResult) {
     const searchOk = searchResult.resultRows > 0 &&
+      searchResult.secondaryPane === false &&
+      searchResult.selected === true &&
       (searchResult.navigated || searchResult.firstRowChevron);
     summary.push('- search "' + args.search + '": results=' + searchResult.resultRows +
-      ' banner="' + searchResult.bannerText + '" navigated=' + searchResult.navigated +
+      ' banner="' + searchResult.bannerText + '" secondaryPane=' + searchResult.secondaryPane +
+      ' navigated=' + searchResult.navigated +
       ' (' + (searchOk ? 'OK' : 'FAIL') + ')');
+  }
+  if (profileSwitch) {
+    summary.push('- profile switch: pass=' + profileSwitch.pass +
+      ' steps=' + JSON.stringify(profileSwitch.steps));
+  }
+  if (singlePane) {
+    summary.push('- single-pane routing: pass=' + singlePane.pass +
+      ' steps=' + JSON.stringify(singlePane.steps));
+  }
+  if (keyboard) {
+    summary.push('- keyboard probe: pass=' + keyboard.pass +
+      ' steps=' + JSON.stringify(keyboard.steps));
+  }
+  if (workUnit) {
+    summary.push('- work-unit probe: pass=' + workUnit.pass +
+      ' skipped=' + workUnit.skipped +
+      ' steps=' + JSON.stringify(workUnit.steps.map((s) => ({
+        name: s.name, aria: s.bundleAria, subops: s.subopRows, roving: s.rovingTabs,
+      }))));
+  }
+  if (restoreResult) {
+    summary.push('- restore probe: pass=' + restoreResult.pass +
+      ' scrollTop=' + JSON.stringify(restoreResult.detail && restoreResult.detail.actualScrollTop) +
+      ' (expected ' + JSON.stringify(restoreResult.detail && restoreResult.detail.expectedScrollTop) + ')' +
+      ' persisted=' + JSON.stringify(restoreResult.detail && restoreResult.detail.persistedAfter));
   }
   if (searchRace) {
     const step = searchRace.steps[0];
@@ -275,10 +370,17 @@ async function main() {
   const interactionFailed =
     (expansion !== null && !(expansion.subopRows === 7 && expansion.rowsRendered >= 9)) ||
     (searchResult !== null && !(searchResult.resultRows > 0 &&
+      searchResult.secondaryPane === false &&
+      searchResult.selected === true &&
       (searchResult.navigated || searchResult.firstRowChevron))) ||
     (searchRace !== null && !(searchRace.steps[0] && searchRace.steps[0].latestWins === true)) ||
     (resizeResult !== null && resizeResult.pass !== true) ||
-    (deferredLayout !== null && deferredLayout.pass !== true);
+    (deferredLayout !== null && deferredLayout.pass !== true) ||
+    (profileSwitch !== null && profileSwitch.pass !== true) ||
+    (singlePane !== null && singlePane.pass !== true) ||
+    (keyboard !== null && keyboard.pass !== true) ||
+    (workUnit !== null && workUnit.pass !== true) ||
+    (restoreResult !== null && restoreResult.pass !== true);
   if (args.cmd === 'check' && (failedChecks.length > 0 || pageErrors.length > 0 || interactionFailed)) {
     console.error('CHECK FAILED: ' + failedChecks.length + ' layout check(s), ' +
       pageErrors.length + ' page error(s), interactionFailed=' + interactionFailed);
@@ -290,6 +392,7 @@ async function main() {
   console.log('scenario=' + args.scenario + ' viewport=' + args.viewport);
   console.log('state=' + JSON.stringify(layout.state));
   console.log('svg dots=' + (layout.svg && layout.svg.dots ? layout.svg.dots.length : 0) +
+    ' capsules=' + (layout.svg && layout.svg.capsules ? layout.svg.capsules.length : 0) +
     ' edges=' + (layout.svg && layout.svg.edges ? layout.svg.edges.length : 0));
   console.log('checks pass=' + assertion.passCount + ' fail=' + assertion.failCount);
   failedChecks.forEach((c) => console.log('FAIL ' + c.name + ': ' + c.detail));
@@ -297,7 +400,20 @@ async function main() {
   if (expansion) console.log('combined expansion subopRows=' + expansion.subopRows +
     ' rowsRendered=' + expansion.rowsRendered);
   if (searchResult) console.log('search results=' + searchResult.resultRows +
+    ' secondaryPane=' + searchResult.secondaryPane +
     ' navigated=' + searchResult.navigated);
+  if (profileSwitch) console.log('profile-switch pass=' + profileSwitch.pass +
+    ' steps=' + profileSwitch.steps.length);
+  if (singlePane) console.log('single-pane pass=' + singlePane.pass +
+    ' steps=' + singlePane.steps.length);
+  if (keyboard) console.log('keyboard pass=' + keyboard.pass +
+    ' steps=' + keyboard.steps.length);
+  if (workUnit) console.log('work-unit probe pass=' + workUnit.pass +
+    ' skipped=' + workUnit.skipped +
+    ' steps=' + workUnit.steps.map((s) => s.name).join(','));
+  if (restoreResult) console.log('restore pass=' + restoreResult.pass +
+    ' scrollTop=' + JSON.stringify(restoreResult.detail && restoreResult.detail.actualScrollTop) +
+    ' persisted=' + JSON.stringify(restoreResult.detail && restoreResult.detail.persistedAfter));
   if (searchRace) console.log('search-race latestWins=' + searchRace.steps[0].latestWins);
   if (resizeResult) console.log('resize pass=' + resizeResult.pass +
     ' detail=' + JSON.stringify(resizeResult.detail));
@@ -342,6 +458,11 @@ function formatLayoutText(layout) {
   for (const d of (svg.dots || [])) {
     lines.push('dot row=' + d.row + ' center=(' + d.cx + ',' + d.cy + ') r=' + d.r);
   }
+  for (const c of (svg.capsules || [])) {
+    lines.push('capsule row=' + c.row + ' box=(' + c.x + ',' + c.y + ',' + c.w + ',' + c.h + ')' +
+      (c.entry ? (' entry=(' + c.entry.cx + ',' + c.entry.cy + ')') : '') +
+      (c.exit ? (' exit=(' + c.exit.cx + ',' + c.exit.cy + ')') : ''));
+  }
   for (const e of (svg.edges || [])) {
     lines.push('edge len=' + e.len +
       (e.start ? (' start=(' + e.start.x + ',' + e.start.y + ')') : '') +
@@ -362,7 +483,7 @@ function formatAria(page) {
     '',
     '- search input: #search',
     '- rows container: #rows',
-    '- detail pane: #detail',
+    '- secondary pane: none (single history surface)',
     '',
     '_Full ARIA snapshot requires Playwright; this is a structural summary._',
     '',

@@ -6,6 +6,7 @@
 )]
 // Crate-level dependency markers (used by Cargo for feature resolution).
 use regex as _;
+use serde as _;
 use serde_json as _;
 
 use editchain_core::{
@@ -96,7 +97,14 @@ fn virtual_subagent_parent_not_duplicated_after_filter_materializes_it() {
 #[test]
 fn empty_filter_keeps_all_nodes() {
     let projection = HistoryProjection::from_ops(linear_chain());
-    let filter = ChainFilter::new(String::new(), String::new(), String::new(), false, false);
+    let filter = ChainFilter::new(
+        String::new(),
+        String::new(),
+        String::new(),
+        false,
+        false,
+        false,
+    );
     let nodes = projection.filtered_nodes(&filter);
     assert_eq!(nodes.len(), 3);
 }
@@ -110,7 +118,14 @@ fn hide_undated_removes_clock_zero_nodes() {
     let projection = HistoryProjection::from_ops(vec![a, b, c]);
 
     // With splice off, the undated node is dropped but edges are NOT reconnected.
-    let filter = ChainFilter::new(String::new(), String::new(), String::new(), true, false);
+    let filter = ChainFilter::new(
+        String::new(),
+        String::new(),
+        String::new(),
+        true,
+        false,
+        false,
+    );
     let nodes = projection.filtered_nodes(&filter);
     assert_eq!(nodes.len(), 2);
     // The kept nodes are a and c; c's parent still points at the hidden b.
@@ -136,7 +151,14 @@ fn hide_undated_with_splice_reconnects_edges() {
     let a_id = a.id;
     let projection = HistoryProjection::from_ops(vec![a, b, c]);
 
-    let filter = ChainFilter::new(String::new(), String::new(), String::new(), true, true);
+    let filter = ChainFilter::new(
+        String::new(),
+        String::new(),
+        String::new(),
+        true,
+        true,
+        false,
+    );
     let nodes = projection.filtered_nodes(&filter);
     assert_eq!(nodes.len(), 2);
     // c's parent should now be a (the nearest kept ancestor).
@@ -158,7 +180,14 @@ fn hide_undated_removes_undated_leaf_nodes() {
     let leaf = msg_op(1, 2, 0, Some(a.id), "last-prompt");
     let projection = HistoryProjection::from_ops(vec![a.clone(), leaf]);
 
-    let filter = ChainFilter::new(String::new(), String::new(), String::new(), true, true);
+    let filter = ChainFilter::new(
+        String::new(),
+        String::new(),
+        String::new(),
+        true,
+        true,
+        false,
+    );
     let nodes = projection.filtered_nodes(&filter);
     assert_eq!(nodes.len(), 1);
     assert_eq!(nodes[0].summary(), "alpha");
@@ -174,6 +203,7 @@ fn summary_pattern_hides_matching_intermediate_nodes() {
         String::new(),
         false,
         true,
+        false,
     );
     let nodes = projection.filtered_nodes(&filter);
     assert_eq!(nodes.len(), 2);
@@ -200,6 +230,7 @@ fn endpoints_are_preserved_even_when_matching() {
         String::new(),
         false,
         true,
+        false,
     );
     let nodes = projection.filtered_nodes(&filter);
     assert_eq!(nodes.len(), 3);
@@ -232,6 +263,7 @@ fn kind_pattern_hides_matching_nodes() {
         String::new(),
         false,
         true,
+        false,
     );
     let nodes = projection.filtered_nodes(&filter);
     assert_eq!(nodes.len(), 2);
@@ -268,6 +300,7 @@ fn include_kind_pattern_keeps_only_matching_kinds() {
         "^message$".to_string(),
         false,
         true,
+        false,
     );
     let nodes = projection.filtered_nodes(&filter);
     assert_eq!(nodes.len(), 2);
@@ -311,6 +344,7 @@ fn include_kind_pattern_excludes_nonmatching_endpoints() {
         "^message$".to_string(),
         false,
         true,
+        false,
     );
     let nodes = projection.filtered_nodes(&filter);
     assert_eq!(nodes.len(), 1);
@@ -347,6 +381,7 @@ fn include_kind_pattern_is_unconditional_with_hide_undated() {
         "^message$".to_string(),
         true,
         true,
+        false,
     );
     let nodes = projection.filtered_nodes(&filter);
     assert_eq!(nodes.len(), 2);
@@ -376,7 +411,14 @@ fn empty_include_kind_pattern_imposes_no_constraint() {
     let projection = HistoryProjection::from_ops(vec![a.clone(), tool.clone(), c.clone()]);
 
     // Empty include pattern + empty hide patterns -> nothing hidden.
-    let filter = ChainFilter::new(String::new(), String::new(), String::new(), false, false);
+    let filter = ChainFilter::new(
+        String::new(),
+        String::new(),
+        String::new(),
+        false,
+        false,
+        false,
+    );
     assert!(filter.is_empty());
     assert_eq!(projection.filtered_nodes(&filter).len(), 3);
 
@@ -388,6 +430,7 @@ fn empty_include_kind_pattern_imposes_no_constraint() {
         String::new(),
         false,
         true,
+        false,
     );
     let nodes = projection.filtered_nodes(&hide);
     assert_eq!(nodes.len(), 2);

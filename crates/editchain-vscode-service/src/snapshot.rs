@@ -22,7 +22,38 @@ use crate::{OpRecordLocation, OpenDiagnostics, SnapshotOpLocator};
 /// On-disk schema for the immutable render snapshot.
 pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Revision of projection/default-view semantics represented by this schema.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 1;
+///
+/// Bumped when the fixed default view's semantics change so stale snapshots
+/// (which would otherwise silently serve the old default) live under a
+/// different identity hash and are rebuilt from the live projection.
+///
+/// Revision 6: compacted import JSON now carries an explicit
+/// `payload.echo_text_truncated` flag whenever a record's echo message text
+/// was truncated by the display budget, so truncated texts never participate
+/// in cross-record duplicate pairing; the projection also recovers
+/// payload-level `exitCode` evidence from truncated previews and decodes
+/// complete JSON string escapes recovered from a bounded prefix.
+///
+/// Revision 7: the fixed Activity view gains deterministic work-unit metadata
+/// (`work_unit` markers), a conservative promotion flag, and execute-run
+/// bundling (maximal runs of safe low-signal execute rows collapse into one
+/// synthetic expandable node), so stale revision-6 snapshots must not serve
+/// the old flat Activity profile.
+///
+/// Revision 8 preserves canonical Codex custom-exec outcome headers through
+/// bounded import compaction and keeps context-compaction checkpoints visible
+/// but inline in the Activity path, so stale revision-7 snapshots must not
+/// retain misleading success states or one-row compaction branches.
+///
+/// Revision 9 adds the bounded model-provider and agent-nickname subset from
+/// Codex `session_meta` to history rows, so stale revision-8 snapshots must not
+/// silently omit session provenance chips.
+///
+/// Revision 10 groups adjacent repeated Plan headings into typed expandable
+/// Activity bundles while preserving every original reasoning record and the
+/// linear graph path, so stale revision-9 snapshots must not serve duplicate
+/// flat Plan rows.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 10;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

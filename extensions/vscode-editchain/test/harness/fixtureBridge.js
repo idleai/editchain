@@ -31,6 +31,8 @@
   // server-side filtering for the harness). Returns { rows, hiddenKeys }.
   //
   // Semantics are exactly the service's ChainFilter:
+  //   - hide_trace hides every row whose visibility is "trace" unconditionally
+  //     (internal trace records disappear entirely — no endpoint preservation);
   //   - hide_undated hides every undated row unconditionally (including leaves);
   //   - include_kind_pattern is an INCLUSIVE constraint: when set, only rows
   //     whose kind matches are kept — every non-matching kind is excluded
@@ -70,6 +72,10 @@
       // Clone before any splice mutation: applyFilter must be idempotent —
       // GetWindow and GetLayout each run their own pass over the same rows.
       const row = { ...r, parents: Array.isArray(r.parents) ? r.parents.slice() : [] };
+      if (filter.hide_trace && r.visibility === 'trace') {
+        hide(r);
+        continue;
+      }
       if (filter.hide_undated && !r.timestamp_ms) {
         hide(r);
         continue;
@@ -125,6 +131,55 @@
     return { rows: kept, hiddenKeys };
   }
 
+  // A fixture may model the Activity projection AND the raw (unbundled)
+  // stream separately (`rawRows` + `layoutRowsRaw`), mirroring the service's
+  // profile views. The Raw profile requests hide_trace=false on the wire, so
+  // the bridge serves the raw stream (bundles unfolded, trace rows kept)
+  // exactly when that flag is set; every other request gets the Activity
+  // projection (the default profile). Fixtures without `rawRows` keep their
+  // single-list behaviour unchanged.
+  function viewRows(fixture, req) {
+    if (req && req.filter && req.filter.hide_trace === false &&
+        Array.isArray(fixture.rawRows)) {
+      return fixture.rawRows;
+    }
+    return fixture.rows || [];
+  }
+
+  function isRawView(fixture, req) {
+    return !!req && !!req.filter && req.filter.hide_trace === false &&
+      Array.isArray(fixture.rawRows);
+  }
+
+  function viewLayoutRows(fixture, req) {
+    if (isRawView(fixture, req) && Array.isArray(fixture.layoutRowsRaw)) return fixture.layoutRowsRaw;
+    return fixture.layoutRows || [];
+  }
+
+  // Mirror the HistoryRow serde defaults for the additive activity fields
+  // (work_unit -> None, promoted -> false, activity_bundle -> None — see
+  // crates/editchain-protocol) and the ActivityBundleKind enum round trip:
+  // the typed "execute-run" and "plan-repeat" strings survive; every other
+  // kind maps to the protocol's forward-compatible Unknown variant
+  // ("unknown"), exactly like serde's
+  // #[serde(other)] deserialization. Hand-written fixture JSON and older
+  // payloads both exercise the same defaulting the real service applies, so
+  // clients can rely on the normalized shape.
+  function normalizeActivityFields(row) {
+    const out = { ...row };
+    if (!Object.prototype.hasOwnProperty.call(out, 'work_unit')) out.work_unit = null;
+    if (!Object.prototype.hasOwnProperty.call(out, 'promoted')) out.promoted = false;
+    if (!Object.prototype.hasOwnProperty.call(out, 'activity_bundle')) out.activity_bundle = null;
+    const b = out.activity_bundle;
+    if (b && typeof b === 'object') {
+      out.activity_bundle = {
+        ...b,
+        kind: b.kind === 'execute-run' || b.kind === 'plan-repeat' ? b.kind : 'unknown',
+      };
+    }
+    return out;
+  }
+
   // Expand a top-level row's bundled sub_ops into a fixed fully-expanded flat
   // list (parent + one row per sub-op), mirroring the service. Each sub-op row
   // is flagged is_subop and draws every lane passing straight through its region
@@ -167,6 +222,12 @@
           is_subop: true,
           parent_row: out.length - 1 - subs.length + i,
           subop_kind: sub.kind,
+          // Bundled metadata records are sub-ops, never top-level rows: they
+          // carry no work-unit, no promotion, and no bundle metadata of their
+          // own (exactly like the service's expanded member rows).
+          work_unit: null,
+          promoted: false,
+          activity_bundle: null,
         });
       }
     }
@@ -178,7 +239,7 @@
     const offset = req.offset || 0;
     const limit = req.limit || 0;
     const hideSub = !!req.hide_submodules;
-    let rows = fixture.rows || [];
+    let rows = viewRows(fixture, req);
     if (hideSub) rows = rows.filter((r) => !r.is_submodule);
     const filtered = applyFilter(rows, req.filter);
     rows = filtered.rows;
@@ -186,7 +247,7 @@
     // service: shipped ONLY with the offset-0 window, so the renderer must
     // establish the snapshot from offset zero before paging deep windows.
     const subOpCounts = req.offset === 0
-      ? (fixture.subOpCounts || rows.map((r) => (r.sub_ops || []).length))
+      ? rows.map((r) => (r.sub_ops || []).length)
       : null;
     const expanded = expandSubOps(rows);
     const total = fixture.total !== undefined && fixture.total >= 0
@@ -197,17 +258,16 @@
     // graph column from real lane data.
     const maxLane = fixture.max_lane !== undefined
       ? fixture.max_lane
-      : (fixture.layoutRows || []).reduce((m, r) => Math.max(m, r.lane || 0), 0);
+      : viewLayoutRows(fixture, req).reduce((m, r) => Math.max(m, r.lane || 0), 0);
     const includeLayout = req.include_layout !== false;
     const slice = expanded.slice(offset, offset + limit).map((row) => {
-      if (includeLayout) return row;
-      return {
-        ...row,
-        lane: 0,
-        above: [],
-        below: [],
-        transitions: [],
-      };
+      const out = normalizeActivityFields(row);
+      if (includeLayout) return out;
+      out.lane = 0;
+      out.above = [];
+      out.below = [];
+      out.transitions = [];
+      return out;
     });
     return {
       rows: slice,
@@ -223,20 +283,21 @@
   function layoutResponse(fixture, req) {
     const offset = req.offset || 0;
     const limit = req.limit || 0;
-    let rows = fixture.layoutRows || [];
+    let rows = viewLayoutRows(fixture, req);
     // Coherent with windowResponse: the hidden set is computed from the SAME
     // row population GetWindow filters — submodules are hidden when requested,
     // then the chain filter's hidden keys are added — so layout never shows
     // rows the window response excluded.
+    const rowSource = viewRows(fixture, req);
     const hiddenKeys = new Set();
     if (req.hide_submodules) {
-      for (const r of (fixture.rows || [])) {
+      for (const r of rowSource) {
         if (r.is_submodule && r.node_key !== undefined) hiddenKeys.add(r.node_key);
       }
     }
     // The window's filter result also carries the SPLICED parent lists; layout
     // reuses them so its edges match the window's reconnected parents exactly.
-    const filtered = applyFilter(fixture.rows, req.filter);
+    const filtered = applyFilter(rowSource, req.filter);
     const filterHidden = filtered.hiddenKeys;
     for (const k of filterHidden) hiddenKeys.add(k);
     rows = rows.filter((r) => !hiddenKeys.has(r.node));
@@ -253,7 +314,10 @@
     // their authored edge geometry untouched.
     let edges;
     if (hiddenKeys.size === 0) {
-      edges = (fixture.edges || []).filter((e) => {
+      const edgesSource = isRawView(fixture, req)
+        ? (fixture.edgesRaw || fixture.edges || [])
+        : (fixture.edges || []);
+      edges = edgesSource.filter((e) => {
         const idx = rowIndex.get(e.child);
         return idx !== undefined && idx >= offset && idx < offset + limit;
       });
@@ -289,6 +353,9 @@
   function handleRequest(id, body) {
     const fixture = window.__editchainFixture || {};
     if (!body || typeof body !== 'object') return;
+    // Harness-only request log: probes/e2e assert on the exact DTOs the
+    // renderer sends (e.g. hide_trace riding inside every GetWindow filter).
+    window.__editchainRequestLog.push(body);
 
     switch (body.Open !== undefined ? 'Open' : Object.keys(body)[0]) {
       case 'Open': {
@@ -337,13 +404,33 @@
       }
       case 'GetNodeDetails': {
         const opId = body.GetNodeDetails.op_id;
-        const row = (fixture.rows || []).find((r) => r.node_key === opId);
+        // Resolve against top-level rows AND their expanded bundled sub-ops
+        // (sub-op rows carry the bundled record's real op_id), mirroring the
+        // service's ability to inspect bundled records.
+        const expanded = expandSubOps(fixture.rows || []);
+        const row = (fixture.rows || []).find((r) => r.node_key === opId) ||
+          expanded.find((r) => r.op_id === opId);
         if (row) {
           respond(id, { Ok: { op_id: opId, git_oid: null, repository: null,
             summary: row.summary, body: row.summary, parents: [], git_parents: [],
             refs: [], changed_paths: [] } });
         } else {
           respond(id, { Error: 'node not found' });
+        }
+        return;
+      }
+      case 'ResolveObject': {
+        const oid = body.ResolveObject.oid;
+        const repo = body.ResolveObject.repository;
+        const row = (fixture.rows || []).find(
+          (r) => r.git_oid === oid && (repo === undefined || r.repository === repo)
+        );
+        if (row) {
+          respond(id, { Ok: { oid, repository: repo || row.repository,
+            message: row.summary, author: row.author || '',
+            timestamp_ms: row.timestamp_ms || 0, refs: [], changed_paths: [] } });
+        } else {
+          respond(id, { Error: 'object not found' });
         }
         return;
       }
@@ -432,6 +519,11 @@
   };
 
   window.__editchainReqId = 0;
+  // Harness-only request log (see handleRequest). Reset per scenario.
+  window.__editchainRequestLog = [];
+  window.__editchainClearRequestLog = function () {
+    window.__editchainRequestLog = [];
+  };
   // Controlled-release hooks for the deterministic race tests (see
   // layoutProbe). The first GetWindow / Search request after a hook is set is
   // captured as `{ taken:false }` and only responds when the test calls
@@ -447,6 +539,7 @@
     window.__editchainFixture = all[name]();
     window.__editchainScenarioName = name;
     persistedState = undefined;
+    window.__editchainRequestLog = [];
   };
 
   // Emulate the extension host's startup handshake (see extension.ts

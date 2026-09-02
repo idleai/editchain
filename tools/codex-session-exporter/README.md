@@ -89,7 +89,14 @@ rolloutOrdinal?, timestamp?).
     "changedTurns": [{ "turnId": "turn-1", "status": "completed", "errorMessage": null,
                         "startedAt": ..., "completedAt": ..., "durationMs": ... }],
     "removedTurnIds": ["turn-2"],           // rollback
-    "sessionMeta": { ... } | null,          // session/subagent metadata
+    "sessionMeta": {
+      "threadId": "...", "cwd": "/workspace",
+      "git": {                              // one snapshot at session start
+        "commitHash": "012345...",
+        "branch": "r4",
+        "repositoryUrl": "https://github.com/..."
+      }
+    } | null,
     "interAgent": { ... } | null,           // subagent message content + metadata
     "compacted": { "message": "...", "replacementCount": 1 } | null
   }
@@ -237,6 +244,9 @@ marker's item id.
   `parentThreadId`, `forkedFromId`, `agentPath`, `agentNickname`, `agentRole`,
   `threadSource`, and the raw `source` passthrough (e.g.
   `{"subagent":{"thread_spawn":{...}}}`) are exposed separately.
+- `sessionMeta.git` is the optional Git snapshot Codex captured when the
+  session started (`commitHash`, `branch`, and `repositoryUrl`). It is
+  session-level provenance; the bridge never synthesizes per-turn Git state.
 - Each physical file is projected independently (fresh builder, fresh id
   space). Item ids and raw lines may repeat across files; always scope by
   `sourcePath`.

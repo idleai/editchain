@@ -7,12 +7,15 @@
 //! kept ancestor — producing a truncated view rather than disconnected stubs.
 //!
 //! This subsumes hiding timestamp-less records (`last-prompt`, `custom-title`,
-//! etc.) that import with `Clock::UnixMs(0)` via [`ChainFilter::hide_undated`].
+//! etc.) that import with `Clock::UnixMs(0)` via [`ChainFilter::hide_undated`],
+//! and hiding semantic trace rows (duplicate/echo/transport envelopes) via
+//! [`ChainFilter::hide_trace`].
 
 use std::collections::{HashMap, HashSet};
 
 use editchain_core::{Op, OpId};
 
+use crate::taxonomy::Visibility;
 use crate::HistoryNode;
 
 /// A compiled matcher over display text.
@@ -64,11 +67,15 @@ impl Matcher {
 ///   anchors/targets required to preserve branch and reconnect geometry. This
 ///   lets "Show messages only" stay server-side without severing the execution
 ///   topology.
+/// - [`Self::hide_trace`] hides semantic trace rows (classified
+///   [`crate::taxonomy::Visibility::Trace`]) unconditionally, like
+///   `hide_undated`.
 ///
 /// Chain endpoints (nodes with no parent or no child in the full graph) are
-/// always preserved regardless of *hide* predicate matches. `hide_undated` and
-/// `include_kind_pattern` are not ordinarily endpoint-aware; structural
-/// relationship anchors/targets are the topology-preserving exception.
+/// always preserved regardless of *hide* predicate matches. `hide_undated`,
+/// `hide_trace`, and `include_kind_pattern` are not ordinarily endpoint-aware;
+/// structural relationship anchors/targets are the topology-preserving
+/// exception.
 #[derive(Debug)]
 pub struct ChainFilter {
     /// Regex/literal pattern matched against each node's display summary.
@@ -80,6 +87,11 @@ pub struct ChainFilter {
     pub include_kind_pattern: String,
     /// Hide nodes with no real timestamp (`timestamp_ms() == 0`).
     pub hide_undated: bool,
+    /// Hide semantic trace rows (duplicate/echo/transport envelopes classified
+    /// as [`crate::taxonomy::Visibility::Trace`]) unconditionally, splicing
+    /// causal edges across them. Structural relationship anchors/targets are
+    /// always preserved, matching `hide_undated` semantics.
+    pub hide_trace: bool,
     /// Reconnect causal edges across hidden intermediate nodes so chains stay
     /// continuous instead of leaving disconnected stubs.
     pub splice: bool,
@@ -90,7 +102,14 @@ pub struct ChainFilter {
 
 impl Default for ChainFilter {
     fn default() -> Self {
-        Self::new(String::new(), String::new(), String::new(), true, true)
+        Self::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            true,
+            true,
+            false,
+        )
     }
 }
 
@@ -98,8 +117,9 @@ impl ChainFilter {
     /// Build a filter from raw patterns and flags.
     #[must_use]
     #[expect(
+        clippy::too_many_arguments,
         clippy::fn_params_excessive_bools,
-        reason = "hide_undated and splice are independent, mutually-exclusive filter flags"
+        reason = "the filter flags are independent, named constructor parameters used across the workspace"
     )]
     pub fn new(
         summary_pattern: String,
@@ -107,6 +127,7 @@ impl ChainFilter {
         include_kind_pattern: String,
         hide_undated: bool,
         splice: bool,
+        hide_trace: bool,
     ) -> Self {
         Self {
             summary_matcher: Matcher::new(&summary_pattern),
@@ -116,6 +137,7 @@ impl ChainFilter {
             kind_pattern,
             include_kind_pattern,
             hide_undated,
+            hide_trace,
             splice,
         }
     }
@@ -124,6 +146,7 @@ impl ChainFilter {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         !self.hide_undated
+            && !self.hide_trace
             && self.summary_pattern.is_empty()
             && self.kind_pattern.is_empty()
             && self.include_kind_pattern.is_empty()
@@ -149,6 +172,7 @@ impl ChainFilter {
             kind_pattern: self.kind_pattern.clone(),
             include_kind_pattern: self.include_kind_pattern.clone(),
             hide_undated: self.hide_undated,
+            hide_trace: self.hide_trace,
             splice: self.splice,
         }
     }
@@ -165,6 +189,8 @@ pub struct ChainFilterKey {
     pub include_kind_pattern: String,
     /// Hide undated flag.
     pub hide_undated: bool,
+    /// Hide trace flag.
+    pub hide_trace: bool,
     /// Splice flag.
     pub splice: bool,
 }
@@ -176,9 +202,10 @@ pub struct ChainFilterKey {
 /// hidden intermediate nodes.
 ///
 /// `hide_undated` hides every ordinary undated node (including leaves).
-/// `include_kind_pattern` keeps only ordinary matching kinds (including leaves).
-/// Pattern-based hide truncation preserves endpoints (no parent / no child in
-/// the full graph) so a filtered chain keeps its anchors. Structural
+/// `hide_trace` hides every trace-classified node (including leaves).
+/// `include_kind_pattern` keeps only ordinary matching kinds (including
+/// leaves). Pattern-based hide truncation preserves endpoints (no parent / no
+/// child in the full graph) so a filtered chain keeps its anchors. Structural
 /// relationship anchor and target rows (the rows that carry or point at a
 /// `ForkOf` / `SubagentOf` / `ReconnectsTo` note) are preserved from every
 /// hide predicate so branch/reconnect geometry stays visible even when their
@@ -274,7 +301,9 @@ pub fn apply_owned(
     // `hide_undated` hides EVERY undated node unconditionally — including leaf
     // nodes. Undated records (e.g. `last-prompt`, `custom-title`) are metadata
     // with no meaningful chain position, so a lone undated leaf is junk and must
-    // not survive just because it happens to be an endpoint.
+    // not survive just because it happens to be an endpoint. `hide_trace`
+    // behaves the same way for trace-classified rows: duplicate/echo/transport
+    // envelopes are noise even as endpoints.
     //
     // Pattern-based hide truncation (summary/kind) instead preserves endpoints
     // (nodes with no parent or no child in the full graph) so a filtered chain
@@ -292,6 +321,10 @@ pub fn apply_owned(
             continue;
         }
         if filter.hide_undated && n.timestamp_ms() == 0 {
+            let _: bool = hidden.insert(key);
+            continue;
+        }
+        if filter.hide_trace && n.visibility() == Visibility::Trace {
             let _: bool = hidden.insert(key);
             continue;
         }

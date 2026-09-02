@@ -626,6 +626,7 @@ version = "0.1.0"
 dependencies = [
  "editchain-core",
  "regex",
+ "serde",
  "serde_json",
 ]
 
@@ -634,6 +635,7 @@ name = "editchain-protocol"
 version = "0.1.0"
 dependencies = [
  "editchain-core",
+ "editchain-project",
  "editchain-query",
  "serde",
  "serde_json",

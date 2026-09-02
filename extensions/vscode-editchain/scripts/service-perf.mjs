@@ -139,6 +139,9 @@ async function main() {
     kind_pattern: '',
     include_kind_pattern: '',
     hide_undated: false,
+    // Mirror the production webview's fixed Activity profile so this probe
+    // measures the pregenerated render-snapshot path instead of Raw mode.
+    hide_trace: true,
     splice: true,
   };
 

@@ -29,13 +29,15 @@ use editchain_core::{
 use editchain_git::{discover_repositories, resolve_commit, walk_history, RepositoryHandle};
 use editchain_import::{hash_raw, FsBlobSink};
 use editchain_index::LexicalIndex;
+use editchain_project::activity::{ActivityRowAnnotation, WorkUnitMarker};
 use editchain_project::filter::ChainFilter;
+use editchain_project::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
 use editchain_protocol::{
     ChainFilterDto, GraphLayout as ProtocolGraphLayout, HistoryRow, HistoryWindow, LayoutEdge,
     LayoutPoint, LayoutRow, NodeDetails, ParentRelationDto, ParentRelationKind, RepositoryInfo,
     Request, RequestBody, ResolvedObject, Response, ResponseBody, SearchFiltersDto, SearchHit,
-    SearchResponse,
+    SearchResponse, SessionMetaDto, WorkUnitDto,
 };
 use editchain_query::search::{SearchFilters, Source};
 
@@ -52,6 +54,9 @@ pub struct Workspace {
     source_ops: Vec<Op>,
     /// Constant-time lookup into `source_ops` for detail requests.
     source_op_index: HashMap<OpId, usize>,
+    /// Small session provenance labels keyed by the same `session:<id>` group
+    /// strings used by projected history rows.
+    session_metadata: HashMap<String, SessionMetaDto>,
     /// Accepted operation ids and exact segment-record locations. This is
     /// persisted into render snapshots so details remain lazy on the fast path.
     source_op_locations: Vec<SnapshotOpLocator>,
@@ -104,6 +109,9 @@ pub struct HistoryWindowOptions<'a> {
 struct ViewSnapshot {
     /// Canonical top-level rows in display order.
     nodes: Vec<editchain_project::HistoryNode>,
+    /// Per-row Activity-view annotations (work-unit markers + promotion),
+    /// parallel to `nodes` 1:1.
+    annotations: Vec<ActivityRowAnnotation>,
     /// Graph geometry over `nodes`, built only after the first row window has
     /// painted. `None` is a valid provisional row-only snapshot.
     context: Option<editchain_project::layout::LayoutContext>,
@@ -652,58 +660,681 @@ fn compact_import_payload(
     }
 }
 
-/// Convert raw JSONL to the minimal fields used by row/sub-op labeling.
+/// Convert raw JSONL to the bounded semantic subset used by row labeling,
+/// classification, and outcome logic.
+///
+/// The projection classifier and outcome logic read the envelope
+/// discriminators plus a small semantic subset: `payload.message` /
+/// `payload.content` text (bounded), the first `payload.summary` reasoning
+/// summary text (bounded), `payload.role`, `arguments`/`output` previews, a
+/// bounded structural/content signal for tool-payload carriers
+/// (`arguments`/`input`/`parameters`), and structured outcome evidence
+/// (`status`, `exitCode`, `errorMessage` at `payload` or `payload.item`
+/// level, plus the canonical three-line Codex execution-result header).
+/// Large outputs stay bounded to the display preview limits, and blob-backed
+/// imports pass through the same bounded preview path, so the full record is
+/// never copied into the projection.
+#[must_use]
 fn compact_import_record(bytes: &[u8]) -> Vec<u8> {
     if let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) {
-        let record_type = value
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        if !record_type.is_empty() {
-            let compact = match record_type {
-                "event_msg" => serde_json::json!({
-                    "type": record_type,
-                    "payload": {
-                        "type": value
-                            .get("payload")
-                            .and_then(|payload| payload.get("type"))
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("")
-                    }
-                }),
-                "attachment" => serde_json::json!({
-                    "type": record_type,
-                    "attachment": value.get("attachment").cloned().unwrap_or_default()
-                }),
-                "user" => serde_json::json!({
-                    "type": record_type,
-                    "text": first_nested_json_text(&value).unwrap_or_default()
-                }),
-                _ => serde_json::json!({ "type": record_type }),
-            };
-            return serde_json::to_vec(&compact).unwrap_or_default();
-        }
+        return serde_json::to_vec(&compact_import_value(&value)).unwrap_or_default();
     }
 
     // Large blob JSON is intentionally read only as a prefix, so a complete
-    // serde parse can end at EOF. Discriminators are near the envelope start;
-    // recover those simple string fields without reading the full record.
+    // serde parse can end at EOF. Discriminators and the semantic subset sit
+    // near the envelope start; recover those simple fields without reading
+    // the full record.
     let raw = String::from_utf8_lossy(bytes);
-    if let Some(record_type) = json_string_field(&raw, "type", 0) {
-        let compact = if record_type == "event_msg" {
-            let payload_start = raw.find("\"payload\"").unwrap_or(0);
-            let event_type = json_string_field(&raw, "type", payload_start).unwrap_or("");
-            serde_json::json!({
-                "type": record_type,
-                "payload": { "type": event_type }
-            })
-        } else {
-            serde_json::json!({ "type": record_type })
-        };
-        return serde_json::to_vec(&compact).unwrap_or_default();
+    let Some(record_type) = json_string_field(&raw, "type", 0) else {
+        return compact_text_bytes(bytes);
+    };
+    let mut compact = serde_json::Map::new();
+    drop(compact.insert(
+        "type".to_string(),
+        serde_json::Value::String(record_type.to_string()),
+    ));
+    if record_type == "session_meta" {
+        let payload_start = raw.find("\"payload\"").unwrap_or(0);
+        let mut payload = serde_json::Map::new();
+        let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "model_provider");
+        let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "agent_nickname");
+        if !payload.is_empty() {
+            drop(compact.insert("payload".to_string(), serde_json::Value::Object(payload)));
+        }
+    } else if record_type == "event_msg" || record_type == "response_item" {
+        let payload_start = raw.find("\"payload\"").unwrap_or(0);
+        let mut payload = serde_json::Map::new();
+        // Whether the echo message text (`payload.message` on an
+        // `event_msg`/`agent_message`, or the first `payload.content` text on
+        // a `response_item`/`message`) was truncated by the preview read limit
+        // or the display budget. Truncated text must never participate in
+        // exact duplicate pairing, so the classifier is told explicitly
+        // instead of guessing from an ellipsis.
+        let mut echo_text_truncated = false;
+        if let Some(event_type) = json_string_field(&raw, "type", payload_start) {
+            drop(payload.insert(
+                "type".to_string(),
+                serde_json::Value::String(event_type.to_string()),
+            ));
+        }
+        echo_text_truncated |= copy_preview_string(&raw, payload_start, &mut payload, "message");
+        let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "role");
+        let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "status");
+        let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "errorMessage");
+        // Recover payload-level outcome evidence the same way the full-parse
+        // path does (a truncated prefix may cut the record before its
+        // `payload.item` block entirely).
+        if let Some(code) = json_number_field(&raw, "exitCode", payload_start) {
+            drop(payload.insert(
+                "exitCode".to_string(),
+                serde_json::Value::Number(code.into()),
+            ));
+        }
+        let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "arguments");
+        copy_preview_structured(&raw, payload_start, &mut payload, "arguments");
+        let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "input");
+        copy_preview_structured(&raw, payload_start, &mut payload, "input");
+        let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "parameters");
+        copy_preview_structured(&raw, payload_start, &mut payload, "parameters");
+        let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "output");
+        copy_codex_exec_output_header_from_prefix(&raw, payload_start, &mut payload);
+        if let Some(content_start) = raw
+            .get(payload_start..)
+            .and_then(|tail| tail.find("\"content\""))
+        {
+            let content_abs = payload_start.saturating_add(content_start);
+            if let Some((text, cut_by_read_limit)) =
+                json_string_field_preview(&raw, "text", content_abs)
+            {
+                let decoded = decode_json_string_preview(text);
+                let (compact, cut_by_char_limit) = compact_text_with_signal(&decoded);
+                echo_text_truncated |= cut_by_read_limit || cut_by_char_limit;
+                drop(payload.insert(
+                    "content".to_string(),
+                    serde_json::json!([{ "type": "input_text", "text": compact }]),
+                ));
+            }
+        }
+        if let Some(summary_start) = raw
+            .get(payload_start..)
+            .and_then(|tail| tail.find("\"summary\""))
+        {
+            let summary_abs = payload_start.saturating_add(summary_start);
+            if let Some(text) = json_string_field(&raw, "text", summary_abs) {
+                let decoded = decode_json_string_preview(text);
+                if !decoded.trim().is_empty() {
+                    drop(payload.insert(
+                        "summary".to_string(),
+                        serde_json::json!([{ "type": "summary_text", "text": compact_text(&decoded) }]),
+                    ));
+                }
+            }
+        }
+        if let Some(item_start) = raw
+            .get(payload_start..)
+            .and_then(|tail| tail.find("\"item\""))
+        {
+            let item_abs = payload_start.saturating_add(item_start);
+            let mut item = serde_json::Map::new();
+            let _: bool = copy_preview_string(&raw, item_abs, &mut item, "status");
+            let _: bool = copy_preview_string(&raw, item_abs, &mut item, "errorMessage");
+            if let Some(code) = json_number_field(&raw, "exitCode", item_abs) {
+                drop(item.insert(
+                    "exitCode".to_string(),
+                    serde_json::Value::Number(code.into()),
+                ));
+            }
+            if !item.is_empty() {
+                drop(payload.insert("item".to_string(), serde_json::Value::Object(item)));
+            }
+        }
+        if echo_text_truncated {
+            drop(payload.insert(
+                "echo_text_truncated".to_string(),
+                serde_json::Value::Bool(true),
+            ));
+        }
+        if !payload.is_empty() {
+            drop(compact.insert("payload".to_string(), serde_json::Value::Object(payload)));
+        }
     }
+    serde_json::to_vec(&serde_json::Value::Object(compact)).unwrap_or_default()
+}
 
-    compact_text_bytes(bytes)
+/// Bounded semantic subset of one fully-parsed raw import record.
+#[must_use]
+fn compact_import_value(value: &serde_json::Value) -> serde_json::Value {
+    let record_type = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let mut compact = serde_json::Map::new();
+    drop(compact.insert(
+        "type".to_string(),
+        serde_json::Value::String(record_type.to_string()),
+    ));
+    match record_type {
+        "attachment" => {
+            drop(compact.insert(
+                "attachment".to_string(),
+                value.get("attachment").cloned().unwrap_or_default(),
+            ));
+        }
+        "user" => {
+            drop(compact.insert(
+                "text".to_string(),
+                serde_json::Value::String(first_nested_json_text(value).unwrap_or_default()),
+            ));
+        }
+        _ => {}
+    }
+    if let Some(payload) = value.get("payload") {
+        let mut compact_payload = serde_json::Map::new();
+        // Whether the echo message text (`payload.message` on an
+        // `event_msg`/`agent_message`, or the first `payload.content` text on
+        // a `response_item`/`message`) was truncated by the display budget.
+        // Truncated text must never participate in exact duplicate pairing,
+        // so the classifier is told explicitly instead of guessing from the
+        // ellipsis.
+        let mut echo_text_truncated = false;
+        if record_type == "session_meta" {
+            let _: bool = copy_bounded_field(payload, &mut compact_payload, "model_provider");
+            let _: bool = copy_bounded_field(payload, &mut compact_payload, "agent_nickname");
+        }
+        copy_string_field(payload, &mut compact_payload, "type");
+        copy_string_field(payload, &mut compact_payload, "role");
+        echo_text_truncated |= copy_bounded_field(payload, &mut compact_payload, "message");
+        let _: bool = copy_bounded_field(payload, &mut compact_payload, "arguments");
+        copy_structured_payload_field(payload, &mut compact_payload, "arguments");
+        copy_structured_payload_field(payload, &mut compact_payload, "input");
+        copy_structured_payload_field(payload, &mut compact_payload, "parameters");
+        let _: bool = copy_bounded_field(payload, &mut compact_payload, "output");
+        copy_codex_exec_output_header(payload, &mut compact_payload);
+        let _: bool = copy_bounded_field(payload, &mut compact_payload, "status");
+        let _: bool = copy_bounded_field(payload, &mut compact_payload, "errorMessage");
+        copy_i64_field(payload, &mut compact_payload, "exitCode");
+        if let Some(content) = payload.get("content") {
+            let (compact, truncated) = compact_content(content);
+            echo_text_truncated |= truncated;
+            drop(compact_payload.insert("content".to_string(), compact));
+        }
+        if let Some(summary) = payload.get("summary") {
+            let compact = compact_summary(summary);
+            match compact.as_array() {
+                Some(items) if !items.is_empty() => {
+                    drop(compact_payload.insert("summary".to_string(), compact));
+                }
+                _ => {}
+            }
+        }
+        if let Some(item) = payload.get("item") {
+            let mut compact_item = serde_json::Map::new();
+            let _: bool = copy_bounded_field(item, &mut compact_item, "status");
+            let _: bool = copy_bounded_field(item, &mut compact_item, "errorMessage");
+            copy_i64_field(item, &mut compact_item, "exitCode");
+            if !compact_item.is_empty() {
+                drop(
+                    compact_payload
+                        .insert("item".to_string(), serde_json::Value::Object(compact_item)),
+                );
+            }
+        }
+        if echo_text_truncated {
+            drop(compact_payload.insert(
+                "echo_text_truncated".to_string(),
+                serde_json::Value::Bool(true),
+            ));
+        }
+        if !compact_payload.is_empty() {
+            drop(compact.insert(
+                "payload".to_string(),
+                serde_json::Value::Object(compact_payload),
+            ));
+        }
+    }
+    serde_json::Value::Object(compact)
+}
+
+/// Copy one JSON string field verbatim into a compact payload object.
+fn copy_string_field(
+    source: &serde_json::Value,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) {
+    if let Some(value) = source.get(key).and_then(serde_json::Value::as_str) {
+        drop(out.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        ));
+    }
+}
+
+/// Copy one JSON text field, bounded to the display preview limit.
+///
+/// Returns whether the copied text was truncated by the display budget, so
+/// callers can flag echo message text that must not participate in exact
+/// duplicate pairing.
+fn copy_bounded_field(
+    source: &serde_json::Value,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> bool {
+    let Some(value) = source.get(key).and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    if value.trim().is_empty() {
+        return false;
+    }
+    let (compact, truncated) = compact_text_with_signal(value);
+    drop(out.insert(key.to_string(), serde_json::Value::String(compact)));
+    truncated
+}
+
+/// Retain only the canonical three-line status header from a fully parsed
+/// Codex custom-exec output array.
+///
+/// The normalized Tool child keeps the complete bounded result preview. This
+/// small raw-envelope copy exists solely so projection outcome classification
+/// does not lose its structured evidence during service compaction.
+fn copy_codex_exec_output_header(
+    payload: &serde_json::Value,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if payload.get("type").and_then(serde_json::Value::as_str) != Some("custom_tool_call_output") {
+        return;
+    }
+    let Some(first) = payload
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|blocks| blocks.first())
+    else {
+        return;
+    };
+    if first.get("type").and_then(serde_json::Value::as_str) != Some("input_text") {
+        return;
+    }
+    let Some(header) = first
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .and_then(codex_exec_output_header)
+    else {
+        return;
+    };
+    drop(out.insert(
+        "output".to_string(),
+        serde_json::json!([{ "type": "input_text", "text": header }]),
+    ));
+}
+
+/// Recover the same canonical header when a blob preview ends before the raw
+/// JSON record closes and therefore cannot be fully parsed.
+fn copy_codex_exec_output_header_from_prefix(
+    raw: &str,
+    payload_start: usize,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if out.get("type").and_then(serde_json::Value::as_str) != Some("custom_tool_call_output") {
+        return;
+    }
+    let Some(output_rel) = raw
+        .get(payload_start..)
+        .and_then(|tail| tail.find("\"output\""))
+    else {
+        return;
+    };
+    let output_start = payload_start.saturating_add(output_rel);
+    let Some((encoded, _)) = json_string_field_preview(raw, "text", output_start) else {
+        return;
+    };
+    let decoded = decode_json_string_preview(encoded);
+    let Some(header) = codex_exec_output_header(&decoded) else {
+        return;
+    };
+    drop(out.insert(
+        "output".to_string(),
+        serde_json::json!([{ "type": "input_text", "text": header }]),
+    ));
+}
+
+/// Validate and bound Codex's machine-generated execution-result header.
+#[must_use]
+fn codex_exec_output_header(text: &str) -> Option<String> {
+    let mut lines = text.lines();
+    let status = lines.next()?;
+    if !matches!(status, "Script completed" | "Script failed") {
+        return None;
+    }
+    let wall_time = lines.next()?;
+    if !wall_time.starts_with("Wall time ")
+        || !wall_time.ends_with(" seconds")
+        || lines.next() != Some("Output:")
+    {
+        return None;
+    }
+    Some(format!("{status}\n{wall_time}\nOutput:"))
+}
+
+/// Copy one structured tool-payload carrier (`arguments`/`input`/
+/// `parameters`) into a compact payload, bounded to the display preview
+/// limits. A carrier holding a non-empty object/array, non-empty string, or
+/// scalar boolean/number keeps a bounded content signal so a childless
+/// tool-like envelope is not misread as empty transport after compaction.
+fn copy_structured_payload_field(
+    source: &serde_json::Value,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) {
+    let Some(value) = source.get(key) else {
+        return;
+    };
+    if !is_meaningful_carrier_value(value) {
+        return;
+    }
+    drop(out.insert(key.to_string(), compact_structured(value)));
+}
+
+/// Maximum nesting depth retained in a structured tool-payload carrier
+/// preview. Deeper input is pruned so pathological nesting cannot recurse
+/// without bound.
+const STRUCTURED_CARRIER_MAX_DEPTH: usize = 16;
+/// Maximum total entries retained across the whole structured tool-payload
+/// carrier preview. The budget is shared globally (not per object/array), so
+/// the retained output is deterministically bounded.
+const STRUCTURED_CARRIER_TOTAL_ENTRY_LIMIT: usize = 64;
+
+/// Bounded copy of a structured tool-payload carrier.
+///
+/// Retains a bounded structural/content signal for the classifier: strings
+/// are cut to the display preview limit, object keys are cut the same way
+/// (Unicode-scalar safe, with an ellipsis on cut), nesting is pruned at
+/// `STRUCTURED_CARRIER_MAX_DEPTH`, and the total number of retained object
+/// keys plus array items never exceeds `STRUCTURED_CARRIER_TOTAL_ENTRY_LIMIT`
+/// across the whole carrier.
+#[must_use]
+fn compact_structured(value: &serde_json::Value) -> serde_json::Value {
+    let mut budget = STRUCTURED_CARRIER_TOTAL_ENTRY_LIMIT;
+    compact_structured_bounded(value, 0, &mut budget)
+}
+
+/// Depth- and budget-bounded recursive step of [`compact_structured`].
+#[must_use]
+fn compact_structured_bounded(
+    value: &serde_json::Value,
+    depth: usize,
+    budget: &mut usize,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) if depth < STRUCTURED_CARRIER_MAX_DEPTH => {
+            let mut compact = serde_json::Map::new();
+            for (key, child) in map {
+                if *budget == 0 {
+                    break;
+                }
+                // Bound the retained key text the same way as string values;
+                // otherwise a few arbitrarily huge keys would keep unbounded
+                // raw payload despite the entry budget. Keep the first key
+                // when truncation makes two distinct original keys collide,
+                // so no retained entry is silently overwritten.
+                let bounded_key = compact_text(key);
+                if compact.contains_key(&bounded_key) {
+                    continue;
+                }
+                *budget = budget.saturating_sub(1);
+                drop(compact.insert(
+                    bounded_key,
+                    compact_structured_bounded(child, depth.saturating_add(1), budget),
+                ));
+            }
+            serde_json::Value::Object(compact)
+        }
+        serde_json::Value::Array(items) if depth < STRUCTURED_CARRIER_MAX_DEPTH => {
+            let mut compact = Vec::new();
+            for item in items {
+                if *budget == 0 {
+                    break;
+                }
+                *budget = budget.saturating_sub(1);
+                compact.push(compact_structured_bounded(
+                    item,
+                    depth.saturating_add(1),
+                    budget,
+                ));
+            }
+            serde_json::Value::Array(compact)
+        }
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => serde_json::Value::Null,
+        serde_json::Value::String(text) => serde_json::Value::String(compact_text(text)),
+        other @ (serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)) => other.clone(),
+    }
+}
+
+/// Whether a JSON value carries a meaningful tool-payload signal.
+///
+/// Non-empty objects/arrays, non-empty strings, and scalar booleans/numbers
+/// all carry signal; null, empty strings, and empty objects/arrays do not.
+fn is_meaningful_carrier_value(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => !map.is_empty(),
+        serde_json::Value::Array(items) => !items.is_empty(),
+        serde_json::Value::String(text) => !text.trim().is_empty(),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+        serde_json::Value::Null => false,
+    }
+}
+
+/// Copy one JSON integer field verbatim.
+fn copy_i64_field(
+    source: &serde_json::Value,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) {
+    if let Some(value) = source.get(key).and_then(serde_json::Value::as_i64) {
+        drop(out.insert(key.to_string(), serde_json::Value::Number(value.into())));
+    }
+}
+
+/// Bounded copy of a `payload.content` array for the classifier.
+///
+/// Keeps only the first text-bearing item (bounded), which is all the prefix
+/// classifier and content-presence checks read; the rest of the content stays
+/// deferred to the durable record. The returned flag reports whether the
+/// retained text was truncated by the display budget, so callers can flag
+/// response-item echo message text that must not participate in exact
+/// duplicate pairing.
+#[must_use]
+fn compact_content(content: &serde_json::Value) -> (serde_json::Value, bool) {
+    let Some(items) = content.as_array() else {
+        return (serde_json::Value::Array(Vec::new()), false);
+    };
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let mut compact_item = serde_json::Map::new();
+        if let Some(kind) = obj.get("type").and_then(serde_json::Value::as_str) {
+            drop(compact_item.insert(
+                "type".to_string(),
+                serde_json::Value::String(kind.to_string()),
+            ));
+        }
+        let mut truncated = false;
+        for key in ["text", "input_text", "output_text"] {
+            if let Some(text) = obj.get(key).and_then(serde_json::Value::as_str) {
+                let (compact, cut) = compact_text_with_signal(text);
+                truncated |= cut;
+                drop(compact_item.insert(key.to_string(), serde_json::Value::String(compact)));
+            }
+        }
+        if compact_item.contains_key("text")
+            || compact_item.contains_key("input_text")
+            || compact_item.contains_key("output_text")
+        {
+            return (
+                serde_json::Value::Array(vec![serde_json::Value::Object(compact_item)]),
+                truncated,
+            );
+        }
+    }
+    (serde_json::Value::Array(Vec::new()), false)
+}
+
+/// Bounded copy of a `payload.summary` array for response-item labeling.
+///
+/// Reasoning response items carry a `summary` array of summary-text blocks;
+/// keeps only the first text-bearing item (bounded), which is all the
+/// response-item label logic reads. The rest of the summary stays deferred
+/// to the durable record.
+#[must_use]
+fn compact_summary(summary: &serde_json::Value) -> serde_json::Value {
+    let Some(items) = summary.as_array() else {
+        return serde_json::Value::Array(Vec::new());
+    };
+    for item in items {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let mut compact_item = serde_json::Map::new();
+        if let Some(kind) = obj.get("type").and_then(serde_json::Value::as_str) {
+            drop(compact_item.insert(
+                "type".to_string(),
+                serde_json::Value::String(kind.to_string()),
+            ));
+        }
+        if let Some(text) = obj.get("text").and_then(serde_json::Value::as_str) {
+            if !text.trim().is_empty() {
+                drop(compact_item.insert(
+                    "text".to_string(),
+                    serde_json::Value::String(compact_text(text)),
+                ));
+            }
+        }
+        if compact_item.contains_key("text") {
+            return serde_json::Value::Array(vec![serde_json::Value::Object(compact_item)]);
+        }
+    }
+    serde_json::Value::Array(Vec::new())
+}
+
+/// Copy one simple string field recovered from a truncated JSON prefix,
+/// bounded to the display preview limit.
+///
+/// Returns whether the copied value was truncated by the preview read limit
+/// or the display budget, so callers can flag echo message text that must not
+/// participate in exact duplicate pairing.
+fn copy_preview_string(
+    raw: &str,
+    start: usize,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> bool {
+    let Some((value, cut_by_read_limit)) = json_string_field_preview(raw, field, start) else {
+        return false;
+    };
+    let decoded = decode_json_string_preview(value);
+    if decoded.trim().is_empty() {
+        return false;
+    }
+    let (compact, cut_by_char_limit) = compact_text_with_signal(&decoded);
+    drop(out.insert(field.to_string(), serde_json::Value::String(compact)));
+    cut_by_read_limit || cut_by_char_limit
+}
+
+/// Decode the JSON escapes in one recovered string fragment.
+///
+/// Prefix recovery sees the bytes *inside* the source JSON quotes. Wrapping a
+/// fragment in a fresh pair of quotes lets serde decode complete escapes (for
+/// example `\n` and `\"`) so display summaries match the fully parsed path.
+/// A preview can end in an incomplete escape; in that case parsing fails and
+/// the raw fragment is retained while the caller's read-limit flag preserves
+/// the conservative truncation semantics.
+fn decode_json_string_preview(fragment: &str) -> String {
+    let mut wrapped = String::with_capacity(fragment.len().saturating_add(2));
+    wrapped.push('"');
+    wrapped.push_str(fragment);
+    wrapped.push('"');
+    serde_json::from_str::<String>(&wrapped).unwrap_or_else(|_| fragment.to_string())
+}
+
+/// Copy one structured tool-payload carrier recovered from a truncated JSON
+/// prefix, bounded to whatever lies within the preview prefix. A carrier that
+/// starts but does not close before the cutoff keeps the incomplete-carrier
+/// sentinel so a large childless tool call is not misread as empty transport.
+fn copy_preview_structured(
+    raw: &str,
+    start: usize,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) {
+    let Some(value) = json_value_field(raw, field, start) else {
+        return;
+    };
+    if !is_meaningful_carrier_value(&value) {
+        return;
+    }
+    drop(out.insert(field.to_string(), compact_structured(&value)));
+}
+
+/// Sentinel retained for a structured tool-payload carrier that begins inside
+/// the bounded preview but closes after the read cutoff.
+#[must_use]
+fn incomplete_carrier_sentinel() -> serde_json::Value {
+    serde_json::json!({ "truncated": true })
+}
+
+/// Extract one JSON object/array/scalar field value from a truncated prefix.
+///
+/// An object/array must close within the bounded prefix to parse; one cut off
+/// by the preview read limit yields the incomplete-carrier sentinel instead
+/// of nothing, so a large childless tool call still carries a content signal.
+/// Numbers and booleans are recovered as bounded scalar tokens; null and
+/// absent fields yield values the caller's meaningfulness check drops.
+fn json_value_field(raw: &str, field: &str, start: usize) -> Option<serde_json::Value> {
+    let tail = raw.get(start..)?;
+    let needle = format!("\"{field}\"");
+    let field_offset = tail.find(&needle)?.saturating_add(needle.len());
+    let after_field = tail.get(field_offset..)?;
+    let colon = after_field.find(':')?;
+    let value = after_field.get(colon.saturating_add(1)..)?.trim_start();
+    match value.chars().next()? {
+        '{' | '[' => {
+            let mut depth: i64 = 0;
+            let mut in_string = false;
+            let mut escaped = false;
+            for (idx, ch) in value.char_indices() {
+                if in_string {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        in_string = false;
+                    }
+                    continue;
+                }
+                match ch {
+                    '"' => in_string = true,
+                    '{' | '[' => depth = depth.saturating_add(1),
+                    '}' | ']' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            let end = idx.saturating_add(ch.len_utf8());
+                            return serde_json::from_str(value.get(..end)?).ok();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some(incomplete_carrier_sentinel())
+        }
+        _ => {
+            let end = value
+                .find(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '+' | '.')))
+                .unwrap_or(value.len());
+            serde_json::from_str(value.get(..end)?).ok()
+        }
+    }
 }
 
 /// Find the first non-empty nested JSON `text` field.
@@ -725,8 +1356,13 @@ fn first_nested_json_text(value: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Extract one simple JSON string field from a prefix.
-fn json_string_field<'a>(raw: &'a str, field: &str, start: usize) -> Option<&'a str> {
+/// Extract one simple JSON string field from a prefix, reporting whether the
+/// value was cut before its closing quote by the preview read limit.
+fn json_string_field_preview<'a>(
+    raw: &'a str,
+    field: &str,
+    start: usize,
+) -> Option<(&'a str, bool)> {
     let tail = raw.get(start..)?;
     let needle = format!("\"{field}\"");
     let field_offset = tail.find(&needle)?.saturating_add(needle.len());
@@ -734,8 +1370,44 @@ fn json_string_field<'a>(raw: &'a str, field: &str, start: usize) -> Option<&'a 
     let colon = after_field.find(':')?;
     let value = after_field.get(colon.saturating_add(1)..)?.trim_start();
     let quoted = value.strip_prefix('"')?;
-    let end = quoted.find('"')?;
-    quoted.get(..end)
+    // A large blob is read only up to the preview limit, so a long value may
+    // be cut before its closing quote; the bounded remainder is still the
+    // value's prefix (the marker lives at the start).
+    // A quote closes the JSON string only when the immediately preceding run
+    // of backslashes has even length. A plain `find('"')` mistakes `\"` for
+    // the closing delimiter and can turn a read-limit-cut echo into an
+    // apparently complete value, defeating the truncation safety flag.
+    let mut odd_backslash_run = false;
+    for (offset, byte) in quoted.bytes().enumerate() {
+        if byte == b'\\' {
+            odd_backslash_run = !odd_backslash_run;
+            continue;
+        }
+        if byte == b'"' && !odd_backslash_run {
+            return Some((quoted.get(..offset)?, false));
+        }
+        odd_backslash_run = false;
+    }
+    Some((quoted, true))
+}
+
+/// Extract one simple JSON string field from a prefix.
+fn json_string_field<'a>(raw: &'a str, field: &str, start: usize) -> Option<&'a str> {
+    json_string_field_preview(raw, field, start).map(|(value, _)| value)
+}
+
+/// Extract one simple JSON integer field from a prefix.
+fn json_number_field(raw: &str, field: &str, start: usize) -> Option<i64> {
+    let tail = raw.get(start..)?;
+    let needle = format!("\"{field}\"");
+    let field_offset = tail.find(&needle)?.saturating_add(needle.len());
+    let after_field = tail.get(field_offset..)?;
+    let colon = after_field.find(':')?;
+    let value = after_field.get(colon.saturating_add(1)..)?.trim_start();
+    let end = value
+        .find(|c: char| !(c.is_ascii_digit() || c == '-'))
+        .unwrap_or(value.len());
+    value.get(..end)?.parse().ok()
 }
 
 /// Bound one inline byte vector as UTF-8 display text.
@@ -748,14 +1420,23 @@ fn compact_text_bytes(bytes: &[u8]) -> Vec<u8> {
     compact_text(&String::from_utf8_lossy(bytes)).into_bytes()
 }
 
-/// Bound display text by Unicode scalar count, appending an ellipsis on cut.
-fn compact_text(text: &str) -> String {
+/// Bound display text by Unicode scalar count, appending an ellipsis on cut,
+/// reporting whether the text was truncated.
+#[must_use]
+fn compact_text_with_signal(text: &str) -> (String, bool) {
     let mut chars = text.chars();
     let mut compact: String = chars.by_ref().take(DISPLAY_PREVIEW_CHAR_LIMIT).collect();
-    if chars.next().is_some() {
+    let truncated = chars.next().is_some();
+    if truncated {
         compact.push('…');
     }
-    compact
+    (compact, truncated)
+}
+
+/// Bound display text by Unicode scalar count, appending an ellipsis on cut.
+#[must_use]
+fn compact_text(text: &str) -> String {
+    compact_text_with_signal(text).0
 }
 
 /// Record a blob-backed field whose operation shape has no inline payload slot.
@@ -776,6 +1457,7 @@ impl Workspace {
     #[must_use]
     pub fn from_projection(projection: HistoryProjection) -> Self {
         let source_ops = projection.ops.clone();
+        let session_metadata = session_metadata_index(&projection.ops);
         let source_op_index = source_ops
             .iter()
             .enumerate()
@@ -785,6 +1467,7 @@ impl Workspace {
             projection,
             source_ops,
             source_op_index,
+            session_metadata,
             source_op_locations: Vec::new(),
             blob_resolver: None,
             repositories: Vec::new(),
@@ -820,6 +1503,7 @@ impl Workspace {
                     projection: HistoryProjection::from_ops_with(Vec::new(), projection_options()),
                     source_ops: Vec::new(),
                     source_op_index: HashMap::new(),
+                    session_metadata: HashMap::new(),
                     source_op_locations: Vec::new(),
                     blob_resolver: Some(BlobResolver::open(&chain_path)?),
                     repositories,
@@ -867,17 +1551,21 @@ impl Workspace {
                 projection.merge_git_commits(commits);
             }
         }
-        // Stitch sessions and git history into a single edit chain.
-        projection.link_history();
+        // A session may have started on a commit that is no longer reachable
+        // from the repository's current HEAD. Resolve only the exact OIDs
+        // carried by durable GitLink ops; never guess from timestamps or text.
+        merge_exact_git_link_targets(&mut projection, &repositories);
         let source_op_index = source_ops
             .iter()
             .enumerate()
             .map(|(index, op)| (op.id, index))
             .collect();
+        let session_metadata = session_metadata_index(&projection.ops);
         Ok(Self {
             projection,
             source_ops,
             source_op_index,
+            session_metadata,
             source_op_locations,
             blob_resolver: Some(resolver),
             repositories,
@@ -904,6 +1592,7 @@ impl Workspace {
         self.projection = loaded.projection;
         self.source_ops = loaded.source_ops;
         self.source_op_index = loaded.source_op_index;
+        self.session_metadata = loaded.session_metadata;
         self.source_op_locations = loaded.source_op_locations;
         self.blob_resolver = loaded.blob_resolver;
         self.diagnostics = loaded.diagnostics;
@@ -1054,6 +1743,8 @@ impl Workspace {
                 },
             );
             let parent_row = block_start;
+            let group = node.group();
+            let session_meta = self.session_metadata.get(&group).cloned();
             // Emit the parent row if it falls inside the window.
             if block_start >= offset_usize && block_start < end_usize {
                 // Parents come from the cached LayoutContext for THIS exact
@@ -1087,7 +1778,7 @@ impl Workspace {
                     repository: node.repository().map(|rid| rid.0.to_string()),
                     summary: node.summary(),
                     timestamp_ms: node.timestamp_ms(),
-                    group: node.group(),
+                    group: group.clone(),
                     node_key: node.node_key(),
                     parents,
                     parent_relations,
@@ -1106,10 +1797,25 @@ impl Workspace {
                     is_subop: false,
                     parent_row: None,
                     subop_kind: None,
+                    record_role: node.record_role(),
+                    activity_kind: node.activity_kind(),
+                    visibility: node.visibility(),
+                    outcome: node.outcome(),
+                    turn_id: node.turn_id().map(|id| id.0.to_string()),
+                    session_meta: session_meta.clone(),
+                    work_unit: snapshot
+                        .annotations
+                        .get(abs_idx)
+                        .map(|annotation| work_unit_dto(&annotation.work_unit)),
+                    promoted: snapshot
+                        .annotations
+                        .get(abs_idx)
+                        .is_some_and(|annotation| annotation.promoted),
+                    activity_bundle: node_activity_bundle(node),
                 });
             }
             // Emit each bundled sub-op as its own row immediately after its parent.
-            let summaries = sub_op_summaries(node.sub_ops());
+            let summaries = node_sub_op_summaries(node);
             // Lanes passing straight through this sub-op region (between this
             // parent and the next top-level node): any lane with a vertical line
             // leaving this parent downward AND entering the next node from above
@@ -1122,18 +1828,28 @@ impl Workspace {
                 .and_then(|layout| layout.row_above.get(abs_idx + 1))
                 .map_or(&[][..], Vec::as_slice);
             let region_lanes = intersect_sorted(below_parent, above_next);
+            // Per-bundle member meta lookup, built once so sub-op row metadata
+            // stays O(1) per row instead of scanning the bundle's members.
+            let member_meta: HashMap<String, (RecordRole, ActivityKind)> =
+                node_sub_op_meta_index(node);
             for (i, sub) in summaries.iter().enumerate() {
                 let slot = block_start + 1 + i;
                 if slot < offset_usize || slot >= end_usize {
                     continue;
                 }
+                let (record_role, activity_kind) = node
+                    .sub_ops()
+                    .get(i)
+                    .map_or((RecordRole::Unknown, ActivityKind::Unknown), |op| {
+                        node_sub_op_meta(op.as_ref(), &member_meta)
+                    });
                 rows.push(HistoryRow {
                     op_id: Some(sub.op_id.clone()),
                     git_oid: None,
                     repository: None,
                     summary: sub.summary.clone(),
                     timestamp_ms: sub.timestamp_ms,
-                    group: node.group(),
+                    group: group.clone(),
                     // Sub-op rows are not graph nodes; key them under their parent so
                     // group-start detection and click routing stay unambiguous.
                     node_key: format!("{}::sub:{i}", node.node_key()),
@@ -1154,6 +1870,16 @@ impl Workspace {
                     is_subop: true,
                     parent_row: Some(parent_row),
                     subop_kind: Some(subop_semantic_class(&sub.kind)),
+                    record_role,
+                    activity_kind,
+                    // Bundled sub-ops are supporting rows revealed on demand.
+                    visibility: Visibility::Supporting,
+                    outcome: Outcome::Unknown,
+                    turn_id: node.turn_id().map(|id| id.0.to_string()),
+                    session_meta: session_meta.clone(),
+                    work_unit: None,
+                    promoted: false,
+                    activity_bundle: None,
                 });
             }
         }
@@ -1192,6 +1918,39 @@ impl Workspace {
         } else {
             all_nodes
         };
+        // Activity-view semantics: every view gets deterministic work-unit and
+        // promotion annotations. The fixed Activity view additionally keeps
+        // context-compaction checkpoints inline, groups adjacent repeated Plan
+        // headings, and folds safe low-signal execute runs (never the Raw
+        // profile, whose topology stays exact).
+        // Annotations are recomputed on the final list so bundle rows carry
+        // their own unit markers.
+        let is_activity = filter.key() == fixed_view_filter().key();
+        let structural = is_activity.then(|| self.projection.structural_row_keys(&nodes));
+        let nodes = if let Some(structural) = structural.as_ref() {
+            editchain_project::activity::inline_context_compaction_checkpoints(nodes, structural)
+        } else {
+            nodes
+        };
+        // Plan repeats group before promotion is computed: the newest member
+        // may itself be the unit-final narrative, and the resulting bundle —
+        // not an arbitrary duplicate member — should carry that significance.
+        let nodes = if let Some(structural) = structural.as_ref() {
+            editchain_project::activity::bundle_activity_plan_repeats(nodes, structural)
+        } else {
+            nodes
+        };
+        let mut annotations = editchain_project::activity::annotate_activity_rows(&nodes);
+        let nodes = if let Some(structural) = structural.as_ref() {
+            editchain_project::activity::bundle_activity_execute_runs(
+                nodes,
+                &annotations,
+                structural,
+            )
+        } else {
+            nodes
+        };
+        annotations = editchain_project::activity::annotate_activity_rows(&nodes);
         let sub_op_counts: Vec<usize> = nodes.iter().map(|node| node.sub_ops().len()).collect();
         let mut starts = Vec::with_capacity(nodes.len().saturating_add(1));
         starts.push(0usize);
@@ -1210,6 +1969,7 @@ impl Workspace {
             key,
             ViewSnapshot {
                 nodes,
+                annotations,
                 context: None,
                 sub_op_counts,
                 starts,
@@ -1498,9 +2258,11 @@ pub fn prepare_render_snapshot(
 
 /// Convert an optional protocol filter DTO into a [`ChainFilter`].
 ///
-/// A `None` DTO yields the default filter (hide undated, splice on), matching
-/// the webview's default behavior. An empty DTO yields an empty filter that
-/// hides nothing.
+/// A `None` DTO yields the fixed viewer filter (Activity view: splice on,
+/// hide trace; undated rows kept) so the render snapshot serves it. An empty
+/// DTO yields an empty filter that hides nothing; raw mode sends an explicit
+/// `hide_trace: false`. `ChainFilter::default()` itself stays the raw
+/// baseline (`hide_trace` off) — the Activity view is an explicit choice.
 #[must_use]
 fn chain_filter_from_dto(dto: Option<&ChainFilterDto>) -> ChainFilter {
     match dto {
@@ -1510,8 +2272,9 @@ fn chain_filter_from_dto(dto: Option<&ChainFilterDto>) -> ChainFilter {
             d.include_kind_pattern.clone(),
             d.hide_undated,
             d.splice,
+            d.hide_trace,
         ),
-        None => ChainFilter::default(),
+        None => fixed_view_filter(),
     }
 }
 
@@ -1524,7 +2287,14 @@ const fn projection_options() -> editchain_project::ProjectionOptions {
 
 /// Temporary fixed viewer filter while the filtering UI is being redesigned.
 fn fixed_view_filter() -> ChainFilter {
-    ChainFilter::new(String::new(), String::new(), String::new(), false, true)
+    ChainFilter::new(
+        String::new(),
+        String::new(),
+        String::new(),
+        false,
+        true,
+        true,
+    )
 }
 
 /// The temporary fixed viewer hides nested Git repositories/submodules.
@@ -1640,7 +2410,13 @@ fn node_is_system(node: &editchain_project::HistoryNode) -> bool {
         editchain_project::HistoryNode::CollapsedImport { kind, .. } => {
             kind == "tool" || kind == "import"
         }
-        editchain_project::HistoryNode::GitCommit(_) => false,
+        // Execute-run bundles summarize tool/command rows: dim them like the
+        // individual tool rows they fold.
+        editchain_project::HistoryNode::ExecuteBundle { .. } => true,
+        // Plan-repeat bundles remain prose-first narrative rows; Git rows are
+        // likewise user-facing source history rather than system artifacts.
+        editchain_project::HistoryNode::PlanBundle { .. }
+        | editchain_project::HistoryNode::GitCommit(_) => false,
     }
 }
 
@@ -1657,8 +2433,37 @@ fn node_author(node: &editchain_project::HistoryNode) -> String {
         // Collapsed imports carry their author label directly (derived from the
         // children's tags in the projection), since the raw import op's own tags
         // only carry `IMPORT`.
-        editchain_project::HistoryNode::CollapsedImport { author, .. } => author.clone(),
+        editchain_project::HistoryNode::CollapsedImport { author, .. }
+        | editchain_project::HistoryNode::ExecuteBundle { author, .. }
+        | editchain_project::HistoryNode::PlanBundle { author, .. } => author.clone(),
         editchain_project::HistoryNode::GitCommit(commit) => payload_text(&commit.author.name),
+    }
+}
+
+/// Semantic role/activity for a bundled sub-op row.
+///
+/// Tool-result sub-ops (Finish stage) are results of the enclosing call;
+/// bundled metadata imports are lifecycle/system records. Everything else
+/// stays conservatively unknown.
+#[must_use]
+fn sub_op_meta(op: &Op) -> (RecordRole, ActivityKind) {
+    match &op.kind {
+        OpKind::Tool(t) if matches!(t.stage, editchain_core::op::ToolStage::Finish) => {
+            (RecordRole::Result, ActivityKind::Execute)
+        }
+        OpKind::Tool(_) => (RecordRole::Action, ActivityKind::Execute),
+        OpKind::Import(_) => (RecordRole::Lifecycle, ActivityKind::System),
+        OpKind::ChainStart(_)
+        | OpKind::Actor(_)
+        | OpKind::Message(_)
+        | OpKind::Command(_)
+        | OpKind::File(_)
+        | OpKind::Reflection(_)
+        | OpKind::Note(_)
+        | OpKind::Error(_)
+        | OpKind::GitCommit(_)
+        | OpKind::GitLink(_)
+        | OpKind::Unknown(_) => (RecordRole::Unknown, ActivityKind::Unknown),
     }
 }
 
@@ -1681,6 +2486,206 @@ fn sub_op_summaries(sub_ops: &[std::sync::Arc<Op>]) -> Vec<editchain_protocol::S
             }
         })
         .collect()
+}
+
+/// Convert a row's Activity annotation into the protocol's wire DTO.
+#[must_use]
+fn work_unit_dto(marker: &WorkUnitMarker) -> WorkUnitDto {
+    WorkUnitDto {
+        id: marker.id.clone(),
+        is_start: marker.is_start,
+        is_end: marker.is_end,
+        title: marker.title.clone(),
+        count: marker.count,
+    }
+}
+
+/// Collect the two session-provenance labels the history UI is allowed to
+/// surface. Raw `session_meta` records remain authoritative; this index only
+/// avoids making the webview parse provider JSON or repeat large payloads.
+#[must_use]
+fn session_metadata_index(ops: &[Op]) -> HashMap<String, SessionMetaDto> {
+    let mut by_group = HashMap::<String, SessionMetaDto>::new();
+    for op in ops {
+        let ScopeRef::Session(session_id) = op.scope else {
+            continue;
+        };
+        let Some(found) = session_metadata_from_op(op) else {
+            continue;
+        };
+        let entry = by_group
+            .entry(format!("session:{}", session_id.0))
+            .or_default();
+        if entry.model_provider.is_none() {
+            entry.model_provider = found.model_provider;
+        }
+        if entry.agent_nickname.is_none() {
+            entry.agent_nickname = found.agent_nickname;
+        }
+    }
+    by_group
+}
+
+/// Parse the bounded projection copy of one raw Codex `session_meta` import.
+#[must_use]
+fn session_metadata_from_op(op: &Op) -> Option<SessionMetaDto> {
+    let OpKind::Import(import) = &op.kind else {
+        return None;
+    };
+    let Payload::Inline(raw) = &import.raw_ref else {
+        return None;
+    };
+    let value = serde_json::from_slice::<serde_json::Value>(raw).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    let display_field = |name: &str| {
+        payload
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    };
+    let metadata = SessionMetaDto {
+        model_provider: display_field("model_provider"),
+        agent_nickname: display_field("agent_nickname"),
+    };
+    (metadata.model_provider.is_some() || metadata.agent_nickname.is_some()).then_some(metadata)
+}
+
+/// Typed Activity-view bundle metadata for a top-level row.
+///
+/// `Some` only for synthetic Activity bundles, carrying the ORIGINAL top-level
+/// member count (`member_nodes.len()`, never the flattened
+/// metadata-subop count) so the viewer can render faithful bundle labels from
+/// structured data without parsing the summary string. `None` for every
+/// ordinary and sub-op row, including the raw (unbundled) profile.
+#[must_use]
+fn node_activity_bundle(
+    node: &editchain_project::HistoryNode,
+) -> Option<editchain_protocol::ActivityBundleDto> {
+    match node {
+        editchain_project::HistoryNode::ExecuteBundle { member_nodes, .. } => {
+            Some(editchain_protocol::ActivityBundleDto {
+                kind: editchain_protocol::ActivityBundleKind::ExecuteRun,
+                member_count: u64::try_from(member_nodes.len()).unwrap_or(u64::MAX),
+            })
+        }
+        editchain_project::HistoryNode::PlanBundle { member_nodes, .. } => {
+            Some(editchain_protocol::ActivityBundleDto {
+                kind: editchain_protocol::ActivityBundleKind::PlanRepeat,
+                member_count: u64::try_from(member_nodes.len()).unwrap_or(u64::MAX),
+            })
+        }
+        editchain_project::HistoryNode::EditOperation { .. }
+        | editchain_project::HistoryNode::CollapsedImport { .. }
+        | editchain_project::HistoryNode::GitCommit(_) => None,
+    }
+}
+
+/// Build the expanded sub-op summaries for a top-level node.
+///
+/// Activity bundles expose their folded member rows, so each member renders
+/// with its ORIGINAL row's summary/kind (faithful labels) while the member's
+/// own metadata sub-ops keep the generic op-derived labels. All other nodes
+/// use the generic op-derived path unchanged.
+#[must_use]
+fn node_sub_op_summaries(
+    node: &editchain_project::HistoryNode,
+) -> Vec<editchain_protocol::SubOpSummary> {
+    if let editchain_project::HistoryNode::ExecuteBundle {
+        member_nodes,
+        members,
+        ..
+    }
+    | editchain_project::HistoryNode::PlanBundle {
+        member_nodes,
+        members,
+        ..
+    } = node
+    {
+        member_sub_op_summaries(members, member_nodes)
+    } else {
+        sub_op_summaries(node.sub_ops())
+    }
+}
+
+/// Sub-op summaries for one bundle's flattened member ops.
+///
+/// Each entry is the member's anchor op (labels come from the original row) or
+/// one of the member's own bundled metadata ops (generic labels), preserving
+/// reveal order.
+#[must_use]
+fn member_sub_op_summaries(
+    members: &[std::sync::Arc<Op>],
+    member_nodes: &[editchain_project::HistoryNode],
+) -> Vec<editchain_protocol::SubOpSummary> {
+    let key_to_node: HashMap<String, &editchain_project::HistoryNode> = member_nodes
+        .iter()
+        .map(|node| (node.node_key(), node))
+        .collect();
+    members
+        .iter()
+        .map(|op| {
+            let op_key = op.id.to_string();
+            if let Some(member) = key_to_node.get(&op_key) {
+                editchain_protocol::SubOpSummary {
+                    op_id: op_key,
+                    summary: member.summary(),
+                    kind: member.kind(),
+                    timestamp_ms: op.clock.as_u64(),
+                }
+            } else {
+                let (summary, kind) = sub_op_label(op);
+                editchain_protocol::SubOpSummary {
+                    op_id: op_key,
+                    summary,
+                    kind,
+                    timestamp_ms: op.clock.as_u64(),
+                }
+            }
+        })
+        .collect()
+}
+
+/// Per-bundle op-key -> member metadata index for expanded sub-op rows.
+///
+/// Built once per bundle node; entries cover only the folded member rows (their
+/// own metadata sub-ops fall through to the generic op-derived classifier).
+#[must_use]
+fn node_sub_op_meta_index(
+    node: &editchain_project::HistoryNode,
+) -> HashMap<String, (RecordRole, ActivityKind)> {
+    match node {
+        editchain_project::HistoryNode::ExecuteBundle { member_nodes, .. }
+        | editchain_project::HistoryNode::PlanBundle { member_nodes, .. } => member_nodes
+            .iter()
+            .map(|member| {
+                (
+                    member.node_key(),
+                    (member.record_role(), member.activity_kind()),
+                )
+            })
+            .collect(),
+        editchain_project::HistoryNode::EditOperation { .. }
+        | editchain_project::HistoryNode::CollapsedImport { .. }
+        | editchain_project::HistoryNode::GitCommit(_) => HashMap::new(),
+    }
+}
+
+/// Semantic role/activity for one expanded sub-op row, using the bundle's
+/// precomputed member metadata when the op is a folded member row.
+#[must_use]
+fn node_sub_op_meta(
+    op: &Op,
+    member_meta: &HashMap<String, (RecordRole, ActivityKind)>,
+) -> (RecordRole, ActivityKind) {
+    member_meta
+        .get(&op.id.to_string())
+        .copied()
+        .unwrap_or_else(|| sub_op_meta(op))
 }
 
 /// Map the projection's provider-neutral relation kind to the protocol enum.
@@ -1850,6 +2855,8 @@ fn node_commit_id(node: &editchain_project::HistoryNode) -> String {
     match node {
         editchain_project::HistoryNode::EditOperation { op, .. }
         | editchain_project::HistoryNode::CollapsedImport { op, .. } => abbreviate_op_id(&op.id),
+        editchain_project::HistoryNode::ExecuteBundle { anchor, .. }
+        | editchain_project::HistoryNode::PlanBundle { anchor, .. } => abbreviate_op_id(&anchor.id),
         editchain_project::HistoryNode::GitCommit(commit) => abbreviate_oid(&commit.oid),
     }
 }
@@ -2213,6 +3220,44 @@ fn open_repository_handle(
         repo,
         discovery: discovery.clone(),
     })
+}
+
+/// Resolve exact durable Git-link targets that the current HEAD walk did not
+/// include (for example, a session started on a branch that was later switched).
+fn merge_exact_git_link_targets(
+    projection: &mut HistoryProjection,
+    repositories: &[editchain_git::RepositoryDiscovery],
+) {
+    let targets: std::collections::BTreeSet<(RepositoryId, GitOid)> = projection
+        .git
+        .links
+        .values()
+        .flatten()
+        .map(|link| (link.target_repo, link.target_oid))
+        .filter(|target| !projection.git.commits.contains_key(target))
+        .collect();
+
+    for discovery in repositories {
+        let repository_targets: Vec<GitOid> = targets
+            .iter()
+            .filter_map(|(repository, oid)| (*repository == discovery.id).then_some(*oid))
+            .collect();
+        if repository_targets.is_empty() {
+            continue;
+        }
+        let Ok(handle) = open_repository_handle(discovery) else {
+            continue;
+        };
+        let commits: Vec<_> = repository_targets
+            .iter()
+            .filter_map(|oid| {
+                resolve_commit(&handle, oid)
+                    .ok()
+                    .map(|result| result.commit)
+            })
+            .collect();
+        projection.merge_git_commits(commits);
+    }
 }
 
 /// A stateful server that owns a loaded workspace across requests.
@@ -2695,6 +3740,7 @@ mod tests {
             "^message$".to_string(),
             false,
             true,
+            false,
         );
         let window = ws.history_window(HistoryWindowOptions {
             offset: 0,
@@ -3646,6 +4692,7 @@ mod tests {
             projection,
             source_ops: vec![source.clone()],
             source_op_index,
+            session_metadata: HashMap::new(),
             source_op_locations: Vec::new(),
             blob_resolver: Some(resolver),
             repositories: Vec::new(),
@@ -3663,12 +4710,741 @@ mod tests {
     }
 
     #[test]
+    fn compact_import_record_preserves_bounded_semantic_subset_and_prefix_fallback() {
+        // Inline records keep the envelope discriminators plus the bounded
+        // semantic subset the classifier and outcome logic read.
+        let echo = compact_import_record(
+            br#"{"type":"event_msg","payload":{"type":"agent_message","message":"[external_agent_tool_call] {\"tool\":\"Bash\"}"}}"#,
+        );
+        let echo: serde_json::Value = serde_json::from_slice(&echo).unwrap();
+        assert_eq!(echo["type"], "event_msg");
+        assert_eq!(echo["payload"]["type"], "agent_message");
+        assert_eq!(
+            echo["payload"]["message"],
+            "[external_agent_tool_call] {\"tool\":\"Bash\"}"
+        );
+
+        let item = compact_import_record(
+            br#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"call_9","exitCode":1,"status":"completed","errorMessage":"boom"}}}"#,
+        );
+        let item: serde_json::Value = serde_json::from_slice(&item).unwrap();
+        assert_eq!(item["payload"]["item"]["exitCode"], 1);
+        assert_eq!(item["payload"]["item"]["status"], "completed");
+        assert_eq!(item["payload"]["item"]["errorMessage"], "boom");
+
+        let response = compact_import_record(
+            br#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"[external_agent_tool_result] done"}]}}"#,
+        );
+        let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response["payload"]["role"], "assistant");
+        assert_eq!(
+            response["payload"]["content"][0]["text"],
+            "[external_agent_tool_result] done"
+        );
+
+        // Session provenance is the only `session_meta` payload copied into
+        // the display projection. It survives both complete JSON and the
+        // prefix-only path used for large blob-backed records.
+        let session = compact_import_record(
+            br#"{"type":"session_meta","payload":{"model_provider":"sglang_dsv4","agent_nickname":"Harvey","base_instructions":"large private field"}}"#,
+        );
+        let session: serde_json::Value = serde_json::from_slice(&session).unwrap();
+        assert_eq!(session["payload"]["model_provider"], "sglang_dsv4");
+        assert_eq!(session["payload"]["agent_nickname"], "Harvey");
+        assert!(session["payload"].get("base_instructions").is_none());
+        let session_op = op_envelope(
+            90,
+            1,
+            OpKind::Import(ImportOp {
+                raw_ref: Payload::Inline(serde_json::to_vec(&session).unwrap()),
+                raw_hash: None,
+            }),
+        );
+        let metadata = session_metadata_index(std::slice::from_ref(&session_op));
+        let metadata = metadata.get("session:10").expect("session metadata");
+        assert_eq!(metadata.model_provider.as_deref(), Some("sglang_dsv4"));
+        assert_eq!(metadata.agent_nickname.as_deref(), Some("Harvey"));
+
+        let session_prefix = compact_import_record(
+            br#"{"type":"session_meta","payload":{"model_provider":"sglang_dsv4","agent_nickname":"Harvey","base_instructions":"unterminated"#,
+        );
+        let session_prefix: serde_json::Value = serde_json::from_slice(&session_prefix).unwrap();
+        assert_eq!(session_prefix["payload"]["model_provider"], "sglang_dsv4");
+        assert_eq!(session_prefix["payload"]["agent_nickname"], "Harvey");
+
+        // Large outputs are bounded, never copied into the projection.
+        let huge = format!(
+            r#"{{"type":"response_item","payload":{{"type":"function_call_output","output":"{}"}}}}"#,
+            "y".repeat(200_000),
+        );
+        let compacted = compact_import_record(huge.as_bytes());
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        let output = compacted["payload"]["output"].as_str().unwrap();
+        assert!(output.chars().count() <= DISPLAY_PREVIEW_CHAR_LIMIT.saturating_add(1));
+
+        // Truncated blob preview: the prefix fallback still recovers the
+        // external-tool marker near the envelope start.
+        let truncated = format!(
+            r#"{{"type":"event_msg","payload":{{"type":"agent_message","message":"[external_agent_tool_result] {}"}}"#,
+            "z".repeat(200_000),
+        );
+        let compacted = compact_import_record(truncated.as_bytes());
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert_eq!(compacted["type"], "event_msg");
+        assert_eq!(compacted["payload"]["type"], "agent_message");
+        assert!(
+            compacted["payload"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("[external_agent_tool_result]"),
+            "marker recovered from truncated blob preview"
+        );
+    }
+
+    #[test]
+    fn compact_import_record_preserves_canonical_codex_exec_outcome_header() {
+        let raw = format!(
+            r#"{{"type":"response_item","payload":{{"type":"custom_tool_call_output","output":[{{"type":"input_text","text":"Script failed\nWall time 0.0 seconds\nOutput:\n"}},{{"type":"input_text","text":"{}"}}]}}}}"#,
+            "x".repeat(DISPLAY_PREVIEW_READ_LIMIT.saturating_mul(2)),
+        );
+
+        let compacted = compact_import_record(raw.as_bytes());
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert_eq!(
+            compacted["payload"]["output"][0]["text"],
+            "Script failed\nWall time 0.0 seconds\nOutput:"
+        );
+
+        // A truncated blob preview takes the prefix parser but must retain the
+        // identical status evidence near the start of the envelope.
+        let compacted = compact_import_record(&raw.as_bytes()[..DISPLAY_PREVIEW_READ_LIMIT]);
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert_eq!(
+            compacted["payload"]["output"][0]["text"],
+            "Script failed\nWall time 0.0 seconds\nOutput:"
+        );
+    }
+
+    #[test]
+    fn compact_import_record_preserves_structured_tool_payload_carriers() {
+        // Object/array tool-payload carriers (arguments/input/parameters)
+        // keep a bounded structural/content signal so childless tool-like
+        // rows are not compacted into empty transport. Large nested strings
+        // stay bounded.
+        let call = compact_import_record(
+            br#"{"type":"response_item","payload":{"type":"function_call","name":"WebSearch","arguments":{"query":"editchain docs"}}}"#,
+        );
+        let call: serde_json::Value = serde_json::from_slice(&call).unwrap();
+        assert_eq!(call["payload"]["arguments"]["query"], "editchain docs");
+
+        let carriers = compact_import_record(
+            br#"{"type":"response_item","payload":{"type":"function_call","input":{"path":"/tmp/x"},"parameters":{"depth":2}}}"#,
+        );
+        let carriers: serde_json::Value = serde_json::from_slice(&carriers).unwrap();
+        assert_eq!(carriers["payload"]["input"]["path"], "/tmp/x");
+        assert_eq!(carriers["payload"]["parameters"]["depth"], 2);
+
+        // Nested strings inside a structured carrier are bounded like any
+        // other display field.
+        let huge = format!(
+            r#"{{"type":"response_item","payload":{{"type":"function_call","arguments":{{"query":"{}"}}}}}}"#,
+            "y".repeat(200_000),
+        );
+        let compacted = compact_import_record(huge.as_bytes());
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        let query = compacted["payload"]["arguments"]["query"].as_str().unwrap();
+        assert!(query.chars().count() <= DISPLAY_PREVIEW_CHAR_LIMIT.saturating_add(1));
+
+        // Truncated blob preview: the prefix fallback still recovers an
+        // object arguments carrier near the envelope start.
+        let truncated = format!(
+            r#"{{"type":"response_item","payload":{{"type":"function_call","arguments":{{"query":"docs"}},"output":"{}"}}"#,
+            "z".repeat(200_000),
+        );
+        let compacted = compact_import_record(truncated.as_bytes());
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert_eq!(compacted["type"], "response_item");
+        assert_eq!(compacted["payload"]["type"], "function_call");
+        assert_eq!(compacted["payload"]["arguments"]["query"], "docs");
+    }
+
+    /// Total retained object keys plus array items in a compacted carrier.
+    fn count_entries(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Object(map) => map
+                .iter()
+                .map(|(_, child)| count_entries(child).saturating_add(1))
+                .sum(),
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(|child| count_entries(child).saturating_add(1))
+                .sum(),
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => 0,
+        }
+    }
+
+    /// Maximum container nesting depth of a value (containers count 1, leaves
+    /// count 0).
+    fn depth_of(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Object(map) => map
+                .values()
+                .map(depth_of)
+                .max()
+                .map_or(1, |depth| depth.saturating_add(1)),
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(depth_of)
+                .max()
+                .map_or(1, |depth| depth.saturating_add(1)),
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => 0,
+        }
+    }
+
+    #[test]
+    fn compact_structured_globally_bounds_retained_entries() {
+        // Two wide sibling objects share one total budget: the retained
+        // output never exceeds the total entry limit across the whole carrier
+        // (the old per-depth cap would retain 64 entries at every level).
+        let value = serde_json::json!({
+            "first": (0..128u32)
+                .map(|i: u32| (format!("a{i}"), serde_json::Value::from(i)))
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+            "second": (0..128u32)
+                .map(|i: u32| (format!("b{i}"), serde_json::Value::from(i)))
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+        });
+        let compacted = compact_structured(&value);
+        assert_eq!(
+            count_entries(&compacted),
+            STRUCTURED_CARRIER_TOTAL_ENTRY_LIMIT,
+            "the shared budget must cap the whole carrier"
+        );
+        let compacted_object = compacted.as_object().unwrap();
+        assert!(
+            compacted_object.contains_key("first"),
+            "the leading sibling keeps the budget"
+        );
+        assert!(
+            !compacted_object.contains_key("second"),
+            "the trailing sibling is dropped once the shared budget is spent"
+        );
+    }
+
+    #[test]
+    fn compact_structured_bounds_oversized_multibyte_keys() {
+        // Up to STRUCTURED_CARRIER_TOTAL_ENTRY_LIMIT object keys are retained
+        // verbatim by key.clone(); oversized multibyte keys would otherwise
+        // keep unbounded raw payload despite the boundedness claim. Keys must
+        // be cut to the display char limit while staying non-empty.
+        let huge_key = "界".repeat(DISPLAY_PREVIEW_CHAR_LIMIT.saturating_mul(8));
+        let mut map = serde_json::Map::new();
+        for i in 0..STRUCTURED_CARRIER_TOTAL_ENTRY_LIMIT {
+            // Distinct leading discriminators keep every truncated bounded key
+            // unique, so the budget slots are retained rather than collapsed
+            // into one colliding entry.
+            drop(map.insert(format!("{i}{huge_key}"), serde_json::Value::from(i)));
+        }
+        let compacted = compact_structured(&serde_json::Value::Object(map));
+        let serialized = serde_json::to_string(&compacted).unwrap();
+        assert!(
+            !serialized.is_empty(),
+            "the compacted carrier must keep a non-empty signal"
+        );
+        assert_eq!(
+            compacted.as_object().unwrap().len(),
+            STRUCTURED_CARRIER_TOTAL_ENTRY_LIMIT,
+            "every budget slot stays retained with a bounded key"
+        );
+        // Fixed ceiling: each retained key holds at most
+        // DISPLAY_PREVIEW_CHAR_LIMIT chars, worst-case 6 JSON-escaped bytes
+        // per char, plus quotes; values and punctuation add a tiny fixed
+        // amount. Unbounded keys would blow far past this ceiling.
+        let ceiling = STRUCTURED_CARRIER_TOTAL_ENTRY_LIMIT
+            .saturating_mul(
+                DISPLAY_PREVIEW_CHAR_LIMIT
+                    .saturating_mul(6)
+                    .saturating_add(8),
+            )
+            .saturating_add(256);
+        assert!(
+            serialized.len() < ceiling,
+            "serialized compact output ({} bytes) must stay below the fixed \
+             ceiling ({ceiling} bytes)",
+            serialized.len()
+        );
+    }
+
+    #[test]
+    fn compact_structured_keeps_first_key_when_truncation_collides() {
+        // Two distinct oversized keys sharing one 1024-char prefix truncate to
+        // the same bounded key text; the retained object must deterministically
+        // keep the first original key instead of silently overwriting it.
+        let shared_prefix = "界".repeat(DISPLAY_PREVIEW_CHAR_LIMIT.saturating_mul(8));
+        let value = serde_json::json!({
+            // Lexicographically first original key: keeps value 1 on collision
+            // with first-wins handling.
+            format!("{shared_prefix}a"): 1,
+            format!("{shared_prefix}b"): 2,
+        });
+        let compacted = compact_structured(&value);
+        let compacted_object = compacted.as_object().unwrap();
+        assert_eq!(
+            compacted_object.len(),
+            1,
+            "truncation collision must not produce two identical retained keys"
+        );
+        let bounded_key = compact_text(&format!("{shared_prefix}a"));
+        assert_eq!(
+            compacted_object.get(&bounded_key),
+            Some(&serde_json::Value::from(1)),
+            "the lexicographically first original key wins deterministically"
+        );
+    }
+
+    #[test]
+    fn compact_structured_prunes_nesting_beyond_max_depth() {
+        // Pathological nesting is pruned at STRUCTURED_CARRIER_MAX_DEPTH
+        // rather than recursing without bound, through the direct compactor
+        // and the full compact_import_record path.
+        let mut deep = serde_json::Value::Bool(true);
+        for _ in 0..(STRUCTURED_CARRIER_MAX_DEPTH.saturating_mul(2)) {
+            deep = serde_json::Value::Array(vec![deep]);
+        }
+        assert!(
+            depth_of(&deep) > STRUCTURED_CARRIER_MAX_DEPTH,
+            "input must exceed the depth cap"
+        );
+        assert!(
+            depth_of(&compact_structured(&deep)) <= STRUCTURED_CARRIER_MAX_DEPTH.saturating_add(1)
+        );
+
+        let mut inner = String::from("1");
+        for _ in 0..(STRUCTURED_CARRIER_MAX_DEPTH.saturating_mul(2)) {
+            inner = format!("[{inner}]");
+        }
+        let raw = format!(
+            r#"{{"type":"response_item","payload":{{"type":"function_call","arguments":{inner}}}}}"#
+        );
+        let compacted = compact_import_record(raw.as_bytes());
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert!(
+            depth_of(&compacted["payload"]["arguments"])
+                <= STRUCTURED_CARRIER_MAX_DEPTH.saturating_add(1),
+            "deep arguments carrier must be pruned through the import path"
+        );
+    }
+
+    #[test]
+    fn compact_import_record_keeps_sentinel_for_unclosed_preview_carrier() {
+        // A large blob-backed function call whose arguments object starts
+        // inside the bounded preview read window but closes after the cutoff
+        // must keep a tiny non-empty signal: it is a genuine tool payload, not
+        // empty transport.
+        let raw = format!(
+            r#"{{"type":"response_item","payload":{{"type":"function_call","name":"Bash","arguments":{{"command":"{}","cwd":"/tmp"}}}}}}"#,
+            "x".repeat(200_000),
+        );
+        let bytes = raw.as_bytes();
+        assert!(bytes.len() > DISPLAY_PREVIEW_READ_LIMIT);
+        let compacted = compact_import_record(&bytes[..DISPLAY_PREVIEW_READ_LIMIT]);
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert_eq!(compacted["type"], "response_item");
+        assert_eq!(compacted["payload"]["type"], "function_call");
+        assert_eq!(
+            compacted["payload"]["arguments"]["truncated"], true,
+            "started-but-incomplete carrier keeps the sentinel"
+        );
+    }
+
+    #[test]
+    fn compact_import_record_keeps_complete_empty_carriers_silent_in_previews() {
+        // A complete empty object/array carrier closes inside the preview and
+        // must stay silent even when the surrounding record is truncated.
+        let cases = [
+            r#"{"type":"response_item","payload":{"type":"function_call","arguments":{}},"output":""#,
+            r#"{"type":"response_item","payload":{"type":"function_call","parameters":[]},"output":""#,
+        ];
+        for prefix in cases {
+            let full = format!("{prefix}{}\"}}}}", "z".repeat(200_000));
+            let bytes = full.as_bytes();
+            assert!(bytes.len() > DISPLAY_PREVIEW_READ_LIMIT);
+            let compacted = compact_import_record(&bytes[..DISPLAY_PREVIEW_READ_LIMIT]);
+            let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+            assert!(
+                compacted["payload"].get("arguments").is_none(),
+                "complete empty arguments carrier must stay silent: {prefix}"
+            );
+            assert!(
+                compacted["payload"].get("parameters").is_none(),
+                "complete empty parameters carrier must stay silent: {prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_import_record_preserves_scalar_tool_payload_carriers() {
+        // Non-empty string and scalar bool/number carriers (arguments/input/
+        // parameters) keep a bounded signal; null/empty strings stay silent.
+        let call = compact_import_record(
+            br#"{"type":"response_item","payload":{"type":"function_call","name":"Bash","arguments":"ls -la"}}"#,
+        );
+        let call: serde_json::Value = serde_json::from_slice(&call).unwrap();
+        assert_eq!(call["payload"]["arguments"], "ls -la");
+
+        let carriers = compact_import_record(
+            br#"{"type":"response_item","payload":{"type":"function_call","name":"Read","input":"/tmp/x","parameters":true}}"#,
+        );
+        let carriers: serde_json::Value = serde_json::from_slice(&carriers).unwrap();
+        assert_eq!(carriers["payload"]["input"], "/tmp/x");
+        assert_eq!(carriers["payload"]["parameters"], true);
+
+        let number = compact_import_record(
+            br#"{"type":"response_item","payload":{"type":"function_call","name":"Tool","parameters":7}}"#,
+        );
+        let number: serde_json::Value = serde_json::from_slice(&number).unwrap();
+        assert_eq!(number["payload"]["parameters"], 7);
+
+        let empty = compact_import_record(
+            br#"{"type":"response_item","payload":{"type":"function_call","arguments":"","parameters":null}}"#,
+        );
+        let empty: serde_json::Value = serde_json::from_slice(&empty).unwrap();
+        assert!(empty["payload"].get("arguments").is_none());
+        assert!(empty["payload"].get("parameters").is_none());
+    }
+
+    #[test]
+    fn compact_import_record_prefix_fallback_recovers_scalar_carriers() {
+        // Truncated blob preview: string/bool input and parameters carriers
+        // near the envelope start survive the prefix fallback.
+        let raw = format!(
+            r#"{{"type":"response_item","payload":{{"type":"function_call","name":"Read","input":"/tmp/x","parameters":true,"output":"{}"}}}}"#,
+            "z".repeat(200_000),
+        );
+        let bytes = raw.as_bytes();
+        assert!(bytes.len() > DISPLAY_PREVIEW_READ_LIMIT);
+        let compacted = compact_import_record(&bytes[..DISPLAY_PREVIEW_READ_LIMIT]);
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert_eq!(compacted["payload"]["input"], "/tmp/x");
+        assert_eq!(compacted["payload"]["parameters"], true);
+    }
+
+    #[test]
+    fn compact_import_record_preserves_bounded_reasoning_summary() {
+        // Reasoning response items keep the first non-empty summary text so
+        // the compact service record can still yield a legible row label.
+        let item = compact_import_record(
+            br#"{"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Audit the tree layout"},{"type":"summary_text","text":"ignored"}],"content":[{"type":"reasoning","text":"ignored"}]}}"#,
+        );
+        let item: serde_json::Value = serde_json::from_slice(&item).unwrap();
+        assert_eq!(item["payload"]["summary"][0]["type"], "summary_text");
+        assert_eq!(
+            item["payload"]["summary"][0]["text"],
+            "Audit the tree layout"
+        );
+
+        // Empty/whitespace-only first summary blocks fall through to a later
+        // text-bearing block.
+        let skipped = compact_import_record(
+            br#"{"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"  "},{"type":"summary_text","text":"second block"}]}}"#,
+        );
+        let skipped: serde_json::Value = serde_json::from_slice(&skipped).unwrap();
+        assert_eq!(skipped["payload"]["summary"][0]["text"], "second block");
+
+        // An empty summary array keeps no summary field at all.
+        let empty = compact_import_record(
+            br#"{"type":"response_item","payload":{"type":"reasoning","summary":[]}}"#,
+        );
+        let empty: serde_json::Value = serde_json::from_slice(&empty).unwrap();
+        assert!(empty["payload"].get("summary").is_none());
+
+        // Large multibyte summary text stays bounded to the display limit.
+        let huge = format!(
+            r#"{{"type":"response_item","payload":{{"type":"reasoning","summary":[{{"type":"summary_text","text":"{}"}}]}}}}"#,
+            "界".repeat(200_000),
+        );
+        let compacted = compact_import_record(huge.as_bytes());
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        let text = compacted["payload"]["summary"][0]["text"].as_str().unwrap();
+        assert!(text.chars().count() <= DISPLAY_PREVIEW_CHAR_LIMIT.saturating_add(1));
+        assert!(text.ends_with('…'), "cut summary keeps the ellipsis marker");
+    }
+
+    #[test]
+    fn compact_import_record_prefix_fallback_recovers_reasoning_summary() {
+        // Truncated blob preview: the first summary text sits near the
+        // envelope start and survives the prefix fallback even when a huge
+        // trailing output never closes inside the read limit.
+        let raw = format!(
+            r#"{{"type":"response_item","payload":{{"type":"reasoning","summary":[{{"type":"summary_text","text":"Recovered from prefix"}}],"output":"{}"}}"#,
+            "z".repeat(200_000),
+        );
+        let bytes = raw.as_bytes();
+        assert!(bytes.len() > DISPLAY_PREVIEW_READ_LIMIT);
+        let compacted = compact_import_record(&bytes[..DISPLAY_PREVIEW_READ_LIMIT]);
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert_eq!(compacted["type"], "response_item");
+        assert_eq!(compacted["payload"]["type"], "reasoning");
+        assert_eq!(
+            compacted["payload"]["summary"][0]["text"],
+            "Recovered from prefix"
+        );
+    }
+
+    #[test]
+    fn json_string_field_preview_skips_escaped_quotes() {
+        let raw = r#"{"message":"say \"hello\" now","tail":true}"#;
+        let (value, cut_by_read_limit) =
+            json_string_field_preview(raw, "message", 0).expect("message preview");
+        assert_eq!(value, r#"say \"hello\" now"#);
+        assert!(!cut_by_read_limit);
+    }
+
+    #[test]
+    fn json_string_field_preview_accepts_even_backslash_run_before_close() {
+        let mut raw = String::from(r#"{"message":"path"#);
+        raw.push('\\');
+        raw.push('\\');
+        raw.push('"');
+        raw.push('}');
+
+        let (value, cut_by_read_limit) =
+            json_string_field_preview(&raw, "message", 0).expect("message preview");
+        let mut expected = String::from("path");
+        expected.push('\\');
+        expected.push('\\');
+        assert_eq!(value, expected);
+        assert!(!cut_by_read_limit);
+    }
+
+    #[test]
+    fn compact_import_record_prefix_fallback_decodes_string_escapes() {
+        // The message closes inside the preview, but a later output field is
+        // cut so the record takes the prefix-recovery path. Its display text
+        // must match serde's fully parsed path, not expose raw `\n` / `\"`.
+        let raw = br#"{"type":"event_msg","payload":{"type":"agent_message","message":"line one\n\"quoted\"","output":"unfinished"#;
+        let compacted = compact_import_record(raw);
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert_eq!(compacted["payload"]["message"], "line one\n\"quoted\"");
+        assert!(compacted["payload"].get("echo_text_truncated").is_none());
+    }
+
+    #[test]
+    fn compact_import_record_marks_preview_ending_at_escaped_quote_truncated() {
+        let mut raw = String::from(
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"prefix "#,
+        );
+        raw.push('\\');
+        raw.push('"');
+
+        let (_, cut_by_read_limit) =
+            json_string_field_preview(&raw, "message", 0).expect("message preview");
+        assert!(cut_by_read_limit, "an escaped quote is not a closing quote");
+
+        let compacted = compact_import_record(raw.as_bytes());
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert_eq!(compacted["payload"]["message"], "prefix \"");
+        assert_eq!(compacted["payload"]["echo_text_truncated"], true);
+    }
+
+    #[test]
+    fn compact_import_record_marks_truncated_echo_text() {
+        // The classifier must be told explicitly when a service-compacted echo
+        // message text was truncated, instead of guessing from an ellipsis:
+        // two distinct long texts sharing a display-preview prefix would
+        // otherwise compare equal after compaction and be conflated by exact
+        // duplicate pairing.
+
+        // Inline event_msg agent_message over the display budget: the message
+        // keeps the bounded prefix with an ellipsis and the flag is set.
+        let prefix = "shared-prefix-".repeat(200);
+        let long_event = format!(
+            r#"{{"type":"event_msg","payload":{{"type":"agent_message","message":"{prefix}TAIL-A"}}}}"#,
+        );
+        let compacted = compact_import_record(long_event.as_bytes());
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert_eq!(compacted["payload"]["echo_text_truncated"], true);
+        let message = compacted["payload"]["message"].as_str().unwrap();
+        assert!(message.starts_with("shared-prefix-"));
+        assert!(
+            message.ends_with('…'),
+            "cut message keeps the ellipsis marker"
+        );
+
+        // A short untruncated message never sets the flag.
+        let short_event = compact_import_record(
+            br#"{"type":"event_msg","payload":{"type":"agent_message","message":"exact narrative"}}"#,
+        );
+        let short_event: serde_json::Value = serde_json::from_slice(&short_event).unwrap();
+        assert!(short_event["payload"].get("echo_text_truncated").is_none());
+        assert_eq!(short_event["payload"]["message"], "exact narrative");
+
+        // Inline response_item assistant message: a long first content text
+        // sets the flag; a short one does not.
+        let long_response = format!(
+            r#"{{"type":"response_item","payload":{{"type":"message","role":"assistant","content":[{{"type":"output_text","text":"{prefix}TAIL-B"}}]}}}}"#,
+        );
+        let compacted = compact_import_record(long_response.as_bytes());
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert_eq!(compacted["payload"]["echo_text_truncated"], true);
+        let text = compacted["payload"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.ends_with('…'));
+
+        let short_response = compact_import_record(
+            br#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"exact narrative"}]}}"#,
+        );
+        let short_response: serde_json::Value = serde_json::from_slice(&short_response).unwrap();
+        assert!(short_response["payload"]
+            .get("echo_text_truncated")
+            .is_none());
+
+        // Blob-backed record over the read budget: the preview window ends
+        // inside the huge message value, so the prefix fallback recovers only
+        // the bounded prefix (with an ellipsis) and sets the flag.
+        let blob_raw = format!(
+            r#"{{"type":"event_msg","payload":{{"type":"agent_message","message":"{}"}}}}"#,
+            "k".repeat(200_000),
+        );
+        let bytes = blob_raw.as_bytes();
+        assert!(bytes.len() > DISPLAY_PREVIEW_READ_LIMIT);
+        let compacted = compact_import_record(&bytes[..DISPLAY_PREVIEW_READ_LIMIT]);
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert_eq!(
+            compacted["payload"]["echo_text_truncated"], true,
+            "read-limit cut blob preview sets the flag"
+        );
+        assert!(compacted["payload"]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with('…'));
+
+        // Read-limit cut WITHOUT an ellipsis: a record whose `message` value
+        // starts late enough in the preview window that the 4096-byte boundary
+        // lands inside the value after fewer than the character-budget chars
+        // (here ~622), so `compact_text` appends no ellipsis. Only the flag
+        // tells the classifier the text is known-truncated — the ellipsis
+        // heuristic alone would miss it.
+        let padded_event = format!(
+            r#"{{"type":"event_msg","payload":{{"type":"agent_message","pad":"{}","message":"{}"}}}}"#,
+            "p".repeat(3400),
+            "k".repeat(5000),
+        );
+        let bytes = padded_event.as_bytes();
+        let message_needle = r#""message":""#;
+        let message_value_start = bytes
+            .windows(message_needle.len())
+            .position(|window| window == message_needle.as_bytes())
+            .expect("message field")
+            .saturating_add(message_needle.len());
+        assert_eq!(
+            message_value_start, 3474,
+            "layout drives the no-ellipsis cut"
+        );
+        assert!(bytes.len() > DISPLAY_PREVIEW_READ_LIMIT);
+        assert!(message_value_start < DISPLAY_PREVIEW_READ_LIMIT);
+        let compacted = compact_import_record(&bytes[..DISPLAY_PREVIEW_READ_LIMIT]);
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        let message = compacted["payload"]["message"].as_str().unwrap();
+        assert_eq!(message.chars().count(), 622);
+        assert!(
+            !message.ends_with('…'),
+            "short remainder inside the window gets no appended ellipsis"
+        );
+        assert_eq!(
+            compacted["payload"]["echo_text_truncated"], true,
+            "read-limit cut without ellipsis still sets the flag"
+        );
+
+        // Same no-ellipsis read-limit cut for a response_item's first content
+        // text value (window ends ~675 chars into the value, no ellipsis).
+        let padded_response = format!(
+            r#"{{"type":"response_item","payload":{{"type":"message","role":"assistant","pad":"{}","content":[{{"type":"output_text","text":"{}"}}]}}}}"#,
+            "p".repeat(3300),
+            "k".repeat(6000),
+        );
+        let bytes = padded_response.as_bytes();
+        let text_needle = r#""text":""#;
+        let text_value_start = bytes
+            .windows(text_needle.len())
+            .position(|window| window == text_needle.as_bytes())
+            .expect("content text field")
+            .saturating_add(text_needle.len());
+        assert_eq!(text_value_start, 3421, "layout drives the no-ellipsis cut");
+        assert!(bytes.len() > DISPLAY_PREVIEW_READ_LIMIT);
+        assert!(text_value_start < DISPLAY_PREVIEW_READ_LIMIT);
+        let compacted = compact_import_record(&bytes[..DISPLAY_PREVIEW_READ_LIMIT]);
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        let text = compacted["payload"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text.chars().count(), 675);
+        assert!(!text.ends_with('…'));
+        assert_eq!(compacted["payload"]["echo_text_truncated"], true);
+    }
+
+    #[test]
+    fn compact_import_record_prefix_fallback_recovers_payload_exit_code() {
+        // A truncated blob preview may cut the record before its
+        // `payload.item` block entirely; payload-level exitCode/status/
+        // errorMessage outcome evidence near the envelope start must still
+        // survive, exactly as the full-parse path preserves it.
+        let failure = format!(
+            r#"{{"type":"response_item","payload":{{"type":"function_call_output","exitCode":1,"errorMessage":"boom","status":"failed","output":"{}"}}}}"#,
+            "z".repeat(200_000),
+        );
+        let bytes = failure.as_bytes();
+        assert!(bytes.len() > DISPLAY_PREVIEW_READ_LIMIT);
+        let compacted = compact_import_record(&bytes[..DISPLAY_PREVIEW_READ_LIMIT]);
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert_eq!(compacted["payload"]["type"], "function_call_output");
+        assert_eq!(compacted["payload"]["exitCode"], 1);
+        assert_eq!(compacted["payload"]["errorMessage"], "boom");
+        assert_eq!(compacted["payload"]["status"], "failed");
+
+        // Success evidence: exitCode 0 is recovered the same way.
+        let success = format!(
+            r#"{{"type":"response_item","payload":{{"type":"function_call_output","exitCode":0,"output":"{}"}}}}"#,
+            "y".repeat(200_000),
+        );
+        let bytes = success.as_bytes();
+        assert!(bytes.len() > DISPLAY_PREVIEW_READ_LIMIT);
+        let compacted = compact_import_record(&bytes[..DISPLAY_PREVIEW_READ_LIMIT]);
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert_eq!(compacted["payload"]["exitCode"], 0);
+
+        // The nested item-level copy is still recovered (unchanged behavior),
+        // including when the payload-level field precedes it.
+        let nested = format!(
+            r#"{{"type":"event_msg","payload":{{"type":"item_completed","exitCode":2,"status":"completed","item":{{"type":"CommandExecution","id":"call_x","exitCode":2,"status":"completed"}},"output":"{}"}}}}"#,
+            "w".repeat(200_000),
+        );
+        let bytes = nested.as_bytes();
+        assert!(bytes.len() > DISPLAY_PREVIEW_READ_LIMIT);
+        let compacted = compact_import_record(&bytes[..DISPLAY_PREVIEW_READ_LIMIT]);
+        let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
+        assert_eq!(compacted["payload"]["exitCode"], 2);
+        assert_eq!(compacted["payload"]["item"]["exitCode"], 2);
+        assert_eq!(compacted["payload"]["item"]["status"], "completed");
+    }
+
+    #[test]
     fn row_first_window_precedes_global_layout() {
         let first = message_op(1, 1, OpId::new(NodeId(0), 0, 0));
         let second = message_op(1, 2, first.id);
         let projection = HistoryProjection::from_ops(vec![first, second]);
         let mut ws = Workspace::from_projection(projection);
-        let filter = ChainFilter::new(String::new(), String::new(), String::new(), false, false);
+        let filter = ChainFilter::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            false,
+            false,
+            false,
+        );
 
         let provisional = ws.history_window(HistoryWindowOptions {
             offset: 0,
@@ -3722,6 +5498,7 @@ mod tests {
                     String::new(),
                     false,
                     false,
+                    false,
                 )
             })
             .collect();
@@ -3750,6 +5527,50 @@ mod tests {
         assert_eq!(
             ws.current_view.as_ref().map(|(key, _)| key.clone()),
             Some((false, filters.last().unwrap().key()))
+        );
+    }
+
+    #[test]
+    fn default_and_fixed_filters_hide_trace_but_dto_raw_mode_does_not() {
+        // The fixed pregenerated viewer filter hides trace rows so Activity
+        // mode is served from the render snapshot. A `None` DTO maps to that
+        // fixed filter explicitly; `ChainFilter::default()` stays the raw
+        // baseline (hide_trace off), and raw mode sends an explicit
+        // `hide_trace: false` to materialize the live projection.
+        let default_filter = chain_filter_from_dto(None);
+        assert!(default_filter.key().hide_trace);
+        assert_eq!(
+            default_filter.key(),
+            fixed_view_filter().key(),
+            "None DTO must map to the fixed viewer filter"
+        );
+        assert!(fixed_view_filter().key().hide_trace);
+        assert!(
+            !ChainFilter::default().key().hide_trace,
+            "ChainFilter::default is the raw baseline"
+        );
+        assert!(
+            ChainFilter::default().key().hide_undated,
+            "existing ChainFilter::default behavior preserved"
+        );
+        assert!(
+            !default_filter.key().hide_undated,
+            "the fixed Activity view does not hide undated rows"
+        );
+
+        let raw = chain_filter_from_dto(Some(&ChainFilterDto {
+            summary_pattern: String::new(),
+            kind_pattern: String::new(),
+            include_kind_pattern: String::new(),
+            hide_undated: false,
+            hide_trace: false,
+            splice: true,
+        }));
+        assert!(!raw.key().hide_trace);
+        assert_ne!(
+            raw.key(),
+            fixed_view_filter().key(),
+            "raw mode must not be served from the fixed-view snapshot"
         );
     }
 }

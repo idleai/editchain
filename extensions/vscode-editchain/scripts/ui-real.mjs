@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Render the REAL EditChain data from a chain dir through the harness, using
 // the actual Rust service over framed stdio. Dumps the full DOM tree + styles
-// as text artifacts — no screenshots.
+// as text artifacts, with an optional deterministic screenshot.
 //
 // Usage:
 //   node scripts/ui-real.mjs [--workspace DIR] [--chain-dir .editchain]
@@ -526,6 +526,7 @@ async function main() {
   console.log('settings: ' + (settings.length ? settings.join(', ') : 'none'));
   if (args.expandVisible) console.log('expanded chevrons=' + expandCount);
   console.log('svg dots=' + (layout.svg && layout.svg.dots ? layout.svg.dots.length : 0) +
+    ' capsules=' + (layout.svg && layout.svg.capsules ? layout.svg.capsules.length : 0) +
     ' edges=' + (layout.svg && layout.svg.edges ? layout.svg.edges.length : 0));
   console.log('checks pass=' + assertion.passCount + ' fail=' + assertion.failCount);
   failedChecks.forEach((c) => console.log('FAIL ' + c.name + ': ' + c.detail));

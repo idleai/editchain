@@ -435,6 +435,7 @@ mod tests {
                     byte_offset: 1,
                     ops_emitted: 1,
                     content_hash: [0u8; 32],
+                    normalization_version: 0,
                 },
             )
             .unwrap();
@@ -453,6 +454,7 @@ mod tests {
                     byte_offset: 1,
                     ops_emitted: 1,
                     content_hash: [0u8; 32],
+                    normalization_version: 0,
                 },
             )
             .unwrap();

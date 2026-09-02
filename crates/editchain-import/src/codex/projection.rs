@@ -185,6 +185,19 @@ pub struct SessionMeta {
     /// Working directory recorded by the provider (projection `cwd`); used by
     /// the workspace project filter. Absent in projections from older bridges.
     pub cwd: Option<String>,
+    /// Git state captured by Codex when the session started.
+    pub git: Option<SessionGitMeta>,
+}
+
+/// Provider-neutral Git state captured at session start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionGitMeta {
+    /// Exact commit checked out when the session started.
+    pub commit_hash: Option<String>,
+    /// Branch name observed at session start (provenance only).
+    pub branch: Option<String>,
+    /// Repository remote URL observed at session start (provenance only).
+    pub repository_url: Option<String>,
 }
 
 /// The folded result of one physical file's projection stream.
@@ -208,6 +221,8 @@ pub struct Projection {
     pub owning_thread: Option<String>,
     /// First bridge `sessionMeta` object (structural/provenance metadata).
     pub session_meta: Option<SessionMeta>,
+    /// Physical source ordinal carrying [`Self::session_meta`].
+    pub session_meta_source_ordinal: Option<u64>,
     /// Final per-turn metadata, first-appearance order, merged by turn id
     /// (the last reported status/timing wins, mirroring item upserts).
     pub turns: Vec<TurnMeta>,
@@ -300,6 +315,8 @@ pub fn parse_projection(
                     projection.owning_thread.clone_from(&record.thread_id);
                 }
                 if projection.session_meta.is_none() {
+                    projection.session_meta_source_ordinal =
+                        record.session_meta.as_ref().map(|_| record.source_ordinal);
                     projection.session_meta.clone_from(&record.session_meta);
                 }
                 for turn in &record.changed_turns {
@@ -639,6 +656,26 @@ fn parse_session_meta(meta: &serde_json::Map<String, Value>) -> SessionMeta {
         originator: str_field("originator"),
         model_provider: str_field("modelProvider"),
         cwd: str_field("cwd"),
+        git: meta
+            .get("git")
+            .and_then(Value::as_object)
+            .map(|git| SessionGitMeta {
+                commit_hash: git
+                    .get("commitHash")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string),
+                branch: git
+                    .get("branch")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string),
+                repository_url: git
+                    .get("repositoryUrl")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string),
+            }),
     }
 }
 

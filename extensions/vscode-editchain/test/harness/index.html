@@ -26,14 +26,19 @@
   }
 </style>
 </head>
-<body>
-<div id="controls">
+<body data-treatment="pulse">
+<div id="controls" role="group" aria-label="History controls">
+<div id="profile-control" class="segmented" role="group" aria-label="History profile">
+<button type="button" id="profile-activity" class="segmented-btn active" aria-pressed="true">Activity</button>
+<button type="button" id="profile-raw" class="segmented-btn" aria-pressed="false">Raw</button>
+</div>
+<label class="visually-hidden" for="search">Search history</label>
 <input id="search" type="text" placeholder="Search history… (Enter to search)">
 </div>
 <div id="layout">
 <div id="rows"></div>
-<div id="detail"></div>
 </div>
+<div id="status-live" class="visually-hidden" role="status" aria-live="polite"></div>
 
 <!-- Theme tokens the VS Code webview normally gets from the workbench. -->
 <script>
@@ -50,6 +55,17 @@
     root.style.setProperty('--vscode-descriptionForeground', '#9d9d9d');
     root.style.setProperty('--vscode-panel-border', '#2b2b2b');
     root.style.setProperty('--vscode-list-hoverBackground', '#2a2d2e');
+    root.style.setProperty('--vscode-list-activeSelectionBackground', '#04395e');
+    root.style.setProperty('--vscode-list-activeSelectionForeground', '#ffffff');
+    root.style.setProperty('--vscode-badge-background', '#4d4d4d');
+    root.style.setProperty('--vscode-badge-foreground', '#ffffff');
+    root.style.setProperty('--vscode-keybindingLabel-background', '#3a3d41');
+    root.style.setProperty('--vscode-keybindingLabel-foreground', '#cccccc');
+    root.style.setProperty('--vscode-keybindingLabel-border', '#515151');
+    root.style.setProperty('--vscode-textPreformat-foreground', '#d7ba7d');
+    root.style.setProperty('--vscode-testing-iconPassed', '#89d185');
+    root.style.setProperty('--vscode-editorWarning-foreground', '#cca700');
+    root.style.setProperty('--vscode-editorError-foreground', '#f48771');
   })();
 </script>
 
@@ -64,7 +80,7 @@
 </script>
 
 <!-- The REAL production renderer. It calls acquireVsCodeApi() and renders into
-     #rows/#detail exactly as it does inside VS Code. -->
+     the same single-pane #rows surface used inside VS Code. -->
 <script src="../../media/main.js"></script>
 
 <!-- Text-only layout probe (harness-only). -->

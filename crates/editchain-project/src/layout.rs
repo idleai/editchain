@@ -17,7 +17,7 @@
 //!   through every intermediate grid point). This is what the webview uses to
 //!   draw continuous git-style lines across rows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use editchain_core::OpId;
 
@@ -239,6 +239,12 @@ pub struct LayoutContext {
     /// whose child lies above the window so lines entering from offscreen above
     /// are still drawn through the visible slice.
     pub children_of: HashMap<String, Vec<String>>,
+    /// Cross-lane edges whose bend belongs in the parent node's row. True
+    /// forks (a parent with multiple children) and operation→Git session
+    /// anchors use this orientation so an above-right branch forms the visual
+    /// bottom-right corner before entering the anchor. Merge-only edges retain
+    /// child-side bends.
+    pub parent_anchored_edges: HashSet<(String, String)>,
     /// Node key → connected-component id. Used to detect open chains that span
     /// across a query window so pass-through edges are still drawn.
     pub comp_id: HashMap<String, usize>,
@@ -261,9 +267,10 @@ pub struct LayoutContext {
     /// Per-row lanes with a vertical segment in the BOTTOM half of that row's cell
     /// (lines leaving downward). See [`Self::row_above`].
     pub row_below: Vec<Vec<usize>>,
-    /// Per-row horizontal lane-jog segments: for each row index, the list of
-    /// `(from_lane, to_lane)` transitions that occur at that row (merge
-    /// connectors). Also static and shipped per row.
+    /// Per-row cross-lane transitions: for each row index, the list of
+    /// `(from_lane, to_lane)` bends that occur there. Fork/session-anchor bends
+    /// live in the parent row; merge-only bends remain at the child or final
+    /// pre-parent row. Also static and shipped per row.
     pub row_transitions: Vec<Vec<(usize, usize)>>,
 }
 
@@ -308,14 +315,36 @@ impl LayoutContext {
                 }
             }
         }
+        // A branch visually originates at its shared parent, so its cross-lane
+        // bend belongs in that parent's row. Cross-domain operation→Git edges
+        // are exact session-start anchors and follow the same rule even when
+        // the commit currently has only that one visible child. Merge-only
+        // edges stay child-anchored so multiple parents still fan out from the
+        // merge node rather than appearing to fork later in history.
+        let mut parent_anchored_edges: HashSet<(String, String)> = HashSet::new();
+        for child in nodes {
+            let child_is_git = is_git(child);
+            if let Some(node_parents) = parents.get(child) {
+                for parent in node_parents {
+                    let is_fork = children_of
+                        .get(parent)
+                        .is_some_and(|children| children.len() > 1);
+                    let is_session_git_anchor = !child_is_git && is_git(parent);
+                    if is_fork || is_session_git_anchor {
+                        let _: bool = parent_anchored_edges.insert((child.clone(), parent.clone()));
+                    }
+                }
+            }
+        }
         // Precompute connected components so open chains that span across a query
         // window (pass-through edges) can be detected without iterating window rows.
         let (comp_id, comp_min, comp_max, _) = compute_components(nodes, &row_of, &parents);
         // Build per-lane OCCUPANCY RUNS keyed by component: for each lane,
         // record every CONTIGUOUS run of rows where that component actually has
         // geometry on that lane — node dots plus the exact edge runs
-        // `build_edge_points` emits (same-lane runs, adjacent cross-lane jog
-        // halves, non-adjacent cross-lane source/destination runs).
+        // `build_edge_points` emits (same-lane runs, parent-anchored fork runs,
+        // adjacent merge jog halves, and non-adjacent merge source/destination
+        // runs).
         //
         // A component may touch several lanes (merges), but a lane is only
         // "open" where the component's geometry actually crosses it. Tracking
@@ -341,11 +370,26 @@ impl LayoutContext {
                     continue; // not a downward edge
                 }
                 let p_lane = *lane_at.get(parent).unwrap_or(&lane);
+                let parent_anchored =
+                    parent_anchored_edges.contains(&(key.clone(), parent.clone()));
                 if lane == p_lane {
                     lane_spans
                         .entry(lane)
                         .or_default()
                         .push((cid, row, parent_row));
+                } else if parent_anchored {
+                    // Parent-anchored fork: the source lane stays live through
+                    // the top half of the parent row, where the convex curve
+                    // terminates at the parent dot. The parent lane's node
+                    // occupancy was already recorded above. `lane_spans`
+                    // models FULL pass-through runs, so stop one row earlier:
+                    // the source touches only the parent row's top half and
+                    // must not bridge to a later reused-lane run below it.
+                    lane_spans.entry(lane).or_default().push((
+                        cid,
+                        row,
+                        parent_row.saturating_sub(1),
+                    ));
                 } else if parent_row == row.saturating_add(1) {
                     // Adjacent cross-lane: the jog starts at the child's
                     // midpoint, so the destination lane carries the two
@@ -389,13 +433,14 @@ impl LayoutContext {
             *list = merged;
         }
 
-        // Compute per-row ABOVE/BELOW lanes and horizontal TRANSITIONS by walking every
-        // edge's geometry. An edge from (child_row, child_lane) to (parent_row,
-        // parent_lane):
+        // Compute per-row ABOVE/BELOW lanes and cross-lane TRANSITIONS by walking
+        // every edge's geometry. An edge from (child_row, child_lane) to
+        // (parent_row, parent_lane):
         //   - same lane: vertical on child_lane from child down to parent;
-        //   - different lanes: vertical on child_lane down to parent_row-1, a
-        //     horizontal jog child_lane→parent_lane at parent_row-1, then vertical
-        //     on parent_lane down to parent.
+        //   - parent-anchored fork/session edge: vertical on child_lane into the
+        //     parent row, then a transition ending at the parent dot;
+        //   - merge-only different-lane edge: transition at the child row when
+        //     adjacent, otherwise at parent_row-1 with a short destination run.
         // Splitting into above/below halves means a TIP (newest node, no children)
         // draws no line above its dot and a ROOT (no parents) draws no line below —
         // no dangling segments. All static, shipped per row.
@@ -413,6 +458,8 @@ impl LayoutContext {
                     continue; // parent above or same row — not a downward edge
                 }
                 let p_lane = *lane_at.get(parent).unwrap_or(&my_lane);
+                let parent_anchored =
+                    parent_anchored_edges.contains(&(key.clone(), parent.clone()));
                 if my_lane == p_lane {
                     // Same-lane edge: vertical on my_lane from `row` down to
                     // `parent_row`. Bottom half at the child's own row, top half at
@@ -430,6 +477,30 @@ impl LayoutContext {
                         if let Some(below) = row_below.get_mut(r) {
                             add_unique(below, my_lane);
                         }
+                    }
+                } else if parent_anchored {
+                    // A true fork (or exact operation→Git session anchor)
+                    // bends in the PARENT row. Run the child lane down through
+                    // every preceding row, enter the parent row from above,
+                    // then terminate the transition at the parent's dot. Any
+                    // independent edge leaving that parent contributes its own
+                    // bottom half on the parent lane.
+                    if let Some(below) = row_below.get_mut(row) {
+                        add_unique(below, my_lane);
+                    }
+                    for r in (row.saturating_add(1))..parent_row {
+                        if let Some(above) = row_above.get_mut(r) {
+                            add_unique(above, my_lane);
+                        }
+                        if let Some(below) = row_below.get_mut(r) {
+                            add_unique(below, my_lane);
+                        }
+                    }
+                    if let Some(above) = row_above.get_mut(parent_row) {
+                        add_unique(above, my_lane);
+                    }
+                    if let Some(transitions) = row_transitions.get_mut(parent_row) {
+                        add_unique(transitions, (my_lane, p_lane));
                     }
                 } else if parent_row == row.saturating_add(1) {
                     // Adjacent cross-lane edge: the jog originates at the child
@@ -494,6 +565,7 @@ impl LayoutContext {
             lanes,
             parents,
             children_of,
+            parent_anchored_edges,
             comp_id,
             comp_min,
             comp_max,
@@ -533,10 +605,30 @@ impl LayoutContext {
                         let p_lane = *self.lane_at.get(parent).unwrap_or(&my_lane);
                         // Clamp to window bottom if the parent lies below it.
                         let draw_to = parent_row.min(end);
+                        let parent_anchored = self
+                            .parent_anchored_edges
+                            .contains(&(key.clone(), parent.clone()));
+                        let parent_visible = parent_row < end;
+                        let transition_at_parent = parent_visible && parent_anchored;
+                        // A parent-anchored edge does not bend early merely
+                        // because its real anchor is below this window. Keep
+                        // the visible/clamped segment on the branch lane; the
+                        // parent-row curve appears once that row is visible.
+                        let draw_lane = if parent_anchored && !parent_visible {
+                            my_lane
+                        } else {
+                            p_lane
+                        };
                         edges.push(LaneEdge {
                             child: key.clone(),
                             parent: parent.clone(),
-                            points: build_edge_points(row, my_lane, draw_to, p_lane),
+                            points: build_edge_points(
+                                row,
+                                my_lane,
+                                draw_to,
+                                draw_lane,
+                                transition_at_parent,
+                            ),
                         });
                     }
                     _ => {}
@@ -580,7 +672,16 @@ impl LayoutContext {
                                 }
                                 pts
                             } else {
-                                build_edge_points(draw_from, c_lane, row, my_lane)
+                                let transition_at_parent = self
+                                    .parent_anchored_edges
+                                    .contains(&(child.clone(), key.clone()));
+                                build_edge_points(
+                                    draw_from,
+                                    c_lane,
+                                    row,
+                                    my_lane,
+                                    transition_at_parent,
+                                )
                             };
                             edges.push(LaneEdge {
                                 child: child.clone(),
@@ -680,7 +781,7 @@ fn compute_components(
     row_of: &HashMap<String, usize>,
     parents: &HashMap<String, Vec<String>>,
 ) -> ComponentData {
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::VecDeque;
 
     // Undirected adjacency.
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
@@ -829,7 +930,7 @@ pub fn compute_lane_assignment(
     reason = "In-degree counters are bounded by the number of present parents; HashMap insert returns Option which is discarded"
 )]
 fn topological_order(nodes: &[String], parents_of: &impl Fn(&str) -> Vec<String>) -> Vec<String> {
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::VecDeque;
     let present: HashSet<String> = nodes.iter().cloned().collect();
     let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
     let mut indegree: HashMap<String, usize> = HashMap::new();
@@ -965,16 +1066,17 @@ fn compute_lane_map(
 /// Build the ordered grid points for an edge from `(child_row, child_lane)` down
 /// to `(parent_row, parent_lane)`.
 ///
-/// The path starts at the child's point and ends at the parent's point. Between
-/// them it runs vertically on the child's own lane down to just above the
-/// parent's row; if the lanes differ it jogs horizontally onto the parent's
-/// lane at that final intermediate step before landing on the parent's point.
-/// This yields continuous vertical runs plus one horizontal transition per edge.
+/// The path starts at the child's point and ends at the parent's point. A
+/// parent-anchored fork remains on the child lane through the parent row, then
+/// turns into the parent dot there. Other cross-lane edges retain the merge
+/// geometry: they jog onto the parent lane at the child row when adjacent or at
+/// the final intermediate row when non-adjacent.
 fn build_edge_points(
     child_row: usize,
     child_lane: usize,
     parent_row: usize,
     parent_lane: usize,
+    transition_at_parent: bool,
 ) -> Vec<GridPoint> {
     debug_assert!(parent_row > child_row, "parent must be below child");
 
@@ -984,6 +1086,24 @@ fn build_edge_points(
         row: child_row,
         lane: child_lane,
     });
+
+    if child_lane != parent_lane && transition_at_parent {
+        // A fork bends in the parent's own row: keep the branch lane vertical
+        // through the top half of that row, then enter the parent dot from its
+        // right/left side. This is the grid equivalent of the webview's smooth
+        // bottom-right/bottom-left quadratic.
+        for r in child_row.saturating_add(1)..=parent_row {
+            points.push(GridPoint {
+                row: r,
+                lane: child_lane,
+            });
+        }
+        points.push(GridPoint {
+            row: parent_row,
+            lane: parent_lane,
+        });
+        return points;
+    }
 
     // Vertical run on the child's own lane down to just above the transition
     // step (`..` excludes `parent_row - 1`, which we add explicitly).
@@ -1064,7 +1184,7 @@ fn compute_lane_map_reuse(
     parents_of: &impl Fn(&str) -> Vec<String>,
     is_git: &impl Fn(&str) -> bool,
 ) -> HashMap<String, usize> {
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::VecDeque;
 
     // --- Phase 0/1: connected components over undirected edges ------------------
     // Build undirected adjacency so we can flood-fill components regardless of
@@ -1157,7 +1277,7 @@ fn compute_lane_map_reuse(
             // `compute_lane_map` never frees a lane, so sequential branches
             // inside one component would each keep a permanent column. Compact
             // only disjoint geometry; overlapping branches remain distinct.
-            compact_component_lanes(members, &uncompacted, parents_of, &row_of_key)
+            compact_component_lanes(members, &uncompacted, parents_of, &row_of_key, is_git)
         };
 
         // Git is globally remapped to lane 0. Rank only the operation lanes so
@@ -1280,7 +1400,15 @@ fn compact_component_lanes(
     lane_of: &HashMap<String, usize>,
     parents_of: &impl Fn(&str) -> Vec<String>,
     row_of_key: &HashMap<String, usize>,
+    is_git: &impl Fn(&str) -> bool,
 ) -> HashMap<String, usize> {
+    let mut child_counts: HashMap<String, usize> = HashMap::new();
+    for key in members {
+        for parent in parents_of(key) {
+            let count = child_counts.entry(parent).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
     // Per-lane used-row span (lo, hi): initialize one entry per lane in use.
     let mut lane_spans: Vec<(usize, usize)> = Vec::new();
     for key in members {
@@ -1290,8 +1418,9 @@ fn compact_component_lanes(
         }
     }
     // Fold node dots and every edge run into the lanes they touch, using the
-    // same geometry `LayoutContext` emits (same-lane run, adjacent cross-lane
-    // jog with no source run, non-adjacent cross-lane jog at parent_row - 1).
+    // same geometry `LayoutContext` emits (same-lane run, parent-anchored fork
+    // run, adjacent merge jog with no source run, or non-adjacent merge jog at
+    // parent_row - 1).
     for key in members {
         let my_lane = *lane_of.get(key).unwrap_or(&0);
         let Some(child_row) = row_of_key.get(key).copied() else {
@@ -1306,7 +1435,14 @@ fn compact_component_lanes(
                 continue; // not a downward edge
             }
             let p_lane = *lane_of.get(&parent).unwrap_or(&my_lane);
+            let parent_anchored = child_counts.get(&parent).copied().unwrap_or(0) > 1
+                || (!is_git(key) && is_git(&parent));
             if my_lane == p_lane {
+                lane_spans[my_lane] = fold_span(lane_spans[my_lane], parent_row);
+            } else if parent_anchored {
+                // Parent-anchored fork: the source lane remains live through
+                // the parent row's top half; the destination lane is already
+                // occupied there by the parent node itself.
                 lane_spans[my_lane] = fold_span(lane_spans[my_lane], parent_row);
             } else if parent_row == child_row.saturating_add(1) {
                 // Adjacent cross-lane: the jog starts at the child's midpoint,

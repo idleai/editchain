@@ -16,4 +16,5 @@ workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 editchain-core = { path = "../editchain-core" }
+editchain-project = { path = "../editchain-project" }
 editchain-query = { path = "../editchain-query" }

@@ -156,6 +156,14 @@ pub struct ChainFilterDto {
     /// Hide nodes with no real timestamp (`timestamp_ms() == 0`).
     #[serde(default)]
     pub hide_undated: bool,
+    /// Hide trace rows (duplicate/echo/transport envelopes classified as
+    /// `Visibility::Trace`) unconditionally, splicing causal edges across them.
+    ///
+    /// Backward compatible: older clients omit the field and deserialize it as
+    /// `false` (the raw view), while the fixed pregenerated/default viewer
+    /// sends `true` so Activity mode can be served from the render snapshot.
+    #[serde(default)]
+    pub hide_trace: bool,
     /// Reconnect causal edges across hidden intermediate nodes.
     #[serde(default)]
     pub splice: bool,
@@ -324,6 +332,10 @@ pub struct ResolvedObject {
 
 /// A history row in the unified projection (`EditChain` op or `Git` commit).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "flat versioned wire DTO: each boolean is an independent backward-compatible serde-defaulted flag the viewer toggles (submodule/system/subop/promoted); refactoring to enums would churn the wire contract"
+)]
 pub struct HistoryRow {
     /// The operation ID (for `EditChain` ops) in display form `"node:boot:seq"`,
     /// or `None` for git commits. Stored as a string to avoid JS precision loss.
@@ -414,6 +426,147 @@ pub struct HistoryRow {
     /// `"tool_result"`). `None` on top-level rows.
     #[serde(default)]
     pub subop_kind: Option<String>,
+    /// Provider-neutral record role (narrative/action/result/artifact/
+    /// lifecycle/echo/unknown). Serialized as a lowercase `snake_case` string;
+    /// unknown values deserialize to `Unknown` for forward compatibility.
+    #[serde(default)]
+    pub record_role: editchain_project::taxonomy::RecordRole,
+    /// Provider-neutral activity kind (conversation/plan/execute/change/...).
+    /// Serialized as a lowercase `snake_case` string; unknown values deserialize
+    /// to `Unknown` for forward compatibility.
+    #[serde(default)]
+    pub activity_kind: editchain_project::taxonomy::ActivityKind,
+    /// Render prominence (primary/supporting/trace). Trace rows are hidden by
+    /// the `hide_trace` chain filter.
+    #[serde(default)]
+    pub visibility: editchain_project::taxonomy::Visibility,
+    /// Concluded outcome (success/warning/failure/cancelled/unknown). Unknown
+    /// is the default — success is never inferred without structured evidence.
+    #[serde(default)]
+    pub outcome: editchain_project::taxonomy::Outcome,
+    /// Provider-neutral turn identity as an exact decimal string (u64 values
+    /// above 2^53 round-trip through JavaScript without precision loss).
+    /// `None` when the row is not turn-scoped.
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    /// Small display-safe subset of the owning Codex session metadata.
+    ///
+    /// The service attaches this to session-scoped rows so clients can label a
+    /// session boundary without parsing raw import JSON. Both members are
+    /// optional because older providers and older imports may omit either one.
+    #[serde(default)]
+    pub session_meta: Option<SessionMetaDto>,
+    /// Stable, additive work-unit metadata for boundary/header rendering.
+    ///
+    /// Every row in a window carries its opaque work-unit id plus view-stable
+    /// boundary flags, so the client can render a unit header (at
+    /// [`WorkUnitDto::is_start`]) without inferring boundaries across paged
+    /// windows. `None` only on older services that predate the field.
+    #[serde(default)]
+    pub work_unit: Option<WorkUnitDto>,
+    /// Conservative promotion marker: `true` when this row is significant
+    /// enough that the Activity projection must never fold it into a bundled
+    /// execute run (warning/failure/cancelled outcome, change/verify activity,
+    /// or a deterministically known unit-final narrative/final decision).
+    /// Bundling-eligible execute rows are never promoted.
+    #[serde(default)]
+    pub promoted: bool,
+    /// Typed metadata for a synthetic Activity-view execute-run bundle row.
+    ///
+    /// `Some` only for top-level execute bundle rows (the synthetic Activity
+    /// projection node folding a contiguous execute run): the client can then
+    /// distinguish a bundled execute run from an ordinary execute row with
+    /// `sub_ops` without parsing the display summary string. `None` on every
+    /// ordinary row, expanded sub-op row, and raw (unbundled) row. Older
+    /// services that predate the field omit it entirely, so it defaults to
+    /// `None`.
+    #[serde(default)]
+    pub activity_bundle: Option<ActivityBundleDto>,
+}
+
+/// Display-safe provenance copied from a session's `session_meta` record.
+///
+/// This deliberately remains a tiny subset of the provider payload: model and
+/// agent labels are useful history chrome, while instructions, environment,
+/// and other large or sensitive session fields stay in the raw record only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMetaDto {
+    /// Model/provider label recorded by the session (for example
+    /// `sglang_dsv4`).
+    #[serde(default)]
+    pub model_provider: Option<String>,
+    /// Human-friendly agent nickname, when the provider assigned one.
+    #[serde(default)]
+    pub agent_nickname: Option<String>,
+}
+
+/// Stable metadata for the work unit one history row belongs to.
+///
+/// Serialized inline on [`HistoryRow::work_unit`]. The id is opaque and
+/// provider-neutral; the client compares ids only for equality and renders a
+/// unit header when [`Self::is_start`] is `true`. All fields except `id` are
+/// serde-defaulted so older payloads and hand-written JSON tolerate missing
+/// members (forward/backward compatibility).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkUnitDto {
+    /// Opaque work-unit id (stable within a view snapshot; e.g. a turn
+    /// identity for turn-scoped rows, else the row's group key). Rows that
+    /// share an id form one unit, and ids never repeat across unrelated units
+    /// in a view.
+    pub id: String,
+    /// Whether this row is the FIRST row of its unit in the view's display
+    /// order (newest-first). The client renders the unit boundary/header here.
+    #[serde(default)]
+    pub is_start: bool,
+    /// Whether this row is the LAST row of its unit in display order. Absent
+    /// on older clients/services it is simply ignored; present rows can close
+    /// the unit's rendered section.
+    #[serde(default)]
+    pub is_end: bool,
+    /// Deterministic unit title when evidence supports one: the display
+    /// summary of the unit's oldest primary narrative row (the initiating
+    /// request for a turn). `None` when the unit has no narrative evidence.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Total number of top-level rows in this unit for the current view
+    /// (computed over the full view, so stable across paged windows).
+    #[serde(default)]
+    pub count: u64,
+}
+
+/// Typed metadata for a synthetic Activity-view execute-run bundle row.
+///
+/// Serialized inline on [`HistoryRow::activity_bundle`]. `member_count` is the
+/// ORIGINAL top-level run member count (`member_nodes.len()`), never the
+/// flattened metadata-subop count, so the client can render faithful
+/// "N steps" labels from structured data. The bundle kind is an enum so new
+/// bundle kinds stay forward-compatible with older viewers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityBundleDto {
+    /// Provider-neutral kind of this activity bundle row.
+    pub kind: ActivityBundleKind,
+    /// Number of original top-level member rows folded into the bundle
+    /// (exact, as a u64).
+    pub member_count: u64,
+}
+
+/// Provider-neutral kinds for an activity bundle row.
+///
+/// Serialized as kebab-case strings (`"execute-run"`, `"plan-repeat"`). Unknown strings
+/// deserialize to [`Self::Unknown`] so older clients tolerate new bundle kinds
+/// from newer services (forward compatibility).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ActivityBundleKind {
+    /// A synthetic Activity-view summary node folding a maximal contiguous
+    /// run of low-signal execute rows into one expandable run.
+    ExecuteRun,
+    /// Adjacent primary Plan narratives that repeat the same normalized
+    /// heading, retained as expandable original reasoning records.
+    PlanRepeat,
+    /// A bundle kind this client does not recognize (forward compatibility).
+    #[serde(other)]
+    Unknown,
 }
 
 /// One typed parent edge on a history row.
@@ -654,6 +807,15 @@ mod tests {
             is_subop: false,
             parent_row: None,
             subop_kind: None,
+            record_role: editchain_project::taxonomy::RecordRole::Artifact,
+            activity_kind: editchain_project::taxonomy::ActivityKind::SourceControl,
+            visibility: editchain_project::taxonomy::Visibility::Primary,
+            outcome: editchain_project::taxonomy::Outcome::Success,
+            turn_id: Some(OVER_2_53.to_string()),
+            session_meta: None,
+            work_unit: None,
+            promoted: false,
+            activity_bundle: None,
         };
         let json = serde_json::to_value(&row).expect("serialize");
         assert_eq!(json["op_id"], "9007199254740993:7:42");
@@ -671,6 +833,19 @@ mod tests {
         assert_eq!(back.repository.as_deref(), Some("9007199254740993"));
         assert_eq!(back.git_oid.as_deref(), Some(big_oid_hex().as_str()));
         assert_eq!(back.parent_relations[0].kind, ParentRelationKind::Subagent);
+        // Taxonomy values serialize as stable lowercase `snake_case` strings and
+        // turn identity round-trips as an exact decimal string above 2^53.
+        let round_trip = serde_json::to_value(&back).expect("re-serialize");
+        assert_eq!(round_trip["record_role"], "artifact");
+        assert_eq!(round_trip["activity_kind"], "source_control");
+        assert_eq!(round_trip["visibility"], "primary");
+        assert_eq!(round_trip["outcome"], "success");
+        assert_eq!(round_trip["turn_id"], "9007199254740993");
+        assert_eq!(
+            back.record_role,
+            editchain_project::taxonomy::RecordRole::Artifact
+        );
+        assert_eq!(back.turn_id.as_deref(), Some("9007199254740993"));
     }
 
     #[test]
@@ -691,6 +866,24 @@ mod tests {
         }))
         .expect("sparse HistoryRow without parent_relations");
         assert!(sparse.parent_relations.is_empty());
+        // Newer provider-neutral fields default safely on sparse payloads.
+        assert_eq!(
+            sparse.record_role,
+            editchain_project::taxonomy::RecordRole::Unknown
+        );
+        assert_eq!(
+            sparse.activity_kind,
+            editchain_project::taxonomy::ActivityKind::Unknown
+        );
+        assert_eq!(
+            sparse.visibility,
+            editchain_project::taxonomy::Visibility::Unknown
+        );
+        assert_eq!(
+            sparse.outcome,
+            editchain_project::taxonomy::Outcome::Unknown
+        );
+        assert!(sparse.turn_id.is_none());
         // Unknown relationship kinds deserialize to the forward-compatible
         // Unknown variant (and re-serialize as a string), so a newer service
         // never breaks an older viewer.
@@ -945,17 +1138,236 @@ mod tests {
             kind_pattern: String::new(),
             include_kind_pattern: "^(message|command)$".to_string(),
             hide_undated: true,
+            hide_trace: true,
             splice: true,
         };
         let json = serde_json::to_value(&dto).expect("serialize");
         assert_eq!(json["include_kind_pattern"], "^(message|command)$");
+        assert_eq!(json["hide_trace"], true);
         let back: ChainFilterDto = serde_json::from_value(json).expect("deserialize");
         assert_eq!(back.include_kind_pattern, "^(message|command)$");
-        // Absent field defaults to empty (no inclusion constraint).
+        assert!(back.hide_trace);
+        // Absent field defaults to empty (no inclusion constraint); the
+        // backward-compatible hide_trace default is `false` (raw view).
         let sparse: ChainFilterDto =
             serde_json::from_value(serde_json::json!({ "splice": true })).expect("deserialize");
         assert_eq!(sparse.include_kind_pattern, "");
         assert!(sparse.splice);
+        assert!(!sparse.hide_trace);
+    }
+
+    #[test]
+    fn history_row_taxonomy_unknowns_round_trip_and_unknown_strings_fall_back() {
+        // Unknown taxonomy strings from a newer service deserialize to the
+        // forward-compatible Unknown variants and re-serialize as "unknown".
+        let row: HistoryRow = serde_json::from_value(serde_json::json!({
+            "op_id": null,
+            "git_oid": null,
+            "repository": null,
+            "summary": "row",
+            "timestamp_ms": 0,
+            "group": "session:1",
+            "node_key": "1:0:1",
+            "parents": [],
+            "is_submodule": false,
+            "record_role": "curated_note",
+            "activity_kind": "gardening",
+            "visibility": "spotlight",
+            "outcome": "heroic",
+            "turn_id": "9007199254740993",
+        }))
+        .expect("unknown taxonomy tolerated");
+        assert_eq!(
+            row.record_role,
+            editchain_project::taxonomy::RecordRole::Unknown
+        );
+        assert_eq!(
+            row.activity_kind,
+            editchain_project::taxonomy::ActivityKind::Unknown
+        );
+        assert_eq!(
+            row.visibility,
+            editchain_project::taxonomy::Visibility::Unknown
+        );
+        assert_eq!(row.outcome, editchain_project::taxonomy::Outcome::Unknown);
+        assert_eq!(row.turn_id.as_deref(), Some("9007199254740993"));
+        let reserialized = serde_json::to_string(&row).expect("serialize row");
+        assert!(reserialized.contains("\"record_role\":\"unknown\""));
+        assert!(reserialized.contains("\"activity_kind\":\"unknown\""));
+        assert!(reserialized.contains("\"visibility\":\"unknown\""));
+        assert!(reserialized.contains("\"outcome\":\"unknown\""));
+    }
+
+    #[test]
+    fn history_row_work_unit_and_promotion_default_and_round_trip() {
+        // Older services omit the new fields entirely: each must serde-default
+        // (work_unit -> None, promoted -> false, activity_bundle -> None) so
+        // old payloads keep loading.
+        let legacy: HistoryRow = serde_json::from_value(serde_json::json!({
+            "op_id": null,
+            "git_oid": null,
+            "repository": null,
+            "summary": "row",
+            "timestamp_ms": 1,
+            "group": "session:1",
+            "node_key": "1:0:1",
+            "parents": [],
+            "is_submodule": false,
+        }))
+        .expect("legacy row deserializes");
+        assert_eq!(legacy.work_unit, None);
+        assert_eq!(legacy.session_meta, None);
+        assert!(!legacy.promoted);
+        assert_eq!(legacy.activity_bundle, None);
+
+        // Newer services emit the fields; partial WorkUnitDto members default.
+        let row = HistoryRow {
+            op_id: Some("1:0:1".to_string()),
+            git_oid: None,
+            repository: None,
+            summary: "row".to_string(),
+            timestamp_ms: 1,
+            group: "session:1".to_string(),
+            node_key: "1:0:1".to_string(),
+            parents: Vec::new(),
+            parent_relations: Vec::new(),
+            is_submodule: false,
+            is_system: false,
+            author: String::new(),
+            commit_id: String::new(),
+            kind: String::new(),
+            lane: 0,
+            above: Vec::new(),
+            below: Vec::new(),
+            transitions: Vec::new(),
+            sub_ops: Vec::new(),
+            is_subop: false,
+            parent_row: None,
+            subop_kind: None,
+            record_role: editchain_project::taxonomy::RecordRole::Action,
+            activity_kind: editchain_project::taxonomy::ActivityKind::Execute,
+            visibility: editchain_project::taxonomy::Visibility::Primary,
+            outcome: editchain_project::taxonomy::Outcome::Success,
+            turn_id: Some(OVER_2_53.to_string()),
+            session_meta: Some(SessionMetaDto {
+                model_provider: Some("sglang_dsv4".to_string()),
+                agent_nickname: Some("Harvey".to_string()),
+            }),
+            work_unit: Some(WorkUnitDto {
+                id: format!("session:1/turn:{OVER_2_53}"),
+                is_start: true,
+                is_end: false,
+                title: Some("request".to_string()),
+                count: 12,
+            }),
+            promoted: true,
+            activity_bundle: Some(ActivityBundleDto {
+                kind: ActivityBundleKind::ExecuteRun,
+                member_count: 3,
+            }),
+        };
+        let json = serde_json::to_value(&row).expect("serialize row");
+        assert_eq!(
+            json["work_unit"]["id"],
+            format!("session:1/turn:{OVER_2_53}")
+        );
+        assert_eq!(json["work_unit"]["is_start"], true);
+        assert_eq!(json["work_unit"]["title"], "request");
+        assert_eq!(json["work_unit"]["count"], 12u64);
+        assert_eq!(json["promoted"], true);
+        assert_eq!(json["session_meta"]["model_provider"], "sglang_dsv4");
+        assert_eq!(json["session_meta"]["agent_nickname"], "Harvey");
+        assert_eq!(json["activity_bundle"]["kind"], "execute-run");
+        assert_eq!(json["activity_bundle"]["member_count"], 3u64);
+        let back: HistoryRow = serde_json::from_value(json).expect("deserialize row");
+        assert_eq!(
+            back.work_unit.as_ref().map(|w| w.id.as_str()),
+            Some("session:1/turn:9007199254740993")
+        );
+        assert!(back
+            .work_unit
+            .as_ref()
+            .is_some_and(|w| w.is_start && !w.is_end));
+        assert!(back.promoted);
+        assert_eq!(
+            back.session_meta
+                .as_ref()
+                .and_then(|meta| meta.model_provider.as_deref()),
+            Some("sglang_dsv4")
+        );
+        assert_eq!(
+            back.activity_bundle.as_ref().map(|bundle| bundle.kind),
+            Some(ActivityBundleKind::ExecuteRun)
+        );
+        assert_eq!(
+            back.activity_bundle
+                .as_ref()
+                .map(|bundle| bundle.member_count),
+            Some(3u64)
+        );
+
+        let plan_repeat = ActivityBundleDto {
+            kind: ActivityBundleKind::PlanRepeat,
+            member_count: 3,
+        };
+        let plan_json = serde_json::to_value(&plan_repeat).expect("serialize Plan repeat");
+        assert_eq!(plan_json["kind"], "plan-repeat");
+        let plan_back: ActivityBundleDto =
+            serde_json::from_value(plan_json).expect("deserialize Plan repeat");
+        assert_eq!(plan_back.kind, ActivityBundleKind::PlanRepeat);
+        assert_eq!(plan_back.member_count, 3);
+
+        // A missing `activity_bundle` member defaults to None, keeping older
+        // payloads additive-compatible with the new field.
+        let without_bundle: HistoryRow = serde_json::from_value(serde_json::json!({
+            "op_id": null,
+            "git_oid": null,
+            "repository": null,
+            "summary": "row",
+            "timestamp_ms": 1,
+            "group": "session:1",
+            "node_key": "1:0:1",
+            "parents": [],
+            "is_submodule": false,
+            "work_unit": { "id": "ops" }
+        }))
+        .expect("row without activity_bundle deserializes");
+        assert_eq!(without_bundle.activity_bundle, None);
+
+        // Unknown bundle kinds from a newer service deserialize to the
+        // forward-compatible Unknown variant (and re-serialize as a string),
+        // so a newer service never breaks an older viewer.
+        let unknown: ActivityBundleDto = serde_json::from_value(serde_json::json!({
+            "kind": "super-run",
+            "member_count": 2,
+        }))
+        .expect("unknown bundle kind tolerated");
+        assert_eq!(unknown.kind, ActivityBundleKind::Unknown);
+        assert_eq!(unknown.member_count, 2);
+        let reserialized = serde_json::to_string(&unknown).expect("serialize unknown kind");
+        assert!(reserialized.contains("\"unknown\""), "got {reserialized}");
+
+        // A partial WorkUnitDto (only the required id) fills the rest with
+        // defaults, keeping the wire additive for older viewers.
+        let sparse: HistoryRow = serde_json::from_value(serde_json::json!({
+            "op_id": null,
+            "git_oid": null,
+            "repository": null,
+            "summary": "row",
+            "timestamp_ms": 1,
+            "group": "ops",
+            "node_key": "1:0:1",
+            "parents": [],
+            "is_submodule": false,
+            "work_unit": { "id": "ops" }
+        }))
+        .expect("sparse work unit deserializes");
+        let unit = sparse.work_unit.expect("work unit present");
+        assert_eq!(unit.id, "ops");
+        assert!(!unit.is_start);
+        assert!(!unit.is_end);
+        assert_eq!(unit.title, None);
+        assert_eq!(unit.count, 0);
     }
 
     #[test]

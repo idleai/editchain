@@ -85,7 +85,8 @@ npm run ui:check   -- --scenario merge --shot shot.png       # ...plus a settled
 ```
 
 Scenarios: `empty`, `linear`, `merge`, `mixed`, `filtered`, `undated`, `error`,
-`warned`, `large`, `longsummary`, `combined` (expansion), `fork` (lanes), and
+`warned`, `large`, `longsummary`, `combined` (expansion), `sessionBranch`
+(a Codex session anchored below six newer Git commits), `fork` (lanes), and
 `highLanes` (200 concurrent lanes — proves no 128-lane clipping). `check` mode
 is **test-blocking**: it exits non-zero when any layout check fails or the page
 reports errors.
