@@ -297,12 +297,15 @@ async function main() {
       ' (' + (expOk ? 'OK' : 'FAIL') + ')');
   }
   if (searchResult) {
-    const searchOk = searchResult.resultRows > 0 &&
-      searchResult.secondaryPane === false &&
-      searchResult.selected === true &&
-      (searchResult.navigated || searchResult.firstRowChevron);
-    summary.push('- search "' + args.search + '": results=' + searchResult.resultRows +
-      ' banner="' + searchResult.bannerText + '" secondaryPane=' + searchResult.secondaryPane +
+    // In-place find contract: the chain DOM survives untouched, a real row is
+    // highlighted, the counter reports "i of N", and activation navigates.
+    const searchOk = searchResult.chainPreserved === true &&
+      !!searchResult.selectedKey &&
+      /^\d+ of \d/.test(searchResult.counterText || '') &&
+      searchResult.navigated === true;
+    summary.push('- search "' + args.search + '": counter="' + searchResult.counterText +
+      '" selectedKey=' + searchResult.selectedKey +
+      ' chainPreserved=' + searchResult.chainPreserved +
       ' navigated=' + searchResult.navigated +
       ' (' + (searchOk ? 'OK' : 'FAIL') + ')');
   }
@@ -369,10 +372,10 @@ async function main() {
   // (expansion / search) misbehaves. `dump`/`inspect` stay diagnostic.
   const interactionFailed =
     (expansion !== null && !(expansion.subopRows === 7 && expansion.rowsRendered >= 9)) ||
-    (searchResult !== null && !(searchResult.resultRows > 0 &&
-      searchResult.secondaryPane === false &&
-      searchResult.selected === true &&
-      (searchResult.navigated || searchResult.firstRowChevron))) ||
+    (searchResult !== null && !(searchResult.chainPreserved === true &&
+      !!searchResult.selectedKey &&
+      /^\d+ of \d/.test(searchResult.counterText || '') &&
+      searchResult.navigated === true)) ||
     (searchRace !== null && !(searchRace.steps[0] && searchRace.steps[0].latestWins === true)) ||
     (resizeResult !== null && resizeResult.pass !== true) ||
     (deferredLayout !== null && deferredLayout.pass !== true) ||
@@ -399,8 +402,9 @@ async function main() {
   if (pageErrors.length) console.log('PAGE ERRORS: ' + pageErrors.length);
   if (expansion) console.log('combined expansion subopRows=' + expansion.subopRows +
     ' rowsRendered=' + expansion.rowsRendered);
-  if (searchResult) console.log('search results=' + searchResult.resultRows +
-    ' secondaryPane=' + searchResult.secondaryPane +
+  if (searchResult) console.log('search counter="' + searchResult.counterText +
+    '" selectedKey=' + searchResult.selectedKey +
+    ' chainPreserved=' + searchResult.chainPreserved +
     ' navigated=' + searchResult.navigated);
   if (profileSwitch) console.log('profile-switch pass=' + profileSwitch.pass +
     ' steps=' + profileSwitch.steps.length);

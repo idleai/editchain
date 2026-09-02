@@ -771,6 +771,26 @@ impl HistoryProjection {
         )
     }
 
+    /// Resolve an operation id to the canonical op id of the visible top-level
+    /// row that represents it in the full (unfiltered) projection.
+    ///
+    /// Follows the semantic-collapse representative map, so a normalized child
+    /// folded into its raw import parent, a bundled META sub-op, a tool result
+    /// folded into its call, a structural note, or a fork prologue all resolve
+    /// to the row that renders them. Returns `None` when the id is neither a
+    /// top-level row nor folded into one (for example a synthetic git-index op
+    /// id, which is never a projection node). Find-in-chain callers use this to
+    /// lift a search hit to its visible row, then check that row against the
+    /// active filtered snapshot so hits hidden by the current view are dropped.
+    #[must_use]
+    pub fn visible_op_id(&self, op_id: OpId) -> Option<OpId> {
+        canonical_op_id(
+            op_id,
+            &self.collapsed_projection.representative,
+            &self.collapsed_projection.present,
+        )
+    }
+
     /// Returns the number of independent (disconnected) chains among the top-level
     /// rows, matching how the source Claude Code sessions/streams are expected to
     /// break down.

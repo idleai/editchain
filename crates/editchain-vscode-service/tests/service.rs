@@ -419,6 +419,127 @@ fn op_identifiers_above_2_53_round_trip_exactly_through_window_details_and_searc
 }
 
 #[test]
+fn find_in_history_protocol_path_resolves_visible_rows_and_reports_truncation() {
+    // Two message ops in one chain: both contain the needle. The Find-in-Chain
+    // request carries the exact view DTO (raw: no hide predicates, submodules
+    // hidden as the fixed viewer does) and must resolve both hits to real
+    // visible top-level rows with absolute parent-row offsets — and never
+    // claim an exact total when the top_k candidate cap truncates.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let chain_dir = tmp.path().join(".editchain");
+    let first = msg_op(41, 1, b"needle-fi chain row one");
+    let second = msg_op(41, 2, b"needle-fi chain row two");
+    let mut page = editchain_codec::page::Page::new(0);
+    page.add_record(0, editchain_codec::frame::encode_op(&first).unwrap());
+    page.add_record(0, editchain_codec::frame::encode_op(&second).unwrap());
+    write_page(&chain_dir, &page);
+
+    let mut server = editchain_vscode_service::Server::new();
+    let open = server
+        .handle(&Request {
+            id: 1,
+            body: RequestBody::Open(editchain_protocol::OpenRequest {
+                workspace_path: tmp.path().to_str().expect("utf8").to_string(),
+                chain_dir: ".editchain".to_string(),
+            }),
+        })
+        .expect("open");
+    assert!(matches!(open.body, ResponseBody::Ok(_)));
+
+    let find = server
+        .handle(&Request {
+            id: 2,
+            body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
+                query: "needle-fi".to_string(),
+                top_k: 50,
+                filters: SearchFiltersDto::default(),
+                filter: Some(editchain_protocol::ChainFilterDto {
+                    summary_pattern: String::new(),
+                    kind_pattern: String::new(),
+                    include_kind_pattern: String::new(),
+                    hide_undated: false,
+                    hide_trace: false,
+                    splice: true,
+                }),
+                hide_submodules: true,
+            }),
+        })
+        .expect("find in history");
+    let ResponseBody::Ok(value) = find.body else {
+        panic!("expected Ok find-in-history response, got {:?}", find.body);
+    };
+    // Both messages are top-level rows; row 1 = second (newest), row 0 = first.
+    assert_eq!(value["returned"], 2usize);
+    assert_eq!(value["more"], false);
+    let rows: Vec<u64> = value["matches"]
+        .as_array()
+        .expect("matches array")
+        .iter()
+        .map(|m| m["row"].as_u64().expect("row offset"))
+        .collect();
+    assert_eq!(rows, vec![0, 1]);
+    let keys: Vec<String> = value["matches"]
+        .as_array()
+        .expect("matches array")
+        .iter()
+        .map(|m| m["node_key"].as_str().expect("node_key").to_string())
+        .collect();
+    assert_eq!(keys, vec![second.id.to_string(), first.id.to_string()]);
+    assert!(
+        value["matches"][0]["op_id"].is_string(),
+        "op_id must be an exact string"
+    );
+    assert!(value["matches"][0]["summary"].is_string());
+
+    // A top_k of 1 truncates the candidate list: the response must say `more`
+    // rather than claim an exact total.
+    let truncated = server
+        .handle(&Request {
+            id: 3,
+            body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
+                query: "needle-fi".to_string(),
+                top_k: 1,
+                filters: SearchFiltersDto::default(),
+                filter: Some(editchain_protocol::ChainFilterDto {
+                    summary_pattern: String::new(),
+                    kind_pattern: String::new(),
+                    include_kind_pattern: String::new(),
+                    hide_undated: false,
+                    hide_trace: false,
+                    splice: true,
+                }),
+                hide_submodules: true,
+            }),
+        })
+        .expect("find in history truncated");
+    let ResponseBody::Ok(truncated_value) = truncated.body else {
+        panic!(
+            "expected Ok find-in-history response, got {:?}",
+            truncated.body
+        );
+    };
+    assert!(truncated_value["more"].as_bool().expect("more flag"));
+    assert_eq!(truncated_value["returned"], 1usize);
+
+    // The legacy Search request still works unchanged alongside it.
+    let search = server
+        .handle(&Request {
+            id: 4,
+            body: RequestBody::Search(editchain_protocol::SearchRequest {
+                query: "needle-fi".to_string(),
+                mode: editchain_query::search::SearchMode::Lexical,
+                top_k: 5,
+                filters: SearchFiltersDto::default(),
+            }),
+        })
+        .expect("legacy search");
+    let ResponseBody::Ok(search_value) = search.body else {
+        panic!("expected Ok search response, got {:?}", search.body);
+    };
+    assert!(search_value["results"].as_array().expect("results").len() >= 2);
+}
+
+#[test]
 fn git_resolve_uses_exact_string_ids_and_rejects_invalid_input() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let _repo = make_git_repo(tmp.path());

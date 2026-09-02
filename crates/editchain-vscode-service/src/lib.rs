@@ -34,12 +34,12 @@ use editchain_project::filter::ChainFilter;
 use editchain_project::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
 use editchain_protocol::{
-    ChainFilterDto, GraphLayout as ProtocolGraphLayout, HistoryRow, HistoryWindow, LayoutEdge,
-    LayoutPoint, LayoutRow, NodeDetails, ParentRelationDto, ParentRelationKind, RepositoryInfo,
-    Request, RequestBody, ResolvedObject, Response, ResponseBody, SearchFiltersDto, SearchHit,
-    SearchResponse, SessionMetaDto, WorkUnitDto,
+    ChainFilterDto, FindInHistoryMatch, FindInHistoryResponse, GraphLayout as ProtocolGraphLayout,
+    HistoryRow, HistoryWindow, LayoutEdge, LayoutPoint, LayoutRow, NodeDetails, ParentRelationDto,
+    ParentRelationKind, RepositoryInfo, Request, RequestBody, ResolvedObject, Response,
+    ResponseBody, SearchFiltersDto, SearchHit, SearchResponse, SessionMetaDto, WorkUnitDto,
 };
-use editchain_query::search::{SearchFilters, Source};
+use editchain_query::search::{ScoredChunk, SearchFilters, Source};
 
 use snapshot::{RenderSnapshot, SnapshotBuilder, SnapshotIdentity, SnapshotManifestData};
 
@@ -123,6 +123,15 @@ struct ViewSnapshot {
     expanded_total: usize,
     /// Maximum graph lane in this view.
     max_lane: usize,
+    /// Cached op id → visible top-level row index for every op represented by
+    /// this snapshot: each row's own op id (or bundle anchor) plus every
+    /// bundled sub-op/member op id. Built lazily on the first Find-in-Chain
+    /// request so arrow-key navigation never rebuilds an O(V) map per keypress.
+    op_rows: Option<HashMap<OpId, usize>>,
+    /// Cached git `(repository, oid)` → visible top-level row index for the
+    /// git commits in this snapshot (submodule rows are absent when the view
+    /// hides them). Built lazily together with [`Self::op_rows`].
+    git_rows: Option<HashMap<(RepositoryId, GitOid), usize>>,
 }
 
 /// Canonicalization outcome for the records decoded from a chain's segments.
@@ -1975,6 +1984,8 @@ impl Workspace {
                 starts,
                 expanded_total,
                 max_lane: 0,
+                op_rows: None,
+                git_rows: None,
             },
         ));
     }
@@ -1991,6 +2002,115 @@ impl Workspace {
         let context = projection.layout_context(&snapshot.nodes);
         snapshot.max_lane = context.lanes.iter().map(|row| row.lane).max().unwrap_or(0);
         snapshot.context = Some(context);
+    }
+
+    /// Build (once) the cached op→row / git→row maps for the current view
+    /// snapshot, so repeated Find-in-Chain requests reuse the O(V) mapping
+    /// instead of rebuilding it per arrow press.
+    ///
+    /// The op map indexes every op this snapshot renders: each top-level row's
+    /// own op id (or bundle anchor) plus every bundled sub-op/member op id, so
+    /// a hit inside a folded META sub-op, tool result, execute-run member, or
+    /// plan-repeat member resolves directly to its containing top-level row.
+    /// The git map indexes visible git commits by `(repository, oid)`; rows
+    /// hidden by the active filter or `hide_submodules` are simply absent, so
+    /// hits with no row in the active view are filtered out downstream.
+    fn build_find_row_maps(&mut self) {
+        let Some((_, snapshot)) = self.current_view.as_mut() else {
+            return;
+        };
+        if snapshot.op_rows.is_some() && snapshot.git_rows.is_some() {
+            return;
+        }
+        let mut op_rows = HashMap::with_capacity(snapshot.nodes.len());
+        let mut git_rows = HashMap::new();
+        for (row, node) in snapshot.nodes.iter().enumerate() {
+            if let Some(id) = node.op_id() {
+                let _: Option<usize> = op_rows.insert(id, row);
+            }
+            if let (Some(oid), Some(repository)) = (node.git_oid(), node.repository()) {
+                let _: Option<usize> = git_rows.insert((repository, oid), row);
+            }
+            for op in node.sub_ops() {
+                let _: Option<usize> = op_rows.insert(op.id, row);
+            }
+        }
+        snapshot.op_rows = Some(op_rows);
+        snapshot.git_rows = Some(git_rows);
+    }
+
+    /// Resolve scored search chunks to distinct visible top-level rows of the
+    /// active view, deduplicating by row and keeping the best BM25 score.
+    ///
+    /// The exact `(hide_submodules, filter)` pair must match the view the
+    /// client renders (the same values it passed to `GetWindow`/`GetLayout`);
+    /// the resolution reuses the cached per-filter `ViewSnapshot` for that key. Every
+    /// returned match carries the row's stable real `node_key` and its absolute
+    /// expanded-history parent-row offset (from the snapshot's `starts` prefix
+    /// sums), so the viewer can cycle matches without auto-expanding anything.
+    /// Hits whose op id has no visible row under the active view are dropped;
+    /// `Git` hits are resolved by real `(repository, oid)` identity, never the
+    /// synthetic index-only op id.
+    #[must_use]
+    pub fn find_in_history(
+        &mut self,
+        chunks: &[ScoredChunk],
+        git_identities: &std::collections::BTreeMap<OpId, GitHitIdentity>,
+        hide_submodules: bool,
+        filter: &ChainFilter,
+    ) -> Vec<FindInHistoryMatch> {
+        self.ensure_view_snapshot(hide_submodules, filter);
+        self.build_find_row_maps();
+        let Some((_, snapshot)) = self.current_view.as_ref() else {
+            return Vec::new();
+        };
+        let Some(op_rows) = snapshot.op_rows.as_ref() else {
+            return Vec::new();
+        };
+        let Some(git_rows) = snapshot.git_rows.as_ref() else {
+            return Vec::new();
+        };
+        let projection = &self.projection;
+        // Distinct visible rows → best (highest) score chunk for that row.
+        let mut best: HashMap<usize, (f64, &ScoredChunk)> = HashMap::new();
+        for chunk in chunks {
+            let Some(row) = resolve_chunk_row(
+                op_rows,
+                git_rows,
+                git_identities,
+                &|op_id| projection.visible_op_id(op_id),
+                chunk,
+            ) else {
+                continue;
+            };
+            let entry = best.entry(row).or_insert_with(|| (chunk.score, chunk));
+            if chunk.score > entry.0 {
+                *entry = (chunk.score, chunk);
+            }
+        }
+        let starts = &snapshot.starts;
+        let mut matches: Vec<FindInHistoryMatch> = best
+            .into_iter()
+            .filter_map(|(row, (_, chunk))| {
+                let node = snapshot.nodes.get(row)?;
+                Some(find_match_from_chunk(
+                    chunk,
+                    git_identities,
+                    node.node_key(),
+                    u64::try_from(starts.get(row).copied().unwrap_or(0)).unwrap_or(u64::MAX),
+                    node.summary(),
+                ))
+            })
+            .collect();
+        // Ranked: best score first; ties break to the newest visible row so the
+        // ordering is deterministic for the viewer's cycle.
+        matches.sort_unstable_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.row.cmp(&b.row))
+        });
+        matches
     }
 
     /// Fallible compatibility path that materializes projection state as needed.
@@ -2368,7 +2488,7 @@ pub fn search_filters_from_dto(dto: &SearchFiltersDto) -> Result<SearchFilters, 
 /// never by the synthetic, projection-less op id.
 #[must_use]
 pub fn search_hit_from_chunk(
-    chunk: &editchain_query::search::ScoredChunk,
+    chunk: &ScoredChunk,
     git_identities: &std::collections::BTreeMap<OpId, GitHitIdentity>,
 ) -> SearchHit {
     let git = (chunk.metadata.source == Source::Git)
@@ -2389,6 +2509,73 @@ pub fn search_hit_from_chunk(
         repository: git.map(|identity| identity.repository_id.0.to_string()),
         kind: git.map_or_else(String::new, |_| "git".to_string()),
         is_submodule: git.is_some_and(|identity| identity.is_submodule),
+    }
+}
+
+/// Resolve one scored chunk to its visible top-level row index in the active
+/// view snapshot, or `None` when the hit has no row in that view.
+///
+/// `EditChain` hits resolve directly when the op (or a bundled sub-op/member
+/// that shares the row) is in `op_rows`, otherwise through the projection's
+/// semantic-collapse representative map (`visible_op_id`) to the canonical row
+/// that renders the op — a folded normalized child, META sub-op, tool result,
+/// or fork prologue. A canonical row that is absent from `op_rows` is hidden by
+/// the active filter/profile and dropped. `Git` hits resolve by real
+/// `(repository, oid)` identity from `git_identities` (never the synthetic
+/// index-only op id), so submodule rows hidden by `hide_submodules` are absent
+/// from `git_rows` and dropped.
+#[must_use]
+fn resolve_chunk_row(
+    op_rows: &HashMap<OpId, usize>,
+    git_rows: &HashMap<(RepositoryId, GitOid), usize>,
+    git_identities: &std::collections::BTreeMap<OpId, GitHitIdentity>,
+    visible_op_id: &impl Fn(OpId) -> Option<OpId>,
+    chunk: &ScoredChunk,
+) -> Option<usize> {
+    if chunk.metadata.source == Source::Git {
+        let identity = git_identities.get(&chunk.op_id)?;
+        return git_rows
+            .get(&(identity.repository_id, identity.oid))
+            .copied();
+    }
+    if let Some(&row) = op_rows.get(&chunk.op_id) {
+        return Some(row);
+    }
+    visible_op_id(chunk.op_id).and_then(|canonical| op_rows.get(&canonical).copied())
+}
+
+/// Convert the best-scoring chunk for one visible row into a Find-in-Chain
+/// match, attaching the row's stable identity and absolute parent-row offset.
+///
+/// Reuses [`search_hit_from_chunk`] so `EditChain`/`Git` identity fields stay
+/// byte-identical to the legacy `Search` response.
+#[must_use]
+fn find_match_from_chunk(
+    chunk: &ScoredChunk,
+    git_identities: &std::collections::BTreeMap<OpId, GitHitIdentity>,
+    node_key: String,
+    row: u64,
+    summary: String,
+) -> FindInHistoryMatch {
+    let hit = search_hit_from_chunk(chunk, git_identities);
+    FindInHistoryMatch {
+        node_key,
+        row,
+        summary,
+        score: hit.score,
+        op_id: hit.op_id,
+        chunk_id: hit.chunk_id,
+        text: hit.text,
+        source: hit.source,
+        session_id: hit.session_id,
+        actor_id: hit.actor_id,
+        kind_tags: hit.kind_tags,
+        timestamp_ms: hit.timestamp_ms,
+        generation: hit.generation,
+        git_oid: hit.git_oid,
+        repository: hit.repository,
+        kind: hit.kind,
+        is_submodule: hit.is_submodule,
     }
 }
 
@@ -3385,6 +3572,46 @@ impl Server {
                 };
                 ResponseBody::Ok(serde_json::to_value(response)?)
             }
+            RequestBody::FindInHistory(req) => {
+                let filters = match search_filters_from_dto(&req.filters) {
+                    Ok(filters) => filters,
+                    Err(msg) => {
+                        return Ok(Response {
+                            id,
+                            body: ResponseBody::Error(msg),
+                        });
+                    }
+                };
+                // Build the lexical index lazily on first search.
+                if self.lexical.is_none() {
+                    let ws = self.workspace.as_mut().ok_or("no workspace open")?;
+                    ws.ensure_projection_loaded()?;
+                    self.lexical = Some(build_lexical_index(ws)?);
+                }
+                let lexical = self.lexical.as_ref().ok_or("no index built")?;
+                let chunks = lexical
+                    .index
+                    .search_internal(&req.query, &filters, req.top_k)?;
+                let ws = self.workspace.as_mut().ok_or("no workspace open")?;
+                // The exact ChainFilterDto + hide_submodules the client used for
+                // GetWindow/GetLayout, so resolution reuses the cached snapshot.
+                let filter = chain_filter_from_dto(req.filter.as_ref());
+                let matches = ws.find_in_history(
+                    &chunks,
+                    &lexical.git_identities,
+                    req.hide_submodules,
+                    &filter,
+                );
+                // `more` reports only whether the candidate/top_k limit may have
+                // truncated retrieval; the response never claims an exact total.
+                let more = req.top_k > 0 && chunks.len() >= req.top_k;
+                let response = FindInHistoryResponse {
+                    returned: matches.len(),
+                    more,
+                    matches,
+                };
+                ResponseBody::Ok(serde_json::to_value(response)?)
+            }
         };
         Ok(Response { id, body })
     }
@@ -3456,6 +3683,7 @@ mod tests {
     use editchain_codec::page::{encode_page, Page};
     use editchain_core::{ImportOp, MessageOp, PathId};
     use editchain_import::BlobSink as _;
+    use std::collections::BTreeMap;
 
     /// 2^53 + 1 — the first integer JavaScript's IEEE-754 doubles round.
     const OVER_2_53: u64 = 9_007_199_254_740_993;
@@ -5572,5 +5800,291 @@ mod tests {
             fixed_view_filter().key(),
             "raw mode must not be served from the fixed-view snapshot"
         );
+    }
+
+    /// Build a scored chunk for a search hit.
+    fn scored_chunk(op_id: OpId, score: f64, source: Source, text: &str) -> ScoredChunk {
+        let chunk_id = editchain_query::search::ChunkId {
+            op_id,
+            chunk_ordinal: 0,
+        };
+        ScoredChunk {
+            chunk_id,
+            op_id,
+            score,
+            text: text.to_string(),
+            metadata: editchain_query::search::ChunkMetadata {
+                op_id,
+                chunk_id,
+                source,
+                session_id: Some(SessionId(10)),
+                actor_id: ActorId(1),
+                kind_tags: 0,
+                timestamp_ms: 1_000,
+                generation: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn find_in_history_resolves_top_level_and_folded_children_and_dedupes() {
+        // One visible turn row (raw import) with a normalized message child
+        // folded into it and a META sub-op bundled under it. Chunks matching
+        // the row's own op, the folded child, or the sub-op must all resolve to
+        // the single visible top-level row, keeping the best BM25 score.
+        let turn = import_op(1, 1, false);
+        let msg = message_op(1, 2, turn.id);
+        let meta = import_op(1, 3, true);
+        let opts = editchain_project::ProjectionOptions {
+            bundle_metadata: true,
+        };
+        let projection =
+            HistoryProjection::from_ops_with(vec![turn.clone(), msg.clone(), meta.clone()], opts);
+        let mut ws = Workspace::from_projection(projection);
+        let filter = ChainFilter::default();
+
+        let chunks = vec![
+            scored_chunk(turn.id, 1.0, Source::EditChain, "needle in turn"),
+            scored_chunk(msg.id, 3.5, Source::EditChain, "needle in folded message"),
+            scored_chunk(meta.id, 0.5, Source::EditChain, "needle in meta sub-op"),
+        ];
+        let matches = ws.find_in_history(&chunks, &BTreeMap::new(), false, &filter);
+
+        assert_eq!(matches.len(), 1, "all three chunks dedupe into one row");
+        assert_eq!(matches[0].node_key, turn.id.to_string());
+        assert_eq!(matches[0].row, 0);
+        assert_eq!(matches[0].op_id, msg.id.to_string());
+        assert!((matches[0].score - 3.5).abs() < f64::EPSILON);
+        assert!(matches[0].git_oid.is_none());
+        assert!(matches[0].repository.is_none());
+        // The O(V) op→row map is built once and cached on the view snapshot.
+        assert!(ws
+            .current_view
+            .as_ref()
+            .is_some_and(|(_, snapshot)| snapshot.op_rows.is_some()));
+        let again = ws.find_in_history(&chunks, &BTreeMap::new(), false, &filter);
+        assert_eq!(again.len(), 1);
+        assert!((again[0].score - 3.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn find_in_history_maps_bundle_members_and_subops_to_containing_parent() {
+        // An Activity-view execute-run bundle folds two member rows into one
+        // top-level row; a hit inside any member (or a member's own bundled
+        // metadata sub-op) must resolve to the containing bundle row and its
+        // absolute parent-row offset — never auto-expand anything.
+        let anchor = op_envelope(
+            1,
+            1,
+            OpKind::Tool(editchain_core::op::ToolOp {
+                tool_call_id: Payload::Empty,
+                tool_name: Payload::Inline(b"Bash".to_vec()),
+                stage: editchain_core::op::ToolStage::Start,
+                content: Payload::Empty,
+            }),
+        );
+        let member_a = op_envelope(
+            1,
+            2,
+            OpKind::Tool(editchain_core::op::ToolOp {
+                tool_call_id: Payload::Empty,
+                tool_name: Payload::Inline(b"Bash".to_vec()),
+                stage: editchain_core::op::ToolStage::Start,
+                content: Payload::Empty,
+            }),
+        );
+        let member_b = op_envelope(
+            1,
+            3,
+            OpKind::Tool(editchain_core::op::ToolOp {
+                tool_call_id: Payload::Empty,
+                tool_name: Payload::Inline(b"Bash".to_vec()),
+                stage: editchain_core::op::ToolStage::Start,
+                content: Payload::Empty,
+            }),
+        );
+        let meta_of_b = import_op(1, 4, true);
+        let bundle = editchain_project::HistoryNode::ExecuteBundle {
+            anchor: std::sync::Arc::new(anchor.clone()),
+            source_time: editchain_project::EffectiveTime::Observed(1_000),
+            member_nodes: Vec::new(),
+            members: vec![
+                std::sync::Arc::new(member_a.clone()),
+                std::sync::Arc::new(member_b.clone()),
+                std::sync::Arc::new(meta_of_b.clone()),
+            ],
+            summary: "2 tool steps".to_string(),
+            kind: "tool".to_string(),
+            author: "agent".to_string(),
+            meta: editchain_project::meta::NodeMeta::default(),
+        };
+        let filter = ChainFilter::default();
+        let projection = HistoryProjection::from_ops(vec![anchor.clone()]);
+        let mut ws = Workspace::from_projection(projection);
+        // Hand-build the cached snapshot so the mapping test exercises the exact
+        // Activity-view shape (bundle row + two expanded member slots).
+        ws.current_view = Some((
+            (false, filter.key()),
+            ViewSnapshot {
+                nodes: vec![bundle],
+                annotations: Vec::new(),
+                context: None,
+                sub_op_counts: vec![3],
+                starts: vec![0, 4],
+                expanded_total: 4,
+                max_lane: 0,
+                op_rows: None,
+                git_rows: None,
+            },
+        ));
+
+        let chunks = vec![
+            scored_chunk(member_a.id, 2.0, Source::EditChain, "needle member a"),
+            scored_chunk(member_b.id, 1.0, Source::EditChain, "needle member b"),
+            scored_chunk(meta_of_b.id, 0.5, Source::EditChain, "needle meta of b"),
+        ];
+        let matches = ws.find_in_history(&chunks, &BTreeMap::new(), false, &filter);
+
+        assert_eq!(matches.len(), 1, "members dedupe into the bundle row");
+        assert_eq!(matches[0].node_key, anchor.id.to_string());
+        assert_eq!(matches[0].row, 0, "bundle parent row offset");
+        assert_eq!(matches[0].op_id, member_a.id.to_string());
+        assert!((matches[0].score - 2.0).abs() < f64::EPSILON);
+        assert_eq!(matches[0].summary, "2 tool steps");
+    }
+
+    #[test]
+    fn find_in_history_excludes_hits_with_no_row_in_the_active_view() {
+        // turn1 is dated and visible; turn2 lives in its own undated session,
+        // so `hide_undated` removes it from the view (sessions with no dated
+        // rows keep `Unknown` time — no BundleAnchor display time is assigned).
+        // A hit inside turn2's folded child must be dropped even though the op
+        // exists in the projection.
+        let turn1 = import_op(1, 1, false);
+        let msg1 = message_op(1, 2, turn1.id);
+        let mut turn2 = import_op(1, 3, false);
+        turn2.scope = ScopeRef::Session(SessionId(20));
+        turn2 = {
+            let mut op = turn2;
+            op.clock = Clock::None;
+            op
+        };
+        let mut msg2 = message_op(1, 4, turn2.id);
+        if let OpKind::Message(m) = &mut msg2.kind {
+            m.content = Payload::Inline(b"needle-hidden".to_vec());
+        }
+        msg2.scope = ScopeRef::Session(SessionId(20));
+        let opts = editchain_project::ProjectionOptions {
+            bundle_metadata: true,
+        };
+        let projection = HistoryProjection::from_ops_with(
+            vec![turn1.clone(), msg1.clone(), turn2.clone(), msg2.clone()],
+            opts,
+        );
+        let mut ws = Workspace::from_projection(projection);
+        let filter = ChainFilter::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            true,
+            false,
+            false,
+        );
+
+        let chunks = vec![
+            scored_chunk(msg1.id, 1.0, Source::EditChain, "needle visible"),
+            scored_chunk(msg2.id, 2.0, Source::EditChain, "needle-hidden"),
+        ];
+        let matches = ws.find_in_history(&chunks, &BTreeMap::new(), false, &filter);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].node_key, turn1.id.to_string());
+        assert_eq!(matches[0].row, 0);
+        assert!(matches[0].text.contains("needle visible"));
+    }
+
+    #[test]
+    fn find_in_history_git_hits_resolve_by_real_identity_and_respect_submodules() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0xbb;
+        let oid = GitOid::new(editchain_core::GitObjectFormat::Sha1, bytes);
+        let commit = editchain_core::GitCommitEntity {
+            repository: RepositoryId(2),
+            object_format: editchain_core::GitObjectFormat::Sha1,
+            oid,
+            imported_record: None,
+            availability: editchain_core::GitAvailability::Resolved,
+            tree: oid,
+            parents: Vec::new(),
+            author: editchain_core::GitSignature {
+                name: Payload::Inline(b"Alice".to_vec()),
+                email: Payload::Inline(b"alice@example.com".to_vec()),
+                when: 0,
+            },
+            committer: editchain_core::GitSignature {
+                name: Payload::Inline(b"Alice".to_vec()),
+                email: Payload::Inline(b"alice@example.com".to_vec()),
+                when: 0,
+            },
+            authored_at: 0,
+            committed_at: 0,
+            message: Payload::Inline(b"needle-git".to_vec()),
+            imported_refs: Vec::new(),
+            live_refs: Vec::new(),
+            changed_paths: Vec::new(),
+        };
+        let mut projection = HistoryProjection::new();
+        projection.merge_git_commits(vec![commit.clone()]);
+        let mut ws = Workspace::from_projection(projection);
+        // Mark the commit's repository as a nested/submodule repo: the main
+        // workspace repo at /ws/.git (id 1) contains /ws/nested/.git (id 2).
+        ws.repositories = vec![
+            editchain_git::RepositoryDiscovery {
+                id: RepositoryId(1),
+                path: PathBuf::from("/ws/.git"),
+                is_worktree: false,
+            },
+            editchain_git::RepositoryDiscovery {
+                id: RepositoryId(2),
+                path: PathBuf::from("/ws/nested/.git"),
+                is_worktree: false,
+            },
+        ];
+        let synthetic = OpId::new(NodeId(0), 0, 0);
+        let mut identities = BTreeMap::new();
+        let _: Option<GitHitIdentity> = identities.insert(
+            synthetic,
+            GitHitIdentity {
+                repository_id: commit.repository,
+                oid: commit.oid,
+                is_submodule: true,
+            },
+        );
+        let chunks = vec![scored_chunk(synthetic, 1.0, Source::Git, "needle-git")];
+
+        // With submodules visible, the commit row resolves by real identity.
+        // (The raw baseline hides nothing undated here; the commit is dated.)
+        let raw = ChainFilter::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            false,
+            false,
+            false,
+        );
+        let visible = ws.find_in_history(&chunks, &identities, false, &raw);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].node_key, oid.to_hex());
+        assert_eq!(visible[0].row, 0);
+        assert_eq!(visible[0].git_oid.as_deref(), Some(oid.to_hex().as_str()));
+        assert_eq!(visible[0].repository.as_deref(), Some("2"));
+        assert_eq!(visible[0].kind, "git");
+        assert!(visible[0].is_submodule);
+
+        // With `hide_submodules` (as the fixed viewer sends), the same hit has
+        // no row in the active view and is dropped — never resolved to a
+        // synthetic op id or phantom offset.
+        let hidden = ws.find_in_history(&chunks, &identities, true, &raw);
+        assert!(hidden.is_empty());
     }
 }

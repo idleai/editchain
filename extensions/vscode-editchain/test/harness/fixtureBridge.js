@@ -279,6 +279,66 @@
     };
   }
 
+  // Resolve a FindInHistory request against the ACTIVE view, mirroring the
+  // service's find_in_history: run the same lexical candidate search the
+  // legacy Search case uses, resolve each hit to its distinct visible
+  // TOP-LEVEL row under the EXACT (hide_submodules, ChainFilterDto) pair the
+  // client used for GetWindow, and report the row's absolute expanded-history
+  // parent-row offset (0 = newest) plus `more` when the candidate cap
+  // truncated retrieval. Fixture candidate scores are uniform, so ranking
+  // matches the service's deterministic tie-break: newest row first (row 0).
+  function findInHistoryResponse(fixture, req) {
+    const q = (req.query || '').toLowerCase();
+    const filters = req.filters || {};
+    let rows = viewRows(fixture, req);
+    if (req.hide_submodules) rows = rows.filter((r) => !r.is_submodule);
+    const filtered = applyFilter(rows, req.filter);
+    rows = filtered.rows;
+    let hits = rows.filter((r) =>
+      String(r.summary || '').toLowerCase().includes(q));
+    if (Array.isArray(filters.kinds) && filters.kinds.length) {
+      // Fixture rows carry lowercase index terms ("message"/"command"…);
+      // map the protocol's TagFilter variants ("Message"/"Command"…) down.
+      const kinds = new Set(filters.kinds.map((k) => String(k).toLowerCase()));
+      hits = hits.filter((r) => kinds.has(String(r.kind || '').toLowerCase()));
+    }
+    if (typeof filters.after === 'number' && filters.after > 0) {
+      hits = hits.filter((r) => !!r.timestamp_ms && r.timestamp_ms >= filters.after);
+    }
+    const topK = typeof req.top_k === 'number' && req.top_k > 0 ? req.top_k : 25;
+    const more = hits.length > topK;
+    const capped = hits.slice(0, topK);
+    // Absolute expanded-history parent-row offset per top-level row: the same
+    // `starts` prefix sums the service ships with the offset-0 GetWindow
+    // (each block occupies 1 + sub-op count absolute slots).
+    const absOf = new Map();
+    let acc = 0;
+    for (const r of rows) {
+      absOf.set(r.node_key, acc);
+      acc += 1 + (r.sub_ops || []).length;
+    }
+    const matches = capped.map((r) => ({
+      node_key: r.node_key,
+      row: absOf.get(r.node_key),
+      summary: r.summary || '',
+      score: 1,
+      op_id: r.op_id || null,
+      chunk_id: r.node_key,
+      text: r.summary || '',
+      source: r.git_oid ? 'Git' : 'EditChain',
+      session_id: r.session_id || null,
+      actor_id: r.author || '1',
+      kind_tags: 0,
+      timestamp_ms: r.timestamp_ms || 0,
+      generation: 0,
+      git_oid: r.git_oid || null,
+      repository: r.repository || null,
+      kind: r.git_oid ? 'git' : (r.kind || 'message'),
+      is_submodule: !!r.is_submodule,
+    }));
+    return { matches, returned: matches.length, more };
+  }
+
   // Slice a full dataset into a GetLayout response.
   function layoutResponse(fixture, req) {
     const offset = req.offset || 0;
@@ -487,6 +547,33 @@
         }
         return;
       }
+      case 'FindInHistory': {
+        // In-place find: matches resolve to real top-level rows of the ACTIVE
+        // view (the same filter/profile the client used for GetWindow), with
+        // absolute expanded-history parent-row offsets. The response shape is
+        // exactly the protocol FindInHistoryResponse: { matches, returned,
+        // more }.
+        // Harness-only error switch: when set, every FindInHistory request
+        // fails so tests can prove error states stay compact and never
+        // replace the chain.
+        if (window.__editchainFindError) {
+          respond(id, { Error: window.__editchainFindError });
+          return;
+        }
+        const respondNow = () => respond(id, { Ok: findInHistoryResponse(fixture, body.FindInHistory) });
+        // Controlled-release hook for the stale-find race (parallels the
+        // legacy __editchainHoldSearch): the FIRST FindInHistory request after
+        // the hook is set is captured as { taken:false } and only responds
+        // when the test calls hook.release().
+        const hold = window.__editchainHoldFind;
+        if (hold && !hold.taken) {
+          hold.taken = true;
+          hold.release = respondNow;
+        } else {
+          respondNow();
+        }
+        return;
+      }
       default:
         respond(id, { Error: 'unhandled request in fixture bridge' });
     }
@@ -531,6 +618,8 @@
   // depend on wall-clock timing.
   window.__editchainHoldWindow = null;
   window.__editchainHoldSearch = null;
+  window.__editchainHoldFind = null;
+  window.__editchainFindError = null;
 
   // Expose a way to select a scenario from the harness page / puppeteer.
   window.__editchainSetScenario = function (name) {

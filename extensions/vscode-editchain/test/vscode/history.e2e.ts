@@ -637,4 +637,371 @@ describe('EditChain History Explorer', () => {
 
     await webview.close();
   });
+
+  it('find-in-chain keeps the real history chain and navigates matches in place', async function () {
+    // The first find on a large chain lazily builds the service's lexical
+    // index, so this test needs a larger budget than the config default.
+    this.timeout(420000);
+
+    const workbench = await browser.getWorkbench();
+    await browser.executeWorkbench((vscode) => {
+      vscode.commands.executeCommand('editchain-history.open');
+    });
+    const webview = await workbench.getWebviewByTitle('EditChain History');
+    await webview.open();
+    await browser.$('.row').waitForExist({ timeout: 120000 });
+
+    // Webview state survives panel recreation, and the previous test leaves
+    // the profile on Raw. Find-in-chain resolves matches against the ACTIVE
+    // view, so pin the deterministic Activity profile before searching.
+    const profile = await browser.execute(() =>
+      typeof window.__editchainGetProfile === 'function'
+        ? window.__editchainGetProfile() : null);
+    if (profile !== 'activity') {
+      await browser.execute(() => {
+        document.getElementById('profile-activity').click();
+      });
+    }
+
+    // Wait for the initial window to settle before snapshotting the chain:
+    // `total` is only authoritative after the first GetWindow response (the
+    // Open response reports the raw node count), and the find assertions below
+    // compare the pre/post totals.
+    await browser.waitUntil(async () => browser.execute(() => {
+      const rows = Array.from(document.querySelectorAll('.row'));
+      return window.__editchainDataReady === true &&
+        rows.length > 0 &&
+        rows.every((r) => {
+          const abs = Number(r.getAttribute('data-row'));
+          return Number.isFinite(abs) && window.__editchainRowAt(abs) != null;
+        });
+    }), { timeout: 30000, interval: 100 });
+
+    // Deterministic nonempty query present in this repo's real .editchain
+    // chain (BM25 lexical match over operation summaries; verified through
+    // the real service's FindInHistory path before this test was written).
+    const QUERY = 'find in chain';
+
+    // Snapshot the legitimate chain state before submitting the find.
+    const before = await browser.execute(() => {
+      const input = document.getElementById('search');
+      input.focus();
+      const navState = (id) => {
+        const el = document.getElementById(id);
+        if (!el) return null;
+        const rect = el.getBoundingClientRect();
+        return {
+          exists: true,
+          displayed: rect.width > 0 && rect.height > 0 && el.offsetParent !== null,
+          hidden: el.hidden,
+          disabled: el.disabled,
+        };
+      };
+      return {
+        total: typeof window.__editchainGetTotal === 'function'
+          ? window.__editchainGetTotal() : -1,
+        grid: !!document.querySelector('.tbl-grid'),
+        spacer: !!document.querySelector('.scroll-spacer'),
+        header: !!document.querySelector('.tbl-header'),
+        banner: !!document.querySelector('.search-banner'),
+        focusIsInput: document.activeElement === input,
+        profile: typeof window.__editchainGetProfile === 'function'
+          ? window.__editchainGetProfile() : null,
+        prevNav: navState('search-prev'),
+        nextNav: navState('search-next'),
+      };
+    });
+    console.log('[e2e] find-in-chain before:', JSON.stringify(before));
+    expect(before.banner).toBe(false);
+    expect(before.grid).toBe(true);
+    expect(before.spacer).toBe(true);
+    expect(before.header).toBe(true);
+    expect(before.total).toBeGreaterThan(0);
+    expect(before.profile).toBe('activity');
+    // The Previous/Next chevrons exist in the composite but stay collapsed
+    // until a non-empty result set has actually settled.
+    expect(before.prevNav && before.prevNav.displayed).toBe(false);
+    expect(before.nextNav && before.nextNav.displayed).toBe(false);
+    expect(before.prevNav && before.prevNav.hidden).toBe(true);
+    expect(before.nextNav && before.nextNav.hidden).toBe(true);
+    expect(before.prevNav && before.prevNav.disabled).toBe(true);
+    expect(before.nextNav && before.nextNav.disabled).toBe(true);
+
+    // Submit through the real keyboard path: type the query into #search and
+    // press Enter (the same keydown handler a keyboard user triggers).
+    await browser.$('#search').setValue(QUERY);
+    await browser.keys('Enter');
+
+    // The session settles when the counter leaves the pending "…" state and
+    // reports "1 of N" (or "1 of N+" when retrieval was truncated), with the
+    // current match already highlighted. The first query builds the lazy
+    // lexical index, so the deadline is long.
+    await browser.waitUntil(async () => browser.execute(() => {
+      const text = (document.getElementById('search-counter')?.textContent || '').trim();
+      if (text === '0 of 0' || text === 'error') return true;
+      if (!/^1 of \d+\+?$/.test(text)) return false;
+      const cur = document.querySelector('.row-find-current');
+      return !!cur && !!cur.getAttribute('data-key');
+    }), { timeout: 300000, interval: 200 });
+
+    const readFindState = () => browser.execute(() => {
+      const input = document.getElementById('search');
+      const counter = document.getElementById('search-counter');
+      const cur = document.querySelector('.row-find-current');
+      const sel = document.querySelector('.row.row-selected');
+      const rowsEl = document.getElementById('rows');
+      const abs = cur ? Number(cur.getAttribute('data-row')) : -1;
+      const cached = abs >= 0 && typeof window.__editchainRowAt === 'function'
+        ? window.__editchainRowAt(abs) : null;
+      const headerH = rowsEl.querySelector('.tbl-header')?.getBoundingClientRect().height || 0;
+      const rowsRect = rowsEl.getBoundingClientRect();
+      const curRect = cur ? cur.getBoundingClientRect() : null;
+      const navState = (el) => {
+        if (!el) return null;
+        const rect = el.getBoundingClientRect();
+        return {
+          exists: true,
+          displayed: rect.width > 0 && rect.height > 0 && el.offsetParent !== null,
+          hidden: el.hidden,
+          disabled: el.disabled,
+          title: el.getAttribute('title'),
+          ariaLabel: el.getAttribute('aria-label'),
+        };
+      };
+      return {
+        counterText: (counter?.textContent || '').trim(),
+        banner: !!document.querySelector('.search-banner'),
+        grid: !!document.querySelector('.tbl-grid'),
+        spacer: !!document.querySelector('.scroll-spacer'),
+        header: !!document.querySelector('.tbl-header'),
+        total: typeof window.__editchainGetTotal === 'function'
+          ? window.__editchainGetTotal() : -1,
+        curKey: cur ? cur.getAttribute('data-key') : null,
+        curRow: abs,
+        curIsReal: !!(cur && cached && cached.node_key === cur.getAttribute('data-key')),
+        selKey: sel ? sel.getAttribute('data-key') : null,
+        focusIsInput: document.activeElement === input,
+        revealed: !!curRect && curRect.top >= rowsRect.top + headerH - 2 &&
+          curRect.bottom <= rowsRect.bottom + 2,
+        profile: typeof window.__editchainGetProfile === 'function'
+          ? window.__editchainGetProfile() : null,
+        prevNav: navState(document.getElementById('search-prev')),
+        nextNav: navState(document.getElementById('search-next')),
+      };
+    });
+
+    const settled = await readFindState();
+    console.log('[e2e] find-in-chain settled:', JSON.stringify(settled));
+    // The counter reports "1 of N" (or "1 of N+"); the find never replaces the
+    // chain: no flat .search-banner, the real grid/header survive, and the
+    // authoritative total is untouched.
+    expect(settled.counterText).toMatch(/^1 of \d+\+?$/);
+    expect(settled.banner).toBe(false);
+    expect(settled.grid).toBe(true);
+    expect(settled.spacer).toBe(true);
+    expect(settled.header).toBe(true);
+    expect(settled.total).toBe(before.total);
+    // A real history row is highlighted/selected and revealed in the viewport
+    // while focus stays in the search input.
+    expect(settled.curKey).toBeTruthy();
+    expect(settled.curIsReal).toBe(true);
+    expect(settled.selKey).toBe(settled.curKey);
+    expect(settled.revealed).toBe(true);
+    expect(settled.focusIsInput).toBe(true);
+    expect(settled.profile).toBe('activity');
+    // The adjacent Previous/Next chevron controls are displayed, carry the
+    // accessible labels/titles, and are enabled once the session settles —
+    // the affordances the find session exposes for mouse navigation.
+    expect(settled.prevNav && settled.prevNav.exists).toBe(true);
+    expect(settled.nextNav && settled.nextNav.exists).toBe(true);
+    expect(settled.prevNav && settled.prevNav.displayed).toBe(true);
+    expect(settled.nextNav && settled.nextNav.displayed).toBe(true);
+    expect(settled.prevNav && settled.prevNav.hidden).toBe(false);
+    expect(settled.nextNav && settled.nextNav.hidden).toBe(false);
+    expect(settled.prevNav && settled.prevNav.disabled).toBe(false);
+    expect(settled.nextNav && settled.nextNav.disabled).toBe(false);
+    expect(settled.prevNav && settled.prevNav.title).toBe('Previous match (Shift+Enter)');
+    expect(settled.nextNav && settled.nextNav.title).toBe('Next match (Enter)');
+    expect(settled.prevNav && settled.prevNav.ariaLabel).toBe('Previous match');
+    expect(settled.nextNav && settled.nextNav.ariaLabel).toBe('Next match');
+
+    // Clean the capture environment: leave the webview frame, close the
+    // auxiliary Chat bar and clear any startup toasts (they would obscure the
+    // full-workbench shots), then re-enter the webview. The webview DOM and
+    // the find session survive the frame switch.
+    await webview.close();
+    await browser.executeWorkbench(async (vscode) => {
+      await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
+      await vscode.commands.executeCommand('notifications.clearAll');
+      await vscode.commands.executeCommand('notifications.hideToasts');
+    });
+    const auxiliaryBarHidden = await browser.execute(() => {
+      const auxiliary = document.querySelector('.part.auxiliarybar');
+      return !auxiliary || getComputedStyle(auxiliary).display === 'none' ||
+        auxiliary.getBoundingClientRect().width < 1;
+    });
+    expect(auxiliaryBarHidden).toBe(true);
+    await webview.open();
+    await browser.$('.row').waitForExist({ timeout: 10000 });
+
+    // The find session must survive the context switch: same counter, same
+    // current match, no flat replacement.
+    const survived = await readFindState();
+    console.log('[e2e] find-in-chain after workbench cleanup:', JSON.stringify(survived));
+    expect(survived.counterText).toBe(settled.counterText);
+    expect(survived.curKey).toBe(settled.curKey);
+    expect(survived.banner).toBe(false);
+    expect(survived.grid).toBe(true);
+    expect(survived.total).toBe(before.total);
+    // The buttons survive the context switch too: still displayed and enabled.
+    expect(survived.prevNav && survived.prevNav.displayed).toBe(true);
+    expect(survived.nextNav && survived.nextNav.displayed).toBe(true);
+    expect(survived.prevNav && survived.prevNav.disabled).toBe(false);
+    expect(survived.nextNav && survived.nextNav.disabled).toBe(false);
+
+    // The frame switch drops DOM focus; put it back in #search before the
+    // captures so the screenshots show the real keyboard interaction state.
+    await browser.execute(() => {
+      document.getElementById('search').focus();
+    });
+    const refocused = await browser.execute(() =>
+      document.activeElement === document.getElementById('search'));
+    expect(refocused).toBe(true);
+
+    // Capture the initial match in the trace (clean workbench, no toasts).
+    const traceDir = path.join(__dirname, '..', '..', 'trace');
+    const fullShot1 = path.join(traceDir, 'e2e-find-in-chain-1-full.png');
+    const paneShot1 = path.join(traceDir, 'e2e-find-in-chain-1-webview.png');
+    await browser.saveScreenshot(fullShot1);
+    await browser.$('body').saveScreenshot(paneShot1);
+    console.log('[e2e] find-in-chain screenshots ->', fullShot1, paneShot1);
+
+    // Click the visible Next chevron (a real mouse click on the button, not
+    // the keyboard path) to move from match 1 to match 2. It drives the same
+    // wrapping navigateFind(+1) Enter/ArrowDown use, and the click keeps focus
+    // in #search (mousedown is prevented from stealing it). Refocus the input
+    // first so the frame switch cannot leave keyboard targeting elsewhere.
+    await browser.execute(() => {
+      document.getElementById('search').focus();
+    });
+    await browser.$('#search-next').click();
+    await browser.waitUntil(async () => browser.execute((prevKey) => {
+      const text = (document.getElementById('search-counter')?.textContent || '').trim();
+      const cur = document.querySelector('.row-find-current');
+      return /^2 of \d+\+?$/.test(text) && !!cur &&
+        cur.getAttribute('data-key') !== prevKey;
+    }, settled.curKey), { timeout: 120000, interval: 100 });
+
+    const next = await readFindState();
+    console.log('[e2e] find-in-chain after Next click:', JSON.stringify(next));
+    expect(next.counterText).toMatch(/^2 of \d+\+?$/);
+    expect(next.curKey).toBeTruthy();
+    expect(next.curKey).not.toBe(settled.curKey);
+    expect(next.curIsReal).toBe(true);
+    expect(next.selKey).toBe(next.curKey);
+    expect(next.revealed).toBe(true);
+    expect(next.focusIsInput).toBe(true);
+    expect(next.banner).toBe(false);
+    expect(next.total).toBe(before.total);
+    // The session is still settled after the click, so both buttons remain
+    // displayed and enabled.
+    expect(next.prevNav && next.prevNav.displayed).toBe(true);
+    expect(next.nextNav && next.nextNav.displayed).toBe(true);
+    expect(next.prevNav && next.prevNav.disabled).toBe(false);
+    expect(next.nextNav && next.nextNav.disabled).toBe(false);
+
+    // Capture the post-navigation state: a different real row highlighted with
+    // the counter advanced to "2 of N".
+    const fullShot2 = path.join(traceDir, 'e2e-find-in-chain-2-full.png');
+    const paneShot2 = path.join(traceDir, 'e2e-find-in-chain-2-webview.png');
+    await browser.saveScreenshot(fullShot2);
+    await browser.$('body').saveScreenshot(paneShot2);
+    console.log('[e2e] find-in-chain screenshots ->', fullShot2, paneShot2);
+
+    // Click the visible Previous chevron to return to match 1: the counter
+    // goes back to "1 of N", the same real row is highlighted/selected and
+    // revealed, focus stays in the input, and the chain is untouched.
+    await browser.execute(() => {
+      document.getElementById('search').focus();
+    });
+    await browser.$('#search-prev').click();
+    await browser.waitUntil(async () => browser.execute((targetKey) => {
+      const text = (document.getElementById('search-counter')?.textContent || '').trim();
+      const cur = document.querySelector('.row-find-current');
+      return /^1 of \d+\+?$/.test(text) && !!cur &&
+        cur.getAttribute('data-key') === targetKey;
+    }, settled.curKey), { timeout: 120000, interval: 100 });
+
+    const backToFirst = await readFindState();
+    console.log('[e2e] find-in-chain after Previous click:', JSON.stringify(backToFirst));
+    expect(backToFirst.counterText).toBe(settled.counterText);
+    expect(backToFirst.curKey).toBe(settled.curKey);
+    expect(backToFirst.curIsReal).toBe(true);
+    expect(backToFirst.selKey).toBe(backToFirst.curKey);
+    expect(backToFirst.revealed).toBe(true);
+    expect(backToFirst.focusIsInput).toBe(true);
+    expect(backToFirst.banner).toBe(false);
+    expect(backToFirst.total).toBe(before.total);
+
+    // Wrap-around through real clicks too: Previous at match 1 lands on the
+    // LAST match, and Next from there wraps back to match 1 — the same modulo
+    // path the keyboard uses. The harness tests already cover wrap semantics
+    // deeply, so this stays a compact real-VS-Code proof and only runs when
+    // the query yields more than one match (a single-match session wraps in
+    // place and would be indistinguishable from a no-op, hence skipped).
+    const settledCounter = settled.counterText.match(/^1 of (\d+)(\+?)$/);
+    const matchTotal = settledCounter ? Number(settledCounter[1]) : 0;
+    const moreSuffix = settledCounter ? settledCounter[2] : '';
+    if (matchTotal >= 2) {
+      await browser.execute(() => {
+        document.getElementById('search').focus();
+      });
+      await browser.$('#search-prev').click();
+      await browser.waitUntil(async () => browser.execute((prevKey) => {
+        const text = (document.getElementById('search-counter')?.textContent || '').trim();
+        const cur = document.querySelector('.row-find-current');
+        return !/^1 of \d+\+?$/.test(text) && !!cur &&
+          cur.getAttribute('data-key') !== prevKey;
+      }, settled.curKey), { timeout: 120000, interval: 100 });
+
+      const wrappedPrev = await readFindState();
+      console.log('[e2e] find-in-chain after wrap Previous:', JSON.stringify(wrappedPrev));
+      expect(wrappedPrev.counterText).toBe(matchTotal + ' of ' + matchTotal + moreSuffix);
+      expect(wrappedPrev.curKey).toBeTruthy();
+      expect(wrappedPrev.curKey).not.toBe(settled.curKey);
+      expect(wrappedPrev.curIsReal).toBe(true);
+      expect(wrappedPrev.selKey).toBe(wrappedPrev.curKey);
+      expect(wrappedPrev.revealed).toBe(true);
+      expect(wrappedPrev.focusIsInput).toBe(true);
+      expect(wrappedPrev.total).toBe(before.total);
+      expect(wrappedPrev.nextNav && wrappedPrev.nextNav.disabled).toBe(false);
+
+      // Next click wraps from the last match back to match 1.
+      await browser.execute(() => {
+        document.getElementById('search').focus();
+      });
+      await browser.$('#search-next').click();
+      await browser.waitUntil(async () => browser.execute((targetKey) => {
+        const text = (document.getElementById('search-counter')?.textContent || '').trim();
+        const cur = document.querySelector('.row-find-current');
+        return /^1 of \d+\+?$/.test(text) && !!cur &&
+          cur.getAttribute('data-key') === targetKey;
+      }, settled.curKey), { timeout: 120000, interval: 100 });
+
+      const wrappedFirst = await readFindState();
+      console.log('[e2e] find-in-chain after wrap Next:', JSON.stringify(wrappedFirst));
+      expect(wrappedFirst.counterText).toBe(settled.counterText);
+      expect(wrappedFirst.curKey).toBe(settled.curKey);
+      expect(wrappedFirst.curIsReal).toBe(true);
+      expect(wrappedFirst.selKey).toBe(wrappedFirst.curKey);
+      expect(wrappedFirst.revealed).toBe(true);
+      expect(wrappedFirst.focusIsInput).toBe(true);
+      expect(wrappedFirst.total).toBe(before.total);
+    } else {
+      console.log('[e2e] find-in-chain skip wrap proof (single-match session):',
+        settled.counterText);
+    }
+
+    await webview.close();
+  });
 });

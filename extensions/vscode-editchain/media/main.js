@@ -26,6 +26,9 @@ const rendererInstanceId = Date.now().toString(36) + '-' +
 
 const rowsEl = document.getElementById('rows');
 const searchEl = document.getElementById('search');
+const searchCounterEl = document.getElementById('search-counter');
+const searchPrevBtn = document.getElementById('search-prev');
+const searchNextBtn = document.getElementById('search-next');
 const statusLiveEl = document.getElementById('status-live');
 const profileActivityBtn = document.getElementById('profile-activity');
 const profileRawBtn = document.getElementById('profile-raw');
@@ -119,6 +122,19 @@ showViewMessage('Loading history…', false);
 // regardless of response order.
 let searchEpoch = 0;          // monotonically increasing issue counter
 let currentSearchEpoch = -1;  // epoch of the latest issued search; -1 = none
+
+// Find-in-chain state (in-place find over the real history view). Unlike the
+// legacy flat-list Search, a find NEVER replaces the history DOM: the backend
+// resolves every hit to a real top-level row of the ACTIVE view, and the
+// session only scrolls, highlights, and updates the adjacent counter. All
+// other view state (profile, expansion, cache, layout, scroll) stays intact.
+const FIND_TOP_K = 50;        // candidate cap; the response reports more=true
+let findActive = false;       // a find session has settled
+let findMatches = [];         // settled ranked matches (FindInHistoryMatch)
+let findTotal = 0;            // navigable distinct match count
+let findMore = false;         // response.more — more may exist past the cap
+let findIndex = 0;            // current match (0-based)
+let pendingFindTarget = null; // { abs, index } awaiting its window in cache
 
 // --- Request correlation ----------------------------------------------------
 //
@@ -879,13 +895,307 @@ function filterPayload() {
   return { ...FIXED_FILTER, hide_trace: hideTrace() };
 }
 
-/** Search is explicitly UNPROFILED: the Search DTO has no hide_trace field and
- * the service's search index is profile-agnostic, so search results never
- * carry a profile. A profile switch therefore exits search mode and resets to
- * the full history view under the new profile (see setProfile), so results can
- * never silently mix profile semantics. */
+/** Search-filters DTO for FindInHistory (kinds, sources, sessions, actors,
+ * paths, times). The UI has no filter controls yet, so the defaults apply; the
+ * profile/chain filter is carried separately via filterPayload() so the
+ * backend resolves hits against the exact active view. */
 function searchFiltersPayload() {
   return {};
+}
+
+// --- Find-in-chain ---------------------------------------------------------
+//
+// In-place find over the real history view. A settled FindInHistory response
+// carries ranked matches resolved to real top-level rows of the ACTIVE view
+// (absolute expanded-history parent-row offsets, GetWindow coordinates). The
+// find never rebuilds the chain: it only scrolls, highlights the current
+// match, and updates the adjacent counter. Navigation keeps focus in the
+// search input so query editing stays easy.
+
+/** Normalize one FindInHistoryMatch into the shape the find session consumes:
+ * the stable real node key plus the absolute expanded-history parent-row
+ * offset the backend resolved under the active view. A row coordinate that is
+ * absent (null/undefined/empty) or not a finite, whole, in-range offset
+ * (negative, fractional, NaN, or beyond the view total) normalizes to null, so
+ * the session only ever navigates to coordinates the cache can hold — a
+ * malformed backend row can never stall a pending jump, and a missing row is
+ * never silently mapped to row 0. */
+function normalizeFindMatch(m) {
+  const raw = m.row;
+  const row = typeof raw === 'number' ? raw : Number(raw);
+  if (raw === null || raw === undefined || raw === '' ||
+      !Number.isFinite(row) || !Number.isInteger(row) || row < 0 || row >= total) {
+    return null;
+  }
+  return {
+    row,
+    node_key: String(m.node_key || ''),
+    summary: String(m.summary || ''),
+    op_id: m.op_id || null,
+    git_oid: m.git_oid || null,
+    repository: m.repository || null,
+    source: m.source || 'EditChain',
+    is_submodule: !!m.is_submodule,
+  };
+}
+
+/** Render the adjacent find counter. Every state is compact and none replaces
+ * the chain: pending is a spinner-only busy state (no visible text; the
+ * .search-counter-pending pseudo-element draws the ring, aria-label keeps the
+ * "Searching…" announcement, aria-busy marks the region busy), settled is
+ * "i of N" (or "N+" when the response was truncated), plus "0 of 0" and a
+ * styled "error" with the reason as a tooltip. */
+function updateFindCounter(state, detail) {
+  if (!searchCounterEl) return;
+  searchCounterEl.classList.remove(
+    'search-counter-pending', 'search-counter-zero', 'search-counter-error');
+  let text = '';
+  if (state === 'pending') {
+    searchCounterEl.classList.add('search-counter-pending');
+    searchCounterEl.setAttribute('aria-label', 'Searching…');
+    searchCounterEl.setAttribute('aria-busy', 'true');
+    searchCounterEl.removeAttribute('title');
+  } else if (state === 'zero') {
+    text = '0 of 0';
+    searchCounterEl.classList.add('search-counter-zero');
+    searchCounterEl.removeAttribute('aria-label');
+    searchCounterEl.removeAttribute('aria-busy');
+    searchCounterEl.removeAttribute('title');
+  } else if (state === 'error') {
+    text = 'error';
+    searchCounterEl.classList.add('search-counter-error');
+    searchCounterEl.setAttribute('aria-label', 'Find failed' + (detail ? ': ' + detail : ''));
+    searchCounterEl.removeAttribute('aria-busy');
+    searchCounterEl.title = detail || '';
+  } else if (state === 'settled') {
+    text = (findIndex + 1) + ' of ' + findTotal + (findMore ? '+' : '');
+    searchCounterEl.removeAttribute('aria-label');
+    searchCounterEl.removeAttribute('aria-busy');
+    searchCounterEl.removeAttribute('title');
+  } else {
+    searchCounterEl.removeAttribute('aria-label');
+    searchCounterEl.removeAttribute('aria-busy');
+    searchCounterEl.removeAttribute('title');
+  }
+  searchCounterEl.textContent = text;
+  syncFindNavButtons();
+}
+
+/** Whether the exact submitted query has a settled, navigable find: matches
+ * exist, no replacement is in flight, and the input text still matches the
+ * submitted query (edited-but-unsubmitted text never navigates stale
+ * matches). Mirrors the ArrowUp/ArrowDown guard in the search keydown
+ * handler, so the buttons can only ever drive the same wrap path. */
+function findNavigationEnabled() {
+  return !!searchEl && findActive && findMatches.length > 0 &&
+    currentSearchEpoch === -1 && searchEl.value.trim() === searchQuery;
+}
+
+/** Sync Previous/Next visibility and enabled state with the find session. The
+ * buttons are collapsed from the initial/pending/zero/error/cleared/profile-
+ * reset and edited-query states, then shown and enabled only once valid
+ * matches settle (including a single match, where a click wraps in place). */
+function syncFindNavButtons() {
+  const enabled = findNavigationEnabled();
+  if (searchPrevBtn) {
+    searchPrevBtn.hidden = !enabled;
+    searchPrevBtn.disabled = !enabled;
+  }
+  if (searchNextBtn) {
+    searchNextBtn.hidden = !enabled;
+    searchNextBtn.disabled = !enabled;
+  }
+}
+
+/** Drop every piece of find-in-chain state except the rendered highlight. */
+function resetFindState() {
+  findActive = false;
+  findMatches = [];
+  findTotal = 0;
+  findMore = false;
+  findIndex = 0;
+  pendingFindTarget = null;
+}
+
+/** End the find session: state, highlight, and counter are cleared WITHOUT
+ * reloading history or moving the scroll position (the chain was never
+ * replaced, so there is nothing to restore). */
+function clearFind() {
+  resetFindState();
+  searchQuery = '';
+  currentSearchEpoch = -1;
+  clearFindHighlight();
+  updateFindCounter('hidden');
+}
+
+/** Clear the find-induced row highlight (inline selection + current marker). */
+function clearFindHighlight() {
+  clearSelection();
+  const w = wrapEl();
+  if (w) {
+    const cur = w.querySelector('.row-find-current');
+    if (cur) cur.classList.remove('row-find-current');
+  }
+}
+
+/** Mark `absIdx` as the current find match: the row-selected inline selection
+ * plus a left-edge current-marker accent. Both derive from real cached rows —
+ * nothing is fabricated. */
+function setFindHighlight(absIdx) {
+  const row = cache.get(absIdx);
+  if (!row) return;
+  const w = wrapEl();
+  if (w) {
+    const prev = w.querySelector('.row-find-current');
+    if (prev && Number(prev.getAttribute('data-row')) !== absIdx) {
+      prev.classList.remove('row-find-current');
+    }
+    const cur = w.querySelector('.row[data-row="' + absIdx + '"]');
+    if (cur) cur.classList.add('row-find-current');
+  }
+  selectRow(row, absIdx);
+}
+
+/** Map an ABSOLUTE slot index back to its VISIBLE index under the current
+ * expansion state (inverse of absIndexForVisible). A hidden collapsed sub-op
+ * slot maps to null — it is drawn as nothing. */
+function visibleIndexForAbs(abs) {
+  if (!blockStarts.length) return abs; // no expansion known yet — identity
+  let lo = 0;
+  let hi = blockStarts.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (blockStarts[mid] <= abs) lo = mid + 1;
+    else hi = mid;
+  }
+  const b = lo - 1;
+  if (b < 0 || b >= blockStarts.length) return abs;
+  const offInBlock = abs - blockStarts[b];
+  if (offInBlock > 0 && !expandedBlocks.has(b)) return null; // hidden sub-op
+  return blockStarts[b] - hiddenBeforeBlock(b) + offInBlock;
+}
+
+/** Move the viewport to find match `index`, selecting/revealing its row once
+ * the window around the backend-resolved absolute row is cached. Matches are
+ * ranked top-level rows of the ACTIVE view, so no expansion toggle is ever
+ * needed. */
+function jumpToFindMatch(index) {
+  if (index < 0 || index >= findMatches.length) return;
+  findIndex = index;
+  const abs = findMatches[index].row;
+  updateFindCounter('settled');
+  pendingFindTarget = { abs, index };
+  if (cache.has(abs)) {
+    completeFindJump();
+  } else {
+    fetchWindowAround(abs);
+  }
+}
+
+/** Complete a find jump once the target row's window is cached: scroll the
+ * target into view under the CURRENT expansion state, render the cached
+ * window, then select/reveal the real row. */
+function completeFindJump() {
+  const t = pendingFindTarget;
+  if (!t) return;
+  // Defensive: a match coordinate outside the active view (a malformed backend
+  // row, or a view/total that changed after the response) can never be cached;
+  // refresh the window instead of stalling the jump with a phantom pending
+  // target. The check runs BEFORE the cache probe so a non-finite coordinate
+  // (which cache.has() can never satisfy) still recovers.
+  if (!Number.isFinite(t.abs) || t.abs < 0 || t.abs >= total) {
+    pendingFindTarget = null;
+    fetchWindow();
+    return;
+  }
+  if (!cache.has(t.abs)) return;
+  pendingFindTarget = null;
+  const vis = visibleIndexForAbs(t.abs);
+  if (vis === null) return; // hidden slot — backend only targets top-level rows
+  const targetTop = Math.max(0,
+    vis * ROW_H - Math.floor(rowsEl.clientHeight / ROW_H / 2) * ROW_H);
+  rowsEl.scrollTop = targetTop;
+  // Render the cached window around the target immediately (the scroll event
+  // would do it asynchronously; the harness needs the jump complete before
+  // idle settles).
+  syncWindow();
+  setFindHighlight(t.abs);
+  const el = wrapEl() ? wrapEl().querySelector('.row[data-row="' + t.abs + '"]') : null;
+  if (el) revealRow(el);
+  announce('Match ' + (findIndex + 1) + ' of ' + findTotal + (findMore ? '+' : ''));
+}
+
+/** Move the find cursor by `delta` (+1 next / -1 previous), wrapping at both
+ * ends. Only invoked for a SETTLED session matching the exact submitted
+ * query. */
+function navigateFind(delta) {
+  if (!findActive || findMatches.length === 0) return;
+  findIndex = (findIndex + delta + findMatches.length) % findMatches.length;
+  jumpToFindMatch(findIndex);
+}
+
+/** Issue a FindInHistory request for the trimmed query text. The response is
+ * correlated by search epoch so only the LATEST query's matches can land.
+ * The request mirrors the active view exactly: the same ChainFilterDto the
+ * view was fetched with (filterPayload carries the profile's hide_trace), the
+ * same hide_submodules flag, and the search filters (no controls yet, so the
+ * defaults). */
+function submitFind(q) {
+  searchQuery = q;
+  resetFindState();
+  clearFindHighlight();
+  currentSearchEpoch = ++searchEpoch;
+  updateFindCounter('pending');
+  announce('Searching for "' + q + '"');
+  sendSearch({
+    FindInHistory: {
+      query: q,
+      top_k: FIND_TOP_K,
+      filters: searchFiltersPayload(),
+      filter: filterPayload(),
+      hide_submodules: hideSubmodules(),
+    },
+  }, currentSearchEpoch);
+}
+
+/** Apply a settled FindInHistory response in place: the history DOM, profile,
+ * expansion state, virtualization cache, and layout are untouched — the find
+ * only selects/highlights, scrolls, and updates the counter. */
+function applyFindResponse(response) {
+  findMatches = (Array.isArray(response.matches) ? response.matches : [])
+    .map(normalizeFindMatch)
+    .filter((m) => m !== null);
+  // The counter reflects the NAVIGABLE set — rows the view can actually jump
+  // to. A malformed backend row (or one beyond a changed view's total) is
+  // filtered above, so the session never claims a count it cannot cycle.
+  findTotal = findMatches.length;
+  findMore = !!response.more;
+  findActive = true;
+  findIndex = 0;
+  currentSearchEpoch = -1;
+  pendingFindTarget = null;
+  clearFindHighlight();
+  if (findMatches.length === 0) {
+    updateFindCounter('zero');
+    announce('No matches for "' + searchQuery + '"');
+    vscode.postMessage({ type: 'log', text: 'find: 0 match(es) for "' + searchQuery + '"' });
+    return;
+  }
+  vscode.postMessage({ type: 'log', text: `find: ${findTotal} match(es) for "${searchQuery}"` });
+  // On a settled response, immediately scroll to and highlight match 1.
+  jumpToFindMatch(0);
+}
+
+/** Compact, non-disruptive find error: the chain stays fully visible, the
+ * counter shows "error" with the reason, and the session ends (the next Enter
+ * re-searches). */
+function showFindError(errText) {
+  resetFindState();
+  currentSearchEpoch = -1;
+  clearFindHighlight();
+  updateFindCounter('error', errText);
+  announce('Find failed: ' + errText);
+  vscode.postMessage({ type: 'log', text: 'find error: ' + errText });
 }
 
 /** Announce a status change to assistive tech (and the status bar) without
@@ -1080,6 +1390,37 @@ function fetchWindow() {
   }
   if (start === -1) return; // everything we want is already cached
 
+  const limit = Math.min(PAGE, rangeBottom - start + 1);
+  sendWindow({
+    GetWindow: {
+      offset: start,
+      limit,
+      hide_submodules: hideSubmodules(),
+      filter: filterPayload(),
+      include_layout: layoutReady,
+    },
+  });
+}
+
+/**
+ * Fetch the sparse window around an arbitrary ABSOLUTE row (a find-in-chain
+ * target) so far matches are revealed WITHOUT scanning or loading the chain
+ * before them. Like fetchWindow, the offset-0 window is forced until the
+ * expansion snapshot establishes visible/absolute mapping.
+ */
+function fetchWindowAround(absRow) {
+  if (pendingWindowReqId !== -1 || total <= 0) return;
+  const forceSnapshot = !snapshotEstablished;
+  const top = Math.max(0, absRow - BUFFER);
+  const bottom = Math.min(total - 1, absRow + BUFFER);
+  const rangeTop = forceSnapshot ? 0 : top;
+  const rangeBottom = forceSnapshot ? Math.min(PAGE - 1, bottom) : bottom;
+  if (rangeTop > rangeBottom) return;
+  let start = -1;
+  for (let i = rangeTop; i <= rangeBottom; i++) {
+    if (!cache.has(i)) { start = i; break; }
+  }
+  if (start === -1) return; // the target window is already cached
   const limit = Math.min(PAGE, rangeBottom - start + 1);
   sendWindow({
     GetWindow: {
@@ -1886,6 +2227,11 @@ function buildRowHtml(row, absIdx, isGroupStart) {
   // full strength (row height is untouched — the class only affects opacity).
   const relClass = semanticChrome || sessionChrome ? ' row-has-badges' : '';
   const selectedClass = row.node_key === selectedRowKey ? ' row-selected' : '';
+  // The current find-in-chain match is re-marked on every rebuild (selection
+  // survives by node key; the accent class is keyed to the match's row).
+  const findCurrentClass = findActive && findMatches.length > 0 &&
+    findMatches[findIndex] && findMatches[findIndex].row === absIdx
+    ? ' row-find-current' : '';
   const summaryText = row.summary || '(no summary)';
   const displaySummary = displaySummaryForRow(row, summaryText);
   const plainSummary = plainRowSummary(row, displaySummary) || '(no summary)';
@@ -1980,7 +2326,7 @@ function buildRowHtml(row, absIdx, isGroupStart) {
         ? ' data-bundle-count="' + row.activity_bundle.member_count + '"'
         : '')
     : '';
-  return '<div class="row ' + kindClass + humanClass + subopClass + roleClass + relClass + selectedClass + groupClass +
+  return '<div class="row ' + kindClass + humanClass + subopClass + roleClass + relClass + selectedClass + findCurrentClass + groupClass +
     workUnitClasses(row) + (isBundle ? ' row-activity-bundle' : '') +
     (expandable ? ' row-expandable' : '') + promotedCls +
     '" role="row" tabindex="' + rovingTab + '" aria-selected="' + (row.node_key === selectedRowKey ? 'true' : 'false') + '"' +
@@ -2305,19 +2651,32 @@ rowsEl.addEventListener('keydown', (e) => {
     // Move the roving focus to the adjacent rendered row. Stops at the rendered
     // window edge (no wrap/auto-scroll): scrolling beyond it re-arms the roving
     // anchor via applyRovingTabindex, so large-list navigation is unchanged.
+    // Search results are a flat, fully rendered list, so arrows wrap at the
+    // ends (last -> first / first -> last) and ALSO move the inline selection,
+    // keeping roving tabindex/focus/aria-selected/selectedRowKey in sync.
     const w = wrapEl();
     if (!w) return;
     const rows = Array.from(w.querySelectorAll('.row'));
     if (!rows.length) return;
     const cur = e.target.closest('.row');
     const curIdx = cur ? rows.indexOf(cur) : -1;
-    const nextIdx = e.key === 'ArrowDown' ? curIdx + 1 : curIdx - 1;
-    if (nextIdx < 0 || nextIdx >= rows.length) return;
+    let nextIdx = e.key === 'ArrowDown' ? curIdx + 1 : curIdx - 1;
+    if (searchMode) {
+      if (nextIdx < 0) nextIdx = rows.length - 1;
+      else if (nextIdx >= rows.length) nextIdx = 0;
+    } else if (nextIdx < 0 || nextIdx >= rows.length) {
+      return;
+    }
     e.preventDefault();
     const target = rows[nextIdx];
-    rovingAbs = parseInt(target.getAttribute('data-row'), 10);
-    applyRovingTabindex();
-    target.focus();
+    const absIdx = parseInt(target.getAttribute('data-row'), 10);
+    if (searchMode) {
+      focusSearchResult(absIdx);
+    } else {
+      rovingAbs = absIdx;
+      applyRovingTabindex();
+      target.focus();
+    }
     return;
   }
   if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
@@ -2632,6 +2991,43 @@ function clearSelection() {
   }
 }
 
+/** Focus a search-result row, keeping every arrow-navigation invariant
+ * synchronized: roving tabindex (single tab stop), DOM focus, aria-selected /
+ * visual row selection, and selectedRowKey. The target is revealed with a
+ * minimal header-aware scroll (see revealRow) so a wrap from the input to the
+ * last hit (or last -> first) never jars the scroller, then focus is applied
+ * without a second scroll. */
+function focusSearchResult(absIdx) {
+  const w = wrapEl();
+  if (!w) return;
+  const target = w.querySelector('.row[data-row="' + absIdx + '"]');
+  const row = cache.get(absIdx);
+  if (!target || !row) return;
+  rovingAbs = absIdx;
+  applyRovingTabindex();
+  selectRow(row, absIdx);
+  revealRow(target);
+  target.focus({ preventScroll: true });
+}
+
+/** Reveal `el` inside the #rows scroller with the minimal scroll needed, so
+ * the sticky column header never overlaps the target and content below the
+ * fold is brought in by exactly its overflow. No scroll happens when the row
+ * is already fully visible, which keeps keyboard-driven wraps non-jarring. */
+function revealRow(el) {
+  const viewport = rowsEl.getBoundingClientRect();
+  const header = rowsEl.querySelector('.tbl-header');
+  const headerH = header ? header.getBoundingClientRect().height : 0;
+  const rect = el.getBoundingClientRect();
+  const top = rect.top - viewport.top;
+  const bottom = rect.bottom - viewport.top;
+  if (top < headerH) {
+    rowsEl.scrollTop -= (headerH - top);
+  } else if (bottom > rowsEl.clientHeight) {
+    rowsEl.scrollTop += (bottom - rowsEl.clientHeight);
+  }
+}
+
 // Surface any uncaught exception in the webview so we can diagnose.
 window.addEventListener('error', (e) => {
   console.error('[editchain] uncaught error:', e.message, e.error);
@@ -2653,6 +3049,8 @@ window.addEventListener('message', (event) => {
       window.__editchainDataReady = false;
       searchMode = false;
       searchQuery = '';
+      resetFindState();
+      updateFindCounter('hidden');
       // A fresh chain is a new view: drop any responses from a previous chain
       // (or a replayed open into a surviving context) and re-establish the
       // offset-0 expansion snapshot. The cache is cleared too: a replayed open
@@ -2826,9 +3224,24 @@ window.addEventListener('message', (event) => {
       });
       return;
     }
+    if (reqBody.FindInHistory !== undefined) {
+      // Find-in-chain errors are compact and non-disruptive: the chain stays
+      // fully visible and the counter reports the failure (next Enter retries).
+      showFindError(errText);
+      return;
+    }
     return;
   }
   if (!r.value || typeof r.value !== 'object') return;
+
+  // FindInHistory response — an in-place find: `{ matches, returned, more }`.
+  // Unlike the legacy flat-list Search, this NEVER replaces the history view:
+  // matches resolve to real top-level rows of the current view, and the find
+  // only scrolls, highlights, and updates the counter (applyFindResponse).
+  if (Array.isArray(r.value.matches)) {
+    applyFindResponse(r.value);
+    return;
+  }
 
   // Search response — a bare array of hits (harness fixtures) or the service's
   // `{ results: [...] }` envelope of scored chunks. Rendered as a flat result
@@ -2879,6 +3292,12 @@ window.addEventListener('message', (event) => {
       if (!cache.has(absIdx)) totalFetched++;
       cache.set(absIdx, r.value.rows[i]);
     }
+    // A find-in-chain jump's target window has arrived: move the viewport to
+    // it BEFORE eviction (eviction keys off the current viewport) and
+    // select/reveal the real row.
+    if (pendingFindTarget && cache.has(pendingFindTarget.abs)) {
+      completeFindJump();
+    }
     // The layout hydration response overwrites already-rendered provisional
     // rows. Rebuild the bounded visible window once so lane SVGs update; the
     // initial row-only response has already delivered the first paint.
@@ -2919,8 +3338,14 @@ window.addEventListener('message', (event) => {
       });
       return;
     }
-    // Keep loading until the content fills the viewport so scrolling works.
-    fetchWindow();
+    if (pendingFindTarget) {
+      // Keep driving the jump: fetch the target's window (or the offset-0
+      // snapshot first) until the row is cached.
+      fetchWindowAround(pendingFindTarget.abs);
+    } else {
+      // Keep loading until the content fills the viewport so scrolling works.
+      fetchWindow();
+    }
     return;
   }
 
@@ -2988,6 +3413,9 @@ function normalizeSearchHit(hit, index) {
  */
 function renderSearchResults(hits) {
   searchMode = true;
+  // The legacy flat-list view supersedes any in-place find session.
+  resetFindState();
+  updateFindCounter('hidden');
   // SearchFilters cannot express submodule exclusion, so apply the same fixed
   // default client-side. Git hits carry `is_submodule` from the service.
   if (hideSubmodules()) {
@@ -3032,6 +3460,8 @@ function resetHistory() {
   searchMode = false;
   searchQuery = '';
   currentSearchEpoch = -1;
+  resetFindState();
+  updateFindCounter('hidden');
   // The previous view (e.g. a 0-result search) may have left `total` at 0;
   // the full-history window must be re-requested, not treated as empty.
   total = -1;
@@ -3065,33 +3495,99 @@ function resetHistory() {
   fetchWindow();
 }
 
-// Search on Enter; empty query resets back to the full history.
+// Find-in-chain keyboard behaviour. Enter submits a NEW query; Enter/Shift+Enter
+// on the SAME settled query advance / step back through matches (wrapping).
+// ArrowDown/ArrowUp move next/previous through SETTLED matches for the exact
+// submitted query and wrap; while a newer search is in flight or the input text
+// has been edited without submitting, navigation stays in the input (stale
+// matches are never entered). Escape clears the find session without reloading
+// history or changing the scroll position. Focus ALWAYS remains in the input
+// during find navigation so query editing stays easy.
 searchEl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') {
     const q = searchEl.value.trim();
-    if (q) {
-      searchQuery = q;
-      // Latest-query-wins: tag this search with a fresh epoch so its response
-      // is rendered even if an earlier search's (older-epoch) response lands
-      // first, and so a late older response can never overwrite it. Results
-      // render/navigate as a flat list on the Search response.
-      currentSearchEpoch = ++searchEpoch;
-      sendSearch(
-        { Search: { query: q, mode: 'Lexical', top_k: 50, filters: searchFiltersPayload() } },
-        currentSearchEpoch
-      );
+    if (!q) {
+      // Empty query: exit find (or restore the chain from the legacy flat-list
+      // view) without reloading anything.
+      if (searchMode) resetHistory();
+      else clearFind();
+      return;
+    }
+    if (q === searchQuery && findActive) {
+      // Same-query Enter advances to the next match; Shift+Enter steps back.
+      e.preventDefault();
+      navigateFind(e.shiftKey ? -1 : 1);
     } else {
-      resetHistory();
+      submitFind(q);
+    }
+    return;
+  }
+  if (e.key === 'Escape') {
+    // Escape exits the find session but keeps the typed text so the query
+    // stays editable; nothing refetches and the scroll position is unchanged.
+    e.preventDefault();
+    if (searchMode) resetHistory();
+    else clearFind();
+    return;
+  }
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    const q = searchEl.value.trim();
+    // In-place find: navigate the SETTLED matches for the exact submitted
+    // query only. Edited-but-unsubmitted text and an in-flight replacement
+    // keep the arrows in the input.
+    if (findActive && findMatches.length > 0 && q === searchQuery &&
+        currentSearchEpoch === -1) {
+      e.preventDefault();
+      navigateFind(e.key === 'ArrowDown' ? 1 : -1);
+      return;
+    }
+    // Legacy flat-list search results (older services): leave the input and
+    // focus+select the first (ArrowDown) or last (ArrowUp) result. Kept only
+    // for compatibility — production navigation stays in the input above.
+    if (searchMode && total > 0 && q === searchQuery &&
+        currentSearchEpoch === -1) {
+      e.preventDefault();
+      focusSearchResult(e.key === 'ArrowDown' ? 0 : total - 1);
     }
   }
 });
 
-// Clearing the search input resets back to the full history.
+// Clearing the search input exits find-in-chain without reloading history or
+// moving the scroll position (the chain was never replaced); the legacy
+// flat-list search view still resets to restore the history DOM.
 searchEl.addEventListener('input', () => {
   if (!searchEl.value.trim()) {
-    resetHistory();
+    if (searchMode) resetHistory();
+    else clearFind();
   }
+  // Edited-but-unsubmitted text must disable the buttons (and restore them
+  // when the exact submitted query is retyped), mirroring the arrow guard.
+  syncFindNavButtons();
 });
+
+// Previous/Next find navigation buttons: the exact same wrapping
+// navigateFind(-1/+1) path ArrowUp/ArrowDown use, so a click moves the cursor
+// through the SAME settled matches, updates "i of N", and reveals/selects/
+// highlights the real chain row without ever replacing or rebuilding the
+// chain. mousedown is prevented from stealing focus so a mouse click never
+// blurs the search input; the click then re-focuses the input so editing and
+// keyboard navigation stay immediate. Disabled buttons never fire clicks, so
+// the disabled-state guard in syncFindNavButtons is the only gate needed.
+if (searchPrevBtn) {
+  searchPrevBtn.addEventListener('mousedown', (e) => e.preventDefault());
+  searchPrevBtn.addEventListener('click', () => {
+    navigateFind(-1);
+    searchEl.focus();
+  });
+}
+if (searchNextBtn) {
+  searchNextBtn.addEventListener('mousedown', (e) => e.preventDefault());
+  searchNextBtn.addEventListener('click', () => {
+    navigateFind(1);
+    searchEl.focus();
+  });
+}
+syncFindNavButtons();
 
 // Activity/Raw profile control. Switching resets the view coherently: the
 // search exits, the view generation bumps (stale windows from the old profile

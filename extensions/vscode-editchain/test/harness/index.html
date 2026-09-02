@@ -33,7 +33,12 @@
 <button type="button" id="profile-raw" class="segmented-btn" aria-pressed="false">Raw</button>
 </div>
 <label class="visually-hidden" for="search">Search history</label>
+<div id="search-control" class="search-control" role="group" aria-label="Find in chain">
 <input id="search" type="text" placeholder="Search history… (Enter to search)">
+<span id="search-counter" class="search-counter" role="status" aria-live="polite"></span>
+<button type="button" id="search-prev" class="search-nav" title="Previous match (Shift+Enter)" aria-label="Previous match" hidden disabled><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M13.5 10.5 8 5.06 2.5 10.5l-1.06-1.06L8 2.94l6.56 6.5z"/></svg></button>
+<button type="button" id="search-next" class="search-nav" title="Next match (Enter)" aria-label="Next match" hidden disabled><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 13.06 1.44 6.56 2.5 5.5 8 10.94l5.5-5.44 1.06 1.06z"/></svg></button>
+</div>
 </div>
 <div id="layout">
 <div id="rows"></div>
