@@ -1,56 +1,19 @@
-//! Rust/WebAssembly `wgpu` renderer for the experimental VS Code history view.
+//! Rust/WebAssembly history graph renderer for the experimental VS Code
+//! history view.
 //!
-//! This crate owns the deterministic history graph geometry and submits it
-//! through WebGPU or the WebGL2 fallback selected by `wgpu`. Since Slice 3A
-//! the wasm32 build ALSO owns the Rust browser shell ([`shell`] module, and
+//! The wasm32 build owns the Rust browser shell ([`shell`] module and
 //! `app::dom`): it acquires the VS Code API through a narrow wasm-bindgen
 //! binding exposed by VS Code (or the deterministic fixture bridge), installs
-//! the host-message
-//! listener before posting `webviewReady`, owns `HistoryAppState`, renders
-//! real row DOM nodes, and instantiates [`GpuRenderer`] directly to build
-//! frames from cached row data. The production `media/main.js` controller is
-//! NOT loaded on the Rust-owned path.
+//! the host-message listener before posting `webviewReady`, owns
+//! `HistoryAppState`, and renders real row DOM nodes whose `.graph-cell` each
+//! carries its own SVG graph fragment (production `buildGraphCell`). The
+//! graph scrolls inside the row DOM, so no fixed-viewport overlay exists to
+//! reconcile. The production `media/main.js` controller is NOT loaded on the
+//! Rust-owned path.
 //!
-//! # Frame contract
-//!
-//! The renderer consumes one JSON frame whose layout is computed by the Rust
-//! application/DOM adapter so the GPU canvas stays in lockstep with the
-//! accessible DOM renderer:
-//!
-//! ```json
-//! {
-//!   "graph": {
-//!     "left": 0,
-//!     "width": 132,
-//!     "lane_x": [14.76, 29.52],
-//!     "dot_radius": 4,
-//!     "line_width": 1.4,
-//!     "bundle_half_height": 7,
-//!     "bundle_margin": 1,
-//!     "background_color": [0.06, 0.07, 0.09, 1]
-//!   },
-//!   "rows": [
-//!     {
-//!       "index": 0,
-//!       "top": 0,
-//!       "bottom": 34,
-//!       "middle": 17,
-//!       "lane": 0,
-//!       "above": [0],
-//!       "below": [0],
-//!       "transitions": [[0, 2]],
-//!       "is_subop": false,
-//!       "is_bundle": false
-//!     }
-//!   ]
-//! }
-//! ```
-//!
-//! `graph.lane_x[0..=max_lane]` holds the CSS-pixel x center of every lane and
-//! every frame coordinate is a CSS pixel. `GpuRenderer::render` additionally
-//! receives the canvas backing-store dimensions (`width` and `height` in
-//! device pixels) and `scale` (CSS pixels → device pixels); geometry is
-//! emitted in device pixels and normalized to clip space before submission.
+//! The obsolete `GpuRenderer`/wgpu surface (target-independent geometry in
+//! this module, `browser.rs` on wasm32) remains compiled for its native
+//! geometry tests; the shell no longer instantiates it.
 
 // Pure, target-independent HistoryApp application core (Stage 1+): the host
 // protocol and the view state machine ported from the production
@@ -802,72 +765,6 @@ fn u32_to_f32(value: u32) -> f32 {
     let high = u16::try_from(value >> 16).unwrap_or(u16::MAX);
     let low = u16::try_from(value & 0xffff).unwrap_or(0);
     f32::from(high) * 65536.0 + f32::from(low)
-}
-
-/// Convert an f64 to f32 with round-to-nearest-even, matching the IEEE-754
-/// narrowing semantics without a lossy cast (NaN payloads quiet to f32,
-/// out-of-range magnitudes saturate to infinity, and the sign is preserved).
-#[cfg(target_arch = "wasm32")]
-fn f64_to_f32(value: f64) -> f32 {
-    const F32_EXPONENT_MASK: u32 = 0x7f80_0000;
-    const F32_MANTISSA_MASK: u32 = 0x007f_ffff;
-
-    let bits = value.to_bits();
-    let sign = u32::try_from((bits >> 63) & 1).unwrap_or(0) << 31;
-    let exponent = u32::try_from((bits >> 52) & 0x7ff).unwrap_or(0);
-    let mantissa = bits & 0x000f_ffff_ffff_ffff;
-
-    // Zero keeps its sign; infinity and NaN map directly to f32.
-    if exponent == 0 && mantissa == 0 {
-        return f32::from_bits(sign);
-    }
-    if exponent == 0x7ff {
-        let quiet = if mantissa == 0 {
-            0
-        } else {
-            F32_MANTISSA_MASK >> 1
-        };
-        return f32::from_bits(sign | F32_EXPONENT_MASK | quiet);
-    }
-
-    // The f32 exponent field is the f64 field minus the bias difference
-    // (1023 - 127); values beyond the f32 range saturate to infinity.
-    let f32_exponent = exponent.saturating_sub(896);
-    if f32_exponent >= 0xff {
-        return f32::from_bits(sign | F32_EXPONENT_MASK);
-    }
-
-    // Round the 53-bit significand (implied leading 1 included) onto the f32
-    // grid: 24 bits for normal values, a shifted 23-bit field for subnormals.
-    let full = (1_u64 << 52) | mantissa;
-    let drop_bits = if f32_exponent >= 1 {
-        29
-    } else {
-        (926_u32.saturating_sub(exponent)).min(63)
-    };
-    let kept = full >> drop_bits;
-    let guard = (full >> drop_bits.saturating_sub(1)) & 1;
-    let sticky = full & ((1_u64 << drop_bits.saturating_sub(1)).saturating_sub(1));
-    let round_up = guard == 1 && (sticky != 0 || kept & 1 == 1);
-    let rounded = kept.saturating_add(u64::from(round_up));
-
-    if f32_exponent >= 1 {
-        if rounded >= (1_u64 << 24) {
-            // The significand carried into the next exponent.
-            let carried = f32_exponent.saturating_add(1);
-            if carried >= 0xff {
-                return f32::from_bits(sign | F32_EXPONENT_MASK);
-            }
-            return f32::from_bits(sign | (carried << 23));
-        }
-        let mantissa_bits = u32::try_from(rounded & u64::from(F32_MANTISSA_MASK)).unwrap_or(0);
-        f32::from_bits(sign | (f32_exponent << 23) | mantissa_bits)
-    } else if rounded >= (1_u64 << 23) {
-        // The subnormal significand carried into the smallest normal value.
-        f32::from_bits(sign | (1_u32 << 23))
-    } else {
-        f32::from_bits(sign | u32::try_from(rounded).unwrap_or(0))
-    }
 }
 
 /// Convert a rounded, non-negative CSS/device float to u32 without a cast:
@@ -1732,8 +1629,7 @@ mod shell {
     //! wasm-bindgen binding, message-listener installation before
     //! `webviewReady`, state restore/save), the `HistoryAppState` machine, the
     //! reducer `Step` sends and DOM ops, scroll/profile controls and
-    //! persistence, the debug hooks, and direct `GpuRenderer` instantiation
-    //! with frames serialized from cached row data.
+    //! persistence, the debug hooks, and the per-row SVG graph render pass.
     //!
     //! Reentrancy contract: the fixture bridge dispatches correlated
     //! responses synchronously inside `postMessage`, so host messages are
@@ -1754,8 +1650,6 @@ mod shell {
     use crate::app::state::{
         DomOp, HistoryAppState, Profile, ProfileAction, RetryAction, Step, Viewport, ROW_H,
     };
-    use crate::GpuRenderer;
-    use crate::{f64_to_f32, u32_to_f32};
 
     /// Narrow wasm-bindgen binding for VS Code API acquisition: the webview
     /// host (and the harness fixture bridge) provide `acquireVsCodeApi` as a
@@ -1795,26 +1689,25 @@ mod shell {
     /// Boolean shell state, grouped under the `struct_excessive_bools` gate.
     #[derive(Debug, Default, Clone, Copy)]
     struct ShellFlags {
-        /// Renderer created successfully.
+        /// The per-row SVG graph renderer is ready (first window rendered).
         renderer_ready: bool,
         /// Startup completed (listener installed, webviewReady posted).
         wasm_ready: bool,
     }
 
-    /// The live shell: DOM + state machine + renderer + debug counters.
+    /// The live shell: DOM + state machine + SVG render counters.
     #[derive(Debug)]
     struct ShellData {
         flags: ShellFlags,
         vscode: JsValue,
         dom: HistoryDom,
         state: HistoryAppState,
-        renderer: Option<GpuRenderer>,
-        renderer_backend: String,
         instance_id: String,
-        requested_backend: String,
-        frame_dirty: bool,
+        /// Successful per-row SVG render passes (replaces the GPU frame
+        /// counter; the debug facade still reports it as `renderCount`).
         render_count: u64,
-        vertex_count: u64,
+        /// DOM generation counter (the harness `whenIdle` settles on two
+        /// stable generations, unchanged).
         generation: u64,
         started_at_ms: f64,
         first_window_ms: Option<f64>,
@@ -1862,6 +1755,19 @@ mod shell {
             dom::current_graph_width(&layout, &self.col_widths)
         }
 
+        /// The per-row SVG graph cell geometry: pinned natural lane centers,
+        /// the compressed dot radius, the rendered column width (divider
+        /// override or natural), and the fixed `ROW_H` cell height.
+        fn graph_cell_spec(&self) -> dom::GraphCellSpec {
+            let layout = self.layout();
+            dom::GraphCellSpec {
+                lane_x: layout.lane_x.clone(),
+                dot_radius: layout.dot_radius,
+                width: self.current_graph_width(),
+                height: dom::i64_to_f64(ROW_H),
+            }
+        }
+
         fn col_style(&self) -> String {
             let layout = self.layout();
             dom::col_style(
@@ -1900,11 +1806,13 @@ mod shell {
         fn reanchor_window(&mut self, top: i64, bottom: i64) -> Result<(), JsValue> {
             let specs = dom::window_specs(&self.state, top, bottom);
             let col_style = self.col_style();
+            let graph = self.graph_cell_spec();
             let options = dom::RebuildOptions {
                 spacer_height_px: self.spacer_height_px(),
                 wrap_top_px: top.saturating_mul(ROW_H),
                 aria_rowcount: self.state.visible_total(),
                 graph_width_css: self.current_graph_width(),
+                graph,
                 status: self.pane_status(),
             };
             self.dom.reanchor(&specs, &col_style, &options)?;
@@ -2063,7 +1971,8 @@ mod shell {
                 .map(|row| row.spec)
                 .collect::<Vec<_>>();
             let col_style = self.col_style();
-            self.dom.append_rows(&specs, &col_style)
+            let graph = self.graph_cell_spec();
+            self.dom.append_rows(&specs, &col_style, &graph)
         }
 
         fn prepend_window(&mut self, from: i64, to: i64) -> Result<(), JsValue> {
@@ -2073,10 +1982,12 @@ mod shell {
                 .map(|row| row.spec.clone())
                 .collect::<Vec<_>>();
             let col_style = self.col_style();
+            let graph = self.graph_cell_spec();
             self.dom.prepend_rows(
                 &specs,
                 &col_style,
                 self.state.render_top.saturating_mul(ROW_H),
+                &graph,
             )?;
             // Production re-evaluates the old first-row chip against its new
             // previous sibling after a prepend crosses a group boundary.
@@ -2093,26 +2004,35 @@ mod shell {
                 dom::window_rows_from(&self.state, boundary_vis, boundary_vis, Some(&prev_group));
             if let Some(row) = boundary.first() {
                 let abs = row.spec.identity.abs_index;
-                self.dom.replace_row_abs(abs, &row.spec, &col_style)?;
+                self.dom
+                    .replace_row_abs(abs, &row.spec, &col_style, &graph)?;
             }
             Ok(())
         }
 
         fn trim_top(&mut self, keep_top: i64) -> Result<(), JsValue> {
-            // Trim by scanning the rendered DOM: rows prepended above the
-            // pre-step window during this transition must be removed too,
-            // otherwise stale rows survive and later prepends duplicate them.
-            let remove = self.dom.rows_outside(keep_top, i64::MAX);
-            self.dom.remove_abs(&remove)
+            // Trim by scanning the rendered DOM and mapping each rendered
+            // absolute id back through the collapsed-mode mapping (production
+            // `trimTop`): visible bounds never compare directly to `data-row`
+            // absolute values, and rows added by a prepend/append during this
+            // same transition are covered too. The wrap then shifts to the
+            // state's advanced visible top (`setWrapTop(renderTop)`).
+            let rendered = self.dom.rendered_row_abs();
+            let remove = dom::rows_outside_visible(&self.state, &rendered, keep_top, i64::MAX);
+            self.dom.remove_abs(&remove)?;
+            self.dom
+                .set_wrap_top(self.state.render_top.saturating_mul(ROW_H))
         }
 
         fn trim_bottom(&mut self, keep_bottom: i64) -> Result<(), JsValue> {
-            let remove = self.dom.rows_outside(i64::MIN, keep_bottom);
+            let rendered = self.dom.rendered_row_abs();
+            let remove = dom::rows_outside_visible(&self.state, &rendered, i64::MIN, keep_bottom);
             self.dom.remove_abs(&remove)
         }
 
         fn fill_placeholders(&mut self) -> Result<(), JsValue> {
             let col_style = self.col_style();
+            let graph = self.graph_cell_spec();
             for abs in self.dom.placeholder_abs() {
                 let Some(row) = self.state.cache.get(&abs) else {
                     continue;
@@ -2122,7 +2042,7 @@ mod shell {
                 let is_group_start = prev_group.as_deref().is_none_or(|prev| prev != group);
                 let context = self.row_context(abs, is_group_start);
                 let spec = RowSpec::from_value(row, &context);
-                self.dom.replace_row_abs(abs, &spec, &col_style)?;
+                self.dom.replace_row_abs(abs, &spec, &col_style, &graph)?;
             }
             Ok(())
         }
@@ -2264,80 +2184,32 @@ mod shell {
             }
         }
 
-        /// Schedule a frame (DOM rows changed); renders immediately when the
-        /// renderer exists.
-        fn schedule_frame(&mut self) {
-            self.frame_dirty = true;
-            self.render_frame_if_dirty();
-        }
-
-        /// Render the current frame from cached/`RowSpec` data.
-        fn render_frame_if_dirty(&mut self) {
-            if !self.frame_dirty {
-                return;
-            }
-            self.frame_dirty = false;
-            let Some(renderer) = self.renderer.as_mut() else {
-                // The renderer is still initializing; keep the request queued.
-                self.frame_dirty = true;
-                return;
-            };
-            let layout = dom::graph_layout(
-                self.state.max_lane,
-                self.dom.rows_client_width_css(),
-                self.dom.window_inner_width_css(),
-            );
-            let column_width = dom::current_graph_width(&layout, &self.col_widths);
-            if let Err(error) = self.dom.position_canvas_host(column_width) {
-                let message = format!("canvas positioning failed: {}", js_value_text(&error));
-                record_error(&message);
-                return;
-            }
+        /// Publish the SVG render state after DOM rows changed. The per-row SVG
+        /// graph cells are painted at row-build time inside the scrolling DOM
+        /// subtree, so there is no canvas surface to size, position, or chase
+        /// the scroll offset. This pass keeps the debug facade's frame-row
+        /// mirror (`#gpu-rows`), counters (`renderCount`/`generation`),
+        /// metrics, and status text aligned with the old GPU frame contract.
+        fn publish_render_state(&mut self) {
             let host_height = self.dom.client_height_css();
-            let view =
-                dom::canvas_view(column_width, host_height, HistoryDom::device_pixel_ratio());
-            self.dom
-                .set_canvas_backing(view.backing_width, view.backing_height);
-            let rows = dom::frame_rows(&self.state, self.dom.scroll_top(), view.css_height);
-            let frame =
-                dom::build_frame_value(&layout, &HistoryDom::editor_background_color(), &rows);
-            let frame_json = frame.to_string();
-            let width = u32_to_f32(view.backing_width);
-            let height = u32_to_f32(view.backing_height);
-            let scale = f64_to_f32(view.scale);
-            let started = web_sys::window()
-                .and_then(|window| window.performance())
-                .map_or(0.0, |performance| performance.now());
-            match renderer.render(&frame_json, width, height, scale) {
-                Ok(vertex_count) => {
-                    self.last_frame_rows.clone_from(&rows);
-                    self.vertex_count = u64::from(vertex_count);
-                    self.render_count = self.render_count.saturating_add(1);
-                    self.generation = self.generation.saturating_add(1);
-                    self.last_render_ms = Some(
-                        web_sys::window()
-                            .and_then(|window| window.performance())
-                            .map_or(0.0, |performance| performance.now() - started),
-                    );
-                    if self.first_window_ms.is_none() {
-                        self.first_window_ms = Some(performance_now() - self.started_at_ms);
-                    }
-                    self.last_error = None;
-                    set_window_prop("__editchainLastError", &JsValue::NULL);
-                    if let Err(error) = self.dom.mirror_rows(&rows) {
-                        let message = format!("gpu row mirror failed: {}", js_value_text(&error));
-                        record_error(&message);
-                    }
-                    let total = self.state.total.unwrap_or(0);
-                    self.dom
-                        .set_status(&format!("{} / {} rows", rows.len(), total));
-                }
-                Err(error) => {
-                    // Transient surface errors recover on the next frame.
-                    self.frame_dirty = true;
-                    record_error(&format!("GPU render error: {}", js_value_text(&error)));
-                }
+            let rows = dom::frame_rows(&self.state, self.dom.scroll_top(), host_height);
+            let started = performance_now();
+            self.last_frame_rows.clone_from(&rows);
+            self.render_count = self.render_count.saturating_add(1);
+            self.generation = self.generation.saturating_add(1);
+            self.last_render_ms = Some(performance_now() - started);
+            if self.first_window_ms.is_none() {
+                self.first_window_ms = Some(performance_now() - self.started_at_ms);
             }
+            self.last_error = None;
+            set_window_prop("__editchainLastError", &JsValue::NULL);
+            if let Err(error) = self.dom.mirror_rows(&rows) {
+                let message = format!("gpu row mirror failed: {}", js_value_text(&error));
+                record_error(&message);
+            }
+            let total = self.state.total.unwrap_or(0);
+            self.dom
+                .set_status(&format!("{} / {} rows", rows.len(), total));
         }
 
         /// Persist the step's save-state through the narrow binding.
@@ -3416,8 +3288,8 @@ mod shell {
         after_transition();
     }
 
-    /// Post-step sync: persist save-state, mirror readiness flags to the
-    /// window debug properties, and schedule a GPU frame when rows changed.
+    /// Post-step sync: mirror readiness flags to the window debug properties
+    /// and publish the SVG render state after rows changed.
     fn after_transition() {
         SHELL_DATA.with(|cell| {
             let mut borrow = cell.borrow_mut();
@@ -3425,7 +3297,7 @@ mod shell {
                 return;
             };
             sync_debug_props_locked(shell);
-            shell.schedule_frame();
+            shell.publish_render_state();
         });
     }
 
@@ -3502,13 +3374,8 @@ mod shell {
             vscode,
             dom,
             state,
-            renderer: None,
-            renderer_backend: String::new(),
             instance_id: new_instance_id(),
-            requested_backend: parse_backend_param(),
-            frame_dirty: false,
             render_count: 0,
-            vertex_count: 0,
             generation: 0,
             started_at_ms: performance_now(),
             first_window_ms: None,
@@ -3704,68 +3571,30 @@ mod shell {
         format!("{now}-{suffix}")
     }
 
-    /// Parse the `?backend=webgl|webgpu` override; default `auto`.
-    fn parse_backend_param() -> String {
-        let query = web_sys::window()
-            .map(|window| window.location().search().unwrap_or_default())
-            .unwrap_or_default();
-        if query.contains("backend=webgl") {
-            "webgl".to_owned()
-        } else if query.contains("backend=webgpu") {
-            "webgpu".to_owned()
-        } else {
-            "auto".to_owned()
-        }
-    }
-
     /// WASM startup entry: install the Rust shell (listener before
-    /// `webviewReady`), then create the renderer directly and render the first
-    /// frame from cached/`RowSpec` data.
+    /// `webviewReady`) and mark the per-row SVG renderer ready. No wgpu
+    /// surface is created on this path — the graph lives inside the scrolling
+    /// row DOM, so there is nothing to position or chase.
     ///
     /// # Errors
     ///
     /// Returns an error when the shell scaffold or the VS Code API is
-    /// unavailable; renderer creation failures are recorded, not propagated.
+    /// unavailable.
     #[wasm_bindgen(js_name = "startHistoryView")]
-    pub async fn start_history_view() -> Result<(), JsValue> {
+    pub fn start_history_view() -> Result<(), JsValue> {
         install_shell()?;
-        let requested_backend = SHELL_DATA.with(|cell| {
-            cell.borrow_mut()
-                .as_mut()
-                .map(|shell| shell.requested_backend.clone())
-                .unwrap_or_default()
+        SHELL_DATA.with(|cell| {
+            let mut borrow = cell.borrow_mut();
+            let Some(shell) = borrow.as_mut() else {
+                return;
+            };
+            shell.flags.renderer_ready = true;
+            shell.last_error = None;
+            shell.dom.set_backend("svg", "svg");
+            shell.publish_render_state();
         });
-        match GpuRenderer::create("gpu-canvas".to_owned(), requested_backend).await {
-            Ok(renderer) => {
-                let backend = renderer.backend();
-                SHELL_DATA.with(|cell| {
-                    let mut borrow = cell.borrow_mut();
-                    let Some(shell) = borrow.as_mut() else {
-                        return;
-                    };
-                    shell.renderer = Some(renderer);
-                    shell.renderer_backend.clone_from(&backend);
-                    shell.flags.renderer_ready = true;
-                    shell.last_error = None;
-                    shell
-                        .dom
-                        .set_backend(&backend, &format!("wgpu · {backend}"));
-                });
-                set_window_prop("__editchainLastError", &JsValue::NULL);
-                sync_debug_props();
-                SHELL_DATA.with(|cell| {
-                    if let Some(shell) = cell.borrow_mut().as_mut() {
-                        shell.schedule_frame();
-                    }
-                });
-            }
-            Err(error) => {
-                record_error(&format!(
-                    "GPU renderer creation failed: {}",
-                    js_value_text(&error)
-                ));
-            }
-        }
+        set_window_prop("__editchainLastError", &JsValue::NULL);
+        sync_debug_props();
         Ok(())
     }
 
@@ -3908,7 +3737,7 @@ mod shell {
             json!({
                 "rows": rows,
                 "total": shell.state.total.unwrap_or(-1),
-                "backend": shell.renderer_backend,
+                "backend": "svg",
             })
             .to_string()
         })
@@ -3928,7 +3757,7 @@ mod shell {
                 "firstWindowMs": shell.first_window_ms,
                 "lastRenderMs": shell.last_render_ms,
                 "renderCount": shell.render_count,
-                "vertexCount": shell.vertex_count,
+                "vertexCount": 0,
                 "domRows": shell.last_frame_rows.len(),
                 "generation": shell.generation,
                 "rendererReady": shell.flags.renderer_ready,
@@ -3973,26 +3802,21 @@ mod shell {
         })
     }
 
-    /// The selected wgpu backend (`webgl`/`webgpu`/empty).
+    /// The active graph renderer: the per-row SVG cells (`svg`).
     #[wasm_bindgen(js_name = "debugBackend")]
     #[must_use]
     pub fn debug_backend() -> String {
-        SHELL_DATA.with(|cell| {
-            cell.borrow()
-                .as_ref()
-                .map(|shell| shell.renderer_backend.clone())
-                .unwrap_or_default()
-        })
+        "svg".to_owned()
     }
 
-    /// Frame generation counter (renders) for `whenIdle` stability checks.
+    /// DOM generation counter (render passes) for `whenIdle` stability checks.
     #[wasm_bindgen(js_name = "debugGeneration")]
     #[must_use]
     pub fn debug_generation() -> u64 {
         SHELL_DATA.with(|cell| cell.borrow().as_ref().map_or(0, |shell| shell.generation))
     }
 
-    /// Successful GPU render count.
+    /// Successful per-row SVG render passes.
     #[wasm_bindgen(js_name = "debugRenderCount")]
     #[must_use]
     pub fn debug_render_count() -> u64 {

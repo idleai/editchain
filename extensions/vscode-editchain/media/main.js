@@ -2924,7 +2924,7 @@ function syncWindow() {
     appendRowsBelow(wantBottom - renderBottom);
     fetchWindow(); // request more below
   }
-  if (renderTop > wantTop || cache.has(absIndexForVisible(renderTop - 1))) {
+  if (renderTop > wantTop) {
     prependRowsAbove(Math.max(1, renderTop - wantTop));
     fetchWindow(); // request more above
   }

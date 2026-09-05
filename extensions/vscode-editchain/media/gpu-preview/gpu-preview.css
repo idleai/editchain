@@ -1,27 +1,23 @@
-/* Default Rust/WASM GPU renderer overlay stylesheet.
+/* Rust/WASM history graph renderer stylesheet.
  *
  * Shared by two hosts:
  *   - the VS Code GPU webview (getGpuHtml in src/extension.ts), which loads
- *     media/main.css + media/main.js FIRST and this file on top;
+ *     media/main.css + media/rust-history/loader.js (the Rust-owned path);
  *   - the standalone Puppeteer harness (test/harness/gpu.html), which mirrors
  *     that exact production scaffold.
  *
- * Production (media/main.css + media/main.js) owns the controls, virtual
+ * Production (media/main.css + the Rust shell) owns the controls, virtual
  * paging, search, work-unit/bundle/promotion rows, selection/keyboard/
  * disclosure, raw JSON routing, responsive columns, accessibility and resize.
- * This sheet adds ONLY the GPU chrome:
+ * This sheet adds ONLY the renderer chrome:
  *   - a slim toolbar (backend badge + renderer status);
- *   - a TRANSPARENT canvas overlay aligned over the rendered .graph-cell
- *     column (pointer-events: none; z-index below the sticky header and the
- *     group chips so production UI stays interactive and readable);
- *   - the rule that hides the per-row SVG graph cells while the GPU canvas is
- *     active (the DOM rows and their text/interactions are untouched);
+ *   - the obsolete fixed-viewport canvas overlay, inert on the Rust-owned
+ *     path (the per-row SVG graph cells are the active graph and scroll with
+ *     the rows, so no overlay is ever created);
+ *   - the rule that hides the per-row SVG graph cells while the legacy GPU
+ *     oracle canvas is active (harness-only path);
  *   - a hidden #gpu-rows mirror carrying data-row/data-key per rendered row
  *     (harness/e2e DOM contract) and the visually-hidden live region.
- *
- * While the GPU is NOT active (no rows yet, or a render error), body lacks
- * `.gpu-canvas-active` and the production SVG graphs remain visible — the
- * renderer degrades to the deprecated SVG fallback instead of a blank rail.
  */
 
 :root {
@@ -93,6 +89,13 @@
   z-index: 0;
   overflow: hidden;
   pointer-events: none;
+}
+
+/* The Rust-owned history view never creates a canvas: the per-row SVG graph
+   cells are the active graph and live inside the scrolling row DOM. Keep the
+   legacy overlay host inert so it can never paint over or chase the rows. */
+body[data-rust-wasm] #gpu-canvas-host {
+  display: none;
 }
 
 #gpu-canvas {

@@ -7,10 +7,11 @@ import { resolveServicePath, StdioClient } from './stdioClient';
 // always renders the Rust/WASM history view: media/rust-history/loader.js is
 // the ONLY script the webview loads. It initializes the wasm-bindgen module
 // and calls the Rust shell's startHistoryView(), which owns the whole runtime
-// (window/frame/lane presentation on a wgpu canvas, virtual paging, search,
-// profile switching, selection and raw-JSON routing). Production media/main.js
-// and media/gpu-preview/bootstrap.js are NOT loaded here; they remain only as
-// the offscreen CPU/SVG parity-reference side of the harness oracle.
+// (window/frame/lane presentation as per-row SVG graph fragments inside each
+// row's .graph-cell, virtual paging, search, profile switching, selection and
+// raw-JSON routing). Production media/main.js and media/gpu-preview/bootstrap.js
+// are NOT loaded here; they remain only as the offscreen CPU/SVG
+// parity-reference side of the harness oracle.
 let historyPanel: vscode.WebviewPanel | undefined = undefined;
 // Output channel for debugging the service bridge and panel lifecycle.
 let output: vscode.OutputChannel | undefined = undefined;
@@ -559,10 +560,12 @@ class JsonContentProvider implements vscode.TextDocumentContentProvider {
  * profile switching, virtual paging (PAGE=500), FindInHistory search/nav,
  * loading/error, work-unit/bundle/promotion rows, row selection/keyboard/
  * disclosure, raw JSON routing, five responsive columns, accessibility,
- * resize, and the wgpu canvas under #gpu-canvas-host. Production media/main.js
- * and media/gpu-preview/bootstrap.js are deliberately NOT loaded here; they
- * remain only as the offscreen CPU/SVG parity-reference side of the harness
- * oracle (test/harness/index.html + gpu.html).
+ * resize, and per-row SVG graph fragments (the inert #gpu-canvas-host
+ * scaffold stays only for scaffold/oracle parity — no canvas is created).
+ * Production media/main.js and media/gpu-preview/bootstrap.js are
+ * deliberately NOT loaded here; they remain only as the offscreen CPU/SVG
+ * parity-reference side of the harness oracle (test/harness/index.html +
+ * gpu.html).
  *
  * The CSP keeps the production policy's shape and permits no network or worker
  * access. Its script-src additionally allows 'wasm-unsafe-eval' for

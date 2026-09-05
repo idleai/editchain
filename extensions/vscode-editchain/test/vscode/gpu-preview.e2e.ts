@@ -1,4 +1,5 @@
-// End-to-end test for the Rust/WASM GPU history renderer in real VS Code.
+// End-to-end test for the Rust/WASM history renderer (per-row SVG graph
+// fragments) in real VS Code.
 //
 // Uses WebdriverIO's global `expect` (injected by @wdio/globals), exactly like
 // history.e2e.ts — no explicit import (importing expect-webdriverio directly
@@ -9,16 +10,18 @@
 // titled "EditChain History"; that panel loads the exact production scaffold
 // (media/main.css + media/gpu-preview/gpu-preview.css) and
 // media/rust-history/loader.js as its ONLY script. The Rust shell owns the
-// runtime (window/frame/lane presentation on the single wgpu canvas under
-// #gpu-canvas-host) and exposes window.__editchainGpuDebug (loader:
-// 'rust-history', dataReady, lastError, backend, snapshot, metrics, whenIdle)
+// runtime (window/frame/lane presentation as per-row SVG graph fragments
+// inside each .graph-cell; no canvas surface is created) and exposes
+// window.__editchainGpuDebug (loader: 'rust-history', dataReady, lastError,
+// backend: 'svg', snapshot, metrics, whenIdle)
 // plus the __editchainGetProfile/GetTotal/RowAt compatibility hooks. This
 // spec exercises the pieces the standalone harness cannot: the default open
 // command, the single panel title, the production control paths (Activity/Raw
 // profile, find-in-chain submit + navigation + clear, scrolling, inline
 // selection/keyboard roving) inside the Rust-backed webview, and the debug
-// renderer contract (loader identity, renderCount/vertexCount > 0, one canvas
-// under #gpu-canvas-host, no foreign canvases). There is deliberately NO
+// renderer contract (loader identity, backend 'svg', renderCount > 0,
+// vertexCount 0, zero canvases, one aria-hidden svg.graph-row-fragment per
+// hydrated row). There is deliberately NO
 // second panel and NO side-by-side capture: CPU-vs-GPU fixture parity is the
 // offscreen regression oracle (test/harness/functionalParity.test.js +
 // scripts/ui-gpu-preview.mjs), not a shipped two-panel UI. This spec does NOT
@@ -32,21 +35,21 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TRACE_DIR = path.join(__dirname, '..', '..', 'trace');
 
-// Real-service Open + the first GPU window can take 20s+ on the 119k-node
+// Real-service Open + the first render window can take 20s+ on the 119k-node
 // chain (the service builds blobs/diagnostics on Open), so the deadline
 // mirrors the history e2e's 120s — the outer mocha timeout bounds the run,
 // not a fixed service deadline.
 const ROW_TIMEOUT_MS = 120000;
 const IDLE_TIMEOUT_MS = 60000;
 
-describe('EditChain GPU history renderer', () => {
+describe('EditChain Rust history renderer (per-row SVG)', () => {
   it('loads VS Code with the extension', async () => {
     const workbench = await browser.getWorkbench();
     const title = await workbench.getTitleBar().getTitle();
     expect(title).toContain('editchain');
   });
 
-  it('opens the default history panel with the wgpu canvas, drives the shared production controls, and captures the single-panel frame', async function () {
+  it('opens the default history panel with the per-row SVG renderer, drives the shared production controls, and captures the single-panel frame', async function () {
     // The first find lazily builds the real service's lexical index, so this
     // test needs a larger budget than the config default (mirrors history.e2e).
     this.timeout(420000);
@@ -54,7 +57,7 @@ describe('EditChain GPU history renderer', () => {
 
     // Keep the editor area dedicated to the capture: close auxiliary bar and
     // notifications, then run the DEFAULT history command — it must open ONE
-    // panel titled "EditChain History" with the wgpu canvas inside it.
+    // panel titled "EditChain History" with the per-row SVG renderer inside it.
     await browser.executeWorkbench(async (vscode) => {
       await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
       await vscode.commands.executeCommand('notifications.clearAll');
@@ -101,13 +104,13 @@ describe('EditChain GPU history renderer', () => {
       timeoutMsg: 'history panel produced neither rows nor an explicit error',
     });
     if (startupError !== null) {
-      throw new Error('GPU renderer startup failed: ' + startupError);
+      throw new Error('Rust renderer startup failed: ' + startupError);
     }
 
     // Assert the __editchainGpuDebug contract in the DEFAULT panel: the
-    // rust-history loader facade, a real backend (webgl or webgpu), a healthy
-    // snapshot over the production DOM, nonempty wgpu geometry, and the
-    // canvas overlaid ONLY inside #gpu-canvas-host.
+    // rust-history loader facade, the 'svg' backend, a healthy snapshot over
+    // the production DOM, zero canvases/vertices, and one aria-hidden
+    // svg.graph-row-fragment per hydrated row, centred on the row.
     const debug = await browser.execute(() => {
       const g = window.__editchainGpuDebug;
       if (!g || typeof g.snapshot !== 'function') {
@@ -115,9 +118,56 @@ describe('EditChain GPU history renderer', () => {
       }
       const snap = g.snapshot();
       const metrics = typeof g.metrics === 'function' ? g.metrics() : null;
-      // The transparent GPU surface lives inside #gpu-canvas-host (aligned
-      // over the .graph-cell column); #gpu-rows mirrors the frame rows.
+      // Per-row SVG fragments live inside each .graph-cell; #gpu-canvas-host
+      // stays an empty inert scaffold; #gpu-rows mirrors the frame rows.
       const graphCanvases = document.querySelectorAll('#gpu-canvas-host canvas');
+      const hydratedRows = Array.from(document.querySelectorAll(
+        '#rows .row[data-row][data-key]:not(.row-placeholder)'));
+      let fragmentCount = 0;
+      const fragmentIssues: Array<{
+        row: number; count: number; ariaHidden: string | null;
+      }> = [];
+      let maxAlignDelta = 0;
+      const alignExamples: Array<{ row: number; delta: number }> = [];
+      for (const el of hydratedRows) {
+        const fragments = el.querySelectorAll('svg.graph-row-fragment');
+        const fragment = fragments[0] ?? null;
+        if (fragments.length !== 1 || !fragment ||
+            fragment.getAttribute('aria-hidden') !== 'true') {
+          if (fragmentIssues.length < 5) {
+            fragmentIssues.push({
+              row: Number(el.getAttribute('data-row')),
+              count: fragments.length,
+              ariaHidden: fragment ? fragment.getAttribute('aria-hidden') : null,
+            });
+          }
+          continue;
+        }
+        fragmentCount++;
+        const rowBox = el.getBoundingClientRect();
+        const svgBox = fragment.getBoundingClientRect();
+        const shapes = Array.from(fragment.querySelectorAll(
+          '.graphDot, .graphBundleCapsule'));
+        let minY = Infinity;
+        let maxY = -Infinity;
+        let any = false;
+        for (const shape of shapes) {
+          const b = shape.getBoundingClientRect();
+          if (b.width <= 0 && b.height <= 0) continue;
+          any = true;
+          if (b.top < minY) minY = b.top;
+          if (b.bottom > maxY) maxY = b.bottom;
+        }
+        const center = any ? (minY + maxY) / 2 : svgBox.top + svgBox.height / 2;
+        const delta = Math.abs(center - (rowBox.top + rowBox.height / 2));
+        if (delta > maxAlignDelta) maxAlignDelta = delta;
+        if (delta > 1 && alignExamples.length < 5) {
+          alignExamples.push({
+            row: Number(el.getAttribute('data-row')),
+            delta: Math.round(delta * 100) / 100,
+          });
+        }
+      }
       return {
         loader: g.loader || null,
         backend: typeof g.backend === 'function' ? g.backend() : (snap.backend || null),
@@ -125,13 +175,18 @@ describe('EditChain GPU history renderer', () => {
         lastError: g.lastError || null,
         rows: Array.isArray(snap.rows) ? snap.rows.length : 0,
         total: typeof snap.total === 'number' ? snap.total : -1,
-        domRows: document.querySelectorAll('#rows .row[data-key]').length,
+        domRows: hydratedRows.length,
         mirrorRows: document.querySelectorAll('#gpu-rows [data-row][data-key]').length,
         hasCanvas: graphCanvases.length > 0,
         canvasCount: graphCanvases.length,
         foreignCanvasCount: document.querySelectorAll('canvas:not(#gpu-canvas-host canvas)').length,
         canvasWidth: graphCanvases[0]?.width || 0,
         canvasHeight: graphCanvases[0]?.height || 0,
+        fragmentCount,
+        fragmentMissing: hydratedRows.length - fragmentCount,
+        fragmentIssues,
+        maxAlignDelta: Math.round(maxAlignDelta * 100) / 100,
+        alignExamples,
         renderCount: metrics?.renderCount ?? 0,
         vertexCount: metrics?.vertexCount ?? 0,
       };
@@ -139,29 +194,32 @@ describe('EditChain GPU history renderer', () => {
     console.log('[gpu-e2e] debug:', JSON.stringify(debug));
 
     expect(debug.loader).toBe('rust-history');
-    expect(['webgl', 'webgpu']).toContain(debug.backend);
+    expect(debug.backend).toBe('svg');
     expect(debug.dataReady).toBe(true);
     expect(debug.lastError).toBeNull();
     expect(debug.rows).toBeGreaterThan(0);
     expect(debug.domRows).toBeGreaterThan(0);
     expect(debug.mirrorRows).toBe(debug.rows);
     expect(debug.total).toBeGreaterThan(0);
-    expect(debug.hasCanvas).toBe(true);
-    expect(debug.canvasCount).toBe(1);
+    expect(debug.hasCanvas).toBe(false);
+    expect(debug.canvasCount).toBe(0);
     expect(debug.foreignCanvasCount).toBe(0);
-    expect(debug.canvasWidth).toBeGreaterThan(0);
-    expect(debug.canvasHeight).toBeGreaterThan(0);
+    expect(debug.canvasWidth).toBe(0);
+    expect(debug.canvasHeight).toBe(0);
+    expect(debug.fragmentCount).toBe(debug.domRows);
+    expect(debug.fragmentMissing).toBe(0);
+    expect(debug.maxAlignDelta).toBeLessThanOrEqual(1);
     expect(debug.renderCount).toBeGreaterThan(0);
-    expect(debug.vertexCount).toBeGreaterThan(0);
+    expect(debug.vertexCount).toBe(0);
 
     // Deterministic settle before driving controls: whenIdle resolves only when
     // the renderer reports no in-flight work and stable frames.
     const idle = await browser.execute((timeout) => window.__editchainGpuDebug.whenIdle(timeout), IDLE_TIMEOUT_MS);
     console.log('[gpu-e2e] idle:', JSON.stringify(idle));
 
-    // --- Production control path inside the GPU-backed history panel ----------
+    // --- Production control path inside the Rust-backed history panel --------
     // Activity/Raw profile switch through the real segmented control. Raw
-    // (hide_trace=false) must refetch and re-render through the GPU host.
+    // (hide_trace=false) must refetch and re-render through the Rust shell.
     const profileDefaults = await browser.execute(() => ({
       profile: typeof window.__editchainGetProfile === 'function'
         ? window.__editchainGetProfile() : null,
@@ -199,7 +257,7 @@ describe('EditChain GPU history renderer', () => {
     expect(activityTotal).toBeGreaterThan(0);
 
     // Find-in-chain through the real keyboard path: type the query and press
-    // Enter. The GPU host forwards the read-only FindInHistory request.
+    // Enter. The Rust shell forwards the read-only FindInHistory request.
     const QUERY = 'find in chain';
     await browser.$('#search').setValue(QUERY);
     await browser.keys('Enter');
@@ -209,7 +267,7 @@ describe('EditChain GPU history renderer', () => {
       if (!/^1 of \d+\+?$/.test(text)) return false;
       const cur = document.querySelector('.row-find-current');
       return !!cur && !!cur.getAttribute('data-key');
-    }), { timeout: 300000, interval: 200, timeoutMsg: 'GPU find did not settle' });
+    }), { timeout: 300000, interval: 200, timeoutMsg: 'Rust find did not settle' });
     const findState = await browser.execute(() => {
       const counter = document.getElementById('search-counter');
       const cur = document.querySelector('.row-find-current');
@@ -228,7 +286,7 @@ describe('EditChain GPU history renderer', () => {
     await browser.waitUntil(async () => browser.execute(() => {
       const text = (document.getElementById('search-counter')?.textContent || '').trim();
       return /^2 of \d+\+?$/.test(text) && !!document.querySelector('.row-find-current');
-    }), { timeout: 30000, timeoutMsg: 'GPU find did not advance to match 2' });
+    }), { timeout: 30000, timeoutMsg: 'Rust find did not advance to match 2' });
     // Clear the find session through the input handler (no reload, no JSON).
     await browser.execute(() => {
       const input = document.getElementById('search');
@@ -238,7 +296,7 @@ describe('EditChain GPU history renderer', () => {
     await browser.waitUntil(async () => browser.execute(() => {
       const text = (document.getElementById('search-counter')?.textContent || '').trim();
       return text === '' && !document.querySelector('.row-find-current');
-    }), { timeout: 30000, timeoutMsg: 'GPU find did not clear' });
+    }), { timeout: 30000, timeoutMsg: 'Rust find did not clear' });
 
     // Scrolling: page the production virtual window (fetch + render on scroll)
     // and return to the top.
@@ -293,9 +351,9 @@ describe('EditChain GPU history renderer', () => {
     expect(roving).toBe(2);
 
     // --- Single-panel contract artifact --------------------------------------
-    // Record the GPU contract exercised above. Renderer equivalence against
-    // the CPU/SVG renderer is NOT asserted here: it is the offscreen
-    // regression oracle (test/harness/functionalParity.test.js +
+    // Record the Rust renderer contract exercised above. Renderer equivalence
+    // against the CPU/SVG oracle renderer is NOT asserted here: it is the
+    // offscreen regression oracle (test/harness/functionalParity.test.js +
     // scripts/ui-gpu-preview.mjs).
     fs.mkdirSync(TRACE_DIR, { recursive: true });
     fs.writeFileSync(path.join(TRACE_DIR, 'e2e-history-gpu-contract.json'), JSON.stringify({
@@ -306,6 +364,9 @@ describe('EditChain GPU history renderer', () => {
       mirrorRows: debug.mirrorRows,
       canvasCount: debug.canvasCount,
       foreignCanvasCount: debug.foreignCanvasCount,
+      fragmentCount: debug.fragmentCount,
+      fragmentMissing: debug.fragmentMissing,
+      maxAlignDelta: debug.maxAlignDelta,
       renderCount: debug.renderCount,
       vertexCount: debug.vertexCount,
       profile: { activityTotal, rawTotal },

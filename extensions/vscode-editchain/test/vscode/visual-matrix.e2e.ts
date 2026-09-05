@@ -174,6 +174,53 @@ async function readState(): Promise<Record<string, unknown>> {
     const profileFn = (window as any).__editchainGetProfile;
     const debug = (window as any).__editchainGpuDebug;
     const metrics = typeof debug?.metrics === 'function' ? debug.metrics() : null;
+    // Per-row SVG graph fragments: exactly one aria-hidden
+    // svg.graph-row-fragment per hydrated row, centred on the row's middle.
+    let fragmentCount = 0;
+    let maxAlignDelta = 0;
+    const fragmentIssues: Array<{
+      row: number; count: number; ariaHidden: string | null;
+    }> = [];
+    const alignExamples: Array<{ row: number; delta: number }> = [];
+    for (const el of rows) {
+      const fragments = el.querySelectorAll('svg.graph-row-fragment');
+      const fragment = fragments[0] ?? null;
+      if (fragments.length !== 1 || !fragment ||
+          fragment.getAttribute('aria-hidden') !== 'true') {
+        if (fragmentIssues.length < 5) {
+          fragmentIssues.push({
+            row: Number(el.getAttribute('data-row')),
+            count: fragments.length,
+            ariaHidden: fragment ? fragment.getAttribute('aria-hidden') : null,
+          });
+        }
+        continue;
+      }
+      fragmentCount++;
+      const rowBox = el.getBoundingClientRect();
+      const svgBox = fragment.getBoundingClientRect();
+      const shapes = Array.from(fragment.querySelectorAll(
+        '.graphDot, .graphBundleCapsule'));
+      let minY = Infinity;
+      let maxY = -Infinity;
+      let any = false;
+      for (const shape of shapes) {
+        const b = shape.getBoundingClientRect();
+        if (b.width <= 0 && b.height <= 0) continue;
+        any = true;
+        if (b.top < minY) minY = b.top;
+        if (b.bottom > maxY) maxY = b.bottom;
+      }
+      const center = any ? (minY + maxY) / 2 : svgBox.top + svgBox.height / 2;
+      const delta = Math.abs(center - (rowBox.top + rowBox.height / 2));
+      if (delta > maxAlignDelta) maxAlignDelta = delta;
+      if (delta > 1 && alignExamples.length < 5) {
+        alignExamples.push({
+          row: Number(el.getAttribute('data-row')),
+          delta: Math.round(delta * 100) / 100,
+        });
+      }
+    }
     return {
       loader: debug?.loader ?? null,
       backend: typeof debug?.backend === 'function' ? debug.backend() : null,
@@ -199,6 +246,11 @@ async function readState(): Promise<Record<string, unknown>> {
         : null,
       renderCount: metrics?.renderCount ?? 0,
       vertexCount: metrics?.vertexCount ?? 0,
+      fragmentCount,
+      fragmentMissing: rows.length - fragmentCount,
+      fragmentIssues,
+      maxAlignDelta: Math.round(maxAlignDelta * 100) / 100,
+      alignExamples,
       canvasCount: document.querySelectorAll('#gpu-canvas-host canvas').length,
       foreignCanvasCount: document.querySelectorAll(
         'canvas:not(#gpu-canvas-host canvas)'
@@ -335,17 +387,20 @@ describe('EditChain History visual state matrix', () => {
     const initial = await readState();
     rendererInstanceId = initial.rendererInstanceId as string;
     expect(initial.loader).toBe('rust-history');
-    expect(['webgl', 'webgpu']).toContain(initial.backend);
+    expect(initial.backend).toBe('svg');
     expect(initial.profile).toBe('activity');
     expect(initial.dataReady).toBe(true);
     expect((initial.rowCount as number)).toBeGreaterThan(0);
     expect((initial.total as number)).toBeGreaterThan(0);
     expect(initial.hasDetail).toBe(false);
     expect(initial.scrollTop).toBe(0);
-    expect(initial.canvasCount).toBe(1);
+    expect(initial.canvasCount).toBe(0);
     expect(initial.foreignCanvasCount).toBe(0);
     expect((initial.renderCount as number)).toBeGreaterThan(0);
-    expect((initial.vertexCount as number)).toBeGreaterThan(0);
+    expect((initial.vertexCount as number)).toBe(0);
+    expect((initial.fragmentCount as number)).toBe(initial.rowCount as number);
+    expect((initial.fragmentMissing as number)).toBe(0);
+    expect((initial.maxAlignDelta as number)).toBeLessThanOrEqual(1);
     expect(initial.gridRole).toBe('grid');
     // __editchainGetTotal is the authoritative absolute-slot count (including
     // collapsed sub-op slots); aria-rowcount is the currently visible logical

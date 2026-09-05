@@ -2,11 +2,13 @@
 // artifact. The SHIPPED VS Code UI is ONE panel titled "EditChain History",
 // opened by the default `editchain-history.open` command: it loads
 // media/rust-history/loader.js as its ONLY script (the Rust shell owns the
-// whole runtime, including the wgpu canvas under #gpu-canvas-host and the
-// window.__editchainGpuDebug facade: loader, dataReady, lastError, backend,
-// snapshot, metrics, laneXAll, whenIdle). Production media/main.js and
-// media/gpu-preview/bootstrap.js are NOT loaded in production; they remain as
-// the offscreen regression-oracle side of the parity tests below.
+// whole runtime: it renders per-row SVG graph fragments — an aria-hidden
+// svg.graph-row-fragment inside every hydrated row's .graph-cell — and
+// exposes the window.__editchainGpuDebug facade: loader, dataReady,
+// lastError, backend ('svg'), snapshot, metrics, laneXAll, whenIdle).
+// Production media/main.js and media/gpu-preview/bootstrap.js are NOT loaded
+// in production; they remain as the offscreen regression-oracle side of the
+// parity tests below.
 //
 // test/harness/gpu.html is that OFFSCREEN regression-oracle page: it mirrors
 // test/harness/index.html (the same fixtures.js + fixtureBridge.js,
@@ -235,7 +237,7 @@ test('extension contributes exactly one public history command (editchain-histor
     'the extension host must not register or reference an openGpuPreview command');
 });
 
-test('no side-by-side host path: one panel titled "EditChain History" hosts the wgpu canvas', () => {
+test('no side-by-side host path: one panel titled "EditChain History" hosts the Rust per-row SVG renderer', () => {
   // A single webview panel: no distinct GPU panel identity, no companion
   // column-two reveal, no second panel title.
   assert.doesNotMatch(EXTENSION_SOURCE, /openGpuPreviewView/,
@@ -246,7 +248,8 @@ test('no side-by-side host path: one panel titled "EditChain History" hosts the 
     'no column-two reveal of a companion GPU panel may remain');
   assert.doesNotMatch(EXTENSION_SOURCE, /EditChain History — Rust\/WASM GPU/,
     'the side-by-side GPU panel title must not exist');
-  // The DEFAULT panel is the history panel, and it hosts the GPU canvas.
+  // The DEFAULT panel is the history panel, and it hosts the Rust per-row SVG
+  // renderer (no canvas surface is created).
   assert.match(EXTENSION_SOURCE, /createWebviewPanel\(/,
     'the host still creates the history webview panel');
   assert.match(EXTENSION_SOURCE, /'EditChain History'/,
@@ -254,7 +257,7 @@ test('no side-by-side host path: one panel titled "EditChain History" hosts the 
   assert.match(EXTENSION_SOURCE, /rust-history', 'loader\.js/,
     'the single panel HTML loads the Rust/WASM loader');
   assert.match(EXTENSION_SOURCE, /gpu-canvas-host/,
-    'the single panel HTML carries the wgpu canvas host');
+    'the single panel HTML keeps the inert canvas-host scaffold (scaffold/oracle parity)');
   assert.match(EXTENSION_SOURCE, /script-src \$\{cspSource\} 'wasm-unsafe-eval'/,
     'CSP permits local wasm initialization');
   assert.match(EXTENSION_SOURCE, /connect-src \$\{cspSource\}/,

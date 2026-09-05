@@ -8,14 +8,15 @@ import path from 'node:path';
 // gpu-preview.e2e.ts: the DEFAULT `editchain-history.open` command opens ONE
 // panel titled "EditChain History", which loads the exact production scaffold
 // (media/main.css + media/gpu-preview/gpu-preview.css) and ONLY the tiny
-// media/rust-history/loader.js bootstrap. Rust/web-sys owns the DOM and
-// accessibility surface, while wgpu owns the transparent graph canvas. The
-// test drives the production controls
-// (profile, find-in-chain, scroll, selection) inside that GPU-backed webview,
-// asserts the debug renderer contract (backend, snapshot, renderCount/
-// vertexCount, canvas over .graph-cell), and captures a single-panel
-// screenshot. There is deliberately no second panel and no side-by-side
-// capture — CPU-vs-GPU parity lives in the offscreen regression oracle
+// media/rust-history/loader.js bootstrap. Rust/web-sys owns the DOM,
+// accessibility surface, and the per-row SVG graph fragments (no canvas
+// surface is created). The test drives the production controls (profile,
+// find-in-chain, scroll, selection) inside that Rust-backed webview, asserts
+// the debug renderer contract (backend 'svg', snapshot, renderCount > 0,
+// vertexCount 0, zero canvases, one aria-hidden svg.graph-row-fragment per
+// hydrated row), and captures a single-panel screenshot. There is
+// deliberately no second panel and no side-by-side capture — CPU-vs-GPU
+// parity lives in the offscreen regression oracle
 // (test/harness/functionalParity.test.js + scripts/ui-gpu-preview.mjs).
 //
 // Requires the Rust production assets (media/rust-history/loader.js and
@@ -40,9 +41,9 @@ export const config: Options.Testrunner = {
       'wdio:vscodeOptions': {
         extensionPath: path.resolve(__dirname, '../..'),
         workspacePath: repositoryPath,
-        // CI/Xvfb has no hardware GPU. Keep WebGL available through Chromium's
-        // supported SwiftShader fallback so the real-webview run exercises the
-        // same deterministic backend as the standalone parity harness.
+        // CI/Xvfb has no hardware GPU. The production panel renders per-row
+        // SVG, so keep SwiftShader WebGL enabled to match the wdio base
+        // config and support any other webview/GPU surfaces.
         vscodeArgs: {
           useAngle: 'swiftshader',
           enableUnsafeSwiftshader: true,

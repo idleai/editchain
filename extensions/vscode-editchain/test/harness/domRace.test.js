@@ -428,9 +428,12 @@ test('prepending same-group rows removes a stale chip left by a mid-group reanch
 
     // Force a MID-GROUP reanchor (viewport-resize path rebuilds the window
     // from cache). reanchorTo marks the first rendered row (120) as a group
-    // start solely because it is the window's top edge — even though the real
-    // repo:b start is 100. Prepending same-group rows above it must strip that
-    // chip instead of leaving a duplicate stale boundary.
+    // start solely because it is the window's top edge — the documented
+    // window-edge rule shared by prependRowsAbove and the C2 layout check, so
+    // chip positions stay identical before/after a full rebuild. The chip at
+    // 120 must therefore SURVIVE while 120 is the window edge, even though the
+    // real repo:b start is 100; prepending same-group rows above it is what
+    // strips it (below), never a background prepend/trim cycle.
     await page.evaluate(() => {
       window.__chipProbeRowRef = document.querySelector('.row');
     });
@@ -441,11 +444,13 @@ test('prepending same-group rows removes a stale chip left by a mid-group reanch
     }, { timeout: 10000, polling: 50 });
     await page.evaluate(() => window.__editchainDebug.whenIdle(20000));
     assert.equal(await renderTop(), 120, 'the mid-group reanchor must keep the same window');
-    assert.deepEqual(await chips(), [200], 'no stale chip may survive the mid-group reanchor');
+    assert.deepEqual(await chips(), [120, 200], 'the window-edge chip must survive the mid-group reanchor');
 
     // Scroll UP across the 100 boundary: prependRowsAbove rebuilds rows
-    // 0..119. The chip at the old window edge (120) must not reappear, so the
-    // final chips match a full reanchor of the same window.
+    // 0..119. The chip at the old window edge (120) was only justified by the
+    // edge; the prepend boundary re-eval must strip it now that a same-group
+    // row renders above it, so the final chips match a full reanchor of the
+    // same window.
     await setScroll(300);
     await page.waitForFunction(() => {
       const g = window.__editchainGraphState();

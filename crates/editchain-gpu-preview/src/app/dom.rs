@@ -1,4 +1,4 @@
-//! Rust-owned browser slice (3A): window/frame/lane presentation + DOM shell.
+//! Rust-owned browser slice (3A): window/lane presentation + DOM shell.
 //!
 //! This module is the first coherent vertical slice of the Rust-owned history
 //! view and contains two layers:
@@ -11,22 +11,28 @@
 //!     width.
 //!   - [`window_rows`] — the ordered `RowSpec` plan for a rendered window
 //!     (group-start chips, placeholders, visible/absolute mapping).
-//!   - [`canvas_view`] / [`frame_rows`] / [`build_frame_value`] — the
-//!     `GpuRenderer` frame contract serialized directly from cached/`RowSpec`
-//!     data with no DOM observation.
-//! - The wasm32-only [`HistoryDom`] shell: creates the single canvas under
-//!   `#gpu-canvas-host`, renders rows as real DOM/text nodes (never
-//!   application `innerHTML` strings), and owns the scroll-window mutations
-//!   and Activity/Raw profile-control state.
+//!   - [`row_graph_items`] — the per-row SVG graph fragments (production
+//!     `buildGraphCell`): local-cell lane halves, cross-lane transition
+//!     halves, the centered node dot, and bundle glyphs. Lane centers are
+//!     pinned to the natural layout, so divider resizing clips/reveals the
+//!     cell instead of rescaling the topology.
+//!   - [`rows_outside_visible`] — trimming decisions that map visible bounds
+//!     through the Activity collapsed-mode absolute ids (production
+//!     `trimTop`/`trimBottom`).
+//! - The wasm32-only [`HistoryDom`] shell: renders rows as real DOM/text
+//!   nodes (never application `innerHTML` strings), paints each `.graph-cell`
+//!   SVG from the pure items, and owns the scroll-window mutations and
+//!   Activity/Raw profile-control state. The obsolete fixed-viewport wgpu
+//!   canvas overlay is gone — the graph scrolls inside the row DOM.
 //!
-//! The host message bridge, `HistoryAppState` ownership, and `GpuRenderer`
-//! instantiation live in the wasm32 shell in `crate::lib`; they drive this
-//! module's pure plans into the DOM.
+//! The host message bridge and `HistoryAppState` ownership live in the wasm32
+//! shell in `crate::lib`; they drive this module's pure plans into the DOM.
 
+#[cfg(test)]
 use serde_json::{json, Value};
 
 use super::host::row as row_reader;
-use super::rows::{RowSpec, ViewMode};
+use super::rows::{GraphData, RowSpec, ViewMode};
 use super::state::{HistoryAppState, Profile, ROW_H};
 
 // ---------------------------------------------------------------------------
@@ -53,11 +59,19 @@ pub(crate) const MIN_LANE_W: f64 = 1.5;
 /// Production `DOT_R`: node-dot radius before compression shrinking.
 pub(crate) const DOT_R: f64 = 4.0;
 
-/// Production graph stroke width (media/main.css Pulse override).
+/// Production graph stroke width (media/main.css Pulse override). Retained as
+/// a test-only constant with the `GpuRenderer` frame contract it feeds.
+#[cfg(test)]
 pub(crate) const LINE_WIDTH_CSS_PX: f64 = 1.4;
 
 /// Production bundle glyph half-height/span (CSS px).
 pub(crate) const BUNDLE_HALF_HEIGHT_CSS_PX: f64 = 7.0;
+
+/// Production bundle terminal radius ratio (`BUNDLE_TERMINAL_RATIO`).
+pub(crate) const BUNDLE_TERMINAL_RATIO_CSS_PX: f64 = 0.75;
+
+/// Production bundle terminal radius floor (`BUNDLE_TERMINAL_MIN`).
+pub(crate) const BUNDLE_TERMINAL_MIN_CSS_PX: f64 = 1.5;
 
 /// Production bundle capsule margin (CSS px).
 pub(crate) const BUNDLE_MARGIN_CSS_PX: f64 = 1.0;
@@ -83,13 +97,17 @@ pub(crate) const GRAPH_MAX_W_NARROW: f64 = 120.0;
 /// Production compact-rail breakpoint width (CSS px, `<=480px`).
 pub(crate) const COMPACT_RAIL_MAX_WIDTH: f64 = 480.0;
 
-/// Bootstrap `MAX_SURFACE_EDGE` cap for WebGL texture limits.
+/// Bootstrap `MAX_SURFACE_EDGE` cap for WebGL texture limits (test-only, with
+/// the obsolete canvas surface descriptor it bounds).
+#[cfg(test)]
 pub(crate) const MAX_SURFACE_EDGE: f64 = 2048.0;
 
 /// Bootstrap overscan rows kept visible above/below the canvas viewport.
 pub(crate) const OVERSCAN_ROWS: f64 = 1.0;
 
-/// The editor background the frame reports when the CSS variable is absent.
+/// The editor background the obsolete GPU frame reported when the CSS variable
+/// was absent (test-only, with the frame-contract fixtures).
+#[cfg(test)]
 pub(crate) const DEFAULT_EDITOR_BACKGROUND_HEX: &str = "#1e1e1e";
 
 /// Round a CSS-pixel value to two decimals like the production formatter.
@@ -125,6 +143,345 @@ pub(crate) fn f64_round_to_i64(value: f64) -> i64 {
         }
     }
     low
+}
+
+/// Production `COLORS` lane palette as CSS hex strings (media/main.js). The
+/// per-row SVG graph paints every lane by wrapping modulo this length, exactly
+/// like the production `buildGraphCell`.
+pub(crate) const LANE_COLORS_HEX: [&str; 10] = [
+    "#48f1dc", "#a18aff", "#6ee7a2", "#5ca8ff", "#ffc86a", "#ff70a6", "#72ddf7", "#c77dff",
+    "#64dfdf", "#ff8fa3",
+];
+
+/// The SVG namespace every per-row graph cell fragment lives in.
+#[cfg(target_arch = "wasm32")]
+pub(crate) const SVG_NS: &str = "http://www.w3.org/2000/svg";
+
+/// The per-row SVG graph inputs for one rendered row: the pinned lane centers
+/// and dot radius from the natural layout plus the rendered cell width.
+/// Lane centers never rescale with the column width — resizing the divider
+/// clips/reveals the cell instead of re-spacing the topology.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GraphCellSpec {
+    /// Lane-center X positions (CSS px, from the natural layout).
+    pub(crate) lane_x: Vec<f64>,
+    /// Node-dot radius (CSS px, compressed with dense lanes).
+    pub(crate) dot_radius: f64,
+    /// Rendered cell width (CSS px; divider override or natural).
+    pub(crate) width: f64,
+    /// Cell height (CSS px; always `ROW_H` = 34).
+    pub(crate) height: f64,
+}
+
+/// One small pure description of an SVG graph fragment. The web layer turns
+/// these into real SVG DOM nodes (never application `innerHTML` strings), and
+/// the native tests verify the exact production geometry (`buildGraphCell`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SvgItem {
+    /// A vertical lane half-segment entering from above or leaving below.
+    Line {
+        class: &'static str,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+        stroke: &'static str,
+    },
+    /// One half of a cross-lane quadratic transition (source or destination).
+    Path {
+        class: &'static str,
+        d: String,
+        stroke: &'static str,
+    },
+    /// A node dot or a typed Activity-bundle terminal.
+    Circle {
+        class: &'static str,
+        cx: f64,
+        cy: f64,
+        r: f64,
+        fill: &'static str,
+    },
+    /// The typed Activity-bundle capsule.
+    Rect {
+        class: &'static str,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        rx: f64,
+        fill: &'static str,
+    },
+}
+
+/// The bundle glyph metrics for a recognized typed Activity-bundle row
+/// (production `bundleTerminalRadius` plus the fixed half-span constants).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BundleGlyph {
+    pub(crate) term_r: f64,
+    pub(crate) entry_y: f64,
+    pub(crate) exit_y: f64,
+}
+
+/// Format one SVG coordinate like production `fmt`: round to two decimals and
+/// emit the shortest exact decimal (`String(Math.round(v * 100) / 100)`).
+#[must_use]
+pub(crate) fn svg_number(value: f64) -> String {
+    round2(value).to_string()
+}
+
+/// The production lane color for `lane` as a CSS hex (wraps modulo the
+/// palette length, exactly like `COLORS[lane % COLORS.length]`).
+#[must_use]
+pub(crate) fn lane_color_hex(lane: u32) -> &'static str {
+    let len = u32::try_from(LANE_COLORS_HEX.len()).unwrap_or(10);
+    LANE_COLORS_HEX
+        .get(usize::try_from(lane.checked_rem(len).unwrap_or(0)).unwrap_or(0))
+        .copied()
+        .unwrap_or_else(|| LANE_COLORS_HEX.first().copied().unwrap_or("#48f1dc"))
+}
+
+/// The CSS-pixel x center of `lane` from the cell's pinned lane positions.
+/// Unknown lanes fall back to the last supplied center, then the cell middle.
+#[must_use]
+pub(crate) fn lane_center_x(lane: u32, cell: &GraphCellSpec) -> f64 {
+    let index = usize::try_from(lane).unwrap_or(0);
+    cell.lane_x
+        .get(index)
+        .copied()
+        .unwrap_or_else(|| cell.lane_x.last().copied().unwrap_or(cell.width / 2.0))
+}
+
+/// Midpoint of two SVG coordinates (production `midpoint`).
+#[must_use]
+fn midpoint(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5)
+}
+
+/// One compact quadratic SVG path with stable two-decimal coordinates
+/// (production `quadraticPath`).
+#[must_use]
+fn quadratic_path_d(start: (f64, f64), control: (f64, f64), end: (f64, f64)) -> String {
+    format!(
+        "M {} {} Q {} {} {} {}",
+        svg_number(start.0),
+        svg_number(start.1),
+        svg_number(control.0),
+        svg_number(control.1),
+        svg_number(end.0),
+        svg_number(end.1),
+    )
+}
+
+/// One cross-lane transition whose anchors this row actually owns, mirroring
+/// production's `rendered` list in `buildGraphCell`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RenderedTransition {
+    from_lane: u32,
+    to_lane: u32,
+    start_at_dot: bool,
+    end_at_dot: bool,
+}
+
+/// Build the ordered per-row SVG graph fragments for one row (production
+/// `buildGraphCell`): top/bottom lane halves, cross-lane transition halves,
+/// then the node dot or the bundle capsule. Geometry is expressed in local
+/// cell coordinates (`0..height`) with the node marker centered at
+/// `height / 2` (17 for `ROW_H`), so the cell scrolls with its row.
+#[must_use]
+pub(crate) fn row_graph_items(graph: &GraphData, cell: &GraphCellSpec) -> Vec<SvgItem> {
+    let mid_y = cell.height / 2.0;
+    let node_lane = graph.lane;
+    let bundle = if graph.is_bundle {
+        Some(BundleGlyph {
+            term_r: (cell.dot_radius * BUNDLE_TERMINAL_RATIO_CSS_PX)
+                .max(BUNDLE_TERMINAL_MIN_CSS_PX),
+            entry_y: mid_y - BUNDLE_HALF_HEIGHT_CSS_PX,
+            exit_y: mid_y + BUNDLE_HALF_HEIGHT_CSS_PX,
+        })
+    } else {
+        None
+    };
+    // Resolve each transition's real anchors before drawing anything (same
+    // rules as production): a side is dot-anchored when the transition starts
+    // or ends on this row's own node; a boundary-anchored side must be backed
+    // by the adjacent row's geometry. Dangling stubs are dropped.
+    let mut rendered = Vec::new();
+    for (from_lane, to_lane) in &graph.transitions {
+        let start_at_dot = node_lane == *from_lane;
+        let end_at_dot = node_lane == *to_lane;
+        let end_at_boundary = !end_at_dot && graph.below.contains(to_lane);
+        let start_connected = start_at_dot || graph.above.contains(from_lane);
+        if !start_connected || (!end_at_boundary && !end_at_dot) {
+            continue;
+        }
+        rendered.push(RenderedTransition {
+            from_lane: *from_lane,
+            to_lane: *to_lane,
+            start_at_dot,
+            end_at_dot,
+        });
+    }
+    // The halves a rendered transition path actually covers: the from-lane's
+    // top half (only when the path begins at the boundary) and the to-lane's
+    // bottom half (only when the path ends at the boundary). Dot-anchored
+    // sides leave the neighbouring generic half in place.
+    let mut owns_top = Vec::new();
+    let mut owns_bottom = Vec::new();
+    for transition in &rendered {
+        if !transition.start_at_dot && !owns_top.contains(&transition.from_lane) {
+            owns_top.push(transition.from_lane);
+        }
+        if !transition.end_at_dot && !owns_bottom.contains(&transition.to_lane) {
+            owns_bottom.push(transition.to_lane);
+        }
+    }
+    let mut items = Vec::new();
+    for lane in &graph.above {
+        if owns_top.contains(lane) {
+            continue;
+        }
+        let x = lane_center_x(*lane, cell);
+        let end_y = bundle
+            .filter(|_| *lane == node_lane)
+            .map_or(mid_y, |glyph| glyph.entry_y);
+        items.push(SvgItem::Line {
+            class: "graphLine",
+            x1: x,
+            y1: 0.0,
+            x2: x,
+            y2: end_y,
+            stroke: lane_color_hex(*lane),
+        });
+    }
+    for lane in &graph.below {
+        if owns_bottom.contains(lane) {
+            continue;
+        }
+        let x = lane_center_x(*lane, cell);
+        let start_y = bundle
+            .filter(|_| *lane == node_lane)
+            .map_or(mid_y, |glyph| glyph.exit_y);
+        items.push(SvgItem::Line {
+            class: "graphLine",
+            x1: x,
+            y1: start_y,
+            x2: x,
+            y2: cell.height,
+            stroke: lane_color_hex(*lane),
+        });
+    }
+    for transition in rendered {
+        items.extend(transition_items(transition, cell, bundle.as_ref(), mid_y));
+    }
+    // A sub-op row draws NO node mark — it is a pass-through region. Only
+    // top-level rows get the ordinary dot or the bundle capsule.
+    if !graph.is_subop {
+        let colour = lane_color_hex(node_lane);
+        if let Some(glyph) = bundle {
+            let x = lane_center_x(node_lane, cell);
+            let cap_w = glyph.term_r * 2.0 + BUNDLE_MARGIN_CSS_PX * 2.0;
+            let cap_h = (glyph.exit_y - glyph.entry_y) + glyph.term_r * 2.0;
+            items.push(SvgItem::Rect {
+                class: "graphBundleCapsule",
+                x: x - cap_w / 2.0,
+                y: glyph.entry_y - glyph.term_r,
+                width: cap_w,
+                height: cap_h,
+                rx: cap_w / 2.0,
+                fill: colour,
+            });
+            items.push(SvgItem::Circle {
+                class: "graphBundleTerminal graphBundleEntry",
+                cx: x,
+                cy: glyph.entry_y,
+                r: glyph.term_r,
+                fill: colour,
+            });
+            items.push(SvgItem::Circle {
+                class: "graphBundleTerminal graphBundleExit",
+                cx: x,
+                cy: glyph.exit_y,
+                r: glyph.term_r,
+                fill: colour,
+            });
+        } else {
+            items.push(SvgItem::Circle {
+                class: "graphDot",
+                cx: lane_center_x(node_lane, cell),
+                cy: mid_y,
+                r: cell.dot_radius,
+                fill: colour,
+            });
+        }
+    }
+    items
+}
+
+/// The two exact path halves for one cross-lane transition (production
+/// `buildTransitionPaths`): the source half and the destination half with a
+/// shared tangent-continuous seam.
+#[must_use]
+fn transition_items(
+    transition: RenderedTransition,
+    cell: &GraphCellSpec,
+    bundle: Option<&BundleGlyph>,
+    mid_y: f64,
+) -> Vec<SvgItem> {
+    let x1 = lane_center_x(transition.from_lane, cell);
+    let x2 = lane_center_x(transition.to_lane, cell);
+    let start = (
+        x1,
+        if transition.start_at_dot {
+            bundle.map_or(mid_y, |glyph| glyph.exit_y)
+        } else {
+            0.0
+        },
+    );
+    let end = (
+        x2,
+        if transition.end_at_dot {
+            bundle.map_or(mid_y, |glyph| glyph.entry_y)
+        } else {
+            cell.height
+        },
+    );
+    let (src_control, dst_control, seam) = if transition.start_at_dot != transition.end_at_dot {
+        // One endpoint is the row's node: a single convex quadratic split at
+        // t = 0.5; the control point gives the boundary endpoint a vertical
+        // tangent and the node endpoint an outward horizontal tangent.
+        let control = if transition.start_at_dot {
+            (x2, start.1)
+        } else {
+            (x1, end.1)
+        };
+        let src = midpoint(start, control);
+        let dst = midpoint(control, end);
+        (src, dst, midpoint(src, dst))
+    } else if !transition.start_at_dot {
+        // Both endpoints are row boundaries: two convex halves meet with an
+        // exact horizontal tangent at the geometric centre.
+        let seam = ((x1 + x2) * 0.5, (start.1 + end.1) * 0.5);
+        ((x1, seam.1), (x2, seam.1), seam)
+    } else {
+        // Defensive fallback for the impossible ordinary-row case where both
+        // different lanes claim the same node: a smooth straight quadratic.
+        let control = midpoint(start, end);
+        let src = midpoint(start, control);
+        let dst = midpoint(control, end);
+        (src, dst, midpoint(src, dst))
+    };
+    vec![
+        SvgItem::Path {
+            class: "graphTransition graphTransitionSrc",
+            d: quadratic_path_d(start, src_control, seam),
+            stroke: lane_color_hex(transition.from_lane),
+        },
+        SvgItem::Path {
+            class: "graphTransition graphTransitionDst",
+            d: quadratic_path_d(seam, dst_control, end),
+            stroke: lane_color_hex(transition.to_lane),
+        },
+    ]
 }
 
 /// The pure lane/column layout for the Rust-owned graph (Slice 3A).
@@ -402,7 +759,35 @@ pub(crate) fn window_specs(state: &HistoryAppState, top: i64, bottom: i64) -> Ve
         .collect()
 }
 
+/// The rendered absolute row ids that fall outside the kept VISIBLE window
+/// `[keep_top, keep_bottom]`.
+///
+/// Mirrors production `trimTop`/`trimBottom`: visible index bounds are mapped
+/// through the Activity collapsed-mode mapping (`visibleIndexForAbs`) instead
+/// of comparing `data-row` absolute values directly — they diverge whenever
+/// collapsed sub-op slots hide absolute indices.
+#[must_use]
+pub(crate) fn rows_outside_visible(
+    state: &HistoryAppState,
+    rendered: &[i64],
+    keep_top: i64,
+    keep_bottom: i64,
+) -> Vec<i64> {
+    rendered
+        .iter()
+        .copied()
+        .filter(|abs| {
+            state
+                .visible_index_for_abs(*abs)
+                .is_none_or(|vis| vis < keep_top || vis > keep_bottom)
+        })
+        .collect()
+}
+
 /// The bounded canvas surface descriptor (bootstrap `canvasDimensions()`).
+/// The wgpu overlay is obsolete — this contract is retained for its native
+/// geometry tests only.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct CanvasView {
     /// CSS-pixel surface size (graph column width × rows viewport height).
@@ -416,8 +801,9 @@ pub(crate) struct CanvasView {
 }
 
 /// Size the canvas surface like bootstrap.js: DPR-aware, bounded so a long or
-/// narrow window never exceeds common WebGL texture limits. CSS size is capped
-/// at 1 CSS px so the surface descriptor always stays renderable.
+/// narrow window never exceeds common WebGL texture limits (test-only helper
+/// for the obsolete wgpu overlay contract).
+#[cfg(test)]
 pub(crate) fn canvas_view(css_width: f64, css_height: f64, device_pixel_ratio: f64) -> CanvasView {
     let preferred_scale = device_pixel_ratio.clamp(1.0, 2.0);
     let scale = preferred_scale
@@ -502,7 +888,9 @@ pub(crate) fn frame_rows(
     out
 }
 
-/// Serialize the complete frame contract (graph + rows) as JSON.
+/// Serialize the complete obsolete GPU frame contract (graph + rows) as JSON;
+/// retained as a test-only fixture for the `GpuRenderer` geometry contract.
+#[cfg(test)]
 pub(crate) fn build_frame_value(
     layout: &GraphLayout,
     background_color: &str,
@@ -574,6 +962,8 @@ mod web {
         pub(crate) aria_rowcount: i64,
         /// The effective graph column width (label accessibility decision).
         pub(crate) graph_width_css: f64,
+        /// The per-row SVG graph geometry (pinned lane centers + cell size).
+        pub(crate) graph: GraphCellSpec,
         /// Warnings/banner chrome state.
         pub(crate) status: PaneStatus,
     }
@@ -584,8 +974,8 @@ mod web {
     use wasm_bindgen::prelude::*;
 
     use super::{
-        f64_round_to_i64, i64_to_f64, ColKey, FrameRow, Profile, RowSpec,
-        DEFAULT_EDITOR_BACKGROUND_HEX, ROW_H,
+        f64_round_to_i64, i64_to_f64, ColKey, FrameRow, GraphCellSpec, GraphData, Profile, RowSpec,
+        SvgItem, ROW_H, SVG_NS,
     };
     use crate::app::rows::RowSummary;
     use crate::app::state::{FindCounterState, HistoryAppState, Viewport};
@@ -620,14 +1010,12 @@ mod web {
             .map_err(|error| js_error(format!("element #{id} has the wrong type: {error:?}")))
     }
 
-    /// The Rust-owned DOM shell (Slice 3A): owns `#rows`, the single GPU
-    /// canvas under `#gpu-canvas-host`, the status surfaces, and the profile
-    /// buttons. All row content is built with DOM/text nodes; application
+    /// The Rust-owned DOM shell (Slice 3A): owns `#rows`, the status
+    /// surfaces, and the profile buttons. All row content — including the
+    /// per-row SVG graph fragments — is built with DOM/text nodes; application
     /// strings never pass through `innerHTML`.
     pub(crate) struct HistoryDom {
         rows: web_sys::HtmlDivElement,
-        canvas_host: web_sys::HtmlDivElement,
-        canvas: web_sys::HtmlCanvasElement,
         status_live: web_sys::HtmlElement,
         gpu_status: web_sys::HtmlElement,
         gpu_backend: web_sys::HtmlElement,
@@ -638,9 +1026,6 @@ mod web {
         search_next: web_sys::HtmlButtonElement,
         profile_activity: web_sys::HtmlButtonElement,
         profile_raw: web_sys::HtmlButtonElement,
-        /// The graph column's effective CSS width (divider override or
-        /// natural); the header label accessibility decision reads it.
-        graph_width: Cell<f64>,
         /// Measured once: the smallest graph column width that renders the
         /// "Graph" columnheader label without clipping (`graphLabelMinW`).
         graph_label_min_width: Cell<Option<f64>>,
@@ -651,15 +1036,14 @@ mod web {
             formatter
                 .debug_struct("HistoryDom")
                 .field("rows", &"#rows")
-                .field("canvas_id", &self.canvas.id())
-                .field("canvas_host", &"#gpu-canvas-host")
                 .finish_non_exhaustive()
         }
     }
 
     impl HistoryDom {
-        /// Query the page scaffold and create the single canvas under
-        /// `#gpu-canvas-host` (idempotent when the page already hosts one).
+        /// Query the page scaffold. The obsolete `#gpu-canvas-host` overlay is
+        /// intentionally left untouched: the per-row SVG graph cells replaced
+        /// it, so no canvas surface is ever created on this path.
         pub(crate) fn new() -> Result<HistoryDom, JsValue> {
             let window =
                 web_sys::window().ok_or_else(|| js_error("browser window is unavailable"))?;
@@ -667,8 +1051,6 @@ mod web {
                 .document()
                 .ok_or_else(|| js_error("browser document is unavailable"))?;
             let rows = require_element(&document, "rows")?;
-            let canvas_host: web_sys::HtmlDivElement =
-                require_element(&document, "gpu-canvas-host")?;
             let status_live = require_element(&document, "status-live")?;
             let gpu_status = require_element(&document, "gpu-status")?;
             let gpu_backend = require_element(&document, "gpu-backend")?;
@@ -680,29 +1062,8 @@ mod web {
             let profile_activity = require_element(&document, "profile-activity")?;
             let profile_raw = require_element(&document, "profile-raw")?;
 
-            let existing = canvas_host.query_selector("canvas").map_err(js_err_from)?;
-            let canvas = if let Some(existing) = existing {
-                existing
-                    .dyn_into::<web_sys::HtmlCanvasElement>()
-                    .map_err(|error| {
-                        js_error(format!(
-                            "element under #gpu-canvas-host is not a canvas: {error:?}"
-                        ))
-                    })?
-            } else {
-                let created: web_sys::HtmlCanvasElement = document
-                    .create_element("canvas")?
-                    .dyn_into()
-                    .map_err(js_err_from)?;
-                created.set_id("gpu-canvas");
-                drop(canvas_host.append_child(&created).map_err(js_err_from)?);
-                created
-            };
-
             Ok(HistoryDom {
                 rows,
-                canvas_host,
-                canvas,
                 status_live,
                 gpu_status,
                 gpu_backend,
@@ -713,7 +1074,6 @@ mod web {
                 search_next,
                 profile_activity,
                 profile_raw,
-                graph_width: Cell::new(0.0),
                 graph_label_min_width: Cell::new(None),
             })
         }
@@ -756,37 +1116,6 @@ mod web {
                 .and_then(|value| value.as_f64())
                 .filter(|width| *width > 0.0)
                 .unwrap_or(fallback)
-        }
-
-        /// The device pixel ratio (bounded by the renderer contract).
-        pub(crate) fn device_pixel_ratio() -> f64 {
-            web_sys::window().map_or(1.0, |window| window.device_pixel_ratio())
-        }
-
-        /// The editor background CSS color (frame `background_color`).
-        pub(crate) fn editor_background_color() -> String {
-            let Some(window) = web_sys::window() else {
-                return DEFAULT_EDITOR_BACKGROUND_HEX.to_owned();
-            };
-            let Some(document) = window.document() else {
-                return DEFAULT_EDITOR_BACKGROUND_HEX.to_owned();
-            };
-            let Some(root) = document.document_element() else {
-                return DEFAULT_EDITOR_BACKGROUND_HEX.to_owned();
-            };
-            let Some(style) = window.get_computed_style(&root).ok().flatten() else {
-                return DEFAULT_EDITOR_BACKGROUND_HEX.to_owned();
-            };
-            let value = style
-                .get_property_value("--vscode-editor-background")
-                .unwrap_or_default()
-                .trim()
-                .to_owned();
-            if value.is_empty() {
-                DEFAULT_EDITOR_BACKGROUND_HEX.to_owned()
-            } else {
-                value
-            }
         }
 
         /// Apply an integer scroll offset (whole CSS pixels).
@@ -873,13 +1202,12 @@ mod web {
             out
         }
 
-        /// Every rendered absolute row index (real or placeholder) outside the
-        /// kept visible window `[keep_top, keep_bottom]`. The shell trims by
-        /// scanning the DOM (not by re-deriving the pre-step window) so rows
-        /// added by a prepend/append during the same transition are removed
-        /// too — stale rows would otherwise survive and later prepends would
-        /// duplicate them.
-        pub(crate) fn rows_outside(&self, keep_top: i64, keep_bottom: i64) -> Vec<i64> {
+        /// Every rendered absolute row index (real or placeholder) in DOM
+        /// order. The shell trims by scanning the DOM (not by re-deriving the
+        /// pre-step window) so rows added by a prepend/append during the same
+        /// transition are removed too — stale rows would otherwise survive
+        /// and later prepends would duplicate them.
+        pub(crate) fn rendered_row_abs(&self) -> Vec<i64> {
             let Some(wrap) = self.wrap() else {
                 return Vec::new();
             };
@@ -896,13 +1224,21 @@ mod web {
                 };
                 if let Some(raw) = element.get_attribute("data-row") {
                     if let Ok(abs) = raw.trim().parse::<i64>() {
-                        if abs < keep_top || abs > keep_bottom {
-                            out.push(abs);
-                        }
+                        out.push(abs);
                     }
                 }
             }
             out
+        }
+
+        /// Position `.table-wrap` at a rendered-window offset in CSS px
+        /// (production `setWrapTop`).
+        pub(crate) fn set_wrap_top(&self, top_px: i64) -> Result<(), JsValue> {
+            let Some(wrap) = self.wrap() else {
+                return Ok(());
+            };
+            wrap.style().set_property("top", &format!("{top_px}px"))?;
+            Ok(())
         }
 
         /// Replace `#rows` with a full-pane message (`showViewMessage`).
@@ -994,6 +1330,7 @@ mod web {
                 wrap_top_px,
                 aria_rowcount,
                 graph_width_css,
+                graph,
                 status,
             } = options;
             let document = Self::document()?;
@@ -1033,7 +1370,7 @@ mod web {
                 .set_property("top", &format!("{wrap_top_px}px"))?;
 
             for spec in specs {
-                let row = build_row(&document, spec, col_style)?;
+                let row = build_row(&document, spec, col_style, graph)?;
                 drop(wrap.append_child(&row).map_err(js_err_from)?);
             }
             drop(spacer.append_child(&wrap).map_err(js_err_from)?);
@@ -1097,13 +1434,14 @@ mod web {
             &self,
             specs: &[RowSpec],
             col_style: &str,
+            graph: &GraphCellSpec,
         ) -> Result<(), JsValue> {
             let Some(wrap) = self.wrap() else {
                 return Ok(());
             };
             let document = Self::document()?;
             for spec in specs {
-                let row = build_row(&document, spec, col_style)?;
+                let row = build_row(&document, spec, col_style, graph)?;
                 let node = node_of(&row)?;
                 drop(wrap.append_child(&node).map_err(js_err_from)?);
             }
@@ -1117,21 +1455,26 @@ mod web {
             specs: &[RowSpec],
             col_style: &str,
             wrap_top_px: i64,
+            graph: &GraphCellSpec,
         ) -> Result<(), JsValue> {
             let Some(wrap) = self.wrap() else {
                 return Ok(());
             };
             let document = Self::document()?;
-            let mut anchor: Option<web_sys::Node> = wrap.first_child();
+            // Insert all new rows as ONE fragment before the first existing
+            // child, preserving the ascending spec order (production
+            // `insertAdjacentHTML('afterbegin', html)`). Inserting each node
+            // before a moving anchor would reverse the run.
+            let fragment = document.create_document_fragment();
             for spec in specs {
-                let row = build_row(&document, spec, col_style)?;
+                let row = build_row(&document, spec, col_style, graph)?;
                 let node = node_of(&row)?;
-                drop(
-                    wrap.insert_before(&node, anchor.as_ref())
-                        .map_err(js_err_from)?,
-                );
-                anchor = Some(node);
+                drop(fragment.append_child(&node).map_err(js_err_from)?);
             }
+            drop(
+                wrap.insert_before(&fragment, wrap.first_child().as_ref())
+                    .map_err(js_err_from)?,
+            );
             wrap.style()
                 .set_property("top", &format!("{wrap_top_px}px"))?;
             Ok(())
@@ -1144,6 +1487,7 @@ mod web {
             abs: i64,
             spec: &RowSpec,
             col_style: &str,
+            graph: &GraphCellSpec,
         ) -> Result<(), JsValue> {
             let Some(wrap) = self.wrap() else {
                 return Ok(());
@@ -1153,7 +1497,7 @@ mod web {
                 return Ok(());
             };
             let document = Self::document()?;
-            let new = build_row(&document, spec, col_style)?;
+            let new = build_row(&document, spec, col_style, graph)?;
             let parent = old
                 .parent_node()
                 .ok_or_else(|| js_error("row has no parent"))?;
@@ -1199,27 +1543,6 @@ mod web {
             let new = build_header(self, &document, col_style, graph_width_css)?;
             drop(parent.replace_child(&new, &old).map_err(js_err_from)?);
             Ok(())
-        }
-
-        /// Position the canvas host over the graph column and size it to the
-        /// rows viewport (production `positionOverlay`; in the Rust page the
-        /// graph column is the first grid track at the layout's left edge).
-        /// Also records the effective graph width for the header-label
-        /// accessibility decision.
-        pub(crate) fn position_canvas_host(&self, graph_width_css: f64) -> Result<(), JsValue> {
-            self.graph_width.set(graph_width_css);
-            let style = self.canvas_host.style();
-            style.set_property("left", "0px")?;
-            style.set_property("top", "0px")?;
-            style.set_property("width", &format!("{graph_width_css}px"))?;
-            style.set_property("height", &format!("{}px", self.client_height()))?;
-            Ok(())
-        }
-
-        /// Set the canvas backing-store dimensions.
-        pub(crate) fn set_canvas_backing(&self, width: u32, height: u32) {
-            self.canvas.set_width(width);
-            self.canvas.set_height(height);
         }
 
         /// Replace the hidden `#gpu-rows` mirror with `[data-row][data-key]`
@@ -1665,10 +1988,13 @@ mod web {
     }
 
     /// Build one `.row` element from its spec (production `buildRowHtml`).
+    /// The graph cell carries its own SVG fragment (production
+    /// `buildGraphCell`); placeholder rows render no cells at all.
     pub(crate) fn build_row(
         document: &web_sys::Document,
         spec: &RowSpec,
         col_style: &str,
+        graph: &GraphCellSpec,
     ) -> Result<web_sys::HtmlDivElement, JsValue> {
         let row: web_sys::HtmlDivElement = document
             .create_element("div")?
@@ -1715,6 +2041,8 @@ mod web {
 
         let graph_cell = make_element(document, "div", "graph-cell", None)?;
         graph_cell.set_attribute("role", "gridcell")?;
+        let svg = build_graph_svg(document, graph, &spec.graph)?;
+        drop(graph_cell.append_child(&svg).map_err(js_err_from)?);
         drop(row.append_child(&graph_cell).map_err(js_err_from)?);
 
         let text_cell = make_element(document, "div", "text-cell", None)?;
@@ -1752,6 +2080,112 @@ mod web {
         drop(row.append_child(&commit_cell).map_err(js_err_from)?);
 
         Ok(row)
+    }
+
+    /// Create the per-row SVG graph fragment from the pure item list (the
+    /// markup `buildGraphCell` produces, as real SVG DOM nodes). The SVG is
+    /// decorative — it is hidden from the accessibility tree.
+    fn build_graph_svg(
+        document: &web_sys::Document,
+        cell: &GraphCellSpec,
+        graph: &GraphData,
+    ) -> Result<web_sys::Element, JsValue> {
+        let svg = document.create_element_ns(Some(SVG_NS), "svg")?;
+        // Keep the established graphCell hook for styling/oracle parity while
+        // exposing the explicit row-fragment contract to E2E probes.
+        svg.set_attribute("class", "graphCell graph-row-fragment")?;
+        svg.set_attribute("width", &super::svg_number(cell.width))?;
+        svg.set_attribute("height", &super::svg_number(cell.height))?;
+        svg.set_attribute(
+            "viewBox",
+            &format!(
+                "0 0 {} {}",
+                super::svg_number(cell.width),
+                super::svg_number(cell.height)
+            ),
+        )?;
+        svg.set_attribute("aria-hidden", "true")?;
+        for item in super::row_graph_items(graph, cell) {
+            let node = svg_item_node(document, &item)?;
+            drop(svg.append_child(&node).map_err(js_err_from)?);
+        }
+        Ok(svg)
+    }
+
+    /// Create one SVG graph element from a pure [`SvgItem`] description.
+    fn svg_item_node(
+        document: &web_sys::Document,
+        item: &SvgItem,
+    ) -> Result<web_sys::Node, JsValue> {
+        let (tag, attributes): (&str, Vec<(&str, String)>) = match item {
+            SvgItem::Line {
+                class,
+                x1,
+                y1,
+                x2,
+                y2,
+                stroke,
+            } => (
+                "line",
+                vec![
+                    ("class", class.to_string()),
+                    ("x1", super::svg_number(*x1)),
+                    ("y1", super::svg_number(*y1)),
+                    ("x2", super::svg_number(*x2)),
+                    ("y2", super::svg_number(*y2)),
+                    ("style", format!("stroke:{stroke}")),
+                ],
+            ),
+            SvgItem::Path { class, d, stroke } => (
+                "path",
+                vec![
+                    ("class", class.to_string()),
+                    ("d", d.clone()),
+                    ("style", format!("stroke:{stroke}")),
+                ],
+            ),
+            SvgItem::Circle {
+                class,
+                cx,
+                cy,
+                r,
+                fill,
+            } => (
+                "circle",
+                vec![
+                    ("class", class.to_string()),
+                    ("cx", super::svg_number(*cx)),
+                    ("cy", super::svg_number(*cy)),
+                    ("r", super::svg_number(*r)),
+                    ("fill", fill.to_string()),
+                ],
+            ),
+            SvgItem::Rect {
+                class,
+                x,
+                y,
+                width,
+                height,
+                rx,
+                fill,
+            } => (
+                "rect",
+                vec![
+                    ("class", class.to_string()),
+                    ("x", super::svg_number(*x)),
+                    ("y", super::svg_number(*y)),
+                    ("width", super::svg_number(*width)),
+                    ("height", super::svg_number(*height)),
+                    ("rx", super::svg_number(*rx)),
+                    ("fill", fill.to_string()),
+                ],
+            ),
+        };
+        let element = document.create_element_ns(Some(SVG_NS), tag)?;
+        for (name, value) in attributes {
+            element.set_attribute(name, &value)?;
+        }
+        element.dyn_into::<web_sys::Node>().map_err(js_err_from)
     }
 
     /// Build the content-cell children (chevron, session chips, chrome,
@@ -2291,6 +2725,278 @@ mod tests {
             layout.lane_x,
             vec![14.76, 29.52],
             "lane centers never rescale with the divider"
+        );
+    }
+
+    fn graph_cell_spec(lane_x: Vec<f64>, dot_radius: f64, width: f64) -> GraphCellSpec {
+        GraphCellSpec {
+            lane_x,
+            dot_radius,
+            width,
+            height: i64_to_f64(ROW_H),
+        }
+    }
+
+    fn graph_data(
+        lane: u32,
+        above: Vec<u32>,
+        below: Vec<u32>,
+        transitions: Vec<(u32, u32)>,
+    ) -> GraphData {
+        GraphData {
+            lane,
+            above,
+            below,
+            transitions,
+            ..GraphData::default()
+        }
+    }
+
+    #[test]
+    fn lane_colors_match_production_hexes_and_wrap() {
+        assert_eq!(
+            LANE_COLORS_HEX,
+            [
+                "#48f1dc", "#a18aff", "#6ee7a2", "#5ca8ff", "#ffc86a", "#ff70a6", "#72ddf7",
+                "#c77dff", "#64dfdf", "#ff8fa3",
+            ]
+        );
+        assert_eq!(lane_color_hex(0), "#48f1dc");
+        assert_eq!(lane_color_hex(9), "#ff8fa3");
+        assert_eq!(
+            lane_color_hex(10),
+            "#48f1dc",
+            "lanes wrap modulo the palette"
+        );
+        assert_eq!(lane_color_hex(21), "#a18aff");
+    }
+
+    #[test]
+    fn ordinary_row_draws_local_halves_and_a_center_dot() {
+        let cell = graph_cell_spec(vec![14.76, 29.52], 4.0, 44.28);
+        let graph = graph_data(0, vec![0], vec![0], Vec::new());
+        let items = row_graph_items(&graph, &cell);
+        assert_eq!(items.len(), 3, "top half + bottom half + node dot");
+        let top = items.first().expect("top half");
+        assert!(
+            matches!(top, SvgItem::Line { .. }),
+            "expected a line, got {top:?}"
+        );
+        if let SvgItem::Line {
+            class,
+            x1,
+            y1,
+            x2,
+            y2,
+            stroke,
+        } = top
+        {
+            assert_eq!(*class, "graphLine");
+            assert!((*x1 - 14.76).abs() < 1e-9, "lane 0 x is pinned");
+            assert!(
+                (*x2 - 14.76).abs() < 1e-9,
+                "vertical halves share the lane x"
+            );
+            assert!((*y1 - 0.0).abs() < 1e-9, "top half starts at the cell top");
+            assert!((*y2 - 17.0).abs() < 1e-9, "top half ends at the midpoint");
+            assert_eq!(*stroke, "#48f1dc");
+        }
+        let bottom = items.get(1).expect("bottom half");
+        assert!(
+            matches!(bottom, SvgItem::Line { .. }),
+            "expected a line, got {bottom:?}"
+        );
+        if let SvgItem::Line { y1, y2, .. } = bottom {
+            assert!(
+                (*y1 - 17.0).abs() < 1e-9,
+                "bottom half starts at the midpoint"
+            );
+            assert!(
+                (*y2 - 34.0).abs() < 1e-9,
+                "bottom half ends at the cell bottom"
+            );
+        }
+        let dot = items.get(2).expect("node dot");
+        assert!(
+            matches!(dot, SvgItem::Circle { .. }),
+            "expected a circle, got {dot:?}"
+        );
+        if let SvgItem::Circle {
+            class,
+            cx,
+            cy,
+            r,
+            fill,
+        } = dot
+        {
+            assert_eq!(*class, "graphDot");
+            assert!((*cx - 14.76).abs() < 1e-9, "dot sits on the row's lane");
+            assert!((*cy - 17.0).abs() < 1e-9, "marker centered at ROW_H / 2");
+            assert!((*r - 4.0).abs() < 1e-9, "dot radius from the layout");
+            assert_eq!(*fill, "#48f1dc");
+        }
+    }
+
+    #[test]
+    fn subop_rows_draw_no_node_mark() {
+        let cell = graph_cell_spec(vec![14.76, 29.52], 4.0, 44.28);
+        let graph = graph_data(0, vec![0, 1], vec![0, 1], Vec::new());
+        let graph = GraphData {
+            is_subop: true,
+            ..graph
+        };
+        let items = row_graph_items(&graph, &cell);
+        assert!(
+            items
+                .iter()
+                .all(|item| matches!(item, SvgItem::Line { .. })),
+            "sub-op rows are pass-through regions with full-height lines only"
+        );
+        assert_eq!(items.len(), 4, "both lanes pass through both halves");
+    }
+
+    #[test]
+    fn bundle_rows_render_capsule_and_terminals_around_the_midpoint() {
+        let cell = graph_cell_spec(vec![14.76, 29.52], 4.0, 44.28);
+        let graph = graph_data(0, vec![0], vec![0], Vec::new());
+        let graph = GraphData {
+            is_bundle: true,
+            ..graph
+        };
+        let items = row_graph_items(&graph, &cell);
+        assert_eq!(
+            items.len(),
+            5,
+            "incoming line + outgoing line + capsule + 2 terminals"
+        );
+        let capsule = items
+            .iter()
+            .find(|item| matches!(item, SvgItem::Rect { .. }))
+            .expect("capsule rect");
+        assert!(
+            matches!(capsule, SvgItem::Rect { .. }),
+            "expected a rect, got {capsule:?}"
+        );
+        if let SvgItem::Rect {
+            class,
+            x,
+            y,
+            width,
+            height,
+            rx,
+            fill,
+        } = capsule
+        {
+            assert_eq!(*class, "graphBundleCapsule");
+            let term_r = (4.0 * BUNDLE_TERMINAL_RATIO_CSS_PX).max(BUNDLE_TERMINAL_MIN_CSS_PX);
+            assert!((*x - (14.76 - term_r - 1.0)).abs() < 1e-9);
+            assert!(
+                (*y - (10.0 - term_r)).abs() < 1e-9,
+                "entry terminal at y=10"
+            );
+            assert!((*width - (term_r * 2.0 + 2.0)).abs() < 1e-9);
+            assert!((*height - (14.0 + term_r * 2.0)).abs() < 1e-9);
+            assert!((*rx - (term_r + 1.0)).abs() < 1e-9);
+            assert_eq!(*fill, "#48f1dc");
+        }
+        let terminals: Vec<&SvgItem> = items
+            .iter()
+            .filter(|item| matches!(item, SvgItem::Circle { .. }))
+            .collect();
+        assert_eq!(terminals.len(), 2);
+    }
+
+    #[test]
+    fn dangling_transitions_are_dropped_and_connected_ones_split_at_a_seam() {
+        let cell = graph_cell_spec(vec![14.76, 29.52], 4.0, 44.28);
+        // A transition (0,1) on a row whose `below` never reaches lane 1 is a
+        // dangling stub: neither endpoint is dot-anchored nor boundary-backed.
+        let dangling = graph_data(0, vec![0], vec![0], vec![(0, 1)]);
+        assert!(
+            row_graph_items(&dangling, &cell)
+                .iter()
+                .all(|item| !matches!(item, SvgItem::Path { .. })),
+            "dangling transitions draw nothing"
+        );
+        // A boundary-backed transition splits into two exact path halves with
+        // a shared tangent seam (production `buildTransitionPaths`).
+        let connected = graph_data(0, vec![0], vec![1], vec![(0, 1)]);
+        let items = row_graph_items(&connected, &cell);
+        let paths: Vec<&SvgItem> = items
+            .iter()
+            .filter(|item| matches!(item, SvgItem::Path { .. }))
+            .collect();
+        assert_eq!(paths.len(), 2, "source half + destination half");
+        let src = paths.first().expect("source half");
+        assert!(
+            matches!(src, SvgItem::Path { .. }),
+            "expected a path, got {src:?}"
+        );
+        if let SvgItem::Path { class, d, stroke } = src {
+            assert_eq!(*class, "graphTransition graphTransitionSrc");
+            assert_eq!(*d, "M 14.76 17 Q 22.14 17 25.83 21.25");
+            assert_eq!(*stroke, "#48f1dc");
+        }
+        let dst = paths.get(1).expect("destination half");
+        assert!(
+            matches!(dst, SvgItem::Path { .. }),
+            "expected a path, got {dst:?}"
+        );
+        if let SvgItem::Path { class, d, stroke } = dst {
+            assert_eq!(*class, "graphTransition graphTransitionDst");
+            assert_eq!(*d, "M 25.83 21.25 Q 29.52 25.5 29.52 34");
+            assert_eq!(*stroke, "#a18aff");
+        }
+    }
+
+    #[test]
+    fn lane_centers_stay_pinned_when_the_column_resizes() {
+        let natural = graph_cell_spec(vec![14.76, 29.52], 4.0, 44.28);
+        let dragged = graph_cell_spec(vec![14.76, 29.52], 4.0, 180.0);
+        let graph = graph_data(1, vec![0, 1], vec![1], vec![(0, 1)]);
+        let natural_items = row_graph_items(&graph, &natural);
+        let dragged_items = row_graph_items(&graph, &dragged);
+        assert_eq!(natural_items.len(), dragged_items.len());
+        for (before, after) in natural_items.iter().zip(&dragged_items) {
+            let x_of = |item: &SvgItem| match item {
+                SvgItem::Line { x1, .. } => Some(*x1),
+                SvgItem::Circle { cx, .. } => Some(*cx),
+                SvgItem::Path { .. } | SvgItem::Rect { .. } => None,
+            };
+            assert_eq!(
+                x_of(before),
+                x_of(after),
+                "resizing clips/reveals width; lane centers never move"
+            );
+        }
+    }
+
+    #[test]
+    fn rows_outside_visible_maps_bounds_through_collapsed_slots() {
+        let mut state = HistoryAppState {
+            total: Some(6),
+            sub_op_counts: vec![2, 0, 1],
+            ..HistoryAppState::default()
+        };
+        state.recompute_expansion();
+        assert_eq!(state.visible_total(), 3, "collapsed view hides 3 slots");
+        // Rendered window [vis 0..=2] = abs [0, 3, 4]. Keeping vis 2 must drop
+        // abs 0 (vis 0) AND abs 3 (vis 1) — comparing the visible bound 2 to
+        // absolute ids directly would wrongly keep abs 3.
+        assert_eq!(
+            rows_outside_visible(&state, &[0, 3, 4], 2, 2),
+            vec![0, 3],
+            "visible bounds map through the collapsed-mode absolute ids"
+        );
+        assert_eq!(
+            rows_outside_visible(&state, &[0, 3, 4], 1, 2),
+            vec![0],
+            "keep_top 1 keeps abs 3 (vis 1)"
+        );
+        assert_eq!(
+            rows_outside_visible(&state, &[0, 3, 4], 0, 1),
+            vec![4],
+            "keep_bottom 1 drops abs 4 (vis 2)"
         );
     }
 }

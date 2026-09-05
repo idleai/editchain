@@ -46,6 +46,504 @@
     return r.width > 0 && r.height > 0;
   }
 
+  // --- graph fragment + scroll parity (regression coverage for the
+  // scrolling/graph parity fix; mirrors test/vscode/layoutProbe.js) ------------
+
+  const ROW_H = 34; // fixed production row height (also used by the probes)
+
+  function round2(v) {
+    return Math.round(v * 100) / 100;
+  }
+
+  function clamp(v, lo, hi) {
+    return Math.min(hi, Math.max(lo, v));
+  }
+
+  function shortKey(key) {
+    if (!key) return null;
+    return key.length > 28 ? key.slice(0, 12) + '\u2026' + key.slice(-12) : key;
+  }
+
+  // The CPU oracle already uses a row-local svg.graphCell. Accept that legacy
+  // class here while the real-VS-Code probe strictly requires the Rust
+  // svg.graph-row-fragment contract.
+  function rowFragmentInfo(rowEl) {
+    const cell = rowEl.querySelector('.graph-cell');
+    if (!cell) return { cell: null, svg: null, legacy: null, ariaHidden: false, note: 'no .graph-cell' };
+    const fragment = cell.querySelector('svg.graph-row-fragment');
+    const legacy = cell.querySelector('svg.graphCell, svg.graph-cell');
+    const svg = fragment || legacy;
+    if (!svg) {
+      return {
+        cell, svg: null, legacy, ariaHidden: false,
+        note: 'no row svg fragment',
+      };
+    }
+    const ariaHidden = svg.getAttribute('aria-hidden') === 'true';
+    return { cell, svg, legacy, ariaHidden, note: 'ok' };
+  }
+
+  // Vertical centre (viewport CSS px) of the row's node marker. Lane halves
+  // legitimately occupy only one side on tip/root rows, so using all drawn
+  // geometry would falsely call those correct endpoint fragments off-centre.
+  // Sub-op rows have no marker and fall back to the row-aligned SVG box.
+  function fragmentMarkerCenterY(svg) {
+    const shapes = Array.from(svg.querySelectorAll('.graphDot, .graphBundleCapsule'));
+    let minY = Infinity;
+    let maxY = -Infinity;
+    let any = false;
+    for (const shape of shapes) {
+      const b = shape.getBoundingClientRect();
+      if (b.width <= 0 && b.height <= 0) continue;
+      any = true;
+      if (b.top < minY) minY = b.top;
+      if (b.bottom > maxY) maxY = b.bottom;
+    }
+    return any ? (minY + maxY) / 2 : null;
+  }
+
+  function readActiveProfile() {
+    if (typeof window.__editchainGetProfile === 'function') {
+      const p = window.__editchainGetProfile();
+      if (p === 'activity' || p === 'raw') return p;
+    }
+    const raw = document.getElementById('profile-raw');
+    if (raw && raw.getAttribute('aria-pressed') === 'true') return 'raw';
+    return 'activity';
+  }
+
+  function readGraphWindow() {
+    const debug = window.__editchainGpuDebug;
+    const state = debug && typeof debug.graphState === 'function'
+      ? debug.graphState()
+      : (typeof window.__editchainGraphState === 'function'
+          ? window.__editchainGraphState() : null);
+    return state && Number.isFinite(Number(state.renderTop)) ? state : null;
+  }
+
+  // Snapshot the rendered window's structural invariants at the CURRENT scroll
+  // position (synchronous, no motion, no waiting). Live snapshots taken while
+  // the renderer is still catching up may contain placeholders — every
+  // invariant below is stated per-row so a lagging window never false-fails:
+  //   - keys unique, data-row strictly monotonic in DOM order;
+  //   - rows contiguous at exactly ROW_H (gap-contiguity; no internal snaps),
+  //     and retained rows' viewport tops move by exactly the scroll delta
+  //     between consecutive snapshots (same-key stability; no wrapper drift
+  //     or rebuild snaps — works even when collapsed sub-op slots make
+  //     data-row values non-dense);
+  //   - every HYDRATED row owns a row-local fragment, and its geometry centre
+  //     sits on the row's vertical centre (<= 1px).
+  function sampleScrollState() {
+    const rowsEl = document.getElementById('rows');
+    const wrapEl = rowsEl && rowsEl.querySelector('.table-wrap');
+    const graphWindow = readGraphWindow();
+    const wrapTopPx = wrapEl ? round2(parseFloat(getComputedStyle(wrapEl).top) || 0) : null;
+    const renderTop = graphWindow ? Number(graphWindow.renderTop) : null;
+    const rows = wrapEl ? Array.from(wrapEl.querySelectorAll('.row')) : [];
+    const keyCounts = new Map();
+    let dupKeys = 0;
+    const dupExamples = [];
+    let orderOk = true;
+    let firstOrderBad = null;
+    let prevRow = null;
+    let minGap = Infinity;
+    let maxGap = -Infinity;
+    let firstBadGap = null;
+    const hydrated = [];
+    const keyTops = {};
+    let fragmentCount = 0;
+    let legacyCount = 0;
+    const fragmentIssues = [];
+    let maxAlignDelta = 0;
+    const alignExamples = [];
+    for (let i = 0; i < rows.length; i++) {
+      const el = rows[i];
+      const abs = Number(el.getAttribute('data-row'));
+      const key = el.getAttribute('data-key') || null;
+      if (!Number.isFinite(abs)) continue;
+      if (key) {
+        const c = (keyCounts.get(key) || 0) + 1;
+        keyCounts.set(key, c);
+        if (c === 2) {
+          dupKeys++;
+          if (dupExamples.length < 5) dupExamples.push({ row: abs, key: shortKey(key) });
+        }
+      }
+      if (prevRow !== null && abs <= prevRow) {
+        orderOk = false;
+        if (!firstOrderBad) firstOrderBad = { prev: prevRow, cur: abs };
+      }
+      prevRow = abs;
+      const b = el.getBoundingClientRect();
+      if (i > 0) {
+        const gap = b.top - rows[i - 1].getBoundingClientRect().bottom;
+        if (gap < minGap) minGap = gap;
+        if (gap > maxGap) maxGap = gap;
+        if (Math.abs(gap) > 0.5 && !firstBadGap) firstBadGap = { at: abs, gap: round2(gap) };
+      }
+      const info = rowFragmentInfo(el);
+      if (info.legacy) legacyCount++;
+      if (el.classList.contains('row-placeholder')) continue;
+      hydrated.push({ row: abs, key: shortKey(key), top: round2(b.top) });
+      if (key && !(key in keyTops)) keyTops[key] = round2(b.top);
+      if (!info.cell || !info.svg || !info.ariaHidden) {
+        if (fragmentIssues.length < 5) fragmentIssues.push({ row: abs, reason: info.note });
+      } else {
+        fragmentCount++;
+        const svgBox = info.svg.getBoundingClientRect();
+        const rowBox = b;
+        const geomCenter = fragmentMarkerCenterY(info.svg);
+        const center = geomCenter === null ? svgBox.top + svgBox.height / 2 : geomCenter;
+        const delta = Math.abs(center - (rowBox.top + rowBox.height / 2));
+        if (delta > maxAlignDelta) maxAlignDelta = delta;
+        if (delta > 1 && alignExamples.length < 5) {
+          alignExamples.push({ row: abs, delta: round2(delta) });
+        }
+      }
+    }
+    // Keep only the head + tail hydrated keys so the cross-sample stability
+    // check has plenty of overlap while the returned sample stays lean.
+    const keyEntries = Object.entries(keyTops);
+    const trimmedKeyTops = {};
+    for (const entry of keyEntries.slice(0, 40).concat(keyEntries.slice(-40))) {
+      trimmedKeyTops[entry[0]] = entry[1];
+    }
+    return {
+      scrollTop: rowsEl ? rowsEl.scrollTop : -1,
+      scrollHeight: rowsEl ? rowsEl.scrollHeight : -1,
+      clientHeight: rowsEl ? rowsEl.clientHeight : -1,
+      maxScroll: rowsEl ? Math.max(0, rowsEl.scrollHeight - rowsEl.clientHeight) : -1,
+      rowCount: rows.length,
+      hydratedCount: hydrated.length,
+      placeholders: rows.length - hydrated.length,
+      firstRow: hydrated.length ? hydrated[0] : null,
+      lastRow: hydrated.length ? hydrated[hydrated.length - 1] : null,
+      head: hydrated.slice(0, 3),
+      tail: hydrated.slice(-2),
+      wrapRectTop: wrapEl ? round2(wrapEl.getBoundingClientRect().top) : null,
+      wrapTopPx,
+      renderTop,
+      wrapAnchorDelta: wrapTopPx === null || renderTop === null
+        ? null : round2(Math.abs(wrapTopPx - renderTop * ROW_H)),
+      spacerH: rowsEl && rowsEl.querySelector('.scroll-spacer')
+        ? Math.round(rowsEl.querySelector('.scroll-spacer').offsetHeight) : null,
+      keyTops: trimmedKeyTops,
+      minGap: minGap === Infinity ? null : round2(minGap),
+      maxGap: maxGap === -Infinity ? null : round2(maxGap),
+      firstBadGap,
+      dupKeys,
+      dupExamples,
+      orderOk,
+      firstOrderBad,
+      fragmentCount,
+      legacyCount,
+      fragmentIssues,
+      maxAlignDelta: round2(maxAlignDelta),
+      alignExamples,
+    };
+  }
+
+  // Drive #rows.scrollTop continuously from `from` to `target` (scrollbar-like
+  // per-frame increments, no arbitrary sleeps) and record a LIVE snapshot each
+  // time `sampleEveryPx` of travel is crossed. Also records renderer scrollTop
+  // corrections observed between frames (an assignment the renderer later
+  // overrides mid-range is the "unbounded scrollTop correction" pathology).
+  function driveLeg(rowsEl, from, target, phase, sampleEveryPx, pxPerFrame, samples, corrections) {
+    return new Promise((resolve) => {
+      const distance = Math.abs(target - from);
+      if (distance < 1) { resolve({ traveled: 0 }); return; }
+      const dir = target > from ? 1 : -1;
+      let commanded = from;
+      let nextSampleAt = from + dir * sampleEveryPx;
+      const step = () => {
+        const actual = rowsEl.scrollTop; // post-scroll-event value from last frame
+        if (Math.abs(actual - commanded) > 2) {
+          const nearEnd = actual <= rowsEl.clientHeight ||
+            actual >= Math.max(0, rowsEl.scrollHeight - rowsEl.clientHeight) - rowsEl.clientHeight;
+          if (!nearEnd && corrections.length < 8) {
+            corrections.push({ at: actual, commanded: round2(commanded), actual: round2(actual) });
+          }
+        }
+        const remaining = target - commanded;
+        const move = Math.min(Math.abs(remaining), pxPerFrame);
+        commanded += move * dir;
+        rowsEl.scrollTop = commanded;
+        const crossed = dir > 0 ? commanded >= nextSampleAt : commanded <= nextSampleAt;
+        if (crossed) {
+          const snap = sampleScrollState();
+          snap.kind = 'live';
+          snap.phase = phase;
+          snap.commanded = round2(commanded);
+          snap.traveled = round2(Math.abs(commanded - from));
+          samples.push(snap);
+          nextSampleAt = commanded + dir * sampleEveryPx;
+        }
+        if (Math.abs(commanded - target) > 0.5) {
+          requestAnimationFrame(step);
+        } else {
+          rowsEl.scrollTop = target;
+          resolve({ traveled: distance });
+        }
+      };
+      requestAnimationFrame(step);
+    });
+  }
+
+  // Continuous scrollbar-like deep sweep with live + settled sampling. The
+  // caller (e2e/harness test) owns profile switching through the REAL control;
+  // this probe only verifies the active profile matches expectations.
+  async function probeScrollParity(options) {
+    options = options || {};
+    const rowsEl = document.getElementById('rows');
+    const checks = [];
+    const samples = [];
+    const corrections = [];
+    if (!rowsEl || !rowsEl.querySelector('.table-wrap')) {
+      checks.push({
+        name: 'SCROLL_PARITY_RUNNABLE',
+        pass: false,
+        detail: '#rows virtualized container missing',
+      });
+      return {
+        ok: false, failCount: 1, checks, samples,
+        summary: { profile: readActiveProfile(), traveledPx: 0, sampleCount: 0, elapsedMs: 0 },
+      };
+    }
+    const expectedProfile = options.profile || null;
+    const activeProfile = readActiveProfile();
+    const sweepPx = Math.max(Number(options.sweepPx) || 60000, 1);
+    const sampleEveryPx = Math.max(Number(options.sampleEveryPx) || 680, 200);
+    const pxPerFrame = Math.max(Number(options.pxPerFrame) || 136, 1);
+    const idleTimeoutMs = Number(options.idleTimeoutMs) || 120000;
+    const maxScroll = Math.max(0, rowsEl.scrollHeight - rowsEl.clientHeight);
+    const startedAt = performance.now();
+    const addCheck = (name, pass, detail) => checks.push({ name, pass, detail });
+
+    try {
+      await whenIdle(idleTimeoutMs);
+    } catch (error) {
+      addCheck('SCROLL_PARITY_IDLE', false,
+        'renderer did not settle before sweeping: ' +
+        (error && error.message ? error.message : error));
+      return {
+        ok: false, failCount: checks.length, checks, samples,
+        summary: { profile: activeProfile, traveledPx: 0, sampleCount: samples.length,
+          elapsedMs: Math.round(performance.now() - startedAt) },
+      };
+    }
+
+    const initial = sampleScrollState();
+    initial.kind = 'settled';
+    initial.phase = 'start';
+    samples.push(initial);
+
+    // Leg 1 descends `sweepPx` (clamped to the scroll range), leg 2 ascends
+    // back — both directions exercise prepend/trim + re-anchor paths.
+    const leg1Target = clamp(rowsEl.scrollTop + sweepPx, 0, maxScroll);
+    const leg2Target = clamp(leg1Target - sweepPx, 0, maxScroll);
+    const expectedTravel = Math.abs(leg1Target - rowsEl.scrollTop) +
+      Math.abs(leg2Target - leg1Target);
+    let totalTraveled = 0;
+
+    for (const leg of [
+      { target: leg1Target, phase: 'descend' },
+      { target: leg2Target, phase: 'ascend' },
+    ]) {
+      const start = rowsEl.scrollTop;
+      if (Math.abs(leg.target - start) < 1) continue;
+      const result = await driveLeg(rowsEl, start, leg.target, leg.phase,
+        sampleEveryPx, pxPerFrame, samples, corrections);
+      totalTraveled += result.traveled;
+      try {
+        await whenIdle(idleTimeoutMs);
+      } catch (error) {
+        addCheck('SCROLL_PARITY_IDLE', false,
+          'renderer did not settle after ' + leg.phase + ': ' +
+          (error && error.message ? error.message : error));
+        break;
+      }
+      const settled = sampleScrollState();
+      settled.kind = 'settled';
+      settled.phase = leg.phase + '-end';
+      settled.commanded = round2(leg.target);
+      settled.traveled = round2(result.traveled);
+      samples.push(settled);
+    }
+
+    // Aggregate per-sample invariants into verdicts with concrete diagnostics.
+    const problems = {
+      fragment: [],
+      alignment: [],
+      duplicates: [],
+      order: [],
+      wrapper: [],
+      scrollTop: [],
+      keyStability: [],
+    };
+    let maxAlignmentDelta = 0;
+    let prevSample = null;
+    for (const s of samples) {
+      if (s.hydratedCount > 0) {
+        if (s.fragmentCount !== s.hydratedCount) {
+          problems.fragment.push({
+            at: s.scrollTop, phase: s.phase, kind: s.kind,
+            missing: s.hydratedCount - s.fragmentCount,
+            legacy: s.legacyCount,
+            issues: s.fragmentIssues,
+          });
+        }
+        if (s.maxAlignDelta > 1) {
+          problems.alignment.push({
+            at: s.scrollTop, phase: s.phase, kind: s.kind,
+            maxAlignDelta: s.maxAlignDelta, examples: s.alignExamples,
+          });
+        }
+        if (s.maxAlignDelta > maxAlignmentDelta) maxAlignmentDelta = s.maxAlignDelta;
+      }
+      if (s.dupKeys > 0) {
+        problems.duplicates.push({
+          at: s.scrollTop, phase: s.phase, count: s.dupKeys, examples: s.dupExamples,
+        });
+      }
+      if (!s.orderOk) {
+        problems.order.push({ at: s.scrollTop, phase: s.phase, firstBad: s.firstOrderBad });
+      }
+      if (s.firstBadGap) {
+        problems.wrapper.push({
+          at: s.scrollTop, phase: s.phase, firstBadGap: s.firstBadGap,
+          minGap: s.minGap, maxGap: s.maxGap,
+        });
+      }
+      if (s.wrapAnchorDelta !== null && s.wrapAnchorDelta > 0.5) {
+        problems.wrapper.push({
+          at: s.scrollTop,
+          phase: s.phase,
+          renderTop: s.renderTop,
+          wrapTopPx: s.wrapTopPx,
+          expectedWrapTopPx: s.renderTop * ROW_H,
+          delta: s.wrapAnchorDelta,
+        });
+      }
+      if (s.kind === 'live' && s.commanded !== undefined) {
+        const nearEnd = s.scrollTop <= s.clientHeight ||
+          s.scrollTop >= s.maxScroll - s.clientHeight;
+        const drift = Math.abs(s.scrollTop - s.commanded);
+        if (drift > 2 && !nearEnd) {
+          problems.scrollTop.push({
+            at: s.scrollTop, commanded: s.commanded, drift: round2(drift),
+          });
+        }
+      }
+      // Same-key stability: any row key present in both consecutive samples
+      // must move by EXACTLY the scroll delta (viewport physics; prepends,
+      // trims, and re-anchors never shift a retained row's document position).
+      // A wrapper drift or rebuild snap moves the retained row, so this is the
+      // "no drift/snaps" proof that works even when collapsed sub-op slots
+      // make data-row values non-dense.
+      if (prevSample && s.keyTops && prevSample.keyTops) {
+        let worst = 0;
+        const examples = [];
+        const dScroll = s.scrollTop - prevSample.scrollTop;
+        for (const key of Object.keys(s.keyTops)) {
+          const prevTop = prevSample.keyTops[key];
+          if (prevTop === undefined) continue;
+          const dTop = s.keyTops[key] - prevTop;
+          const dev = Math.abs(dTop + dScroll);
+          if (dev > worst) worst = dev;
+          if (dev > 1 && examples.length < 5) {
+            examples.push({
+              key: shortKey(key), dTop: round2(dTop), dScroll: round2(dScroll),
+              dev: round2(dev),
+            });
+          }
+        }
+        if (worst > 1) {
+          problems.keyStability.push({
+            at: s.scrollTop, phase: s.phase, worst: round2(worst), examples,
+          });
+        }
+      }
+      prevSample = s;
+    }
+    for (const c of corrections) {
+      problems.scrollTop.push({ at: c.at, commanded: c.commanded, actual: c.actual, kind: 'renderer-correction' });
+    }
+
+    addCheck('SCROLL_PARITY_PROFILE',
+      !expectedProfile || activeProfile === expectedProfile,
+      'active profile=' + activeProfile + (expectedProfile ? ' expected=' + expectedProfile : ''));
+    const observedScrollTops = samples.map((s) => Number(s.scrollTop))
+      .filter((value) => Number.isFinite(value));
+    const observedScrollSpan = observedScrollTops.length > 0
+      ? Math.max(...observedScrollTops) - Math.min(...observedScrollTops) : 0;
+    const expectedScrollSpan = Math.abs(leg1Target - initial.scrollTop);
+    addCheck('SCROLL_PARITY_SWEEP_ADVANCED',
+      samples.length >= 2 && totalTraveled >= expectedTravel * 0.8 &&
+        expectedScrollSpan > 0 && observedScrollSpan >= expectedScrollSpan * 0.8,
+      'commanded ' + Math.round(totalTraveled) + 'px and observed ' +
+        Math.round(observedScrollSpan) + 'px of scroll range across ' + samples.length +
+        ' samples (expected observed >= ' + Math.round(expectedScrollSpan * 0.8) + 'px)');
+    addCheck('SCROLL_PARITY_FRAGMENT_PRESENT',
+      problems.fragment.length === 0 && samples.some((s) => s.hydratedCount > 0 && s.kind === 'settled'),
+      problems.fragment.length === 0
+        ? 'every hydrated row owned an aria-hidden row-local SVG in every sample'
+        : 'fragment gaps=' + JSON.stringify(problems.fragment.slice(0, 3)));
+    const anyFragment = samples.some((s) => s.fragmentCount > 0 && s.kind === 'settled');
+    addCheck('SCROLL_PARITY_FRAGMENT_ALIGNED',
+      problems.alignment.length === 0 && anyFragment,
+      problems.alignment.length === 0
+        ? (anyFragment
+            ? 'fragment geometry centered on its row through the sweep (max delta ' +
+              round2(maxAlignmentDelta) + 'px)'
+            : 'no row-local graph SVG rendered in any settled sample (presence check fails)')
+        : 'alignment failures=' + JSON.stringify(problems.alignment.slice(0, 3)));
+    addCheck('SCROLL_PARITY_KEYS_UNIQUE',
+      problems.duplicates.length === 0,
+      problems.duplicates.length === 0
+        ? 'no duplicate rendered row keys in any sample'
+        : 'duplicate keys=' + JSON.stringify(problems.duplicates.slice(0, 3)));
+    addCheck('SCROLL_PARITY_ORDER_MONOTONIC',
+      problems.order.length === 0,
+      problems.order.length === 0
+        ? 'data-row strictly increasing in DOM order in every sample'
+        : 'non-monotonic DOM order=' + JSON.stringify(problems.order.slice(0, 3)));
+    addCheck('SCROLL_PARITY_WRAPPER_STABLE',
+      problems.wrapper.length === 0 && problems.keyStability.length === 0,
+      (problems.wrapper.length === 0 && problems.keyStability.length === 0)
+        ? 'contiguous ROW_H spacing and scroll-locked retained rows across ' +
+          samples.length + ' samples'
+        : 'wrapper=' + JSON.stringify(problems.wrapper.slice(0, 3)) +
+          ' keyStability=' + JSON.stringify(problems.keyStability.slice(0, 3)));
+    addCheck('SCROLL_PARITY_SCROLLTOP_BOUNDED',
+      problems.scrollTop.length === 0,
+      problems.scrollTop.length === 0
+        ? 'no unbounded scrollTop corrections mid-sweep'
+        : 'scrollTop corrections=' + JSON.stringify(problems.scrollTop.slice(0, 3)));
+
+    for (const s of samples) {
+      delete s.keyTops;
+    }
+    const failCount = checks.filter((c) => !c.pass).length;
+    return {
+      ok: failCount === 0,
+      failCount,
+      checks,
+      samples,
+      summary: {
+        profile: activeProfile,
+        expectedProfile,
+        maxScroll: Math.round(maxScroll),
+        sweepPx: Math.round(sweepPx),
+        sampleEveryPx: Math.round(sampleEveryPx),
+        pxPerFrame: Math.round(pxPerFrame),
+        sampleCount: samples.length,
+        traveledPx: Math.round(totalTraveled),
+        observedScrollSpanPx: Math.round(observedScrollSpan),
+        elapsedMs: Math.round(performance.now() - startedAt),
+      },
+    };
+  }
+
   // Format a timestamp the same way the renderer does (media/main.js
   // `formatDate`), using explicit Intl options. Both sides run in the same
   // engine, so the comparison is locale/timezone-explicit and deterministic —
@@ -3441,5 +3939,6 @@
     workUnitContractState,
     captureResizeMetrics,
     evaluateResizeAssert,
+    probeScrollParity,
   };
 })();

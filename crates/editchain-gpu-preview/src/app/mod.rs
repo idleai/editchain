@@ -15,18 +15,17 @@
 //!   production row renderer: identity/`data-key`, classes/ARIA/disclosure,
 //!   summary/chrome/work-unit/bundle/promotion inputs, wgpu graph data, and
 //!   the `openJson` envelope. No DOM is built here (see the module docs).
-//! - [`dom`]    — the Rust-owned browser slice (3A): pure window/frame/lane
+//! - [`dom`]    — the Rust-owned browser slice (3A): pure window/lane
 //!   presentation helpers (native-tested) plus the web-sys DOM shell that
-//!   renders `RowSpec`s into real `#rows` nodes, owns scroll/paging and the
-//!   Activity/Raw profile controls, positions the single GPU canvas, and
-//!   serializes the renderer frame directly from cached row data.
+//!   renders `RowSpec`s into real `#rows` nodes with per-row SVG graph cells,
+//!   owns scroll/paging and the Activity/Raw profile controls, and mirrors
+//!   the render window for the debug facade. The obsolete fixed-viewport
+//!   canvas overlay is no longer created.
 //!
 //! Everything here is pure `std` code and covered by native unit tests and
 //! clippy with `-D warnings`; the wasm-only DOM shell compiles on
 //! `wasm32-unknown-unknown` and is exercised by the browser smoke test
-//! (`extensions/vscode-editchain/test/harness/rustSmoke.test.js`). The wasm
-//! surface (`GpuRenderer` stays as-is in `crate::browser`) is instantiated
-//! directly by the shell.
+//! (`extensions/vscode-editchain/test/harness/rustSmoke.test.js`).
 
 pub(crate) mod host;
 

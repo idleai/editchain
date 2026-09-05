@@ -127,8 +127,15 @@ async function openPages(browser, baseUrl) {
   const errors = { cpu: [], gpu: [] };
   cpu.on('pageerror', (e) => errors.cpu.push(e.message));
   gpu.on('pageerror', (e) => errors.gpu.push(e.message));
-  await cpu.goto(baseUrl + '/test/harness/index.html', { waitUntil: 'networkidle0', timeout: BOOT_TIMEOUT_MS });
-  await gpu.goto(baseUrl + '/test/harness/gpu.html?backend=webgl', { waitUntil: 'networkidle0', timeout: BOOT_TIMEOUT_MS });
+  // These are local static pages. Renderer readiness is asserted explicitly
+  // by bootScenario below; waiting for Chrome's incidental network-idle state
+  // made repeated WebGL oracle boots randomly consume the full timeout.
+  await cpu.goto(baseUrl + '/test/harness/index.html', {
+    waitUntil: 'domcontentloaded', timeout: BOOT_TIMEOUT_MS,
+  });
+  await gpu.goto(baseUrl + '/test/harness/gpu.html?backend=webgl', {
+    waitUntil: 'domcontentloaded', timeout: BOOT_TIMEOUT_MS,
+  });
   return { cpu, gpu, errors };
 }
 

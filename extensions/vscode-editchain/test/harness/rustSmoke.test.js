@@ -1,16 +1,17 @@
 // Rust-only adapter smoke test (Browser Slice 3A runtime completion).
 //
 // This suite drives the REAL Rust/WASM history adapter end-to-end in headless
-// Chrome (deterministic SwiftShader WebGL baseline) through the new fixture
-// page test/harness/rust.html. Unlike gpu.html (the offscreen parity oracle
-// where production media/main.js renders the DOM and bootstrap.js overlays the
-// GPU canvas), rust.html loads NEITHER main.js NOR gpu-preview/bootstrap.js:
-// media/rust-history/loader.js initializes the generated wasm-bindgen module
-// and calls the Rust shell's startHistoryView(), which acquires
-// window.acquireVsCodeApi() (capital C — the fixture bridge supplies it),
-// installs the host-message listener, renders real .row[data-row][data-key]
-// DOM with grid ARIA into #rows, creates the single canvas under
-// #gpu-canvas-host, and mirrors row markers into #gpu-rows.
+// Chrome through the fixture page test/harness/rust.html. Unlike gpu.html
+// (the offscreen parity oracle where production media/main.js renders the DOM
+// and bootstrap.js overlays a transparent wgpu canvas), rust.html loads
+// NEITHER main.js NOR gpu-preview/bootstrap.js: media/rust-history/loader.js
+// initializes the generated wasm-bindgen module and calls the Rust shell's
+// startHistoryView(), which acquires window.acquireVsCodeApi() (capital C —
+// the fixture bridge supplies it), installs the host-message listener,
+// renders real .row[data-row][data-key] DOM with grid ARIA into #rows, paints
+// every hydrated row's own aria-hidden svg.graph-row-fragment inside its
+// .graph-cell, and mirrors the frame rows into #gpu-rows. No canvas surface
+// is created anywhere.
 //
 // Run:  CHROME_PATH=... node --test test/harness/rustSmoke.test.js
 //
@@ -76,7 +77,7 @@ test('rust.html shares the scaffold but loads neither main.js nor the gpu-previe
   assert.match(RUST_HTML, /<link rel="stylesheet" href="\.\.\/\.\.\/media\/main\.css">/,
     'links the shared production media/main.css');
   assert.match(RUST_HTML, /<link rel="stylesheet" href="\.\.\/\.\.\/media\/gpu-preview\/gpu-preview\.css">/,
-    'links the shared GPU overlay stylesheet (positioning + status chrome only)');
+    'links the shared renderer stylesheet (row-fragment + status chrome only)');
   assert.match(RUST_HTML, /--vscode-editor-background/, 'ships the VS Code theme tokens');
   // Production scaffold IDs shared with index.html/gpu.html.
   for (const id of [
@@ -115,7 +116,7 @@ async function openRustPage(scenario, viewport) {
   page.on('console', (message) => {
     if (message.type() === 'error') errors.console.push(message.text());
   });
-  await page.goto(baseUrl + '/test/harness/rust.html?backend=webgl', {
+  await page.goto(baseUrl + '/test/harness/rust.html?backend=svg', {
     waitUntil: 'domcontentloaded',
     timeout: driver.BOOT_TIMEOUT_MS,
   });
@@ -153,7 +154,7 @@ async function openRustPage(scenario, viewport) {
 async function rustState(page) {
   return page.evaluate(() => {
     const gpu = window.__editchainGpuDebug;
-    const rows = Array.from(document.querySelectorAll(
+    const hydrated = Array.from(document.querySelectorAll(
       '#rows .row[data-row][data-key]:not(.row-placeholder)'));
     const grid = document.querySelector('#rows .tbl-grid');
     const log = window.__editchainRequestLog || [];
@@ -164,6 +165,65 @@ async function rustState(page) {
         offset: getWindow.offset,
         hideTrace: !!(getWindow.filter && getWindow.filter.hide_trace),
       }));
+    // Per-row SVG graph fragments: the production contract is exactly one
+    // aria-hidden svg.graph-row-fragment per hydrated row, whose geometry
+    // centre sits on the row's vertical centre. Marker shapes (dots/bundle
+    // capsules) define the visual centre; rows without a marker (sub-ops)
+    // fall back to the row-aligned SVG box itself.
+    let fragmentCount = 0;
+    const fragmentIssues = [];
+    let maxAlignDelta = 0;
+    const alignExamples = [];
+    const rows = hydrated.map((row) => {
+      const fragments = row.querySelectorAll('svg.graph-row-fragment');
+      const fragment = fragments[0] || null;
+      const fragmentOk = fragments.length === 1 && !!fragment &&
+        fragment.getAttribute('aria-hidden') === 'true';
+      if (fragmentOk) {
+        fragmentCount++;
+      } else if (fragmentIssues.length < 5) {
+        fragmentIssues.push({
+          row: Number(row.getAttribute('data-row')),
+          count: fragments.length,
+          ariaHidden: fragment ? fragment.getAttribute('aria-hidden') : null,
+        });
+      }
+      let alignDelta = null;
+      if (fragmentOk) {
+        const rowBox = row.getBoundingClientRect();
+        const svgBox = fragment.getBoundingClientRect();
+        const shapes = Array.from(fragment.querySelectorAll(
+          '.graphDot, .graphBundleCapsule'));
+        let minY = Infinity;
+        let maxY = -Infinity;
+        let any = false;
+        for (const shape of shapes) {
+          const b = shape.getBoundingClientRect();
+          if (b.width <= 0 && b.height <= 0) continue;
+          any = true;
+          if (b.top < minY) minY = b.top;
+          if (b.bottom > maxY) maxY = b.bottom;
+        }
+        const center = any ? (minY + maxY) / 2 : svgBox.top + svgBox.height / 2;
+        alignDelta = Math.abs(center - (rowBox.top + rowBox.height / 2));
+        if (alignDelta > maxAlignDelta) maxAlignDelta = alignDelta;
+        if (alignDelta > 1 && alignExamples.length < 5) {
+          alignExamples.push({
+            row: Number(row.getAttribute('data-row')),
+            delta: Math.round(alignDelta * 100) / 100,
+          });
+        }
+      }
+      return {
+        index: Number(row.getAttribute('data-row')),
+        key: row.getAttribute('data-key'),
+        role: row.getAttribute('role'),
+        gridcellCount: row.querySelectorAll('[role="gridcell"]').length,
+        fragmentCount: fragments.length,
+        fragmentAriaHidden: fragment ? fragment.getAttribute('aria-hidden') : null,
+        alignDelta: alignDelta === null ? null : Math.round(alignDelta * 100) / 100,
+      };
+    });
     return {
       wasmReady: window.__editchainWasmReady === true,
       rendererReady: window.__editchainRendererReady === true,
@@ -179,12 +239,12 @@ async function rustState(page) {
       snapshot: typeof gpu.snapshot === 'function' ? gpu.snapshot() : null,
       gridRole: grid ? grid.getAttribute('role') : null,
       ariaRowcount: grid ? grid.getAttribute('aria-rowcount') : null,
-      rows: rows.map((row) => ({
-        index: Number(row.getAttribute('data-row')),
-        key: row.getAttribute('data-key'),
-        role: row.getAttribute('role'),
-        gridcellCount: row.querySelectorAll('[role="gridcell"]').length,
-      })),
+      rows,
+      fragmentCount,
+      fragmentMissing: hydrated.length - fragmentCount,
+      fragmentIssues,
+      maxAlignDelta: Math.round(maxAlignDelta * 100) / 100,
+      alignExamples,
       placeholderCount: document.querySelectorAll('#rows .row-placeholder').length,
       canvasHostCount: document.querySelectorAll('#gpu-canvas-host canvas').length,
       foreignCanvasCount: document.querySelectorAll('canvas:not(#gpu-canvas-host canvas)').length,
@@ -207,19 +267,30 @@ function assertNoErrors(errors, label) {
     (label || 'console') + ' errors: ' + JSON.stringify(errors.console));
 }
 
-function assertGpuHealthy(state, label) {
+function assertRustHealthy(state, label) {
   assert.equal(state.loader, 'rust-history', label + ': __editchainGpuDebug must be the rust loader');
   assert.equal(state.wasmReady, true, label + ': __editchainWasmReady');
   assert.equal(state.rendererReady, true, label + ': renderer ready');
   assert.equal(state.dataReady, true, label + ': dataReady');
   assert.equal(state.lastError, null, label + ': no renderer error');
-  assert.equal(state.backend, 'webgl', label + ': deterministic SwiftShader WebGL baseline');
-  assert.equal(state.canvasHostCount, 1, label + ': exactly one canvas inside #gpu-canvas-host');
+  assert.equal(state.backend, 'svg', label + ': the Rust shell reports the per-row SVG backend');
+  assert.equal(state.canvasHostCount, 0, label + ': no canvas inside #gpu-canvas-host');
   assert.equal(state.foreignCanvasCount, 0, label + ': no foreign canvases');
   assert.ok(state.metrics && state.metrics.renderCount > 0,
     label + ': renderCount > 0, got ' + JSON.stringify(state.metrics));
-  assert.ok(state.metrics && state.metrics.vertexCount > 0,
-    label + ': vertexCount > 0, got ' + JSON.stringify(state.metrics));
+  assert.equal(state.metrics && state.metrics.vertexCount, 0,
+    label + ': vertexCount is 0 for the SVG renderer, got ' + JSON.stringify(state.metrics));
+  assert.equal(state.fragmentCount, state.rows.length,
+    label + ': every hydrated row owns exactly one svg.graph-row-fragment');
+  assert.equal(state.fragmentMissing, 0,
+    label + ': no hydrated row misses its fragment, got ' + JSON.stringify(state.fragmentIssues));
+  assert.ok(state.maxAlignDelta <= 1,
+    label + ': fragment centres sit on the row centre (<= 1px), got ' + state.maxAlignDelta +
+    ' ' + JSON.stringify(state.alignExamples));
+  for (const row of state.rows) {
+    assert.equal(row.fragmentCount, 1, 'row ' + row.index + ' owns exactly one fragment');
+    assert.equal(row.fragmentAriaHidden, 'true', 'row ' + row.index + ' fragment is aria-hidden');
+  }
 }
 
 async function settleRust(page) {
@@ -281,8 +352,9 @@ test('rust-only adapter boots in headless Chrome and renders (merge)', { skip: S
     }
     assert.equal(state.mirrorRows, state.rows.length, '#gpu-rows mirror matches frame rows');
 
-    // Renderer health (one canvas, no foreign canvases, webgl, geometry).
-    assertGpuHealthy(state, 'boot');
+    // Renderer health (svg backend, zero canvases/vertices, one per-row
+    // fragment, fragment centres on the row centres).
+    assertRustHealthy(state, 'boot');
 
     // Activity -> Raw -> Activity through real button clicks; the correlated
     // GetWindow filter must flip hide_trace with the profile.
@@ -335,7 +407,7 @@ test('rust-only adapter boots in headless Chrome and renders (merge)', { skip: S
       'the available width actually changed');
     assert.deepEqual(state.laneXAll, laneXBefore,
       'laneXAll is unchanged after changing the graph host/available width');
-    assertGpuHealthy(state, 'after resize');
+    assertRustHealthy(state, 'after resize');
 
     // Runtime proof that production main.js and the gpu-preview bootstrap are
     // absent (they would have set __editchainVscode / loaded their scripts).
@@ -731,7 +803,7 @@ test('row keyboard disclosure, double-click identity, and divider drag remain co
       assert.deepEqual(after.laneXAll, before.laneXAll,
         'divider drag changes width without moving lanes');
       assert.ok(after.metrics.renderCount > before.metrics.renderCount,
-        'divider drag renders a fresh GPU frame');
+        'divider drag re-renders the per-row SVG fragments');
       await saveParityScreenshot(page, 'selected-graph-wide');
       await page.setViewport({ width: 420, height: 900 });
       await driver.waitFor(page, () => document.getElementById('rows').clientWidth <= 420,
@@ -829,7 +901,7 @@ test('deep scroll pages the large window with bounded offsets and settles', { sk
     assert.equal(state.placeholderCount, 0, 'no placeholders after settle');
     assert.ok(state.metrics.renderCount > renderCountBefore,
       'deep scroll rendered additional frames');
-    assertGpuHealthy(state, 'after deep scroll');
+    assertRustHealthy(state, 'after deep scroll');
     await saveParityScreenshot(page, 'deep-scroll');
     assertNoErrors(errors, 'rust smoke (large)');
   } finally {
