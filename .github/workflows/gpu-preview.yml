@@ -1,0 +1,235 @@
+name: GPU History Renderer
+
+# Rust/WASM GPU history renderer (extensions/vscode-editchain GPU webview).
+# The shipped UI is ONE panel titled "EditChain History" (default command
+# editchain-history.open) rendered by the Rust-owned webview: the tiny
+# media/rust-history/loader.js bootstrap + generated wasm-bindgen glue +
+# the editchain-gpu-preview crate (HistoryAppState / RowSpec / web-sys DOM /
+# wgpu). media/main.js + media/gpu-preview/bootstrap.js are the DEPRECATED
+# test-only oracle (offscreen CPU-vs-GPU parity pages) and are never shipped
+# as the renderer. Separate from lint.yml on purpose: this job builds the
+# wasm-bindgen assets, checks the wasm32 crate, verifies BOTH committed pkg
+# trees (media/rust-history/pkg production + media/gpu-preview/pkg oracle)
+# regenerate without diff, runs the focused static contract tests, the
+# Rust-owned adapter smoke test in real Chrome (explicitly, so it cannot
+# silently skip), the deterministic offscreen CPU-vs-GPU regression-oracle
+# suites (functional parity + divider lane-pitch invariance + WebGL parity
+# scenarios merge/fork/highLanes/multigroup/empty/error), and the real VS
+# Code GPU history e2e under xvfb. It does not weaken or skip any lint.yml
+# gate, and it never requires hardware WebGPU — every deterministic run pins
+# the SwiftShader WebGL baseline explicitly.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  gpu-preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Full history: the real-VS-Code e2e opens this repo as its workspace
+          # and renders git commits as rows even when no .editchain chain exists.
+          fetch-depth: 0
+
+      - name: Install Rust 1.97 toolchain and wasm32 target
+        run: |
+          rustup show
+          rustup component add clippy rustfmt
+          rustup target add wasm32-unknown-unknown
+
+      - name: Cache Cargo registry and target
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install wasm-bindgen-cli (exactly 0.2.127)
+        timeout-minutes: 20
+        run: cargo install wasm-bindgen-cli --version 0.2.127 --locked
+
+      - name: Set up Node 20
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: extensions/vscode-editchain/package-lock.json
+
+      - name: Install extension dependencies
+        working-directory: extensions/vscode-editchain
+        run: npm ci
+
+      - name: Build native service (release)
+        timeout-minutes: 25
+        run: cargo build --release -p editchain-vscode-service
+
+      - name: Build GPU assets (deterministic dual output)
+        working-directory: extensions/vscode-editchain
+        timeout-minutes: 25
+        run: npm run build:gpu
+
+      - name: Verify committed GPU pkg trees regenerate without diff (production + oracle)
+        working-directory: extensions/vscode-editchain
+        run: |
+          for pkg in media/rust-history/pkg media/gpu-preview/pkg; do
+            if git ls-files --error-unmatch "$pkg" >/dev/null 2>&1; then
+              if [ -n "$(git status --porcelain -- "$pkg")" ]; then
+                echo "::error::Regenerating $pkg produced a diff; the committed wasm-bindgen artifacts are out of sync with the crate."
+                git status --porcelain -- "$pkg"
+                exit 1
+              fi
+              echo "$pkg regeneration matches the committed artifacts"
+            else
+              echo "$pkg is not tracked in git — skipping the regeneration diff check"
+            fi
+          done
+
+      - name: wasm32 cargo check (editchain-gpu-preview)
+        run: cargo check -p editchain-gpu-preview --target wasm32-unknown-unknown --locked
+
+      - name: wasm32 clippy (editchain-gpu-preview, -D warnings)
+        run: cargo clippy -p editchain-gpu-preview --target wasm32-unknown-unknown --locked -- -D warnings
+
+      - name: Compile extension
+        working-directory: extensions/vscode-editchain
+        run: npm run compile
+
+      - name: Generic harness tests
+        working-directory: extensions/vscode-editchain
+        run: npm run test:harness
+
+      - name: Focused GPU renderer contract tests (static, no browser)
+        working-directory: extensions/vscode-editchain
+        run: node --test test/harness/gpuContract.test.js
+
+      - name: Install Chrome for the GPU parity + Rust smoke harnesses
+        id: chrome
+        working-directory: extensions/vscode-editchain
+        timeout-minutes: 10
+        run: |
+          OUT="$(npx @puppeteer/browsers install chrome@stable --path "$RUNNER_TEMP/puppeteer-chrome")"
+          printf '%s\n' "$OUT"
+          CHROME_BIN="$(printf '%s\n' "$OUT" | tail -n 1 | awk '{print $NF}')"
+          test -n "$CHROME_BIN"
+          test -x "$CHROME_BIN"
+          echo "path=$CHROME_BIN" >> "$GITHUB_OUTPUT"
+
+      - name: Rust-owned history adapter smoke test (real Chrome, deterministic WebGL)
+        working-directory: extensions/vscode-editchain
+        timeout-minutes: 20
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.path }}
+        run: |
+          # Run with TAP output and fail the step if the suite did not run or
+          # ANY test skipped: Chrome is installed and the assets were just
+          # built, so a skip here means the suite silently stopped covering
+          # the Rust-owned path.
+          set -o pipefail
+          npm run test:rust-smoke 2>&1 | tee "$RUNNER_TEMP/rust-smoke.tap"
+          grep -q '^# tests ' "$RUNNER_TEMP/rust-smoke.tap" || {
+            echo "::error::rustSmoke produced no test plan; the suite did not run."
+            exit 1
+          }
+          if grep -q '# SKIP ' "$RUNNER_TEMP/rust-smoke.tap"; then
+            echo "::error::rustSmoke skipped a runtime test in CI despite CHROME_PATH and built assets; it must run for real."
+            grep '# SKIP ' "$RUNNER_TEMP/rust-smoke.tap"
+            exit 1
+          fi
+
+      - name: Graph-lane divider invariance oracle (fixed Pulse pitch, real Chrome)
+        working-directory: extensions/vscode-editchain
+        timeout-minutes: 15
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.path }}
+        run: |
+          set -o pipefail
+          node --test --test-reporter=tap test/harness/dividerResize.test.js 2>&1 | tee "$RUNNER_TEMP/divider-resize.tap"
+          grep -q '^# tests ' "$RUNNER_TEMP/divider-resize.tap" || {
+            echo "::error::dividerResize produced no test plan; the suite did not run."
+            exit 1
+          }
+          if grep -q '# SKIP ' "$RUNNER_TEMP/divider-resize.tap"; then
+            echo "::error::dividerResize skipped a runtime test in CI despite CHROME_PATH and built assets; it must run for real."
+            grep '# SKIP ' "$RUNNER_TEMP/divider-resize.tap"
+            exit 1
+          fi
+
+      - name: GPU functional parity regression oracle (deterministic WebGL, offscreen)
+        working-directory: extensions/vscode-editchain
+        timeout-minutes: 20
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.path }}
+        run: node --test test/harness/functionalParity.test.js
+
+      - name: GPU parity oracle — empty state (WebGL baseline, offscreen)
+        working-directory: extensions/vscode-editchain
+        timeout-minutes: 15
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.path }}
+        run: npm run ui:gpu -- --scenario empty --backend webgl
+
+      - name: GPU parity oracle — error state (WebGL baseline, offscreen)
+        working-directory: extensions/vscode-editchain
+        timeout-minutes: 15
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.path }}
+        run: npm run ui:gpu -- --scenario error --backend webgl
+
+      - name: GPU parity oracle — merge (WebGL baseline, offscreen)
+        working-directory: extensions/vscode-editchain
+        timeout-minutes: 15
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.path }}
+        run: npm run ui:gpu -- --scenario merge --backend webgl --shot
+
+      - name: GPU parity oracle — fork (WebGL baseline, offscreen)
+        working-directory: extensions/vscode-editchain
+        timeout-minutes: 15
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.path }}
+        run: npm run ui:gpu -- --scenario fork --backend webgl --shot
+
+      - name: GPU parity oracle — highLanes (WebGL baseline, offscreen)
+        working-directory: extensions/vscode-editchain
+        timeout-minutes: 15
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.path }}
+        run: npm run ui:gpu -- --scenario highLanes --backend webgl --shot
+
+      - name: GPU parity oracle — multigroup paging (WebGL baseline, offscreen)
+        working-directory: extensions/vscode-editchain
+        timeout-minutes: 15
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.path }}
+        run: npm run ui:gpu -- --scenario multigroup --backend webgl --shot
+
+      - name: Install xvfb for the real VS Code e2e
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb
+
+      - name: Real VS Code GPU history e2e (xvfb)
+        working-directory: extensions/vscode-editchain
+        timeout-minutes: 30
+        run: npm run ui:vscode:gpu
+
+      - name: Upload GPU history artifacts (.ui-out + trace)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gpu-history-artifacts
+          path: |
+            extensions/vscode-editchain/.ui-out
+            extensions/vscode-editchain/trace
+          if-no-files-found: warn
+          retention-days: 7

@@ -8,8 +8,9 @@
 // standalone Puppeteer harness cannot: extension activation, native Rust service
 // spawn, the message bridge, and the webview/panel lifecycle.
 //
-// It also injects the same text-only layout probe (test/harness/layoutProbe.js)
-// into the webview so the identical textual checks run inside real VS Code.
+// It also injects the Rust-shell text-only layout probe
+// (test/vscode/layoutProbe.js) into the webview so the identical textual
+// checks run inside real VS Code against the Rust/WASM renderer.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -17,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROBE_SRC = fs.readFileSync(
-  path.join(__dirname, '..', 'harness', 'layoutProbe.js'),
+  path.join(__dirname, 'layoutProbe.js'),
   'utf8'
 );
 
@@ -479,11 +480,35 @@ describe('EditChain History Explorer', () => {
     expect(bottom.rowCount).toBeGreaterThan(0);
     expect(bottom.placeholders).toBe(0);
 
+    // Leave the retained panel in a cheap, fully hydrated state for the next
+    // independent test. Keeping Chromium at its maximum virtual scroll offset
+    // makes every later frame lookup traverse the largest retained surface and
+    // can exhaust WebdriverIO's per-test budget even though the Rust renderer
+    // itself is healthy. This reset is part of the assertion: the same panel
+    // must page back to row 0 without a reload.
+    await browser.execute(() => {
+      document.getElementById('rows').scrollTop = 0;
+    });
+    await browser.waitUntil(async () => browser.execute(() => {
+      const top = document.querySelector('.row[data-row="0"]');
+      return window.__editchainDataReady === true && !!top &&
+        !top.classList.contains('row-placeholder');
+    }), {
+      timeout: 60000,
+      interval: 100,
+      timeoutMsg: 'history panel did not hydrate row 0 after the bottom-scroll assertion',
+    });
+
     // Leave the webview context.
     await webview.close();
   });
 
-  it('keeps the Activity work-unit/bundle/promotion layer coherent with the wire and gates it off in Raw', async () => {
+  it('keeps the Activity work-unit/bundle/promotion layer coherent with the wire and gates it off in Raw', async function () {
+    // This test may have to reopen a retained 126k-row virtual surface after
+    // the preceding bottom-scroll test. Give the explicit 120s renderer wait
+    // room to report its own diagnostic instead of racing Mocha's 120s suite
+    // default and terminating the Extension Development Host mid-command.
+    this.timeout(300000);
     const workbench = await browser.getWorkbench();
 
     await browser.executeWorkbench((vscode) => {
@@ -492,6 +517,15 @@ describe('EditChain History Explorer', () => {
     const webview = await workbench.getWebviewByTitle('EditChain History');
     await webview.open();
     await browser.$('.row').waitForExist({ timeout: 120000 });
+    console.log('[e2e] work-unit frame state:', JSON.stringify(await browser.execute(() => ({
+      visibility: document.visibilityState,
+      focused: document.hasFocus(),
+      rows: document.querySelectorAll('.row').length,
+      loader: window.__editchainGpuDebug?.loader || null,
+      dataReady: window.__editchainDataReady === true,
+      inFlight: window.__editchainInFlightCount,
+      lastError: window.__editchainLastError,
+    }))));
 
     // Inject the text-only layout probe so its contract helpers + textual
     // checks run inside real VS Code (same probe the harness uses).
@@ -500,7 +534,8 @@ describe('EditChain History Explorer', () => {
       (0, eval)(src);
       return typeof window.__editchainDebug;
     }, PROBE_SRC);
-    await browser.execute(() => window.__editchainDebug.whenIdle(60000));
+    const idleResult = await browser.execute(() => window.__editchainDebug.whenIdle(60000));
+    console.log('[e2e] work-unit idle:', JSON.stringify(idleResult));
 
     // Deterministic, chain-agnostic invariants over REAL rows: wherever a
     // rendered row carries work_unit / promoted / activity_bundle wire
@@ -543,10 +578,14 @@ describe('EditChain History Explorer', () => {
             }
           }
         }
-        if (row.activity_bundle && row.activity_bundle.kind === 'execute-run') {
+        const typedBundle = row.activity_bundle &&
+          (row.activity_bundle.kind === 'execute-run' ||
+            row.activity_bundle.kind === 'plan-repeat');
+        if (typedBundle) {
           typedBundles++;
-          if (el.getAttribute('data-activity-bundle') !== 'execute-run') {
-            problems.push('typed bundle missing data-activity-bundle=execute-run on ' + abs);
+          if (el.getAttribute('data-activity-bundle') !== row.activity_bundle.kind) {
+            problems.push('typed bundle missing data-activity-bundle=' +
+              row.activity_bundle.kind + ' on ' + abs);
           }
           if (el.getAttribute('data-bundle-count') !== String(row.activity_bundle.member_count)) {
             problems.push('data-bundle-count mismatch on ' + abs);
@@ -558,13 +597,13 @@ describe('EditChain History Explorer', () => {
           }
           const statusEl = el.querySelector('.bundle-status');
           const statusText = statusEl ? (statusEl.textContent || '').trim() : '';
-          if (row.outcome === 'success') {
+          if (row.activity_bundle.kind === 'execute-run' && row.outcome === 'success') {
             if (!statusEl || statusText !== '✓' ||
                 !statusEl.classList.contains('bundle-status-success')) {
               problems.push('successful bundle missing quiet success check on ' + abs);
             }
           } else if (statusEl) {
-            problems.push('unknown-outcome bundle renders noisy status on ' + abs);
+            problems.push('non-success/plan bundle renders noisy status on ' + abs);
           }
         } else if (row.activity_bundle) {
           // Forward-compatible unknown bundle kind: never styled as execute-run.
@@ -604,7 +643,11 @@ describe('EditChain History Explorer', () => {
     await browser.waitUntil(async () => browser.execute(() => {
       return document.querySelectorAll('.row:not(.row-placeholder)').length > 0 &&
         window.__editchainDataReady === true;
-    }), { timeout: 60000, interval: 200 });
+    }), {
+      timeout: 60000,
+      interval: 200,
+      timeoutMsg: 'raw gating wait timed out',
+    });
     const raw = await browser.execute(() => {
       const rows = Array.from(document.querySelectorAll('.row:not(.row-placeholder)'));
       const groupingSel = '.row-work-unit-start, .row-work-unit-end, .work-unit-ribbon, ' +

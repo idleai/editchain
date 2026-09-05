@@ -4,7 +4,7 @@ CRDT-based edit chain built from agent session history, browsed through the **Ed
 
 ## VS Code extension
 
-The primary UI lives in [`extensions/vscode-editchain/`](./extensions/vscode-editchain/): a read-only unified history explorer that overlays EditChain operations with live Git history.
+The primary UI lives in [`extensions/vscode-editchain/`](./extensions/vscode-editchain/): a read-only unified history explorer that overlays EditChain operations with live Git history. The default history view is **Rust-owned**: `editchain-history.open` opens one panel titled **"EditChain History"** bootstrapped by the tiny `media/rust-history/loader.js` + generated wasm-bindgen glue, with the `editchain-gpu-preview` crate owning the view state (`HistoryAppState`), row model (`RowSpec`), web-sys DOM/accessibility, and the wgpu canvas (WebGL CI baseline, WebGPU diagnostic). The legacy `media/main.js` controller and `media/gpu-preview/bootstrap.js` are the deprecated test-only oracle (offscreen CPU-vs-GPU parity harnesses, never production), all documented in the extension README.
 
 Build the native service and the extension:
 

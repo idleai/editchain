@@ -4,6 +4,14 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>EditChain History — Harness</title>
+<!--
+  Offscreen harness page: the CPU/SVG side of the CPU-vs-GPU parity regression
+  oracle (compare this page against gpu.html). The shipped VS Code UI is ONE
+  panel titled "EditChain History" whose graph cells are drawn by the
+  Rust/WASM GPU renderer; the inline SVG graph renderer in media/main.js is
+  retained only as a deprecated internal fallback and as this offscreen
+  reference side.
+-->
 <!-- Same stylesheet the VS Code webview uses (media/main.css). -->
 <link rel="stylesheet" href="../../media/main.css">
 <style>

@@ -1,0 +1,61 @@
+[package]
+name = "editchain-gpu-preview"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# The wgpu surface exists only on wasm32. Geometry stays target-independent so
+# native workspace tests can validate the exact vertex generation used by the
+# browser renderer. The HistoryApp application core (app::state / app::host /
+# app::layout) is pure std + serde_json and compiles for both targets.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bytemuck = { workspace = true }
+serde = { workspace = true, features = ["alloc"] }
+serde_json = { workspace = true }
+wgpu = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+js-sys = { version = "=0.3.104", default-features = false }
+web-sys = { workspace = true, features = [
+    "CssStyleDeclaration",
+    "Document",
+    "DocumentFragment",
+    "DomRect",
+    "DomTokenList",
+    "Element",
+    "Event",
+    "EventTarget",
+    "FocusOptions",
+    "HtmlButtonElement",
+    "HtmlCanvasElement",
+    "HtmlDivElement",
+    "HtmlElement",
+    "HtmlInputElement",
+    "KeyboardEvent",
+    "Location",
+    "MessageEvent",
+    "MouseEvent",
+    "Node",
+    "NodeList",
+    "Performance",
+    "ResizeObserver",
+    "ResizeObserverEntry",
+    "Text",
+    "Window",
+    "console",
+] }
+
+[dev-dependencies]
+serde = { workspace = true, features = ["alloc"] }
+serde_json = { workspace = true }

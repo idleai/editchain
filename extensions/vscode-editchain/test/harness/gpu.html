@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EditChain History — GPU Harness (offscreen oracle)</title>
+<!-- Same production stylesheet the VS Code webview uses (media/main.css),
+     loaded BEFORE the GPU overlay stylesheet (media/gpu-preview/gpu-preview.css)
+     exactly as getGpuHtml links them. -->
+<link rel="stylesheet" href="../../media/main.css">
+<link rel="stylesheet" href="../../media/gpu-preview/gpu-preview.css">
+<style>
+  /* Harness-only chrome: a status bar so the agent can see scenario/state.
+     This is NOT part of the production webview. */
+  #harness-status {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 22px;
+    background: #1e1e1e;
+    color: #9cdcfe;
+    font: 11px/22px monospace;
+    padding: 0 8px;
+    z-index: 100;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+</style>
+</head>
+<!--
+  GPU harness contract (consumed by media/gpu-preview/bootstrap.js):
+
+    data-gpu-module  -> HTTP-relative URI of the wasm-bindgen JS module
+                        (media/gpu-preview/pkg/editchain_gpu_preview.js)
+    data-gpu-wasm    -> HTTP-relative URI of the compiled WASM blob
+                        (media/gpu-preview/pkg/editchain_gpu_preview_bg.wasm)
+    data-gpu-backend -> requested render backend: "webgl" (default) or "webgpu".
+
+  The bootstrap MUST read the requested backend from the `?backend=` query
+  parameter when present (the runner always passes it explicitly); the inline
+  script below keeps the body attribute in sync with the query override so the
+  attribute is always the effective backend, deterministically. The bootstrap
+  also honours the query parameter itself.
+
+  This page is an OFFSCREEN regression-oracle harness: it is NOT the shipped
+  VS Code UI. The shipped UI is ONE panel titled "EditChain History", opened
+  by the default `editchain-history.open` command, hosting this same scaffold
+  and GPU overlay inside it. This page is the EXACT production scaffold
+  (media/main.css + media/main.js + the production controls and #rows), so
+  Activity/Raw, profile persistence,
+  virtual paging (PAGE=500), FindInHistory search/nav, loading/error,
+  work-unit/bundle/promotion rows, row selection/keyboard/disclosure, raw JSON
+  routing, five responsive columns, accessibility and resize are behaviorally
+  identical by construction. The GPU bootstrap overlays a transparent canvas
+  on the rendered .graph-cell column and mirrors data-row/data-key markers
+  into #gpu-rows.
+-->
+<body data-treatment="pulse"
+      data-gpu-module="../../media/gpu-preview/pkg/editchain_gpu_preview.js"
+      data-gpu-wasm="../../media/gpu-preview/pkg/editchain_gpu_preview_bg.wasm"
+      data-gpu-backend="webgl">
+<!-- GPU toolbar: backend badge + renderer status (same chrome as the VS Code
+     GPU webview). -->
+<div id="gpu-toolbar" role="toolbar" aria-label="Renderer status">
+<span id="gpu-backend" data-backend="webgl">backend: webgl</span>
+<span id="gpu-status">idle</span>
+</div>
+<!-- Production controls, byte-for-byte the primary webview's scaffold. -->
+<div id="controls" role="group" aria-label="History controls">
+<div id="profile-control" class="segmented" role="group" aria-label="History profile">
+<button type="button" id="profile-activity" class="segmented-btn active" aria-pressed="true">Activity</button>
+<button type="button" id="profile-raw" class="segmented-btn" aria-pressed="false">Raw</button>
+</div>
+<label class="visually-hidden" for="search">Search history</label>
+<div id="search-control" class="search-control" role="group" aria-label="Find in chain">
+<input id="search" type="text" placeholder="Search history… (Enter to search)">
+<span id="search-counter" class="search-counter" role="status" aria-live="polite"></span>
+<button type="button" id="search-prev" class="search-nav" title="Previous match (Shift+Enter)" aria-label="Previous match" hidden disabled><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M13.5 10.5 8 5.06 2.5 10.5l-1.06-1.06L8 2.94l6.56 6.5z"/></svg></button>
+<button type="button" id="search-next" class="search-nav" title="Next match (Enter)" aria-label="Next match" hidden disabled><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 13.06 1.44 6.56 2.5 5.5 8 10.94l5.5-5.44 1.06 1.06z"/></svg></button>
+</div>
+</div>
+<!-- Production single-pane surface, plus the transparent GPU canvas overlay
+     aligned over the rendered .graph-cell column (pointer-events: none). -->
+<div id="layout">
+<div id="rows"></div>
+<div id="gpu-canvas-host" aria-hidden="true"></div>
+</div>
+<div id="status-live" class="visually-hidden" role="status" aria-live="polite"></div>
+<!-- Hidden GPU row mirror: bootstrap.js writes one [data-row][data-key]
+     marker per rendered row so harness/e2e runners can assert rendered DOM
+     without touching the production rows (the VISIBLE rows live in #rows). -->
+<div id="gpu-scroll">
+<div id="gpu-rows" role="table" aria-label="Rust/WASM history renderer" aria-hidden="true"></div>
+</div>
+<div id="gpu-live" class="visually-hidden" role="status" aria-live="polite"></div>
+
+<!-- Theme tokens the VS Code webview normally gets from the workbench. -->
+<script>
+  (function () {
+    var root = document.documentElement;
+    root.style.setProperty('--vscode-font-family', 'system-ui, sans-serif');
+    root.style.setProperty('--vscode-foreground', '#cccccc');
+    root.style.setProperty('--vscode-editor-background', '#1e1e1e');
+    root.style.setProperty('--vscode-input-background', '#3c3c3c');
+    root.style.setProperty('--vscode-input-foreground', '#cccccc');
+    root.style.setProperty('--vscode-input-border', '#3c3c3c');
+    root.style.setProperty('--vscode-input-placeholderForeground', '#a0a0a0');
+    root.style.setProperty('--vscode-focusBorder', '#007fd4');
+    root.style.setProperty('--vscode-descriptionForeground', '#9d9d9d');
+    root.style.setProperty('--vscode-panel-border', '#2b2b2b');
+    root.style.setProperty('--vscode-list-hoverBackground', '#2a2d2e');
+    root.style.setProperty('--vscode-list-activeSelectionBackground', '#04395e');
+    root.style.setProperty('--vscode-list-activeSelectionForeground', '#ffffff');
+    root.style.setProperty('--vscode-badge-background', '#4d4d4d');
+    root.style.setProperty('--vscode-badge-foreground', '#ffffff');
+    root.style.setProperty('--vscode-keybindingLabel-background', '#3a3d41');
+    root.style.setProperty('--vscode-keybindingLabel-foreground', '#cccccc');
+    root.style.setProperty('--vscode-keybindingLabel-border', '#515151');
+    root.style.setProperty('--vscode-textPreformat-foreground', '#d7ba7d');
+    root.style.setProperty('--vscode-testing-iconPassed', '#89d185');
+    root.style.setProperty('--vscode-editorWarning-foreground', '#cca700');
+    root.style.setProperty('--vscode-editorError-foreground', '#f48771');
+  })();
+</script>
+
+<!-- Apply the ?backend= query override BEFORE bootstrap.js runs (module scripts
+     execute after parsing; classic scripts run inline in order, so the attribute
+     is final by the time the deferred bootstrap reads it). The bootstrap also
+     honours the query parameter itself per the production contract. -->
+<script>
+  (function () {
+    var backend = new URLSearchParams(location.search).get('backend');
+    if (backend === 'webgl' || backend === 'webgpu') {
+      document.body.setAttribute('data-gpu-backend', backend);
+      document.getElementById('gpu-backend').setAttribute('data-backend', backend);
+    }
+  })();
+</script>
+
+<!-- Harness scaffolding: the SAME deterministic protocol fixtures + fixture
+     bridge as test/harness/index.html (defines window.vscode /
+     window.acquireVsCodeApi / __editchainSetScenario / __editchainStart and
+     dispatches GetWindow/GetLayout/Open against the selected scenario). -->
+<script src="./fixtures.js"></script>
+<script src="./fixtureBridge.js"></script>
+
+<!-- The REAL production renderer (media/main.js — the same file the VS Code
+     webview loads, acquired once and shared via window.__editchainVscode).
+     It renders into the production #rows above; the GPU bootstrap observes it. -->
+<script src="../../media/main.js"></script>
+
+<!-- The REAL production GPU bootstrap (media/gpu-preview/bootstrap.js). ES module
+     contract: it initializes the wasm-bindgen pkg named by data-gpu-module /
+     data-gpu-wasm, reuses window.__editchainVscode, overlays a transparent
+     canvas on the rendered .graph-cell column, serializes ONE frame per
+     renderer.render(JSON.stringify(frame), width, height, scale), mirrors
+     data-row/data-key markers into #gpu-rows, and exposes
+     window.__editchainGpuDebug:
+
+       whenIdle(timeoutMs) -> Promise<{ generation, elapsedMs }>
+                              resolves only when the render is settled
+                              (dataReady true, no in-flight work, stable frames)
+       snapshot()          -> { rows: [{ index, key, node_key?, lane,
+                                         above, below, transitions, ... }],
+                                total, backend }
+       metrics()           -> renderer metrics object (timing/DOM counts)
+       backend()           -> 'webgl' | 'webgpu'
+       dataReady           -> boolean (true after the first window renders)
+       lastError           -> string|null (null while healthy)
+
+     The wasm blob is fetched over HTTP(S) with MIME application/wasm by the
+     harness server; wasm-bindgen's URL resolution is relative to import.meta /
+     document baseURI and works unchanged. -->
+<script type="module" src="../../media/gpu-preview/bootstrap.js"></script>
+
+<div id="harness-status">EditChain GPU harness — idle</div>
+</body>
+</html>

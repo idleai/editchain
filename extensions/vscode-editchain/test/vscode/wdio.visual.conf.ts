@@ -1,16 +1,30 @@
 import type { Options } from '@wdio/types';
 
-// WebdriverIO config for testing the EditChain extension in REAL VS Code.
+// WebdriverIO config for the deterministic visual state matrix in REAL VS
+// Code (screenshots + animated-scroll recording).
 //
-// wdio-vscode-service downloads/launches VS Code (Extension Development Host),
-// installs the extension, and lets tests drive the workbench + webview.
+// Mirrors wdio.conf.ts exactly (same extension/workspace/service settings and
+// the same DEFAULT `editchain-history.open` command with exactly ONE
+// "EditChain History" panel) but runs ONLY visual-matrix.e2e.ts. The suite
+// drives the default production panel through a deterministic state matrix —
+// initial Activity, Raw profile, find-in-chain current/next, inline selection
+// + keyboard roving, expandable-bundle disclosure (when available),
+// deep virtualized scroll (animated down and back up), and graph-column
+// narrow/wide with the lane-geometry invariant — capturing clearly named
+// full-workbench and webview screenshots plus a JSON/Markdown manifest under
+// trace/visual-matrix/.
 //
-// Run:  npx wdio run ./test/vscode/wdio.conf.ts
+// Record it with:
+//   ./scripts/ui-vscode-record.sh \
+//     .ui-out/vscode-visual-matrix.mp4 \
+//     ./test/vscode/wdio.visual.conf.ts
+//
+// Run:  npx wdio run ./test/vscode/wdio.visual.conf.ts
 
 export const config: Options.Testrunner = {
   outputDir: 'trace',
   // Specs are resolved relative to this config file's directory (test/vscode/).
-  specs: ['./history.e2e.ts'],
+  specs: ['./visual-matrix.e2e.ts'],
   capabilities: [
     {
       browserName: 'vscode',
@@ -44,12 +58,8 @@ export const config: Options.Testrunner = {
   framework: 'mocha',
   mochaOpts: {
     ui: 'bdd',
-    // A real-chain FindInHistory run can spend over two minutes building the
-    // lexical index and capturing full/webview screenshots before it reaches
-    // its navigation assertions. Keep individual WebdriverIO waits strict,
-    // but do not let Mocha terminate the Extension Development Host between a
-    // click command and the corresponding Rust render.
-    timeout: 480000,
+    // Bounds the whole matrix (first window + lazy find index + transitions).
+    timeout: 720000,
   },
   // Keep logs concise; the harness artifacts go to trace/.
   logLevel: 'info',

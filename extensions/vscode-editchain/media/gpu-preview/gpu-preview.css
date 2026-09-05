@@ -1,0 +1,134 @@
+/* Default Rust/WASM GPU renderer overlay stylesheet.
+ *
+ * Shared by two hosts:
+ *   - the VS Code GPU webview (getGpuHtml in src/extension.ts), which loads
+ *     media/main.css + media/main.js FIRST and this file on top;
+ *   - the standalone Puppeteer harness (test/harness/gpu.html), which mirrors
+ *     that exact production scaffold.
+ *
+ * Production (media/main.css + media/main.js) owns the controls, virtual
+ * paging, search, work-unit/bundle/promotion rows, selection/keyboard/
+ * disclosure, raw JSON routing, responsive columns, accessibility and resize.
+ * This sheet adds ONLY the GPU chrome:
+ *   - a slim toolbar (backend badge + renderer status);
+ *   - a TRANSPARENT canvas overlay aligned over the rendered .graph-cell
+ *     column (pointer-events: none; z-index below the sticky header and the
+ *     group chips so production UI stays interactive and readable);
+ *   - the rule that hides the per-row SVG graph cells while the GPU canvas is
+ *     active (the DOM rows and their text/interactions are untouched);
+ *   - a hidden #gpu-rows mirror carrying data-row/data-key per rendered row
+ *     (harness/e2e DOM contract) and the visually-hidden live region.
+ *
+ * While the GPU is NOT active (no rows yet, or a render error), body lacks
+ * `.gpu-canvas-active` and the production SVG graphs remain visible — the
+ * renderer degrades to the deprecated SVG fallback instead of a blank rail.
+ */
+
+:root {
+  --gpu-border: color-mix(in srgb, var(--vscode-panel-border, #30343a) 76%, transparent);
+  --gpu-muted: var(--vscode-descriptionForeground, #9da3ad);
+}
+
+/* Slim GPU status strip above the production controls. This is GPU-specific
+   chrome; it never reflows the production grid below it. */
+#gpu-toolbar {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  min-height: 28px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--gpu-border);
+  background: color-mix(in srgb, var(--vscode-editor-background, #0e1116) 90%, #5078a0 10%);
+}
+
+#gpu-backend {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  padding: 1px 8px;
+  border: 1px solid color-mix(in srgb, var(--vscode-focusBorder, #4ca6ea) 48%, transparent);
+  border-radius: 999px;
+  color: #b9e4ff;
+  background: color-mix(in srgb, var(--vscode-focusBorder, #147fc2) 20%, transparent);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+#gpu-backend[data-backend='webgpu'] {
+  color: #cbf5d8;
+  border-color: color-mix(in srgb, #57cc7a 55%, transparent);
+  background: color-mix(in srgb, #57cc7a 17%, transparent);
+}
+
+#gpu-status {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--gpu-muted);
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The overlay anchor: #layout becomes the containing block for the absolute
+   canvas surface so it tracks the #rows viewport exactly (including scroll,
+   resize, and the sticky header). */
+#layout {
+  position: relative;
+}
+
+/* Transparent GPU canvas surface. Sizing/positioning are set by bootstrap.js
+   from the rendered .graph-cell column each frame; pointer-events none keeps
+   every production row interaction (selection, disclosure, dblclick JSON)
+   untouched. z-index 0 paints above row backgrounds but below the sticky
+   header (z-index 3), group chips, and any graph-cell content. */
+#gpu-canvas-host {
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+#gpu-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: transparent;
+}
+
+/* Hidden DOM mirror (data-row/data-key per rendered row) for the harness and
+   e2e runners. Kept out of layout and the accessibility tree: the VISIBLE rows
+   are the production #rows elements. */
+#gpu-scroll {
+  display: none;
+}
+
+#gpu-rows {
+  display: none;
+}
+
+/* While the GPU canvas is active, replace ONLY the per-row SVG graph: the DOM
+   rows (backgrounds, hover/selection, text cells, interactions) stay exactly
+   as production renders them. visibility (not display) preserves the cell's
+   layout box so the grid template and scroll math are untouched. */
+body.gpu-canvas-active .graph-cell svg.graphCell {
+  visibility: hidden;
+}
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}

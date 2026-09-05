@@ -16,8 +16,15 @@
 // design target is ~1M nodes).
 //
 
+// The VS Code API is acquired EXACTLY ONCE per webview and shared through a
+// window handle (window.__editchainVscode). The GPU preview bootstrap
+// (media/gpu-preview/bootstrap.js) reuses this handle instead of acquiring a
+// second, incompatible API object, so both renderers talk to the same host
+// bridge. The primary webview and the harness (which installs its own
+// acquireVsCodeApi) are unchanged: the first acquisition wins and every later
+// consumer shares it.
 // @ts-ignore — vscode provides this global in webviews.
-const vscode = acquireVsCodeApi();
+const vscode = window.__editchainVscode || (window.__editchainVscode = acquireVsCodeApi());
 // Distinguishes this concrete main.js context from an older one owned by the
 // same WebviewPanel. The host uses it to replay Open only after this instance's
 // message listener is installed, never during an ordinary retained reveal.
@@ -1470,12 +1477,17 @@ const GRAPH_MAX_FRACTION = 0.5;
 // Compact graph-rail cap for narrow panels (must match the <=480px CSS media
 // query that drops the Author column). Below this width the rail switches to a
 // fixed compact width instead of taking half the viewport, so Content keeps a
-// readable budget — every service lane is still drawn (laneX distributes lane
-// centres across the full column, see graphLaneWidth/laneX). The rail is
-// SHRUNK, never hidden: it stays >= MIN_COL_W.graph at all widths.
+// readable budget — every service lane is still drawn inside the natural graph
+// rail (see graphLaneWidth/laneX). The rail is SHRUNK, never hidden: it stays
+// >= MIN_COL_W.graph at all widths.
 const GRAPH_MAX_W_NARROW = 120;
 // Lane-spacing floor in px when lane count exceeds the natural budget.
 const MIN_LANE_W = 1.5;
+// Pulse rail pitch factor: the default lane pitch is `LANE_W * LANE_W_PULSE_SCALE`
+// (a quiet navigation rail). It is a FIXED constant — it never switches with
+// divider state — so lane X positions stay put when the graph column divider
+// is dragged left/right (only the column width changes).
+const LANE_W_PULSE_SCALE = 0.82;
 
 /** Pixel budget for the graph column.
  *
@@ -1533,21 +1545,21 @@ function bundleTerminalRadius() {
 
 /** Effective per-lane pixel width.
  *
- * Normally `LANE_W`; when the lane count would exceed the graph budget, lanes
- * compress (down to `MIN_LANE_W`). There is NO hard lane-count cap: every
- * service lane is drawn, with spacing compressing inside the graph budget
- * (and, beyond the compression floor, laneX distributes centres proportionally
- * across the full column so no lane is ever clipped). User-dragged graph
- * widths are unaffected.
+ * Normally `LANE_W * LANE_W_PULSE_SCALE` (Pulse's quiet-rail pitch); when the
+ * lane count would exceed the graph budget, lanes compress (down to
+ * `MIN_LANE_W`). There is NO hard lane-count cap: every service lane is drawn,
+ * with spacing compressing inside the natural graph budget (and, beyond the
+ * compression floor, laneX distributes centres proportionally across that
+ * natural width). The Pulse pitch factor is a fixed constant applied in EVERY
+ * divider state — never conditional on whether the graph column was manually
+ * resized — so lane X positions stay put when the divider is dragged
+ * left/right. A manually narrowed column may therefore clip rightmost lanes.
  */
 function graphLaneWidth() {
   const numLanes = maxLane + 1;
-  // Pulse compresses topology into a quiet navigation rail. A manually resized
-  // Graph column remains authoritative and therefore uses normal lane spacing.
-  const pulseScale = colWidths.graph !== null ? 1 : 0.82;
   return Math.max(
     MIN_LANE_W,
-    Math.min(LANE_W * pulseScale, graphWidthBudget() / (numLanes + 1))
+    Math.min(LANE_W * LANE_W_PULSE_SCALE, graphWidthBudget() / (numLanes + 1))
   );
 }
 
@@ -1555,12 +1567,15 @@ function graphLaneWidth() {
  *
  * Natural placement for ordinary lane counts. If the lane count exceeds what
  * the column can fit at `MIN_LANE_W` (extreme chains), every lane centre is
- * distributed proportionally across the full column width instead — distinct
- * lanes stay monotonic and no lane is drawn outside the graph cell.
+ * distributed proportionally across the natural graph width instead. Lane
+ * positions are computed against the NATURAL graph width (lane geometry only),
+ * never the divider-dragged width, so resizing the graph column left/right clips
+ * lanes at the column edge or adds trailing space — it never rescales the
+ * topology, and distinct lanes stay monotonic.
  */
 function laneX(lane) {
   const w = graphLaneWidth();
-  const width = currentGraphWidth();
+  const width = graphNaturalWidth();
   const numLanes = maxLane + 1;
   if (numLanes * w <= width) {
     return w / 2 + lane * w + w / 2;
@@ -3704,27 +3719,32 @@ function onViewportResize() {
 // can adjust any column, not just the graph. Handles are re-created on every
 // full rebuild because `reanchorTo` rebuilds the table DOM.
 
-/** Current effective graph column width (override or natural).
+/** Natural graph column width derived from lane geometry only.
  *
- * The natural width is `numLanes * LANE_W` (each lane is a fixed `LANE_W`-wide
- * column) plus one extra lane of padding, so the last lane's node dot (centred
- * on the final lane boundary) isn't clipped by the column's overflow. The
- * column never exceeds the viewport graph budget (GRAPH_MAX_FRACTION): lanes
- * compress (graphLaneWidth) and, beyond the compression floor, distribute
- * proportionally inside the budget (laneX) — so NO lane count is ever clipped
- * or allowed to push the content column off-screen. A user drag overrides the
- * natural width entirely.
+ * The natural width is `numLanes * graphLaneWidth()` plus one extra lane of
+ * padding, so the last lane's node dot (centred on the final lane boundary)
+ * isn't clipped at the default width. The column never exceeds the viewport
+ * graph budget (GRAPH_MAX_FRACTION): lanes compress (graphLaneWidth) and,
+ * beyond the compression floor, distribute proportionally inside the budget
+ * (laneX), so the natural graph cannot push the content column off-screen.
+ * Lane geometry pins to this width, so a divider drag overrides the rendered
+ * column width without ever rescaling lane X positions (see `laneX`).
  */
-function currentGraphWidth() {
+function graphNaturalWidth() {
   // Use the GLOBAL max lane (reported by the server) so the graph column width
   // is stable regardless of which window is loaded — lanes don't jump on scroll.
-  if (colWidths.graph !== null) return colWidths.graph;
   const numLanes = maxLane + 1;
   const w = graphLaneWidth();
   const natural = (numLanes + 1) * w;
   // Keep even Pulse's compressed one-lane rail visibly present at narrow
   // widths (the layout contract treats topology as quiet, never absent).
   return Math.round(Math.min(Math.max(32, natural), graphWidthBudget()) * 100) / 100;
+}
+
+/** Current effective graph column width (divider override or natural). */
+function currentGraphWidth() {
+  if (colWidths.graph !== null) return colWidths.graph;
+  return graphNaturalWidth();
 }
 
 /**
@@ -3872,3 +3892,53 @@ window.__editchainViewGen = function () {
   return viewGen;
 };
 window.__editchainProgressiveTimerActive = false;
+
+// GPU preview adapter (consumed by media/gpu-preview/bootstrap.js). Exposes the
+// PRODUCTION graph helpers verbatim so the WASM renderer never re-derives lane
+// budgets, lane compression, viewport breakpoints, or the categorical palette:
+// lane positions, graph width, dot radius, lane spacing, bundle glyph metrics,
+// and colours are computed by THIS renderer and serialized into the GPU frame
+// contract. All values are CSS pixels in the current row coordinate space.
+window.__editchainGraphAdapter = {
+  // Lane X positions for every lane 0..maxLane inclusive (production laneX,
+  // including dense-lane compression inside the graph budget).
+  laneXAll: function () {
+    const positions = [];
+    for (let lane = 0; lane <= maxLane; lane++) positions.push(laneX(lane));
+    return positions;
+  },
+  laneX: function (lane) {
+    return laneX(lane);
+  },
+  laneCount: function () {
+    return maxLane + 1;
+  },
+  laneWidth: function () {
+    return graphLaneWidth();
+  },
+  graphWidth: function () {
+    return currentGraphWidth();
+  },
+  dotRadius: function () {
+    return dotRadius();
+  },
+  bundleTerminalRadius: function () {
+    return bundleTerminalRadius();
+  },
+  bundleHalfSpan: function () {
+    return BUNDLE_HALF_SPAN;
+  },
+  bundleMargin: function () {
+    return BUNDLE_CAPSULE_MARGIN;
+  },
+  // Pulse overrides the base 2px graph stroke to 1.4px (media/main.css).
+  // Keep the GPU graph on the exact active production treatment.
+  lineWidth: 1.4,
+  colors: function () {
+    return COLORS.slice();
+  },
+  rowHeight: ROW_H,
+  isBundle: function (row) {
+    return isActivityBundle(row);
+  },
+};
