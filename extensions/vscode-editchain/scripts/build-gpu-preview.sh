@@ -17,6 +17,15 @@ if ! command -v wasm-bindgen >/dev/null 2>&1; then
   exit 1
 fi
 
+# rustc bakes absolute build paths (CARGO_HOME registry sources and RUSTUP_HOME
+# std sources) into panic-location strings, so the wasm bytes would otherwise
+# differ between machines (e.g. CI vs local) and the committed-artifact
+# regeneration check would fail. Remap both roots to fixed prefixes so the
+# generated pkg tree is byte-identical everywhere.
+CARGO_HOME_BASE="${CARGO_HOME:-$HOME/.cargo}"
+RUSTUP_HOME_BASE="${RUSTUP_HOME:-$HOME/.rustup}"
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${CARGO_HOME_BASE}=/cargo --remap-path-prefix=${RUSTUP_HOME_BASE}=/rustup"
+
 cargo build \
   --manifest-path "$REPOSITORY_DIR/Cargo.toml" \
   --package editchain-gpu-preview \
