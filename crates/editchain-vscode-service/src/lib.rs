@@ -679,7 +679,10 @@ fn compact_import_payload(
 /// bounded structural/content signal for tool-payload carriers
 /// (`arguments`/`input`/`parameters`), and structured outcome evidence
 /// (`status`, `exitCode`, `errorMessage` at `payload` or `payload.item`
-/// level, plus the canonical three-line Codex execution-result header).
+/// level, plus the canonical three-line Codex execution-result header). Codex
+/// token-usage records retain only their bounded identity strings and empty
+/// usage-object markers so legacy metadata classification can validate the
+/// complete schema without retaining accounting values.
 /// Large outputs stay bounded to the display preview limits, and blob-backed
 /// imports pass through the same bounded preview path, so the full record is
 /// never copied into the projection.
@@ -709,6 +712,16 @@ fn compact_import_record(bytes: &[u8]) -> Vec<u8> {
         let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "agent_nickname");
         if !payload.is_empty() {
             drop(compact.insert("payload".to_string(), serde_json::Value::Object(payload)));
+        }
+    } else if record_type == "assistant" {
+        let message_start = raw.find("\"message\"").unwrap_or(0);
+        let mut message = serde_json::Map::new();
+        let truncated = copy_preview_string(&raw, message_start, &mut message, "id");
+        if truncated {
+            drop(message.remove("id"));
+        }
+        if !message.is_empty() {
+            drop(compact.insert("message".to_string(), serde_json::Value::Object(message)));
         }
     } else if record_type == "event_msg" || record_type == "response_item" {
         let payload_start = raw.find("\"payload\"").unwrap_or(0);
@@ -835,6 +848,18 @@ fn compact_import_value(value: &serde_json::Value) -> serde_json::Value {
                 serde_json::Value::String(first_nested_json_text(value).unwrap_or_default()),
             ));
         }
+        "assistant" => {
+            let mut message = serde_json::Map::new();
+            let truncated = value
+                .get("message")
+                .is_some_and(|source| copy_bounded_field(source, &mut message, "id"));
+            if truncated {
+                drop(message.remove("id"));
+            }
+            if !message.is_empty() {
+                drop(compact.insert("message".to_string(), serde_json::Value::Object(message)));
+            }
+        }
         _ => {}
     }
     if let Some(payload) = value.get("payload") {
@@ -849,6 +874,25 @@ fn compact_import_value(value: &serde_json::Value) -> serde_json::Value {
         if record_type == "session_meta" {
             let _: bool = copy_bounded_field(payload, &mut compact_payload, "model_provider");
             let _: bool = copy_bounded_field(payload, &mut compact_payload, "agent_nickname");
+        }
+        if record_type == "token_usage_record" {
+            for field in [
+                "thread_id",
+                "turn_id",
+                "session_id",
+                "root_turn_id",
+                "response_id",
+            ] {
+                let _: bool = copy_bounded_field(payload, &mut compact_payload, field);
+            }
+            for field in ["usage", "turn_token_usage", "thread_token_usage"] {
+                if payload.get(field).is_some_and(serde_json::Value::is_object) {
+                    drop(compact_payload.insert(
+                        field.to_string(),
+                        serde_json::Value::Object(serde_json::Map::new()),
+                    ));
+                }
+            }
         }
         copy_string_field(payload, &mut compact_payload, "type");
         copy_string_field(payload, &mut compact_payload, "role");
@@ -1959,6 +2003,11 @@ impl Workspace {
         } else {
             nodes
         };
+        let nodes = if let Some(structural) = structural.as_ref() {
+            editchain_project::activity::bundle_claude_response_tool_fragments(nodes, structural)
+        } else {
+            nodes
+        };
         annotations = editchain_project::activity::annotate_activity_rows(&nodes);
         let sub_op_counts: Vec<usize> = nodes.iter().map(|node| node.sub_ops().len()).collect();
         let mut starts = Vec::with_capacity(nodes.len().saturating_add(1));
@@ -2519,7 +2568,7 @@ pub fn search_hit_from_chunk(
 /// that shares the row) is in `op_rows`, otherwise through the projection's
 /// semantic-collapse representative map (`visible_op_id`) to the canonical row
 /// that renders the op — a folded normalized child, META sub-op, tool result,
-/// or fork prologue. A canonical row that is absent from `op_rows` is hidden by
+/// or copied provider occurrence. A canonical row that is absent from `op_rows` is hidden by
 /// the active filter/profile and dropped. `Git` hits resolve by real
 /// `(repository, oid)` identity from `git_identities` (never the synthetic
 /// index-only op id), so submodule rows hidden by `hide_submodules` are absent
@@ -2877,9 +2926,9 @@ fn node_sub_op_meta(
 
 /// Map the projection's provider-neutral relation kind to the protocol enum.
 ///
-/// The projection derives kinds from `SubagentOf` / `ReconnectsTo` / `ForkOf`
-/// structural notes; the protocol enum has exactly those three variants plus a
-/// forward-compatible `Unknown` (never produced by this service today).
+/// The projection derives kinds from exact spawn, reconnect, and fork facts;
+/// the protocol enum has exactly those three variants plus a forward-compatible
+/// `Unknown` (never produced by this service today).
 #[must_use]
 fn protocol_relation_kind(kind: editchain_project::RelationKind) -> ParentRelationKind {
     match kind {
@@ -2922,17 +2971,48 @@ fn sub_op_label(op: &Op) -> (String, String) {
     };
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
         if let Some(record_type) = value.get("type").and_then(serde_json::Value::as_str) {
-            let label = if record_type == "event_msg" {
+            let label = if record_type == "assistant" {
+                value
+                    .get("message")
+                    .and_then(|message| message.get("content"))
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|content| content.first())
+                    .and_then(|block| {
+                        let kind = block.get("type").and_then(serde_json::Value::as_str)?;
+                        match kind {
+                            "tool_use" => block
+                                .get("name")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|name| !name.is_empty())
+                                .map(|name| format!("tool: {name}")),
+                            "text" => block
+                                .get("text")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|text| !text.trim().is_empty())
+                                .map(tool_result_preview),
+                            "thinking" => Some("thinking".to_string()),
+                            other if !other.is_empty() => Some(other.to_string()),
+                            _ => None,
+                        }
+                    })
+                    .unwrap_or_else(|| record_type.to_string())
+            } else if record_type == "event_msg" {
                 value
                     .get("payload")
                     .and_then(|payload| payload.get("type"))
                     .and_then(serde_json::Value::as_str)
                     .filter(|event_type| !event_type.is_empty())
                     .unwrap_or(record_type)
+                    .to_string()
             } else {
-                record_type
+                record_type.to_string()
             };
-            return (label.to_string(), label.to_string());
+            let kind = if record_type == "assistant" && label.starts_with("tool:") {
+                "tool".to_string()
+            } else {
+                label.clone()
+            };
+            return (label, kind);
         }
     }
     (raw, "meta".to_string())
@@ -3723,6 +3803,7 @@ mod tests {
         if meta {
             tags |= Tags::META;
         }
+        let record_type = if meta { "last-prompt" } else { "user" };
         Op {
             id: OpId::new(NodeId(node), 0, seq),
             parents: ParentSet::None,
@@ -3732,7 +3813,7 @@ mod tests {
             tags,
             kind: OpKind::Import(ImportOp {
                 raw_ref: Payload::Inline(
-                    format!(r#"{{"type":"last-prompt","seq":{seq}}}"#).into_bytes(),
+                    format!(r#"{{"type":"{record_type}","seq":{seq}}}"#).into_bytes(),
                 ),
                 raw_hash: None,
             }),
@@ -3755,9 +3836,9 @@ mod tests {
         }
     }
 
-    /// Build a structural relationship note (the shape `emit_codex_relationship_notes`
-    /// produces): causal parent `parent`, targets `targets`, META-tagged so the
-    /// projection folds it out of rendered rows and reads it as a virtual edge.
+    /// Build a versioned exact relationship fact: causal parent `parent`,
+    /// targets `targets`, META-tagged so the projection folds it out of rendered
+    /// rows and reads it as a virtual edge.
     fn structural_note(
         id: OpId,
         parent: OpId,
@@ -3775,7 +3856,9 @@ mod tests {
             kind: OpKind::Note(editchain_core::op::NoteOp {
                 target_ids: targets,
                 relationship,
-                content: Payload::Empty,
+                content: Payload::Inline(
+                    br#"{"confidence":"exact","resolver":"service-test-v1"}"#.to_vec(),
+                ),
             }),
         }
     }
@@ -3784,8 +3867,8 @@ mod tests {
     fn history_window_exposes_structural_relationship_kinds() {
         // A parent thread (node 1) spawns a subagent thread (node 2) and
         // reconnects into it; a third thread (node 3) forks off the parent.
-        // The structural notes drive untyped virtual edges in the projection;
-        // the service must tag those edges with their provider-neutral kinds.
+        // Exact relationship facts drive typed virtual edges in the projection;
+        // the service must preserve their provider-neutral kinds.
         let trunk = import_op(1, 1, false);
         let spawn_marker = message_op(1, 3, trunk.id);
         let sub_first = import_op(2, 1, false);
@@ -3804,7 +3887,7 @@ mod tests {
                 OpId::new(NodeId(1), 0, 0xFFFC),
                 sub_first.id,
                 vec![spawn_marker.id],
-                editchain_core::NoteRelationship::SubagentOf,
+                editchain_core::NoteRelationship::SpawnedBy,
                 2,
             ),
             structural_note(
@@ -3836,7 +3919,7 @@ mod tests {
             include_layout: true,
         });
 
-        // SubagentOf: the subagent thread's first op carries a "subagent"
+        // SpawnedBy: the subagent thread's first op carries a "subagent"
         // relation to the CANONICAL spawn anchor. The raw target (the folded
         // spawn marker op) resolves through the representative map to the
         // trunk's visible import row, which is the parent the row actually
@@ -4023,7 +4106,10 @@ mod tests {
         // own expanded row immediately after the parent.
         let turn = import_op(1, 1, false);
         let msg = message_op(1, 2, turn.id);
-        let meta = import_op(1, 3, true);
+        let meta = Op {
+            parents: ParentSet::One(turn.id),
+            ..import_op(1, 3, true)
+        };
 
         // q6 Phase-1: bundling is driven by explicit ProjectionOptions, not a global
         // toggle — no mutex needed; each projection is independently configured.
@@ -4081,11 +4167,14 @@ mod tests {
     #[test]
     fn meta_bundle_default_standalone_opt_in_bundles() {
         // META imports render standalone by default (no cross-session grouping).
-        // Only when META bundling is re-enabled do they collapse into the nearest
-        // preceding real node as an expanded sub-op row.
+        // Only when META bundling is re-enabled do they contract along their
+        // exact stored parent into an expanded sub-op row.
         let turn = import_op(1, 1, false);
         let msg = message_op(1, 2, turn.id);
-        let meta = import_op(1, 3, true);
+        let meta = Op {
+            parents: ParentSet::One(turn.id),
+            ..import_op(1, 3, true)
+        };
 
         // Default (bundling off): META is a standalone top-level row.
         let projection_off =
@@ -4153,7 +4242,10 @@ mod tests {
             ..turn.clone()
         };
         let msg = message_op(5, 6, turn.id); // child of turn
-        let meta = import_op(5, 7, true); // bundled under turn
+        let meta = Op {
+            parents: ParentSet::One(turn.id),
+            ..import_op(5, 7, true)
+        }; // bundled under turn
 
         let opts = editchain_project::ProjectionOptions {
             bundle_metadata: true,
@@ -4212,6 +4304,24 @@ mod tests {
         let (summary, kind) = sub_op_label(&op);
         assert_eq!(summary, "task_complete");
         assert_eq!(kind, "task_complete");
+    }
+
+    #[test]
+    fn sub_op_label_preserves_folded_claude_tool_fragment() {
+        let op = op_envelope(
+            1,
+            1,
+            OpKind::Import(ImportOp {
+                raw_ref: Payload::Inline(
+                    br#"{"type":"assistant","message":{"id":"msg-1","content":[{"type":"tool_use","name":"Read"}]}}"#
+                        .to_vec(),
+                ),
+                raw_hash: None,
+            }),
+        );
+        let (summary, kind) = sub_op_label(&op);
+        assert_eq!(summary, "tool: Read");
+        assert_eq!(kind, "tool");
     }
 
     #[test]
@@ -5000,6 +5110,18 @@ mod tests {
         assert_eq!(session_prefix["payload"]["model_provider"], "sglang_dsv4");
         assert_eq!(session_prefix["payload"]["agent_nickname"], "Harvey");
 
+        // Legacy token-usage imports need their exact schema shape during
+        // projection, but never their accounting values.
+        let usage = compact_import_record(
+            br#"{"type":"token_usage_record","payload":{"thread_id":"0195cda5-433d-7f9a-9d7b-a9f15b60c2e2","turn_id":"turn-1","session_id":"0195cda5-433d-7f9a-9d7b-a9f15b60c2e2","root_turn_id":"turn-1","response_id":"response-1","usage":{"total_tokens":13},"turn_token_usage":{"total_tokens":13},"thread_token_usage":{"total_tokens":13}}}"#,
+        );
+        let usage: serde_json::Value = serde_json::from_slice(&usage).unwrap();
+        assert_eq!(usage["type"], "token_usage_record");
+        assert_eq!(usage["payload"]["turn_id"], "turn-1");
+        for field in ["usage", "turn_token_usage", "thread_token_usage"] {
+            assert_eq!(usage["payload"][field], serde_json::json!({}));
+        }
+
         // Large outputs are bounded, never copied into the projection.
         let huge = format!(
             r#"{{"type":"response_item","payload":{{"type":"function_call_output","output":"{}"}}}}"#,
@@ -5027,6 +5149,24 @@ mod tests {
                 .starts_with("[external_agent_tool_result]"),
             "marker recovered from truncated blob preview"
         );
+    }
+
+    #[test]
+    fn compact_import_record_preserves_exact_claude_response_identity() {
+        let complete = compact_import_record(
+            br#"{"parentUuid":"parent-1","type":"assistant","message":{"id":"msg-response-1","content":[{"type":"tool_use","id":"call-1"}]}}"#,
+        );
+        let complete: serde_json::Value = serde_json::from_slice(&complete).unwrap();
+        assert_eq!(complete["type"], "assistant");
+        assert_eq!(complete["message"]["id"], "msg-response-1");
+
+        // Blob previews can end before the large content body closes. Identity
+        // is near the envelope start and remains exact in that prefix path.
+        let prefix = compact_import_record(
+            br#"{"parentUuid":"parent-1","type":"assistant","message":{"id":"msg-response-1","content":[{"type":"tool_use","input":"unterminated"#,
+        );
+        let prefix: serde_json::Value = serde_json::from_slice(&prefix).unwrap();
+        assert_eq!(prefix["message"]["id"], "msg-response-1");
     }
 
     #[test]
@@ -5834,7 +5974,10 @@ mod tests {
         // the single visible top-level row, keeping the best BM25 score.
         let turn = import_op(1, 1, false);
         let msg = message_op(1, 2, turn.id);
-        let meta = import_op(1, 3, true);
+        let meta = Op {
+            parents: ParentSet::One(turn.id),
+            ..import_op(1, 3, true)
+        };
         let opts = editchain_project::ProjectionOptions {
             bundle_metadata: true,
         };
@@ -5907,6 +6050,7 @@ mod tests {
         let bundle = editchain_project::HistoryNode::ExecuteBundle {
             anchor: std::sync::Arc::new(anchor.clone()),
             source_time: editchain_project::EffectiveTime::Observed(1_000),
+            parent_override: None,
             member_nodes: Vec::new(),
             members: vec![
                 std::sync::Arc::new(member_a.clone()),

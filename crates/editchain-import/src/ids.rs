@@ -148,6 +148,34 @@ pub fn derive_session_id(session_uuid: &str) -> SessionId {
     SessionId(hash_prefix_u64(hash))
 }
 
+/// Derive a deterministic local handle for an external provider entity.
+///
+/// External entities (provider events, tool calls, executions, and similar
+/// identities) are relation endpoints, not accepted operations. The handle uses
+/// 160 bits from a domain-separated SHA-256 digest so it cannot be confused with
+/// a source-position derivation by construction of the input namespace. The full
+/// provider identifier remains in raw evidence and relation-note content; this
+/// compact handle is only the graph/index key.
+///
+/// # Panics
+///
+/// This function cannot panic — SHA-256 always produces 32 bytes.
+#[must_use]
+#[expect(
+    clippy::expect_used,
+    reason = "SHA-256 output is always 32 bytes and all slices are fixed in-bounds ranges"
+)]
+pub fn derive_external_entity_id(namespace: &str, external_id: &str) -> OpId {
+    let hash: [u8; 32] = Sha256::digest(
+        format!("editchain:external-entity:v1:{namespace}:{external_id}").as_bytes(),
+    )
+    .into();
+    let node = u64::from_le_bytes(hash[0..8].try_into().expect("8-byte node digest"));
+    let boot = u32::from_le_bytes(hash[8..12].try_into().expect("4-byte boot digest"));
+    let seq = u64::from_le_bytes(hash[12..20].try_into().expect("8-byte seq digest"));
+    OpId::new(NodeId(node), boot, seq)
+}
+
 /// Derive a `TurnId` from a turn identifier string.
 ///
 /// # Panics
@@ -197,6 +225,26 @@ pub fn derive_source_stream(
         format!("editchain:source-stream:v1:{workspace_path}:{session_file_path}").as_bytes(),
     )
     .into();
+    SourceStream {
+        node: NodeId(hash_prefix_u64(hash)),
+        boot,
+    }
+}
+
+/// Derive a portable source stream from a provider-owned source key.
+///
+/// Unlike the legacy path-based derivation, this identity does not include the
+/// workspace path or the absolute sessions root. A transcript therefore keeps
+/// the same stream when an exact provider-relative source is copied between an
+/// archive and its live sessions directory.
+///
+/// # Panics
+///
+/// This function cannot panic — SHA-256 always produces 32 bytes.
+#[must_use]
+pub fn derive_keyed_source_stream(source_key: &str, boot: u32) -> SourceStream {
+    let hash: [u8; 32] =
+        Sha256::digest(format!("editchain:source-stream:v2:{source_key}").as_bytes()).into();
     SourceStream {
         node: NodeId(hash_prefix_u64(hash)),
         boot,

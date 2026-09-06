@@ -40,12 +40,13 @@ pub enum RecordClass {
 /// Classify a Claude Code envelope into a [`RecordClass`].
 ///
 /// `BundleMetadata` records (e.g. `last-prompt`, `permission-mode`,
-/// `custom-title`, `mode`, `agent-name`, `file-history-snapshot`,
-/// `queue-operation`, telemetry `system` subtypes, whitespace-only assistant
-/// streaming artifacts, and environment/listing attachments) are bundled as
-/// sub-ops of a real turn/tool node rather than occupying their own graph
-/// row/lane. They are tagged `META` so the projection can group them without
-/// re-parsing the raw JSONL.
+/// `custom-title`, `mode`, `agent-name`, file-history bookkeeping,
+/// `fork-context-ref`, `atis-latch`, `queue-operation`, telemetry `system`
+/// subtypes, whitespace-only assistant streaming artifacts, and
+/// environment/listing attachments) are bundled as sub-ops of a real
+/// turn/tool node rather than occupying their own graph row/lane. They are
+/// tagged `META` so the projection can group them without re-parsing the raw
+/// JSONL.
 #[must_use]
 pub fn record_class(env: &CcEnvelope) -> RecordClass {
     match env.record_type.as_str() {
@@ -55,6 +56,9 @@ pub fn record_class(env: &CcEnvelope) -> RecordClass {
         | "mode"
         | "agent-name"
         | "file-history-snapshot"
+        | "file-history-delta"
+        | "fork-context-ref"
+        | "atis-latch"
         | "queue-operation"
         | "ai-title" => RecordClass::BundleMetadata,
         // Telemetry system records carry no user-facing prose — bundle.

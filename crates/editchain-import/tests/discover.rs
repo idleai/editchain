@@ -69,3 +69,28 @@ fn discover_subagents_in_session_subdir() {
         .iter()
         .all(|s| s.parent_session_id.as_deref() == Some("sess-1")));
 }
+
+#[test]
+fn discover_recurses_into_workflow_subkeys() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("sess-1.jsonl"), "{}\n").unwrap();
+    let workflow = dir
+        .path()
+        .join("sess-1")
+        .join("subagents")
+        .join("workflows")
+        .join("wf-1");
+    std::fs::create_dir_all(&workflow).unwrap();
+    std::fs::write(workflow.join("agent-deep.jsonl"), "{}\n").unwrap();
+    std::fs::write(workflow.join("journal.jsonl"), "{}\n").unwrap();
+
+    let sessions = discover_sessions(dir.path()).unwrap();
+
+    assert_eq!(sessions.len(), 3);
+    assert!(sessions
+        .iter()
+        .any(|source| source.session_id == "deep" && source.is_subagent));
+    assert!(sessions.iter().any(|source| {
+        source.session_id == "subagents/workflows/wf-1/journal" && !source.is_subagent
+    }));
+}

@@ -2,17 +2,18 @@
 
 use editchain_core::Op;
 
-use crate::claude_code::discover::{discover_sessions, SessionFile};
+use crate::claude_code::discover::discover_sessions;
 use crate::claude_code::envelope::parse_envelope;
 use crate::claude_code::normalize::{normalize_envelope, NormalizeOptions};
 use crate::claude_code::reader::read_session_file;
-use crate::cursor::check_file_generation;
+use crate::claude_code::topology::{
+    relation_facts_for_envelope, spawn_fact, CLAUDE_NORMALIZATION_VERSION,
+};
+use crate::cursor::{check_file_generation, resolve_source_cursor};
 use crate::error::ImportError;
-use crate::fork::emit_fork_notes;
-use crate::ids::{derive_source_stream, SourcePosition};
+use crate::ids::{derive_session_id, SourcePosition, SourceStream};
 use crate::model::{DiscoveryRequest, ImportOptions, ImportReport};
-use crate::sink::{BlobSink, CursorStore, MemoryOpSink, OpSink};
-use crate::subagent::{emit_subagent_notes_from, SubagentMeta};
+use crate::sink::{BlobSink, CursorStore, OpSink};
 
 /// Import all Claude Code sessions from a directory into editchain operations.
 ///
@@ -46,61 +47,116 @@ pub fn import_claude_code(
     let sessions = discover_sessions(&request.sessions_dir).map_err(ImportError::OpSink)?;
     report.files_discovered = sessions.len();
 
-    // Collect subagent metadata for post-import branch/reconnect linking.
-    let subagent_meta: Vec<SubagentMeta> = sessions
-        .iter()
-        .filter(|s| s.is_subagent)
-        .filter_map(subagent_meta_from)
-        .collect();
-
     let workspace_str = request.workspace_path.to_str().unwrap_or("/workspace");
 
     for session in &sessions {
-        // Check cursor for idempotency.
-        let cursor_key = session.path.to_string_lossy().to_string();
-        let existing_cursor = cursors.get_cursor(&cursor_key)?;
+        // Resolve the provider-relative cursor key. If this chain predates that
+        // contract, the exact absolute-path cursor is migrated while retaining
+        // the node that already owns its immutable operation IDs.
+        let resolved = resolve_source_cursor(
+            cursors,
+            "claude-code",
+            &request.sessions_dir,
+            &session.path,
+            workspace_str,
+        )?;
+        let cursor_key = resolved.canonical_key;
+        let state_key = resolved.state_key;
+        let source_node = resolved.source_node;
+        let migrates_legacy_key = cursor_key != state_key;
+        let mut existing_cursor = resolved.cursor;
+        let needs_topology_upgrade = options.normalize
+            && existing_cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.normalization_version < CLAUDE_NORMALIZATION_VERSION);
+        let needs_cursor_upgrade = migrates_legacy_key
+            || existing_cursor.as_ref().is_some_and(|cursor| {
+                cursor.source_node != Some(source_node) || cursor.content_hash_version < 1
+            });
 
-        // Determine boot generation — increment if file was rewritten.
-        let boot = if let Some(ref cursor) = existing_cursor {
+        // Decide which source bytes need raw emission and whether a complete
+        // topology replay is required. A topology replay reads every record but
+        // emits only new, deterministic relationship facts; raw/semantic op IDs
+        // remain untouched. Rewrites use the durable generation counter rather
+        // than repeatedly colliding in a hard-coded boot 1 lane.
+        let (boot, start_seq, lines, mut new_cursor, topology_replay) = if let Some(cursor) =
+            existing_cursor.as_mut()
+        {
             match check_file_generation(&session.path, cursor) {
                 Ok(true) => {
-                    // File unchanged — skip entirely.
-                    continue;
+                    if needs_topology_upgrade || needs_cursor_upgrade {
+                        let topology_replay = if needs_topology_upgrade {
+                            let (all_lines, _bytes_read, _replayed_cursor) =
+                                read_session_file(&session.path, None)?;
+                            Some(all_lines)
+                        } else {
+                            None
+                        };
+                        (
+                            cursors.get_generation(&state_key)?,
+                            cursor.ops_emitted,
+                            Vec::new(),
+                            cursor.clone(),
+                            topology_replay,
+                        )
+                    } else {
+                        // File unchanged and current — idempotent skip.
+                        continue;
+                    }
                 }
                 Ok(false) => {
-                    // File grew — same boot, read only new bytes.
-                    0
+                    let boot = cursors.get_generation(&state_key)?;
+                    let (new_lines, _bytes_read, new_cursor) =
+                        read_session_file(&session.path, Some(cursor))?;
+                    let topology_replay = if needs_topology_upgrade {
+                        let (all_lines, _bytes_read, _replayed_cursor) =
+                            read_session_file(&session.path, None)?;
+                        Some(all_lines)
+                    } else {
+                        None
+                    };
+                    (
+                        boot,
+                        cursor.ops_emitted,
+                        new_lines,
+                        new_cursor,
+                        topology_replay,
+                    )
                 }
                 Err(ImportError::SourceGenerationChanged { .. }) => {
-                    // File was rewritten — new boot generation.
-                    1
+                    let generation = cursors.get_generation(&state_key)?.saturating_add(1);
+                    cursors.set_generation(&cursor_key, generation)?;
+                    let (lines, _bytes_read, new_cursor) = read_session_file(&session.path, None)?;
+                    (generation, 0, lines, new_cursor, None)
                 }
                 Err(e) => return Err(e),
             }
         } else {
-            0
+            let boot = cursors.get_generation(&cursor_key)?;
+            let (lines, _bytes_read, new_cursor) = read_session_file(&session.path, None)?;
+            (boot, 0, lines, new_cursor, None)
         };
 
         report.files_processed += 1;
 
-        // Derive a deterministic source stream per session file.
-        let stream = derive_source_stream(workspace_str, &cursor_key, boot);
-
-        // Read session file (from cursor offset if appending).
-        let (lines, _bytes_read, new_cursor) =
-            read_session_file(&session.path, existing_cursor.as_ref())?;
+        // The cursor carries the source node explicitly so archive/live-root
+        // relocation never changes existing operation IDs.
+        let stream = SourceStream::new(source_node, boot);
 
         let norm_opts = NormalizeOptions {
             normalize: options.normalize,
             include_thinking: options.include_thinking,
         };
 
-        // Use per-file sequence numbering starting from cursor's last ordinal.
-        let start_seq = existing_cursor.as_ref().map_or(0, |c| c.ops_emitted);
         // Chain raw import ops into a single linear chain per session file: each
-        // line's raw op parents to the previous line's raw op. This makes a
-        // session read as one continuous chain rather than N disconnected roots.
-        let mut prev_raw_id: Option<editchain_core::OpId> = None;
+        // line's raw op parents to the previous physical occurrence, including
+        // across cursor boundaries. Provider parentage remains a separate typed
+        // relation emitted below.
+        let mut prev_raw_id = if start_seq > 0 {
+            Some(stream.op_from_position(SourcePosition::raw(start_seq))?)
+        } else {
+            None
+        };
         for (i, line) in lines.iter().enumerate() {
             let seq = start_seq + i as u64 + 1;
 
@@ -134,6 +190,19 @@ pub fn import_claude_code(
                     let _ = ops.accept_op(norm_op)?;
                     report.normalized_ops += 1;
                 }
+
+                // Current-version incremental/fresh import: emit exact provider
+                // facts for this batch directly from the parsed envelope. An
+                // upgrade run emits the complete source's facts in the replay
+                // below so old and new records use one path.
+                if options.normalize && topology_replay.is_none() {
+                    for fact in
+                        relation_facts_for_envelope(envelope, &stream, seq, &session.session_id)?
+                    {
+                        let _: bool = ops.accept_op(&fact)?;
+                        report.normalized_ops += 1;
+                    }
+                }
             } else {
                 // Unparseable line — still emit as raw ImportOp, chained to the
                 // previous line's raw op using the same ID scheme (seq << 16).
@@ -160,71 +229,62 @@ pub fn import_claude_code(
             }
         }
 
+        // Version upgrade: rebuild topology from complete durable source
+        // evidence, including records whose raw payloads spilled to blobs. This
+        // intentionally emits no historical raw/content ops and is independent
+        // of the output sink's concrete type.
+        if options.normalize {
+            if let Some(all_lines) = topology_replay.as_ref() {
+                for (i, line) in all_lines.iter().enumerate() {
+                    let Some(envelope) = parse_envelope(&line.data) else {
+                        continue;
+                    };
+                    let seq = i as u64 + 1;
+                    for fact in
+                        relation_facts_for_envelope(&envelope, &stream, seq, &session.session_id)?
+                    {
+                        let _: bool = ops.accept_op(&fact)?;
+                        report.normalized_ops += 1;
+                    }
+                }
+            }
+
+            // The sidecar's toolUseId is an exact spawn endpoint. Emit it once
+            // for a fresh generation or topology upgrade; unresolved parent tool
+            // entities stay unresolved in projection instead of falling back to
+            // actor, time, or content matching.
+            if (start_seq == 0 || needs_topology_upgrade)
+                && new_cursor.ops_emitted > 0
+                && session.is_subagent
+            {
+                if let (Some(tool_use_id), Some(parent_session_id)) = (
+                    session.tool_use_id.as_deref(),
+                    session.parent_session_id.as_deref(),
+                ) {
+                    let first_raw = stream.op_from_position(SourcePosition::raw(1))?;
+                    let fact = spawn_fact(
+                        first_raw,
+                        editchain_core::ScopeRef::Session(derive_session_id(parent_session_id)),
+                        tool_use_id,
+                    )?;
+                    let _: bool = ops.accept_op(&fact)?;
+                    report.normalized_ops += 1;
+                }
+            }
+
+            new_cursor.normalization_version = new_cursor
+                .normalization_version
+                .max(CLAUDE_NORMALIZATION_VERSION);
+        }
+        new_cursor.source_node = Some(source_node);
+        new_cursor.content_hash_version = 1;
+        if migrates_legacy_key && boot > 0 {
+            cursors.set_generation(&cursor_key, boot)?;
+        }
+
         // Persist cursor after successful processing.
         cursors.set_cursor(&cursor_key, &new_cursor)?;
     }
 
-    // Post-pass: emit subagent branch/reconnect relationship notes. These are
-    // new ops appended to the sink (not mutations of existing ops), so they work
-    // for any sink that can accept ops — not just in-memory ones. They must run
-    // after all sessions are imported because they need cross-session view.
-    let subagent_notes = emit_subagent_notes(ops, &subagent_meta);
-    for note in &subagent_notes {
-        let _: bool = ops.accept_op(note)?;
-        report.normalized_ops += 1;
-    }
-
-    // Post-pass: emit ForkOf relationship notes linking sessions that are forks
-    // of one original session (shared parentUuid chain) so they render as a fork
-    // rather than duplicated chains.
-    let fork_notes = emit_fork_notes_from(ops);
-    for note in &fork_notes {
-        let _: bool = ops.accept_op(note)?;
-        report.normalized_ops += 1;
-    }
-
     Ok(report)
-}
-
-/// Convert a discovered subagent `SessionFile` into linking metadata.
-fn subagent_meta_from(session: &SessionFile) -> Option<SubagentMeta> {
-    let tool_use_id = session.tool_use_id.clone()?;
-    let parent_session_id = session.parent_session_id.clone()?;
-    Some(SubagentMeta {
-        subagent_session_id: session.session_id.clone(),
-        parent_session_id,
-        tool_use_id,
-    })
-}
-
-/// Emit subagent branch/reconnect relationship notes over the ops already
-/// emitted into a sink.
-///
-/// Reads the collected ops from a [`MemoryOpSink`] (which exposes them as a
-/// slice) and returns the new relationship notes to append. For sinks that do
-/// not expose their op vec, returns an empty vec (linking is best-effort).
-fn emit_subagent_notes(ops: &mut dyn OpSink, meta: &[SubagentMeta]) -> Vec<Op> {
-    if let Some(mem) = ops
-        .as_any_mut()
-        .and_then(|o| o.downcast_mut::<MemoryOpSink>())
-    {
-        emit_subagent_notes_from(&mem.ops, meta)
-    } else {
-        Vec::new()
-    }
-}
-
-/// Emit `ForkOf` relationship notes over the ops already emitted into a sink.
-///
-/// Reads the collected ops from a [`MemoryOpSink`] and returns the new notes to
-/// append. For sinks that do not expose their op vec, returns an empty vec.
-fn emit_fork_notes_from(ops: &mut dyn OpSink) -> Vec<Op> {
-    if let Some(mem) = ops
-        .as_any_mut()
-        .and_then(|o| o.downcast_mut::<MemoryOpSink>())
-    {
-        emit_fork_notes(&mem.ops)
-    } else {
-        Vec::new()
-    }
 }

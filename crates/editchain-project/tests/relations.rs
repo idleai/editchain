@@ -309,202 +309,217 @@ fn fully_unresolved_relationship_note_is_ignored() {
     assert!(layout.edges.is_empty());
 }
 
-/// The fork-prologue fold drops the branch's duplicated pre-boundary rows. A
-/// surviving branch node whose stored parent is a dropped prologue row must
-/// resolve to the trunk boundary at the split — not to a phantom that stops a
-/// later disjoint chain from reusing the base lane.
+/// Exact provider event identity suppresses only copied occurrences and uses
+/// each branch's own `ProviderParent` endpoint. No prefix, length, timestamp, or
+/// cross-stream sequence comparison participates.
 #[test]
-fn fork_prologue_drop_does_not_inflate_later_chain_lanes() {
-    // Trunk session A: roota -> a2 -> a3 -> a4 (a3 = divergence boundary).
-    let roota = msg_op(1, 1, 10, 1_000, None);
-    let a2 = msg_op(1, 2, 10, 2_000, Some(roota.id));
-    let a3 = msg_op(1, 3, 10, 3_000, Some(a2.id));
-    let a4 = msg_op(1, 4, 10, 4_000, Some(a3.id));
-    // Branch B duplicates the prologue (b_roota, b_a2) then diverges at b3.
-    // The fork runs AFTER the trunk in time, so the branch rows are newer and
-    // the branch boundary's edge points DOWN to the trunk boundary.
-    let b_roota = msg_op(2, 1, 20, 5_000, None);
-    let b_a2 = msg_op(2, 2, 20, 6_000, Some(b_roota.id));
-    let b3 = msg_op(2, 3, 20, 7_000, Some(b_a2.id));
-    let b4 = msg_op(2, 4, 20, 8_000, Some(b3.id));
-    let fork = relation_note(7, 0xFF0, b3.id, a3.id, NoteRelationship::ForkOf);
-    // A later disjoint chain C must reuse the base lane.
-    let c1 = msg_op(3, 1, 30, 100, None);
-    let c2 = msg_op(3, 2, 30, 200, Some(c1.id));
+fn exact_occurrences_form_a_provider_fork_without_self_edges() {
+    let shared_entity = OpId::new(NodeId(90), 7, 1);
+    let left_entity = OpId::new(NodeId(90), 7, 2);
+    let right_entity = OpId::new(NodeId(90), 7, 3);
 
-    let projection = HistoryProjection::from_ops(vec![
-        roota.clone(),
-        a2.clone(),
-        a3.clone(),
-        a4.clone(),
-        b_roota.clone(),
-        b_a2.clone(),
-        b3.clone(),
-        b4.clone(),
-        fork.clone(),
-        c1.clone(),
-        c2.clone(),
-    ]);
-    let layout = projection.graph_layout();
+    let mut shared_left = import_op(1, 1, 10, 1_000);
+    let mut shared_right = import_op(2, 1, 20, 1_000);
+    if let (OpKind::Import(left), OpKind::Import(right)) =
+        (&mut shared_left.kind, &mut shared_right.kind)
+    {
+        left.raw_hash = Some([7; 32]);
+        right.raw_hash = Some([7; 32]);
+    }
+    let mut left = import_op(1, 2, 10, 2_000);
+    left.parents = ParentSet::One(shared_left.id);
+    let mut right = import_op(2, 2, 20, 3_000);
+    right.parents = ParentSet::One(shared_right.id);
 
-    // The branch boundary b3's stored parent (b_a2, a dropped prologue row)
-    // resolves to the trunk boundary a3 — one edge to a visible row.
-    assert!(
-        layout
-            .edges
-            .iter()
-            .any(|e| { e.child == b3.id.to_string() && e.parent == a3.id.to_string() }),
-        "fork boundary must resolve to the trunk boundary; got {:#?}",
-        layout
-            .edges
-            .iter()
-            .map(|e| (e.child.as_str(), e.parent.as_str()))
-            .collect::<Vec<_>>()
-    );
-    let lane_of = |op_id: OpId| {
-        layout
-            .rows
-            .iter()
-            .find(|r| r.node == op_id.to_string())
-            .map_or(usize::MAX, |r| r.lane)
-    };
-    // The fork still renders on distinct lanes (branch b3 stays on the trunk
-    // lane, the trunk continuation a4 diverges onto its own lane)...
-    assert_ne!(
-        lane_of(b3.id),
-        lane_of(a4.id),
-        "fork and trunk continuation diverge"
-    );
+    let ops = vec![
+        shared_left.clone(),
+        shared_right.clone(),
+        left.clone(),
+        right.clone(),
+        relation_note(
+            11,
+            1,
+            shared_left.id,
+            shared_entity,
+            NoteRelationship::OccurrenceOf,
+        ),
+        relation_note(
+            12,
+            1,
+            shared_right.id,
+            shared_entity,
+            NoteRelationship::OccurrenceOf,
+        ),
+        relation_note(13, 1, left.id, left_entity, NoteRelationship::OccurrenceOf),
+        relation_note(
+            14,
+            1,
+            left.id,
+            shared_entity,
+            NoteRelationship::ProviderParent,
+        ),
+        relation_note(
+            15,
+            1,
+            right.id,
+            right_entity,
+            NoteRelationship::OccurrenceOf,
+        ),
+        relation_note(
+            16,
+            1,
+            right.id,
+            shared_entity,
+            NoteRelationship::ProviderParent,
+        ),
+    ];
+    let projection = HistoryProjection::from_ops(ops);
+
+    assert_eq!(projection.nodes().len(), 3);
     assert_eq!(
-        lane_of(b4.id),
-        lane_of(b3.id),
-        "fork continuation stays with its branch"
+        projection.visible_op_id(shared_right.id),
+        Some(shared_left.id)
     );
-    // ...and the later disjoint chain REUSES the base lane 0 instead of being
-    // pushed onto a fresh lane by a phantom dropped prologue row.
-    assert_eq!(lane_of(c1.id), 0, "later disjoint chain must reuse lane 0");
-    assert_eq!(lane_of(c2.id), 0, "later disjoint chain must reuse lane 0");
+    for child in [&left, &right] {
+        let row = projection
+            .nodes()
+            .into_iter()
+            .find(|row| row.node_key() == child.id.to_string())
+            .unwrap();
+        assert_eq!(
+            projection.lifted_parent_keys(&row),
+            vec![shared_left.id.to_string()]
+        );
+        assert!(!projection
+            .lifted_parent_keys(&row)
+            .contains(&child.id.to_string()));
+    }
+    assert!(projection
+        .graph_layout()
+        .edges
+        .iter()
+        .all(|edge| edge.child != edge.parent));
 }
 
-/// The fork-prologue fold must restrict prologue detection and representative
-/// rewiring to the fork boundary's exact source chain `(OpId.node, OpId.boot)`.
-/// One session may hold several source chains at once — the fork branch, the
-/// trunk it forked from, and an unrelated chain sharing the same session id.
-/// Lower-seq rows on those other chains must never be elided or redirected to
-/// the trunk boundary just because they share the session with the branch, while
-/// the intended same-chain duplicated-prologue fold still runs.
 #[test]
-fn fork_prologue_fold_ignores_unrelated_chains_in_same_session() {
-    // ONE session (10) carries three distinct source chains: trunk T (node 1),
-    // fork branch B (node 2, duplicating the trunk prologue), and an unrelated
-    // chain U (node 3).
-    let t1 = msg_op(1, 1, 10, 1_000, None);
-    let t2 = msg_op(1, 2, 10, 2_000, Some(t1.id));
-    let t3 = msg_op(1, 3, 10, 3_000, Some(t2.id));
-    let t4 = msg_op(1, 4, 10, 4_000, Some(t3.id));
-    let b1 = msg_op(2, 1, 10, 5_000, None);
-    let b2 = msg_op(2, 2, 10, 6_000, Some(b1.id));
-    let b3 = msg_op(2, 3, 10, 7_000, Some(b2.id));
-    let b4 = msg_op(2, 4, 10, 8_000, Some(b3.id));
-    let u1 = msg_op(3, 1, 10, 9_000, None);
-    let u2 = msg_op(3, 2, 10, 10_000, Some(u1.id));
-    let fork = relation_note(7, 0xFF0, b3.id, t3.id, NoteRelationship::ForkOf);
+fn provider_event_revisions_resolve_parents_within_their_source() {
+    let shared_entity = OpId::new(NodeId(90), 8, 1);
+    let left_entity = OpId::new(NodeId(90), 8, 2);
+    let right_entity = OpId::new(NodeId(90), 8, 3);
 
+    let mut shared_left = import_op(1, 1, 10, 1_000);
+    let mut shared_right = import_op(2, 1, 20, 1_000);
+    if let (OpKind::Import(left), OpKind::Import(right)) =
+        (&mut shared_left.kind, &mut shared_right.kind)
+    {
+        left.raw_hash = Some([1; 32]);
+        right.raw_hash = Some([2; 32]);
+    }
+    let left = import_op(1, 2, 10, 2_000);
+    let right = import_op(2, 2, 20, 3_000);
     let projection = HistoryProjection::from_ops(vec![
-        t1.clone(),
-        t2.clone(),
-        t3.clone(),
-        t4.clone(),
-        b1.clone(),
-        b2.clone(),
-        b3.clone(),
-        b4.clone(),
-        u1.clone(),
-        u2.clone(),
-        fork,
+        shared_left.clone(),
+        shared_right.clone(),
+        left.clone(),
+        right.clone(),
+        relation_note(
+            21,
+            1,
+            shared_left.id,
+            shared_entity,
+            NoteRelationship::OccurrenceOf,
+        ),
+        relation_note(
+            22,
+            1,
+            shared_right.id,
+            shared_entity,
+            NoteRelationship::OccurrenceOf,
+        ),
+        relation_note(23, 1, left.id, left_entity, NoteRelationship::OccurrenceOf),
+        relation_note(
+            24,
+            1,
+            left.id,
+            shared_entity,
+            NoteRelationship::ProviderParent,
+        ),
+        relation_note(
+            25,
+            1,
+            right.id,
+            right_entity,
+            NoteRelationship::OccurrenceOf,
+        ),
+        relation_note(
+            26,
+            1,
+            right.id,
+            shared_entity,
+            NoteRelationship::ProviderParent,
+        ),
     ]);
 
-    // Only the branch's own duplicate prologue folds away: every trunk and
-    // unrelated row stays a visible row, and the branch boundary + continuation
-    // stay.
+    assert_eq!(projection.nodes().len(), 4);
+    assert_eq!(
+        projection.visible_op_id(shared_left.id),
+        Some(shared_left.id)
+    );
+    assert_eq!(
+        projection.visible_op_id(shared_right.id),
+        Some(shared_right.id)
+    );
+    for (child, parent) in [(&left, &shared_left), (&right, &shared_right)] {
+        let row = projection
+            .nodes()
+            .into_iter()
+            .find(|row| row.node_key() == child.id.to_string())
+            .unwrap();
+        assert_eq!(
+            projection.lifted_parent_keys(&row),
+            vec![parent.id.to_string()]
+        );
+    }
+}
+
+/// Immutable notes from the retired Claude fork detector remain stored but are
+/// inert in current projection. In particular they cannot delete a whole source
+/// prefix or introduce a canonical self-parent.
+#[test]
+fn legacy_inferred_claude_fork_note_is_inert() {
+    let trunk = msg_op(1, 1, 10, 1_000, None);
+    let branch_root = msg_op(2, 1, 20, 1_000, None);
+    let branch = msg_op(2, 2, 20, 2_000, Some(branch_root.id));
+    let mut legacy = relation_note(
+        2,
+        (2 << 16) | 0xFFFE,
+        branch.id,
+        branch.id,
+        NoteRelationship::ForkOf,
+    );
+    legacy.tags = Tags::META | Tags::IMPORT;
+
+    let projection = HistoryProjection::from_ops(vec![
+        trunk.clone(),
+        branch_root.clone(),
+        branch.clone(),
+        legacy,
+    ]);
     let keys: Vec<String> = projection
         .nodes()
         .iter()
         .map(editchain_project::HistoryNode::node_key)
         .collect();
-    let visible = |id: OpId| keys.iter().any(|k| k == &id.to_string());
-    assert!(
-        visible(t1.id) && visible(t2.id) && visible(t3.id) && visible(t4.id),
-        "trunk chain must survive the fold; got {keys:?}"
-    );
-    assert!(
-        visible(u1.id) && visible(u2.id),
-        "unrelated chain must survive the fold; got {keys:?}"
-    );
-    assert!(
-        !visible(b1.id) && !visible(b2.id),
-        "branch duplicate prologue must fold; got {keys:?}"
-    );
-    assert!(
-        visible(b3.id) && visible(b4.id),
-        "branch must stay; got {keys:?}"
-    );
 
-    // The branch boundary's stored parent (b2, a dropped prologue row) resolves
-    // to the trunk boundary t3 — one edge to a visible row — and no edge ever
-    // references a dropped id or rewires an unrelated/trunk row onto the trunk
-    // boundary.
-    let layout = projection.graph_layout();
-    assert!(
-        layout
-            .edges
-            .iter()
-            .any(|e| { e.child == b3.id.to_string() && e.parent == t3.id.to_string() }),
-        "fork boundary must resolve to the trunk boundary; got {:#?}",
-        layout
-            .edges
-            .iter()
-            .map(|e| (e.child.as_str(), e.parent.as_str()))
-            .collect::<Vec<_>>()
-    );
-    for edge in &layout.edges {
-        assert_ne!(
-            edge.child,
-            b1.id.to_string(),
-            "dropped id in edges: {edge:?}"
-        );
-        assert_ne!(
-            edge.child,
-            b2.id.to_string(),
-            "dropped id in edges: {edge:?}"
-        );
-        assert_ne!(
-            edge.parent,
-            b1.id.to_string(),
-            "dropped id in edges: {edge:?}"
-        );
-        assert_ne!(
-            edge.parent,
-            b2.id.to_string(),
-            "dropped id in edges: {edge:?}"
-        );
-    }
-    // Trunk and unrelated causality stays intact: no row was rewired onto the
-    // trunk boundary.
-    assert!(
-        layout
-            .edges
-            .iter()
-            .any(|e| { e.child == t2.id.to_string() && e.parent == t1.id.to_string() }),
-        "trunk prologue causality must stay intact"
-    );
-    assert!(
-        layout
-            .edges
-            .iter()
-            .any(|e| { e.child == u2.id.to_string() && e.parent == u1.id.to_string() }),
-        "unrelated chain causality must stay intact"
-    );
+    assert_eq!(keys.len(), 3);
+    assert!(keys.contains(&trunk.id.to_string()));
+    assert!(keys.contains(&branch_root.id.to_string()));
+    assert!(keys.contains(&branch.id.to_string()));
+    assert!(projection
+        .graph_layout()
+        .edges
+        .iter()
+        .all(|edge| edge.child != edge.parent));
 }
 
 /// Filtered + windowed layout: after the default (hide-undated, splice) filter

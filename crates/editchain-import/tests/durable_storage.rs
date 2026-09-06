@@ -26,6 +26,7 @@ use editchain_core::payload::{ContentId, Payload};
 use editchain_core::Op;
 
 use editchain_import::codex::{import_codex, CodexDiscoveryRequest, HelperCommand};
+use editchain_import::cursor::canonical_source_key;
 use editchain_import::ids::hash_raw;
 use editchain_import::model::{ImportOptions, ImportReport};
 use editchain_import::sink::{CursorStore, CursorValue, FsBlobSink, FsCursorStore, MemoryOpSink};
@@ -95,6 +96,10 @@ fn run_import_inner(
         cursors.commit().unwrap();
     }
     DurableRun { report, ops, blobs }
+}
+
+fn source_key(root: &Path, source: &Path) -> String {
+    canonical_source_key("codex", root, source).unwrap()
 }
 
 /// Run the fake helper through `/bin/sh` with no prefix args.
@@ -268,10 +273,8 @@ fn uncommitted_staged_cursors_disappear_after_reopen() {
 
     // A fresh store over the same directory sees no cursor: the staged
     // mutation never reached disk.
-    let cursor_key = raw_root
-        .join("rollout-1.jsonl")
-        .to_string_lossy()
-        .to_string();
+    let rollout = raw_root.join("rollout-1.jsonl");
+    let cursor_key = source_key(&raw_root, &rollout);
     let reopened = FsCursorStore::new(chain.join("cursors")).unwrap();
     assert!(reopened.get_cursor(&cursor_key).unwrap().is_none());
 
@@ -299,10 +302,8 @@ fn committed_cursors_persist_after_reopen() {
     assert_eq!(first.report.raw_ops, 2);
 
     // The commit after a successful append made the cursor durable.
-    let cursor_key = raw_root
-        .join("rollout-1.jsonl")
-        .to_string_lossy()
-        .to_string();
+    let rollout = raw_root.join("rollout-1.jsonl");
+    let cursor_key = source_key(&raw_root, &rollout);
     let reopened = FsCursorStore::new(chain.join("cursors")).unwrap();
     let cursor = reopened.get_cursor(&cursor_key).unwrap().unwrap();
     assert_eq!(cursor.ops_emitted, 2);
@@ -325,7 +326,7 @@ fn rewritten_rollout_reimport_is_deterministic_across_restarts() {
     let raw_root = dir.path().join("sessions");
     std::fs::create_dir_all(&raw_root).unwrap();
     let rollout = raw_root.join("rollout-1.jsonl");
-    let cursor_key = rollout.to_string_lossy().to_string();
+    let cursor_key = source_key(&raw_root, &rollout);
 
     let helper = helper_in(&dir, &messages_awk("thread-1"));
     let options = ImportOptions::default();
@@ -398,7 +399,7 @@ fn cursor_reset_reimports_source_with_current_generation_ids() {
     let raw_root = dir.path().join("sessions");
     std::fs::create_dir_all(&raw_root).unwrap();
     let rollout = raw_root.join("rollout-1.jsonl");
-    let cursor_key = rollout.to_string_lossy().to_string();
+    let cursor_key = source_key(&raw_root, &rollout);
 
     let helper = helper_in(&dir, &messages_awk("thread-1"));
     let options = ImportOptions::default();
@@ -412,9 +413,7 @@ fn cursor_reset_reimports_source_with_current_generation_ids() {
     let first = run_import(&raw_root, &helper, &options, &chain);
     assert_eq!(first.report.raw_ops, 2);
 
-    // Truncating rewrite (a size change is required for detection; an exact
-    // same-size rewrite is an undetectable documented residual) and commit
-    // generation 1.
+    // Truncating rewrite starts and commits generation 1.
     write_rollout(
         &raw_root,
         "rollout-1.jsonl",
@@ -451,6 +450,8 @@ fn commit_persists_generation_before_cursors_on_write_error() {
         byte_offset: 40,
         ops_emitted: 7,
         content_hash: [7u8; 32],
+        content_hash_version: 1,
+        source_node: Some(editchain_core::NodeId(7)),
         normalization_version: 0,
     };
     let new_cursor = CursorValue {
@@ -458,6 +459,8 @@ fn commit_persists_generation_before_cursors_on_write_error() {
         byte_offset: 8,
         ops_emitted: 2,
         content_hash: [9u8; 32],
+        content_hash_version: 1,
+        source_node: Some(editchain_core::NodeId(7)),
         normalization_version: 0,
     };
 

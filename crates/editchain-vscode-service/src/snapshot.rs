@@ -53,7 +53,27 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Activity bundles while preserving every original reasoning record and the
 /// linear graph path, so stale revision-9 snapshots must not serve duplicate
 /// flat Plan rows.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 10;
+///
+/// Revision 11 projects exact provider occurrence/parent facts and contracts
+/// metadata only along its unique graph-parent path. This prevents positional
+/// metadata folding from manufacturing cycles and invalidates snapshots built
+/// with the retired inferred relationship rules.
+///
+/// Revision 12 collapses provider occurrences only when their exact raw hashes
+/// agree and resolves entity endpoints within the relation anchor's source.
+/// Incremental payload revisions therefore remain distinct and ambiguous
+/// cross-source entities never acquire an arbitrary representative.
+///
+/// Revision 13 classifies top-level Codex `token_usage_record` envelopes as
+/// metadata and contracts legacy untagged records through their unique exact
+/// parent path, preventing usage accounting from appearing as separate lanes.
+///
+/// Revision 22 keeps tool-result identity correlation out of visible ancestry,
+/// preserves exact Claude response identities, contracts connected tool blocks
+/// from one response, and makes derived-view parent rewrites authoritative over
+/// immutable provider facts. This removes synthetic one-row tool branches
+/// without changing canonical import evidence.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 22;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

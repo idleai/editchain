@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use crate::error::ImportError;
@@ -28,7 +28,7 @@ pub fn read_session_file(
     let metadata = std::fs::metadata(path).map_err(ImportError::Io)?;
     let file_size = metadata.len();
 
-    let (offset, prior_hash) = match cursor {
+    let offset = match cursor {
         Some(c) => {
             if file_size < c.file_size {
                 return Err(ImportError::SourceGenerationChanged {
@@ -37,24 +37,28 @@ pub fn read_session_file(
                     actual_size: file_size,
                 });
             }
-            (c.byte_offset, c.content_hash)
+            c.byte_offset
         }
-        None => (0, [0u8; 32]),
+        None => 0,
     };
 
-    let file = std::fs::File::open(path).map_err(ImportError::Io)?;
-    let mut reader = BufReader::new(file);
-
-    if offset > 0 {
-        let _: u64 = reader
-            .seek(SeekFrom::Start(offset))
-            .map_err(ImportError::Io)?;
-    }
-
+    let mut file = std::fs::File::open(path).map_err(ImportError::Io)?;
     let mut hasher = blake3::Hasher::new();
-    if prior_hash != [0u8; 32] {
-        let _: &mut blake3::Hasher = hasher.update(&prior_hash);
+    // Re-hash the accepted prefix directly. Persisting a digest as if it were
+    // resumable hasher state made the old cursor hash depend on append batch
+    // boundaries and could not prove continuity after source relocation.
+    let hashed_bytes = {
+        let mut prefix = (&mut file).take(offset);
+        std::io::copy(&mut prefix, &mut hasher).map_err(ImportError::Io)?
+    };
+    if hashed_bytes != offset {
+        return Err(ImportError::SourceGenerationChanged {
+            path: path.to_path_buf(),
+            expected_size: offset,
+            actual_size: file_size,
+        });
     }
+    let mut reader = BufReader::new(file);
 
     let mut lines = Vec::new();
     let mut bytes_read: u64 = 0;
@@ -94,6 +98,8 @@ pub fn read_session_file(
         byte_offset: offset + bytes_read,
         ops_emitted: cursor.map_or(0, |c| c.ops_emitted) + lines.len() as u64,
         content_hash,
+        content_hash_version: 1,
+        source_node: cursor.and_then(|c| c.source_node),
         normalization_version: cursor.map_or(0, |c| c.normalization_version),
     };
 

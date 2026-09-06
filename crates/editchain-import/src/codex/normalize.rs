@@ -95,9 +95,11 @@ pub fn is_blank_line(data: &[u8]) -> bool {
 #[must_use]
 pub fn raw_type_tags(raw_type: &str) -> Tags {
     match raw_type {
-        "session_meta" | "world_state" | "turn_context" | "inter_agent_communication_metadata" => {
-            Tags::META
-        }
+        "session_meta"
+        | "world_state"
+        | "turn_context"
+        | "token_usage_record"
+        | "inter_agent_communication_metadata" => Tags::META,
         "compacted" => Tags::STRUCTURAL,
         _ => Tags::NONE,
     }
@@ -107,10 +109,9 @@ pub fn raw_type_tags(raw_type: &str) -> Tags {
 ///
 /// Terminal lifecycle `event_msg` records contain no independent conversational
 /// content. They remain byte-exact raw imports, but carry `META` so the history
-/// projection can fold them into the nearest preceding semantic turn in the
-/// same source stream. Other event messages (including `task_started` and
-/// user/agent messages) remain ordinary rows because backward bundling would
-/// otherwise associate a turn prologue with the previous turn or hide content.
+/// projection can fold them only through their unique stored source parent.
+/// Other event messages (including `task_started` and user/agent messages)
+/// remain ordinary rows because they carry independent lifecycle or content.
 #[must_use]
 pub fn raw_line_tags(meta: &RawLineMeta) -> Tags {
     let mut tags = raw_type_tags(&meta.raw_type);
@@ -133,6 +134,7 @@ pub fn raw_actor_key(raw_type: &str, thread: &str) -> String {
         "session_meta"
         | "world_state"
         | "turn_context"
+        | "token_usage_record"
         | "inter_agent_communication_metadata"
         | "compacted" => format!("system:{thread}"),
         "" => format!("codex:unknown:{thread}"),

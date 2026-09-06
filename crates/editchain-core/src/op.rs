@@ -375,6 +375,51 @@ pub enum NoteRelationship {
     ///
     /// Emitted during import instead of mutating the completion result's parents.
     ReconnectsTo,
+    /// This physical source occurrence represents the target provider entity.
+    ///
+    /// The target is a deterministic external-entity handle. The full provider
+    /// identifier and resolver provenance remain in the note content and the raw
+    /// import payload. Several occurrences may name the same entity (for example,
+    /// copied Claude Code fork prefixes) without losing occurrence identity.
+    OccurrenceOf,
+    /// This provider event declares the target provider event as its parent.
+    ///
+    /// Unlike [`Self::ForkOf`], this is direct provider evidence rather than a
+    /// session-level relationship inferred from timestamps or shared content.
+    ProviderParent,
+    /// This source record declares a logical provider parent.
+    ///
+    /// Logical parent facts are retained separately from ordinary provider
+    /// parentage and do not become display edges unless a provider adapter gives
+    /// their record shape an explicit graph meaning.
+    LogicalParent,
+    /// This execution explicitly identifies the target execution as its fork
+    /// source, but no exact visible divergence event is available.
+    ///
+    /// This preserves explicit provider evidence without guessing a row-level
+    /// attachment point.
+    ForkedFrom,
+    /// This child execution was spawned by the target provider entity.
+    ///
+    /// A projection may draw this relation only when the target entity resolves
+    /// to an exact visible occurrence.
+    SpawnedBy,
+    /// This source occurrence contains the target provider entity.
+    ///
+    /// Unlike [`Self::OccurrenceOf`], containment does not make the whole source
+    /// occurrence interchangeable with the contained entity. It is used for
+    /// exact endpoint resolution such as a tool call embedded in an assistant
+    /// event.
+    Contains,
+    /// This tool-result occurrence is the result of the target provider tool
+    /// call entity.
+    ///
+    /// This is an identity/correlation fact, not conversation ancestry. A
+    /// result envelope can contain outputs for several parallel calls; drawing
+    /// every correlation as a parent edge would manufacture fan-out/fan-in
+    /// diamonds. Provider conversation ancestry is carried independently by
+    /// [`Self::ProviderParent`].
+    ToolResultOf,
 }
 
 // ---------------------------------------------------------------------------

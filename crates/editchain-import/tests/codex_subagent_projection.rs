@@ -7,7 +7,7 @@
 //! relationship notes) is then fed through `editchain_project`'s collapsed
 //! `HistoryProjection` to prove:
 //!
-//! - visible rows retain branch (`SubagentOf`) and reconnect (`ReconnectsTo`)
+//! - visible rows retain branch (`SpawnedBy`) and reconnect (`ReconnectsTo`)
 //!   topology after collapsing raw imports with their normalized children;
 //! - every relationship endpoint resolves — to an emitted op, and after
 //!   collapsing, to a visible row (the anchor raw op of the folded marker /
@@ -34,13 +34,10 @@ use std::path::Path;
 
 use editchain_core::op::{NoteRelationship, OpKind};
 use editchain_core::parents::ParentSet;
-use editchain_core::payload::Payload;
 use editchain_core::scope::ScopeRef;
 use editchain_core::{Op, OpId};
 use editchain_import::codex::HelperCommand;
-use editchain_import::ids::{
-    derive_session_id, derive_source_stream, SourcePosition, SourceStream,
-};
+use editchain_import::ids::{derive_session_id, SourcePosition, SourceStream};
 use editchain_project::{HistoryNode, HistoryProjection};
 
 use common::{import, raw_bytes, sh_helper, write_dispatching_helper, write_rollout};
@@ -312,8 +309,14 @@ fn fixture(root: &Path) -> HelperCommand {
 
 /// Deterministic source stream for a rollout file in the temp root (the
 /// harness imports with workspace `/workspace`).
+#[expect(
+    clippy::unwrap_used,
+    reason = "fixture rollout is constructed directly beneath its temp root"
+)]
 fn stream_for(dir: &Path, name: &str) -> SourceStream {
-    derive_source_stream("/workspace", &dir.join(name).to_string_lossy(), 0)
+    let path = dir.join(name);
+    let key = editchain_import::cursor::canonical_source_key("codex", dir, &path).unwrap();
+    editchain_import::ids::derive_keyed_source_stream(&key, 0)
 }
 
 /// Whether an op is a structural note of the given relationship.
@@ -332,8 +335,8 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
     let dir = tempfile::tempdir().unwrap();
     let harness = import(dir.path(), &fixture(dir.path()));
 
-    // Import shape: 4 rollouts, 12 raw lines, 12 normalized ops (8 content +
-    // 4 relationship notes), no malformed bridge records.
+    // Import shape: 4 rollouts, 12 raw lines, 15 normalized ops (8 content +
+    // 7 exact relationship facts), no malformed bridge records.
     assert_eq!(
         harness.report.files_discovered, 4,
         "one parent + three children discovered"
@@ -341,24 +344,24 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
     assert_eq!(harness.report.files_processed, 4, "every rollout processed");
     assert_eq!(harness.report.raw_ops, 12, "6 parent lines + 2 per child");
     assert_eq!(
-        harness.report.normalized_ops, 12,
-        "3 spawn notes + 1 collab tool + 1 compaction + 3 messages + 4 relationship notes"
+        harness.report.normalized_ops, 15,
+        "8 content ops + 3 SpawnedBy + 1 ReconnectsTo + 3 ForkedFrom facts"
     );
     assert_eq!(harness.report.malformed, 0, "no bridge decode errors");
-    assert_eq!(harness.ops.ops.len(), 24, "12 raw + 12 normalized ops");
+    assert_eq!(harness.ops.ops.len(), 27, "12 raw + 15 normalized ops");
 
     // Deterministic source streams per physical rollout.
     let parent = stream_for(dir.path(), "rollout-parent.jsonl");
     let child = |n: u32| stream_for(dir.path(), &format!("rollout-child-{n}.jsonl"));
 
     // --- Op-level topology -------------------------------------------------
-    // The importer emits exactly one SubagentOf note per child and one grouped
+    // The importer emits exactly one SpawnedBy fact per child and one grouped
     // ReconnectsTo note for the collab completion.
-    let subagent_of: Vec<&Op> = harness
+    let spawned_by: Vec<&Op> = harness
         .ops
         .ops
         .iter()
-        .filter(|o| is_note(o, NoteRelationship::SubagentOf))
+        .filter(|o| is_note(o, NoteRelationship::SpawnedBy))
         .collect();
     let reconnects_to: Vec<&Op> = harness
         .ops
@@ -367,9 +370,9 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
         .filter(|o| is_note(o, NoteRelationship::ReconnectsTo))
         .collect();
     assert_eq!(
-        subagent_of.len(),
+        spawned_by.len(),
         3,
-        "one SubagentOf note per spawned child"
+        "one exact SpawnedBy fact per spawned child"
     );
     assert_eq!(
         reconnects_to.len(),
@@ -377,9 +380,8 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
         "one grouped ReconnectsTo note for the completion tool call"
     );
 
-    // SubagentOf: causal parent = the child's first raw op; target = the
-    // parent thread's real `started` marker (derived note op, lane 1 at the
-    // spawn line).
+    // SpawnedBy: causal parent = the child's first raw op; target = the parent
+    // thread's physical occurrence carrying the real `started` marker.
     for (n, spawn_ordinal, thread, _path) in CHILDREN {
         let child_stream = child(n);
         let expected_parent = child_stream
@@ -387,38 +389,30 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
             .unwrap();
         // Notes are sorted by their causal parent's node id (a path hash), so
         // locate each child's note by its causal parent rather than by index.
-        let note = subagent_of
+        let note = spawned_by
             .iter()
             .find(|note| note.parents == ParentSet::One(expected_parent))
-            .unwrap_or_else(|| panic!("missing SubagentOf note for {thread}"));
+            .unwrap_or_else(|| panic!("missing SpawnedBy fact for {thread}"));
         let expected_target = parent
-            .op_from_position(SourcePosition::derived(spawn_ordinal, 1))
+            .op_from_position(SourcePosition::raw(spawn_ordinal))
             .unwrap();
         match &note.kind {
             OpKind::Note(note) => assert_eq!(
                 note.target_ids,
                 vec![expected_target],
-                "SubagentOf target is the parent's started marker for {thread}"
+                "SpawnedBy target is the parent's exact started occurrence for {thread}"
             ),
             _ => panic!("expected a note op"),
         }
     }
 
-    // ReconnectsTo: causal parent = the collab tool-call op (derived lane 1 at
-    // the completion line); targets = each child's last raw op, sorted.
-    let collab_op = harness
-        .ops
-        .ops
-        .iter()
-        .find(|o| {
-            matches!(&o.kind, OpKind::Tool(t) if t.tool_call_id == Payload::Inline(b"call-1".to_vec()))
-        })
-        .expect("collab tool op");
+    // ReconnectsTo: causal parent = the physical completion occurrence;
+    // targets = each child's last raw op, sorted.
     let reconnect = reconnects_to[0];
     assert_eq!(
         reconnect.parents,
-        ParentSet::One(collab_op.id),
-        "ReconnectsTo causal parent is the collab tool op"
+        ParentSet::One(parent.op_from_position(SourcePosition::raw(5)).unwrap()),
+        "ReconnectsTo causal parent is the exact completion occurrence"
     );
     let mut expected_reconnect_targets: Vec<OpId> = CHILDREN
         .iter()
@@ -442,7 +436,7 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
             OpKind::Note(n)
                 if matches!(
                     n.relationship,
-                    NoteRelationship::SubagentOf | NoteRelationship::ReconnectsTo
+                    NoteRelationship::SpawnedBy | NoteRelationship::ReconnectsTo
                 )
         )
     }) {
@@ -470,11 +464,7 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
     // --- Collapsed projection rows -----------------------------------------
     let projection = HistoryProjection::from_ops(harness.ops.ops.clone());
     let nodes = projection.nodes();
-    assert_eq!(
-        nodes.len(),
-        12,
-        "24 ops collapse to 12 visible rows (6 parent + 6 child)"
-    );
+    assert_eq!(nodes.len(), 12, "27 ops collapse to 12 physical rows");
     let row_by_key: HashMap<String, &HistoryNode> =
         nodes.iter().map(|n| (n.node_key(), n)).collect();
     for node in &nodes {
@@ -488,7 +478,9 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
         .ops
         .iter()
         .filter(|o| {
-            is_note(o, NoteRelationship::SubagentOf) || is_note(o, NoteRelationship::ReconnectsTo)
+            is_note(o, NoteRelationship::SpawnedBy)
+                || is_note(o, NoteRelationship::ReconnectsTo)
+                || is_note(o, NoteRelationship::ForkedFrom)
         })
         .map(|o| o.id.to_string())
         .collect();
@@ -499,18 +491,14 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
         );
     }
 
-    // Branch topology after collapsing: the SubagentOf virtual target (the
-    // folded spawn-marker note op) must resolve to the parent's visible anchor
-    // row — the raw import op that owns the marker.
+    // Branch topology after collapsing: the exact SpawnedBy target is already
+    // the parent's visible raw occurrence.
     let mut topology_gaps: Vec<String> = Vec::new();
     for (n, spawn_ordinal, thread, _path) in CHILDREN {
         let child_first = child(n).op_from_position(SourcePosition::raw(1)).unwrap();
         let child_row = row_by_key
             .get(&child_first.to_string())
             .expect("child first row present");
-        let marker_op = parent
-            .op_from_position(SourcePosition::derived(spawn_ordinal, 1))
-            .unwrap();
         let expected_anchor = parent
             .op_from_position(SourcePosition::raw(spawn_ordinal))
             .unwrap();
@@ -520,12 +508,12 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
             child_row.parent_keys(&projection.git.links, projection.relationship_notes());
         assert!(
             !raw_parents.is_empty(),
-            "the SubagentOf virtual target must be read from the note for {thread}"
+            "the SpawnedBy virtual target must be read from the fact for {thread}"
         );
         let lifted = projection.lifted_parent_keys(child_row);
         if lifted != vec![expected_anchor.to_string()] {
             topology_gaps.push(format!(
-                "{thread}: SubagentOf virtual target resolves to the folded marker op {marker_op}, expected the visible spawn anchor row {expected_anchor}; lifted_parent_keys = {lifted:?}"
+                "{thread}: SpawnedBy target should resolve to visible occurrence {expected_anchor}; lifted_parent_keys = {lifted:?}"
             ));
         }
     }
@@ -612,7 +600,7 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
     }
 
     // Expected edge set with correct collapsed semantics: stored chains (5
-    // parent + 3 child), SubagentOf branch edges (3, onto the spawn anchor
+    // parent + 3 child), SpawnedBy branch edges (3, onto the spawn anchor
     // rows), ReconnectsTo edges (3, from the completion row to each child's
     // last row).
     let parent_raw: Vec<String> = (1..=6u64)
@@ -689,10 +677,9 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
 #[expect(
     clippy::indexing_slicing,
     clippy::panic,
-    clippy::wildcard_enum_match_arm,
     reason = "this marker-less fixture asserts directly on deterministic, known-shape data"
 )]
-fn markerless_subagents_attach_at_clock_bounded_parent_anchors() {
+fn markerless_subagents_stay_unlinked_regardless_of_clocks() {
     let dir = tempfile::tempdir().unwrap();
 
     // Marker-less parent: 5 raw lines (meta + 4 events) with strictly
@@ -721,9 +708,9 @@ fn markerless_subagents_attach_at_clock_bounded_parent_anchors() {
         line_record(5, Vec::new(), None, None),
     ]);
 
-    // Children start between parent events (clock anchors at parent ordinals
-    // 2..=5), plus one child whose meta carries no timestamp (no reliable
-    // clock — deterministic fallback to the parent's first op, ordinal 1).
+    // Children start between parent events, plus one child whose meta carries
+    // no timestamp. None has a structured spawn marker, so none may acquire a
+    // branch endpoint from those clocks.
     let children: Vec<(&str, &str, Option<&str>, u64)> = vec![
         (
             "rollout-ml-child-1.jsonl",
@@ -809,18 +796,27 @@ fn markerless_subagents_attach_at_clock_bounded_parent_anchors() {
     assert_eq!(harness.report.raw_ops, 15, "5 parent lines + 2 per child");
     assert_eq!(
         harness.report.normalized_ops, 10,
-        "5 child messages + 5 SubagentOf notes"
+        "5 child messages + 5 hidden ForkedFrom facts"
     );
     assert_eq!(harness.report.malformed, 0, "no bridge decode errors");
 
-    let parent = stream_for(dir.path(), "rollout-parent-ml.jsonl");
-    let subagent_of: Vec<&Op> = harness
+    let spawned_by: Vec<&Op> = harness
         .ops
         .ops
         .iter()
-        .filter(|o| is_note(o, NoteRelationship::SubagentOf))
+        .filter(|o| is_note(o, NoteRelationship::SpawnedBy))
         .collect();
-    assert_eq!(subagent_of.len(), 5, "one SubagentOf note per child");
+    assert!(spawned_by.is_empty(), "no exact spawn marker means no edge");
+    assert_eq!(
+        harness
+            .ops
+            .ops
+            .iter()
+            .filter(|o| is_note(o, NoteRelationship::ForkedFrom))
+            .count(),
+        5,
+        "exact fork metadata remains inspectable without row geometry"
+    );
     assert!(
         !harness
             .ops
@@ -838,46 +834,30 @@ fn markerless_subagents_attach_at_clock_bounded_parent_anchors() {
         "no completion evidence in this fixture"
     );
 
-    // Each child attaches at the newest eligible parent op at or before its
-    // first reliable clock, so the clocked children spread across the parent's
-    // history (distinct anchors), and the clock-less child deterministically
-    // falls back to the parent's first op.
-    let mut targets: HashSet<OpId> = HashSet::new();
-    for (file, thread, _ts, ordinal) in &children {
+    // Every child remains an independent source root in the visible projection;
+    // neither known nor unknown timestamps create provenance.
+    let projection = HistoryProjection::from_ops(harness.ops.ops.clone());
+    let rows: HashMap<String, HistoryNode> = projection
+        .nodes()
+        .into_iter()
+        .map(|node| (node.node_key(), node))
+        .collect();
+    for (file, thread, _ts, _ordinal) in &children {
         let child_stream = stream_for(dir.path(), file);
-        let expected_parent = child_stream
+        let child_first = child_stream
             .op_from_position(SourcePosition::raw(1))
             .unwrap();
-        let note = subagent_of
-            .iter()
-            .find(|note| note.parents == ParentSet::One(expected_parent))
-            .unwrap_or_else(|| panic!("missing SubagentOf note for {thread}"));
-        let expected_target = parent
-            .op_from_position(SourcePosition::raw(*ordinal))
-            .unwrap();
-        match &note.kind {
-            OpKind::Note(note) => assert_eq!(
-                note.target_ids,
-                vec![expected_target],
-                "marker-less child {thread} anchors at parent ordinal {ordinal}"
-            ),
-            _ => panic!("expected a note op"),
-        }
-        let _: bool = targets.insert(expected_target);
+        let row = rows
+            .get(&child_first.to_string())
+            .unwrap_or_else(|| panic!("missing first row for {thread}"));
+        assert!(
+            projection.lifted_parent_keys(row).is_empty(),
+            "marker-less child {thread} must remain an unlinked root"
+        );
     }
-    assert_eq!(
-        targets.len(),
-        5,
-        "clocked children spread to distinct parent anchors; unknown-clock child uses the first-op fallback"
-    );
 }
 
 #[test]
-#[expect(
-    clippy::panic,
-    clippy::wildcard_enum_match_arm,
-    reason = "this embedded-meta fixture asserts directly on deterministic, known-shape data"
-)]
 fn embedded_parent_session_meta_does_not_hijack_child_identity_or_scope() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -954,7 +934,6 @@ fn embedded_parent_session_meta_does_not_hijack_child_identity_or_scope() {
     assert_eq!(harness.report.raw_ops, 5, "2 parent lines + 3 child lines");
     assert_eq!(harness.report.malformed, 0);
 
-    let parent = stream_for(dir.path(), "rollout-emb-parent.jsonl");
     let child = stream_for(dir.path(), "rollout-emb-child.jsonl");
     let child_session = ScopeRef::Session(derive_session_id("emb-child"));
     let parent_session = ScopeRef::Session(derive_session_id("parent-emb"));
@@ -971,7 +950,7 @@ fn embedded_parent_session_meta_does_not_hijack_child_identity_or_scope() {
         .iter()
         .filter(|o| o.id.node == child_node)
         .collect();
-    assert_eq!(child_ops.len(), 5, "3 raw + 1 message + 1 SubagentOf note");
+    assert_eq!(child_ops.len(), 4, "3 raw + 1 message");
     for op in &child_ops {
         assert_ne!(
             op.scope, parent_session,
@@ -998,26 +977,28 @@ fn embedded_parent_session_meta_does_not_hijack_child_identity_or_scope() {
         "embedded parent meta is preserved byte-exact (with its newline) in the child's raw lane"
     );
 
-    // SubagentOf: causal parent = the child's first raw op; target = the
-    // clock-bounded anchor in the PARENT session (the parent's event at
-    // 12:00:05, ordinal 2) — never the embedded copy in the child's lane.
+    // With no exact started marker, parentThreadId does not manufacture a row
+    // edge from either the parent clock or the embedded copy.
+    assert!(!harness
+        .ops
+        .ops
+        .iter()
+        .any(|o| is_note(o, NoteRelationship::SpawnedBy)));
+
+    // The explicit fork field is still retained as a hidden execution fact,
+    // anchored to the child's own first occurrence and scope.
     let note = harness
         .ops
         .ops
         .iter()
-        .find(|o| is_note(o, NoteRelationship::SubagentOf))
-        .expect("SubagentOf note");
+        .find(|o| is_note(o, NoteRelationship::ForkedFrom))
+        .expect("ForkedFrom fact");
     assert_eq!(note.parents, ParentSet::One(child_first));
     assert_eq!(
         note.scope, child_session,
         "relationship note is child-scoped"
     );
-    match &note.kind {
-        OpKind::Note(note) => assert_eq!(
-            note.target_ids,
-            vec![parent.op_from_position(SourcePosition::raw(2)).unwrap()],
-            "target is the parent-session anchor, not the embedded parent meta"
-        ),
-        _ => panic!("expected a note op"),
-    }
+    assert!(matches!(&note.kind, OpKind::Note(fact)
+        if fact.target_ids.len() == 1
+            && !fact.target_ids.contains(&child_embedded_meta)));
 }

@@ -435,6 +435,8 @@ mod tests {
                     byte_offset: 1,
                     ops_emitted: 1,
                     content_hash: [0u8; 32],
+                    content_hash_version: 0,
+                    source_node: None,
                     normalization_version: 0,
                 },
             )
@@ -454,6 +456,8 @@ mod tests {
                     byte_offset: 1,
                     ops_emitted: 1,
                     content_hash: [0u8; 32],
+                    content_hash_version: 0,
+                    source_node: None,
                     normalization_version: 0,
                 },
             )
@@ -534,7 +538,8 @@ mod tests {
         let sessions = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         let rollout = sessions.join("rollout-1.jsonl");
-        let cursor_key = rollout.to_string_lossy().into_owned();
+        let cursor_key =
+            editchain_import::cursor::canonical_source_key("codex", &sessions, &rollout).unwrap();
         let chain = dir.path().join("chain");
 
         let helper = write_codex_test_helper(dir.path(), "helper.sh");

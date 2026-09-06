@@ -294,6 +294,13 @@ pub(crate) fn for_collapsed_import(
         .and_then(Value::as_str);
     let has_children = children.is_some_and(|cs| !cs.is_empty());
 
+    // Current Claude imports tag these exact transport/sidecar schemas META.
+    // Older immutable rows predate that tag, so classify them equivalently in
+    // projection. Raw storage remains untouched and Raw view stays inspectable.
+    if is_claude_bundle_metadata_value(&value) {
+        return NodeMeta::trace(RecordRole::Lifecycle, ActivityKind::System).with_turn_id(turn_id);
+    }
+
     // Family 3: external-agent tool-call/result echo messages. The raw marker
     // (`[external_agent_tool_call]` / `[external_agent_tool_result]`, with an
     // optional `: <tool>` metadata suffix) is the stable inter-agent
@@ -593,6 +600,26 @@ pub(crate) fn sub_op_is_world_state_or_turn_context(op: &Op) -> bool {
     )
 }
 
+/// Exact Anthropic response identity carried by one Claude assistant envelope.
+///
+/// Claude writes each content block of one response as a separate provider
+/// event while retaining the same `message.id`. Activity presentation may use
+/// that identity to bundle adjacent execute blocks without guessing from time,
+/// text, tool names, or source proximity alone.
+#[must_use]
+pub(crate) fn claude_assistant_message_id(op: &Op) -> Option<String> {
+    let value = raw_import_json(op)?;
+    if value.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    value
+        .get("message")
+        .and_then(|message| message.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && !id.ends_with('…'))
+        .map(ToOwned::to_owned)
+}
+
 /// Parse the raw JSONL of an import op, if it is inline JSON.
 #[must_use]
 fn raw_import_json(op: &Op) -> Option<Value> {
@@ -615,6 +642,97 @@ fn raw_import_json(op: &Op) -> Option<Value> {
         | OpKind::Unknown(_) => return None,
     };
     serde_json::from_slice(raw).ok()
+}
+
+/// Whether an import is an older untagged Claude transport/sidecar record.
+///
+/// Recognition uses only exact provider schema discriminators also used by
+/// the current Claude importer. It exists because imported ops are immutable:
+/// upgrading an importer cannot retroactively add `META` to stored raw rows.
+#[must_use]
+pub(crate) fn is_legacy_claude_bundle_metadata_import(op: &Op) -> bool {
+    !op.tags.matches_any(Tags::META)
+        && raw_import_json(op).is_some_and(|value| is_claude_bundle_metadata_value(&value))
+}
+
+/// Exact Claude metadata schemas that never carry an independent activity.
+#[must_use]
+fn is_claude_bundle_metadata_value(value: &Value) -> bool {
+    match value.get("type").and_then(Value::as_str) {
+        Some(
+            "last-prompt"
+            | "permission-mode"
+            | "custom-title"
+            | "mode"
+            | "agent-name"
+            | "file-history-snapshot"
+            | "file-history-delta"
+            | "fork-context-ref"
+            | "atis-latch"
+            | "queue-operation"
+            | "ai-title",
+        ) => true,
+        Some("system") => matches!(
+            value.get("subtype").and_then(Value::as_str),
+            Some("turn_duration" | "local_command" | "scheduled_task_fire")
+        ),
+        Some("attachment") => value
+            .get("attachment")
+            .and_then(|attachment| attachment.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "task_reminder"
+                        | "skill_listing"
+                        | "agent_listing_delta"
+                        | "mcp_instructions_delta"
+                        | "deferred_tools_delta"
+                        | "command_permissions"
+                        | "date_change"
+                        | "nested_memory"
+                        | "read_truncation_notice"
+                        | "plan_mode"
+                        | "plan_mode_exit"
+                )
+            }),
+        _ => false,
+    }
+}
+
+/// Whether an import is a legacy, untagged Codex token-usage record.
+///
+/// Older `EditChain` imports preserved these records byte-exactly but did not
+/// tag them as `META`. Recognize only the complete persisted Codex envelope so
+/// immutable chains can receive today's metadata contraction without relying
+/// on summaries, timestamps, adjacency, or provider-specific text.
+#[must_use]
+pub(crate) fn is_codex_token_usage_record_import(op: &Op) -> bool {
+    let Some(value) = raw_import_json(op) else {
+        return false;
+    };
+    if value.get("type").and_then(Value::as_str) != Some("token_usage_record") {
+        return false;
+    }
+    let Some(payload) = value.get("payload").and_then(Value::as_object) else {
+        return false;
+    };
+    [
+        "thread_id",
+        "turn_id",
+        "session_id",
+        "root_turn_id",
+        "response_id",
+    ]
+    .iter()
+    .all(|field| {
+        payload
+            .get(*field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    }) && ["usage", "turn_token_usage", "thread_token_usage"]
+        .iter()
+        .all(|field| payload.get(*field).is_some_and(Value::is_object))
 }
 
 /// Whether a JSON value carries non-empty text under a content-bearing key.
@@ -812,6 +930,7 @@ fn raw_payload_meta(raw: Option<&Value>, turn_id: Option<TurnId>) -> NodeMeta {
             "session_meta"
             | "world_state"
             | "turn_context"
+            | "token_usage_record"
             | "inter_agent_communication_metadata"
             | "item_completed"
             | "attachment"

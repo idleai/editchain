@@ -31,10 +31,11 @@ use editchain_core::tags::Tags;
 use editchain_core::parents::ParentSet;
 use editchain_import::claude_code::normalize::parse_source_time;
 use editchain_import::codex::{import_codex, CodexDiscoveryRequest, HelperCommand};
+use editchain_import::cursor::canonical_source_key;
 use editchain_import::error::ImportError;
 use editchain_import::ids::{
-    derive_actor_id, derive_path_id, derive_session_id, derive_source_stream, derive_turn_id,
-    SourcePosition,
+    derive_actor_id, derive_keyed_source_stream, derive_path_id, derive_session_id,
+    derive_source_stream, derive_turn_id, SourcePosition, SourceStream,
 };
 use editchain_import::model::ImportOptions;
 use editchain_import::sink::{
@@ -61,6 +62,14 @@ fn fixed_helper(dir: &tempfile::TempDir, projection: &[u8]) -> HelperCommand {
     sh_helper(&script, &[])
 }
 
+fn source_key(root: &Path, path: &Path) -> String {
+    canonical_source_key("codex", root, path).unwrap()
+}
+
+fn source_stream(root: &Path, path: &Path, boot: u32) -> SourceStream {
+    derive_keyed_source_stream(&source_key(root, path), boot)
+}
+
 /// Line bytes with trailing newline, as stored in the raw lane.
 fn ln(s: &str) -> Vec<u8> {
     let mut v = s.as_bytes().to_vec();
@@ -85,6 +94,32 @@ fn lifecycle_event_line(event_type: &str) -> String {
         "timestamp": "2026-08-26T12:00:02.000Z",
         "type": "event_msg",
         "payload": {"type": event_type},
+    })
+    .to_string()
+}
+
+fn token_usage_line() -> String {
+    let usage = serde_json::json!({
+        "input_tokens": 10,
+        "cached_input_tokens": 2,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 3,
+        "reasoning_output_tokens": 1,
+        "total_tokens": 13,
+    });
+    serde_json::json!({
+        "timestamp": "2026-08-26T12:00:02.000Z",
+        "type": "token_usage_record",
+        "payload": {
+            "thread_id": "0195cda5-433d-7f9a-9d7b-a9f15b60c2e2",
+            "turn_id": "turn-1",
+            "session_id": "0195cda5-433d-7f9a-9d7b-a9f15b60c2e2",
+            "root_turn_id": "turn-1",
+            "response_id": "response-1",
+            "usage": usage,
+            "turn_token_usage": usage,
+            "thread_token_usage": usage,
+        },
     })
     .to_string()
 }
@@ -163,11 +198,7 @@ fn session_start_git_metadata_emits_one_exact_based_on_link() {
         .collect();
     assert_eq!(links.len(), 1, "one session gets one Git base relation");
     let (link_op, link) = links[0];
-    let stream = derive_source_stream(
-        workspace.to_str().unwrap(),
-        &rollouts.join("rollout-thread-1.jsonl").to_string_lossy(),
-        0,
-    );
+    let stream = source_stream(&rollouts, &rollouts.join("rollout-thread-1.jsonl"), 0);
     let session_start = stream.op_from_position(SourcePosition::raw(1)).unwrap();
     assert_eq!(link.source, session_start);
     assert_eq!(link_op.parents, ParentSet::One(session_start));
@@ -221,7 +252,7 @@ fn legacy_cursor_backfills_session_git_link_once_without_replaying_rows() {
     let initial =
         import_workspace_into(&rollouts, &workspace, &helper, &options, &mut cursors).unwrap();
     assert_eq!(initial.report.raw_ops, 1);
-    let cursor_key = rollout.to_string_lossy();
+    let cursor_key = source_key(&rollouts, &rollout);
     let mut legacy = cursors.get_cursor(&cursor_key).unwrap().unwrap();
     legacy.normalization_version = 0;
     cursors.set_cursor(&cursor_key, &legacy).unwrap();
@@ -246,13 +277,146 @@ fn legacy_cursor_backfills_session_git_link_once_without_replaying_rows() {
             .unwrap()
             .unwrap()
             .normalization_version,
-        1
+        2
     );
 
     let current =
         import_workspace_into(&rollouts, &workspace, &helper, &options, &mut cursors).unwrap();
     assert_eq!(current.report.files_processed, 0);
     assert!(current.ops.ops.is_empty());
+}
+
+#[test]
+fn version_one_cursor_upgrades_topology_without_replaying_git_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir_all(workspace.join(".git")).unwrap();
+    let rollouts = dir.path().join("rollouts");
+    std::fs::create_dir_all(&rollouts).unwrap();
+    let rollout = rollouts.join("rollout-thread-1.jsonl");
+    write_rollout(
+        &rollouts,
+        "rollout-thread-1.jsonl",
+        &[session_meta_line("thread-1", "s")],
+    );
+    let projection = projection_bytes(&[line_record(
+        1,
+        Vec::new(),
+        Some(serde_json::json!({
+            "sessionId": "s",
+            "threadId": "thread-1",
+            "cwd": workspace.to_string_lossy(),
+            "git": {
+                "commitHash": "0123456789abcdef0123456789abcdef01234567"
+            }
+        })),
+    )]);
+    let helper = fixed_helper(&dir, &projection);
+    let options = ImportOptions::default();
+    let mut cursors = MemoryCursorStore::new();
+
+    let initial =
+        import_workspace_into(&rollouts, &workspace, &helper, &options, &mut cursors).unwrap();
+    assert_eq!(initial.report.raw_ops, 1);
+    assert_eq!(
+        initial
+            .ops
+            .ops
+            .iter()
+            .filter(|op| matches!(op.kind, OpKind::GitLink(_)))
+            .count(),
+        1
+    );
+
+    let cursor_key = source_key(&rollouts, &rollout);
+    let mut version_one = cursors.get_cursor(&cursor_key).unwrap().unwrap();
+    version_one.normalization_version = 1;
+    cursors.set_cursor(&cursor_key, &version_one).unwrap();
+
+    let upgrade =
+        import_workspace_into(&rollouts, &workspace, &helper, &options, &mut cursors).unwrap();
+    assert_eq!(upgrade.report.files_processed, 1);
+    assert_eq!(upgrade.report.raw_ops, 0);
+    assert!(
+        upgrade
+            .ops
+            .ops
+            .iter()
+            .all(|op| !matches!(op.kind, OpKind::GitLink(_))),
+        "the v2 topology checkpoint must not replay the v1 Git fact"
+    );
+    assert_eq!(
+        cursors
+            .get_cursor(&cursor_key)
+            .unwrap()
+            .unwrap()
+            .normalization_version,
+        2
+    );
+}
+
+#[test]
+fn legacy_cursor_migrates_once_and_survives_sessions_root_relocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let relative = Path::new("2026/09/05/rollout-thread-1.jsonl");
+    let archive_root = dir.path().join("archive");
+    let live_root = dir.path().join("live");
+    let archive_path = archive_root.join(relative);
+    let live_path = live_root.join(relative);
+    std::fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+    let source = format!(
+        "{}\n{}\n",
+        session_meta_line("thread-1", "s"),
+        event_line("A")
+    );
+    std::fs::write(&archive_path, &source).unwrap();
+    std::fs::write(&live_path, &source).unwrap();
+
+    let (_lines, _bytes, mut legacy_cursor) =
+        editchain_import::claude_code::reader::read_session_file(&archive_path, None).unwrap();
+    legacy_cursor.normalization_version = 1;
+    legacy_cursor.source_node = None;
+    let legacy_key = archive_path.to_string_lossy().to_string();
+    let legacy_stream = derive_source_stream("/workspace", &legacy_key, 0);
+    let mut cursors = MemoryCursorStore::new();
+    cursors.set_cursor(&legacy_key, &legacy_cursor).unwrap();
+
+    let helper = helper_in(&dir, &messages_awk("thread-1"));
+    let archive_upgrade = import_with_options_into(
+        &archive_root,
+        &helper,
+        &ImportOptions::default(),
+        &mut cursors,
+    );
+    assert_eq!(archive_upgrade.report.raw_ops, 0);
+
+    let archive_key = source_key(&archive_root, &archive_path);
+    let live_key = source_key(&live_root, &live_path);
+    assert_eq!(archive_key, live_key);
+    let migrated = cursors.get_cursor(&archive_key).unwrap().unwrap();
+    assert_eq!(migrated.source_node, Some(legacy_stream.node));
+    assert_eq!(migrated.content_hash_version, 1);
+
+    let relocated =
+        import_with_options_into(&live_root, &helper, &ImportOptions::default(), &mut cursors);
+    assert_eq!(relocated.report.files_processed, 0);
+    assert!(relocated.ops.ops.is_empty());
+
+    let mut live = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&live_path)
+        .unwrap();
+    writeln!(live, "{}", event_line("B")).unwrap();
+    drop(live);
+    let appended =
+        import_with_options_into(&live_root, &helper, &ImportOptions::default(), &mut cursors);
+    assert_eq!(appended.report.raw_ops, 1);
+    let expected_parent = legacy_stream
+        .op_from_position(SourcePosition::raw(2))
+        .unwrap();
+    assert_eq!(appended.ops.ops[0].parents, ParentSet::One(expected_parent));
+    assert_eq!(appended.ops.ops[0].id.node, legacy_stream.node);
 }
 
 #[test]
@@ -334,11 +498,12 @@ fn full_import_preserves_raw_bytes_and_spills_blobs() {
 }
 
 #[test]
-fn terminal_event_messages_fold_into_the_last_semantic_turn() {
+fn token_usage_and_terminal_events_fold_into_the_last_semantic_turn() {
     let dir = tempfile::tempdir().unwrap();
     let raw_lines = [
         session_meta_line("thread-1", "s"),
         event_line("SEMANTIC"),
+        token_usage_line(),
         lifecycle_event_line("token_count"),
         lifecycle_event_line("task_complete"),
         lifecycle_event_line("turn_aborted"),
@@ -364,22 +529,28 @@ fn terminal_event_messages_fold_into_the_last_semantic_turn() {
         line_record(4, Vec::new(), None),
         line_record(5, Vec::new(), None),
         line_record(6, Vec::new(), None),
+        line_record(7, Vec::new(), None),
     ]);
     let harness = import(dir.path(), &fixed_helper(&dir, &projection));
 
-    assert_eq!(harness.report.raw_ops, 6);
+    assert_eq!(harness.report.raw_ops, 7);
     assert_eq!(harness.report.normalized_ops, 1);
-    let raw = &harness.ops.ops[..6];
+    let raw = &harness.ops.ops[..7];
     assert!(!raw[1].tags.matches_any(Tags::META));
-    for op in &raw[2..5] {
+    for op in &raw[2..6] {
         assert!(
             op.tags.matches_all(Tags::IMPORT | Tags::META),
-            "terminal lifecycle event must be foldable metadata: {op:?}"
+            "usage and terminal lifecycle records must be foldable metadata: {op:?}"
         );
     }
     assert!(
-        !raw[5].tags.matches_any(Tags::META),
+        !raw[6].tags.matches_any(Tags::META),
         "task_started is a turn prologue and must not fold backward"
+    );
+    assert_eq!(
+        raw[2].actor,
+        derive_actor_id("system:thread-1"),
+        "top-level usage records belong to the system metadata lane"
     );
 
     let opts = editchain_project::ProjectionOptions {
@@ -394,7 +565,10 @@ fn terminal_event_messages_fold_into_the_last_semantic_turn() {
         .find(|node| node.node_key() == semantic_key)
         .expect("semantic turn row");
     let bundled_ids: Vec<_> = semantic.sub_ops().iter().map(|op| op.id).collect();
-    assert_eq!(bundled_ids, vec![raw[2].id, raw[3].id, raw[4].id]);
+    assert_eq!(
+        bundled_ids,
+        vec![raw[2].id, raw[3].id, raw[4].id, raw[5].id]
+    );
     assert_eq!(
         history.nodes().len(),
         3,
@@ -591,7 +765,7 @@ fn repeated_upserts_fold_echo_and_completion_repeats() {
     assert_eq!(message_text(messages[1]), "b-final");
     // Anchored at first-seen ordinals: derived(2,1) and derived(4,1).
     let path = dir.path().join("rollout-1.jsonl");
-    let stream = derive_source_stream("/workspace", &path.to_string_lossy(), 0);
+    let stream = source_stream(dir.path(), &path, 0);
     assert_eq!(
         messages[0].id,
         stream
@@ -728,7 +902,7 @@ fn legacy_and_paginated_physical_ordinals() {
     assert_eq!(paged.report.raw_ops, 2);
     assert_eq!(paged.report.normalized_ops, 1);
     let paged_path = paged_dir.path().join("rollout-paged.jsonl");
-    let stream = derive_source_stream("/workspace", &paged_path.to_string_lossy(), 0);
+    let stream = source_stream(paged_dir.path(), &paged_path, 0);
     let paged_msg = paged
         .ops
         .ops
@@ -823,16 +997,14 @@ fn incremental_append_chains_across_batches() {
 
     // Raw chain continuity across the cursor boundary: first new raw op parents
     // to the raw op at ordinal 2 from run 1.
-    let stream = derive_source_stream("/workspace", &path.to_string_lossy(), 0);
+    let stream = source_stream(dir.path(), &path, 0);
     let expected_prev = stream.op_from_position(SourcePosition::raw(2)).unwrap();
     assert_eq!(run2.ops.ops[0].parents, ParentSet::One(expected_prev));
     assert_eq!(run2.ops.ops[1].parents, ParentSet::One(run2.ops.ops[0].id));
 
     // Cursor advanced.
-    let cursor = cursors
-        .get_cursor(path.to_string_lossy().as_ref())
-        .unwrap()
-        .unwrap();
+    let key = source_key(dir.path(), &path);
+    let cursor = cursors.get_cursor(&key).unwrap().unwrap();
     assert_eq!(cursor.ops_emitted, 4);
 }
 
@@ -870,10 +1042,8 @@ fn incremental_import_rejects_helper_output_that_omits_the_new_line() {
         ImportError::ProjectionProtocol { ref detail, .. }
             if detail.contains("source ordinal 2")
     ));
-    let cursor = cursors
-        .get_cursor(path.to_string_lossy().as_ref())
-        .unwrap()
-        .unwrap();
+    let key = source_key(dir.path(), &path);
+    let cursor = cursors.get_cursor(&key).unwrap().unwrap();
     assert_eq!(
         cursor.ops_emitted, 1,
         "failed import must not advance cursor"
@@ -912,7 +1082,7 @@ fn incremental_append_emits_deterministic_update_for_item_changed_after_cursor()
 }
 "#;
     let helper = helper_in(&dir, awk);
-    let stream = derive_source_stream("/workspace", &path.to_string_lossy(), 0);
+    let stream = source_stream(dir.path(), &path, 0);
     let mut cursors = MemoryCursorStore::new();
 
     let run1 =
@@ -1037,11 +1207,8 @@ fn helper_nonzero_exit_is_error_without_cursor() {
         }
         other => panic!("expected HelperFailed, got {other:?}"),
     }
-    let key = dir
-        .path()
-        .join("rollout-1.jsonl")
-        .to_string_lossy()
-        .to_string();
+    let path = dir.path().join("rollout-1.jsonl");
+    let key = source_key(dir.path(), &path);
     assert!(
         cursors.get_cursor(&key).unwrap().is_none(),
         "cursor not persisted on helper failure"
@@ -1063,11 +1230,8 @@ fn schema_mismatch_is_error_without_cursor() {
         }
         other => panic!("expected ProjectionProtocol, got {other:?}"),
     }
-    let key = dir
-        .path()
-        .join("rollout-1.jsonl")
-        .to_string_lossy()
-        .to_string();
+    let path = dir.path().join("rollout-1.jsonl");
+    let key = source_key(dir.path(), &path);
     assert!(cursors.get_cursor(&key).unwrap().is_none());
 }
 
@@ -1086,11 +1250,8 @@ fn missing_ordinal_is_error_without_cursor() {
         }
         other => panic!("expected ProjectionProtocol, got {other:?}"),
     }
-    let key = dir
-        .path()
-        .join("rollout-1.jsonl")
-        .to_string_lossy()
-        .to_string();
+    let path = dir.path().join("rollout-1.jsonl");
+    let key = source_key(dir.path(), &path);
     assert!(cursors.get_cursor(&key).unwrap().is_none());
 }
 
@@ -1414,7 +1575,7 @@ fn tool_lifecycle_split_uses_first_and_last_seen_lanes() {
     );
 
     let path = dir.path().join("rollout-1.jsonl");
-    let stream = derive_source_stream("/workspace", &path.to_string_lossy(), 0);
+    let stream = source_stream(dir.path(), &path, 0);
     let start = harness
         .ops
         .ops
@@ -1520,7 +1681,7 @@ fn inter_agent_and_compaction_lines_normalize_to_note_and_reflection() {
 
     let ops = &harness.ops.ops;
     let path = dir.path().join("rollout-1.jsonl");
-    let stream = derive_source_stream("/workspace", &path.to_string_lossy(), 0);
+    let stream = source_stream(dir.path(), &path, 0);
 
     let note = ops
         .iter()
@@ -1592,7 +1753,7 @@ fn normalized_items_on_the_same_line_use_distinct_derived_lanes() {
     let harness = import(dir.path(), &fixed_helper(&dir, projection.as_bytes()));
 
     let path = dir.path().join("rollout-1.jsonl");
-    let stream = derive_source_stream("/workspace", &path.to_string_lossy(), 0);
+    let stream = source_stream(dir.path(), &path, 0);
     let mut ids = harness
         .ops
         .ops
@@ -1618,7 +1779,7 @@ fn normalized_items_on_the_same_line_use_distinct_derived_lanes() {
 }
 
 #[test]
-fn cross_file_subagent_linking_emits_subagent_of_and_reconnects_to() {
+fn cross_file_subagent_linking_emits_exact_spawn_and_reconnects_to() {
     let dir = tempfile::tempdir().unwrap();
     write_rollout(
         dir.path(),
@@ -1712,7 +1873,7 @@ fn cross_file_subagent_linking_emits_subagent_of_and_reconnects_to() {
 
     // The real `started` kind renders as readable spawn prose; no completion
     // prose is invented for it.
-    let spawned = harness
+    let _spawned = harness
         .ops
         .ops
         .iter()
@@ -1721,45 +1882,39 @@ fn cross_file_subagent_linking_emits_subagent_of_and_reconnects_to() {
         })
         .expect("spawn note");
 
-    // SubagentOf: causal parent = the subagent thread's first op; target = the
-    // parent thread's real `started` marker op.
-    let subagent_of = harness
+    // SpawnedBy: causal parent = the subagent thread's first raw occurrence;
+    // target = the parent thread's exact raw `started` occurrence.
+    let spawned_by = harness
         .ops
         .ops
         .iter()
         .find(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::SubagentOf)
+            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::SpawnedBy)
         })
-        .expect("SubagentOf note");
-    let sub_stream = derive_source_stream(
-        "/workspace",
-        &dir.path().join("rollout-sub.jsonl").to_string_lossy(),
-        0,
-    );
+        .expect("SpawnedBy fact");
+    let sub_stream = source_stream(dir.path(), &dir.path().join("rollout-sub.jsonl"), 0);
+    let parent_stream = source_stream(dir.path(), &dir.path().join("rollout-parent.jsonl"), 0);
     assert_eq!(
-        subagent_of.parents,
+        spawned_by.parents,
         ParentSet::One(sub_stream.op_from_position(SourcePosition::raw(1)).unwrap())
     );
-    match &subagent_of.kind {
-        OpKind::Note(note) => assert_eq!(note.target_ids, vec![spawned.id]),
+    match &spawned_by.kind {
+        OpKind::Note(note) => assert_eq!(
+            note.target_ids,
+            vec![parent_stream
+                .op_from_position(SourcePosition::raw(2))
+                .unwrap()]
+        ),
         _ => panic!("expected note op"),
     }
     // Relationship notes are session-scoped, never turn-scoped.
     assert_eq!(
-        subagent_of.scope,
+        spawned_by.scope,
         ScopeRef::Session(derive_session_id("sub-1"))
     );
 
-    // ReconnectsTo: causal parent = the collab tool-call op whose agentsStates
-    // marks the child completed; target = the subagent thread's last op.
-    let collab_op = harness
-        .ops
-        .ops
-        .iter()
-        .find(|o| {
-            matches!(&o.kind, OpKind::Tool(t) if t.tool_call_id == Payload::Inline(b"call-1".to_vec()))
-        })
-        .expect("collab tool op");
+    // ReconnectsTo: causal parent = the raw occurrence whose agentsStates marks
+    // the child completed; target = the child's last physical occurrence.
     let reconnects_to = harness
         .ops
         .ops
@@ -1768,7 +1923,14 @@ fn cross_file_subagent_linking_emits_subagent_of_and_reconnects_to() {
             matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ReconnectsTo)
         })
         .expect("ReconnectsTo note");
-    assert_eq!(reconnects_to.parents, ParentSet::One(collab_op.id));
+    assert_eq!(
+        reconnects_to.parents,
+        ParentSet::One(
+            parent_stream
+                .op_from_position(SourcePosition::raw(3))
+                .unwrap()
+        )
+    );
     match &reconnects_to.kind {
         OpKind::Note(note) => {
             assert_eq!(
@@ -1784,17 +1946,21 @@ fn cross_file_subagent_linking_emits_subagent_of_and_reconnects_to() {
         "relationship notes are session-scoped to the owning thread"
     );
 
-    // Explicit subagent provenance suppresses the copied forkedFromId geometry.
+    // The copied forkedFromId is retained as an execution fact, but never
+    // converted into guessed row geometry.
     assert!(
         !harness.ops.ops.iter().any(|o| {
             matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ForkOf)
         }),
-        "parentThreadId/agentPath provenance must suppress ForkOf"
+        "forkedFromId must not manufacture ForkOf row geometry"
     );
+    assert!(harness.ops.ops.iter().any(|o| {
+        matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ForkedFrom)
+    }));
 }
 
 #[test]
-fn cross_file_fork_linking_emits_fork_of_at_clock_boundary() {
+fn fork_metadata_emits_exact_execution_fact_without_clock_boundary() {
     let dir = tempfile::tempdir().unwrap();
     write_rollout(
         dir.path(),
@@ -1836,45 +2002,36 @@ fn cross_file_fork_linking_emits_fork_of_at_clock_boundary() {
 "#;
     let harness = import(dir.path(), &helper_in(&dir, awk));
 
-    let fork_of = harness
+    let forked_from = harness
         .ops
         .ops
         .iter()
         .find(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ForkOf)
+            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ForkedFrom)
         })
-        .expect("ForkOf note");
-    let branch_stream = derive_source_stream(
-        "/workspace",
-        &dir.path().join("rollout-branch.jsonl").to_string_lossy(),
-        0,
-    );
-    let trunk_stream = derive_source_stream(
-        "/workspace",
-        &dir.path().join("rollout-trunk.jsonl").to_string_lossy(),
-        0,
-    );
-    // Branch first op at 12:00:03; the trunk's newest op at or before that
-    // clock is its second line (12:00:01).
+        .expect("ForkedFrom fact");
+    let branch_stream = source_stream(dir.path(), &dir.path().join("rollout-branch.jsonl"), 0);
+    // The child execution occurrence is exact; the target is a stable execution
+    // entity, not whichever trunk row happened to precede the branch clock.
     assert_eq!(
-        fork_of.parents,
+        forked_from.parents,
         ParentSet::One(
             branch_stream
                 .op_from_position(SourcePosition::raw(1))
                 .unwrap()
         )
     );
-    match &fork_of.kind {
+    match &forked_from.kind {
         OpKind::Note(note) => {
-            assert_eq!(
-                note.target_ids,
-                vec![trunk_stream
-                    .op_from_position(SourcePosition::raw(2))
-                    .unwrap()]
-            );
+            assert_eq!(note.target_ids.len(), 1);
+            assert!(matches!(&note.content, Payload::Inline(bytes)
+                if String::from_utf8_lossy(bytes).contains("codex-topology-v2")));
         }
         _ => panic!("expected note op"),
     }
+    assert!(!harness.ops.ops.iter().any(|o| {
+        matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ForkOf)
+    }));
 }
 
 #[test]
@@ -1972,20 +2129,7 @@ fn legacy_list_agents_completion_links_via_started_marker_agent_path() {
         ],
     );
     let harness = import(dir.path(), &sh_helper(&helper, &[]));
-    let sub_stream = derive_source_stream(
-        "/workspace",
-        &dir.path().join("rollout-sub.jsonl").to_string_lossy(),
-        0,
-    );
-
-    let list_op = harness
-        .ops
-        .ops
-        .iter()
-        .find(|o| {
-            matches!(&o.kind, OpKind::Tool(t) if t.tool_call_id == Payload::Inline(b"call-list".to_vec()))
-        })
-        .expect("list_agents tool op");
+    let sub_stream = source_stream(dir.path(), &dir.path().join("rollout-sub.jsonl"), 0);
 
     let reconnects: Vec<_> = harness
         .ops
@@ -1998,8 +2142,12 @@ fn legacy_list_agents_completion_links_via_started_marker_agent_path() {
     assert_eq!(reconnects.len(), 1, "only the completed agent reconnects");
     assert_eq!(
         reconnects[0].parents,
-        ParentSet::One(list_op.id),
-        "the legacy list_agents tool op is the completion marker"
+        ParentSet::One(
+            source_stream(dir.path(), &dir.path().join("rollout-parent.jsonl"), 0)
+                .op_from_position(SourcePosition::raw(3))
+                .unwrap()
+        ),
+        "the physical list_agents result occurrence is the completion endpoint"
     );
     match &reconnects[0].kind {
         OpKind::Note(note) => {
@@ -2011,29 +2159,28 @@ fn legacy_list_agents_completion_links_via_started_marker_agent_path() {
         _ => panic!("expected note op"),
     }
 
-    // The started marker is still the SubagentOf target.
-    let started = harness
+    // The raw started occurrence is the exact SpawnedBy target.
+    let spawned_by = harness
         .ops
         .ops
         .iter()
         .find(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.content == Payload::Inline(b"spawned subagent sub-1 (path /root/sub)".to_vec()))
+            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::SpawnedBy)
         })
-        .expect("started marker note");
-    let subagent_of = harness
-        .ops
-        .ops
-        .iter()
-        .find(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::SubagentOf)
-        })
-        .expect("SubagentOf note");
-    match &subagent_of.kind {
-        OpKind::Note(note) => assert_eq!(note.target_ids, vec![started.id]),
+        .expect("SpawnedBy fact");
+    match &spawned_by.kind {
+        OpKind::Note(note) => assert_eq!(
+            note.target_ids,
+            vec![
+                source_stream(dir.path(), &dir.path().join("rollout-parent.jsonl"), 0,)
+                    .op_from_position(SourcePosition::raw(2))
+                    .unwrap()
+            ]
+        ),
         _ => panic!("expected note op"),
     }
     assert_eq!(
-        subagent_of.parents,
+        spawned_by.parents,
         ParentSet::One(sub_stream.op_from_position(SourcePosition::raw(1)).unwrap())
     );
 }
@@ -2077,7 +2224,7 @@ fn turn_identity_is_persisted_on_ops_with_a_turn_metadata_note() {
         .expect("turn metadata note");
     assert_eq!(turn_note.scope, turn_scope);
     let path = dir.path().join("rollout-1.jsonl");
-    let stream = derive_source_stream("/workspace", &path.to_string_lossy(), 0);
+    let stream = source_stream(dir.path(), &path, 0);
     assert_eq!(
         turn_note.id,
         stream
@@ -2300,16 +2447,10 @@ fn workspace_filter_is_idempotent_and_never_writes_foreign_cursors() {
 
     // Excluded rollouts never get cursors, so a later widened workspace still
     // imports them from scratch and reruns stay deterministic.
-    let own_key = dir
-        .path()
-        .join("rollout-own.jsonl")
-        .to_string_lossy()
-        .into_owned();
-    let foreign_key = dir
-        .path()
-        .join("rollout-foreign.jsonl")
-        .to_string_lossy()
-        .into_owned();
+    let own_path = dir.path().join("rollout-own.jsonl");
+    let own_key = source_key(dir.path(), &own_path);
+    let foreign_path = dir.path().join("rollout-foreign.jsonl");
+    let foreign_key = source_key(dir.path(), &foreign_path);
     assert!(cursors.get_cursor(&own_key).unwrap().is_some());
     assert!(
         cursors.get_cursor(&foreign_key).unwrap().is_none(),
@@ -2385,12 +2526,8 @@ fn rewritten_rollout_reimports_at_new_generation_and_is_idempotent() {
     // (covered end-to-end in `durable_storage.rs`).
 
     // The generation bump is persisted with the cursor.
-    assert_eq!(
-        cursors
-            .get_generation(path.to_string_lossy().as_ref())
-            .unwrap(),
-        1
-    );
+    let key = source_key(dir.path(), &path);
+    assert_eq!(cursors.get_generation(&key).unwrap(), 1);
 
     // Idempotent third run: the rewritten file is now unchanged and skipped.
     let third =
@@ -2399,10 +2536,7 @@ fn rewritten_rollout_reimports_at_new_generation_and_is_idempotent() {
     assert!(third.ops.ops.is_empty());
 
     // Cursor is not corrupted: it matches the rewritten file's shape.
-    let cursor = cursors
-        .get_cursor(path.to_string_lossy().as_ref())
-        .unwrap()
-        .unwrap();
+    let cursor = cursors.get_cursor(&key).unwrap().unwrap();
     assert_eq!(cursor.ops_emitted, 2);
     assert_eq!(cursor.file_size, std::fs::metadata(&path).unwrap().len());
 }
@@ -2460,12 +2594,7 @@ fn rewritten_rollout_does_not_block_unrelated_rollouts() {
         .ops
         .ops
         .iter()
-        .filter(|op| {
-            op.id.node.0
-                == derive_source_stream("/workspace", &rewrite_path.to_string_lossy(), 1)
-                    .node
-                    .0
-        })
+        .filter(|op| op.id.node.0 == source_stream(dir.path(), &rewrite_path, 1).node.0)
         .collect();
     assert!(!rewritten.is_empty());
     assert!(rewritten.iter().all(|op| op.id.boot == 1));
@@ -2473,12 +2602,7 @@ fn rewritten_rollout_does_not_block_unrelated_rollouts() {
         .ops
         .ops
         .iter()
-        .filter(|op| {
-            op.id.node.0
-                == derive_source_stream("/workspace", &append_path.to_string_lossy(), 0)
-                    .node
-                    .0
-        })
+        .filter(|op| op.id.node.0 == source_stream(dir.path(), &append_path, 0).node.0)
         .collect();
     assert!(!appended.is_empty());
     assert!(appended.iter().all(|op| op.id.boot == 0));
@@ -2523,7 +2647,7 @@ fn append_after_rewrite_continues_the_new_generation_chain() {
     assert_eq!(appended.report.files_processed, 1);
     assert_eq!(appended.report.raw_ops, 1);
     // The append continues the boot-1 stream: same node, same boot, next seq.
-    let stream = derive_source_stream("/workspace", &path.to_string_lossy(), 1);
+    let stream = source_stream(dir.path(), &path, 1);
     let expected_prev = stream.op_from_position(SourcePosition::raw(1)).unwrap();
     assert_eq!(appended.ops.ops[0].id.boot, 1);
     assert_eq!(appended.ops.ops[0].parents, ParentSet::One(expected_prev));

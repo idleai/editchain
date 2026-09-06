@@ -133,12 +133,10 @@
 //!
 //! ## Structural topology
 //!
-//! Relationship edges are never inferred from raw records — they come only
-//! from explicit evidence carried by the projection:
+//! Relationship facts come only from explicit bridge evidence:
 //!
-//! - `sessionMeta.parentThreadId` yields a `SubagentOf` edge targeting the
-//!   parent's earliest real `started` subagent-activity marker (fallback: the
-//!   parent thread's first op);
+//! - `sessionMeta.parentThreadId` yields a visible `SpawnedBy` edge only when
+//!   exactly one matching `started` subagent-activity occurrence exists;
 //! - `collabToolCall.agentsStates` entries whose per-child status is
 //!   `completed` (the exporter's additive `agentsStates` map) yield
 //!   `ReconnectsTo` edges — the collab tool's own status or a
@@ -149,11 +147,11 @@
 //!   `agents[{agent_name, agent_status:{completed:...}}]`) yield
 //!   `ReconnectsTo` edges by mapping each completed `agent_name` to exactly
 //!   one `started` marker's `agentPath` in the same thread;
-//! - `sessionMeta.forkedFromId` yields a `ForkOf` edge only for standalone
-//!   forks (no `parentThreadId`/`agentPath` provenance) with known clocks.
+//! - `sessionMeta.forkedFromId` yields a hidden `ForkedFrom` execution fact,
+//!   never a timestamp-selected row-level `ForkOf` edge.
 //!
-//! The post-pass ([`link`]) resolves threads within one import run only;
-//! cross-run incremental imports cannot relink threads from earlier runs.
+//! Missing and ambiguous endpoints stay unlinked. The resolver never uses
+//! timestamps, file order, content, names, or proximity as provenance.
 //!
 //! ## Error handling
 //!
@@ -173,7 +171,7 @@ pub mod discover;
 pub mod helper;
 /// Top-level import orchestrator for Codex rollouts.
 pub mod import;
-/// Cross-thread structural relationship linking (SubagentOf/ReconnectsTo/ForkOf).
+/// Exact cross-thread execution-topology facts.
 pub mod link;
 /// Normalization of raw lines and projection items into editchain ops.
 pub mod normalize;

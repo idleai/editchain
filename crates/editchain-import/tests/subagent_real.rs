@@ -1,17 +1,10 @@
-//! End-to-end verification of subagent branch/reconnect linking against a real
+//! End-to-end verification of exact subagent spawn linking against a real
 //! Claude Code session.
 //!
 //! This test copies a real session directory (main session + its `subagents/`)
 //! into a temp dir, runs the full import pipeline, and asserts that subagent
-//! relationship notes are emitted — i.e. that `SubagentOf` (branch) and
-//! `ReconnectsTo` (reconnect) notes exist, which is the signature of a subagent
-//! that branched off its parent's `Agent` call and reconnected via a completion
-//! result.
-//!
-//! The fixture session (`8a7a3ac4-...`, rtx-pro-6000-bench) reports subagent
-//! completion through the `TaskStop`/late-check "not running (status:
-//! completed)" format, which is the path this fix targets. It has 3 subagents;
-//! with the fix, 3 branch notes + 3 reconnect notes are emitted.
+//! `SpawnedBy` notes are derived from the sidecar's exact `toolUseId`; free-form
+//! completion text is deliberately not interpreted as provenance.
 
 #![expect(
     clippy::unwrap_used,
@@ -78,8 +71,7 @@ fn stage_session(tmp: &std::path::Path) -> PathBuf {
     tmp.to_path_buf()
 }
 
-/// Count relationship notes of a given kind — the signature of a linked
-/// subagent (branch `SubagentOf` + reconnect `ReconnectsTo`).
+/// Count relationship notes of a given kind.
 fn count_notes(ops: &[Op], rel: NoteRelationship) -> usize {
     ops.iter()
         .filter(|op| matches!(&op.kind, OpKind::Note(n) if n.relationship == rel))
@@ -87,7 +79,7 @@ fn count_notes(ops: &[Op], rel: NoteRelationship) -> usize {
 }
 
 #[test]
-fn real_session_produces_reconnect_edges() {
+fn real_session_produces_exact_spawn_edges() {
     if !std::path::Path::new(SESSION_DIR).exists() {
         // Real session not present on this machine — skip (e.g. CI).
         return;
@@ -119,21 +111,17 @@ fn real_session_produces_reconnect_edges() {
     assert!(report.files_discovered >= 2, "expected main + subagents");
     assert!(!ops_sink.ops.is_empty(), "expected normalized ops");
 
-    // The linking post-pass runs inside import_claude_code. Verify relationship
-    // notes exist. This session has 3 subagents; every one branches (3
-    // `SubagentOf` notes) and one reconnects via a detected completion result
-    // (1 `ReconnectsTo` note) — matching the original code's "4 ops with two
-    // parents" (3 branch + 1 reconnect = 4 edges). Asserting exact counts
-    // catches a regression in either completion path.
-    let branches = count_notes(&ops_sink.ops, NoteRelationship::SubagentOf);
+    // This fixture has three sidecars with exact toolUseIds. Every one emits a
+    // SpawnedBy fact; the old substring-derived reconnect is intentionally gone.
+    let branches = count_notes(&ops_sink.ops, NoteRelationship::SpawnedBy);
     let reconnects = count_notes(&ops_sink.ops, NoteRelationship::ReconnectsTo);
     assert_eq!(
         branches, 3,
-        "expected 3 SubagentOf branch notes; got {branches}"
+        "expected 3 exact SpawnedBy notes; got {branches}"
     );
     assert_eq!(
-        reconnects, 1,
-        "expected 1 ReconnectsTo reconnect note; got {reconnects}"
+        reconnects, 0,
+        "free-form completion text must not create reconnect provenance"
     );
 
     // SPEC §5 gate: the notes must actually drive projection. Build a

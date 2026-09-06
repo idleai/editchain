@@ -21,9 +21,10 @@ pub struct SessionFile {
 
 /// Discover all Claude Code session files in a directory.
 ///
-/// Scans for `.jsonl` files (excluding `agent-.jsonl` subagent files
-/// which are discovered separately), and also discovers subagent files
-/// within `subagents/` subdirectories.
+/// Scans for top-level `.jsonl` sessions (excluding misplaced `agent-.jsonl`
+/// files), then recursively discovers every nested `.jsonl` source beneath the
+/// matching `<session-id>/` directory. Recursion is deliberate: workflows and
+/// future Claude Code subkeys can nest agent logs more than one directory deep.
 ///
 /// # Errors
 ///
@@ -56,9 +57,8 @@ pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<SessionFile>, String
             tool_use_id: None,
         });
 
-        // Discover subagents for this session.
-        let subagents = discover_subagents(&path, &session_id);
-        sessions.extend(subagents);
+        // Discover nested execution/opaque sources for this session.
+        sessions.extend(discover_nested_sources(&path, &session_id)?);
     }
 
     // Sort by path for deterministic ordering.
@@ -67,64 +67,76 @@ pub fn discover_sessions(sessions_dir: &Path) -> Result<Vec<SessionFile>, String
     Ok(sessions)
 }
 
-/// Discover subagent files for a given session.
-///
-/// Claude Code stores subagent transcripts in `subagents/agent-*.jsonl`
-/// relative to the main session file.
-fn discover_subagents(session_path: &Path, parent_session_id: &str) -> Vec<SessionFile> {
-    let mut subagents = Vec::new();
-
-    // Claude Code stores subagent transcripts in a directory named after the
-    // session ID, containing a `subagents/` subdirectory:
-    //   <encoded-cwd>/<session-id>/subagents/agent-*.jsonl
+/// Discover all nested JSONL sources owned by one top-level session.
+fn discover_nested_sources(
+    session_path: &Path,
+    parent_session_id: &str,
+) -> Result<Vec<SessionFile>, String> {
     let parent_dir = session_path.parent().unwrap_or(Path::new("."));
-    let subagents_dir = parent_dir.join(parent_session_id).join("subagents");
+    let owner_dir = parent_dir.join(parent_session_id);
 
-    if !subagents_dir.exists() {
-        return subagents;
+    if !owner_dir.exists() {
+        return Ok(Vec::new());
     }
 
-    let Ok(entries) = std::fs::read_dir(&subagents_dir) else {
-        return subagents;
-    };
+    let mut sources = Vec::new();
+    let mut pending = vec![owner_dir.clone()];
+    while let Some(dir) = pending.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|e| format!("reading nested source directory {}: {e}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("reading entry in {}: {e}", dir.display()))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("file type for {}: {e}", entry.path().display()))?;
+            if file_type.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            // Do not follow symlinked directories/files: discovery identity is
+            // the physical source path, and following links could duplicate or
+            // cycle the source set.
+            if !file_type.is_file() {
+                continue;
+            }
 
-    for entry in entries {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let name = entry.file_name().to_string_lossy().to_string();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.to_lowercase().ends_with(".jsonl") {
+                continue;
+            }
 
-        if !name.to_lowercase().ends_with(".jsonl") {
-            continue;
+            let path = entry.path();
+            let metadata = std::fs::metadata(&path)
+                .map_err(|e| format!("metadata for {}: {e}", path.display()))?;
+            let is_subagent = name.starts_with("agent-");
+            let source_id = if is_subagent {
+                name.strip_prefix("agent-")
+                    .and_then(|s| s.strip_suffix(".jsonl"))
+                    .unwrap_or(&name)
+                    .to_string()
+            } else {
+                path.strip_prefix(&owner_dir)
+                    .unwrap_or(&path)
+                    .with_extension("")
+                    .to_string_lossy()
+                    .to_string()
+            };
+
+            // Read exact spawn identity, when present, before import. Opaque
+            // nested sources remain discoverable even without a sidecar.
+            let tool_use_id = is_subagent.then(|| read_tool_use_id(&path)).flatten();
+            sources.push(SessionFile {
+                path,
+                session_id: source_id,
+                file_size: metadata.len(),
+                is_subagent,
+                parent_session_id: Some(parent_session_id.to_string()),
+                tool_use_id,
+            });
         }
-
-        let path = entry.path();
-        let Ok(metadata) = std::fs::metadata(&path) else {
-            continue;
-        };
-
-        // agent-<uuid>.jsonl — strip prefix for session ID.
-        let agent_id = name
-            .strip_prefix("agent-")
-            .and_then(|s| s.strip_suffix(".jsonl"))
-            .unwrap_or(&name)
-            .to_string();
-
-        // Read the sibling `<name>.meta.json` for the parent's `Agent` tool_use
-        // id (`toolUseId`), which anchors this subagent's branch point.
-        let tool_use_id = read_tool_use_id(&path);
-
-        subagents.push(SessionFile {
-            path,
-            session_id: agent_id,
-            file_size: metadata.len(),
-            is_subagent: true,
-            parent_session_id: Some(parent_session_id.to_string()),
-            tool_use_id,
-        });
     }
 
-    subagents
+    Ok(sources)
 }
 
 /// Read the parent's `Agent` `tool_use` id from a subagent's sibling meta file.
