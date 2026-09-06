@@ -39,7 +39,7 @@ use super::state::{HistoryAppState, Profile, ROW_H};
 // Pure graph/lane geometry (exact production constants)
 // ---------------------------------------------------------------------------
 
-/// Production `LANE_W` (media/main.js): the natural per-lane grid step.
+/// Production `LANE_W`: the natural per-lane grid step.
 pub(crate) const LANE_W: f64 = 18.0;
 
 /// Production `LANE_W_PULSE_SCALE`: the fixed Pulse quiet-rail pitch factor.
@@ -145,9 +145,9 @@ pub(crate) fn f64_round_to_i64(value: f64) -> i64 {
     low
 }
 
-/// Production `COLORS` lane palette as CSS hex strings (media/main.js). The
-/// per-row SVG graph paints every lane by wrapping modulo this length, exactly
-/// like the production `buildGraphCell`.
+/// Production `COLORS` lane palette as CSS hex strings. The per-row SVG graph
+/// paints every lane by wrapping modulo this length, exactly like the legacy
+/// `buildGraphCell`.
 pub(crate) const LANE_COLORS_HEX: [&str; 10] = [
     "#48f1dc", "#a18aff", "#6ee7a2", "#5ca8ff", "#ffc86a", "#ff70a6", "#72ddf7", "#c77dff",
     "#64dfdf", "#ff8fa3",
@@ -552,7 +552,7 @@ pub(crate) fn graph_layout(
     }
 }
 
-/// Production `MIN_COL_W` per resizable column (media/main.js).
+/// Production `MIN_COL_W` per resizable column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ColKey {
     Graph,
@@ -2091,7 +2091,7 @@ mod web {
         graph: &GraphData,
     ) -> Result<web_sys::Element, JsValue> {
         let svg = document.create_element_ns(Some(SVG_NS), "svg")?;
-        // Keep the established graphCell hook for styling/oracle parity while
+        // Keep the established graphCell hook for styling parity while
         // exposing the explicit row-fragment contract to E2E probes.
         svg.set_attribute("class", "graphCell graph-row-fragment")?;
         svg.set_attribute("width", &super::svg_number(cell.width))?;

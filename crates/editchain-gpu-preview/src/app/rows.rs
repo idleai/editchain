@@ -1,7 +1,7 @@
 //! Pure row presentation model for one `HistoryRow` JSON value.
 //!
-//! This module ports the row-presentation half of `media/main.js` into a
-//! deterministic, target-independent layer. Given a raw cached row
+//! This module ports the row-presentation half of the legacy JS controller
+//! into a deterministic, target-independent layer. Given a raw cached row
 //! ([`RowSpec::from_value`]) it resolves every presentation input the DOM
 //! shell needs:
 //!
@@ -35,9 +35,8 @@
 //! - The graph cell SVG, column layout `style`, sticky header, and column
 //!   resize plumbing are layout concerns; this layer only exposes the frame
 //!   graph fields.
-//! - `formatDate` renders deterministically in UTC. `main.js` uses the host
-//!   locale/timezone (`toLocaleDateString`); the DOM layer may re-render the
-//!   date column with `Intl` for exact host-locale parity.
+//! - `formatDate` renders deterministically in UTC (the legacy JS renderer
+//!   used the host locale/timezone via `toLocaleDateString`).
 //! - Selection/find/expansion/roving-tabindex state is passed in via
 //!   [`RowContext`] because the pure state machine does not own those flags;
 //!   the shell supplies them.
@@ -3086,9 +3085,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     // ---- Test-only HTML renderers -----------------------------------------
-    // These mirror `main.js`'s span assembly byte-for-byte so the structured
-    // model is verified against the frozen oracle's exact markup. They are
-    // intentionally test-only: the real DOM shell owns rendering.
+    // These mirror the legacy JS renderer's span assembly byte-for-byte so
+    // the structured model is verified against its frozen golden markup.
+    // They are intentionally test-only: the real DOM shell owns rendering.
 
     fn esc(text: &str) -> String {
         html_escape(text)
@@ -3657,7 +3656,7 @@ mod tests {
         )
     }
 
-    // ---- Function-level contract goldens (oracle-captured) -----------------
+    // ---- Function-level contract goldens (production-captured) ---------------
 
     #[test]
     fn identity_helpers_match_production_values() {
@@ -4290,7 +4289,7 @@ mod tests {
         );
     }
 
-    // ---- Markdown plain-text goldens (oracle-captured) ---------------------
+    // ---- Markdown plain-text goldens (production-captured) -------------------
 
     struct MdCase {
         source: &'static str,
@@ -4330,7 +4329,7 @@ mod tests {
     ];
 
     #[test]
-    fn markdown_plain_and_summary_goldens_match_the_oracle() {
+    fn markdown_plain_and_summary_goldens_match_production() {
         for case in MD_CASES {
             assert_eq!(
                 markdown_plain_inline(case.source),
@@ -4411,7 +4410,8 @@ mod tests {
     #[test]
     fn html_tag_strip_removes_tags_but_keeps_same_line_text() {
         // JS `\<\/?[A-Za-z][^>\n]*>` ends at the tag's own first `>`, so the
-        // text between tags on one line survives exactly like the oracle.
+        // text between tags on one line survives exactly like the legacy JS
+        // renderer.
         assert_eq!(markdown_plain_inline("<b>a</b> x"), "a x");
         assert_eq!(markdown_plain_inline("<b>a</b> and <i>y</i>"), "a and y");
         assert_eq!(markdown_plain_inline("<b>a</b> x <i>y</i>"), "a x y");
@@ -4436,7 +4436,7 @@ mod tests {
         assert_eq!(summary.line.inline.len(), 4, "Text, Code, Space, Strong");
     }
 
-    // ---- RowSpec contract goldens (oracle-captured) ------------------------
+    // ---- RowSpec contract goldens (production-captured) ----------------------
 
     fn context(view: ViewMode, abs: i64, group_start: bool) -> RowContext {
         RowContext::for_row(view, abs, group_start)

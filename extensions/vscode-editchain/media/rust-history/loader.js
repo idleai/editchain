@@ -2,8 +2,9 @@
 //
 // This ES module is the ONLY bootstrap the Rust-owned history webview loads:
 // it initializes the generated wasm-bindgen module and calls the Rust shell's
-// `startHistoryView` entry point. Production `media/main.js` and
-// `media/gpu-preview/bootstrap.js` are deliberately NOT loaded on this path.
+// `startHistoryView` entry point. The deleted legacy JS bootstraps
+// (`media/main.js`, `media/gpu-preview/bootstrap.js`) are not part of this
+// path: the Rust shell owns the full runtime once the wasm module boots.
 //
 // CSP contract: static ES module imports only (no eval, no inline code, no
 // dynamic import strings). The wasm URL is passed to `init()` explicitly so
@@ -12,9 +13,8 @@
 // This file owns no app state, events, DOM rendering, frame assembly, or
 // host-request logic: the Rust shell owns all of those. It only mirrors the
 // Rust shell's wasm-bindgen debug exports as a read-only
-// `window.__editchainGpuDebug` facade for harness/e2e runners (the same
-// contract name the gpu-preview bootstrap uses, with `loader: 'rust-history'`
-// so suites can prove which bootstrap produced it).
+// `window.__editchainGpuDebug` facade for harness/e2e runners, tagged
+// `loader: 'rust-history'` so suites can prove which loader produced it.
 import init, {
   debugBackend,
   debugDataReady,
@@ -61,7 +61,7 @@ function parseJson(value) {
 
 // Read-only polling wrapper over the Rust debug exports: resolves once the
 // shell reports dataReady, zero in-flight requests, and two stable frame
-// generations (mirrors the gpu-preview bootstrap's idle contract).
+// generations (the shell's idle contract).
 function whenIdle(timeoutMs) {
   const startedAt = performance.now();
   const limit = Number(timeoutMs) || 60000;

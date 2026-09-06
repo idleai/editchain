@@ -8,7 +8,7 @@ from Claude Code and Codex, overlaid with live Git history from the workspace's
 
 - **VS Code** 1.85+
 - **Rust toolchain** (to build the native service binary)
-- **Rust 1.97 + `wasm32-unknown-unknown` target + `wasm-bindgen-cli` 0.2.127** (Rust-owned history renderer — see below)
+- **Rust 1.97 + `wasm32-unknown-unknown` target + `wasm-bindgen-cli` 0.2.127** (to build the Rust/WASM history renderer assets — the production webview renderer)
 
 ## Build & install
 
@@ -21,13 +21,12 @@ cd extensions/vscode-editchain
 npm install
 npm run compile        # compiles TS -> out/
 
-# 2b. (Rust-owned history renderer) Build the Rust/WASM assets
+# 2b. Build the Rust/WASM history renderer assets
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.127 --locked
 npm run build:gpu      # builds crates/editchain-gpu-preview for wasm32 and emits
-                       # deterministic dual output: media/rust-history/pkg/ (the
-                       # PRODUCTION loader + wasm glue tree) and
-                       # media/gpu-preview/pkg/ (the deprecated oracle tree)
+                       # the deterministic production tree:
+                       # media/rust-history/pkg/ (the generated wasm-bindgen glue)
 
 # 3a. Package a .vsix and install it (run from INSIDE this folder)
 npx @vscode/vsce package
@@ -41,14 +40,14 @@ code --install-extension editchain-history-0.1.0.vsix
 A packaged `.vsix` must carry the full production webview payload plus the
 native service it launches:
 
-- **Rust loader**: `media/rust-history/loader.js` — the ONLY bootstrap the
+- **Rust loader**: `media/rust-history/loader.js` — the ONLY script the
   production webview loads.
 - **Generated wasm-bindgen glue**: `media/rust-history/pkg/editchain_gpu_preview.js`
-  and `media/rust-history/pkg/editchain_gpu_preview_bg.wasm` (plus the
-  oracle's identical `media/gpu-preview/pkg/` copies used by the offscreen
-  parity harnesses).
+  and `media/rust-history/pkg/editchain_gpu_preview_bg.wasm`.
 - **Stylesheets**: `media/main.css` (shared history scaffold) and
-  `media/gpu-preview/gpu-preview.css` (canvas overlay + status chrome).
+  `media/gpu-preview/gpu-preview.css` (status chrome + the inert
+  canvas-overlay scaffold + `#gpu-rows` mirror; the Rust shell never creates a
+  canvas).
 - **TS host output**: `out/extension.js`.
 - **Service binary**: the native `editchain-vscode-service` release build
   (from the repo root: `cargo build --release -p editchain-vscode-service`).
@@ -128,13 +127,12 @@ payload is a typed `ResolvedObject` DTO under the same rule: `repository` and
 hex strings, and `imported_record` is a `node:boot:seq` string when present —
 never raw u64 numbers or byte-array ID structures.
 
-### Rust-owned history renderer (default)
+### Rust/WASM history renderer (sole renderer)
 
 `editchain-history.open` opens **one** panel titled **"EditChain History"** and
 the webview is owned end-to-end by the Rust/WASM runtime. There is **no second
-panel and no side-by-side preview**; `media/main.js` and
-`media/gpu-preview/bootstrap.js` are the **deprecated test-only oracle** (see
-below) and are not part of the production webview.
+panel and no side-by-side preview** — the single Rust/WASM panel is the only
+shipped UI.
 
 **Architecture boundary.** The Rust-owned webview is deliberately narrow:
 
@@ -168,20 +166,23 @@ below) and are not part of the production webview.
     `data-key` identity for top-level and sub-op rows, the exact CSS classes
     and ARIA attributes (roving tabindex, `aria-selected`, `aria-expanded`,
     disclosure labels), summary/chrome/work-unit/bundle/promotion inputs,
-    wgpu graph data (`lane`, `above`, `below`, `transitions`, `is_subop`,
+    graph data (`lane`, `above`, `below`, `transitions`, `is_subop`,
     `is_bundle`), and the exact `openJson` identity envelope.
   - web-sys DOM shell (`app/dom.rs`) — renders rows as real DOM/text nodes
     (never application `innerHTML` strings), the `role="grid"` table with
     `aria-rowcount`, per-row `role="row"` + gridcell roles, live-region
     announcements (`#status-live`, `#gpu-live`), labelled profile/search
-    controls, the single transparent canvas under `#gpu-canvas-host`
-    (`pointer-events: none`, over the `.graph-cell` column), the `#gpu-rows`
-    frame mirror, and scroll-window mutations + profile-control state.
-  - wgpu runtime (`browser.rs` + `shader.wgsl`) — instantiates `GpuRenderer`
-    on WebGPU or the WebGL2 fallback selected by wgpu, and submits geometry
-    from the serialized frame contract built directly from cached `RowSpec`
-    data. `renderCount`/`vertexCount` debug exports let tests assert nonempty
-    GPU geometry in addition to the rendered DOM.
+    controls, one aria-hidden `svg.graph-row-fragment` per hydrated row inside
+    its `.graph-cell`, the inert `#gpu-canvas-host` container (no canvas is
+    ever created), the `#gpu-rows` frame mirror, and scroll-window mutations +
+    profile-control state.
+  - Per-row SVG graph rendering (`app/dom.rs` + `row_graph_items`) — paints
+    each row's graph from the pure `RowSpec` items (local-cell lane halves,
+    cross-lane transition halves, the centered node dot, bundle glyphs) as
+    real SVG nodes, so the graph scrolls inside the row DOM. The obsolete
+    `GpuRenderer`/wgpu surface remains compiled only for its native geometry
+    tests; the shell never instantiates it (`renderCount` > 0, `vertexCount`
+    0, backend `svg`).
 - **Accessibility**: the Rust shell owns the a11y surface — grid/row/gridcell
   roles, `aria-rowcount`, `aria-selected`/`aria-expanded`, roving tabindex
   (exactly one tabbable row), labelled controls, `aria-live` status regions,
@@ -197,25 +198,15 @@ that initial budget) so every lane remains addressable. After that initial
 layout, lane X positions are immutable with respect to column width: dragging
 the divider changes only the rendered column width, so rightmost lanes may
 clip at the edge or trailing space may appear, but the topology never shifts.
-`dividerResize.test.js` pins the exact centers across divider drags, while the
-low-lane `rustSmoke` fixture re-asserts `[14.76, 29.52, …]` after a viewport
-change. The real-chain visual matrix records the complete dense-lane vector
-before and after narrow/wide divider drags and requires exact equality.
+The low-lane `rustSmoke` fixture re-asserts `[14.76, 29.52, …]` after a
+viewport change. The real-chain visual matrix records the complete dense-lane
+vector before and after narrow/wide divider drags and requires exact equality.
 
-**Deprecated test-only oracle (not production).** `media/main.js` (the former
-SVG/DOM controller) and `media/gpu-preview/bootstrap.js` (its GPU overlay
-bridge) are retained **only** as the offscreen regression oracle:
-`test/harness/index.html` and `test/harness/gpu.html` load them so the
-deprecated CPU/SVG renderer can be compared against the GPU overlay (functional
-parity, `npm run ui:gpu` scenario oracle, divider invariance). They are never
-loaded or executed by the production webview, never act as its renderer, and
-must not be described as production.
-
-**Backend selection/fallback.** Inside VS Code the webview starts with
-`data-gpu-backend="auto"` and probes GPU capability, preferring WebGPU and
-falling back to WebGL. **WebGL is the deterministic CI baseline** (software
-rasterization in headless Chromium); **WebGPU is capability-probed and
-diagnostic only** — parity and smoke runs pin `--backend webgl` explicitly.
+**Backend.** The Rust shell reports the deterministic per-row SVG backend
+(`backend: 'svg'`); the `data-gpu-backend` attribute on the webview body is
+accepted for scaffold compatibility but no wgpu/WebGL surface is created — the
+graph lives inside the scrolling row DOM, so there is nothing to probe or
+fall back between.
 
 ## Configuration
 
@@ -224,284 +215,50 @@ diagnostic only** — parity and smoke runs pin `--backend webgl` explicitly.
 | `editchain-history.servicePath` | `""` | Path to the Rust service binary. Empty = prefer the workspace release build, then fall back to debug. |
 | `editchain-history.chainDir` | `.editchain` | Path to the EditChain directory relative to the workspace root. |
 
-## Harness testing (text-first layout debugging)
+## Harness testing
 
-The legacy CPU/SVG renderer (`media/main.js`, the deprecated oracle side) can
-be driven headlessly in Chromium so a text-only agent can inspect the rendered
-layout without opening VS Code. These harnesses load the **same** oracle page
-(`test/harness/index.html` + stylesheet) and report geometry as text first;
-settled screenshots are also supported via `--shot` (see below). The Rust-owned
-production webview is exercised headlessly by the **Rust-owned adapter smoke
-test** (real Chrome) and in real VS Code by the e2e suites further down.
-
-### Fixture mode (deterministic scenarios)
-
-```sh
-npm run ui:dump    -- --scenario merge --viewport 1440x900   # full layout dump
-npm run ui:inspect -- --scenario merge --selector ".row"     # one element's geometry
-npm run ui:check   -- --scenario merge                       # textual checks only
-npm run ui:check   -- --scenario merge --shot shot.png       # ...plus a settled screenshot
-```
-
-Scenarios: `empty`, `linear`, `merge`, `mixed`, `filtered`, `undated`, `error`,
-`warned`, `large`, `longsummary`, `combined` (expansion), `sessionBranch`
-(a Codex session anchored below six newer Git commits), `fork` (lanes), and
-`highLanes` (200 concurrent lanes — proves no 128-lane clipping). `check` mode
-is **test-blocking**: it exits non-zero when any layout check fails or the page
-reports errors.
-
-Scenario interactions exercised by the harness block `check` mode:
-
-- `combined` — clicks the combined op and verifies ALL bundled sub-ops reveal
-  inline (not just the first one).
-- `--search "query"` — runs the renderer's real Find-in-Chain path (input →
-  Enter → in-place jump) and verifies the chain DOM is preserved, the counter
-  reports `i of N` (e.g. `1 of 4`), focus stays in the search input, and
-  double-clicking the highlighted row navigates to the JSON editor with the
-  match's real identity (git hits by `git_oid`/`repository`, never the
-  synthetic index-only `op_id`), e.g.
-  `npm run ui:check -- --scenario mixed --search message`.
-- `--search-race` — with `--scenario merge`, issues two rapid searches with the
-  first response held, and verifies the LATEST query wins (search-epoch
-  correlation): releasing the older query's late response must not replace the
-  newer query's matches.
-- `--resize` — resizes the viewport and asserts the renderer RECOMPUTES graph
-  geometry (header, lane compression, SVG cell widths, rows) instead of just
-  stretching the DOM, with lane dots staying inside their cells.
-- `warned` — Open responses carrying `warnings`/`diagnostics` (e.g. missing
-  blob payloads) render a non-blocking banner above the table while rows still
-  load; `OPEN_WARNINGS_VISIBLE` asserts the warning is surfaced, never silently
-  discarded.
-
-Find-in-chain keyboard behaviour (ArrowDown/Up + Enter/Shift+Enter wrap with
-focus retained, Escape/empty clearing without refetch — the revealed scroll
-position is preserved — stale in-flight/edited queries never navigating,
-expansion/profile preserved, and the legacy flat-list `Search` path still
-rendering) is covered by `node --test test/harness/searchKeyboard.test.js`
-against the same harness page.
-
-Artifacts are written to `.ui-out/<scenario>/` (`summary.md`, `layout.txt`,
-`layout.json`, `svg.json`, `console.txt`, `metrics.json`, `aria.yml`,
-`expansion.json`, `search.json`, `search-race.json`,
-`resize.json`).
-
-`--shot PATH` captures a PNG only after the UI is settled (`whenIdle` resolves:
-no in-flight requests, no placeholder rows, fonts loaded), so screenshots are
-deterministic and never capture the loading state. The probe also asserts
-visible nonzero-width Content/Date/Author/Commit cells (`CELL_GEOMETRY`) and
-readable text contrast (`CONTRAST_READABLE`) at every viewport width, so the
-visual acceptance criteria are checked numerically in `check` mode.
-
-### Real-data mode (live Rust service)
-
-```sh
-npm run ui:real -- --workspace /path/to/repo --chain-dir .editchain
-```
-
-Spawns the actual `editchain-vscode-service`, opens the workspace, and renders
-the real chain. Writes a full DOM tree with computed styles to `.ui-out/real/`
-(`dom.json`, `dom.txt`, plus the same artifacts as fixture mode). Add
-`--shot out.png` to capture a settled screenshot after `whenIdle` (same
-deterministic readiness gate as fixture mode).
-
-Use `--scroll-row N` to jump to a specific visible history row after the
-full-height virtual-scroll spacer is ready. The run fails unless the settled
-renderer window actually contains that row, and records the requested row,
-pixel offset, and resulting `renderTop`/`renderBottom` in `summary.md`.
-`--row-timeout MS` applies to the renderer's real `GetWindow` transport calls
-as well as readiness checks, which is important for large imported chains.
-
-### Graph harness (real service, structural checks)
-
-The graph harness pages the **entire** rendered dataset through the real
-service bridge using the exact `GetWindow` DTOs the renderer sends, then runs
-structural checks over the data **and** the rendered DOM — built for ~150k-row
-chains without accumulating full row DTOs:
-
-```sh
-npm run ui:graph -- --workspace /path/to/repo --chain-dir .editchain
-```
-
-Options: `--out DIR` (default `.ui-out/graph`), `--limit N` (probe page size,
-default 2000; the renderer uses 500), `--viewport WxH`, `--row-timeout MS`.
-`--row-timeout` is threaded through **every** page-side `GetWindow` request
-(probe pages and the renderer's own scroll fetches, via the service transport
-default): a hung service fails the run after the configured bound instead of
-the old hardcoded 120s. `Open` remains explicitly unbounded (0 deadline) —
-building the chain + git graph can take minutes on a large workspace. The
-service binary comes from `SERVICE_PATH` or
-`<workspace>/target/release/editchain-vscode-service`, with the debug build as
-a fallback.
-
-The probe's own failure detection is verified without a service via simulated
-fixtures:
-
-```sh
-npm run ui:graph -- --self-test
-```
-
-`--self-test` runs an in-page simulated service and asserts that a
-`chain_generation` change mid-scan is detected (the run fails with
-`CHAIN_GENERATION_STABLE`) and that a hung `GetWindow` rejects after the
-configured timeout instead of hanging. Artifacts land in `.ui-out/graph-self-test/`.
-
-Checks (all exit non-zero on failure):
-
-- Paging: page totals stable, paged rows match the reported total, and
-  `chain_generation` is **identical across every paged response** — a change
-  mid-scan (the chain was rewritten while being read) fails the run.
-- Node keys: non-empty and unique across top-level and sub-op rows.
-- Sub-ops: `<parent>::sub:<i>` key format, `parent_row`/expanded-slot layout,
-  and the offset-0 `sub_op_counts` snapshot agree.
-- Parents: every parent key resolves to a top-level node; no self/repeated
-  parents.
-- Relations: `parent_relations` reference drawn parents, carry a known kind,
-  and are not duplicated — plus a per-kind count report (never hardcoded).
-- Diagnostics: Open duplicate/quarantine counts are consistent
-  (`records = accepted + duplicates + quarantined`) and their rates are
-  reported.
-- Lanes: all lane references within `[0, max_lane]`, vertical segments meet at
-  every row boundary (page boundaries included), no lane reuse without a
-  parent edge, tip/root boundaries clean, sub-op lanes inherit their parent,
-  transitions anchored by dots or boundary geometry.
-- Rendered rows: `data-row`/`data-key` integrity, uniform `ROW_H`, bounded DOM,
-  one in-cell dot per top-level row, lane-consistent monotonic dot positions,
-  and render/data coherence (rendered keys match the dataset at the same
-  absolute slot; renderer `total`/`max_lane` match the dataset). Coherence is
-  sampled at the initial viewport **and** after scrolling to the top, middle,
-  and bottom of the chain (plus a top re-anchor after the full traversal),
-  waiting for idle after each jump — a scroll path that leaks DOM rows or
-  fails to re-anchor fails the run (`SCROLL_*` checks).
-
-Artifacts (`--out`, default `.ui-out/graph/`):
-
-- `graph.json` — aggregates: totals, relation-kind counts, duplicate rates,
-  kind/lane histograms, paging summary.
-- `dataset.ndjson` — one compact row per line (probe fields only; streamed in
-  chunks so the full dataset is never materialized as a single blob).
-- `checks.json` / `render.json` / `open.json` — checks, rendered DOM slice +
-  renderer state + scroll samples, and the Open response (diagnostics).
-- `summary.md` / `console.txt` / `service-stderr.txt`.
-
-The harness reuses the real `editchain-vscode-service`, `serviceBridge.js`,
-the legacy oracle `media/main.js`, and `media/main.css` — no simulated
-renderer. The probe pages through the same bridge the renderer uses, so a
-structural failure
-reflects what the viewer would actually draw. Run against a small chain first
-(e.g. a scratch workspace); the harness is memory-conscious but a full scan of
-a very large chain still pages every row.
+The Rust/WASM production webview is exercised headlessly in real Chrome by the
+**Rust-owned adapter smoke test** below, and inside real VS Code by the e2e and
+visual suites further down.
 
 ### Rust-owned adapter smoke test (real Chrome)
 
 Drives the REAL Rust/WASM history adapter end-to-end in headless Chrome
-(deterministic SwiftShader WebGL baseline) through the Rust-only fixture page
-`test/harness/rust.html`:
+through the Rust-only fixture page `test/harness/rust.html`:
 
 ```sh
 CHROME_PATH=/path/to/chrome npm run test:rust-smoke
 ```
 
 `rust.html` loads **neither** `media/main.js` **nor**
-`media/gpu-preview/bootstrap.js`: `media/rust-history/loader.js` initializes
-the generated wasm-bindgen module and calls the Rust shell's
-`startHistoryView()`, which acquires `window.acquireVsCodeApi()` (the fixture
-bridge supplies it), installs the host-message listener, renders real
-`.row[data-row][data-key]` DOM with grid ARIA into `#rows`, creates the single
-canvas under `#gpu-canvas-host`, and mirrors frame markers into `#gpu-rows`.
+`media/gpu-preview/bootstrap.js` (both retired oracle files):
+`media/rust-history/loader.js` initializes the generated wasm-bindgen module
+and calls the Rust shell's `startHistoryView()`, which acquires
+`window.acquireVsCodeApi()` (the fixture bridge supplies it), installs the
+host-message listener, renders real `.row[data-row][data-key]` DOM with grid
+ARIA into `#rows`, paints every hydrated row's own aria-hidden
+`svg.graph-row-fragment` inside its `.graph-cell`, and mirrors frame rows into
+`#gpu-rows` — no canvas surface is created anywhere.
 
 The suite asserts: wasm starts cleanly; the synchronous Open/Ready handshake
 and correlated numeric-id window replies drive `dataReady`; `role="grid"` +
-`aria-rowcount` + per-row gridcell roles; exactly one canvas in
-`#gpu-canvas-host` and no foreign canvases; the `#gpu-rows` mirror; the
-deterministic `webgl` backend with `renderCount`/`vertexCount` > 0; the nominal
-low-lane Pulse pitch `[14.76, 29.52, …]` unchanged across a viewport change;
-and the functional path through the Rust shell — Activity→Raw→Activity profile
-switching with `hide_trace` flipping, find-in-chain submit/next/clear with
-pending/busy ARIA, row selection + roving keyboard + raw-JSON identity,
+`aria-rowcount` + per-row gridcell roles; the deterministic `svg` backend with
+`renderCount` > 0 and `vertexCount` 0; zero canvases (the inert
+`#gpu-canvas-host` stays empty and no foreign canvases exist); one
+aria-hidden `svg.graph-row-fragment` per hydrated row; the `#gpu-rows` mirror;
+the nominal low-lane Pulse pitch `[14.76, 29.52, …]` unchanged across a viewport
+change; and the functional path through the Rust shell — Activity→Raw→Activity
+profile switching with `hide_trace` flipping, find-in-chain submit/next/clear
+with pending/busy ARIA, row selection + roving keyboard + raw-JSON identity,
 chevron disclosure with `aria-expanded` and sub-op reveal, and the legacy
 flat-list `Search` — plus a screenshot under `trace/rust-smoke.png`. It also
-proves `media/main.js` and the gpu-preview bootstrap are absent at runtime.
+proves `media/main.js` and the gpu-preview bootstrap stay absent at runtime.
 
-Like the parity suites, the runtime tests **skip** (never fail) when Chrome or
-the built `media/rust-history/pkg` assets are missing, so the generic
+The runtime tests **skip** (never fail) when Chrome or the built
+`media/rust-history/pkg` assets are missing, so the generic
 `npm run test:harness` suite stays green without GPU build artifacts. CI
 installs Chrome first and runs this suite explicitly with `CHROME_PATH` so it
 **cannot silently skip**.
-
-### GPU renderer harness (fixture parity, offscreen regression oracle)
-
-This harness is an **offscreen regression oracle**: it compares the deprecated
-CPU/SVG harness page against the GPU harness page over a local static HTTP
-server and is **not** the shipped VS Code UI — the shipped UI is the single
-"EditChain History" panel (default `editchain-history.open`) rendered by the
-Rust-owned webview, exercised by the real VS Code e2e below.
-
-Drives **both** renderers against the **same deterministic fixture
-scenario**: the CPU/SVG harness (`test/harness/index.html`) and the GPU
-harness (`test/harness/gpu.html`, which loads the **same legacy scaffold** —
-`media/main.css` + `media/main.js` + fixtures + fixture bridge — plus the
-deprecated `media/gpu-preview` bootstrap + wasm over a local static HTTP
-server). Each side
-settles through its own debug `whenIdle` (no arbitrary sleeps), then the runner
-compares normalized rows — absolute index, key/`node_key`, lane, sorted
-above/below lane sets, directed transitions, and total — **and the shared
-functional state**: profile, search mode, view-message state, table header,
-group warnings, an overlapping render window with the same anchor (buffer
-extent may differ with viewport height), and the last `GetWindow` `hide_trace`
-flag. Scenarios declare an expected end state: `empty` and `error` expect the
-full-pane empty/error message on both sides (and pass only if the message state
-matches), while every other scenario expects rendered rows + nonempty wgpu
-geometry (`renderCount`/`vertexCount` > 0, one canvas in `#gpu-canvas-host`
-over the `.graph-cell` column, `#gpu-rows` mirror == snapshot rows).
-The runner fails when common functional state is missing, not merely on a
-geometry-prefix mismatch.
-
-```sh
-npm run ui:gpu -- --scenario merge --backend webgl --shot
-```
-
-Options: `--scenario` (default `merge`; the full fixture set from the CPU
-harness, including `multigroup` for virtual paging across group boundaries),
-`--backend webgl|webgpu` (default `webgl` — the deterministic CI baseline;
-`webgpu` is diagnostic), `--viewport WxH`, `--out DIR`, `--shot` (settled
-full-page screenshots). Artifacts land in `.ui-out/gpu-<scenario>/`:
-`parity.json`, `metrics.json`, `console.txt`, `summary.md`, plus `dom.png` /
-`gpu.png` with `--shot`. The run exits non-zero on page errors, missing
-wasm/bootstrap artifacts, unexpected empty/error states, or any geometry or
-functional-state mismatch — contract tests for the comparison helpers run in
-the generic harness suite (`test/harness/gpuContract.test.js`).
-
-Deterministic **browser functional parity** drives the SAME page behavior
-through both sides — Activity→Raw→Activity request filters and
-metadata gating, virtual scroll/paging on `large`/`workUnitsDeep`, find-in-chain
-submit + next/prev + off-cache jump + clear, legacy flat-list `Search`,
-row selection/keyboard roving/raw-JSON identity, work-unit/bundle expansion with
-sub-op visibility, and the expected `empty`/`error` states — and asserts the GPU
-DOM meets the exact shared semantics plus `renderCount`/`vertexCount` > 0:
-
-```sh
-CHROME_PATH=/path/to/chrome node --test test/harness/functionalParity.test.js
-```
-
-The suite reuses `fixtures.js` + `fixtureBridge.js` + `media/main.js` debug
-hooks (`test/harness/functionalDriver.js`) and **skips** (never fails) when
-Chrome or the built wasm assets are absent, so the generic harness suite stays
-green without GPU assets. CI runs the focused contract + functional tests and
-pins WebGL parity on `merge`, `fork`, `highLanes`, `multigroup`, `empty`, and
-`error` in `.github/workflows/gpu-preview.yml`; WebGPU is never required.
-Explicit WebGPU runs use the `gpu-<scenario>-webgpu` artifact directory so a
-capability diagnostic cannot overwrite the deterministic WebGL baseline.
-
-**Graph-lane divider invariance (fixed low-lane Pulse pitch).** The lane-pitch
-regression oracle (`test/harness/dividerResize.test.js`) drives both oracle
-pages and asserts that resizing the graph-column divider changes ONLY the
-column width: `window.__editchainGraphAdapter.laneXAll()` and the rendered
-dot `cx` stay at the fixed `[14.76, 29.52, 44.28, 59.04]` centers in every
-divider state (this pins the bug fix: the Pulse pitch used to switch to the
-unscaled 18px spacing after the first drag, and dragging the column narrower
-than `numLanes × 14.76` used to re-distribute every lane centre
-proportionally). It skips gracefully without Chrome/assets and runs explicitly
-with real Chrome in CI.
 
 ### Real VS Code harness (WebdriverIO)
 
@@ -518,7 +275,7 @@ npm run ui:vscode   # requires xvfb on headless servers (wrapped automatically)
 - Spec: `test/vscode/history.e2e.ts` — opens the webview via
   `workbench.getWebviewByTitle('EditChain History')`, switches into its iframe,
   asserts rows render, then **injects the same `window.__editchainDebug` probe**
-  (`test/harness/layoutProbe.js`) into the webview and runs the identical textual
+  (`test/vscode/layoutProbe.js`) into the webview and runs the identical textual
   checks inside real VS Code. It also exercises inline selection/raw JSON,
   Activity/Raw profile switching, scroll-through-history, and Find-in-Chain
   against the native service. The find test verifies the preserved real chain,
@@ -529,7 +286,7 @@ npm run ui:vscode   # requires xvfb on headless servers (wrapped automatically)
 - Downloads VS Code + Chromedriver on first run into `.wdio-vscode-service/`
   (gitignored).
 
-The Rust/WASM GPU renderer has its own real-VS-Code e2e:
+The Rust/WASM history renderer has its own real-VS-Code e2e:
 
 ```sh
 npm run ui:vscode:gpu
@@ -540,18 +297,18 @@ npm run ui:vscode:gpu
   opens the **default** `editchain-history.open` command and asserts exactly
   **one** panel titled "EditChain History" (no second/companion panel), the
   panel's rendered `#rows .row[data-key]` rows, the
-  `window.__editchainGpuDebug` contract (backend `webgl`/`webgpu`, snapshot
-  rows/total, `dataReady`, no `lastError`, `renderCount`/`vertexCount` > 0),
-  the single transparent wgpu canvas in `#gpu-canvas-host` over the
-  `.graph-cell` column with the `#gpu-rows` mirror matching the snapshot, and
-  a deterministic `whenIdle` settle. It then drives a compact production path
-  inside the GPU-backed panel — Activity→Raw→Activity profile switching,
-  find-in-chain submit + next + clear, scrolling/paging, and inline selection
-  + keyboard roving (raw JSON stays closed: the harness covers the exact
-  `openJson` envelope) — writes `trace/e2e-history-gpu-contract.json`, and
-  captures the single-panel webview frame
-  (`trace/e2e-history-webview.png`). There is deliberately no side-by-side
-  capture; CPU-vs-GPU row parity stays in the offscreen regression oracle.
+  `window.__editchainGpuDebug` contract (backend `svg`, snapshot rows/total,
+  `dataReady`, no `lastError`, `renderCount` > 0, `vertexCount` 0), zero
+  canvases (the inert `#gpu-canvas-host` stays empty), one aria-hidden
+  `svg.graph-row-fragment` per hydrated row, the `#gpu-rows` mirror matching
+  the snapshot, and a deterministic `whenIdle` settle. It then drives a compact
+  production path inside the Rust-backed panel — Activity→Raw→Activity profile
+  switching, find-in-chain submit + next + clear, scrolling/paging, and inline
+  selection + keyboard roving (raw JSON stays closed: the harness covers the
+  exact `openJson` envelope) — writes `trace/e2e-history-gpu-contract.json`,
+  and captures the single-panel webview frame
+  (`trace/e2e-history-webview.png`). There is deliberately no second panel and
+  no side-by-side capture — the single Rust/WASM panel is the only shipped UI.
 - The GPU WDIO config resolves the repository and native service relative to
   itself. Override them with `EDITCHAIN_GPU_E2E_WORKSPACE` and
   `EDITCHAIN_GPU_E2E_SERVICE` when testing another checkout or binary.
@@ -596,16 +353,12 @@ exits with the wdio suite's own exit code.
 
 ### How it works
 
-- `test/harness/index.html` mounts `media/main.css` + `media/main.js` with a
-  `vscode` shim in place of `acquireVsCodeApi()` — the deprecated CPU/SVG
-  oracle page; `test/harness/gpu.html` adds the deprecated
-  `media/gpu-preview/bootstrap.js` + wasm on top of the same scaffold.
 - `test/harness/rust.html` loads **only** `media/rust-history/loader.js` (plus
   fixtures + fixture bridge) — the Rust-owned production path, driven by
   `test/harness/rustSmoke.test.js`.
 - `?bridge=fixture` (default) uses deterministic protocol fixtures;
   `?bridge=service` forwards requests to the real Rust service over framed stdio.
-- `test/harness/layoutProbe.js` exposes `window.__editchainDebug` with
+- `test/vscode/layoutProbe.js` exposes `window.__editchainDebug` with
   `whenIdle()`, `dumpLayout()`, `assertLayout()`, and `getMetrics()`.
 - The probe runs textual checks (header present, no overflow, dot-row alignment,
   column alignment) that report expected/actual/delta — so layout regressions are
@@ -620,19 +373,15 @@ exits with the wdio suite's own exit code.
   in `editchain-query` and the `editchain-node` CLI but is not wired to the VS
   Code service; the legacy flat-list `Search` request remains for compatibility
   only.
-- The Rust-owned history renderer is the default history view: the webview is
+- The Rust/WASM history renderer is the sole renderer: the webview is
   bootstrapped by `media/rust-history/loader.js` + the generated wasm-bindgen
-  glue and owned by the Rust `HistoryAppState`/`RowSpec`/web-sys/wgpu runtime.
-  WebGL is the deterministic CI baseline (software rasterization in headless
-  Chromium); WebGPU is capability-probed and diagnostic only. The renderer
-  never mutates Git, the worktree, or canonical EditChain storage. The former
-  `media/main.js` SVG controller + `media/gpu-preview/bootstrap.js` are
-  retained only as the deprecated test-only oracle (the offscreen CPU
-  reference side of the parity harnesses), never as production.
+  glue and owned by the Rust `HistoryAppState`/`RowSpec`/web-sys runtime,
+  which paints each row's graph as an inline `svg.graph-row-fragment` (no wgpu
+  canvas surface is created). The renderer never mutates Git, the worktree, or
+  canonical EditChain storage.
 - `Open` is unbounded: building the chain + git graph can take minutes on a
   large workspace. All other service calls carry a generous finite deadline
-  (120s by default, ≥ the measured near-minute first window on large chains;
-  the graph harness's `--row-timeout` overrides this default); a timed-out
-  window/search shows a visible error and suspends background retries until the
-  user clicks **Retry** or re-runs the open command (which restarts a crashed
-  service and re-opens the chain).
+  (120s by default, ≥ the measured near-minute first window on large chains); a
+  timed-out window/search shows a visible error and suspends background
+  retries until the user clicks **Retry** or re-runs the open command (which
+  restarts a crashed service and re-opens the chain).

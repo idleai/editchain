@@ -6,18 +6,18 @@
 //! binding exposed by VS Code (or the deterministic fixture bridge), installs
 //! the host-message listener before posting `webviewReady`, owns
 //! `HistoryAppState`, and renders real row DOM nodes whose `.graph-cell` each
-//! carries its own SVG graph fragment (production `buildGraphCell`). The
-//! graph scrolls inside the row DOM, so no fixed-viewport overlay exists to
-//! reconcile. The production `media/main.js` controller is NOT loaded on the
-//! Rust-owned path.
+//! carries its own SVG graph fragment (`buildGraphCell` markup). The graph
+//! scrolls inside the row DOM, so no fixed-viewport overlay exists to
+//! reconcile. The legacy JS controller is not loaded on the Rust-owned
+//! path.
 //!
 //! The obsolete `GpuRenderer`/wgpu surface (target-independent geometry in
 //! this module, `browser.rs` on wasm32) remains compiled for its native
 //! geometry tests; the shell no longer instantiates it.
 
-// Pure, target-independent HistoryApp application core (Stage 1+): the host
-// protocol and the view state machine ported from the production
-// media/main.js controller. Native unit tests exercise every decision path;
+// Pure, target-independent HistoryApp application core: the host protocol
+// and the view state machine ported from the legacy JS controller. Native
+// unit tests exercise every decision path;
 // the wasm32 build includes the module for the Rust-owned browser shell
 // (`crate::shell` + `app::dom` is the Slice 3A runtime consumer).
 #[cfg(any(target_arch = "wasm32", test))]
@@ -29,10 +29,9 @@ use serde::Deserialize;
 #[cfg(any(target_arch = "wasm32", test))]
 const FLOATS_PER_VERTEX: usize = 6;
 
-/// Production lane palette (`COLORS` in
-/// `extensions/vscode-editchain/media/main.js`), stored as sRGB bytes and
-/// converted to linear space by [`lane_color`] so an sRGB swapchain displays
-/// the exact production hexes.
+/// Production lane palette (`COLORS` from the legacy JS controller), stored
+/// as sRGB bytes and converted to linear space by [`lane_color`] so an
+/// sRGB swapchain displays the exact production hexes.
 #[cfg(any(target_arch = "wasm32", test))]
 const PALETTE_HEX: [[u8; 3]; 10] = [
     [0x48, 0xf1, 0xdc],
@@ -371,7 +370,7 @@ fn lane_center(graph: &FrameGraph, lane: u32) -> f32 {
 
 /// Resolve the production anchor/drop rules: a transition is rendered only
 /// when its start is the row's own node or backed by an `above` lane and its
-/// end is the row's own node or backed by a `below` lane (main.js
+/// end is the row's own node or backed by a `below` lane (legacy
 /// `buildGraphCell`).
 #[cfg(any(target_arch = "wasm32", test))]
 fn resolved_transitions(row: &RenderRow) -> Vec<RenderedTransition> {

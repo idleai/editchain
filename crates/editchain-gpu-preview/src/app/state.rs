@@ -1,7 +1,7 @@
 //! The Rust `HistoryApp` state machine.
 //!
-//! This is a faithful port of the production controller (`media/main.js`)
-//! view-state logic: view/search generations, request correlation (including
+//! This is a faithful native port of the legacy JS controller's view-state
+//! logic: view/search generations, request correlation (including
 //! synchronous fixture-response reentrancy), the sparse window cache, virtual
 //! paging decisions (`PAGE=500`, `BUFFER=400`, `ROW_H=34`), profile
 //! switching, find/search sessions, expansion (sub-op reveal), persistence,

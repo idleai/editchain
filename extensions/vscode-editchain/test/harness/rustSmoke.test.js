@@ -1,24 +1,21 @@
 // Rust-only adapter smoke test (Browser Slice 3A runtime completion).
 //
 // This suite drives the REAL Rust/WASM history adapter end-to-end in headless
-// Chrome through the fixture page test/harness/rust.html. Unlike gpu.html
-// (the offscreen parity oracle where production media/main.js renders the DOM
-// and bootstrap.js overlays a transparent wgpu canvas), rust.html loads
-// NEITHER main.js NOR gpu-preview/bootstrap.js: media/rust-history/loader.js
-// initializes the generated wasm-bindgen module and calls the Rust shell's
-// startHistoryView(), which acquires window.acquireVsCodeApi() (capital C —
-// the fixture bridge supplies it), installs the host-message listener,
-// renders real .row[data-row][data-key] DOM with grid ARIA into #rows, paints
-// every hydrated row's own aria-hidden svg.graph-row-fragment inside its
-// .graph-cell, and mirrors the frame rows into #gpu-rows. No canvas surface
-// is created anywhere.
+// Chrome through the fixture page test/harness/rust.html. rust.html loads
+// NEITHER media/main.js NOR media/gpu-preview/bootstrap.js (both retired
+// oracle files): media/rust-history/loader.js initializes the generated
+// wasm-bindgen module and calls the Rust shell's startHistoryView(), which
+// acquires window.acquireVsCodeApi() (capital C — the fixture bridge supplies
+// it), installs the host-message listener, renders real .row[data-row][data-key]
+// DOM with grid ARIA into #rows, paints every hydrated row's own aria-hidden
+// svg.graph-row-fragment inside its .graph-cell, and mirrors the frame rows
+// into #gpu-rows. No canvas surface is created anywhere.
 //
 // Run:  CHROME_PATH=... node --test test/harness/rustSmoke.test.js
 //
-// Like functionalParity.test.js, the runtime tests SKIP (never fail) when
-// Chrome or the built rust-history assets are missing, so the generic
-// `npm run test:harness` suite stays green without GPU build artifacts. The
-// static source test always runs.
+// The runtime tests SKIP (never fail) when Chrome or the built rust-history
+// assets are missing, so the generic `npm run test:harness` suite stays green
+// without GPU build artifacts. The static source test always runs.
 
 'use strict';
 
@@ -69,7 +66,8 @@ after(async () => {
 // --- static source contract ------------------------------------------------
 
 test('rust.html shares the scaffold but loads neither main.js nor the gpu-preview bootstrap', () => {
-  // Shared fixture scripts + theme tokens, exactly like gpu.html.
+  // Shared fixture scripts + theme tokens, exactly like the production
+  // webview scaffold.
   assert.match(RUST_HTML, /<script src="\.\/fixtures\.js"><\/script>/,
     'loads fixtures.js with the exact relative src used by the other harness pages');
   assert.match(RUST_HTML, /<script src="\.\/fixtureBridge\.js"><\/script>/,
@@ -79,7 +77,7 @@ test('rust.html shares the scaffold but loads neither main.js nor the gpu-previe
   assert.match(RUST_HTML, /<link rel="stylesheet" href="\.\.\/\.\.\/media\/gpu-preview\/gpu-preview\.css">/,
     'links the shared renderer stylesheet (row-fragment + status chrome only)');
   assert.match(RUST_HTML, /--vscode-editor-background/, 'ships the VS Code theme tokens');
-  // Production scaffold IDs shared with index.html/gpu.html.
+  // Production scaffold IDs shared with the shipped webview scaffold.
   for (const id of [
     'controls', 'profile-control', 'profile-activity', 'profile-raw',
     'search-control', 'search', 'search-counter', 'search-prev', 'search-next',
@@ -409,7 +407,7 @@ test('rust-only adapter boots in headless Chrome and renders (merge)', { skip: S
       'laneXAll is unchanged after changing the graph host/available width');
     assertRustHealthy(state, 'after resize');
 
-    // Runtime proof that production main.js and the gpu-preview bootstrap are
+    // Runtime proof that the retired main.js and gpu-preview bootstrap stay
     // absent (they would have set __editchainVscode / loaded their scripts).
     assert.equal(state.mainJsScripts, 0, 'no media/main.js script at runtime');
     assert.equal(state.bootstrapScripts, 0, 'no gpu-preview/bootstrap.js script at runtime');

@@ -1,8 +1,9 @@
 // Fixture bridge: a test replacement for VS Code's `acquireVsCodeApi()`.
 //
-// Loaded in the harness page BEFORE media/main.js. It defines a global `vscode`
-// object (postMessage / getState / setState) that dispatches requests against
-// the selected scenario's protocol fixtures instead of a real service.
+// Loaded in the harness page BEFORE the renderer bootstrap. It defines a
+// global `vscode` object (postMessage / getState / setState) that dispatches
+// requests against the selected scenario's protocol fixtures instead of a
+// real service.
 //
 // The renderer sends `{ body: <RequestBody> }` via vscode.postMessage and
 // expects responses as `{ id, body }` events on window. We emulate the
@@ -600,7 +601,7 @@
     },
   };
 
-  // acquireVsCodeApi is called by main.js; provide it too.
+  // acquireVsCodeApi is called by the renderer; provide it too.
   window.acquireVsCodeApi = function () {
     return window.vscode;
   };
@@ -611,11 +612,11 @@
   window.__editchainClearRequestLog = function () {
     window.__editchainRequestLog = [];
   };
-  // Controlled-release hooks for the deterministic race tests (see
-  // layoutProbe). The first GetWindow / Search request after a hook is set is
-  // captured as `{ taken:false }` and only responds when the test calls
-  // `hook.release()`. No timers — completion is explicit, so the races never
-  // depend on wall-clock timing.
+  // Controlled-release hooks for the deterministic race tests. The first
+  // GetWindow / Search request after a hook is set is captured as
+  // `{ taken:false }` and only responds when the test calls `hook.release()`.
+  // No timers — completion is explicit, so the races never depend on
+  // wall-clock timing.
   window.__editchainHoldWindow = null;
   window.__editchainHoldSearch = null;
   window.__editchainHoldFind = null;

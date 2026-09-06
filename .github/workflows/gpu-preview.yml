@@ -1,23 +1,21 @@
 name: GPU History Renderer
 
-# Rust/WASM GPU history renderer (extensions/vscode-editchain GPU webview).
+# Rust/WASM history renderer (extensions/vscode-editchain history webview).
 # The shipped UI is ONE panel titled "EditChain History" (default command
 # editchain-history.open) rendered by the Rust-owned webview: the tiny
 # media/rust-history/loader.js bootstrap + generated wasm-bindgen glue +
 # the editchain-gpu-preview crate (HistoryAppState / RowSpec / web-sys DOM /
-# wgpu). media/main.js + media/gpu-preview/bootstrap.js are the DEPRECATED
-# test-only oracle (offscreen CPU-vs-GPU parity pages) and are never shipped
-# as the renderer. Separate from lint.yml on purpose: this job builds the
-# wasm-bindgen assets, checks the wasm32 crate, verifies BOTH committed pkg
-# trees (media/rust-history/pkg production + media/gpu-preview/pkg oracle)
-# regenerate without diff, runs the focused static contract tests, the
-# Rust-owned adapter smoke test in real Chrome (explicitly, so it cannot
-# silently skip), the deterministic offscreen CPU-vs-GPU regression-oracle
-# suites (functional parity + divider lane-pitch invariance + WebGL parity
-# scenarios merge/fork/highLanes/multigroup/empty/error), and the real VS
-# Code GPU history e2e under xvfb. It does not weaken or skip any lint.yml
-# gate, and it never requires hardware WebGPU — every deterministic run pins
-# the SwiftShader WebGL baseline explicitly.
+# per-row SVG graph fragments). The deprecated pre-Rust raw-JS/oracle stack
+# (media/main.js, media/gpu-preview/bootstrap.js, the duplicate
+# media/gpu-preview/pkg tree, and the legacy CPU/GPU oracle harness
+# pages/suites) is retired. Separate from lint.yml on purpose: this job
+# builds the wasm-bindgen assets, checks the wasm32 crate, verifies the
+# committed media/rust-history/pkg tree regenerates without diff, runs the
+# focused static contract tests, the Rust-owned adapter smoke test in real
+# Chrome (explicitly, so it cannot silently skip), and the real VS Code
+# history e2e under xvfb. It does not weaken or skip any lint.yml gate, and
+# it never requires hardware WebGPU — the renderer is the per-row SVG graph,
+# so no canvas or WebGL baseline is exercised anywhere.
 
 on:
   push:
@@ -75,26 +73,25 @@ jobs:
         timeout-minutes: 25
         run: cargo build --release -p editchain-vscode-service
 
-      - name: Build GPU assets (deterministic dual output)
+      - name: Build GPU assets (deterministic single output)
         working-directory: extensions/vscode-editchain
         timeout-minutes: 25
         run: npm run build:gpu
 
-      - name: Verify committed GPU pkg trees regenerate without diff (production + oracle)
+      - name: Verify committed GPU pkg tree regenerates without diff (production)
         working-directory: extensions/vscode-editchain
         run: |
-          for pkg in media/rust-history/pkg media/gpu-preview/pkg; do
-            if git ls-files --error-unmatch "$pkg" >/dev/null 2>&1; then
-              if [ -n "$(git status --porcelain -- "$pkg")" ]; then
-                echo "::error::Regenerating $pkg produced a diff; the committed wasm-bindgen artifacts are out of sync with the crate."
-                git status --porcelain -- "$pkg"
-                exit 1
-              fi
-              echo "$pkg regeneration matches the committed artifacts"
-            else
-              echo "$pkg is not tracked in git — skipping the regeneration diff check"
+          pkg=media/rust-history/pkg
+          if git ls-files --error-unmatch "$pkg" >/dev/null 2>&1; then
+            if [ -n "$(git status --porcelain -- "$pkg")" ]; then
+              echo "::error::Regenerating $pkg produced a diff; the committed wasm-bindgen artifacts are out of sync with the crate."
+              git status --porcelain -- "$pkg"
+              exit 1
             fi
-          done
+            echo "$pkg regeneration matches the committed artifacts"
+          else
+            echo "$pkg is not tracked in git — skipping the regeneration diff check"
+          fi
 
       - name: wasm32 cargo check (editchain-gpu-preview)
         run: cargo check -p editchain-gpu-preview --target wasm32-unknown-unknown --locked
@@ -114,7 +111,7 @@ jobs:
         working-directory: extensions/vscode-editchain
         run: node --test test/harness/gpuContract.test.js
 
-      - name: Install Chrome for the GPU parity + Rust smoke harnesses
+      - name: Install Chrome for the Rust smoke harness
         id: chrome
         working-directory: extensions/vscode-editchain
         timeout-minutes: 10
@@ -126,7 +123,7 @@ jobs:
           test -x "$CHROME_BIN"
           echo "path=$CHROME_BIN" >> "$GITHUB_OUTPUT"
 
-      - name: Rust-owned history adapter smoke test (real Chrome, deterministic WebGL)
+      - name: Rust-owned history adapter smoke test (real Chrome, deterministic per-row SVG)
         working-directory: extensions/vscode-editchain
         timeout-minutes: 20
         env:
@@ -147,73 +144,6 @@ jobs:
             grep '# SKIP ' "$RUNNER_TEMP/rust-smoke.tap"
             exit 1
           fi
-
-      - name: Graph-lane divider invariance oracle (fixed Pulse pitch, real Chrome)
-        working-directory: extensions/vscode-editchain
-        timeout-minutes: 15
-        env:
-          CHROME_PATH: ${{ steps.chrome.outputs.path }}
-        run: |
-          set -o pipefail
-          node --test --test-reporter=tap test/harness/dividerResize.test.js 2>&1 | tee "$RUNNER_TEMP/divider-resize.tap"
-          grep -q '^# tests ' "$RUNNER_TEMP/divider-resize.tap" || {
-            echo "::error::dividerResize produced no test plan; the suite did not run."
-            exit 1
-          }
-          if grep -q '# SKIP ' "$RUNNER_TEMP/divider-resize.tap"; then
-            echo "::error::dividerResize skipped a runtime test in CI despite CHROME_PATH and built assets; it must run for real."
-            grep '# SKIP ' "$RUNNER_TEMP/divider-resize.tap"
-            exit 1
-          fi
-
-      - name: GPU functional parity regression oracle (deterministic WebGL, offscreen)
-        working-directory: extensions/vscode-editchain
-        timeout-minutes: 20
-        env:
-          CHROME_PATH: ${{ steps.chrome.outputs.path }}
-        run: node --test test/harness/functionalParity.test.js
-
-      - name: GPU parity oracle — empty state (WebGL baseline, offscreen)
-        working-directory: extensions/vscode-editchain
-        timeout-minutes: 15
-        env:
-          CHROME_PATH: ${{ steps.chrome.outputs.path }}
-        run: npm run ui:gpu -- --scenario empty --backend webgl
-
-      - name: GPU parity oracle — error state (WebGL baseline, offscreen)
-        working-directory: extensions/vscode-editchain
-        timeout-minutes: 15
-        env:
-          CHROME_PATH: ${{ steps.chrome.outputs.path }}
-        run: npm run ui:gpu -- --scenario error --backend webgl
-
-      - name: GPU parity oracle — merge (WebGL baseline, offscreen)
-        working-directory: extensions/vscode-editchain
-        timeout-minutes: 15
-        env:
-          CHROME_PATH: ${{ steps.chrome.outputs.path }}
-        run: npm run ui:gpu -- --scenario merge --backend webgl --shot
-
-      - name: GPU parity oracle — fork (WebGL baseline, offscreen)
-        working-directory: extensions/vscode-editchain
-        timeout-minutes: 15
-        env:
-          CHROME_PATH: ${{ steps.chrome.outputs.path }}
-        run: npm run ui:gpu -- --scenario fork --backend webgl --shot
-
-      - name: GPU parity oracle — highLanes (WebGL baseline, offscreen)
-        working-directory: extensions/vscode-editchain
-        timeout-minutes: 15
-        env:
-          CHROME_PATH: ${{ steps.chrome.outputs.path }}
-        run: npm run ui:gpu -- --scenario highLanes --backend webgl --shot
-
-      - name: GPU parity oracle — multigroup paging (WebGL baseline, offscreen)
-        working-directory: extensions/vscode-editchain
-        timeout-minutes: 15
-        env:
-          CHROME_PATH: ${{ steps.chrome.outputs.path }}
-        run: npm run ui:gpu -- --scenario multigroup --backend webgl --shot
 
       - name: Install xvfb for the real VS Code e2e
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb

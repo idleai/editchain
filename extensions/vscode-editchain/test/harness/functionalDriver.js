@@ -1,21 +1,14 @@
-// Browser driver for deterministic GPU functional-parity tests
-// (functionalParity.test.js). This is the OFFSCREEN regression-oracle driver:
-// both harness pages run the SAME production renderer (media/main.js) +
-// fixture bridge, so every interaction is driven through the real controls on
-// BOTH pages and the outcomes are compared:
-// profile switches, find-in-chain navigation, legacy flat-list Search, virtual
-// scrolling/paging, row selection/keyboard/raw-JSON identity, and work-unit /
-// bundle expansion. The GPU page additionally exposes
-// window.__editchainGpuDebug (dataReady, lastError, backend, snapshot,
-// metrics, whenIdle) and overlays its wgpu canvas only over .graph-cell.
+// Browser driver for the Rust/WASM history adapter smoke suite
+// (test/harness/rustSmoke.test.js). Every helper drives the REAL Rust-owned
+// renderer through the fixture page test/harness/rust.html: the page loads
+// media/rust-history/loader.js as its only bootstrap, the Rust shell owns the
+// DOM, the per-row SVG graph fragments, and find-in-chain, and the loader
+// mirrors the wasm-bindgen debug exports as a read-only
+// window.__editchainGpuDebug facade (loader: 'rust-history', dataReady,
+// lastError, backend, snapshot, metrics, laneXAll, whenIdle).
 //
 // Everything waits on concrete renderer state (debug whenIdle / DOM
 // predicates) — never wall-clock sleeps — so the suite is deterministic.
-//
-// This file deliberately reuses the harness helpers (fixtures.js,
-// fixtureBridge.js, layoutProbe's __editchainDebug, main.js debug hooks) and
-// mirrors the interaction patterns of searchKeyboard.test.js; it does not
-// duplicate the CPU-only probes.
 
 'use strict';
 
@@ -44,23 +37,6 @@ const MIME = {
   '.png': 'image/png',
   '.map': 'application/json; charset=utf-8',
 };
-
-/** Whether this machine can run the browser functional suite at all. */
-function suitePrereqs() {
-  if (!fs.existsSync(CHROME)) {
-    return { ok: false, reason: 'Chrome not found at ' + CHROME + ' (set CHROME_PATH)' };
-  }
-  for (const rel of [
-    'media/gpu-preview/bootstrap.js',
-    'media/gpu-preview/pkg/editchain_gpu_preview.js',
-    'media/gpu-preview/pkg/editchain_gpu_preview_bg.wasm',
-  ]) {
-    if (!fs.existsSync(path.join(EXT_ROOT, rel))) {
-      return { ok: false, reason: 'missing GPU asset ' + rel + ' (run npm run build:gpu first)' };
-    }
-  }
-  return { ok: true, reason: '' };
-}
 
 /** Minimal static server over the extension root (node:http, no deps). */
 function startServer(rootDir) {
@@ -100,7 +76,7 @@ function startServer(rootDir) {
 }
 
 /** Headless Chrome with the deterministic software-rasterized WebGL backend
- * (same flags as ui-gpu-preview.mjs; never requires hardware WebGPU). */
+ * (never requires hardware WebGPU). */
 function launchBrowser() {
   return puppeteer.launch({
     executablePath: CHROME,
@@ -117,32 +93,10 @@ function launchBrowser() {
   });
 }
 
-/** Open the CPU harness page and the GPU harness page against the same base. */
-async function openPages(browser, baseUrl) {
-  const viewport = { width: 1440, height: 900 };
-  const cpu = await browser.newPage();
-  await cpu.setViewport(viewport);
-  const gpu = await browser.newPage();
-  await gpu.setViewport(viewport);
-  const errors = { cpu: [], gpu: [] };
-  cpu.on('pageerror', (e) => errors.cpu.push(e.message));
-  gpu.on('pageerror', (e) => errors.gpu.push(e.message));
-  // These are local static pages. Renderer readiness is asserted explicitly
-  // by bootScenario below; waiting for Chrome's incidental network-idle state
-  // made repeated WebGL oracle boots randomly consume the full timeout.
-  await cpu.goto(baseUrl + '/test/harness/index.html', {
-    waitUntil: 'domcontentloaded', timeout: BOOT_TIMEOUT_MS,
-  });
-  await gpu.goto(baseUrl + '/test/harness/gpu.html?backend=webgl', {
-    waitUntil: 'domcontentloaded', timeout: BOOT_TIMEOUT_MS,
-  });
-  return { cpu, gpu, errors };
-}
-
 /** Wait for a page-side predicate (serializable function body). */
 async function waitFor(page, fn, opts) {
   opts = opts || {};
-  // Timer polling keeps cross-page predicates live when Chromium throttles
+  // Timer polling keeps page-side predicates live when Chromium throttles
   // requestAnimationFrame in the background tab.
   await page.waitForFunction(fn, {
     timeout: opts.timeout || BOOT_TIMEOUT_MS,
@@ -150,50 +104,9 @@ async function waitFor(page, fn, opts) {
   }, ...(opts.args || []));
 }
 
-/** Load a scenario through the real harness startup handshake and settle. */
-async function bootScenario(page, kind, scenario) {
-  await page.evaluate((name) => {
-    window.__editchainSetScenario(name);
-    window.__editchainStart();
-  }, scenario);
-  if (kind === 'cpu') {
-    await waitFor(page, () =>
-      typeof window.__editchainDebug === 'object' && window.__editchainDataReady === true);
-    await page.bringToFront();
-    await page.evaluate((ms) => window.__editchainDebug.whenIdle(ms), IDLE_TIMEOUT_MS);
-    return;
-  }
-  // GPU page: the bootstrap must exist; readiness may come from main.js even
-  // for expected empty/error scenarios (which never render rows or geometry).
-  await waitFor(page, () =>
-    typeof window.__editchainGpuDebug === 'object' &&
-    (window.__editchainDataReady === true || !!window.__editchainGpuDebug.lastError));
-  const startupError = await page.evaluate(() => window.__editchainGpuDebug.lastError || null);
-  if (startupError) throw new Error('GPU startup failed: ' + startupError);
-  await page.bringToFront();
-  const rowsExpected = scenario !== 'empty' && scenario !== 'error';
-  if (rowsExpected) {
-    await page.evaluate((ms) => window.__editchainGpuDebug.whenIdle(ms), IDLE_TIMEOUT_MS);
-  } else {
-    await waitFor(page, () => !!document.querySelector('#rows .view-message'));
-  }
-}
-
-/** Re-settle a page after an interaction (debug whenIdle, never a sleep). */
-async function settle(page, kind) {
-  // Both renderer idle contracts advance on requestAnimationFrame. Chromium
-  // suspends rAF in background tabs, so every settle must foreground its page
-  // and callers must settle the CPU/GPU pages sequentially.
-  await page.bringToFront();
-  if (kind === 'cpu') {
-    await page.evaluate((ms) => window.__editchainDebug.whenIdle(ms), IDLE_TIMEOUT_MS);
-  } else {
-    await page.evaluate((ms) => window.__editchainGpuDebug.whenIdle(ms), IDLE_TIMEOUT_MS);
-  }
-}
-
 /** Wrap postMessage on a page so raw-JSON identity is captured and (optionally)
- * FindInHistory requests are rewritten down the legacy Search path. */
+ * FindInHistory requests are rewritten down the harness's legacy Search path
+ * (which the Rust shell also serves). */
 async function installHarnessSpies(page, { legacySearch = false } = {}) {
   await page.evaluate((rewrite) => {
     const orig = window.vscode.postMessage.bind(window.vscode);
@@ -227,8 +140,7 @@ async function runSearch(page, query) {
   }, query);
 }
 
-/** Clear the search input through the real input handler (exits find / restores
- * the chain from a legacy flat-list view). */
+/** Clear the search input through the real input handler. */
 async function clearSearch(page) {
   await page.evaluate(() => {
     const input = document.getElementById('search');
@@ -242,73 +154,10 @@ async function focusSearch(page) {
   await page.evaluate(() => document.getElementById('search').focus());
 }
 
-/** Switch the profile through the real segmented control. */
-async function clickProfile(page, name) {
-  await page.evaluate((n) => {
-    document.getElementById('profile-' + n).click();
-  }, name);
-}
-
 /** Real-mouse click on a find-navigation button (mousedown + click pipeline). */
 async function clickNav(page, which) {
   await page.bringToFront();
   await page.click('#' + (which === 'prev' ? 'search-prev' : 'search-next'));
-}
-
-/** Scroll #rows to an absolute row (pixel target; the renderer pages as it
- * scrolls) and wait for the row to be a real (non-placeholder) element. */
-async function scrollToRow(page, absRow) {
-  const ROW_H = 34;
-  await page.bringToFront();
-  await page.evaluate((target) => {
-    const rows = document.getElementById('rows');
-    rows.scrollTop = Math.max(0, target);
-  }, absRow * ROW_H);
-  await waitFor(page, (target) => {
-    const el = document.querySelector('.row[data-row="' + target + '"]');
-    return !!el && !el.classList.contains('row-placeholder') &&
-      typeof window.__editchainRowAt === 'function' &&
-      window.__editchainRowAt(target) !== null;
-  }, { timeout: IDLE_TIMEOUT_MS, args: [absRow] });
-}
-
-/** Scroll #rows to the bottom in bounded steps (pages load as it scrolls). */
-async function scrollToBottom(page) {
-  await page.bringToFront();
-  let prevHeight = -1;
-  for (let i = 0; i < 60; i++) {
-    const height = await page.evaluate(() => {
-      const rows = document.getElementById('rows');
-      rows.scrollTop = rows.scrollHeight;
-      return rows.scrollHeight;
-    });
-    await page.waitForFunction(() => {
-      const rows = document.getElementById('rows');
-      const rendered = Array.from(document.querySelectorAll(
-        '#rows .row:not(.row-placeholder)[data-row]'));
-      const last = rendered.at(-1);
-      const total = typeof window.__editchainGetTotal === 'function'
-        ? Number(window.__editchainGetTotal())
-        : 0;
-      return rows.scrollTop >= rows.scrollHeight - rows.clientHeight - 1 &&
-        document.querySelectorAll('.row-placeholder').length === 0 &&
-        last !== undefined && Number(last.getAttribute('data-row')) === total - 1;
-    }, { timeout: IDLE_TIMEOUT_MS, polling: 50 });
-    if (height === prevHeight) break;
-    prevHeight = height;
-  }
-}
-
-/** Scroll #rows back to the top and wait for the top row to be real. */
-async function scrollToTop(page) {
-  await page.bringToFront();
-  await page.evaluate(() => {
-    document.getElementById('rows').scrollTop = 0;
-  });
-  await waitFor(page, () => {
-    const el = document.querySelector('.row[data-row="0"]');
-    return !!el && !el.classList.contains('row-placeholder');
-  }, { timeout: IDLE_TIMEOUT_MS });
 }
 
 /** Click a rendered row by absolute index (inline selection; disclosure also
@@ -340,7 +189,8 @@ async function pressRowKey(page, key, absRow) {
   }, { key, absRow });
 }
 
-/** Read the full functional state of a page (production DOM + debug APIs). */
+/** Read the full functional state of the rust.html page (production DOM +
+ * the Rust loader's __editchainGpuDebug facade). */
 async function readState(page) {
   return page.evaluate(() => {
     const rows = [];
@@ -377,30 +227,6 @@ async function readState(page) {
           return r ? Number(r.getAttribute('data-row')) : null;
         })()
       : null;
-    const gpu = window.__editchainGpuDebug
-      ? (() => {
-          const g = window.__editchainGpuDebug;
-          const snap = typeof g.snapshot === 'function' ? g.snapshot() : null;
-          // The landed bootstrap creates ONE transparent canvas inside
-          // #gpu-canvas-host (positioned over the .graph-cell column) and
-          // mirrors one [data-row][data-key] marker per FRAME row into the
-          // hidden #gpu-rows element.
-          const canvases = document.querySelectorAll('#gpu-canvas-host canvas');
-          return {
-            present: true,
-            dataReady: g.dataReady === true,
-            lastError: g.lastError || null,
-            backend: typeof g.backend === 'function' ? g.backend() : (snap && snap.backend) || null,
-            snapshotRows: snap && Array.isArray(snap.rows) ? snap.rows.length : 0,
-            snapshotTotal: snap && typeof snap.total === 'number' ? snap.total : -1,
-            hasWhenIdle: typeof g.whenIdle === 'function',
-            metrics: typeof g.metrics === 'function' ? g.metrics() : null,
-            canvasCount: canvases.length,
-            foreignCanvasCount: document.querySelectorAll('canvas:not(#gpu-canvas-host canvas)').length,
-            mirrorRows: document.querySelectorAll('#gpu-rows [data-row][data-key]').length,
-          };
-        })()
-      : { present: false };
     return {
       profile: typeof window.__editchainGetProfile === 'function' ? window.__editchainGetProfile() : null,
       total: typeof window.__editchainGetTotal === 'function' ? window.__editchainGetTotal() : -1,
@@ -424,7 +250,6 @@ async function readState(page) {
       windowOffsets,
       windowHideTraces,
       openJsonLog: window.__editchainOpenJsonLog || [],
-      gpu,
     };
   });
 }
@@ -434,22 +259,14 @@ module.exports = {
   CHROME,
   BOOT_TIMEOUT_MS,
   IDLE_TIMEOUT_MS,
-  suitePrereqs,
   startServer,
   launchBrowser,
-  openPages,
-  bootScenario,
-  settle,
   waitFor,
   installHarnessSpies,
   runSearch,
   clearSearch,
   focusSearch,
-  clickProfile,
   clickNav,
-  scrollToRow,
-  scrollToBottom,
-  scrollToTop,
   clickRow,
   clickFirstExpandable,
   pressRowKey,

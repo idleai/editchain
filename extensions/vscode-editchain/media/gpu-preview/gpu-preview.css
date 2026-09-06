@@ -1,9 +1,9 @@
 /* Rust/WASM history graph renderer stylesheet.
  *
  * Shared by two hosts:
- *   - the VS Code GPU webview (getGpuHtml in src/extension.ts), which loads
+ *   - the VS Code history webview (`getHtml` in src/extension.ts), which loads
  *     media/main.css + media/rust-history/loader.js (the Rust-owned path);
- *   - the standalone Puppeteer harness (test/harness/gpu.html), which mirrors
+ *   - the standalone browser harness (test/harness/rust.html), which mirrors
  *     that exact production scaffold.
  *
  * Production (media/main.css + the Rust shell) owns the controls, virtual
@@ -11,11 +11,9 @@
  * disclosure, raw JSON routing, responsive columns, accessibility and resize.
  * This sheet adds ONLY the renderer chrome:
  *   - a slim toolbar (backend badge + renderer status);
- *   - the obsolete fixed-viewport canvas overlay, inert on the Rust-owned
- *     path (the per-row SVG graph cells are the active graph and scroll with
- *     the rows, so no overlay is ever created);
- *   - the rule that hides the per-row SVG graph cells while the legacy GPU
- *     oracle canvas is active (harness-only path);
+ *   - the inert #gpu-canvas-host scaffold, permanently hidden (the per-row
+ *     SVG graph cells are the active graph and scroll with the rows, so no
+ *     canvas is ever created on any host);
  *   - a hidden #gpu-rows mirror carrying data-row/data-key per rendered row
  *     (harness/e2e DOM contract) and the visually-hidden live region.
  */
@@ -70,39 +68,13 @@
   white-space: nowrap;
 }
 
-/* The overlay anchor: #layout becomes the containing block for the absolute
-   canvas surface so it tracks the #rows viewport exactly (including scroll,
-   resize, and the sticky header). */
-#layout {
-  position: relative;
-}
-
-/* Transparent GPU canvas surface. Sizing/positioning are set by bootstrap.js
-   from the rendered .graph-cell column each frame; pointer-events none keeps
-   every production row interaction (selection, disclosure, dblclick JSON)
-   untouched. z-index 0 paints above row backgrounds but below the sticky
-   header (z-index 3), group chips, and any graph-cell content. */
+/* Legacy fixed-viewport canvas host. Permanently inert: the per-row SVG graph
+   cells are the active graph and live inside the scrolling row DOM, so no
+   canvas surface is ever created. Hidden unconditionally (not just under
+   body[data-rust-wasm]) so production stays zero-canvas from first paint and
+   the scaffold can never paint over or chase the rows. */
 #gpu-canvas-host {
-  position: absolute;
-  top: 0;
-  left: 0;
-  z-index: 0;
-  overflow: hidden;
-  pointer-events: none;
-}
-
-/* The Rust-owned history view never creates a canvas: the per-row SVG graph
-   cells are the active graph and live inside the scrolling row DOM. Keep the
-   legacy overlay host inert so it can never paint over or chase the rows. */
-body[data-rust-wasm] #gpu-canvas-host {
   display: none;
-}
-
-#gpu-canvas {
-  display: block;
-  width: 100%;
-  height: 100%;
-  background: transparent;
 }
 
 /* Hidden DOM mirror (data-row/data-key per rendered row) for the harness and
@@ -114,14 +86,6 @@ body[data-rust-wasm] #gpu-canvas-host {
 
 #gpu-rows {
   display: none;
-}
-
-/* While the GPU canvas is active, replace ONLY the per-row SVG graph: the DOM
-   rows (backgrounds, hover/selection, text cells, interactions) stay exactly
-   as production renders them. visibility (not display) preserves the cell's
-   layout box so the grid template and scroll math are untouched. */
-body.gpu-canvas-active .graph-cell svg.graphCell {
-  visibility: hidden;
 }
 
 .visually-hidden {

@@ -8,13 +8,13 @@
 //   assertLayout()  -> AssertionResult            textual checks (pass/fail)
 //   getMetrics()    -> RenderMetrics              render timing / DOM counts
 //
-// This probe is the Rust-shell counterpart of test/harness/layoutProbe.js: it
-// runs inside the REAL VS Code webview, where the production page loads ONLY
+// This probe runs inside the REAL VS Code webview (the browser-based harness
+// page is test/harness/rust.html): the production page loads ONLY
 // media/rust-history/loader.js and the Rust shell owns the runtime. It reads
 // renderer state through the window.__editchainGpuDebug facade (loader,
 // dataReady, laneXAll, graphState, metrics, whenIdle) and the
 // window.__editchainGetProfile/GetTotal/RowAt compatibility hooks the shell
-// installs, plus plain DOM state. main.js-only hooks (__editchainRequestLog,
+// installs, plus plain DOM state. Legacy JS-only hooks (__editchainRequestLog,
 // __editchainGraphState, __editchainScenarioName, ...) do not exist here, so
 // no harness-scenario checks run; every check below is a real-VS-Code check.
 //
@@ -75,22 +75,18 @@
   }
 
   // The parity-fix row-local graph contract: every hydrated row's .graph-cell
-  // owns exactly one svg.graph-row-fragment[aria-hidden="true"]. Reports the
-  // legacy svg.graphCell fallback too, so a mid-migration build produces a
-  // precise diagnostic instead of a bare selector miss.
+  // owns exactly one svg.graph-row-fragment[aria-hidden="true"].
   function rowFragmentInfo(rowEl) {
     const cell = rowEl.querySelector('.graph-cell');
-    if (!cell) return { cell: null, svg: null, legacy: null, ariaHidden: false, note: 'no .graph-cell' };
+    if (!cell) return { cell: null, svg: null, ariaHidden: false, note: 'no .graph-cell' };
     const svg = cell.querySelector('svg.graph-row-fragment');
-    const legacy = cell.querySelector('svg.graphCell, svg.graph-cell');
     if (!svg) {
       return {
-        cell, svg: null, legacy, ariaHidden: false,
-        note: legacy ? 'legacy graphCell, no graph-row-fragment' : 'no row svg fragment',
+        cell, svg: null, ariaHidden: false, note: 'no row svg fragment',
       };
     }
     const ariaHidden = svg.getAttribute('aria-hidden') === 'true';
-    return { cell, svg, legacy, ariaHidden, note: 'ok' };
+    return { cell, svg, ariaHidden, note: 'ok' };
   }
 
   // Vertical centre (viewport CSS px) of the row's node marker. Lane halves
@@ -162,7 +158,6 @@
     const hydrated = [];
     const keyTops = {};
     let fragmentCount = 0;
-    let legacyCount = 0;
     const fragmentIssues = [];
     let maxAlignDelta = 0;
     const alignExamples = [];
@@ -192,7 +187,6 @@
         if (Math.abs(gap) > 0.5 && !firstBadGap) firstBadGap = { at: abs, gap: round2(gap) };
       }
       const info = rowFragmentInfo(el);
-      if (info.legacy) legacyCount++;
       if (el.classList.contains('row-placeholder')) continue;
       hydrated.push({ row: abs, key: shortKey(key), top: round2(b.top) });
       if (key && !(key in keyTops)) keyTops[key] = round2(b.top);
@@ -246,7 +240,6 @@
       orderOk,
       firstOrderBad,
       fragmentCount,
-      legacyCount,
       fragmentIssues,
       maxAlignDelta: round2(maxAlignDelta),
       alignExamples,
@@ -379,7 +372,6 @@
           problems.fragment.push({
             at: s.scrollTop, phase: s.phase, kind: s.kind,
             missing: s.hydratedCount - s.fragmentCount,
-            legacy: s.legacyCount,
             issues: s.fragmentIssues,
           });
         }
@@ -817,9 +809,10 @@
 
   // Deterministic UTC formatDate — the EXACT contract the Rust shell renders
   // (crates/editchain-gpu-preview/src/app/rows.rs `format_date`): month/day/
-  // year/hour/minute in UTC with a fixed 12-hour clock. main.js used the host
-  // locale; the Rust shell is deliberately host-independent, so the probe
-  // expectation is computed the same way instead of via Intl.
+  // year/hour/minute in UTC with a fixed 12-hour clock. The legacy JS
+  // bootstrap used the host locale; the Rust shell is deliberately
+  // host-independent, so the probe expectation is computed the same way
+  // instead of via Intl.
   const MONTH_NAMES = [
     'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
   ];
@@ -984,11 +977,9 @@
   // --- assertions ------------------------------------------------------------
 
   // A small set of textual checks. Each returns { name, pass, detail }.
-  // These mirror the real-VS-Code subset of test/harness/layoutProbe.js's
-  // runChecks, adapted to the Rust shell: graph geometry comes from the
-  // canvas + laneXAll facade instead of per-row SVG nodes, and the date
-  // column is checked against the shell's deterministic UTC format. No check
-  // is weaker than its main.js counterpart.
+  // Checks target the Rust shell's contract: row-local SVG fragments are
+  // checked per row, and the date column is checked against the shell's
+  // deterministic UTC format.
   function runChecks() {
     const checks = [];
     const rowsEl = document.getElementById('rows');
@@ -1087,17 +1078,14 @@
 
     // Check 3b: every hydrated rendered row owns a ROW-LOCAL graph fragment
     // inside its own .graph-cell — svg.graph-row-fragment, aria-hidden=true
-    // (the scrolling/graph parity contract). Legacy svg.graphCell fallbacks
-    // are reported for a precise mid-migration diagnostic.
+    // (the scrolling/graph parity contract).
     if (wrapEl && !viewMessage) {
       const rows = Array.from(wrapEl.querySelectorAll('.row:not(.row-placeholder)'));
       const problems = [];
       let fragments = 0;
-      let legacy = 0;
       for (const row of rows) {
         const abs = Number(row.getAttribute('data-row'));
         const info = rowFragmentInfo(row);
-        if (info.legacy) legacy++;
         if (!info.cell || !info.svg) {
           problems.push({ row: abs, reason: info.note });
           continue;
@@ -1118,10 +1106,9 @@
         pass: rows.length > 0 && problems.length === 0 && fragments === rows.length,
         detail: problems.length === 0 && rows.length > 0
           ? rows.length + '/' + rows.length + ' hydrated rows own a row-local ' +
-            'svg.graph-row-fragment[aria-hidden=true]' +
-            (legacy ? '; ' + legacy + ' legacy svg.graphCell' : '')
-          : rows.length + ' hydrated rows, ' + fragments + ' fragments, ' +
-            legacy + ' legacy; first problems=' + JSON.stringify(problems.slice(0, 3)),
+            'svg.graph-row-fragment[aria-hidden=true]'
+          : rows.length + ' hydrated rows, ' + fragments + ' fragments; first ' +
+            'problems=' + JSON.stringify(problems.slice(0, 3)),
       });
     }
 

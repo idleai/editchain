@@ -22,11 +22,9 @@
 // renderer contract (loader identity, backend 'svg', renderCount > 0,
 // vertexCount 0, zero canvases, one aria-hidden svg.graph-row-fragment per
 // hydrated row). There is deliberately NO
-// second panel and NO side-by-side capture: CPU-vs-GPU fixture parity is the
-// offscreen regression oracle (test/harness/functionalParity.test.js +
-// scripts/ui-gpu-preview.mjs), not a shipped two-panel UI. This spec does NOT
-// open the raw-JSON editor (disruptive to framing); the harness covers the
-// exact openJson envelope.
+// second panel and NO side-by-side capture — the single Rust/WASM panel is the
+// only shipped UI. This spec does NOT open the raw-JSON editor (disruptive to
+// framing); the harness covers the exact openJson envelope.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -351,10 +349,9 @@ describe('EditChain Rust history renderer (per-row SVG)', () => {
     expect(roving).toBe(2);
 
     // --- Single-panel contract artifact --------------------------------------
-    // Record the Rust renderer contract exercised above. Renderer equivalence
-    // against the CPU/SVG oracle renderer is NOT asserted here: it is the
-    // offscreen regression oracle (test/harness/functionalParity.test.js +
-    // scripts/ui-gpu-preview.mjs).
+    // Record the Rust renderer contract exercised above. This spec only
+    // asserts the Rust/WASM panel's own contract — no other renderer exists in
+    // production to compare against.
     fs.mkdirSync(TRACE_DIR, { recursive: true });
     fs.writeFileSync(path.join(TRACE_DIR, 'e2e-history-gpu-contract.json'), JSON.stringify({
       backend: debug.backend,
