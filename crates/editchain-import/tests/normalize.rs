@@ -190,3 +190,30 @@ fn test_metadata_without_session_id_falls_back_to_owning_session() {
         _ => panic!("expected Session scope"),
     }
 }
+
+#[test]
+fn test_transport_sidecars_are_exact_bundle_metadata() {
+    for json in [
+        br#"{"type":"atis-latch","atis":"","sessionId":"sess-1"}"#.as_slice(),
+        br#"{"type":"fork-context-ref","parentSessionId":"sess-0","contextLength":8}"#.as_slice(),
+        br#"{"type":"file-history-delta","messageId":"m1","trackingPath":"src/lib.rs"}"#.as_slice(),
+    ] {
+        let env = parse_envelope(json).expect("parse transport sidecar");
+        assert!(is_metadata_record(&env), "record type: {}", env.record_type);
+
+        let stream = SourceStream::new(derive_node_id("/transport-sidecar"), 0);
+        let mut blobs = MemoryBlobSink::new();
+        let (raw, normalized) = normalize_envelope(
+            &env,
+            hash_raw(json),
+            json,
+            &stream,
+            1,
+            &NormalizeOptions::default(),
+            &mut blobs,
+            "sess-1",
+        );
+        assert!(raw.tags.matches_any(Tags::META));
+        assert!(normalized.is_empty());
+    }
+}

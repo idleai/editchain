@@ -8,3 +8,5 @@ pub mod envelope;
 pub mod normalize;
 /// Streaming reader for session files.
 pub mod reader;
+/// Exact provider-event and tool-correlation relationship facts.
+pub mod topology;

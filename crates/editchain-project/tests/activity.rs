@@ -23,7 +23,8 @@ use editchain_core::{
 };
 use editchain_project::activity::{
     annotate_activity_rows, bundle_activity_execute_runs, bundle_activity_plan_repeats,
-    inline_context_compaction_checkpoints, ActivityRowAnnotation,
+    bundle_claude_response_tool_fragments, inline_context_compaction_checkpoints,
+    ActivityRowAnnotation,
 };
 use editchain_project::filter::ChainFilter;
 use editchain_project::meta::NodeMeta;
@@ -68,6 +69,23 @@ fn import_op(node: u64, seq: u64, parent: Option<OpId>, status: Option<&str>) ->
             raw_hash: None,
         }),
     }
+}
+
+/// A session-scoped Claude assistant content block with an exact Anthropic
+/// response identity (matching historical imports that predate turn scopes).
+fn claude_assistant_import(node: u64, seq: u64, parent: OpId, message_id: &str) -> Op {
+    let mut op = import_op(node, seq, Some(parent), None);
+    if let OpKind::Import(import) = &mut op.kind {
+        import.raw_ref = Payload::Inline(
+            serde_json::json!({
+                "type": "assistant",
+                "message": { "id": message_id }
+            })
+            .to_string()
+            .into_bytes(),
+        );
+    }
+    op
 }
 
 /// A META raw import op carrying a `world_state` record (sub-op fodder), kept
@@ -348,6 +366,7 @@ fn manual_collapsed(
     HistoryNode::CollapsedImport {
         op: Arc::new(op),
         source_time: EffectiveTime::Observed(0),
+        parent_override: None,
         summary: summary.to_string(),
         kind: kind.to_string(),
         author: "agent".to_string(),
@@ -568,6 +587,681 @@ fn bundles_maximal_run_of_three_tool_rows_into_one_expandable_node() {
         .collect();
     assert_eq!(member_keys, vec!["4:0:40", "3:0:30", "2:0:20"]);
     assert_eq!(member_keys[0], bundle_node.node_key());
+}
+
+#[test]
+fn bundles_parallel_claude_tool_blocks_from_one_exact_response() {
+    // Claude persists parallel tool_use content blocks as separate UUID events
+    // sharing one Anthropic message id. Its provider graph leaves one call as a
+    // short sibling branch once results are folded. Activity contracts those
+    // adjacent blocks into one response-level work row; Raw remains untouched.
+    let root = import_op(30, 1, None, None);
+    let first = claude_assistant_import(30, 2, root.id, "msg-response-1");
+    let second = claude_assistant_import(30, 3, first.id, "msg-response-1");
+    let mut continuation = import_op(30, 4, Some(first.id), None);
+    continuation.scope = root.scope;
+    let nodes = vec![
+        manual_collapsed(
+            continuation.clone(),
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "answer",
+            "message",
+        ),
+        manual_collapsed(
+            second,
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Read two",
+            "tool",
+        ),
+        manual_collapsed(
+            first,
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Read one",
+            "tool",
+        ),
+        manual_collapsed(
+            root.clone(),
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "request",
+            "message",
+        ),
+    ];
+    let annotations = annotate_activity_rows(&nodes);
+    let bundled = bundle_activity_execute_runs(nodes, &annotations, &HashSet::new());
+
+    assert_eq!(bundled.len(), 3);
+    let bundle = unwrap_bundle(&bundled);
+    assert_eq!(bundle.sub_ops().len(), 2);
+    let empty_links = BTreeMap::new();
+    let empty_notes = HashMap::new();
+    assert_eq!(
+        bundle.parent_keys(&empty_links, &empty_notes),
+        vec![root.id.to_string()]
+    );
+    let HistoryNode::CollapsedImport { op, .. } = &bundled[0] else {
+        panic!("expected continuation row");
+    };
+    assert_eq!(
+        op.parents
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec![bundle.node_key()],
+        "the response continuation must follow the bundle, not form a sibling"
+    );
+}
+
+#[test]
+fn different_claude_response_ids_do_not_bundle_without_a_turn() {
+    let root = import_op(31, 1, None, None);
+    let first = claude_assistant_import(31, 2, root.id, "msg-response-1");
+    let second = claude_assistant_import(31, 3, first.id, "msg-response-2");
+    let nodes = vec![
+        manual_collapsed(
+            second,
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Read two",
+            "tool",
+        ),
+        manual_collapsed(
+            first,
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Read one",
+            "tool",
+        ),
+        manual_collapsed(
+            root,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "request",
+            "message",
+        ),
+    ];
+    let annotations = annotate_activity_rows(&nodes);
+    let bundled = bundle_activity_execute_runs(nodes, &annotations, &HashSet::new());
+
+    assert_eq!(bundled.len(), 3);
+    assert!(bundled
+        .iter()
+        .all(|node| !matches!(node, HistoryNode::ExecuteBundle { .. })));
+}
+
+#[test]
+fn exact_claude_tool_fragment_folds_across_an_unrelated_interleaved_row() {
+    let root = import_op(32, 1, None, None);
+    let first = claude_assistant_import(32, 2, root.id, "msg-response-1");
+    let second = claude_assistant_import(32, 3, first.id, "msg-response-1");
+    let mut continuation = import_op(32, 4, Some(first.id), None);
+    continuation.scope = root.scope;
+    let mut unrelated = import_op(99, 3, None, None);
+    unrelated.scope = ScopeRef::Session(SessionId(99));
+    let nodes = vec![
+        manual_collapsed(
+            continuation.clone(),
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "answer",
+            "message",
+        ),
+        manual_collapsed(
+            second.clone(),
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Read two",
+            "tool",
+        ),
+        manual_collapsed(
+            unrelated,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "other session",
+            "message",
+        ),
+        manual_collapsed(
+            first.clone(),
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Read one",
+            "tool",
+        ),
+        manual_collapsed(
+            root,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "request",
+            "message",
+        ),
+    ];
+
+    let annotations = annotate_activity_rows(&nodes);
+    let run_bundled = bundle_activity_execute_runs(nodes, &annotations, &HashSet::new());
+    assert!(run_bundled
+        .iter()
+        .all(|node| !matches!(node, HistoryNode::ExecuteBundle { .. })));
+    let bundled = bundle_claude_response_tool_fragments(run_bundled, &HashSet::new());
+
+    assert_eq!(bundled.len(), 4);
+    assert!(bundled
+        .iter()
+        .all(|node| node.node_key() != second.id.to_string()));
+    let response = bundled
+        .iter()
+        .find(|node| node.node_key() == first.id.to_string())
+        .unwrap_or_else(|| panic!("response parent missing"));
+    assert!(response.sub_ops().iter().any(|op| op.id == second.id));
+    let kept_continuation = bundled
+        .iter()
+        .find(|node| node.node_key() == continuation.id.to_string())
+        .unwrap_or_else(|| panic!("continuation missing"));
+    let HistoryNode::CollapsedImport {
+        op: continuation_op,
+        ..
+    } = kept_continuation
+    else {
+        panic!("expected collapsed continuation");
+    };
+    assert_eq!(
+        continuation_op
+            .parents
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec![first.id.to_string()]
+    );
+}
+
+#[test]
+fn connected_claude_tool_chain_folds_without_touching_its_result_path() {
+    // Real Claude shape: one response emits a chain of tool-use content blocks,
+    // while the later batched result points to the response's first block. An
+    // unrelated session can be interleaved between those response records.
+    let root = import_op(37, 1, None, None);
+    let first = claude_assistant_import(37, 2, root.id, "msg-response-1");
+    let second = claude_assistant_import(37, 3, first.id, "msg-response-1");
+    let third = claude_assistant_import(37, 4, second.id, "msg-response-1");
+    let result = import_op(37, 5, Some(first.id), None);
+    let continuation = import_op(37, 6, Some(result.id), None);
+    let mut unrelated = import_op(97, 3, None, None);
+    unrelated.scope = ScopeRef::Session(SessionId(97));
+    let nodes = vec![
+        manual_collapsed(
+            continuation,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "continued after results",
+            "message",
+        ),
+        manual_collapsed(
+            result.clone(),
+            ActivityKind::Execute,
+            RecordRole::Result,
+            Outcome::Success,
+            None,
+            "three results",
+            "tool",
+        ),
+        manual_collapsed(
+            third,
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Read three",
+            "tool",
+        ),
+        manual_collapsed(
+            unrelated,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "other session",
+            "message",
+        ),
+        manual_collapsed(
+            second,
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Read two",
+            "tool",
+        ),
+        manual_collapsed(
+            first.clone(),
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Read one",
+            "tool",
+        ),
+        manual_collapsed(
+            root.clone(),
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "request",
+            "message",
+        ),
+    ];
+
+    let bundled = bundle_claude_response_tool_fragments(nodes, &HashSet::new());
+
+    assert_eq!(bundled.len(), 5);
+    let response = unwrap_bundle(&bundled);
+    assert_eq!(response.node_key(), first.id.to_string());
+    let HistoryNode::ExecuteBundle { member_nodes, .. } = response else {
+        panic!("expected exact-response execute bundle");
+    };
+    assert_eq!(member_nodes.len(), 3);
+    assert_eq!(
+        response.parent_keys(&BTreeMap::new(), &HashMap::new()),
+        vec![root.id.to_string()]
+    );
+    let result_row = bundled
+        .iter()
+        .find(|node| node.node_key() == result.id.to_string())
+        .unwrap_or_else(|| panic!("result path missing"));
+    assert_eq!(
+        result_row.parent_keys(&BTreeMap::new(), &HashMap::new()),
+        vec![response.node_key()],
+        "the result path must continue through the one response bundle"
+    );
+}
+
+#[test]
+fn connected_claude_tool_chain_rewrites_a_non_root_continuation() {
+    let root = import_op(39, 1, None, None);
+    let first = claude_assistant_import(39, 2, root.id, "msg-response-1");
+    let second = claude_assistant_import(39, 3, first.id, "msg-response-1");
+    let continuation = import_op(39, 4, Some(second.id), None);
+    let nodes = vec![
+        manual_collapsed(
+            continuation.clone(),
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "continued",
+            "message",
+        ),
+        manual_collapsed(
+            second,
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Read two",
+            "tool",
+        ),
+        manual_collapsed(
+            first.clone(),
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Read one",
+            "tool",
+        ),
+        manual_collapsed(
+            root,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "request",
+            "message",
+        ),
+    ];
+
+    let bundled = bundle_claude_response_tool_fragments(nodes, &HashSet::new());
+
+    assert_eq!(bundled.len(), 3);
+    let response = unwrap_bundle(&bundled);
+    assert_eq!(response.node_key(), first.id.to_string());
+    let continuation_row = bundled
+        .iter()
+        .find(|node| node.node_key() == continuation.id.to_string())
+        .unwrap_or_else(|| panic!("continuation missing"));
+    assert_eq!(
+        continuation_row.parent_keys(&BTreeMap::new(), &HashMap::new()),
+        vec![response.node_key()],
+        "the derived-view override must keep a non-root continuation connected"
+    );
+}
+
+#[test]
+fn disconnected_claude_rows_with_the_same_message_id_stay_separate() {
+    let root = import_op(38, 1, None, None);
+    let first = claude_assistant_import(38, 2, root.id, "msg-reused");
+    let second = claude_assistant_import(38, 3, root.id, "msg-reused");
+    let nodes = vec![
+        manual_collapsed(
+            second.clone(),
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Read two",
+            "tool",
+        ),
+        manual_collapsed(
+            first.clone(),
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Read one",
+            "tool",
+        ),
+        manual_collapsed(
+            root,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "request",
+            "message",
+        ),
+    ];
+
+    let bundled = bundle_claude_response_tool_fragments(nodes, &HashSet::new());
+
+    assert_eq!(bundled.len(), 3);
+    assert!(bundled
+        .iter()
+        .any(|node| node.node_key() == first.id.to_string()));
+    assert!(bundled
+        .iter()
+        .any(|node| node.node_key() == second.id.to_string()));
+}
+
+#[test]
+fn terminal_claude_execute_bundle_merges_into_its_continued_response_parent() {
+    let root = import_op(36, 1, None, None);
+    let first = claude_assistant_import(36, 2, root.id, "msg-response-1");
+    let second = claude_assistant_import(36, 3, first.id, "msg-response-1");
+    let third = claude_assistant_import(36, 4, second.id, "msg-response-1");
+    let continuation = import_op(36, 5, Some(first.id), None);
+    let mut unrelated = import_op(98, 3, None, None);
+    unrelated.scope = ScopeRef::Session(SessionId(98));
+    let nodes = vec![
+        manual_collapsed(
+            continuation.clone(),
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "answer",
+            "message",
+        ),
+        manual_collapsed(
+            third,
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Read three",
+            "tool",
+        ),
+        manual_collapsed(
+            second,
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Read two",
+            "tool",
+        ),
+        manual_collapsed(
+            unrelated,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "other session",
+            "message",
+        ),
+        manual_collapsed(
+            first.clone(),
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Read one",
+            "tool",
+        ),
+        manual_collapsed(
+            root,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "request",
+            "message",
+        ),
+    ];
+
+    let annotations = annotate_activity_rows(&nodes);
+    let run_bundled = bundle_activity_execute_runs(nodes, &annotations, &HashSet::new());
+    let bundled = bundle_claude_response_tool_fragments(run_bundled, &HashSet::new());
+
+    assert_eq!(bundled.len(), 4);
+    let response = unwrap_bundle(&bundled);
+    assert_eq!(response.node_key(), first.id.to_string());
+    let HistoryNode::ExecuteBundle { member_nodes, .. } = response else {
+        panic!("expected merged execute bundle");
+    };
+    assert_eq!(member_nodes.len(), 3);
+    let kept_continuation = bundled
+        .iter()
+        .find(|node| node.node_key() == continuation.id.to_string())
+        .unwrap_or_else(|| panic!("continuation missing"));
+    let HistoryNode::CollapsedImport {
+        op: continuation_op,
+        ..
+    } = kept_continuation
+    else {
+        panic!("expected collapsed continuation");
+    };
+    assert_eq!(continuation_op.parents, ParentSet::One(first.id));
+}
+
+#[test]
+fn exact_claude_tool_fragment_folds_into_same_response_narrative() {
+    let root = import_op(33, 1, None, None);
+    let narrative = claude_assistant_import(33, 2, root.id, "msg-response-1");
+    let tool = claude_assistant_import(33, 3, narrative.id, "msg-response-1");
+    let continuation = import_op(33, 4, Some(narrative.id), None);
+    let nodes = vec![
+        manual_collapsed(
+            continuation,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "continued",
+            "message",
+        ),
+        manual_collapsed(
+            tool.clone(),
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Bash",
+            "tool",
+        ),
+        manual_collapsed(
+            narrative.clone(),
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "I will inspect it.",
+            "message",
+        ),
+        manual_collapsed(
+            root,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "request",
+            "message",
+        ),
+    ];
+
+    let bundled = bundle_claude_response_tool_fragments(nodes, &HashSet::new());
+
+    assert_eq!(bundled.len(), 3);
+    let response = bundled
+        .iter()
+        .find(|node| node.node_key() == narrative.id.to_string())
+        .unwrap_or_else(|| panic!("narrative response missing"));
+    assert_eq!(response.activity_kind(), ActivityKind::Conversation);
+    assert!(response.sub_ops().iter().any(|op| op.id == tool.id));
+}
+
+#[test]
+fn claude_response_fragment_with_structural_topology_stays_visible() {
+    let root = import_op(34, 1, None, None);
+    let parent = claude_assistant_import(34, 2, root.id, "msg-response-1");
+    let tool = claude_assistant_import(34, 3, parent.id, "msg-response-1");
+    let continuation = import_op(34, 4, Some(parent.id), None);
+    let nodes = vec![
+        manual_collapsed(
+            continuation,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "continued",
+            "message",
+        ),
+        manual_collapsed(
+            tool.clone(),
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Task",
+            "tool",
+        ),
+        manual_collapsed(
+            parent,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "delegating",
+            "message",
+        ),
+        manual_collapsed(
+            root,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "request",
+            "message",
+        ),
+    ];
+
+    let bundled =
+        bundle_claude_response_tool_fragments(nodes, &HashSet::from([tool.id.to_string()]));
+
+    assert_eq!(bundled.len(), 4);
+    assert!(bundled
+        .iter()
+        .any(|node| node.node_key() == tool.id.to_string()));
+}
+
+#[test]
+fn mainline_single_claude_tool_block_stays_visible() {
+    let root = import_op(35, 1, None, None);
+    let parent = claude_assistant_import(35, 2, root.id, "msg-response-1");
+    let tool = claude_assistant_import(35, 3, parent.id, "msg-response-1");
+    let continuation = import_op(35, 4, Some(tool.id), None);
+    let nodes = vec![
+        manual_collapsed(
+            continuation,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "continued through tool",
+            "message",
+        ),
+        manual_collapsed(
+            tool.clone(),
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            None,
+            "tool: Read",
+            "tool",
+        ),
+        manual_collapsed(
+            parent,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "reading",
+            "message",
+        ),
+        manual_collapsed(
+            root,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            None,
+            "request",
+            "message",
+        ),
+    ];
+
+    let bundled = bundle_claude_response_tool_fragments(nodes, &HashSet::new());
+
+    assert_eq!(bundled.len(), 4);
+    assert!(bundled
+        .iter()
+        .any(|node| node.node_key() == tool.id.to_string()));
 }
 
 #[test]

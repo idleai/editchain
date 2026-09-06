@@ -17,10 +17,9 @@
 //! - overall collab tool completion / `CloseAgent` / `SendInput` is never a
 //!   completion signal, and old bridge payloads without `agentsStates` remain
 //!   deserializable;
-//! - a `SubagentOf` edge targets the thread's actual earliest `started`
-//!   marker;
-//! - explicit subagent provenance (`parentThreadId`/`agentPath`) suppresses
-//!   the copied `forkedFromId` geometry: no `ForkOf` edge;
+//! - a `SpawnedBy` edge targets one exact physical `started` occurrence;
+//! - copied `forkedFromId` metadata is retained as an execution fact and never
+//!   converted into timestamp-selected `ForkOf` geometry;
 //! - relationship notes are session-scoped.
 #![cfg(unix)]
 #![expect(
@@ -55,12 +54,19 @@ use editchain_core::payload::Payload;
 use editchain_core::scope::ScopeRef;
 
 use editchain_import::codex::HelperCommand;
-use editchain_import::ids::{derive_session_id, derive_source_stream, SourcePosition};
+use editchain_import::cursor::canonical_source_key;
+use editchain_import::ids::{derive_keyed_source_stream, derive_session_id, SourcePosition};
 
 use common::*;
 
 fn helper_in(script: &std::path::Path) -> HelperCommand {
     sh_helper(script, &[])
+}
+
+fn source_stream(dir: &tempfile::TempDir, name: &str) -> editchain_import::SourceStream {
+    let path = dir.path().join(name);
+    let key = canonical_source_key("codex", dir.path(), &path).unwrap();
+    derive_keyed_source_stream(&key, 0)
 }
 
 fn session_meta_line(thread: &str, session_id: &str) -> String {
@@ -192,11 +198,7 @@ fn write_parent_and_sub(
 }
 
 fn sub_stream(dir: &tempfile::TempDir) -> editchain_core::OpId {
-    let sub = derive_source_stream(
-        "/workspace",
-        &dir.path().join("rollout-sub.jsonl").to_string_lossy(),
-        0,
-    );
+    let sub = source_stream(dir, "rollout-sub.jsonl");
     sub.op_from_position(SourcePosition::raw(1)).unwrap()
 }
 
@@ -214,7 +216,7 @@ fn real_subagent_activity_schema_pins_link_geometry_and_summary() {
 
     // Real activity kinds render truthfully: `started` reads as readable spawn
     // prose, `interacted` renders verbatim — never invented completion prose.
-    let started = harness
+    let _started = harness
         .ops
         .ops
         .iter()
@@ -244,36 +246,43 @@ fn real_subagent_activity_schema_pins_link_geometry_and_summary() {
         "real SubAgentActivity kinds must not fabricate a ReconnectsTo edge"
     );
 
-    // SubagentOf: causal parent = the subagent thread's first op; target = the
-    // thread's actual earliest `started` marker.
-    let subagent_of = harness
+    // SpawnedBy: causal parent = the subagent thread's first occurrence;
+    // target = the exact raw occurrence carrying `started`.
+    let spawned_by = harness
         .ops
         .ops
         .iter()
-        .find(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == NoteRelationship::SubagentOf)
-        })
-        .expect("SubagentOf note from explicit parentThreadId");
-    assert_eq!(subagent_of.parents, ParentSet::One(sub_stream(&dir)));
-    match &subagent_of.kind {
-        OpKind::Note(note) => assert_eq!(note.target_ids, vec![started.id]),
+        .find(
+            |o| matches!(&o.kind, OpKind::Note(n) if n.relationship == NoteRelationship::SpawnedBy),
+        )
+        .expect("SpawnedBy fact from exact started marker");
+    assert_eq!(spawned_by.parents, ParentSet::One(sub_stream(&dir)));
+    match &spawned_by.kind {
+        OpKind::Note(note) => {
+            let parent = source_stream(&dir, "rollout-parent.jsonl");
+            assert_eq!(
+                note.target_ids,
+                vec![parent.op_from_position(SourcePosition::raw(2)).unwrap()]
+            );
+        }
         _ => panic!("expected note op"),
     }
     assert_eq!(
-        subagent_of.scope,
+        spawned_by.scope,
         ScopeRef::Session(derive_session_id("sub-1")),
         "relationship notes are session-scoped"
     );
 
-    // Explicit subagent provenance (parentThreadId == forkedFromId +
-    // agentPath) suppresses the copied fork geometry: exactly one SubagentOf
-    // edge, no ForkOf.
+    // The copied fork field stays inspectable without guessed row geometry.
     assert!(
         !harness.ops.ops.iter().any(|o| {
             matches!(&o.kind, OpKind::Note(n) if n.relationship == NoteRelationship::ForkOf)
         }),
-        "explicit subagent provenance must suppress ForkOf"
+        "forkedFromId must not manufacture ForkOf"
     );
+    assert!(harness.ops.ops.iter().any(|o| {
+        matches!(&o.kind, OpKind::Note(n) if n.relationship == NoteRelationship::ForkedFrom)
+    }));
 }
 
 #[test]
@@ -314,15 +323,6 @@ fn structured_agent_states_drive_reconnect_but_old_payloads_do_not() {
     );
     let harness = import(dir.path(), &helper_in(&helper));
 
-    let collab_op = harness
-        .ops
-        .ops
-        .iter()
-        .find(|o| {
-            matches!(&o.kind, OpKind::Tool(t) if t.tool_call_id == Payload::Inline(b"call-1".to_vec()))
-        })
-        .expect("agentsStates collab tool op");
-
     let reconnects: Vec<_> = harness
         .ops
         .ops
@@ -338,16 +338,16 @@ fn structured_agent_states_drive_reconnect_but_old_payloads_do_not() {
     );
     assert_eq!(
         reconnects[0].parents,
-        ParentSet::One(collab_op.id),
-        "the agentsStates-carrying collab op is the completion marker"
+        ParentSet::One(
+            source_stream(&dir, "rollout-parent.jsonl")
+                .op_from_position(SourcePosition::raw(3))
+                .unwrap()
+        ),
+        "the agentsStates-carrying physical occurrence is the endpoint"
     );
     match &reconnects[0].kind {
         OpKind::Note(note) => {
-            let sub = derive_source_stream(
-                "/workspace",
-                &dir.path().join("rollout-sub.jsonl").to_string_lossy(),
-                0,
-            );
+            let sub = source_stream(&dir, "rollout-sub.jsonl");
             assert_eq!(
                 note.target_ids,
                 vec![sub.op_from_position(SourcePosition::raw(2)).unwrap()]
@@ -391,15 +391,6 @@ fn legacy_list_agents_completion_maps_agent_path_to_started_marker() {
     );
     let harness = import(dir.path(), &helper_in(&helper));
 
-    let list_op = harness
-        .ops
-        .ops
-        .iter()
-        .find(|o| {
-            matches!(&o.kind, OpKind::Tool(t) if t.tool_call_id == Payload::Inline(b"call-list".to_vec()))
-        })
-        .expect("list_agents tool op");
-
     let reconnects: Vec<_> = harness
         .ops
         .ops
@@ -409,14 +400,17 @@ fn legacy_list_agents_completion_maps_agent_path_to_started_marker() {
         })
         .collect();
     assert_eq!(reconnects.len(), 1, "only the completed agent reconnects");
-    assert_eq!(reconnects[0].parents, ParentSet::One(list_op.id));
+    assert_eq!(
+        reconnects[0].parents,
+        ParentSet::One(
+            source_stream(&dir, "rollout-parent.jsonl")
+                .op_from_position(SourcePosition::raw(3))
+                .unwrap()
+        )
+    );
     match &reconnects[0].kind {
         OpKind::Note(note) => {
-            let sub = derive_source_stream(
-                "/workspace",
-                &dir.path().join("rollout-sub.jsonl").to_string_lossy(),
-                0,
-            );
+            let sub = source_stream(&dir, "rollout-sub.jsonl");
             assert_eq!(
                 note.target_ids,
                 vec![sub.op_from_position(SourcePosition::raw(2)).unwrap()]

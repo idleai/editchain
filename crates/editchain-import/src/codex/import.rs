@@ -4,29 +4,28 @@ use editchain_core::clock::Clock;
 use serde_json::Value;
 
 use crate::claude_code::reader::read_session_file;
-use crate::cursor::{check_file_generation, read_new_bytes};
+use crate::cursor::{check_file_generation, read_new_bytes, resolve_source_cursor};
 use crate::error::ImportError;
-use crate::ids::{derive_session_id, derive_source_stream, SourcePosition};
+use crate::ids::{derive_session_id, SourcePosition, SourceStream};
 use crate::model::{ImportOptions, ImportReport};
-use crate::sink::{BlobSink, CursorStore, MemoryOpSink, OpSink};
+use crate::sink::{BlobSink, CursorStore, OpSink};
 
 use super::discover::discover_rollouts;
 use super::helper::HelperCommand;
 use super::link::{
     emit_codex_relationship_notes, ActivityMarker, CompletionEvidence, LegacyCompletionEvidence,
-    ThreadTopology,
+    ThreadTopology, CODEX_NORMALIZATION_VERSION,
 };
 use super::normalize::{
     build_raw_op, completed_agent_paths_from_tool, is_blank_line, normalized_ops_for_compaction,
     normalized_ops_for_inter_agent, normalized_ops_for_item, normalized_ops_for_turn,
     owning_thread_from_raw_line, ItemAnchor, NormalizeContext,
 };
-use super::projection::{parse_projection, ProjectionKind};
+use super::projection::{parse_projection, FinalItem, ProjectionKind};
 use super::session_git::session_git_link_op;
 
-/// Current Codex normalized-projection schema applied to a source cursor.
-/// Version 1 adds the exact session-start Git link.
-const CODEX_NORMALIZATION_VERSION: u32 = 1;
+/// Normalization version that introduced exact session-start Git links.
+const CODEX_GIT_NORMALIZATION_VERSION: u32 = 1;
 
 /// Configuration for a Codex rollout discovery/import request.
 #[derive(Debug, Clone)]
@@ -70,7 +69,7 @@ enum ReadState {
         new_cursor: crate::sink::CursorValue,
     },
     /// Source bytes are unchanged, but an older normalized projection needs a
-    /// deterministic metadata-only upgrade. No raw/content rows are replayed.
+    /// deterministic exact-fact upgrade. No raw/content rows are replayed.
     Reproject {
         /// Existing boot generation of the source stream.
         boot: u32,
@@ -122,16 +121,14 @@ enum ReadState {
 /// `session_meta.payload.id`, then the rollout filename stem. `payload
 /// session_id` is never used (Codex subagents carry parent session ids).
 ///
-/// # Rewrite detection residual
+/// # Rewrite detection
 ///
-/// The persisted cursor records the source's size, read offset, and a
-/// cumulative hash of the bytes read so far. Only a size decrease (truncation
-/// or a rewrite that shrinks the file) is detectable reliably. An exact
-/// same-size rewrite is indistinguishable from an unchanged file and is
-/// skipped; a rewrite that grows the file looks like an append, so bytes at
-/// the old read offsets are assumed unchanged. Both cases are accepted
-/// residuals of the current cursor design (no per-file content hash of the
-/// full file is persisted); deleting the source's cursor file re-imports it.
+/// The persisted cursor records an exact direct BLAKE3 hash of every accepted
+/// source byte. Before an append or relocation, the importer re-hashes that
+/// prefix byte-for-byte. Same-size and grown rewrites therefore start a new
+/// source generation; file size alone never proves continuity. A trailing
+/// partial line remains outside the accepted prefix and is read again once it
+/// becomes complete.
 ///
 /// # Errors
 ///
@@ -167,8 +164,7 @@ pub fn import_codex(
     cursors: &mut dyn CursorStore,
 ) -> Result<ImportReport, ImportError> {
     let mut report = ImportReport::new();
-    // Per-thread topology for the structural linking post-pass (explicit
-    // session metadata + subagent lifecycle markers found in this run's ops).
+    // Per-thread exact topology for the sink-independent relationship pass.
     let mut topology: Vec<ThreadTopology> = Vec::new();
 
     let rollouts = discover_rollouts(&request.raw_root).map_err(ImportError::OpSink)?;
@@ -176,27 +172,44 @@ pub fn import_codex(
     let workspace_str = request.workspace_path.to_str().unwrap_or("/workspace");
 
     for rollout in &rollouts {
-        let cursor_key = rollout.path.to_string_lossy().to_string();
-        let existing_cursor = cursors.get_cursor(&cursor_key)?;
+        let resolved = resolve_source_cursor(
+            cursors,
+            "codex",
+            &request.raw_root,
+            &rollout.path,
+            workspace_str,
+        )?;
+        let cursor_key = resolved.canonical_key;
+        let state_key = resolved.state_key;
+        let source_node = resolved.source_node;
+        let migrates_legacy_key = cursor_key != state_key;
+        let mut existing_cursor = resolved.cursor;
+        let needs_git_upgrade = options.normalize
+            && existing_cursor.as_ref().is_some_and(|cursor| {
+                cursor.normalization_version < CODEX_GIT_NORMALIZATION_VERSION
+            });
         let needs_normalization_upgrade = options.normalize
             && existing_cursor
                 .as_ref()
                 .is_some_and(|cursor| cursor.normalization_version < CODEX_NORMALIZATION_VERSION);
+        let needs_cursor_upgrade = migrates_legacy_key
+            || existing_cursor.as_ref().is_some_and(|cursor| {
+                cursor.source_node != Some(source_node) || cursor.content_hash_version < 1
+            });
 
         // Decide how to read this rollout. A persisted cursor whose source was
         // truncated or rewritten is NOT fatal: the file is bumped to a new
         // deterministic boot generation (persisted per source by the cursor
         // store) and re-imported whole from byte 0, so its new ops never
         // collide with the previous generation's ids and unrelated rollouts
-        // keep importing. Only size decreases are detectable with the current
-        // cursor design; an exact same-size rewrite is indistinguishable from
-        // an unchanged file and is skipped (documented residual).
-        let read = if let Some(cursor) = &existing_cursor {
+        // keep importing. Exact accepted-prefix hashing detects same-size and
+        // grown rewrites as generation changes.
+        let read = if let Some(cursor) = existing_cursor.as_mut() {
             match check_file_generation(&rollout.path, cursor) {
                 Ok(true) => {
-                    if needs_normalization_upgrade {
+                    if needs_normalization_upgrade || needs_cursor_upgrade {
                         ReadState::Reproject {
-                            boot: cursors.get_generation(&cursor_key)?,
+                            boot: cursors.get_generation(&state_key)?,
                             start_seq: cursor.ops_emitted,
                             new_cursor: cursor.clone(),
                         }
@@ -207,7 +220,7 @@ pub fn import_codex(
                 }
                 Ok(false) => {
                     // Grew — incremental append on the current generation's stream.
-                    let boot = cursors.get_generation(&cursor_key)?;
+                    let boot = cursors.get_generation(&state_key)?;
                     let (lines, _bytes_read, new_cursor) =
                         read_session_file(&rollout.path, Some(cursor))?;
                     ReadState::Append {
@@ -221,7 +234,7 @@ pub fn import_codex(
                     // Truncated/rewritten — bump to a new generation and read
                     // the whole file from scratch (a fresh read, so the stale
                     // cursor never re-triggers the generation error).
-                    let generation = cursors.get_generation(&cursor_key)?.saturating_add(1);
+                    let generation = cursors.get_generation(&state_key)?.saturating_add(1);
                     cursors.set_generation(&cursor_key, generation)?;
                     let (lines, _bytes_read, new_cursor) = read_session_file(&rollout.path, None)?;
                     ReadState::Rewritten {
@@ -272,7 +285,7 @@ pub fn import_codex(
         // owning stream identity). The boot generation separates rewritten
         // generations from the original import and from each other, so op ids
         // never collide across generations of one file.
-        let stream = derive_source_stream(workspace_str, &cursor_key, boot);
+        let stream = SourceStream::new(source_node, boot);
         // The bridge counts every physical line it reads, including blank lines
         // and one trailing partial line; align `expected_total` with it.
         let (has_partial, partial_blank) = trailing_partial(&rollout.path, &new_cursor)?;
@@ -285,6 +298,11 @@ pub fn import_codex(
                 new_cursor.normalization_version = new_cursor
                     .normalization_version
                     .max(CODEX_NORMALIZATION_VERSION);
+            }
+            new_cursor.source_node = Some(source_node);
+            new_cursor.content_hash_version = 1;
+            if migrates_legacy_key && boot > 0 {
+                cursors.set_generation(&cursor_key, boot)?;
             }
             cursors.set_cursor(&cursor_key, &new_cursor)?;
             continue;
@@ -362,10 +380,24 @@ pub fn import_codex(
                 .session_meta
                 .as_ref()
                 .and_then(|m| m.agent_path.clone()),
+            first_raw: (new_cursor.ops_emitted > 0)
+                .then(|| stream.op_from_position(SourcePosition::raw(1)))
+                .transpose()?,
+            last_raw: (new_cursor.ops_emitted > 0)
+                .then(|| stream.op_from_position(SourcePosition::raw(new_cursor.ops_emitted)))
+                .transpose()?,
             markers: Vec::new(),
             completions: Vec::new(),
             legacy_completions: Vec::new(),
         };
+
+        // Capture exact lifecycle endpoints from the complete helper
+        // projection, including metadata-only version upgrades. Endpoints are
+        // physical source occurrences, so their IDs do not depend on derived
+        // lane allocation or on whether this batch replayed normalized rows.
+        if options.normalize {
+            collect_topology_evidence(&projection.final_items, &stream, &mut topo)?;
+        }
 
         // Emit raw ops for the new lines, chaining across the cursor boundary.
         let mut prev_raw_id = if start_seq > 0 {
@@ -397,7 +429,7 @@ pub fn import_codex(
         // is deliberately no command-text or timestamp inference here: an
         // absent/invalid hash or an unresolvable local repository yields no
         // link. Appends do not replay the deterministic session-start link.
-        if options.normalize && (start_seq == 0 || needs_normalization_upgrade) {
+        if options.normalize && (start_seq == 0 || needs_git_upgrade) {
             let raw_batch_end = u64::try_from(lines.len())
                 .unwrap_or(u64::MAX)
                 .saturating_add(start_seq);
@@ -465,64 +497,6 @@ pub fn import_codex(
                         last_seen_clock,
                         &mut ctx,
                     )?;
-                    if item.kind == ProjectionKind::Note {
-                        if let Some(agent_thread) = item
-                            .payload
-                            .get("agentThreadId")
-                            .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty())
-                        {
-                            if let Some(marker_op) = item_ops.first() {
-                                topo.markers.push(ActivityMarker {
-                                    agent_thread_id: agent_thread.to_string(),
-                                    agent_path: item
-                                        .payload
-                                        .get("agentPath")
-                                        .and_then(Value::as_str)
-                                        .filter(|s| !s.is_empty())
-                                        .map(ToString::to_string),
-                                    op_id: marker_op.id,
-                                    started: item
-                                        .payload
-                                        .get("activityKind")
-                                        .and_then(Value::as_str)
-                                        .is_some_and(|k| k.eq_ignore_ascii_case("started")),
-                                });
-                            }
-                        }
-                    } else if item.kind == ProjectionKind::Tool {
-                        // Explicit per-child completion evidence only. The
-                        // collab tool call's own status/tool never completes a
-                        // child; subAgentActivity kinds never do either.
-                        if let Some(marker_op) = item_ops.last() {
-                            if let Some(agents_states) =
-                                item.payload.get("agentsStates").and_then(Value::as_object)
-                            {
-                                for (child_thread, state) in agents_states {
-                                    let completed = state
-                                        .get("status")
-                                        .and_then(Value::as_str)
-                                        .is_some_and(|s| s.eq_ignore_ascii_case("completed"));
-                                    if completed {
-                                        topo.completions.push(CompletionEvidence {
-                                            agent_thread_id: child_thread.clone(),
-                                            op_id: marker_op.id,
-                                        });
-                                    }
-                                }
-                            }
-                            if item.payload.get("tool").and_then(Value::as_str)
-                                == Some("list_agents")
-                            {
-                                for path in completed_agent_paths_from_tool(&item.payload) {
-                                    topo.legacy_completions.push(LegacyCompletionEvidence {
-                                        agent_path: path,
-                                        op_id: marker_op.id,
-                                    });
-                                }
-                            }
-                        }
-                    }
                     for op in &item_ops {
                         let _: bool = ops.accept_op(op)?;
                         report.normalized_ops += 1;
@@ -618,21 +592,103 @@ pub fn import_codex(
                 .normalization_version
                 .max(CODEX_NORMALIZATION_VERSION);
         }
+        new_cursor.source_node = Some(source_node);
+        new_cursor.content_hash_version = 1;
+        if migrates_legacy_key && boot > 0 {
+            cursors.set_generation(&cursor_key, boot)?;
+        }
         cursors.set_cursor(&cursor_key, &new_cursor)?;
-        topology.push(topo);
+        if options.normalize {
+            topology.push(topo);
+        }
     }
 
-    // Post-pass: emit provider-neutral structural relationship notes from the
-    // explicit Codex session metadata (parentThreadId → SubagentOf, completion
-    // markers → ReconnectsTo, forkedFromId → ForkOf). Best-effort over this
-    // run's ops, mirroring the Claude subagent/fork post-passes.
-    let relationship_notes = emit_codex_relationship_notes_from(ops, &topology);
+    // Sink-independent exact topology pass. Missing or ambiguous visible
+    // endpoints remain unlinked; no timestamp/file-order fallback is allowed.
+    let relationship_notes = emit_codex_relationship_notes(&topology)?;
     for note in &relationship_notes {
         let _: bool = ops.accept_op(note)?;
         report.normalized_ops += 1;
     }
 
     Ok(report)
+}
+
+/// Collect exact lifecycle endpoints from a complete helper projection.
+///
+/// The bridge projection is always computed over the whole rollout, including
+/// on an incremental append or metadata-only upgrade. Anchoring evidence to raw
+/// source occurrences keeps relation identity independent from normalized lane
+/// allocation. Evidence on a trailing partial line is ignored until that line
+/// becomes a durable raw occurrence on a later import.
+fn collect_topology_evidence(
+    items: &[FinalItem],
+    stream: &SourceStream,
+    topology: &mut ThreadTopology,
+) -> Result<(), ImportError> {
+    let last_complete_ordinal = topology.last_raw.map_or(0, |op| op.seq >> 16);
+    for item in items {
+        if item.kind == ProjectionKind::Note
+            && item.first_seen > 0
+            && item.first_seen <= last_complete_ordinal
+        {
+            let Some(agent_thread) = item
+                .payload
+                .get("agentThreadId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            topology.markers.push(ActivityMarker {
+                agent_thread_id: agent_thread.to_string(),
+                agent_path: item
+                    .payload
+                    .get("agentPath")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string),
+                op_id: stream.op_from_position(SourcePosition::raw(item.first_seen))?,
+                started: item
+                    .payload
+                    .get("activityKind")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("started")),
+            });
+            continue;
+        }
+
+        if item.kind != ProjectionKind::Tool
+            || item.last_seen == 0
+            || item.last_seen > last_complete_ordinal
+        {
+            continue;
+        }
+        let evidence_op = stream.op_from_position(SourcePosition::raw(item.last_seen))?;
+        if let Some(agents_states) = item.payload.get("agentsStates").and_then(Value::as_object) {
+            for (child_thread, state) in agents_states {
+                let completed = state
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_some_and(|status| status.eq_ignore_ascii_case("completed"));
+                if completed {
+                    topology.completions.push(CompletionEvidence {
+                        agent_thread_id: child_thread.clone(),
+                        op_id: evidence_op,
+                    });
+                }
+            }
+        }
+        if item.payload.get("tool").and_then(Value::as_str) == Some("list_agents") {
+            for agent_path in completed_agent_paths_from_tool(&item.payload) {
+                topology.legacy_completions.push(LegacyCompletionEvidence {
+                    agent_path,
+                    op_id: evidence_op,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Decide whether a rollout belongs to the requested workspace.
@@ -674,25 +730,6 @@ fn resolve_workspace_path(workspace: &Path) -> PathBuf {
 /// Canonicalize a path when it exists locally; otherwise keep it as given.
 fn canonical_or_literal(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// Emit Codex relationship notes over the ops already emitted into a sink.
-///
-/// Reads the collected ops from a [`MemoryOpSink`] (which exposes them as a
-/// slice) and returns the new relationship notes to append. For sinks that do
-/// not expose their op vec, returns an empty vec (linking is best-effort).
-fn emit_codex_relationship_notes_from(
-    ops: &mut dyn OpSink,
-    topology: &[ThreadTopology],
-) -> Vec<editchain_core::Op> {
-    if let Some(mem) = ops
-        .as_any_mut()
-        .and_then(|o| o.downcast_mut::<MemoryOpSink>())
-    {
-        emit_codex_relationship_notes(&mem.ops, topology)
-    } else {
-        Vec::new()
-    }
 }
 
 /// Scan the physical rollout for its raw `session_meta.payload.id` fallback.

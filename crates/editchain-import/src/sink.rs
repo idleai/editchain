@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use editchain_core::payload;
-use editchain_core::{BlobRef, ContentId, Op};
+use editchain_core::{BlobRef, ContentId, NodeId, Op};
 
 use crate::error::ImportError;
 use crate::ids::hash_raw;
@@ -16,15 +16,6 @@ pub trait OpSink {
     ///
     /// Returns [`ImportError`] if the operation cannot be stored.
     fn accept_op(&mut self, op: &Op) -> Result<bool, ImportError>;
-
-    /// Downcast this sink to a concrete type for post-import mutation.
-    ///
-    /// Used by the import orchestrator to run subagent linking over the ops a
-    /// [`MemoryOpSink`] has collected. Returns `None` for sinks that do not
-    /// expose their op vec (linking is then skipped).
-    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-        None
-    }
 }
 
 /// A sink for accepting large blob payloads.
@@ -77,26 +68,26 @@ pub fn payload_for(
     }
 }
 
-/// A store for persisting per-file read cursors.
+/// A store for persisting per-source read cursors.
 pub trait CursorStore {
-    /// Read the cursor for a source file.
+    /// Read the cursor for a source key.
     ///
     /// # Errors
     ///
     /// Returns [`ImportError`] if the cursor cannot be read.
-    fn get_cursor(&self, path: &str) -> Result<Option<CursorValue>, ImportError>;
-    /// Write the cursor for a source file.
+    fn get_cursor(&self, key: &str) -> Result<Option<CursorValue>, ImportError>;
+    /// Write the cursor for a source key.
     ///
     /// # Errors
     ///
     /// Returns [`ImportError`] if the cursor cannot be written.
-    fn set_cursor(&mut self, path: &str, cursor: &CursorValue) -> Result<(), ImportError>;
+    fn set_cursor(&mut self, key: &str, cursor: &CursorValue) -> Result<(), ImportError>;
 
-    /// Read the persisted boot generation for a source file.
+    /// Read the persisted boot generation for a source key.
     ///
     /// The generation counter is bumped whenever an import detects that a
-    /// source file was rewritten (truncated) since the last read; it selects
-    /// the deterministic boot epoch for the file's op ids. Stores that do not
+    /// source's accepted byte prefix changed since the last read; it selects
+    /// the deterministic boot epoch for the source's op ids. Stores that do not
     /// track generations return `0` (the original generation), which keeps
     /// the Claude importer's boot behavior unchanged.
     ///
@@ -106,7 +97,7 @@ pub trait CursorStore {
     fn get_generation(&self, _path: &str) -> Result<u32, ImportError> {
         Ok(0)
     }
-    /// Persist the boot generation for a source file.
+    /// Persist the boot generation for a source key.
     ///
     /// Filesystem stores stage the value in memory like [`Self::set_cursor`];
     /// nothing reaches disk until [`Self::commit`] runs.
@@ -147,6 +138,16 @@ pub struct CursorValue {
     pub ops_emitted: u64,
     /// Blake3 hash of all content up to `byte_offset` (for integrity).
     pub content_hash: [u8; 32],
+    /// Hash contract for `content_hash`: zero is the legacy rolling scheme;
+    /// version one is direct BLAKE3 over exactly `0..byte_offset`.
+    #[serde(default)]
+    pub content_hash_version: u32,
+    /// Stable node that owns this source's operation IDs.
+    ///
+    /// Legacy cursors omit it; migration derives their original path-based node
+    /// once and then carries it across sessions-root relocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node: Option<NodeId>,
     /// Importer-owned normalized projection version applied to this source.
     /// Older cursor JSON omits this field and therefore upgrades from zero.
     #[serde(default)]
@@ -172,10 +173,6 @@ impl OpSink for MemoryOpSink {
     fn accept_op(&mut self, op: &Op) -> Result<bool, ImportError> {
         self.ops.push(op.clone());
         Ok(true)
-    }
-
-    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
-        Some(self)
     }
 }
 
@@ -396,9 +393,9 @@ impl BlobSink for FsBlobSink {
     }
 }
 
-/// A filesystem-backed cursor store persisting one JSON file per source path.
+/// A filesystem-backed cursor store persisting one JSON file per source key.
 ///
-/// Source paths are keyed by their BLAKE3 hash so filenames stay bounded and
+/// Source keys are keyed by their BLAKE3 hash so filenames stay bounded and
 /// free of path separators (`<dir>/<hex-hash>.json`). [`Self::set_cursor`]
 /// mutations are staged in memory; only [`CursorStore::commit`] writes them to
 /// disk (atomic temp file + rename). This lets the import command advance
@@ -453,7 +450,7 @@ impl FsCursorStore {
         &self.dir
     }
 
-    /// Path the cursor for `source_path` is stored at.
+    /// Path the cursor for `source_key` is stored at.
     #[must_use]
     pub fn cursor_path(&self, source_path: &str) -> PathBuf {
         let key = hex_encode(&hash_raw(source_path.as_bytes()));
@@ -666,6 +663,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cursor.normalization_version, 0);
+        assert_eq!(cursor.content_hash_version, 0);
+        assert_eq!(cursor.source_node, None);
     }
 
     #[test]
@@ -713,6 +712,8 @@ mod tests {
             byte_offset: 40,
             ops_emitted: 7,
             content_hash: [7u8; 32],
+            content_hash_version: 1,
+            source_node: Some(NodeId(9)),
             normalization_version: 0,
         };
 
@@ -769,6 +770,8 @@ mod tests {
             byte_offset: 40,
             ops_emitted: 7,
             content_hash: [7u8; 32],
+            content_hash_version: 1,
+            source_node: Some(NodeId(9)),
             normalization_version: 0,
         };
 

@@ -258,13 +258,16 @@ pub fn apply_owned(
     // targets are each note's raw ids lifted to their visible rows.
     let mut structural_keys = HashSet::with_capacity(note_map.len());
     for (anchor, notes) in note_map {
-        if let Some(key) =
-            crate::canonical_parent_key(&anchor.to_string(), representative, &present)
-        {
-            let _: bool = structural_keys.insert(key);
-        }
         for note in notes {
             if let editchain_core::OpKind::Note(n) = &note.kind {
+                if !crate::is_protected_structural_relationship(n.relationship) {
+                    continue;
+                }
+                if let Some(key) =
+                    crate::canonical_parent_key(&anchor.to_string(), representative, &present)
+                {
+                    let _: bool = structural_keys.insert(key);
+                }
                 for target in &n.target_ids {
                     if let Some(key) =
                         crate::canonical_parent_key(&target.to_string(), representative, &present)
@@ -282,8 +285,12 @@ pub fn apply_owned(
     let mut children_of_key = HashMap::with_capacity(nodes.len());
     for n in &nodes {
         let key = n.node_key();
-        let ps =
-            crate::canonicalize_parents(n.parent_keys(links, note_map), representative, &present);
+        let ps = crate::canonicalize_parents(
+            n.parent_keys(links, note_map),
+            representative,
+            &present,
+            &key,
+        );
         drop(parents_of_key.insert(key.clone(), ps.clone()));
         for p in ps {
             children_of_key
@@ -356,10 +363,11 @@ pub fn apply_owned(
         } else {
             n.parent_keys(links, note_map)
         };
-        n.set_parent_keys(&crate::canonicalize_parents(
+        n.override_parent_keys(&crate::canonicalize_parents(
             spliced,
             representative,
             &present,
+            &key,
         ));
         result.push(n);
     }

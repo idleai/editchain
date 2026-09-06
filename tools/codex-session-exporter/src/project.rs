@@ -1163,9 +1163,12 @@ pub fn rollout_item_kind(item: &RolloutItem) -> &'static str {
         RolloutItem::InterAgentCommunicationMetadata { .. } => "interAgentCommunicationMetadata",
         RolloutItem::Compacted(_) => "compacted",
         RolloutItem::TurnContext(_) => "turnContext",
+        RolloutItem::TokenUsageRecord(_) => "tokenUsageRecord",
         RolloutItem::WorldState(_) => "worldState",
         RolloutItem::SecurityRiskScore(_) => "securityRiskScore",
+        RolloutItem::RetainedContext(_) => "retainedContext",
         RolloutItem::EventMsg(_) => "eventMsg",
+        RolloutItem::RealtimeItem(_) => "realtimeItem",
     }
 }
 
@@ -1240,7 +1243,7 @@ fn enrich_projection(projection: &mut ProjectionRecord, item: &RolloutItem) {
                 git: meta_line.git.as_ref().map(|git| SessionGitProjection {
                     commit_hash: git.commit_hash.as_ref().map(|sha| sha.0.clone()),
                     branch: git.branch.clone(),
-                    repository_url: git.repository_url.clone(),
+                    repository_url: git.repository_url.as_ref().map(ToString::to_string),
                 }),
             });
         }
@@ -1313,6 +1316,23 @@ pub fn project_thread_item(item: &ThreadItem) -> ItemProjection {
                 phase: phase.as_ref().and_then(enum_str),
             }
         }
+        ThreadItem::FunctionCallOutput {
+            id,
+            name,
+            namespace,
+            output,
+        } => ItemProjection::ToolCall {
+            id: id.clone(),
+            tool: name.clone(),
+            server: None,
+            namespace: namespace.clone(),
+            plugin_id: None,
+            status: None,
+            duration_ms: None,
+            arguments: None,
+            result: serde_json::to_value(output).ok(),
+            error_message: None,
+        },
         ThreadItem::HookPrompt { id, fragments } => ItemProjection::HookPrompt {
             id: id.clone(),
             fragment_count: fragments.len(),
@@ -1502,6 +1522,7 @@ pub fn thread_item_kind_label(item: &ThreadItem) -> &'static str {
     match item {
         ThreadItem::UserMessage { .. } => "userMessage",
         ThreadItem::AgentMessage { .. } => "agentMessage",
+        ThreadItem::FunctionCallOutput { .. } => "toolCall",
         ThreadItem::Reasoning { .. } => "reasoning",
         ThreadItem::Plan { .. } => "plan",
         ThreadItem::CommandExecution { .. } => "commandExecution",
@@ -1964,6 +1985,19 @@ mod tests {
         let compacted = record.projection.compacted.expect("compacted");
         assert_eq!(compacted.message, "summarized earlier context");
         assert_eq!(compacted.replacement_count, 0);
+    }
+
+    #[test]
+    fn token_usage_record_decodes_without_semantic_changes() {
+        let raw = r#"{"timestamp":"2026-09-06T14:17:24.614Z","type":"token_usage_record","payload":{"thread_id":"0195cda5-433d-7f9a-9d7b-a9f15b60c2e2","turn_id":"turn-1","session_id":"0195cda5-433d-7f9a-9d7b-a9f15b60c2e2","root_turn_id":"turn-1","response_id":"response-1","usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":0,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"turn_token_usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":0,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13},"thread_token_usage":{"input_tokens":10,"cached_input_tokens":2,"cache_write_input_tokens":0,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":13}}}"#;
+        let record = project_line(raw);
+
+        assert_eq!(record.decode.status, DECODE_OK);
+        assert_eq!(record.decode.kind, "tokenUsageRecord");
+        assert!(record.decode.diagnostic.is_none());
+        assert!(record.projection.changed_items.is_empty());
+        assert!(record.projection.changed_turns.is_empty());
+        assert!(record.projection.removed_turn_ids.is_empty());
     }
 
     #[test]

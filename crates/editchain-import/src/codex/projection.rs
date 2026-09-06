@@ -155,10 +155,11 @@ pub struct TurnMeta {
 /// Provider-neutral session metadata from the bridge `sessionMeta` object.
 ///
 /// The owning thread id ([`Self::thread_id`]) is the session scope identity.
-/// `parent_thread_id` / `forked_from_id` are explicit structural pointers that
-/// the importer translates into [`NoteRelationship::SubagentOf`] / `ForkOf`
-/// relationship notes; `agent_path` and the source fields are explicit
-/// provenance (never inferred by sniffing raw records).
+/// `parent_thread_id` / `forked_from_id` are explicit execution pointers. The
+/// importer emits a visible `SpawnedBy` relation only with
+/// an exact matching start occurrence and retains `forked_from_id` as a hidden
+/// `ForkedFrom` fact. `agent_path` and source fields are
+/// explicit provenance (never inferred by sniffing raw records).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMeta {
     /// Owning thread identity (`session_meta.payload.id`).

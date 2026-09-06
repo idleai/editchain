@@ -18,8 +18,6 @@ use tempfile as _;
 pub mod cursor;
 /// Import error types.
 pub mod error;
-/// Fork linking — link sessions that are forks of one original session.
-pub mod fork;
 /// Deterministic ID derivation for import.
 pub mod ids;
 /// Main import orchestrator.
@@ -28,8 +26,6 @@ pub mod import;
 pub mod model;
 /// Pluggable output sinks (ops, blobs, cursors).
 pub mod sink;
-/// Subagent branch/reconnect linking.
-pub mod subagent;
 
 /// Claude Code session import pipeline.
 pub mod claude_code;

@@ -429,11 +429,10 @@ fn inverted_timestamps_folded_reconnects_to_endpoint_keeps_edge_downward() {
     );
 }
 
-/// Undated anchoring with inverted clocks: the undated header still anchors to
-/// its OWN session's earliest dated op (the inverted child's clock), never to a
-/// newer session, and the inverted chain keeps the parent below the child.
+/// Unknown time remains unknown even around inverted clocks, while topology
+/// still keeps each present parent below its child.
 #[test]
-fn undated_header_anchors_to_own_session_with_inverted_clocks() {
+fn undated_header_stays_unknown_with_inverted_clocks() {
     let a_header = Op {
         id: OpId::new(NodeId(1), 0, 1),
         parents: ParentSet::None,
@@ -466,21 +465,15 @@ fn undated_header_anchors_to_own_session_with_inverted_clocks() {
         .find(|n| n.node_key() == a_header.id.to_string())
         .expect("header row");
 
-    // Anchored to session A's own earliest dated op (the inverted child's
-    // clock), not 0 and not session B's later date.
-    assert_eq!(
-        header.timestamp_ms(),
-        1_000,
-        "header must anchor to its own session's clock range"
-    );
-    assert!(header.timestamp_ms() != 0);
+    // No session/global timestamp is borrowed.
+    assert_eq!(header.timestamp_ms(), 0);
     let b1_node = nodes
         .iter()
         .find(|n| n.node_key() == b1.id.to_string())
         .expect("b1 row");
     assert!(
         header.timestamp_ms() < b1_node.timestamp_ms(),
-        "header must not inherit the newer session's date"
+        "unknown time must not inherit the newer session's date"
     );
 
     // The inverted chain keeps the child above the parent, and the header stays

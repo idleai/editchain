@@ -1740,17 +1740,10 @@ fn fork_note_renders_distinct_lane_via_virtual_edge() {
 }
 
 #[test]
-fn fork_branch_prologue_is_folded_into_trunk_no_duplication() {
-    // The seed-hub "don't duplicate the shared prologue" directive: a fork branch
-    // carries its own copy of the trunk's earlier messages (the prologue before
-    // its divergence boundary). A ForkOf note anchored at the divergence boundary
-    // must cause the projection to elide that duplicated prologue so it renders
-    // once on the trunk, while the branch still draws off the trunk at the split.
-    //
-    // Trunk session A:  [rootA, a2, a3, a4]  — 4 messages.
-    // Branch session B: [rootA, a2, b3, b4]  — shares the first TWO messages
-    // (rootA, a2) then diverges at its 3rd (b3). The divergence boundary on B is
-    // `b3`; the matching boundary on A is `a3`.
+fn fork_note_never_suppresses_rows_without_occurrence_evidence() {
+    // A ForkOf edge says where a branch attaches; it does not prove that every
+    // lower-sequence row in that physical source is a copied event. Without exact
+    // OccurrenceOf facts projection must retain all physical rows.
     let roota = msg(1, 1, 10, None); // A's first (shared)
     let a2 = msg(1, 2, 10, Some(roota.id)); // shared
     let a3 = msg(1, 3, 10, Some(a2.id)); // A's divergence boundary
@@ -1779,42 +1772,18 @@ fn fork_branch_prologue_is_folded_into_trunk_no_duplication() {
     let nodes = projection.nodes();
     let keys: Vec<String> = nodes.iter().map(HistoryNode::node_key).collect();
 
-    // The branch's duplicated prologue (b_roota, b_a2) must be elided — it already
-    // renders on the trunk as (rootA, a2). The branch tip (b3, b4) must remain.
-    assert!(
-        !keys.contains(&b_roota.id.to_string()),
-        "branch prologue root must be folded into trunk; got {keys:?}"
-    );
-    assert!(
-        !keys.contains(&b_a2.id.to_string()),
-        "branch prologue second message must be folded into trunk; got {keys:?}"
-    );
-    // Trunk's prologue copies stay (they ARE the trunk), and both branches' tips
-    // past the split remain.
-    assert!(
-        keys.contains(&roota.id.to_string()),
-        "trunk root must be kept"
-    );
-    assert!(
-        keys.contains(&a2.id.to_string()),
-        "trunk shared message must be kept"
-    );
-    assert!(
-        keys.contains(&b3.id.to_string()),
-        "branch boundary must be kept"
-    );
-    assert!(
-        keys.contains(&b4.id.to_string()),
-        "branch continuation must be kept"
-    );
+    assert_eq!(keys.len(), 8);
+    for id in [
+        roota.id, a2.id, a3.id, a4.id, b_roota.id, b_a2.id, b3.id, b4.id,
+    ] {
+        assert!(keys.contains(&id.to_string()), "row {id} must be kept");
+    }
 }
 
-/// Issue-1 fix: an undated metadata header in a session must anchor to its OWN
-/// session's date, not to the globally-newest date of some unrelated newer
-/// session. Otherwise an old session's header floats to the top of the timeline
-/// and visually merges it with unrelated recent work.
+/// Unknown source time stays unknown; neither a session minimum nor an unrelated
+/// global timestamp is fabricated for display ordering.
 #[test]
-fn undated_header_anchors_to_own_session_not_global_newest() {
+fn undated_header_keeps_unknown_source_time() {
     // Old session A: an undated header + dated ops at Jul-10 (ts 1000..1003).
     let a_header = Op {
         id: OpId::new(NodeId(1), 0, 1),
@@ -1842,28 +1811,9 @@ fn undated_header_anchors_to_own_session_not_global_newest() {
         .iter()
         .find(|n| n.node_key() == header_key)
         .expect("header");
-    let a1_key = a1.id.to_string();
-    let a1_node = nodes.iter().find(|n| n.node_key() == a1_key).unwrap();
-    let b1_key = b1.id.to_string();
-    let b1_node = nodes.iter().find(|n| n.node_key() == b1_key).unwrap();
-
-    // The header must be dated near session A's date (a1), NOT near session B's
-    // later date: header <= a1's date and well below b1's date.
-    assert!(
-        header.timestamp_ms() <= a1_node.timestamp_ms(),
-        "header must anchor to its own (older) session, got {} vs a1 {}",
-        header.timestamp_ms(),
-        a1_node.timestamp_ms()
-    );
-    assert!(
-        header.timestamp_ms() < b1_node.timestamp_ms(),
-        "header must NOT inherit the newer session's date; got {} vs b1 {}",
-        header.timestamp_ms(),
-        b1_node.timestamp_ms()
-    );
-    // And it must NOT be 0 (it got an effective date).
-    assert!(
-        header.timestamp_ms() != 0,
-        "header should get an effective date"
+    assert_eq!(header.timestamp_ms(), 0);
+    assert_eq!(
+        header.effective_time(),
+        editchain_project::EffectiveTime::Unknown
     );
 }
