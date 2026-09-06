@@ -149,6 +149,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb
 
       - name: Real VS Code GPU history e2e (xvfb)
+        # Temporarily disabled while the clean-CI fixture is made independent
+        # of a developer-local .editchain store. Keep the step ready to re-enable.
+        if: ${{ false }}
         working-directory: extensions/vscode-editchain
         timeout-minutes: 30
         run: npm run ui:vscode:gpu
