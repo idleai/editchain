@@ -3,14 +3,20 @@ import { resolveServicePath, StdioClient } from './stdioClient';
 
 // The single history panel. Reused across `open` invocations so we never create
 // two webviews of the same type (which races VS Code's service-worker
-// registration and can throw "Could not register service worker").
+// registration and can throw "Could not register service worker"). The panel
+// always renders the Rust/WASM history view: media/rust-history/loader.js is
+// the ONLY script the webview loads. It initializes the wasm-bindgen module
+// and calls the Rust shell's startHistoryView(), which owns the whole runtime
+// (window/frame/lane presentation as per-row SVG graph fragments inside each
+// row's .graph-cell, virtual paging, search, profile switching, selection and
+// raw-JSON routing). The webview loads no other scripts.
 let historyPanel: vscode.WebviewPanel | undefined = undefined;
 // Output channel for debugging the service bridge and panel lifecycle.
 let output: vscode.OutputChannel | undefined = undefined;
 // Status bar item showing how many history nodes are loaded vs total.
 let statusItem: vscode.StatusBarItem | undefined = undefined;
 // The last successful Open response body. Held so command reuse or a genuinely
-// recreated main.js instance can receive the authoritative `open` + `ready`
+// recreated Rust renderer instance can receive the authoritative `open` + `ready`
 // handshake without rebuilding the workspace.
 let lastOpenBody: any = null;
 // The most recent terminal Open error. Successful bodies and errors are kept
@@ -30,10 +36,11 @@ let openPending = false;
 // newer Open was issued) is dropped entirely, so it can never clear a newer
 // Open's pending state or install a stale workspace body for replay.
 let openEpoch = 0;
-// Identity of the currently loaded main.js context and the context that has
-// already received the latest Open result. `retainContextWhenHidden` keeps the
-// normal raw-JSON -> Back path alive; this handshake is the fallback for a real
-// context recreation (window reload, renderer recovery, or memory pressure).
+// Identity of the currently loaded Rust renderer context and the context that
+// has already received the latest Open result. `retainContextWhenHidden` keeps
+// the normal raw-JSON -> Back path alive; this handshake is the fallback for a
+// real context recreation (window reload, renderer recovery, or memory
+// pressure).
 let rendererInstanceId: string | null = null;
 let openDeliveredToRenderer: string | null = null;
 
@@ -101,6 +108,10 @@ function updateStatusBar(loaded: number, total: number): void {
 
 /**
  * Open (or reveal) the history explorer webview panel.
+ *
+ * The single panel always renders the Rust/WASM history view (the
+ * media/rust-history/loader.js bootstrap) in the active/default column. The
+ * Rust shell owns the full runtime — the webview loads no other scripts.
  */
 function openHistoryView(
   context: vscode.ExtensionContext,
@@ -117,7 +128,7 @@ function openHistoryView(
     output?.appendLine('[openHistoryView] reusing existing panel');
     const wasRunning = client.isRunning();
     client.ensureStarted(resolveServicePath());
-    historyPanel.reveal(vscode.ViewColumn.One);
+    historyPanel.reveal(vscode.ViewColumn.Active);
     // Re-run the Open handshake when the service process was dead OR when the
     // last Open never produced a successful body (e.g. it returned an Error),
     // so command reuse always ends up with an authoritative view. Skipped while
@@ -138,7 +149,7 @@ function openHistoryView(
   const panel = vscode.window.createWebviewPanel(
     'editchainHistory',
     'EditChain History',
-    vscode.ViewColumn.One,
+    vscode.ViewColumn.Active,
     {
       enableScripts: true,
       // The renderer retains only a bounded viewport cache, so preserving its
@@ -183,7 +194,7 @@ function openHistoryView(
   // A normal raw-JSON -> Back navigation retains the renderer context, including
   // its bounded row cache and DOM. Do not replay Open on reveal: Open is an
   // authoritative reset and would throw that cache away. If VS Code genuinely
-  // recreates main.js, its `webviewReady` message below carries a new instance
+  // recreates the Rust renderer, its `webviewReady` message below carries a new instance
   // id and receives the last Open state only after its listener is installed.
   panel.onDidChangeViewState((e) => {
     output?.appendLine('[panel] view state changed, active=' + e.webviewPanel.active);
@@ -200,10 +211,21 @@ function openHistoryView(
 
   // Forward webview -> service.
   panel.webview.onDidReceiveMessage(async (msg) => {
-    // main.js sends this only after installing its host-message listener. A new
-    // id means VS Code recreated the JS context; replay the cached Open result
-    // to that instance exactly once. The retained raw-JSON -> Back path sends no
-    // new handshake and therefore performs no reset or network request.
+    if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) {
+      output?.appendLine('[webview] rejected malformed message');
+      panel.webview.postMessage({
+        id: -1,
+        body: { Error: 'EditChain History: malformed webview message' },
+      });
+      return;
+    }
+    // The Rust/WASM shell announces a fresh context via webviewReady after
+    // installing its host-message listener; deliver the current Open result
+    // to THAT instance exactly once. A new id means VS Code recreated the JS
+    // context; the retained raw-JSON -> Back path sends no new handshake and
+    // therefore performs no reset or network request. While an Open is
+    // pending, delivery waits for its authoritative settle (startOpen also
+    // routes the settle to this panel).
     if (msg.type === 'webviewReady') {
       const instanceId = typeof msg.instanceId === 'string' ? msg.instanceId : '';
       if (!instanceId) return;
@@ -223,6 +245,7 @@ function openHistoryView(
       await openJsonEditor(client, jsonProvider, msg);
       return;
     }
+    // Renderer diagnostics and live-region announcements are host-side only.
     if (msg.type === 'log') {
       output?.appendLine('[webview] ' + msg.text);
       return;
@@ -240,15 +263,48 @@ function openHistoryView(
       updateStatusBar(msg.loaded, msg.total);
       return;
     }
+    // The Rust/WASM renderer speaks the production generic bridge: numeric-id
+    // { body: <one-key envelope> } frames. ONLY the read-only envelopes the
+    // renderer issues are forwarded (GetWindow, FindInHistory, legacy Search);
+    // anything else (Open, ResolveObject, GetNodeDetails, ...) is rejected
+    // visibly instead of reaching a non-read-only service call. The explicitly
+    // handled openJson UI action above remains outside this bridge.
+    const id = typeof msg.id === 'number' && Number.isFinite(msg.id) ? msg.id : null;
+    const body = msg.body;
+    // Single-key envelope guard for the generic bridge: exactly one top-level
+    // key, and it must be on the read-only allowlist below.
+    const hasOwnProperty = (target: object, key: string): boolean =>
+      Object.prototype.hasOwnProperty.call(target, key);
+    const isForwardable =
+      body !== null &&
+      typeof body === 'object' &&
+      !Array.isArray(body) &&
+      Object.keys(body).length === 1 &&
+      (hasOwnProperty(body, 'GetWindow') ||
+        hasOwnProperty(body, 'FindInHistory') ||
+        hasOwnProperty(body, 'Search'));
+    if (id === null || !isForwardable) {
+      output?.appendLine(
+        '[webview] rejected request (only GetWindow/FindInHistory/Search are forwarded): ' +
+          JSON.stringify(msg)
+      );
+      panel.webview.postMessage({
+        id: id === null ? -1 : id,
+        body: {
+          Error: 'EditChain History: only GetWindow, FindInHistory and Search requests are forwarded by the host',
+        },
+      });
+      return;
+    }
     try {
       // Non-Open calls get a generous finite deadline (see NON_OPEN_TIMEOUT_MS):
       // a hung window/search surfaces visibly in the webview (which suspends
       // retries until explicit recovery) instead of spinning forever. Open
       // itself stays unbounded — it can legitimately take minutes.
-      const resp = await client.request(msg.body, { timeoutMs: NON_OPEN_TIMEOUT_MS });
-      panel.webview.postMessage({ id: msg.id, body: resp });
+      const resp = await client.request(body, { timeoutMs: NON_OPEN_TIMEOUT_MS });
+      panel.webview.postMessage({ id, body: resp });
     } catch (e) {
-      panel.webview.postMessage({ id: msg.id, body: { Error: String(e) } });
+      panel.webview.postMessage({ id, body: { Error: String(e) } });
     }
   });
 
@@ -351,7 +407,7 @@ function startOpen(client: StdioClient, panel: vscode.WebviewPanel): void {
   });
 }
 
-/** Deliver the latest terminal Open state to the current main.js instance. */
+/** Deliver the latest terminal Open state to the current Rust renderer instance. */
 function deliverOpenState(panel: vscode.WebviewPanel): void {
   if (
     panel !== historyPanel ||
@@ -491,29 +547,57 @@ class JsonContentProvider implements vscode.TextDocumentContentProvider {
   }
 }
 
-/** Build the webview HTML. */
+/** Build the single history panel's webview HTML (the Rust/WASM history view).
+ *
+ * This is the ONLY panel the extension opens. The page is the EXACT production
+ * scaffold (media/main.css + media/gpu-preview/gpu-preview.css and the
+ * controls/rows/gpu chrome markup) with media/rust-history/loader.js as its
+ * ONLY script: the loader initializes the wasm-bindgen module and calls the
+ * Rust shell's startHistoryView(), which owns the full runtime — Activity/Raw
+ * profile switching, virtual paging (PAGE=500), FindInHistory search/nav,
+ * loading/error, work-unit/bundle/promotion rows, row selection/keyboard/
+ * disclosure, raw JSON routing, five responsive columns, accessibility,
+ * resize, and per-row SVG graph fragments (the inert #gpu-canvas-host
+ * scaffold stays in the markup, but no canvas is ever created).
+ *
+ * The CSP keeps the production policy's shape and permits no network or worker
+ * access. Its script-src additionally allows 'wasm-unsafe-eval' for
+ * WebAssembly instantiation, while connect-src is restricted to the
+ * extension's own webview resource origin so the loader can fetch the local
+ * .wasm bytes next to media/rust-history/loader.js.
+ */
 function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): string {
-  const scriptUri = webview.asWebviewUri(
-    vscode.Uri.joinPath(context.extensionUri, 'media', 'main.js')
+  const rustLoaderUri = webview.asWebviewUri(
+    vscode.Uri.joinPath(context.extensionUri, 'media', 'rust-history', 'loader.js')
   );
-  const styleUri = webview.asWebviewUri(
+  const mainStyleUri = webview.asWebviewUri(
     vscode.Uri.joinPath(context.extensionUri, 'media', 'main.css')
   );
+  const styleUri = webview.asWebviewUri(
+    vscode.Uri.joinPath(context.extensionUri, 'media', 'gpu-preview', 'gpu-preview.css')
+  );
   const cspSource = webview.cspSource;
-  // Pulse is the single narrative-first presentation. The Activity/Raw control
-  // independently switches the chain filter's hide_trace flag (Activity = hide
-  // trace records, Raw = show everything). Search is labelled for assistive
-  // tech, and the status region announces changes without stealing focus.
+  // The scaffold mirrors test/harness/rust.html exactly: the SAME production
+  // rust-history loader initializes the wasm module and starts the Rust shell
+  // inside VS Code and in the harness, against the same controls/rows/gpu
+  // chrome. The body carries only the treatment and requested backend; the
+  // loader resolves the wasm URL relative to its own module location, so no
+  // glue/wasm URI data attributes are needed.
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src ${cspSource};">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src ${cspSource} 'wasm-unsafe-eval'; connect-src ${cspSource};">
 <title>EditChain History</title>
+<link rel="stylesheet" href="${mainStyleUri}">
 <link rel="stylesheet" href="${styleUri}">
 </head>
-<body data-treatment="pulse">
+<body data-treatment="pulse" data-gpu-backend="auto">
+<div id="gpu-toolbar" role="toolbar" aria-label="Renderer status">
+<span id="gpu-backend" data-backend="auto">backend: detecting</span>
+<span id="gpu-status">idle</span>
+</div>
 <div id="controls" role="group" aria-label="History controls">
 <div id="profile-control" class="segmented" role="group" aria-label="History profile">
 <button type="button" id="profile-activity" class="segmented-btn active" aria-pressed="true">Activity</button>
@@ -529,9 +613,14 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 </div>
 <div id="layout">
 <div id="rows"></div>
+<div id="gpu-canvas-host" aria-hidden="true"></div>
 </div>
 <div id="status-live" class="visually-hidden" role="status" aria-live="polite"></div>
-<script src="${scriptUri}"></script>
+<div id="gpu-scroll">
+<div id="gpu-rows" role="table" aria-label="Rust/WASM history renderer" aria-hidden="true"></div>
+</div>
+<div id="gpu-live" class="visually-hidden" role="status" aria-live="polite"></div>
+<script type="module" src="${rustLoaderUri}"></script>
 </body>
 </html>`;
 }

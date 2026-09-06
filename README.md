@@ -4,7 +4,7 @@ CRDT-based edit chain built from agent session history, browsed through the **Ed
 
 ## VS Code extension
 
-The primary UI lives in [`extensions/vscode-editchain/`](./extensions/vscode-editchain/): a read-only unified history explorer that overlays EditChain operations with live Git history.
+The primary UI lives in [`extensions/vscode-editchain/`](./extensions/vscode-editchain/): a read-only unified history explorer that overlays EditChain operations with live Git history. The history view is **Rust/WASM — the sole renderer**: `editchain-history.open` opens one panel titled **"EditChain History"** bootstrapped by the tiny `media/rust-history/loader.js` + generated wasm-bindgen glue, with the `editchain-gpu-preview` crate owning the view state (`HistoryAppState`), row model (`RowSpec`), and the web-sys DOM/accessibility surface (each row's graph is an inline `svg.graph-row-fragment`; no canvas overlay). The webview loads no other scripts, and the renderer is exercised headlessly by `test/harness/rust.html` (rustSmoke) and in real VS Code by the e2e/visual suites — full details in the extension README.
 
 Build the native service and the extension:
 

@@ -1,13 +1,14 @@
 // Service bridge: drives the REAL Rust editchain-vscode-service over framed
 // stdio, so the harness renders actual chain data instead of fixtures.
 //
-// Loaded in the harness page BEFORE media/main.js (replacing fixtureBridge.js).
-// It defines a global `vscode` object whose postMessage forwards requests to
-// the service and dispatches responses back as `{ id, body }` message events.
+// Loaded in the harness page BEFORE the renderer bootstrap (replacing
+// fixtureBridge.js). It defines a global `vscode` object whose postMessage
+// forwards requests to the service and dispatches responses back as
+// `{ id, body }` message events.
 //
-// The service is spawned by the harness host (index.html) via a small Node
-// helper that exposes a global `__editchainService` with send(body) -> Promise.
-// This keeps the browser page free of Node APIs.
+// The service is spawned by the harness host via a small Node helper that
+// exposes a global `__editchainService` with send(body) -> Promise. This keeps
+// the browser page free of Node APIs.
 
 (function () {
   'use strict';
@@ -15,8 +16,8 @@
   let persistedState = undefined;
   let reqId = 0;
 
-  // The Node host injects this before main.js runs. Resolve lazily so the
-  // bridge can be defined before the shim is wired.
+  // The Node host injects this before the renderer runs. Resolve lazily so
+  // the bridge can be defined before the shim is wired.
   function svc() {
     return window.__editchainService;
   }

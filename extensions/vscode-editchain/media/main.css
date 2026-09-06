@@ -2,10 +2,11 @@
  *
  * Shared by two hosts:
  *   - VS Code webview (linked via webview.asWebviewUri in extension.ts)
- *   - the standalone Puppeteer harness (test/harness/index.html)
+ *   - the standalone browser harness (test/harness/rust.html)
  *
  * Theme variables come from VS Code's --vscode-* custom properties. The harness
- * injects equivalent tokens so both hosts render identically.
+ * (test/harness/rust.html) injects equivalent tokens so both hosts render
+ * identically.
  */
 
 body {
@@ -299,8 +300,9 @@ body {
 }
 
 /* Each history row is a grid with the same column template as the header.
-   Height is fixed to ROW_H (34px) in main.js so the graph cells' dot/edge
-   y-positions and the scroll-spacer math stay consistent with real row height.
+   Height is fixed to ROW_H (34px) in the Rust shell so the graph cells'
+   dot/edge y-positions and the scroll-spacer math stay consistent with real
+   row height.
    Every row carries its own raw separator (a bottom border) so rows read as
    distinct lines even within a session group; box-sizing must stay border-box
    so that border sits INSIDE the fixed height and never inflates outer height
@@ -817,8 +819,8 @@ body.col-resizing .col-resize-handle {
 
 /* Narrow panels: let the fixed date/author/commit tracks shrink (via minmax)
    so the grid never clips, while the graph column keeps its lane-based width
-   so the graph stays visible. The inline `--*` vars from main.js still size
-   the tracks at their defaults when space allows. */
+   so the graph stays visible. The inline `--*` vars set by the Rust shell
+   still size the tracks at their defaults when space allows. */
 @media (max-width: 720px) {
   .tbl-header,
   .row {
@@ -842,8 +844,9 @@ body.col-resizing .col-resize-handle {
    Date (~400px) — fixed columns are HIDDEN in priority order so Content keeps
    its readable width before it is ever squeezed, and the graph rail keeps the
    space it needs to stay compact instead of smearing. Breakpoints must match
-   the `hiddenColumns()` constants in media/main.js (the JS width math counts
-   only visible tracks). */
+   the `hidden_columns()` logic in the Rust shell
+   (crates/editchain-gpu-preview/src/app/dom.rs), which counts only visible
+   tracks. */
 @media (max-width: 617px) {
   .tbl-header,
   .row {
@@ -858,10 +861,11 @@ body.col-resizing .col-resize-handle {
   }
 }
 @media (max-width: 480px) {
-  /* At <=480px the JS width math caps the graph rail at GRAPH_MAX_W_NARROW
-     (see graphWidthBudget in media/main.js), so the CSS grid here just keeps
-     the --graph-w var authoritative. The rail stays VISIBLE — lanes compress
-     into the compact track instead of being hidden or smearing Content. */
+  /* At <=480px the Rust shell caps the graph rail at GRAPH_MAX_W_NARROW (see
+     graph_width_budget in crates/editchain-gpu-preview/src/app/dom.rs), so the
+     CSS grid here just keeps the --graph-w var authoritative. The rail stays
+     VISIBLE — lanes compress into the compact track instead of being hidden or
+     smearing Content. */
   .tbl-header,
   .row {
     grid-template-columns:

@@ -8,8 +8,9 @@
 // standalone Puppeteer harness cannot: extension activation, native Rust service
 // spawn, the message bridge, and the webview/panel lifecycle.
 //
-// It also injects the same text-only layout probe (test/harness/layoutProbe.js)
-// into the webview so the identical textual checks run inside real VS Code.
+// It also injects the Rust-shell text-only layout probe
+// (test/vscode/layoutProbe.js) into the webview so the identical textual
+// checks run inside real VS Code against the Rust/WASM renderer.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -17,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROBE_SRC = fs.readFileSync(
-  path.join(__dirname, '..', 'harness', 'layoutProbe.js'),
+  path.join(__dirname, 'layoutProbe.js'),
   'utf8'
 );
 
@@ -479,11 +480,213 @@ describe('EditChain History Explorer', () => {
     expect(bottom.rowCount).toBeGreaterThan(0);
     expect(bottom.placeholders).toBe(0);
 
+    // Leave the retained panel in a cheap, fully hydrated state for the next
+    // independent test. Keeping Chromium at its maximum virtual scroll offset
+    // makes every later frame lookup traverse the largest retained surface and
+    // can exhaust WebdriverIO's per-test budget even though the Rust renderer
+    // itself is healthy. This reset is part of the assertion: the same panel
+    // must page back to row 0 without a reload.
+    await browser.execute(() => {
+      document.getElementById('rows').scrollTop = 0;
+    });
+    await browser.waitUntil(async () => browser.execute(() => {
+      const top = document.querySelector('.row[data-row="0"]');
+      return window.__editchainDataReady === true && !!top &&
+        !top.classList.contains('row-placeholder');
+    }), {
+      timeout: 60000,
+      interval: 100,
+      timeoutMsg: 'history panel did not hydrate row 0 after the bottom-scroll assertion',
+    });
+
     // Leave the webview context.
     await webview.close();
   });
 
-  it('keeps the Activity work-unit/bundle/promotion layer coherent with the wire and gates it off in Raw', async () => {
+  it('keeps per-row graph fragments aligned and the scroll window stable during deep continuous scrolling (Activity + Raw)', async function () {
+    // The real chain is 100k+ rows; the continuous sweep drives ~120k CSS px
+    // of motion per profile plus renderer settle waits, so give this test a
+    // larger budget than the config default.
+    this.timeout(600000);
+
+    const workbench = await browser.getWorkbench();
+    await browser.executeWorkbench((vscode) => {
+      vscode.commands.executeCommand('editchain-history.open');
+    });
+    const webview = await workbench.getWebviewByTitle('EditChain History');
+    await webview.open();
+    await browser.$('.row').waitForExist({ timeout: 120000 });
+
+    // Pin the deterministic default Activity profile before measuring.
+    const initialProfile = await browser.execute(() =>
+      typeof window.__editchainGetProfile === 'function'
+        ? window.__editchainGetProfile() : null);
+    if (initialProfile !== 'activity') {
+      await browser.execute(() => {
+        document.getElementById('profile-activity').click();
+      });
+    }
+    await browser.waitUntil(async () => browser.execute(() => {
+      const rows = Array.from(document.querySelectorAll('.row'));
+      return window.__editchainDataReady === true &&
+        rows.length > 0 &&
+        rows.every((r) => {
+          const abs = Number(r.getAttribute('data-row'));
+          return Number.isFinite(abs) && window.__editchainRowAt(abs) != null;
+        });
+    }), { timeout: 60000, interval: 100 });
+
+    // Inject the text-only layout probe (idempotent within this file).
+    await browser.execute((src) => {
+      // eslint-disable-next-line no-eval
+      (0, eval)(src);
+      return typeof window.__editchainDebug;
+    }, PROBE_SRC);
+
+    // Continuous scrollbar-like deep sweep with live + settled sampling runs
+    // INSIDE the page (probeScrollParity), so failures carry concrete samples
+    // instead of a one-shot assertion. The probe never switches profiles: the
+    // REAL segmented control does, and the probe verifies the active profile.
+    //
+    // Real VS Code WebDriver sessions enforce a ~30s script timeout on every
+    // execute/sync command. A 60k px bidirectional sweep with settle waits
+    // exceeded that inside one command (observed: script timeout + 3 driver
+    // retries ≈ 120s, after which later tests ran against a broken webview),
+    // so the sweep runs as a chunked probe session: each bounded command
+    // advances the page-side sweep by at most chunkPx travel / chunkBudgetMs
+    // wall time and reports progress until done. Same samples, same checks,
+    // same screenshot artifacts — just no single command over 30s.
+    const runSweep = async (profile) => {
+      const opts = {
+        profile,
+        sweepPx: 60000,
+        // Sample often enough that the retained head/tail key sets overlap;
+        // this makes same-row viewport movement prove wrapper stability.
+        sampleEveryPx: 680,
+        // 8 rows per animation frame: still a continuous scrollbar-like drag,
+        // but halves the frame count of the 136px/frame default so the whole
+        // 120k px bidirectional sweep fits the 600s test budget on the slow
+        // real-VS-Code renderer (~350ms/frame under Xvfb). Invariants are
+        // sampled every 680px regardless of per-frame step size.
+        pxPerFrame: 272,
+        idleTimeoutMs: 120000,
+        // Bound every execute/sync well under the ~30s script timeout:
+        // at most 8000px of travel per command and a hard 20s wall budget.
+        chunkPx: 8000,
+        chunkBudgetMs: 20000,
+      };
+      // One page-side session per profile (the probe state is reset on each injection anyway).
+      const sessionId = 'scroll-parity-' + profile + '-' + Date.now();
+      let lastProgress = null;
+      const MAX_PROBE_CALLS = 200; // covers pathological slow settle slices within the 600s test budget
+      for (let call = 0; call < MAX_PROBE_CALLS; call++) {
+        const result = await browser.execute(
+          (o) => window.__editchainDebug.probeScrollParity(o),
+          { ...opts, sessionId });
+        if (result.done) return result;
+        lastProgress = result.progress;
+        console.log('[e2e] scroll parity ' + profile + ' progress:',
+          JSON.stringify(result.progress) + (result.awaitingIdle ? ' (awaitingIdle)' : ''));
+      }
+      throw new Error('scroll parity ' + profile + ' did not finish within ' + MAX_PROBE_CALLS +
+        ' probe calls; last progress=' + JSON.stringify(lastProgress));
+    };
+
+    const logSweep = (label, result) => {
+      console.log('[e2e] scroll parity ' + label + ' summary:', JSON.stringify(result.summary));
+      result.checks.forEach((c) =>
+        console.log('[e2e]   ' + c.name + ' ' + (c.pass ? 'PASS' : 'FAIL') +
+          ' — ' + String(c.detail).slice(0, 500)));
+      if (!result.ok) {
+        console.log('[e2e] scroll parity ' + label + ' failure samples:',
+          JSON.stringify(result.samples));
+      }
+    };
+
+    // Park at a deep offset with predicate waits (no sleeps), capture a trace
+    // screenshot, and return to the top of the chain.
+    const parkAtDepth = async (shotPath) => {
+      await browser.execute((depthPx) => {
+        const rows = document.getElementById('rows');
+        rows.scrollTop = Math.min(depthPx, Math.max(0, rows.scrollHeight - rows.clientHeight));
+      }, 60000);
+      await browser.waitUntil(async () => browser.execute(() => {
+        const rows = document.getElementById('rows');
+        return window.__editchainDataReady === true &&
+          rows.scrollTop > 0 &&
+          document.querySelectorAll('.row-placeholder').length === 0;
+      }), { timeout: 60000, interval: 100 });
+      const depth = await browser.execute(() => ({
+        scrollTop: document.getElementById('rows').scrollTop,
+        rowCount: document.querySelectorAll('.row:not(.row-placeholder)').length,
+      }));
+      console.log('[e2e] scroll parity depth capture:', JSON.stringify(depth));
+      await browser.$('body').saveScreenshot(shotPath);
+      await browser.execute(() => {
+        document.getElementById('rows').scrollTop = 0;
+      });
+      await browser.waitUntil(async () => browser.execute(() => {
+        const top = document.querySelector('.row[data-row="0"]');
+        return window.__editchainDataReady === true && !!top &&
+          !top.classList.contains('row-placeholder');
+      }), { timeout: 60000, interval: 100 });
+    };
+    const activity = await runSweep('activity');
+    logSweep('activity', activity);
+    expect(activity.ok).toBe(true);
+
+    // Trace artifact: settle Activity at a deep offset for visual diagnosis,
+    // then return to the top of the chain.
+    await parkAtDepth(path.join(__dirname, '..', '..', 'trace', 'e2e-scroll-parity-activity-depth.png'));
+
+    // Raw through the real segmented control; the reset must clear the grid
+    // synchronously and re-render a cache-backed window at scrollTop 0.
+    await browser.execute(() => {
+      document.getElementById('profile-raw').click();
+    });
+    await browser.waitUntil(async () => browser.execute(() => {
+      const rows = Array.from(document.querySelectorAll('.row'));
+      return window.__editchainDataReady === true &&
+        document.getElementById('rows').scrollTop === 0 &&
+        rows.length > 0 &&
+        rows.every((r) => {
+          const abs = Number(r.getAttribute('data-row'));
+          return Number.isFinite(abs) && window.__editchainRowAt(abs) != null;
+        });
+    }), { timeout: 60000, interval: 100 });
+
+    const raw = await runSweep('raw');
+    logSweep('raw', raw);
+    expect(raw.ok).toBe(true);
+
+    await parkAtDepth(path.join(__dirname, '..', '..', 'trace', 'e2e-scroll-parity-raw-depth.png'));
+
+    // Restore the default Activity profile at the top of the chain so the
+    // next test starts clean (same retained panel, no reload).
+    await browser.execute(() => {
+      document.getElementById('profile-activity').click();
+    });
+    await browser.waitUntil(async () => browser.execute(() => {
+      const rows = Array.from(document.querySelectorAll('.row'));
+      return window.__editchainDataReady === true &&
+        document.getElementById('rows').scrollTop === 0 &&
+        rows.length > 0 &&
+        rows.every((r) => {
+          const abs = Number(r.getAttribute('data-row'));
+          return Number.isFinite(abs) && window.__editchainRowAt(abs) != null;
+        });
+    }), { timeout: 60000, interval: 100 });
+
+    // Leave the webview context.
+    await webview.close();
+  });
+
+  it('keeps the Activity work-unit/bundle/promotion layer coherent with the wire and gates it off in Raw', async function () {
+    // This test may have to reopen a retained 126k-row virtual surface after
+    // the preceding bottom-scroll test. Give the explicit 120s renderer wait
+    // room to report its own diagnostic instead of racing Mocha's 120s suite
+    // default and terminating the Extension Development Host mid-command.
+    this.timeout(300000);
     const workbench = await browser.getWorkbench();
 
     await browser.executeWorkbench((vscode) => {
@@ -492,6 +695,15 @@ describe('EditChain History Explorer', () => {
     const webview = await workbench.getWebviewByTitle('EditChain History');
     await webview.open();
     await browser.$('.row').waitForExist({ timeout: 120000 });
+    console.log('[e2e] work-unit frame state:', JSON.stringify(await browser.execute(() => ({
+      visibility: document.visibilityState,
+      focused: document.hasFocus(),
+      rows: document.querySelectorAll('.row').length,
+      loader: window.__editchainGpuDebug?.loader || null,
+      dataReady: window.__editchainDataReady === true,
+      inFlight: window.__editchainInFlightCount,
+      lastError: window.__editchainLastError,
+    }))));
 
     // Inject the text-only layout probe so its contract helpers + textual
     // checks run inside real VS Code (same probe the harness uses).
@@ -500,7 +712,8 @@ describe('EditChain History Explorer', () => {
       (0, eval)(src);
       return typeof window.__editchainDebug;
     }, PROBE_SRC);
-    await browser.execute(() => window.__editchainDebug.whenIdle(60000));
+    const idleResult = await browser.execute(() => window.__editchainDebug.whenIdle(60000));
+    console.log('[e2e] work-unit idle:', JSON.stringify(idleResult));
 
     // Deterministic, chain-agnostic invariants over REAL rows: wherever a
     // rendered row carries work_unit / promoted / activity_bundle wire
@@ -543,10 +756,14 @@ describe('EditChain History Explorer', () => {
             }
           }
         }
-        if (row.activity_bundle && row.activity_bundle.kind === 'execute-run') {
+        const typedBundle = row.activity_bundle &&
+          (row.activity_bundle.kind === 'execute-run' ||
+            row.activity_bundle.kind === 'plan-repeat');
+        if (typedBundle) {
           typedBundles++;
-          if (el.getAttribute('data-activity-bundle') !== 'execute-run') {
-            problems.push('typed bundle missing data-activity-bundle=execute-run on ' + abs);
+          if (el.getAttribute('data-activity-bundle') !== row.activity_bundle.kind) {
+            problems.push('typed bundle missing data-activity-bundle=' +
+              row.activity_bundle.kind + ' on ' + abs);
           }
           if (el.getAttribute('data-bundle-count') !== String(row.activity_bundle.member_count)) {
             problems.push('data-bundle-count mismatch on ' + abs);
@@ -558,13 +775,13 @@ describe('EditChain History Explorer', () => {
           }
           const statusEl = el.querySelector('.bundle-status');
           const statusText = statusEl ? (statusEl.textContent || '').trim() : '';
-          if (row.outcome === 'success') {
+          if (row.activity_bundle.kind === 'execute-run' && row.outcome === 'success') {
             if (!statusEl || statusText !== '✓' ||
                 !statusEl.classList.contains('bundle-status-success')) {
               problems.push('successful bundle missing quiet success check on ' + abs);
             }
           } else if (statusEl) {
-            problems.push('unknown-outcome bundle renders noisy status on ' + abs);
+            problems.push('non-success/plan bundle renders noisy status on ' + abs);
           }
         } else if (row.activity_bundle) {
           // Forward-compatible unknown bundle kind: never styled as execute-run.
@@ -604,7 +821,11 @@ describe('EditChain History Explorer', () => {
     await browser.waitUntil(async () => browser.execute(() => {
       return document.querySelectorAll('.row:not(.row-placeholder)').length > 0 &&
         window.__editchainDataReady === true;
-    }), { timeout: 60000, interval: 200 });
+    }), {
+      timeout: 60000,
+      interval: 200,
+      timeoutMsg: 'raw gating wait timed out',
+    });
     const raw = await browser.execute(() => {
       const rows = Array.from(document.querySelectorAll('.row:not(.row-placeholder)'));
       const groupingSel = '.row-work-unit-start, .row-work-unit-end, .work-unit-ribbon, ' +

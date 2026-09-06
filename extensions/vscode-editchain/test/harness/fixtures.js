@@ -2,7 +2,7 @@
 //
 // These model *protocol responses* (the shapes in crates/editchain-protocol),
 // not copied DOM. The fixture bridge slices/dispatches them in response to
-// requests from media/main.js.
+// requests from the renderer bootstrap.
 //
 // Row shape (HistoryRow): op_id?, git_oid?, repository?, summary, timestamp_ms,
 //   group, node_key, parents[], is_submodule, is_system, author, commit_id, kind

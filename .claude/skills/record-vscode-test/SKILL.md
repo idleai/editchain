@@ -42,7 +42,7 @@ cd extensions/vscode-editchain
 `test/vscode/history.e2e.ts` runs three tests:
 1. Loads VS Code and asserts the workbench title contains `editchain`.
 2. Opens the history explorer webview, injects the text-only layout probe
-   (`test/harness/layoutProbe.js`), and runs textual layout checks.
+   (`test/vscode/layoutProbe.js`), and runs textual layout checks.
 3. Scrolls through the full history (953 rows with submodules hidden) and
    verifies all rows render down to the genesis ChainStart op. The scroll is
    **animated** (`smoothScrollTo` eases `scrollTop` over ~1.5s per pass) so the

@@ -129,7 +129,7 @@ function fakePanel(index, registeredCommands) {
   return panel;
 }
 
-/** Announce that one concrete main.js context has installed its listener. */
+/** Announce that one concrete webview renderer context has installed its listener. */
 async function rendererReady(panel, instanceId = 'renderer-' + panel.index) {
   await panel.handlers.message({ type: 'webviewReady', instanceId });
   await flush();
@@ -221,8 +221,8 @@ test('late Open response from a superseded panel is dropped', async () => {
   panelB.handlers.viewState({ webviewPanel: { active: true } });
   assert.equal(panelB.webview.messages.length, 2, 'retained reveal must not reset cached rows');
 
-  // A genuinely recreated main.js context announces a NEW identity after its
-  // listener exists and gets the authoritative state exactly once.
+  // A genuinely recreated webview renderer context announces a NEW identity
+  // after its listener exists and gets the authoritative state exactly once.
   await rendererReady(panelB, 'renderer-B-recreated');
   assert.deepEqual(panelB.webview.messages[2], { id: 'open', body: { Ok: { workspace: 'B' } } });
   assert.deepEqual(panelB.webview.messages[3], { id: 'ready' });

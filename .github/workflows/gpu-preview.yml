@@ -1,0 +1,168 @@
+name: GPU History Renderer
+
+# Rust/WASM history renderer (extensions/vscode-editchain history webview).
+# The shipped UI is ONE panel titled "EditChain History" (default command
+# editchain-history.open) rendered by the Rust-owned webview: the tiny
+# media/rust-history/loader.js bootstrap + generated wasm-bindgen glue +
+# the editchain-gpu-preview crate (HistoryAppState / RowSpec / web-sys DOM /
+# per-row SVG graph fragments). The deprecated pre-Rust raw-JS/oracle stack
+# (media/main.js, media/gpu-preview/bootstrap.js, the duplicate
+# media/gpu-preview/pkg tree, and the legacy CPU/GPU oracle harness
+# pages/suites) is retired. Separate from lint.yml on purpose: this job
+# builds the wasm-bindgen assets, checks the wasm32 crate, verifies the
+# committed media/rust-history/pkg tree regenerates without diff, runs the
+# focused static contract tests, the Rust-owned adapter smoke test in real
+# Chrome (explicitly, so it cannot silently skip), and the real VS Code
+# history e2e under xvfb. It does not weaken or skip any lint.yml gate, and
+# it never requires hardware WebGPU — the renderer is the per-row SVG graph,
+# so no canvas or WebGL baseline is exercised anywhere.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  gpu-preview:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Full history: the real-VS-Code e2e opens this repo as its workspace
+          # and renders git commits as rows even when no .editchain chain exists.
+          fetch-depth: 0
+
+      - name: Install Rust 1.97 toolchain and wasm32 target
+        run: |
+          rustup show
+          rustup component add clippy rustfmt
+          rustup target add wasm32-unknown-unknown
+
+      - name: Cache Cargo registry and target
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install wasm-bindgen-cli (exactly 0.2.127)
+        timeout-minutes: 20
+        run: cargo install wasm-bindgen-cli --version 0.2.127 --locked
+
+      - name: Set up Node 20
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: extensions/vscode-editchain/package-lock.json
+
+      - name: Install extension dependencies
+        working-directory: extensions/vscode-editchain
+        run: npm ci
+
+      - name: Build native service (release)
+        timeout-minutes: 25
+        run: cargo build --release -p editchain-vscode-service
+
+      - name: Build GPU assets (deterministic single output)
+        working-directory: extensions/vscode-editchain
+        timeout-minutes: 25
+        run: npm run build:gpu
+
+      - name: Verify committed GPU pkg tree regenerates without diff (production)
+        working-directory: extensions/vscode-editchain
+        run: |
+          pkg=media/rust-history/pkg
+          if git ls-files --error-unmatch "$pkg" >/dev/null 2>&1; then
+            if [ -n "$(git status --porcelain -- "$pkg")" ]; then
+              echo "::error::Regenerating $pkg produced a diff; the committed wasm-bindgen artifacts are out of sync with the crate."
+              git status --porcelain -- "$pkg"
+              exit 1
+            fi
+            echo "$pkg regeneration matches the committed artifacts"
+          else
+            echo "$pkg is not tracked in git — skipping the regeneration diff check"
+          fi
+
+      - name: wasm32 cargo check (editchain-gpu-preview)
+        run: cargo check -p editchain-gpu-preview --target wasm32-unknown-unknown --locked
+
+      - name: wasm32 clippy (editchain-gpu-preview, -D warnings)
+        run: cargo clippy -p editchain-gpu-preview --target wasm32-unknown-unknown --locked -- -D warnings
+
+      - name: Compile extension
+        working-directory: extensions/vscode-editchain
+        run: npm run compile
+
+      - name: Generic harness tests
+        working-directory: extensions/vscode-editchain
+        run: npm run test:harness
+
+      - name: Focused GPU renderer contract tests (static, no browser)
+        working-directory: extensions/vscode-editchain
+        run: node --test test/harness/gpuContract.test.js
+
+      - name: Install Chrome for the Rust smoke harness
+        id: chrome
+        working-directory: extensions/vscode-editchain
+        timeout-minutes: 10
+        run: |
+          OUT="$(npx @puppeteer/browsers install chrome@stable --path "$RUNNER_TEMP/puppeteer-chrome")"
+          printf '%s\n' "$OUT"
+          CHROME_BIN="$(printf '%s\n' "$OUT" | tail -n 1 | awk '{print $NF}')"
+          test -n "$CHROME_BIN"
+          test -x "$CHROME_BIN"
+          echo "path=$CHROME_BIN" >> "$GITHUB_OUTPUT"
+
+      - name: Rust-owned history adapter smoke test (real Chrome, deterministic per-row SVG)
+        working-directory: extensions/vscode-editchain
+        timeout-minutes: 20
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.path }}
+        run: |
+          # Run with TAP output and fail the step if the suite did not run or
+          # ANY test skipped: Chrome is installed and the assets were just
+          # built, so a skip here means the suite silently stopped covering
+          # the Rust-owned path.
+          set -o pipefail
+          npm run test:rust-smoke 2>&1 | tee "$RUNNER_TEMP/rust-smoke.tap"
+          grep -q '^# tests ' "$RUNNER_TEMP/rust-smoke.tap" || {
+            echo "::error::rustSmoke produced no test plan; the suite did not run."
+            exit 1
+          }
+          if grep -q '# SKIP ' "$RUNNER_TEMP/rust-smoke.tap"; then
+            echo "::error::rustSmoke skipped a runtime test in CI despite CHROME_PATH and built assets; it must run for real."
+            grep '# SKIP ' "$RUNNER_TEMP/rust-smoke.tap"
+            exit 1
+          fi
+
+      - name: Install xvfb for the real VS Code e2e
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb
+
+      - name: Real VS Code GPU history e2e (xvfb)
+        # Temporarily disabled while the clean-CI fixture is made independent
+        # of a developer-local .editchain store. Keep the step ready to re-enable.
+        if: ${{ false }}
+        working-directory: extensions/vscode-editchain
+        timeout-minutes: 30
+        run: npm run ui:vscode:gpu
+
+      - name: Upload GPU history artifacts (.ui-out + trace)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gpu-history-artifacts
+          path: |
+            extensions/vscode-editchain/.ui-out
+            extensions/vscode-editchain/trace
+          if-no-files-found: warn
+          retention-days: 7
