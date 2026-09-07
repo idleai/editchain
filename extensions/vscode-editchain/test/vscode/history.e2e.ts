@@ -606,7 +606,8 @@ describe('EditChain History Explorer', () => {
     console.log('[e2e] work-unit idle:', JSON.stringify(idleResult));
 
     // Deterministic, chain-agnostic invariants over REAL rows: wherever a
-    // rendered row carries work_unit / promoted / activity_bundle wire
+    // rendered row carries work_unit / session_summary / promoted /
+    // activity_bundle wire
     // metadata, the DOM layer must agree exactly (class + data attrs + count
     // text). No opaque ids are asserted — the chain's content is irrelevant,
     // only the wire-to-DOM correspondence.
@@ -634,19 +635,35 @@ describe('EditChain History Explorer', () => {
           if (row.work_unit.is_start) {
             startRows++;
             const countEl = el.querySelector('.work-unit-count');
+            const expectedCount = row.session_summary
+              ? row.session_summary.count
+              : row.work_unit.count;
             const text = countEl ? (countEl.textContent || '').trim() : '';
             const expectsCount = row.activity_kind !== 'source_control' &&
-              row.work_unit.count > 1;
+              expectedCount > 1;
             if (!!countEl !== expectsCount) {
               problems.push('work-unit count visibility mismatch on ' + abs);
             } else if (countEl && (!/^\d+/.test(text) ||
-                Number(/^\d+/.exec(text)![0]) !== row.work_unit.count ||
+                Number(/^\d+/.exec(text)![0]) !== expectedCount ||
                 !/entr(?:y|ies)$/.test(text))) {
-              problems.push('work-unit entry count text "' + text + '" != ' + row.work_unit.count + ' on ' + abs);
+              problems.push('entry count text "' + text + '" != ' + expectedCount + ' on ' + abs);
             } else if (countEl && !countEl.parentElement?.classList.contains('tags-cell')) {
               problems.push('work-unit count is outside Tags on ' + abs);
             }
           }
+        }
+        if (row.session_summary) {
+          if (!el.classList.contains('row-session-summary')) {
+            problems.push('session summary class missing on ' + abs);
+          }
+          if (el.getAttribute('data-classification') !== 'session') {
+            problems.push('session summary classification missing on ' + abs);
+          }
+          if (el.getAttribute('data-session-count') !== String(row.session_summary.count)) {
+            problems.push('session summary count attribute mismatch on ' + abs);
+          }
+        } else if (el.classList.contains('row-session-summary')) {
+          problems.push('unexpected session summary class on ' + abs);
         }
         const typedBundle = row.activity_bundle &&
           (row.activity_bundle.kind === 'work-group' ||

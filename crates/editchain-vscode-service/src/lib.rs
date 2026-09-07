@@ -29,7 +29,7 @@ use editchain_core::{
 use editchain_git::{discover_repositories, resolve_commit, walk_history, RepositoryHandle};
 use editchain_import::{hash_raw, FsBlobSink};
 use editchain_index::LexicalIndex;
-use editchain_project::activity::{ActivityRowAnnotation, WorkUnitMarker};
+use editchain_project::activity::{ActivityRowAnnotation, SessionSummaryMarker, WorkUnitMarker};
 use editchain_project::filter::ChainFilter;
 use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
@@ -38,7 +38,7 @@ use editchain_protocol::{
     GraphLayout as ProtocolGraphLayout, HistoryRow, HistoryWindow, LayoutEdge, LayoutPoint,
     LayoutRow, NodeDetails, ParentRelationDto, ParentRelationKind, RepositoryInfo, Request,
     RequestBody, ResolvedObject, Response, ResponseBody, SearchFiltersDto, SearchHit,
-    SearchResponse, SessionMetaDto, SubOpSummary, WorkUnitDto,
+    SearchResponse, SessionMetaDto, SessionSummaryDto, SubOpSummary, WorkUnitDto,
 };
 use editchain_query::search::{ScoredChunk, SearchFilters, Source};
 
@@ -1957,6 +1957,11 @@ impl Workspace {
                     chain_state: node.chain_state(),
                     turn_id: node.turn_id().map(|id| id.0.to_string()),
                     session_meta: session_meta.clone(),
+                    session_summary: snapshot
+                        .annotations
+                        .get(abs_idx)
+                        .and_then(|annotation| annotation.session_summary.as_ref())
+                        .map(session_summary_dto),
                     work_unit: snapshot
                         .annotations
                         .get(abs_idx)
@@ -2034,6 +2039,7 @@ impl Workspace {
                     chain_state: child.chain_state,
                     turn_id: child.turn_id.clone(),
                     session_meta: session_meta.clone(),
+                    session_summary: None,
                     work_unit: None,
                     promoted: child.promoted,
                     activity_bundle: child.activity_bundle.clone(),
@@ -2876,6 +2882,14 @@ fn work_unit_dto(marker: &WorkUnitMarker) -> WorkUnitDto {
         is_start: marker.is_start,
         is_end: marker.is_end,
         title: marker.title.clone(),
+        count: marker.count,
+    }
+}
+
+/// Convert a row's whole-session marker into the additive wire DTO.
+#[must_use]
+const fn session_summary_dto(marker: &SessionSummaryMarker) -> SessionSummaryDto {
+    SessionSummaryDto {
         count: marker.count,
     }
 }
@@ -4243,7 +4257,9 @@ mod tests {
         // the service must preserve their provider-neutral kinds.
         let trunk = import_op(1, 1, false);
         let spawn_marker = message_op(1, 3, trunk.id);
-        let sub_first = import_op(2, 1, false);
+        let sub_meta = import_op(2, 1, true);
+        let mut sub_first = import_op(2, 2, false);
+        sub_first.parents = ParentSet::One(sub_meta.id);
         let sub_last = message_op(2, 5, sub_first.id);
         let completion = message_op(1, 7, spawn_marker.id);
         let branch_first = import_op(3, 1, false);
@@ -4251,13 +4267,14 @@ mod tests {
         let ops = vec![
             trunk.clone(),
             spawn_marker.clone(),
+            sub_meta.clone(),
             sub_first.clone(),
             sub_last.clone(),
             completion.clone(),
             branch_first.clone(),
             structural_note(
                 OpId::new(NodeId(1), 0, 0xFFFC),
-                sub_first.id,
+                sub_meta.id,
                 vec![spawn_marker.id],
                 editchain_core::NoteRelationship::SpawnedBy,
                 2,
@@ -4291,7 +4308,8 @@ mod tests {
             include_layout: true,
         });
 
-        // SpawnedBy: the subagent thread's first op carries a "subagent"
+        // SpawnedBy: the exact anchor is bundled session metadata, matching a
+        // Codex child rollout. Its first surviving row carries the "subagent"
         // relation to the CANONICAL spawn anchor. The raw target (the folded
         // spawn marker op) resolves through the representative map to the
         // trunk's visible import row, which is the parent the row actually

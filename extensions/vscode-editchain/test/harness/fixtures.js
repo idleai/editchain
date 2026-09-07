@@ -823,9 +823,10 @@
       };
     },
 
-    // Round-two Activity-view wire contract: deterministic work-unit markers
-    // (`work_unit`), conservative promotion (`promoted`), and typed Activity
-    // bundles (`activity_bundle`) modelled as the SERVICE's projection output
+    // Activity-view wire contract: deterministic work-unit markers
+    // (`work_unit`), independent whole-session markers (`session_summary`),
+    // conservative promotion (`promoted`), and typed Activity bundles
+    // (`activity_bundle`) modelled as the SERVICE's projection output
     // (crates/editchain-project/src/activity.rs + editchain-vscode-service),
     // newest first in each list:
     //
@@ -1029,6 +1030,8 @@
         const last = new Map();
         const counts = new Map();
         const titles = new Map();
+        const sessionFirst = new Map();
+        const sessionCounts = new Map();
         rows.forEach((r, i) => {
           const id = unitId(r);
           if (!first.has(id)) first.set(id, i);
@@ -1038,6 +1041,10 @@
           // initiating request); the last narrative encountered in
           // newest-first order wins, exactly like annotate_activity_rows.
           if (r.record_role === 'narrative') titles.set(id, r.summary);
+          if (r.group.startsWith('session:')) {
+            if (!sessionFirst.has(r.group)) sessionFirst.set(r.group, i);
+            sessionCounts.set(r.group, (sessionCounts.get(r.group) || 0) + 1);
+          }
         });
         return rows.map((r, i) => {
           const id = unitId(r);
@@ -1049,6 +1056,9 @@
             count: counts.get(id),
           };
           r.work_unit = marker;
+          r.session_summary = r.group.startsWith('session:') && sessionFirst.get(r.group) === i
+            ? { count: sessionCounts.get(r.group) }
+            : null;
           if (!r.record_role) r.record_role = 'narrative';
           return r;
         });
@@ -1089,6 +1099,7 @@
       // None on every ordinary row, never a missing property).
       const finalize = (rows) => rows.map((r) => {
         if (r.work_unit === undefined) r.work_unit = null;
+        if (r.session_summary === undefined) r.session_summary = null;
         if (r.promoted === undefined) r.promoted = false;
         if (r.activity_bundle === undefined) r.activity_bundle = null;
         return r;

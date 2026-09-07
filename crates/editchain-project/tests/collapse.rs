@@ -1011,6 +1011,97 @@ fn bundled_spawned_meta_does_not_leak_its_git_parent_onto_the_visible_anchor() {
 }
 
 #[test]
+fn bundled_structural_metadata_keeps_relation_on_first_visible_child() {
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let spawn = import_op(1, 1);
+    let spawn_tool = tool_op(1, 2, spawn.id, "spawnAgent");
+    let child_meta = meta_import_op(2, 1);
+    let mut child_start = import_op(2, 2);
+    child_start.parents = ParentSet::One(child_meta.id);
+    let spawned_by = relation_fact(702, child_meta.id, spawn.id, NoteRelationship::SpawnedBy);
+    let projection = HistoryProjection::from_ops_with(
+        vec![
+            spawn.clone(),
+            spawn_tool,
+            child_meta.clone(),
+            child_start.clone(),
+            spawned_by,
+        ],
+        opts,
+    );
+    let nodes = projection.nodes();
+    assert_eq!(nodes.len(), 2, "session metadata remains bundled");
+
+    let spawn_row = nodes
+        .iter()
+        .find(|node| node.node_key() == spawn.id.to_string())
+        .expect("spawn row");
+    assert!(spawn_row.sub_ops().iter().any(|op| op.id == child_meta.id));
+
+    let child_row = nodes
+        .iter()
+        .find(|node| node.node_key() == child_start.id.to_string())
+        .expect("first visible child row");
+    let parents = projection.lifted_parent_keys(child_row);
+    assert_eq!(parents, vec![spawn.id.to_string()]);
+    assert_eq!(
+        projection.parent_relations_for(child_row, &parents),
+        vec![editchain_project::ParentRelation {
+            parent: spawn.id.to_string(),
+            kind: editchain_project::RelationKind::Subagent,
+        }],
+        "the bundled metadata anchor must not erase the subagent relation kind"
+    );
+
+    let canonical_notes = projection.relationship_notes();
+    assert!(canonical_notes.get(&spawn.id).is_some_and(|notes| {
+        notes.iter().any(|note| {
+            matches!(&note.kind, OpKind::Note(fact)
+                if fact.relationship == NoteRelationship::SpawnedBy)
+        })
+    }));
+    assert!(canonical_notes.get(&child_start.id).is_some_and(|notes| {
+        notes.iter().any(|note| {
+            matches!(&note.kind, OpKind::Note(fact)
+                if fact.relationship == NoteRelationship::SpawnedBy)
+        })
+    }));
+}
+
+#[test]
+fn bundled_structural_metadata_does_not_guess_between_visible_children() {
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let spawn = import_op(1, 1);
+    let child_meta = meta_import_op(2, 1);
+    let mut first = import_op(2, 2);
+    first.parents = ParentSet::One(child_meta.id);
+    let mut second = import_op(3, 2);
+    second.parents = ParentSet::One(child_meta.id);
+    let spawned_by = relation_fact(703, child_meta.id, spawn.id, NoteRelationship::SpawnedBy);
+    let projection = HistoryProjection::from_ops_with(
+        vec![spawn, child_meta, first.clone(), second.clone(), spawned_by],
+        opts,
+    );
+
+    for child in [first, second] {
+        let row = projection
+            .nodes()
+            .into_iter()
+            .find(|node| node.node_key() == child.id.to_string())
+            .expect("visible child row");
+        let parents = projection.lifted_parent_keys(&row);
+        assert!(
+            projection.parent_relations_for(&row, &parents).is_empty(),
+            "an ambiguous successor must not receive an inferred relation"
+        );
+    }
+}
+
+#[test]
 fn exact_spawn_parent_suppresses_only_the_inherited_git_graph_edge() {
     let spawn = import_op(1, 1);
     let child = import_op(2, 1);

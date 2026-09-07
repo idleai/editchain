@@ -1219,7 +1219,7 @@ body {
 /* Keep the significant session summary visibly distinct with the same subtle
    theme tint rows previously received on hover. Ordinary rows intentionally
    have no hover background while this treatment is in effect. */
-.row.row-work-unit-start[data-classification='session'] {
+.row.row-session-summary {
   background-color: var(--vscode-list-hoverBackground, var(--ec-surface-raised));
 }
 

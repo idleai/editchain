@@ -1885,6 +1885,72 @@ fn work_unit_markers_are_stable_across_turns_and_paging() {
     }
     assert!(annotations[3].work_unit.is_start);
     assert!(annotations[6].work_unit.is_end);
+    assert_eq!(
+        annotations[0]
+            .session_summary
+            .as_ref()
+            .map(|summary| summary.count),
+        Some(7),
+        "the newest row summarizes the complete session across both turns"
+    );
+    assert!(
+        annotations
+            .iter()
+            .skip(1)
+            .all(|annotation| annotation.session_summary.is_none()),
+        "one session group has exactly one summary marker"
+    );
+}
+
+#[test]
+fn session_summary_does_not_follow_an_interior_session_scoped_work_unit() {
+    // Codex mixes turn-scoped chat/work rows with session-scoped lifecycle
+    // rows. The latter form their own work unit, but must not become the
+    // session summary when a newer turn row exists.
+    let newest = manual_collapsed(
+        import_op(31, 3, None, None),
+        ActivityKind::Conversation,
+        RecordRole::Narrative,
+        Outcome::Unknown,
+        Some(TurnId(2)),
+        "final response",
+        "message",
+    );
+    let lifecycle = manual_collapsed(
+        import_op(32, 2, None, None),
+        ActivityKind::System,
+        RecordRole::Lifecycle,
+        Outcome::Unknown,
+        None,
+        "task_complete",
+        "import",
+    );
+    let oldest = manual_collapsed(
+        import_op(33, 1, None, None),
+        ActivityKind::Conversation,
+        RecordRole::Narrative,
+        Outcome::Unknown,
+        Some(TurnId(1)),
+        "initial request",
+        "message",
+    );
+
+    let annotations = annotate_activity_rows(&[newest, lifecycle, oldest]);
+    assert_eq!(annotations.len(), 3);
+    assert_eq!(
+        annotations[0]
+            .session_summary
+            .as_ref()
+            .map(|summary| summary.count),
+        Some(3)
+    );
+    assert_eq!(annotations[1].work_unit.id, "session:10");
+    assert!(annotations[1].work_unit.is_start);
+    assert!(
+        annotations[1].session_summary.is_none(),
+        "an interior session-scoped unit is not a whole-session boundary"
+    );
+    assert!(annotations[2].session_summary.is_none());
 }
 
 #[test]

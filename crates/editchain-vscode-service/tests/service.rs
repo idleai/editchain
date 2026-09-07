@@ -2121,7 +2121,7 @@ fn cancelled_branch_rows_ship_muted_node_and_child_owned_edge_geometry() {
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_thirty_two() {
+fn prepared_snapshot_manifest_records_projection_revision_thirty_five() {
     // Stale snapshots from earlier projection revisions (pre-hide_trace,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
@@ -2147,7 +2147,7 @@ fn prepared_snapshot_manifest_records_projection_revision_thirty_two() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 32u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 35u64);
 }
 
 #[test]
@@ -2398,12 +2398,37 @@ fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() 
     assert_eq!(raw_value["work_unit"]["id"], "session:1/turn:1");
     assert_eq!(raw_value["work_unit"]["count"], 5u64);
     assert_eq!(raw_value["work_unit"]["is_start"], true);
+    assert_eq!(raw_value["session_summary"]["count"], 5u64);
     assert_eq!(raw_value["promoted"], true);
+    assert_eq!(
+        raw_window
+            .rows
+            .iter()
+            .filter(|row| row.session_summary.is_some())
+            .count(),
+        1,
+        "one true session endpoint carries the raw-view summary marker"
+    );
 
     // Activity view: chat / outer work / chat. Opening work reveals the
     // existing execute bundle; opening that reveals its three original tools.
     assert_eq!(activity_window.total, 7);
     assert_eq!(activity_window.rows.len(), 7);
+    let session_summary = activity_window
+        .rows
+        .iter()
+        .find_map(|row| row.session_summary.as_ref().map(|summary| (row, summary)))
+        .expect("activity view has one session summary marker");
+    assert!(!session_summary.0.is_subop);
+    assert_eq!(session_summary.1.count, 3);
+    assert_eq!(
+        activity_window
+            .rows
+            .iter()
+            .filter(|row| row.session_summary.is_some())
+            .count(),
+        1
+    );
     let work_group = activity_window
         .rows
         .iter()
@@ -2654,7 +2679,7 @@ fn activity_view_groups_repeated_plans_as_expandable_linear_updates() {
 }
 
 #[test]
-fn prepared_snapshot_serves_nested_activity_view_and_records_revision_thirty_two() {
+fn prepared_snapshot_serves_nested_activity_view_and_records_revision_thirty_five() {
     // The pregenerated render snapshot must serve the SAME bundled Activity
     // rows as the live projection (work-unit/promotion/bundling parity) and
     // record the bumped projection revision in its identity.
@@ -2710,7 +2735,7 @@ fn prepared_snapshot_serves_nested_activity_view_and_records_revision_thirty_two
         &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["identity"]["projection_revision"], 32u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 35u64);
 
     let mut cached =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");

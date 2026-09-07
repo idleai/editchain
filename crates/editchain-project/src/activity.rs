@@ -7,12 +7,14 @@
 //!   ([`inline_context_compaction_checkpoints`]): a raw Codex context-compaction
 //!   row remains visible but is inserted into its source stream's existing
 //!   path when legacy/imported topology stored it beside the continuation.
-//! - **Work-unit markers** ([`annotate_activity_rows`]): every row carries an
-//!   opaque unit id plus view-stable `is_start`/`is_end`/`count`/`title`, so a
-//!   client renders unit boundaries without inferring across paged windows.
-//!   Units are logical and view-wide: every row sharing an id forms one unit
-//!   even when other units' rows interleave, so interleaved chains never
-//!   fragment into per-segment boundary noise.
+//! - **Work-unit and session-summary markers** ([`annotate_activity_rows`]):
+//!   every row carries an opaque unit id plus view-stable
+//!   `is_start`/`is_end`/`count`/`title`, while the newest visible row of each
+//!   session independently carries its whole-session row count. Units are
+//!   logical and view-wide: every row sharing an id forms one unit even when
+//!   other units' rows interleave, so interleaved chains never fragment into
+//!   per-segment boundary noise. Session summaries remain session-wide even
+//!   when a provider mixes turn-scoped and session-scoped rows.
 //! - **Conservative promotion** ([`ActivityRowAnnotation::promoted`]):
 //!   negative-outcome rows, change/verify rows, and each unit's deterministically
 //!   known newest narrative row are flagged as significant; promoted rows are
@@ -187,6 +189,20 @@ pub struct WorkUnitMarker {
     pub count: u64,
 }
 
+/// Session-wide summary metadata attached only to a session's newest visible
+/// row in display order.
+///
+/// This is deliberately independent of [`WorkUnitMarker`]. Codex sessions mix
+/// turn-scoped rows (`session:…/turn:…`) with session-scoped lifecycle rows
+/// (`session:…`), while legacy Claude sessions commonly use only the latter.
+/// Treating the first session-scoped work unit as the whole-session boundary
+/// therefore places the summary in the middle of Codex sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummaryMarker {
+    /// Total top-level rows in this session for the current view.
+    pub count: u64,
+}
+
 /// Per-row Activity-view annotation, parallel to the annotated node list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivityRowAnnotation {
@@ -194,6 +210,8 @@ pub struct ActivityRowAnnotation {
     pub promoted: bool,
     /// Work-unit metadata for this row's unit.
     pub work_unit: WorkUnitMarker,
+    /// Whole-session summary metadata on exactly one row per session group.
+    pub session_summary: Option<SessionSummaryMarker>,
 }
 
 /// Annotate every row with its deterministic work-unit marker and promotion
@@ -203,10 +221,12 @@ pub struct ActivityRowAnnotation {
 /// interleaved rows are only annotated, never reordered or gathered. Each id
 /// yields exactly one `is_start` (first display-order occurrence), one
 /// `is_end` (last display-order occurrence), and a `count` of every top-level
-/// row with that id in the full view. The result parallels `nodes` 1:1 and is
-/// deterministic for a given node list (the caller supplies the exact
-/// filtered/bundled list it will render, so boundaries, counts, and titles
-/// never depend on window size or scroll position).
+/// row with that id in the full view. Independently, each `session:` group
+/// yields one [`SessionSummaryMarker`] on its first display-order occurrence,
+/// counting every row in that session regardless of work-unit id. The result
+/// parallels `nodes` 1:1 and is deterministic for a given node list (the
+/// caller supplies the exact filtered/bundled list it will render, so
+/// boundaries and counts never depend on window size or scroll position).
 #[must_use]
 #[expect(
     clippy::indexing_slicing,
@@ -223,7 +243,15 @@ pub fn annotate_activity_rows(nodes: &[HistoryNode]) -> Vec<ActivityRowAnnotatio
         final_narrative: Option<usize>,
     }
     let ids: Vec<String> = nodes.iter().map(unit_id).collect();
+    let session_groups: Vec<Option<String>> = nodes
+        .iter()
+        .map(|node| {
+            let group = node.group();
+            group.starts_with("session:").then_some(group)
+        })
+        .collect();
     let mut units: HashMap<&str, UnitAgg> = HashMap::with_capacity(ids.len());
+    let mut sessions: HashMap<&str, (usize, u64)> = HashMap::new();
     for (index, id) in ids.iter().enumerate() {
         let unit = units.entry(id.as_str()).or_insert_with(|| UnitAgg {
             first: index,
@@ -246,6 +274,10 @@ pub fn annotate_activity_rows(nodes: &[HistoryNode]) -> Vec<ActivityRowAnnotatio
             // the last encounter wins for the same reason.
             unit.title = Some(nodes[index].summary());
         }
+        if let Some(group) = session_groups.get(index).and_then(Option::as_deref) {
+            let session = sessions.entry(group).or_insert((index, 0));
+            session.1 = session.1.saturating_add(1);
+        }
     }
     let mut out = Vec::with_capacity(nodes.len());
     for (index, id) in ids.iter().enumerate() {
@@ -259,6 +291,13 @@ pub fn annotate_activity_rows(nodes: &[HistoryNode]) -> Vec<ActivityRowAnnotatio
                 title: unit.title.clone(),
                 count: unit.count,
             },
+            session_summary: session_groups
+                .get(index)
+                .and_then(Option::as_deref)
+                .and_then(|group| sessions.get(group))
+                .and_then(|(first, count)| {
+                    (*first == index).then_some(SessionSummaryMarker { count: *count })
+                }),
         });
     }
     out

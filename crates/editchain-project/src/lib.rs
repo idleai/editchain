@@ -795,9 +795,12 @@ struct CollapsedProjection {
     /// Structural relationship notes re-keyed for edge drawing: keyed by the
     /// CANONICAL visible anchor (the representative of the note's stored causal
     /// parent), so a note whose anchor was folded into a bundle is still reachable
-    /// from the visible row that represents it. Provider entity targets are
-    /// resolved first to a unique same-source occurrence (or one globally unique
-    /// exact-equivalence class); ambiguous targets are removed. Every
+    /// from the visible row that represents it. A metadata anchor folded into
+    /// its own structural target is also indexed on its unique visible causal
+    /// successor, preserving the relation kind on that branch row. Provider
+    /// entity targets are resolved first to a unique same-source occurrence (or
+    /// one globally unique exact-equivalence class); ambiguous targets are
+    /// removed. Every
     /// edge-construction path then lifts folded physical targets through
     /// `representative` via [`canonicalize_parents`], so a virtual edge never
     /// reaches lane allocation or windowed edge geometry with a phantom key.
@@ -883,11 +886,13 @@ impl HistoryProjection {
         projection
     }
 
-    /// Returns the structural relationship notes re-keyed for edge drawing: keyed
-    /// by the CANONICAL visible anchor (the representative of the note's stored
-    /// causal parent). Provider entity targets have been resolved to an
-    /// unambiguous physical occurrence; direct physical targets remain stored as
-    /// supplied. Used by [`HistoryNode::parent_keys`] so virtual
+    /// Returns the structural relationship notes re-keyed for edge drawing:
+    /// keyed by the CANONICAL visible anchor (the representative of the note's
+    /// stored causal parent), plus a unique visible successor when metadata
+    /// contraction would otherwise collapse a structural relation into its own
+    /// target. Provider entity targets have been resolved to an unambiguous
+    /// physical occurrence; direct physical targets remain stored as supplied.
+    /// Used by [`HistoryNode::parent_keys`] so virtual
     /// fork/subagent/reconnect edges are reachable from rendered rows even when
     /// their source ops were folded into a collapsed bundle; targets are lifted
     /// to visible rows (or dropped) by every layout/filter/order path through the
@@ -1466,6 +1471,7 @@ impl HistoryProjection {
             &representative,
             &present,
             &duplicate_event_occurrences,
+            &self.ops,
         );
 
         // Semantic-collapse invariant, checked once per collapse: every ordinary
@@ -1682,9 +1688,13 @@ impl HistoryProjection {
     /// anchored on a Tool op folded into its import, or a `SubagentOf` anchored on
     /// a subagent's first message). This re-keys every note by the canonical
     /// visible anchor (the representative of its stored parent), so the virtual
-    /// edge is reachable from the row that represents the note's anchor. The
-    /// provider entity targets have already been resolved to an unambiguous
-    /// physical occurrence; direct physical targets stay unchanged. A copied
+    /// edge is reachable from the row that represents the note's anchor. When a
+    /// metadata anchor contracts into its own structural target, the note is
+    /// additionally indexed on its unique first visible causal successor. That
+    /// keeps the exact relation kind on the surviving branch-start row while the
+    /// metadata remains bundled with its target. The provider entity targets
+    /// have already been resolved to an unambiguous physical occurrence; direct
+    /// physical targets stay unchanged. A copied
     /// occurrence suppressed by exact-equivalence contraction cannot contribute
     /// its `ProviderParent` edge to the surviving occurrence: doing so would
     /// union the incoming ancestry of separate physical transcripts and turn a
@@ -1698,8 +1708,10 @@ impl HistoryProjection {
         representative: &HashMap<OpId, OpId>,
         present: &std::collections::HashSet<String>,
         duplicate_event_occurrences: &std::collections::HashSet<OpId>,
+        ops: &[Op],
     ) -> HashMap<OpId, Vec<Op>> {
         let mut out: HashMap<OpId, Vec<Op>> = HashMap::new();
+        let mut causal_children: Option<HashMap<OpId, Vec<OpId>>> = None;
         for (stored_anchor, notes) in relationship_notes {
             let Some(anchor) = canonical_op_id(*stored_anchor, representative, present) else {
                 continue;
@@ -1722,7 +1734,28 @@ impl HistoryProjection {
                     editchain_core::OpKind::Note(fact)
                         if fact.relationship == NoteRelationship::Contains
                 ) {
-                    out.entry(anchor).or_default().push(note);
+                    out.entry(anchor).or_default().push(note.clone());
+                    let successor = if protected_relation_targets_anchor(
+                        &note,
+                        anchor,
+                        representative,
+                        present,
+                    ) {
+                        let children =
+                            causal_children.get_or_insert_with(|| causal_children_by_parent(ops));
+                        unique_visible_successor(
+                            *stored_anchor,
+                            anchor,
+                            children,
+                            representative,
+                            present,
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(successor) = successor.filter(|successor| *successor != anchor) {
+                        out.entry(successor).or_default().push(note);
+                    }
                 }
             }
         }
@@ -2624,6 +2657,76 @@ fn canonical_parent_key(
     }
     let pid = OpId::from_display_str(parent)?;
     canonical_op_id(pid, representative, present).map(|id| id.to_string())
+}
+
+/// Index ordinary causal children without treating relationship facts as
+/// transcript continuations.
+fn causal_children_by_parent(ops: &[Op]) -> HashMap<OpId, Vec<OpId>> {
+    let mut children: HashMap<OpId, Vec<OpId>> = HashMap::new();
+    for op in ops.iter().filter(|op| !is_hidden_relation_fact(op)) {
+        for parent in &op.parents {
+            children.entry(*parent).or_default().push(op.id);
+        }
+    }
+    children
+}
+
+/// Whether an exact structural note would collapse into a self-edge at
+/// `anchor` after canonical endpoint lifting.
+fn protected_relation_targets_anchor(
+    note: &Op,
+    anchor: OpId,
+    representative: &HashMap<OpId, OpId>,
+    present: &std::collections::HashSet<String>,
+) -> bool {
+    let editchain_core::OpKind::Note(fact) = &note.kind else {
+        return false;
+    };
+    is_protected_structural_relationship(fact.relationship)
+        && fact
+            .target_ids
+            .iter()
+            .any(|target| canonical_op_id(*target, representative, present) == Some(anchor))
+}
+
+/// Find one unambiguous visible row immediately downstream of a folded anchor.
+///
+/// Traversal may cross operations represented by `collapsed_anchor`, but stops
+/// at the first distinct visible representative on every path. More than one
+/// such row is ambiguous and deliberately produces no structural redirect.
+fn unique_visible_successor(
+    stored_anchor: OpId,
+    collapsed_anchor: OpId,
+    causal_children: &HashMap<OpId, Vec<OpId>>,
+    representative: &HashMap<OpId, OpId>,
+    present: &std::collections::HashSet<String>,
+) -> Option<OpId> {
+    let mut pending = vec![stored_anchor];
+    let mut visited = std::collections::HashSet::from([stored_anchor]);
+    let mut candidates = std::collections::BTreeSet::new();
+    while let Some(parent) = pending.pop() {
+        let Some(children) = causal_children.get(&parent) else {
+            continue;
+        };
+        for child in children {
+            if !visited.insert(*child) {
+                continue;
+            }
+            let child_is_visible = present.contains(&child.to_string());
+            match canonical_op_id(*child, representative, present) {
+                Some(candidate) if candidate != collapsed_anchor => {
+                    let _: bool = candidates.insert(candidate);
+                    if candidates.len() > 1 {
+                        return None;
+                    }
+                }
+                Some(_) if !child_is_visible => pending.push(*child),
+                None => pending.push(*child),
+                Some(_) => {}
+            }
+        }
+    }
+    candidates.into_iter().next()
 }
 
 /// Chase an `OpId` through the representative map until it reaches a visible row.

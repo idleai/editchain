@@ -103,7 +103,21 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 ///
 /// Revision 31 adds semantic muted-chain state and child-owned muted graph
 /// segment masks for cancelled request branches.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 32;
+///
+/// Revision 32 recognizes current Codex `spawnAgent` relations and suppresses
+/// redundant inherited Git parents on their child branches.
+///
+/// Revision 33 preserves structural relation kinds when a metadata anchor is
+/// bundled into its own target, so the first visible child keeps its subagent
+/// tag.
+///
+/// Revision 34 marks the true newest row of every session independently of
+/// turn work-unit boundaries and carries its whole-session entry count.
+///
+/// Revision 35 routes session-to-Git base references through shared,
+/// interval-colored spines so many sessions based on one commit do not retain
+/// one empty graph lane apiece until that commit row.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 35;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

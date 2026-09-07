@@ -158,7 +158,7 @@
   }
 
   // Mirror the HistoryRow serde defaults for the additive activity fields
-  // (work_unit -> None, promoted -> false, activity_bundle -> None — see
+  // (work_unit/session_summary/activity_bundle -> None, promoted -> false — see
   // crates/editchain-protocol) and the ActivityBundleKind enum round trip:
   // the typed work/execute/plan bundle strings survive; every other
   // kind maps to the protocol's forward-compatible Unknown variant
@@ -169,6 +169,7 @@
   function normalizeActivityFields(row) {
     const out = { ...row };
     if (!Object.prototype.hasOwnProperty.call(out, 'work_unit')) out.work_unit = null;
+    if (!Object.prototype.hasOwnProperty.call(out, 'session_summary')) out.session_summary = null;
     if (!Object.prototype.hasOwnProperty.call(out, 'promoted')) out.promoted = false;
     if (!Object.prototype.hasOwnProperty.call(out, 'activity_bundle')) out.activity_bundle = null;
     if (!Object.prototype.hasOwnProperty.call(out, 'group_end')) out.group_end = false;
@@ -235,6 +236,7 @@
           // carry no work-unit, no promotion, and no bundle metadata of their
           // own (exactly like the service's expanded member rows).
           work_unit: null,
+          session_summary: null,
           promoted: false,
           activity_bundle: null,
         });

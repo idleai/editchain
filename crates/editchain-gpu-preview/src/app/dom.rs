@@ -2069,6 +2069,13 @@ mod web {
         if let Some(header) = &spec.work_unit_header {
             row.set_attribute("data-work-unit-id", &header.id)?;
         }
+        if let Some(count) = spec
+            .session_summary
+            .as_ref()
+            .and_then(|summary| summary.count)
+        {
+            row.set_attribute("data-session-count", &count.to_string())?;
+        }
         if let Some(bundle) = &spec.bundle {
             row.set_attribute("data-activity-bundle", bundle.kind.as_str())?;
             if let Some(count) = bundle.member_count {

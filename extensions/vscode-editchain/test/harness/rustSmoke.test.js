@@ -478,6 +478,7 @@ test('Tags owns every chip while Content keeps regular prefix-free prose',
         const activityChip = document.querySelector('.bundle-count');
         const agentChip = document.querySelector('.session-chip-agent');
         const workUnitChip = document.querySelector('.work-unit-count');
+        const sessionRow = document.querySelector('.row-session-summary');
         const chipSelector = [
           '.git-prefix-chip', '.bundle-count', '.bundle-status',
           '.session-chip', '.rel-badge', '.out-badge', '.work-unit-count',
@@ -514,6 +515,13 @@ test('Tags owns every chip while Content keeps regular prefix-free prose',
             '.text-cell :is(' + chipSelector + ')').length,
           maxTagsPerRow: Math.max(0, ...rows.map((row) =>
             row.querySelector('.tags-cell')?.children.length || 0)),
+          sessionSummary: sessionRow ? {
+            classification: sessionRow.getAttribute('data-classification'),
+            sessionCount: sessionRow.getAttribute('data-session-count'),
+            workUnitId: sessionRow.getAttribute('data-work-unit-id'),
+            activity: (sessionRow.querySelector('.activity-label')?.textContent || '').trim(),
+            countChip: (sessionRow.querySelector('.work-unit-count')?.textContent || '').trim(),
+          } : null,
         };
       });
 
@@ -534,6 +542,13 @@ test('Tags owns every chip while Content keeps regular prefix-free prose',
       assert.equal(presentation.misplacedChips, 0, 'every chip is a direct Tags-cell child');
       assert.equal(presentation.contentChipCount, 0, 'Content contains no chips');
       assert.ok(presentation.maxTagsPerRow > 1, 'one row can render multiple tags');
+      assert.deepEqual(presentation.sessionSummary, {
+        classification: 'session',
+        sessionCount: '11',
+        workUnitId: 'session:s1/turn:t1',
+        activity: 'session',
+        countChip: '11 entries',
+      }, 'whole-session presentation overrides the count without replacing the turn unit');
       assertNoErrors(errors, 'content and chip presentation');
     } finally {
       await page.close();

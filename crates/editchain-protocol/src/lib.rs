@@ -534,6 +534,14 @@ pub struct HistoryRow {
     /// optional because older providers and older imports may omit either one.
     #[serde(default)]
     pub session_meta: Option<SessionMetaDto>,
+    /// Whole-session summary metadata on the session's newest visible row.
+    ///
+    /// This is independent of [`Self::work_unit`]: providers such as Codex mix
+    /// turn-scoped and session-scoped rows, so a work-unit boundary is not
+    /// necessarily a boundary for the complete session. `None` on every other
+    /// row and on services that predate this additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_summary: Option<SessionSummaryDto>,
     /// Stable, additive work-unit metadata for boundary/header rendering.
     ///
     /// Every row in a window carries its opaque work-unit id plus view-stable
@@ -581,6 +589,17 @@ pub struct SessionMetaDto {
     /// Human-friendly agent nickname, when the provider assigned one.
     #[serde(default)]
     pub agent_nickname: Option<String>,
+}
+
+/// View-wide metadata attached to the true newest row of one session group.
+///
+/// Presence identifies the significant session-summary row without asking the
+/// client to infer it from provider-specific scope or adjacent paged rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummaryDto {
+    /// Total top-level rows in this session for the current projected view.
+    #[serde(default)]
+    pub count: u64,
 }
 
 /// Stable metadata for the work unit one history row belongs to.
@@ -1005,6 +1024,7 @@ mod tests {
             chain_state: editchain_project::taxonomy::ChainState::Active,
             turn_id: Some(OVER_2_53.to_string()),
             session_meta: None,
+            session_summary: None,
             work_unit: None,
             promoted: false,
             activity_bundle: None,
@@ -1556,6 +1576,7 @@ mod tests {
         assert!(!legacy.group_end);
         assert_eq!(legacy.work_unit, None);
         assert_eq!(legacy.session_meta, None);
+        assert_eq!(legacy.session_summary, None);
         assert!(!legacy.promoted);
         assert_eq!(legacy.activity_bundle, None);
 
@@ -1599,6 +1620,7 @@ mod tests {
                 model_provider: Some("sglang_dsv4".to_string()),
                 agent_nickname: Some("Harvey".to_string()),
             }),
+            session_summary: Some(SessionSummaryDto { count: 87 }),
             work_unit: Some(WorkUnitDto {
                 id: format!("session:1/turn:{OVER_2_53}"),
                 is_start: true,
@@ -1625,6 +1647,7 @@ mod tests {
         assert_eq!(json["session_meta"]["model_provider"], "sglang_dsv4");
         assert_eq!(json["session_meta"]["agent_nickname"], "Harvey");
         assert_eq!(json["session_meta"]["session_title"], "r8");
+        assert_eq!(json["session_summary"]["count"], 87u64);
         assert_eq!(json["activity_bundle"]["kind"], "execute-run");
         assert_eq!(json["activity_bundle"]["member_count"], 3u64);
         assert_eq!(json["chain_state"], "muted");
@@ -1638,6 +1661,7 @@ mod tests {
             .as_ref()
             .is_some_and(|w| w.is_start && !w.is_end));
         assert!(back.promoted);
+        assert_eq!(back.session_summary, Some(SessionSummaryDto { count: 87 }));
         assert_eq!(
             back.chain_state,
             editchain_project::taxonomy::ChainState::Muted

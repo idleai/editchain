@@ -2163,7 +2163,7 @@ impl RowClassification {
     fn session_summary() -> RowClassification {
         RowClassification {
             label: "session".to_owned(),
-            source: "work_unit".to_owned(),
+            source: "session_summary".to_owned(),
             title: "Session summary".to_owned(),
         }
     }
@@ -2335,6 +2335,13 @@ pub(crate) struct WorkUnitData {
     pub(crate) is_end: bool,
 }
 
+/// The additive `session_summary` payload present on one Activity row per
+/// session group.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct SessionSummaryData {
+    pub(crate) count: Option<u64>,
+}
+
 /// Compact two-line header metadata for a work-unit start row.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct WorkUnitHeader {
@@ -2387,19 +2394,19 @@ pub(crate) fn work_unit_of(row: &Value, view: ViewMode) -> Option<WorkUnitData> 
     })
 }
 
-/// Whether this row is the display-order boundary for a whole session.
-///
-/// A turn-scoped unit has an id such as `session:s1/turn:t1`, while legacy
-/// Claude sessions without turn ids use the session group itself as their
-/// unit id. Only the latter acts as the significant session summary row.
-#[must_use]
-fn is_session_summary_row(row: &Value, view: ViewMode, work_unit: Option<&WorkUnitData>) -> bool {
+/// Read the explicit whole-session marker emitted on the session's true newest
+/// visible row. Work-unit identity is intentionally irrelevant: Codex mixes
+/// turn-scoped rows with session-scoped lifecycle rows.
+pub(crate) fn session_summary_of(row: &Value, view: ViewMode) -> Option<SessionSummaryData> {
     if view != ViewMode::Activity || wire::bool(row, "is_subop") {
-        return false;
+        return None;
     }
-    let group = row_str(row, "group");
-    group.starts_with("session:")
-        && work_unit.is_some_and(|unit| unit.is_start && unit.id.as_str() == group)
+    let summary = row
+        .get("session_summary")
+        .filter(|value| js_truthy(value))?;
+    Some(SessionSummaryData {
+        count: summary.get("count").and_then(Value::as_u64),
+    })
 }
 
 /// `workUnitTitle` — DTO title's first meaningful line, else human fallbacks.
@@ -2441,6 +2448,11 @@ pub(crate) fn show_work_unit_count(row: &Value, wu: &WorkUnitData) -> bool {
 /// `workUnitCountTitle` — tooltip explaining what the count measures.
 pub(crate) fn work_unit_count_title(count: u64) -> String {
     format!("{} grouped in this activity", work_unit_count_text(count))
+}
+
+/// Tooltip for the whole-session count shown on a session-summary row.
+pub(crate) fn session_summary_count_title(count: u64) -> String {
+    format!("{} in this session", work_unit_count_text(count))
 }
 
 /// One session-provenance chip (`sessionMetaValues` item).
@@ -2806,6 +2818,7 @@ pub(crate) struct RowSpec {
     pub(crate) tags: Vec<ChromeItem>,
     pub(crate) session_description: String,
     pub(crate) work_unit: Option<WorkUnitData>,
+    pub(crate) session_summary: Option<SessionSummaryData>,
     pub(crate) work_unit_header: Option<WorkUnitHeader>,
     pub(crate) bundle: Option<BundleInfo>,
     pub(crate) promoted: Option<PromotedKind>,
@@ -2844,6 +2857,7 @@ impl Default for RowSpec {
             tags: Vec::new(),
             session_description: String::new(),
             work_unit: None,
+            session_summary: None,
             work_unit_header: None,
             bundle: None,
             promoted: None,
@@ -2890,13 +2904,16 @@ impl RowSpec {
             .is_some_and(|key| key == node_key);
         let work_unit = work_unit_of(row, view);
         let is_work_unit_start = work_unit.as_ref().is_some_and(|wu| wu.is_start);
+        let session_summary = session_summary_of(row, view);
+        let is_session_summary = session_summary.is_some();
+        let has_boundary_header = work_unit.is_some() && (is_work_unit_start || is_session_summary);
         let bundle_kind = activity_bundle_kind(row, view);
         let is_bundle = bundle_kind.is_some();
         let is_work_group = bundle_kind == Some(BundleKind::WorkGroup);
         let is_execute_run = bundle_kind == Some(BundleKind::ExecuteRun);
         let is_plan_repeat = bundle_kind == Some(BundleKind::PlanRepeat);
         let semantic_tags = row_semantic_chrome(row, is_bundle, view, BadgeOptions::default());
-        let classification = if is_session_summary_row(row, view, work_unit.as_ref()) {
+        let classification = if is_session_summary {
             RowClassification::session_summary()
         } else {
             row_classification(row)
@@ -2919,7 +2936,7 @@ impl RowSpec {
         } else {
             detail_summary
         };
-        let unit_title = if is_work_unit_start {
+        let unit_title = if has_boundary_header {
             work_unit_title(row, view)
         } else {
             String::new()
@@ -2956,14 +2973,31 @@ impl RowSpec {
         };
         let row_summary =
             (!is_subop && !is_execute_run).then(|| RowSummary::parse(row, &display_summary));
-        let work_unit_header = if is_work_unit_start {
-            work_unit.as_ref().map(|wu| WorkUnitHeader {
-                id: wu.id.clone(),
-                title: unit_title.clone(),
-                show_count: show_work_unit_count(row, wu),
-                count_text: wu.count.map_or_else(String::new, work_unit_count_text),
-                count_title: wu.count.map_or_else(String::new, work_unit_count_title),
-                title_only: unit_title == plain_summary,
+        let work_unit_header = if has_boundary_header {
+            work_unit.as_ref().map(|wu| {
+                let count = if is_session_summary {
+                    session_summary.as_ref().and_then(|summary| summary.count)
+                } else {
+                    wu.count
+                };
+                WorkUnitHeader {
+                    id: wu.id.clone(),
+                    title: unit_title.clone(),
+                    show_count: if is_session_summary {
+                        count.is_some_and(|count| count > 1)
+                    } else {
+                        show_work_unit_count(row, wu)
+                    },
+                    count_text: count.map_or_else(String::new, work_unit_count_text),
+                    count_title: count.map_or_else(String::new, |count| {
+                        if is_session_summary {
+                            session_summary_count_title(count)
+                        } else {
+                            work_unit_count_title(count)
+                        }
+                    }),
+                    title_only: unit_title == plain_summary,
+                }
             })
         } else {
             None
@@ -3018,7 +3052,7 @@ impl RowSpec {
                 work_unit: None,
             }
         };
-        let group_start = context.is_group_start && !is_work_unit_start;
+        let group_start = context.is_group_start && !has_boundary_header;
         let group_label = if !is_subop && is_graph_endpoint(row) {
             Some(group_label_text(
                 &row_str(row, "group"),
@@ -3060,7 +3094,7 @@ impl RowSpec {
                 aria_label.push_str(": ");
                 aria_label.push_str(&plain_summary);
             }
-        } else if is_work_unit_start {
+        } else if has_boundary_header {
             if unit_title == plain_summary {
                 aria_label.clone_from(&unit_title);
             } else {
@@ -3142,7 +3176,7 @@ impl RowSpec {
             },
             disclosure,
             content_flags: ContentFlags {
-                work_unit_block: is_work_unit_start,
+                work_unit_block: has_boundary_header,
                 work_unit_title_only: work_unit_header
                     .as_ref()
                     .is_some_and(|header| header.title_only),
@@ -3159,6 +3193,7 @@ impl RowSpec {
             tags,
             session_description,
             work_unit,
+            session_summary,
             work_unit_header,
             bundle: bundle_info,
             promoted,
@@ -3209,6 +3244,9 @@ impl RowSpec {
                 WorkUnitClass::Start => "work-unit-start",
                 WorkUnitClass::End => "work-unit-end",
             });
+        }
+        if self.session_summary.is_some() {
+            classes.push_str(" row-session-summary");
         }
         if self.bundle.is_some() {
             classes.push_str(" row-activity-bundle");
@@ -3572,6 +3610,13 @@ mod tests {
         if let Some(header) = &spec.work_unit_header {
             drop(attrs.insert("data-work-unit-id".to_owned(), header.id.clone()));
         }
+        if let Some(count) = spec
+            .session_summary
+            .as_ref()
+            .and_then(|summary| summary.count)
+        {
+            drop(attrs.insert("data-session-count".to_owned(), count.to_string()));
+        }
         if let Some(bundle) = &spec.bundle {
             drop(attrs.insert(
                 "data-activity-bundle".to_owned(),
@@ -3830,13 +3875,14 @@ mod tests {
                 (
                     "work_unit",
                     json!({
-                        "id": "session:s1",
+                        "id": "session:s1/turn:t9",
                         "title": "Initial user request",
                         "is_start": true,
                         "is_end": false,
-                        "count": 87,
+                        "count": 4,
                     }),
                 ),
+                ("session_summary", json!({ "count": 87 })),
                 ("session_meta", Value::Null),
             ],
         )
@@ -4313,8 +4359,27 @@ mod tests {
         let row = session_summary_row();
         let spec = RowSpec::from_value(&row, &RowContext::for_row(ViewMode::Activity, 0, false));
         assert_eq!(spec.classification.label, "session");
-        assert_eq!(spec.classification.source, "work_unit");
+        assert_eq!(spec.classification.source, "session_summary");
         assert_eq!(spec.classification.title, "Session summary");
+        assert!(spec.classes().contains("row-session-summary"));
+        assert_eq!(
+            spec.work_unit.as_ref().map(|unit| unit.id.as_str()),
+            Some("session:s1/turn:t9"),
+            "the session marker does not replace the row's turn work unit"
+        );
+        assert_eq!(
+            spec.work_unit_header
+                .as_ref()
+                .map(|header| (header.count_text.as_str(), header.count_title.as_str())),
+            Some(("87 entries", "87 entries in this session"))
+        );
+        assert_eq!(
+            spec.tags
+                .iter()
+                .find(|tag| tag.classes == "work-unit-count")
+                .map(|tag| tag.text.as_str()),
+            Some("87 entries")
+        );
         assert_eq!(
             render_activity_html(&spec),
             "<span class=\"activity-label\">session</span><button type=\"button\" class=\"subop-chevron\" title=\"Expand 1 activity\" aria-label=\"Expand 1 activity\" aria-expanded=\"false\">▸</button>"
@@ -4325,10 +4390,17 @@ mod tests {
                 .map(String::as_str),
             Some("session")
         );
+        assert_eq!(
+            render_attrs(&spec)
+                .get("data-session-count")
+                .map(String::as_str),
+            Some("87")
+        );
 
         let raw = RowSpec::from_value(&row, &RowContext::for_row(ViewMode::Raw, 0, false));
         assert_eq!(raw.classification.label, "work");
         assert_eq!(raw.classification.source, "activity_kind");
+        assert!(raw.session_summary.is_none());
 
         let turn_start = RowSpec::from_value(
             &wu_start_row(),
