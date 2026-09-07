@@ -5,8 +5,11 @@
 //! endpoints are identified by those fields. It never chooses an endpoint from
 //! timestamps, file order, content, names, or proximity.
 //!
-//! - [`NoteRelationship::SpawnedBy`] requires one unambiguous `started` marker
-//!   whose `agentThreadId` exactly matches the child `parentThreadId` relation.
+//! - [`NoteRelationship::SpawnedBy`] requires one unambiguous exact spawn
+//!   occurrence whose child thread exactly matches the child's
+//!   `parentThreadId` relation. Current rollouts carry this on
+//!   `collabToolCall.spawnAgent`; older rollouts used
+//!   `subAgentActivity.started`.
 //! - [`NoteRelationship::ReconnectsTo`] requires structured successful
 //!   completion evidence and one unambiguous physical child terminal.
 //! - [`NoteRelationship::ForkedFrom`] preserves `forkedFromId` as an
@@ -30,16 +33,20 @@ use editchain_core::{ActorId, Op, OpId, SessionId};
 use crate::error::ImportError;
 use crate::ids::{derive_external_entity_id, derive_session_id};
 
-/// Cursor checkpoint for Codex normalized metadata. Version three adds
-/// portable capture of out-of-band session titles; version two added exact
-/// topology facts.
-pub const CODEX_NORMALIZATION_VERSION: u32 = 3;
+/// Cursor checkpoint for Codex normalized metadata. Version four recognizes
+/// exact `collabToolCall.spawnAgent` topology; version three added portable
+/// capture of out-of-band session titles, and version two added exact topology
+/// facts.
+pub const CODEX_NORMALIZATION_VERSION: u32 = 4;
 
 /// Resolver identifier retained in every emitted evidence payload.
 pub const CODEX_TOPOLOGY_RESOLVER: &str = "codex-topology-v2";
 
 const THREAD_NAMESPACE: &str = "codex:thread";
 const RELATION_NAMESPACE: &str = "codex:relation:v2";
+
+pub(crate) const SPAWN_SIGNAL_SUBAGENT_ACTIVITY: &str = "subAgentActivity.started";
+pub(crate) const SPAWN_SIGNAL_COLLAB_TOOL: &str = "collabToolCall.spawnAgent";
 
 /// A subagent lifecycle marker found in one thread's projection.
 #[derive(Debug, Clone)]
@@ -53,6 +60,8 @@ pub struct ActivityMarker {
     pub op_id: OpId,
     /// Whether the structured activity kind is exactly `started`.
     pub started: bool,
+    /// Exact bridge signal that identified this activation.
+    pub signal: &'static str,
 }
 
 /// Per-child completion evidence from a structured `agentsStates` map.
@@ -126,14 +135,32 @@ fn emit_spawn_facts(topology: &[ThreadTopology], pending: &mut Vec<PendingNote>)
             continue;
         };
 
-        let candidates: BTreeSet<OpId> = topology
+        let candidates: Vec<&ActivityMarker> = topology
             .iter()
             .filter(|parent| parent.thread_id == parent_thread)
             .flat_map(|parent| parent.markers.iter())
             .filter(|marker| marker.started && marker.agent_thread_id == child.thread_id)
-            .map(|marker| marker.op_id)
             .collect();
-        let mut candidates = candidates.into_iter();
+        // Keep the older exact signal when a rollout materializes both
+        // representations of the same activation. That preserves the durable
+        // relationship identity already emitted by normalization v2/v3 while
+        // preventing the duplicate representation from looking ambiguous.
+        // Current-only rollouts fall through to `collabToolCall.spawnAgent`.
+        let legacy: Vec<&ActivityMarker> = candidates
+            .iter()
+            .copied()
+            .filter(|marker| marker.signal == SPAWN_SIGNAL_SUBAGENT_ACTIVITY)
+            .collect();
+        let candidates = if legacy.is_empty() {
+            candidates
+        } else {
+            legacy
+        };
+        let mut candidates_by_occurrence: BTreeMap<OpId, &ActivityMarker> = BTreeMap::new();
+        for marker in candidates {
+            let _: Option<&ActivityMarker> = candidates_by_occurrence.insert(marker.op_id, marker);
+        }
+        let mut candidates = candidates_by_occurrence.into_values();
         let Some(spawn) = candidates.next() else {
             continue;
         };
@@ -145,13 +172,13 @@ fn emit_spawn_facts(topology: &[ThreadTopology], pending: &mut Vec<PendingNote>)
 
         pending.push(PendingNote::new(
             child_first,
-            vec![spawn],
+            vec![spawn.op_id],
             NoteRelationship::SpawnedBy,
             ScopeRef::Session(derive_session_id(&child.thread_id)),
             BTreeMap::from([
                 ("childThreadId".to_string(), child.thread_id.clone()),
                 ("parentThreadId".to_string(), parent_thread.to_string()),
-                ("signal".to_string(), "subAgentActivity.started".to_string()),
+                ("signal".to_string(), spawn.signal.to_string()),
             ]),
         ));
     }
@@ -400,6 +427,7 @@ mod tests {
             agent_path: Some("/root/child".to_string()),
             op_id: marker_id,
             started: true,
+            signal: SPAWN_SIGNAL_SUBAGENT_ACTIVITY,
         });
         let mut child = topology("child", 2, 2);
         child.parent_thread_id = Some("parent".to_string());
@@ -425,17 +453,51 @@ mod tests {
                 agent_path: None,
                 op_id: id(1, 4),
                 started: true,
+                signal: SPAWN_SIGNAL_SUBAGENT_ACTIVITY,
             },
             ActivityMarker {
                 agent_thread_id: "child".to_string(),
                 agent_path: None,
                 op_id: id(1, 5),
                 started: true,
+                signal: SPAWN_SIGNAL_SUBAGENT_ACTIVITY,
             },
         ]);
         assert!(emit_codex_relationship_notes(&[parent, child])
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn legacy_spawn_identity_survives_duplicate_current_representation() {
+        let legacy_spawn = id(1, 3);
+        let mut parent = topology("parent", 1, 1);
+        parent.markers.extend([
+            ActivityMarker {
+                agent_thread_id: "child".to_string(),
+                agent_path: Some("/root/child".to_string()),
+                op_id: legacy_spawn,
+                started: true,
+                signal: SPAWN_SIGNAL_SUBAGENT_ACTIVITY,
+            },
+            ActivityMarker {
+                agent_thread_id: "child".to_string(),
+                agent_path: None,
+                op_id: id(1, 4),
+                started: true,
+                signal: SPAWN_SIGNAL_COLLAB_TOOL,
+            },
+        ]);
+        let mut child = topology("child", 2, 2);
+        child.parent_thread_id = Some("parent".to_string());
+
+        let notes = emit_codex_relationship_notes(&[parent, child]).unwrap();
+        assert!(notes.iter().any(|op| matches!(&op.kind, OpKind::Note(note)
+            if note.relationship == NoteRelationship::SpawnedBy
+                && note.target_ids == vec![legacy_spawn]
+                && matches!(&note.content, Payload::Inline(bytes)
+                    if String::from_utf8_lossy(bytes)
+                        .contains(SPAWN_SIGNAL_SUBAGENT_ACTIVITY)))));
     }
 
     #[test]
@@ -496,6 +558,7 @@ mod tests {
             agent_path: Some("/root/child".to_string()),
             op_id: marker_id,
             started: true,
+            signal: SPAWN_SIGNAL_SUBAGENT_ACTIVITY,
         });
         parent.legacy_completions.push(LegacyCompletionEvidence {
             agent_path: "/root/child".to_string(),
@@ -513,6 +576,7 @@ mod tests {
             agent_path: Some("/root/child".to_string()),
             op_id: id(1, 4),
             started: true,
+            signal: SPAWN_SIGNAL_SUBAGENT_ACTIVITY,
         });
         assert!(emit_codex_relationship_notes(&[parent, child])
             .unwrap()

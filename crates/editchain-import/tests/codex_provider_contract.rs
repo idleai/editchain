@@ -17,7 +17,8 @@
 //! - overall collab tool completion / `CloseAgent` / `SendInput` is never a
 //!   completion signal, and old bridge payloads without `agentsStates` remain
 //!   deserializable;
-//! - a `SpawnedBy` edge targets one exact physical `started` occurrence;
+//! - a `SpawnedBy` edge targets one exact physical current `spawnAgent` or
+//!   older `started` occurrence;
 //! - copied `forkedFromId` metadata is retained as an execution fact and never
 //!   converted into timestamp-selected `ForkOf` geometry;
 //! - relationship notes are session-scoped.

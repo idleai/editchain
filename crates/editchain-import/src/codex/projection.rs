@@ -156,10 +156,11 @@ pub struct TurnMeta {
 ///
 /// The owning thread id ([`Self::thread_id`]) is the session scope identity.
 /// `parent_thread_id` / `forked_from_id` are explicit execution pointers. The
-/// importer emits a visible `SpawnedBy` relation only with
-/// an exact matching start occurrence and retains `forked_from_id` as a hidden
-/// `ForkedFrom` fact. `agent_path` and source fields are
-/// explicit provenance (never inferred by sniffing raw records).
+/// importer emits a visible `SpawnedBy` relation only with an exact matching
+/// `collabToolCall.spawnAgent` or `subAgentActivity.started` occurrence and
+/// retains `forked_from_id` as a hidden `ForkedFrom` fact. `agent_path` and
+/// source fields are explicit provenance (never inferred by sniffing raw
+/// records).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMeta {
     /// Owning thread identity (`session_meta.payload.id`).

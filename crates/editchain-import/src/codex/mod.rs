@@ -136,7 +136,8 @@
 //! Relationship facts come only from explicit bridge evidence:
 //!
 //! - `sessionMeta.parentThreadId` yields a visible `SpawnedBy` edge only when
-//!   exactly one matching `started` subagent-activity occurrence exists;
+//!   exactly one matching current `collabToolCall.spawnAgent` occurrence (or
+//!   older `subAgentActivity.started` occurrence) identifies that child;
 //! - `collabToolCall.agentsStates` entries whose per-child status is
 //!   `completed` (the exporter's additive `agentsStates` map) yield
 //!   `ReconnectsTo` edges — the collab tool's own status or a

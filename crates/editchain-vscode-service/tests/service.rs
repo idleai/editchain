@@ -2121,7 +2121,7 @@ fn cancelled_branch_rows_ship_muted_node_and_child_owned_edge_geometry() {
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_thirty_one() {
+fn prepared_snapshot_manifest_records_projection_revision_thirty_two() {
     // Stale snapshots from earlier projection revisions (pre-hide_trace,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
@@ -2147,7 +2147,7 @@ fn prepared_snapshot_manifest_records_projection_revision_thirty_one() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 31u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 32u64);
 }
 
 #[test]
@@ -2654,7 +2654,7 @@ fn activity_view_groups_repeated_plans_as_expandable_linear_updates() {
 }
 
 #[test]
-fn prepared_snapshot_serves_nested_activity_view_and_records_revision_thirty_one() {
+fn prepared_snapshot_serves_nested_activity_view_and_records_revision_thirty_two() {
     // The pregenerated render snapshot must serve the SAME bundled Activity
     // rows as the live projection (work-unit/promotion/bundling parity) and
     // record the bumped projection revision in its identity.
@@ -2710,7 +2710,7 @@ fn prepared_snapshot_serves_nested_activity_view_and_records_revision_thirty_one
         &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["identity"]["projection_revision"], 31u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 32u64);
 
     let mut cached =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");

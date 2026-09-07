@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use editchain_core::clock::Clock;
@@ -14,7 +15,8 @@ use super::discover::discover_rollouts;
 use super::helper::HelperCommand;
 use super::link::{
     emit_codex_relationship_notes, ActivityMarker, CompletionEvidence, LegacyCompletionEvidence,
-    ThreadTopology, CODEX_NORMALIZATION_VERSION,
+    ThreadTopology, CODEX_NORMALIZATION_VERSION, SPAWN_SIGNAL_COLLAB_TOOL,
+    SPAWN_SIGNAL_SUBAGENT_ACTIVITY,
 };
 use super::normalize::{
     build_raw_op, completed_agent_paths_from_tool, is_blank_line, normalized_ops_for_compaction,
@@ -690,35 +692,10 @@ fn collect_topology_evidence(
 ) -> Result<(), ImportError> {
     let last_complete_ordinal = topology.last_raw.map_or(0, |op| op.seq >> 16);
     for item in items {
-        if item.kind == ProjectionKind::Note
-            && item.first_seen > 0
-            && item.first_seen <= last_complete_ordinal
-        {
-            let Some(agent_thread) = item
-                .payload
-                .get("agentThreadId")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            topology.markers.push(ActivityMarker {
-                agent_thread_id: agent_thread.to_string(),
-                agent_path: item
-                    .payload
-                    .get("agentPath")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .map(ToString::to_string),
-                op_id: stream.op_from_position(SourcePosition::raw(item.first_seen))?,
-                started: item
-                    .payload
-                    .get("activityKind")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| kind.eq_ignore_ascii_case("started")),
-            });
+        if collect_subagent_activity_marker(item, stream, topology, last_complete_ordinal)? {
             continue;
         }
+        collect_collab_spawn_markers(item, stream, topology, last_complete_ordinal)?;
 
         if item.kind != ProjectionKind::Tool
             || item.last_seen == 0
@@ -749,6 +726,92 @@ fn collect_topology_evidence(
                 });
             }
         }
+    }
+    Ok(())
+}
+
+/// Preserve the older dedicated subagent-activity activation signal.
+fn collect_subagent_activity_marker(
+    item: &FinalItem,
+    stream: &SourceStream,
+    topology: &mut ThreadTopology,
+    last_complete_ordinal: u64,
+) -> Result<bool, ImportError> {
+    if item.kind != ProjectionKind::Note
+        || item.first_seen == 0
+        || item.first_seen > last_complete_ordinal
+    {
+        return Ok(false);
+    }
+    let Some(agent_thread) = item
+        .payload
+        .get("agentThreadId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(true);
+    };
+    topology.markers.push(ActivityMarker {
+        agent_thread_id: agent_thread.to_string(),
+        agent_path: item
+            .payload
+            .get("agentPath")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        op_id: stream.op_from_position(SourcePosition::raw(item.first_seen))?,
+        started: item
+            .payload
+            .get("activityKind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("started")),
+        signal: SPAWN_SIGNAL_SUBAGENT_ACTIVITY,
+    });
+    Ok(true)
+}
+
+/// Capture the exact activation shape emitted by current Codex rollouts.
+fn collect_collab_spawn_markers(
+    item: &FinalItem,
+    stream: &SourceStream,
+    topology: &mut ThreadTopology,
+    last_complete_ordinal: u64,
+) -> Result<(), ImportError> {
+    if item.kind != ProjectionKind::Tool
+        || item.first_seen == 0
+        || item.first_seen > last_complete_ordinal
+        || item
+            .payload
+            .get("tool")
+            .and_then(Value::as_str)
+            .is_none_or(|tool| tool != "spawnAgent")
+        || item.payload.get("senderThreadId").and_then(Value::as_str)
+            != Some(topology.thread_id.as_str())
+    {
+        return Ok(());
+    }
+    let Some(receivers) = item
+        .payload
+        .get("receiverThreadIds")
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    let occurrence = stream.op_from_position(SourcePosition::raw(item.first_seen))?;
+    let receiver_threads: BTreeSet<String> = receivers
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|thread| !thread.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    for agent_thread_id in receiver_threads {
+        topology.markers.push(ActivityMarker {
+            agent_thread_id,
+            agent_path: None,
+            op_id: occurrence,
+            started: true,
+            signal: SPAWN_SIGNAL_COLLAB_TOOL,
+        });
     }
     Ok(())
 }

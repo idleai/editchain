@@ -341,12 +341,17 @@ impl HistoryNode {
     /// its bundled sub-ops. This preserves an explicit session-to-Git edge when
     /// its source record is folded into a visible semantic turn.
     ///
+    /// An exact `SpawnedBy` parent suppresses an inherited session-start
+    /// `BasedOn` edge in this display graph. The Git fact remains stored and
+    /// queryable, but drawing both would branch every subagent directly from
+    /// its parent's base commit instead of from its exact spawn occurrence.
+    ///
     /// Keys are deduplicated preserving first-occurrence order (stored causal
-    /// parents, then git-link targets from the row and its sub-ops, then virtual
-    /// note targets), so a target shared between any of the three sources is
-    /// emitted exactly once. This keeps parent keys deterministic and
-    /// duplicate-free even when a filtered clone has materialized a virtual
-    /// target into its stored `Op.parents`.
+    /// parents, then non-redundant git-link targets from the row and its
+    /// sub-ops, then virtual note targets), so a target shared between any of
+    /// the three sources is emitted exactly once. This keeps parent keys
+    /// deterministic and duplicate-free even when a filtered clone has
+    /// materialized a virtual target into its stored `Op.parents`.
     #[must_use]
     pub fn parent_keys(
         &self,
@@ -417,11 +422,25 @@ impl HistoryNode {
                     }
                 }
                 for source in std::iter::once(op).chain(self.sub_ops()) {
+                    // A collapsed row can carry metadata from a different
+                    // session (notably a spawned child's session_meta folded
+                    // into the parent's spawn tool row). Decide whether Git
+                    // provenance is superseded for each source independently;
+                    // using only the visible anchor's notes leaks the child's
+                    // BasedOn edge onto the parent row and fans every spawn
+                    // back to the base commit.
+                    // `notes` is canonicalized by the visible anchor, so facts
+                    // stored on a folded sub-op live in this same bucket. The
+                    // helper checks the fact's immutable stored parent against
+                    // `source.id`, keeping one member's relation from affecting
+                    // another member.
+                    let source_has_spawn_parent =
+                        has_exact_spawn_parent(source.id, anchored_notes.map(Vec::as_slice));
                     if let Some(links) = git_links.get(&source.id) {
-                        for link in links
-                            .iter()
-                            .filter(|link| link.kind != GitLinkKind::ProducedBy)
-                        {
+                        for link in links.iter().filter(|link| {
+                            link.kind != GitLinkKind::ProducedBy
+                                && !(source_has_spawn_parent && link.kind == GitLinkKind::BasedOn)
+                        }) {
                             let key = link.target_oid.to_hex();
                             if seen.insert(key.clone()) {
                                 keys.push(key);
@@ -2416,6 +2435,26 @@ fn has_exact_provider_parent(anchor: OpId, notes: Option<&[Op]>) -> bool {
     })
 }
 
+/// Whether `anchor` has one exact subagent spawn parent.
+///
+/// A child rollout inherits the parent's session-start Git snapshot. Once its
+/// exact activation is known, that inherited `BasedOn` fact is provenance, not
+/// an additional display-graph parent: the execution branch starts at the
+/// spawn occurrence.
+fn has_exact_spawn_parent(anchor: OpId, notes: Option<&[Op]>) -> bool {
+    notes.is_some_and(|facts| {
+        facts.iter().any(|fact| {
+            matches!(
+                &fact.kind,
+                editchain_core::OpKind::Note(note)
+                    if note.relationship == NoteRelationship::SpawnedBy
+                        && !note.target_ids.is_empty()
+                        && fact.parents.iter().any(|parent| *parent == anchor)
+            )
+        })
+    })
+}
+
 /// Resolve an op/entity handle through representatives to one currently
 /// present operation row. Cyclic representative maps are unresolved.
 fn canonical_present_op(
@@ -2483,11 +2522,13 @@ fn ordering_parent_keys(
                 }
             }
             for source in std::iter::once(op).chain(node.sub_ops()) {
+                let source_has_spawn_parent =
+                    has_exact_spawn_parent(source.id, anchored_notes.map(Vec::as_slice));
                 if let Some(links) = git_links.get(&source.id) {
-                    for link in links
-                        .iter()
-                        .filter(|link| link.kind != GitLinkKind::ProducedBy)
-                    {
+                    for link in links.iter().filter(|link| {
+                        link.kind != GitLinkKind::ProducedBy
+                            && !(source_has_spawn_parent && link.kind == GitLinkKind::BasedOn)
+                    }) {
                         let key = OrderingKey::Git(link.target_oid);
                         push(present.contains(&key).then_some(key));
                     }

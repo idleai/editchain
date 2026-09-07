@@ -103,7 +103,7 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 ///
 /// Revision 31 adds semantic muted-chain state and child-owned muted graph
 /// segment masks for cancelled request branches.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 31;
+const SNAPSHOT_PROJECTION_REVISION: u32 = 32;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

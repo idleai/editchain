@@ -277,7 +277,7 @@ fn legacy_cursor_backfills_session_git_link_once_without_replaying_rows() {
             .unwrap()
             .unwrap()
             .normalization_version,
-        3
+        4
     );
 
     let current =
@@ -351,7 +351,7 @@ fn version_one_cursor_upgrades_topology_without_replaying_git_link() {
             .unwrap()
             .unwrap()
             .normalization_version,
-        3
+        4
     );
 }
 
@@ -1866,7 +1866,7 @@ fn normalized_items_on_the_same_line_use_distinct_derived_lanes() {
 }
 
 #[test]
-fn cross_file_subagent_linking_emits_exact_spawn_and_reconnects_to() {
+fn current_collab_spawn_links_exact_child_and_reconnects_to() {
     let dir = tempfile::tempdir().unwrap();
     write_rollout(
         dir.path(),
@@ -1884,10 +1884,10 @@ fn cross_file_subagent_linking_emits_exact_spawn_and_reconnects_to() {
     );
 
     // Projection streams are built with serde_json, so no bridge JSON ever
-    // passes through shell/awk quoting. The parent carries a real `started`
-    // subAgentActivity marker and a collabToolCall whose per-child
-    // `agentsStates` marks the child completed — the child's own status is the
-    // only completion signal.
+    // passes through shell/awk quoting. Current Codex rollouts identify the
+    // exact child directly on the `spawnAgent` collab call. A later collab
+    // call's per-child `agentsStates` marks it completed — the child's own
+    // status is the only completion signal.
     let parent_projection = projection_bytes(&[
         line_record(
             1,
@@ -1899,11 +1899,13 @@ fn cross_file_subagent_linking_emits_exact_spawn_and_reconnects_to() {
             vec![serde_json::json!({
                 "turnId": "turn-1",
                 "item": {
-                    "kind": "subAgentActivity",
+                    "kind": "collabToolCall",
                     "id": "spawn-1",
-                    "activityKind": "started",
-                    "agentThreadId": "sub-1",
-                    "agentPath": "/root/sub",
+                    "tool": "spawnAgent",
+                    "status": "completed",
+                    "senderThreadId": "parent-1",
+                    "receiverThreadIds": ["sub-1"],
+                    "agentsStates": {"sub-1": {"status": "pendingInit"}},
                 }
             })],
             None,
@@ -1958,19 +1960,8 @@ fn cross_file_subagent_linking_emits_exact_spawn_and_reconnects_to() {
     );
     let harness = import(dir.path(), &sh_helper(&helper, &[]));
 
-    // The real `started` kind renders as readable spawn prose; no completion
-    // prose is invented for it.
-    let _spawned = harness
-        .ops
-        .ops
-        .iter()
-        .find(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.content == Payload::Inline(b"spawned subagent sub-1 (path /root/sub)".to_vec()))
-        })
-        .expect("spawn note");
-
     // SpawnedBy: causal parent = the subagent thread's first raw occurrence;
-    // target = the parent thread's exact raw `started` occurrence.
+    // target = the parent thread's exact raw `spawnAgent` occurrence.
     let spawned_by = harness
         .ops
         .ops
@@ -1986,12 +1977,16 @@ fn cross_file_subagent_linking_emits_exact_spawn_and_reconnects_to() {
         ParentSet::One(sub_stream.op_from_position(SourcePosition::raw(1)).unwrap())
     );
     match &spawned_by.kind {
-        OpKind::Note(note) => assert_eq!(
-            note.target_ids,
-            vec![parent_stream
-                .op_from_position(SourcePosition::raw(2))
-                .unwrap()]
-        ),
+        OpKind::Note(note) => {
+            assert_eq!(
+                note.target_ids,
+                vec![parent_stream
+                    .op_from_position(SourcePosition::raw(2))
+                    .unwrap()]
+            );
+            assert!(matches!(&note.content, Payload::Inline(bytes)
+                if String::from_utf8_lossy(bytes).contains("collabToolCall.spawnAgent")));
+        }
         _ => panic!("expected note op"),
     }
     // Relationship notes are session-scoped, never turn-scoped.
