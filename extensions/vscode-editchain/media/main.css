@@ -227,11 +227,12 @@ body {
    Positioned absolutely within the scroll-spacer at the rendered slice's top. */
 .table-wrap { position: absolute; left: 0; top: 0; width: 100%; }
 
-/* Sticky header row (Graph | Activity | Content | Date | Author | Commit/ID). */
+/* Sticky header row (Graph | Activity | Tags | Content | Date | Author | Commit/ID). */
 .tbl-header {
   display: grid;
   grid-template-columns:
     var(--graph-w, auto) var(--activity-w, 88px)
+    var(--tags-w, 180px)
     var(--content-w, minmax(0,1fr))
     var(--date-w, auto) var(--author-w, auto) var(--commit-w, auto);
   width: 100%;
@@ -313,6 +314,7 @@ body {
   display: grid;
   grid-template-columns:
     var(--graph-w, auto) var(--activity-w, 88px)
+    var(--tags-w, 180px)
     var(--content-w, minmax(0,1fr))
     var(--date-w, auto) var(--author-w, auto) var(--commit-w, auto);
   width: 100%;
@@ -344,6 +346,7 @@ body {
 /* Grid cells must not overflow their tracks (same rationale as the header). */
 .row .graph-cell,
 .row .activity-cell,
+.row .tags-cell,
 .row .text-cell,
 .row .date-cell,
 .row .author-cell,
@@ -351,13 +354,8 @@ body {
   box-sizing: border-box;
   min-width: 0;
 }
-/* Row-level dimming by node kind: secondary rows are softened while preserving
-   readable contrast, and text nodes (messages/commands) stay full. Opacity is
-   applied to the TEXT cells only — NOT the graph cell — because a parent's
-   opacity is multiplicative and cannot be overridden by children. The SVG
-   lanes/dots must always render at full (100%) opacity regardless of row kind. */
-.row-tool .text-cell, .row-tool .date-cell, .row-tool .author-cell, .row-tool .commit-cell { opacity: 0.85; }
-.row-dim .text-cell, .row-dim .date-cell, .row-dim .author-cell, .row-dim .commit-cell { opacity: 0.85; }
+/* Rows do not receive kind- or role-specific opacity. Per-column treatments
+   therefore remain identical across narrative, tool, Git, and sub-op rows. */
 .graph-cell {
   position: relative;
   z-index: 2;
@@ -365,6 +363,9 @@ body {
   overflow: hidden;
 }
 .activity-cell {
+  display: flex;
+  align-items: center;
+  gap: 3px;
   padding: 0 8px;
   overflow: hidden;
   color: var(--vscode-descriptionForeground);
@@ -373,6 +374,25 @@ body {
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.activity-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tags-cell {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+.tags-cell > * {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin: 0;
 }
 .text-cell { padding-left: 8px; overflow: hidden; text-align: left; }
 .date-cell, .author-cell, .commit-cell {
@@ -387,12 +407,9 @@ body {
   text-overflow: ellipsis;
 }
 .row .summary {
-  /* One constrained flex line: the inline chrome (chevron, badges, bundle
-     pills) and the summary text share the content cell, and every item can
-     shrink/ellipsize (min-width:0) so nothing ever lays out beyond the cell —
-     at narrow widths the NO_HORIZONTAL_OVERFLOW contract keeps descendants
-     inside their grid track instead of clipping them invisibly. Height is
-     untouched (still the row's own line); virtual scroll keeps ROW_H. */
+  /* One constrained prose line. Row tags and disclosure now have dedicated
+     columns, so Content only needs to shrink/ellipsize authored text and its
+     semantic icon without exceeding the grid track. */
   display: flex;
   align-items: center;
   min-width: 0;
@@ -413,35 +430,27 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-/* A single restrained metadata cluster precedes prose. Keeping it in one
-   shrinkable wrapper gives the content compositor a predictable visual budget
-   instead of making every semantic label compete independently with text. */
-.row-meta {
-  display: inline-flex;
-  align-items: center;
-  flex: 0 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  white-space: nowrap;
-}
-/* Human message turns render bold; all other rows (agent, system, tool) stay
-   at normal weight. */
+/* Role affects color, not weight; authored Markdown may still emphasize its
+   own spans without making an entire human message bold. */
 .row-human .summary {
-  font-weight: 700;
+  font-weight: 400;
 }
 
-/* Chevron on rows that carry bundled sub-ops. It provides an explicit native
-   disclosure affordance while the whole parent row remains the generous click
-   target. Inline sizing never affects ROW_H or virtual-scroll geometry. */
+/* Disclosure follows the Activity label (`agent ▸` / `user ▾`). The button
+   inherits that label's typography and color while the whole parent row stays
+   the generous click target. Inline sizing never affects ROW_H. */
 .subop-chevron {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex: none;
-  width: 14px;
-  margin-right: 4px;
+  width: 12px;
+  height: 16px;
+  margin: 0;
   padding: 0;
-  color: var(--vscode-descriptionForeground);
-  font-size: 0.85em;
-  line-height: 16px;
+  color: inherit;
+  font: inherit;
+  line-height: inherit;
   vertical-align: middle;
   cursor: pointer;
   background: transparent;
@@ -449,7 +458,8 @@ body {
   font-family: inherit;
 }
 .subop-chevron:hover {
-  color: var(--vscode-foreground);
+  color: inherit;
+  background: color-mix(in srgb, currentColor 10%, transparent);
 }
 .subop-chevron:focus-visible {
   outline: 1px solid var(--vscode-focusBorder);
@@ -466,9 +476,8 @@ body {
    branch/return row stays fully legible. */
 .rel-badge {
   display: inline-block;
-  /* Flex-shrinkable chip: at narrow widths an overfull content line shrinks
-     the chips (ellipsizing their labels) instead of laying them out beyond
-     the content cell — same containment contract as .summary-text. */
+  /* Flex-shrinkable tag: at narrow widths an overfull Tags cell ellipsizes
+     labels instead of laying them out beyond its grid track. */
   flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
@@ -485,8 +494,7 @@ body {
   opacity: 1;
 }
 
-/* Concise outcome badges (Activity/Raw profile content). Activity itself lives
-   in the dedicated grid column immediately before Content. */
+/* Concise outcome tags. Activity and Tags each have a dedicated grid column. */
 .out-badge {
   display: inline-block;
   flex: 0 1 auto;
@@ -519,30 +527,14 @@ body {
   color: var(--vscode-descriptionForeground);
 }
 
-/* Rows carrying structural relation badges are graph-topology-critical: lift
-   their text cells out of the `.row-tool` / `.row-dim` opacity dimming so the
-   badge (and its label text) stay readable at full strength. Declared after
-   the dim rules so the equal-specificity override wins. Only opacity changes —
-   row height and layout are untouched. */
-.row-has-badges .text-cell,
-.row-has-badges .date-cell,
-.row-has-badges .author-cell,
-.row-has-badges .commit-cell {
-  opacity: 1;
-}
-
 /* Expanded sub-op rows render indented under their parent with a small Codicon.
-   Dimmed slightly so they read as secondary to the parent row. The indent is
-   applied to the text cell only, so the graph cell (continuation line) stays
-   aligned with the parent's lane. */
+   The indent is applied to the text cell only, so the graph cell (continuation
+   line) stays aligned with the parent's lane. */
 .row-subop .text-cell {
   padding-left: 24px;
 }
-.row-subop .text-cell,
-.row-subop .date-cell,
-.row-subop .author-cell,
-.row-subop .commit-cell {
-  opacity: 0.85;
+.row-subop[data-hierarchy-depth='2'] .text-cell {
+  padding-left: 44px;
 }
 /* Small semantic icon for each expanded sub-op (VS Code Codicon glyph). */
 .subop-icon {
@@ -563,9 +555,9 @@ body {
 /* Activity-profile work-unit layer (Raw renders none of this — the classes
    below only exist on rows the renderer marks in the Activity view). A
    work-unit start opens a unit section: a stronger top separator plus a
-   compact two-line unit header INSIDE the fixed 34px row (unit title + count
-   pill above the row's own summary — never the opaque unit id as primary
-   text). The unit's last row closes with a slightly stronger bottom
+   compact two-line unit header INSIDE the fixed 34px row (unit title above the
+   row's own summary — never the opaque unit id as primary text). Its count is
+   a row tag. The unit's last row closes with a slightly stronger bottom
    separator only — no extra row, no height change. */
 .row-work-unit-start {
   border-top: 1px solid var(--vscode-panel-border);
@@ -575,8 +567,8 @@ body {
   border-bottom-color: var(--vscode-panel-border);
 }
 /* The content cell's summary block becomes a fixed 2-line grid sized to the
-   unchanged 34px row: line 1 = ribbon (title + count pill), line 2 = the
-   row's own summary. Row height and virtual-scroll math are untouched. */
+   unchanged 34px row: line 1 = ribbon title, line 2 = the row's own summary.
+   Row height and virtual-scroll math are untouched. */
 .row-work-unit-start .summary.work-unit-block {
   display: grid;
   grid-template-rows: 13px 16px;
@@ -700,9 +692,7 @@ body {
 .graph-cell svg.graphCell {
   display: block;
   pointer-events: none;
-  /* The graph must NOT inherit the row's dimming opacity (`.row-tool`/`.row-dim`
-     dim the text content, but the chain lines/dots stay full-strength so the
-     graph reads clearly regardless of node kind). */
+  /* Graph geometry stays full-strength like the row that owns it. */
   opacity: 1;
 }
 .graph-cell circle.graphDot {
@@ -738,9 +728,9 @@ body {
   fill: none;
 }
 
-/* Draggable handle on the right edge of each resizable column. Its horizontal
-   position is set in JS (measured from the rendered header cells) because the
-   grid uses flexible/auto tracks that CSS calc() cannot resolve. */
+/* Draggable handle on the right edge of every visible column. Handles live in
+   the sticky header and expose a quiet centre rule even before hover, so each
+   resizable boundary remains discoverable without covering row interactions. */
 .col-resize-handle {
   position: absolute;
   top: 0;
@@ -750,14 +740,29 @@ body {
   z-index: 4;
   background: transparent;
 }
+.col-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  left: 2px;
+  width: 1px;
+  background: color-mix(in srgb, var(--vscode-panel-border) 68%, transparent);
+}
 .col-resize-handle:hover {
-  background: var(--vscode-panel-border);
+  background: color-mix(in srgb, var(--vscode-panel-border) 24%, transparent);
+}
+.col-resize-handle:hover::after {
+  background: var(--vscode-focusBorder);
 }
 body.col-resizing {
   cursor: col-resize;
   user-select: none;
 }
 body.col-resizing .col-resize-handle {
+  background: color-mix(in srgb, var(--vscode-focusBorder) 18%, transparent);
+}
+body.col-resizing .col-resize-handle::after {
   background: var(--vscode-focusBorder);
 }
 
@@ -830,8 +835,9 @@ body.col-resizing .col-resize-handle {
   .tbl-header,
   .row {
     grid-template-columns:
-      var(--graph-w, auto) var(--activity-w, 88px) minmax(0, 1fr)
-      minmax(0, var(--date-w, 140px))
+      var(--graph-w, auto) var(--activity-w, 88px)
+      minmax(0, var(--tags-w, 180px)) minmax(0, 1fr)
+      minmax(0, var(--date-w, 160px))
       minmax(0, var(--author-w, 100px))
       minmax(0, var(--commit-w, 100px));
   }
@@ -856,8 +862,9 @@ body.col-resizing .col-resize-handle {
   .tbl-header,
   .row {
     grid-template-columns:
-      var(--graph-w, auto) var(--activity-w, 88px) minmax(0, 1fr)
-      minmax(0, var(--date-w, 140px))
+      var(--graph-w, auto) var(--activity-w, 88px)
+      minmax(0, var(--tags-w, 180px)) minmax(0, 1fr)
+      minmax(0, var(--date-w, 160px))
       minmax(0, var(--author-w, 100px));
   }
   .th.commit,
@@ -874,8 +881,9 @@ body.col-resizing .col-resize-handle {
   .tbl-header,
   .row {
     grid-template-columns:
-      var(--graph-w, auto) var(--activity-w, 88px) minmax(0, 1fr)
-      minmax(0, var(--date-w, 140px));
+      var(--graph-w, auto) var(--activity-w, 88px)
+      minmax(0, 120px) minmax(0, 1fr)
+      minmax(0, var(--date-w, 160px));
   }
   .th.author,
   .author-cell {
@@ -889,7 +897,8 @@ body.col-resizing .col-resize-handle {
   .tbl-header,
   .row {
     grid-template-columns:
-      var(--graph-w, auto) var(--activity-w, 88px) minmax(0, 1fr);
+      var(--graph-w, auto) var(--activity-w, 88px)
+      minmax(0, 96px) minmax(0, 1fr);
   }
   .th.date,
   .date-cell {
@@ -1049,8 +1058,9 @@ body {
 .tbl-header,
 .row {
   grid-template-columns:
-    var(--graph-w, auto) var(--activity-w, 88px) minmax(0, 1fr)
-    minmax(0, var(--date-w, 140px));
+    var(--graph-w, auto) var(--activity-w, 88px)
+    var(--tags-w, 180px) minmax(0, 1fr)
+    minmax(0, var(--date-w, 160px));
 }
 
 .th.author,
@@ -1116,6 +1126,10 @@ body {
   padding-left: 10px;
 }
 
+.tags-cell {
+  padding: 0 8px 0 10px;
+}
+
 .activity-cell {
   padding: 0 8px 0 10px;
   color: var(--ec-faint);
@@ -1141,17 +1155,7 @@ body {
 
 .row-human .summary {
   color: var(--ec-ink-strong);
-  font-weight: 550;
-}
-
-/* The provider-neutral role owns text hierarchy. Legacy kind/is_system classes
-   remain as compatibility hooks, but no longer dim whole cells and everything
-   inside them indiscriminately. */
-.row-tool .text-cell,
-.row-tool .date-cell,
-.row-dim .text-cell,
-.row-dim .date-cell {
-  opacity: 1;
+  font-weight: 400;
 }
 
 .row-role-result .summary,
@@ -1205,23 +1209,6 @@ body {
   letter-spacing: 0.015em;
 }
 
-.row-meta {
-  gap: 5px;
-  max-width: 46%;
-  margin-right: 7px;
-}
-
-.row-activity-bundle .row-meta {
-  max-width: 100%;
-  margin-right: 0;
-}
-
-/* Plan-repeat bundles retain their narrative heading after the count chip;
-   execute-run bundles use the count as their entire compact label. */
-.row-activity-bundle[data-activity-bundle='plan-repeat'] .row-meta {
-  margin-right: 7px;
-}
-
 /* Relations are topology annotations and outcome is the only lozenge-like
    state. Activity is plain text in its dedicated column. */
 .rel-badge,
@@ -1260,14 +1247,7 @@ body {
 }
 
 .bundle-count {
-  color: var(--ec-ink);
   margin: 0;
-  padding: 0 5px;
-  background: var(
-    --vscode-badge-background,
-    color-mix(in srgb, var(--vscode-panel-border) 22%, transparent)
-  );
-  border-color: var(--ec-hairline-strong);
 }
 
 .bundle-status {
@@ -1283,6 +1263,18 @@ body {
 
 .row-activity-bundle {
   background: transparent;
+}
+
+/* Outer chat-to-chat work groups are presentation-only linear aggregates.
+   Their restrained rail distinguishes the summarized interval without
+   implying a graph branch; actual fork/merge nodes remain outside them. */
+.row-activity-bundle[data-activity-bundle='work-group'] {
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--vscode-focusBorder) 48%, transparent);
+  background: color-mix(in srgb, var(--vscode-focusBorder) 3%, transparent);
+}
+
+.row-subop.row-activity-bundle {
+  background: color-mix(in srgb, var(--vscode-panel-border) 4%, transparent);
 }
 
 .row-work-unit-start {
@@ -1313,37 +1305,19 @@ body {
   font-size: 9.5px;
 }
 
-.work-unit-count::before {
-  content: '· ';
-}
-
-.subop-chevron {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 20px;
-  height: 20px;
-  margin-right: 2px;
-  margin-left: -4px;
-  color: var(--vscode-foreground);
-  font-size: 11px;
+.activity-cell .subop-chevron {
+  width: 12px;
+  height: 16px;
+  margin: 0;
+  color: inherit;
+  font: inherit;
+  line-height: inherit;
   border-radius: 3px;
 }
 
-.row-expandable:hover .subop-chevron {
-  background: color-mix(in srgb, var(--vscode-foreground) 8%, transparent);
-}
-
-.session-meta-slot {
-  display: inline-flex;
-  align-items: center;
-  flex: none;
-  gap: 4px;
-  min-width: 0;
-}
-
-.session-meta-slot:empty {
-  display: none;
+.row-expandable:hover .activity-cell .subop-chevron {
+  color: inherit;
+  background: color-mix(in srgb, currentColor 10%, transparent);
 }
 
 .session-chip {
@@ -1366,17 +1340,16 @@ body {
   white-space: nowrap;
 }
 
-.session-chip-agent {
-  color: var(--vscode-symbolIcon-classForeground, var(--vscode-badge-foreground, var(--ec-ink)));
-}
-
-.git-prefix-chip {
+/* Counts that summarize an activity and named agent provenance are prefix
+   labels too. Give all three the same compact keybinding-label treatment;
+   their surrounding layouts retain their own spacing and width budgets. */
+.git-prefix-chip,
+.bundle-count,
+.session-chip-agent,
+.work-unit-count {
   display: inline-block;
-  flex: 0 1 auto;
   min-width: 0;
-  max-width: 42%;
   box-sizing: border-box;
-  margin-right: 6px;
   padding: 0 6px;
   overflow: hidden;
   color: var(--vscode-keybindingLabel-foreground, var(--ec-ink));
@@ -1392,6 +1365,14 @@ body {
   line-height: 14px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.git-prefix-chip {
+  flex: 0 1 auto;
+}
+
+.session-chip-agent {
+  max-width: 140px;
 }
 
 .git-summary-text {
@@ -1624,8 +1605,9 @@ body {
   .tbl-header,
   .row {
     grid-template-columns:
-      var(--graph-w, auto) var(--activity-w, 88px) minmax(0, 1fr)
-      minmax(0, var(--date-w, 140px));
+      var(--graph-w, auto) var(--activity-w, 88px)
+      minmax(0, 120px) minmax(0, 1fr)
+      minmax(0, var(--date-w, 160px));
   }
 }
 
@@ -1633,6 +1615,7 @@ body {
   .tbl-header,
   .row {
     grid-template-columns:
-      var(--graph-w, auto) var(--activity-w, 88px) minmax(0, 1fr);
+      var(--graph-w, auto) var(--activity-w, 88px)
+      minmax(0, 96px) minmax(0, 1fr);
   }
 }

@@ -155,6 +155,32 @@ pub enum HistoryNode {
         /// Deterministic semantic metadata (Narrative / Plan / Primary).
         meta: NodeMeta,
     },
+    /// A synthetic Activity-view group containing the contiguous linear work
+    /// performed between user/agent chat rows.
+    ///
+    /// Work groups are formed only from one graph path. Every row incident to
+    /// a fork, merge, subagent/reconnect relation, or produced-commit edge is a
+    /// hard boundary and remains outside the group. Existing execute/plan
+    /// bundles remain as member nodes, giving the viewer a bounded second
+    /// disclosure level without losing their original records.
+    WorkGroup {
+        /// The newest member retained as the group's graph identity.
+        anchor: Arc<Op>,
+        /// Effective display time of the newest member.
+        source_time: EffectiveTime,
+        /// Final parent keys for the contracted derived view.
+        parent_override: Option<Vec<String>>,
+        /// Original top-level member rows, newest-first. Existing synthetic
+        /// bundles remain intact in this vector.
+        member_nodes: Vec<HistoryNode>,
+        /// Every represented source op, flattened only for exact find/detail
+        /// lookup. Presentation hierarchy comes from `member_nodes`.
+        members: Vec<Arc<Op>>,
+        /// Deterministic aggregate summary derived from all member activities.
+        summary: String,
+        /// Aggregate semantic metadata (`Work` / Primary plus folded outcome).
+        meta: NodeMeta,
+    },
     /// A `Git` commit entity.
     GitCommit(Box<GitCommitEntity>),
 }
@@ -173,9 +199,9 @@ impl HistoryNode {
             Self::CollapsedImport {
                 summary, sub_ops, ..
             } => combined_summary(summary, sub_ops),
-            Self::ExecuteBundle { summary, .. } | Self::PlanBundle { summary, .. } => {
-                summary.clone()
-            }
+            Self::ExecuteBundle { summary, .. }
+            | Self::PlanBundle { summary, .. }
+            | Self::WorkGroup { summary, .. } => summary.clone(),
             Self::GitCommit(commit) => match &commit.message {
                 Payload::Inline(b) => String::from_utf8_lossy(b).to_string(),
                 Payload::Empty | Payload::Blob(_) => commit.oid.to_hex(),
@@ -209,7 +235,8 @@ impl HistoryNode {
             Self::EditOperation { source_time, .. }
             | Self::CollapsedImport { source_time, .. }
             | Self::ExecuteBundle { source_time, .. }
-            | Self::PlanBundle { source_time, .. } => *source_time,
+            | Self::PlanBundle { source_time, .. }
+            | Self::WorkGroup { source_time, .. } => *source_time,
             Self::GitCommit(commit) => {
                 let secs = u64::try_from(commit.committed_at).unwrap_or(0);
                 EffectiveTime::Observed(secs.saturating_mul(1000))
@@ -222,7 +249,9 @@ impl HistoryNode {
     pub fn op_id(&self) -> Option<OpId> {
         match self {
             Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => Some(op.id),
-            Self::ExecuteBundle { anchor, .. } | Self::PlanBundle { anchor, .. } => Some(anchor.id),
+            Self::ExecuteBundle { anchor, .. }
+            | Self::PlanBundle { anchor, .. }
+            | Self::WorkGroup { anchor, .. } => Some(anchor.id),
             Self::GitCommit(_) => None,
         }
     }
@@ -234,7 +263,8 @@ impl HistoryNode {
             Self::EditOperation { .. }
             | Self::CollapsedImport { .. }
             | Self::ExecuteBundle { .. }
-            | Self::PlanBundle { .. } => None,
+            | Self::PlanBundle { .. }
+            | Self::WorkGroup { .. } => None,
             Self::GitCommit(commit) => Some(commit.oid),
         }
     }
@@ -246,7 +276,8 @@ impl HistoryNode {
             Self::EditOperation { .. }
             | Self::CollapsedImport { .. }
             | Self::ExecuteBundle { .. }
-            | Self::PlanBundle { .. } => None,
+            | Self::PlanBundle { .. }
+            | Self::WorkGroup { .. } => None,
             Self::GitCommit(commit) => Some(commit.repository),
         }
     }
@@ -265,9 +296,9 @@ impl HistoryNode {
                 | editchain_core::ScopeRef::Turn(_)
                 | editchain_core::ScopeRef::File(_) => "ops".to_string(),
             },
-            Self::ExecuteBundle { anchor, .. } | Self::PlanBundle { anchor, .. } => {
-                bundle_group(anchor)
-            }
+            Self::ExecuteBundle { anchor, .. }
+            | Self::PlanBundle { anchor, .. }
+            | Self::WorkGroup { anchor, .. } => bundle_group(anchor),
             Self::GitCommit(commit) => format!("repo:{}", commit.repository.0),
         }
     }
@@ -281,9 +312,9 @@ impl HistoryNode {
             Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => op.id.to_string(),
             // A bundle retains one real member as its graph identity. Its
             // display slot/time can come from the newest member independently.
-            Self::ExecuteBundle { anchor, .. } | Self::PlanBundle { anchor, .. } => {
-                anchor.id.to_string()
-            }
+            Self::ExecuteBundle { anchor, .. }
+            | Self::PlanBundle { anchor, .. }
+            | Self::WorkGroup { anchor, .. } => anchor.id.to_string(),
             Self::GitCommit(commit) => commit.oid.to_hex(),
         }
     }
@@ -338,6 +369,10 @@ impl HistoryNode {
             | Self::PlanBundle {
                 parent_override: Some(keys),
                 ..
+            }
+            | Self::WorkGroup {
+                parent_override: Some(keys),
+                ..
             } => return keys.clone(),
             Self::EditOperation {
                 parent_override: None,
@@ -352,6 +387,10 @@ impl HistoryNode {
                 ..
             }
             | Self::PlanBundle {
+                parent_override: None,
+                ..
+            }
+            | Self::WorkGroup {
                 parent_override: None,
                 ..
             }
@@ -420,6 +459,11 @@ impl HistoryNode {
                 ..
             }
             | Self::PlanBundle {
+                member_nodes,
+                members,
+                ..
+            }
+            | Self::WorkGroup {
                 member_nodes,
                 members,
                 ..
@@ -492,7 +536,9 @@ impl HistoryNode {
                     _ => editchain_core::parents::ParentSet::Two(ids[0], ids[1]),
                 };
             }
-            Self::ExecuteBundle { anchor, .. } | Self::PlanBundle { anchor, .. } => {
+            Self::ExecuteBundle { anchor, .. }
+            | Self::PlanBundle { anchor, .. }
+            | Self::WorkGroup { anchor, .. } => {
                 let mut ids: Vec<OpId> = keys
                     .iter()
                     .filter_map(|k| OpId::from_display_str(k))
@@ -543,6 +589,9 @@ impl HistoryNode {
             }
             | Self::PlanBundle {
                 parent_override, ..
+            }
+            | Self::WorkGroup {
+                parent_override, ..
             } => *parent_override = Some(normalized),
             Self::GitCommit(_) => {}
         }
@@ -555,7 +604,9 @@ impl HistoryNode {
     pub fn sub_ops(&self) -> &[Arc<Op>] {
         match self {
             Self::CollapsedImport { sub_ops, .. } => sub_ops,
-            Self::ExecuteBundle { members, .. } | Self::PlanBundle { members, .. } => members,
+            Self::ExecuteBundle { members, .. }
+            | Self::PlanBundle { members, .. }
+            | Self::WorkGroup { members, .. } => members,
             Self::EditOperation { .. } | Self::GitCommit(_) => &[],
         }
     }
@@ -588,6 +639,7 @@ impl HistoryNode {
             Self::CollapsedImport { kind, .. }
             | Self::ExecuteBundle { kind, .. }
             | Self::PlanBundle { kind, .. } => kind.clone(),
+            Self::WorkGroup { .. } => "work-group".to_string(),
             Self::GitCommit(_) => "git".to_string(),
         }
     }
@@ -602,7 +654,8 @@ impl HistoryNode {
         match self {
             Self::CollapsedImport { meta, .. }
             | Self::ExecuteBundle { meta, .. }
-            | Self::PlanBundle { meta, .. } => *meta,
+            | Self::PlanBundle { meta, .. }
+            | Self::WorkGroup { meta, .. } => *meta,
             Self::EditOperation { op, .. } => meta::for_edit_operation(op),
             Self::GitCommit(_) => meta::for_git_commit(),
         }
@@ -1413,6 +1466,7 @@ impl HistoryProjection {
                 | HistoryNode::CollapsedImport { .. }
                 | HistoryNode::ExecuteBundle { .. }
                 | HistoryNode::PlanBundle { .. }
+                | HistoryNode::WorkGroup { .. }
                 | HistoryNode::GitCommit(_) => None,
             })
             .collect();
@@ -1429,6 +1483,7 @@ impl HistoryProjection {
                 | HistoryNode::CollapsedImport { .. }
                 | HistoryNode::ExecuteBundle { .. }
                 | HistoryNode::PlanBundle { .. }
+                | HistoryNode::WorkGroup { .. }
                 | HistoryNode::GitCommit(_) => None,
             })
             .collect();
@@ -2166,9 +2221,9 @@ fn ordering_key(node: &HistoryNode) -> OrderingKey {
         HistoryNode::EditOperation { op, .. } | HistoryNode::CollapsedImport { op, .. } => {
             OrderingKey::Op(op.id)
         }
-        HistoryNode::ExecuteBundle { anchor, .. } | HistoryNode::PlanBundle { anchor, .. } => {
-            OrderingKey::Op(anchor.id)
-        }
+        HistoryNode::ExecuteBundle { anchor, .. }
+        | HistoryNode::PlanBundle { anchor, .. }
+        | HistoryNode::WorkGroup { anchor, .. } => OrderingKey::Op(anchor.id),
         HistoryNode::GitCommit(commit) => OrderingKey::Git(commit.oid),
     }
 }
@@ -2370,7 +2425,9 @@ fn ordering_parent_keys(
                 }
             }
         }
-        HistoryNode::ExecuteBundle { anchor, .. } | HistoryNode::PlanBundle { anchor, .. } => {
+        HistoryNode::ExecuteBundle { anchor, .. }
+        | HistoryNode::PlanBundle { anchor, .. }
+        | HistoryNode::WorkGroup { anchor, .. } => {
             for parent in &anchor.parents {
                 push(canonical_ordering_op(*parent, representative, present));
             }

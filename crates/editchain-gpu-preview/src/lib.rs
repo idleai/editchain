@@ -256,6 +256,8 @@ struct RenderRow {
     is_subop: bool,
     #[serde(default)]
     is_bundle: bool,
+    #[serde(default)]
+    expanded: bool,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -637,7 +639,7 @@ fn build_geometry(frame: &RenderFrame, scale: f32) -> Vec<f32> {
         let node_x = lane_center(graph, node_lane);
         let node_color = lane_color(node_lane);
         let background = graph.background_color.map(Rgba::linear);
-        let bundle = row.is_bundle.then(|| BundleAnchors {
+        let bundle = (row.is_bundle && !row.is_subop && !row.expanded).then(|| BundleAnchors {
             entry_y: middle - graph.bundle_half_height,
             exit_y: middle + graph.bundle_half_height,
             term_radius: bundle_terminal_radius(graph.dot_radius),
@@ -699,33 +701,31 @@ fn build_geometry(frame: &RenderFrame, scale: f32) -> Vec<f32> {
             builder.quadratic(seam, dst_control, end, lane_color(transition.to_lane));
         }
 
-        if !row.is_subop {
-            if let Some(anchors) = bundle {
-                let shape = CapsuleShape {
-                    x: node_x,
-                    entry_y: anchors.entry_y,
-                    exit_y: anchors.exit_y,
-                    margin: anchors.margin,
-                };
-                let radius = anchors.term_radius + anchors.margin;
-                match background {
-                    Some(bg) => {
-                        builder.capsule(shape, radius + RING_HALF_WIDTH, bg);
-                        builder.capsule(shape, (radius - RING_HALF_WIDTH).max(0.0), node_color);
-                    }
-                    None => builder.capsule(shape, radius, node_color),
+        if let Some(anchors) = bundle {
+            let shape = CapsuleShape {
+                x: node_x,
+                entry_y: anchors.entry_y,
+                exit_y: anchors.exit_y,
+                margin: anchors.margin,
+            };
+            let radius = anchors.term_radius + anchors.margin;
+            match background {
+                Some(bg) => {
+                    builder.capsule(shape, radius + RING_HALF_WIDTH, bg);
+                    builder.capsule(shape, (radius - RING_HALF_WIDTH).max(0.0), node_color);
                 }
-                for terminal_y in [anchors.entry_y, anchors.exit_y] {
-                    builder.dot(
-                        [node_x, terminal_y],
-                        anchors.term_radius,
-                        node_color,
-                        background,
-                    );
-                }
-            } else {
-                builder.dot([node_x, middle], graph.dot_radius, node_color, background);
+                None => builder.capsule(shape, radius, node_color),
             }
+            for terminal_y in [anchors.entry_y, anchors.exit_y] {
+                builder.dot(
+                    [node_x, terminal_y],
+                    anchors.term_radius,
+                    node_color,
+                    background,
+                );
+            }
+        } else {
+            builder.dot([node_x, middle], graph.dot_radius, node_color, background);
         }
     }
 
@@ -848,6 +848,7 @@ mod tests {
             transitions,
             is_subop: false,
             is_bundle: false,
+            expanded: false,
         }
     }
 
@@ -1183,7 +1184,7 @@ mod tests {
     }
 
     #[test]
-    fn dot_is_circular_and_subop_draws_no_node() {
+    fn dots_are_circular_and_opened_rows_draw_nodes() {
         let plain = frame(vec![row(0, Vec::new(), Vec::new(), Vec::new())]);
         let vertices = build_geometry(&plain, 1.0);
         assert!(!vertices.is_empty(), "an ordinary row emits a node dot");
@@ -1213,20 +1214,34 @@ mod tests {
                 transitions: Vec::new(),
                 is_subop: true,
                 is_bundle: false,
+                expanded: false,
             }],
         };
         let vertices = build_geometry(&subop, 1.0);
-        assert!(!vertices.is_empty(), "the sub-op lane line emits geometry");
-        for [x, y] in positions(&vertices) {
-            assert!(
-                (x - 18.0).abs() <= 1.01,
-                "sub-op rows keep only the lane line, no dot (vertex at {x},{y})"
-            );
-            assert!(
-                (-1e-3..=17.0 + 1e-3).contains(&y),
-                "sub-op above half ends at the midpoint (vertex at {x},{y})"
-            );
-        }
+        let subop_positions = positions(&vertices);
+        assert!(
+            subop_positions
+                .iter()
+                .any(|[x, y]| (x - 18.0).abs() <= 1.01 && y.abs() <= 1e-3),
+            "the opened member keeps its incoming lane"
+        );
+        assert!(
+            has_vertex(&vertices, 22.0, 17.0, 1e-3),
+            "the opened member adds a radius-four dot at the midpoint"
+        );
+
+        let mut unfolded_group = row(0, Vec::new(), Vec::new(), Vec::new());
+        unfolded_group.is_bundle = true;
+        unfolded_group.expanded = true;
+        let vertices = build_geometry(&frame(vec![unfolded_group]), 1.0);
+        assert!(
+            has_vertex(&vertices, 22.0, 17.0, 1e-3),
+            "the unfolded group summary adds one radius-four midpoint dot"
+        );
+        assert!(
+            !has_vertex(&vertices, 18.0, 7.0, 1e-3),
+            "the unfolded group summary no longer draws the capsule top"
+        );
     }
 
     #[test]
@@ -1904,7 +1919,8 @@ mod shell {
         }
 
         /// Production click/chevron semantics: select the row, then toggle
-        /// disclosure for any expandable (non-sub-op, has-children) row.
+        /// disclosure for any row with children, including an existing bundle
+        /// nested one level inside a work group.
         fn row_select_and_toggle(&mut self, abs: i64, viewport: &Viewport, step: &mut Step) {
             self.state.select_row(abs);
             if let Err(error) = self.dom.apply_selection(abs) {
@@ -1913,11 +1929,7 @@ mod shell {
                     js_value_text(&error)
                 ));
             }
-            let expandable = self
-                .state
-                .cache
-                .get(&abs)
-                .is_some_and(|row| !host::row::bool(row, "is_subop") && rows::has_sub_ops(row));
+            let expandable = self.state.cache.get(&abs).is_some_and(rows::has_sub_ops);
             if expandable {
                 self.state.toggle_expanded_ui(abs, viewport, step);
             }
@@ -2873,12 +2885,9 @@ mod shell {
             }
             "ArrowRight" | "ArrowLeft" => {
                 let expanded = SHELL_DATA.with(|cell| {
-                    cell.borrow().as_ref().is_some_and(|shell| {
-                        shell
-                            .state
-                            .block_index_of_abs(abs)
-                            .is_some_and(|block| shell.state.is_block_expanded(block))
-                    })
+                    cell.borrow()
+                        .as_ref()
+                        .is_some_and(|shell| shell.state.is_row_expanded(abs))
                 });
                 let wants_toggle = SHELL_DATA.with(|cell| {
                     cell.borrow().as_ref().is_some_and(|shell| {
@@ -2886,7 +2895,7 @@ mod shell {
                         let Some(row) = row else {
                             return false;
                         };
-                        if host::row::bool(row, "is_subop") || !rows::has_sub_ops(row) {
+                        if !rows::has_sub_ops(row) {
                             return false;
                         }
                         (key == "ArrowRight" && !expanded) || (key == "ArrowLeft" && expanded)
@@ -2903,9 +2912,11 @@ mod shell {
                 }
                 let expandable = SHELL_DATA.with(|cell| {
                     cell.borrow().as_ref().is_some_and(|shell| {
-                        shell.state.cache.get(&abs).is_some_and(|row| {
-                            !host::row::bool(row, "is_subop") && rows::has_sub_ops(row)
-                        })
+                        shell
+                            .state
+                            .cache
+                            .get(&abs)
+                            .is_some_and(|row| rows::has_sub_ops(row))
                     })
                 });
                 if expandable {
@@ -2985,9 +2996,12 @@ mod shell {
     fn column_start_width(shell: &ShellData, col: ColKey) -> f64 {
         match col {
             ColKey::Graph => shell.current_graph_width(),
-            ColKey::Content | ColKey::Date | ColKey::Author | ColKey::Commit => {
-                shell.dom.header_cell_width(col).max(col.min_width())
-            }
+            ColKey::Activity
+            | ColKey::Tags
+            | ColKey::Content
+            | ColKey::Date
+            | ColKey::Author
+            | ColKey::Commit => shell.dom.header_cell_width(col).max(col.min_width()),
         }
     }
 
@@ -3589,7 +3603,6 @@ mod shell {
             };
             shell.flags.renderer_ready = true;
             shell.last_error = None;
-            shell.dom.set_backend("svg", "svg");
             shell.publish_render_state();
         });
         set_window_prop("__editchainLastError", &JsValue::NULL);
@@ -3730,6 +3743,7 @@ mod shell {
                         "middle": row.middle,
                         "is_subop": row.is_subop,
                         "is_bundle": row.is_bundle,
+                        "expanded": row.expanded,
                     })
                 })
                 .collect();

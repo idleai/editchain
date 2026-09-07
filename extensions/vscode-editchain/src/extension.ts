@@ -551,7 +551,7 @@ class JsonContentProvider implements vscode.TextDocumentContentProvider {
  *
  * This is the ONLY panel the extension opens. The page is the EXACT production
  * scaffold (media/main.css + media/gpu-preview/gpu-preview.css and the
- * controls/rows/gpu chrome markup) with media/rust-history/loader.js as its
+ * controls/rows/renderer scaffold) with media/rust-history/loader.js as its
  * ONLY script: the loader initializes the wasm-bindgen module and calls the
  * Rust shell's startHistoryView(), which owns the full runtime — Activity/Raw
  * profile switching, virtual paging (PAGE=500), FindInHistory search/nav,
@@ -595,10 +595,6 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 <link rel="stylesheet" href="${styleUri}">
 </head>
 <body data-treatment="pulse" data-gpu-backend="auto">
-<div id="gpu-toolbar" role="toolbar" aria-label="Renderer status">
-<span id="gpu-backend" data-backend="auto">backend: detecting</span>
-<span id="gpu-status">idle</span>
-</div>
 <div id="controls" role="group" aria-label="History controls">
 <div id="profile-control" class="segmented" role="group" aria-label="History profile">
 <button type="button" id="profile-activity" class="segmented-btn active" aria-pressed="true">Activity</button>

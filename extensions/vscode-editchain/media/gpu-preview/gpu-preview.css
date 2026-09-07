@@ -9,64 +9,13 @@
  * Production (media/main.css + the Rust shell) owns the controls, virtual
  * paging, search, work-unit/bundle/promotion rows, selection/keyboard/
  * disclosure, raw JSON routing, responsive columns, accessibility and resize.
- * This sheet adds ONLY the renderer chrome:
- *   - a slim toolbar (backend badge + renderer status);
+ * This sheet adds ONLY the renderer scaffolding:
  *   - the inert #gpu-canvas-host scaffold, permanently hidden (the per-row
  *     SVG graph cells are the active graph and scroll with the rows, so no
  *     canvas is ever created on any host);
  *   - a hidden #gpu-rows mirror carrying data-row/data-key per rendered row
  *     (harness/e2e DOM contract) and the visually-hidden live region.
  */
-
-:root {
-  --gpu-border: color-mix(in srgb, var(--vscode-panel-border, #30343a) 76%, transparent);
-  --gpu-muted: var(--vscode-descriptionForeground, #9da3ad);
-}
-
-/* Slim GPU status strip above the production controls. This is GPU-specific
-   chrome; it never reflows the production grid below it. */
-#gpu-toolbar {
-  position: relative;
-  z-index: 3;
-  display: flex;
-  min-height: 28px;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 0 12px;
-  border-bottom: 1px solid var(--gpu-border);
-  background: color-mix(in srgb, var(--vscode-editor-background, #0e1116) 90%, #5078a0 10%);
-}
-
-#gpu-backend {
-  display: inline-flex;
-  align-items: center;
-  min-height: 18px;
-  padding: 1px 8px;
-  border: 1px solid color-mix(in srgb, var(--vscode-focusBorder, #4ca6ea) 48%, transparent);
-  border-radius: 999px;
-  color: #b9e4ff;
-  background: color-mix(in srgb, var(--vscode-focusBorder, #147fc2) 20%, transparent);
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0.07em;
-  text-transform: uppercase;
-}
-
-#gpu-backend[data-backend='webgpu'] {
-  color: #cbf5d8;
-  border-color: color-mix(in srgb, #57cc7a 55%, transparent);
-  background: color-mix(in srgb, #57cc7a 17%, transparent);
-}
-
-#gpu-status {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--gpu-muted);
-  font-variant-numeric: tabular-nums;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 
 /* Legacy fixed-viewport canvas host. Permanently inert: the per-row SVG graph
    cells are the active graph and live inside the scrolling row DOM, so no

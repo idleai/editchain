@@ -40,6 +40,9 @@ pub enum RecordRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActivityKind {
+    /// A synthetic aggregate of the work performed between conversational
+    /// turns. Individual member rows retain their own concrete activity kind.
+    Work,
     /// Conversational exchange (user/agent messages).
     Conversation,
     /// Planning, reasoning, or reflection.

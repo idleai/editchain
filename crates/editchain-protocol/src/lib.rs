@@ -259,7 +259,7 @@ pub struct SearchRequest {
 /// no row in that view. It never auto-expands or changes expansion state: each
 /// match carries the stable real `node_key` of its top-level row plus the
 /// absolute expanded-history parent-row offset (0 = newest) that matches
-/// `GetWindow` offsets and the `ViewSnapshot.starts` prefix sums the viewer
+/// `GetWindow` offsets and the fixed expanded-row coordinates the viewer
 /// already retains.
 ///
 /// The request carries the exact [`ChainFilterDto`] and `hide_submodules` value
@@ -466,8 +466,14 @@ pub struct HistoryRow {
     /// own; they inherit the parent's lane for a continuation line.
     #[serde(default)]
     pub is_subop: bool,
-    /// Absolute row index of the parent's collapsed row, for sub-op rows.
-    /// `None` on top-level rows.
+    /// Nesting depth in the expandable presentation tree. Top-level graph rows
+    /// are `0`; direct work-group members are `1`; children of an existing
+    /// bundle/member are `2`. Older one-level services omit this and default to
+    /// `0` (the `is_subop` flag remains the compatibility signal).
+    #[serde(default)]
+    pub hierarchy_depth: u8,
+    /// Absolute row index of the direct parent row for nested rows. `None` on
+    /// top-level graph rows.
     #[serde(default)]
     pub parent_row: Option<usize>,
     /// Semantic class for the sub-op's icon (e.g. `"meta"`, `"edit"`, `"msg"`,
@@ -600,12 +606,15 @@ pub struct ActivityBundleDto {
 
 /// Provider-neutral kinds for an activity bundle row.
 ///
-/// Serialized as kebab-case strings (`"execute-run"`, `"plan-repeat"`). Unknown strings
-/// deserialize to [`Self::Unknown`] so older clients tolerate new bundle kinds
-/// from newer services (forward compatibility).
+/// Serialized as kebab-case strings (`"work-group"`, `"execute-run"`,
+/// `"plan-repeat"`). Unknown strings deserialize to [`Self::Unknown`] so
+/// older clients tolerate new bundle kinds from newer services.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ActivityBundleKind {
+    /// All linear non-chat activity between conversational boundaries. Existing
+    /// execute/plan bundles remain expandable children of this outer group.
+    WorkGroup,
     /// A synthetic Activity-view summary node folding a maximal contiguous
     /// run of low-signal execute rows into one expandable run.
     ExecuteRun,
@@ -693,13 +702,30 @@ pub struct HistoryWindow {
     /// Global per-top-level-node bundled sub-op counts for this filter state.
     /// Present on the offset-zero window that establishes a snapshot and omitted
     /// from subsequent pages so response size remains proportional to `limit`.
-    /// The client retains these prefix sums for visible/absolute index mapping.
+    /// Retained for top-level block lookup and compatibility with one-level
+    /// clients; current clients use `expansion_spans` for nested visibility.
     #[serde(default)]
     pub sub_op_counts: Option<Vec<usize>>,
+    /// Global expandable-row spans for this fixed snapshot. Each entry names an
+    /// absolute row and the number of contiguous descendant slots immediately
+    /// following it. Present only on the offset-zero window, like
+    /// `sub_op_counts`. This additive index generalizes one-level sub-op
+    /// collapse to the bounded two-level work-group hierarchy.
+    #[serde(default)]
+    pub expansion_spans: Option<Vec<ExpansionSpanDto>>,
     /// Whether lane/connector fields contain the globally computed layout.
     /// `false` denotes a row-complete provisional first paint.
     #[serde(default)]
     pub layout_ready: bool,
+}
+
+/// One collapsible row's contiguous descendant interval in expanded history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpansionSpanDto {
+    /// Absolute expanded-history row occupied by the expandable parent.
+    pub row: u64,
+    /// Number of descendant slots following `row` in depth-first order.
+    pub descendant_count: u64,
 }
 
 /// Details for a single history node (for the inspector).
@@ -795,7 +821,7 @@ pub struct SearchResponse {
 /// row are deduplicated into one match, keeping the best (highest) BM25 score.
 /// `row` is the absolute expanded-history parent-row offset of the containing
 /// top-level row — the same coordinate the viewer derives from its
-/// `sub_op_counts` prefix sums and the `parent_row` values in `GetWindow`
+/// fixed expanded coordinates and the `parent_row` values in `GetWindow`
 /// responses, so arrow-key navigation never needs to auto-expand anything.
 ///
 /// Identity fields mirror [`SearchHit`] so the viewer can route clicks with the
@@ -936,6 +962,7 @@ mod tests {
             transitions: Vec::new(),
             sub_ops: Vec::new(),
             is_subop: false,
+            hierarchy_depth: 0,
             parent_row: None,
             subop_kind: None,
             record_role: editchain_project::taxonomy::RecordRole::Artifact,
@@ -1503,6 +1530,7 @@ mod tests {
             transitions: Vec::new(),
             sub_ops: Vec::new(),
             is_subop: false,
+            hierarchy_depth: 0,
             parent_row: None,
             subop_kind: None,
             record_role: editchain_project::taxonomy::RecordRole::Action,
@@ -1578,6 +1606,17 @@ mod tests {
         assert_eq!(plan_back.kind, ActivityBundleKind::PlanRepeat);
         assert_eq!(plan_back.member_count, 3);
 
+        let work_group = ActivityBundleDto {
+            kind: ActivityBundleKind::WorkGroup,
+            member_count: 5,
+        };
+        let work_json = serde_json::to_value(&work_group).expect("serialize work group");
+        assert_eq!(work_json["kind"], "work-group");
+        let work_back: ActivityBundleDto =
+            serde_json::from_value(work_json).expect("deserialize work group");
+        assert_eq!(work_back.kind, ActivityBundleKind::WorkGroup);
+        assert_eq!(work_back.member_count, 5);
+
         // A missing `activity_bundle` member defaults to None, keeping older
         // payloads additive-compatible with the new field.
         let without_bundle: HistoryRow = serde_json::from_value(serde_json::json!({
@@ -1594,6 +1633,7 @@ mod tests {
         }))
         .expect("row without activity_bundle deserializes");
         assert_eq!(without_bundle.activity_bundle, None);
+        assert_eq!(without_bundle.hierarchy_depth, 0);
 
         // Unknown bundle kinds from a newer service deserialize to the
         // forward-compatible Unknown variant (and re-serialize as a string),

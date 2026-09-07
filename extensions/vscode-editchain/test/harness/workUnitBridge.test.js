@@ -7,7 +7,8 @@
 //     activity_bundle metadata and DEFAULTS the additive fields on rows that
 //     omit them (mirroring the HistoryRow serde defaults);
 //   - the activity_bundle kind is coerced through the wire enum exactly like
-//     serde: "execute-run" and "plan-repeat" survive, any other string maps
+//     serde: "work-group", "execute-run", and "plan-repeat" survive, any
+//     other string maps
 //     to "unknown" (forward compatibility), so clients style only recognized
 //     typed bundles;
 //   - the Raw profile (hide_trace=false on the wire) is served the unbundled
@@ -218,6 +219,8 @@ test('bridge DEFAULTS additive fields and coerces the bundle kind enum (serde pa
         activity_bundle: { kind: 'execute-run', member_count: 2 } },
       { ...legacy, node_key: 'b:2', summary: 'typed plans', kind: 'reflection',
         activity_bundle: { kind: 'plan-repeat', member_count: 3 } },
+      { ...legacy, node_key: 'b:work', summary: 'typed work', kind: 'work-group',
+        activity_bundle: { kind: 'work-group', member_count: 5 } },
       { ...legacy, node_key: 'b:3', summary: 'unknown kind run', kind: 'command',
         activity_bundle: { kind: 'checkpoint', member_count: 4 } },
     ],
@@ -229,6 +232,8 @@ test('bridge DEFAULTS additive fields and coerces the bundle kind enum (serde pa
     'typed kind survives the enum round trip');
   assert.equal(coerced.find((r) => r.node_key === 'b:2').activity_bundle.kind, 'plan-repeat',
     'typed Plan-repeat kind survives the enum round trip');
+  assert.equal(coerced.find((r) => r.node_key === 'b:work').activity_bundle.kind, 'work-group',
+    'typed work-group kind survives the enum round trip');
   assert.equal(coerced.find((r) => r.node_key === 'b:3').activity_bundle.kind, 'unknown',
     'unknown wire strings coerce to the Unknown variant (forward compatibility)');
 });

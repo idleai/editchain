@@ -1036,21 +1036,27 @@
     // the graph INTO each row as a row-local svg.graph-row-fragment (proven by
     // checks 3b/3c) and removed the single overlay canvas, so this check
     // asserts the lane contract and the absence of any canvas surface: every
-    // non-subop row renders a visible .graph-cell whose row's lane maps onto a
-    // fixed laneXAll center, and no canvas lives under #gpu-canvas-host.
+    // row renders a visible .graph-cell and a node marker whose lane maps onto
+    // a fixed laneXAll center, and no canvas lives under #gpu-canvas-host.
     if (wrapEl && g && typeof g.laneXAll === 'function') {
       const laneX = g.laneXAll();
       const rowEls = wrapEl.querySelectorAll('.row:not(.row-placeholder)');
       let nodesOk = true;
       let firstFail = null;
       rowEls.forEach((row) => {
-        if (row.classList.contains('row-subop')) return; // sub-op rows draw no node
         const absIdx = Number(row.getAttribute('data-row'));
         const cell = row.querySelector('.graph-cell');
         if (!cell || cell.getBoundingClientRect().width <= 0) {
           nodesOk = false;
           firstFail = firstFail || { rowIdx: absIdx, reason: 'no visible graph cell' };
           return;
+        }
+        const marker = row.classList.contains('row-subop')
+          ? cell.querySelector('.graphDot')
+          : cell.querySelector('.graphDot, .graphBundleCapsule');
+        if (!marker) {
+          nodesOk = false;
+          firstFail = firstFail || { rowIdx: absIdx, reason: 'no node marker' };
         }
         const cached = rowAt(absIdx);
         if (cached && Number.isFinite(cached.lane)) {
@@ -1165,7 +1171,8 @@
       let firstFailCol = null;
       if (firstRow) {
         const colClasses = [
-          'graph-cell', 'activity-cell', 'text-cell', 'date-cell', 'author-cell', 'commit-cell',
+          'graph-cell', 'activity-cell', 'tags-cell', 'text-cell', 'date-cell',
+          'author-cell', 'commit-cell',
         ];
         headerCells.forEach((th, i) => {
           const rc = firstRow.querySelector('.' + colClasses[i]);
@@ -1212,7 +1219,42 @@
       });
     }
 
-    // Check 5c: the controls bar must fit its container.
+    // Check 5c: the default visible Date track must fit its complete label.
+    // A custom user drag may intentionally narrow it later; this probe runs
+    // against the freshly opened default layout.
+    if (wrapEl) {
+      const dateCells = Array.from(wrapEl.querySelectorAll('.date-cell'))
+        .filter((cell) => (cell.textContent || '').trim() !== '' &&
+          getComputedStyle(cell).display !== 'none');
+      const clipped = dateCells.filter((cell) =>
+        cell.scrollWidth > cell.clientWidth + 1);
+      checks.push({
+        name: 'DATE_COLUMN_FITS',
+        pass: clipped.length === 0,
+        detail: clipped.length === 0
+          ? dateCells.length + ' visible date labels fit without ellipsis'
+          : clipped.length + '/' + dateCells.length + ' date labels overflow; first=' +
+            JSON.stringify({
+              text: (clipped[0].textContent || '').trim(),
+              clientWidth: clipped[0].clientWidth,
+              scrollWidth: clipped[0].scrollWidth,
+            }),
+      });
+    }
+
+    // Check 5d: the renderer exposes no visual backend/status strip above the
+    // actual history controls.
+    const rendererStatusBars = document.querySelectorAll(
+      '#gpu-toolbar, #gpu-backend, #gpu-status');
+    checks.push({
+      name: 'RENDERER_STATUS_BAR_ABSENT',
+      pass: rendererStatusBars.length === 0,
+      detail: rendererStatusBars.length === 0
+        ? 'no SVG backend/status strip'
+        : rendererStatusBars.length + ' renderer status elements remain',
+    });
+
+    // Check 5e: the controls bar must fit its container.
     const controlsEl = document.getElementById('controls');
     if (controlsEl) {
       const fits = controlsEl.scrollWidth <= controlsEl.clientWidth + 1;
@@ -1224,7 +1266,7 @@
       });
     }
 
-    // Check 5d: the graph column must stay visible (never collapsed/hidden).
+    // Check 5f: the graph column must stay visible (never collapsed/hidden).
     if (rowsEl && !viewMessage) {
       const graphCell = rowsEl.querySelector('.graph-cell');
       const graphW = graphCell ? graphCell.getBoundingClientRect().width : 0;
@@ -1241,8 +1283,8 @@
       });
     }
 
-    // Check 5e: the production cell classes obey the Pulse geometry — Activity
-    // is always visible immediately before Content, author/commit are hidden,
+    // Check 5g: the production cell classes obey the Pulse geometry — Activity
+    // and Tags are always visible before Content, author/commit are hidden,
     // and date drops only at the narrowest breakpoint.
     if (wrapEl && !viewMessage) {
       const firstRow = wrapEl.querySelector('.row:not(.row-placeholder)');
@@ -1253,6 +1295,7 @@
         if (innerW <= 400) hidden.add('date');
         const cols = [
           { name: 'activity', cls: 'activity-cell' },
+          { name: 'tags', cls: 'tags-cell' },
           { name: 'content', cls: 'text-cell' },
           { name: 'date', cls: 'date-cell' },
           { name: 'author', cls: 'author-cell' },
@@ -1286,13 +1329,14 @@
       }
     }
 
-    // Check 5g: readable contrast for Content/Date/Author/Commit text.
+    // Check 5h: readable contrast for Content/Date/Author/Commit text.
     if (wrapEl && !viewMessage) {
       const firstRow = wrapEl.querySelector('.row:not(.row-placeholder)');
       if (firstRow) {
         const bg = effectiveBackground(firstRow);
         const cells = [
           { sel: '.activity-cell', name: 'activity' },
+          { sel: '.tags-cell', name: 'tags' },
           { sel: '.summary', name: 'content' },
           { sel: '.date-cell', name: 'date' },
           { sel: '.author-cell', name: 'author' },
@@ -1388,6 +1432,29 @@
       });
     }
 
+    // Check 5ja: each visible header boundary has an ordered, visibly marked
+    // drag target. Activity and Tags participate in the same resize contract
+    // as Graph, Content, and Date.
+    if (headerEl && !viewMessage) {
+      const handles = Array.from(headerEl.querySelectorAll('.col-resize-handle'));
+      const expected = ['graph', 'activity', 'tags', 'content'];
+      if ((window.innerWidth || 0) > 400) expected.push('date');
+      const actual = handles.map((handle) => handle.getAttribute('data-col') || '');
+      const positions = handles.map((handle) => handle.getBoundingClientRect().left);
+      const ordered = positions.every((left, index) =>
+        index === 0 || left > positions[index - 1]);
+      const visibleIndicators = handles.every((handle) => {
+        const style = getComputedStyle(handle, '::after');
+        return style.width === '1px' && style.backgroundColor !== 'rgba(0, 0, 0, 0)';
+      });
+      checks.push({
+        name: 'RESIZE_HANDLES_COMPLETE',
+        pass: actual.join('|') === expected.join('|') && ordered && visibleIndicators,
+        detail: 'expected=' + expected.join('|') + '; actual=' + actual.join('|') +
+          '; ordered=' + ordered + '; indicators=' + visibleIndicators,
+      });
+    }
+
     // Check 5k: the Activity/Raw segmented control exists, is labelled, and
     // reflects the ACTIVE profile.
     const profileControl = document.getElementById('profile-control');
@@ -1433,10 +1500,10 @@
       const header = rowsEl.querySelector('.tbl-header');
       const labelled = !!grid && grid.getAttribute('aria-label') === 'History rows';
       const headerInside = !!header && !!grid && grid.contains(header);
-      // Pulse renders exactly four columnheaders
-      // (graph/activity/content/date); author/commit are hidden cells.
+      // Pulse renders exactly five columnheaders
+      // (graph/activity/tags/content/date); author/commit are hidden cells.
       const colHeadersInside = !!header &&
-        header.querySelectorAll('[role="columnheader"]').length === 4;
+        header.querySelectorAll('[role="columnheader"]').length === 5;
       const gridOwnsRows = grids.length === 1 && !!grid &&
         !!wrapEl.closest('.tbl-grid');
       let rowsOk = rowEls.length > 0;
@@ -1537,7 +1604,8 @@
       for (const row of rows) {
         const cells = row.querySelectorAll('.activity-cell');
         const cell = cells[0] || null;
-        const text = cell ? (cell.textContent || '').trim() : '';
+        const label = cell && cell.querySelector('.activity-label');
+        const text = label ? (label.textContent || '').trim() : '';
         const data = row.getAttribute('data-classification') || '';
         if (cells.length !== 1 || !text || text !== data || row.querySelector('.act-badge')) {
           if (bad.length < 5) {
@@ -1560,6 +1628,34 @@
       });
     }
 
+    // Check 5qb: every chip-like row annotation belongs directly to the Tags
+    // column, which sits between Activity and Content. Content stays prose.
+    if (wrapEl && !viewMessage) {
+      const rows = Array.from(wrapEl.querySelectorAll('.row:not(.row-placeholder)'));
+      const chipSelector = [
+        '.git-prefix-chip', '.bundle-count', '.bundle-status',
+        '.session-chip', '.rel-badge', '.out-badge', '.work-unit-count',
+      ].join(',');
+      const chips = Array.from(wrapEl.querySelectorAll(chipSelector));
+      const header = Array.from(headerEl ? headerEl.querySelectorAll('.th') : [])
+        .map((cell) => (cell.textContent || '').trim());
+      const misplaced = chips.filter((chip) =>
+        !chip.parentElement || !chip.parentElement.classList.contains('tags-cell'));
+      const contentChips = wrapEl.querySelectorAll('.text-cell :is(' + chipSelector + ')');
+      const rowsWithoutOneTagsCell = rows.filter((row) =>
+        row.querySelectorAll('.tags-cell').length !== 1);
+      checks.push({
+        name: 'TAGS_COLUMN_OWNS_CHIPS',
+        pass: rows.length > 0 &&
+          header.join('|') === 'Graph|Activity|Tags|Content|Date' &&
+          misplaced.length === 0 && contentChips.length === 0 &&
+          rowsWithoutOneTagsCell.length === 0,
+        detail: 'header=' + header.join('|') + '; chips=' + chips.length +
+          '; misplaced=' + misplaced.length + '; content=' + contentChips.length +
+          '; missing cells=' + rowsWithoutOneTagsCell.length,
+      });
+    }
+
     // Check 5r: Git text before the first colon becomes one exact chip.
     if (wrapEl && !viewMessage) {
       const problems = [];
@@ -1577,7 +1673,10 @@
           prefixed++;
           if (!chip || chip.textContent.trim() !== expectedPrefix) {
             problems.push(row.node_key + ': Git prefix chip mismatch');
-          } else if ((chip.parentElement.textContent || '').includes(expectedPrefix + ':')) {
+          } else if (!chip.parentElement.classList.contains('tags-cell')) {
+            problems.push(row.node_key + ': Git prefix chip is outside Tags');
+          } else if ((el.querySelector('.text-cell')?.textContent || '')
+            .includes(expectedPrefix + ':')) {
             problems.push(row.node_key + ': Git prefix delimiter is still visible');
           }
         } else {

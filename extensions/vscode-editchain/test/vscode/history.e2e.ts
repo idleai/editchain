@@ -753,11 +753,14 @@ describe('EditChain History Explorer', () => {
                 Number(/^\d+/.exec(text)![0]) !== row.work_unit.count ||
                 !/entr(?:y|ies)$/.test(text))) {
               problems.push('work-unit entry count text "' + text + '" != ' + row.work_unit.count + ' on ' + abs);
+            } else if (countEl && !countEl.parentElement?.classList.contains('tags-cell')) {
+              problems.push('work-unit count is outside Tags on ' + abs);
             }
           }
         }
         const typedBundle = row.activity_bundle &&
-          (row.activity_bundle.kind === 'execute-run' ||
+          (row.activity_bundle.kind === 'work-group' ||
+            row.activity_bundle.kind === 'execute-run' ||
             row.activity_bundle.kind === 'plan-repeat');
         if (typedBundle) {
           typedBundles++;
@@ -772,6 +775,8 @@ describe('EditChain History Explorer', () => {
           const text = countEl ? (countEl.textContent || '').trim() : '';
           if (!countEl || Number(/^\d+/.exec(text)?.[0]) !== row.activity_bundle.member_count) {
             problems.push('bundle-count text mismatch on ' + abs);
+          } else if (!countEl.parentElement?.classList.contains('tags-cell')) {
+            problems.push('bundle-count is outside Tags on ' + abs);
           }
           const statusEl = el.querySelector('.bundle-status');
           const statusText = statusEl ? (statusEl.textContent || '').trim() : '';
@@ -779,9 +784,11 @@ describe('EditChain History Explorer', () => {
             if (!statusEl || statusText !== '✓' ||
                 !statusEl.classList.contains('bundle-status-success')) {
               problems.push('successful bundle missing quiet success check on ' + abs);
+            } else if (!statusEl.parentElement?.classList.contains('tags-cell')) {
+              problems.push('bundle status is outside Tags on ' + abs);
             }
           } else if (statusEl) {
-            problems.push('non-success/plan bundle renders noisy status on ' + abs);
+            problems.push('bundle without successful execute outcome renders noisy status on ' + abs);
           }
         } else if (row.activity_bundle) {
           // Forward-compatible unknown bundle kind: never styled as execute-run.
@@ -795,6 +802,10 @@ describe('EditChain History Explorer', () => {
         }
         if (row.promoted === false && el.classList.contains('row-promoted')) {
           problems.push('non-promoted row has .row-promoted on ' + abs);
+        }
+        if (el.querySelector('.text-cell :is(.git-prefix-chip, .bundle-count, .bundle-status, ' +
+            '.session-chip, .rel-badge, .out-badge, .work-unit-count)')) {
+          problems.push('Content contains a row tag on ' + abs);
         }
       }
       return {

@@ -2046,13 +2046,13 @@ fn service_path_truncated_echo_texts_never_pair_but_untruncated_exact_pairs_do()
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_twenty_six() {
+fn prepared_snapshot_manifest_records_projection_revision_twenty_seven() {
     // Stale snapshots from earlier projection revisions (pre-hide_trace,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
     // duplicate-pair exclusion, pre prefix-string escape decoding, and pre
-    // Activity work-unit/promotion/execute-run/Plan-repeat bundling and
-    // inline-compaction semantics, exact provider relations, legacy Codex
+    // Activity work-unit/promotion/execute-run/Plan-repeat/work-group bundling
+    // and inline-compaction semantics, exact provider relations, legacy Codex
     // token-usage contraction, correlation-only tool results, exact Claude
     // response contraction, authoritative view-parent rewrites, and causal
     // produced-commit branch edges, and default timestamp-zero omission) must
@@ -2072,7 +2072,7 @@ fn prepared_snapshot_manifest_records_projection_revision_twenty_six() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 26u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 27u64);
 }
 
 #[test]
@@ -2179,14 +2179,38 @@ fn activity_keeps_context_compaction_visible_and_inline_while_raw_stays_exact() 
     let activity_rows: Vec<&HistoryRow> =
         activity.rows.iter().filter(|row| !row.is_subop).collect();
     assert_eq!(activity_rows.len(), 3);
-    let activity_checkpoint = activity_rows
+    let activity_work = activity_rows
         .iter()
         .copied()
         .find(|row| row.node_key == compacted.id.to_string())
-        .expect("Activity keeps the compaction checkpoint");
+        .expect("Activity wraps the compaction checkpoint in one work group");
+    assert_eq!(activity_work.visibility, Visibility::Primary);
+    assert_eq!(activity_work.activity_kind, ActivityKind::Work);
+    assert_eq!(
+        activity_work
+            .activity_bundle
+            .as_ref()
+            .map(|bundle| bundle.kind),
+        Some(ActivityBundleKind::WorkGroup)
+    );
+    assert_eq!(activity_work.parents, vec![root.id.to_string()]);
+    let work_index = activity
+        .rows
+        .iter()
+        .position(|row| row.node_key == activity_work.node_key)
+        .expect("work row index");
+    let activity_checkpoint = activity
+        .rows
+        .iter()
+        .find(|row| {
+            row.is_subop
+                && row.parent_row == Some(work_index)
+                && row.op_id.as_deref() == Some(compacted.id.to_string().as_str())
+        })
+        .expect("expanded work group retains the compaction checkpoint");
+    assert_eq!(activity_checkpoint.hierarchy_depth, 1);
     assert_eq!(activity_checkpoint.visibility, Visibility::Primary);
     assert_eq!(activity_checkpoint.activity_kind, ActivityKind::Plan);
-    assert_eq!(activity_checkpoint.parents, vec![root.id.to_string()]);
     let activity_continuation = activity_rows
         .iter()
         .copied()
@@ -2199,7 +2223,7 @@ fn activity_keeps_context_compaction_visible_and_inline_while_raw_stays_exact() 
     assert!(
         activity_rows
             .iter()
-            .all(|row| row.lane == activity_checkpoint.lane),
+            .all(|row| row.lane == activity_work.lane),
         "checkpoint and continuation stay on the session lane"
     );
 
@@ -2301,10 +2325,28 @@ fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() 
     assert_eq!(raw_value["work_unit"]["is_start"], true);
     assert_eq!(raw_value["promoted"], true);
 
-    // Activity view: three top-level rows plus the bundle's three expandable
-    // member rows, with the original op ids retrievable.
-    assert_eq!(activity_window.total, 6);
-    assert_eq!(activity_window.rows.len(), 6);
+    // Activity view: chat / outer work / chat. Opening work reveals the
+    // existing execute bundle; opening that reveals its three original tools.
+    assert_eq!(activity_window.total, 7);
+    assert_eq!(activity_window.rows.len(), 7);
+    let work_group = activity_window
+        .rows
+        .iter()
+        .find(|row| {
+            row.activity_bundle
+                .as_ref()
+                .is_some_and(|bundle| bundle.kind == ActivityBundleKind::WorkGroup)
+        })
+        .expect("activity view has the outer work group");
+    assert_eq!(work_group.activity_kind, ActivityKind::Work);
+    assert_eq!(
+        work_group
+            .activity_bundle
+            .as_ref()
+            .map(|meta| meta.member_count),
+        Some(3)
+    );
+    assert!(work_group.summary.contains("3 activities"));
     let bundle = activity_window
         .rows
         .iter()
@@ -2314,6 +2356,8 @@ fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() 
     assert_eq!(bundle.visibility, Visibility::Primary);
     assert_eq!(bundle.outcome, Outcome::Success);
     assert!(bundle.is_system);
+    assert!(bundle.is_subop);
+    assert_eq!(bundle.hierarchy_depth, 1);
     assert_eq!(
         bundle.activity_bundle.as_ref().map(|meta| meta.kind),
         Some(ActivityBundleKind::ExecuteRun)
@@ -2330,19 +2374,28 @@ fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() 
     assert_eq!(bundle_value["activity_bundle"]["kind"], "execute-run");
     assert_eq!(bundle_value["activity_bundle"]["member_count"], 3u64);
     assert_eq!(
-        bundle.work_unit.as_ref().map(|unit| unit.id.as_str()),
+        work_group.work_unit.as_ref().map(|unit| unit.id.as_str()),
         Some("session:1/turn:1")
     );
-    assert_eq!(bundle.work_unit.as_ref().map(|unit| unit.count), Some(3u64));
+    assert_eq!(
+        work_group.work_unit.as_ref().map(|unit| unit.count),
+        Some(3u64)
+    );
+    let work_index = activity_window
+        .rows
+        .iter()
+        .position(|row| row.node_key == work_group.node_key)
+        .expect("work row index");
     let bundle_index = activity_window
         .rows
         .iter()
         .position(|row| row.node_key == bundle.node_key)
         .unwrap_or(0);
+    assert_eq!(bundle.parent_row, Some(work_index));
     let member_rows: Vec<&HistoryRow> = activity_window
         .rows
         .iter()
-        .filter(|row| row.is_subop && row.parent_row == Some(bundle_index))
+        .filter(|row| row.hierarchy_depth == 2 && row.parent_row == Some(bundle_index))
         .collect();
     assert_eq!(member_rows.len(), 3);
     assert!(member_rows[0].op_id.is_some());
@@ -2350,7 +2403,7 @@ fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() 
     assert!(member_rows[2].op_id.is_some());
     assert!(
         member_rows.iter().all(|row| row.activity_bundle.is_none()),
-        "expanded member (sub-op) rows never carry activity-bundle metadata"
+        "leaf member rows never carry activity-bundle metadata"
     );
     // The member rows are the original tool rows: ids 2..=4 as raw imports.
     let member_ids: Vec<String> = member_rows
@@ -2361,7 +2414,22 @@ fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() 
     // Expansion index ships once for the snapshot window.
     assert_eq!(
         activity_window.sub_op_counts.as_deref(),
-        Some(&[0usize, 3, 0][..])
+        Some(&[0usize, 4, 0][..])
+    );
+    assert_eq!(
+        activity_window.expansion_spans.as_deref(),
+        Some(
+            &[
+                editchain_protocol::ExpansionSpanDto {
+                    row: 1,
+                    descendant_count: 4,
+                },
+                editchain_protocol::ExpansionSpanDto {
+                    row: 2,
+                    descendant_count: 3,
+                },
+            ][..]
+        )
     );
     // Top-level order is preserved: agent answer, bundle, user request.
     let top_level: Vec<&HistoryRow> = activity_window
@@ -2371,12 +2439,12 @@ fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() 
         .collect();
     assert_eq!(top_level.len(), 3);
     assert_eq!(top_level[0].activity_kind, ActivityKind::Conversation);
-    assert_eq!(top_level[1].node_key, bundle.node_key);
+    assert_eq!(top_level[1].node_key, work_group.node_key);
     assert_eq!(top_level[2].activity_kind, ActivityKind::Conversation);
     assert!(
         top_level
             .iter()
-            .filter(|row| row.node_key != bundle.node_key)
+            .filter(|row| row.node_key != work_group.node_key)
             .all(|row| row.activity_bundle.is_none()),
         "ordinary top-level rows never carry activity-bundle metadata"
     );
@@ -2435,15 +2503,40 @@ fn activity_view_groups_repeated_plans_as_expandable_linear_updates() {
     let wire = serde_json::to_value(bundle).expect("serialize Plan bundle");
     assert_eq!(wire["activity_bundle"]["kind"], "plan-repeat");
 
+    let work_group = activity
+        .rows
+        .iter()
+        .find(|row| {
+            row.activity_bundle
+                .as_ref()
+                .is_some_and(|metadata| metadata.kind == ActivityBundleKind::WorkGroup)
+        })
+        .expect("Activity has one outer work group");
+    assert_eq!(work_group.activity_kind, ActivityKind::Work);
+    assert_eq!(
+        work_group
+            .activity_bundle
+            .as_ref()
+            .map(|metadata| metadata.member_count),
+        Some(3)
+    );
+    let work_index = activity
+        .rows
+        .iter()
+        .position(|row| row.node_key == work_group.node_key)
+        .expect("work row index");
+
     let bundle_index = activity
         .rows
         .iter()
         .position(|row| row.node_key == bundle.node_key)
         .expect("bundle row index");
+    assert_eq!(bundle.parent_row, Some(work_index));
+    assert_eq!(bundle.hierarchy_depth, 1);
     let members: Vec<&HistoryRow> = activity
         .rows
         .iter()
-        .filter(|row| row.is_subop && row.parent_row == Some(bundle_index))
+        .filter(|row| row.hierarchy_depth == 2 && row.parent_row == Some(bundle_index))
         .collect();
     assert_eq!(members.len(), 3);
     assert_eq!(
@@ -2463,8 +2556,8 @@ fn activity_view_groups_repeated_plans_as_expandable_linear_updates() {
     let top_level: Vec<&HistoryRow> = activity.rows.iter().filter(|row| !row.is_subop).collect();
     assert_eq!(top_level.len(), 3);
     assert!(top_level.iter().all(|row| row.lane == 0));
-    assert_eq!(top_level[0].parents, vec![bundle.node_key.clone()]);
-    assert_eq!(bundle.parents, vec![top_level[2].node_key.clone()]);
+    assert_eq!(top_level[0].parents, vec![work_group.node_key.clone()]);
+    assert_eq!(work_group.parents, vec![top_level[2].node_key.clone()]);
     assert_eq!(
         activity.max_lane, 0,
         "grouping does not allocate a branch lane"
@@ -2486,7 +2579,7 @@ fn activity_view_groups_repeated_plans_as_expandable_linear_updates() {
 }
 
 #[test]
-fn prepared_snapshot_serves_bundled_activity_view_and_records_revision_twenty_six() {
+fn prepared_snapshot_serves_nested_activity_view_and_records_revision_twenty_seven() {
     // The pregenerated render snapshot must serve the SAME bundled Activity
     // rows as the live projection (work-unit/promotion/bundling parity) and
     // record the bumped projection revision in its identity.
@@ -2524,8 +2617,8 @@ fn prepared_snapshot_serves_bundled_activity_view_and_records_revision_twenty_si
         include_layout: true,
     });
     assert_eq!(
-        expected.total, 6,
-        "activity view bundles 5 rows into 3 + 3 members"
+        expected.total, 7,
+        "activity view stores chat/work/chat + inner bundle + 3 members"
     );
     assert!(
         expected
@@ -2542,7 +2635,7 @@ fn prepared_snapshot_serves_bundled_activity_view_and_records_revision_twenty_si
         &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["identity"]["projection_revision"], 26u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 27u64);
 
     let mut cached =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");

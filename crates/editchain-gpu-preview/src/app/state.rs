@@ -244,8 +244,12 @@ pub(crate) struct HistoryAppState {
     pub(crate) session_flags: SessionFlags,
     pub(crate) sub_op_counts: Vec<u32>,
     pub(crate) block_starts: Vec<i64>,
-    pub(crate) prefix_contrib: Vec<i64>,
-    pub(crate) expanded_blocks: BTreeSet<usize>,
+    /// Absolute expanded-row index to contiguous descendant count.
+    pub(crate) expansion_spans: BTreeMap<i64, u32>,
+    /// Absolute expandable rows whose direct children are currently visible.
+    pub(crate) expanded_rows: BTreeSet<i64>,
+    /// Visible-index to absolute-index map after applying nested disclosure.
+    pub(crate) visible_abs: Vec<i64>,
     // --- render window (visible indices) ----------------------------------
     pub(crate) render_top: i64,
     pub(crate) render_bottom: i64,
@@ -286,8 +290,9 @@ impl Default for HistoryAppState {
             persisted: None,
             sub_op_counts: Vec::new(),
             block_starts: Vec::new(),
-            prefix_contrib: Vec::new(),
-            expanded_blocks: BTreeSet::new(),
+            expansion_spans: BTreeMap::new(),
+            expanded_rows: BTreeSet::new(),
+            visible_abs: Vec::new(),
             render_top: 0,
             render_bottom: -1,
             selected_key: None,
@@ -324,7 +329,15 @@ impl HistoryAppState {
         FIXED_HIDE_SUBMODULES
     }
 
-    // --- expansion mapping (prefix-sum helpers) ------------------------------
+    // --- expansion mapping ---------------------------------------------------
+
+    fn clear_expansion_state(&mut self) {
+        self.sub_op_counts.clear();
+        self.block_starts.clear();
+        self.expansion_spans.clear();
+        self.expanded_rows.clear();
+        self.visible_abs.clear();
+    }
 
     pub(crate) fn recompute_expansion(&mut self) {
         let n = self.sub_op_counts.len();
@@ -335,128 +348,92 @@ impl HistoryAppState {
             acc = acc.saturating_add(1).saturating_add(i64::from(*count));
         }
         self.block_starts = starts;
-        let mut contrib = Vec::with_capacity(n);
-        let mut pacc: i64 = 0;
-        for (index, count) in self.sub_op_counts.iter().enumerate() {
-            contrib.push(pacc);
-            pacc = pacc.saturating_add(if self.expanded_blocks.contains(&index) {
-                0
-            } else {
-                i64::from(*count)
-            });
-        }
-        self.prefix_contrib = contrib;
-    }
 
-    /// Hidden slots strictly before any slot inside block `b`.
-    pub(crate) fn hidden_before_block(&self, b: usize) -> i64 {
-        self.prefix_contrib.get(b).copied().unwrap_or(0)
+        // Older services expose only one-level top-level counts. Derive the
+        // equivalent generalized spans so the same walker handles both wire
+        // versions. A current service supplies explicit spans, including inner
+        // bundle rows nested under a work group.
+        if self.expansion_spans.is_empty() {
+            for (index, count) in self.sub_op_counts.iter().copied().enumerate() {
+                if count > 0 {
+                    if let Some(start) = self.block_starts.get(index).copied() {
+                        let _: Option<u32> = self.expansion_spans.insert(start, count);
+                    }
+                }
+            }
+        }
+        self.expanded_rows
+            .retain(|row| self.expansion_spans.contains_key(row));
+
+        self.visible_abs.clear();
+        let expansion_index_ready = self.session_flags.snapshot_established
+            || !self.sub_op_counts.is_empty()
+            || !self.expansion_spans.is_empty();
+        if !expansion_index_ready {
+            return;
+        }
+        let total = self.total.unwrap_or(0).max(0);
+        let mut abs = 0i64;
+        while abs < total {
+            self.visible_abs.push(abs);
+            if let Some(descendants) = self.expansion_spans.get(&abs).copied() {
+                if !self.expanded_rows.contains(&abs) {
+                    abs = abs.saturating_add(1).saturating_add(i64::from(descendants));
+                    continue;
+                }
+            }
+            abs = abs.saturating_add(1);
+        }
     }
 
     /// Total number of visible rows given the current reveal state.
     pub(crate) fn visible_total(&self) -> i64 {
-        let mut hidden: i64 = 0;
-        for (index, count) in self.sub_op_counts.iter().enumerate() {
-            if !self.expanded_blocks.contains(&index) {
-                hidden = hidden.saturating_add(i64::from(*count));
-            }
+        if self.session_flags.snapshot_established
+            || !self.sub_op_counts.is_empty()
+            || !self.expansion_spans.is_empty()
+        {
+            return i64::try_from(self.visible_abs.len())
+                .unwrap_or(i64::MAX)
+                .max(1);
         }
-        self.total.unwrap_or(0).saturating_sub(hidden).max(1)
+        self.total.unwrap_or(0).max(1)
     }
 
     /// Map a visible index back to its absolute slot index (or `None` for a
     /// hidden collapsed sub-op slot). Identity before the snapshot arrives.
     pub(crate) fn abs_index_for_visible(&self, vis: i64) -> Option<i64> {
-        if self.block_starts.is_empty() {
-            return Some(vis.max(0));
-        }
         if vis < 0 {
             return None;
         }
-        let mut lo = 0usize;
-        let mut hi = self.block_starts.len();
-        while lo < hi {
-            let mid = lo.saturating_add(hi) >> 1;
-            let v_start_mid = self
-                .block_starts
-                .get(mid)
-                .copied()
-                .unwrap_or(0)
-                .saturating_sub(self.hidden_before_block(mid));
-            if v_start_mid <= vis {
-                lo = lo.saturating_add(1);
-            } else {
-                hi = mid;
-            }
+        if self.session_flags.snapshot_established
+            || !self.sub_op_counts.is_empty()
+            || !self.expansion_spans.is_empty()
+        {
+            return usize::try_from(vis)
+                .ok()
+                .and_then(|index| self.visible_abs.get(index).copied());
         }
-        if lo == 0 {
-            return None;
-        }
-        let b = lo.saturating_sub(1);
-        if b >= self.block_starts.len() {
-            return None;
-        }
-        let v_start_b = self
-            .block_starts
-            .get(b)
-            .copied()
-            .unwrap_or(0)
-            .saturating_sub(self.hidden_before_block(b));
-        let off_in_block_vis = vis.saturating_sub(v_start_b);
-        let count_b = self.sub_op_counts.get(b).copied().unwrap_or(0);
-        if !self.expanded_blocks.contains(&b) {
-            return (off_in_block_vis == 0).then(|| self.block_starts.get(b).copied().unwrap_or(0));
-        }
-        if off_in_block_vis > i64::from(count_b) {
-            return None;
-        }
-        Some(
-            self.block_starts
-                .get(b)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(off_in_block_vis),
-        )
+        Some(vis)
     }
 
     /// Map an absolute slot index back to its visible index (inverse of
     /// `abs_index_for_visible`); `None` for a hidden collapsed sub-op slot.
     pub(crate) fn visible_index_for_abs(&self, abs: i64) -> Option<i64> {
-        if self.block_starts.is_empty() {
-            return Some(abs);
+        if self.session_flags.snapshot_established
+            || !self.sub_op_counts.is_empty()
+            || !self.expansion_spans.is_empty()
+        {
+            return self
+                .visible_abs
+                .binary_search(&abs)
+                .ok()
+                .and_then(|index| i64::try_from(index).ok());
         }
-        let mut lo = 0usize;
-        let mut hi = self.block_starts.len();
-        while lo < hi {
-            let mid = lo.saturating_add(hi) >> 1;
-            if self.block_starts.get(mid).copied().unwrap_or(0) <= abs {
-                lo = lo.saturating_add(1);
-            } else {
-                hi = mid;
-            }
-        }
-        if lo == 0 {
-            return Some(abs);
-        }
-        let b = lo.saturating_sub(1);
-        if b >= self.block_starts.len() {
-            return Some(abs);
-        }
-        let off_in_block = abs.saturating_sub(self.block_starts.get(b).copied().unwrap_or(0));
-        if off_in_block > 0 && !self.expanded_blocks.contains(&b) {
-            return None; // hidden sub-op slot
-        }
-        Some(
-            self.block_starts
-                .get(b)
-                .copied()
-                .unwrap_or(0)
-                .saturating_sub(self.hidden_before_block(b))
-                .saturating_add(off_in_block),
-        )
+        Some(abs)
     }
 
     /// Index of the top-level node whose block starts at `abs_parent_row`.
+    #[cfg(test)]
     pub(crate) fn block_index_of_abs(&self, abs_parent_row: i64) -> Option<usize> {
         let mut lo = 0usize;
         let mut hi = self.block_starts.len();
@@ -481,23 +458,19 @@ impl HistoryAppState {
         }
     }
 
-    /// Toggle expansion of a top-level node by absolute parent-row index.
+    /// Toggle any expandable row by absolute expanded-history index.
     pub(crate) fn toggle_expanded(&mut self, abs_parent_row: i64) -> bool {
-        let Some(b) = self.block_index_of_abs(abs_parent_row) else {
-            return false;
-        };
-        let count = self.sub_op_counts.get(b).copied().unwrap_or(0);
-        if count == 0 {
+        if !self.expansion_spans.contains_key(&abs_parent_row) {
             return false;
         }
-        if !self.expanded_blocks.remove(&b) {
-            let _: bool = self.expanded_blocks.insert(b);
+        if !self.expanded_rows.remove(&abs_parent_row) {
+            let _: bool = self.expanded_rows.insert(abs_parent_row);
         }
         self.recompute_expansion();
         true
     }
 
-    /// `toggleExpandFor` — toggle a top-level row's reveal state and plan the
+    /// `toggleExpandFor` — toggle a row's reveal state and plan the
     /// full desired-window rebuild (`reanchorTo(desiredVisibleRange())` plus
     /// `ensureFilled()`), so every newly revealed sub-op slot fills the
     /// viewport instead of only the pre-expansion slice.
@@ -511,6 +484,11 @@ impl HistoryAppState {
             return;
         }
         let (top, bottom) = self.desired_visible_range(viewport);
+        // Reanchor replaces the DOM with exactly this visible range. Keep the
+        // reducer's rendered-window bounds in lockstep so the next sync does
+        // not append the newly exposed bottom row a second time.
+        self.render_top = top;
+        self.render_bottom = bottom;
         step.ops.push(DomOp::Reanchor { top, bottom });
         self.fetch_window(viewport, step);
     }
@@ -926,10 +904,17 @@ impl HistoryAppState {
         self.current_search_epoch
     }
 
-    /// Whether the top-level block at `block_index` is expanded (sub-ops
-    /// revealed). Collapsed blocks hide their sub-op slots from `visible_total`.
+    /// Whether the top-level block at `block_index` is expanded.
+    #[cfg(test)]
     pub(crate) fn is_block_expanded(&self, block_index: usize) -> bool {
-        self.expanded_blocks.contains(&block_index)
+        self.block_starts
+            .get(block_index)
+            .is_some_and(|row| self.expanded_rows.contains(row))
+    }
+
+    /// Whether an arbitrary expandable row is expanded.
+    pub(crate) fn is_row_expanded(&self, abs: i64) -> bool {
+        self.expanded_rows.contains(&abs)
     }
 
     // --- selection / roving focus --------------------------------------------------
@@ -976,9 +961,7 @@ impl HistoryAppState {
         let find_current = self
             .current_find_match()
             .is_some_and(|found| found.row == abs_index);
-        let expanded = self
-            .block_index_of_abs(abs_index)
-            .is_some_and(|block| self.expanded_blocks.contains(&block));
+        let expanded = self.is_row_expanded(abs_index);
         super::rows::RowContext {
             view,
             abs_index,
@@ -1318,8 +1301,7 @@ impl HistoryAppState {
             .enumerate()
             .map(|(i, hit)| Self::normalize_search_hit(hit, i64::try_from(i).unwrap_or(0)))
             .collect();
-        self.sub_op_counts.clear();
-        self.expanded_blocks.clear();
+        self.clear_expansion_state();
         self.recompute_expansion();
         self.cache.clear();
         self.total_fetched = 0;
@@ -1369,7 +1351,7 @@ impl HistoryAppState {
         self.view_gen = self.view_gen.saturating_add(1);
         self.session_flags.snapshot_established = false;
         self.session_flags.layout_ready = false;
-        self.sub_op_counts.clear();
+        self.clear_expansion_state();
         self.recompute_expansion();
         self.pending_window_req_id = None;
         self.cache.clear();
@@ -1544,7 +1526,7 @@ impl HistoryAppState {
                 self.session_flags.layout_ready = false;
                 self.current_search_epoch = None;
                 self.session_flags.snapshot_established = false;
-                self.sub_op_counts.clear();
+                self.clear_expansion_state();
                 self.recompute_expansion();
                 self.open_warnings = Self::collect_open_warnings(&value);
                 if !self.open_warnings.is_empty() {
@@ -1613,7 +1595,7 @@ impl HistoryAppState {
         self.set_profile(restored_profile, ProfileAction::Restore, viewport, step);
         self.view_gen = self.view_gen.saturating_add(1);
         self.session_flags.snapshot_established = false;
-        self.sub_op_counts.clear();
+        self.clear_expansion_state();
         self.recompute_expansion();
         step.sends.push(Send::Log(format!(
             "reveal: topRow={top_row} total={}",
@@ -1751,13 +1733,30 @@ impl HistoryAppState {
                 }
             }
         }
-        // Snapshot ships only with the offset-0 window. Rebuild the prefix
-        // sums and re-anchor (the identity-mapped first paint is now stale).
+        // Expansion indices ship only with the offset-0 window. Rebuild the
+        // depth-first visibility map and re-anchor (the identity-mapped first
+        // paint is now stale). `sub_op_counts` remains the compatibility path
+        // for one-level services; current services also send nested spans.
         if let Some(counts) = value.get("sub_op_counts").and_then(Value::as_array) {
             self.sub_op_counts = counts
                 .iter()
                 .map(|c| c.as_i64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0))
                 .collect();
+            self.expansion_spans.clear();
+            if let Some(spans) = value.get("expansion_spans").and_then(Value::as_array) {
+                for span in spans {
+                    let row = span.get("row").and_then(Value::as_i64);
+                    let descendants = span
+                        .get("descendant_count")
+                        .and_then(Value::as_i64)
+                        .and_then(|count| u32::try_from(count).ok());
+                    if let (Some(row), Some(descendants)) = (row, descendants) {
+                        if row >= 0 && descendants > 0 {
+                            let _: Option<u32> = self.expansion_spans.insert(row, descendants);
+                        }
+                    }
+                }
+            }
             self.session_flags.snapshot_established = true;
             self.recompute_expansion();
             step.ops.push(DomOp::Reanchor {
@@ -2745,6 +2744,41 @@ mod tests {
     }
 
     #[test]
+    fn nested_expansion_spans_hide_inner_children_until_both_levels_are_open() {
+        let mut state = HistoryAppState {
+            total: Some(7),
+            session_flags: SessionFlags {
+                snapshot_established: true,
+                ..SessionFlags::default()
+            },
+            sub_op_counts: vec![5, 0],
+            expansion_spans: BTreeMap::from([(0, 5), (1, 2)]),
+            ..Default::default()
+        };
+        state.recompute_expansion();
+        assert_eq!(state.visible_abs, vec![0, 6]);
+
+        assert!(state.toggle_expanded(0));
+        assert_eq!(
+            state.visible_abs,
+            vec![0, 1, 4, 5, 6],
+            "opening the work group reveals activities but keeps an inner bundle collapsed"
+        );
+        assert_eq!(state.visible_index_for_abs(2), None);
+
+        assert!(state.toggle_expanded(1));
+        assert_eq!(state.visible_abs, vec![0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(state.visible_index_for_abs(2), Some(2));
+
+        assert!(state.toggle_expanded(0));
+        assert_eq!(state.visible_abs, vec![0, 6]);
+        assert!(
+            state.is_row_expanded(1),
+            "inner disclosure state is retained"
+        );
+    }
+
+    #[test]
     fn open_warnings_collect_strings_and_diagnostics_summary() {
         let value = json!({
             "nodes": 100,
@@ -3095,7 +3129,7 @@ mod tests {
     #[test]
     fn toggle_expanded_ui_reanchors_the_desired_window_and_fetches() {
         let mut state = HistoryAppState {
-            total: Some(100),
+            total: Some(11),
             session_flags: SessionFlags {
                 snapshot_established: true,
                 ..SessionFlags::default()
@@ -3104,7 +3138,7 @@ mod tests {
             ..Default::default()
         };
         state.recompute_expansion();
-        for i in 0..100i64 {
+        for i in [0, 5, 6] {
             drop(state.cache.insert(i, row(i, &format!("node:{i}"), 1)));
         }
         let viewport = Viewport::new(0, 800);
@@ -3112,6 +3146,8 @@ mod tests {
         state.toggle_expanded_ui(0, &viewport, &mut step);
         assert!(state.is_block_expanded(0), "the parent block toggles open");
         let (want_top, want_bottom) = state.desired_visible_range(&viewport);
+        assert_eq!(state.render_top, want_top);
+        assert_eq!(state.render_bottom, want_bottom);
         assert!(
             step.ops.iter().any(|op| matches!(
                 op,

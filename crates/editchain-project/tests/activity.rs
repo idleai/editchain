@@ -23,8 +23,8 @@ use editchain_core::{
 };
 use editchain_project::activity::{
     annotate_activity_rows, bundle_activity_execute_runs, bundle_activity_plan_repeats,
-    bundle_claude_response_tool_fragments, inline_context_compaction_checkpoints,
-    ActivityRowAnnotation,
+    bundle_activity_work_groups, bundle_claude_response_tool_fragments,
+    inline_context_compaction_checkpoints, ActivityRowAnnotation,
 };
 use editchain_project::filter::ChainFilter;
 use editchain_project::meta::NodeMeta;
@@ -379,6 +379,186 @@ fn manual_collapsed(
             turn_id: turn,
         },
     }
+}
+
+#[test]
+fn work_groups_contract_all_linear_activity_between_chat_rows() {
+    let request_op = import_op(41, 1, None, None);
+    let execute_op = import_op(42, 2, Some(request_op.id), Some("completed"));
+    let change_op = import_op(43, 3, Some(execute_op.id), None);
+    let response_op = import_op(44, 4, Some(change_op.id), None);
+    let response = manual_collapsed(
+        response_op,
+        ActivityKind::Conversation,
+        RecordRole::Narrative,
+        Outcome::Unknown,
+        Some(TurnId(7)),
+        "Implemented the requested change",
+        "message",
+    );
+    let change = manual_collapsed(
+        change_op,
+        ActivityKind::Change,
+        RecordRole::Artifact,
+        Outcome::Success,
+        Some(TurnId(7)),
+        "file: src/history.rs",
+        "file",
+    );
+    let execute = manual_collapsed(
+        execute_op,
+        ActivityKind::Execute,
+        RecordRole::Action,
+        Outcome::Success,
+        Some(TurnId(7)),
+        "cargo test",
+        "command",
+    );
+    let request = manual_collapsed(
+        request_op,
+        ActivityKind::Conversation,
+        RecordRole::Narrative,
+        Outcome::Unknown,
+        Some(TurnId(7)),
+        "Please group the work",
+        "message",
+    );
+
+    let grouped =
+        bundle_activity_work_groups(vec![response, change, execute, request], &HashSet::new());
+    assert_eq!(grouped.len(), 3, "chat / work / chat top-level shape");
+    assert_eq!(grouped[0].summary(), "Implemented the requested change");
+    assert_eq!(grouped[2].summary(), "Please group the work");
+    let HistoryNode::WorkGroup { member_nodes, .. } = &grouped[1] else {
+        panic!("middle row must be a work group");
+    };
+    assert_eq!(member_nodes.len(), 2);
+    assert_eq!(grouped[1].activity_kind(), ActivityKind::Work);
+    assert!(grouped[1].summary().starts_with("file: src/history.rs — "));
+    assert!(grouped[1].summary().contains("2 activities"));
+    assert!(grouped[1].summary().contains("1 change"));
+    assert!(grouped[1].summary().contains("1 run"));
+
+    let empty_links = BTreeMap::new();
+    let empty_notes = HashMap::new();
+    assert_eq!(
+        grouped[1].parent_keys(&empty_links, &empty_notes),
+        vec![grouped[2].node_key()],
+        "the group exposes only its oldest member's external parent"
+    );
+    assert_eq!(
+        grouped[0].parent_keys(&empty_links, &empty_notes),
+        vec![grouped[1].node_key()],
+        "the newer chat points at the one contracted group node"
+    );
+}
+
+#[test]
+fn work_group_retains_existing_bundle_as_an_inner_member() {
+    let request_op = import_op(51, 1, None, None);
+    let plan_old_op = import_op(52, 2, Some(request_op.id), None);
+    let plan_new_op = import_op(53, 3, Some(plan_old_op.id), None);
+    let response_op = import_op(54, 4, Some(plan_new_op.id), None);
+    let rows = vec![
+        manual_collapsed(
+            response_op,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            Some(TurnId(8)),
+            "Done",
+            "message",
+        ),
+        manual_collapsed(
+            plan_new_op,
+            ActivityKind::Plan,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            Some(TurnId(8)),
+            "Implementation plan",
+            "reflection",
+        ),
+        manual_collapsed(
+            plan_old_op,
+            ActivityKind::Plan,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            Some(TurnId(8)),
+            "Implementation plan",
+            "reflection",
+        ),
+        manual_collapsed(
+            request_op,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            Some(TurnId(8)),
+            "Plan this",
+            "message",
+        ),
+    ];
+    let inner = bundle_activity_plan_repeats(rows, &HashSet::new());
+    let grouped = bundle_activity_work_groups(inner, &HashSet::new());
+    let HistoryNode::WorkGroup { member_nodes, .. } = &grouped[1] else {
+        panic!("expected outer work group");
+    };
+    assert_eq!(member_nodes.len(), 1, "one direct nested bundle member");
+    assert!(matches!(member_nodes[0], HistoryNode::PlanBundle { .. }));
+    assert!(grouped[1].summary().contains("2 activities"));
+    assert!(grouped[1].summary().contains("2 plans"));
+}
+
+#[test]
+fn causal_branch_endpoints_always_remain_outside_work_groups() {
+    let root_op = import_op(61, 1, None, None);
+    let branch_point_op = import_op(62, 2, Some(root_op.id), Some("completed"));
+    let left_op = import_op(63, 3, Some(branch_point_op.id), Some("completed"));
+    let right_op = import_op(64, 4, Some(branch_point_op.id), Some("completed"));
+    let rows = vec![
+        manual_collapsed(
+            left_op,
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            Some(TurnId(9)),
+            "left branch",
+            "tool",
+        ),
+        manual_collapsed(
+            right_op,
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            Some(TurnId(9)),
+            "right branch",
+            "tool",
+        ),
+        manual_collapsed(
+            branch_point_op,
+            ActivityKind::Execute,
+            RecordRole::Action,
+            Outcome::Success,
+            Some(TurnId(9)),
+            "branch point",
+            "tool",
+        ),
+        manual_collapsed(
+            root_op,
+            ActivityKind::Conversation,
+            RecordRole::Narrative,
+            Outcome::Unknown,
+            Some(TurnId(9)),
+            "start",
+            "message",
+        ),
+    ];
+    let grouped = bundle_activity_work_groups(rows, &HashSet::new());
+    assert!(
+        grouped
+            .iter()
+            .all(|node| !matches!(node, HistoryNode::WorkGroup { .. })),
+        "both fork children and their branch point are hard group boundaries"
+    );
 }
 
 #[test]

@@ -34,10 +34,11 @@ use editchain_project::filter::ChainFilter;
 use editchain_project::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
 use editchain_protocol::{
-    ChainFilterDto, FindInHistoryMatch, FindInHistoryResponse, GraphLayout as ProtocolGraphLayout,
-    HistoryRow, HistoryWindow, LayoutEdge, LayoutPoint, LayoutRow, NodeDetails, ParentRelationDto,
-    ParentRelationKind, RepositoryInfo, Request, RequestBody, ResolvedObject, Response,
-    ResponseBody, SearchFiltersDto, SearchHit, SearchResponse, SessionMetaDto, WorkUnitDto,
+    ChainFilterDto, ExpansionSpanDto, FindInHistoryMatch, FindInHistoryResponse,
+    GraphLayout as ProtocolGraphLayout, HistoryRow, HistoryWindow, LayoutEdge, LayoutPoint,
+    LayoutRow, NodeDetails, ParentRelationDto, ParentRelationKind, RepositoryInfo, Request,
+    RequestBody, ResolvedObject, Response, ResponseBody, SearchFiltersDto, SearchHit,
+    SearchResponse, SessionMetaDto, SubOpSummary, WorkUnitDto,
 };
 use editchain_query::search::{ScoredChunk, SearchFilters, Source};
 
@@ -115,8 +116,13 @@ struct ViewSnapshot {
     /// Graph geometry over `nodes`, built only after the first row window has
     /// painted. `None` is a valid provisional row-only snapshot.
     context: Option<editchain_project::layout::LayoutContext>,
-    /// Number of expandable children attached to each top-level row.
+    /// Total depth-first descendant count attached to each top-level row.
     sub_op_counts: Vec<usize>,
+    /// Precomputed depth-first descendants for each top-level row. Existing
+    /// bundles nested in a work group retain their own direct children.
+    expansions: Vec<NodeExpansion>,
+    /// Global absolute expandable intervals, shipped once with offset zero.
+    expansion_spans: Vec<ExpansionSpanDto>,
     /// Expanded absolute slot where each top-level row starts, plus a sentinel.
     starts: Vec<usize>,
     /// Total number of fully expanded slots.
@@ -132,6 +138,40 @@ struct ViewSnapshot {
     /// git commits in this snapshot (submodule rows are absent when the view
     /// hides them). Built lazily together with [`Self::op_rows`].
     git_rows: Option<HashMap<(RepositoryId, GitOid), usize>>,
+}
+
+/// One top-level row's fully expanded, depth-first presentation descendants.
+#[derive(Debug)]
+struct NodeExpansion {
+    /// Direct children advertised on the top-level row for disclosure chrome.
+    direct: Vec<SubOpSummary>,
+    /// All descendants in stable depth-first slot order.
+    rows: Vec<ExpandedChildRow>,
+}
+
+/// One nested presentation row. It is not a graph node; `parent_relative`
+/// points at its direct parent within the enclosing top-level block (`0` is
+/// the top-level row, descendants start at relative slot `1`).
+#[derive(Debug)]
+struct ExpandedChildRow {
+    op_id: String,
+    summary: String,
+    timestamp_ms: u64,
+    kind: String,
+    author: String,
+    commit_id: String,
+    is_system: bool,
+    record_role: RecordRole,
+    activity_kind: ActivityKind,
+    visibility: Visibility,
+    outcome: Outcome,
+    turn_id: Option<String>,
+    promoted: bool,
+    activity_bundle: Option<editchain_protocol::ActivityBundleDto>,
+    direct: Vec<SubOpSummary>,
+    parent_relative: usize,
+    depth: u8,
+    descendant_count: usize,
 }
 
 /// Canonicalization outcome for the records decoded from a chain's segments.
@@ -1699,6 +1739,7 @@ impl Workspace {
                 chain_generation: self.chain_generation(),
                 max_lane: 0,
                 sub_op_counts: (offset == 0).then(Vec::new),
+                expansion_spans: (offset == 0).then(Vec::new),
                 layout_ready: include_layout,
             },
         }
@@ -1750,18 +1791,17 @@ impl Workspace {
                 chain_generation: u64::try_from(self.projection.ops.len()).unwrap_or(u64::MAX),
                 max_lane: 0,
                 sub_op_counts: (offset == 0).then(Vec::new),
+                expansion_spans: (offset == 0).then(Vec::new),
                 layout_ready: include_layout,
             };
         };
         let filtered = &snapshot.nodes;
         let ctx = snapshot.context.as_ref();
 
-        // The service emits a FIXED fully-expanded flat list: every combined op
-        // always occupies its stable 1+N absolute slots (parent + one per bundled
-        // sub-op), so fetch/cache indices never move regardless of reveal state.
-        // Collapse/expand is purely a client rendering decision; scroll offsets are
-        // derived from how many slots are currently visible via prefix sums over
-        // per-node sub-op counts.
+        // The service emits a FIXED fully-expanded depth-first list: every
+        // top-level graph node always occupies one parent slot followed by all
+        // presentation descendants. Fetch/cache indices therefore never move;
+        // collapse/expand is purely a client decision driven by expansion spans.
         let starts = &snapshot.starts;
         let expanded_total = snapshot.expanded_total;
 
@@ -1777,6 +1817,7 @@ impl Workspace {
                 break;
             }
             let node = &filtered[abs_idx];
+            let expansion = &snapshot.expansions[abs_idx];
             let block_start = starts[abs_idx];
             // Per-row graph geometry from the layout context (absolute row index
             // into the full sorted list).
@@ -1846,8 +1887,9 @@ impl Workspace {
                     above,
                     below,
                     transitions,
-                    sub_ops: sub_op_summaries(node.sub_ops()),
+                    sub_ops: expansion.direct.clone(),
                     is_subop: false,
+                    hierarchy_depth: 0,
                     parent_row: None,
                     subop_kind: None,
                     record_role: node.record_role(),
@@ -1867,8 +1909,9 @@ impl Workspace {
                     activity_bundle: node_activity_bundle(node),
                 });
             }
-            // Emit each bundled sub-op as its own row immediately after its parent.
-            let summaries = node_sub_op_summaries(node);
+            // Emit the fixed depth-first descendant rows immediately after the
+            // graph parent. Work groups use depth 1 for activities and depth 2
+            // for an activity's pre-existing bundle/detail rows.
             // Lanes passing straight through this sub-op region (between this
             // parent and the next top-level node): any lane with a vertical line
             // leaving this parent downward AND entering the next node from above
@@ -1881,58 +1924,48 @@ impl Workspace {
                 .and_then(|layout| layout.row_above.get(abs_idx + 1))
                 .map_or(&[][..], Vec::as_slice);
             let region_lanes = intersect_sorted(below_parent, above_next);
-            // Per-bundle member meta lookup, built once so sub-op row metadata
-            // stays O(1) per row instead of scanning the bundle's members.
-            let member_meta: HashMap<String, (RecordRole, ActivityKind)> =
-                node_sub_op_meta_index(node);
-            for (i, sub) in summaries.iter().enumerate() {
+            for (i, child) in expansion.rows.iter().enumerate() {
                 let slot = block_start + 1 + i;
                 if slot < offset_usize || slot >= end_usize {
                     continue;
                 }
-                let (record_role, activity_kind) = node
-                    .sub_ops()
-                    .get(i)
-                    .map_or((RecordRole::Unknown, ActivityKind::Unknown), |op| {
-                        node_sub_op_meta(op.as_ref(), &member_meta)
-                    });
                 rows.push(HistoryRow {
-                    op_id: Some(sub.op_id.clone()),
+                    op_id: (!child.op_id.is_empty()).then(|| child.op_id.clone()),
                     git_oid: None,
                     repository: None,
-                    summary: sub.summary.clone(),
-                    timestamp_ms: sub.timestamp_ms,
+                    summary: child.summary.clone(),
+                    timestamp_ms: child.timestamp_ms,
                     group: group.clone(),
-                    // Sub-op rows are not graph nodes; key them under their parent so
-                    // group-start detection and click routing stay unambiguous.
-                    node_key: format!("{}::sub:{i}", node.node_key()),
+                    // Nested rows are not graph nodes; stable synthetic keys
+                    // keep group-start detection and click routing unambiguous.
+                    node_key: format!("{}::child:{i}", node.node_key()),
                     parents: Vec::new(),
                     parent_relations: Vec::new(),
                     is_submodule: false,
-                    is_system: true,
-                    author: String::new(),
-                    commit_id: String::new(),
-                    kind: sub.kind.clone(),
+                    is_system: child.is_system,
+                    author: child.author.clone(),
+                    commit_id: child.commit_id.clone(),
+                    kind: child.kind.clone(),
                     // No dot of its own — draw every pass-through lane as a
                     // full-height straight line (both halves meet at midY).
                     lane,
                     above: region_lanes.clone(),
                     below: region_lanes.clone(),
                     transitions: Vec::new(),
-                    sub_ops: Vec::new(),
+                    sub_ops: child.direct.clone(),
                     is_subop: true,
-                    parent_row: Some(parent_row),
-                    subop_kind: Some(subop_semantic_class(&sub.kind)),
-                    record_role,
-                    activity_kind,
-                    // Bundled sub-ops are supporting rows revealed on demand.
-                    visibility: Visibility::Supporting,
-                    outcome: Outcome::Unknown,
-                    turn_id: node.turn_id().map(|id| id.0.to_string()),
+                    hierarchy_depth: child.depth,
+                    parent_row: Some(parent_row.saturating_add(child.parent_relative)),
+                    subop_kind: Some(subop_semantic_class(&child.kind)),
+                    record_role: child.record_role,
+                    activity_kind: child.activity_kind,
+                    visibility: child.visibility,
+                    outcome: child.outcome,
+                    turn_id: child.turn_id.clone(),
                     session_meta: session_meta.clone(),
                     work_unit: None,
-                    promoted: false,
-                    activity_bundle: None,
+                    promoted: child.promoted,
+                    activity_bundle: child.activity_bundle.clone(),
                 });
             }
         }
@@ -1945,6 +1978,7 @@ impl Workspace {
             // ship the O(V) expansion index once for that snapshot, not with
             // every O(window) page.
             sub_op_counts: (offset == 0).then(|| snapshot.sub_op_counts.clone()),
+            expansion_spans: (offset == 0).then(|| snapshot.expansion_spans.clone()),
             layout_ready: snapshot.context.is_some(),
         }
     }
@@ -1974,8 +2008,9 @@ impl Workspace {
         // Activity-view semantics: every view gets deterministic work-unit and
         // promotion annotations. The fixed Activity view additionally keeps
         // context-compaction checkpoints inline, groups adjacent repeated Plan
-        // headings, and folds safe low-signal execute runs (never the Raw
-        // profile, whose topology stays exact).
+        // headings, folds safe low-signal execute runs, then wraps every linear
+        // non-chat interval in an outer work group (never the Raw profile,
+        // whose topology stays exact).
         // Annotations are recomputed on the final list so bundle rows carry
         // their own unit markers.
         let is_activity = filter.key() == fixed_view_filter().key();
@@ -2008,8 +2043,17 @@ impl Workspace {
         } else {
             nodes
         };
+        let nodes = if let Some(structural) = structural.as_ref() {
+            editchain_project::activity::bundle_activity_work_groups(nodes, structural)
+        } else {
+            nodes
+        };
         annotations = editchain_project::activity::annotate_activity_rows(&nodes);
-        let sub_op_counts: Vec<usize> = nodes.iter().map(|node| node.sub_ops().len()).collect();
+        let expansions: Vec<NodeExpansion> = nodes.iter().map(node_expansion).collect();
+        let sub_op_counts: Vec<usize> = expansions
+            .iter()
+            .map(|expansion| expansion.rows.len())
+            .collect();
         let mut starts = Vec::with_capacity(nodes.len().saturating_add(1));
         starts.push(0usize);
         for &count in &sub_op_counts {
@@ -2023,6 +2067,26 @@ impl Workspace {
             );
         }
         let expanded_total = starts.last().copied().unwrap_or(0);
+        let mut expansion_spans = Vec::new();
+        for (index, expansion) in expansions.iter().enumerate() {
+            let block_start = starts.get(index).copied().unwrap_or(0);
+            if !expansion.rows.is_empty() {
+                expansion_spans.push(ExpansionSpanDto {
+                    row: u64::try_from(block_start).unwrap_or(u64::MAX),
+                    descendant_count: u64::try_from(expansion.rows.len()).unwrap_or(u64::MAX),
+                });
+            }
+            for (child_index, child) in expansion.rows.iter().enumerate() {
+                if child.descendant_count == 0 {
+                    continue;
+                }
+                expansion_spans.push(ExpansionSpanDto {
+                    row: u64::try_from(block_start.saturating_add(1).saturating_add(child_index))
+                        .unwrap_or(u64::MAX),
+                    descendant_count: u64::try_from(child.descendant_count).unwrap_or(u64::MAX),
+                });
+            }
+        }
         self.current_view = Some((
             key,
             ViewSnapshot {
@@ -2030,6 +2094,8 @@ impl Workspace {
                 annotations,
                 context: None,
                 sub_op_counts,
+                expansions,
+                expansion_spans,
                 starts,
                 expanded_total,
                 max_lane: 0,
@@ -2383,6 +2449,10 @@ pub fn prepare_render_snapshot(
         .sub_op_counts
         .clone()
         .ok_or("snapshot first window omitted expansion index")?;
+    let expansion_spans = first
+        .expansion_spans
+        .clone()
+        .ok_or("snapshot first window omitted nested expansion index")?;
     let total = first.total;
     let max_lane = first.max_lane;
     let mut builder = SnapshotBuilder::new(&chain_path, identity.clone())?;
@@ -2421,6 +2491,7 @@ pub fn prepare_render_snapshot(
             diagnostics: workspace.diagnostics,
         },
         &sub_op_counts,
+        &expansion_spans,
         &workspace.source_op_locations,
     )
 }
@@ -2649,9 +2720,10 @@ fn node_is_system(node: &editchain_project::HistoryNode) -> bool {
         // Execute-run bundles summarize tool/command rows: dim them like the
         // individual tool rows they fold.
         editchain_project::HistoryNode::ExecuteBundle { .. } => true,
-        // Plan-repeat bundles remain prose-first narrative rows; Git rows are
-        // likewise user-facing source history rather than system artifacts.
-        editchain_project::HistoryNode::PlanBundle { .. }
+        // Work groups and Plan-repeat bundles are navigational/prose-first
+        // summary rows; Git is likewise user-facing source history.
+        editchain_project::HistoryNode::WorkGroup { .. }
+        | editchain_project::HistoryNode::PlanBundle { .. }
         | editchain_project::HistoryNode::GitCommit(_) => false,
     }
 }
@@ -2672,6 +2744,7 @@ fn node_author(node: &editchain_project::HistoryNode) -> String {
         editchain_project::HistoryNode::CollapsedImport { author, .. }
         | editchain_project::HistoryNode::ExecuteBundle { author, .. }
         | editchain_project::HistoryNode::PlanBundle { author, .. } => author.clone(),
+        editchain_project::HistoryNode::WorkGroup { .. } => "agent".to_string(),
         editchain_project::HistoryNode::GitCommit(commit) => payload_text(&commit.author.name),
     }
 }
@@ -2709,12 +2782,12 @@ fn sub_op_meta(op: &Op) -> (RecordRole, ActivityKind) {
 /// record type (derived from the raw JSONL's `type` field when parseable, else
 /// the raw reference text), so the viewer can label each revealed sub-row.
 #[must_use]
-fn sub_op_summaries(sub_ops: &[std::sync::Arc<Op>]) -> Vec<editchain_protocol::SubOpSummary> {
+fn sub_op_summaries(sub_ops: &[std::sync::Arc<Op>]) -> Vec<SubOpSummary> {
     sub_ops
         .iter()
         .map(|op| {
             let (summary, kind) = sub_op_label(op);
-            editchain_protocol::SubOpSummary {
+            SubOpSummary {
                 op_id: op.id.to_string(),
                 summary,
                 kind,
@@ -2791,18 +2864,28 @@ fn session_metadata_from_op(op: &Op) -> Option<SessionMetaDto> {
     (metadata.model_provider.is_some() || metadata.agent_nickname.is_some()).then_some(metadata)
 }
 
-/// Typed Activity-view bundle metadata for a top-level row.
+/// Typed Activity-view bundle metadata for a synthetic Activity row.
 ///
 /// `Some` only for synthetic Activity bundles, carrying the ORIGINAL top-level
 /// member count (`member_nodes.len()`, never the flattened
 /// metadata-subop count) so the viewer can render faithful bundle labels from
-/// structured data without parsing the summary string. `None` for every
-/// ordinary and sub-op row, including the raw (unbundled) profile.
+/// structured data without parsing the summary string. Inner execute/plan
+/// bundles keep this metadata when nested beneath a work group. `None` for
+/// ordinary rows and the raw (unbundled) profile.
 #[must_use]
 fn node_activity_bundle(
     node: &editchain_project::HistoryNode,
 ) -> Option<editchain_protocol::ActivityBundleDto> {
     match node {
+        editchain_project::HistoryNode::WorkGroup { member_nodes, .. } => {
+            Some(editchain_protocol::ActivityBundleDto {
+                kind: editchain_protocol::ActivityBundleKind::WorkGroup,
+                member_count: member_nodes
+                    .iter()
+                    .map(node_leaf_activity_count)
+                    .fold(0u64, u64::saturating_add),
+            })
+        }
         editchain_project::HistoryNode::ExecuteBundle { member_nodes, .. } => {
             Some(editchain_protocol::ActivityBundleDto {
                 kind: editchain_protocol::ActivityBundleKind::ExecuteRun,
@@ -2821,6 +2904,129 @@ fn node_activity_bundle(
     }
 }
 
+/// Original activity-row count represented by a possibly nested synthetic
+/// node. Work-group count labels describe source activities, not display rows.
+#[must_use]
+fn node_leaf_activity_count(node: &editchain_project::HistoryNode) -> u64 {
+    match node {
+        editchain_project::HistoryNode::ExecuteBundle { member_nodes, .. }
+        | editchain_project::HistoryNode::PlanBundle { member_nodes, .. }
+        | editchain_project::HistoryNode::WorkGroup { member_nodes, .. } => member_nodes
+            .iter()
+            .map(node_leaf_activity_count)
+            .fold(0u64, u64::saturating_add),
+        editchain_project::HistoryNode::EditOperation { .. }
+        | editchain_project::HistoryNode::CollapsedImport { .. }
+        | editchain_project::HistoryNode::GitCommit(_) => 1,
+    }
+}
+
+/// Build the fixed depth-first expansion tree for one top-level graph row.
+///
+/// Ordinary rows and top-level execute/plan bundles retain their established
+/// one-level details. A `WorkGroup` exposes each pre-grouped activity as a depth-1
+/// row; that member's existing details/bundle members become depth-2 rows.
+#[must_use]
+fn node_expansion(node: &editchain_project::HistoryNode) -> NodeExpansion {
+    let editchain_project::HistoryNode::WorkGroup { member_nodes, .. } = node else {
+        let direct = node_sub_op_summaries(node);
+        return NodeExpansion {
+            rows: flat_op_child_rows(node, 0, 1),
+            direct,
+        };
+    };
+
+    let direct = member_nodes.iter().map(node_summary_dto).collect();
+    let mut rows = Vec::new();
+    for member in member_nodes {
+        let member_relative = rows.len().saturating_add(1);
+        let member_direct = node_sub_op_summaries(member);
+        let descendants = flat_op_child_rows(member, member_relative, 2);
+        rows.push(ExpandedChildRow {
+            op_id: member.op_id().map_or_else(String::new, |id| id.to_string()),
+            summary: member.summary(),
+            timestamp_ms: member.timestamp_ms(),
+            kind: member.kind(),
+            author: node_author(member),
+            commit_id: node_commit_id(member),
+            is_system: node_is_system(member),
+            record_role: member.record_role(),
+            activity_kind: member.activity_kind(),
+            visibility: member.visibility(),
+            outcome: member.outcome(),
+            turn_id: member.turn_id().map(|id| id.0.to_string()),
+            promoted: matches!(
+                member.outcome(),
+                Outcome::Warning | Outcome::Failure | Outcome::Cancelled
+            ) || matches!(
+                member.activity_kind(),
+                ActivityKind::Change | ActivityKind::Verify
+            ),
+            activity_bundle: node_activity_bundle(member),
+            direct: member_direct,
+            parent_relative: 0,
+            depth: 1,
+            descendant_count: descendants.len(),
+        });
+        rows.extend(descendants);
+    }
+    NodeExpansion { direct, rows }
+}
+
+/// One node as a direct-child summary advertised by its enclosing `WorkGroup`.
+#[must_use]
+fn node_summary_dto(node: &editchain_project::HistoryNode) -> SubOpSummary {
+    SubOpSummary {
+        op_id: node.op_id().map_or_else(String::new, |id| id.to_string()),
+        summary: node.summary(),
+        kind: node.kind(),
+        timestamp_ms: node.timestamp_ms(),
+    }
+}
+
+/// Established flat detail/member rows for one ordinary or inner bundle node.
+#[must_use]
+fn flat_op_child_rows(
+    node: &editchain_project::HistoryNode,
+    parent_relative: usize,
+    depth: u8,
+) -> Vec<ExpandedChildRow> {
+    let summaries = node_sub_op_summaries(node);
+    let member_meta = node_sub_op_meta_index(node);
+    summaries
+        .into_iter()
+        .enumerate()
+        .map(|(index, summary)| {
+            let (record_role, activity_kind) = node
+                .sub_ops()
+                .get(index)
+                .map_or((RecordRole::Unknown, ActivityKind::Unknown), |op| {
+                    node_sub_op_meta(op.as_ref(), &member_meta)
+                });
+            ExpandedChildRow {
+                op_id: summary.op_id,
+                summary: summary.summary,
+                timestamp_ms: summary.timestamp_ms,
+                kind: summary.kind,
+                author: String::new(),
+                commit_id: String::new(),
+                is_system: true,
+                record_role,
+                activity_kind,
+                visibility: Visibility::Supporting,
+                outcome: Outcome::Unknown,
+                turn_id: node.turn_id().map(|id| id.0.to_string()),
+                promoted: false,
+                activity_bundle: None,
+                direct: Vec::new(),
+                parent_relative,
+                depth,
+                descendant_count: 0,
+            }
+        })
+        .collect()
+}
+
 /// Build the expanded sub-op summaries for a top-level node.
 ///
 /// Activity bundles expose their folded member rows, so each member renders
@@ -2828,9 +3034,7 @@ fn node_activity_bundle(
 /// own metadata sub-ops keep the generic op-derived labels. All other nodes
 /// use the generic op-derived path unchanged.
 #[must_use]
-fn node_sub_op_summaries(
-    node: &editchain_project::HistoryNode,
-) -> Vec<editchain_protocol::SubOpSummary> {
+fn node_sub_op_summaries(node: &editchain_project::HistoryNode) -> Vec<SubOpSummary> {
     if let editchain_project::HistoryNode::ExecuteBundle {
         member_nodes,
         members,
@@ -2857,7 +3061,7 @@ fn node_sub_op_summaries(
 fn member_sub_op_summaries(
     members: &[std::sync::Arc<Op>],
     member_nodes: &[editchain_project::HistoryNode],
-) -> Vec<editchain_protocol::SubOpSummary> {
+) -> Vec<SubOpSummary> {
     let key_to_node: HashMap<String, &editchain_project::HistoryNode> = member_nodes
         .iter()
         .map(|node| (node.node_key(), node))
@@ -2867,7 +3071,7 @@ fn member_sub_op_summaries(
         .map(|op| {
             let op_key = op.id.to_string();
             if let Some(member) = key_to_node.get(&op_key) {
-                editchain_protocol::SubOpSummary {
+                SubOpSummary {
                     op_id: op_key,
                     summary: member.summary(),
                     kind: member.kind(),
@@ -2875,7 +3079,7 @@ fn member_sub_op_summaries(
                 }
             } else {
                 let (summary, kind) = sub_op_label(op);
-                editchain_protocol::SubOpSummary {
+                SubOpSummary {
                     op_id: op_key,
                     summary,
                     kind,
@@ -2907,6 +3111,7 @@ fn node_sub_op_meta_index(
             .collect(),
         editchain_project::HistoryNode::EditOperation { .. }
         | editchain_project::HistoryNode::CollapsedImport { .. }
+        | editchain_project::HistoryNode::WorkGroup { .. }
         | editchain_project::HistoryNode::GitCommit(_) => HashMap::new(),
     }
 }
@@ -3123,7 +3328,8 @@ fn node_commit_id(node: &editchain_project::HistoryNode) -> String {
         editchain_project::HistoryNode::EditOperation { op, .. }
         | editchain_project::HistoryNode::CollapsedImport { op, .. } => abbreviate_op_id(&op.id),
         editchain_project::HistoryNode::ExecuteBundle { anchor, .. }
-        | editchain_project::HistoryNode::PlanBundle { anchor, .. } => abbreviate_op_id(&anchor.id),
+        | editchain_project::HistoryNode::PlanBundle { anchor, .. }
+        | editchain_project::HistoryNode::WorkGroup { anchor, .. } => abbreviate_op_id(&anchor.id),
         editchain_project::HistoryNode::GitCommit(commit) => abbreviate_oid(&commit.oid),
     }
 }
@@ -6065,6 +6271,7 @@ mod tests {
         let filter = ChainFilter::default();
         let projection = HistoryProjection::from_ops(vec![anchor.clone()]);
         let mut ws = Workspace::from_projection(projection);
+        let expansion = node_expansion(&bundle);
         // Hand-build the cached snapshot so the mapping test exercises the exact
         // Activity-view shape (bundle row + two expanded member slots).
         ws.current_view = Some((
@@ -6074,6 +6281,11 @@ mod tests {
                 annotations: Vec::new(),
                 context: None,
                 sub_op_counts: vec![3],
+                expansions: vec![expansion],
+                expansion_spans: vec![ExpansionSpanDto {
+                    row: 0,
+                    descendant_count: 3,
+                }],
                 starts: vec![0, 4],
                 expanded_total: 4,
                 max_lane: 0,
