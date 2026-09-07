@@ -556,7 +556,8 @@ class JsonContentProvider implements vscode.TextDocumentContentProvider {
  * Rust shell's startHistoryView(), which owns the full runtime — Activity/Raw
  * profile switching, virtual paging (PAGE=500), FindInHistory search/nav,
  * loading/error, work-unit/bundle/promotion rows, row selection/keyboard/
- * disclosure, raw JSON routing, five responsive columns, accessibility,
+ * disclosure, raw JSON routing, the dedicated Activity classification column,
+ * responsive columns, accessibility,
  * resize, and per-row SVG graph fragments (the inert #gpu-canvas-host
  * scaffold stays in the markup, but no canvas is ever created).
  *

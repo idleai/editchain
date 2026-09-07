@@ -1164,7 +1164,9 @@
       let colsOk = true;
       let firstFailCol = null;
       if (firstRow) {
-        const colClasses = ['graph-cell', 'text-cell', 'date-cell', 'author-cell', 'commit-cell'];
+        const colClasses = [
+          'graph-cell', 'activity-cell', 'text-cell', 'date-cell', 'author-cell', 'commit-cell',
+        ];
         headerCells.forEach((th, i) => {
           const rc = firstRow.querySelector('.' + colClasses[i]);
           if (!rc) return;
@@ -1239,9 +1241,9 @@
       });
     }
 
-    // Check 5e: the five production cell classes obey the Pulse geometry —
-    // author/commit are hidden at every width, content/date are genuinely
-    // rendered inside the rows box (date drops at the narrowest breakpoint).
+    // Check 5e: the production cell classes obey the Pulse geometry — Activity
+    // is always visible immediately before Content, author/commit are hidden,
+    // and date drops only at the narrowest breakpoint.
     if (wrapEl && !viewMessage) {
       const firstRow = wrapEl.querySelector('.row:not(.row-placeholder)');
       if (firstRow) {
@@ -1250,6 +1252,7 @@
         const hidden = new Set(['author', 'commit']);
         if (innerW <= 400) hidden.add('date');
         const cols = [
+          { name: 'activity', cls: 'activity-cell' },
           { name: 'content', cls: 'text-cell' },
           { name: 'date', cls: 'date-cell' },
           { name: 'author', cls: 'author-cell' },
@@ -1289,6 +1292,7 @@
       if (firstRow) {
         const bg = effectiveBackground(firstRow);
         const cells = [
+          { sel: '.activity-cell', name: 'activity' },
           { sel: '.summary', name: 'content' },
           { sel: '.date-cell', name: 'date' },
           { sel: '.author-cell', name: 'author' },
@@ -1429,10 +1433,10 @@
       const header = rowsEl.querySelector('.tbl-header');
       const labelled = !!grid && grid.getAttribute('aria-label') === 'History rows';
       const headerInside = !!header && !!grid && grid.contains(header);
-      // Pulse renders exactly three columnheaders (graph/content/date);
-      // author/commit are display:none cells, not headers.
+      // Pulse renders exactly four columnheaders
+      // (graph/activity/content/date); author/commit are hidden cells.
       const colHeadersInside = !!header &&
-        header.querySelectorAll('[role="columnheader"]').length === 3;
+        header.querySelectorAll('[role="columnheader"]').length === 4;
       const gridOwnsRows = grids.length === 1 && !!grid &&
         !!wrapEl.closest('.tbl-grid');
       let rowsOk = rowEls.length > 0;
@@ -1512,16 +1516,47 @@
       });
     }
 
-    // Check 5q: common clean-state chrome is globally quiet by default.
+    // Check 5q: common clean-state outcome chrome is globally quiet by default.
     if (wrapEl && !viewMessage) {
       const commonBadges = Array.from(wrapEl.querySelectorAll(
-        '.act-badge.act-source-control, .out-badge.outcome-success'));
+        '.out-badge.outcome-success'));
       checks.push({
         name: 'COMMON_ROW_BADGES_DEFAULT_OFF',
         pass: commonBadges.length === 0,
         detail: commonBadges.length === 0
-          ? 'no repeated git/ok row badges'
-          : commonBadges.length + ' repeated git/ok row badge(s)',
+          ? 'no repeated ok outcome badges'
+          : commonBadges.length + ' repeated ok outcome badge(s)',
+      });
+    }
+
+    // Check 5qa: every hydrated row has one populated Activity cell, and no
+    // legacy activity badge remains embedded in Content.
+    if (wrapEl && !viewMessage) {
+      const rows = Array.from(wrapEl.querySelectorAll('.row:not(.row-placeholder)'));
+      const bad = [];
+      for (const row of rows) {
+        const cells = row.querySelectorAll('.activity-cell');
+        const cell = cells[0] || null;
+        const text = cell ? (cell.textContent || '').trim() : '';
+        const data = row.getAttribute('data-classification') || '';
+        if (cells.length !== 1 || !text || text !== data || row.querySelector('.act-badge')) {
+          if (bad.length < 5) {
+            bad.push({
+              row: row.getAttribute('data-row'),
+              cells: cells.length,
+              text,
+              data,
+              contentBadge: !!row.querySelector('.act-badge'),
+            });
+          }
+        }
+      }
+      checks.push({
+        name: 'ACTIVITY_COLUMN_COMPLETE',
+        pass: rows.length > 0 && bad.length === 0,
+        detail: bad.length === 0
+          ? rows.length + ' rows classified outside Content'
+          : 'first bad=' + JSON.stringify(bad),
       });
     }
 

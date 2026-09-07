@@ -139,11 +139,10 @@ pub(crate) struct GraphData {
     pub(crate) is_bundle: bool,
 }
 
-/// The frozen `ROW_BADGE_OPTIONS` visibility switches (both default off).
+/// The frozen outcome-badge visibility switch (default off).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct BadgeOptions {
     pub(crate) show_success_outcome: bool,
-    pub(crate) show_source_control_activity: bool,
 }
 
 /// The production whitelisted record-role classes (`RECORD_ROLE_CLASSES`).
@@ -1991,9 +1990,11 @@ pub(crate) fn relation_badges(row: &Value) -> Vec<ChromeItem> {
     out
 }
 
-/// The `ACTIVITY_LABELS` whitelist (no `conversation` badge, by design).
+/// Provider-neutral activities with concise labels for the dedicated Activity
+/// column. These are presentation labels rather than content badges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActivityKind {
+    Conversation,
     Plan,
     Explore,
     Execute,
@@ -2009,6 +2010,7 @@ pub(crate) enum ActivityKind {
 impl ActivityKind {
     pub(crate) fn from_wire(kind: &str) -> Option<ActivityKind> {
         match kind {
+            "conversation" => Some(ActivityKind::Conversation),
             "plan" => Some(ActivityKind::Plan),
             "explore" => Some(ActivityKind::Explore),
             "execute" => Some(ActivityKind::Execute),
@@ -2023,23 +2025,9 @@ impl ActivityKind {
         }
     }
 
-    pub(crate) fn class(self) -> &'static str {
-        match self {
-            ActivityKind::Plan => "act-plan",
-            ActivityKind::Explore => "act-explore",
-            ActivityKind::Execute => "act-execute",
-            ActivityKind::Change => "act-change",
-            ActivityKind::Verify => "act-verify",
-            ActivityKind::Diagnose => "act-diagnose",
-            ActivityKind::Coordinate => "act-coordinate",
-            ActivityKind::SourceControl => "act-source-control",
-            ActivityKind::External => "act-external",
-            ActivityKind::System => "act-system",
-        }
-    }
-
     pub(crate) fn text(self) -> &'static str {
         match self {
+            ActivityKind::Conversation => "chat",
             ActivityKind::Plan => "plan",
             ActivityKind::Explore => "explore",
             ActivityKind::Execute => "run",
@@ -2052,6 +2040,83 @@ impl ActivityKind {
             ActivityKind::System => "system",
         }
     }
+}
+
+/// One resolved value for the dedicated Activity column. Every real row gets
+/// a non-empty label; placeholders intentionally retain the empty default.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct RowClassification {
+    /// Compact visual label (`run`, `git`, `chat`, or a wire fallback).
+    pub(crate) label: String,
+    /// Field used to resolve the label (`activity_kind`, `kind`, etc.).
+    pub(crate) source: String,
+    /// Hover/accessibility description retaining the unshortened wire value.
+    pub(crate) title: String,
+}
+
+impl RowClassification {
+    fn new(label: &str, source: &str, wire_value: &str) -> RowClassification {
+        let source_title = match source {
+            "activity_kind" => "Activity",
+            "kind" => "Kind",
+            "record_role" => "Record role",
+            "is_system" => "System classification",
+            "git_oid" => "Git identity",
+            _ => "Classification",
+        };
+        RowClassification {
+            label: label.to_owned(),
+            source: source.to_owned(),
+            title: format!("{source_title}: {wire_value}"),
+        }
+    }
+}
+
+/// Whether a wire token is useful as a visible classification fallback.
+fn classification_token(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty() && trimmed != "unknown").then_some(trimmed)
+}
+
+/// Turn a provider-neutral wire token into a compact display fallback.
+fn classification_fallback(value: &str) -> String {
+    value.trim().replace('_', "-")
+}
+
+/// Resolve the stable Activity-column value. Semantic activity wins, except
+/// that Git identity is authoritative even for sparse/older rows; then kind,
+/// record role, and a final `other` label guarantee a populated real row.
+pub(crate) fn row_classification(row: &Value) -> RowClassification {
+    let kind = row_str(row, "kind");
+    let activity = row_str(row, "activity_kind");
+    let git_oid = row_str(row, "git_oid");
+    if !git_oid.is_empty() || kind == "git" {
+        return if activity == "source_control" {
+            RowClassification::new("git", "activity_kind", "source_control")
+        } else if !git_oid.is_empty() {
+            RowClassification::new("git", "git_oid", &git_oid)
+        } else {
+            RowClassification::new("git", "kind", "git")
+        };
+    }
+
+    if let Some(activity_kind) = ActivityKind::from_wire(activity.trim()) {
+        return RowClassification::new(activity_kind.text(), "activity_kind", activity.trim());
+    }
+
+    if wire::bool(row, "is_system") {
+        return RowClassification::new("system", "is_system", "true");
+    }
+    if let Some(kind) = classification_token(&kind) {
+        return RowClassification::new(&classification_fallback(kind), "kind", kind);
+    }
+
+    let role = row_str(row, "record_role");
+    if let Some(role) = classification_token(&role) {
+        return RowClassification::new(&classification_fallback(role), "record_role", role);
+    }
+
+    RowClassification::new("other", "fallback", "other")
 }
 
 /// The `OUTCOME_LABELS` whitelist.
@@ -2102,21 +2167,6 @@ impl OutcomeKind {
     }
 }
 
-/// `activityBadge` with the frozen visibility switches.
-pub(crate) fn activity_badge(row: &Value, options: BadgeOptions) -> Option<ChromeItem> {
-    let wire_kind = row_str(row, "activity_kind");
-    if wire_kind == "source_control" && !options.show_source_control_activity {
-        return None;
-    }
-    let kind = ActivityKind::from_wire(&wire_kind)?;
-    Some(ChromeItem::new(
-        &format!("act-badge {}", kind.class()),
-        kind.text(),
-        &format!("activity: {wire_kind}"),
-        Some(&format!("activity: {}", kind.text())),
-    ))
-}
-
 /// `outcomeBadge` with the frozen visibility switches.
 pub(crate) fn outcome_badge(row: &Value, options: BadgeOptions) -> Option<ChromeItem> {
     let wire_outcome = row_str(row, "outcome");
@@ -2132,8 +2182,8 @@ pub(crate) fn outcome_badge(row: &Value, options: BadgeOptions) -> Option<Chrome
     ))
 }
 
-/// `relationBadges` + a consequential outcome badge (relations outrank generic
-/// activity).
+/// `relationBadges` + a consequential outcome badge. Structural relations
+/// take over the content-chrome slot; Activity remains in its own column.
 fn relation_chrome(row: &Value, options: BadgeOptions) -> Vec<ChromeItem> {
     let mut items = relation_badges(row);
     if !items.is_empty() {
@@ -2147,7 +2197,8 @@ fn relation_chrome(row: &Value, options: BadgeOptions) -> Vec<ChromeItem> {
     items
 }
 
-/// `rowSemanticChrome` — the row's restrained leading metadata.
+/// `rowSemanticChrome` — restrained leading content metadata. Activity is
+/// rendered in its own grid column and is intentionally absent here.
 pub(crate) fn row_semantic_chrome(
     row: &Value,
     is_bundle: bool,
@@ -2162,9 +2213,6 @@ pub(crate) fn row_semantic_chrome(
         return relations;
     }
     let mut items = Vec::new();
-    if let Some(activity) = activity_badge(row, options) {
-        items.push(activity);
-    }
     if let Some(outcome) = outcome_badge(row, options) {
         items.push(outcome);
     }
@@ -2611,6 +2659,7 @@ pub(crate) struct RowSpec {
     pub(crate) kind: String,
     pub(crate) record_role: String,
     pub(crate) activity_kind: String,
+    pub(crate) classification: RowClassification,
     pub(crate) outcome: String,
     pub(crate) group: String,
     pub(crate) kind_class: KindClass,
@@ -2648,6 +2697,7 @@ impl Default for RowSpec {
             kind: String::new(),
             record_role: String::new(),
             activity_kind: String::new(),
+            classification: RowClassification::default(),
             outcome: String::new(),
             group: String::new(),
             kind_class: KindClass::Plain,
@@ -2718,6 +2768,7 @@ impl RowSpec {
         let is_execute_run = bundle_kind == Some(BundleKind::ExecuteRun);
         let is_plan_repeat = bundle_kind == Some(BundleKind::PlanRepeat);
         let chrome = row_semantic_chrome(row, is_bundle, view, BadgeOptions::default());
+        let classification = row_classification(row);
         let session = session_meta_values(row);
         let has_session_meta = !is_subop && !session.is_empty();
         let session_description = session_meta_description(row);
@@ -2908,6 +2959,7 @@ impl RowSpec {
             kind: row_str(row, "kind"),
             record_role: row_str(row, "record_role"),
             activity_kind: row_str(row, "activity_kind"),
+            classification,
             outcome: row_str(row, "outcome"),
             group: row_str(row, "group"),
             kind_class: kind_class_of(row),
@@ -3378,6 +3430,10 @@ mod tests {
         ));
         drop(attrs.insert("data-key".to_owned(), spec.identity.node_key.clone()));
         drop(attrs.insert("data-row".to_owned(), spec.identity.abs_index.to_string()));
+        drop(attrs.insert(
+            "data-classification".to_owned(),
+            spec.classification.label.clone(),
+        ));
         if let Some(header) = &spec.work_unit_header {
             drop(attrs.insert("data-work-unit-id".to_owned(), header.id.clone()));
         }
@@ -3917,28 +3973,88 @@ mod tests {
             )],
         ));
         assert_eq!(dup.len(), 1);
-        let plan_badge = activity_badge(
-            &with(&base_row(), &[("activity_kind", json!("plan"))]),
-            BadgeOptions::default(),
-        );
-        assert_eq!(
-            render_chrome_html(std::slice::from_ref(plan_badge.as_ref().expect("plan badge"))),
-            "<span class=\"act-badge act-plan\" title=\"activity: plan\" aria-label=\"activity: plan\">plan</span>"
-        );
+    }
+
+    #[test]
+    fn activity_column_classifies_every_real_row_with_stable_fallbacks() {
+        let cases = [
+            ("conversation", "chat"),
+            ("plan", "plan"),
+            ("explore", "explore"),
+            ("execute", "run"),
+            ("change", "change"),
+            ("verify", "verify"),
+            ("diagnose", "diagnose"),
+            ("coordinate", "coordinate"),
+            ("source_control", "git"),
+            ("external", "external"),
+            ("system", "system"),
+        ];
+        for (wire, label) in cases {
+            let classification =
+                row_classification(&with(&base_row(), &[("activity_kind", json!(wire))]));
+            assert_eq!(classification.label, label, "{wire} label");
+            assert_eq!(classification.source, "activity_kind", "{wire} source");
+            assert_eq!(classification.title, format!("Activity: {wire}"));
+        }
+
+        let git = row_classification(&with(
+            &base_row(),
+            &[
+                ("kind", json!("message")),
+                ("activity_kind", json!("unknown")),
+                ("git_oid", json!("abc123")),
+            ],
+        ));
+        assert_eq!(git.label, "git", "Git identity is authoritative");
+        assert_eq!(git.source, "git_oid");
+
+        let system = row_classification(&with(
+            &base_row(),
+            &[
+                ("activity_kind", json!("unknown")),
+                ("kind", json!("unknown")),
+                ("is_system", json!(true)),
+            ],
+        ));
+        assert_eq!(system.label, "system");
+        assert_eq!(system.source, "is_system");
+
+        let kind = row_classification(&with(
+            &base_row(),
+            &[
+                ("activity_kind", json!("unknown")),
+                ("kind", json!("tool_result")),
+            ],
+        ));
+        assert_eq!(kind.label, "tool-result");
+        assert_eq!(kind.source, "kind");
+
+        let role = row_classification(&with(
+            &base_row(),
+            &[
+                ("activity_kind", json!("unknown")),
+                ("kind", json!("unknown")),
+                ("record_role", json!("artifact")),
+            ],
+        ));
+        assert_eq!(role.label, "artifact");
+        assert_eq!(role.source, "record_role");
+
+        let other = row_classification(&with(
+            &base_row(),
+            &[
+                ("activity_kind", json!("unknown")),
+                ("kind", json!("unknown")),
+                ("record_role", json!("unknown")),
+            ],
+        ));
+        assert_eq!(other.label, "other");
+        assert!(!other.label.is_empty());
     }
 
     #[test]
     fn chrome_suppressions_match_the_frozen_badge_options() {
-        assert!(activity_badge(
-            &with(&base_row(), &[("activity_kind", json!("source_control"))]),
-            BadgeOptions::default()
-        )
-        .is_none());
-        assert!(activity_badge(
-            &with(&base_row(), &[("activity_kind", json!("future_kind"))]),
-            BadgeOptions::default()
-        )
-        .is_none());
         assert!(outcome_badge(
             &with(&base_row(), &[("outcome", json!("success"))]),
             BadgeOptions::default()
@@ -4022,7 +4138,10 @@ mod tests {
             ViewMode::Activity,
             BadgeOptions::default(),
         );
-        assert_eq!(activity.len(), 1, "common success outcome stays suppressed");
+        assert!(
+            activity.is_empty(),
+            "activity lives in its own column and common success stays suppressed"
+        );
         let bundle = row_semantic_chrome(
             &bundle_row(),
             true,
@@ -4554,6 +4673,8 @@ mod tests {
         );
         assert_eq!(spec.identity.repository, "9007199254740993");
         assert_eq!(spec.identity.turn_id, "");
+        assert_eq!(spec.classification.label, "git");
+        assert_eq!(spec.classification.source, "activity_kind");
         assert_eq!(spec.group_label.as_deref(), Some("Git · repo 199254740993"));
     }
 
@@ -4799,10 +4920,12 @@ mod tests {
         );
         assert_eq!(spec.promoted, Some(PromotedKind::Failure));
         assert!(spec.classes().contains("row-promoted row-promoted-failure"));
+        assert_eq!(spec.classification.label, "run");
+        assert_eq!(spec.chrome.len(), 1);
         assert!(spec
             .chrome
-            .iter()
-            .any(|item| item.classes.starts_with("act-badge")));
+            .first()
+            .is_some_and(|item| item.classes.starts_with("out-badge")));
     }
 
     #[test]
@@ -4838,6 +4961,7 @@ mod tests {
         assert_eq!(spec.classes(), "row");
         assert_eq!(spec.open_json, None);
         assert!(spec.session.is_empty());
+        assert!(spec.classification.label.is_empty());
         assert!(spec.content.top.is_none());
     }
 
@@ -4950,6 +5074,10 @@ mod tests {
         assert_eq!(attrs.get("data-row").map(String::as_str), Some("3"));
         assert_eq!(attrs.get("data-key").map(String::as_str), Some("op:1"));
         assert_eq!(
+            attrs.get("data-classification").map(String::as_str),
+            Some("chat")
+        );
+        assert_eq!(
             attrs.get("aria-label").map(String::as_str),
             Some("Agent turn with metadata")
         );
@@ -4998,9 +5126,9 @@ mod tests {
 &tool,
 &context(ViewMode::Activity, 11, false),
 (
-&["row", "row-tool", "row-role-result", "row-has-badges"],
+&["row", "row-tool", "row-role-result"],
 "summary",
-"<span class=\"row-meta\"><span class=\"act-badge act-execute\" title=\"activity: execute\" aria-label=\"activity: run\">run</span></span><span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">tool result: {&quot;text&quot;: &quot;done the thing&quot;, &quot;type&quot;: &quot;output&quot;}</span></span></span>",
+"<span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">tool result: {&quot;text&quot;: &quot;done the thing&quot;, &quot;type&quot;: &quot;output&quot;}</span></span></span>",
 "Jan 15, 2026 04:00 PM",
 "agent",
 "t1"
@@ -5030,11 +5158,7 @@ mod tests {
         assert_eq!(fork.classes, "rel-badge rel-fork");
         let subagent = spec.chrome.get(1).expect("subagent badge");
         assert_eq!(subagent.classes, "rel-badge rel-subagent");
-        // Relations outrank generic activity badges even on plain rows.
-        assert!(spec
-            .chrome
-            .iter()
-            .all(|item| !item.classes.starts_with("act-badge")));
+        assert_eq!(spec.classification.label, "chat");
     }
 
     #[test]
@@ -5059,7 +5183,7 @@ mod tests {
 "t1"
 ));
 
-        // System rows are tool-classed and carry the system activity badge.
+        // System rows are tool-classed; their activity is rendered separately.
         let system = with(
             &base_row(),
             &[
@@ -5080,15 +5204,15 @@ mod tests {
 &system,
 &context(ViewMode::Activity, 5, false),
 (
-&["row", "row-tool", "row-role-lifecycle", "row-has-badges"],
+&["row", "row-tool", "row-role-lifecycle"],
 "summary",
-"<span class=\"row-meta\"><span class=\"act-badge act-system\" title=\"activity: system\" aria-label=\"activity: system\">system</span></span><span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">system record</span></span></span>",
+"<span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">system record</span></span></span>",
 "Jan 15, 2026 04:00 PM",
 "",
 ""
 ));
 
-        // A tool result row keeps its flat badge row in the raw view.
+        // A tool result row keeps its flat summary in the raw view.
         let dim = with(
             &base_row(),
             &[
@@ -5108,22 +5232,22 @@ mod tests {
 &dim,
 &context(ViewMode::Raw, 4, false),
 (
-&["row", "row-dim", "row-role-result", "row-has-badges"],
+&["row", "row-dim", "row-role-result"],
 "summary",
-"<span class=\"row-meta\"><span class=\"act-badge act-execute\" title=\"activity: execute\" aria-label=\"activity: run\">run</span></span><span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">op result: tool output</span></span></span>",
+"<span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">op result: tool output</span></span></span>",
 "Jan 15, 2026 04:00 PM",
 "",
 "node:2"
 ));
 
-        // Raw view: bundles flatten back to ordinary rows with sub-op chrome.
+        // Raw view: bundles flatten back to ordinary expandable rows.
         assert_row("raw_view_bundle",
 &bundle_row(),
 &context(ViewMode::Raw, 0, true),
 (
-&["row", "row-tool", "row-role-action", "row-has-badges", "row-group-start", "row-expandable"],
+&["row", "row-tool", "row-role-action", "row-group-start", "row-expandable"],
 "summary",
-"<button type=\"button\" class=\"subop-chevron\" title=\"Expand 2 details\" aria-label=\"Expand 2 details\" aria-expanded=\"false\">\u{25b8}</button><span class=\"row-meta\"><span class=\"act-badge act-execute\" title=\"activity: execute\" aria-label=\"activity: run\">run</span></span><span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">tool result: execute run (2 steps)</span></span></span>",
+"<button type=\"button\" class=\"subop-chevron\" title=\"Expand 2 details\" aria-label=\"Expand 2 details\" aria-expanded=\"false\">\u{25b8}</button><span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">tool result: execute run (2 steps)</span></span></span>",
 "Jan 15, 2026 04:00 PM",
 "",
 "bundle:exec1"
@@ -5144,9 +5268,9 @@ mod tests {
 &unknown,
 &context(ViewMode::Activity, 0, false),
 (
-&["row", "row-tool", "row-role-action", "row-has-badges", "row-expandable"],
+&["row", "row-tool", "row-role-action", "row-expandable"],
 "summary",
-"<button type=\"button\" class=\"subop-chevron\" title=\"Expand 2 details\" aria-label=\"Expand 2 details\" aria-expanded=\"false\">\u{25b8}</button><span class=\"row-meta\"><span class=\"act-badge act-execute\" title=\"activity: execute\" aria-label=\"activity: run\">run</span></span><span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">tool result: execute run (2 steps)</span></span></span>",
+"<button type=\"button\" class=\"subop-chevron\" title=\"Expand 2 details\" aria-label=\"Expand 2 details\" aria-expanded=\"false\">\u{25b8}</button><span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">tool result: execute run (2 steps)</span></span></span>",
 "Jan 15, 2026 04:00 PM",
 "",
 "bundle:exec1"
@@ -5172,9 +5296,9 @@ mod tests {
 &wu_end,
 &context(ViewMode::Activity, 2, false),
 (
-&["row", "row-dim", "row-role-result", "row-has-badges", "row-work-unit-end"],
+&["row", "row-dim", "row-role-result", "row-work-unit-end"],
 "summary",
-"<span class=\"row-meta\"><span class=\"act-badge act-execute\" title=\"activity: execute\" aria-label=\"activity: run\">run</span></span><span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">Agent turn with metadata</span></span></span>",
+"<span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">Agent turn with metadata</span></span></span>",
 "Jan 15, 2026 03:59 PM",
 "agent",
 "t1"
@@ -5257,6 +5381,11 @@ mod tests {
 "",
 "ode:1::sub:0"
 ));
+        let msg_spec = RowSpec::from_value(&msg, &context(ViewMode::Activity, 5, false));
+        assert_eq!(
+            msg_spec.classification.label, "chat",
+            "expanded sub-rows retain the Activity-column classification"
+        );
         let meta = with(
             &subop_row(),
             &[

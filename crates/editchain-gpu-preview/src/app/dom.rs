@@ -82,6 +82,9 @@ pub(crate) const MIN_GRAPH_COL_W: f64 = 40.0;
 /// Production `MIN_CONTENT_W`: readable Content summary budget (CSS px).
 pub(crate) const MIN_CONTENT_W: f64 = 160.0;
 
+/// Fixed width of the always-visible Activity classification column (CSS px).
+pub(crate) const ACTIVITY_COL_W: f64 = 88.0;
+
 /// Production `DEFAULT_COL_W.date` (author/commit are hidden in Pulse).
 pub(crate) const DEFAULT_COL_W_DATE: f64 = 140.0;
 
@@ -500,7 +503,9 @@ pub(crate) struct GraphLayout {
 /// Replicate `graphWidthBudget()`: fixed columns reserve their space first and
 /// the graph gets the remainder, capped at half the viewport (and at the
 /// compact rail width on narrow panels). Pulse hides author/commit at every
-/// width; date is retained until the narrowest breakpoint.
+/// width and retains date until the narrowest breakpoint. The fixed Activity
+/// track is deliberately not charged against this rail budget: doing so would
+/// rescale ordinary lane centers at compact widths, violating graph geometry.
 fn graph_width_budget(rows_client_width: f64, window_inner_width: f64) -> f64 {
     let rows_w = rows_client_width.max(1.0);
     let hidden_date = window_inner_width <= HIDE_DATE_MAX;
@@ -667,15 +672,19 @@ pub(crate) fn current_graph_width(layout: &GraphLayout, widths: &ColWidths) -> f
 
 /// The inline column-style string applied to rows/header/wrap (`colStyle()`).
 ///
-/// Pulse hides author/commit at every width; date is fixed at its default
-/// width until the narrowest breakpoint. Dragged overrides (divider state)
-/// are applied exactly like `colWidths` in main.js.
+/// Activity is fixed and always emitted; Pulse hides author/commit at every
+/// width, while date remains at its default until the narrowest breakpoint.
+/// Dragged overrides (divider state) are applied exactly like `colWidths` in
+/// main.js.
 pub(crate) fn col_style(
     graph_width_css: f64,
     window_inner_width: f64,
     widths: &ColWidths,
 ) -> String {
-    let mut parts = vec![format!("--graph-w:{graph_width_css}px")];
+    let mut parts = vec![
+        format!("--graph-w:{graph_width_css}px"),
+        format!("--activity-w:{ACTIVITY_COL_W}px"),
+    ];
     if let Some(content) = widths.content {
         parts.push(format!("--content-w:{content}px"));
     }
@@ -1945,6 +1954,7 @@ mod web {
         header.set_attribute("style", col_style)?;
         let columns = [
             ("graph", Some("Graph")),
+            ("activity", Some("Activity")),
             ("content", Some("Content")),
             ("date", Some("Date")),
         ];
@@ -2023,6 +2033,7 @@ mod web {
         row.set_attribute("title", &spec.aria.title)?;
         row.set_attribute("data-base-aria-label", &spec.aria.base_aria_label)?;
         row.set_attribute("data-key", &spec.identity.node_key)?;
+        row.set_attribute("data-classification", &spec.classification.label)?;
         if let Some(header) = &spec.work_unit_header {
             row.set_attribute("data-work-unit-id", &header.id)?;
         }
@@ -2044,6 +2055,18 @@ mod web {
         let svg = build_graph_svg(document, graph, &spec.graph)?;
         drop(graph_cell.append_child(&svg).map_err(js_err_from)?);
         drop(row.append_child(&graph_cell).map_err(js_err_from)?);
+
+        let activity_cell = make_element(
+            document,
+            "div",
+            "activity-cell",
+            Some(&spec.classification.label),
+        )?;
+        activity_cell.set_attribute("role", "gridcell")?;
+        activity_cell.set_attribute("title", &spec.classification.title)?;
+        activity_cell.set_attribute("aria-label", &spec.classification.title)?;
+        activity_cell.set_attribute("data-classification-source", &spec.classification.source)?;
+        drop(row.append_child(&activity_cell).map_err(js_err_from)?);
 
         let text_cell = make_element(document, "div", "text-cell", None)?;
         text_cell.set_attribute("role", "gridcell")?;
@@ -2511,6 +2534,7 @@ mod tests {
         assert_eq!(specs.len(), 2, "specs cover the window");
         let first = specs.first().expect("first spec");
         assert_eq!(first.identity.abs_index, 0, "first spec identity");
+        assert_eq!(first.classification.label, "chat");
         let second = specs.get(1).expect("second spec");
         assert_eq!(second.identity.node_key, "k1", "second spec node key");
     }
@@ -2641,12 +2665,12 @@ mod tests {
         let widths = ColWidths::default();
         assert_eq!(
             col_style(44.28, 1440.0, &widths),
-            "--graph-w:44.28px;--date-w:140px",
+            "--graph-w:44.28px;--activity-w:88px;--date-w:140px",
             "wide panels carry the fixed date width"
         );
         assert_eq!(
             col_style(44.28, 380.0, &widths),
-            "--graph-w:44.28px",
+            "--graph-w:44.28px;--activity-w:88px",
             "narrow panels drop the date track"
         );
         let dragged = ColWidths {
@@ -2656,7 +2680,7 @@ mod tests {
         };
         assert_eq!(
             col_style(44.28, 1440.0, &dragged),
-            "--graph-w:44.28px;--content-w:220px;--date-w:90px",
+            "--graph-w:44.28px;--activity-w:88px;--content-w:220px;--date-w:90px",
             "dragged overrides reach the inline style"
         );
     }

@@ -227,11 +227,12 @@ body {
    Positioned absolutely within the scroll-spacer at the rendered slice's top. */
 .table-wrap { position: absolute; left: 0; top: 0; width: 100%; }
 
-/* Sticky header row (Graph | Content | Date | Author | Commit/ID). */
+/* Sticky header row (Graph | Activity | Content | Date | Author | Commit/ID). */
 .tbl-header {
   display: grid;
   grid-template-columns:
-    var(--graph-w, auto) var(--content-w, minmax(0,1fr))
+    var(--graph-w, auto) var(--activity-w, 88px)
+    var(--content-w, minmax(0,1fr))
     var(--date-w, auto) var(--author-w, auto) var(--commit-w, auto);
   width: 100%;
   position: sticky;
@@ -311,7 +312,8 @@ body {
 .row {
   display: grid;
   grid-template-columns:
-    var(--graph-w, auto) var(--content-w, minmax(0,1fr))
+    var(--graph-w, auto) var(--activity-w, 88px)
+    var(--content-w, minmax(0,1fr))
     var(--date-w, auto) var(--author-w, auto) var(--commit-w, auto);
   width: 100%;
   height: 34px;
@@ -341,6 +343,7 @@ body {
 }
 /* Grid cells must not overflow their tracks (same rationale as the header). */
 .row .graph-cell,
+.row .activity-cell,
 .row .text-cell,
 .row .date-cell,
 .row .author-cell,
@@ -360,6 +363,16 @@ body {
   z-index: 2;
   line-height: 0;
   overflow: hidden;
+}
+.activity-cell {
+  padding: 0 8px;
+  overflow: hidden;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.72em;
+  line-height: 16px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .text-cell { padding-left: 8px; overflow: hidden; text-align: left; }
 .date-cell, .author-cell, .commit-cell {
@@ -472,12 +485,8 @@ body {
   opacity: 1;
 }
 
-/* Concise semantic activity + outcome badges (Activity/Raw profile content).
-   Same inline, height-neutral pattern as the relation badges: they sit at the
-   start of the summary and clip past it on long text. Text comes from the
-   renderer's whitelists (activity_kind / outcome lookup keys), never raw wire
-   values. */
-.act-badge,
+/* Concise outcome badges (Activity/Raw profile content). Activity itself lives
+   in the dedicated grid column immediately before Content. */
 .out-badge {
   display: inline-block;
   flex: 0 1 auto;
@@ -492,10 +501,6 @@ body {
   vertical-align: middle;
   white-space: nowrap;
   opacity: 1;
-}
-.act-badge {
-  border: 1px solid var(--vscode-descriptionForeground);
-  color: var(--vscode-descriptionForeground);
 }
 .out-badge.outcome-success {
   border: 1px solid var(--vscode-testing-iconPassed, #89d185);
@@ -825,7 +830,7 @@ body.col-resizing .col-resize-handle {
   .tbl-header,
   .row {
     grid-template-columns:
-      var(--graph-w, auto) minmax(0, 1fr)
+      var(--graph-w, auto) var(--activity-w, 88px) minmax(0, 1fr)
       minmax(0, var(--date-w, 140px))
       minmax(0, var(--author-w, 100px))
       minmax(0, var(--commit-w, 100px));
@@ -851,7 +856,7 @@ body.col-resizing .col-resize-handle {
   .tbl-header,
   .row {
     grid-template-columns:
-      var(--graph-w, auto) minmax(0, 1fr)
+      var(--graph-w, auto) var(--activity-w, 88px) minmax(0, 1fr)
       minmax(0, var(--date-w, 140px))
       minmax(0, var(--author-w, 100px));
   }
@@ -869,7 +874,7 @@ body.col-resizing .col-resize-handle {
   .tbl-header,
   .row {
     grid-template-columns:
-      var(--graph-w, auto) minmax(0, 1fr)
+      var(--graph-w, auto) var(--activity-w, 88px) minmax(0, 1fr)
       minmax(0, var(--date-w, 140px));
   }
   .th.author,
@@ -884,7 +889,7 @@ body.col-resizing .col-resize-handle {
   .tbl-header,
   .row {
     grid-template-columns:
-      var(--graph-w, auto) minmax(0, 1fr);
+      var(--graph-w, auto) var(--activity-w, 88px) minmax(0, 1fr);
   }
   .th.date,
   .date-cell {
@@ -1044,7 +1049,8 @@ body {
 .tbl-header,
 .row {
   grid-template-columns:
-    var(--graph-w, auto) minmax(0, 1fr) minmax(0, var(--date-w, 140px));
+    var(--graph-w, auto) var(--activity-w, 88px) minmax(0, 1fr)
+    minmax(0, var(--date-w, 140px));
 }
 
 .th.author,
@@ -1108,6 +1114,16 @@ body {
 
 .text-cell {
   padding-left: 10px;
+}
+
+.activity-cell {
+  padding: 0 8px 0 10px;
+  color: var(--ec-faint);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.015em;
+  line-height: 16px;
 }
 
 .row .summary {
@@ -1179,7 +1195,6 @@ body {
 }
 
 .rel-badge,
-.act-badge,
 .out-badge,
 .bundle-count,
 .bundle-status,
@@ -1207,29 +1222,19 @@ body {
   margin-right: 7px;
 }
 
-/* Activity is a quiet kicker, relations are topology annotations, and outcome
-   is the only lozenge-like state. This prevents every signal from becoming an
-   equally loud outlined chip. */
+/* Relations are topology annotations and outcome is the only lozenge-like
+   state. Activity is plain text in its dedicated column. */
 .rel-badge,
-.act-badge,
 .out-badge {
   margin: 0;
   border: 0;
   line-height: 15px;
 }
 
-.rel-badge,
-.act-badge {
-  padding: 0;
-  background: transparent;
-}
-
 .rel-badge {
+  padding: 0;
   color: color-mix(in srgb, var(--ec-violet) 82%, var(--ec-muted));
-}
-
-.act-badge {
-  color: var(--ec-faint);
+  background: transparent;
 }
 
 .out-badge {
@@ -1619,13 +1624,15 @@ body {
   .tbl-header,
   .row {
     grid-template-columns:
-      var(--graph-w, auto) minmax(0, 1fr) minmax(0, var(--date-w, 140px));
+      var(--graph-w, auto) var(--activity-w, 88px) minmax(0, 1fr)
+      minmax(0, var(--date-w, 140px));
   }
 }
 
 @media (max-width: 400px) {
   .tbl-header,
   .row {
-    grid-template-columns: var(--graph-w, auto) minmax(0, 1fr);
+    grid-template-columns:
+      var(--graph-w, auto) var(--activity-w, 88px) minmax(0, 1fr);
   }
 }
