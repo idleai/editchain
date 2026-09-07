@@ -753,6 +753,14 @@ fn compact_import_record(bytes: &[u8]) -> Vec<u8> {
         if !payload.is_empty() {
             drop(compact.insert("payload".to_string(), serde_json::Value::Object(payload)));
         }
+    } else if let Some(field) = match record_type {
+        "custom-title" => Some("customTitle"),
+        "ai-title" => Some("aiTitle"),
+        "agent-name" => Some("agentName"),
+        "session_title" => Some("title"),
+        _ => None,
+    } {
+        let _: bool = copy_preview_string(&raw, 0, &mut compact, field);
     } else if record_type == "assistant" {
         let message_start = raw.find("\"message\"").unwrap_or(0);
         let mut message = serde_json::Map::new();
@@ -899,6 +907,18 @@ fn compact_import_value(value: &serde_json::Value) -> serde_json::Value {
             if !message.is_empty() {
                 drop(compact.insert("message".to_string(), serde_json::Value::Object(message)));
             }
+        }
+        "custom-title" => {
+            let _: bool = copy_bounded_field(value, &mut compact, "customTitle");
+        }
+        "ai-title" => {
+            let _: bool = copy_bounded_field(value, &mut compact, "aiTitle");
+        }
+        "agent-name" => {
+            let _: bool = copy_bounded_field(value, &mut compact, "agentName");
+        }
+        "session_title" => {
+            let _: bool = copy_bounded_field(value, &mut compact, "title");
         }
         _ => {}
     }
@@ -1873,6 +1893,9 @@ impl Workspace {
                     summary: node.summary(),
                     timestamp_ms: node.timestamp_ms(),
                     group: group.clone(),
+                    group_end: filtered
+                        .get(abs_idx.saturating_add(1))
+                        .is_none_or(|next| next.group() != group),
                     node_key: node.node_key(),
                     parents,
                     parent_relations,
@@ -1936,6 +1959,7 @@ impl Workspace {
                     summary: child.summary.clone(),
                     timestamp_ms: child.timestamp_ms,
                     group: group.clone(),
+                    group_end: false,
                     // Nested rows are not graph nodes; stable synthetic keys
                     // keep group-start detection and click routing unambiguous.
                     node_key: format!("{}::child:{i}", node.node_key()),
@@ -2809,35 +2833,90 @@ fn work_unit_dto(marker: &WorkUnitMarker) -> WorkUnitDto {
     }
 }
 
-/// Collect the two session-provenance labels the history UI is allowed to
-/// surface. Raw `session_meta` records remain authoritative; this index only
+/// Collect the bounded session-provenance labels the history UI is allowed to
+/// surface. Provider metadata records remain authoritative; this index only
 /// avoids making the webview parse provider JSON or repeat large payloads.
 #[must_use]
 fn session_metadata_index(ops: &[Op]) -> HashMap<String, SessionMetaDto> {
-    let mut by_group = HashMap::<String, SessionMetaDto>::new();
+    type Rank = (u8, u64, u16, OpId);
+    #[derive(Default)]
+    struct RankedMetadata {
+        metadata: SessionMetaDto,
+        title_rank: Option<Rank>,
+        model_rank: Option<Rank>,
+        agent_rank: Option<Rank>,
+    }
+
+    fn merge_field(
+        target: &mut Option<String>,
+        target_rank: &mut Option<Rank>,
+        incoming: Option<String>,
+        rank: Rank,
+    ) {
+        if incoming.is_some() && target_rank.is_none_or(|current| rank >= current) {
+            *target = incoming;
+            *target_rank = Some(rank);
+        }
+    }
+
+    let mut by_group = HashMap::<String, RankedMetadata>::new();
     for op in ops {
         let ScopeRef::Session(session_id) = op.scope else {
             continue;
         };
-        let Some(found) = session_metadata_from_op(op) else {
+        let Some((found, title_priority)) = session_metadata_from_op(op) else {
             continue;
         };
         let entry = by_group
             .entry(format!("session:{}", session_id.0))
             .or_default();
-        if entry.model_provider.is_none() {
-            entry.model_provider = found.model_provider;
-        }
-        if entry.agent_nickname.is_none() {
-            entry.agent_nickname = found.agent_nickname;
-        }
+        let base_rank = (0, op.clock.as_u64(), op.clock.sub(), op.id);
+        merge_field(
+            &mut entry.metadata.session_title,
+            &mut entry.title_rank,
+            found.session_title,
+            (title_priority, base_rank.1, base_rank.2, base_rank.3),
+        );
+        merge_field(
+            &mut entry.metadata.model_provider,
+            &mut entry.model_rank,
+            found.model_provider,
+            base_rank,
+        );
+        merge_field(
+            &mut entry.metadata.agent_nickname,
+            &mut entry.agent_rank,
+            found.agent_nickname,
+            base_rank,
+        );
     }
     by_group
+        .into_iter()
+        .map(|(group, mut ranked)| {
+            if ranked
+                .metadata
+                .session_title
+                .as_deref()
+                .is_some_and(|title| {
+                    ranked
+                        .metadata
+                        .agent_nickname
+                        .as_deref()
+                        .is_some_and(|agent| title.eq_ignore_ascii_case(agent))
+                })
+            {
+                ranked.metadata.agent_nickname = None;
+            }
+            (group, ranked.metadata)
+        })
+        .collect()
 }
 
-/// Parse the bounded projection copy of one raw Codex `session_meta` import.
+/// Parse one bounded provider metadata import. The returned priority keeps an
+/// explicit custom title ahead of an AI-generated fallback regardless of the
+/// records' source ordering.
 #[must_use]
-fn session_metadata_from_op(op: &Op) -> Option<SessionMetaDto> {
+fn session_metadata_from_op(op: &Op) -> Option<(SessionMetaDto, u8)> {
     let OpKind::Import(import) = &op.kind else {
         return None;
     };
@@ -2845,23 +2924,61 @@ fn session_metadata_from_op(op: &Op) -> Option<SessionMetaDto> {
         return None;
     };
     let value = serde_json::from_slice::<serde_json::Value>(raw).ok()?;
-    if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
-        return None;
-    }
-    let payload = value.get("payload")?;
-    let display_field = |name: &str| {
-        payload
+    let record_type = value.get("type").and_then(serde_json::Value::as_str)?;
+    let display_field = |source: &serde_json::Value, name: &str| {
+        source
             .get(name)
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
     };
-    let metadata = SessionMetaDto {
-        model_provider: display_field("model_provider"),
-        agent_nickname: display_field("agent_nickname"),
+    let (metadata, title_priority) = match record_type {
+        "session_meta" => {
+            let payload = value.get("payload")?;
+            (
+                SessionMetaDto {
+                    session_title: None,
+                    model_provider: display_field(payload, "model_provider"),
+                    agent_nickname: display_field(payload, "agent_nickname"),
+                },
+                0,
+            )
+        }
+        "custom-title" => (
+            SessionMetaDto {
+                session_title: display_field(&value, "customTitle"),
+                ..SessionMetaDto::default()
+            },
+            2,
+        ),
+        "ai-title" => (
+            SessionMetaDto {
+                session_title: display_field(&value, "aiTitle"),
+                ..SessionMetaDto::default()
+            },
+            1,
+        ),
+        "agent-name" => (
+            SessionMetaDto {
+                agent_nickname: display_field(&value, "agentName"),
+                ..SessionMetaDto::default()
+            },
+            0,
+        ),
+        "session_title" => (
+            SessionMetaDto {
+                session_title: display_field(&value, "title"),
+                ..SessionMetaDto::default()
+            },
+            2,
+        ),
+        _ => return None,
     };
-    (metadata.model_provider.is_some() || metadata.agent_nickname.is_some()).then_some(metadata)
+    (metadata.session_title.is_some()
+        || metadata.model_provider.is_some()
+        || metadata.agent_nickname.is_some())
+    .then_some((metadata, title_priority))
 }
 
 /// Typed Activity-view bundle metadata for a synthetic Activity row.
@@ -4344,9 +4461,11 @@ mod tests {
         assert_eq!(window.rows[0].sub_ops[0].op_id, meta.id.to_string());
         assert_eq!(window.rows[0].sub_ops[0].kind, "last-prompt");
         assert!(!window.rows[0].is_subop);
+        assert!(window.rows[0].group_end);
         assert_eq!(window.rows[0].parent_row, None);
         // The expanded sub-op row follows its parent and inherits its lane.
         assert!(window.rows[1].is_subop);
+        assert!(!window.rows[1].group_end);
         assert_eq!(window.rows[1].parent_row, Some(0));
         assert_eq!(
             window.rows[1].op_id.as_deref(),
@@ -4366,6 +4485,7 @@ mod tests {
         });
         assert_eq!(deep.rows.len(), 1);
         assert!(deep.rows[0].is_subop);
+        assert!(!deep.rows[0].group_end);
         assert_eq!(deep.rows[0].op_id, Some(meta.id.to_string()));
         assert!(deep.sub_op_counts.is_none());
     }
@@ -5306,8 +5426,82 @@ mod tests {
         );
         let metadata = session_metadata_index(std::slice::from_ref(&session_op));
         let metadata = metadata.get("session:10").expect("session metadata");
+        assert_eq!(metadata.session_title, None);
         assert_eq!(metadata.model_provider.as_deref(), Some("sglang_dsv4"));
         assert_eq!(metadata.agent_nickname.as_deref(), Some("Harvey"));
+
+        // Claude's explicit title and the portable Codex title record retain
+        // only their bounded display fields. A duplicate Claude agent-name is
+        // removed from the final metadata, while a distinct named subagent is
+        // kept for `title · nickname` rendering.
+        let custom_title = compact_import_record(
+            br#"{"type":"custom-title","customTitle":"q0","private":"discard"}"#,
+        );
+        let custom_title: serde_json::Value = serde_json::from_slice(&custom_title).unwrap();
+        assert_eq!(custom_title["customTitle"], "q0");
+        assert!(custom_title.get("private").is_none());
+        let codex_title = compact_import_record(
+            br#"{"type":"session_title","provider":"codex","title":"r8","updated_at":"discard"}"#,
+        );
+        let codex_title: serde_json::Value = serde_json::from_slice(&codex_title).unwrap();
+        assert_eq!(codex_title["title"], "r8");
+        assert!(codex_title.get("updated_at").is_none());
+
+        let metadata = session_metadata_index(&[
+            op_envelope(
+                91,
+                1,
+                OpKind::Import(ImportOp {
+                    raw_ref: Payload::Inline(
+                        br#"{"type":"ai-title","aiTitle":"generated"}"#.to_vec(),
+                    ),
+                    raw_hash: None,
+                }),
+            ),
+            op_envelope(
+                91,
+                2,
+                OpKind::Import(ImportOp {
+                    raw_ref: Payload::Inline(serde_json::to_vec(&custom_title).unwrap()),
+                    raw_hash: None,
+                }),
+            ),
+            op_envelope(
+                91,
+                3,
+                OpKind::Import(ImportOp {
+                    raw_ref: Payload::Inline(br#"{"type":"agent-name","agentName":"q0"}"#.to_vec()),
+                    raw_hash: None,
+                }),
+            ),
+        ]);
+        let metadata = metadata.get("session:10").expect("Claude title metadata");
+        assert_eq!(metadata.session_title.as_deref(), Some("q0"));
+        assert_eq!(metadata.agent_nickname, None);
+
+        let metadata = session_metadata_index(&[
+            op_envelope(
+                92,
+                1,
+                OpKind::Import(ImportOp {
+                    raw_ref: Payload::Inline(serde_json::to_vec(&codex_title).unwrap()),
+                    raw_hash: None,
+                }),
+            ),
+            op_envelope(
+                92,
+                2,
+                OpKind::Import(ImportOp {
+                    raw_ref: Payload::Inline(
+                        br#"{"type":"session_meta","payload":{"agent_nickname":"Tesla"}}"#.to_vec(),
+                    ),
+                    raw_hash: None,
+                }),
+            ),
+        ]);
+        let metadata = metadata.get("session:10").expect("Codex title metadata");
+        assert_eq!(metadata.session_title.as_deref(), Some("r8"));
+        assert_eq!(metadata.agent_nickname.as_deref(), Some("Tesla"));
 
         let session_prefix = compact_import_record(
             br#"{"type":"session_meta","payload":{"model_provider":"sglang_dsv4","agent_nickname":"Harvey","base_instructions":"unterminated"#,

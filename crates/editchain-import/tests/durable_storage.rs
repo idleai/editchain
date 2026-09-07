@@ -453,6 +453,7 @@ fn commit_persists_generation_before_cursors_on_write_error() {
         content_hash_version: 1,
         source_node: Some(editchain_core::NodeId(7)),
         normalization_version: 0,
+        session_title_hash: None,
     };
     let new_cursor = CursorValue {
         file_size: 9,
@@ -462,6 +463,7 @@ fn commit_persists_generation_before_cursors_on_write_error() {
         content_hash_version: 1,
         source_node: Some(editchain_core::NodeId(7)),
         normalization_version: 0,
+        session_title_hash: None,
     };
 
     // Durable baseline: a generation-0 cursor covering the pre-rewrite read.

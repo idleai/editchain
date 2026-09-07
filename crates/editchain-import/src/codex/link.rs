@@ -30,8 +30,10 @@ use editchain_core::{ActorId, Op, OpId, SessionId};
 use crate::error::ImportError;
 use crate::ids::{derive_external_entity_id, derive_session_id};
 
-/// Cursor checkpoint for exact Codex topology.
-pub const CODEX_NORMALIZATION_VERSION: u32 = 2;
+/// Cursor checkpoint for Codex normalized metadata. Version three adds
+/// portable capture of out-of-band session titles; version two added exact
+/// topology facts.
+pub const CODEX_NORMALIZATION_VERSION: u32 = 3;
 
 /// Resolver identifier retained in every emitted evidence payload.
 pub const CODEX_TOPOLOGY_RESOLVER: &str = "codex-topology-v2";

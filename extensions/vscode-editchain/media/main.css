@@ -263,16 +263,16 @@ body {
 
 /* Group separator drawn INSIDE the first row of each group so every row stays
    exactly ROW_H tall (the uniform-grid math depends on it). A top border marks
-   the boundary (accenting the per-row bottom borders into a thicker divider);
-   the label is an absolutely-positioned chip so it never affects row height or
-   column layout. */
+   the boundary by accenting the per-row bottom borders into a thicker divider.
+   Subtitles are independent of this presentation boundary and appear only on
+   true graph tips/roots, as derived from each row's lane geometry. */
 .row-group-start {
   box-sizing: border-box;
   border-top: 1px solid var(--row-border);
 }
-/* Session/group title chip. ALWAYS visible so group boundaries read at a
-   glance (short IDs only — never full raw 64-bit strings). Absolutely
-   positioned so its appearance never shifts row height or column layout —
+/* Session/group subtitle. Visible on true graph endpoints. Provider session
+   names replace opaque ids when available.
+   Absolutely positioned so its appearance never shifts row height or column layout —
    virtual scroll keeps every row exactly ROW_H regardless of chip state. The
    translucent background keeps the label legible without a hard-edged box.
    The graph cell is explicitly stacked above this background label so lane
@@ -326,13 +326,11 @@ body {
   align-items: center;
   cursor: pointer;
 }
-.row:hover { background-color: var(--vscode-list-hoverBackground); }
 .row:focus-visible {
   outline: 1px solid var(--vscode-focusBorder);
   outline-offset: -1px;
 }
-/* Inline selected-row highlight: a soft accent that stays clearly visible
-   on top of the hover colour without hard-coded theme assumptions. */
+/* Inline selected-row highlight. */
 .row.row-selected {
   background-color: color-mix(in srgb, var(--vscode-focusBorder) 18%, var(--vscode-editor-background));
 }
@@ -1094,10 +1092,6 @@ body {
   transition: background-color 70ms ease;
 }
 
-.row:hover {
-  background-color: var(--vscode-list-hoverBackground, var(--ec-surface-raised));
-}
-
 .row:focus-visible {
   outline-color: var(--vscode-focusBorder);
 }
@@ -1281,6 +1275,13 @@ body {
   background: transparent;
   border-top-color: var(--ec-hairline-strong);
   box-shadow: none;
+}
+
+/* Keep the significant session summary visibly distinct with the same subtle
+   theme tint rows previously received on hover. Ordinary rows intentionally
+   have no hover background while this treatment is in effect. */
+.row.row-work-unit-start[data-classification='session'] {
+  background-color: var(--vscode-list-hoverBackground, var(--ec-surface-raised));
 }
 
 .row-work-unit-end {

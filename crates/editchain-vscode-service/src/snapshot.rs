@@ -92,7 +92,7 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 /// summarized outer work group and preserves existing bundles as a second
 /// disclosure level. Expandable-row spans are now persisted alongside the
 /// legacy top-level child counts.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 27;
+const SNAPSHOT_PROJECTION_REVISION: u32 = 28;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

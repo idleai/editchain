@@ -179,6 +179,7 @@ pub mod normalize;
 pub mod projection;
 /// Exact session-start Git anchoring from Codex metadata.
 mod session_git;
+mod title;
 
 pub use discover::{discover_rollouts, RolloutFile};
 pub use helper::HelperCommand;

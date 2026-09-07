@@ -380,7 +380,7 @@ pub struct ResolvedObject {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "flat versioned wire DTO: each boolean is an independent backward-compatible serde-defaulted flag the viewer toggles (submodule/system/subop/promoted); refactoring to enums would churn the wire contract"
+    reason = "flat versioned wire DTO: each boolean is an independent backward-compatible serde-defaulted flag the viewer toggles (group boundary/submodule/system/subop/promoted); refactoring to enums would churn the wire contract"
 )]
 pub struct HistoryRow {
     /// The operation ID (for `EditChain` ops) in display form `"node:boot:seq"`,
@@ -398,6 +398,11 @@ pub struct HistoryRow {
     pub timestamp_ms: u64,
     /// Grouping key for block separation (session id for ops, repo id for git).
     pub group: String,
+    /// Whether this is the final top-level graph node in its contiguous group
+    /// run. The service computes this against the complete filtered snapshot,
+    /// so clients never infer a false boundary at a virtual-window edge.
+    #[serde(default)]
+    pub group_end: bool,
     /// Stable node key for graph wiring (op id string or git oid hex).
     pub node_key: String,
     /// Parent node keys (for drawing graph edges).
@@ -545,6 +550,11 @@ pub struct HistoryRow {
 /// and other large or sensitive session fields stay in the raw record only.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMetaDto {
+    /// Human-friendly session title captured from the provider's durable
+    /// rename metadata (for example a Claude `custom-title` or Codex thread
+    /// index entry).
+    #[serde(default)]
+    pub session_title: Option<String>,
     /// Model/provider label recorded by the session (for example
     /// `sglang_dsv4`).
     #[serde(default)]
@@ -945,6 +955,7 @@ mod tests {
             summary: "row".to_string(),
             timestamp_ms: 1_700_000_000_000,
             group: "repo:big".to_string(),
+            group_end: true,
             node_key: big_op_id().to_string(),
             parents: vec![big_op_id().to_string()],
             parent_relations: vec![ParentRelationDto {
@@ -1503,6 +1514,7 @@ mod tests {
             "is_submodule": false,
         }))
         .expect("legacy row deserializes");
+        assert!(!legacy.group_end);
         assert_eq!(legacy.work_unit, None);
         assert_eq!(legacy.session_meta, None);
         assert!(!legacy.promoted);
@@ -1516,6 +1528,7 @@ mod tests {
             summary: "row".to_string(),
             timestamp_ms: 1,
             group: "session:1".to_string(),
+            group_end: true,
             node_key: "1:0:1".to_string(),
             parents: Vec::new(),
             parent_relations: Vec::new(),
@@ -1539,6 +1552,7 @@ mod tests {
             outcome: editchain_project::taxonomy::Outcome::Success,
             turn_id: Some(OVER_2_53.to_string()),
             session_meta: Some(SessionMetaDto {
+                session_title: Some("r8".to_string()),
                 model_provider: Some("sglang_dsv4".to_string()),
                 agent_nickname: Some("Harvey".to_string()),
             }),
@@ -1563,9 +1577,11 @@ mod tests {
         assert_eq!(json["work_unit"]["is_start"], true);
         assert_eq!(json["work_unit"]["title"], "request");
         assert_eq!(json["work_unit"]["count"], 12u64);
+        assert_eq!(json["group_end"], true);
         assert_eq!(json["promoted"], true);
         assert_eq!(json["session_meta"]["model_provider"], "sglang_dsv4");
         assert_eq!(json["session_meta"]["agent_nickname"], "Harvey");
+        assert_eq!(json["session_meta"]["session_title"], "r8");
         assert_eq!(json["activity_bundle"]["kind"], "execute-run");
         assert_eq!(json["activity_bundle"]["member_count"], 3u64);
         let back: HistoryRow = serde_json::from_value(json).expect("deserialize row");

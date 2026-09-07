@@ -501,6 +501,7 @@ mod tests {
                     content_hash_version: 0,
                     source_node: None,
                     normalization_version: 0,
+                    session_title_hash: None,
                 },
             )
             .unwrap();
@@ -522,6 +523,7 @@ mod tests {
                     content_hash_version: 0,
                     source_node: None,
                     normalization_version: 0,
+                    session_title_hash: None,
                 },
             )
             .unwrap();

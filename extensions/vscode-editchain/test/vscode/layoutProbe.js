@@ -1530,7 +1530,8 @@
       });
     }
 
-    // Check 5m: group boundary labels are VISIBLE and show a SHORT id.
+    // Check 5m: graph-endpoint subtitles are visible and any fallback id
+    // remains short. Named sessions can be ordinary prose with no id prefix.
     if (wrapEl && !viewMessage) {
       const labelEl = wrapEl.querySelector('.group-label');
       const computed = labelEl ? getComputedStyle(labelEl) : null;

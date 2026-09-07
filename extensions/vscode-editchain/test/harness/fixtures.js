@@ -5,7 +5,8 @@
 // requests from the renderer bootstrap.
 //
 // Row shape (HistoryRow): op_id?, git_oid?, repository?, summary, timestamp_ms,
-//   group, node_key, parents[], is_submodule, is_system, author, commit_id, kind
+//   group, group_end, node_key, parents[], is_submodule, is_system, author,
+//   commit_id, kind
 // Layout shape (GraphLayout): { rows:[{node,lane}], edges:[{child,parent,points:[{row,lane}]}] }
 //
 // Identifier contract (editchain-protocol): op_id is "node:boot:seq", git_oid

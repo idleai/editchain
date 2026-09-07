@@ -101,6 +101,7 @@ pub fn read_session_file(
         content_hash_version: 1,
         source_node: cursor.and_then(|c| c.source_node),
         normalization_version: cursor.map_or(0, |c| c.normalization_version),
+        session_title_hash: cursor.and_then(|c| c.session_title_hash),
     };
 
     Ok((lines, bytes_read, new_cursor))

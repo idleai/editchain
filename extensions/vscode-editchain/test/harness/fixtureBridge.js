@@ -171,6 +171,7 @@
     if (!Object.prototype.hasOwnProperty.call(out, 'work_unit')) out.work_unit = null;
     if (!Object.prototype.hasOwnProperty.call(out, 'promoted')) out.promoted = false;
     if (!Object.prototype.hasOwnProperty.call(out, 'activity_bundle')) out.activity_bundle = null;
+    if (!Object.prototype.hasOwnProperty.call(out, 'group_end')) out.group_end = false;
     if (!Object.prototype.hasOwnProperty.call(out, 'hierarchy_depth')) {
       out.hierarchy_depth = out.is_subop ? 1 : 0;
     }
@@ -213,6 +214,7 @@
           summary: sub.summary,
           timestamp_ms: sub.timestamp_ms,
           group: row.group,
+          group_end: false,
           node_key: row.node_key + '::sub:' + i,
           parents: [],
           is_submodule: false,
@@ -250,6 +252,12 @@
     if (hideSub) rows = rows.filter((r) => !r.is_submodule);
     const filtered = applyFilter(rows, req.filter);
     rows = filtered.rows;
+    // The real service marks boundaries against the complete filtered
+    // top-level snapshot, before virtual paging or descendant expansion.
+    rows = rows.map((row, index) => ({
+      ...row,
+      group_end: !rows[index + 1] || rows[index + 1].group !== row.group,
+    }));
     // Global per-node sub-op counts (for prefix sums). Mirrors the real
     // service: shipped ONLY with the offset-0 window, so the renderer must
     // establish the snapshot from offset zero before paging deep windows.

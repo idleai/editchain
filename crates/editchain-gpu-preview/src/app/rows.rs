@@ -68,7 +68,7 @@ pub(crate) struct RowContext {
     pub(crate) view: ViewMode,
     /// Absolute expanded-history index (`data-row`).
     pub(crate) abs_index: i64,
-    /// Whether this row opens a new `group` run (`row-group-start` chip).
+    /// Whether this row opens a new `group` run (`row-group-start` divider).
     pub(crate) is_group_start: bool,
     /// The selected row's `node_key` (`selectedRowKey`), if any.
     pub(crate) selected_key: Option<String>,
@@ -258,15 +258,67 @@ pub(crate) fn short_id(id: &str) -> String {
     chars.into_iter().skip(keep_from).collect()
 }
 
-/// `groupLabelText` — human label for a block-separator group key.
-pub(crate) fn group_label_text(group: &str) -> String {
+/// Human subtitle for either endpoint of a connected graph chain.
+/// Provider titles replace opaque session ids; a distinct named subagent is
+/// appended without repeating providers that store the session title in both
+/// fields.
+pub(crate) fn group_label_text(
+    group: &str,
+    session_title: Option<&str>,
+    agent_nickname: Option<&str>,
+) -> String {
     if let Some(rest) = group.strip_prefix("repo:") {
-        format!("Git · repo {}", short_id(rest))
-    } else if let Some(rest) = group.strip_prefix("session:") {
-        format!("Session {}", short_id(rest))
-    } else {
-        "EditChain ops".to_owned()
+        return format!("Git · repo {}", short_id(rest));
     }
+    let title = session_title
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
+    let mut label = title.map_or_else(
+        || {
+            group.strip_prefix("session:").map_or_else(
+                || "EditChain ops".to_owned(),
+                |rest| format!("Session {}", short_id(rest)),
+            )
+        },
+        str::to_owned,
+    );
+    if let Some(agent) = agent_nickname
+        .map(str::trim)
+        .filter(|agent| !agent.is_empty())
+        .filter(|agent| !agent.eq_ignore_ascii_case(&label))
+    {
+        label.push_str(" · ");
+        label.push_str(agent);
+    }
+    label
+}
+
+/// Whether this row's own graph node has an open side.
+///
+/// `above` and `below` carry same-lane half-segments. Cross-lane bends carry
+/// the remaining connection at the node: parent-anchored bends end at the dot
+/// from above, while child-anchored bends start at the dot toward below. A
+/// graph subtitle belongs only on a true tip or root, never merely on a group
+/// boundary that happens to lie inside a continuing chain.
+fn is_graph_endpoint(row: &Value) -> bool {
+    let lane = wire::lane(row);
+    let above = wire::above(row);
+    let below = wire::below(row);
+    let transitions = wire::transitions(row);
+    let connected_above =
+        above.contains(&lane) || transitions.iter().any(|&(_, to_lane)| to_lane == lane);
+    let connected_below =
+        below.contains(&lane) || transitions.iter().any(|&(from_lane, _)| from_lane == lane);
+
+    !connected_above || !connected_below
+}
+
+fn session_meta_field<'a>(row: &'a Value, field: &str) -> Option<&'a str> {
+    row.get("session_meta")
+        .and_then(|meta| meta.get(field))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 /// `shortCommitId` — display value for the Commit/ID column.
@@ -2100,6 +2152,14 @@ impl RowClassification {
             title: format!("{source_title}: {wire_value}"),
         }
     }
+
+    fn session_summary() -> RowClassification {
+        RowClassification {
+            label: "session".to_owned(),
+            source: "work_unit".to_owned(),
+            title: "Session summary".to_owned(),
+        }
+    }
 }
 
 /// Whether a wire token is useful as a visible classification fallback.
@@ -2320,6 +2380,21 @@ pub(crate) fn work_unit_of(row: &Value, view: ViewMode) -> Option<WorkUnitData> 
     })
 }
 
+/// Whether this row is the display-order boundary for a whole session.
+///
+/// A turn-scoped unit has an id such as `session:s1/turn:t1`, while legacy
+/// Claude sessions without turn ids use the session group itself as their
+/// unit id. Only the latter acts as the significant session summary row.
+#[must_use]
+fn is_session_summary_row(row: &Value, view: ViewMode, work_unit: Option<&WorkUnitData>) -> bool {
+    if view != ViewMode::Activity || wire::bool(row, "is_subop") {
+        return false;
+    }
+    let group = row_str(row, "group");
+    group.starts_with("session:")
+        && work_unit.is_some_and(|unit| unit.is_start && unit.id.as_str() == group)
+}
+
 /// `workUnitTitle` — DTO title's first meaningful line, else human fallbacks.
 pub(crate) fn work_unit_title(row: &Value, view: ViewMode) -> String {
     if let Some(wu) = work_unit_of(row, view) {
@@ -2343,7 +2418,7 @@ pub(crate) fn work_unit_title(row: &Value, view: ViewMode) -> String {
     if kind == "message" || kind == "command" {
         return "Request".to_owned();
     }
-    group_label_text(&row_str(row, "group"))
+    group_label_text(&row_str(row, "group"), None, None)
 }
 
 /// `workUnitCountText` — human count text for a unit header.
@@ -2814,7 +2889,11 @@ impl RowSpec {
         let is_execute_run = bundle_kind == Some(BundleKind::ExecuteRun);
         let is_plan_repeat = bundle_kind == Some(BundleKind::PlanRepeat);
         let semantic_tags = row_semantic_chrome(row, is_bundle, view, BadgeOptions::default());
-        let classification = row_classification(row);
+        let classification = if is_session_summary_row(row, view, work_unit.as_ref()) {
+            RowClassification::session_summary()
+        } else {
+            row_classification(row)
+        };
         let session = session_meta_values(row);
         let has_session_meta = !is_subop && !session.is_empty();
         let session_description = session_meta_description(row);
@@ -2933,8 +3012,12 @@ impl RowSpec {
             }
         };
         let group_start = context.is_group_start && !is_work_unit_start;
-        let group_label = if group_start {
-            Some(group_label_text(&row_str(row, "group")))
+        let group_label = if !is_subop && is_graph_endpoint(row) {
+            Some(group_label_text(
+                &row_str(row, "group"),
+                session_meta_field(row, "session_title"),
+                session_meta_field(row, "agent_nickname"),
+            ))
         } else {
             None
         };
@@ -3505,6 +3588,7 @@ mod tests {
             "summary": "Agent turn with metadata",
             "timestamp_ms": now().wrapping_sub(1000),
             "group": "session:s1",
+            "group_end": false,
             "node_key": "op:1",
             "parents": [],
             "is_submodule": false,
@@ -3542,6 +3626,7 @@ mod tests {
             "summary": "feat: add **search** bar\n\nsecond line",
             "timestamp_ms": now(),
             "group": "repo:9007199254740993",
+            "group_end": true,
             "node_key": "git:abc123def456",
             "parents": [],
             "is_submodule": false,
@@ -3706,6 +3791,43 @@ mod tests {
         )
     }
 
+    fn session_summary_row() -> Value {
+        with(
+            &base_row(),
+            &[
+                ("node_key", json!("wu:session-summary")),
+                (
+                    "summary",
+                    json!("system last-prompt custom-title — 1 activity · 1 plan"),
+                ),
+                ("group", json!("session:s1")),
+                ("kind", json!("work-group")),
+                ("record_role", json!("action")),
+                ("activity_kind", json!("work")),
+                ("turn_id", json!("")),
+                (
+                    "activity_bundle",
+                    json!({ "kind": "work-group", "member_count": 1 }),
+                ),
+                (
+                    "sub_ops",
+                    json!([{ "op_id": "n::meta", "summary": "system last-prompt custom-title", "kind": "import" }]),
+                ),
+                (
+                    "work_unit",
+                    json!({
+                        "id": "session:s1",
+                        "title": "Initial user request",
+                        "is_start": true,
+                        "is_end": false,
+                        "count": 87,
+                    }),
+                ),
+                ("session_meta", Value::Null),
+            ],
+        )
+    }
+
     fn promoted_failure_row() -> Value {
         with(
             &base_row(),
@@ -3740,6 +3862,7 @@ mod tests {
                 (
                     "session_meta",
                     json!({
+                        "session_title": "q0",
                         "model_provider": "  sglang_dsv4  ",
                         "agent_nickname": "Harvey",
                     }),
@@ -3758,14 +3881,22 @@ mod tests {
         assert_eq!(short_id("abc123def456"), "abc123def456");
         assert_eq!(short_id(""), "");
         assert_eq!(
-            group_label_text("repo:9007199254740993"),
+            group_label_text("repo:9007199254740993", None, None),
             "Git · repo 199254740993"
         );
         assert_eq!(
-            group_label_text("session:session_abcdefghijklmnop"),
+            group_label_text("session:session_abcdefghijklmnop", None, None),
             "Session efghijklmnop"
         );
-        assert_eq!(group_label_text("ops"), "EditChain ops");
+        assert_eq!(group_label_text("ops", None, None), "EditChain ops");
+        assert_eq!(
+            group_label_text("session:opaque", Some("q0"), Some("Tesla")),
+            "q0 · Tesla"
+        );
+        assert_eq!(
+            group_label_text("session:opaque", Some("q0"), Some("q0")),
+            "q0"
+        );
     }
 
     #[test]
@@ -4161,6 +4292,35 @@ mod tests {
         ));
         assert_eq!(other.label, "other");
         assert!(!other.label.is_empty());
+    }
+
+    #[test]
+    fn session_scoped_boundary_uses_the_session_activity_name() {
+        let row = session_summary_row();
+        let spec = RowSpec::from_value(&row, &RowContext::for_row(ViewMode::Activity, 0, false));
+        assert_eq!(spec.classification.label, "session");
+        assert_eq!(spec.classification.source, "work_unit");
+        assert_eq!(spec.classification.title, "Session summary");
+        assert_eq!(
+            render_activity_html(&spec),
+            "<span class=\"activity-label\">session</span><button type=\"button\" class=\"subop-chevron\" title=\"Expand 1 activity\" aria-label=\"Expand 1 activity\" aria-expanded=\"false\">▸</button>"
+        );
+        assert_eq!(
+            render_attrs(&spec)
+                .get("data-classification")
+                .map(String::as_str),
+            Some("session")
+        );
+
+        let raw = RowSpec::from_value(&row, &RowContext::for_row(ViewMode::Raw, 0, false));
+        assert_eq!(raw.classification.label, "work");
+        assert_eq!(raw.classification.source, "activity_kind");
+
+        let turn_start = RowSpec::from_value(
+            &wu_start_row(),
+            &RowContext::for_row(ViewMode::Activity, 0, false),
+        );
+        assert_eq!(turn_start.classification.label, "user");
     }
 
     #[test]
@@ -4822,7 +4982,10 @@ mod tests {
         assert_eq!(spec.identity.turn_id, "");
         assert_eq!(spec.classification.label, "git");
         assert_eq!(spec.classification.source, "activity_kind");
-        assert_eq!(spec.group_label.as_deref(), Some("Git · repo 199254740993"));
+        assert_eq!(
+            spec.group_label, None,
+            "group markers must not label a graph node connected on both sides"
+        );
     }
 
     #[test]
@@ -5099,7 +5262,60 @@ mod tests {
     }
 
     #[test]
-    fn session_chips_appear_once_at_the_group_boundary() {
+    fn graph_subtitles_only_appear_on_true_tips_and_roots() {
+        let tip = with(
+            &git_row(),
+            &[
+                ("above", json!([0])),
+                ("transitions", json!([])),
+                ("group_end", json!(false)),
+            ],
+        );
+        let tip = RowSpec::from_value(&tip, &context(ViewMode::Activity, 1, false));
+        assert_eq!(tip.group_label.as_deref(), Some("Git · repo 199254740993"));
+
+        let root = with(
+            &git_row(),
+            &[
+                ("below", json!([0])),
+                ("transitions", json!([])),
+                ("group_end", json!(false)),
+            ],
+        );
+        let root = RowSpec::from_value(&root, &context(ViewMode::Activity, 2, false));
+        assert_eq!(root.group_label.as_deref(), Some("Git · repo 199254740993"));
+
+        let parent_anchored_middle = with(
+            &git_row(),
+            &[
+                ("above", json!([0])),
+                ("below", json!([1])),
+                ("transitions", json!([[0, 1]])),
+            ],
+        );
+        let parent_anchored_middle = RowSpec::from_value(
+            &parent_anchored_middle,
+            &context(ViewMode::Activity, 3, true),
+        );
+        assert_eq!(parent_anchored_middle.group_label, None);
+
+        let child_anchored_middle = with(
+            &git_row(),
+            &[
+                ("above", json!([1])),
+                ("below", json!([0])),
+                ("transitions", json!([[1, 0]])),
+            ],
+        );
+        let child_anchored_middle = RowSpec::from_value(
+            &child_anchored_middle,
+            &context(ViewMode::Activity, 4, true),
+        );
+        assert_eq!(child_anchored_middle.group_label, None);
+    }
+
+    #[test]
+    fn session_chips_stay_on_group_boundaries_while_labels_follow_graph_endpoints() {
         let ctx = context(ViewMode::Activity, 9, true);
         let spec = RowSpec::from_value(&session_meta_row(), &ctx);
         assert!(spec.classes().contains("row-has-badges"));
@@ -5122,6 +5338,7 @@ mod tests {
                 ("session-chip session-chip-agent", "Harvey"),
             ]
         );
+        assert_eq!(spec.group_label, None);
 
         let not_group_start =
             RowSpec::from_value(&session_meta_row(), &context(ViewMode::Activity, 10, false));
@@ -5129,6 +5346,19 @@ mod tests {
         assert!(!not_group_start.classes().contains("row-group-start"));
         assert!(not_group_start.tags.is_empty());
         assert_eq!(not_group_start.aria.aria_label, "session boundary row");
+
+        let terminal = with(&session_meta_row(), &[("group_end", json!(true))]);
+        let terminal = RowSpec::from_value(&terminal, &context(ViewMode::Activity, 12, false));
+        assert_eq!(terminal.group_label, None);
+        assert!(!terminal.classes().contains("row-group-start"));
+
+        let tip = with(&session_meta_row(), &[("above", json!([]))]);
+        let tip = RowSpec::from_value(&tip, &context(ViewMode::Activity, 13, true));
+        assert_eq!(tip.group_label.as_deref(), Some("q0 · Harvey"));
+
+        let root = with(&session_meta_row(), &[("below", json!([]))]);
+        let root = RowSpec::from_value(&root, &context(ViewMode::Activity, 14, false));
+        assert_eq!(root.group_label.as_deref(), Some("q0 · Harvey"));
     }
 
     #[test]
