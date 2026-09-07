@@ -2046,7 +2046,7 @@ fn service_path_truncated_echo_texts_never_pair_but_untruncated_exact_pairs_do()
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_twenty_eight() {
+fn prepared_snapshot_manifest_records_projection_revision_twenty_nine() {
     // Stale snapshots from earlier projection revisions (pre-hide_trace,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
@@ -2072,7 +2072,7 @@ fn prepared_snapshot_manifest_records_projection_revision_twenty_eight() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 28u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 29u64);
 }
 
 #[test]
@@ -2635,7 +2635,7 @@ fn prepared_snapshot_serves_nested_activity_view_and_records_revision_twenty_eig
         &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["identity"]["projection_revision"], 28u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 29u64);
 
     let mut cached =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");

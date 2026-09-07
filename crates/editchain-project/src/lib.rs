@@ -764,8 +764,8 @@ struct CollapsedProjection {
     /// id — possibly through a chain of representatives — to an op id that is a
     /// key in `present`. Covers normalized children folded into their raw import
     /// parent, META sub-ops bundled into an anchor, tool results folded into their
-    /// call, equal-hash copied occurrences, and relationship facts folded out of
-    /// rendering (mapped to their anchor's visible row).
+    /// call, equivalent copied provider occurrences, and relationship facts
+    /// folded out of rendering (mapped to their anchor's visible row).
     representative: HashMap<OpId, OpId>,
     /// Structural relationship notes re-keyed for edge drawing: keyed by the
     /// CANONICAL visible anchor (the representative of the note's stored causal
@@ -1185,9 +1185,14 @@ impl HistoryProjection {
         // Index provider entities before any display folding. `OccurrenceOf`
         // and `Contains` are exact identity facts, but identity alone does not
         // prove that two payload occurrences are interchangeable: providers can
-        // reuse an event UUID while incrementally extending its content.
+        // reuse an event UUID while incrementally extending its content. Current
+        // occurrence facts carry an importer-owned canonical payload
+        // fingerprint; legacy facts conservatively fall back to the raw hash.
         let mut entity_occurrences: HashMap<OpId, Vec<OpId>> = HashMap::new();
         let mut event_occurrences: HashMap<OpId, Vec<OpId>> = HashMap::new();
+        let mut occurrence_payload_fingerprints: HashMap<OpId, String> = HashMap::new();
+        let mut conflicting_payload_fingerprints: std::collections::HashSet<OpId> =
+            std::collections::HashSet::new();
         for op in &self.ops {
             let editchain_core::OpKind::Note(note) = &op.kind else {
                 continue;
@@ -1205,6 +1210,19 @@ impl HistoryProjection {
                 entity_occurrences.entry(*target).or_default().push(anchor);
                 if note.relationship == NoteRelationship::OccurrenceOf {
                     event_occurrences.entry(*target).or_default().push(anchor);
+                    if let Some(fingerprint) = exact_occurrence_payload_fingerprint(note) {
+                        if occurrence_payload_fingerprints
+                            .get(&anchor)
+                            .is_some_and(|known| known != &fingerprint)
+                        {
+                            drop(occurrence_payload_fingerprints.remove(&anchor));
+                            let _: bool = conflicting_payload_fingerprints.insert(anchor);
+                        } else if !conflicting_payload_fingerprints.contains(&anchor) {
+                            let _: &mut String = occurrence_payload_fingerprints
+                                .entry(anchor)
+                                .or_insert(fingerprint);
+                        }
+                    }
                 }
             }
         }
@@ -1231,21 +1249,30 @@ impl HistoryProjection {
             })
             .collect();
         for occurrences in event_occurrences.values() {
-            // Only a shared exact raw hash proves two occurrences are the same
-            // display payload. Hash-less fixtures/legacy records and distinct
+            // A shared provider payload fingerprint proves that copied session
+            // envelopes carry the same event content even when session/topology
+            // fields differ. Legacy occurrences retain the stricter raw-hash
+            // behavior. Hash-less records, conflicting evidence, and distinct
             // revisions remain separate rows. The minimum ID merely names one
             // member of an exact-equivalence class; it supplies no ancestry.
-            let mut by_raw_hash: std::collections::BTreeMap<[u8; 32], Vec<OpId>> =
+            let mut by_payload: std::collections::BTreeMap<OccurrencePayloadKey, Vec<OpId>> =
                 std::collections::BTreeMap::new();
             for occurrence in occurrences {
-                if let Some(raw_hash) = imports_by_id
+                let payload_key = occurrence_payload_fingerprints
                     .get(occurrence)
-                    .and_then(|import| import.raw_hash)
-                {
-                    by_raw_hash.entry(raw_hash).or_default().push(*occurrence);
+                    .cloned()
+                    .map(OccurrencePayloadKey::ProviderFingerprint)
+                    .or_else(|| {
+                        imports_by_id
+                            .get(occurrence)
+                            .and_then(|import| import.raw_hash)
+                            .map(OccurrencePayloadKey::RawHash)
+                    });
+                if let Some(payload_key) = payload_key {
+                    by_payload.entry(payload_key).or_default().push(*occurrence);
                 }
             }
-            for equivalent in by_raw_hash.values() {
+            for equivalent in by_payload.values() {
                 let Some(canonical) = equivalent.iter().copied().min() else {
                     continue;
                 };
@@ -1413,6 +1440,7 @@ impl HistoryProjection {
             &resolved_relationship_notes,
             &representative,
             &present,
+            &duplicate_event_occurrences,
         );
 
         // Semantic-collapse invariant, checked once per collapse: every ordinary
@@ -1618,14 +1646,20 @@ impl HistoryProjection {
     /// visible anchor (the representative of its stored parent), so the virtual
     /// edge is reachable from the row that represents the note's anchor. The
     /// provider entity targets have already been resolved to an unambiguous
-    /// physical occurrence; direct physical targets stay unchanged. Every
-    /// edge-construction path then lifts folded targets through the canonical
-    /// representative map. A note whose anchor cannot be resolved to a visible
-    /// row is dropped.
+    /// physical occurrence; direct physical targets stay unchanged. A copied
+    /// occurrence suppressed by exact-equivalence contraction cannot contribute
+    /// its `ProviderParent` edge to the surviving occurrence: doing so would
+    /// union the incoming ancestry of separate physical transcripts and turn a
+    /// normal chain into a false fan-in merge. Other structural relations remain
+    /// eligible because they describe branch/lifecycle topology rather than the
+    /// copied row's provider predecessor. Every edge-construction path then lifts
+    /// folded targets through the canonical representative map. A note whose
+    /// anchor cannot be resolved to a visible row is dropped.
     fn canonicalize_relationship_notes(
         relationship_notes: &HashMap<OpId, Vec<Op>>,
         representative: &HashMap<OpId, OpId>,
         present: &std::collections::HashSet<String>,
+        duplicate_event_occurrences: &std::collections::HashSet<OpId>,
     ) -> HashMap<OpId, Vec<Op>> {
         let mut out: HashMap<OpId, Vec<Op>> = HashMap::new();
         for (stored_anchor, notes) in relationship_notes {
@@ -1633,6 +1667,16 @@ impl HistoryProjection {
                 continue;
             };
             for note in notes.iter().cloned() {
+                let suppressed_copy_parent = *stored_anchor != anchor
+                    && duplicate_event_occurrences.contains(stored_anchor)
+                    && matches!(
+                        &note.kind,
+                        editchain_core::OpKind::Note(fact)
+                            if fact.relationship == NoteRelationship::ProviderParent
+                    );
+                if suppressed_copy_parent {
+                    continue;
+                }
                 // `Contains` participates in entity endpoint resolution during
                 // collapse but is neither a row marker nor a display edge.
                 if !matches!(
@@ -2215,6 +2259,19 @@ enum OrderingKey {
     Git(GitOid),
 }
 
+/// Exact-equivalence key for occurrences of one provider event entity.
+///
+/// Current importers supply a canonical provider payload fingerprint that
+/// excludes copy-local session/topology fields. Legacy occurrences retain the
+/// byte-exact raw hash contract and never compare across key variants.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum OccurrencePayloadKey {
+    /// Canonical content evidence supplied by the provider adapter.
+    ProviderFingerprint(String),
+    /// Byte-exact raw-line evidence retained for legacy facts.
+    RawHash([u8; 32]),
+}
+
 /// Return the typed scheduler key for one visible row.
 fn ordering_key(node: &HistoryNode) -> OrderingKey {
     match node {
@@ -2610,6 +2667,31 @@ fn is_legacy_unversioned_import_relationship(op: &Op) -> bool {
         note.relationship,
         NoteRelationship::ForkOf | NoteRelationship::SubagentOf | NoteRelationship::ReconnectsTo
     )
+}
+
+/// Read exact importer-owned payload-equivalence evidence from an
+/// `OccurrenceOf` note.
+///
+/// The fingerprint is intentionally opaque to the provider-neutral projection.
+/// Requiring exact confidence and a complete 256-bit lowercase/uppercase hex
+/// value prevents truncated display previews or arbitrary prose notes from
+/// participating in occurrence contraction.
+fn exact_occurrence_payload_fingerprint(note: &editchain_core::op::NoteOp) -> Option<String> {
+    if note.relationship != NoteRelationship::OccurrenceOf {
+        return None;
+    }
+    let Payload::Inline(evidence) = &note.content else {
+        return None;
+    };
+    let value = serde_json::from_slice::<serde_json::Value>(evidence).ok()?;
+    if value.get("confidence").and_then(serde_json::Value::as_str) != Some("exact") {
+        return None;
+    }
+    let fingerprint = value
+        .get("payloadFingerprint")
+        .and_then(serde_json::Value::as_str)?;
+    (fingerprint.len() == 64 && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| fingerprint.to_string())
 }
 
 /// Whether a relation fact is indexed for identity/correlation resolution or

@@ -88,6 +88,32 @@ fn relation_note(
     }
 }
 
+/// An exact provider-occurrence note with importer-owned payload evidence.
+fn fingerprinted_occurrence_note(
+    node: u64,
+    seq: u64,
+    parent: OpId,
+    target: OpId,
+    fingerprint: &str,
+) -> Op {
+    Op {
+        id: OpId::new(NodeId(node), 0, seq),
+        parents: ParentSet::One(parent),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(seq),
+        scope: ScopeRef::Session(SessionId(0)),
+        tags: Tags::NOTE,
+        kind: OpKind::Note(NoteOp {
+            target_ids: vec![target],
+            relationship: NoteRelationship::OccurrenceOf,
+            content: Payload::Inline(
+                format!(r#"{{"confidence":"exact","payloadFingerprint":"{fingerprint}"}}"#)
+                    .into_bytes(),
+            ),
+        }),
+    }
+}
+
 /// A standalone message op (its own row; used for fork-prologue scenarios).
 fn msg_op(node: u64, seq: u64, session: u64, clock_ms: u64, parent: Option<OpId>) -> Op {
     Op {
@@ -309,9 +335,10 @@ fn fully_unresolved_relationship_note_is_ignored() {
     assert!(layout.edges.is_empty());
 }
 
-/// Exact provider event identity suppresses only copied occurrences and uses
-/// each branch's own `ProviderParent` endpoint. No prefix, length, timestamp, or
-/// cross-stream sequence comparison participates.
+/// Exact provider event identity and payload evidence suppress copied
+/// occurrences despite copy-local raw envelope drift, then use each branch's
+/// own `ProviderParent` endpoint. No prefix, length, timestamp, or cross-stream
+/// sequence comparison participates.
 #[test]
 fn exact_occurrences_form_a_provider_fork_without_self_edges() {
     let shared_entity = OpId::new(NodeId(90), 7, 1);
@@ -323,8 +350,8 @@ fn exact_occurrences_form_a_provider_fork_without_self_edges() {
     if let (OpKind::Import(left), OpKind::Import(right)) =
         (&mut shared_left.kind, &mut shared_right.kind)
     {
-        left.raw_hash = Some([7; 32]);
-        right.raw_hash = Some([7; 32]);
+        left.raw_hash = Some([1; 32]);
+        right.raw_hash = Some([2; 32]);
     }
     let mut left = import_op(1, 2, 10, 2_000);
     left.parents = ParentSet::One(shared_left.id);
@@ -336,19 +363,19 @@ fn exact_occurrences_form_a_provider_fork_without_self_edges() {
         shared_right.clone(),
         left.clone(),
         right.clone(),
-        relation_note(
+        fingerprinted_occurrence_note(
             11,
             1,
             shared_left.id,
             shared_entity,
-            NoteRelationship::OccurrenceOf,
+            "1111111111111111111111111111111111111111111111111111111111111111",
         ),
-        relation_note(
+        fingerprinted_occurrence_note(
             12,
             1,
             shared_right.id,
             shared_entity,
-            NoteRelationship::OccurrenceOf,
+            "1111111111111111111111111111111111111111111111111111111111111111",
         ),
         relation_note(13, 1, left.id, left_entity, NoteRelationship::OccurrenceOf),
         relation_note(
@@ -399,6 +426,97 @@ fn exact_occurrences_form_a_provider_fork_without_self_edges() {
         .edges
         .iter()
         .all(|edge| edge.child != edge.parent));
+}
+
+/// A copied occurrence can name a different provider parent when one physical
+/// transcript captured an incomplete/alternate parallel tool-result path. Once
+/// the occurrences collapse to one visible row, only the surviving physical
+/// occurrence supplies that row's incoming provider ancestry. The suppressed
+/// copy must not turn an ordinary chain row into a fan-in merge.
+#[test]
+fn suppressed_copy_does_not_union_its_parent_into_the_shared_row() {
+    let root_entity = OpId::new(NodeId(90), 7, 1);
+    let alternate_entity = OpId::new(NodeId(90), 7, 2);
+    let continuation_entity = OpId::new(NodeId(90), 7, 3);
+    let root_fingerprint = "1111111111111111111111111111111111111111111111111111111111111111";
+    let continuation_fingerprint =
+        "2222222222222222222222222222222222222222222222222222222222222222";
+
+    let root_left = import_op(1, 1, 10, 1_000);
+    let root_right = import_op(2, 1, 20, 1_000);
+    let mut alternate = import_op(2, 2, 20, 2_000);
+    alternate.parents = ParentSet::One(root_right.id);
+    let mut continuation_left = import_op(1, 2, 10, 3_000);
+    continuation_left.parents = ParentSet::One(root_left.id);
+    let mut continuation_right = import_op(2, 3, 20, 3_000);
+    continuation_right.parents = ParentSet::One(alternate.id);
+
+    let projection = HistoryProjection::from_ops(vec![
+        root_left.clone(),
+        root_right.clone(),
+        alternate.clone(),
+        continuation_left.clone(),
+        continuation_right.clone(),
+        fingerprinted_occurrence_note(11, 1, root_left.id, root_entity, root_fingerprint),
+        fingerprinted_occurrence_note(12, 1, root_right.id, root_entity, root_fingerprint),
+        relation_note(
+            13,
+            1,
+            alternate.id,
+            alternate_entity,
+            NoteRelationship::OccurrenceOf,
+        ),
+        relation_note(
+            14,
+            1,
+            alternate.id,
+            root_entity,
+            NoteRelationship::ProviderParent,
+        ),
+        fingerprinted_occurrence_note(
+            15,
+            1,
+            continuation_left.id,
+            continuation_entity,
+            continuation_fingerprint,
+        ),
+        relation_note(
+            16,
+            1,
+            continuation_left.id,
+            root_entity,
+            NoteRelationship::ProviderParent,
+        ),
+        fingerprinted_occurrence_note(
+            17,
+            1,
+            continuation_right.id,
+            continuation_entity,
+            continuation_fingerprint,
+        ),
+        relation_note(
+            18,
+            1,
+            continuation_right.id,
+            alternate_entity,
+            NoteRelationship::ProviderParent,
+        ),
+    ]);
+
+    assert_eq!(projection.visible_op_id(root_right.id), Some(root_left.id));
+    assert_eq!(
+        projection.visible_op_id(continuation_right.id),
+        Some(continuation_left.id)
+    );
+    let continuation_row = projection
+        .nodes()
+        .into_iter()
+        .find(|row| row.node_key() == continuation_left.id.to_string())
+        .unwrap();
+    assert_eq!(
+        projection.lifted_parent_keys(&continuation_row),
+        vec![root_left.id.to_string()]
+    );
 }
 
 #[test]

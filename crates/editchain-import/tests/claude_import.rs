@@ -17,7 +17,7 @@ use editchain_import::ids::{derive_keyed_source_stream, SourcePosition};
 use editchain_import::import::import_claude_code;
 use editchain_import::model::{DiscoveryRequest, ImportOptions};
 use editchain_import::sink::{CursorStore, MemoryBlobSink, MemoryCursorStore, MemoryOpSink};
-use editchain_project as _;
+use editchain_project::HistoryProjection;
 use proptest as _;
 use serde as _;
 use sha2 as _;
@@ -46,16 +46,62 @@ fn import(
 }
 
 fn event_line(uuid: &str, parent: Option<&str>, text: &str) -> String {
-    serde_json::json!({
+    copied_event_line(
+        uuid,
+        parent,
+        text,
+        CopyEnvelope {
+            session_id: "session-1",
+            cwd: "/workspace",
+            slug: "seed",
+            has_session_kind: true,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct CopyEnvelope<'a> {
+    session_id: &'a str,
+    cwd: &'a str,
+    slug: &'a str,
+    has_session_kind: bool,
+}
+
+fn copied_event_line(
+    uuid: &str,
+    parent: Option<&str>,
+    text: &str,
+    copy: CopyEnvelope<'_>,
+) -> String {
+    let mut value = serde_json::json!({
         "type": "user",
         "uuid": uuid,
         "parentUuid": parent,
-        "sessionId": "session-1",
+        "sessionId": copy.session_id,
+        "sessionKind": "bg",
+        "slug": copy.slug,
+        "cwd": copy.cwd,
         "timestamp": "2026-07-10T00:00:00.000Z",
         "message": { "role": "user", "content": text },
-    })
-    .to_string()
-        + "\n"
+    });
+    if !copy.has_session_kind {
+        drop(value.as_object_mut().unwrap().remove("sessionKind"));
+    }
+    value.to_string() + "\n"
+}
+
+fn payload_fingerprint(op: &editchain_core::Op) -> Option<String> {
+    let OpKind::Note(note) = &op.kind else {
+        return None;
+    };
+    let editchain_core::Payload::Inline(evidence) = &note.content else {
+        return None;
+    };
+    serde_json::from_slice::<serde_json::Value>(evidence)
+        .ok()?
+        .get("payloadFingerprint")?
+        .as_str()
+        .map(ToOwned::to_owned)
 }
 
 fn source_key(root: &Path, path: &Path) -> String {
@@ -156,6 +202,124 @@ fn unchanged_legacy_cursor_replays_only_exact_topology_facts() {
             .normalization_version,
         CLAUDE_NORMALIZATION_VERSION
     );
+}
+
+#[test]
+fn version_two_cursor_replays_only_payload_fingerprint_supplements() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session-1.jsonl");
+    std::fs::write(
+        &path,
+        event_line("event-1", None, "one") + &event_line("event-2", Some("event-1"), "two"),
+    )
+    .unwrap();
+    let (_lines, _bytes, mut cursor) = read_session_file(&path, None).unwrap();
+    cursor.normalization_version = 2;
+    let key = source_key(dir.path(), &path);
+    let mut cursors = MemoryCursorStore::new();
+    cursors.set_cursor(&key, &cursor).unwrap();
+    let mut ops = MemoryOpSink::new();
+
+    let report = import(dir.path(), &mut ops, &mut cursors);
+
+    assert_eq!(report.raw_ops, 0);
+    assert_eq!(report.normalized_ops, 2);
+    assert!(ops.ops.iter().all(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Note(note) if note.relationship == NoteRelationship::OccurrenceOf
+        ) && payload_fingerprint(op).is_some()
+    }));
+    assert_eq!(
+        cursors
+            .get_cursor(&key)
+            .unwrap()
+            .unwrap()
+            .normalization_version,
+        CLAUDE_NORMALIZATION_VERSION
+    );
+
+    let repeated = import(dir.path(), &mut ops, &mut cursors);
+    assert_eq!(repeated.files_processed, 0);
+    assert_eq!(repeated.normalized_ops, 0);
+}
+
+#[test]
+fn copied_sessions_share_a_root_then_branch_at_distinct_children() {
+    let dir = tempfile::tempdir().unwrap();
+    let left_path = dir.path().join("left.jsonl");
+    let right_path = dir.path().join("right.jsonl");
+    std::fs::write(
+        &left_path,
+        copied_event_line(
+            "shared-root",
+            None,
+            "shared root",
+            CopyEnvelope {
+                session_id: "left-session",
+                cwd: "/workspace/left",
+                slug: "seed-left",
+                has_session_kind: true,
+            },
+        ) + &copied_event_line(
+            "left-child",
+            Some("shared-root"),
+            "left continuation",
+            CopyEnvelope {
+                session_id: "left-session",
+                cwd: "/workspace/left",
+                slug: "seed-left",
+                has_session_kind: true,
+            },
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &right_path,
+        copied_event_line(
+            "shared-root",
+            None,
+            "shared root",
+            CopyEnvelope {
+                session_id: "right-session",
+                cwd: "/workspace/right",
+                slug: "seed-right",
+                has_session_kind: false,
+            },
+        ) + &copied_event_line(
+            "right-child",
+            Some("shared-root"),
+            "right continuation",
+            CopyEnvelope {
+                session_id: "right-session",
+                cwd: "/workspace/right",
+                slug: "seed-right",
+                has_session_kind: false,
+            },
+        ),
+    )
+    .unwrap();
+    let mut ops = MemoryOpSink::new();
+    let mut cursors = MemoryCursorStore::new();
+
+    let report = import(dir.path(), &mut ops, &mut cursors);
+    assert_eq!(report.raw_ops, 4);
+    let projection = HistoryProjection::from_ops(ops.ops);
+    let rows = projection.nodes();
+
+    assert_eq!(rows.len(), 3);
+    let shared = rows
+        .iter()
+        .find(|row| row.summary() == "shared root")
+        .unwrap();
+    let shared_key = shared.node_key();
+    for summary in ["left continuation", "right continuation"] {
+        let branch = rows.iter().find(|row| row.summary() == summary).unwrap();
+        assert_eq!(
+            projection.lifted_parent_keys(branch),
+            vec![shared_key.clone()]
+        );
+    }
 }
 
 #[test]

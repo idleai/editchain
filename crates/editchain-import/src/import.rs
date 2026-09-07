@@ -7,13 +7,19 @@ use crate::claude_code::envelope::parse_envelope;
 use crate::claude_code::normalize::{normalize_envelope, NormalizeOptions};
 use crate::claude_code::reader::read_session_file;
 use crate::claude_code::topology::{
-    relation_facts_for_envelope, spawn_fact, CLAUDE_NORMALIZATION_VERSION,
+    occurrence_fingerprint_fact, relation_facts_for_envelope, spawn_fact,
+    CLAUDE_NORMALIZATION_VERSION,
 };
 use crate::cursor::{check_file_generation, resolve_source_cursor};
 use crate::error::ImportError;
 use crate::ids::{derive_session_id, SourcePosition, SourceStream};
 use crate::model::{DiscoveryRequest, ImportOptions, ImportReport};
 use crate::sink::{BlobSink, CursorStore, OpSink};
+
+/// Version that first emitted the complete provider topology. Version-2
+/// sources need only the collision-free payload-fingerprint supplement when
+/// upgrading; older sources require a complete topology replay.
+const CLAUDE_PROVIDER_TOPOLOGY_VERSION: u32 = 2;
 
 /// Import all Claude Code sessions from a directory into editchain operations.
 ///
@@ -65,10 +71,17 @@ pub fn import_claude_code(
         let source_node = resolved.source_node;
         let migrates_legacy_key = cursor_key != state_key;
         let mut existing_cursor = resolved.cursor;
+        let existing_normalization_version = existing_cursor
+            .as_ref()
+            .map(|cursor| cursor.normalization_version);
         let needs_topology_upgrade = options.normalize
-            && existing_cursor
-                .as_ref()
-                .is_some_and(|cursor| cursor.normalization_version < CLAUDE_NORMALIZATION_VERSION);
+            && existing_normalization_version
+                .is_some_and(|version| version < CLAUDE_NORMALIZATION_VERSION);
+        let needs_full_topology_replay = needs_topology_upgrade
+            && existing_normalization_version
+                .is_some_and(|version| version < CLAUDE_PROVIDER_TOPOLOGY_VERSION);
+        let needs_fingerprint_replay = needs_topology_upgrade
+            && existing_normalization_version == Some(CLAUDE_PROVIDER_TOPOLOGY_VERSION);
         let needs_cursor_upgrade = migrates_legacy_key
             || existing_cursor.as_ref().is_some_and(|cursor| {
                 cursor.source_node != Some(source_node) || cursor.content_hash_version < 1
@@ -192,13 +205,19 @@ pub fn import_claude_code(
                 }
 
                 // Current-version incremental/fresh import: emit exact provider
-                // facts for this batch directly from the parsed envelope. An
-                // upgrade run emits the complete source's facts in the replay
-                // below so old and new records use one path.
-                if options.normalize && topology_replay.is_none() {
-                    for fact in
-                        relation_facts_for_envelope(envelope, &stream, seq, &session.session_id)?
-                    {
+                // facts for this batch directly from the parsed envelope. A
+                // pre-v2 upgrade replays complete topology below; a v2 upgrade
+                // still emits complete facts for newly appended records while
+                // historical records receive only the collision-free
+                // fingerprint supplement.
+                if options.normalize && (!needs_full_topology_replay || topology_replay.is_none()) {
+                    for fact in relation_facts_for_envelope(
+                        envelope,
+                        &line.data,
+                        &stream,
+                        seq,
+                        &session.session_id,
+                    )? {
                         let _: bool = ops.accept_op(&fact)?;
                         report.normalized_ops += 1;
                     }
@@ -235,25 +254,49 @@ pub fn import_claude_code(
         // of the output sink's concrete type.
         if options.normalize {
             if let Some(all_lines) = topology_replay.as_ref() {
-                for (i, line) in all_lines.iter().enumerate() {
+                let replay_limit = if needs_fingerprint_replay {
+                    let historical_count =
+                        usize::try_from(start_seq).map_or(all_lines.len(), |count| count);
+                    all_lines.len().min(historical_count)
+                } else {
+                    all_lines.len()
+                };
+                for (i, line) in all_lines.iter().take(replay_limit).enumerate() {
                     let Some(envelope) = parse_envelope(&line.data) else {
                         continue;
                     };
                     let seq = i as u64 + 1;
-                    for fact in
-                        relation_facts_for_envelope(&envelope, &stream, seq, &session.session_id)?
-                    {
-                        let _: bool = ops.accept_op(&fact)?;
-                        report.normalized_ops += 1;
+                    if needs_fingerprint_replay {
+                        if let Some(fact) = occurrence_fingerprint_fact(
+                            &envelope,
+                            &line.data,
+                            &stream,
+                            seq,
+                            &session.session_id,
+                        )? {
+                            let _: bool = ops.accept_op(&fact)?;
+                            report.normalized_ops += 1;
+                        }
+                    } else {
+                        for fact in relation_facts_for_envelope(
+                            &envelope,
+                            &line.data,
+                            &stream,
+                            seq,
+                            &session.session_id,
+                        )? {
+                            let _: bool = ops.accept_op(&fact)?;
+                            report.normalized_ops += 1;
+                        }
                     }
                 }
             }
 
             // The sidecar's toolUseId is an exact spawn endpoint. Emit it once
-            // for a fresh generation or topology upgrade; unresolved parent tool
-            // entities stay unresolved in projection instead of falling back to
-            // actor, time, or content matching.
-            if (start_seq == 0 || needs_topology_upgrade)
+            // for a fresh generation or full topology upgrade; unresolved parent
+            // tool entities stay unresolved in projection instead of falling
+            // back to actor, time, or content matching.
+            if (start_seq == 0 || needs_full_topology_replay)
                 && new_cursor.ops_emitted > 0
                 && session.is_subagent
             {
