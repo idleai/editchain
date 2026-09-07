@@ -77,7 +77,17 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// Revision 23 projects exact `ProducedBy` Git links in their causal direction:
 /// the producing command remains on the agent chain and becomes an additional
 /// parent of the immutable commit row.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 23;
+///
+/// Revision 24 omits every timestamp-zero row from the fixed presentation and
+/// contracts undated structural relationship endpoints onto their nearest
+/// dated rows.
+///
+/// Revision 25 restores timestamp-zero metadata as expandable sub-rows while
+/// continuing to omit it from the top-level graph.
+///
+/// Revision 26 retains physical session continuity for provider occurrences
+/// that carry identity but no resolved provider-parent relationship.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 26;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

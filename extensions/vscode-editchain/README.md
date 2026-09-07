@@ -80,9 +80,10 @@ The viewer shows a unified, paged history list (EditChain ops + git commits)
 with in-place **Find-in-Chain** search over the real history view, plus an
 explicit read-only raw JSON editor (Enter or double-click on a selected row).
 The old filtering controls are intentionally absent while their replacement is
-designed. The temporary fixed view shows all operation kinds and undated rows,
-hides nested Git repositories/submodules, applies no summary/kind pattern, and
-splices hidden intermediates for graph continuity.
+designed. The temporary fixed view shows all dated operation kinds, omits rows
+whose timestamp is unknown (`timestamp_ms == 0`), hides nested Git
+repositories/submodules, applies no summary/kind pattern, and splices hidden
+intermediates for graph continuity.
 
 Find-in-Chain is in-place: the service runs a Tantivy **BM25 lexical** search
 and maps/dedupes every scored chunk to the real top-level row that renders it

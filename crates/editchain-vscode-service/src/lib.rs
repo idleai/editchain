@@ -2428,7 +2428,7 @@ pub fn prepare_render_snapshot(
 /// Convert an optional protocol filter DTO into a [`ChainFilter`].
 ///
 /// A `None` DTO yields the fixed viewer filter (Activity view: splice on,
-/// hide trace; undated rows kept) so the render snapshot serves it. An empty
+/// hide trace and undated rows) so the render snapshot serves it. An empty
 /// DTO yields an empty filter that hides nothing; raw mode sends an explicit
 /// `hide_trace: false`. `ChainFilter::default()` itself stays the raw
 /// baseline (`hide_trace` off) — the Activity view is an explicit choice.
@@ -2460,7 +2460,7 @@ fn fixed_view_filter() -> ChainFilter {
         String::new(),
         String::new(),
         String::new(),
-        false,
+        true,
         true,
         true,
     )
@@ -5899,7 +5899,7 @@ mod tests {
     }
 
     #[test]
-    fn default_and_fixed_filters_hide_trace_but_dto_raw_mode_does_not() {
+    fn default_and_fixed_filters_hide_undated_and_trace_rows() {
         // The fixed pregenerated viewer filter hides trace rows so Activity
         // mode is served from the render snapshot. A `None` DTO maps to that
         // fixed filter explicitly; `ChainFilter::default()` stays the raw
@@ -5922,8 +5922,8 @@ mod tests {
             "existing ChainFilter::default behavior preserved"
         );
         assert!(
-            !default_filter.key().hide_undated,
-            "the fixed Activity view does not hide undated rows"
+            default_filter.key().hide_undated,
+            "the fixed Activity view must hide timestamp-zero rows"
         );
 
         let raw = chain_filter_from_dto(Some(&ChainFilterDto {

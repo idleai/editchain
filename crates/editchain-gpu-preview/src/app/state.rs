@@ -314,7 +314,7 @@ impl HistoryAppState {
             summary_pattern: String::new(),
             kind_pattern: String::new(),
             include_kind_pattern: String::new(),
-            hide_undated: false,
+            hide_undated: true,
             splice: true,
             hide_trace: self.profile.hide_trace(),
         }
@@ -1879,7 +1879,7 @@ impl HistoryAppState {
             hide_undated: filter
                 .and_then(|f| f.get("hide_undated"))
                 .and_then(Value::as_bool)
-                .unwrap_or(false),
+                .unwrap_or(true),
             splice: filter
                 .and_then(|f| f.get("splice"))
                 .and_then(Value::as_bool)
@@ -1996,13 +1996,20 @@ mod tests {
         // First fetch under the pre-layout view: offset 0, limited to the
         // desired cache range (visible bottom 23 + BUFFER 400 = 423 rows, so
         // limit 424 under a clientHeight of 800), with the Activity
-        // hide_trace flag and layout disabled.
+        // hide_trace + hide_undated flags and layout disabled.
         assert_eq!(state.request_log.len(), 1);
         let window = last_get_window(&state);
         assert_eq!(window["offset"], 0);
         assert_eq!(window["limit"], 424);
         assert_eq!(window["include_layout"], false);
         assert_eq!(window["hide_submodules"], true);
+        assert_eq!(
+            window
+                .get("filter")
+                .and_then(|f| f.get("hide_undated"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
         assert_eq!(
             window
                 .get("filter")
@@ -2598,7 +2605,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_switch_resets_coherently_and_flips_hide_trace() {
+    fn profile_switch_resets_coherently_and_keeps_undated_rows_hidden() {
         let mut state = HistoryAppState::default();
         let mut step = Step::new();
         state.handle_host_message(open_msg(500), &vp(), &mut step);
@@ -2614,6 +2621,14 @@ mod tests {
         let mut step2 = Step::new();
         state.set_profile(Profile::Raw, ProfileAction::Reset, &vp(), &mut step2);
         assert_eq!(state.profile, Profile::Raw);
+        assert_eq!(
+            last_get_window(&state)
+                .get("filter")
+                .and_then(|f| f.get("hide_undated"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "Raw presentation still omits timestamp-zero rows"
+        );
         assert_eq!(
             last_get_window(&state)
                 .get("filter")

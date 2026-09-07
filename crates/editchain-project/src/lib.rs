@@ -362,15 +362,14 @@ impl HistoryNode {
                 let mut keys: Vec<String> = Vec::new();
                 let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 let anchored_notes = notes.get(&op.id);
-                // An exact provider-event occurrence participates in the
-                // provider graph. Its stored parent remains the physical source
-                // predecessor, but that is a different relation domain and must
-                // not also masquerade as a conversation edge in the display
-                // graph. Records without provider identity retain source order as
-                // their conservative fallback.
-                let has_provider_event =
-                    has_exact_provider_occurrence(op.id, anchored_notes.map(Vec::as_slice));
-                if !has_provider_event {
+                // A resolved exact provider parent supersedes the physical
+                // source predecessor in the display graph. Provider identity
+                // alone does not: root-like transport/meta events often carry a
+                // UUID with no parentUuid, so they retain source order as the
+                // conservative fallback instead of starting a phantom chain.
+                let has_provider_parent =
+                    has_exact_provider_parent(op.id, anchored_notes.map(Vec::as_slice));
+                if !has_provider_parent {
                     for parent in &op.parents {
                         let key = parent.to_string();
                         if seen.insert(key.clone()) {
@@ -1387,10 +1386,11 @@ impl HistoryProjection {
 
     /// Fold metadata rows along their unique graph-parent path.
     ///
-    /// Provider occurrences take their parents exclusively from exact visible
-    /// relationship facts. Records without provider identity take their stored
-    /// operation parents. A metadata chain contracts only when that path reaches
-    /// one non-META collapsed import row; every other shape remains visible.
+    /// Provider occurrences with a resolved exact parent take that relationship
+    /// in preference to source order. Occurrences without a provider parent use
+    /// their stored operation parent as a conservative fallback. A metadata
+    /// chain contracts only when that path reaches one non-META collapsed import
+    /// row; every other shape remains visible.
     /// Legacy Codex token-usage imports are classified from their exact raw
     /// schema because their immutable stored tags predate `META` classification.
     fn bundle_metadata_by_exact_parent(
@@ -1444,9 +1444,9 @@ impl HistoryProjection {
                 continue;
             }
             let notes = relationship_notes.get(&op.id);
-            let has_provider_event = has_exact_provider_occurrence(op.id, notes.map(Vec::as_slice));
+            let has_provider_parent = has_exact_provider_parent(op.id, notes.map(Vec::as_slice));
             let mut candidates = std::collections::BTreeSet::new();
-            if !has_provider_event {
+            if !has_provider_parent {
                 for parent in &op.parents {
                     if let Some(parent) = canonical_present_op(*parent, representative, &present) {
                         let _: bool = candidates.insert(parent);
@@ -2259,18 +2259,21 @@ fn occurrence_representative(
     }
 }
 
-/// Whether `anchor` is itself an exact provider-event occurrence.
+/// Whether `anchor` has a resolved exact provider parent.
 ///
 /// Canonical note indexes can contain facts originally anchored on folded
 /// sub-ops. Checking the note's stored parent prevents one bundled member's
-/// `OccurrenceOf` fact from changing the parent domain of the visible anchor.
-fn has_exact_provider_occurrence(anchor: OpId, notes: Option<&[Op]>) -> bool {
+/// `ProviderParent` fact from changing the parent domain of the visible anchor.
+/// An empty target set means provider resolution failed, so source order remains
+/// the conservative fallback.
+fn has_exact_provider_parent(anchor: OpId, notes: Option<&[Op]>) -> bool {
     notes.is_some_and(|facts| {
         facts.iter().any(|fact| {
             matches!(
                 &fact.kind,
                 editchain_core::OpKind::Note(note)
-                    if note.relationship == NoteRelationship::OccurrenceOf
+                    if note.relationship == NoteRelationship::ProviderParent
+                        && !note.target_ids.is_empty()
                         && fact.parents.iter().any(|parent| *parent == anchor)
             )
         })
@@ -2338,7 +2341,7 @@ fn ordering_parent_keys(
     match node {
         HistoryNode::EditOperation { op, .. } | HistoryNode::CollapsedImport { op, .. } => {
             let anchored_notes = notes.get(&op.id);
-            if !has_exact_provider_occurrence(op.id, anchored_notes.map(Vec::as_slice)) {
+            if !has_exact_provider_parent(op.id, anchored_notes.map(Vec::as_slice)) {
                 for parent in &op.parents {
                     push(canonical_ordering_op(*parent, representative, present));
                 }

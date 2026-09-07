@@ -458,6 +458,70 @@ fn metadata_bundle_follows_provider_parent_across_structural_row() {
 }
 
 #[test]
+fn provider_occurrence_without_parent_keeps_physical_session_continuity() {
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let root = import_op(1, 1);
+    let mut snapshot = meta_import_op(1, 2);
+    snapshot.parents = ParentSet::One(root.id);
+    let mut caveat = meta_import_op(1, 3);
+    caveat.parents = ParentSet::One(snapshot.id);
+    let mut ide = import_op(1, 4);
+    ide.parents = ParentSet::One(caveat.id);
+
+    let root_entity = OpId::new(NodeId(90), 4, 1);
+    let caveat_entity = OpId::new(NodeId(90), 4, 2);
+    let ide_entity = OpId::new(NodeId(90), 4, 3);
+    let projection = HistoryProjection::from_ops_with(
+        vec![
+            root.clone(),
+            snapshot.clone(),
+            caveat.clone(),
+            ide.clone(),
+            relation_fact(301, root.id, root_entity, NoteRelationship::OccurrenceOf),
+            relation_fact(
+                302,
+                caveat.id,
+                caveat_entity,
+                NoteRelationship::OccurrenceOf,
+            ),
+            // `caveat` intentionally has no ProviderParent, matching Claude's
+            // root-like local-command metadata envelope.
+            relation_fact(303, ide.id, ide_entity, NoteRelationship::OccurrenceOf),
+            relation_fact(304, ide.id, caveat_entity, NoteRelationship::ProviderParent),
+        ],
+        opts,
+    );
+
+    let nodes = projection.nodes();
+    assert_eq!(nodes.len(), 2);
+    let root_row = nodes
+        .iter()
+        .find(|node| node.node_key() == root.id.to_string())
+        .unwrap();
+    assert_eq!(
+        root_row
+            .sub_ops()
+            .iter()
+            .map(|op| op.id)
+            .collect::<Vec<_>>(),
+        vec![snapshot.id, caveat.id],
+        "root-like provider metadata follows its physical predecessor"
+    );
+    let ide_row = nodes
+        .iter()
+        .find(|node| node.node_key() == ide.id.to_string())
+        .unwrap();
+    assert_eq!(
+        projection.lifted_parent_keys(ide_row),
+        vec![root.id.to_string()],
+        "the next provider event resolves through the bundled caveat"
+    );
+    assert_eq!(projection.independent_chains(), 1);
+}
+
+#[test]
 fn incremental_tool_result_correlations_do_not_create_graph_edges() {
     struct ToolPath {
         root: Op,

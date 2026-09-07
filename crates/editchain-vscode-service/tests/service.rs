@@ -63,13 +63,14 @@ fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() 
     page.add_record(0, editchain_codec::frame::encode_op(&second).unwrap());
     write_page(&chain_dir, &page);
 
-    // The parity filter must equal the fixed viewer filter (hide_trace=true)
-    // so the prepared snapshot actually serves the compared windows.
+    // The parity filter must equal the fixed viewer filter (hide_trace and
+    // hide_undated) so the prepared snapshot actually serves the compared
+    // windows.
     let filter = ChainFilter::new(
         String::new(),
         String::new(),
         String::new(),
-        false,
+        true,
         true,
         true,
     );
@@ -1284,7 +1285,7 @@ fn trace_rows_hidden_by_fixed_filter_kept_in_raw_mode_and_taxonomy_flows() {
         String::new(),
         String::new(),
         String::new(),
-        false,
+        true,
         true,
         true,
     );
@@ -1437,7 +1438,7 @@ fn service_path_compaction_preserves_echo_and_outcome_metadata() {
         String::new(),
         String::new(),
         String::new(),
-        false,
+        true,
         true,
         true,
     );
@@ -1842,7 +1843,7 @@ fn service_path_marks_duplicate_response_item_event_msg_pairs_after_compaction()
         String::new(),
         String::new(),
         String::new(),
-        false,
+        true,
         true,
         true,
     );
@@ -2045,7 +2046,7 @@ fn service_path_truncated_echo_texts_never_pair_but_untruncated_exact_pairs_do()
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_twenty_three() {
+fn prepared_snapshot_manifest_records_projection_revision_twenty_six() {
     // Stale snapshots from earlier projection revisions (pre-hide_trace,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
@@ -2054,8 +2055,9 @@ fn prepared_snapshot_manifest_records_projection_revision_twenty_three() {
     // inline-compaction semantics, exact provider relations, legacy Codex
     // token-usage contraction, correlation-only tool results, exact Claude
     // response contraction, authoritative view-parent rewrites, and causal
-    // produced-commit branch edges) must not be served silently: the revision
-    // participates in the snapshot identity hash.
+    // produced-commit branch edges, and default timestamp-zero omission) must
+    // not be served silently: the revision participates in the snapshot
+    // identity hash.
     let tmp = tempfile::tempdir().expect("tempdir");
     let chain_dir = tmp.path().join(".editchain");
     let first = msg_op(41, 1, b"snapshot first");
@@ -2070,7 +2072,58 @@ fn prepared_snapshot_manifest_records_projection_revision_twenty_three() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 23u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 26u64);
+}
+
+#[test]
+fn prepared_snapshot_omits_timestamp_zero_top_level_rows_and_keeps_bundled_metadata() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let chain_dir = tmp.path().join(".editchain");
+    let dated = raw_import_op(42, 1, 1_000, None, r#"{"type":"user"}"#);
+    let dated_message = raw_message_child(42, 2, dated.id, 1_000, "dated");
+    let mut undated = raw_import_op(
+        42,
+        3,
+        0,
+        Some(dated.id),
+        r#"{"type":"custom-title","customTitle":"undated"}"#,
+    );
+    undated.tags |= Tags::META;
+
+    let mut page = editchain_codec::page::Page::new(0);
+    page.add_record(
+        0,
+        editchain_codec::frame::encode_op(&dated).expect("encode dated op"),
+    );
+    page.add_record(
+        0,
+        editchain_codec::frame::encode_op(&dated_message).expect("encode dated message"),
+    );
+    page.add_record(
+        0,
+        editchain_codec::frame::encode_op(&undated).expect("encode undated op"),
+    );
+    write_page(&chain_dir, &page);
+
+    let report =
+        prepare_render_snapshot(tmp.path(), Path::new(".editchain")).expect("prepare snapshot");
+    assert_eq!(report.top_level_rows, 1, "only the dated row is top-level");
+    assert_eq!(report.rows, 2, "bundled metadata remains expandable");
+    let rows = std::fs::read_to_string(report.path.join("rows.ndjson")).expect("read rows");
+    let presented: Vec<serde_json::Value> = rows
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("parse row"))
+        .collect();
+    assert_eq!(presented.len(), 2);
+    assert_eq!(presented[0]["node_key"], dated.id.to_string());
+    assert_ne!(presented[0]["timestamp_ms"], 0);
+    let sub_ops = presented[0]["sub_ops"].as_array().expect("sub_ops array");
+    assert_eq!(sub_ops.len(), 1);
+    assert_eq!(sub_ops[0]["op_id"], undated.id.to_string());
+    assert_eq!(sub_ops[0]["timestamp_ms"], 0);
+    assert_eq!(presented[1]["op_id"], undated.id.to_string());
+    assert_eq!(presented[1]["timestamp_ms"], 0);
+    assert_eq!(presented[1]["is_subop"], true);
 }
 
 #[test]
@@ -2111,7 +2164,7 @@ fn activity_keeps_context_compaction_visible_and_inline_while_raw_stays_exact() 
         String::new(),
         String::new(),
         String::new(),
-        false,
+        true,
         true,
         true,
     );
@@ -2195,7 +2248,7 @@ fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() 
         String::new(),
         String::new(),
         String::new(),
-        false,
+        true,
         true,
         true,
     );
@@ -2337,7 +2390,7 @@ fn activity_view_groups_repeated_plans_as_expandable_linear_updates() {
         String::new(),
         String::new(),
         String::new(),
-        false,
+        true,
         true,
         true,
     );
@@ -2433,7 +2486,7 @@ fn activity_view_groups_repeated_plans_as_expandable_linear_updates() {
 }
 
 #[test]
-fn prepared_snapshot_serves_bundled_activity_view_and_records_revision_twenty_three() {
+fn prepared_snapshot_serves_bundled_activity_view_and_records_revision_twenty_six() {
     // The pregenerated render snapshot must serve the SAME bundled Activity
     // rows as the live projection (work-unit/promotion/bundling parity) and
     // record the bumped projection revision in its identity.
@@ -2458,7 +2511,7 @@ fn prepared_snapshot_serves_bundled_activity_view_and_records_revision_twenty_th
         String::new(),
         String::new(),
         String::new(),
-        false,
+        true,
         true,
         true,
     );
@@ -2489,7 +2542,7 @@ fn prepared_snapshot_serves_bundled_activity_view_and_records_revision_twenty_th
         &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["identity"]["projection_revision"], 23u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 26u64);
 
     let mut cached =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");

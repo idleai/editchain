@@ -11,11 +11,11 @@ use serde_json as _;
 
 use editchain_core::{
     ActorId, Clock, GitAvailability, GitCommitEntity, GitLink, GitLinkKind, GitObjectFormat,
-    GitOid, GitSignature, MessageOp, NodeId, NoteOp, NoteRelationship, Op, OpId, OpKind, ParentSet,
-    Payload, RepositoryId, ScopeRef, Tags,
+    GitOid, GitSignature, ImportOp, MessageOp, NodeId, NoteOp, NoteRelationship, Op, OpId, OpKind,
+    ParentSet, Payload, RepositoryId, ScopeRef, Tags,
 };
 use editchain_project::filter::ChainFilter;
-use editchain_project::HistoryProjection;
+use editchain_project::{HistoryProjection, ProjectionOptions};
 
 /// Build a message op with a given clock and parent.
 fn msg_op(node: u64, seq: u64, clock_ms: u64, parent: Option<OpId>, text: &str) -> Op {
@@ -202,6 +202,107 @@ fn hide_undated_with_splice_reconnects_edges() {
     let parents = c_node.parent_keys(&projection.git.links, projection.relationship_notes());
     assert_eq!(parents.len(), 1);
     assert_eq!(parents[0], a_id.to_string());
+}
+
+#[test]
+fn hide_undated_keeps_metadata_already_bundled_as_sub_ops() {
+    let turn = Op {
+        id: OpId::new(NodeId(1), 0, 1),
+        parents: ParentSet::None,
+        actor: ActorId(1),
+        clock: Clock::UnixMs(1_000),
+        scope: ScopeRef::None,
+        tags: Tags::IMPORT,
+        kind: OpKind::Import(ImportOp {
+            raw_ref: Payload::Inline(br#"{"type":"user"}"#.to_vec()),
+            raw_hash: None,
+        }),
+    };
+    let metadata = Op {
+        id: OpId::new(NodeId(1), 0, 2),
+        parents: ParentSet::One(turn.id),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(0),
+        scope: ScopeRef::None,
+        tags: Tags::IMPORT | Tags::META,
+        kind: OpKind::Import(ImportOp {
+            raw_ref: Payload::Inline(br#"{"type":"custom-title"}"#.to_vec()),
+            raw_hash: None,
+        }),
+    };
+    let projection = HistoryProjection::from_ops_with(
+        vec![turn, metadata.clone()],
+        ProjectionOptions {
+            bundle_metadata: true,
+        },
+    );
+
+    let unfiltered = projection.nodes();
+    assert_eq!(unfiltered.len(), 1, "metadata is folded before filtering");
+    assert_eq!(unfiltered[0].sub_ops().len(), 1);
+
+    let filtered = projection.filtered_nodes(&ChainFilter::default());
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(
+        filtered[0]
+            .sub_ops()
+            .iter()
+            .map(|op| op.id)
+            .collect::<Vec<_>>(),
+        vec![metadata.id],
+        "hide_undated only removes top-level rows; bundled metadata remains inspectable"
+    );
+}
+
+#[test]
+fn hide_undated_splices_through_structural_relationship_endpoints() {
+    // Both exact SubagentOf endpoints are undated: the parent-side spawn row
+    // follows a dated trunk row, while the child-side branch anchor precedes a
+    // dated work row. The relationship remains in the projection, but neither
+    // timestamp-zero carrier may survive presentation. Splicing must lift the
+    // branch edge onto the two dated rows.
+    let trunk = msg_op(1, 1, 1_000, None, "parent work");
+    let spawn = msg_op(1, 2, 0, Some(trunk.id), "spawn marker");
+    let branch_anchor = msg_op(2, 1, 0, None, "subagent anchor");
+    let branch_work = msg_op(2, 2, 3_000, Some(branch_anchor.id), "subagent work");
+    let note = subagent_note(branch_anchor.id, spawn.id);
+    let projection = HistoryProjection::from_ops(vec![
+        trunk.clone(),
+        spawn.clone(),
+        branch_anchor.clone(),
+        branch_work.clone(),
+        note,
+    ]);
+
+    let nodes = projection.filtered_nodes(&ChainFilter::default());
+    assert!(
+        nodes.iter().all(|node| node.timestamp_ms() != 0),
+        "hide_undated must remove structural timestamp-zero rows too"
+    );
+    let keys: Vec<String> = nodes
+        .iter()
+        .map(editchain_project::HistoryNode::node_key)
+        .collect();
+    assert!(!keys.contains(&spawn.id.to_string()));
+    assert!(!keys.contains(&branch_anchor.id.to_string()));
+
+    let work = nodes
+        .iter()
+        .find(|node| node.node_key() == branch_work.id.to_string())
+        .expect("dated subagent work remains visible");
+    assert_eq!(
+        work.parent_keys(&projection.git.links, projection.relationship_notes()),
+        vec![trunk.id.to_string()],
+        "the stored structural relationship must splice onto dated endpoints"
+    );
+
+    let layout = projection.layout_context(&nodes);
+    assert!(
+        layout.edges_for_window(0, nodes.len()).iter().any(|edge| {
+            edge.child == branch_work.id.to_string() && edge.parent == trunk.id.to_string()
+        }),
+        "the lifted branch edge must remain drawable between dated rows"
+    );
 }
 
 #[test]
