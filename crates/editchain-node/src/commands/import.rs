@@ -1,11 +1,15 @@
 //! Import agent sessions (Claude Code or Codex) into the edit chain.
 
+mod git_commit_links;
+
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::Provider;
 use crate::segment::SegmentStore;
-use editchain_codec::frame::encode_op;
+use editchain_codec::frame::{decode_op, encode_op};
 use editchain_codec::page::Page;
+use editchain_core::{Op, OpId};
 use editchain_import::codex::{import_codex, CodexDiscoveryRequest, HelperCommand};
 use editchain_import::import::import_claude_code;
 use editchain_import::model::{DiscoveryRequest, ImportOptions};
@@ -105,6 +109,27 @@ pub fn run(
     println!("  Malformed: {}", report.malformed);
 
     if !dry_run {
+        let mut produced_links = 0usize;
+        let reconciliation = || -> Result<Vec<Op>, Box<dyn std::error::Error>> {
+            let all_ops = reconciliation_ops(&chain_path, &ops_sink.ops)?;
+            let blob_reader = FsBlobSink::open_read_only(chain_path.join("blobs"))?;
+            git_commit_links::derive_produced_commit_links(
+                Path::new(&workspace),
+                &all_ops,
+                blob_reader.as_ref(),
+            )
+        };
+        match reconciliation() {
+            Ok(links) => {
+                produced_links = links.len();
+                ops_sink.ops.extend(links);
+            }
+            Err(error) => println!(
+                "Produced-commit link reconciliation failed (session import will continue): {error}"
+            ),
+        }
+        println!("  Produced commit links: {produced_links}");
+
         if !ops_sink.ops.is_empty() {
             // Write ops to the chain store.
             let mut store = SegmentStore::open(&chain_path)?;
@@ -165,6 +190,46 @@ pub fn run(
     }
 
     Ok(())
+}
+
+/// Read accepted chain operations and merge the current import batch for
+/// produced-commit reconciliation.
+///
+/// Exact replay duplicates collapse by ID. Conflicting same-ID records are
+/// excluded entirely, matching the authoritative reader's quarantine rule, so
+/// malformed history can never become relationship evidence.
+fn reconciliation_ops(chain: &Path, imported: &[Op]) -> Result<Vec<Op>, std::io::Error> {
+    let store = SegmentStore::open(chain)?;
+    let mut accepted: BTreeMap<OpId, Op> = BTreeMap::new();
+    let mut conflicted = HashSet::new();
+    for page in store.read_all()? {
+        for record in page.records {
+            if let Ok(op) = decode_op(&record.data) {
+                reconcile_op(op, &mut accepted, &mut conflicted);
+            }
+        }
+    }
+    for op in imported {
+        reconcile_op(op.clone(), &mut accepted, &mut conflicted);
+    }
+    Ok(accepted.into_values().collect())
+}
+
+/// Insert one reconciliation candidate or quarantine its conflicting ID.
+fn reconcile_op(op: Op, accepted: &mut BTreeMap<OpId, Op>, conflicted: &mut HashSet<OpId>) {
+    if conflicted.contains(&op.id) {
+        return;
+    }
+    match accepted.get(&op.id) {
+        Some(existing) if existing != &op => {
+            drop(accepted.remove(&op.id));
+            let _: bool = conflicted.insert(op.id);
+        }
+        Some(_) => {}
+        None => {
+            drop(accepted.insert(op.id, op));
+        }
+    }
 }
 
 /// Build the blob and cursor sinks for an import run.
@@ -254,8 +319,6 @@ mod tests {
     use super::*;
     use crate::commands::{Cli, Commands};
     use clap::Parser;
-    use editchain_codec::frame::decode_op;
-    use editchain_core::Op;
 
     struct ImportArgs {
         sessions_dir: String,
@@ -438,6 +501,7 @@ mod tests {
                     content_hash_version: 0,
                     source_node: None,
                     normalization_version: 0,
+                    session_title_hash: None,
                 },
             )
             .unwrap();
@@ -459,6 +523,7 @@ mod tests {
                     content_hash_version: 0,
                     source_node: None,
                     normalization_version: 0,
+                    session_title_hash: None,
                 },
             )
             .unwrap();
@@ -596,7 +661,7 @@ mod tests {
         let regrown: Vec<Op> = all.iter().filter(|op| op.id.boot == 1).cloned().collect();
         assert!(!regrown.is_empty(), "regrown content must emit boot-1 ops");
         assert_eq!(all.len(), first.len() + regrown.len());
-        let boot0: std::collections::HashSet<_> = all
+        let boot0: HashSet<_> = all
             .iter()
             .filter(|op| op.id.boot == 0)
             .map(|op| op.id)

@@ -12,8 +12,7 @@
 // full-workbench and/or webview screenshots for each materially distinct
 // state:
 //
-//   initial-activity     default Activity profile, top of chain, single pane
-//   raw-profile          Raw via the real segmented control (hide_trace)
+//   initial-activity     fixed Activity presentation, top of chain, single pane
 //   find-current/next    real find-in-chain session, match 1 and match 2
 //   row-selected         inline row selection (no secondary pane)
 //   keyboard-focus       roving keyboard focus after ArrowDown
@@ -171,6 +170,10 @@ async function readState(): Promise<Record<string, unknown>> {
     const rowsEl = document.getElementById('rows');
     if (!rowsEl) throw new Error('no #rows element');
     const rows = Array.from(document.querySelectorAll('.row:not(.row-placeholder)'));
+    const rowIds = rows.map((row) => row.getAttribute('data-row'));
+    const visibleDateCells = Array.from(document.querySelectorAll<HTMLElement>('.date-cell'))
+      .filter((cell) => (cell.textContent ?? '').trim() !== '' &&
+        getComputedStyle(cell).display !== 'none');
     const profileFn = (window as any).__editchainGetProfile;
     const debug = (window as any).__editchainGpuDebug;
     const metrics = typeof debug?.metrics === 'function' ? debug.metrics() : null;
@@ -230,6 +233,7 @@ async function readState(): Promise<Record<string, unknown>> {
       total: typeof (window as any).__editchainGetTotal === 'function'
         ? (window as any).__editchainGetTotal() : -1,
       rowCount: rows.length,
+      uniqueRowCount: new Set(rowIds).size,
       placeholders: document.querySelectorAll('.row-placeholder').length,
       scrollTop: rowsEl.scrollTop,
       scrollHeight: rowsEl.scrollHeight,
@@ -251,6 +255,11 @@ async function readState(): Promise<Record<string, unknown>> {
       fragmentIssues,
       maxAlignDelta: Math.round(maxAlignDelta * 100) / 100,
       alignExamples,
+      rendererStatusBarCount: document.querySelectorAll(
+        '#gpu-toolbar, #gpu-backend, #gpu-status').length,
+      visibleDateCount: visibleDateCells.length,
+      clippedDateCount: visibleDateCells.filter((cell) =>
+        cell.scrollWidth > cell.clientWidth + 1).length,
       canvasCount: document.querySelectorAll('#gpu-canvas-host canvas').length,
       foreignCanvasCount: document.querySelectorAll(
         'canvas:not(#gpu-canvas-host canvas)'
@@ -391,9 +400,13 @@ describe('EditChain History visual state matrix', () => {
     expect(initial.profile).toBe('activity');
     expect(initial.dataReady).toBe(true);
     expect((initial.rowCount as number)).toBeGreaterThan(0);
+    expect(initial.uniqueRowCount).toBe(initial.rowCount);
     expect((initial.total as number)).toBeGreaterThan(0);
     expect(initial.hasDetail).toBe(false);
     expect(initial.scrollTop).toBe(0);
+    expect(initial.rendererStatusBarCount).toBe(0);
+    expect((initial.visibleDateCount as number)).toBeGreaterThan(0);
+    expect(initial.clippedDateCount).toBe(0);
     expect(initial.canvasCount).toBe(0);
     expect(initial.foreignCanvasCount).toBe(0);
     expect((initial.renderCount as number)).toBeGreaterThan(0);
@@ -414,47 +427,18 @@ describe('EditChain History visual state matrix', () => {
     expect(naturalGraphWidth).toBeTruthy();
     await capture('initial-activity', true, initial);
 
-    // --- raw-profile ----------------------------------------------------------
-    await browser.execute(() => {
-      const btn = document.getElementById('profile-raw');
-      if (!btn) throw new Error('no #profile-raw control');
-      btn.click();
+    const profileSurface = await browser.execute(() => ({
+      control: !!document.getElementById('profile-control'),
+      activity: !!document.getElementById('profile-activity'),
+      raw: !!document.getElementById('profile-raw'),
+      setter: typeof (window as any).__editchainSetProfile,
+    }));
+    expect(profileSurface).toEqual({
+      control: false,
+      activity: false,
+      raw: false,
+      setter: 'undefined',
     });
-    await browser.waitUntil(async () => browser.execute(() => {
-      const profileFn = (window as any).__editchainGetProfile;
-      const rowsEl = document.getElementById('rows');
-      return typeof profileFn === 'function' && profileFn() === 'raw' &&
-        !!rowsEl && rowsEl.scrollTop === 0 &&
-        document.querySelectorAll('#rows .row:not(.row-placeholder)').length > 0;
-    }), { timeout: ROW_TIMEOUT_MS, interval: 100 });
-    await waitIdle();
-    const raw = await readState();
-    expect(raw.profile).toBe('raw');
-    expect(raw.dataReady).toBe(true);
-    expect((raw.rowCount as number)).toBeGreaterThan(0);
-    expect(raw.scrollTop).toBe(0);
-    const rawPressed = await browser.execute(() =>
-      document.getElementById('profile-raw')?.getAttribute('aria-pressed'));
-    expect(rawPressed).toBe('true');
-    await capture('raw-profile', false, raw);
-
-    // Back to Activity through the real control (Raw -> Activity must reset
-    // the window and drop stale DOM before the new generation arrives).
-    await browser.execute(() => {
-      const btn = document.getElementById('profile-activity');
-      if (!btn) throw new Error('no #profile-activity control');
-      btn.click();
-    });
-    await browser.waitUntil(async () => browser.execute(() => {
-      const profileFn = (window as any).__editchainGetProfile;
-      const rowsEl = document.getElementById('rows');
-      return typeof profileFn === 'function' && profileFn() === 'activity' &&
-        !!rowsEl && rowsEl.scrollTop === 0 &&
-        document.querySelectorAll('#rows .row:not(.row-placeholder)').length > 0;
-    }), { timeout: ROW_TIMEOUT_MS, interval: 100 });
-    await waitIdle();
-    const activity = await readState();
-    expect(activity.profile).toBe('activity');
 
     // --- find-current / find-next ---------------------------------------------
     await browser.$('#search').setValue(QUERY);
@@ -489,7 +473,7 @@ describe('EditChain History visual state matrix', () => {
     } else {
       expect(findCurrent.counter).toMatch(/^1 of \d+\+?$/);
       expect(findCurrent.findKey).toBeTruthy();
-      expect(findCurrent.total).toBe(activity.total); // the chain is untouched
+      expect(findCurrent.total).toBe(initial.total); // the chain is untouched
       await capture('find-current', true, findCurrent);
       const findSurvived = await readFind();
       expect(findSurvived.counter).toBe(findCurrent.counter);
@@ -505,7 +489,10 @@ describe('EditChain History visual state matrix', () => {
       }), { timeout: 60000, interval: 100 });
       const findNext = await readFind();
       expect(findNext.counter).toMatch(/^2 of \d+\+?$/);
-      expect(findNext.findKey).not.toBe(findCurrent.findKey);
+      // Distinct underlying hits can resolve to the same visible parent when
+      // both live inside one folded activity group. The counter is the search
+      // cursor identity; the highlighted row key is intentionally shared.
+      expect(findNext.findKey).toBeTruthy();
       await capture('find-next', false, findNext);
 
       // Clear the session through the real input handler (no reload, no JSON).
@@ -577,7 +564,8 @@ describe('EditChain History visual state matrix', () => {
     let expandAbs: number | null = null;
     let expandDepth = 0;
     const findExpandable = () => browser.execute(() => {
-      const el = document.querySelector<HTMLElement>('.row-expandable:not(.row-placeholder)');
+      const el = document.querySelector<HTMLElement>(
+        '.row-expandable[data-activity-bundle]:not(.row-placeholder)');
       return el ? Number(el.getAttribute('data-row')) : null;
     });
     expandAbs = await findExpandable();
@@ -597,6 +585,18 @@ describe('EditChain History visual state matrix', () => {
       });
       writeManifest();
     } else {
+      const collapsedGroupMarker = await browser.execute((abs: number) => {
+        const graph = document.querySelector<HTMLElement>(
+          '.row[data-row="' + abs + '"] .graph-cell');
+        const capsule = graph?.querySelector<SVGRectElement>('.graphBundleCapsule');
+        const terminal = graph?.querySelector<SVGCircleElement>('.graphBundleTerminal');
+        return {
+          dots: graph?.querySelectorAll('.graphDot').length ?? 0,
+          capsules: graph?.querySelectorAll('.graphBundleCapsule').length ?? 0,
+          width: Number(capsule?.getAttribute('width') ?? 0),
+          terminalDiameter: Number(terminal?.getAttribute('r') ?? 0) * 2,
+        };
+      }, expandAbs);
       await browser.execute((abs: number) => {
         const row = document.querySelector<HTMLElement>('.row[data-row="' + abs + '"]');
         const chevron = row?.querySelector<HTMLElement>('.subop-chevron');
@@ -606,15 +606,264 @@ describe('EditChain History visual state matrix', () => {
       await browser.waitUntil(async () => browser.execute(() =>
         document.querySelectorAll('.row-subop').length > 0), { timeout: 60000, interval: 100 });
       await waitIdle();
+      const nestedAbs = await browser.execute(() => {
+        const row = document.querySelector<HTMLElement>(
+          '.row-subop[data-hierarchy-depth="1"].row-expandable'
+        );
+        return row ? Number(row.getAttribute('data-row')) : null;
+      });
+      if (nestedAbs != null) {
+        await browser.execute((abs: number) => {
+          const row = document.querySelector<HTMLElement>('.row[data-row="' + abs + '"]');
+          const chevron = row?.querySelector<HTMLElement>('.subop-chevron');
+          if (!chevron) throw new Error('no nested .subop-chevron on row ' + abs);
+          chevron.click();
+        }, nestedAbs);
+        await browser.waitUntil(async () => browser.execute(() =>
+          document.querySelectorAll('.row-subop[data-hierarchy-depth="2"]').length > 0),
+        { timeout: 60000, interval: 100 });
+        await waitIdle();
+      }
+      await browser.execute((abs: number) => {
+        document.querySelector<HTMLElement>('.row[data-row="' + abs + '"]')
+          ?.scrollIntoView({ block: 'center' });
+      }, expandAbs);
+      await browser.pause(200);
       const expanded = await readState();
       const ariaExpanded = await browser.execute((abs: number) =>
         document.querySelector('.row[data-row="' + abs + '"]')?.getAttribute('aria-expanded'), expandAbs);
+      const nestedAriaExpanded = nestedAbs == null ? null : await browser.execute((abs: number) =>
+        document.querySelector('.row[data-row="' + abs + '"]')?.getAttribute('aria-expanded'), nestedAbs);
+      const activityAffordance = await browser.execute((abs: number) => {
+        const row = document.querySelector<HTMLElement>('.row[data-row="' + abs + '"]');
+        const activity = row?.querySelector<HTMLElement>('.activity-cell');
+        const label = activity?.querySelector<HTMLElement>('.activity-label');
+        const chevron = activity?.querySelector<HTMLElement>('.subop-chevron');
+        return {
+          order: activity ? Array.from(activity.children).map((child) => child.className) : [],
+          label: label?.textContent ?? '',
+          glyph: chevron?.textContent ?? '',
+          colorMatches: !!label && !!chevron &&
+            getComputedStyle(label).color === getComputedStyle(chevron).color,
+          contentChevron: !!row?.querySelector('.text-cell .subop-chevron'),
+        };
+      }, expandAbs);
+      const contentPresentation = await browser.execute((parentAbs: number) => {
+        const styleOf = (element: Element | null) => {
+          if (!element) return null;
+          const style = getComputedStyle(element);
+          return {
+            color: style.color,
+            backgroundColor: style.backgroundColor,
+            borderTop: style.borderTop,
+            borderRight: style.borderRight,
+            borderBottom: style.borderBottom,
+            borderLeft: style.borderLeft,
+            borderRadius: style.borderRadius,
+            fontFamily: style.fontFamily,
+            fontSize: style.fontSize,
+            fontWeight: style.fontWeight,
+            lineHeight: style.lineHeight,
+            paddingTop: style.paddingTop,
+            paddingRight: style.paddingRight,
+            paddingBottom: style.paddingBottom,
+            paddingLeft: style.paddingLeft,
+          };
+        };
+        const gitChip = document.querySelector<HTMLElement>('.git-prefix-chip');
+        const gitContent = gitChip?.closest('.row')
+          ?.querySelector<HTMLElement>('.text-cell .git-summary-text') ?? null;
+        const activityChip = document.querySelector<HTMLElement>('.bundle-count');
+        const agentChip = document.querySelector<HTMLElement>('.session-chip-agent');
+        const workUnitChip = document.querySelector<HTMLElement>('.work-unit-count');
+        const chipSelector = [
+          '.git-prefix-chip', '.bundle-count', '.bundle-status',
+          '.session-chip', '.rel-badge', '.out-badge', '.work-unit-count',
+        ].join(',');
+        const chips = Array.from(document.querySelectorAll<HTMLElement>(chipSelector));
+        const resizeHandles = Array.from(document.querySelectorAll<HTMLElement>(
+          '.col-resize-handle'
+        ));
+        const tableHeader = document.querySelector('.tbl-header');
+        const humanSummary = document.querySelector<HTMLElement>('.row-human .summary');
+        const renderedRows = Array.from(document.querySelectorAll<HTMLElement>(
+          '.row:not(.row-placeholder)'
+        ));
+        const sessionRow = renderedRows.find((row) =>
+          row.getAttribute('data-classification') === 'session') ?? null;
+        const ordinaryRow = renderedRows.find((row) =>
+          row.getAttribute('data-classification') !== 'session') ?? null;
+        const sessionBox = sessionRow?.getBoundingClientRect() ?? null;
+        const ordinaryBox = ordinaryRow?.getBoundingClientRect() ?? null;
+        const sessionStyle = sessionRow ? getComputedStyle(sessionRow) : null;
+        const hoverProbe = document.createElement('div');
+        hoverProbe.style.backgroundColor =
+          'var(--vscode-list-hoverBackground, var(--ec-surface-raised))';
+        hoverProbe.style.position = 'absolute';
+        hoverProbe.style.visibility = 'hidden';
+        document.body.append(hoverProbe);
+        const hoverBackgroundColor = getComputedStyle(hoverProbe).backgroundColor;
+        hoverProbe.remove();
+        const openedGroupRows = renderedRows.filter((row) =>
+          row.classList.contains('row-subop'));
+        const parentGraph = document.querySelector<HTMLElement>(
+          '.row[data-row="' + parentAbs + '"] .graph-cell');
+        const opacityByColumn = Object.fromEntries([
+          ['activity', '.activity-cell'],
+          ['tags', '.tags-cell'],
+          ['content', '.text-cell'],
+          ['date', '.date-cell'],
+          ['author', '.author-cell'],
+          ['commit', '.commit-cell'],
+        ].map(([name, selector]) => [name, Array.from(new Set(renderedRows
+          .map((row) => row.querySelector<HTMLElement>(selector))
+          .filter((cell): cell is HTMLElement => cell != null)
+          .map((cell) => getComputedStyle(cell).opacity)))]));
+        const conversationCounts = { agent: 0, user: 0 };
+        const conversationMismatches: Array<{ author: string; label: string }> = [];
+        for (const rendered of renderedRows) {
+          const abs = Number(rendered.getAttribute('data-row'));
+          const wire = window.__editchainRowAt?.(abs);
+          if (!wire || wire.activity_kind !== 'conversation') continue;
+          const author = String(wire.author ?? '');
+          const label = (rendered.querySelector('.activity-label')?.textContent ?? '').trim();
+          const expected = author === 'human' || author === 'user' ? 'user' : 'agent';
+          conversationCounts[expected] += 1;
+          if (label !== expected) conversationMismatches.push({ author, label });
+        }
+        const prefix = (gitChip?.textContent ?? '').trim();
+        const content = (gitContent?.textContent ?? '').trim();
+        const gitStyle = styleOf(gitChip);
+        return {
+          prefix,
+          content,
+          repeatsPrefix: !!prefix && (content === prefix || content.startsWith(prefix + ' ') ||
+            content.startsWith(prefix + ':')),
+          humanWeight: humanSummary ? getComputedStyle(humanSummary).fontWeight : null,
+          activityChipStyleMatches: !!gitStyle &&
+            JSON.stringify(styleOf(activityChip)) === JSON.stringify(gitStyle),
+          agentChipStyleMatches: agentChip == null ? null :
+            JSON.stringify(styleOf(agentChip)) === JSON.stringify(gitStyle),
+          workUnitChipStyleMatches: workUnitChip == null ? null :
+            JSON.stringify(styleOf(workUnitChip)) === JSON.stringify(gitStyle),
+          headerLabels: Array.from(document.querySelectorAll('.tbl-header .th'))
+            .map((cell) => (cell.textContent ?? '').trim()),
+          chipCount: chips.length,
+          misplacedChips: chips.filter((chip) =>
+            !chip.parentElement?.classList.contains('tags-cell')).length,
+          contentChipCount: document.querySelectorAll(
+            '.text-cell :is(' + chipSelector + ')').length,
+          maxTagsPerRow: Math.max(0, ...renderedRows.map((row) =>
+            row.querySelector('.tags-cell')?.children.length ?? 0)),
+          resizeHandleColumns: resizeHandles.map((handle) => handle.dataset.col ?? ''),
+          resizeHandlesInHeader: resizeHandles.every((handle) =>
+            handle.parentElement === tableHeader),
+          visibleResizeIndicators: resizeHandles.every((handle) => {
+            const style = getComputedStyle(handle, '::after');
+            return style.width === '1px' && style.backgroundColor !== 'rgba(0, 0, 0, 0)';
+          }),
+          openedGroupMarkers: {
+            rows: openedGroupRows.length,
+            dots: openedGroupRows.filter((row) =>
+              row.querySelectorAll('.graph-cell .graphDot').length === 1).length,
+            nestedCapsules: openedGroupRows.filter((row) =>
+              row.querySelector('.graph-cell .graphBundleCapsule') != null).length,
+          },
+          unfoldedGroupMarker: {
+            dots: parentGraph?.querySelectorAll('.graphDot').length ?? 0,
+            capsules: parentGraph?.querySelectorAll('.graphBundleCapsule').length ?? 0,
+            terminals: parentGraph?.querySelectorAll('.graphBundleTerminal').length ?? 0,
+          },
+          sessionTreatment: {
+            found: sessionRow != null,
+            backgroundColor: sessionStyle?.backgroundColor ?? null,
+            color: sessionStyle?.color ?? null,
+            editorBackgroundColor: getComputedStyle(document.body).backgroundColor,
+            boxShadow: sessionStyle?.boxShadow ?? null,
+            hoverBackgroundColor,
+            fullWidth: !!sessionBox && !!ordinaryBox &&
+              Math.abs(sessionBox.width - ordinaryBox.width) <= 1,
+          },
+          opacityByColumn,
+          conversationCounts,
+          conversationMismatches,
+        };
+      }, expandAbs);
       expect(ariaExpanded).toBe('true');
+      if (nestedAbs != null) expect(nestedAriaExpanded).toBe('true');
+      expect(activityAffordance.order).toEqual(['activity-label', 'subop-chevron']);
+      expect(activityAffordance.glyph).toBe('\u25be');
+      expect(activityAffordance.colorMatches).toBe(true);
+      expect(activityAffordance.contentChevron).toBe(false);
+      expect(contentPresentation.prefix.length).toBeGreaterThan(0);
+      expect(contentPresentation.content.length).toBeGreaterThan(0);
+      expect(contentPresentation.repeatsPrefix).toBe(false);
+      expect(contentPresentation.humanWeight).toBe('400');
+      expect(contentPresentation.activityChipStyleMatches).toBe(true);
+      if (contentPresentation.agentChipStyleMatches != null) {
+        expect(contentPresentation.agentChipStyleMatches).toBe(true);
+      }
+      if (contentPresentation.workUnitChipStyleMatches != null) {
+        expect(contentPresentation.workUnitChipStyleMatches).toBe(true);
+      }
+      expect(contentPresentation.headerLabels).toEqual([
+        'Graph', 'Activity', 'Tags', 'Content', 'Date',
+      ]);
+      expect(contentPresentation.chipCount).toBeGreaterThan(0);
+      expect(contentPresentation.misplacedChips).toBe(0);
+      expect(contentPresentation.contentChipCount).toBe(0);
+      expect(contentPresentation.maxTagsPerRow).toBeGreaterThan(1);
+      expect(contentPresentation.resizeHandleColumns).toEqual([
+        'graph', 'activity', 'tags', 'content', 'date',
+      ]);
+      expect(contentPresentation.resizeHandlesInHeader).toBe(true);
+      expect(contentPresentation.visibleResizeIndicators).toBe(true);
+      expect(contentPresentation.openedGroupMarkers.rows).toBeGreaterThan(0);
+      expect(contentPresentation.openedGroupMarkers.dots)
+        .toBe(contentPresentation.openedGroupMarkers.rows);
+      expect(contentPresentation.openedGroupMarkers.nestedCapsules).toBe(0);
+      expect(collapsedGroupMarker.dots).toBe(0);
+      expect(collapsedGroupMarker.capsules).toBe(1);
+      expect(collapsedGroupMarker.width).toBeGreaterThan(0);
+      expect(collapsedGroupMarker.width - collapsedGroupMarker.terminalDiameter)
+        .toBeCloseTo(1, 5);
+      expect(contentPresentation.unfoldedGroupMarker)
+        .toEqual({ dots: 1, capsules: 0, terminals: 0 });
+      expect(contentPresentation.sessionTreatment.found).toBe(true);
+      expect(contentPresentation.sessionTreatment.backgroundColor)
+        .not.toBe(contentPresentation.sessionTreatment.editorBackgroundColor);
+      expect(contentPresentation.sessionTreatment.backgroundColor)
+        .toBe(contentPresentation.sessionTreatment.hoverBackgroundColor);
+      expect(contentPresentation.sessionTreatment.fullWidth).toBe(true);
+      expect(contentPresentation.opacityByColumn.activity).toEqual(['1']);
+      expect(contentPresentation.opacityByColumn.tags).toEqual(['1']);
+      expect(contentPresentation.opacityByColumn.content).toEqual(['1']);
+      expect(contentPresentation.opacityByColumn.date).toHaveLength(1);
+      expect(contentPresentation.opacityByColumn.author).toEqual(['1']);
+      expect(contentPresentation.opacityByColumn.commit).toEqual(['1']);
+      expect(contentPresentation.conversationCounts.agent).toBeGreaterThan(0);
+      expect(contentPresentation.conversationCounts.user).toBeGreaterThan(0);
+      expect(contentPresentation.conversationMismatches).toEqual([]);
       expect((expanded.rowCount as number)).toBeGreaterThan(0);
+      expect(expanded.uniqueRowCount).toBe(expanded.rowCount);
       await capture('bundle-expanded', false, {
-        ...expanded, parentRow: expandAbs, ariaExpanded, expandDepth,
+        ...expanded, parentRow: expandAbs, ariaExpanded, nestedRow: nestedAbs,
+        nestedAriaExpanded, activityAffordance, collapsedGroupMarker,
+        contentPresentation, expandDepth,
       });
       // Collapse again so the later states start from the default reveal state.
+      if (nestedAbs != null) {
+        await browser.execute((abs: number) => {
+          const row = document.querySelector<HTMLElement>('.row[data-row="' + abs + '"]');
+          const chevron = row?.querySelector<HTMLElement>('.subop-chevron');
+          if (!chevron) throw new Error('no nested .subop-chevron to collapse row ' + abs);
+          chevron.click();
+        }, nestedAbs);
+        await browser.waitUntil(async () => browser.execute(() =>
+          document.querySelectorAll('.row-subop[data-hierarchy-depth="2"]').length === 0),
+        { timeout: 60000, interval: 100 });
+        await waitIdle();
+      }
       await browser.execute((abs: number) => {
         const row = document.querySelector<HTMLElement>('.row[data-row="' + abs + '"]');
         const chevron = row?.querySelector<HTMLElement>('.subop-chevron');
@@ -624,10 +873,8 @@ describe('EditChain History visual state matrix', () => {
       await browser.waitUntil(async () => browser.execute(() =>
         document.querySelectorAll('.row-subop').length === 0), { timeout: 60000, interval: 100 });
       await waitIdle();
-      if (expandDepth > 0) {
-        await smoothScrollTo(0, 1200);
-        await browser.pause(200);
-      }
+      await smoothScrollTo(0, 1200);
+      await browser.pause(200);
     }
 
     // --- deep-scroll (virtualized window at depth) ----------------------------
@@ -636,11 +883,10 @@ describe('EditChain History visual state matrix', () => {
       if (!rowsEl) throw new Error('no #rows element');
       return Math.max(0, rowsEl.scrollHeight - rowsEl.clientHeight);
     });
-    // BUFFER=400 at ROW_H=34 keeps the first 13,600px cached. Move beyond that
-    // boundary so this state proves a true virtual-window reanchor (and
-    // therefore a different rendered key prefix), while keeping the live
-    // service fetch bounded to the nearest deep window instead of filling
-    // several additional background pages solely for a screenshot.
+    // BUFFER=400 at ROW_H=34 keeps the first 13,600px cached. When the collapsed
+    // view is larger than that buffer, move beyond the boundary to prove a true
+    // virtual-window reanchor while keeping the live service fetch bounded.
+    // A compact grouped view may fit entirely in the rendered window instead.
     const deepTarget = Math.min(14000, maxScroll as number);
     const deepThreshold = Math.max(0, deepTarget - 200);
     await smoothScrollTo(deepTarget, 1600);
@@ -653,11 +899,13 @@ describe('EditChain History visual state matrix', () => {
     const deep = await readState();
     expect((deep.scrollTop as number)).toBeGreaterThanOrEqual(deepThreshold);
     expect((deep.rowCount as number)).toBeGreaterThan(0);
+    expect(deep.uniqueRowCount).toBe(deep.rowCount);
     if ((deep.total as number) > 100) {
       // Bounded viewport: only a slice is rendered, never the whole chain.
       expect((deep.rowCount as number)).toBeLessThan(deep.total as number);
     }
-    if (deepTarget > 0) {
+    if (deepTarget > 0 &&
+        (deep.rowCount as number) < Number(deep.gridRowCount)) {
       expect(deep.firstKeys).not.toEqual(initial.firstKeys);
     }
     await capture('deep-scroll', true, deep);
@@ -678,6 +926,44 @@ describe('EditChain History visual state matrix', () => {
     expect(topRestored.scrollTop).toBe(0);
     await capture('scroll-top-restored', false, topRestored);
 
+    // --- Activity/Tags column resizing ------------------------------------------
+    const dragTextColumn = (column: 'activity' | 'tags', deltaX: number): Promise<number> =>
+      browser.execute((col: string, delta: number) => {
+        const handle = document.querySelector<HTMLElement>(
+          '.col-resize-handle[data-col="' + col + '"]'
+        );
+        if (!handle) throw new Error('no ' + col + ' resize handle');
+        const rect = handle.getBoundingClientRect();
+        const startX = rect.left + rect.width / 2;
+        const y = rect.top + rect.height / 2;
+        handle.dispatchEvent(new MouseEvent('mousedown', {
+          bubbles: true, cancelable: true, clientX: startX, clientY: y,
+        }));
+        window.dispatchEvent(new MouseEvent('mousemove', {
+          bubbles: true, cancelable: true, clientX: startX + delta, clientY: y,
+        }));
+        window.dispatchEvent(new MouseEvent('mouseup', {
+          bubbles: true, cancelable: true, clientX: startX + delta, clientY: y,
+        }));
+        return document.querySelector<HTMLElement>('.tbl-header .th.' + col)
+          ?.getBoundingClientRect().width ?? 0;
+      }, column, deltaX);
+    const textColumnWidths = await browser.execute(() => ({
+      activity: document.querySelector<HTMLElement>('.tbl-header .th.activity')
+        ?.getBoundingClientRect().width ?? 0,
+      tags: document.querySelector<HTMLElement>('.tbl-header .th.tags')
+        ?.getBoundingClientRect().width ?? 0,
+    }));
+    const widerActivity = await dragTextColumn('activity', 18);
+    expect(widerActivity).toBeGreaterThan((textColumnWidths as any).activity);
+    const widerTags = await dragTextColumn('tags', 24);
+    expect(widerTags).toBeGreaterThan((textColumnWidths as any).tags);
+    const restoredActivity = await dragTextColumn('activity', -18);
+    const restoredTags = await dragTextColumn('tags', -24);
+    expect(Math.abs(restoredActivity - (textColumnWidths as any).activity)).toBeLessThanOrEqual(1);
+    expect(Math.abs(restoredTags - (textColumnWidths as any).tags)).toBeLessThanOrEqual(1);
+    await waitVisibleFrame();
+
     // --- graph-column narrow/wide (lane geometry invariant) --------------------
     const dragGraph = (deltaX: number): Promise<number> =>
       browser.execute((delta: number) => {
@@ -697,6 +983,11 @@ describe('EditChain History visual state matrix', () => {
         }));
         return (window as any).__editchainGpuDebug.graphState().graphWidth;
       }, deltaX);
+    const expectPointerWidth = (actual: number, expected: number): void => {
+      // MouseEvent.clientX is integer-valued in Chromium, while the natural
+      // lane-derived graph width can be fractional (44.28px here).
+      expect(Math.abs(actual - expected)).toBeLessThanOrEqual(0.5);
+    };
 
     const wideTarget = await browser.execute((natural: number) => {
       const rowsEl = document.getElementById('rows');
@@ -718,17 +1009,17 @@ describe('EditChain History visual state matrix', () => {
     const wideWidth = await dragGraph((wideTarget as number) - 40);
     await waitVisibleFrame();
     const wide = await readState();
-    expect((wide.graphState as any).graphWidth).toBe(wideTarget);
-    expect(wideWidth).toBe(wideTarget);
+    expectPointerWidth((wide.graphState as any).graphWidth, wideTarget as number);
+    expectPointerWidth(wideWidth, wideTarget as number);
     expect(wide.laneXAll).toEqual(laneXBaseline);
     await capture('graph-wide', true, { ...wide, graphWidthAfterDrag: wideWidth });
 
     // Restore the natural width so the session ends in its default layout.
-    const restoredWidth = await dragGraph((naturalGraphWidth as number) - (wideTarget as number));
+    const restoredWidth = await dragGraph((naturalGraphWidth as number) - wideWidth);
     await waitVisibleFrame();
     const restored = await readState();
-    expect((restored.graphState as any).graphWidth).toBe(naturalGraphWidth);
-    expect(restoredWidth).toBe(naturalGraphWidth);
+    expectPointerWidth((restored.graphState as any).graphWidth, naturalGraphWidth as number);
+    expectPointerWidth(restoredWidth, naturalGraphWidth as number);
     expect(restored.laneXAll).toEqual(laneXBaseline);
     await capture('graph-restored', false, { ...restored, graphWidthAfterDrag: restoredWidth });
 

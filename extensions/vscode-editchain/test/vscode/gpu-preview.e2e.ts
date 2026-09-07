@@ -16,8 +16,8 @@
 // backend: 'svg', snapshot, metrics, whenIdle)
 // plus the __editchainGetProfile/GetTotal/RowAt compatibility hooks. This
 // spec exercises the pieces the standalone harness cannot: the default open
-// command, the single panel title, the production control paths (Activity/Raw
-// profile, find-in-chain submit + navigation + clear, scrolling, inline
+// command, the single panel title, the fixed Activity presentation,
+// find-in-chain submit + navigation + clear, scrolling, inline
 // selection/keyboard roving) inside the Rust-backed webview, and the debug
 // renderer contract (loader identity, backend 'svg', renderCount > 0,
 // vertexCount 0, zero canvases, one aria-hidden svg.graph-row-fragment per
@@ -216,42 +216,22 @@ describe('EditChain Rust history renderer (per-row SVG)', () => {
     console.log('[gpu-e2e] idle:', JSON.stringify(idle));
 
     // --- Production control path inside the Rust-backed history panel --------
-    // Activity/Raw profile switch through the real segmented control. Raw
-    // (hide_trace=false) must refetch and re-render through the Rust shell.
+    // The extension is permanently Activity and exposes no profile controls.
     const profileDefaults = await browser.execute(() => ({
       profile: typeof window.__editchainGetProfile === 'function'
         ? window.__editchainGetProfile() : null,
-      rawPressed: document.getElementById('profile-raw')?.getAttribute('aria-pressed'),
+      profileControl: !!document.getElementById('profile-control'),
+      profileActivity: !!document.getElementById('profile-activity'),
+      profileRaw: !!document.getElementById('profile-raw'),
+      profileSetter: typeof window.__editchainSetProfile,
     }));
     console.log('[gpu-e2e] profile defaults:', JSON.stringify(profileDefaults));
     expect(profileDefaults.profile).toBe('activity');
-    await browser.execute(() => {
-      document.getElementById('profile-raw').click();
-    });
-    await browser.waitUntil(async () => browser.execute(() =>
-      typeof window.__editchainGetProfile === 'function' &&
-      window.__editchainGetProfile() === 'raw' &&
-      document.getElementById('rows').scrollTop === 0 &&
-      document.querySelectorAll('#rows .row:not(.row-placeholder)').length > 0), {
-      timeout: ROW_TIMEOUT_MS,
-      timeoutMsg: 'history panel did not re-render under the Raw profile',
-    });
-    await browser.execute((timeout) => window.__editchainGpuDebug.whenIdle(timeout), IDLE_TIMEOUT_MS);
-    const rawTotal = await browser.execute(() => window.__editchainGetTotal());
-    // Pin Activity back for the deterministic find-in-chain query below.
-    await browser.execute(() => {
-      document.getElementById('profile-activity').click();
-    });
-    await browser.waitUntil(async () => browser.execute(() =>
-      typeof window.__editchainGetProfile === 'function' &&
-      window.__editchainGetProfile() === 'activity' &&
-      document.querySelectorAll('#rows .row:not(.row-placeholder)').length > 0), {
-      timeout: ROW_TIMEOUT_MS,
-      timeoutMsg: 'history panel did not re-render under the Activity profile',
-    });
-    await browser.execute((timeout) => window.__editchainGpuDebug.whenIdle(timeout), IDLE_TIMEOUT_MS);
+    expect(profileDefaults.profileControl).toBe(false);
+    expect(profileDefaults.profileActivity).toBe(false);
+    expect(profileDefaults.profileRaw).toBe(false);
+    expect(profileDefaults.profileSetter).toBe('undefined');
     const activityTotal = await browser.execute(() => window.__editchainGetTotal());
-    expect(rawTotal).toBeGreaterThan(activityTotal);
     expect(activityTotal).toBeGreaterThan(0);
 
     // Find-in-chain through the real keyboard path: type the query and press
@@ -366,7 +346,7 @@ describe('EditChain Rust history renderer (per-row SVG)', () => {
       maxAlignDelta: debug.maxAlignDelta,
       renderCount: debug.renderCount,
       vertexCount: debug.vertexCount,
-      profile: { activityTotal, rawTotal },
+      profile: { mode: 'activity', activityTotal, togglePresent: false },
       find: findState,
     }, null, 2));
 

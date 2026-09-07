@@ -1,13 +1,15 @@
 // Node unit tests for the round-two Activity-view wire contract through the
-// fixture bridge: work_unit / promoted / activity_bundle fidelity.
+// fixture bridge: work_unit / session_summary / promoted / activity_bundle fidelity.
 //
 // Loads test/harness/fixtureBridge.js (a browser IIFE) in a sandboxed global
 // and drives GetWindow / GetLayout against the `workUnits` fixture, asserting:
-//   - the bridge faithfully PASSES THROUGH authored work_unit / promoted /
-//     activity_bundle metadata and DEFAULTS the additive fields on rows that
+//   - the bridge faithfully PASSES THROUGH authored work_unit /
+//     session_summary / promoted / activity_bundle metadata and DEFAULTS them
+//     on rows that
 //     omit them (mirroring the HistoryRow serde defaults);
 //   - the activity_bundle kind is coerced through the wire enum exactly like
-//     serde: "execute-run" and "plan-repeat" survive, any other string maps
+//     serde: "work-group", "execute-run", and "plan-repeat" survive, any
+//     other string maps
 //     to "unknown" (forward compatibility), so clients style only recognized
 //     typed bundles;
 //   - the Raw profile (hide_trace=false on the wire) is served the unbundled
@@ -97,6 +99,13 @@ test('fixture view-wide invariants: one start/end per unit id, exact counts, tit
       ? { 'session:s1/turn:t1': 7, 'session:s1/turn:t2': 4, 'repo:ops': 2 }
       : { 'session:s1/turn:t1': 14, 'session:s1/turn:t2': 5, 'repo:ops': 2 };
     assert.deepEqual(Object.fromEntries(counts), expected, label + ' per-unit counts');
+
+    const sessionRows = rows.filter((r) => r.group.startsWith('session:'));
+    const summaries = sessionRows.filter((r) => r.session_summary);
+    assert.equal(summaries.length, 1, label + ' has one whole-session marker');
+    assert.equal(summaries[0], sessionRows[0], label + ' marker is on the newest session row');
+    assert.equal(summaries[0].session_summary.count, sessionRows.length,
+      label + ' session count spans every turn and session-scoped row');
   }
   // Titled units carry the oldest narrative summary verbatim on the wire
   // (Markdown cleanup is a renderer concern); the fallback ops unit with no
@@ -155,7 +164,7 @@ test('exact bundle metadata: member_count matches folded members; promoted sets 
   }
 });
 
-test('bridge PASSES THROUGH authored work_unit/promoted/activity_bundle in GetWindow (Activity profile)', () => {
+test('bridge PASSES THROUGH authored activity metadata in GetWindow (Activity profile)', () => {
   const ok = windowRows(FIXTURE, { hide_trace: true });
   assert.equal(ok.rows.filter((r) => !r.is_subop).length, 13,
     'activity view serves 13 top-level rows (plus expanded sub-op rows)');
@@ -163,6 +172,7 @@ test('bridge PASSES THROUGH authored work_unit/promoted/activity_bundle in GetWi
   assert.equal(subopRows.length, 14, 'bundle members + metadata sub-ops are expandable sub-op rows');
   for (const r of subopRows) {
     assert.equal(r.work_unit, null, 'sub-op rows never carry work-unit metadata');
+    assert.equal(r.session_summary, null, 'sub-op rows never carry session-summary metadata');
     assert.equal(r.promoted, false, 'sub-op rows are never promoted');
     assert.equal(r.activity_bundle, null, 'sub-op rows never carry bundle metadata');
   }
@@ -175,6 +185,7 @@ test('bridge PASSES THROUGH authored work_unit/promoted/activity_bundle in GetWi
     title: '**User asks** to fix `the build`',
     count: 7,
   });
+  assert.deepEqual(req1.session_summary, { count: 11 });
   assert.equal(req1.promoted, true);
   const run1 = byKey.get('wu:run1');
   assert.deepEqual(run1.activity_bundle, { kind: 'execute-run', member_count: 3 });
@@ -208,6 +219,7 @@ test('bridge DEFAULTS additive fields and coerces the bundle kind enum (serde pa
   assert.equal(ok.rows.length, 1);
   const row = ok.rows[0];
   assert.equal(row.work_unit, null, 'missing work_unit defaults to null (serde default)');
+  assert.equal(row.session_summary, null, 'missing session_summary defaults to null');
   assert.equal(row.promoted, false, 'missing promoted defaults to false');
   assert.equal(row.activity_bundle, null, 'missing activity_bundle defaults to null');
 
@@ -218,6 +230,8 @@ test('bridge DEFAULTS additive fields and coerces the bundle kind enum (serde pa
         activity_bundle: { kind: 'execute-run', member_count: 2 } },
       { ...legacy, node_key: 'b:2', summary: 'typed plans', kind: 'reflection',
         activity_bundle: { kind: 'plan-repeat', member_count: 3 } },
+      { ...legacy, node_key: 'b:work', summary: 'typed work', kind: 'work-group',
+        activity_bundle: { kind: 'work-group', member_count: 5 } },
       { ...legacy, node_key: 'b:3', summary: 'unknown kind run', kind: 'command',
         activity_bundle: { kind: 'checkpoint', member_count: 4 } },
     ],
@@ -229,6 +243,8 @@ test('bridge DEFAULTS additive fields and coerces the bundle kind enum (serde pa
     'typed kind survives the enum round trip');
   assert.equal(coerced.find((r) => r.node_key === 'b:2').activity_bundle.kind, 'plan-repeat',
     'typed Plan-repeat kind survives the enum round trip');
+  assert.equal(coerced.find((r) => r.node_key === 'b:work').activity_bundle.kind, 'work-group',
+    'typed work-group kind survives the enum round trip');
   assert.equal(coerced.find((r) => r.node_key === 'b:3').activity_bundle.kind, 'unknown',
     'unknown wire strings coerce to the Unknown variant (forward compatibility)');
 });

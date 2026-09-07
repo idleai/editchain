@@ -10,11 +10,12 @@ use serde as _;
 use serde_json as _;
 
 use editchain_core::{
-    ActorId, Clock, MessageOp, NodeId, NoteOp, NoteRelationship, Op, OpId, OpKind, ParentSet,
-    Payload, ScopeRef, Tags,
+    ActorId, Clock, GitAvailability, GitCommitEntity, GitLink, GitLinkKind, GitObjectFormat,
+    GitOid, GitSignature, ImportOp, MessageOp, NodeId, NoteOp, NoteRelationship, Op, OpId, OpKind,
+    ParentSet, Payload, RepositoryId, ScopeRef, Tags,
 };
 use editchain_project::filter::ChainFilter;
-use editchain_project::HistoryProjection;
+use editchain_project::{HistoryProjection, ProjectionOptions};
 
 /// Build a message op with a given clock and parent.
 fn msg_op(node: u64, seq: u64, clock_ms: u64, parent: Option<OpId>, text: &str) -> Op {
@@ -38,6 +39,38 @@ fn linear_chain() -> Vec<Op> {
     let b = msg_op(1, 2, 2_000, Some(a.id), "beta");
     let c = msg_op(1, 3, 3_000, Some(b.id), "gamma");
     vec![a, b, c]
+}
+
+/// Build a minimal live Git commit for cross-domain filter tests.
+fn git_commit(byte: u8, timestamp: i64) -> GitCommitEntity {
+    let mut bytes = [0u8; 32];
+    bytes[0] = byte;
+    let oid = GitOid::new(GitObjectFormat::Sha1, bytes);
+    GitCommitEntity {
+        repository: RepositoryId(7),
+        object_format: GitObjectFormat::Sha1,
+        oid,
+        imported_record: None,
+        availability: GitAvailability::Resolved,
+        tree: GitOid::new(GitObjectFormat::Sha1, [0u8; 32]),
+        parents: Vec::new(),
+        author: GitSignature {
+            name: Payload::Empty,
+            email: Payload::Empty,
+            when: timestamp,
+        },
+        committer: GitSignature {
+            name: Payload::Empty,
+            email: Payload::Empty,
+            when: timestamp,
+        },
+        authored_at: timestamp,
+        committed_at: timestamp,
+        message: Payload::Inline(b"produced commit".to_vec()),
+        imported_refs: Vec::new(),
+        live_refs: Vec::new(),
+        changed_paths: Vec::new(),
+    }
 }
 
 /// A `SubagentOf` relationship note: the subagent's first op (`parent_id`) is
@@ -169,6 +202,107 @@ fn hide_undated_with_splice_reconnects_edges() {
     let parents = c_node.parent_keys(&projection.git.links, projection.relationship_notes());
     assert_eq!(parents.len(), 1);
     assert_eq!(parents[0], a_id.to_string());
+}
+
+#[test]
+fn hide_undated_keeps_metadata_already_bundled_as_sub_ops() {
+    let turn = Op {
+        id: OpId::new(NodeId(1), 0, 1),
+        parents: ParentSet::None,
+        actor: ActorId(1),
+        clock: Clock::UnixMs(1_000),
+        scope: ScopeRef::None,
+        tags: Tags::IMPORT,
+        kind: OpKind::Import(ImportOp {
+            raw_ref: Payload::Inline(br#"{"type":"user"}"#.to_vec()),
+            raw_hash: None,
+        }),
+    };
+    let metadata = Op {
+        id: OpId::new(NodeId(1), 0, 2),
+        parents: ParentSet::One(turn.id),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(0),
+        scope: ScopeRef::None,
+        tags: Tags::IMPORT | Tags::META,
+        kind: OpKind::Import(ImportOp {
+            raw_ref: Payload::Inline(br#"{"type":"custom-title"}"#.to_vec()),
+            raw_hash: None,
+        }),
+    };
+    let projection = HistoryProjection::from_ops_with(
+        vec![turn, metadata.clone()],
+        ProjectionOptions {
+            bundle_metadata: true,
+        },
+    );
+
+    let unfiltered = projection.nodes();
+    assert_eq!(unfiltered.len(), 1, "metadata is folded before filtering");
+    assert_eq!(unfiltered[0].sub_ops().len(), 1);
+
+    let filtered = projection.filtered_nodes(&ChainFilter::default());
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(
+        filtered[0]
+            .sub_ops()
+            .iter()
+            .map(|op| op.id)
+            .collect::<Vec<_>>(),
+        vec![metadata.id],
+        "hide_undated only removes top-level rows; bundled metadata remains inspectable"
+    );
+}
+
+#[test]
+fn hide_undated_splices_through_structural_relationship_endpoints() {
+    // Both exact SubagentOf endpoints are undated: the parent-side spawn row
+    // follows a dated trunk row, while the child-side branch anchor precedes a
+    // dated work row. The relationship remains in the projection, but neither
+    // timestamp-zero carrier may survive presentation. Splicing must lift the
+    // branch edge onto the two dated rows.
+    let trunk = msg_op(1, 1, 1_000, None, "parent work");
+    let spawn = msg_op(1, 2, 0, Some(trunk.id), "spawn marker");
+    let branch_anchor = msg_op(2, 1, 0, None, "subagent anchor");
+    let branch_work = msg_op(2, 2, 3_000, Some(branch_anchor.id), "subagent work");
+    let note = subagent_note(branch_anchor.id, spawn.id);
+    let projection = HistoryProjection::from_ops(vec![
+        trunk.clone(),
+        spawn.clone(),
+        branch_anchor.clone(),
+        branch_work.clone(),
+        note,
+    ]);
+
+    let nodes = projection.filtered_nodes(&ChainFilter::default());
+    assert!(
+        nodes.iter().all(|node| node.timestamp_ms() != 0),
+        "hide_undated must remove structural timestamp-zero rows too"
+    );
+    let keys: Vec<String> = nodes
+        .iter()
+        .map(editchain_project::HistoryNode::node_key)
+        .collect();
+    assert!(!keys.contains(&spawn.id.to_string()));
+    assert!(!keys.contains(&branch_anchor.id.to_string()));
+
+    let work = nodes
+        .iter()
+        .find(|node| node.node_key() == branch_work.id.to_string())
+        .expect("dated subagent work remains visible");
+    assert_eq!(
+        work.parent_keys(&projection.git.links, projection.relationship_notes()),
+        vec![trunk.id.to_string()],
+        "the stored structural relationship must splice onto dated endpoints"
+    );
+
+    let layout = projection.layout_context(&nodes);
+    assert!(
+        layout.edges_for_window(0, nodes.len()).iter().any(|edge| {
+            edge.child == branch_work.id.to_string() && edge.parent == trunk.id.to_string()
+        }),
+        "the lifted branch edge must remain drawable between dated rows"
+    );
 }
 
 #[test]
@@ -313,6 +447,67 @@ fn include_kind_pattern_keeps_only_matching_kinds() {
     assert_eq!(
         gamma.parent_keys(&projection.git.links, projection.relationship_notes()),
         vec![a_id.to_string()]
+    );
+}
+
+#[test]
+fn produced_commit_endpoints_survive_inclusive_kind_filtering() {
+    let before = msg_op(1, 1, 1_000, None, "before");
+    let producer = Op {
+        id: OpId::new(NodeId(1), 0, 2),
+        parents: ParentSet::One(before.id),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(2_000),
+        scope: ScopeRef::None,
+        tags: Tags::AGENT | Tags::TOOL,
+        kind: OpKind::Tool(editchain_core::ToolOp {
+            tool_call_id: Payload::Inline(b"commit-call".to_vec()),
+            tool_name: Payload::Inline(b"Bash".to_vec()),
+            stage: editchain_core::ToolStage::Finish,
+            content: Payload::Empty,
+        }),
+    };
+    let after = msg_op(1, 3, 3_000, Some(producer.id), "after");
+    let commit = git_commit(9, 2);
+    let link = Op {
+        id: OpId::new(NodeId(9), 0, 1),
+        parents: ParentSet::One(producer.id),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(2_000),
+        scope: ScopeRef::None,
+        tags: Tags::IMPORT | Tags::META,
+        kind: OpKind::GitLink(GitLink {
+            source: producer.id,
+            target_repo: commit.repository,
+            target_oid: commit.oid,
+            kind: GitLinkKind::ProducedBy,
+        }),
+    };
+    let mut projection = HistoryProjection::from_ops(vec![before, producer.clone(), after, link]);
+    projection.merge_git_commits(vec![commit.clone()]);
+
+    let filter = ChainFilter::new(
+        String::new(),
+        String::new(),
+        "^message$".to_string(),
+        false,
+        true,
+        false,
+    );
+    let nodes = projection.filtered_nodes(&filter);
+    assert!(
+        nodes
+            .iter()
+            .any(|node| node.node_key() == producer.id.to_string()),
+        "the branch point must survive even though it is not a message"
+    );
+    let commit_node = nodes
+        .iter()
+        .find(|node| node.node_key() == commit.oid.to_hex())
+        .expect("produced commit survives as a structural endpoint");
+    assert_eq!(
+        commit_node.parent_keys(&projection.git.links, projection.relationship_notes()),
+        vec![producer.id.to_string()]
     );
 }
 

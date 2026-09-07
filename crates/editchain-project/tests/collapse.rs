@@ -275,6 +275,7 @@ fn collapse_author_derived_from_children_tags() {
         editchain_project::HistoryNode::EditOperation { .. }
         | editchain_project::HistoryNode::ExecuteBundle { .. }
         | editchain_project::HistoryNode::PlanBundle { .. }
+        | editchain_project::HistoryNode::WorkGroup { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     };
     assert_eq!(author, "human");
@@ -295,6 +296,7 @@ fn collapse_author_prefers_human_over_agent() {
         editchain_project::HistoryNode::EditOperation { .. }
         | editchain_project::HistoryNode::ExecuteBundle { .. }
         | editchain_project::HistoryNode::PlanBundle { .. }
+        | editchain_project::HistoryNode::WorkGroup { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     };
     assert_eq!(author, "human");
@@ -344,6 +346,7 @@ fn meta_imports_bundle_along_exact_parent_chain() {
         editchain_project::HistoryNode::EditOperation { .. }
         | editchain_project::HistoryNode::ExecuteBundle { .. }
         | editchain_project::HistoryNode::PlanBundle { .. }
+        | editchain_project::HistoryNode::WorkGroup { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     }
 }
@@ -453,6 +456,70 @@ fn metadata_bundle_follows_provider_parent_across_structural_row() {
     assert_eq!(
         projection.lifted_parent_keys(boundary_row),
         vec![turn.id.to_string()]
+    );
+    assert_eq!(projection.independent_chains(), 1);
+}
+
+#[test]
+fn provider_occurrence_without_parent_keeps_physical_session_continuity() {
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let root = import_op(1, 1);
+    let mut snapshot = meta_import_op(1, 2);
+    snapshot.parents = ParentSet::One(root.id);
+    let mut caveat = meta_import_op(1, 3);
+    caveat.parents = ParentSet::One(snapshot.id);
+    let mut ide = import_op(1, 4);
+    ide.parents = ParentSet::One(caveat.id);
+
+    let root_entity = OpId::new(NodeId(90), 4, 1);
+    let caveat_entity = OpId::new(NodeId(90), 4, 2);
+    let ide_entity = OpId::new(NodeId(90), 4, 3);
+    let projection = HistoryProjection::from_ops_with(
+        vec![
+            root.clone(),
+            snapshot.clone(),
+            caveat.clone(),
+            ide.clone(),
+            relation_fact(301, root.id, root_entity, NoteRelationship::OccurrenceOf),
+            relation_fact(
+                302,
+                caveat.id,
+                caveat_entity,
+                NoteRelationship::OccurrenceOf,
+            ),
+            // `caveat` intentionally has no ProviderParent, matching Claude's
+            // root-like local-command metadata envelope.
+            relation_fact(303, ide.id, ide_entity, NoteRelationship::OccurrenceOf),
+            relation_fact(304, ide.id, caveat_entity, NoteRelationship::ProviderParent),
+        ],
+        opts,
+    );
+
+    let nodes = projection.nodes();
+    assert_eq!(nodes.len(), 2);
+    let root_row = nodes
+        .iter()
+        .find(|node| node.node_key() == root.id.to_string())
+        .unwrap();
+    assert_eq!(
+        root_row
+            .sub_ops()
+            .iter()
+            .map(|op| op.id)
+            .collect::<Vec<_>>(),
+        vec![snapshot.id, caveat.id],
+        "root-like provider metadata follows its physical predecessor"
+    );
+    let ide_row = nodes
+        .iter()
+        .find(|node| node.node_key() == ide.id.to_string())
+        .unwrap();
+    assert_eq!(
+        projection.lifted_parent_keys(ide_row),
+        vec![root.id.to_string()],
+        "the next provider event resolves through the bundled caveat"
     );
     assert_eq!(projection.independent_chains(), 1);
 }
@@ -747,6 +814,7 @@ fn meta_bundle_keeps_parents_unchanged() {
         editchain_project::HistoryNode::EditOperation { .. }
         | editchain_project::HistoryNode::ExecuteBundle { .. }
         | editchain_project::HistoryNode::PlanBundle { .. }
+        | editchain_project::HistoryNode::WorkGroup { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     }
 
@@ -767,7 +835,7 @@ fn meta_bundle_keeps_parents_unchanged() {
 }
 
 #[test]
-fn bundled_meta_graph_git_link_is_inherited_by_visible_anchor() {
+fn produced_commit_link_branches_from_folded_source_without_rewriting_agent_chain() {
     let opts = editchain_project::ProjectionOptions {
         bundle_metadata: true,
     };
@@ -775,31 +843,84 @@ fn bundled_meta_graph_git_link_is_inherited_by_visible_anchor() {
     let msg = message_op(1, 2, turn.id, "hello world");
     let mut meta = meta_import_op(1, 3);
     meta.parents = ParentSet::One(turn.id);
-    let projection = HistoryProjection::from_ops_with(vec![turn.clone(), msg, meta.clone()], opts);
-    let node = projection
-        .nodes()
-        .into_iter()
+    let mut continuation = import_op(1, 4);
+    continuation.parents = ParentSet::One(meta.id);
+    let commit = git_commit(7, 5);
+    let link_record = Op {
+        id: OpId::new(NodeId(99), 0, 1),
+        parents: ParentSet::One(meta.id),
+        actor: ActorId(1),
+        clock: Clock::None,
+        scope: meta.scope,
+        tags: Tags::IMPORT | Tags::META,
+        kind: OpKind::GitLink(GitLink {
+            source: meta.id,
+            target_repo: commit.repository,
+            target_oid: commit.oid,
+            kind: GitLinkKind::ProducedBy,
+        }),
+    };
+    let mut projection = HistoryProjection::from_ops_with(
+        vec![
+            turn.clone(),
+            msg,
+            meta.clone(),
+            continuation.clone(),
+            link_record,
+        ],
+        opts,
+    );
+    projection.merge_git_commits(vec![commit.clone()]);
+
+    let nodes = projection.nodes();
+    let source = nodes
+        .iter()
         .find(|node| node.node_key() == turn.id.to_string())
         .unwrap();
+    let continued = nodes
+        .iter()
+        .find(|node| node.node_key() == continuation.id.to_string())
+        .unwrap();
+    let committed = nodes
+        .iter()
+        .find(|node| node.node_key() == commit.oid.to_hex())
+        .unwrap();
 
-    let mut bytes = [0u8; 32];
-    bytes[0] = 7;
-    let target_oid = GitOid::new(GitObjectFormat::Sha1, bytes);
-    let mut links = std::collections::BTreeMap::new();
-    drop(links.insert(
-        meta.id,
-        vec![GitLink {
-            source: meta.id,
-            target_repo: RepositoryId(1),
-            target_oid,
-            kind: GitLinkKind::ProducedBy,
-        }],
-    ));
-
+    assert!(
+        !projection
+            .lifted_parent_keys(source)
+            .contains(&commit.oid.to_hex()),
+        "ProducedBy is not a BasedOn edge from the command back to its result"
+    );
     assert_eq!(
-        node.parent_keys(&links, &std::collections::HashMap::new()),
-        vec![target_oid.to_hex()],
-        "an explicit Git edge sourced from folded metadata must remain on its visible turn"
+        projection.lifted_parent_keys(continued),
+        vec![turn.id.to_string()],
+        "the agent continuation remains attached to the producing row"
+    );
+    assert_eq!(
+        projection.lifted_parent_keys(committed),
+        vec![turn.id.to_string()],
+        "the commit becomes a second child of the producing row"
+    );
+    assert_eq!(
+        projection.parent_relations_for(committed, &[turn.id.to_string()]),
+        vec![editchain_project::ParentRelation {
+            parent: turn.id.to_string(),
+            kind: editchain_project::RelationKind::ProducedCommit,
+        }]
+    );
+    let structural = projection.structural_row_keys(&nodes);
+    assert!(structural.contains(&turn.id.to_string()));
+    assert!(structural.contains(&commit.oid.to_hex()));
+
+    let raw_commit_parents =
+        committed.parent_keys(&projection.git.links, projection.relationship_notes());
+    assert_eq!(raw_commit_parents, vec![meta.id.to_string()]);
+    let raw_source_parents =
+        source.parent_keys(&projection.git.links, projection.relationship_notes());
+    assert!(
+        !raw_source_parents.contains(&commit.oid.to_hex()),
+        "the source operation never treats its produced commit as an ancestor"
     );
 }
 
@@ -838,6 +959,200 @@ fn bundled_meta_based_on_link_is_inherited_by_visible_anchor() {
         vec![target_oid.to_hex()],
         "an exact session-start BasedOn relation must remain on its visible turn"
     );
+}
+
+#[test]
+fn bundled_spawned_meta_does_not_leak_its_git_parent_onto_the_visible_anchor() {
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let turn = import_op(1, 1);
+    let msg = message_op(1, 2, turn.id, "parent spawn tool");
+    let mut child_meta = meta_import_op(2, 1);
+    child_meta.parents = ParentSet::One(turn.id);
+    let projection =
+        HistoryProjection::from_ops_with(vec![turn.clone(), msg, child_meta.clone()], opts);
+    let node = projection
+        .nodes()
+        .into_iter()
+        .find(|node| node.node_key() == turn.id.to_string())
+        .unwrap();
+
+    let commit = git_commit(8, 0);
+    let mut links = std::collections::BTreeMap::new();
+    drop(links.insert(
+        child_meta.id,
+        vec![GitLink {
+            source: child_meta.id,
+            target_repo: commit.repository,
+            target_oid: commit.oid,
+            kind: GitLinkKind::BasedOn,
+        }],
+    ));
+    let mut notes = std::collections::HashMap::new();
+    // Canonical relationship indexes are keyed by the visible row that owns
+    // folded metadata; the fact retains `child_meta.id` as its stored anchor.
+    drop(notes.insert(
+        turn.id,
+        vec![relation_fact(
+            701,
+            child_meta.id,
+            turn.id,
+            NoteRelationship::SpawnedBy,
+        )],
+    ));
+
+    assert!(
+        !node
+            .parent_keys(&links, &notes)
+            .contains(&commit.oid.to_hex()),
+        "a spawned child's bundled session metadata must not fan the parent row back to Git"
+    );
+}
+
+#[test]
+fn bundled_structural_metadata_keeps_relation_on_first_visible_child() {
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let spawn = import_op(1, 1);
+    let spawn_tool = tool_op(1, 2, spawn.id, "spawnAgent");
+    let child_meta = meta_import_op(2, 1);
+    let mut child_start = import_op(2, 2);
+    child_start.parents = ParentSet::One(child_meta.id);
+    let spawned_by = relation_fact(702, child_meta.id, spawn.id, NoteRelationship::SpawnedBy);
+    let projection = HistoryProjection::from_ops_with(
+        vec![
+            spawn.clone(),
+            spawn_tool,
+            child_meta.clone(),
+            child_start.clone(),
+            spawned_by,
+        ],
+        opts,
+    );
+    let nodes = projection.nodes();
+    assert_eq!(nodes.len(), 2, "session metadata remains bundled");
+
+    let spawn_row = nodes
+        .iter()
+        .find(|node| node.node_key() == spawn.id.to_string())
+        .expect("spawn row");
+    assert!(spawn_row.sub_ops().iter().any(|op| op.id == child_meta.id));
+
+    let child_row = nodes
+        .iter()
+        .find(|node| node.node_key() == child_start.id.to_string())
+        .expect("first visible child row");
+    let parents = projection.lifted_parent_keys(child_row);
+    assert_eq!(parents, vec![spawn.id.to_string()]);
+    assert_eq!(
+        projection.parent_relations_for(child_row, &parents),
+        vec![editchain_project::ParentRelation {
+            parent: spawn.id.to_string(),
+            kind: editchain_project::RelationKind::Subagent,
+        }],
+        "the bundled metadata anchor must not erase the subagent relation kind"
+    );
+
+    let canonical_notes = projection.relationship_notes();
+    assert!(canonical_notes.get(&spawn.id).is_some_and(|notes| {
+        notes.iter().any(|note| {
+            matches!(&note.kind, OpKind::Note(fact)
+                if fact.relationship == NoteRelationship::SpawnedBy)
+        })
+    }));
+    assert!(canonical_notes.get(&child_start.id).is_some_and(|notes| {
+        notes.iter().any(|note| {
+            matches!(&note.kind, OpKind::Note(fact)
+                if fact.relationship == NoteRelationship::SpawnedBy)
+        })
+    }));
+}
+
+#[test]
+fn bundled_structural_metadata_does_not_guess_between_visible_children() {
+    let opts = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let spawn = import_op(1, 1);
+    let child_meta = meta_import_op(2, 1);
+    let mut first = import_op(2, 2);
+    first.parents = ParentSet::One(child_meta.id);
+    let mut second = import_op(3, 2);
+    second.parents = ParentSet::One(child_meta.id);
+    let spawned_by = relation_fact(703, child_meta.id, spawn.id, NoteRelationship::SpawnedBy);
+    let projection = HistoryProjection::from_ops_with(
+        vec![spawn, child_meta, first.clone(), second.clone(), spawned_by],
+        opts,
+    );
+
+    for child in [first, second] {
+        let row = projection
+            .nodes()
+            .into_iter()
+            .find(|node| node.node_key() == child.id.to_string())
+            .expect("visible child row");
+        let parents = projection.lifted_parent_keys(&row);
+        assert!(
+            projection.parent_relations_for(&row, &parents).is_empty(),
+            "an ambiguous successor must not receive an inferred relation"
+        );
+    }
+}
+
+#[test]
+fn exact_spawn_parent_suppresses_only_the_inherited_git_graph_edge() {
+    let spawn = import_op(1, 1);
+    let child = import_op(2, 1);
+    let commit = git_commit(8, 0);
+    let git_link = Op {
+        id: OpId::new(NodeId(99), 0, 1),
+        parents: ParentSet::One(child.id),
+        actor: ActorId(0),
+        clock: Clock::None,
+        scope: child.scope,
+        tags: Tags::IMPORT | Tags::META,
+        kind: OpKind::GitLink(GitLink {
+            source: child.id,
+            target_repo: commit.repository,
+            target_oid: commit.oid,
+            kind: GitLinkKind::BasedOn,
+        }),
+    };
+    let spawned_by = relation_fact(700, child.id, spawn.id, NoteRelationship::SpawnedBy);
+    let mut projection =
+        HistoryProjection::from_ops(vec![spawn.clone(), child.clone(), git_link, spawned_by]);
+    projection.merge_git_commits(vec![commit.clone()]);
+
+    let child_row = projection
+        .nodes()
+        .into_iter()
+        .find(|node| node.node_key() == child.id.to_string())
+        .expect("child row");
+    assert!(projection.git.links.get(&child.id).is_some_and(|links| {
+        links.iter().any(|link| {
+            link.kind == GitLinkKind::BasedOn
+                && link.target_repo == commit.repository
+                && link.target_oid == commit.oid
+        })
+    }));
+    assert_eq!(
+        projection.lifted_parent_keys(&child_row),
+        vec![spawn.id.to_string()],
+        "the exact spawn is the child's sole display parent"
+    );
+
+    let nodes = projection.nodes();
+    let edges = projection
+        .layout_context(&nodes)
+        .edges_for_window(0, nodes.len());
+    assert!(edges
+        .iter()
+        .any(|edge| edge.child == child.id.to_string() && edge.parent == spawn.id.to_string()));
+    assert!(!edges
+        .iter()
+        .any(|edge| { edge.child == child.id.to_string() && edge.parent == commit.oid.to_hex() }));
 }
 
 #[test]
@@ -1335,6 +1650,7 @@ fn no_cross_chain_meta_bundling() {
         editchain_project::HistoryNode::EditOperation { .. }
         | editchain_project::HistoryNode::ExecuteBundle { .. }
         | editchain_project::HistoryNode::PlanBundle { .. }
+        | editchain_project::HistoryNode::WorkGroup { .. }
         | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
     }
 

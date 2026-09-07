@@ -3,15 +3,15 @@
 //! This is a faithful native port of the legacy JS controller's view-state
 //! logic: view/search generations, request correlation (including
 //! synchronous fixture-response reentrancy), the sparse window cache, virtual
-//! paging decisions (`PAGE=500`, `BUFFER=400`, `ROW_H=34`), profile
-//! switching, find/search sessions, expansion (sub-op reveal), persistence,
-//! and the DOM operation plans the webview shell executes.
+//! paging decisions (`PAGE=500`, `BUFFER=400`, `ROW_H=34`), find/search
+//! sessions, expansion (sub-op reveal), persistence, and the DOM operation
+//! plans the webview shell executes.
 //!
 //! The state machine is pure: it never touches the DOM or the VS Code API.
 //! Every transition produces a [`Step`] describing what to send to the host,
 //! what to render, and whether to persist state, so native tests can drive
-//! the exact production interactions (profile switches, scroll paging, find
-//! navigation, stale-response races) deterministically.
+//! the exact production interactions (scroll paging, find navigation,
+//! stale-response races) deterministically.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,38 +32,6 @@ pub(crate) const BUFFER: i64 = 400;
 pub(crate) const FIND_TOP_K: i64 = 50;
 /// Fixed submodule hiding for the current view (`FIXED_HIDE_SUBMODULES`).
 pub(crate) const FIXED_HIDE_SUBMODULES: bool = true;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Profile {
-    Activity,
-    Raw,
-}
-
-impl Profile {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Profile::Activity => "Activity",
-            Profile::Raw => "Raw",
-        }
-    }
-
-    pub(crate) fn hide_trace(self) -> bool {
-        self == Profile::Activity
-    }
-}
-
-/// How a profile switch is applied (mirrors the production `setProfile` opts:
-/// the user action resets coherently; open/reveal restores in memory only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProfileAction {
-    /// Coherent reset: bump the view generation, drop the cache/snapshot, and
-    /// refetch offset 0 under the new profile, persisting `{profile, topRow: 0}`
-    /// immediately.
-    Reset,
-    /// Restore path (open/reveal): apply the profile in memory only; the caller
-    /// persists the profile once the restored viewport is applied.
-    Restore,
-}
 
 /// Viewport measurements the renderer observes (CSS pixels).
 #[derive(Debug, Clone, Copy)]
@@ -231,21 +199,24 @@ pub(crate) struct HistoryAppState {
     pub(crate) search_epoch: u64,
     pub(crate) current_search_epoch: Option<u64>,
     // --- view state -------------------------------------------------------
-    pub(crate) profile: Profile,
     /// Authoritative total; `None` = unknown (fresh view / after a reset).
     pub(crate) total: Option<i64>,
     pub(crate) cache: BTreeMap<i64, Value>,
     pub(crate) total_fetched: u64,
     pub(crate) max_lane: u32,
     pub(crate) open_warnings: Vec<String>,
-    /// Persisted webview state from `vscode.getState()` (profile/topRow).
+    /// Persisted webview state from `vscode.getState()` (`topRow` only).
     pub(crate) persisted: Option<Value>,
     // --- expansion snapshot -----------------------------------------------
     pub(crate) session_flags: SessionFlags,
     pub(crate) sub_op_counts: Vec<u32>,
     pub(crate) block_starts: Vec<i64>,
-    pub(crate) prefix_contrib: Vec<i64>,
-    pub(crate) expanded_blocks: BTreeSet<usize>,
+    /// Absolute expanded-row index to contiguous descendant count.
+    pub(crate) expansion_spans: BTreeMap<i64, u32>,
+    /// Absolute expandable rows whose direct children are currently visible.
+    pub(crate) expanded_rows: BTreeSet<i64>,
+    /// Visible-index to absolute-index map after applying nested disclosure.
+    pub(crate) visible_abs: Vec<i64>,
     // --- render window (visible indices) ----------------------------------
     pub(crate) render_top: i64,
     pub(crate) render_bottom: i64,
@@ -277,7 +248,6 @@ impl Default for HistoryAppState {
             session_flags: SessionFlags::default(),
             search_epoch: 0,
             current_search_epoch: None,
-            profile: Profile::Activity,
             total: None,
             cache: BTreeMap::new(),
             total_fetched: 0,
@@ -286,8 +256,9 @@ impl Default for HistoryAppState {
             persisted: None,
             sub_op_counts: Vec::new(),
             block_starts: Vec::new(),
-            prefix_contrib: Vec::new(),
-            expanded_blocks: BTreeSet::new(),
+            expansion_spans: BTreeMap::new(),
+            expanded_rows: BTreeSet::new(),
+            visible_abs: Vec::new(),
             render_top: 0,
             render_bottom: -1,
             selected_key: None,
@@ -309,14 +280,14 @@ impl Default for HistoryAppState {
 impl HistoryAppState {
     // --- filter payloads -----------------------------------------------------
 
-    pub(crate) fn filter_payload(&self) -> ChainFilter {
+    pub(crate) fn filter_payload() -> ChainFilter {
         ChainFilter {
             summary_pattern: String::new(),
             kind_pattern: String::new(),
             include_kind_pattern: String::new(),
-            hide_undated: false,
+            hide_undated: true,
             splice: true,
-            hide_trace: self.profile.hide_trace(),
+            hide_trace: true,
         }
     }
 
@@ -324,7 +295,15 @@ impl HistoryAppState {
         FIXED_HIDE_SUBMODULES
     }
 
-    // --- expansion mapping (prefix-sum helpers) ------------------------------
+    // --- expansion mapping ---------------------------------------------------
+
+    fn clear_expansion_state(&mut self) {
+        self.sub_op_counts.clear();
+        self.block_starts.clear();
+        self.expansion_spans.clear();
+        self.expanded_rows.clear();
+        self.visible_abs.clear();
+    }
 
     pub(crate) fn recompute_expansion(&mut self) {
         let n = self.sub_op_counts.len();
@@ -335,128 +314,92 @@ impl HistoryAppState {
             acc = acc.saturating_add(1).saturating_add(i64::from(*count));
         }
         self.block_starts = starts;
-        let mut contrib = Vec::with_capacity(n);
-        let mut pacc: i64 = 0;
-        for (index, count) in self.sub_op_counts.iter().enumerate() {
-            contrib.push(pacc);
-            pacc = pacc.saturating_add(if self.expanded_blocks.contains(&index) {
-                0
-            } else {
-                i64::from(*count)
-            });
-        }
-        self.prefix_contrib = contrib;
-    }
 
-    /// Hidden slots strictly before any slot inside block `b`.
-    pub(crate) fn hidden_before_block(&self, b: usize) -> i64 {
-        self.prefix_contrib.get(b).copied().unwrap_or(0)
+        // Older services expose only one-level top-level counts. Derive the
+        // equivalent generalized spans so the same walker handles both wire
+        // versions. A current service supplies explicit spans, including inner
+        // bundle rows nested under a work group.
+        if self.expansion_spans.is_empty() {
+            for (index, count) in self.sub_op_counts.iter().copied().enumerate() {
+                if count > 0 {
+                    if let Some(start) = self.block_starts.get(index).copied() {
+                        let _: Option<u32> = self.expansion_spans.insert(start, count);
+                    }
+                }
+            }
+        }
+        self.expanded_rows
+            .retain(|row| self.expansion_spans.contains_key(row));
+
+        self.visible_abs.clear();
+        let expansion_index_ready = self.session_flags.snapshot_established
+            || !self.sub_op_counts.is_empty()
+            || !self.expansion_spans.is_empty();
+        if !expansion_index_ready {
+            return;
+        }
+        let total = self.total.unwrap_or(0).max(0);
+        let mut abs = 0i64;
+        while abs < total {
+            self.visible_abs.push(abs);
+            if let Some(descendants) = self.expansion_spans.get(&abs).copied() {
+                if !self.expanded_rows.contains(&abs) {
+                    abs = abs.saturating_add(1).saturating_add(i64::from(descendants));
+                    continue;
+                }
+            }
+            abs = abs.saturating_add(1);
+        }
     }
 
     /// Total number of visible rows given the current reveal state.
     pub(crate) fn visible_total(&self) -> i64 {
-        let mut hidden: i64 = 0;
-        for (index, count) in self.sub_op_counts.iter().enumerate() {
-            if !self.expanded_blocks.contains(&index) {
-                hidden = hidden.saturating_add(i64::from(*count));
-            }
+        if self.session_flags.snapshot_established
+            || !self.sub_op_counts.is_empty()
+            || !self.expansion_spans.is_empty()
+        {
+            return i64::try_from(self.visible_abs.len())
+                .unwrap_or(i64::MAX)
+                .max(1);
         }
-        self.total.unwrap_or(0).saturating_sub(hidden).max(1)
+        self.total.unwrap_or(0).max(1)
     }
 
     /// Map a visible index back to its absolute slot index (or `None` for a
     /// hidden collapsed sub-op slot). Identity before the snapshot arrives.
     pub(crate) fn abs_index_for_visible(&self, vis: i64) -> Option<i64> {
-        if self.block_starts.is_empty() {
-            return Some(vis.max(0));
-        }
         if vis < 0 {
             return None;
         }
-        let mut lo = 0usize;
-        let mut hi = self.block_starts.len();
-        while lo < hi {
-            let mid = lo.saturating_add(hi) >> 1;
-            let v_start_mid = self
-                .block_starts
-                .get(mid)
-                .copied()
-                .unwrap_or(0)
-                .saturating_sub(self.hidden_before_block(mid));
-            if v_start_mid <= vis {
-                lo = lo.saturating_add(1);
-            } else {
-                hi = mid;
-            }
+        if self.session_flags.snapshot_established
+            || !self.sub_op_counts.is_empty()
+            || !self.expansion_spans.is_empty()
+        {
+            return usize::try_from(vis)
+                .ok()
+                .and_then(|index| self.visible_abs.get(index).copied());
         }
-        if lo == 0 {
-            return None;
-        }
-        let b = lo.saturating_sub(1);
-        if b >= self.block_starts.len() {
-            return None;
-        }
-        let v_start_b = self
-            .block_starts
-            .get(b)
-            .copied()
-            .unwrap_or(0)
-            .saturating_sub(self.hidden_before_block(b));
-        let off_in_block_vis = vis.saturating_sub(v_start_b);
-        let count_b = self.sub_op_counts.get(b).copied().unwrap_or(0);
-        if !self.expanded_blocks.contains(&b) {
-            return (off_in_block_vis == 0).then(|| self.block_starts.get(b).copied().unwrap_or(0));
-        }
-        if off_in_block_vis > i64::from(count_b) {
-            return None;
-        }
-        Some(
-            self.block_starts
-                .get(b)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(off_in_block_vis),
-        )
+        Some(vis)
     }
 
     /// Map an absolute slot index back to its visible index (inverse of
     /// `abs_index_for_visible`); `None` for a hidden collapsed sub-op slot.
     pub(crate) fn visible_index_for_abs(&self, abs: i64) -> Option<i64> {
-        if self.block_starts.is_empty() {
-            return Some(abs);
+        if self.session_flags.snapshot_established
+            || !self.sub_op_counts.is_empty()
+            || !self.expansion_spans.is_empty()
+        {
+            return self
+                .visible_abs
+                .binary_search(&abs)
+                .ok()
+                .and_then(|index| i64::try_from(index).ok());
         }
-        let mut lo = 0usize;
-        let mut hi = self.block_starts.len();
-        while lo < hi {
-            let mid = lo.saturating_add(hi) >> 1;
-            if self.block_starts.get(mid).copied().unwrap_or(0) <= abs {
-                lo = lo.saturating_add(1);
-            } else {
-                hi = mid;
-            }
-        }
-        if lo == 0 {
-            return Some(abs);
-        }
-        let b = lo.saturating_sub(1);
-        if b >= self.block_starts.len() {
-            return Some(abs);
-        }
-        let off_in_block = abs.saturating_sub(self.block_starts.get(b).copied().unwrap_or(0));
-        if off_in_block > 0 && !self.expanded_blocks.contains(&b) {
-            return None; // hidden sub-op slot
-        }
-        Some(
-            self.block_starts
-                .get(b)
-                .copied()
-                .unwrap_or(0)
-                .saturating_sub(self.hidden_before_block(b))
-                .saturating_add(off_in_block),
-        )
+        Some(abs)
     }
 
     /// Index of the top-level node whose block starts at `abs_parent_row`.
+    #[cfg(test)]
     pub(crate) fn block_index_of_abs(&self, abs_parent_row: i64) -> Option<usize> {
         let mut lo = 0usize;
         let mut hi = self.block_starts.len();
@@ -481,23 +424,19 @@ impl HistoryAppState {
         }
     }
 
-    /// Toggle expansion of a top-level node by absolute parent-row index.
+    /// Toggle any expandable row by absolute expanded-history index.
     pub(crate) fn toggle_expanded(&mut self, abs_parent_row: i64) -> bool {
-        let Some(b) = self.block_index_of_abs(abs_parent_row) else {
-            return false;
-        };
-        let count = self.sub_op_counts.get(b).copied().unwrap_or(0);
-        if count == 0 {
+        if !self.expansion_spans.contains_key(&abs_parent_row) {
             return false;
         }
-        if !self.expanded_blocks.remove(&b) {
-            let _: bool = self.expanded_blocks.insert(b);
+        if !self.expanded_rows.remove(&abs_parent_row) {
+            let _: bool = self.expanded_rows.insert(abs_parent_row);
         }
         self.recompute_expansion();
         true
     }
 
-    /// `toggleExpandFor` — toggle a top-level row's reveal state and plan the
+    /// `toggleExpandFor` — toggle a row's reveal state and plan the
     /// full desired-window rebuild (`reanchorTo(desiredVisibleRange())` plus
     /// `ensureFilled()`), so every newly revealed sub-op slot fills the
     /// viewport instead of only the pre-expansion slice.
@@ -511,6 +450,11 @@ impl HistoryAppState {
             return;
         }
         let (top, bottom) = self.desired_visible_range(viewport);
+        // Reanchor replaces the DOM with exactly this visible range. Keep the
+        // reducer's rendered-window bounds in lockstep so the next sync does
+        // not append the newly exposed bottom row a second time.
+        self.render_top = top;
+        self.render_bottom = bottom;
         step.ops.push(DomOp::Reanchor { top, bottom });
         self.fetch_window(viewport, step);
     }
@@ -627,7 +571,7 @@ impl HistoryAppState {
         let body = get_window(
             start,
             limit,
-            &self.filter_payload(),
+            &Self::filter_payload(),
             self.session_flags.layout_ready,
         );
         let _: u64 = self.issue_request(body, true, None, step);
@@ -660,7 +604,7 @@ impl HistoryAppState {
         let body = get_window(
             start,
             limit,
-            &self.filter_payload(),
+            &Self::filter_payload(),
             self.session_flags.layout_ready,
         );
         let _: u64 = self.issue_request(body, true, None, step);
@@ -838,33 +782,22 @@ impl HistoryAppState {
 
     // --- persistence -----------------------------------------------------------
 
-    /// `saveState` — persist only safe profile + visible top row index.
-    pub(crate) fn persisted_state(&self, viewport: &Viewport) -> Value {
+    /// `saveState` — persist only the safe visible top-row index.
+    pub(crate) fn persisted_state(viewport: &Viewport) -> Value {
         json!({
-            "profile": match self.profile {
-                Profile::Activity => "activity",
-                Profile::Raw => "raw",
-            },
             "topRow": Self::viewport_visible_top(viewport),
         })
     }
 
-    /// `restoreState` — read `{ topRow, profile }` from persisted state.
-    pub(crate) fn restore_state(&self) -> (i64, Profile) {
-        let persisted = self.persisted.as_ref();
-        let top_row = persisted
+    /// `restoreState` — read `topRow` while intentionally ignoring legacy
+    /// persisted profile values. The shipped extension is always Activity.
+    pub(crate) fn restore_state(&self) -> i64 {
+        self.persisted
+            .as_ref()
             .and_then(|v| v.get("topRow"))
             .and_then(Value::as_i64)
             .filter(|n| *n > 0)
-            .unwrap_or(-1);
-        let profile = match persisted
-            .and_then(|v| v.get("profile"))
-            .and_then(Value::as_str)
-        {
-            Some("raw") => Profile::Raw,
-            _ => Profile::Activity,
-        };
-        (top_row, profile)
+            .unwrap_or(-1)
     }
 
     // --- find counter / nav ------------------------------------------------------
@@ -926,10 +859,17 @@ impl HistoryAppState {
         self.current_search_epoch
     }
 
-    /// Whether the top-level block at `block_index` is expanded (sub-ops
-    /// revealed). Collapsed blocks hide their sub-op slots from `visible_total`.
+    /// Whether the top-level block at `block_index` is expanded.
+    #[cfg(test)]
     pub(crate) fn is_block_expanded(&self, block_index: usize) -> bool {
-        self.expanded_blocks.contains(&block_index)
+        self.block_starts
+            .get(block_index)
+            .is_some_and(|row| self.expanded_rows.contains(row))
+    }
+
+    /// Whether an arbitrary expandable row is expanded.
+    pub(crate) fn is_row_expanded(&self, abs: i64) -> bool {
+        self.expanded_rows.contains(&abs)
     }
 
     // --- selection / roving focus --------------------------------------------------
@@ -976,9 +916,7 @@ impl HistoryAppState {
         let find_current = self
             .current_find_match()
             .is_some_and(|found| found.row == abs_index);
-        let expanded = self
-            .block_index_of_abs(abs_index)
-            .is_some_and(|block| self.expanded_blocks.contains(&block));
+        let expanded = self.is_row_expanded(abs_index);
         super::rows::RowContext {
             view,
             abs_index,
@@ -1049,7 +987,7 @@ impl HistoryAppState {
         let body = find_in_history(
             query,
             FIND_TOP_K,
-            &self.filter_payload(),
+            &Self::filter_payload(),
             Self::hide_submodules(),
         );
         let _: u64 = self.issue_request(body, false, Some(epoch), step);
@@ -1318,8 +1256,7 @@ impl HistoryAppState {
             .enumerate()
             .map(|(i, hit)| Self::normalize_search_hit(hit, i64::try_from(i).unwrap_or(0)))
             .collect();
-        self.sub_op_counts.clear();
-        self.expanded_blocks.clear();
+        self.clear_expansion_state();
         self.recompute_expansion();
         self.cache.clear();
         self.total_fetched = 0;
@@ -1369,7 +1306,7 @@ impl HistoryAppState {
         self.view_gen = self.view_gen.saturating_add(1);
         self.session_flags.snapshot_established = false;
         self.session_flags.layout_ready = false;
-        self.sub_op_counts.clear();
+        self.clear_expansion_state();
         self.recompute_expansion();
         self.pending_window_req_id = None;
         self.cache.clear();
@@ -1382,38 +1319,6 @@ impl HistoryAppState {
         self.view_flags.data_ready = false;
         Self::show_view_message(step, "Loading history…", false);
         self.fetch_window(viewport, step);
-    }
-
-    // --- profile -----------------------------------------------------------------
-
-    /// `setProfile` — switch the Activity/Raw profile. `reset` mirrors the user
-    /// action (coherent reset + persist `{profile, topRow:0}`); `persist:false`
-    /// mirrors the restore path used on open/reveal before the first fetch.
-    pub(crate) fn set_profile(
-        &mut self,
-        next: Profile,
-        action: ProfileAction,
-        viewport: &Viewport,
-        step: &mut Step,
-    ) {
-        if self.profile == next && action != ProfileAction::Reset {
-            return;
-        }
-        self.profile = next;
-        match action {
-            ProfileAction::Reset => {
-                step.sends.push(Send::StatusText(format!(
-                    "Showing {} history",
-                    self.profile.label()
-                )));
-                step.save_state = Some(json!({
-                    "profile": match self.profile { Profile::Activity => "activity", Profile::Raw => "raw" },
-                    "topRow": 0,
-                }));
-                self.reset_history(viewport, step);
-            }
-            ProfileAction::Restore => {}
-        }
     }
 
     // --- open warnings ----------------------------------------------------------
@@ -1544,7 +1449,7 @@ impl HistoryAppState {
                 self.session_flags.layout_ready = false;
                 self.current_search_epoch = None;
                 self.session_flags.snapshot_established = false;
-                self.sub_op_counts.clear();
+                self.clear_expansion_state();
                 self.recompute_expansion();
                 self.open_warnings = Self::collect_open_warnings(&value);
                 if !self.open_warnings.is_empty() {
@@ -1567,10 +1472,7 @@ impl HistoryAppState {
                     Self::show_view_message(step, "No history found in this workspace", false);
                     return;
                 }
-                let (top_row, restored_profile) = self.restore_state();
-                // Apply the persisted profile BEFORE the first fetch so the
-                // offset-0 window carries the right hide_trace flag.
-                self.set_profile(restored_profile, ProfileAction::Restore, viewport, step);
+                let top_row = self.restore_state();
                 self.fetch_window(viewport, step);
                 let (want_top, want_bottom) = self.desired_visible_range(viewport);
                 self.render_top = want_top;
@@ -1587,7 +1489,7 @@ impl HistoryAppState {
                 }
                 // Persist the actually-restored viewport (the ONLY open-path
                 // save; any earlier save would write scrollTop 0).
-                step.save_state = Some(self.persisted_state(viewport));
+                step.save_state = Some(Self::persisted_state(viewport));
                 step.ops.push(DomOp::ProgressiveLoader(true));
                 self.report_status(viewport, step);
             }
@@ -1609,11 +1511,10 @@ impl HistoryAppState {
     }
 
     fn handle_reveal(&mut self, viewport: &Viewport, step: &mut Step) {
-        let (top_row, restored_profile) = self.restore_state();
-        self.set_profile(restored_profile, ProfileAction::Restore, viewport, step);
+        let top_row = self.restore_state();
         self.view_gen = self.view_gen.saturating_add(1);
         self.session_flags.snapshot_established = false;
-        self.sub_op_counts.clear();
+        self.clear_expansion_state();
         self.recompute_expansion();
         step.sends.push(Send::Log(format!(
             "reveal: topRow={top_row} total={}",
@@ -1635,7 +1536,7 @@ impl HistoryAppState {
         } else {
             step.ops.push(DomOp::SetScrollTop(0));
         }
-        step.save_state = Some(self.persisted_state(viewport));
+        step.save_state = Some(Self::persisted_state(viewport));
         step.ops.push(DomOp::ProgressiveLoader(true));
     }
 
@@ -1751,13 +1652,30 @@ impl HistoryAppState {
                 }
             }
         }
-        // Snapshot ships only with the offset-0 window. Rebuild the prefix
-        // sums and re-anchor (the identity-mapped first paint is now stale).
+        // Expansion indices ship only with the offset-0 window. Rebuild the
+        // depth-first visibility map and re-anchor (the identity-mapped first
+        // paint is now stale). `sub_op_counts` remains the compatibility path
+        // for one-level services; current services also send nested spans.
         if let Some(counts) = value.get("sub_op_counts").and_then(Value::as_array) {
             self.sub_op_counts = counts
                 .iter()
                 .map(|c| c.as_i64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0))
                 .collect();
+            self.expansion_spans.clear();
+            if let Some(spans) = value.get("expansion_spans").and_then(Value::as_array) {
+                for span in spans {
+                    let row = span.get("row").and_then(Value::as_i64);
+                    let descendants = span
+                        .get("descendant_count")
+                        .and_then(Value::as_i64)
+                        .and_then(|count| u32::try_from(count).ok());
+                    if let (Some(row), Some(descendants)) = (row, descendants) {
+                        if row >= 0 && descendants > 0 {
+                            let _: Option<u32> = self.expansion_spans.insert(row, descendants);
+                        }
+                    }
+                }
+            }
             self.session_flags.snapshot_established = true;
             self.recompute_expansion();
             step.ops.push(DomOp::Reanchor {
@@ -1826,7 +1744,7 @@ impl HistoryAppState {
             self.total_fetched
         )));
         self.report_status(viewport, step);
-        step.save_state = Some(self.persisted_state(viewport));
+        step.save_state = Some(Self::persisted_state(viewport));
         if !response_layout_ready {
             let include_layout = req_body
                 .get("GetWindow")
@@ -1879,7 +1797,7 @@ impl HistoryAppState {
             hide_undated: filter
                 .and_then(|f| f.get("hide_undated"))
                 .and_then(Value::as_bool)
-                .unwrap_or(false),
+                .unwrap_or(true),
             splice: filter
                 .and_then(|f| f.get("splice"))
                 .and_then(Value::as_bool)
@@ -1986,7 +1904,6 @@ mod tests {
         state.handle_host_message(open_msg(1200), &vp(), &mut step);
 
         assert_eq!(state.total, Some(1200));
-        assert_eq!(state.profile, Profile::Activity);
         assert!(!state.view_flags.data_ready);
         // The scaffold is re-anchored immediately (placeholders fill in later):
         // visible bottom (row 23 at 800px / ROW_H 34) + BUFFER 400 = 423,
@@ -1996,13 +1913,20 @@ mod tests {
         // First fetch under the pre-layout view: offset 0, limited to the
         // desired cache range (visible bottom 23 + BUFFER 400 = 423 rows, so
         // limit 424 under a clientHeight of 800), with the Activity
-        // hide_trace flag and layout disabled.
+        // hide_trace + hide_undated flags and layout disabled.
         assert_eq!(state.request_log.len(), 1);
         let window = last_get_window(&state);
         assert_eq!(window["offset"], 0);
         assert_eq!(window["limit"], 424);
         assert_eq!(window["include_layout"], false);
         assert_eq!(window["hide_submodules"], true);
+        assert_eq!(
+            window
+                .get("filter")
+                .and_then(|f| f.get("hide_undated"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
         assert_eq!(
             window
                 .get("filter")
@@ -2036,10 +1960,7 @@ mod tests {
             .any(|op| matches!(op, DomOp::ProgressiveLoader(true))));
         // The open-path save persists the actually-restored viewport.
         let saved = step.save_state.expect("open persists state");
-        assert_eq!(
-            saved.get("profile").and_then(Value::as_str),
-            Some("activity")
-        );
+        assert!(saved.get("profile").is_none());
         assert_eq!(saved.get("topRow").and_then(Value::as_i64), Some(0));
     }
 
@@ -2598,10 +2519,14 @@ mod tests {
     }
 
     #[test]
-    fn profile_switch_resets_coherently_and_flips_hide_trace() {
-        let mut state = HistoryAppState::default();
+    fn activity_filter_is_fixed_and_legacy_raw_state_cannot_restore_it() {
+        let mut state = HistoryAppState {
+            persisted: Some(json!({ "topRow": 12, "profile": "raw" })),
+            ..HistoryAppState::default()
+        };
         let mut step = Step::new();
         state.handle_host_message(open_msg(500), &vp(), &mut step);
+        assert_eq!(state.restore_state(), 12);
         assert_eq!(
             last_get_window(&state)
                 .get("filter")
@@ -2609,60 +2534,32 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(true)
         );
-        let gen_activity = state.view_gen;
-
-        let mut step2 = Step::new();
-        state.set_profile(Profile::Raw, ProfileAction::Reset, &vp(), &mut step2);
-        assert_eq!(state.profile, Profile::Raw);
         assert_eq!(
             last_get_window(&state)
                 .get("filter")
-                .and_then(|f| f.get("hide_trace"))
-                .and_then(Value::as_bool),
-            Some(false)
-        );
-        // total resets to unknown so the fresh view re-requests offset 0 under
-        // the new profile; the view generation bumps so stale windows drop.
-        assert_eq!(state.total, None);
-        assert_eq!(state.view_gen, gen_activity + 1);
-        assert!(state.cache.is_empty(), "the old profile's cache is dropped");
-        // main.js `resetHistory` keeps stale in-flight entries correlated (a
-        // late response is rejected by the view-generation check) and issues a
-        // fresh offset-0 window, so the table holds both requests.
-        assert_eq!(
-            state.in_flight.len(),
-            2,
-            "stale window + fresh window stay correlated"
-        );
-        let saved = step2
-            .save_state
-            .expect("profile switch persists immediately");
-        assert_eq!(saved.get("profile").and_then(Value::as_str), Some("raw"));
-        assert_eq!(saved.get("topRow").and_then(Value::as_i64), Some(0));
-        assert!(
-            state.request_log.len() > 1,
-            "reset re-issues the first window"
-        );
-        assert_eq!(
-            state
-                .request_log
-                .first()
-                .and_then(|r| r.body.get("GetWindow"))
-                .and_then(|w| w.get("filter"))
-                .and_then(|f| f.get("hide_trace"))
-                .and_then(Value::as_bool),
-            Some(true)
-        );
-
-        let mut step3 = Step::new();
-        state.set_profile(Profile::Activity, ProfileAction::Reset, &vp(), &mut step3);
-        assert_eq!(
-            last_get_window(&state)
-                .get("filter")
-                .and_then(|f| f.get("hide_trace"))
+                .and_then(|f| f.get("hide_undated"))
                 .and_then(Value::as_bool),
             Some(true),
-            "Activity restores hide_trace"
+            "Activity always omits timestamp-zero rows"
+        );
+        let saved = step.save_state.expect("open persists state");
+        assert!(
+            saved.get("profile").is_none(),
+            "obsolete profile state is not persisted again"
+        );
+        assert_eq!(saved.get("topRow").and_then(Value::as_i64), Some(0));
+
+        let previous_generation = state.view_gen;
+        let mut reset_step = Step::new();
+        state.reset_history(&vp(), &mut reset_step);
+        assert_eq!(state.view_gen, previous_generation.saturating_add(1));
+        assert_eq!(
+            last_get_window(&state)
+                .get("filter")
+                .and_then(|filter| filter.get("hide_trace"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "retry/reset cannot leave the fixed Activity view"
         );
     }
 
@@ -2730,6 +2627,41 @@ mod tests {
     }
 
     #[test]
+    fn nested_expansion_spans_hide_inner_children_until_both_levels_are_open() {
+        let mut state = HistoryAppState {
+            total: Some(7),
+            session_flags: SessionFlags {
+                snapshot_established: true,
+                ..SessionFlags::default()
+            },
+            sub_op_counts: vec![5, 0],
+            expansion_spans: BTreeMap::from([(0, 5), (1, 2)]),
+            ..Default::default()
+        };
+        state.recompute_expansion();
+        assert_eq!(state.visible_abs, vec![0, 6]);
+
+        assert!(state.toggle_expanded(0));
+        assert_eq!(
+            state.visible_abs,
+            vec![0, 1, 4, 5, 6],
+            "opening the work group reveals activities but keeps an inner bundle collapsed"
+        );
+        assert_eq!(state.visible_index_for_abs(2), None);
+
+        assert!(state.toggle_expanded(1));
+        assert_eq!(state.visible_abs, vec![0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(state.visible_index_for_abs(2), Some(2));
+
+        assert!(state.toggle_expanded(0));
+        assert_eq!(state.visible_abs, vec![0, 6]);
+        assert!(
+            state.is_row_expanded(1),
+            "inner disclosure state is retained"
+        );
+    }
+
+    #[test]
     fn open_warnings_collect_strings_and_diagnostics_summary() {
         let value = json!({
             "nodes": 100,
@@ -2756,20 +2688,13 @@ mod tests {
     #[test]
     fn restore_and_save_state_round_trip() {
         let mut state = HistoryAppState::default();
-        assert_eq!(state.restore_state(), (-1, Profile::Activity));
+        assert_eq!(state.restore_state(), -1);
         state.persisted = Some(json!({ "topRow": 12, "profile": "raw" }));
-        assert_eq!(state.restore_state(), (12, Profile::Raw));
+        assert_eq!(state.restore_state(), 12, "legacy raw profile is ignored");
         state.persisted = Some(json!({ "topRow": 0, "profile": "activity" }));
-        assert_eq!(
-            state.restore_state(),
-            (-1, Profile::Activity),
-            "zero topRow restores to top"
-        );
-        let saved = state.persisted_state(&vp());
-        assert_eq!(
-            saved.get("profile").and_then(Value::as_str),
-            Some("activity")
-        );
+        assert_eq!(state.restore_state(), -1, "zero topRow restores to top");
+        let saved = HistoryAppState::persisted_state(&vp());
+        assert!(saved.get("profile").is_none());
         assert_eq!(saved.get("topRow").and_then(Value::as_i64), Some(0));
     }
 
@@ -3080,7 +3005,7 @@ mod tests {
     #[test]
     fn toggle_expanded_ui_reanchors_the_desired_window_and_fetches() {
         let mut state = HistoryAppState {
-            total: Some(100),
+            total: Some(11),
             session_flags: SessionFlags {
                 snapshot_established: true,
                 ..SessionFlags::default()
@@ -3089,7 +3014,7 @@ mod tests {
             ..Default::default()
         };
         state.recompute_expansion();
-        for i in 0..100i64 {
+        for i in [0, 5, 6] {
             drop(state.cache.insert(i, row(i, &format!("node:{i}"), 1)));
         }
         let viewport = Viewport::new(0, 800);
@@ -3097,6 +3022,8 @@ mod tests {
         state.toggle_expanded_ui(0, &viewport, &mut step);
         assert!(state.is_block_expanded(0), "the parent block toggles open");
         let (want_top, want_bottom) = state.desired_visible_range(&viewport);
+        assert_eq!(state.render_top, want_top);
+        assert_eq!(state.render_bottom, want_bottom);
         assert!(
             step.ops.iter().any(|op| matches!(
                 op,

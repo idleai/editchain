@@ -450,7 +450,7 @@ test('wire taxonomy is restricted to the exact Rust enum values', () => {
   // drifted from the Rust wire enums.
   const rows = fixtureRows();
   const roles = new Set(['narrative', 'action', 'result', 'artifact', 'lifecycle', 'echo', 'unknown']);
-  const kinds = new Set(['conversation', 'plan', 'explore', 'execute', 'change', 'verify',
+  const kinds = new Set(['work', 'conversation', 'plan', 'explore', 'execute', 'change', 'verify',
     'diagnose', 'coordinate', 'source_control', 'external', 'system', 'unknown']);
   const visibilities = new Set(['primary', 'supporting', 'trace', 'unknown']);
   const outcomes = new Set(['success', 'warning', 'failure', 'cancelled', 'unknown']);

@@ -277,7 +277,7 @@ fn legacy_cursor_backfills_session_git_link_once_without_replaying_rows() {
             .unwrap()
             .unwrap()
             .normalization_version,
-        2
+        4
     );
 
     let current =
@@ -343,7 +343,7 @@ fn version_one_cursor_upgrades_topology_without_replaying_git_link() {
             .ops
             .iter()
             .all(|op| !matches!(op.kind, OpKind::GitLink(_))),
-        "the v2 topology checkpoint must not replay the v1 Git fact"
+        "the current metadata checkpoint must not replay the v1 Git fact"
     );
     assert_eq!(
         cursors
@@ -351,7 +351,94 @@ fn version_one_cursor_upgrades_topology_without_replaying_git_link() {
             .unwrap()
             .unwrap()
             .normalization_version,
-        2
+        4
+    );
+}
+
+#[test]
+fn session_index_title_is_captured_and_title_only_changes_reproject() {
+    let dir = tempfile::tempdir().unwrap();
+    let rollout = dir.path().join("rollout-1.jsonl");
+    write_rollout(
+        dir.path(),
+        "rollout-1.jsonl",
+        &[session_meta_line("thread-1", "s")],
+    );
+    let index = dir.path().join("session_index.jsonl");
+    std::fs::write(
+        &index,
+        "{\"id\":\"thread-1\",\"thread_name\":\"First title\",\"updated_at\":\"2026-08-26T12:05:00Z\"}\n",
+    )
+    .unwrap();
+    let helper = fixed_helper(&dir, &session_projection("thread-1", None));
+    let options = ImportOptions::default();
+    let mut cursors = MemoryCursorStore::new();
+
+    let first = import_with_options_into(dir.path(), &helper, &options, &mut cursors);
+    assert_eq!(first.report.raw_ops, 1);
+    assert_eq!(first.report.normalized_ops, 1);
+    let title_op = first
+        .ops
+        .ops
+        .iter()
+        .find(|op| {
+            matches!(&op.kind, OpKind::Import(import)
+                if matches!(&import.raw_ref, Payload::Inline(raw)
+                    if serde_json::from_slice::<serde_json::Value>(raw).ok()
+                        .is_some_and(|value| value["type"] == "session_title")))
+        })
+        .expect("portable session title op");
+    assert_eq!(
+        title_op.scope,
+        ScopeRef::Session(derive_session_id("thread-1"))
+    );
+    assert_eq!(
+        title_op.parents,
+        ParentSet::One(
+            source_stream(dir.path(), &rollout, 0)
+                .op_from_position(SourcePosition::raw(1))
+                .unwrap()
+        )
+    );
+    let OpKind::Import(title_import) = &title_op.kind else {
+        panic!("title is an import metadata op");
+    };
+    let Payload::Inline(raw) = &title_import.raw_ref else {
+        panic!("small title stays inline");
+    };
+    let title: serde_json::Value = serde_json::from_slice(raw).unwrap();
+    assert_eq!(title["title"], "First title");
+
+    let unchanged = import_with_options_into(dir.path(), &helper, &options, &mut cursors);
+    assert_eq!(unchanged.report.files_processed, 0);
+    assert!(unchanged.ops.ops.is_empty());
+
+    std::fs::write(
+        &index,
+        concat!(
+            "{\"id\":\"thread-1\",\"thread_name\":\"First title\",\"updated_at\":\"2026-08-26T12:05:00Z\"}\n",
+            "{\"id\":\"thread-1\",\"thread_name\":\"Renamed\",\"updated_at\":\"2026-08-26T12:06:00Z\"}\n",
+        ),
+    )
+    .unwrap();
+    let renamed = import_with_options_into(dir.path(), &helper, &options, &mut cursors);
+    assert_eq!(renamed.report.files_processed, 1);
+    assert_eq!(renamed.report.raw_ops, 0);
+    assert_eq!(renamed.report.normalized_ops, 1);
+    let renamed_title = renamed.ops.ops.iter().find_map(|op| {
+        let OpKind::Import(import) = &op.kind else {
+            return None;
+        };
+        let Payload::Inline(raw) = &import.raw_ref else {
+            return None;
+        };
+        serde_json::from_slice::<serde_json::Value>(raw)
+            .ok()
+            .filter(|value| value["type"] == "session_title")
+    });
+    assert_eq!(
+        renamed_title.as_ref().map(|value| &value["title"]),
+        Some(&serde_json::json!("Renamed"))
     );
 }
 
@@ -1779,7 +1866,7 @@ fn normalized_items_on_the_same_line_use_distinct_derived_lanes() {
 }
 
 #[test]
-fn cross_file_subagent_linking_emits_exact_spawn_and_reconnects_to() {
+fn current_collab_spawn_links_exact_child_and_reconnects_to() {
     let dir = tempfile::tempdir().unwrap();
     write_rollout(
         dir.path(),
@@ -1797,10 +1884,10 @@ fn cross_file_subagent_linking_emits_exact_spawn_and_reconnects_to() {
     );
 
     // Projection streams are built with serde_json, so no bridge JSON ever
-    // passes through shell/awk quoting. The parent carries a real `started`
-    // subAgentActivity marker and a collabToolCall whose per-child
-    // `agentsStates` marks the child completed — the child's own status is the
-    // only completion signal.
+    // passes through shell/awk quoting. Current Codex rollouts identify the
+    // exact child directly on the `spawnAgent` collab call. A later collab
+    // call's per-child `agentsStates` marks it completed — the child's own
+    // status is the only completion signal.
     let parent_projection = projection_bytes(&[
         line_record(
             1,
@@ -1812,11 +1899,13 @@ fn cross_file_subagent_linking_emits_exact_spawn_and_reconnects_to() {
             vec![serde_json::json!({
                 "turnId": "turn-1",
                 "item": {
-                    "kind": "subAgentActivity",
+                    "kind": "collabToolCall",
                     "id": "spawn-1",
-                    "activityKind": "started",
-                    "agentThreadId": "sub-1",
-                    "agentPath": "/root/sub",
+                    "tool": "spawnAgent",
+                    "status": "completed",
+                    "senderThreadId": "parent-1",
+                    "receiverThreadIds": ["sub-1"],
+                    "agentsStates": {"sub-1": {"status": "pendingInit"}},
                 }
             })],
             None,
@@ -1871,19 +1960,8 @@ fn cross_file_subagent_linking_emits_exact_spawn_and_reconnects_to() {
     );
     let harness = import(dir.path(), &sh_helper(&helper, &[]));
 
-    // The real `started` kind renders as readable spawn prose; no completion
-    // prose is invented for it.
-    let _spawned = harness
-        .ops
-        .ops
-        .iter()
-        .find(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.content == Payload::Inline(b"spawned subagent sub-1 (path /root/sub)".to_vec()))
-        })
-        .expect("spawn note");
-
     // SpawnedBy: causal parent = the subagent thread's first raw occurrence;
-    // target = the parent thread's exact raw `started` occurrence.
+    // target = the parent thread's exact raw `spawnAgent` occurrence.
     let spawned_by = harness
         .ops
         .ops
@@ -1899,12 +1977,16 @@ fn cross_file_subagent_linking_emits_exact_spawn_and_reconnects_to() {
         ParentSet::One(sub_stream.op_from_position(SourcePosition::raw(1)).unwrap())
     );
     match &spawned_by.kind {
-        OpKind::Note(note) => assert_eq!(
-            note.target_ids,
-            vec![parent_stream
-                .op_from_position(SourcePosition::raw(2))
-                .unwrap()]
-        ),
+        OpKind::Note(note) => {
+            assert_eq!(
+                note.target_ids,
+                vec![parent_stream
+                    .op_from_position(SourcePosition::raw(2))
+                    .unwrap()]
+            );
+            assert!(matches!(&note.content, Payload::Inline(bytes)
+                if String::from_utf8_lossy(bytes).contains("collabToolCall.spawnAgent")));
+        }
         _ => panic!("expected note op"),
     }
     // Relationship notes are session-scoped, never turn-scoped.

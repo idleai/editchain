@@ -152,6 +152,12 @@ pub struct CursorValue {
     /// Older cursor JSON omits this field and therefore upgrades from zero.
     #[serde(default)]
     pub normalization_version: u32,
+    /// Content hash of the provider-owned session-title record last captured
+    /// for this source. Codex titles live beside rollouts rather than inside
+    /// them, so this lets an unchanged rollout reproject when only its title
+    /// changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_title_hash: Option<[u8; 32]>,
 }
 
 /// A memory-backed op sink for testing.
@@ -665,6 +671,7 @@ mod tests {
         assert_eq!(cursor.normalization_version, 0);
         assert_eq!(cursor.content_hash_version, 0);
         assert_eq!(cursor.source_node, None);
+        assert_eq!(cursor.session_title_hash, None);
     }
 
     #[test]
@@ -715,6 +722,7 @@ mod tests {
             content_hash_version: 1,
             source_node: Some(NodeId(9)),
             normalization_version: 0,
+            session_title_hash: None,
         };
 
         {
@@ -773,6 +781,7 @@ mod tests {
             content_hash_version: 1,
             source_node: Some(NodeId(9)),
             normalization_version: 0,
+            session_title_hash: None,
         };
 
         {

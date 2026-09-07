@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use editchain_core::{Op, OpId};
+use editchain_core::{GitLinkKind, Op, OpId};
 
 use crate::taxonomy::Visibility;
 use crate::HistoryNode;
@@ -63,19 +63,19 @@ impl Matcher {
 /// - [`Self::summary_pattern`] hides nodes whose display summary matches;
 /// - [`Self::kind_pattern`] hides nodes whose kind tag matches.
 /// - [`Self::include_kind_pattern`] is an INCLUSIVE constraint: when non-empty,
-///   only nodes whose kind tag matches are kept — except structural relationship
-///   anchors/targets required to preserve branch and reconnect geometry. This
-///   lets "Show messages only" stay server-side without severing the execution
-///   topology.
+///   only nodes whose kind tag matches are kept — except dated structural
+///   relationship anchors/targets required to preserve branch and reconnect
+///   geometry. This lets "Show messages only" stay server-side without severing
+///   the execution topology.
 /// - [`Self::hide_trace`] hides semantic trace rows (classified
 ///   [`crate::taxonomy::Visibility::Trace`]) unconditionally, like
 ///   `hide_undated`.
 ///
 /// Chain endpoints (nodes with no parent or no child in the full graph) are
-/// always preserved regardless of *hide* predicate matches. `hide_undated`,
-/// `hide_trace`, and `include_kind_pattern` are not ordinarily endpoint-aware;
-/// structural relationship anchors/targets are the topology-preserving
-/// exception.
+/// always preserved regardless of pattern-based *hide* predicate matches.
+/// `hide_undated` is absolute; `hide_trace` and `include_kind_pattern` are not
+/// ordinarily endpoint-aware. Dated structural relationship anchors/targets
+/// are the topology-preserving exception for the latter predicates.
 #[derive(Debug)]
 pub struct ChainFilter {
     /// Regex/literal pattern matched against each node's display summary.
@@ -89,8 +89,9 @@ pub struct ChainFilter {
     pub hide_undated: bool,
     /// Hide semantic trace rows (duplicate/echo/transport envelopes classified
     /// as [`crate::taxonomy::Visibility::Trace`]) unconditionally, splicing
-    /// causal edges across them. Structural relationship anchors/targets are
-    /// always preserved, matching `hide_undated` semantics.
+    /// causal edges across them. Dated structural relationship anchors/targets
+    /// are preserved; unlike trace filtering, `hide_undated` has no structural
+    /// exception.
     pub hide_trace: bool,
     /// Reconnect causal edges across hidden intermediate nodes so chains stay
     /// continuous instead of leaving disconnected stubs.
@@ -201,15 +202,19 @@ pub struct ChainFilterKey {
 /// every kept child points at its nearest kept ancestor through any run of
 /// hidden intermediate nodes.
 ///
-/// `hide_undated` hides every ordinary undated node (including leaves).
+/// `hide_undated` hides every undated top-level node (including leaves and
+/// structural relationship endpoints). Metadata already bundled beneath a
+/// dated row remains available through that row's expandable sub-ops.
 /// `hide_trace` hides every trace-classified node (including leaves).
 /// `include_kind_pattern` keeps only ordinary matching kinds (including
 /// leaves). Pattern-based hide truncation preserves endpoints (no parent / no
 /// child in the full graph) so a filtered chain keeps its anchors. Structural
 /// relationship anchor and target rows (the rows that carry or point at a
-/// `ForkOf` / `SubagentOf` / `ReconnectsTo` note) are preserved from every
-/// hide predicate so branch/reconnect geometry stays visible even when their
-/// kind (e.g. a tool-kind spawn marker) would be excluded by "messages only".
+/// `ForkOf` / `SubagentOf` / `ReconnectsTo` note) are preserved from semantic
+/// and pattern hide predicates so branch/reconnect geometry stays visible even
+/// when their kind (e.g. a tool-kind spawn marker) would be excluded by
+/// "messages only". Undated structural rows are removed and spliced through,
+/// allowing their stored relationships to connect the nearest dated rows.
 #[must_use]
 #[expect(
     clippy::implicit_hasher,
@@ -257,6 +262,21 @@ pub fn apply_owned(
     // geometry visible. Anchors are the canonical (visible) note-map keys;
     // targets are each note's raw ids lifted to their visible rows.
     let mut structural_keys = HashSet::with_capacity(note_map.len());
+    for link in links
+        .values()
+        .flatten()
+        .filter(|link| link.kind == GitLinkKind::ProducedBy)
+    {
+        if let Some(key) =
+            crate::canonical_parent_key(&link.source.to_string(), representative, &present)
+        {
+            let _: bool = structural_keys.insert(key);
+        }
+        let target = link.target_oid.to_hex();
+        if present.contains(&target) {
+            let _: bool = structural_keys.insert(target);
+        }
+    }
     for (anchor, notes) in note_map {
         for note in notes {
             if let editchain_core::OpKind::Note(n) = &note.kind {
@@ -317,18 +337,23 @@ pub fn apply_owned(
     // keeps its anchors — the oldest root and newest leaf stay visible even
     // when they match. The inclusive-kind constraint is NOT ordinarily
     // endpoint-aware: "messages only" excludes non-message kinds, including
-    // lone leaves that would otherwise survive as anchors. Structural relation
-    // anchors/targets are the explicit exception handled below.
+    // lone leaves that would otherwise survive as anchors. Dated structural
+    // relation anchors/targets are the explicit exception handled below.
     let mut hidden = HashSet::with_capacity(nodes.len());
     for n in &nodes {
         let key = n.node_key();
-        // Structural relation anchors/targets are never hidden: their rows
-        // carry the virtual edges that keep branch/reconnect geometry visible.
-        if structural_keys.contains(&key) {
-            continue;
-        }
+        // Timestamp-zero rows never enter a hide-undated presentation, even
+        // when they carry a structural relationship. The splice walk below
+        // still traverses their stored parent/relationship edges and lifts any
+        // dated descendants onto the nearest visible dated ancestors.
         if filter.hide_undated && n.timestamp_ms() == 0 {
             let _: bool = hidden.insert(key);
+            continue;
+        }
+        // Structural relation anchors/targets are never hidden: their rows
+        // carry the virtual edges that keep branch/reconnect geometry visible.
+        // Undated structural rows were already removed above.
+        if structural_keys.contains(&key) {
             continue;
         }
         if filter.hide_trace && n.visibility() == Visibility::Trace {

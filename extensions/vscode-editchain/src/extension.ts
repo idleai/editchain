@@ -8,7 +8,7 @@ import { resolveServicePath, StdioClient } from './stdioClient';
 // the ONLY script the webview loads. It initializes the wasm-bindgen module
 // and calls the Rust shell's startHistoryView(), which owns the whole runtime
 // (window/frame/lane presentation as per-row SVG graph fragments inside each
-// row's .graph-cell, virtual paging, search, profile switching, selection and
+// row's .graph-cell, virtual paging, search, selection and
 // raw-JSON routing). The webview loads no other scripts.
 let historyPanel: vscode.WebviewPanel | undefined = undefined;
 // Output channel for debugging the service bridge and panel lifecycle.
@@ -251,8 +251,8 @@ function openHistoryView(
       return;
     }
     if (msg.type === 'statusText') {
-      // Assistive-tech/live-region announcements (profile switches, load
-      // progress). Mirrored to the output channel for diagnostics; the status
+      // Assistive-tech/live-region announcements (load progress and search).
+      // Mirrored to the output channel for diagnostics; the status
       // bar count remains driven by the `status` message below.
       output?.appendLine('[webview] status: ' + msg.text);
       return;
@@ -551,12 +551,13 @@ class JsonContentProvider implements vscode.TextDocumentContentProvider {
  *
  * This is the ONLY panel the extension opens. The page is the EXACT production
  * scaffold (media/main.css + media/gpu-preview/gpu-preview.css and the
- * controls/rows/gpu chrome markup) with media/rust-history/loader.js as its
+ * controls/rows/renderer scaffold) with media/rust-history/loader.js as its
  * ONLY script: the loader initializes the wasm-bindgen module and calls the
- * Rust shell's startHistoryView(), which owns the full runtime — Activity/Raw
- * profile switching, virtual paging (PAGE=500), FindInHistory search/nav,
+ * Rust shell's startHistoryView(), which owns the full runtime — the fixed
+ * Activity presentation, virtual paging (PAGE=500), FindInHistory search/nav,
  * loading/error, work-unit/bundle/promotion rows, row selection/keyboard/
- * disclosure, raw JSON routing, five responsive columns, accessibility,
+ * disclosure, raw JSON routing, the dedicated Activity classification column,
+ * responsive columns, accessibility,
  * resize, and per-row SVG graph fragments (the inert #gpu-canvas-host
  * scaffold stays in the markup, but no canvas is ever created).
  *
@@ -594,15 +595,7 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 <link rel="stylesheet" href="${styleUri}">
 </head>
 <body data-treatment="pulse" data-gpu-backend="auto">
-<div id="gpu-toolbar" role="toolbar" aria-label="Renderer status">
-<span id="gpu-backend" data-backend="auto">backend: detecting</span>
-<span id="gpu-status">idle</span>
-</div>
 <div id="controls" role="group" aria-label="History controls">
-<div id="profile-control" class="segmented" role="group" aria-label="History profile">
-<button type="button" id="profile-activity" class="segmented-btn active" aria-pressed="true">Activity</button>
-<button type="button" id="profile-raw" class="segmented-btn" aria-pressed="false">Raw</button>
-</div>
 <label class="visually-hidden" for="search">Search history</label>
 <div id="search-control" class="search-control" role="group" aria-label="Find in chain">
 <input id="search" type="text" placeholder="Search history… (Enter to search)">

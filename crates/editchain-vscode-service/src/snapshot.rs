@@ -14,13 +14,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use editchain_core::OpId;
 use editchain_git::RepositoryDiscovery;
 use editchain_import::hash_raw;
-use editchain_protocol::{HistoryRow, HistoryWindow};
+use editchain_protocol::{ExpansionSpanDto, HistoryRow, HistoryWindow};
 use serde::{Deserialize, Serialize};
 
 use crate::{OpRecordLocation, OpenDiagnostics, SnapshotOpLocator};
 
 /// On-disk schema for the immutable render snapshot.
-pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 /// Revision of projection/default-view semantics represented by this schema.
 ///
 /// Bumped when the fixed default view's semantics change so stale snapshots
@@ -73,7 +73,51 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// from one response, and makes derived-view parent rewrites authoritative over
 /// immutable provider facts. This removes synthetic one-row tool branches
 /// without changing canonical import evidence.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 22;
+///
+/// Revision 23 projects exact `ProducedBy` Git links in their causal direction:
+/// the producing command remains on the agent chain and becomes an additional
+/// parent of the immutable commit row.
+///
+/// Revision 24 omits every timestamp-zero row from the fixed presentation and
+/// contracts undated structural relationship endpoints onto their nearest
+/// dated rows.
+///
+/// Revision 25 restores timestamp-zero metadata as expandable sub-rows while
+/// continuing to omit it from the top-level graph.
+///
+/// Revision 26 retains physical session continuity for provider occurrences
+/// that carry identity but no resolved provider-parent relationship.
+///
+/// Revision 27 wraps linear activity intervals between chat turns in a
+/// summarized outer work group and preserves existing bundles as a second
+/// disclosure level. Expandable-row spans are now persisted alongside the
+/// legacy top-level child counts.
+///
+/// Revision 28 refines session-summary presentation and graph endpoint labels.
+///
+/// Revision 29 contracts copied provider occurrences by canonical payload while
+/// retaining only the surviving physical occurrence's incoming provider edge.
+///
+/// Revision 30 places disconnected graph components against exact per-lane
+/// geometry, allowing operation lanes to be reused inside Git-only gaps.
+///
+/// Revision 31 adds semantic muted-chain state and child-owned muted graph
+/// segment masks for cancelled request branches.
+///
+/// Revision 32 recognizes current Codex `spawnAgent` relations and suppresses
+/// redundant inherited Git parents on their child branches.
+///
+/// Revision 33 preserves structural relation kinds when a metadata anchor is
+/// bundled into its own target, so the first visible child keeps its subagent
+/// tag.
+///
+/// Revision 34 marks the true newest row of every session independently of
+/// turn work-unit boundaries and carries its whole-session entry count.
+///
+/// Revision 35 routes session-to-Git base references through shared,
+/// interval-colored spines so many sessions based on one commit do not retain
+/// one empty graph lane apiece until that commit row.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 35;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.
@@ -84,6 +128,8 @@ const ROWS_FILE: &str = "rows.ndjson";
 const ROW_OFFSETS_FILE: &str = "rows.offsets";
 /// Little-endian `u32` bundled-child counts, one per top-level row.
 const SUB_OP_COUNTS_FILE: &str = "sub-op-counts.bin";
+/// Little-endian `(row, descendant_count)` u64 pairs for every expandable row.
+const EXPANSION_SPANS_FILE: &str = "expansion-spans.bin";
 /// Fixed-width operation id to segment-record location index.
 const OP_LOCATORS_FILE: &str = "op-locators.bin";
 /// Bytes in one encoded operation locator record.
@@ -286,6 +332,7 @@ impl SnapshotBuilder {
         mut self,
         manifest_data: SnapshotManifestData,
         sub_op_counts: &[usize],
+        expansion_spans: &[ExpansionSpanDto],
         op_locators: &[SnapshotOpLocator],
     ) -> Result<RenderSnapshotReport, Box<dyn std::error::Error>> {
         if let Some(mut rows) = self.rows.take() {
@@ -294,6 +341,10 @@ impl SnapshotBuilder {
         }
         write_u64_file(&self.staging_path.join(ROW_OFFSETS_FILE), &self.row_offsets)?;
         write_sub_op_counts(&self.staging_path.join(SUB_OP_COUNTS_FILE), sub_op_counts)?;
+        write_expansion_spans(
+            &self.staging_path.join(EXPANSION_SPANS_FILE),
+            expansion_spans,
+        )?;
         write_op_locators(&self.staging_path.join(OP_LOCATORS_FILE), op_locators)?;
 
         let expanded_rows = u64::try_from(self.row_offsets.len().saturating_sub(1))?;
@@ -362,6 +413,7 @@ pub(crate) struct RenderSnapshot {
     rows: File,
     row_offsets: Vec<u64>,
     sub_op_counts: Option<Vec<usize>>,
+    expansion_spans: Option<Vec<ExpansionSpanDto>>,
     op_locators: Vec<SnapshotOpLocator>,
 }
 
@@ -407,6 +459,8 @@ impl RenderSnapshot {
         }
         let sub_op_counts =
             read_sub_op_counts(&path.join(SUB_OP_COUNTS_FILE), manifest.top_level_rows)?;
+        let expansion_spans =
+            read_expansion_spans(&path.join(EXPANSION_SPANS_FILE), manifest.expanded_rows)?;
 
         Ok(Some(Self {
             path,
@@ -415,6 +469,7 @@ impl RenderSnapshot {
             rows,
             row_offsets,
             sub_op_counts: Some(sub_op_counts),
+            expansion_spans: Some(expansion_spans),
             op_locators,
         }))
     }
@@ -478,6 +533,11 @@ impl RenderSnapshot {
         } else {
             None
         };
+        let expansion_spans = if offset == 0 {
+            Some(self.load_expansion_spans()?.clone())
+        } else {
+            None
+        };
         Ok(HistoryWindow {
             rows,
             total: self.manifest.expanded_rows,
@@ -488,6 +548,7 @@ impl RenderSnapshot {
                 0
             },
             sub_op_counts,
+            expansion_spans,
             layout_ready: include_layout,
         })
     }
@@ -532,6 +593,21 @@ impl RenderSnapshot {
         self.sub_op_counts
             .as_ref()
             .ok_or_else(|| invalid_data("render snapshot sub-op index unavailable").into())
+    }
+
+    /// Load the generalized nested expansion index once per service process.
+    fn load_expansion_spans(
+        &mut self,
+    ) -> Result<&Vec<ExpansionSpanDto>, Box<dyn std::error::Error>> {
+        if self.expansion_spans.is_none() {
+            self.expansion_spans = Some(read_expansion_spans(
+                &self.path.join(EXPANSION_SPANS_FILE),
+                self.manifest.expanded_rows,
+            )?);
+        }
+        self.expansion_spans
+            .as_ref()
+            .ok_or_else(|| invalid_data("render snapshot expansion index unavailable").into())
     }
 }
 
@@ -625,6 +701,65 @@ fn write_sub_op_counts(path: &Path, counts: &[usize]) -> Result<(), Box<dyn std:
     let mut file = BufWriter::new(File::create(path)?);
     for count in counts {
         file.write_all(&u32::try_from(*count)?.to_le_bytes())?;
+    }
+    file.flush()?;
+    file.get_ref().sync_all()?;
+    Ok(())
+}
+
+/// Read and validate the fixed-width nested expansion index.
+fn read_expansion_spans(
+    path: &Path,
+    expanded_rows: u64,
+) -> Result<Vec<ExpansionSpanDto>, Box<dyn std::error::Error>> {
+    let bytes = fs::read(path)?;
+    if bytes.len() % 16 != 0 {
+        return Err(invalid_data("invalid render snapshot expansion index").into());
+    }
+    let mut spans = Vec::with_capacity(bytes.len() / 16);
+    for chunk in bytes.chunks_exact(16) {
+        let row_bytes = chunk
+            .get(..8)
+            .ok_or_else(|| invalid_data("invalid expansion row"))?;
+        let row = u64::from_le_bytes(
+            row_bytes
+                .try_into()
+                .map_err(|_error| invalid_data("invalid expansion row"))?,
+        );
+        let descendant_bytes = chunk
+            .get(8..16)
+            .ok_or_else(|| invalid_data("invalid expansion descendant count"))?;
+        let descendant_count = u64::from_le_bytes(
+            descendant_bytes
+                .try_into()
+                .map_err(|_error| invalid_data("invalid expansion descendant count"))?,
+        );
+        if descendant_count == 0
+            || row >= expanded_rows
+            || row.saturating_add(descendant_count) >= expanded_rows
+            || spans
+                .last()
+                .is_some_and(|previous: &ExpansionSpanDto| previous.row >= row)
+        {
+            return Err(invalid_data("render snapshot expansion span is invalid").into());
+        }
+        spans.push(ExpansionSpanDto {
+            row,
+            descendant_count,
+        });
+    }
+    Ok(spans)
+}
+
+/// Write the fixed-width nested expansion index durably.
+fn write_expansion_spans(
+    path: &Path,
+    spans: &[ExpansionSpanDto],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut file = BufWriter::new(File::create(path)?);
+    for span in spans {
+        file.write_all(&span.row.to_le_bytes())?;
+        file.write_all(&span.descendant_count.to_le_bytes())?;
     }
     file.flush()?;
     file.get_ref().sync_all()?;

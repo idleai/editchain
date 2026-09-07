@@ -158,9 +158,9 @@
   }
 
   // Mirror the HistoryRow serde defaults for the additive activity fields
-  // (work_unit -> None, promoted -> false, activity_bundle -> None — see
+  // (work_unit/session_summary/activity_bundle -> None, promoted -> false — see
   // crates/editchain-protocol) and the ActivityBundleKind enum round trip:
-  // the typed "execute-run" and "plan-repeat" strings survive; every other
+  // the typed work/execute/plan bundle strings survive; every other
   // kind maps to the protocol's forward-compatible Unknown variant
   // ("unknown"), exactly like serde's
   // #[serde(other)] deserialization. Hand-written fixture JSON and older
@@ -169,13 +169,19 @@
   function normalizeActivityFields(row) {
     const out = { ...row };
     if (!Object.prototype.hasOwnProperty.call(out, 'work_unit')) out.work_unit = null;
+    if (!Object.prototype.hasOwnProperty.call(out, 'session_summary')) out.session_summary = null;
     if (!Object.prototype.hasOwnProperty.call(out, 'promoted')) out.promoted = false;
     if (!Object.prototype.hasOwnProperty.call(out, 'activity_bundle')) out.activity_bundle = null;
+    if (!Object.prototype.hasOwnProperty.call(out, 'group_end')) out.group_end = false;
+    if (!Object.prototype.hasOwnProperty.call(out, 'hierarchy_depth')) {
+      out.hierarchy_depth = out.is_subop ? 1 : 0;
+    }
     const b = out.activity_bundle;
     if (b && typeof b === 'object') {
       out.activity_bundle = {
         ...b,
-        kind: b.kind === 'execute-run' || b.kind === 'plan-repeat' ? b.kind : 'unknown',
+        kind: b.kind === 'work-group' || b.kind === 'execute-run' || b.kind === 'plan-repeat'
+          ? b.kind : 'unknown',
       };
     }
     return out;
@@ -183,12 +189,13 @@
 
   // Expand a top-level row's bundled sub_ops into a fixed fully-expanded flat
   // list (parent + one row per sub-op), mirroring the service. Each sub-op row
-  // is flagged is_subop and draws every lane passing straight through its region
-  // as a full-height line (above == below), with no dot.
+  // is flagged is_subop and draws every lane passing straight through its
+  // region (above == below), with a centered dot on the member's own lane.
   function expandSubOps(rows) {
     const out = [];
     for (let ri = 0; ri < rows.length; ri++) {
       const row = rows[ri];
+      const parentRow = out.length;
       out.push(row);
       const subs = row.sub_ops || [];
       if (!subs.length) continue;
@@ -208,6 +215,7 @@
           summary: sub.summary,
           timestamp_ms: sub.timestamp_ms,
           group: row.group,
+          group_end: false,
           node_key: row.node_key + '::sub:' + i,
           parents: [],
           is_submodule: false,
@@ -221,12 +229,14 @@
           transitions: [],
           sub_ops: [],
           is_subop: true,
-          parent_row: out.length - 1 - subs.length + i,
+          hierarchy_depth: 1,
+          parent_row: parentRow,
           subop_kind: sub.kind,
           // Bundled metadata records are sub-ops, never top-level rows: they
           // carry no work-unit, no promotion, and no bundle metadata of their
           // own (exactly like the service's expanded member rows).
           work_unit: null,
+          session_summary: null,
           promoted: false,
           activity_bundle: null,
         });
@@ -244,12 +254,29 @@
     if (hideSub) rows = rows.filter((r) => !r.is_submodule);
     const filtered = applyFilter(rows, req.filter);
     rows = filtered.rows;
+    // The real service marks boundaries against the complete filtered
+    // top-level snapshot, before virtual paging or descendant expansion.
+    rows = rows.map((row, index) => ({
+      ...row,
+      group_end: !rows[index + 1] || rows[index + 1].group !== row.group,
+    }));
     // Global per-node sub-op counts (for prefix sums). Mirrors the real
     // service: shipped ONLY with the offset-0 window, so the renderer must
     // establish the snapshot from offset zero before paging deep windows.
     const subOpCounts = req.offset === 0
       ? rows.map((r) => (r.sub_ops || []).length)
       : null;
+    let expansionSpans = null;
+    if (req.offset === 0) {
+      expansionSpans = [];
+      let absoluteRow = 0;
+      for (const count of subOpCounts) {
+        if (count > 0) {
+          expansionSpans.push({ row: absoluteRow, descendant_count: count });
+        }
+        absoluteRow += 1 + count;
+      }
+    }
     const expanded = expandSubOps(rows);
     const total = fixture.total !== undefined && fixture.total >= 0
       ? fixture.total
@@ -276,6 +303,7 @@
       chain_generation: 0,
       max_lane: includeLayout ? maxLane : 0,
       sub_op_counts: subOpCounts,
+      expansion_spans: expansionSpans,
       layout_ready: includeLayout,
     };
   }

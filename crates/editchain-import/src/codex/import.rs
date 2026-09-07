@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use editchain_core::clock::Clock;
@@ -14,7 +15,8 @@ use super::discover::discover_rollouts;
 use super::helper::HelperCommand;
 use super::link::{
     emit_codex_relationship_notes, ActivityMarker, CompletionEvidence, LegacyCompletionEvidence,
-    ThreadTopology, CODEX_NORMALIZATION_VERSION,
+    ThreadTopology, CODEX_NORMALIZATION_VERSION, SPAWN_SIGNAL_COLLAB_TOOL,
+    SPAWN_SIGNAL_SUBAGENT_ACTIVITY,
 };
 use super::normalize::{
     build_raw_op, completed_agent_paths_from_tool, is_blank_line, normalized_ops_for_compaction,
@@ -23,6 +25,7 @@ use super::normalize::{
 };
 use super::projection::{parse_projection, FinalItem, ProjectionKind};
 use super::session_git::session_git_link_op;
+use super::title::{load_session_titles, raw_session_identity, session_title_op};
 
 /// Normalization version that introduced exact session-start Git links.
 const CODEX_GIT_NORMALIZATION_VERSION: u32 = 1;
@@ -166,12 +169,30 @@ pub fn import_codex(
     let mut report = ImportReport::new();
     // Per-thread exact topology for the sink-independent relationship pass.
     let mut topology: Vec<ThreadTopology> = Vec::new();
+    let session_titles = if options.normalize {
+        load_session_titles(&request.raw_root)?
+    } else {
+        std::collections::HashMap::new()
+    };
 
     let rollouts = discover_rollouts(&request.raw_root).map_err(ImportError::OpSink)?;
     report.files_discovered = rollouts.len();
     let workspace_str = request.workspace_path.to_str().unwrap_or("/workspace");
 
     for rollout in &rollouts {
+        let raw_identity = if session_titles.is_empty() {
+            None
+        } else {
+            raw_session_identity(&rollout.path)?
+        };
+        let indexed_title = raw_identity.as_ref().and_then(|identity| {
+            session_titles.get(&identity.thread_id).or_else(|| {
+                identity
+                    .parent_thread_id
+                    .as_ref()
+                    .and_then(|parent| session_titles.get(parent))
+            })
+        });
         let resolved = resolve_source_cursor(
             cursors,
             "codex",
@@ -184,6 +205,12 @@ pub fn import_codex(
         let source_node = resolved.source_node;
         let migrates_legacy_key = cursor_key != state_key;
         let mut existing_cursor = resolved.cursor;
+        let previous_session_title_hash = existing_cursor
+            .as_ref()
+            .and_then(|cursor| cursor.session_title_hash);
+        let needs_session_title_refresh = options.normalize
+            && indexed_title
+                .is_some_and(|title| previous_session_title_hash != Some(title.source_hash));
         let needs_git_upgrade = options.normalize
             && existing_cursor.as_ref().is_some_and(|cursor| {
                 cursor.normalization_version < CODEX_GIT_NORMALIZATION_VERSION
@@ -207,7 +234,10 @@ pub fn import_codex(
         let read = if let Some(cursor) = existing_cursor.as_mut() {
             match check_file_generation(&rollout.path, cursor) {
                 Ok(true) => {
-                    if needs_normalization_upgrade || needs_cursor_upgrade {
+                    if needs_normalization_upgrade
+                        || needs_session_title_refresh
+                        || needs_cursor_upgrade
+                    {
                         ReadState::Reproject {
                             boot: cursors.get_generation(&state_key)?,
                             start_seq: cursor.ops_emitted,
@@ -366,6 +396,13 @@ pub fn import_codex(
                 .unwrap_or_else(|| rollout.session_id.clone()),
         };
         let session_id = derive_session_id(&owning_thread);
+        let session_title = session_titles.get(&owning_thread).or_else(|| {
+            projection
+                .session_meta
+                .as_ref()
+                .and_then(|meta| meta.parent_thread_id.as_ref())
+                .and_then(|parent| session_titles.get(parent))
+        });
         let mut topo = ThreadTopology {
             thread_id: owning_thread.clone(),
             parent_thread_id: projection
@@ -422,6 +459,30 @@ pub fn import_codex(
             let _: bool = ops.accept_op(&op)?;
             report.raw_ops += 1;
             prev_raw_id = Some(op.id);
+        }
+
+        // Codex keeps user-visible thread renames in `session_index.jsonl`,
+        // outside the rollout. Persist the selected bounded title as a
+        // deterministic metadata op attached to this source's first raw row.
+        // A parent thread's title is inherited by a named subagent session so
+        // the renderer can display `title · nickname` without consulting live
+        // Codex state.
+        let should_emit_session_title = options.normalize
+            && session_title.is_some_and(|title| {
+                full_read || previous_session_title_hash != Some(title.source_hash)
+            });
+        if should_emit_session_title {
+            if let (Some(title), Some(first_raw)) = (
+                session_title,
+                (new_cursor.ops_emitted > 0)
+                    .then(|| stream.op_from_position(SourcePosition::raw(1)))
+                    .transpose()?,
+            ) {
+                let title_op =
+                    session_title_op(title, &owning_thread, session_id, first_raw, blobs)?;
+                let accepted = ops.accept_op(&title_op)?;
+                report.normalized_ops = report.normalized_ops.saturating_add(usize::from(accepted));
+            }
         }
 
         // Codex records one exact Git snapshot on `session_meta`. Materialize
@@ -591,6 +652,9 @@ pub fn import_codex(
             new_cursor.normalization_version = new_cursor
                 .normalization_version
                 .max(CODEX_NORMALIZATION_VERSION);
+            if let Some(title) = session_title {
+                new_cursor.session_title_hash = Some(title.source_hash);
+            }
         }
         new_cursor.source_node = Some(source_node);
         new_cursor.content_hash_version = 1;
@@ -628,35 +692,10 @@ fn collect_topology_evidence(
 ) -> Result<(), ImportError> {
     let last_complete_ordinal = topology.last_raw.map_or(0, |op| op.seq >> 16);
     for item in items {
-        if item.kind == ProjectionKind::Note
-            && item.first_seen > 0
-            && item.first_seen <= last_complete_ordinal
-        {
-            let Some(agent_thread) = item
-                .payload
-                .get("agentThreadId")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            topology.markers.push(ActivityMarker {
-                agent_thread_id: agent_thread.to_string(),
-                agent_path: item
-                    .payload
-                    .get("agentPath")
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .map(ToString::to_string),
-                op_id: stream.op_from_position(SourcePosition::raw(item.first_seen))?,
-                started: item
-                    .payload
-                    .get("activityKind")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| kind.eq_ignore_ascii_case("started")),
-            });
+        if collect_subagent_activity_marker(item, stream, topology, last_complete_ordinal)? {
             continue;
         }
+        collect_collab_spawn_markers(item, stream, topology, last_complete_ordinal)?;
 
         if item.kind != ProjectionKind::Tool
             || item.last_seen == 0
@@ -687,6 +726,92 @@ fn collect_topology_evidence(
                 });
             }
         }
+    }
+    Ok(())
+}
+
+/// Preserve the older dedicated subagent-activity activation signal.
+fn collect_subagent_activity_marker(
+    item: &FinalItem,
+    stream: &SourceStream,
+    topology: &mut ThreadTopology,
+    last_complete_ordinal: u64,
+) -> Result<bool, ImportError> {
+    if item.kind != ProjectionKind::Note
+        || item.first_seen == 0
+        || item.first_seen > last_complete_ordinal
+    {
+        return Ok(false);
+    }
+    let Some(agent_thread) = item
+        .payload
+        .get("agentThreadId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(true);
+    };
+    topology.markers.push(ActivityMarker {
+        agent_thread_id: agent_thread.to_string(),
+        agent_path: item
+            .payload
+            .get("agentPath")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        op_id: stream.op_from_position(SourcePosition::raw(item.first_seen))?,
+        started: item
+            .payload
+            .get("activityKind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("started")),
+        signal: SPAWN_SIGNAL_SUBAGENT_ACTIVITY,
+    });
+    Ok(true)
+}
+
+/// Capture the exact activation shape emitted by current Codex rollouts.
+fn collect_collab_spawn_markers(
+    item: &FinalItem,
+    stream: &SourceStream,
+    topology: &mut ThreadTopology,
+    last_complete_ordinal: u64,
+) -> Result<(), ImportError> {
+    if item.kind != ProjectionKind::Tool
+        || item.first_seen == 0
+        || item.first_seen > last_complete_ordinal
+        || item
+            .payload
+            .get("tool")
+            .and_then(Value::as_str)
+            .is_none_or(|tool| tool != "spawnAgent")
+        || item.payload.get("senderThreadId").and_then(Value::as_str)
+            != Some(topology.thread_id.as_str())
+    {
+        return Ok(());
+    }
+    let Some(receivers) = item
+        .payload
+        .get("receiverThreadIds")
+        .and_then(Value::as_array)
+    else {
+        return Ok(());
+    };
+    let occurrence = stream.op_from_position(SourcePosition::raw(item.first_seen))?;
+    let receiver_threads: BTreeSet<String> = receivers
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|thread| !thread.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    for agent_thread_id in receiver_threads {
+        topology.markers.push(ActivityMarker {
+            agent_thread_id,
+            agent_path: None,
+            op_id: occurrence,
+            started: true,
+            signal: SPAWN_SIGNAL_COLLAB_TOOL,
+        });
     }
     Ok(())
 }

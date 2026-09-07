@@ -1,18 +1,20 @@
 //! Deterministic Activity-view semantics on top of the canonical projection.
 //!
-//! This module owns the six fixed-view behaviors the unified history service
+//! This module owns the seven fixed-view behaviors the unified history service
 //! emits for its Activity profile (and only for that profile):
 //!
 //! - **Inline context checkpoints**
 //!   ([`inline_context_compaction_checkpoints`]): a raw Codex context-compaction
 //!   row remains visible but is inserted into its source stream's existing
 //!   path when legacy/imported topology stored it beside the continuation.
-//! - **Work-unit markers** ([`annotate_activity_rows`]): every row carries an
-//!   opaque unit id plus view-stable `is_start`/`is_end`/`count`/`title`, so a
-//!   client renders unit boundaries without inferring across paged windows.
-//!   Units are logical and view-wide: every row sharing an id forms one unit
-//!   even when other units' rows interleave, so interleaved chains never
-//!   fragment into per-segment boundary noise.
+//! - **Work-unit and session-summary markers** ([`annotate_activity_rows`]):
+//!   every row carries an opaque unit id plus view-stable
+//!   `is_start`/`is_end`/`count`/`title`, while the newest visible row of each
+//!   session independently carries its whole-session row count. Units are
+//!   logical and view-wide: every row sharing an id forms one unit even when
+//!   other units' rows interleave, so interleaved chains never fragment into
+//!   per-segment boundary noise. Session summaries remain session-wide even
+//!   when a provider mixes turn-scoped and session-scoped rows.
 //! - **Conservative promotion** ([`ActivityRowAnnotation::promoted`]):
 //!   negative-outcome rows, change/verify rows, and each unit's deterministically
 //!   known newest narrative row are flagged as significant; promoted rows are
@@ -33,6 +35,11 @@
 //!   every record carries the same exact Anthropic `message.id`. This works even
 //!   when unrelated sessions interleave in display order. No timestamp, text,
 //!   tool-name, or proximity matching participates.
+//! - **Conversational work grouping** ([`bundle_activity_work_groups`]): every
+//!   maximal linear span of non-chat activity contracts into one expandable
+//!   work summary. Existing execute/plan bundles remain nested members. Rows
+//!   incident to any fork, merge, subagent/reconnect, or produced-commit edge
+//!   are hard boundaries, so branching always remains outside a work group.
 //!
 //! Conservative guards keep evidence visible: runs never cross turn or group
 //! boundaries, are built from display-order contiguity only (never timestamps),
@@ -51,7 +58,7 @@ use crate::meta::{
     claude_assistant_message_id, is_context_compaction_import,
     sub_op_is_world_state_or_turn_context, NodeMeta,
 };
-use crate::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility};
+use crate::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use crate::{EffectiveTime, HistoryNode};
 
 /// Keep raw context-compaction checkpoints visible while making them inline in
@@ -182,6 +189,20 @@ pub struct WorkUnitMarker {
     pub count: u64,
 }
 
+/// Session-wide summary metadata attached only to a session's newest visible
+/// row in display order.
+///
+/// This is deliberately independent of [`WorkUnitMarker`]. Codex sessions mix
+/// turn-scoped rows (`session:…/turn:…`) with session-scoped lifecycle rows
+/// (`session:…`), while legacy Claude sessions commonly use only the latter.
+/// Treating the first session-scoped work unit as the whole-session boundary
+/// therefore places the summary in the middle of Codex sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummaryMarker {
+    /// Total top-level rows in this session for the current view.
+    pub count: u64,
+}
+
 /// Per-row Activity-view annotation, parallel to the annotated node list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivityRowAnnotation {
@@ -189,6 +210,8 @@ pub struct ActivityRowAnnotation {
     pub promoted: bool,
     /// Work-unit metadata for this row's unit.
     pub work_unit: WorkUnitMarker,
+    /// Whole-session summary metadata on exactly one row per session group.
+    pub session_summary: Option<SessionSummaryMarker>,
 }
 
 /// Annotate every row with its deterministic work-unit marker and promotion
@@ -198,10 +221,12 @@ pub struct ActivityRowAnnotation {
 /// interleaved rows are only annotated, never reordered or gathered. Each id
 /// yields exactly one `is_start` (first display-order occurrence), one
 /// `is_end` (last display-order occurrence), and a `count` of every top-level
-/// row with that id in the full view. The result parallels `nodes` 1:1 and is
-/// deterministic for a given node list (the caller supplies the exact
-/// filtered/bundled list it will render, so boundaries, counts, and titles
-/// never depend on window size or scroll position).
+/// row with that id in the full view. Independently, each `session:` group
+/// yields one [`SessionSummaryMarker`] on its first display-order occurrence,
+/// counting every row in that session regardless of work-unit id. The result
+/// parallels `nodes` 1:1 and is deterministic for a given node list (the
+/// caller supplies the exact filtered/bundled list it will render, so
+/// boundaries and counts never depend on window size or scroll position).
 #[must_use]
 #[expect(
     clippy::indexing_slicing,
@@ -218,7 +243,15 @@ pub fn annotate_activity_rows(nodes: &[HistoryNode]) -> Vec<ActivityRowAnnotatio
         final_narrative: Option<usize>,
     }
     let ids: Vec<String> = nodes.iter().map(unit_id).collect();
+    let session_groups: Vec<Option<String>> = nodes
+        .iter()
+        .map(|node| {
+            let group = node.group();
+            group.starts_with("session:").then_some(group)
+        })
+        .collect();
     let mut units: HashMap<&str, UnitAgg> = HashMap::with_capacity(ids.len());
+    let mut sessions: HashMap<&str, (usize, u64)> = HashMap::new();
     for (index, id) in ids.iter().enumerate() {
         let unit = units.entry(id.as_str()).or_insert_with(|| UnitAgg {
             first: index,
@@ -241,6 +274,10 @@ pub fn annotate_activity_rows(nodes: &[HistoryNode]) -> Vec<ActivityRowAnnotatio
             // the last encounter wins for the same reason.
             unit.title = Some(nodes[index].summary());
         }
+        if let Some(group) = session_groups.get(index).and_then(Option::as_deref) {
+            let session = sessions.entry(group).or_insert((index, 0));
+            session.1 = session.1.saturating_add(1);
+        }
     }
     let mut out = Vec::with_capacity(nodes.len());
     for (index, id) in ids.iter().enumerate() {
@@ -254,6 +291,13 @@ pub fn annotate_activity_rows(nodes: &[HistoryNode]) -> Vec<ActivityRowAnnotatio
                 title: unit.title.clone(),
                 count: unit.count,
             },
+            session_summary: session_groups
+                .get(index)
+                .and_then(Option::as_deref)
+                .and_then(|group| sessions.get(group))
+                .and_then(|(first, count)| {
+                    (*first == index).then_some(SessionSummaryMarker { count: *count })
+                }),
         });
     }
     out
@@ -684,6 +728,7 @@ fn fold_terminal_claude_execute_into_narrative<S: std::hash::BuildHasher>(
                     HistoryNode::ExecuteBundle { members, .. } => sub_ops.extend(members),
                     HistoryNode::EditOperation { .. }
                     | HistoryNode::PlanBundle { .. }
+                    | HistoryNode::WorkGroup { .. }
                     | HistoryNode::GitCommit(_) => {}
                 }
             }
@@ -703,6 +748,7 @@ fn flatten_execute_member_nodes(members: impl Iterator<Item = HistoryNode>) -> V
             HistoryNode::CollapsedImport { .. } => flattened.push(member),
             HistoryNode::EditOperation { .. }
             | HistoryNode::PlanBundle { .. }
+            | HistoryNode::WorkGroup { .. }
             | HistoryNode::GitCommit(_) => {}
         }
     }
@@ -780,6 +826,127 @@ pub fn bundle_activity_plan_repeats<S: std::hash::BuildHasher>(
     contract_runs(nodes, runs, build_plan_bundle)
 }
 
+/// Group maximal connected linear spans of work between user/agent chats.
+///
+/// A work candidate is any non-Git row except a primary user/agent
+/// Conversation row. System/lifecycle records, plans, exploration, execution,
+/// changes, verification, and diagnostics therefore collapse together until a
+/// conversational boundary. Existing execute-run and plan-repeat bundles are
+/// retained as direct member nodes, which gives the renderer one outer work
+/// disclosure and one existing inner disclosure level.
+///
+/// Branching is forbidden inside a group. Explicit structural endpoints from
+/// `structural_keys` are excluded, and this pass independently protects every
+/// row incident to ordinary causal fan-out or fan-in. Remaining members must
+/// be adjacent on one exact parent path, in one display group. Even a
+/// single-row interval becomes a work group so the top-level Activity view is
+/// consistently chat / work / chat rather than leaking isolated bookkeeping.
+#[must_use]
+pub fn bundle_activity_work_groups<S: std::hash::BuildHasher>(
+    nodes: Vec<HistoryNode>,
+    structural_keys: &HashSet<String, S>,
+) -> Vec<HistoryNode> {
+    if nodes.is_empty() {
+        return nodes;
+    }
+    let keys: Vec<String> = nodes.iter().map(HistoryNode::node_key).collect();
+    let present: HashSet<&str> = keys.iter().map(String::as_str).collect();
+    let parents: Vec<Vec<String>> = nodes
+        .iter()
+        .map(|node| {
+            stored_parent_keys(node)
+                .into_iter()
+                .filter(|parent| present.contains(parent.as_str()))
+                .collect()
+        })
+        .collect();
+    let branch_boundaries = causal_branch_boundaries(&keys, &parents, structural_keys);
+    let eligible: Vec<bool> = nodes
+        .iter()
+        .zip(&keys)
+        .map(|(node, key)| {
+            node.git_oid().is_none()
+                && !is_user_or_agent_chat(node)
+                && !branch_boundaries.contains(key)
+                && node_anchor_op(node).is_some()
+        })
+        .collect();
+
+    let groups: Vec<String> = nodes.iter().map(HistoryNode::group).collect();
+    let mut runs = Vec::new();
+    let mut index = 0usize;
+    while index < nodes.len() {
+        if !eligible.get(index).copied().unwrap_or(false) {
+            index = index.saturating_add(1);
+            continue;
+        }
+        let start = index;
+        let mut end = index;
+        while let Some(next) = end.checked_add(1).filter(|next| *next < nodes.len()) {
+            let connected = parents.get(end).is_some_and(|node_parents| {
+                node_parents.len() == 1
+                    && keys.get(next).is_some_and(|next_key| {
+                        node_parents
+                            .first()
+                            .is_some_and(|parent| parent == next_key)
+                    })
+            });
+            if !eligible.get(next).copied().unwrap_or(false)
+                || groups.get(next) != groups.get(start)
+                || !connected
+            {
+                break;
+            }
+            end = next;
+        }
+        runs.push((start, end));
+        index = end.saturating_add(1);
+    }
+    contract_runs(nodes, runs, build_work_group)
+}
+
+/// Protect every row incident to explicit structure or ordinary causal
+/// fan-in/fan-out. The returned set is the complete set of legal group breaks.
+#[must_use]
+fn causal_branch_boundaries<S: std::hash::BuildHasher>(
+    keys: &[String],
+    parents: &[Vec<String>],
+    structural_keys: &HashSet<String, S>,
+) -> HashSet<String> {
+    let mut boundaries: HashSet<String> = structural_keys.iter().cloned().collect();
+    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (child, node_parents) in keys.iter().zip(parents) {
+        if node_parents.len() > 1 {
+            let _: bool = boundaries.insert(child.clone());
+            boundaries.extend(node_parents.iter().cloned());
+        }
+        for parent in node_parents {
+            children
+                .entry(parent.as_str())
+                .or_default()
+                .push(child.as_str());
+        }
+    }
+    for (parent, child_keys) in children {
+        if child_keys.len() > 1 {
+            let _: bool = boundaries.insert(parent.to_owned());
+            boundaries.extend(child_keys.into_iter().map(str::to_owned));
+        }
+    }
+    boundaries
+}
+
+/// Primary narrative prose is a user/agent chat boundary. Provider transport
+/// copies and conversation-like lifecycle records are supporting/trace rows,
+/// so they may still live inside a group without relying on provider-specific
+/// author labels being present.
+#[must_use]
+fn is_user_or_agent_chat(node: &HistoryNode) -> bool {
+    node.activity_kind() == ActivityKind::Conversation
+        && node.record_role() == RecordRole::Narrative
+        && node.visibility() == Visibility::Primary
+}
+
 /// Per-node facts precomputed once for the run scan, so membership checks do
 /// no repeated string formatting or sub-op JSON parsing.
 struct MemberFacts {
@@ -821,6 +988,7 @@ fn claude_response_id_of_node(node: &HistoryNode) -> Option<String> {
         }
         HistoryNode::EditOperation { .. }
         | HistoryNode::PlanBundle { .. }
+        | HistoryNode::WorkGroup { .. }
         | HistoryNode::GitCommit(_) => None,
     }
 }
@@ -877,12 +1045,7 @@ fn contract_runs(
             // Bundles read their parents through an intra-run filter and git
             // rows never reference op members; only stored op parents of kept
             // rows need the rewrite.
-            if matches!(
-                node,
-                HistoryNode::ExecuteBundle { .. }
-                    | HistoryNode::PlanBundle { .. }
-                    | HistoryNode::GitCommit(_)
-            ) {
+            if matches!(node, HistoryNode::GitCommit(_)) {
                 continue;
             }
             let old = stored_parent_keys(node);
@@ -927,6 +1090,10 @@ fn stored_parent_keys(node: &HistoryNode) -> Vec<String> {
         | HistoryNode::PlanBundle {
             parent_override: Some(keys),
             ..
+        }
+        | HistoryNode::WorkGroup {
+            parent_override: Some(keys),
+            ..
         } => keys.clone(),
         HistoryNode::EditOperation {
             op,
@@ -944,6 +1111,11 @@ fn stored_parent_keys(node: &HistoryNode) -> Vec<String> {
             ..
         }
         | HistoryNode::PlanBundle {
+            member_nodes,
+            parent_override: None,
+            ..
+        }
+        | HistoryNode::WorkGroup {
             member_nodes,
             parent_override: None,
             ..
@@ -1035,6 +1207,7 @@ fn build_plan_bundle(members: Vec<HistoryNode>) -> HistoryNode {
         activity_kind: ActivityKind::Plan,
         visibility: Visibility::Primary,
         outcome: Outcome::Unknown,
+        chain_state: aggregate_chain_state(&members),
         turn_id: newest.and_then(HistoryNode::turn_id),
     };
     let sub_ops = flattened_bundle_members(&members);
@@ -1048,6 +1221,221 @@ fn build_plan_bundle(members: Vec<HistoryNode>) -> HistoryNode {
         kind,
         author,
         meta,
+    }
+}
+
+/// Build one outer work summary while retaining existing inner bundle nodes.
+#[must_use]
+fn build_work_group(members: Vec<HistoryNode>) -> HistoryNode {
+    let newest = members.first();
+    let anchor = newest
+        .and_then(node_anchor_op)
+        .cloned()
+        .unwrap_or_else(empty_anchor_op);
+    let source_time = newest.map_or(EffectiveTime::Unknown, HistoryNode::effective_time);
+    let summary = work_group_summary(&members);
+    let represented = flattened_work_group_members(&members);
+    let meta = NodeMeta {
+        record_role: RecordRole::Action,
+        activity_kind: ActivityKind::Work,
+        visibility: Visibility::Primary,
+        outcome: aggregate_work_outcome(&members),
+        chain_state: aggregate_chain_state(&members),
+        turn_id: common_turn_id(&members),
+    };
+    HistoryNode::WorkGroup {
+        anchor: std::sync::Arc::new(anchor),
+        source_time,
+        parent_override: None,
+        member_nodes: members,
+        members: represented,
+        summary,
+        meta,
+    }
+}
+
+/// All source operations represented by a work group's direct member nodes.
+#[must_use]
+fn flattened_work_group_members(members: &[HistoryNode]) -> Vec<std::sync::Arc<Op>> {
+    let mut represented = Vec::new();
+    let mut seen = HashSet::new();
+    for member in members {
+        let candidates: Vec<std::sync::Arc<Op>> = match member {
+            HistoryNode::EditOperation { op, .. } => vec![op.clone()],
+            HistoryNode::CollapsedImport { op, sub_ops, .. } => std::iter::once(op.clone())
+                .chain(sub_ops.iter().cloned())
+                .collect(),
+            HistoryNode::ExecuteBundle { members, .. }
+            | HistoryNode::PlanBundle { members, .. }
+            | HistoryNode::WorkGroup { members, .. } => members.clone(),
+            HistoryNode::GitCommit(_) => Vec::new(),
+        };
+        for op in candidates {
+            if seen.insert(op.id) {
+                represented.push(op);
+            }
+        }
+    }
+    represented
+}
+
+/// Deterministic, bounded summary from the whole work interval.
+#[must_use]
+fn work_group_summary(members: &[HistoryNode]) -> String {
+    let mut counts: HashMap<ActivityKind, usize> = HashMap::new();
+    for member in members {
+        collect_activity_counts(member, &mut counts);
+    }
+    let total = counts.values().copied().sum::<usize>();
+    let breakdown = work_breakdown(&counts);
+    let overview = if breakdown.is_empty() {
+        format!("{total} {}", activity_noun(total))
+    } else {
+        format!("{total} {} · {breakdown}", activity_noun(total))
+    };
+    let headline = work_headline(members);
+    if headline.is_empty() || headline == overview {
+        overview
+    } else {
+        format!("{} — {overview}", bounded_summary(&headline, 96))
+    }
+}
+
+/// Count original activity rows recursively through existing inner bundles.
+fn collect_activity_counts(node: &HistoryNode, counts: &mut HashMap<ActivityKind, usize>) {
+    match node {
+        HistoryNode::ExecuteBundle { member_nodes, .. }
+        | HistoryNode::PlanBundle { member_nodes, .. }
+        | HistoryNode::WorkGroup { member_nodes, .. } => {
+            for member in member_nodes {
+                collect_activity_counts(member, counts);
+            }
+        }
+        HistoryNode::EditOperation { .. }
+        | HistoryNode::CollapsedImport { .. }
+        | HistoryNode::GitCommit(_) => {
+            let count = counts.entry(node.activity_kind()).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+}
+
+/// Pick one meaningful member summary, preferring durable/high-signal work.
+#[must_use]
+fn work_headline(members: &[HistoryNode]) -> String {
+    const PRIORITY: [ActivityKind; 11] = [
+        ActivityKind::Change,
+        ActivityKind::Verify,
+        ActivityKind::Diagnose,
+        ActivityKind::Plan,
+        ActivityKind::Explore,
+        ActivityKind::Execute,
+        ActivityKind::Coordinate,
+        ActivityKind::External,
+        ActivityKind::System,
+        ActivityKind::Conversation,
+        ActivityKind::Unknown,
+    ];
+    for activity in PRIORITY {
+        if let Some(summary) = members
+            .iter()
+            .find(|member| member.activity_kind() == activity)
+            .map(HistoryNode::summary)
+            .filter(|summary| !summary.trim().is_empty())
+        {
+            return summary.split_whitespace().collect::<Vec<_>>().join(" ");
+        }
+    }
+    String::new()
+}
+
+/// Stable semantic breakdown ordered by how useful it is in a collapsed row.
+#[must_use]
+fn work_breakdown(counts: &HashMap<ActivityKind, usize>) -> String {
+    const ORDER: [(ActivityKind, &str, &str); 11] = [
+        (ActivityKind::Change, "change", "changes"),
+        (ActivityKind::Verify, "verification", "verifications"),
+        (ActivityKind::Diagnose, "diagnosis", "diagnoses"),
+        (ActivityKind::Plan, "plan", "plans"),
+        (ActivityKind::Explore, "exploration", "explorations"),
+        (ActivityKind::Execute, "run", "runs"),
+        (ActivityKind::Coordinate, "coordination", "coordinations"),
+        (ActivityKind::External, "external event", "external events"),
+        (ActivityKind::System, "system event", "system events"),
+        (
+            ActivityKind::Conversation,
+            "supporting chat",
+            "supporting chats",
+        ),
+        (ActivityKind::Unknown, "other", "other"),
+    ];
+    ORDER
+        .iter()
+        .filter_map(|(kind, singular, plural)| {
+            let count = counts.get(kind).copied().unwrap_or(0);
+            (count > 0).then(|| format!("{count} {}", if count == 1 { *singular } else { *plural }))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+const fn activity_noun(count: usize) -> &'static str {
+    if count == 1 {
+        "activity"
+    } else {
+        "activities"
+    }
+}
+
+/// Character-safe summary bound; UI rows remain one line and retain the
+/// aggregate breakdown even when the chosen member headline is very long.
+#[must_use]
+fn bounded_summary(summary: &str, max_chars: usize) -> String {
+    let mut chars = summary.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}…", prefix.trim_end())
+    } else {
+        prefix
+    }
+}
+
+/// Preserve a turn id only when every member carries that same exact id.
+#[must_use]
+fn common_turn_id(members: &[HistoryNode]) -> Option<TurnId> {
+    let first = members.first()?.turn_id()?;
+    members
+        .iter()
+        .all(|member| member.turn_id() == Some(first))
+        .then_some(first)
+}
+
+/// Fold structured outcomes without inventing success from missing evidence.
+#[must_use]
+fn aggregate_work_outcome(members: &[HistoryNode]) -> Outcome {
+    if members
+        .iter()
+        .any(|member| member.outcome() == Outcome::Failure)
+    {
+        Outcome::Failure
+    } else if members
+        .iter()
+        .any(|member| member.outcome() == Outcome::Cancelled)
+    {
+        Outcome::Cancelled
+    } else if members
+        .iter()
+        .any(|member| member.outcome() == Outcome::Warning)
+    {
+        Outcome::Warning
+    } else if !members.is_empty()
+        && members
+            .iter()
+            .all(|member| member.outcome() == Outcome::Success)
+    {
+        Outcome::Success
+    } else {
+        Outcome::Unknown
     }
 }
 
@@ -1120,9 +1508,10 @@ fn node_anchor_op(node: &HistoryNode) -> Option<&Op> {
         HistoryNode::EditOperation { op, .. } | HistoryNode::CollapsedImport { op, .. } => {
             Some(op.as_ref())
         }
-        HistoryNode::ExecuteBundle { .. }
-        | HistoryNode::PlanBundle { .. }
-        | HistoryNode::GitCommit(_) => None,
+        HistoryNode::ExecuteBundle { anchor, .. }
+        | HistoryNode::PlanBundle { anchor, .. }
+        | HistoryNode::WorkGroup { anchor, .. } => Some(anchor.as_ref()),
+        HistoryNode::GitCommit(_) => None,
     }
 }
 
@@ -1144,7 +1533,24 @@ fn bundle_meta(members: &[HistoryNode]) -> NodeMeta {
         activity_kind: ActivityKind::Execute,
         visibility: Visibility::Primary,
         outcome,
+        chain_state: aggregate_chain_state(members),
         turn_id: members.first().and_then(HistoryNode::turn_id),
+    }
+}
+
+/// A synthetic row is muted only when every activity it replaces is muted.
+/// Mixed groups retain their active presentation so one abandoned member can
+/// never de-emphasize unrelated work sharing the same aggregate row.
+#[must_use]
+fn aggregate_chain_state(members: &[HistoryNode]) -> ChainState {
+    if !members.is_empty()
+        && members
+            .iter()
+            .all(|member| member.chain_state() == ChainState::Muted)
+    {
+        ChainState::Muted
+    } else {
+        ChainState::Active
     }
 }
 
@@ -1184,6 +1590,7 @@ fn member_author_label(node: &HistoryNode) -> String {
         }
         HistoryNode::ExecuteBundle { .. }
         | HistoryNode::PlanBundle { .. }
+        | HistoryNode::WorkGroup { .. }
         | HistoryNode::GitCommit(_) => "system".to_string(),
     }
 }

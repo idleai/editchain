@@ -259,7 +259,7 @@ pub struct SearchRequest {
 /// no row in that view. It never auto-expands or changes expansion state: each
 /// match carries the stable real `node_key` of its top-level row plus the
 /// absolute expanded-history parent-row offset (0 = newest) that matches
-/// `GetWindow` offsets and the `ViewSnapshot.starts` prefix sums the viewer
+/// `GetWindow` offsets and the fixed expanded-row coordinates the viewer
 /// already retains.
 ///
 /// The request carries the exact [`ChainFilterDto`] and `hide_submodules` value
@@ -380,7 +380,7 @@ pub struct ResolvedObject {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "flat versioned wire DTO: each boolean is an independent backward-compatible serde-defaulted flag the viewer toggles (submodule/system/subop/promoted); refactoring to enums would churn the wire contract"
+    reason = "flat versioned wire DTO: each boolean is an independent backward-compatible serde-defaulted flag the viewer toggles (group boundary/submodule/system/subop/promoted); refactoring to enums would churn the wire contract"
 )]
 pub struct HistoryRow {
     /// The operation ID (for `EditChain` ops) in display form `"node:boot:seq"`,
@@ -398,6 +398,11 @@ pub struct HistoryRow {
     pub timestamp_ms: u64,
     /// Grouping key for block separation (session id for ops, repo id for git).
     pub group: String,
+    /// Whether this is the final top-level graph node in its contiguous group
+    /// run. The service computes this against the complete filtered snapshot,
+    /// so clients never infer a false boundary at a virtual-window edge.
+    #[serde(default)]
+    pub group_end: bool,
     /// Stable node key for graph wiring (op id string or git oid hex).
     pub node_key: String,
     /// Parent node keys (for drawing graph edges).
@@ -415,6 +420,8 @@ pub struct HistoryRow {
     ///   target row (the subagent's last op).
     /// - `"fork"` — the parent edge is a `ForkOf` structural note: this row
     ///   branches off the target row at a fork divergence boundary.
+    /// - `"produced_commit"` — this Git row was produced by the parent command
+    ///   operation.
     ///
     /// One entry is listed per parent key in [`Self::parents`] whose edge is
     /// structural (the row's final lifted parents after filtering/splicing),
@@ -456,6 +463,18 @@ pub struct HistoryRow {
     /// connectors (per-row graph cells).
     #[serde(default)]
     pub transitions: Vec<(usize, usize)>,
+    /// Subset of [`Self::above`] whose edge ownership is exclusively muted.
+    /// Omitted when empty for compact snapshot rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub muted_above: Vec<usize>,
+    /// Subset of [`Self::below`] whose edge ownership is exclusively muted.
+    /// Omitted when empty for compact snapshot rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub muted_below: Vec<usize>,
+    /// Subset of [`Self::transitions`] whose edge ownership is exclusively
+    /// muted. Omitted when empty for compact snapshot rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub muted_transitions: Vec<(usize, usize)>,
     /// Bundled metadata sub-ops attached to this row (revealed on click).
     #[serde(default)]
     pub sub_ops: Vec<SubOpSummary>,
@@ -464,8 +483,14 @@ pub struct HistoryRow {
     /// own; they inherit the parent's lane for a continuation line.
     #[serde(default)]
     pub is_subop: bool,
-    /// Absolute row index of the parent's collapsed row, for sub-op rows.
-    /// `None` on top-level rows.
+    /// Nesting depth in the expandable presentation tree. Top-level graph rows
+    /// are `0`; direct work-group members are `1`; children of an existing
+    /// bundle/member are `2`. Older one-level services omit this and default to
+    /// `0` (the `is_subop` flag remains the compatibility signal).
+    #[serde(default)]
+    pub hierarchy_depth: u8,
+    /// Absolute row index of the direct parent row for nested rows. `None` on
+    /// top-level graph rows.
     #[serde(default)]
     pub parent_row: Option<usize>,
     /// Semantic class for the sub-op's icon (e.g. `"meta"`, `"edit"`, `"msg"`,
@@ -490,6 +515,13 @@ pub struct HistoryRow {
     /// is the default — success is never inferred without structured evidence.
     #[serde(default)]
     pub outcome: editchain_project::taxonomy::Outcome,
+    /// Reusable presentation state for this row and its child-owned graph edge.
+    /// Active is the backward-compatible default and is omitted on the wire.
+    #[serde(
+        default,
+        skip_serializing_if = "editchain_project::taxonomy::ChainState::is_active"
+    )]
+    pub chain_state: editchain_project::taxonomy::ChainState,
     /// Provider-neutral turn identity as an exact decimal string (u64 values
     /// above 2^53 round-trip through JavaScript without precision loss).
     /// `None` when the row is not turn-scoped.
@@ -502,6 +534,14 @@ pub struct HistoryRow {
     /// optional because older providers and older imports may omit either one.
     #[serde(default)]
     pub session_meta: Option<SessionMetaDto>,
+    /// Whole-session summary metadata on the session's newest visible row.
+    ///
+    /// This is independent of [`Self::work_unit`]: providers such as Codex mix
+    /// turn-scoped and session-scoped rows, so a work-unit boundary is not
+    /// necessarily a boundary for the complete session. `None` on every other
+    /// row and on services that predate this additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_summary: Option<SessionSummaryDto>,
     /// Stable, additive work-unit metadata for boundary/header rendering.
     ///
     /// Every row in a window carries its opaque work-unit id plus view-stable
@@ -537,6 +577,11 @@ pub struct HistoryRow {
 /// and other large or sensitive session fields stay in the raw record only.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionMetaDto {
+    /// Human-friendly session title captured from the provider's durable
+    /// rename metadata (for example a Claude `custom-title` or Codex thread
+    /// index entry).
+    #[serde(default)]
+    pub session_title: Option<String>,
     /// Model/provider label recorded by the session (for example
     /// `sglang_dsv4`).
     #[serde(default)]
@@ -544,6 +589,17 @@ pub struct SessionMetaDto {
     /// Human-friendly agent nickname, when the provider assigned one.
     #[serde(default)]
     pub agent_nickname: Option<String>,
+}
+
+/// View-wide metadata attached to the true newest row of one session group.
+///
+/// Presence identifies the significant session-summary row without asking the
+/// client to infer it from provider-specific scope or adjacent paged rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSummaryDto {
+    /// Total top-level rows in this session for the current projected view.
+    #[serde(default)]
+    pub count: u64,
 }
 
 /// Stable metadata for the work unit one history row belongs to.
@@ -598,12 +654,15 @@ pub struct ActivityBundleDto {
 
 /// Provider-neutral kinds for an activity bundle row.
 ///
-/// Serialized as kebab-case strings (`"execute-run"`, `"plan-repeat"`). Unknown strings
-/// deserialize to [`Self::Unknown`] so older clients tolerate new bundle kinds
-/// from newer services (forward compatibility).
+/// Serialized as kebab-case strings (`"work-group"`, `"execute-run"`,
+/// `"plan-repeat"`). Unknown strings deserialize to [`Self::Unknown`] so
+/// older clients tolerate new bundle kinds from newer services.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ActivityBundleKind {
+    /// All linear non-chat activity between conversational boundaries. Existing
+    /// execute/plan bundles remain expandable children of this outer group.
+    WorkGroup,
     /// A synthetic Activity-view summary node folding a maximal contiguous
     /// run of low-signal execute rows into one expandable run.
     ExecuteRun,
@@ -633,7 +692,8 @@ pub struct ParentRelationDto {
 
 /// Provider-neutral relationship kinds for a structural parent edge.
 ///
-/// Serialized as lowercase strings (`"subagent"`, `"reconnect"`, `"fork"`).
+/// Serialized as lowercase strings (`"subagent"`, `"reconnect"`, `"fork"`,
+/// `"produced_commit"`).
 /// Unknown strings deserialize to [`Self::Unknown`] so clients tolerate new
 /// structural relationships from newer services; the viewer ignores unknown
 /// kinds instead of breaking.
@@ -647,6 +707,9 @@ pub enum ParentRelationKind {
     Reconnect,
     /// The row branches off the target row at a fork divergence boundary.
     Fork,
+    /// A Git commit row was produced by the parent command operation.
+    #[serde(rename = "produced_commit")]
+    ProducedCommit,
     /// A relationship kind this client does not recognize (forward
     /// compatibility).
     #[serde(other)]
@@ -687,13 +750,30 @@ pub struct HistoryWindow {
     /// Global per-top-level-node bundled sub-op counts for this filter state.
     /// Present on the offset-zero window that establishes a snapshot and omitted
     /// from subsequent pages so response size remains proportional to `limit`.
-    /// The client retains these prefix sums for visible/absolute index mapping.
+    /// Retained for top-level block lookup and compatibility with one-level
+    /// clients; current clients use `expansion_spans` for nested visibility.
     #[serde(default)]
     pub sub_op_counts: Option<Vec<usize>>,
+    /// Global expandable-row spans for this fixed snapshot. Each entry names an
+    /// absolute row and the number of contiguous descendant slots immediately
+    /// following it. Present only on the offset-zero window, like
+    /// `sub_op_counts`. This additive index generalizes one-level sub-op
+    /// collapse to the bounded two-level work-group hierarchy.
+    #[serde(default)]
+    pub expansion_spans: Option<Vec<ExpansionSpanDto>>,
     /// Whether lane/connector fields contain the globally computed layout.
     /// `false` denotes a row-complete provisional first paint.
     #[serde(default)]
     pub layout_ready: bool,
+}
+
+/// One collapsible row's contiguous descendant interval in expanded history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpansionSpanDto {
+    /// Absolute expanded-history row occupied by the expandable parent.
+    pub row: u64,
+    /// Number of descendant slots following `row` in depth-first order.
+    pub descendant_count: u64,
 }
 
 /// Details for a single history node (for the inspector).
@@ -789,7 +869,7 @@ pub struct SearchResponse {
 /// row are deduplicated into one match, keeping the best (highest) BM25 score.
 /// `row` is the absolute expanded-history parent-row offset of the containing
 /// top-level row — the same coordinate the viewer derives from its
-/// `sub_op_counts` prefix sums and the `parent_row` values in `GetWindow`
+/// fixed expanded coordinates and the `parent_row` values in `GetWindow`
 /// responses, so arrow-key navigation never needs to auto-expand anything.
 ///
 /// Identity fields mirror [`SearchHit`] so the viewer can route clicks with the
@@ -913,6 +993,7 @@ mod tests {
             summary: "row".to_string(),
             timestamp_ms: 1_700_000_000_000,
             group: "repo:big".to_string(),
+            group_end: true,
             node_key: big_op_id().to_string(),
             parents: vec![big_op_id().to_string()],
             parent_relations: vec![ParentRelationDto {
@@ -928,16 +1009,22 @@ mod tests {
             above: Vec::new(),
             below: Vec::new(),
             transitions: Vec::new(),
+            muted_above: Vec::new(),
+            muted_below: Vec::new(),
+            muted_transitions: Vec::new(),
             sub_ops: Vec::new(),
             is_subop: false,
+            hierarchy_depth: 0,
             parent_row: None,
             subop_kind: None,
             record_role: editchain_project::taxonomy::RecordRole::Artifact,
             activity_kind: editchain_project::taxonomy::ActivityKind::SourceControl,
             visibility: editchain_project::taxonomy::Visibility::Primary,
             outcome: editchain_project::taxonomy::Outcome::Success,
+            chain_state: editchain_project::taxonomy::ChainState::Active,
             turn_id: Some(OVER_2_53.to_string()),
             session_meta: None,
+            session_summary: None,
             work_unit: None,
             promoted: false,
             activity_bundle: None,
@@ -965,6 +1052,10 @@ mod tests {
         assert_eq!(round_trip["activity_kind"], "source_control");
         assert_eq!(round_trip["visibility"], "primary");
         assert_eq!(round_trip["outcome"], "success");
+        assert!(
+            round_trip.get("chain_state").is_none(),
+            "the default active state stays compact on the wire"
+        );
         assert_eq!(round_trip["turn_id"], "9007199254740993");
         assert_eq!(
             back.record_role,
@@ -1008,6 +1099,13 @@ mod tests {
             sparse.outcome,
             editchain_project::taxonomy::Outcome::Unknown
         );
+        assert_eq!(
+            sparse.chain_state,
+            editchain_project::taxonomy::ChainState::Active
+        );
+        assert!(sparse.muted_above.is_empty());
+        assert!(sparse.muted_below.is_empty());
+        assert!(sparse.muted_transitions.is_empty());
         assert!(sparse.turn_id.is_none());
         // Unknown relationship kinds deserialize to the forward-compatible
         // Unknown variant (and re-serialize as a string), so a newer service
@@ -1020,6 +1118,19 @@ mod tests {
         assert_eq!(unknown.kind, ParentRelationKind::Unknown);
         let reserialized = serde_json::to_string(&unknown).expect("serialize unknown kind");
         assert!(reserialized.contains("\"unknown\""), "got {reserialized}");
+    }
+
+    #[test]
+    fn produced_commit_relation_has_a_stable_protocol_name() {
+        let relation = ParentRelationDto {
+            parent: "1:0:2".to_string(),
+            kind: ParentRelationKind::ProducedCommit,
+        };
+        let json = serde_json::to_value(&relation).expect("serialize produced-commit relation");
+        assert_eq!(json["kind"], "produced_commit");
+        let round_trip: ParentRelationDto =
+            serde_json::from_value(json).expect("deserialize produced-commit relation");
+        assert_eq!(round_trip, relation);
     }
 
     #[test]
@@ -1416,6 +1527,7 @@ mod tests {
             "activity_kind": "gardening",
             "visibility": "spotlight",
             "outcome": "heroic",
+            "chain_state": "retired",
             "turn_id": "9007199254740993",
         }))
         .expect("unknown taxonomy tolerated");
@@ -1432,6 +1544,10 @@ mod tests {
             editchain_project::taxonomy::Visibility::Unknown
         );
         assert_eq!(row.outcome, editchain_project::taxonomy::Outcome::Unknown);
+        assert_eq!(
+            row.chain_state,
+            editchain_project::taxonomy::ChainState::Active
+        );
         assert_eq!(row.turn_id.as_deref(), Some("9007199254740993"));
         let reserialized = serde_json::to_string(&row).expect("serialize row");
         assert!(reserialized.contains("\"record_role\":\"unknown\""));
@@ -1457,8 +1573,10 @@ mod tests {
             "is_submodule": false,
         }))
         .expect("legacy row deserializes");
+        assert!(!legacy.group_end);
         assert_eq!(legacy.work_unit, None);
         assert_eq!(legacy.session_meta, None);
+        assert_eq!(legacy.session_summary, None);
         assert!(!legacy.promoted);
         assert_eq!(legacy.activity_bundle, None);
 
@@ -1470,6 +1588,7 @@ mod tests {
             summary: "row".to_string(),
             timestamp_ms: 1,
             group: "session:1".to_string(),
+            group_end: true,
             node_key: "1:0:1".to_string(),
             parents: Vec::new(),
             parent_relations: Vec::new(),
@@ -1482,19 +1601,26 @@ mod tests {
             above: Vec::new(),
             below: Vec::new(),
             transitions: Vec::new(),
+            muted_above: Vec::new(),
+            muted_below: Vec::new(),
+            muted_transitions: Vec::new(),
             sub_ops: Vec::new(),
             is_subop: false,
+            hierarchy_depth: 0,
             parent_row: None,
             subop_kind: None,
             record_role: editchain_project::taxonomy::RecordRole::Action,
             activity_kind: editchain_project::taxonomy::ActivityKind::Execute,
             visibility: editchain_project::taxonomy::Visibility::Primary,
             outcome: editchain_project::taxonomy::Outcome::Success,
+            chain_state: editchain_project::taxonomy::ChainState::Muted,
             turn_id: Some(OVER_2_53.to_string()),
             session_meta: Some(SessionMetaDto {
+                session_title: Some("r8".to_string()),
                 model_provider: Some("sglang_dsv4".to_string()),
                 agent_nickname: Some("Harvey".to_string()),
             }),
+            session_summary: Some(SessionSummaryDto { count: 87 }),
             work_unit: Some(WorkUnitDto {
                 id: format!("session:1/turn:{OVER_2_53}"),
                 is_start: true,
@@ -1516,11 +1642,15 @@ mod tests {
         assert_eq!(json["work_unit"]["is_start"], true);
         assert_eq!(json["work_unit"]["title"], "request");
         assert_eq!(json["work_unit"]["count"], 12u64);
+        assert_eq!(json["group_end"], true);
         assert_eq!(json["promoted"], true);
         assert_eq!(json["session_meta"]["model_provider"], "sglang_dsv4");
         assert_eq!(json["session_meta"]["agent_nickname"], "Harvey");
+        assert_eq!(json["session_meta"]["session_title"], "r8");
+        assert_eq!(json["session_summary"]["count"], 87u64);
         assert_eq!(json["activity_bundle"]["kind"], "execute-run");
         assert_eq!(json["activity_bundle"]["member_count"], 3u64);
+        assert_eq!(json["chain_state"], "muted");
         let back: HistoryRow = serde_json::from_value(json).expect("deserialize row");
         assert_eq!(
             back.work_unit.as_ref().map(|w| w.id.as_str()),
@@ -1531,6 +1661,11 @@ mod tests {
             .as_ref()
             .is_some_and(|w| w.is_start && !w.is_end));
         assert!(back.promoted);
+        assert_eq!(back.session_summary, Some(SessionSummaryDto { count: 87 }));
+        assert_eq!(
+            back.chain_state,
+            editchain_project::taxonomy::ChainState::Muted
+        );
         assert_eq!(
             back.session_meta
                 .as_ref()
@@ -1559,6 +1694,17 @@ mod tests {
         assert_eq!(plan_back.kind, ActivityBundleKind::PlanRepeat);
         assert_eq!(plan_back.member_count, 3);
 
+        let work_group = ActivityBundleDto {
+            kind: ActivityBundleKind::WorkGroup,
+            member_count: 5,
+        };
+        let work_json = serde_json::to_value(&work_group).expect("serialize work group");
+        assert_eq!(work_json["kind"], "work-group");
+        let work_back: ActivityBundleDto =
+            serde_json::from_value(work_json).expect("deserialize work group");
+        assert_eq!(work_back.kind, ActivityBundleKind::WorkGroup);
+        assert_eq!(work_back.member_count, 5);
+
         // A missing `activity_bundle` member defaults to None, keeping older
         // payloads additive-compatible with the new field.
         let without_bundle: HistoryRow = serde_json::from_value(serde_json::json!({
@@ -1575,6 +1721,7 @@ mod tests {
         }))
         .expect("row without activity_bundle deserializes");
         assert_eq!(without_bundle.activity_bundle, None);
+        assert_eq!(without_bundle.hierarchy_depth, 0);
 
         // Unknown bundle kinds from a newer service deserialize to the
         // forward-compatible Unknown variant (and re-serialize as a string),

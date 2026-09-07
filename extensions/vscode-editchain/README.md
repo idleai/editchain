@@ -80,14 +80,15 @@ The viewer shows a unified, paged history list (EditChain ops + git commits)
 with in-place **Find-in-Chain** search over the real history view, plus an
 explicit read-only raw JSON editor (Enter or double-click on a selected row).
 The old filtering controls are intentionally absent while their replacement is
-designed. The temporary fixed view shows all operation kinds and undated rows,
-hides nested Git repositories/submodules, applies no summary/kind pattern, and
-splices hidden intermediates for graph continuity.
+designed. The temporary fixed view shows all dated operation kinds, omits rows
+whose timestamp is unknown (`timestamp_ms == 0`), hides nested Git
+repositories/submodules, applies no summary/kind pattern, and splices hidden
+intermediates for graph continuity.
 
 Find-in-Chain is in-place: the service runs a Tantivy **BM25 lexical** search
 and maps/dedupes every scored chunk to the real top-level row that renders it
-under the **exact** active chain filter/profile (the same `hide_submodules` +
-`ChainFilterDto` the view was fetched with), so the history DOM, profile,
+under the **exact** fixed Activity filter (the same `hide_submodules` +
+`ChainFilterDto` the view was fetched with), so the history DOM, presentation,
 expansion, cache, and layout are never replaced — the find only scrolls and
 highlights. A settled search auto-jumps to and highlights match 1, shows an
 adjacent `i of N` counter (`N+` when the candidate cap truncated retrieval),
@@ -99,9 +100,8 @@ top-level row without auto-expanding anything. Git hits carry their real
 identity (`git_oid` lowercase hex, exact decimal `repository`, `kind: "git"`,
 `is_submodule`), so opening a git match resolves by `ResolveObject` — never by
 the synthetic index-only `op_id`. Rapid consecutive searches are
-latest-query-wins. Only the profile and viewport row are restored across
-recreated panels; switching the Activity/Raw profile exits the find and
-refetches from offset 0.
+latest-query-wins. Only the viewport row is restored across recreated panels;
+the extension always uses Activity presentation (`hide_trace=true`).
 
 The result counter and **Previous/Next** chevrons are embedded inside the same
 bordered search field, matching VS Code's built-in find controls. The chevrons
@@ -160,8 +160,8 @@ shipped UI.
     from the production controller: view/search generations, request
     correlation (including synchronous fixture-response reentrancy), the
     sparse window cache, virtual paging (`PAGE=500`, `BUFFER=400`,
-    `ROW_H=34`), Activity/Raw profile switching, find-in-chain sessions,
-    expansion, persistence, and render planning.
+    `ROW_H=34`), the fixed Activity filter, find-in-chain sessions, expansion,
+    persistence, and render planning.
   - `RowSpec` (`app/rows.rs`) — the pure row presentation model: stable
     `data-key` identity for top-level and sub-op rows, the exact CSS classes
     and ARIA attributes (roving tabindex, `aria-selected`, `aria-expanded`,
@@ -171,11 +171,10 @@ shipped UI.
   - web-sys DOM shell (`app/dom.rs`) — renders rows as real DOM/text nodes
     (never application `innerHTML` strings), the `role="grid"` table with
     `aria-rowcount`, per-row `role="row"` + gridcell roles, live-region
-    announcements (`#status-live`, `#gpu-live`), labelled profile/search
+    announcements (`#status-live`, `#gpu-live`), labelled search
     controls, one aria-hidden `svg.graph-row-fragment` per hydrated row inside
     its `.graph-cell`, the inert `#gpu-canvas-host` container (no canvas is
-    ever created), the `#gpu-rows` frame mirror, and scroll-window mutations +
-    profile-control state.
+    ever created), the `#gpu-rows` frame mirror, and scroll-window mutations.
   - Per-row SVG graph rendering (`app/dom.rs` + `row_graph_items`) — paints
     each row's graph from the pure `RowSpec` items (local-cell lane halves,
     cross-lane transition halves, the centered node dot, bundle glyphs) as
@@ -247,8 +246,8 @@ and correlated numeric-id window replies drive `dataReady`; `role="grid"` +
 `#gpu-canvas-host` stays empty and no foreign canvases exist); one
 aria-hidden `svg.graph-row-fragment` per hydrated row; the `#gpu-rows` mirror;
 the nominal low-lane Pulse pitch `[14.76, 29.52, …]` unchanged across a viewport
-change; and the functional path through the Rust shell — Activity→Raw→Activity
-profile switching with `hide_trace` flipping, find-in-chain submit/next/clear
+change; and the functional path through the Rust shell — fixed Activity
+presentation with no profile mutation surface, find-in-chain submit/next/clear
 with pending/busy ARIA, row selection + roving keyboard + raw-JSON identity,
 chevron disclosure with `aria-expanded` and sub-op reveal, and the legacy
 flat-list `Search` — plus a screenshot under `trace/rust-smoke.png`. It also
@@ -277,7 +276,7 @@ npm run ui:vscode   # requires xvfb on headless servers (wrapped automatically)
   asserts rows render, then **injects the same `window.__editchainDebug` probe**
   (`test/vscode/layoutProbe.js`) into the webview and runs the identical textual
   checks inside real VS Code. It also exercises inline selection/raw JSON,
-  Activity/Raw profile switching, scroll-through-history, and Find-in-Chain
+  the fixed Activity presentation, scroll-through-history, and Find-in-Chain
   against the native service. The find test verifies the preserved real chain,
   counter, highlighted row, input focus, the visible Previous/Next chevron
   buttons (labels, enabled state, and real mouse clicks navigating forward,
@@ -302,8 +301,8 @@ npm run ui:vscode:gpu
   canvases (the inert `#gpu-canvas-host` stays empty), one aria-hidden
   `svg.graph-row-fragment` per hydrated row, the `#gpu-rows` mirror matching
   the snapshot, and a deterministic `whenIdle` settle. It then drives a compact
-  production path inside the Rust-backed panel — Activity→Raw→Activity profile
-  switching, find-in-chain submit + next + clear, scrolling/paging, and inline
+  production path inside the Rust-backed panel — fixed Activity presentation,
+  find-in-chain submit + next + clear, scrolling/paging, and inline
   selection + keyboard roving (raw JSON stays closed: the harness covers the
   exact `openJson` envelope) — writes `trace/e2e-history-gpu-contract.json`,
   and captures the single-panel webview frame

@@ -15,8 +15,8 @@
 //! - content/summary formatting inputs (`summary`, `displaySummaryForRow`,
 //!   `plainRowSummary`, Git prefix chips, deterministic Markdown summary
 //!   structure),
-//! - date/author/commit labels, kind classes, badge chrome, work-unit headers,
-//!   typed Activity bundles, promotion rails, session chips and disclosure
+//! - date/author/commit labels, kind classes, row tags, work-unit headers,
+//!   typed Activity bundles, promotion rails, session provenance and disclosure
 //!   metadata,
 //! - graph data consumed by the wgpu frame contract (`lane`, `above`, `below`,
 //!   `transitions`, `is_subop`, `is_bundle`), and
@@ -51,30 +51,32 @@ use std::collections::VecDeque;
 use serde_json::Value;
 
 use super::host::row as wire;
+use crate::ChainState;
 
-/// The active view profile (`profile === 'activity'` in `main.js`).
+/// Row presentation mode. Production always constructs [`Self::Activity`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ViewMode {
-    /// Renders the additive work-unit/bundle/promotion semantic layer.
+    /// The shipped semantic work-unit/bundle/promotion presentation.
     Activity,
-    /// Renders the exact flat row with none of the semantic layer.
+    /// Retained only for pure compatibility tests of the former raw UI.
+    #[cfg(test)]
     Raw,
 }
 
 /// Shell-owned state a row build depends on (selection, find highlight,
-/// expansion, roving tabindex, group boundary, profile).
+/// expansion, roving tabindex, and group boundary).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RowContext {
     pub(crate) view: ViewMode,
     /// Absolute expanded-history index (`data-row`).
     pub(crate) abs_index: i64,
-    /// Whether this row opens a new `group` run (`row-group-start` chip).
+    /// Whether this row opens a new `group` run (`row-group-start` divider).
     pub(crate) is_group_start: bool,
     /// The selected row's `node_key` (`selectedRowKey`), if any.
     pub(crate) selected_key: Option<String>,
     /// Whether this absolute index is the current find-in-chain match.
     pub(crate) find_current: bool,
-    /// Whether this row's sub-op block is revealed (`expandedBlocks`).
+    /// Whether this row's descendant span is revealed.
     pub(crate) expanded: bool,
     /// The roving-tabindex row (`rovingAbs`); exactly one per window is 0.
     pub(crate) roving_abs: Option<i64>,
@@ -119,6 +121,9 @@ pub(crate) struct RowIdentity {
     /// Stable wire identity (`data-key`; selection compares on it).
     pub(crate) node_key: String,
     pub(crate) is_subop: bool,
+    /// Presentation hierarchy depth (`0` top-level, `1` work member, `2`
+    /// existing detail/bundle member nested beneath that work member).
+    pub(crate) hierarchy_depth: u8,
     /// `subop_kind` wire value (Codicon selector; `meta`/unknown -> `info`).
     pub(crate) subop_kind: String,
     pub(crate) op_id: String,
@@ -128,22 +133,29 @@ pub(crate) struct RowIdentity {
     pub(crate) turn_id: String,
 }
 
-/// Graph fields the wgpu frame consumes, verbatim from the wire row.
+/// Graph fields the row-local SVG renderer and retained frame contract consume,
+/// verbatim from the wire row.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct GraphData {
     pub(crate) lane: u32,
     pub(crate) above: Vec<u32>,
     pub(crate) below: Vec<u32>,
     pub(crate) transitions: Vec<(u32, u32)>,
+    pub(crate) muted_above: Vec<u32>,
+    pub(crate) muted_below: Vec<u32>,
+    pub(crate) muted_transitions: Vec<(u32, u32)>,
+    /// Presentation state for this row's own dot/capsule.
+    pub(crate) chain_state: ChainState,
     pub(crate) is_subop: bool,
     pub(crate) is_bundle: bool,
+    /// Whether this bundle's members are currently revealed.
+    pub(crate) expanded: bool,
 }
 
-/// The frozen `ROW_BADGE_OPTIONS` visibility switches (both default off).
+/// The frozen outcome-badge visibility switch (default off).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct BadgeOptions {
     pub(crate) show_success_outcome: bool,
-    pub(crate) show_source_control_activity: bool,
 }
 
 /// The production whitelisted record-role classes (`RECORD_ROLE_CLASSES`).
@@ -253,15 +265,67 @@ pub(crate) fn short_id(id: &str) -> String {
     chars.into_iter().skip(keep_from).collect()
 }
 
-/// `groupLabelText` — human label for a block-separator group key.
-pub(crate) fn group_label_text(group: &str) -> String {
+/// Human subtitle for either endpoint of a connected graph chain.
+/// Provider titles replace opaque session ids; a distinct named subagent is
+/// appended without repeating providers that store the session title in both
+/// fields.
+pub(crate) fn group_label_text(
+    group: &str,
+    session_title: Option<&str>,
+    agent_nickname: Option<&str>,
+) -> String {
     if let Some(rest) = group.strip_prefix("repo:") {
-        format!("Git · repo {}", short_id(rest))
-    } else if let Some(rest) = group.strip_prefix("session:") {
-        format!("Session {}", short_id(rest))
-    } else {
-        "EditChain ops".to_owned()
+        return format!("Git · repo {}", short_id(rest));
     }
+    let title = session_title
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
+    let mut label = title.map_or_else(
+        || {
+            group.strip_prefix("session:").map_or_else(
+                || "EditChain ops".to_owned(),
+                |rest| format!("Session {}", short_id(rest)),
+            )
+        },
+        str::to_owned,
+    );
+    if let Some(agent) = agent_nickname
+        .map(str::trim)
+        .filter(|agent| !agent.is_empty())
+        .filter(|agent| !agent.eq_ignore_ascii_case(&label))
+    {
+        label.push_str(" · ");
+        label.push_str(agent);
+    }
+    label
+}
+
+/// Whether this row's own graph node has an open side.
+///
+/// `above` and `below` carry same-lane half-segments. Cross-lane bends carry
+/// the remaining connection at the node: parent-anchored bends end at the dot
+/// from above, while child-anchored bends start at the dot toward below. A
+/// graph subtitle belongs only on a true tip or root, never merely on a group
+/// boundary that happens to lie inside a continuing chain.
+fn is_graph_endpoint(row: &Value) -> bool {
+    let lane = wire::lane(row);
+    let above = wire::above(row);
+    let below = wire::below(row);
+    let transitions = wire::transitions(row);
+    let connected_above =
+        above.contains(&lane) || transitions.iter().any(|&(_, to_lane)| to_lane == lane);
+    let connected_below =
+        below.contains(&lane) || transitions.iter().any(|&(from_lane, _)| from_lane == lane);
+
+    !connected_above || !connected_below
+}
+
+fn session_meta_field<'a>(row: &'a Value, field: &str) -> Option<&'a str> {
+    row.get("session_meta")
+        .and_then(|meta| meta.get(field))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 /// `shortCommitId` — display value for the Commit/ID column.
@@ -995,14 +1059,17 @@ impl Summary {
     }
 }
 
-/// The summary row content: optional Git prefix chip + markdown content.
+/// The summary row content after any Git prefix has moved to the Tags column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RowSummary {
-    /// `gitSummaryParts` prefix chip (`title`/`aria-label` "Commit prefix: …").
+    /// `gitSummaryParts` prefix used to build the separate Tags-column chip.
     pub(crate) git_prefix: Option<String>,
     /// Rendered markdown of the content after the colon; `None` when a Git
     /// prefix leaves no content span (production renders no content then).
     pub(crate) content: Option<Summary>,
+    /// Plain DOM text for `content`, kept separate from the row's full plain
+    /// summary so a rendered Git prefix is not repeated beside its chip.
+    pub(crate) plain_content: Option<String>,
 }
 
 /// Split a Git conventional prefix from the first colon (`gitSummaryParts`).
@@ -1030,9 +1097,19 @@ pub(crate) fn git_summary_parts(row: &Value, value: &str) -> Option<(String, Str
 }
 
 impl RowSummary {
-    /// `renderRowSummary` semantics minus markup: git chip + content summary.
+    /// Parse the content summary and its separate Tags-column Git prefix.
     pub(crate) fn parse(row: &Value, display_summary: &str) -> RowSummary {
         if let Some((prefix, content)) = git_summary_parts(row, display_summary) {
+            let plain_content = if content.is_empty() {
+                None
+            } else {
+                let plain = markdown_plain_summary(&content);
+                Some(if plain.is_empty() {
+                    "(no summary)".to_owned()
+                } else {
+                    plain
+                })
+            };
             RowSummary {
                 git_prefix: Some(prefix),
                 content: if content.is_empty() {
@@ -1040,11 +1117,18 @@ impl RowSummary {
                 } else {
                     Some(Summary::parse(&content))
                 },
+                plain_content,
             }
         } else {
+            let plain = markdown_plain_summary(display_summary);
             RowSummary {
                 git_prefix: None,
                 content: Some(Summary::parse(display_summary)),
+                plain_content: Some(if plain.is_empty() {
+                    "(no summary)".to_owned()
+                } else {
+                    plain
+                }),
             }
         }
     }
@@ -1890,12 +1974,12 @@ fn tool_wrapper_len(candidate: &str) -> Option<usize> {
 
 // --- Badge / chrome layer ---------------------------------------------------
 
-/// One assembled chrome token (DOM-ready exact class list, text, titles).
+/// One assembled row tag (DOM-ready exact class list, text, and labels).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChromeItem {
     /// Exact production class list (e.g. `"rel-badge rel-subagent"`).
     pub(crate) classes: String,
-    /// Display text (rel glyph + label, activity/outcome text, bundle count).
+    /// Display text (relation glyph + label, outcome, prefix, or count).
     pub(crate) text: String,
     /// Hover title.
     pub(crate) title: String,
@@ -1991,9 +2075,13 @@ pub(crate) fn relation_badges(row: &Value) -> Vec<ChromeItem> {
     out
 }
 
-/// The `ACTIVITY_LABELS` whitelist (no `conversation` badge, by design).
+/// Provider-neutral activities with concise labels for the dedicated Activity
+/// column. Conversation rows are refined to `agent` or `user` from their
+/// author; the remaining values are presentation labels rather than badges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ActivityKind {
+    Work,
+    Conversation,
     Plan,
     Explore,
     Execute,
@@ -2009,6 +2097,8 @@ pub(crate) enum ActivityKind {
 impl ActivityKind {
     pub(crate) fn from_wire(kind: &str) -> Option<ActivityKind> {
         match kind {
+            "work" => Some(ActivityKind::Work),
+            "conversation" => Some(ActivityKind::Conversation),
             "plan" => Some(ActivityKind::Plan),
             "explore" => Some(ActivityKind::Explore),
             "execute" => Some(ActivityKind::Execute),
@@ -2023,26 +2113,13 @@ impl ActivityKind {
         }
     }
 
-    pub(crate) fn class(self) -> &'static str {
-        match self {
-            ActivityKind::Plan => "act-plan",
-            ActivityKind::Explore => "act-explore",
-            ActivityKind::Execute => "act-execute",
-            ActivityKind::Change => "act-change",
-            ActivityKind::Verify => "act-verify",
-            ActivityKind::Diagnose => "act-diagnose",
-            ActivityKind::Coordinate => "act-coordinate",
-            ActivityKind::SourceControl => "act-source-control",
-            ActivityKind::External => "act-external",
-            ActivityKind::System => "act-system",
-        }
-    }
-
     pub(crate) fn text(self) -> &'static str {
         match self {
+            ActivityKind::Work => "work",
+            ActivityKind::Conversation => "agent",
             ActivityKind::Plan => "plan",
             ActivityKind::Explore => "explore",
-            ActivityKind::Execute => "run",
+            ActivityKind::Execute => "tooluse",
             ActivityKind::Change => "change",
             ActivityKind::Verify => "verify",
             ActivityKind::Diagnose => "diagnose",
@@ -2052,6 +2129,98 @@ impl ActivityKind {
             ActivityKind::System => "system",
         }
     }
+}
+
+/// One resolved value for the dedicated Activity column. Every real row gets
+/// a non-empty label; placeholders intentionally retain the empty default.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct RowClassification {
+    /// Compact visual label (`tooluse`, `git`, `agent`, `user`, or a wire fallback).
+    pub(crate) label: String,
+    /// Field used to resolve the label (`activity_kind`, `kind`, etc.).
+    pub(crate) source: String,
+    /// Hover/accessibility description retaining the unshortened wire value.
+    pub(crate) title: String,
+}
+
+impl RowClassification {
+    fn new(label: &str, source: &str, wire_value: &str) -> RowClassification {
+        let source_title = match source {
+            "activity_kind" => "Activity",
+            "kind" => "Kind",
+            "record_role" => "Record role",
+            "is_system" => "System classification",
+            "git_oid" => "Git identity",
+            _ => "Classification",
+        };
+        RowClassification {
+            label: label.to_owned(),
+            source: source.to_owned(),
+            title: format!("{source_title}: {wire_value}"),
+        }
+    }
+
+    fn session_summary() -> RowClassification {
+        RowClassification {
+            label: "session".to_owned(),
+            source: "session_summary".to_owned(),
+            title: "Session summary".to_owned(),
+        }
+    }
+}
+
+/// Whether a wire token is useful as a visible classification fallback.
+fn classification_token(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty() && trimmed != "unknown").then_some(trimmed)
+}
+
+/// Turn a provider-neutral wire token into a compact display fallback.
+fn classification_fallback(value: &str) -> String {
+    value.trim().replace('_', "-")
+}
+
+/// Resolve the stable Activity-column value. Semantic activity wins, except
+/// that Git identity is authoritative even for sparse/older rows; then kind,
+/// record role, and a final `other` label guarantee a populated real row.
+pub(crate) fn row_classification(row: &Value) -> RowClassification {
+    let kind = row_str(row, "kind");
+    let activity = row_str(row, "activity_kind");
+    let git_oid = row_str(row, "git_oid");
+    if !git_oid.is_empty() || kind == "git" {
+        return if activity == "source_control" {
+            RowClassification::new("git", "activity_kind", "source_control")
+        } else if !git_oid.is_empty() {
+            RowClassification::new("git", "git_oid", &git_oid)
+        } else {
+            RowClassification::new("git", "kind", "git")
+        };
+    }
+
+    if let Some(activity_kind) = ActivityKind::from_wire(activity.trim()) {
+        let label = if activity_kind == ActivityKind::Conversation
+            && matches!(row_str(row, "author").trim(), "human" | "user")
+        {
+            "user"
+        } else {
+            activity_kind.text()
+        };
+        return RowClassification::new(label, "activity_kind", activity.trim());
+    }
+
+    if wire::bool(row, "is_system") {
+        return RowClassification::new("system", "is_system", "true");
+    }
+    if let Some(kind) = classification_token(&kind) {
+        return RowClassification::new(&classification_fallback(kind), "kind", kind);
+    }
+
+    let role = row_str(row, "record_role");
+    if let Some(role) = classification_token(&role) {
+        return RowClassification::new(&classification_fallback(role), "record_role", role);
+    }
+
+    RowClassification::new("other", "fallback", "other")
 }
 
 /// The `OUTCOME_LABELS` whitelist.
@@ -2102,21 +2271,6 @@ impl OutcomeKind {
     }
 }
 
-/// `activityBadge` with the frozen visibility switches.
-pub(crate) fn activity_badge(row: &Value, options: BadgeOptions) -> Option<ChromeItem> {
-    let wire_kind = row_str(row, "activity_kind");
-    if wire_kind == "source_control" && !options.show_source_control_activity {
-        return None;
-    }
-    let kind = ActivityKind::from_wire(&wire_kind)?;
-    Some(ChromeItem::new(
-        &format!("act-badge {}", kind.class()),
-        kind.text(),
-        &format!("activity: {wire_kind}"),
-        Some(&format!("activity: {}", kind.text())),
-    ))
-}
-
 /// `outcomeBadge` with the frozen visibility switches.
 pub(crate) fn outcome_badge(row: &Value, options: BadgeOptions) -> Option<ChromeItem> {
     let wire_outcome = row_str(row, "outcome");
@@ -2132,8 +2286,8 @@ pub(crate) fn outcome_badge(row: &Value, options: BadgeOptions) -> Option<Chrome
     ))
 }
 
-/// `relationBadges` + a consequential outcome badge (relations outrank generic
-/// activity).
+/// `relationBadges` + a consequential outcome badge. Structural relations
+/// take over the semantic-tag slot; Activity remains in its own column.
 fn relation_chrome(row: &Value, options: BadgeOptions) -> Vec<ChromeItem> {
     let mut items = relation_badges(row);
     if !items.is_empty() {
@@ -2147,7 +2301,8 @@ fn relation_chrome(row: &Value, options: BadgeOptions) -> Vec<ChromeItem> {
     items
 }
 
-/// `rowSemanticChrome` — the row's restrained leading metadata.
+/// `rowSemanticChrome` — restrained row tags. Activity is rendered in its own
+/// grid column and is intentionally absent here.
 pub(crate) fn row_semantic_chrome(
     row: &Value,
     is_bundle: bool,
@@ -2162,9 +2317,6 @@ pub(crate) fn row_semantic_chrome(
         return relations;
     }
     let mut items = Vec::new();
-    if let Some(activity) = activity_badge(row, options) {
-        items.push(activity);
-    }
     if let Some(outcome) = outcome_badge(row, options) {
         items.push(outcome);
     }
@@ -2183,6 +2335,13 @@ pub(crate) struct WorkUnitData {
     pub(crate) is_end: bool,
 }
 
+/// The additive `session_summary` payload present on one Activity row per
+/// session group.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct SessionSummaryData {
+    pub(crate) count: Option<u64>,
+}
+
 /// Compact two-line header metadata for a work-unit start row.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct WorkUnitHeader {
@@ -2192,13 +2351,12 @@ pub(crate) struct WorkUnitHeader {
     pub(crate) count_text: String,
     pub(crate) count_title: String,
     pub(crate) title_only: bool,
-    /// Whether session chips render in the ribbon (raw group boundary).
-    pub(crate) session_chips: bool,
 }
 
 /// `WORK_UNIT_FALLBACK_LABELS` — short human labels keyed by activity kind.
 fn work_unit_fallback(activity_kind: &str) -> Option<&'static str> {
     match activity_kind {
+        "work" => Some("Work"),
         "execute" => Some("Run"),
         "change" => Some("Change"),
         "verify" => Some("Verify"),
@@ -2236,6 +2394,21 @@ pub(crate) fn work_unit_of(row: &Value, view: ViewMode) -> Option<WorkUnitData> 
     })
 }
 
+/// Read the explicit whole-session marker emitted on the session's true newest
+/// visible row. Work-unit identity is intentionally irrelevant: Codex mixes
+/// turn-scoped rows with session-scoped lifecycle rows.
+pub(crate) fn session_summary_of(row: &Value, view: ViewMode) -> Option<SessionSummaryData> {
+    if view != ViewMode::Activity || wire::bool(row, "is_subop") {
+        return None;
+    }
+    let summary = row
+        .get("session_summary")
+        .filter(|value| js_truthy(value))?;
+    Some(SessionSummaryData {
+        count: summary.get("count").and_then(Value::as_u64),
+    })
+}
+
 /// `workUnitTitle` — DTO title's first meaningful line, else human fallbacks.
 pub(crate) fn work_unit_title(row: &Value, view: ViewMode) -> String {
     if let Some(wu) = work_unit_of(row, view) {
@@ -2259,7 +2432,7 @@ pub(crate) fn work_unit_title(row: &Value, view: ViewMode) -> String {
     if kind == "message" || kind == "command" {
         return "Request".to_owned();
     }
-    group_label_text(&row_str(row, "group"))
+    group_label_text(&row_str(row, "group"), None, None)
 }
 
 /// `workUnitCountText` — human count text for a unit header.
@@ -2275,6 +2448,11 @@ pub(crate) fn show_work_unit_count(row: &Value, wu: &WorkUnitData) -> bool {
 /// `workUnitCountTitle` — tooltip explaining what the count measures.
 pub(crate) fn work_unit_count_title(count: u64) -> String {
     format!("{} grouped in this activity", work_unit_count_text(count))
+}
+
+/// Tooltip for the whole-session count shown on a session-summary row.
+pub(crate) fn session_summary_count_title(count: u64) -> String {
+    format!("{} in this session", work_unit_count_text(count))
 }
 
 /// One session-provenance chip (`sessionMetaValues` item).
@@ -2326,6 +2504,7 @@ pub(crate) fn session_meta_description(row: &Value) -> String {
 /// The typed Activity-bundle kinds the renderer understands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BundleKind {
+    WorkGroup,
     ExecuteRun,
     PlanRepeat,
 }
@@ -2333,6 +2512,7 @@ pub(crate) enum BundleKind {
 impl BundleKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            BundleKind::WorkGroup => "work-group",
             BundleKind::ExecuteRun => "execute-run",
             BundleKind::PlanRepeat => "plan-repeat",
         }
@@ -2340,6 +2520,7 @@ impl BundleKind {
 
     pub(crate) fn from_wire(kind: &str) -> Option<BundleKind> {
         match kind {
+            "work-group" => Some(BundleKind::WorkGroup),
             "execute-run" => Some(BundleKind::ExecuteRun),
             "plan-repeat" => Some(BundleKind::PlanRepeat),
             _ => None,
@@ -2349,7 +2530,7 @@ impl BundleKind {
 
 /// `activityBundleKind` — the recognized typed bundle kind of a row.
 pub(crate) fn activity_bundle_kind(row: &Value, view: ViewMode) -> Option<BundleKind> {
-    if view != ViewMode::Activity || wire::bool(row, "is_subop") {
+    if view != ViewMode::Activity {
         return None;
     }
     let bundle = row
@@ -2397,6 +2578,12 @@ pub(crate) fn bundle_count_text(row: &Value, view: ViewMode) -> String {
     else {
         return String::new();
     };
+    if kind == BundleKind::WorkGroup {
+        return format!(
+            "{member_count} activit{}",
+            if member_count == 1 { "y" } else { "ies" }
+        );
+    }
     if kind == BundleKind::PlanRepeat {
         return format!(
             "{member_count} update{}",
@@ -2564,19 +2751,17 @@ pub(crate) struct Disclosure {
     pub(crate) label: String,
 }
 
-/// Sub-op row content: small Codicon + indented summary.
+/// Sub-op row content: small Codicon and indented summary. Semantic tags live
+/// in the dedicated Tags column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SubopContent {
     pub(crate) icon: &'static str,
     pub(crate) summary: Summary,
 }
 
-/// Top-level row content: chevron + session slot + chrome + summary.
+/// Top-level row content after all chip-like metadata moves to Tags.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TopContent {
-    pub(crate) chevron: Option<Disclosure>,
-    pub(crate) session_slot: bool,
-    pub(crate) chrome: Vec<ChromeItem>,
     pub(crate) summary: Option<RowSummary>,
 }
 
@@ -2611,12 +2796,15 @@ pub(crate) struct RowSpec {
     pub(crate) kind: String,
     pub(crate) record_role: String,
     pub(crate) activity_kind: String,
+    pub(crate) classification: RowClassification,
     pub(crate) outcome: String,
     pub(crate) group: String,
     pub(crate) kind_class: KindClass,
     pub(crate) role_class: Option<&'static str>,
     pub(crate) flags: RowFlags,
     pub(crate) state: StateFlags,
+    /// Activity-column disclosure rendered immediately after the activity label.
+    pub(crate) disclosure: Option<Disclosure>,
     pub(crate) content_flags: ContentFlags,
     pub(crate) author_text: String,
     pub(crate) date_text: String,
@@ -2626,10 +2814,11 @@ pub(crate) struct RowSpec {
     pub(crate) display_summary: String,
     pub(crate) plain_summary: String,
     pub(crate) detail_summary: String,
-    pub(crate) chrome: Vec<ChromeItem>,
-    pub(crate) session: Vec<SessionChip>,
+    /// Ordered chips rendered exclusively in the dedicated Tags column.
+    pub(crate) tags: Vec<ChromeItem>,
     pub(crate) session_description: String,
     pub(crate) work_unit: Option<WorkUnitData>,
+    pub(crate) session_summary: Option<SessionSummaryData>,
     pub(crate) work_unit_header: Option<WorkUnitHeader>,
     pub(crate) bundle: Option<BundleInfo>,
     pub(crate) promoted: Option<PromotedKind>,
@@ -2648,12 +2837,14 @@ impl Default for RowSpec {
             kind: String::new(),
             record_role: String::new(),
             activity_kind: String::new(),
+            classification: RowClassification::default(),
             outcome: String::new(),
             group: String::new(),
             kind_class: KindClass::Plain,
             role_class: None,
             flags: RowFlags::default(),
             state: StateFlags::default(),
+            disclosure: None,
             content_flags: ContentFlags::default(),
             author_text: String::new(),
             date_text: String::new(),
@@ -2663,10 +2854,10 @@ impl Default for RowSpec {
             display_summary: String::new(),
             plain_summary: String::new(),
             detail_summary: String::new(),
-            chrome: Vec::new(),
-            session: Vec::new(),
+            tags: Vec::new(),
             session_description: String::new(),
             work_unit: None,
+            session_summary: None,
             work_unit_header: None,
             bundle: None,
             promoted: None,
@@ -2713,11 +2904,20 @@ impl RowSpec {
             .is_some_and(|key| key == node_key);
         let work_unit = work_unit_of(row, view);
         let is_work_unit_start = work_unit.as_ref().is_some_and(|wu| wu.is_start);
+        let session_summary = session_summary_of(row, view);
+        let is_session_summary = session_summary.is_some();
+        let has_boundary_header = work_unit.is_some() && (is_work_unit_start || is_session_summary);
         let bundle_kind = activity_bundle_kind(row, view);
         let is_bundle = bundle_kind.is_some();
+        let is_work_group = bundle_kind == Some(BundleKind::WorkGroup);
         let is_execute_run = bundle_kind == Some(BundleKind::ExecuteRun);
         let is_plan_repeat = bundle_kind == Some(BundleKind::PlanRepeat);
-        let chrome = row_semantic_chrome(row, is_bundle, view, BadgeOptions::default());
+        let semantic_tags = row_semantic_chrome(row, is_bundle, view, BadgeOptions::default());
+        let classification = if is_session_summary {
+            RowClassification::session_summary()
+        } else {
+            row_classification(row)
+        };
         let session = session_meta_values(row);
         let has_session_meta = !is_subop && !session.is_empty();
         let session_description = session_meta_description(row);
@@ -2736,7 +2936,7 @@ impl RowSpec {
         } else {
             detail_summary
         };
-        let unit_title = if is_work_unit_start {
+        let unit_title = if has_boundary_header {
             work_unit_title(row, view)
         } else {
             String::new()
@@ -2745,7 +2945,7 @@ impl RowSpec {
             .get("sub_ops")
             .and_then(Value::as_array)
             .map_or(0usize, Vec::len);
-        let has_subs = !is_subop && has_sub_ops(row);
+        let has_subs = has_sub_ops(row);
         let expanded_state = has_subs && context.expanded;
         let expandable = has_subs;
         let child_label = if is_bundle {
@@ -2771,8 +2971,69 @@ impl RowSpec {
         } else {
             None
         };
-        let has_badges = !chrome.is_empty()
-            || (has_session_meta && context.is_group_start && !session.is_empty());
+        let row_summary =
+            (!is_subop && !is_execute_run).then(|| RowSummary::parse(row, &display_summary));
+        let work_unit_header = if has_boundary_header {
+            work_unit.as_ref().map(|wu| {
+                let count = if is_session_summary {
+                    session_summary.as_ref().and_then(|summary| summary.count)
+                } else {
+                    wu.count
+                };
+                WorkUnitHeader {
+                    id: wu.id.clone(),
+                    title: unit_title.clone(),
+                    show_count: if is_session_summary {
+                        count.is_some_and(|count| count > 1)
+                    } else {
+                        show_work_unit_count(row, wu)
+                    },
+                    count_text: count.map_or_else(String::new, work_unit_count_text),
+                    count_title: count.map_or_else(String::new, |count| {
+                        if is_session_summary {
+                            session_summary_count_title(count)
+                        } else {
+                            work_unit_count_title(count)
+                        }
+                    }),
+                    title_only: unit_title == plain_summary,
+                }
+            })
+        } else {
+            None
+        };
+
+        // Tags have one stable, row-level home. Preserve semantic ordering,
+        // then add summary/session provenance that previously occupied several
+        // different positions inside Content.
+        let mut tags = semantic_tags;
+        if let Some(header) = work_unit_header.as_ref().filter(|header| header.show_count) {
+            tags.push(ChromeItem::new(
+                "work-unit-count",
+                &header.count_text,
+                &header.count_title,
+                None,
+            ));
+        }
+        if let Some(prefix) = row_summary
+            .as_ref()
+            .and_then(|summary| summary.git_prefix.as_deref())
+        {
+            let label = format!("Commit prefix: {prefix}");
+            tags.push(ChromeItem::new(
+                "git-prefix-chip",
+                prefix,
+                &label,
+                Some(&label),
+            ));
+        }
+        if context.is_group_start && has_session_meta {
+            tags.extend(session.iter().map(|chip| {
+                let label = format!("{}: {}", chip.title, chip.label);
+                ChromeItem::new(&chip.class, &chip.label, &label, Some(&label))
+            }));
+        }
+        let has_badges = !tags.is_empty();
         let row_content = if is_subop {
             RowContent {
                 subop: Some(SubopContent {
@@ -2786,34 +3047,18 @@ impl RowSpec {
             RowContent {
                 subop: None,
                 top: Some(TopContent {
-                    chevron: disclosure,
-                    session_slot: has_session_meta && !is_work_unit_start,
-                    chrome: chrome.clone(),
-                    summary: if is_execute_run {
-                        None
-                    } else {
-                        Some(RowSummary::parse(row, &display_summary))
-                    },
+                    summary: row_summary,
                 }),
                 work_unit: None,
             }
         };
-        let work_unit_header = if is_work_unit_start {
-            work_unit.as_ref().map(|wu| WorkUnitHeader {
-                id: wu.id.clone(),
-                title: unit_title.clone(),
-                show_count: show_work_unit_count(row, wu),
-                count_text: wu.count.map_or_else(String::new, work_unit_count_text),
-                count_title: wu.count.map_or_else(String::new, work_unit_count_title),
-                title_only: unit_title == plain_summary,
-                session_chips: has_session_meta && context.is_group_start,
-            })
-        } else {
-            None
-        };
-        let group_start = context.is_group_start && !is_work_unit_start;
-        let group_label = if group_start {
-            Some(group_label_text(&row_str(row, "group")))
+        let group_start = context.is_group_start && !has_boundary_header;
+        let group_label = if !is_subop && is_graph_endpoint(row) {
+            Some(group_label_text(
+                &row_str(row, "group"),
+                session_meta_field(row, "session_title"),
+                session_meta_field(row, "agent_nickname"),
+            ))
         } else {
             None
         };
@@ -2824,35 +3069,32 @@ impl RowSpec {
                 .get("activity_bundle")
                 .and_then(|bundle| bundle.get("member_count"))
                 .and_then(Value::as_u64);
-            let label = if is_plan_repeat {
-                "Plan group"
-            } else {
-                "Execute run"
+            let label = match bundle_kind {
+                Some(BundleKind::WorkGroup) => "Work group",
+                Some(BundleKind::PlanRepeat) => "Plan group",
+                Some(BundleKind::ExecuteRun) | None => "Execute run",
             };
             label.clone_into(&mut aria_label);
             aria_label.push_str(", ");
             aria_label.push_str(&member_count.map_or_else(String::new, |count| {
-                let noun = if is_plan_repeat {
-                    if count == 1 {
-                        " update"
-                    } else {
-                        " updates"
-                    }
-                } else if count == 1 {
-                    " step"
-                } else {
-                    " steps"
+                let noun = match bundle_kind {
+                    Some(BundleKind::WorkGroup) if count == 1 => " activity",
+                    Some(BundleKind::WorkGroup) => " activities",
+                    Some(BundleKind::PlanRepeat) if count == 1 => " update",
+                    Some(BundleKind::PlanRepeat) => " updates",
+                    Some(BundleKind::ExecuteRun) | None if count == 1 => " step",
+                    Some(BundleKind::ExecuteRun) | None => " steps",
                 };
                 format!("{count}{noun}")
             }));
             if is_execute_run && row_str(row, "outcome") == "success" {
                 aria_label.push_str(", completed");
             }
-            if is_plan_repeat {
+            if is_plan_repeat || is_work_group {
                 aria_label.push_str(": ");
                 aria_label.push_str(&plain_summary);
             }
-        } else if is_work_unit_start {
+        } else if has_boundary_header {
             if unit_title == plain_summary {
                 aria_label.clone_from(&unit_title);
             } else {
@@ -2890,6 +3132,11 @@ impl RowSpec {
                 abs_index: context.abs_index,
                 node_key: node_key.clone(),
                 is_subop,
+                hierarchy_depth: row
+                    .get("hierarchy_depth")
+                    .and_then(Value::as_u64)
+                    .and_then(|depth| u8::try_from(depth).ok())
+                    .unwrap_or(u8::from(is_subop)),
                 subop_kind: row_str(row, "subop_kind"),
                 op_id: row_str(row, "op_id"),
                 git_oid: row_str(row, "git_oid"),
@@ -2902,12 +3149,18 @@ impl RowSpec {
                 above: wire::above(row),
                 below: wire::below(row),
                 transitions: wire::transitions(row),
+                muted_above: wire::muted_above(row),
+                muted_below: wire::muted_below(row),
+                muted_transitions: wire::muted_transitions(row),
+                chain_state: ChainState::from_wire(&row_str(row, "chain_state")),
                 is_subop,
                 is_bundle,
+                expanded: expanded_state,
             },
             kind: row_str(row, "kind"),
             record_role: row_str(row, "record_role"),
             activity_kind: row_str(row, "activity_kind"),
+            classification,
             outcome: row_str(row, "outcome"),
             group: row_str(row, "group"),
             kind_class: kind_class_of(row),
@@ -2921,8 +3174,9 @@ impl RowSpec {
                 group_start,
                 expandable,
             },
+            disclosure,
             content_flags: ContentFlags {
-                work_unit_block: is_work_unit_start,
+                work_unit_block: has_boundary_header,
                 work_unit_title_only: work_unit_header
                     .as_ref()
                     .is_some_and(|header| header.title_only),
@@ -2936,10 +3190,10 @@ impl RowSpec {
             display_summary: display_summary.clone(),
             plain_summary: plain_summary.clone(),
             detail_summary: detail_summary.clone(),
-            chrome,
-            session,
+            tags,
             session_description,
             work_unit,
+            session_summary,
             work_unit_header,
             bundle: bundle_info,
             promoted,
@@ -2961,6 +3215,9 @@ impl RowSpec {
         }
         if self.flags.human {
             classes.push_str(" row-human");
+        }
+        if self.graph.chain_state.is_muted() {
+            classes.push_str(" row-chain-muted");
         }
         if self.identity.is_subop {
             classes.push_str(" row-subop");
@@ -2988,6 +3245,9 @@ impl RowSpec {
                 WorkUnitClass::End => "work-unit-end",
             });
         }
+        if self.session_summary.is_some() {
+            classes.push_str(" row-session-summary");
+        }
         if self.bundle.is_some() {
             classes.push_str(" row-activity-bundle");
         }
@@ -3013,10 +3273,8 @@ impl RowSpec {
     /// The resolved disclosure state (`aria-expanded` value when expandable).
     #[cfg(test)]
     pub(crate) fn expanded(&self) -> Option<bool> {
-        self.content
-            .top
+        self.disclosure
             .as_ref()
-            .and_then(|top| top.chevron.as_ref())
             .map(|disclosure| disclosure.expanded)
     }
 }
@@ -3083,6 +3341,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::fmt::Write as _;
 
     // ---- Test-only HTML renderers -----------------------------------------
     // These mirror the legacy JS renderer's span assembly byte-for-byte so
@@ -3230,16 +3489,6 @@ mod tests {
 
     fn render_row_summary_html(row_summary: &RowSummary) -> String {
         let mut html = String::new();
-        if let Some(prefix) = &row_summary.git_prefix {
-            let label = format!("Commit prefix: {prefix}");
-            html.push_str("<span class=\"git-prefix-chip\" title=\"");
-            html.push_str(&esc(&label));
-            html.push_str("\" aria-label=\"");
-            html.push_str(&esc(&label));
-            html.push_str("\">");
-            html.push_str(&esc(prefix));
-            html.push_str("</span>");
-        }
         if let Some(content) = &row_summary.content {
             html.push_str("<span class=\"summary-text");
             if row_summary.git_prefix.is_some() {
@@ -3250,6 +3499,10 @@ mod tests {
             html.push_str("</span>");
         }
         html
+    }
+
+    fn render_tags_html(spec: &RowSpec) -> String {
+        render_chrome_html(&spec.tags)
     }
 
     fn render_chrome_html(chrome: &[ChromeItem]) -> String {
@@ -3272,28 +3525,6 @@ mod tests {
         html
     }
 
-    fn render_session_slot_html(spec: &RowSpec, at_group_start: bool) -> String {
-        if spec.session.is_empty() {
-            return String::new();
-        }
-        let mut chips = String::new();
-        if at_group_start {
-            for chip in &spec.session {
-                let label = format!("{}: {}", chip.title, chip.label);
-                chips.push_str("<span class=\"");
-                chips.push_str(&chip.class);
-                chips.push_str("\" title=\"");
-                chips.push_str(&esc(&label));
-                chips.push_str("\" aria-label=\"");
-                chips.push_str(&esc(&label));
-                chips.push_str("\">");
-                chips.push_str(&esc(&chip.label));
-                chips.push_str("</span>");
-            }
-        }
-        format!("<span class=\"session-meta-slot\">{chips}</span>")
-    }
-
     fn render_chevron_html(disclosure: &Disclosure) -> String {
         format!(
             "<button type=\"button\" class=\"subop-chevron\" title=\"{0}\" aria-label=\"{0}\" aria-expanded=\"{1}\">{2}</button>",
@@ -3303,28 +3534,32 @@ mod tests {
         )
     }
 
+    fn render_activity_html(spec: &RowSpec) -> String {
+        let mut content = format!(
+            "<span class=\"activity-label\">{}</span>",
+            esc(&spec.classification.label)
+        );
+        if let Some(disclosure) = &spec.disclosure {
+            content.push_str(&render_chevron_html(disclosure));
+        }
+        content
+    }
+
     fn render_content_html(spec: &RowSpec) -> String {
         if let Some(subop) = &spec.content.subop {
-            return format!(
+            let mut content = String::new();
+            write!(
+                content,
                 "<span class=\"subop-icon codicon codicon-{}\" aria-hidden=\"true\"></span><span class=\"subop-summary\">{}</span>",
                 subop.icon,
                 render_summary_html(&subop.summary)
-            );
+            )
+            .expect("writing sub-op fixture HTML to a String cannot fail");
+            return content;
         }
         let top = spec.content.top.as_ref().expect("top-level row content");
         let wu_start = spec.content_flags.work_unit_block;
         let mut content = String::new();
-        if let Some(chevron) = &top.chevron {
-            content.push_str(&render_chevron_html(chevron));
-        }
-        if !wu_start {
-            content.push_str(&render_session_slot_html(spec, spec.state.group_start));
-        }
-        if !top.chrome.is_empty() {
-            content.push_str("<span class=\"row-meta\">");
-            content.push_str(&render_chrome_html(&top.chrome));
-            content.push_str("</span>");
-        }
         if let Some(row_summary) = &top.summary {
             content.push_str(&render_row_summary_html(row_summary));
         }
@@ -3335,20 +3570,6 @@ mod tests {
                 esc(&header.title),
                 esc(&header.title)
             );
-            ribbon.push_str(&render_session_slot_html(
-                spec,
-                spec.work_unit_header
-                    .as_ref()
-                    .is_some_and(|header| header.session_chips),
-            ));
-            if header.show_count {
-                let count = format!(
-                    "<span class=\"work-unit-count\" title=\"{}\">{}</span>",
-                    esc(&header.count_title),
-                    esc(&header.count_text)
-                );
-                ribbon.push_str(&count);
-            }
             ribbon.push_str("</span>");
             return if spec.content_flags.work_unit_title_only {
                 ribbon
@@ -3378,8 +3599,23 @@ mod tests {
         ));
         drop(attrs.insert("data-key".to_owned(), spec.identity.node_key.clone()));
         drop(attrs.insert("data-row".to_owned(), spec.identity.abs_index.to_string()));
+        drop(attrs.insert(
+            "data-hierarchy-depth".to_owned(),
+            spec.identity.hierarchy_depth.to_string(),
+        ));
+        drop(attrs.insert(
+            "data-classification".to_owned(),
+            spec.classification.label.clone(),
+        ));
         if let Some(header) = &spec.work_unit_header {
             drop(attrs.insert("data-work-unit-id".to_owned(), header.id.clone()));
+        }
+        if let Some(count) = spec
+            .session_summary
+            .as_ref()
+            .and_then(|summary| summary.count)
+        {
+            drop(attrs.insert("data-session-count".to_owned(), count.to_string()));
         }
         if let Some(bundle) = &spec.bundle {
             drop(attrs.insert(
@@ -3411,6 +3647,7 @@ mod tests {
             "summary": "Agent turn with metadata",
             "timestamp_ms": now().wrapping_sub(1000),
             "group": "session:s1",
+            "group_end": false,
             "node_key": "op:1",
             "parents": [],
             "is_submodule": false,
@@ -3448,6 +3685,7 @@ mod tests {
             "summary": "feat: add **search** bar\n\nsecond line",
             "timestamp_ms": now(),
             "group": "repo:9007199254740993",
+            "group_end": true,
             "node_key": "git:abc123def456",
             "parents": [],
             "is_submodule": false,
@@ -3612,6 +3850,44 @@ mod tests {
         )
     }
 
+    fn session_summary_row() -> Value {
+        with(
+            &base_row(),
+            &[
+                ("node_key", json!("wu:session-summary")),
+                (
+                    "summary",
+                    json!("system last-prompt custom-title — 1 activity · 1 plan"),
+                ),
+                ("group", json!("session:s1")),
+                ("kind", json!("work-group")),
+                ("record_role", json!("action")),
+                ("activity_kind", json!("work")),
+                ("turn_id", json!("")),
+                (
+                    "activity_bundle",
+                    json!({ "kind": "work-group", "member_count": 1 }),
+                ),
+                (
+                    "sub_ops",
+                    json!([{ "op_id": "n::meta", "summary": "system last-prompt custom-title", "kind": "import" }]),
+                ),
+                (
+                    "work_unit",
+                    json!({
+                        "id": "session:s1/turn:t9",
+                        "title": "Initial user request",
+                        "is_start": true,
+                        "is_end": false,
+                        "count": 4,
+                    }),
+                ),
+                ("session_summary", json!({ "count": 87 })),
+                ("session_meta", Value::Null),
+            ],
+        )
+    }
+
     fn promoted_failure_row() -> Value {
         with(
             &base_row(),
@@ -3646,6 +3922,7 @@ mod tests {
                 (
                     "session_meta",
                     json!({
+                        "session_title": "q0",
                         "model_provider": "  sglang_dsv4  ",
                         "agent_nickname": "Harvey",
                     }),
@@ -3664,14 +3941,22 @@ mod tests {
         assert_eq!(short_id("abc123def456"), "abc123def456");
         assert_eq!(short_id(""), "");
         assert_eq!(
-            group_label_text("repo:9007199254740993"),
+            group_label_text("repo:9007199254740993", None, None),
             "Git · repo 199254740993"
         );
         assert_eq!(
-            group_label_text("session:session_abcdefghijklmnop"),
+            group_label_text("session:session_abcdefghijklmnop", None, None),
             "Session efghijklmnop"
         );
-        assert_eq!(group_label_text("ops"), "EditChain ops");
+        assert_eq!(group_label_text("ops", None, None), "EditChain ops");
+        assert_eq!(
+            group_label_text("session:opaque", Some("q0"), Some("Tesla")),
+            "q0 · Tesla"
+        );
+        assert_eq!(
+            group_label_text("session:opaque", Some("q0"), Some("q0")),
+            "q0"
+        );
     }
 
     #[test]
@@ -3882,6 +4167,73 @@ mod tests {
     }
 
     #[test]
+    fn work_group_and_nested_bundle_keep_two_independent_disclosures() {
+        let work = with(
+            &base_row(),
+            &[
+                ("kind", json!("work-group")),
+                ("activity_kind", json!("work")),
+                (
+                    "activity_bundle",
+                    json!({ "kind": "work-group", "member_count": 4 }),
+                ),
+                (
+                    "sub_ops",
+                    json!([
+                        { "op_id": "1:0:2", "summary": "run tools", "kind": "command", "timestamp_ms": now() }
+                    ]),
+                ),
+            ],
+        );
+        let work_spec =
+            RowSpec::from_value(&work, &RowContext::for_row(ViewMode::Activity, 0, false));
+        assert_eq!(work_spec.classification.label, "work");
+        assert_eq!(
+            work_spec.bundle.as_ref().map(|bundle| bundle.kind),
+            Some(BundleKind::WorkGroup)
+        );
+        assert_eq!(
+            work_spec
+                .bundle
+                .as_ref()
+                .map(|bundle| bundle.count_text.as_str()),
+            Some("4 activities")
+        );
+        assert!(work_spec.state.expandable);
+        assert_eq!(work_spec.expanded(), Some(false));
+        assert_eq!(
+            render_attrs(&work_spec)
+                .get("data-activity-bundle")
+                .map(String::as_str),
+            Some("work-group")
+        );
+
+        let nested = with(
+            &bundle_row(),
+            &[
+                ("is_subop", json!(true)),
+                ("hierarchy_depth", json!(1)),
+                ("parent_row", json!(0)),
+            ],
+        );
+        let nested_spec =
+            RowSpec::from_value(&nested, &RowContext::for_row(ViewMode::Activity, 1, false));
+        assert!(nested_spec.identity.is_subop);
+        assert_eq!(nested_spec.identity.hierarchy_depth, 1);
+        assert!(nested_spec.state.expandable);
+        assert_eq!(nested_spec.expanded(), Some(false));
+        assert!(nested_spec.classes().contains("row-activity-bundle"));
+        assert!(nested_spec.classes().contains("row-expandable"));
+        assert!(nested_spec.disclosure.is_some());
+        let nested_activity = render_activity_html(&nested_spec);
+        assert!(nested_activity.starts_with("<span class=\"activity-label\">tooluse</span>"));
+        assert!(nested_activity.contains("class=\"subop-chevron\""));
+        let nested_html = render_tags_html(&nested_spec);
+        assert!(!nested_html.contains("class=\"subop-chevron\""));
+        assert!(nested_html.contains("class=\"bundle-count\""));
+    }
+
+    #[test]
     fn chrome_items_match_exact_span_contracts() {
         let rel = relation_badges(&with(
             &base_row(),
@@ -3917,28 +4269,148 @@ mod tests {
             )],
         ));
         assert_eq!(dup.len(), 1);
-        let plan_badge = activity_badge(
-            &with(&base_row(), &[("activity_kind", json!("plan"))]),
-            BadgeOptions::default(),
+    }
+
+    #[test]
+    fn activity_column_classifies_every_real_row_with_stable_fallbacks() {
+        let cases = [
+            ("conversation", "agent"),
+            ("plan", "plan"),
+            ("explore", "explore"),
+            ("execute", "tooluse"),
+            ("change", "change"),
+            ("verify", "verify"),
+            ("diagnose", "diagnose"),
+            ("coordinate", "coordinate"),
+            ("source_control", "git"),
+            ("external", "external"),
+            ("system", "system"),
+        ];
+        for (wire, label) in cases {
+            let classification =
+                row_classification(&with(&base_row(), &[("activity_kind", json!(wire))]));
+            assert_eq!(classification.label, label, "{wire} label");
+            assert_eq!(classification.source, "activity_kind", "{wire} source");
+            assert_eq!(classification.title, format!("Activity: {wire}"));
+        }
+
+        let user = row_classification(&with(&base_row(), &[("author", json!("human"))]));
+        assert_eq!(user.label, "user");
+        assert_eq!(user.source, "activity_kind");
+        assert_eq!(user.title, "Activity: conversation");
+
+        let git = row_classification(&with(
+            &base_row(),
+            &[
+                ("kind", json!("message")),
+                ("activity_kind", json!("unknown")),
+                ("git_oid", json!("abc123")),
+            ],
+        ));
+        assert_eq!(git.label, "git", "Git identity is authoritative");
+        assert_eq!(git.source, "git_oid");
+
+        let system = row_classification(&with(
+            &base_row(),
+            &[
+                ("activity_kind", json!("unknown")),
+                ("kind", json!("unknown")),
+                ("is_system", json!(true)),
+            ],
+        ));
+        assert_eq!(system.label, "system");
+        assert_eq!(system.source, "is_system");
+
+        let kind = row_classification(&with(
+            &base_row(),
+            &[
+                ("activity_kind", json!("unknown")),
+                ("kind", json!("tool_result")),
+            ],
+        ));
+        assert_eq!(kind.label, "tool-result");
+        assert_eq!(kind.source, "kind");
+
+        let role = row_classification(&with(
+            &base_row(),
+            &[
+                ("activity_kind", json!("unknown")),
+                ("kind", json!("unknown")),
+                ("record_role", json!("artifact")),
+            ],
+        ));
+        assert_eq!(role.label, "artifact");
+        assert_eq!(role.source, "record_role");
+
+        let other = row_classification(&with(
+            &base_row(),
+            &[
+                ("activity_kind", json!("unknown")),
+                ("kind", json!("unknown")),
+                ("record_role", json!("unknown")),
+            ],
+        ));
+        assert_eq!(other.label, "other");
+        assert!(!other.label.is_empty());
+    }
+
+    #[test]
+    fn session_scoped_boundary_uses_the_session_activity_name() {
+        let row = session_summary_row();
+        let spec = RowSpec::from_value(&row, &RowContext::for_row(ViewMode::Activity, 0, false));
+        assert_eq!(spec.classification.label, "session");
+        assert_eq!(spec.classification.source, "session_summary");
+        assert_eq!(spec.classification.title, "Session summary");
+        assert!(spec.classes().contains("row-session-summary"));
+        assert_eq!(
+            spec.work_unit.as_ref().map(|unit| unit.id.as_str()),
+            Some("session:s1/turn:t9"),
+            "the session marker does not replace the row's turn work unit"
         );
         assert_eq!(
-            render_chrome_html(std::slice::from_ref(plan_badge.as_ref().expect("plan badge"))),
-            "<span class=\"act-badge act-plan\" title=\"activity: plan\" aria-label=\"activity: plan\">plan</span>"
+            spec.work_unit_header
+                .as_ref()
+                .map(|header| (header.count_text.as_str(), header.count_title.as_str())),
+            Some(("87 entries", "87 entries in this session"))
         );
+        assert_eq!(
+            spec.tags
+                .iter()
+                .find(|tag| tag.classes == "work-unit-count")
+                .map(|tag| tag.text.as_str()),
+            Some("87 entries")
+        );
+        assert_eq!(
+            render_activity_html(&spec),
+            "<span class=\"activity-label\">session</span><button type=\"button\" class=\"subop-chevron\" title=\"Expand 1 activity\" aria-label=\"Expand 1 activity\" aria-expanded=\"false\">▸</button>"
+        );
+        assert_eq!(
+            render_attrs(&spec)
+                .get("data-classification")
+                .map(String::as_str),
+            Some("session")
+        );
+        assert_eq!(
+            render_attrs(&spec)
+                .get("data-session-count")
+                .map(String::as_str),
+            Some("87")
+        );
+
+        let raw = RowSpec::from_value(&row, &RowContext::for_row(ViewMode::Raw, 0, false));
+        assert_eq!(raw.classification.label, "work");
+        assert_eq!(raw.classification.source, "activity_kind");
+        assert!(raw.session_summary.is_none());
+
+        let turn_start = RowSpec::from_value(
+            &wu_start_row(),
+            &RowContext::for_row(ViewMode::Activity, 0, false),
+        );
+        assert_eq!(turn_start.classification.label, "user");
     }
 
     #[test]
     fn chrome_suppressions_match_the_frozen_badge_options() {
-        assert!(activity_badge(
-            &with(&base_row(), &[("activity_kind", json!("source_control"))]),
-            BadgeOptions::default()
-        )
-        .is_none());
-        assert!(activity_badge(
-            &with(&base_row(), &[("activity_kind", json!("future_kind"))]),
-            BadgeOptions::default()
-        )
-        .is_none());
         assert!(outcome_badge(
             &with(&base_row(), &[("outcome", json!("success"))]),
             BadgeOptions::default()
@@ -4022,7 +4494,10 @@ mod tests {
             ViewMode::Activity,
             BadgeOptions::default(),
         );
-        assert_eq!(activity.len(), 1, "common success outcome stays suppressed");
+        assert!(
+            activity.is_empty(),
+            "activity lives in its own column and common success stays suppressed"
+        );
         let bundle = row_semantic_chrome(
             &bundle_row(),
             true,
@@ -4473,7 +4948,28 @@ mod tests {
             summary_class,
             "{name}: summary div class"
         );
-        assert_eq!(render_content_html(&spec), content, "{name}: content cell");
+        let rendered_content = render_content_html(&spec);
+        assert_eq!(rendered_content, content, "{name}: content cell");
+        let rendered_tags = render_tags_html(&spec);
+        assert_eq!(
+            rendered_tags.matches("<span").count(),
+            spec.tags.len(),
+            "{name}: every tag renders once in the Tags column"
+        );
+        for chip_class in [
+            "git-prefix-chip",
+            "bundle-count",
+            "bundle-status",
+            "session-chip",
+            "rel-badge",
+            "out-badge",
+            "work-unit-count",
+        ] {
+            assert!(
+                !rendered_content.contains(chip_class),
+                "{name}: {chip_class} must not render in Content"
+            );
+        }
         assert_eq!(spec.date_text, date, "{name}: date cell");
         assert_eq!(spec.author_text, author, "{name}: author cell");
         assert_eq!(spec.commit_text, commit, "{name}: commit cell");
@@ -4506,6 +5002,29 @@ mod tests {
     }
 
     #[test]
+    fn muted_chain_state_drives_row_class_and_graph_masks() {
+        let row = with(
+            &base_row(),
+            &[
+                ("chain_state", json!("muted")),
+                ("muted_above", json!([1])),
+                ("muted_below", json!([1, 2])),
+                ("muted_transitions", json!([[1, 0]])),
+            ],
+        );
+        let spec = RowSpec::from_value(&row, &context(ViewMode::Activity, 3, false));
+        assert!(spec.classes().contains("row-chain-muted"));
+        assert_eq!(spec.graph.chain_state, ChainState::Muted);
+        assert_eq!(spec.graph.muted_above, vec![1]);
+        assert_eq!(spec.graph.muted_below, vec![1, 2]);
+        assert_eq!(spec.graph.muted_transitions, vec![(1, 0)]);
+
+        let active = RowSpec::from_value(&base_row(), &context(ViewMode::Activity, 3, false));
+        assert!(!active.classes().contains("row-chain-muted"));
+        assert_eq!(active.graph.chain_state, ChainState::Active);
+    }
+
+    #[test]
     fn selection_find_and_roving_tabindex_are_context_driven() {
         let mut ctx = context(ViewMode::Activity, 3, false);
         ctx.selected_key = Some("op:1".to_owned());
@@ -4533,18 +5052,34 @@ mod tests {
 &git_row(),
 &ctx.clone(),
 (
-&["row", "row-dim", "row-role-artifact", "row-group-start"],
+&["row", "row-dim", "row-role-artifact", "row-has-badges", "row-group-start"],
 "summary",
-"<span class=\"git-prefix-chip\" title=\"Commit prefix: feat\" aria-label=\"Commit prefix: feat\">feat</span><span class=\"summary-text git-summary-text\"><span class=\"md-line\"><span class=\"md-text\">add\u{00a0}</span><strong class=\"md-strong\"><span class=\"md-text\">search</span></strong><span class=\"md-text\">\u{00a0}bar</span></span><span class=\"md-more\" aria-hidden=\"true\">+1 line</span></span>",
+"<span class=\"summary-text git-summary-text\"><span class=\"md-line\"><span class=\"md-text\">add\u{00a0}</span><strong class=\"md-strong\"><span class=\"md-text\">search</span></strong><span class=\"md-text\">\u{00a0}bar</span></span><span class=\"md-more\" aria-hidden=\"true\">+1 line</span></span>",
 "Jan 15, 2026 04:00 PM",
 "ambientlight",
 "git:abc123d"
 ));
+        assert_eq!(
+            render_tags_html(&spec),
+            "<span class=\"git-prefix-chip\" title=\"Commit prefix: feat\" aria-label=\"Commit prefix: feat\">feat</span>"
+        );
         assert_eq!(spec.aria.aria_label, "feat add search bar · second line");
         assert_eq!(spec.aria.title, "feat: add search bar · second line");
         assert_eq!(
             spec.aria.base_aria_label,
             "feat add search bar · second line"
+        );
+        let summary = spec
+            .content
+            .top
+            .as_ref()
+            .and_then(|top| top.summary.as_ref())
+            .expect("git row summary");
+        assert_eq!(summary.git_prefix.as_deref(), Some("feat"));
+        assert_eq!(
+            summary.plain_content.as_deref(),
+            Some("add search bar · second line"),
+            "the DOM content excludes the prefix already rendered in the chip"
         );
         assert_eq!(spec.identity.node_key, "git:abc123def456");
         assert_eq!(spec.identity.abs_index, 1);
@@ -4554,7 +5089,12 @@ mod tests {
         );
         assert_eq!(spec.identity.repository, "9007199254740993");
         assert_eq!(spec.identity.turn_id, "");
-        assert_eq!(spec.group_label.as_deref(), Some("Git · repo 199254740993"));
+        assert_eq!(spec.classification.label, "git");
+        assert_eq!(spec.classification.source, "activity_kind");
+        assert_eq!(
+            spec.group_label, None,
+            "group markers must not label a graph node connected on both sides"
+        );
     }
 
     #[test]
@@ -4570,14 +5110,22 @@ mod tests {
         assert_eq!(spec.identity.node_key, "git:abc123def456");
         let bundle_spec = RowSpec::from_value(&bundle_row(), &context(ViewMode::Activity, 0, true));
         assert!(bundle_spec.graph.is_bundle);
+        assert!(!bundle_spec.graph.expanded);
         assert_eq!(
             bundle_spec.identity.node_key, "bundle:exec1",
             "bundle rows keep their own data-key identity"
         );
+        let mut expanded_context = context(ViewMode::Activity, 0, true);
+        expanded_context.expanded = true;
+        let expanded_bundle = RowSpec::from_value(&bundle_row(), &expanded_context);
+        assert!(
+            expanded_bundle.graph.expanded,
+            "the live disclosure state reaches graph marker selection"
+        );
     }
 
     #[test]
-    fn subop_rows_keep_identity_and_draw_no_graph_node() {
+    fn subop_rows_keep_identity_for_opened_group_markers() {
         let ctx = context(ViewMode::Activity, 4, false);
         let spec = RowSpec::from_value(&subop_row(), &ctx);
         assert!(spec.identity.is_subop);
@@ -4625,13 +5173,14 @@ mod tests {
         assert_eq!(collapsed.expanded(), Some(false));
         assert_eq!(collapsed.aria.aria_expanded, Some(false));
         assert!(collapsed.classes().contains("row-expandable"));
-        let disclosure = collapsed
-            .content
-            .top
-            .as_ref()
-            .and_then(|top| top.chevron.as_ref())
-            .expect("chevron");
+        let disclosure = collapsed.disclosure.as_ref().expect("chevron");
         assert_eq!(disclosure.label, "Expand 2 details");
+        assert_eq!(
+            render_activity_html(&collapsed),
+            "<span class=\"activity-label\">agent</span><button type=\"button\" class=\"subop-chevron\" title=\"Expand 2 details\" aria-label=\"Expand 2 details\" aria-expanded=\"false\">\u{25b8}</button>",
+            "the collapsed arrow follows the Activity label"
+        );
+        assert!(!render_content_html(&collapsed).contains("subop-chevron"));
 
         let mut ctx = context(ViewMode::Activity, 0, false);
         ctx.expanded = true;
@@ -4639,32 +5188,41 @@ mod tests {
         assert_eq!(expanded.expanded(), Some(true));
         assert_eq!(expanded.aria.aria_expanded, Some(true));
         assert_eq!(
-            expanded
-                .content
-                .top
-                .as_ref()
-                .and_then(|top| top.chevron.as_ref())
-                .expect("chevron")
-                .label,
+            expanded.disclosure.as_ref().expect("chevron").label,
             "Collapse 2 details"
         );
+        assert!(render_activity_html(&expanded).ends_with("\u{25be}</button>"));
     }
 
     #[test]
     fn bundle_rows_own_chrome_aria_and_data_attributes() {
         let ctx = context(ViewMode::Activity, 0, true);
         let spec = RowSpec::from_value(&bundle_row(), &ctx);
-        assert_row("bundle_execute",
-&bundle_row(),
-&ctx.clone(),
-(
-&["row", "row-tool", "row-role-action", "row-has-badges", "row-group-start", "row-activity-bundle", "row-expandable"],
-"summary",
-"<button type=\"button\" class=\"subop-chevron\" title=\"Expand 2 commands\" aria-label=\"Expand 2 commands\" aria-expanded=\"false\">\u{25b8}</button><span class=\"row-meta\"><span class=\"bundle-count\" title=\"2 commands, completed\">2 commands</span><span class=\"bundle-status bundle-status-success\" title=\"completed\" aria-label=\"completed\">\u{2713}</span></span>",
-"Jan 15, 2026 04:00 PM",
-"",
-"bundle:exec1"
-));
+        assert_row(
+            "bundle_execute",
+            &bundle_row(),
+            &ctx.clone(),
+            (
+                &[
+                    "row",
+                    "row-tool",
+                    "row-role-action",
+                    "row-has-badges",
+                    "row-group-start",
+                    "row-activity-bundle",
+                    "row-expandable",
+                ],
+                "summary",
+                "",
+                "Jan 15, 2026 04:00 PM",
+                "",
+                "bundle:exec1",
+            ),
+        );
+        assert_eq!(
+            render_tags_html(&spec),
+            "<span class=\"bundle-count\" title=\"2 commands, completed\">2 commands</span><span class=\"bundle-status bundle-status-success\" title=\"completed\" aria-label=\"completed\">\u{2713}</span>"
+        );
         assert_eq!(spec.aria.aria_label, "Execute run, 2 steps, completed");
         assert!(is_activity_bundle(&bundle_row(), ViewMode::Activity));
         assert!(is_execute_run_bundle(&bundle_row(), ViewMode::Activity));
@@ -4740,11 +5298,15 @@ mod tests {
 (
 &["row", "row-human", "row-role-narrative", "row-has-badges", "row-work-unit-start"],
 "summary work-unit-block work-unit-title-only",
-"<span class=\"work-unit-ribbon-line\"><span class=\"work-unit-ribbon\" title=\"User request: make the search faster\">User request: make the search faster</span><span class=\"session-meta-slot\"><span class=\"session-chip session-chip-model\" title=\"Model provider: sglang_dsv4\" aria-label=\"Model provider: sglang_dsv4\">sglang_dsv4</span><span class=\"session-chip session-chip-agent\" title=\"Agent: Harvey\" aria-label=\"Agent: Harvey\">Harvey</span></span><span class=\"work-unit-count\" title=\"5 entries grouped in this activity\">5 entries</span></span>",
+"<span class=\"work-unit-ribbon-line\"><span class=\"work-unit-ribbon\" title=\"User request: make the search faster\">User request: make the search faster</span></span>",
 "Jan 15, 2026 04:00 PM",
 "human",
 "t1"
 ));
+        assert_eq!(
+            render_tags_html(&spec),
+            "<span class=\"work-unit-count\" title=\"5 entries grouped in this activity\">5 entries</span><span class=\"session-chip session-chip-model\" title=\"Model provider: sglang_dsv4\" aria-label=\"Model provider: sglang_dsv4\">sglang_dsv4</span><span class=\"session-chip session-chip-agent\" title=\"Agent: Harvey\" aria-label=\"Agent: Harvey\">Harvey</span>"
+        );
         assert_eq!(
             spec.aria.aria_label,
             "User request: make the search faster, Model provider sglang_dsv4, Agent Harvey"
@@ -4760,7 +5322,8 @@ mod tests {
             Some("session:s1/turn:t1")
         );
 
-        // Not at a group start: no chips, no aria suffix, no group class.
+        // Not at a group start: no session tags, aria suffix, or group class;
+        // the row's own work-unit count tag remains.
         let not_start =
             RowSpec::from_value(&wu_start_row(), &context(ViewMode::Activity, 0, false));
         assert!(!not_start.classes().contains("row-group-start"));
@@ -4799,14 +5362,69 @@ mod tests {
         );
         assert_eq!(spec.promoted, Some(PromotedKind::Failure));
         assert!(spec.classes().contains("row-promoted row-promoted-failure"));
+        assert_eq!(spec.classification.label, "tooluse");
+        assert_eq!(spec.tags.len(), 1);
         assert!(spec
-            .chrome
-            .iter()
-            .any(|item| item.classes.starts_with("act-badge")));
+            .tags
+            .first()
+            .is_some_and(|item| item.classes.starts_with("out-badge")));
     }
 
     #[test]
-    fn session_chips_appear_once_at_the_group_boundary() {
+    fn graph_subtitles_only_appear_on_true_tips_and_roots() {
+        let tip = with(
+            &git_row(),
+            &[
+                ("above", json!([0])),
+                ("transitions", json!([])),
+                ("group_end", json!(false)),
+            ],
+        );
+        let tip = RowSpec::from_value(&tip, &context(ViewMode::Activity, 1, false));
+        assert_eq!(tip.group_label.as_deref(), Some("Git · repo 199254740993"));
+
+        let root = with(
+            &git_row(),
+            &[
+                ("below", json!([0])),
+                ("transitions", json!([])),
+                ("group_end", json!(false)),
+            ],
+        );
+        let root = RowSpec::from_value(&root, &context(ViewMode::Activity, 2, false));
+        assert_eq!(root.group_label.as_deref(), Some("Git · repo 199254740993"));
+
+        let parent_anchored_middle = with(
+            &git_row(),
+            &[
+                ("above", json!([0])),
+                ("below", json!([1])),
+                ("transitions", json!([[0, 1]])),
+            ],
+        );
+        let parent_anchored_middle = RowSpec::from_value(
+            &parent_anchored_middle,
+            &context(ViewMode::Activity, 3, true),
+        );
+        assert_eq!(parent_anchored_middle.group_label, None);
+
+        let child_anchored_middle = with(
+            &git_row(),
+            &[
+                ("above", json!([1])),
+                ("below", json!([0])),
+                ("transitions", json!([[1, 0]])),
+            ],
+        );
+        let child_anchored_middle = RowSpec::from_value(
+            &child_anchored_middle,
+            &context(ViewMode::Activity, 4, true),
+        );
+        assert_eq!(child_anchored_middle.group_label, None);
+    }
+
+    #[test]
+    fn session_chips_stay_on_group_boundaries_while_labels_follow_graph_endpoints() {
         let ctx = context(ViewMode::Activity, 9, true);
         let spec = RowSpec::from_value(&session_meta_row(), &ctx);
         assert!(spec.classes().contains("row-has-badges"));
@@ -4816,16 +5434,40 @@ mod tests {
             "session boundary row, Model provider sglang_dsv4, Agent Harvey"
         );
         assert!(spec
-            .content
-            .top
-            .as_ref()
-            .is_some_and(|top| top.session_slot));
+            .tags
+            .iter()
+            .any(|tag| tag.classes == "session-chip session-chip-agent"));
+        assert_eq!(
+            spec.tags
+                .iter()
+                .map(|tag| (tag.classes.as_str(), tag.text.as_str()))
+                .collect::<Vec<(&str, &str)>>(),
+            vec![
+                ("session-chip session-chip-model", "sglang_dsv4"),
+                ("session-chip session-chip-agent", "Harvey"),
+            ]
+        );
+        assert_eq!(spec.group_label, None);
 
         let not_group_start =
             RowSpec::from_value(&session_meta_row(), &context(ViewMode::Activity, 10, false));
         assert!(!not_group_start.classes().contains("row-has-badges"));
         assert!(!not_group_start.classes().contains("row-group-start"));
+        assert!(not_group_start.tags.is_empty());
         assert_eq!(not_group_start.aria.aria_label, "session boundary row");
+
+        let terminal = with(&session_meta_row(), &[("group_end", json!(true))]);
+        let terminal = RowSpec::from_value(&terminal, &context(ViewMode::Activity, 12, false));
+        assert_eq!(terminal.group_label, None);
+        assert!(!terminal.classes().contains("row-group-start"));
+
+        let tip = with(&session_meta_row(), &[("above", json!([]))]);
+        let tip = RowSpec::from_value(&tip, &context(ViewMode::Activity, 13, true));
+        assert_eq!(tip.group_label.as_deref(), Some("q0 · Harvey"));
+
+        let root = with(&session_meta_row(), &[("below", json!([]))]);
+        let root = RowSpec::from_value(&root, &context(ViewMode::Activity, 14, false));
+        assert_eq!(root.group_label.as_deref(), Some("q0 · Harvey"));
     }
 
     #[test]
@@ -4837,7 +5479,8 @@ mod tests {
         assert_eq!(RowSpec::PLACEHOLDER_CLASSES, "row row-placeholder");
         assert_eq!(spec.classes(), "row");
         assert_eq!(spec.open_json, None);
-        assert!(spec.session.is_empty());
+        assert!(spec.tags.is_empty());
+        assert!(spec.classification.label.is_empty());
         assert!(spec.content.top.is_none());
     }
 
@@ -4950,6 +5593,10 @@ mod tests {
         assert_eq!(attrs.get("data-row").map(String::as_str), Some("3"));
         assert_eq!(attrs.get("data-key").map(String::as_str), Some("op:1"));
         assert_eq!(
+            attrs.get("data-classification").map(String::as_str),
+            Some("agent")
+        );
+        assert_eq!(
             attrs.get("aria-label").map(String::as_str),
             Some("Agent turn with metadata")
         );
@@ -4998,9 +5645,9 @@ mod tests {
 &tool,
 &context(ViewMode::Activity, 11, false),
 (
-&["row", "row-tool", "row-role-result", "row-has-badges"],
+&["row", "row-tool", "row-role-result"],
 "summary",
-"<span class=\"row-meta\"><span class=\"act-badge act-execute\" title=\"activity: execute\" aria-label=\"activity: run\">run</span></span><span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">tool result: {&quot;text&quot;: &quot;done the thing&quot;, &quot;type&quot;: &quot;output&quot;}</span></span></span>",
+"<span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">tool result: {&quot;text&quot;: &quot;done the thing&quot;, &quot;type&quot;: &quot;output&quot;}</span></span></span>",
 "Jan 15, 2026 04:00 PM",
 "agent",
 "t1"
@@ -5024,17 +5671,13 @@ mod tests {
             ),
             &context(ViewMode::Activity, 6, false),
         );
-        assert_eq!(spec.chrome.len(), 2);
+        assert_eq!(spec.tags.len(), 2);
         assert!(spec.classes().contains("row-has-badges"));
-        let fork = spec.chrome.first().expect("fork badge");
+        let fork = spec.tags.first().expect("fork badge");
         assert_eq!(fork.classes, "rel-badge rel-fork");
-        let subagent = spec.chrome.get(1).expect("subagent badge");
+        let subagent = spec.tags.get(1).expect("subagent badge");
         assert_eq!(subagent.classes, "rel-badge rel-subagent");
-        // Relations outrank generic activity badges even on plain rows.
-        assert!(spec
-            .chrome
-            .iter()
-            .all(|item| !item.classes.starts_with("act-badge")));
+        assert_eq!(spec.classification.label, "agent");
     }
 
     #[test]
@@ -5059,7 +5702,7 @@ mod tests {
 "t1"
 ));
 
-        // System rows are tool-classed and carry the system activity badge.
+        // System rows are tool-classed; their activity is rendered separately.
         let system = with(
             &base_row(),
             &[
@@ -5080,15 +5723,15 @@ mod tests {
 &system,
 &context(ViewMode::Activity, 5, false),
 (
-&["row", "row-tool", "row-role-lifecycle", "row-has-badges"],
+&["row", "row-tool", "row-role-lifecycle"],
 "summary",
-"<span class=\"row-meta\"><span class=\"act-badge act-system\" title=\"activity: system\" aria-label=\"activity: system\">system</span></span><span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">system record</span></span></span>",
+"<span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">system record</span></span></span>",
 "Jan 15, 2026 04:00 PM",
 "",
 ""
 ));
 
-        // A tool result row keeps its flat badge row in the raw view.
+        // A tool result row keeps its flat summary in the raw view.
         let dim = with(
             &base_row(),
             &[
@@ -5108,22 +5751,22 @@ mod tests {
 &dim,
 &context(ViewMode::Raw, 4, false),
 (
-&["row", "row-dim", "row-role-result", "row-has-badges"],
+&["row", "row-dim", "row-role-result"],
 "summary",
-"<span class=\"row-meta\"><span class=\"act-badge act-execute\" title=\"activity: execute\" aria-label=\"activity: run\">run</span></span><span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">op result: tool output</span></span></span>",
+"<span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">op result: tool output</span></span></span>",
 "Jan 15, 2026 04:00 PM",
 "",
 "node:2"
 ));
 
-        // Raw view: bundles flatten back to ordinary rows with sub-op chrome.
+        // Raw view: bundles flatten back to ordinary expandable rows.
         assert_row("raw_view_bundle",
 &bundle_row(),
 &context(ViewMode::Raw, 0, true),
 (
-&["row", "row-tool", "row-role-action", "row-has-badges", "row-group-start", "row-expandable"],
+&["row", "row-tool", "row-role-action", "row-group-start", "row-expandable"],
 "summary",
-"<button type=\"button\" class=\"subop-chevron\" title=\"Expand 2 details\" aria-label=\"Expand 2 details\" aria-expanded=\"false\">\u{25b8}</button><span class=\"row-meta\"><span class=\"act-badge act-execute\" title=\"activity: execute\" aria-label=\"activity: run\">run</span></span><span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">tool result: execute run (2 steps)</span></span></span>",
+"<span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">tool result: execute run (2 steps)</span></span></span>",
 "Jan 15, 2026 04:00 PM",
 "",
 "bundle:exec1"
@@ -5144,9 +5787,9 @@ mod tests {
 &unknown,
 &context(ViewMode::Activity, 0, false),
 (
-&["row", "row-tool", "row-role-action", "row-has-badges", "row-expandable"],
+&["row", "row-tool", "row-role-action", "row-expandable"],
 "summary",
-"<button type=\"button\" class=\"subop-chevron\" title=\"Expand 2 details\" aria-label=\"Expand 2 details\" aria-expanded=\"false\">\u{25b8}</button><span class=\"row-meta\"><span class=\"act-badge act-execute\" title=\"activity: execute\" aria-label=\"activity: run\">run</span></span><span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">tool result: execute run (2 steps)</span></span></span>",
+"<span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">tool result: execute run (2 steps)</span></span></span>",
 "Jan 15, 2026 04:00 PM",
 "",
 "bundle:exec1"
@@ -5172,9 +5815,9 @@ mod tests {
 &wu_end,
 &context(ViewMode::Activity, 2, false),
 (
-&["row", "row-dim", "row-role-result", "row-has-badges", "row-work-unit-end"],
+&["row", "row-dim", "row-role-result", "row-work-unit-end"],
 "summary",
-"<span class=\"row-meta\"><span class=\"act-badge act-execute\" title=\"activity: execute\" aria-label=\"activity: run\">run</span></span><span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">Agent turn with metadata</span></span></span>",
+"<span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">Agent turn with metadata</span></span></span>",
 "Jan 15, 2026 03:59 PM",
 "agent",
 "t1"
@@ -5200,7 +5843,7 @@ mod tests {
 "t1"
 ));
 
-        // Relation + consequential outcome chrome keeps the branch semantics.
+        // Relation + consequential outcome tags keep the branch semantics.
         let rel_warning = with(
             &base_row(),
             &[
@@ -5215,21 +5858,31 @@ mod tests {
 (
 &["row", "row-role-narrative", "row-has-badges"],
 "summary",
-"<span class=\"row-meta\"><span class=\"rel-badge rel-reconnect\" title=\"Completion returns into the subagent branch\" aria-label=\"Completion returns into the subagent branch\">\u{21a9} return</span><span class=\"out-badge outcome-warning\" title=\"outcome: warning\" aria-label=\"outcome: warn\">warn</span></span><span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">Agent turn with metadata</span></span></span>",
+"<span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">Agent turn with metadata</span></span></span>",
 "Jan 15, 2026 03:59 PM",
 "agent",
 "t1"
 ));
+        let relation_spec =
+            RowSpec::from_value(&rel_warning, &context(ViewMode::Activity, 7, false));
+        assert_eq!(
+            relation_spec
+                .tags
+                .iter()
+                .map(|tag| tag.text.as_str())
+                .collect::<Vec<&str>>(),
+            vec!["↩ return", "warn"]
+        );
 
-        // Session meta renders an empty slot (no chips) away from the group
-        // boundary but still contributes no badge class there.
+        // Session metadata renders no tags away from the group boundary and
+        // contributes no badge class there.
         assert_row("session_meta_not_group_start",
 &session_meta_row(),
 &context(ViewMode::Activity, 10, false),
 (
 &["row", "row-role-narrative"],
 "summary",
-"<span class=\"session-meta-slot\"></span><span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">session boundary row</span></span></span>",
+"<span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">session boundary row</span></span></span>",
 "Jan 15, 2026 03:59 PM",
 "agent",
 "node:1"
@@ -5257,6 +5910,11 @@ mod tests {
 "",
 "ode:1::sub:0"
 ));
+        let msg_spec = RowSpec::from_value(&msg, &context(ViewMode::Activity, 5, false));
+        assert_eq!(
+            msg_spec.classification.label, "agent",
+            "expanded sub-rows retain the Activity-column classification"
+        );
         let meta = with(
             &subop_row(),
             &[
@@ -5293,8 +5951,9 @@ mod tests {
         assert_eq!(expanded.aria.tabindex, 0);
         assert_eq!(
             render_content_html(&expanded),
-            "<button type=\"button\" class=\"subop-chevron\" title=\"Collapse 2 details\" aria-label=\"Collapse 2 details\" aria-expanded=\"true\">\u{25be}</button><span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">Agent turn with metadata</span></span></span>",
-            "expanded rows show the collapse chevron and keep the row summary"
+            "<span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">Agent turn with metadata</span></span></span>",
+            "moving disclosure leaves the content summary unchanged"
         );
+        assert!(render_activity_html(&expanded).contains("aria-expanded=\"true\">\u{25be}"));
     }
 }

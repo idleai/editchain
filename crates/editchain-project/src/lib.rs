@@ -24,12 +24,12 @@ use std::sync::Arc;
 
 use editchain_core::op::NoteRelationship;
 use editchain_core::{
-    Clock, GitCommitEntity, GitOid, GitProjection, Op, OpId, Payload, RepositoryId,
+    Clock, GitCommitEntity, GitLinkKind, GitOid, GitProjection, Op, OpId, Payload, RepositoryId,
 };
 
 use crate::layout::{compute_graph_layout, compute_lane_assignment, GraphLayout, GraphRow};
 use crate::meta::NodeMeta;
-use crate::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility as RowVisibility};
+use crate::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility as RowVisibility};
 
 /// Provenance of a node's effective display time.
 ///
@@ -155,6 +155,32 @@ pub enum HistoryNode {
         /// Deterministic semantic metadata (Narrative / Plan / Primary).
         meta: NodeMeta,
     },
+    /// A synthetic Activity-view group containing the contiguous linear work
+    /// performed between user/agent chat rows.
+    ///
+    /// Work groups are formed only from one graph path. Every row incident to
+    /// a fork, merge, subagent/reconnect relation, or produced-commit edge is a
+    /// hard boundary and remains outside the group. Existing execute/plan
+    /// bundles remain as member nodes, giving the viewer a bounded second
+    /// disclosure level without losing their original records.
+    WorkGroup {
+        /// The newest member retained as the group's graph identity.
+        anchor: Arc<Op>,
+        /// Effective display time of the newest member.
+        source_time: EffectiveTime,
+        /// Final parent keys for the contracted derived view.
+        parent_override: Option<Vec<String>>,
+        /// Original top-level member rows, newest-first. Existing synthetic
+        /// bundles remain intact in this vector.
+        member_nodes: Vec<HistoryNode>,
+        /// Every represented source op, flattened only for exact find/detail
+        /// lookup. Presentation hierarchy comes from `member_nodes`.
+        members: Vec<Arc<Op>>,
+        /// Deterministic aggregate summary derived from all member activities.
+        summary: String,
+        /// Aggregate semantic metadata (`Work` / Primary plus folded outcome).
+        meta: NodeMeta,
+    },
     /// A `Git` commit entity.
     GitCommit(Box<GitCommitEntity>),
 }
@@ -173,9 +199,9 @@ impl HistoryNode {
             Self::CollapsedImport {
                 summary, sub_ops, ..
             } => combined_summary(summary, sub_ops),
-            Self::ExecuteBundle { summary, .. } | Self::PlanBundle { summary, .. } => {
-                summary.clone()
-            }
+            Self::ExecuteBundle { summary, .. }
+            | Self::PlanBundle { summary, .. }
+            | Self::WorkGroup { summary, .. } => summary.clone(),
             Self::GitCommit(commit) => match &commit.message {
                 Payload::Inline(b) => String::from_utf8_lossy(b).to_string(),
                 Payload::Empty | Payload::Blob(_) => commit.oid.to_hex(),
@@ -209,7 +235,8 @@ impl HistoryNode {
             Self::EditOperation { source_time, .. }
             | Self::CollapsedImport { source_time, .. }
             | Self::ExecuteBundle { source_time, .. }
-            | Self::PlanBundle { source_time, .. } => *source_time,
+            | Self::PlanBundle { source_time, .. }
+            | Self::WorkGroup { source_time, .. } => *source_time,
             Self::GitCommit(commit) => {
                 let secs = u64::try_from(commit.committed_at).unwrap_or(0);
                 EffectiveTime::Observed(secs.saturating_mul(1000))
@@ -222,7 +249,9 @@ impl HistoryNode {
     pub fn op_id(&self) -> Option<OpId> {
         match self {
             Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => Some(op.id),
-            Self::ExecuteBundle { anchor, .. } | Self::PlanBundle { anchor, .. } => Some(anchor.id),
+            Self::ExecuteBundle { anchor, .. }
+            | Self::PlanBundle { anchor, .. }
+            | Self::WorkGroup { anchor, .. } => Some(anchor.id),
             Self::GitCommit(_) => None,
         }
     }
@@ -234,7 +263,8 @@ impl HistoryNode {
             Self::EditOperation { .. }
             | Self::CollapsedImport { .. }
             | Self::ExecuteBundle { .. }
-            | Self::PlanBundle { .. } => None,
+            | Self::PlanBundle { .. }
+            | Self::WorkGroup { .. } => None,
             Self::GitCommit(commit) => Some(commit.oid),
         }
     }
@@ -246,7 +276,8 @@ impl HistoryNode {
             Self::EditOperation { .. }
             | Self::CollapsedImport { .. }
             | Self::ExecuteBundle { .. }
-            | Self::PlanBundle { .. } => None,
+            | Self::PlanBundle { .. }
+            | Self::WorkGroup { .. } => None,
             Self::GitCommit(commit) => Some(commit.repository),
         }
     }
@@ -265,9 +296,9 @@ impl HistoryNode {
                 | editchain_core::ScopeRef::Turn(_)
                 | editchain_core::ScopeRef::File(_) => "ops".to_string(),
             },
-            Self::ExecuteBundle { anchor, .. } | Self::PlanBundle { anchor, .. } => {
-                bundle_group(anchor)
-            }
+            Self::ExecuteBundle { anchor, .. }
+            | Self::PlanBundle { anchor, .. }
+            | Self::WorkGroup { anchor, .. } => bundle_group(anchor),
             Self::GitCommit(commit) => format!("repo:{}", commit.repository.0),
         }
     }
@@ -281,9 +312,9 @@ impl HistoryNode {
             Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => op.id.to_string(),
             // A bundle retains one real member as its graph identity. Its
             // display slot/time can come from the newest member independently.
-            Self::ExecuteBundle { anchor, .. } | Self::PlanBundle { anchor, .. } => {
-                anchor.id.to_string()
-            }
+            Self::ExecuteBundle { anchor, .. }
+            | Self::PlanBundle { anchor, .. }
+            | Self::WorkGroup { anchor, .. } => anchor.id.to_string(),
             Self::GitCommit(commit) => commit.oid.to_hex(),
         }
     }
@@ -294,11 +325,13 @@ impl HistoryNode {
     /// filtering and Activity contraction splice visible topology while the
     /// canonical operation envelope and relationship evidence remain intact.
     ///
-    /// For `EditChain` ops, this includes the causal `Op.parents`, graph-bearing
-    /// explicit git links (whose target OID hex becomes a parent key), and — when `notes`
-    /// annotates this op with a graph-bearing relationship — the note's target
-    /// as a *virtual* parent. Git links are explicit stored
-    /// relations; no timestamp/text inference is performed by this projection.
+    /// For `EditChain` ops, this includes the causal `Op.parents`, inbound
+    /// graph-bearing Git links (whose target OID hex becomes a parent key), and
+    /// — when `notes` annotates this op with a graph-bearing relationship — the
+    /// note's target as a *virtual* parent. A `ProducedBy` link has the opposite
+    /// direction: its Git commit gains the source operation as a parent. Git
+    /// links are explicit stored relations; no timestamp/text inference is
+    /// performed by this projection.
     /// Virtual parents let provider-event, fork, and subagent branches render
     /// without mutating stored source-order causality (SPEC §1.1, §5).
     /// `notes` maps a causal parent op id to the structural notes that annotate
@@ -308,12 +341,17 @@ impl HistoryNode {
     /// its bundled sub-ops. This preserves an explicit session-to-Git edge when
     /// its source record is folded into a visible semantic turn.
     ///
+    /// An exact `SpawnedBy` parent suppresses an inherited session-start
+    /// `BasedOn` edge in this display graph. The Git fact remains stored and
+    /// queryable, but drawing both would branch every subagent directly from
+    /// its parent's base commit instead of from its exact spawn occurrence.
+    ///
     /// Keys are deduplicated preserving first-occurrence order (stored causal
-    /// parents, then git-link targets from the row and its sub-ops, then virtual
-    /// note targets), so a target shared between any of the three sources is
-    /// emitted exactly once. This keeps parent keys deterministic and
-    /// duplicate-free even when a filtered clone has materialized a virtual
-    /// target into its stored `Op.parents`.
+    /// parents, then non-redundant git-link targets from the row and its
+    /// sub-ops, then virtual note targets), so a target shared between any of
+    /// the three sources is emitted exactly once. This keeps parent keys
+    /// deterministic and duplicate-free even when a filtered clone has
+    /// materialized a virtual target into its stored `Op.parents`.
     #[must_use]
     pub fn parent_keys(
         &self,
@@ -336,6 +374,10 @@ impl HistoryNode {
             | Self::PlanBundle {
                 parent_override: Some(keys),
                 ..
+            }
+            | Self::WorkGroup {
+                parent_override: Some(keys),
+                ..
             } => return keys.clone(),
             Self::EditOperation {
                 parent_override: None,
@@ -353,6 +395,10 @@ impl HistoryNode {
                 parent_override: None,
                 ..
             }
+            | Self::WorkGroup {
+                parent_override: None,
+                ..
+            }
             | Self::GitCommit(_) => {}
         }
         match self {
@@ -360,15 +406,14 @@ impl HistoryNode {
                 let mut keys: Vec<String> = Vec::new();
                 let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
                 let anchored_notes = notes.get(&op.id);
-                // An exact provider-event occurrence participates in the
-                // provider graph. Its stored parent remains the physical source
-                // predecessor, but that is a different relation domain and must
-                // not also masquerade as a conversation edge in the display
-                // graph. Records without provider identity retain source order as
-                // their conservative fallback.
-                let has_provider_event =
-                    has_exact_provider_occurrence(op.id, anchored_notes.map(Vec::as_slice));
-                if !has_provider_event {
+                // A resolved exact provider parent supersedes the physical
+                // source predecessor in the display graph. Provider identity
+                // alone does not: root-like transport/meta events often carry a
+                // UUID with no parentUuid, so they retain source order as the
+                // conservative fallback instead of starting a phantom chain.
+                let has_provider_parent =
+                    has_exact_provider_parent(op.id, anchored_notes.map(Vec::as_slice));
+                if !has_provider_parent {
                     for parent in &op.parents {
                         let key = parent.to_string();
                         if seen.insert(key.clone()) {
@@ -377,8 +422,25 @@ impl HistoryNode {
                     }
                 }
                 for source in std::iter::once(op).chain(self.sub_ops()) {
+                    // A collapsed row can carry metadata from a different
+                    // session (notably a spawned child's session_meta folded
+                    // into the parent's spawn tool row). Decide whether Git
+                    // provenance is superseded for each source independently;
+                    // using only the visible anchor's notes leaks the child's
+                    // BasedOn edge onto the parent row and fans every spawn
+                    // back to the base commit.
+                    // `notes` is canonicalized by the visible anchor, so facts
+                    // stored on a folded sub-op live in this same bucket. The
+                    // helper checks the fact's immutable stored parent against
+                    // `source.id`, keeping one member's relation from affecting
+                    // another member.
+                    let source_has_spawn_parent =
+                        has_exact_spawn_parent(source.id, anchored_notes.map(Vec::as_slice));
                     if let Some(links) = git_links.get(&source.id) {
-                        for link in links {
+                        for link in links.iter().filter(|link| {
+                            link.kind != GitLinkKind::ProducedBy
+                                && !(source_has_spawn_parent && link.kind == GitLinkKind::BasedOn)
+                        }) {
                             let key = link.target_oid.to_hex();
                             if seen.insert(key.clone()) {
                                 keys.push(key);
@@ -419,6 +481,11 @@ impl HistoryNode {
                 member_nodes,
                 members,
                 ..
+            }
+            | Self::WorkGroup {
+                member_nodes,
+                members,
+                ..
             } => {
                 // The bundle contracts a whole run, so it inherits the union of
                 // every member's EXTERNAL parent keys (stored causal parents,
@@ -443,7 +510,23 @@ impl HistoryNode {
                 }
                 keys
             }
-            Self::GitCommit(commit) => commit.parents.iter().map(GitOid::to_hex).collect(),
+            Self::GitCommit(commit) => {
+                let mut keys: Vec<String> = commit.parents.iter().map(GitOid::to_hex).collect();
+                let mut seen: std::collections::HashSet<String> = keys.iter().cloned().collect();
+                for links in git_links.values() {
+                    for link in links.iter().filter(|link| {
+                        link.kind == GitLinkKind::ProducedBy
+                            && link.target_repo == commit.repository
+                            && link.target_oid == commit.oid
+                    }) {
+                        let key = link.source.to_string();
+                        if seen.insert(key.clone()) {
+                            keys.push(key);
+                        }
+                    }
+                }
+                keys
+            }
         }
     }
 
@@ -472,7 +555,9 @@ impl HistoryNode {
                     _ => editchain_core::parents::ParentSet::Two(ids[0], ids[1]),
                 };
             }
-            Self::ExecuteBundle { anchor, .. } | Self::PlanBundle { anchor, .. } => {
+            Self::ExecuteBundle { anchor, .. }
+            | Self::PlanBundle { anchor, .. }
+            | Self::WorkGroup { anchor, .. } => {
                 let mut ids: Vec<OpId> = keys
                     .iter()
                     .filter_map(|k| OpId::from_display_str(k))
@@ -523,6 +608,9 @@ impl HistoryNode {
             }
             | Self::PlanBundle {
                 parent_override, ..
+            }
+            | Self::WorkGroup {
+                parent_override, ..
             } => *parent_override = Some(normalized),
             Self::GitCommit(_) => {}
         }
@@ -535,7 +623,9 @@ impl HistoryNode {
     pub fn sub_ops(&self) -> &[Arc<Op>] {
         match self {
             Self::CollapsedImport { sub_ops, .. } => sub_ops,
-            Self::ExecuteBundle { members, .. } | Self::PlanBundle { members, .. } => members,
+            Self::ExecuteBundle { members, .. }
+            | Self::PlanBundle { members, .. }
+            | Self::WorkGroup { members, .. } => members,
             Self::EditOperation { .. } | Self::GitCommit(_) => &[],
         }
     }
@@ -568,6 +658,7 @@ impl HistoryNode {
             Self::CollapsedImport { kind, .. }
             | Self::ExecuteBundle { kind, .. }
             | Self::PlanBundle { kind, .. } => kind.clone(),
+            Self::WorkGroup { .. } => "work-group".to_string(),
             Self::GitCommit(_) => "git".to_string(),
         }
     }
@@ -582,7 +673,8 @@ impl HistoryNode {
         match self {
             Self::CollapsedImport { meta, .. }
             | Self::ExecuteBundle { meta, .. }
-            | Self::PlanBundle { meta, .. } => *meta,
+            | Self::PlanBundle { meta, .. }
+            | Self::WorkGroup { meta, .. } => *meta,
             Self::EditOperation { op, .. } => meta::for_edit_operation(op),
             Self::GitCommit(_) => meta::for_git_commit(),
         }
@@ -611,6 +703,12 @@ impl HistoryNode {
     #[must_use]
     pub fn outcome(&self) -> Outcome {
         self.record_meta().outcome
+    }
+
+    /// The reusable presentation state of this row and its child-owned edge.
+    #[must_use]
+    pub fn chain_state(&self) -> ChainState {
+        self.record_meta().chain_state
     }
 
     /// The owning turn identity of this row, if turn-scoped.
@@ -691,15 +789,18 @@ struct CollapsedProjection {
     /// id — possibly through a chain of representatives — to an op id that is a
     /// key in `present`. Covers normalized children folded into their raw import
     /// parent, META sub-ops bundled into an anchor, tool results folded into their
-    /// call, equal-hash copied occurrences, and relationship facts folded out of
-    /// rendering (mapped to their anchor's visible row).
+    /// call, equivalent copied provider occurrences, and relationship facts
+    /// folded out of rendering (mapped to their anchor's visible row).
     representative: HashMap<OpId, OpId>,
     /// Structural relationship notes re-keyed for edge drawing: keyed by the
     /// CANONICAL visible anchor (the representative of the note's stored causal
     /// parent), so a note whose anchor was folded into a bundle is still reachable
-    /// from the visible row that represents it. Provider entity targets are
-    /// resolved first to a unique same-source occurrence (or one globally unique
-    /// exact-equivalence class); ambiguous targets are removed. Every
+    /// from the visible row that represents it. A metadata anchor folded into
+    /// its own structural target is also indexed on its unique visible causal
+    /// successor, preserving the relation kind on that branch row. Provider
+    /// entity targets are resolved first to a unique same-source occurrence (or
+    /// one globally unique exact-equivalence class); ambiguous targets are
+    /// removed. Every
     /// edge-construction path then lifts folded physical targets through
     /// `representative` via [`canonicalize_parents`], so a virtual edge never
     /// reaches lane allocation or windowed edge geometry with a phantom key.
@@ -785,11 +886,13 @@ impl HistoryProjection {
         projection
     }
 
-    /// Returns the structural relationship notes re-keyed for edge drawing: keyed
-    /// by the CANONICAL visible anchor (the representative of the note's stored
-    /// causal parent). Provider entity targets have been resolved to an
-    /// unambiguous physical occurrence; direct physical targets remain stored as
-    /// supplied. Used by [`HistoryNode::parent_keys`] so virtual
+    /// Returns the structural relationship notes re-keyed for edge drawing:
+    /// keyed by the CANONICAL visible anchor (the representative of the note's
+    /// stored causal parent), plus a unique visible successor when metadata
+    /// contraction would otherwise collapse a structural relation into its own
+    /// target. Provider entity targets have been resolved to an unambiguous
+    /// physical occurrence; direct physical targets remain stored as supplied.
+    /// Used by [`HistoryNode::parent_keys`] so virtual
     /// fork/subagent/reconnect edges are reachable from rendered rows even when
     /// their source ops were folded into a collapsed bundle; targets are lifted
     /// to visible rows (or dropped) by every layout/filter/order path through the
@@ -1112,9 +1215,14 @@ impl HistoryProjection {
         // Index provider entities before any display folding. `OccurrenceOf`
         // and `Contains` are exact identity facts, but identity alone does not
         // prove that two payload occurrences are interchangeable: providers can
-        // reuse an event UUID while incrementally extending its content.
+        // reuse an event UUID while incrementally extending its content. Current
+        // occurrence facts carry an importer-owned canonical payload
+        // fingerprint; legacy facts conservatively fall back to the raw hash.
         let mut entity_occurrences: HashMap<OpId, Vec<OpId>> = HashMap::new();
         let mut event_occurrences: HashMap<OpId, Vec<OpId>> = HashMap::new();
+        let mut occurrence_payload_fingerprints: HashMap<OpId, String> = HashMap::new();
+        let mut conflicting_payload_fingerprints: std::collections::HashSet<OpId> =
+            std::collections::HashSet::new();
         for op in &self.ops {
             let editchain_core::OpKind::Note(note) = &op.kind else {
                 continue;
@@ -1132,6 +1240,19 @@ impl HistoryProjection {
                 entity_occurrences.entry(*target).or_default().push(anchor);
                 if note.relationship == NoteRelationship::OccurrenceOf {
                     event_occurrences.entry(*target).or_default().push(anchor);
+                    if let Some(fingerprint) = exact_occurrence_payload_fingerprint(note) {
+                        if occurrence_payload_fingerprints
+                            .get(&anchor)
+                            .is_some_and(|known| known != &fingerprint)
+                        {
+                            drop(occurrence_payload_fingerprints.remove(&anchor));
+                            let _: bool = conflicting_payload_fingerprints.insert(anchor);
+                        } else if !conflicting_payload_fingerprints.contains(&anchor) {
+                            let _: &mut String = occurrence_payload_fingerprints
+                                .entry(anchor)
+                                .or_insert(fingerprint);
+                        }
+                    }
                 }
             }
         }
@@ -1158,21 +1279,30 @@ impl HistoryProjection {
             })
             .collect();
         for occurrences in event_occurrences.values() {
-            // Only a shared exact raw hash proves two occurrences are the same
-            // display payload. Hash-less fixtures/legacy records and distinct
+            // A shared provider payload fingerprint proves that copied session
+            // envelopes carry the same event content even when session/topology
+            // fields differ. Legacy occurrences retain the stricter raw-hash
+            // behavior. Hash-less records, conflicting evidence, and distinct
             // revisions remain separate rows. The minimum ID merely names one
             // member of an exact-equivalence class; it supplies no ancestry.
-            let mut by_raw_hash: std::collections::BTreeMap<[u8; 32], Vec<OpId>> =
+            let mut by_payload: std::collections::BTreeMap<OccurrencePayloadKey, Vec<OpId>> =
                 std::collections::BTreeMap::new();
             for occurrence in occurrences {
-                if let Some(raw_hash) = imports_by_id
+                let payload_key = occurrence_payload_fingerprints
                     .get(occurrence)
-                    .and_then(|import| import.raw_hash)
-                {
-                    by_raw_hash.entry(raw_hash).or_default().push(*occurrence);
+                    .cloned()
+                    .map(OccurrencePayloadKey::ProviderFingerprint)
+                    .or_else(|| {
+                        imports_by_id
+                            .get(occurrence)
+                            .and_then(|import| import.raw_hash)
+                            .map(OccurrencePayloadKey::RawHash)
+                    });
+                if let Some(payload_key) = payload_key {
+                    by_payload.entry(payload_key).or_default().push(*occurrence);
                 }
             }
-            for equivalent in by_raw_hash.values() {
+            for equivalent in by_payload.values() {
                 let Some(canonical) = equivalent.iter().copied().min() else {
                     continue;
                 };
@@ -1340,6 +1470,8 @@ impl HistoryProjection {
             &resolved_relationship_notes,
             &representative,
             &present,
+            &duplicate_event_occurrences,
+            &self.ops,
         );
 
         // Semantic-collapse invariant, checked once per collapse: every ordinary
@@ -1366,10 +1498,11 @@ impl HistoryProjection {
 
     /// Fold metadata rows along their unique graph-parent path.
     ///
-    /// Provider occurrences take their parents exclusively from exact visible
-    /// relationship facts. Records without provider identity take their stored
-    /// operation parents. A metadata chain contracts only when that path reaches
-    /// one non-META collapsed import row; every other shape remains visible.
+    /// Provider occurrences with a resolved exact parent take that relationship
+    /// in preference to source order. Occurrences without a provider parent use
+    /// their stored operation parent as a conservative fallback. A metadata
+    /// chain contracts only when that path reaches one non-META collapsed import
+    /// row; every other shape remains visible.
     /// Legacy Codex token-usage imports are classified from their exact raw
     /// schema because their immutable stored tags predate `META` classification.
     fn bundle_metadata_by_exact_parent(
@@ -1392,6 +1525,7 @@ impl HistoryProjection {
                 | HistoryNode::CollapsedImport { .. }
                 | HistoryNode::ExecuteBundle { .. }
                 | HistoryNode::PlanBundle { .. }
+                | HistoryNode::WorkGroup { .. }
                 | HistoryNode::GitCommit(_) => None,
             })
             .collect();
@@ -1408,6 +1542,7 @@ impl HistoryProjection {
                 | HistoryNode::CollapsedImport { .. }
                 | HistoryNode::ExecuteBundle { .. }
                 | HistoryNode::PlanBundle { .. }
+                | HistoryNode::WorkGroup { .. }
                 | HistoryNode::GitCommit(_) => None,
             })
             .collect();
@@ -1423,9 +1558,9 @@ impl HistoryProjection {
                 continue;
             }
             let notes = relationship_notes.get(&op.id);
-            let has_provider_event = has_exact_provider_occurrence(op.id, notes.map(Vec::as_slice));
+            let has_provider_parent = has_exact_provider_parent(op.id, notes.map(Vec::as_slice));
             let mut candidates = std::collections::BTreeSet::new();
-            if !has_provider_event {
+            if !has_provider_parent {
                 for parent in &op.parents {
                     if let Some(parent) = canonical_present_op(*parent, representative, &present) {
                         let _: bool = candidates.insert(parent);
@@ -1503,8 +1638,12 @@ impl HistoryProjection {
         // Collect before mutating so attachment order remains the operation
         // input order, independent of HashMap iteration.
         let mut attachments: HashMap<OpId, Vec<Arc<Op>>> = HashMap::new();
+        let mut muted_anchors: std::collections::HashSet<OpId> = std::collections::HashSet::new();
         for node in result.iter() {
-            let HistoryNode::CollapsedImport { op, sub_ops, .. } = node else {
+            let HistoryNode::CollapsedImport {
+                op, sub_ops, meta, ..
+            } = node
+            else {
                 continue;
             };
             let Some(anchor) = destinations.get(&op.id).copied() else {
@@ -1515,6 +1654,9 @@ impl HistoryProjection {
                 .entry(anchor)
                 .or_default()
                 .extend(sub_ops.iter().cloned());
+            if meta.chain_state == ChainState::Muted {
+                let _: bool = muted_anchors.insert(anchor);
+            }
         }
         for (&metadata, &anchor) in &destinations {
             let _: Option<OpId> = representative.insert(metadata, anchor);
@@ -1524,11 +1666,17 @@ impl HistoryProjection {
                 .is_none_or(|op_id| !destinations.contains_key(&op_id))
         });
         for node in result.iter_mut() {
-            let HistoryNode::CollapsedImport { op, sub_ops, .. } = node else {
+            let HistoryNode::CollapsedImport {
+                op, sub_ops, meta, ..
+            } = node
+            else {
                 continue;
             };
             if let Some(mut folded) = attachments.remove(&op.id) {
                 sub_ops.append(&mut folded);
+            }
+            if muted_anchors.contains(&op.id) {
+                meta.chain_state = ChainState::Muted;
             }
         }
     }
@@ -1540,23 +1688,45 @@ impl HistoryProjection {
     /// anchored on a Tool op folded into its import, or a `SubagentOf` anchored on
     /// a subagent's first message). This re-keys every note by the canonical
     /// visible anchor (the representative of its stored parent), so the virtual
-    /// edge is reachable from the row that represents the note's anchor. The
-    /// provider entity targets have already been resolved to an unambiguous
-    /// physical occurrence; direct physical targets stay unchanged. Every
-    /// edge-construction path then lifts folded targets through the canonical
-    /// representative map. A note whose anchor cannot be resolved to a visible
-    /// row is dropped.
+    /// edge is reachable from the row that represents the note's anchor. When a
+    /// metadata anchor contracts into its own structural target, the note is
+    /// additionally indexed on its unique first visible causal successor. That
+    /// keeps the exact relation kind on the surviving branch-start row while the
+    /// metadata remains bundled with its target. The provider entity targets
+    /// have already been resolved to an unambiguous physical occurrence; direct
+    /// physical targets stay unchanged. A copied
+    /// occurrence suppressed by exact-equivalence contraction cannot contribute
+    /// its `ProviderParent` edge to the surviving occurrence: doing so would
+    /// union the incoming ancestry of separate physical transcripts and turn a
+    /// normal chain into a false fan-in merge. Other structural relations remain
+    /// eligible because they describe branch/lifecycle topology rather than the
+    /// copied row's provider predecessor. Every edge-construction path then lifts
+    /// folded targets through the canonical representative map. A note whose
+    /// anchor cannot be resolved to a visible row is dropped.
     fn canonicalize_relationship_notes(
         relationship_notes: &HashMap<OpId, Vec<Op>>,
         representative: &HashMap<OpId, OpId>,
         present: &std::collections::HashSet<String>,
+        duplicate_event_occurrences: &std::collections::HashSet<OpId>,
+        ops: &[Op],
     ) -> HashMap<OpId, Vec<Op>> {
         let mut out: HashMap<OpId, Vec<Op>> = HashMap::new();
+        let mut causal_children: Option<HashMap<OpId, Vec<OpId>>> = None;
         for (stored_anchor, notes) in relationship_notes {
             let Some(anchor) = canonical_op_id(*stored_anchor, representative, present) else {
                 continue;
             };
             for note in notes.iter().cloned() {
+                let suppressed_copy_parent = *stored_anchor != anchor
+                    && duplicate_event_occurrences.contains(stored_anchor)
+                    && matches!(
+                        &note.kind,
+                        editchain_core::OpKind::Note(fact)
+                            if fact.relationship == NoteRelationship::ProviderParent
+                    );
+                if suppressed_copy_parent {
+                    continue;
+                }
                 // `Contains` participates in entity endpoint resolution during
                 // collapse but is neither a row marker nor a display edge.
                 if !matches!(
@@ -1564,7 +1734,28 @@ impl HistoryProjection {
                     editchain_core::OpKind::Note(fact)
                         if fact.relationship == NoteRelationship::Contains
                 ) {
-                    out.entry(anchor).or_default().push(note);
+                    out.entry(anchor).or_default().push(note.clone());
+                    let successor = if protected_relation_targets_anchor(
+                        &note,
+                        anchor,
+                        representative,
+                        present,
+                    ) {
+                        let children =
+                            causal_children.get_or_insert_with(|| causal_children_by_parent(ops));
+                        unique_visible_successor(
+                            *stored_anchor,
+                            anchor,
+                            children,
+                            representative,
+                            present,
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(successor) = successor.filter(|successor| *successor != anchor) {
+                        out.entry(successor).or_default().push(note);
+                    }
                 }
             }
         }
@@ -1899,7 +2090,12 @@ impl HistoryProjection {
         };
         let is_git =
             |key: &str| -> bool { key_to_node.get(key).is_some_and(|n| n.git_oid().is_some()) };
-        layout::LayoutContext::new(&keys, &parents_of, &is_git)
+        let chain_state_of = |key: &str| -> ChainState {
+            key_to_node
+                .get(key)
+                .map_or(ChainState::Active, |node| node.chain_state())
+        };
+        layout::LayoutContext::new_with_chain_state(&keys, &parents_of, &is_git, &chain_state_of)
     }
 
     /// Build the string-keyed node list for layout.
@@ -1969,15 +2165,33 @@ impl HistoryProjection {
         node: &HistoryNode,
         parents: &[String],
     ) -> Vec<ParentRelation> {
-        let Some(anchor_id) = node.op_id() else {
-            return Vec::new();
-        };
-        let Some(notes) = self.relationship_notes().get(&anchor_id) else {
-            return Vec::new();
-        };
         let representative = &self.collapsed_projection.representative;
         let present = &self.collapsed_projection.present;
         let mut out: Vec<ParentRelation> = Vec::new();
+        if let HistoryNode::GitCommit(commit) = node {
+            for parent in parents {
+                let matches = self.git.links.values().flatten().any(|link| {
+                    link.kind == GitLinkKind::ProducedBy
+                        && link.target_repo == commit.repository
+                        && link.target_oid == commit.oid
+                        && canonical_op_id(link.source, representative, present)
+                            .is_some_and(|source| source.to_string() == *parent)
+                });
+                if matches {
+                    out.push(ParentRelation {
+                        parent: parent.clone(),
+                        kind: RelationKind::ProducedCommit,
+                    });
+                }
+            }
+            return out;
+        }
+        let Some(anchor_id) = node.op_id() else {
+            return out;
+        };
+        let Some(notes) = self.relationship_notes().get(&anchor_id) else {
+            return out;
+        };
         for parent in parents {
             for note in notes {
                 let editchain_core::OpKind::Note(n) = &note.kind else {
@@ -2009,7 +2223,8 @@ impl HistoryProjection {
     }
 
     /// Returns the node keys of rows that participate in structural topology
-    /// (`ForkOf` / `SubagentOf` / `ReconnectsTo` anchors or targets).
+    /// (`ForkOf` / `SubagentOf` / `ReconnectsTo` anchors or targets, or either
+    /// endpoint of a produced-commit edge).
     ///
     /// Structural rows carry virtual edges, so a view must never fold them away:
     /// the Activity execute-run bundling excludes them exactly like the chain
@@ -2021,6 +2236,18 @@ impl HistoryProjection {
         let note_map = self.relationship_notes();
         let representative = &self.collapsed_projection.representative;
         let present = row_node_keys(nodes);
+        for link in self.git.links.values().flatten().filter(|link| {
+            link.kind == GitLinkKind::ProducedBy && present.contains(&link.target_oid.to_hex())
+        }) {
+            if let Some(source) = canonical_op_id(
+                link.source,
+                representative,
+                &self.collapsed_projection.present,
+            ) {
+                let _: bool = keys.insert(source.to_string());
+            }
+            let _: bool = keys.insert(link.target_oid.to_hex());
+        }
         for node in nodes {
             let Some(anchor_id) = node.op_id() else {
                 continue;
@@ -2084,8 +2311,8 @@ pub struct ParentRelation {
     pub kind: RelationKind,
 }
 
-/// Provider-neutral structural relationship kinds, derived from the
-/// `SubagentOf` / `ReconnectsTo` / `ForkOf` structural notes.
+/// Provider-neutral structural relationship kinds, derived from exact stored
+/// relationship facts and Git links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelationKind {
     /// The row starts a subagent branch spawned by the target row.
@@ -2095,6 +2322,8 @@ pub enum RelationKind {
     Reconnect,
     /// The row branches off the target row at a fork divergence boundary.
     Fork,
+    /// A Git commit was produced by the parent operation.
+    ProducedCommit,
 }
 
 /// Allocation-free identity used only by the topological scheduler.
@@ -2106,15 +2335,28 @@ enum OrderingKey {
     Git(GitOid),
 }
 
+/// Exact-equivalence key for occurrences of one provider event entity.
+///
+/// Current importers supply a canonical provider payload fingerprint that
+/// excludes copy-local session/topology fields. Legacy occurrences retain the
+/// byte-exact raw hash contract and never compare across key variants.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum OccurrencePayloadKey {
+    /// Canonical content evidence supplied by the provider adapter.
+    ProviderFingerprint(String),
+    /// Byte-exact raw-line evidence retained for legacy facts.
+    RawHash([u8; 32]),
+}
+
 /// Return the typed scheduler key for one visible row.
 fn ordering_key(node: &HistoryNode) -> OrderingKey {
     match node {
         HistoryNode::EditOperation { op, .. } | HistoryNode::CollapsedImport { op, .. } => {
             OrderingKey::Op(op.id)
         }
-        HistoryNode::ExecuteBundle { anchor, .. } | HistoryNode::PlanBundle { anchor, .. } => {
-            OrderingKey::Op(anchor.id)
-        }
+        HistoryNode::ExecuteBundle { anchor, .. }
+        | HistoryNode::PlanBundle { anchor, .. }
+        | HistoryNode::WorkGroup { anchor, .. } => OrderingKey::Op(anchor.id),
         HistoryNode::GitCommit(commit) => OrderingKey::Git(commit.oid),
     }
 }
@@ -2205,18 +2447,41 @@ fn occurrence_representative(
     }
 }
 
-/// Whether `anchor` is itself an exact provider-event occurrence.
+/// Whether `anchor` has a resolved exact provider parent.
 ///
 /// Canonical note indexes can contain facts originally anchored on folded
 /// sub-ops. Checking the note's stored parent prevents one bundled member's
-/// `OccurrenceOf` fact from changing the parent domain of the visible anchor.
-fn has_exact_provider_occurrence(anchor: OpId, notes: Option<&[Op]>) -> bool {
+/// `ProviderParent` fact from changing the parent domain of the visible anchor.
+/// An empty target set means provider resolution failed, so source order remains
+/// the conservative fallback.
+fn has_exact_provider_parent(anchor: OpId, notes: Option<&[Op]>) -> bool {
     notes.is_some_and(|facts| {
         facts.iter().any(|fact| {
             matches!(
                 &fact.kind,
                 editchain_core::OpKind::Note(note)
-                    if note.relationship == NoteRelationship::OccurrenceOf
+                    if note.relationship == NoteRelationship::ProviderParent
+                        && !note.target_ids.is_empty()
+                        && fact.parents.iter().any(|parent| *parent == anchor)
+            )
+        })
+    })
+}
+
+/// Whether `anchor` has one exact subagent spawn parent.
+///
+/// A child rollout inherits the parent's session-start Git snapshot. Once its
+/// exact activation is known, that inherited `BasedOn` fact is provenance, not
+/// an additional display-graph parent: the execution branch starts at the
+/// spawn occurrence.
+fn has_exact_spawn_parent(anchor: OpId, notes: Option<&[Op]>) -> bool {
+    notes.is_some_and(|facts| {
+        facts.iter().any(|fact| {
+            matches!(
+                &fact.kind,
+                editchain_core::OpKind::Note(note)
+                    if note.relationship == NoteRelationship::SpawnedBy
+                        && !note.target_ids.is_empty()
                         && fact.parents.iter().any(|parent| *parent == anchor)
             )
         })
@@ -2284,14 +2549,19 @@ fn ordering_parent_keys(
     match node {
         HistoryNode::EditOperation { op, .. } | HistoryNode::CollapsedImport { op, .. } => {
             let anchored_notes = notes.get(&op.id);
-            if !has_exact_provider_occurrence(op.id, anchored_notes.map(Vec::as_slice)) {
+            if !has_exact_provider_parent(op.id, anchored_notes.map(Vec::as_slice)) {
                 for parent in &op.parents {
                     push(canonical_ordering_op(*parent, representative, present));
                 }
             }
             for source in std::iter::once(op).chain(node.sub_ops()) {
+                let source_has_spawn_parent =
+                    has_exact_spawn_parent(source.id, anchored_notes.map(Vec::as_slice));
                 if let Some(links) = git_links.get(&source.id) {
-                    for link in links {
+                    for link in links.iter().filter(|link| {
+                        link.kind != GitLinkKind::ProducedBy
+                            && !(source_has_spawn_parent && link.kind == GitLinkKind::BasedOn)
+                    }) {
                         let key = OrderingKey::Git(link.target_oid);
                         push(present.contains(&key).then_some(key));
                     }
@@ -2310,7 +2580,9 @@ fn ordering_parent_keys(
                 }
             }
         }
-        HistoryNode::ExecuteBundle { anchor, .. } | HistoryNode::PlanBundle { anchor, .. } => {
+        HistoryNode::ExecuteBundle { anchor, .. }
+        | HistoryNode::PlanBundle { anchor, .. }
+        | HistoryNode::WorkGroup { anchor, .. } => {
             for parent in &anchor.parents {
                 push(canonical_ordering_op(*parent, representative, present));
             }
@@ -2319,6 +2591,15 @@ fn ordering_parent_keys(
             for parent in &commit.parents {
                 let key = OrderingKey::Git(*parent);
                 push(present.contains(&key).then_some(key));
+            }
+            for links in git_links.values() {
+                for link in links.iter().filter(|link| {
+                    link.kind == GitLinkKind::ProducedBy
+                        && link.target_repo == commit.repository
+                        && link.target_oid == commit.oid
+                }) {
+                    push(canonical_ordering_op(link.source, representative, present));
+                }
             }
         }
     }
@@ -2376,6 +2657,76 @@ fn canonical_parent_key(
     }
     let pid = OpId::from_display_str(parent)?;
     canonical_op_id(pid, representative, present).map(|id| id.to_string())
+}
+
+/// Index ordinary causal children without treating relationship facts as
+/// transcript continuations.
+fn causal_children_by_parent(ops: &[Op]) -> HashMap<OpId, Vec<OpId>> {
+    let mut children: HashMap<OpId, Vec<OpId>> = HashMap::new();
+    for op in ops.iter().filter(|op| !is_hidden_relation_fact(op)) {
+        for parent in &op.parents {
+            children.entry(*parent).or_default().push(op.id);
+        }
+    }
+    children
+}
+
+/// Whether an exact structural note would collapse into a self-edge at
+/// `anchor` after canonical endpoint lifting.
+fn protected_relation_targets_anchor(
+    note: &Op,
+    anchor: OpId,
+    representative: &HashMap<OpId, OpId>,
+    present: &std::collections::HashSet<String>,
+) -> bool {
+    let editchain_core::OpKind::Note(fact) = &note.kind else {
+        return false;
+    };
+    is_protected_structural_relationship(fact.relationship)
+        && fact
+            .target_ids
+            .iter()
+            .any(|target| canonical_op_id(*target, representative, present) == Some(anchor))
+}
+
+/// Find one unambiguous visible row immediately downstream of a folded anchor.
+///
+/// Traversal may cross operations represented by `collapsed_anchor`, but stops
+/// at the first distinct visible representative on every path. More than one
+/// such row is ambiguous and deliberately produces no structural redirect.
+fn unique_visible_successor(
+    stored_anchor: OpId,
+    collapsed_anchor: OpId,
+    causal_children: &HashMap<OpId, Vec<OpId>>,
+    representative: &HashMap<OpId, OpId>,
+    present: &std::collections::HashSet<String>,
+) -> Option<OpId> {
+    let mut pending = vec![stored_anchor];
+    let mut visited = std::collections::HashSet::from([stored_anchor]);
+    let mut candidates = std::collections::BTreeSet::new();
+    while let Some(parent) = pending.pop() {
+        let Some(children) = causal_children.get(&parent) else {
+            continue;
+        };
+        for child in children {
+            if !visited.insert(*child) {
+                continue;
+            }
+            let child_is_visible = present.contains(&child.to_string());
+            match canonical_op_id(*child, representative, present) {
+                Some(candidate) if candidate != collapsed_anchor => {
+                    let _: bool = candidates.insert(candidate);
+                    if candidates.len() > 1 {
+                        return None;
+                    }
+                }
+                Some(_) if !child_is_visible => pending.push(*child),
+                None => pending.push(*child),
+                Some(_) => {}
+            }
+        }
+    }
+    candidates.into_iter().next()
 }
 
 /// Chase an `OpId` through the representative map until it reaches a visible row.
@@ -2484,6 +2835,31 @@ fn is_legacy_unversioned_import_relationship(op: &Op) -> bool {
         note.relationship,
         NoteRelationship::ForkOf | NoteRelationship::SubagentOf | NoteRelationship::ReconnectsTo
     )
+}
+
+/// Read exact importer-owned payload-equivalence evidence from an
+/// `OccurrenceOf` note.
+///
+/// The fingerprint is intentionally opaque to the provider-neutral projection.
+/// Requiring exact confidence and a complete 256-bit lowercase/uppercase hex
+/// value prevents truncated display previews or arbitrary prose notes from
+/// participating in occurrence contraction.
+fn exact_occurrence_payload_fingerprint(note: &editchain_core::op::NoteOp) -> Option<String> {
+    if note.relationship != NoteRelationship::OccurrenceOf {
+        return None;
+    }
+    let Payload::Inline(evidence) = &note.content else {
+        return None;
+    };
+    let value = serde_json::from_slice::<serde_json::Value>(evidence).ok()?;
+    if value.get("confidence").and_then(serde_json::Value::as_str) != Some("exact") {
+        return None;
+    }
+    let fingerprint = value
+        .get("payloadFingerprint")
+        .and_then(serde_json::Value::as_str)?;
+    (fingerprint.len() == 64 && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| fingerprint.to_string())
 }
 
 /// Whether a relation fact is indexed for identity/correlation resolution or

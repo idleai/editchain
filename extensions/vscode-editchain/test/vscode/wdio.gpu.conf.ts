@@ -10,8 +10,8 @@ import path from 'node:path';
 // (media/main.css + media/gpu-preview/gpu-preview.css) and ONLY the tiny
 // media/rust-history/loader.js bootstrap. Rust/web-sys owns the DOM,
 // accessibility surface, and the per-row SVG graph fragments (no canvas
-// surface is created). The test drives the production controls (profile,
-// find-in-chain, scroll, selection) inside that Rust-backed webview, asserts
+// surface is created). The test drives the production controls (find-in-chain,
+// scroll, selection) inside that Rust-backed webview, asserts
 // the debug renderer contract (backend 'svg', snapshot, renderCount > 0,
 // vertexCount 0, zero canvases, one aria-hidden svg.graph-row-fragment per
 // hydrated row), and captures a single-panel screenshot. There is

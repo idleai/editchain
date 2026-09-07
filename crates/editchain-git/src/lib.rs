@@ -14,9 +14,11 @@ pub mod merge;
 /// Object resolution (commits, trees, refs, diffs) via `gix`.
 pub mod resolve;
 
-pub use discover::{discover_repositories, RepositoryDiscovery, RepositoryHandle};
+pub use discover::{discover_repositories, open_repository, RepositoryDiscovery, RepositoryHandle};
 pub use merge::{merge_commit_entities, MergeOutcome};
-pub use resolve::{resolve_commit, walk_history, CommitResolution, ResolutionError};
+pub use resolve::{
+    resolve_commit, resolve_commit_prefix, walk_history, CommitResolution, ResolutionError,
+};
 
 use editchain_core::RepositoryId;
 

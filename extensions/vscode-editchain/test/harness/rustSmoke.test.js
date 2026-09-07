@@ -75,16 +75,22 @@ test('rust.html shares the scaffold but loads neither main.js nor the gpu-previe
   assert.match(RUST_HTML, /<link rel="stylesheet" href="\.\.\/\.\.\/media\/main\.css">/,
     'links the shared production media/main.css');
   assert.match(RUST_HTML, /<link rel="stylesheet" href="\.\.\/\.\.\/media\/gpu-preview\/gpu-preview\.css">/,
-    'links the shared renderer stylesheet (row-fragment + status chrome only)');
+    'links the shared renderer scaffold stylesheet');
   assert.match(RUST_HTML, /--vscode-editor-background/, 'ships the VS Code theme tokens');
   // Production scaffold IDs shared with the shipped webview scaffold.
   for (const id of [
-    'controls', 'profile-control', 'profile-activity', 'profile-raw',
-    'search-control', 'search', 'search-counter', 'search-prev', 'search-next',
+    'controls', 'search-control', 'search', 'search-counter', 'search-prev', 'search-next',
     'layout', 'rows', 'gpu-canvas-host', 'status-live',
   ]) {
     assert.ok(RUST_HTML.includes('id="' + id + '"'), 'rust.html missing production id #' + id);
   }
+  assert.doesNotMatch(
+    RUST_HTML,
+    /id="profile-control"|id="profile-activity"|id="profile-raw"/,
+    'the Activity-only extension has no profile toggle',
+  );
+  assert.doesNotMatch(RUST_HTML, /id="gpu-toolbar"|id="gpu-backend"|id="gpu-status"/,
+    'the harness has no visible renderer-status toolbar');
   // The Rust-only loader module is the page's bootstrap.
   assert.match(
     RUST_HTML,
@@ -354,30 +360,44 @@ test('rust-only adapter boots in headless Chrome and renders (merge)', { skip: S
     // fragment, fragment centres on the row centres).
     assertRustHealthy(state, 'boot');
 
-    // Activity -> Raw -> Activity through real button clicks; the correlated
-    // GetWindow filter must flip hide_trace with the profile.
-    assert.equal(state.profile, 'activity', 'boots in Activity');
+    const visibleChrome = await page.evaluate(() => {
+      const dateCells = Array.from(document.querySelectorAll('.date-cell'))
+        .filter((cell) => (cell.textContent || '').trim() !== '' &&
+          getComputedStyle(cell).display !== 'none');
+      return {
+        rendererStatusBars: document.querySelectorAll(
+          '#gpu-toolbar, #gpu-backend, #gpu-status').length,
+        datedRows: dateCells.length,
+        clippedDates: dateCells.filter((cell) =>
+          cell.scrollWidth > cell.clientWidth + 1).map((cell) => ({
+            text: (cell.textContent || '').trim(),
+            clientWidth: cell.clientWidth,
+            scrollWidth: cell.scrollWidth,
+          })),
+      };
+    });
+    assert.equal(visibleChrome.rendererStatusBars, 0,
+      'the SVG renderer status bar is absent');
+    assert.ok(visibleChrome.datedRows > 0, 'fixture renders dated rows');
+    assert.deepEqual(visibleChrome.clippedDates, [],
+      'the default Date column renders complete timestamps without ellipsis');
+
+    // The shipped extension is permanently Activity: no profile controls or
+    // hidden mutating parity hook exist, and every window hides trace rows.
+    assert.equal(state.profile, 'activity', 'boots and remains in Activity');
     assert.ok(state.windowRequests.length >= 1, 'boot issued a GetWindow');
-    assert.equal(state.windowRequests.at(-1).hideTrace, true, 'Activity sends hide_trace=true');
-    await page.bringToFront();
-    await page.click('#profile-raw');
-    await driver.waitFor(page, () => window.__editchainGpuDebug.profile() === 'raw',
-      { timeout: driver.IDLE_TIMEOUT_MS });
-    await page.evaluate((ms) => window.__editchainGpuDebug.whenIdle(ms), driver.IDLE_TIMEOUT_MS);
-    state = await rustState(page);
-    assert.equal(state.profile, 'raw', 'profile switched to Raw');
-    assert.equal(state.windowRequests.at(-1).hideTrace, false, 'Raw sends hide_trace=false');
-    assert.equal(await page.$eval('#profile-raw', (el) => el.getAttribute('aria-pressed')), 'true',
-      'Raw button aria-pressed');
-    assert.equal(await page.$eval('#profile-activity', (el) => el.getAttribute('aria-pressed')), 'false',
-      'Activity button aria-pressed cleared');
-    await page.click('#profile-activity');
-    await driver.waitFor(page, () => window.__editchainGpuDebug.profile() === 'activity',
-      { timeout: driver.IDLE_TIMEOUT_MS });
-    await page.evaluate((ms) => window.__editchainGpuDebug.whenIdle(ms), driver.IDLE_TIMEOUT_MS);
-    state = await rustState(page);
-    assert.equal(state.profile, 'activity', 'profile switched back to Activity');
-    assert.equal(state.windowRequests.at(-1).hideTrace, true, 'Activity restores hide_trace=true');
+    assert.ok(state.windowRequests.every((request) => request.hideTrace === true),
+      'every Activity window sends hide_trace=true');
+    const profileSurface = await page.evaluate(() => ({
+      control: document.getElementById('profile-control'),
+      activity: document.getElementById('profile-activity'),
+      raw: document.getElementById('profile-raw'),
+      setterType: typeof window.__editchainSetProfile,
+    }));
+    assert.equal(profileSurface.control, null, 'profile control is absent');
+    assert.equal(profileSurface.activity, null, 'Activity button is absent');
+    assert.equal(profileSurface.raw, null, 'Raw button is absent');
+    assert.equal(profileSurface.setterType, 'undefined', 'no hidden profile setter remains');
 
     // laneXAll is invariant across graph column / available-width changes.
     const laneXBefore = state.laneXAll;
@@ -424,6 +444,116 @@ test('rust-only adapter boots in headless Chrome and renders (merge)', { skip: S
     await page.close();
   }
 });
+
+test('Tags owns every chip while Content keeps regular prefix-free prose',
+  { skip: SKIP }, async () => {
+    const { page, errors } = await openRustPage('workUnits');
+    try {
+      const presentation = await page.evaluate(() => {
+        const styleOf = (element) => {
+          if (!element) return null;
+          const style = getComputedStyle(element);
+          return {
+            color: style.color,
+            backgroundColor: style.backgroundColor,
+            borderTop: style.borderTop,
+            borderRight: style.borderRight,
+            borderBottom: style.borderBottom,
+            borderLeft: style.borderLeft,
+            borderRadius: style.borderRadius,
+            fontFamily: style.fontFamily,
+            fontSize: style.fontSize,
+            fontWeight: style.fontWeight,
+            lineHeight: style.lineHeight,
+            paddingTop: style.paddingTop,
+            paddingRight: style.paddingRight,
+            paddingBottom: style.paddingBottom,
+            paddingLeft: style.paddingLeft,
+          };
+        };
+        const gitChip = Array.from(document.querySelectorAll('.git-prefix-chip'))
+          .find((element) => (element.textContent || '').trim() === 'chore') || null;
+        const gitRow = gitChip?.closest('.row') || null;
+        const gitContent = gitRow?.querySelector('.text-cell .git-summary-text') || null;
+        const activityChip = document.querySelector('.bundle-count');
+        const agentChip = document.querySelector('.session-chip-agent');
+        const workUnitChip = document.querySelector('.work-unit-count');
+        const sessionRow = document.querySelector('.row-session-summary');
+        const chipSelector = [
+          '.git-prefix-chip', '.bundle-count', '.bundle-status',
+          '.session-chip', '.rel-badge', '.out-badge', '.work-unit-count',
+        ].join(',');
+        const chips = Array.from(document.querySelectorAll(chipSelector));
+        const rows = Array.from(document.querySelectorAll('.row:not(.row-placeholder)'));
+
+        const humanRow = document.createElement('div');
+        humanRow.className = 'row row-human';
+        humanRow.style.position = 'fixed';
+        humanRow.style.visibility = 'hidden';
+        const humanSummary = document.createElement('span');
+        humanSummary.className = 'summary';
+        humanSummary.textContent = 'human content';
+        humanRow.appendChild(humanSummary);
+        document.body.appendChild(humanRow);
+        const humanWeight = getComputedStyle(humanSummary).fontWeight;
+        humanRow.remove();
+
+        return {
+          humanWeight,
+          gitPrefix: (gitChip?.textContent || '').trim(),
+          gitContent: (gitContent?.textContent || '').trim(),
+          gitStyle: styleOf(gitChip),
+          activityStyle: styleOf(activityChip),
+          agentStyle: styleOf(agentChip),
+          workUnitStyle: styleOf(workUnitChip),
+          headerLabels: Array.from(document.querySelectorAll('.tbl-header .th'))
+            .map((cell) => (cell.textContent || '').trim()),
+          chipCount: chips.length,
+          misplacedChips: chips.filter((chip) =>
+            !chip.parentElement?.classList.contains('tags-cell')).length,
+          contentChipCount: document.querySelectorAll(
+            '.text-cell :is(' + chipSelector + ')').length,
+          maxTagsPerRow: Math.max(0, ...rows.map((row) =>
+            row.querySelector('.tags-cell')?.children.length || 0)),
+          sessionSummary: sessionRow ? {
+            classification: sessionRow.getAttribute('data-classification'),
+            sessionCount: sessionRow.getAttribute('data-session-count'),
+            workUnitId: sessionRow.getAttribute('data-work-unit-id'),
+            activity: (sessionRow.querySelector('.activity-label')?.textContent || '').trim(),
+            countChip: (sessionRow.querySelector('.work-unit-count')?.textContent || '').trim(),
+          } : null,
+        };
+      });
+
+      assert.equal(presentation.humanWeight, '400', 'human content uses regular weight');
+      assert.equal(presentation.gitPrefix, 'chore', 'fixture exposes a conventional git prefix');
+      assert.equal(presentation.gitContent, 'ops one',
+        'git content excludes the prefix already shown in its chip');
+      assert.ok(presentation.gitStyle, 'git prefix chip is rendered');
+      assert.deepEqual(presentation.activityStyle, presentation.gitStyle,
+        'activity-count chip matches the git-prefix visual treatment');
+      assert.deepEqual(presentation.agentStyle, presentation.gitStyle,
+        'named-agent chip matches the git-prefix visual treatment');
+      assert.deepEqual(presentation.workUnitStyle, presentation.gitStyle,
+        'work-unit count chip matches the git-prefix visual treatment');
+      assert.deepEqual(presentation.headerLabels, ['Graph', 'Activity', 'Tags', 'Content', 'Date'],
+        'Tags is a real column directly before Content');
+      assert.ok(presentation.chipCount > 0, 'fixture renders row tags');
+      assert.equal(presentation.misplacedChips, 0, 'every chip is a direct Tags-cell child');
+      assert.equal(presentation.contentChipCount, 0, 'Content contains no chips');
+      assert.ok(presentation.maxTagsPerRow > 1, 'one row can render multiple tags');
+      assert.deepEqual(presentation.sessionSummary, {
+        classification: 'session',
+        sessionCount: '11',
+        workUnitId: 'session:s1/turn:t1',
+        activity: 'session',
+        countChip: '11 entries',
+      }, 'whole-session presentation overrides the count without replacing the turn unit');
+      assertNoErrors(errors, 'content and chip presentation');
+    } finally {
+      await page.close();
+    }
+  });
 
 test('find-in-chain, row selection, and disclosure interactions settle in real DOM',
   { skip: SKIP }, async () => {
@@ -509,20 +639,85 @@ test('find-in-chain, row selection, and disclosure interactions settle in real D
 
       // Chevron disclosure: exactly one tab stop and aria-expanded toggle.
       const expandable = await page.evaluate(() => {
-        const el = document.querySelector('.row-expandable');
+        const el = document.querySelector('.row-expandable[data-activity-bundle]');
         return el ? Number(el.getAttribute('data-row')) : null;
       });
-      assert.ok(expandable !== null, 'scenario contains an expandable row');
-      await driver.clickFirstExpandable(page);
+      assert.ok(expandable !== null, 'scenario contains an expandable group row');
+      const affordance = await page.evaluate((n) => {
+        const row = document.querySelector('.row[data-row="' + n + '"]');
+        const activity = row?.querySelector('.activity-cell');
+        const label = activity?.querySelector('.activity-label');
+        const chevron = activity?.querySelector('.subop-chevron');
+        return {
+          children: activity ? Array.from(activity.children).map((child) => child.className) : [],
+          label: label?.textContent ?? '',
+          glyph: chevron?.textContent ?? '',
+          labelColor: label ? getComputedStyle(label).color : '',
+          chevronColor: chevron ? getComputedStyle(chevron).color : '',
+          contentChevron: !!row?.querySelector('.text-cell .subop-chevron'),
+        };
+      }, expandable);
+      assert.deepEqual(
+        affordance.children,
+        ['activity-label', 'subop-chevron'],
+        'disclosure follows the Activity text');
+      assert.ok(affordance.label, 'Activity text remains visible');
+      assert.equal(affordance.glyph, '\u25b8', 'collapsed Activity affordance points right');
+      assert.equal(
+        affordance.chevronColor,
+        affordance.labelColor,
+        'disclosure inherits the Activity title color');
+      assert.equal(affordance.contentChevron, false, 'content cell no longer owns disclosure');
+      const collapsedGroupMarker = await page.evaluate((n) => {
+        const graph = document.querySelector('.row[data-row="' + n + '"] .graph-cell');
+        return {
+          dots: graph?.querySelectorAll('.graphDot').length ?? 0,
+          capsules: graph?.querySelectorAll('.graphBundleCapsule').length ?? 0,
+        };
+      }, expandable);
+      assert.deepEqual(collapsedGroupMarker, { dots: 0, capsules: 1 },
+        'a folded group summary uses the capsule marker');
+      await page.evaluate((n) => document
+        .querySelector('.row[data-row="' + n + '"] .subop-chevron')?.click(), expandable);
       await page.bringToFront();
       await page.evaluate((ms) => window.__editchainGpuDebug.whenIdle(ms), driver.IDLE_TIMEOUT_MS);
       const aria = await page.evaluate((n) =>
         document.querySelector('.row[data-row="' + n + '"]')?.getAttribute('aria-expanded'),
       expandable);
       assert.equal(aria, 'true', 'chevron toggles aria-expanded');
+      assert.equal(
+        await page.evaluate((n) => document
+          .querySelector('.row[data-row="' + n + '"] .activity-cell .subop-chevron')
+          ?.textContent, expandable),
+        '\u25be',
+        'expanded Activity affordance points down');
       assert.ok(
         await page.evaluate(() => document.querySelectorAll('#rows .row-subop').length) > 0,
         'expanding reveals sub-op rows');
+      const unfoldedGroupMarker = await page.evaluate((n) => {
+        const graph = document.querySelector('.row[data-row="' + n + '"] .graph-cell');
+        return {
+          dots: graph?.querySelectorAll('.graphDot').length ?? 0,
+          capsules: graph?.querySelectorAll('.graphBundleCapsule').length ?? 0,
+          terminals: graph?.querySelectorAll('.graphBundleTerminal').length ?? 0,
+        };
+      }, expandable);
+      assert.deepEqual(unfoldedGroupMarker, { dots: 1, capsules: 0, terminals: 0 },
+        'an unfolded group summary uses one ordinary circle');
+      const openedGroupMarkers = await page.evaluate(() => {
+        const members = Array.from(document.querySelectorAll('#rows .row-subop'));
+        return {
+          rows: members.length,
+          dots: members.filter((row) =>
+            row.querySelectorAll('.graph-cell .graphDot').length === 1).length,
+          nestedCapsules: members.filter((row) =>
+            row.querySelector('.graph-cell .graphBundleCapsule')).length,
+        };
+      });
+      assert.equal(openedGroupMarkers.dots, openedGroupMarkers.rows,
+        'every revealed group member owns one graph dot');
+      assert.equal(openedGroupMarkers.nestedCapsules, 0,
+        'revealed members use dots instead of nested heavy capsules');
       assert.equal(
         await page.evaluate(() =>
           Array.from(document.querySelectorAll('#rows .row'))
@@ -780,6 +975,69 @@ test('row keyboard disclosure, double-click identity, and divider drag remain co
         git_oid: expected.git_oid,
         repository: expected.repository,
       }, 'double-click posts the exact git identity');
+
+      const resizeAffordances = await page.evaluate(() => {
+        const header = document.querySelector('.tbl-header');
+        const handles = Array.from(document.querySelectorAll('.col-resize-handle'));
+        return {
+          columns: handles.map((handle) => handle.getAttribute('data-col')),
+          allInHeader: handles.every((handle) => handle.parentElement === header),
+          positions: handles.map((handle) => handle.getBoundingClientRect().left),
+          indicators: handles.map((handle) => {
+            const style = getComputedStyle(handle, '::after');
+            return { width: style.width, backgroundColor: style.backgroundColor };
+          }),
+        };
+      });
+      assert.deepEqual(resizeAffordances.columns,
+        ['graph', 'activity', 'tags', 'content', 'date'],
+        'every visible column exposes a resize handle');
+      assert.equal(resizeAffordances.allInHeader, true,
+        'resize handles stay in the sticky header');
+      assert.ok(resizeAffordances.positions.every((left, index, positions) =>
+        index === 0 || left > positions[index - 1]), 'resize handles follow column order');
+      assert.ok(resizeAffordances.indicators.every((indicator) =>
+        indicator.width === '1px' && indicator.backgroundColor !== 'rgba(0, 0, 0, 0)'),
+      'every handle has a visible centre indicator');
+
+      const resizedFixedColumns = await page.evaluate(() => {
+        const drag = (column, delta) => {
+          const header = document.querySelector('.tbl-header .th.' + column);
+          const handle = document.querySelector('.col-resize-handle[data-col="' + column + '"]');
+          const before = header.getBoundingClientRect().width;
+          const rect = handle.getBoundingClientRect();
+          const startX = rect.left + rect.width / 2;
+          const clientY = rect.top + rect.height / 2;
+          handle.dispatchEvent(new MouseEvent('mousedown', {
+            bubbles: true, cancelable: true, clientX: startX, clientY,
+          }));
+          window.dispatchEvent(new MouseEvent('mousemove', {
+            bubbles: true, cancelable: true, clientX: startX + delta, clientY,
+          }));
+          window.dispatchEvent(new MouseEvent('mouseup', {
+            bubbles: true, cancelable: true, clientX: startX + delta, clientY,
+          }));
+          return {
+            before,
+            after: document.querySelector('.tbl-header .th.' + column)
+              .getBoundingClientRect().width,
+          };
+        };
+        const activity = drag('activity', 18);
+        const tags = drag('tags', 24);
+        const activityRestored = drag('activity', -18);
+        const tagsRestored = drag('tags', -24);
+        return { activity, tags, activityRestored, tagsRestored };
+      });
+      assert.ok(resizedFixedColumns.activity.after > resizedFixedColumns.activity.before,
+        'Activity divider resizes its column');
+      assert.ok(resizedFixedColumns.tags.after > resizedFixedColumns.tags.before,
+        'Tags divider resizes its column');
+      assert.ok(Math.abs(resizedFixedColumns.activityRestored.after -
+        resizedFixedColumns.activity.before) <= 1, 'Activity width restores');
+      assert.ok(Math.abs(resizedFixedColumns.tagsRestored.after -
+        resizedFixedColumns.tags.before) <= 1, 'Tags width restores');
+      await settleRust(page);
 
       const before = await rustState(page);
       const handle = await page.$('.col-resize-handle[data-col="graph"]');

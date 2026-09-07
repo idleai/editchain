@@ -238,9 +238,28 @@ pub(crate) mod row {
         lane_list(value.get("below"))
     }
 
+    /// The incoming lane halves owned exclusively by muted edges.
+    pub(crate) fn muted_above(value: &Value) -> Vec<u32> {
+        lane_list(value.get("muted_above"))
+    }
+
+    /// The outgoing lane halves owned exclusively by muted edges.
+    pub(crate) fn muted_below(value: &Value) -> Vec<u32> {
+        lane_list(value.get("muted_below"))
+    }
+
     /// The directed (child-lane, parent-lane) transition pairs.
     pub(crate) fn transitions(value: &Value) -> Vec<(u32, u32)> {
-        match value.get("transitions") {
+        transition_list(value.get("transitions"))
+    }
+
+    /// The cross-lane transitions owned exclusively by muted edges.
+    pub(crate) fn muted_transitions(value: &Value) -> Vec<(u32, u32)> {
+        transition_list(value.get("muted_transitions"))
+    }
+
+    fn transition_list(value: Option<&Value>) -> Vec<(u32, u32)> {
+        match value {
             Some(Value::Array(pairs)) => pairs
                 .iter()
                 .filter_map(|pair| {
@@ -395,6 +414,9 @@ mod tests {
             "above": [1, 0],
             "below": [2],
             "transitions": [[1, 0], [2, 1]],
+            "muted_above": [1],
+            "muted_below": [2],
+            "muted_transitions": [[2, 1]],
             "is_subop": true,
         });
         assert_eq!(row::str(&row, "node_key"), "git:m1");
@@ -403,12 +425,17 @@ mod tests {
         assert_eq!(row::above(&row), vec![1, 0]);
         assert_eq!(row::below(&row), vec![2]);
         assert_eq!(row::transitions(&row), vec![(1, 0), (2, 1)]);
+        assert_eq!(row::muted_above(&row), vec![1]);
+        assert_eq!(row::muted_below(&row), vec![2]);
+        assert_eq!(row::muted_transitions(&row), vec![(2, 1)]);
         assert!(row::bool(&row, "is_subop"));
         assert!(!row::bool(&row, "promoted"));
         // Malformed geometry defaults to empty lanes.
         let sparse = json!({ "lane": "7" });
         assert_eq!(row::lane(&sparse), 0);
         assert!(row::above(&sparse).is_empty());
+        assert!(row::muted_above(&sparse).is_empty());
+        assert!(row::muted_transitions(&sparse).is_empty());
     }
     #[test]
     fn search_envelope_matches_the_production_retry_shape() {

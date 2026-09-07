@@ -289,7 +289,7 @@ describe('EditChain History Explorer', () => {
     await restoredWebview.close();
   });
 
-  it('switches Activity/Raw profiles and supports keyboard activation', async () => {
+  it('keeps the extension Activity-only and supports keyboard activation', async () => {
     const workbench = await browser.getWorkbench();
 
     await browser.executeWorkbench((vscode) => {
@@ -299,92 +299,24 @@ describe('EditChain History Explorer', () => {
     await webview.open();
     await browser.$('.row').waitForExist({ timeout: 120000 });
 
-    // The segmented control exists and defaults to Activity.
+    // Activity is the only shipped presentation; no visible or hidden profile
+    // mutation surface remains.
     const defaults = await browser.execute(() => ({
-      activityPressed: document.getElementById('profile-activity')?.getAttribute('aria-pressed'),
-      rawPressed: document.getElementById('profile-raw')?.getAttribute('aria-pressed'),
       profile: typeof window.__editchainGetProfile === 'function'
         ? window.__editchainGetProfile() : null,
       hasControl: !!document.getElementById('profile-control'),
+      hasActivityButton: !!document.getElementById('profile-activity'),
+      hasRawButton: !!document.getElementById('profile-raw'),
+      setterType: typeof (window as any).__editchainSetProfile,
+      rowCount: document.querySelectorAll('.row:not(.row-placeholder)').length,
     }));
     console.log('[e2e] profile defaults:', JSON.stringify(defaults));
-    expect(defaults.hasControl).toBe(true);
-    expect(defaults.activityPressed).toBe('true');
-    expect(defaults.rawPressed).toBe('false');
-
-    // Switch to Raw: the control updates and the view resets coherently
-    // (scroll to the top, rows re-render under the new profile). The real
-    // service may ignore hide_trace until the r4 backend lands, so the
-    // assertions are chain-agnostic: control state, profile, scroll reset,
-    // and a re-rendered bounded window.
-    await browser.execute(() => {
-      document.getElementById('profile-raw').click();
-    });
-    // The reset must clear readiness and drop the stale grid SYNCHRONOUSLY —
-    // before the new profile's window arrives. This is the product fix for the
-    // stale-DOM race (Raw -> Activity left old rows interactive and
-    // readiness-satisfying; Enter then hit a stale row whose abs index was
-    // absent from the cleared cache and raw activation was swallowed).
-    const resetState = await browser.execute(() => ({
-      dataReady: window.__editchainDataReady,
-      rowCount: document.querySelectorAll('.row').length,
-      loading: (document.querySelector('.view-message')?.textContent || ''),
-      profile: window.__editchainGetProfile(),
-    }));
-    console.log('[e2e] raw reset state:', JSON.stringify(resetState));
-    expect(resetState.dataReady).toBe(false);
-    expect(resetState.rowCount).toBe(0);
-    expect(resetState.loading).toContain('Loading');
-    expect(resetState.profile).toBe('raw');
-    // Wait for the NEW generation on authoritative readiness + current-profile
-    // cache only: every rendered row must be backed by the cache, so a stale
-    // DOM can never satisfy the wait while the new window is in flight.
-    await browser.waitUntil(async () => browser.execute(() => {
-      const rows = Array.from(document.querySelectorAll('.row'));
-      return window.__editchainDataReady === true &&
-        document.getElementById('rows').scrollTop === 0 &&
-        rows.length > 0 &&
-        rows.every((r) => {
-          const abs = Number(r.getAttribute('data-row'));
-          return Number.isFinite(abs) && window.__editchainRowAt(abs) != null;
-        });
-    }), { timeout: 30000, interval: 100 });
-    const rawState = await browser.execute(() => ({
-      profile: typeof window.__editchainGetProfile === 'function'
-        ? window.__editchainGetProfile() : null,
-      activityPressed: document.getElementById('profile-activity')?.getAttribute('aria-pressed'),
-      rawPressed: document.getElementById('profile-raw')?.getAttribute('aria-pressed'),
-      rowCount: document.querySelectorAll('.row').length,
-      scrollTop: document.getElementById('rows').scrollTop,
-    }));
-    console.log('[e2e] raw state:', JSON.stringify(rawState));
-    expect(rawState.profile).toBe('raw');
-    expect(rawState.activityPressed).toBe('false');
-    expect(rawState.rawPressed).toBe('true');
-    expect(rawState.rowCount).toBeGreaterThan(0);
-    expect(rawState.scrollTop).toBe(0);
-
-    // Switch back to Activity through the control.
-    await browser.execute(() => {
-      document.getElementById('profile-activity').click();
-    });
-    await browser.waitUntil(async () => browser.execute(() => {
-      const rows = Array.from(document.querySelectorAll('.row'));
-      return window.__editchainDataReady === true &&
-        document.getElementById('rows').scrollTop === 0 &&
-        rows.length > 0 &&
-        rows.every((r) => {
-          const abs = Number(r.getAttribute('data-row'));
-          return Number.isFinite(abs) && window.__editchainRowAt(abs) != null;
-        });
-    }), { timeout: 30000, interval: 100 });
-    const activityState = await browser.execute(() => ({
-      profile: window.__editchainGetProfile ? window.__editchainGetProfile() : null,
-      rowCount: document.querySelectorAll('.row').length,
-    }));
-    console.log('[e2e] activity state:', JSON.stringify(activityState));
-    expect(activityState.profile).toBe('activity');
-    expect(activityState.rowCount).toBeGreaterThan(0);
+    expect(defaults.profile).toBe('activity');
+    expect(defaults.hasControl).toBe(false);
+    expect(defaults.hasActivityButton).toBe(false);
+    expect(defaults.hasRawButton).toBe(false);
+    expect(defaults.setterType).toBe('undefined');
+    expect(defaults.rowCount).toBeGreaterThan(0);
 
     // Keyboard: Enter selects inline and explicitly opens the raw JSON editor.
     const keyboard = await browser.execute(() => {
@@ -503,9 +435,9 @@ describe('EditChain History Explorer', () => {
     await webview.close();
   });
 
-  it('keeps per-row graph fragments aligned and the scroll window stable during deep continuous scrolling (Activity + Raw)', async function () {
+  it('keeps per-row graph fragments aligned and the Activity window stable during deep continuous scrolling', async function () {
     // The real chain is 100k+ rows; the continuous sweep drives ~120k CSS px
-    // of motion per profile plus renderer settle waits, so give this test a
+    // of motion plus renderer settle waits, so give this test a
     // larger budget than the config default.
     this.timeout(600000);
 
@@ -517,15 +449,11 @@ describe('EditChain History Explorer', () => {
     await webview.open();
     await browser.$('.row').waitForExist({ timeout: 120000 });
 
-    // Pin the deterministic default Activity profile before measuring.
+    // Activity is fixed before measuring; there is no profile control.
     const initialProfile = await browser.execute(() =>
       typeof window.__editchainGetProfile === 'function'
         ? window.__editchainGetProfile() : null);
-    if (initialProfile !== 'activity') {
-      await browser.execute(() => {
-        document.getElementById('profile-activity').click();
-      });
-    }
+    expect(initialProfile).toBe('activity');
     await browser.waitUntil(async () => browser.execute(() => {
       const rows = Array.from(document.querySelectorAll('.row'));
       return window.__editchainDataReady === true &&
@@ -545,8 +473,8 @@ describe('EditChain History Explorer', () => {
 
     // Continuous scrollbar-like deep sweep with live + settled sampling runs
     // INSIDE the page (probeScrollParity), so failures carry concrete samples
-    // instead of a one-shot assertion. The probe never switches profiles: the
-    // REAL segmented control does, and the probe verifies the active profile.
+    // instead of a one-shot assertion. The probe verifies the fixed Activity
+    // presentation.
     //
     // Real VS Code WebDriver sessions enforce a ~30s script timeout on every
     // execute/sync command. A 60k px bidirectional sweep with settle waits
@@ -575,7 +503,7 @@ describe('EditChain History Explorer', () => {
         chunkPx: 8000,
         chunkBudgetMs: 20000,
       };
-      // One page-side session per profile (the probe state is reset on each injection anyway).
+      // One page-side session (the probe state is reset on each injection anyway).
       const sessionId = 'scroll-parity-' + profile + '-' + Date.now();
       let lastProgress = null;
       const MAX_PROBE_CALLS = 200; // covers pathological slow settle slices within the 600s test budget
@@ -639,49 +567,11 @@ describe('EditChain History Explorer', () => {
     // then return to the top of the chain.
     await parkAtDepth(path.join(__dirname, '..', '..', 'trace', 'e2e-scroll-parity-activity-depth.png'));
 
-    // Raw through the real segmented control; the reset must clear the grid
-    // synchronously and re-render a cache-backed window at scrollTop 0.
-    await browser.execute(() => {
-      document.getElementById('profile-raw').click();
-    });
-    await browser.waitUntil(async () => browser.execute(() => {
-      const rows = Array.from(document.querySelectorAll('.row'));
-      return window.__editchainDataReady === true &&
-        document.getElementById('rows').scrollTop === 0 &&
-        rows.length > 0 &&
-        rows.every((r) => {
-          const abs = Number(r.getAttribute('data-row'));
-          return Number.isFinite(abs) && window.__editchainRowAt(abs) != null;
-        });
-    }), { timeout: 60000, interval: 100 });
-
-    const raw = await runSweep('raw');
-    logSweep('raw', raw);
-    expect(raw.ok).toBe(true);
-
-    await parkAtDepth(path.join(__dirname, '..', '..', 'trace', 'e2e-scroll-parity-raw-depth.png'));
-
-    // Restore the default Activity profile at the top of the chain so the
-    // next test starts clean (same retained panel, no reload).
-    await browser.execute(() => {
-      document.getElementById('profile-activity').click();
-    });
-    await browser.waitUntil(async () => browser.execute(() => {
-      const rows = Array.from(document.querySelectorAll('.row'));
-      return window.__editchainDataReady === true &&
-        document.getElementById('rows').scrollTop === 0 &&
-        rows.length > 0 &&
-        rows.every((r) => {
-          const abs = Number(r.getAttribute('data-row'));
-          return Number.isFinite(abs) && window.__editchainRowAt(abs) != null;
-        });
-    }), { timeout: 60000, interval: 100 });
-
     // Leave the webview context.
     await webview.close();
   });
 
-  it('keeps the Activity work-unit/bundle/promotion layer coherent with the wire and gates it off in Raw', async function () {
+  it('keeps the Activity work-unit/bundle/promotion layer coherent with the wire', async function () {
     // This test may have to reopen a retained 126k-row virtual surface after
     // the preceding bottom-scroll test. Give the explicit 120s renderer wait
     // room to report its own diagnostic instead of racing Mocha's 120s suite
@@ -716,7 +606,8 @@ describe('EditChain History Explorer', () => {
     console.log('[e2e] work-unit idle:', JSON.stringify(idleResult));
 
     // Deterministic, chain-agnostic invariants over REAL rows: wherever a
-    // rendered row carries work_unit / promoted / activity_bundle wire
+    // rendered row carries work_unit / session_summary / promoted /
+    // activity_bundle wire
     // metadata, the DOM layer must agree exactly (class + data attrs + count
     // text). No opaque ids are asserted — the chain's content is irrelevant,
     // only the wire-to-DOM correspondence.
@@ -744,20 +635,39 @@ describe('EditChain History Explorer', () => {
           if (row.work_unit.is_start) {
             startRows++;
             const countEl = el.querySelector('.work-unit-count');
+            const expectedCount = row.session_summary
+              ? row.session_summary.count
+              : row.work_unit.count;
             const text = countEl ? (countEl.textContent || '').trim() : '';
             const expectsCount = row.activity_kind !== 'source_control' &&
-              row.work_unit.count > 1;
+              expectedCount > 1;
             if (!!countEl !== expectsCount) {
               problems.push('work-unit count visibility mismatch on ' + abs);
             } else if (countEl && (!/^\d+/.test(text) ||
-                Number(/^\d+/.exec(text)![0]) !== row.work_unit.count ||
+                Number(/^\d+/.exec(text)![0]) !== expectedCount ||
                 !/entr(?:y|ies)$/.test(text))) {
-              problems.push('work-unit entry count text "' + text + '" != ' + row.work_unit.count + ' on ' + abs);
+              problems.push('entry count text "' + text + '" != ' + expectedCount + ' on ' + abs);
+            } else if (countEl && !countEl.parentElement?.classList.contains('tags-cell')) {
+              problems.push('work-unit count is outside Tags on ' + abs);
             }
           }
         }
+        if (row.session_summary) {
+          if (!el.classList.contains('row-session-summary')) {
+            problems.push('session summary class missing on ' + abs);
+          }
+          if (el.getAttribute('data-classification') !== 'session') {
+            problems.push('session summary classification missing on ' + abs);
+          }
+          if (el.getAttribute('data-session-count') !== String(row.session_summary.count)) {
+            problems.push('session summary count attribute mismatch on ' + abs);
+          }
+        } else if (el.classList.contains('row-session-summary')) {
+          problems.push('unexpected session summary class on ' + abs);
+        }
         const typedBundle = row.activity_bundle &&
-          (row.activity_bundle.kind === 'execute-run' ||
+          (row.activity_bundle.kind === 'work-group' ||
+            row.activity_bundle.kind === 'execute-run' ||
             row.activity_bundle.kind === 'plan-repeat');
         if (typedBundle) {
           typedBundles++;
@@ -772,6 +682,8 @@ describe('EditChain History Explorer', () => {
           const text = countEl ? (countEl.textContent || '').trim() : '';
           if (!countEl || Number(/^\d+/.exec(text)?.[0]) !== row.activity_bundle.member_count) {
             problems.push('bundle-count text mismatch on ' + abs);
+          } else if (!countEl.parentElement?.classList.contains('tags-cell')) {
+            problems.push('bundle-count is outside Tags on ' + abs);
           }
           const statusEl = el.querySelector('.bundle-status');
           const statusText = statusEl ? (statusEl.textContent || '').trim() : '';
@@ -779,9 +691,11 @@ describe('EditChain History Explorer', () => {
             if (!statusEl || statusText !== '✓' ||
                 !statusEl.classList.contains('bundle-status-success')) {
               problems.push('successful bundle missing quiet success check on ' + abs);
+            } else if (!statusEl.parentElement?.classList.contains('tags-cell')) {
+              problems.push('bundle status is outside Tags on ' + abs);
             }
           } else if (statusEl) {
-            problems.push('non-success/plan bundle renders noisy status on ' + abs);
+            problems.push('bundle without successful execute outcome renders noisy status on ' + abs);
           }
         } else if (row.activity_bundle) {
           // Forward-compatible unknown bundle kind: never styled as execute-run.
@@ -795,6 +709,10 @@ describe('EditChain History Explorer', () => {
         }
         if (row.promoted === false && el.classList.contains('row-promoted')) {
           problems.push('non-promoted row has .row-promoted on ' + abs);
+        }
+        if (el.querySelector('.text-cell :is(.git-prefix-chip, .bundle-count, .bundle-status, ' +
+            '.session-chip, .rel-badge, .out-badge, .work-unit-count)')) {
+          problems.push('Content contains a row tag on ' + abs);
         }
       }
       return {
@@ -812,50 +730,6 @@ describe('EditChain History Explorer', () => {
     expect(activity.startRows).toBeGreaterThan(0);
     expect(activity.problems).toEqual([]);
 
-    // Raw gating: after switching through the REAL control path, no rendered
-    // row may carry any grouping/promotion class, descendant, or data attr —
-    // even when its cached row still carries the wire metadata.
-    await browser.execute(() => {
-      document.getElementById('profile-raw').click();
-    });
-    await browser.waitUntil(async () => browser.execute(() => {
-      return document.querySelectorAll('.row:not(.row-placeholder)').length > 0 &&
-        window.__editchainDataReady === true;
-    }), {
-      timeout: 60000,
-      interval: 200,
-      timeoutMsg: 'raw gating wait timed out',
-    });
-    const raw = await browser.execute(() => {
-      const rows = Array.from(document.querySelectorAll('.row:not(.row-placeholder)'));
-      const groupingSel = '.row-work-unit-start, .row-work-unit-end, .work-unit-ribbon, ' +
-        '.work-unit-count, .row-activity-bundle, .bundle-count, .bundle-status, ' +
-        '.row-promoted, [data-activity-bundle], [data-bundle-count]';
-      const leakRows = rows.filter((el) =>
-        el.querySelector(groupingSel) !== null || el.matches(groupingSel));
-      const cacheHasMetadata = rows.some((el) => {
-        const abs = Number(el.getAttribute('data-row'));
-        const row = window.__editchainRowAt ? window.__editchainRowAt(abs) : null;
-        return row && (!!row.work_unit || row.promoted || row.activity_bundle);
-      });
-      return {
-        profile: typeof window.__editchainGetProfile === 'function'
-          ? window.__editchainGetProfile() : null,
-        rows: rows.length,
-        leakRows: leakRows.length,
-        cacheHasMetadata,
-      };
-    });
-    console.log('[e2e] raw gating:', JSON.stringify(raw));
-    expect(raw.profile).toBe('raw');
-    expect(raw.rows).toBeGreaterThan(0);
-    expect(raw.leakRows).toBe(0);
-    // Raw may legitimately lack metadata (older service), but when it is
-    // present the gating must hold — never rendered.
-    if (raw.cacheHasMetadata) {
-      expect(raw.leakRows).toBe(0);
-    }
-
     await webview.close();
   });
 
@@ -872,17 +746,12 @@ describe('EditChain History Explorer', () => {
     await webview.open();
     await browser.$('.row').waitForExist({ timeout: 120000 });
 
-    // Webview state survives panel recreation, and the previous test leaves
-    // the profile on Raw. Find-in-chain resolves matches against the ACTIVE
-    // view, so pin the deterministic Activity profile before searching.
+    // Webview state survives panel recreation, while presentation remains
+    // fixed to Activity.
     const profile = await browser.execute(() =>
       typeof window.__editchainGetProfile === 'function'
         ? window.__editchainGetProfile() : null);
-    if (profile !== 'activity') {
-      await browser.execute(() => {
-        document.getElementById('profile-activity').click();
-      });
-    }
+    expect(profile).toBe('activity');
 
     // Wait for the initial window to settle before snapshotting the chain:
     // `total` is only authoritative after the first GetWindow response (the

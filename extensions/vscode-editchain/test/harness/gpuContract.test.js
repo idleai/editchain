@@ -112,8 +112,8 @@ test('production webview is Rust-only: rust-history loader, never main.js or the
     'the production body keeps the pulse treatment');
   assert.match(EXTENSION_SOURCE, /data-gpu-backend="auto"/,
     'the production body keeps the auto backend request');
-  assert.match(EXTENSION_SOURCE, /id="gpu-toolbar"/,
-    'the production scaffold keeps the GPU toolbar');
+  assert.doesNotMatch(EXTENSION_SOURCE, /id="gpu-toolbar"|id="gpu-backend"|id="gpu-status"/,
+    'the production scaffold has no visible renderer-status toolbar');
   assert.match(EXTENSION_SOURCE, /id="gpu-canvas-host"/,
     'the production scaffold keeps the canvas host');
   assert.match(EXTENSION_SOURCE, /id="gpu-rows"/,

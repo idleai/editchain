@@ -22,8 +22,8 @@
 //! - The wasm32-only [`HistoryDom`] shell: renders rows as real DOM/text
 //!   nodes (never application `innerHTML` strings), paints each `.graph-cell`
 //!   SVG from the pure items, and owns the scroll-window mutations and
-//!   Activity/Raw profile-control state. The obsolete fixed-viewport wgpu
-//!   canvas overlay is gone — the graph scrolls inside the row DOM.
+//!   fixed Activity presentation. The obsolete fixed-viewport wgpu canvas
+//!   overlay is gone — the graph scrolls inside the row DOM.
 //!
 //! The host message bridge and `HistoryAppState` ownership live in the wasm32
 //! shell in `crate::lib`; they drive this module's pure plans into the DOM.
@@ -33,7 +33,8 @@ use serde_json::{json, Value};
 
 use super::host::row as row_reader;
 use super::rows::{GraphData, RowSpec, ViewMode};
-use super::state::{HistoryAppState, Profile, ROW_H};
+use super::state::{HistoryAppState, ROW_H};
+use crate::ChainState;
 
 // ---------------------------------------------------------------------------
 // Pure graph/lane geometry (exact production constants)
@@ -73,8 +74,10 @@ pub(crate) const BUNDLE_TERMINAL_RATIO_CSS_PX: f64 = 0.75;
 /// Production bundle terminal radius floor (`BUNDLE_TERMINAL_MIN`).
 pub(crate) const BUNDLE_TERMINAL_MIN_CSS_PX: f64 = 1.5;
 
-/// Production bundle capsule margin (CSS px).
-pub(crate) const BUNDLE_MARGIN_CSS_PX: f64 = 1.0;
+/// Horizontal margin around a group capsule's terminal diameter (CSS px per
+/// side). A half-pixel keeps the rail distinct from its terminals without
+/// turning the group marker into a heavy bar.
+pub(crate) const BUNDLE_MARGIN_CSS_PX: f64 = 0.5;
 
 /// Production `MIN_COL_W.graph` (CSS px).
 pub(crate) const MIN_GRAPH_COL_W: f64 = 40.0;
@@ -82,8 +85,18 @@ pub(crate) const MIN_GRAPH_COL_W: f64 = 40.0;
 /// Production `MIN_CONTENT_W`: readable Content summary budget (CSS px).
 pub(crate) const MIN_CONTENT_W: f64 = 160.0;
 
+/// Fixed width of the always-visible Activity classification column (CSS px).
+pub(crate) const ACTIVITY_COL_W: f64 = 88.0;
+
+/// Fixed width of the always-visible row Tags column (CSS px).
+pub(crate) const TAGS_COL_W: f64 = 180.0;
+
 /// Production `DEFAULT_COL_W.date` (author/commit are hidden in Pulse).
-pub(crate) const DEFAULT_COL_W_DATE: f64 = 140.0;
+///
+/// The deterministic label can be as wide as `Sep 30, 2026 12:00 PM`; 160px
+/// leaves room for that text plus the cell's leading padding without the
+/// browser applying its ellipsis treatment.
+pub(crate) const DEFAULT_COL_W_DATE: f64 = 160.0;
 
 /// Production `HIDE_DATE_MAX`: at/below this width the date column drops too.
 pub(crate) const HIDE_DATE_MAX: f64 = 400.0;
@@ -152,6 +165,9 @@ pub(crate) const LANE_COLORS_HEX: [&str; 10] = [
     "#48f1dc", "#a18aff", "#6ee7a2", "#5ca8ff", "#ffc86a", "#ff70a6", "#72ddf7", "#c77dff",
     "#64dfdf", "#ff8fa3",
 ];
+
+/// Neutral graph color for a de-emphasized chain branch.
+pub(crate) const MUTED_GRAPH_HEX: &str = "#858585";
 
 /// The SVG namespace every per-row graph cell fragment lives in.
 #[cfg(target_arch = "wasm32")]
@@ -240,6 +256,16 @@ pub(crate) fn lane_color_hex(lane: u32) -> &'static str {
         .unwrap_or_else(|| LANE_COLORS_HEX.first().copied().unwrap_or("#48f1dc"))
 }
 
+/// Resolve either the normal lane palette or the reusable muted treatment.
+#[must_use]
+fn graph_color_hex(lane: u32, muted: bool) -> &'static str {
+    if muted {
+        MUTED_GRAPH_HEX
+    } else {
+        lane_color_hex(lane)
+    }
+}
+
 /// The CSS-pixel x center of `lane` from the cell's pinned lane positions.
 /// Unknown lanes fall back to the last supplied center, then the cell middle.
 #[must_use]
@@ -291,7 +317,10 @@ struct RenderedTransition {
 pub(crate) fn row_graph_items(graph: &GraphData, cell: &GraphCellSpec) -> Vec<SvgItem> {
     let mid_y = cell.height / 2.0;
     let node_lane = graph.lane;
-    let bundle = if graph.is_bundle {
+    // Only a folded group summary owns the capsule. Once unfolded, its summary
+    // row and every revealed member use ordinary dots, including members that
+    // are themselves nested bundles.
+    let bundle = if graph.is_bundle && !graph.is_subop && !graph.expanded {
         Some(BundleGlyph {
             term_r: (cell.dot_radius * BUNDLE_TERMINAL_RATIO_CSS_PX)
                 .max(BUNDLE_TERMINAL_MIN_CSS_PX),
@@ -350,7 +379,7 @@ pub(crate) fn row_graph_items(graph: &GraphData, cell: &GraphCellSpec) -> Vec<Sv
             y1: 0.0,
             x2: x,
             y2: end_y,
-            stroke: lane_color_hex(*lane),
+            stroke: graph_color_hex(*lane, graph.muted_above.contains(lane)),
         });
     }
     for lane in &graph.below {
@@ -367,52 +396,57 @@ pub(crate) fn row_graph_items(graph: &GraphData, cell: &GraphCellSpec) -> Vec<Sv
             y1: start_y,
             x2: x,
             y2: cell.height,
-            stroke: lane_color_hex(*lane),
+            stroke: graph_color_hex(*lane, graph.muted_below.contains(lane)),
         });
     }
     for transition in rendered {
-        items.extend(transition_items(transition, cell, bundle.as_ref(), mid_y));
+        let muted = graph
+            .muted_transitions
+            .contains(&(transition.from_lane, transition.to_lane));
+        items.extend(transition_items(
+            transition,
+            cell,
+            bundle.as_ref(),
+            mid_y,
+            muted,
+        ));
     }
-    // A sub-op row draws NO node mark — it is a pass-through region. Only
-    // top-level rows get the ordinary dot or the bundle capsule.
-    if !graph.is_subop {
-        let colour = lane_color_hex(node_lane);
-        if let Some(glyph) = bundle {
-            let x = lane_center_x(node_lane, cell);
-            let cap_w = glyph.term_r * 2.0 + BUNDLE_MARGIN_CSS_PX * 2.0;
-            let cap_h = (glyph.exit_y - glyph.entry_y) + glyph.term_r * 2.0;
-            items.push(SvgItem::Rect {
-                class: "graphBundleCapsule",
-                x: x - cap_w / 2.0,
-                y: glyph.entry_y - glyph.term_r,
-                width: cap_w,
-                height: cap_h,
-                rx: cap_w / 2.0,
-                fill: colour,
-            });
-            items.push(SvgItem::Circle {
-                class: "graphBundleTerminal graphBundleEntry",
-                cx: x,
-                cy: glyph.entry_y,
-                r: glyph.term_r,
-                fill: colour,
-            });
-            items.push(SvgItem::Circle {
-                class: "graphBundleTerminal graphBundleExit",
-                cx: x,
-                cy: glyph.exit_y,
-                r: glyph.term_r,
-                fill: colour,
-            });
-        } else {
-            items.push(SvgItem::Circle {
-                class: "graphDot",
-                cx: lane_center_x(node_lane, cell),
-                cy: mid_y,
-                r: cell.dot_radius,
-                fill: colour,
-            });
-        }
+    let colour = graph_color_hex(node_lane, graph.chain_state.is_muted());
+    if let Some(glyph) = bundle {
+        let x = lane_center_x(node_lane, cell);
+        let cap_w = glyph.term_r * 2.0 + BUNDLE_MARGIN_CSS_PX * 2.0;
+        let cap_h = (glyph.exit_y - glyph.entry_y) + glyph.term_r * 2.0;
+        items.push(SvgItem::Rect {
+            class: "graphBundleCapsule",
+            x: x - cap_w / 2.0,
+            y: glyph.entry_y - glyph.term_r,
+            width: cap_w,
+            height: cap_h,
+            rx: cap_w / 2.0,
+            fill: colour,
+        });
+        items.push(SvgItem::Circle {
+            class: "graphBundleTerminal graphBundleEntry",
+            cx: x,
+            cy: glyph.entry_y,
+            r: glyph.term_r,
+            fill: colour,
+        });
+        items.push(SvgItem::Circle {
+            class: "graphBundleTerminal graphBundleExit",
+            cx: x,
+            cy: glyph.exit_y,
+            r: glyph.term_r,
+            fill: colour,
+        });
+    } else {
+        items.push(SvgItem::Circle {
+            class: "graphDot",
+            cx: lane_center_x(node_lane, cell),
+            cy: mid_y,
+            r: cell.dot_radius,
+            fill: colour,
+        });
     }
     items
 }
@@ -426,6 +460,7 @@ fn transition_items(
     cell: &GraphCellSpec,
     bundle: Option<&BundleGlyph>,
     mid_y: f64,
+    muted: bool,
 ) -> Vec<SvgItem> {
     let x1 = lane_center_x(transition.from_lane, cell);
     let x2 = lane_center_x(transition.to_lane, cell);
@@ -474,12 +509,12 @@ fn transition_items(
         SvgItem::Path {
             class: "graphTransition graphTransitionSrc",
             d: quadratic_path_d(start, src_control, seam),
-            stroke: lane_color_hex(transition.from_lane),
+            stroke: graph_color_hex(transition.from_lane, muted),
         },
         SvgItem::Path {
             class: "graphTransition graphTransitionDst",
             d: quadratic_path_d(seam, dst_control, end),
-            stroke: lane_color_hex(transition.to_lane),
+            stroke: graph_color_hex(transition.to_lane, muted),
         },
     ]
 }
@@ -500,7 +535,9 @@ pub(crate) struct GraphLayout {
 /// Replicate `graphWidthBudget()`: fixed columns reserve their space first and
 /// the graph gets the remainder, capped at half the viewport (and at the
 /// compact rail width on narrow panels). Pulse hides author/commit at every
-/// width; date is retained until the narrowest breakpoint.
+/// width and retains date until the narrowest breakpoint. The fixed Activity
+/// track is deliberately not charged against this rail budget: doing so would
+/// rescale ordinary lane centers at compact widths, violating graph geometry.
 fn graph_width_budget(rows_client_width: f64, window_inner_width: f64) -> f64 {
     let rows_w = rows_client_width.max(1.0);
     let hidden_date = window_inner_width <= HIDE_DATE_MAX;
@@ -556,6 +593,8 @@ pub(crate) fn graph_layout(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ColKey {
     Graph,
+    Activity,
+    Tags,
     Content,
     Date,
     Author,
@@ -567,6 +606,8 @@ impl ColKey {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             ColKey::Graph => "graph",
+            ColKey::Activity => "activity",
+            ColKey::Tags => "tags",
             ColKey::Content => "content",
             ColKey::Date => "date",
             ColKey::Author => "author",
@@ -578,6 +619,8 @@ impl ColKey {
     pub(crate) fn parse(value: &str) -> Option<ColKey> {
         match value {
             "graph" => Some(ColKey::Graph),
+            "activity" => Some(ColKey::Activity),
+            "tags" => Some(ColKey::Tags),
             "content" => Some(ColKey::Content),
             "date" => Some(ColKey::Date),
             "author" => Some(ColKey::Author),
@@ -590,7 +633,9 @@ impl ColKey {
     pub(crate) fn min_width(self) -> f64 {
         match self {
             ColKey::Graph => 40.0,
-            ColKey::Content | ColKey::Author | ColKey::Commit => 60.0,
+            ColKey::Activity | ColKey::Tags | ColKey::Content | ColKey::Author | ColKey::Commit => {
+                60.0
+            }
             ColKey::Date => 90.0,
         }
     }
@@ -600,6 +645,8 @@ impl ColKey {
     pub(crate) fn default_width(self) -> f64 {
         match self {
             ColKey::Graph | ColKey::Content => 0.0,
+            ColKey::Activity => ACTIVITY_COL_W,
+            ColKey::Tags => TAGS_COL_W,
             ColKey::Date => DEFAULT_COL_W_DATE,
             ColKey::Author | ColKey::Commit => 100.0,
         }
@@ -612,6 +659,10 @@ impl ColKey {
 pub(crate) struct ColWidths {
     /// `--graph-w`: natural lane-based width unless the divider was dragged.
     pub(crate) graph: Option<f64>,
+    /// `--activity-w`: 88px unless the divider was dragged.
+    pub(crate) activity: Option<f64>,
+    /// `--tags-w`: 180px unless the divider was dragged.
+    pub(crate) tags: Option<f64>,
     /// `--content-w`: flexible `minmax(0,1fr)` unless dragged.
     pub(crate) content: Option<f64>,
     /// `--date-w` override (author/commit are always hidden in Pulse).
@@ -625,6 +676,8 @@ impl ColWidths {
     pub(crate) fn width(&self, col: ColKey) -> f64 {
         match col {
             ColKey::Graph => self.graph.unwrap_or(0.0),
+            ColKey::Activity => self.activity.unwrap_or_else(|| col.default_width()),
+            ColKey::Tags => self.tags.unwrap_or_else(|| col.default_width()),
             ColKey::Content => self.content.unwrap_or(0.0),
             ColKey::Date => self.date.unwrap_or_else(|| col.default_width()),
             ColKey::Author => self.author.unwrap_or_else(|| col.default_width()),
@@ -636,6 +689,8 @@ impl ColWidths {
     pub(crate) fn set(&mut self, col: ColKey, width: Option<f64>) {
         match col {
             ColKey::Graph => self.graph = width,
+            ColKey::Activity => self.activity = width,
+            ColKey::Tags => self.tags = width,
             ColKey::Content => self.content = width,
             ColKey::Date => self.date = width,
             ColKey::Author => self.author = width,
@@ -667,15 +722,23 @@ pub(crate) fn current_graph_width(layout: &GraphLayout, widths: &ColWidths) -> f
 
 /// The inline column-style string applied to rows/header/wrap (`colStyle()`).
 ///
-/// Pulse hides author/commit at every width; date is fixed at its default
-/// width until the narrowest breakpoint. Dragged overrides (divider state)
-/// are applied exactly like `colWidths` in main.js.
+/// Activity and Tags use responsive CSS defaults until dragged; Pulse hides
+/// author/commit at every width, while date remains until the narrowest
+/// breakpoint.
+/// Dragged overrides (divider state) are applied exactly like `colWidths` in
+/// main.js.
 pub(crate) fn col_style(
     graph_width_css: f64,
     window_inner_width: f64,
     widths: &ColWidths,
 ) -> String {
     let mut parts = vec![format!("--graph-w:{graph_width_css}px")];
+    if let Some(activity) = widths.activity {
+        parts.push(format!("--activity-w:{activity}px"));
+    }
+    if let Some(tags) = widths.tags {
+        parts.push(format!("--tags-w:{tags}px"));
+    }
     if let Some(content) = widths.content {
         parts.push(format!("--content-w:{content}px"));
     }
@@ -721,10 +784,7 @@ pub(crate) fn window_rows_from(
     bottom: i64,
     initial_group: Option<&str>,
 ) -> Vec<WindowRow> {
-    let view = match state.profile {
-        Profile::Activity => ViewMode::Activity,
-        Profile::Raw => ViewMode::Raw,
-    };
+    let view = ViewMode::Activity;
     let mut rows = Vec::new();
     let mut last_group = initial_group;
     for vis in top..=bottom {
@@ -843,10 +903,20 @@ pub(crate) struct FrameRow {
     pub(crate) below: Vec<u32>,
     /// Directed child→parent transition pairs.
     pub(crate) transitions: Vec<(u32, u32)>,
+    /// Incoming lane halves owned exclusively by muted edges.
+    pub(crate) muted_above: Vec<u32>,
+    /// Outgoing lane halves owned exclusively by muted edges.
+    pub(crate) muted_below: Vec<u32>,
+    /// Cross-lane transitions owned exclusively by muted edges.
+    pub(crate) muted_transitions: Vec<(u32, u32)>,
+    /// Presentation state for the row's node glyph.
+    pub(crate) chain_state: ChainState,
     /// Whether this is an expanded sub-op row.
     pub(crate) is_subop: bool,
     /// Whether this row is a typed Activity bundle.
     pub(crate) is_bundle: bool,
+    /// Whether this bundle's members are currently revealed.
+    pub(crate) expanded: bool,
 }
 
 /// Build the `GpuRenderer` frame rows directly from cached/`RowSpec` data for
@@ -881,8 +951,13 @@ pub(crate) fn frame_rows(
             above: graph.above.clone(),
             below: graph.below.clone(),
             transitions: graph.transitions.clone(),
+            muted_above: graph.muted_above.clone(),
+            muted_below: graph.muted_below.clone(),
+            muted_transitions: graph.muted_transitions.clone(),
+            chain_state: graph.chain_state,
             is_subop: graph.is_subop,
             is_bundle: graph.is_bundle,
+            expanded: graph.expanded,
         });
     }
     out
@@ -911,8 +986,13 @@ pub(crate) fn build_frame_value(
                 "above": row.above,
                 "below": row.below,
                 "transitions": row.transitions,
+                "muted_above": row.muted_above,
+                "muted_below": row.muted_below,
+                "muted_transitions": row.muted_transitions,
+                "chain_state": row.chain_state.as_wire(),
                 "is_subop": row.is_subop,
                 "is_bundle": row.is_bundle,
+                "expanded": row.expanded,
             })
         })
         .collect();
@@ -974,10 +1054,10 @@ mod web {
     use wasm_bindgen::prelude::*;
 
     use super::{
-        f64_round_to_i64, i64_to_f64, ColKey, FrameRow, GraphCellSpec, GraphData, Profile, RowSpec,
-        SvgItem, ROW_H, SVG_NS,
+        f64_round_to_i64, i64_to_f64, ColKey, FrameRow, GraphCellSpec, GraphData, RowSpec, SvgItem,
+        ROW_H, SVG_NS,
     };
-    use crate::app::rows::RowSummary;
+    use crate::app::rows::{Disclosure, RowSummary};
     use crate::app::state::{FindCounterState, HistoryAppState, Viewport};
 
     /// Build a `JsValue` error string.
@@ -1010,22 +1090,18 @@ mod web {
             .map_err(|error| js_error(format!("element #{id} has the wrong type: {error:?}")))
     }
 
-    /// The Rust-owned DOM shell (Slice 3A): owns `#rows`, the status
-    /// surfaces, and the profile buttons. All row content — including the
-    /// per-row SVG graph fragments — is built with DOM/text nodes; application
-    /// strings never pass through `innerHTML`.
+    /// The Rust-owned DOM shell (Slice 3A): owns `#rows` and the accessible
+    /// status surface. All row content — including the per-row SVG graph
+    /// fragments — is built with DOM/text nodes; application strings never
+    /// pass through `innerHTML`.
     pub(crate) struct HistoryDom {
         rows: web_sys::HtmlDivElement,
         status_live: web_sys::HtmlElement,
-        gpu_status: web_sys::HtmlElement,
-        gpu_backend: web_sys::HtmlElement,
         gpu_rows_mirror: web_sys::HtmlElement,
         search_counter: web_sys::HtmlElement,
         search_input: web_sys::HtmlInputElement,
         search_prev: web_sys::HtmlButtonElement,
         search_next: web_sys::HtmlButtonElement,
-        profile_activity: web_sys::HtmlButtonElement,
-        profile_raw: web_sys::HtmlButtonElement,
         /// Measured once: the smallest graph column width that renders the
         /// "Graph" columnheader label without clipping (`graphLabelMinW`).
         graph_label_min_width: Cell<Option<f64>>,
@@ -1052,28 +1128,19 @@ mod web {
                 .ok_or_else(|| js_error("browser document is unavailable"))?;
             let rows = require_element(&document, "rows")?;
             let status_live = require_element(&document, "status-live")?;
-            let gpu_status = require_element(&document, "gpu-status")?;
-            let gpu_backend = require_element(&document, "gpu-backend")?;
             let gpu_rows_mirror = require_element(&document, "gpu-rows")?;
             let search_counter = require_element(&document, "search-counter")?;
             let search_input = require_element(&document, "search")?;
             let search_prev = require_element(&document, "search-prev")?;
             let search_next = require_element(&document, "search-next")?;
-            let profile_activity = require_element(&document, "profile-activity")?;
-            let profile_raw = require_element(&document, "profile-raw")?;
-
             Ok(HistoryDom {
                 rows,
                 status_live,
-                gpu_status,
-                gpu_backend,
                 gpu_rows_mirror,
                 search_counter,
                 search_input,
                 search_prev,
                 search_next,
-                profile_activity,
-                profile_raw,
                 graph_label_min_width: Cell::new(None),
             })
         }
@@ -1566,9 +1633,8 @@ mod web {
             Ok(())
         }
 
-        /// Update the status surfaces (`#gpu-status` and the live region).
+        /// Update the accessible live status surface.
         pub(crate) fn set_status(&self, text: &str) {
-            self.gpu_status.set_text_content(Some(text));
             self.status_live.set_text_content(Some(text));
         }
 
@@ -1839,14 +1905,16 @@ mod web {
                 return Ok(());
             };
             let hidden = super::hidden_columns(window_inner_width);
-            let mut columns = vec![ColKey::Graph];
-            if !hidden.contains(&ColKey::Content) {
-                columns.push(ColKey::Content);
-            }
+            let mut columns = vec![
+                ColKey::Graph,
+                ColKey::Activity,
+                ColKey::Tags,
+                ColKey::Content,
+            ];
             if !hidden.contains(&ColKey::Date) {
                 columns.push(ColKey::Date);
             }
-            let wrap_width = f64::from(wrap.client_width());
+            let header_width = f64::from(header.client_width());
             for col in columns {
                 let selector = format!(".th.{}", col.as_str());
                 let Some(cell) = header.query_selector(&selector).map_err(js_err_from)? else {
@@ -1864,9 +1932,9 @@ mod web {
                 handle.set_attribute("data-col", col.as_str())?;
                 handle
                     .set_attribute("title", &format!("Drag to resize {} column", col.as_str()))?;
-                let left = (boundary - 3.0).min((wrap_width - 6.0).max(0.0));
+                let left = (boundary - 3.0).min((header_width - 6.0).max(0.0));
                 handle.style().set_property("left", &format!("{left}px"))?;
-                drop(wrap.append_child(&handle).map_err(js_err_from)?);
+                drop(header.append_child(&handle).map_err(js_err_from)?);
             }
             Ok(())
         }
@@ -1880,42 +1948,10 @@ mod web {
             graph_width_css >= self.graph_label_min_width()
         }
 
-        /// Update the backend badge (text + `data-backend`).
-        pub(crate) fn set_backend(&self, backend: &str, label: &str) {
-            self.gpu_backend.set_text_content(Some(label));
-            drop(self.gpu_backend.set_attribute("data-backend", backend));
-        }
-
-        /// Toggle the segmented Activity/Raw profile buttons.
-        pub(crate) fn set_profile_ui(&self, profile: Profile) {
-            let activity_active = matches!(profile, Profile::Activity);
-            Self::set_segmented_button(&self.profile_activity, activity_active);
-            Self::set_segmented_button(&self.profile_raw, !activity_active);
-        }
-
-        /// The activity profile button element (event wiring).
-        pub(crate) fn profile_activity_button(&self) -> web_sys::HtmlButtonElement {
-            self.profile_activity.clone()
-        }
-
-        /// The raw profile button element (event wiring).
-        pub(crate) fn profile_raw_button(&self) -> web_sys::HtmlButtonElement {
-            self.profile_raw.clone()
-        }
-
         fn document() -> Result<web_sys::Document, JsValue> {
             web_sys::window()
                 .and_then(|window| window.document())
                 .ok_or_else(|| js_error("browser document is unavailable"))
-        }
-
-        fn set_segmented_button(button: &web_sys::HtmlButtonElement, active: bool) {
-            if active {
-                drop(button.class_list().add_1("active"));
-            } else {
-                drop(button.class_list().remove_1("active"));
-            }
-            drop(button.set_attribute("aria-pressed", if active { "true" } else { "false" }));
         }
     }
 
@@ -1945,6 +1981,8 @@ mod web {
         header.set_attribute("style", col_style)?;
         let columns = [
             ("graph", Some("Graph")),
+            ("activity", Some("Activity")),
+            ("tags", Some("Tags")),
             ("content", Some("Content")),
             ("date", Some("Date")),
         ];
@@ -2023,8 +2061,20 @@ mod web {
         row.set_attribute("title", &spec.aria.title)?;
         row.set_attribute("data-base-aria-label", &spec.aria.base_aria_label)?;
         row.set_attribute("data-key", &spec.identity.node_key)?;
+        row.set_attribute(
+            "data-hierarchy-depth",
+            &spec.identity.hierarchy_depth.to_string(),
+        )?;
+        row.set_attribute("data-classification", &spec.classification.label)?;
         if let Some(header) = &spec.work_unit_header {
             row.set_attribute("data-work-unit-id", &header.id)?;
+        }
+        if let Some(count) = spec
+            .session_summary
+            .as_ref()
+            .and_then(|summary| summary.count)
+        {
+            row.set_attribute("data-session-count", &count.to_string())?;
         }
         if let Some(bundle) = &spec.bundle {
             row.set_attribute("data-activity-bundle", bundle.kind.as_str())?;
@@ -2044,6 +2094,33 @@ mod web {
         let svg = build_graph_svg(document, graph, &spec.graph)?;
         drop(graph_cell.append_child(&svg).map_err(js_err_from)?);
         drop(row.append_child(&graph_cell).map_err(js_err_from)?);
+
+        let activity_cell = make_element(document, "div", "activity-cell", None)?;
+        activity_cell.set_attribute("role", "gridcell")?;
+        activity_cell.set_attribute("title", &spec.classification.title)?;
+        activity_cell.set_attribute("aria-label", &spec.classification.title)?;
+        activity_cell.set_attribute("data-classification-source", &spec.classification.source)?;
+        let activity_label = make_element(
+            document,
+            "span",
+            "activity-label",
+            Some(&spec.classification.label),
+        )?;
+        let activity_node = node_of(&activity_cell)?;
+        drop(
+            activity_node
+                .append_child(&node_of(&activity_label)?)
+                .map_err(js_err_from)?,
+        );
+        if let Some(disclosure) = &spec.disclosure {
+            append_disclosure(document, &activity_node, disclosure)?;
+        }
+        drop(row.append_child(&activity_cell).map_err(js_err_from)?);
+
+        let tags_cell = make_element(document, "div", "tags-cell", None)?;
+        tags_cell.set_attribute("role", "gridcell")?;
+        append_tags(document, &tags_cell, spec)?;
+        drop(row.append_child(&tags_cell).map_err(js_err_from)?);
 
         let text_cell = make_element(document, "div", "text-cell", None)?;
         text_cell.set_attribute("role", "gridcell")?;
@@ -2188,8 +2265,61 @@ mod web {
         element.dyn_into::<web_sys::Node>().map_err(js_err_from)
     }
 
-    /// Build the content-cell children (chevron, session chips, chrome,
-    /// summary, work-unit ribbon, sub-op line) as DOM/text nodes.
+    /// Append one disclosure control to either a top-level or nested row.
+    fn append_disclosure(
+        document: &web_sys::Document,
+        parent: &web_sys::Node,
+        disclosure: &Disclosure,
+    ) -> Result<(), JsValue> {
+        let button: web_sys::HtmlButtonElement = document
+            .create_element("button")?
+            .dyn_into()
+            .map_err(js_err_from)?;
+        button.set_class_name("subop-chevron");
+        button.set_attribute("type", "button")?;
+        button.set_attribute("title", &disclosure.label)?;
+        button.set_attribute("aria-label", &disclosure.label)?;
+        button.set_attribute("aria-expanded", &disclosure.expanded.to_string())?;
+        button.set_text_content(Some(if disclosure.expanded {
+            "\u{25be}"
+        } else {
+            "\u{25b8}"
+        }));
+        let button = button
+            .dyn_into::<web_sys::HtmlElement>()
+            .map_err(js_err_from)?;
+        drop(
+            parent
+                .append_child(&node_of(&button)?)
+                .map_err(js_err_from)?,
+        );
+        Ok(())
+    }
+
+    /// Build the Tags-column chips in their stable model order.
+    fn append_tags(
+        document: &web_sys::Document,
+        parent: &web_sys::HtmlElement,
+        spec: &RowSpec,
+    ) -> Result<(), JsValue> {
+        let parent_node = node_of(parent)?;
+        for item in &spec.tags {
+            let tag = make_element(document, "span", &item.classes, Some(&item.text))?;
+            tag.set_attribute("title", &item.title)?;
+            if let Some(aria) = &item.aria_label {
+                tag.set_attribute("aria-label", aria)?;
+            }
+            drop(
+                parent_node
+                    .append_child(&node_of(&tag)?)
+                    .map_err(js_err_from)?,
+            );
+        }
+        Ok(())
+    }
+
+    /// Build Content-column prose, work-unit ribbon, and sub-op line as
+    /// DOM/text nodes. Disclosure lives in Activity and chips live in Tags.
     fn append_content(
         document: &web_sys::Document,
         parent: &web_sys::HtmlElement,
@@ -2235,52 +2365,8 @@ mod web {
             parent_node.clone()
         };
 
-        if let Some(disclosure) = &top.chevron {
-            let button: web_sys::HtmlButtonElement = document
-                .create_element("button")?
-                .dyn_into()
-                .map_err(js_err_from)?;
-            button.set_class_name("subop-chevron");
-            button.set_attribute("type", "button")?;
-            button.set_attribute("title", &disclosure.label)?;
-            button.set_attribute("aria-label", &disclosure.label)?;
-            let expanded_text = disclosure.expanded.to_string();
-            button.set_attribute("aria-expanded", &expanded_text)?;
-            button.set_text_content(Some(if disclosure.expanded {
-                "\u{25be}"
-            } else {
-                "\u{25b8}"
-            }));
-            let button_node = node_of(
-                &button
-                    .dyn_into::<web_sys::HtmlElement>()
-                    .map_err(js_err_from)?,
-            )?;
-            drop(
-                content_node
-                    .append_child(&button_node)
-                    .map_err(js_err_from)?,
-            );
-        }
-        if !wu_start {
-            append_session_slot(document, &content_node, spec, spec.state.group_start)?;
-        }
-        if !top.chrome.is_empty() {
-            let meta = make_element(document, "span", "row-meta", None)?;
-            let meta_node = node_of(&meta)?;
-            for item in &top.chrome {
-                let badge = make_element(document, "span", &item.classes, Some(&item.text))?;
-                badge.set_attribute("title", &item.title)?;
-                if let Some(aria) = &item.aria_label {
-                    badge.set_attribute("aria-label", aria)?;
-                }
-                let badge_node = node_of(&badge)?;
-                drop(meta_node.append_child(&badge_node).map_err(js_err_from)?);
-            }
-            drop(content_node.append_child(&meta_node).map_err(js_err_from)?);
-        }
         if let Some(summary) = &top.summary {
-            append_row_summary(document, &content_node, spec, summary)?;
+            append_row_summary(document, &content_node, summary)?;
         }
         if wu_start {
             let header = spec
@@ -2299,70 +2385,25 @@ mod web {
             title_span.set_attribute("title", &header.title)?;
             let title_node = node_of(&title_span)?;
             drop(ribbon_node.append_child(&title_node).map_err(js_err_from)?);
-            append_session_slot(document, &ribbon_node, spec, header.session_chips)?;
-            if header.show_count {
-                let count = make_element(
-                    document,
-                    "span",
-                    "work-unit-count",
-                    Some(&header.count_text),
-                )?;
-                count.set_attribute("title", &header.count_title)?;
-                let count_node = node_of(&count)?;
-                drop(ribbon_node.append_child(&count_node).map_err(js_err_from)?);
-            }
         }
         Ok(())
     }
 
-    /// Append the session-meta slot (chips only at the group boundary).
-    fn append_session_slot(
-        document: &web_sys::Document,
-        parent: &web_sys::Node,
-        spec: &RowSpec,
-        at_group_start: bool,
-    ) -> Result<(), JsValue> {
-        if spec.session.is_empty() {
-            return Ok(());
-        }
-        let slot = make_element(document, "span", "session-meta-slot", None)?;
-        let slot_node = node_of(&slot)?;
-        if at_group_start {
-            for chip in &spec.session {
-                let label = format!("{}: {}", chip.title, chip.label);
-                let chip_element = make_element(document, "span", &chip.class, Some(&chip.label))?;
-                chip_element.set_attribute("title", &label)?;
-                chip_element.set_attribute("aria-label", &label)?;
-                let chip_node = node_of(&chip_element)?;
-                drop(slot_node.append_child(&chip_node).map_err(js_err_from)?);
-            }
-        }
-        drop(parent.append_child(&slot_node).map_err(js_err_from)?);
-        Ok(())
-    }
-
-    /// Append the summary text (Git prefix chip + summary span).
+    /// Append summary prose; Git prefixes are rendered by `append_tags`.
     fn append_row_summary(
         document: &web_sys::Document,
         parent: &web_sys::Node,
-        spec: &RowSpec,
         summary: &RowSummary,
     ) -> Result<(), JsValue> {
-        if let Some(prefix) = &summary.git_prefix {
-            let label = format!("Commit prefix: {prefix}");
-            let chip = make_element(document, "span", "git-prefix-chip", Some(prefix))?;
-            chip.set_attribute("title", &label)?;
-            chip.set_attribute("aria-label", &label)?;
-            let chip_node = node_of(&chip)?;
-            drop(parent.append_child(&chip_node).map_err(js_err_from)?);
+        if let Some(plain_content) = &summary.plain_content {
+            let mut class = String::from("summary-text");
+            if summary.git_prefix.is_some() {
+                class.push_str(" git-summary-text");
+            }
+            let text = make_element(document, "span", &class, Some(plain_content))?;
+            let text_node = node_of(&text)?;
+            drop(parent.append_child(&text_node).map_err(js_err_from)?);
         }
-        let mut class = String::from("summary-text");
-        if summary.git_prefix.is_some() {
-            class.push_str(" git-summary-text");
-        }
-        let text = make_element(document, "span", &class, Some(&spec.plain_summary))?;
-        let text_node = node_of(&text)?;
-        drop(parent.append_child(&text_node).map_err(js_err_from)?);
         Ok(())
     }
 }
@@ -2511,6 +2552,7 @@ mod tests {
         assert_eq!(specs.len(), 2, "specs cover the window");
         let first = specs.first().expect("first spec");
         assert_eq!(first.identity.abs_index, 0, "first spec identity");
+        assert_eq!(first.classification.label, "agent");
         let second = specs.get(1).expect("second spec");
         assert_eq!(second.identity.node_key, "k1", "second spec node key");
     }
@@ -2601,8 +2643,13 @@ mod tests {
             above: Vec::new(),
             below: vec![0],
             transitions: vec![(0, 1)],
+            muted_above: Vec::new(),
+            muted_below: vec![0],
+            muted_transitions: vec![(0, 1)],
+            chain_state: ChainState::Muted,
             is_subop: false,
             is_bundle: false,
+            expanded: false,
         }];
         let frame = build_frame_value(&layout, DEFAULT_EDITOR_BACKGROUND_HEX, &rows);
         let graph = frame.get("graph").expect("frame has graph");
@@ -2634,6 +2681,9 @@ mod tests {
                 .and_then(|array| array.first()),
             Some(&Value::from(vec![0, 1]))
         );
+        assert_eq!(row.get("muted_below"), Some(&json!([0])));
+        assert_eq!(row.get("muted_transitions"), Some(&json!([[0, 1]])));
+        assert_eq!(row.get("chain_state"), Some(&Value::from("muted")));
     }
 
     #[test]
@@ -2641,8 +2691,8 @@ mod tests {
         let widths = ColWidths::default();
         assert_eq!(
             col_style(44.28, 1440.0, &widths),
-            "--graph-w:44.28px;--date-w:140px",
-            "wide panels carry the fixed date width"
+            "--graph-w:44.28px;--date-w:160px",
+            "wide panels use CSS defaults for undragged Activity and Tags"
         );
         assert_eq!(
             col_style(44.28, 380.0, &widths),
@@ -2650,13 +2700,15 @@ mod tests {
             "narrow panels drop the date track"
         );
         let dragged = ColWidths {
+            activity: Some(104.0),
+            tags: Some(200.0),
             content: Some(220.0),
             date: Some(90.0),
             ..ColWidths::default()
         };
         assert_eq!(
             col_style(44.28, 1440.0, &dragged),
-            "--graph-w:44.28px;--content-w:220px;--date-w:90px",
+            "--graph-w:44.28px;--activity-w:104px;--tags-w:200px;--content-w:220px;--date-w:90px",
             "dragged overrides reach the inline style"
         );
     }
@@ -2665,6 +2717,8 @@ mod tests {
     fn every_column_has_min_default_and_parse_round_trips() {
         for col in [
             ColKey::Graph,
+            ColKey::Activity,
+            ColKey::Tags,
             ColKey::Content,
             ColKey::Date,
             ColKey::Author,
@@ -2687,9 +2741,13 @@ mod tests {
     fn col_widths_set_applies_and_clears_overrides() {
         let mut widths = ColWidths::default();
         widths.set(ColKey::Graph, Some(180.0));
+        widths.set(ColKey::Activity, Some(96.0));
+        widths.set(ColKey::Tags, Some(200.0));
         widths.set(ColKey::Content, Some(220.0));
         widths.set(ColKey::Date, Some(90.0));
         assert_eq!(widths.graph, Some(180.0));
+        assert_eq!(widths.activity, Some(96.0));
+        assert_eq!(widths.tags, Some(200.0));
         assert_eq!(widths.content, Some(220.0));
         assert_eq!(widths.date, Some(90.0));
         widths.set(ColKey::Graph, None);
@@ -2838,25 +2896,145 @@ mod tests {
     }
 
     #[test]
-    fn subop_rows_draw_no_node_mark() {
+    fn muted_branch_uses_gray_only_for_its_node_and_owned_segments() {
         let cell = graph_cell_spec(vec![14.76, 29.52], 4.0, 44.28);
-        let graph = graph_data(0, vec![0, 1], vec![0, 1], Vec::new());
         let graph = GraphData {
-            is_subop: true,
-            ..graph
+            muted_below: vec![1],
+            chain_state: ChainState::Muted,
+            ..graph_data(1, vec![0], vec![0, 1], Vec::new())
         };
         let items = row_graph_items(&graph, &cell);
+
+        assert!(items.iter().any(|item| matches!(
+            item,
+            SvgItem::Line {
+                x1,
+                stroke: MUTED_GRAPH_HEX,
+                ..
+            } if (*x1 - 29.52).abs() < 1e-9
+        )));
+        assert!(items.iter().any(|item| matches!(
+            item,
+            SvgItem::Circle {
+                fill: MUTED_GRAPH_HEX,
+                ..
+            }
+        )));
         assert!(
-            items
-                .iter()
-                .all(|item| matches!(item, SvgItem::Line { .. })),
-            "sub-op rows are pass-through regions with full-height lines only"
+            items.iter().any(|item| matches!(
+                item,
+                SvgItem::Line {
+                    x1,
+                    stroke: "#48f1dc",
+                    ..
+                } if (*x1 - 14.76).abs() < 1e-9
+            )),
+            "the unrelated active lane keeps its palette color"
         );
-        assert_eq!(items.len(), 4, "both lanes pass through both halves");
     }
 
     #[test]
-    fn bundle_rows_render_capsule_and_terminals_around_the_midpoint() {
+    fn muted_parent_row_transition_is_entirely_gray() {
+        let cell = graph_cell_spec(vec![14.76, 29.52], 4.0, 44.28);
+        let graph = GraphData {
+            muted_above: vec![1],
+            muted_transitions: vec![(1, 0)],
+            ..graph_data(0, vec![1], Vec::new(), vec![(1, 0)])
+        };
+        let items = row_graph_items(&graph, &cell);
+        let paths: Vec<&SvgItem> = items
+            .iter()
+            .filter(|item| matches!(item, SvgItem::Path { .. }))
+            .collect();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().all(|item| matches!(
+            item,
+            SvgItem::Path {
+                stroke: MUTED_GRAPH_HEX,
+                ..
+            }
+        )));
+        assert!(
+            items.iter().any(|item| matches!(
+                item,
+                SvgItem::Circle {
+                    fill: "#48f1dc",
+                    ..
+                }
+            )),
+            "the active parent dot remains colored"
+        );
+    }
+
+    #[test]
+    fn opened_group_members_draw_center_dots_even_for_nested_bundles() {
+        let cell = graph_cell_spec(vec![14.76, 29.52], 4.0, 44.28);
+        for is_bundle in [false, true] {
+            let graph = graph_data(0, vec![0, 1], vec![0, 1], Vec::new());
+            let graph = GraphData {
+                is_subop: true,
+                is_bundle,
+                ..graph
+            };
+            let items = row_graph_items(&graph, &cell);
+            assert_eq!(items.len(), 5, "four lane halves plus member dot");
+            assert_eq!(
+                items
+                    .iter()
+                    .filter(|item| matches!(
+                        item,
+                        SvgItem::Circle {
+                            class: "graphDot",
+                            ..
+                        }
+                    ))
+                    .count(),
+                1,
+                "every revealed member gets exactly one dot"
+            );
+            assert!(
+                items
+                    .iter()
+                    .all(|item| !matches!(item, SvgItem::Rect { .. })),
+                "a nested bundle member gets a dot, not another group capsule"
+            );
+        }
+    }
+
+    #[test]
+    fn unfolded_group_summary_draws_one_center_dot() {
+        let cell = graph_cell_spec(vec![14.76, 29.52], 4.0, 44.28);
+        let graph = GraphData {
+            is_bundle: true,
+            expanded: true,
+            ..graph_data(0, vec![0], vec![0], Vec::new())
+        };
+        let items = row_graph_items(&graph, &cell);
+        assert_eq!(items.len(), 3, "two lane halves plus one summary dot");
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(
+                    item,
+                    SvgItem::Circle {
+                        class: "graphDot",
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "an unfolded group summary gets exactly one ordinary dot"
+        );
+        assert!(
+            items
+                .iter()
+                .all(|item| !matches!(item, SvgItem::Rect { .. })),
+            "an unfolded group summary no longer gets a capsule"
+        );
+    }
+
+    #[test]
+    fn folded_bundle_rows_render_capsule_and_terminals_around_the_midpoint() {
         let cell = graph_cell_spec(vec![14.76, 29.52], 4.0, 44.28);
         let graph = graph_data(0, vec![0], vec![0], Vec::new());
         let graph = GraphData {
@@ -2889,14 +3067,14 @@ mod tests {
         {
             assert_eq!(*class, "graphBundleCapsule");
             let term_r = (4.0 * BUNDLE_TERMINAL_RATIO_CSS_PX).max(BUNDLE_TERMINAL_MIN_CSS_PX);
-            assert!((*x - (14.76 - term_r - 1.0)).abs() < 1e-9);
+            assert!((*x - (14.76 - term_r - BUNDLE_MARGIN_CSS_PX)).abs() < 1e-9);
             assert!(
                 (*y - (10.0 - term_r)).abs() < 1e-9,
                 "entry terminal at y=10"
             );
-            assert!((*width - (term_r * 2.0 + 2.0)).abs() < 1e-9);
+            assert!((*width - (term_r * 2.0 + BUNDLE_MARGIN_CSS_PX * 2.0)).abs() < 1e-9);
             assert!((*height - (14.0 + term_r * 2.0)).abs() < 1e-9);
-            assert!((*rx - (term_r + 1.0)).abs() < 1e-9);
+            assert!((*rx - (term_r + BUNDLE_MARGIN_CSS_PX)).abs() < 1e-9);
             assert_eq!(*fill, "#48f1dc");
         }
         let terminals: Vec<&SvgItem> = items

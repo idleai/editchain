@@ -26,6 +26,48 @@ mod app;
 #[cfg(any(target_arch = "wasm32", test))]
 use serde::Deserialize;
 
+/// Renderer-side form of the protocol's reusable chain presentation state.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ChainState {
+    /// De-emphasized node and child-owned graph edge.
+    Muted,
+    /// Ordinary graph and row presentation; also the compatibility fallback.
+    #[default]
+    #[serde(other)]
+    Active,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl ChainState {
+    /// Parse the compact wire value without allocating.
+    #[must_use]
+    pub(crate) fn from_wire(value: &str) -> Self {
+        if value == "muted" {
+            Self::Muted
+        } else {
+            Self::Active
+        }
+    }
+
+    /// Stable wire value used by the retained GPU frame mirror.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Muted => "muted",
+            Self::Active => "active",
+        }
+    }
+
+    /// Whether muted graph styling applies.
+    #[must_use]
+    pub(crate) const fn is_muted(self) -> bool {
+        matches!(self, Self::Muted)
+    }
+}
+
 #[cfg(any(target_arch = "wasm32", test))]
 const FLOATS_PER_VERTEX: usize = 6;
 
@@ -253,9 +295,19 @@ struct RenderRow {
     #[serde(default)]
     transitions: Vec<[u32; 2]>,
     #[serde(default)]
+    muted_above: Vec<u32>,
+    #[serde(default)]
+    muted_below: Vec<u32>,
+    #[serde(default)]
+    muted_transitions: Vec<[u32; 2]>,
+    #[serde(default)]
+    chain_state: ChainState,
+    #[serde(default)]
     is_subop: bool,
     #[serde(default)]
     is_bundle: bool,
+    #[serde(default)]
+    expanded: bool,
 }
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -349,6 +401,17 @@ fn lane_color(lane: u32) -> [f32; 4] {
         srgb_to_linear(blue),
         1.0,
     ]
+}
+
+/// Linear-space graph color for an ordinary lane or the neutral muted state.
+#[cfg(any(target_arch = "wasm32", test))]
+fn graph_color(lane: u32, muted: bool) -> [f32; 4] {
+    if muted {
+        let gray = srgb_to_linear(0x85);
+        [gray, gray, gray, 1.0]
+    } else {
+        lane_color(lane)
+    }
 }
 
 /// CSS-pixel x center of a lane from the supplied layout, clamped into the
@@ -635,9 +698,9 @@ fn build_geometry(frame: &RenderFrame, scale: f32) -> Vec<f32> {
         let middle = row.middle_y();
         let node_lane = row.lane;
         let node_x = lane_center(graph, node_lane);
-        let node_color = lane_color(node_lane);
+        let node_color = graph_color(node_lane, row.chain_state.is_muted());
         let background = graph.background_color.map(Rgba::linear);
-        let bundle = row.is_bundle.then(|| BundleAnchors {
+        let bundle = (row.is_bundle && !row.is_subop && !row.expanded).then(|| BundleAnchors {
             entry_y: middle - graph.bundle_half_height,
             exit_y: middle + graph.bundle_half_height,
             term_radius: bundle_terminal_radius(graph.dot_radius),
@@ -665,7 +728,11 @@ fn build_geometry(frame: &RenderFrame, scale: f32) -> Vec<f32> {
                 Some(anchors) if *lane == node_lane => anchors.entry_y,
                 _ => middle,
             };
-            builder.line([x, top], [x, end_y], lane_color(*lane));
+            builder.line(
+                [x, top],
+                [x, end_y],
+                graph_color(*lane, row.muted_above.contains(lane)),
+            );
         }
         for lane in &row.below {
             if owns_bottom.contains(lane) {
@@ -676,7 +743,11 @@ fn build_geometry(frame: &RenderFrame, scale: f32) -> Vec<f32> {
                 Some(anchors) if *lane == node_lane => anchors.exit_y,
                 _ => middle,
             };
-            builder.line([x, start_y], [x, bottom], lane_color(*lane));
+            builder.line(
+                [x, start_y],
+                [x, bottom],
+                graph_color(*lane, row.muted_below.contains(lane)),
+            );
         }
 
         for transition in &rendered {
@@ -695,37 +766,48 @@ fn build_geometry(frame: &RenderFrame, scale: f32) -> Vec<f32> {
             let start = [x1, start_y];
             let end = [x2, end_y];
             let (src_control, dst_control, seam) = transition_controls(start, end, *transition);
-            builder.quadratic(start, src_control, seam, lane_color(transition.from_lane));
-            builder.quadratic(seam, dst_control, end, lane_color(transition.to_lane));
+            let muted = row
+                .muted_transitions
+                .contains(&[transition.from_lane, transition.to_lane]);
+            builder.quadratic(
+                start,
+                src_control,
+                seam,
+                graph_color(transition.from_lane, muted),
+            );
+            builder.quadratic(
+                seam,
+                dst_control,
+                end,
+                graph_color(transition.to_lane, muted),
+            );
         }
 
-        if !row.is_subop {
-            if let Some(anchors) = bundle {
-                let shape = CapsuleShape {
-                    x: node_x,
-                    entry_y: anchors.entry_y,
-                    exit_y: anchors.exit_y,
-                    margin: anchors.margin,
-                };
-                let radius = anchors.term_radius + anchors.margin;
-                match background {
-                    Some(bg) => {
-                        builder.capsule(shape, radius + RING_HALF_WIDTH, bg);
-                        builder.capsule(shape, (radius - RING_HALF_WIDTH).max(0.0), node_color);
-                    }
-                    None => builder.capsule(shape, radius, node_color),
+        if let Some(anchors) = bundle {
+            let shape = CapsuleShape {
+                x: node_x,
+                entry_y: anchors.entry_y,
+                exit_y: anchors.exit_y,
+                margin: anchors.margin,
+            };
+            let radius = anchors.term_radius + anchors.margin;
+            match background {
+                Some(bg) => {
+                    builder.capsule(shape, radius + RING_HALF_WIDTH, bg);
+                    builder.capsule(shape, (radius - RING_HALF_WIDTH).max(0.0), node_color);
                 }
-                for terminal_y in [anchors.entry_y, anchors.exit_y] {
-                    builder.dot(
-                        [node_x, terminal_y],
-                        anchors.term_radius,
-                        node_color,
-                        background,
-                    );
-                }
-            } else {
-                builder.dot([node_x, middle], graph.dot_radius, node_color, background);
+                None => builder.capsule(shape, radius, node_color),
             }
+            for terminal_y in [anchors.entry_y, anchors.exit_y] {
+                builder.dot(
+                    [node_x, terminal_y],
+                    anchors.term_radius,
+                    node_color,
+                    background,
+                );
+            }
+        } else {
+            builder.dot([node_x, middle], graph.dot_radius, node_color, background);
         }
     }
 
@@ -818,10 +900,10 @@ pub use browser::GpuRenderer;
 #[cfg(test)]
 mod tests {
     use super::{
-        build_geometry, build_vertices, curve_segments, lane_center, lane_color, midpoint,
-        resolved_transitions, scissor_rect, transition_controls, FrameGraph, RenderFrame,
-        RenderRow, RenderedTransition, Rgba, FLOATS_PER_VERTEX, MAX_CURVE_SEGMENTS, PALETTE_HEX,
-        PALETTE_LEN,
+        build_geometry, build_vertices, curve_segments, graph_color, lane_center, lane_color,
+        midpoint, resolved_transitions, scissor_rect, transition_controls, ChainState, FrameGraph,
+        RenderFrame, RenderRow, RenderedTransition, Rgba, FLOATS_PER_VERTEX, MAX_CURVE_SEGMENTS,
+        PALETTE_HEX, PALETTE_LEN,
     };
 
     fn graph(lane_x: Vec<f32>) -> FrameGraph {
@@ -846,8 +928,13 @@ mod tests {
             above,
             below,
             transitions,
+            muted_above: Vec::new(),
+            muted_below: Vec::new(),
+            muted_transitions: Vec::new(),
+            chain_state: ChainState::Active,
             is_subop: false,
             is_bundle: false,
+            expanded: false,
         }
     }
 
@@ -1001,6 +1088,8 @@ mod tests {
                 "rows": [{
                     "index": 3, "top": 0, "bottom": 34, "middle": 17, "lane": 1,
                     "above": [0], "below": [1], "transitions": [[0, 2]],
+                    "muted_above": [0], "muted_below": [1],
+                    "muted_transitions": [[0, 2]], "chain_state": "muted",
                     "is_subop": false, "is_bundle": true
                 }]
             }"#,
@@ -1022,6 +1111,10 @@ mod tests {
             Some(&[0, 2]),
             "directed transition passes through"
         );
+        assert_eq!(row.muted_above, vec![0]);
+        assert_eq!(row.muted_below, vec![1]);
+        assert_eq!(row.muted_transitions, vec![[0, 2]]);
+        assert_eq!(row.chain_state, ChainState::Muted);
         assert!(row.is_bundle, "bundle flag passes through");
         let [r, g, b, a] = frame
             .graph
@@ -1062,6 +1155,15 @@ mod tests {
         assert!(!parsed_row.is_subop, "not a sub-op by default");
         assert!(!parsed_row.is_bundle, "not a bundle by default");
         assert!(parsed_row.above.is_empty(), "no above lanes by default");
+        assert!(
+            parsed_row.muted_above.is_empty(),
+            "no muted lanes by default"
+        );
+        assert_eq!(
+            parsed_row.chain_state,
+            ChainState::Active,
+            "rows are active by default"
+        );
         assert!(
             parsed_row.transitions.is_empty(),
             "no transitions by default"
@@ -1183,7 +1285,34 @@ mod tests {
     }
 
     #[test]
-    fn dot_is_circular_and_subop_draws_no_node() {
+    fn muted_geometry_uses_neutral_gray_without_recoloring_active_lanes() {
+        let mut muted = row(1, vec![0], vec![0, 1], Vec::new());
+        muted.muted_below = vec![1];
+        muted.chain_state = ChainState::Muted;
+        let vertices = build_geometry(&frame(vec![muted]), 1.0);
+        let gray = graph_color(1, true);
+
+        assert!(
+            colors(&vertices)
+                .iter()
+                .any(|color| color_close(*color, gray)),
+            "the muted node and owned edge emit gray vertices"
+        );
+        assert!(
+            colors(&vertices)
+                .iter()
+                .any(|color| color_close(*color, lane_color(0))),
+            "the pass-through active lane keeps its palette color"
+        );
+        let [red, green, blue, alpha] = gray;
+        assert!((linear_to_srgb_bytes(red) - 133.0).abs() <= 1.0);
+        assert!((linear_to_srgb_bytes(green) - 133.0).abs() <= 1.0);
+        assert!((linear_to_srgb_bytes(blue) - 133.0).abs() <= 1.0);
+        assert!((alpha - 1.0).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn dots_are_circular_and_opened_rows_draw_nodes() {
         let plain = frame(vec![row(0, Vec::new(), Vec::new(), Vec::new())]);
         let vertices = build_geometry(&plain, 1.0);
         assert!(!vertices.is_empty(), "an ordinary row emits a node dot");
@@ -1211,22 +1340,40 @@ mod tests {
                 above: vec![0],
                 below: Vec::new(),
                 transitions: Vec::new(),
+                muted_above: Vec::new(),
+                muted_below: Vec::new(),
+                muted_transitions: Vec::new(),
+                chain_state: ChainState::Active,
                 is_subop: true,
                 is_bundle: false,
+                expanded: false,
             }],
         };
         let vertices = build_geometry(&subop, 1.0);
-        assert!(!vertices.is_empty(), "the sub-op lane line emits geometry");
-        for [x, y] in positions(&vertices) {
-            assert!(
-                (x - 18.0).abs() <= 1.01,
-                "sub-op rows keep only the lane line, no dot (vertex at {x},{y})"
-            );
-            assert!(
-                (-1e-3..=17.0 + 1e-3).contains(&y),
-                "sub-op above half ends at the midpoint (vertex at {x},{y})"
-            );
-        }
+        let subop_positions = positions(&vertices);
+        assert!(
+            subop_positions
+                .iter()
+                .any(|[x, y]| (x - 18.0).abs() <= 1.01 && y.abs() <= 1e-3),
+            "the opened member keeps its incoming lane"
+        );
+        assert!(
+            has_vertex(&vertices, 22.0, 17.0, 1e-3),
+            "the opened member adds a radius-four dot at the midpoint"
+        );
+
+        let mut unfolded_group = row(0, Vec::new(), Vec::new(), Vec::new());
+        unfolded_group.is_bundle = true;
+        unfolded_group.expanded = true;
+        let vertices = build_geometry(&frame(vec![unfolded_group]), 1.0);
+        assert!(
+            has_vertex(&vertices, 22.0, 17.0, 1e-3),
+            "the unfolded group summary adds one radius-four midpoint dot"
+        );
+        assert!(
+            !has_vertex(&vertices, 18.0, 7.0, 1e-3),
+            "the unfolded group summary no longer draws the capsule top"
+        );
     }
 
     #[test]
@@ -1627,8 +1774,8 @@ mod shell {
     //! Owns startup sequencing (VS Code API acquisition through the narrow
     //! wasm-bindgen binding, message-listener installation before
     //! `webviewReady`, state restore/save), the `HistoryAppState` machine, the
-    //! reducer `Step` sends and DOM ops, scroll/profile controls and
-    //! persistence, the debug hooks, and the per-row SVG graph render pass.
+    //! reducer `Step` sends and DOM ops, scroll/search controls and persistence,
+    //! the debug hooks, and the per-row SVG graph render pass.
     //!
     //! Reentrancy contract: the fixture bridge dispatches correlated
     //! responses synchronously inside `postMessage`, so host messages are
@@ -1646,9 +1793,7 @@ mod shell {
     use crate::app::dom::{self, ColKey, HistoryDom};
     use crate::app::host::{self, Send};
     use crate::app::rows::{self, RowContext, RowSpec, ViewMode};
-    use crate::app::state::{
-        DomOp, HistoryAppState, Profile, ProfileAction, RetryAction, Step, Viewport, ROW_H,
-    };
+    use crate::app::state::{DomOp, HistoryAppState, RetryAction, Step, Viewport, ROW_H};
 
     /// Narrow wasm-bindgen binding for VS Code API acquisition: the webview
     /// host (and the harness fixture bridge) provide `acquireVsCodeApi` as a
@@ -1788,18 +1933,11 @@ mod shell {
         /// The state-aware per-row context (selection/find/expansion/roving).
         fn row_context(&self, abs_index: i64, is_group_start: bool) -> RowContext {
             self.state
-                .row_context(self.profile_view(), abs_index, is_group_start)
+                .row_context(ViewMode::Activity, abs_index, is_group_start)
         }
 
         fn spacer_height_px(&self) -> i64 {
             self.state.visible_total().saturating_mul(ROW_H).max(1)
-        }
-
-        fn profile_view(&self) -> ViewMode {
-            match self.state.profile {
-                Profile::Activity => ViewMode::Activity,
-                Profile::Raw => ViewMode::Raw,
-            }
         }
 
         fn reanchor_window(&mut self, top: i64, bottom: i64) -> Result<(), JsValue> {
@@ -1904,7 +2042,8 @@ mod shell {
         }
 
         /// Production click/chevron semantics: select the row, then toggle
-        /// disclosure for any expandable (non-sub-op, has-children) row.
+        /// disclosure for any row with children, including an existing bundle
+        /// nested one level inside a work group.
         fn row_select_and_toggle(&mut self, abs: i64, viewport: &Viewport, step: &mut Step) {
             self.state.select_row(abs);
             if let Err(error) = self.dom.apply_selection(abs) {
@@ -1913,11 +2052,7 @@ mod shell {
                     js_value_text(&error)
                 ));
             }
-            let expandable = self
-                .state
-                .cache
-                .get(&abs)
-                .is_some_and(|row| !host::row::bool(row, "is_subop") && rows::has_sub_ops(row));
+            let expandable = self.state.cache.get(&abs).is_some_and(rows::has_sub_ops);
             if expandable {
                 self.state.toggle_expanded_ui(abs, viewport, step);
             }
@@ -2452,23 +2587,6 @@ mod shell {
         });
     }
 
-    /// Activity/Raw profile control click.
-    fn on_profile(next: Profile) {
-        run_transition(|shell| {
-            let viewport = shell.dom.viewport();
-            let mut step = Step::new();
-            shell
-                .state
-                .set_profile(next, ProfileAction::Reset, &viewport, &mut step);
-            shell.apply_step_ops(&step);
-            shell.dom.set_profile_ui(next);
-            TransitionOutput {
-                sends: std::mem::take(&mut step.sends),
-                save_state: step.save_state.take(),
-            }
-        });
-    }
-
     /// Terminal request-error Retry button (named recovery per the error's
     /// `RetryAction`: reset the history, or re-issue the legacy Search query).
     fn on_retry(action: RetryAction) {
@@ -2873,12 +2991,9 @@ mod shell {
             }
             "ArrowRight" | "ArrowLeft" => {
                 let expanded = SHELL_DATA.with(|cell| {
-                    cell.borrow().as_ref().is_some_and(|shell| {
-                        shell
-                            .state
-                            .block_index_of_abs(abs)
-                            .is_some_and(|block| shell.state.is_block_expanded(block))
-                    })
+                    cell.borrow()
+                        .as_ref()
+                        .is_some_and(|shell| shell.state.is_row_expanded(abs))
                 });
                 let wants_toggle = SHELL_DATA.with(|cell| {
                     cell.borrow().as_ref().is_some_and(|shell| {
@@ -2886,7 +3001,7 @@ mod shell {
                         let Some(row) = row else {
                             return false;
                         };
-                        if host::row::bool(row, "is_subop") || !rows::has_sub_ops(row) {
+                        if !rows::has_sub_ops(row) {
                             return false;
                         }
                         (key == "ArrowRight" && !expanded) || (key == "ArrowLeft" && expanded)
@@ -2903,9 +3018,11 @@ mod shell {
                 }
                 let expandable = SHELL_DATA.with(|cell| {
                     cell.borrow().as_ref().is_some_and(|shell| {
-                        shell.state.cache.get(&abs).is_some_and(|row| {
-                            !host::row::bool(row, "is_subop") && rows::has_sub_ops(row)
-                        })
+                        shell
+                            .state
+                            .cache
+                            .get(&abs)
+                            .is_some_and(|row| rows::has_sub_ops(row))
                     })
                 });
                 if expandable {
@@ -2985,9 +3102,12 @@ mod shell {
     fn column_start_width(shell: &ShellData, col: ColKey) -> f64 {
         match col {
             ColKey::Graph => shell.current_graph_width(),
-            ColKey::Content | ColKey::Date | ColKey::Author | ColKey::Commit => {
-                shell.dom.header_cell_width(col).max(col.min_width())
-            }
+            ColKey::Activity
+            | ColKey::Tags
+            | ColKey::Content
+            | ColKey::Date
+            | ColKey::Author
+            | ColKey::Commit => shell.dom.header_cell_width(col).max(col.min_width()),
         }
     }
 
@@ -3180,21 +3300,11 @@ mod shell {
     }
 
     /// Install the read-only harness parity hooks (`__editchainGetProfile`,
-    /// `__editchainGetTotal`, `__editchainRowAt`, `__editchainSetProfile`).
-    /// These are pure facades over the live shell — no JS app state or
-    /// business logic lives here.
+    /// `__editchainGetTotal`, `__editchainRowAt`). These are pure facades over
+    /// the live shell — no JS app state or business logic lives here.
     fn install_parity_hooks() {
-        let get_profile = Closure::<dyn FnMut() -> String>::wrap(Box::new(|| {
-            SHELL_DATA.with(|cell| {
-                cell.borrow().as_ref().map_or_else(
-                    || "activity".to_owned(),
-                    |shell| match shell.state.profile {
-                        Profile::Activity => "activity".to_owned(),
-                        Profile::Raw => "raw".to_owned(),
-                    },
-                )
-            })
-        }));
+        let get_profile =
+            Closure::<dyn FnMut() -> String>::wrap(Box::new(|| "activity".to_owned()));
         let get_total = Closure::<dyn FnMut() -> f64>::wrap(Box::new(|| {
             SHELL_DATA.with(|cell| {
                 cell.borrow().as_ref().map_or(-1.0, |shell| {
@@ -3215,30 +3325,17 @@ mod shell {
                 js_sys::JSON::parse(&row.to_string()).unwrap_or(JsValue::NULL)
             })
         }));
-        let set_profile = Closure::<dyn FnMut(String)>::wrap(Box::new(|name: String| {
-            let next = if name == "raw" {
-                Profile::Raw
-            } else {
-                Profile::Activity
-            };
-            on_profile(next);
-        }));
         set_window_prop(
             "__editchainGetProfile",
             get_profile.as_ref().unchecked_ref(),
         );
         set_window_prop("__editchainGetTotal", get_total.as_ref().unchecked_ref());
         set_window_prop("__editchainRowAt", row_at.as_ref().unchecked_ref());
-        set_window_prop(
-            "__editchainSetProfile",
-            set_profile.as_ref().unchecked_ref(),
-        );
         // The window props hold the JS functions; the wasm closures leak
         // deliberately for the shell's lifetime.
         get_profile.forget();
         get_total.forget();
         row_at.forget();
-        set_profile.forget();
     }
 
     /// Drain queued host messages and any synchronous responses they trigger.
@@ -3341,11 +3438,7 @@ mod shell {
             "__editchainRendererInstanceId",
             &JsValue::from_str(&shell.instance_id),
         );
-        let profile = match shell.state.profile {
-            Profile::Activity => "activity",
-            Profile::Raw => "raw",
-        };
-        set_window_prop("__editchainProfile", &JsValue::from_str(profile));
+        set_window_prop("__editchainProfile", &JsValue::from_str("activity"));
     }
 
     /// Install the shell, listeners, and webviewReady handshake.
@@ -3387,15 +3480,12 @@ mod shell {
             resize_observer: None,
             col_widths: dom::ColWidths::default(),
         };
-        shell.dom.set_profile_ui(shell.state.profile);
         shell.dom.set_status("idle");
         shell.dom.set_find_nav(false);
         let rows_el = shell.dom.rows();
         let search_input = shell.dom.search_input();
         let search_prev = shell.dom.search_prev_button();
         let search_next = shell.dom.search_next_button();
-        let profile_activity = shell.dom.profile_activity_button();
-        let profile_raw = shell.dom.profile_raw_button();
         SHELL_DATA.with(|cell| drop(cell.borrow_mut().replace(shell)));
 
         let window =
@@ -3411,16 +3501,6 @@ mod shell {
         rows_el
             .add_event_listener_with_callback("scroll", scroll_closure.as_ref().unchecked_ref())?;
         scroll_closure.forget();
-        let activity_closure =
-            Closure::<dyn FnMut()>::wrap(Box::new(|| on_profile(Profile::Activity)));
-        profile_activity
-            .add_event_listener_with_callback("click", activity_closure.as_ref().unchecked_ref())?;
-        activity_closure.forget();
-        let raw_closure = Closure::<dyn FnMut()>::wrap(Box::new(|| on_profile(Profile::Raw)));
-        profile_raw
-            .add_event_listener_with_callback("click", raw_closure.as_ref().unchecked_ref())?;
-        raw_closure.forget();
-
         // Search controls: keyboard (Enter/Escape/Arrow), input-clearing, and
         // the Previous/Next buttons (mousedown keeps focus in the input).
         let search_keydown_closure = Closure::<dyn FnMut(web_sys::KeyboardEvent)>::wrap(Box::new(
@@ -3589,7 +3669,6 @@ mod shell {
             };
             shell.flags.renderer_ready = true;
             shell.last_error = None;
-            shell.dom.set_backend("svg", "svg");
             shell.publish_render_state();
         });
         set_window_prop("__editchainLastError", &JsValue::NULL);
@@ -3621,20 +3700,12 @@ mod shell {
         })
     }
 
-    /// `__editchainGetProfile` data source: `activity` or `raw`.
+    /// `__editchainGetProfile` compatibility data source. The shipped view is
+    /// permanently Activity.
     #[wasm_bindgen(js_name = "debugProfile")]
     #[must_use]
     pub fn debug_profile() -> String {
-        SHELL_DATA.with(|cell| {
-            let profile = cell
-                .borrow()
-                .as_ref()
-                .map_or(Profile::Activity, |shell| shell.state.profile);
-            match profile {
-                Profile::Activity => "activity".to_owned(),
-                Profile::Raw => "raw".to_owned(),
-            }
-        })
+        "activity".to_owned()
     }
 
     /// `__editchainGpuDebug.findState()` data source: the settled find session
@@ -3730,6 +3801,7 @@ mod shell {
                         "middle": row.middle,
                         "is_subop": row.is_subop,
                         "is_bundle": row.is_bundle,
+                        "expanded": row.expanded,
                     })
                 })
                 .collect();

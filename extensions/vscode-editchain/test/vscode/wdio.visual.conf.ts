@@ -7,7 +7,7 @@ import type { Options } from '@wdio/types';
 // the same DEFAULT `editchain-history.open` command with exactly ONE
 // "EditChain History" panel) but runs ONLY visual-matrix.e2e.ts. The suite
 // drives the default production panel through a deterministic state matrix —
-// initial Activity, Raw profile, find-in-chain current/next, inline selection
+// fixed Activity view, find-in-chain current/next, inline selection
 // + keyboard roving, expandable-bundle disclosure (when available),
 // deep virtualized scroll (animated down and back up), and graph-column
 // narrow/wide with the lane-geometry invariant — capturing clearly named

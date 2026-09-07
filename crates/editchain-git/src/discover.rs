@@ -28,6 +28,29 @@ pub struct RepositoryHandle {
     pub discovery: RepositoryDiscovery,
 }
 
+/// Open a discovered repository for object resolution.
+///
+/// Linked-worktree discoveries point at a `.git` indirection file, so their
+/// worktree root is opened; ordinary discoveries point directly at the Git
+/// directory.
+///
+/// # Errors
+///
+/// Returns an error when `gix` cannot open the discovered repository.
+pub fn open_repository(
+    discovery: &RepositoryDiscovery,
+) -> Result<RepositoryHandle, Box<dyn std::error::Error>> {
+    let open_path = if discovery.is_worktree {
+        discovery.path.parent().unwrap_or(&discovery.path)
+    } else {
+        &discovery.path
+    };
+    Ok(RepositoryHandle {
+        repo: gix::open(open_path)?,
+        discovery: discovery.clone(),
+    })
+}
+
 #[expect(
     clippy::missing_fields_in_debug,
     reason = "gix::Repository does not implement Debug; discovery metadata is the meaningful state"
