@@ -10,8 +10,9 @@ use serde as _;
 use serde_json as _;
 
 use editchain_core::{
-    ActorId, Clock, MessageOp, NodeId, NoteOp, NoteRelationship, Op, OpId, OpKind, ParentSet,
-    Payload, ScopeRef, Tags,
+    ActorId, Clock, GitAvailability, GitCommitEntity, GitLink, GitLinkKind, GitObjectFormat,
+    GitOid, GitSignature, MessageOp, NodeId, NoteOp, NoteRelationship, Op, OpId, OpKind, ParentSet,
+    Payload, RepositoryId, ScopeRef, Tags,
 };
 use editchain_project::filter::ChainFilter;
 use editchain_project::HistoryProjection;
@@ -38,6 +39,38 @@ fn linear_chain() -> Vec<Op> {
     let b = msg_op(1, 2, 2_000, Some(a.id), "beta");
     let c = msg_op(1, 3, 3_000, Some(b.id), "gamma");
     vec![a, b, c]
+}
+
+/// Build a minimal live Git commit for cross-domain filter tests.
+fn git_commit(byte: u8, timestamp: i64) -> GitCommitEntity {
+    let mut bytes = [0u8; 32];
+    bytes[0] = byte;
+    let oid = GitOid::new(GitObjectFormat::Sha1, bytes);
+    GitCommitEntity {
+        repository: RepositoryId(7),
+        object_format: GitObjectFormat::Sha1,
+        oid,
+        imported_record: None,
+        availability: GitAvailability::Resolved,
+        tree: GitOid::new(GitObjectFormat::Sha1, [0u8; 32]),
+        parents: Vec::new(),
+        author: GitSignature {
+            name: Payload::Empty,
+            email: Payload::Empty,
+            when: timestamp,
+        },
+        committer: GitSignature {
+            name: Payload::Empty,
+            email: Payload::Empty,
+            when: timestamp,
+        },
+        authored_at: timestamp,
+        committed_at: timestamp,
+        message: Payload::Inline(b"produced commit".to_vec()),
+        imported_refs: Vec::new(),
+        live_refs: Vec::new(),
+        changed_paths: Vec::new(),
+    }
 }
 
 /// A `SubagentOf` relationship note: the subagent's first op (`parent_id`) is
@@ -313,6 +346,67 @@ fn include_kind_pattern_keeps_only_matching_kinds() {
     assert_eq!(
         gamma.parent_keys(&projection.git.links, projection.relationship_notes()),
         vec![a_id.to_string()]
+    );
+}
+
+#[test]
+fn produced_commit_endpoints_survive_inclusive_kind_filtering() {
+    let before = msg_op(1, 1, 1_000, None, "before");
+    let producer = Op {
+        id: OpId::new(NodeId(1), 0, 2),
+        parents: ParentSet::One(before.id),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(2_000),
+        scope: ScopeRef::None,
+        tags: Tags::AGENT | Tags::TOOL,
+        kind: OpKind::Tool(editchain_core::ToolOp {
+            tool_call_id: Payload::Inline(b"commit-call".to_vec()),
+            tool_name: Payload::Inline(b"Bash".to_vec()),
+            stage: editchain_core::ToolStage::Finish,
+            content: Payload::Empty,
+        }),
+    };
+    let after = msg_op(1, 3, 3_000, Some(producer.id), "after");
+    let commit = git_commit(9, 2);
+    let link = Op {
+        id: OpId::new(NodeId(9), 0, 1),
+        parents: ParentSet::One(producer.id),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(2_000),
+        scope: ScopeRef::None,
+        tags: Tags::IMPORT | Tags::META,
+        kind: OpKind::GitLink(GitLink {
+            source: producer.id,
+            target_repo: commit.repository,
+            target_oid: commit.oid,
+            kind: GitLinkKind::ProducedBy,
+        }),
+    };
+    let mut projection = HistoryProjection::from_ops(vec![before, producer.clone(), after, link]);
+    projection.merge_git_commits(vec![commit.clone()]);
+
+    let filter = ChainFilter::new(
+        String::new(),
+        String::new(),
+        "^message$".to_string(),
+        false,
+        true,
+        false,
+    );
+    let nodes = projection.filtered_nodes(&filter);
+    assert!(
+        nodes
+            .iter()
+            .any(|node| node.node_key() == producer.id.to_string()),
+        "the branch point must survive even though it is not a message"
+    );
+    let commit_node = nodes
+        .iter()
+        .find(|node| node.node_key() == commit.oid.to_hex())
+        .expect("produced commit survives as a structural endpoint");
+    assert_eq!(
+        commit_node.parent_keys(&projection.git.links, projection.relationship_notes()),
+        vec![producer.id.to_string()]
     );
 }
 

@@ -20,6 +20,7 @@ dirs = "6"
 editchain-core = { path = "../editchain-core" }
 editchain-codec = { path = "../editchain-codec" }
 editchain-import = { path = "../editchain-import" }
+editchain-git = { path = "../editchain-git" }
 editchain-query = { path = "../editchain-query" }
 editchain-index = { path = "../editchain-index" }
 editchain-embed = { path = "../editchain-embed" }

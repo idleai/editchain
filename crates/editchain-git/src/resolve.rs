@@ -119,6 +119,29 @@ pub fn resolve_commit(
     })
 }
 
+/// Resolve an unambiguous hexadecimal object prefix to a commit.
+///
+/// Git's normal commit output uses an abbreviated object ID. This helper asks
+/// the repository object database to disambiguate that prefix, rejects matches
+/// to non-commit objects, and then returns the same fully populated resolution
+/// as [`resolve_commit`]. Invalid, missing, ambiguous, and non-commit prefixes
+/// all return `None` rather than inventing an association.
+#[must_use]
+pub fn resolve_commit_prefix(handle: &RepositoryHandle, prefix: &str) -> Option<CommitResolution> {
+    if prefix.len() < 7 || prefix.len() > 64 || !prefix.as_bytes().iter().all(u8::is_ascii_hexdigit)
+    {
+        return None;
+    }
+    let id = handle.repo.rev_parse_single(prefix).ok()?;
+    let object = id.object().ok()?;
+    if object.kind != gix_object::Kind::Commit {
+        return None;
+    }
+    let oid = git_oid_from_gix(&object.id);
+    drop(object);
+    resolve_commit(handle, &oid).ok()
+}
+
 /// Walk the commit history of a repository from HEAD, resolving each commit.
 ///
 /// Returns commits newest-first. `limit` bounds the number of commits walked

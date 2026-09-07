@@ -2045,7 +2045,7 @@ fn service_path_truncated_echo_texts_never_pair_but_untruncated_exact_pairs_do()
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_twenty_two() {
+fn prepared_snapshot_manifest_records_projection_revision_twenty_three() {
     // Stale snapshots from earlier projection revisions (pre-hide_trace,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
@@ -2053,9 +2053,9 @@ fn prepared_snapshot_manifest_records_projection_revision_twenty_two() {
     // Activity work-unit/promotion/execute-run/Plan-repeat bundling and
     // inline-compaction semantics, exact provider relations, legacy Codex
     // token-usage contraction, correlation-only tool results, exact Claude
-    // response contraction, and authoritative view-parent rewrites) must not
-    // be served silently: the revision participates in the snapshot identity
-    // hash.
+    // response contraction, authoritative view-parent rewrites, and causal
+    // produced-commit branch edges) must not be served silently: the revision
+    // participates in the snapshot identity hash.
     let tmp = tempfile::tempdir().expect("tempdir");
     let chain_dir = tmp.path().join(".editchain");
     let first = msg_op(41, 1, b"snapshot first");
@@ -2070,7 +2070,7 @@ fn prepared_snapshot_manifest_records_projection_revision_twenty_two() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 22u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 23u64);
 }
 
 #[test]
@@ -2433,7 +2433,7 @@ fn activity_view_groups_repeated_plans_as_expandable_linear_updates() {
 }
 
 #[test]
-fn prepared_snapshot_serves_bundled_activity_view_and_records_revision_twenty_two() {
+fn prepared_snapshot_serves_bundled_activity_view_and_records_revision_twenty_three() {
     // The pregenerated render snapshot must serve the SAME bundled Activity
     // rows as the live projection (work-unit/promotion/bundling parity) and
     // record the bumped projection revision in its identity.
@@ -2489,7 +2489,7 @@ fn prepared_snapshot_serves_bundled_activity_view_and_records_revision_twenty_tw
         &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["identity"]["projection_revision"], 22u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 23u64);
 
     let mut cached =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");

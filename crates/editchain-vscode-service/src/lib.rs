@@ -2926,15 +2926,15 @@ fn node_sub_op_meta(
 
 /// Map the projection's provider-neutral relation kind to the protocol enum.
 ///
-/// The projection derives kinds from exact spawn, reconnect, and fork facts;
-/// the protocol enum has exactly those three variants plus a forward-compatible
-/// `Unknown` (never produced by this service today).
+/// The projection derives kinds from exact spawn, reconnect, fork, and
+/// produced-commit facts; `Unknown` remains the forward-compatible fallback.
 #[must_use]
 fn protocol_relation_kind(kind: editchain_project::RelationKind) -> ParentRelationKind {
     match kind {
         editchain_project::RelationKind::Subagent => ParentRelationKind::Subagent,
         editchain_project::RelationKind::Reconnect => ParentRelationKind::Reconnect,
         editchain_project::RelationKind::Fork => ParentRelationKind::Fork,
+        editchain_project::RelationKind::ProducedCommit => ParentRelationKind::ProducedCommit,
     }
 }
 

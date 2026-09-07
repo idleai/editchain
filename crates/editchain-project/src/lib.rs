@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use editchain_core::op::NoteRelationship;
 use editchain_core::{
-    Clock, GitCommitEntity, GitOid, GitProjection, Op, OpId, Payload, RepositoryId,
+    Clock, GitCommitEntity, GitLinkKind, GitOid, GitProjection, Op, OpId, Payload, RepositoryId,
 };
 
 use crate::layout::{compute_graph_layout, compute_lane_assignment, GraphLayout, GraphRow};
@@ -294,11 +294,13 @@ impl HistoryNode {
     /// filtering and Activity contraction splice visible topology while the
     /// canonical operation envelope and relationship evidence remain intact.
     ///
-    /// For `EditChain` ops, this includes the causal `Op.parents`, graph-bearing
-    /// explicit git links (whose target OID hex becomes a parent key), and — when `notes`
-    /// annotates this op with a graph-bearing relationship — the note's target
-    /// as a *virtual* parent. Git links are explicit stored
-    /// relations; no timestamp/text inference is performed by this projection.
+    /// For `EditChain` ops, this includes the causal `Op.parents`, inbound
+    /// graph-bearing Git links (whose target OID hex becomes a parent key), and
+    /// — when `notes` annotates this op with a graph-bearing relationship — the
+    /// note's target as a *virtual* parent. A `ProducedBy` link has the opposite
+    /// direction: its Git commit gains the source operation as a parent. Git
+    /// links are explicit stored relations; no timestamp/text inference is
+    /// performed by this projection.
     /// Virtual parents let provider-event, fork, and subagent branches render
     /// without mutating stored source-order causality (SPEC §1.1, §5).
     /// `notes` maps a causal parent op id to the structural notes that annotate
@@ -378,7 +380,10 @@ impl HistoryNode {
                 }
                 for source in std::iter::once(op).chain(self.sub_ops()) {
                     if let Some(links) = git_links.get(&source.id) {
-                        for link in links {
+                        for link in links
+                            .iter()
+                            .filter(|link| link.kind != GitLinkKind::ProducedBy)
+                        {
                             let key = link.target_oid.to_hex();
                             if seen.insert(key.clone()) {
                                 keys.push(key);
@@ -443,7 +448,23 @@ impl HistoryNode {
                 }
                 keys
             }
-            Self::GitCommit(commit) => commit.parents.iter().map(GitOid::to_hex).collect(),
+            Self::GitCommit(commit) => {
+                let mut keys: Vec<String> = commit.parents.iter().map(GitOid::to_hex).collect();
+                let mut seen: std::collections::HashSet<String> = keys.iter().cloned().collect();
+                for links in git_links.values() {
+                    for link in links.iter().filter(|link| {
+                        link.kind == GitLinkKind::ProducedBy
+                            && link.target_repo == commit.repository
+                            && link.target_oid == commit.oid
+                    }) {
+                        let key = link.source.to_string();
+                        if seen.insert(key.clone()) {
+                            keys.push(key);
+                        }
+                    }
+                }
+                keys
+            }
         }
     }
 
@@ -1969,15 +1990,33 @@ impl HistoryProjection {
         node: &HistoryNode,
         parents: &[String],
     ) -> Vec<ParentRelation> {
-        let Some(anchor_id) = node.op_id() else {
-            return Vec::new();
-        };
-        let Some(notes) = self.relationship_notes().get(&anchor_id) else {
-            return Vec::new();
-        };
         let representative = &self.collapsed_projection.representative;
         let present = &self.collapsed_projection.present;
         let mut out: Vec<ParentRelation> = Vec::new();
+        if let HistoryNode::GitCommit(commit) = node {
+            for parent in parents {
+                let matches = self.git.links.values().flatten().any(|link| {
+                    link.kind == GitLinkKind::ProducedBy
+                        && link.target_repo == commit.repository
+                        && link.target_oid == commit.oid
+                        && canonical_op_id(link.source, representative, present)
+                            .is_some_and(|source| source.to_string() == *parent)
+                });
+                if matches {
+                    out.push(ParentRelation {
+                        parent: parent.clone(),
+                        kind: RelationKind::ProducedCommit,
+                    });
+                }
+            }
+            return out;
+        }
+        let Some(anchor_id) = node.op_id() else {
+            return out;
+        };
+        let Some(notes) = self.relationship_notes().get(&anchor_id) else {
+            return out;
+        };
         for parent in parents {
             for note in notes {
                 let editchain_core::OpKind::Note(n) = &note.kind else {
@@ -2009,7 +2048,8 @@ impl HistoryProjection {
     }
 
     /// Returns the node keys of rows that participate in structural topology
-    /// (`ForkOf` / `SubagentOf` / `ReconnectsTo` anchors or targets).
+    /// (`ForkOf` / `SubagentOf` / `ReconnectsTo` anchors or targets, or either
+    /// endpoint of a produced-commit edge).
     ///
     /// Structural rows carry virtual edges, so a view must never fold them away:
     /// the Activity execute-run bundling excludes them exactly like the chain
@@ -2021,6 +2061,18 @@ impl HistoryProjection {
         let note_map = self.relationship_notes();
         let representative = &self.collapsed_projection.representative;
         let present = row_node_keys(nodes);
+        for link in self.git.links.values().flatten().filter(|link| {
+            link.kind == GitLinkKind::ProducedBy && present.contains(&link.target_oid.to_hex())
+        }) {
+            if let Some(source) = canonical_op_id(
+                link.source,
+                representative,
+                &self.collapsed_projection.present,
+            ) {
+                let _: bool = keys.insert(source.to_string());
+            }
+            let _: bool = keys.insert(link.target_oid.to_hex());
+        }
         for node in nodes {
             let Some(anchor_id) = node.op_id() else {
                 continue;
@@ -2084,8 +2136,8 @@ pub struct ParentRelation {
     pub kind: RelationKind,
 }
 
-/// Provider-neutral structural relationship kinds, derived from the
-/// `SubagentOf` / `ReconnectsTo` / `ForkOf` structural notes.
+/// Provider-neutral structural relationship kinds, derived from exact stored
+/// relationship facts and Git links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelationKind {
     /// The row starts a subagent branch spawned by the target row.
@@ -2095,6 +2147,8 @@ pub enum RelationKind {
     Reconnect,
     /// The row branches off the target row at a fork divergence boundary.
     Fork,
+    /// A Git commit was produced by the parent operation.
+    ProducedCommit,
 }
 
 /// Allocation-free identity used only by the topological scheduler.
@@ -2291,7 +2345,10 @@ fn ordering_parent_keys(
             }
             for source in std::iter::once(op).chain(node.sub_ops()) {
                 if let Some(links) = git_links.get(&source.id) {
-                    for link in links {
+                    for link in links
+                        .iter()
+                        .filter(|link| link.kind != GitLinkKind::ProducedBy)
+                    {
                         let key = OrderingKey::Git(link.target_oid);
                         push(present.contains(&key).then_some(key));
                     }
@@ -2319,6 +2376,15 @@ fn ordering_parent_keys(
             for parent in &commit.parents {
                 let key = OrderingKey::Git(*parent);
                 push(present.contains(&key).then_some(key));
+            }
+            for links in git_links.values() {
+                for link in links.iter().filter(|link| {
+                    link.kind == GitLinkKind::ProducedBy
+                        && link.target_repo == commit.repository
+                        && link.target_oid == commit.oid
+                }) {
+                    push(canonical_ordering_op(link.source, representative, present));
+                }
             }
         }
     }

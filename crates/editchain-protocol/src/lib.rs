@@ -415,6 +415,8 @@ pub struct HistoryRow {
     ///   target row (the subagent's last op).
     /// - `"fork"` — the parent edge is a `ForkOf` structural note: this row
     ///   branches off the target row at a fork divergence boundary.
+    /// - `"produced_commit"` — this Git row was produced by the parent command
+    ///   operation.
     ///
     /// One entry is listed per parent key in [`Self::parents`] whose edge is
     /// structural (the row's final lifted parents after filtering/splicing),
@@ -633,7 +635,8 @@ pub struct ParentRelationDto {
 
 /// Provider-neutral relationship kinds for a structural parent edge.
 ///
-/// Serialized as lowercase strings (`"subagent"`, `"reconnect"`, `"fork"`).
+/// Serialized as lowercase strings (`"subagent"`, `"reconnect"`, `"fork"`,
+/// `"produced_commit"`).
 /// Unknown strings deserialize to [`Self::Unknown`] so clients tolerate new
 /// structural relationships from newer services; the viewer ignores unknown
 /// kinds instead of breaking.
@@ -647,6 +650,9 @@ pub enum ParentRelationKind {
     Reconnect,
     /// The row branches off the target row at a fork divergence boundary.
     Fork,
+    /// A Git commit row was produced by the parent command operation.
+    #[serde(rename = "produced_commit")]
+    ProducedCommit,
     /// A relationship kind this client does not recognize (forward
     /// compatibility).
     #[serde(other)]
@@ -1020,6 +1026,19 @@ mod tests {
         assert_eq!(unknown.kind, ParentRelationKind::Unknown);
         let reserialized = serde_json::to_string(&unknown).expect("serialize unknown kind");
         assert!(reserialized.contains("\"unknown\""), "got {reserialized}");
+    }
+
+    #[test]
+    fn produced_commit_relation_has_a_stable_protocol_name() {
+        let relation = ParentRelationDto {
+            parent: "1:0:2".to_string(),
+            kind: ParentRelationKind::ProducedCommit,
+        };
+        let json = serde_json::to_value(&relation).expect("serialize produced-commit relation");
+        assert_eq!(json["kind"], "produced_commit");
+        let round_trip: ParentRelationDto =
+            serde_json::from_value(json).expect("deserialize produced-commit relation");
+        assert_eq!(round_trip, relation);
     }
 
     #[test]

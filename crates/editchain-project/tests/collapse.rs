@@ -767,7 +767,7 @@ fn meta_bundle_keeps_parents_unchanged() {
 }
 
 #[test]
-fn bundled_meta_graph_git_link_is_inherited_by_visible_anchor() {
+fn produced_commit_link_branches_from_folded_source_without_rewriting_agent_chain() {
     let opts = editchain_project::ProjectionOptions {
         bundle_metadata: true,
     };
@@ -775,31 +775,84 @@ fn bundled_meta_graph_git_link_is_inherited_by_visible_anchor() {
     let msg = message_op(1, 2, turn.id, "hello world");
     let mut meta = meta_import_op(1, 3);
     meta.parents = ParentSet::One(turn.id);
-    let projection = HistoryProjection::from_ops_with(vec![turn.clone(), msg, meta.clone()], opts);
-    let node = projection
-        .nodes()
-        .into_iter()
+    let mut continuation = import_op(1, 4);
+    continuation.parents = ParentSet::One(meta.id);
+    let commit = git_commit(7, 5);
+    let link_record = Op {
+        id: OpId::new(NodeId(99), 0, 1),
+        parents: ParentSet::One(meta.id),
+        actor: ActorId(1),
+        clock: Clock::None,
+        scope: meta.scope,
+        tags: Tags::IMPORT | Tags::META,
+        kind: OpKind::GitLink(GitLink {
+            source: meta.id,
+            target_repo: commit.repository,
+            target_oid: commit.oid,
+            kind: GitLinkKind::ProducedBy,
+        }),
+    };
+    let mut projection = HistoryProjection::from_ops_with(
+        vec![
+            turn.clone(),
+            msg,
+            meta.clone(),
+            continuation.clone(),
+            link_record,
+        ],
+        opts,
+    );
+    projection.merge_git_commits(vec![commit.clone()]);
+
+    let nodes = projection.nodes();
+    let source = nodes
+        .iter()
         .find(|node| node.node_key() == turn.id.to_string())
         .unwrap();
+    let continued = nodes
+        .iter()
+        .find(|node| node.node_key() == continuation.id.to_string())
+        .unwrap();
+    let committed = nodes
+        .iter()
+        .find(|node| node.node_key() == commit.oid.to_hex())
+        .unwrap();
 
-    let mut bytes = [0u8; 32];
-    bytes[0] = 7;
-    let target_oid = GitOid::new(GitObjectFormat::Sha1, bytes);
-    let mut links = std::collections::BTreeMap::new();
-    drop(links.insert(
-        meta.id,
-        vec![GitLink {
-            source: meta.id,
-            target_repo: RepositoryId(1),
-            target_oid,
-            kind: GitLinkKind::ProducedBy,
-        }],
-    ));
-
+    assert!(
+        !projection
+            .lifted_parent_keys(source)
+            .contains(&commit.oid.to_hex()),
+        "ProducedBy is not a BasedOn edge from the command back to its result"
+    );
     assert_eq!(
-        node.parent_keys(&links, &std::collections::HashMap::new()),
-        vec![target_oid.to_hex()],
-        "an explicit Git edge sourced from folded metadata must remain on its visible turn"
+        projection.lifted_parent_keys(continued),
+        vec![turn.id.to_string()],
+        "the agent continuation remains attached to the producing row"
+    );
+    assert_eq!(
+        projection.lifted_parent_keys(committed),
+        vec![turn.id.to_string()],
+        "the commit becomes a second child of the producing row"
+    );
+    assert_eq!(
+        projection.parent_relations_for(committed, &[turn.id.to_string()]),
+        vec![editchain_project::ParentRelation {
+            parent: turn.id.to_string(),
+            kind: editchain_project::RelationKind::ProducedCommit,
+        }]
+    );
+    let structural = projection.structural_row_keys(&nodes);
+    assert!(structural.contains(&turn.id.to_string()));
+    assert!(structural.contains(&commit.oid.to_hex()));
+
+    let raw_commit_parents =
+        committed.parent_keys(&projection.git.links, projection.relationship_notes());
+    assert_eq!(raw_commit_parents, vec![meta.id.to_string()]);
+    let raw_source_parents =
+        source.parent_keys(&projection.git.links, projection.relationship_notes());
+    assert!(
+        !raw_source_parents.contains(&commit.oid.to_hex()),
+        "the source operation never treats its produced commit as an ancestor"
     );
 }
 

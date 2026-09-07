@@ -241,7 +241,9 @@ pub enum GitLinkKind {
     Checkpoint,
     /// The operation's work was committed as this commit.
     CommittedAs,
-    /// The operation produced this commit (e.g. a git push/tool call).
+    /// The operation produced this commit (for example, a successful shell
+    /// command that ran `git commit`). Unlike the other link kinds, projection
+    /// renders the operation as a causal parent of the commit.
     ProducedBy,
     /// The operation mentions this commit in its content.
     Mentions,

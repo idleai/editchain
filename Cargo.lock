@@ -689,6 +689,7 @@ dependencies = [
  "editchain-codec",
  "editchain-core",
  "editchain-embed",
+ "editchain-git",
  "editchain-import",
  "editchain-index",
  "editchain-query",

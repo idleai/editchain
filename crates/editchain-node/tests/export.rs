@@ -4,6 +4,7 @@ use clap as _;
 use dirs as _;
 use editchain_codec as _;
 use editchain_embed as _;
+use editchain_git as _;
 use editchain_import as _;
 use editchain_index as _;
 use editchain_query as _;

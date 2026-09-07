@@ -73,7 +73,11 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 /// from one response, and makes derived-view parent rewrites authoritative over
 /// immutable provider facts. This removes synthetic one-row tool branches
 /// without changing canonical import evidence.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 22;
+///
+/// Revision 23 projects exact `ProducedBy` Git links in their causal direction:
+/// the producing command remains on the agent chain and becomes an additional
+/// parent of the immutable commit row.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 23;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

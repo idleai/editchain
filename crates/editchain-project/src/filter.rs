@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use editchain_core::{Op, OpId};
+use editchain_core::{GitLinkKind, Op, OpId};
 
 use crate::taxonomy::Visibility;
 use crate::HistoryNode;
@@ -257,6 +257,21 @@ pub fn apply_owned(
     // geometry visible. Anchors are the canonical (visible) note-map keys;
     // targets are each note's raw ids lifted to their visible rows.
     let mut structural_keys = HashSet::with_capacity(note_map.len());
+    for link in links
+        .values()
+        .flatten()
+        .filter(|link| link.kind == GitLinkKind::ProducedBy)
+    {
+        if let Some(key) =
+            crate::canonical_parent_key(&link.source.to_string(), representative, &present)
+        {
+            let _: bool = structural_keys.insert(key);
+        }
+        let target = link.target_oid.to_hex();
+        if present.contains(&target) {
+            let _: bool = structural_keys.insert(target);
+        }
+    }
     for (anchor, notes) in note_map {
         for note in notes {
             if let editchain_core::OpKind::Note(n) = &note.kind {

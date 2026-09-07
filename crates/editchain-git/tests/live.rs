@@ -19,7 +19,7 @@ use editchain_core::{
 };
 use editchain_git::{
     discover_repositories, merge_commit_entities, repository_id_from_path, resolve_commit,
-    RepositoryHandle,
+    resolve_commit_prefix, RepositoryHandle,
 };
 
 /// Create a temporary git repository with one commit and return its path.
@@ -138,6 +138,34 @@ fn resolve_missing_object_reports_not_found() {
     let missing = GitOid::from_sha1([0u8; 20]);
     let result = resolve_commit(&handle, &missing);
     assert!(result.is_err(), "missing object should error");
+}
+
+#[test]
+fn resolve_commit_prefix_requires_an_unambiguous_commit_object() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = make_repo(tmp.path());
+    let oid = head_oid(&repo);
+    let handle = RepositoryHandle {
+        repo: gix::open(&repo).expect("open repo"),
+        discovery: editchain_git::RepositoryDiscovery {
+            id: repository_id_from_path(&repo),
+            path: repo,
+            is_worktree: false,
+        },
+    };
+
+    let full = oid.to_hex();
+    let prefix = full.get(..7).expect("seven-character prefix");
+    let resolved = resolve_commit_prefix(&handle, prefix).expect("unique commit prefix");
+    assert_eq!(resolved.commit.oid, oid);
+    assert!(
+        resolve_commit_prefix(&handle, "123").is_none(),
+        "too-short prefixes are not strong identity evidence"
+    );
+    assert!(
+        resolve_commit_prefix(&handle, "not-hexadecimal").is_none(),
+        "non-hexadecimal strings are not object prefixes"
+    );
 }
 
 #[test]
