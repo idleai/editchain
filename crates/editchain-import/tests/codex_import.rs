@@ -277,7 +277,7 @@ fn legacy_cursor_backfills_session_git_link_once_without_replaying_rows() {
             .unwrap()
             .unwrap()
             .normalization_version,
-        4
+        5
     );
 
     let current =
@@ -351,7 +351,7 @@ fn version_one_cursor_upgrades_topology_without_replaying_git_link() {
             .unwrap()
             .unwrap()
             .normalization_version,
-        4
+        5
     );
 }
 
@@ -1634,6 +1634,92 @@ fn kinds_map_full_content_to_neutral_ops() {
         .iter()
         .find(|o| matches!(&o.kind, OpKind::File(f) if f.path == derive_path_id("/tmp/img.png")));
     assert!(img.is_some());
+}
+
+#[test]
+fn multi_path_file_change_retains_one_edit_and_path_note_per_file() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rollout(
+        dir.path(),
+        "rollout-multi-file.jsonl",
+        &[session_meta_line("thread-1", "s"), event_line("MULTI_FILE")],
+    );
+    let projection = projection_bytes(&[
+        line_record(
+            1,
+            Vec::new(),
+            Some(serde_json::json!({
+                "sessionId": "s",
+                "threadId": "thread-1",
+                "cwd": "/workspace"
+            })),
+        ),
+        line_record(
+            2,
+            vec![serde_json::json!({
+                "turnId": "turn-1",
+                "item": {
+                    "kind": "fileChange",
+                    "id": "files-1",
+                    "status": "applied",
+                    "changes": [
+                        {"path": "src/a.rs", "kind": "update", "diff": "@@ -1 +1 @@\n-old a\n+new a"},
+                        {"path": "src/b.rs", "kind": "delete", "diff": "@@ -1 +0,0 @@\n-old b"},
+                        {"path": "src/a.rs", "kind": "update", "diff": "@@ -3 +3 @@\n-old c\n+new c"}
+                    ]
+                }
+            })],
+            None,
+        ),
+    ]);
+    let imported = import(dir.path(), &fixed_helper(&dir, &projection));
+    let files: Vec<_> = imported
+        .ops
+        .ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::File(file) => Some((op, file)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(files.len(), 2, "every distinct path becomes a FileOp");
+    assert_eq!(files[0].1.path, derive_path_id("src/a.rs"));
+    assert_eq!(files[1].1.path, derive_path_id("src/b.rs"));
+    assert_eq!(files[0].1.stage, editchain_core::op::FileStage::Applied);
+    assert_eq!(files[1].1.stage, editchain_core::op::FileStage::Deleted);
+    match &files[0].1.edit {
+        editchain_core::op::FileEdit::UnifiedDiff(Payload::Inline(diff)) => assert_eq!(
+            String::from_utf8_lossy(diff),
+            "@@ -1 +1 @@\n-old a\n+new a\n@@ -3 +3 @@\n-old c\n+new c"
+        ),
+        other => panic!("expected path-specific unified diff, got {other:?}"),
+    }
+    match &files[1].1.edit {
+        editchain_core::op::FileEdit::UnifiedDiff(Payload::Inline(diff)) => {
+            assert_eq!(String::from_utf8_lossy(diff), "@@ -1 +0,0 @@\n-old b");
+        }
+        other => panic!("expected delete unified diff, got {other:?}"),
+    }
+
+    let path_notes: Vec<_> = imported
+        .ops
+        .ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Note(note)
+                if note.relationship == editchain_core::op::NoteRelationship::Explains =>
+            {
+                Some(note)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(path_notes.len(), 2);
+    assert_eq!(path_notes[0].target_ids, vec![files[0].0.id]);
+    assert_eq!(path_notes[0].content, Payload::Inline(b"src/a.rs".to_vec()));
+    assert_eq!(path_notes[1].target_ids, vec![files[1].0.id]);
+    assert_eq!(path_notes[1].content, Payload::Inline(b"src/b.rs".to_vec()));
+    assert_eq!(imported.report.normalized_ops, 4);
 }
 
 #[test]

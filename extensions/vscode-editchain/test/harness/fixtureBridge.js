@@ -208,10 +208,12 @@
       const regionLanes = belowParent.filter((l) => aboveNext.includes(l));
       for (let i = 0; i < subs.length; i++) {
         const sub = subs[i];
+        const fileChange = sub.file_change && typeof sub.file_change === 'object'
+          ? sub.file_change : null;
         out.push({
           op_id: sub.op_id,
-          git_oid: null,
-          repository: null,
+          git_oid: fileChange && fileChange.commit_oid ? fileChange.commit_oid : null,
+          repository: fileChange && fileChange.repository ? fileChange.repository : null,
           summary: sub.summary,
           timestamp_ms: sub.timestamp_ms,
           group: row.group,
@@ -219,10 +221,15 @@
           node_key: row.node_key + '::sub:' + i,
           parents: [],
           is_submodule: false,
-          is_system: true,
+          is_system: fileChange ? false : true,
           author: '',
           commit_id: '',
-          kind: sub.kind,
+          kind: fileChange ? 'file' : sub.kind,
+          record_role: fileChange ? 'artifact' : (sub.record_role || 'unknown'),
+          activity_kind: fileChange ? 'change' : (sub.activity_kind || 'unknown'),
+          visibility: fileChange ? 'supporting' : (sub.visibility || 'supporting'),
+          outcome: 'unknown',
+          chain_state: row.chain_state || 'active',
           lane: row.lane || 0,
           above: regionLanes.slice(),
           below: regionLanes.slice(),
@@ -232,6 +239,7 @@
           hierarchy_depth: 1,
           parent_row: parentRow,
           subop_kind: sub.kind,
+          file_change: fileChange,
           // Bundled metadata records are sub-ops, never top-level rows: they
           // carry no work-unit, no promotion, and no bundle metadata of their
           // own (exactly like the service's expanded member rows).

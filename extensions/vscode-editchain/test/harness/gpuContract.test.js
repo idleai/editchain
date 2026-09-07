@@ -46,7 +46,7 @@ test('production host forwards an exact read-only allowlist and rejects mutating
     assert.match(guard, new RegExp("hasOwnProperty\\(body,\\s*'" + allowed + "'\\)"),
       'read-only allowlist forwards ' + allowed);
   }
-  for (const blocked of ['Open', 'GetNodeDetails', 'ResolveObject', 'GetLayout']) {
+  for (const blocked of ['Open', 'GetNodeDetails', 'ResolveObject', 'GetFileDiff', 'GetLayout']) {
     assert.doesNotMatch(guard, new RegExp("hasOwnProperty\\(body,\\s*'" + blocked + "'\\)"),
       'allowlist excludes ' + blocked);
   }
@@ -63,6 +63,10 @@ test('production host forwards an exact read-only allowlist and rejects mutating
   // still explicitly handled on the single history panel.
   assert.match(EXTENSION_SOURCE, /msg\.type === 'openJson'/,
     'production openJson control remains handled');
+  assert.match(EXTENSION_SOURCE, /msg\.type === 'openDiff'/,
+    'production openDiff control remains explicitly handled');
+  assert.match(EXTENSION_SOURCE, /\{ GetFileDiff: \{ change: msg\.change \} \}/,
+    'openDiff materializes only the service-advertised file-change identity');
 });
 
 test('production webview is Rust-only: rust-history loader, never main.js or the gpu-preview bootstrap', () => {

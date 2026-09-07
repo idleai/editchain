@@ -43,6 +43,9 @@ let openEpoch = 0;
 // pressure).
 let rendererInstanceId: string | null = null;
 let openDeliveredToRenderer: string | null = null;
+// Unique virtual-document namespace for native diff tabs. Reusing a URI would
+// let VS Code retain stale text from an earlier click on the same path.
+let diffDocumentSerial = 0;
 
 // Generous finite deadline for NON-Open service requests (window fetches,
 // search and object resolution). The measured first-window time on a large
@@ -76,9 +79,13 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider('editchain-json', jsonProvider)
   );
+  const diffProvider = new DiffContentProvider();
+  context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider('editchain-diff', diffProvider)
+  );
 
   const openCommand = vscode.commands.registerCommand('editchain-history.open', () => {
-    openHistoryView(context, client, jsonProvider);
+    openHistoryView(context, client, jsonProvider, diffProvider);
   });
   context.subscriptions.push(openCommand);
 
@@ -116,7 +123,8 @@ function updateStatusBar(loaded: number, total: number): void {
 function openHistoryView(
   context: vscode.ExtensionContext,
   client: StdioClient,
-  jsonProvider: JsonContentProvider
+  jsonProvider: JsonContentProvider,
+  diffProvider: DiffContentProvider
 ): void {
   // Reuse an existing panel if one is still open, so we never create two
   // webviews of the same type (which races service-worker registration).
@@ -235,6 +243,14 @@ function openHistoryView(
         output?.appendLine('[webview] renderer ready: ' + instanceId);
       }
       deliverOpenState(panel);
+      return;
+    }
+    // File children open VS Code's native diff editor. The webview sends only
+    // the identity advertised by the service; the service revalidates it and
+    // resolves immutable Git blobs or retained agent-edit evidence.
+    if (msg.type === 'openDiff') {
+      output?.appendLine('[webview] openDiff request');
+      await openDiffEditor(client, diffProvider, msg);
       return;
     }
     // Intercept the "open JSON editor" request from the webview: fetch the
@@ -488,6 +504,71 @@ async function openJsonEditor(
   }
 }
 
+/** Materialize one advertised file change and open VS Code's native diff UI. */
+async function openDiffEditor(
+  client: StdioClient,
+  diffProvider: DiffContentProvider,
+  msg: { change?: any }
+): Promise<void> {
+  try {
+    if (!msg.change || typeof msg.change !== 'object' || Array.isArray(msg.change)) {
+      throw new Error('missing file-change identity');
+    }
+    const resp = await client.request(
+      { GetFileDiff: { change: msg.change } },
+      { timeoutMs: NON_OPEN_TIMEOUT_MS }
+    );
+    if (resp && resp.Error !== undefined) throw new Error(String(resp.Error));
+    const diff = resp?.Ok ?? resp;
+    if (!diff || typeof diff !== 'object') {
+      throw new Error('service returned no file diff');
+    }
+    if (diff.binary) {
+      const note = typeof diff.note === 'string' ? diff.note : 'Binary edits cannot be shown as text.';
+      await vscode.window.showWarningMessage(`EditChain: ${note}`);
+      return;
+    }
+    if (typeof diff.before !== 'string' || typeof diff.after !== 'string') {
+      throw new Error('service returned invalid diff content');
+    }
+
+    const serial = ++diffDocumentSerial;
+    const currentPath = typeof diff.path === 'string' && diff.path ? diff.path : 'edit.txt';
+    const previousPath =
+      typeof diff.old_path === 'string' && diff.old_path ? diff.old_path : currentPath;
+    const beforeUri = diffDocumentUri(serial, 'before', previousPath);
+    const afterUri = diffDocumentUri(serial, 'after', currentPath);
+    diffProvider.setContent(beforeUri.toString(), diff.before);
+    diffProvider.setContent(afterUri.toString(), diff.after);
+
+    const source = msg.change.source === 'git' ? 'Git' : 'agent';
+    const fidelity = diff.partial ? ', recorded evidence' : '';
+    const title = `${currentPath} (${source}${fidelity})`;
+    await vscode.commands.executeCommand(
+      'vscode.diff',
+      beforeUri,
+      afterUri,
+      title,
+      { preview: true }
+    );
+    if (diff.partial && typeof diff.note === 'string' && diff.note) {
+      output?.appendLine(`[diff] ${currentPath}: ${diff.note}`);
+    }
+  } catch (e) {
+    vscode.window.showErrorMessage(`EditChain: failed to open diff editor: ${String(e)}`);
+  }
+}
+
+/** Unique read-only URI whose suffix preserves the file's language mode. */
+function diffDocumentUri(serial: number, side: 'before' | 'after', filePath: string): vscode.Uri {
+  const normalized = filePath.replace(/\\/g, '/').replace(/^\/+/, '');
+  return vscode.Uri.from({
+    scheme: 'editchain-diff',
+    authority: `${serial}-${side}`,
+    path: `/${normalized || 'edit.txt'}`,
+  });
+}
+
 /**
  * Recursively parse string values that are themselves JSON-serialized, so they
  * render as nested JSON rather than escaped strings.
@@ -539,6 +620,26 @@ class JsonContentProvider implements vscode.TextDocumentContentProvider {
 
   /** Set (or update) the content for a document URI. */
   setContent(uri: string, content: string): void {
+    this.contents.set(uri, content);
+  }
+
+  provideTextDocumentContent(uri: vscode.Uri): string {
+    return this.contents.get(uri.toString()) ?? '';
+  }
+}
+
+/** Read-only before/after documents consumed by VS Code's diff command. */
+class DiffContentProvider implements vscode.TextDocumentContentProvider {
+  private contents = new Map<string, string>();
+
+  setContent(uri: string, content: string): void {
+    // Keep recent tabs resolvable while bounding extension-host memory during
+    // long review sessions. Map insertion order gives a tiny FIFO here.
+    while (this.contents.size >= 128) {
+      const oldest = this.contents.keys().next().value;
+      if (typeof oldest !== 'string') break;
+      this.contents.delete(oldest);
+    }
     this.contents.set(uri, content);
   }
 

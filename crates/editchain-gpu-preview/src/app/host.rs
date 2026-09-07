@@ -187,6 +187,10 @@ pub(crate) enum Send {
     /// envelope). The wasm shell (`src/lib.rs` `execute_send`) posts the
     /// envelope verbatim; rows.rs builds the git/op identity form.
     OpenJson(Value),
+    /// Native VS Code diff activation (`{ type: 'openDiff', change: ... }`).
+    /// The host asks the service to revalidate and materialize the advertised
+    /// file identity before opening virtual before/after documents.
+    OpenDiff(Value),
     /// Renderer-instance handshake after installing the host listener.
     WebviewReady(String),
 }
@@ -457,6 +461,13 @@ mod tests {
         // alive and their envelope shapes explicit.
         let open_json = Send::OpenJson(json!({ "op_id": "op:1" }));
         assert!(matches!(&open_json, Send::OpenJson(body) if body["op_id"] == "op:1"));
+        let open_diff = Send::OpenDiff(json!({ "change": { "path": "src/lib.rs" } }));
+        assert!(matches!(&open_diff, Send::OpenDiff(body)
+            if body
+                .get("change")
+                .and_then(|change| change.get("path"))
+                .and_then(Value::as_str)
+                == Some("src/lib.rs")));
         let ready = Send::WebviewReady("instance-abc".to_owned());
         assert!(matches!(&ready, Send::WebviewReady(id) if id == "instance-abc"));
     }

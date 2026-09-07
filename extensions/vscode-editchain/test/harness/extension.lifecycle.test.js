@@ -41,12 +41,18 @@ function writeFakeVscode() {
   fs.writeFileSync(
     fakeVscodePath,
     `'use strict';
+const providers = [];
+const executedCommands = [];
+const warnings = [];
 module.exports = {
   __esModule: true,
   workspace: {
     workspaceFolders: [{ uri: ${uri.toString()}('/ws') }],
     getConfiguration: () => ({ get: (_key, def) => def }),
-    registerTextDocumentContentProvider: () => ({ dispose() {} }),
+    registerTextDocumentContentProvider: (scheme, provider) => {
+      providers.push({ scheme, provider });
+      return { dispose() {} };
+    },
     openTextDocument: async () => ({}),
   },
   window: {
@@ -55,13 +61,22 @@ module.exports = {
     createWebviewPanel: () => { throw new Error('createWebviewPanel must be intercepted by the test harness'); },
     showTextDocument: async () => ({}),
     showErrorMessage: () => undefined,
+    showWarningMessage: async (message) => { warnings.push(message); },
   },
   commands: {
     registerCommand: () => { throw new Error('registerCommand must be intercepted by the test harness'); },
+    executeCommand: async (...args) => { executedCommands.push(args); },
   },
-  Uri: { parse: (s) => ${uri.toString()}(s), joinPath: (...p) => ${uri.toString()}(p.map(String).join('/')) },
+  Uri: {
+    parse: (s) => ${uri.toString()}(s),
+    joinPath: (...p) => ${uri.toString()}(p.map(String).join('/')),
+    from: (parts) => (${uri.toString()})(parts.scheme + '://' + (parts.authority || '') + (parts.path || '')),
+  },
   ViewColumn: { One: 1 },
   StatusBarAlignment: { Left: 1 },
+  __providers: providers,
+  __executedCommands: executedCommands,
+  __warnings: warnings,
 };
 `
   );
@@ -93,7 +108,8 @@ class FakeStdioClient {
       this.openRequests.push(rec);
     } else {
       this.requests.push(rec);
-      rec.resolve({ Ok: {} });
+      rec.resolve(this.nextResponse || { Ok: {} });
+      this.nextResponse = null;
     }
     return rec.promise;
   }
@@ -180,6 +196,7 @@ function loadExtension() {
     panels,
     client,
     statusItem,
+    vscode: fakeVscode,
   };
 }
 
@@ -348,4 +365,51 @@ test('history panel retains its bounded renderer context across raw JSON navigat
   panel.handlers.viewState({ webviewPanel: { active: true } });
   assert.equal(panel.webview.messages.length, 2, 'Back must display retained rows without replaying Open');
   assert.equal(env.client.openRequests.length, 1, 'Back must not rebuild the workspace');
+});
+
+test('openDiff resolves service content into VS Code native virtual documents', async () => {
+  const env = loadExtension();
+  env.open();
+  const panel = env.panels[0];
+  const change = {
+    source: 'git',
+    path: 'src/lib.rs',
+    status: 'modified',
+    repository: '42',
+    repository_path: 'src/lib.rs',
+    commit_oid: '0123456789012345678901234567890123456789',
+    old_oid: '1111111111111111111111111111111111111111',
+    new_oid: '2222222222222222222222222222222222222222',
+    old_mode: 'blob',
+    new_mode: 'blob',
+    binary: false,
+    partial: false,
+  };
+  env.client.nextResponse = {
+    Ok: {
+      path: 'src/lib.rs',
+      status: 'modified',
+      binary: false,
+      partial: false,
+      before: 'fn old() {}\n',
+      after: 'fn new() {}\n',
+    },
+  };
+
+  await panel.handlers.message({ type: 'openDiff', change });
+  await flush();
+  assert.deepEqual(env.client.requests[0].body, { GetFileDiff: { change } });
+  assert.equal(env.client.requests[0].opts.timeoutMs, 120_000);
+
+  const command = env.vscode.__executedCommands[0];
+  assert.equal(command[0], 'vscode.diff');
+  assert.match(command[1].toString(), /^editchain-diff:\/\/1-before\/src\/lib\.rs$/);
+  assert.match(command[2].toString(), /^editchain-diff:\/\/1-after\/src\/lib\.rs$/);
+  assert.equal(command[3], 'src/lib.rs (Git)');
+  assert.deepEqual(command[4], { preview: true });
+
+  const registration = env.vscode.__providers.find((entry) => entry.scheme === 'editchain-diff');
+  assert.ok(registration, 'the read-only diff content provider is registered');
+  assert.equal(registration.provider.provideTextDocumentContent(command[1]), 'fn old() {}\n');
+  assert.equal(registration.provider.provideTextDocumentContent(command[2]), 'fn new() {}\n');
 });

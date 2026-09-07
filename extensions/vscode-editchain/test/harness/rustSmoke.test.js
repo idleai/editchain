@@ -114,6 +114,10 @@ test('rust.html shares the scaffold but loads neither main.js nor the gpu-previe
  * listener, start the scenario, and settle until dataReady + idle. */
 async function openRustPage(scenario, viewport) {
   const page = await browser.newPage();
+  // Chrome may leave a newly-created page backgrounded after the preceding
+  // fixture page closes. Keep module/WASM startup on the foreground page so
+  // renderer scheduling cannot be throttled before the boot marker appears.
+  await page.bringToFront();
   await page.setViewport(viewport || { width: 1440, height: 900 });
   const errors = { page: [], console: [] };
   page.on('pageerror', (error) => errors.page.push(error.message));
@@ -124,9 +128,21 @@ async function openRustPage(scenario, viewport) {
     waitUntil: 'domcontentloaded',
     timeout: driver.BOOT_TIMEOUT_MS,
   });
-  await driver.waitFor(page, () =>
-    document.body.dataset.rustWasm === 'started' || document.body.dataset.rustWasm === 'error',
-  { timeout: driver.BOOT_TIMEOUT_MS });
+  try {
+    await driver.waitFor(page, () =>
+      document.body.dataset.rustWasm === 'started' || document.body.dataset.rustWasm === 'error',
+    { timeout: driver.BOOT_TIMEOUT_MS });
+  } catch (error) {
+    const startup = await page.evaluate(() => ({
+      documentState: document.readyState,
+      visibility: document.visibilityState,
+      marker: document.body.dataset.rustWasm || null,
+      loader: window.__editchainRustLoader || null,
+      resources: performance.getEntriesByType('resource').map((entry) => entry.name),
+    }));
+    throw new Error('Rust WASM startup stalled for fixture ' + scenario + ': ' +
+      JSON.stringify(startup), { cause: error });
+  }
   const marker = await page.evaluate(() => ({
     state: document.body.dataset.rustWasm,
     error: document.body.dataset.rustWasmError,
@@ -1085,8 +1101,128 @@ test('row keyboard disclosure, double-click identity, and divider drag remain co
       assertNoErrors(errors, 'rust row/divider');
     } finally {
       await merge.page.close();
+  }
+});
+
+test('Git and agent parents reveal column-aligned file rows whose click opens an exact diff identity',
+  { skip: SKIP }, async () => {
+    const { page, errors } = await openRustPage('fileEdits');
+    try {
+      await driver.installHarnessSpies(page);
+
+      await driver.clickRow(page, 0);
+      await settleRust(page);
+      const gitFile = await page.evaluate(() => {
+        const row = document.querySelector('.row-file[data-row="1"]');
+        if (!row) return null;
+        const style = getComputedStyle(row.querySelector('.text-cell'));
+        const icon = row.querySelector('.file-icon');
+        const iconOutline = getComputedStyle(icon, '::before');
+        const iconStroke = getComputedStyle(icon, '::after');
+        return {
+          path: row.getAttribute('data-file-path'),
+          status: row.getAttribute('data-file-status'),
+          source: row.getAttribute('data-file-source'),
+          name: row.querySelector('.file-name')?.textContent,
+          directory: row.querySelector('.file-directory')?.textContent,
+          statusText: row.querySelector('.file-status')?.textContent,
+          fidelity: row.querySelector('.file-fidelity')?.textContent || '',
+          activityText: row.querySelector('.activity-label')?.textContent,
+          activityDisplay: getComputedStyle(row.querySelector('.activity-cell')).display,
+          textGridStart: style.gridColumnStart,
+          statusParent: row.querySelector('.file-status')?.parentElement?.className,
+          contentParent: row.querySelector('.file-name')?.closest('.text-cell')?.className,
+          iconWidth: icon.getBoundingClientRect().width,
+          iconOutline: iconOutline.borderTopWidth,
+          iconStrokeVisible: iconStroke.backgroundColor !== 'rgba(0, 0, 0, 0)',
+          aria: row.getAttribute('aria-label'),
+        };
+      });
+      assert.deepEqual(gitFile, {
+        path: 'crates/editchain-git/src/diff.rs',
+        status: 'modified',
+        source: 'git',
+        name: 'diff.rs',
+        directory: 'crates/editchain-git/src',
+        statusText: 'M',
+        fidelity: '',
+        activityText: 'change',
+        activityDisplay: 'flex',
+        textGridStart: 'auto',
+        statusParent: 'tags-cell',
+        contentParent: 'text-cell',
+        iconWidth: 16,
+        iconOutline: '1px',
+        iconStrokeVisible: true,
+        aria: 'Modified crates/editchain-git/src/diff.rs, Git commit; open diff',
+      });
+      await driver.clickRow(page, 1);
+      let state = await driver.readState(page);
+      assert.equal(state.selectedRow, 1, 'file click selects the edit child');
+      assert.equal(state.openDiffLog.length, 1, 'file click posts one openDiff action');
+      assert.deepEqual(state.openDiffLog[0].change,
+        windowlessGitChange(), 'Git envelope preserves every immutable identity field');
+
+      await page.evaluate(() => {
+        document.querySelector('.row-file[data-row="1"]')?.dispatchEvent(new MouseEvent('dblclick', {
+          bubbles: true,
+          cancelable: true,
+          detail: 2,
+        }));
+      });
+      state = await driver.readState(page);
+      assert.equal(state.openJsonLog.length, 0, 'double-click never replaces a file diff with JSON');
+
+      await driver.clickRow(page, 2);
+      await settleRust(page);
+      const agentFile = await page.evaluate(() => {
+        const row = document.querySelector('.row-file[data-row="3"]');
+        return row ? {
+          path: row.getAttribute('data-file-path'),
+          source: row.getAttribute('data-file-source'),
+          fidelity: row.querySelector('.file-fidelity')?.textContent,
+          statusParent: row.querySelector('.file-status')?.parentElement?.className,
+          fidelityParent: row.querySelector('.file-fidelity')?.parentElement?.className,
+          contentParent: row.querySelector('.file-name')?.closest('.text-cell')?.className,
+          activity: row.querySelector('.activity-label')?.textContent,
+          classes: Array.from(row.classList),
+        } : null;
+      });
+      assert.equal(agentFile?.path, 'extensions/vscode-editchain/src/extension.ts');
+      assert.equal(agentFile?.source, 'agent');
+      assert.equal(agentFile?.fidelity, 'recorded');
+      assert.equal(agentFile?.statusParent, 'tags-cell');
+      assert.equal(agentFile?.fidelityParent, 'tags-cell');
+      assert.equal(agentFile?.contentParent, 'text-cell');
+      assert.equal(agentFile?.activity, 'change');
+      assert.ok(agentFile?.classes.includes('row-file-partial'));
+      await saveParityScreenshot(page, 'file-edits');
+      await driver.pressRowKey(page, 'Enter', 3);
+      state = await driver.readState(page);
+      assert.equal(state.openDiffLog.length, 2, 'Enter activates the agent diff');
+      assert.equal(state.openDiffLog[1].change.op_id, 'node:agent:edit:normalized');
+      assertNoErrors(errors, 'SCM file rows');
+    } finally {
+      await page.close();
     }
   });
+
+function windowlessGitChange() {
+  return {
+    source: 'git',
+    path: 'crates/editchain-git/src/diff.rs',
+    status: 'modified',
+    binary: false,
+    partial: false,
+    repository: '9007199254740993',
+    repository_path: 'crates/editchain-git/src/diff.rs',
+    commit_oid: '0123456789abcdef0123456789abcdef01234567',
+    old_oid: '1111111111111111111111111111111111111111',
+    new_oid: '2222222222222222222222222222222222222222',
+    old_mode: 'blob',
+    new_mode: 'blob',
+  };
+}
 
 test('warning, empty, and open-error terminal states remain accessible',
   { skip: SKIP }, async () => {

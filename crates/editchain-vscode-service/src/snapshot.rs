@@ -117,7 +117,10 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 /// Revision 35 routes session-to-Git base references through shared,
 /// interval-colored spines so many sessions based on one commit do not retain
 /// one empty graph lane apiece until that commit row.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 35;
+///
+/// Revision 36 adds expandable source-control-style file rows with immutable
+/// Git object identities and retained agent-edit identities.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 36;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

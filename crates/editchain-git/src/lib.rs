@@ -7,6 +7,8 @@
 #[cfg(test)]
 use tempfile as _;
 
+/// Commit tree diffs and immutable blob resolution.
+pub mod diff;
 /// Repository discovery and identity derivation.
 pub mod discover;
 /// Merging imported and live commit entities.
@@ -14,6 +16,10 @@ pub mod merge;
 /// Object resolution (commits, trees, refs, diffs) via `gix`.
 pub mod resolve;
 
+pub use diff::{
+    commit_file_changes, resolve_blob, resolve_path_at_commit, GitBlob, GitFileChange,
+    GitFileStatus, GitPathObject,
+};
 pub use discover::{discover_repositories, open_repository, RepositoryDiscovery, RepositoryHandle};
 pub use merge::{merge_commit_entities, MergeOutcome};
 pub use resolve::{

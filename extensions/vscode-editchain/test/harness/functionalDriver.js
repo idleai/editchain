@@ -111,6 +111,7 @@ async function installHarnessSpies(page, { legacySearch = false } = {}) {
   await page.evaluate((rewrite) => {
     const orig = window.vscode.postMessage.bind(window.vscode);
     window.__editchainOpenJsonLog = [];
+    window.__editchainOpenDiffLog = [];
     window.vscode.postMessage = function (msg) {
       if (msg && msg.type === 'openJson') {
         window.__editchainOpenJsonLog.push({
@@ -119,6 +120,9 @@ async function installHarnessSpies(page, { legacySearch = false } = {}) {
           git_oid: msg.git_oid !== undefined ? msg.git_oid : null,
           repository: msg.repository !== undefined ? msg.repository : null,
         });
+      }
+      if (msg && msg.type === 'openDiff') {
+        window.__editchainOpenDiffLog.push(msg);
       }
       if (rewrite && msg && msg.body && msg.body.FindInHistory) {
         const f = msg.body.FindInHistory;
@@ -250,6 +254,7 @@ async function readState(page) {
       windowOffsets,
       windowHideTraces,
       openJsonLog: window.__editchainOpenJsonLog || [],
+      openDiffLog: window.__editchainOpenDiffLog || [],
     };
   });
 }

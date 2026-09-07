@@ -185,7 +185,7 @@ pub fn walk_history(
     clippy::indexing_slicing,
     reason = "digest_len is 20 or 32, always within the 32-byte buffer"
 )]
-fn git_oid_from(oid: &GitOid) -> Result<gix::hash::ObjectId, ResolutionError> {
+pub(crate) fn git_oid_from(oid: &GitOid) -> Result<gix::hash::ObjectId, ResolutionError> {
     let len = oid.digest_len();
     let bytes = &oid.bytes[..len];
     gix::hash::ObjectId::try_from(bytes)
@@ -198,7 +198,7 @@ fn git_oid_from(oid: &GitOid) -> Result<gix::hash::ObjectId, ResolutionError> {
     clippy::match_same_arms,
     reason = "SHA-1/SHA-256 digests are at most 32 bytes; Kind is non-exhaustive so a wildcard fallback is required"
 )]
-fn git_oid_from_gix(id: &gix::hash::ObjectId) -> GitOid {
+pub(crate) fn git_oid_from_gix(id: &gix::hash::ObjectId) -> GitOid {
     let format = match id.kind() {
         gix::hash::Kind::Sha1 => GitObjectFormat::Sha1,
         gix::hash::Kind::Sha256 => GitObjectFormat::Sha256,

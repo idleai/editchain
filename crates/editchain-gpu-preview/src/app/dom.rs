@@ -2066,6 +2066,11 @@ mod web {
             &spec.identity.hierarchy_depth.to_string(),
         )?;
         row.set_attribute("data-classification", &spec.classification.label)?;
+        if let Some(file) = &spec.content.file {
+            row.set_attribute("data-file-path", &file.path)?;
+            row.set_attribute("data-file-status", file.status.class())?;
+            row.set_attribute("data-file-source", &file.source)?;
+        }
         if let Some(header) = &spec.work_unit_header {
             row.set_attribute("data-work-unit-id", &header.id)?;
         }
@@ -2326,6 +2331,31 @@ mod web {
         spec: &RowSpec,
     ) -> Result<(), JsValue> {
         let parent_node = node_of(parent)?;
+        if let Some(file) = &spec.content.file {
+            let icon = make_element(document, "span", "file-icon", None)?;
+            icon.set_attribute("aria-hidden", "true")?;
+            drop(
+                parent_node
+                    .append_child(&node_of(&icon)?)
+                    .map_err(js_err_from)?,
+            );
+            let name = make_element(document, "span", "file-name", Some(&file.name))?;
+            drop(
+                parent_node
+                    .append_child(&node_of(&name)?)
+                    .map_err(js_err_from)?,
+            );
+            if !file.directory.is_empty() {
+                let directory =
+                    make_element(document, "span", "file-directory", Some(&file.directory))?;
+                drop(
+                    parent_node
+                        .append_child(&node_of(&directory)?)
+                        .map_err(js_err_from)?,
+                );
+            }
+            return Ok(());
+        }
         if let Some(subop) = &spec.content.subop {
             let icon = make_element(
                 document,

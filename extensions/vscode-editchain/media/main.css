@@ -517,6 +517,123 @@ body {
   text-overflow: ellipsis;
 }
 
+/* Git and agent edit children obey the same column grammar as every other
+   history row: Activity says `change`, Tags owns the SCM status/fidelity, and
+   Content owns only the filename/path. Hierarchy indentation therefore stays
+   inside Content without spanning or suppressing any table columns. */
+.row-file .summary {
+  width: 100%;
+  gap: 0;
+}
+.file-icon {
+  position: relative;
+  display: inline-block;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  margin-right: 6px;
+  color: var(--vscode-descriptionForeground);
+}
+.file-icon::before {
+  position: absolute;
+  top: 1px;
+  left: 2px;
+  box-sizing: border-box;
+  width: 11px;
+  height: 14px;
+  border: 1px solid currentColor;
+  border-radius: 1px;
+  content: '';
+  opacity: 0.9;
+}
+.file-icon::after {
+  position: absolute;
+  top: 6px;
+  left: 5px;
+  width: 5px;
+  height: 1px;
+  background: currentColor;
+  box-shadow: 0 3px 0 currentColor;
+  content: '';
+}
+.file-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--vscode-foreground);
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-directory {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin-left: 7px;
+  overflow: hidden;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.92em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-fidelity {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  height: 16px;
+  padding: 0 5px;
+  overflow: hidden;
+  color: var(--vscode-descriptionForeground);
+  border: 1px solid color-mix(in srgb, currentColor 38%, transparent);
+  border-radius: 3px;
+  font-size: 9px;
+  letter-spacing: 0.02em;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 16px;
+}
+.row-file:hover {
+  background: var(--vscode-list-hoverBackground, transparent);
+}
+.row-file-added .file-icon,
+.row-file-added .file-status {
+  color: var(--vscode-gitDecoration-addedResourceForeground, #81b88b);
+}
+.row-file-modified .file-icon,
+.row-file-modified .file-status,
+.row-file-type-changed .file-icon,
+.row-file-type-changed .file-status {
+  color: var(--vscode-gitDecoration-modifiedResourceForeground, #e2c08d);
+}
+.row-file-deleted .file-icon,
+.row-file-deleted .file-status {
+  color: var(--vscode-gitDecoration-deletedResourceForeground, #c74e39);
+}
+.row-file-renamed .file-icon,
+.row-file-renamed .file-status,
+.row-file-copied .file-icon,
+.row-file-copied .file-status {
+  color: var(--vscode-gitDecoration-renamedResourceForeground, #73c991);
+}
+.row-file-unknown .file-status {
+  color: var(--vscode-descriptionForeground);
+}
+.row-file-binary .file-fidelity,
+.row-file-partial .file-fidelity {
+  opacity: 0.86;
+}
+
 /* Activity work-unit layer. A work-unit start opens a unit section: a
    stronger top separator plus a
    compact two-line unit header INSIDE the fixed 34px row (unit title above the

@@ -20,9 +20,9 @@
 //!   metadata,
 //! - graph data consumed by the wgpu frame contract (`lane`, `above`, `below`,
 //!   `transitions`, `is_subop`, `is_bundle`), and
-//! - the exact `openJson` identity envelope for eligible rows and nothing
-//!   else. Ineligible rows yield `None` (production announces "No raw record
-//!   is available for this row").
+//! - the exact `openJson` identity envelope for eligible rows and `openDiff`
+//!   envelope for source-control-style file rows. Ineligible rows yield
+//!   `None` (production announces "No raw record is available for this row").
 //!
 //! The summary is represented as a structured, HTML-safe token tree
 //! ([`MdInline`]/[`MdLine`]/[`Summary`]) instead of markup: no HTML string is
@@ -2759,6 +2759,83 @@ pub(crate) struct SubopContent {
     pub(crate) summary: Summary,
 }
 
+/// Source-control status for a rendered file row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileRowStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    TypeChanged,
+    Unknown,
+}
+
+impl FileRowStatus {
+    fn from_wire(value: &str) -> Self {
+        match value {
+            "added" => Self::Added,
+            "modified" => Self::Modified,
+            "deleted" => Self::Deleted,
+            "renamed" => Self::Renamed,
+            "copied" => Self::Copied,
+            "type_changed" => Self::TypeChanged,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::Added => "A",
+            Self::Modified => "M",
+            Self::Deleted => "D",
+            Self::Renamed => "R",
+            Self::Copied => "C",
+            Self::TypeChanged => "T",
+            Self::Unknown => "?",
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Added => "Added",
+            Self::Modified => "Modified",
+            Self::Deleted => "Deleted",
+            Self::Renamed => "Renamed",
+            Self::Copied => "Copied",
+            Self::TypeChanged => "Type changed",
+            Self::Unknown => "Changed",
+        }
+    }
+
+    pub(crate) const fn class(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Modified => "modified",
+            Self::Deleted => "deleted",
+            Self::Renamed => "renamed",
+            Self::Copied => "copied",
+            Self::TypeChanged => "type-changed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Column-aligned SCM content for one expandable Git/agent edit child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileContent {
+    pub(crate) path: String,
+    pub(crate) name: String,
+    pub(crate) directory: String,
+    pub(crate) status: FileRowStatus,
+    pub(crate) source: String,
+    pub(crate) fidelity: String,
+    pub(crate) binary: bool,
+    pub(crate) partial: bool,
+    pub(crate) title: String,
+    pub(crate) aria_label: String,
+}
+
 /// Top-level row content after all chip-like metadata moves to Tags.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TopContent {
@@ -2769,6 +2846,7 @@ pub(crate) struct TopContent {
 /// ribbon wrapper on top when a unit header is present).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct RowContent {
+    pub(crate) file: Option<FileContent>,
     pub(crate) subop: Option<SubopContent>,
     pub(crate) top: Option<TopContent>,
     pub(crate) work_unit: Option<WorkUnitHeader>,
@@ -2826,6 +2904,7 @@ pub(crate) struct RowSpec {
     pub(crate) aria: RowAria,
     pub(crate) group_label: Option<String>,
     pub(crate) open_json: Option<Value>,
+    pub(crate) open_diff: Option<Value>,
     pub(crate) placeholder: bool,
 }
 
@@ -2872,6 +2951,7 @@ impl Default for RowSpec {
             },
             group_label: None,
             open_json: None,
+            open_diff: None,
             placeholder: false,
         }
     }
@@ -2897,6 +2977,8 @@ impl RowSpec {
     pub(crate) fn from_value(row: &Value, context: &RowContext) -> RowSpec {
         let view = context.view;
         let is_subop = wire::bool(row, "is_subop");
+        let file_content = file_content(row);
+        let is_file = file_content.is_some();
         let node_key = row_str(row, "node_key");
         let selected = context
             .selected_key
@@ -2913,7 +2995,9 @@ impl RowSpec {
         let is_execute_run = bundle_kind == Some(BundleKind::ExecuteRun);
         let is_plan_repeat = bundle_kind == Some(BundleKind::PlanRepeat);
         let semantic_tags = row_semantic_chrome(row, is_bundle, view, BadgeOptions::default());
-        let classification = if is_session_summary {
+        let classification = if is_file {
+            RowClassification::new("change", "activity_kind", "change")
+        } else if is_session_summary {
             RowClassification::session_summary()
         } else {
             row_classification(row)
@@ -3033,9 +3117,40 @@ impl RowSpec {
                 ChromeItem::new(&chip.class, &chip.label, &label, Some(&label))
             }));
         }
+        if let Some(file) = &file_content {
+            tags.clear();
+            let status_class = format!("file-status file-status-{}", file.status.class());
+            tags.push(ChromeItem::new(
+                &status_class,
+                file.status.code(),
+                file.status.label(),
+                Some(file.status.label()),
+            ));
+            if !file.fidelity.is_empty() {
+                let fidelity_title = if file.binary {
+                    "Binary file content"
+                } else {
+                    "Recorded agent edit"
+                };
+                tags.push(ChromeItem::new(
+                    "file-fidelity",
+                    &file.fidelity,
+                    fidelity_title,
+                    Some(fidelity_title),
+                ));
+            }
+        }
         let has_badges = !tags.is_empty();
-        let row_content = if is_subop {
+        let row_content = if let Some(file) = file_content.clone() {
             RowContent {
+                file: Some(file),
+                subop: None,
+                top: None,
+                work_unit: None,
+            }
+        } else if is_subop {
+            RowContent {
+                file: None,
                 subop: Some(SubopContent {
                     icon: subop_icon(&row_str(row, "subop_kind")),
                     summary: Summary::parse(&display_summary),
@@ -3045,6 +3160,7 @@ impl RowSpec {
             }
         } else {
             RowContent {
+                file: None,
                 subop: None,
                 top: Some(TopContent {
                     summary: row_summary,
@@ -3101,6 +3217,9 @@ impl RowSpec {
                 aria_label = format!("{unit_title}: {plain_summary}");
             }
         }
+        if let Some(file) = &file_content {
+            aria_label.clone_from(&file.aria_label);
+        }
         let base_aria_label = aria_label.clone();
         if context.is_group_start && has_session_meta {
             aria_label.push_str(", ");
@@ -3112,7 +3231,9 @@ impl RowSpec {
             aria_selected: selected,
             aria_expanded: expandable.then_some(expanded_state),
             aria_label,
-            title: detail_summary.clone(),
+            title: file_content
+                .as_ref()
+                .map_or_else(|| detail_summary.clone(), |file| file.title.clone()),
             base_aria_label: base_aria_label.clone(),
         };
         let mut bundle_info = None;
@@ -3200,7 +3321,8 @@ impl RowSpec {
             content: row_content,
             aria,
             group_label,
-            open_json: open_json_envelope(row),
+            open_json: (!is_file).then(|| open_json_envelope(row)).flatten(),
+            open_diff: open_diff_envelope(row),
             placeholder: false,
         }
     }
@@ -3221,6 +3343,16 @@ impl RowSpec {
         }
         if self.identity.is_subop {
             classes.push_str(" row-subop");
+        }
+        if let Some(file) = &self.content.file {
+            classes.push_str(" row-file row-file-");
+            classes.push_str(file.status.class());
+            if file.binary {
+                classes.push_str(" row-file-binary");
+            }
+            if file.partial {
+                classes.push_str(" row-file-partial");
+            }
         }
         if let Some(role) = self.role_class {
             classes.push_str(" row-role-");
@@ -3279,6 +3411,91 @@ impl RowSpec {
     }
 }
 
+fn file_content(row: &Value) -> Option<FileContent> {
+    let change = row.get("file_change")?.as_object()?;
+    let path = change.get("path")?.as_str()?.trim().replace('\\', "/");
+    if path.is_empty() {
+        return None;
+    }
+    let (directory, name) = path.rsplit_once('/').map_or_else(
+        || (String::new(), path.clone()),
+        |(directory, name)| (directory.to_owned(), name.to_owned()),
+    );
+    let status = FileRowStatus::from_wire(
+        change
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+    );
+    let source = change
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let binary = change
+        .get("binary")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let partial = change
+        .get("partial")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let fidelity = if binary {
+        "binary"
+    } else if partial {
+        "recorded"
+    } else {
+        ""
+    }
+    .to_owned();
+    let old_path = change
+        .get("old_path")
+        .and_then(Value::as_str)
+        .filter(|old| !old.is_empty());
+    let mut title = format!("{} · {path}", status.label());
+    if let Some(old_path) = old_path {
+        title.push_str(" ← ");
+        title.push_str(old_path);
+    }
+    if binary {
+        title.push_str(" · binary content");
+    } else if partial {
+        title.push_str(" · recorded edit (partial file evidence)");
+    } else if source == "git" {
+        title.push_str(" · exact Git blobs");
+    }
+    let source_label = if source == "git" {
+        "Git commit"
+    } else if partial {
+        "recorded agent edit"
+    } else {
+        "agent edit"
+    };
+    let fidelity_label = if binary {
+        ", binary content"
+    } else if partial {
+        ", partial file evidence"
+    } else {
+        ""
+    };
+    let aria_label = format!(
+        "{} {path}, {source_label}{fidelity_label}; open diff",
+        status.label()
+    );
+    Some(FileContent {
+        path,
+        name,
+        directory,
+        status,
+        source,
+        fidelity,
+        binary,
+        partial,
+        title,
+        aria_label,
+    })
+}
+
 /// `subOpCount` details label (`N detail` / `N details`).
 fn sub_op_label(sub_op_count: usize) -> String {
     format!(
@@ -3308,6 +3525,22 @@ fn role_class_of(row: &Value) -> Option<&'static str> {
         .iter()
         .find(|candidate| **candidate == record_role)
         .copied()
+}
+
+/// `openDiff` identity envelope for a source-control-style file row.
+pub(crate) fn open_diff_envelope(row: &Value) -> Option<Value> {
+    let change = row.get("file_change")?.as_object()?;
+    if change
+        .get("path")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return None;
+    }
+    let mut envelope = serde_json::Map::new();
+    drop(envelope.insert("type".to_owned(), Value::String("openDiff".to_owned())));
+    drop(envelope.insert("change".to_owned(), Value::Object(change.clone())));
+    Some(Value::Object(envelope))
 }
 
 /// `openJson` identity envelope for eligible rows (exact production shape).
@@ -3546,6 +3779,21 @@ mod tests {
     }
 
     fn render_content_html(spec: &RowSpec) -> String {
+        if let Some(file) = &spec.content.file {
+            let mut content = format!(
+                "<span class=\"file-icon\" aria-hidden=\"true\"></span><span class=\"file-name\">{}</span>",
+                esc(&file.name)
+            );
+            if !file.directory.is_empty() {
+                write!(
+                    content,
+                    "<span class=\"file-directory\">{}</span>",
+                    esc(&file.directory)
+                )
+                .expect("writing file-row fixture HTML to a String cannot fail");
+            }
+            return content;
+        }
         if let Some(subop) = &spec.content.subop {
             let mut content = String::new();
             write!(
@@ -3625,6 +3873,14 @@ mod tests {
             if let Some(count) = bundle.member_count {
                 drop(attrs.insert("data-bundle-count".to_owned(), count.to_string()));
             }
+        }
+        if let Some(file) = &spec.content.file {
+            drop(attrs.insert("data-file-path".to_owned(), file.path.clone()));
+            drop(attrs.insert(
+                "data-file-status".to_owned(),
+                file.status.class().to_owned(),
+            ));
+            drop(attrs.insert("data-file-source".to_owned(), file.source.clone()));
         }
         attrs
     }
@@ -3721,6 +3977,33 @@ mod tests {
                 ("below", json!([0, 1])),
                 ("timestamp_ms", json!(now())),
                 ("author", json!("")),
+            ],
+        )
+    }
+
+    fn file_row() -> Value {
+        with(
+            &subop_row(),
+            &[
+                ("node_key", json!("node:1::file:0")),
+                ("op_id", json!("node:1::edit:0")),
+                ("summary", json!("crates/service/src/lib.rs")),
+                ("kind", json!("file")),
+                ("record_role", json!("artifact")),
+                ("activity_kind", json!("change")),
+                ("subop_kind", json!("edit")),
+                ("hierarchy_depth", json!(1)),
+                (
+                    "file_change",
+                    json!({
+                        "source": "agent",
+                        "path": "crates/service/src/lib.rs",
+                        "status": "modified",
+                        "partial": true,
+                        "binary": false,
+                        "op_id": "node:1::edit:0"
+                    }),
+                ),
             ],
         )
     }
@@ -5482,6 +5765,74 @@ mod tests {
         assert!(spec.tags.is_empty());
         assert!(spec.classification.label.is_empty());
         assert!(spec.content.top.is_none());
+    }
+
+    #[test]
+    fn file_rows_match_native_scm_content_and_open_diff_contract() {
+        let row = file_row();
+        let spec = RowSpec::from_value(&row, &context(ViewMode::Activity, 4, false));
+        assert_eq!(
+            spec.classes().split_whitespace().collect::<Vec<_>>(),
+            vec![
+                "row",
+                "row-dim",
+                "row-subop",
+                "row-file",
+                "row-file-modified",
+                "row-file-partial",
+                "row-role-artifact",
+                "row-has-badges",
+            ]
+        );
+        assert_eq!(spec.classification.label, "change");
+        assert_eq!(
+            spec.tags
+                .iter()
+                .map(|tag| (tag.classes.as_str(), tag.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("file-status file-status-modified", "M"),
+                ("file-fidelity", "recorded"),
+            ]
+        );
+        assert_eq!(
+            render_tags_html(&spec),
+            "<span class=\"file-status file-status-modified\" title=\"Modified\" aria-label=\"Modified\">M</span><span class=\"file-fidelity\" title=\"Recorded agent edit\" aria-label=\"Recorded agent edit\">recorded</span>"
+        );
+        assert_eq!(
+            render_content_html(&spec),
+            "<span class=\"file-icon\" aria-hidden=\"true\"></span><span class=\"file-name\">lib.rs</span><span class=\"file-directory\">crates/service/src</span>"
+        );
+        assert_eq!(
+            spec.aria.aria_label,
+            "Modified crates/service/src/lib.rs, recorded agent edit, partial file evidence; open diff"
+        );
+        assert!(spec.aria.title.contains("recorded edit"));
+        assert!(spec.open_json.is_none());
+        assert_eq!(
+            spec.open_diff
+                .as_ref()
+                .and_then(|envelope| envelope.get("type"))
+                .and_then(Value::as_str),
+            Some("openDiff")
+        );
+        assert_eq!(
+            spec.open_diff
+                .as_ref()
+                .and_then(|envelope| envelope.get("change"))
+                .and_then(|change| change.get("path"))
+                .and_then(Value::as_str),
+            Some("crates/service/src/lib.rs")
+        );
+        let attrs = render_attrs(&spec);
+        assert_eq!(
+            attrs.get("data-file-status").map(String::as_str),
+            Some("modified")
+        );
+        assert_eq!(
+            attrs.get("data-file-source").map(String::as_str),
+            Some("agent")
+        );
     }
 
     #[test]

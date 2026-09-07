@@ -2052,10 +2052,26 @@ mod shell {
                     js_value_text(&error)
                 ));
             }
+            if self.open_diff_for_abs(abs, step) {
+                return;
+            }
             let expandable = self.state.cache.get(&abs).is_some_and(rows::has_sub_ops);
             if expandable {
                 self.state.toggle_expanded_ui(abs, viewport, step);
             }
+        }
+
+        /// Post the exact advertised file-change identity for host-side native
+        /// diff materialization. Returns whether this row is a file row.
+        fn open_diff_for_abs(&self, abs: i64, step: &mut Step) -> bool {
+            let Some(row) = self.state.cache.get(&abs) else {
+                return false;
+            };
+            let Some(envelope) = rows::open_diff_envelope(row) else {
+                return false;
+            };
+            step.sends.push(Send::OpenDiff(envelope));
+            true
         }
 
         /// `openRawJson` — post the exact `openJson` identity envelope
@@ -2509,6 +2525,9 @@ mod shell {
             Send::OpenJson(body) => {
                 post_envelope(body);
             }
+            Send::OpenDiff(body) => {
+                post_envelope(body);
+            }
             Send::WebviewReady(instance_id) => {
                 post_envelope(&json!({ "type": "webviewReady", "instanceId": instance_id }));
             }
@@ -2829,12 +2848,14 @@ mod shell {
         });
     }
 
-    /// Double-click on a row: select and open its raw JSON (explicit gesture).
+    /// Double-click on an ordinary row opens raw JSON. File rows already open
+    /// their native diff on the first click and must never replace it with the
+    /// normalized operation JSON on the second click.
     fn on_row_dblclick(event: &web_sys::Event) {
         let Some(target) = event.target() else {
             return;
         };
-        if target_inside(&target, "button") {
+        if target_inside(&target, "button") || target_inside(&target, ".row-file") {
             return;
         }
         let Some(abs) = closest_row_abs(&target) else {
@@ -3041,7 +3062,9 @@ mod shell {
                         ));
                     }
                     if key == "Enter" {
-                        shell.open_json_for_abs(abs, &mut step);
+                        if !shell.open_diff_for_abs(abs, &mut step) {
+                            shell.open_json_for_abs(abs, &mut step);
+                        }
                     }
                     shell.apply_step_ops(&step);
                     TransitionOutput {
