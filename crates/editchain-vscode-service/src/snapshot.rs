@@ -97,7 +97,10 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 ///
 /// Revision 29 contracts copied provider occurrences by canonical payload while
 /// retaining only the surviving physical occurrence's incoming provider edge.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 29;
+///
+/// Revision 30 places disconnected graph components against exact per-lane
+/// geometry, allowing operation lanes to be reused inside Git-only gaps.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 30;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

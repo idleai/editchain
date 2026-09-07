@@ -532,6 +532,48 @@ fn overlapping_component_does_not_collide_with_active_fork_lane() {
     );
 }
 
+/// A wide/long connected component reserves only the rows where each of its
+/// operation lanes has real geometry. A disconnected session nested inside a
+/// Git-only gap may therefore reuse the first operation lane instead of being
+/// pushed beyond the connected component's maximum width.
+///
+/// The A session is linked to Git above the gap. The Git chain continues across
+/// Q on lane 0, but A's operation geometry ends at row 2. Q (rows 3..4) should
+/// use lane 1 even though the A+Git component itself spans rows 0..6.
+#[test]
+fn disconnected_session_reuses_operation_lane_inside_git_only_component_gap() {
+    let nodes = vec![
+        "A2".to_string(),
+        "A1".to_string(),
+        "G2".to_string(),
+        "Q2".to_string(),
+        "Q1".to_string(),
+        "G1".to_string(),
+        "G0".to_string(),
+    ];
+    let parents = parents_from(&[
+        ("A2", &["A1", "G2"]),
+        ("G2", &["G1"]),
+        ("Q2", &["Q1"]),
+        ("G1", &["G0"]),
+    ]);
+    let is_git = |key: &str| key.starts_with('G');
+    let layout = compute_graph_layout(&nodes, parents, &is_git);
+    let lane_of = |key: &str| layout.rows.iter().find(|row| row.node == key).unwrap().lane;
+
+    assert_eq!(lane_of("G2"), 0);
+    assert_eq!(lane_of("G1"), 0);
+    assert_eq!(lane_of("G0"), 0);
+    assert_eq!(lane_of("A2"), 1);
+    assert_eq!(lane_of("A1"), 1);
+    assert_eq!(
+        lane_of("Q2"),
+        1,
+        "the Git-only gap must release the first operation lane"
+    );
+    assert_eq!(lane_of("Q1"), 1);
+}
+
 /// Three sequential chains that each fully end before the next begins all
 /// reuse a single freed lane rather than each claiming a fresh column.
 ///

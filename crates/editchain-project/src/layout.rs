@@ -1161,18 +1161,13 @@ fn find_spare_lane_str(active: &[Option<String>]) -> usize {
 /// permanent ones. This keeps long histories readable when many sequential,
 /// non-overlapping sessions would otherwise each claim their own column.
 ///
-/// The approach treats each connected component of the graph as an *interval*
-/// over display rows (`nodes` are newest-first; row 0 is newest). Components are
-/// greedily colored by interval so overlapping components get distinct base
-/// colors while non-overlapping ones may share — this is exactly git-log-style
-/// column packing and yields minimal base columns for sequential sessions.
-/// Within each component the existing branch logic runs unchanged relative to
-/// that base color (`compute_lane_map` semantics), so merges still span extra
-/// lanes above their base column.
-///
-/// Because same-color components have disjoint row intervals by construction,
-/// their internal branch activity never temporally overlaps another same-color
-/// component's region — reused columns never carry crossing edges.
+/// Each component first receives its normal compact local layout. Those local
+/// lanes are then translated into the first global lane block where their exact
+/// rendered geometry fits. Occupancy is tracked as row intervals per lane (node
+/// dots, vertical runs, and transition rows), rather than reserving a component's
+/// full bounding rectangle. A disconnected session can therefore reuse an
+/// operation lane inside a long component's Git-only gap while active fork lanes
+/// remain protected.
 #[must_use]
 #[expect(
     clippy::indexing_slicing,
@@ -1267,7 +1262,8 @@ fn compute_lane_map_reuse(
         Vec::with_capacity(comp_start_end.len());
     let mut op_lane_rank_by_component: Vec<HashMap<usize, usize>> =
         Vec::with_capacity(comp_start_end.len());
-    let mut comp_op_width: Vec<usize> = Vec::with_capacity(comp_start_end.len());
+    let mut operation_usage_by_component: Vec<Vec<Vec<RowInterval>>> =
+        Vec::with_capacity(comp_start_end.len());
     for members in &members_by_component {
         let local = if members.is_empty() {
             HashMap::new()
@@ -1294,17 +1290,26 @@ fn compute_lane_map_reuse(
         for (rank, lane) in op_local_lanes.iter().copied().enumerate() {
             let _: Option<usize> = rank_by_lane.insert(lane, rank);
         }
-        comp_op_width.push(op_local_lanes.len());
+        let operation_usage = component_operation_lane_usage(
+            members,
+            ComponentLocalLayout {
+                lanes: &local,
+                operation_rank_by_lane: &rank_by_lane,
+            },
+            parents_of,
+            &row_of_key,
+            is_git,
+        );
+        operation_usage_by_component.push(operation_usage);
         op_lane_rank_by_component.push(rank_by_lane);
         local_lanes_by_component.push(local);
     }
 
-    // --- Phase 3: width-aware greedy interval coloring ----------------------------
-    // Components are inclusive display-row intervals. Allocate each active
-    // component's entire dense operation-lane block, releasing the block only
-    // after its last row. This permits exact reuse for sequential sessions while
-    // preventing a narrow component from landing on an active component's fork
-    // lane. Git itself is pinned separately to final lane 0.
+    // --- Phase 3: geometry-aware greedy lane-block placement ----------------------
+    // Preserve every component's compact local lane ordering, but reserve only
+    // the rows where each translated lane has real geometry. This lets a small
+    // disconnected component fit into a Git-only gap inside a much longer
+    // component without colliding with live forks or merge runs.
     let mut comp_ids_sorted_by_start: Vec<usize> = comp_start_end
         .iter()
         .enumerate()
@@ -1312,38 +1317,24 @@ fn compute_lane_map_reuse(
         .collect();
     comp_ids_sorted_by_start.sort_by_key(|&id| comp_start_end[id]);
 
-    // Active blocks are `(inclusive_end_row, base_lane, width)` in final lane
-    // space. Lane 0 is reserved exactly once when Git is present.
+    // Global operation-lane occupancy in final lane space. Lane 0 stays reserved
+    // for Git and is never considered as an operation-lane candidate.
     let minimum_op_lane = usize::from(git_present);
-    let mut active_blocks: Vec<(usize, usize, usize)> = Vec::new();
+    let mut global_lane_usage: Vec<Vec<RowInterval>> = vec![Vec::new(); minimum_op_lane];
     let mut comp_base_lane: Vec<usize> = vec![minimum_op_lane; comp_start_end.len()];
 
     for &cid in &comp_ids_sorted_by_start {
-        let start = comp_start_end[cid].0;
-        let end = comp_start_end[cid].1;
-        active_blocks.retain(|(active_end, _, _)| *active_end >= start);
-
-        let width = comp_op_width[cid];
-        if width == 0 {
+        let operation_usage = &operation_usage_by_component[cid];
+        if operation_usage.is_empty() {
             continue;
         }
 
-        let mut occupied: Vec<(usize, usize)> = active_blocks
-            .iter()
-            .map(|(_, base, active_width)| (*base, base.saturating_add(*active_width)))
-            .collect();
-        occupied.sort_unstable();
         let mut base = minimum_op_lane;
-        for (occupied_start, occupied_end) in occupied {
-            if base.saturating_add(width) <= occupied_start {
-                break;
-            }
-            if base < occupied_end {
-                base = occupied_end;
-            }
+        while !component_usage_fits(&global_lane_usage, operation_usage, base) {
+            base = base.saturating_add(1);
         }
         comp_base_lane[cid] = base;
-        active_blocks.push((end, base, width));
+        reserve_component_usage(&mut global_lane_usage, operation_usage, base);
     }
 
     // --- Phase 4: map compact local lanes into their allocated global blocks -------
@@ -1364,6 +1355,274 @@ fn compute_lane_map_reuse(
     }
 
     lane_of
+}
+
+type RowInterval = (usize, usize);
+
+#[derive(Debug, Clone, Copy)]
+struct LaneRun {
+    lane: usize,
+    rows: RowInterval,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LaneTransition {
+    row: usize,
+    first_lane: usize,
+    last_lane: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EdgeLaneUsage {
+    runs: [Option<LaneRun>; 2],
+    transition: Option<LaneTransition>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ComponentLocalLayout<'a> {
+    lanes: &'a HashMap<String, usize>,
+    operation_rank_by_lane: &'a HashMap<usize, usize>,
+}
+
+/// Describe the lanes and rows touched by one downward edge.
+fn edge_lane_usage(
+    child_row: usize,
+    child_lane: usize,
+    parent_row: usize,
+    parent_lane: usize,
+    parent_anchored: bool,
+) -> EdgeLaneUsage {
+    let transition = (child_lane != parent_lane).then(|| LaneTransition {
+        row: if parent_anchored {
+            parent_row
+        } else if parent_row == child_row.saturating_add(1) {
+            child_row
+        } else {
+            parent_row.saturating_sub(1)
+        },
+        first_lane: child_lane.min(parent_lane),
+        last_lane: child_lane.max(parent_lane),
+    });
+
+    if child_lane == parent_lane || parent_anchored {
+        return EdgeLaneUsage {
+            runs: [
+                Some(LaneRun {
+                    lane: child_lane,
+                    rows: (child_row, parent_row),
+                }),
+                None,
+            ],
+            transition,
+        };
+    }
+    if parent_row == child_row.saturating_add(1) {
+        return EdgeLaneUsage {
+            runs: [
+                Some(LaneRun {
+                    lane: parent_lane,
+                    rows: (child_row, parent_row),
+                }),
+                None,
+            ],
+            transition,
+        };
+    }
+
+    let jog_row = parent_row.saturating_sub(1);
+    EdgeLaneUsage {
+        runs: [
+            Some(LaneRun {
+                lane: child_lane,
+                rows: (child_row, jog_row),
+            }),
+            Some(LaneRun {
+                lane: parent_lane,
+                rows: (jog_row, parent_row),
+            }),
+        ],
+        transition,
+    }
+}
+
+/// Compute exact rendered row intervals for each dense operation-lane rank in
+/// one connected component. Git occupies canonical lane 0 while operation ranks
+/// start at 1, allowing Git↔operation transition rows to reserve every operation
+/// lane crossed inside the component's translated block.
+fn component_operation_lane_usage(
+    members: &[String],
+    local: ComponentLocalLayout<'_>,
+    parents_of: &impl Fn(&str) -> Vec<String>,
+    row_of_key: &HashMap<String, usize>,
+    is_git: &impl Fn(&str) -> bool,
+) -> Vec<Vec<RowInterval>> {
+    let mut usage: Vec<Vec<RowInterval>> = vec![Vec::new(); local.operation_rank_by_lane.len()];
+    let op_offset = usize::from(members.iter().any(|key| is_git(key)));
+    let child_counts = count_children(members, parents_of);
+
+    for key in members {
+        let Some(child_row) = row_of_key.get(key).copied() else {
+            continue;
+        };
+        let child_lane = canonical_component_lane(key, local, is_git, op_offset);
+        record_canonical_run(
+            &mut usage,
+            op_offset,
+            LaneRun {
+                lane: child_lane,
+                rows: (child_row, child_row),
+            },
+        );
+
+        for parent in parents_of(key) {
+            let Some(parent_row) = row_of_key.get(&parent).copied() else {
+                continue;
+            };
+            if parent_row <= child_row {
+                continue;
+            }
+            let parent_lane = canonical_component_lane(&parent, local, is_git, op_offset);
+            let parent_anchored = child_counts.get(&parent).copied().unwrap_or(0) > 1
+                || (!is_git(key) && is_git(&parent));
+            let edge = edge_lane_usage(
+                child_row,
+                child_lane,
+                parent_row,
+                parent_lane,
+                parent_anchored,
+            );
+            for run in edge.runs.into_iter().flatten() {
+                record_canonical_run(&mut usage, op_offset, run);
+            }
+            if let Some(transition) = edge.transition {
+                record_canonical_transition(&mut usage, op_offset, transition);
+            }
+        }
+    }
+
+    for intervals in &mut usage {
+        merge_row_intervals(intervals);
+    }
+    usage
+}
+
+fn canonical_component_lane(
+    key: &str,
+    local: ComponentLocalLayout<'_>,
+    is_git: &impl Fn(&str) -> bool,
+    op_offset: usize,
+) -> usize {
+    if is_git(key) {
+        return 0;
+    }
+    let local_lane = local.lanes.get(key).copied().unwrap_or(0);
+    op_offset.saturating_add(
+        local
+            .operation_rank_by_lane
+            .get(&local_lane)
+            .copied()
+            .unwrap_or(0),
+    )
+}
+
+fn record_canonical_run(usage: &mut [Vec<RowInterval>], op_offset: usize, run: LaneRun) {
+    let Some(rank) = run.lane.checked_sub(op_offset) else {
+        return;
+    };
+    if let Some(intervals) = usage.get_mut(rank) {
+        intervals.push(run.rows);
+    }
+}
+
+fn record_canonical_transition(
+    usage: &mut [Vec<RowInterval>],
+    op_offset: usize,
+    transition: LaneTransition,
+) {
+    for lane in transition.first_lane..=transition.last_lane {
+        record_canonical_run(
+            usage,
+            op_offset,
+            LaneRun {
+                lane,
+                rows: (transition.row, transition.row),
+            },
+        );
+    }
+}
+
+fn count_children(
+    members: &[String],
+    parents_of: &impl Fn(&str) -> Vec<String>,
+) -> HashMap<String, usize> {
+    let mut child_counts: HashMap<String, usize> = HashMap::new();
+    for key in members {
+        for parent in parents_of(key) {
+            let count = child_counts.entry(parent).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+    child_counts
+}
+
+fn component_usage_fits(
+    global_usage: &[Vec<RowInterval>],
+    component_usage: &[Vec<RowInterval>],
+    base: usize,
+) -> bool {
+    component_usage.iter().enumerate().all(|(rank, intervals)| {
+        global_usage
+            .get(base.saturating_add(rank))
+            .is_none_or(|occupied| !row_interval_lists_overlap(intervals, occupied))
+    })
+}
+
+fn reserve_component_usage(
+    global_usage: &mut Vec<Vec<RowInterval>>,
+    component_usage: &[Vec<RowInterval>],
+    base: usize,
+) {
+    let needed = base.saturating_add(component_usage.len());
+    global_usage.resize_with(needed, Vec::new);
+    for (rank, intervals) in component_usage.iter().enumerate() {
+        if let Some(occupied) = global_usage.get_mut(base.saturating_add(rank)) {
+            occupied.extend_from_slice(intervals);
+            merge_row_intervals(occupied);
+        }
+    }
+}
+
+fn row_interval_lists_overlap(left: &[RowInterval], right: &[RowInterval]) -> bool {
+    let mut left_index = 0usize;
+    let mut right_index = 0usize;
+    while let (Some(&(left_lo, left_hi)), Some(&(right_lo, right_hi))) =
+        (left.get(left_index), right.get(right_index))
+    {
+        if left_lo <= right_hi && right_lo <= left_hi {
+            return true;
+        }
+        if left_hi < right_lo {
+            left_index = left_index.saturating_add(1);
+        } else {
+            right_index = right_index.saturating_add(1);
+        }
+    }
+    false
+}
+
+fn merge_row_intervals(intervals: &mut Vec<RowInterval>) {
+    intervals.sort_unstable();
+    let mut merged: Vec<RowInterval> = Vec::with_capacity(intervals.len());
+    for &(lo, hi) in intervals.iter() {
+        if let Some(last) = merged.last_mut() {
+            if lo <= last.1.saturating_add(1) {
+                last.1 = last.1.max(hi);
+                continue;
+            }
+        }
+        merged.push((lo, hi));
+    }
+    *intervals = merged;
 }
 
 /// Merge lanes inside ONE component whose rendered row usage never overlaps.
