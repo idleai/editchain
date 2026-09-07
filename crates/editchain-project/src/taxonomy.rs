@@ -2,15 +2,16 @@
 //!
 //! These enums describe what a history row *is* ([`RecordRole`]), what kind of
 //! activity it represents ([`ActivityKind`]), how prominently it should render
-//! ([`Visibility`]), and how its underlying activity concluded ([`Outcome`]),
-//! without referencing any provider-specific raw format. The projection derives
-//! them deterministically from raw/normalized structure; the protocol
-//! serializes them as stable lowercase snake_case strings.
+//! ([`Visibility`]), how its underlying activity concluded ([`Outcome`]), and
+//! how its chain should be presented ([`ChainState`]), without referencing any
+//! provider-specific raw format. The projection derives them deterministically
+//! from raw/normalized structure; the protocol serializes them as stable
+//! lowercase snake_case strings.
 //!
-//! Forward compatibility: every enum carries an `Unknown` variant that is both
-//! the [`Default`] and the serde catch-all (`#[serde(other)]`), so a newer
-//! service emitting a value this client does not recognize, or an older
-//! payload missing the field entirely, never breaks deserialization.
+//! Forward compatibility: classification enums carry an `Unknown` variant that
+//! is both the [`Default`] and the serde catch-all (`#[serde(other)]`).
+//! [`ChainState`] instead treats missing or unrecognized values as `Active`, so
+//! presentation remains unchanged across protocol versions.
 
 use serde::{Deserialize, Serialize};
 
@@ -104,4 +105,31 @@ pub enum Outcome {
     #[default]
     #[serde(other)]
     Unknown,
+}
+
+/// Reusable presentation state for a node and the child-owned edge connecting
+/// it to its parent.
+///
+/// This is deliberately independent of the reason a row is de-emphasized.
+/// Import projection currently assigns [`Self::Muted`] to terminal cancelled
+/// requests; future projection rules can reuse the same treatment for other
+/// abandoned or superseded branches without teaching the renderer about each
+/// provider-specific cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainState {
+    /// De-emphasized history that remains present, connected, and interactive.
+    Muted,
+    /// Ordinary active history geometry and row presentation.
+    #[default]
+    #[serde(other)]
+    Active,
+}
+
+impl ChainState {
+    /// Whether this is the default active state.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        matches!(self, Self::Active)
+    }
 }

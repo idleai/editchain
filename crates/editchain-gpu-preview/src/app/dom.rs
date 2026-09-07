@@ -22,8 +22,8 @@
 //! - The wasm32-only [`HistoryDom`] shell: renders rows as real DOM/text
 //!   nodes (never application `innerHTML` strings), paints each `.graph-cell`
 //!   SVG from the pure items, and owns the scroll-window mutations and
-//!   Activity/Raw profile-control state. The obsolete fixed-viewport wgpu
-//!   canvas overlay is gone — the graph scrolls inside the row DOM.
+//!   fixed Activity presentation. The obsolete fixed-viewport wgpu canvas
+//!   overlay is gone — the graph scrolls inside the row DOM.
 //!
 //! The host message bridge and `HistoryAppState` ownership live in the wasm32
 //! shell in `crate::lib`; they drive this module's pure plans into the DOM.
@@ -33,7 +33,8 @@ use serde_json::{json, Value};
 
 use super::host::row as row_reader;
 use super::rows::{GraphData, RowSpec, ViewMode};
-use super::state::{HistoryAppState, Profile, ROW_H};
+use super::state::{HistoryAppState, ROW_H};
+use crate::ChainState;
 
 // ---------------------------------------------------------------------------
 // Pure graph/lane geometry (exact production constants)
@@ -165,6 +166,9 @@ pub(crate) const LANE_COLORS_HEX: [&str; 10] = [
     "#64dfdf", "#ff8fa3",
 ];
 
+/// Neutral graph color for a de-emphasized chain branch.
+pub(crate) const MUTED_GRAPH_HEX: &str = "#858585";
+
 /// The SVG namespace every per-row graph cell fragment lives in.
 #[cfg(target_arch = "wasm32")]
 pub(crate) const SVG_NS: &str = "http://www.w3.org/2000/svg";
@@ -250,6 +254,16 @@ pub(crate) fn lane_color_hex(lane: u32) -> &'static str {
         .get(usize::try_from(lane.checked_rem(len).unwrap_or(0)).unwrap_or(0))
         .copied()
         .unwrap_or_else(|| LANE_COLORS_HEX.first().copied().unwrap_or("#48f1dc"))
+}
+
+/// Resolve either the normal lane palette or the reusable muted treatment.
+#[must_use]
+fn graph_color_hex(lane: u32, muted: bool) -> &'static str {
+    if muted {
+        MUTED_GRAPH_HEX
+    } else {
+        lane_color_hex(lane)
+    }
 }
 
 /// The CSS-pixel x center of `lane` from the cell's pinned lane positions.
@@ -365,7 +379,7 @@ pub(crate) fn row_graph_items(graph: &GraphData, cell: &GraphCellSpec) -> Vec<Sv
             y1: 0.0,
             x2: x,
             y2: end_y,
-            stroke: lane_color_hex(*lane),
+            stroke: graph_color_hex(*lane, graph.muted_above.contains(lane)),
         });
     }
     for lane in &graph.below {
@@ -382,13 +396,22 @@ pub(crate) fn row_graph_items(graph: &GraphData, cell: &GraphCellSpec) -> Vec<Sv
             y1: start_y,
             x2: x,
             y2: cell.height,
-            stroke: lane_color_hex(*lane),
+            stroke: graph_color_hex(*lane, graph.muted_below.contains(lane)),
         });
     }
     for transition in rendered {
-        items.extend(transition_items(transition, cell, bundle.as_ref(), mid_y));
+        let muted = graph
+            .muted_transitions
+            .contains(&(transition.from_lane, transition.to_lane));
+        items.extend(transition_items(
+            transition,
+            cell,
+            bundle.as_ref(),
+            mid_y,
+            muted,
+        ));
     }
-    let colour = lane_color_hex(node_lane);
+    let colour = graph_color_hex(node_lane, graph.chain_state.is_muted());
     if let Some(glyph) = bundle {
         let x = lane_center_x(node_lane, cell);
         let cap_w = glyph.term_r * 2.0 + BUNDLE_MARGIN_CSS_PX * 2.0;
@@ -437,6 +460,7 @@ fn transition_items(
     cell: &GraphCellSpec,
     bundle: Option<&BundleGlyph>,
     mid_y: f64,
+    muted: bool,
 ) -> Vec<SvgItem> {
     let x1 = lane_center_x(transition.from_lane, cell);
     let x2 = lane_center_x(transition.to_lane, cell);
@@ -485,12 +509,12 @@ fn transition_items(
         SvgItem::Path {
             class: "graphTransition graphTransitionSrc",
             d: quadratic_path_d(start, src_control, seam),
-            stroke: lane_color_hex(transition.from_lane),
+            stroke: graph_color_hex(transition.from_lane, muted),
         },
         SvgItem::Path {
             class: "graphTransition graphTransitionDst",
             d: quadratic_path_d(seam, dst_control, end),
-            stroke: lane_color_hex(transition.to_lane),
+            stroke: graph_color_hex(transition.to_lane, muted),
         },
     ]
 }
@@ -760,10 +784,7 @@ pub(crate) fn window_rows_from(
     bottom: i64,
     initial_group: Option<&str>,
 ) -> Vec<WindowRow> {
-    let view = match state.profile {
-        Profile::Activity => ViewMode::Activity,
-        Profile::Raw => ViewMode::Raw,
-    };
+    let view = ViewMode::Activity;
     let mut rows = Vec::new();
     let mut last_group = initial_group;
     for vis in top..=bottom {
@@ -882,6 +903,14 @@ pub(crate) struct FrameRow {
     pub(crate) below: Vec<u32>,
     /// Directed child→parent transition pairs.
     pub(crate) transitions: Vec<(u32, u32)>,
+    /// Incoming lane halves owned exclusively by muted edges.
+    pub(crate) muted_above: Vec<u32>,
+    /// Outgoing lane halves owned exclusively by muted edges.
+    pub(crate) muted_below: Vec<u32>,
+    /// Cross-lane transitions owned exclusively by muted edges.
+    pub(crate) muted_transitions: Vec<(u32, u32)>,
+    /// Presentation state for the row's node glyph.
+    pub(crate) chain_state: ChainState,
     /// Whether this is an expanded sub-op row.
     pub(crate) is_subop: bool,
     /// Whether this row is a typed Activity bundle.
@@ -922,6 +951,10 @@ pub(crate) fn frame_rows(
             above: graph.above.clone(),
             below: graph.below.clone(),
             transitions: graph.transitions.clone(),
+            muted_above: graph.muted_above.clone(),
+            muted_below: graph.muted_below.clone(),
+            muted_transitions: graph.muted_transitions.clone(),
+            chain_state: graph.chain_state,
             is_subop: graph.is_subop,
             is_bundle: graph.is_bundle,
             expanded: graph.expanded,
@@ -953,6 +986,10 @@ pub(crate) fn build_frame_value(
                 "above": row.above,
                 "below": row.below,
                 "transitions": row.transitions,
+                "muted_above": row.muted_above,
+                "muted_below": row.muted_below,
+                "muted_transitions": row.muted_transitions,
+                "chain_state": row.chain_state.as_wire(),
                 "is_subop": row.is_subop,
                 "is_bundle": row.is_bundle,
                 "expanded": row.expanded,
@@ -1017,8 +1054,8 @@ mod web {
     use wasm_bindgen::prelude::*;
 
     use super::{
-        f64_round_to_i64, i64_to_f64, ColKey, FrameRow, GraphCellSpec, GraphData, Profile, RowSpec,
-        SvgItem, ROW_H, SVG_NS,
+        f64_round_to_i64, i64_to_f64, ColKey, FrameRow, GraphCellSpec, GraphData, RowSpec, SvgItem,
+        ROW_H, SVG_NS,
     };
     use crate::app::rows::{Disclosure, RowSummary};
     use crate::app::state::{FindCounterState, HistoryAppState, Viewport};
@@ -1053,10 +1090,10 @@ mod web {
             .map_err(|error| js_error(format!("element #{id} has the wrong type: {error:?}")))
     }
 
-    /// The Rust-owned DOM shell (Slice 3A): owns `#rows`, the accessible status
-    /// surface, and the profile buttons. All row content — including the
-    /// per-row SVG graph fragments — is built with DOM/text nodes; application
-    /// strings never pass through `innerHTML`.
+    /// The Rust-owned DOM shell (Slice 3A): owns `#rows` and the accessible
+    /// status surface. All row content — including the per-row SVG graph
+    /// fragments — is built with DOM/text nodes; application strings never
+    /// pass through `innerHTML`.
     pub(crate) struct HistoryDom {
         rows: web_sys::HtmlDivElement,
         status_live: web_sys::HtmlElement,
@@ -1065,8 +1102,6 @@ mod web {
         search_input: web_sys::HtmlInputElement,
         search_prev: web_sys::HtmlButtonElement,
         search_next: web_sys::HtmlButtonElement,
-        profile_activity: web_sys::HtmlButtonElement,
-        profile_raw: web_sys::HtmlButtonElement,
         /// Measured once: the smallest graph column width that renders the
         /// "Graph" columnheader label without clipping (`graphLabelMinW`).
         graph_label_min_width: Cell<Option<f64>>,
@@ -1098,9 +1133,6 @@ mod web {
             let search_input = require_element(&document, "search")?;
             let search_prev = require_element(&document, "search-prev")?;
             let search_next = require_element(&document, "search-next")?;
-            let profile_activity = require_element(&document, "profile-activity")?;
-            let profile_raw = require_element(&document, "profile-raw")?;
-
             Ok(HistoryDom {
                 rows,
                 status_live,
@@ -1109,8 +1141,6 @@ mod web {
                 search_input,
                 search_prev,
                 search_next,
-                profile_activity,
-                profile_raw,
                 graph_label_min_width: Cell::new(None),
             })
         }
@@ -1918,36 +1948,10 @@ mod web {
             graph_width_css >= self.graph_label_min_width()
         }
 
-        /// Toggle the segmented Activity/Raw profile buttons.
-        pub(crate) fn set_profile_ui(&self, profile: Profile) {
-            let activity_active = matches!(profile, Profile::Activity);
-            Self::set_segmented_button(&self.profile_activity, activity_active);
-            Self::set_segmented_button(&self.profile_raw, !activity_active);
-        }
-
-        /// The activity profile button element (event wiring).
-        pub(crate) fn profile_activity_button(&self) -> web_sys::HtmlButtonElement {
-            self.profile_activity.clone()
-        }
-
-        /// The raw profile button element (event wiring).
-        pub(crate) fn profile_raw_button(&self) -> web_sys::HtmlButtonElement {
-            self.profile_raw.clone()
-        }
-
         fn document() -> Result<web_sys::Document, JsValue> {
             web_sys::window()
                 .and_then(|window| window.document())
                 .ok_or_else(|| js_error("browser document is unavailable"))
-        }
-
-        fn set_segmented_button(button: &web_sys::HtmlButtonElement, active: bool) {
-            if active {
-                drop(button.class_list().add_1("active"));
-            } else {
-                drop(button.class_list().remove_1("active"));
-            }
-            drop(button.set_attribute("aria-pressed", if active { "true" } else { "false" }));
         }
     }
 
@@ -2632,6 +2636,10 @@ mod tests {
             above: Vec::new(),
             below: vec![0],
             transitions: vec![(0, 1)],
+            muted_above: Vec::new(),
+            muted_below: vec![0],
+            muted_transitions: vec![(0, 1)],
+            chain_state: ChainState::Muted,
             is_subop: false,
             is_bundle: false,
             expanded: false,
@@ -2666,6 +2674,9 @@ mod tests {
                 .and_then(|array| array.first()),
             Some(&Value::from(vec![0, 1]))
         );
+        assert_eq!(row.get("muted_below"), Some(&json!([0])));
+        assert_eq!(row.get("muted_transitions"), Some(&json!([[0, 1]])));
+        assert_eq!(row.get("chain_state"), Some(&Value::from("muted")));
     }
 
     #[test]
@@ -2875,6 +2886,77 @@ mod tests {
             assert!((*r - 4.0).abs() < 1e-9, "dot radius from the layout");
             assert_eq!(*fill, "#48f1dc");
         }
+    }
+
+    #[test]
+    fn muted_branch_uses_gray_only_for_its_node_and_owned_segments() {
+        let cell = graph_cell_spec(vec![14.76, 29.52], 4.0, 44.28);
+        let graph = GraphData {
+            muted_below: vec![1],
+            chain_state: ChainState::Muted,
+            ..graph_data(1, vec![0], vec![0, 1], Vec::new())
+        };
+        let items = row_graph_items(&graph, &cell);
+
+        assert!(items.iter().any(|item| matches!(
+            item,
+            SvgItem::Line {
+                x1,
+                stroke: MUTED_GRAPH_HEX,
+                ..
+            } if (*x1 - 29.52).abs() < 1e-9
+        )));
+        assert!(items.iter().any(|item| matches!(
+            item,
+            SvgItem::Circle {
+                fill: MUTED_GRAPH_HEX,
+                ..
+            }
+        )));
+        assert!(
+            items.iter().any(|item| matches!(
+                item,
+                SvgItem::Line {
+                    x1,
+                    stroke: "#48f1dc",
+                    ..
+                } if (*x1 - 14.76).abs() < 1e-9
+            )),
+            "the unrelated active lane keeps its palette color"
+        );
+    }
+
+    #[test]
+    fn muted_parent_row_transition_is_entirely_gray() {
+        let cell = graph_cell_spec(vec![14.76, 29.52], 4.0, 44.28);
+        let graph = GraphData {
+            muted_above: vec![1],
+            muted_transitions: vec![(1, 0)],
+            ..graph_data(0, vec![1], Vec::new(), vec![(1, 0)])
+        };
+        let items = row_graph_items(&graph, &cell);
+        let paths: Vec<&SvgItem> = items
+            .iter()
+            .filter(|item| matches!(item, SvgItem::Path { .. }))
+            .collect();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().all(|item| matches!(
+            item,
+            SvgItem::Path {
+                stroke: MUTED_GRAPH_HEX,
+                ..
+            }
+        )));
+        assert!(
+            items.iter().any(|item| matches!(
+                item,
+                SvgItem::Circle {
+                    fill: "#48f1dc",
+                    ..
+                }
+            )),
+            "the active parent dot remains colored"
+        );
     }
 
     #[test]

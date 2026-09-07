@@ -111,10 +111,8 @@
   function readActiveProfile() {
     if (typeof window.__editchainGetProfile === 'function') {
       const p = window.__editchainGetProfile();
-      if (p === 'activity' || p === 'raw') return p;
+      if (p === 'activity') return p;
     }
-    const raw = document.getElementById('profile-raw');
-    if (raw && raw.getAttribute('aria-pressed') === 'true') return 'raw';
     return 'activity';
   }
 
@@ -532,8 +530,7 @@
   }
 
   // Continuous scrollbar-like deep sweep with live + settled sampling. The
-  // caller (e2e/harness test) owns profile switching through the REAL control;
-  // this probe only verifies the active profile matches expectations.
+  // probe verifies the fixed Activity presentation alongside scroll geometry.
   async function probeScrollParity(options) {
     options = options || {};
     const rowsEl = document.getElementById('rows');
@@ -1455,39 +1452,24 @@
       });
     }
 
-    // Check 5k: the Activity/Raw segmented control exists, is labelled, and
-    // reflects the ACTIVE profile.
+    // Check 5k: the shipped view is fixed to Activity and exposes no profile
+    // controls or hidden profile mutation hook.
     const profileControl = document.getElementById('profile-control');
     const profileActivityBtn = document.getElementById('profile-activity');
     const profileRawBtn = document.getElementById('profile-raw');
     const activeProfile = typeof window.__editchainGetProfile === 'function'
       ? window.__editchainGetProfile()
       : 'activity';
-    if (profileControl && profileActivityBtn && profileRawBtn) {
-      const controlMatches =
-        activeProfile === 'activity'
-          ? profileActivityBtn.classList.contains('active') &&
-            profileActivityBtn.getAttribute('aria-pressed') === 'true' &&
-            profileRawBtn.getAttribute('aria-pressed') === 'false'
-          : profileRawBtn.classList.contains('active') &&
-            profileRawBtn.getAttribute('aria-pressed') === 'true' &&
-            profileActivityBtn.getAttribute('aria-pressed') === 'false';
-      const labeled = profileControl.getAttribute('aria-label');
-      checks.push({
-        name: 'PROFILE_CONTROL_PRESENT',
-        pass: !!labeled && controlMatches,
-        detail: controlMatches
-          ? 'segmented control present, labelled "' + labeled + '", profile=' + activeProfile
-          : 'control does not match profile ' + activeProfile + ' (aria-pressed activity=' +
-            profileActivityBtn.getAttribute('aria-pressed') + ')',
-      });
-    } else {
-      checks.push({
-        name: 'PROFILE_CONTROL_PRESENT',
-        pass: false,
-        detail: 'segmented control missing from #controls',
-      });
-    }
+    const profileFixed = activeProfile === 'activity' &&
+      !profileControl && !profileActivityBtn && !profileRawBtn &&
+      typeof window.__editchainSetProfile === 'undefined';
+    checks.push({
+      name: 'ACTIVITY_PROFILE_FIXED',
+      pass: profileFixed,
+      detail: 'profile=' + activeProfile + '; controls=' +
+        [profileControl, profileActivityBtn, profileRawBtn].filter(Boolean).length +
+        '; setter=' + typeof window.__editchainSetProfile,
+    });
 
     // Check 5l: rows expose keyboard/grid semantics — ONE labelled role=grid
     // wrapper owns the sticky header row (whose Pulse columnheaders live

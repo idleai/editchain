@@ -29,7 +29,7 @@ use editchain_core::{
 
 use crate::layout::{compute_graph_layout, compute_lane_assignment, GraphLayout, GraphRow};
 use crate::meta::NodeMeta;
-use crate::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility as RowVisibility};
+use crate::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility as RowVisibility};
 
 /// Provenance of a node's effective display time.
 ///
@@ -684,6 +684,12 @@ impl HistoryNode {
     #[must_use]
     pub fn outcome(&self) -> Outcome {
         self.record_meta().outcome
+    }
+
+    /// The reusable presentation state of this row and its child-owned edge.
+    #[must_use]
+    pub fn chain_state(&self) -> ChainState {
+        self.record_meta().chain_state
     }
 
     /// The owning turn identity of this row, if turn-scoped.
@@ -1607,8 +1613,12 @@ impl HistoryProjection {
         // Collect before mutating so attachment order remains the operation
         // input order, independent of HashMap iteration.
         let mut attachments: HashMap<OpId, Vec<Arc<Op>>> = HashMap::new();
+        let mut muted_anchors: std::collections::HashSet<OpId> = std::collections::HashSet::new();
         for node in result.iter() {
-            let HistoryNode::CollapsedImport { op, sub_ops, .. } = node else {
+            let HistoryNode::CollapsedImport {
+                op, sub_ops, meta, ..
+            } = node
+            else {
                 continue;
             };
             let Some(anchor) = destinations.get(&op.id).copied() else {
@@ -1619,6 +1629,9 @@ impl HistoryProjection {
                 .entry(anchor)
                 .or_default()
                 .extend(sub_ops.iter().cloned());
+            if meta.chain_state == ChainState::Muted {
+                let _: bool = muted_anchors.insert(anchor);
+            }
         }
         for (&metadata, &anchor) in &destinations {
             let _: Option<OpId> = representative.insert(metadata, anchor);
@@ -1628,11 +1641,17 @@ impl HistoryProjection {
                 .is_none_or(|op_id| !destinations.contains_key(&op_id))
         });
         for node in result.iter_mut() {
-            let HistoryNode::CollapsedImport { op, sub_ops, .. } = node else {
+            let HistoryNode::CollapsedImport {
+                op, sub_ops, meta, ..
+            } = node
+            else {
                 continue;
             };
             if let Some(mut folded) = attachments.remove(&op.id) {
                 sub_ops.append(&mut folded);
+            }
+            if muted_anchors.contains(&op.id) {
+                meta.chain_state = ChainState::Muted;
             }
         }
     }
@@ -2019,7 +2038,12 @@ impl HistoryProjection {
         };
         let is_git =
             |key: &str| -> bool { key_to_node.get(key).is_some_and(|n| n.git_oid().is_some()) };
-        layout::LayoutContext::new(&keys, &parents_of, &is_git)
+        let chain_state_of = |key: &str| -> ChainState {
+            key_to_node
+                .get(key)
+                .map_or(ChainState::Active, |node| node.chain_state())
+        };
+        layout::LayoutContext::new_with_chain_state(&keys, &parents_of, &is_git, &chain_state_of)
     }
 
     /// Build the string-keyed node list for layout.

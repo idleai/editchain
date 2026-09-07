@@ -51,18 +51,20 @@ use std::collections::VecDeque;
 use serde_json::Value;
 
 use super::host::row as wire;
+use crate::ChainState;
 
-/// The active view profile (`profile === 'activity'` in `main.js`).
+/// Row presentation mode. Production always constructs [`Self::Activity`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ViewMode {
-    /// Renders the additive work-unit/bundle/promotion semantic layer.
+    /// The shipped semantic work-unit/bundle/promotion presentation.
     Activity,
-    /// Renders the exact flat row with none of the semantic layer.
+    /// Retained only for pure compatibility tests of the former raw UI.
+    #[cfg(test)]
     Raw,
 }
 
 /// Shell-owned state a row build depends on (selection, find highlight,
-/// expansion, roving tabindex, group boundary, profile).
+/// expansion, roving tabindex, and group boundary).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RowContext {
     pub(crate) view: ViewMode,
@@ -139,6 +141,11 @@ pub(crate) struct GraphData {
     pub(crate) above: Vec<u32>,
     pub(crate) below: Vec<u32>,
     pub(crate) transitions: Vec<(u32, u32)>,
+    pub(crate) muted_above: Vec<u32>,
+    pub(crate) muted_below: Vec<u32>,
+    pub(crate) muted_transitions: Vec<(u32, u32)>,
+    /// Presentation state for this row's own dot/capsule.
+    pub(crate) chain_state: ChainState,
     pub(crate) is_subop: bool,
     pub(crate) is_bundle: bool,
     /// Whether this bundle's members are currently revealed.
@@ -2112,7 +2119,7 @@ impl ActivityKind {
             ActivityKind::Conversation => "agent",
             ActivityKind::Plan => "plan",
             ActivityKind::Explore => "explore",
-            ActivityKind::Execute => "run",
+            ActivityKind::Execute => "tooluse",
             ActivityKind::Change => "change",
             ActivityKind::Verify => "verify",
             ActivityKind::Diagnose => "diagnose",
@@ -2128,7 +2135,7 @@ impl ActivityKind {
 /// a non-empty label; placeholders intentionally retain the empty default.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct RowClassification {
-    /// Compact visual label (`run`, `git`, `agent`, `user`, or a wire fallback).
+    /// Compact visual label (`tooluse`, `git`, `agent`, `user`, or a wire fallback).
     pub(crate) label: String,
     /// Field used to resolve the label (`activity_kind`, `kind`, etc.).
     pub(crate) source: String,
@@ -3108,6 +3115,10 @@ impl RowSpec {
                 above: wire::above(row),
                 below: wire::below(row),
                 transitions: wire::transitions(row),
+                muted_above: wire::muted_above(row),
+                muted_below: wire::muted_below(row),
+                muted_transitions: wire::muted_transitions(row),
+                chain_state: ChainState::from_wire(&row_str(row, "chain_state")),
                 is_subop,
                 is_bundle,
                 expanded: expanded_state,
@@ -3169,6 +3180,9 @@ impl RowSpec {
         }
         if self.flags.human {
             classes.push_str(" row-human");
+        }
+        if self.graph.chain_state.is_muted() {
+            classes.push_str(" row-chain-muted");
         }
         if self.identity.is_subop {
             classes.push_str(" row-subop");
@@ -4166,7 +4180,7 @@ mod tests {
         assert!(nested_spec.classes().contains("row-expandable"));
         assert!(nested_spec.disclosure.is_some());
         let nested_activity = render_activity_html(&nested_spec);
-        assert!(nested_activity.starts_with("<span class=\"activity-label\">run</span>"));
+        assert!(nested_activity.starts_with("<span class=\"activity-label\">tooluse</span>"));
         assert!(nested_activity.contains("class=\"subop-chevron\""));
         let nested_html = render_tags_html(&nested_spec);
         assert!(!nested_html.contains("class=\"subop-chevron\""));
@@ -4217,7 +4231,7 @@ mod tests {
             ("conversation", "agent"),
             ("plan", "plan"),
             ("explore", "explore"),
-            ("execute", "run"),
+            ("execute", "tooluse"),
             ("change", "change"),
             ("verify", "verify"),
             ("diagnose", "diagnose"),
@@ -4916,6 +4930,29 @@ mod tests {
     }
 
     #[test]
+    fn muted_chain_state_drives_row_class_and_graph_masks() {
+        let row = with(
+            &base_row(),
+            &[
+                ("chain_state", json!("muted")),
+                ("muted_above", json!([1])),
+                ("muted_below", json!([1, 2])),
+                ("muted_transitions", json!([[1, 0]])),
+            ],
+        );
+        let spec = RowSpec::from_value(&row, &context(ViewMode::Activity, 3, false));
+        assert!(spec.classes().contains("row-chain-muted"));
+        assert_eq!(spec.graph.chain_state, ChainState::Muted);
+        assert_eq!(spec.graph.muted_above, vec![1]);
+        assert_eq!(spec.graph.muted_below, vec![1, 2]);
+        assert_eq!(spec.graph.muted_transitions, vec![(1, 0)]);
+
+        let active = RowSpec::from_value(&base_row(), &context(ViewMode::Activity, 3, false));
+        assert!(!active.classes().contains("row-chain-muted"));
+        assert_eq!(active.graph.chain_state, ChainState::Active);
+    }
+
+    #[test]
     fn selection_find_and_roving_tabindex_are_context_driven() {
         let mut ctx = context(ViewMode::Activity, 3, false);
         ctx.selected_key = Some("op:1".to_owned());
@@ -5253,7 +5290,7 @@ mod tests {
         );
         assert_eq!(spec.promoted, Some(PromotedKind::Failure));
         assert!(spec.classes().contains("row-promoted row-promoted-failure"));
-        assert_eq!(spec.classification.label, "run");
+        assert_eq!(spec.classification.label, "tooluse");
         assert_eq!(spec.tags.len(), 1);
         assert!(spec
             .tags

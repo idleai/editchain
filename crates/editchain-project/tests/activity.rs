@@ -28,7 +28,7 @@ use editchain_project::activity::{
 };
 use editchain_project::filter::ChainFilter;
 use editchain_project::meta::NodeMeta;
-use editchain_project::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility};
+use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use editchain_project::{EffectiveTime, HistoryNode, HistoryProjection, ProjectionOptions};
 
 /// The Activity view filter the service uses for its fixed default profile.
@@ -376,6 +376,7 @@ fn manual_collapsed(
             activity_kind,
             visibility: Visibility::Primary,
             outcome,
+            chain_state: ChainState::Active,
             turn_id: turn,
         },
     }

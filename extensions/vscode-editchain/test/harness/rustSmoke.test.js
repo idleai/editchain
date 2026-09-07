@@ -79,12 +79,16 @@ test('rust.html shares the scaffold but loads neither main.js nor the gpu-previe
   assert.match(RUST_HTML, /--vscode-editor-background/, 'ships the VS Code theme tokens');
   // Production scaffold IDs shared with the shipped webview scaffold.
   for (const id of [
-    'controls', 'profile-control', 'profile-activity', 'profile-raw',
-    'search-control', 'search', 'search-counter', 'search-prev', 'search-next',
+    'controls', 'search-control', 'search', 'search-counter', 'search-prev', 'search-next',
     'layout', 'rows', 'gpu-canvas-host', 'status-live',
   ]) {
     assert.ok(RUST_HTML.includes('id="' + id + '"'), 'rust.html missing production id #' + id);
   }
+  assert.doesNotMatch(
+    RUST_HTML,
+    /id="profile-control"|id="profile-activity"|id="profile-raw"/,
+    'the Activity-only extension has no profile toggle',
+  );
   assert.doesNotMatch(RUST_HTML, /id="gpu-toolbar"|id="gpu-backend"|id="gpu-status"/,
     'the harness has no visible renderer-status toolbar');
   // The Rust-only loader module is the page's bootstrap.
@@ -378,30 +382,22 @@ test('rust-only adapter boots in headless Chrome and renders (merge)', { skip: S
     assert.deepEqual(visibleChrome.clippedDates, [],
       'the default Date column renders complete timestamps without ellipsis');
 
-    // Activity -> Raw -> Activity through real button clicks; the correlated
-    // GetWindow filter must flip hide_trace with the profile.
-    assert.equal(state.profile, 'activity', 'boots in Activity');
+    // The shipped extension is permanently Activity: no profile controls or
+    // hidden mutating parity hook exist, and every window hides trace rows.
+    assert.equal(state.profile, 'activity', 'boots and remains in Activity');
     assert.ok(state.windowRequests.length >= 1, 'boot issued a GetWindow');
-    assert.equal(state.windowRequests.at(-1).hideTrace, true, 'Activity sends hide_trace=true');
-    await page.bringToFront();
-    await page.click('#profile-raw');
-    await driver.waitFor(page, () => window.__editchainGpuDebug.profile() === 'raw',
-      { timeout: driver.IDLE_TIMEOUT_MS });
-    await page.evaluate((ms) => window.__editchainGpuDebug.whenIdle(ms), driver.IDLE_TIMEOUT_MS);
-    state = await rustState(page);
-    assert.equal(state.profile, 'raw', 'profile switched to Raw');
-    assert.equal(state.windowRequests.at(-1).hideTrace, false, 'Raw sends hide_trace=false');
-    assert.equal(await page.$eval('#profile-raw', (el) => el.getAttribute('aria-pressed')), 'true',
-      'Raw button aria-pressed');
-    assert.equal(await page.$eval('#profile-activity', (el) => el.getAttribute('aria-pressed')), 'false',
-      'Activity button aria-pressed cleared');
-    await page.click('#profile-activity');
-    await driver.waitFor(page, () => window.__editchainGpuDebug.profile() === 'activity',
-      { timeout: driver.IDLE_TIMEOUT_MS });
-    await page.evaluate((ms) => window.__editchainGpuDebug.whenIdle(ms), driver.IDLE_TIMEOUT_MS);
-    state = await rustState(page);
-    assert.equal(state.profile, 'activity', 'profile switched back to Activity');
-    assert.equal(state.windowRequests.at(-1).hideTrace, true, 'Activity restores hide_trace=true');
+    assert.ok(state.windowRequests.every((request) => request.hideTrace === true),
+      'every Activity window sends hide_trace=true');
+    const profileSurface = await page.evaluate(() => ({
+      control: document.getElementById('profile-control'),
+      activity: document.getElementById('profile-activity'),
+      raw: document.getElementById('profile-raw'),
+      setterType: typeof window.__editchainSetProfile,
+    }));
+    assert.equal(profileSurface.control, null, 'profile control is absent');
+    assert.equal(profileSurface.activity, null, 'Activity button is absent');
+    assert.equal(profileSurface.raw, null, 'Raw button is absent');
+    assert.equal(profileSurface.setterType, 'undefined', 'no hidden profile setter remains');
 
     // laneXAll is invariant across graph column / available-width changes.
     const laneXBefore = state.laneXAll;

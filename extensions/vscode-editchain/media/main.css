@@ -41,39 +41,6 @@ body {
      not on the body, so the grid below spans edge-to-edge. */
   padding: 0 12px;
 }
-/* Activity/Raw profile segmented control. The active segment is filled like a
-   VS Code radio/segmented control; both remain keyboard-focusable buttons with
-   aria-pressed state. */
-.segmented {
-  display: inline-flex;
-  border: 1px solid var(--vscode-input-border, transparent);
-  border-radius: 2px;
-  overflow: hidden;
-  background: var(--vscode-input-background);
-}
-.segmented-btn {
-  font: inherit;
-  color: var(--vscode-input-foreground);
-  background: transparent;
-  border: 0;
-  padding: 4px 12px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-.segmented-btn + .segmented-btn {
-  border-left: 1px solid var(--vscode-input-border, transparent);
-}
-.segmented-btn.active {
-  background: var(--vscode-button-background, #0e639c);
-  color: var(--vscode-button-foreground, #ffffff);
-}
-.segmented-btn:hover:not(.active) {
-  background: var(--vscode-list-hoverBackground);
-}
-.segmented-btn:focus-visible {
-  outline: 1px solid var(--vscode-focusBorder);
-  outline-offset: -1px;
-}
 /* Screen-reader-only utility: the search label and the aria-live status region
    stay in the accessibility tree but never take visual space. */
 .visually-hidden {
@@ -320,7 +287,7 @@ body {
   width: 100%;
   height: 34px;
   box-sizing: border-box;
-  /* Raw per-row separator line between every history entry. */
+  /* Base per-row separator line between every history entry. */
   border-bottom: 1px solid var(--row-border);
   position: relative;
   align-items: center;
@@ -550,9 +517,8 @@ body {
   text-overflow: ellipsis;
 }
 
-/* Activity-profile work-unit layer (Raw renders none of this — the classes
-   below only exist on rows the renderer marks in the Activity view). A
-   work-unit start opens a unit section: a stronger top separator plus a
+/* Activity work-unit layer. A work-unit start opens a unit section: a
+   stronger top separator plus a
    compact two-line unit header INSIDE the fixed 34px row (unit title above the
    row's own summary — never the opaque unit id as primary text). Its count is
    a row tag. The unit's last row closes with a slightly stronger bottom
@@ -912,7 +878,7 @@ body.col-resizing .col-resize-handle::after {
  * -------------------------------------------------------------------------
  * Narrative-first and deliberately restrained: topology remains a continuous
  * reading rail, but prose and semantic grouping lead. Fixed row geometry,
- * keyboard semantics, and Activity/Raw behaviour remain unchanged.
+ * keyboard semantics, and the fixed Activity behavior remain unchanged.
  */
 
 :root {
@@ -954,39 +920,6 @@ body {
   padding: 6px 10px;
   background: var(--vscode-editor-background);
   border-bottom: 1px solid var(--ec-hairline-strong);
-}
-
-.segmented {
-  flex: none;
-  background: var(--ec-surface);
-  border-color: var(--ec-hairline);
-  border-radius: 4px;
-}
-
-.segmented-btn {
-  color: var(--ec-muted);
-  padding: 4px 10px;
-  font-size: 12px;
-  line-height: 17px;
-  letter-spacing: 0.005em;
-}
-
-.segmented-btn + .segmented-btn {
-  border-left-color: var(--ec-hairline);
-}
-
-.segmented-btn:hover:not(.active) {
-  color: var(--ec-ink);
-  background: var(--vscode-list-hoverBackground, var(--ec-surface-raised));
-}
-
-#profile-control .segmented-btn.active {
-  color: var(--vscode-button-foreground, var(--ec-ink-strong));
-  background: var(
-    --vscode-button-background,
-    var(--vscode-list-activeSelectionBackground, var(--vscode-focusBorder))
-  );
-  box-shadow: none;
 }
 
 #search-control {
@@ -1090,6 +1023,12 @@ body {
   border-bottom-color: var(--ec-hairline);
   user-select: none;
   transition: background-color 70ms ease;
+}
+
+/* Reusable de-emphasis for abandoned/superseded chain branches. The semantic
+   chain_state comes from projection; CSS owns only the visual treatment. */
+.row.row-chain-muted {
+  opacity: 0.5;
 }
 
 .row:focus-visible {
@@ -1592,11 +1531,6 @@ body {
   #controls {
     gap: 6px;
     padding: 6px 8px;
-  }
-
-  .segmented-btn {
-    padding-right: 8px;
-    padding-left: 8px;
   }
 
   #search-control {

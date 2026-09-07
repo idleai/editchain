@@ -1,8 +1,9 @@
 //! Deterministic semantic metadata for projected history rows.
 //!
 //! Derives the provider-neutral readability taxonomy (`RecordRole`,
-//! `ActivityKind`, `Visibility`, `Outcome`, and turn identity) from the raw
-//! and normalized structure of each row — never from display summaries.
+//! `ActivityKind`, `Visibility`, `Outcome`, `ChainState`, and turn identity)
+//! from the raw and normalized structure of each row — never from display
+//! summaries.
 //!
 //! The slice classifies four measured trace families so the fixed Activity
 //! view can hide them unconditionally:
@@ -41,7 +42,7 @@
 
 use std::collections::HashMap;
 
-use crate::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility};
+use crate::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use editchain_core::op::ImportOp;
 use editchain_core::payload::Payload;
 use editchain_core::{Op, OpKind, ScopeRef, SessionId, Tags, TurnId};
@@ -191,6 +192,8 @@ pub struct NodeMeta {
     pub visibility: Visibility,
     /// Concluded outcome; `Unknown` unless structured evidence exists.
     pub outcome: Outcome,
+    /// Reusable presentation state for this node and its child-owned edge.
+    pub chain_state: ChainState,
     /// Owning turn identity, when the row is turn-scoped.
     pub turn_id: Option<TurnId>,
 }
@@ -203,6 +206,7 @@ impl NodeMeta {
             activity_kind,
             visibility: Visibility::Trace,
             outcome: Outcome::Unknown,
+            chain_state: ChainState::Active,
             turn_id: None,
         }
     }
@@ -211,6 +215,12 @@ impl NodeMeta {
     /// a bundled turn-scoped child can carry the turn).
     const fn with_turn_id(mut self, turn_id: Option<TurnId>) -> Self {
         self.turn_id = turn_id;
+        self
+    }
+
+    /// Attach the presentation state derived from the raw provider envelope.
+    const fn with_chain_state(mut self, chain_state: ChainState) -> Self {
+        self.chain_state = chain_state;
         self
     }
 }
@@ -259,6 +269,7 @@ pub(crate) fn for_edit_operation(op: &Op) -> NodeMeta {
         activity_kind,
         visibility: Visibility::Primary,
         outcome,
+        chain_state: ChainState::Active,
         turn_id,
     }
 }
@@ -271,6 +282,7 @@ pub(crate) const fn for_git_commit() -> NodeMeta {
         activity_kind: ActivityKind::SourceControl,
         visibility: Visibility::Primary,
         outcome: Outcome::Unknown,
+        chain_state: ChainState::Active,
         turn_id: None,
     }
 }
@@ -293,12 +305,15 @@ pub(crate) fn for_collapsed_import(
         .and_then(|payload| payload.get("type"))
         .and_then(Value::as_str);
     let has_children = children.is_some_and(|cs| !cs.is_empty());
+    let chain_state = raw_chain_state(&value);
 
     // Current Claude imports tag these exact transport/sidecar schemas META.
     // Older immutable rows predate that tag, so classify them equivalently in
     // projection. Raw storage remains untouched and Raw view stays inspectable.
     if is_claude_bundle_metadata_value(&value) {
-        return NodeMeta::trace(RecordRole::Lifecycle, ActivityKind::System).with_turn_id(turn_id);
+        return NodeMeta::trace(RecordRole::Lifecycle, ActivityKind::System)
+            .with_turn_id(turn_id)
+            .with_chain_state(chain_state);
     }
 
     // Family 3: external-agent tool-call/result echo messages. The raw marker
@@ -307,7 +322,9 @@ pub(crate) fn for_collapsed_import(
     // discriminator, so rows carrying it classify as trace even when a
     // normalized Message child repeats the echoed text.
     if is_external_tool_echo(&value, record_type, event_type) {
-        return NodeMeta::trace(RecordRole::Echo, ActivityKind::External).with_turn_id(turn_id);
+        return NodeMeta::trace(RecordRole::Echo, ActivityKind::External)
+            .with_turn_id(turn_id)
+            .with_chain_state(chain_state);
     }
     // Family 4: exact cross-record duplicate of an `event_msg` `agent_message`
     // row in the same source chain at the same timestamp (one-to-one paired by
@@ -318,7 +335,9 @@ pub(crate) fn for_collapsed_import(
     // child) stays visible because the event row cannot canonically replace
     // that content — only a duplicated Message child is safe to demote.
     if duplicate_of_event_msg && !has_unique_content_child(children) {
-        return NodeMeta::trace(RecordRole::Echo, ActivityKind::External).with_turn_id(turn_id);
+        return NodeMeta::trace(RecordRole::Echo, ActivityKind::External)
+            .with_turn_id(turn_id)
+            .with_chain_state(chain_state);
     }
     // Unmarked inter-agent prose is classified from the envelope shape alone,
     // guarded so a genuine content child or raw payload narrative keeps the
@@ -327,7 +346,9 @@ pub(crate) fn for_collapsed_import(
         && !has_content_child(children)
         && !value.get("payload").is_some_and(json_has_user_content)
     {
-        return NodeMeta::trace(RecordRole::Echo, ActivityKind::External).with_turn_id(turn_id);
+        return NodeMeta::trace(RecordRole::Echo, ActivityKind::External)
+            .with_turn_id(turn_id)
+            .with_chain_state(chain_state);
     }
     // Family 1: raw/empty response_item envelopes. A response_item whose
     // payload carries narrative text or a unique projected action is never
@@ -336,15 +357,19 @@ pub(crate) fn for_collapsed_import(
         && !has_children
         && !value.get("payload").is_some_and(json_has_user_content)
     {
-        return NodeMeta::trace(RecordRole::Lifecycle, ActivityKind::System).with_turn_id(turn_id);
+        return NodeMeta::trace(RecordRole::Lifecycle, ActivityKind::System)
+            .with_turn_id(turn_id)
+            .with_chain_state(chain_state);
     }
     // Family 2: duplicate item_completed lifecycle envelopes. A completion
     // marker that produced no normalized children repeats lifecycle state
     // already folded onto the item's first-seen row.
     if is_item_completed(record_type, event_type) && !has_children {
-        return NodeMeta::trace(RecordRole::Lifecycle, ActivityKind::System).with_turn_id(turn_id);
+        return NodeMeta::trace(RecordRole::Lifecycle, ActivityKind::System)
+            .with_turn_id(turn_id)
+            .with_chain_state(chain_state);
     }
-    children_based_meta(children, Some(&value), turn_id)
+    children_based_meta(children, Some(&value), turn_id).with_chain_state(chain_state)
 }
 
 /// Classify a row from its normalized children, falling back to the raw
@@ -430,6 +455,7 @@ fn children_based_meta(
         activity_kind,
         visibility: Visibility::Primary,
         outcome,
+        chain_state: ChainState::Active,
         turn_id,
     }
 }
@@ -581,6 +607,115 @@ fn echo_text_truncated(value: &Value) -> bool {
 #[must_use]
 fn is_item_completed(record_type: Option<&str>, event_type: Option<&str>) -> bool {
     record_type == Some("item_completed") || event_type == Some("item_completed")
+}
+
+/// Derive the reusable presentation state from exact provider cancellation
+/// structure. The UI never inspects display summaries to recognize these rows.
+#[must_use]
+fn raw_chain_state(value: &Value) -> ChainState {
+    if is_codex_turn_aborted(value) || is_claude_interrupted_request(value) {
+        ChainState::Muted
+    } else {
+        ChainState::Active
+    }
+}
+
+/// Whether this is Codex's explicit turn-abort lifecycle record or its
+/// machine-generated companion message.
+#[must_use]
+fn is_codex_turn_aborted(value: &Value) -> bool {
+    let record_type = value.get("type").and_then(Value::as_str);
+    let payload = value.get("payload");
+    if record_type == Some("event_msg")
+        && payload
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            == Some("turn_aborted")
+    {
+        return true;
+    }
+
+    match (record_type, payload) {
+        (Some("event_msg"), Some(payload))
+            if payload.get("type").and_then(Value::as_str) == Some("user_message") =>
+        {
+            payload
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(is_cancelled_request_marker)
+        }
+        (Some("response_item"), Some(payload))
+            if payload.get("type").and_then(Value::as_str) == Some("message")
+                && matches!(
+                    payload.get("role").and_then(Value::as_str),
+                    Some("user" | "developer")
+                ) =>
+        {
+            payload
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|content| content.iter().any(is_codex_abort_content))
+        }
+        _ => false,
+    }
+}
+
+/// Whether this is Claude Code's explicit interrupted-request message.
+#[must_use]
+fn is_claude_interrupted_request(value: &Value) -> bool {
+    if value.get("type").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    if value
+        .get("interruptedMessageId")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+    {
+        return true;
+    }
+    if value
+        .get("text")
+        .and_then(Value::as_str)
+        .is_some_and(is_cancelled_request_marker)
+    {
+        return true;
+    }
+    value
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .is_some_and(|content| {
+            content.iter().any(|item| {
+                item.get("type").and_then(Value::as_str) == Some("text")
+                    && item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_cancelled_request_marker)
+            })
+        })
+}
+
+/// Whether one Codex message content block is a canonical abort marker.
+#[must_use]
+fn is_codex_abort_content(item: &Value) -> bool {
+    item.get("text")
+        .or_else(|| item.get("input_text"))
+        .or_else(|| item.get("output_text"))
+        .and_then(Value::as_str)
+        .is_some_and(|text| {
+            is_cancelled_request_marker(text)
+                || (text.trim().starts_with("<turn_aborted>")
+                    && text.trim().ends_with("</turn_aborted>"))
+        })
+}
+
+/// Exact machine-generated request-cancellation markers shared by current
+/// Claude Code and legacy Codex captures.
+#[must_use]
+fn is_cancelled_request_marker(text: &str) -> bool {
+    matches!(
+        text.trim(),
+        "[Request interrupted by user]" | "[Request interrupted by user for tool use]"
+    )
 }
 
 /// Whether a bundled metadata sub-op is a heavy per-turn state record
@@ -951,6 +1086,7 @@ fn raw_payload_meta(raw: Option<&Value>, turn_id: Option<TurnId>) -> NodeMeta {
         activity_kind,
         visibility: Visibility::Primary,
         outcome: Outcome::Unknown,
+        chain_state: ChainState::Active,
         turn_id,
     }
 }

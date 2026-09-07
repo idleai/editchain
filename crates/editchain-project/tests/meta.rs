@@ -15,7 +15,7 @@ use editchain_core::{
     ParentSet, Payload, ScopeRef, SessionId, Tags, ToolOp, ToolStage, TurnId,
 };
 use editchain_project::filter::ChainFilter;
-use editchain_project::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility};
+use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
 
 /// 2^53 + 1 — the first integer JavaScript's IEEE-754 doubles round.
@@ -164,6 +164,97 @@ fn response_item_with_message_child_is_primary_narrative() {
     assert_eq!(node.visibility(), Visibility::Primary);
     assert_eq!(node.record_role(), RecordRole::Narrative);
     assert_eq!(node.activity_kind(), ActivityKind::Conversation);
+}
+
+#[test]
+fn claude_interrupted_request_gets_muted_chain_state() {
+    let raw = raw_import(
+        1,
+        1,
+        1_000,
+        None,
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"interruptedMessageId":"msg_cancelled"}"#,
+    );
+    let message = child(2, 1, raw.id, message_op("[Request interrupted by user]"));
+    let node = sole_node(vec![raw, message]);
+    assert_eq!(node.chain_state(), ChainState::Muted);
+    assert_eq!(node.outcome(), Outcome::Unknown);
+}
+
+#[test]
+fn claude_tool_use_interruption_without_message_id_is_still_muted() {
+    // Claude does not consistently include `interruptedMessageId` on the
+    // tool-use variant, so the exact typed provider marker is the fallback.
+    let raw = raw_import(
+        1,
+        1,
+        1_000,
+        None,
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}}"#,
+    );
+    let message = child(
+        2,
+        1,
+        raw.id,
+        message_op("[Request interrupted by user for tool use]"),
+    );
+    assert_eq!(
+        sole_node(vec![raw, message]).chain_state(),
+        ChainState::Muted
+    );
+}
+
+#[test]
+fn codex_turn_abort_reason_folds_muted_state_onto_visible_anchor() {
+    let anchor = raw_import(
+        1,
+        1,
+        1_000,
+        None,
+        r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial response"}]}}"#,
+    );
+    let message = child(2, 1, anchor.id, message_op("partial response"));
+    let mut abort = raw_import(
+        1,
+        2,
+        2_000,
+        Some(anchor.id),
+        r#"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"model_error"}}"#,
+    );
+    abort.tags |= Tags::META;
+
+    let projection = HistoryProjection::from_ops_with(
+        vec![anchor, message, abort],
+        editchain_project::ProjectionOptions {
+            bundle_metadata: true,
+        },
+    );
+    let mut nodes = projection.nodes();
+    assert_eq!(nodes.len(), 1);
+    let node = nodes.remove(0);
+    assert_eq!(node.summary(), "partial response turn_aborted");
+    assert_eq!(node.chain_state(), ChainState::Muted);
+}
+
+#[test]
+fn interruption_like_prose_does_not_mutate_chain_state() {
+    let raw = raw_import(
+        1,
+        1,
+        1_000,
+        None,
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Please explain how request interruption works"}]}}"#,
+    );
+    let message = child(
+        2,
+        1,
+        raw.id,
+        message_op("Please explain how request interruption works"),
+    );
+    assert_eq!(
+        sole_node(vec![raw, message]).chain_state(),
+        ChainState::Active
+    );
 }
 
 #[test]

@@ -26,7 +26,7 @@ use editchain_core::{
 };
 use editchain_import::BlobSink as _;
 use editchain_project::filter::ChainFilter;
-use editchain_project::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility};
+use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
 use editchain_protocol::{
     ActivityBundleKind, HistoryRow, Request, RequestBody, ResponseBody, SearchFiltersDto,
@@ -2046,7 +2046,82 @@ fn service_path_truncated_echo_texts_never_pair_but_untruncated_exact_pairs_do()
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_thirty() {
+fn cancelled_branch_rows_ship_muted_node_and_child_owned_edge_geometry() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let chain_dir = tmp.path().join(".editchain");
+    let root = raw_import_op(
+        1,
+        1,
+        1_000,
+        None,
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"root"}]}}"#,
+    );
+    let active = raw_import_op(
+        2,
+        1,
+        3_000,
+        Some(root.id),
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"continue"}]}}"#,
+    );
+    let cancelled = raw_import_op(
+        3,
+        1,
+        2_000,
+        Some(root.id),
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"interruptedMessageId":"msg_cancelled"}"#,
+    );
+    let mut page = editchain_codec::page::Page::new(0);
+    for op in [&root, &active, &cancelled] {
+        page.add_record(0, editchain_codec::frame::encode_op(op).expect("encode"));
+    }
+    write_page(&chain_dir, &page);
+
+    let mut workspace =
+        Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("open workspace");
+    let raw = ChainFilter::new(
+        String::new(),
+        String::new(),
+        String::new(),
+        false,
+        true,
+        false,
+    );
+    let window = workspace.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 100,
+        hide_submodules: true,
+        filter: &raw,
+        include_layout: true,
+    });
+    let row = |id: OpId| {
+        window
+            .rows
+            .iter()
+            .find(|row| row.node_key == id.to_string())
+            .unwrap_or_else(|| panic!("missing row {id}"))
+    };
+    let active_row = row(active.id);
+    let cancelled_row = row(cancelled.id);
+    let root_row = row(root.id);
+
+    assert_eq!(active_row.chain_state, ChainState::Active);
+    assert_eq!(cancelled_row.chain_state, ChainState::Muted);
+    assert!(cancelled_row.muted_below.contains(&cancelled_row.lane));
+    assert!(root_row.muted_above.contains(&cancelled_row.lane));
+    assert!(
+        root_row
+            .muted_transitions
+            .contains(&(cancelled_row.lane, root_row.lane)),
+        "the gray edge owns its bend in the active parent row"
+    );
+    assert!(
+        !root_row.muted_above.contains(&active_row.lane),
+        "the active sibling and shared trunk retain their palette color"
+    );
+}
+
+#[test]
+fn prepared_snapshot_manifest_records_projection_revision_thirty_one() {
     // Stale snapshots from earlier projection revisions (pre-hide_trace,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
@@ -2072,7 +2147,7 @@ fn prepared_snapshot_manifest_records_projection_revision_thirty() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 30u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 31u64);
 }
 
 #[test]
@@ -2579,7 +2654,7 @@ fn activity_view_groups_repeated_plans_as_expandable_linear_updates() {
 }
 
 #[test]
-fn prepared_snapshot_serves_nested_activity_view_and_records_revision_thirty() {
+fn prepared_snapshot_serves_nested_activity_view_and_records_revision_thirty_one() {
     // The pregenerated render snapshot must serve the SAME bundled Activity
     // rows as the live projection (work-unit/promotion/bundling parity) and
     // record the bumped projection revision in its identity.
@@ -2635,7 +2710,7 @@ fn prepared_snapshot_serves_nested_activity_view_and_records_revision_thirty() {
         &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["identity"]["projection_revision"], 30u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 31u64);
 
     let mut cached =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");

@@ -12,8 +12,7 @@
 // full-workbench and/or webview screenshots for each materially distinct
 // state:
 //
-//   initial-activity     default Activity profile, top of chain, single pane
-//   raw-profile          Raw via the real segmented control (hide_trace)
+//   initial-activity     fixed Activity presentation, top of chain, single pane
 //   find-current/next    real find-in-chain session, match 1 and match 2
 //   row-selected         inline row selection (no secondary pane)
 //   keyboard-focus       roving keyboard focus after ArrowDown
@@ -428,47 +427,18 @@ describe('EditChain History visual state matrix', () => {
     expect(naturalGraphWidth).toBeTruthy();
     await capture('initial-activity', true, initial);
 
-    // --- raw-profile ----------------------------------------------------------
-    await browser.execute(() => {
-      const btn = document.getElementById('profile-raw');
-      if (!btn) throw new Error('no #profile-raw control');
-      btn.click();
+    const profileSurface = await browser.execute(() => ({
+      control: !!document.getElementById('profile-control'),
+      activity: !!document.getElementById('profile-activity'),
+      raw: !!document.getElementById('profile-raw'),
+      setter: typeof (window as any).__editchainSetProfile,
+    }));
+    expect(profileSurface).toEqual({
+      control: false,
+      activity: false,
+      raw: false,
+      setter: 'undefined',
     });
-    await browser.waitUntil(async () => browser.execute(() => {
-      const profileFn = (window as any).__editchainGetProfile;
-      const rowsEl = document.getElementById('rows');
-      return typeof profileFn === 'function' && profileFn() === 'raw' &&
-        !!rowsEl && rowsEl.scrollTop === 0 &&
-        document.querySelectorAll('#rows .row:not(.row-placeholder)').length > 0;
-    }), { timeout: ROW_TIMEOUT_MS, interval: 100 });
-    await waitIdle();
-    const raw = await readState();
-    expect(raw.profile).toBe('raw');
-    expect(raw.dataReady).toBe(true);
-    expect((raw.rowCount as number)).toBeGreaterThan(0);
-    expect(raw.scrollTop).toBe(0);
-    const rawPressed = await browser.execute(() =>
-      document.getElementById('profile-raw')?.getAttribute('aria-pressed'));
-    expect(rawPressed).toBe('true');
-    await capture('raw-profile', false, raw);
-
-    // Back to Activity through the real control (Raw -> Activity must reset
-    // the window and drop stale DOM before the new generation arrives).
-    await browser.execute(() => {
-      const btn = document.getElementById('profile-activity');
-      if (!btn) throw new Error('no #profile-activity control');
-      btn.click();
-    });
-    await browser.waitUntil(async () => browser.execute(() => {
-      const profileFn = (window as any).__editchainGetProfile;
-      const rowsEl = document.getElementById('rows');
-      return typeof profileFn === 'function' && profileFn() === 'activity' &&
-        !!rowsEl && rowsEl.scrollTop === 0 &&
-        document.querySelectorAll('#rows .row:not(.row-placeholder)').length > 0;
-    }), { timeout: ROW_TIMEOUT_MS, interval: 100 });
-    await waitIdle();
-    const activity = await readState();
-    expect(activity.profile).toBe('activity');
 
     // --- find-current / find-next ---------------------------------------------
     await browser.$('#search').setValue(QUERY);
@@ -503,7 +473,7 @@ describe('EditChain History visual state matrix', () => {
     } else {
       expect(findCurrent.counter).toMatch(/^1 of \d+\+?$/);
       expect(findCurrent.findKey).toBeTruthy();
-      expect(findCurrent.total).toBe(activity.total); // the chain is untouched
+      expect(findCurrent.total).toBe(initial.total); // the chain is untouched
       await capture('find-current', true, findCurrent);
       const findSurvived = await readFind();
       expect(findSurvived.counter).toBe(findCurrent.counter);

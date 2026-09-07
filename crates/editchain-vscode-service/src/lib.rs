@@ -31,7 +31,7 @@ use editchain_import::{hash_raw, FsBlobSink};
 use editchain_index::LexicalIndex;
 use editchain_project::activity::{ActivityRowAnnotation, WorkUnitMarker};
 use editchain_project::filter::ChainFilter;
-use editchain_project::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility};
+use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
 use editchain_protocol::{
     ChainFilterDto, ExpansionSpanDto, FindInHistoryMatch, FindInHistoryResponse,
@@ -165,6 +165,7 @@ struct ExpandedChildRow {
     activity_kind: ActivityKind,
     visibility: Visibility,
     outcome: Outcome,
+    chain_state: ChainState,
     turn_id: Option<String>,
     promoted: bool,
     activity_bundle: Option<editchain_protocol::ActivityBundleDto>,
@@ -719,7 +720,8 @@ fn compact_import_payload(
 /// bounded structural/content signal for tool-payload carriers
 /// (`arguments`/`input`/`parameters`), and structured outcome evidence
 /// (`status`, `exitCode`, `errorMessage` at `payload` or `payload.item`
-/// level, plus the canonical three-line Codex execution-result header). Codex
+/// level, plus the canonical three-line Codex execution-result header), and
+/// Claude's interrupted-request identity/marker. Codex
 /// token-usage records retain only their bounded identity strings and empty
 /// usage-object markers so legacy metadata classification can validate the
 /// complete schema without retaining accounting values.
@@ -761,6 +763,9 @@ fn compact_import_record(bytes: &[u8]) -> Vec<u8> {
         _ => None,
     } {
         let _: bool = copy_preview_string(&raw, 0, &mut compact, field);
+    } else if record_type == "user" {
+        let _: bool = copy_preview_string(&raw, 0, &mut compact, "interruptedMessageId");
+        let _: bool = copy_preview_string(&raw, 0, &mut compact, "text");
     } else if record_type == "assistant" {
         let message_start = raw.find("\"message\"").unwrap_or(0);
         let mut message = serde_json::Map::new();
@@ -895,6 +900,7 @@ fn compact_import_value(value: &serde_json::Value) -> serde_json::Value {
                 "text".to_string(),
                 serde_json::Value::String(first_nested_json_text(value).unwrap_or_default()),
             ));
+            let _: bool = copy_bounded_field(value, &mut compact, "interruptedMessageId");
         }
         "assistant" => {
             let mut message = serde_json::Map::new();
@@ -1841,21 +1847,47 @@ impl Workspace {
             let block_start = starts[abs_idx];
             // Per-row graph geometry from the layout context (absolute row index
             // into the full sorted list).
-            let (lane, above, below, transitions) = ctx.map_or_else(
-                || (0, Vec::new(), Vec::new(), Vec::new()),
-                |layout| {
-                    (
-                        layout.lanes.get(abs_idx).map_or(0, |row| row.lane),
-                        layout.row_above.get(abs_idx).cloned().unwrap_or_default(),
-                        layout.row_below.get(abs_idx).cloned().unwrap_or_default(),
-                        layout
-                            .row_transitions
-                            .get(abs_idx)
-                            .cloned()
-                            .unwrap_or_default(),
-                    )
-                },
-            );
+            let (lane, above, below, transitions, muted_above, muted_below, muted_transitions) =
+                ctx.map_or_else(
+                    || {
+                        (
+                            0,
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                        )
+                    },
+                    |layout| {
+                        (
+                            layout.lanes.get(abs_idx).map_or(0, |row| row.lane),
+                            layout.row_above.get(abs_idx).cloned().unwrap_or_default(),
+                            layout.row_below.get(abs_idx).cloned().unwrap_or_default(),
+                            layout
+                                .row_transitions
+                                .get(abs_idx)
+                                .cloned()
+                                .unwrap_or_default(),
+                            layout
+                                .row_muted_above
+                                .get(abs_idx)
+                                .cloned()
+                                .unwrap_or_default(),
+                            layout
+                                .row_muted_below
+                                .get(abs_idx)
+                                .cloned()
+                                .unwrap_or_default(),
+                            layout
+                                .row_muted_transitions
+                                .get(abs_idx)
+                                .cloned()
+                                .unwrap_or_default(),
+                        )
+                    },
+                );
             let parent_row = block_start;
             let group = node.group();
             let session_meta = self.session_metadata.get(&group).cloned();
@@ -1910,6 +1942,9 @@ impl Workspace {
                     above,
                     below,
                     transitions,
+                    muted_above,
+                    muted_below,
+                    muted_transitions,
                     sub_ops: expansion.direct.clone(),
                     is_subop: false,
                     hierarchy_depth: 0,
@@ -1919,6 +1954,7 @@ impl Workspace {
                     activity_kind: node.activity_kind(),
                     visibility: node.visibility(),
                     outcome: node.outcome(),
+                    chain_state: node.chain_state(),
                     turn_id: node.turn_id().map(|id| id.0.to_string()),
                     session_meta: session_meta.clone(),
                     work_unit: snapshot
@@ -1947,6 +1983,13 @@ impl Workspace {
                 .and_then(|layout| layout.row_above.get(abs_idx + 1))
                 .map_or(&[][..], Vec::as_slice);
             let region_lanes = intersect_sorted(below_parent, above_next);
+            let muted_below_parent = ctx
+                .and_then(|layout| layout.row_muted_below.get(abs_idx))
+                .map_or(&[][..], Vec::as_slice);
+            let muted_above_next = ctx
+                .and_then(|layout| layout.row_muted_above.get(abs_idx + 1))
+                .map_or(&[][..], Vec::as_slice);
+            let muted_region_lanes = intersect_sorted(muted_below_parent, muted_above_next);
             for (i, child) in expansion.rows.iter().enumerate() {
                 let slot = block_start + 1 + i;
                 if slot < offset_usize || slot >= end_usize {
@@ -1976,6 +2019,9 @@ impl Workspace {
                     above: region_lanes.clone(),
                     below: region_lanes.clone(),
                     transitions: Vec::new(),
+                    muted_above: muted_region_lanes.clone(),
+                    muted_below: muted_region_lanes.clone(),
+                    muted_transitions: Vec::new(),
                     sub_ops: child.direct.clone(),
                     is_subop: true,
                     hierarchy_depth: child.depth,
@@ -1985,6 +2031,7 @@ impl Workspace {
                     activity_kind: child.activity_kind,
                     visibility: child.visibility,
                     outcome: child.outcome,
+                    chain_state: child.chain_state,
                     turn_id: child.turn_id.clone(),
                     session_meta: session_meta.clone(),
                     work_unit: None,
@@ -3071,6 +3118,7 @@ fn node_expansion(node: &editchain_project::HistoryNode) -> NodeExpansion {
             activity_kind: member.activity_kind(),
             visibility: member.visibility(),
             outcome: member.outcome(),
+            chain_state: member.chain_state(),
             turn_id: member.turn_id().map(|id| id.0.to_string()),
             promoted: matches!(
                 member.outcome(),
@@ -3132,6 +3180,7 @@ fn flat_op_child_rows(
                 activity_kind,
                 visibility: Visibility::Supporting,
                 outcome: Outcome::Unknown,
+                chain_state: node.chain_state(),
                 turn_id: node.turn_id().map(|id| id.0.to_string()),
                 promoted: false,
                 activity_bundle: None,
@@ -5567,6 +5616,25 @@ mod tests {
         );
         let prefix: serde_json::Value = serde_json::from_slice(&prefix).unwrap();
         assert_eq!(prefix["message"]["id"], "msg-response-1");
+    }
+
+    #[test]
+    fn compact_import_record_preserves_claude_interruption_evidence() {
+        let complete = compact_import_record(
+            br#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"interruptedMessageId":"msg-cancelled"}"#,
+        );
+        let complete: serde_json::Value = serde_json::from_slice(&complete).unwrap();
+        assert_eq!(complete["type"], "user");
+        assert_eq!(complete["text"], "[Request interrupted by user]");
+        assert_eq!(complete["interruptedMessageId"], "msg-cancelled");
+
+        // An unclosed blob preview can still recover the exact typed marker
+        // even when the trailing interruption id has not arrived yet.
+        let prefix = compact_import_record(
+            br#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"},{"type":"tool_result","content":"unterminated"#,
+        );
+        let prefix: serde_json::Value = serde_json::from_slice(&prefix).unwrap();
+        assert_eq!(prefix["text"], "[Request interrupted by user for tool use]");
     }
 
     #[test]

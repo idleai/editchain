@@ -21,6 +21,8 @@ use std::collections::{HashMap, HashSet};
 
 use editchain_core::OpId;
 
+use crate::taxonomy::ChainState;
+
 /// A single row in the [`compute_lanes`] layout.
 #[derive(Debug, Clone)]
 pub struct LaneRow {
@@ -272,6 +274,146 @@ pub struct LayoutContext {
     /// live in the parent row; merge-only bends remain at the child or final
     /// pre-parent row. Also static and shipped per row.
     pub row_transitions: Vec<Vec<(usize, usize)>>,
+    /// Subset of [`Self::row_above`] owned exclusively by muted child edges.
+    /// Active geometry wins when active and muted edges overlap a shared lane.
+    pub row_muted_above: Vec<Vec<usize>>,
+    /// Subset of [`Self::row_below`] owned exclusively by muted child edges.
+    pub row_muted_below: Vec<Vec<usize>>,
+    /// Subset of [`Self::row_transitions`] owned exclusively by muted child
+    /// edges.
+    pub row_muted_transitions: Vec<Vec<(usize, usize)>>,
+}
+
+/// Per-row graph fragments produced by a selected subset of child→parent
+/// edges. The complete layout and presentation-state masks use the same path
+/// builder so their geometry cannot drift apart.
+#[derive(Debug)]
+struct RowGeometry {
+    above: Vec<Vec<usize>>,
+    below: Vec<Vec<usize>>,
+    transitions: Vec<Vec<(usize, usize)>>,
+}
+
+impl RowGeometry {
+    fn new(row_count: usize) -> Self {
+        Self {
+            above: vec![Vec::new(); row_count],
+            below: vec![Vec::new(); row_count],
+            transitions: vec![Vec::new(); row_count],
+        }
+    }
+
+    fn add_above(&mut self, row: usize, lane: usize) {
+        if let Some(above) = self.above.get_mut(row) {
+            add_unique(above, lane);
+        }
+    }
+
+    fn add_below(&mut self, row: usize, lane: usize) {
+        if let Some(below) = self.below.get_mut(row) {
+            add_unique(below, lane);
+        }
+    }
+
+    fn add_transition(&mut self, row: usize, transition: (usize, usize)) {
+        if let Some(transitions) = self.transitions.get_mut(row) {
+            add_unique(transitions, transition);
+        }
+    }
+
+    fn sort_lanes(&mut self) {
+        for list in &mut self.above {
+            list.sort_unstable();
+        }
+        for list in &mut self.below {
+            list.sort_unstable();
+        }
+    }
+
+    /// Remove fragments also owned by active edges. This gives active geometry
+    /// precedence where multiple child edges overlap a shared trunk.
+    fn without(mut self, active: &Self) -> Self {
+        for (muted, active) in self.above.iter_mut().zip(&active.above) {
+            muted.retain(|lane| !active.contains(lane));
+        }
+        for (muted, active) in self.below.iter_mut().zip(&active.below) {
+            muted.retain(|lane| !active.contains(lane));
+        }
+        for (muted, active) in self.transitions.iter_mut().zip(&active.transitions) {
+            muted.retain(|transition| !active.contains(transition));
+        }
+        self
+    }
+}
+
+/// Inputs shared by complete, active, and muted row-geometry passes.
+struct GeometryContext<'a> {
+    nodes: &'a [String],
+    row_of: &'a HashMap<String, usize>,
+    lane_at: &'a HashMap<String, usize>,
+    parents: &'a HashMap<String, Vec<String>>,
+    parent_anchored_edges: &'a HashSet<(String, String)>,
+}
+
+impl GeometryContext<'_> {
+    /// Compute ABOVE/BELOW lane halves and transitions for the edges selected
+    /// by `include_edge`.
+    #[must_use]
+    fn compute(&self, include_edge: &impl Fn(&str, &str) -> bool) -> RowGeometry {
+        let mut geometry = RowGeometry::new(self.nodes.len());
+        for (row, key) in self.nodes.iter().enumerate() {
+            let my_lane = *self.lane_at.get(key).unwrap_or(&0);
+            let node_parents = self.parents.get(key).map_or(&[][..], Vec::as_slice);
+            for parent in node_parents {
+                if !include_edge(key, parent) {
+                    continue;
+                }
+                let Some(parent_row) = self.row_of.get(parent).copied() else {
+                    continue;
+                };
+                if parent_row <= row {
+                    continue;
+                }
+                let parent_lane = *self.lane_at.get(parent).unwrap_or(&my_lane);
+                let parent_anchored = self
+                    .parent_anchored_edges
+                    .contains(&(key.clone(), parent.clone()));
+                if my_lane == parent_lane {
+                    geometry.add_below(row, my_lane);
+                    geometry.add_above(parent_row, my_lane);
+                    for intermediate in row.saturating_add(1)..parent_row {
+                        geometry.add_above(intermediate, my_lane);
+                        geometry.add_below(intermediate, my_lane);
+                    }
+                } else if parent_anchored {
+                    geometry.add_below(row, my_lane);
+                    for intermediate in row.saturating_add(1)..parent_row {
+                        geometry.add_above(intermediate, my_lane);
+                        geometry.add_below(intermediate, my_lane);
+                    }
+                    geometry.add_above(parent_row, my_lane);
+                    geometry.add_transition(parent_row, (my_lane, parent_lane));
+                } else if parent_row == row.saturating_add(1) {
+                    geometry.add_transition(row, (my_lane, parent_lane));
+                    geometry.add_below(row, parent_lane);
+                    geometry.add_above(parent_row, parent_lane);
+                } else {
+                    geometry.add_below(row, my_lane);
+                    for intermediate in row.saturating_add(1)..parent_row.saturating_sub(1) {
+                        geometry.add_above(intermediate, my_lane);
+                        geometry.add_below(intermediate, my_lane);
+                    }
+                    let jog_row = parent_row.saturating_sub(1);
+                    geometry.add_above(jog_row, my_lane);
+                    geometry.add_transition(jog_row, (my_lane, parent_lane));
+                    geometry.add_below(jog_row, parent_lane);
+                    geometry.add_above(parent_row, parent_lane);
+                }
+            }
+        }
+        geometry.sort_lanes();
+        geometry
+    }
 }
 
 impl LayoutContext {
@@ -281,6 +423,22 @@ impl LayoutContext {
         nodes: &[String],
         parents_of: &impl Fn(&str) -> Vec<String>,
         is_git: &impl Fn(&str) -> bool,
+    ) -> Self {
+        Self::new_with_chain_state(nodes, parents_of, is_git, &|_| ChainState::Active)
+    }
+
+    /// Build a context and derive graph-segment presentation from each child
+    /// node's chain state.
+    ///
+    /// Edges are child-owned: muting a terminal node mutes its complete path to
+    /// the parent, including a parent-row fork bend. Shared geometry remains
+    /// active whenever any active edge also occupies that segment.
+    #[must_use]
+    pub fn new_with_chain_state(
+        nodes: &[String],
+        parents_of: &impl Fn(&str) -> Vec<String>,
+        is_git: &impl Fn(&str) -> bool,
+        chain_state_of: &impl Fn(&str) -> ChainState,
     ) -> Self {
         // Compute lanes from a TOPOLOGICAL ordering of the nodes (parents before
         // children), so each causal chain gets contiguous lanes regardless of the
@@ -433,130 +591,33 @@ impl LayoutContext {
             *list = merged;
         }
 
-        // Compute per-row ABOVE/BELOW lanes and cross-lane TRANSITIONS by walking
-        // every edge's geometry. An edge from (child_row, child_lane) to
-        // (parent_row, parent_lane):
-        //   - same lane: vertical on child_lane from child down to parent;
-        //   - parent-anchored fork/session edge: vertical on child_lane into the
-        //     parent row, then a transition ending at the parent dot;
-        //   - merge-only different-lane edge: transition at the child row when
-        //     adjacent, otherwise at parent_row-1 with a short destination run.
-        // Splitting into above/below halves means a TIP (newest node, no children)
-        // draws no line above its dot and a ROOT (no parents) draws no line below —
-        // no dangling segments. All static, shipped per row.
-        let mut row_above: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
-        let mut row_below: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
-        let mut row_transitions: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nodes.len()];
-        for (row, key) in nodes.iter().enumerate() {
-            let my_lane = *lane_at.get(key).unwrap_or(&0);
-            let node_parents = parents.get(key).map_or(&[][..], Vec::as_slice);
-            for parent in node_parents {
-                let Some(parent_row) = row_of.get(parent).copied() else {
-                    continue;
-                };
-                if parent_row <= row {
-                    continue; // parent above or same row — not a downward edge
-                }
-                let p_lane = *lane_at.get(parent).unwrap_or(&my_lane);
-                let parent_anchored =
-                    parent_anchored_edges.contains(&(key.clone(), parent.clone()));
-                if my_lane == p_lane {
-                    // Same-lane edge: vertical on my_lane from `row` down to
-                    // `parent_row`. Bottom half at the child's own row, top half at
-                    // the parent's row, both halves in between.
-                    if let Some(below) = row_below.get_mut(row) {
-                        add_unique(below, my_lane);
-                    }
-                    if let Some(above) = row_above.get_mut(parent_row) {
-                        add_unique(above, my_lane);
-                    }
-                    for r in (row.saturating_add(1))..parent_row {
-                        if let Some(above) = row_above.get_mut(r) {
-                            add_unique(above, my_lane);
-                        }
-                        if let Some(below) = row_below.get_mut(r) {
-                            add_unique(below, my_lane);
-                        }
-                    }
-                } else if parent_anchored {
-                    // A true fork (or exact operation→Git session anchor)
-                    // bends in the PARENT row. Run the child lane down through
-                    // every preceding row, enter the parent row from above,
-                    // then terminate the transition at the parent's dot. Any
-                    // independent edge leaving that parent contributes its own
-                    // bottom half on the parent lane.
-                    if let Some(below) = row_below.get_mut(row) {
-                        add_unique(below, my_lane);
-                    }
-                    for r in (row.saturating_add(1))..parent_row {
-                        if let Some(above) = row_above.get_mut(r) {
-                            add_unique(above, my_lane);
-                        }
-                        if let Some(below) = row_below.get_mut(r) {
-                            add_unique(below, my_lane);
-                        }
-                    }
-                    if let Some(above) = row_above.get_mut(parent_row) {
-                        add_unique(above, my_lane);
-                    }
-                    if let Some(transitions) = row_transitions.get_mut(parent_row) {
-                        add_unique(transitions, (my_lane, p_lane));
-                    }
-                } else if parent_row == row.saturating_add(1) {
-                    // Adjacent cross-lane edge: the jog originates at the child
-                    // node's own midpoint, so the edge has NO source-lane run.
-                    // Adding a source-lane top/bottom half at the child row
-                    // would create a dangling boundary stub; the transition
-                    // starts at the child node itself instead.
-                    // Emit the transition at the child row plus the two
-                    // destination-lane halves only; any source-lane halves at
-                    // this row come from other edges.
-                    if let Some(transitions) = row_transitions.get_mut(row) {
-                        add_unique(transitions, (my_lane, p_lane));
-                    }
-                    if let Some(below) = row_below.get_mut(row) {
-                        add_unique(below, p_lane);
-                    }
-                    if let Some(above) = row_above.get_mut(parent_row) {
-                        add_unique(above, p_lane);
-                    }
-                } else {
-                    // Non-adjacent different-lane edge: vertical on my_lane down
-                    // to parent_row-1, jog to p_lane at parent_row-1, then
-                    // vertical on p_lane down to parent_row.
-                    if let Some(below) = row_below.get_mut(row) {
-                        add_unique(below, my_lane);
-                    }
-                    for r in (row.saturating_add(1))..parent_row.saturating_sub(1) {
-                        if let Some(above) = row_above.get_mut(r) {
-                            add_unique(above, my_lane);
-                        }
-                        if let Some(below) = row_below.get_mut(r) {
-                            add_unique(below, my_lane);
-                        }
-                    }
-                    let jog_row = parent_row.saturating_sub(1);
-                    if let Some(above) = row_above.get_mut(jog_row) {
-                        add_unique(above, my_lane);
-                    }
-                    if let Some(transitions) = row_transitions.get_mut(jog_row) {
-                        add_unique(transitions, (my_lane, p_lane));
-                    }
-                    if let Some(below) = row_below.get_mut(jog_row) {
-                        add_unique(below, p_lane);
-                    }
-                    if let Some(above) = row_above.get_mut(parent_row) {
-                        add_unique(above, p_lane);
-                    }
-                }
-            }
-        }
-        for list in &mut row_above {
-            list.sort_unstable();
-        }
-        for list in &mut row_below {
-            list.sort_unstable();
-        }
+        // Compute the complete geometry once, then the muted and active edge
+        // ownership masks from the same deterministic path builder. Subtracting
+        // active ownership means a shared trunk never turns gray merely because
+        // a muted child also reaches it.
+        let geometry_context = GeometryContext {
+            nodes,
+            row_of: &row_of,
+            lane_at: &lane_at,
+            parents: &parents,
+            parent_anchored_edges: &parent_anchored_edges,
+        };
+        let geometry = geometry_context.compute(&|_, _| true);
+        let muted_geometry =
+            geometry_context.compute(&|child, _| chain_state_of(child) == ChainState::Muted);
+        let active_geometry =
+            geometry_context.compute(&|child, _| chain_state_of(child) != ChainState::Muted);
+        let muted_geometry = muted_geometry.without(&active_geometry);
+        let RowGeometry {
+            above: row_above,
+            below: row_below,
+            transitions: row_transitions,
+        } = geometry;
+        let RowGeometry {
+            above: row_muted_above,
+            below: row_muted_below,
+            transitions: row_muted_transitions,
+        } = muted_geometry;
 
         Self {
             keys: nodes.to_vec(),
@@ -573,6 +634,9 @@ impl LayoutContext {
             row_above,
             row_below,
             row_transitions,
+            row_muted_above,
+            row_muted_below,
+            row_muted_transitions,
         }
     }
 

@@ -463,6 +463,18 @@ pub struct HistoryRow {
     /// connectors (per-row graph cells).
     #[serde(default)]
     pub transitions: Vec<(usize, usize)>,
+    /// Subset of [`Self::above`] whose edge ownership is exclusively muted.
+    /// Omitted when empty for compact snapshot rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub muted_above: Vec<usize>,
+    /// Subset of [`Self::below`] whose edge ownership is exclusively muted.
+    /// Omitted when empty for compact snapshot rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub muted_below: Vec<usize>,
+    /// Subset of [`Self::transitions`] whose edge ownership is exclusively
+    /// muted. Omitted when empty for compact snapshot rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub muted_transitions: Vec<(usize, usize)>,
     /// Bundled metadata sub-ops attached to this row (revealed on click).
     #[serde(default)]
     pub sub_ops: Vec<SubOpSummary>,
@@ -503,6 +515,13 @@ pub struct HistoryRow {
     /// is the default — success is never inferred without structured evidence.
     #[serde(default)]
     pub outcome: editchain_project::taxonomy::Outcome,
+    /// Reusable presentation state for this row and its child-owned graph edge.
+    /// Active is the backward-compatible default and is omitted on the wire.
+    #[serde(
+        default,
+        skip_serializing_if = "editchain_project::taxonomy::ChainState::is_active"
+    )]
+    pub chain_state: editchain_project::taxonomy::ChainState,
     /// Provider-neutral turn identity as an exact decimal string (u64 values
     /// above 2^53 round-trip through JavaScript without precision loss).
     /// `None` when the row is not turn-scoped.
@@ -971,6 +990,9 @@ mod tests {
             above: Vec::new(),
             below: Vec::new(),
             transitions: Vec::new(),
+            muted_above: Vec::new(),
+            muted_below: Vec::new(),
+            muted_transitions: Vec::new(),
             sub_ops: Vec::new(),
             is_subop: false,
             hierarchy_depth: 0,
@@ -980,6 +1002,7 @@ mod tests {
             activity_kind: editchain_project::taxonomy::ActivityKind::SourceControl,
             visibility: editchain_project::taxonomy::Visibility::Primary,
             outcome: editchain_project::taxonomy::Outcome::Success,
+            chain_state: editchain_project::taxonomy::ChainState::Active,
             turn_id: Some(OVER_2_53.to_string()),
             session_meta: None,
             work_unit: None,
@@ -1009,6 +1032,10 @@ mod tests {
         assert_eq!(round_trip["activity_kind"], "source_control");
         assert_eq!(round_trip["visibility"], "primary");
         assert_eq!(round_trip["outcome"], "success");
+        assert!(
+            round_trip.get("chain_state").is_none(),
+            "the default active state stays compact on the wire"
+        );
         assert_eq!(round_trip["turn_id"], "9007199254740993");
         assert_eq!(
             back.record_role,
@@ -1052,6 +1079,13 @@ mod tests {
             sparse.outcome,
             editchain_project::taxonomy::Outcome::Unknown
         );
+        assert_eq!(
+            sparse.chain_state,
+            editchain_project::taxonomy::ChainState::Active
+        );
+        assert!(sparse.muted_above.is_empty());
+        assert!(sparse.muted_below.is_empty());
+        assert!(sparse.muted_transitions.is_empty());
         assert!(sparse.turn_id.is_none());
         // Unknown relationship kinds deserialize to the forward-compatible
         // Unknown variant (and re-serialize as a string), so a newer service
@@ -1473,6 +1507,7 @@ mod tests {
             "activity_kind": "gardening",
             "visibility": "spotlight",
             "outcome": "heroic",
+            "chain_state": "retired",
             "turn_id": "9007199254740993",
         }))
         .expect("unknown taxonomy tolerated");
@@ -1489,6 +1524,10 @@ mod tests {
             editchain_project::taxonomy::Visibility::Unknown
         );
         assert_eq!(row.outcome, editchain_project::taxonomy::Outcome::Unknown);
+        assert_eq!(
+            row.chain_state,
+            editchain_project::taxonomy::ChainState::Active
+        );
         assert_eq!(row.turn_id.as_deref(), Some("9007199254740993"));
         let reserialized = serde_json::to_string(&row).expect("serialize row");
         assert!(reserialized.contains("\"record_role\":\"unknown\""));
@@ -1541,6 +1580,9 @@ mod tests {
             above: Vec::new(),
             below: Vec::new(),
             transitions: Vec::new(),
+            muted_above: Vec::new(),
+            muted_below: Vec::new(),
+            muted_transitions: Vec::new(),
             sub_ops: Vec::new(),
             is_subop: false,
             hierarchy_depth: 0,
@@ -1550,6 +1592,7 @@ mod tests {
             activity_kind: editchain_project::taxonomy::ActivityKind::Execute,
             visibility: editchain_project::taxonomy::Visibility::Primary,
             outcome: editchain_project::taxonomy::Outcome::Success,
+            chain_state: editchain_project::taxonomy::ChainState::Muted,
             turn_id: Some(OVER_2_53.to_string()),
             session_meta: Some(SessionMetaDto {
                 session_title: Some("r8".to_string()),
@@ -1584,6 +1627,7 @@ mod tests {
         assert_eq!(json["session_meta"]["session_title"], "r8");
         assert_eq!(json["activity_bundle"]["kind"], "execute-run");
         assert_eq!(json["activity_bundle"]["member_count"], 3u64);
+        assert_eq!(json["chain_state"], "muted");
         let back: HistoryRow = serde_json::from_value(json).expect("deserialize row");
         assert_eq!(
             back.work_unit.as_ref().map(|w| w.id.as_str()),
@@ -1594,6 +1638,10 @@ mod tests {
             .as_ref()
             .is_some_and(|w| w.is_start && !w.is_end));
         assert!(back.promoted);
+        assert_eq!(
+            back.chain_state,
+            editchain_project::taxonomy::ChainState::Muted
+        );
         assert_eq!(
             back.session_meta
                 .as_ref()

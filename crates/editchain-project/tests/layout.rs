@@ -9,6 +9,7 @@ use editchain_core::{NodeId, OpId};
 use editchain_project::layout::{
     compute_graph_layout, compute_lanes, GridPoint, LaneEdge, LayoutContext,
 };
+use editchain_project::taxonomy::ChainState;
 use editchain_project::{HistoryNode, HistoryProjection};
 
 fn op(node: u64, seq: u64) -> OpId {
@@ -1857,5 +1858,80 @@ fn undated_header_keeps_unknown_source_time() {
     assert_eq!(
         header.effective_time(),
         editchain_project::EffectiveTime::Unknown
+    );
+}
+
+#[test]
+fn muted_same_lane_edge_marks_both_row_halves() {
+    let nodes = vec!["cancelled".to_string(), "parent".to_string()];
+    let parents = parents_from(&[("cancelled", &["parent"]), ("parent", &[])]);
+    let state = |key: &str| {
+        if key == "cancelled" {
+            ChainState::Muted
+        } else {
+            ChainState::Active
+        }
+    };
+    let ctx = LayoutContext::new_with_chain_state(&nodes, &parents, &no_git, &state);
+    let lane = *ctx.lane_at.get("cancelled").expect("cancelled lane");
+
+    assert_eq!(ctx.lane_at.get("parent").copied(), Some(lane));
+    assert_eq!(ctx.row_muted_below.first().expect("cancelled row"), &[lane]);
+    assert_eq!(ctx.row_muted_above.get(1).expect("parent row"), &[lane]);
+    assert!(ctx
+        .row_muted_above
+        .first()
+        .expect("cancelled row")
+        .is_empty());
+    assert!(ctx.row_muted_below.get(1).expect("parent row").is_empty());
+}
+
+#[test]
+fn muted_fork_edge_stays_gray_through_the_parent_row_bend() {
+    let nodes = vec![
+        "active-tip".to_string(),
+        "muted-tip".to_string(),
+        "root".to_string(),
+    ];
+    let parents = parents_from(&[
+        ("active-tip", &["root"]),
+        ("muted-tip", &["root"]),
+        ("root", &[]),
+    ]);
+    let state = |key: &str| {
+        if key == "muted-tip" {
+            ChainState::Muted
+        } else {
+            ChainState::Active
+        }
+    };
+    let ctx = LayoutContext::new_with_chain_state(&nodes, &parents, &no_git, &state);
+    let muted_lane = *ctx.lane_at.get("muted-tip").expect("muted tip lane");
+    let root_lane = *ctx.lane_at.get("root").expect("root lane");
+
+    assert_ne!(
+        muted_lane, root_lane,
+        "the second child occupies a fork lane"
+    );
+    assert_eq!(
+        ctx.row_muted_below.get(1).expect("muted tip row"),
+        &[muted_lane]
+    );
+    assert!(ctx
+        .row_muted_above
+        .get(2)
+        .expect("root row")
+        .contains(&muted_lane));
+    assert_eq!(
+        ctx.row_muted_transitions.get(2).expect("root row"),
+        &[(muted_lane, root_lane)],
+        "the child-owned muted state reaches the bend in the active parent row"
+    );
+    assert!(
+        !ctx.row_muted_above
+            .get(2)
+            .expect("root row")
+            .contains(&root_lane),
+        "the shared active trunk retains its lane color"
     );
 }

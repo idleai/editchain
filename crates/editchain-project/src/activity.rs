@@ -56,7 +56,7 @@ use crate::meta::{
     claude_assistant_message_id, is_context_compaction_import,
     sub_op_is_world_state_or_turn_context, NodeMeta,
 };
-use crate::taxonomy::{ActivityKind, Outcome, RecordRole, Visibility};
+use crate::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use crate::{EffectiveTime, HistoryNode};
 
 /// Keep raw context-compaction checkpoints visible while making them inline in
@@ -1168,6 +1168,7 @@ fn build_plan_bundle(members: Vec<HistoryNode>) -> HistoryNode {
         activity_kind: ActivityKind::Plan,
         visibility: Visibility::Primary,
         outcome: Outcome::Unknown,
+        chain_state: aggregate_chain_state(&members),
         turn_id: newest.and_then(HistoryNode::turn_id),
     };
     let sub_ops = flattened_bundle_members(&members);
@@ -1200,6 +1201,7 @@ fn build_work_group(members: Vec<HistoryNode>) -> HistoryNode {
         activity_kind: ActivityKind::Work,
         visibility: Visibility::Primary,
         outcome: aggregate_work_outcome(&members),
+        chain_state: aggregate_chain_state(&members),
         turn_id: common_turn_id(&members),
     };
     HistoryNode::WorkGroup {
@@ -1492,7 +1494,24 @@ fn bundle_meta(members: &[HistoryNode]) -> NodeMeta {
         activity_kind: ActivityKind::Execute,
         visibility: Visibility::Primary,
         outcome,
+        chain_state: aggregate_chain_state(members),
         turn_id: members.first().and_then(HistoryNode::turn_id),
+    }
+}
+
+/// A synthetic row is muted only when every activity it replaces is muted.
+/// Mixed groups retain their active presentation so one abandoned member can
+/// never de-emphasize unrelated work sharing the same aggregate row.
+#[must_use]
+fn aggregate_chain_state(members: &[HistoryNode]) -> ChainState {
+    if !members.is_empty()
+        && members
+            .iter()
+            .all(|member| member.chain_state() == ChainState::Muted)
+    {
+        ChainState::Muted
+    } else {
+        ChainState::Active
     }
 }
 

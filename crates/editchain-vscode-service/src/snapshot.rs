@@ -100,7 +100,10 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 ///
 /// Revision 30 places disconnected graph components against exact per-lane
 /// geometry, allowing operation lanes to be reused inside Git-only gaps.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 30;
+///
+/// Revision 31 adds semantic muted-chain state and child-owned muted graph
+/// segment masks for cancelled request branches.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 31;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.
