@@ -1692,25 +1692,32 @@
       });
     }
 
-    // Check 7: expanded sub-op rows render with a Codicon and are indented.
+    // Check 7: expanded rows retain hierarchy indentation and use the shared
+    // Content grammar (file grammar for edits; icon/title/subtitle otherwise).
     if (wrapEl) {
       const subopRows = wrapEl.querySelectorAll('.row.row-subop');
       if (subopRows.length) {
         let iconsOk = true;
         let indentOk = true;
         subopRows.forEach((r) => {
-          if (!r.querySelector('.subop-icon')) iconsOk = false;
+          const icon = r.classList.contains('row-file')
+            ? r.querySelector('.file-icon')
+            : r.querySelector('.content-icon[data-content-icon] svg.content-icon-svg path');
+          if (!icon) iconsOk = false;
+          if (r.getAttribute('data-activity-bundle') === 'work-group' &&
+              (!r.querySelector('.content-icon[data-content-icon="layers"]') ||
+               r.querySelector('.content-title'))) iconsOk = false;
           const pad = parseFloat(getComputedStyle(r.querySelector('.text-cell')).paddingLeft);
           if (!(pad >= 24)) indentOk = false;
         });
         checks.push({
-          name: 'SUBOP_ICON_INDENT',
+          name: 'SUBOP_CONTENT_INDENT',
           pass: iconsOk && indentOk,
           detail: 'subopRows=' + subopRows.length + ' iconsOk=' + iconsOk + ' indentOk=' + indentOk,
         });
       } else {
         checks.push({
-          name: 'SUBOP_ICON_INDENT',
+          name: 'SUBOP_CONTENT_INDENT',
           pass: true,
           detail: 'no sub-op rows in this view (skipped)',
         });

@@ -501,6 +501,31 @@ test('Tags owns every chip while Content keeps regular prefix-free prose',
         ].join(',');
         const chips = Array.from(document.querySelectorAll(chipSelector));
         const rows = Array.from(document.querySelectorAll('.row:not(.row-placeholder)'));
+        const structuredRows = rows.filter((row) =>
+          !row.classList.contains('row-file'));
+        const omitsObviousTitle = (row) => {
+          const wire = window.__editchainRowAt?.(Number(row.getAttribute('data-row'))) || {};
+          const kind = String(wire.kind || '');
+          const role = String(wire.record_role || '');
+          return kind === 'git' || !!wire.git_oid || kind === 'message' ||
+            kind === 'work-group' ||
+            (!kind && role === 'narrative');
+        };
+        const structuredIssues = structuredRows.filter((row) => {
+          const icon = row.querySelector('.text-cell .content-icon');
+          const svg = icon?.querySelector('svg.content-icon-svg');
+          const title = row.querySelector('.text-cell .content-title');
+          const subtitle = row.querySelector('.text-cell .content-subtitle');
+          return !icon?.getAttribute('data-content-icon') ||
+            icon.getAttribute('aria-hidden') !== 'true' || !svg ||
+            svg.querySelectorAll('path').length === 0 ||
+            svg.getBoundingClientRect().width <= 0 || svg.getBoundingClientRect().height <= 0 ||
+            (omitsObviousTitle(row) ? !!title : !(title?.textContent || '').trim()) ||
+            !(subtitle?.textContent || '').trim();
+        }).map((row) => row.getAttribute('data-row'));
+        const obviousTitleRows = structuredRows.filter(omitsObviousTitle);
+        const workGroupRows = rows.filter((row) =>
+          row.getAttribute('data-activity-bundle') === 'work-group');
 
         const humanRow = document.createElement('div');
         humanRow.className = 'row row-human';
@@ -529,6 +554,21 @@ test('Tags owns every chip while Content keeps regular prefix-free prose',
             !chip.parentElement?.classList.contains('tags-cell')).length,
           contentChipCount: document.querySelectorAll(
             '.text-cell :is(' + chipSelector + ')').length,
+          activityIconCount: document.querySelectorAll(
+            '.activity-cell :is(svg, .content-icon)').length,
+          structuredRowCount: structuredRows.length,
+          structuredIssues,
+          obviousTitleRowCount: obviousTitleRows.length,
+          obviousTitleIssues: obviousTitleRows.filter((row) =>
+            row.querySelector('.text-cell .content-title')).map((row) =>
+            row.getAttribute('data-row')),
+          workGroupCount: workGroupRows.length,
+          workGroupIssues: workGroupRows.filter((row) =>
+            !row.querySelector(
+              '.text-cell .content-icon[data-content-icon="layers"] svg.content-icon-svg path') ||
+            !!row.querySelector('.text-cell .content-title') ||
+            !(row.querySelector('.text-cell .content-subtitle')?.textContent || '').trim()
+          ).map((row) => row.getAttribute('data-row')),
           maxTagsPerRow: Math.max(0, ...rows.map((row) =>
             row.querySelector('.tags-cell')?.children.length || 0)),
           sessionSummary: sessionRow ? {
@@ -557,6 +597,16 @@ test('Tags owns every chip while Content keeps regular prefix-free prose',
       assert.ok(presentation.chipCount > 0, 'fixture renders row tags');
       assert.equal(presentation.misplacedChips, 0, 'every chip is a direct Tags-cell child');
       assert.equal(presentation.contentChipCount, 0, 'Content contains no chips');
+      assert.equal(presentation.activityIconCount, 0, 'Activity remains readable text, not an icon');
+      assert.ok(presentation.structuredRowCount > 0, 'fixture renders structured Content rows');
+      assert.deepEqual(presentation.structuredIssues, [],
+        'rows render icon/subtitle and a title only when it adds information');
+      assert.ok(presentation.obviousTitleRowCount > 0,
+        'fixture covers Commit/Message rows with intentionally omitted titles');
+      assert.deepEqual(presentation.obviousTitleIssues, [],
+        'Commit/Message rows do not render redundant Content titles');
+      assert.deepEqual(presentation.workGroupIssues, [],
+        'any WorkGroups render a layers icon directly into their aggregate subtitle');
       assert.ok(presentation.maxTagsPerRow > 1, 'one row can render multiple tags');
       assert.deepEqual(presentation.sessionSummary, {
         classification: 'session',
@@ -667,6 +717,7 @@ test('find-in-chain, row selection, and disclosure interactions settle in real D
         return {
           children: activity ? Array.from(activity.children).map((child) => child.className) : [],
           label: label?.textContent ?? '',
+          iconCount: activity?.querySelectorAll('svg, .content-icon').length ?? 0,
           glyph: chevron?.textContent ?? '',
           labelColor: label ? getComputedStyle(label).color : '',
           chevronColor: chevron ? getComputedStyle(chevron).color : '',
@@ -676,8 +727,9 @@ test('find-in-chain, row selection, and disclosure interactions settle in real D
       assert.deepEqual(
         affordance.children,
         ['activity-label', 'subop-chevron'],
-        'disclosure follows the Activity text');
+        'disclosure follows the readable Activity text');
       assert.ok(affordance.label, 'Activity text remains visible');
+      assert.equal(affordance.iconCount, 0, 'Activity owns no icon');
       assert.equal(affordance.glyph, '\u25b8', 'collapsed Activity affordance points right');
       assert.equal(
         affordance.chevronColor,
@@ -722,18 +774,40 @@ test('find-in-chain, row selection, and disclosure interactions settle in real D
         'an unfolded group summary uses one ordinary circle');
       const openedGroupMarkers = await page.evaluate(() => {
         const members = Array.from(document.querySelectorAll('#rows .row-subop'));
+        const structured = members.filter((row) =>
+          !row.classList.contains('row-file'));
+        const titleIsCorrect = (row) => {
+          const wire = window.__editchainRowAt?.(Number(row.getAttribute('data-row'))) || {};
+          const kind = String(wire.kind || '');
+          const role = String(wire.record_role || '');
+          const omit = kind === 'git' || !!wire.git_oid || kind === 'message' ||
+            kind === 'work-group' ||
+            (!kind && role === 'narrative');
+          const title = row.querySelector('.text-cell .content-title');
+          return omit ? !title : !!(title?.textContent || '').trim();
+        };
         return {
           rows: members.length,
           dots: members.filter((row) =>
             row.querySelectorAll('.graph-cell .graphDot').length === 1).length,
           nestedCapsules: members.filter((row) =>
             row.querySelector('.graph-cell .graphBundleCapsule')).length,
+          structured: structured.length,
+          structureIssues: structured.filter((row) =>
+            !row.querySelector('.text-cell .content-icon[data-content-icon] svg.content-icon-svg path') ||
+            !titleIsCorrect(row) ||
+            !(row.querySelector('.text-cell .content-subtitle')?.textContent || '').trim()
+          ).length,
         };
       });
       assert.equal(openedGroupMarkers.dots, openedGroupMarkers.rows,
         'every revealed group member owns one graph dot');
       assert.equal(openedGroupMarkers.nestedCapsules, 0,
         'revealed members use dots instead of nested heavy capsules');
+      assert.ok(openedGroupMarkers.structured > 0,
+        'revealed ordinary members use the shared Content structure');
+      assert.equal(openedGroupMarkers.structureIssues, 0,
+        'revealed ordinary members contain icon/subtitle and only useful titles');
       assert.equal(
         await page.evaluate(() =>
           Array.from(document.querySelectorAll('#rows .row'))

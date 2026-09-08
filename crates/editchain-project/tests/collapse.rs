@@ -261,6 +261,215 @@ fn collapse_tool_summary_prefixes_tool() {
 }
 
 #[test]
+fn completed_command_summary_uses_stdout_or_formatted_output() {
+    let cases = [
+        (
+            1,
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "stdout": "first output line\nsecond output line",
+                        "formatted_output": "decorated output",
+                    },
+                },
+            }),
+            "first output line\nsecond output line",
+        ),
+        (
+            2,
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "stdout": "",
+                        "formatted_output": "formatted fallback",
+                    },
+                },
+            }),
+            "formatted fallback",
+        ),
+        (
+            3,
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "stdout": "",
+                        "formatted_output": "",
+                    },
+                },
+            }),
+            "No output",
+        ),
+    ];
+
+    for (node, raw, expected) in cases {
+        let mut import = import_op(node, 1);
+        if let OpKind::Import(raw_import) = &mut import.kind {
+            raw_import.raw_ref = Payload::Inline(raw.to_string().into_bytes());
+        }
+        let command = Op {
+            id: OpId::new(NodeId(node), 0, 2),
+            parents: ParentSet::One(import.id),
+            actor: ActorId(1),
+            clock: Clock::UnixMs(2),
+            scope: ScopeRef::Session(SessionId(10)),
+            tags: Tags::AGENT | Tags::COMMAND,
+            kind: OpKind::Command(CommandOp {
+                command_id: Payload::Inline(b"command-1".to_vec()),
+                content: Payload::Inline(b"printf old\nnormalized aggregate".to_vec()),
+                stage: CommandStage::Finish,
+            }),
+        };
+
+        let projection = HistoryProjection::from_ops(vec![import, command]);
+        let rows = projection.nodes();
+        let row = rows.first().expect("command row");
+        assert_eq!(row.summary(), expected);
+        assert_eq!(
+            row.record_role(),
+            editchain_project::taxonomy::RecordRole::Result
+        );
+        assert!(!row.summary().starts_with("$ "));
+        assert!(!row.summary().contains("printf old"));
+    }
+}
+
+#[test]
+fn codex_custom_exec_summary_uses_the_command_not_token_metadata() {
+    let mut call_import = import_op(1, 1);
+    if let OpKind::Import(import) = &mut call_import.kind {
+        import.raw_ref = Payload::Inline(
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "input": "const result = await tools.exec_command({\n  cmd: \"cargo test -p editchain-project\",\n  workdir: \"/workspace\"\n});\ntext(result.output);",
+                },
+            })
+            .to_string()
+            .into_bytes(),
+        );
+    }
+    let call = tool_op(1, 2, call_import.id, "exec");
+    let usage = legacy_token_usage_import_op(1, 3, call_import.id);
+    let (result_import, result) = tool_result_pair(1, 4, 5, call_import.id, None);
+    let result_id = result.id;
+    let projection = HistoryProjection::from_ops_with(
+        vec![
+            call_import.clone(),
+            call,
+            usage.clone(),
+            result_import,
+            result,
+        ],
+        editchain_project::ProjectionOptions {
+            bundle_metadata: true,
+        },
+    );
+    let nodes = projection.nodes();
+
+    assert_eq!(nodes.len(), 1);
+    let node = nodes.first().expect("exec row");
+    assert_eq!(node.summary(), "tool: exec cargo test -p editchain-project");
+    let sub_op_ids = node.sub_ops().iter().map(|op| op.id).collect::<Vec<_>>();
+    assert!(sub_op_ids.contains(&usage.id));
+    assert!(sub_op_ids.contains(&result_id));
+}
+
+#[test]
+fn codex_function_call_summary_uses_structured_arguments() {
+    let mut op = import_op(1, 1);
+    if let OpKind::Import(import) = &mut op.kind {
+        import.raw_ref = Payload::Inline(
+            br#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"git status --short\",\"workdir\":\"/workspace\"}"}}"#
+                .to_vec(),
+        );
+    }
+    let tool = tool_op(1, 2, op.id, "exec_command");
+    let projection = HistoryProjection::from_ops(vec![op, tool]);
+
+    assert_eq!(
+        projection.nodes().first().expect("tool row").summary(),
+        "tool: exec_command git status --short"
+    );
+}
+
+#[test]
+fn claude_tool_summary_uses_tool_use_input() {
+    let mut op = import_op(1, 1);
+    if let OpKind::Import(import) = &mut op.kind {
+        import.raw_ref = Payload::Inline(
+            br#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"src/lib.rs"}}]}}"#
+                .to_vec(),
+        );
+    }
+    let tool = tool_op(1, 2, op.id, "Read");
+    let projection = HistoryProjection::from_ops(vec![op, tool]);
+
+    assert_eq!(
+        projection.nodes().first().expect("tool row").summary(),
+        "tool: Read src/lib.rs"
+    );
+}
+
+#[test]
+fn token_count_summary_compares_latest_context_with_its_limit() {
+    let raw = serde_json::json!({
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "total_token_usage": { "total_tokens": 34_652 },
+                "last_token_usage": { "total_tokens": 17_502 },
+                "model_context_window": 258_400,
+            },
+        },
+    })
+    .to_string()
+    .into_bytes();
+    assert_eq!(
+        editchain_project::import_token_accounting_summary(&raw).as_deref(),
+        Some("17,502 / 258,400")
+    );
+
+    let mut op = import_op(1, 1);
+    if let OpKind::Import(import) = &mut op.kind {
+        import.raw_ref = Payload::Inline(raw);
+    }
+    let projection = HistoryProjection::from_ops(vec![op]);
+    let nodes = projection.nodes();
+    let node = nodes.first().expect("token-count row");
+    assert_eq!(node.summary(), "17,502 / 258,400");
+    assert_eq!(node.kind(), "token_count");
+}
+
+#[test]
+fn legacy_token_usage_summary_uses_the_request_total() {
+    let raw = serde_json::json!({
+        "type": "token_usage_record",
+        "payload": {
+            "usage": { "total_tokens": 140_635 },
+            "turn_token_usage": { "total_tokens": 282_570 },
+            "thread_token_usage": { "total_tokens": 900_001 },
+        },
+    })
+    .to_string();
+    assert_eq!(
+        editchain_project::import_token_accounting_summary(raw.as_bytes()).as_deref(),
+        Some("140,635")
+    );
+}
+
+#[test]
 fn collapse_author_derived_from_children_tags() {
     // A raw import op whose child is a HUMAN message should collapse to a node
     // with author "human" (not "system", which the raw import's IMPORT-only tags

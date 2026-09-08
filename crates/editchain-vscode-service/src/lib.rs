@@ -737,15 +737,17 @@ fn compact_import_payload(
 /// The projection classifier and outcome logic read the envelope
 /// discriminators plus a small semantic subset: `payload.message` /
 /// `payload.content` text (bounded), the first `payload.summary` reasoning
-/// summary text (bounded), `payload.role`, `arguments`/`output` previews, a
-/// bounded structural/content signal for tool-payload carriers
+/// summary text (bounded), `payload.role`, `arguments`/`output` previews,
+/// bounded command-output carriers (`stdout`/`formatted_output`/aggregate
+/// spellings), a bounded structural/content signal for tool-payload carriers
 /// (`arguments`/`input`/`parameters`), and structured outcome evidence
 /// (`status`, `exitCode`, `errorMessage` at `payload` or `payload.item`
 /// level, plus the canonical three-line Codex execution-result header), and
-/// Claude's interrupted-request identity/marker. Codex
-/// token-usage records retain only their bounded identity strings and empty
-/// usage-object markers so legacy metadata classification can validate the
-/// complete schema without retaining accounting values.
+/// Claude's interrupted-request identity/marker. Codex token-accounting
+/// records retain only their bounded identity strings, request totals, latest
+/// context total, and model context limit. That is enough to validate legacy
+/// metadata shapes and render a useful numeric subtitle without retaining the
+/// full accounting or rate-limit payload.
 /// Large outputs stay bounded to the display preview limits, and blob-backed
 /// imports pass through the same bounded preview path, so the full record is
 /// never copied into the projection.
@@ -773,6 +775,28 @@ fn compact_import_record(bytes: &[u8]) -> Vec<u8> {
         let mut payload = serde_json::Map::new();
         let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "model_provider");
         let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "agent_nickname");
+        if !payload.is_empty() {
+            drop(compact.insert("payload".to_string(), serde_json::Value::Object(payload)));
+        }
+    } else if record_type == "token_usage_record" {
+        let payload_start = raw.find("\"payload\"").unwrap_or(0);
+        let mut payload = serde_json::Map::new();
+        for field in [
+            "thread_id",
+            "turn_id",
+            "session_id",
+            "root_turn_id",
+            "response_id",
+        ] {
+            let _: bool = copy_preview_string(&raw, payload_start, &mut payload, field);
+        }
+        for field in ["usage", "turn_token_usage", "thread_token_usage"] {
+            if let Some(usage) = json_value_field(&raw, field, payload_start)
+                .and_then(|value| compact_token_usage(&value))
+            {
+                drop(payload.insert(field.to_string(), usage));
+            }
+        }
         if !payload.is_empty() {
             drop(compact.insert("payload".to_string(), serde_json::Value::Object(payload)));
         }
@@ -807,11 +831,17 @@ fn compact_import_record(bytes: &[u8]) -> Vec<u8> {
         // exact duplicate pairing, so the classifier is told explicitly
         // instead of guessing from an ellipsis.
         let mut echo_text_truncated = false;
-        if let Some(event_type) = json_string_field(&raw, "type", payload_start) {
+        let event_type = json_string_field(&raw, "type", payload_start);
+        if let Some(event_type) = event_type {
             drop(payload.insert(
                 "type".to_string(),
                 serde_json::Value::String(event_type.to_string()),
             ));
+        }
+        if event_type == Some("token_count") {
+            if let Some(info) = json_value_field(&raw, "info", payload_start) {
+                copy_token_count_info(&info, &mut payload);
+            }
         }
         echo_text_truncated |= copy_preview_string(&raw, payload_start, &mut payload, "message");
         let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "role");
@@ -833,6 +863,9 @@ fn compact_import_record(bytes: &[u8]) -> Vec<u8> {
         let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "parameters");
         copy_preview_structured(&raw, payload_start, &mut payload, "parameters");
         let _: bool = copy_preview_string(&raw, payload_start, &mut payload, "output");
+        for field in COMMAND_OUTPUT_FIELDS {
+            let _: bool = copy_preview_string(&raw, payload_start, &mut payload, field);
+        }
         copy_codex_exec_output_header_from_prefix(&raw, payload_start, &mut payload);
         if let Some(content_start) = raw
             .get(payload_start..)
@@ -872,8 +905,12 @@ fn compact_import_record(bytes: &[u8]) -> Vec<u8> {
         {
             let item_abs = payload_start.saturating_add(item_start);
             let mut item = serde_json::Map::new();
+            let _: bool = copy_preview_string(&raw, item_abs, &mut item, "type");
             let _: bool = copy_preview_string(&raw, item_abs, &mut item, "status");
             let _: bool = copy_preview_string(&raw, item_abs, &mut item, "errorMessage");
+            for field in COMMAND_OUTPUT_FIELDS {
+                let _: bool = copy_preview_string(&raw, item_abs, &mut item, field);
+            }
             if let Some(code) = json_number_field(&raw, "exitCode", item_abs) {
                 drop(item.insert(
                     "exitCode".to_string(),
@@ -962,25 +999,7 @@ fn compact_import_value(value: &serde_json::Value) -> serde_json::Value {
             let _: bool = copy_bounded_field(payload, &mut compact_payload, "model_provider");
             let _: bool = copy_bounded_field(payload, &mut compact_payload, "agent_nickname");
         }
-        if record_type == "token_usage_record" {
-            for field in [
-                "thread_id",
-                "turn_id",
-                "session_id",
-                "root_turn_id",
-                "response_id",
-            ] {
-                let _: bool = copy_bounded_field(payload, &mut compact_payload, field);
-            }
-            for field in ["usage", "turn_token_usage", "thread_token_usage"] {
-                if payload.get(field).is_some_and(serde_json::Value::is_object) {
-                    drop(compact_payload.insert(
-                        field.to_string(),
-                        serde_json::Value::Object(serde_json::Map::new()),
-                    ));
-                }
-            }
-        }
+        copy_token_accounting_payload(record_type, payload, &mut compact_payload);
         copy_string_field(payload, &mut compact_payload, "type");
         copy_string_field(payload, &mut compact_payload, "role");
         echo_text_truncated |= copy_bounded_field(payload, &mut compact_payload, "message");
@@ -989,6 +1008,9 @@ fn compact_import_value(value: &serde_json::Value) -> serde_json::Value {
         copy_structured_payload_field(payload, &mut compact_payload, "input");
         copy_structured_payload_field(payload, &mut compact_payload, "parameters");
         let _: bool = copy_bounded_field(payload, &mut compact_payload, "output");
+        for field in COMMAND_OUTPUT_FIELDS {
+            let _: bool = copy_bounded_field(payload, &mut compact_payload, field);
+        }
         copy_codex_exec_output_header(payload, &mut compact_payload);
         let _: bool = copy_bounded_field(payload, &mut compact_payload, "status");
         let _: bool = copy_bounded_field(payload, &mut compact_payload, "errorMessage");
@@ -1009,8 +1031,12 @@ fn compact_import_value(value: &serde_json::Value) -> serde_json::Value {
         }
         if let Some(item) = payload.get("item") {
             let mut compact_item = serde_json::Map::new();
+            copy_string_field(item, &mut compact_item, "type");
             let _: bool = copy_bounded_field(item, &mut compact_item, "status");
             let _: bool = copy_bounded_field(item, &mut compact_item, "errorMessage");
+            for field in COMMAND_OUTPUT_FIELDS {
+                let _: bool = copy_bounded_field(item, &mut compact_item, field);
+            }
             copy_i64_field(item, &mut compact_item, "exitCode");
             if !compact_item.is_empty() {
                 drop(
@@ -1034,6 +1060,16 @@ fn compact_import_value(value: &serde_json::Value) -> serde_json::Value {
     }
     serde_json::Value::Object(compact)
 }
+
+/// Provider spellings that can carry the readable result of a completed
+/// command. Every retained value passes through the bounded text-preview path.
+const COMMAND_OUTPUT_FIELDS: [&str; 5] = [
+    "stdout",
+    "formatted_output",
+    "formattedOutput",
+    "aggregated_output",
+    "aggregatedOutput",
+];
 
 /// Copy one JSON string field verbatim into a compact payload object.
 fn copy_string_field(
@@ -1261,6 +1297,84 @@ fn is_meaningful_carrier_value(value: &serde_json::Value) -> bool {
         serde_json::Value::String(text) => !text.trim().is_empty(),
         serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
         serde_json::Value::Null => false,
+    }
+}
+
+/// Retain only numeric fields needed to label Codex token-accounting rows.
+fn copy_token_accounting_payload(
+    record_type: &str,
+    payload: &serde_json::Value,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if record_type == "token_usage_record" {
+        for field in [
+            "thread_id",
+            "turn_id",
+            "session_id",
+            "root_turn_id",
+            "response_id",
+        ] {
+            let _: bool = copy_bounded_field(payload, out, field);
+        }
+        for field in ["usage", "turn_token_usage", "thread_token_usage"] {
+            copy_token_usage_field(payload, out, field);
+        }
+    } else if record_type == "event_msg"
+        && payload.get("type").and_then(serde_json::Value::as_str) == Some("token_count")
+    {
+        if let Some(info) = payload.get("info") {
+            copy_token_count_info(info, out);
+        }
+    }
+}
+
+/// Copy one usage object while discarding every field except `total_tokens`.
+fn copy_token_usage_field(
+    source: &serde_json::Value,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) {
+    if let Some(usage) = source.get(field).and_then(compact_token_usage) {
+        drop(out.insert(field.to_string(), usage));
+    }
+}
+
+/// Compact a token-usage object to its total while retaining an empty object
+/// marker for legacy schema recognition.
+fn compact_token_usage(value: &serde_json::Value) -> Option<serde_json::Value> {
+    if !value.is_object() {
+        return None;
+    }
+    let mut compact = serde_json::Map::new();
+    copy_u64_field(value, &mut compact, "total_tokens");
+    Some(serde_json::Value::Object(compact))
+}
+
+/// Copy the latest active-context total and context limit from a token event.
+fn copy_token_count_info(
+    info: &serde_json::Value,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if !info.is_object() {
+        return;
+    }
+    let mut compact = serde_json::Map::new();
+    copy_token_usage_field(info, &mut compact, "last_token_usage");
+    copy_token_usage_field(info, &mut compact, "total_token_usage");
+    copy_u64_field(info, &mut compact, "model_context_window");
+    if !compact.is_empty() {
+        drop(out.insert("info".to_string(), serde_json::Value::Object(compact)));
+    }
+}
+
+/// Copy one non-negative JSON integer field verbatim.
+fn copy_u64_field(
+    source: &serde_json::Value,
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) {
+    if let Some(value) = source.get(key).and_then(serde_json::Value::as_u64) {
+        drop(out.insert(key.to_string(), serde_json::Value::Number(value.into())));
     }
 }
 
@@ -4028,7 +4142,10 @@ fn node_is_system(node: &editchain_project::HistoryNode) -> bool {
         // dominant child kind tells us whether it is user-facing text or a
         // system artifact.
         editchain_project::HistoryNode::CollapsedImport { kind, .. } => {
-            kind == "tool" || kind == "import"
+            matches!(
+                kind.as_str(),
+                "tool" | "import" | "token_count" | "token_usage_record"
+            )
         }
         // Execute-run bundles summarize tool/command rows: dim them like the
         // individual tool rows they fold.
@@ -4338,8 +4455,9 @@ fn node_leaf_activity_count(node: &editchain_project::HistoryNode) -> u64 {
 /// Build the fixed depth-first expansion tree for one top-level graph row.
 ///
 /// Ordinary rows and top-level execute/plan bundles retain their established
-/// one-level details. A `WorkGroup` exposes each pre-grouped activity as a depth-1
-/// row; that member's existing details/bundle members become depth-2 rows.
+/// one-level details. A `WorkGroup` exposes each direct activity as a depth-1
+/// row. The projection flattens a sole nested synthetic group before this
+/// point, while nested groups that accompany other work retain depth-2 rows.
 #[must_use]
 fn node_expansion(
     node: &editchain_project::HistoryNode,
@@ -4707,6 +4825,25 @@ fn sub_op_label(op: &Op) -> (String, String) {
     };
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
         if let Some(record_type) = value.get("type").and_then(serde_json::Value::as_str) {
+            let token_kind = if record_type == "token_usage_record" {
+                Some("token_usage_record")
+            } else if record_type == "event_msg"
+                && value
+                    .get("payload")
+                    .and_then(|payload| payload.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("token_count")
+            {
+                Some("token_count")
+            } else {
+                None
+            };
+            if let (Some(kind), Some(summary)) = (
+                token_kind,
+                editchain_project::import_token_accounting_summary(raw.as_bytes()),
+            ) {
+                return (summary, kind.to_string());
+            }
             let label = if record_type == "assistant" {
                 value
                     .get("message")
@@ -6061,6 +6198,41 @@ mod tests {
     }
 
     #[test]
+    fn sub_op_label_formats_token_accounting_as_numbers() {
+        let count = op_envelope(
+            1,
+            1,
+            OpKind::Import(ImportOp {
+                raw_ref: Payload::Inline(
+                    br#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":34652},"last_token_usage":{"total_tokens":17502},"model_context_window":258400}}}"#
+                        .to_vec(),
+                ),
+                raw_hash: None,
+            }),
+        );
+        assert_eq!(
+            sub_op_label(&count),
+            ("17,502 / 258,400".to_string(), "token_count".to_string())
+        );
+
+        let usage = op_envelope(
+            1,
+            2,
+            OpKind::Import(ImportOp {
+                raw_ref: Payload::Inline(
+                    br#"{"type":"token_usage_record","payload":{"usage":{"total_tokens":140635},"turn_token_usage":{"total_tokens":282570},"thread_token_usage":{"total_tokens":900001}}}"#
+                        .to_vec(),
+                ),
+                raw_hash: None,
+            }),
+        );
+        assert_eq!(
+            sub_op_label(&usage),
+            ("140,635".to_string(), "token_usage_record".to_string())
+        );
+    }
+
+    #[test]
     fn sub_op_label_preserves_folded_claude_tool_fragment() {
         let op = op_envelope(
             1,
@@ -6819,12 +6991,18 @@ mod tests {
         );
 
         let item = compact_import_record(
-            br#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"call_9","exitCode":1,"status":"completed","errorMessage":"boom"}}}"#,
+            br#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"call_9","exitCode":1,"status":"completed","errorMessage":"boom","stdout":"actual stdout","formatted_output":"formatted fallback"}}}"#,
         );
         let item: serde_json::Value = serde_json::from_slice(&item).unwrap();
+        assert_eq!(item["payload"]["item"]["type"], "CommandExecution");
         assert_eq!(item["payload"]["item"]["exitCode"], 1);
         assert_eq!(item["payload"]["item"]["status"], "completed");
         assert_eq!(item["payload"]["item"]["errorMessage"], "boom");
+        assert_eq!(item["payload"]["item"]["stdout"], "actual stdout");
+        assert_eq!(
+            item["payload"]["item"]["formatted_output"],
+            "formatted fallback"
+        );
 
         let response = compact_import_record(
             br#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"[external_agent_tool_result] done"}]}}"#,
@@ -6940,8 +7118,8 @@ mod tests {
         assert_eq!(session_prefix["payload"]["model_provider"], "sglang_dsv4");
         assert_eq!(session_prefix["payload"]["agent_nickname"], "Harvey");
 
-        // Legacy token-usage imports need their exact schema shape during
-        // projection, but never their accounting values.
+        // Token-accounting imports retain only the compact totals required for
+        // numeric subtitles and legacy schema recognition.
         let usage = compact_import_record(
             br#"{"type":"token_usage_record","payload":{"thread_id":"0195cda5-433d-7f9a-9d7b-a9f15b60c2e2","turn_id":"turn-1","session_id":"0195cda5-433d-7f9a-9d7b-a9f15b60c2e2","root_turn_id":"turn-1","response_id":"response-1","usage":{"total_tokens":13},"turn_token_usage":{"total_tokens":13},"thread_token_usage":{"total_tokens":13}}}"#,
         );
@@ -6949,8 +7127,33 @@ mod tests {
         assert_eq!(usage["type"], "token_usage_record");
         assert_eq!(usage["payload"]["turn_id"], "turn-1");
         for field in ["usage", "turn_token_usage", "thread_token_usage"] {
-            assert_eq!(usage["payload"][field], serde_json::json!({}));
+            assert_eq!(
+                usage["payload"][field],
+                serde_json::json!({ "total_tokens": 13 })
+            );
         }
+
+        let count = compact_import_record(
+            br#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":33772,"total_tokens":34652},"last_token_usage":{"input_tokens":17187,"total_tokens":17502},"model_context_window":258400},"rate_limits":{"primary":{"used_percent":2.0}}}}"#,
+        );
+        let count: serde_json::Value = serde_json::from_slice(&count).unwrap();
+        assert_eq!(
+            count["payload"]["info"],
+            serde_json::json!({
+                "total_token_usage": { "total_tokens": 34_652 },
+                "last_token_usage": { "total_tokens": 17_502 },
+                "model_context_window": 258_400,
+            })
+        );
+        assert!(count["payload"].get("rate_limits").is_none());
+
+        // Prefix-only parsing keeps the same small accounting subset when a
+        // later field runs past the bounded preview.
+        let count_prefix = compact_import_record(
+            br#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":34652},"last_token_usage":{"total_tokens":17502},"model_context_window":258400},"rate_limits":{"private":"unterminated"#,
+        );
+        let count_prefix: serde_json::Value = serde_json::from_slice(&count_prefix).unwrap();
+        assert_eq!(count_prefix["payload"]["info"], count["payload"]["info"]);
 
         // Large outputs are bounded, never copied into the projection.
         let huge = format!(
@@ -7634,9 +7837,10 @@ mod tests {
         assert_eq!(compacted["payload"]["exitCode"], 0);
 
         // The nested item-level copy is still recovered (unchanged behavior),
-        // including when the payload-level field precedes it.
+        // including its bounded command output, when the payload-level field
+        // precedes it.
         let nested = format!(
-            r#"{{"type":"event_msg","payload":{{"type":"item_completed","exitCode":2,"status":"completed","item":{{"type":"CommandExecution","id":"call_x","exitCode":2,"status":"completed"}},"output":"{}"}}}}"#,
+            r#"{{"type":"event_msg","payload":{{"type":"item_completed","exitCode":2,"status":"completed","item":{{"type":"CommandExecution","id":"call_x","exitCode":2,"status":"completed","stdout":"prefix stdout","formatted_output":"prefix formatted"}},"output":"{}"}}}}"#,
             "w".repeat(200_000),
         );
         let bytes = nested.as_bytes();
@@ -7644,8 +7848,14 @@ mod tests {
         let compacted = compact_import_record(&bytes[..DISPLAY_PREVIEW_READ_LIMIT]);
         let compacted: serde_json::Value = serde_json::from_slice(&compacted).unwrap();
         assert_eq!(compacted["payload"]["exitCode"], 2);
+        assert_eq!(compacted["payload"]["item"]["type"], "CommandExecution");
         assert_eq!(compacted["payload"]["item"]["exitCode"], 2);
         assert_eq!(compacted["payload"]["item"]["status"], "completed");
+        assert_eq!(compacted["payload"]["item"]["stdout"], "prefix stdout");
+        assert_eq!(
+            compacted["payload"]["item"]["formatted_output"],
+            "prefix formatted"
+        );
     }
 
     #[test]

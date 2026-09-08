@@ -518,11 +518,16 @@ describe('EditChain History visual state matrix', () => {
     await waitIdle();
 
     // --- row-selected ---------------------------------------------------------
-    await browser.execute(() => {
-      const row = document.querySelector<HTMLElement>('.row[data-row="1"]');
-      if (!row) throw new Error('no .row[data-row="1"] to select');
+    const selectionRows = await browser.execute(() =>
+      Array.from(document.querySelectorAll<HTMLElement>(
+        '#rows .row[data-row][data-key]:not(.row-placeholder)'
+      )).slice(0, 2).map((row) => Number(row.dataset.row)));
+    expect(selectionRows).toHaveLength(2);
+    await browser.execute((abs: number) => {
+      const row = document.querySelector<HTMLElement>('.row[data-row="' + abs + '"]');
+      if (!row) throw new Error('no rendered row ' + abs + ' to select');
       row.click();
-    });
+    }, selectionRows[0]);
     const selection = await browser.execute(() => {
       const sel = document.querySelector('.row.row-selected');
       return {
@@ -533,20 +538,20 @@ describe('EditChain History visual state matrix', () => {
           (document.getElementById('layout')?.classList.contains('has-detail') ?? false),
       };
     });
-    expect(selection.selectedRow).toBe(1);
+    expect(selection.selectedRow).toBe(selectionRows[0]);
     expect(selection.ariaSelected).toBe('true');
     expect(selection.hasDetail).toBe(false); // inline selection, no secondary pane
     await capture('row-selected', false, selection);
 
     // --- keyboard-focus -------------------------------------------------------
-    await browser.execute(() => {
-      const row = document.querySelector<HTMLElement>('.row[data-row="1"]');
-      if (!row) throw new Error('no .row[data-row="1"] to focus');
+    await browser.execute((abs: number) => {
+      const row = document.querySelector<HTMLElement>('.row[data-row="' + abs + '"]');
+      if (!row) throw new Error('no rendered row ' + abs + ' to focus');
       row.focus();
       row.dispatchEvent(new KeyboardEvent('keydown', {
         key: 'ArrowDown', bubbles: true, cancelable: true,
       }));
-    });
+    }, selectionRows[0]);
     const keyboard = await browser.execute(() => {
       const active = document.activeElement?.closest('.row');
       const sel = document.querySelector('.row.row-selected');
@@ -556,8 +561,9 @@ describe('EditChain History visual state matrix', () => {
         selectedRow: sel ? Number(sel.getAttribute('data-row')) : null,
       };
     });
-    expect(keyboard.focusedRow).toBe(2); // roving focus moved down one
-    expect(keyboard.tabbable).toBe(1);   // exactly one row in the tab order
+    expect(keyboard.focusedRow).not.toBeNull();
+    expect(keyboard.focusedRow).toBeGreaterThan(selectionRows[0]);
+    expect(keyboard.tabbable).toBe(1); // exactly one row in the tab order
     await capture('keyboard-focus', false, keyboard);
 
     // --- bundle-expanded (only when the real chain exposes an expandable row) --
@@ -607,9 +613,14 @@ describe('EditChain History visual state matrix', () => {
         document.querySelectorAll('.row-subop').length > 0), { timeout: 60000, interval: 100 });
       await waitIdle();
       const nestedAbs = await browser.execute(() => {
-        const row = document.querySelector<HTMLElement>(
+        const rows = Array.from(document.querySelectorAll<HTMLElement>(
           '.row-subop[data-hierarchy-depth="1"].row-expandable'
-        );
+        ));
+        const row = rows.find((candidate) => {
+          const wire = window.__editchainRowAt?.(Number(candidate.dataset.row));
+          return Array.isArray(wire?.sub_ops) && wire.sub_ops.some((sub: any) =>
+            sub?.kind === 'token_count');
+        }) ?? rows[0];
         return row ? Number(row.getAttribute('data-row')) : null;
       });
       if (nestedAbs != null) {
@@ -642,6 +653,7 @@ describe('EditChain History visual state matrix', () => {
         return {
           order: activity ? Array.from(activity.children).map((child) => child.className) : [],
           label: label?.textContent ?? '',
+          iconCount: activity?.querySelectorAll('svg, .content-icon').length ?? 0,
           glyph: chevron?.textContent ?? '',
           colorMatches: !!label && !!chevron &&
             getComputedStyle(label).color === getComputedStyle(chevron).color,
@@ -689,6 +701,40 @@ describe('EditChain History visual state matrix', () => {
         const renderedRows = Array.from(document.querySelectorAll<HTMLElement>(
           '.row:not(.row-placeholder)'
         ));
+        const structuredRows = renderedRows.filter((row) =>
+          !row.classList.contains('row-file'));
+        const omitsObviousTitle = (row: HTMLElement): boolean => {
+          const wire = window.__editchainRowAt?.(Number(row.dataset.row));
+          const kind = String(wire?.kind ?? '');
+          const role = String(wire?.record_role ?? '');
+          return kind === 'git' || !!wire?.git_oid || kind === 'message' ||
+            kind === 'work-group' ||
+            (!kind && role === 'narrative');
+        };
+        const contentStructureIssues = structuredRows.filter((row) => {
+          const icon = row.querySelector<HTMLElement>('.text-cell .content-icon');
+          const svg = icon?.querySelector<SVGElement>('svg.content-icon-svg');
+          const title = row.querySelector<HTMLElement>('.text-cell .content-title');
+          const subtitle = row.querySelector<HTMLElement>('.text-cell .content-subtitle');
+          return !icon?.dataset.contentIcon || icon.getAttribute('aria-hidden') !== 'true' ||
+            !svg || svg.querySelectorAll('path').length === 0 ||
+            svg.getBoundingClientRect().width <= 0 || svg.getBoundingClientRect().height <= 0 ||
+            (omitsObviousTitle(row) ? !!title : !(title?.textContent ?? '').trim()) ||
+            !(subtitle?.textContent ?? '').trim();
+        }).map((row) => Number(row.dataset.row)).slice(0, 5);
+        const obviousTitleRows = structuredRows.filter(omitsObviousTitle);
+        const obviousTitleIssues = obviousTitleRows.filter((row) =>
+          !!row.querySelector('.text-cell .content-title')
+        ).map((row) => Number(row.dataset.row)).slice(0, 5);
+        const workGroupRows = renderedRows.filter((row) =>
+          row.getAttribute('data-activity-bundle') === 'work-group');
+        const workGroupIssues = workGroupRows.filter((row) =>
+          !row.querySelector(
+            '.text-cell .content-icon[data-content-icon="layers"] svg.content-icon-svg path') ||
+          !!row.querySelector('.text-cell .content-title') ||
+          !(row.querySelector<HTMLElement>('.text-cell .content-subtitle')?.textContent ?? '')
+            .trim()
+        ).map((row) => Number(row.dataset.row)).slice(0, 5);
         const sessionRow = renderedRows.find((row) =>
           row.getAttribute('data-classification') === 'session') ?? null;
         const ordinaryRow = renderedRows.find((row) =>
@@ -721,10 +767,24 @@ describe('EditChain History visual state matrix', () => {
           .map((cell) => getComputedStyle(cell).opacity)))]));
         const conversationCounts = { agent: 0, user: 0 };
         const conversationMismatches: Array<{ author: string; label: string }> = [];
+        const tokenRows: Array<{
+          kind: string; activity: string; icon: string; title: string; subtitle: string;
+        }> = [];
         for (const rendered of renderedRows) {
           const abs = Number(rendered.getAttribute('data-row'));
           const wire = window.__editchainRowAt?.(abs);
-          if (!wire || wire.activity_kind !== 'conversation') continue;
+          if (wire?.kind === 'token_count' || wire?.kind === 'token_usage_record') {
+            tokenRows.push({
+              kind: wire.kind,
+              activity: (rendered.querySelector('.activity-label')?.textContent ?? '').trim(),
+              icon: rendered.querySelector<HTMLElement>('.content-icon')
+                ?.dataset.contentIcon ?? '',
+              title: (rendered.querySelector('.content-title')?.textContent ?? '').trim(),
+              subtitle: (rendered.querySelector('.content-subtitle')?.textContent ?? '').trim(),
+            });
+          }
+          if (!wire || wire.activity_kind !== 'conversation' ||
+              rendered.getAttribute('data-classification') === 'session') continue;
           const author = String(wire.author ?? '');
           const label = (rendered.querySelector('.activity-label')?.textContent ?? '').trim();
           const expected = author === 'human' || author === 'user' ? 'user' : 'agent';
@@ -753,6 +813,14 @@ describe('EditChain History visual state matrix', () => {
             !chip.parentElement?.classList.contains('tags-cell')).length,
           contentChipCount: document.querySelectorAll(
             '.text-cell :is(' + chipSelector + ')').length,
+          activityIconCount: document.querySelectorAll(
+            '.activity-cell :is(svg, .content-icon)').length,
+          structuredRowCount: structuredRows.length,
+          contentStructureIssues,
+          obviousTitleRowCount: obviousTitleRows.length,
+          obviousTitleIssues,
+          workGroupCount: workGroupRows.length,
+          workGroupIssues,
           maxTagsPerRow: Math.max(0, ...renderedRows.map((row) =>
             row.querySelector('.tags-cell')?.children.length ?? 0)),
           resizeHandleColumns: resizeHandles.map((handle) => handle.dataset.col ?? ''),
@@ -787,11 +855,14 @@ describe('EditChain History visual state matrix', () => {
           opacityByColumn,
           conversationCounts,
           conversationMismatches,
+          tokenRows,
         };
       }, expandAbs);
       expect(ariaExpanded).toBe('true');
       if (nestedAbs != null) expect(nestedAriaExpanded).toBe('true');
       expect(activityAffordance.order).toEqual(['activity-label', 'subop-chevron']);
+      expect(activityAffordance.label.length).toBeGreaterThan(0);
+      expect(activityAffordance.iconCount).toBe(0);
       expect(activityAffordance.glyph).toBe('\u25be');
       expect(activityAffordance.colorMatches).toBe(true);
       expect(activityAffordance.contentChevron).toBe(false);
@@ -812,6 +883,13 @@ describe('EditChain History visual state matrix', () => {
       expect(contentPresentation.chipCount).toBeGreaterThan(0);
       expect(contentPresentation.misplacedChips).toBe(0);
       expect(contentPresentation.contentChipCount).toBe(0);
+      expect(contentPresentation.activityIconCount).toBe(0);
+      expect(contentPresentation.structuredRowCount).toBeGreaterThan(0);
+      expect(contentPresentation.contentStructureIssues).toEqual([]);
+      expect(contentPresentation.obviousTitleRowCount).toBeGreaterThan(0);
+      expect(contentPresentation.obviousTitleIssues).toEqual([]);
+      expect(contentPresentation.workGroupCount).toBeGreaterThan(0);
+      expect(contentPresentation.workGroupIssues).toEqual([]);
       expect(contentPresentation.maxTagsPerRow).toBeGreaterThan(1);
       expect(contentPresentation.resizeHandleColumns).toEqual([
         'graph', 'activity', 'tags', 'content', 'date',
@@ -844,6 +922,15 @@ describe('EditChain History visual state matrix', () => {
       expect(contentPresentation.conversationCounts.agent).toBeGreaterThan(0);
       expect(contentPresentation.conversationCounts.user).toBeGreaterThan(0);
       expect(contentPresentation.conversationMismatches).toEqual([]);
+      expect(contentPresentation.tokenRows.length).toBeGreaterThan(0);
+      for (const token of contentPresentation.tokenRows) {
+        expect(token.activity).toBe('meta');
+        expect(token.icon).toBe('settings');
+        expect(token.title).toBe(token.kind === 'token_count' ? 'Token count' : 'Token usage');
+        expect(token.subtitle).toMatch(/^\d{1,3}(?:,\d{3})*(?: \/ \d{1,3}(?:,\d{3})*)?$/);
+      }
+      expect(contentPresentation.tokenRows.some((token) =>
+        token.kind === 'token_count' && token.subtitle.includes(' / '))).toBe(true);
       expect((expanded.rowCount as number)).toBeGreaterThan(0);
       expect(expanded.uniqueRowCount).toBe(expanded.rowCount);
       await capture('bundle-expanded', false, {
@@ -870,8 +957,10 @@ describe('EditChain History visual state matrix', () => {
         if (!chevron) throw new Error('no .subop-chevron to collapse row ' + abs);
         chevron.click();
       }, expandAbs);
-      await browser.waitUntil(async () => browser.execute(() =>
-        document.querySelectorAll('.row-subop').length === 0), { timeout: 60000, interval: 100 });
+      await browser.waitUntil(async () => browser.execute((abs: number) =>
+        document.querySelector('.row[data-row="' + abs + '"]')
+          ?.getAttribute('aria-expanded') === 'false', expandAbs),
+      { timeout: 60000, interval: 100 });
       await waitIdle();
       await smoothScrollTo(0, 1200);
       await browser.pause(200);
@@ -985,8 +1074,9 @@ describe('EditChain History visual state matrix', () => {
       }, deltaX);
     const expectPointerWidth = (actual: number, expected: number): void => {
       // MouseEvent.clientX is integer-valued in Chromium, while the natural
-      // lane-derived graph width can be fractional (44.28px here).
-      expect(Math.abs(actual - expected)).toBeLessThanOrEqual(0.5);
+      // lane-derived graph width can be fractional. Depending on the handle's
+      // own fractional origin, restoring it can quantize by up to one CSS px.
+      expect(Math.abs(actual - expected)).toBeLessThanOrEqual(1);
     };
 
     const wideTarget = await browser.execute((natural: number) => {

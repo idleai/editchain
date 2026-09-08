@@ -122,6 +122,47 @@ describe('EditChain Rust history renderer (per-row SVG)', () => {
       const graphCanvases = document.querySelectorAll('#gpu-canvas-host canvas');
       const hydratedRows = Array.from(document.querySelectorAll(
         '#rows .row[data-row][data-key]:not(.row-placeholder)'));
+      const structuredRows = hydratedRows.filter((row) =>
+        !row.classList.contains('row-file'));
+      const omitsObviousTitle = (row: Element): boolean => {
+        const wire = window.__editchainRowAt?.(Number(row.getAttribute('data-row')));
+        const kind = String(wire?.kind ?? '');
+        const role = String(wire?.record_role ?? '');
+        return kind === 'git' || !!wire?.git_oid || kind === 'message' ||
+          kind === 'work-group' ||
+          (!kind && role === 'narrative');
+      };
+      const contentStructureIssues = structuredRows.filter((row) => {
+        const icon = row.querySelector<HTMLElement>('.text-cell .content-icon');
+        const svg = icon?.querySelector<SVGElement>('svg.content-icon-svg');
+        const title = row.querySelector<HTMLElement>('.text-cell .content-title');
+        const subtitle = row.querySelector<HTMLElement>('.text-cell .content-subtitle');
+        return !icon?.dataset.contentIcon || icon.getAttribute('aria-hidden') !== 'true' ||
+          !svg || svg.querySelectorAll('path').length === 0 ||
+          svg.getBoundingClientRect().width <= 0 || svg.getBoundingClientRect().height <= 0 ||
+          (omitsObviousTitle(row) ? !!title : !(title?.textContent ?? '').trim()) ||
+          !(subtitle?.textContent ?? '').trim();
+      }).map((row) => Number(row.getAttribute('data-row'))).slice(0, 5);
+      const obviousTitleRows = structuredRows.filter(omitsObviousTitle);
+      const obviousTitleIssues = obviousTitleRows.filter((row) =>
+        !!row.querySelector('.text-cell .content-title')
+      ).map((row) => Number(row.getAttribute('data-row'))).slice(0, 5);
+      const activityPresentationIssues = hydratedRows.filter((row) => {
+        const activity = row.querySelector<HTMLElement>('.activity-cell');
+        const label = activity?.querySelector<HTMLElement>('.activity-label');
+        return !(label?.textContent ?? '').trim() ||
+          !!activity?.querySelector('svg, .content-icon');
+      }).map((row) => Number(row.getAttribute('data-row'))).slice(0, 5);
+      const workGroupRows = hydratedRows.filter((row) =>
+        row.getAttribute('data-activity-bundle') === 'work-group');
+      const workGroupIssues = workGroupRows.filter((row) =>
+        row.getAttribute('data-activity-bundle') === 'work-group' &&
+        (!row.querySelector(
+          '.text-cell .content-icon[data-content-icon="layers"] svg.content-icon-svg path') ||
+         !!row.querySelector('.text-cell .content-title') ||
+         !(row.querySelector<HTMLElement>('.text-cell .content-subtitle')?.textContent ?? '')
+           .trim())
+      ).map((row) => Number(row.getAttribute('data-row'))).slice(0, 5);
       let fragmentCount = 0;
       const fragmentIssues: Array<{
         row: number; count: number; ariaHidden: string | null;
@@ -184,6 +225,13 @@ describe('EditChain Rust history renderer (per-row SVG)', () => {
         fragmentCount,
         fragmentMissing: hydratedRows.length - fragmentCount,
         fragmentIssues,
+        structuredRows: structuredRows.length,
+        contentStructureIssues,
+        obviousTitleRows: obviousTitleRows.length,
+        obviousTitleIssues,
+        activityPresentationIssues,
+        workGroupRows: workGroupRows.length,
+        workGroupIssues,
         maxAlignDelta: Math.round(maxAlignDelta * 100) / 100,
         alignExamples,
         renderCount: metrics?.renderCount ?? 0,
@@ -207,6 +255,13 @@ describe('EditChain Rust history renderer (per-row SVG)', () => {
     expect(debug.canvasHeight).toBe(0);
     expect(debug.fragmentCount).toBe(debug.domRows);
     expect(debug.fragmentMissing).toBe(0);
+    expect(debug.structuredRows).toBeGreaterThan(0);
+    expect(debug.contentStructureIssues).toEqual([]);
+    expect(debug.obviousTitleRows).toBeGreaterThan(0);
+    expect(debug.obviousTitleIssues).toEqual([]);
+    expect(debug.activityPresentationIssues).toEqual([]);
+    expect(debug.workGroupRows).toBeGreaterThan(0);
+    expect(debug.workGroupIssues).toEqual([]);
     expect(debug.maxAlignDelta).toBeLessThanOrEqual(1);
     expect(debug.renderCount).toBeGreaterThan(0);
     expect(debug.vertexCount).toBe(0);

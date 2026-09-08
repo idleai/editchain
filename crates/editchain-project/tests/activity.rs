@@ -435,10 +435,7 @@ fn work_groups_contract_all_linear_activity_between_chat_rows() {
     };
     assert_eq!(member_nodes.len(), 2);
     assert_eq!(grouped[1].activity_kind(), ActivityKind::Work);
-    assert!(grouped[1].summary().starts_with("file: src/history.rs — "));
-    assert!(grouped[1].summary().contains("2 activities"));
-    assert!(grouped[1].summary().contains("1 change"));
-    assert!(grouped[1].summary().contains("1 run"));
+    assert_eq!(grouped[1].summary(), "1 edit · 1 tool call");
 
     let empty_links = BTreeMap::new();
     let empty_notes = HashMap::new();
@@ -455,7 +452,7 @@ fn work_groups_contract_all_linear_activity_between_chat_rows() {
 }
 
 #[test]
-fn work_group_retains_existing_bundle_as_an_inner_member() {
+fn work_group_flattens_a_single_existing_bundle_into_direct_members() {
     let request_op = import_op(51, 1, None, None);
     let plan_old_op = import_op(52, 2, Some(request_op.id), None);
     let plan_new_op = import_op(53, 3, Some(plan_old_op.id), None);
@@ -503,10 +500,22 @@ fn work_group_retains_existing_bundle_as_an_inner_member() {
     let HistoryNode::WorkGroup { member_nodes, .. } = &grouped[1] else {
         panic!("expected outer work group");
     };
-    assert_eq!(member_nodes.len(), 1, "one direct nested bundle member");
-    assert!(matches!(member_nodes[0], HistoryNode::PlanBundle { .. }));
-    assert!(grouped[1].summary().contains("2 activities"));
-    assert!(grouped[1].summary().contains("2 plans"));
+    assert_eq!(
+        member_nodes.len(),
+        2,
+        "the original plans are direct members"
+    );
+    assert!(member_nodes
+        .iter()
+        .all(|member| !matches!(member, HistoryNode::PlanBundle { .. })));
+    assert_eq!(
+        member_nodes
+            .iter()
+            .map(HistoryNode::summary)
+            .collect::<Vec<_>>(),
+        vec!["Implementation plan", "Implementation plan"]
+    );
+    assert_eq!(grouped[1].summary(), "2 planning steps");
 }
 
 #[test]

@@ -120,7 +120,25 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 ///
 /// Revision 36 adds expandable source-control-style file rows with immutable
 /// Git object identities and retained agent-edit identities.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 36;
+///
+/// Revision 37 flattens a work group's sole nested Execute/Plan group so its
+/// original activities expand directly beneath the work row.
+///
+/// Revision 38 replaces provider-payload `WorkGroup` headlines with concise,
+/// provider-neutral activity breakdowns.
+///
+/// Revision 39 retains compact token-accounting totals so expanded metadata
+/// rows can show numeric usage and context-window subtitles.
+///
+/// Revision 40 keeps metadata out of parent summaries and adds concrete tool
+/// invocation arguments to tool rows.
+///
+/// Revision 41 keeps bundled tool results child-only when the parent already
+/// has concrete invocation detail.
+///
+/// Revision 42 preserves bounded command-output carriers and uses their stdout
+/// or formatted output as the completed command row's Content subtitle.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 42;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.
