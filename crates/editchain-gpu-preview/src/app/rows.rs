@@ -20,9 +20,9 @@
 //!   metadata,
 //! - graph data consumed by the wgpu frame contract (`lane`, `above`, `below`,
 //!   `transitions`, `is_subop`, `is_bundle`), and
-//! - the exact `openJson` identity envelope for eligible rows and nothing
-//!   else. Ineligible rows yield `None` (production announces "No raw record
-//!   is available for this row").
+//! - the exact `openJson` identity envelope for eligible rows and `openDiff`
+//!   envelope for source-control-style file rows. Ineligible rows yield
+//!   `None` (production announces "No raw record is available for this row").
 //!
 //! The summary is represented as a structured, HTML-safe token tree
 //! ([`MdInline`]/[`MdLine`]/[`Summary`]) instead of markup: no HTML string is
@@ -124,7 +124,7 @@ pub(crate) struct RowIdentity {
     /// Presentation hierarchy depth (`0` top-level, `1` work member, `2`
     /// existing detail/bundle member nested beneath that work member).
     pub(crate) hierarchy_depth: u8,
-    /// `subop_kind` wire value (Codicon selector; `meta`/unknown -> `info`).
+    /// `subop_kind` wire value used as a semantic fallback for detail rows.
     pub(crate) subop_kind: String,
     pub(crate) op_id: String,
     pub(crate) git_oid: String,
@@ -170,12 +170,15 @@ const RECORD_ROLE_CLASSES: [&str; 7] = [
 ];
 
 /// `TOOL_PAYLOAD_TEXT_KEYS` — BFS visit order for tool envelopes.
-const TOOL_PAYLOAD_TEXT_KEYS: [&str; 15] = [
+const TOOL_PAYLOAD_TEXT_KEYS: [&str; 18] = [
     "text",
     "output_text",
     "input_text",
     "message",
     "summary",
+    "stdout",
+    "formatted_output",
+    "formattedOutput",
     "output",
     "content",
     "status",
@@ -1946,6 +1949,9 @@ fn tool_wrapper_len(candidate: &str) -> Option<usize> {
         return None;
     }
     let mut cursor = 5usize;
+    while chars.get(cursor).is_some_and(|c| c.is_whitespace()) {
+        cursor = cursor.saturating_add(1);
+    }
     let mut name_len = 0usize;
     while let Some(c) = chars.get(cursor).copied() {
         if !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-')) {
@@ -2075,6 +2081,168 @@ pub(crate) fn relation_badges(row: &Value) -> Vec<ChromeItem> {
     out
 }
 
+/// One self-contained VS Code Codicon used at the start of structured Content.
+///
+/// The SVG geometry is compiled into the WASM renderer so icons remain visible
+/// in a sandboxed webview without relying on workbench-global icon fonts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActivityIcon {
+    Work,
+    Agent,
+    User,
+    Plan,
+    Explore,
+    Execute,
+    Change,
+    Verify,
+    Diagnose,
+    Coordinate,
+    SourceControl,
+    External,
+    System,
+}
+
+impl ActivityIcon {
+    /// Stable Codicon name exposed to DOM/test probes.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            ActivityIcon::Work => "layers",
+            ActivityIcon::Agent => "robot",
+            ActivityIcon::User => "account",
+            ActivityIcon::Plan => "checklist",
+            ActivityIcon::Explore => "search",
+            ActivityIcon::Execute => "tools",
+            ActivityIcon::Change => "edit",
+            ActivityIcon::Verify => "pass",
+            ActivityIcon::Diagnose => "bug",
+            ActivityIcon::Coordinate => "type-hierarchy",
+            ActivityIcon::SourceControl => "source-control",
+            ActivityIcon::External => "link-external",
+            ActivityIcon::System => "settings",
+        }
+    }
+
+    /// Source view box for this Codicon's vector geometry.
+    pub(crate) fn view_box(self) -> &'static str {
+        match self {
+            ActivityIcon::SourceControl => "0 0 24 24",
+            ActivityIcon::Work
+            | ActivityIcon::Agent
+            | ActivityIcon::User
+            | ActivityIcon::Plan
+            | ActivityIcon::Explore
+            | ActivityIcon::Execute
+            | ActivityIcon::Change
+            | ActivityIcon::Verify
+            | ActivityIcon::Diagnose
+            | ActivityIcon::Coordinate
+            | ActivityIcon::External
+            | ActivityIcon::System => "0 0 16 16",
+        }
+    }
+
+    /// Vector paths that make up the icon.
+    pub(crate) fn paths(self) -> &'static [ActivityIconPath] {
+        match self {
+            ActivityIcon::Work => &[
+                ActivityIconPath {
+                    d: r"M8 8.99993C7.819 8.99993 7.643 8.95093 7.486 8.85793L2.486 5.85693C2.186 5.67793 2 5.34893 2 4.99993C2 4.65093 2.187 4.32093 2.486 4.14193L7.486 1.14293C7.789 0.95693 8.207 0.95493 8.517 1.14493L13.513 4.14293C13.813 4.32293 13.999 4.65093 13.999 4.99993C13.999 5.34893 13.812 5.67893 13.513 5.85793L8.513 8.85693C8.357 8.95093 8.181 8.99993 8 8.99993ZM8 1.99993L3 4.99993L8 7.99993L13 4.99993L8 1.99993Z",
+                    even_odd: false,
+                },
+                ActivityIconPath {
+                    d: r"M2.146 6.9873L8 10.5003L13.854 6.9873C13.946 7.1413 14 7.3173 14 7.5003C14 7.8493 13.814 8.1783 13.514 8.3583L8.514 11.3573C8.357 11.4513 8.181 11.5003 8 11.5003C7.819 11.5003 7.642 11.4513 7.486 11.3583L2.486 8.35731C2.187 8.17931 2 7.8503 2 7.5003C2 7.3163 2.054 7.1403 2.146 6.9873Z",
+                    even_odd: false,
+                },
+                ActivityIconPath {
+                    d: r"M2.146 9.4873L8 13.0003L13.854 9.4873C13.946 9.6413 14 9.8173 14 10.0003C14 10.3493 13.814 10.6783 13.514 10.8583L8.514 13.8573C8.357 13.9513 8.181 14.0003 8 14.0003C7.819 14.0003 7.642 13.9513 7.486 13.8583L2.486 10.8573C2.187 10.6793 2 10.3503 2 10.0003C2 9.8163 2.054 9.6403 2.146 9.4873Z",
+                    even_odd: false,
+                },
+            ],
+            ActivityIcon::Agent => &[ActivityIconPath {
+                d: r"M12 9H4C3.173 9 2.5 9.673 2.5 10.5V11C2.5 11.123 2.562 14 8 14C13.438 14 13.5 11.123 13.5 11V10.5C13.5 9.673 12.827 9 12 9ZM12.5 10.991C12.497 11.073 12.372 13 8 13C3.628 13 3.503 11.073 3.5 11V10.5C3.5 10.224 3.724 10 4 10H12C12.276 10 12.5 10.224 12.5 10.5V10.991ZM5.5 8H10.5C11.327 8 12 7.327 12 6.5V3.5C12 2.673 11.327 2 10.5 2H8.5V1.5C8.5 1.224 8.276 1 8 1C7.724 1 7.5 1.224 7.5 1.5V2H5.5C4.673 2 4 2.673 4 3.5V6.5C4 7.327 4.673 8 5.5 8ZM5 3.5C5 3.224 5.224 3 5.5 3H10.5C10.776 3 11 3.224 11 3.5V6.5C11 6.776 10.776 7 10.5 7H5.5C5.224 7 5 6.776 5 6.5V3.5ZM5.75 5C5.75 4.586 6.086 4.25 6.5 4.25C6.914 4.25 7.25 4.586 7.25 5C7.25 5.414 6.914 5.75 6.5 5.75C6.086 5.75 5.75 5.414 5.75 5ZM8.75 5C8.75 4.586 9.086 4.25 9.5 4.25C9.914 4.25 10.25 4.586 10.25 5C10.25 5.414 9.914 5.75 9.5 5.75C9.086 5.75 8.75 5.414 8.75 5Z",
+                even_odd: false,
+            }],
+            ActivityIcon::User => &[ActivityIconPath {
+                d: r"M8 2C4.686 2 2 4.686 2 8C2 11.314 4.686 14 8 14C11.314 14 14 11.314 14 8C14 4.686 11.314 2 8 2ZM1 8C1 4.134 4.134 1 8 1C11.866 1 15 4.134 15 8C15 11.866 11.866 15 8 15C4.134 15 1 11.866 1 8ZM8 12.25C9.933 12.25 11.5 11.036 11.5 9.214C11.5 8.543 10.956 8 10.286 8H5.715C5.044 8 4.501 8.544 4.501 9.214C4.501 11.035 6.068 12.25 8.001 12.25H8ZM8 7.25C9.036 7.25 9.875 6.411 9.875 5.375C9.875 4.339 9.036 3.5 8 3.5C6.964 3.5 6.125 4.339 6.125 5.375C6.125 6.411 6.964 7.25 8 7.25Z",
+                even_odd: false,
+            }],
+            ActivityIcon::Plan => &[ActivityIconPath {
+                d: r"M4.85401 2.146C5.04901 2.341 5.04901 2.658 4.85401 2.853L2.85401 4.853C2.65901 5.048 2.34201 5.048 2.14701 4.853L1.14701 3.853C0.952013 3.658 0.952013 3.341 1.14701 3.146C1.34201 2.951 1.65901 2.951 1.85401 3.146L2.50001 3.792L4.14601 2.146C4.34101 1.951 4.65901 1.951 4.85401 2.146ZM14.5 4H6.50001C6.22401 4 6.00001 3.776 6.00001 3.5C6.00001 3.224 6.22401 3 6.50001 3H14.5C14.776 3 15 3.224 15 3.5C15 3.776 14.776 4 14.5 4ZM4.85401 11.146C5.04901 11.341 5.04901 11.658 4.85401 11.853L2.85401 13.853C2.65901 14.048 2.34201 14.048 2.14701 13.853L1.14701 12.853C0.952013 12.658 0.952013 12.341 1.14701 12.146C1.34201 11.951 1.65901 11.951 1.85401 12.146L2.50001 12.792L4.14601 11.146C4.34101 10.951 4.65901 10.951 4.85401 11.146ZM14.5 13H6.50001C6.22401 13 6.00001 12.776 6.00001 12.5C6.00001 12.224 6.22401 12 6.50001 12H14.5C14.776 12 15 12.224 15 12.5C15 12.776 14.776 13 14.5 13ZM4.85401 6.646C5.04901 6.841 5.04901 7.158 4.85401 7.353L2.85401 9.353C2.65901 9.548 2.34201 9.548 2.14701 9.353L1.14701 8.353C0.952013 8.158 0.952013 7.841 1.14701 7.646C1.34201 7.451 1.65901 7.451 1.85401 7.646L2.50001 8.292L4.14601 6.646C4.34101 6.451 4.65901 6.451 4.85401 6.646ZM14.5 8.5H6.50001C6.22401 8.5 6.00001 8.276 6.00001 8C6.00001 7.724 6.22401 7.5 6.50001 7.5H14.5C14.776 7.5 15 7.724 15 8C15 8.276 14.776 8.5 14.5 8.5Z",
+                even_odd: false,
+            }],
+            ActivityIcon::Explore => &[ActivityIconPath {
+                d: r"M10.0195 10.7266C9.06578 11.5217 7.83875 12 6.5 12C3.46243 12 1 9.53757 1 6.5C1 3.46243 3.46243 1 6.5 1C9.53757 1 12 3.46243 12 6.5C12 7.83875 11.5217 9.06578 10.7266 10.0195L13.8535 13.1464C14.0488 13.3417 14.0488 13.6583 13.8535 13.8536C13.6583 14.0488 13.3417 14.0488 13.1464 13.8536L10.0195 10.7266ZM11 6.5C11 4.01472 8.98528 2 6.5 2C4.01472 2 2 4.01472 2 6.5C2 8.98528 4.01472 11 6.5 11C8.98528 11 11 8.98528 11 6.5Z",
+                even_odd: false,
+            }],
+            ActivityIcon::Execute => &[ActivityIconPath {
+                d: r"M5.66901 0.999997C5.52101 0.945997 5.34701 0.968997 5.21401 1.062C5.08101 1.155 5.00201 1.308 5.00201 1.47V3.286C5.00201 3.561 4.77701 3.786 4.50201 3.786C4.22701 3.786 4.00201 3.561 4.00201 3.286V1.47C4.00201 1.308 3.92301 1.156 3.79001 1.062C3.65801 0.967997 3.48501 0.945997 3.33501 0.999997C1.93901 1.495 1.00201 2.816 1.00201 4.287C1.00201 5.646 1.79201 6.876 3.00201 7.449V13.5C3.00201 14.327 3.67501 15 4.50201 15C5.32901 15 6.00201 14.327 6.00201 13.5V7.449C7.21201 6.876 8.00201 5.646 8.00201 4.287C8.00201 2.816 7.06401 1.495 5.66901 0.999997ZM5.33601 6.644C5.13601 6.714 5.00201 6.904 5.00201 7.116V13.501C5.00201 13.776 4.77701 14.001 4.50201 14.001C4.22701 14.001 4.00201 13.776 4.00201 13.501V7.116C4.00201 6.904 3.86801 6.715 3.66801 6.644C2.67201 6.292 2.00201 5.345 2.00201 4.288C2.00201 3.496 2.38501 2.765 3.00201 2.301V3.288C3.00201 4.115 3.67501 4.788 4.50201 4.788C5.32901 4.788 6.00201 4.115 6.00201 3.288V2.301C6.61901 2.765 7.00201 3.496 7.00201 4.288C7.00201 5.346 6.33201 6.293 5.33601 6.644ZM13.5 8H13.002V4.118L13.449 3.223C13.509 3.105 13.518 2.967 13.476 2.841L12.976 1.341C12.908 1.137 12.716 0.998997 12.501 0.998997H10.501C10.286 0.998997 10.095 1.137 10.026 1.341L9.52601 2.841C9.48401 2.967 9.49401 3.105 9.55301 3.223L10 4.118V8H9.50001C9.22401 8 9.00001 8.224 9.00001 8.5V12.5C9.00001 13.879 10.121 15 11.5 15C12.879 15 14 13.879 14 12.5V8.5C14 8.224 13.776 8 13.5 8ZM10.862 2.001H12.141L12.461 2.963L12.054 3.777C12.02 3.846 12.001 3.923 12.001 4.001V8.001H11.001V4.001C11.001 3.924 10.983 3.847 10.949 3.777L10.542 2.963L10.862 2.001ZM13.002 12.5C13.002 13.327 12.329 14 11.502 14C10.675 14 10.002 13.327 10.002 12.5V9H13.002V12.5Z",
+                even_odd: false,
+            }],
+            ActivityIcon::Change => &[ActivityIconPath {
+                d: r"M14.236 1.76386C13.2123 0.740172 11.5525 0.740171 10.5289 1.76386L2.65722 9.63549C2.28304 10.0097 2.01623 10.4775 1.88467 10.99L1.01571 14.3755C0.971767 14.5467 1.02148 14.7284 1.14646 14.8534C1.27144 14.9783 1.45312 15.028 1.62432 14.9841L5.00978 14.1151C5.52234 13.9836 5.99015 13.7168 6.36433 13.3426L14.236 5.47097C15.2596 4.44728 15.2596 2.78755 14.236 1.76386ZM11.236 2.47097C11.8691 1.8378 12.8957 1.8378 13.5288 2.47097C14.162 3.10413 14.162 4.1307 13.5288 4.76386L12.75 5.54269L10.4571 3.24979L11.236 2.47097ZM9.75002 3.9569L12.0429 6.24979L5.65722 12.6355C5.40969 12.883 5.10023 13.0595 4.76117 13.1465L2.19447 13.8053L2.85327 11.2386C2.9403 10.8996 3.1168 10.5901 3.36433 10.3426L9.75002 3.9569Z",
+                even_odd: false,
+            }],
+            ActivityIcon::Verify => &[
+                ActivityIconPath {
+                    d: r"M10.6484 5.64648C10.8434 5.45148 11.1605 5.45148 11.3555 5.64648C11.5498 5.84137 11.5499 6.15766 11.3555 6.35254L7.35547 10.3525C7.25747 10.4495 7.12898 10.499 7.00098 10.499C6.87299 10.499 6.74545 10.4505 6.64746 10.3525L4.64746 8.35254C4.45247 8.15754 4.45248 7.84148 4.64746 7.64648C4.84246 7.45148 5.15949 7.45148 5.35449 7.64648L7 9.29199L10.6465 5.64648H10.6484Z",
+                    even_odd: false,
+                },
+                ActivityIconPath {
+                    d: r"M8 1C11.86 1 15 4.14 15 8C15 11.86 11.86 15 8 15C4.14 15 1 11.86 1 8C1 4.14 4.14 1 8 1ZM8 2C4.691 2 2 4.691 2 8C2 11.309 4.691 14 8 14C11.309 14 14 11.309 14 8C14 4.691 11.309 2 8 2Z",
+                    even_odd: true,
+                },
+            ],
+            ActivityIcon::Diagnose => &[ActivityIconPath {
+                d: r"M14.5 8H13V6C13 5.63 12.898 5.283 12.722 4.985L13.853 3.854C14.048 3.659 14.048 3.342 13.853 3.147C13.658 2.952 13.341 2.952 13.146 3.147L12.015 4.278C11.717 4.102 11.37 4 11 4C11 2.346 9.654 1 8 1C6.346 1 5 2.346 5 4C4.63 4 4.283 4.102 3.985 4.278L2.854 3.147C2.659 2.952 2.342 2.952 2.147 3.147C1.952 3.342 1.952 3.659 2.147 3.854L3.278 4.985C3.102 5.283 3 5.63 3 6V8H1.5C1.224 8 1 8.224 1 8.5C1 8.776 1.224 9 1.5 9H3C3 10.199 3.424 11.3 4.13 12.163L2.396 13.897C2.201 14.092 2.201 14.409 2.396 14.604C2.494 14.702 2.622 14.75 2.75 14.75C2.878 14.75 3.006 14.701 3.104 14.604L4.838 12.87C5.7 13.576 6.802 14 8.001 14C9.2 14 10.301 13.576 11.164 12.87L12.898 14.604C12.996 14.702 13.124 14.75 13.252 14.75C13.38 14.75 13.508 14.701 13.606 14.604C13.801 14.409 13.801 14.092 13.606 13.897L11.872 12.163C12.578 11.301 13.002 10.199 13.002 9H14.502C14.778 9 15.002 8.776 15.002 8.5C15.002 8.224 14.778 8 14.502 8H14.5ZM8 2C9.103 2 10 2.897 10 4H6C6 2.897 6.897 2 8 2ZM12 9C12 11.206 10.206 13 8 13C5.794 13 4 11.206 4 9V6C4 5.449 4.448 5 5 5H11C11.552 5 12 5.449 12 6V9Z",
+                even_odd: false,
+            }],
+            ActivityIcon::Coordinate => &[ActivityIconPath {
+                d: r"M8 1C6.61929 1 5.5 2.11929 5.5 3.5C5.5 4.7093 6.35863 5.71806 7.4995 5.94989V6.99994H5.36684C4.61209 6.99994 4.00024 7.61178 4.00024 8.36653V10.05C2.859 10.2815 2 11.2904 2 12.5C2 13.8807 3.11929 15 4.5 15C5.88071 15 7 13.8807 7 12.5C7 11.2906 6.14124 10.2818 5.00024 10.0501V8.36653C5.00024 8.16407 5.16437 7.99994 5.36684 7.99994H10.6337C10.8361 7.99994 11.0002 8.16407 11.0002 8.36653V10.05C9.859 10.2815 9 11.2904 9 12.5C9 13.8807 10.1193 15 11.5 15C12.8807 15 14 13.8807 14 12.5C14 11.2906 13.1412 10.2818 12.0002 10.0501V8.36653C12.0002 7.61178 11.3884 6.99994 10.6337 6.99994H8.4995V5.95009C9.64087 5.71865 10.5 4.70966 10.5 3.5C10.5 2.11929 9.38071 1 8 1ZM6.5 3.5C6.5 2.67157 7.17157 2 8 2C8.82843 2 9.5 2.67157 9.5 3.5C9.5 4.32843 8.82843 5 8 5C7.17157 5 6.5 4.32843 6.5 3.5ZM3 12.5C3 11.6716 3.67157 11 4.5 11C5.32843 11 6 11.6716 6 12.5C6 13.3284 5.32843 14 4.5 14C3.67157 14 3 13.3284 3 12.5ZM11.5 11C12.3284 11 13 11.6716 13 12.5C13 13.3284 12.3284 14 11.5 14C10.6716 14 10 13.3284 10 12.5C10 11.6716 10.6716 11 11.5 11Z",
+                even_odd: false,
+            }],
+            ActivityIcon::SourceControl => &[ActivityIconPath {
+                d: r"M21 8.25C21 6.1815 19.3185 4.5 17.25 4.5C15.1815 4.5 13.5 6.1815 13.5 8.25C13.5 10.023 14.739 11.5035 16.395 11.892C16.116 12.819 15.2655 13.5 14.25 13.5H9.75C8.9025 13.5 8.1285 13.7925 7.5 14.268V7.4235C9.21 7.0755 10.5 5.5605 10.5 3.75C10.5 1.6815 8.8185 0 6.75 0C4.6815 0 3 1.6815 3 3.75C3 5.562 4.29 7.0755 6 7.4235V16.575C4.29 16.923 3 18.438 3 20.2485C3 22.317 4.6815 23.9985 6.75 23.9985C8.8185 23.9985 10.5 22.317 10.5 20.2485C10.5 18.4755 9.261 16.995 7.605 16.6065C7.884 15.6795 8.7345 14.9985 9.75 14.9985H14.25C16.0845 14.9985 17.61 13.6725 17.931 11.9295C19.674 11.607 21 10.0845 21 8.25ZM4.5 3.75C4.5 2.5095 5.5095 1.5 6.75 1.5C7.9905 1.5 9 2.5095 9 3.75C9 4.9905 7.9905 6 6.75 6C5.5095 6 4.5 4.9905 4.5 3.75ZM9 20.25C9 21.4905 7.9905 22.5 6.75 22.5C5.5095 22.5 4.5 21.4905 4.5 20.25C4.5 19.0095 5.5095 18 6.75 18C7.9905 18 9 19.0095 9 20.25ZM17.25 10.5C16.0095 10.5 15 9.4905 15 8.25C15 7.0095 16.0095 6 17.25 6C18.4905 6 19.5 7.0095 19.5 8.25C19.5 9.4905 18.4905 10.5 17.25 10.5Z",
+                even_odd: false,
+            }],
+            ActivityIcon::External => &[ActivityIconPath {
+                d: r"M15 9.5V12.5C15 13.879 13.879 15 12.5 15H3.5C2.121 15 1 13.879 1 12.5V3.5C1 2.121 2.121 1 3.5 1H6.5C6.776 1 7 1.224 7 1.5C7 1.776 6.776 2 6.5 2H3.5C2.673 2 2 2.673 2 3.5V12.5C2 13.327 2.673 14 3.5 14H12.5C13.327 14 14 13.327 14 12.5V9.5C14 9.224 14.224 9 14.5 9C14.776 9 15 9.224 15 9.5ZM14.5 1H9.5C9.224 1 9 1.224 9 1.5C9 1.776 9.224 2 9.5 2H13.293L9.147 6.146C8.952 6.341 8.952 6.658 9.147 6.853C9.245 6.951 9.373 6.999 9.501 6.999C9.629 6.999 9.757 6.95 9.855 6.853L14.001 2.707V6.5C14.001 6.776 14.225 7 14.501 7C14.777 7 15.001 6.776 15.001 6.5V1.5C15.001 1.224 14.777 1 14.501 1H14.5Z",
+                even_odd: false,
+            }],
+            ActivityIcon::System => &[ActivityIconPath {
+                d: r"M6 9.5C6.93191 9.5 7.71496 10.1374 7.93699 11L13.5 11C13.7761 11 14 11.2239 14 11.5C14 11.7455 13.8231 11.9496 13.5899 11.9919L13.5 12L7.93673 12.001C7.71435 12.8631 6.93155 13.5 6 13.5C5.06845 13.5 4.28565 12.8631 4.06327 12.001L2.5 12C2.22386 12 2 11.7761 2 11.5C2 11.2545 2.17688 11.0504 2.41012 11.0081L2.5 11L4.06301 11C4.28504 10.1374 5.06809 9.5 6 9.5ZM6 10.5C5.44772 10.5 5 10.9477 5 11.5C5 12.0523 5.44772 12.5 6 12.5C6.55228 12.5 7 12.0523 7 11.5C7 10.9477 6.55228 10.5 6 10.5ZM10 2.5C10.9319 2.5 11.715 3.13738 11.937 3.99998L13.5 4C13.7761 4 14 4.22386 14 4.5C14 4.74546 13.8231 4.94961 13.5899 4.99194L13.5 5L11.9367 5.00102C11.7144 5.86312 10.9316 6.5 10 6.5C9.06845 6.5 8.28565 5.86312 8.06327 5.00102L2.5 5C2.22386 5 2 4.77614 2 4.5C2 4.25454 2.17688 4.05039 2.41012 4.00806L2.5 4L8.06301 3.99998C8.28504 3.13738 9.06809 2.5 10 2.5ZM10 3.5C9.44772 3.5 9 3.94772 9 4.5C9 5.05228 9.44772 5.5 10 5.5C10.5523 5.5 11 5.05228 11 4.5C11 3.94772 10.5523 3.5 10 3.5Z",
+                even_odd: false,
+            }],
+        }
+    }
+
+    /// Resolve the Content icon for one stable Activity classification.
+    fn from_label(label: &str) -> Option<ActivityIcon> {
+        match label {
+            "work" => Some(ActivityIcon::Work),
+            "agent" => Some(ActivityIcon::Agent),
+            "user" => Some(ActivityIcon::User),
+            "plan" => Some(ActivityIcon::Plan),
+            "explore" => Some(ActivityIcon::Explore),
+            "tooluse" => Some(ActivityIcon::Execute),
+            "change" => Some(ActivityIcon::Change),
+            "verify" => Some(ActivityIcon::Verify),
+            "diagnose" => Some(ActivityIcon::Diagnose),
+            "coordinate" => Some(ActivityIcon::Coordinate),
+            "git" => Some(ActivityIcon::SourceControl),
+            "external" => Some(ActivityIcon::External),
+            "meta" | "system" => Some(ActivityIcon::System),
+            _ => None,
+        }
+    }
+}
+
+/// One vector path inside a Content icon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ActivityIconPath {
+    pub(crate) d: &'static str,
+    pub(crate) even_odd: bool,
+}
+
 /// Provider-neutral activities with concise labels for the dedicated Activity
 /// column. Conversation rows are refined to `agent` or `user` from their
 /// author; the remaining values are presentation labels rather than badges.
@@ -2126,7 +2294,7 @@ impl ActivityKind {
             ActivityKind::Coordinate => "coordinate",
             ActivityKind::SourceControl => "git",
             ActivityKind::External => "external",
-            ActivityKind::System => "system",
+            ActivityKind::System => "meta",
         }
     }
 }
@@ -2139,7 +2307,7 @@ pub(crate) struct RowClassification {
     pub(crate) label: String,
     /// Field used to resolve the label (`activity_kind`, `kind`, etc.).
     pub(crate) source: String,
-    /// Hover/accessibility description retaining the unshortened wire value.
+    /// Hover/accessibility description retaining the semantic display value.
     pub(crate) title: String,
 }
 
@@ -2153,10 +2321,15 @@ impl RowClassification {
             "git_oid" => "Git identity",
             _ => "Classification",
         };
+        let title = if label == "meta" {
+            "Activity: meta".to_owned()
+        } else {
+            format!("{source_title}: {wire_value}")
+        };
         RowClassification {
             label: label.to_owned(),
             source: source.to_owned(),
-            title: format!("{source_title}: {wire_value}"),
+            title,
         }
     }
 
@@ -2209,7 +2382,7 @@ pub(crate) fn row_classification(row: &Value) -> RowClassification {
     }
 
     if wire::bool(row, "is_system") {
-        return RowClassification::new("system", "is_system", "true");
+        return RowClassification::new("meta", "is_system", "true");
     }
     if let Some(kind) = classification_token(&kind) {
         return RowClassification::new(&classification_fallback(kind), "kind", kind);
@@ -2366,7 +2539,7 @@ fn work_unit_fallback(activity_kind: &str) -> Option<&'static str> {
         "coordinate" => Some("Coordinate"),
         "source_control" => Some("Git"),
         "external" => Some("External"),
-        "system" => Some("System"),
+        "system" => Some("Meta"),
         _ => None,
     }
 }
@@ -2676,13 +2849,133 @@ pub(crate) fn promoted_kind(row: &Value, view: ViewMode) -> Option<PromotedKind>
     }
 }
 
-/// `subopIcon` — Codicon glyph name for a sub-op semantic class.
-pub(crate) fn subop_icon(subop_kind: &str) -> &'static str {
-    match subop_kind {
-        "edit" => "edit",
-        "msg" => "comment",
-        "tool_result" => "output",
-        _ => "info",
+/// Resolve the semantic icon used by an ordinary Content row. The explicit
+/// activity taxonomy is authoritative; kind/sub-op fallbacks keep older and
+/// forward-compatible rows inside the same visual grammar.
+fn content_icon(row: &Value) -> ActivityIcon {
+    if let Some(icon) = ActivityIcon::from_label(&row_classification(row).label) {
+        return icon;
+    }
+    match row_str(row, "subop_kind").as_str() {
+        "edit" => return ActivityIcon::Change,
+        "msg" => {
+            return if matches!(row_str(row, "author").trim(), "human" | "user") {
+                ActivityIcon::User
+            } else {
+                ActivityIcon::Agent
+            };
+        }
+        "tool_result" => return ActivityIcon::Execute,
+        "meta" | "" => {}
+        _ => return ActivityIcon::System,
+    }
+    match row_str(row, "kind").as_str() {
+        "git" => ActivityIcon::SourceControl,
+        "file" => ActivityIcon::Change,
+        "message" => {
+            if matches!(row_str(row, "author").trim(), "human" | "user") {
+                ActivityIcon::User
+            } else {
+                ActivityIcon::Agent
+            }
+        }
+        "reflection" => ActivityIcon::Plan,
+        "command" | "tool" | "tool_result" => ActivityIcon::Execute,
+        "error" => ActivityIcon::Diagnose,
+        "import" if row_str(row, "record_role") == "artifact" => ActivityIcon::Change,
+        "import" if row_str(row, "record_role") == "narrative" => ActivityIcon::Plan,
+        _ => ActivityIcon::System,
+    }
+}
+
+/// Recover a provider's tool name from the established `tool: NAME …`
+/// summary wrapper. The display-summary compactor removes that wrapper from
+/// the subtitle, making the name a natural compact title rather than repeated
+/// prose.
+fn tool_name_from_summary(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let candidate = leading_container_tag_len(trimmed)
+        .and_then(|len| trimmed.get(len..))
+        .unwrap_or(trimmed)
+        .trim();
+    let wrapper_len = tool_wrapper_len(candidate)?;
+    let wrapped = candidate.get(5..wrapper_len)?.trim();
+    (!wrapped.is_empty()).then(|| wrapped.to_owned())
+}
+
+/// Humanize a forward-compatible kind token without inventing provider
+/// semantics (`future_kind` -> `Future kind`).
+fn humanize_content_kind(value: &str) -> String {
+    let words = value
+        .trim()
+        .split(|c: char| c == '_' || c == '-' || c.is_whitespace())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<&str>>()
+        .join(" ");
+    let mut chars = words.chars();
+    let Some(first) = chars.next() else {
+        return "Activity".to_owned();
+    };
+    first.to_uppercase().chain(chars).collect()
+}
+
+/// Resolve the optional compact title between Content's icon and authored
+/// summary. Commit, message, and aggregate work rows omit the redundant noun;
+/// tool wrappers can provide a more useful concrete tool name for less obvious
+/// activity.
+fn content_title(row: &Value, summary_source: &str) -> String {
+    let kind = row_str(row, "kind");
+    let role = row_str(row, "record_role");
+    if kind == "git" || !row_str(row, "git_oid").is_empty() {
+        return String::new();
+    }
+    if kind == "tool" {
+        if let Some(tool_name) = tool_name_from_summary(summary_source) {
+            return tool_name;
+        }
+        return if role == "result" {
+            "Tool result".to_owned()
+        } else {
+            "Tool".to_owned()
+        };
+    }
+    match kind.as_str() {
+        "message" | "work-group" => String::new(),
+        "command" if role == "result" => "Command output".to_owned(),
+        "command" => "Command".to_owned(),
+        "tool_result" => "Tool result".to_owned(),
+        "file" => "Change".to_owned(),
+        "reflection" => "Reflection".to_owned(),
+        "error" => "Error".to_owned(),
+        "note" => "Note".to_owned(),
+        "import" => "Import".to_owned(),
+        "token_usage_record" => "Token usage".to_owned(),
+        "token_count" => "Token count".to_owned(),
+        "world_state" => "World state".to_owned(),
+        "turn_context" => "Turn context".to_owned(),
+        "task_complete" => "Task complete".to_owned(),
+        "session_title" => "Session title".to_owned(),
+        "session_meta" => "Session metadata".to_owned(),
+        "turn_aborted" => "Turn aborted".to_owned(),
+        "execute-run" => "Run".to_owned(),
+        "plan-repeat" => "Plan".to_owned(),
+        "" => match role.as_str() {
+            "narrative" => String::new(),
+            "action" => "Action".to_owned(),
+            "result" => "Result".to_owned(),
+            "artifact" => "Artifact".to_owned(),
+            "lifecycle" => "Metadata".to_owned(),
+            "echo" => "Echo".to_owned(),
+            _ => "Activity".to_owned(),
+        },
+        other => humanize_content_kind(other),
+    }
+}
+
+fn content_heading(row: &Value, summary_source: &str) -> ContentHeading {
+    ContentHeading {
+        icon: content_icon(row),
+        title: content_title(row, summary_source),
     }
 }
 
@@ -2751,17 +3044,103 @@ pub(crate) struct Disclosure {
     pub(crate) label: String,
 }
 
-/// Sub-op row content: small Codicon and indented summary. Semantic tags live
-/// in the dedicated Tags column.
+/// Semantic lead for a structured Content cell. Obvious row kinds may leave
+/// `title` empty so the icon leads directly into the subtitle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ContentHeading {
+    pub(crate) icon: ActivityIcon,
+    pub(crate) title: String,
+}
+
+/// Sub-op row content: semantic icon, compact type/tool title, and indented
+/// authored summary. Semantic tags live in the dedicated Tags column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SubopContent {
-    pub(crate) icon: &'static str,
+    pub(crate) heading: Option<ContentHeading>,
     pub(crate) summary: Summary,
+}
+
+/// Source-control status for a rendered file row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileRowStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    TypeChanged,
+    Unknown,
+}
+
+impl FileRowStatus {
+    fn from_wire(value: &str) -> Self {
+        match value {
+            "added" => Self::Added,
+            "modified" => Self::Modified,
+            "deleted" => Self::Deleted,
+            "renamed" => Self::Renamed,
+            "copied" => Self::Copied,
+            "type_changed" => Self::TypeChanged,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::Added => "A",
+            Self::Modified => "M",
+            Self::Deleted => "D",
+            Self::Renamed => "R",
+            Self::Copied => "C",
+            Self::TypeChanged => "T",
+            Self::Unknown => "?",
+        }
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Added => "Added",
+            Self::Modified => "Modified",
+            Self::Deleted => "Deleted",
+            Self::Renamed => "Renamed",
+            Self::Copied => "Copied",
+            Self::TypeChanged => "Type changed",
+            Self::Unknown => "Changed",
+        }
+    }
+
+    pub(crate) const fn class(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Modified => "modified",
+            Self::Deleted => "deleted",
+            Self::Renamed => "renamed",
+            Self::Copied => "copied",
+            Self::TypeChanged => "type-changed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Column-aligned SCM content for one expandable Git/agent edit child.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileContent {
+    pub(crate) path: String,
+    pub(crate) name: String,
+    pub(crate) directory: String,
+    pub(crate) status: FileRowStatus,
+    pub(crate) source: String,
+    pub(crate) fidelity: String,
+    pub(crate) binary: bool,
+    pub(crate) partial: bool,
+    pub(crate) title: String,
+    pub(crate) aria_label: String,
 }
 
 /// Top-level row content after all chip-like metadata moves to Tags.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TopContent {
+    pub(crate) heading: Option<ContentHeading>,
     pub(crate) summary: Option<RowSummary>,
 }
 
@@ -2769,6 +3148,7 @@ pub(crate) struct TopContent {
 /// ribbon wrapper on top when a unit header is present).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct RowContent {
+    pub(crate) file: Option<FileContent>,
     pub(crate) subop: Option<SubopContent>,
     pub(crate) top: Option<TopContent>,
     pub(crate) work_unit: Option<WorkUnitHeader>,
@@ -2826,6 +3206,7 @@ pub(crate) struct RowSpec {
     pub(crate) aria: RowAria,
     pub(crate) group_label: Option<String>,
     pub(crate) open_json: Option<Value>,
+    pub(crate) open_diff: Option<Value>,
     pub(crate) placeholder: bool,
 }
 
@@ -2872,6 +3253,7 @@ impl Default for RowSpec {
             },
             group_label: None,
             open_json: None,
+            open_diff: None,
             placeholder: false,
         }
     }
@@ -2897,6 +3279,8 @@ impl RowSpec {
     pub(crate) fn from_value(row: &Value, context: &RowContext) -> RowSpec {
         let view = context.view;
         let is_subop = wire::bool(row, "is_subop");
+        let file_content = file_content(row);
+        let is_file = file_content.is_some();
         let node_key = row_str(row, "node_key");
         let selected = context
             .selected_key
@@ -2913,7 +3297,9 @@ impl RowSpec {
         let is_execute_run = bundle_kind == Some(BundleKind::ExecuteRun);
         let is_plan_repeat = bundle_kind == Some(BundleKind::PlanRepeat);
         let semantic_tags = row_semantic_chrome(row, is_bundle, view, BadgeOptions::default());
-        let classification = if is_session_summary {
+        let classification = if is_file {
+            RowClassification::new("change", "activity_kind", "change")
+        } else if is_session_summary {
             RowClassification::session_summary()
         } else {
             row_classification(row)
@@ -2971,8 +3357,7 @@ impl RowSpec {
         } else {
             None
         };
-        let row_summary =
-            (!is_subop && !is_execute_run).then(|| RowSummary::parse(row, &display_summary));
+        let row_summary = (!is_subop).then(|| RowSummary::parse(row, &display_summary));
         let work_unit_header = if has_boundary_header {
             work_unit.as_ref().map(|wu| {
                 let count = if is_session_summary {
@@ -3033,11 +3418,43 @@ impl RowSpec {
                 ChromeItem::new(&chip.class, &chip.label, &label, Some(&label))
             }));
         }
+        if let Some(file) = &file_content {
+            tags.clear();
+            let status_class = format!("file-status file-status-{}", file.status.class());
+            tags.push(ChromeItem::new(
+                &status_class,
+                file.status.code(),
+                file.status.label(),
+                Some(file.status.label()),
+            ));
+            if !file.fidelity.is_empty() {
+                let fidelity_title = if file.binary {
+                    "Binary file content"
+                } else {
+                    "Recorded agent edit"
+                };
+                tags.push(ChromeItem::new(
+                    "file-fidelity",
+                    &file.fidelity,
+                    fidelity_title,
+                    Some(fidelity_title),
+                ));
+            }
+        }
         let has_badges = !tags.is_empty();
-        let row_content = if is_subop {
+        let structured_heading = (!is_file).then(|| content_heading(row, &summary_source));
+        let row_content = if let Some(file) = file_content.clone() {
             RowContent {
+                file: Some(file),
+                subop: None,
+                top: None,
+                work_unit: None,
+            }
+        } else if is_subop {
+            RowContent {
+                file: None,
                 subop: Some(SubopContent {
-                    icon: subop_icon(&row_str(row, "subop_kind")),
+                    heading: structured_heading,
                     summary: Summary::parse(&display_summary),
                 }),
                 top: None,
@@ -3045,8 +3462,10 @@ impl RowSpec {
             }
         } else {
             RowContent {
+                file: None,
                 subop: None,
                 top: Some(TopContent {
+                    heading: structured_heading,
                     summary: row_summary,
                 }),
                 work_unit: None,
@@ -3101,6 +3520,9 @@ impl RowSpec {
                 aria_label = format!("{unit_title}: {plain_summary}");
             }
         }
+        if let Some(file) = &file_content {
+            aria_label.clone_from(&file.aria_label);
+        }
         let base_aria_label = aria_label.clone();
         if context.is_group_start && has_session_meta {
             aria_label.push_str(", ");
@@ -3112,7 +3534,9 @@ impl RowSpec {
             aria_selected: selected,
             aria_expanded: expandable.then_some(expanded_state),
             aria_label,
-            title: detail_summary.clone(),
+            title: file_content
+                .as_ref()
+                .map_or_else(|| detail_summary.clone(), |file| file.title.clone()),
             base_aria_label: base_aria_label.clone(),
         };
         let mut bundle_info = None;
@@ -3200,7 +3624,8 @@ impl RowSpec {
             content: row_content,
             aria,
             group_label,
-            open_json: open_json_envelope(row),
+            open_json: (!is_file).then(|| open_json_envelope(row)).flatten(),
+            open_diff: open_diff_envelope(row),
             placeholder: false,
         }
     }
@@ -3221,6 +3646,16 @@ impl RowSpec {
         }
         if self.identity.is_subop {
             classes.push_str(" row-subop");
+        }
+        if let Some(file) = &self.content.file {
+            classes.push_str(" row-file row-file-");
+            classes.push_str(file.status.class());
+            if file.binary {
+                classes.push_str(" row-file-binary");
+            }
+            if file.partial {
+                classes.push_str(" row-file-partial");
+            }
         }
         if let Some(role) = self.role_class {
             classes.push_str(" row-role-");
@@ -3279,6 +3714,91 @@ impl RowSpec {
     }
 }
 
+fn file_content(row: &Value) -> Option<FileContent> {
+    let change = row.get("file_change")?.as_object()?;
+    let path = change.get("path")?.as_str()?.trim().replace('\\', "/");
+    if path.is_empty() {
+        return None;
+    }
+    let (directory, name) = path.rsplit_once('/').map_or_else(
+        || (String::new(), path.clone()),
+        |(directory, name)| (directory.to_owned(), name.to_owned()),
+    );
+    let status = FileRowStatus::from_wire(
+        change
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+    );
+    let source = change
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    let binary = change
+        .get("binary")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let partial = change
+        .get("partial")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let fidelity = if binary {
+        "binary"
+    } else if partial {
+        "recorded"
+    } else {
+        ""
+    }
+    .to_owned();
+    let old_path = change
+        .get("old_path")
+        .and_then(Value::as_str)
+        .filter(|old| !old.is_empty());
+    let mut title = format!("{} · {path}", status.label());
+    if let Some(old_path) = old_path {
+        title.push_str(" ← ");
+        title.push_str(old_path);
+    }
+    if binary {
+        title.push_str(" · binary content");
+    } else if partial {
+        title.push_str(" · recorded edit (partial file evidence)");
+    } else if source == "git" {
+        title.push_str(" · exact Git blobs");
+    }
+    let source_label = if source == "git" {
+        "Git commit"
+    } else if partial {
+        "recorded agent edit"
+    } else {
+        "agent edit"
+    };
+    let fidelity_label = if binary {
+        ", binary content"
+    } else if partial {
+        ", partial file evidence"
+    } else {
+        ""
+    };
+    let aria_label = format!(
+        "{} {path}, {source_label}{fidelity_label}; open diff",
+        status.label()
+    );
+    Some(FileContent {
+        path,
+        name,
+        directory,
+        status,
+        source,
+        fidelity,
+        binary,
+        partial,
+        title,
+        aria_label,
+    })
+}
+
 /// `subOpCount` details label (`N detail` / `N details`).
 fn sub_op_label(sub_op_count: usize) -> String {
     format!(
@@ -3308,6 +3828,22 @@ fn role_class_of(row: &Value) -> Option<&'static str> {
         .iter()
         .find(|candidate| **candidate == record_role)
         .copied()
+}
+
+/// `openDiff` identity envelope for a source-control-style file row.
+pub(crate) fn open_diff_envelope(row: &Value) -> Option<Value> {
+    let change = row.get("file_change")?.as_object()?;
+    if change
+        .get("path")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return None;
+    }
+    let mut envelope = serde_json::Map::new();
+    drop(envelope.insert("type".to_owned(), Value::String("openDiff".to_owned())));
+    drop(envelope.insert("change".to_owned(), Value::Object(change.clone())));
+    Some(Value::Object(envelope))
 }
 
 /// `openJson` identity envelope for eligible rows (exact production shape).
@@ -3487,12 +4023,15 @@ mod tests {
         html
     }
 
-    fn render_row_summary_html(row_summary: &RowSummary) -> String {
+    fn render_row_summary_html(row_summary: &RowSummary, subtitle: bool) -> String {
         let mut html = String::new();
         if let Some(content) = &row_summary.content {
             html.push_str("<span class=\"summary-text");
             if row_summary.git_prefix.is_some() {
                 html.push_str(" git-summary-text");
+            }
+            if subtitle {
+                html.push_str(" content-subtitle");
             }
             html.push_str("\">");
             html.push_str(&render_summary_html(content));
@@ -3545,13 +4084,70 @@ mod tests {
         content
     }
 
+    fn render_content_icon_html(icon: ActivityIcon) -> String {
+        let mut html = format!(
+            "<span class=\"content-icon\" data-content-icon=\"{}\" aria-hidden=\"true\"><svg class=\"content-icon-svg\" viewBox=\"{}\" focusable=\"false\">",
+            icon.name(),
+            icon.view_box(),
+        );
+        for path in icon.paths() {
+            if path.even_odd {
+                write!(
+                    html,
+                    "<path d=\"{}\" fill-rule=\"evenodd\" clip-rule=\"evenodd\"></path>",
+                    esc(path.d),
+                )
+                .expect("writing Content icon HTML to a String cannot fail");
+            } else {
+                write!(html, "<path d=\"{}\"></path>", esc(path.d))
+                    .expect("writing Content icon HTML to a String cannot fail");
+            }
+        }
+        html.push_str("</svg></span>");
+        html
+    }
+
+    fn render_content_heading_html(heading: &ContentHeading) -> String {
+        let icon = render_content_icon_html(heading.icon);
+        if heading.title.is_empty() {
+            icon
+        } else {
+            format!(
+                "{icon}<span class=\"content-title\">{}</span>",
+                esc(&heading.title),
+            )
+        }
+    }
+
     fn render_content_html(spec: &RowSpec) -> String {
+        if let Some(file) = &spec.content.file {
+            let mut content = format!(
+                "<span class=\"file-icon\" aria-hidden=\"true\"></span><span class=\"file-name\">{}</span>",
+                esc(&file.name)
+            );
+            if !file.directory.is_empty() {
+                write!(
+                    content,
+                    "<span class=\"file-directory\">{}</span>",
+                    esc(&file.directory)
+                )
+                .expect("writing file-row fixture HTML to a String cannot fail");
+            }
+            return content;
+        }
         if let Some(subop) = &spec.content.subop {
             let mut content = String::new();
+            if let Some(heading) = &subop.heading {
+                content.push_str(&render_content_heading_html(heading));
+            }
             write!(
                 content,
-                "<span class=\"subop-icon codicon codicon-{}\" aria-hidden=\"true\"></span><span class=\"subop-summary\">{}</span>",
-                subop.icon,
+                "<span class=\"{}\">{}</span>",
+                if subop.heading.is_some() {
+                    "content-subtitle subop-summary"
+                } else {
+                    "subop-summary"
+                },
                 render_summary_html(&subop.summary)
             )
             .expect("writing sub-op fixture HTML to a String cannot fail");
@@ -3560,10 +4156,16 @@ mod tests {
         let top = spec.content.top.as_ref().expect("top-level row content");
         let wu_start = spec.content_flags.work_unit_block;
         let mut content = String::new();
+        if let Some(heading) = &top.heading {
+            content.push_str(&render_content_heading_html(heading));
+        }
         if let Some(row_summary) = &top.summary {
-            content.push_str(&render_row_summary_html(row_summary));
+            content.push_str(&render_row_summary_html(row_summary, top.heading.is_some()));
         }
         if wu_start {
+            if spec.content_flags.work_unit_title_only {
+                return content;
+            }
             let header = spec.work_unit_header.as_ref().expect("work-unit header");
             let mut ribbon = format!(
                 "<span class=\"work-unit-ribbon-line\"><span class=\"work-unit-ribbon\" title=\"{}\">{}</span>",
@@ -3571,11 +4173,7 @@ mod tests {
                 esc(&header.title)
             );
             ribbon.push_str("</span>");
-            return if spec.content_flags.work_unit_title_only {
-                ribbon
-            } else {
-                format!("{ribbon}<span class=\"work-unit-row-line\">{content}</span>")
-            };
+            return format!("{ribbon}<span class=\"work-unit-row-line\">{content}</span>");
         }
         content
     }
@@ -3625,6 +4223,14 @@ mod tests {
             if let Some(count) = bundle.member_count {
                 drop(attrs.insert("data-bundle-count".to_owned(), count.to_string()));
             }
+        }
+        if let Some(file) = &spec.content.file {
+            drop(attrs.insert("data-file-path".to_owned(), file.path.clone()));
+            drop(attrs.insert(
+                "data-file-status".to_owned(),
+                file.status.class().to_owned(),
+            ));
+            drop(attrs.insert("data-file-source".to_owned(), file.source.clone()));
         }
         attrs
     }
@@ -3721,6 +4327,33 @@ mod tests {
                 ("below", json!([0, 1])),
                 ("timestamp_ms", json!(now())),
                 ("author", json!("")),
+            ],
+        )
+    }
+
+    fn file_row() -> Value {
+        with(
+            &subop_row(),
+            &[
+                ("node_key", json!("node:1::file:0")),
+                ("op_id", json!("node:1::edit:0")),
+                ("summary", json!("crates/service/src/lib.rs")),
+                ("kind", json!("file")),
+                ("record_role", json!("artifact")),
+                ("activity_kind", json!("change")),
+                ("subop_kind", json!("edit")),
+                ("hierarchy_depth", json!(1)),
+                (
+                    "file_change",
+                    json!({
+                        "source": "agent",
+                        "path": "crates/service/src/lib.rs",
+                        "status": "modified",
+                        "partial": true,
+                        "binary": false,
+                        "op_id": "node:1::edit:0"
+                    }),
+                ),
             ],
         )
     }
@@ -3855,10 +4488,7 @@ mod tests {
             &base_row(),
             &[
                 ("node_key", json!("wu:session-summary")),
-                (
-                    "summary",
-                    json!("system last-prompt custom-title — 1 activity · 1 plan"),
-                ),
+                ("summary", json!("1 planning step")),
                 ("group", json!("session:s1")),
                 ("kind", json!("work-group")),
                 ("record_role", json!("action")),
@@ -4007,12 +4637,176 @@ mod tests {
     }
 
     #[test]
-    fn subop_icon_mapping_matches_codicon_names() {
-        assert_eq!(subop_icon("edit"), "edit");
-        assert_eq!(subop_icon("msg"), "comment");
-        assert_eq!(subop_icon("tool_result"), "output");
-        assert_eq!(subop_icon("meta"), "info");
-        assert_eq!(subop_icon("future_kind"), "info");
+    fn content_heading_uses_tool_names_and_forward_compatible_titles() {
+        let tool = with(
+            &base_row(),
+            &[
+                ("kind", json!("tool")),
+                ("record_role", json!("action")),
+                ("activity_kind", json!("execute")),
+                ("summary", json!("tool: exec inspect the workspace")),
+            ],
+        );
+        let heading = content_heading(&tool, &summary_source(&tool));
+        assert_eq!(heading.icon.name(), "tools");
+        assert_eq!(heading.title, "exec");
+
+        let future = with(
+            &base_row(),
+            &[
+                ("kind", json!("future_kind")),
+                ("activity_kind", json!("unknown")),
+            ],
+        );
+        let heading = content_heading(&future, &summary_source(&future));
+        assert_eq!(heading.icon.name(), "settings");
+        assert_eq!(heading.title, "Future kind");
+    }
+
+    #[test]
+    fn content_titles_cover_the_supported_record_surface() {
+        let cases = [
+            ("message", "narrative", ""),
+            ("command", "action", "Command"),
+            ("command", "result", "Command output"),
+            ("tool", "result", "Tool result"),
+            ("tool_result", "result", "Tool result"),
+            ("reflection", "narrative", "Reflection"),
+            ("file", "artifact", "Change"),
+            ("error", "result", "Error"),
+            ("note", "lifecycle", "Note"),
+            ("import", "artifact", "Import"),
+            ("token_usage_record", "lifecycle", "Token usage"),
+            ("token_count", "lifecycle", "Token count"),
+            ("world_state", "lifecycle", "World state"),
+            ("turn_context", "lifecycle", "Turn context"),
+            ("task_complete", "lifecycle", "Task complete"),
+            ("session_title", "lifecycle", "Session title"),
+            ("session_meta", "lifecycle", "Session metadata"),
+            ("turn_aborted", "lifecycle", "Turn aborted"),
+            ("work-group", "action", ""),
+            ("", "lifecycle", "Metadata"),
+        ];
+        for (kind, role, expected) in cases {
+            let row = with(
+                &base_row(),
+                &[("kind", json!(kind)), ("record_role", json!(role))],
+            );
+            assert_eq!(
+                content_title(&row, &summary_source(&row)),
+                expected,
+                "{kind}"
+            );
+        }
+
+        let git = git_row();
+        assert_eq!(content_title(&git, &summary_source(&git)), "");
+    }
+
+    #[test]
+    fn token_count_rows_render_as_meta_with_a_numeric_subtitle() {
+        let token = with(
+            &subop_row(),
+            &[
+                ("summary", json!("17,502 / 258,400")),
+                ("kind", json!("token_count")),
+                ("record_role", json!("lifecycle")),
+                ("activity_kind", json!("system")),
+                ("is_system", json!(true)),
+                ("hierarchy_depth", json!(2)),
+            ],
+        );
+        let spec = RowSpec::from_value(&token, &RowContext::for_row(ViewMode::Activity, 0, false));
+        assert_eq!(
+            render_activity_html(&spec),
+            "<span class=\"activity-label\">meta</span>"
+        );
+        let content = render_content_html(&spec);
+        assert!(content.contains("data-content-icon=\"settings\""));
+        assert!(content.contains("class=\"content-title\">Token count</span>"));
+        assert!(content.contains("17,502"));
+        assert!(content.contains("258,400"));
+    }
+
+    #[test]
+    fn token_bearing_exec_parent_renders_its_command_as_content() {
+        let parent = with(
+            &base_row(),
+            &[
+                ("summary", json!("tool: exec rsync -a source/ destination/")),
+                ("kind", json!("tool")),
+                ("record_role", json!("action")),
+                ("activity_kind", json!("execute")),
+                (
+                    "sub_ops",
+                    json!([{
+                        "op_id": "node:2",
+                        "kind": "token_usage_record",
+                        "summary": "114,757",
+                    }]),
+                ),
+            ],
+        );
+        let spec = RowSpec::from_value(&parent, &RowContext::for_row(ViewMode::Activity, 0, false));
+        let content = render_content_html(&spec);
+
+        assert!(content.contains("data-content-icon=\"tools\""));
+        assert!(content.contains("class=\"content-title\">exec</span>"));
+        assert!(content.contains("rsync -a source/ destination/"));
+        assert!(!content.contains("114,757"));
+    }
+
+    #[test]
+    fn command_output_renders_stdout_as_its_subtitle() {
+        let command = with(
+            &base_row(),
+            &[
+                (
+                    "summary",
+                    json!("{\"stdout\":\"actual stdout\",\"formatted_output\":\"fallback\"}"),
+                ),
+                ("kind", json!("command")),
+                ("record_role", json!("result")),
+                ("activity_kind", json!("execute")),
+            ],
+        );
+        let spec =
+            RowSpec::from_value(&command, &RowContext::for_row(ViewMode::Activity, 0, false));
+        let content = render_content_html(&spec);
+
+        assert!(content.contains("data-content-icon=\"tools\""));
+        assert!(content.contains("class=\"content-title\">Command output</span>"));
+        assert!(content.contains("class=\"summary-text content-subtitle\""));
+        assert!(content.contains("actual stdout"));
+        assert!(!content.contains("formatted_output"));
+    }
+
+    #[test]
+    fn activity_stays_text_while_all_non_file_content_gets_a_heading() {
+        let ordinary = RowSpec::from_value(
+            &base_row(),
+            &RowContext::for_row(ViewMode::Activity, 0, false),
+        );
+        assert_eq!(
+            render_activity_html(&ordinary),
+            "<span class=\"activity-label\">agent</span>"
+        );
+        let ordinary_content = render_content_html(&ordinary);
+        assert!(ordinary_content
+            .contains("class=\"content-icon\" data-content-icon=\"robot\" aria-hidden=\"true\""));
+        assert!(!ordinary_content.contains("content-title"));
+        assert!(ordinary_content.contains("class=\"summary-text content-subtitle\""));
+
+        let work_group = RowSpec::from_value(
+            &session_summary_row(),
+            &RowContext::for_row(ViewMode::Activity, 0, false),
+        );
+        let work_group_content = render_content_html(&work_group);
+        assert!(work_group_content
+            .contains("class=\"content-icon\" data-content-icon=\"layers\" aria-hidden=\"true\""));
+        assert!(!work_group_content.contains("content-title"));
+        assert!(work_group_content.contains("class=\"summary-text content-subtitle\""));
+        assert!(work_group_content.contains("1 planning step"));
     }
 
     #[test]
@@ -4228,6 +5022,8 @@ mod tests {
         let nested_activity = render_activity_html(&nested_spec);
         assert!(nested_activity.starts_with("<span class=\"activity-label\">tooluse</span>"));
         assert!(nested_activity.contains("class=\"subop-chevron\""));
+        assert!(render_content_html(&nested_spec)
+            .contains("class=\"content-icon\" data-content-icon=\"tools\""));
         let nested_html = render_tags_html(&nested_spec);
         assert!(!nested_html.contains("class=\"subop-chevron\""));
         assert!(nested_html.contains("class=\"bundle-count\""));
@@ -4274,28 +5070,33 @@ mod tests {
     #[test]
     fn activity_column_classifies_every_real_row_with_stable_fallbacks() {
         let cases = [
-            ("conversation", "agent"),
-            ("plan", "plan"),
-            ("explore", "explore"),
-            ("execute", "tooluse"),
-            ("change", "change"),
-            ("verify", "verify"),
-            ("diagnose", "diagnose"),
-            ("coordinate", "coordinate"),
-            ("source_control", "git"),
-            ("external", "external"),
-            ("system", "system"),
+            ("work", "work", "layers"),
+            ("conversation", "agent", "robot"),
+            ("plan", "plan", "checklist"),
+            ("explore", "explore", "search"),
+            ("execute", "tooluse", "tools"),
+            ("change", "change", "edit"),
+            ("verify", "verify", "pass"),
+            ("diagnose", "diagnose", "bug"),
+            ("coordinate", "coordinate", "type-hierarchy"),
+            ("source_control", "git", "source-control"),
+            ("external", "external", "link-external"),
+            ("system", "meta", "settings"),
         ];
-        for (wire, label) in cases {
-            let classification =
-                row_classification(&with(&base_row(), &[("activity_kind", json!(wire))]));
+        for (wire, label, icon) in cases {
+            let row = with(&base_row(), &[("activity_kind", json!(wire))]);
+            let classification = row_classification(&row);
             assert_eq!(classification.label, label, "{wire} label");
+            assert_eq!(content_icon(&row).name(), icon, "{wire} Content icon");
             assert_eq!(classification.source, "activity_kind", "{wire} source");
-            assert_eq!(classification.title, format!("Activity: {wire}"));
+            let title_value = if wire == "system" { "meta" } else { wire };
+            assert_eq!(classification.title, format!("Activity: {title_value}"));
         }
 
-        let user = row_classification(&with(&base_row(), &[("author", json!("human"))]));
+        let user_row = with(&base_row(), &[("author", json!("human"))]);
+        let user = row_classification(&user_row);
         assert_eq!(user.label, "user");
+        assert_eq!(content_icon(&user_row).name(), "account");
         assert_eq!(user.source, "activity_kind");
         assert_eq!(user.title, "Activity: conversation");
 
@@ -4318,8 +5119,9 @@ mod tests {
                 ("is_system", json!(true)),
             ],
         ));
-        assert_eq!(system.label, "system");
+        assert_eq!(system.label, "meta");
         assert_eq!(system.source, "is_system");
+        assert_eq!(system.title, "Activity: meta");
 
         let kind = row_classification(&with(
             &base_row(),
@@ -4725,6 +5527,28 @@ mod tests {
             ),
             "Tool request"
         );
+        let command_output = with(
+            &base_row(),
+            &[
+                ("kind", json!("command")),
+                ("record_role", json!("result")),
+                ("activity_kind", json!("execute")),
+            ],
+        );
+        assert_eq!(
+            display_summary_for_row(
+                &command_output,
+                "{\"output\":\"transport fallback\",\"stdout\":\"actual stdout\"}"
+            ),
+            "actual stdout"
+        );
+        assert_eq!(
+            display_summary_for_row(
+                &command_output,
+                "{\"formatted_output\":\"formatted fallback\"}"
+            ),
+            "formatted fallback"
+        );
         assert_eq!(
             display_summary_for_row(
                 &with(
@@ -4948,7 +5772,29 @@ mod tests {
             summary_class,
             "{name}: summary div class"
         );
-        let rendered_content = render_content_html(&spec);
+        // Existing goldens focus on each row's authored payload. The shared
+        // Content icon/title lead has a dedicated cross-taxonomy contract
+        // test below, so strip that common prefix here rather than copying
+        // large inline-SVG paths into every unrelated row golden.
+        let mut rendered_content = render_content_html(&spec);
+        let heading = spec
+            .content
+            .subop
+            .as_ref()
+            .and_then(|content| content.heading.as_ref())
+            .or_else(|| {
+                spec.content
+                    .top
+                    .as_ref()
+                    .and_then(|content| content.heading.as_ref())
+            });
+        if let Some(heading) = heading {
+            rendered_content =
+                rendered_content.replacen(&render_content_heading_html(heading), "", 1);
+            rendered_content = rendered_content.replacen(" content-subtitle", "", 1);
+            rendered_content =
+                rendered_content.replacen("content-subtitle subop-summary", "subop-summary", 1);
+        }
         assert_eq!(rendered_content, content, "{name}: content cell");
         let rendered_tags = render_tags_html(&spec);
         assert_eq!(
@@ -5138,7 +5984,7 @@ mod tests {
 (
 &["row", "row-dim", "row-subop", "row-role-narrative"],
 "summary",
-"<span class=\"subop-icon codicon codicon-edit\" aria-hidden=\"true\"></span><span class=\"subop-summary\"><span class=\"md-line\"><span class=\"md-text\">custom-title metadata</span></span></span>",
+"<span class=\"subop-summary\"><span class=\"md-line\"><span class=\"md-text\">custom-title metadata</span></span></span>",
 "Jan 15, 2026 04:00 PM",
 "",
 "ode:1::sub:0"
@@ -5160,8 +6006,13 @@ mod tests {
             "sub-op data-key is its own wire identity, never synthesized from the parent"
         );
         assert_eq!(
-            msg_spec.content.subop.as_ref().expect("subop content").icon,
-            "comment"
+            msg_spec
+                .content
+                .subop
+                .as_ref()
+                .and_then(|content| content.heading.as_ref())
+                .map(|heading| heading.icon.name()),
+            Some("robot")
         );
     }
 
@@ -5175,11 +6026,11 @@ mod tests {
         assert!(collapsed.classes().contains("row-expandable"));
         let disclosure = collapsed.disclosure.as_ref().expect("chevron");
         assert_eq!(disclosure.label, "Expand 2 details");
-        assert_eq!(
-            render_activity_html(&collapsed),
-            "<span class=\"activity-label\">agent</span><button type=\"button\" class=\"subop-chevron\" title=\"Expand 2 details\" aria-label=\"Expand 2 details\" aria-expanded=\"false\">\u{25b8}</button>",
-            "the collapsed arrow follows the Activity label"
-        );
+        let activity = render_activity_html(&collapsed);
+        assert!(activity.starts_with(
+            "<span class=\"activity-label\">agent</span><button type=\"button\" class=\"subop-chevron\""
+        ));
+        assert!(activity.ends_with("aria-expanded=\"false\">\u{25b8}</button>"));
         assert!(!render_content_html(&collapsed).contains("subop-chevron"));
 
         let mut ctx = context(ViewMode::Activity, 0, false);
@@ -5213,7 +6064,7 @@ mod tests {
                     "row-expandable",
                 ],
                 "summary",
-                "",
+                "<span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">tool result: execute run (2 steps)</span></span></span>",
                 "Jan 15, 2026 04:00 PM",
                 "",
                 "bundle:exec1",
@@ -5289,7 +6140,7 @@ mod tests {
     }
 
     #[test]
-    fn work_unit_start_rows_render_the_ribbon_header() {
+    fn work_unit_start_rows_avoid_duplicate_ribbons_and_keep_distinct_headers() {
         let ctx = context(ViewMode::Activity, 0, true);
         let spec = RowSpec::from_value(&wu_start_row(), &ctx);
         assert_row("wu_start",
@@ -5298,7 +6149,7 @@ mod tests {
 (
 &["row", "row-human", "row-role-narrative", "row-has-badges", "row-work-unit-start"],
 "summary work-unit-block work-unit-title-only",
-"<span class=\"work-unit-ribbon-line\"><span class=\"work-unit-ribbon\" title=\"User request: make the search faster\">User request: make the search faster</span></span>",
+"<span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">User request: make the search faster</span></span></span>",
 "Jan 15, 2026 04:00 PM",
 "human",
 "t1"
@@ -5322,6 +6173,27 @@ mod tests {
             Some("session:s1/turn:t1")
         );
 
+        let distinct = with(
+            &wu_start_row(),
+            &[(
+                "work_unit",
+                json!({
+                    "id": "session:s1/turn:t1",
+                    "title": "Turn header",
+                    "is_start": true,
+                    "is_end": false,
+                    "count": 5,
+                }),
+            )],
+        );
+        let distinct = RowSpec::from_value(&distinct, &context(ViewMode::Activity, 0, false));
+        let distinct_html = render_content_html(&distinct);
+        assert!(distinct_html.starts_with(
+            "<span class=\"work-unit-ribbon-line\"><span class=\"work-unit-ribbon\" title=\"Turn header\">Turn header</span></span><span class=\"work-unit-row-line\">"
+        ));
+        assert!(!distinct_html.contains("content-title"));
+        assert!(distinct_html.contains("class=\"summary-text content-subtitle\""));
+
         // Not at a group start: no session tags, aria suffix, or group class;
         // the row's own work-unit count tag remains.
         let not_start =
@@ -5332,7 +6204,7 @@ mod tests {
             "User request: make the search faster"
         );
 
-        // Title-only start: single ribbon line, no count for a single entry.
+        // Title-only start: one structured Content line, no count for a single entry.
         let title_only = RowSpec::from_value(
             &wu_start_title_only_row(),
             &context(ViewMode::Activity, 1, false),
@@ -5482,6 +6354,74 @@ mod tests {
         assert!(spec.tags.is_empty());
         assert!(spec.classification.label.is_empty());
         assert!(spec.content.top.is_none());
+    }
+
+    #[test]
+    fn file_rows_match_native_scm_content_and_open_diff_contract() {
+        let row = file_row();
+        let spec = RowSpec::from_value(&row, &context(ViewMode::Activity, 4, false));
+        assert_eq!(
+            spec.classes().split_whitespace().collect::<Vec<_>>(),
+            vec![
+                "row",
+                "row-dim",
+                "row-subop",
+                "row-file",
+                "row-file-modified",
+                "row-file-partial",
+                "row-role-artifact",
+                "row-has-badges",
+            ]
+        );
+        assert_eq!(spec.classification.label, "change");
+        assert_eq!(
+            spec.tags
+                .iter()
+                .map(|tag| (tag.classes.as_str(), tag.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("file-status file-status-modified", "M"),
+                ("file-fidelity", "recorded"),
+            ]
+        );
+        assert_eq!(
+            render_tags_html(&spec),
+            "<span class=\"file-status file-status-modified\" title=\"Modified\" aria-label=\"Modified\">M</span><span class=\"file-fidelity\" title=\"Recorded agent edit\" aria-label=\"Recorded agent edit\">recorded</span>"
+        );
+        assert_eq!(
+            render_content_html(&spec),
+            "<span class=\"file-icon\" aria-hidden=\"true\"></span><span class=\"file-name\">lib.rs</span><span class=\"file-directory\">crates/service/src</span>"
+        );
+        assert_eq!(
+            spec.aria.aria_label,
+            "Modified crates/service/src/lib.rs, recorded agent edit, partial file evidence; open diff"
+        );
+        assert!(spec.aria.title.contains("recorded edit"));
+        assert!(spec.open_json.is_none());
+        assert_eq!(
+            spec.open_diff
+                .as_ref()
+                .and_then(|envelope| envelope.get("type"))
+                .and_then(Value::as_str),
+            Some("openDiff")
+        );
+        assert_eq!(
+            spec.open_diff
+                .as_ref()
+                .and_then(|envelope| envelope.get("change"))
+                .and_then(|change| change.get("path"))
+                .and_then(Value::as_str),
+            Some("crates/service/src/lib.rs")
+        );
+        let attrs = render_attrs(&spec);
+        assert_eq!(
+            attrs.get("data-file-status").map(String::as_str),
+            Some("modified")
+        );
+        assert_eq!(
+            attrs.get("data-file-source").map(String::as_str),
+            Some("agent")
+        );
     }
 
     #[test]
@@ -5890,7 +6830,7 @@ mod tests {
     }
 
     #[test]
-    fn subop_icon_variants_render_in_the_content_cell() {
+    fn subop_content_uses_the_shared_icon_title_subtitle_grammar() {
         let msg = with(
             &subop_row(),
             &[
@@ -5905,7 +6845,7 @@ mod tests {
 (
 &["row", "row-dim", "row-subop", "row-role-narrative"],
 "summary",
-"<span class=\"subop-icon codicon codicon-comment\" aria-hidden=\"true\"></span><span class=\"subop-summary\"><span class=\"md-line\"><span class=\"md-text\">mode</span></span></span>",
+"<span class=\"subop-summary\"><span class=\"md-line\"><span class=\"md-text\">mode</span></span></span>",
 "Jan 15, 2026 04:00 PM",
 "",
 "ode:1::sub:0"
@@ -5925,9 +6865,13 @@ mod tests {
         );
         let spec = RowSpec::from_value(&meta, &context(ViewMode::Activity, 6, false));
         assert_eq!(
-            spec.content.subop.as_ref().expect("subop").icon,
-            "info",
-            "meta and unknown kinds fall back to the info codicon"
+            spec.content
+                .subop
+                .as_ref()
+                .and_then(|content| content.heading.as_ref())
+                .map(|heading| heading.icon.name()),
+            Some("robot"),
+            "the semantic activity classification wins over the detail grouping kind"
         );
     }
 
@@ -5949,10 +6893,12 @@ mod tests {
         assert!(expanded.classes().contains("row-expandable"));
         assert_eq!(expanded.aria.aria_expanded, Some(true));
         assert_eq!(expanded.aria.tabindex, 0);
+        let collapsed =
+            RowSpec::from_value(&expandable_row(), &context(ViewMode::Activity, 0, false));
         assert_eq!(
             render_content_html(&expanded),
-            "<span class=\"summary-text\"><span class=\"md-line\"><span class=\"md-text\">Agent turn with metadata</span></span></span>",
-            "moving disclosure leaves the content summary unchanged"
+            render_content_html(&collapsed),
+            "moving disclosure leaves structured Content unchanged"
         );
         assert!(render_activity_html(&expanded).contains("aria-expanded=\"true\">\u{25be}"));
     }

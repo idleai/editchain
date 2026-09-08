@@ -126,7 +126,7 @@ pub(super) fn derive_produced_commit_links(
 
 /// Open every repository discovered under the workspace, skipping individual
 /// repositories that cannot currently be opened.
-fn open_repositories(
+pub(super) fn open_repositories(
     workspace: &Path,
 ) -> Result<Vec<RepositoryHandle>, Box<dyn std::error::Error>> {
     let discoveries = discover_repositories(workspace)?;
@@ -528,7 +528,10 @@ fn git_subcommand(args: &[String]) -> Option<&str> {
 }
 
 /// Read one inline or verified content-addressed payload.
-fn payload_bytes<'a>(payload: &'a Payload, blobs: Option<&FsBlobSink>) -> Option<Cow<'a, [u8]>> {
+pub(super) fn payload_bytes<'a>(
+    payload: &'a Payload,
+    blobs: Option<&FsBlobSink>,
+) -> Option<Cow<'a, [u8]>> {
     match payload {
         Payload::Empty => None,
         Payload::Inline(bytes) => Some(Cow::Borrowed(bytes)),

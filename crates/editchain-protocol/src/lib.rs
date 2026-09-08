@@ -51,6 +51,8 @@ pub enum RequestBody {
     GetRepositories,
     /// Resolve a git object by OID.
     ResolveObject(ResolveObjectRequest),
+    /// Materialize the immutable text sides for one advertised file change.
+    GetFileDiff(GetFileDiffRequest),
 }
 
 /// A response message from the Rust service to the extension host.
@@ -328,6 +330,144 @@ pub struct ResolveObjectRequest {
     pub oid: String,
 }
 
+/// Request the before/after text for one file row previously advertised by a
+/// history window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetFileDiffRequest {
+    /// Complete identity of the advertised change. The service revalidates it
+    /// against Git objects or the canonical source operation before returning
+    /// any content.
+    pub change: FileChangeDto,
+}
+
+/// Provenance domain for one file change row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileChangeSource {
+    /// Immutable Git commit/tree objects.
+    Git,
+    /// An imported Claude/Codex operation.
+    Agent,
+    /// Forward-compatible unknown source.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Source-control-style status for one changed path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileChangeStatus {
+    /// A new path.
+    Added,
+    /// An existing path whose content or executable bit changed.
+    Modified,
+    /// A removed path.
+    Deleted,
+    /// A path moved from [`FileChangeDto::old_path`].
+    Renamed,
+    /// A path copied from [`FileChangeDto::old_path`].
+    Copied,
+    /// The Git entry kind changed (for example file to symlink).
+    TypeChanged,
+    /// Forward-compatible unknown status.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Display and immutable-content identity for one expandable file row.
+///
+/// Git identities use full object IDs. Agent identities use an exact `OpId`;
+/// their retained content may be a snippet or hunk rather than a whole-file
+/// snapshot, which is surfaced by [`Self::partial`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChangeDto {
+    /// Provenance domain.
+    pub source: FileChangeSource,
+    /// Current/destination path, normalized for workspace display.
+    pub path: String,
+    /// Previous/source path for renames and copies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    /// Source-control-style status.
+    pub status: FileChangeStatus,
+    /// Whether either side is not representable as a text document.
+    #[serde(default)]
+    pub binary: bool,
+    /// Whether the retained agent evidence is a snippet/hunk rather than two
+    /// complete file snapshots. Always `false` for resolved Git blobs.
+    #[serde(default)]
+    pub partial: bool,
+    /// Exact imported operation identity for agent changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op_id: Option<String>,
+    /// Exact repository identity for Git changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    /// Path relative to the anchored repository tree. This can differ from
+    /// [`Self::path`] when the workspace contains a nested repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_path: Option<String>,
+    /// Commit whose first-parent diff advertised this row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_oid: Option<String>,
+    /// First-parent blob/gitlink object, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_oid: Option<String>,
+    /// Commit-side blob/gitlink object, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_oid: Option<String>,
+    /// First-parent Git entry mode (`blob`, `exe`, `link`, or `commit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_mode: Option<String>,
+    /// Commit-side Git entry mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_mode: Option<String>,
+}
+
+/// One independently recorded hunk from a unified diff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDiffHunkDto {
+    /// Original unified-diff header, including source ranges and any section
+    /// heading.
+    pub header: String,
+    /// Recorded source-side lines for this hunk.
+    pub before: String,
+    /// Recorded destination-side lines for this hunk.
+    pub after: String,
+}
+
+/// Materialized text shown by VS Code's native diff editors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDiffDto {
+    /// Current/destination path.
+    pub path: String,
+    /// Previous/source path for renames and copies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    /// Source-control-style status.
+    pub status: FileChangeStatus,
+    /// Whether this change must not be opened through a text provider.
+    #[serde(default)]
+    pub binary: bool,
+    /// Whether these sides are recorded snippets/hunks rather than complete
+    /// files.
+    #[serde(default)]
+    pub partial: bool,
+    /// Complete source text or a lone recorded hunk. Empty for an exact
+    /// addition or when `hunks` contains disconnected regions.
+    pub before: String,
+    /// Complete destination text or a lone recorded hunk. Empty for an exact
+    /// deletion or when `hunks` contains disconnected regions.
+    pub after: String,
+    /// Disconnected unified-diff regions that VS Code should render as
+    /// independent entries in its changes editor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hunks: Vec<FileDiffHunkDto>,
+    /// Optional fidelity/availability explanation for the editor title or UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 /// The full resolved git commit, JSON-safe for the read-only JSON editor.
 ///
 /// This mirrors [`editchain_core::GitCommitEntity`] with every identity
@@ -568,6 +708,10 @@ pub struct HistoryRow {
     /// `None`.
     #[serde(default)]
     pub activity_bundle: Option<ActivityBundleDto>,
+    /// Source-control-style metadata for a nested file row. `None` on every
+    /// graph node and non-file descendant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_change: Option<FileChangeDto>,
 }
 
 /// Display-safe provenance copied from a session's `session_meta` record.
@@ -1028,6 +1172,7 @@ mod tests {
             work_unit: None,
             promoted: false,
             activity_bundle: None,
+            file_change: None,
         };
         let json = serde_json::to_value(&row).expect("serialize");
         assert_eq!(json["op_id"], "9007199254740993:7:42");
@@ -1485,6 +1630,73 @@ mod tests {
     }
 
     #[test]
+    fn file_change_and_diff_request_round_trip_exact_identities() {
+        let change = FileChangeDto {
+            source: FileChangeSource::Git,
+            path: "src/new.rs".to_string(),
+            old_path: Some("src/old.rs".to_string()),
+            status: FileChangeStatus::Renamed,
+            binary: false,
+            partial: false,
+            op_id: None,
+            repository: Some(OVER_2_53.to_string()),
+            repository_path: Some("src/new.rs".to_string()),
+            commit_oid: Some(big_oid_hex()),
+            old_oid: Some(format!("beef{}", "0".repeat(36))),
+            new_oid: Some(big_oid_hex()),
+            old_mode: Some("blob".to_string()),
+            new_mode: Some("blob".to_string()),
+        };
+        let body = RequestBody::GetFileDiff(GetFileDiffRequest {
+            change: change.clone(),
+        });
+        let json = serde_json::to_value(&body).expect("serialize file diff request");
+        assert_eq!(
+            json["GetFileDiff"]["change"]["repository"],
+            OVER_2_53.to_string()
+        );
+        assert_eq!(json["GetFileDiff"]["change"]["status"], "renamed");
+        assert_eq!(json["GetFileDiff"]["change"]["source"], "git");
+        let back: RequestBody =
+            serde_json::from_value(json).expect("deserialize file diff request");
+        assert!(matches!(
+            back,
+            RequestBody::GetFileDiff(GetFileDiffRequest { change: parsed }) if parsed == change
+        ));
+
+        let diff = FileDiffDto {
+            path: change.path,
+            old_path: change.old_path,
+            status: change.status,
+            binary: false,
+            partial: true,
+            before: "old\n".to_string(),
+            after: "new\n".to_string(),
+            hunks: vec![FileDiffHunkDto {
+                header: "@@ -1 +1 @@".to_string(),
+                before: "old\n".to_string(),
+                after: "new\n".to_string(),
+            }],
+            note: None,
+        };
+        let diff_json = serde_json::to_value(&diff).expect("serialize materialized diff");
+        assert_eq!(diff_json["before"], "old\n");
+        assert_eq!(diff_json["after"], "new\n");
+        assert_eq!(diff_json["hunks"][0]["header"], "@@ -1 +1 @@");
+        assert_eq!(diff_json["hunks"][0]["before"], "old\n");
+        assert_eq!(diff_json["hunks"][0]["after"], "new\n");
+
+        let legacy: FileDiffDto = serde_json::from_value(serde_json::json!({
+            "path": "src/lib.rs",
+            "status": "modified",
+            "before": "old",
+            "after": "new"
+        }))
+        .expect("deserialize diff without structured hunks");
+        assert!(legacy.hunks.is_empty());
+    }
+
+    #[test]
     fn chain_filter_dto_round_trips_include_kind_pattern() {
         let dto = ChainFilterDto {
             summary_pattern: String::new(),
@@ -1579,6 +1791,7 @@ mod tests {
         assert_eq!(legacy.session_summary, None);
         assert!(!legacy.promoted);
         assert_eq!(legacy.activity_bundle, None);
+        assert_eq!(legacy.file_change, None);
 
         // Newer services emit the fields; partial WorkUnitDto members default.
         let row = HistoryRow {
@@ -1633,6 +1846,7 @@ mod tests {
                 kind: ActivityBundleKind::ExecuteRun,
                 member_count: 3,
             }),
+            file_change: None,
         };
         let json = serde_json::to_value(&row).expect("serialize row");
         assert_eq!(

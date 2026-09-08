@@ -117,7 +117,33 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 /// Revision 35 routes session-to-Git base references through shared,
 /// interval-colored spines so many sessions based on one commit do not retain
 /// one empty graph lane apiece until that commit row.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 35;
+///
+/// Revision 36 adds expandable source-control-style file rows with immutable
+/// Git object identities and retained agent-edit identities.
+///
+/// Revision 37 flattens a work group's sole nested Execute/Plan group so its
+/// original activities expand directly beneath the work row.
+///
+/// Revision 38 replaces provider-payload `WorkGroup` headlines with concise,
+/// provider-neutral activity breakdowns.
+///
+/// Revision 39 retains compact token-accounting totals so expanded metadata
+/// rows can show numeric usage and context-window subtitles.
+///
+/// Revision 40 keeps metadata out of parent summaries and adds concrete tool
+/// invocation arguments to tool rows.
+///
+/// Revision 41 keeps bundled tool results child-only when the parent already
+/// has concrete invocation detail.
+///
+/// Revision 42 preserves bounded command-output carriers and uses their stdout
+/// or formatted output as the completed command row's Content subtitle.
+///
+/// Revision 44 coalesces exact same-session metadata descendants into their
+/// retained session metadata root, keeps session-start records out of synthetic
+/// work groups, and routes a lone session-to-Git anchor directly instead of
+/// allocating an unnecessary shared-spine junction.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 44;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

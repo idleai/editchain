@@ -533,6 +533,79 @@
       return combinedOp();
     },
 
+    fileEdits() {
+      const commit = gitRow('0123456789abcdef0123456789abcdef01234567', 'show changed files', {
+        group: 'repo:files',
+        parents: ['node:agent:edit'],
+        ts: NOW,
+        outcome: 'success',
+      });
+      const gitChange = {
+        source: 'git',
+        path: 'crates/editchain-git/src/diff.rs',
+        status: 'modified',
+        binary: false,
+        partial: false,
+        repository: commit.repository,
+        repository_path: 'crates/editchain-git/src/diff.rs',
+        commit_oid: commit.git_oid,
+        old_oid: '1111111111111111111111111111111111111111',
+        new_oid: '2222222222222222222222222222222222222222',
+        old_mode: 'blob',
+        new_mode: 'blob',
+      };
+      commit.sub_ops = [{
+        op_id: '',
+        summary: gitChange.path,
+        kind: 'file',
+        timestamp_ms: commit.timestamp_ms,
+        file_change: gitChange,
+      }];
+
+      const agent = opRow('node:agent:edit', 'Edited the VS Code bridge', {
+        group: 'session:files',
+        kind: 'tool',
+        author: 'agent',
+        parents: ['node:files:root'],
+        ts: NOW - 60_000,
+      });
+      const agentChange = {
+        source: 'agent',
+        path: 'extensions/vscode-editchain/src/extension.ts',
+        status: 'modified',
+        binary: false,
+        partial: true,
+        op_id: 'node:agent:edit:normalized',
+      };
+      agent.sub_ops = [{
+        op_id: agentChange.op_id,
+        summary: agentChange.path,
+        kind: 'file',
+        timestamp_ms: agent.timestamp_ms,
+        file_change: agentChange,
+      }];
+      const root = opRow('node:files:root', 'Review requested', {
+        group: 'session:files',
+        kind: 'message',
+        author: 'human',
+        parents: [],
+        ts: NOW - 120_000,
+      });
+      const rows = [commit, agent, root];
+      rows.forEach((row) => {
+        row.lane = 0;
+        row.above = row === commit ? [] : [0];
+        row.below = row === root ? [] : [0];
+        row.transitions = [];
+      });
+      return {
+        rows,
+        layoutRows: rows.map((row) => ({ node: row.node_key, lane: 0 })),
+        edges: [],
+        subOpCounts: rows.map((row) => (row.sub_ops || []).length),
+      };
+    },
+
     // A turn + tool chain with internal trace-VISIBILITY records (the r4
     // Activity/Raw profile contract). Activity (hide_trace=true, the default)
     // removes every visibility==="trace" row via the server-side chain

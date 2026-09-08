@@ -189,9 +189,9 @@ impl HistoryNode {
     /// Returns a display summary for this node.
     ///
     /// For collapsed imports, the summary is the row's own content combined with
-    /// the content of any bundled sub-ops (metadata records, tool results), so a
-    /// row that would otherwise show `(no summary)` still carries meaningful
-    /// text. The combined result is truncated to ~200 chars.
+    /// the content of any bundled tool results. Metadata remains independently
+    /// visible through expansion and never masquerades as parent-row content.
+    /// The combined result is truncated to ~1024 chars.
     #[must_use]
     pub fn summary(&self) -> String {
         match self {
@@ -1367,7 +1367,7 @@ impl HistoryProjection {
                 }
                 let children = children_of.get(&op.id);
                 let summary = collapsed_import_summary(op, children);
-                let kind = collapsed_import_kind(children);
+                let kind = collapsed_import_kind(op, children);
                 let author = collapsed_import_author(children);
                 // Semantic readability metadata is derived deterministically
                 // here, where the raw envelope and its normalized children are
@@ -1501,8 +1501,10 @@ impl HistoryProjection {
     /// Provider occurrences with a resolved exact parent take that relationship
     /// in preference to source order. Occurrences without a provider parent use
     /// their stored operation parent as a conservative fallback. A metadata
-    /// chain contracts only when that path reaches one non-META collapsed import
-    /// row; every other shape remains visible.
+    /// chain contracts when that path reaches one non-META collapsed import
+    /// row. If it instead ends at an exact same-session metadata root, its
+    /// descendants coalesce into that root while the root itself remains visible
+    /// as the session boundary. Cycles and cross-session paths remain visible.
     /// Legacy Codex token-usage imports are classified from their exact raw
     /// schema because their immutable stored tags predate `META` classification.
     fn bundle_metadata_by_exact_parent(
@@ -1510,6 +1512,13 @@ impl HistoryProjection {
         representative: &mut HashMap<OpId, OpId>,
         relationship_notes: &HashMap<OpId, Vec<Op>>,
     ) {
+        #[derive(Clone, Copy)]
+        enum MetadataResolution {
+            Anchor(OpId),
+            Root(OpId),
+            Unresolved,
+        }
+
         let present: std::collections::HashSet<OpId> =
             result.iter().filter_map(HistoryNode::op_id).collect();
         let is_metadata = |op: &Op| {
@@ -1517,10 +1526,12 @@ impl HistoryProjection {
                 || meta::is_codex_token_usage_record_import(op)
                 || meta::is_legacy_claude_bundle_metadata_import(op)
         };
-        let metadata: std::collections::HashSet<OpId> = result
+        let metadata_scopes: HashMap<OpId, _> = result
             .iter()
             .filter_map(|node| match node {
-                HistoryNode::CollapsedImport { op, .. } if is_metadata(op) => Some(op.id),
+                HistoryNode::CollapsedImport { op, .. } if is_metadata(op) => {
+                    Some((op.id, op.scope))
+                }
                 HistoryNode::EditOperation { .. }
                 | HistoryNode::CollapsedImport { .. }
                 | HistoryNode::ExecuteBundle { .. }
@@ -1529,6 +1540,7 @@ impl HistoryProjection {
                 | HistoryNode::GitCommit(_) => None,
             })
             .collect();
+        let metadata: std::collections::HashSet<OpId> = metadata_scopes.keys().copied().collect();
         if metadata.is_empty() {
             return;
         }
@@ -1593,43 +1605,54 @@ impl HistoryProjection {
         }
 
         // Resolve metadata-to-metadata paths with memoized path compression.
-        // A missing endpoint or cycle resolves to `None`, preserving every row
-        // in that unresolved component instead of selecting a nearby anchor.
-        let mut destination: HashMap<OpId, Option<OpId>> = HashMap::new();
+        // A same-session path with no semantic destination retains its oldest
+        // metadata member as a visible root and folds only exact descendants
+        // into it. This is the session-start shape: both the first activity and
+        // the separately persisted session title can name `session_meta` as
+        // their parent without creating a false title branch. Cross-session
+        // paths and cycles remain uncontracted.
+        let mut resolution: HashMap<OpId, MetadataResolution> = HashMap::new();
         for start in &metadata {
-            if destination.contains_key(start) {
+            if resolution.contains_key(start) {
                 continue;
             }
             let mut path = Vec::new();
             let mut path_set = std::collections::HashSet::new();
             let mut current = *start;
             let resolved = loop {
-                if let Some(known) = destination.get(&current).copied() {
+                if let Some(known) = resolution.get(&current).copied() {
                     break known;
                 }
                 if !path_set.insert(current) {
-                    break None;
+                    break MetadataResolution::Unresolved;
                 }
                 path.push(current);
                 let Some(parent) = direct_parent.get(&current).copied() else {
-                    break None;
+                    break MetadataResolution::Root(current);
                 };
                 if anchors.contains(&parent) {
-                    break Some(parent);
+                    break MetadataResolution::Anchor(parent);
                 }
                 if !metadata.contains(&parent) {
-                    break None;
+                    break MetadataResolution::Root(current);
+                }
+                if metadata_scopes.get(&current) != metadata_scopes.get(&parent) {
+                    break MetadataResolution::Root(current);
                 }
                 current = parent;
             };
             for member in path {
-                let _: Option<Option<OpId>> = destination.insert(member, resolved);
+                let _: Option<MetadataResolution> = resolution.insert(member, resolved);
             }
         }
 
-        let destinations: HashMap<OpId, OpId> = destination
+        let destinations: HashMap<OpId, OpId> = resolution
             .into_iter()
-            .filter_map(|(metadata, anchor)| anchor.map(|anchor| (metadata, anchor)))
+            .filter_map(|(metadata, resolved)| match resolved {
+                MetadataResolution::Anchor(anchor) => Some((metadata, anchor)),
+                MetadataResolution::Root(root) if metadata != root => Some((metadata, root)),
+                MetadataResolution::Root(_) | MetadataResolution::Unresolved => None,
+            })
             .collect();
         if destinations.is_empty() {
             return;
@@ -2983,10 +3006,15 @@ fn collapsed_import_summary(op: &Op, children: Option<&Vec<&Op>>) -> String {
     use editchain_core::OpKind;
     let mut message = String::new();
     let mut tool = String::new();
+    let mut tool_detail = String::new();
     // Whether the tool child is a result (Finish, empty name) — its summary is
     // the content preview, shown WITHOUT the `tool: ` prefix.
     let mut tool_is_result = false;
     let mut command = String::new();
+    // A completed command is an output record. Its Content subtitle comes from
+    // the provider's output field and must not repeat the invocation with a
+    // leading `$`.
+    let mut command_is_result = false;
     let mut file = String::new();
     if let Some(children) = children {
         for child in children {
@@ -3004,10 +3032,16 @@ fn collapsed_import_summary(op: &Op, children: Option<&Vec<&Op>>) -> String {
                         tool_is_result = true;
                     } else {
                         tool = payload_text(&t.tool_name);
+                        tool_detail = tool_invocation_detail(op, t);
                     }
                 }
                 OpKind::Command(c) if command.is_empty() => {
-                    command = payload_text(&c.content);
+                    command_is_result = matches!(c.stage, editchain_core::op::CommandStage::Finish);
+                    command = if command_is_result {
+                        command_output_summary(op, c)
+                    } else {
+                        payload_text(&c.content)
+                    };
                 }
                 OpKind::File(_) if file.is_empty() => {
                     if let Some(path) = annotated_file_path(child, Some(children)) {
@@ -3025,11 +3059,24 @@ fn collapsed_import_summary(op: &Op, children: Option<&Vec<&Op>>) -> String {
         return if tool_is_result {
             tool
         } else {
-            format!("tool: {tool}")
+            let detail = if tool_detail.is_empty() {
+                command.as_str()
+            } else {
+                tool_detail.as_str()
+            };
+            if detail.is_empty() {
+                format!("tool: {tool}")
+            } else {
+                format!("tool: {tool} {detail}")
+            }
         };
     }
     if !command.is_empty() {
-        return format!("$ {command}");
+        return if command_is_result {
+            command
+        } else {
+            format!("$ {command}")
+        };
     }
     if !file.is_empty() {
         return file;
@@ -3050,6 +3097,283 @@ fn collapsed_import_summary(op: &Op, children: Option<&Vec<&Op>>) -> String {
         OpKind::GitLink(l) => format!("git:{}", l.target_oid),
         OpKind::Unknown(u) => format!("unknown kind={}", u.kind_discriminant),
     }
+}
+
+/// Resolve the readable payload for one completed command row.
+///
+/// Current Codex command-completion envelopes retain the command and its
+/// output in separate fields, while the normalized `CommandOp` historically
+/// joined both into `content`. Prefer the raw output carrier so a Content cell
+/// titled “Command output” starts with actual output instead of `$ <command>`.
+/// The normalized content remains a compatibility fallback for standalone or
+/// older provider-neutral command records.
+fn command_output_summary(op: &Op, command: &editchain_core::op::CommandOp) -> String {
+    raw_command_output(op).map_or_else(
+        || truncate_line(&payload_text(&command.content)),
+        |output| {
+            let preview = truncate_line(&output);
+            if preview.is_empty() {
+                "No output".to_owned()
+            } else {
+                preview
+            }
+        },
+    )
+}
+
+/// Extract a command-output preview from a supported raw provider envelope.
+///
+/// The service keeps these fields bounded when it prepares a render
+/// projection, so this path works for both direct projections and prepared
+/// snapshots. `stdout` is the least decorated source; formatted and aggregate
+/// spellings cover Codex schema generations and provider bridges.
+fn raw_command_output(op: &Op) -> Option<String> {
+    let editchain_core::OpKind::Import(import) = &op.kind else {
+        return None;
+    };
+    let Payload::Inline(raw) = &import.raw_ref else {
+        return None;
+    };
+    let value = serde_json::from_slice::<serde_json::Value>(raw).ok()?;
+    let payload = value.get("payload");
+    let item = payload.and_then(|payload| payload.get("item"));
+    if let Some(output) = item.and_then(command_output_field) {
+        return Some(output);
+    }
+    if let Some(output) = payload.and_then(command_output_field) {
+        return Some(output);
+    }
+    if let Some(output) = command_output_field(&value) {
+        return Some(output);
+    }
+    let recognized = [item, payload, Some(&value)]
+        .into_iter()
+        .flatten()
+        .any(is_command_output_container);
+    recognized.then(String::new)
+}
+
+/// Select the first non-empty command output field in display-preference
+/// order from one JSON object.
+fn command_output_field(value: &serde_json::Value) -> Option<String> {
+    COMMAND_OUTPUT_FIELD_NAMES
+        .iter()
+        .filter_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .find(|text| !text.trim().is_empty())
+        .map(str::to_owned)
+}
+
+/// Whether an object is known to represent a command result even when every
+/// output carrier is present-but-empty (a successful silent command).
+fn is_command_output_container(value: &serde_json::Value) -> bool {
+    value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|kind| matches!(kind, "CommandExecution" | "commandExecution"))
+        || COMMAND_OUTPUT_FIELD_NAMES
+            .iter()
+            .any(|key| value.get(*key).is_some())
+}
+
+const COMMAND_OUTPUT_FIELD_NAMES: [&str; 5] = [
+    "stdout",
+    "formatted_output",
+    "formattedOutput",
+    "aggregated_output",
+    "aggregatedOutput",
+];
+
+/// Derive one concise argument preview for a normalized tool invocation.
+///
+/// The raw provider envelope is preferred because current Codex custom-tool
+/// records keep their JavaScript invocation there while their normalized
+/// `ToolOp` has empty content. The normalized content remains a provider-neutral
+/// fallback and is the primary path for Claude tool-use records.
+fn tool_invocation_detail(op: &Op, tool: &editchain_core::op::ToolOp) -> String {
+    raw_tool_invocation_detail(op, &payload_text(&tool.tool_name))
+        .or_else(|| normalized_tool_invocation_detail(tool))
+        .unwrap_or_default()
+}
+
+/// Read invocation arguments from a supported raw provider envelope.
+fn raw_tool_invocation_detail(op: &Op, tool_name: &str) -> Option<String> {
+    let editchain_core::OpKind::Import(import) = &op.kind else {
+        return None;
+    };
+    let Payload::Inline(raw) = &import.raw_ref else {
+        return None;
+    };
+    let value = serde_json::from_slice::<serde_json::Value>(raw).ok()?;
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("response_item") => value.get("payload").and_then(tool_payload_detail),
+        Some("assistant") => claude_tool_input(&value, tool_name).and_then(tool_argument_summary),
+        Some(_) | None => None,
+    }
+}
+
+/// Select the first meaningful argument carrier from a Codex tool payload.
+fn tool_payload_detail(payload: &serde_json::Value) -> Option<String> {
+    ["arguments", "input", "parameters"]
+        .iter()
+        .filter_map(|key| payload.get(*key))
+        .find_map(tool_argument_summary)
+}
+
+/// Select the matching Claude `tool_use` input block.
+fn claude_tool_input<'a>(
+    value: &'a serde_json::Value,
+    tool_name: &str,
+) -> Option<&'a serde_json::Value> {
+    let content = value.get("message")?.get("content")?.as_array()?;
+    content
+        .iter()
+        .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("tool_use"))
+        .find(|block| {
+            tool_name.is_empty()
+                || block.get("name").and_then(serde_json::Value::as_str) == Some(tool_name)
+        })
+        .and_then(|block| block.get("input"))
+}
+
+/// Derive an argument preview from the normalized provider-neutral tool op.
+fn normalized_tool_invocation_detail(tool: &editchain_core::op::ToolOp) -> Option<String> {
+    let content = payload_text(&tool.content);
+    if content.trim().is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+        return tool_argument_summary(&value);
+    }
+    matches!(tool.stage, editchain_core::op::ToolStage::Start)
+        .then(|| compact_tool_text(&content))
+        .filter(|detail| !detail.is_empty())
+}
+
+/// Produce a readable preview from JSON/scalar tool arguments.
+fn tool_argument_summary(value: &serde_json::Value) -> Option<String> {
+    tool_argument_summary_at_depth(value, 0)
+}
+
+/// Bounded recursive implementation for string-encoded JSON arguments.
+fn tool_argument_summary_at_depth(value: &serde_json::Value, depth: usize) -> Option<String> {
+    if depth > 2 {
+        return None;
+    }
+    match value {
+        serde_json::Value::String(text) => {
+            if let Some(summary) = custom_tool_script_summary(text) {
+                return Some(summary);
+            }
+            if let Ok(nested) = serde_json::from_str::<serde_json::Value>(text) {
+                if !matches!(nested, serde_json::Value::String(_)) {
+                    return tool_argument_summary_at_depth(&nested, depth.saturating_add(1));
+                }
+            }
+            let compact = compact_tool_text(text);
+            (!compact.is_empty()).then_some(compact)
+        }
+        serde_json::Value::Object(map) => {
+            for key in [
+                "cmd",
+                "command",
+                "query",
+                "pattern",
+                "path",
+                "file_path",
+                "url",
+                "prompt",
+                "description",
+                "task_name",
+                "target",
+            ] {
+                if let Some(summary) = map.get(key).and_then(|field| {
+                    tool_argument_summary_at_depth(field, depth.saturating_add(1))
+                }) {
+                    return Some(summary);
+                }
+            }
+            (map.len() == 1)
+                .then(|| map.values().next())
+                .flatten()
+                .and_then(|field| tool_argument_summary_at_depth(field, depth.saturating_add(1)))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|item| tool_argument_summary_at_depth(item, depth.saturating_add(1))),
+        serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Null => None,
+    }
+}
+
+/// Summarize the nested tool invoked by a current Codex custom-tool script.
+fn custom_tool_script_summary(source: &str) -> Option<String> {
+    let nested_tool = nested_tool_name(source)?;
+    let detail = [
+        "cmd",
+        "command",
+        "query",
+        "q",
+        "pattern",
+        "path",
+        "file_path",
+        "url",
+        "prompt",
+    ]
+    .iter()
+    .find_map(|key| javascript_string_property(source, key))
+    .map(|value| compact_tool_text(&value))
+    .filter(|value| !value.is_empty());
+    if nested_tool == "exec_command" {
+        return detail.or(Some(nested_tool));
+    }
+    Some(detail.map_or(nested_tool.clone(), |detail| {
+        format!("{nested_tool} · {detail}")
+    }))
+}
+
+/// Extract the first `tools.<name>(...)` callee from a custom-tool script.
+fn nested_tool_name(source: &str) -> Option<String> {
+    let start = source.find("tools.")?.saturating_add("tools.".len());
+    let after_marker = source.get(start..)?;
+    let name = after_marker
+        .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .next()
+        .unwrap_or("");
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Parse one generated JavaScript `key: "value"` property without executing
+/// provider-authored code.
+fn javascript_string_property(source: &str, key: &str) -> Option<String> {
+    for (index, _) in source.match_indices(key) {
+        let before = source
+            .get(..index)
+            .and_then(|prefix| prefix.chars().next_back());
+        if before.is_some_and(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '$')
+        }) {
+            continue;
+        }
+        let Some(after_key) = source.get(index.saturating_add(key.len())..) else {
+            continue;
+        };
+        let Some(encoded) = after_key.trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let encoded = encoded.trim_start();
+        let mut values =
+            serde_json::Deserializer::from_str(encoded).into_iter::<serde_json::Value>();
+        if let Some(Ok(serde_json::Value::String(value))) = values.next() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Collapse whitespace and bound an invocation preview for one content cell.
+fn compact_tool_text(value: &str) -> String {
+    truncate_line(&value.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 /// Resolve a collapsed File row's display path.
@@ -3095,6 +3419,9 @@ fn raw_import_label(import: &editchain_core::op::ImportOp) -> String {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
         return raw;
     };
+    if let Some(summary) = token_accounting_summary(&value) {
+        return summary;
+    }
     let record_type = value
         .get("type")
         .and_then(serde_json::Value::as_str)
@@ -3229,6 +3556,91 @@ fn raw_import_label(import: &editchain_core::op::ImportOp) -> String {
         _ if !record_type.is_empty() => record_type.to_string(),
         _ => raw,
     }
+}
+
+/// Derive the compact numeric subtitle for a Codex token-accounting record.
+///
+/// Current `token_count` events compare the latest active context with the
+/// model context window (`used / limit`). Legacy `token_usage_record` entries
+/// have no corresponding limit, so they show the request total alone. Returns
+/// `None` for every other import shape and for token records without a usable
+/// total.
+#[must_use]
+pub fn import_token_accounting_summary(raw: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(raw).ok()?;
+    token_accounting_summary(&value)
+}
+
+/// Resolve token-accounting values from a parsed import envelope.
+fn token_accounting_summary(value: &serde_json::Value) -> Option<String> {
+    let kind = token_accounting_kind(value)?;
+    let payload = value.get("payload")?;
+    let (used, limit) = match kind {
+        "token_count" => {
+            let info = payload.get("info")?;
+            let used = nested_u64(info, &["last_token_usage", "total_tokens"])
+                .or_else(|| nested_u64(info, &["total_token_usage", "total_tokens"]))?;
+            let limit = info
+                .get("model_context_window")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|limit| *limit > 0);
+            (used, limit)
+        }
+        "token_usage_record" => {
+            let used = nested_u64(payload, &["usage", "total_tokens"])
+                .or_else(|| nested_u64(payload, &["turn_token_usage", "total_tokens"]))
+                .or_else(|| nested_u64(payload, &["thread_token_usage", "total_tokens"]))?;
+            let limit = payload
+                .get("model_context_window")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|limit| *limit > 0);
+            (used, limit)
+        }
+        _ => return None,
+    };
+    let used = format_token_count(used);
+    Some(limit.map_or(used.clone(), |limit| {
+        format!("{used} / {}", format_token_count(limit))
+    }))
+}
+
+/// Return the normalized token-accounting kind carried by an import envelope.
+fn token_accounting_kind(value: &serde_json::Value) -> Option<&'static str> {
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("token_usage_record") => Some("token_usage_record"),
+        Some("event_msg")
+            if value
+                .get("payload")
+                .and_then(|payload| payload.get("type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("token_count") =>
+        {
+            Some("token_count")
+        }
+        _ => None,
+    }
+}
+
+/// Read one unsigned integer through a short fixed JSON object path.
+fn nested_u64(value: &serde_json::Value, path: &[&str]) -> Option<u64> {
+    let mut current = value;
+    for field in path {
+        current = current.get(*field)?;
+    }
+    current.as_u64()
+}
+
+/// Format a token count with stable ASCII thousands separators.
+fn format_token_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut reversed = String::new();
+    for (index, digit) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            reversed.push(',');
+        }
+        reversed.push(digit);
+    }
+    reversed.chars().rev().collect()
 }
 
 /// Extract the first non-empty summary text from a response-item payload.
@@ -3420,12 +3832,15 @@ fn truncate_line(s: &str) -> String {
 }
 
 /// Build a display summary for a collapsed import from its own content plus its
-/// bundled sub-ops' content.
+/// bundled tool-result content.
 ///
 /// The row's own summary is combined with each sub-op's meaningful content
-/// (tool-result previews, metadata labels), joined with spaces, and truncated to
-/// ~1024 chars. If the row has no own content and no sub-op content, falls back
-/// to `(no summary)`.
+/// (tool-result previews), joined with spaces, and truncated to ~1024 chars.
+/// Metadata is intentionally child-only: copying its label into the parent
+/// makes accounting records look like invocation arguments. A tool row with
+/// concrete invocation detail also keeps its result child-only; generic tool
+/// names may still borrow a result preview. If the row has no own content and
+/// no tool-result content, falls back to `(no summary)`.
 #[must_use]
 fn combined_summary(row_summary: &str, sub_ops: &[Arc<Op>]) -> String {
     const MAX: usize = 1024;
@@ -3433,6 +3848,12 @@ fn combined_summary(row_summary: &str, sub_ops: &[Arc<Op>]) -> String {
     let own = row_summary.trim();
     if !own.is_empty() && own != "(no summary)" {
         parts.push(own.to_string());
+    }
+    // A concrete invocation is already the parent's best description. Its
+    // result remains available as an expanded child and must not crowd or
+    // duplicate the command in the parent cell.
+    if tool_summary_has_invocation_detail(own) {
+        return truncate_line(own);
     }
     for op in sub_ops {
         if let Some(content) = sub_op_content(op) {
@@ -3454,11 +3875,21 @@ fn combined_summary(row_summary: &str, sub_ops: &[Arc<Op>]) -> String {
     }
 }
 
+/// Whether a `tool: <name> <arguments>` summary contains concrete invocation
+/// detail beyond the tool's name.
+fn tool_summary_has_invocation_detail(summary: &str) -> bool {
+    let Some(tool_summary) = summary.strip_prefix("tool:") else {
+        return false;
+    };
+    let mut parts = tool_summary.split_whitespace();
+    parts.next().is_some() && parts.next().is_some()
+}
+
 /// Extract meaningful display content from a bundled sub-op.
 ///
-/// Tool-result sub-ops (Tool, Finish) contribute their content preview; metadata
-/// Import sub-ops contribute a short label derived from the raw record. Returns
-/// `None` for sub-ops with no useful text.
+/// Tool-result sub-ops (Tool, Finish) contribute their content preview. Import
+/// sub-ops are metadata disclosed as child rows and never contribute parent-row
+/// content. Returns `None` for sub-ops with no useful text.
 #[must_use]
 fn sub_op_content(op: &Op) -> Option<String> {
     match &op.kind {
@@ -3472,15 +3903,8 @@ fn sub_op_content(op: &Op) -> Option<String> {
                 Some(preview)
             }
         }
-        editchain_core::OpKind::Import(i) => {
-            let label = raw_import_label(i);
-            if label.is_empty() || label.starts_with('{') {
-                None
-            } else {
-                Some(label)
-            }
-        }
-        editchain_core::OpKind::ChainStart(_)
+        editchain_core::OpKind::Import(_)
+        | editchain_core::OpKind::ChainStart(_)
         | editchain_core::OpKind::Actor(_)
         | editchain_core::OpKind::Message(_)
         | editchain_core::OpKind::Tool(_)
@@ -3498,13 +3922,14 @@ fn sub_op_content(op: &Op) -> Option<String> {
 /// Determine the dominant child kind for a collapsed import op.
 ///
 /// Prefers message, then tool, then command — matching the summary derivation.
-/// Falls back to `"import"` when there are no meaningful children.
+/// Childless token-accounting imports retain their concrete kind for Content
+/// titles; every other childless record falls back to `"import"`.
 #[must_use]
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "Only message/tool/command children determine the dominant kind; all other kinds fall through"
 )]
-fn collapsed_import_kind(children: Option<&Vec<&Op>>) -> String {
+fn collapsed_import_kind(op: &Op, children: Option<&Vec<&Op>>) -> String {
     use editchain_core::OpKind;
     if let Some(children) = children {
         for child in children {
@@ -3516,7 +3941,18 @@ fn collapsed_import_kind(children: Option<&Vec<&Op>>) -> String {
             }
         }
     }
-    "import".to_string()
+    match &op.kind {
+        OpKind::Import(import) => match &import.raw_ref {
+            Payload::Inline(raw) => serde_json::from_slice::<serde_json::Value>(raw)
+                .ok()
+                .as_ref()
+                .and_then(token_accounting_kind)
+                .unwrap_or("import")
+                .to_string(),
+            Payload::Empty | Payload::Blob(_) => "import".to_string(),
+        },
+        _ => "import".to_string(),
+    }
 }
 
 /// Determine the author label for a collapsed import op from its children's

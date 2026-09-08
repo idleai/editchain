@@ -37,9 +37,10 @@
 //!   tool-name, or proximity matching participates.
 //! - **Conversational work grouping** ([`bundle_activity_work_groups`]): every
 //!   maximal linear span of non-chat activity contracts into one expandable
-//!   work summary. Existing execute/plan bundles remain nested members. Rows
-//!   incident to any fork, merge, subagent/reconnect, or produced-commit edge
-//!   are hard boundaries, so branching always remains outside a work group.
+//!   work summary. Existing execute/plan bundles remain nested members. Session
+//!   creation records and rows incident to any fork, merge,
+//!   subagent/reconnect, or produced-commit edge are hard boundaries, so
+//!   metadata headers and branching always remain outside a work group.
 //!
 //! Conservative guards keep evidence visible: runs never cross turn or group
 //! boundaries, are built from display-order contiguity only (never timestamps),
@@ -55,7 +56,7 @@ use editchain_core::{
 };
 
 use crate::meta::{
-    claude_assistant_message_id, is_context_compaction_import,
+    claude_assistant_message_id, is_context_compaction_import, is_session_start_boundary_import,
     sub_op_is_world_state_or_turn_context, NodeMeta,
 };
 use crate::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
@@ -831,9 +832,13 @@ pub fn bundle_activity_plan_repeats<S: std::hash::BuildHasher>(
 /// A work candidate is any non-Git row except a primary user/agent
 /// Conversation row. System/lifecycle records, plans, exploration, execution,
 /// changes, verification, and diagnostics therefore collapse together until a
-/// conversational boundary. Existing execute-run and plan-repeat bundles are
-/// retained as direct member nodes, which gives the renderer one outer work
-/// disclosure and one existing inner disclosure level.
+/// conversational boundary. Explicit session-start metadata/lifecycle rows are
+/// boundaries too: they describe the session rather than work and must not turn
+/// into a synthetic `1 meta event · 1 other activity` group. Existing
+/// execute-run and plan-repeat bundles are retained when they share the work
+/// interval with other activities. When one is the interval's sole member, its
+/// original activities become the work group's direct children so the UI does
+/// not expose a redundant second disclosure level.
 ///
 /// Branching is forbidden inside a group. Explicit structural endpoints from
 /// `structural_keys` are excluded, and this pass independently protects every
@@ -867,6 +872,7 @@ pub fn bundle_activity_work_groups<S: std::hash::BuildHasher>(
         .map(|(node, key)| {
             node.git_oid().is_none()
                 && !is_user_or_agent_chat(node)
+                && !is_session_start_boundary(node)
                 && !branch_boundaries.contains(key)
                 && node_anchor_op(node).is_some()
         })
@@ -945,6 +951,17 @@ fn is_user_or_agent_chat(node: &HistoryNode) -> bool {
     node.activity_kind() == ActivityKind::Conversation
         && node.record_role() == RecordRole::Narrative
         && node.visibility() == Visibility::Primary
+}
+
+/// Session creation is presentation context, never turn work.
+#[must_use]
+fn is_session_start_boundary(node: &HistoryNode) -> bool {
+    node_anchor_op(node).is_some_and(|op| {
+        (op.tags.matches_any(Tags::META)
+            || (node.activity_kind() == ActivityKind::System
+                && node.record_role() == RecordRole::Lifecycle))
+            && is_session_start_boundary_import(op)
+    })
 }
 
 /// Per-node facts precomputed once for the run scan, so membership checks do
@@ -1224,7 +1241,7 @@ fn build_plan_bundle(members: Vec<HistoryNode>) -> HistoryNode {
     }
 }
 
-/// Build one outer work summary while retaining existing inner bundle nodes.
+/// Build one outer work summary, flattening a sole nested synthetic group.
 #[must_use]
 fn build_work_group(members: Vec<HistoryNode>) -> HistoryNode {
     let newest = members.first();
@@ -1243,14 +1260,38 @@ fn build_work_group(members: Vec<HistoryNode>) -> HistoryNode {
         chain_state: aggregate_chain_state(&members),
         turn_id: common_turn_id(&members),
     };
+    let member_nodes = flatten_single_work_group_member(members);
     HistoryNode::WorkGroup {
         anchor: std::sync::Arc::new(anchor),
         source_time,
         parent_override: None,
-        member_nodes: members,
+        member_nodes,
         members: represented,
         summary,
         meta,
+    }
+}
+
+/// Remove one otherwise redundant disclosure boundary from a work group.
+///
+/// The work row remains the stable graph/summary anchor; only its expansion
+/// children change. Ordinary singleton activities stay wrapped so the fixed
+/// Activity view still has its consistent chat / work / chat shape.
+#[must_use]
+fn flatten_single_work_group_member(mut members: Vec<HistoryNode>) -> Vec<HistoryNode> {
+    if members.len() != 1 {
+        return members;
+    }
+    let Some(member) = members.pop() else {
+        return members;
+    };
+    match member {
+        HistoryNode::ExecuteBundle { member_nodes, .. }
+        | HistoryNode::PlanBundle { member_nodes, .. }
+        | HistoryNode::WorkGroup { member_nodes, .. } => member_nodes,
+        ordinary @ (HistoryNode::EditOperation { .. }
+        | HistoryNode::CollapsedImport { .. }
+        | HistoryNode::GitCommit(_)) => vec![ordinary],
     }
 }
 
@@ -1279,25 +1320,26 @@ fn flattened_work_group_members(members: &[HistoryNode]) -> Vec<std::sync::Arc<O
     represented
 }
 
-/// Deterministic, bounded summary from the whole work interval.
+/// Deterministic provider-neutral summary of the work interval's activity mix.
+///
+/// The `WorkGroup` count already has a dedicated UI tag, so Content describes
+/// what happened without repeating the total or promoting arbitrary provider
+/// payloads (tool wrappers, command output, file paths, or reasoning prose).
 #[must_use]
 fn work_group_summary(members: &[HistoryNode]) -> String {
     let mut counts: HashMap<ActivityKind, usize> = HashMap::new();
     for member in members {
         collect_activity_counts(member, &mut counts);
     }
-    let total = counts.values().copied().sum::<usize>();
     let breakdown = work_breakdown(&counts);
-    let overview = if breakdown.is_empty() {
-        format!("{total} {}", activity_noun(total))
+    if breakdown.is_empty() {
+        let total = counts.values().copied().sum::<usize>();
+        format!(
+            "{total} recorded activit{}",
+            if total == 1 { "y" } else { "ies" }
+        )
     } else {
-        format!("{total} {} · {breakdown}", activity_noun(total))
-    };
-    let headline = work_headline(members);
-    if headline.is_empty() || headline == overview {
-        overview
-    } else {
-        format!("{} — {overview}", bounded_summary(&headline, 96))
+        breakdown
     }
 }
 
@@ -1320,54 +1362,29 @@ fn collect_activity_counts(node: &HistoryNode, counts: &mut HashMap<ActivityKind
     }
 }
 
-/// Pick one meaningful member summary, preferring durable/high-signal work.
-#[must_use]
-fn work_headline(members: &[HistoryNode]) -> String {
-    const PRIORITY: [ActivityKind; 11] = [
-        ActivityKind::Change,
-        ActivityKind::Verify,
-        ActivityKind::Diagnose,
-        ActivityKind::Plan,
-        ActivityKind::Explore,
-        ActivityKind::Execute,
-        ActivityKind::Coordinate,
-        ActivityKind::External,
-        ActivityKind::System,
-        ActivityKind::Conversation,
-        ActivityKind::Unknown,
-    ];
-    for activity in PRIORITY {
-        if let Some(summary) = members
-            .iter()
-            .find(|member| member.activity_kind() == activity)
-            .map(HistoryNode::summary)
-            .filter(|summary| !summary.trim().is_empty())
-        {
-            return summary.split_whitespace().collect::<Vec<_>>().join(" ");
-        }
-    }
-    String::new()
-}
-
 /// Stable semantic breakdown ordered by how useful it is in a collapsed row.
 #[must_use]
 fn work_breakdown(counts: &HashMap<ActivityKind, usize>) -> String {
     const ORDER: [(ActivityKind, &str, &str); 11] = [
-        (ActivityKind::Change, "change", "changes"),
+        (ActivityKind::Change, "edit", "edits"),
         (ActivityKind::Verify, "verification", "verifications"),
-        (ActivityKind::Diagnose, "diagnosis", "diagnoses"),
-        (ActivityKind::Plan, "plan", "plans"),
+        (ActivityKind::Diagnose, "diagnostic", "diagnostics"),
+        (ActivityKind::Plan, "planning step", "planning steps"),
         (ActivityKind::Explore, "exploration", "explorations"),
-        (ActivityKind::Execute, "run", "runs"),
-        (ActivityKind::Coordinate, "coordination", "coordinations"),
+        (ActivityKind::Execute, "tool call", "tool calls"),
+        (
+            ActivityKind::Coordinate,
+            "coordination step",
+            "coordination steps",
+        ),
         (ActivityKind::External, "external event", "external events"),
-        (ActivityKind::System, "system event", "system events"),
+        (ActivityKind::System, "meta event", "meta events"),
         (
             ActivityKind::Conversation,
-            "supporting chat",
-            "supporting chats",
+            "supporting message",
+            "supporting messages",
         ),
-        (ActivityKind::Unknown, "other", "other"),
+        (ActivityKind::Unknown, "other activity", "other activities"),
     ];
     ORDER
         .iter()
@@ -1376,28 +1393,7 @@ fn work_breakdown(counts: &HashMap<ActivityKind, usize>) -> String {
             (count > 0).then(|| format!("{count} {}", if count == 1 { *singular } else { *plural }))
         })
         .collect::<Vec<_>>()
-        .join(", ")
-}
-
-const fn activity_noun(count: usize) -> &'static str {
-    if count == 1 {
-        "activity"
-    } else {
-        "activities"
-    }
-}
-
-/// Character-safe summary bound; UI rows remain one line and retain the
-/// aggregate breakdown even when the chosen member headline is very long.
-#[must_use]
-fn bounded_summary(summary: &str, max_chars: usize) -> String {
-    let mut chars = summary.chars();
-    let prefix: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{}…", prefix.trim_end())
-    } else {
-        prefix
-    }
+        .join(" · ")
 }
 
 /// Preserve a turn id only when every member carries that same exact id.

@@ -490,33 +490,34 @@ pub fn normalized_ops_for_item(
             }
         }
         ProjectionKind::File => {
-            let lane = take_lane(&mut ctx.lanes, anchor_ordinal)?;
-            let stage = file_stage(item.payload.get("status").and_then(Value::as_str));
-            let path = file_path(&item.payload);
-            let file_op_id = ctx
-                .stream
-                .op_from_position(SourcePosition::derived(anchor_ordinal, lane))?;
-            ops.push(Op {
-                id: file_op_id,
-                parents: ParentSet::One(raw_op_id),
-                actor: actor_id,
-                clock: anchor_clock,
-                scope,
-                tags: actor_tag | kind_tag_flag,
-                kind: OpKind::File(FileOp {
-                    path,
-                    stage,
-                    base: None,
-                    after: None,
-                    edit: file_edit(&item.payload, ctx.blobs)?,
-                }),
-            });
-            // Persist the provider-neutral path text as an explicit annotation
-            // targeting the file op: the core `FileOp` only carries the hashed
-            // `PathId`, and the layout renders the annotated path for the row
-            // summary. Claude behavior is untouched (Claude emits no such
-            // annotations).
-            if let Some(path_text) = file_path_text(&item.payload) {
+            let default_stage = file_stage(item.payload.get("status").and_then(Value::as_str));
+            for part in file_change_parts(&item.payload) {
+                let lane = take_lane(&mut ctx.lanes, anchor_ordinal)?;
+                let file_op_id = ctx
+                    .stream
+                    .op_from_position(SourcePosition::derived(anchor_ordinal, lane))?;
+                ops.push(Op {
+                    id: file_op_id,
+                    parents: ParentSet::One(raw_op_id),
+                    actor: actor_id,
+                    clock: anchor_clock,
+                    scope,
+                    tags: actor_tag | kind_tag_flag,
+                    kind: OpKind::File(FileOp {
+                        path: derive_path_id(&part.path),
+                        stage: if part.deleted {
+                            FileStage::Deleted
+                        } else {
+                            default_stage
+                        },
+                        base: None,
+                        after: None,
+                        edit: file_edit(&part.diffs, ctx.blobs)?,
+                    }),
+                });
+                // Persist each provider-neutral path as an explicit annotation
+                // targeting its own file op. `FileOp` carries only `PathId`,
+                // while one Codex fileChange item can contain several paths.
                 let note_lane = take_lane(&mut ctx.lanes, anchor_ordinal)?;
                 ops.push(Op {
                     id: ctx
@@ -530,7 +531,7 @@ pub fn normalized_ops_for_item(
                     kind: OpKind::Note(NoteOp {
                         target_ids: vec![file_op_id],
                         relationship: NoteRelationship::Explains,
-                        content: payload_for(path_text.as_bytes(), ctx.blobs)?,
+                        content: payload_for(part.path.as_bytes(), ctx.blobs)?,
                     }),
                 });
             }
@@ -861,23 +862,72 @@ fn command_content_payload(
     join_payload(&parts, blobs)
 }
 
-/// File edit payload from `changes[].diff` (unified diff text), if present.
-fn file_edit(payload: &Value, blobs: &mut dyn BlobSink) -> Result<FileEdit, ImportError> {
-    let diffs: Vec<String> = payload
-        .get("changes")
-        .and_then(Value::as_array)
-        .map(|changes| {
-            changes
+/// One path-specific projection retained from a Codex `fileChange` item.
+#[derive(Debug)]
+struct FileChangePart {
+    path: String,
+    diffs: Vec<String>,
+    deleted: bool,
+}
+
+/// Preserve every changed path instead of collapsing `changes[]` onto its
+/// first entry. Repeated entries for one path are folded in source order.
+fn file_change_parts(payload: &Value) -> Vec<FileChangePart> {
+    let mut parts: Vec<FileChangePart> = Vec::new();
+    if let Some(changes) = payload.get("changes").and_then(Value::as_array) {
+        for change in changes {
+            let Some(path) = change
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+            else {
+                continue;
+            };
+            let index = parts
                 .iter()
-                .filter_map(|c| {
-                    c.get("diff")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+                .position(|part| part.path == path)
+                .unwrap_or_else(|| {
+                    parts.push(FileChangePart {
+                        path: path.to_string(),
+                        diffs: Vec::new(),
+                        deleted: false,
+                    });
+                    parts.len().saturating_sub(1)
+                });
+            let Some(part) = parts.get_mut(index) else {
+                continue;
+            };
+            if let Some(diff) = change
+                .get("diff")
+                .and_then(Value::as_str)
+                .filter(|diff| !diff.is_empty())
+            {
+                part.diffs.push(diff.to_string());
+            }
+            part.deleted |= change
+                .get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| matches!(kind, "delete" | "deleted" | "remove" | "removed"));
+        }
+    }
+    if parts.is_empty() {
+        if let Some(path) = payload
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+        {
+            parts.push(FileChangePart {
+                path: path.to_string(),
+                diffs: Vec::new(),
+                deleted: false,
+            });
+        }
+    }
+    parts
+}
+
+/// File edit payload for one path's unified diff text, if present.
+fn file_edit(diffs: &[String], blobs: &mut dyn BlobSink) -> Result<FileEdit, ImportError> {
     if diffs.is_empty() {
         return Ok(FileEdit::None);
     }
@@ -885,35 +935,6 @@ fn file_edit(payload: &Value, blobs: &mut dyn BlobSink) -> Result<FileEdit, Impo
         diffs.join("\n").as_bytes(),
         blobs,
     )?))
-}
-
-/// File path for `fileChange` (first change's path) or `imageView` (`path`).
-#[must_use]
-fn file_path(payload: &Value) -> editchain_core::PathId {
-    derive_path_id(file_path_text(payload).as_deref().unwrap_or(""))
-}
-
-/// The provider-neutral path text for a `fileChange` (first change's path) or
-/// `imageView` (`path`) item, when present.
-#[must_use]
-fn file_path_text(payload: &Value) -> Option<String> {
-    let path = payload
-        .get("changes")
-        .and_then(Value::as_array)
-        .and_then(|changes| {
-            changes.iter().find_map(|c| {
-                c.get("path")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-            })
-        });
-    path.or_else(|| {
-        payload
-            .get("path")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-    })
-    .map(str::to_string)
 }
 
 /// Deterministic provider-neutral summary for a subagent activity item.

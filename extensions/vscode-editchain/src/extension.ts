@@ -43,6 +43,9 @@ let openEpoch = 0;
 // pressure).
 let rendererInstanceId: string | null = null;
 let openDeliveredToRenderer: string | null = null;
+// Unique virtual-document namespace for native diff tabs. Reusing a URI would
+// let VS Code retain stale text from an earlier click on the same path.
+let diffDocumentSerial = 0;
 
 // Generous finite deadline for NON-Open service requests (window fetches,
 // search and object resolution). The measured first-window time on a large
@@ -52,6 +55,12 @@ let openDeliveredToRenderer: string | null = null;
 // a visible error in the webview and suspends the progressive loader until the
 // user explicitly retries or re-opens.
 const NON_OPEN_TIMEOUT_MS = 120_000;
+
+type RecordedDiffHunk = Readonly<{
+  header: string;
+  before: string;
+  after: string;
+}>;
 
 /**
  * Activate the EditChain History extension.
@@ -76,9 +85,14 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.workspace.registerTextDocumentContentProvider('editchain-json', jsonProvider)
   );
+  const diffProvider = new DiffContentProvider();
+  context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider('editchain-diff', diffProvider),
+    vscode.workspace.registerTextDocumentContentProvider('editchain-hunk', diffProvider)
+  );
 
   const openCommand = vscode.commands.registerCommand('editchain-history.open', () => {
-    openHistoryView(context, client, jsonProvider);
+    openHistoryView(context, client, jsonProvider, diffProvider);
   });
   context.subscriptions.push(openCommand);
 
@@ -116,7 +130,8 @@ function updateStatusBar(loaded: number, total: number): void {
 function openHistoryView(
   context: vscode.ExtensionContext,
   client: StdioClient,
-  jsonProvider: JsonContentProvider
+  jsonProvider: JsonContentProvider,
+  diffProvider: DiffContentProvider
 ): void {
   // Reuse an existing panel if one is still open, so we never create two
   // webviews of the same type (which races service-worker registration).
@@ -235,6 +250,14 @@ function openHistoryView(
         output?.appendLine('[webview] renderer ready: ' + instanceId);
       }
       deliverOpenState(panel);
+      return;
+    }
+    // File children open VS Code's native diff editor. The webview sends only
+    // the identity advertised by the service; the service revalidates it and
+    // resolves immutable Git blobs or retained agent-edit evidence.
+    if (msg.type === 'openDiff') {
+      output?.appendLine('[webview] openDiff request');
+      await openDiffEditor(client, diffProvider, msg);
       return;
     }
     // Intercept the "open JSON editor" request from the webview: fetch the
@@ -488,6 +511,165 @@ async function openJsonEditor(
   }
 }
 
+/** Materialize one advertised file change and open VS Code's native diff UI. */
+async function openDiffEditor(
+  client: StdioClient,
+  diffProvider: DiffContentProvider,
+  msg: { change?: any }
+): Promise<void> {
+  try {
+    if (!msg.change || typeof msg.change !== 'object' || Array.isArray(msg.change)) {
+      throw new Error('missing file-change identity');
+    }
+    const resp = await client.request(
+      { GetFileDiff: { change: msg.change } },
+      { timeoutMs: NON_OPEN_TIMEOUT_MS }
+    );
+    if (resp && resp.Error !== undefined) throw new Error(String(resp.Error));
+    const diff = resp?.Ok ?? resp;
+    if (!diff || typeof diff !== 'object') {
+      throw new Error('service returned no file diff');
+    }
+    if (diff.binary) {
+      const note = typeof diff.note === 'string' ? diff.note : 'Binary edits cannot be shown as text.';
+      await vscode.window.showWarningMessage(`EditChain: ${note}`);
+      return;
+    }
+    if (typeof diff.before !== 'string' || typeof diff.after !== 'string') {
+      throw new Error('service returned invalid diff content');
+    }
+    const hunks = parseRecordedDiffHunks(diff.hunks);
+
+    const serial = ++diffDocumentSerial;
+    const currentPath = typeof diff.path === 'string' && diff.path ? diff.path : 'edit.txt';
+    const source = msg.change.source === 'git' ? 'Git' : 'agent';
+    if (hunks.length > 1) {
+      await openRecordedHunks(diffProvider, serial, currentPath, source, hunks);
+    } else {
+      const hunk = hunks[0];
+      const previousPath = hunk
+        ? currentPath
+        : typeof diff.old_path === 'string' && diff.old_path
+          ? diff.old_path
+          : currentPath;
+      const beforeUri = diffDocumentUri(serial, 'before', previousPath);
+      const afterUri = diffDocumentUri(serial, 'after', currentPath);
+      diffProvider.setContent(beforeUri.toString(), hunk?.before ?? diff.before);
+      diffProvider.setContent(afterUri.toString(), hunk?.after ?? diff.after);
+
+      const fidelity = diff.partial ? ', recorded evidence' : '';
+      const hunkRange = hunk ? `, ${compactHunkHeader(hunk.header)}` : '';
+      const title = `${currentPath} (${source}${fidelity}${hunkRange})`;
+      await vscode.commands.executeCommand(
+        'vscode.diff',
+        beforeUri,
+        afterUri,
+        title,
+        { preview: true }
+      );
+    }
+    if (diff.partial && typeof diff.note === 'string' && diff.note) {
+      output?.appendLine(`[diff] ${currentPath}: ${diff.note}`);
+    }
+  } catch (e) {
+    vscode.window.showErrorMessage(`EditChain: failed to open diff editor: ${String(e)}`);
+  }
+}
+
+/** Open disconnected recorded hunks without pretending they are one file. */
+async function openRecordedHunks(
+  diffProvider: DiffContentProvider,
+  serial: number,
+  filePath: string,
+  source: string,
+  hunks: readonly RecordedDiffHunk[]
+): Promise<void> {
+  const resources: [vscode.Uri, vscode.Uri, vscode.Uri][] = hunks.map((hunk, index) => {
+    const ordinal = index + 1;
+    const beforeUri = diffHunkDocumentUri(
+      serial,
+      'before',
+      filePath,
+      ordinal,
+      hunks.length,
+      hunk.header
+    );
+    const afterUri = diffHunkDocumentUri(
+      serial,
+      'after',
+      filePath,
+      ordinal,
+      hunks.length,
+      hunk.header
+    );
+    diffProvider.setContent(beforeUri.toString(), hunk.before);
+    diffProvider.setContent(afterUri.toString(), hunk.after);
+    return [afterUri, beforeUri, afterUri];
+  });
+  const noun = hunks.length === 1 ? 'recorded hunk' : `${hunks.length} recorded hunks`;
+  const title = `${filePath} (${source}, ${noun}; gaps unavailable)`;
+  await vscode.commands.executeCommand('vscode.changes', title, resources);
+}
+
+/** Validate the structured hunk envelope received from the native service. */
+function parseRecordedDiffHunks(value: unknown): RecordedDiffHunk[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error('service returned invalid diff hunks');
+  return value.map((item) => {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+      throw new Error('service returned invalid diff hunk');
+    }
+    const hunk = item as Record<string, unknown>;
+    if (
+      typeof hunk.header !== 'string' ||
+      typeof hunk.before !== 'string' ||
+      typeof hunk.after !== 'string'
+    ) {
+      throw new Error('service returned invalid diff hunk content');
+    }
+    return { header: hunk.header, before: hunk.before, after: hunk.after };
+  });
+}
+
+/** Unique read-only URI whose suffix preserves the file's language mode. */
+function diffDocumentUri(
+  serial: number,
+  side: 'before' | 'after',
+  filePath: string
+): vscode.Uri {
+  const normalized = filePath.replace(/\\/g, '/').replace(/^\/+/, '');
+  return vscode.Uri.from({
+    scheme: 'editchain-diff',
+    authority: `${serial}-${side}`,
+    path: `/${normalized || 'edit.txt'}`,
+  });
+}
+
+/** Hunk document URI whose formatter exposes the recorded source range. */
+function diffHunkDocumentUri(
+  serial: number,
+  side: 'before' | 'after',
+  filePath: string,
+  ordinal: number,
+  total: number,
+  header: string
+): vscode.Uri {
+  const normalized = filePath.replace(/\\/g, '/').replace(/^\/+/, '') || 'edit.txt';
+  const label = `recorded hunk ${ordinal} of ${total} · ${compactHunkHeader(header)}`;
+  return vscode.Uri.from({
+    scheme: 'editchain-hunk',
+    authority: `${serial}-hunk-${ordinal}-${side}`,
+    path: `/${normalized}`,
+    query: JSON.stringify({ label }),
+  });
+}
+
+/** Compact a patch header for use in native editor titles and resource labels. */
+function compactHunkHeader(header: string): string {
+  const compact = header.replace(/\s+/g, ' ').trim();
+  return compact.length > 96 ? `${compact.slice(0, 95)}…` : compact;
+}
+
 /**
  * Recursively parse string values that are themselves JSON-serialized, so they
  * render as nested JSON rather than escaped strings.
@@ -539,6 +721,26 @@ class JsonContentProvider implements vscode.TextDocumentContentProvider {
 
   /** Set (or update) the content for a document URI. */
   setContent(uri: string, content: string): void {
+    this.contents.set(uri, content);
+  }
+
+  provideTextDocumentContent(uri: vscode.Uri): string {
+    return this.contents.get(uri.toString()) ?? '';
+  }
+}
+
+/** Read-only before/after documents consumed by VS Code's diff command. */
+class DiffContentProvider implements vscode.TextDocumentContentProvider {
+  private contents = new Map<string, string>();
+
+  setContent(uri: string, content: string): void {
+    // Keep recent tabs resolvable while bounding extension-host memory during
+    // long review sessions. Map insertion order gives a tiny FIFO here.
+    while (this.contents.size >= 128) {
+      const oldest = this.contents.keys().next().value;
+      if (typeof oldest !== 'string') break;
+      this.contents.delete(oldest);
+    }
     this.contents.set(uri, content);
   }
 

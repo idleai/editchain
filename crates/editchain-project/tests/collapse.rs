@@ -261,6 +261,215 @@ fn collapse_tool_summary_prefixes_tool() {
 }
 
 #[test]
+fn completed_command_summary_uses_stdout_or_formatted_output() {
+    let cases = [
+        (
+            1,
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "stdout": "first output line\nsecond output line",
+                        "formatted_output": "decorated output",
+                    },
+                },
+            }),
+            "first output line\nsecond output line",
+        ),
+        (
+            2,
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "stdout": "",
+                        "formatted_output": "formatted fallback",
+                    },
+                },
+            }),
+            "formatted fallback",
+        ),
+        (
+            3,
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "stdout": "",
+                        "formatted_output": "",
+                    },
+                },
+            }),
+            "No output",
+        ),
+    ];
+
+    for (node, raw, expected) in cases {
+        let mut import = import_op(node, 1);
+        if let OpKind::Import(raw_import) = &mut import.kind {
+            raw_import.raw_ref = Payload::Inline(raw.to_string().into_bytes());
+        }
+        let command = Op {
+            id: OpId::new(NodeId(node), 0, 2),
+            parents: ParentSet::One(import.id),
+            actor: ActorId(1),
+            clock: Clock::UnixMs(2),
+            scope: ScopeRef::Session(SessionId(10)),
+            tags: Tags::AGENT | Tags::COMMAND,
+            kind: OpKind::Command(CommandOp {
+                command_id: Payload::Inline(b"command-1".to_vec()),
+                content: Payload::Inline(b"printf old\nnormalized aggregate".to_vec()),
+                stage: CommandStage::Finish,
+            }),
+        };
+
+        let projection = HistoryProjection::from_ops(vec![import, command]);
+        let rows = projection.nodes();
+        let row = rows.first().expect("command row");
+        assert_eq!(row.summary(), expected);
+        assert_eq!(
+            row.record_role(),
+            editchain_project::taxonomy::RecordRole::Result
+        );
+        assert!(!row.summary().starts_with("$ "));
+        assert!(!row.summary().contains("printf old"));
+    }
+}
+
+#[test]
+fn codex_custom_exec_summary_uses_the_command_not_token_metadata() {
+    let mut call_import = import_op(1, 1);
+    if let OpKind::Import(import) = &mut call_import.kind {
+        import.raw_ref = Payload::Inline(
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "input": "const result = await tools.exec_command({\n  cmd: \"cargo test -p editchain-project\",\n  workdir: \"/workspace\"\n});\ntext(result.output);",
+                },
+            })
+            .to_string()
+            .into_bytes(),
+        );
+    }
+    let call = tool_op(1, 2, call_import.id, "exec");
+    let usage = legacy_token_usage_import_op(1, 3, call_import.id);
+    let (result_import, result) = tool_result_pair(1, 4, 5, call_import.id, None);
+    let result_id = result.id;
+    let projection = HistoryProjection::from_ops_with(
+        vec![
+            call_import.clone(),
+            call,
+            usage.clone(),
+            result_import,
+            result,
+        ],
+        editchain_project::ProjectionOptions {
+            bundle_metadata: true,
+        },
+    );
+    let nodes = projection.nodes();
+
+    assert_eq!(nodes.len(), 1);
+    let node = nodes.first().expect("exec row");
+    assert_eq!(node.summary(), "tool: exec cargo test -p editchain-project");
+    let sub_op_ids = node.sub_ops().iter().map(|op| op.id).collect::<Vec<_>>();
+    assert!(sub_op_ids.contains(&usage.id));
+    assert!(sub_op_ids.contains(&result_id));
+}
+
+#[test]
+fn codex_function_call_summary_uses_structured_arguments() {
+    let mut op = import_op(1, 1);
+    if let OpKind::Import(import) = &mut op.kind {
+        import.raw_ref = Payload::Inline(
+            br#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"git status --short\",\"workdir\":\"/workspace\"}"}}"#
+                .to_vec(),
+        );
+    }
+    let tool = tool_op(1, 2, op.id, "exec_command");
+    let projection = HistoryProjection::from_ops(vec![op, tool]);
+
+    assert_eq!(
+        projection.nodes().first().expect("tool row").summary(),
+        "tool: exec_command git status --short"
+    );
+}
+
+#[test]
+fn claude_tool_summary_uses_tool_use_input() {
+    let mut op = import_op(1, 1);
+    if let OpKind::Import(import) = &mut op.kind {
+        import.raw_ref = Payload::Inline(
+            br#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"src/lib.rs"}}]}}"#
+                .to_vec(),
+        );
+    }
+    let tool = tool_op(1, 2, op.id, "Read");
+    let projection = HistoryProjection::from_ops(vec![op, tool]);
+
+    assert_eq!(
+        projection.nodes().first().expect("tool row").summary(),
+        "tool: Read src/lib.rs"
+    );
+}
+
+#[test]
+fn token_count_summary_compares_latest_context_with_its_limit() {
+    let raw = serde_json::json!({
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "total_token_usage": { "total_tokens": 34_652 },
+                "last_token_usage": { "total_tokens": 17_502 },
+                "model_context_window": 258_400,
+            },
+        },
+    })
+    .to_string()
+    .into_bytes();
+    assert_eq!(
+        editchain_project::import_token_accounting_summary(&raw).as_deref(),
+        Some("17,502 / 258,400")
+    );
+
+    let mut op = import_op(1, 1);
+    if let OpKind::Import(import) = &mut op.kind {
+        import.raw_ref = Payload::Inline(raw);
+    }
+    let projection = HistoryProjection::from_ops(vec![op]);
+    let nodes = projection.nodes();
+    let node = nodes.first().expect("token-count row");
+    assert_eq!(node.summary(), "17,502 / 258,400");
+    assert_eq!(node.kind(), "token_count");
+}
+
+#[test]
+fn legacy_token_usage_summary_uses_the_request_total() {
+    let raw = serde_json::json!({
+        "type": "token_usage_record",
+        "payload": {
+            "usage": { "total_tokens": 140_635 },
+            "turn_token_usage": { "total_tokens": 282_570 },
+            "thread_token_usage": { "total_tokens": 900_001 },
+        },
+    })
+    .to_string();
+    assert_eq!(
+        editchain_project::import_token_accounting_summary(raw.as_bytes()).as_deref(),
+        Some("140,635")
+    );
+}
+
+#[test]
 fn collapse_author_derived_from_children_tags() {
     // A raw import op whose child is a HUMAN message should collapse to a node
     // with author "human" (not "system", which the raw import's IMPORT-only tags
@@ -365,6 +574,109 @@ fn unparented_meta_after_turn_stays_standalone() {
         .nodes()
         .iter()
         .any(|node| node.node_key() == meta.id.to_string()));
+}
+
+#[test]
+fn session_title_bundles_into_its_git_anchored_session_meta_root() {
+    let options = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let mut session_meta = meta_import_op(1, 1);
+    if let OpKind::Import(import) = &mut session_meta.kind {
+        import.raw_ref = Payload::Inline(br#"{"type":"session_meta"}"#.to_vec());
+    }
+    let mut task_started = import_op(1, 2);
+    task_started.parents = ParentSet::One(session_meta.id);
+    let mut session_title = meta_import_op(2, 3);
+    session_title.parents = ParentSet::One(session_meta.id);
+    if let OpKind::Import(import) = &mut session_title.kind {
+        import.raw_ref = Payload::Inline(
+            br#"{"type":"session_title","provider":"codex","title":"r8"}"#.to_vec(),
+        );
+    }
+
+    let commit = git_commit(7, 0);
+    let based_on = Op {
+        id: OpId::new(NodeId(99), 0, 1),
+        parents: ParentSet::One(session_meta.id),
+        actor: ActorId(0),
+        clock: Clock::None,
+        scope: session_meta.scope,
+        tags: Tags::IMPORT | Tags::META,
+        kind: OpKind::GitLink(GitLink {
+            source: session_meta.id,
+            target_repo: commit.repository,
+            target_oid: commit.oid,
+            kind: GitLinkKind::BasedOn,
+        }),
+    };
+    let mut projection = HistoryProjection::from_ops_with(
+        vec![
+            session_meta.clone(),
+            task_started.clone(),
+            session_title.clone(),
+            based_on,
+        ],
+        options,
+    );
+    projection.merge_git_commits(vec![commit.clone()]);
+
+    let nodes = projection.nodes();
+    assert_eq!(nodes.len(), 3, "title metadata must not form a sibling row");
+    assert_eq!(
+        projection.visible_op_id(session_title.id),
+        Some(session_meta.id)
+    );
+    let meta_row = nodes
+        .iter()
+        .find(|node| node.node_key() == session_meta.id.to_string())
+        .expect("session metadata root");
+    assert_eq!(
+        meta_row
+            .sub_ops()
+            .iter()
+            .map(|op| op.id)
+            .collect::<Vec<_>>(),
+        vec![session_title.id]
+    );
+    assert_eq!(
+        projection.lifted_parent_keys(meta_row),
+        vec![commit.oid.to_hex()],
+        "the surviving metadata root keeps the exact Git anchor"
+    );
+    let activity_row = nodes
+        .iter()
+        .find(|node| node.node_key() == task_started.id.to_string())
+        .expect("first session activity");
+    assert_eq!(
+        projection.lifted_parent_keys(activity_row),
+        vec![session_meta.id.to_string()],
+        "the actual session remains the metadata root's sole visible child"
+    );
+    assert_eq!(projection.independent_chains(), 1);
+}
+
+#[test]
+fn metadata_root_does_not_absorb_child_from_another_session() {
+    let options = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let root = meta_import_op(1, 1);
+    let mut other_session = meta_import_op(2, 2);
+    other_session.parents = ParentSet::One(root.id);
+    other_session.scope = ScopeRef::Session(SessionId(11));
+
+    let projection =
+        HistoryProjection::from_ops_with(vec![root.clone(), other_session.clone()], options);
+    let nodes = projection.nodes();
+
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(projection.visible_op_id(root.id), Some(root.id));
+    assert_eq!(
+        projection.visible_op_id(other_session.id),
+        Some(other_session.id),
+        "an exact parent does not erase a distinct session boundary"
+    );
 }
 
 #[test]

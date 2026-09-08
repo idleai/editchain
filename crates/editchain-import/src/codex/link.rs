@@ -33,11 +33,12 @@ use editchain_core::{ActorId, Op, OpId, SessionId};
 use crate::error::ImportError;
 use crate::ids::{derive_external_entity_id, derive_session_id};
 
-/// Cursor checkpoint for Codex normalized metadata. Version four recognizes
-/// exact `collabToolCall.spawnAgent` topology; version three added portable
-/// capture of out-of-band session titles, and version two added exact topology
-/// facts.
-pub const CODEX_NORMALIZATION_VERSION: u32 = 4;
+/// Cursor checkpoint for Codex normalized metadata. Version five retains one
+/// path-specific `FileOp` for every entry in a multi-file change; version four
+/// recognized exact `collabToolCall.spawnAgent` topology, version three added
+/// portable capture of out-of-band session titles, and version two added exact
+/// topology facts.
+pub const CODEX_NORMALIZATION_VERSION: u32 = 5;
 
 /// Resolver identifier retained in every emitted evidence payload.
 pub const CODEX_TOPOLOGY_RESOLVER: &str = "codex-topology-v2";

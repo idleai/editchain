@@ -232,7 +232,12 @@ fn codex_turn_abort_reason_folds_muted_state_onto_visible_anchor() {
     let mut nodes = projection.nodes();
     assert_eq!(nodes.len(), 1);
     let node = nodes.remove(0);
-    assert_eq!(node.summary(), "partial response turn_aborted");
+    assert_eq!(node.summary(), "partial response");
+    assert_eq!(
+        node.sub_ops().len(),
+        1,
+        "the abort remains independently visible under expansion"
+    );
     assert_eq!(node.chain_state(), ChainState::Muted);
 }
 

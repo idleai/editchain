@@ -41,12 +41,18 @@ function writeFakeVscode() {
   fs.writeFileSync(
     fakeVscodePath,
     `'use strict';
+const providers = [];
+const executedCommands = [];
+const warnings = [];
 module.exports = {
   __esModule: true,
   workspace: {
     workspaceFolders: [{ uri: ${uri.toString()}('/ws') }],
     getConfiguration: () => ({ get: (_key, def) => def }),
-    registerTextDocumentContentProvider: () => ({ dispose() {} }),
+    registerTextDocumentContentProvider: (scheme, provider) => {
+      providers.push({ scheme, provider });
+      return { dispose() {} };
+    },
     openTextDocument: async () => ({}),
   },
   window: {
@@ -55,13 +61,23 @@ module.exports = {
     createWebviewPanel: () => { throw new Error('createWebviewPanel must be intercepted by the test harness'); },
     showTextDocument: async () => ({}),
     showErrorMessage: () => undefined,
+    showWarningMessage: async (message) => { warnings.push(message); },
   },
   commands: {
     registerCommand: () => { throw new Error('registerCommand must be intercepted by the test harness'); },
+    executeCommand: async (...args) => { executedCommands.push(args); },
   },
-  Uri: { parse: (s) => ${uri.toString()}(s), joinPath: (...p) => ${uri.toString()}(p.map(String).join('/')) },
+  Uri: {
+    parse: (s) => ${uri.toString()}(s),
+    joinPath: (...p) => ${uri.toString()}(p.map(String).join('/')),
+    from: (parts) => (${uri.toString()})(parts.scheme + '://' + (parts.authority || '') +
+      (parts.path || '') + (parts.query ? '?' + parts.query : '')),
+  },
   ViewColumn: { One: 1 },
   StatusBarAlignment: { Left: 1 },
+  __providers: providers,
+  __executedCommands: executedCommands,
+  __warnings: warnings,
 };
 `
   );
@@ -93,7 +109,8 @@ class FakeStdioClient {
       this.openRequests.push(rec);
     } else {
       this.requests.push(rec);
-      rec.resolve({ Ok: {} });
+      rec.resolve(this.nextResponse || { Ok: {} });
+      this.nextResponse = null;
     }
     return rec.promise;
   }
@@ -180,6 +197,7 @@ function loadExtension() {
     panels,
     client,
     statusItem,
+    vscode: fakeVscode,
   };
 }
 
@@ -348,4 +366,153 @@ test('history panel retains its bounded renderer context across raw JSON navigat
   panel.handlers.viewState({ webviewPanel: { active: true } });
   assert.equal(panel.webview.messages.length, 2, 'Back must display retained rows without replaying Open');
   assert.equal(env.client.openRequests.length, 1, 'Back must not rebuild the workspace');
+});
+
+test('openDiff resolves service content into VS Code native virtual documents', async () => {
+  const env = loadExtension();
+  env.open();
+  const panel = env.panels[0];
+  const change = {
+    source: 'git',
+    path: 'src/lib.rs',
+    status: 'modified',
+    repository: '42',
+    repository_path: 'src/lib.rs',
+    commit_oid: '0123456789012345678901234567890123456789',
+    old_oid: '1111111111111111111111111111111111111111',
+    new_oid: '2222222222222222222222222222222222222222',
+    old_mode: 'blob',
+    new_mode: 'blob',
+    binary: false,
+    partial: false,
+  };
+  env.client.nextResponse = {
+    Ok: {
+      path: 'src/lib.rs',
+      status: 'modified',
+      binary: false,
+      partial: false,
+      before: 'fn old() {}\n',
+      after: 'fn new() {}\n',
+    },
+  };
+
+  await panel.handlers.message({ type: 'openDiff', change });
+  await flush();
+  assert.deepEqual(env.client.requests[0].body, { GetFileDiff: { change } });
+  assert.equal(env.client.requests[0].opts.timeoutMs, 120_000);
+
+  const command = env.vscode.__executedCommands[0];
+  assert.equal(command[0], 'vscode.diff');
+  assert.match(command[1].toString(), /^editchain-diff:\/\/1-before\/src\/lib\.rs$/);
+  assert.match(command[2].toString(), /^editchain-diff:\/\/1-after\/src\/lib\.rs$/);
+  assert.equal(command[3], 'src/lib.rs (Git)');
+  assert.deepEqual(command[4], { preview: true });
+
+  const registration = env.vscode.__providers.find((entry) => entry.scheme === 'editchain-diff');
+  assert.ok(registration, 'the read-only diff content provider is registered');
+  assert.equal(registration.provider.provideTextDocumentContent(command[1]), 'fn old() {}\n');
+  assert.equal(registration.provider.provideTextDocumentContent(command[2]), 'fn new() {}\n');
+});
+
+test('openDiff keeps one structured hunk flat in the ordinary diff editor', async () => {
+  const env = loadExtension();
+  env.open();
+  const panel = env.panels[0];
+  const change = {
+    source: 'agent',
+    path: 'src/lib.rs',
+    status: 'modified',
+    binary: false,
+    partial: true,
+  };
+  env.client.nextResponse = {
+    Ok: {
+      path: 'src/lib.rs',
+      status: 'modified',
+      binary: false,
+      partial: true,
+      before: 'legacy before must not win',
+      after: 'legacy after must not win',
+      hunks: [
+        {
+          header: '@@ -10 +12 @@ fn only()',
+          before: 'let old = 1;',
+          after: 'let new = 1;',
+        },
+      ],
+    },
+  };
+
+  await panel.handlers.message({ type: 'openDiff', change });
+  await flush();
+
+  const command = env.vscode.__executedCommands[0];
+  assert.equal(command[0], 'vscode.diff');
+  assert.equal(command[3], 'src/lib.rs (agent, recorded evidence, @@ -10 +12 @@ fn only())');
+  const registration = env.vscode.__providers.find((entry) => entry.scheme === 'editchain-diff');
+  assert.equal(registration.provider.provideTextDocumentContent(command[1]), 'let old = 1;');
+  assert.equal(registration.provider.provideTextDocumentContent(command[2]), 'let new = 1;');
+});
+
+test('openDiff presents recorded hunks as independent VS Code changes entries', async () => {
+  const env = loadExtension();
+  env.open();
+  const panel = env.panels[0];
+  const change = {
+    source: 'agent',
+    path: 'src/lib.rs',
+    status: 'modified',
+    op_id: '0000000000000001:0:1',
+    binary: false,
+    partial: true,
+  };
+  env.client.nextResponse = {
+    Ok: {
+      path: 'src/lib.rs',
+      status: 'modified',
+      binary: false,
+      partial: true,
+      before: '',
+      after: '',
+      hunks: [
+        {
+          header: '@@ -10,2 +10,3 @@ fn first()',
+          before: 'let old = 1;',
+          after: 'let new = 1;\nlet added = 2;',
+        },
+        {
+          header: '@@ -80 +81 @@ fn second()',
+          before: 'return old;',
+          after: 'return new;',
+        },
+      ],
+      note: 'Only recorded hunks are available.',
+    },
+  };
+
+  await panel.handlers.message({ type: 'openDiff', change });
+  await flush();
+
+  const command = env.vscode.__executedCommands[0];
+  assert.equal(command[0], 'vscode.changes');
+  assert.equal(command[1], 'src/lib.rs (agent, 2 recorded hunks; gaps unavailable)');
+  assert.equal(command[2].length, 2);
+
+  const [firstLabel, firstBefore, firstAfter] = command[2][0];
+  assert.equal(firstLabel, firstAfter, 'the modified hunk URI is the visible label resource');
+  assert.match(firstBefore.toString(), /^editchain-hunk:\/\/1-hunk-1-before\/src\/lib\.rs\?/);
+  assert.match(firstAfter.toString(), /^editchain-hunk:\/\/1-hunk-1-after\/src\/lib\.rs\?/);
+  assert.match(firstAfter.toString(), /recorded hunk 1 of 2 · @@ -10,2 \+10,3 @@ fn first\(\)/);
+
+  const registration = env.vscode.__providers.find((entry) => entry.scheme === 'editchain-hunk');
+  assert.ok(registration, 'the read-only diff content provider is registered');
+  assert.equal(registration.provider.provideTextDocumentContent(firstBefore), 'let old = 1;');
+  assert.equal(
+    registration.provider.provideTextDocumentContent(firstAfter),
+    'let new = 1;\nlet added = 2;'
+  );
+  const [, secondBefore, secondAfter] = command[2][1];
+  assert.equal(registration.provider.provideTextDocumentContent(secondBefore), 'return old;');
+  assert.equal(registration.provider.provideTextDocumentContent(secondAfter), 'return new;');
 });

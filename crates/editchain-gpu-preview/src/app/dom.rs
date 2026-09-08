@@ -1057,7 +1057,7 @@ mod web {
         f64_round_to_i64, i64_to_f64, ColKey, FrameRow, GraphCellSpec, GraphData, RowSpec, SvgItem,
         ROW_H, SVG_NS,
     };
-    use crate::app::rows::{Disclosure, RowSummary};
+    use crate::app::rows::{ActivityIcon, ContentHeading, Disclosure, RowSummary};
     use crate::app::state::{FindCounterState, HistoryAppState, Viewport};
 
     /// Build a `JsValue` error string.
@@ -2066,6 +2066,11 @@ mod web {
             &spec.identity.hierarchy_depth.to_string(),
         )?;
         row.set_attribute("data-classification", &spec.classification.label)?;
+        if let Some(file) = &spec.content.file {
+            row.set_attribute("data-file-path", &file.path)?;
+            row.set_attribute("data-file-status", file.status.class())?;
+            row.set_attribute("data-file-source", &file.source)?;
+        }
         if let Some(header) = &spec.work_unit_header {
             row.set_attribute("data-work-unit-id", &header.id)?;
         }
@@ -2157,6 +2162,51 @@ mod web {
         drop(row.append_child(&commit_cell).map_err(js_err_from)?);
 
         Ok(row)
+    }
+
+    /// Build one self-contained semantic icon for structured Content. Inline
+    /// SVG avoids relying on a workbench-global Codicon font in the sandboxed
+    /// extension webview.
+    fn build_content_icon(
+        document: &web_sys::Document,
+        icon: ActivityIcon,
+    ) -> Result<web_sys::HtmlElement, JsValue> {
+        let label = make_element(document, "span", "content-icon", None)?;
+        label.set_attribute("data-content-icon", icon.name())?;
+        label.set_attribute("aria-hidden", "true")?;
+        let svg = document.create_element_ns(Some(SVG_NS), "svg")?;
+        svg.set_attribute("class", "content-icon-svg")?;
+        svg.set_attribute("viewBox", icon.view_box())?;
+        svg.set_attribute("focusable", "false")?;
+        for icon_path in icon.paths() {
+            let path = document.create_element_ns(Some(SVG_NS), "path")?;
+            path.set_attribute("d", icon_path.d)?;
+            if icon_path.even_odd {
+                path.set_attribute("fill-rule", "evenodd")?;
+                path.set_attribute("clip-rule", "evenodd")?;
+            }
+            drop(svg.append_child(&path).map_err(js_err_from)?);
+        }
+        drop(label.append_child(&svg).map_err(js_err_from)?);
+        Ok(label)
+    }
+
+    fn append_content_heading(
+        document: &web_sys::Document,
+        parent: &web_sys::Node,
+        heading: &ContentHeading,
+    ) -> Result<(), JsValue> {
+        let icon = build_content_icon(document, heading.icon)?;
+        drop(parent.append_child(&node_of(&icon)?).map_err(js_err_from)?);
+        if !heading.title.is_empty() {
+            let title = make_element(document, "span", "content-title", Some(&heading.title))?;
+            drop(
+                parent
+                    .append_child(&node_of(&title)?)
+                    .map_err(js_err_from)?,
+            );
+        }
+        Ok(())
     }
 
     /// Create the per-row SVG graph fragment from the pure item list (the
@@ -2326,17 +2376,41 @@ mod web {
         spec: &RowSpec,
     ) -> Result<(), JsValue> {
         let parent_node = node_of(parent)?;
-        if let Some(subop) = &spec.content.subop {
-            let icon = make_element(
-                document,
-                "span",
-                &format!("subop-icon codicon codicon-{}", subop.icon),
-                None,
-            )?;
+        if let Some(file) = &spec.content.file {
+            let icon = make_element(document, "span", "file-icon", None)?;
             icon.set_attribute("aria-hidden", "true")?;
-            let icon_node = node_of(&icon)?;
-            drop(parent_node.append_child(&icon_node).map_err(js_err_from)?);
-            let text = make_element(document, "span", "subop-summary", Some(&spec.plain_summary))?;
+            drop(
+                parent_node
+                    .append_child(&node_of(&icon)?)
+                    .map_err(js_err_from)?,
+            );
+            let name = make_element(document, "span", "file-name", Some(&file.name))?;
+            drop(
+                parent_node
+                    .append_child(&node_of(&name)?)
+                    .map_err(js_err_from)?,
+            );
+            if !file.directory.is_empty() {
+                let directory =
+                    make_element(document, "span", "file-directory", Some(&file.directory))?;
+                drop(
+                    parent_node
+                        .append_child(&node_of(&directory)?)
+                        .map_err(js_err_from)?,
+                );
+            }
+            return Ok(());
+        }
+        if let Some(subop) = &spec.content.subop {
+            if let Some(heading) = &subop.heading {
+                append_content_heading(document, &parent_node, heading)?;
+            }
+            let subtitle_class = if subop.heading.is_some() {
+                "content-subtitle subop-summary"
+            } else {
+                "subop-summary"
+            };
+            let text = make_element(document, "span", subtitle_class, Some(&spec.plain_summary))?;
             let text_node = node_of(&text)?;
             drop(parent_node.append_child(&text_node).map_err(js_err_from)?);
             return Ok(());
@@ -2348,9 +2422,30 @@ mod web {
             .ok_or_else(|| js_error("top-level row has no content"))?;
         let wu_start = spec.content_flags.work_unit_block;
 
-        // Work-unit starts render their compact unit header in a separate
-        // ribbon line ABOVE the row's own content line, exactly like
-        // production's buildRowHtml; title-only units omit the row line.
+        // A distinct work-unit heading sits above the row's structured
+        // content. When both strings are identical, the normal Content line
+        // carries the information once and the redundant ribbon is omitted.
+        if wu_start && !spec.content_flags.work_unit_title_only {
+            let header = spec
+                .work_unit_header
+                .as_ref()
+                .ok_or_else(|| js_error("work-unit start has no header"))?;
+            let ribbon_line = make_element(document, "span", "work-unit-ribbon-line", None)?;
+            let ribbon_node = node_of(&ribbon_line)?;
+            let title_span =
+                make_element(document, "span", "work-unit-ribbon", Some(&header.title))?;
+            title_span.set_attribute("title", &header.title)?;
+            drop(
+                ribbon_node
+                    .append_child(&node_of(&title_span)?)
+                    .map_err(js_err_from)?,
+            );
+            drop(
+                parent_node
+                    .append_child(&ribbon_node)
+                    .map_err(js_err_from)?,
+            );
+        }
         let content_target: Option<web_sys::HtmlElement> =
             if wu_start && !spec.content_flags.work_unit_title_only {
                 let line = make_element(document, "span", "work-unit-row-line", None)?;
@@ -2365,26 +2460,11 @@ mod web {
             parent_node.clone()
         };
 
-        if let Some(summary) = &top.summary {
-            append_row_summary(document, &content_node, summary)?;
+        if let Some(heading) = &top.heading {
+            append_content_heading(document, &content_node, heading)?;
         }
-        if wu_start {
-            let header = spec
-                .work_unit_header
-                .as_ref()
-                .ok_or_else(|| js_error("work-unit start has no header"))?;
-            let ribbon_line = make_element(document, "span", "work-unit-ribbon-line", None)?;
-            let ribbon_node = node_of(&ribbon_line)?;
-            drop(
-                parent_node
-                    .append_child(&ribbon_node)
-                    .map_err(js_err_from)?,
-            );
-            let title_span =
-                make_element(document, "span", "work-unit-ribbon", Some(&header.title))?;
-            title_span.set_attribute("title", &header.title)?;
-            let title_node = node_of(&title_span)?;
-            drop(ribbon_node.append_child(&title_node).map_err(js_err_from)?);
+        if let Some(summary) = &top.summary {
+            append_row_summary(document, &content_node, summary, top.heading.is_some())?;
         }
         Ok(())
     }
@@ -2394,11 +2474,15 @@ mod web {
         document: &web_sys::Document,
         parent: &web_sys::Node,
         summary: &RowSummary,
+        subtitle: bool,
     ) -> Result<(), JsValue> {
         if let Some(plain_content) = &summary.plain_content {
             let mut class = String::from("summary-text");
             if summary.git_prefix.is_some() {
                 class.push_str(" git-summary-text");
+            }
+            if subtitle {
+                class.push_str(" content-subtitle");
             }
             let text = make_element(document, "span", &class, Some(plain_content))?;
             let text_node = node_of(&text)?;

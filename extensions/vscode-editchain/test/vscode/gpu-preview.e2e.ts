@@ -58,6 +58,7 @@ describe('EditChain Rust history renderer (per-row SVG)', () => {
     // panel titled "EditChain History" with the per-row SVG renderer inside it.
     await browser.executeWorkbench(async (vscode) => {
       await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
+      await vscode.commands.executeCommand('workbench.action.closeSidebar');
       await vscode.commands.executeCommand('notifications.clearAll');
       await vscode.commands.executeCommand('notifications.hideToasts');
       await vscode.commands.executeCommand('editchain-history.open');
@@ -121,6 +122,47 @@ describe('EditChain Rust history renderer (per-row SVG)', () => {
       const graphCanvases = document.querySelectorAll('#gpu-canvas-host canvas');
       const hydratedRows = Array.from(document.querySelectorAll(
         '#rows .row[data-row][data-key]:not(.row-placeholder)'));
+      const structuredRows = hydratedRows.filter((row) =>
+        !row.classList.contains('row-file'));
+      const omitsObviousTitle = (row: Element): boolean => {
+        const wire = window.__editchainRowAt?.(Number(row.getAttribute('data-row')));
+        const kind = String(wire?.kind ?? '');
+        const role = String(wire?.record_role ?? '');
+        return kind === 'git' || !!wire?.git_oid || kind === 'message' ||
+          kind === 'work-group' ||
+          (!kind && role === 'narrative');
+      };
+      const contentStructureIssues = structuredRows.filter((row) => {
+        const icon = row.querySelector<HTMLElement>('.text-cell .content-icon');
+        const svg = icon?.querySelector<SVGElement>('svg.content-icon-svg');
+        const title = row.querySelector<HTMLElement>('.text-cell .content-title');
+        const subtitle = row.querySelector<HTMLElement>('.text-cell .content-subtitle');
+        return !icon?.dataset.contentIcon || icon.getAttribute('aria-hidden') !== 'true' ||
+          !svg || svg.querySelectorAll('path').length === 0 ||
+          svg.getBoundingClientRect().width <= 0 || svg.getBoundingClientRect().height <= 0 ||
+          (omitsObviousTitle(row) ? !!title : !(title?.textContent ?? '').trim()) ||
+          !(subtitle?.textContent ?? '').trim();
+      }).map((row) => Number(row.getAttribute('data-row'))).slice(0, 5);
+      const obviousTitleRows = structuredRows.filter(omitsObviousTitle);
+      const obviousTitleIssues = obviousTitleRows.filter((row) =>
+        !!row.querySelector('.text-cell .content-title')
+      ).map((row) => Number(row.getAttribute('data-row'))).slice(0, 5);
+      const activityPresentationIssues = hydratedRows.filter((row) => {
+        const activity = row.querySelector<HTMLElement>('.activity-cell');
+        const label = activity?.querySelector<HTMLElement>('.activity-label');
+        return !(label?.textContent ?? '').trim() ||
+          !!activity?.querySelector('svg, .content-icon');
+      }).map((row) => Number(row.getAttribute('data-row'))).slice(0, 5);
+      const workGroupRows = hydratedRows.filter((row) =>
+        row.getAttribute('data-activity-bundle') === 'work-group');
+      const workGroupIssues = workGroupRows.filter((row) =>
+        row.getAttribute('data-activity-bundle') === 'work-group' &&
+        (!row.querySelector(
+          '.text-cell .content-icon[data-content-icon="layers"] svg.content-icon-svg path') ||
+         !!row.querySelector('.text-cell .content-title') ||
+         !(row.querySelector<HTMLElement>('.text-cell .content-subtitle')?.textContent ?? '')
+           .trim())
+      ).map((row) => Number(row.getAttribute('data-row'))).slice(0, 5);
       let fragmentCount = 0;
       const fragmentIssues: Array<{
         row: number; count: number; ariaHidden: string | null;
@@ -183,6 +225,13 @@ describe('EditChain Rust history renderer (per-row SVG)', () => {
         fragmentCount,
         fragmentMissing: hydratedRows.length - fragmentCount,
         fragmentIssues,
+        structuredRows: structuredRows.length,
+        contentStructureIssues,
+        obviousTitleRows: obviousTitleRows.length,
+        obviousTitleIssues,
+        activityPresentationIssues,
+        workGroupRows: workGroupRows.length,
+        workGroupIssues,
         maxAlignDelta: Math.round(maxAlignDelta * 100) / 100,
         alignExamples,
         renderCount: metrics?.renderCount ?? 0,
@@ -206,6 +255,13 @@ describe('EditChain Rust history renderer (per-row SVG)', () => {
     expect(debug.canvasHeight).toBe(0);
     expect(debug.fragmentCount).toBe(debug.domRows);
     expect(debug.fragmentMissing).toBe(0);
+    expect(debug.structuredRows).toBeGreaterThan(0);
+    expect(debug.contentStructureIssues).toEqual([]);
+    expect(debug.obviousTitleRows).toBeGreaterThan(0);
+    expect(debug.obviousTitleIssues).toEqual([]);
+    expect(debug.activityPresentationIssues).toEqual([]);
+    expect(debug.workGroupRows).toBeGreaterThan(0);
+    expect(debug.workGroupIssues).toEqual([]);
     expect(debug.maxAlignDelta).toBeLessThanOrEqual(1);
     expect(debug.renderCount).toBeGreaterThan(0);
     expect(debug.vertexCount).toBe(0);
@@ -233,6 +289,259 @@ describe('EditChain Rust history renderer (per-row SVG)', () => {
     expect(profileDefaults.profileSetter).toBe('undefined');
     const activityTotal = await browser.execute(() => window.__editchainGetTotal());
     expect(activityTotal).toBeGreaterThan(0);
+
+    // --- Real edit-node captures ---------------------------------------------
+    // Exercise the production disclosure path against this workspace's actual
+    // .editchain snapshot. Prefer a compact Git commit so every changed file
+    // fits in one frame, then reveal a recorded agent import and its nested
+    // file child. These are real service rows, not fixture data.
+    fs.mkdirSync(TRACE_DIR, { recursive: true });
+    const gitParent = await browser.execute(() => {
+      const candidates = Array.from(document.querySelectorAll<HTMLElement>(
+        '#rows .row.row-expandable[data-classification="git"]:not(.row-placeholder)'
+      ));
+      const compact = candidates.find((element) => {
+        const abs = Number(element.dataset.row);
+        const wire = window.__editchainRowAt?.(abs);
+        const count = Array.isArray(wire?.sub_ops) ? wire.sub_ops.length : 0;
+        return count >= 2 && count <= 8;
+      });
+      const element = compact ?? candidates[0];
+      if (!element) throw new Error('no real Git row with file edits is rendered');
+      const abs = Number(element.dataset.row);
+      const wire = window.__editchainRowAt(abs);
+      element.querySelector<HTMLElement>('.subop-chevron')?.click();
+      return {
+        abs,
+        summary: String(wire?.summary ?? ''),
+        expectedFiles: Array.isArray(wire?.sub_ops) ? wire.sub_ops.length : 0,
+      };
+    });
+    await browser.waitUntil(async () => browser.execute((abs: number) => {
+      const parent = document.querySelector<HTMLElement>(
+        '.row[data-row="' + abs + '"]'
+      );
+      const files = Array.from(document.querySelectorAll<HTMLElement>(
+        '#rows .row-file[data-file-source="git"]'
+      ));
+      return parent?.getAttribute('aria-expanded') === 'true' && files.length > 0;
+    }, gitParent.abs), {
+      timeout: ROW_TIMEOUT_MS,
+      interval: 100,
+      timeoutMsg: 'real Git edit rows did not expand',
+    });
+    await browser.execute((abs: number) => {
+      document.querySelector<HTMLElement>('.row[data-row="' + abs + '"]')
+        ?.scrollIntoView({ block: 'center' });
+    }, gitParent.abs);
+    await browser.execute((timeout) => window.__editchainGpuDebug.whenIdle(timeout), IDLE_TIMEOUT_MS);
+    const gitEdits = await browser.execute(() =>
+      Array.from(document.querySelectorAll<HTMLElement>(
+        '#rows .row-file[data-file-source="git"]'
+      )).map((row) => ({
+        row: Number(row.dataset.row),
+        path: row.dataset.filePath ?? '',
+        status: row.dataset.fileStatus ?? '',
+        activity: (row.querySelector('.activity-label')?.textContent ?? '').trim(),
+        statusTag: (row.querySelector('.file-status')?.textContent ?? '').trim(),
+        statusColumn: row.querySelector('.file-status')?.parentElement?.className ?? '',
+        contentColumn: row.querySelector('.file-name')?.closest('.text-cell')?.className ?? '',
+        label: (row.querySelector('.summary')?.textContent ?? '').trim(),
+      })));
+    expect(gitEdits.length).toBe(gitParent.expectedFiles);
+    expect(gitEdits.every((edit) => edit.activity === 'change')).toBe(true);
+    expect(gitEdits.every((edit) => edit.statusTag.length > 0 &&
+      edit.statusColumn === 'tags-cell')).toBe(true);
+    expect(gitEdits.every((edit) => edit.contentColumn === 'text-cell')).toBe(true);
+    const gitWorkbenchShot = path.join(TRACE_DIR, 'e2e-edit-nodes-git-workbench.png');
+    const gitWebviewShot = path.join(TRACE_DIR, 'e2e-edit-nodes-git-webview.png');
+    await historyWebview.close();
+    await browser.executeWorkbench(async (vscode) => {
+      await vscode.commands.executeCommand('workbench.action.closeSidebar');
+      await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
+      await vscode.commands.executeCommand('notifications.clearAll');
+      await vscode.commands.executeCommand('notifications.hideToasts');
+    });
+    await historyWebview.open();
+    await browser.waitUntil(async () => browser.execute((abs: number) =>
+      document.querySelector('.row[data-row="' + abs + '"]')
+        ?.getAttribute('aria-expanded') === 'true' &&
+      document.querySelectorAll('.row-file[data-file-source="git"]').length > 0,
+    gitParent.abs), { timeout: ROW_TIMEOUT_MS, interval: 100 });
+    await browser.execute((timeout) => window.__editchainGpuDebug.whenIdle(timeout), IDLE_TIMEOUT_MS);
+    await browser.saveScreenshot(gitWorkbenchShot);
+    await browser.$('body').saveScreenshot(gitWebviewShot);
+    console.log('[gpu-e2e] real Git edits ->', JSON.stringify({ gitParent, gitEdits }));
+    console.log('[gpu-e2e] Git edit screenshots ->', gitWorkbenchShot, gitWebviewShot);
+
+    // Restore the collapsed Git state before locating an agent work group.
+    await browser.execute((abs: number) => {
+      document.querySelector<HTMLElement>(
+        '.row[data-row="' + abs + '"] .subop-chevron'
+      )?.click();
+      document.getElementById('rows')!.scrollTop = 0;
+    }, gitParent.abs);
+    await browser.waitUntil(async () => browser.execute(() =>
+      document.querySelectorAll('.row-file[data-file-source="git"]').length === 0), {
+      timeout: ROW_TIMEOUT_MS,
+      interval: 100,
+      timeoutMsg: 'real Git edit rows did not collapse',
+    });
+
+    // The current chain has agent file events inside work groups. Locate the
+    // first rendered group whose wire descriptors mention an imported file,
+    // without depending on an operation id or absolute row number.
+    const agentGroup = await browser.execute(() => {
+      const groups = Array.from(document.querySelectorAll<HTMLElement>(
+        '#rows .row.row-expandable:not(.row-subop):not([data-classification="git"])'
+      ));
+      const group = groups.find((element) => {
+        const wire = window.__editchainRowAt?.(Number(element.dataset.row));
+        return Array.isArray(wire?.sub_ops) && wire.sub_ops.some((sub: any) =>
+          sub?.kind === 'import' && String(sub?.summary ?? '').startsWith('file:'));
+      });
+      if (!group) throw new Error('no rendered agent work group contains recorded file edits');
+      const abs = Number(group.dataset.row);
+      const wire = window.__editchainRowAt(abs);
+      group.scrollIntoView({ block: 'start' });
+      group.querySelector<HTMLElement>('.subop-chevron')?.click();
+      return { abs, summary: String(wire?.summary ?? '') };
+    });
+    await browser.waitUntil(async () => browser.execute((abs: number) =>
+      document.querySelector('.row[data-row="' + abs + '"]')
+        ?.getAttribute('aria-expanded') === 'true' &&
+      document.querySelectorAll('.row-subop[data-hierarchy-depth="1"]').length > 0,
+    agentGroup.abs), {
+      timeout: ROW_TIMEOUT_MS,
+      interval: 100,
+      timeoutMsg: 'real agent work group did not expand',
+    });
+
+    // Move a few revealed members down so the first nested import row enters
+    // the virtual frame, then open that import to expose its file edit child.
+    await browser.execute(() => {
+      const rows = document.getElementById('rows')!;
+      rows.scrollTop += 300;
+    });
+    const agentImportAbs = await browser.waitUntil(async () => browser.execute(() => {
+      const imports = Array.from(document.querySelectorAll<HTMLElement>(
+        '#rows .row.row-expandable.row-subop[data-hierarchy-depth="1"]'
+      ));
+      const row = imports.find((element) => {
+        const wire = window.__editchainRowAt?.(Number(element.dataset.row));
+        return wire?.kind === 'import' && String(wire?.summary ?? '').startsWith('file:');
+      });
+      return row ? Number(row.dataset.row) : null;
+    }), {
+      timeout: ROW_TIMEOUT_MS,
+      interval: 100,
+      timeoutMsg: 'no recorded agent import row entered the real viewport',
+    });
+    await browser.execute((abs: number) => {
+      const row = document.querySelector<HTMLElement>('.row[data-row="' + abs + '"]');
+      row?.querySelector<HTMLElement>('.subop-chevron')?.click();
+    }, agentImportAbs);
+    await browser.waitUntil(async () => browser.execute((abs: number) => {
+      const parent = document.querySelector('.row[data-row="' + abs + '"]');
+      return parent?.getAttribute('aria-expanded') === 'true' &&
+        document.querySelectorAll('.row-file[data-file-source="agent"]').length > 0;
+    }, agentImportAbs), {
+      timeout: ROW_TIMEOUT_MS,
+      interval: 100,
+      timeoutMsg: 'real agent file edit did not expand',
+    });
+    await browser.execute((abs: number) => {
+      document.querySelector<HTMLElement>('.row[data-row="' + abs + '"]')
+        ?.scrollIntoView({ block: 'center' });
+    }, agentImportAbs);
+    await browser.execute((timeout) => window.__editchainGpuDebug.whenIdle(timeout), IDLE_TIMEOUT_MS);
+    const agentEdits = await browser.execute(() =>
+      Array.from(document.querySelectorAll<HTMLElement>(
+        '#rows .row-file[data-file-source="agent"]'
+      )).map((row) => ({
+        row: Number(row.dataset.row),
+        path: row.dataset.filePath ?? '',
+        status: row.dataset.fileStatus ?? '',
+        activity: (row.querySelector('.activity-label')?.textContent ?? '').trim(),
+        statusTag: (row.querySelector('.file-status')?.textContent ?? '').trim(),
+        statusColumn: row.querySelector('.file-status')?.parentElement?.className ?? '',
+        fidelityColumn: row.querySelector('.file-fidelity')?.parentElement?.className ?? '',
+        contentColumn: row.querySelector('.file-name')?.closest('.text-cell')?.className ?? '',
+        fidelity: (row.querySelector('.file-fidelity')?.textContent ?? '').trim(),
+        label: (row.querySelector('.summary')?.textContent ?? '').trim(),
+      })));
+    expect(agentEdits.length).toBeGreaterThan(0);
+    expect(agentEdits.every((edit) => edit.activity === 'change')).toBe(true);
+    expect(agentEdits.every((edit) => edit.statusTag.length > 0 &&
+      edit.statusColumn === 'tags-cell')).toBe(true);
+    expect(agentEdits.every((edit) => edit.fidelityColumn === 'tags-cell')).toBe(true);
+    expect(agentEdits.every((edit) => edit.contentColumn === 'text-cell')).toBe(true);
+    const agentWorkbenchShot = path.join(TRACE_DIR, 'e2e-edit-nodes-agent-workbench.png');
+    const agentWebviewShot = path.join(TRACE_DIR, 'e2e-edit-nodes-agent-webview.png');
+    await historyWebview.close();
+    await browser.executeWorkbench(async (vscode) => {
+      await vscode.commands.executeCommand('workbench.action.closeSidebar');
+      await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
+      await vscode.commands.executeCommand('notifications.clearAll');
+      await vscode.commands.executeCommand('notifications.hideToasts');
+    });
+    await historyWebview.open();
+    await browser.waitUntil(async () => browser.execute((abs: number) =>
+      document.querySelector('.row[data-row="' + abs + '"]')
+        ?.getAttribute('aria-expanded') === 'true' &&
+      document.querySelectorAll('.row-file[data-file-source="agent"]').length > 0,
+    agentImportAbs), { timeout: ROW_TIMEOUT_MS, interval: 100 });
+    await browser.execute((timeout) => window.__editchainGpuDebug.whenIdle(timeout), IDLE_TIMEOUT_MS);
+    await browser.saveScreenshot(agentWorkbenchShot);
+    await browser.$('body').saveScreenshot(agentWebviewShot);
+    console.log('[gpu-e2e] real agent edits ->', JSON.stringify({
+      agentGroup, agentImportAbs, agentEdits,
+    }));
+    console.log('[gpu-e2e] agent edit screenshots ->', agentWorkbenchShot, agentWebviewShot);
+
+    fs.writeFileSync(path.join(TRACE_DIR, 'e2e-edit-nodes-real.json'), JSON.stringify({
+      total: activityTotal,
+      git: { parent: gitParent, edits: gitEdits },
+      agent: { group: agentGroup, importRow: agentImportAbs, edits: agentEdits },
+    }, null, 2));
+
+    // Collapse both agent disclosures and restore the default top viewport so
+    // the remaining production-control assertions start from a clean state.
+    await browser.execute((importAbs: number) => {
+      document.querySelector<HTMLElement>(
+        '.row[data-row="' + importAbs + '"] .subop-chevron'
+      )?.click();
+    }, agentImportAbs);
+    await browser.waitUntil(async () => browser.execute(() =>
+      document.querySelectorAll('.row-file[data-file-source="agent"]').length === 0), {
+      timeout: ROW_TIMEOUT_MS,
+      interval: 100,
+      timeoutMsg: 'real agent file edit did not collapse',
+    });
+    await browser.execute((groupAbs: number) => {
+      const rows = document.getElementById('rows')!;
+      rows.scrollTop = Math.max(0, rows.scrollTop - 500);
+      document.querySelector<HTMLElement>('.row[data-row="' + groupAbs + '"]')
+        ?.scrollIntoView({ block: 'start' });
+    }, agentGroup.abs);
+    await browser.waitUntil(async () => browser.execute((groupAbs: number) =>
+      !!document.querySelector('.row[data-row="' + groupAbs + '"]'), agentGroup.abs), {
+      timeout: ROW_TIMEOUT_MS,
+      interval: 100,
+      timeoutMsg: 'real agent group did not return to the viewport',
+    });
+    await browser.execute((groupAbs: number) => {
+      document.querySelector<HTMLElement>(
+        '.row[data-row="' + groupAbs + '"] .subop-chevron'
+      )?.click();
+      document.getElementById('rows')!.scrollTop = 0;
+    }, agentGroup.abs);
+    await browser.waitUntil(async () => browser.execute(() =>
+      document.querySelectorAll('.row-subop').length === 0), {
+      timeout: ROW_TIMEOUT_MS,
+      interval: 100,
+      timeoutMsg: 'real agent edit rows did not collapse',
+    });
 
     // Find-in-chain through the real keyboard path: type the query and press
     // Enter. The Rust shell forwards the read-only FindInHistory request.
@@ -278,18 +587,25 @@ describe('EditChain Rust history renderer (per-row SVG)', () => {
 
     // Scrolling: page the production virtual window (fetch + render on scroll)
     // and return to the top.
-    await browser.execute(() => {
+    const scrollOrigin = await browser.execute(() => {
       const rows = document.getElementById('rows');
+      const first = document.querySelector<HTMLElement>(
+        '#rows .row[data-row]:not(.row-placeholder)'
+      );
       rows.scrollTop = 2500;
+      return first ? Number(first.dataset.row) : null;
     });
-    await browser.waitUntil(async () => browser.execute(() => {
+    await browser.waitUntil(async () => browser.execute((origin: number | null) => {
       const rows = document.getElementById('rows');
-      const target = document.querySelector('.row[data-row="70"]');
+      const rendered = Array.from(document.querySelectorAll<HTMLElement>(
+        '#rows .row[data-row]:not(.row-placeholder)'
+      ));
+      const first = rendered[0];
       return rows.scrollTop > 2000 &&
-        !!target && !target.classList.contains('row-placeholder') &&
+        !!first && Number(first.dataset.row) !== origin &&
         typeof window.__editchainRowAt === 'function' &&
-        window.__editchainRowAt(70) != null;
-    }), { timeout: ROW_TIMEOUT_MS, timeoutMsg: 'history panel did not page on scroll' });
+        rendered.every((row) => window.__editchainRowAt(Number(row.dataset.row)) != null);
+    }, scrollOrigin), { timeout: ROW_TIMEOUT_MS, timeoutMsg: 'history panel did not page on scroll' });
     await browser.execute(() => {
       document.getElementById('rows').scrollTop = 0;
     });
@@ -299,10 +615,22 @@ describe('EditChain Rust history renderer (per-row SVG)', () => {
     }), { timeout: ROW_TIMEOUT_MS, timeoutMsg: 'history panel did not return to the top' });
 
     // Inline selection + keyboard roving (safe: no raw-JSON activation).
-    await browser.execute(() => {
-      const row = document.querySelector('.row[data-row="1"]');
-      if (!row) throw new Error('no .row[data-row="1"] to select');
+    const selectionTarget = await browser.execute(() => {
+      const rows = Array.from(document.querySelectorAll<HTMLElement>(
+        '#rows .row:not(.row-placeholder):not(.row-expandable):not(.row-subop):not(.row-file)'
+      ));
+      const row = rows[0];
+      if (!row) throw new Error('no plain rendered row to select');
       row.click();
+      const all = Array.from(document.querySelectorAll<HTMLElement>(
+        '#rows .row:not(.row-placeholder)'
+      ));
+      const index = all.indexOf(row);
+      const next = all[index + 1];
+      return {
+        abs: Number(row.dataset.row),
+        nextAbs: next ? Number(next.dataset.row) : null,
+      };
     });
     const selection = await browser.execute(() => {
       const sel = document.querySelector('.row.row-selected');
@@ -313,20 +641,21 @@ describe('EditChain Rust history renderer (per-row SVG)', () => {
       };
     });
     console.log('[gpu-e2e] selection:', JSON.stringify(selection));
-    expect(selection.selectedRow).toBe(1);
+    expect(selection.selectedRow).toBe(selectionTarget.abs);
     expect(selection.ariaSelected).toBe('true');
     expect(selection.selectedKey).toBeTruthy();
-    await browser.execute(() => {
-      const row = document.querySelector('.row[data-row="1"]');
-      if (!row) throw new Error('no .row[data-row="1"] to focus');
+    await browser.execute((abs: number) => {
+      const row = document.querySelector('.row[data-row="' + abs + '"]');
+      if (!row) throw new Error('selected row disappeared before keyboard probe');
       row.focus();
       row.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
-    });
+    }, selectionTarget.abs);
     const roving = await browser.execute(() => {
       const active = document.activeElement?.closest('.row');
       return active ? Number(active.getAttribute('data-row')) : null;
     });
-    expect(roving).toBe(2);
+    expect(selectionTarget.nextAbs).not.toBeNull();
+    expect(roving).toBe(selectionTarget.nextAbs);
 
     // --- Single-panel contract artifact --------------------------------------
     // Record the Rust renderer contract exercised above. This spec only

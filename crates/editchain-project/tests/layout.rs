@@ -535,14 +535,13 @@ fn overlapping_component_does_not_collide_with_active_fork_lane() {
 
 /// A wide/long connected component reserves only the rows where each of its
 /// operation lanes has real geometry. A disconnected session nested inside a
-/// Git-only gap may therefore reuse the first operation lane after the shared
-/// session-base spine instead of being
+/// Git-only gap may therefore reuse the first operation lane instead of being
 /// pushed beyond the connected component's maximum width.
 ///
 /// The A session is linked to Git above the gap. The Git chain continues across
 /// Q on lane 0, but A's operation geometry ends at row 2. Q (rows 3..4) should
-/// use lane 2 even though the A+Git component itself spans rows 0..6. Lane 1
-/// is the edge-only session-base spine.
+/// use lane 1 even though the A+Git component itself spans rows 0..6. A is the
+/// only session linked to G2, so no edge-only session-base spine is allocated.
 #[test]
 fn disconnected_session_reuses_operation_lane_inside_git_only_component_gap() {
     let nodes = vec![
@@ -567,14 +566,14 @@ fn disconnected_session_reuses_operation_lane_inside_git_only_component_gap() {
     assert_eq!(lane_of("G2"), 0);
     assert_eq!(lane_of("G1"), 0);
     assert_eq!(lane_of("G0"), 0);
-    assert_eq!(lane_of("A2"), 2);
-    assert_eq!(lane_of("A1"), 2);
+    assert_eq!(lane_of("A2"), 1);
+    assert_eq!(lane_of("A1"), 1);
     assert_eq!(
         lane_of("Q2"),
-        2,
+        1,
         "the Git-only gap must release the first operation lane"
     );
-    assert_eq!(lane_of("Q1"), 2);
+    assert_eq!(lane_of("Q1"), 1);
 }
 
 /// Three sequential chains that each fully end before the next begins all
@@ -681,19 +680,20 @@ fn sequential_explicit_git_links_reuse_operation_lanes() {
     let mut lanes: Vec<usize> = ctx.lanes.iter().map(|r| r.lane).collect();
     lanes.extend(ctx.session_git_spine_lanes.values().copied());
     // Everything is one component (each branch reaches the shared Git chain),
-    // yet the sequential branches must pack onto one reusable op lane after
-    // one shared/reused edge-only spine.
+    // yet the sequential branches must pack onto one reusable direct op lane.
+    // Each Git target has only one session child, so there are no spines.
     assert_eq!(
-        max_lane, 2,
+        max_lane, 1,
         "sequential branches linked to a shared Git chain must reuse one op lane"
     );
+    assert!(ctx.session_git_spine_lanes.is_empty());
     assert_lanes_are_dense(&lanes);
     for key in &nodes {
-        let expected = if is_git(key) { 0 } else { 2 };
+        let expected = usize::from(!is_git(key));
         assert_eq!(
             lane_of(key),
             expected,
-            "{key} must land on the expected lane (git=0, spine=1, ops=2)"
+            "{key} must land on the expected lane (git=0, direct ops=1)"
         );
     }
 }
@@ -776,8 +776,8 @@ fn sequential_fork_diamonds_reuse_the_freed_branch_lane() {
 /// C) linked to one git chain: A's op lane (rows 0..2) and B's op lane (rows
 /// 4..6) are disjoint in time, so B merges into A's lane; C's op lane spans
 /// rows 1..7 and overlaps the merged span, so C cannot merge. The survivors
-/// would have a gap unless they are renumbered. The final absolute lanes are
-/// Git=0, two overlapping session-base spines=1..2, and operations=3..4.
+/// would have a gap unless they are renumbered. Every Git target has only one
+/// session child, so the final absolute lanes are Git=0 and operations=1..2.
 ///
 /// Newest-first rows: A2(0), C2(1), A1(2), G2(3), B2(4), B1(5), C1(6), G1(7),
 /// G0(8). Sessions: A2 -> [A1, G2], B2 -> [B1, G1], C2 -> [C1, G0]; git chain
@@ -823,11 +823,12 @@ fn intermediate_lane_merges_but_later_lane_cannot_densifies_survivors() {
         lane_of("A1"),
         "C's overlapping op lane must stay distinct"
     );
-    assert_eq!(max_lane, 4, "git=0, two spines, and two dense op lanes");
+    assert_eq!(max_lane, 2, "git=0 and two dense direct operation lanes");
+    assert!(ctx.session_git_spine_lanes.is_empty());
     assert_lanes_are_dense(&lanes);
-    assert_eq!(lane_of("A1"), 3);
-    assert_eq!(lane_of("B1"), 3);
-    assert_eq!(lane_of("C1"), 4);
+    assert_eq!(lane_of("A1"), 1);
+    assert_eq!(lane_of("B1"), 1);
+    assert_eq!(lane_of("C1"), 2);
     assert_eq!(lane_of("G0"), 0);
     assert_eq!(lane_of("G2"), 0);
 }
@@ -839,7 +840,7 @@ fn intermediate_lane_merges_but_later_lane_cannot_densifies_survivors() {
 ///
 /// Uses the same three-session graph as
 /// `intermediate_lane_merges_but_later_lane_cannot_densifies_survivors`:
-/// final operation lanes are merged ops A+B=3 and op C=4. Lane 3 has real
+/// final operation lanes are merged ops A+B=1 and op C=2. Lane 1 has real
 /// segments at rows 0..2 and 4..6 with a gap at row 3; lane 0 carries the
 /// continuous git chain G2(3) -> G1(7) spanning rows 3..7.
 #[test]
@@ -1420,10 +1421,10 @@ fn lone_adjacent_fork_anchors_transition_at_parent() {
     );
 }
 
-/// An exact session→Git anchor leaves the session node for a dedicated routing
-/// spine, then enters the exact Git target from that spine.
+/// A lone exact session→Git anchor is one direct branch with no synthetic
+/// routing junction.
 #[test]
-fn session_git_anchor_routes_through_shared_spine() {
+fn lone_session_git_anchor_uses_one_direct_branch() {
     let nodes = vec!["session".to_string(), "git".to_string()];
     let parents = parents_from(&[("session", &["git"])]);
     let is_git = |key: &str| key == "git";
@@ -1431,32 +1432,30 @@ fn session_git_anchor_routes_through_shared_spine() {
     let lane_of = |key: &str| ctx.lanes.iter().find(|row| row.node == key).unwrap().lane;
     let session_lane = lane_of("session");
     let git_lane = lane_of("git");
-    let spine_lane = *ctx
-        .session_git_spine_lanes
-        .get(&("session".to_string(), "git".to_string()))
-        .expect("session-base spine");
     assert_ne!(session_lane, git_lane, "session and Git use distinct lanes");
-    assert_ne!(session_lane, spine_lane, "the spine is edge-only");
-    assert_ne!(spine_lane, git_lane, "the spine stays separate from Git");
+    assert!(
+        ctx.session_git_spine_lanes.is_empty(),
+        "one session must not allocate an edge-only spine"
+    );
     assert_eq!(
         ctx.row_transitions.first().map_or(&[][..], Vec::as_slice),
-        &[(session_lane, spine_lane)],
-        "the session peels onto the spine at its own row"
+        &[(session_lane, git_lane)],
+        "the session edge bends directly into Git"
     );
     assert_eq!(
         ctx.row_transitions.get(1).map_or(&[][..], Vec::as_slice),
-        &[(spine_lane, git_lane)],
-        "the shared spine enters Git in the anchor row"
+        &[],
+        "there is no second junction at the Git row"
     );
     assert_eq!(
         ctx.row_below.first().map_or(&[][..], Vec::as_slice),
-        &[spine_lane],
-        "the spine leaves the session row downward"
+        &[git_lane],
+        "the direct edge leaves on the Git lane"
     );
     assert_eq!(
         ctx.row_above.get(1).map_or(&[][..], Vec::as_slice),
-        &[spine_lane],
-        "the shared spine enters the Git row from above"
+        &[git_lane],
+        "the direct edge enters the Git row"
     );
 
     let layout = compute_graph_layout(&nodes, &parents, &is_git);
@@ -1467,26 +1466,23 @@ fn session_git_anchor_routes_through_shared_spine() {
             .iter()
             .map(|point| (point.row, point.lane))
             .collect::<Vec<_>>(),
-        vec![
-            (0, session_lane),
-            (0, spine_lane),
-            (1, spine_lane),
-            (1, git_lane),
-        ],
-        "edge points must use both endpoint transitions"
+        vec![(0, session_lane), (0, git_lane), (1, git_lane)],
+        "the edge has one direct transition and no intermediate lane"
     );
 }
 
-/// A session joins its shared spine immediately even when the Git anchor is
-/// below the visible window; the Git-side bend remains at the real parent row.
+/// A session joins a genuinely shared spine immediately even when the Git
+/// anchor is below the visible window; the Git-side bend remains at the real
+/// parent row.
 #[test]
 fn session_git_anchor_joins_spine_before_offscreen_parent() {
     let nodes = vec![
         "session".to_string(),
+        "peer-session".to_string(),
         "filler".to_string(),
         "git".to_string(),
     ];
-    let parents = parents_from(&[("session", &["git"])]);
+    let parents = parents_from(&[("session", &["git"]), ("peer-session", &["git"])]);
     let is_git = |key: &str| key == "git";
     let ctx = LayoutContext::new(&nodes, &parents, &is_git);
     let session_lane = *ctx.lane_at.get("session").expect("session lane");
@@ -1580,21 +1576,28 @@ fn sessions_with_one_git_base_share_spine_and_reuse_operation_lane() {
 #[test]
 fn overlapping_git_base_spines_use_distinct_lanes() {
     let nodes = vec![
-        "session-a".to_string(),
-        "session-b".to_string(),
+        "session-a-new".to_string(),
+        "session-b-new".to_string(),
+        "session-a-old".to_string(),
+        "session-b-old".to_string(),
         "git-b".to_string(),
         "git-a".to_string(),
     ];
-    let parents = parents_from(&[("session-a", &["git-a"]), ("session-b", &["git-b"])]);
+    let parents = parents_from(&[
+        ("session-a-new", &["git-a"]),
+        ("session-a-old", &["git-a"]),
+        ("session-b-new", &["git-b"]),
+        ("session-b-old", &["git-b"]),
+    ]);
     let is_git = |key: &str| key.starts_with("git-");
     let ctx = LayoutContext::new(&nodes, &parents, &is_git);
     let spine_a = *ctx
         .session_git_spine_lanes
-        .get(&("session-a".to_string(), "git-a".to_string()))
+        .get(&("session-a-new".to_string(), "git-a".to_string()))
         .expect("first spine");
     let spine_b = *ctx
         .session_git_spine_lanes
-        .get(&("session-b".to_string(), "git-b".to_string()))
+        .get(&("session-b-new".to_string(), "git-b".to_string()))
         .expect("second spine");
 
     assert_ne!(spine_a, spine_b);

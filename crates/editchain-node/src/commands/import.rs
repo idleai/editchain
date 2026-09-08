@@ -1,5 +1,6 @@
 //! Import agent sessions (Claude Code or Codex) into the edit chain.
 
+mod claude_session_git;
 mod git_commit_links;
 
 use std::collections::{BTreeMap, HashSet};
@@ -109,24 +110,24 @@ pub fn run(
     println!("  Malformed: {}", report.malformed);
 
     if !dry_run {
+        let mut session_base_links = 0usize;
         let mut produced_links = 0usize;
-        let reconciliation = || -> Result<Vec<Op>, Box<dyn std::error::Error>> {
-            let all_ops = reconciliation_ops(&chain_path, &ops_sink.ops)?;
-            let blob_reader = FsBlobSink::open_read_only(chain_path.join("blobs"))?;
-            git_commit_links::derive_produced_commit_links(
-                Path::new(&workspace),
-                &all_ops,
-                blob_reader.as_ref(),
-            )
-        };
-        match reconciliation() {
-            Ok(links) => {
-                produced_links = links.len();
-                ops_sink.ops.extend(links);
+        match reconcile_git_links(provider, Path::new(&workspace), &chain_path, &ops_sink.ops) {
+            Ok(GitReconciliation {
+                base_links,
+                produced_links: commit_links,
+            }) => {
+                session_base_links = base_links.len();
+                produced_links = commit_links.len();
+                ops_sink.ops.extend(base_links);
+                ops_sink.ops.extend(commit_links);
             }
-            Err(error) => println!(
-                "Produced-commit link reconciliation failed (session import will continue): {error}"
-            ),
+            Err(error) => {
+                println!("Git-link reconciliation failed (session import will continue): {error}");
+            }
+        }
+        if provider == Provider::Claude {
+            println!("  Claude session Git anchors: {session_base_links}");
         }
         println!("  Produced commit links: {produced_links}");
 
@@ -190,6 +191,34 @@ pub fn run(
     }
 
     Ok(())
+}
+
+/// Reconcile all Git relationships that depend on live repository evidence.
+fn reconcile_git_links(
+    provider: Provider,
+    workspace: &Path,
+    chain: &Path,
+    imported: &[Op],
+) -> Result<GitReconciliation, Box<dyn std::error::Error>> {
+    let mut all_ops = reconciliation_ops(chain, imported)?;
+    let blob_reader = FsBlobSink::open_read_only(chain.join("blobs"))?;
+    let base_links = if provider == Provider::Claude {
+        claude_session_git::derive_session_base_links(workspace, &all_ops, blob_reader.as_ref())?
+    } else {
+        Vec::new()
+    };
+    all_ops.extend(base_links.iter().cloned());
+    let produced_links =
+        git_commit_links::derive_produced_commit_links(workspace, &all_ops, blob_reader.as_ref())?;
+    Ok(GitReconciliation {
+        base_links,
+        produced_links,
+    })
+}
+
+struct GitReconciliation {
+    base_links: Vec<Op>,
+    produced_links: Vec<Op>,
 }
 
 /// Read accepted chain operations and merge the current import batch for

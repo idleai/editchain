@@ -21,15 +21,17 @@ use serde as _;
 use serde_json as _;
 
 use editchain_core::{
-    ActorId, Clock, GitLink, GitLinkKind, GitOid, ImportOp, MessageOp, NodeId, Op, OpId, OpKind,
-    ParentSet, Payload, ReflectionOp, ScopeRef, SessionId, Tags, ToolOp, ToolStage,
+    ActorId, Clock, CommandOp, CommandStage, FileEdit, FileOp, FileStage, GitLink, GitLinkKind,
+    GitOid, ImportOp, MessageOp, NodeId, NoteOp, NoteRelationship, Op, OpId, OpKind, ParentSet,
+    Payload, ReflectionOp, ScopeRef, SessionId, Tags, ToolOp, ToolStage,
 };
-use editchain_import::BlobSink as _;
+use editchain_import::{derive_path_id, BlobSink as _};
 use editchain_project::filter::ChainFilter;
 use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
 use editchain_protocol::{
-    ActivityBundleKind, HistoryRow, Request, RequestBody, ResponseBody, SearchFiltersDto,
+    ActivityBundleKind, FileChangeDto, FileDiffDto, HistoryRow, HistoryWindow, Request,
+    RequestBody, ResponseBody, SearchFiltersDto,
 };
 use editchain_vscode_service::{
     parse_git_oid, parse_repository_id, prepare_render_snapshot, resolve_git_commit,
@@ -205,6 +207,506 @@ fn make_git_repo(dir: &Path) -> std::path::PathBuf {
         ],
     );
     repo
+}
+
+#[test]
+fn imported_agent_edit_rows_materialize_recorded_snippets_without_fabricating_files() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let chain_dir = tmp.path().join(".editchain");
+    let raw_id = OpId::new(NodeId(71), 0, 1);
+    let raw = Op {
+        id: raw_id,
+        parents: ParentSet::None,
+        actor: ActorId(1),
+        clock: Clock::UnixMs(1_700_000_001),
+        scope: ScopeRef::Session(SessionId(71)),
+        tags: Tags::IMPORT,
+        kind: OpKind::Import(ImportOp {
+            raw_ref: Payload::Inline(br#"{"type":"assistant"}"#.to_vec()),
+            raw_hash: None,
+        }),
+    };
+    let edit = Op {
+        id: OpId::new(NodeId(71), 0, 2),
+        parents: ParentSet::One(raw_id),
+        actor: ActorId(2),
+        clock: Clock::UnixMs(1_700_000_001),
+        scope: ScopeRef::Session(SessionId(71)),
+        tags: Tags::AGENT | Tags::TOOL,
+        kind: OpKind::Tool(ToolOp {
+            tool_call_id: Payload::Inline(b"tool-1".to_vec()),
+            tool_name: Payload::Inline(b"Edit".to_vec()),
+            stage: ToolStage::Start,
+            content: Payload::Inline(
+                br#"{"file_path":"src/lib.rs","old_string":"fn old() {}","new_string":"fn new() {}"}"#
+                    .to_vec(),
+            ),
+        }),
+    };
+    let mut page = editchain_codec::page::Page::new(0);
+    page.add_record(0, editchain_codec::frame::encode_op(&raw).unwrap());
+    page.add_record(0, editchain_codec::frame::encode_op(&edit).unwrap());
+    write_page(&chain_dir, &page);
+
+    let mut server = editchain_vscode_service::Server::new();
+    let open = server
+        .handle(&Request {
+            id: 1,
+            body: RequestBody::Open(editchain_protocol::OpenRequest {
+                workspace_path: tmp.path().to_string_lossy().into_owned(),
+                chain_dir: ".editchain".to_string(),
+            }),
+        })
+        .expect("open imported chain");
+    assert!(matches!(open.body, ResponseBody::Ok(_)));
+    let response = server
+        .handle(&Request {
+            id: 2,
+            body: RequestBody::GetWindow(editchain_protocol::GetWindowRequest {
+                offset: 0,
+                limit: 100,
+                hide_submodules: true,
+                filter: None,
+                include_layout: true,
+            }),
+        })
+        .expect("agent history window");
+    let ResponseBody::Ok(value) = response.body else {
+        panic!("expected history window, got {:?}", response.body);
+    };
+    let window: HistoryWindow = serde_json::from_value(value).expect("decode history window");
+    let file_row = window
+        .rows
+        .iter()
+        .find(|row| row.file_change.is_some())
+        .expect("agent file row");
+    assert!(file_row.is_subop);
+    assert_eq!(file_row.kind, "file");
+    let change = file_row.file_change.clone().expect("file identity");
+    assert_eq!(change.path, "src/lib.rs");
+    assert_eq!(change.op_id.as_deref(), Some(edit.id.to_string().as_str()));
+    assert!(change.partial);
+
+    let response = server
+        .handle(&Request {
+            id: 3,
+            body: RequestBody::GetFileDiff(editchain_protocol::GetFileDiffRequest { change }),
+        })
+        .expect("materialize agent diff");
+    let ResponseBody::Ok(value) = response.body else {
+        panic!("expected agent diff, got {:?}", response.body);
+    };
+    let diff: FileDiffDto = serde_json::from_value(value).expect("decode agent diff");
+    assert_eq!(diff.before, "fn old() {}");
+    assert_eq!(diff.after, "fn new() {}");
+    assert!(diff.partial);
+    assert!(diff
+        .note
+        .as_deref()
+        .is_some_and(|note| note.contains("full before/after")));
+}
+
+#[test]
+fn agent_edit_uses_exact_session_git_baseline_when_available() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = make_git_repo(tmp.path());
+    let chain_dir = repo.join(".editchain");
+    let session = SessionId(73);
+    let raw_id = OpId::new(NodeId(73), 0, 1);
+    let edit_id = OpId::new(NodeId(73), 0, 2);
+    let link_id = OpId::new(NodeId(73), 0, 3);
+    let repository = editchain_git::repository_id_from_path(&repo.join(".git"));
+    let commit_hex = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    let commit_oid = GitOid::from_hex(&commit_hex).expect("full commit oid");
+    let raw = Op {
+        id: raw_id,
+        parents: ParentSet::None,
+        actor: ActorId(1),
+        clock: Clock::UnixMs(1_700_000_001),
+        scope: ScopeRef::Session(session),
+        tags: Tags::IMPORT,
+        kind: OpKind::Import(ImportOp {
+            raw_ref: Payload::Inline(
+                serde_json::json!({
+                    "type": "session_meta",
+                    "payload": { "cwd": repo.to_string_lossy() }
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+            raw_hash: None,
+        }),
+    };
+    let edit = Op {
+        id: edit_id,
+        parents: ParentSet::One(raw_id),
+        actor: ActorId(2),
+        clock: Clock::UnixMs(1_700_000_002),
+        scope: ScopeRef::Session(session),
+        tags: Tags::AGENT | Tags::TOOL,
+        kind: OpKind::Tool(ToolOp {
+            tool_call_id: Payload::Inline(b"tool-anchored".to_vec()),
+            tool_name: Payload::Inline(b"Edit".to_vec()),
+            stage: ToolStage::Start,
+            content: Payload::Inline(
+                br#"{"file_path":"file.txt","old_string":"hello\n","new_string":"hello from the agent\n"}"#
+                    .to_vec(),
+            ),
+        }),
+    };
+    let link = Op {
+        id: link_id,
+        parents: ParentSet::One(raw_id),
+        actor: ActorId(1),
+        clock: Clock::None,
+        scope: ScopeRef::Session(session),
+        tags: Tags::IMPORT | Tags::META,
+        kind: OpKind::GitLink(GitLink {
+            source: raw_id,
+            target_repo: repository,
+            target_oid: commit_oid,
+            kind: GitLinkKind::BasedOn,
+        }),
+    };
+    let mut page = editchain_codec::page::Page::new(0);
+    for op in [&raw, &edit, &link] {
+        page.add_record(0, editchain_codec::frame::encode_op(op).unwrap());
+    }
+    write_page(&chain_dir, &page);
+
+    let mut server = editchain_vscode_service::Server::new();
+    let open = server
+        .handle(&Request {
+            id: 1,
+            body: RequestBody::Open(editchain_protocol::OpenRequest {
+                workspace_path: repo.to_string_lossy().into_owned(),
+                chain_dir: ".editchain".to_string(),
+            }),
+        })
+        .expect("open Git-anchored agent chain");
+    assert!(matches!(open.body, ResponseBody::Ok(_)));
+    let window = server
+        .handle(&Request {
+            id: 2,
+            body: RequestBody::GetWindow(editchain_protocol::GetWindowRequest {
+                offset: 0,
+                limit: 100,
+                hide_submodules: true,
+                filter: None,
+                include_layout: true,
+            }),
+        })
+        .expect("anchored agent history window");
+    let ResponseBody::Ok(value) = window.body else {
+        panic!("expected history window, got {:?}", window.body);
+    };
+    let window: HistoryWindow = serde_json::from_value(value).expect("decode history window");
+    let change = window
+        .rows
+        .iter()
+        .filter_map(|row| row.file_change.clone())
+        .find(|change| change.source == editchain_protocol::FileChangeSource::Agent)
+        .expect("agent file row");
+    assert_eq!(change.path, "file.txt");
+    assert_eq!(
+        change.repository.as_deref(),
+        Some(repository.0.to_string().as_str())
+    );
+    assert_eq!(change.repository_path.as_deref(), Some("file.txt"));
+    assert_eq!(change.commit_oid.as_deref(), Some(commit_hex.as_str()));
+
+    let response = server
+        .handle(&Request {
+            id: 3,
+            body: RequestBody::GetFileDiff(editchain_protocol::GetFileDiffRequest { change }),
+        })
+        .expect("materialize Git-anchored agent diff");
+    let ResponseBody::Ok(value) = response.body else {
+        panic!("expected anchored agent diff, got {:?}", response.body);
+    };
+    let diff: FileDiffDto = serde_json::from_value(value).expect("decode agent diff");
+    assert_eq!(diff.before, "hello\n");
+    assert_eq!(diff.after, "hello from the agent\n");
+    assert!(diff.partial, "sequential agent state is still conservative");
+    assert!(diff
+        .note
+        .as_deref()
+        .is_some_and(|note| note.contains("session's exact Git baseline")));
+}
+
+#[test]
+fn legacy_codex_multi_file_record_recovers_every_path_from_raw_evidence() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let chain_dir = tmp.path().join(".editchain");
+    let raw_id = OpId::new(NodeId(72), 0, 1);
+    let legacy_file_id = OpId::new(NodeId(72), 0, 2);
+    let raw_json = serde_json::json!({
+        "timestamp": "2026-08-26T12:00:00Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "item_completed",
+            "turn_id": "turn-1",
+            "item": {
+                "type": "FileChange",
+                "id": "file-1",
+                "changes": {
+                    "src/a.rs": {
+                        "type": "update",
+                        "unified_diff": "@@ -1 +1 @@\n-old a\n+new a"
+                    },
+                    "src/b.rs": {
+                        "type": "delete",
+                        "content": "old b\n"
+                    }
+                },
+                "status": "completed"
+            }
+        }
+    })
+    .to_string();
+    let raw = Op {
+        id: raw_id,
+        parents: ParentSet::None,
+        actor: ActorId(1),
+        clock: Clock::UnixMs(1_700_000_001),
+        scope: ScopeRef::Session(SessionId(72)),
+        tags: Tags::IMPORT,
+        kind: OpKind::Import(ImportOp {
+            raw_ref: Payload::Inline(raw_json.into_bytes()),
+            raw_hash: None,
+        }),
+    };
+    // Version-four Codex normalization retained only the first path and joined
+    // every path's hunks into this one FileOp. The service must suppress that
+    // lossy child in favor of the still-exact raw record above.
+    let legacy_file = Op {
+        id: legacy_file_id,
+        parents: ParentSet::One(raw_id),
+        actor: ActorId(2),
+        clock: Clock::UnixMs(1_700_000_001),
+        scope: ScopeRef::Session(SessionId(72)),
+        tags: Tags::AGENT | Tags::FILE,
+        kind: OpKind::File(FileOp {
+            path: derive_path_id("src/a.rs"),
+            stage: FileStage::Applied,
+            base: None,
+            after: None,
+            edit: FileEdit::UnifiedDiff(Payload::Inline(
+                b"@@ -1 +1 @@\n-old a\n+new a\n@@ -1 +0,0 @@\n-old b".to_vec(),
+            )),
+        }),
+    };
+    let legacy_path = Op {
+        id: OpId::new(NodeId(72), 0, 3),
+        parents: ParentSet::One(raw_id),
+        actor: ActorId(2),
+        clock: Clock::UnixMs(1_700_000_001),
+        scope: ScopeRef::Session(SessionId(72)),
+        tags: Tags::AGENT | Tags::META,
+        kind: OpKind::Note(NoteOp {
+            target_ids: vec![legacy_file_id],
+            relationship: NoteRelationship::Explains,
+            content: Payload::Inline(b"src/a.rs".to_vec()),
+        }),
+    };
+    let mut page = editchain_codec::page::Page::new(0);
+    for op in [&raw, &legacy_file, &legacy_path] {
+        page.add_record(0, editchain_codec::frame::encode_op(op).unwrap());
+    }
+    write_page(&chain_dir, &page);
+
+    let mut server = editchain_vscode_service::Server::new();
+    let open = server
+        .handle(&Request {
+            id: 1,
+            body: RequestBody::Open(editchain_protocol::OpenRequest {
+                workspace_path: tmp.path().to_string_lossy().into_owned(),
+                chain_dir: ".editchain".to_string(),
+            }),
+        })
+        .expect("open legacy Codex chain");
+    assert!(matches!(open.body, ResponseBody::Ok(_)));
+    let response = server
+        .handle(&Request {
+            id: 2,
+            body: RequestBody::GetWindow(editchain_protocol::GetWindowRequest {
+                offset: 0,
+                limit: 100,
+                hide_submodules: true,
+                filter: None,
+                include_layout: true,
+            }),
+        })
+        .expect("legacy Codex history window");
+    let ResponseBody::Ok(value) = response.body else {
+        panic!("expected history window, got {:?}", response.body);
+    };
+    let window: HistoryWindow = serde_json::from_value(value).expect("decode history window");
+    let changes: Vec<FileChangeDto> = window
+        .rows
+        .iter()
+        .filter_map(|row| row.file_change.clone())
+        .collect();
+    assert_eq!(changes.len(), 2, "raw evidence restores both changed paths");
+    assert_eq!(changes[0].path, "src/a.rs");
+    assert_eq!(
+        changes[0].status,
+        editchain_protocol::FileChangeStatus::Modified
+    );
+    assert!(changes[0].partial);
+    assert_eq!(changes[1].path, "src/b.rs");
+    assert_eq!(
+        changes[1].status,
+        editchain_protocol::FileChangeStatus::Deleted
+    );
+    assert!(
+        !changes[1].partial,
+        "Codex retained complete deleted content"
+    );
+    assert!(changes
+        .iter()
+        .all(|change| change.op_id.as_deref() == Some(raw_id.to_string().as_str())));
+
+    let update = server
+        .handle(&Request {
+            id: 3,
+            body: RequestBody::GetFileDiff(editchain_protocol::GetFileDiffRequest {
+                change: changes[0].clone(),
+            }),
+        })
+        .expect("materialize raw Codex update");
+    let ResponseBody::Ok(value) = update.body else {
+        panic!("expected update diff, got {:?}", update.body);
+    };
+    let update: FileDiffDto = serde_json::from_value(value).expect("decode update diff");
+    assert_eq!(update.before, "old a");
+    assert_eq!(update.after, "new a");
+    assert!(update.partial);
+    assert_eq!(update.hunks.len(), 1);
+    assert_eq!(update.hunks[0].header, "@@ -1 +1 @@");
+    assert_eq!(update.hunks[0].before, "old a");
+    assert_eq!(update.hunks[0].after, "new a");
+
+    let deletion = server
+        .handle(&Request {
+            id: 4,
+            body: RequestBody::GetFileDiff(editchain_protocol::GetFileDiffRequest {
+                change: changes[1].clone(),
+            }),
+        })
+        .expect("materialize raw Codex deletion");
+    let ResponseBody::Ok(value) = deletion.body else {
+        panic!("expected deletion diff, got {:?}", deletion.body);
+    };
+    let deletion: FileDiffDto = serde_json::from_value(value).expect("decode deletion diff");
+    assert_eq!(deletion.before, "old b\n");
+    assert!(deletion.after.is_empty());
+    assert!(!deletion.partial);
+}
+
+#[test]
+fn git_commit_rows_expand_to_files_and_materialize_exact_native_diff_sides() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = make_git_repo(tmp.path());
+    std::fs::write(repo.join("file.txt"), b"hello from the second commit\n").expect("modify file");
+    run(&repo, &["add", "file.txt"]);
+    run(
+        &repo,
+        &[
+            "-c",
+            "user.name=Alice",
+            "-c",
+            "user.email=alice@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "modify file",
+        ],
+    );
+    let commit_oid = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    std::fs::create_dir_all(repo.join(".editchain")).expect("chain directory");
+
+    let mut server = editchain_vscode_service::Server::new();
+    let open = server
+        .handle(&Request {
+            id: 1,
+            body: RequestBody::Open(editchain_protocol::OpenRequest {
+                workspace_path: repo.to_string_lossy().into_owned(),
+                chain_dir: ".editchain".to_string(),
+            }),
+        })
+        .expect("open repository");
+    assert!(matches!(open.body, ResponseBody::Ok(_)));
+    let window = server
+        .handle(&Request {
+            id: 2,
+            body: RequestBody::GetWindow(editchain_protocol::GetWindowRequest {
+                offset: 0,
+                limit: 100,
+                hide_submodules: true,
+                filter: None,
+                include_layout: true,
+            }),
+        })
+        .expect("history window");
+    let ResponseBody::Ok(value) = window.body else {
+        panic!("expected history window, got {:?}", window.body);
+    };
+    let window: HistoryWindow = serde_json::from_value(value).expect("decode history window");
+    let parent_index = window
+        .rows
+        .iter()
+        .position(|row| row.git_oid.as_deref() == Some(commit_oid.as_str()) && !row.is_subop)
+        .expect("new commit row");
+    let parent = &window.rows[parent_index];
+    assert_eq!(
+        parent.sub_ops.len(),
+        1,
+        "commit advertises one changed path"
+    );
+    assert_eq!(parent.sub_ops[0].summary, "file.txt");
+    let file_row = window
+        .rows
+        .get(parent_index + 1)
+        .expect("expanded file row");
+    assert!(file_row.is_subop);
+    assert_eq!(file_row.kind, "file");
+    assert_eq!(file_row.summary, "file.txt");
+    let change = file_row.file_change.clone().expect("file-change identity");
+    assert_eq!(change.path, "file.txt");
+    assert_eq!(change.repository_path.as_deref(), Some("file.txt"));
+    assert_eq!(change.commit_oid.as_deref(), Some(commit_oid.as_str()));
+    assert!(!change.partial);
+
+    let response = server
+        .handle(&Request {
+            id: 3,
+            body: RequestBody::GetFileDiff(editchain_protocol::GetFileDiffRequest {
+                change: change.clone(),
+            }),
+        })
+        .expect("materialize file diff");
+    let ResponseBody::Ok(value) = response.body else {
+        panic!("expected exact file diff, got {:?}", response.body);
+    };
+    let diff: FileDiffDto = serde_json::from_value(value).expect("decode file diff");
+    assert_eq!(diff.before, "hello\n");
+    assert_eq!(diff.after, "hello from the second commit\n");
+    assert!(!diff.binary);
+    assert!(!diff.partial);
+    assert!(diff.note.is_none());
+
+    let mut tampered: FileChangeDto = change;
+    tampered.path = "another-file.txt".to_string();
+    let rejected = server
+        .handle(&Request {
+            id: 4,
+            body: RequestBody::GetFileDiff(editchain_protocol::GetFileDiffRequest {
+                change: tampered,
+            }),
+        })
+        .expect("tampered request returns protocol error");
+    assert!(matches!(rejected.body, ResponseBody::Error(_)));
 }
 
 fn run(dir: &Path, args: &[&str]) {
@@ -1607,6 +2109,94 @@ fn service_path_compaction_preserves_childless_output_rows_and_blob_echoes() {
 }
 
 #[test]
+fn service_path_uses_command_stdout_as_the_output_subtitle() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let chain_dir = tmp.path().join(".editchain");
+    let command_raw = raw_import_op(
+        10,
+        1,
+        1_000,
+        None,
+        r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"cmd-1","status":"completed","stdout":"actual stdout\nsecond line","formatted_output":"formatted fallback"}}}"#,
+    );
+    let command = Op {
+        id: OpId::new(NodeId(10), 0, 2),
+        parents: ParentSet::One(command_raw.id),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(1_000),
+        scope: ScopeRef::Session(SessionId(1)),
+        tags: Tags::AGENT | Tags::COMMAND,
+        kind: OpKind::Command(CommandOp {
+            command_id: Payload::Inline(b"cmd-1".to_vec()),
+            content: Payload::Inline(
+                b"/bin/bash -lc 'printf actual'\nnormalized aggregate".to_vec(),
+            ),
+            stage: CommandStage::Finish,
+        }),
+    };
+    let empty_output_import = raw_import_op(
+        11,
+        1,
+        1_100,
+        Some(command_raw.id),
+        r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"cmd-2","status":"completed","stdout":"","formatted_output":""}}}"#,
+    );
+    let empty_output_command = Op {
+        id: OpId::new(NodeId(11), 0, 2),
+        parents: ParentSet::One(empty_output_import.id),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(1_100),
+        scope: ScopeRef::Session(SessionId(1)),
+        tags: Tags::AGENT | Tags::COMMAND,
+        kind: OpKind::Command(CommandOp {
+            command_id: Payload::Inline(b"cmd-2".to_vec()),
+            content: Payload::Inline(b"/bin/bash -lc true".to_vec()),
+            stage: CommandStage::Finish,
+        }),
+    };
+
+    let mut page = editchain_codec::page::Page::new(0);
+    for op in [
+        &command_raw,
+        &command,
+        &empty_output_import,
+        &empty_output_command,
+    ] {
+        page.add_record(0, editchain_codec::frame::encode_op(op).expect("encode"));
+    }
+    write_page(&chain_dir, &page);
+
+    let mut workspace = Workspace::open(tmp.path().to_str().unwrap(), ".editchain")
+        .expect("open workspace through the real service path");
+    let window = workspace.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 100,
+        hide_submodules: true,
+        filter: &no_filter(),
+        include_layout: false,
+    });
+    let row = window
+        .rows
+        .iter()
+        .find(|row| row.node_key == command_raw.id.to_string())
+        .expect("command output row");
+
+    assert_eq!(row.kind, "command");
+    assert_eq!(row.record_role, RecordRole::Result);
+    assert_eq!(row.summary, "actual stdout\nsecond line");
+    assert!(!row.summary.starts_with("$ "));
+    assert!(!row.summary.contains("/bin/bash"));
+
+    let empty_output_row = window
+        .rows
+        .iter()
+        .find(|row| row.node_key == empty_output_import.id.to_string())
+        .expect("silent command output row");
+    assert_eq!(empty_output_row.summary, "No output");
+    assert!(!empty_output_row.summary.contains("/bin/bash"));
+}
+
+#[test]
 fn service_path_compaction_preserves_object_tool_payload_carriers() {
     // Childless tool-like response_item envelopes carrying non-empty object
     // arguments/parameters survive compaction with a bounded content signal:
@@ -1678,6 +2268,77 @@ fn service_path_compaction_preserves_object_tool_payload_carriers() {
         .find(|r| r.node_key == id_only.id.to_string())
         .expect("id-only row");
     assert_eq!(id_only_row.visibility, Visibility::Trace);
+}
+
+#[test]
+fn service_path_keeps_exec_command_separate_from_token_metadata() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let chain_dir = tmp.path().join(".editchain");
+    let script = "const result = await tools.exec_command({\n  cmd: \"cargo test -p editchain-project\",\n  workdir: \"/workspace\"\n});\ntext(result.output);";
+    let call_raw = serde_json::json!({
+        "type": "response_item",
+        "payload": {
+            "type": "custom_tool_call",
+            "name": "exec",
+            "input": script,
+        },
+    })
+    .to_string();
+    let call = raw_import_op(20, 1, 1_000, None, &call_raw);
+    let call_child = Op {
+        id: OpId::new(NodeId(20), 0, 2),
+        parents: ParentSet::One(call.id),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(1_000),
+        scope: ScopeRef::Session(SessionId(1)),
+        tags: Tags::AGENT | Tags::TOOL,
+        kind: OpKind::Tool(ToolOp {
+            tool_call_id: Payload::Inline(b"call-1".to_vec()),
+            tool_name: Payload::Inline(b"exec".to_vec()),
+            stage: ToolStage::Start,
+            content: Payload::Empty,
+        }),
+    };
+    let accounting_json = serde_json::json!({
+        "type": "token_usage_record",
+        "payload": {
+            "thread_id": "thread-1",
+            "turn_id": "turn-1",
+            "session_id": "thread-1",
+            "root_turn_id": "turn-1",
+            "response_id": "response-1",
+            "usage": { "total_tokens": 114_757 },
+        },
+    })
+    .to_string();
+    let mut token = raw_import_op(20, 3, 1_100, Some(call.id), &accounting_json);
+    token.tags |= Tags::META;
+    let mut page = editchain_codec::page::Page::new(0);
+    for op in [&call, &call_child, &token] {
+        page.add_record(0, editchain_codec::frame::encode_op(op).expect("encode"));
+    }
+    write_page(&chain_dir, &page);
+
+    let mut workspace = Workspace::open(tmp.path().to_str().unwrap(), ".editchain")
+        .expect("open workspace through the real service path");
+    let window = workspace.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 100,
+        hide_submodules: true,
+        filter: &no_filter(),
+        include_layout: false,
+    });
+    let row = window
+        .rows
+        .iter()
+        .find(|row| row.node_key == call.id.to_string())
+        .expect("exec row");
+
+    assert_eq!(row.summary, "tool: exec cargo test -p editchain-project");
+    assert_eq!(row.sub_ops.len(), 1);
+    let accounting_child = row.sub_ops.first().expect("token child");
+    assert_eq!(accounting_child.kind, "token_usage_record");
+    assert_eq!(accounting_child.summary, "114,757");
 }
 
 #[test]
@@ -2121,7 +2782,7 @@ fn cancelled_branch_rows_ship_muted_node_and_child_owned_edge_geometry() {
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_thirty_five() {
+fn prepared_snapshot_manifest_records_projection_revision_forty_four() {
     // Stale snapshots from earlier projection revisions (pre-hide_trace,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
@@ -2130,9 +2791,10 @@ fn prepared_snapshot_manifest_records_projection_revision_thirty_five() {
     // and inline-compaction semantics, exact provider relations, legacy Codex
     // token-usage contraction, correlation-only tool results, exact Claude
     // response contraction, authoritative view-parent rewrites, and causal
-    // produced-commit branch edges, and default timestamp-zero omission) must
-    // not be served silently: the revision participates in the snapshot
-    // identity hash.
+    // produced-commit branch edges, default timestamp-zero omission,
+    // source-control file rows, and singleton nested-work flattening) must not
+    // be served silently: the revision participates in the snapshot identity
+    // hash.
     let tmp = tempfile::tempdir().expect("tempdir");
     let chain_dir = tmp.path().join(".editchain");
     let first = msg_op(41, 1, b"snapshot first");
@@ -2147,7 +2809,7 @@ fn prepared_snapshot_manifest_records_projection_revision_thirty_five() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 35u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 44u64);
 }
 
 #[test]
@@ -2410,10 +3072,11 @@ fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() 
         "one true session endpoint carries the raw-view summary marker"
     );
 
-    // Activity view: chat / outer work / chat. Opening work reveals the
-    // existing execute bundle; opening that reveals its three original tools.
-    assert_eq!(activity_window.total, 7);
-    assert_eq!(activity_window.rows.len(), 7);
+    // Activity view: chat / outer work / chat. Because the execute bundle is
+    // the work interval's only grouped member, opening work reveals its three
+    // original tools directly without a redundant second disclosure.
+    assert_eq!(activity_window.total, 6);
+    assert_eq!(activity_window.rows.len(), 6);
     let session_summary = activity_window
         .rows
         .iter()
@@ -2446,33 +3109,12 @@ fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() 
             .map(|meta| meta.member_count),
         Some(3)
     );
-    assert!(work_group.summary.contains("3 activities"));
-    let bundle = activity_window
-        .rows
-        .iter()
-        .find(|row| row.summary == "3 tool steps (success)")
-        .expect("activity view has the execute-run bundle");
-    assert_eq!(bundle.activity_kind, ActivityKind::Execute);
-    assert_eq!(bundle.visibility, Visibility::Primary);
-    assert_eq!(bundle.outcome, Outcome::Success);
-    assert!(bundle.is_system);
-    assert!(bundle.is_subop);
-    assert_eq!(bundle.hierarchy_depth, 1);
-    assert_eq!(
-        bundle.activity_bundle.as_ref().map(|meta| meta.kind),
-        Some(ActivityBundleKind::ExecuteRun)
-    );
-    assert_eq!(
-        bundle
-            .activity_bundle
+    assert_eq!(work_group.summary, "3 tool calls");
+    assert!(activity_window.rows.iter().all(|row| {
+        row.activity_bundle
             .as_ref()
-            .map(|meta| meta.member_count),
-        Some(3u64),
-        "member count is the ORIGINAL top-level run size, not the flattened subop count"
-    );
-    let bundle_value = serde_json::to_value(bundle).expect("serialize bundle row");
-    assert_eq!(bundle_value["activity_bundle"]["kind"], "execute-run");
-    assert_eq!(bundle_value["activity_bundle"]["member_count"], 3u64);
+            .is_none_or(|bundle| bundle.kind != ActivityBundleKind::ExecuteRun)
+    }));
     assert_eq!(
         work_group.work_unit.as_ref().map(|unit| unit.id.as_str()),
         Some("session:1/turn:1")
@@ -2486,16 +3128,10 @@ fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() 
         .iter()
         .position(|row| row.node_key == work_group.node_key)
         .expect("work row index");
-    let bundle_index = activity_window
-        .rows
-        .iter()
-        .position(|row| row.node_key == bundle.node_key)
-        .unwrap_or(0);
-    assert_eq!(bundle.parent_row, Some(work_index));
     let member_rows: Vec<&HistoryRow> = activity_window
         .rows
         .iter()
-        .filter(|row| row.hierarchy_depth == 2 && row.parent_row == Some(bundle_index))
+        .filter(|row| row.hierarchy_depth == 1 && row.parent_row == Some(work_index))
         .collect();
     assert_eq!(member_rows.len(), 3);
     assert!(member_rows[0].op_id.is_some());
@@ -2514,21 +3150,15 @@ fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() 
     // Expansion index ships once for the snapshot window.
     assert_eq!(
         activity_window.sub_op_counts.as_deref(),
-        Some(&[0usize, 4, 0][..])
+        Some(&[0usize, 3, 0][..])
     );
     assert_eq!(
         activity_window.expansion_spans.as_deref(),
         Some(
-            &[
-                editchain_protocol::ExpansionSpanDto {
-                    row: 1,
-                    descendant_count: 4,
-                },
-                editchain_protocol::ExpansionSpanDto {
-                    row: 2,
-                    descendant_count: 3,
-                },
-            ][..]
+            &[editchain_protocol::ExpansionSpanDto {
+                row: 1,
+                descendant_count: 3,
+            }][..]
         )
     );
     // Top-level order is preserved: agent answer, bundle, user request.
@@ -2577,32 +3207,6 @@ fn activity_view_groups_repeated_plans_as_expandable_linear_updates() {
         include_layout: true,
     });
 
-    let bundle = activity
-        .rows
-        .iter()
-        .find(|row| {
-            row.activity_bundle
-                .as_ref()
-                .is_some_and(|bundle| bundle.kind == ActivityBundleKind::PlanRepeat)
-        })
-        .expect("Activity has one typed Plan-repeat bundle");
-    assert_eq!(
-        bundle.summary,
-        "__Planning build and dry-run import steps__"
-    );
-    assert_eq!(bundle.record_role, RecordRole::Narrative);
-    assert_eq!(bundle.activity_kind, ActivityKind::Plan);
-    assert_eq!(bundle.outcome, Outcome::Unknown);
-    assert_eq!(
-        bundle
-            .activity_bundle
-            .as_ref()
-            .map(|metadata| metadata.member_count),
-        Some(3)
-    );
-    let wire = serde_json::to_value(bundle).expect("serialize Plan bundle");
-    assert_eq!(wire["activity_bundle"]["kind"], "plan-repeat");
-
     let work_group = activity
         .rows
         .iter()
@@ -2626,17 +3230,15 @@ fn activity_view_groups_repeated_plans_as_expandable_linear_updates() {
         .position(|row| row.node_key == work_group.node_key)
         .expect("work row index");
 
-    let bundle_index = activity
-        .rows
-        .iter()
-        .position(|row| row.node_key == bundle.node_key)
-        .expect("bundle row index");
-    assert_eq!(bundle.parent_row, Some(work_index));
-    assert_eq!(bundle.hierarchy_depth, 1);
+    assert!(activity.rows.iter().all(|row| {
+        row.activity_bundle
+            .as_ref()
+            .is_none_or(|bundle| bundle.kind != ActivityBundleKind::PlanRepeat)
+    }));
     let members: Vec<&HistoryRow> = activity
         .rows
         .iter()
-        .filter(|row| row.hierarchy_depth == 2 && row.parent_row == Some(bundle_index))
+        .filter(|row| row.hierarchy_depth == 1 && row.parent_row == Some(work_index))
         .collect();
     assert_eq!(members.len(), 3);
     assert_eq!(
@@ -2679,7 +3281,7 @@ fn activity_view_groups_repeated_plans_as_expandable_linear_updates() {
 }
 
 #[test]
-fn prepared_snapshot_serves_nested_activity_view_and_records_revision_thirty_five() {
+fn prepared_snapshot_serves_flattened_activity_view_and_records_current_revision() {
     // The pregenerated render snapshot must serve the SAME bundled Activity
     // rows as the live projection (work-unit/promotion/bundling parity) and
     // record the bumped projection revision in its identity.
@@ -2717,15 +3319,15 @@ fn prepared_snapshot_serves_nested_activity_view_and_records_revision_thirty_fiv
         include_layout: true,
     });
     assert_eq!(
-        expected.total, 7,
-        "activity view stores chat/work/chat + inner bundle + 3 members"
+        expected.total, 6,
+        "activity view stores chat/work/chat + 3 direct work members"
     );
     assert!(
         expected
             .rows
             .iter()
-            .any(|row| row.summary == "3 tool steps (success)"),
-        "live activity view contains the bundle"
+            .all(|row| row.summary != "3 tool steps (success)"),
+        "live activity view omits the redundant execute bundle"
     );
 
     let report =
@@ -2735,7 +3337,7 @@ fn prepared_snapshot_serves_nested_activity_view_and_records_revision_thirty_fiv
         &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["identity"]["projection_revision"], 35u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 44u64);
 
     let mut cached =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");
