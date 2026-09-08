@@ -244,14 +244,17 @@ pub struct LayoutContext {
     /// Cross-lane edges whose bend belongs in the parent node's row. True
     /// forks use this orientation so an above-right branch forms the visual
     /// bottom-right corner before entering the anchor. Merge-only edges retain
-    /// child-side bends. Session→Git anchors use [`Self::session_git_spine_lanes`]
-    /// instead so many sessions based on one commit share one routed spine.
+    /// child-side bends. Shared session→Git anchors use
+    /// [`Self::session_git_spine_lanes`] instead so many sessions based on one
+    /// commit share one routed spine.
     pub parent_anchored_edges: HashSet<(String, String)>,
-    /// Session→Git edge → dedicated shared-spine lane.
+    /// Shared session→Git edge → dedicated shared-spine lane.
     ///
-    /// Every edge targeting the same Git commit uses the same lane. Spines for
-    /// different commits reuse a lane only when their row intervals are
-    /// disjoint. These are routing lanes, not synthetic nodes or relationships.
+    /// Two or more session edges targeting the same Git commit use one lane.
+    /// A lone session edge remains direct and does not gain an artificial
+    /// junction. Spines for different commits reuse a lane only when their row
+    /// intervals are disjoint. These are routing lanes, not synthetic nodes or
+    /// relationships.
     pub session_git_spine_lanes: HashMap<(String, String), usize>,
     /// Node key → connected-component id. Used to detect open chains that span
     /// across a query window so pass-through edges are still drawn.
@@ -365,15 +368,18 @@ struct GeometryContext<'a> {
 #[derive(Debug, Default)]
 struct SessionGitSpines {
     edge_lanes: HashMap<(String, String), usize>,
+    shared_parents: HashSet<String>,
     lane_count: usize,
 }
 
 /// Assign edge-only routing lanes to exact session→Git anchors.
 ///
-/// All sessions based on one commit share one spine. Different commit spines
-/// are interval-colored so a lane is reused only after its previous spine has
-/// ended; overlapping targets therefore never appear connected. Absolute
-/// spine lanes begin at one because Git owns lane zero.
+/// Two or more sessions based on one commit share one spine. A commit with one
+/// session child keeps a direct edge, avoiding a visually synthetic junction.
+/// Different shared commit spines are interval-colored so a lane is reused only
+/// after its previous spine has ended; overlapping targets therefore never
+/// appear connected. Absolute spine lanes begin at one because Git owns lane
+/// zero.
 fn compute_session_git_spines(
     nodes: &[String],
     row_of: &HashMap<String, usize>,
@@ -430,7 +436,11 @@ fn compute_session_git_spines(
 
     let mut lane_end_rows: Vec<usize> = Vec::new();
     let mut edge_lanes = HashMap::new();
+    let mut shared_parents = HashSet::new();
     for group in groups {
+        if group.children.len() < 2 {
+            continue;
+        }
         let slot = lane_end_rows
             .iter()
             .position(|end_row| *end_row < group.first_child_row)
@@ -441,6 +451,7 @@ fn compute_session_git_spines(
             lane_end_rows.push(group.parent_row);
         }
         let spine_lane = slot.saturating_add(1);
+        let _: bool = shared_parents.insert(group.parent.clone());
         for child in group.children {
             let _: Option<usize> = edge_lanes.insert((child, group.parent.clone()), spine_lane);
         }
@@ -448,6 +459,7 @@ fn compute_session_git_spines(
 
     SessionGitSpines {
         edge_lanes,
+        shared_parents,
         lane_count: lane_end_rows.len(),
     }
 }
@@ -570,8 +582,13 @@ impl LayoutContext {
         // (e.g. separate sessions) share columns instead of each claiming a
         // permanent fresh lane. `nodes` are newest-first, which is the display
         // order the reuse algorithm needs to detect non-overlapping intervals.
-        let lane_of =
-            compute_lane_map_reuse(nodes, parents_of, is_git, session_git_spines.lane_count);
+        let lane_of = compute_lane_map_reuse(
+            nodes,
+            parents_of,
+            is_git,
+            session_git_spines.lane_count,
+            &session_git_spines.shared_parents,
+        );
         // Per-row lanes in the given (possibly time-sorted) node order.
         let lanes: Vec<GraphRow> = nodes
             .iter()
@@ -594,9 +611,10 @@ impl LayoutContext {
             }
         }
         // A branch visually originates at its shared parent, so its cross-lane
-        // bend belongs in that parent's row. Session→Git edges are excluded:
-        // they use a shared base spine instead of keeping every child lane open
-        // all the way to the commit. Merge-only edges stay child-anchored so
+        // bend belongs in that parent's row. Shared session→Git edges are
+        // excluded: they use a shared base spine instead of keeping every child
+        // lane open all the way to the commit. A lone session branch remains a
+        // direct parent-anchored edge. Merge-only edges stay child-anchored so
         // multiple parents still fan out from the merge node rather than
         // appearing to fork later in history.
         let mut parent_anchored_edges: HashSet<(String, String)> = HashSet::new();
@@ -1475,6 +1493,7 @@ fn compute_lane_map_reuse(
     parents_of: &impl Fn(&str) -> Vec<String>,
     is_git: &impl Fn(&str) -> bool,
     session_git_spine_count: usize,
+    shared_session_git_parents: &HashSet<String>,
 ) -> HashMap<String, usize> {
     use std::collections::VecDeque;
 
@@ -1571,7 +1590,16 @@ fn compute_lane_map_reuse(
             // `compute_lane_map` never frees a lane, so sequential branches
             // inside one component would each keep a permanent column. Compact
             // only disjoint geometry; overlapping branches remain distinct.
-            compact_component_lanes(members, &domain_separated, parents_of, &row_of_key, is_git)
+            compact_component_lanes(
+                members,
+                &domain_separated,
+                parents_of,
+                is_git,
+                ComponentGeometry {
+                    row_of_key: &row_of_key,
+                    shared_session_git_parents,
+                },
+            )
         };
 
         // Git is globally remapped to lane 0. Rank only the operation lanes so
@@ -1595,8 +1623,11 @@ fn compute_lane_map_reuse(
                 operation_rank_by_lane: &rank_by_lane,
             },
             parents_of,
-            &row_of_key,
             is_git,
+            ComponentGeometry {
+                row_of_key: &row_of_key,
+                shared_session_git_parents,
+            },
         );
         operation_usage_by_component.push(operation_usage);
         op_lane_rank_by_component.push(rank_by_lane);
@@ -1683,6 +1714,12 @@ struct ComponentLocalLayout<'a> {
     operation_rank_by_lane: &'a HashMap<usize, usize>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ComponentGeometry<'a> {
+    row_of_key: &'a HashMap<String, usize>,
+    shared_session_git_parents: &'a HashSet<String>,
+}
+
 /// Describe the lanes and rows touched by one downward edge.
 fn edge_lane_usage(
     child_row: usize,
@@ -1752,15 +1789,15 @@ fn component_operation_lane_usage(
     members: &[String],
     local: ComponentLocalLayout<'_>,
     parents_of: &impl Fn(&str) -> Vec<String>,
-    row_of_key: &HashMap<String, usize>,
     is_git: &impl Fn(&str) -> bool,
+    geometry: ComponentGeometry<'_>,
 ) -> Vec<Vec<RowInterval>> {
     let mut usage: Vec<Vec<RowInterval>> = vec![Vec::new(); local.operation_rank_by_lane.len()];
     let op_offset = usize::from(members.iter().any(|key| is_git(key)));
     let child_counts = count_children(members, parents_of);
 
     for key in members {
-        let Some(child_row) = row_of_key.get(key).copied() else {
+        let Some(child_row) = geometry.row_of_key.get(key).copied() else {
             continue;
         };
         let child_lane = canonical_component_lane(key, local, is_git, op_offset);
@@ -1774,16 +1811,21 @@ fn component_operation_lane_usage(
         );
 
         for parent in parents_of(key) {
-            let Some(parent_row) = row_of_key.get(&parent).copied() else {
+            let Some(parent_row) = geometry.row_of_key.get(&parent).copied() else {
                 continue;
             };
             if parent_row <= child_row {
                 continue;
             }
-            // This edge is routed on a dedicated shared spine outside the
-            // operation-lane block. Only the child node itself occupies its
-            // operation lane, which was recorded above.
-            if !is_git(key) && is_git(&parent) {
+            // This shared edge is routed on a dedicated spine outside the
+            // operation-lane block. A lone session→Git edge remains direct and
+            // therefore contributes its ordinary lane usage below.
+            if !is_git(key)
+                && is_git(&parent)
+                && geometry
+                    .shared_session_git_parents
+                    .contains(parent.as_str())
+            {
                 continue;
             }
             let parent_lane = canonical_component_lane(&parent, local, is_git, op_offset);
@@ -2009,8 +2051,8 @@ fn compact_component_lanes(
     members: &[String],
     lane_of: &HashMap<String, usize>,
     parents_of: &impl Fn(&str) -> Vec<String>,
-    row_of_key: &HashMap<String, usize>,
     is_git: &impl Fn(&str) -> bool,
+    geometry: ComponentGeometry<'_>,
 ) -> HashMap<String, usize> {
     let mut child_counts: HashMap<String, usize> = HashMap::new();
     for key in members {
@@ -2033,21 +2075,26 @@ fn compact_component_lanes(
     // parent_row - 1).
     for key in members {
         let my_lane = *lane_of.get(key).unwrap_or(&0);
-        let Some(child_row) = row_of_key.get(key).copied() else {
+        let Some(child_row) = geometry.row_of_key.get(key).copied() else {
             continue;
         };
         lane_spans[my_lane] = fold_span(lane_spans[my_lane], child_row);
         for parent in parents_of(key) {
-            let Some(parent_row) = row_of_key.get(&parent).copied() else {
+            let Some(parent_row) = geometry.row_of_key.get(&parent).copied() else {
                 continue;
             };
             if parent_row <= child_row {
                 continue; // not a downward edge
             }
-            // Session→Git edges leave the operation block at the child row and
-            // run on their reserved shared spine. They therefore do not keep
-            // this source lane occupied through the Git target row.
-            if !is_git(key) && is_git(&parent) {
+            // Shared session→Git edges leave the operation block at the child
+            // row and run on their reserved spine. A lone edge remains direct
+            // and keeps its source lane occupied through the Git target row.
+            if !is_git(key)
+                && is_git(&parent)
+                && geometry
+                    .shared_session_git_parents
+                    .contains(parent.as_str())
+            {
                 continue;
             }
             let p_lane = *lane_of.get(&parent).unwrap_or(&my_lane);

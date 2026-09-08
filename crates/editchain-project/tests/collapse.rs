@@ -577,6 +577,109 @@ fn unparented_meta_after_turn_stays_standalone() {
 }
 
 #[test]
+fn session_title_bundles_into_its_git_anchored_session_meta_root() {
+    let options = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let mut session_meta = meta_import_op(1, 1);
+    if let OpKind::Import(import) = &mut session_meta.kind {
+        import.raw_ref = Payload::Inline(br#"{"type":"session_meta"}"#.to_vec());
+    }
+    let mut task_started = import_op(1, 2);
+    task_started.parents = ParentSet::One(session_meta.id);
+    let mut session_title = meta_import_op(2, 3);
+    session_title.parents = ParentSet::One(session_meta.id);
+    if let OpKind::Import(import) = &mut session_title.kind {
+        import.raw_ref = Payload::Inline(
+            br#"{"type":"session_title","provider":"codex","title":"r8"}"#.to_vec(),
+        );
+    }
+
+    let commit = git_commit(7, 0);
+    let based_on = Op {
+        id: OpId::new(NodeId(99), 0, 1),
+        parents: ParentSet::One(session_meta.id),
+        actor: ActorId(0),
+        clock: Clock::None,
+        scope: session_meta.scope,
+        tags: Tags::IMPORT | Tags::META,
+        kind: OpKind::GitLink(GitLink {
+            source: session_meta.id,
+            target_repo: commit.repository,
+            target_oid: commit.oid,
+            kind: GitLinkKind::BasedOn,
+        }),
+    };
+    let mut projection = HistoryProjection::from_ops_with(
+        vec![
+            session_meta.clone(),
+            task_started.clone(),
+            session_title.clone(),
+            based_on,
+        ],
+        options,
+    );
+    projection.merge_git_commits(vec![commit.clone()]);
+
+    let nodes = projection.nodes();
+    assert_eq!(nodes.len(), 3, "title metadata must not form a sibling row");
+    assert_eq!(
+        projection.visible_op_id(session_title.id),
+        Some(session_meta.id)
+    );
+    let meta_row = nodes
+        .iter()
+        .find(|node| node.node_key() == session_meta.id.to_string())
+        .expect("session metadata root");
+    assert_eq!(
+        meta_row
+            .sub_ops()
+            .iter()
+            .map(|op| op.id)
+            .collect::<Vec<_>>(),
+        vec![session_title.id]
+    );
+    assert_eq!(
+        projection.lifted_parent_keys(meta_row),
+        vec![commit.oid.to_hex()],
+        "the surviving metadata root keeps the exact Git anchor"
+    );
+    let activity_row = nodes
+        .iter()
+        .find(|node| node.node_key() == task_started.id.to_string())
+        .expect("first session activity");
+    assert_eq!(
+        projection.lifted_parent_keys(activity_row),
+        vec![session_meta.id.to_string()],
+        "the actual session remains the metadata root's sole visible child"
+    );
+    assert_eq!(projection.independent_chains(), 1);
+}
+
+#[test]
+fn metadata_root_does_not_absorb_child_from_another_session() {
+    let options = editchain_project::ProjectionOptions {
+        bundle_metadata: true,
+    };
+    let root = meta_import_op(1, 1);
+    let mut other_session = meta_import_op(2, 2);
+    other_session.parents = ParentSet::One(root.id);
+    other_session.scope = ScopeRef::Session(SessionId(11));
+
+    let projection =
+        HistoryProjection::from_ops_with(vec![root.clone(), other_session.clone()], options);
+    let nodes = projection.nodes();
+
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(projection.visible_op_id(root.id), Some(root.id));
+    assert_eq!(
+        projection.visible_op_id(other_session.id),
+        Some(other_session.id),
+        "an exact parent does not erase a distinct session boundary"
+    );
+}
+
+#[test]
 fn metadata_bundle_follows_provider_parent_across_structural_row() {
     let opts = editchain_project::ProjectionOptions {
         bundle_metadata: true,

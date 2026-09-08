@@ -142,6 +142,56 @@ pub fn resolve_commit_prefix(handle: &RepositoryHandle, prefix: &str) -> Option<
     resolve_commit(handle, &oid).ok()
 }
 
+/// Resolve the commit at the tip of a local branch at a historical wall time.
+///
+/// This is deliberately stricter than Git's `branch@{date}` revision syntax:
+/// the branch must still exist, its own reflog must cover `unix_ms`, every
+/// inspected reflog entry must decode, and the selected object must resolve as
+/// a commit. Reflog timestamps have one-second precision, so an update in the
+/// same second as `unix_ms` is rejected rather than ordered arbitrarily.
+///
+/// The result is suitable for recovering a durable object identity from local
+/// historical evidence. It is not portable source metadata: callers should
+/// persist the resulting full OID when they accept it.
+#[must_use]
+pub fn resolve_branch_tip_at_time(
+    handle: &RepositoryHandle,
+    branch: &str,
+    unix_ms: u64,
+) -> Option<CommitResolution> {
+    if branch.is_empty() || branch == "HEAD" {
+        return None;
+    }
+    let target_seconds = i64::try_from(unix_ms / 1_000).ok()?;
+    let reference_name = format!("refs/heads/{branch}");
+    let reference = handle.repo.find_reference(reference_name.as_str()).ok()?;
+    let mut platform = reference.log_iter();
+    let entries = platform.all().ok()??;
+    let mut first_entry_seconds = None;
+    let mut candidate = None;
+
+    for entry in entries {
+        let entry = entry.ok()?;
+        let entry_seconds = entry.signature.time().ok()?.seconds;
+        if first_entry_seconds.is_none() {
+            first_entry_seconds = Some(entry_seconds);
+        }
+        if entry_seconds == target_seconds {
+            return None;
+        }
+        if entry_seconds < target_seconds {
+            candidate = Some(entry.new_oid());
+        }
+    }
+
+    if first_entry_seconds? > target_seconds {
+        return None;
+    }
+    let candidate = candidate.filter(|oid| !oid.is_null())?;
+    let oid = git_oid_from_gix(&candidate);
+    resolve_commit(handle, &oid).ok()
+}
+
 /// Walk the commit history of a repository from HEAD, resolving each commit.
 ///
 /// Returns commits newest-first. `limit` bounds the number of commits walked

@@ -1102,6 +1102,24 @@ pub(crate) fn is_context_compaction_import(op: &Op) -> bool {
         .is_some_and(|value| value.get("type").and_then(Value::as_str) == Some("compacted"))
 }
 
+/// Whether an import is part of the explicit session-start boundary.
+///
+/// These records describe the session itself rather than work performed in a
+/// turn. Activity presentation therefore keeps them out of synthetic work
+/// groups while preserving them as ordinary canonical rows.
+#[must_use]
+pub(crate) fn is_session_start_boundary_import(op: &Op) -> bool {
+    raw_import_json(op).is_some_and(|value| {
+        value.get("type").and_then(Value::as_str) == Some("session_meta")
+            || (value.get("type").and_then(Value::as_str) == Some("event_msg")
+                && value
+                    .get("payload")
+                    .and_then(|payload| payload.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("task_started"))
+    })
+}
+
 /// The turn identity of a turn-scoped op, if any.
 #[must_use]
 const fn turn_id_of_scope(scope: ScopeRef) -> Option<TurnId> {

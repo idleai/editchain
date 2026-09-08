@@ -1501,8 +1501,10 @@ impl HistoryProjection {
     /// Provider occurrences with a resolved exact parent take that relationship
     /// in preference to source order. Occurrences without a provider parent use
     /// their stored operation parent as a conservative fallback. A metadata
-    /// chain contracts only when that path reaches one non-META collapsed import
-    /// row; every other shape remains visible.
+    /// chain contracts when that path reaches one non-META collapsed import
+    /// row. If it instead ends at an exact same-session metadata root, its
+    /// descendants coalesce into that root while the root itself remains visible
+    /// as the session boundary. Cycles and cross-session paths remain visible.
     /// Legacy Codex token-usage imports are classified from their exact raw
     /// schema because their immutable stored tags predate `META` classification.
     fn bundle_metadata_by_exact_parent(
@@ -1510,6 +1512,13 @@ impl HistoryProjection {
         representative: &mut HashMap<OpId, OpId>,
         relationship_notes: &HashMap<OpId, Vec<Op>>,
     ) {
+        #[derive(Clone, Copy)]
+        enum MetadataResolution {
+            Anchor(OpId),
+            Root(OpId),
+            Unresolved,
+        }
+
         let present: std::collections::HashSet<OpId> =
             result.iter().filter_map(HistoryNode::op_id).collect();
         let is_metadata = |op: &Op| {
@@ -1517,10 +1526,12 @@ impl HistoryProjection {
                 || meta::is_codex_token_usage_record_import(op)
                 || meta::is_legacy_claude_bundle_metadata_import(op)
         };
-        let metadata: std::collections::HashSet<OpId> = result
+        let metadata_scopes: HashMap<OpId, _> = result
             .iter()
             .filter_map(|node| match node {
-                HistoryNode::CollapsedImport { op, .. } if is_metadata(op) => Some(op.id),
+                HistoryNode::CollapsedImport { op, .. } if is_metadata(op) => {
+                    Some((op.id, op.scope))
+                }
                 HistoryNode::EditOperation { .. }
                 | HistoryNode::CollapsedImport { .. }
                 | HistoryNode::ExecuteBundle { .. }
@@ -1529,6 +1540,7 @@ impl HistoryProjection {
                 | HistoryNode::GitCommit(_) => None,
             })
             .collect();
+        let metadata: std::collections::HashSet<OpId> = metadata_scopes.keys().copied().collect();
         if metadata.is_empty() {
             return;
         }
@@ -1593,43 +1605,54 @@ impl HistoryProjection {
         }
 
         // Resolve metadata-to-metadata paths with memoized path compression.
-        // A missing endpoint or cycle resolves to `None`, preserving every row
-        // in that unresolved component instead of selecting a nearby anchor.
-        let mut destination: HashMap<OpId, Option<OpId>> = HashMap::new();
+        // A same-session path with no semantic destination retains its oldest
+        // metadata member as a visible root and folds only exact descendants
+        // into it. This is the session-start shape: both the first activity and
+        // the separately persisted session title can name `session_meta` as
+        // their parent without creating a false title branch. Cross-session
+        // paths and cycles remain uncontracted.
+        let mut resolution: HashMap<OpId, MetadataResolution> = HashMap::new();
         for start in &metadata {
-            if destination.contains_key(start) {
+            if resolution.contains_key(start) {
                 continue;
             }
             let mut path = Vec::new();
             let mut path_set = std::collections::HashSet::new();
             let mut current = *start;
             let resolved = loop {
-                if let Some(known) = destination.get(&current).copied() {
+                if let Some(known) = resolution.get(&current).copied() {
                     break known;
                 }
                 if !path_set.insert(current) {
-                    break None;
+                    break MetadataResolution::Unresolved;
                 }
                 path.push(current);
                 let Some(parent) = direct_parent.get(&current).copied() else {
-                    break None;
+                    break MetadataResolution::Root(current);
                 };
                 if anchors.contains(&parent) {
-                    break Some(parent);
+                    break MetadataResolution::Anchor(parent);
                 }
                 if !metadata.contains(&parent) {
-                    break None;
+                    break MetadataResolution::Root(current);
+                }
+                if metadata_scopes.get(&current) != metadata_scopes.get(&parent) {
+                    break MetadataResolution::Root(current);
                 }
                 current = parent;
             };
             for member in path {
-                let _: Option<Option<OpId>> = destination.insert(member, resolved);
+                let _: Option<MetadataResolution> = resolution.insert(member, resolved);
             }
         }
 
-        let destinations: HashMap<OpId, OpId> = destination
+        let destinations: HashMap<OpId, OpId> = resolution
             .into_iter()
-            .filter_map(|(metadata, anchor)| anchor.map(|anchor| (metadata, anchor)))
+            .filter_map(|(metadata, resolved)| match resolved {
+                MetadataResolution::Anchor(anchor) => Some((metadata, anchor)),
+                MetadataResolution::Root(root) if metadata != root => Some((metadata, root)),
+                MetadataResolution::Root(_) | MetadataResolution::Unresolved => None,
+            })
             .collect();
         if destinations.is_empty() {
             return;

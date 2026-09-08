@@ -48,6 +48,9 @@ impl Tags {
     /// The raw source record carried no usable timestamp (absent or unparseable).
     /// Distinct from `Clock::UnixMs(0)`, which we treat as confident "epoch".
     pub const SOURCE_TIME_UNKNOWN: Self = Self(1 << 15);
+    /// Relationship or metadata recovered from indirect, explicitly bounded
+    /// evidence rather than recorded directly by the source provider.
+    pub const INFERRED: Self = Self(1 << 16);
 
     /// Returns true if any of the given tags are set.
     #[must_use]
@@ -95,6 +98,7 @@ impl core::fmt::Display for Tags {
             (Self::STRUCTURAL, "structural"),
             (Self::DIAGNOSTIC, "diagnostic"),
             (Self::SOURCE_TIME_UNKNOWN, "source_time_unknown"),
+            (Self::INFERRED, "inferred"),
         ];
         for (tag, name) in &pairs {
             if self.matches_any(*tag) {

@@ -25,4 +25,5 @@ fn tag_display() {
     let s = format!("{t}");
     assert!(s.contains("agent"));
     assert!(s.contains("file"));
+    assert_eq!(format!("{}", Tags::INFERRED), "inferred");
 }

@@ -138,7 +138,12 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 ///
 /// Revision 42 preserves bounded command-output carriers and uses their stdout
 /// or formatted output as the completed command row's Content subtitle.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 42;
+///
+/// Revision 44 coalesces exact same-session metadata descendants into their
+/// retained session metadata root, keeps session-start records out of synthetic
+/// work groups, and routes a lone session-to-Git anchor directly instead of
+/// allocating an unnecessary shared-spine junction.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 44;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

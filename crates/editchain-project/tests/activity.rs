@@ -452,6 +452,62 @@ fn work_groups_contract_all_linear_activity_between_chat_rows() {
 }
 
 #[test]
+fn session_start_rows_remain_metadata_instead_of_becoming_a_work_group() {
+    let mut session_meta = import_op(45, 1, None, None);
+    session_meta.tags |= Tags::META;
+    if let OpKind::Import(import) = &mut session_meta.kind {
+        import.raw_ref = Payload::Inline(br#"{"type":"session_meta","payload":{}}"#.to_vec());
+    }
+    let mut task_started = import_op(45, 2, Some(session_meta.id), None);
+    if let OpKind::Import(import) = &mut task_started.kind {
+        import.raw_ref =
+            Payload::Inline(br#"{"type":"event_msg","payload":{"type":"task_started"}}"#.to_vec());
+    }
+    let mut session_title = import_op(46, 3, Some(session_meta.id), None);
+    session_title.tags |= Tags::META;
+    if let OpKind::Import(import) = &mut session_title.kind {
+        import.raw_ref = Payload::Inline(
+            br#"{"type":"session_title","provider":"codex","title":"r8"}"#.to_vec(),
+        );
+    }
+
+    let projection = HistoryProjection::from_ops_with(
+        vec![
+            session_meta.clone(),
+            task_started.clone(),
+            session_title.clone(),
+        ],
+        ProjectionOptions {
+            bundle_metadata: true,
+        },
+    );
+    let nodes = projection.filtered_nodes(&activity_filter());
+    let structural = projection.structural_row_keys(&nodes);
+    let grouped = bundle_activity_work_groups(nodes, &structural);
+
+    assert_eq!(grouped.len(), 2);
+    assert!(grouped
+        .iter()
+        .all(|node| !matches!(node, HistoryNode::WorkGroup { .. })));
+    assert!(grouped
+        .iter()
+        .any(|node| node.node_key() == task_started.id.to_string()));
+    let metadata_row = grouped
+        .iter()
+        .find(|node| node.node_key() == session_meta.id.to_string())
+        .expect("session metadata row");
+    assert_eq!(
+        metadata_row
+            .sub_ops()
+            .iter()
+            .map(|op| op.id)
+            .collect::<Vec<_>>(),
+        vec![session_title.id],
+        "the title remains folded into the standalone session boundary"
+    );
+}
+
+#[test]
 fn work_group_flattens_a_single_existing_bundle_into_direct_members() {
     let request_op = import_op(51, 1, None, None);
     let plan_old_op = import_op(52, 2, Some(request_op.id), None);

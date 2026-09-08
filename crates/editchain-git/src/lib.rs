@@ -23,7 +23,8 @@ pub use diff::{
 pub use discover::{discover_repositories, open_repository, RepositoryDiscovery, RepositoryHandle};
 pub use merge::{merge_commit_entities, MergeOutcome};
 pub use resolve::{
-    resolve_commit, resolve_commit_prefix, walk_history, CommitResolution, ResolutionError,
+    resolve_branch_tip_at_time, resolve_commit, resolve_commit_prefix, walk_history,
+    CommitResolution, ResolutionError,
 };
 
 use editchain_core::RepositoryId;

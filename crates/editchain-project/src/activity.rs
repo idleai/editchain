@@ -37,9 +37,10 @@
 //!   tool-name, or proximity matching participates.
 //! - **Conversational work grouping** ([`bundle_activity_work_groups`]): every
 //!   maximal linear span of non-chat activity contracts into one expandable
-//!   work summary. Existing execute/plan bundles remain nested members. Rows
-//!   incident to any fork, merge, subagent/reconnect, or produced-commit edge
-//!   are hard boundaries, so branching always remains outside a work group.
+//!   work summary. Existing execute/plan bundles remain nested members. Session
+//!   creation records and rows incident to any fork, merge,
+//!   subagent/reconnect, or produced-commit edge are hard boundaries, so
+//!   metadata headers and branching always remain outside a work group.
 //!
 //! Conservative guards keep evidence visible: runs never cross turn or group
 //! boundaries, are built from display-order contiguity only (never timestamps),
@@ -55,7 +56,7 @@ use editchain_core::{
 };
 
 use crate::meta::{
-    claude_assistant_message_id, is_context_compaction_import,
+    claude_assistant_message_id, is_context_compaction_import, is_session_start_boundary_import,
     sub_op_is_world_state_or_turn_context, NodeMeta,
 };
 use crate::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
@@ -831,11 +832,13 @@ pub fn bundle_activity_plan_repeats<S: std::hash::BuildHasher>(
 /// A work candidate is any non-Git row except a primary user/agent
 /// Conversation row. System/lifecycle records, plans, exploration, execution,
 /// changes, verification, and diagnostics therefore collapse together until a
-/// conversational boundary. Existing execute-run and plan-repeat bundles are
-/// retained when they share the work interval with other activities. When one
-/// is the interval's sole member, its original activities become the work
-/// group's direct children so the UI does not expose a redundant second
-/// disclosure level.
+/// conversational boundary. Explicit session-start metadata/lifecycle rows are
+/// boundaries too: they describe the session rather than work and must not turn
+/// into a synthetic `1 meta event · 1 other activity` group. Existing
+/// execute-run and plan-repeat bundles are retained when they share the work
+/// interval with other activities. When one is the interval's sole member, its
+/// original activities become the work group's direct children so the UI does
+/// not expose a redundant second disclosure level.
 ///
 /// Branching is forbidden inside a group. Explicit structural endpoints from
 /// `structural_keys` are excluded, and this pass independently protects every
@@ -869,6 +872,7 @@ pub fn bundle_activity_work_groups<S: std::hash::BuildHasher>(
         .map(|(node, key)| {
             node.git_oid().is_none()
                 && !is_user_or_agent_chat(node)
+                && !is_session_start_boundary(node)
                 && !branch_boundaries.contains(key)
                 && node_anchor_op(node).is_some()
         })
@@ -947,6 +951,17 @@ fn is_user_or_agent_chat(node: &HistoryNode) -> bool {
     node.activity_kind() == ActivityKind::Conversation
         && node.record_role() == RecordRole::Narrative
         && node.visibility() == Visibility::Primary
+}
+
+/// Session creation is presentation context, never turn work.
+#[must_use]
+fn is_session_start_boundary(node: &HistoryNode) -> bool {
+    node_anchor_op(node).is_some_and(|op| {
+        (op.tags.matches_any(Tags::META)
+            || (node.activity_kind() == ActivityKind::System
+                && node.record_role() == RecordRole::Lifecycle))
+            && is_session_start_boundary_import(op)
+    })
 }
 
 /// Per-node facts precomputed once for the run scan, so membership checks do
