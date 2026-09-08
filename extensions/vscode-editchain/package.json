@@ -20,6 +20,16 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "resourceLabelFormatters": [
+      {
+        "scheme": "editchain-hunk",
+        "formatting": {
+          "label": "${query.label}",
+          "separator": "/",
+          "stripPathStartingSeparator": true
+        }
+      }
+    ],
     "commands": [
       {
         "command": "editchain-history.open",

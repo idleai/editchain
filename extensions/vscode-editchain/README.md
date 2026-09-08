@@ -82,14 +82,18 @@ commit or a supported Claude/Codex edit activity to see its changed files in a
 column-aligned VS Code Source Control-style list: Activity remains `change`,
 Tags shows the colored `A`/`M`/`D`/`R`/`C` status (plus `recorded` when
 applicable), and Content shows the file name with its dimmed directory.
-Clicking a file row (or pressing Enter) opens VS Code's native diff editor. Git
+Clicking a file row (or pressing Enter) opens VS Code's native diff UI. Git
 diffs are exact immutable commit
 content against the commit's first parent. Agent diffs use the strongest
 evidence retained by the importer; a visible `recorded` label means the diff is
 a snippet, hunk, or reconstruction that may not be a complete sequential file
-snapshot. Older Codex chains that collapsed a multi-file event onto its first
-path are repaired at read time from the byte-exact raw `FileChange` evidence.
-Binary changes produce an explanatory warning instead of a text diff.
+snapshot. A lone unified-diff hunk stays in the ordinary diff editor, while
+disconnected hunks open in VS Code's Changes editor with every recorded region
+labeled and independently collapsible instead of being joined into a synthetic
+file. Older Codex chains that collapsed a multi-file
+event onto its first path are repaired at read time from the byte-exact raw
+`FileChange` evidence. Binary changes produce an explanatory warning instead of
+a text diff.
 
 Enter or double-click on an ordinary selected history row opens its explicit
 read-only raw JSON editor; file rows always use the native diff action.
@@ -159,7 +163,8 @@ shipped UI.
   panel instance (replayed exactly once after a recreated JS context). Ordinary
   row JSON and file-row diffs are separate, explicitly handled read-only host
   actions; diff content is revalidated and materialized by the native service
-  before the host invokes `vscode.diff` with virtual read-only documents.
+  before the host invokes `vscode.diff` for complete/single-region content or
+  `vscode.changes` for structured hunks, using virtual read-only documents.
 - **Rust history loader** (`media/rust-history/loader.js`): the ONLY bootstrap
   the production webview loads — a tiny static ES module (no eval, no inline
   code, no dynamic import strings). It initializes the generated wasm-bindgen

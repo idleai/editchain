@@ -582,6 +582,10 @@ fn legacy_codex_multi_file_record_recovers_every_path_from_raw_evidence() {
     assert_eq!(update.before, "old a");
     assert_eq!(update.after, "new a");
     assert!(update.partial);
+    assert_eq!(update.hunks.len(), 1);
+    assert_eq!(update.hunks[0].header, "@@ -1 +1 @@");
+    assert_eq!(update.hunks[0].before, "old a");
+    assert_eq!(update.hunks[0].after, "new a");
 
     let deletion = server
         .handle(&Request {

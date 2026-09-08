@@ -424,7 +424,19 @@ pub struct FileChangeDto {
     pub new_mode: Option<String>,
 }
 
-/// Materialized text shown by VS Code's native diff editor.
+/// One independently recorded hunk from a unified diff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDiffHunkDto {
+    /// Original unified-diff header, including source ranges and any section
+    /// heading.
+    pub header: String,
+    /// Recorded source-side lines for this hunk.
+    pub before: String,
+    /// Recorded destination-side lines for this hunk.
+    pub after: String,
+}
+
+/// Materialized text shown by VS Code's native diff editors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileDiffDto {
     /// Current/destination path.
@@ -441,10 +453,16 @@ pub struct FileDiffDto {
     /// files.
     #[serde(default)]
     pub partial: bool,
-    /// First-parent or recorded-before text. Empty for an exact addition.
+    /// Complete source text or a lone recorded hunk. Empty for an exact
+    /// addition or when `hunks` contains disconnected regions.
     pub before: String,
-    /// Commit-side or recorded-after text. Empty for an exact deletion.
+    /// Complete destination text or a lone recorded hunk. Empty for an exact
+    /// deletion or when `hunks` contains disconnected regions.
     pub after: String,
+    /// Disconnected unified-diff regions that VS Code should render as
+    /// independent entries in its changes editor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hunks: Vec<FileDiffHunkDto>,
     /// Optional fidelity/availability explanation for the editor title or UI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -1651,14 +1669,31 @@ mod tests {
             old_path: change.old_path,
             status: change.status,
             binary: false,
-            partial: false,
+            partial: true,
             before: "old\n".to_string(),
             after: "new\n".to_string(),
+            hunks: vec![FileDiffHunkDto {
+                header: "@@ -1 +1 @@".to_string(),
+                before: "old\n".to_string(),
+                after: "new\n".to_string(),
+            }],
             note: None,
         };
         let diff_json = serde_json::to_value(&diff).expect("serialize materialized diff");
         assert_eq!(diff_json["before"], "old\n");
         assert_eq!(diff_json["after"], "new\n");
+        assert_eq!(diff_json["hunks"][0]["header"], "@@ -1 +1 @@");
+        assert_eq!(diff_json["hunks"][0]["before"], "old\n");
+        assert_eq!(diff_json["hunks"][0]["after"], "new\n");
+
+        let legacy: FileDiffDto = serde_json::from_value(serde_json::json!({
+            "path": "src/lib.rs",
+            "status": "modified",
+            "before": "old",
+            "after": "new"
+        }))
+        .expect("deserialize diff without structured hunks");
+        assert!(legacy.hunks.is_empty());
     }
 
     #[test]

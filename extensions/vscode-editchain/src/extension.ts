@@ -56,6 +56,12 @@ let diffDocumentSerial = 0;
 // user explicitly retries or re-opens.
 const NON_OPEN_TIMEOUT_MS = 120_000;
 
+type RecordedDiffHunk = Readonly<{
+  header: string;
+  before: string;
+  after: string;
+}>;
+
 /**
  * Activate the EditChain History extension.
  *
@@ -81,7 +87,8 @@ export function activate(context: vscode.ExtensionContext): void {
   );
   const diffProvider = new DiffContentProvider();
   context.subscriptions.push(
-    vscode.workspace.registerTextDocumentContentProvider('editchain-diff', diffProvider)
+    vscode.workspace.registerTextDocumentContentProvider('editchain-diff', diffProvider),
+    vscode.workspace.registerTextDocumentContentProvider('editchain-hunk', diffProvider)
   );
 
   const openCommand = vscode.commands.registerCommand('editchain-history.open', () => {
@@ -531,26 +538,36 @@ async function openDiffEditor(
     if (typeof diff.before !== 'string' || typeof diff.after !== 'string') {
       throw new Error('service returned invalid diff content');
     }
+    const hunks = parseRecordedDiffHunks(diff.hunks);
 
     const serial = ++diffDocumentSerial;
     const currentPath = typeof diff.path === 'string' && diff.path ? diff.path : 'edit.txt';
-    const previousPath =
-      typeof diff.old_path === 'string' && diff.old_path ? diff.old_path : currentPath;
-    const beforeUri = diffDocumentUri(serial, 'before', previousPath);
-    const afterUri = diffDocumentUri(serial, 'after', currentPath);
-    diffProvider.setContent(beforeUri.toString(), diff.before);
-    diffProvider.setContent(afterUri.toString(), diff.after);
-
     const source = msg.change.source === 'git' ? 'Git' : 'agent';
-    const fidelity = diff.partial ? ', recorded evidence' : '';
-    const title = `${currentPath} (${source}${fidelity})`;
-    await vscode.commands.executeCommand(
-      'vscode.diff',
-      beforeUri,
-      afterUri,
-      title,
-      { preview: true }
-    );
+    if (hunks.length > 1) {
+      await openRecordedHunks(diffProvider, serial, currentPath, source, hunks);
+    } else {
+      const hunk = hunks[0];
+      const previousPath = hunk
+        ? currentPath
+        : typeof diff.old_path === 'string' && diff.old_path
+          ? diff.old_path
+          : currentPath;
+      const beforeUri = diffDocumentUri(serial, 'before', previousPath);
+      const afterUri = diffDocumentUri(serial, 'after', currentPath);
+      diffProvider.setContent(beforeUri.toString(), hunk?.before ?? diff.before);
+      diffProvider.setContent(afterUri.toString(), hunk?.after ?? diff.after);
+
+      const fidelity = diff.partial ? ', recorded evidence' : '';
+      const hunkRange = hunk ? `, ${compactHunkHeader(hunk.header)}` : '';
+      const title = `${currentPath} (${source}${fidelity}${hunkRange})`;
+      await vscode.commands.executeCommand(
+        'vscode.diff',
+        beforeUri,
+        afterUri,
+        title,
+        { preview: true }
+      );
+    }
     if (diff.partial && typeof diff.note === 'string' && diff.note) {
       output?.appendLine(`[diff] ${currentPath}: ${diff.note}`);
     }
@@ -559,14 +576,98 @@ async function openDiffEditor(
   }
 }
 
+/** Open disconnected recorded hunks without pretending they are one file. */
+async function openRecordedHunks(
+  diffProvider: DiffContentProvider,
+  serial: number,
+  filePath: string,
+  source: string,
+  hunks: readonly RecordedDiffHunk[]
+): Promise<void> {
+  const resources: [vscode.Uri, vscode.Uri, vscode.Uri][] = hunks.map((hunk, index) => {
+    const ordinal = index + 1;
+    const beforeUri = diffHunkDocumentUri(
+      serial,
+      'before',
+      filePath,
+      ordinal,
+      hunks.length,
+      hunk.header
+    );
+    const afterUri = diffHunkDocumentUri(
+      serial,
+      'after',
+      filePath,
+      ordinal,
+      hunks.length,
+      hunk.header
+    );
+    diffProvider.setContent(beforeUri.toString(), hunk.before);
+    diffProvider.setContent(afterUri.toString(), hunk.after);
+    return [afterUri, beforeUri, afterUri];
+  });
+  const noun = hunks.length === 1 ? 'recorded hunk' : `${hunks.length} recorded hunks`;
+  const title = `${filePath} (${source}, ${noun}; gaps unavailable)`;
+  await vscode.commands.executeCommand('vscode.changes', title, resources);
+}
+
+/** Validate the structured hunk envelope received from the native service. */
+function parseRecordedDiffHunks(value: unknown): RecordedDiffHunk[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error('service returned invalid diff hunks');
+  return value.map((item) => {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+      throw new Error('service returned invalid diff hunk');
+    }
+    const hunk = item as Record<string, unknown>;
+    if (
+      typeof hunk.header !== 'string' ||
+      typeof hunk.before !== 'string' ||
+      typeof hunk.after !== 'string'
+    ) {
+      throw new Error('service returned invalid diff hunk content');
+    }
+    return { header: hunk.header, before: hunk.before, after: hunk.after };
+  });
+}
+
 /** Unique read-only URI whose suffix preserves the file's language mode. */
-function diffDocumentUri(serial: number, side: 'before' | 'after', filePath: string): vscode.Uri {
+function diffDocumentUri(
+  serial: number,
+  side: 'before' | 'after',
+  filePath: string
+): vscode.Uri {
   const normalized = filePath.replace(/\\/g, '/').replace(/^\/+/, '');
   return vscode.Uri.from({
     scheme: 'editchain-diff',
     authority: `${serial}-${side}`,
     path: `/${normalized || 'edit.txt'}`,
   });
+}
+
+/** Hunk document URI whose formatter exposes the recorded source range. */
+function diffHunkDocumentUri(
+  serial: number,
+  side: 'before' | 'after',
+  filePath: string,
+  ordinal: number,
+  total: number,
+  header: string
+): vscode.Uri {
+  const normalized = filePath.replace(/\\/g, '/').replace(/^\/+/, '') || 'edit.txt';
+  const label = `recorded hunk ${ordinal} of ${total} · ${compactHunkHeader(header)}`;
+  return vscode.Uri.from({
+    scheme: 'editchain-hunk',
+    authority: `${serial}-hunk-${ordinal}-${side}`,
+    path: `/${normalized}`,
+    query: JSON.stringify({ label }),
+  });
+}
+
+/** Compact a patch header for use in native editor titles and resource labels. */
+function compactHunkHeader(header: string): string {
+  const compact = header.replace(/\s+/g, ' ').trim();
+  return compact.length > 96 ? `${compact.slice(0, 95)}…` : compact;
 }
 
 /**

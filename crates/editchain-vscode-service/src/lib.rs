@@ -38,11 +38,11 @@ use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole,
 use editchain_project::HistoryProjection;
 use editchain_protocol::{
     ChainFilterDto, ExpansionSpanDto, FileChangeDto, FileChangeSource, FileChangeStatus,
-    FileDiffDto, FindInHistoryMatch, FindInHistoryResponse, GraphLayout as ProtocolGraphLayout,
-    HistoryRow, HistoryWindow, LayoutEdge, LayoutPoint, LayoutRow, NodeDetails, ParentRelationDto,
-    ParentRelationKind, RepositoryInfo, Request, RequestBody, ResolvedObject, Response,
-    ResponseBody, SearchFiltersDto, SearchHit, SearchResponse, SessionMetaDto, SessionSummaryDto,
-    SubOpSummary, WorkUnitDto,
+    FileDiffDto, FileDiffHunkDto, FindInHistoryMatch, FindInHistoryResponse,
+    GraphLayout as ProtocolGraphLayout, HistoryRow, HistoryWindow, LayoutEdge, LayoutPoint,
+    LayoutRow, NodeDetails, ParentRelationDto, ParentRelationKind, RepositoryInfo, Request,
+    RequestBody, ResolvedObject, Response, ResponseBody, SearchFiltersDto, SearchHit,
+    SearchResponse, SessionMetaDto, SessionSummaryDto, SubOpSummary, WorkUnitDto,
 };
 use editchain_query::search::{ScoredChunk, SearchFilters, Source};
 
@@ -3182,6 +3182,7 @@ impl Workspace {
                 partial: false,
                 before: String::new(),
                 after: String::new(),
+                hunks: Vec::new(),
                 note: Some("Binary Git blobs cannot be opened as text.".to_string()),
             });
         }
@@ -3203,6 +3204,7 @@ impl Workspace {
             partial: false,
             before,
             after,
+            hunks: Vec::new(),
             note: None,
         })
     }
@@ -3355,6 +3357,7 @@ fn materialize_tool_diff(
         partial: true,
         before: content.before,
         after: content.after,
+        hunks: Vec::new(),
         note: Some(content.note),
     })
 }
@@ -3591,26 +3594,18 @@ fn materialize_codex_raw_file_diff(
                     partial: true,
                     before: String::new(),
                     after: String::new(),
+                    hunks: Vec::new(),
                     note: Some(
                         "Recorded Codex update evidence is binary and cannot be opened as text."
                             .to_string(),
                     ),
                 });
             }
-            let (before, after) = unified_diff_fragments(&diff);
-            Ok(FileDiffDto {
-                path: requested.path.clone(),
-                old_path: requested.old_path.clone(),
-                status: requested.status,
-                binary: false,
-                partial: true,
-                before,
-                after,
-                note: Some(
-                    "Recorded Codex unified-diff hunks; complete sequential file snapshots were not retained."
-                        .to_string(),
-                ),
-            })
+            Ok(recorded_unified_diff(
+                requested,
+                &diff,
+                "Recorded Codex unified-diff hunks; complete sequential file snapshots were not retained.",
+            ))
         }
     }
 }
@@ -3657,20 +3652,11 @@ fn materialize_file_op_diff(
                 .ok_or_else(|| "unified diff payload is unavailable".to_string())?;
             let diff = String::from_utf8(bytes)
                 .map_err(|error| format!("unified diff payload is not UTF-8: {error}"))?;
-            let (before, after) = unified_diff_fragments(&diff);
-            Ok(FileDiffDto {
-                path: requested.path.clone(),
-                old_path: requested.old_path.clone(),
-                status: requested.status,
-                binary: false,
-                partial: true,
-                before,
-                after,
-                note: Some(
-                    "Recorded unified-diff hunks; complete before/after file snapshots were not retained."
-                        .to_string(),
-                ),
-            })
+            Ok(recorded_unified_diff(
+                requested,
+                &diff,
+                "Recorded unified-diff hunks; complete before/after file snapshots were not retained.",
+            ))
         }
         editchain_core::op::FileEdit::Blob(blob) => {
             let after = workspace
@@ -3769,6 +3755,7 @@ fn file_diff_from_bytes(
             partial,
             before: String::new(),
             after: String::new(),
+            hunks: Vec::new(),
             note: Some("Retained file content is binary and cannot be opened as text.".to_string()),
         });
     }
@@ -3784,6 +3771,7 @@ fn file_diff_from_bytes(
         partial,
         before,
         after,
+        hunks: Vec::new(),
         note: note.map(str::to_string),
     })
 }
@@ -3793,25 +3781,45 @@ fn bytes_are_binary(bytes: &[u8]) -> bool {
     bytes.contains(&0) || std::str::from_utf8(bytes).is_err()
 }
 
-fn unified_diff_fragments(diff: &str) -> (String, String) {
-    const SEPARATOR: &str = "\n\n… next recorded hunk …\n\n";
-    let mut before_hunks = Vec::new();
-    let mut after_hunks = Vec::new();
+fn recorded_unified_diff(requested: &FileChangeDto, diff: &str, note: &str) -> FileDiffDto {
+    let hunks = unified_diff_hunks(diff);
+    let (before, after) = match hunks.as_slice() {
+        [hunk] => (hunk.before.clone(), hunk.after.clone()),
+        [] => (String::new(), diff.to_string()),
+        _ => (String::new(), String::new()),
+    };
+    FileDiffDto {
+        path: requested.path.clone(),
+        old_path: requested.old_path.clone(),
+        status: requested.status,
+        binary: false,
+        partial: true,
+        before,
+        after,
+        hunks,
+        note: Some(note.to_string()),
+    }
+}
+
+fn unified_diff_hunks(diff: &str) -> Vec<FileDiffHunkDto> {
+    let mut hunks = Vec::new();
+    let mut header = None;
     let mut before = Vec::new();
     let mut after = Vec::new();
-    let mut in_hunk = false;
     for line in diff.lines() {
         if line.starts_with("@@") {
-            if in_hunk {
-                before_hunks.push(before.join("\n"));
-                after_hunks.push(after.join("\n"));
+            if let Some(previous_header) = header.replace(line.to_string()) {
+                hunks.push(FileDiffHunkDto {
+                    header: previous_header,
+                    before: before.join("\n"),
+                    after: after.join("\n"),
+                });
                 before.clear();
                 after.clear();
             }
-            in_hunk = true;
             continue;
         }
-        if !in_hunk {
+        if header.is_none() {
             continue;
         }
         if let Some(context) = line.strip_prefix(' ') {
@@ -3823,14 +3831,14 @@ fn unified_diff_fragments(diff: &str) -> (String, String) {
             after.push(added);
         }
     }
-    if in_hunk {
-        before_hunks.push(before.join("\n"));
-        after_hunks.push(after.join("\n"));
+    if let Some(header) = header {
+        hunks.push(FileDiffHunkDto {
+            header,
+            before: before.join("\n"),
+            after: after.join("\n"),
+        });
     }
-    if before_hunks.is_empty() && after_hunks.is_empty() {
-        return (String::new(), diff.to_string());
-    }
-    (before_hunks.join(SEPARATOR), after_hunks.join(SEPARATOR))
+    hunks
 }
 
 /// Pregenerate the immutable fixed-view render snapshot used by the extension.
@@ -5666,6 +5674,34 @@ mod tests {
     fn store_blob(chain_dir: &Path, data: &[u8]) -> BlobRef {
         let mut blobs = FsBlobSink::new(chain_dir.join("blobs")).unwrap();
         blobs.put(data).unwrap()
+    }
+
+    #[test]
+    fn unified_diff_hunks_preserve_headers_and_disconnected_sides() {
+        let diff = concat!(
+            "diff --git a/src/lib.rs b/src/lib.rs\n",
+            "--- a/src/lib.rs\n",
+            "+++ b/src/lib.rs\n",
+            "@@ -1,3 +1,3 @@ fn first()\n",
+            " context one\n",
+            "-old one\n",
+            "+new one\n",
+            " context two\n",
+            "@@ -20 +21,2 @@ fn second()\n",
+            "-old two\n",
+            "+new two\n",
+            "+another line\n",
+        );
+
+        let hunks = unified_diff_hunks(diff);
+
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].header, "@@ -1,3 +1,3 @@ fn first()");
+        assert_eq!(hunks[0].before, "context one\nold one\ncontext two");
+        assert_eq!(hunks[0].after, "context one\nnew one\ncontext two");
+        assert_eq!(hunks[1].header, "@@ -20 +21,2 @@ fn second()");
+        assert_eq!(hunks[1].before, "old two");
+        assert_eq!(hunks[1].after, "new two\nanother line");
     }
 
     /// Wrap `kind` in a standalone operation envelope.
