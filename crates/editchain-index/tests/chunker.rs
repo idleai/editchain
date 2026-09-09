@@ -1,10 +1,5 @@
 #![doc = "Tests for the chunker module."]
 
-// Crate-level dependency markers (used by Cargo for feature resolution).
-use editchain_embed as _;
-use editchain_query as _;
-use half as _;
-use roaring as _;
 use tantivy as _;
 
 use editchain_core::*;

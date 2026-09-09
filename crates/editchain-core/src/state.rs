@@ -1,10 +1,5 @@
-#[cfg(not(feature = "use-std"))]
-use alloc::collections::{btree_map::Entry, BTreeMap};
-#[cfg(not(feature = "use-std"))]
-use alloc::vec::Vec;
 use core::cmp::Ordering;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "use-std")]
 use std::collections::{btree_map::Entry, BTreeMap};
 
 use crate::ids::{OpId, PathId};
@@ -289,7 +284,6 @@ impl core::fmt::Display for ReduceError {
     }
 }
 
-#[cfg(feature = "use-std")]
 impl std::error::Error for ReduceError {}
 
 /// A reducer processes operations and updates canonical state.

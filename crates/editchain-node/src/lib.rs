@@ -1,15 +1,9 @@
-//! Editchain node — segment files, CLI commands, JSON export, daemon.
+//! Editchain ingestion CLI and segment storage.
 
 /// CLI command implementations.
 pub mod commands;
-/// Daemon with append coordinator and projector bus.
-pub mod daemon;
-/// JSON export utilities.
-pub mod export;
 /// Segment file storage.
 pub mod segment;
-/// Service layer.
-pub mod services;
 
 use serde as _;
 

@@ -9,7 +9,6 @@
     reason = "Tests index into vectors whose length is asserted immediately before"
 )]
 // Crate-level dependency markers (used by Cargo for feature resolution).
-use regex as _;
 use serde as _;
 use serde_json as _;
 
@@ -363,18 +362,13 @@ fn codex_custom_exec_summary_uses_the_command_not_token_metadata() {
     let usage = legacy_token_usage_import_op(1, 3, call_import.id);
     let (result_import, result) = tool_result_pair(1, 4, 5, call_import.id, None);
     let result_id = result.id;
-    let projection = HistoryProjection::from_ops_with(
-        vec![
-            call_import.clone(),
-            call,
-            usage.clone(),
-            result_import,
-            result,
-        ],
-        editchain_project::ProjectionOptions {
-            bundle_metadata: true,
-        },
-    );
+    let projection = HistoryProjection::from_ops(vec![
+        call_import.clone(),
+        call,
+        usage.clone(),
+        result_import,
+        result,
+    ]);
     let nodes = projection.nodes();
 
     assert_eq!(nodes.len(), 1);
@@ -516,9 +510,6 @@ fn meta_imports_bundle_along_exact_parent_chain() {
     // A real turn (import + message child), then two causally parented META
     // imports, then another real turn. The META imports must bundle along their
     // exact parent path and not appear as their own nodes.
-    let options = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let turn1 = import_op(1, 1);
     let msg = message_op(1, 2, turn1.id, "hello world");
     let mut meta1 = meta_import_op(1, 3);
@@ -528,17 +519,14 @@ fn meta_imports_bundle_along_exact_parent_chain() {
     let turn2 = import_op(1, 5);
     let tool = tool_op(1, 6, turn2.id, "Bash");
 
-    let projection = HistoryProjection::from_ops_with(
-        vec![
-            turn1.clone(),
-            msg,
-            meta1.clone(),
-            meta2.clone(),
-            turn2.clone(),
-            tool,
-        ],
-        options,
-    );
+    let projection = HistoryProjection::from_ops(vec![
+        turn1.clone(),
+        msg,
+        meta1.clone(),
+        meta2.clone(),
+        turn2.clone(),
+        tool,
+    ]);
     let nodes = projection.nodes();
 
     // Two real turns only — the META imports are bundled, not separate nodes.
@@ -562,13 +550,10 @@ fn meta_imports_bundle_along_exact_parent_chain() {
 
 #[test]
 fn unparented_meta_after_turn_stays_standalone() {
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let turn = import_op(1, 1);
     let meta = meta_import_op(1, 2);
 
-    let projection = HistoryProjection::from_ops_with(vec![turn, meta.clone()], opts);
+    let projection = HistoryProjection::from_ops(vec![turn, meta.clone()]);
 
     assert!(projection
         .nodes()
@@ -578,9 +563,6 @@ fn unparented_meta_after_turn_stays_standalone() {
 
 #[test]
 fn session_title_bundles_into_its_git_anchored_session_meta_root() {
-    let options = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let mut session_meta = meta_import_op(1, 1);
     if let OpKind::Import(import) = &mut session_meta.kind {
         import.raw_ref = Payload::Inline(br#"{"type":"session_meta"}"#.to_vec());
@@ -610,15 +592,12 @@ fn session_title_bundles_into_its_git_anchored_session_meta_root() {
             kind: GitLinkKind::BasedOn,
         }),
     };
-    let mut projection = HistoryProjection::from_ops_with(
-        vec![
-            session_meta.clone(),
-            task_started.clone(),
-            session_title.clone(),
-            based_on,
-        ],
-        options,
-    );
+    let mut projection = HistoryProjection::from_ops(vec![
+        session_meta.clone(),
+        task_started.clone(),
+        session_title.clone(),
+        based_on,
+    ]);
     projection.merge_git_commits(vec![commit.clone()]);
 
     let nodes = projection.nodes();
@@ -658,16 +637,12 @@ fn session_title_bundles_into_its_git_anchored_session_meta_root() {
 
 #[test]
 fn metadata_root_does_not_absorb_child_from_another_session() {
-    let options = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let root = meta_import_op(1, 1);
     let mut other_session = meta_import_op(2, 2);
     other_session.parents = ParentSet::One(root.id);
     other_session.scope = ScopeRef::Session(SessionId(11));
 
-    let projection =
-        HistoryProjection::from_ops_with(vec![root.clone(), other_session.clone()], options);
+    let projection = HistoryProjection::from_ops(vec![root.clone(), other_session.clone()]);
     let nodes = projection.nodes();
 
     assert_eq!(nodes.len(), 2);
@@ -681,9 +656,6 @@ fn metadata_root_does_not_absorb_child_from_another_session() {
 
 #[test]
 fn metadata_bundle_follows_provider_parent_across_structural_row() {
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let turn = import_op(1, 1);
     let mut timing = meta_import_op(1, 3);
     timing.parents = ParentSet::One(turn.id);
@@ -734,7 +706,7 @@ fn metadata_bundle_follows_provider_parent_across_structural_row() {
     ];
     records.extend(facts);
 
-    let projection = HistoryProjection::from_ops_with(records, opts);
+    let projection = HistoryProjection::from_ops(records);
     let nodes = projection.nodes();
     assert_eq!(nodes.len(), 2);
     assert_eq!(nodes[0].node_key(), boundary.id.to_string());
@@ -774,9 +746,6 @@ fn metadata_bundle_follows_provider_parent_across_structural_row() {
 
 #[test]
 fn provider_occurrence_without_parent_keeps_physical_session_continuity() {
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let root = import_op(1, 1);
     let mut snapshot = meta_import_op(1, 2);
     snapshot.parents = ParentSet::One(root.id);
@@ -788,26 +757,23 @@ fn provider_occurrence_without_parent_keeps_physical_session_continuity() {
     let root_entity = OpId::new(NodeId(90), 4, 1);
     let caveat_entity = OpId::new(NodeId(90), 4, 2);
     let ide_entity = OpId::new(NodeId(90), 4, 3);
-    let projection = HistoryProjection::from_ops_with(
-        vec![
-            root.clone(),
-            snapshot.clone(),
-            caveat.clone(),
-            ide.clone(),
-            relation_fact(301, root.id, root_entity, NoteRelationship::OccurrenceOf),
-            relation_fact(
-                302,
-                caveat.id,
-                caveat_entity,
-                NoteRelationship::OccurrenceOf,
-            ),
-            // `caveat` intentionally has no ProviderParent, matching Claude's
-            // root-like local-command metadata envelope.
-            relation_fact(303, ide.id, ide_entity, NoteRelationship::OccurrenceOf),
-            relation_fact(304, ide.id, caveat_entity, NoteRelationship::ProviderParent),
-        ],
-        opts,
-    );
+    let projection = HistoryProjection::from_ops(vec![
+        root.clone(),
+        snapshot.clone(),
+        caveat.clone(),
+        ide.clone(),
+        relation_fact(301, root.id, root_entity, NoteRelationship::OccurrenceOf),
+        relation_fact(
+            302,
+            caveat.id,
+            caveat_entity,
+            NoteRelationship::OccurrenceOf,
+        ),
+        // `caveat` intentionally has no ProviderParent, matching Claude's
+        // root-like local-command metadata envelope.
+        relation_fact(303, ide.id, ide_entity, NoteRelationship::OccurrenceOf),
+        relation_fact(304, ide.id, caveat_entity, NoteRelationship::ProviderParent),
+    ]);
 
     let nodes = projection.nodes();
     assert_eq!(nodes.len(), 2);
@@ -1097,9 +1063,6 @@ fn meta_bundle_keeps_parents_unchanged() {
     // parent is the META op. q6 Phase-1 contract: bundling MUST NOT rewrite
     // stored parents/clocks — turn2 keeps pointing at the META op; chain
     // continuity is preserved through the representative map, not a parent splice.
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let turn1 = import_op(1, 1);
     let msg = message_op(1, 2, turn1.id, "hello world");
     let mut meta = meta_import_op(1, 3);
@@ -1108,10 +1071,8 @@ fn meta_bundle_keeps_parents_unchanged() {
     let mut turn2 = import_op(1, 4);
     turn2.parents = ParentSet::One(meta.id);
 
-    let projection = HistoryProjection::from_ops_with(
-        vec![turn1.clone(), msg, meta.clone(), turn2.clone()],
-        opts,
-    );
+    let projection =
+        HistoryProjection::from_ops(vec![turn1.clone(), msg, meta.clone(), turn2.clone()]);
     let nodes = projection.nodes();
 
     // Two real turns only (the META import is bundled into turn1).
@@ -1148,9 +1109,6 @@ fn meta_bundle_keeps_parents_unchanged() {
 
 #[test]
 fn produced_commit_link_branches_from_folded_source_without_rewriting_agent_chain() {
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let turn = import_op(1, 1);
     let msg = message_op(1, 2, turn.id, "hello world");
     let mut meta = meta_import_op(1, 3);
@@ -1172,16 +1130,13 @@ fn produced_commit_link_branches_from_folded_source_without_rewriting_agent_chai
             kind: GitLinkKind::ProducedBy,
         }),
     };
-    let mut projection = HistoryProjection::from_ops_with(
-        vec![
-            turn.clone(),
-            msg,
-            meta.clone(),
-            continuation.clone(),
-            link_record,
-        ],
-        opts,
-    );
+    let mut projection = HistoryProjection::from_ops(vec![
+        turn.clone(),
+        msg,
+        meta.clone(),
+        continuation.clone(),
+        link_record,
+    ]);
     projection.merge_git_commits(vec![commit.clone()]);
 
     let nodes = projection.nodes();
@@ -1238,14 +1193,11 @@ fn produced_commit_link_branches_from_folded_source_without_rewriting_agent_chai
 
 #[test]
 fn bundled_meta_based_on_link_is_inherited_by_visible_anchor() {
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let turn = import_op(1, 1);
     let msg = message_op(1, 2, turn.id, "hello world");
     let mut meta = meta_import_op(1, 3);
     meta.parents = ParentSet::One(turn.id);
-    let projection = HistoryProjection::from_ops_with(vec![turn.clone(), msg, meta.clone()], opts);
+    let projection = HistoryProjection::from_ops(vec![turn.clone(), msg, meta.clone()]);
     let node = projection
         .nodes()
         .into_iter()
@@ -1275,15 +1227,11 @@ fn bundled_meta_based_on_link_is_inherited_by_visible_anchor() {
 
 #[test]
 fn bundled_spawned_meta_does_not_leak_its_git_parent_onto_the_visible_anchor() {
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let turn = import_op(1, 1);
     let msg = message_op(1, 2, turn.id, "parent spawn tool");
     let mut child_meta = meta_import_op(2, 1);
     child_meta.parents = ParentSet::One(turn.id);
-    let projection =
-        HistoryProjection::from_ops_with(vec![turn.clone(), msg, child_meta.clone()], opts);
+    let projection = HistoryProjection::from_ops(vec![turn.clone(), msg, child_meta.clone()]);
     let node = projection
         .nodes()
         .into_iter()
@@ -1324,25 +1272,19 @@ fn bundled_spawned_meta_does_not_leak_its_git_parent_onto_the_visible_anchor() {
 
 #[test]
 fn bundled_structural_metadata_keeps_relation_on_first_visible_child() {
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let spawn = import_op(1, 1);
     let spawn_tool = tool_op(1, 2, spawn.id, "spawnAgent");
     let child_meta = meta_import_op(2, 1);
     let mut child_start = import_op(2, 2);
     child_start.parents = ParentSet::One(child_meta.id);
     let spawned_by = relation_fact(702, child_meta.id, spawn.id, NoteRelationship::SpawnedBy);
-    let projection = HistoryProjection::from_ops_with(
-        vec![
-            spawn.clone(),
-            spawn_tool,
-            child_meta.clone(),
-            child_start.clone(),
-            spawned_by,
-        ],
-        opts,
-    );
+    let projection = HistoryProjection::from_ops(vec![
+        spawn.clone(),
+        spawn_tool,
+        child_meta.clone(),
+        child_start.clone(),
+        spawned_by,
+    ]);
     let nodes = projection.nodes();
     assert_eq!(nodes.len(), 2, "session metadata remains bundled");
 
@@ -1384,9 +1326,6 @@ fn bundled_structural_metadata_keeps_relation_on_first_visible_child() {
 
 #[test]
 fn bundled_structural_metadata_does_not_guess_between_visible_children() {
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let spawn = import_op(1, 1);
     let child_meta = meta_import_op(2, 1);
     let mut first = import_op(2, 2);
@@ -1394,10 +1333,13 @@ fn bundled_structural_metadata_does_not_guess_between_visible_children() {
     let mut second = import_op(3, 2);
     second.parents = ParentSet::One(child_meta.id);
     let spawned_by = relation_fact(703, child_meta.id, spawn.id, NoteRelationship::SpawnedBy);
-    let projection = HistoryProjection::from_ops_with(
-        vec![spawn, child_meta, first.clone(), second.clone(), spawned_by],
-        opts,
-    );
+    let projection = HistoryProjection::from_ops(vec![
+        spawn,
+        child_meta,
+        first.clone(),
+        second.clone(),
+        spawned_by,
+    ]);
 
     for child in [first, second] {
         let row = projection
@@ -1934,9 +1876,6 @@ fn collapse_keeps_git_commits() {
 /// attach to chain A's anchor.
 #[test]
 fn no_cross_chain_meta_bundling() {
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     // Chain A: node 1, turn + META.
     let a_turn = import_op(1, 1);
     let a_msg = message_op(1, 2, a_turn.id, "hello");
@@ -1945,10 +1884,8 @@ fn no_cross_chain_meta_bundling() {
     // Chain B: node 2, only a META record (no real anchor in B).
     let b_meta = meta_import_op(2, 1);
 
-    let projection = HistoryProjection::from_ops_with(
-        vec![a_turn.clone(), a_msg, a_meta.clone(), b_meta.clone()],
-        opts,
-    );
+    let projection =
+        HistoryProjection::from_ops(vec![a_turn.clone(), a_msg, a_meta.clone(), b_meta.clone()]);
     let nodes = projection.nodes();
 
     // Chain A's META bundles under A's turn -> A contributes 1 node.
@@ -1987,9 +1924,6 @@ fn no_cross_chain_meta_bundling() {
 /// anchored by that op. Neither is silently dropped.
 #[test]
 fn metadata_after_standalone_not_dropped() {
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     // A standalone op (a message not tied to an import), then a META op.
     let standalone = Op {
         id: OpId::new(NodeId(1), 0, 1),
@@ -2005,7 +1939,7 @@ fn metadata_after_standalone_not_dropped() {
     };
     let meta = meta_import_op(1, 2);
 
-    let projection = HistoryProjection::from_ops_with(vec![standalone.clone(), meta.clone()], opts);
+    let projection = HistoryProjection::from_ops(vec![standalone.clone(), meta.clone()]);
     let nodes = projection.nodes();
 
     // The META record must survive (its occurrence is never dropped), rendered as
@@ -2026,35 +1960,6 @@ fn metadata_after_standalone_not_dropped() {
     );
 }
 
-/// q6 Phase-1 gate: options are per-projection, not global.
-///
-/// The same ops projected with bundling off and on produce different row sets,
-/// chosen purely by the option — no process-global state, so tests can run in
-/// any order without a mutex.
-#[test]
-fn bundle_options_are_per_projection() {
-    let turn1 = import_op(1, 1);
-    let msg = message_op(1, 2, turn1.id, "hi");
-    let mut meta = meta_import_op(1, 3);
-    meta.parents = ParentSet::One(turn1.id);
-    let ops = vec![turn1.clone(), msg, meta.clone()];
-
-    let opts_off = editchain_project::ProjectionOptions {
-        bundle_metadata: false,
-    };
-    let opts_on = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
-    let off = HistoryProjection::from_ops_with(ops.clone(), opts_off).nodes();
-    let on = HistoryProjection::from_ops_with(ops, opts_on).nodes();
-
-    // Off: turn + META both top-level.
-    assert!(off.iter().any(|n| n.node_key() == meta.id.to_string()));
-    // On: META bundled under turn -> only the turn node remains.
-    assert!(!on.iter().any(|n| n.node_key() == meta.id.to_string()));
-    assert_eq!(on.len(), 1);
-}
-
 /// q6 Phase-1 regression: a child whose PARENT is a bundled META op must stay
 /// connected to its source chain, NOT fragment into its own independent chain.
 ///
@@ -2066,9 +1971,6 @@ fn bundle_options_are_per_projection() {
 /// onto the anchor so the two real turns share one chain.
 #[test]
 fn child_parented_to_bundled_meta_stays_connected() {
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     // turn0 is the anchor; meta is bundled under it; turn1's parent is `meta`.
     let turn0 = import_op(1, 1);
     let msg0 = message_op(1, 2, turn0.id, "first");
@@ -2077,10 +1979,8 @@ fn child_parented_to_bundled_meta_stays_connected() {
     let mut turn1 = import_op(1, 5);
     turn1.parents = ParentSet::One(meta.id);
 
-    let projection = HistoryProjection::from_ops_with(
-        vec![turn0.clone(), msg0, meta.clone(), turn1.clone()],
-        opts,
-    );
+    let projection =
+        HistoryProjection::from_ops(vec![turn0.clone(), msg0, meta.clone(), turn1.clone()]);
     let nodes = projection.nodes();
 
     // The META op is bundled (not a top-level row) — exactly two real rows.
@@ -2115,9 +2015,6 @@ fn child_parented_to_bundled_meta_stays_connected() {
 
 #[test]
 fn legacy_untagged_token_usage_bundles_without_fragmenting_its_chain() {
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let turn0 = import_op(1, 1);
     let msg0 = message_op(1, 2, turn0.id, "first");
     let usage = legacy_token_usage_import_op(1, 3, turn0.id);
@@ -2126,10 +2023,13 @@ fn legacy_untagged_token_usage_bundles_without_fragmenting_its_chain() {
     turn1.parents = ParentSet::One(usage.id);
     let msg1 = message_op(1, 5, turn1.id, "second");
 
-    let projection = HistoryProjection::from_ops_with(
-        vec![turn0.clone(), msg0, usage.clone(), turn1.clone(), msg1],
-        opts,
-    );
+    let projection = HistoryProjection::from_ops(vec![
+        turn0.clone(),
+        msg0,
+        usage.clone(),
+        turn1.clone(),
+        msg1,
+    ]);
     let nodes = projection.nodes();
 
     assert_eq!(nodes.len(), 2, "usage accounting must not become a row");
@@ -2158,9 +2058,6 @@ fn legacy_untagged_token_usage_bundles_without_fragmenting_its_chain() {
 
 #[test]
 fn legacy_untagged_claude_transport_sidecars_bundle_exactly() {
-    let options = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let anchor = import_op(1, 1);
     let anchor_message = message_op(1, 2, anchor.id, "before");
     let mut previous = anchor.id;
@@ -2190,7 +2087,7 @@ fn legacy_untagged_claude_transport_sidecars_bundle_exactly() {
     input_ops.extend(metadata.iter().cloned());
     input_ops.extend([continuation.clone(), continuation_message]);
 
-    let projection = HistoryProjection::from_ops_with(input_ops, options);
+    let projection = HistoryProjection::from_ops(input_ops);
     let nodes = projection.nodes();
     assert_eq!(nodes.len(), 2);
     let anchor_row = nodes
@@ -2217,9 +2114,6 @@ fn legacy_untagged_claude_transport_sidecars_bundle_exactly() {
 
 #[test]
 fn malformed_token_usage_lookalike_stays_visible() {
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let anchor = import_op(1, 1);
     let mut lookalike = import_op(1, 2);
     lookalike.parents = ParentSet::One(anchor.id);
@@ -2229,7 +2123,7 @@ fn malformed_token_usage_lookalike_stays_visible() {
         );
     }
 
-    let projection = HistoryProjection::from_ops_with(vec![anchor, lookalike.clone()], opts);
+    let projection = HistoryProjection::from_ops(vec![anchor, lookalike.clone()]);
 
     assert!(projection
         .nodes()
@@ -2243,9 +2137,6 @@ fn malformed_token_usage_lookalike_stays_visible() {
 /// one connected chain, not fragment it per turn.
 #[test]
 fn long_linear_chain_with_meta_breaks_stays_one_chain() {
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let mut entries: Vec<Op> = Vec::new();
     let mut prev: Option<OpId> = None;
     // Sequence: t1 (real), m2 (meta), t3 (real), m4 (meta), t5 (real), m6 (meta),
@@ -2272,7 +2163,7 @@ fn long_linear_chain_with_meta_breaks_stays_one_chain() {
         prev = Some(id);
         entries.push(record);
     }
-    let projection = HistoryProjection::from_ops_with(entries, opts);
+    let projection = HistoryProjection::from_ops(entries);
     // Exactly the 4 real turns remain (3 meta bundled away).
     let nodes = projection.nodes();
     assert_eq!(nodes.len(), 4);
@@ -2294,9 +2185,6 @@ fn long_linear_chain_with_meta_breaks_stays_one_chain() {
 /// must be re-pointed to the call so the chain stays one chain.
 #[test]
 fn meta_under_tool_result_stays_connected_after_grouping() {
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let call_import = import_op(1, 1);
     let call = tool_op(1, 2, call_import.id, "Bash"); // Start call
                                                       // Tool-result row (Finish, empty name), parented to the call's raw import.
@@ -2314,17 +2202,14 @@ fn meta_under_tool_result_stays_connected_after_grouping() {
     let mut next_turn = import_op(1, 6);
     next_turn.parents = ParentSet::One(meta.id);
 
-    let projection = HistoryProjection::from_ops_with(
-        vec![
-            call_import.clone(),
-            call,
-            result_import.clone(),
-            result_tool,
-            meta.clone(),
-            next_turn.clone(),
-        ],
-        opts,
-    );
+    let projection = HistoryProjection::from_ops(vec![
+        call_import.clone(),
+        call,
+        result_import.clone(),
+        result_tool,
+        meta.clone(),
+        next_turn.clone(),
+    ]);
     let nodes = projection.nodes();
     // The tool-result row and the META are both folded away -> rows = call + turn.
     assert!(!nodes.iter().any(|n| n.node_key() == meta.id.to_string()));
@@ -2416,9 +2301,6 @@ fn file_row_summary_uses_annotated_path_note() {
 
 #[test]
 fn visible_op_id_resolves_folded_ops_to_their_rendered_row() {
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
     let turn = import_op(1, 1);
     let msg = message_op(1, 2, turn.id, "hello world");
     let mut meta = meta_import_op(1, 3);
@@ -2427,18 +2309,15 @@ fn visible_op_id_resolves_folded_ops_to_their_rendered_row() {
     let call_import = import_op(2, 4);
     let call_tool = tool_op(2, 5, call_import.id, "Bash");
     let (result_import, result_tool) = tool_result_pair(2, 6, 7, call_import.id, Some("success"));
-    let projection = HistoryProjection::from_ops_with(
-        vec![
-            turn.clone(),
-            msg.clone(),
-            meta.clone(),
-            call_import.clone(),
-            call_tool,
-            result_import.clone(),
-            result_tool,
-        ],
-        opts,
-    );
+    let projection = HistoryProjection::from_ops(vec![
+        turn.clone(),
+        msg.clone(),
+        meta.clone(),
+        call_import.clone(),
+        call_tool,
+        result_import.clone(),
+        result_tool,
+    ]);
 
     // Top-level rows resolve to themselves.
     assert_eq!(projection.visible_op_id(turn.id), Some(turn.id));

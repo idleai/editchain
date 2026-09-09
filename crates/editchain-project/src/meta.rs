@@ -188,7 +188,7 @@ pub struct NodeMeta {
     pub record_role: RecordRole,
     /// Provider-neutral activity kind.
     pub activity_kind: ActivityKind,
-    /// Render prominence (trace rows are hidden by `hide_trace` filtering).
+    /// Render prominence (trace rows are hidden from the Activity view).
     pub visibility: Visibility,
     /// Concluded outcome; `Unknown` unless structured evidence exists.
     pub outcome: Outcome,
@@ -309,7 +309,7 @@ pub(crate) fn for_collapsed_import(
 
     // Current Claude imports tag these exact transport/sidecar schemas META.
     // Older immutable rows predate that tag, so classify them equivalently in
-    // projection. Raw storage remains untouched and Raw view stays inspectable.
+    // projection. Raw storage remains untouched and details stay inspectable.
     if is_claude_bundle_metadata_value(&value) {
         return NodeMeta::trace(RecordRole::Lifecycle, ActivityKind::System)
             .with_turn_id(turn_id)

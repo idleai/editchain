@@ -1,18 +1,12 @@
-#![cfg_attr(not(feature = "use-std"), no_std)]
-#![doc = "Editchain core types — `no_std` CRDT schema, IDs, merge, and canonical reducers."]
+#![doc = "Editchain core types — CRDT schema, IDs, merge, and canonical reducers."]
 // Public API types are consumed by other workspace crates; not dead code.
 #![allow(
     dead_code,
     reason = "Public API types consumed by other workspace crates"
 )]
 
-#[cfg(not(feature = "use-std"))]
-extern crate alloc;
-
-// Referenced by sibling crates via serde Serialize/Deserialize derives.
-// Import unconditionally to satisfy unused-crate-dependencies lint.
+#[cfg(test)]
 use postcard as _;
-
 #[cfg(test)]
 use proptest as _;
 

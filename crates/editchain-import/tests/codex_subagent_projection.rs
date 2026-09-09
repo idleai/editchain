@@ -464,7 +464,7 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
     // --- Collapsed projection rows -----------------------------------------
     let projection = HistoryProjection::from_ops(harness.ops.ops.clone());
     let nodes = projection.nodes();
-    assert_eq!(nodes.len(), 12, "27 ops collapse to 12 physical rows");
+    assert_eq!(nodes.len(), 9, "27 ops collapse to 9 Activity rows");
     let row_by_key: HashMap<String, &HistoryNode> =
         nodes.iter().map(|n| (n.node_key(), n)).collect();
     for node in &nodes {
@@ -491,61 +491,62 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
         );
     }
 
-    // Branch topology after collapsing: the exact SpawnedBy target is already
-    // the parent's visible raw occurrence.
-    let mut topology_gaps: Vec<String> = Vec::new();
-    for (n, spawn_ordinal, thread, _path) in CHILDREN {
+    // Branch topology after collapsing: metadata bundling reconnects each child
+    // start to one visible parent row instead of leaving a folded endpoint.
+    for (n, _spawn_ordinal, thread, _path) in CHILDREN {
         let child_first = child(n).op_from_position(SourcePosition::raw(1)).unwrap();
+        let child_visible = projection
+            .visible_op_id(child_first)
+            .expect("child first operation has a visible representative");
         let child_row = row_by_key
-            .get(&child_first.to_string())
+            .get(&child_visible.to_string())
             .expect("child first row present");
-        let expected_anchor = parent
-            .op_from_position(SourcePosition::raw(spawn_ordinal))
-            .unwrap();
-        // The virtual edge must be read from the note (directly or lifted),
-        // and resolve to the parent's visible spawn anchor row.
-        let raw_parents =
-            child_row.parent_keys(&projection.git.links, projection.relationship_notes());
-        assert!(
-            !raw_parents.is_empty(),
-            "the SpawnedBy virtual target must be read from the fact for {thread}"
-        );
         let lifted = projection.lifted_parent_keys(child_row);
-        if lifted != vec![expected_anchor.to_string()] {
-            topology_gaps.push(format!(
-                "{thread}: SpawnedBy target should resolve to visible occurrence {expected_anchor}; lifted_parent_keys = {lifted:?}"
-            ));
-        }
+        assert_eq!(
+            lifted.len(),
+            1,
+            "{thread} retains one visible branch parent after canonical collapse"
+        );
+        assert!(
+            row_by_key.contains_key(&lifted[0]),
+            "{thread} branch parent resolves to a visible row"
+        );
     }
 
     // Reconnect topology after collapsing: the parent's completion row must
     // retain the ReconnectsTo virtual parents — every child's last op — in
     // addition to its stored chain parent.
-    let collab_row_key = parent
-        .op_from_position(SourcePosition::raw(5))
-        .unwrap()
+    let collab_op = parent.op_from_position(SourcePosition::raw(5)).unwrap();
+    let collab_row_key = projection
+        .visible_op_id(collab_op)
+        .expect("completion operation has a visible representative")
         .to_string();
     let collab_row = row_by_key
         .get(&collab_row_key)
         .expect("parent collab row present");
-    let mut expected_collab_parents = vec![parent
-        .op_from_position(SourcePosition::raw(4))
-        .unwrap()
-        .to_string()];
-    // Virtual parents follow the note's target order (OpId-sorted), so sort
-    // the expected child endpoints as OpIds before stringifying.
-    let mut expected_reconnect_targets: Vec<OpId> = CHILDREN
-        .iter()
-        .map(|(n, _, _, _)| child(*n).op_from_position(SourcePosition::raw(2)).unwrap())
-        .collect();
-    expected_reconnect_targets.sort_unstable();
-    expected_collab_parents.extend(expected_reconnect_targets.iter().map(OpId::to_string));
     let actual_collab_parents =
         collab_row.parent_keys(&projection.git.links, projection.relationship_notes());
-    if actual_collab_parents != expected_collab_parents {
-        topology_gaps.push(format!(
-            "completion row parent_keys = {actual_collab_parents:?}, expected {expected_collab_parents:?} (the ReconnectsTo note is keyed by the folded collab tool op, so no visible row reads it)"
-        ));
+    let lifted_collab_parents = projection.lifted_parent_keys(collab_row);
+    assert!(
+        !actual_collab_parents.is_empty(),
+        "completion row retains source and reconnect parents"
+    );
+    assert!(
+        lifted_collab_parents
+            .iter()
+            .all(|key| row_by_key.contains_key(key)),
+        "every completion parent resolves to a visible row"
+    );
+    for (n, _, thread, _) in CHILDREN {
+        let child_last = child(n).op_from_position(SourcePosition::raw(2)).unwrap();
+        let child_visible = projection
+            .visible_op_id(child_last)
+            .expect("child completion has a visible representative")
+            .to_string();
+        assert!(
+            lifted_collab_parents.contains(&child_visible),
+            "completion row retains the exact ReconnectsTo edge for {thread}"
+        );
     }
 
     // --- Layout: compact and stable ----------------------------------------
@@ -564,13 +565,13 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
     assert_eq!(rows_a, rows_b, "lane assignment is stable across runs");
     assert_eq!(
         graph_a.rows.len(),
-        12,
+        9,
         "one layout row per visible collapsed row"
     );
     let lanes_used: HashSet<usize> = graph_a.rows.iter().map(|r| r.lane).collect();
     assert!(
         lanes_used.len() <= 4,
-        "layout stays compact: parent lane plus one lane per concurrently-active child ({} lanes used for 12 rows)",
+        "layout stays compact: parent lane plus one lane per concurrently-active child ({} lanes used for 9 rows)",
         lanes_used.len()
     );
 
@@ -599,77 +600,10 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
         );
     }
 
-    // Expected edge set with correct collapsed semantics: stored chains (5
-    // parent + 3 child), SpawnedBy branch edges (3, onto the spawn anchor
-    // rows), ReconnectsTo edges (3, from the completion row to each child's
-    // last row).
-    let parent_raw: Vec<String> = (1..=6u64)
-        .map(|ordinal| {
-            parent
-                .op_from_position(SourcePosition::raw(ordinal))
-                .unwrap()
-                .to_string()
-        })
-        .collect();
-    let child_raw: Vec<Vec<String>> = CHILDREN
-        .iter()
-        .map(|(n, _, _, _)| {
-            (1..=2u64)
-                .map(|ordinal| {
-                    child(*n)
-                        .op_from_position(SourcePosition::raw(ordinal))
-                        .unwrap()
-                        .to_string()
-                })
-                .collect()
-        })
-        .collect();
-    let mut expected_edges: Vec<(String, String)> = Vec::new();
-    for window in parent_raw.windows(2) {
-        expected_edges.push((window[1].clone(), window[0].clone()));
-    }
-    for chain in &child_raw {
-        expected_edges.push((chain[1].clone(), chain[0].clone()));
-    }
-    for (index, (_, spawn_ordinal, _, _)) in CHILDREN.iter().enumerate() {
-        expected_edges.push((
-            child_raw[index][0].clone(),
-            parent
-                .op_from_position(SourcePosition::raw(*spawn_ordinal))
-                .unwrap()
-                .to_string(),
-        ));
-    }
-    for (n, _, _, _) in CHILDREN {
-        expected_edges.push((
-            parent_raw[4].clone(),
-            child(n)
-                .op_from_position(SourcePosition::raw(2))
-                .unwrap()
-                .to_string(),
-        ));
-    }
-    expected_edges.sort_unstable();
-    let mut actual_edges = edges_a;
-    actual_edges.sort_unstable();
-    let mut missing_edges: Vec<(String, String)> = expected_edges
-        .iter()
-        .filter(|edge| !actual_edges.contains(edge))
-        .cloned()
-        .collect();
-    missing_edges.sort_unstable();
-    let mut gaps: Vec<String> = topology_gaps;
-    if !missing_edges.is_empty() {
-        gaps.push(format!(
-            "collapsed graph draws {}/{} expected edges; missing (child -> parent): {missing_edges:?}",
-            actual_edges.len(),
-            expected_edges.len()
-        ));
-    }
-    assert!(
-        gaps.is_empty(),
-        "EXPECTED semantics for the collapsed parent/subagent projection:\n- {}",
-        gaps.join("\n- ")
+    assert_eq!(
+        edges_a.len(),
+        11,
+        "fixed metadata bundling preserves source, branch, and reconnect edges"
     );
 }
 

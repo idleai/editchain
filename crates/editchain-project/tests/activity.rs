@@ -10,7 +10,6 @@
 )]
 
 // Crate-level dependency markers (used by Cargo for feature resolution).
-use regex as _;
 use serde as _;
 use serde_json as _;
 
@@ -26,22 +25,9 @@ use editchain_project::activity::{
     bundle_activity_work_groups, bundle_claude_response_tool_fragments,
     inline_context_compaction_checkpoints, ActivityRowAnnotation,
 };
-use editchain_project::filter::ChainFilter;
 use editchain_project::meta::NodeMeta;
 use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
-use editchain_project::{EffectiveTime, HistoryNode, HistoryProjection, ProjectionOptions};
-
-/// The Activity view filter the service uses for its fixed default profile.
-fn activity_filter() -> ChainFilter {
-    ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        false,
-        true,
-        true,
-    )
-}
+use editchain_project::{EffectiveTime, HistoryNode, HistoryProjection};
 
 /// Raw JSONL for an import row with an optional structured tool/command status.
 fn raw_line(status: Option<&str>) -> String {
@@ -234,7 +220,7 @@ fn linear_chain(root_seq: u64, root_text: &str, rows: &[RowSpec]) -> Vec<Op> {
 /// Project ops and return the Activity-filtered node list + annotations.
 fn activity_view(ops: Vec<Op>) -> (Vec<HistoryNode>, Vec<ActivityRowAnnotation>) {
     let projection = HistoryProjection::from_ops(ops);
-    let nodes = projection.filtered_nodes(&activity_filter());
+    let nodes = projection.activity_nodes();
     let annotations = annotate_activity_rows(&nodes);
     (nodes, annotations)
 }
@@ -276,7 +262,7 @@ fn context_compaction_stays_visible_and_is_inlined_without_changing_raw() {
         "Raw keeps the imported sibling topology"
     );
 
-    let filtered = projection.filtered_nodes(&activity_filter());
+    let filtered = projection.activity_nodes();
     let structural = projection.structural_row_keys(&filtered);
     let activity = inline_context_compaction_checkpoints(filtered, &structural);
     assert_eq!(activity.len(), 3, "the checkpoint remains a visible row");
@@ -324,7 +310,7 @@ fn context_compaction_does_not_rewire_a_structural_continuation() {
         continuation.clone(),
         continuation_message,
     ]);
-    let filtered = projection.filtered_nodes(&activity_filter());
+    let filtered = projection.activity_nodes();
     let structural = HashSet::from([continuation.id.to_string()]);
     let activity = inline_context_compaction_checkpoints(filtered, &structural);
     let kept = activity
@@ -471,17 +457,12 @@ fn session_start_rows_remain_metadata_instead_of_becoming_a_work_group() {
         );
     }
 
-    let projection = HistoryProjection::from_ops_with(
-        vec![
-            session_meta.clone(),
-            task_started.clone(),
-            session_title.clone(),
-        ],
-        ProjectionOptions {
-            bundle_metadata: true,
-        },
-    );
-    let nodes = projection.filtered_nodes(&activity_filter());
+    let projection = HistoryProjection::from_ops(vec![
+        session_meta.clone(),
+        task_started.clone(),
+        session_title.clone(),
+    ]);
+    let nodes = projection.activity_nodes();
     let structural = projection.structural_row_keys(&nodes);
     let grouped = bundle_activity_work_groups(nodes, &structural);
 
@@ -1795,13 +1776,8 @@ fn world_state_subop_member_breaks_runs() {
         tool_child(402, 1030, a_stateful.id, "Bash", 1),
         meta.clone(),
     ];
-    let projection = HistoryProjection::from_ops_with(
-        ops,
-        ProjectionOptions {
-            bundle_metadata: true,
-        },
-    );
-    let nodes = projection.filtered_nodes(&activity_filter());
+    let projection = HistoryProjection::from_ops(ops);
+    let nodes = projection.activity_nodes();
     assert_eq!(nodes.len(), 3);
     let bundled = bundle(nodes);
     let stateful_row = bundled

@@ -58,9 +58,10 @@
     "package": "vsce package",
     "perf:service": "node scripts/service-perf.mjs",
     "ui:vscode": "xvfb-run -a npx wdio run ./test/vscode/wdio.conf.ts",
-    "ui:vscode:gpu": "xvfb-run -a npx wdio run ./test/vscode/wdio.gpu.conf.ts",
+    "ui:vscode:renderer": "xvfb-run -a npx wdio run ./test/vscode/wdio.renderer.conf.ts",
     "ui:vscode:visual": "xvfb-run -a npx wdio run ./test/vscode/wdio.visual.conf.ts",
-    "build:gpu": "bash scripts/build-gpu-preview.sh",
+    "build:renderer": "bash scripts/build-history-renderer.sh",
+    "build:gpu": "npm run build:renderer",
     "test:harness": "node --test test/harness/*.test.js",
     "test:rust-smoke": "node --test --test-reporter=tap test/harness/rustSmoke.test.js"
   },
@@ -75,5 +76,10 @@
     "tsx": "^4.23.12",
     "typescript": "^5.4.0",
     "wdio-vscode-service": "^8.0.0"
+  },
+  "overrides": {
+    "@vscode/vsce": {
+      "cheerio": "1.0.0"
+    }
   }
 }

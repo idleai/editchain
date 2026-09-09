@@ -8,13 +8,8 @@
      (the harness server has no favicon route and the 404 would surface as a
      console error in the smoke suite). -->
 <link rel="icon" href="data:,">
-<!-- Same production stylesheet the VS Code webview uses (media/main.css) plus
-     the shared renderer scaffold sheet (media/gpu-preview/gpu-preview.css).
-     The Rust DOM shell (crates/editchain-gpu-preview) renders into the same
-     production scaffold; gpu-preview.css keeps the obsolete
-     #gpu-canvas-host and test-only row mirror inert. -->
+<!-- Same production stylesheet the VS Code webview uses. -->
 <link rel="stylesheet" href="../../media/main.css">
-<link rel="stylesheet" href="../../media/gpu-preview/gpu-preview.css">
 <style>
   /* Harness-only chrome: a status bar so the agent can see scenario/state.
      This is NOT part of the production webview. */
@@ -38,18 +33,14 @@
 <!--
   Rust-only harness contract (consumed by media/rust-history/loader.js):
 
-    ?backend=svg|webgl|webgpu -> retained scaffold hint only; the Rust shell
-    always pins the per-row SVG backend when it boots.
-
   The loader initializes the generated wasm-bindgen module
-  (media/rust-history/pkg/editchain_gpu_preview.js + _bg.wasm) and calls the
+  (media/rust-history/pkg/editchain_history_renderer.js + _bg.wasm) and calls the
   Rust shell's startHistoryView(). The shell acquires window.acquireVsCodeApi()
   (supplied by fixtureBridge.js), installs its host-message listener before
   posting webviewReady, renders real .row[data-row][data-key] DOM nodes with
   grid ARIA into #rows, draws every hydrated row's graph as an aria-hidden
-  svg.graph-row-fragment inside its .graph-cell (zero canvas anywhere — the
-  inert #gpu-canvas-host stays empty), and mirrors row markers into #gpu-rows.
-  The loader exposes a read-only window.__editchainGpuDebug facade (loader:
+  svg.graph-row-fragment inside its .graph-cell.
+  The loader exposes a read-only window.__editchainRendererDebug facade (loader:
   'rust-history', dataReady, lastError, backend, snapshot, metrics, whenIdle,
   laneXAll, findState, ...) and marks body[data-rust-wasm] = "started" |
   "error" plus window.__editchainRustLoader.
@@ -59,7 +50,7 @@
   legacy JS bootstraps (media/main.js, media/gpu-preview/bootstrap.js) are not
   part of this path.
 -->
-<body data-treatment="pulse" data-gpu-backend="webgl">
+<body data-treatment="pulse">
 <!-- Production controls, byte-for-byte the primary webview's scaffold. -->
 <div id="controls" role="group" aria-label="History controls">
 <label class="visually-hidden" for="search">Search history</label>
@@ -70,21 +61,11 @@
 <button type="button" id="search-next" class="search-nav" title="Next match (Enter)" aria-label="Next match" hidden disabled><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 13.06 1.44 6.56 2.5 5.5 8 10.94l5.5-5.44 1.06 1.06z"/></svg></button>
 </div>
 </div>
-<!-- Production single-pane surface. #gpu-canvas-host is the obsolete fixed
-     canvas host: permanently inert (no canvas is ever created — the active
-     graph is each row's aria-hidden svg.graph-row-fragment). -->
+<!-- Production single-pane surface. -->
 <div id="layout">
 <div id="rows"></div>
-<div id="gpu-canvas-host" aria-hidden="true" inert></div>
 </div>
 <div id="status-live" class="visually-hidden" role="status" aria-live="polite"></div>
-<!-- Hidden row mirror: the Rust shell writes one [data-row][data-key] marker
-     per rendered frame row so harness/e2e runners can assert rendered DOM
-     without touching the visible rows in #rows. -->
-<div id="gpu-scroll">
-<div id="gpu-rows" role="table" aria-label="Rust/WASM history renderer" aria-hidden="true"></div>
-</div>
-<div id="gpu-live" class="visually-hidden" role="status" aria-live="polite"></div>
 
 <!-- Theme tokens the VS Code webview normally gets from the workbench. -->
 <script>
@@ -115,22 +96,10 @@
   })();
 </script>
 
-<!-- Apply the ?backend= query override BEFORE the loader module runs (module
-     scripts execute after parsing; the Rust shell also honours the query
-     parameter itself). -->
-<script>
-  (function () {
-    var backend = new URLSearchParams(location.search).get('backend');
-    if (backend === 'svg' || backend === 'webgl' || backend === 'webgpu') {
-      document.body.setAttribute('data-gpu-backend', backend);
-    }
-  })();
-</script>
-
 <!-- Harness scaffolding: deterministic protocol fixtures + fixture bridge
      providing the VS Code API shims (window.vscode / window.acquireVsCodeApi /
-     __editchainSetScenario / __editchainStart) and dispatching
-     GetWindow/GetLayout/Open against the selected scenario. -->
+     __editchainSetScenario / __editchainStart) and dispatching GetWindow and
+     FindInHistory against the selected scenario. -->
 <script src="./fixtures.js"></script>
 <script src="./fixtureBridge.js"></script>
 

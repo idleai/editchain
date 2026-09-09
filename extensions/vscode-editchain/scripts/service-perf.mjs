@@ -134,17 +134,6 @@ async function main() {
   if (!fs.existsSync(binary)) throw new Error('service binary not found: ' + binary);
   const svc = client(binary, args.timeoutMs);
   const phases = {};
-  const filter = {
-    summary_pattern: '',
-    kind_pattern: '',
-    include_kind_pattern: '',
-    hide_undated: false,
-    // Mirror the production webview's fixed Activity profile so this probe
-    // measures the pregenerated render-snapshot path instead of Raw mode.
-    hide_trace: true,
-    splice: true,
-  };
-
   const measure = async (name, body) => {
     const result = await svc.request(body);
     const value = okValue(result, name);
@@ -167,8 +156,6 @@ async function main() {
     const windowBase = {
       offset: 0,
       limit: args.limit,
-      hide_submodules: true,
-      filter,
     };
     const provisional = await measure('first_rows', {
       GetWindow: { ...windowBase, include_layout: false },

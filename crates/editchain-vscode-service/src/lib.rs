@@ -4,18 +4,18 @@
 //! git resolver, and unified search, and writes framed responses to stdout.
 
 #[cfg(test)]
+use editchain_import as _;
+#[cfg(test)]
 use tempfile as _;
 
 mod snapshot;
 
 pub use snapshot::RenderSnapshotReport;
 
-// Crate-level dependency markers (used by Cargo for feature resolution).
-use editchain_import as _;
-use editchain_query as _;
 use serde as _;
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -27,24 +27,20 @@ use editchain_core::{
     Payload, RepositoryId, ScopeRef, SessionId, Tags,
 };
 use editchain_git::{
-    commit_file_changes, discover_repositories, resolve_blob as resolve_git_blob, resolve_commit,
-    resolve_path_at_commit, walk_history, GitFileChange, GitFileStatus, RepositoryHandle,
+    commit_file_changes, discover_repositories, open_repository, resolve_blob as resolve_git_blob,
+    resolve_commit, resolve_path_at_commit, walk_history, GitFileChange, GitFileStatus,
+    RepositoryHandle,
 };
-use editchain_import::{hash_raw, FsBlobSink};
-use editchain_index::LexicalIndex;
+use editchain_index::{LexicalHit, LexicalIndex, LexicalSource};
 use editchain_project::activity::{ActivityRowAnnotation, SessionSummaryMarker, WorkUnitMarker};
-use editchain_project::filter::ChainFilter;
 use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
 use editchain_protocol::{
-    ChainFilterDto, ExpansionSpanDto, FileChangeDto, FileChangeSource, FileChangeStatus,
-    FileDiffDto, FileDiffHunkDto, FindInHistoryMatch, FindInHistoryResponse,
-    GraphLayout as ProtocolGraphLayout, HistoryRow, HistoryWindow, LayoutEdge, LayoutPoint,
-    LayoutRow, NodeDetails, ParentRelationDto, ParentRelationKind, RepositoryInfo, Request,
-    RequestBody, ResolvedObject, Response, ResponseBody, SearchFiltersDto, SearchHit,
-    SearchResponse, SessionMetaDto, SessionSummaryDto, SubOpSummary, WorkUnitDto,
+    ExpansionSpanDto, FileChangeDto, FileChangeSource, FileChangeStatus, FileDiffDto,
+    FileDiffHunkDto, FindInHistoryMatch, FindInHistoryResponse, HistoryRow, HistoryWindow,
+    NodeDetails, ParentRelationDto, ParentRelationKind, Request, RequestBody, ResolvedObject,
+    Response, ResponseBody, SessionMetaDto, SessionSummaryDto, SubOpSummary, WorkUnitDto,
 };
-use editchain_query::search::{ScoredChunk, SearchFilters, Source};
 
 use snapshot::{RenderSnapshot, SnapshotBuilder, SnapshotIdentity, SnapshotManifestData};
 
@@ -86,35 +82,22 @@ pub struct Workspace {
     snapshot: Option<RenderSnapshot>,
     /// Whether `projection`/`source_ops` contain the authoritative live model.
     projection_loaded: bool,
-    /// The single currently cached filtered snapshot, keyed by
-    /// `(hide_submodules, filter)`.
-    ///
-    /// The extension keeps one active view at a time, so the cache holds a
-    /// single O(V) snapshot: window and layout paging reuse it for the same
-    /// filter key, and switching filters rebuilds it in place. Arbitrary
-    /// regex/filter churn therefore never accumulates unbounded snapshots.
-    current_view: Option<(ViewKey, ViewSnapshot)>,
+    /// The fixed Activity-view snapshot shared by window and find requests.
+    current_view: Option<ViewSnapshot>,
 }
-
-/// Cache key for one filtered history snapshot.
-type ViewKey = (bool, editchain_project::filter::ChainFilterKey);
 
 /// Parameters for one history-window read.
 #[derive(Debug, Clone, Copy)]
-pub struct HistoryWindowOptions<'a> {
+pub struct HistoryWindowOptions {
     /// Expanded-row offset (zero is newest).
     pub offset: u64,
     /// Maximum expanded rows to return.
     pub limit: u64,
-    /// Exclude rows from nested repositories.
-    pub hide_submodules: bool,
-    /// Active graph/content filter.
-    pub filter: &'a ChainFilter,
     /// Compute and attach global lane geometry before returning.
     pub include_layout: bool,
 }
 
-/// Immutable per-filter projection consumed by both history and layout paging.
+/// Immutable fixed Activity projection consumed by history and layout paging.
 #[derive(Debug)]
 struct ViewSnapshot {
     /// Canonical top-level rows in display order.
@@ -308,15 +291,15 @@ pub enum BlobResolution {
 
 /// Read-only resolver over a chain's durable blob store.
 ///
-/// Lookup and filename derivation are delegated to [`FsBlobSink`] so the
-/// `<chain>/blobs/<lowercase blake3 hex>` naming convention stays in exactly
-/// one place. Full resolution validates declared length and BLAKE3; bounded
-/// row previews validate file length and defer full hashing until content is
-/// explicitly requested.
+/// Blob files use the importer's durable
+/// `<chain>/blobs/<lowercase blake3 hex>` format. Full resolution validates
+/// declared length and BLAKE3; bounded row previews validate file length and
+/// defer full hashing until content is explicitly requested.
 #[derive(Debug, Clone)]
 pub struct BlobResolver {
-    /// The durable store; `None` when the chain has no `blobs/` directory.
-    sink: Option<FsBlobSink>,
+    /// The durable store directory; `None` when the chain has no `blobs/`
+    /// directory.
+    dir: Option<PathBuf>,
 }
 
 impl BlobResolver {
@@ -326,9 +309,32 @@ impl BlobResolver {
     ///
     /// Returns an IO error if `chain_dir/blobs` exists but cannot be read.
     pub fn open(chain_dir: &Path) -> io::Result<Self> {
-        Ok(Self {
-            sink: FsBlobSink::open_read_only(chain_dir.join("blobs"))?,
-        })
+        let dir = chain_dir.join("blobs");
+        match fs::metadata(&dir) {
+            Ok(metadata) if metadata.is_dir() => Ok(Self { dir: Some(dir) }),
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("blob path is not a directory: {}", dir.display()),
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self { dir: None }),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn path_for(&self, hash: &[u8; 32]) -> Option<PathBuf> {
+        let filename = hex_string(hash).ok()?;
+        self.dir.as_ref().map(|dir| dir.join(filename))
+    }
+
+    fn get(&self, hash: &[u8; 32]) -> io::Result<Option<Vec<u8>>> {
+        let Some(path) = self.path_for(hash) else {
+            return Ok(None);
+        };
+        match fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Resolve a blob reference, validating declared length and hash.
@@ -340,14 +346,10 @@ impl BlobResolver {
         let Some(hash) = addressable_hash(blob.id) else {
             return BlobResolution::Unresolvable;
         };
-        match self
-            .sink
-            .as_ref()
-            .and_then(|sink| sink.get(&hash).transpose())
-        {
-            Some(Ok(bytes)) if blob_matches(&bytes, blob, hash) => BlobResolution::Found(bytes),
-            Some(Ok(_) | Err(_)) => BlobResolution::Corrupt,
-            None => BlobResolution::Missing,
+        match self.get(&hash) {
+            Ok(Some(bytes)) if blob_matches(&bytes, blob, hash) => BlobResolution::Found(bytes),
+            Ok(Some(_)) | Err(_) => BlobResolution::Corrupt,
+            Ok(None) => BlobResolution::Missing,
         }
     }
 
@@ -356,7 +358,7 @@ impl BlobResolver {
     #[must_use]
     fn resolve_content(&self, id: ContentId) -> Option<Vec<u8>> {
         let hash = addressable_hash(id)?;
-        let bytes = self.sink.as_ref()?.get(&hash).ok().flatten()?;
+        let bytes = self.get(&hash).ok().flatten()?;
         (hash_raw(&bytes) == hash).then_some(bytes)
     }
 
@@ -371,10 +373,9 @@ impl BlobResolver {
         let Some(hash) = addressable_hash(blob.id) else {
             return BlobPreviewResolution::Unresolvable;
         };
-        let Some(sink) = self.sink.as_ref() else {
+        let Some(path) = self.path_for(&hash) else {
             return BlobPreviewResolution::Missing;
         };
-        let path = sink.path_for(&hash);
         let Ok(metadata) = fs::metadata(&path) else {
             return if path.exists() {
                 BlobPreviewResolution::Corrupt
@@ -412,7 +413,7 @@ enum BlobPreviewResolution {
 
 /// The full BLAKE3 hash the durable store can address, if the id uses one.
 ///
-/// `FsBlobSink` keys files by the full 256-bit BLAKE3 hash, so truncated
+/// Blob files are keyed by the full 256-bit BLAKE3 hash, so truncated
 /// `Hash128` and node-local ids cannot be looked up and count as unresolved.
 #[must_use]
 fn addressable_hash(id: ContentId) -> Option<[u8; 32]> {
@@ -429,6 +430,19 @@ fn blob_matches(bytes: &[u8], blob: &BlobRef, hash: [u8; 32]) -> bool {
         Ok(declared) => declared == bytes.len() && hash_raw(bytes) == hash,
         Err(_) => false,
     }
+}
+
+#[must_use]
+fn hash_raw(data: &[u8]) -> [u8; 32] {
+    blake3::hash(data).into()
+}
+
+fn hex_string(bytes: &[u8]) -> Result<String, std::fmt::Error> {
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        write!(&mut output, "{byte:02x}")?;
+    }
+    Ok(output)
 }
 
 /// Hydrate every blob payload across a chain's decoded ops in place.
@@ -1980,7 +1994,7 @@ fn git_file_change_index(
 ) -> HashMap<(RepositoryId, GitOid), Vec<FileChangeDto>> {
     let mut index = HashMap::new();
     for discovery in repositories {
-        let Ok(handle) = open_repository_handle(discovery) else {
+        let Ok(handle) = open_repository(discovery) else {
             continue;
         };
         for commit in projection
@@ -2295,7 +2309,7 @@ impl Workspace {
             if let Ok(Some(snapshot)) = RenderSnapshot::open(&chain_path, &identity) {
                 let diagnostics = snapshot.diagnostics();
                 return Ok(Self {
-                    projection: HistoryProjection::from_ops_with(Vec::new(), projection_options()),
+                    projection: HistoryProjection::from_ops(Vec::new()),
                     source_ops: Vec::new(),
                     source_op_index: HashMap::new(),
                     session_metadata: HashMap::new(),
@@ -2325,7 +2339,7 @@ impl Workspace {
         let (source_ops, chain_stats, source_op_locations) = read_chain_ops(&chain_path)?;
         // Keep durable references in the canonical source corpus. The graph
         // projection receives only bounded display previews, preventing large
-        // payload bytes from being multiplied by collapse/filter/layout clones.
+        // payload bytes from being multiplied by collapse/view/layout clones.
         // Details and search hydrate a single source op at a time on demand.
         let resolver = BlobResolver::open(&chain_path)?;
         let (projection_ops, blob_stats) = projection_ops_with_previews(&source_ops, &resolver);
@@ -2333,13 +2347,10 @@ impl Workspace {
             chain: chain_stats,
             blobs: blob_stats,
         };
-        // q6 Phase-1: enable per-source-chain META bundling by default in the live
-        // viewer. `ProjectionOptions` is passed explicitly so the behavior is
-        // deterministic and a real cache key, never a process-global toggle.
-        let mut projection = HistoryProjection::from_ops_with(projection_ops, projection_options());
+        let mut projection = HistoryProjection::from_ops(projection_ops);
         // Walk each discovered repo's history into the projection.
         for discovery in &repositories {
-            let opened = open_repository_handle(discovery);
+            let opened = open_repository(discovery);
             let Ok(handle) = opened else {
                 continue;
             };
@@ -2380,8 +2391,8 @@ impl Workspace {
         })
     }
 
-    /// Materialize the complete projection only for compatibility requests
-    /// that cannot be served by the fixed-view snapshot.
+    /// Materialize the complete projection when details, diffs, or find need
+    /// source data that is not stored in the render snapshot.
     fn ensure_projection_loaded(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.projection_loaded {
             return Ok(());
@@ -2403,13 +2414,6 @@ impl Workspace {
         self.projection_loaded = true;
         self.current_view = None;
         Ok(())
-    }
-
-    /// Whether this request matches the pregenerated temporary default view.
-    fn snapshot_supports_view(&self, hide_submodules: bool, filter: &ChainFilter) -> bool {
-        self.snapshot.is_some()
-            && hide_submodules == fixed_view_hide_submodules()
-            && filter.key() == fixed_view_filter().key()
     }
 
     /// Node count for the Open handshake, independent of backend.
@@ -2439,7 +2443,7 @@ impl Workspace {
 
     /// Get a window of history rows (newest-first).
     #[must_use]
-    pub fn history_window(&mut self, options: HistoryWindowOptions<'_>) -> HistoryWindow {
+    pub fn history_window(&mut self, options: HistoryWindowOptions) -> HistoryWindow {
         let offset = options.offset;
         let include_layout = options.include_layout;
         match self.try_history_window(options) {
@@ -2459,13 +2463,9 @@ impl Workspace {
     /// Fallible history-window path used by the protocol server and snapshot builder.
     fn try_history_window(
         &mut self,
-        options: HistoryWindowOptions<'_>,
+        options: HistoryWindowOptions,
     ) -> Result<HistoryWindow, Box<dyn std::error::Error>> {
-        if self.snapshot_supports_view(options.hide_submodules, options.filter) {
-            let snapshot = self
-                .snapshot
-                .as_mut()
-                .ok_or("render snapshot disappeared during request")?;
+        if let Some(snapshot) = self.snapshot.as_mut() {
             return snapshot.history_window(options.offset, options.limit, options.include_layout);
         }
         self.ensure_projection_loaded()?;
@@ -2480,22 +2480,20 @@ impl Workspace {
         clippy::needless_borrow,
         reason = "expanded-slot prefix sums are bounded by node count; indexing is bounds-checked by partition_point; node is a &HistoryNode reference"
     )]
-    fn projection_history_window(&mut self, options: HistoryWindowOptions<'_>) -> HistoryWindow {
+    fn projection_history_window(&mut self, options: HistoryWindowOptions) -> HistoryWindow {
         let HistoryWindowOptions {
             offset,
             limit,
-            hide_submodules,
-            filter,
             include_layout,
         } = options;
         let offset_usize = usize::try_from(offset).unwrap_or(usize::MAX);
         let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
 
-        self.ensure_view_snapshot(hide_submodules, filter);
+        self.ensure_view_snapshot();
         if include_layout {
             self.ensure_view_layout();
         }
-        let Some((_, snapshot)) = self.current_view.as_ref() else {
+        let Some(snapshot) = self.current_view.as_ref() else {
             return HistoryWindow {
                 rows: Vec::new(),
                 total: 0,
@@ -2580,7 +2578,7 @@ impl Workspace {
             if block_start >= offset_usize && block_start < end_usize {
                 // Parents come from the cached LayoutContext for THIS exact
                 // filtered snapshot (not the full projection), so a parent
-                // that resolves to a row hidden by the filter is never
+                // that resolves to a row hidden by the Activity view is never
                 // emitted as a dangling key. Relations are derived by the
                 // projection from these same final parent keys, so every
                 // relation's parent is guaranteed to be a rendered parent.
@@ -2738,7 +2736,7 @@ impl Workspace {
             total: u64::try_from(expanded_total).unwrap_or(u64::MAX),
             chain_generation: u64::try_from(self.projection.ops.len()).unwrap_or(u64::MAX),
             max_lane: snapshot.max_lane,
-            // The renderer always establishes a filter state from offset zero;
+            // The renderer always establishes snapshot state from offset zero;
             // ship the O(V) expansion index once for that snapshot, not with
             // every O(window) page.
             sub_op_counts: (offset == 0).then(|| snapshot.sub_op_counts.clone()),
@@ -2747,71 +2745,41 @@ impl Workspace {
         }
     }
 
-    /// Build and cache the immutable node/layout/expansion snapshot for a filter.
-    fn ensure_view_snapshot(&mut self, hide_submodules: bool, filter: &ChainFilter) {
-        let key = (hide_submodules, filter.key());
-        if self
-            .current_view
-            .as_ref()
-            .is_some_and(|(cached_key, _)| *cached_key == key)
-        {
+    /// Build and cache the immutable fixed Activity-view snapshot.
+    fn ensure_view_snapshot(&mut self) {
+        if self.current_view.is_some() {
             return;
         }
-        let all_nodes = self.projection.filtered_nodes(filter);
-        let nodes: Vec<_> = if hide_submodules {
-            all_nodes
-                .into_iter()
-                .filter(|n| {
-                    !n.repository()
-                        .is_some_and(|rid| self.repo_is_submodule(rid))
-                })
-                .collect()
-        } else {
-            all_nodes
-        };
-        // Activity-view semantics: every view gets deterministic work-unit and
-        // promotion annotations. The fixed Activity view additionally keeps
-        // context-compaction checkpoints inline, groups adjacent repeated Plan
-        // headings, folds safe low-signal execute runs, then wraps every linear
-        // non-chat interval in an outer work group (never the Raw profile,
-        // whose topology stays exact).
+        let all_nodes = self.projection.activity_nodes();
+        let nodes: Vec<_> = all_nodes
+            .into_iter()
+            .filter(|node| {
+                !node
+                    .repository()
+                    .is_some_and(|repository| self.repo_is_submodule(repository))
+            })
+            .collect();
+        // Activity-view semantics keep context-compaction checkpoints inline,
+        // group adjacent repeated Plan headings, fold safe low-signal execute
+        // runs, then wrap every linear non-chat interval in an outer work group.
         // Annotations are recomputed on the final list so bundle rows carry
         // their own unit markers.
-        let is_activity = filter.key() == fixed_view_filter().key();
-        let structural = is_activity.then(|| self.projection.structural_row_keys(&nodes));
-        let nodes = if let Some(structural) = structural.as_ref() {
-            editchain_project::activity::inline_context_compaction_checkpoints(nodes, structural)
-        } else {
-            nodes
-        };
+        let structural = self.projection.structural_row_keys(&nodes);
+        let nodes =
+            editchain_project::activity::inline_context_compaction_checkpoints(nodes, &structural);
         // Plan repeats group before promotion is computed: the newest member
         // may itself be the unit-final narrative, and the resulting bundle —
         // not an arbitrary duplicate member — should carry that significance.
-        let nodes = if let Some(structural) = structural.as_ref() {
-            editchain_project::activity::bundle_activity_plan_repeats(nodes, structural)
-        } else {
-            nodes
-        };
+        let nodes = editchain_project::activity::bundle_activity_plan_repeats(nodes, &structural);
         let mut annotations = editchain_project::activity::annotate_activity_rows(&nodes);
-        let nodes = if let Some(structural) = structural.as_ref() {
-            editchain_project::activity::bundle_activity_execute_runs(
-                nodes,
-                &annotations,
-                structural,
-            )
-        } else {
-            nodes
-        };
-        let nodes = if let Some(structural) = structural.as_ref() {
-            editchain_project::activity::bundle_claude_response_tool_fragments(nodes, structural)
-        } else {
-            nodes
-        };
-        let nodes = if let Some(structural) = structural.as_ref() {
-            editchain_project::activity::bundle_activity_work_groups(nodes, structural)
-        } else {
-            nodes
-        };
+        let nodes = editchain_project::activity::bundle_activity_execute_runs(
+            nodes,
+            &annotations,
+            &structural,
+        );
+        let nodes =
+            editchain_project::activity::bundle_claude_response_tool_fragments(nodes, &structural);
+        let nodes = editchain_project::activity::bundle_activity_work_groups(nodes, &structural);
         annotations = editchain_project::activity::annotate_activity_rows(&nodes);
         let expansions: Vec<NodeExpansion> = nodes
             .iter()
@@ -2854,28 +2822,25 @@ impl Workspace {
                 });
             }
         }
-        self.current_view = Some((
-            key,
-            ViewSnapshot {
-                nodes,
-                annotations,
-                context: None,
-                sub_op_counts,
-                expansions,
-                expansion_spans,
-                starts,
-                expanded_total,
-                max_lane: 0,
-                op_rows: None,
-                git_rows: None,
-            },
-        ));
+        self.current_view = Some(ViewSnapshot {
+            nodes,
+            annotations,
+            context: None,
+            sub_op_counts,
+            expansions,
+            expansion_spans,
+            starts,
+            expanded_total,
+            max_lane: 0,
+            op_rows: None,
+            git_rows: None,
+        });
     }
 
     /// Build global graph geometry for the current row snapshot on demand.
     fn ensure_view_layout(&mut self) {
         let projection = &self.projection;
-        let Some((_, snapshot)) = self.current_view.as_mut() else {
+        let Some(snapshot) = self.current_view.as_mut() else {
             return;
         };
         if snapshot.context.is_some() {
@@ -2895,10 +2860,10 @@ impl Workspace {
     /// a hit inside a folded META sub-op, tool result, execute-run member, or
     /// plan-repeat member resolves directly to its containing top-level row.
     /// The git map indexes visible git commits by `(repository, oid)`; rows
-    /// hidden by the active filter or `hide_submodules` are simply absent, so
+    /// hidden by the fixed Activity view are simply absent, so
     /// hits with no row in the active view are filtered out downstream.
     fn build_find_row_maps(&mut self) {
-        let Some((_, snapshot)) = self.current_view.as_mut() else {
+        let Some(snapshot) = self.current_view.as_mut() else {
             return;
         };
         if snapshot.op_rows.is_some() && snapshot.git_rows.is_some() {
@@ -2922,28 +2887,24 @@ impl Workspace {
     }
 
     /// Resolve scored search chunks to distinct visible top-level rows of the
-    /// active view, deduplicating by row and keeping the best BM25 score.
+    /// fixed Activity view, deduplicating by row and keeping the best BM25 score.
     ///
-    /// The exact `(hide_submodules, filter)` pair must match the view the
-    /// client renders (the same values it passed to `GetWindow`/`GetLayout`);
-    /// the resolution reuses the cached per-filter `ViewSnapshot` for that key. Every
+    /// The resolution reuses the cached `ViewSnapshot`. Every
     /// returned match carries the row's stable real `node_key` and its absolute
     /// expanded-history parent-row offset (from the snapshot's `starts` prefix
     /// sums), so the viewer can cycle matches without auto-expanding anything.
-    /// Hits whose op id has no visible row under the active view are dropped;
+    /// Hits whose op id has no visible row are dropped;
     /// `Git` hits are resolved by real `(repository, oid)` identity, never the
     /// synthetic index-only op id.
     #[must_use]
     pub fn find_in_history(
         &mut self,
-        chunks: &[ScoredChunk],
+        chunks: &[LexicalHit],
         git_identities: &std::collections::BTreeMap<OpId, GitHitIdentity>,
-        hide_submodules: bool,
-        filter: &ChainFilter,
     ) -> Vec<FindInHistoryMatch> {
-        self.ensure_view_snapshot(hide_submodules, filter);
+        self.ensure_view_snapshot();
         self.build_find_row_maps();
-        let Some((_, snapshot)) = self.current_view.as_ref() else {
+        let Some(snapshot) = self.current_view.as_ref() else {
             return Vec::new();
         };
         let Some(op_rows) = snapshot.op_rows.as_ref() else {
@@ -2953,8 +2914,8 @@ impl Workspace {
             return Vec::new();
         };
         let projection = &self.projection;
-        // Distinct visible rows → best (highest) score chunk for that row.
-        let mut best: HashMap<usize, (f64, &ScoredChunk)> = HashMap::new();
+        // Distinct visible rows → best (highest) score for that row.
+        let mut best: HashMap<usize, f64> = HashMap::new();
         for chunk in chunks {
             let Some(row) = resolve_chunk_row(
                 op_rows,
@@ -2965,133 +2926,31 @@ impl Workspace {
             ) else {
                 continue;
             };
-            let entry = best.entry(row).or_insert_with(|| (chunk.score, chunk));
-            if chunk.score > entry.0 {
-                *entry = (chunk.score, chunk);
+            let entry = best.entry(row).or_insert(chunk.score);
+            if chunk.score > *entry {
+                *entry = chunk.score;
             }
         }
         let starts = &snapshot.starts;
-        let mut matches: Vec<FindInHistoryMatch> = best
-            .into_iter()
-            .filter_map(|(row, (_, chunk))| {
-                let node = snapshot.nodes.get(row)?;
-                Some(find_match_from_chunk(
-                    chunk,
-                    git_identities,
-                    node.node_key(),
-                    u64::try_from(starts.get(row).copied().unwrap_or(0)).unwrap_or(u64::MAX),
-                    node.summary(),
-                ))
-            })
-            .collect();
+        let mut ranked: Vec<(usize, f64)> = best.into_iter().collect();
         // Ranked: best score first; ties break to the newest visible row so the
         // ordering is deterministic for the viewer's cycle.
-        matches.sort_unstable_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
+        ranked.sort_unstable_by(|(row_a, score_a), (row_b, score_b)| {
+            score_b
+                .partial_cmp(score_a)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.row.cmp(&b.row))
+                .then(row_a.cmp(row_b))
         });
-        matches
-    }
-
-    /// Fallible compatibility path that materializes projection state as needed.
-    fn try_graph_layout(
-        &mut self,
-        hide_submodules: bool,
-        offset: u64,
-        limit: u64,
-        filter: &ChainFilter,
-    ) -> Result<ProtocolGraphLayout, Box<dyn std::error::Error>> {
-        self.ensure_projection_loaded()?;
-        Ok(self.graph_layout(hide_submodules, offset, limit, filter))
-    }
-
-    /// Compute the graph layout for a bounded window of rows.
-    ///
-    /// The layout context (all O(V) derived data) is cached per `hide_submodules`
-    /// and computed once; only edges whose child falls inside `[offset,
-    /// offset+limit)` are emitted. This keeps per-scroll cost proportional to the
-    /// visible slice rather than the whole graph.
-    #[must_use]
-    #[expect(
-        clippy::print_stderr,
-        reason = "Diagnostic logging to the VS Code output pane via service stderr"
-    )]
-    pub fn graph_layout(
-        &mut self,
-        hide_submodules: bool,
-        offset: u64,
-        limit: u64,
-        filter: &ChainFilter,
-    ) -> ProtocolGraphLayout {
-        self.ensure_view_snapshot(hide_submodules, filter);
-        self.ensure_view_layout();
-        let Some((_, snapshot)) = self.current_view.as_ref() else {
-            return ProtocolGraphLayout {
-                rows: Vec::new(),
-                edges: Vec::new(),
-                max_lane: 0,
-            };
-        };
-        let Some(ctx) = snapshot.context.as_ref() else {
-            return ProtocolGraphLayout {
-                rows: Vec::new(),
-                edges: Vec::new(),
-                max_lane: 0,
-            };
-        };
-        let offset_usize = usize::try_from(offset).unwrap_or(0);
-        let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
-
-        let edges = ctx.edges_for_window(offset_usize, limit_usize);
-        eprintln!(
-            "[layout] GetLayout offset={} limit={} rows={} edges={} max_lane={}",
-            offset_usize,
-            limit_usize,
-            ctx.lanes.len(),
-            edges.len(),
-            ctx.lanes.iter().map(|r| r.lane).max().unwrap_or(0)
-        );
-
-        // Only send the window slice of rows (the webview needs lanes only for
-        // visible rows). Sending all V rows would serialize the whole graph on
-        // every scroll.
-        let row_end = offset_usize
-            .saturating_add(limit_usize)
-            .min(ctx.lanes.len());
-        let rows = ctx
-            .lanes
-            .get(offset_usize..row_end)
-            .unwrap_or(&[])
-            .iter()
-            .map(|r| LayoutRow {
-                node: r.node.clone(),
-                lane: r.lane,
-            })
-            .collect();
-
-        // Global max lane across ALL rows (not just this window), so the client
-        // can size the graph column stably regardless of which window is loaded.
-        ProtocolGraphLayout {
-            rows,
-            edges: edges
-                .into_iter()
-                .map(|e| LayoutEdge {
-                    child: e.child,
-                    parent: e.parent,
-                    points: e
-                        .points
-                        .into_iter()
-                        .map(|p| LayoutPoint {
-                            row: p.row,
-                            lane: p.lane,
-                        })
-                        .collect(),
+        ranked
+            .into_iter()
+            .filter_map(|(row, _)| {
+                let node = snapshot.nodes.get(row)?;
+                Some(FindInHistoryMatch {
+                    node_key: node.node_key(),
+                    row: u64::try_from(starts.get(row).copied().unwrap_or(0)).unwrap_or(u64::MAX),
                 })
-                .collect(),
-            max_lane: snapshot.max_lane,
-        }
+            })
+            .collect()
     }
 
     /// Get details for a specific node by operation ID or git OID.
@@ -3165,7 +3024,7 @@ impl Workspace {
             .iter()
             .find(|discovery| discovery.id == repository)
             .ok_or_else(|| "repository not found".to_string())?;
-        let handle = open_repository_handle(discovery).map_err(|error| error.to_string())?;
+        let handle = open_repository(discovery).map_err(|error| error.to_string())?;
         let advertised = commit_file_changes(&handle, &commit_oid)
             .map_err(|error| error.to_string())?
             .into_iter()
@@ -3241,20 +3100,6 @@ impl Workspace {
             | OpKind::GitLink(_)
             | OpKind::Unknown(_) => Err("operation is not a retained file edit".to_string()),
         }
-    }
-
-    /// List discovered repositories.
-    #[must_use]
-    pub fn repositories_info(&self) -> Vec<RepositoryInfo> {
-        self.repositories
-            .iter()
-            .map(|d| RepositoryInfo {
-                id: d.id.0.to_string(),
-                path: d.path.to_string_lossy().to_string(),
-                is_worktree: d.is_worktree,
-                is_submodule: self.is_submodule(d),
-            })
-            .collect()
     }
 
     /// Returns true if a repository is nested inside another discovered repo
@@ -3545,7 +3390,7 @@ fn agent_git_baseline(workspace: &Workspace, requested: &FileChangeDto) -> Optio
         .repositories
         .iter()
         .find(|discovery| discovery.id == repository)?;
-    let handle = open_repository_handle(discovery).ok()?;
+    let handle = open_repository(discovery).ok()?;
     match resolve_path_at_commit(&handle, &commit_oid, repository_path).ok()? {
         None => Some(AgentBaseline::Missing),
         Some(object) => match object.blob {
@@ -3871,13 +3716,10 @@ pub fn prepare_render_snapshot(
         chain_path.clone(),
         repositories.clone(),
     )?;
-    let filter = fixed_view_filter();
     let page_limit = 4_096u64;
     let first = workspace.try_history_window(HistoryWindowOptions {
         offset: 0,
         limit: page_limit,
-        hide_submodules: fixed_view_hide_submodules(),
-        filter: &filter,
         include_layout: true,
     })?;
     let sub_op_counts = first
@@ -3897,8 +3739,6 @@ pub fn prepare_render_snapshot(
         let window = workspace.try_history_window(HistoryWindowOptions {
             offset,
             limit: page_limit,
-            hide_submodules: fixed_view_hide_submodules(),
-            filter: &filter,
             include_layout: true,
         })?;
         if window.rows.is_empty() {
@@ -3931,52 +3771,6 @@ pub fn prepare_render_snapshot(
     )
 }
 
-/// Convert an optional protocol filter DTO into a [`ChainFilter`].
-///
-/// A `None` DTO yields the fixed viewer filter (Activity view: splice on,
-/// hide trace and undated rows) so the render snapshot serves it. An empty
-/// DTO yields an empty filter that hides nothing; raw mode sends an explicit
-/// `hide_trace: false`. `ChainFilter::default()` itself stays the raw
-/// baseline (`hide_trace` off) — the Activity view is an explicit choice.
-#[must_use]
-fn chain_filter_from_dto(dto: Option<&ChainFilterDto>) -> ChainFilter {
-    match dto {
-        Some(d) => ChainFilter::new(
-            d.summary_pattern.clone(),
-            d.kind_pattern.clone(),
-            d.include_kind_pattern.clone(),
-            d.hide_undated,
-            d.splice,
-            d.hide_trace,
-        ),
-        None => fixed_view_filter(),
-    }
-}
-
-/// Projection options shared by live computation and pregeneration.
-const fn projection_options() -> editchain_project::ProjectionOptions {
-    editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    }
-}
-
-/// Temporary fixed viewer filter while the filtering UI is being redesigned.
-fn fixed_view_filter() -> ChainFilter {
-    ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        true,
-        true,
-        true,
-    )
-}
-
-/// The temporary fixed viewer hides nested Git repositories/submodules.
-const fn fixed_view_hide_submodules() -> bool {
-    true
-}
-
 /// Parse an exact decimal `RepositoryId` string, rejecting anything else.
 ///
 /// # Errors
@@ -3998,75 +3792,6 @@ pub fn parse_git_oid(s: &str) -> Result<GitOid, String> {
     GitOid::from_hex(s).ok_or_else(|| format!("invalid git oid: {s:?}"))
 }
 
-/// Convert protocol search filters into the query crate's internal filters,
-/// parsing exact decimal session/actor ID strings.
-///
-/// # Errors
-///
-/// Returns an error message when a session or actor ID is not a valid `u64`.
-pub fn search_filters_from_dto(dto: &SearchFiltersDto) -> Result<SearchFilters, String> {
-    fn parse_ids<T>(
-        ids: Option<&Vec<String>>,
-        what: &str,
-        wrap: impl Fn(u64) -> T + Copy,
-    ) -> Result<Option<Vec<T>>, String> {
-        ids.map(|values| {
-            values
-                .iter()
-                .map(|s| {
-                    s.parse::<u64>()
-                        .map(wrap)
-                        .map_err(|_err| format!("invalid {what} id: {s:?}"))
-                })
-                .collect()
-        })
-        .transpose()
-    }
-    Ok(SearchFilters {
-        kinds: dto.kinds.clone(),
-        sources: dto.sources.clone(),
-        sessions: parse_ids(dto.sessions.as_ref(), "session", SessionId)?,
-        actors: parse_ids(dto.actors.as_ref(), "actor", ActorId)?,
-        paths: dto.paths.clone(),
-        after: dto.after,
-        before: dto.before,
-        include_raw: dto.include_raw,
-        include_private: dto.include_private,
-    })
-}
-
-/// Convert a scored search chunk into the protocol's JSON-safe search hit.
-///
-/// `Git` hits are looked up in `git_identities` — the deterministic map from
-/// the synthetic op ids assigned at index time to the real commit identity —
-/// so the response navigates by exact `(repository, git_oid)` strings and
-/// never by the synthetic, projection-less op id.
-#[must_use]
-pub fn search_hit_from_chunk(
-    chunk: &ScoredChunk,
-    git_identities: &std::collections::BTreeMap<OpId, GitHitIdentity>,
-) -> SearchHit {
-    let git = (chunk.metadata.source == Source::Git)
-        .then(|| git_identities.get(&chunk.op_id))
-        .flatten();
-    SearchHit {
-        op_id: chunk.op_id.to_string(),
-        chunk_id: chunk.chunk_id.to_string(),
-        score: chunk.score,
-        text: chunk.text.clone(),
-        source: chunk.metadata.source,
-        session_id: chunk.metadata.session_id.map(|id| id.0.to_string()),
-        actor_id: chunk.metadata.actor_id.0.to_string(),
-        kind_tags: chunk.metadata.kind_tags,
-        timestamp_ms: chunk.metadata.timestamp_ms,
-        generation: chunk.metadata.generation,
-        git_oid: git.map(|identity| identity.oid.to_hex()),
-        repository: git.map(|identity| identity.repository_id.0.to_string()),
-        kind: git.map_or_else(String::new, |_| "git".to_string()),
-        is_submodule: git.is_some_and(|identity| identity.is_submodule),
-    }
-}
-
 /// Resolve one scored chunk to its visible top-level row index in the active
 /// view snapshot, or `None` when the hit has no row in that view.
 ///
@@ -4074,10 +3799,10 @@ pub fn search_hit_from_chunk(
 /// that shares the row) is in `op_rows`, otherwise through the projection's
 /// semantic-collapse representative map (`visible_op_id`) to the canonical row
 /// that renders the op — a folded normalized child, META sub-op, tool result,
-/// or copied provider occurrence. A canonical row that is absent from `op_rows` is hidden by
-/// the active filter/profile and dropped. `Git` hits resolve by real
+/// or copied provider occurrence. A canonical row that is absent from `op_rows`
+/// is hidden by the Activity view and dropped. `Git` hits resolve by real
 /// `(repository, oid)` identity from `git_identities` (never the synthetic
-/// index-only op id), so submodule rows hidden by `hide_submodules` are absent
+/// index-only op id), so nested-repository rows are absent
 /// from `git_rows` and dropped.
 #[must_use]
 fn resolve_chunk_row(
@@ -4085,9 +3810,9 @@ fn resolve_chunk_row(
     git_rows: &HashMap<(RepositoryId, GitOid), usize>,
     git_identities: &std::collections::BTreeMap<OpId, GitHitIdentity>,
     visible_op_id: &impl Fn(OpId) -> Option<OpId>,
-    chunk: &ScoredChunk,
+    chunk: &LexicalHit,
 ) -> Option<usize> {
-    if chunk.metadata.source == Source::Git {
+    if chunk.source == LexicalSource::Git {
         let identity = git_identities.get(&chunk.op_id)?;
         return git_rows
             .get(&(identity.repository_id, identity.oid))
@@ -4097,41 +3822,6 @@ fn resolve_chunk_row(
         return Some(row);
     }
     visible_op_id(chunk.op_id).and_then(|canonical| op_rows.get(&canonical).copied())
-}
-
-/// Convert the best-scoring chunk for one visible row into a Find-in-Chain
-/// match, attaching the row's stable identity and absolute parent-row offset.
-///
-/// Reuses [`search_hit_from_chunk`] so `EditChain`/`Git` identity fields stay
-/// byte-identical to the legacy `Search` response.
-#[must_use]
-fn find_match_from_chunk(
-    chunk: &ScoredChunk,
-    git_identities: &std::collections::BTreeMap<OpId, GitHitIdentity>,
-    node_key: String,
-    row: u64,
-    summary: String,
-) -> FindInHistoryMatch {
-    let hit = search_hit_from_chunk(chunk, git_identities);
-    FindInHistoryMatch {
-        node_key,
-        row,
-        summary,
-        score: hit.score,
-        op_id: hit.op_id,
-        chunk_id: hit.chunk_id,
-        text: hit.text,
-        source: hit.source,
-        session_id: hit.session_id,
-        actor_id: hit.actor_id,
-        kind_tags: hit.kind_tags,
-        timestamp_ms: hit.timestamp_ms,
-        generation: hit.generation,
-        git_oid: hit.git_oid,
-        repository: hit.repository,
-        kind: hit.kind,
-        is_submodule: hit.is_submodule,
-    }
 }
 
 /// Whether a history node is a system-generated artifact (tool results, raw
@@ -4410,7 +4100,7 @@ fn session_metadata_from_op(op: &Op) -> Option<(SessionMetaDto, u8)> {
 /// metadata-subop count) so the viewer can render faithful bundle labels from
 /// structured data without parsing the summary string. Inner execute/plan
 /// bundles keep this metadata when nested beneath a work group. `None` for
-/// ordinary rows and the raw (unbundled) profile.
+/// ordinary rows and expandable Activity bundles.
 #[must_use]
 fn node_activity_bundle(
     node: &editchain_project::HistoryNode,
@@ -5342,33 +5032,13 @@ pub fn resolve_git_commit(
     else {
         return Ok(None);
     };
-    let Ok(handle) = open_repository_handle(discovery) else {
+    let Ok(handle) = open_repository(discovery) else {
         return Ok(None);
     };
     match resolve_commit(&handle, oid) {
         Ok(res) => Ok(Some(res.commit)),
         Err(_) => Ok(None),
     }
-}
-
-/// Open a discovered repository as a `RepositoryHandle`.
-fn open_repository_handle(
-    discovery: &editchain_git::RepositoryDiscovery,
-) -> Result<RepositoryHandle, Box<dyn std::error::Error>> {
-    let open_path = if discovery.is_worktree {
-        discovery
-            .path
-            .parent()
-            .unwrap_or(&discovery.path)
-            .to_path_buf()
-    } else {
-        discovery.path.clone()
-    };
-    let repo = gix::open(&open_path)?;
-    Ok(RepositoryHandle {
-        repo,
-        discovery: discovery.clone(),
-    })
 }
 
 /// Resolve exact durable Git-link targets that the current HEAD walk did not
@@ -5394,7 +5064,7 @@ fn merge_exact_git_link_targets(
         if repository_targets.is_empty() {
             continue;
         }
-        let Ok(handle) = open_repository_handle(discovery) else {
+        let Ok(handle) = open_repository(discovery) else {
             continue;
         };
         let commits: Vec<_> = repository_targets
@@ -5415,7 +5085,7 @@ pub struct Server {
     /// The currently loaded workspace (None until `Open`).
     pub workspace: Option<Workspace>,
     /// The lexical search index plus synthetic-op → git identity map (built
-    /// lazily on first `Search`).
+    /// lazily on first `FindInHistory`).
     pub lexical: Option<SearchIndexState>,
 }
 
@@ -5441,7 +5111,7 @@ impl Server {
                 let workspace = Workspace::open(&req.workspace_path, &req.chain_dir)?;
                 let diagnostics = workspace.diagnostics;
                 let warnings = workspace.diagnostics.warnings();
-                // The lexical index is built lazily on first Search (it is
+                // The lexical index is built lazily on first find request (it is
                 // expensive for large chains and unnecessary for the graph view).
                 self.workspace = Some(workspace);
                 self.lexical = None;
@@ -5460,22 +5130,12 @@ impl Server {
             }
             RequestBody::GetWindow(req) => {
                 let ws = self.workspace.as_mut().ok_or("no workspace open")?;
-                let filter = chain_filter_from_dto(req.filter.as_ref());
                 let window = ws.try_history_window(HistoryWindowOptions {
                     offset: req.offset,
                     limit: req.limit,
-                    hide_submodules: req.hide_submodules,
-                    filter: &filter,
                     include_layout: req.include_layout,
                 })?;
                 ResponseBody::Ok(serde_json::to_value(window)?)
-            }
-            RequestBody::GetLayout(req) => {
-                let ws = self.workspace.as_mut().ok_or("no workspace open")?;
-                let filter = chain_filter_from_dto(req.filter.as_ref());
-                let layout =
-                    ws.try_graph_layout(req.hide_submodules, req.offset, req.limit, &filter)?;
-                ResponseBody::Ok(serde_json::to_value(layout)?)
             }
             RequestBody::GetNodeDetails(req) => {
                 let ws = self.workspace.as_ref().ok_or("no workspace open")?;
@@ -5483,10 +5143,6 @@ impl Server {
                     Some(details) => ResponseBody::Ok(serde_json::to_value(details)?),
                     None => ResponseBody::Error("node not found".to_string()),
                 }
-            }
-            RequestBody::GetRepositories => {
-                let ws = self.workspace.as_ref().ok_or("no workspace open")?;
-                ResponseBody::Ok(serde_json::to_value(ws.repositories_info())?)
             }
             RequestBody::ResolveObject(req) => {
                 let ws = self.workspace.as_ref().ok_or("no workspace open")?;
@@ -5515,45 +5171,7 @@ impl Server {
                     Err(message) => ResponseBody::Error(message),
                 }
             }
-            RequestBody::SetFilters(_) => ResponseBody::Error("filters not yet wired".to_string()),
-            RequestBody::Search(req) => {
-                let filters = match search_filters_from_dto(&req.filters) {
-                    Ok(filters) => filters,
-                    Err(msg) => {
-                        return Ok(Response {
-                            id,
-                            body: ResponseBody::Error(msg),
-                        });
-                    }
-                };
-                // Build the lexical index lazily on first search.
-                if self.lexical.is_none() {
-                    let ws = self.workspace.as_mut().ok_or("no workspace open")?;
-                    ws.ensure_projection_loaded()?;
-                    self.lexical = Some(build_lexical_index(ws)?);
-                }
-                let lexical = self.lexical.as_ref().ok_or("no index built")?;
-                let results = lexical
-                    .index
-                    .search_internal(&req.query, &filters, req.top_k)?;
-                let response = SearchResponse {
-                    results: results
-                        .iter()
-                        .map(|chunk| search_hit_from_chunk(chunk, &lexical.git_identities))
-                        .collect(),
-                };
-                ResponseBody::Ok(serde_json::to_value(response)?)
-            }
             RequestBody::FindInHistory(req) => {
-                let filters = match search_filters_from_dto(&req.filters) {
-                    Ok(filters) => filters,
-                    Err(msg) => {
-                        return Ok(Response {
-                            id,
-                            body: ResponseBody::Error(msg),
-                        });
-                    }
-                };
                 // Build the lexical index lazily on first search.
                 if self.lexical.is_none() {
                     let ws = self.workspace.as_mut().ok_or("no workspace open")?;
@@ -5561,27 +5179,13 @@ impl Server {
                     self.lexical = Some(build_lexical_index(ws)?);
                 }
                 let lexical = self.lexical.as_ref().ok_or("no index built")?;
-                let chunks = lexical
-                    .index
-                    .search_internal(&req.query, &filters, req.top_k)?;
+                let chunks = lexical.index.search_internal(&req.query, req.top_k)?;
                 let ws = self.workspace.as_mut().ok_or("no workspace open")?;
-                // The exact ChainFilterDto + hide_submodules the client used for
-                // GetWindow/GetLayout, so resolution reuses the cached snapshot.
-                let filter = chain_filter_from_dto(req.filter.as_ref());
-                let matches = ws.find_in_history(
-                    &chunks,
-                    &lexical.git_identities,
-                    req.hide_submodules,
-                    &filter,
-                );
+                let matches = ws.find_in_history(&chunks, &lexical.git_identities);
                 // `more` reports only whether the candidate/top_k limit may have
                 // truncated retrieval; the response never claims an exact total.
                 let more = req.top_k > 0 && chunks.len() >= req.top_k;
-                let response = FindInHistoryResponse {
-                    returned: matches.len(),
-                    more,
-                    matches,
-                };
+                let response = FindInHistoryResponse { more, matches };
                 ResponseBody::Ok(serde_json::to_value(response)?)
             }
         };
@@ -5655,6 +5259,7 @@ mod tests {
     use editchain_codec::page::{encode_page, Page};
     use editchain_core::{ImportOp, MessageOp, PathId};
     use editchain_import::BlobSink as _;
+    use editchain_import::FsBlobSink;
     use std::collections::BTreeMap;
 
     /// 2^53 + 1 — the first integer JavaScript's IEEE-754 doubles round.
@@ -5828,17 +5433,11 @@ mod tests {
                 3,
             ),
         ];
-        let options = editchain_project::ProjectionOptions {
-            bundle_metadata: true,
-        };
-        let projection = HistoryProjection::from_ops_with(ops, options);
+        let projection = HistoryProjection::from_ops(ops);
         let mut ws = Workspace::from_projection(projection);
-        let filter = ChainFilter::default();
         let window = ws.history_window(HistoryWindowOptions {
             offset: 0,
             limit: 100,
-            hide_submodules: false,
-            filter: &filter,
             include_layout: true,
         });
 
@@ -5927,103 +5526,6 @@ mod tests {
     }
 
     #[test]
-    fn include_kind_filter_preserves_structural_anchor_and_target_rows() {
-        // "Messages only" is an INCLUSIVE kind constraint: ordinary non-message
-        // rows are excluded. Structural relation anchors and targets are
-        // graph-topology-critical, so their rows must survive even
-        // when their kind (tool) matches the exclusion — otherwise the
-        // branch/reconnect geometry disappears. Here a parent thread's spawn
-        // marker (a Tool op) and the subagent's first op (also a Tool op) are
-        // both preserved, the SubagentOf edge still renders, and the relation
-        // parent is one of the row's final parents.
-        let spawn = op_envelope(
-            1,
-            1,
-            OpKind::Tool(editchain_core::ToolOp {
-                tool_call_id: Payload::Empty,
-                tool_name: Payload::Inline(b"Task".to_vec()),
-                stage: editchain_core::ToolStage::Start,
-                content: Payload::Empty,
-            }),
-        );
-        let sub_first = op_envelope(
-            2,
-            1,
-            OpKind::Tool(editchain_core::ToolOp {
-                tool_call_id: Payload::Empty,
-                tool_name: Payload::Inline(b"Bash".to_vec()),
-                stage: editchain_core::ToolStage::Start,
-                content: Payload::Empty,
-            }),
-        );
-        let ops = vec![
-            spawn.clone(),
-            sub_first.clone(),
-            structural_note(
-                OpId::new(NodeId(9), 0, 1),
-                sub_first.id,
-                vec![spawn.id],
-                editchain_core::NoteRelationship::SubagentOf,
-                10,
-            ),
-        ];
-        let projection = HistoryProjection::from_ops(ops);
-        let mut ws = Workspace::from_projection(projection);
-        let filter = ChainFilter::new(
-            String::new(),
-            String::new(),
-            "^message$".to_string(),
-            false,
-            true,
-            false,
-        );
-        let window = ws.history_window(HistoryWindowOptions {
-            offset: 0,
-            limit: 100,
-            hide_submodules: false,
-            filter: &filter,
-            include_layout: true,
-        });
-
-        // Both tool-kind rows are preserved because they are a structural
-        // anchor/target pair; every other row kind is excluded.
-        let sub_row = window
-            .rows
-            .iter()
-            .find(|r| r.op_id.as_deref() == Some(sub_first.id.to_string().as_str()))
-            .expect("subagent first op row preserved");
-        let spawn_row = window
-            .rows
-            .iter()
-            .find(|r| r.op_id.as_deref() == Some(spawn.id.to_string().as_str()))
-            .expect("spawn marker row preserved");
-        assert_eq!(sub_row.parents, vec![spawn.id.to_string()]);
-        assert_eq!(
-            sub_row.parent_relations,
-            vec![ParentRelationDto {
-                parent: spawn.id.to_string(),
-                kind: ParentRelationKind::Subagent,
-            }]
-        );
-        assert!(spawn_row.parent_relations.is_empty());
-
-        // The layout for the SAME filtered view still draws the SubagentOf
-        // edge between the two visible rows.
-        let layout = ws.graph_layout(false, 0, 100, &filter);
-        assert!(
-            layout.edges.iter().any(|e| {
-                e.child == sub_first.id.to_string() && e.parent == spawn.id.to_string()
-            }),
-            "filtered layout must draw the SubagentOf edge; got {:#?}",
-            layout
-                .edges
-                .iter()
-                .map(|e| (e.child.as_str(), e.parent.as_str()))
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
     fn history_window_bundles_meta_subops() {
         // A real turn (import + message), then a META import. The META import
         // bundles into the turn's row as a sub-op; the service emits it as its
@@ -6035,20 +5537,11 @@ mod tests {
             ..import_op(1, 3, true)
         };
 
-        // q6 Phase-1: bundling is driven by explicit ProjectionOptions, not a global
-        // toggle — no mutex needed; each projection is independently configured.
-        let opts = editchain_project::ProjectionOptions {
-            bundle_metadata: true,
-        };
-        let projection =
-            HistoryProjection::from_ops_with(vec![turn.clone(), msg, meta.clone()], opts);
+        let projection = HistoryProjection::from_ops(vec![turn.clone(), msg, meta.clone()]);
         let mut ws = Workspace::from_projection(projection);
-        let filter = ChainFilter::default();
         let window = ws.history_window(HistoryWindowOptions {
             offset: 0,
             limit: 100,
-            hide_submodules: false,
-            filter: &filter,
             include_layout: true,
         });
 
@@ -6080,8 +5573,6 @@ mod tests {
         let deep = ws.history_window(HistoryWindowOptions {
             offset: 1,
             limit: 1,
-            hide_submodules: false,
-            filter: &filter,
             include_layout: true,
         });
         assert_eq!(deep.rows.len(), 1);
@@ -6089,68 +5580,6 @@ mod tests {
         assert!(!deep.rows[0].group_end);
         assert_eq!(deep.rows[0].op_id, Some(meta.id.to_string()));
         assert!(deep.sub_op_counts.is_none());
-    }
-
-    #[test]
-    fn meta_bundle_default_standalone_opt_in_bundles() {
-        // META imports render standalone by default (no cross-session grouping).
-        // Only when META bundling is re-enabled do they contract along their
-        // exact stored parent into an expanded sub-op row.
-        let turn = import_op(1, 1, false);
-        let msg = message_op(1, 2, turn.id);
-        let meta = Op {
-            parents: ParentSet::One(turn.id),
-            ..import_op(1, 3, true)
-        };
-
-        // Default (bundling off): META is a standalone top-level row.
-        let projection_off =
-            HistoryProjection::from_ops(vec![turn.clone(), msg.clone(), meta.clone()]);
-        let mut ws_off = Workspace::from_projection(projection_off);
-        let filter = ChainFilter::default();
-        let window_off = ws_off.history_window(HistoryWindowOptions {
-            offset: 0,
-            limit: 100,
-            hide_submodules: false,
-            filter: &filter,
-            include_layout: true,
-        });
-        let meta_default = window_off
-            .rows
-            .iter()
-            .find(|r| r.op_id.as_deref() == Some(meta.id.to_string().as_str()));
-        assert!(
-            meta_default.is_some(),
-            "META import must appear as a row by default"
-        );
-        assert!(
-            !meta_default.unwrap().is_subop,
-            "META import must be a standalone top-level row by default (not a sub-op)"
-        );
-
-        // Opt-in (bundling on, fresh projection so the per-filter node cache is
-        // not reused): the same META op renders as an expanded sub-op row.
-        let opts_on = editchain_project::ProjectionOptions {
-            bundle_metadata: true,
-        };
-        let projection_on =
-            HistoryProjection::from_ops_with(vec![turn.clone(), msg, meta.clone()], opts_on);
-        let mut ws_on = Workspace::from_projection(projection_on);
-        let window_on = ws_on.history_window(HistoryWindowOptions {
-            offset: 0,
-            limit: 100,
-            hide_submodules: false,
-            filter: &filter,
-            include_layout: true,
-        });
-        let meta_on = window_on
-            .rows
-            .iter()
-            .find(|r| r.op_id.as_deref() == Some(meta.id.to_string().as_str()));
-        assert!(
-            meta_on.is_some_and(|r| r.is_subop),
-            "META import must be an expanded sub-op row when bundling is enabled"
-        );
     }
 
     #[test]
@@ -6174,25 +5603,16 @@ mod tests {
             ..import_op(5, 7, true)
         }; // bundled under turn
 
-        let opts = editchain_project::ProjectionOptions {
-            bundle_metadata: true,
-        };
-        let projection = HistoryProjection::from_ops_with(
-            vec![
-                msg.clone(),
-                turn_with_parent.clone(),
-                meta.clone(),
-                parent.clone(),
-            ],
-            opts,
-        );
+        let projection = HistoryProjection::from_ops(vec![
+            msg.clone(),
+            turn_with_parent.clone(),
+            meta.clone(),
+            parent.clone(),
+        ]);
         let mut ws = Workspace::from_projection(projection);
-        let filter = ChainFilter::default();
         let window = ws.history_window(HistoryWindowOptions {
             offset: 0,
             limit: 100,
-            hide_submodules: false,
-            filter: &filter,
             include_layout: true,
         });
 
@@ -6308,101 +5728,6 @@ mod tests {
         assert_eq!(kind, "tool_result");
     }
 
-    /// Diagnostic (not run in CI): load a real chain and report how many
-    /// independent chains the projection produces, comparing raw source chains
-    /// (`(OpId.node, OpId.boot)` streams) vs the bundled projection's own
-    /// connected-root count against `metadata` on/off.
-    #[test]
-    #[ignore = "manual diagnostics against a real chain"]
-    #[expect(
-        clippy::print_stderr,
-        reason = "manual diagnostics deliberately print raw chain-level counts to stderr"
-    )]
-    fn diag_chain_counts() {
-        let (ops, _stats, _locations) = read_chain_ops(&PathBuf::from(
-            "/mnt/hot/ambientlight/repos/editchain/.editchain",
-        ))
-        .unwrap();
-        eprintln!("\n=== chain diag: {} ops ===", ops.len());
-
-        // Raw source chains = distinct (node, boot) streams among Import ops.
-        let meta_imports = ops
-            .iter()
-            .filter(|o| matches!(o.kind, OpKind::Import(_)))
-            .filter(|o| o.tags.matches_any(Tags::META))
-            .count();
-        eprintln!("meta-tagged raw imports: {meta_imports}");
-        // Show the import tag bitmask distribution so we can see what the old
-        // importer actually stamped (META may be encoded differently or absent).
-        let mut tag_hist: HashMap<u64, usize> = HashMap::new();
-        for o in ops.iter().filter(|o| matches!(o.kind, OpKind::Import(_))) {
-            *tag_hist.entry(o.tags.0).or_default() += 1;
-        }
-        let mut sorted_tags: Vec<(u64, usize)> = tag_hist.into_iter().collect();
-        sorted_tags.sort_by_key(|(t, _)| *t);
-        for (t, c) in sorted_tags.iter().take(12) {
-            eprintln!("  import tags {t:#016b} x{c}");
-        }
-
-        let sources: std::collections::HashSet<(u64, u32)> = ops
-            .iter()
-            .filter(|o| matches!(o.kind, OpKind::Import(_)))
-            .map(|o| (o.id.node.0, o.id.boot))
-            .collect();
-        eprintln!(
-            "raw source streams (node,boot) among import ops: {}",
-            sources.len()
-        );
-
-        // Distinct raw import roots (SnapshotTopology: count nodes with no parent
-        // present among import ops) — how many chains the importer actually made.
-        let import_ids: std::collections::HashSet<OpId> = ops
-            .iter()
-            .filter(|o| matches!(o.kind, OpKind::Import(_)))
-            .map(|o| o.id)
-            .collect();
-        let import_roots = ops
-            .iter()
-            .filter(|o| matches!(o.kind, OpKind::Import(_)))
-            .filter(|o| {
-                o.parents.iter().all(|p| !import_ids.contains(p)) // no import parent present => root
-            })
-            .count();
-        eprintln!("raw import roots (no import parent): {import_roots}");
-
-        // Projection counts.
-        for (label, bundle) in [("meta OFF", false), ("meta ON", true)] {
-            let proj = HistoryProjection::from_ops_with(
-                ops.clone(),
-                editchain_project::ProjectionOptions {
-                    bundle_metadata: bundle,
-                },
-            );
-            let rows = proj.nodes().len();
-            let chains = proj.independent_chains();
-            eprintln!("{label}: top_rows={rows} chains={chains}");
-            if bundle {
-                // Client-view root count over one shared meta-ON projection: how
-                // many top-level rows have NO parent that resolves to a present
-                // row, using the SAME lifted `parents` the service emits in
-                // HistoryRow. This is what actually renders as a distinct chain.
-                let nodes = proj.nodes();
-                let present: std::collections::HashSet<String> = nodes
-                    .iter()
-                    .map(editchain_project::HistoryNode::node_key)
-                    .collect();
-                let mut client_roots = 0usize;
-                for node in &nodes {
-                    let lifted = proj.lifted_parent_keys(node);
-                    if lifted.iter().all(|p| !present.contains(p)) {
-                        client_roots += 1;
-                    }
-                }
-                eprintln!("meta ON client-view roots (lifted parents): {client_roots}");
-            }
-        }
-    }
-
     #[test]
     fn open_previews_blobs_and_hydrates_details_and_search_on_demand() {
         let dir = tempfile::tempdir().unwrap();
@@ -6468,20 +5793,9 @@ mod tests {
 
         // Search hydrates each source operation while lazily building its index.
         let state = build_lexical_index(&ws).unwrap();
-        let filters = SearchFilters {
-            kinds: None,
-            sources: None,
-            sessions: None,
-            actors: None,
-            paths: None,
-            after: None,
-            before: None,
-            include_raw: false,
-            include_private: false,
-        };
         let results = state
             .index
-            .search_internal("needle-hydrated-message", &filters, 5)
+            .search_internal("needle-hydrated-message", 5)
             .unwrap();
         assert!(!results.is_empty());
         assert!(results.iter().any(|r| r.op_id == msg.id));
@@ -6524,24 +5838,13 @@ mod tests {
         let ws = Workspace::from_projection(projection);
 
         let state = build_lexical_index(&ws).unwrap();
-        let filters = SearchFilters {
-            kinds: None,
-            sources: None,
-            sessions: None,
-            actors: None,
-            paths: None,
-            after: None,
-            before: None,
-            include_raw: false,
-            include_private: false,
-        };
         let results = state
             .index
-            .search_internal("needle-git-identity", &filters, 5)
+            .search_internal("needle-git-identity", 5)
             .unwrap();
         let hit = results
             .iter()
-            .find(|r| r.metadata.source == Source::Git)
+            .find(|result| state.git_identities.contains_key(&result.op_id))
             .expect("git hit");
 
         // The synthetic indexed op id deterministically maps to the real
@@ -6554,18 +5857,8 @@ mod tests {
         assert_eq!(identity.repository_id.0, OVER_2_53);
         assert!(!identity.is_submodule);
 
-        let dto = search_hit_from_chunk(hit, &state.git_identities);
-        assert_eq!(dto.git_oid.as_deref(), Some(oid.to_hex().as_str()));
-        assert_eq!(
-            dto.repository.as_deref(),
-            Some(OVER_2_53.to_string().as_str())
-        );
-        assert_eq!(dto.kind, "git");
-        assert!(!dto.is_submodule);
-        // The synthetic op id is present in the envelope but is NOT a
-        // projection node: GetNodeDetails must not resolve it.
-        assert_eq!(dto.op_id, hit.op_id.to_string());
-        assert!(ws.node_details(Some(dto.op_id.clone()), None).is_none());
+        // The synthetic op id is index-internal and is not a projection node.
+        assert!(ws.node_details(Some(hit.op_id.to_string()), None).is_none());
     }
 
     #[test]
@@ -7900,20 +7193,9 @@ mod tests {
         let second = message_op(1, 2, first.id);
         let projection = HistoryProjection::from_ops(vec![first, second]);
         let mut ws = Workspace::from_projection(projection);
-        let filter = ChainFilter::new(
-            String::new(),
-            String::new(),
-            String::new(),
-            false,
-            false,
-            false,
-        );
-
         let provisional = ws.history_window(HistoryWindowOptions {
             offset: 0,
             limit: 10,
-            hide_submodules: false,
-            filter: &filter,
             include_layout: false,
         });
         assert!(!provisional.layout_ready);
@@ -7927,13 +7209,11 @@ mod tests {
         assert!(ws
             .current_view
             .as_ref()
-            .is_some_and(|(_, snapshot)| snapshot.context.is_none()));
+            .is_some_and(|snapshot| snapshot.context.is_none()));
 
         let laid_out = ws.history_window(HistoryWindowOptions {
             offset: 0,
             limit: 10,
-            hide_submodules: false,
-            filter: &filter,
             include_layout: true,
         });
         assert!(laid_out.layout_ready);
@@ -7942,122 +7222,15 @@ mod tests {
         assert!(ws
             .current_view
             .as_ref()
-            .is_some_and(|(_, snapshot)| snapshot.context.is_some()));
+            .is_some_and(|snapshot| snapshot.context.is_some()));
     }
 
-    #[test]
-    fn view_cache_stays_bounded_across_filter_changes() {
-        let ops = vec![
-            message_op(1, 1, OpId::new(NodeId(0), 0, 0)),
-            message_op(1, 2, OpId::new(NodeId(0), 0, 0)),
-        ];
-        let projection = HistoryProjection::from_ops(ops);
-        let mut ws = Workspace::from_projection(projection);
-        let filters: Vec<ChainFilter> = (0..8)
-            .map(|i| {
-                ChainFilter::new(
-                    format!("pattern-{i}"),
-                    String::new(),
-                    String::new(),
-                    false,
-                    false,
-                    false,
-                )
-            })
-            .collect();
-        for filter in &filters {
-            drop(ws.history_window(HistoryWindowOptions {
-                offset: 0,
-                limit: 10,
-                hide_submodules: false,
-                filter,
-                include_layout: true,
-            }));
-            drop(ws.graph_layout(false, 0, 10, filter));
-        }
-        // The cache keeps a single active slot: after eight distinct filters
-        // only the last snapshot is retained, never an accumulated O(V) set.
-        let cached_key = ws.current_view.as_ref().map(|(key, _)| key.clone());
-        assert_eq!(cached_key, Some((false, filters.last().unwrap().key())));
-        // Same-key reuse between GetWindow and GetLayout keeps the snapshot.
-        drop(ws.history_window(HistoryWindowOptions {
-            offset: 0,
-            limit: 10,
-            hide_submodules: false,
-            filter: filters.last().unwrap(),
-            include_layout: true,
-        }));
-        assert_eq!(
-            ws.current_view.as_ref().map(|(key, _)| key.clone()),
-            Some((false, filters.last().unwrap().key()))
-        );
-    }
-
-    #[test]
-    fn default_and_fixed_filters_hide_undated_and_trace_rows() {
-        // The fixed pregenerated viewer filter hides trace rows so Activity
-        // mode is served from the render snapshot. A `None` DTO maps to that
-        // fixed filter explicitly; `ChainFilter::default()` stays the raw
-        // baseline (hide_trace off), and raw mode sends an explicit
-        // `hide_trace: false` to materialize the live projection.
-        let default_filter = chain_filter_from_dto(None);
-        assert!(default_filter.key().hide_trace);
-        assert_eq!(
-            default_filter.key(),
-            fixed_view_filter().key(),
-            "None DTO must map to the fixed viewer filter"
-        );
-        assert!(fixed_view_filter().key().hide_trace);
-        assert!(
-            !ChainFilter::default().key().hide_trace,
-            "ChainFilter::default is the raw baseline"
-        );
-        assert!(
-            ChainFilter::default().key().hide_undated,
-            "existing ChainFilter::default behavior preserved"
-        );
-        assert!(
-            default_filter.key().hide_undated,
-            "the fixed Activity view must hide timestamp-zero rows"
-        );
-
-        let raw = chain_filter_from_dto(Some(&ChainFilterDto {
-            summary_pattern: String::new(),
-            kind_pattern: String::new(),
-            include_kind_pattern: String::new(),
-            hide_undated: false,
-            hide_trace: false,
-            splice: true,
-        }));
-        assert!(!raw.key().hide_trace);
-        assert_ne!(
-            raw.key(),
-            fixed_view_filter().key(),
-            "raw mode must not be served from the fixed-view snapshot"
-        );
-    }
-
-    /// Build a scored chunk for a search hit.
-    fn scored_chunk(op_id: OpId, score: f64, source: Source, text: &str) -> ScoredChunk {
-        let chunk_id = editchain_query::search::ChunkId {
+    /// Build a ranked lexical hit.
+    const fn lexical_hit(op_id: OpId, score: f64) -> LexicalHit {
+        LexicalHit {
             op_id,
-            chunk_ordinal: 0,
-        };
-        ScoredChunk {
-            chunk_id,
-            op_id,
+            source: LexicalSource::EditChain,
             score,
-            text: text.to_string(),
-            metadata: editchain_query::search::ChunkMetadata {
-                op_id,
-                chunk_id,
-                source,
-                session_id: Some(SessionId(10)),
-                actor_id: ActorId(1),
-                kind_tags: 0,
-                timestamp_ms: 1_000,
-                generation: 0,
-            },
         }
     }
 
@@ -8073,36 +7246,27 @@ mod tests {
             parents: ParentSet::One(turn.id),
             ..import_op(1, 3, true)
         };
-        let opts = editchain_project::ProjectionOptions {
-            bundle_metadata: true,
-        };
-        let projection =
-            HistoryProjection::from_ops_with(vec![turn.clone(), msg.clone(), meta.clone()], opts);
+        let projection = HistoryProjection::from_ops(vec![turn.clone(), msg.clone(), meta.clone()]);
         let mut ws = Workspace::from_projection(projection);
-        let filter = ChainFilter::default();
 
         let chunks = vec![
-            scored_chunk(turn.id, 1.0, Source::EditChain, "needle in turn"),
-            scored_chunk(msg.id, 3.5, Source::EditChain, "needle in folded message"),
-            scored_chunk(meta.id, 0.5, Source::EditChain, "needle in meta sub-op"),
+            lexical_hit(turn.id, 1.0),
+            lexical_hit(msg.id, 3.5),
+            lexical_hit(meta.id, 0.5),
         ];
-        let matches = ws.find_in_history(&chunks, &BTreeMap::new(), false, &filter);
+        let matches = ws.find_in_history(&chunks, &BTreeMap::new());
 
         assert_eq!(matches.len(), 1, "all three chunks dedupe into one row");
         assert_eq!(matches[0].node_key, turn.id.to_string());
         assert_eq!(matches[0].row, 0);
-        assert_eq!(matches[0].op_id, msg.id.to_string());
-        assert!((matches[0].score - 3.5).abs() < f64::EPSILON);
-        assert!(matches[0].git_oid.is_none());
-        assert!(matches[0].repository.is_none());
         // The O(V) op→row map is built once and cached on the view snapshot.
         assert!(ws
             .current_view
             .as_ref()
-            .is_some_and(|(_, snapshot)| snapshot.op_rows.is_some()));
-        let again = ws.find_in_history(&chunks, &BTreeMap::new(), false, &filter);
+            .is_some_and(|snapshot| snapshot.op_rows.is_some()));
+        let again = ws.find_in_history(&chunks, &BTreeMap::new());
         assert_eq!(again.len(), 1);
-        assert!((again[0].score - 3.5).abs() < f64::EPSILON);
+        assert_eq!(again[0].node_key, turn.id.to_string());
     }
 
     #[test]
@@ -8157,51 +7321,44 @@ mod tests {
             author: "agent".to_string(),
             meta: editchain_project::meta::NodeMeta::default(),
         };
-        let filter = ChainFilter::default();
         let projection = HistoryProjection::from_ops(vec![anchor.clone()]);
         let mut ws = Workspace::from_projection(projection);
         let expansion = node_expansion(&bundle, &HashMap::new(), &HashMap::new());
         // Hand-build the cached snapshot so the mapping test exercises the exact
         // Activity-view shape (bundle row + two expanded member slots).
-        ws.current_view = Some((
-            (false, filter.key()),
-            ViewSnapshot {
-                nodes: vec![bundle],
-                annotations: Vec::new(),
-                context: None,
-                sub_op_counts: vec![3],
-                expansions: vec![expansion],
-                expansion_spans: vec![ExpansionSpanDto {
-                    row: 0,
-                    descendant_count: 3,
-                }],
-                starts: vec![0, 4],
-                expanded_total: 4,
-                max_lane: 0,
-                op_rows: None,
-                git_rows: None,
-            },
-        ));
+        ws.current_view = Some(ViewSnapshot {
+            nodes: vec![bundle],
+            annotations: Vec::new(),
+            context: None,
+            sub_op_counts: vec![3],
+            expansions: vec![expansion],
+            expansion_spans: vec![ExpansionSpanDto {
+                row: 0,
+                descendant_count: 3,
+            }],
+            starts: vec![0, 4],
+            expanded_total: 4,
+            max_lane: 0,
+            op_rows: None,
+            git_rows: None,
+        });
 
         let chunks = vec![
-            scored_chunk(member_a.id, 2.0, Source::EditChain, "needle member a"),
-            scored_chunk(member_b.id, 1.0, Source::EditChain, "needle member b"),
-            scored_chunk(meta_of_b.id, 0.5, Source::EditChain, "needle meta of b"),
+            lexical_hit(member_a.id, 2.0),
+            lexical_hit(member_b.id, 1.0),
+            lexical_hit(meta_of_b.id, 0.5),
         ];
-        let matches = ws.find_in_history(&chunks, &BTreeMap::new(), false, &filter);
+        let matches = ws.find_in_history(&chunks, &BTreeMap::new());
 
         assert_eq!(matches.len(), 1, "members dedupe into the bundle row");
         assert_eq!(matches[0].node_key, anchor.id.to_string());
         assert_eq!(matches[0].row, 0, "bundle parent row offset");
-        assert_eq!(matches[0].op_id, member_a.id.to_string());
-        assert!((matches[0].score - 2.0).abs() < f64::EPSILON);
-        assert_eq!(matches[0].summary, "2 tool steps");
     }
 
     #[test]
     fn find_in_history_excludes_hits_with_no_row_in_the_active_view() {
         // turn1 is dated and visible; turn2 lives in its own undated session,
-        // so `hide_undated` removes it from the view (sessions with no dated
+        // so Activity omits it (sessions with no dated
         // rows keep `Unknown` time — no BundleAnchor display time is assigned).
         // A hit inside turn2's folded child must be dropped even though the op
         // exists in the projection.
@@ -8219,37 +7376,23 @@ mod tests {
             m.content = Payload::Inline(b"needle-hidden".to_vec());
         }
         msg2.scope = ScopeRef::Session(SessionId(20));
-        let opts = editchain_project::ProjectionOptions {
-            bundle_metadata: true,
-        };
-        let projection = HistoryProjection::from_ops_with(
-            vec![turn1.clone(), msg1.clone(), turn2.clone(), msg2.clone()],
-            opts,
-        );
+        let projection = HistoryProjection::from_ops(vec![
+            turn1.clone(),
+            msg1.clone(),
+            turn2.clone(),
+            msg2.clone(),
+        ]);
         let mut ws = Workspace::from_projection(projection);
-        let filter = ChainFilter::new(
-            String::new(),
-            String::new(),
-            String::new(),
-            true,
-            false,
-            false,
-        );
-
-        let chunks = vec![
-            scored_chunk(msg1.id, 1.0, Source::EditChain, "needle visible"),
-            scored_chunk(msg2.id, 2.0, Source::EditChain, "needle-hidden"),
-        ];
-        let matches = ws.find_in_history(&chunks, &BTreeMap::new(), false, &filter);
+        let chunks = vec![lexical_hit(msg1.id, 1.0), lexical_hit(msg2.id, 2.0)];
+        let matches = ws.find_in_history(&chunks, &BTreeMap::new());
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].node_key, turn1.id.to_string());
         assert_eq!(matches[0].row, 0);
-        assert!(matches[0].text.contains("needle visible"));
     }
 
     #[test]
-    fn find_in_history_git_hits_resolve_by_real_identity_and_respect_submodules() {
+    fn find_in_history_excludes_nested_repository_git_hits() {
         let mut bytes = [0u8; 32];
         bytes[0] = 0xbb;
         let oid = GitOid::new(editchain_core::GitObjectFormat::Sha1, bytes);
@@ -8305,31 +7448,14 @@ mod tests {
                 is_submodule: true,
             },
         );
-        let chunks = vec![scored_chunk(synthetic, 1.0, Source::Git, "needle-git")];
+        let chunks = vec![LexicalHit {
+            source: LexicalSource::Git,
+            ..lexical_hit(synthetic, 1.0)
+        }];
 
-        // With submodules visible, the commit row resolves by real identity.
-        // (The raw baseline hides nothing undated here; the commit is dated.)
-        let raw = ChainFilter::new(
-            String::new(),
-            String::new(),
-            String::new(),
-            false,
-            false,
-            false,
-        );
-        let visible = ws.find_in_history(&chunks, &identities, false, &raw);
-        assert_eq!(visible.len(), 1);
-        assert_eq!(visible[0].node_key, oid.to_hex());
-        assert_eq!(visible[0].row, 0);
-        assert_eq!(visible[0].git_oid.as_deref(), Some(oid.to_hex().as_str()));
-        assert_eq!(visible[0].repository.as_deref(), Some("2"));
-        assert_eq!(visible[0].kind, "git");
-        assert!(visible[0].is_submodule);
-
-        // With `hide_submodules` (as the fixed viewer sends), the same hit has
-        // no row in the active view and is dropped — never resolved to a
-        // synthetic op id or phantom offset.
-        let hidden = ws.find_in_history(&chunks, &identities, true, &raw);
+        // The fixed viewer hides nested repositories, so this identity has no
+        // row and is dropped rather than mapped to a phantom offset.
+        let hidden = ws.find_in_history(&chunks, &identities);
         assert!(hidden.is_empty());
     }
 }

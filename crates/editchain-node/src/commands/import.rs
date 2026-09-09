@@ -381,14 +381,7 @@ mod tests {
                 codex_helper,
                 codex_helper_arg,
             }),
-            Commands::Init { .. }
-            | Commands::Append { .. }
-            | Commands::Dump { .. }
-            | Commands::Merge { .. }
-            | Commands::Search { .. }
-            | Commands::Tail { .. }
-            | Commands::Retrieve { .. }
-            | Commands::PrepareView { .. } => None,
+            Commands::PrepareView { .. } => None,
         }
     }
 

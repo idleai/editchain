@@ -1,14 +1,9 @@
 #![doc = "Tests for the lexical index module."]
 
-// Crate-level dependency markers (used by Cargo for feature resolution).
-use editchain_embed as _;
-use half as _;
-use roaring as _;
 use tantivy as _;
 
 use editchain_core::*;
 use editchain_index::lexical::LexicalIndex;
-use editchain_query::search::SearchFilters;
 
 #[test]
 #[expect(
@@ -40,8 +35,7 @@ fn index_and_search_message() {
 
     index.commit().unwrap();
 
-    let filters = SearchFilters::default();
-    let results = index.search_internal("hello", &filters, 10).unwrap();
+    let results = index.search_internal("hello", 10).unwrap();
     assert!(!results.is_empty());
     assert_eq!(results[0].op_id.seq, 1);
 }

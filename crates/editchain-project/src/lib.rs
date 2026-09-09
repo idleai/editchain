@@ -5,19 +5,17 @@
 //! intentionally free of filesystem and process dependencies so it can later
 //! target WASM.
 
-// Crate-level dependency markers (used by Cargo for feature resolution).
-use regex as _;
 use serde as _;
 
-/// General chain filtering with truncation.
 pub mod activity;
-pub mod filter;
 /// Deterministic lane layout for graph rendering.
 pub mod layout;
 /// Deterministic semantic metadata for projected history rows.
 pub mod meta;
 /// Provider-neutral readability taxonomy shared with the protocol layer.
 pub mod taxonomy;
+
+mod view;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -692,8 +690,8 @@ impl HistoryNode {
         self.record_meta().activity_kind
     }
 
-    /// The render prominence of this row (`Trace` rows are hidden by
-    /// `hide_trace` chain filtering).
+    /// The render prominence of this row (`Trace` rows are hidden from the
+    /// Activity view).
     #[must_use]
     pub fn visibility(&self) -> RowVisibility {
         self.record_meta().visibility
@@ -745,9 +743,6 @@ pub struct HistoryProjection {
     /// exposed by [`Self::relationship_notes`]. Keeping the raw index here means
     /// collapse-time logic never needs the canonical map before it exists.
     relationship_notes: HashMap<OpId, Vec<Op>>,
-    /// Explicit projection options (bundling policy, etc.). Threaded through so
-    /// projection behavior is deterministic and a real cache key — never global.
-    options: ProjectionOptions,
     /// Git commit OID hexes of the currently projected commits, cached so
     /// per-row parent lifting stays O(parents) instead of cloning the full
     /// present set (or scanning every commit) for each windowed row.
@@ -755,7 +750,7 @@ pub struct HistoryProjection {
     /// Cached collapsed (top-level-row) projection with its canonical
     /// representative map and canonicalized relationship notes. Computed once at
     /// construction so every per-row path (`ordered_nodes`, `independent_chains`,
-    /// `lifted_parent_keys`, layout, filtering, windowed edges) reads a stable
+    /// `lifted_parent_keys`, layout, Activity view, windowed edges) reads a stable
     /// canonical view without rebuilding it per row. The collapse is ~linear in
     /// op count and cheap relative to the per-row consumers that reuse it.
     collapsed_projection: CollapsedProjection,
@@ -763,8 +758,8 @@ pub struct HistoryProjection {
 
 /// Result of collapsing raw imports into top-level history rows.
 ///
-/// Alongside the rows carries the reversible bundle membership maps so layout/filter
-/// can preserve chain continuity when a child's parent is a bundled META op — without
+/// Alongside the rows carries the reversible bundle membership maps so layout/view
+/// code can preserve chain continuity when a child's parent is a bundled META op — without
 /// ever rewriting stored `Op.parents`.
 ///
 /// The central invariant of the semantic collapse: **every source operation that
@@ -775,7 +770,7 @@ pub struct HistoryProjection {
 /// occurrence, or a relationship fact folded out of rendering) to the
 /// op id of the visible row that represents it. Relationship anchors and targets
 /// are canonicalized through this map before any parent-key construction, lane
-/// allocation, filtering, or windowed edge geometry runs, so a folded endpoint can
+/// allocation, Activity-view shaping, or windowed edge geometry runs, so a folded endpoint can
 /// never dangle or draw a phantom interval.
 #[derive(Debug, Clone, Default)]
 struct CollapsedProjection {
@@ -804,7 +799,7 @@ struct CollapsedProjection {
     /// edge-construction path then lifts folded physical targets through
     /// `representative` via [`canonicalize_parents`], so a virtual edge never
     /// reaches lane allocation or windowed edge geometry with a phantom key.
-    /// Built once per collapse so per-row paths (layout/filter/order) don't
+    /// Built once per collapse so per-row paths (layout/view/order) don't
     /// re-derive it.
     canonical_notes: HashMap<OpId, Vec<Op>>,
     /// Precomputed `node_key` set of every top-level row (the "present" rows
@@ -813,33 +808,20 @@ struct CollapsedProjection {
     present: std::collections::HashSet<String>,
 }
 
-/// Explicit, versionable options controlling projection behavior.
-///
-/// q6 Phase-1: replaces the process-global `META_BUNDLE_ENABLED` toggle. Bundling
-/// stays OFF by default; when enabled it follows explicit graph parents and
-/// never touches stored `Op.parents`/clocks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ProjectionOptions {
-    /// Whether metadata-only raw imports bundle as sub-ops of their unique exact
-    /// parent row. Default `false`.
-    pub bundle_metadata: bool,
-}
-
 impl HistoryProjection {
-    /// Create an empty projection with default options.
+    /// Create an empty projection.
     #[must_use]
     pub fn new() -> Self {
         Self {
             ops: Vec::new(),
             git: GitProjection::new(),
             relationship_notes: HashMap::new(),
-            options: ProjectionOptions::default(),
             git_present: std::collections::HashSet::new(),
             collapsed_projection: CollapsedProjection::default(),
         }
     }
 
-    /// Build a projection from a set of operations with default options.
+    /// Build a projection from a set of operations.
     ///
     /// Operations are stored in input order; git commits are projected into
     /// the `GitProjection` keyed by `(RepositoryId, GitOid)`. Structural
@@ -847,15 +829,6 @@ impl HistoryProjection {
     /// virtual graph edges.
     #[must_use]
     pub fn from_ops(ops: Vec<Op>) -> Self {
-        Self::from_ops_with(ops, ProjectionOptions::default())
-    }
-
-    /// Build a projection from a set of operations with explicit options.
-    ///
-    /// Options are a cache key: two projections built from the same ops with
-    /// different options may render differently but only per that option.
-    #[must_use]
-    pub fn from_ops_with(ops: Vec<Op>, options: ProjectionOptions) -> Self {
         let mut git = GitProjection::new();
         let mut relationship_notes: HashMap<OpId, Vec<Op>> = HashMap::new();
         for op in &ops {
@@ -875,12 +848,11 @@ impl HistoryProjection {
             ops,
             git,
             relationship_notes,
-            options,
             git_present,
             collapsed_projection: CollapsedProjection::default(),
         };
         // Build the canonical collapse eagerly so `relationship_notes` and every
-        // layout/filter/order path see a stable canonical view from the start
+        // layout/view/order path see a stable canonical view from the start
         // and reused by every row/layout path.
         projection.collapsed_projection = projection.collapsed_ops();
         projection
@@ -895,7 +867,7 @@ impl HistoryProjection {
     /// Used by [`HistoryNode::parent_keys`] so virtual
     /// fork/subagent/reconnect edges are reachable from rendered rows even when
     /// their source ops were folded into a collapsed bundle; targets are lifted
-    /// to visible rows (or dropped) by every layout/filter/order path through the
+    /// to visible rows (or dropped) by every layout/view/order path through the
     /// canonical representative map.
     #[must_use]
     pub fn relationship_notes(&self) -> &HashMap<OpId, Vec<Op>> {
@@ -924,21 +896,22 @@ impl HistoryProjection {
         self.ordered_nodes()
     }
 
-    /// Returns history nodes (newest-first) with a [`filter::ChainFilter`] applied.
+    /// Returns the fixed VS Code Activity-view nodes (newest-first).
     ///
-    /// Hidden intermediate nodes are removed and (when the filter splices) their
-    /// causal edges are reconnected to the nearest kept ancestors. The result is
-    /// in the same canonical order as [`Self::nodes`], so layout row indices stay
-    /// in lockstep with window row positions.
+    /// Timestamp-less metadata and semantic trace rows are removed, with their
+    /// causal edges reconnected to the nearest visible ancestors. Dated
+    /// structural relationship rows remain visible. The result keeps the same
+    /// canonical order as [`Self::nodes`].
     #[must_use]
-    pub fn filtered_nodes(&self, filter: &filter::ChainFilter) -> Vec<HistoryNode> {
+    pub fn activity_nodes(&self) -> Vec<HistoryNode> {
         let nodes = self.ordered_nodes();
-        filter::apply_owned(
+        let structural = self.structural_row_keys(&nodes);
+        view::apply(
             nodes,
             &self.git.links,
             self.relationship_notes(),
             &self.collapsed_projection.representative,
-            filter,
+            &structural,
         )
     }
 
@@ -952,7 +925,7 @@ impl HistoryProjection {
     /// top-level row nor folded into one (for example a synthetic git-index op
     /// id, which is never a projection node). Find-in-chain callers use this to
     /// lift a search hit to its visible row, then check that row against the
-    /// active filtered snapshot so hits hidden by the current view are dropped.
+    /// Activity snapshot so hidden hits are dropped.
     #[must_use]
     pub fn visible_op_id(&self, op_id: OpId) -> Option<OpId> {
         canonical_op_id(
@@ -1189,10 +1162,9 @@ impl HistoryProjection {
     /// meaningful node per source line instead of a dense star. Non-import ops
     /// (e.g. `ChainStart`, git-link records) are kept as-is.
     ///
-    /// Metadata-only raw imports (tagged `META`) render as their own top-level
-    /// nodes by default. When [`ProjectionOptions::bundle_metadata`] is enabled,
-    /// a metadata row is bundled only when its unique graph parent resolves to
-    /// another collapsed import row. Provider occurrences use their explicit
+    /// Metadata-only raw imports (tagged `META`) bundle only when their unique
+    /// graph parent resolves to another collapsed import row. Provider
+    /// occurrences use their explicit
     /// provider relationship; records without provider identity use their stored
     /// source parent. Metadata chains are followed transitively. Missing,
     /// ambiguous, cyclic, and non-import parents leave the metadata standalone.
@@ -1410,13 +1382,11 @@ impl HistoryProjection {
             }
         }
 
-        if self.options.bundle_metadata {
-            Self::bundle_metadata_by_exact_parent(
-                &mut result,
-                &mut representative,
-                &resolved_relationship_notes,
-            );
-        }
+        Self::bundle_metadata_by_exact_parent(
+            &mut result,
+            &mut representative,
+            &resolved_relationship_notes,
+        );
 
         // Tool-grouping pass: fold each tool RESULT into its tool CALL's sub-ops
         // so a call + its result render as one row (the result revealed on click).
@@ -2091,7 +2061,7 @@ impl HistoryProjection {
     ///
     /// The context bundles all O(V) derived data (keys, row map, lane map, lane
     /// assignment) so per-window edge computation is O(window). Build once per
-    /// filter state and reuse across scrolls/resizes.
+    /// Activity-view snapshot and reuse across scrolls/resizes.
     #[must_use]
     pub fn layout_context(&self, sorted: &[HistoryNode]) -> layout::LayoutContext {
         let keys = Self::layout_keys(sorted);
@@ -2251,7 +2221,7 @@ impl HistoryProjection {
     ///
     /// Structural rows carry virtual edges, so a view must never fold them away:
     /// the Activity execute-run bundling excludes them exactly like the chain
-    /// filter preserves them from every hide predicate. Targets are lifted to
+    /// Activity view preserves them from trace removal. Targets are lifted to
     /// their canonical visible rows (or dropped when unresolvable in this view).
     #[must_use]
     pub fn structural_row_keys(&self, nodes: &[HistoryNode]) -> std::collections::HashSet<String> {
@@ -2645,7 +2615,7 @@ fn row_node_keys(nodes: &[HistoryNode]) -> std::collections::HashSet<String> {
 /// lane allocation or windowed edge geometry as a phantom. Non-op keys (git OID
 /// hex) are external anchors and are kept for the caller's row lookup. The
 /// result is deduplicated preserving first-occurrence order. This never rewrites
-/// stored `Op.parents`; it is a layout/filter-time lift only.
+/// stored `Op.parents`; it is a layout/view-time lift only.
 fn canonicalize_parents(
     parents: Vec<String>,
     representative: &HashMap<OpId, OpId>,

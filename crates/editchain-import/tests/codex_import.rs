@@ -640,11 +640,7 @@ fn token_usage_and_terminal_events_fold_into_the_last_semantic_turn() {
         "top-level usage records belong to the system metadata lane"
     );
 
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
-    let history =
-        editchain_project::HistoryProjection::from_ops_with(harness.ops.ops.clone(), opts);
+    let history = editchain_project::HistoryProjection::from_ops(harness.ops.ops.clone());
     let semantic_key = raw[1].id.to_string();
     let semantic = history
         .nodes()

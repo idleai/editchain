@@ -2,7 +2,6 @@
 // or by derive macros.
 #[cfg(test)]
 use proptest as _;
-#[cfg_attr(not(feature = "use-std"), allow(unused_extern_crates))]
 use serde as _;
 
 use editchain_core::Op;

@@ -4,7 +4,7 @@ CRDT-based edit chain built from agent session history, browsed through the **Ed
 
 ## VS Code extension
 
-The primary UI lives in [`extensions/vscode-editchain/`](./extensions/vscode-editchain/): a read-only unified history explorer that overlays EditChain operations with live Git history. The history view is **Rust/WASM — the sole renderer**: `editchain-history.open` opens one panel titled **"EditChain History"** bootstrapped by the tiny `media/rust-history/loader.js` + generated wasm-bindgen glue, with the `editchain-gpu-preview` crate owning the view state (`HistoryAppState`), row model (`RowSpec`), and the web-sys DOM/accessibility surface (each row's graph is an inline `svg.graph-row-fragment`; no canvas overlay). The webview loads no other scripts, and the renderer is exercised headlessly by `test/harness/rust.html` (rustSmoke) and in real VS Code by the e2e/visual suites — full details in the extension README.
+The primary UI lives in [`extensions/vscode-editchain/`](./extensions/vscode-editchain/): a read-only unified history explorer that overlays EditChain operations with live Git history. The history view is **Rust/WASM — the sole renderer**: `editchain-history.open` opens one panel titled **"EditChain History"** bootstrapped by the tiny `media/rust-history/loader.js` + generated wasm-bindgen glue, with the `editchain-history-renderer` crate owning the view state (`HistoryAppState`), row model (`RowSpec`), and the web-sys DOM/accessibility surface (each row's graph is an inline `svg.graph-row-fragment`; no canvas overlay). The webview loads no other scripts, and the renderer is exercised headlessly by `test/harness/rust.html` (rustSmoke) and in real VS Code by the e2e/visual suites — full details in the extension README.
 
 Build the native service and the extension:
 
@@ -17,21 +17,21 @@ npm run compile
 
 Then open the folder in VS Code and press F5, or package a `.vsix` — full instructions in [`extensions/vscode-editchain/README.md`](./extensions/vscode-editchain/README.md). Open the viewer via the command palette → **"EditChain: Open History Explorer"**.
 
-## CLI
+## Ingestion CLI
 
-The native CLI initializes chains and imports/searches history:
+The native CLI keeps only the two workflows that feed the extension: importing
+session history and preparing its immutable render snapshot.
 
 ```sh
 cargo build
-cargo run --bin editchain -- init my-chain
 cargo run --bin editchain -- import \
   --sessions-dir /path/to/cc-sessions --workspace /path/to/repo --chain ./outputs/cc-chain
 cargo build --manifest-path tools/codex-session-exporter/Cargo.toml
 cargo run --bin editchain -- import --provider codex \
   --sessions-dir ~/.codex/sessions --workspace /path/to/repo --chain ./outputs/codex-chain \
   --codex-helper ./tools/codex-session-exporter/target/debug/codex-session-exporter
-cargo run --bin editchain -- search ./outputs/cc-chain "query" --mode hybrid --top 10
-cargo run --bin editchain -- retrieve ./outputs/cc-chain --op "<op-id>"
+cargo run --bin editchain -- prepare-view \
+  --workspace /path/to/repo --chain .editchain
 ```
 
 Codex import currently uses an isolated local bridge against a sibling `codex` checkout; see [the exporter contract](./tools/codex-session-exporter/README.md). The bridge boundary is versioned so it can later move behind a native Codex command without coupling the chain or viewer schemas to Codex internals.

@@ -1,8 +1,7 @@
 //! Live Git repository resolution for the unified history model.
 //!
 //! This crate wraps `gix` to discover repositories in a workspace, resolve
-//! commit/tree/blob/ref/diff objects without mutating or fetching, and merge
-//! imported and live commit entities by `(RepositoryId, GitOid)`.
+//! commit/tree/blob/ref/diff objects without mutating or fetching.
 
 #[cfg(test)]
 use tempfile as _;
@@ -11,8 +10,6 @@ use tempfile as _;
 pub mod diff;
 /// Repository discovery and identity derivation.
 pub mod discover;
-/// Merging imported and live commit entities.
-pub mod merge;
 /// Object resolution (commits, trees, refs, diffs) via `gix`.
 pub mod resolve;
 
@@ -21,7 +18,6 @@ pub use diff::{
     GitFileStatus, GitPathObject,
 };
 pub use discover::{discover_repositories, open_repository, RepositoryDiscovery, RepositoryHandle};
-pub use merge::{merge_commit_entities, MergeOutcome};
 pub use resolve::{
     resolve_branch_tip_at_time, resolve_commit, resolve_commit_prefix, walk_history,
     CommitResolution, ResolutionError,

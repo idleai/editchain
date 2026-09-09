@@ -81,7 +81,7 @@ pub enum Visibility {
     /// A supporting row (bundled metadata revealed on demand).
     Supporting,
     /// A trace row (duplicate/echo/transport noise) — hidden by
-    /// `hide_trace` filtering.
+    /// Activity-view trace hiding.
     Trace,
     /// Visibility could not be determined.
     #[default]

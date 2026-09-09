@@ -14,12 +14,10 @@ use std::process::Command;
 use gix_object as _;
 use sha2 as _;
 
-use editchain_core::{
-    GitAvailability, GitCommitEntity, GitObjectFormat, GitOid, GitSignature, Payload, RepositoryId,
-};
+use editchain_core::{GitAvailability, GitObjectFormat, GitOid, Payload};
 use editchain_git::{
-    discover_repositories, merge_commit_entities, repository_id_from_path, resolve_commit,
-    resolve_commit_prefix, RepositoryHandle,
+    discover_repositories, repository_id_from_path, resolve_commit, resolve_commit_prefix,
+    RepositoryHandle,
 };
 
 /// Create a temporary git repository with one commit and return its path.
@@ -166,81 +164,4 @@ fn resolve_commit_prefix_requires_an_unambiguous_commit_object() {
         resolve_commit_prefix(&handle, "not-hexadecimal").is_none(),
         "non-hexadecimal strings are not object prefixes"
     );
-}
-
-#[test]
-fn merge_prefers_live_and_keeps_imported_record() {
-    let imported = GitCommitEntity {
-        repository: RepositoryId(7),
-        object_format: GitObjectFormat::Sha1,
-        oid: GitOid::from_sha1([0x01; 20]),
-        imported_record: Some(editchain_core::OpId::new(editchain_core::NodeId(1), 0, 5)),
-        availability: GitAvailability::ImportedOnly,
-        tree: GitOid::from_sha1([0x02; 20]),
-        parents: Vec::new(),
-        author: GitSignature {
-            name: Payload::Inline(b"Alice".to_vec()),
-            email: Payload::Inline(b"alice@example.com".to_vec()),
-            when: 1_700_000_000,
-        },
-        committer: GitSignature {
-            name: Payload::Inline(b"Alice".to_vec()),
-            email: Payload::Inline(b"alice@example.com".to_vec()),
-            when: 1_700_000_100,
-        },
-        authored_at: 1_700_000_000,
-        committed_at: 1_700_000_100,
-        message: Payload::Inline(b"imported msg".to_vec()),
-        imported_refs: vec![Payload::Inline(b"refs/heads/main".to_vec())],
-        live_refs: Vec::new(),
-        changed_paths: Vec::new(),
-    };
-
-    // Live version has a different message (authoritative).
-    let mut live = imported.clone();
-    live.message = Payload::Inline(b"live msg".to_vec());
-    live.availability = GitAvailability::Resolved;
-
-    let outcome = merge_commit_entities(Some(imported), Some(live)).expect("merge");
-    assert!(outcome.used_live);
-    // Live message wins.
-    match &outcome.merged.message {
-        Payload::Inline(b) => assert_eq!(b, b"live msg"),
-        _ => panic!("expected inline"),
-    }
-    // Imported record link retained.
-    assert!(outcome.merged.imported_record.is_some());
-}
-
-#[test]
-fn merge_imported_only_when_no_live() {
-    let imported = GitCommitEntity {
-        repository: RepositoryId(7),
-        object_format: GitObjectFormat::Sha1,
-        oid: GitOid::from_sha1([0x01; 20]),
-        imported_record: None,
-        availability: GitAvailability::ImportedOnly,
-        tree: GitOid::from_sha1([0x02; 20]),
-        parents: Vec::new(),
-        author: GitSignature {
-            name: Payload::Inline(b"Alice".to_vec()),
-            email: Payload::Inline(b"alice@example.com".to_vec()),
-            when: 0,
-        },
-        committer: GitSignature {
-            name: Payload::Inline(b"Alice".to_vec()),
-            email: Payload::Inline(b"alice@example.com".to_vec()),
-            when: 0,
-        },
-        authored_at: 0,
-        committed_at: 0,
-        message: Payload::Inline(b"msg".to_vec()),
-        imported_refs: Vec::new(),
-        live_refs: Vec::new(),
-        changed_paths: Vec::new(),
-    };
-
-    let outcome = merge_commit_entities(Some(imported.clone()), None).expect("merge");
-    assert!(!outcome.used_live);
-    assert_eq!(outcome.merged.message, imported.message);
 }

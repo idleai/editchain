@@ -1,12 +1,10 @@
-//! Tests for deterministic semantic metadata (readability taxonomy) and
-//! `hide_trace` chain filtering in the projection.
+//! Tests for deterministic semantic metadata and Activity-view visibility.
 
 #![expect(
     clippy::indexing_slicing,
     reason = "Tests index into freshly built vectors"
 )]
 // Crate-level dependency markers (used by Cargo for feature resolution).
-use regex as _;
 use serde as _;
 use serde_json as _;
 
@@ -14,7 +12,6 @@ use editchain_core::{
     ActorId, Clock, ImportOp, MessageOp, NodeId, NoteOp, NoteRelationship, Op, OpId, OpKind,
     ParentSet, Payload, ScopeRef, SessionId, Tags, ToolOp, ToolStage, TurnId,
 };
-use editchain_project::filter::ChainFilter;
 use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
 
@@ -223,12 +220,7 @@ fn codex_turn_abort_reason_folds_muted_state_onto_visible_anchor() {
     );
     abort.tags |= Tags::META;
 
-    let projection = HistoryProjection::from_ops_with(
-        vec![anchor, message, abort],
-        editchain_project::ProjectionOptions {
-            bundle_metadata: true,
-        },
-    );
+    let projection = HistoryProjection::from_ops(vec![anchor, message, abort]);
     let mut nodes = projection.nodes();
     assert_eq!(nodes.len(), 1);
     let node = nodes.remove(0);
@@ -395,23 +387,16 @@ fn compacted_checkpoint_stays_primary_plan_content() {
     let compacted_id = compacted.id;
     let projection = HistoryProjection::from_ops(vec![compacted]);
 
-    let raw_nodes = projection.nodes();
-    let checkpoint = raw_nodes
+    let canonical_nodes = projection.nodes();
+    let checkpoint = canonical_nodes
         .iter()
         .find(|node| node.node_key() == compacted_id.to_string())
-        .expect("Raw mode keeps context checkpoint");
+        .expect("canonical projection keeps context checkpoint");
     assert_eq!(checkpoint.visibility(), Visibility::Primary);
     assert_eq!(checkpoint.record_role(), RecordRole::Narrative);
     assert_eq!(checkpoint.activity_kind(), ActivityKind::Plan);
 
-    let activity_nodes = projection.filtered_nodes(&ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        false,
-        true,
-        true,
-    ));
+    let activity_nodes = projection.activity_nodes();
     assert_eq!(activity_nodes.len(), 1);
     assert_eq!(activity_nodes[0].node_key(), compacted_id.to_string());
 }
@@ -1065,7 +1050,7 @@ fn user_role_response_item_is_never_demoted_by_event_duplicate() {
 }
 
 #[test]
-fn trace_filter_hides_unconditionally_and_splices_chain() {
+fn activity_view_hides_trace_rows_and_splices_chain() {
     // chain: import_a (message) -> trace envelope -> import_c (message).
     let a = raw_import(
         1,
@@ -1092,15 +1077,7 @@ fn trace_filter_hides_unconditionally_and_splices_chain() {
     let mc = child(5, 1, c.id, message_op("gamma"));
     let projection = HistoryProjection::from_ops(vec![a.clone(), trace.clone(), c.clone(), ma, mc]);
 
-    let filter = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        false,
-        true,
-        true,
-    );
-    let nodes = projection.filtered_nodes(&filter);
+    let nodes = projection.activity_nodes();
     let keys: Vec<String> = nodes
         .iter()
         .map(editchain_project::HistoryNode::node_key)
@@ -1126,9 +1103,8 @@ fn trace_filter_hides_unconditionally_and_splices_chain() {
 }
 
 #[test]
-fn trace_filter_hides_trace_leaves_too() {
-    // A lone trace leaf is noise and must not survive as an endpoint anchor,
-    // matching `hide_undated` semantics.
+fn activity_view_hides_trace_leaves_too() {
+    // A lone trace leaf is noise and must not survive as an endpoint anchor.
     let a = raw_import(
         1,
         1,
@@ -1146,21 +1122,13 @@ fn trace_filter_hides_trace_leaves_too() {
     let ma = child(3, 1, a.id, message_op("alpha"));
     let projection = HistoryProjection::from_ops(vec![a.clone(), trace.clone(), ma]);
 
-    let filter = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        false,
-        true,
-        true,
-    );
-    let nodes = projection.filtered_nodes(&filter);
+    let nodes = projection.activity_nodes();
     assert_eq!(nodes.len(), 1);
     assert_eq!(nodes[0].node_key(), a.id.to_string());
 }
 
 #[test]
-fn hide_trace_preserves_structural_anchor_rows() {
+fn activity_view_preserves_structural_trace_anchor_rows() {
     // A SubagentOf note anchored on a trace row keeps that row visible so the
     // virtual branch edge survives.
     let spawn = raw_import(
@@ -1208,22 +1176,14 @@ fn hide_trace_preserves_structural_anchor_rows() {
         note,
     ]);
 
-    let filter = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        false,
-        true,
-        true,
-    );
-    let nodes = projection.filtered_nodes(&filter);
+    let nodes = projection.activity_nodes();
     let keys: Vec<String> = nodes
         .iter()
         .map(editchain_project::HistoryNode::node_key)
         .collect();
     assert!(
         keys.contains(&trace.id.to_string()),
-        "structural anchor preserved under hide_trace: {keys:?}"
+        "structural anchor preserved in Activity: {keys:?}"
     );
     let trace_node = nodes
         .iter()
@@ -1274,47 +1234,6 @@ fn non_turn_rows_have_no_turn_id() {
     let message = child(2, 1, raw.id, message_op("hi"));
     let node = sole_node(vec![raw, message]);
     assert_eq!(node.turn_id(), None);
-}
-
-#[test]
-fn filter_key_and_is_empty_include_hide_trace() {
-    let hide = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        false,
-        false,
-        true,
-    );
-    let keep = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        false,
-        false,
-        false,
-    );
-    assert_ne!(
-        hide.key(),
-        keep.key(),
-        "hide_trace must participate in cache keys"
-    );
-    assert!(!hide.is_empty());
-    assert!(keep.is_empty());
-
-    let default_filter = ChainFilter::default();
-    assert!(
-        !default_filter.is_empty(),
-        "default filter still hides undated rows"
-    );
-    assert!(
-        !default_filter.key().hide_trace,
-        "ChainFilter::default is the raw baseline; hide_trace is an explicit choice"
-    );
-    assert!(
-        default_filter.key().hide_undated,
-        "existing default behavior preserved"
-    );
 }
 
 #[test]

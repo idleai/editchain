@@ -3,17 +3,14 @@ resolver = "2"
 members = [
     "crates/editchain-core",
     "crates/editchain-codec",
-    "crates/editchain-sync",
     "crates/editchain-node",
     "crates/editchain-import",
-    "crates/editchain-query",
     "crates/editchain-index",
-    "crates/editchain-embed",
     "crates/editchain-git",
     "crates/editchain-project",
     "crates/editchain-protocol",
     "crates/editchain-vscode-service",
-    "crates/editchain-gpu-preview",
+    "crates/editchain-history-renderer",
 ]
 
 [workspace.package]
@@ -106,13 +103,10 @@ redundant_explicit_links = "deny"
 unescaped_backticks = "deny"
 
 [workspace.dependencies]
-serde = { version = "1", default-features = false, features = ["derive"] }
-postcard = { version = "1", default-features = false }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }
 proptest = "1"
-regex = "1"
 serde_json = "1"
-bytemuck = { version = "=1.25.2", default-features = false }
-wgpu = { version = "=30.0.1", default-features = false, features = ["std", "wgsl", "webgpu", "webgl", "fragile-send-sync-non-atomic-wasm"] }
 wasm-bindgen = { version = "=0.2.127", default-features = false }
 wasm-bindgen-futures = { version = "=0.4.77", default-features = false }
 web-sys = { version = "=0.3.104", default-features = false }

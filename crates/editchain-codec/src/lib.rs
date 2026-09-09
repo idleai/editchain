@@ -1,6 +1,4 @@
-#![cfg_attr(not(feature = "use-std"), no_std)]
-#![doc = "Editchain binary codec — `no_std` frame encoding via postcard."]
-#![cfg_attr(not(feature = "use-std"), allow(unused_extern_crates))]
+#![doc = "Editchain binary codec — frame encoding via postcard."]
 
 use serde as _;
 

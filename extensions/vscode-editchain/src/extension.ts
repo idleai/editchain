@@ -288,7 +288,7 @@ function openHistoryView(
     }
     // The Rust/WASM renderer speaks the production generic bridge: numeric-id
     // { body: <one-key envelope> } frames. ONLY the read-only envelopes the
-    // renderer issues are forwarded (GetWindow, FindInHistory, legacy Search);
+    // renderer issues are forwarded (GetWindow and FindInHistory);
     // anything else (Open, ResolveObject, GetNodeDetails, ...) is rejected
     // visibly instead of reaching a non-read-only service call. The explicitly
     // handled openJson UI action above remains outside this bridge.
@@ -303,18 +303,16 @@ function openHistoryView(
       typeof body === 'object' &&
       !Array.isArray(body) &&
       Object.keys(body).length === 1 &&
-      (hasOwnProperty(body, 'GetWindow') ||
-        hasOwnProperty(body, 'FindInHistory') ||
-        hasOwnProperty(body, 'Search'));
+      (hasOwnProperty(body, 'GetWindow') || hasOwnProperty(body, 'FindInHistory'));
     if (id === null || !isForwardable) {
       output?.appendLine(
-        '[webview] rejected request (only GetWindow/FindInHistory/Search are forwarded): ' +
+        '[webview] rejected request (only GetWindow/FindInHistory are forwarded): ' +
           JSON.stringify(msg)
       );
       panel.webview.postMessage({
         id: id === null ? -1 : id,
         body: {
-          Error: 'EditChain History: only GetWindow, FindInHistory and Search requests are forwarded by the host',
+          Error: 'EditChain History: only GetWindow and FindInHistory requests are forwarded by the host',
         },
       });
       return;
@@ -752,16 +750,15 @@ class DiffContentProvider implements vscode.TextDocumentContentProvider {
 /** Build the single history panel's webview HTML (the Rust/WASM history view).
  *
  * This is the ONLY panel the extension opens. The page is the EXACT production
- * scaffold (media/main.css + media/gpu-preview/gpu-preview.css and the
- * controls/rows/renderer scaffold) with media/rust-history/loader.js as its
+ * scaffold (media/main.css and the controls/rows surface) with
+ * media/rust-history/loader.js as its
  * ONLY script: the loader initializes the wasm-bindgen module and calls the
  * Rust shell's startHistoryView(), which owns the full runtime — the fixed
  * Activity presentation, virtual paging (PAGE=500), FindInHistory search/nav,
  * loading/error, work-unit/bundle/promotion rows, row selection/keyboard/
  * disclosure, raw JSON routing, the dedicated Activity classification column,
  * responsive columns, accessibility,
- * resize, and per-row SVG graph fragments (the inert #gpu-canvas-host
- * scaffold stays in the markup, but no canvas is ever created).
+ * resize, and per-row SVG graph fragments.
  *
  * The CSP keeps the production policy's shape and permits no network or worker
  * access. Its script-src additionally allows 'wasm-unsafe-eval' for
@@ -776,14 +773,11 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
   const mainStyleUri = webview.asWebviewUri(
     vscode.Uri.joinPath(context.extensionUri, 'media', 'main.css')
   );
-  const styleUri = webview.asWebviewUri(
-    vscode.Uri.joinPath(context.extensionUri, 'media', 'gpu-preview', 'gpu-preview.css')
-  );
   const cspSource = webview.cspSource;
   // The scaffold mirrors test/harness/rust.html exactly: the SAME production
   // rust-history loader initializes the wasm module and starts the Rust shell
-  // inside VS Code and in the harness, against the same controls/rows/gpu
-  // chrome. The body carries only the treatment and requested backend; the
+  // inside VS Code and in the harness, against the same controls and rows.
+  // The body carries only the treatment; the
   // loader resolves the wasm URL relative to its own module location, so no
   // glue/wasm URI data attributes are needed.
   return `<!DOCTYPE html>
@@ -794,9 +788,8 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${cspSource} 'unsafe-inline'; script-src ${cspSource} 'wasm-unsafe-eval'; connect-src ${cspSource};">
 <title>EditChain History</title>
 <link rel="stylesheet" href="${mainStyleUri}">
-<link rel="stylesheet" href="${styleUri}">
 </head>
-<body data-treatment="pulse" data-gpu-backend="auto">
+<body data-treatment="pulse">
 <div id="controls" role="group" aria-label="History controls">
 <label class="visually-hidden" for="search">Search history</label>
 <div id="search-control" class="search-control" role="group" aria-label="Find in chain">
@@ -808,13 +801,8 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 </div>
 <div id="layout">
 <div id="rows"></div>
-<div id="gpu-canvas-host" aria-hidden="true"></div>
 </div>
 <div id="status-live" class="visually-hidden" role="status" aria-live="polite"></div>
-<div id="gpu-scroll">
-<div id="gpu-rows" role="table" aria-label="Rust/WASM history renderer" aria-hidden="true"></div>
-</div>
-<div id="gpu-live" class="visually-hidden" role="status" aria-live="polite"></div>
 <script type="module" src="${rustLoaderUri}"></script>
 </body>
 </html>`;

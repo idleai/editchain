@@ -1,17 +1,10 @@
-#[cfg(not(feature = "use-std"))]
-extern crate alloc;
-
 // Suppress unused_crate_dependencies warnings for crates consumed by other modules
 // or by derive macros.
-#[cfg_attr(not(feature = "use-std"), allow(unused_extern_crates))]
 use crc as _;
-#[cfg_attr(not(feature = "use-std"), allow(unused_extern_crates))]
 use editchain_core as _;
-#[cfg_attr(not(feature = "use-std"), allow(unused_extern_crates))]
 use postcard as _;
 #[cfg(test)]
 use proptest as _;
-#[cfg_attr(not(feature = "use-std"), allow(unused_extern_crates))]
 use serde as _;
 
 /// Page magic bytes — "EC" + version 02.

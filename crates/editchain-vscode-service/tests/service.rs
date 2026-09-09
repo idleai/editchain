@@ -9,14 +9,13 @@
 )]
 
 // Crate-level dependency markers (used by Cargo for feature resolution).
+use blake3 as _;
 use editchain_codec as _;
 use editchain_git as _;
 use editchain_import as _;
 use editchain_index as _;
 use editchain_project as _;
 use editchain_protocol as _;
-use editchain_query as _;
-use gix as _;
 use serde as _;
 use serde_json as _;
 
@@ -26,12 +25,11 @@ use editchain_core::{
     Payload, ReflectionOp, ScopeRef, SessionId, Tags, ToolOp, ToolStage,
 };
 use editchain_import::{derive_path_id, BlobSink as _};
-use editchain_project::filter::ChainFilter;
 use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
 use editchain_protocol::{
     ActivityBundleKind, FileChangeDto, FileDiffDto, HistoryRow, HistoryWindow, Request,
-    RequestBody, ResponseBody, SearchFiltersDto,
+    RequestBody, ResponseBody,
 };
 use editchain_vscode_service::{
     parse_git_oid, parse_repository_id, prepare_render_snapshot, resolve_git_commit,
@@ -54,6 +52,19 @@ fn write_page_sequence(chain_dir: &Path, sequence: u32, page: &editchain_codec::
     .expect("write segment");
 }
 
+/// Find the rendered Activity row that represents one source operation.
+///
+/// Work groups reuse an anchor id for their synthetic top-level row, so prefer
+/// the expanded source row before falling back to an ordinary top-level row.
+fn activity_row_for_op(window: &HistoryWindow, id: OpId) -> Option<&HistoryRow> {
+    let key = id.to_string();
+    window
+        .rows
+        .iter()
+        .find(|row| row.is_subop && row.op_id.as_deref() == Some(key.as_str()))
+        .or_else(|| window.rows.iter().find(|row| row.node_key == key))
+}
+
 #[test]
 fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -65,23 +76,12 @@ fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() 
     page.add_record(0, editchain_codec::frame::encode_op(&second).unwrap());
     write_page(&chain_dir, &page);
 
-    // The parity filter must equal the fixed viewer filter (hide_trace and
-    // hide_undated) so the prepared snapshot actually serves the compared
-    // windows.
-    let filter = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        true,
-        true,
-        true,
-    );
+    // The prepared snapshot must serve the same fixed Activity view as the
+    // live projection.
     let mut live = Workspace::open(tmp.path().to_str().unwrap(), ".editchain").unwrap();
     let expected = live.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 100,
-        hide_submodules: true,
-        filter: &filter,
         include_layout: true,
     });
     let expected_details = live
@@ -102,8 +102,6 @@ fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() 
     let actual = cached.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 100,
-        hide_submodules: true,
-        filter: &filter,
         include_layout: true,
     });
     assert_eq!(
@@ -153,19 +151,6 @@ fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() 
     };
     assert_eq!(stale_body["render_snapshot"], "miss");
     assert_eq!(stale_body["chain_generation"], 3);
-}
-
-/// An empty filter that hides nothing (used to keep existing tests focused on
-/// windowing rather than filtering).
-fn no_filter() -> ChainFilter {
-    ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        false,
-        false,
-        false,
-    )
 }
 
 fn msg_op(node: u64, seq: u64, text: &[u8]) -> Op {
@@ -265,8 +250,6 @@ fn imported_agent_edit_rows_materialize_recorded_snippets_without_fabricating_fi
             body: RequestBody::GetWindow(editchain_protocol::GetWindowRequest {
                 offset: 0,
                 limit: 100,
-                hide_submodules: true,
-                filter: None,
                 include_layout: true,
             }),
         })
@@ -391,8 +374,6 @@ fn agent_edit_uses_exact_session_git_baseline_when_available() {
             body: RequestBody::GetWindow(editchain_protocol::GetWindowRequest {
                 offset: 0,
                 limit: 100,
-                hide_submodules: true,
-                filter: None,
                 include_layout: true,
             }),
         })
@@ -532,8 +513,6 @@ fn legacy_codex_multi_file_record_recovers_every_path_from_raw_evidence() {
             body: RequestBody::GetWindow(editchain_protocol::GetWindowRequest {
                 offset: 0,
                 limit: 100,
-                hide_submodules: true,
-                filter: None,
                 include_layout: true,
             }),
         })
@@ -643,8 +622,6 @@ fn git_commit_rows_expand_to_files_and_materialize_exact_native_diff_sides() {
             body: RequestBody::GetWindow(editchain_protocol::GetWindowRequest {
                 offset: 0,
                 limit: 100,
-                hide_submodules: true,
-                filter: None,
                 include_layout: true,
             }),
         })
@@ -813,19 +790,16 @@ fn open_resolves_exact_session_base_outside_current_head_history() {
 }
 
 #[test]
-fn op_identifiers_above_2_53_round_trip_exactly_through_window_details_and_search() {
+fn op_identifiers_above_2_53_round_trip_exactly_through_window_details_and_find() {
     let big_op = msg_op(OVER_2_53, 42, b"needle-exact-id");
     let projection = HistoryProjection::from_ops(vec![big_op.clone()]);
     let mut ws = Workspace::from_projection(projection);
 
     // History window: the op id must be the exact decimal string, never a
     // number that JavaScript could round.
-    let filter = no_filter();
     let window = ws.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 10,
-        hide_submodules: false,
-        filter: &filter,
         include_layout: true,
     });
     let row = window
@@ -850,40 +824,14 @@ fn op_identifiers_above_2_53_round_trip_exactly_through_window_details_and_searc
             .collect::<Vec<_>>()
     );
 
-    // Search: the scored chunk's identifiers must serialize as exact strings.
+    // The lexical index retains the exact operation identity internally.
     let state = editchain_vscode_service::build_lexical_index(&ws).unwrap();
-    let filters = editchain_query::search::SearchFilters {
-        kinds: None,
-        sources: None,
-        sessions: None,
-        actors: None,
-        paths: None,
-        after: None,
-        before: None,
-        include_raw: false,
-        include_private: false,
-    };
-    let results = state
-        .index
-        .search_internal("needle-exact-id", &filters, 5)
-        .unwrap();
+    let results = state.index.search_internal("needle-exact-id", 5).unwrap();
     let hit = results
         .iter()
         .find(|r| r.op_id == big_op.id)
         .expect("search hit for big op");
-    let dto = editchain_vscode_service::search_hit_from_chunk(hit, &state.git_identities);
-    assert_eq!(dto.op_id, big_op.id.to_string());
-    assert_eq!(dto.op_id, "9007199254740993:0:42");
-    assert_eq!(dto.chunk_id, format!("{}:0", big_op.id));
-    assert_eq!(dto.actor_id, big_op.actor.0.to_string());
-    assert!(
-        dto.git_oid.is_none(),
-        "EditChain hit must not carry git identity"
-    );
-    assert!(
-        dto.repository.is_none(),
-        "EditChain hit must not carry git identity"
-    );
+    assert_eq!(hit.op_id.to_string(), "9007199254740993:0:42");
 
     // The full protocol path (Server::handle over a real chain dir) must
     // return the same exact strings inside an Ok envelope.
@@ -903,29 +851,25 @@ fn op_identifiers_above_2_53_round_trip_exactly_through_window_details_and_searc
         })
         .expect("open");
     assert!(matches!(open.body, ResponseBody::Ok(_)));
-    let search = server
+    let find = server
         .handle(&Request {
             id: 2,
-            body: RequestBody::Search(editchain_protocol::SearchRequest {
+            body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
                 query: "needle-exact-id".to_string(),
-                mode: editchain_query::search::SearchMode::Lexical,
                 top_k: 5,
-                filters: SearchFiltersDto::default(),
             }),
         })
-        .expect("search");
-    let ResponseBody::Ok(value) = search.body else {
-        panic!("expected Ok search response, got {:?}", search.body);
+        .expect("find");
+    let ResponseBody::Ok(value) = find.body else {
+        panic!("expected Ok find response, got {:?}", find.body);
     };
-    assert_eq!(value["results"][0]["op_id"], "9007199254740993:0:42");
-    assert_eq!(value["results"][0]["chunk_id"], "9007199254740993:0:42:0");
+    assert_eq!(value["matches"][0]["node_key"], "9007199254740993:0:42");
 }
 
 #[test]
 fn find_in_history_protocol_path_resolves_visible_rows_and_reports_truncation() {
     // Two message ops in one chain: both contain the needle. The Find-in-Chain
-    // request carries the exact view DTO (raw: no hide predicates, submodules
-    // hidden as the fixed viewer does) and must resolve both hits to real
+    // request uses the fixed Activity view and must resolve both hits to real
     // visible top-level rows with absolute parent-row offsets — and never
     // claim an exact total when the top_k candidate cap truncates.
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -955,16 +899,6 @@ fn find_in_history_protocol_path_resolves_visible_rows_and_reports_truncation() 
             body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
                 query: "needle-fi".to_string(),
                 top_k: 50,
-                filters: SearchFiltersDto::default(),
-                filter: Some(editchain_protocol::ChainFilterDto {
-                    summary_pattern: String::new(),
-                    kind_pattern: String::new(),
-                    include_kind_pattern: String::new(),
-                    hide_undated: false,
-                    hide_trace: false,
-                    splice: true,
-                }),
-                hide_submodules: true,
             }),
         })
         .expect("find in history");
@@ -972,7 +906,7 @@ fn find_in_history_protocol_path_resolves_visible_rows_and_reports_truncation() 
         panic!("expected Ok find-in-history response, got {:?}", find.body);
     };
     // Both messages are top-level rows; row 1 = second (newest), row 0 = first.
-    assert_eq!(value["returned"], 2usize);
+    assert_eq!(value["matches"].as_array().map(Vec::len), Some(2));
     assert_eq!(value["more"], false);
     let rows: Vec<u64> = value["matches"]
         .as_array()
@@ -988,11 +922,7 @@ fn find_in_history_protocol_path_resolves_visible_rows_and_reports_truncation() 
         .map(|m| m["node_key"].as_str().expect("node_key").to_string())
         .collect();
     assert_eq!(keys, vec![second.id.to_string(), first.id.to_string()]);
-    assert!(
-        value["matches"][0]["op_id"].is_string(),
-        "op_id must be an exact string"
-    );
-    assert!(value["matches"][0]["summary"].is_string());
+    assert!(value.get("returned").is_none());
 
     // A top_k of 1 truncates the candidate list: the response must say `more`
     // rather than claim an exact total.
@@ -1002,16 +932,6 @@ fn find_in_history_protocol_path_resolves_visible_rows_and_reports_truncation() 
             body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
                 query: "needle-fi".to_string(),
                 top_k: 1,
-                filters: SearchFiltersDto::default(),
-                filter: Some(editchain_protocol::ChainFilterDto {
-                    summary_pattern: String::new(),
-                    kind_pattern: String::new(),
-                    include_kind_pattern: String::new(),
-                    hide_undated: false,
-                    hide_trace: false,
-                    splice: true,
-                }),
-                hide_submodules: true,
             }),
         })
         .expect("find in history truncated");
@@ -1022,24 +942,64 @@ fn find_in_history_protocol_path_resolves_visible_rows_and_reports_truncation() 
         );
     };
     assert!(truncated_value["more"].as_bool().expect("more flag"));
-    assert_eq!(truncated_value["returned"], 1usize);
+    assert_eq!(truncated_value["matches"].as_array().map(Vec::len), Some(1));
+}
 
-    // The legacy Search request still works unchanged alongside it.
-    let search = server
+#[test]
+fn find_in_history_distinguishes_colliding_operation_and_git_ids() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = make_git_repo(tmp.path());
+    let oid = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    // The first synthetic Git id follows the one stored operation: 0:0:1.
+    // That is also a valid persisted operation id, not a reserved namespace.
+    let message = msg_op(0, 1, b"initial collisionneedle");
+    let mut page = editchain_codec::page::Page::new(0);
+    page.add_record(0, editchain_codec::frame::encode_op(&message).unwrap());
+    write_page(&repo.join(".editchain"), &page);
+
+    let mut server = editchain_vscode_service::Server::new();
+    let open = server
         .handle(&Request {
-            id: 4,
-            body: RequestBody::Search(editchain_protocol::SearchRequest {
-                query: "needle-fi".to_string(),
-                mode: editchain_query::search::SearchMode::Lexical,
-                top_k: 5,
-                filters: SearchFiltersDto::default(),
+            id: 1,
+            body: RequestBody::Open(editchain_protocol::OpenRequest {
+                workspace_path: repo.to_str().expect("utf8").to_string(),
+                chain_dir: ".editchain".to_string(),
             }),
         })
-        .expect("legacy search");
-    let ResponseBody::Ok(search_value) = search.body else {
-        panic!("expected Ok search response, got {:?}", search.body);
-    };
-    assert!(search_value["results"].as_array().expect("results").len() >= 2);
+        .expect("open");
+    assert!(matches!(open.body, ResponseBody::Ok(_)));
+
+    for (query, mut expected) in [
+        ("collisionneedle", vec![message.id.to_string()]),
+        ("commit", vec![oid.clone()]),
+        ("initial", vec![message.id.to_string(), oid]),
+    ] {
+        let response = server
+            .handle(&Request {
+                id: 2,
+                body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
+                    query: query.to_string(),
+                    top_k: 50,
+                }),
+            })
+            .expect("find");
+        let ResponseBody::Ok(value) = response.body else {
+            panic!("expected find results, got {:?}", response.body);
+        };
+        let response: editchain_protocol::FindInHistoryResponse =
+            serde_json::from_value(value).expect("decode find response");
+        let mut actual: Vec<_> = response
+            .matches
+            .into_iter()
+            .map(|found| found.node_key)
+            .collect();
+        actual.sort();
+        expected.sort();
+        assert_eq!(
+            actual, expected,
+            "source identity must survive query {query}"
+        );
+    }
 }
 
 #[test]
@@ -1050,12 +1010,9 @@ fn git_resolve_uses_exact_string_ids_and_rejects_invalid_input() {
     // Open the workspace: git rows carry hex oid + decimal repository strings.
     let mut ws = Workspace::open(tmp.path().to_str().expect("utf8"), "").expect("open");
     assert!(!ws.repositories.is_empty(), "repo should be discovered");
-    let filter = no_filter();
     let window = ws.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 10,
-        hide_submodules: false,
-        filter: &filter,
         include_layout: true,
     });
     let row = window
@@ -1132,196 +1089,6 @@ fn git_resolve_uses_exact_string_ids_and_rejects_invalid_input() {
 }
 
 #[test]
-fn git_search_hits_carry_real_identity_and_resolve_object_round_trips() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let _repo = make_git_repo(tmp.path());
-
-    let mut server = editchain_vscode_service::Server::new();
-    let open = server
-        .handle(&Request {
-            id: 1,
-            body: RequestBody::Open(editchain_protocol::OpenRequest {
-                workspace_path: tmp.path().to_str().expect("utf8").to_string(),
-                chain_dir: String::new(),
-            }),
-        })
-        .expect("open");
-    assert!(matches!(open.body, ResponseBody::Ok(_)));
-
-    // Search must return the git commit as a real Git hit carrying the exact
-    // lowercase oid + decimal repository identity — never a message-shaped hit.
-    let search = server
-        .handle(&Request {
-            id: 2,
-            body: RequestBody::Search(editchain_protocol::SearchRequest {
-                query: "initial".to_string(),
-                mode: editchain_query::search::SearchMode::Lexical,
-                top_k: 5,
-                filters: SearchFiltersDto::default(),
-            }),
-        })
-        .expect("search");
-    let ResponseBody::Ok(value) = search.body else {
-        panic!("expected Ok search response, got {:?}", search.body);
-    };
-    let hits = value["results"].as_array().expect("results array");
-    let git_hits: Vec<_> = hits.iter().filter(|h| h["source"] == "Git").collect();
-    assert!(
-        !git_hits.is_empty(),
-        "git commit must be indexed and searchable"
-    );
-    let hit = git_hits[0];
-    assert_eq!(hit["kind"], "git");
-    assert_eq!(hit["is_submodule"], false);
-    let git_oid = hit["git_oid"].as_str().expect("git_oid string");
-    assert_eq!(git_oid.len(), 40, "SHA-1 hex is 40 chars");
-    assert_eq!(
-        git_oid,
-        git_oid.to_ascii_lowercase(),
-        "oid must be lowercase hex"
-    );
-    let repository = hit["repository"].as_str().expect("repository string");
-    assert!(
-        repository.parse::<u64>().is_ok(),
-        "repository must be an exact decimal string, got {repository:?}"
-    );
-    assert!(hit["op_id"].is_string(), "synthetic op id stays a string");
-    assert!(
-        hit["git_oid"].is_string() && hit["repository"].is_string(),
-        "git identity must serialize as exact strings"
-    );
-
-    // ResolveObject round-trip: the exact strings from the search hit resolve
-    // the same commit through the service.
-    let resolve = server
-        .handle(&Request {
-            id: 3,
-            body: RequestBody::ResolveObject(editchain_protocol::ResolveObjectRequest {
-                repository: repository.to_string(),
-                oid: git_oid.to_string(),
-            }),
-        })
-        .expect("resolve");
-    assert!(
-        matches!(resolve.body, ResponseBody::Ok(_)),
-        "hit identity must resolve, got {:?}",
-        resolve.body
-    );
-    let ResponseBody::Ok(resolved) = resolve.body else {
-        panic!("expected Ok resolve response, got {:?}", resolve.body);
-    };
-    let rid = parse_repository_id(repository).expect("parse repository");
-    let oid = parse_git_oid(git_oid).expect("parse oid");
-    let ws = server.workspace.as_ref().expect("workspace open");
-    let commit = resolve_git_commit(ws, rid, &oid)
-        .expect("resolve helper")
-        .expect("commit found");
-    assert_eq!(commit.oid.to_hex(), git_oid);
-    assert_eq!(commit.repository.0.to_string(), repository);
-    // The ResolveObject Ok payload is the JSON-safe `ResolvedObject` DTO:
-    // every identity is an exact string, never a raw numeric/structural ID
-    // object (the pre-DTO wire form leaked repository u64, GitOid bytes
-    // arrays, and OpId node/boot/seq numbers).
-    assert_eq!(resolved["repository"], repository);
-    assert_eq!(resolved["oid"], git_oid);
-    assert!(
-        resolved["repository"].is_string(),
-        "repository must be a string"
-    );
-    assert!(resolved["oid"].is_string(), "oid must be a hex string");
-    assert!(resolved["tree"].is_string(), "tree must be a hex string");
-    assert!(
-        resolved["parents"]
-            .as_array()
-            .is_some_and(|p| p.iter().all(serde_json::Value::is_string)),
-        "parents must be lowercase hex strings"
-    );
-    assert!(
-        resolved["imported_record"].is_null() || resolved["imported_record"].is_string(),
-        "imported_record must be null or a display string"
-    );
-    assert!(
-        resolved["changed_paths"]
-            .as_array()
-            .is_some_and(|paths| paths.iter().all(serde_json::Value::is_string)),
-        "changed_paths must be decimal strings"
-    );
-    assert_eq!(resolved["object_format"], "Sha1");
-    assert_eq!(resolved["availability"], "Resolved");
-    assert!(
-        resolved["oid"]["bytes"].is_null(),
-        "oid must not leak the raw bytes array"
-    );
-    assert!(
-        resolved["imported_record"]["node"].is_null(),
-        "imported_record must not leak a structural OpId"
-    );
-}
-
-#[test]
-fn search_filters_accept_exact_string_ids_and_reject_invalid() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let mut server = editchain_vscode_service::Server::new();
-    let open = server
-        .handle(&Request {
-            id: 1,
-            body: RequestBody::Open(editchain_protocol::OpenRequest {
-                workspace_path: tmp.path().to_str().expect("utf8").to_string(),
-                chain_dir: String::new(),
-            }),
-        })
-        .expect("open");
-    assert!(matches!(open.body, ResponseBody::Ok(_)));
-
-    // Exact decimal strings above 2^53 convert cleanly (no results for a
-    // bogus session, but the request must succeed, not fail validation).
-    let ok = server
-        .handle(&Request {
-            id: 2,
-            body: RequestBody::Search(editchain_protocol::SearchRequest {
-                query: "anything".to_string(),
-                mode: editchain_query::search::SearchMode::Lexical,
-                top_k: 5,
-                filters: SearchFiltersDto {
-                    sessions: Some(vec![OVER_2_53.to_string()]),
-                    actors: Some(vec![OVER_2_53.to_string()]),
-                    ..SearchFiltersDto::default()
-                },
-            }),
-        })
-        .expect("search");
-    assert!(matches!(ok.body, ResponseBody::Ok(_)));
-
-    // Non-numeric IDs must produce a service Error.
-    for (sessions, actors) in [
-        (Some(vec!["abc".to_string()]), None),
-        (None, Some(vec!["1.5".to_string()])),
-        (Some(vec![String::new()]), None),
-    ] {
-        let resp = server
-            .handle(&Request {
-                id: 2,
-                body: RequestBody::Search(editchain_protocol::SearchRequest {
-                    query: "anything".to_string(),
-                    mode: editchain_query::search::SearchMode::Lexical,
-                    top_k: 5,
-                    filters: SearchFiltersDto {
-                        sessions,
-                        actors,
-                        ..SearchFiltersDto::default()
-                    },
-                }),
-            })
-            .expect("search");
-        assert!(
-            matches!(resp.body, ResponseBody::Error(_)),
-            "invalid search IDs must produce Error, got {:?}",
-            resp.body
-        );
-    }
-}
-
-#[test]
 fn workspace_open_with_empty_chain() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // No chain dir and no git repo — should open with empty projection.
@@ -1335,12 +1102,9 @@ fn history_window_returns_rows() {
     let ops = vec![msg_op(1, 1, b"first"), msg_op(1, 2, b"second")];
     let projection = HistoryProjection::from_ops(ops);
     let mut ws = Workspace::from_projection(projection);
-    let filter = no_filter();
     let window = ws.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 10,
-        hide_submodules: false,
-        filter: &filter,
         include_layout: true,
     });
     assert_eq!(window.total, 2);
@@ -1355,12 +1119,9 @@ fn op_rows_have_uniform_author_and_short_commit_id() {
     let ops = vec![msg_op(7, 42, b"hello")];
     let projection = HistoryProjection::from_ops(ops);
     let mut ws = Workspace::from_projection(projection);
-    let filter = no_filter();
     let window = ws.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 10,
-        hide_submodules: false,
-        filter: &filter,
         include_layout: true,
     });
     let row = &window.rows[0];
@@ -1388,12 +1149,9 @@ fn system_flag_marks_tool_and_import_ops() {
     let msg = msg_op(1, 2, b"hello");
     let projection = HistoryProjection::from_ops(vec![tool, msg]);
     let mut ws = Workspace::from_projection(projection);
-    let filter = no_filter();
     let window = ws.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 10,
-        hide_submodules: false,
-        filter: &filter,
         include_layout: true,
     });
     // Rows are newest-first; find by kind.
@@ -1498,13 +1256,6 @@ fn get_window_geometry_identical_across_independent_processes() {
     let exe = env!("CARGO_BIN_EXE_editchain-vscode-service");
     let workspace = tmp.path().to_str().expect("utf8 workspace");
     let chain = chain_dir.to_str().expect("utf8 chain");
-    let filter = serde_json::json!({
-        "summary_pattern": "",
-        "kind_pattern": "",
-        "include_kind_pattern": "",
-        "hide_undated": true,
-        "splice": true,
-    });
     let mut windows: Vec<serde_json::Value> = Vec::new();
     for _ in 0..6 {
         let mut child = Command::new(exe)
@@ -1533,8 +1284,7 @@ fn get_window_geometry_identical_across_independent_processes() {
                 "body": {"GetWindow": {
                     "offset": 0,
                     "limit": 500,
-                    "hide_submodules": false,
-                    "filter": filter,
+                    "include_layout": true,
                 }}
             }),
         );
@@ -1753,10 +1503,10 @@ fn store_blob(chain_dir: &Path, data: &[u8]) -> editchain_core::payload::BlobRef
 }
 
 #[test]
-fn trace_rows_hidden_by_fixed_filter_kept_in_raw_mode_and_taxonomy_flows() {
-    // import_a (message) -> trace envelope -> import_c (message). The fixed
-    // viewer filter hides the trace envelope; raw mode keeps every row and
-    // carries the provider-neutral taxonomy on each HistoryRow.
+fn activity_view_hides_trace_envelopes_and_preserves_primary_taxonomy() {
+    // import_a (message) -> trace envelope -> import_c (message). The Activity
+    // view hides the trace envelope while preserving the provider-neutral
+    // taxonomy on visible rows.
     let a = raw_import_op(
         1,
         1,
@@ -1783,57 +1533,18 @@ fn trace_rows_hidden_by_fixed_filter_kept_in_raw_mode_and_taxonomy_flows() {
     let projection = HistoryProjection::from_ops(vec![a, trace.clone(), c, ma, mc]);
     let mut ws = Workspace::from_projection(projection);
 
-    let fixed = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        true,
-        true,
-        true,
-    );
-    let raw = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        false,
-        true,
-        false,
-    );
-    let fixed_window = ws.history_window(HistoryWindowOptions {
+    let window = ws.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 100,
-        hide_submodules: true,
-        filter: &fixed,
-        include_layout: true,
-    });
-    let raw_window = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        hide_submodules: true,
-        filter: &raw,
         include_layout: true,
     });
 
-    let trace_key = trace.id.to_string();
     assert!(
-        !fixed_window.rows.iter().any(|r| r.node_key == trace_key),
-        "fixed view hides the trace envelope"
+        activity_row_for_op(&window, trace.id).is_none(),
+        "Activity hides the trace envelope"
     );
-    assert_eq!(fixed_window.rows.len(), 2);
-    assert!(
-        raw_window.rows.iter().any(|r| r.node_key == trace_key),
-        "raw view keeps the trace envelope"
-    );
-    assert_eq!(raw_window.rows.len(), 3);
-    let trace_row = raw_window
-        .rows
-        .iter()
-        .find(|r| r.node_key == trace_key)
-        .expect("trace row");
-    assert_eq!(trace_row.visibility, Visibility::Trace);
-    assert_eq!(trace_row.record_role, RecordRole::Lifecycle);
-    assert_eq!(trace_row.activity_kind, ActivityKind::System);
-    let message_rows: Vec<&HistoryRow> = raw_window
+    assert_eq!(window.rows.len(), 2);
+    let message_rows: Vec<&HistoryRow> = window
         .rows
         .iter()
         .filter(|r| r.visibility == Visibility::Primary)
@@ -1936,86 +1647,35 @@ fn service_path_compaction_preserves_echo_and_outcome_metadata() {
 
     let mut ws = Workspace::open(tmp.path().to_str().unwrap(), ".editchain")
         .expect("open workspace through the real service path");
-    let fixed = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        true,
-        true,
-        true,
-    );
-    let raw = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        false,
-        true,
-        false,
-    );
-    let fixed_window = ws.history_window(HistoryWindowOptions {
+    let window = ws.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 100,
-        hide_submodules: true,
-        filter: &fixed,
-        include_layout: false,
-    });
-    let raw_window = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        hide_submodules: true,
-        filter: &raw,
         include_layout: false,
     });
 
     let echo_keys = [echo_call.id.to_string(), echo_result.id.to_string()];
     for key in &echo_keys {
-        let row = raw_window
-            .rows
-            .iter()
-            .find(|r| &r.node_key == key)
-            .unwrap_or_else(|| panic!("echo row {key} missing from raw window"));
-        assert_eq!(row.visibility, Visibility::Trace);
-        assert_eq!(row.record_role, RecordRole::Echo);
-        assert_eq!(row.activity_kind, ActivityKind::External);
         assert!(
-            !fixed_window.rows.iter().any(|r| &r.node_key == key),
-            "fixed Activity view hides echoed external tool row {key}"
+            !window
+                .rows
+                .iter()
+                .any(|row| { row.node_key == *key || row.op_id.as_deref() == Some(key.as_str()) }),
+            "Activity hides echoed external tool row {key}"
         );
     }
 
-    let prose_row = raw_window
-        .rows
-        .iter()
-        .find(|r| r.node_key == prose.id.to_string())
-        .expect("prose row");
+    let prose_row = activity_row_for_op(&window, prose.id).expect("prose row");
     assert_eq!(prose_row.visibility, Visibility::Primary);
     assert_eq!(prose_row.record_role, RecordRole::Narrative);
     assert_eq!(prose_row.activity_kind, ActivityKind::Conversation);
-    assert!(
-        fixed_window
-            .rows
-            .iter()
-            .any(|r| r.node_key == prose.id.to_string()),
-        "generic agent prose stays visible in both views"
-    );
 
-    let success_row = raw_window
-        .rows
-        .iter()
-        .find(|r| r.node_key == success_item.id.to_string())
-        .expect("tool row");
+    let success_row = activity_row_for_op(&window, success_item.id).expect("tool row");
     assert_eq!(
         success_row.outcome,
         Outcome::Success,
         "structured outcome evidence survives compaction"
     );
-    assert!(
-        fixed_window
-            .rows
-            .iter()
-            .any(|r| r.node_key == success_item.id.to_string()),
-        "tool row stays primary"
-    );
+    assert_eq!(success_row.visibility, Visibility::Primary);
 }
 
 #[test]
@@ -2073,39 +1733,21 @@ fn service_path_compaction_preserves_childless_output_rows_and_blob_echoes() {
 
     let mut ws = Workspace::open(tmp.path().to_str().unwrap(), ".editchain")
         .expect("open workspace through the real service path");
-    let raw = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        false,
-        true,
-        false,
-    );
     let window = ws.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 100,
-        hide_submodules: true,
-        filter: &raw,
         include_layout: false,
     });
 
-    let output_row = window
-        .rows
-        .iter()
-        .find(|r| r.node_key == output.id.to_string())
-        .expect("output row");
+    let output_row = activity_row_for_op(&window, output.id).expect("output row");
     assert_eq!(output_row.visibility, Visibility::Primary);
     assert_eq!(output_row.record_role, RecordRole::Result);
     assert_eq!(output_row.activity_kind, ActivityKind::Execute);
 
-    let echo_row = window
-        .rows
-        .iter()
-        .find(|r| r.node_key == blob_echo.id.to_string())
-        .expect("blob echo row");
-    assert_eq!(echo_row.visibility, Visibility::Trace);
-    assert_eq!(echo_row.record_role, RecordRole::Echo);
-    assert_eq!(echo_row.activity_kind, ActivityKind::External);
+    assert!(
+        activity_row_for_op(&window, blob_echo.id).is_none(),
+        "blob-backed echoes stay hidden after bounded compaction"
+    );
 }
 
 #[test]
@@ -2171,15 +1813,9 @@ fn service_path_uses_command_stdout_as_the_output_subtitle() {
     let window = workspace.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 100,
-        hide_submodules: true,
-        filter: &no_filter(),
         include_layout: false,
     });
-    let row = window
-        .rows
-        .iter()
-        .find(|row| row.node_key == command_raw.id.to_string())
-        .expect("command output row");
+    let row = activity_row_for_op(&window, command_raw.id).expect("command output row");
 
     assert_eq!(row.kind, "command");
     assert_eq!(row.record_role, RecordRole::Result);
@@ -2187,11 +1823,8 @@ fn service_path_uses_command_stdout_as_the_output_subtitle() {
     assert!(!row.summary.starts_with("$ "));
     assert!(!row.summary.contains("/bin/bash"));
 
-    let empty_output_row = window
-        .rows
-        .iter()
-        .find(|row| row.node_key == empty_output_import.id.to_string())
-        .expect("silent command output row");
+    let empty_output_row =
+        activity_row_for_op(&window, empty_output_import.id).expect("silent command output row");
     assert_eq!(empty_output_row.summary, "No output");
     assert!(!empty_output_row.summary.contains("/bin/bash"));
 }
@@ -2235,39 +1868,24 @@ fn service_path_compaction_preserves_object_tool_payload_carriers() {
 
     let mut ws = Workspace::open(tmp.path().to_str().unwrap(), ".editchain")
         .expect("open workspace through the real service path");
-    let raw = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        false,
-        true,
-        false,
-    );
     let window = ws.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 100,
-        hide_submodules: true,
-        filter: &raw,
         include_layout: false,
     });
 
-    for key in [call.id.to_string(), with_params.id.to_string()] {
-        let row = window
-            .rows
-            .iter()
-            .find(|r| r.node_key == key)
-            .unwrap_or_else(|| panic!("tool-like row {key} missing from raw window"));
+    for id in [call.id, with_params.id] {
+        let row = activity_row_for_op(&window, id)
+            .unwrap_or_else(|| panic!("tool-like row {id} missing from Activity"));
         assert_eq!(row.visibility, Visibility::Primary);
         assert_eq!(row.record_role, RecordRole::Action);
         assert_eq!(row.activity_kind, ActivityKind::Execute);
     }
 
-    let id_only_row = window
-        .rows
-        .iter()
-        .find(|r| r.node_key == id_only.id.to_string())
-        .expect("id-only row");
-    assert_eq!(id_only_row.visibility, Visibility::Trace);
+    assert!(
+        activity_row_for_op(&window, id_only.id).is_none(),
+        "empty transport envelopes stay hidden"
+    );
 }
 
 #[test]
@@ -2324,15 +1942,9 @@ fn service_path_keeps_exec_command_separate_from_token_metadata() {
     let window = workspace.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 100,
-        hide_submodules: true,
-        filter: &no_filter(),
         include_layout: false,
     });
-    let row = window
-        .rows
-        .iter()
-        .find(|row| row.node_key == call.id.to_string())
-        .expect("exec row");
+    let row = activity_row_for_op(&window, call.id).expect("exec row");
 
     assert_eq!(row.summary, "tool: exec cargo test -p editchain-project");
     assert_eq!(row.sub_ops.len(), 1);
@@ -2392,53 +2004,37 @@ fn service_path_compaction_preserves_scalar_and_truncated_tool_payload_carriers(
 
     let mut ws = Workspace::open(tmp.path().to_str().unwrap(), ".editchain")
         .expect("open workspace through the real service path");
-    let raw = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        false,
-        true,
-        false,
-    );
     let window = ws.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 100,
-        hide_submodules: true,
-        filter: &raw,
         include_layout: false,
     });
 
-    for (key, label) in [
-        (scalar_call.id.to_string(), "scalar carrier call"),
-        (blob_call.id.to_string(), "truncated blob carrier call"),
+    for (id, label) in [
+        (scalar_call.id, "scalar carrier call"),
+        (blob_call.id, "truncated blob carrier call"),
     ] {
-        let row = window
-            .rows
-            .iter()
-            .find(|r| r.node_key == key)
-            .unwrap_or_else(|| panic!("{label} missing from raw window"));
+        let row = activity_row_for_op(&window, id)
+            .unwrap_or_else(|| panic!("{label} missing from Activity"));
         assert_eq!(row.visibility, Visibility::Primary, "{label}");
         assert_eq!(row.record_role, RecordRole::Action, "{label}");
         assert_eq!(row.activity_kind, ActivityKind::Execute, "{label}");
     }
 
-    let id_only_row = window
-        .rows
-        .iter()
-        .find(|r| r.node_key == id_only.id.to_string())
-        .expect("id-only row");
-    assert_eq!(id_only_row.visibility, Visibility::Trace);
+    assert!(
+        activity_row_for_op(&window, id_only.id).is_none(),
+        "empty transport envelopes stay hidden"
+    );
 }
 
 #[test]
-fn service_path_marks_duplicate_response_item_event_msg_pairs_after_compaction() {
-    // Exact raw pair shapes: a `response_item` message/assistant copy paired
+fn service_path_hides_duplicate_response_item_event_msg_pairs_after_compaction() {
+    // Exact source pair shapes: a `response_item` message/assistant copy paired
     // with an `event_msg` agent_message carrying the same text at the same
     // timestamp in the same source chain. After the service path compacts the
     // records, the marker-with-colon pair classifies as trace on both sides,
     // the plain narrative pair demotes only the response_item copy (the
-    // event_msg stays visible), and a unique response_item stays primary. Raw
-    // row count semantics are unchanged: every row survives in raw mode.
+    // event_msg stays visible), and a unique response_item stays primary.
     let tmp = tempfile::tempdir().expect("tempdir");
     let chain_dir = tmp.path().join(".editchain");
 
@@ -2492,59 +2088,21 @@ fn service_path_marks_duplicate_response_item_event_msg_pairs_after_compaction()
 
     let mut ws = Workspace::open(tmp.path().to_str().unwrap(), ".editchain")
         .expect("open workspace through the real service path");
-    let raw = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        false,
-        true,
-        false,
-    );
-    let fixed = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        true,
-        true,
-        true,
-    );
-    let raw_window = ws.history_window(HistoryWindowOptions {
+    let window = ws.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 100,
-        hide_submodules: true,
-        filter: &raw,
         include_layout: false,
     });
-    assert_eq!(
-        raw_window.rows.len(),
-        5,
-        "raw row count semantics unchanged"
-    );
+    assert_eq!(window.rows.len(), 2);
+    for hidden in [marker_response.id, marker_event.id, narrative_response.id] {
+        assert!(
+            activity_row_for_op(&window, hidden).is_none(),
+            "duplicate or marker row {hidden} stays hidden"
+        );
+    }
 
-    let row_meta = |key: &str| {
-        raw_window
-            .rows
-            .iter()
-            .find(|r| r.node_key == key)
-            .unwrap_or_else(|| panic!("row {key} missing from raw window"))
-    };
-
-    let marker_response_row = row_meta(&marker_response.id.to_string());
-    assert_eq!(marker_response_row.visibility, Visibility::Trace);
-    assert_eq!(marker_response_row.record_role, RecordRole::Echo);
-    assert_eq!(marker_response_row.activity_kind, ActivityKind::External);
-
-    let marker_event_row = row_meta(&marker_event.id.to_string());
-    assert_eq!(marker_event_row.visibility, Visibility::Trace);
-    assert_eq!(marker_event_row.record_role, RecordRole::Echo);
-    assert_eq!(marker_event_row.activity_kind, ActivityKind::External);
-
-    let narrative_response_row = row_meta(&narrative_response.id.to_string());
-    assert_eq!(narrative_response_row.visibility, Visibility::Trace);
-    assert_eq!(narrative_response_row.record_role, RecordRole::Echo);
-    assert_eq!(narrative_response_row.activity_kind, ActivityKind::External);
-
-    let narrative_event_row = row_meta(&narrative_event.id.to_string());
+    let narrative_event_row =
+        activity_row_for_op(&window, narrative_event.id).expect("narrative event row");
     assert_eq!(narrative_event_row.visibility, Visibility::Primary);
     assert_eq!(narrative_event_row.record_role, RecordRole::Narrative);
     assert_eq!(
@@ -2552,36 +2110,13 @@ fn service_path_marks_duplicate_response_item_event_msg_pairs_after_compaction()
         ActivityKind::Conversation
     );
 
-    let unique_response_row = row_meta(&unique_response.id.to_string());
+    let unique_response_row =
+        activity_row_for_op(&window, unique_response.id).expect("unique response row");
     assert_eq!(unique_response_row.visibility, Visibility::Primary);
     assert_eq!(unique_response_row.record_role, RecordRole::Narrative);
     assert_eq!(
         unique_response_row.activity_kind,
         ActivityKind::Conversation
-    );
-
-    let fixed_window = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        hide_submodules: true,
-        filter: &fixed,
-        include_layout: false,
-    });
-    let fixed_keys: Vec<String> = fixed_window
-        .rows
-        .iter()
-        .map(|r| r.node_key.clone())
-        .collect();
-    assert!(
-        !fixed_keys.contains(&marker_response.id.to_string())
-            && !fixed_keys.contains(&marker_event.id.to_string())
-            && !fixed_keys.contains(&narrative_response.id.to_string()),
-        "trace rows hidden by the fixed filter: {fixed_keys:?}"
-    );
-    assert!(
-        fixed_keys.contains(&narrative_event.id.to_string())
-            && fixed_keys.contains(&unique_response.id.to_string()),
-        "primary rows survive the fixed filter: {fixed_keys:?}"
     );
 }
 
@@ -2648,32 +2183,15 @@ fn service_path_truncated_echo_texts_never_pair_but_untruncated_exact_pairs_do()
 
     let mut ws = Workspace::open(tmp.path().to_str().unwrap(), ".editchain")
         .expect("open workspace through the real service path");
-    let raw = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        false,
-        true,
-        false,
-    );
     let window = ws.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 100,
-        hide_submodules: true,
-        filter: &raw,
         include_layout: false,
     });
-    assert_eq!(window.rows.len(), 4, "raw row count semantics unchanged");
+    assert_eq!(window.rows.len(), 3);
 
-    let row_meta = |key: &str| {
-        window
-            .rows
-            .iter()
-            .find(|r| r.node_key == key)
-            .unwrap_or_else(|| panic!("row {key} missing from raw window"))
-    };
-
-    let long_response_row = row_meta(&long_response.id.to_string());
+    let long_response_row =
+        activity_row_for_op(&window, long_response.id).expect("long response row");
     assert_eq!(
         long_response_row.visibility,
         Visibility::Primary,
@@ -2685,23 +2203,19 @@ fn service_path_truncated_echo_texts_never_pair_but_untruncated_exact_pairs_do()
         "truncated response keeps its narrative taxonomy"
     );
 
-    let long_event_row = row_meta(&long_event.id.to_string());
+    let long_event_row = activity_row_for_op(&window, long_event.id).expect("long event row");
     assert_eq!(
         long_event_row.visibility,
         Visibility::Primary,
         "truncated event row stays visible"
     );
 
-    let exact_response_row = row_meta(&exact_response.id.to_string());
-    assert_eq!(
-        exact_response_row.visibility,
-        Visibility::Trace,
-        "untruncated exact pair still demotes the response copy after compaction"
+    assert!(
+        activity_row_for_op(&window, exact_response.id).is_none(),
+        "untruncated exact pair still hides the response copy after compaction"
     );
-    assert_eq!(exact_response_row.record_role, RecordRole::Echo);
-    assert_eq!(exact_response_row.activity_kind, ActivityKind::External);
 
-    let exact_event_row = row_meta(&exact_event.id.to_string());
+    let exact_event_row = activity_row_for_op(&window, exact_event.id).expect("exact event row");
     assert_eq!(exact_event_row.visibility, Visibility::Primary);
     assert_eq!(exact_event_row.record_role, RecordRole::Narrative);
 }
@@ -2739,19 +2253,9 @@ fn cancelled_branch_rows_ship_muted_node_and_child_owned_edge_geometry() {
 
     let mut workspace =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("open workspace");
-    let raw = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        false,
-        true,
-        false,
-    );
     let window = workspace.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 100,
-        hide_submodules: true,
-        filter: &raw,
         include_layout: true,
     });
     let row = |id: OpId| {
@@ -2783,7 +2287,7 @@ fn cancelled_branch_rows_ship_muted_node_and_child_owned_edge_geometry() {
 
 #[test]
 fn prepared_snapshot_manifest_records_projection_revision_forty_four() {
-    // Stale snapshots from earlier projection revisions (pre-hide_trace,
+    // Stale snapshots from earlier projection revisions (before trace hiding,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
     // duplicate-pair exclusion, pre prefix-string escape decoding, and pre
@@ -2864,7 +2368,7 @@ fn prepared_snapshot_omits_timestamp_zero_top_level_rows_and_keeps_bundled_metad
 }
 
 #[test]
-fn activity_keeps_context_compaction_visible_and_inline_while_raw_stays_exact() {
+fn activity_keeps_context_compaction_visible_and_inline() {
     let root = raw_import_op(
         9,
         1,
@@ -2897,20 +2401,10 @@ fn activity_keeps_context_compaction_visible_and_inline_while_raw_stays_exact() 
         continuation_message,
     ]);
     let mut ws = Workspace::from_projection(projection);
-    let fixed = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        true,
-        true,
-        true,
-    );
 
     let activity = ws.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 100,
-        hide_submodules: true,
-        filter: &fixed,
         include_layout: true,
     });
     let activity_rows: Vec<&HistoryRow> =
@@ -2963,37 +2457,12 @@ fn activity_keeps_context_compaction_visible_and_inline_while_raw_stays_exact() 
             .all(|row| row.lane == activity_work.lane),
         "checkpoint and continuation stay on the session lane"
     );
-
-    let raw = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        hide_submodules: true,
-        filter: &no_filter(),
-        include_layout: true,
-    });
-    let raw_checkpoint = raw
-        .rows
-        .iter()
-        .find(|row| row.node_key == compacted.id.to_string())
-        .expect("Raw keeps the compaction checkpoint");
-    assert_eq!(raw_checkpoint.visibility, Visibility::Primary);
-    let raw_continuation = raw
-        .rows
-        .iter()
-        .find(|row| row.node_key == continuation.id.to_string())
-        .expect("Raw continuation");
-    assert_eq!(
-        raw_continuation.parents,
-        vec![root.id.to_string()],
-        "Raw preserves the imported sibling topology"
-    );
 }
 
 #[test]
-fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() {
+fn activity_view_bundles_execute_runs_in_source_order() {
     // One turn: user request, three successful tools, agent answer. The fixed
-    // Activity view folds the three tool rows into one expandable summary row;
-    // the raw profile must keep every row, in the same order, un-bundled.
+    // Activity view folds the three tool rows into one expandable summary row.
     let ops = turn_chain_ops(
         &[
             ("tool", Some("completed")),
@@ -3005,73 +2474,11 @@ fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() 
     );
     let projection = HistoryProjection::from_ops(ops);
     let mut ws = Workspace::from_projection(projection);
-    let fixed = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        true,
-        true,
-        true,
-    );
-    let raw = no_filter();
     let activity_window = ws.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 100,
-        hide_submodules: true,
-        filter: &fixed,
         include_layout: false,
     });
-    let raw_window = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        hide_submodules: true,
-        filter: &raw,
-        include_layout: false,
-    });
-
-    // Raw profile: exact and ordered — five top-level rows, newest-first, no
-    // synthetic bundle anywhere.
-    assert_eq!(raw_window.rows.len(), 5);
-    let raw_kinds: Vec<&str> = raw_window
-        .rows
-        .iter()
-        .map(|row| row.kind.as_str())
-        .collect();
-    assert_eq!(
-        raw_kinds,
-        vec!["message", "tool", "tool", "tool", "message"]
-    );
-    assert!(
-        raw_window
-            .rows
-            .iter()
-            .all(|row| !row.is_subop && row.summary != "3 tool steps (success)"),
-        "raw profile never bundles"
-    );
-    assert!(
-        raw_window
-            .rows
-            .iter()
-            .all(|row| row.activity_bundle.is_none()),
-        "raw (unbundled) rows never carry activity-bundle metadata"
-    );
-    // Raw rows still carry the additive work-unit/promotion wire fields.
-    let raw_value = serde_json::to_value(&raw_window.rows[0]).expect("serialize raw row");
-    assert_eq!(raw_value["work_unit"]["id"], "session:1/turn:1");
-    assert_eq!(raw_value["work_unit"]["count"], 5u64);
-    assert_eq!(raw_value["work_unit"]["is_start"], true);
-    assert_eq!(raw_value["session_summary"]["count"], 5u64);
-    assert_eq!(raw_value["promoted"], true);
-    assert_eq!(
-        raw_window
-            .rows
-            .iter()
-            .filter(|row| row.session_summary.is_some())
-            .count(),
-        1,
-        "one true session endpoint carries the raw-view summary marker"
-    );
-
     // Activity view: chat / outer work / chat. Because the execute bundle is
     // the work interval's only grouped member, opening work reveals its three
     // original tools directly without a redundant second disclosure.
@@ -3184,29 +2591,11 @@ fn activity_view_bundles_execute_runs_but_raw_profile_stays_exact_and_ordered() 
 fn activity_view_groups_repeated_plans_as_expandable_linear_updates() {
     let projection = HistoryProjection::from_ops(repeated_plan_chain_ops());
     let mut ws = Workspace::from_projection(projection);
-    let fixed = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        true,
-        true,
-        true,
-    );
     let activity = ws.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 100,
-        hide_submodules: true,
-        filter: &fixed,
         include_layout: true,
     });
-    let raw = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        hide_submodules: true,
-        filter: &no_filter(),
-        include_layout: true,
-    });
-
     let work_group = activity
         .rows
         .iter()
@@ -3264,20 +2653,6 @@ fn activity_view_groups_repeated_plans_as_expandable_linear_updates() {
         activity.max_lane, 0,
         "grouping does not allocate a branch lane"
     );
-
-    let raw_top_level: Vec<&HistoryRow> = raw.rows.iter().filter(|row| !row.is_subop).collect();
-    assert_eq!(raw_top_level.len(), 5);
-    assert_eq!(
-        raw_top_level
-            .iter()
-            .filter(|row| row.activity_kind == ActivityKind::Plan)
-            .count(),
-        3
-    );
-    assert!(
-        raw.rows.iter().all(|row| row.activity_bundle.is_none()),
-        "Raw remains an exact ungrouped source view"
-    );
 }
 
 #[test]
@@ -3302,20 +2677,10 @@ fn prepared_snapshot_serves_flattened_activity_view_and_records_current_revision
     }
     write_page(&chain_dir, &page);
 
-    let filter = ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        true,
-        true,
-        true,
-    );
     let mut live = Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("live open");
     let expected = live.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 100,
-        hide_submodules: true,
-        filter: &filter,
         include_layout: true,
     });
     assert_eq!(
@@ -3344,8 +2709,6 @@ fn prepared_snapshot_serves_flattened_activity_view_and_records_current_revision
     let actual = cached.history_window(HistoryWindowOptions {
         offset: 0,
         limit: 100,
-        hide_submodules: true,
-        filter: &filter,
         include_layout: true,
     });
     assert_eq!(

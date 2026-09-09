@@ -27,8 +27,7 @@
 //!   contiguous runs of at least two safe low-signal execute rows from one exact
 //!   turn/response collapse into one synthetic [`HistoryNode::ExecuteBundle`]
 //!   whose members stay expandable through the existing sub-ops model, so
-//!   paging indices and virtualization work unchanged. Raw profiles never
-//!   invoke bundling and stay exact/ordered.
+//!   paging indices and virtualization work unchanged.
 //! - **Claude response-fragment contraction**
 //!   ([`bundle_claude_response_tool_fragments`]): safe execute records in one
 //!   connected provider response fold into one expandable response row when
@@ -417,7 +416,7 @@ pub fn bundle_activity_execute_runs(
 /// into its same-response narrative parent because it has no descendants.
 /// Structural endpoints, heavy state rows, disconnected ID reuse, ambiguous
 /// roots, and negative outcomes stay visible. Original rows and sub-ops remain
-/// expandable. Raw profiles never invoke this pass.
+/// expandable.
 #[must_use]
 pub fn bundle_claude_response_tool_fragments<S: std::hash::BuildHasher>(
     mut nodes: Vec<HistoryNode>,

@@ -220,11 +220,11 @@ pub fn build_lane_at(lanes: &[GraphRow]) -> HashMap<String, usize> {
     lanes.iter().map(|r| (r.node.clone(), r.lane)).collect()
 }
 
-/// A cached layout context for one filter state.
+/// A cached layout context for one Activity-view snapshot.
 ///
 /// Bundles the O(V) derived data (node keys, row index map, lane map, lane
 /// assignment) so that per-window edge computation is O(window) rather than
-/// O(V). Built once per filter state and reused across scrolls/resizes.
+/// O(V). Built once per snapshot and reused across scrolls/resizes.
 #[derive(Debug, Clone)]
 pub struct LayoutContext {
     /// Node keys in canonical newest-first order.

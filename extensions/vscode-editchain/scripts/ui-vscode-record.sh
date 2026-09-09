@@ -7,8 +7,7 @@
 #
 #   out.mp4      output video path (default .ui-out/vscode-session.mp4)
 #   wdio-config   wdio config to run (default ./test/vscode/wdio.conf.ts).
-#                Use ./test/vscode/wdio.q6.conf.ts to validate the q6 chain,
-#                or ./test/vscode/wdio.visual.conf.ts for the visual state
+#                Use ./test/vscode/wdio.visual.conf.ts for the visual state
 #                matrix (screenshots + animated-scroll recording).
 #
 # The MP4 is ALWAYS finished: ffmpeg is stopped with a graceful SIGTERM and

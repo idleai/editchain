@@ -975,7 +975,7 @@ body.col-resizing .col-resize-handle::after {
    its readable width before it is ever squeezed, and the graph rail keeps the
    space it needs to stay compact instead of smearing. Breakpoints must match
    the `hidden_columns()` logic in the Rust shell
-   (crates/editchain-gpu-preview/src/app/dom.rs), which counts only visible
+   (crates/editchain-history-renderer/src/app/dom.rs), which counts only visible
    tracks. */
 @media (max-width: 617px) {
   .tbl-header,
@@ -993,7 +993,7 @@ body.col-resizing .col-resize-handle::after {
 }
 @media (max-width: 480px) {
   /* At <=480px the Rust shell caps the graph rail at GRAPH_MAX_W_NARROW (see
-     graph_width_budget in crates/editchain-gpu-preview/src/app/dom.rs), so the
+     graph_width_budget in crates/editchain-history-renderer/src/app/dom.rs), so the
      CSS grid here just keeps the --graph-w var authoritative. The rail stays
      VISIBLE — lanes compress into the compact track instead of being hidden or
      smearing Content. */

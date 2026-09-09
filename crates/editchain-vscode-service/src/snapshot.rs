@@ -5,7 +5,6 @@
 //! segment log and blob store remain authoritative, and callers fall back to
 //! the live projection whenever a snapshot is absent, stale, or incompatible.
 
-use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
@@ -13,11 +12,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use editchain_core::OpId;
 use editchain_git::RepositoryDiscovery;
-use editchain_import::hash_raw;
 use editchain_protocol::{ExpansionSpanDto, HistoryRow, HistoryWindow};
 use serde::{Deserialize, Serialize};
 
-use crate::{OpRecordLocation, OpenDiagnostics, SnapshotOpLocator};
+use crate::{hash_raw, hex_string, OpRecordLocation, OpenDiagnostics, SnapshotOpLocator};
 
 /// On-disk schema for the immutable render snapshot.
 pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
@@ -38,7 +36,7 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 /// (`work_unit` markers), a conservative promotion flag, and execute-run
 /// bundling (maximal runs of safe low-signal execute rows collapse into one
 /// synthetic expandable node), so stale revision-6 snapshots must not serve
-/// the old flat Activity profile.
+/// the old flat Activity view.
 ///
 /// Revision 8 preserves canonical Codex custom-exec outcome headers through
 /// bounded import compaction and keeps context-compaction checkpoints visible
@@ -236,7 +234,7 @@ impl SnapshotIdentity {
         let mut repository_stamps = repositories
             .iter()
             .map(|repository| {
-                let head = crate::open_repository_handle(repository)
+                let head = editchain_git::open_repository(repository)
                     .ok()
                     .and_then(|handle| {
                         let head = handle.repo.head().ok()?;
@@ -675,15 +673,6 @@ fn unix_time_ms() -> u64 {
         .unwrap_or_default()
         .as_millis();
     u64::try_from(millis).unwrap_or(u64::MAX)
-}
-
-/// Lowercase hexadecimal encoding without another runtime dependency.
-fn hex_string(bytes: &[u8]) -> Result<String, std::fmt::Error> {
-    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
-    for byte in bytes {
-        write!(&mut output, "{byte:02x}")?;
-    }
-    Ok(output)
 }
 
 /// Write a JSON value durably to one new snapshot file.

@@ -289,7 +289,7 @@ describe('EditChain History Explorer', () => {
     await restoredWebview.close();
   });
 
-  it('keeps the extension Activity-only and supports keyboard activation', async () => {
+  it('supports keyboard activation in the Activity view', async () => {
     const workbench = await browser.getWorkbench();
 
     await browser.executeWorkbench((vscode) => {
@@ -299,37 +299,27 @@ describe('EditChain History Explorer', () => {
     await webview.open();
     await browser.$('.row').waitForExist({ timeout: 120000 });
 
-    // Activity is the only shipped presentation; no visible or hidden profile
-    // mutation surface remains.
     const defaults = await browser.execute(() => ({
-      profile: typeof window.__editchainGetProfile === 'function'
-        ? window.__editchainGetProfile() : null,
-      hasControl: !!document.getElementById('profile-control'),
-      hasActivityButton: !!document.getElementById('profile-activity'),
-      hasRawButton: !!document.getElementById('profile-raw'),
-      setterType: typeof (window as any).__editchainSetProfile,
       rowCount: document.querySelectorAll('.row:not(.row-placeholder)').length,
     }));
-    console.log('[e2e] profile defaults:', JSON.stringify(defaults));
-    expect(defaults.profile).toBe('activity');
-    expect(defaults.hasControl).toBe(false);
-    expect(defaults.hasActivityButton).toBe(false);
-    expect(defaults.hasRawButton).toBe(false);
-    expect(defaults.setterType).toBe('undefined');
     expect(defaults.rowCount).toBeGreaterThan(0);
 
-    // Keyboard: Enter selects inline and explicitly opens the raw JSON editor.
+    // Keyboard: Space verifies inline selection without leaving the webview;
+    // Enter then explicitly opens raw JSON for the same ordinary row.
     const keyboard = await browser.execute(() => {
-      const row = document.querySelector('.row:not(.row-placeholder)');
+      const row = document.querySelector(
+        '.row:not(.row-placeholder):not([aria-expanded]):not([data-file-path])'
+      );
       if (!row) throw new Error('no rendered row for keyboard probe');
       const abs = Number(row.getAttribute('data-row'));
       row.focus();
-      row.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+      row.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', bubbles: true }));
+      const current = document.querySelector(`.row[data-row="${abs}"]`);
       return {
-        focused: document.activeElement === row,
+        focused: document.activeElement === current,
         abs,
         cacheBacked: window.__editchainRowAt(abs) != null,
-        selected: row.classList.contains('row-selected'),
+        selected: current?.classList.contains('row-selected') === true,
         secondaryPane: !!document.getElementById('detail') ||
           document.getElementById('layout').classList.contains('has-detail'),
       };
@@ -341,6 +331,11 @@ describe('EditChain History Explorer', () => {
     expect(keyboard.cacheBacked).toBe(true);
     expect(keyboard.selected).toBe(true);
     expect(keyboard.secondaryPane).toBe(false);
+    await browser.execute((abs) => {
+      const row = document.querySelector(`.row[data-row="${abs}"]`);
+      if (!row) throw new Error('selected keyboard row disappeared before Enter');
+      row.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    }, keyboard.abs);
     await webview.close();
     await browser.waitUntil(async () => {
       const tab = await workbench.getEditorView().getActiveTab();
@@ -449,11 +444,6 @@ describe('EditChain History Explorer', () => {
     await webview.open();
     await browser.$('.row').waitForExist({ timeout: 120000 });
 
-    // Activity is fixed before measuring; there is no profile control.
-    const initialProfile = await browser.execute(() =>
-      typeof window.__editchainGetProfile === 'function'
-        ? window.__editchainGetProfile() : null);
-    expect(initialProfile).toBe('activity');
     await browser.waitUntil(async () => browser.execute(() => {
       const rows = Array.from(document.querySelectorAll('.row'));
       return window.__editchainDataReady === true &&
@@ -484,9 +474,8 @@ describe('EditChain History Explorer', () => {
     // advances the page-side sweep by at most chunkPx travel / chunkBudgetMs
     // wall time and reports progress until done. Same samples, same checks,
     // same screenshot artifacts — just no single command over 30s.
-    const runSweep = async (profile) => {
+    const runSweep = async () => {
       const opts = {
-        profile,
         sweepPx: 60000,
         // Sample often enough that the retained head/tail key sets overlap;
         // this makes same-row viewport movement prove wrapper stability.
@@ -504,7 +493,7 @@ describe('EditChain History Explorer', () => {
         chunkBudgetMs: 20000,
       };
       // One page-side session (the probe state is reset on each injection anyway).
-      const sessionId = 'scroll-parity-' + profile + '-' + Date.now();
+      const sessionId = 'scroll-parity-' + Date.now();
       let lastProgress = null;
       const MAX_PROBE_CALLS = 200; // covers pathological slow settle slices within the 600s test budget
       for (let call = 0; call < MAX_PROBE_CALLS; call++) {
@@ -513,10 +502,10 @@ describe('EditChain History Explorer', () => {
           { ...opts, sessionId });
         if (result.done) return result;
         lastProgress = result.progress;
-        console.log('[e2e] scroll parity ' + profile + ' progress:',
+        console.log('[e2e] scroll parity progress:',
           JSON.stringify(result.progress) + (result.awaitingIdle ? ' (awaitingIdle)' : ''));
       }
-      throw new Error('scroll parity ' + profile + ' did not finish within ' + MAX_PROBE_CALLS +
+      throw new Error('scroll parity did not finish within ' + MAX_PROBE_CALLS +
         ' probe calls; last progress=' + JSON.stringify(lastProgress));
     };
 
@@ -559,7 +548,7 @@ describe('EditChain History Explorer', () => {
           !top.classList.contains('row-placeholder');
       }), { timeout: 60000, interval: 100 });
     };
-    const activity = await runSweep('activity');
+    const activity = await runSweep();
     logSweep('activity', activity);
     expect(activity.ok).toBe(true);
 
@@ -589,7 +578,7 @@ describe('EditChain History Explorer', () => {
       visibility: document.visibilityState,
       focused: document.hasFocus(),
       rows: document.querySelectorAll('.row').length,
-      loader: window.__editchainGpuDebug?.loader || null,
+      loader: window.__editchainRendererDebug?.loader || null,
       dataReady: window.__editchainDataReady === true,
       inFlight: window.__editchainInFlightCount,
       lastError: window.__editchainLastError,
@@ -720,12 +709,9 @@ describe('EditChain History Explorer', () => {
         rowsChecked: rows.length,
         startRows,
         typedBundles,
-        profile: typeof window.__editchainGetProfile === 'function'
-          ? window.__editchainGetProfile() : null,
       };
     });
     console.log('[e2e] activity wire/DOM coherence:', JSON.stringify(activity));
-    expect(activity.profile).toBe('activity');
     expect(activity.rowsChecked).toBeGreaterThan(0);
     expect(activity.startRows).toBeGreaterThan(0);
     expect(activity.problems).toEqual([]);
@@ -745,13 +731,6 @@ describe('EditChain History Explorer', () => {
     const webview = await workbench.getWebviewByTitle('EditChain History');
     await webview.open();
     await browser.$('.row').waitForExist({ timeout: 120000 });
-
-    // Webview state survives panel recreation, while presentation remains
-    // fixed to Activity.
-    const profile = await browser.execute(() =>
-      typeof window.__editchainGetProfile === 'function'
-        ? window.__editchainGetProfile() : null);
-    expect(profile).toBe('activity');
 
     // Wait for the initial window to settle before snapshotting the chain:
     // `total` is only authoritative after the first GetWindow response (the
@@ -795,8 +774,6 @@ describe('EditChain History Explorer', () => {
         header: !!document.querySelector('.tbl-header'),
         banner: !!document.querySelector('.search-banner'),
         focusIsInput: document.activeElement === input,
-        profile: typeof window.__editchainGetProfile === 'function'
-          ? window.__editchainGetProfile() : null,
         prevNav: navState('search-prev'),
         nextNav: navState('search-next'),
       };
@@ -807,7 +784,6 @@ describe('EditChain History Explorer', () => {
     expect(before.spacer).toBe(true);
     expect(before.header).toBe(true);
     expect(before.total).toBeGreaterThan(0);
-    expect(before.profile).toBe('activity');
     // The Previous/Next chevrons exist in the composite but stay collapsed
     // until a non-empty result set has actually settled.
     expect(before.prevNav && before.prevNav.displayed).toBe(false);
@@ -873,8 +849,6 @@ describe('EditChain History Explorer', () => {
         focusIsInput: document.activeElement === input,
         revealed: !!curRect && curRect.top >= rowsRect.top + headerH - 2 &&
           curRect.bottom <= rowsRect.bottom + 2,
-        profile: typeof window.__editchainGetProfile === 'function'
-          ? window.__editchainGetProfile() : null,
         prevNav: navState(document.getElementById('search-prev')),
         nextNav: navState(document.getElementById('search-next')),
       };
@@ -898,7 +872,6 @@ describe('EditChain History Explorer', () => {
     expect(settled.selKey).toBe(settled.curKey);
     expect(settled.revealed).toBe(true);
     expect(settled.focusIsInput).toBe(true);
-    expect(settled.profile).toBe('activity');
     // The adjacent Previous/Next chevron controls are displayed, carry the
     // accessible labels/titles, and are enabled once the session settles —
     // the affordances the find session exposes for mouse navigation.

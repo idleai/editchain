@@ -11,9 +11,9 @@
 // This probe runs inside the REAL VS Code webview (the browser-based harness
 // page is test/harness/rust.html): the production page loads ONLY
 // media/rust-history/loader.js and the Rust shell owns the runtime. It reads
-// renderer state through the window.__editchainGpuDebug facade (loader,
+// renderer state through the window.__editchainRendererDebug facade (loader,
 // dataReady, laneXAll, graphState, metrics, whenIdle) and the
-// window.__editchainGetProfile/GetTotal/RowAt compatibility hooks the shell
+// window.__editchainGetTotal/RowAt inspection hooks the shell
 // installs, plus plain DOM state. Legacy JS-only hooks (__editchainRequestLog,
 // __editchainGraphState, __editchainScenarioName, ...) do not exist here, so
 // no harness-scenario checks run; every check below is a real-VS-Code check.
@@ -108,16 +108,8 @@
     return any ? (minY + maxY) / 2 : null;
   }
 
-  function readActiveProfile() {
-    if (typeof window.__editchainGetProfile === 'function') {
-      const p = window.__editchainGetProfile();
-      if (p === 'activity') return p;
-    }
-    return 'activity';
-  }
-
   function readGraphWindow() {
-    const debug = window.__editchainGpuDebug;
+    const debug = window.__editchainRendererDebug;
     const state = debug && typeof debug.graphState === 'function'
       ? debug.graphState()
       : (typeof window.__editchainGraphState === 'function'
@@ -451,10 +443,6 @@
     }
 
     const addCheck = (name, pass, detail) => session.checks.push({ name, pass, detail });
-    addCheck('SCROLL_PARITY_PROFILE',
-      !session.expectedProfile || session.activeProfile === session.expectedProfile,
-      'active profile=' + session.activeProfile +
-        (session.expectedProfile ? ' expected=' + session.expectedProfile : ''));
     const observedScrollTops = session.samples.map((s) => Number(s.scrollTop))
       .filter((value) => Number.isFinite(value));
     const observedScrollSpan = observedScrollTops.length > 0
@@ -515,8 +503,6 @@
       checks: session.checks,
       samples: session.samples,
       summary: {
-        profile: session.activeProfile,
-        expectedProfile: session.expectedProfile,
         maxScroll: Math.round(session.maxScroll),
         sweepPx: Math.round(session.sweepPx),
         sampleEveryPx: Math.round(session.sampleEveryPx),
@@ -545,10 +531,9 @@
           detail: '#rows virtualized container missing',
         }],
         samples: [],
-        summary: { profile: readActiveProfile(), traveledPx: 0, sampleCount: 0, elapsedMs: 0 },
+        summary: { traveledPx: 0, sampleCount: 0, elapsedMs: 0 },
       };
     }
-    const expectedProfile = options.profile || null;
     const sweepPx = Math.max(Number(options.sweepPx) || 60000, 1);
     const sampleEveryPx = Math.max(Number(options.sampleEveryPx) || 680, 200);
     const pxPerFrame = Math.max(Number(options.pxPerFrame) || 136, 1);
@@ -595,8 +580,6 @@
         target: null,
         legTraveled: 0,
         totalTraveled: 0,
-        activeProfile: readActiveProfile(),
-        expectedProfile,
       };
       const leg1Target = clamp(session.initialScrollTop + sweepPx, 0, session.maxScroll);
       const leg2Target = clamp(leg1Target - sweepPx, 0, session.maxScroll);
@@ -637,7 +620,6 @@
           checks: session.checks.concat([{ name: 'SCROLL_PARITY_IDLE', pass: false, detail }]),
           samples: session.samples,
           summary: {
-            profile: session.activeProfile,
             traveledPx: 0,
             sampleCount: session.samples.length,
             elapsedMs: Math.round(performance.now() - session.startedPerf),
@@ -782,7 +764,7 @@
 
   // The Rust shell's read-only debug facade (media/rust-history/loader.js).
   function facade() {
-    return window.__editchainGpuDebug;
+    return window.__editchainRendererDebug;
   }
 
   // Renderer data-ready: the facade getter is authoritative; the shell's
@@ -805,7 +787,7 @@
   }
 
   // Deterministic UTC formatDate — the EXACT contract the Rust shell renders
-  // (crates/editchain-gpu-preview/src/app/rows.rs `format_date`): month/day/
+  // (crates/editchain-history-renderer/src/app/rows.rs `format_date`): month/day/
   // year/hour/minute in UTC with a fixed 12-hour clock. The legacy JS
   // bootstrap used the host locale; the Rust shell is deliberately
   // host-independent, so the probe expectation is computed the same way
@@ -913,7 +895,7 @@
     const started = Date.now();
     const g = facade();
     if (!g || typeof g.whenIdle !== 'function') {
-      return Promise.reject(new Error('window.__editchainGpuDebug.whenIdle missing'));
+      return Promise.reject(new Error('window.__editchainRendererDebug.whenIdle missing'));
     }
     return g.whenIdle(timeoutMs).then((result) => new Promise((resolve, reject) => {
       const check = () => {
@@ -957,7 +939,7 @@
         graphWidth: graphState ? graphState.graphWidth : undefined,
         laneXAll: laneX,
         rowsRendered: document.querySelectorAll('.row').length,
-        canvasCount: document.querySelectorAll('#gpu-canvas-host canvas').length,
+        canvasCount: document.querySelectorAll('canvas').length,
       },
       layoutBoxes: {
         rowsEl: rowsEl ? box(rowsEl) : null,
@@ -1031,10 +1013,10 @@
 
     // Check 3: graph geometry is aligned and lane-backed. The parity fix moved
     // the graph INTO each row as a row-local svg.graph-row-fragment (proven by
-    // checks 3b/3c) and removed the single overlay canvas, so this check
+    // checks 3b/3c), so this check
     // asserts the lane contract and the absence of any canvas surface: every
     // row renders a visible .graph-cell and a node marker whose lane maps onto
-    // a fixed laneXAll center, and no canvas lives under #gpu-canvas-host.
+    // a fixed laneXAll center, and no canvas exists.
     if (wrapEl && g && typeof g.laneXAll === 'function') {
       const laneX = g.laneXAll();
       const rowEls = wrapEl.querySelectorAll('.row:not(.row-placeholder)');
@@ -1064,8 +1046,7 @@
           }
         }
       });
-      const canvases = document.querySelectorAll(
-        '#gpu-canvas-host canvas, canvas:not(#gpu-canvas-host canvas)');
+      const canvases = document.querySelectorAll('canvas');
       const graphCell = wrapEl.querySelector('.row:not(.row-placeholder) .graph-cell');
       const graphW = graphCell ? graphCell.getBoundingClientRect().width : 0;
       checks.push({
@@ -1452,25 +1433,6 @@
       });
     }
 
-    // Check 5k: the shipped view is fixed to Activity and exposes no profile
-    // controls or hidden profile mutation hook.
-    const profileControl = document.getElementById('profile-control');
-    const profileActivityBtn = document.getElementById('profile-activity');
-    const profileRawBtn = document.getElementById('profile-raw');
-    const activeProfile = typeof window.__editchainGetProfile === 'function'
-      ? window.__editchainGetProfile()
-      : 'activity';
-    const profileFixed = activeProfile === 'activity' &&
-      !profileControl && !profileActivityBtn && !profileRawBtn &&
-      typeof window.__editchainSetProfile === 'undefined';
-    checks.push({
-      name: 'ACTIVITY_PROFILE_FIXED',
-      pass: profileFixed,
-      detail: 'profile=' + activeProfile + '; controls=' +
-        [profileControl, profileActivityBtn, profileRawBtn].filter(Boolean).length +
-        '; setter=' + typeof window.__editchainSetProfile,
-    });
-
     // Check 5l: rows expose keyboard/grid semantics — ONE labelled role=grid
     // wrapper owns the sticky header row (whose Pulse columnheaders live
     // inside the grid) and the data rows; every row carries role=row +
@@ -1725,15 +1687,9 @@
     }
 
     // Check 8: the Rust renderer contract — the facade is the rust-history
-    // loader, the shell is data-ready, the overlay canvas is GONE (the
-    // scrolling/graph parity fix draws each row's graph as a row-local SVG
-    // fragment instead; checked per-row by ROW_GRAPH_FRAGMENT), the #gpu-rows
-    // mirror matches the FRAME rows (the rendered viewport — the DOM window
-    // is larger by design), lane centers are fixed, and frames have been
-    // submitted (renderCount > 0).
-    const canvasHostCanvases = document.querySelectorAll('#gpu-canvas-host canvas');
-    const foreignCanvases = document.querySelectorAll('canvas:not(#gpu-canvas-host canvas)');
-    const mirrorRows = document.querySelectorAll('#gpu-rows [data-row][data-key]');
+    // loader, the shell is data-ready, every row owns an SVG fragment, no
+    // canvas exists, lane centers are fixed, and frames have been submitted.
+    const canvases = document.querySelectorAll('canvas');
     const renderedRows = document.querySelectorAll(
       '#rows .row[data-row][data-key]:not(.row-placeholder)');
     const fragmentRows = document.querySelectorAll(
@@ -1745,9 +1701,7 @@
     const rustContractOk = !!g &&
       g.loader === 'rust-history' &&
       dataReady() &&
-      canvasHostCanvases.length === 0 &&
-      foreignCanvases.length === 0 &&
-      mirrorRows.length === frameRows &&
+      canvases.length === 0 &&
       frameRows > 0 &&
       renderedRows.length >= frameRows &&
       fragmentRows.length === renderedRows.length &&
@@ -1757,13 +1711,12 @@
       name: 'RUST_RENDERER_CONTRACT',
       pass: rustContractOk,
       detail: rustContractOk
-        ? 'rust-history loader, dataReady, no canvas, ' + mirrorRows.length +
-          ' mirror rows == frame rows, DOM rows=' + renderedRows.length +
+        ? 'rust-history loader, dataReady, no canvas, frame rows=' + frameRows +
+          ', DOM rows=' + renderedRows.length +
           ' with row-local fragments=' + fragmentRows.length + ', ' + laneX.length +
           ' lanes, renderCount=' + (metrics ? metrics.renderCount : 'n/a')
         : 'loader=' + (g ? g.loader : 'MISSING') + ' dataReady=' + dataReady() +
-          ' canvases=' + canvasHostCanvases.length + ' foreign=' + foreignCanvases.length +
-          ' mirror=' + mirrorRows.length + ' frameRows=' + frameRows +
+          ' canvases=' + canvases.length + ' frameRows=' + frameRows +
           ' rendered=' + renderedRows.length + ' fragments=' + fragmentRows.length +
           ' laneX=' + JSON.stringify(laneX) +
           ' renderCount=' + (metrics ? metrics.renderCount : 'n/a'),
@@ -1786,12 +1739,10 @@
     return {
       loader: g ? g.loader : null,
       renderCount: metrics ? metrics.renderCount : undefined,
-      vertexCount: metrics ? metrics.vertexCount : undefined,
       domNodes: document.querySelectorAll('*').length,
       dataReady: dataReady(),
       placeholders: hasPlaceholders(),
-      canvasCount: document.querySelectorAll('#gpu-canvas-host canvas').length,
-      mirrorRows: document.querySelectorAll('#gpu-rows [data-row][data-key]').length,
+      canvasCount: document.querySelectorAll('canvas').length,
     };
   }
 

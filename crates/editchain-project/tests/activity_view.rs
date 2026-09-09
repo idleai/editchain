@@ -1,0 +1,264 @@
+//! Tests for fixed Activity-view visibility and edge splicing.
+
+#![expect(
+    clippy::indexing_slicing,
+    reason = "Tests index into known-length parent vectors"
+)]
+// Crate-level dependency markers (used by Cargo for feature resolution).
+use serde as _;
+use serde_json as _;
+
+use editchain_core::{
+    ActorId, Clock, GitLink, GitLinkKind, GitOid, ImportOp, MessageOp, NodeId, NoteOp,
+    NoteRelationship, Op, OpId, OpKind, ParentSet, Payload, RepositoryId, ScopeRef, Tags,
+};
+use editchain_project::HistoryProjection;
+
+/// Build a message op with a given clock and parent.
+fn msg_op(node: u64, seq: u64, clock_ms: u64, parent: Option<OpId>, text: &str) -> Op {
+    Op {
+        id: OpId::new(NodeId(node), 0, seq),
+        parents: parent.map_or(ParentSet::None, ParentSet::One),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(clock_ms),
+        scope: ScopeRef::None,
+        tags: Tags::MESSAGE,
+        kind: OpKind::Message(MessageOp {
+            content: Payload::Inline(text.as_bytes().to_vec()),
+            content_type: Payload::Empty,
+        }),
+    }
+}
+
+/// A `SubagentOf` relationship note: the subagent's first op (`parent_id`) is
+/// annotated as branching from the parent thread's spawn marker (`target_id`),
+/// mirroring the Codex importer's virtual-edge shape.
+fn subagent_note(parent_id: OpId, target_id: OpId) -> Op {
+    Op {
+        id: OpId::new(NodeId(9), 0, 2),
+        parents: ParentSet::One(parent_id),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(2_000),
+        scope: ScopeRef::None,
+        tags: Tags::NOTE,
+        kind: OpKind::Note(NoteOp {
+            target_ids: vec![target_id],
+            relationship: NoteRelationship::SubagentOf,
+            content: Payload::Empty,
+        }),
+    }
+}
+
+#[test]
+fn virtual_subagent_parent_is_not_duplicated_after_activity_projection() {
+    // The chain holds exactly one SubagentOf note per child. The default
+    // Activity projection materializes the virtual target into the visible
+    // clone's stored `Op.parents`; re-reading `parent_keys` (as the service
+    // does when emitting `HistoryRow.parents`) must not append the same
+    // virtual target a second time.
+    let spawn_marker = msg_op(2, 1, 1_000, None, "spawned subagent");
+    let sub_first = msg_op(3, 1, 2_000, None, "sub work");
+    let note = subagent_note(sub_first.id, spawn_marker.id);
+
+    let projection =
+        HistoryProjection::from_ops(vec![spawn_marker.clone(), sub_first.clone(), note]);
+    let nodes = projection.activity_nodes();
+    let sub = nodes
+        .iter()
+        .find(|n| n.node_key() == sub_first.id.to_string())
+        .expect("subagent first op kept");
+
+    let parents = sub.parent_keys(&projection.git.links, projection.relationship_notes());
+    assert_eq!(
+        parents,
+        vec![spawn_marker.id.to_string()],
+        "virtual SubagentOf target must appear exactly once, in stable order"
+    );
+
+    // The service emits `lifted_parent_keys`; it must be duplicate-free too.
+    let lifted = projection.lifted_parent_keys(sub);
+    assert_eq!(
+        lifted,
+        vec![spawn_marker.id.to_string()],
+        "lifted parents must not repeat the materialized virtual target"
+    );
+}
+
+#[test]
+fn activity_view_splices_edges_across_undated_rows() {
+    // b has clock 0 (undated); c's parent is rewritten to a.
+    let a = msg_op(1, 1, 1_000, None, "alpha");
+    let b = msg_op(1, 2, 0, Some(a.id), "beta");
+    let c = msg_op(1, 3, 3_000, Some(b.id), "gamma");
+    let a_id = a.id;
+    let projection = HistoryProjection::from_ops(vec![a, b, c]);
+
+    let nodes = projection.activity_nodes();
+    assert_eq!(nodes.len(), 2);
+    // c's parent should now be a (the nearest kept ancestor).
+    let c_node = nodes
+        .iter()
+        .find(|n| n.summary() == "gamma")
+        .expect("gamma kept");
+    let parents = c_node.parent_keys(&projection.git.links, projection.relationship_notes());
+    assert_eq!(parents.len(), 1);
+    assert_eq!(parents[0], a_id.to_string());
+}
+
+#[test]
+fn activity_view_keeps_undated_metadata_bundled_as_sub_ops() {
+    let turn = Op {
+        id: OpId::new(NodeId(1), 0, 1),
+        parents: ParentSet::None,
+        actor: ActorId(1),
+        clock: Clock::UnixMs(1_000),
+        scope: ScopeRef::None,
+        tags: Tags::IMPORT,
+        kind: OpKind::Import(ImportOp {
+            raw_ref: Payload::Inline(br#"{"type":"user"}"#.to_vec()),
+            raw_hash: None,
+        }),
+    };
+    let metadata = Op {
+        id: OpId::new(NodeId(1), 0, 2),
+        parents: ParentSet::One(turn.id),
+        actor: ActorId(1),
+        clock: Clock::UnixMs(0),
+        scope: ScopeRef::None,
+        tags: Tags::IMPORT | Tags::META,
+        kind: OpKind::Import(ImportOp {
+            raw_ref: Payload::Inline(br#"{"type":"custom-title"}"#.to_vec()),
+            raw_hash: None,
+        }),
+    };
+    let projection = HistoryProjection::from_ops(vec![turn, metadata.clone()]);
+
+    let unfiltered = projection.nodes();
+    assert_eq!(unfiltered.len(), 1, "metadata is folded before filtering");
+    assert_eq!(unfiltered[0].sub_ops().len(), 1);
+
+    let filtered = projection.activity_nodes();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(
+        filtered[0]
+            .sub_ops()
+            .iter()
+            .map(|op| op.id)
+            .collect::<Vec<_>>(),
+        vec![metadata.id],
+        "undated top-level rows are omitted while bundled metadata remains inspectable"
+    );
+}
+
+#[test]
+fn activity_view_splices_through_undated_structural_endpoints() {
+    // Both exact SubagentOf endpoints are undated: the parent-side spawn row
+    // follows a dated trunk row, while the child-side branch anchor precedes a
+    // dated work row. The relationship remains in the projection, but neither
+    // timestamp-zero carrier may survive presentation. Splicing must lift the
+    // branch edge onto the two dated rows.
+    let trunk = msg_op(1, 1, 1_000, None, "parent work");
+    let spawn = msg_op(1, 2, 0, Some(trunk.id), "spawn marker");
+    let branch_anchor = msg_op(2, 1, 0, None, "subagent anchor");
+    let branch_work = msg_op(2, 2, 3_000, Some(branch_anchor.id), "subagent work");
+    let note = subagent_note(branch_anchor.id, spawn.id);
+    let projection = HistoryProjection::from_ops(vec![
+        trunk.clone(),
+        spawn.clone(),
+        branch_anchor.clone(),
+        branch_work.clone(),
+        note,
+    ]);
+
+    let nodes = projection.activity_nodes();
+    assert!(
+        nodes.iter().all(|node| node.timestamp_ms() != 0),
+        "Activity must omit structural timestamp-zero rows too"
+    );
+    let keys: Vec<String> = nodes
+        .iter()
+        .map(editchain_project::HistoryNode::node_key)
+        .collect();
+    assert!(!keys.contains(&spawn.id.to_string()));
+    assert!(!keys.contains(&branch_anchor.id.to_string()));
+
+    let work = nodes
+        .iter()
+        .find(|node| node.node_key() == branch_work.id.to_string())
+        .expect("dated subagent work remains visible");
+    assert_eq!(
+        work.parent_keys(&projection.git.links, projection.relationship_notes()),
+        vec![trunk.id.to_string()],
+        "the stored structural relationship must splice onto dated endpoints"
+    );
+
+    let layout = projection.layout_context(&nodes);
+    assert!(
+        layout.edges_for_window(0, nodes.len()).iter().any(|edge| {
+            edge.child == branch_work.id.to_string() && edge.parent == trunk.id.to_string()
+        }),
+        "the lifted branch edge must remain drawable between dated rows"
+    );
+}
+
+#[test]
+fn activity_view_preserves_dated_produced_by_sources_without_resolved_targets() {
+    for (timestamp, expected_visible) in [(1_000, true), (0, false)] {
+        let source = Op {
+            id: OpId::new(NodeId(7), 0, 1),
+            parents: ParentSet::None,
+            actor: ActorId(1),
+            clock: Clock::UnixMs(timestamp),
+            scope: ScopeRef::None,
+            tags: Tags::IMPORT,
+            kind: OpKind::Import(ImportOp {
+                raw_ref: Payload::Inline(br#"{"type":"response_item","payload":{}}"#.to_vec()),
+                raw_hash: None,
+            }),
+        };
+        let link = Op {
+            id: OpId::new(NodeId(7), 0, 2),
+            parents: ParentSet::None,
+            kind: OpKind::GitLink(GitLink {
+                source: source.id,
+                target_repo: RepositoryId(1),
+                target_oid: GitOid::from_sha1([0x55; 20]),
+                kind: GitLinkKind::ProducedBy,
+            }),
+            ..source.clone()
+        };
+        let projection = HistoryProjection::from_ops(vec![source.clone(), link]);
+        let nodes = projection.nodes();
+        let source_row = nodes
+            .iter()
+            .find(|node| node.op_id() == Some(source.id))
+            .expect("source in canonical projection");
+        assert_eq!(
+            source_row.visibility(),
+            editchain_project::taxonomy::Visibility::Trace,
+            "the fixture exercises structural protection from trace hiding"
+        );
+        assert_eq!(
+            projection
+                .activity_nodes()
+                .iter()
+                .any(|node| node.op_id() == Some(source.id)),
+            expected_visible,
+            "preserve the r9 fixed view even when the linked Git object is unavailable"
+        );
+    }
+}
+
+#[test]
+fn activity_view_removes_undated_leaf_nodes() {
+    // A dated root with an undated leaf child (e.g. a `last-prompt` record).
+    // The undated leaf must be hidden even though it has no children (it is an
+    // endpoint) — it is junk metadata with no chain position to anchor.
+    let a = msg_op(1, 1, 1_000, None, "alpha");
+    let leaf = msg_op(1, 2, 0, Some(a.id), "last-prompt");
+    let projection = HistoryProjection::from_ops(vec![a.clone(), leaf]);
+
+    let nodes = projection.activity_nodes();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].summary(), "alpha");
+}
