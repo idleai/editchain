@@ -8,7 +8,10 @@ use editchain_import as _;
 #[cfg(test)]
 use tempfile as _;
 
+mod search;
 mod snapshot;
+
+pub use search::{build_lexical_index, SearchIndexState};
 
 pub use snapshot::RenderSnapshotReport;
 
@@ -21,26 +24,25 @@ use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
 use editchain_core::{
-    ActorId, BlobRef, Clock, ContentId, GitOid, NodeId, Op, OpId, OpKind, ParentSet, Payload,
-    RepositoryId, ScopeRef, SessionId, Tags,
+    BlobRef, ContentId, GitOid, Op, OpId, OpKind, Payload, RepositoryId, ScopeRef, SessionId, Tags,
 };
 use editchain_git::{
     commit_file_changes, open_repository, resolve_blob as resolve_git_blob, resolve_commit,
     resolve_path_at_commit, walk_history, GitFileChange, GitFileStatus, RepositoryCatalog,
     RepositoryHandle,
 };
-use editchain_index::{LexicalHit, LexicalIndex, LexicalSource};
+#[cfg(test)]
+use editchain_index::{DocumentId, LexicalHit};
 use editchain_project::activity::{SessionSummaryMarker, WorkUnitMarker};
 use editchain_project::activity_view::{ActivityPresentation, ActivityView};
 use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
-use editchain_project::NodeKey;
 use editchain_protocol::{
     ErrorCode, ExpansionSpanDto, FileChangeDto, FileChangeSource, FileChangeStatus, FileDiffDto,
-    FileDiffHunkDto, FindInHistoryMatch, FindInHistoryResponse, HistoryRow, HistoryWindow,
-    NodeDetails, OpenResponse, ParentRelationDto, ParentRelationKind, Request, RequestBody,
-    ResolvedObject, Response, ResponseBody, ServiceError, SessionMetaDto, SessionSummaryDto,
-    SnapshotId, SnapshotResult, SubOpSummary, WorkUnitDto, PROTOCOL_VERSION,
+    FileDiffHunkDto, HistoryRow, HistoryWindow, NodeDetails, OpenResponse, ParentRelationDto,
+    ParentRelationKind, Request, RequestBody, ResolvedObject, Response, ResponseBody, ServiceError,
+    SessionMetaDto, SessionSummaryDto, SnapshotId, SnapshotResult, SubOpSummary, WorkUnitDto,
+    PROTOCOL_VERSION,
 };
 
 use snapshot::{RenderSnapshot, SnapshotBuilder, SnapshotIdentity, SnapshotManifestData};
@@ -421,8 +423,8 @@ fn hex_string(bytes: &[u8]) -> Result<String, std::fmt::Error> {
 /// with inline content; every other blob stays a [`Payload::Blob`] reference
 /// and is counted in the returned stats. Blob references with no inline
 /// representation (`FileEdit::Blob`) are validated and preserved unchanged.
-/// Runs before projection and lexical indexing so summaries, details, and
-/// search see the actual content.
+/// Full detail reads use this adapter; display and search select their own
+/// required fields before reading payloads.
 #[must_use]
 pub fn hydrate_blob_payloads(ops: &mut [Op], resolver: &BlobResolver) -> BlobHydrationStats {
     let mut stats = BlobHydrationStats::default();
@@ -2781,70 +2783,6 @@ impl Workspace {
         ));
     }
 
-    /// Resolve scored search chunks to distinct visible top-level rows of the
-    /// fixed Activity view, deduplicating by row and keeping the best BM25 score.
-    ///
-    /// The resolution reuses the cached `ActivityView`. Every
-    /// returned match carries the row's stable real `node_key` and its absolute
-    /// expanded-history parent-row offset (from the snapshot's `starts` prefix
-    /// sums), so the viewer can cycle matches without auto-expanding anything.
-    /// Hits whose op id has no visible row are dropped;
-    /// `Git` hits are resolved by real `(repository, oid)` identity, never the
-    /// synthetic index-only op id.
-    #[must_use]
-    pub fn find_in_history(
-        &mut self,
-        chunks: &[LexicalHit],
-        git_identities: &std::collections::BTreeMap<OpId, GitHitIdentity>,
-    ) -> Vec<FindInHistoryMatch> {
-        self.ensure_view_snapshot();
-        let Some(snapshot) = self.current_view.as_ref() else {
-            return Vec::new();
-        };
-        // Distinct visible rows → best (highest) score for that row.
-        let mut best: HashMap<usize, f64> = HashMap::new();
-        for chunk in chunks {
-            let source = if chunk.source == LexicalSource::Git {
-                let Some(identity) = git_identities.get(&chunk.op_id) else {
-                    continue;
-                };
-                NodeKey::Git(editchain_core::GitCommitKey::new(
-                    identity.repository_id,
-                    identity.oid,
-                ))
-            } else {
-                NodeKey::Op(chunk.op_id)
-            };
-            let Some(row) = snapshot.source_row(source) else {
-                continue;
-            };
-            let entry = best.entry(row).or_insert(chunk.score);
-            if chunk.score > *entry {
-                *entry = chunk.score;
-            }
-        }
-        let starts = snapshot.starts();
-        let mut ranked: Vec<(usize, f64)> = best.into_iter().collect();
-        // Ranked: best score first; ties break to the newest visible row so the
-        // ordering is deterministic for the viewer's cycle.
-        ranked.sort_unstable_by(|(row_a, score_a), (row_b, score_b)| {
-            score_b
-                .partial_cmp(score_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(row_a.cmp(row_b))
-        });
-        ranked
-            .into_iter()
-            .filter_map(|(row, _)| {
-                let node = snapshot.entries().get(row)?.node();
-                Some(FindInHistoryMatch {
-                    node_key: node.node_key(),
-                    row: u64::try_from(starts.get(row).copied().unwrap_or(0)).unwrap_or(u64::MAX),
-                })
-            })
-            .collect()
-    }
-
     /// Get details for a specific node by operation ID or git OID.
     #[must_use]
     pub fn node_details(
@@ -4606,92 +4544,6 @@ fn read_op_at(
     editchain_store::read_op_at(chain_dir, location).map_err(Into::into)
 }
 
-/// Deterministic git identity for a synthetic search-indexed op.
-///
-/// Git commits are indexed as synthetic ops whose numeric ids exist only
-/// inside the index; this record is the single source of truth for the real
-/// identity a search hit must navigate to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitHitIdentity {
-    /// Repository identity.
-    pub repository_id: RepositoryId,
-    /// Commit OID (lowercase hex when serialized).
-    pub oid: GitOid,
-    /// Whether the commit's repository is a nested/submodule repository.
-    pub is_submodule: bool,
-}
-
-/// A lexical search index plus the synthetic-op → git identity map built
-/// alongside it, so search responses stay deterministic and exact.
-#[derive(Debug)]
-pub struct SearchIndexState {
-    /// Opened snapshot whose canonical documents were indexed.
-    snapshot_id: SnapshotId,
-    /// The underlying Tantivy lexical index.
-    pub index: LexicalIndex,
-    /// Map from each synthetic indexed `OpId` to the real git commit identity
-    /// (`BTreeMap`: deterministic order, no hasher dependency).
-    pub git_identities: std::collections::BTreeMap<OpId, GitHitIdentity>,
-}
-
-/// Build a lexical index over all chain ops and git commits.
-///
-/// # Errors
-///
-/// Returns an error if the index cannot be created or populated.
-#[expect(
-    clippy::arithmetic_side_effects,
-    reason = "Generation counter increments are bounded by the number of indexed ops"
-)]
-pub fn build_lexical_index(
-    workspace: &Workspace,
-) -> Result<SearchIndexState, Box<dyn std::error::Error>> {
-    workspace.ensure_sources_current()?;
-    let mut index = LexicalIndex::new()?;
-    let mut git_identities = std::collections::BTreeMap::new();
-    let mut generation = 0u64;
-    for source in &workspace.source_ops {
-        let mut op = source.clone();
-        if let Some(resolver) = &workspace.blob_resolver {
-            let mut stats = BlobHydrationStats::default();
-            hydrate_kind(&mut op.kind, resolver, &mut stats);
-        }
-        drop(index.index_op(&op, generation)?);
-        generation += 1;
-    }
-    // Index git commits as synthetic ops, recording the deterministic mapping
-    // from each synthetic op id back to the real commit identity so search
-    // responses navigate by (repository, oid) — never the synthetic id.
-    for commit in workspace.projection.git().commits.values() {
-        let op = Op {
-            id: OpId::new(NodeId(0), 0, generation),
-            parents: ParentSet::None,
-            actor: ActorId(0),
-            clock: Clock::UnixMs(u64::try_from(commit.committed_at).unwrap_or(0)),
-            scope: ScopeRef::None,
-            tags: Tags::IMPORT,
-            kind: OpKind::GitCommit(Box::new(commit.clone())),
-        };
-        drop(index.index_op(&op, generation)?);
-        let _: Option<GitHitIdentity> = git_identities.insert(
-            op.id,
-            GitHitIdentity {
-                repository_id: commit.repository,
-                oid: commit.oid,
-                is_submodule: workspace.repo_is_submodule(commit.repository),
-            },
-        );
-        generation += 1;
-    }
-    index.commit()?;
-    workspace.ensure_sources_current()?;
-    Ok(SearchIndexState {
-        snapshot_id: workspace.snapshot_id.clone(),
-        index,
-        git_identities,
-    })
-}
-
 /// Resolve a git commit by OID in a discovered repository.
 ///
 /// # Errors
@@ -4760,7 +4612,7 @@ fn merge_exact_git_link_targets(
 pub struct Server {
     /// The currently loaded workspace (None until `Open`).
     pub workspace: Option<Workspace>,
-    /// The lexical search index plus synthetic-op → git identity map (built
+    /// The immutable lexical search index bound to the opened snapshot (built
     /// lazily on first `FindInHistory`).
     pub lexical: Option<SearchIndexState>,
 }
@@ -4916,30 +4768,11 @@ impl Server {
                 // Build the lexical index lazily on first search.
                 if self.lexical.is_none() {
                     let ws = self.workspace.as_mut().ok_or_else(no_workspace)?;
-                    ws.ensure_projection_loaded()?;
                     self.lexical = Some(build_lexical_index(ws)?);
                 }
                 let lexical = self.lexical.as_ref().ok_or("no index built")?;
-                if self
-                    .workspace
-                    .as_ref()
-                    .ok_or_else(no_workspace)?
-                    .snapshot_id()
-                    != &lexical.snapshot_id
-                {
-                    return Err(stale_snapshot().into());
-                }
-                let chunks = lexical.index.search_internal(&req.query, req.top_k)?;
                 let ws = self.workspace.as_mut().ok_or_else(no_workspace)?;
-                let matches = ws.find_in_history(&chunks, &lexical.git_identities);
-                // `more` reports only whether the candidate/top_k limit may have
-                // truncated retrieval; the response never claims an exact total.
-                let more = req.top_k > 0 && chunks.len() >= req.top_k;
-                let response = FindInHistoryResponse {
-                    snapshot_id: ws.snapshot_id.clone(),
-                    more,
-                    matches,
-                };
+                let response = lexical.find(ws, &req.query, req.top_k)?;
                 ResponseBody::Ok(serde_json::to_value(response)?)
             }
         };
@@ -5034,10 +4867,9 @@ mod tests {
     use super::*;
     use editchain_codec::frame::encode_op;
     use editchain_codec::page::{encode_page, Page};
-    use editchain_core::{ImportOp, MessageOp, PathId};
+    use editchain_core::{ActorId, Clock, ImportOp, MessageOp, NodeId, ParentSet, PathId};
     use editchain_import::BlobSink as _;
     use editchain_import::FsBlobSink;
-    use std::collections::BTreeMap;
 
     /// 2^53 + 1 — the first integer JavaScript's IEEE-754 doubles round.
     const OVER_2_53: u64 = 9_007_199_254_740_993;
@@ -5578,7 +5410,7 @@ mod tests {
         write_chain(&chain_dir, &[msg.clone(), tool.clone(), raw.clone()]);
 
         // Reopen the workspace over the durable chain.
-        let ws = Workspace::open(workspace_path.to_str().unwrap(), ".editchain").unwrap();
+        let mut ws = Workspace::open(workspace_path.to_str().unwrap(), ".editchain").unwrap();
         assert_eq!(ws.diagnostics.chain.records, 3);
         assert_eq!(ws.diagnostics.chain.accepted, 3);
         assert_eq!(ws.diagnostics.blobs.hydrated, 0);
@@ -5596,18 +5428,23 @@ mod tests {
         let raw_details = ws.node_details(Some(raw.id.to_string()), None).unwrap();
         assert!(raw_details.summary.contains("needle-hydrated-raw"));
 
-        // Search hydrates each source operation while lazily building its index.
-        let state = build_lexical_index(&ws).unwrap();
+        // Search hydrates eligible content fields while lazily building its index.
+        let state = build_lexical_index(&mut ws).unwrap();
         let results = state
-            .index
-            .search_internal("needle-hydrated-message", 5)
-            .unwrap();
+            .index()
+            .candidates("needle-hydrated-message", 5)
+            .unwrap()
+            .next_page(5)
+            .unwrap()
+            .hits;
         assert!(!results.is_empty());
-        assert!(results.iter().any(|r| r.op_id == msg.id));
+        assert!(results
+            .iter()
+            .any(|r| r.document == DocumentId::Operation(msg.id)));
     }
 
     #[test]
-    fn git_search_hits_use_index_identity_map_not_synthetic_ids() {
+    fn git_search_hits_retain_real_repository_and_commit_identity() {
         // A real commit in a repository whose id exceeds 2^53, so the identity
         // must round-trip as an exact decimal string.
         let mut bytes = [0u8; 32];
@@ -5640,30 +5477,30 @@ mod tests {
         };
         let mut projection = HistoryProjection::new();
         projection.merge_git_commits(vec![commit]);
-        let ws = Workspace::from_projection(projection);
+        let mut ws = Workspace::from_projection(projection);
 
-        let state = build_lexical_index(&ws).unwrap();
+        let state = build_lexical_index(&mut ws).unwrap();
         let results = state
-            .index
-            .search_internal("needle-git-identity", 5)
-            .unwrap();
-        let hit = results
+            .index()
+            .candidates("needle-git-identity", 5)
+            .unwrap()
+            .next_page(5)
+            .unwrap()
+            .hits;
+        let key = editchain_core::GitCommitKey::new(RepositoryId(OVER_2_53), oid);
+        assert!(results
             .iter()
-            .find(|result| state.git_identities.contains_key(&result.op_id))
-            .expect("git hit");
-
-        // The synthetic indexed op id deterministically maps to the real
-        // commit identity — never guessed at response time.
-        let identity = state
-            .git_identities
-            .get(&hit.op_id)
-            .expect("identity map entry for synthetic op id");
-        assert_eq!(identity.oid, oid);
-        assert_eq!(identity.repository_id.0, OVER_2_53);
-        assert!(!identity.is_submodule);
-
-        // The synthetic op id is index-internal and is not a projection node.
-        assert!(ws.node_details(Some(hit.op_id.to_string()), None).is_none());
+            .any(|hit| hit.document == DocumentId::GitCommit(key)));
+        let exact = state
+            .index()
+            .candidates(&oid.to_hex(), 5)
+            .unwrap()
+            .next_page(5)
+            .unwrap();
+        assert!(exact
+            .hits
+            .iter()
+            .any(|hit| hit.document == DocumentId::GitCommit(key)));
     }
 
     #[test]
@@ -7043,8 +6880,7 @@ mod tests {
     /// Build a ranked lexical hit.
     const fn lexical_hit(op_id: OpId, score: f64) -> LexicalHit {
         LexicalHit {
-            op_id,
-            source: LexicalSource::EditChain,
+            document: DocumentId::Operation(op_id),
             score,
         }
     }
@@ -7069,13 +6905,13 @@ mod tests {
             lexical_hit(msg.id, 3.5),
             lexical_hit(meta.id, 0.5),
         ];
-        let matches = ws.find_in_history(&chunks, &BTreeMap::new());
+        let matches = ws.find_in_history(&chunks);
 
         assert_eq!(matches.len(), 1, "all three chunks dedupe into one row");
         assert_eq!(matches[0].node_key, turn.id.to_string());
         assert_eq!(matches[0].row, 0);
         let entries = ws.current_view.as_ref().unwrap().entries().as_ptr();
-        let again = ws.find_in_history(&chunks, &BTreeMap::new());
+        let again = ws.find_in_history(&chunks);
         assert_eq!(
             entries,
             ws.current_view.as_ref().unwrap().entries().as_ptr(),
@@ -7142,7 +6978,7 @@ mod tests {
             lexical_hit(member_b.id, 1.0),
             lexical_hit(meta_of_b.id, 0.5),
         ];
-        let matches = ws.find_in_history(&chunks, &BTreeMap::new());
+        let matches = ws.find_in_history(&chunks);
 
         assert_eq!(matches.len(), 1, "members dedupe into the bundle row");
         assert_eq!(matches[0].node_key, owner.node_key);
@@ -7178,7 +7014,7 @@ mod tests {
         ]);
         let mut ws = Workspace::from_projection(projection);
         let chunks = vec![lexical_hit(msg1.id, 1.0), lexical_hit(msg2.id, 2.0)];
-        let matches = ws.find_in_history(&chunks, &BTreeMap::new());
+        let matches = ws.find_in_history(&chunks);
 
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].node_key, turn1.id.to_string());
@@ -7236,24 +7072,17 @@ mod tests {
                 common_dir: PathBuf::from("/ws/nested/.git"),
             },
         ]);
-        let synthetic = OpId::new(NodeId(0), 0, 0);
-        let mut identities = BTreeMap::new();
-        let _: Option<GitHitIdentity> = identities.insert(
-            synthetic,
-            GitHitIdentity {
-                repository_id: commit.repository,
-                oid: commit.oid,
-                is_submodule: true,
-            },
-        );
         let chunks = vec![LexicalHit {
-            source: LexicalSource::Git,
-            ..lexical_hit(synthetic, 1.0)
+            document: DocumentId::GitCommit(editchain_core::GitCommitKey::new(
+                commit.repository,
+                commit.oid,
+            )),
+            score: 1.0,
         }];
 
         // The fixed viewer hides nested repositories, so this identity has no
         // row and is dropped rather than mapped to a phantom offset.
-        let hidden = ws.find_in_history(&chunks, &identities);
+        let hidden = ws.find_in_history(&chunks);
         assert!(hidden.is_empty());
     }
 }

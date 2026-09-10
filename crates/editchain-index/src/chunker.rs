@@ -1,211 +1,92 @@
-use editchain_core::{Op, OpId};
-use tantivy as _;
+//! Deterministic overlapping UTF-8 text ranges, independent of source identity.
 
-/// A generation counter for tracking projection freshness.
-pub type Generation = u64;
+use std::io;
+use std::ops::Range;
 
-/// A chunk record — a deterministic text segment extracted from an operation.
-#[derive(Debug, Clone)]
-pub struct ChunkRecord {
-    /// Unique identifier for this chunk.
-    pub chunk_id: ChunkId,
-    /// The operation this chunk was extracted from.
-    pub op_id: OpId,
-    /// Ordinal position of this chunk within the operation's text.
-    pub chunk_ordinal: u32,
-    /// Byte offset of the start of this chunk in the original text.
-    pub byte_start: u32,
-    /// Byte offset of the end of this chunk in the original text.
-    pub byte_end: u32,
-    /// Generation counter for tracking projection freshness.
-    pub generation: Generation,
+/// Validated chunk sizes, using the existing estimate of four bytes per token.
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkOptions {
+    window_bytes: usize,
+    stride_bytes: usize,
 }
 
-/// A chunk identifier — unique within a chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ChunkId {
-    /// The operation this chunk belongs to.
-    pub op_id: OpId,
-    /// Ordinal position of this chunk within the operation.
-    pub chunk_ordinal: u32,
+impl ChunkOptions {
+    /// Require a positive window and an overlap strictly smaller than it.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid or unrepresentable sizes before chunking any text.
+    pub fn new(window_tokens: u32, overlap_tokens: u32) -> Result<Self, io::Error> {
+        if window_tokens == 0 || overlap_tokens >= window_tokens {
+            return Err(io::Error::other(
+                "chunk overlap must be smaller than a positive window",
+            ));
+        }
+        let window_bytes = usize::try_from(window_tokens)
+            .ok()
+            .and_then(|value| value.checked_mul(4))
+            .ok_or_else(|| io::Error::other("chunk window is too large"))?;
+        let stride_bytes = window_tokens
+            .checked_sub(overlap_tokens)
+            .and_then(|value| usize::try_from(value).ok())
+            .and_then(|value| value.checked_mul(4))
+            .ok_or_else(|| io::Error::other("chunk stride is too large"))?;
+        Ok(Self {
+            window_bytes,
+            stride_bytes,
+        })
+    }
 }
 
-impl ChunkId {
-    /// Create a new chunk identifier.
-    #[must_use]
-    pub const fn new(op_id: OpId, chunk_ordinal: u32) -> Self {
+impl Default for ChunkOptions {
+    fn default() -> Self {
         Self {
-            op_id,
-            chunk_ordinal,
+            window_bytes: 3072,
+            stride_bytes: 2688,
         }
     }
 }
 
-impl core::fmt::Display for ChunkId {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}:{}", self.op_id, self.chunk_ordinal)
-    }
+/// Borrowed text ranges whose endpoints are already valid UTF-8 boundaries.
+#[derive(Debug)]
+pub struct TextChunks<'a> {
+    text: &'a str,
+    options: ChunkOptions,
+    start: usize,
 }
 
-/// Default chunking window size in tokens (768).
-pub const DEFAULT_CHUNK_WINDOW_TOKENS: u32 = 768;
-/// Default chunk overlap in tokens (96).
-pub const DEFAULT_CHUNK_OVERLAP_TOKENS: u32 = 96;
-
-/// Extract searchable text from an operation based on its kind.
-///
-/// Returns `None` for operations that should not be indexed (e.g. private
-/// content when disabled, or raw import ops when raw search is off).
-#[expect(
-    clippy::fn_params_excessive_bools,
-    reason = "Two booleans control indexing behavior; grouped into a config struct would add ceremony"
-)]
+/// Chunk text lazily without allocating chunk records or source identifiers.
 #[must_use]
-pub fn extract_op_text(op: &Op, include_raw: bool, include_private: bool) -> Option<String> {
-    use editchain_core::op::OpKind;
-
-    if !include_private && op.tags.matches_any(editchain_core::tags::Tags::PRIVATE) {
-        return None;
-    }
-
-    match &op.kind {
-        OpKind::Message(msg) => match &msg.content {
-            editchain_core::payload::Payload::Inline(bytes) => {
-                Some(String::from_utf8_lossy(bytes).to_string())
-            }
-            editchain_core::payload::Payload::Empty | editchain_core::payload::Payload::Blob(_) => {
-                None
-            }
-        },
-        OpKind::Tool(tool) => match &tool.content {
-            editchain_core::payload::Payload::Inline(bytes) => {
-                Some(String::from_utf8_lossy(bytes).to_string())
-            }
-            editchain_core::payload::Payload::Empty | editchain_core::payload::Payload::Blob(_) => {
-                None
-            }
-        },
-        OpKind::Command(cmd) => match &cmd.content {
-            editchain_core::payload::Payload::Inline(bytes) => {
-                Some(String::from_utf8_lossy(bytes).to_string())
-            }
-            editchain_core::payload::Payload::Empty | editchain_core::payload::Payload::Blob(_) => {
-                None
-            }
-        },
-        OpKind::File(file) => {
-            // File ops carry path info but not always text content.
-            // Index the path as searchable text.
-            Some(format!("file:{}", file.path.0))
-        }
-        OpKind::Reflection(_refl) => {
-            // Reflection summaries are indexed when available.
-            None // Placeholder — will index summary when populated.
-        }
-        OpKind::Import(_import) if include_raw => {
-            // Raw import records indexed only when explicitly requested.
-            None // Placeholder — raw_ref payload may be blob.
-        }
-        OpKind::GitCommit(commit) => {
-            // Index the commit message, OID, refs, and changed paths as
-            // searchable text. This is the git document surface.
-            let mut parts: Vec<String> = Vec::new();
-            parts.push(commit.oid.to_hex());
-            if let editchain_core::payload::Payload::Inline(msg) = &commit.message {
-                parts.push(String::from_utf8_lossy(msg).to_string());
-            }
-            for r in &commit.imported_refs {
-                if let editchain_core::payload::Payload::Inline(b) = r {
-                    parts.push(String::from_utf8_lossy(b).to_string());
-                }
-            }
-            for r in &commit.live_refs {
-                if let editchain_core::payload::Payload::Inline(b) = r {
-                    parts.push(String::from_utf8_lossy(b).to_string());
-                }
-            }
-            for p in &commit.changed_paths {
-                parts.push(format!("path:{}", p.0));
-            }
-            Some(parts.join("\n"))
-        }
-        OpKind::GitLink(link) => {
-            // Index the target OID and relation kind.
-            Some(format!("git:{} {:?}", link.target_oid, link.kind))
-        }
-        OpKind::ChainStart(_)
-        | OpKind::Actor(_)
-        | OpKind::Import(_)
-        | OpKind::Note(_)
-        | OpKind::Error(_)
-        | OpKind::Unknown(_) => None,
+pub const fn chunk_text(text: &str, options: ChunkOptions) -> TextChunks<'_> {
+    TextChunks {
+        text,
+        options,
+        start: 0,
     }
 }
 
-/// Chunk a text string into overlapping segments.
-///
-/// Uses a simple token estimate (4 bytes per token) for deterministic
-/// chunking without an external tokenizer dependency.
-#[expect(
-    clippy::as_conversions,
-    clippy::arithmetic_side_effects,
-    clippy::cast_possible_truncation,
-    reason = "Token counts are small (<4096); usize/u32 conversions are safe; arithmetic on byte offsets is bounded by text length"
-)]
-#[must_use]
-pub fn chunk_text(
-    text: &str,
-    op_id: OpId,
-    generation: Generation,
-    window_tokens: u32,
-    overlap_tokens: u32,
-) -> Vec<ChunkRecord> {
-    if text.is_empty() {
-        return Vec::new();
-    }
+impl Iterator for TextChunks<'_> {
+    type Item = Range<usize>;
 
-    // Rough token estimate: ~4 bytes per token for mixed code/prose.
-    let window_bytes = (window_tokens as usize).saturating_mul(4);
-    let overlap_bytes = (overlap_tokens as usize).saturating_mul(4);
-    let stride = window_bytes.saturating_sub(overlap_bytes);
-
-    if stride == 0 {
-        // Window <= overlap — just return one chunk.
-        return vec![ChunkRecord {
-            chunk_id: ChunkId::new(op_id, 0),
-            op_id,
-            chunk_ordinal: 0,
-            byte_start: 0,
-            byte_end: text.len() as u32,
-            generation,
-        }];
-    }
-
-    let bytes = text.as_bytes();
-    let mut chunks = Vec::new();
-    let mut ordinal = 0u32;
-    let mut start = 0usize;
-
-    while start < bytes.len() {
-        let end = (start + window_bytes).min(bytes.len());
-
-        chunks.push(ChunkRecord {
-            chunk_id: ChunkId::new(op_id, ordinal),
-            op_id,
-            chunk_ordinal: ordinal,
-            byte_start: start as u32,
-            byte_end: end as u32,
-            generation,
-        });
-
-        ordinal += 1;
-
-        if end == bytes.len() {
-            break;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.start >= self.text.len() {
+            return None;
         }
-
-        start += stride;
+        let start = self.start;
+        let end = self.text.floor_char_boundary(
+            start
+                .saturating_add(self.options.window_bytes)
+                .min(self.text.len()),
+        );
+        self.start = if end == self.text.len() {
+            end
+        } else {
+            self.text.floor_char_boundary(
+                start
+                    .saturating_add(self.options.stride_bytes)
+                    .min(self.text.len()),
+            )
+        };
+        Some(start..end)
     }
-
-    chunks
 }

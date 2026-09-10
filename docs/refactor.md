@@ -195,9 +195,31 @@ Completed increments:
   A Git marker inside a skipped directory leaves that cwd unresolved instead
   of assigning the containing repository's identity.
 
+- Search documents: a fallible Tantivy builder publishes an immutable index
+  with real operation or repository-qualified Git identities. The service owns
+  content selection and the exact snapshot association, including direct builds
+  from cached workspaces. Per-chunk generations, synthetic Git operations and
+  their side map, and panic-based index defaults are removed. Validated chunk
+  options produce UTF-8 ranges directly. Search keeps public message/tool/command
+  content and Git labels, adds reflection summaries and known current/old paths,
+  and excludes raw JSON, private operations, file bodies, and auxiliary payloads
+  before hydration. Full Git content uses canonical source payloads rather than
+  display previews. An exact-term field makes full SHA-1/SHA-256 OIDs and known
+  paths searchable alongside the existing BM25 prose fields; colon-bearing code
+  identifiers retain Tantivy's quoted-query syntax.
+  Find now limits distinct visible rows. Bounded continuation resolves hidden
+  and repeated chunks and completes score ties for newest-row ordering, examining
+  up to 16,384 candidates. The unchanged `more` field distinguishes exhausted
+  results from additional visible matches or unexamined candidates. This bounds
+  candidate resolution, not Tantivy's internal ranking work. Regressions cover
+  identity domains, wide IDs, cached/direct publication, source payload selection,
+  hidden and long documents, paging/ties, full OIDs and real paths, UTF-8 ranges,
+  invalid limits, and snapshot mismatch. Search remains ephemeral, so existing
+  rendered row caches and persisted source bytes do not require a version change.
+
 Remaining work, in dependency order:
 
-1. Simplify search document identity and renderer request/cache state.
+1. Simplify renderer request/cache state and content adapters.
 2. Retire migrated compatibility machinery and optimize measured repeated work.
 
 Validation uses the existing crate, service, renderer, and extension suites.

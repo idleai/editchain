@@ -123,6 +123,13 @@ fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() 
         serde_json::to_value(expected_details).unwrap()
     );
 
+    // Direct callers must materialize the pinned source before publishing an
+    // index too; a cached workspace initially has no decoded source corpus.
+    let direct = editchain_vscode_service::build_lexical_index(&mut cached).unwrap();
+    let found = direct.find(&mut cached, "snapshot", 10).unwrap();
+    assert_eq!(found.matches.len(), 2);
+    assert!(!found.more);
+
     let mut materialized = editchain_vscode_service::Server::new();
     materialized.workspace =
         Some(Workspace::open(tmp.path().to_str().unwrap(), ".editchain").unwrap());
@@ -1090,13 +1097,22 @@ fn op_identifiers_above_2_53_round_trip_exactly_through_window_details_and_find(
     );
 
     // The lexical index retains the exact operation identity internally.
-    let state = editchain_vscode_service::build_lexical_index(&ws).unwrap();
-    let results = state.index.search_internal("needle-exact-id", 5).unwrap();
+    let state = editchain_vscode_service::build_lexical_index(&mut ws).unwrap();
+    let results = state
+        .index()
+        .candidates("needle-exact-id", 5)
+        .unwrap()
+        .next_page(5)
+        .unwrap()
+        .hits;
     let hit = results
         .iter()
-        .find(|r| r.op_id == big_op.id)
+        .find(|r| r.document == editchain_index::DocumentId::Operation(big_op.id))
         .expect("search hit for big op");
-    assert_eq!(hit.op_id.to_string(), "9007199254740993:0:42");
+    assert_eq!(
+        hit.document,
+        editchain_index::DocumentId::Operation(big_op.id)
+    );
 
     // The full protocol path (Server::handle over a real chain dir) must
     // return the same exact strings inside an Ok envelope.
@@ -1137,7 +1153,7 @@ fn find_in_history_protocol_path_resolves_visible_rows_and_reports_truncation() 
     // Two message ops in one chain: both contain the needle. The Find-in-Chain
     // request uses the fixed Activity view and must resolve both hits to real
     // visible top-level rows with absolute parent-row offsets — and never
-    // claim an exact total when the top_k candidate cap truncates.
+    // claim an exact total when the distinct visible row limit truncates.
     let tmp = tempfile::tempdir().expect("tempdir");
     let chain_dir = tmp.path().join(".editchain");
     let first = msg_op(41, 1, b"needle-fi chain row one");
@@ -1191,7 +1207,7 @@ fn find_in_history_protocol_path_resolves_visible_rows_and_reports_truncation() 
     assert_eq!(keys, vec![second.id.to_string(), first.id.to_string()]);
     assert!(value.get("returned").is_none());
 
-    // A top_k of 1 truncates the candidate list: the response must say `more`
+    // A top_k of 1 limits the visible rows: the response must say `more`
     // rather than claim an exact total.
     let truncated = server
         .handle(&Request {
@@ -1245,6 +1261,8 @@ fn find_in_history_distinguishes_colliding_operation_and_git_ids() {
     for (query, mut expected) in [
         ("collisionneedle", vec![message.id.to_string()]),
         ("commit", vec![git_key.clone()]),
+        ("\"file.txt\"", vec![git_key.clone()]),
+        (oid.as_str(), vec![git_key.clone()]),
         ("initial", vec![message.id.to_string(), git_key]),
     ] {
         let response = server

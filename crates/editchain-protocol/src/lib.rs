@@ -146,9 +146,8 @@ pub struct FindInHistoryRequest {
     pub snapshot_id: SnapshotId,
     /// The query string (BM25 lexical search only).
     pub query: String,
-    /// Number of candidate chunks to retrieve from the index before row
-    /// resolution and deduplication. When the candidate list hits this cap the
-    /// response reports `more: true` — it never claims an exact total.
+    /// Maximum distinct visible rows to return. Candidate continuation skips
+    /// hidden rows and repeated chunks within a bounded scan budget.
     pub top_k: usize,
 }
 
@@ -804,20 +803,19 @@ pub struct NodeDetails {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindInHistoryMatch {
     /// The stable real node key of the visible top-level row that renders this
-    /// hit (`"node:boot:seq"` for `EditChain` rows, lowercase OID hex for git).
+    /// hit (`"node:boot:seq"` for `EditChain`, `"git:<repository>:<oid>"` for Git).
     pub node_key: String,
     /// Absolute expanded-history parent-row offset (0 = newest) of the
     /// containing top-level row, compatible with `GetWindow` offsets and
-    /// `ViewSnapshot.starts`.
+    /// the opened Activity view.
     pub row: u64,
 }
 
 /// A Find-in-Chain response.
 ///
-/// `returned` is the exact number of distinct visible matches in `matches`;
-/// `more` reports whether additional matches **may** exist because the
-/// `candidate/top_k` limit truncated retrieval. When `more` is `true` the
-/// response never claims an exact total.
+/// `matches.len()` is the exact number of returned distinct visible rows.
+/// `more` means another visible match was found or unscanned candidates remain
+/// because the scan budget was reached; it never claims an exact total.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindInHistoryResponse {
     /// Snapshot whose fixed expanded coordinates are returned below.
@@ -825,7 +823,7 @@ pub struct FindInHistoryResponse {
     /// Distinct visible matches, one per top-level history row, ranked by best
     /// BM25 score (highest first; ties broken by newest row first).
     pub matches: Vec<FindInHistoryMatch>,
-    /// Whether more matches may exist due to `candidate/top_k` truncation.
+    /// Whether additional visible matches were found or may remain unscanned.
     pub more: bool,
 }
 
