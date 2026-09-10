@@ -22,6 +22,7 @@ tempfile = "3"
 tokio = { version = "1", default-features = false, features = ["io-util", "macros", "process", "rt", "time"] }
 process-wrap = { version = "10", default-features = false, features = ["tokio1", "process-group", "job-object", "kill-on-drop"] }
 editchain-core = { path = "../editchain-core" }
+editchain-codec = { path = "../editchain-codec" }
 
 [dev-dependencies]
 proptest = "1"

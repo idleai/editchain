@@ -63,38 +63,43 @@ pub fn run(
     };
     let (mut blobs, mut cursors) = storage_sinks(&chain_path, dry_run)?;
 
-    let mut batch = ImportBatch::capture(cursors.as_ref(), |ops, pending| match provider {
-        Provider::Claude => {
-            let sessions_path = if sessions_dir.is_empty() {
-                claude_auto_detect_sessions_dir()
-                    .map_err(|error| editchain_import::ImportError::OpSink(error.to_string()))?
-            } else {
-                PathBuf::from(&sessions_dir)
-            };
-            let request = DiscoveryRequest {
-                workspace_path: PathBuf::from(&workspace),
-                sessions_dir: sessions_path,
-                chain_dir: chain_path.clone(),
-            };
+    let mut batch =
+        ImportBatch::capture_bounded(cursors.as_ref(), options.batch_limits, |ops, pending| {
+            match provider {
+                Provider::Claude => {
+                    let sessions_path = if sessions_dir.is_empty() {
+                        claude_auto_detect_sessions_dir().map_err(|error| {
+                            editchain_import::ImportError::OpSink(error.to_string())
+                        })?
+                    } else {
+                        PathBuf::from(&sessions_dir)
+                    };
+                    let request = DiscoveryRequest {
+                        workspace_path: PathBuf::from(&workspace),
+                        sessions_dir: sessions_path,
+                        chain_dir: chain_path.clone(),
+                    };
 
-            import_claude_code(&request, options, ops, blobs.as_mut(), pending)
-        }
-        Provider::Codex => {
-            let raw_root = if sessions_dir.is_empty() {
-                codex_default_sessions_dir()
-                    .map_err(|error| editchain_import::ImportError::OpSink(error.to_string()))?
-            } else {
-                PathBuf::from(&sessions_dir)
-            };
-            let request = CodexDiscoveryRequest {
-                workspace_path: PathBuf::from(&workspace),
-                raw_root,
-            };
-            let helper = codex_helper_command(codex_helper, codex_helper_args);
+                    import_claude_code(&request, options, ops, blobs.as_mut(), pending)
+                }
+                Provider::Codex => {
+                    let raw_root = if sessions_dir.is_empty() {
+                        codex_default_sessions_dir().map_err(|error| {
+                            editchain_import::ImportError::OpSink(error.to_string())
+                        })?
+                    } else {
+                        PathBuf::from(&sessions_dir)
+                    };
+                    let request = CodexDiscoveryRequest {
+                        workspace_path: PathBuf::from(&workspace),
+                        raw_root,
+                    };
+                    let helper = codex_helper_command(codex_helper, codex_helper_args);
 
-            import_codex(&request, options, &helper, ops, blobs.as_mut(), pending)
-        }
-    })?;
+                    import_codex(&request, options, &helper, ops, blobs.as_mut(), pending)
+                }
+            }
+        })?;
 
     options.cancellation.check(Path::new(&sessions_dir))?;
 
@@ -113,8 +118,8 @@ pub fn run(
             }) => {
                 session_base_links = base_links.len();
                 produced_links = commit_links.len();
-                batch.extend_operations(base_links);
-                batch.extend_operations(commit_links);
+                batch = batch.extend_operations(base_links)?;
+                batch = batch.extend_operations(commit_links)?;
             }
             Err(error) => {
                 println!("Git-link reconciliation failed (session import will continue): {error}");
@@ -132,7 +137,13 @@ pub fn run(
             "  Written operation variants: {}",
             outcome.admission.written
         );
-        println!("  Exact duplicates: {}", outcome.admission.duplicates);
+        println!(
+            "  Exact duplicates: {}",
+            outcome
+                .admission
+                .duplicates
+                .saturating_add(outcome.report.duplicates)
+        );
         println!(
             "  New conflicting variants: {}",
             outcome.admission.conflicts

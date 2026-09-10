@@ -6,7 +6,7 @@ use editchain_core::Op;
 
 use crate::error::ImportError;
 use crate::model::ImportReport;
-use crate::sink::{CursorStore, CursorValue, MemoryOpSink, OpSink};
+use crate::sink::{BatchLimits, CursorStore, CursorValue, MemoryOpSink, OpSink};
 
 /// Admission outcomes confirmed by a durable operation writer.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +48,7 @@ pub struct DurableImport {
 #[derive(Debug)]
 pub struct ImportBatch {
     report: ImportReport,
-    ops: Vec<Op>,
+    ops: MemoryOpSink,
     checkpoints: CheckpointChanges,
 }
 
@@ -63,7 +63,22 @@ impl ImportBatch {
         cursors: &dyn CursorStore,
         run: impl FnOnce(&mut dyn OpSink, &mut dyn CursorStore) -> Result<ImportReport, ImportError>,
     ) -> Result<Self, ImportError> {
-        let mut ops = MemoryOpSink::new();
+        Self::capture_bounded(cursors, BatchLimits::default(), run)
+    }
+
+    /// Capture with explicit aggregate bounds, including reconciliation added
+    /// later through [`Self::extend_operations`]. Exact duplicates need no
+    /// additional capacity; conflicting variants consume their full budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns capture/admission errors without staging any base checkpoint.
+    pub fn capture_bounded(
+        cursors: &dyn CursorStore,
+        limits: BatchLimits,
+        run: impl FnOnce(&mut dyn OpSink, &mut dyn CursorStore) -> Result<ImportReport, ImportError>,
+    ) -> Result<Self, ImportError> {
+        let mut ops = MemoryOpSink::with_limits(limits);
         let mut pending = PendingCursors {
             base: cursors,
             changes: CheckpointChanges::default(),
@@ -71,7 +86,7 @@ impl ImportBatch {
         let report = run(&mut ops, &mut pending)?;
         Ok(Self {
             report,
-            ops: ops.ops,
+            ops,
             checkpoints: pending.changes,
         })
     }
@@ -85,12 +100,28 @@ impl ImportBatch {
     /// Captured source operations and derived evidence in emission order.
     #[must_use]
     pub fn operations(&self) -> &[Op] {
-        &self.ops
+        &self.ops.ops
     }
 
     /// Add exact reconciliation evidence to the same durable batch.
-    pub fn extend_operations(&mut self, operations: impl IntoIterator<Item = Op>) {
-        self.ops.extend(operations);
+    ///
+    /// # Errors
+    ///
+    /// Returns an admission or limit error, consuming the failed batch so a
+    /// partial reconciliation cannot advance its checkpoints.
+    pub fn extend_operations(
+        mut self,
+        operations: impl IntoIterator<Item = Op>,
+    ) -> Result<Self, ImportError> {
+        for op in operations {
+            crate::sink::emit_op(
+                &op,
+                &mut self.ops,
+                &mut self.report,
+                crate::sink::EmissionKind::Derived,
+            )?;
+        }
+        Ok(self)
     }
 
     /// Persist operations, then the source checkpoints covered by this batch.
@@ -109,12 +140,13 @@ impl ImportBatch {
         writer: &mut dyn DurableOpSink,
         cursors: &mut dyn CursorStore,
     ) -> Result<DurableImport, ImportError> {
+        let operations = self.ops.into_operations();
         // Reserve physical IDs before a possibly partial append. A later
         // source rewrite must not reuse an ID already written by this attempt.
         for (key, cursor) in &self.checkpoints.cursors {
             cursors.reserve_checkpoint(key, cursor)?;
         }
-        let admission = writer.append_durable(&self.ops)?;
+        let admission = writer.append_durable(&operations)?;
         self.checkpoints.stage(cursors)?;
         cursors.commit()?;
         Ok(DurableImport {

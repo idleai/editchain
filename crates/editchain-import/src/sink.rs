@@ -1,21 +1,54 @@
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use editchain_codec::frame::{encode_op, encoded_op_len};
 use editchain_core::payload;
-use editchain_core::{BlobRef, ContentId, NodeId, Op};
+use editchain_core::{Admission, BlobRef, ContentId, NodeId, NoteRelationship, Op, OpKind, OpSet};
 
 use crate::error::ImportError;
 use crate::ids::hash_raw;
 
-/// A sink for accepting encoded operations.
+/// A sink for retaining typed operation variants and reporting their admission.
 pub trait OpSink {
-    /// Accept a single encoded operation (postcard bytes).
+    /// Retain a typed operation; admission is relative to this sink's evidence.
+    /// This acknowledgment does not imply durability.
     ///
     /// # Errors
     ///
     /// Returns [`ImportError`] if the operation cannot be stored.
-    fn accept_op(&mut self, op: &Op) -> Result<bool, ImportError>;
+    fn accept_op(&mut self, op: &Op) -> Result<Admission, ImportError>;
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum EmissionKind {
+    Raw,
+    Derived,
+}
+
+pub(crate) fn emit_op(
+    op: &Op,
+    sink: &mut dyn OpSink,
+    report: &mut crate::model::ImportReport,
+    kind: EmissionKind,
+) -> Result<(), ImportError> {
+    match sink.accept_op(op)? {
+        Admission::Duplicate => {
+            report.duplicates = report.duplicates.saturating_add(1);
+            return Ok(());
+        }
+        Admission::Conflict => report.op_conflicts = report.op_conflicts.saturating_add(1),
+        Admission::Accepted => {}
+    }
+    if matches!(kind, EmissionKind::Raw) {
+        report.raw_ops = report.raw_ops.saturating_add(1);
+    } else if matches!(&op.kind, OpKind::Note(note) if note.relationship == NoteRelationship::ProviderEvidence)
+    {
+        report.evidence_ops = report.evidence_ops.saturating_add(1);
+    } else {
+        report.normalized_ops = report.normalized_ops.saturating_add(1);
+    }
+    Ok(())
 }
 
 /// A sink for accepting large blob payloads.
@@ -32,19 +65,16 @@ pub trait BlobSink {
     /// # Errors
     ///
     /// Returns [`ImportError`] if the blob cannot be stored.
-    #[expect(
-        clippy::as_conversions,
-        clippy::cast_possible_truncation,
-        reason = "data.len() fits in u32 for practical blob sizes"
-    )]
     fn put(&mut self, data: &[u8]) -> Result<BlobRef, ImportError> {
+        let len = u32::try_from(data.len()).map_err(|error| {
+            ImportError::BlobSink(format!(
+                "blob length exceeds the 32-bit reference format: {error}"
+            ))
+        })?;
         let hash = hash_raw(data);
         let id = ContentId::Hash256(hash);
         self.store_blob(data)?;
-        Ok(BlobRef {
-            id,
-            len: data.len() as u32,
-        })
+        Ok(BlobRef { id, len })
     }
 }
 
@@ -196,25 +226,89 @@ pub struct CursorValue {
     pub session_title_hash: Option<[u8; 32]>,
 }
 
-/// A memory-backed op sink for testing.
+/// Bounds on distinct operations retained by one capture sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchLimits {
+    /// Maximum distinct operation variants, including conflicting variants.
+    pub operations: usize,
+    /// Maximum combined Postcard bytes of the retained variants.
+    pub encoded_bytes: u64,
+}
+
+impl Default for BatchLimits {
+    fn default() -> Self {
+        Self {
+            operations: 1_000_000,
+            encoded_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+/// A bounded memory sink retaining every distinct variant, including conflicts.
+/// Canonical evidence remains immutable even if the public inspection vector
+/// is consumed or changed by a compatibility caller.
 #[derive(Debug, Default)]
 pub struct MemoryOpSink {
-    /// Stored operations.
+    /// Distinct retained operations in emission order.
     pub ops: Vec<Op>,
+    evidence: OpSet,
+    retained_variants: usize,
+    encoded_bytes: u64,
+    limits: BatchLimits,
 }
 
 impl MemoryOpSink {
     /// Create a new empty memory op sink.
     #[must_use]
     pub fn new() -> Self {
-        Self { ops: Vec::new() }
+        Self::default()
+    }
+
+    /// Construct a capture sink with explicit aggregate resource limits.
+    #[must_use]
+    pub fn with_limits(limits: BatchLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
+    /// Consume the capture and release its encoded admission index.
+    #[must_use]
+    pub fn into_operations(self) -> Vec<Op> {
+        self.ops
     }
 }
 
 impl OpSink for MemoryOpSink {
-    fn accept_op(&mut self, op: &Op) -> Result<bool, ImportError> {
+    fn accept_op(&mut self, op: &Op) -> Result<Admission, ImportError> {
+        let length = encoded_op_len(op).map_err(|error| ImportError::OpSink(error.to_string()))?;
+        let bytes = u64::try_from(length).map_err(io::Error::other)?;
+        if bytes > u64::from(editchain_codec::scan::MAX_RECORD_BYTES) {
+            return Err(ImportError::OpSink(
+                "encoded operation exceeds the 64 MiB record limit".into(),
+            ));
+        }
+        let encoded = encode_op(op).map_err(|error| ImportError::OpSink(error.to_string()))?;
+        let admission = self.evidence.classify(op.id, &encoded);
+        if admission == Admission::Duplicate {
+            return Ok(admission);
+        }
+        let total = self
+            .encoded_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| ImportError::OpSink("capture byte count exhausted".into()))?;
+        if self.retained_variants >= self.limits.operations || total > self.limits.encoded_bytes {
+            return Err(ImportError::OpSink(format!(
+                "capture exceeds batch limit ({} operation variants, {} encoded bytes)",
+                self.limits.operations, self.limits.encoded_bytes
+            )));
+        }
+        let retained = self.evidence.insert(op.id, encoded);
         self.ops.push(op.clone());
-        Ok(true)
+        self.retained_variants = self.retained_variants.saturating_add(1);
+        self.encoded_bytes = total;
+        Ok(retained)
     }
 }
 
@@ -440,13 +534,44 @@ impl BlobSink for FsBlobSink {
     fn store_blob(&mut self, data: &[u8]) -> Result<(), ImportError> {
         let hash = hash_raw(data);
         let path = self.path_for(&hash);
-        if path.exists() {
-            // Content-addressed dedup: identical bytes are stored once.
-            return Ok(());
+        match fs::File::open(&path) {
+            Ok(mut file) => {
+                if !same_blob_bytes(&mut file, data)? {
+                    return Err(ImportError::BlobSink(format!(
+                        "existing blob {} does not match its content address",
+                        path.display()
+                    )));
+                }
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ImportError::BlobSink(format!(
+                    "opening blob {}: {error}",
+                    path.display()
+                )))
+            }
         }
         atomic_write(&path, data)
             .map_err(|e| ImportError::BlobSink(format!("storing blob {}: {e}", path.display())))
     }
+}
+
+fn same_blob_bytes(file: &mut fs::File, expected: &[u8]) -> io::Result<bool> {
+    if file.metadata()?.len() != u64::try_from(expected.len()).map_err(io::Error::other)? {
+        return Ok(false);
+    }
+    let mut buffer = [0; 8192];
+    for chunk in expected.chunks(buffer.len()) {
+        let target = buffer
+            .get_mut(..chunk.len())
+            .ok_or_else(|| io::Error::other("blob comparison range"))?;
+        file.read_exact(target)?;
+        if target != chunk {
+            return Ok(false);
+        }
+    }
+    Ok(file.read(&mut buffer)? == 0)
 }
 
 /// A filesystem-backed cursor store persisting one JSON file per source key.
@@ -821,6 +946,108 @@ fn sync_parent_dir(_path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use tempfile as _;
+
+    fn captured_record(bytes: &[u8]) -> Op {
+        Op {
+            id: editchain_core::OpId::new(NodeId(1), 0, 1),
+            parents: editchain_core::ParentSet::None,
+            actor: editchain_core::ActorId(0),
+            clock: editchain_core::Clock::None,
+            scope: editchain_core::ScopeRef::None,
+            tags: editchain_core::Tags::IMPORT,
+            kind: OpKind::Import(editchain_core::ImportOp {
+                raw_ref: payload::Payload::Inline(bytes.to_vec()),
+                raw_hash: Some(hash_raw(bytes)),
+            }),
+        }
+    }
+
+    #[test]
+    fn bounded_capture_reports_duplicates_and_retains_conflicts_without_extra_capacity() {
+        let first = captured_record(b"first");
+        let second = captured_record(b"second");
+        let bytes =
+            u64::try_from(encode_op(&first).unwrap().len() + encode_op(&second).unwrap().len())
+                .unwrap();
+        let mut sink = MemoryOpSink::with_limits(BatchLimits {
+            operations: 2,
+            encoded_bytes: bytes,
+        });
+        let mut report = crate::model::ImportReport::default();
+        emit_op(&first, &mut sink, &mut report, EmissionKind::Raw).unwrap();
+        emit_op(&first, &mut sink, &mut report, EmissionKind::Raw).unwrap();
+        emit_op(&second, &mut sink, &mut report, EmissionKind::Raw).unwrap();
+        emit_op(&first, &mut sink, &mut report, EmissionKind::Raw).unwrap();
+        assert_eq!(report.raw_ops, 2);
+        assert_eq!(report.duplicates, 2);
+        assert_eq!(report.op_conflicts, 1);
+        assert_eq!(sink.ops, [first, second.clone()]);
+        assert!(
+            !sink.evidence.contains(&second.id),
+            "both conflicting variants remain inert"
+        );
+        let mut extra = second.clone();
+        extra.id.seq = 2;
+        assert!(emit_op(&extra, &mut sink, &mut report, EmissionKind::Raw).is_err());
+        assert_eq!(report.raw_ops, 2, "failed admission does not change counts");
+        assert_eq!(
+            sink.accept_op(&second).unwrap(),
+            Admission::Duplicate,
+            "exact replay still works at the bound"
+        );
+        assert_eq!(
+            sink.evidence
+                .classify(extra.id, &encode_op(&extra).unwrap()),
+            Admission::Accepted,
+            "a limit failure cannot poison later admission"
+        );
+    }
+
+    #[test]
+    fn encoded_byte_limit_rejects_before_retaining_or_quarantining_an_id() {
+        let larger = captured_record(b"payload that cannot fit");
+        let smaller = captured_record(b"x");
+        let encoded = encode_op(&larger).unwrap();
+        assert_eq!(encoded_op_len(&larger).unwrap(), encoded.len());
+        let mut sink = MemoryOpSink::with_limits(BatchLimits {
+            operations: 10,
+            encoded_bytes: u64::try_from(encoded.len() - 1).unwrap(),
+        });
+        assert!(sink.accept_op(&larger).is_err());
+        assert!(sink.ops.is_empty());
+        assert!(sink.evidence.is_empty());
+        assert_eq!(sink.accept_op(&smaller).unwrap(), Admission::Accepted);
+    }
+
+    #[test]
+    fn existing_blob_bytes_must_match_before_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = FsBlobSink::new(dir.path()).unwrap();
+        let data = vec![b'a'; 8193];
+        let reference = sink.put(&data).unwrap();
+        assert_eq!(reference.len, 8193);
+        assert_eq!(reference.id, ContentId::Hash256(hash_raw(&data)));
+        assert_eq!(sink.put(&data).unwrap(), reference);
+        let path = sink.path_for(&hash_raw(&data));
+        let mut same_length = data.clone();
+        *same_length.last_mut().unwrap() = b'b';
+        let mut truncated = data.clone();
+        let _: Option<u8> = truncated.pop();
+        let mut extended = data.clone();
+        extended.push(b'b');
+        for invalid in [same_length, truncated, extended] {
+            fs::write(&path, &invalid).unwrap();
+            assert!(matches!(sink.put(&data), Err(ImportError::BlobSink(_))));
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                invalid,
+                "verification preserves the inconsistent evidence"
+            );
+        }
+        fs::remove_file(&path).unwrap();
+        assert_eq!(sink.put(&data).unwrap(), reference);
+        assert_eq!(fs::read(&path).unwrap(), data);
+    }
 
     #[test]
     fn legacy_cursor_json_defaults_normalization_version_to_zero() {

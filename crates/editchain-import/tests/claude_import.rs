@@ -10,6 +10,7 @@ use std::path::Path;
 use time as _;
 
 use blake3 as _;
+use editchain_codec as _;
 use editchain_core::{NoteRelationship, OpKind, ParentSet};
 use editchain_import::claude_code::reader::read_session_file;
 use editchain_import::claude_code::topology::CLAUDE_NORMALIZATION_VERSION;

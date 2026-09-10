@@ -14,6 +14,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use blake3 as _;
+use editchain_codec::frame::encode_op;
 use editchain_project as _;
 use process_wrap as _;
 use proptest as _;
@@ -606,6 +607,100 @@ fn batch_discards_failed_capture_and_checkpoints_only_after_durable_acceptance()
     assert_eq!(outcome.admission.written, 0);
     assert_eq!(base.get_cursor("source").unwrap(), Some(cursor));
     assert_eq!(base.get_generation("source").unwrap(), 3);
+}
+
+#[test]
+fn batch_limit_failure_discards_completed_files_and_retry_preserves_bytes() {
+    use editchain_import::batch::ImportBatch;
+    use editchain_import::sink::BatchLimits;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sessions");
+    std::fs::create_dir(&root).unwrap();
+    for name in ["rollout-1.jsonl", "rollout-2.jsonl"] {
+        write_rollout(
+            &root,
+            name,
+            &[
+                session_meta_line("thread", "session"),
+                big_event_line('a', 1),
+            ],
+        );
+    }
+    let first_key = source_key(&root, &root.join("rollout-1.jsonl"));
+    let second_key = source_key(&root, &root.join("rollout-2.jsonl"));
+    let base = FsCursorStore::new(dir.path().join("cursors")).unwrap();
+    let mut blobs = FsBlobSink::new(dir.path().join("blobs")).unwrap();
+    let helper = helper_in(&dir, &messages_awk("thread"));
+    let request = CodexDiscoveryRequest {
+        workspace_path: "/workspace".into(),
+        raw_root: root,
+    };
+    let mut capture = |limits| {
+        ImportBatch::capture_bounded(&base, limits, |ops, pending| {
+            let result = import_codex(
+                &request,
+                &ImportOptions::default(),
+                &helper,
+                ops,
+                &mut blobs,
+                pending,
+            );
+            assert!(
+                pending.get_cursor(&first_key).unwrap().is_some(),
+                "the first file completed inside the private capture"
+            );
+            result
+        })
+    };
+    let expected = capture(BatchLimits::default()).unwrap();
+    assert_eq!(expected.operations().len(), 12);
+    let bytes = expected
+        .operations()
+        .iter()
+        .map(|op| encode_op(op).unwrap())
+        .collect::<Vec<_>>();
+    let encoded_bytes = u64::try_from(bytes.iter().map(Vec::len).sum::<usize>()).unwrap();
+    for limits in [
+        BatchLimits {
+            operations: 7,
+            ..BatchLimits::default()
+        },
+        BatchLimits {
+            encoded_bytes: encoded_bytes.saturating_sub(1),
+            ..BatchLimits::default()
+        },
+    ] {
+        assert!(capture(limits).is_err());
+        for key in [&first_key, &second_key] {
+            assert!(base.get_cursor(key).unwrap().is_none());
+            assert!(base.get_reservation(key).unwrap().is_none());
+            assert_eq!(base.get_generation(key).unwrap(), 0);
+        }
+        assert!(!base.has_pending());
+    }
+    let retry = capture(BatchLimits {
+        operations: 12,
+        encoded_bytes,
+    })
+    .unwrap();
+    assert_eq!(
+        retry
+            .operations()
+            .iter()
+            .map(|op| encode_op(op).unwrap())
+            .collect::<Vec<_>>(),
+        bytes
+    );
+    let extra = retry.operations()[0].clone();
+    let retry = retry.extend_operations([extra.clone()]).unwrap();
+    assert_eq!(retry.operations().len(), 12);
+    assert_eq!(retry.report().duplicates, 1);
+    let mut extra = extra;
+    extra.id.seq = u64::MAX;
+    assert!(retry.extend_operations([extra]).is_err());
+    assert!(!base.has_pending());
+    assert!(base.get_cursor(&first_key).unwrap().is_none());
 }
 
 #[test]

@@ -17,6 +17,15 @@ pub fn encode_op(op: &Op) -> Result<Vec<u8>, postcard::Error> {
     postcard::to_stdvec(op)
 }
 
+/// Compute the exact encoded length without allocating the output buffer.
+///
+/// # Errors
+///
+/// Returns the same serialization errors as [`encode_op`].
+pub fn encoded_op_len(op: &Op) -> Result<usize, postcard::Error> {
+    postcard::experimental::serialized_size(op)
+}
+
 /// Decode an operation from a binary frame.
 ///
 /// # Errors

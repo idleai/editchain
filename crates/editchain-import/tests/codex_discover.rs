@@ -1,6 +1,7 @@
 //! Codex rollout discovery tests.
 
 use blake3 as _;
+use editchain_codec as _;
 use editchain_core as _;
 use editchain_project as _;
 use process_wrap as _;

@@ -7,7 +7,7 @@ use crate::cursor::resolve_source_cursor;
 use crate::error::ImportError;
 use crate::ids::{derive_session_id, SourcePosition, SourceStream};
 use crate::model::{ImportOptions, ImportReport};
-use crate::sink::{BlobSink, CursorStore, OpSink};
+use crate::sink::{emit_op, BlobSink, CursorStore, EmissionKind, OpSink};
 use crate::source_read::{SourceReadPlan, SourceReadState};
 
 use super::discover::discover_rollouts;
@@ -356,8 +356,7 @@ pub fn import_codex(
                 prev_raw_id,
                 blobs,
             )?;
-            let _: bool = ops.accept_op(&op)?;
-            report.raw_ops += 1;
+            emit_op(&op, ops, &mut report, EmissionKind::Raw)?;
             prev_raw_id = Some(op.id);
         }
 
@@ -380,8 +379,7 @@ pub fn import_codex(
             ) {
                 let title_op =
                     session_title_op(title, &owning_thread, session_id, first_raw, blobs)?;
-                let accepted = ops.accept_op(&title_op)?;
-                report.normalized_ops = report.normalized_ops.saturating_add(usize::from(accepted));
+                emit_op(&title_op, ops, &mut report, EmissionKind::Derived)?;
             }
         }
 
@@ -406,8 +404,7 @@ pub fn import_codex(
                         &stream,
                         session_id,
                     )? {
-                        let _: bool = ops.accept_op(&op)?;
-                        report.normalized_ops += 1;
+                        emit_op(&op, ops, &mut report, EmissionKind::Derived)?;
                     }
                 }
             }
@@ -423,15 +420,14 @@ pub fn import_codex(
                 include_thinking: options.include_thinking,
                 blobs,
             };
-            let (normalized, evidence) = super::materialize::emit_occurrences(
+            let derived = super::materialize::emit_occurrences(
                 &projection,
                 &plan,
                 &mut context,
                 ops,
                 needs_materialization_replay,
             )?;
-            report.normalized_ops = report.normalized_ops.saturating_add(normalized);
-            report.evidence_ops = report.evidence_ops.saturating_add(evidence);
+            report.merge_emissions(&derived);
             new_cursor.materialization = Some(crate::sink::MaterializationCheckpoint {
                 contract: super::materialize::CONTRACT.to_owned(),
                 through: new_cursor.ops_emitted,
@@ -451,8 +447,7 @@ pub fn import_codex(
                 full_read || needs_evidence_upgrade,
             )? {
                 options.cancellation.check(&rollout.path)?;
-                let _: bool = ops.accept_op(&evidence)?;
-                report.evidence_ops = report.evidence_ops.saturating_add(1);
+                emit_op(&evidence, ops, &mut report, EmissionKind::Derived)?;
             }
             new_cursor.normalization_version = new_cursor
                 .normalization_version
@@ -477,8 +472,7 @@ pub fn import_codex(
     // endpoints remain unlinked; no timestamp/file-order fallback is allowed.
     let relationship_notes = emit_codex_relationship_notes(&topology)?;
     for note in &relationship_notes {
-        let _: bool = ops.accept_op(note)?;
-        report.normalized_ops += 1;
+        emit_op(note, ops, &mut report, EmissionKind::Derived)?;
     }
 
     Ok(report)

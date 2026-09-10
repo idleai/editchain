@@ -16,7 +16,7 @@ use super::normalize::{
 };
 use super::projection::{CompactedLine, FinalItem, InterAgentLine, Projection, TurnMeta};
 use crate::ids::{derive_node_id, SourcePosition, SourceStream};
-use crate::sink::{MaterializationCheckpoint, OpSink};
+use crate::sink::{emit_op, EmissionKind, MaterializationCheckpoint, OpSink};
 use crate::source_read::SourceReadPlan;
 use crate::ImportError;
 
@@ -95,15 +95,14 @@ pub(super) fn emit_occurrences(
     context: &mut NormalizeContext<'_>,
     sink: &mut dyn OpSink,
     replay: bool,
-) -> Result<(usize, usize), ImportError> {
+) -> Result<crate::model::ImportReport, ImportError> {
     let historical = (replay && plan.start_seq() > 0)
         .then(|| plan.all_lines())
         .transpose()?;
     let lines = historical.as_deref().unwrap_or_else(|| plan.lines());
     let start = if replay { 0 } else { plan.start_seq() };
     let mut records = RecordProjection::index(projection);
-    let mut normalized = 0usize;
-    let mut evidence = 0usize;
+    let mut report = crate::model::ImportReport::default();
     for (index, line) in lines.iter().enumerate() {
         plan.check_cancellation()?;
         let ordinal = start
@@ -133,13 +132,11 @@ pub(super) fn emit_occurrences(
         )?;
         for op in &output.ops {
             plan.check_cancellation()?;
-            let _: bool = sink.accept_op(op)?;
-            normalized = normalized.saturating_add(1);
+            emit_op(op, sink, &mut report, EmissionKind::Derived)?;
         }
-        let _: bool = sink.accept_op(&proof)?;
-        evidence = evidence.saturating_add(1);
+        emit_op(&proof, sink, &mut report, EmissionKind::Derived)?;
     }
-    Ok((normalized, evidence))
+    Ok(report)
 }
 
 fn materialize_record(

@@ -13,7 +13,7 @@ use crate::cursor::resolve_source_cursor;
 use crate::error::ImportError;
 use crate::ids::{derive_session_id, SourcePosition, SourceStream};
 use crate::model::{DiscoveryRequest, ImportOptions, ImportReport};
-use crate::sink::{BlobSink, CursorStore, OpSink};
+use crate::sink::{emit_op, BlobSink, CursorStore, EmissionKind, OpSink};
 use crate::source_read::{SourceReadPlan, SourceReadState};
 
 /// Version that first emitted the complete provider topology. Version-2
@@ -35,10 +35,6 @@ const CLAUDE_PROVIDER_TOPOLOGY_VERSION: u32 = 2;
 #[expect(
     clippy::as_conversions,
     reason = "usize to u64 is safe on all supported platforms"
-)]
-#[expect(
-    clippy::let_underscore_untyped,
-    reason = "Result return values are intentionally discarded for side effects"
 )]
 pub fn import_claude_code(
     request: &DiscoveryRequest,
@@ -161,14 +157,12 @@ pub fn import_claude_code(
                 }
 
                 // Emit raw import op.
-                let _: bool = ops.accept_op(&raw_op)?;
-                report.raw_ops += 1;
+                emit_op(&raw_op, ops, &mut report, EmissionKind::Raw)?;
                 prev_raw_id = Some(raw_op.id);
 
                 // Emit normalized ops.
                 for norm_op in &normalized_ops {
-                    let _ = ops.accept_op(norm_op)?;
-                    report.normalized_ops += 1;
+                    emit_op(norm_op, ops, &mut report, EmissionKind::Derived)?;
                 }
 
                 // Current-version incremental/fresh import: emit exact provider
@@ -185,8 +179,7 @@ pub fn import_claude_code(
                         seq,
                         &session.session_id,
                     )? {
-                        let _: bool = ops.accept_op(&fact)?;
-                        report.normalized_ops += 1;
+                        emit_op(&fact, ops, &mut report, EmissionKind::Derived)?;
                     }
                 }
             } else {
@@ -208,8 +201,7 @@ pub fn import_claude_code(
                 if let Some(prev) = prev_raw_id {
                     raw_op.parents = editchain_core::parents::ParentSet::One(prev);
                 }
-                let _: bool = ops.accept_op(&raw_op)?;
-                report.raw_ops += 1;
+                emit_op(&raw_op, ops, &mut report, EmissionKind::Raw)?;
                 report.malformed += 1;
                 prev_raw_id = Some(op_id);
             }
@@ -242,8 +234,7 @@ pub fn import_claude_code(
                             seq,
                             &session.session_id,
                         )? {
-                            let _: bool = ops.accept_op(&fact)?;
-                            report.normalized_ops += 1;
+                            emit_op(&fact, ops, &mut report, EmissionKind::Derived)?;
                         }
                     } else {
                         for fact in relation_facts_for_envelope(
@@ -253,8 +244,7 @@ pub fn import_claude_code(
                             seq,
                             &session.session_id,
                         )? {
-                            let _: bool = ops.accept_op(&fact)?;
-                            report.normalized_ops += 1;
+                            emit_op(&fact, ops, &mut report, EmissionKind::Derived)?;
                         }
                     }
                 }
@@ -278,8 +268,7 @@ pub fn import_claude_code(
                         editchain_core::ScopeRef::Session(derive_session_id(parent_session_id)),
                         tool_use_id,
                     )?;
-                    let _: bool = ops.accept_op(&fact)?;
-                    report.normalized_ops += 1;
+                    emit_op(&fact, ops, &mut report, EmissionKind::Derived)?;
                 }
             }
 

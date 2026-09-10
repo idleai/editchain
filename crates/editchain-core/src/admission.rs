@@ -39,6 +39,17 @@ impl OpSet {
         }
     }
 
+    /// Inspect admission without retaining bytes or changing existing evidence.
+    /// Callers can check resource bounds before committing the insertion.
+    #[must_use]
+    pub fn classify(&self, id: OpId, encoded: &[u8]) -> Admission {
+        match self.evidence.get(&id) {
+            None => Admission::Accepted,
+            Some(variants) if variants.contains(encoded) => Admission::Duplicate,
+            Some(_) => Admission::Conflict,
+        }
+    }
+
     /// Retain one distinct record and update its ID's admission status.
     pub fn insert(&mut self, id: OpId, encoded: Vec<u8>) -> Admission {
         let variants = self.evidence.entry(id).or_default();

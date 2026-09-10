@@ -612,6 +612,7 @@ name = "editchain-import"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "editchain-codec",
  "editchain-core",
  "editchain-project",
  "process-wrap",

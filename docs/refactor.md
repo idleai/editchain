@@ -158,10 +158,22 @@ Completed increments:
   one-shot and multiple append boundaries, input order, logical removal and
   reuse, incomplete evidence, legacy migration, and option changes.
 
+- Capture admission: typed sinks distinguish accepted, duplicate, and conflicting
+  operation variants using core's canonical byte contract. Batches bound retained
+  variants and their combined encoded size, including later reconciliation;
+  exact duplicates remain admissible at capacity. Defaults are one million
+  variants and 256 MiB of encoded evidence. The codec measures individual records
+  before allocating their output, enforcing its 64 MiB limit. Failed capture or
+  extension discards private checkpoints. Reports count retained variants and
+  actual duplicate/conflict outcomes. Blob references check their 32-bit lengths
+  before storage, and filesystem blob reuse verifies all existing bytes.
+  Regressions cover two-file limit failure, exact retry, duplicate admission at
+  capacity, conflict retention, and truncated or corrupted existing blobs.
+
 Remaining work, in dependency order:
 
-1. Finish shared capture/payload replay policy, Claude materialization, and
-   bounded admission; preserve compatibility with existing normalized records.
+1. Finish shared capture/payload replay policy and Claude materialization;
+   preserve compatibility with existing normalized records.
 2. Simplify search document identity and renderer request/cache state.
 3. Retire migrated compatibility machinery and optimize measured repeated work.
 
