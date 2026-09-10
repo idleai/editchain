@@ -71,6 +71,28 @@ impl From<HistoryRow> for RowInput {
 }
 
 impl RowInput {
+    /// Charge the encoded DTO and copied presentation text once at ingestion.
+    /// This measures retained evidence, not allocator overhead or process RSS.
+    pub(super) fn cache_bytes(&self) -> Result<u64, serde_json::Error> {
+        let mut encoded = EncodedLength::default();
+        serde_json::to_writer(&mut encoded, &self.source)?;
+        let presentation = [
+            self.record_role.as_str(),
+            &self.activity_kind,
+            &self.outcome,
+            &self.display_summary,
+            self.tool_label.as_deref().unwrap_or_default(),
+            self.work_unit.as_ref().map_or("", |unit| unit.id.as_str()),
+            self.work_unit
+                .as_ref()
+                .and_then(|unit| unit.title.as_deref())
+                .unwrap_or_default(),
+        ];
+        Ok(presentation.into_iter().fold(encoded.0, |bytes, text| {
+            bytes.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX))
+        }))
+    }
+
     pub(crate) fn summary_source(&self) -> &str {
         if self.source.content.is_some() {
             return &self.display_summary;
@@ -144,6 +166,22 @@ impl RowInput {
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn wire_json(&self) -> String {
         serde_json::to_string(&self.source).unwrap_or_else(|_| "null".to_owned())
+    }
+}
+
+#[derive(Default)]
+struct EncodedLength(u64);
+
+impl std::io::Write for EncodedLength {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

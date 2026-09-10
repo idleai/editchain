@@ -344,14 +344,33 @@ impl HistoryAppState {
 
     /// Fetch missing visible rows around the viewport.
     pub(crate) fn fetch_window(&mut self, viewport: &Viewport, step: &mut Step) {
-        let (top, bottom) = self.desired_cache_range(viewport);
+        let (top, bottom) = if self.cache.byte_limited() {
+            let (top, bottom) = self.viewport_range(viewport);
+            (
+                self.abs_index_for_visible(top).unwrap_or(0),
+                self.abs_index_for_visible(bottom).unwrap_or(0),
+            )
+        } else {
+            self.desired_cache_range(viewport)
+        };
         self.fetch_range(top, bottom, step);
+    }
+
+    /// The portion of the actual viewport within the bounded render window.
+    fn viewport_range(&self, viewport: &Viewport) -> (i64, i64) {
+        let (_, render_bottom) = self.desired_visible_range(viewport);
+        let bottom = self.viewport_visible_bottom(viewport).min(render_bottom);
+        (Self::viewport_visible_top(viewport).min(bottom), bottom)
     }
 
     /// Fetch a sparse window around an absolute find destination.
     pub(crate) fn fetch_window_around(&mut self, abs_row: ExpandedRow, step: &mut Step) {
         let total = self.total.unwrap_or(0);
         if total <= 0 {
+            return;
+        }
+        if self.cache.byte_limited() {
+            self.fetch_range(abs_row.get(), abs_row.get(), step);
             return;
         }
         let top = abs_row.get().saturating_sub(BUFFER).max(0);
@@ -407,21 +426,23 @@ impl HistoryAppState {
     }
 
     /// Drop every far row, then prefer visible rows nearest the viewport up to
-    /// the retained-row budget. Hidden rows can be fetched again on disclosure.
-    pub(crate) fn evict_far_windows(&mut self, viewport: &Viewport) {
+    /// both retention budgets. False means the viewport itself does not fit.
+    /// Hidden rows can be fetched again on disclosure.
+    pub(crate) fn evict_far_windows(&mut self, viewport: &Viewport) -> bool {
         let (top, bottom) = self.desired_cache_range(viewport);
+        let (viewport_top, viewport_bottom) = self.viewport_range(viewport);
         let center = Self::viewport_visible_top(viewport)
             .saturating_add(self.viewport_visible_bottom(viewport))
             / 2;
         let center_abs = self.abs_index_for_visible(center).unwrap_or(0);
         let expansion = &self.expansion;
         let Some(keep_top) = ExpandedRow::new(top.saturating_sub(BUFFER).max(0)) else {
-            return;
+            return true;
         };
         let Some(keep_bottom) =
             ExpandedRow::new(bottom.saturating_add(BUFFER).min(MAX_RENDER_ROWS))
         else {
-            return;
+            return true;
         };
         self.cache.retain(keep_top, keep_bottom, |row| {
             let visible = expansion.as_ref().map_or_else(
@@ -429,13 +450,16 @@ impl HistoryAppState {
                 |index| index.visible_for(row).map(VisibleRow::get),
             );
             match visible {
+                Some(visible) if visible >= viewport_top && visible <= viewport_bottom => {
+                    RetentionPriority::Viewport(visible.abs_diff(center))
+                }
                 Some(visible) if row.get() >= top && row.get() <= bottom => {
                     RetentionPriority::Requested(visible.abs_diff(center))
                 }
                 Some(visible) => RetentionPriority::Visible(visible.abs_diff(center)),
                 None => RetentionPriority::Hidden(row.get().abs_diff(center_abs)),
             }
-        });
+        })
     }
 
     /// `syncWindow` — extend/trim the rendered window to the desired visible
@@ -1430,6 +1454,13 @@ impl HistoryAppState {
                 return;
             }
         };
+        let rows = match PageCache::prepare(window.rows) {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.fail_response(&RequestBody::GetWindow(request.clone()), &error, step);
+                return;
+            }
+        };
         let response_layout_ready = window.layout_ready;
         if response_layout_ready {
             self.phase = SnapshotPhase::LayoutReady;
@@ -1464,7 +1495,7 @@ impl HistoryAppState {
             }
         }
         let base = i64::try_from(request.offset).unwrap_or(i64::MAX);
-        for (index, row) in window.rows.into_iter().enumerate() {
+        for (index, row) in rows.into_iter().enumerate() {
             let Some(abs) =
                 ExpandedRow::new(base.saturating_add(i64::try_from(index).unwrap_or(0)))
             else {
@@ -1473,9 +1504,7 @@ impl HistoryAppState {
             if !self.cache.contains_key(abs) {
                 self.total_fetched = self.total_fetched.saturating_add(1);
             }
-            // Resolve compatibility presentation once; retain the decoded DTO
-            // for subsequent rendering and exact source actions.
-            drop(self.cache.insert(abs, row.into()));
+            drop(self.cache.insert(abs, row));
         }
         // Complete a pending find jump before eviction changes the viewport.
         let mut effective_viewport = *viewport;
@@ -1495,7 +1524,19 @@ impl HistoryAppState {
                 bottom: self.render_bottom,
             });
         }
-        self.evict_far_windows(&effective_viewport);
+        if !self.evict_far_windows(&effective_viewport) {
+            // Retire hydration/find work already queued during this transition;
+            // a later response must not revive this terminal failure.
+            self.requests.clear();
+            step.sends
+                .retain(|send| !matches!(send, Send::Request { .. }));
+            self.show_request_error(
+                step,
+                "Visible history rows exceed the retained content budget.",
+                RetryAction::ResetHistory,
+            );
+            return;
+        }
         self.sync_window(&effective_viewport, step);
         if self.phase == SnapshotPhase::Opening {
             self.phase = SnapshotPhase::RowsReady;
@@ -1512,10 +1553,11 @@ impl HistoryAppState {
             Self::show_view_message(step, "No history rows", false);
         }
         step.sends.push(Send::Log(format!(
-            "cached {}/{} nodes (fetched {})",
+            "cached {}/{} nodes (fetched {}); {} content bytes",
             self.cache.len(),
             total,
-            self.total_fetched
+            self.total_fetched,
+            self.cache.retained_bytes()
         )));
         self.report_status(viewport, step);
         step.save_state = Some(Self::persisted_state(viewport));
@@ -1533,6 +1575,7 @@ impl HistoryAppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::cache::MAX_CACHED_BYTES;
     use editchain_protocol::ExpansionSpanDto;
     use serde_json::json;
 
@@ -1669,9 +1712,13 @@ mod tests {
         drop(oversized.as_object_mut().unwrap().insert("content".to_owned(), json!({
             "tool_label": { "text": "x".repeat(editchain_protocol::MAX_TOOL_LABEL_BYTES + 1), "complete": true }
         })));
+        let mut oversized_row = row(1, "node:1", 0);
+        *oversized_row.get_mut("group").unwrap() =
+            json!("x".repeat(usize::try_from(MAX_CACHED_BYTES).unwrap()));
         for changes in [
             json!({"rows": []}),
             json!({"rows": [oversized]}),
+            json!({"rows": [row(0, "node:0", 0), oversized_row]}),
             json!({"total": 0}),
             json!({"total": u64::MAX}),
             json!({"sub_op_counts": [500]}),
@@ -2822,7 +2869,7 @@ mod tests {
                     .insert_legacy(abs(i), &row(i, &format!("node:{i}"), 1)),
             );
         }
-        state.evict_far_windows(&vp());
+        assert!(state.evict_far_windows(&vp()));
         assert!(!state.cache.contains_key(abs(1500)), "far rows evicted");
         assert!(state.cache.contains_key(abs(0)));
         // Desired cache range bottom is viewport bottom (row 23) + BUFFER 400
@@ -2898,7 +2945,7 @@ mod tests {
                     .insert_legacy(abs(hidden), &row(hidden, "hidden", 1)),
             );
         }
-        state.evict_far_windows(&vp());
+        assert!(state.evict_far_windows(&vp()));
         assert_eq!(state.cache.len(), MAX_CACHED_ROWS);
         assert!(state.cache.contains_key(abs(0)));
         assert!(
@@ -2965,6 +3012,157 @@ mod tests {
                 "visible content stays cached at {top}"
             );
         }
+    }
+
+    fn deliver_large_page(
+        state: &mut HistoryAppState,
+        viewport: &mut Viewport,
+        total: i64,
+        metadata_bytes: usize,
+    ) -> Step {
+        let id = state.requests.pending_window().unwrap();
+        let request = state
+            .requests
+            .get(id)
+            .and_then(|flight| {
+                if let RequestBody::GetWindow(request) = &flight.body {
+                    Some(request)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let mut response = window_response(
+            i64::try_from(request.offset).unwrap(),
+            i64::try_from(request.limit).unwrap(),
+            total,
+            request.include_layout.then_some((2, None)),
+        );
+        let body = response.get_mut("Ok").unwrap();
+        if request.offset == 0 {
+            *body.get_mut("sub_op_counts").unwrap() =
+                json!(vec![0; usize::try_from(total).unwrap()]);
+        }
+        for row in body.get_mut("rows").unwrap().as_array_mut().unwrap() {
+            *row.get_mut("group").unwrap() = json!("x".repeat(metadata_bytes));
+            let content = json!({
+                "authored_summary": { "text": row.get("summary").unwrap(), "complete": true }
+            });
+            drop(
+                row.as_object_mut()
+                    .unwrap()
+                    .insert("content".to_owned(), content),
+            );
+        }
+        let mut step = Step::new();
+        state.handle_host_message(resp(id, &response), viewport, &mut step);
+        for op in &step.ops {
+            if let DomOp::SetScrollTop(top) = op {
+                viewport.scroll_top = Pixels::new(*top);
+            }
+        }
+        assert!(state.cache.retained_bytes() <= MAX_CACHED_BYTES);
+        step
+    }
+
+    #[test]
+    fn byte_budget_paging_settles_through_hydration_scrolling_and_find() {
+        let mut state = fixture_state();
+        state.handle_host_message(open_msg(20_000), &vp(), &mut Step::new());
+        for top in [0_i64, 5000, 10_000, 19_000, 10_000, 5500, 0] {
+            let mut viewport = Viewport::new(top * ROW_H, 800);
+            state.fetch_window(&viewport, &mut Step::new());
+            for _ in 0..5 {
+                if state.requests.pending_window().is_none() {
+                    break;
+                }
+                drop(deliver_large_page(
+                    &mut state,
+                    &mut viewport,
+                    20_000,
+                    64 * 1024,
+                ));
+            }
+            assert!(state.cache.byte_limited());
+            assert_eq!(state.phase, SnapshotPhase::LayoutReady);
+            assert_eq!(state.requests.pending_window(), None, "settles at {top}");
+            for visible in top..=state.viewport_visible_bottom(&viewport) {
+                assert!(
+                    state.cache.contains_key(abs(visible)),
+                    "viewport row {visible}"
+                );
+            }
+            for _ in 0..3 {
+                state.fetch_window(&viewport, &mut Step::new());
+                assert_eq!(
+                    state.requests.pending_window(),
+                    None,
+                    "prefetch stays paused"
+                );
+            }
+        }
+
+        state.submit_find("distant match", &mut Step::new());
+        let find_id = state.requests.log().last().unwrap().id;
+        let mut viewport = vp();
+        state.handle_host_message(
+            resp(
+                find_id,
+                &json!({ "Ok": {
+                    "matches": [{ "row": 17_000 }], "returned": 1, "more": false
+                }}),
+            ),
+            &viewport,
+            &mut Step::new(),
+        );
+        assert_eq!(last_get_window(&state).get("offset"), Some(&json!(17_000)));
+        assert_eq!(last_get_window(&state).get("limit"), Some(&json!(1)));
+        for _ in 0..5 {
+            if state.requests.pending_window().is_none() {
+                break;
+            }
+            drop(deliver_large_page(
+                &mut state,
+                &mut viewport,
+                20_000,
+                64 * 1024,
+            ));
+        }
+        assert_eq!(state.requests.pending_window(), None);
+        assert_eq!(state.selected_key(), Some("node:17000"));
+        assert!(state.cache.contains_key(abs(17_000)));
+    }
+
+    #[test]
+    fn an_unretainable_viewport_fails_without_publishing_hydration_requests() {
+        let mut state = fixture_state();
+        let mut viewport = vp();
+        state.handle_host_message(open_msg(24), &viewport, &mut Step::new());
+        let retired_hydration = state.requests.pending_window().unwrap() + 1;
+        let mut step = deliver_large_page(&mut state, &mut viewport, 24, 768 * 1024);
+        assert_eq!(state.phase, SnapshotPhase::Failed);
+        assert!(state.requests.is_empty());
+        assert!(step.ops.iter().any(|op| matches!(
+            op, DomOp::ShowRequestError { text, .. } if text.contains("content budget")
+        )));
+        state.fetch_window(&viewport, &mut step);
+        assert!(!step
+            .sends
+            .iter()
+            .any(|send| matches!(send, Send::Request { .. })));
+        state.handle_host_message(
+            resp(
+                retired_hydration,
+                &window_response(0, 24, 24, Some((2, None))),
+            ),
+            &viewport,
+            &mut Step::new(),
+        );
+        assert_eq!(state.phase, SnapshotPhase::Failed);
+        state.reset_history(&viewport, &mut Step::new());
+        assert_eq!(state.phase, SnapshotPhase::Opening);
+        assert_eq!(state.cache.retained_bytes(), 0);
+        assert!(!state.cache.byte_limited());
     }
 
     #[test]

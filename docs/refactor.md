@@ -284,9 +284,22 @@ Completed increments:
   source/summary contracts and new completeness, content precedence, Unicode,
   and rejected-page regressions cover the boundary.
 
+- Renderer content budget: the sparse cache retains at most 2,000 rows and
+  16 MiB of encoded DTOs plus copied presentation text. Each arriving row is
+  charged once without constructing another JSON value or string; replacement,
+  eviction, and reset update the retained total. The budget covers published
+  cache content, rather than temporary response staging or allocator overhead.
+  An individually oversized row rejects its whole page before metadata or rows
+  are published. Eviction protects the actual viewport first. After byte
+  pressure, prefetch pauses for the snapshot while viewport and find requests
+  continue, preventing repeated fetch/evict loops. A viewport that cannot fit
+  fails explicitly and retires queued hydration work until Retry. Regressions
+  cover heterogeneous metadata, replacement accounting, forward/backward
+  scrolling, hydration, distant find, oversized pages, and terminal recovery.
+
 Remaining work, in dependency order:
 
-1. Add a retained byte budget and finish renderer shell lifetime boundaries.
+1. Finish renderer shell lifetime boundaries.
 2. Retire migrated compatibility machinery and optimize measured repeated work.
 
 Validation uses the existing crate, service, renderer, and extension suites.
