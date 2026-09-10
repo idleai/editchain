@@ -10,6 +10,8 @@ use postcard as _;
 #[cfg(test)]
 use proptest as _;
 
+/// Canonical admission and retained conflict evidence.
+pub mod admission;
 /// Clock types for causal ordering.
 pub mod clock;
 /// Git identity, commit, and explicit-link types.
@@ -30,6 +32,7 @@ pub mod state;
 pub mod tags;
 
 // Re-exports for convenience.
+pub use admission::*;
 pub use clock::*;
 pub use git::*;
 pub use ids::*;

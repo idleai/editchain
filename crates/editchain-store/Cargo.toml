@@ -1,5 +1,5 @@
 [package]
-name = "editchain-node"
+name = "editchain-store"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,16 +13,9 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-clap = { version = "4", features = ["derive"] }
-dirs = "6"
 editchain-core = { path = "../editchain-core" }
 editchain-codec = { path = "../editchain-codec" }
-editchain-store = { path = "../editchain-store" }
-editchain-import = { path = "../editchain-import" }
-editchain-git = { path = "../editchain-git" }
-editchain-vscode-service = { path = "../editchain-vscode-service" }
+serde.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

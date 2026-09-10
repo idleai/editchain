@@ -11,12 +11,29 @@ use serde_json as _;
 
 use editchain_codec::page::Page;
 use editchain_node::segment::SegmentStore;
+use editchain_store::CanonicalChain;
 
 #[test]
 fn open_creates_directory() {
     let dir = tempfile::tempdir().unwrap();
     let store = SegmentStore::open(dir.path().join("test-chain")).unwrap();
-    assert!(store.chain_dir.exists());
+    assert!(store.chain_dir().exists());
+}
+
+#[test]
+fn writers_are_exclusive_and_readers_can_observe_complete_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SegmentStore::open(dir.path()).unwrap();
+    assert_eq!(
+        SegmentStore::open(dir.path()).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        CanonicalChain::read(dir.path()).unwrap().stats().accepted,
+        0
+    );
+    drop(store);
+    assert!(SegmentStore::open(dir.path()).is_ok());
 }
 
 #[expect(
@@ -45,10 +62,12 @@ fn append_and_read() {
 fn rotate_and_read_multiple() {
     let dir = tempfile::tempdir().unwrap();
     let mut store = SegmentStore::open(dir.path().join("test-chain")).unwrap();
+    store.rotate().unwrap(); // An empty current segment must not leave a gap.
 
     let mut page1 = Page::new(0);
     page1.add_record(0x01, vec![1]);
     store.append_page(&page1).unwrap();
+    store.rotate().unwrap();
     store.rotate().unwrap();
 
     let mut page2 = Page::new(1);
@@ -99,4 +118,41 @@ fn incomplete_tail_is_tolerated_but_unsupported_format_is_an_error() {
         store.read_all().unwrap_err().kind(),
         std::io::ErrorKind::InvalidData
     );
+}
+
+#[test]
+fn canonical_reads_are_read_only_and_segment_gaps_are_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing");
+    assert_eq!(CanonicalChain::read(&missing).unwrap().stats().accepted, 0);
+    assert!(!missing.exists());
+
+    let page = editchain_codec::page::encode_page(&Page::new(1)).unwrap();
+    std::fs::write(dir.path().join("000001.eclog"), page).unwrap();
+    assert_eq!(
+        CanonicalChain::read(dir.path()).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(
+        SegmentStore::open(dir.path()).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+}
+
+#[test]
+fn canonical_reads_report_undecodable_records_and_incomplete_tails() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = SegmentStore::open(dir.path()).unwrap();
+    let mut page = Page::new(0);
+    page.add_record(0, vec![0xff]);
+    store.append_page(&page).unwrap();
+    let path = dir.path().join("000000.eclog");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(b"EC02\x01");
+    std::fs::write(&path, &bytes).unwrap();
+    let read = CanonicalChain::read(dir.path()).unwrap();
+    assert_eq!(read.stats().undecodable, 1);
+    assert_eq!(read.stats().incomplete_tails, 1);
+    assert_eq!(read.stats().accepted, 0);
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
 }

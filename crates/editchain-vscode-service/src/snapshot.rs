@@ -141,7 +141,10 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 /// retained session metadata root, keeps session-start records out of synthetic
 /// work groups, and routes a lone session-to-Git anchor directly instead of
 /// allocating an unnecessary shared-spine junction.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 44;
+/// Revision 45 excludes every variant of a conflicted operation ID and uses
+/// strict operation decoding. Snapshots built with first-version admission
+/// must be rebuilt from the unchanged durable records.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 45;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

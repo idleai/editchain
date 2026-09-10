@@ -19,6 +19,14 @@ const MESSAGE_V1: &[u8] = &[
 ];
 
 #[test]
+fn operation_decode_requires_complete_schema_consumption() {
+    let mut extended = MESSAGE_V1.to_vec();
+    extended.push(0);
+    assert!(decode_op(&extended).is_err());
+    assert!(decode_op(MESSAGE_V1).is_ok());
+}
+
+#[test]
 #[expect(clippy::panic, reason = "test assertion")]
 fn round_trip_message_op() {
     let op = Op {

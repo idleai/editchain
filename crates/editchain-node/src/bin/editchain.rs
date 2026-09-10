@@ -6,6 +6,7 @@ use editchain_codec as _;
 use editchain_core as _;
 use editchain_git as _;
 use editchain_import as _;
+use editchain_store as _;
 use editchain_vscode_service as _;
 use serde as _;
 use serde_json as _;

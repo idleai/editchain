@@ -16,6 +16,7 @@ use editchain_import as _;
 use editchain_index as _;
 use editchain_project as _;
 use editchain_protocol as _;
+use editchain_store as _;
 use serde as _;
 use serde_json as _;
 
@@ -2286,7 +2287,7 @@ fn cancelled_branch_rows_ship_muted_node_and_child_owned_edge_geometry() {
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_forty_four() {
+fn prepared_snapshot_manifest_records_projection_revision_forty_five() {
     // Stale snapshots from earlier projection revisions (before trace hiding,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
@@ -2313,7 +2314,7 @@ fn prepared_snapshot_manifest_records_projection_revision_forty_four() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 44u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 45u64);
 }
 
 #[test]
@@ -2702,7 +2703,7 @@ fn prepared_snapshot_serves_flattened_activity_view_and_records_current_revision
         &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["identity"]["projection_revision"], 44u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 45u64);
 
     let mut cached =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");

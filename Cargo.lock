@@ -600,6 +600,7 @@ dependencies = [
  "editchain-core",
  "editchain-git",
  "editchain-import",
+ "editchain-store",
  "editchain-vscode-service",
  "serde",
  "serde_json",
@@ -626,6 +627,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "editchain-store"
+version = "0.1.0"
+dependencies = [
+ "editchain-codec",
+ "editchain-core",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
 name = "editchain-vscode-service"
 version = "0.1.0"
 dependencies = [
@@ -637,6 +648,7 @@ dependencies = [
  "editchain-index",
  "editchain-project",
  "editchain-protocol",
+ "editchain-store",
  "serde",
  "serde_json",
  "tempfile",

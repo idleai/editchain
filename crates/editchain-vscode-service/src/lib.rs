@@ -17,14 +17,12 @@ use serde as _;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::{self, Read as _, Seek as _, SeekFrom};
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
-use editchain_codec::frame::decode_op;
-use editchain_codec::scan::{PageScanner, ScanErrorKind, ScanItem};
 use editchain_core::{
-    ActorId, BlobRef, Clock, ContentId, GitOid, NodeId, Op, OpId, OpKind, OpSet, ParentSet,
-    Payload, RepositoryId, ScopeRef, SessionId, Tags,
+    ActorId, BlobRef, Clock, ContentId, GitOid, NodeId, Op, OpId, OpKind, ParentSet, Payload,
+    RepositoryId, ScopeRef, SessionId, Tags,
 };
 use editchain_git::{
     commit_file_changes, discover_repositories, open_repository, resolve_blob as resolve_git_blob,
@@ -170,33 +168,8 @@ struct ExpandedChildRow {
     descendant_count: usize,
 }
 
-/// Canonicalization outcome for the records decoded from a chain's segments.
-///
-/// Records are admitted through [`OpSet`], which ignores exact replays of an
-/// accepted op and quarantines same-id records with conflicting bytes, so a
-/// crash-replayed import page never double-counts or silently mutates an op.
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
-pub struct ChainReadStats {
-    /// Successfully decoded records handed to the `OpSet`.
-    pub records: usize,
-    /// Unique operations accepted into the workspace.
-    pub accepted: usize,
-    /// Exact replay records ignored (same `OpId`, same bytes).
-    pub duplicates: usize,
-    /// Conflicting records quarantined (same `OpId`, different bytes).
-    pub quarantined: usize,
-}
-
-/// Exact location of one encoded operation inside an append-only segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OpRecordLocation {
-    /// Numeric sequence from `<sequence>.eclog`.
-    pub(crate) segment_seq: u32,
-    /// Absolute byte offset of the encoded operation (after length + flags).
-    pub(crate) data_offset: u64,
-    /// Encoded operation length in bytes.
-    pub(crate) data_len: u32,
-}
+pub use editchain_store::ChainReadStats;
+use editchain_store::{CanonicalChain, OpRecordLocation};
 
 /// Accepted operation identity paired with its authoritative record location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,6 +225,18 @@ impl OpenDiagnostics {
             warnings.push(format!(
                 "{} conflicting same-id record(s) quarantined during open",
                 self.chain.quarantined
+            ));
+        }
+        if self.chain.undecodable > 0 {
+            warnings.push(format!(
+                "{} record(s) could not be decoded; source bytes remain in the segments",
+                self.chain.undecodable
+            ));
+        }
+        if self.chain.incomplete_tails > 0 {
+            warnings.push(format!(
+                "{} incomplete segment tail(s); only complete records were loaded",
+                self.chain.incomplete_tails
             ));
         }
         if self.blobs.missing > 0 {
@@ -4801,111 +4786,34 @@ fn resolved_object_from_commit(commit: &editchain_core::GitCommitEntity) -> Reso
 type ChainReadResult =
     Result<(Vec<Op>, ChainReadStats, Vec<SnapshotOpLocator>), Box<dyn std::error::Error>>;
 
-/// Encoded chain record paired with its exact durable location.
-#[derive(Debug)]
-struct LocatedChainRecord {
-    data: Vec<u8>,
-    location: OpRecordLocation,
-}
-
-/// Read all decoded operations from a chain directory, canonicalized through
-/// [`OpSet`].
-///
-/// Replayed pages (e.g. after an interrupted import retried a page the first
-/// run had already synced) are deduplicated by exact bytes, and same-id
-/// records with conflicting bytes are quarantined rather than silently
-/// overwriting the accepted op. Returns the accepted ops in canonical key
-/// order plus the read stats.
-///
-/// # Errors
-///
-/// Returns an error if the chain directory cannot be read.
+/// Read canonical operations and their durable detail locations through the
+/// shared store. Conflicted IDs are absent from every consumer's valid corpus.
 fn read_chain_ops(chain_dir: &Path) -> ChainReadResult {
-    if chain_dir.as_os_str().is_empty() {
-        return Ok((Vec::new(), ChainReadStats::default(), Vec::new()));
+    let chain = CanonicalChain::read(chain_dir)?;
+    let stats = chain.stats();
+    let mut ops = Vec::with_capacity(stats.accepted);
+    let mut locations = Vec::with_capacity(stats.accepted);
+    for (op, location) in chain.into_located_ops() {
+        let location = location.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "stored operation has no location",
+            )
+        })?;
+        locations.push(SnapshotOpLocator {
+            id: op.id,
+            location,
+        });
+        ops.push(op);
     }
-    let records = read_chain_records(chain_dir)?;
-    let mut opset = OpSet::new();
-    let mut accepted: Vec<(Op, SnapshotOpLocator)> = Vec::new();
-    let mut stats = ChainReadStats::default();
-    for record in records {
-        let Ok(op) = decode_op(&record.data) else {
-            continue;
-        };
-        stats.records = stats.records.saturating_add(1);
-        match opset.insert(op.id, record.data) {
-            Ok(true) => {
-                stats.accepted = stats.accepted.saturating_add(1);
-                let id = op.id;
-                accepted.push((
-                    op,
-                    SnapshotOpLocator {
-                        id,
-                        location: record.location,
-                    },
-                ));
-            }
-            Ok(false) => stats.duplicates = stats.duplicates.saturating_add(1),
-            Err(_) => stats.quarantined = stats.quarantined.saturating_add(1),
-        }
-    }
-    // Match the OpSet's canonical `OpId` key order without a second decode
-    // pass — decoding 100k+ records twice is the dominant Open cost in debug.
-    accepted.sort_by_key(|(op, _)| op.id);
-    let (ops, locations) = accepted.into_iter().unzip();
     Ok((ops, stats, locations))
 }
 
-/// Scan every complete segment record while retaining byte offsets.
-fn read_chain_records(chain_dir: &Path) -> io::Result<Vec<LocatedChainRecord>> {
-    let mut records = Vec::new();
-    let mut segment_seq = 0u32;
-    loop {
-        let path = chain_dir.join(format!("{segment_seq:06}.eclog"));
-        if !path.exists() {
-            break;
-        }
-        scan_segment_records(segment_seq, &fs::read(path)?, &mut records)?;
-        segment_seq = segment_seq.saturating_add(1);
-    }
-    Ok(records)
-}
-
-/// Scan complete pages and records from one segment, ignoring a partial tail.
-fn scan_segment_records(
-    segment_seq: u32,
-    bytes: &[u8],
-    records: &mut Vec<LocatedChainRecord>,
-) -> io::Result<()> {
-    for item in PageScanner::new(bytes) {
-        match item {
-            Ok(ScanItem::Page { .. }) => {}
-            Ok(ScanItem::Record(record)) => records.push(LocatedChainRecord {
-                data: record.data.to_vec(),
-                location: OpRecordLocation {
-                    segment_seq,
-                    data_offset: u64::try_from(record.data_offset).map_err(io::Error::other)?,
-                    data_len: u32::try_from(record.data.len()).map_err(io::Error::other)?,
-                },
-            }),
-            Err(error) if error.kind == ScanErrorKind::IncompleteTail => break,
-            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
-        }
-    }
-    Ok(())
-}
-
-/// Decode one operation directly from its indexed segment-record location.
 fn read_op_at(
     chain_dir: &Path,
     location: OpRecordLocation,
 ) -> Result<Op, Box<dyn std::error::Error>> {
-    let path = chain_dir.join(format!("{:06}.eclog", location.segment_seq));
-    let mut file = File::open(path)?;
-    let _: u64 = file.seek(SeekFrom::Start(location.data_offset))?;
-    let mut encoded = vec![0u8; usize::try_from(location.data_len)?];
-    file.read_exact(&mut encoded)?;
-    decode_op(&encoded).map_err(Into::into)
+    editchain_store::read_op_at(chain_dir, location).map_err(Into::into)
 }
 
 /// Deterministic git identity for a synthetic search-indexed op.
@@ -6016,16 +5924,12 @@ mod tests {
 
         let ws = Workspace::open(workspace_path.to_str().unwrap(), ".editchain").unwrap();
         assert_eq!(ws.diagnostics.chain.records, 4);
-        assert_eq!(ws.diagnostics.chain.accepted, 2);
+        assert_eq!(ws.diagnostics.chain.accepted, 1);
         assert_eq!(ws.diagnostics.chain.duplicates, 1);
-        assert_eq!(ws.diagnostics.chain.quarantined, 1);
-        assert_eq!(ws.projection.ops.len(), 2);
+        assert_eq!(ws.diagnostics.chain.quarantined, 2);
+        assert_eq!(ws.projection.ops, vec![second]);
         assert_eq!(ws.diagnostics.warnings().len(), 2);
-
-        // The quarantined conflict must not replace the accepted payload silently.
-        let details = ws.node_details(Some(first.id.to_string()), None).unwrap();
-        assert!(details.body.contains("first-payload"));
-        assert!(!details.body.contains("conflicting-payload"));
+        assert!(ws.node_details(Some(first.id.to_string()), None).is_none());
     }
 
     #[test]

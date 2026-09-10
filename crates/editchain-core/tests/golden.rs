@@ -199,9 +199,9 @@ fn golden_concurrent_merge() {
     let a2 = msg_op(1, 0, 2, 200, b"also from A");
     let b1 = msg_op(2, 0, 1, 150, b"from B");
 
-    let _: Option<bool> = state_a.ops.insert(a1.id, encode(&a1)).ok();
-    let _: Option<bool> = state_a.ops.insert(a2.id, encode(&a2)).ok();
-    let _: Option<bool> = state_b.ops.insert(b1.id, encode(&b1)).ok();
+    let _: Admission = state_a.ops.insert(a1.id, encode(&a1));
+    let _: Admission = state_a.ops.insert(a2.id, encode(&a2));
+    let _: Admission = state_b.ops.insert(b1.id, encode(&b1));
 
     let (accepted, duplicates, quarantined) = state_a.ops.merge(&state_b.ops);
     assert_eq!(accepted, 1);
@@ -246,10 +246,10 @@ fn golden_duplicate_detection() {
     let mut opset = OpSet::new();
     let id = OpId::new(NodeId(1), 0, 1);
 
-    assert!(opset.insert(id, vec![1, 2, 3]).unwrap());
-    assert!(!opset.insert(id, vec![1, 2, 3]).unwrap());
-    assert!(opset.insert(id, vec![4, 5, 6]).is_err());
-    assert_eq!(opset.quarantined().len(), 1);
+    assert_eq!(opset.insert(id, vec![1, 2, 3]), Admission::Accepted);
+    assert_eq!(opset.insert(id, vec![1, 2, 3]), Admission::Duplicate);
+    assert_eq!(opset.insert(id, vec![4, 5, 6]), Admission::Conflict);
+    assert_eq!(opset.conflicts().count(), 1);
 }
 
 // ---------------------------------------------------------------------------

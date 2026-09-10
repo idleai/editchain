@@ -3,14 +3,13 @@
 mod claude_session_git;
 mod git_commit_links;
 
-use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::Provider;
 use crate::segment::SegmentStore;
-use editchain_codec::frame::{decode_op, encode_op};
+use editchain_codec::frame::encode_op;
 use editchain_codec::page::Page;
-use editchain_core::{Op, OpId};
+use editchain_core::Op;
 use editchain_import::codex::{import_codex, CodexDiscoveryRequest, HelperCommand};
 use editchain_import::import::import_claude_code;
 use editchain_import::model::{DiscoveryRequest, ImportOptions};
@@ -18,6 +17,7 @@ use editchain_import::sink::{
     BlobSink, CursorStore, FsBlobSink, FsCursorStore, MemoryBlobSink, MemoryCursorStore,
     MemoryOpSink,
 };
+use editchain_store::CanonicalChain;
 
 /// Default Codex helper program, resolved from `PATH` when unconfigured.
 const DEFAULT_CODEX_HELPER: &str = "codex-session-exporter";
@@ -228,37 +228,11 @@ struct GitReconciliation {
 /// excluded entirely, matching the authoritative reader's quarantine rule, so
 /// malformed history can never become relationship evidence.
 fn reconciliation_ops(chain: &Path, imported: &[Op]) -> Result<Vec<Op>, std::io::Error> {
-    let store = SegmentStore::open(chain)?;
-    let mut accepted: BTreeMap<OpId, Op> = BTreeMap::new();
-    let mut conflicted = HashSet::new();
-    for page in store.read_all()? {
-        for record in page.records {
-            if let Ok(op) = decode_op(&record.data) {
-                reconcile_op(op, &mut accepted, &mut conflicted);
-            }
-        }
-    }
+    let mut corpus = CanonicalChain::read(chain)?;
     for op in imported {
-        reconcile_op(op.clone(), &mut accepted, &mut conflicted);
+        let _: editchain_core::Admission = corpus.insert(op.clone())?;
     }
-    Ok(accepted.into_values().collect())
-}
-
-/// Insert one reconciliation candidate or quarantine its conflicting ID.
-fn reconcile_op(op: Op, accepted: &mut BTreeMap<OpId, Op>, conflicted: &mut HashSet<OpId>) {
-    if conflicted.contains(&op.id) {
-        return;
-    }
-    match accepted.get(&op.id) {
-        Some(existing) if existing != &op => {
-            drop(accepted.remove(&op.id));
-            let _: bool = conflicted.insert(op.id);
-        }
-        Some(_) => {}
-        None => {
-            drop(accepted.insert(op.id, op));
-        }
-    }
+    Ok(corpus.into_located_ops().map(|(op, _)| op).collect())
 }
 
 /// Build the blob and cursor sinks for an import run.
@@ -348,6 +322,8 @@ mod tests {
     use super::*;
     use crate::commands::{Cli, Commands};
     use clap::Parser;
+    use editchain_codec::frame::decode_op;
+    use std::collections::HashSet;
 
     struct ImportArgs {
         sessions_dir: String,
@@ -617,6 +593,61 @@ mod tests {
             }
         }
         ops
+    }
+
+    #[test]
+    fn reconciliation_and_viewer_share_conflict_admission() {
+        use editchain_core::{
+            ActorId, Clock, MessageOp, NodeId, OpId, OpKind, ParentSet, Payload, ScopeRef, Tags,
+        };
+
+        let candidate = |seq, text: &[u8]| Op {
+            id: OpId::new(NodeId(1), 0, seq),
+            parents: ParentSet::None,
+            actor: ActorId(1),
+            clock: Clock::UnixMs(1),
+            scope: ScopeRef::None,
+            tags: Tags::MESSAGE,
+            kind: OpKind::Message(MessageOp {
+                content: Payload::Inline(text.to_vec()),
+                content_type: Payload::Empty,
+            }),
+        };
+        let stable = candidate(2, b"stable");
+        for (first, conflicting) in [
+            (b"one".as_slice(), b"two".as_slice()),
+            (b"two".as_slice(), b"one".as_slice()),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let chain = dir.path().join(".editchain");
+            let first = candidate(1, first);
+            let conflicting = candidate(1, conflicting);
+            let mut store = SegmentStore::open(&chain).unwrap();
+            let mut page = Page::new(0);
+            for op in [&first, &first, &stable] {
+                page.add_record(0, encode_op(op).unwrap());
+            }
+            store.append_page(&page).unwrap();
+            assert_eq!(
+                reconciliation_ops(&chain, &[conflicting.clone(), first.clone()]).unwrap(),
+                vec![stable.clone()]
+            );
+            let mut next_page = Page::new(1);
+            for op in [&conflicting, &first, &conflicting] {
+                next_page.add_record(0, encode_op(op).unwrap());
+            }
+            store.append_page(&next_page).unwrap();
+            let reconciled = reconciliation_ops(&chain, &[]).unwrap();
+            let viewer = editchain_vscode_service::Workspace::open(
+                dir.path().to_str().unwrap(),
+                ".editchain",
+            )
+            .unwrap();
+            assert_eq!(reconciled, vec![stable.clone()]);
+            assert_eq!(viewer.projection.ops, reconciled);
+            assert_eq!(viewer.diagnostics.chain.quarantined, 2);
+            assert_eq!(viewer.diagnostics.chain.duplicates, 3);
+        }
     }
 
     #[test]

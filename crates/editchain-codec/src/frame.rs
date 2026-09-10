@@ -21,9 +21,15 @@ pub fn encode_op(op: &Op) -> Result<Vec<u8>, postcard::Error> {
 ///
 /// # Errors
 ///
-/// Returns `postcard::Error` if deserialization fails.
+/// Returns `postcard::Error` if deserialization fails or bytes remain after the
+/// supported operation schema. A future extension must not masquerade as a
+/// complete operation understood by this reader.
 pub fn decode_op(bytes: &[u8]) -> Result<Op, postcard::Error> {
-    postcard::from_bytes(bytes)
+    let (op, remaining) = postcard::take_from_bytes(bytes)?;
+    if !remaining.is_empty() {
+        return Err(postcard::Error::DeserializeBadEncoding);
+    }
+    Ok(op)
 }
 
 // ---------------------------------------------------------------------------

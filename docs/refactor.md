@@ -16,18 +16,24 @@ Completed increments:
   limit; large payloads belong in the blob store. EC02 has no checksum, so a
   plausible truncated record cannot be distinguished from every form of damaged
   length data. Fixed byte fixtures protect the current page/message encoding.
+- Canonical storage: core retains a sorted set of all byte variants per ID.
+  Conflicted IDs are entirely absent from accepted history, including after
+  merge or replay. Node reconciliation and the viewer use `editchain-store` for
+  the same decoding, admission, and detail locations. Strict operation decoding
+  reports trailing or unsupported bytes as undecodable while retaining source
+  files. Read-only access creates no directories; missing segments are errors.
+  Segment writers hold an exclusive lock and check sequence exhaustion.
+  Render projection revision 45 invalidates caches using first-version admission.
 
 Remaining work, in dependency order:
 
-1. Unify canonical admission and read-only store access, including deterministic
-   conflict evidence and consistent viewer/reconciliation behavior.
-2. Establish repository-qualified graph identity and a shared repository catalog.
-3. Bind service windows, search, layout, and renderer requests to one snapshot.
-4. Move complete Activity assembly and presentation-tree ownership into project.
-5. Consolidate typed provider evidence, source lifecycle, and persistence
+1. Establish repository-qualified graph identity and a shared repository catalog.
+2. Bind service windows, search, layout, and renderer requests to one snapshot.
+3. Move complete Activity assembly and presentation-tree ownership into project.
+4. Consolidate typed provider evidence, source lifecycle, and persistence
    checkpoints; preserve compatibility with existing normalized records.
-6. Simplify search document identity and renderer request/cache state.
-7. Retire migrated compatibility machinery and optimize measured repeated work.
+5. Simplify search document identity and renderer request/cache state.
+6. Retire migrated compatibility machinery and optimize measured repeated work.
 
 Validation uses the existing crate, service, renderer, and extension suites.
 Every completed code increment must pass `./scripts/lint.sh`. Regression tests

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/editchain-core",
     "crates/editchain-codec",
+    "crates/editchain-store",
     "crates/editchain-node",
     "crates/editchain-import",
     "crates/editchain-index",

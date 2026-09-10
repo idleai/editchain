@@ -86,9 +86,11 @@ Git repository ──► editchain-git              │
 - `editchain-codec`: postcard operation frames and bounded EC02 page scanning.
   EC02 uses fixed u32 record lengths and has no checksum; EC03 is a separate,
   currently inactive checksummed format.
+- `editchain-store`: canonical read-only chain access, record locations,
+  integrity diagnostics, and exclusive durable segment writers.
 - `editchain-import`: deterministic, incremental Claude Code and Codex
   importers, cursors, and content-addressed blob storage.
-- `editchain-node`: ingestion CLI and segment storage. Its only commands are
+- `editchain-node`: ingestion CLI and persistence coordination. Its commands are
   `import` and `prepare-view`.
 - `editchain-git`: repository discovery, history walking, commit/blob
   resolution, and file-change extraction used by the extension.
