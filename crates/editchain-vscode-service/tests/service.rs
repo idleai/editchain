@@ -785,7 +785,7 @@ fn open_resolves_exact_session_base_outside_current_head_history() {
         workspace
             .projection
             .lifted_parent_keys(&session_node)
-            .contains(&session_base.to_hex()),
+            .contains(&editchain_core::GitCommitKey::new(repository, session_base).to_string()),
         "the exact BasedOn relation must branch the session from its start commit"
     );
 }
@@ -951,6 +951,11 @@ fn find_in_history_distinguishes_colliding_operation_and_git_ids() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = make_git_repo(tmp.path());
     let oid = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    let git_key = editchain_core::GitCommitKey::new(
+        editchain_git::repository_id_from_path(&repo.join(".git")),
+        GitOid::from_hex(&oid).unwrap(),
+    )
+    .to_string();
     // The first synthetic Git id follows the one stored operation: 0:0:1.
     // That is also a valid persisted operation id, not a reserved namespace.
     let message = msg_op(0, 1, b"initial collisionneedle");
@@ -972,8 +977,8 @@ fn find_in_history_distinguishes_colliding_operation_and_git_ids() {
 
     for (query, mut expected) in [
         ("collisionneedle", vec![message.id.to_string()]),
-        ("commit", vec![oid.clone()]),
-        ("initial", vec![message.id.to_string(), oid]),
+        ("commit", vec![git_key.clone()]),
+        ("initial", vec![message.id.to_string(), git_key]),
     ] {
         let response = server
             .handle(&Request {
@@ -2287,7 +2292,7 @@ fn cancelled_branch_rows_ship_muted_node_and_child_owned_edge_geometry() {
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_forty_five() {
+fn prepared_snapshot_manifest_records_projection_revision_forty_six() {
     // Stale snapshots from earlier projection revisions (before trace hiding,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
@@ -2314,7 +2319,7 @@ fn prepared_snapshot_manifest_records_projection_revision_forty_five() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 45u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 46u64);
 }
 
 #[test]
@@ -2703,7 +2708,7 @@ fn prepared_snapshot_serves_flattened_activity_view_and_records_current_revision
         &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["identity"]["projection_revision"], 45u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 46u64);
 
     let mut cached =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");

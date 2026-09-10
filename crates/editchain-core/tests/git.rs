@@ -20,6 +20,19 @@ fn sha256(bytes: [u8; 32]) -> GitOid {
 }
 
 #[test]
+fn qualified_commit_keys_preserve_full_repository_identity() {
+    use editchain_core::GitCommitKey;
+    let oid = sha1([0xab; 20]);
+    let key = GitCommitKey::new(RepositoryId(u64::MAX), oid);
+    assert_eq!(GitCommitKey::from_display_str(&key.to_string()), Some(key));
+    assert!(GitCommitKey::from_display_str(&oid.to_hex()).is_none());
+    assert_ne!(
+        key.to_string(),
+        GitCommitKey::new(RepositoryId(1), oid).to_string()
+    );
+}
+
+#[test]
 fn oid_sha1_pads_to_32_bytes() {
     let oid = sha1([0xab; 20]);
     assert_eq!(oid.format, GitObjectFormat::Sha1);

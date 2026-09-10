@@ -620,7 +620,7 @@ fn session_title_bundles_into_its_git_anchored_session_meta_root() {
     );
     assert_eq!(
         projection.lifted_parent_keys(meta_row),
-        vec![commit.oid.to_hex()],
+        vec![commit.key().to_string()],
         "the surviving metadata root keeps the exact Git anchor"
     );
     let activity_row = nodes
@@ -1150,13 +1150,13 @@ fn produced_commit_link_branches_from_folded_source_without_rewriting_agent_chai
         .unwrap();
     let committed = nodes
         .iter()
-        .find(|node| node.node_key() == commit.oid.to_hex())
+        .find(|node| node.node_key() == commit.key().to_string())
         .unwrap();
 
     assert!(
         !projection
             .lifted_parent_keys(source)
-            .contains(&commit.oid.to_hex()),
+            .contains(&commit.key().to_string()),
         "ProducedBy is not a BasedOn edge from the command back to its result"
     );
     assert_eq!(
@@ -1178,7 +1178,7 @@ fn produced_commit_link_branches_from_folded_source_without_rewriting_agent_chai
     );
     let structural = projection.structural_row_keys(&nodes);
     assert!(structural.contains(&turn.id.to_string()));
-    assert!(structural.contains(&commit.oid.to_hex()));
+    assert!(structural.contains(&commit.key().to_string()));
 
     let raw_commit_parents =
         committed.parent_keys(&projection.git.links, projection.relationship_notes());
@@ -1186,7 +1186,7 @@ fn produced_commit_link_branches_from_folded_source_without_rewriting_agent_chai
     let raw_source_parents =
         source.parent_keys(&projection.git.links, projection.relationship_notes());
     assert!(
-        !raw_source_parents.contains(&commit.oid.to_hex()),
+        !raw_source_parents.contains(&commit.key().to_string()),
         "the source operation never treats its produced commit as an ancestor"
     );
 }
@@ -1220,7 +1220,7 @@ fn bundled_meta_based_on_link_is_inherited_by_visible_anchor() {
 
     assert_eq!(
         node.parent_keys(&links, &std::collections::HashMap::new()),
-        vec![target_oid.to_hex()],
+        vec![editchain_core::GitCommitKey::new(RepositoryId(1), target_oid).to_string()],
         "an exact session-start BasedOn relation must remain on its visible turn"
     );
 }
@@ -1265,7 +1265,7 @@ fn bundled_spawned_meta_does_not_leak_its_git_parent_onto_the_visible_anchor() {
     assert!(
         !node
             .parent_keys(&links, &notes)
-            .contains(&commit.oid.to_hex()),
+            .contains(&commit.key().to_string()),
         "a spawned child's bundled session metadata must not fan the parent row back to Git"
     );
 }
@@ -1404,9 +1404,9 @@ fn exact_spawn_parent_suppresses_only_the_inherited_git_graph_edge() {
     assert!(edges
         .iter()
         .any(|edge| edge.child == child.id.to_string() && edge.parent == spawn.id.to_string()));
-    assert!(!edges
-        .iter()
-        .any(|edge| { edge.child == child.id.to_string() && edge.parent == commit.oid.to_hex() }));
+    assert!(!edges.iter().any(|edge| {
+        edge.child == child.id.to_string() && edge.parent == commit.key().to_string()
+    }));
 }
 
 #[test]

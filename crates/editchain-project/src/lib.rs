@@ -22,7 +22,8 @@ use std::sync::Arc;
 
 use editchain_core::op::NoteRelationship;
 use editchain_core::{
-    Clock, GitCommitEntity, GitLinkKind, GitOid, GitProjection, Op, OpId, Payload, RepositoryId,
+    Clock, GitCommitEntity, GitCommitKey, GitLinkKind, GitOid, GitProjection, Op, OpId, Payload,
+    RepositoryId,
 };
 
 use crate::layout::{compute_graph_layout, compute_lane_assignment, GraphLayout, GraphRow};
@@ -303,7 +304,7 @@ impl HistoryNode {
 
     /// Returns a stable node key for graph wiring.
     ///
-    /// `EditChain` ops use their `OpId` string; git commits use their OID hex.
+    /// `EditChain` ops use their `OpId` string; Git commits use `git:<repository>:<oid>` keys.
     #[must_use]
     pub fn node_key(&self) -> String {
         match self {
@@ -313,7 +314,7 @@ impl HistoryNode {
             Self::ExecuteBundle { anchor, .. }
             | Self::PlanBundle { anchor, .. }
             | Self::WorkGroup { anchor, .. } => anchor.id.to_string(),
-            Self::GitCommit(commit) => commit.oid.to_hex(),
+            Self::GitCommit(commit) => commit.key().to_string(),
         }
     }
 
@@ -324,7 +325,7 @@ impl HistoryNode {
     /// canonical operation envelope and relationship evidence remain intact.
     ///
     /// For `EditChain` ops, this includes the causal `Op.parents`, inbound
-    /// graph-bearing Git links (whose target OID hex becomes a parent key), and
+    /// graph-bearing Git links (with repository-qualified target keys), and
     /// — when `notes` annotates this op with a graph-bearing relationship — the
     /// note's target as a *virtual* parent. A `ProducedBy` link has the opposite
     /// direction: its Git commit gains the source operation as a parent. Git
@@ -439,7 +440,7 @@ impl HistoryNode {
                             link.kind != GitLinkKind::ProducedBy
                                 && !(source_has_spawn_parent && link.kind == GitLinkKind::BasedOn)
                         }) {
-                            let key = link.target_oid.to_hex();
+                            let key = link.target_key().to_string();
                             if seen.insert(key.clone()) {
                                 keys.push(key);
                             }
@@ -509,7 +510,11 @@ impl HistoryNode {
                 keys
             }
             Self::GitCommit(commit) => {
-                let mut keys: Vec<String> = commit.parents.iter().map(GitOid::to_hex).collect();
+                let mut keys: Vec<String> = commit
+                    .parents
+                    .iter()
+                    .map(|oid| GitCommitKey::new(commit.repository, *oid).to_string())
+                    .collect();
                 let mut seen: std::collections::HashSet<String> = keys.iter().cloned().collect();
                 for links in git_links.values() {
                     for link in links.iter().filter(|link| {
@@ -531,7 +536,7 @@ impl HistoryNode {
     /// Rewrite this cloned node's physical causal parents.
     ///
     /// Op parents are parsed from `"node:boot:seq"` display strings; git parents
-    /// are parsed from OID hex. Keys that fail to parse are dropped. Derived
+    /// are parsed from repository-qualified Git keys. Keys that fail to parse are dropped. Derived
     /// projections should use [`Self::override_parent_keys`] so immutable
     /// relationship notes cannot supersede the rewrite during graph layout.
     #[expect(
@@ -569,8 +574,12 @@ impl HistoryNode {
                 };
             }
             Self::GitCommit(commit) => {
-                let mut oids: Vec<GitOid> =
-                    keys.iter().filter_map(|k| GitOid::from_hex(k)).collect();
+                let mut oids: Vec<GitOid> = keys
+                    .iter()
+                    .filter_map(|key| GitCommitKey::from_display_str(key))
+                    .filter(|key| key.repository == commit.repository)
+                    .map(|key| key.oid)
+                    .collect();
                 oids.sort_unstable();
                 oids.dedup();
                 commit.parents = oids;
@@ -842,8 +851,11 @@ impl HistoryProjection {
                 }
             }
         }
-        let git_present: std::collections::HashSet<String> =
-            git.commits.keys().map(|(_, oid)| oid.to_hex()).collect();
+        let git_present: std::collections::HashSet<String> = git
+            .commits
+            .values()
+            .map(|commit| commit.key().to_string())
+            .collect();
         let mut projection = Self {
             ops,
             git,
@@ -1980,13 +1992,13 @@ impl HistoryProjection {
     /// same key replaces an earlier one.
     pub fn merge_git_commits(&mut self, commits: Vec<GitCommitEntity>) {
         for commit in commits {
-            let hex = commit.oid.to_hex();
+            let key = commit.key().to_string();
             drop(
                 self.git
                     .commits
                     .insert((commit.repository, commit.oid), commit),
             );
-            let _: bool = self.git_present.insert(hex);
+            let _: bool = self.git_present.insert(key);
         }
     }
 
@@ -2230,7 +2242,7 @@ impl HistoryProjection {
         let representative = &self.collapsed_projection.representative;
         let present = row_node_keys(nodes);
         for link in self.git.links.values().flatten().filter(|link| {
-            link.kind == GitLinkKind::ProducedBy && present.contains(&link.target_oid.to_hex())
+            link.kind == GitLinkKind::ProducedBy && present.contains(&link.target_key().to_string())
         }) {
             if let Some(source) = canonical_op_id(
                 link.source,
@@ -2239,7 +2251,7 @@ impl HistoryProjection {
             ) {
                 let _: bool = keys.insert(source.to_string());
             }
-            let _: bool = keys.insert(link.target_oid.to_hex());
+            let _: bool = keys.insert(link.target_key().to_string());
         }
         for node in nodes {
             let Some(anchor_id) = node.op_id() else {
@@ -2325,7 +2337,7 @@ enum OrderingKey {
     /// `EditChain` operation identity.
     Op(OpId),
     /// Git commit identity.
-    Git(GitOid),
+    Git(GitCommitKey),
 }
 
 /// Exact-equivalence key for occurrences of one provider event entity.
@@ -2350,7 +2362,7 @@ fn ordering_key(node: &HistoryNode) -> OrderingKey {
         HistoryNode::ExecuteBundle { anchor, .. }
         | HistoryNode::PlanBundle { anchor, .. }
         | HistoryNode::WorkGroup { anchor, .. } => OrderingKey::Op(anchor.id),
-        HistoryNode::GitCommit(commit) => OrderingKey::Git(commit.oid),
+        HistoryNode::GitCommit(commit) => OrderingKey::Git(commit.key()),
     }
 }
 
@@ -2555,7 +2567,7 @@ fn ordering_parent_keys(
                         link.kind != GitLinkKind::ProducedBy
                             && !(source_has_spawn_parent && link.kind == GitLinkKind::BasedOn)
                     }) {
-                        let key = OrderingKey::Git(link.target_oid);
+                        let key = OrderingKey::Git(link.target_key());
                         push(present.contains(&key).then_some(key));
                     }
                 }
@@ -2582,7 +2594,7 @@ fn ordering_parent_keys(
         }
         HistoryNode::GitCommit(commit) => {
             for parent in &commit.parents {
-                let key = OrderingKey::Git(*parent);
+                let key = OrderingKey::Git(GitCommitKey::new(commit.repository, *parent));
                 push(present.contains(&key).then_some(key));
             }
             for links in git_links.values() {

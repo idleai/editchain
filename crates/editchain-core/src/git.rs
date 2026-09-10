@@ -12,11 +12,47 @@ use crate::payload::Payload;
 
 /// A repository identifier — 64 bits wide.
 ///
-/// Derived deterministically from the canonical workspace root plus the
-/// repository-relative path, so the same repository always maps to the same
-/// `RepositoryId` across imports and live resolution.
+/// The live Git adapter and importers preserve the legacy SHA-256 path-derived
+/// ID of the repository's `.git` marker. Relocating a repository requires an
+/// explicit mapping when existing durable links must retain their identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RepositoryId(pub u64);
+
+/// A Git commit identity qualified by its repository.
+///
+/// Clones and linked worktrees may contain the same OID while remaining
+/// distinct history sources. Graph, search, and display keys retain both parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GitCommitKey {
+    /// Repository supplying this commit's history and live observations.
+    pub repository: RepositoryId,
+    /// Full commit object identity.
+    pub oid: GitOid,
+}
+
+impl GitCommitKey {
+    /// Create a repository-qualified identity.
+    #[must_use]
+    pub const fn new(repository: RepositoryId, oid: GitOid) -> Self {
+        Self { repository, oid }
+    }
+
+    /// Parse the display key. Bare OIDs are ambiguous and are rejected.
+    #[must_use]
+    pub fn from_display_str(value: &str) -> Option<Self> {
+        let (repository, oid) = value.strip_prefix("git:")?.split_once(':')?;
+        Some(Self::new(
+            RepositoryId(repository.parse().ok()?),
+            GitOid::from_hex(oid)?,
+        ))
+    }
+}
+
+impl core::fmt::Display for GitCommitKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "git:{}:{}", self.repository.0, self.oid)
+    }
+}
 
 /// The object format of a Git repository (SHA-1 or SHA-256).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
@@ -221,6 +257,14 @@ pub struct GitCommitEntity {
     pub changed_paths: Vec<PathId>,
 }
 
+impl GitCommitEntity {
+    /// Repository-qualified identity used by graph and view consumers.
+    #[must_use]
+    pub const fn key(&self) -> GitCommitKey {
+        GitCommitKey::new(self.repository, self.oid)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Explicit EditChain-to-Git links
 // ---------------------------------------------------------------------------
@@ -257,6 +301,14 @@ pub struct GitLink {
     pub target_oid: GitOid,
     /// Stored relation kind.
     pub kind: GitLinkKind,
+}
+
+impl GitLink {
+    /// Repository-qualified target, shared by ancestry and display adapters.
+    #[must_use]
+    pub const fn target_key(&self) -> GitCommitKey {
+        GitCommitKey::new(self.target_repo, self.target_oid)
+    }
 }
 
 impl Ord for GitOid {

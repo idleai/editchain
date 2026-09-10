@@ -24,10 +24,14 @@ Completed increments:
   files. Read-only access creates no directories; missing segments are errors.
   Segment writers hold an exclusive lock and check sequence exhaustion.
   Render projection revision 45 invalidates caches using first-version admission.
+- Git graph identity: `GitCommitKey` keeps repository and OID together through
+  scheduling, parent edges, structural markers, and display keys. Git row keys
+  are now `git:<repository>:<oid>`; full OID/detail fields retain their existing
+  representation. Projection revision 46 invalidates earlier row-key caches.
 
 Remaining work, in dependency order:
 
-1. Establish repository-qualified graph identity and a shared repository catalog.
+1. Establish a shared repository catalog and explicit Git resolution outcomes.
 2. Bind service windows, search, layout, and renderer requests to one snapshot.
 3. Move complete Activity assembly and presentation-tree ownership into project.
 4. Consolidate typed provider evidence, source lifecycle, and persistence

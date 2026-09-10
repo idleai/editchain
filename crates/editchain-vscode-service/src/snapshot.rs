@@ -144,7 +144,9 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 /// Revision 45 excludes every variant of a conflicted operation ID and uses
 /// strict operation decoding. Snapshots built with first-version admission
 /// must be rebuilt from the unchanged durable records.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 45;
+///
+/// Revision 46 qualifies Git graph and row keys by repository identity.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 46;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

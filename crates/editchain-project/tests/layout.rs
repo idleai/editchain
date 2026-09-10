@@ -277,6 +277,70 @@ fn graph_layout_topologically_sorts_git_commits() {
     }
 }
 
+#[test]
+fn shared_commit_oids_keep_repository_scoped_rows_and_edges() {
+    use editchain_core::{GitCommitKey, GitLink, GitLinkKind, RepositoryId};
+
+    let mut base = git_commit(1, &[]);
+    base.committed_at = 100;
+    let mut tip = git_commit(2, &[1]);
+    tip.committed_at = 1; // Ancestry must win even with inverted clocks.
+    let mut other_base = base.clone();
+    other_base.repository = RepositoryId(2);
+    let mut other_tip = tip.clone();
+    other_tip.repository = RepositoryId(2);
+    let source = msg(10, 1, 1, None);
+    let mut relation = msg(10, 2, 1, Some(source.id));
+    relation.tags = Tags::META | Tags::IMPORT;
+    relation.kind = OpKind::GitLink(GitLink {
+        source: source.id,
+        target_repo: other_base.repository,
+        target_oid: other_base.oid,
+        kind: GitLinkKind::BasedOn,
+    });
+    let mut projection = HistoryProjection::from_ops(vec![source.clone(), relation]);
+    projection.merge_git_commits(vec![
+        tip.clone(),
+        other_base.clone(),
+        base.clone(),
+        other_tip.clone(),
+    ]);
+    let nodes = projection.nodes();
+    let keys: std::collections::HashSet<_> = nodes.iter().map(HistoryNode::node_key).collect();
+    assert_eq!(
+        keys.len(),
+        nodes.len(),
+        "every row key must be unique across repositories"
+    );
+    for commit in [&base, &tip, &other_base, &other_tip] {
+        assert!(keys.contains(&commit.key().to_string()));
+    }
+    let layout = projection.layout_context(&nodes);
+    let edges = layout.edges_for_window(0, nodes.len());
+    for (child, parent) in [
+        (tip.key().to_string(), base.key().to_string()),
+        (other_tip.key().to_string(), other_base.key().to_string()),
+        (source.id.to_string(), other_base.key().to_string()),
+    ] {
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.child == child && edge.parent == parent),
+            "missing {child} -> {parent}"
+        );
+        assert!(layout.row_of.get(&child) < layout.row_of.get(&parent));
+    }
+    for edge in edges {
+        if let Some(child) = GitCommitKey::from_display_str(&edge.child) {
+            let parent = GitCommitKey::from_display_str(&edge.parent).unwrap();
+            assert_eq!(
+                child.repository, parent.repository,
+                "Git ancestry cannot cross repositories"
+            );
+        }
+    }
+}
+
 /// A projection built directly from ops must keep valid Git parent edges in
 /// `lifted_parent_keys` without any prior `merge_git_commits` call.
 #[test]
@@ -285,8 +349,8 @@ fn lifted_git_parent_edge_survives_direct_from_ops_projection() {
     // `from_ops` reduces them into `git.commits` at construction time.
     let parent_commit = git_commit(2, &[]);
     let child_commit = git_commit(3, &[2]);
-    let parent_key = parent_commit.oid.to_hex();
-    let child_key = child_commit.oid.to_hex();
+    let parent_key = parent_commit.key().to_string();
+    let child_key = child_commit.key().to_string();
 
     let projection = HistoryProjection::from_ops(vec![
         git_commit_op(1, 1, child_commit),
