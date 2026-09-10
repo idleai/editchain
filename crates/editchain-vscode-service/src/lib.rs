@@ -19,12 +19,11 @@ use serde as _;
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::fs::{self, File};
-use std::io::{self, Read as _};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use editchain_core::{
-    BlobRef, ContentId, GitOid, Op, OpId, OpKind, Payload, RepositoryId, ScopeRef, SessionId, Tags,
+    BlobRef, GitOid, Op, OpId, OpKind, Payload, RepositoryId, ScopeRef, SessionId, Tags,
 };
 use editchain_git::{
     commit_file_changes, open_repository, resolve_blob as resolve_git_blob, resolve_commit,
@@ -132,7 +131,8 @@ struct ExpandedChildRow {
     file_change: Option<FileChangeDto>,
 }
 
-pub use editchain_store::ChainReadStats;
+use editchain_store::BlobPreviewResolution;
+pub use editchain_store::{BlobReader as BlobResolver, BlobResolution, ChainReadStats};
 use editchain_store::{CanonicalChain, OpRecordLocation};
 
 /// Accepted operation identity paired with its authoritative record location.
@@ -246,162 +246,6 @@ impl OpenDiagnostics {
             ));
         }
         warnings
-    }
-}
-
-/// The outcome of resolving one blob reference against the durable store.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BlobResolution {
-    /// Verified content found; carries the bytes to hydrate inline.
-    Found(Vec<u8>),
-    /// No blob file exists for the reference.
-    Missing,
-    /// A blob file exists but failed declared-length or BLAKE3 validation.
-    Corrupt,
-    /// The reference cannot be addressed by the durable store.
-    Unresolvable,
-}
-
-/// Read-only resolver over a chain's durable blob store.
-///
-/// Blob files use the importer's durable
-/// `<chain>/blobs/<lowercase blake3 hex>` format. Full resolution validates
-/// declared length and BLAKE3; bounded row previews validate file length and
-/// defer full hashing until content is explicitly requested.
-#[derive(Debug, Clone)]
-pub struct BlobResolver {
-    /// The durable store directory; `None` when the chain has no `blobs/`
-    /// directory.
-    dir: Option<PathBuf>,
-}
-
-impl BlobResolver {
-    /// Open the blob store for a chain directory without creating it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an IO error if `chain_dir/blobs` exists but cannot be read.
-    pub fn open(chain_dir: &Path) -> io::Result<Self> {
-        let dir = chain_dir.join("blobs");
-        match fs::metadata(&dir) {
-            Ok(metadata) if metadata.is_dir() => Ok(Self { dir: Some(dir) }),
-            Ok(_) => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("blob path is not a directory: {}", dir.display()),
-            )),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self { dir: None }),
-            Err(error) => Err(error),
-        }
-    }
-
-    fn path_for(&self, hash: &[u8; 32]) -> Option<PathBuf> {
-        let filename = hex_string(hash).ok()?;
-        self.dir.as_ref().map(|dir| dir.join(filename))
-    }
-
-    fn get(&self, hash: &[u8; 32]) -> io::Result<Option<Vec<u8>>> {
-        let Some(path) = self.path_for(hash) else {
-            return Ok(None);
-        };
-        match fs::read(path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Resolve a blob reference, validating declared length and hash.
-    ///
-    /// Non-`Found` outcomes leave the caller's [`BlobRef`] untouched so legacy
-    /// chains with missing or corrupt blobs still open.
-    #[must_use]
-    pub fn resolve(&self, blob: &BlobRef) -> BlobResolution {
-        let Some(hash) = addressable_hash(blob.id) else {
-            return BlobResolution::Unresolvable;
-        };
-        match self.get(&hash) {
-            Ok(Some(bytes)) if blob_matches(&bytes, blob, hash) => BlobResolution::Found(bytes),
-            Ok(Some(_)) | Err(_) => BlobResolution::Corrupt,
-            Ok(None) => BlobResolution::Missing,
-        }
-    }
-
-    /// Resolve a full content-addressed payload when only its `ContentId` is
-    /// stored (as with `FileOp.base` / `FileOp.after`).
-    #[must_use]
-    fn resolve_content(&self, id: ContentId) -> Option<Vec<u8>> {
-        let hash = addressable_hash(id)?;
-        let bytes = self.get(&hash).ok().flatten()?;
-        (hash_raw(&bytes) == hash).then_some(bytes)
-    }
-
-    /// Read at most `limit` bytes for a display preview without hydrating or
-    /// hashing the complete payload.
-    ///
-    /// File length is checked against the reference up front. Full BLAKE3
-    /// validation remains deferred to [`Self::resolve`] when details/search
-    /// actually request the complete payload.
-    #[must_use]
-    fn preview(&self, blob: &BlobRef, limit: usize) -> BlobPreviewResolution {
-        let Some(hash) = addressable_hash(blob.id) else {
-            return BlobPreviewResolution::Unresolvable;
-        };
-        let Some(path) = self.path_for(&hash) else {
-            return BlobPreviewResolution::Missing;
-        };
-        let Ok(metadata) = fs::metadata(&path) else {
-            return if path.exists() {
-                BlobPreviewResolution::Corrupt
-            } else {
-                BlobPreviewResolution::Missing
-            };
-        };
-        if metadata.len() != u64::from(blob.len) {
-            return BlobPreviewResolution::Corrupt;
-        }
-        let Ok(file) = File::open(path) else {
-            return BlobPreviewResolution::Corrupt;
-        };
-        let mut bytes = Vec::with_capacity(limit);
-        let limit_u64 = u64::try_from(limit).unwrap_or(u64::MAX);
-        if file.take(limit_u64).read_to_end(&mut bytes).is_err() {
-            return BlobPreviewResolution::Corrupt;
-        }
-        BlobPreviewResolution::Found(bytes)
-    }
-}
-
-/// Outcome of a bounded, length-checked preview read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BlobPreviewResolution {
-    /// Prefix bytes found (possibly the complete short blob).
-    Found(Vec<u8>),
-    /// No blob file exists for the reference.
-    Missing,
-    /// The file exists but its metadata/read failed validation.
-    Corrupt,
-    /// The reference cannot be addressed by the durable store.
-    Unresolvable,
-}
-
-/// The full BLAKE3 hash the durable store can address, if the id uses one.
-///
-/// Blob files are keyed by the full 256-bit BLAKE3 hash, so truncated
-/// `Hash128` and node-local ids cannot be looked up and count as unresolved.
-#[must_use]
-fn addressable_hash(id: ContentId) -> Option<[u8; 32]> {
-    match id {
-        ContentId::Hash256(hash) => Some(hash),
-        ContentId::Hash128(_) | ContentId::Local { .. } => None,
-    }
-}
-
-/// Whether `bytes` match a blob reference's declared length and BLAKE3 hash.
-#[must_use]
-fn blob_matches(bytes: &[u8], blob: &BlobRef, hash: [u8; 32]) -> bool {
-    match usize::try_from(blob.len) {
-        Ok(declared) => declared == bytes.len() && hash_raw(bytes) == hash,
-        Err(_) => false,
     }
 }
 
@@ -4910,9 +4754,12 @@ mod tests {
     use super::*;
     use editchain_codec::frame::encode_op;
     use editchain_codec::page::{encode_page, Page};
-    use editchain_core::{ActorId, Clock, ImportOp, MessageOp, NodeId, ParentSet, PathId};
+    use editchain_core::{
+        ActorId, Clock, ContentId, ImportOp, MessageOp, NodeId, ParentSet, PathId,
+    };
     use editchain_import::BlobSink as _;
     use editchain_import::FsBlobSink;
+    use std::fs;
 
     /// 2^53 + 1 — the first integer JavaScript's IEEE-754 doubles round.
     const OVER_2_53: u64 = 9_007_199_254_740_993;

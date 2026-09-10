@@ -615,6 +615,7 @@ dependencies = [
  "editchain-codec",
  "editchain-core",
  "editchain-project",
+ "editchain-store",
  "process-wrap",
  "proptest",
  "serde",
@@ -673,6 +674,7 @@ dependencies = [
 name = "editchain-store"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "editchain-codec",
  "editchain-core",
  "serde",

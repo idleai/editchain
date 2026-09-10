@@ -11,6 +11,7 @@
 
 mod common;
 
+use editchain_store as _;
 use std::path::{Path, PathBuf};
 
 use blake3 as _;

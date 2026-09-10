@@ -1,10 +1,12 @@
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use editchain_codec::frame::{encode_op, encoded_op_len};
 use editchain_core::payload;
 use editchain_core::{Admission, BlobRef, ContentId, NodeId, NoteRelationship, Op, OpKind, OpSet};
+
+use editchain_store::durable::{atomic_write, sync_parent_dir};
 
 use crate::error::ImportError;
 use crate::ids::hash_raw;
@@ -450,149 +452,14 @@ impl CursorStore for MemoryCursorStore {
     }
 }
 
-/// A filesystem-backed, content-addressed blob sink.
-///
-/// Blobs are stored under a directory as one file per unique BLAKE3 hash
-/// (`<dir>/<hex-hash>`), deduplicated by content: storing identical bytes
-/// twice writes only one file. Writes are atomic (temp file + rename) so a
-/// crash never leaves a truncated blob readable under its final name, and the
-/// directory survives process restarts, giving durable storage for payloads
-/// that spill past [`INLINE_LIMIT`].
-#[derive(Debug, Clone)]
-pub struct FsBlobSink {
-    /// Directory holding the blob files.
-    dir: PathBuf,
-}
-
-impl FsBlobSink {
-    /// Open (creating if needed) a blob directory.
-    ///
-    /// # Errors
-    ///
-    /// Returns an IO error if the directory cannot be created.
-    pub fn new(dir: impl Into<PathBuf>) -> io::Result<Self> {
-        let dir = dir.into();
-        fs::create_dir_all(&dir)?;
-        Ok(Self { dir })
-    }
-
-    /// Open an existing blob directory for reading without creating it.
-    ///
-    /// Returns `Ok(None)` when no blob directory exists yet (the common case
-    /// for chains that predate durable blobs), so read paths never mutate
-    /// storage.
-    ///
-    /// # Errors
-    ///
-    /// Returns an IO error if the path exists but cannot be read.
-    pub fn open_read_only(dir: impl Into<PathBuf>) -> io::Result<Option<Self>> {
-        let dir = dir.into();
-        match fs::metadata(&dir) {
-            Ok(meta) if meta.is_dir() => Ok(Some(Self { dir })),
-            Ok(_) => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("blob path is not a directory: {}", dir.display()),
-            )),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Directory containing the blob files.
-    #[must_use]
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    /// Path a blob with the given hash is stored at.
-    #[must_use]
-    pub fn path_for(&self, hash: &[u8; 32]) -> PathBuf {
-        self.dir.join(hex_encode(hash))
-    }
-
-    /// Read a blob back by its BLAKE3 hash.
-    ///
-    /// Returns `Ok(None)` when no blob with that hash has been stored.
-    ///
-    /// # Errors
-    ///
-    /// Returns an IO error if the blob file exists but cannot be read.
-    pub fn get(&self, hash: &[u8; 32]) -> io::Result<Option<Vec<u8>>> {
-        match fs::read(self.path_for(hash)) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Number of distinct blobs stored.
-    ///
-    /// # Errors
-    ///
-    /// Returns an IO error if the blob directory cannot be read.
-    pub fn len(&self) -> io::Result<usize> {
-        fs::read_dir(&self.dir)?.try_fold(0usize, |count, entry| {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                Ok(count.saturating_add(1))
-            } else {
-                Ok(count)
-            }
-        })
-    }
-
-    /// Whether no blobs are stored.
-    ///
-    /// # Errors
-    ///
-    /// Returns an IO error if the blob directory cannot be read.
-    pub fn is_empty(&self) -> io::Result<bool> {
-        self.len().map(|len| len == 0)
-    }
-}
+/// The shared filesystem blob store, retained under the importer API name.
+pub use editchain_store::BlobStore as FsBlobSink;
 
 impl BlobSink for FsBlobSink {
     fn store_blob(&mut self, data: &[u8]) -> Result<(), ImportError> {
-        let hash = hash_raw(data);
-        let path = self.path_for(&hash);
-        match fs::File::open(&path) {
-            Ok(mut file) => {
-                if !same_blob_bytes(&mut file, data)? {
-                    return Err(ImportError::BlobSink(format!(
-                        "existing blob {} does not match its content address",
-                        path.display()
-                    )));
-                }
-                return Ok(());
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(ImportError::BlobSink(format!(
-                    "opening blob {}: {error}",
-                    path.display()
-                )))
-            }
-        }
-        atomic_write(&path, data)
-            .map_err(|e| ImportError::BlobSink(format!("storing blob {}: {e}", path.display())))
+        self.write(data)
+            .map_err(|error| ImportError::BlobSink(error.to_string()))
     }
-}
-
-fn same_blob_bytes(file: &mut fs::File, expected: &[u8]) -> io::Result<bool> {
-    if file.metadata()?.len() != u64::try_from(expected.len()).map_err(io::Error::other)? {
-        return Ok(false);
-    }
-    let mut buffer = [0; 8192];
-    for chunk in expected.chunks(buffer.len()) {
-        let target = buffer
-            .get_mut(..chunk.len())
-            .ok_or_else(|| io::Error::other("blob comparison range"))?;
-        file.read_exact(target)?;
-        if target != chunk {
-            return Ok(false);
-        }
-    }
-    Ok(file.read(&mut buffer)? == 0)
 }
 
 /// A filesystem-backed cursor store persisting one JSON file per source key.
@@ -887,80 +754,6 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     out
-}
-
-/// Atomically write `data` to `path` via a same-directory temp file + rename.
-///
-/// The rename makes the final name appear only with complete contents; a crash
-/// mid-write leaves at worst a stale temp file. After the rename the parent
-/// directory is synced, so the new directory entry is durable before this
-/// returns — otherwise a crash could lose the rename even though the file
-/// bytes themselves were synced.
-///
-/// # Errors
-///
-/// Returns an IO error if the temp file cannot be written or renamed, or the
-/// parent directory cannot be synced.
-fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        file.write_all(data)?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    sync_parent_dir(path)
-}
-
-/// Fsync `path`'s parent directory so a rename/create inside it survives a
-/// crash (directory entries are metadata and are not covered by the file's own
-/// `sync_all`).
-///
-/// On Unix the directory is opened read-only and fsynced. On Windows opening a
-/// directory requires `FILE_FLAG_BACKUP_SEMANTICS`. On other platforms
-/// directory fsync is not available portably and the call degrades to a no-op
-/// (best-effort durability).
-///
-/// # Errors
-///
-/// Returns an IO error if the parent directory cannot be opened or synced.
-#[cfg(unix)]
-fn sync_parent_dir(path: &Path) -> io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("cannot sync parent of {}", path.display()),
-        )
-    })?;
-    fs::File::open(parent)?.sync_all()
-}
-
-/// Windows variant of [`sync_parent_dir`]: directories open with
-/// `FILE_FLAG_BACKUP_SEMANTICS` (0x02000000) and can then be fsynced.
-#[cfg(windows)]
-fn sync_parent_dir(path: &Path) -> io::Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("cannot sync parent of {}", path.display()),
-        )
-    })?;
-    fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(0x0200_0000)
-        .open(parent)?
-        .sync_all()
-}
-
-/// Fallback for platforms without directory fsync: best-effort no-op.
-#[cfg(not(any(unix, windows)))]
-fn sync_parent_dir(_path: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

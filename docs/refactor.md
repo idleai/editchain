@@ -373,6 +373,19 @@ Completed increments:
   (0.49–0.51 s), about 18%; peak RSS stayed around 66 MiB. These measurements
   include fixture creation and assertions and do not measure Codex helper work.
 
+The crate-ownership follow-up now centralizes durable blob storage in
+`editchain-store`. `BlobStore` owns the content-addressed paths, atomic writes,
+replay checks, and verified reads; `BlobReader` retains availability observed at
+open and performs either full verification or explicitly length-checked bounded
+previews. Import keeps its checkpoint policy and `BlobSink` adapter; the viewer
+keeps its hydration and preview policy. Existing `FsBlobSink` and `BlobResolver`
+API names remain available as re-exports. Shared atomic publication also serves
+the import checkpoint journal without moving checkpoint ownership out of import.
+The on-disk blob layout, imported operation bytes, snapshot revision, and wire
+protocol are unchanged. The full lint suite and shared-store reader/writer
+contracts pass, including missing directories, corrupt bytes, unsupported
+addresses, preview limits, and idempotent writes.
+
 The planned refactor increments are complete. EC02 and historical operations
 remain readable; the documented protocol, repository-qualified row keys, and
 pre-1.0 Rust API changes require coordinated consumers. Compatibility readers

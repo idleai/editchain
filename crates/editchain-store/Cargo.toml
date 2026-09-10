@@ -13,6 +13,7 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
+blake3 = "1"
 editchain-core = { path = "../editchain-core" }
 editchain-codec = { path = "../editchain-codec" }
 serde.workspace = true

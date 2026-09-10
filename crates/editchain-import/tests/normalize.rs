@@ -3,6 +3,7 @@
 use blake3 as _;
 use editchain_codec as _;
 use editchain_project as _;
+use editchain_store as _;
 use process_wrap as _;
 use proptest as _;
 use serde as _;

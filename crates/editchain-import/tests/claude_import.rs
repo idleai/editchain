@@ -5,6 +5,7 @@
     reason = "integration fixtures require setup and import success"
 )]
 
+use editchain_store as _;
 use std::io::Write as _;
 use std::path::Path;
 use time as _;

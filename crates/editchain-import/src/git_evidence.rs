@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use editchain_core::{ContentId, NodeId, Op, OpKind, Payload, ScopeRef, SessionId};
+use editchain_core::{NodeId, Op, OpKind, Payload, ScopeRef, SessionId};
 use serde_json::Value;
 
 use crate::ids::derive_session_id;
@@ -435,16 +435,12 @@ pub fn payload_bytes<'a>(
     match payload {
         Payload::Empty => None,
         Payload::Inline(bytes) => Some(Cow::Borrowed(bytes)),
-        Payload::Blob(blob) => {
-            let ContentId::Hash256(hash) = blob.id else {
-                return None;
-            };
-            let bytes = blobs?.get(&hash).ok()??;
-            if usize::try_from(blob.len).ok()? != bytes.len() || crate::hash_raw(&bytes) != hash {
-                return None;
-            }
-            Some(Cow::Owned(bytes))
-        }
+        Payload::Blob(blob) => match blobs?.resolve(blob) {
+            editchain_store::BlobResolution::Found(bytes) => Some(Cow::Owned(bytes)),
+            editchain_store::BlobResolution::Missing
+            | editchain_store::BlobResolution::Corrupt
+            | editchain_store::BlobResolution::Unresolvable => None,
+        },
     }
 }
 
