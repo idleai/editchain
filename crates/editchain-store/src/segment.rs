@@ -2,8 +2,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use editchain_codec::page::{encode_page, Page};
-use editchain_codec::scan::{PageScanner, ScanErrorKind, ScanItem};
+use crate::format::scan::{PageScanner, ScanErrorKind, ScanItem};
+use crate::format::{encode_page, Page};
 
 /// Directory layout for segment storage.
 ///
@@ -243,7 +243,7 @@ fn sync_parent_dir(_path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use editchain_codec::page::decode_page;
+    use crate::format::decode_page;
 
     #[test]
     fn append_page_creates_and_persists_a_new_segment() {

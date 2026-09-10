@@ -287,8 +287,8 @@ mod tests {
     use super::*;
     use crate::commands::{Cli, Commands, ImportCommand};
     use clap::Parser;
-    use editchain_codec::frame::decode_op;
     use editchain_core::Op;
+    use editchain_store::format::decode_op;
     use std::collections::HashSet;
 
     fn import_args(args: &[&str]) -> Option<ImportCommand> {

@@ -11,7 +11,6 @@ use std::path::Path;
 use time as _;
 
 use blake3 as _;
-use editchain_codec::frame::encode_op;
 use editchain_core::{NoteRelationship, Op, OpId, OpKind, ParentSet, Payload, Tags};
 use editchain_import::claude_code::reader::read_session_file;
 use editchain_import::claude_code::topology::CLAUDE_NORMALIZATION_VERSION;
@@ -25,6 +24,7 @@ use editchain_import::sink::{
     MemoryOpSink, INLINE_LIMIT,
 };
 use editchain_project::HistoryProjection;
+use editchain_store::format::encode_op;
 use process_wrap as _;
 use proptest as _;
 use serde as _;

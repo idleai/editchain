@@ -26,7 +26,6 @@
 mod common;
 
 use blake3 as _;
-use editchain_codec as _;
 use editchain_store as _;
 use process_wrap as _;
 use proptest as _;

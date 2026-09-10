@@ -109,8 +109,8 @@ fn reconciliation_ops(chain: &Path, imported: &[Op]) -> Result<Vec<Op>, std::io:
 mod tests {
     use super::*;
     use crate::segment::SegmentStore;
-    use editchain_codec::frame::encode_op;
-    use editchain_codec::page::Page;
+    use editchain_store::format::encode_op;
+    use editchain_store::format::Page;
 
     #[test]
     fn reconciliation_and_viewer_share_conflict_admission() {

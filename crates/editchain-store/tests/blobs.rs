@@ -4,9 +4,11 @@ use std::error::Error;
 use std::fmt::Debug;
 use std::fs;
 
-use editchain_codec as _;
+use crc as _;
 use editchain_core::{BlobRef, ContentId};
 use editchain_store::{BlobPreviewResolution, BlobReader, BlobResolution, BlobStore};
+use postcard as _;
+use proptest as _;
 use serde as _;
 
 type TestResult = Result<(), Box<dyn Error>>;

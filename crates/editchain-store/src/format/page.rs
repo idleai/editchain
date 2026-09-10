@@ -7,10 +7,10 @@ use postcard as _;
 use proptest as _;
 use serde as _;
 
-use crate::scan::{PageScanner, ScanErrorKind, ScanItem, MAX_RECORD_BYTES};
+use super::scan::{PageScanner, ScanErrorKind, ScanItem, MAX_RECORD_BYTES};
 
 /// Page magic bytes — "EC" + version 02.
-pub const PAGE_MAGIC: [u8; 4] = [0x45, 0x43, 0x30, 0x32]; // "EC02"
+pub(super) const PAGE_MAGIC: [u8; 4] = [0x45, 0x43, 0x30, 0x32]; // "EC02"
 
 /// A framed page of operations.
 ///
@@ -100,8 +100,8 @@ impl std::error::Error for PageEncodeError {}
 /// Decode a page from bytes.
 ///
 /// Returns the first page, retaining complete records before an incomplete
-/// trailing write. Invalid and unsupported input returns `None`. Use
-/// [`PageScanner`] when all pages, locations, or diagnostics are needed.
+/// trailing write. Invalid and unsupported input returns `None`. The store
+/// uses its bounded scanner when all pages, locations, or diagnostics are needed.
 #[must_use]
 pub fn decode_page(bytes: &[u8]) -> Option<Page> {
     let mut scanner = PageScanner::new(bytes);

@@ -6,7 +6,7 @@ use serde as _;
 
 use editchain_core::Op;
 
-use crate::page::PAGE_MAGIC;
+use super::page::PAGE_MAGIC;
 
 /// Encode an operation into a binary frame using postcard.
 ///
@@ -46,7 +46,7 @@ pub fn decode_op(bytes: &[u8]) -> Result<Op, postcard::Error> {
 // ---------------------------------------------------------------------------
 
 /// Magic bytes for EC03 frames.
-pub const EC03_MAGIC: [u8; 4] = [0x45, 0x43, 0x30, 0x33]; // "EC03"
+const EC03_MAGIC: [u8; 4] = [0x45, 0x43, 0x30, 0x33]; // "EC03"
 
 /// Current format version.
 pub const EC03_FORMAT_VERSION: u16 = 1;

@@ -1,6 +1,6 @@
 //! Borrowed EC02 page and record scanning shared by all segment readers.
 
-use crate::page::PAGE_MAGIC;
+use super::page::PAGE_MAGIC;
 
 /// Largest record written or accepted by the current EC02 implementation.
 ///
@@ -10,7 +10,7 @@ pub const MAX_RECORD_BYTES: u32 = 64 * 1024 * 1024;
 
 /// A complete page header or record borrowed from a segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScanItem<'a> {
+pub(crate) enum ScanItem<'a> {
     /// A page begins at this byte offset in the supplied segment.
     Page {
         /// Page sequence encoded in the header.
@@ -24,22 +24,22 @@ pub enum ScanItem<'a> {
 
 /// A complete record and its exact source location.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecordRef<'a> {
+pub(crate) struct RecordRef<'a> {
     /// Page sequence owning this record.
-    pub page_sequence: u32,
+    pub(crate) page_sequence: u32,
     /// Offset of the record length prefix.
-    pub offset: usize,
+    pub(crate) offset: usize,
     /// Offset of the encoded operation, after length and flags.
-    pub data_offset: usize,
+    pub(crate) data_offset: usize,
     /// Record metadata flags, preserved independently of the payload.
-    pub flags: u8,
+    pub(crate) flags: u8,
     /// Complete encoded operation bytes.
-    pub data: &'a [u8],
+    pub(crate) data: &'a [u8],
 }
 
 /// Why a scanner stopped before clean EOF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScanErrorKind {
+pub(crate) enum ScanErrorKind {
     /// A final page header or record was not fully written.
     IncompleteTail,
     /// Bytes where the first page header was expected have an invalid magic.
@@ -52,11 +52,11 @@ pub enum ScanErrorKind {
 
 /// The first unread item and the reason it could not be consumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScanError {
+pub(crate) struct ScanError {
     /// Offset at which the incomplete, invalid, or unsupported item begins.
-    pub offset: usize,
+    pub(crate) offset: usize,
     /// Structured scanner outcome.
-    pub kind: ScanErrorKind,
+    pub(crate) kind: ScanErrorKind,
 }
 
 impl std::fmt::Display for ScanError {
@@ -74,7 +74,7 @@ impl std::error::Error for ScanError {}
 /// Callers may retain previously yielded complete records after an incomplete
 /// final write; corruption and unsupported formats are separate outcomes.
 #[derive(Debug)]
-pub struct PageScanner<'a> {
+pub(crate) struct PageScanner<'a> {
     bytes: &'a [u8],
     offset: usize,
     page_sequence: Option<u32>,
@@ -84,7 +84,7 @@ pub struct PageScanner<'a> {
 impl<'a> PageScanner<'a> {
     /// Start scanning at the first page header in a segment.
     #[must_use]
-    pub const fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) const fn new(bytes: &'a [u8]) -> Self {
         Self {
             bytes,
             offset: 0,
@@ -94,8 +94,9 @@ impl<'a> PageScanner<'a> {
     }
 
     /// Bytes consumed through the last complete header or record.
+    #[cfg(test)]
     #[must_use]
-    pub const fn consumed(&self) -> usize {
+    pub(crate) const fn consumed(&self) -> usize {
         self.offset
     }
 

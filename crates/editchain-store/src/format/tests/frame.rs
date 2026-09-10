@@ -5,7 +5,7 @@ use postcard as _;
 use proptest as _;
 use serde as _;
 
-use editchain_codec::frame::{
+use crate::format::{
     decode_ec03, decode_op, detect_format, encode_ec03, encode_op, Ec03Frame, FrameFormat,
     EC03_FORMAT_VERSION,
 };

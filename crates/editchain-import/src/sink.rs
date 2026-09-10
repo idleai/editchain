@@ -2,9 +2,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use editchain_codec::frame::{encode_op, encoded_op_len};
 use editchain_core::payload;
 use editchain_core::{Admission, BlobRef, ContentId, NodeId, NoteRelationship, Op, OpKind, OpSet};
+use editchain_store::format::{encode_op, encoded_op_len};
 
 use editchain_store::durable::{atomic_write, sync_parent_dir};
 
@@ -307,7 +307,7 @@ impl OpSink for MemoryOpSink {
     fn accept_op(&mut self, op: &Op) -> Result<Admission, ImportError> {
         let length = encoded_op_len(op).map_err(|error| ImportError::OpSink(error.to_string()))?;
         let bytes = u64::try_from(length).map_err(io::Error::other)?;
-        if bytes > u64::from(editchain_codec::scan::MAX_RECORD_BYTES) {
+        if bytes > u64::from(editchain_store::format::MAX_RECORD_BYTES) {
             return Err(ImportError::OpSink(
                 "encoded operation exceeds the 64 MiB record limit".into(),
             ));

@@ -3,8 +3,8 @@ use std::fs::{self, File};
 use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::path::Path;
 
-use editchain_codec::frame::{decode_op, encode_op};
-use editchain_codec::scan::{PageScanner, ScanErrorKind, ScanItem, MAX_RECORD_BYTES};
+use crate::format::scan::{PageScanner, ScanErrorKind, ScanItem, MAX_RECORD_BYTES};
+use crate::format::{decode_op, encode_op};
 use editchain_core::{Admission, Op, OpId, OpSet};
 
 use crate::segment::segment_sequences;

@@ -6,8 +6,8 @@ use postcard as _;
 use proptest as _;
 use serde as _;
 
-use editchain_codec::page::{decode_page, encode_page, Page};
-use editchain_codec::scan::{PageScanner, ScanErrorKind, ScanItem, MAX_RECORD_BYTES};
+use crate::format::scan::{PageScanner, ScanErrorKind, ScanItem, MAX_RECORD_BYTES};
+use crate::format::{decode_page, encode_page, Page};
 
 #[test]
 #[expect(
@@ -65,7 +65,7 @@ fn scans_frozen_concatenated_pages_with_exact_offsets_and_flags() {
                 sequence: 7,
                 offset: 0
             },
-            ScanItem::Record(editchain_codec::scan::RecordRef {
+            ScanItem::Record(crate::format::scan::RecordRef {
                 page_sequence: 7,
                 offset: 8,
                 data_offset: 13,
@@ -76,7 +76,7 @@ fn scans_frozen_concatenated_pages_with_exact_offsets_and_flags() {
                 sequence: 8,
                 offset: 17
             },
-            ScanItem::Record(editchain_codec::scan::RecordRef {
+            ScanItem::Record(crate::format::scan::RecordRef {
                 page_sequence: 8,
                 offset: 25,
                 data_offset: 30,
@@ -136,6 +136,6 @@ fn distinguishes_invalid_unsupported_and_oversized_input() {
     page.magic = *b"bad!";
     assert_eq!(
         encode_page(&page),
-        Err(editchain_codec::page::PageEncodeError::InvalidMagic)
+        Err(crate::format::PageEncodeError::InvalidMagic)
     );
 }

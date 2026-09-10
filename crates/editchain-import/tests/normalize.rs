@@ -1,7 +1,6 @@
 //! Normalization tests for Claude Code envelopes.
 
 use blake3 as _;
-use editchain_codec as _;
 use editchain_project as _;
 use editchain_store as _;
 use process_wrap as _;

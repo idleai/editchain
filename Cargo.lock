@@ -564,17 +564,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
-name = "editchain-codec"
-version = "0.1.0"
-dependencies = [
- "crc",
- "editchain-core",
- "postcard",
- "proptest",
- "serde",
-]
-
-[[package]]
 name = "editchain-core"
 version = "0.1.0"
 dependencies = [
@@ -612,7 +601,6 @@ name = "editchain-import"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "editchain-codec",
  "editchain-core",
  "editchain-project",
  "editchain-store",
@@ -641,7 +629,6 @@ dependencies = [
  "clap",
  "ctrlc",
  "dirs",
- "editchain-codec",
  "editchain-core",
  "editchain-git",
  "editchain-import",
@@ -675,8 +662,10 @@ name = "editchain-store"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "editchain-codec",
+ "crc",
  "editchain-core",
+ "postcard",
+ "proptest",
  "serde",
  "tempfile",
 ]
@@ -686,7 +675,6 @@ name = "editchain-vscode-service"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "editchain-codec",
  "editchain-core",
  "editchain-git",
  "editchain-import",

@@ -3,6 +3,8 @@
 mod blob;
 /// Atomic publication and directory synchronization for durable metadata.
 pub mod durable;
+/// Operation frames and durable page formats used by storage writers/readers.
+pub mod format;
 mod reader;
 mod segment;
 

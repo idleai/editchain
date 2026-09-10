@@ -10,7 +10,6 @@
 
 // Crate-level dependency markers (used by Cargo for feature resolution).
 use blake3 as _;
-use editchain_codec as _;
 use editchain_git as _;
 use editchain_import as _;
 use editchain_index as _;
@@ -40,15 +39,15 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-fn write_page(chain_dir: &Path, page: &editchain_codec::page::Page) {
+fn write_page(chain_dir: &Path, page: &editchain_store::format::Page) {
     write_page_sequence(chain_dir, 0, page);
 }
 
-fn write_page_sequence(chain_dir: &Path, sequence: u32, page: &editchain_codec::page::Page) {
+fn write_page_sequence(chain_dir: &Path, sequence: u32, page: &editchain_store::format::Page) {
     std::fs::create_dir_all(chain_dir).expect("create chain dir");
     std::fs::write(
         chain_dir.join(format!("{sequence:06}.eclog")),
-        editchain_codec::page::encode_page(page).expect("encode page"),
+        editchain_store::format::encode_page(page).expect("encode page"),
     )
     .expect("write segment");
 }
@@ -72,9 +71,9 @@ fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() 
     let chain_dir = tmp.path().join(".editchain");
     let first = msg_op(41, 1, b"snapshot first");
     let second = msg_op(41, 2, b"snapshot second");
-    let mut page = editchain_codec::page::Page::new(0);
-    page.add_record(0, editchain_codec::frame::encode_op(&first).unwrap());
-    page.add_record(0, editchain_codec::frame::encode_op(&second).unwrap());
+    let mut page = editchain_store::format::Page::new(0);
+    page.add_record(0, editchain_store::format::encode_op(&first).unwrap());
+    page.add_record(0, editchain_store::format::encode_op(&second).unwrap());
     write_page(&chain_dir, &page);
 
     // The prepared snapshot must serve the same fixed Activity view as the
@@ -200,8 +199,8 @@ fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() 
     assert_eq!(open_body["render_snapshot"], "hit");
 
     let third = msg_op(41, 3, b"snapshot invalidation");
-    let mut appended = editchain_codec::page::Page::new(1);
-    appended.add_record(0, editchain_codec::frame::encode_op(&third).unwrap());
+    let mut appended = editchain_store::format::Page::new(1);
+    appended.add_record(0, editchain_store::format::encode_op(&third).unwrap());
     write_page_sequence(&chain_dir, 1, &appended);
     let stale_search = server
         .handle(&Request {
@@ -271,8 +270,8 @@ fn recovered_blob_invalidates_cached_rows_and_lazy_search_without_a_chain_append
         panic!("message fixture");
     };
     message.content = Payload::Blob(blob);
-    let mut page = editchain_codec::page::Page::new(0);
-    page.add_record(0, editchain_codec::frame::encode_op(&op).unwrap());
+    let mut page = editchain_store::format::Page::new(0);
+    page.add_record(0, editchain_store::format::encode_op(&op).unwrap());
     write_page(&chain, &page);
     let before = prepare_render_snapshot(tmp.path(), Path::new(".editchain")).unwrap();
     let mut server = editchain_vscode_service::Server::new();
@@ -315,8 +314,8 @@ fn invalid_snapshot_offsets_fall_back_to_authoritative_rows() {
     let tmp = tempfile::tempdir().unwrap();
     let chain = tmp.path().join(".editchain");
     let op = msg_op(41, 1, b"authoritative row");
-    let mut page = editchain_codec::page::Page::new(0);
-    page.add_record(0, editchain_codec::frame::encode_op(&op).unwrap());
+    let mut page = editchain_store::format::Page::new(0);
+    page.add_record(0, editchain_store::format::encode_op(&op).unwrap());
     write_page(&chain, &page);
     let report = prepare_render_snapshot(tmp.path(), Path::new(".editchain")).unwrap();
     let offsets_path = report.path.join("rows.offsets");
@@ -484,9 +483,9 @@ fn imported_agent_edit_rows_materialize_recorded_snippets_without_fabricating_fi
             ),
         }),
     };
-    let mut page = editchain_codec::page::Page::new(0);
-    page.add_record(0, editchain_codec::frame::encode_op(&raw).unwrap());
-    page.add_record(0, editchain_codec::frame::encode_op(&edit).unwrap());
+    let mut page = editchain_store::format::Page::new(0);
+    page.add_record(0, editchain_store::format::encode_op(&raw).unwrap());
+    page.add_record(0, editchain_store::format::encode_op(&edit).unwrap());
     write_page(&chain_dir, &page);
 
     let mut server = editchain_vscode_service::Server::new();
@@ -611,9 +610,9 @@ fn agent_edit_uses_exact_session_git_baseline_when_available() {
             kind: GitLinkKind::BasedOn,
         }),
     };
-    let mut page = editchain_codec::page::Page::new(0);
+    let mut page = editchain_store::format::Page::new(0);
     for op in [&raw, &edit, &link] {
-        page.add_record(0, editchain_codec::frame::encode_op(op).unwrap());
+        page.add_record(0, editchain_store::format::encode_op(op).unwrap());
     }
     write_page(&chain_dir, &page);
 
@@ -754,9 +753,9 @@ fn legacy_codex_multi_file_record_recovers_every_path_from_raw_evidence() {
             content: Payload::Inline(b"src/a.rs".to_vec()),
         }),
     };
-    let mut page = editchain_codec::page::Page::new(0);
+    let mut page = editchain_store::format::Page::new(0);
     for op in [&raw, &legacy_file, &legacy_path] {
-        page.add_record(0, editchain_codec::frame::encode_op(op).unwrap());
+        page.add_record(0, editchain_store::format::encode_op(op).unwrap());
     }
     write_page(&chain_dir, &page);
 
@@ -1030,9 +1029,9 @@ fn open_resolves_exact_session_base_outside_current_head_history() {
             kind: GitLinkKind::BasedOn,
         }),
     };
-    let mut page = editchain_codec::page::Page::new(0);
-    page.add_record(0, editchain_codec::frame::encode_op(&source).unwrap());
-    page.add_record(0, editchain_codec::frame::encode_op(&link_record).unwrap());
+    let mut page = editchain_store::format::Page::new(0);
+    page.add_record(0, editchain_store::format::encode_op(&source).unwrap());
+    page.add_record(0, editchain_store::format::encode_op(&link_record).unwrap());
     write_page(&repo.join(".editchain"), &page);
 
     let workspace = Workspace::open(repo.to_str().unwrap(), ".editchain").unwrap();
@@ -1118,8 +1117,8 @@ fn op_identifiers_above_2_53_round_trip_exactly_through_window_details_and_find(
     // return the same exact strings inside an Ok envelope.
     let tmp = tempfile::tempdir().expect("tempdir");
     let chain_dir = tmp.path().join(".editchain");
-    let mut page = editchain_codec::page::Page::new(0);
-    page.add_record(0, editchain_codec::frame::encode_op(&big_op).unwrap());
+    let mut page = editchain_store::format::Page::new(0);
+    page.add_record(0, editchain_store::format::encode_op(&big_op).unwrap());
     write_page(&chain_dir, &page);
     let mut server = editchain_vscode_service::Server::new();
     let open = server
@@ -1158,9 +1157,9 @@ fn find_in_history_protocol_path_resolves_visible_rows_and_reports_truncation() 
     let chain_dir = tmp.path().join(".editchain");
     let first = msg_op(41, 1, b"needle-fi chain row one");
     let second = msg_op(41, 2, b"needle-fi chain row two");
-    let mut page = editchain_codec::page::Page::new(0);
-    page.add_record(0, editchain_codec::frame::encode_op(&first).unwrap());
-    page.add_record(0, editchain_codec::frame::encode_op(&second).unwrap());
+    let mut page = editchain_store::format::Page::new(0);
+    page.add_record(0, editchain_store::format::encode_op(&first).unwrap());
+    page.add_record(0, editchain_store::format::encode_op(&second).unwrap());
     write_page(&chain_dir, &page);
 
     let mut server = editchain_vscode_service::Server::new();
@@ -1242,8 +1241,8 @@ fn find_in_history_distinguishes_colliding_operation_and_git_ids() {
     // The first synthetic Git id follows the one stored operation: 0:0:1.
     // That is also a valid persisted operation id, not a reserved namespace.
     let message = msg_op(0, 1, b"initial collisionneedle");
-    let mut page = editchain_codec::page::Page::new(0);
-    page.add_record(0, editchain_codec::frame::encode_op(&message).unwrap());
+    let mut page = editchain_store::format::Page::new(0);
+    page.add_record(0, editchain_store::format::encode_op(&message).unwrap());
     write_page(&repo.join(".editchain"), &page);
 
     let mut server = editchain_vscode_service::Server::new();
@@ -1598,11 +1597,11 @@ fn read_frame(reader: &mut impl Read) -> Vec<u8> {
 fn get_window_geometry_identical_across_independent_processes() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let chain_dir = tmp.path().join("chain");
-    let mut page = editchain_codec::page::Page::new(0);
+    let mut page = editchain_store::format::Page::new(0);
     for op in sensitive_chain_ops() {
         page.add_record(
             0,
-            editchain_codec::frame::encode_op(&op).expect("encode op"),
+            editchain_store::format::encode_op(&op).expect("encode op"),
         );
     }
     write_page(&chain_dir, &page);
@@ -1690,10 +1689,10 @@ fn get_window_geometry_identical_across_independent_processes() {
 fn stdio_refresh_replaces_snapshot_and_rejects_old_coordinates() {
     let tmp = tempfile::tempdir().unwrap();
     let chain_dir = tmp.path().join(".editchain");
-    let mut page = editchain_codec::page::Page::new(0);
+    let mut page = editchain_store::format::Page::new(0);
     page.add_record(
         0,
-        editchain_codec::frame::encode_op(&msg_op(51, 1, b"snapshot first")).unwrap(),
+        editchain_store::format::encode_op(&msg_op(51, 1, b"snapshot first")).unwrap(),
     );
     write_page(&chain_dir, &page);
     assert!(
@@ -1725,10 +1724,10 @@ fn stdio_refresh_replaces_snapshot_and_rejects_old_coordinates() {
     }});
     let pinned = request(old_window.clone());
 
-    let mut appended = editchain_codec::page::Page::new(1);
+    let mut appended = editchain_store::format::Page::new(1);
     appended.add_record(
         0,
-        editchain_codec::frame::encode_op(&msg_op(51, 2, b"snapshot appended")).unwrap(),
+        editchain_store::format::encode_op(&msg_op(51, 2, b"snapshot appended")).unwrap(),
     );
     write_page_sequence(&chain_dir, 1, &appended);
     let stale = request(serde_json::json!({"FindInHistory": {
@@ -2085,7 +2084,7 @@ fn service_path_compaction_preserves_echo_and_outcome_metadata() {
             content: Payload::Inline(b"done".to_vec()),
         }),
     };
-    let mut page = editchain_codec::page::Page::new(0);
+    let mut page = editchain_store::format::Page::new(0);
     for op in [
         &echo_call,
         &echo_call_msg,
@@ -2096,7 +2095,7 @@ fn service_path_compaction_preserves_echo_and_outcome_metadata() {
         &success_item,
         &success_tool,
     ] {
-        page.add_record(0, editchain_codec::frame::encode_op(op).expect("encode"));
+        page.add_record(0, editchain_store::format::encode_op(op).expect("encode"));
     }
     write_page(&chain_dir, &page);
 
@@ -2182,9 +2181,9 @@ fn service_path_compaction_preserves_childless_output_rows_and_blob_echoes() {
         "[external_agent_tool_result] blob",
     );
 
-    let mut page = editchain_codec::page::Page::new(0);
+    let mut page = editchain_store::format::Page::new(0);
     for op in [&output, &blob_echo, &blob_echo_msg] {
-        page.add_record(0, editchain_codec::frame::encode_op(op).expect("encode"));
+        page.add_record(0, editchain_store::format::encode_op(op).expect("encode"));
     }
     write_page(&chain_dir, &page);
 
@@ -2256,14 +2255,14 @@ fn service_path_uses_command_stdout_as_the_output_subtitle() {
         }),
     };
 
-    let mut page = editchain_codec::page::Page::new(0);
+    let mut page = editchain_store::format::Page::new(0);
     for op in [
         &command_raw,
         &command,
         &empty_output_import,
         &empty_output_command,
     ] {
-        page.add_record(0, editchain_codec::frame::encode_op(op).expect("encode"));
+        page.add_record(0, editchain_store::format::encode_op(op).expect("encode"));
     }
     write_page(&chain_dir, &page);
 
@@ -2321,9 +2320,9 @@ fn service_path_compaction_preserves_object_tool_payload_carriers() {
         r#"{"type":"response_item","payload":{"type":"function_call","id":"call_0"}}"#,
     );
 
-    let mut page = editchain_codec::page::Page::new(0);
+    let mut page = editchain_store::format::Page::new(0);
     for op in [&call, &with_params, &id_only] {
-        page.add_record(0, editchain_codec::frame::encode_op(op).expect("encode"));
+        page.add_record(0, editchain_store::format::encode_op(op).expect("encode"));
     }
     write_page(&chain_dir, &page);
 
@@ -2394,9 +2393,9 @@ fn service_path_keeps_exec_command_separate_from_token_metadata() {
     .to_string();
     let mut token = raw_import_op(20, 3, 1_100, Some(call.id), &accounting_json);
     token.tags |= Tags::META;
-    let mut page = editchain_codec::page::Page::new(0);
+    let mut page = editchain_store::format::Page::new(0);
     for op in [&call, &call_child, &token] {
-        page.add_record(0, editchain_codec::frame::encode_op(op).expect("encode"));
+        page.add_record(0, editchain_store::format::encode_op(op).expect("encode"));
     }
     write_page(&chain_dir, &page);
 
@@ -2461,9 +2460,9 @@ fn service_path_compaction_preserves_scalar_and_truncated_tool_payload_carriers(
         r#"{"type":"response_item","payload":{"type":"function_call","id":"call_0"}}"#,
     );
 
-    let mut page = editchain_codec::page::Page::new(0);
+    let mut page = editchain_store::format::Page::new(0);
     for op in [&scalar_call, &blob_call, &id_only] {
-        page.add_record(0, editchain_codec::frame::encode_op(op).expect("encode"));
+        page.add_record(0, editchain_store::format::encode_op(op).expect("encode"));
     }
     write_page(&chain_dir, &page);
 
@@ -2541,7 +2540,7 @@ fn service_path_hides_duplicate_response_item_event_msg_pairs_after_compaction()
         r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"unique narrative"}]}}"#,
     );
 
-    let mut page = editchain_codec::page::Page::new(0);
+    let mut page = editchain_store::format::Page::new(0);
     for op in [
         &marker_response,
         &marker_event,
@@ -2549,7 +2548,7 @@ fn service_path_hides_duplicate_response_item_event_msg_pairs_after_compaction()
         &narrative_event,
         &unique_response,
     ] {
-        page.add_record(0, editchain_codec::frame::encode_op(op).expect("encode"));
+        page.add_record(0, editchain_store::format::encode_op(op).expect("encode"));
     }
     write_page(&chain_dir, &page);
 
@@ -2644,9 +2643,9 @@ fn service_path_truncated_echo_texts_never_pair_but_untruncated_exact_pairs_do()
         ),
     );
 
-    let mut page = editchain_codec::page::Page::new(0);
+    let mut page = editchain_store::format::Page::new(0);
     for op in [&long_response, &long_event, &exact_response, &exact_event] {
-        page.add_record(0, editchain_codec::frame::encode_op(op).expect("encode"));
+        page.add_record(0, editchain_store::format::encode_op(op).expect("encode"));
     }
     write_page(&chain_dir, &page);
 
@@ -2716,9 +2715,9 @@ fn cancelled_branch_rows_ship_muted_node_and_child_owned_edge_geometry() {
         Some(root.id),
         r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"interruptedMessageId":"msg_cancelled"}"#,
     );
-    let mut page = editchain_codec::page::Page::new(0);
+    let mut page = editchain_store::format::Page::new(0);
     for op in [&root, &active, &cancelled] {
-        page.add_record(0, editchain_codec::frame::encode_op(op).expect("encode"));
+        page.add_record(0, editchain_store::format::encode_op(op).expect("encode"));
     }
     write_page(&chain_dir, &page);
 
@@ -2775,8 +2774,8 @@ fn prepared_snapshot_manifest_records_projection_revision_fifty_six() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let chain_dir = tmp.path().join(".editchain");
     let first = msg_op(41, 1, b"snapshot first");
-    let mut page = editchain_codec::page::Page::new(0);
-    page.add_record(0, editchain_codec::frame::encode_op(&first).unwrap());
+    let mut page = editchain_store::format::Page::new(0);
+    page.add_record(0, editchain_store::format::encode_op(&first).unwrap());
     write_page(&chain_dir, &page);
 
     let report =
@@ -2812,18 +2811,18 @@ fn prepared_snapshot_keeps_unobserved_metadata_undated() {
         undated.clock = clock;
         undated.tags |= Tags::META | tags;
 
-        let mut page = editchain_codec::page::Page::new(0);
+        let mut page = editchain_store::format::Page::new(0);
         page.add_record(
             0,
-            editchain_codec::frame::encode_op(&dated).expect("encode dated op"),
+            editchain_store::format::encode_op(&dated).expect("encode dated op"),
         );
         page.add_record(
             0,
-            editchain_codec::frame::encode_op(&dated_message).expect("encode dated message"),
+            editchain_store::format::encode_op(&dated_message).expect("encode dated message"),
         );
         page.add_record(
             0,
-            editchain_codec::frame::encode_op(&undated).expect("encode undated op"),
+            editchain_store::format::encode_op(&undated).expect("encode undated op"),
         );
         write_page(&chain_dir, &page);
 
@@ -3159,9 +3158,12 @@ fn prepared_snapshot_serves_flattened_activity_view_and_records_current_revision
         ],
         1,
     );
-    let mut page = editchain_codec::page::Page::new(0);
+    let mut page = editchain_store::format::Page::new(0);
     for op in &ops {
-        page.add_record(0, editchain_codec::frame::encode_op(op).expect("encode op"));
+        page.add_record(
+            0,
+            editchain_store::format::encode_op(op).expect("encode op"),
+        );
     }
     write_page(&chain_dir, &page);
 

@@ -5,7 +5,6 @@
 //! - Repeated import is logically idempotent
 
 use blake3 as _;
-use editchain_codec as _;
 use editchain_core as _;
 use editchain_project as _;
 use editchain_store as _;

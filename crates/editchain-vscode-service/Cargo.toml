@@ -24,6 +24,5 @@ editchain-protocol = { path = "../editchain-protocol" }
 editchain-index = { path = "../editchain-index" }
 
 [dev-dependencies]
-editchain-codec = { path = "../editchain-codec" }
 tempfile = "3"
 editchain-import = { path = "../editchain-import" }

@@ -7,8 +7,6 @@ use super::payloads::DISPLAY_PREVIEW_READ_LIMIT;
 use super::presentation::{row_content_dto, sub_op_label};
 use super::*;
 use crate::Server;
-use editchain_codec::frame::encode_op;
-use editchain_codec::page::{encode_page, Page};
 use editchain_core::{
     ActorId, BlobRef, Clock, ContentId, ImportOp, MessageOp, NodeId, OpKind, ParentSet, PathId,
     Payload, ScopeRef, SessionId, Tags,
@@ -19,6 +17,8 @@ use editchain_index::{DocumentId, LexicalHit};
 use editchain_protocol::{
     ParentRelationDto, ParentRelationKind, Request, RequestBody, ResponseBody,
 };
+use editchain_store::format::encode_op;
+use editchain_store::format::{encode_page, Page};
 use std::fs;
 
 /// 2^53 + 1 — the first integer JavaScript's IEEE-754 doubles round.

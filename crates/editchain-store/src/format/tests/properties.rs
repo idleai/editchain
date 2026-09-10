@@ -10,8 +10,8 @@ use crc as _;
 use postcard as _;
 use serde as _;
 
-use editchain_codec::frame::{decode_ec03, decode_op, encode_ec03, encode_op, Ec03Frame};
-use editchain_codec::page::{decode_page, encode_page, Page};
+use crate::format::{decode_ec03, decode_op, encode_ec03, encode_op, Ec03Frame};
+use crate::format::{decode_page, encode_page, Page};
 use editchain_core::*;
 use proptest::prelude::*;
 

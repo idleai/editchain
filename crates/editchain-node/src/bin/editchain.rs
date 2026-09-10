@@ -2,7 +2,6 @@
 
 use clap::Parser;
 use dirs as _;
-use editchain_codec as _;
 use editchain_core as _;
 use editchain_git as _;
 use editchain_import as _;

@@ -428,6 +428,15 @@ CLI history preparation has an explicit backend API, and the service, project,
 and renderer now group their largest modules by responsibility. It does not
 claim a measured runtime or build-time improvement from moving modules.
 
+The subsequent package consolidation targets eight workspace packages. The
+codec package is now part of `editchain-store`, with an explicit `format` API
+for operation encoding and supported EC02/EC03 formats. Page-scanner types are
+internal to storage; cursor inspection used only by scanner tests is test-only.
+All frame, page, corruption, and property tests moved with the implementation.
+In-repo callers now use `editchain_store::format`; the old codec package path
+is retired. This first merge passes the full lint suite, with ten packages and
+19 direct production dependencies between workspace packages.
+
 The planned refactor increments are complete. EC02 and historical operations
 remain readable; the documented protocol, repository-qualified row keys, and
 pre-1.0 Rust API changes require coordinated consumers. Compatibility readers

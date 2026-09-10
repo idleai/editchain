@@ -1,10 +1,10 @@
 //! Canonical admission and durable append for a complete captured import batch.
 
-use editchain_codec::frame::encode_op;
-use editchain_codec::page::Page;
 use editchain_core::{Admission, Op};
 use editchain_import::batch::{DurableAdmission, DurableOpSink};
 use editchain_import::ImportError;
+use editchain_store::format::encode_op;
+use editchain_store::format::Page;
 use editchain_store::{CanonicalChain, SegmentStore};
 
 /// Target page size; a larger legal record occupies its own page.

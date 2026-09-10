@@ -4,7 +4,6 @@
 use clap as _;
 use ctrlc as _;
 use dirs as _;
-use editchain_codec as _;
 use editchain_core as _;
 use editchain_git as _;
 use editchain_node as _;

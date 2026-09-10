@@ -10,8 +10,8 @@ use editchain_vscode_service as _;
 use serde as _;
 use serde_json as _;
 
-use editchain_codec::page::Page;
 use editchain_node::segment::SegmentStore;
+use editchain_store::format::Page;
 use editchain_store::CanonicalChain;
 
 #[test]
@@ -128,7 +128,7 @@ fn canonical_reads_are_read_only_and_segment_gaps_are_errors() {
     assert_eq!(CanonicalChain::read(&missing).unwrap().stats().accepted, 0);
     assert!(!missing.exists());
 
-    let page = editchain_codec::page::encode_page(&Page::new(1)).unwrap();
+    let page = editchain_store::format::encode_page(&Page::new(1)).unwrap();
     std::fs::write(dir.path().join("000001.eclog"), page).unwrap();
     assert_eq!(
         CanonicalChain::read(dir.path()).unwrap_err().kind(),

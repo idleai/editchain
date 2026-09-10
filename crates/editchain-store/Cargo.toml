@@ -13,10 +13,12 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
+postcard.workspace = true
+crc = "3"
 blake3 = "1"
 editchain-core = { path = "../editchain-core" }
-editchain-codec = { path = "../editchain-codec" }
 serde.workspace = true
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"
