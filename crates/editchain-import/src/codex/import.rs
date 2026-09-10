@@ -116,6 +116,7 @@ pub fn import_codex(
     blobs: &mut dyn BlobSink,
     cursors: &mut dyn CursorStore,
 ) -> Result<ImportReport, ImportError> {
+    options.cancellation.check(&request.raw_root)?;
     let mut report = ImportReport::new();
     // Per-thread exact topology for the sink-independent relationship pass.
     let mut topology: Vec<ThreadTopology> = Vec::new();
@@ -142,12 +143,12 @@ pub fn import_codex(
         let source_node = resolved.source_node;
         let migrates_legacy_key = cursor_key != state_key;
         let existing_cursor = resolved.cursor;
-        let plan = SourceReadPlan::capture_reserved(
+        let plan = SourceReadPlan::capture_controlled(
             &rollout.path,
             existing_cursor.as_ref(),
             cursors.get_generation(&state_key)?,
             cursors.get_reservation(&cursor_key)?.as_ref(),
-            options.source_limits,
+            &options.source_control(),
         )?;
         let raw_identity = if session_titles.is_empty() {
             None
@@ -220,6 +221,7 @@ pub fn import_codex(
             }
             new_cursor.source_node = Some(source_node);
             new_cursor.content_hash_version = 1;
+            options.cancellation.check(&rollout.path)?;
             if boot > 0 {
                 cursors.set_generation(&cursor_key, boot)?;
             }
@@ -241,7 +243,12 @@ pub fn import_codex(
 
         // Run the helper over the whole file and validate/fold its projection
         // BEFORE emitting anything, so a bridge failure leaves no partial state.
-        let stdout = helper.run_captured(plan.captured_path(), &rollout.path)?;
+        let stdout = helper.run_captured(
+            plan.captured_path(),
+            &rollout.path,
+            options.helper_limits,
+            &options.cancellation,
+        )?;
         let projection =
             parse_projection(&stdout, expected_total, expected_records).map_err(|e| {
                 ImportError::ProjectionProtocol {
@@ -333,6 +340,7 @@ pub fn import_codex(
         };
         let mut clocks: Vec<Clock> = Vec::with_capacity(lines.len());
         for (i, line) in lines.iter().enumerate() {
+            options.cancellation.check(&rollout.path)?;
             let seq = start_seq + i as u64 + 1;
             let op = build_raw_op(
                 &line.data,
@@ -427,6 +435,7 @@ pub fn import_codex(
                 blobs,
             };
             for item in &projection.final_items {
+                options.cancellation.check(&rollout.path)?;
                 if item.first_seen > start_seq {
                     // Fresh item: anchor at first-seen. Items anchored to a
                     // trailing partial line emit on a later run once the line
@@ -547,6 +556,7 @@ pub fn import_codex(
         }
         new_cursor.source_node = Some(source_node);
         new_cursor.content_hash_version = 1;
+        options.cancellation.check(&rollout.path)?;
         if boot > 0 {
             cursors.set_generation(&cursor_key, boot)?;
         }

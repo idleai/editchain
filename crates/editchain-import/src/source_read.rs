@@ -1,9 +1,10 @@
 //! One captured JSONL source shared by cursor validation and provider derivation.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::cancellation::ImportCancellation;
 use crate::error::ImportError;
 use crate::ids::hash_raw;
 use crate::sink::CursorValue;
@@ -27,6 +28,15 @@ impl Default for SourceReadLimits {
             records: 1_000_000,
         }
     }
+}
+
+/// Resource and cancellation controls retained by a captured source.
+#[derive(Debug, Clone, Default)]
+pub struct SourceReadControl {
+    /// Bounds on source bytes and physical records.
+    pub limits: SourceReadLimits,
+    /// Shared cancellation signal, also used by historical record replay.
+    pub cancellation: ImportCancellation,
 }
 
 /// One complete physical source occurrence, retaining its exact newline bytes.
@@ -59,10 +69,16 @@ struct CapturedSource {
     original: PathBuf,
     file_size: u64,
     limits: SourceReadLimits,
+    cancellation: ImportCancellation,
 }
 
 impl CapturedSource {
-    fn capture(path: &Path, limits: SourceReadLimits) -> Result<Self, ImportError> {
+    fn capture(
+        path: &Path,
+        limits: SourceReadLimits,
+        cancellation: &ImportCancellation,
+    ) -> Result<Self, ImportError> {
+        cancellation.check(path)?;
         let mut source = File::open(path)?;
         let file_size = source.metadata()?.len();
         check_limit(path, "source bytes", file_size, limits.source_bytes)?;
@@ -78,7 +94,12 @@ impl CapturedSource {
             ))
         })?);
         let mut captured = File::create(&captured_path)?;
-        let copied = std::io::copy(&mut (&mut source).take(file_size), &mut captured)?;
+        let copied = copy_checked(
+            &mut (&mut source).take(file_size),
+            &mut captured,
+            path,
+            cancellation,
+        )?;
         if copied != file_size {
             return Err(ImportError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -94,6 +115,7 @@ impl CapturedSource {
             original: path.to_path_buf(),
             file_size,
             limits,
+            cancellation: cancellation.clone(),
         })
     }
 
@@ -101,7 +123,12 @@ impl CapturedSource {
         let offset = cursor.map_or(0, |value| value.byte_offset);
         let mut file = File::open(&self.path)?;
         let mut hasher = blake3::Hasher::new();
-        let prefix_bytes = std::io::copy(&mut (&mut file).take(offset), &mut hasher)?;
+        let prefix_bytes = copy_checked(
+            &mut (&mut file).take(offset),
+            &mut hasher,
+            &self.original,
+            &self.cancellation,
+        )?;
         let prefix_hash = *hasher.finalize().as_bytes();
         if let Some(cursor) = cursor {
             let empty_legacy = offset == 0 && cursor.content_hash == [0; 32];
@@ -118,6 +145,7 @@ impl CapturedSource {
         let mut byte_offset = offset;
         let mut ops_emitted = cursor.map_or(0, |value| value.ops_emitted);
         let partial = loop {
+            self.cancellation.check(&self.original)?;
             let mut data = Vec::new();
             let count = (&mut reader)
                 .take(self.limits.record_bytes.saturating_add(1))
@@ -221,11 +249,36 @@ impl SourceReadPlan {
         reservation: Option<&CursorValue>,
         limits: SourceReadLimits,
     ) -> Result<Self, ImportError> {
+        Self::capture_controlled(
+            path,
+            cursor,
+            generation,
+            reservation,
+            &SourceReadControl {
+                limits,
+                cancellation: ImportCancellation::default(),
+            },
+        )
+    }
+
+    /// Capture a reserved source with cooperative cancellation during copying,
+    /// prefix verification, and record reads, including later metadata replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as `capture_reserved`, or cancellation.
+    pub fn capture_controlled(
+        path: &Path,
+        cursor: Option<&CursorValue>,
+        generation: u32,
+        reservation: Option<&CursorValue>,
+        control: &SourceReadControl,
+    ) -> Result<Self, ImportError> {
         let accepted_generation = cursor
             .and_then(|value| value.accepted_generation)
             .unwrap_or(generation);
         let highest_generation = generation.max(accepted_generation);
-        let source = CapturedSource::capture(path, limits)?;
+        let source = CapturedSource::capture(path, control.limits, &control.cancellation)?;
         let Some(reservation) = reservation else {
             return Self::from_source(source, cursor, accepted_generation, highest_generation);
         };
@@ -372,13 +425,40 @@ pub fn read_session_file(
     path: &Path,
     cursor: Option<&CursorValue>,
 ) -> Result<(Vec<LineWithHash>, u64, CursorValue), ImportError> {
-    let source = CapturedSource::capture(path, SourceReadLimits::default())?;
+    let source = CapturedSource::capture(
+        path,
+        SourceReadLimits::default(),
+        &ImportCancellation::default(),
+    )?;
     let records = source.read(cursor)?;
     let bytes = records
         .checkpoint
         .byte_offset
         .saturating_sub(cursor.map_or(0, |c| c.byte_offset));
     Ok((records.lines, bytes, records.checkpoint))
+}
+
+fn copy_checked(
+    source: &mut impl Read,
+    target: &mut impl Write,
+    path: &Path,
+    cancellation: &ImportCancellation,
+) -> Result<u64, ImportError> {
+    let mut buffer = vec![0; 64 * 1024].into_boxed_slice();
+    let mut copied = 0_u64;
+    loop {
+        cancellation.check(path)?;
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(copied);
+        }
+        if let Some(bytes) = buffer.get(..count) {
+            target.write_all(bytes)?;
+        }
+        copied = copied
+            .checked_add(u64::try_from(count).map_err(std::io::Error::other)?)
+            .ok_or_else(|| std::io::Error::other("source copy length exhausted"))?;
+    }
 }
 
 fn check_limit(

@@ -26,6 +26,10 @@ pub struct ImportOptions {
     pub max_inline_bytes: usize,
     /// Bounds on captured sources and individual physical records.
     pub source_limits: crate::source_read::SourceReadLimits,
+    /// Bounds on helper output and elapsed execution time.
+    pub helper_limits: crate::codex::helper::HelperLimits,
+    /// Shared cancellation signal for capture and derivation.
+    pub cancellation: crate::cancellation::ImportCancellation,
 }
 
 impl Default for ImportOptions {
@@ -35,6 +39,17 @@ impl Default for ImportOptions {
             include_thinking: false,
             max_inline_bytes: 4096,
             source_limits: crate::source_read::SourceReadLimits::default(),
+            helper_limits: crate::codex::helper::HelperLimits::default(),
+            cancellation: crate::cancellation::ImportCancellation::default(),
+        }
+    }
+}
+
+impl ImportOptions {
+    pub(crate) fn source_control(&self) -> crate::source_read::SourceReadControl {
+        crate::source_read::SourceReadControl {
+            limits: self.source_limits,
+            cancellation: self.cancellation.clone(),
         }
     }
 }

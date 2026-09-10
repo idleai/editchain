@@ -18,5 +18,10 @@ use editchain_node::commands::Cli;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    editchain_node::commands::dispatch(cli.command)
+    let options = editchain_import::ImportOptions::default();
+    if matches!(cli.command, editchain_node::commands::Commands::Import(_)) {
+        let cancellation = options.cancellation.clone();
+        ctrlc::set_handler(move || cancellation.cancel())?;
+    }
+    editchain_node::commands::dispatch_with_import_options(cli.command, &options)
 }

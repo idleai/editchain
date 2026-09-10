@@ -14,6 +14,8 @@ use proptest as _;
 
 /// Capture batches and ordered operation/checkpoint persistence.
 pub mod batch;
+/// Cooperative cancellation of source capture and helper execution.
+pub mod cancellation;
 /// Cursor-based incremental file reading.
 pub mod cursor;
 /// Import error types.

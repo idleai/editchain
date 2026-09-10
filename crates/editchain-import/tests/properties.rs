@@ -14,7 +14,9 @@ use tempfile as _;
 use time as _;
 
 use editchain_import::ids::derive_source_stream;
+use process_wrap as _;
 use proptest::prelude::*;
+use tokio as _;
 
 proptest! {
     #![proptest_config(ProptestConfig {

@@ -7,6 +7,11 @@ pub enum ImportError {
     Io(std::io::Error),
     /// JSON parse error on a line.
     Json(serde_json::Error),
+    /// The caller cancelled capture or derivation before checkpoint acceptance.
+    Cancelled {
+        /// Source being processed.
+        path: PathBuf,
+    },
     /// A configured input or execution resource bound was exceeded.
     ResourceLimit {
         /// Source being processed.
@@ -74,6 +79,7 @@ impl std::fmt::Display for ImportError {
         match self {
             Self::Io(e) => write!(f, "IO error: {e}"),
             Self::Json(e) => write!(f, "JSON error: {e}"),
+            Self::Cancelled { path } => write!(f, "import cancelled for {}", path.display()),
             Self::ResourceLimit {
                 path,
                 resource,

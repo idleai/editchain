@@ -3,11 +3,13 @@
 use blake3 as _;
 use editchain_core as _;
 use editchain_project as _;
+use process_wrap as _;
 use proptest as _;
 use serde as _;
 use serde_json as _;
 use sha2 as _;
 use time as _;
+use tokio as _;
 
 use editchain_import::claude_code::reader::read_session_file;
 use std::io::Write;
@@ -22,6 +24,26 @@ fn read_empty_file() {
     assert!(lines.is_empty());
     assert_eq!(bytes, 0);
     assert_eq!(cursor.byte_offset, 0);
+}
+
+#[test]
+fn capture_and_later_replay_share_cancellation() {
+    use editchain_import::source_read::{SourceReadControl, SourceReadPlan};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.jsonl");
+    std::fs::write(&path, "first\nsecond\n").unwrap();
+    let control = SourceReadControl::default();
+    let plan = SourceReadPlan::capture_controlled(&path, None, 0, None, &control).unwrap();
+    assert_eq!(plan.lines().len(), 2);
+    control.cancellation.cancel();
+    assert!(matches!(
+        plan.all_lines(),
+        Err(editchain_import::ImportError::Cancelled { .. })
+    ));
+    assert!(matches!(
+        SourceReadPlan::capture_controlled(&path, None, 0, None, &control),
+        Err(editchain_import::ImportError::Cancelled { .. })
+    ));
 }
 
 #[test]

@@ -111,6 +111,22 @@ Completed increments:
   remain readable; cursors gain the paired field on their next successful import,
   and the retained generation map continues to support explicit cursor reset.
 
+- Execution controls: helper stdout and stderr have independent byte limits
+  (256 MiB and 1 MiB by default), with a two-minute deadline that includes pipe
+  draining. Asynchronous pipe reads avoid leaving blocked reader threads when
+  a descendant retains a handle. Failure or cancellation terminates the owned
+  Unix process group or Windows job and reaps the helper. Source capture, prefix
+  hashing, replay, and emission share a cooperative cancellation signal. The CLI
+  maps interrupts to that signal and checks it before beginning persistence;
+  an append already in progress finishes its durable checkpoint handoff. CLI
+  arguments now form one typed request, removing the parallel test-only shape
+  and two obsolete lint expectations. Native regressions cover output floods,
+  exact output bounds, inherited pipes, cancellation after helper startup, and
+  a real CLI interrupt without accepted source evidence. Tokio, process-wrap,
+  and ctrlc provide the pipe/process/signal support; prior dependency versions
+  are retained in the lockfile. Windows job behavior is not runtime-tested in
+  the Linux suite.
+
 Remaining work, in dependency order:
 
 1. Consolidate typed provider evidence, source lifecycle, and persistence

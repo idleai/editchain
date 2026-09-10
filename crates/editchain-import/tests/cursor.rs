@@ -3,12 +3,14 @@
 use blake3 as _;
 use editchain_core as _;
 use editchain_project as _;
+use process_wrap as _;
 use proptest as _;
 use serde as _;
 use serde_json as _;
 use sha2 as _;
 use tempfile as _;
 use time as _;
+use tokio as _;
 
 use editchain_import::claude_code::reader::read_session_file;
 use editchain_import::cursor::{check_file_generation, split_lines};

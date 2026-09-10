@@ -19,6 +19,8 @@ blake3 = "1"
 sha2 = "0.10"
 time = { version = "0.3", default-features = false, features = ["parsing"] }
 tempfile = "3"
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "process", "rt", "time"] }
+process-wrap = { version = "10", default-features = false, features = ["tokio1", "process-group", "job-object", "kill-on-drop"] }
 editchain-core = { path = "../editchain-core" }
 
 [dev-dependencies]

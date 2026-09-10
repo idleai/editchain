@@ -47,6 +47,7 @@ pub fn import_claude_code(
     blobs: &mut dyn BlobSink,
     cursors: &mut dyn CursorStore,
 ) -> Result<ImportReport, ImportError> {
+    options.cancellation.check(&request.sessions_dir)?;
     let mut report = ImportReport::new();
 
     // Discover session files.
@@ -89,12 +90,12 @@ pub fn import_claude_code(
                     || cursor.accepted_generation.is_none()
             });
 
-        let plan = SourceReadPlan::capture_reserved(
+        let plan = SourceReadPlan::capture_controlled(
             &session.path,
             existing_cursor.as_ref(),
             cursors.get_generation(&state_key)?,
             cursors.get_reservation(&cursor_key)?.as_ref(),
-            options.source_limits,
+            &options.source_control(),
         )?;
         if plan.state() == SourceReadState::Unchanged
             && !needs_topology_upgrade
@@ -136,6 +137,7 @@ pub fn import_claude_code(
             None
         };
         for (i, line) in lines.iter().enumerate() {
+            options.cancellation.check(&session.path)?;
             let seq = start_seq + i as u64 + 1;
 
             // Parse envelope for normalization.
@@ -227,6 +229,7 @@ pub fn import_claude_code(
                     all_lines.len()
                 };
                 for (i, line) in all_lines.iter().take(replay_limit).enumerate() {
+                    options.cancellation.check(&session.path)?;
                     let Some(envelope) = parse_envelope(&line.data) else {
                         continue;
                     };
@@ -286,6 +289,7 @@ pub fn import_claude_code(
         }
         new_cursor.source_node = Some(source_node);
         new_cursor.content_hash_version = 1;
+        options.cancellation.check(&session.path)?;
         if boot > 0 {
             cursors.set_generation(&cursor_key, boot)?;
         }

@@ -23,9 +23,11 @@ use editchain_import::sink::{
     MemoryOpSink, INLINE_LIMIT,
 };
 use editchain_project::HistoryProjection;
+use process_wrap as _;
 use proptest as _;
 use serde as _;
 use sha2 as _;
+use tokio as _;
 
 fn request(root: &Path) -> DiscoveryRequest {
     DiscoveryRequest {

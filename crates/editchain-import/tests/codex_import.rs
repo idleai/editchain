@@ -14,6 +14,7 @@ mod common;
 use blake3 as _;
 use editchain_core as _;
 use editchain_project as _;
+use process_wrap as _;
 use proptest as _;
 use serde as _;
 use serde_json as _;
@@ -22,6 +23,7 @@ use std::io::Write;
 use std::path::Path;
 use tempfile as _;
 use time as _;
+use tokio as _;
 
 use editchain_core::clock::Clock;
 use editchain_core::op::{CommandStage, OpKind, ToolStage};
@@ -1297,6 +1299,174 @@ fn helper_nonzero_exit_is_error_without_cursor() {
         cursors.get_cursor(&key).unwrap().is_none(),
         "cursor not persisted on helper failure"
     );
+}
+
+#[test]
+fn helper_output_limits_preserve_checkpoints_and_allow_retry() {
+    for (redirection, resource) in [("", "helper stdout bytes"), (">&2", "helper stderr bytes")] {
+        let dir = tempfile::tempdir().unwrap();
+        write_rollout(dir.path(), "rollout-1.jsonl", &[event_line("A")]);
+        let path = dir.path().join("rollout-1.jsonl");
+        let script = dir.path().join("flood.sh");
+        std::fs::write(
+            &script,
+            format!("head -c 65536 /dev/zero {redirection}\nsleep 30\n"),
+        )
+        .unwrap();
+        let options = ImportOptions {
+            helper_limits: editchain_import::codex::helper::HelperLimits {
+                stdout_bytes: 1024,
+                stderr_bytes: 1024,
+                timeout: std::time::Duration::from_secs(5),
+            },
+            ..ImportOptions::default()
+        };
+        let mut cursors = MemoryCursorStore::new();
+        let started = std::time::Instant::now();
+        let error =
+            try_import(dir.path(), &sh_helper(&script, &[]), &options, &mut cursors).unwrap_err();
+        assert!(
+            matches!(error, ImportError::ResourceLimit { path: failed, resource: actual, limit: 1024 }
+            if failed == path && actual == resource)
+        );
+        assert!(started.elapsed() < options.helper_limits.timeout);
+        let key = source_key(dir.path(), &path);
+        assert!(cursors.get_cursor(&key).unwrap().is_none());
+        assert!(cursors.get_reservation(&key).unwrap().is_none());
+        assert_eq!(cursors.get_generation(&key).unwrap(), 0);
+        let retry = try_import(
+            dir.path(),
+            &helper_in(&dir, &messages_awk("thread-1")),
+            &ImportOptions::default(),
+            &mut cursors,
+        )
+        .unwrap();
+        assert_eq!(retry.report.raw_ops, 1);
+    }
+}
+
+#[test]
+fn helper_accepts_exact_output_bounds_inside_an_existing_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.jsonl");
+    std::fs::write(&source, "{}\n").unwrap();
+    let script = dir.path().join("exact.sh");
+    std::fs::write(
+        &script,
+        "head -c 1024 /dev/zero\nhead -c 1024 /dev/zero >&2\n",
+    )
+    .unwrap();
+    let limits = editchain_import::codex::helper::HelperLimits {
+        stdout_bytes: 1024,
+        stderr_bytes: 1024,
+        ..editchain_import::codex::helper::HelperLimits::default()
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let output = sh_helper(&script, &[])
+            .run_with_control(
+                &source,
+                limits,
+                &editchain_import::cancellation::ImportCancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(output, vec![0; 1024]);
+    });
+}
+
+#[test]
+fn helper_deadline_covers_pipes_inherited_by_descendants() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.jsonl");
+    std::fs::write(&source, "x\n").unwrap();
+    let script = dir.path().join("inherited-pipe.sh");
+    let child_pid = dir.path().join("child.pid");
+    std::fs::write(&script, "sleep 30 &\nprintf '%s' \"$!\" > \"$1\"\nexit 0\n").unwrap();
+    let limits = editchain_import::codex::helper::HelperLimits {
+        timeout: std::time::Duration::from_millis(250),
+        ..editchain_import::codex::helper::HelperLimits::default()
+    };
+    let started = std::time::Instant::now();
+    let error = sh_helper(&script, &[child_pid.to_string_lossy().into_owned()])
+        .run_with_control(
+            &source,
+            limits,
+            &editchain_import::cancellation::ImportCancellation::default(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, ImportError::ResourceLimit { path, resource: "helper elapsed milliseconds", limit: 250 }
+        if path == source)
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_process_stopped(&child_pid);
+}
+
+fn assert_process_stopped(pid_file: &Path) {
+    let pid = std::fs::read_to_string(pid_file).unwrap();
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(5))
+        .unwrap();
+    loop {
+        let status = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid.trim()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&status.stdout);
+        if state.trim().is_empty() || state.trim().starts_with('Z') {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "helper descendant {pid} still runs: {state}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn helper_cancellation_after_startup_kills_children_without_accepting_a_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rollout(dir.path(), "rollout-1.jsonl", &[event_line("A")]);
+    let source = dir.path().join("rollout-1.jsonl");
+    let child_pid = dir.path().join("child.pid");
+    let script = dir.path().join("cancel.sh");
+    std::fs::write(&script, "sleep 30 &\nprintf '%s' \"$!\" > \"$1\"\nwait\n").unwrap();
+    let helper = sh_helper(&script, &[child_pid.to_string_lossy().into_owned()]);
+    let options = ImportOptions::default();
+    let mut cursors = MemoryCursorStore::new();
+    std::thread::scope(|scope| {
+        let cancel = scope.spawn(|| {
+            let deadline = std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(5))
+                .unwrap();
+            while !child_pid.exists() {
+                if std::time::Instant::now() >= deadline {
+                    options.cancellation.cancel();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            options.cancellation.cancel();
+        });
+        let error = try_import(dir.path(), &helper, &options, &mut cursors).unwrap_err();
+        assert!(matches!(error, ImportError::Cancelled { path } if path == source));
+        cancel.join().unwrap();
+    });
+    assert_process_stopped(&child_pid);
+    let key = source_key(dir.path(), &source);
+    assert!(cursors.get_cursor(&key).unwrap().is_none());
+    assert!(cursors.get_reservation(&key).unwrap().is_none());
+    assert_eq!(cursors.get_generation(&key).unwrap(), 0);
+    // A cancelled signal remains cancelled, including before a later spawn.
+    std::fs::remove_file(&child_pid).unwrap();
+    assert!(matches!(
+        try_import(dir.path(), &helper, &options, &mut cursors),
+        Err(ImportError::Cancelled { .. })
+    ));
+    assert!(!child_pid.exists());
 }
 
 #[test]

@@ -34,20 +34,23 @@ const DEFAULT_CODEX_HELPER: &str = "codex-session-exporter";
 /// Returns an error if session files cannot be discovered or imported, or if
 /// Codex-only helper options are used with the Claude provider.
 #[expect(
-    clippy::needless_pass_by_value,
     clippy::print_stdout,
-    clippy::too_many_arguments,
-    reason = "CLI command; strings consumed by design"
+    reason = "CLI command reports durable import outcomes to stdout"
 )]
 pub fn run(
-    sessions_dir: String,
-    workspace: String,
-    chain: String,
-    dry_run: bool,
-    provider: Provider,
-    codex_helper: Option<String>,
-    codex_helper_args: Vec<String>,
+    request: super::ImportCommand,
+    options: &ImportOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let super::ImportCommand {
+        sessions_dir,
+        workspace,
+        chain,
+        dry_run,
+        provider,
+        codex_helper,
+        codex_helper_arg: codex_helper_args,
+    } = request;
+    options.cancellation.check(Path::new(&sessions_dir))?;
     check_codex_only_helper_args(provider, codex_helper.as_deref(), &codex_helper_args)?;
 
     let chain_path = PathBuf::from(&chain);
@@ -74,8 +77,7 @@ pub fn run(
                 chain_dir: chain_path.clone(),
             };
 
-            let options = ImportOptions::default();
-            import_claude_code(&request, &options, ops, blobs.as_mut(), pending)
+            import_claude_code(&request, options, ops, blobs.as_mut(), pending)
         }
         Provider::Codex => {
             let raw_root = if sessions_dir.is_empty() {
@@ -90,10 +92,11 @@ pub fn run(
             };
             let helper = codex_helper_command(codex_helper, codex_helper_args);
 
-            let options = ImportOptions::default();
-            import_codex(&request, &options, &helper, ops, blobs.as_mut(), pending)
+            import_codex(&request, options, &helper, ops, blobs.as_mut(), pending)
         }
     })?;
+
+    options.cancellation.check(Path::new(&sessions_dir))?;
 
     if let Some(store) = store.as_mut() {
         let mut session_base_links = 0usize;
@@ -117,6 +120,7 @@ pub fn run(
                 println!("Git-link reconciliation failed (session import will continue): {error}");
             }
         }
+        options.cancellation.check(Path::new(&sessions_dir))?;
         let outcome = batch.persist(&mut persistence::ImportWriter { store }, cursors.as_mut())?;
         println!("Import complete:");
         println!("{}", capture_report(&outcome.report));
@@ -307,44 +311,18 @@ fn codex_helper_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{Cli, Commands};
+    use crate::commands::{Cli, Commands, ImportCommand};
     use clap::Parser;
     use editchain_codec::frame::{decode_op, encode_op};
     use editchain_codec::page::Page;
     use std::collections::HashSet;
 
-    struct ImportArgs {
-        sessions_dir: String,
-        workspace: String,
-        chain: String,
-        dry_run: bool,
-        provider: Provider,
-        codex_helper: Option<String>,
-        codex_helper_arg: Vec<String>,
-    }
-
-    fn import_args(args: &[&str]) -> Option<ImportArgs> {
+    fn import_args(args: &[&str]) -> Option<ImportCommand> {
         let mut tokens = vec!["editchain", "import"];
         tokens.extend_from_slice(args);
         let cli = Cli::try_parse_from(tokens).ok()?;
         match cli.command {
-            Commands::Import {
-                sessions_dir,
-                workspace,
-                chain,
-                dry_run,
-                provider,
-                codex_helper,
-                codex_helper_arg,
-            } => Some(ImportArgs {
-                sessions_dir,
-                workspace,
-                chain,
-                dry_run,
-                provider,
-                codex_helper,
-                codex_helper_arg,
-            }),
+            Commands::Import(request) => Some(request),
             Commands::PrepareView { .. } => None,
         }
     }
@@ -473,16 +451,20 @@ mod tests {
         let chain = dir.path().join("chain");
         let held = SegmentStore::open(&chain).unwrap();
         let error = run(
-            dir.path()
-                .join("missing-sources")
-                .to_string_lossy()
-                .into_owned(),
-            dir.path().to_string_lossy().into_owned(),
-            chain.to_string_lossy().into_owned(),
-            false,
-            Provider::Claude,
-            None,
-            Vec::new(),
+            ImportCommand {
+                sessions_dir: dir
+                    .path()
+                    .join("missing-sources")
+                    .to_string_lossy()
+                    .into_owned(),
+                workspace: dir.path().to_string_lossy().into_owned(),
+                chain: chain.to_string_lossy().into_owned(),
+                dry_run: false,
+                provider: Provider::Claude,
+                codex_helper: None,
+                codex_helper_arg: Vec::new(),
+            },
+            &ImportOptions::default(),
         )
         .unwrap_err();
         assert_eq!(
@@ -681,13 +663,16 @@ mod tests {
         let helper_args = vec![helper.to_string_lossy().into_owned()];
         let import = |sessions: &str, chain: &str| {
             run(
-                sessions.to_string(),
-                "/workspace".to_string(),
-                chain.to_string(),
-                false,
-                Provider::Codex,
-                Some("sh".to_string()),
-                helper_args.clone(),
+                ImportCommand {
+                    sessions_dir: sessions.to_string(),
+                    workspace: "/workspace".to_string(),
+                    chain: chain.to_string(),
+                    dry_run: false,
+                    provider: Provider::Codex,
+                    codex_helper: Some("sh".to_string()),
+                    codex_helper_arg: helper_args.clone(),
+                },
+                &ImportOptions::default(),
             )
             .unwrap();
         };
