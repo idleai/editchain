@@ -151,8 +151,8 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 /// Prefix-related sibling repositories remain visible as independent sources.
 ///
 /// Revision 48 retains Git history gaps and observes refs once per history read.
-/// Revision 49 pins source availability and ref observations for lazy components.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 49;
+/// Revision 50 uses typed derived edges without rewriting source parents.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 50;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

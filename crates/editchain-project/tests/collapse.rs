@@ -479,7 +479,7 @@ fn collapse_author_derived_from_children_tags() {
         | editchain_project::HistoryNode::ExecuteBundle { .. }
         | editchain_project::HistoryNode::PlanBundle { .. }
         | editchain_project::HistoryNode::WorkGroup { .. }
-        | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
+        | editchain_project::HistoryNode::GitCommit { .. } => panic!("expected CollapsedImport"),
     };
     assert_eq!(author, "human");
 }
@@ -500,7 +500,7 @@ fn collapse_author_prefers_human_over_agent() {
         | editchain_project::HistoryNode::ExecuteBundle { .. }
         | editchain_project::HistoryNode::PlanBundle { .. }
         | editchain_project::HistoryNode::WorkGroup { .. }
-        | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
+        | editchain_project::HistoryNode::GitCommit { .. } => panic!("expected CollapsedImport"),
     };
     assert_eq!(author, "human");
 }
@@ -544,7 +544,7 @@ fn meta_imports_bundle_along_exact_parent_chain() {
         | editchain_project::HistoryNode::ExecuteBundle { .. }
         | editchain_project::HistoryNode::PlanBundle { .. }
         | editchain_project::HistoryNode::WorkGroup { .. }
-        | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
+        | editchain_project::HistoryNode::GitCommit { .. } => panic!("expected CollapsedImport"),
     }
 }
 
@@ -1042,10 +1042,18 @@ fn derived_parent_override_wins_over_provider_notes_without_mutating_canonical_t
     );
 
     let mut derived = canonical.clone();
-    derived.override_parent_keys(&[]);
+    derived.override_parents(&[]);
+    let editchain_project::HistoryNode::CollapsedImport { op, .. } = &derived else {
+        panic!("derived source import missing");
+    };
+    assert_eq!(
+        op.as_ref(),
+        &child,
+        "even the derived row retains its source envelope"
+    );
     assert!(
         derived
-            .parent_keys(&projection.git.links, projection.relationship_notes())
+            .parent_keys(&projection.git().links, projection.relationship_notes())
             .is_empty(),
         "a derived view must not silently reintroduce immutable provider edges"
     );
@@ -1054,6 +1062,50 @@ fn derived_parent_override_wins_over_provider_notes_without_mutating_canonical_t
         vec![root.id.to_string()],
         "the canonical projection remains unchanged"
     );
+}
+
+#[test]
+fn derived_git_edges_preserve_source_and_every_mixed_parent() {
+    use editchain_project::{HistoryNode, NodeKey};
+
+    let mut commit = git_commit(9, 20);
+    let parent_commit = git_commit(8, 10);
+    commit.parents = vec![parent_commit.oid];
+    let operations = [import_op(70, 1), import_op(71, 1), import_op(72, 1)];
+    let mut projection = HistoryProjection::from_ops(operations.to_vec());
+    projection.merge_git_commits(vec![commit.clone(), parent_commit.clone()]);
+    let mut nodes = projection.nodes();
+    let derived = nodes
+        .iter_mut()
+        .find(|node| node.key() == NodeKey::Git(commit.key()))
+        .unwrap();
+    let parents = vec![
+        NodeKey::Op(operations[0].id),
+        NodeKey::Git(parent_commit.key()),
+        NodeKey::Op(operations[1].id),
+        NodeKey::Op(operations[2].id),
+    ];
+    derived.override_parents(&parents);
+    let HistoryNode::GitCommit { commit: source, .. } = derived else {
+        panic!("commit row missing");
+    };
+    assert_eq!(source.as_ref(), &commit);
+    let graph = projection.resolved_graph(&nodes);
+    assert_eq!(graph.parents(NodeKey::Git(commit.key())), parents);
+    assert_eq!(
+        projection
+            .git()
+            .commits
+            .get(&(commit.repository, commit.oid)),
+        Some(&commit)
+    );
+    assert_eq!(projection.ops(), operations);
+    for key in graph.keys() {
+        assert!(graph
+            .parents(*key)
+            .iter()
+            .all(|parent| graph.keys().contains(parent)));
+    }
 }
 
 #[test]
@@ -1088,7 +1140,7 @@ fn meta_bundle_keeps_parents_unchanged() {
         | editchain_project::HistoryNode::ExecuteBundle { .. }
         | editchain_project::HistoryNode::PlanBundle { .. }
         | editchain_project::HistoryNode::WorkGroup { .. }
-        | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
+        | editchain_project::HistoryNode::GitCommit { .. } => panic!("expected CollapsedImport"),
     }
 
     // Storage parents are NOT rewritten: turn2 still points at the bundled META
@@ -1177,14 +1229,14 @@ fn produced_commit_link_branches_from_folded_source_without_rewriting_agent_chai
         }]
     );
     let structural = projection.structural_row_keys(&nodes);
-    assert!(structural.contains(&turn.id.to_string()));
-    assert!(structural.contains(&commit.key().to_string()));
+    assert!(structural.contains(&editchain_project::NodeKey::Op(turn.id)));
+    assert!(structural.contains(&editchain_project::NodeKey::Git(commit.key())));
 
     let raw_commit_parents =
-        committed.parent_keys(&projection.git.links, projection.relationship_notes());
+        committed.parent_keys(&projection.git().links, projection.relationship_notes());
     assert_eq!(raw_commit_parents, vec![meta.id.to_string()]);
     let raw_source_parents =
-        source.parent_keys(&projection.git.links, projection.relationship_notes());
+        source.parent_keys(&projection.git().links, projection.relationship_notes());
     assert!(
         !raw_source_parents.contains(&commit.key().to_string()),
         "the source operation never treats its produced commit as an ancestor"
@@ -1384,7 +1436,7 @@ fn exact_spawn_parent_suppresses_only_the_inherited_git_graph_edge() {
         .into_iter()
         .find(|node| node.node_key() == child.id.to_string())
         .expect("child row");
-    assert!(projection.git.links.get(&child.id).is_some_and(|links| {
+    assert!(projection.git().links.get(&child.id).is_some_and(|links| {
         links.iter().any(|link| {
             link.kind == GitLinkKind::BasedOn
                 && link.target_repo == commit.repository
@@ -1431,7 +1483,7 @@ fn projection_does_not_infer_links_from_git_command_text_or_timestamps() {
     projection.merge_git_commits(vec![commit]);
 
     assert!(
-        projection.git.links.is_empty(),
+        projection.git().links.is_empty(),
         "only durable GitLink ops may connect sessions to Git"
     );
 }
@@ -1865,7 +1917,7 @@ fn collapse_keeps_git_commits() {
     assert_eq!(nodes.len(), 2);
     assert!(nodes
         .iter()
-        .any(|n| matches!(n, editchain_project::HistoryNode::GitCommit(_))));
+        .any(|n| matches!(n, editchain_project::HistoryNode::GitCommit { .. })));
 }
 
 /// q6 Phase-1 gate: META records must never bundle across source chains.
@@ -1900,7 +1952,7 @@ fn no_cross_chain_meta_bundling() {
         | editchain_project::HistoryNode::ExecuteBundle { .. }
         | editchain_project::HistoryNode::PlanBundle { .. }
         | editchain_project::HistoryNode::WorkGroup { .. }
-        | editchain_project::HistoryNode::GitCommit(_) => panic!("expected CollapsedImport"),
+        | editchain_project::HistoryNode::GitCommit { .. } => panic!("expected CollapsedImport"),
     }
 
     // Chain B's META has no anchor in B -> must stay standalone (never attach to A).

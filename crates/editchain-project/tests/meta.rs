@@ -1096,7 +1096,7 @@ fn activity_view_hides_trace_rows_and_splices_chain() {
         .find(|n| n.node_key() == c.id.to_string())
         .expect("gamma row kept");
     assert_eq!(
-        c_node.parent_keys(&projection.git.links, projection.relationship_notes()),
+        c_node.parent_keys(&projection.git().links, projection.relationship_notes()),
         vec![a.id.to_string()],
         "spliced parent skips the hidden trace row"
     );
@@ -1190,7 +1190,7 @@ fn activity_view_preserves_structural_trace_anchor_rows() {
         .find(|n| n.node_key() == trace.id.to_string())
         .expect("preserved trace anchor row");
     assert_eq!(
-        trace_node.parent_keys(&projection.git.links, projection.relationship_notes()),
+        trace_node.parent_keys(&projection.git().links, projection.relationship_notes()),
         vec![spawn.id.to_string()],
         "virtual SubagentOf edge renders from the preserved trace anchor"
     );
@@ -1199,7 +1199,7 @@ fn activity_view_preserves_structural_trace_anchor_rows() {
         .find(|n| n.node_key() == sub.id.to_string())
         .expect("sub row");
     assert_eq!(
-        sub_node.parent_keys(&projection.git.links, projection.relationship_notes()),
+        sub_node.parent_keys(&projection.git().links, projection.relationship_notes()),
         vec![trace.id.to_string()],
         "sub row still points at the preserved structural anchor"
     );

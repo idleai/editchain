@@ -257,7 +257,7 @@ fn context_compaction_stays_visible_and_is_inlined_without_changing_raw() {
         .find(|node| node.node_key() == continuation.id.to_string())
         .unwrap_or_else(|| panic!("raw continuation missing"));
     assert_eq!(
-        raw_continuation.parent_keys(&projection.git.links, projection.relationship_notes()),
+        raw_continuation.parent_keys(&projection.git().links, projection.relationship_notes()),
         vec![root.id.to_string()],
         "Raw keeps the imported sibling topology"
     );
@@ -273,7 +273,7 @@ fn context_compaction_stays_visible_and_is_inlined_without_changing_raw() {
     assert_eq!(checkpoint.visibility(), Visibility::Primary);
     assert_eq!(checkpoint.activity_kind(), ActivityKind::Plan);
     assert_eq!(
-        checkpoint.parent_keys(&projection.git.links, projection.relationship_notes()),
+        checkpoint.parent_keys(&projection.git().links, projection.relationship_notes()),
         vec![root.id.to_string()]
     );
     let activity_continuation = activity
@@ -281,7 +281,7 @@ fn context_compaction_stays_visible_and_is_inlined_without_changing_raw() {
         .find(|node| node.node_key() == continuation.id.to_string())
         .unwrap_or_else(|| panic!("Activity continuation missing"));
     assert_eq!(
-        activity_continuation.parent_keys(&projection.git.links, projection.relationship_notes()),
+        activity_continuation.parent_keys(&projection.git().links, projection.relationship_notes()),
         vec![compacted.id.to_string()],
         "Activity inserts the continuation after the visible checkpoint"
     );
@@ -311,14 +311,14 @@ fn context_compaction_does_not_rewire_a_structural_continuation() {
         continuation_message,
     ]);
     let filtered = projection.activity_nodes();
-    let structural = HashSet::from([continuation.id.to_string()]);
+    let structural = HashSet::from([editchain_project::NodeKey::Op(continuation.id)]);
     let activity = inline_context_compaction_checkpoints(filtered, &structural);
     let kept = activity
         .iter()
         .find(|node| node.node_key() == continuation.id.to_string())
         .unwrap_or_else(|| panic!("structural continuation missing"));
     assert_eq!(
-        kept.parent_keys(&projection.git.links, projection.relationship_notes()),
+        kept.parent_keys(&projection.git().links, projection.relationship_notes()),
         vec![root.id.to_string()],
         "structural fork/subagent/reconnect endpoints are never rewritten"
     );
@@ -742,7 +742,7 @@ fn plan_repeat_grouping_never_crosses_content_group_or_structural_boundaries() {
         plan(import_op(22, 2, None, None), "Structural heading"),
         plan(import_op(22, 1, None, None), "Structural heading"),
     ];
-    let structural = HashSet::from([structural_pair[0].node_key()]);
+    let structural = HashSet::from([structural_pair[0].key()]);
     let preserved = bundle_activity_plan_repeats(structural_pair, &structural);
     assert!(
         preserved
@@ -881,13 +881,11 @@ fn bundles_parallel_claude_tool_blocks_from_one_exact_response() {
         panic!("expected continuation row");
     };
     assert_eq!(
-        op.parents
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>(),
+        bundled[0].parent_keys(&empty_links, &empty_notes),
         vec![bundle.node_key()],
-        "the response continuation must follow the bundle, not form a sibling"
+        "the response continuation follows the bundle"
     );
+    assert_eq!(op.as_ref(), &continuation, "source envelope is retained");
 }
 
 #[test]
@@ -1429,8 +1427,10 @@ fn claude_response_fragment_with_structural_topology_stays_visible() {
         ),
     ];
 
-    let bundled =
-        bundle_claude_response_tool_fragments(nodes, &HashSet::from([tool.id.to_string()]));
+    let bundled = bundle_claude_response_tool_fragments(
+        nodes,
+        &HashSet::from([editchain_project::NodeKey::Op(tool.id)]),
+    );
 
     assert_eq!(bundled.len(), 4);
     assert!(bundled
@@ -2190,7 +2190,12 @@ fn bundle_parents_rewire_to_the_anchor_key() {
     let HistoryNode::CollapsedImport { op, .. } = kept_message else {
         panic!("expected kept CollapsedImport message row");
     };
-    let parent_keys: Vec<String> = op.parents.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        op.parents,
+        ParentSet::One(tool_op_3.id),
+        "source parent is retained"
+    );
+    let parent_keys = kept_message.parent_keys(&BTreeMap::new(), &HashMap::new());
     assert_eq!(parent_keys, vec![tool_op_4.id.to_string()]);
     let HistoryNode::ExecuteBundle { .. } = &bundled[0] else {
         panic!("expected ExecuteBundle at the run slot");

@@ -670,7 +670,7 @@ fn filtered_layout_resolves_folded_relationship_endpoints() {
         .find(|n| n.node_key() == sub_later.id.to_string())
         .expect("later subagent row kept");
     assert_eq!(
-        later.parent_keys(&projection.git.links, projection.relationship_notes()),
+        later.parent_keys(&projection.git().links, projection.relationship_notes()),
         vec![sub_import.id.to_string()],
         "splice must reconnect across the hidden undated row"
     );
@@ -761,6 +761,7 @@ fn parent_relations_for_emits_every_distinct_kind_per_parent() {
     let sub_note = relation_note(6, 2, b1.id, t1.id, NoteRelationship::SubagentOf);
     let dup_sub_note = relation_note(7, 3, b1.id, t1.id, NoteRelationship::SubagentOf);
 
+    let evidence = [fork_note.id, sub_note.id, dup_sub_note.id];
     let projection = HistoryProjection::from_ops(vec![
         t1.clone(),
         b1.clone(),
@@ -791,4 +792,15 @@ fn parent_relations_for_emits_every_distinct_kind_per_parent() {
         ],
         "every distinct (parent, kind) must be emitted once"
     );
+    let graph = projection.resolved_graph(&projection.nodes());
+    let relations = graph.relations(editchain_project::NodeKey::Op(b1.id));
+    assert_eq!(relations.len(), 2);
+    assert_eq!(relations.first().unwrap().evidence, vec![evidence[0]]);
+    assert_eq!(
+        relations.last().unwrap().evidence,
+        vec![evidence[1], evidence[2]]
+    );
+    assert!(relations.iter().all(|relation| graph
+        .parents(editchain_project::NodeKey::Op(b1.id))
+        .contains(&relation.parent)));
 }

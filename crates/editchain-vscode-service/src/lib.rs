@@ -2016,7 +2016,7 @@ fn git_file_change_index(
             continue;
         };
         for commit in projection
-            .git
+            .git()
             .commits
             .values()
             .filter(|commit| commit.repository == discovery.id)
@@ -2290,8 +2290,8 @@ impl Workspace {
     /// Create a workspace from an existing projection (used in tests).
     #[must_use]
     pub fn from_projection(projection: HistoryProjection) -> Self {
-        let source_ops = projection.ops.clone();
-        let session_metadata = session_metadata_index(&projection.ops);
+        let source_ops = projection.ops().to_vec();
+        let session_metadata = session_metadata_index(projection.ops());
         let source_op_index = source_ops
             .iter()
             .enumerate()
@@ -2431,7 +2431,7 @@ impl Workspace {
             .enumerate()
             .map(|(index, op)| (op.id, index))
             .collect();
-        let session_metadata = session_metadata_index(&projection.ops);
+        let session_metadata = session_metadata_index(projection.ops());
         let agent_file_changes = agent_file_change_index(
             &source_ops,
             &workspace_path,
@@ -2511,7 +2511,7 @@ impl Workspace {
         match &self.backend {
             WorkspaceBackend::Cached(snapshot) => snapshot.chain_generation(),
             WorkspaceBackend::Projected => {
-                u64::try_from(self.projection.ops.len()).unwrap_or(u64::MAX)
+                u64::try_from(self.projection.ops().len()).unwrap_or(u64::MAX)
             }
         }
     }
@@ -2567,7 +2567,7 @@ impl Workspace {
                 snapshot_id: self.snapshot_id.clone(),
                 rows: Vec::new(),
                 total: 0,
-                chain_generation: u64::try_from(self.projection.ops.len()).unwrap_or(u64::MAX),
+                chain_generation: u64::try_from(self.projection.ops().len()).unwrap_or(u64::MAX),
                 max_lane: 0,
                 sub_op_counts: (offset == 0).then(Vec::new),
                 expansion_spans: (offset == 0).then(Vec::new),
@@ -2805,7 +2805,7 @@ impl Workspace {
             snapshot_id: self.snapshot_id.clone(),
             rows,
             total: u64::try_from(expanded_total).unwrap_or(u64::MAX),
-            chain_generation: u64::try_from(self.projection.ops.len()).unwrap_or(u64::MAX),
+            chain_generation: u64::try_from(self.projection.ops().len()).unwrap_or(u64::MAX),
             max_lane: snapshot.max_lane,
             // The renderer always establishes snapshot state from offset zero;
             // ship the O(V) expansion index once for that snapshot, not with
@@ -3039,7 +3039,7 @@ impl Workspace {
         if let Some(oid) = git_oid {
             let commit = self
                 .projection
-                .git
+                .git()
                 .commits
                 .values()
                 .find(|c| c.oid == oid)?;
@@ -3832,7 +3832,7 @@ pub fn prepare_render_snapshot(
     builder.finish(
         SnapshotManifestData {
             projection_nodes: u64::try_from(workspace.projection.len()).unwrap_or(u64::MAX),
-            chain_generation: u64::try_from(workspace.projection.ops.len()).unwrap_or(u64::MAX),
+            chain_generation: u64::try_from(workspace.projection.ops().len()).unwrap_or(u64::MAX),
             max_lane,
             diagnostics: workspace.diagnostics,
         },
@@ -3923,7 +3923,7 @@ fn node_is_system(node: &editchain_project::HistoryNode) -> bool {
         // summary rows; Git is likewise user-facing source history.
         editchain_project::HistoryNode::WorkGroup { .. }
         | editchain_project::HistoryNode::PlanBundle { .. }
-        | editchain_project::HistoryNode::GitCommit(_) => false,
+        | editchain_project::HistoryNode::GitCommit { .. } => false,
     }
 }
 
@@ -3944,7 +3944,9 @@ fn node_author(node: &editchain_project::HistoryNode) -> String {
         | editchain_project::HistoryNode::ExecuteBundle { author, .. }
         | editchain_project::HistoryNode::PlanBundle { author, .. } => author.clone(),
         editchain_project::HistoryNode::WorkGroup { .. } => "agent".to_string(),
-        editchain_project::HistoryNode::GitCommit(commit) => payload_text(&commit.author.name),
+        editchain_project::HistoryNode::GitCommit { commit, .. } => {
+            payload_text(&commit.author.name)
+        }
     }
 }
 
@@ -4200,7 +4202,7 @@ fn node_activity_bundle(
         }
         editchain_project::HistoryNode::EditOperation { .. }
         | editchain_project::HistoryNode::CollapsedImport { .. }
-        | editchain_project::HistoryNode::GitCommit(_) => None,
+        | editchain_project::HistoryNode::GitCommit { .. } => None,
     }
 }
 
@@ -4217,7 +4219,7 @@ fn node_leaf_activity_count(node: &editchain_project::HistoryNode) -> u64 {
             .fold(0u64, u64::saturating_add),
         editchain_project::HistoryNode::EditOperation { .. }
         | editchain_project::HistoryNode::CollapsedImport { .. }
-        | editchain_project::HistoryNode::GitCommit(_) => 1,
+        | editchain_project::HistoryNode::GitCommit { .. } => 1,
     }
 }
 
@@ -4320,7 +4322,7 @@ fn node_file_changes(
         | editchain_project::HistoryNode::CollapsedImport { op, .. } => {
             agent_changes.get(&op.id).cloned().unwrap_or_default()
         }
-        editchain_project::HistoryNode::GitCommit(commit) => git_changes
+        editchain_project::HistoryNode::GitCommit { commit, .. } => git_changes
             .get(&(commit.repository, commit.oid))
             .cloned()
             .unwrap_or_default(),
@@ -4530,7 +4532,7 @@ fn node_sub_op_meta_index(
         editchain_project::HistoryNode::EditOperation { .. }
         | editchain_project::HistoryNode::CollapsedImport { .. }
         | editchain_project::HistoryNode::WorkGroup { .. }
-        | editchain_project::HistoryNode::GitCommit(_) => HashMap::new(),
+        | editchain_project::HistoryNode::GitCommit { .. } => HashMap::new(),
     }
 }
 
@@ -4767,7 +4769,7 @@ fn node_commit_id(node: &editchain_project::HistoryNode) -> String {
         editchain_project::HistoryNode::ExecuteBundle { anchor, .. }
         | editchain_project::HistoryNode::PlanBundle { anchor, .. }
         | editchain_project::HistoryNode::WorkGroup { anchor, .. } => abbreviate_op_id(&anchor.id),
-        editchain_project::HistoryNode::GitCommit(commit) => abbreviate_oid(&commit.oid),
+        editchain_project::HistoryNode::GitCommit { commit, .. } => abbreviate_oid(&commit.oid),
     }
 }
 
@@ -4958,7 +4960,7 @@ pub fn build_lexical_index(
     // Index git commits as synthetic ops, recording the deterministic mapping
     // from each synthetic op id back to the real commit identity so search
     // responses navigate by (repository, oid) — never the synthetic id.
-    for commit in workspace.projection.git.commits.values() {
+    for commit in workspace.projection.git().commits.values() {
         let op = Op {
             id: OpId::new(NodeId(0), 0, generation),
             parents: ParentSet::None,
@@ -5021,12 +5023,12 @@ fn merge_exact_git_link_targets(
     repositories: &[editchain_git::RepositoryDiscovery],
 ) -> usize {
     let targets: std::collections::BTreeSet<(RepositoryId, GitOid)> = projection
-        .git
+        .git()
         .links
         .values()
         .flatten()
         .map(|link| (link.target_repo, link.target_oid))
-        .filter(|target| !projection.git.commits.contains_key(target))
+        .filter(|target| !projection.git().commits.contains_key(target))
         .collect();
 
     let mut unresolved = targets.len();
@@ -6071,7 +6073,7 @@ mod tests {
         assert!(!value["warnings"].as_array().unwrap().is_empty());
 
         let ws = server.workspace.as_ref().unwrap();
-        for op in &ws.projection.ops {
+        for op in ws.projection.ops() {
             if let OpKind::Message(message) = &op.kind {
                 assert!(matches!(message.content, Payload::Blob(_)));
             }
@@ -6125,7 +6127,7 @@ mod tests {
         assert_eq!(ws.diagnostics.chain.accepted, 1);
         assert_eq!(ws.diagnostics.chain.duplicates, 1);
         assert_eq!(ws.diagnostics.chain.quarantined, 2);
-        assert_eq!(ws.projection.ops, vec![second]);
+        assert_eq!(ws.projection.ops(), vec![second]);
         assert_eq!(ws.diagnostics.warnings().len(), 2);
         assert!(ws.node_details(Some(first.id.to_string()), None).is_none());
     }

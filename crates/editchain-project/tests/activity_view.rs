@@ -52,10 +52,8 @@ fn subagent_note(parent_id: OpId, target_id: OpId) -> Op {
 #[test]
 fn virtual_subagent_parent_is_not_duplicated_after_activity_projection() {
     // The chain holds exactly one SubagentOf note per child. The default
-    // Activity projection materializes the virtual target into the visible
-    // clone's stored `Op.parents`; re-reading `parent_keys` (as the service
-    // does when emitting `HistoryRow.parents`) must not append the same
-    // virtual target a second time.
+    // Activity projection retains that target as a derived edge. Re-reading
+    // `parent_keys` must not append the same virtual target a second time.
     let spawn_marker = msg_op(2, 1, 1_000, None, "spawned subagent");
     let sub_first = msg_op(3, 1, 2_000, None, "sub work");
     let note = subagent_note(sub_first.id, spawn_marker.id);
@@ -68,7 +66,7 @@ fn virtual_subagent_parent_is_not_duplicated_after_activity_projection() {
         .find(|n| n.node_key() == sub_first.id.to_string())
         .expect("subagent first op kept");
 
-    let parents = sub.parent_keys(&projection.git.links, projection.relationship_notes());
+    let parents = sub.parent_keys(&projection.git().links, projection.relationship_notes());
     assert_eq!(
         parents,
         vec![spawn_marker.id.to_string()],
@@ -91,6 +89,7 @@ fn activity_view_splices_edges_across_undated_rows() {
     let b = msg_op(1, 2, 0, Some(a.id), "beta");
     let c = msg_op(1, 3, 3_000, Some(b.id), "gamma");
     let a_id = a.id;
+    let original = c.clone();
     let projection = HistoryProjection::from_ops(vec![a, b, c]);
 
     let nodes = projection.activity_nodes();
@@ -100,9 +99,37 @@ fn activity_view_splices_edges_across_undated_rows() {
         .iter()
         .find(|n| n.summary() == "gamma")
         .expect("gamma kept");
-    let parents = c_node.parent_keys(&projection.git.links, projection.relationship_notes());
+    let parents = c_node.parent_keys(&projection.git().links, projection.relationship_notes());
     assert_eq!(parents.len(), 1);
     assert_eq!(parents[0], a_id.to_string());
+    assert!(
+        matches!(c_node, editchain_project::HistoryNode::EditOperation { op, .. } if op.as_ref() == &original)
+    );
+}
+
+#[test]
+fn activity_splices_a_long_hidden_chain_without_recursive_stack_growth() {
+    let root = msg_op(77, 1, 1_000, None, "root");
+    let mut previous = root.id;
+    let mut operations = vec![root.clone()];
+    for sequence in 2..20_000 {
+        let hidden = msg_op(77, sequence, 0, Some(previous), "hidden");
+        previous = hidden.id;
+        operations.push(hidden);
+    }
+    let tip = msg_op(77, 20_000, 2_000, Some(previous), "tip");
+    operations.push(tip.clone());
+    let projection = HistoryProjection::from_ops(operations);
+    let nodes = projection.activity_nodes();
+    assert_eq!(nodes.len(), 2);
+    let graph = projection.resolved_graph(&nodes);
+    assert_eq!(
+        graph.parents(editchain_project::NodeKey::Op(tip.id)),
+        &[editchain_project::NodeKey::Op(root.id)]
+    );
+    assert!(
+        matches!(nodes.first(), Some(editchain_project::HistoryNode::EditOperation { op, .. }) if op.as_ref() == &tip)
+    );
 }
 
 #[test]
@@ -187,7 +214,7 @@ fn activity_view_splices_through_undated_structural_endpoints() {
         .find(|node| node.node_key() == branch_work.id.to_string())
         .expect("dated subagent work remains visible");
     assert_eq!(
-        work.parent_keys(&projection.git.links, projection.relationship_notes()),
+        work.parent_keys(&projection.git().links, projection.relationship_notes()),
         vec![trunk.id.to_string()],
         "the stored structural relationship must splice onto dated endpoints"
     );

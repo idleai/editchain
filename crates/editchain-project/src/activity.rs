@@ -59,7 +59,7 @@ use crate::meta::{
     sub_op_is_world_state_or_turn_context, NodeMeta,
 };
 use crate::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
-use crate::{EffectiveTime, HistoryNode};
+use crate::{EffectiveTime, HistoryNode, NodeKey};
 
 /// Keep raw context-compaction checkpoints visible while making them inline in
 /// the Activity view's source-stream path.
@@ -82,7 +82,7 @@ use crate::{EffectiveTime, HistoryNode};
 #[must_use]
 pub fn inline_context_compaction_checkpoints<S: std::hash::BuildHasher>(
     mut nodes: Vec<HistoryNode>,
-    structural_keys: &HashSet<String, S>,
+    structural_keys: &HashSet<NodeKey, S>,
 ) -> Vec<HistoryNode> {
     let mut streams: HashMap<(u64, u32), Vec<RawRowFacts>> = HashMap::new();
     let mut stored_parents = HashSet::new();
@@ -110,8 +110,8 @@ pub fn inline_context_compaction_checkpoints<S: std::hash::BuildHasher>(
                 || checkpoint.sole_parent.is_none()
                 || checkpoint.sole_parent != continuation.sole_parent
                 || stored_parents.contains(&checkpoint.id)
-                || structural_keys.contains(&checkpoint.id.to_string())
-                || structural_keys.contains(&continuation.id.to_string())
+                || structural_keys.contains(&NodeKey::Op(checkpoint.id))
+                || structural_keys.contains(&NodeKey::Op(continuation.id))
             {
                 continue;
             }
@@ -127,7 +127,7 @@ pub fn inline_context_compaction_checkpoints<S: std::hash::BuildHasher>(
 
     for (index, checkpoint) in rewrites {
         if let Some(continuation) = nodes.get_mut(index) {
-            continuation.override_parent_keys(&[checkpoint.to_string()]);
+            continuation.override_parents(&[NodeKey::Op(checkpoint)]);
         }
     }
     nodes
@@ -331,7 +331,7 @@ pub fn annotate_activity_rows(nodes: &[HistoryNode]) -> Vec<ActivityRowAnnotatio
 pub fn bundle_activity_execute_runs(
     nodes: Vec<HistoryNode>,
     annotations: &[ActivityRowAnnotation],
-    structural_keys: &HashSet<String>,
+    structural_keys: &HashSet<NodeKey>,
 ) -> Vec<HistoryNode> {
     debug_assert_eq!(
         nodes.len(),
@@ -342,7 +342,7 @@ pub fn bundle_activity_execute_runs(
         .iter()
         .zip(annotations)
         .map(|(node, _)| MemberFacts {
-            key: node.node_key(),
+            key: node.key(),
             group: node.group(),
             execution_unit: node.turn_id().map(ExecuteUnit::Turn).or_else(|| {
                 node_anchor_op(node)
@@ -420,17 +420,17 @@ pub fn bundle_activity_execute_runs(
 #[must_use]
 pub fn bundle_claude_response_tool_fragments<S: std::hash::BuildHasher>(
     mut nodes: Vec<HistoryNode>,
-    structural_keys: &HashSet<String, S>,
+    structural_keys: &HashSet<NodeKey, S>,
 ) -> Vec<HistoryNode> {
     if nodes.len() < 2 {
         return nodes;
     }
 
-    let keys: Vec<String> = nodes.iter().map(HistoryNode::node_key).collect();
-    let index_of: HashMap<String, usize> = keys
+    let keys: Vec<NodeKey> = nodes.iter().map(HistoryNode::key).collect();
+    let index_of: HashMap<NodeKey, usize> = keys
         .iter()
         .enumerate()
-        .map(|(index, key)| (key.clone(), index))
+        .map(|(index, key)| (*key, index))
         .collect();
     let groups: Vec<String> = nodes.iter().map(HistoryNode::group).collect();
     let response_ids: Vec<Option<String>> = nodes.iter().map(claude_response_id_of_node).collect();
@@ -447,7 +447,7 @@ pub fn bundle_claude_response_tool_fragments<S: std::hash::BuildHasher>(
     // edges. Coincidental/disconnected reuse of an id is never gathered.
     let mut neighbors: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
     for (child_index, node) in nodes.iter().enumerate() {
-        for parent_key in stored_parent_keys(node) {
+        for parent_key in node.activity_parents() {
             let Some(&parent_index) = index_of.get(&parent_key) else {
                 continue;
             };
@@ -470,12 +470,12 @@ pub fn bundle_claude_response_tool_fragments<S: std::hash::BuildHasher>(
     let components = claude_response_components(&nodes, &keys, &eligible, &neighbors);
     let mut replacement = HashMap::new();
     for component in &components {
-        let Some(representative) = keys.get(component.anchor_index).cloned() else {
+        let Some(representative) = keys.get(component.anchor_index).copied() else {
             continue;
         };
         for &index in &component.indices {
             if let Some(key) = keys.get(index) {
-                drop(replacement.insert(key.clone(), representative.clone()));
+                let _: Option<NodeKey> = replacement.insert(*key, representative);
             }
         }
     }
@@ -493,7 +493,7 @@ pub fn bundle_claude_response_tool_fragments<S: std::hash::BuildHasher>(
         if members.is_empty() {
             continue;
         }
-        let Some(representative) = keys.get(component.anchor_index).cloned() else {
+        let Some(representative) = keys.get(component.anchor_index).copied() else {
             continue;
         };
         let execute_members = flatten_execute_member_nodes(members.into_iter());
@@ -519,8 +519,8 @@ struct ClaudeResponseComponent {
 #[must_use]
 fn claude_execute_response_eligible<S: std::hash::BuildHasher>(
     node: &HistoryNode,
-    key: &str,
-    structural_keys: &HashSet<String, S>,
+    key: &NodeKey,
+    structural_keys: &HashSet<NodeKey, S>,
 ) -> bool {
     if structural_keys.contains(key)
         || node.visibility() != Visibility::Primary
@@ -543,7 +543,7 @@ fn claude_execute_response_eligible<S: std::hash::BuildHasher>(
 #[must_use]
 fn claude_response_components(
     nodes: &[HistoryNode],
-    keys: &[String],
+    keys: &[NodeKey],
     eligible: &[bool],
     neighbors: &[Vec<usize>],
 ) -> Vec<ClaudeResponseComponent> {
@@ -579,7 +579,7 @@ fn claude_response_components(
 #[must_use]
 fn contractible_claude_component(
     nodes: &[HistoryNode],
-    keys: &[String],
+    keys: &[NodeKey],
     indices: Vec<usize>,
 ) -> Option<ClaudeResponseComponent> {
     if indices.len() < 2 {
@@ -591,18 +591,19 @@ fn contractible_claude_component(
     {
         return None;
     }
-    let member_keys: HashSet<&str> = indices
+    let member_keys: HashSet<NodeKey> = indices
         .iter()
-        .filter_map(|&index| keys.get(index).map(String::as_str))
+        .filter_map(|&index| keys.get(index).copied())
         .collect();
     let roots: Vec<usize> = indices
         .iter()
         .copied()
         .filter(|&index| {
             nodes.get(index).is_some_and(|node| {
-                !stored_parent_keys(node)
+                !node
+                    .activity_parents()
                     .iter()
-                    .any(|parent| member_keys.contains(parent.as_str()))
+                    .any(|parent| member_keys.contains(parent))
             })
         })
         .collect();
@@ -617,16 +618,16 @@ fn contractible_claude_component(
 }
 
 /// Rewrite one Activity node through exact response representatives.
-fn rewrite_activity_parent_keys(node: &mut HistoryNode, replacement: &HashMap<String, String>) {
-    let old = stored_parent_keys(node);
-    let mut rewritten: Vec<String> = old
+fn rewrite_activity_parent_keys(node: &mut HistoryNode, replacement: &HashMap<NodeKey, NodeKey>) {
+    let old = node.activity_parents();
+    let mut rewritten: Vec<NodeKey> = old
         .iter()
-        .map(|key| replacement.get(key).cloned().unwrap_or_else(|| key.clone()))
+        .map(|key| replacement.get(key).copied().unwrap_or(*key))
         .collect();
     let mut seen = HashSet::with_capacity(rewritten.len());
-    rewritten.retain(|key| seen.insert(key.clone()));
+    rewritten.retain(|key| seen.insert(*key));
     if rewritten != old {
-        node.override_parent_keys(&rewritten);
+        node.override_parents(&rewritten);
     }
 }
 
@@ -634,18 +635,18 @@ fn rewrite_activity_parent_keys(node: &mut HistoryNode, replacement: &HashMap<St
 #[must_use]
 fn fold_terminal_claude_execute_into_narrative<S: std::hash::BuildHasher>(
     nodes: Vec<HistoryNode>,
-    structural_keys: &HashSet<String, S>,
+    structural_keys: &HashSet<NodeKey, S>,
 ) -> Vec<HistoryNode> {
-    let keys: Vec<String> = nodes.iter().map(HistoryNode::node_key).collect();
-    let index_of: HashMap<String, usize> = keys
+    let keys: Vec<NodeKey> = nodes.iter().map(HistoryNode::key).collect();
+    let index_of: HashMap<NodeKey, usize> = keys
         .iter()
         .enumerate()
-        .map(|(index, key)| (key.clone(), index))
+        .map(|(index, key)| (*key, index))
         .collect();
     let response_ids: Vec<Option<String>> = nodes.iter().map(claude_response_id_of_node).collect();
     let mut child_counts = vec![0usize; nodes.len()];
     for node in &nodes {
-        for parent in stored_parent_keys(node) {
+        for parent in node.activity_parents() {
             if let Some(&parent_index) = index_of.get(&parent) {
                 if let Some(count) = child_counts.get_mut(parent_index) {
                     *count = count.saturating_add(1);
@@ -665,7 +666,7 @@ fn fold_terminal_claude_execute_into_narrative<S: std::hash::BuildHasher>(
         {
             continue;
         }
-        let parent_keys = stored_parent_keys(child);
+        let parent_keys = child.activity_parents();
         let [parent_key] = parent_keys.as_slice() else {
             continue;
         };
@@ -729,7 +730,7 @@ fn fold_terminal_claude_execute_into_narrative<S: std::hash::BuildHasher>(
                     HistoryNode::EditOperation { .. }
                     | HistoryNode::PlanBundle { .. }
                     | HistoryNode::WorkGroup { .. }
-                    | HistoryNode::GitCommit(_) => {}
+                    | HistoryNode::GitCommit { .. } => {}
                 }
             }
         }
@@ -749,7 +750,7 @@ fn flatten_execute_member_nodes(members: impl Iterator<Item = HistoryNode>) -> V
             HistoryNode::EditOperation { .. }
             | HistoryNode::PlanBundle { .. }
             | HistoryNode::WorkGroup { .. }
-            | HistoryNode::GitCommit(_) => {}
+            | HistoryNode::GitCommit { .. } => {}
         }
     }
     flattened
@@ -772,12 +773,12 @@ fn flatten_execute_member_nodes(members: impl Iterator<Item = HistoryNode>) -> V
 )]
 pub fn bundle_activity_plan_repeats<S: std::hash::BuildHasher>(
     nodes: Vec<HistoryNode>,
-    structural_keys: &HashSet<String, S>,
+    structural_keys: &HashSet<NodeKey, S>,
 ) -> Vec<HistoryNode> {
     let facts: Vec<PlanMemberFacts> = nodes
         .iter()
         .map(|node| PlanMemberFacts {
-            key: node.node_key(),
+            key: node.key(),
             group: node.group(),
             turn: node.turn_id(),
             heading: normalized_plan_heading(&node.summary()),
@@ -848,19 +849,19 @@ pub fn bundle_activity_plan_repeats<S: std::hash::BuildHasher>(
 #[must_use]
 pub fn bundle_activity_work_groups<S: std::hash::BuildHasher>(
     nodes: Vec<HistoryNode>,
-    structural_keys: &HashSet<String, S>,
+    structural_keys: &HashSet<NodeKey, S>,
 ) -> Vec<HistoryNode> {
     if nodes.is_empty() {
         return nodes;
     }
-    let keys: Vec<String> = nodes.iter().map(HistoryNode::node_key).collect();
-    let present: HashSet<&str> = keys.iter().map(String::as_str).collect();
-    let parents: Vec<Vec<String>> = nodes
+    let keys: Vec<NodeKey> = nodes.iter().map(HistoryNode::key).collect();
+    let present: HashSet<NodeKey> = keys.iter().copied().collect();
+    let parents: Vec<Vec<NodeKey>> = nodes
         .iter()
         .map(|node| {
-            stored_parent_keys(node)
+            node.activity_parents()
                 .into_iter()
-                .filter(|parent| present.contains(parent.as_str()))
+                .filter(|parent| present.contains(parent))
                 .collect()
         })
         .collect();
@@ -914,28 +915,25 @@ pub fn bundle_activity_work_groups<S: std::hash::BuildHasher>(
 /// fan-in/fan-out. The returned set is the complete set of legal group breaks.
 #[must_use]
 fn causal_branch_boundaries<S: std::hash::BuildHasher>(
-    keys: &[String],
-    parents: &[Vec<String>],
-    structural_keys: &HashSet<String, S>,
-) -> HashSet<String> {
-    let mut boundaries: HashSet<String> = structural_keys.iter().cloned().collect();
-    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
+    keys: &[NodeKey],
+    parents: &[Vec<NodeKey>],
+    structural_keys: &HashSet<NodeKey, S>,
+) -> HashSet<NodeKey> {
+    let mut boundaries: HashSet<NodeKey> = structural_keys.iter().copied().collect();
+    let mut children: HashMap<NodeKey, Vec<NodeKey>> = HashMap::new();
     for (child, node_parents) in keys.iter().zip(parents) {
         if node_parents.len() > 1 {
-            let _: bool = boundaries.insert(child.clone());
-            boundaries.extend(node_parents.iter().cloned());
+            let _: bool = boundaries.insert(*child);
+            boundaries.extend(node_parents.iter().copied());
         }
         for parent in node_parents {
-            children
-                .entry(parent.as_str())
-                .or_default()
-                .push(child.as_str());
+            children.entry(*parent).or_default().push(*child);
         }
     }
     for (parent, child_keys) in children {
         if child_keys.len() > 1 {
-            let _: bool = boundaries.insert(parent.to_owned());
-            boundaries.extend(child_keys.into_iter().map(str::to_owned));
+            let _: bool = boundaries.insert(parent);
+            boundaries.extend(child_keys);
         }
     }
     boundaries
@@ -967,7 +965,7 @@ fn is_session_start_boundary(node: &HistoryNode) -> bool {
 /// no repeated string formatting or sub-op JSON parsing.
 struct MemberFacts {
     /// Node key (op id or commit OID hex).
-    key: String,
+    key: NodeKey,
     /// Display group (session/repo/ops), precomputed once per node.
     group: String,
     /// Exact execution identity (runs never cross turns/responses).
@@ -1005,13 +1003,13 @@ fn claude_response_id_of_node(node: &HistoryNode) -> Option<String> {
         HistoryNode::EditOperation { .. }
         | HistoryNode::PlanBundle { .. }
         | HistoryNode::WorkGroup { .. }
-        | HistoryNode::GitCommit(_) => None,
+        | HistoryNode::GitCommit { .. } => None,
     }
 }
 
 /// Precomputed identity and heading facts for one Plan-repeat candidate.
 struct PlanMemberFacts {
-    key: String,
+    key: NodeKey,
     group: String,
     turn: Option<TurnId>,
     heading: Option<String>,
@@ -1037,7 +1035,7 @@ fn contract_runs(
     }
     let mut slots: Vec<Option<HistoryNode>> = nodes.into_iter().map(Some).collect();
     let mut result: Vec<HistoryNode> = Vec::with_capacity(slots.len());
-    let mut bundle_of_member: HashMap<String, String> = HashMap::new();
+    let mut bundle_of_member: HashMap<NodeKey, NodeKey> = HashMap::new();
     let mut run_iter = runs.into_iter().peekable();
     for idx in 0..slots.len() {
         if let Some((start, end)) = run_iter.next_if(|&(start, _)| start == idx) {
@@ -1045,11 +1043,11 @@ fn contract_runs(
                 .iter_mut()
                 .filter_map(Option::take)
                 .collect();
-            let bundle_key = members
-                .first()
-                .map_or_else(String::new, HistoryNode::node_key);
+            let Some(bundle_key) = members.first().map(HistoryNode::key) else {
+                continue;
+            };
             for member in &members {
-                drop(bundle_of_member.insert(member.node_key(), bundle_key.clone()));
+                let _: Option<NodeKey> = bundle_of_member.insert(member.key(), bundle_key);
             }
             result.push(build(members));
         } else if let Some(node) = slots[idx].take() {
@@ -1058,21 +1056,15 @@ fn contract_runs(
     }
     if !bundle_of_member.is_empty() {
         for node in &mut result {
-            // Bundles read their parents through an intra-run filter and git
-            // rows never reference op members; only stored op parents of kept
-            // rows need the rewrite.
-            if matches!(node, HistoryNode::GitCommit(_)) {
-                continue;
-            }
-            let old = stored_parent_keys(node);
+            let old = node.activity_parents();
             if old.is_empty() {
                 continue;
             }
             let mut keys = old;
             let mut changed = false;
             for key in &mut keys {
-                if let Some(replacement) = bundle_of_member.get(key.as_str()) {
-                    *key = replacement.clone();
+                if let Some(replacement) = bundle_of_member.get(key) {
+                    *key = *replacement;
                     changed = true;
                 }
             }
@@ -1080,77 +1072,11 @@ fn contract_runs(
                 continue;
             }
             let mut seen = HashSet::with_capacity(keys.len());
-            keys.retain(|key| seen.insert(key.clone()));
-            node.override_parent_keys(&keys);
+            keys.retain(|key| seen.insert(*key));
+            node.override_parents(&keys);
         }
     }
     result
-}
-
-/// The stored causal parent keys of an op-backed row (empty otherwise).
-#[must_use]
-fn stored_parent_keys(node: &HistoryNode) -> Vec<String> {
-    match node {
-        HistoryNode::EditOperation {
-            parent_override: Some(keys),
-            ..
-        }
-        | HistoryNode::CollapsedImport {
-            parent_override: Some(keys),
-            ..
-        }
-        | HistoryNode::ExecuteBundle {
-            parent_override: Some(keys),
-            ..
-        }
-        | HistoryNode::PlanBundle {
-            parent_override: Some(keys),
-            ..
-        }
-        | HistoryNode::WorkGroup {
-            parent_override: Some(keys),
-            ..
-        } => keys.clone(),
-        HistoryNode::EditOperation {
-            op,
-            parent_override: None,
-            ..
-        }
-        | HistoryNode::CollapsedImport {
-            op,
-            parent_override: None,
-            ..
-        } => op.parents.iter().map(ToString::to_string).collect(),
-        HistoryNode::ExecuteBundle {
-            member_nodes,
-            parent_override: None,
-            ..
-        }
-        | HistoryNode::PlanBundle {
-            member_nodes,
-            parent_override: None,
-            ..
-        }
-        | HistoryNode::WorkGroup {
-            member_nodes,
-            parent_override: None,
-            ..
-        } => {
-            let member_keys: HashSet<String> =
-                member_nodes.iter().map(HistoryNode::node_key).collect();
-            let mut seen = HashSet::new();
-            let mut parents = Vec::new();
-            for member in member_nodes {
-                for parent in stored_parent_keys(member) {
-                    if !member_keys.contains(&parent) && seen.insert(parent.clone()) {
-                        parents.push(parent);
-                    }
-                }
-            }
-            parents
-        }
-        HistoryNode::GitCommit(_) => Vec::new(),
-    }
 }
 
 /// Build one synthetic summary node from a run's member rows (newest-first).
@@ -1164,11 +1090,11 @@ fn build_execute_bundle(members: Vec<HistoryNode>) -> HistoryNode {
 #[must_use]
 fn build_execute_bundle_with_anchor(
     members: Vec<HistoryNode>,
-    anchor_key: Option<&str>,
+    anchor_key: Option<&NodeKey>,
 ) -> HistoryNode {
     let newest = members.first();
     let anchor_member = anchor_key
-        .and_then(|key| members.iter().find(|member| member.node_key() == key))
+        .and_then(|key| members.iter().find(|member| member.key() == *key))
         .or(newest);
     let anchor = anchor_member
         .and_then(node_anchor_op)
@@ -1290,7 +1216,7 @@ fn flatten_single_work_group_member(mut members: Vec<HistoryNode>) -> Vec<Histor
         | HistoryNode::WorkGroup { member_nodes, .. } => member_nodes,
         ordinary @ (HistoryNode::EditOperation { .. }
         | HistoryNode::CollapsedImport { .. }
-        | HistoryNode::GitCommit(_)) => vec![ordinary],
+        | HistoryNode::GitCommit { .. }) => vec![ordinary],
     }
 }
 
@@ -1308,7 +1234,7 @@ fn flattened_work_group_members(members: &[HistoryNode]) -> Vec<std::sync::Arc<O
             HistoryNode::ExecuteBundle { members, .. }
             | HistoryNode::PlanBundle { members, .. }
             | HistoryNode::WorkGroup { members, .. } => members.clone(),
-            HistoryNode::GitCommit(_) => Vec::new(),
+            HistoryNode::GitCommit { .. } => Vec::new(),
         };
         for op in candidates {
             if seen.insert(op.id) {
@@ -1354,7 +1280,7 @@ fn collect_activity_counts(node: &HistoryNode, counts: &mut HashMap<ActivityKind
         }
         HistoryNode::EditOperation { .. }
         | HistoryNode::CollapsedImport { .. }
-        | HistoryNode::GitCommit(_) => {
+        | HistoryNode::GitCommit { .. } => {
             let count = counts.entry(node.activity_kind()).or_default();
             *count = count.saturating_add(1);
         }
@@ -1506,7 +1432,7 @@ fn node_anchor_op(node: &HistoryNode) -> Option<&Op> {
         HistoryNode::ExecuteBundle { anchor, .. }
         | HistoryNode::PlanBundle { anchor, .. }
         | HistoryNode::WorkGroup { anchor, .. } => Some(anchor.as_ref()),
-        HistoryNode::GitCommit(_) => None,
+        HistoryNode::GitCommit { .. } => None,
     }
 }
 
@@ -1586,7 +1512,7 @@ fn member_author_label(node: &HistoryNode) -> String {
         HistoryNode::ExecuteBundle { .. }
         | HistoryNode::PlanBundle { .. }
         | HistoryNode::WorkGroup { .. }
-        | HistoryNode::GitCommit(_) => "system".to_string(),
+        | HistoryNode::GitCommit { .. } => "system".to_string(),
     }
 }
 

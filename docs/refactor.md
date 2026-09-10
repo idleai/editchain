@@ -60,6 +60,14 @@ Completed increments:
   tokens even when the cache fingerprint is unchanged. Old services receive
   the unchanged Open request and produce a visible version error. Rust, browser,
   and host regressions cover stale responses and refresh ownership.
+- Graph stages: scheduling, filtering, and Activity contraction use typed
+  operation/Git keys and a common parent contract. Derived parents preserve
+  complete source envelopes for every row kind, including mixed-domain edges
+  and more than two parents. An immutable resolved table supplies layout and
+  structural labels, retaining supporting note/source IDs. Projection inputs
+  are read-only through their public API. Hidden ancestry uses an iterative
+  traversal; a 20,000-record regression protects it. Revision 50 invalidates
+  caches from the earlier parent-rewrite implementation.
 
 Remaining work, in dependency order:
 

@@ -17,6 +17,9 @@ pub mod taxonomy;
 
 mod view;
 
+mod graph;
+pub use graph::{NodeKey, ResolvedGraph, ResolvedRelation};
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -26,7 +29,7 @@ use editchain_core::{
     RepositoryId,
 };
 
-use crate::layout::{compute_graph_layout, compute_lane_assignment, GraphLayout, GraphRow};
+use crate::layout::{GraphLayout, GraphRow};
 use crate::meta::NodeMeta;
 use crate::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility as RowVisibility};
 
@@ -53,7 +56,7 @@ pub enum HistoryNode {
         source_time: EffectiveTime,
         /// Final parent keys for a derived view, when filtering or Activity
         /// contraction rewrites topology without changing canonical evidence.
-        parent_override: Option<Vec<String>>,
+        parent_override: Option<Vec<NodeKey>>,
     },
     /// A raw import op collapsed with its normalized children into one node.
     ///
@@ -68,7 +71,7 @@ pub enum HistoryNode {
         source_time: EffectiveTime,
         /// Final parent keys for a derived view, when filtering or Activity
         /// contraction rewrites topology without changing canonical evidence.
-        parent_override: Option<Vec<String>>,
+        parent_override: Option<Vec<NodeKey>>,
         /// Display summary derived from the normalization children.
         summary: String,
         /// Dominant child kind (e.g. "tool", "message", "command") for styling.
@@ -104,7 +107,7 @@ pub enum HistoryNode {
         source_time: EffectiveTime,
         /// Final parent keys for a derived view, when a later contraction
         /// rewrites this bundle's visible topology.
-        parent_override: Option<Vec<String>>,
+        parent_override: Option<Vec<NodeKey>>,
         /// The original top-level member rows, newest-first (display order).
         /// Used to render faithful expandable sub-op labels.
         member_nodes: Vec<HistoryNode>,
@@ -139,7 +142,7 @@ pub enum HistoryNode {
         source_time: EffectiveTime,
         /// Final parent keys for a derived view, when a later contraction
         /// rewrites this bundle's visible topology.
-        parent_override: Option<Vec<String>>,
+        parent_override: Option<Vec<NodeKey>>,
         /// Original top-level Plan rows, newest-first (display order).
         member_nodes: Vec<HistoryNode>,
         /// Flat expandable ops: every member's op followed by its own bundled
@@ -168,7 +171,7 @@ pub enum HistoryNode {
         /// Effective display time of the newest member.
         source_time: EffectiveTime,
         /// Final parent keys for the contracted derived view.
-        parent_override: Option<Vec<String>>,
+        parent_override: Option<Vec<NodeKey>>,
         /// Original top-level member rows, newest-first. Existing synthetic
         /// bundles remain intact in this vector.
         member_nodes: Vec<HistoryNode>,
@@ -181,7 +184,12 @@ pub enum HistoryNode {
         meta: NodeMeta,
     },
     /// A `Git` commit entity.
-    GitCommit(Box<GitCommitEntity>),
+    GitCommit {
+        /// Immutable source commit; derived edges never rewrite its parents.
+        commit: Box<GitCommitEntity>,
+        /// Final parents in a derived view, including operation parents.
+        parent_override: Option<Vec<NodeKey>>,
+    },
 }
 
 impl HistoryNode {
@@ -201,7 +209,7 @@ impl HistoryNode {
             Self::ExecuteBundle { summary, .. }
             | Self::PlanBundle { summary, .. }
             | Self::WorkGroup { summary, .. } => summary.clone(),
-            Self::GitCommit(commit) => match &commit.message {
+            Self::GitCommit { commit, .. } => match &commit.message {
                 Payload::Inline(b) => String::from_utf8_lossy(b).to_string(),
                 Payload::Empty | Payload::Blob(_) => commit.oid.to_hex(),
             },
@@ -236,7 +244,7 @@ impl HistoryNode {
             | Self::ExecuteBundle { source_time, .. }
             | Self::PlanBundle { source_time, .. }
             | Self::WorkGroup { source_time, .. } => *source_time,
-            Self::GitCommit(commit) => {
+            Self::GitCommit { commit, .. } => {
                 let secs = u64::try_from(commit.committed_at).unwrap_or(0);
                 EffectiveTime::Observed(secs.saturating_mul(1000))
             }
@@ -251,7 +259,7 @@ impl HistoryNode {
             Self::ExecuteBundle { anchor, .. }
             | Self::PlanBundle { anchor, .. }
             | Self::WorkGroup { anchor, .. } => Some(anchor.id),
-            Self::GitCommit(_) => None,
+            Self::GitCommit { .. } => None,
         }
     }
 
@@ -264,7 +272,7 @@ impl HistoryNode {
             | Self::ExecuteBundle { .. }
             | Self::PlanBundle { .. }
             | Self::WorkGroup { .. } => None,
-            Self::GitCommit(commit) => Some(commit.oid),
+            Self::GitCommit { commit, .. } => Some(commit.oid),
         }
     }
 
@@ -277,7 +285,7 @@ impl HistoryNode {
             | Self::ExecuteBundle { .. }
             | Self::PlanBundle { .. }
             | Self::WorkGroup { .. } => None,
-            Self::GitCommit(commit) => Some(commit.repository),
+            Self::GitCommit { commit, .. } => Some(commit.repository),
         }
     }
 
@@ -298,7 +306,7 @@ impl HistoryNode {
             Self::ExecuteBundle { anchor, .. }
             | Self::PlanBundle { anchor, .. }
             | Self::WorkGroup { anchor, .. } => bundle_group(anchor),
-            Self::GitCommit(commit) => format!("repo:{}", commit.repository.0),
+            Self::GitCommit { commit, .. } => format!("repo:{}", commit.repository.0),
         }
     }
 
@@ -307,14 +315,18 @@ impl HistoryNode {
     /// `EditChain` ops use their `OpId` string; Git commits use `git:<repository>:<oid>` keys.
     #[must_use]
     pub fn node_key(&self) -> String {
+        self.key().to_string()
+    }
+
+    /// Typed graph identity, independent of display formatting.
+    #[must_use]
+    pub fn key(&self) -> NodeKey {
         match self {
-            Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => op.id.to_string(),
-            // A bundle retains one real member as its graph identity. Its
-            // display slot/time can come from the newest member independently.
+            Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => NodeKey::Op(op.id),
             Self::ExecuteBundle { anchor, .. }
             | Self::PlanBundle { anchor, .. }
-            | Self::WorkGroup { anchor, .. } => anchor.id.to_string(),
-            Self::GitCommit(commit) => commit.key().to_string(),
+            | Self::WorkGroup { anchor, .. } => NodeKey::Op(anchor.id),
+            Self::GitCommit { commit, .. } => NodeKey::Git(commit.key()),
         }
     }
 
@@ -349,14 +361,29 @@ impl HistoryNode {
     /// parents, then non-redundant git-link targets from the row and its
     /// sub-ops, then virtual note targets), so a target shared between any of
     /// the three sources is emitted exactly once. This keeps parent keys
-    /// deterministic and duplicate-free even when a filtered clone has
-    /// materialized a virtual target into its stored `Op.parents`.
+    /// deterministic and duplicate-free across source and derived views.
     #[must_use]
     pub fn parent_keys(
         &self,
         git_links: &std::collections::BTreeMap<OpId, Vec<editchain_core::GitLink>>,
         notes: &HashMap<OpId, Vec<Op>>,
     ) -> Vec<String> {
+        self.parent_nodes(git_links, notes)
+            .into_iter()
+            .map(|key| key.to_string())
+            .collect()
+    }
+
+    /// Authoritative typed parents for this stage of the projection.
+    ///
+    /// Source ancestry, stored links, resolved notes, and group membership are
+    /// interpreted here once; ordering and derived views use this same contract.
+    #[must_use]
+    pub fn parent_nodes(
+        &self,
+        git_links: &std::collections::BTreeMap<OpId, Vec<editchain_core::GitLink>>,
+        notes: &HashMap<OpId, Vec<Op>>,
+    ) -> Vec<NodeKey> {
         match self {
             Self::EditOperation {
                 parent_override: Some(keys),
@@ -375,6 +402,10 @@ impl HistoryNode {
                 ..
             }
             | Self::WorkGroup {
+                parent_override: Some(keys),
+                ..
+            }
+            | Self::GitCommit {
                 parent_override: Some(keys),
                 ..
             } => return keys.clone(),
@@ -398,12 +429,15 @@ impl HistoryNode {
                 parent_override: None,
                 ..
             }
-            | Self::GitCommit(_) => {}
+            | Self::GitCommit {
+                parent_override: None,
+                ..
+            } => {}
         }
         match self {
             Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => {
-                let mut keys: Vec<String> = Vec::new();
-                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut keys: Vec<NodeKey> = Vec::new();
+                let mut seen: std::collections::HashSet<NodeKey> = std::collections::HashSet::new();
                 let anchored_notes = notes.get(&op.id);
                 // A resolved exact provider parent supersedes the physical
                 // source predecessor in the display graph. Provider identity
@@ -414,8 +448,8 @@ impl HistoryNode {
                     has_exact_provider_parent(op.id, anchored_notes.map(Vec::as_slice));
                 if !has_provider_parent {
                     for parent in &op.parents {
-                        let key = parent.to_string();
-                        if seen.insert(key.clone()) {
+                        let key = NodeKey::Op(*parent);
+                        if seen.insert(key) {
                             keys.push(key);
                         }
                     }
@@ -440,8 +474,8 @@ impl HistoryNode {
                             link.kind != GitLinkKind::ProducedBy
                                 && !(source_has_spawn_parent && link.kind == GitLinkKind::BasedOn)
                         }) {
-                            let key = link.target_key().to_string();
-                            if seen.insert(key.clone()) {
+                            let key = NodeKey::Git(link.target_key());
+                            if seen.insert(key) {
                                 keys.push(key);
                             }
                         }
@@ -450,10 +484,8 @@ impl HistoryNode {
                 // Virtual parents: this op is the child occurrence annotated by
                 // a graph-bearing relation, so the note's target becomes a
                 // parent edge. Correlation-only facts never enter this path.
-                // Deduplicate against stored/git parents: the hide-undated
-                // filter materializes virtual targets into the cloned op's
-                // `Op.parents`, so a later read would otherwise repeat the same
-                // edge even though the chain holds one note per child.
+                // A stored causal edge and a resolved note can name the same
+                // parent; their shared endpoint appears only once.
                 if let Some(notes) = anchored_notes {
                     for note in notes {
                         if let editchain_core::OpKind::Note(n) = &note.kind {
@@ -461,8 +493,8 @@ impl HistoryNode {
                                 continue;
                             }
                             for target in &n.target_ids {
-                                let key = target.to_string();
-                                if seen.insert(key.clone()) {
+                                let key = NodeKey::Op(*target);
+                                if seen.insert(key) {
                                     keys.push(key);
                                 }
                             }
@@ -493,37 +525,37 @@ impl HistoryNode {
                 // those slots no longer render. In a linear chain the anchor's
                 // own parents are intra-run, so this union — not just the
                 // anchor's parents — is what keeps the run's incoming edges.
-                let member_keys: std::collections::HashSet<String> =
-                    members.iter().map(|m| m.id.to_string()).collect();
-                let mut keys: Vec<String> = Vec::new();
-                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let member_keys: std::collections::HashSet<NodeKey> =
+                    members.iter().map(|m| NodeKey::Op(m.id)).collect();
+                let mut keys: Vec<NodeKey> = Vec::new();
+                let mut seen: std::collections::HashSet<NodeKey> = std::collections::HashSet::new();
                 for member in member_nodes {
-                    for parent in member.parent_keys(git_links, notes) {
+                    for parent in member.parent_nodes(git_links, notes) {
                         if member_keys.contains(&parent) {
                             continue;
                         }
-                        if seen.insert(parent.clone()) {
+                        if seen.insert(parent) {
                             keys.push(parent);
                         }
                     }
                 }
                 keys
             }
-            Self::GitCommit(commit) => {
-                let mut keys: Vec<String> = commit
+            Self::GitCommit { commit, .. } => {
+                let mut keys: Vec<NodeKey> = commit
                     .parents
                     .iter()
-                    .map(|oid| GitCommitKey::new(commit.repository, *oid).to_string())
+                    .map(|oid| NodeKey::Git(GitCommitKey::new(commit.repository, *oid)))
                     .collect();
-                let mut seen: std::collections::HashSet<String> = keys.iter().cloned().collect();
+                let mut seen: std::collections::HashSet<NodeKey> = keys.iter().copied().collect();
                 for links in git_links.values() {
                     for link in links.iter().filter(|link| {
                         link.kind == GitLinkKind::ProducedBy
                             && link.target_repo == commit.repository
                             && link.target_oid == commit.oid
                     }) {
-                        let key = link.source.to_string();
-                        if seen.insert(key.clone()) {
+                        let key = NodeKey::Op(link.source);
+                        if seen.insert(key) {
                             keys.push(key);
                         }
                     }
@@ -533,75 +565,16 @@ impl HistoryNode {
         }
     }
 
-    /// Rewrite this cloned node's physical causal parents.
+    /// Set authoritative typed parents for this derived view.
     ///
-    /// Op parents are parsed from `"node:boot:seq"` display strings; git parents
-    /// are parsed from repository-qualified Git keys. Keys that fail to parse are dropped. Derived
-    /// projections should use [`Self::override_parent_keys`] so immutable
-    /// relationship notes cannot supersede the rewrite during graph layout.
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "ids[0]/ids[1] are guarded by the match on ids.len()"
-    )]
-    pub fn set_parent_keys(&mut self, keys: &[String]) {
-        match self {
-            Self::EditOperation { op, .. } | Self::CollapsedImport { op, .. } => {
-                let mut ids: Vec<OpId> = keys
-                    .iter()
-                    .filter_map(|k| OpId::from_display_str(k))
-                    .collect();
-                ids.sort_unstable();
-                ids.dedup();
-                Arc::make_mut(op).parents = match ids.len() {
-                    0 => editchain_core::parents::ParentSet::None,
-                    1 => editchain_core::parents::ParentSet::One(ids[0]),
-                    _ => editchain_core::parents::ParentSet::Two(ids[0], ids[1]),
-                };
-            }
-            Self::ExecuteBundle { anchor, .. }
-            | Self::PlanBundle { anchor, .. }
-            | Self::WorkGroup { anchor, .. } => {
-                let mut ids: Vec<OpId> = keys
-                    .iter()
-                    .filter_map(|k| OpId::from_display_str(k))
-                    .collect();
-                ids.sort_unstable();
-                ids.dedup();
-                Arc::make_mut(anchor).parents = match ids.len() {
-                    0 => editchain_core::parents::ParentSet::None,
-                    1 => editchain_core::parents::ParentSet::One(ids[0]),
-                    _ => editchain_core::parents::ParentSet::Two(ids[0], ids[1]),
-                };
-            }
-            Self::GitCommit(commit) => {
-                let mut oids: Vec<GitOid> = keys
-                    .iter()
-                    .filter_map(|key| GitCommitKey::from_display_str(key))
-                    .filter(|key| key.repository == commit.repository)
-                    .map(|key| key.oid)
-                    .collect();
-                oids.sort_unstable();
-                oids.dedup();
-                commit.parents = oids;
-            }
-        }
-    }
-
-    /// Set authoritative parent keys for this derived view.
-    ///
-    /// Unlike [`Self::set_parent_keys`], this override wins over immutable
-    /// provider relationship notes when layout later asks for parents. The
-    /// underlying cloned op is also updated for callers that inspect its
-    /// envelope directly, while the canonical projection and raw records stay
-    /// unchanged. Git rows have no separate override and are rewritten in
-    /// place.
-    pub fn override_parent_keys(&mut self, keys: &[String]) {
-        self.set_parent_keys(keys);
+    /// Operation and Git source envelopes remain unchanged, including when a
+    /// view contracts more than two parents or mixes Git and operation edges.
+    pub fn override_parents(&mut self, keys: &[NodeKey]) {
         let mut seen = std::collections::HashSet::with_capacity(keys.len());
-        let normalized: Vec<String> = keys
+        let normalized = keys
             .iter()
-            .filter(|key| seen.insert((*key).clone()))
-            .cloned()
+            .copied()
+            .filter(|key| seen.insert(*key))
             .collect();
         match self {
             Self::EditOperation {
@@ -618,9 +591,17 @@ impl HistoryNode {
             }
             | Self::WorkGroup {
                 parent_override, ..
+            }
+            | Self::GitCommit {
+                parent_override, ..
             } => *parent_override = Some(normalized),
-            Self::GitCommit(_) => {}
         }
+    }
+
+    /// Parents used by Activity passes after canonical edges have been frozen.
+    /// Standalone advanced-pass callers retain source-parent behavior.
+    fn activity_parents(&self) -> Vec<NodeKey> {
+        self.parent_nodes(&std::collections::BTreeMap::new(), &HashMap::new())
     }
 
     /// Returns the bundled metadata sub-ops attached to this node (empty for
@@ -633,7 +614,7 @@ impl HistoryNode {
             Self::ExecuteBundle { members, .. }
             | Self::PlanBundle { members, .. }
             | Self::WorkGroup { members, .. } => members,
-            Self::EditOperation { .. } | Self::GitCommit(_) => &[],
+            Self::EditOperation { .. } | Self::GitCommit { .. } => &[],
         }
     }
 
@@ -666,7 +647,7 @@ impl HistoryNode {
             | Self::ExecuteBundle { kind, .. }
             | Self::PlanBundle { kind, .. } => kind.clone(),
             Self::WorkGroup { .. } => "work-group".to_string(),
-            Self::GitCommit(_) => "git".to_string(),
+            Self::GitCommit { .. } => "git".to_string(),
         }
     }
 
@@ -683,7 +664,7 @@ impl HistoryNode {
             | Self::PlanBundle { meta, .. }
             | Self::WorkGroup { meta, .. } => *meta,
             Self::EditOperation { op, .. } => meta::for_edit_operation(op),
-            Self::GitCommit(_) => meta::for_git_commit(),
+            Self::GitCommit { .. } => meta::for_git_commit(),
         }
     }
 
@@ -743,19 +724,15 @@ fn bundle_group(anchor: &Op) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct HistoryProjection {
     /// `EditChain` operations in canonical causal order (oldest-first).
-    pub ops: Vec<Op>,
+    ops: Vec<Op>,
     /// `Git` commits keyed by `(RepositoryId, GitOid)`.
-    pub git: GitProjection,
+    git: GitProjection,
     /// Typed relationship facts keyed by the raw occurrence they annotate, as
     /// stored in `Op.parents`. This is the construction-time index: collapse
     /// reads it to resolve provider entities and canonicalize endpoints
     /// exposed by [`Self::relationship_notes`]. Keeping the raw index here means
     /// collapse-time logic never needs the canonical map before it exists.
     relationship_notes: HashMap<OpId, Vec<Op>>,
-    /// Git commit OID hexes of the currently projected commits, cached so
-    /// per-row parent lifting stays O(parents) instead of cloning the full
-    /// present set (or scanning every commit) for each windowed row.
-    git_present: std::collections::HashSet<String>,
     /// Cached collapsed (top-level-row) projection with its canonical
     /// representative map and canonicalized relationship notes. Computed once at
     /// construction so every per-row path (`ordered_nodes`, `independent_chains`,
@@ -825,7 +802,6 @@ impl HistoryProjection {
             ops: Vec::new(),
             git: GitProjection::new(),
             relationship_notes: HashMap::new(),
-            git_present: std::collections::HashSet::new(),
             collapsed_projection: CollapsedProjection::default(),
         }
     }
@@ -851,16 +827,10 @@ impl HistoryProjection {
                 }
             }
         }
-        let git_present: std::collections::HashSet<String> = git
-            .commits
-            .values()
-            .map(|commit| commit.key().to_string())
-            .collect();
         let mut projection = Self {
             ops,
             git,
             relationship_notes,
-            git_present,
             collapsed_projection: CollapsedProjection::default(),
         };
         // Build the canonical collapse eagerly so `relationship_notes` and every
@@ -868,6 +838,18 @@ impl HistoryProjection {
         // and reused by every row/layout path.
         projection.collapsed_projection = projection.collapsed_ops();
         projection
+    }
+
+    /// Accepted source operations, immutable for this projection.
+    #[must_use]
+    pub fn ops(&self) -> &[Op] {
+        &self.ops
+    }
+
+    /// Observed Git facts. New commits enter through `merge_git_commits`.
+    #[must_use]
+    pub const fn git(&self) -> &GitProjection {
+        &self.git
     }
 
     /// Returns the structural relationship notes re-keyed for edge drawing:
@@ -917,14 +899,18 @@ impl HistoryProjection {
     #[must_use]
     pub fn activity_nodes(&self) -> Vec<HistoryNode> {
         let nodes = self.ordered_nodes();
-        let structural = self.structural_row_keys(&nodes);
-        view::apply(
-            nodes,
-            &self.git.links,
-            self.relationship_notes(),
-            &self.collapsed_projection.representative,
-            &structural,
-        )
+        let graph = self.resolved_graph(&nodes);
+        let mut structural = self.structural_row_keys(&nodes);
+        // Preserve dated producing rows even when their commit is unavailable.
+        structural.extend(
+            self.git
+                .links
+                .values()
+                .flatten()
+                .filter(|link| link.kind == GitLinkKind::ProducedBy)
+                .filter_map(|link| self.visible_op_id(link.source).map(NodeKey::Op)),
+        );
+        view::apply(nodes, &graph, &structural)
     }
 
     /// Resolve an operation id to the canonical op id of the visible top-level
@@ -958,29 +944,25 @@ impl HistoryProjection {
     pub fn independent_chains(&self) -> usize {
         let mut nodes: Vec<HistoryNode> = self.collapsed_projection.nodes.clone();
         for commit in self.git.commits.values() {
-            nodes.push(HistoryNode::GitCommit(Box::new(commit.clone())));
+            nodes.push(HistoryNode::GitCommit {
+                commit: Box::new(commit.clone()),
+                parent_override: None,
+            });
         }
-        let present: std::collections::HashSet<String> =
-            nodes.iter().map(HistoryNode::node_key).collect();
-        let roots: Vec<&HistoryNode> = nodes
+        let present = nodes.iter().map(HistoryNode::key).collect();
+        nodes
             .iter()
             .filter(|node| {
-                // A node is a root only when none of its parents resolve to a
-                // present row — directly, or through a folded-op representative
-                // (bundled META op, normalized child, tool result, relation fact,
-                // copied occurrence, ...). Unresolved parents are dropped, so they can
-                // never fragment a source chain into an extra root.
-                let child_key = node.node_key();
-                canonicalize_parents(
-                    node.parent_keys(&self.git.links, self.relationship_notes()),
+                ordering_parent_keys(
+                    node,
+                    &self.git.links,
+                    self.relationship_notes(),
                     &self.collapsed_projection.representative,
                     &present,
-                    &child_key,
                 )
                 .is_empty()
             })
-            .collect();
-        roots.len()
+            .count()
     }
 
     /// Returns a window of history nodes (newest-first).
@@ -1031,7 +1013,10 @@ impl HistoryProjection {
             nodes.push(op.clone());
         }
         for commit in self.git.commits.values() {
-            nodes.push(HistoryNode::GitCommit(Box::new(commit.clone())));
+            nodes.push(HistoryNode::GitCommit {
+                commit: Box::new(commit.clone()),
+                parent_override: None,
+            });
         }
 
         // Unknown source time stays unknown. Topology and source order place
@@ -1053,11 +1038,11 @@ impl HistoryProjection {
         // through `representative` to the absorbing anchor row, so the child stays
         // connected to its source chain instead of fragmenting into a new root.
         // This lifts the edge WITHOUT rewriting stored `Op.parents`.
-        let keys: Vec<OrderingKey> = nodes.iter().map(ordering_key).collect();
-        let present: std::collections::HashSet<OrderingKey> = keys.iter().copied().collect();
+        let keys: Vec<NodeKey> = nodes.iter().map(HistoryNode::key).collect();
+        let present: std::collections::HashSet<NodeKey> = keys.iter().copied().collect();
         // Use typed Copy keys while scheduling, avoiding repeated OpId string
         // formatting, allocation, and hashing on the first large-chain window.
-        let index_of: HashMap<OrderingKey, usize> = keys
+        let index_of: HashMap<NodeKey, usize> = keys
             .iter()
             .enumerate()
             .map(|(index, key)| (*key, index))
@@ -1519,7 +1504,7 @@ impl HistoryProjection {
                 | HistoryNode::ExecuteBundle { .. }
                 | HistoryNode::PlanBundle { .. }
                 | HistoryNode::WorkGroup { .. }
-                | HistoryNode::GitCommit(_) => None,
+                | HistoryNode::GitCommit { .. } => None,
             })
             .collect();
         let metadata: std::collections::HashSet<OpId> = metadata_scopes.keys().copied().collect();
@@ -1537,7 +1522,7 @@ impl HistoryProjection {
                 | HistoryNode::ExecuteBundle { .. }
                 | HistoryNode::PlanBundle { .. }
                 | HistoryNode::WorkGroup { .. }
-                | HistoryNode::GitCommit(_) => None,
+                | HistoryNode::GitCommit { .. } => None,
             })
             .collect();
 
@@ -1914,20 +1899,6 @@ impl HistoryProjection {
                 kept.push(n);
             }
             *result = kept;
-            for node in result.iter_mut() {
-                let keys = node.parent_keys(&self.git.links, relationship_notes);
-                let mut spliced: Vec<String> = keys
-                    .iter()
-                    .map(|k| {
-                        OpId::from_display_str(k)
-                            .and_then(|id| replacement.get(&id).copied())
-                            .map_or_else(|| k.clone(), |repl| repl.to_string())
-                    })
-                    .collect();
-                spliced.sort_unstable();
-                spliced.dedup();
-                node.set_parent_keys(&spliced);
-            }
         }
     }
 
@@ -1992,13 +1963,11 @@ impl HistoryProjection {
     /// same key replaces an earlier one.
     pub fn merge_git_commits(&mut self, commits: Vec<GitCommitEntity>) {
         for commit in commits {
-            let key = commit.key().to_string();
             drop(
                 self.git
                     .commits
                     .insert((commit.repository, commit.oid), commit),
             );
-            let _: bool = self.git_present.insert(key);
         }
     }
 
@@ -2021,96 +1990,51 @@ impl HistoryProjection {
     /// appears below its child.
     #[must_use]
     pub fn graph_layout_filtered(&self, sorted: &[HistoryNode]) -> GraphLayout {
-        let keys = Self::layout_keys(sorted);
-        let key_to_node = Self::layout_index(sorted);
-        let links = &self.git.links;
-        // The visible rows are the rows being laid out (possibly filtered), so a
-        // parent resolves only when it is present in THIS layout.
-        let present = row_node_keys(sorted);
-        let representative = &self.collapsed_projection.representative;
-        let parents_of = |key: &str| -> Vec<String> {
-            key_to_node.get(key).map_or(Vec::new(), |n| {
-                canonicalize_parents(
-                    n.parent_keys(links, self.relationship_notes()),
-                    representative,
-                    &present,
-                    key,
-                )
-            })
-        };
-        let is_git =
-            |key: &str| -> bool { key_to_node.get(key).is_some_and(|n| n.git_oid().is_some()) };
-        compute_graph_layout(&keys, parents_of, &is_git)
+        self.resolved_graph(sorted).layout()
     }
 
-    /// Compute the lane assignment over a pre-sorted node list (no edges).
-    ///
-    /// This is linear and stable across viewport sizes, so it can be cached and
-    /// reused for many windowed edge computations.
+    /// Assign lanes for this exact ordered graph, without edge geometry.
     #[must_use]
     pub fn lane_assignment_filtered(&self, sorted: &[HistoryNode]) -> Vec<GraphRow> {
-        let keys = Self::layout_keys(sorted);
-        let key_to_node = Self::layout_index(sorted);
-        let links = &self.git.links;
-        let present = row_node_keys(sorted);
-        let representative = &self.collapsed_projection.representative;
-        let parents_of = |key: &str| -> Vec<String> {
-            key_to_node.get(key).map_or(Vec::new(), |n| {
-                canonicalize_parents(
-                    n.parent_keys(links, self.relationship_notes()),
-                    representative,
-                    &present,
-                    key,
-                )
-            })
-        };
-        let is_git =
-            |key: &str| -> bool { key_to_node.get(key).is_some_and(|n| n.git_oid().is_some()) };
-        compute_lane_assignment(&keys, &parents_of, &is_git)
+        self.resolved_graph(sorted).lane_assignment()
     }
 
-    /// Build a cached [`layout::LayoutContext`] over a pre-sorted node list.
-    ///
-    /// The context bundles all O(V) derived data (keys, row map, lane map, lane
-    /// assignment) so per-window edge computation is O(window). Build once per
-    /// Activity-view snapshot and reuse across scrolls/resizes.
+    /// Build reusable geometry from the same finalized typed graph as rows.
     #[must_use]
     pub fn layout_context(&self, sorted: &[HistoryNode]) -> layout::LayoutContext {
-        let keys = Self::layout_keys(sorted);
-        let key_to_node = Self::layout_index(sorted);
-        let links = &self.git.links;
-        // The visible rows are the rows being laid out (possibly filtered), so a
-        // parent resolves only when it is present in THIS layout.
-        let present = row_node_keys(sorted);
-        let representative = &self.collapsed_projection.representative;
-        let parents_of = |key: &str| -> Vec<String> {
-            key_to_node.get(key).map_or(Vec::new(), |n| {
-                canonicalize_parents(
-                    n.parent_keys(links, self.relationship_notes()),
-                    representative,
+        self.resolved_graph(sorted).layout_context()
+    }
+
+    /// Resolve a complete graph stage from canonical or derived nodes.
+    ///
+    /// All endpoints belong to `sorted`; geometry and structural labels share
+    /// this table. Source operations and commits are never modified.
+    #[must_use]
+    pub fn resolved_graph(&self, sorted: &[HistoryNode]) -> ResolvedGraph {
+        let keys: Vec<NodeKey> = sorted.iter().map(HistoryNode::key).collect();
+        let present = keys.iter().copied().collect();
+        let rows = sorted
+            .iter()
+            .map(|node| {
+                let parents = ordering_parent_keys(
+                    node,
+                    &self.git.links,
+                    self.relationship_notes(),
+                    &self.collapsed_projection.representative,
                     &present,
-                    key,
+                );
+                let relations = self.resolved_relations_for(node, &parents);
+                (
+                    node.key(),
+                    graph::ResolvedGraphRow {
+                        parents,
+                        relations,
+                        chain_state: node.chain_state(),
+                    },
                 )
             })
-        };
-        let is_git =
-            |key: &str| -> bool { key_to_node.get(key).is_some_and(|n| n.git_oid().is_some()) };
-        let chain_state_of = |key: &str| -> ChainState {
-            key_to_node
-                .get(key)
-                .map_or(ChainState::Active, |node| node.chain_state())
-        };
-        layout::LayoutContext::new_with_chain_state(&keys, &parents_of, &is_git, &chain_state_of)
-    }
-
-    /// Build the string-keyed node list for layout.
-    fn layout_keys(sorted: &[HistoryNode]) -> Vec<String> {
-        sorted.iter().map(HistoryNode::node_key).collect()
-    }
-
-    /// Build a node-key → node index over a pre-sorted node list.
-    fn layout_index(sorted: &[HistoryNode]) -> HashMap<String, &HistoryNode> {
-        sorted.iter().map(|n| (n.node_key(), n)).collect()
+            .collect();
+        ResolvedGraph::new(keys, rows)
     }
 
     /// Return this node's parent keys resolved to their canonical visible rows, so
@@ -2122,34 +2046,21 @@ impl HistoryProjection {
     /// chain assembly sees connected chains, not dangling folded-op parents.
     #[must_use]
     pub fn lifted_parent_keys(&self, node: &HistoryNode) -> Vec<String> {
-        // This public helper accepts either op or git rows. The collapsed cache's
-        // `present` set contains op rows only, so projected commit keys are
-        // checked against the cached [`Self::git_present`] set instead of
-        // cloning the full present set per row: the window emission calls this
-        // once per top-level row, so a per-row O(V) clone would make window
-        // materialization superlinear.
-        let representative = &self.collapsed_projection.representative;
-        let present = &self.collapsed_projection.present;
-        let mut out: Vec<String> = Vec::with_capacity(4);
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let child_key = node.node_key();
-        for parent in node.parent_keys(&self.git.links, self.relationship_notes()) {
-            let resolved = if present.contains(&parent) {
-                Some(parent)
-            } else if let Some(pid) = OpId::from_display_str(&parent) {
-                canonical_op_id(pid, representative, present).map(|id| id.to_string())
-            } else if self.git_present.contains(&parent) {
-                Some(parent)
-            } else {
-                None
-            };
-            if let Some(key) = resolved {
-                if key != child_key && seen.insert(key.clone()) {
-                    out.push(key);
-                }
-            }
-        }
-        out
+        let mut seen = std::collections::HashSet::new();
+        node.parent_nodes(&self.git.links, self.relationship_notes())
+            .into_iter()
+            .filter_map(|parent| {
+                let resolved = match parent {
+                    NodeKey::Op(id) => self.visible_op_id(id).map(NodeKey::Op),
+                    NodeKey::Git(key) => self
+                        .git
+                        .commits
+                        .contains_key(&(key.repository, key.oid))
+                        .then_some(parent),
+                }?;
+                (resolved != node.key() && seen.insert(resolved)).then(|| resolved.to_string())
+            })
+            .collect()
     }
 
     /// Returns the provider-neutral structural relations for one row in a view.
@@ -2170,61 +2081,75 @@ impl HistoryProjection {
         node: &HistoryNode,
         parents: &[String],
     ) -> Vec<ParentRelation> {
-        let representative = &self.collapsed_projection.representative;
-        let present = &self.collapsed_projection.present;
-        let mut out: Vec<ParentRelation> = Vec::new();
-        if let HistoryNode::GitCommit(commit) = node {
-            for parent in parents {
-                let matches = self.git.links.values().flatten().any(|link| {
-                    link.kind == GitLinkKind::ProducedBy
-                        && link.target_repo == commit.repository
-                        && link.target_oid == commit.oid
-                        && canonical_op_id(link.source, representative, present)
-                            .is_some_and(|source| source.to_string() == *parent)
+        let parents: Vec<NodeKey> = parents
+            .iter()
+            .filter_map(|key| NodeKey::from_display_str(key))
+            .collect();
+        self.resolved_relations_for(node, &parents)
+            .into_iter()
+            .map(|relation| ParentRelation {
+                parent: relation.parent.to_string(),
+                kind: relation.kind,
+            })
+            .collect()
+    }
+
+    fn resolved_relations_for(
+        &self,
+        node: &HistoryNode,
+        parents: &[NodeKey],
+    ) -> Vec<ResolvedRelation> {
+        let mut relations: Vec<ResolvedRelation> = Vec::new();
+        let mut record = |parent, kind, evidence| {
+            if let Some(relation) = relations
+                .iter_mut()
+                .find(|relation| relation.parent == parent && relation.kind == kind)
+            {
+                if !relation.evidence.contains(&evidence) {
+                    relation.evidence.push(evidence);
+                }
+            } else {
+                relations.push(ResolvedRelation {
+                    parent,
+                    kind,
+                    evidence: vec![evidence],
                 });
-                if matches {
-                    out.push(ParentRelation {
-                        parent: parent.clone(),
-                        kind: RelationKind::ProducedCommit,
-                    });
+            }
+        };
+        if let HistoryNode::GitCommit { commit, .. } = node {
+            for &parent in parents {
+                for link in self.git.links.values().flatten().filter(|link| {
+                    link.kind == GitLinkKind::ProducedBy
+                        && link.target_key() == commit.key()
+                        && self
+                            .visible_op_id(link.source)
+                            .is_some_and(|source| NodeKey::Op(source) == parent)
+                }) {
+                    record(parent, RelationKind::ProducedCommit, link.source);
                 }
             }
-            return out;
-        }
-        let Some(anchor_id) = node.op_id() else {
-            return out;
-        };
-        let Some(notes) = self.relationship_notes().get(&anchor_id) else {
-            return out;
-        };
-        for parent in parents {
-            for note in notes {
-                let editchain_core::OpKind::Note(n) = &note.kind else {
-                    continue;
-                };
-                let matches = n.target_ids.iter().any(|target| {
-                    canonical_parent_key(&target.to_string(), representative, present).as_deref()
-                        == Some(parent.as_str())
-                });
-                if !matches {
-                    continue;
-                }
-                if let Some(kind) = relation_kind(n.relationship) {
-                    let relation = ParentRelation {
-                        parent: parent.clone(),
-                        kind,
+        } else if let Some(notes) = node
+            .op_id()
+            .and_then(|id| self.relationship_notes().get(&id))
+        {
+            for &parent in parents {
+                for note in notes {
+                    let editchain_core::OpKind::Note(fact) = &note.kind else {
+                        continue;
                     };
-                    // Emit every distinct (parent, kind) pair rather than stopping
-                    // at the first note kind that matches a canonical parent; skip
-                    // exact duplicates deterministically (parent/note iteration
-                    // order is stable).
-                    if !out.contains(&relation) {
-                        out.push(relation);
+                    let Some(kind) = relation_kind(fact.relationship) else {
+                        continue;
+                    };
+                    if fact.target_ids.iter().any(|target| {
+                        self.visible_op_id(*target)
+                            .is_some_and(|id| NodeKey::Op(id) == parent)
+                    }) {
+                        record(parent, kind, note.id);
                     }
                 }
             }
         }
-        out
+        relations
     }
 
     /// Returns the node keys of rows that participate in structural topology
@@ -2236,22 +2161,24 @@ impl HistoryProjection {
     /// Activity view preserves them from trace removal. Targets are lifted to
     /// their canonical visible rows (or dropped when unresolvable in this view).
     #[must_use]
-    pub fn structural_row_keys(&self, nodes: &[HistoryNode]) -> std::collections::HashSet<String> {
+    pub fn structural_row_keys(&self, nodes: &[HistoryNode]) -> std::collections::HashSet<NodeKey> {
         let mut keys = std::collections::HashSet::new();
         let note_map = self.relationship_notes();
         let representative = &self.collapsed_projection.representative;
-        let present = row_node_keys(nodes);
+        let present: std::collections::HashSet<NodeKey> =
+            nodes.iter().map(HistoryNode::key).collect();
         for link in self.git.links.values().flatten().filter(|link| {
-            link.kind == GitLinkKind::ProducedBy && present.contains(&link.target_key().to_string())
+            link.kind == GitLinkKind::ProducedBy
+                && present.contains(&NodeKey::Git(link.target_key()))
         }) {
             if let Some(source) = canonical_op_id(
                 link.source,
                 representative,
                 &self.collapsed_projection.present,
             ) {
-                let _: bool = keys.insert(source.to_string());
+                let _: bool = keys.insert(NodeKey::Op(source));
             }
-            let _: bool = keys.insert(link.target_key().to_string());
+            let _: bool = keys.insert(NodeKey::Git(link.target_key()));
         }
         for node in nodes {
             let Some(anchor_id) = node.op_id() else {
@@ -2265,10 +2192,9 @@ impl HistoryProjection {
                     if !is_protected_structural_relationship(n.relationship) {
                         continue;
                     }
-                    let _: bool = keys.insert(node.node_key());
+                    let _: bool = keys.insert(node.key());
                     for target in &n.target_ids {
-                        if let Some(key) =
-                            canonical_parent_key(&target.to_string(), representative, &present)
+                        if let Some(key) = canonical_ordering_op(*target, representative, &present)
                         {
                             let _: bool = keys.insert(key);
                         }
@@ -2331,15 +2257,6 @@ pub enum RelationKind {
     ProducedCommit,
 }
 
-/// Allocation-free identity used only by the topological scheduler.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum OrderingKey {
-    /// `EditChain` operation identity.
-    Op(OpId),
-    /// Git commit identity.
-    Git(GitCommitKey),
-}
-
 /// Exact-equivalence key for occurrences of one provider event entity.
 ///
 /// Current importers supply a canonical provider payload fingerprint that
@@ -2351,19 +2268,6 @@ enum OccurrencePayloadKey {
     ProviderFingerprint(String),
     /// Byte-exact raw-line evidence retained for legacy facts.
     RawHash([u8; 32]),
-}
-
-/// Return the typed scheduler key for one visible row.
-fn ordering_key(node: &HistoryNode) -> OrderingKey {
-    match node {
-        HistoryNode::EditOperation { op, .. } | HistoryNode::CollapsedImport { op, .. } => {
-            OrderingKey::Op(op.id)
-        }
-        HistoryNode::ExecuteBundle { anchor, .. }
-        | HistoryNode::PlanBundle { anchor, .. }
-        | HistoryNode::WorkGroup { anchor, .. } => OrderingKey::Op(anchor.id),
-        HistoryNode::GitCommit(commit) => OrderingKey::Git(commit.key()),
-    }
 }
 
 /// Resolve provider entity handles in cloned relation facts without choosing an
@@ -2519,10 +2423,13 @@ fn canonical_present_op(
 fn canonical_ordering_op(
     mut id: OpId,
     representative: &HashMap<OpId, OpId>,
-    present: &std::collections::HashSet<OrderingKey>,
-) -> Option<OrderingKey> {
-    loop {
-        let key = OrderingKey::Op(id);
+    present: &std::collections::HashSet<NodeKey>,
+) -> Option<NodeKey> {
+    // At most one representative can be traversed per map entry; the extra
+    // lookup permits the terminal row. Cycles remain unresolved without a
+    // per-edge allocation for a visited set.
+    for _ in 0..=representative.len() {
+        let key = NodeKey::Op(id);
         if present.contains(&key) {
             return Some(key);
         }
@@ -2531,84 +2438,43 @@ fn canonical_ordering_op(
             Some(_) | None => return None,
         }
     }
+    None
 }
 
-/// Build canonical typed parents without formatting IDs as strings.
+/// Canonical typed edges shared by scheduling, filtering, and geometry.
+fn canonical_node_parents(
+    parents: Vec<NodeKey>,
+    representative: &HashMap<OpId, OpId>,
+    present: &std::collections::HashSet<NodeKey>,
+    child: NodeKey,
+) -> Vec<NodeKey> {
+    let mut seen = std::collections::HashSet::new();
+    parents
+        .into_iter()
+        .filter_map(|parent| {
+            let resolved = match parent {
+                NodeKey::Op(id) => canonical_ordering_op(id, representative, present),
+                NodeKey::Git(_) => present.contains(&parent).then_some(parent),
+            }?;
+            (resolved != child && seen.insert(resolved)).then_some(resolved)
+        })
+        .collect()
+}
+
+/// Build canonical typed parents through the common node contract.
 fn ordering_parent_keys(
     node: &HistoryNode,
     git_links: &std::collections::BTreeMap<OpId, Vec<editchain_core::GitLink>>,
     notes: &HashMap<OpId, Vec<Op>>,
     representative: &HashMap<OpId, OpId>,
-    present: &std::collections::HashSet<OrderingKey>,
-) -> Vec<OrderingKey> {
-    let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let child = ordering_key(node);
-    let mut push = |candidate: Option<OrderingKey>| {
-        if let Some(key) = candidate {
-            if key != child && seen.insert(key) {
-                out.push(key);
-            }
-        }
-    };
-    match node {
-        HistoryNode::EditOperation { op, .. } | HistoryNode::CollapsedImport { op, .. } => {
-            let anchored_notes = notes.get(&op.id);
-            if !has_exact_provider_parent(op.id, anchored_notes.map(Vec::as_slice)) {
-                for parent in &op.parents {
-                    push(canonical_ordering_op(*parent, representative, present));
-                }
-            }
-            for source in std::iter::once(op).chain(node.sub_ops()) {
-                let source_has_spawn_parent =
-                    has_exact_spawn_parent(source.id, anchored_notes.map(Vec::as_slice));
-                if let Some(links) = git_links.get(&source.id) {
-                    for link in links.iter().filter(|link| {
-                        link.kind != GitLinkKind::ProducedBy
-                            && !(source_has_spawn_parent && link.kind == GitLinkKind::BasedOn)
-                    }) {
-                        let key = OrderingKey::Git(link.target_key());
-                        push(present.contains(&key).then_some(key));
-                    }
-                }
-            }
-            if let Some(relationship_notes) = anchored_notes {
-                for note in relationship_notes {
-                    if let editchain_core::OpKind::Note(note) = &note.kind {
-                        if !is_visible_edge_relationship(note.relationship) {
-                            continue;
-                        }
-                        for target in &note.target_ids {
-                            push(canonical_ordering_op(*target, representative, present));
-                        }
-                    }
-                }
-            }
-        }
-        HistoryNode::ExecuteBundle { anchor, .. }
-        | HistoryNode::PlanBundle { anchor, .. }
-        | HistoryNode::WorkGroup { anchor, .. } => {
-            for parent in &anchor.parents {
-                push(canonical_ordering_op(*parent, representative, present));
-            }
-        }
-        HistoryNode::GitCommit(commit) => {
-            for parent in &commit.parents {
-                let key = OrderingKey::Git(GitCommitKey::new(commit.repository, *parent));
-                push(present.contains(&key).then_some(key));
-            }
-            for links in git_links.values() {
-                for link in links.iter().filter(|link| {
-                    link.kind == GitLinkKind::ProducedBy
-                        && link.target_repo == commit.repository
-                        && link.target_oid == commit.oid
-                }) {
-                    push(canonical_ordering_op(link.source, representative, present));
-                }
-            }
-        }
-    }
-    out
+    present: &std::collections::HashSet<NodeKey>,
+) -> Vec<NodeKey> {
+    canonical_node_parents(
+        node.parent_nodes(git_links, notes),
+        representative,
+        present,
+        node.key(),
+    )
 }
 
 /// Collect the node keys of collapsed top-level rows (the "present" set used to
