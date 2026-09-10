@@ -1,8 +1,6 @@
 //! Object resolution via `gix`.
 
-use editchain_core::{
-    GitAvailability, GitCommitEntity, GitObjectFormat, GitOid, GitSignature, Payload,
-};
+use editchain_core::{GitAvailability, GitCommitEntity, GitOid, GitSignature, Payload};
 
 use crate::discover::RepositoryHandle;
 use crate::{HistoryRead, HistoryReadIssue, RefSnapshot};
@@ -93,12 +91,15 @@ fn resolve_commit_with_refs(
         .committer()
         .map_err(|e| ResolutionError::Decode(e.to_string()))?;
 
-    let parents = parsed.parents().map(|p| git_oid_from_gix(&p)).collect();
-    let tree = git_oid_from_gix(&parsed.tree());
+    let parents = parsed
+        .parents()
+        .map(|p| git_oid_from_gix(&p))
+        .collect::<Result<_, _>>()?;
+    let tree = git_oid_from_gix(&parsed.tree())?;
 
     Ok(GitCommitEntity {
         repository: handle.discovery.id,
-        object_format: oid.format,
+        object_format: oid.format(),
         oid: *oid,
         imported_record: None,
         availability: GitAvailability::Resolved,
@@ -166,7 +167,7 @@ pub fn resolve_commit_prefix(
     match candidate {
         None => Ok(None),
         Some(Err(())) => Err(ResolutionError::AmbiguousPrefix(prefix.to_owned())),
-        Some(Ok(oid)) => resolve_commit(handle, &git_oid_from_gix(&oid)).map(Some),
+        Some(Ok(oid)) => resolve_commit(handle, &git_oid_from_gix(&oid)?).map(Some),
     }
 }
 
@@ -216,7 +217,7 @@ pub fn resolve_branch_tip_at_time(
         return None;
     }
     let candidate = candidate.filter(|oid| !oid.is_null())?;
-    let oid = git_oid_from_gix(&candidate);
+    let oid = git_oid_from_gix(&candidate).ok()?;
     resolve_commit(handle, &oid).ok()
 }
 
@@ -273,7 +274,13 @@ pub fn walk_history(
                 continue;
             }
         };
-        let git_oid = git_oid_from_gix(&info.id);
+        let git_oid = match git_oid_from_gix(&info.id) {
+            Ok(oid) => oid,
+            Err(error) => {
+                result.issues.push(HistoryReadIssue { oid: None, error });
+                continue;
+            }
+        };
         match resolve_commit_with_refs(handle, &git_oid, &result.refs) {
             Ok(commit) => result.commits.push(commit),
             Err(error) => result.issues.push(HistoryReadIssue {
@@ -292,24 +299,18 @@ pub fn walk_history(
 )]
 pub(crate) fn git_oid_from(oid: &GitOid) -> Result<gix::hash::ObjectId, ResolutionError> {
     let len = oid.digest_len();
-    let bytes = &oid.bytes[..len];
+    let bytes = &oid.as_bytes()[..len];
     gix::hash::ObjectId::try_from(bytes)
         .map_err(|e| ResolutionError::Decode(format!("invalid OID bytes: {e}")))
 }
 
 /// Convert a `gix::hash::ObjectId` to an `editchain_core::GitOid`.
-#[expect(
-    clippy::indexing_slicing,
-    clippy::match_same_arms,
-    reason = "SHA-1/SHA-256 digests are at most 32 bytes; Kind is non-exhaustive so a wildcard fallback is required"
-)]
-pub(crate) fn git_oid_from_gix(id: &gix::hash::ObjectId) -> GitOid {
-    let format = match id.kind() {
-        gix::hash::Kind::Sha1 => GitObjectFormat::Sha1,
-        gix::hash::Kind::Sha256 => GitObjectFormat::Sha256,
-        _ => GitObjectFormat::Sha256,
-    };
-    let mut bytes = [0u8; 32];
-    bytes[..id.as_bytes().len()].copy_from_slice(id.as_bytes());
-    GitOid { format, bytes }
+pub(crate) fn git_oid_from_gix(id: &gix::hash::ObjectId) -> Result<GitOid, ResolutionError> {
+    match id {
+        gix::hash::ObjectId::Sha1(bytes) => Ok(GitOid::from_sha1(*bytes)),
+        gix::hash::ObjectId::Sha256(bytes) => Ok(GitOid::from_sha256(*bytes)),
+        _ => Err(ResolutionError::Decode(
+            "unsupported Git object format".to_owned(),
+        )),
+    }
 }

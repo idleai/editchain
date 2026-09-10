@@ -145,13 +145,7 @@ impl EchoPairState {
 /// long texts that share a display-preview prefix are never conflated.
 #[must_use]
 fn echo_pair_signature(op: &Op, side: EchoPairSide) -> Option<EchoPairSignature> {
-    if op.tags.matches_any(Tags::SOURCE_TIME_UNKNOWN) {
-        return None;
-    }
-    let clock_ms = op.clock.as_u64();
-    if clock_ms == 0 {
-        return None;
-    }
+    let clock_ms = op.observed_unix_ms()?;
     let value = raw_import_json(op)?;
     let record_type = value.get("type").and_then(Value::as_str);
     let event_type = value

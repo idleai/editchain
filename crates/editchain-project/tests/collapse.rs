@@ -65,9 +65,9 @@ use editchain_project::HistoryProjection;
 
 fn git_commit(oid_byte: u8, committed_at: i64) -> GitCommitEntity {
     let oid = |byte: u8| {
-        let mut bytes = [0u8; 32];
+        let mut bytes = [0u8; 20];
         bytes[0] = byte;
-        GitOid::new(GitObjectFormat::Sha1, bytes)
+        GitOid::from_sha1(bytes)
     };
     GitCommitEntity {
         repository: RepositoryId(1),
@@ -1276,9 +1276,9 @@ fn bundled_meta_based_on_link_is_inherited_by_visible_anchor() {
         .find(|node| node.node_key() == turn.id.to_string())
         .unwrap();
 
-    let mut bytes = [0u8; 32];
+    let mut bytes = [0u8; 20];
     bytes[0] = 8;
-    let target_oid = GitOid::new(GitObjectFormat::Sha1, bytes);
+    let target_oid = GitOid::from_sha1(bytes);
     let mut links = std::collections::BTreeMap::new();
     drop(links.insert(
         meta.id,
@@ -1905,15 +1905,15 @@ fn collapse_keeps_git_commits() {
     let op1 = import_op(1, 1);
     let mut projection = HistoryProjection::from_ops(vec![op1.clone()]);
     // Add a git commit.
-    let mut bytes = [0u8; 32];
+    let mut bytes = [0u8; 20];
     bytes[0] = 9;
     projection.merge_git_commits(vec![GitCommitEntity {
         repository: RepositoryId(1),
         object_format: GitObjectFormat::Sha1,
-        oid: GitOid::new(GitObjectFormat::Sha1, bytes),
+        oid: GitOid::from_sha1(bytes),
         imported_record: None,
         availability: GitAvailability::Resolved,
-        tree: GitOid::new(GitObjectFormat::Sha1, [0u8; 32]),
+        tree: GitOid::from_sha1([0u8; 20]),
         parents: Vec::new(),
         author: editchain_core::GitSignature {
             name: Payload::Empty,

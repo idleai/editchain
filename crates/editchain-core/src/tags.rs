@@ -46,7 +46,8 @@ impl Tags {
     /// stays visible so nothing content-bearing is hidden by metadata folding.
     pub const DIAGNOSTIC: Self = Self(1 << 14);
     /// The raw source record carried no usable timestamp (absent or unparseable).
-    /// Distinct from `Clock::UnixMs(0)`, which we treat as confident "epoch".
+    /// Overrides any stored clock; zero wall times also remain undated for
+    /// legacy compatibility. See [`crate::Op::observed_unix_ms`].
     pub const SOURCE_TIME_UNKNOWN: Self = Self(1 << 15);
     /// Relationship or metadata recovered from indirect, explicitly bounded
     /// evidence rather than recorded directly by the source provider.

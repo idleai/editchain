@@ -68,19 +68,36 @@ pub enum GitObjectFormat {
 /// The `bytes` field always holds 32 bytes: SHA-256 uses all 32; SHA-1 uses
 /// the first 20 bytes and leaves the remainder zero. This keeps the type a
 /// fixed size regardless of object format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct GitOid {
     /// Object format this OID was produced under.
-    pub format: GitObjectFormat,
+    format: GitObjectFormat,
     /// Full OID bytes (32 bytes; SHA-1 occupies the first 20).
-    pub bytes: [u8; 32],
+    bytes: [u8; 32],
 }
 
 impl GitOid {
-    /// Create a new `GitOid` from a full 32-byte digest.
+    /// Validate a padded 32-byte digest. SHA-1 requires a zero unused tail;
+    /// otherwise the same displayed hash could compare as different keys.
     #[must_use]
-    pub const fn new(format: GitObjectFormat, bytes: [u8; 32]) -> Self {
-        Self { format, bytes }
+    pub fn new(format: GitObjectFormat, bytes: [u8; 32]) -> Option<Self> {
+        if format == GitObjectFormat::Sha1 && bytes.iter().skip(20).any(|byte| *byte != 0) {
+            None
+        } else {
+            Some(Self { format, bytes })
+        }
+    }
+
+    /// Object format this identifier was produced under.
+    #[must_use]
+    pub const fn format(&self) -> GitObjectFormat {
+        self.format
+    }
+
+    /// Fixed-width storage, including the canonical zero tail for SHA-1.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.bytes
     }
 
     /// Create a `GitOid` from a 20-byte SHA-1 digest.
@@ -139,6 +156,21 @@ impl GitOid {
             out.push(HEX[(b & 0x0f) as usize]);
         }
         out
+    }
+}
+
+impl<'de> Deserialize<'de> for GitOid {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Keep the existing named fields and Postcard sequence unchanged.
+        #[derive(Deserialize)]
+        #[serde(rename = "GitOid")]
+        struct WireOid {
+            format: GitObjectFormat,
+            bytes: [u8; 32],
+        }
+        let wire = WireOid::deserialize(deserializer)?;
+        Self::new(wire.format, wire.bytes)
+            .ok_or_else(|| serde::de::Error::custom("SHA-1 OID has nonzero padding"))
     }
 }
 

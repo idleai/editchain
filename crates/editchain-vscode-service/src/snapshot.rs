@@ -159,7 +159,10 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 /// Revision 54 also selects complete Claude content-block materializations.
 /// Revision 53 uses immutable occurrence materializations and explicit logical
 /// removals, retaining legacy records through the compatibility view.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 55;
+/// Revision 55 bounds typed content previews and retains completeness.
+/// Revision 56 keeps logical clocks and explicitly unknown source times out
+/// of row timestamps and observed-time duplicate pairing.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 56;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

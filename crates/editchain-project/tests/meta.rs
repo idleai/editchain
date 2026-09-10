@@ -817,6 +817,49 @@ fn marker_lookalike_without_delimiter_stays_primary() {
 }
 
 #[test]
+fn duplicate_pairing_requires_observed_time_on_both_sides() {
+    let response = raw_import(
+        1,
+        1,
+        1_000,
+        None,
+        r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"same text"}]}}"#,
+    );
+    let event = raw_import(
+        1,
+        2,
+        1_000,
+        None,
+        r#"{"type":"event_msg","payload":{"type":"agent_message","message":"same text"}}"#,
+    );
+    for (clock, tags) in [
+        (Clock::None, Tags::NONE),
+        (Clock::Lamport(1_000), Tags::NONE),
+        (Clock::UnixMs(0), Tags::NONE),
+        (Clock::Hybrid { ms: 0, ctr: 1 }, Tags::NONE),
+        (Clock::UnixMs(1_000), Tags::SOURCE_TIME_UNKNOWN),
+    ] {
+        for unobserved_response in [false, true] {
+            let mut response = response.clone();
+            let mut event = event.clone();
+            let unobserved = if unobserved_response {
+                &mut response
+            } else {
+                &mut event
+            };
+            unobserved.clock = clock;
+            unobserved.tags |= tags;
+            let projection = HistoryProjection::from_ops(vec![response, event]);
+            assert_eq!(projection.nodes().len(), 2);
+            assert!(projection
+                .nodes()
+                .iter()
+                .all(|node| node.visibility() == Visibility::Primary));
+        }
+    }
+}
+
+#[test]
 fn normal_duplicate_pair_hides_response_item_keeps_event_msg() {
     // A `response_item` message/assistant row whose untruncated message text
     // is exactly duplicated by an `event_msg` agent_message row in the same

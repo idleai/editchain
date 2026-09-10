@@ -891,10 +891,10 @@ mod tests {
     }
 
     fn big_oid() -> GitOid {
-        let mut bytes = [0u8; 32];
+        let mut bytes = [0u8; 20];
         bytes[0] = 0xde;
         bytes[1] = 0xad;
-        GitOid::new(GitObjectFormat::Sha1, bytes)
+        GitOid::from_sha1(bytes)
     }
 
     /// The 40-char SHA-1 hex form of [`big_oid`].

@@ -36,6 +36,20 @@ pub struct Op {
 }
 
 impl Op {
+    /// Observed source time, respecting explicit unknown-time provenance.
+    ///
+    /// `SOURCE_TIME_UNKNOWN` overrides the stored clock. Absent clocks,
+    /// logical counters, and legacy zero wall times are also undated. Reading
+    /// this adapter never rewrites the immutable clock or tags.
+    #[must_use]
+    pub const fn observed_unix_ms(&self) -> Option<u64> {
+        if self.tags.matches_any(Tags::SOURCE_TIME_UNKNOWN) {
+            None
+        } else {
+            self.clock.observed_unix_ms()
+        }
+    }
+
     /// Create a new operation with the given fields.
     #[expect(
         clippy::too_many_arguments,

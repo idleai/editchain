@@ -34,7 +34,7 @@ impl RefSnapshot {
             if reference.target().try_id().is_some() {
                 snapshot
                     .refs
-                    .entry(git_oid_from_gix(&reference.id().detach()))
+                    .entry(git_oid_from_gix(&reference.id().detach())?)
                     .or_default()
                     .push(reference.name().as_bstr().to_vec());
             }

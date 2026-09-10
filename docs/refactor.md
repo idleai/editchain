@@ -311,10 +311,22 @@ Completed increments:
   The real VS Code suite also passes against its seeded CI checkout with the
   current native service and generated renderer assets.
 
+- Core time and Git identity: one observed-time adapter excludes logical
+  counters, absent clocks, legacy zero wall times, and explicit unknown-source
+  tags. Projection, duplicate pairing, and service disclosure timestamps use
+  that adapter; numeric metadata ranking keeps its separate ordering policy.
+  Projection revision 56 rebuilds older caches. Git OIDs expose immutable
+  accessors and validate SHA-1 padding at construction and deserialization;
+  canonical SHA-1/SHA-256 storage and clock variant bytes remain unchanged.
+  The live Git adapter constructs supported digest types directly and reports
+  unsupported formats through its existing errors and history diagnostics.
+  Regressions cover wire bytes, each unused SHA-1 byte, visible topology across
+  logical-clock records, observed-time echo pairing, and prepared metadata rows.
+
 Remaining work, in dependency order:
 
-1. Finish core observed-time and Git identity validation, and retire the unused
-   materialization API.
+1. Retire the unused core materialization API and move Git projection policy
+   to project.
 2. Retire migrated producer compatibility machinery.
 3. Measure and reduce repeated work.
 

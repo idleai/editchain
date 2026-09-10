@@ -2759,7 +2759,7 @@ fn cancelled_branch_rows_ship_muted_node_and_child_owned_edge_geometry() {
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_fifty_five() {
+fn prepared_snapshot_manifest_records_projection_revision_fifty_six() {
     // Stale snapshots from earlier projection revisions (before trace hiding,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
@@ -2786,58 +2786,67 @@ fn prepared_snapshot_manifest_records_projection_revision_fifty_five() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 55u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 56u64);
 }
 
 #[test]
-fn prepared_snapshot_omits_timestamp_zero_top_level_rows_and_keeps_bundled_metadata() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let chain_dir = tmp.path().join(".editchain");
-    let dated = raw_import_op(42, 1, 1_000, None, r#"{"type":"user"}"#);
-    let dated_message = raw_message_child(42, 2, dated.id, 1_000, "dated");
-    let mut undated = raw_import_op(
-        42,
-        3,
-        0,
-        Some(dated.id),
-        r#"{"type":"custom-title","customTitle":"undated"}"#,
-    );
-    undated.tags |= Tags::META;
+fn prepared_snapshot_keeps_unobserved_metadata_undated() {
+    for (clock, tags) in [
+        (Clock::None, Tags::NONE),
+        (Clock::Lamport(1_700_000_000_000), Tags::NONE),
+        (Clock::UnixMs(0), Tags::NONE),
+        (Clock::Hybrid { ms: 0, ctr: 7 }, Tags::NONE),
+        (Clock::UnixMs(1_700_000_000_000), Tags::SOURCE_TIME_UNKNOWN),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let chain_dir = tmp.path().join(".editchain");
+        let dated = raw_import_op(42, 1, 1_000, None, r#"{"type":"user"}"#);
+        let dated_message = raw_message_child(42, 2, dated.id, 1_000, "dated");
+        let mut undated = raw_import_op(
+            42,
+            3,
+            0,
+            Some(dated.id),
+            r#"{"type":"custom-title","customTitle":"undated"}"#,
+        );
+        undated.clock = clock;
+        undated.tags |= Tags::META | tags;
 
-    let mut page = editchain_codec::page::Page::new(0);
-    page.add_record(
-        0,
-        editchain_codec::frame::encode_op(&dated).expect("encode dated op"),
-    );
-    page.add_record(
-        0,
-        editchain_codec::frame::encode_op(&dated_message).expect("encode dated message"),
-    );
-    page.add_record(
-        0,
-        editchain_codec::frame::encode_op(&undated).expect("encode undated op"),
-    );
-    write_page(&chain_dir, &page);
+        let mut page = editchain_codec::page::Page::new(0);
+        page.add_record(
+            0,
+            editchain_codec::frame::encode_op(&dated).expect("encode dated op"),
+        );
+        page.add_record(
+            0,
+            editchain_codec::frame::encode_op(&dated_message).expect("encode dated message"),
+        );
+        page.add_record(
+            0,
+            editchain_codec::frame::encode_op(&undated).expect("encode undated op"),
+        );
+        write_page(&chain_dir, &page);
 
-    let report =
-        prepare_render_snapshot(tmp.path(), Path::new(".editchain")).expect("prepare snapshot");
-    assert_eq!(report.top_level_rows, 1, "only the dated row is top-level");
-    assert_eq!(report.rows, 2, "bundled metadata remains expandable");
-    let rows = std::fs::read_to_string(report.path.join("rows.ndjson")).expect("read rows");
-    let presented: Vec<serde_json::Value> = rows
-        .lines()
-        .map(|line| serde_json::from_str(line).expect("parse row"))
-        .collect();
-    assert_eq!(presented.len(), 2);
-    assert_eq!(presented[0]["node_key"], dated.id.to_string());
-    assert_ne!(presented[0]["timestamp_ms"], 0);
-    let sub_ops = presented[0]["sub_ops"].as_array().expect("sub_ops array");
-    assert_eq!(sub_ops.len(), 1);
-    assert_eq!(sub_ops[0]["op_id"], undated.id.to_string());
-    assert_eq!(sub_ops[0]["timestamp_ms"], 0);
-    assert_eq!(presented[1]["op_id"], undated.id.to_string());
-    assert_eq!(presented[1]["timestamp_ms"], 0);
-    assert_eq!(presented[1]["is_subop"], true);
+        let report =
+            prepare_render_snapshot(tmp.path(), Path::new(".editchain")).expect("prepare snapshot");
+        assert_eq!(report.top_level_rows, 1, "only the dated row is top-level");
+        assert_eq!(report.rows, 2, "bundled metadata remains expandable");
+        let rows = std::fs::read_to_string(report.path.join("rows.ndjson")).expect("read rows");
+        let presented: Vec<serde_json::Value> = rows
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("parse row"))
+            .collect();
+        assert_eq!(presented.len(), 2);
+        assert_eq!(presented[0]["node_key"], dated.id.to_string());
+        assert_ne!(presented[0]["timestamp_ms"], 0);
+        let sub_ops = presented[0]["sub_ops"].as_array().expect("sub_ops array");
+        assert_eq!(sub_ops.len(), 1);
+        assert_eq!(sub_ops[0]["op_id"], undated.id.to_string());
+        assert_eq!(sub_ops[0]["timestamp_ms"], 0);
+        assert_eq!(presented[1]["op_id"], undated.id.to_string());
+        assert_eq!(presented[1]["timestamp_ms"], 0);
+        assert_eq!(presented[1]["is_subop"], true);
+    }
 }
 
 #[test]
@@ -3183,7 +3192,7 @@ fn prepared_snapshot_serves_flattened_activity_view_and_records_current_revision
         &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["identity"]["projection_revision"], 55u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 56u64);
 
     let mut cached =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");

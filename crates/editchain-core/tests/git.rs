@@ -35,19 +35,42 @@ fn qualified_commit_keys_preserve_full_repository_identity() {
 #[test]
 fn oid_sha1_pads_to_32_bytes() {
     let oid = sha1([0xab; 20]);
-    assert_eq!(oid.format, GitObjectFormat::Sha1);
+    assert_eq!(oid.format(), GitObjectFormat::Sha1);
     assert_eq!(oid.digest_len(), 20);
     // First 20 bytes are the digest; the rest are zero.
-    assert_eq!(&oid.bytes[..20], &[0xab; 20]);
-    assert_eq!(&oid.bytes[20..], &[0u8; 12]);
+    assert_eq!(&oid.as_bytes()[..20], &[0xab; 20]);
+    assert_eq!(&oid.as_bytes()[20..], &[0u8; 12]);
 }
 
 #[test]
 fn oid_sha256_uses_all_bytes() {
     let oid = sha256([0xcd; 32]);
-    assert_eq!(oid.format, GitObjectFormat::Sha256);
+    assert_eq!(oid.format(), GitObjectFormat::Sha256);
     assert_eq!(oid.digest_len(), 32);
-    assert_eq!(&oid.bytes[..], &[0xcd; 32]);
+    assert_eq!(&oid.as_bytes()[..], &[0xcd; 32]);
+}
+
+#[test]
+fn oid_decode_preserves_canonical_wire_bytes_and_rejects_sha1_aliases() {
+    for (format_tag, oid) in [(0, sha1([0xab; 20])), (1, sha256([0xcd; 32]))] {
+        let mut bytes = vec![format_tag];
+        bytes.extend_from_slice(oid.as_bytes());
+        assert_eq!(postcard::to_stdvec(&oid).unwrap(), bytes);
+        assert_eq!(postcard::from_bytes::<GitOid>(&bytes).unwrap(), oid);
+        assert_eq!(GitOid::new(oid.format(), *oid.as_bytes()), Some(oid));
+    }
+    for padding_index in 20..32 {
+        let mut storage = *sha1([0xab; 20]).as_bytes();
+        *storage.get_mut(padding_index).unwrap() = 1;
+        assert_eq!(GitOid::new(GitObjectFormat::Sha1, storage), None);
+        let bytes = postcard::to_stdvec(&(GitObjectFormat::Sha1, storage)).unwrap();
+        assert!(postcard::from_bytes::<GitOid>(&bytes).is_err());
+        // The same bytes are significant and valid under SHA-256.
+        assert_eq!(
+            GitOid::new(GitObjectFormat::Sha256, storage),
+            Some(sha256(storage))
+        );
+    }
 }
 
 #[test]
@@ -170,7 +193,7 @@ fn git_link_kind_custom_payload() {
 fn commit_op(id: OpId, repo: RepositoryId, oid: GitOid) -> Op {
     let commit = GitCommitEntity {
         repository: repo,
-        object_format: oid.format,
+        object_format: oid.format(),
         oid,
         imported_record: Some(id),
         availability: GitAvailability::ImportedOnly,

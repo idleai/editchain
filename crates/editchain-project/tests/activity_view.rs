@@ -27,6 +27,37 @@ impl editchain_project::activity_view::ActivityPresentation for NoDetails {
 }
 
 #[test]
+fn logical_time_remains_unknown_while_visible_edges_cross_it() {
+    use editchain_project::activity_view::{OmissionReason, SourceDisposition};
+    use editchain_project::NodeKey;
+
+    let parent = msg_op(90, 1, 1_000, None, "observed parent");
+    let mut logical = msg_op(90, 2, 0, Some(parent.id), "logical child");
+    logical.clock = Clock::Lamport(u64::MAX);
+    let mut child = msg_op(90, 3, 500, Some(logical.id), "observed child");
+    child.clock = Clock::Hybrid { ms: 500, ctr: 7 };
+    let sources = vec![parent.clone(), logical.clone(), child.clone()];
+    let projection = HistoryProjection::from_ops(sources.clone());
+    let nodes = projection.nodes();
+    let logical_node = nodes
+        .iter()
+        .find(|node| node.node_key() == logical.id.to_string())
+        .unwrap();
+    assert_eq!(logical_node.timestamp_ms(), 0);
+    let view = projection.build_activity_view(|_| true, &NoDetails);
+    assert_eq!(
+        view.source_disposition(NodeKey::Op(logical.id)),
+        Some(SourceDisposition::Omitted(OmissionReason::UnknownTime))
+    );
+    assert_eq!(
+        view.graph().parents(NodeKey::Op(child.id)),
+        &[NodeKey::Op(parent.id)]
+    );
+    assert!(view.source_row(NodeKey::Op(child.id)) < view.source_row(NodeKey::Op(parent.id)));
+    assert_eq!(projection.ops(), &sources);
+}
+
+#[test]
 fn complete_view_retains_explicit_dispositions_for_every_accepted_source() {
     use editchain_project::activity_view::{OmissionReason, SourceDisposition};
     use editchain_project::NodeKey;

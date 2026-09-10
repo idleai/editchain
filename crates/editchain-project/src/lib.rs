@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use editchain_core::op::NoteRelationship;
 use editchain_core::{
-    Clock, GitCommitEntity, GitCommitKey, GitLinkKind, GitOid, GitProjection, Op, OpId, Payload,
+    GitCommitEntity, GitCommitKey, GitLinkKind, GitOid, GitProjection, Op, OpId, Payload,
     RepositoryId,
 };
 
@@ -2899,21 +2899,11 @@ fn tool_result_summary(content: &str) -> String {
 /// Decode the effective source time of an op, distinguishing `Observed` from
 /// `Unknown`.
 ///
-/// A record is `Unknown` when either the importer tagged `SOURCE_TIME_UNKNOWN`
-/// (absent/invalid source timestamp) or the op carries no usable clock value
-/// (`Clock::None`, or `UnixMs(0)` — the legacy "undated" marker). The stored
-/// `Clock` is never rewritten; this only records provenance.
+/// Core owns unknown-time and legacy-zero interpretation. The stored clock
+/// is never rewritten; this only adapts observed provenance for projection.
 fn source_time_of(op: &Op) -> EffectiveTime {
-    let unknown = op
-        .tags
-        .matches_any(editchain_core::Tags::SOURCE_TIME_UNKNOWN)
-        || matches!(op.clock, Clock::None)
-        || op.clock.as_u64() == 0;
-    if unknown {
-        EffectiveTime::Unknown
-    } else {
-        EffectiveTime::Observed(op.clock.as_u64())
-    }
+    op.observed_unix_ms()
+        .map_or(EffectiveTime::Unknown, EffectiveTime::Observed)
 }
 
 /// Resolve the readable payload for one completed command row.

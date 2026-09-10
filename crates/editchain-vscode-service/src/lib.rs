@@ -3727,7 +3727,7 @@ fn sub_op_summaries(sub_ops: &[std::sync::Arc<Op>]) -> Vec<SubOpSummary> {
                 op_id: op.id.to_string(),
                 summary,
                 kind,
-                timestamp_ms: op.clock.as_u64(),
+                timestamp_ms: op.observed_unix_ms().unwrap_or(0),
             }
         })
         .collect()
@@ -4178,7 +4178,7 @@ fn member_sub_op_summaries(
                     op_id: op_key,
                     summary: ContentTextDto::new(member.summary(), false).text,
                     kind: member.kind(),
-                    timestamp_ms: op.clock.as_u64(),
+                    timestamp_ms: op.observed_unix_ms().unwrap_or(0),
                 }
             } else {
                 let (summary, kind) = sub_op_label(op);
@@ -4186,7 +4186,7 @@ fn member_sub_op_summaries(
                     op_id: op_key,
                     summary,
                     kind,
-                    timestamp_ms: op.clock.as_u64(),
+                    timestamp_ms: op.observed_unix_ms().unwrap_or(0),
                 }
             }
         })
@@ -5490,9 +5490,9 @@ mod tests {
     fn git_search_hits_retain_real_repository_and_commit_identity() {
         // A real commit in a repository whose id exceeds 2^53, so the identity
         // must round-trip as an exact decimal string.
-        let mut bytes = [0u8; 32];
+        let mut bytes = [0u8; 20];
         bytes[0] = 0xaa;
-        let oid = GitOid::new(editchain_core::GitObjectFormat::Sha1, bytes);
+        let oid = GitOid::from_sha1(bytes);
         let commit = editchain_core::GitCommitEntity {
             repository: RepositoryId(OVER_2_53),
             object_format: editchain_core::GitObjectFormat::Sha1,
@@ -5722,7 +5722,7 @@ mod tests {
         let file_blob_ref = blobs.put(b"full-file-content").unwrap();
         let resolver = BlobResolver::open(&chain_dir).unwrap();
         let mut blob = |data: &[u8]| Payload::Blob(blobs.put(data).unwrap());
-        let git_oid = || GitOid::new(editchain_core::GitObjectFormat::Sha1, [0u8; 32]);
+        let git_oid = || GitOid::from_sha1([0u8; 20]);
 
         let mut ops = vec![
             op_envelope(
@@ -7070,9 +7070,9 @@ mod tests {
 
     #[test]
     fn find_in_history_excludes_nested_repository_git_hits() {
-        let mut bytes = [0u8; 32];
+        let mut bytes = [0u8; 20];
         bytes[0] = 0xbb;
-        let oid = GitOid::new(editchain_core::GitObjectFormat::Sha1, bytes);
+        let oid = GitOid::from_sha1(bytes);
         let commit = editchain_core::GitCommitEntity {
             repository: RepositoryId(2),
             object_format: editchain_core::GitObjectFormat::Sha1,

@@ -190,9 +190,9 @@ fn graph_layout_edge_points_are_continuous() {
 fn git_commit(oid_byte: u8, parent_bytes: &[u8]) -> editchain_core::GitCommitEntity {
     use editchain_core::{GitAvailability, GitObjectFormat, GitOid, GitSignature};
     let oid = |b: u8| {
-        let mut bytes = [0u8; 32];
+        let mut bytes = [0u8; 20];
         bytes[0] = b;
-        GitOid::new(GitObjectFormat::Sha1, bytes)
+        GitOid::from_sha1(bytes)
     };
     editchain_core::GitCommitEntity {
         repository: editchain_core::RepositoryId(1),
