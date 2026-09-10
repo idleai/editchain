@@ -6,6 +6,9 @@
 #[cfg(test)]
 use tempfile as _;
 
+mod catalog;
+pub use catalog::{DiscoveryIssue, RepositoryCatalog};
+
 /// Commit tree diffs and immutable blob resolution.
 pub mod diff;
 /// Repository discovery and identity derivation.

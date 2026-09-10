@@ -146,7 +146,10 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 /// must be rebuilt from the unchanged durable records.
 ///
 /// Revision 46 qualifies Git graph and row keys by repository identity.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 46;
+///
+/// Revision 47 uses explicit repository roots and component-wise nesting.
+/// Prefix-related sibling repositories remain visible as independent sources.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 47;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.
@@ -248,8 +251,8 @@ impl SnapshotIdentity {
                     .unwrap_or_default();
                 RepositoryStamp {
                     id: repository.id.0,
-                    path: repository.path.to_string_lossy().into_owned(),
-                    is_worktree: repository.is_worktree,
+                    path: repository.marker_path.to_string_lossy().into_owned(),
+                    is_worktree: repository.is_linked_worktree(),
                     head,
                 }
             })

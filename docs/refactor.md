@@ -28,10 +28,17 @@ Completed increments:
   scheduling, parent edges, structural markers, and display keys. Git row keys
   are now `git:<repository>:<oid>`; full OID/detail fields retain their existing
   representation. Projection revision 46 invalidates earlier row-key caches.
+- Repository catalog: worktree roots, Git directories, common directories, and
+  legacy marker-derived IDs are explicit. Discovery retains failures and skips
+  directory symlinks; reconciliation requires complete discovery and open
+  results. Component-wise containment handles nested and prefix-related sibling
+  repositories. Open diagnostics report unavailable repositories, and full-OID
+  commit resolution rejects tree/blob objects without panicking. Projection
+  revision 47 invalidates caches built with string-prefix nesting.
 
 Remaining work, in dependency order:
 
-1. Establish a shared repository catalog and explicit Git resolution outcomes.
+1. Separate immutable Git reads from ref observations and expose history completeness.
 2. Bind service windows, search, layout, and renderer requests to one snapshot.
 3. Move complete Activity assembly and presentation-tree ownership into project.
 4. Consolidate typed provider evidence, source lifecycle, and persistence

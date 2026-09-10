@@ -24,6 +24,13 @@ pub enum ResolutionError {
     NotFound(String),
     /// The object data could not be decoded.
     Decode(String),
+    /// An object exists but is not the requested Git kind.
+    WrongKind {
+        /// Required object kind.
+        expected: &'static str,
+        /// Actual object kind supplied by the repository.
+        actual: String,
+    },
 }
 
 impl core::fmt::Display for ResolutionError {
@@ -32,6 +39,9 @@ impl core::fmt::Display for ResolutionError {
             Self::Open(e) => write!(f, "failed to open repository: {e}"),
             Self::NotFound(e) => write!(f, "object not found: {e}"),
             Self::Decode(e) => write!(f, "failed to decode object: {e}"),
+            Self::WrongKind { expected, actual } => {
+                write!(f, "expected Git {expected}, found {actual}")
+            }
         }
     }
 }
@@ -41,8 +51,8 @@ impl std::error::Error for ResolutionError {}
 /// Resolve a commit by OID from a live repository.
 ///
 /// Reads the commit, tree, parents, author, committer, message, and refs
-/// without mutating or fetching. Returns `found: false` if the object is
-/// missing from the object database (e.g. shallow clone).
+/// without mutating or fetching. Missing objects return `NotFound`; tree,
+/// blob, and tag identities return `WrongKind`.
 ///
 /// # Errors
 ///
@@ -60,8 +70,13 @@ pub fn resolve_commit(
         gix_object::find::existing::Error::Find(_) => ResolutionError::Decode(e.to_string()),
     })?;
 
-    let commit = id.into_commit();
-    let parsed = gix_object::CommitRef::from_bytes(&commit.data, gix_oid.kind())
+    if id.kind != gix_object::Kind::Commit {
+        return Err(ResolutionError::WrongKind {
+            expected: "commit",
+            actual: id.kind.to_string(),
+        });
+    }
+    let parsed = gix_object::CommitRef::from_bytes(&id.data, gix_oid.kind())
         .map_err(|e| ResolutionError::Decode(e.to_string()))?;
 
     let author = parsed

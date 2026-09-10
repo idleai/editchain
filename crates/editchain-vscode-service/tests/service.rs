@@ -1103,6 +1103,56 @@ fn workspace_open_with_empty_chain() {
 }
 
 #[test]
+fn sibling_clones_remain_visible_and_partial_catalogs_report_gaps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_git_repo(tmp.path());
+    let sibling = tmp.path().join("repo-copy");
+    drop(git_stdout(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            repo.to_str().unwrap(),
+            sibling.to_str().unwrap(),
+        ],
+    ));
+    let oid = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    let broken = tmp.path().join("broken");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(
+        broken.join(".git"),
+        "gitdir: /nonexistent/editchain-test-repo",
+    )
+    .unwrap();
+
+    let mut workspace = Workspace::open(tmp.path().to_str().unwrap(), ".editchain").unwrap();
+    assert_eq!(workspace.diagnostics.git.unavailable_repositories, 1);
+    assert!(!workspace.diagnostics.warnings().is_empty());
+    let window = workspace.history_window(HistoryWindowOptions {
+        offset: 0,
+        limit: 20,
+        include_layout: true,
+    });
+    let commits: Vec<_> = window
+        .rows
+        .iter()
+        .filter(|row| row.kind == "git" && row.git_oid.as_deref() == Some(oid.as_str()))
+        .collect();
+    assert_eq!(
+        commits.len(),
+        2,
+        "sibling path prefixes must not hide a clone"
+    );
+    let keys: std::collections::BTreeSet<_> = commits.iter().map(|row| &row.node_key).collect();
+    assert_eq!(
+        keys.len(),
+        2,
+        "the shared commit keeps two repository-qualified row keys"
+    );
+    assert!(prepare_render_snapshot(tmp.path(), Path::new(".editchain")).is_err());
+}
+
+#[test]
 fn history_window_returns_rows() {
     // Build a projection directly with two ops.
     let ops = vec![msg_op(1, 1, b"first"), msg_op(1, 2, b"second")];
@@ -2292,7 +2342,7 @@ fn cancelled_branch_rows_ship_muted_node_and_child_owned_edge_geometry() {
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_forty_six() {
+fn prepared_snapshot_manifest_records_projection_revision_forty_seven() {
     // Stale snapshots from earlier projection revisions (before trace hiding,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
@@ -2319,7 +2369,7 @@ fn prepared_snapshot_manifest_records_projection_revision_forty_six() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 46u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 47u64);
 }
 
 #[test]
@@ -2708,7 +2758,7 @@ fn prepared_snapshot_serves_flattened_activity_view_and_records_current_revision
         &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["identity"]["projection_revision"], 46u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 47u64);
 
     let mut cached =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");

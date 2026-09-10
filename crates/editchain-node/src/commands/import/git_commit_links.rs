@@ -130,10 +130,7 @@ pub(super) fn open_repositories(
     workspace: &Path,
 ) -> Result<Vec<RepositoryHandle>, Box<dyn std::error::Error>> {
     let discoveries = discover_repositories(workspace)?;
-    Ok(discoveries
-        .into_iter()
-        .filter_map(|discovery| open_repository(&discovery).ok())
-        .collect())
+    discoveries.iter().map(open_repository).collect()
 }
 
 /// Resolve one Git-issued abbreviation uniquely across all workspace repos.

@@ -25,8 +25,8 @@ use editchain_core::{
     RepositoryId, ScopeRef, SessionId, Tags,
 };
 use editchain_git::{
-    commit_file_changes, discover_repositories, open_repository, resolve_blob as resolve_git_blob,
-    resolve_commit, resolve_path_at_commit, walk_history, GitFileChange, GitFileStatus,
+    commit_file_changes, open_repository, resolve_blob as resolve_git_blob, resolve_commit,
+    resolve_path_at_commit, walk_history, GitFileChange, GitFileStatus, RepositoryCatalog,
     RepositoryHandle,
 };
 use editchain_index::{LexicalHit, LexicalIndex, LexicalSource};
@@ -67,7 +67,7 @@ pub struct Workspace {
     /// Read-only durable blob store used by on-demand details/search hydration.
     blob_resolver: Option<BlobResolver>,
     /// Discovered git repositories.
-    pub repositories: Vec<editchain_git::RepositoryDiscovery>,
+    pub repositories: RepositoryCatalog,
     /// Diagnostics for this open: chain canonicalization and bounded blob
     /// preview/deferred-hydration outcomes.
     pub diagnostics: OpenDiagnostics,
@@ -208,6 +208,18 @@ pub struct OpenDiagnostics {
     pub chain: ChainReadStats,
     /// Durable blob hydration counts.
     pub blobs: BlobHydrationStats,
+    /// Git discovery and history availability gaps.
+    #[serde(default)]
+    pub git: GitReadStats,
+}
+
+/// Observable gaps in live repository discovery and history reads.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct GitReadStats {
+    /// Repository markers or directories that could not be inspected or opened.
+    pub unavailable_repositories: usize,
+    /// History reads that failed or were incomplete.
+    pub history_errors: usize,
 }
 
 impl OpenDiagnostics {
@@ -215,6 +227,18 @@ impl OpenDiagnostics {
     #[must_use]
     pub fn warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
+        if self.git.unavailable_repositories > 0 {
+            warnings.push(format!(
+                "{} Git repository location(s) could not be inspected",
+                self.git.unavailable_repositories
+            ));
+        }
+        if self.git.history_errors > 0 {
+            warnings.push(format!(
+                "{} Git history read(s) were incomplete",
+                self.git.history_errors
+            ));
+        }
         if self.chain.duplicates > 0 {
             warnings.push(format!(
                 "{} exact replay record(s) ignored during open",
@@ -2230,18 +2254,9 @@ fn agent_repository_path(
     cwd: Option<&Path>,
     repository: &editchain_git::RepositoryDiscovery,
 ) -> Option<String> {
-    let repo_root = repository.path.parent().unwrap_or(&repository.path);
-    let path = Path::new(path);
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd?.join(path)
-    };
-    absolute
-        .strip_prefix(repo_root)
-        .ok()
+    repository
+        .relative_worktree_path(Path::new(path), cwd)
         .map(|relative| relative.to_string_lossy().replace('\\', "/"))
-        .filter(|relative| !relative.is_empty())
 }
 
 impl Workspace {
@@ -2264,7 +2279,7 @@ impl Workspace {
             git_file_changes: HashMap::new(),
             source_op_locations: Vec::new(),
             blob_resolver: None,
-            repositories: Vec::new(),
+            repositories: RepositoryCatalog::default(),
             diagnostics: OpenDiagnostics::default(),
             root_path: PathBuf::new(),
             chain_path: PathBuf::new(),
@@ -2289,8 +2304,12 @@ impl Workspace {
             PathBuf::from(workspace_path).join(chain_dir)
         };
         let workspace_path = PathBuf::from(workspace_path);
-        let repositories = discover_repositories(&workspace_path)?;
-        if let Ok(identity) = SnapshotIdentity::capture(&chain_path, &repositories) {
+        let repositories = RepositoryCatalog::discover(&workspace_path)?;
+        if let Some(identity) = repositories
+            .is_complete()
+            .then(|| SnapshotIdentity::capture(&chain_path, repositories.entries()))
+            .and_then(Result::ok)
+        {
             if let Ok(Some(snapshot)) = RenderSnapshot::open(&chain_path, &identity) {
                 let diagnostics = snapshot.diagnostics();
                 return Ok(Self {
@@ -2319,7 +2338,7 @@ impl Workspace {
     fn open_projection(
         workspace_path: PathBuf,
         chain_path: PathBuf,
-        repositories: Vec<editchain_git::RepositoryDiscovery>,
+        repositories: RepositoryCatalog,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let (source_ops, chain_stats, source_op_locations) = read_chain_ops(&chain_path)?;
         // Keep durable references in the canonical source corpus. The graph
@@ -2328,35 +2347,47 @@ impl Workspace {
         // Details and search hydrate a single source op at a time on demand.
         let resolver = BlobResolver::open(&chain_path)?;
         let (projection_ops, blob_stats) = projection_ops_with_previews(&source_ops, &resolver);
-        let diagnostics = OpenDiagnostics {
+        let mut diagnostics = OpenDiagnostics {
             chain: chain_stats,
             blobs: blob_stats,
+            git: GitReadStats {
+                unavailable_repositories: repositories.issues().len(),
+                history_errors: 0,
+            },
         };
         let mut projection = HistoryProjection::from_ops(projection_ops);
         // Walk each discovered repo's history into the projection.
         for discovery in &repositories {
             let opened = open_repository(discovery);
             let Ok(handle) = opened else {
+                diagnostics.git.unavailable_repositories =
+                    diagnostics.git.unavailable_repositories.saturating_add(1);
                 continue;
             };
             let walked = walk_history(&handle, 0);
             if let Ok(commits) = walked {
                 projection.merge_git_commits(commits);
+            } else {
+                diagnostics.git.history_errors = diagnostics.git.history_errors.saturating_add(1);
             }
         }
         // A session may have started on a commit that is no longer reachable
         // from the repository's current HEAD. Resolve only the exact OIDs
         // carried by durable GitLink ops; never guess from timestamps or text.
-        merge_exact_git_link_targets(&mut projection, &repositories);
+        merge_exact_git_link_targets(&mut projection, repositories.entries());
         let source_op_index = source_ops
             .iter()
             .enumerate()
             .map(|(index, op)| (op.id, index))
             .collect();
         let session_metadata = session_metadata_index(&projection.ops);
-        let agent_file_changes =
-            agent_file_change_index(&source_ops, &workspace_path, Some(&resolver), &repositories);
-        let git_file_changes = git_file_change_index(&projection, &repositories);
+        let agent_file_changes = agent_file_change_index(
+            &source_ops,
+            &workspace_path,
+            Some(&resolver),
+            repositories.entries(),
+        );
+        let git_file_changes = git_file_change_index(&projection, repositories.entries());
         Ok(Self {
             projection,
             source_ops,
@@ -3091,18 +3122,7 @@ impl Workspace {
     /// (i.e. a submodule or vendored nested repo, not the workspace root).
     #[must_use]
     fn is_submodule(&self, discovery: &editchain_git::RepositoryDiscovery) -> bool {
-        // Discovery paths point at `.git`; the repo root is the parent dir.
-        let root = discovery.path.parent().unwrap_or(&discovery.path);
-        let root_str = root.to_string_lossy();
-        self.repositories.iter().any(|other| {
-            if other.id == discovery.id || other.path == discovery.path {
-                return false;
-            }
-            let other_root = other.path.parent().unwrap_or(&other.path);
-            let other_str = other_root.to_string_lossy();
-            // This repo's root is strictly inside another repo's root.
-            other_str.len() < root_str.len() && root_str.starts_with(&*other_str)
-        })
+        self.repositories.is_nested(discovery.id)
     }
 
     /// Returns true if the repository with the given id is a submodule.
@@ -3690,8 +3710,16 @@ pub fn prepare_render_snapshot(
     } else {
         workspace_path.join(chain_dir)
     };
-    let repositories = discover_repositories(workspace_path)?;
-    let identity = SnapshotIdentity::capture(&chain_path, &repositories)?;
+    let repositories = RepositoryCatalog::discover(workspace_path)?;
+    if let Some(issue) = repositories.issues().first() {
+        return Err(format!(
+            "repository discovery is incomplete at {}: {}",
+            issue.path.display(),
+            issue.message
+        )
+        .into());
+    }
+    let identity = SnapshotIdentity::capture(&chain_path, repositories.entries())?;
     if let Ok(Some(snapshot)) = RenderSnapshot::open(&chain_path, &identity) {
         return snapshot.report();
     }
@@ -3737,7 +3765,7 @@ pub fn prepare_render_snapshot(
         offset = offset.saturating_add(u64::try_from(window.rows.len())?);
     }
 
-    let final_identity = SnapshotIdentity::capture(&chain_path, &repositories)?;
+    let final_identity = SnapshotIdentity::capture(&chain_path, repositories.entries())?;
     if final_identity != identity {
         return Err(
             io::Error::other("chain or Git HEAD changed while preparing render snapshot").into(),
@@ -6189,7 +6217,7 @@ mod tests {
             git_file_changes: HashMap::new(),
             source_op_locations: Vec::new(),
             blob_resolver: Some(resolver),
-            repositories: Vec::new(),
+            repositories: RepositoryCatalog::default(),
             diagnostics: OpenDiagnostics::default(),
             root_path: PathBuf::new(),
             chain_path: tmp.path().to_path_buf(),
@@ -7325,18 +7353,22 @@ mod tests {
         let mut ws = Workspace::from_projection(projection);
         // Mark the commit's repository as a nested/submodule repo: the main
         // workspace repo at /ws/.git (id 1) contains /ws/nested/.git (id 2).
-        ws.repositories = vec![
+        ws.repositories = RepositoryCatalog::from_entries(vec![
             editchain_git::RepositoryDiscovery {
                 id: RepositoryId(1),
-                path: PathBuf::from("/ws/.git"),
-                is_worktree: false,
+                marker_path: PathBuf::from("/ws/.git"),
+                worktree_root: Some(PathBuf::from("/ws")),
+                git_dir: PathBuf::from("/ws/.git"),
+                common_dir: PathBuf::from("/ws/.git"),
             },
             editchain_git::RepositoryDiscovery {
                 id: RepositoryId(2),
-                path: PathBuf::from("/ws/nested/.git"),
-                is_worktree: false,
+                marker_path: PathBuf::from("/ws/nested/.git"),
+                worktree_root: Some(PathBuf::from("/ws/nested")),
+                git_dir: PathBuf::from("/ws/nested/.git"),
+                common_dir: PathBuf::from("/ws/nested/.git"),
             },
-        ];
+        ]);
         let synthetic = OpId::new(NodeId(0), 0, 0);
         let mut identities = BTreeMap::new();
         let _: Option<GitHitIdentity> = identities.insert(

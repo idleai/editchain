@@ -92,7 +92,8 @@ Git repository ──► editchain-git              │
   importers, cursors, and content-addressed blob storage.
 - `editchain-node`: ingestion CLI and persistence coordination. Its commands are
   `import` and `prepare-view`.
-- `editchain-git`: repository discovery, history walking, commit/blob
+- `editchain-git`: repository catalog with explicit worktree/Git/common paths,
+  scoped discovery diagnostics, history walking, commit/blob
   resolution, and file-change extraction used by the extension.
 - `editchain-project`: the unified EditChain/Git Activity projection, graph
   layout, work-unit grouping, and presentation taxonomy.

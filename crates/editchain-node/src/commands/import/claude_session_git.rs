@@ -51,6 +51,12 @@ pub(super) fn derive_session_base_links(
         return Ok(Vec::new());
     }
 
+    let catalog = editchain_git::RepositoryCatalog::from_entries(
+        repositories
+            .iter()
+            .map(|repository| repository.discovery.clone())
+            .collect(),
+    );
     let mut based_sessions: HashSet<SessionId> = ops
         .iter()
         .filter_map(|op| match (&op.scope, &op.kind) {
@@ -103,7 +109,8 @@ pub(super) fn derive_session_base_links(
         if based_sessions.contains(&start.session) {
             continue;
         }
-        let Some(repository) = repository_for_cwd(workspace, &start.cwd, &repositories) else {
+        let Some(repository) = repository_for_cwd(workspace, &start.cwd, &catalog, &repositories)
+        else {
             continue;
         };
         let Some(commit) = resolve_branch_tip_at_time(repository, &start.branch, start.unix_ms)
@@ -176,6 +183,7 @@ fn claude_start_evidence(op: &Op, raw: &[u8]) -> Option<StartEvidence> {
 fn repository_for_cwd<'a>(
     workspace: &Path,
     cwd: &Path,
+    catalog: &editchain_git::RepositoryCatalog,
     repositories: &'a [RepositoryHandle],
 ) -> Option<&'a RepositoryHandle> {
     let workspace = absolute_path(workspace).canonicalize().ok()?;
@@ -183,14 +191,10 @@ fn repository_for_cwd<'a>(
     if !cwd.starts_with(&workspace) {
         return None;
     }
+    let descriptor = catalog.repository_for_path(&cwd)?;
     repositories
         .iter()
-        .filter_map(|repository| {
-            let root = repository.discovery.path.parent()?.canonicalize().ok()?;
-            cwd.starts_with(&root).then_some((root, repository))
-        })
-        .max_by_key(|(root, _)| root.components().count())
-        .map(|(_, repository)| repository)
+        .find(|repository| repository.discovery.id == descriptor.id)
 }
 
 fn absolute_path(path: &Path) -> PathBuf {
