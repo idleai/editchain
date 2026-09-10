@@ -47,7 +47,7 @@ use snapshot::{RenderSnapshot, SnapshotBuilder, SnapshotIdentity, SnapshotManife
 #[derive(Debug)]
 pub struct Workspace {
     /// The unified history projection.
-    pub projection: HistoryProjection,
+    projection: HistoryProjection,
     /// Canonical decoded operations with durable blob references preserved.
     /// Full payload bytes are materialized from this corpus only for details or
     /// the lazy search index, never for graph projection/layout.
@@ -68,7 +68,7 @@ pub struct Workspace {
     /// Read-only durable blob store used by on-demand details/search hydration.
     blob_resolver: Option<BlobResolver>,
     /// Discovered git repositories.
-    pub repositories: RepositoryCatalog,
+    repositories: RepositoryCatalog,
     /// Diagnostics for this open: chain canonicalization and bounded blob
     /// preview/deferred-hydration outcomes.
     pub diagnostics: OpenDiagnostics,
@@ -77,12 +77,18 @@ pub struct Workspace {
     root_path: PathBuf,
     /// Absolute authoritative chain directory.
     chain_path: PathBuf,
-    /// Valid immutable render snapshot for the fixed default view, if present.
-    snapshot: Option<RenderSnapshot>,
-    /// Whether `projection`/`source_ops` contain the authoritative live model.
-    projection_loaded: bool,
+    /// Inputs pinned at open; absent only for an in-memory projection.
+    source_identity: Option<SnapshotIdentity>,
+    /// Exactly one backend owns the fixed row order at a time.
+    backend: WorkspaceBackend,
     /// The fixed Activity-view snapshot shared by window and find requests.
     current_view: Option<ViewSnapshot>,
+}
+
+#[derive(Debug)]
+enum WorkspaceBackend {
+    Cached(Box<RenderSnapshot>),
+    Projected,
 }
 
 /// Parameters for one history-window read.
@@ -2261,6 +2267,18 @@ fn agent_repository_path(
 }
 
 impl Workspace {
+    /// Read the loaded projection without allowing independent cache mutation.
+    #[must_use]
+    pub const fn projection(&self) -> &HistoryProjection {
+        &self.projection
+    }
+
+    /// Repository locations fixed when this workspace was opened.
+    #[must_use]
+    pub const fn repositories(&self) -> &RepositoryCatalog {
+        &self.repositories
+    }
+
     /// Create a workspace from an existing projection (used in tests).
     #[must_use]
     pub fn from_projection(projection: HistoryProjection) -> Self {
@@ -2284,8 +2302,8 @@ impl Workspace {
             diagnostics: OpenDiagnostics::default(),
             root_path: PathBuf::new(),
             chain_path: PathBuf::new(),
-            snapshot: None,
-            projection_loaded: true,
+            source_identity: None,
+            backend: WorkspaceBackend::Projected,
             current_view: None,
         }
     }
@@ -2308,12 +2326,14 @@ impl Workspace {
         let repositories = RepositoryCatalog::discover(&workspace_path)?;
         if let Some(identity) = repositories
             .is_complete()
-            .then(|| SnapshotIdentity::capture(&chain_path, repositories.entries()))
+            .then(|| {
+                SnapshotIdentity::capture(&workspace_path, &chain_path, repositories.entries())
+            })
             .and_then(Result::ok)
         {
             if let Ok(Some(snapshot)) = RenderSnapshot::open(&chain_path, &identity) {
                 let diagnostics = snapshot.diagnostics();
-                return Ok(Self {
+                let workspace = Self {
                     projection: HistoryProjection::from_ops(Vec::new()),
                     source_ops: Vec::new(),
                     source_op_index: HashMap::new(),
@@ -2326,10 +2346,12 @@ impl Workspace {
                     diagnostics,
                     root_path: workspace_path,
                     chain_path,
-                    snapshot: Some(snapshot),
-                    projection_loaded: false,
+                    source_identity: Some(identity),
+                    backend: WorkspaceBackend::Cached(Box::new(snapshot)),
                     current_view: None,
-                });
+                };
+                workspace.ensure_sources_current()?;
+                return Ok(workspace);
             }
         }
         Self::open_projection(workspace_path, chain_path, repositories)
@@ -2341,6 +2363,8 @@ impl Workspace {
         chain_path: PathBuf,
         repositories: RepositoryCatalog,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let identity =
+            SnapshotIdentity::capture(&workspace_path, &chain_path, repositories.entries())?;
         let (source_ops, chain_stats, source_op_locations) = read_chain_ops(&chain_path)?;
         // Keep durable references in the canonical source corpus. The graph
         // projection receives only bounded display previews, preventing large
@@ -2398,7 +2422,7 @@ impl Workspace {
             repositories.entries(),
         );
         let git_file_changes = git_file_change_index(&projection, repositories.entries());
-        Ok(Self {
+        let workspace = Self {
             projection,
             source_ops,
             source_op_index,
@@ -2411,90 +2435,91 @@ impl Workspace {
             diagnostics,
             root_path: workspace_path,
             chain_path,
-            snapshot: None,
-            projection_loaded: true,
+            source_identity: Some(identity),
+            backend: WorkspaceBackend::Projected,
             current_view: None,
-        })
+        };
+        workspace.ensure_sources_current()?;
+        Ok(workspace)
     }
 
     /// Materialize the complete projection when details, diffs, or find need
     /// source data that is not stored in the render snapshot.
     fn ensure_projection_loaded(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.projection_loaded {
+        if matches!(self.backend, WorkspaceBackend::Projected) {
             return Ok(());
         }
+        self.ensure_sources_current()?;
         let loaded = Self::open_projection(
             self.root_path.clone(),
             self.chain_path.clone(),
             self.repositories.clone(),
         )?;
-        self.projection = loaded.projection;
-        self.source_ops = loaded.source_ops;
-        self.source_op_index = loaded.source_op_index;
-        self.session_metadata = loaded.session_metadata;
-        self.agent_file_changes = loaded.agent_file_changes;
-        self.git_file_changes = loaded.git_file_changes;
-        self.source_op_locations = loaded.source_op_locations;
-        self.blob_resolver = loaded.blob_resolver;
-        self.diagnostics = loaded.diagnostics;
-        self.projection_loaded = true;
-        self.current_view = None;
+        if loaded.source_identity != self.source_identity {
+            return Err(stale_snapshot().into());
+        }
+        // Publish the complete replacement only after validating its sources.
+        // All subsequent pages and search use this same computed backend.
+        *self = loaded;
+        Ok(())
+    }
+
+    /// Guard work that reads authoritative files after an opened view exists.
+    /// Pure paging and searches of an already-built index retain pinned data.
+    fn ensure_sources_current(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(identity) = &self.source_identity {
+            let current = SnapshotIdentity::capture(
+                &self.root_path,
+                &self.chain_path,
+                self.repositories.entries(),
+            )?;
+            if &current != identity {
+                return Err(stale_snapshot().into());
+            }
+        }
         Ok(())
     }
 
     /// Node count for the Open handshake, independent of backend.
     fn node_count(&self) -> u64 {
-        self.snapshot.as_ref().map_or_else(
-            || u64::try_from(self.projection.len()).unwrap_or(u64::MAX),
-            RenderSnapshot::projection_nodes,
-        )
+        match &self.backend {
+            WorkspaceBackend::Cached(snapshot) => snapshot.projection_nodes(),
+            WorkspaceBackend::Projected => u64::try_from(self.projection.len()).unwrap_or(u64::MAX),
+        }
     }
 
     /// Accepted chain generation for the Open handshake, independent of backend.
     fn chain_generation(&self) -> u64 {
-        self.snapshot.as_ref().map_or_else(
-            || u64::try_from(self.projection.ops.len()).unwrap_or(u64::MAX),
-            RenderSnapshot::chain_generation,
-        )
+        match &self.backend {
+            WorkspaceBackend::Cached(snapshot) => snapshot.chain_generation(),
+            WorkspaceBackend::Projected => {
+                u64::try_from(self.projection.ops.len()).unwrap_or(u64::MAX)
+            }
+        }
     }
 
     /// Human-readable render-cache status for diagnostics and performance tests.
     const fn render_snapshot_status(&self) -> &'static str {
-        if self.snapshot.is_some() {
+        if matches!(self.backend, WorkspaceBackend::Cached(_)) {
             "hit"
         } else {
             "miss"
         }
     }
 
-    /// Get a window of history rows (newest-first).
-    #[must_use]
-    pub fn history_window(&mut self, options: HistoryWindowOptions) -> HistoryWindow {
-        let offset = options.offset;
-        let include_layout = options.include_layout;
-        match self.try_history_window(options) {
-            Ok(window) => window,
-            Err(_) => HistoryWindow {
-                rows: Vec::new(),
-                total: 0,
-                chain_generation: self.chain_generation(),
-                max_lane: 0,
-                sub_op_counts: (offset == 0).then(Vec::new),
-                expansion_spans: (offset == 0).then(Vec::new),
-                layout_ready: include_layout,
-            },
-        }
-    }
-
-    /// Fallible history-window path used by the protocol server and snapshot builder.
-    fn try_history_window(
+    /// Get a window from the fixed opened Activity view.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if cached rows cannot be read. Failures never become
+    /// an apparently successful empty history.
+    pub fn history_window(
         &mut self,
         options: HistoryWindowOptions,
     ) -> Result<HistoryWindow, Box<dyn std::error::Error>> {
-        if let Some(snapshot) = self.snapshot.as_mut() {
+        if let WorkspaceBackend::Cached(snapshot) = &mut self.backend {
             return snapshot.history_window(options.offset, options.limit, options.include_layout);
         }
-        self.ensure_projection_loaded()?;
         Ok(self.projection_history_window(options))
     }
 
@@ -3009,7 +3034,9 @@ impl Workspace {
         let mut op = if let Some(index) = self.source_op_index.get(&op_id).copied() {
             self.source_ops.get(index)?.clone()
         } else {
-            let snapshot = self.snapshot.as_ref()?;
+            let WorkspaceBackend::Cached(snapshot) = &self.backend else {
+                return None;
+            };
             let location = snapshot.op_location(op_id)?;
             let decoded = read_op_at(snapshot.chain_dir(), location).ok()?;
             if decoded.id != op_id {
@@ -3729,7 +3756,7 @@ pub fn prepare_render_snapshot(
         )
         .into());
     }
-    let identity = SnapshotIdentity::capture(&chain_path, repositories.entries())?;
+    let identity = SnapshotIdentity::capture(workspace_path, &chain_path, repositories.entries())?;
     if let Ok(Some(snapshot)) = RenderSnapshot::open(&chain_path, &identity) {
         return snapshot.report();
     }
@@ -3740,7 +3767,7 @@ pub fn prepare_render_snapshot(
         repositories.clone(),
     )?;
     let page_limit = 4_096u64;
-    let first = workspace.try_history_window(HistoryWindowOptions {
+    let first = workspace.history_window(HistoryWindowOptions {
         offset: 0,
         limit: page_limit,
         include_layout: true,
@@ -3759,7 +3786,7 @@ pub fn prepare_render_snapshot(
     builder.write_rows(&first.rows)?;
     let mut offset = u64::try_from(first.rows.len())?;
     while offset < total {
-        let window = workspace.try_history_window(HistoryWindowOptions {
+        let window = workspace.history_window(HistoryWindowOptions {
             offset,
             limit: page_limit,
             include_layout: true,
@@ -3775,7 +3802,8 @@ pub fn prepare_render_snapshot(
         offset = offset.saturating_add(u64::try_from(window.rows.len())?);
     }
 
-    let final_identity = SnapshotIdentity::capture(&chain_path, repositories.entries())?;
+    let final_identity =
+        SnapshotIdentity::capture(workspace_path, &chain_path, repositories.entries())?;
     if final_identity != identity {
         return Err(
             io::Error::other("chain or Git HEAD changed while preparing render snapshot").into(),
@@ -4892,6 +4920,7 @@ pub struct SearchIndexState {
 pub fn build_lexical_index(
     workspace: &Workspace,
 ) -> Result<SearchIndexState, Box<dyn std::error::Error>> {
+    workspace.ensure_sources_current()?;
     let mut index = LexicalIndex::new()?;
     let mut git_identities = std::collections::BTreeMap::new();
     let mut generation = 0u64;
@@ -4929,6 +4958,7 @@ pub fn build_lexical_index(
         generation += 1;
     }
     index.commit()?;
+    workspace.ensure_sources_current()?;
     Ok(SearchIndexState {
         index,
         git_identities,
@@ -5031,6 +5061,19 @@ impl Server {
                 body: ResponseBody::Error(error),
             });
         }
+        let reads_sources = match &request.body {
+            RequestBody::Open(_) | RequestBody::GetWindow(_) => false,
+            RequestBody::FindInHistory(_) => self.lexical.is_none(),
+            RequestBody::GetNodeDetails(_)
+            | RequestBody::ResolveObject(_)
+            | RequestBody::GetFileDiff(_) => true,
+        };
+        if reads_sources {
+            self.workspace
+                .as_ref()
+                .ok_or_else(no_workspace)?
+                .ensure_sources_current()?;
+        }
         let body = match &request.body {
             RequestBody::Open(req) => {
                 let workspace = Workspace::open(&req.workspace_path, &req.chain_dir)?;
@@ -5054,8 +5097,8 @@ impl Server {
                 }))
             }
             RequestBody::GetWindow(req) => {
-                let ws = self.workspace.as_mut().ok_or("no workspace open")?;
-                let window = ws.try_history_window(HistoryWindowOptions {
+                let ws = self.workspace.as_mut().ok_or_else(no_workspace)?;
+                let window = ws.history_window(HistoryWindowOptions {
                     offset: req.offset,
                     limit: req.limit,
                     include_layout: req.include_layout,
@@ -5063,7 +5106,7 @@ impl Server {
                 ResponseBody::Ok(serde_json::to_value(window)?)
             }
             RequestBody::GetNodeDetails(req) => {
-                let ws = self.workspace.as_ref().ok_or("no workspace open")?;
+                let ws = self.workspace.as_ref().ok_or_else(no_workspace)?;
                 match ws.node_details(Some(req.op_id.clone()), None) {
                     Some(details) => ResponseBody::Ok(serde_json::to_value(details)?),
                     None => ResponseBody::Error(ServiceError::new(
@@ -5073,7 +5116,7 @@ impl Server {
                 }
             }
             RequestBody::ResolveObject(req) => {
-                let ws = self.workspace.as_ref().ok_or("no workspace open")?;
+                let ws = self.workspace.as_ref().ok_or_else(no_workspace)?;
                 let parsed = parse_repository_id(&req.repository).and_then(|repository_id| {
                     parse_git_oid(&req.oid).map(|oid| (repository_id, oid))
                 });
@@ -5095,7 +5138,7 @@ impl Server {
                 }
             }
             RequestBody::GetFileDiff(req) => {
-                let ws = self.workspace.as_mut().ok_or("no workspace open")?;
+                let ws = self.workspace.as_mut().ok_or_else(no_workspace)?;
                 if req.change.source == FileChangeSource::Agent {
                     ws.ensure_projection_loaded()?;
                 }
@@ -5110,13 +5153,13 @@ impl Server {
             RequestBody::FindInHistory(req) => {
                 // Build the lexical index lazily on first search.
                 if self.lexical.is_none() {
-                    let ws = self.workspace.as_mut().ok_or("no workspace open")?;
+                    let ws = self.workspace.as_mut().ok_or_else(no_workspace)?;
                     ws.ensure_projection_loaded()?;
                     self.lexical = Some(build_lexical_index(ws)?);
                 }
                 let lexical = self.lexical.as_ref().ok_or("no index built")?;
                 let chunks = lexical.index.search_internal(&req.query, req.top_k)?;
-                let ws = self.workspace.as_mut().ok_or("no workspace open")?;
+                let ws = self.workspace.as_mut().ok_or_else(no_workspace)?;
                 let matches = ws.find_in_history(&chunks, &lexical.git_identities);
                 // `more` reports only whether the candidate/top_k limit may have
                 // truncated retrieval; the response never claims an exact total.
@@ -5125,6 +5168,12 @@ impl Server {
                 ResponseBody::Ok(serde_json::to_value(response)?)
             }
         };
+        if reads_sources {
+            self.workspace
+                .as_ref()
+                .ok_or_else(no_workspace)?
+                .ensure_sources_current()?;
+        }
         Ok(Response { id, body })
     }
 }
@@ -5133,6 +5182,17 @@ impl Default for Server {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn stale_snapshot() -> ServiceError {
+    ServiceError::new(
+        ErrorCode::StaleSnapshot,
+        "History sources changed. Reopen history to refresh this view.",
+    )
+}
+
+fn no_workspace() -> ServiceError {
+    ServiceError::new(ErrorCode::NoWorkspace, "no workspace open")
 }
 
 /// Produce a short summary for an `EditChain` operation.
@@ -5391,11 +5451,13 @@ mod tests {
         ];
         let projection = HistoryProjection::from_ops(ops);
         let mut ws = Workspace::from_projection(projection);
-        let window = ws.history_window(HistoryWindowOptions {
-            offset: 0,
-            limit: 100,
-            include_layout: true,
-        });
+        let window = ws
+            .history_window(HistoryWindowOptions {
+                offset: 0,
+                limit: 100,
+                include_layout: true,
+            })
+            .unwrap();
 
         // SpawnedBy: the exact anchor is bundled session metadata, matching a
         // Codex child rollout. Its first surviving row carries the "subagent"
@@ -5495,11 +5557,13 @@ mod tests {
 
         let projection = HistoryProjection::from_ops(vec![turn.clone(), msg, meta.clone()]);
         let mut ws = Workspace::from_projection(projection);
-        let window = ws.history_window(HistoryWindowOptions {
-            offset: 0,
-            limit: 100,
-            include_layout: true,
-        });
+        let window = ws
+            .history_window(HistoryWindowOptions {
+                offset: 0,
+                limit: 100,
+                include_layout: true,
+            })
+            .unwrap();
 
         // Parent row + one expanded sub-op row.
         assert_eq!(window.rows.len(), 2);
@@ -5526,11 +5590,13 @@ mod tests {
         // A page beginning inside an expanded block must still resolve the
         // owning top-level node. Global expansion metadata is sent only on the
         // offset-zero page and retained by the client for later windows.
-        let deep = ws.history_window(HistoryWindowOptions {
-            offset: 1,
-            limit: 1,
-            include_layout: true,
-        });
+        let deep = ws
+            .history_window(HistoryWindowOptions {
+                offset: 1,
+                limit: 1,
+                include_layout: true,
+            })
+            .unwrap();
         assert_eq!(deep.rows.len(), 1);
         assert!(deep.rows[0].is_subop);
         assert!(!deep.rows[0].group_end);
@@ -5566,11 +5632,13 @@ mod tests {
             parent.clone(),
         ]);
         let mut ws = Workspace::from_projection(projection);
-        let window = ws.history_window(HistoryWindowOptions {
-            offset: 0,
-            limit: 100,
-            include_layout: true,
-        });
+        let window = ws
+            .history_window(HistoryWindowOptions {
+                offset: 0,
+                limit: 100,
+                include_layout: true,
+            })
+            .unwrap();
 
         // Find the sub-op row (is_subop).
         let sub = window
@@ -6246,8 +6314,8 @@ mod tests {
             diagnostics: OpenDiagnostics::default(),
             root_path: PathBuf::new(),
             chain_path: tmp.path().to_path_buf(),
-            snapshot: None,
-            projection_loaded: true,
+            source_identity: None,
+            backend: WorkspaceBackend::Projected,
             current_view: None,
         };
         let details = ws
@@ -7145,11 +7213,13 @@ mod tests {
         let second = message_op(1, 2, first.id);
         let projection = HistoryProjection::from_ops(vec![first, second]);
         let mut ws = Workspace::from_projection(projection);
-        let provisional = ws.history_window(HistoryWindowOptions {
-            offset: 0,
-            limit: 10,
-            include_layout: false,
-        });
+        let provisional = ws
+            .history_window(HistoryWindowOptions {
+                offset: 0,
+                limit: 10,
+                include_layout: false,
+            })
+            .unwrap();
         assert!(!provisional.layout_ready);
         assert!(!provisional.rows.is_empty());
         assert!(provisional.rows.iter().all(|row| {
@@ -7163,11 +7233,13 @@ mod tests {
             .as_ref()
             .is_some_and(|snapshot| snapshot.context.is_none()));
 
-        let laid_out = ws.history_window(HistoryWindowOptions {
-            offset: 0,
-            limit: 10,
-            include_layout: true,
-        });
+        let laid_out = ws
+            .history_window(HistoryWindowOptions {
+                offset: 0,
+                limit: 10,
+                include_layout: true,
+            })
+            .unwrap();
         assert!(laid_out.layout_ready);
         assert_eq!(laid_out.rows.len(), provisional.rows.len());
         assert_eq!(laid_out.rows[0].node_key, provisional.rows[0].node_key);

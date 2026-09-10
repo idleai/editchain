@@ -80,11 +80,13 @@ fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() 
     // The prepared snapshot must serve the same fixed Activity view as the
     // live projection.
     let mut live = Workspace::open(tmp.path().to_str().unwrap(), ".editchain").unwrap();
-    let expected = live.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        include_layout: true,
-    });
+    let expected = live
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: true,
+        })
+        .unwrap();
     let expected_details = live
         .node_details(Some(first.id.to_string()), None)
         .expect("live details");
@@ -100,11 +102,13 @@ fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() 
     assert_eq!(reused.path, report.path);
 
     let mut cached = Workspace::open(tmp.path().to_str().unwrap(), ".editchain").unwrap();
-    let actual = cached.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        include_layout: true,
-    });
+    let actual = cached
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: true,
+        })
+        .unwrap();
     assert_eq!(
         serde_json::to_value(actual).unwrap(),
         serde_json::to_value(expected).unwrap()
@@ -117,6 +121,54 @@ fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() 
         )
         .unwrap(),
         serde_json::to_value(expected_details).unwrap()
+    );
+
+    let mut materialized = editchain_vscode_service::Server::new();
+    materialized.workspace =
+        Some(Workspace::open(tmp.path().to_str().unwrap(), ".editchain").unwrap());
+    let before_search = materialized
+        .workspace
+        .as_mut()
+        .unwrap()
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: true,
+        })
+        .unwrap();
+    let found = materialized
+        .handle(&Request {
+            id: 1,
+            body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
+                query: "snapshot".to_owned(),
+                top_k: 10,
+            }),
+        })
+        .unwrap();
+    let ResponseBody::Ok(found) = found.body else {
+        panic!("stable cached search");
+    };
+    let found: editchain_protocol::FindInHistoryResponse = serde_json::from_value(found).unwrap();
+    assert_eq!(found.matches.len(), 2);
+    for hit in found.matches {
+        assert_eq!(
+            before_search.rows[usize::try_from(hit.row).unwrap()].node_key,
+            hit.node_key
+        );
+    }
+    let after_search = materialized
+        .workspace
+        .as_mut()
+        .unwrap()
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: true,
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(before_search).unwrap(),
+        serde_json::to_value(after_search).unwrap()
     );
 
     let mut server = editchain_vscode_service::Server::new();
@@ -138,6 +190,40 @@ fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() 
     let mut appended = editchain_codec::page::Page::new(1);
     appended.add_record(0, editchain_codec::frame::encode_op(&third).unwrap());
     write_page_sequence(&chain_dir, 1, &appended);
+    let stale_search = server
+        .handle(&Request {
+            id: 2,
+            body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
+                query: "invalidation".to_owned(),
+                top_k: 10,
+            }),
+        })
+        .unwrap_err();
+    assert_eq!(
+        editchain_protocol::ServiceError::from_error(stale_search.as_ref()).code,
+        editchain_protocol::ErrorCode::StaleSnapshot
+    );
+    assert!(
+        server.lexical.is_none(),
+        "stale search must not install a newer index"
+    );
+    let pinned = server
+        .handle(&Request {
+            id: 3,
+            body: RequestBody::GetWindow(editchain_protocol::GetWindowRequest {
+                offset: 0,
+                limit: 100,
+                include_layout: true,
+            }),
+        })
+        .unwrap();
+    let ResponseBody::Ok(pinned) = pinned.body else {
+        panic!("pinned window");
+    };
+    assert_eq!(
+        pinned["chain_generation"], 2,
+        "already cached pages retain their fixed source version"
+    );
     let stale_open = server
         .handle(&Request {
             id: 2,
@@ -152,6 +238,138 @@ fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() 
     };
     assert_eq!(stale_body["render_snapshot"], "miss");
     assert_eq!(stale_body["chain_generation"], 3);
+}
+
+#[test]
+fn recovered_blob_invalidates_cached_rows_and_lazy_search_without_a_chain_append() {
+    let tmp = tempfile::tempdir().unwrap();
+    let chain = tmp.path().join(".editchain");
+    let bytes = b"recoveredneedle complete message";
+    let blob = store_blob(&chain, bytes);
+    let hash = editchain_import::hash_raw(bytes);
+    let sink = editchain_import::FsBlobSink::open_read_only(chain.join("blobs"))
+        .unwrap()
+        .unwrap();
+    std::fs::remove_file(sink.path_for(&hash)).unwrap();
+    let mut op = msg_op(41, 1, b"");
+    let OpKind::Message(message) = &mut op.kind else {
+        panic!("message fixture");
+    };
+    message.content = Payload::Blob(blob);
+    let mut page = editchain_codec::page::Page::new(0);
+    page.add_record(0, editchain_codec::frame::encode_op(&op).unwrap());
+    write_page(&chain, &page);
+    let before = prepare_render_snapshot(tmp.path(), Path::new(".editchain")).unwrap();
+    let mut server = editchain_vscode_service::Server::new();
+    server.workspace = Some(Workspace::open(tmp.path().to_str().unwrap(), ".editchain").unwrap());
+    let _: editchain_core::BlobRef = store_blob(&chain, bytes);
+    let error = server
+        .handle(&Request {
+            id: 1,
+            body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
+                query: "recoveredneedle".to_owned(),
+                top_k: 10,
+            }),
+        })
+        .unwrap_err();
+    assert_eq!(
+        editchain_protocol::ServiceError::from_error(error.as_ref()).code,
+        editchain_protocol::ErrorCode::StaleSnapshot
+    );
+    let after = prepare_render_snapshot(tmp.path(), Path::new(".editchain")).unwrap();
+    assert!(!after.reused);
+    assert_ne!(before.path, after.path);
+    assert_eq!(before.chain_generation, after.chain_generation);
+    let mut recovered = Workspace::open(tmp.path().to_str().unwrap(), ".editchain").unwrap();
+    let window = recovered
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: true,
+        })
+        .unwrap();
+    assert!(window
+        .rows
+        .iter()
+        .any(|row| row.summary.contains("recoveredneedle")));
+}
+
+#[test]
+fn invalid_snapshot_offsets_fall_back_to_authoritative_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let chain = tmp.path().join(".editchain");
+    let op = msg_op(41, 1, b"authoritative row");
+    let mut page = editchain_codec::page::Page::new(0);
+    page.add_record(0, editchain_codec::frame::encode_op(&op).unwrap());
+    write_page(&chain, &page);
+    let report = prepare_render_snapshot(tmp.path(), Path::new(".editchain")).unwrap();
+    let offsets_path = report.path.join("rows.offsets");
+    let mut offsets = std::fs::read(&offsets_path).unwrap();
+    offsets
+        .get_mut(..8)
+        .unwrap()
+        .copy_from_slice(&1u64.to_le_bytes());
+    std::fs::write(offsets_path, offsets).unwrap();
+    let mut workspace = Workspace::open(tmp.path().to_str().unwrap(), ".editchain").unwrap();
+    let window = workspace
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 10,
+            include_layout: true,
+        })
+        .unwrap();
+    assert_eq!(window.rows.len(), 1);
+    assert_eq!(window.rows[0].node_key, op.id.to_string());
+    assert_eq!(window.rows[0].summary, "authoritative row");
+}
+
+#[test]
+fn git_ref_changes_and_object_recovery_invalidate_render_cache_with_unchanged_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_git_repo(tmp.path());
+    let parent = String::from_utf8(
+        Command::new("git")
+            .current_dir(&repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    run(
+        &repo,
+        &[
+            "-c",
+            "user.name=Alice",
+            "-c",
+            "user.email=alice@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "second",
+        ],
+    );
+    let parent = parent.trim();
+    let object = repo
+        .join(".git/objects")
+        .join(parent.get(..2).unwrap())
+        .join(parent.get(2..).unwrap());
+    let bytes = std::fs::read(&object).unwrap();
+    std::fs::remove_file(&object).unwrap();
+    let before = prepare_render_snapshot(&repo, Path::new(".editchain")).unwrap();
+    std::fs::write(&object, bytes).unwrap();
+    let recovered = prepare_render_snapshot(&repo, Path::new(".editchain")).unwrap();
+    assert!(!recovered.reused);
+    assert!(
+        recovered.rows > before.rows,
+        "recovered ancestry is present after refresh"
+    );
+    assert_eq!(before.chain_generation, recovered.chain_generation);
+    run(&repo, &["branch", "observed-after-cache"]);
+    let labels = prepare_render_snapshot(&repo, Path::new(".editchain")).unwrap();
+    assert!(!labels.reused);
+    assert_ne!(labels.path, recovered.path);
 }
 
 fn msg_op(node: u64, seq: u64, text: &[u8]) -> Op {
@@ -789,21 +1007,21 @@ fn open_resolves_exact_session_base_outside_current_head_history() {
     let workspace = Workspace::open(repo.to_str().unwrap(), ".editchain").unwrap();
     assert!(
         workspace
-            .projection
+            .projection()
             .git
             .commit(repository, &session_base)
             .is_some(),
         "the exact durable target must load even when HEAD cannot reach it"
     );
     let session_node = workspace
-        .projection
+        .projection()
         .nodes()
         .into_iter()
         .find(|node| node.node_key() == source.id.to_string())
         .expect("session start node");
     assert!(
         workspace
-            .projection
+            .projection()
             .lifted_parent_keys(&session_node)
             .contains(&editchain_core::GitCommitKey::new(repository, session_base).to_string()),
         "the exact BasedOn relation must branch the session from its start commit"
@@ -818,11 +1036,13 @@ fn op_identifiers_above_2_53_round_trip_exactly_through_window_details_and_find(
 
     // History window: the op id must be the exact decimal string, never a
     // number that JavaScript could round.
-    let window = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 10,
-        include_layout: true,
-    });
+    let window = ws
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 10,
+            include_layout: true,
+        })
+        .unwrap();
     let row = window
         .rows
         .iter()
@@ -1035,12 +1255,14 @@ fn git_resolve_uses_exact_string_ids_and_rejects_invalid_input() {
 
     // Open the workspace: git rows carry hex oid + decimal repository strings.
     let mut ws = Workspace::open(tmp.path().to_str().expect("utf8"), "").expect("open");
-    assert!(!ws.repositories.is_empty(), "repo should be discovered");
-    let window = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 10,
-        include_layout: true,
-    });
+    assert!(!ws.repositories().is_empty(), "repo should be discovered");
+    let window = ws
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 10,
+            include_layout: true,
+        })
+        .unwrap();
     let row = window
         .rows
         .iter()
@@ -1119,7 +1341,7 @@ fn workspace_open_with_empty_chain() {
     let tmp = tempfile::tempdir().expect("tempdir");
     // No chain dir and no git repo — should open with empty projection.
     let ws = Workspace::open(tmp.path().to_str().expect("utf8"), "").expect("open");
-    assert!(ws.projection.is_empty());
+    assert!(ws.projection().is_empty());
 }
 
 #[test]
@@ -1148,11 +1370,13 @@ fn sibling_clones_remain_visible_and_partial_catalogs_report_gaps() {
     let mut workspace = Workspace::open(tmp.path().to_str().unwrap(), ".editchain").unwrap();
     assert_eq!(workspace.diagnostics.git.unavailable_repositories, 1);
     assert!(!workspace.diagnostics.warnings().is_empty());
-    let window = workspace.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 20,
-        include_layout: true,
-    });
+    let window = workspace
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 20,
+            include_layout: true,
+        })
+        .unwrap();
     let commits: Vec<_> = window
         .rows
         .iter()
@@ -1178,11 +1402,13 @@ fn history_window_returns_rows() {
     let ops = vec![msg_op(1, 1, b"first"), msg_op(1, 2, b"second")];
     let projection = HistoryProjection::from_ops(ops);
     let mut ws = Workspace::from_projection(projection);
-    let window = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 10,
-        include_layout: true,
-    });
+    let window = ws
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 10,
+            include_layout: true,
+        })
+        .unwrap();
     assert_eq!(window.total, 2);
     assert_eq!(window.rows.len(), 2);
 }
@@ -1195,11 +1421,13 @@ fn op_rows_have_uniform_author_and_short_commit_id() {
     let ops = vec![msg_op(7, 42, b"hello")];
     let projection = HistoryProjection::from_ops(ops);
     let mut ws = Workspace::from_projection(projection);
-    let window = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 10,
-        include_layout: true,
-    });
+    let window = ws
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 10,
+            include_layout: true,
+        })
+        .unwrap();
     let row = &window.rows[0];
     assert_eq!(row.author, "system");
     assert_eq!(row.commit_id, "7:42");
@@ -1225,11 +1453,13 @@ fn system_flag_marks_tool_and_import_ops() {
     let msg = msg_op(1, 2, b"hello");
     let projection = HistoryProjection::from_ops(vec![tool, msg]);
     let mut ws = Workspace::from_projection(projection);
-    let window = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 10,
-        include_layout: true,
-    });
+    let window = ws
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 10,
+            include_layout: true,
+        })
+        .unwrap();
     // Rows are newest-first; find by kind.
     let tool_row = window
         .rows
@@ -1609,11 +1839,13 @@ fn activity_view_hides_trace_envelopes_and_preserves_primary_taxonomy() {
     let projection = HistoryProjection::from_ops(vec![a, trace.clone(), c, ma, mc]);
     let mut ws = Workspace::from_projection(projection);
 
-    let window = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        include_layout: true,
-    });
+    let window = ws
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: true,
+        })
+        .unwrap();
 
     assert!(
         activity_row_for_op(&window, trace.id).is_none(),
@@ -1723,11 +1955,13 @@ fn service_path_compaction_preserves_echo_and_outcome_metadata() {
 
     let mut ws = Workspace::open(tmp.path().to_str().unwrap(), ".editchain")
         .expect("open workspace through the real service path");
-    let window = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        include_layout: false,
-    });
+    let window = ws
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: false,
+        })
+        .unwrap();
 
     let echo_keys = [echo_call.id.to_string(), echo_result.id.to_string()];
     for key in &echo_keys {
@@ -1809,11 +2043,13 @@ fn service_path_compaction_preserves_childless_output_rows_and_blob_echoes() {
 
     let mut ws = Workspace::open(tmp.path().to_str().unwrap(), ".editchain")
         .expect("open workspace through the real service path");
-    let window = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        include_layout: false,
-    });
+    let window = ws
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: false,
+        })
+        .unwrap();
 
     let output_row = activity_row_for_op(&window, output.id).expect("output row");
     assert_eq!(output_row.visibility, Visibility::Primary);
@@ -1886,11 +2122,13 @@ fn service_path_uses_command_stdout_as_the_output_subtitle() {
 
     let mut workspace = Workspace::open(tmp.path().to_str().unwrap(), ".editchain")
         .expect("open workspace through the real service path");
-    let window = workspace.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        include_layout: false,
-    });
+    let window = workspace
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: false,
+        })
+        .unwrap();
     let row = activity_row_for_op(&window, command_raw.id).expect("command output row");
 
     assert_eq!(row.kind, "command");
@@ -1944,11 +2182,13 @@ fn service_path_compaction_preserves_object_tool_payload_carriers() {
 
     let mut ws = Workspace::open(tmp.path().to_str().unwrap(), ".editchain")
         .expect("open workspace through the real service path");
-    let window = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        include_layout: false,
-    });
+    let window = ws
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: false,
+        })
+        .unwrap();
 
     for id in [call.id, with_params.id] {
         let row = activity_row_for_op(&window, id)
@@ -2015,11 +2255,13 @@ fn service_path_keeps_exec_command_separate_from_token_metadata() {
 
     let mut workspace = Workspace::open(tmp.path().to_str().unwrap(), ".editchain")
         .expect("open workspace through the real service path");
-    let window = workspace.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        include_layout: false,
-    });
+    let window = workspace
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: false,
+        })
+        .unwrap();
     let row = activity_row_for_op(&window, call.id).expect("exec row");
 
     assert_eq!(row.summary, "tool: exec cargo test -p editchain-project");
@@ -2080,11 +2322,13 @@ fn service_path_compaction_preserves_scalar_and_truncated_tool_payload_carriers(
 
     let mut ws = Workspace::open(tmp.path().to_str().unwrap(), ".editchain")
         .expect("open workspace through the real service path");
-    let window = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        include_layout: false,
-    });
+    let window = ws
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: false,
+        })
+        .unwrap();
 
     for (id, label) in [
         (scalar_call.id, "scalar carrier call"),
@@ -2164,11 +2408,13 @@ fn service_path_hides_duplicate_response_item_event_msg_pairs_after_compaction()
 
     let mut ws = Workspace::open(tmp.path().to_str().unwrap(), ".editchain")
         .expect("open workspace through the real service path");
-    let window = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        include_layout: false,
-    });
+    let window = ws
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: false,
+        })
+        .unwrap();
     assert_eq!(window.rows.len(), 2);
     for hidden in [marker_response.id, marker_event.id, narrative_response.id] {
         assert!(
@@ -2259,11 +2505,13 @@ fn service_path_truncated_echo_texts_never_pair_but_untruncated_exact_pairs_do()
 
     let mut ws = Workspace::open(tmp.path().to_str().unwrap(), ".editchain")
         .expect("open workspace through the real service path");
-    let window = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        include_layout: false,
-    });
+    let window = ws
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: false,
+        })
+        .unwrap();
     assert_eq!(window.rows.len(), 3);
 
     let long_response_row =
@@ -2329,11 +2577,13 @@ fn cancelled_branch_rows_ship_muted_node_and_child_owned_edge_geometry() {
 
     let mut workspace =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("open workspace");
-    let window = workspace.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        include_layout: true,
-    });
+    let window = workspace
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: true,
+        })
+        .unwrap();
     let row = |id: OpId| {
         window
             .rows
@@ -2362,7 +2612,7 @@ fn cancelled_branch_rows_ship_muted_node_and_child_owned_edge_geometry() {
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_forty_eight() {
+fn prepared_snapshot_manifest_records_projection_revision_forty_nine() {
     // Stale snapshots from earlier projection revisions (before trace hiding,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
@@ -2389,7 +2639,7 @@ fn prepared_snapshot_manifest_records_projection_revision_forty_eight() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 48u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 49u64);
 }
 
 #[test]
@@ -2478,11 +2728,13 @@ fn activity_keeps_context_compaction_visible_and_inline() {
     ]);
     let mut ws = Workspace::from_projection(projection);
 
-    let activity = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        include_layout: true,
-    });
+    let activity = ws
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: true,
+        })
+        .unwrap();
     let activity_rows: Vec<&HistoryRow> =
         activity.rows.iter().filter(|row| !row.is_subop).collect();
     assert_eq!(activity_rows.len(), 3);
@@ -2550,11 +2802,13 @@ fn activity_view_bundles_execute_runs_in_source_order() {
     );
     let projection = HistoryProjection::from_ops(ops);
     let mut ws = Workspace::from_projection(projection);
-    let activity_window = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        include_layout: false,
-    });
+    let activity_window = ws
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: false,
+        })
+        .unwrap();
     // Activity view: chat / outer work / chat. Because the execute bundle is
     // the work interval's only grouped member, opening work reveals its three
     // original tools directly without a redundant second disclosure.
@@ -2667,11 +2921,13 @@ fn activity_view_bundles_execute_runs_in_source_order() {
 fn activity_view_groups_repeated_plans_as_expandable_linear_updates() {
     let projection = HistoryProjection::from_ops(repeated_plan_chain_ops());
     let mut ws = Workspace::from_projection(projection);
-    let activity = ws.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        include_layout: true,
-    });
+    let activity = ws
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: true,
+        })
+        .unwrap();
     let work_group = activity
         .rows
         .iter()
@@ -2754,11 +3010,13 @@ fn prepared_snapshot_serves_flattened_activity_view_and_records_current_revision
     write_page(&chain_dir, &page);
 
     let mut live = Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("live open");
-    let expected = live.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        include_layout: true,
-    });
+    let expected = live
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: true,
+        })
+        .unwrap();
     assert_eq!(
         expected.total, 6,
         "activity view stores chat/work/chat + 3 direct work members"
@@ -2778,15 +3036,17 @@ fn prepared_snapshot_serves_flattened_activity_view_and_records_current_revision
         &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["identity"]["projection_revision"], 48u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 49u64);
 
     let mut cached =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");
-    let actual = cached.history_window(HistoryWindowOptions {
-        offset: 0,
-        limit: 100,
-        include_layout: true,
-    });
+    let actual = cached
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 100,
+            include_layout: true,
+        })
+        .unwrap();
     assert_eq!(
         serde_json::to_value(&actual).expect("serialize actual"),
         serde_json::to_value(&expected).expect("serialize expected"),

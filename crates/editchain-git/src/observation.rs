@@ -51,6 +51,11 @@ impl RefSnapshot {
     pub fn refs_for(&self, oid: &GitOid) -> &[Vec<u8>] {
         self.refs.get(oid).map_or(&[], Vec::as_slice)
     }
+
+    /// Exact target/name observations in deterministic target order.
+    pub fn entries(&self) -> impl Iterator<Item = (&GitOid, &[Vec<u8>])> {
+        self.refs.iter().map(|(oid, names)| (oid, names.as_slice()))
+    }
 }
 
 /// One failed observation or object read during a history walk.

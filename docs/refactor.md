@@ -45,6 +45,13 @@ Completed increments:
   inside the existing envelope; clients accept both structured and legacy string
   errors. Requests validate page, search, query, and exact-coordinate limits.
   The stdio reader rejects frames above 8 MiB before allocating their payloads.
+- Opened source lifetime: cached rows remain fixed. Lazy projection and search
+  compare the pinned source version before and after reading, and report
+  `StaleSnapshot` on a change. A complete computed backend replaces the cached
+  backend atomically; both windows and search then use it. Revision 49 includes
+  ref labels, shallow metadata, and blob/object availability inventories in
+  cache identity. Window read failures remain errors, and cached offset and
+  expansion indices are checked before use.
 
 Remaining work, in dependency order:
 

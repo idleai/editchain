@@ -644,7 +644,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(reconciled, vec![stable.clone()]);
-            assert_eq!(viewer.projection.ops, reconciled);
+            assert_eq!(viewer.projection().ops, reconciled);
             assert_eq!(viewer.diagnostics.chain.quarantined, 2);
             assert_eq!(viewer.diagnostics.chain.duplicates, 3);
         }

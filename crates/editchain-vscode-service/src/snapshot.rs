@@ -151,7 +151,8 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 /// Prefix-related sibling repositories remain visible as independent sources.
 ///
 /// Revision 48 retains Git history gaps and observes refs once per history read.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 48;
+/// Revision 49 pins source availability and ref observations for lazy components.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 49;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.
@@ -186,96 +187,171 @@ pub struct RenderSnapshotReport {
     pub bytes: u64,
 }
 
-/// Fast freshness identity for the source chain, Git overlay, and projection.
+/// Version of the inputs fixed for an opened source/view snapshot.
+///
+/// Segment and content-addressed object files are immutable or append-only.
+/// Metadata inventories track normal writes, availability recovery, and GC;
+/// exact ref and shallow observations also affect the derived view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SnapshotIdentity {
     schema_version: u32,
     projection_revision: u32,
-    chain_files: Vec<ChainFileStamp>,
+    workspace: Vec<u8>,
+    chain: Vec<u8>,
+    chain_files: Vec<SourceFileStamp>,
+    blobs: Result<Vec<SourceFileStamp>, String>,
     repositories: Vec<RepositoryStamp>,
 }
 
-/// Metadata stamp for one append-only segment file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ChainFileStamp {
-    name: String,
+struct SourceFileStamp {
+    name: Vec<u8>,
     length: u64,
     modified_secs: u64,
     modified_nanos: u32,
 }
 
-/// Metadata stamp for one repository whose HEAD contributes live Git history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RepositoryStamp {
     id: u64,
-    path: String,
-    is_worktree: bool,
-    head: String,
+    marker: Vec<u8>,
+    git_dir: Vec<u8>,
+    common_dir: Vec<u8>,
+    observation: Result<RepositoryObservation, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RepositoryObservation {
+    head: Result<Option<String>, String>,
+    refs: Result<Vec<RefObservation>, String>,
+    objects: Result<Vec<SourceFileStamp>, String>,
+    shallow: Result<Option<Vec<u8>>, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RefObservation {
+    target: editchain_core::GitOid,
+    names: Vec<Vec<u8>>,
 }
 
 impl SnapshotIdentity {
-    /// Capture a cheap identity without decoding operations or walking history.
+    /// Capture source versions without decoding operations or commit history.
     pub(crate) fn capture(
+        workspace: &Path,
         chain_dir: &Path,
         repositories: &[RepositoryDiscovery],
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let mut chain_files = Vec::new();
-        for entry in fs::read_dir(chain_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("eclog") {
-                continue;
-            }
-            let metadata = entry.metadata()?;
-            if !metadata.is_file() {
-                continue;
-            }
-            let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
-            let duration = modified.duration_since(UNIX_EPOCH).unwrap_or_default();
-            chain_files.push(ChainFileStamp {
-                name: entry.file_name().to_string_lossy().into_owned(),
-                length: metadata.len(),
-                modified_secs: duration.as_secs(),
-                modified_nanos: duration.subsec_nanos(),
-            });
-        }
-        chain_files.sort_by(|left, right| left.name.cmp(&right.name));
-
+        let mut chain_files = source_file_stamps(chain_dir, false)?;
+        chain_files.retain(|stamp| stamp.name.ends_with(b".eclog"));
         let mut repository_stamps = repositories
             .iter()
-            .map(|repository| {
-                let head = editchain_git::open_repository(repository)
-                    .ok()
-                    .and_then(|handle| {
-                        let head = handle.repo.head().ok()?;
-                        head.id().map(|id| id.to_string())
-                    })
-                    .unwrap_or_default();
-                RepositoryStamp {
-                    id: repository.id.0,
-                    path: repository.marker_path.to_string_lossy().into_owned(),
-                    is_worktree: repository.is_linked_worktree(),
-                    head,
-                }
-            })
+            .map(repository_stamp)
             .collect::<Vec<_>>();
-        repository_stamps.sort_by(|left, right| {
-            (left.id, left.path.as_str()).cmp(&(right.id, right.path.as_str()))
-        });
-
+        repository_stamps
+            .sort_by(|left, right| (left.id, &left.marker).cmp(&(right.id, &right.marker)));
         Ok(Self {
             schema_version: SNAPSHOT_SCHEMA_VERSION,
             projection_revision: SNAPSHOT_PROJECTION_REVISION,
+            workspace: workspace.as_os_str().as_encoded_bytes().to_vec(),
+            chain: chain_dir.as_os_str().as_encoded_bytes().to_vec(),
             chain_files,
+            blobs: source_file_stamps(&chain_dir.join("blobs"), true)
+                .map_err(|error| error.to_string()),
             repositories: repository_stamps,
         })
     }
 
     /// Stable lowercase BLAKE3 hex key used as the immutable directory name.
-    fn hash(&self) -> Result<String, Box<dyn std::error::Error>> {
+    pub(crate) fn hash(&self) -> Result<String, Box<dyn std::error::Error>> {
         let encoded = serde_json::to_vec(self)?;
         hex_string(&hash_raw(&encoded)).map_err(Into::into)
     }
+}
+
+fn repository_stamp(repository: &RepositoryDiscovery) -> RepositoryStamp {
+    let observation = editchain_git::open_repository(repository)
+        .map_err(|error| error.to_string())
+        .map(|handle| RepositoryObservation {
+            head: handle
+                .repo
+                .head()
+                .map(|head| head.id().map(|id| id.to_string()))
+                .map_err(|error| error.to_string()),
+            refs: editchain_git::RefSnapshot::capture(&handle)
+                .map(|snapshot| {
+                    snapshot
+                        .entries()
+                        .map(|(oid, names)| RefObservation {
+                            target: *oid,
+                            names: names.to_vec(),
+                        })
+                        .collect()
+                })
+                .map_err(|error| error.to_string()),
+            objects: source_file_stamps(&repository.common_dir.join("objects"), true)
+                .map_err(|error| error.to_string()),
+            shallow: match fs::read(repository.common_dir.join("shallow")) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.to_string()),
+            },
+        });
+    RepositoryStamp {
+        id: repository.id.0,
+        marker: repository
+            .marker_path
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec(),
+        git_dir: repository.git_dir.as_os_str().as_encoded_bytes().to_vec(),
+        common_dir: repository
+            .common_dir
+            .as_os_str()
+            .as_encoded_bytes()
+            .to_vec(),
+        observation,
+    }
+}
+
+/// Enumerate source metadata without following directory symlinks.
+fn source_file_stamps(root: &Path, recursive: bool) -> io::Result<Vec<SourceFileStamp>> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut stamps = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if directory == root && error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                if recursive {
+                    pending.push(path);
+                }
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            let duration = metadata
+                .modified()?
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            stamps.push(SourceFileStamp {
+                name: path
+                    .strip_prefix(root)
+                    .map_err(io::Error::other)?
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec(),
+                length: metadata.len(),
+                modified_secs: duration.as_secs(),
+                modified_nanos: duration.subsec_nanos(),
+            });
+        }
+    }
+    stamps.sort_by(|left, right| left.name.cmp(&right.name));
+    Ok(stamps)
 }
 
 /// Snapshot metadata loaded before any row data.
@@ -478,7 +554,14 @@ impl RenderSnapshot {
         }
         let rows = File::open(path.join(ROWS_FILE))?;
         let rows_len = rows.metadata()?.len();
-        if row_offsets.last().copied() != Some(rows_len) {
+        if row_offsets.first().copied() != Some(0)
+            || row_offsets.last().copied() != Some(rows_len)
+            || !row_offsets.windows(2).all(|pair| {
+                pair.first()
+                    .zip(pair.get(1))
+                    .is_some_and(|(left, right)| left < right)
+            })
+        {
             return Err(invalid_data("render snapshot row sentinel mismatch").into());
         }
         let op_locators = read_op_locators(&path.join(OP_LOCATORS_FILE))?;
@@ -493,6 +576,17 @@ impl RenderSnapshot {
         }
         let sub_op_counts =
             read_sub_op_counts(&path.join(SUB_OP_COUNTS_FILE), manifest.top_level_rows)?;
+        if sub_op_counts
+            .iter()
+            .try_fold(manifest.top_level_rows, |total, count| {
+                u64::try_from(*count)
+                    .ok()
+                    .and_then(|count| total.checked_add(count))
+            })
+            != Some(manifest.expanded_rows)
+        {
+            return Err(invalid_data("render snapshot expansion count mismatch").into());
+        }
         let expansion_spans =
             read_expansion_spans(&path.join(EXPANSION_SPANS_FILE), manifest.expanded_rows)?;
 
