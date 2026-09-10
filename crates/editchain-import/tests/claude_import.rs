@@ -13,10 +13,14 @@ use editchain_core::{NoteRelationship, OpKind, ParentSet};
 use editchain_import::claude_code::reader::read_session_file;
 use editchain_import::claude_code::topology::CLAUDE_NORMALIZATION_VERSION;
 use editchain_import::cursor::canonical_source_key;
+use editchain_import::error::ImportError;
 use editchain_import::ids::{derive_keyed_source_stream, SourcePosition};
 use editchain_import::import::import_claude_code;
 use editchain_import::model::{DiscoveryRequest, ImportOptions};
-use editchain_import::sink::{CursorStore, MemoryBlobSink, MemoryCursorStore, MemoryOpSink};
+use editchain_import::sink::{
+    BlobSink, ContentAddressedBlobSink, CursorStore, MemoryBlobSink, MemoryCursorStore,
+    MemoryOpSink, INLINE_LIMIT,
+};
 use editchain_project::HistoryProjection;
 use proptest as _;
 use serde as _;
@@ -144,6 +148,68 @@ fn incremental_append_continues_physical_source_chain_and_exact_topology() {
     let third_report = import(dir.path(), &mut ops, &mut cursors);
     assert_eq!(third_report.raw_ops, 0);
     assert_eq!(third_report.normalized_ops, 0);
+}
+
+#[test]
+fn blob_failure_keeps_the_accepted_prefix_and_retry_preserves_complete_raw_bytes() {
+    struct FailingBlobSink;
+
+    impl BlobSink for FailingBlobSink {
+        fn store_blob(&mut self, _data: &[u8]) -> Result<(), ImportError> {
+            Err(ImportError::BlobSink("blob write failed".into()))
+        }
+    }
+
+    for normalize in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session-1.jsonl");
+        let first = event_line("event-1", None, "accepted");
+        std::fs::write(&path, &first).unwrap();
+        let mut ops = MemoryOpSink::new();
+        let mut cursors = MemoryCursorStore::new();
+        let _report = import(dir.path(), &mut ops, &mut cursors);
+        let key = source_key(dir.path(), &path);
+        let accepted_cursor = cursors.get_cursor(&key).unwrap();
+        let accepted_count = ops.ops.len();
+        let appended = event_line("event-2", Some("event-1"), &"x".repeat(INLINE_LIMIT));
+        std::fs::write(&path, first + &appended).unwrap();
+        let options = ImportOptions {
+            normalize,
+            ..ImportOptions::default()
+        };
+
+        let result = import_claude_code(
+            &request(dir.path()),
+            &options,
+            &mut ops,
+            &mut FailingBlobSink,
+            &mut cursors,
+        );
+        assert!(matches!(result, Err(ImportError::BlobSink(_))));
+        assert_eq!(cursors.get_cursor(&key).unwrap(), accepted_cursor);
+        assert_eq!(ops.ops.len(), accepted_count);
+
+        let mut blobs = ContentAddressedBlobSink::new();
+        let report = import_claude_code(
+            &request(dir.path()),
+            &options,
+            &mut ops,
+            &mut blobs,
+            &mut cursors,
+        )
+        .unwrap();
+        assert_eq!(report.raw_ops, 1);
+        let expected_hash = editchain_import::hash_raw(appended.as_bytes());
+        assert_eq!(blobs.get(&expected_hash), Some(appended.as_bytes()));
+        assert!(ops.ops.iter().any(|op| {
+            matches!(&op.kind, OpKind::Import(import)
+                if import.raw_hash == Some(expected_hash)
+                    && matches!(&import.raw_ref, editchain_core::Payload::Blob(blob)
+                        if blob.id == editchain_core::ContentId::Hash256(expected_hash)
+                            && usize::try_from(blob.len).unwrap() == appended.len()))
+        }));
+        assert_eq!(cursors.get_cursor(&key).unwrap().unwrap().ops_emitted, 2);
+    }
 }
 
 #[test]

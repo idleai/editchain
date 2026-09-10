@@ -85,7 +85,8 @@ fn test_normalize_user_message() {
         &NormalizeOptions::default(),
         &mut blobs,
         "sess-1",
-    );
+    )
+    .expect("normalize user record");
 
     assert!(matches!(raw.kind, OpKind::Import(_)));
     assert!(raw.tags.matches_any(Tags::IMPORT));
@@ -124,7 +125,8 @@ fn test_normalize_mode_event() {
         &NormalizeOptions::default(),
         &mut blobs,
         "sess-1",
-    );
+    )
+    .expect("normalize mode record");
 
     assert!(matches!(raw.kind, OpKind::Import(_)));
     assert_eq!(norm.len(), 1);
@@ -172,7 +174,8 @@ fn test_metadata_without_session_id_falls_back_to_owning_session() {
         &NormalizeOptions::default(),
         &mut blobs,
         "sess-A",
-    );
+    )
+    .expect("normalize metadata record");
 
     let expected = editchain_import::ids::derive_session_id("sess-A").0;
     let wrong_constant = editchain_import::ids::derive_session_id("").0;
@@ -212,7 +215,8 @@ fn test_transport_sidecars_are_exact_bundle_metadata() {
             &NormalizeOptions::default(),
             &mut blobs,
             "sess-1",
-        );
+        )
+        .expect("normalize transport sidecar");
         assert!(raw.tags.matches_any(Tags::META));
         assert!(normalized.is_empty());
     }

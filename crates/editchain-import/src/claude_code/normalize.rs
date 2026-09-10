@@ -14,6 +14,7 @@ use editchain_core::{
 use serde_json::Value;
 
 use super::envelope::{CcContentBlock, CcEnvelope};
+use crate::error::ImportError;
 use crate::ids::{derive_actor_id, derive_session_id, SourcePosition, SourceStream};
 use crate::sink::{payload_for, BlobSink};
 
@@ -148,11 +149,15 @@ fn is_whitespace_only_assistant(env: &CcEnvelope) -> bool {
 ///
 /// Returns (`raw_import_op`, `optional_normalized_ops`).
 ///
+/// # Errors
+///
+/// Returns [`ImportError`] if the complete raw record cannot be stored.
+/// No operations from this record are returned on a storage failure.
+///
 /// # Panics
 ///
 /// Panics if the source position overflows — this should never happen
-/// in practice since sequence numbers are bounded by file size. Also
-/// panics if `payload_for` fails and the raw bytes exceed 4096 bytes.
+/// in practice since sequence numbers are bounded by file size.
 #[expect(
     clippy::too_many_arguments,
     reason = "all arguments are required for normalization"
@@ -160,10 +165,6 @@ fn is_whitespace_only_assistant(env: &CcEnvelope) -> bool {
 #[expect(
     clippy::unwrap_used,
     reason = "source positions are always valid — derived from bounded u64/u16 values"
-)]
-#[expect(
-    clippy::indexing_slicing,
-    reason = "raw_bytes[..4096] is bounded by INLINE_LIMIT constant"
 )]
 #[expect(
     clippy::cast_possible_truncation,
@@ -186,7 +187,7 @@ pub fn normalize_envelope(
     options: &NormalizeOptions,
     blobs: &mut dyn BlobSink,
     fallback_session_id: &str,
-) -> (Op, Vec<Op>) {
+) -> Result<(Op, Vec<Op>), ImportError> {
     let raw_pos = SourcePosition::raw(seq);
     let op_id = stream.op_from_position(raw_pos).unwrap();
     let timestamp = parse_source_time(&env.timestamp);
@@ -250,14 +251,13 @@ pub fn normalize_envelope(
         scope: ScopeRef::Session(session_id),
         tags: raw_tags,
         kind: OpKind::Import(ImportOp {
-            raw_ref: payload_for(raw_bytes, blobs)
-                .unwrap_or_else(|_| Payload::Inline(raw_bytes[..4096].to_vec())),
+            raw_ref: payload_for(raw_bytes, blobs)?,
             raw_hash: Some(line_hash),
         }),
     };
 
     if !options.normalize {
-        return (raw_op, vec![]);
+        return Ok((raw_op, vec![]));
     }
 
     // Normalized ops — use SourcePosition for collision-free ID allocation.
@@ -596,7 +596,7 @@ pub fn normalize_envelope(
         _ => {}
     }
 
-    (raw_op, normalized)
+    Ok((raw_op, normalized))
 }
 
 /// Options for controlling normalization behavior.

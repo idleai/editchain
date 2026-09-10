@@ -186,7 +186,7 @@ pub fn import_claude_code(
                     &norm_opts,
                     blobs,
                     &session.session_id,
-                );
+                )?;
 
                 // Chain this raw op to the previous line's raw op.
                 if let Some(prev) = prev_raw_id {
