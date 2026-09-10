@@ -83,7 +83,9 @@ Git repository ──► editchain-git              │
 
 - `editchain-core`: operation schema, identifiers, causal ordering, `OpSet`,
   chain state, and reducers.
-- `editchain-codec`: postcard operation frames and checksummed EC02 pages.
+- `editchain-codec`: postcard operation frames and bounded EC02 page scanning.
+  EC02 uses fixed u32 record lengths and has no checksum; EC03 is a separate,
+  currently inactive checksummed format.
 - `editchain-import`: deterministic, incremental Claude Code and Codex
   importers, cursors, and content-addressed blob storage.
 - `editchain-node`: ingestion CLI and segment storage. Its only commands are

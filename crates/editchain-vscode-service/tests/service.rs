@@ -47,7 +47,7 @@ fn write_page_sequence(chain_dir: &Path, sequence: u32, page: &editchain_codec::
     std::fs::create_dir_all(chain_dir).expect("create chain dir");
     std::fs::write(
         chain_dir.join(format!("{sequence:06}.eclog")),
-        editchain_codec::page::encode_page(page),
+        editchain_codec::page::encode_page(page).expect("encode page"),
     )
     .expect("write segment");
 }

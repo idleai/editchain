@@ -11,6 +11,13 @@ use editchain_codec::frame::{
 };
 use editchain_core::*;
 
+// Pin the unversioned Postcard message representation used by EC02 at
+// bb3fb12; an encoder/decoder round trip alone cannot detect schema drift.
+const MESSAGE_V1: &[u8] = &[
+    1, 0, 42, 0, 1, 2, 128, 208, 149, 255, 188, 49, 0, 8, 2, 1, 11, b'h', b'e', b'l', b'l', b'o',
+    b' ', b'w', b'o', b'r', b'l', b'd', 0,
+];
+
 #[test]
 #[expect(clippy::panic, reason = "test assertion")]
 fn round_trip_message_op() {
@@ -28,6 +35,8 @@ fn round_trip_message_op() {
     };
 
     let encoded = encode_op(&op).unwrap();
+    assert_eq!(encoded, MESSAGE_V1);
+    assert_eq!(decode_op(MESSAGE_V1).unwrap(), op);
     let decoded: Op = decode_op(&encoded).unwrap();
 
     assert_eq!(op.id, decoded.id);

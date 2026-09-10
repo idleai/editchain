@@ -21,7 +21,7 @@ use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use editchain_codec::frame::decode_op;
-use editchain_codec::page::PAGE_MAGIC;
+use editchain_codec::scan::{PageScanner, ScanErrorKind, ScanItem};
 use editchain_core::{
     ActorId, BlobRef, Clock, ContentId, GitOid, NodeId, Op, OpId, OpKind, OpSet, ParentSet,
     Payload, RepositoryId, ScopeRef, SessionId, Tags,
@@ -4877,44 +4877,19 @@ fn scan_segment_records(
     bytes: &[u8],
     records: &mut Vec<LocatedChainRecord>,
 ) -> io::Result<()> {
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        let Some(magic) = bytes.get(offset..offset.saturating_add(4)) else {
-            break;
-        };
-        if magic != PAGE_MAGIC {
-            break;
-        }
-        if bytes.get(offset..offset.saturating_add(8)).is_none() {
-            break;
-        }
-        offset = offset.saturating_add(8);
-        loop {
-            let Some(length_bytes) = bytes.get(offset..offset.saturating_add(4)) else {
-                return Ok(());
-            };
-            if length_bytes == PAGE_MAGIC {
-                break;
-            }
-            let length_array: [u8; 4] = length_bytes.try_into().map_err(|_error| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid record length")
-            })?;
-            let data_len = u32::from_le_bytes(length_array);
-            let data_offset = offset.saturating_add(5);
-            let data_end =
-                data_offset.saturating_add(usize::try_from(data_len).unwrap_or(usize::MAX));
-            let Some(data) = bytes.get(data_offset..data_end) else {
-                return Ok(());
-            };
-            records.push(LocatedChainRecord {
-                data: data.to_vec(),
+    for item in PageScanner::new(bytes) {
+        match item {
+            Ok(ScanItem::Page { .. }) => {}
+            Ok(ScanItem::Record(record)) => records.push(LocatedChainRecord {
+                data: record.data.to_vec(),
                 location: OpRecordLocation {
                     segment_seq,
-                    data_offset: u64::try_from(data_offset).unwrap_or(u64::MAX),
-                    data_len,
+                    data_offset: u64::try_from(record.data_offset).map_err(io::Error::other)?,
+                    data_len: u32::try_from(record.data.len()).map_err(io::Error::other)?,
                 },
-            });
-            offset = data_end;
+            }),
+            Err(error) if error.kind == ScanErrorKind::IncompleteTail => break,
+            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
         }
     }
     Ok(())
@@ -5272,7 +5247,27 @@ mod tests {
             page.add_record(0, encode_op(op).unwrap());
         }
         fs::create_dir_all(chain_dir).unwrap();
-        fs::write(chain_dir.join("000000.eclog"), encode_page(&page)).unwrap();
+        fs::write(chain_dir.join("000000.eclog"), encode_page(&page).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn concatenated_pages_preserve_all_operations_and_detail_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = import_op(7, 1, false);
+        let second = import_op(7, 2, false);
+        let mut bytes = Vec::new();
+        for (sequence, op) in [(0, &first), (1, &second)] {
+            let mut page = Page::new(sequence);
+            page.add_record(0x81, encode_op(op).unwrap());
+            bytes.extend(encode_page(&page).unwrap());
+        }
+        fs::write(dir.path().join("000000.eclog"), bytes).unwrap();
+        let (ops, stats, locations) = read_chain_ops(dir.path()).unwrap();
+        assert_eq!(ops, vec![first, second]);
+        assert_eq!(stats.accepted, 2);
+        for (op, locator) in ops.iter().zip(locations) {
+            assert_eq!(read_op_at(dir.path(), locator.location).unwrap(), *op);
+        }
     }
 
     /// Store a blob in a chain's durable blob store, returning its reference.

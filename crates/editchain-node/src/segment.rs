@@ -9,7 +9,8 @@ use editchain_import as _;
 use serde as _;
 use serde_json as _;
 
-use editchain_codec::page::{decode_page, encode_page, Page};
+use editchain_codec::page::{encode_page, Page};
+use editchain_codec::scan::{PageScanner, ScanErrorKind, ScanItem};
 
 /// Directory layout for segment storage.
 ///
@@ -61,7 +62,8 @@ impl SegmentStore {
     /// durable cursors (the import command commits its staged cursors here).
     pub fn append_page(&mut self, page: &Page) -> io::Result<()> {
         let path = self.current_segment_path();
-        let encoded = encode_page(page);
+        let encoded = encode_page(page)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         // A new segment file needs its directory entry persisted, not just its
         // bytes: a crash could otherwise lose the entry while a cursor commit
         // that follows this append has already been made durable.
@@ -83,11 +85,6 @@ impl SegmentStore {
     /// # Errors
     ///
     /// Returns an IO error if any segment file cannot be read.
-    #[expect(
-        clippy::arithmetic_side_effects,
-        clippy::indexing_slicing,
-        reason = "Segment file reading; offsets bounded by buffer length checks"
-    )]
     pub fn read_all(&self) -> io::Result<Vec<Page>> {
         let mut pages = Vec::new();
         let mut seq = 0u32;
@@ -98,18 +95,24 @@ impl SegmentStore {
                 break;
             }
             let bytes = fs::read(&path)?;
-            // A segment file may contain multiple concatenated pages.
-            let mut offset = 0;
-            while offset < bytes.len() {
-                if let Some(page) = decode_page(&bytes[offset..]) {
-                    let encoded_len = encoded_page_len(&bytes[offset..]);
-                    pages.push(page);
-                    offset += encoded_len;
-                } else {
-                    break; // partial trailing page (power-loss)
+            for item in PageScanner::new(&bytes) {
+                match item {
+                    Ok(ScanItem::Page { sequence, .. }) => pages.push(Page::new(sequence)),
+                    Ok(ScanItem::Record(record)) => {
+                        let page = pages.last_mut().ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::InvalidData, "record has no page")
+                        })?;
+                        page.add_record(record.flags, record.data.to_vec());
+                    }
+                    Err(error) if error.kind == ScanErrorKind::IncompleteTail => break,
+                    Err(error) => {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, error));
+                    }
                 }
             }
-            seq += 1;
+            seq = seq.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "segment sequence exhausted")
+            })?;
         }
 
         Ok(pages)
@@ -138,31 +141,6 @@ impl SegmentStore {
         let filename = format!("{seq:06}.eclog");
         self.chain_dir.join(filename)
     }
-}
-
-/// Compute the encoded length of a page from its bytes.
-/// Reads the magic + `page_seq` (8 bytes) then scans records.
-#[expect(
-    clippy::arithmetic_side_effects,
-    clippy::as_conversions,
-    clippy::indexing_slicing,
-    reason = "Binary page parsing; offsets are bounded by buffer length checks"
-)]
-fn encoded_page_len(bytes: &[u8]) -> usize {
-    if bytes.len() < 8 {
-        return bytes.len();
-    }
-    let mut offset = 8;
-    while offset + 4 <= bytes.len() {
-        let len =
-            u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap_or([0; 4])) as usize;
-        offset += 4;
-        if offset + 1 + len > bytes.len() {
-            break;
-        }
-        offset += 1 + len;
-    }
-    offset
 }
 
 /// Find the next available segment sequence number.
@@ -227,6 +205,7 @@ fn sync_parent_dir(_path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use editchain_codec::page::decode_page;
 
     #[test]
     fn append_page_creates_and_persists_a_new_segment() {

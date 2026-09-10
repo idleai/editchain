@@ -7,13 +7,17 @@ use postcard as _;
 use proptest as _;
 use serde as _;
 
+use crate::scan::{PageScanner, ScanErrorKind, ScanItem, MAX_RECORD_BYTES};
+
 /// Page magic bytes — "EC" + version 02.
 pub const PAGE_MAGIC: [u8; 4] = [0x45, 0x43, 0x30, 0x32]; // "EC02"
 
 /// A framed page of operations.
 ///
-/// Format: magic | `page_seq` (u32 LE) | records... | optional CRC32
-/// Each record: `varint_len` | flags (u8) | `encoded_op` | optional CRC32
+/// Format: magic | `page_seq` (u32 LE) | records...
+/// Each record: payload length (u32 LE) | flags (u8) | encoded operation.
+/// EC02 contains no checksum or record count. The next page marker or EOF
+/// terminates the page; record lengths are bounded below the reserved marker.
 #[derive(Debug, Clone)]
 pub struct Page {
     /// Magic bytes identifying the page format ("EC02").
@@ -51,70 +55,67 @@ impl Page {
 }
 
 /// Encode a page into bytes.
-#[must_use]
-#[expect(
-    clippy::as_conversions,
-    clippy::cast_possible_truncation,
-    reason = "Record length fits in u32; chain pages are <4 GiB"
-)]
-pub fn encode_page(page: &Page) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Rejects invalid magic or a record larger than [`MAX_RECORD_BYTES`].
+pub fn encode_page(page: &Page) -> Result<Vec<u8>, PageEncodeError> {
+    if page.magic != PAGE_MAGIC {
+        return Err(PageEncodeError::InvalidMagic);
+    }
     let mut buf = Vec::new();
     buf.extend_from_slice(&page.magic);
     buf.extend_from_slice(&page.page_seq.to_le_bytes());
 
     for record in &page.records {
-        // Varint-length prefix (simplified — just u32 LE for now)
-        let len = record.data.len() as u32;
+        let len = u32::try_from(record.data.len())
+            .ok()
+            .filter(|length| *length <= MAX_RECORD_BYTES)
+            .ok_or(PageEncodeError::RecordTooLarge(record.data.len()))?;
         buf.extend_from_slice(&len.to_le_bytes());
         buf.push(record.flags);
         buf.extend_from_slice(&record.data);
     }
 
-    buf
+    Ok(buf)
 }
+
+/// A page cannot be represented by the supported EC02 writer/reader contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageEncodeError {
+    /// Page magic must be the EC02 marker.
+    InvalidMagic,
+    /// Payload length exceeds the supported record limit.
+    RecordTooLarge(usize),
+}
+
+impl std::fmt::Display for PageEncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot encode EC02 page: {self:?}")
+    }
+}
+
+impl std::error::Error for PageEncodeError {}
 
 /// Decode a page from bytes.
 ///
-/// Power-loss rule: ignore partial trailing records.
+/// Returns the first page, retaining complete records before an incomplete
+/// trailing write. Invalid and unsupported input returns `None`. Use
+/// [`PageScanner`] when all pages, locations, or diagnostics are needed.
 #[must_use]
-#[expect(
-    clippy::as_conversions,
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing,
-    reason = "Page decoding uses bounded offsets; all bounds checked before access"
-)]
 pub fn decode_page(bytes: &[u8]) -> Option<Page> {
-    if bytes.len() < 8 {
+    let mut scanner = PageScanner::new(bytes);
+    let ScanItem::Page { sequence, .. } = scanner.next()?.ok()? else {
         return None;
-    }
-
-    let magic = &bytes[..4];
-    if magic != PAGE_MAGIC {
-        return None;
-    }
-
-    let page_seq = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
-    let mut page = Page::new(page_seq);
-    let mut offset = 8;
-
-    while offset + 4 <= bytes.len() {
-        // Read length prefix
-        let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().ok()?);
-        offset += 4;
-
-        if offset + 1 + len as usize > bytes.len() {
-            // Partial trailing record — stop (power-loss tolerance)
-            break;
+    };
+    let mut page = Page::new(sequence);
+    for item in scanner {
+        match item {
+            Ok(ScanItem::Record(record)) => page.add_record(record.flags, record.data.to_vec()),
+            Ok(ScanItem::Page { .. }) => break,
+            Err(error) if error.kind == ScanErrorKind::IncompleteTail => break,
+            Err(_) => return None,
         }
-
-        let flags = bytes[offset];
-        offset += 1;
-
-        let data = bytes[offset..offset + len as usize].to_vec();
-        offset += len as usize;
-
-        page.add_record(flags, data);
     }
-
     Some(page)
 }

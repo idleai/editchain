@@ -146,7 +146,7 @@ proptest! {
             page.add_record(*flags, data.clone());
         }
 
-        let encoded = encode_page(&page);
+        let encoded = encode_page(&page).unwrap();
         let decoded = decode_page(&encoded);
 
         prop_assert!(decoded.is_some(), "decode should succeed");

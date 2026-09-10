@@ -10,3 +10,6 @@ pub mod frame;
 
 /// EC02 page-level encoding and decoding.
 pub mod page;
+
+/// Shared bounded scanning of concatenated EC02 pages and record locations.
+pub mod scan;
