@@ -153,6 +153,7 @@ impl CapturedSource {
             lines,
             partial,
             checkpoint: CursorValue {
+                accepted_generation: cursor.and_then(|value| value.accepted_generation),
                 file_size: self.file_size,
                 byte_offset,
                 ops_emitted,
@@ -202,8 +203,70 @@ impl SourceReadPlan {
         generation: u32,
         limits: SourceReadLimits,
     ) -> Result<Self, ImportError> {
+        Self::capture_reserved(path, cursor, generation, None, limits)
+    }
+
+    /// Capture with any source prefix reserved before an interrupted append.
+    /// The reservation constrains ID reuse while the accepted cursor continues
+    /// to determine which records must be replayed.
+    ///
+    /// # Errors
+    ///
+    /// Returns source IO/limit errors, invalid reservation state, or generation
+    /// exhaustion. A reserved prefix that changed starts another generation.
+    pub fn capture_reserved(
+        path: &Path,
+        cursor: Option<&CursorValue>,
+        generation: u32,
+        reservation: Option<&CursorValue>,
+        limits: SourceReadLimits,
+    ) -> Result<Self, ImportError> {
+        let accepted_generation = cursor
+            .and_then(|value| value.accepted_generation)
+            .unwrap_or(generation);
+        let highest_generation = generation.max(accepted_generation);
         let source = CapturedSource::capture(path, limits)?;
-        let (records, state, generation, start_seq) = match source.read(cursor) {
+        let Some(reservation) = reservation else {
+            return Self::from_source(source, cursor, accepted_generation, highest_generation);
+        };
+        let reserved_generation = reservation.accepted_generation.ok_or_else(|| {
+            ImportError::CursorStore("source reservation has no generation".into())
+        })?;
+        match source.read(Some(reservation)) {
+            Ok(_) => {
+                if cursor.is_some() && reserved_generation != accepted_generation {
+                    let mut plan =
+                        Self::from_source(source, None, reserved_generation, highest_generation)?;
+                    plan.state = SourceReadState::Rewritten;
+                    return Ok(plan);
+                }
+                Self::from_source(source, cursor, reserved_generation, highest_generation)
+            }
+            Err(ImportError::SourceGenerationChanged { .. }) => {
+                let next = highest_generation
+                    .max(reserved_generation)
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        ImportError::CursorStore(format!(
+                            "source generation exhausted for {}",
+                            path.display()
+                        ))
+                    })?;
+                let mut plan = Self::from_source(source, None, next, next)?;
+                plan.state = SourceReadState::Rewritten;
+                Ok(plan)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn from_source(
+        source: CapturedSource,
+        cursor: Option<&CursorValue>,
+        generation: u32,
+        generation_floor: u32,
+    ) -> Result<Self, ImportError> {
+        let (mut records, state, generation, start_seq) = match source.read(cursor) {
             Ok(records) => {
                 let state = match cursor {
                     None => SourceReadState::Fresh,
@@ -218,12 +281,16 @@ impl SourceReadPlan {
                 )
             }
             Err(ImportError::SourceGenerationChanged { .. }) => {
-                let generation = generation.checked_add(1).ok_or_else(|| {
-                    ImportError::CursorStore(format!(
-                        "source generation exhausted for {}",
-                        path.display()
-                    ))
-                })?;
+                let generation =
+                    generation
+                        .max(generation_floor)
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            ImportError::CursorStore(format!(
+                                "source generation exhausted for {}",
+                                source.original.display()
+                            ))
+                        })?;
                 (
                     source.read(None)?,
                     SourceReadState::Rewritten,
@@ -233,6 +300,7 @@ impl SourceReadPlan {
             }
             Err(error) => return Err(error),
         };
+        records.checkpoint.accepted_generation = Some(generation);
         Ok(Self {
             source,
             records,

@@ -70,6 +70,22 @@ pub fn payload_for(
 
 /// A store for persisting per-source read cursors.
 pub trait CursorStore {
+    /// Read a proposed source prefix whose operation IDs were reserved before
+    /// append. It constrains generation reuse without advancing accepted bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reservation state cannot be read.
+    fn get_reservation(&self, key: &str) -> Result<Option<CursorValue>, ImportError>;
+
+    /// Durably reserve the generation and source prefix before appending any
+    /// operations that use them. Accepted cursor reads remain unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reservation cannot be stored.
+    fn reserve_checkpoint(&mut self, key: &str, cursor: &CursorValue) -> Result<(), ImportError>;
+
     /// Read the cursor for a source key.
     ///
     /// # Errors
@@ -130,6 +146,12 @@ pub trait CursorStore {
 /// A cursor value representing how far we've read in a source file.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CursorValue {
+    /// Generation of the accepted bytes in this cursor. Older cursors omit it
+    /// and use the legacy generation map until their first successful capture.
+    /// Keeping it beside the accepted hash makes rewrite replay stable after a
+    /// crash between persisting a proposed generation and its new cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_generation: Option<u32>,
     /// File size at last read (for generation detection).
     pub file_size: u64,
     /// Byte offset we've read up to.
@@ -252,6 +274,7 @@ impl BlobSink for ContentAddressedBlobSink {
 pub struct MemoryCursorStore {
     cursors: std::collections::HashMap<String, CursorValue>,
     generations: std::collections::HashMap<String, u32>,
+    reservations: std::collections::HashMap<String, CursorValue>,
 }
 
 impl MemoryCursorStore {
@@ -261,17 +284,30 @@ impl MemoryCursorStore {
         Self {
             cursors: std::collections::HashMap::new(),
             generations: std::collections::HashMap::new(),
+            reservations: std::collections::HashMap::new(),
         }
     }
 }
 
 impl CursorStore for MemoryCursorStore {
+    fn get_reservation(&self, key: &str) -> Result<Option<CursorValue>, ImportError> {
+        Ok(self.reservations.get(key).cloned())
+    }
+
+    fn reserve_checkpoint(&mut self, key: &str, cursor: &CursorValue) -> Result<(), ImportError> {
+        let _: Option<CursorValue> = self.reservations.insert(key.to_string(), cursor.clone());
+        Ok(())
+    }
+
     fn get_cursor(&self, path: &str) -> Result<Option<CursorValue>, ImportError> {
         Ok(self.cursors.get(path).cloned())
     }
 
     fn set_cursor(&mut self, path: &str, cursor: &CursorValue) -> Result<(), ImportError> {
         let _: Option<CursorValue> = self.cursors.insert(path.to_string(), cursor.clone());
+        if self.reservations.get(path) == Some(cursor) {
+            let _: Option<CursorValue> = self.reservations.remove(path);
+        }
         Ok(())
     }
 
@@ -401,6 +437,11 @@ impl BlobSink for FsBlobSink {
 
 /// A filesystem-backed cursor store persisting one JSON file per source key.
 ///
+/// A source-prefix reservation is made before operation append. If that append
+/// is interrupted and the source changes again, the next capture uses another
+/// generation instead of colliding with already written physical record IDs.
+/// Reservations constrain ID reuse without advancing accepted cursors.
+///
 /// Source keys are keyed by their BLAKE3 hash so filenames stay bounded and
 /// free of path separators (`<dir>/<hex-hash>.json`). [`Self::set_cursor`]
 /// mutations are staged in memory; only [`CursorStore::commit`] writes them to
@@ -418,7 +459,10 @@ impl BlobSink for FsBlobSink {
 /// the wrong boot stream). It is retained even when an individual cursor file
 /// is deleted, so a reset re-import of a rewritten source reuses its current
 /// generation's op ids instead of falling back into the original boot-0 id
-/// space.
+/// space. Each current cursor also retains its accepted generation beside the
+/// prefix hash. The journal binds a completed rewrite to its exact accepted
+/// source bytes even when another rewrite arrives before recovery. Callers must
+/// serialize access with the chain writer lock throughout capture and commit.
 #[derive(Debug, Clone)]
 pub struct FsCursorStore {
     /// Directory holding the cursor files.
@@ -429,6 +473,8 @@ pub struct FsCursorStore {
     generations: std::collections::HashMap<String, u32>,
     /// Generation bumps staged since the last commit; not yet durable.
     staged_generations: std::collections::HashMap<String, u32>,
+    /// A durable intent still needs materialization or journal cleanup.
+    journal_pending: bool,
 }
 
 impl FsCursorStore {
@@ -437,17 +483,37 @@ impl FsCursorStore {
     /// # Errors
     ///
     /// Returns an IO error if the directory cannot be created or the persisted
-    /// generation map cannot be read.
+    /// generation map cannot be read, or interrupted checkpoint recovery fails.
     pub fn new(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
         let generations = read_generations(&dir.join("generations.json"))?;
-        Ok(Self {
+        let mut store = Self {
             dir,
             staged: std::collections::HashMap::new(),
             generations,
             staged_generations: std::collections::HashMap::new(),
-        })
+            journal_pending: false,
+        };
+        match fs::read(store.journal_path()) {
+            Ok(bytes) => {
+                let journal: CheckpointJournal =
+                    serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                if journal.version != 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unsupported checkpoint journal version",
+                    ));
+                }
+                store.staged = journal.cursors;
+                store.staged_generations = journal.generations;
+                store.journal_pending = true;
+                store.finish_commit().map_err(io::Error::other)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        Ok(store)
     }
 
     /// Directory containing the cursor files.
@@ -466,11 +532,35 @@ impl FsCursorStore {
     /// Whether any cursor mutations are staged and not yet committed.
     #[must_use]
     pub fn has_pending(&self) -> bool {
-        !self.staged.is_empty() || !self.staged_generations.is_empty()
+        self.journal_pending || !self.staged.is_empty() || !self.staged_generations.is_empty()
     }
 }
 
 impl CursorStore for FsCursorStore {
+    fn get_reservation(&self, key: &str) -> Result<Option<CursorValue>, ImportError> {
+        let path = self.cursor_path(key).with_extension("reservation.json");
+        match fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+                ImportError::CursorStore(format!("decoding source reservation: {error}"))
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(ImportError::CursorStore(format!(
+                "reading source reservation: {error}"
+            ))),
+        }
+    }
+
+    fn reserve_checkpoint(&mut self, key: &str, cursor: &CursorValue) -> Result<(), ImportError> {
+        let json = serde_json::to_vec(cursor).map_err(|error| {
+            ImportError::CursorStore(format!("encoding source reservation: {error}"))
+        })?;
+        atomic_write(
+            &self.cursor_path(key).with_extension("reservation.json"),
+            &json,
+        )
+        .map_err(|error| ImportError::CursorStore(format!("writing source reservation: {error}")))
+    }
+
     fn get_cursor(&self, path: &str) -> Result<Option<CursorValue>, ImportError> {
         // Read-your-writes: a staged mutation shadows the durable value.
         if let Some(cursor) = self.staged.get(path) {
@@ -505,6 +595,9 @@ impl CursorStore for FsCursorStore {
     }
 
     fn set_generation(&mut self, path: &str, generation: u32) -> Result<(), ImportError> {
+        if self.get_generation(path)? == generation {
+            return Ok(());
+        }
         // Buffer in memory; committed (before the staged cursors) by
         // `commit()`.
         let _: Option<u32> = self.staged_generations.insert(path.to_string(), generation);
@@ -512,11 +605,41 @@ impl CursorStore for FsCursorStore {
     }
 
     fn commit(&mut self) -> Result<(), ImportError> {
-        // Durability ordering: make any generation bump durable BEFORE the
-        // cursor files that depend on it. A failure in the between-writes
-        // window must never leave a durable cursor whose generation is not
-        // yet recorded — reopening would then continue the wrong boot stream.
-        // Writing cursors first (the old order) could strand exactly that state.
+        if !self.has_pending() {
+            return Ok(());
+        }
+        // This intent is written only after operations are durable. Recovery
+        // can finish exactly this paired checkpoint before reading a source
+        // that may have changed again since the failed commit.
+        let journal = CheckpointJournal {
+            version: 1,
+            cursors: self.staged.clone(),
+            generations: self.staged_generations.clone(),
+        };
+        let json = serde_json::to_vec(&journal).map_err(|error| {
+            ImportError::CursorStore(format!("encoding checkpoint journal: {error}"))
+        })?;
+        atomic_write(&self.journal_path(), &json).map_err(|error| {
+            ImportError::CursorStore(format!("writing checkpoint journal: {error}"))
+        })?;
+        self.journal_pending = true;
+        self.finish_commit()
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CheckpointJournal {
+    version: u32,
+    cursors: std::collections::HashMap<String, CursorValue>,
+    generations: std::collections::HashMap<String, u32>,
+}
+
+impl FsCursorStore {
+    fn journal_path(&self) -> PathBuf {
+        self.dir.join("checkpoint.pending.json")
+    }
+
+    fn finish_commit(&mut self) -> Result<(), ImportError> {
         if !self.staged_generations.is_empty() {
             for (path, generation) in &self.staged_generations {
                 let _: Option<u32> = self.generations.insert(path.clone(), *generation);
@@ -539,10 +662,33 @@ impl CursorStore for FsCursorStore {
             atomic_write(&file, &json).map_err(|e| {
                 ImportError::CursorStore(format!("writing {}: {e}", file.display()))
             })?;
+            if self.get_reservation(&path)?.as_ref() == Some(&cursor) {
+                let reservation = self.cursor_path(&path).with_extension("reservation.json");
+                fs::remove_file(&reservation).map_err(|error| {
+                    ImportError::CursorStore(format!("removing source reservation: {error}"))
+                })?;
+                sync_parent_dir(&reservation).map_err(|error| {
+                    ImportError::CursorStore(format!("syncing source reservation removal: {error}"))
+                })?;
+            }
             // Only remove after the durable write succeeded, so a retry after
             // a partial failure still commits the remaining entries.
             let _: Option<CursorValue> = self.staged.remove(&path);
         }
+        let journal = self.journal_path();
+        match fs::remove_file(&journal) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ImportError::CursorStore(format!(
+                    "removing checkpoint journal: {error}"
+                )))
+            }
+        }
+        sync_parent_dir(&journal).map_err(|error| {
+            ImportError::CursorStore(format!("syncing checkpoint journal removal: {error}"))
+        })?;
+        self.journal_pending = false;
         Ok(())
     }
 }
@@ -715,6 +861,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cursor_dir = dir.path().join("chain/cursors");
         let cursor = CursorValue {
+            accepted_generation: None,
             file_size: 42,
             byte_offset: 40,
             ops_emitted: 7,
@@ -774,6 +921,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cursor_dir = dir.path().join("chain/cursors");
         let cursor = CursorValue {
+            accepted_generation: None,
             file_size: 42,
             byte_offset: 40,
             ops_emitted: 7,

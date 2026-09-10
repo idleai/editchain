@@ -441,12 +441,13 @@ fn cursor_reset_reimports_source_with_current_generation_ids() {
 }
 
 #[test]
-fn commit_persists_generation_before_cursors_on_write_error() {
+fn commit_journals_the_paired_checkpoint_before_materializing_legacy_files() {
     let dir = tempfile::tempdir().unwrap();
     let cursor_dir = dir.path().join("chain/cursors");
     let key = "/workspace/rollout-1.jsonl";
 
     let old_cursor = CursorValue {
+        accepted_generation: None,
         file_size: 42,
         byte_offset: 40,
         ops_emitted: 7,
@@ -457,6 +458,7 @@ fn commit_persists_generation_before_cursors_on_write_error() {
         session_title_hash: None,
     };
     let new_cursor = CursorValue {
+        accepted_generation: None,
         file_size: 9,
         byte_offset: 8,
         ops_emitted: 2,
@@ -494,13 +496,15 @@ fn commit_persists_generation_before_cursors_on_write_error() {
         );
         std::fs::remove_dir(&blocked).unwrap();
 
-        // A fresh store over the same directory (process restart) sees the
-        // generation bump but the OLD cursor: reopening never has a cursor
-        // ahead of its generation, because the generation is always durable
-        // before any cursor that depends on it.
+        // The legacy cursor file still contains the old value. The durable
+        // journal owns the paired checkpoint; opening finishes its recovery.
+        let stored: CursorValue =
+            serde_json::from_slice(&std::fs::read(store.cursor_path(key)).unwrap()).unwrap();
+        assert_eq!(stored, old_cursor);
         let reopened = FsCursorStore::new(&cursor_dir).unwrap();
         assert_eq!(reopened.get_generation(key).unwrap(), 1);
-        assert_eq!(reopened.get_cursor(key).unwrap().unwrap(), old_cursor);
+        assert_eq!(reopened.get_cursor(key).unwrap().unwrap(), new_cursor);
+        assert!(!cursor_dir.join("checkpoint.pending.json").exists());
 
         // In-memory state stays coherent after the partial commit: the staged
         // generation is durable and readable, the failed cursor is still
@@ -517,4 +521,168 @@ fn commit_persists_generation_before_cursors_on_write_error() {
     let reopened = FsCursorStore::new(&cursor_dir).unwrap();
     assert_eq!(reopened.get_generation(key).unwrap(), 1);
     assert_eq!(reopened.get_cursor(key).unwrap().unwrap(), new_cursor);
+}
+
+#[test]
+fn batch_discards_failed_capture_and_checkpoints_only_after_durable_acceptance() {
+    use editchain_import::batch::{DurableAdmission, DurableOpSink, ImportBatch};
+    use editchain_import::{ImportError, MemoryCursorStore};
+    struct Writer {
+        fail: bool,
+        calls: usize,
+    }
+    impl DurableOpSink for Writer {
+        fn append_durable(&mut self, ops: &[Op]) -> Result<DurableAdmission, ImportError> {
+            self.calls = self.calls.saturating_add(1);
+            if self.fail {
+                return Err(ImportError::OpSink("append failed".into()));
+            }
+            Ok(DurableAdmission {
+                written: ops.len(),
+                ..DurableAdmission::default()
+            })
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("empty.jsonl");
+    std::fs::write(&source, b"").unwrap();
+    let (_, _, mut cursor) =
+        editchain_import::source_read::read_session_file(&source, None).unwrap();
+    cursor.accepted_generation = Some(3);
+    let mut base = MemoryCursorStore::new();
+    let failed = ImportBatch::capture(&base, |_ops, pending| {
+        pending.set_generation("source", 3)?;
+        pending.set_cursor("source", &cursor)?;
+        Err(ImportError::OpSink("later source failed".into()))
+    });
+    assert!(failed.is_err());
+    assert_eq!(base.get_generation("source").unwrap(), 0);
+    assert!(base.get_cursor("source").unwrap().is_none());
+
+    let capture = |base: &dyn CursorStore| {
+        ImportBatch::capture(base, |_ops, pending| {
+            pending.set_generation("source", 3)?;
+            pending.set_cursor("source", &cursor)?;
+            assert_eq!(pending.get_generation("source")?, 3);
+            assert_eq!(pending.get_cursor("source")?, Some(cursor.clone()));
+            Ok(ImportReport::default())
+        })
+        .unwrap()
+    };
+    let mut writer = Writer {
+        fail: true,
+        calls: 0,
+    };
+    assert!(capture(&base).persist(&mut writer, &mut base).is_err());
+    assert_eq!(base.get_generation("source").unwrap(), 0);
+    assert!(base.get_cursor("source").unwrap().is_none());
+    writer.fail = false;
+    let outcome = capture(&base).persist(&mut writer, &mut base).unwrap();
+    assert_eq!(
+        writer.calls, 2,
+        "even empty sources require the persistence handoff"
+    );
+    assert_eq!(outcome.admission.written, 0);
+    assert_eq!(base.get_cursor("source").unwrap(), Some(cursor));
+    assert_eq!(base.get_generation("source").unwrap(), 3);
+}
+
+#[test]
+fn both_checkpoint_crash_windows_preserve_generation_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("sessions");
+    let chain = dir.path().join("chain");
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("rollout-1.jsonl");
+    write_rollout(&root, "rollout-1.jsonl", &[big_event_line('A', 1)]);
+    let helper = helper_in(&dir, &messages_awk("t"));
+    let first = run_import(&root, &helper, &ImportOptions::default(), &chain);
+    assert_eq!(first.report.raw_ops, 1);
+    let key = canonical_source_key("codex", &root, &path).unwrap();
+    let cursor_dir = chain.join("cursors");
+    let mut cursors = FsCursorStore::new(&cursor_dir).unwrap();
+    let accepted = cursors.get_cursor(&key).unwrap().unwrap();
+    assert_eq!(accepted.accepted_generation, Some(0));
+    write_rollout(&root, "rollout-1.jsonl", &[big_event_line('B', 1)]);
+    let request = CodexDiscoveryRequest {
+        workspace_path: "/workspace".into(),
+        raw_root: root.clone(),
+    };
+    let mut blobs = FsBlobSink::new(chain.join("blobs")).unwrap();
+    let mut capture = |cursors: &mut FsCursorStore| {
+        let mut ops = MemoryOpSink::new();
+        let report = import_codex(
+            &request,
+            &ImportOptions::default(),
+            &helper,
+            &mut ops,
+            &mut blobs,
+            cursors,
+        )
+        .unwrap();
+        assert_eq!(report.raw_ops, 1);
+        ops.ops
+    };
+    let proposed = capture(&mut cursors);
+    // Failure before the journal is durable: the same source must replay the
+    // exact same envelopes, including the proposed generation.
+    let blocked_journal = cursor_dir
+        .join("checkpoint.pending.json")
+        .with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::create_dir(&blocked_journal).unwrap();
+    assert!(cursors.commit().is_err());
+    std::fs::remove_dir(&blocked_journal).unwrap();
+    drop(cursors);
+    let mut retry = FsCursorStore::new(&cursor_dir).unwrap();
+    assert_eq!(retry.get_generation(&key).unwrap(), 0);
+    assert_eq!(retry.get_cursor(&key).unwrap(), Some(accepted.clone()));
+    assert_eq!(capture(&mut retry), proposed);
+
+    // Failure after journal durability but before the legacy cursor write.
+    let blocked_cursor = retry
+        .cursor_path(&key)
+        .with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::create_dir(&blocked_cursor).unwrap();
+    assert!(retry.commit().is_err());
+    std::fs::remove_dir(&blocked_cursor).unwrap();
+    let stored: CursorValue =
+        serde_json::from_slice(&std::fs::read(retry.cursor_path(&key)).unwrap()).unwrap();
+    assert_eq!(stored, accepted);
+    drop(retry);
+    // A third source version arrives before restart. Recovery must retain B's
+    // completed generation before considering C, avoiding reuse of B's IDs.
+    write_rollout(&root, "rollout-1.jsonl", &[big_event_line('C', 1)]);
+    let mut recovered = FsCursorStore::new(&cursor_dir).unwrap();
+    assert_eq!(recovered.get_generation(&key).unwrap(), 1);
+    let restored = recovered.get_cursor(&key).unwrap().unwrap();
+    assert_eq!(restored.accepted_generation, Some(1));
+    assert_eq!(
+        restored.content_hash,
+        hash_raw(&ln(&big_event_line('B', 1)))
+    );
+    assert!(!cursor_dir.join("checkpoint.pending.json").exists());
+    let third = capture(&mut recovered);
+    assert!(third
+        .iter()
+        .filter(|op| op.id.seq == 1 << 16)
+        .all(|op| op.id.boot == 2));
+    assert!(third
+        .iter()
+        .all(|new| proposed.iter().all(|old| old.id != new.id)));
+    recovered.commit().unwrap();
+    // Explicit cursor reset still reuses the last reserved generation.
+    std::fs::remove_file(recovered.cursor_path(&key)).unwrap();
+    let reset = run_import(&root, &helper, &ImportOptions::default(), &chain);
+    assert_eq!(reset.ops.ops, third);
+}
+
+#[test]
+fn unsupported_checkpoint_journal_is_retained_and_blocks_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = dir.path().join("checkpoint.pending.json");
+    let bytes = br#"{"version":2,"cursors":{},"generations":{}}"#;
+    std::fs::write(&journal, bytes).unwrap();
+    let error = FsCursorStore::new(dir.path()).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(std::fs::read(journal).unwrap(), bytes);
 }

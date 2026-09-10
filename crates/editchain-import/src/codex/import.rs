@@ -142,10 +142,11 @@ pub fn import_codex(
         let source_node = resolved.source_node;
         let migrates_legacy_key = cursor_key != state_key;
         let existing_cursor = resolved.cursor;
-        let plan = SourceReadPlan::capture(
+        let plan = SourceReadPlan::capture_reserved(
             &rollout.path,
             existing_cursor.as_ref(),
             cursors.get_generation(&state_key)?,
+            cursors.get_reservation(&cursor_key)?.as_ref(),
             options.source_limits,
         )?;
         let raw_identity = if session_titles.is_empty() {
@@ -177,7 +178,9 @@ pub fn import_codex(
                 .is_some_and(|cursor| cursor.normalization_version < CODEX_NORMALIZATION_VERSION);
         let needs_cursor_upgrade = migrates_legacy_key
             || existing_cursor.as_ref().is_some_and(|cursor| {
-                cursor.source_node != Some(source_node) || cursor.content_hash_version < 1
+                cursor.source_node != Some(source_node)
+                    || cursor.content_hash_version < 1
+                    || cursor.accepted_generation.is_none()
             });
 
         if plan.state() == SourceReadState::Unchanged
@@ -217,7 +220,7 @@ pub fn import_codex(
             }
             new_cursor.source_node = Some(source_node);
             new_cursor.content_hash_version = 1;
-            if boot > 0 && (migrates_legacy_key || plan.state() == SourceReadState::Rewritten) {
+            if boot > 0 {
                 cursors.set_generation(&cursor_key, boot)?;
             }
             cursors.set_cursor(&cursor_key, &new_cursor)?;
@@ -544,7 +547,7 @@ pub fn import_codex(
         }
         new_cursor.source_node = Some(source_node);
         new_cursor.content_hash_version = 1;
-        if boot > 0 && (migrates_legacy_key || plan.state() == SourceReadState::Rewritten) {
+        if boot > 0 {
             cursors.set_generation(&cursor_key, boot)?;
         }
         cursors.set_cursor(&cursor_key, &new_cursor)?;

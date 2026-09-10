@@ -12,6 +12,8 @@ use editchain_project as _;
 #[cfg(test)]
 use proptest as _;
 
+/// Capture batches and ordered operation/checkpoint persistence.
+pub mod batch;
 /// Cursor-based incremental file reading.
 pub mod cursor;
 /// Import error types.

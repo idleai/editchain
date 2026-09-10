@@ -115,7 +115,10 @@ pub fn resolve_source_cursor(
         });
     }
 
-    let source_node = derive_keyed_source_stream(&canonical_key, 0).node;
+    let source_node = cursors
+        .get_reservation(&canonical_key)?
+        .and_then(|reservation| reservation.source_node)
+        .unwrap_or_else(|| derive_keyed_source_stream(&canonical_key, 0).node);
     Ok(ResolvedSourceCursor {
         state_key: canonical_key.clone(),
         canonical_key,

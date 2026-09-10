@@ -2,20 +2,19 @@
 
 mod claude_session_git;
 mod git_commit_links;
+mod persistence;
 
 use std::path::{Path, PathBuf};
 
 use super::Provider;
 use crate::segment::SegmentStore;
-use editchain_codec::frame::encode_op;
-use editchain_codec::page::Page;
 use editchain_core::Op;
+use editchain_import::batch::ImportBatch;
 use editchain_import::codex::{import_codex, CodexDiscoveryRequest, HelperCommand};
 use editchain_import::import::import_claude_code;
 use editchain_import::model::{DiscoveryRequest, ImportOptions};
 use editchain_import::sink::{
     BlobSink, CursorStore, FsBlobSink, FsCursorStore, MemoryBlobSink, MemoryCursorStore,
-    MemoryOpSink,
 };
 use editchain_store::CanonicalChain;
 
@@ -52,13 +51,20 @@ pub fn run(
     check_codex_only_helper_args(provider, codex_helper.as_deref(), &codex_helper_args)?;
 
     let chain_path = PathBuf::from(&chain);
-    let mut ops_sink = MemoryOpSink::new();
+    // Hold the writer lock before reading cursors, capturing sources, or
+    // reconciling evidence, and through the final checkpoint commit.
+    let mut store = if dry_run {
+        None
+    } else {
+        Some(SegmentStore::open(&chain_path)?)
+    };
     let (mut blobs, mut cursors) = storage_sinks(&chain_path, dry_run)?;
 
-    let report = match provider {
+    let mut batch = ImportBatch::capture(cursors.as_ref(), |ops, pending| match provider {
         Provider::Claude => {
             let sessions_path = if sessions_dir.is_empty() {
-                claude_auto_detect_sessions_dir()?
+                claude_auto_detect_sessions_dir()
+                    .map_err(|error| editchain_import::ImportError::OpSink(error.to_string()))?
             } else {
                 PathBuf::from(&sessions_dir)
             };
@@ -69,17 +75,12 @@ pub fn run(
             };
 
             let options = ImportOptions::default();
-            import_claude_code(
-                &request,
-                &options,
-                &mut ops_sink,
-                blobs.as_mut(),
-                cursors.as_mut(),
-            )?
+            import_claude_code(&request, &options, ops, blobs.as_mut(), pending)
         }
         Provider::Codex => {
             let raw_root = if sessions_dir.is_empty() {
-                codex_default_sessions_dir()?
+                codex_default_sessions_dir()
+                    .map_err(|error| editchain_import::ImportError::OpSink(error.to_string()))?
             } else {
                 PathBuf::from(&sessions_dir)
             };
@@ -90,70 +91,48 @@ pub fn run(
             let helper = codex_helper_command(codex_helper, codex_helper_args);
 
             let options = ImportOptions::default();
-            import_codex(
-                &request,
-                &options,
-                &helper,
-                &mut ops_sink,
-                blobs.as_mut(),
-                cursors.as_mut(),
-            )?
+            import_codex(&request, &options, &helper, ops, blobs.as_mut(), pending)
         }
-    };
+    })?;
 
-    println!("Import complete:");
-    println!("  Files discovered: {}", report.files_discovered);
-    println!("  Files processed: {}", report.files_processed);
-    println!("  Raw ops: {}", report.raw_ops);
-    println!("  Normalized ops: {}", report.normalized_ops);
-    println!("  Duplicates: {}", report.duplicates);
-    println!("  Malformed: {}", report.malformed);
-
-    if !dry_run {
+    if let Some(store) = store.as_mut() {
         let mut session_base_links = 0usize;
         let mut produced_links = 0usize;
-        match reconcile_git_links(provider, Path::new(&workspace), &chain_path, &ops_sink.ops) {
+        match reconcile_git_links(
+            provider,
+            Path::new(&workspace),
+            &chain_path,
+            batch.operations(),
+        ) {
             Ok(GitReconciliation {
                 base_links,
                 produced_links: commit_links,
             }) => {
                 session_base_links = base_links.len();
                 produced_links = commit_links.len();
-                ops_sink.ops.extend(base_links);
-                ops_sink.ops.extend(commit_links);
+                batch.extend_operations(base_links);
+                batch.extend_operations(commit_links);
             }
             Err(error) => {
                 println!("Git-link reconciliation failed (session import will continue): {error}");
             }
         }
+        let outcome = batch.persist(&mut persistence::ImportWriter { store }, cursors.as_mut())?;
+        println!("Import complete:");
+        println!("{}", capture_report(&outcome.report));
         if provider == Provider::Claude {
             println!("  Claude session Git anchors: {session_base_links}");
         }
         println!("  Produced commit links: {produced_links}");
-
-        if !ops_sink.ops.is_empty() {
-            // Write ops to the chain store.
-            let mut store = SegmentStore::open(&chain_path)?;
-            let mut page = Page::new(0);
-            for op in &ops_sink.ops {
-                let encoded = encode_op(op)?;
-                page.add_record(0, encoded);
-            }
-            store.append_page(&page)?;
-            println!("Wrote {} operations to chain.", ops_sink.ops.len());
-        }
-        // `append_page` has flushed the segment (and, for a brand-new segment
-        // file, its directory entry) to stable storage; only now make the
-        // staged cursors durable, so a failed encode/append never advances a
-        // cursor past operations that were not stored. The ordering is
-        // intentionally at-least-once, not atomic: a crash between the append
-        // and this commit re-imports the same sources and replays identical
-        // ops, which `Open` canonicalizes through the core `OpSet`. The commit
-        // also runs when no ops were emitted: a fresh or truncated-to-empty
-        // source stages a cursor (and possibly a generation bump) with zero
-        // ops, and that checkpoint must survive the restart so a later
-        // regrowth continues at the correct boot generation.
-        cursors.commit()?;
+        println!(
+            "  Written operation variants: {}",
+            outcome.admission.written
+        );
+        println!("  Exact duplicates: {}", outcome.admission.duplicates);
+        println!(
+            "  New conflicting variants: {}",
+            outcome.admission.conflicts
+        );
 
         // Render rows, expansion offsets, graph geometry, and operation lookup
         // locations are deterministic derived data. Build them only after the
@@ -180,17 +159,25 @@ pub fn run(
                 "Render snapshot preparation failed (import remains durable; run prepare-view to retry): {error}"
             ),
         }
-    }
-
-    if dry_run {
+    } else {
+        println!("Import preview:");
+        println!("{}", capture_report(batch.report()));
         println!("\n--- Dry run: first 5 ops ---");
-        for op in ops_sink.ops.iter().take(5) {
+        for op in batch.operations().iter().take(5) {
             let json = serde_json::to_string(op)?;
             println!("{json}");
         }
     }
 
     Ok(())
+}
+
+fn capture_report(report: &editchain_import::ImportReport) -> String {
+    format!(
+        "  Files discovered: {}\n  Files processed: {}\n  Captured raw ops: {}\n  Derived ops: {}\n  Malformed source records: {}",
+        report.files_discovered, report.files_processed, report.raw_ops,
+        report.normalized_ops, report.malformed,
+    )
 }
 
 /// Reconcile all Git relationships that depend on live repository evidence.
@@ -322,7 +309,8 @@ mod tests {
     use super::*;
     use crate::commands::{Cli, Commands};
     use clap::Parser;
-    use editchain_codec::frame::decode_op;
+    use editchain_codec::frame::{decode_op, encode_op};
+    use editchain_codec::page::Page;
     use std::collections::HashSet;
 
     struct ImportArgs {
@@ -480,6 +468,33 @@ mod tests {
     }
 
     #[test]
+    fn writer_lock_precedes_source_discovery_and_cursor_store_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = dir.path().join("chain");
+        let held = SegmentStore::open(&chain).unwrap();
+        let error = run(
+            dir.path()
+                .join("missing-sources")
+                .to_string_lossy()
+                .into_owned(),
+            dir.path().to_string_lossy().into_owned(),
+            chain.to_string_lossy().into_owned(),
+            false,
+            Provider::Claude,
+            None,
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(!chain.join("blobs").exists());
+        assert!(!chain.join("cursors").exists());
+        drop(held);
+    }
+
+    #[test]
     fn storage_sinks_are_durable_unless_dry_run() {
         use editchain_import::sink::CursorValue;
 
@@ -492,6 +507,7 @@ mod tests {
             .set_cursor(
                 "/sessions/x.jsonl",
                 &CursorValue {
+                    accepted_generation: None,
                     file_size: 1,
                     byte_offset: 1,
                     ops_emitted: 1,
@@ -514,6 +530,7 @@ mod tests {
             .set_cursor(
                 "/sessions/x.jsonl",
                 &CursorValue {
+                    accepted_generation: None,
                     file_size: 1,
                     byte_offset: 1,
                     ops_emitted: 1,

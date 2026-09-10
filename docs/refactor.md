@@ -95,6 +95,22 @@ Completed increments:
   writers also release their lock explicitly at drop, even when a concurrently
   spawned process temporarily retains a duplicate descriptor.
 
+- Persistence handoff: capture returns an import batch with private proposed
+  checkpoints. Failed capture or append cannot stage those checkpoints in the
+  caller's store. The CLI acquires the writer lock before reading any cursor,
+  appends distinct canonical variants in pages targeting 4 MiB, and commits
+  checkpoints only after durable append. Its completion report follows that
+  commit and includes actual duplicate/conflict admission. Conflicting variants
+  remain durable evidence. Source-prefix reservations written before append
+  prevent ID reuse if a failed append is followed by another source rewrite;
+  unchanged retries retain their exact operation envelopes. A versioned
+  checkpoint journal binds each accepted
+  prefix to its generation and completes interrupted metadata writes on reopen,
+  including when the source changes again before restart. A crash before the
+  journal replays the same immutable operations. Legacy cursor/generation files
+  remain readable; cursors gain the paired field on their next successful import,
+  and the retained generation map continues to support explicit cursor reset.
+
 Remaining work, in dependency order:
 
 1. Consolidate typed provider evidence, source lifecycle, and persistence
