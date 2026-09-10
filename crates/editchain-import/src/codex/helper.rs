@@ -37,10 +37,19 @@ impl HelperCommand {
     /// Returns [`ImportError::HelperSpawn`] when the process cannot be spawned
     /// and [`ImportError::HelperFailed`] when it exits nonzero.
     pub fn run(&self, rollout_path: &Path) -> Result<Vec<u8>, ImportError> {
+        self.run_captured(rollout_path, rollout_path)
+    }
+
+    /// Project a captured copy while retaining the original path in diagnostics.
+    pub(crate) fn run_captured(
+        &self,
+        captured_path: &Path,
+        source_path: &Path,
+    ) -> Result<Vec<u8>, ImportError> {
         let mut cmd = Command::new(&self.program);
         let _: &mut Command = cmd
             .args(&self.args)
-            .arg(rollout_path)
+            .arg(captured_path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let output = cmd.output().map_err(|source| ImportError::HelperSpawn {
@@ -52,7 +61,7 @@ impl HelperCommand {
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
             Err(ImportError::HelperFailed {
-                path: rollout_path.to_path_buf(),
+                path: source_path.to_path_buf(),
                 program: self.program.clone(),
                 exit_code: output.status.code(),
                 stderr,

@@ -140,56 +140,15 @@ pub fn resolve_source_cursor(
 /// Returns `ImportError::Io` if the file cannot be read, or
 /// `ImportError::SourceGenerationChanged` if its accepted prefix changed.
 pub fn check_file_generation(path: &Path, cursor: &mut CursorValue) -> Result<bool, ImportError> {
-    let metadata = std::fs::metadata(path).map_err(ImportError::Io)?;
-    let current_size = metadata.len();
-    if current_size < cursor.byte_offset {
-        return Err(ImportError::SourceGenerationChanged {
-            path: path.to_path_buf(),
-            expected_size: cursor.byte_offset,
-            actual_size: current_size,
-        });
-    }
-
-    let mut file = std::fs::File::open(path).map_err(ImportError::Io)?;
-    let mut hasher = blake3::Hasher::new();
-    let hashed_bytes = {
-        let mut prefix = (&mut file).take(cursor.byte_offset);
-        std::io::copy(&mut prefix, &mut hasher).map_err(ImportError::Io)?
-    };
-    if hashed_bytes != cursor.byte_offset {
-        return Err(ImportError::SourceGenerationChanged {
-            path: path.to_path_buf(),
-            expected_size: cursor.byte_offset,
-            actual_size: current_size,
-        });
-    }
-    let direct_hash: [u8; 32] = hasher.finalize().into();
-    let empty_legacy_cursor = cursor.byte_offset == 0 && cursor.content_hash == [0_u8; 32];
-    if !empty_legacy_cursor && cursor.content_hash != direct_hash {
-        return Err(ImportError::SourceGenerationChanged {
-            path: path.to_path_buf(),
-            expected_size: cursor.file_size,
-            actual_size: current_size,
-        });
-    }
-
-    cursor.content_hash = direct_hash;
+    let (lines, _bytes, proposed) = crate::source_read::read_session_file(path, Some(cursor))?;
+    // This compatibility API checks continuity without accepting new records.
+    // Importers use SourceReadPlan directly, retaining the captured source.
+    cursor.file_size = proposed.file_size;
     cursor.content_hash_version = 1;
-    cursor.file_size = current_size;
-
-    let mut buffer = [0_u8; 8 * 1024];
-    loop {
-        let read = file.read(&mut buffer).map_err(ImportError::Io)?;
-        if read == 0 {
-            return Ok(true);
-        }
-        if buffer
-            .get(..read)
-            .is_some_and(|bytes| bytes.contains(&b'\n'))
-        {
-            return Ok(false);
-        }
+    if cursor.byte_offset == 0 {
+        cursor.content_hash = hash_raw(&[]);
     }
+    Ok(lines.is_empty())
 }
 
 /// Read new bytes from a file starting at the given offset.

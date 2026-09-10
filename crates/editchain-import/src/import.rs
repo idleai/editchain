@@ -5,16 +5,16 @@ use editchain_core::Op;
 use crate::claude_code::discover::discover_sessions;
 use crate::claude_code::envelope::parse_envelope;
 use crate::claude_code::normalize::{normalize_envelope, NormalizeOptions};
-use crate::claude_code::reader::read_session_file;
 use crate::claude_code::topology::{
     occurrence_fingerprint_fact, relation_facts_for_envelope, spawn_fact,
     CLAUDE_NORMALIZATION_VERSION,
 };
-use crate::cursor::{check_file_generation, resolve_source_cursor};
+use crate::cursor::resolve_source_cursor;
 use crate::error::ImportError;
 use crate::ids::{derive_session_id, SourcePosition, SourceStream};
 use crate::model::{DiscoveryRequest, ImportOptions, ImportReport};
 use crate::sink::{BlobSink, CursorStore, OpSink};
+use crate::source_read::{SourceReadPlan, SourceReadState};
 
 /// Version that first emitted the complete provider topology. Version-2
 /// sources need only the collision-free payload-fingerprint supplement when
@@ -70,7 +70,7 @@ pub fn import_claude_code(
         let state_key = resolved.state_key;
         let source_node = resolved.source_node;
         let migrates_legacy_key = cursor_key != state_key;
-        let mut existing_cursor = resolved.cursor;
+        let existing_cursor = resolved.cursor;
         let existing_normalization_version = existing_cursor
             .as_ref()
             .map(|cursor| cursor.normalization_version);
@@ -87,68 +87,30 @@ pub fn import_claude_code(
                 cursor.source_node != Some(source_node) || cursor.content_hash_version < 1
             });
 
-        // Decide which source bytes need raw emission and whether a complete
-        // topology replay is required. A topology replay reads every record but
-        // emits only new, deterministic relationship facts; raw/semantic op IDs
-        // remain untouched. Rewrites use the durable generation counter rather
-        // than repeatedly colliding in a hard-coded boot 1 lane.
-        let (boot, start_seq, lines, mut new_cursor, topology_replay) = if let Some(cursor) =
-            existing_cursor.as_mut()
+        let plan = SourceReadPlan::capture(
+            &session.path,
+            existing_cursor.as_ref(),
+            cursors.get_generation(&state_key)?,
+            options.source_limits,
+        )?;
+        if plan.state() == SourceReadState::Unchanged
+            && !needs_topology_upgrade
+            && !needs_cursor_upgrade
         {
-            match check_file_generation(&session.path, cursor) {
-                Ok(true) => {
-                    if needs_topology_upgrade || needs_cursor_upgrade {
-                        let topology_replay = if needs_topology_upgrade {
-                            let (all_lines, _bytes_read, _replayed_cursor) =
-                                read_session_file(&session.path, None)?;
-                            Some(all_lines)
-                        } else {
-                            None
-                        };
-                        (
-                            cursors.get_generation(&state_key)?,
-                            cursor.ops_emitted,
-                            Vec::new(),
-                            cursor.clone(),
-                            topology_replay,
-                        )
-                    } else {
-                        // File unchanged and current — idempotent skip.
-                        continue;
-                    }
-                }
-                Ok(false) => {
-                    let boot = cursors.get_generation(&state_key)?;
-                    let (new_lines, _bytes_read, new_cursor) =
-                        read_session_file(&session.path, Some(cursor))?;
-                    let topology_replay = if needs_topology_upgrade {
-                        let (all_lines, _bytes_read, _replayed_cursor) =
-                            read_session_file(&session.path, None)?;
-                        Some(all_lines)
-                    } else {
-                        None
-                    };
-                    (
-                        boot,
-                        cursor.ops_emitted,
-                        new_lines,
-                        new_cursor,
-                        topology_replay,
-                    )
-                }
-                Err(ImportError::SourceGenerationChanged { .. }) => {
-                    let generation = cursors.get_generation(&state_key)?.saturating_add(1);
-                    cursors.set_generation(&cursor_key, generation)?;
-                    let (lines, _bytes_read, new_cursor) = read_session_file(&session.path, None)?;
-                    (generation, 0, lines, new_cursor, None)
-                }
-                Err(e) => return Err(e),
-            }
-        } else {
-            let boot = cursors.get_generation(&cursor_key)?;
-            let (lines, _bytes_read, new_cursor) = read_session_file(&session.path, None)?;
-            (boot, 0, lines, new_cursor, None)
-        };
+            continue;
+        }
+        let boot = plan.generation();
+        let start_seq = plan.start_seq();
+        let lines = plan.lines();
+        let mut new_cursor = plan.checkpoint().clone();
+        // Historical upgrades use the same captured source and emit only
+        // relationship evidence. A rewrite starts a fresh generation instead.
+        let topology_replay =
+            if needs_topology_upgrade && plan.state() != SourceReadState::Rewritten {
+                Some(plan.all_lines()?)
+            } else {
+                None
+            };
 
         report.files_processed += 1;
 
@@ -321,7 +283,7 @@ pub fn import_claude_code(
         }
         new_cursor.source_node = Some(source_node);
         new_cursor.content_hash_version = 1;
-        if migrates_legacy_key && boot > 0 {
+        if boot > 0 && (migrates_legacy_key || plan.state() == SourceReadState::Rewritten) {
             cursors.set_generation(&cursor_key, boot)?;
         }
 

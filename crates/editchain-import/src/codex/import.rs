@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use editchain_core::clock::Clock;
 use serde_json::Value;
 
-use crate::claude_code::reader::read_session_file;
-use crate::cursor::{check_file_generation, read_new_bytes, resolve_source_cursor};
+use crate::cursor::resolve_source_cursor;
 use crate::error::ImportError;
 use crate::ids::{derive_session_id, SourcePosition, SourceStream};
 use crate::model::{ImportOptions, ImportReport};
 use crate::sink::{BlobSink, CursorStore, OpSink};
+use crate::source_read::{SourceReadPlan, SourceReadState};
 
 use super::discover::discover_rollouts;
 use super::helper::HelperCommand;
@@ -41,56 +41,6 @@ pub struct CodexDiscoveryRequest {
     /// Root directory containing raw Codex rollout JSONL files, recursively
     /// (e.g. `~/.codex/sessions`; date trees are discovered automatically).
     pub raw_root: PathBuf,
-}
-
-/// How one rollout's raw bytes are read for this run.
-///
-/// [`ReadState::Fresh`] and [`ReadState::Rewritten`] re-read the whole file
-/// from byte 0 (a "full read": the exact non-blank line set is known and the
-/// projection record count is enforced); [`ReadState::Append`] reads only the
-/// bytes past the persisted cursor; [`ReadState::Reproject`] reads no raw bytes
-/// and upgrades only deterministic normalized metadata.
-enum ReadState {
-    /// First import (or a reset re-import) of the source.
-    Fresh {
-        /// Boot generation for the deterministic source stream.
-        boot: u32,
-        /// Complete lines read from the whole file.
-        lines: Vec<crate::claude_code::reader::LineWithHash>,
-        /// Cursor covering the whole file.
-        new_cursor: crate::sink::CursorValue,
-    },
-    /// The source grew since the last read; same generation, incremental read.
-    Append {
-        /// Boot generation of the current generation (unchanged by appends).
-        boot: u32,
-        /// First ordinal of this batch (one past the cursor's emitted count).
-        start_seq: u64,
-        /// Complete lines read past the cursor.
-        lines: Vec<crate::claude_code::reader::LineWithHash>,
-        /// Cursor covering the old plus new bytes.
-        new_cursor: crate::sink::CursorValue,
-    },
-    /// Source bytes are unchanged, but an older normalized projection needs a
-    /// deterministic exact-fact upgrade. No raw/content rows are replayed.
-    Reproject {
-        /// Existing boot generation of the source stream.
-        boot: u32,
-        /// Number of raw records already emitted for this source.
-        start_seq: u64,
-        /// Unchanged source cursor, upgraded only after projection succeeds.
-        new_cursor: crate::sink::CursorValue,
-    },
-    /// The source was truncated/rewritten; bumped to a new generation and
-    /// re-read whole from byte 0.
-    Rewritten {
-        /// New boot generation, persisted by the cursor store.
-        boot: u32,
-        /// Complete lines read from the whole rewritten file.
-        lines: Vec<crate::claude_code::reader::LineWithHash>,
-        /// Cursor covering the whole rewritten file.
-        new_cursor: crate::sink::CursorValue,
-    },
 }
 
 /// Import all Codex rollouts under a raw sessions root into editchain ops.
@@ -180,19 +130,6 @@ pub fn import_codex(
     let workspace_str = request.workspace_path.to_str().unwrap_or("/workspace");
 
     for rollout in &rollouts {
-        let raw_identity = if session_titles.is_empty() {
-            None
-        } else {
-            raw_session_identity(&rollout.path)?
-        };
-        let indexed_title = raw_identity.as_ref().and_then(|identity| {
-            session_titles.get(&identity.thread_id).or_else(|| {
-                identity
-                    .parent_thread_id
-                    .as_ref()
-                    .and_then(|parent| session_titles.get(parent))
-            })
-        });
         let resolved = resolve_source_cursor(
             cursors,
             "codex",
@@ -204,7 +141,26 @@ pub fn import_codex(
         let state_key = resolved.state_key;
         let source_node = resolved.source_node;
         let migrates_legacy_key = cursor_key != state_key;
-        let mut existing_cursor = resolved.cursor;
+        let existing_cursor = resolved.cursor;
+        let plan = SourceReadPlan::capture(
+            &rollout.path,
+            existing_cursor.as_ref(),
+            cursors.get_generation(&state_key)?,
+            options.source_limits,
+        )?;
+        let raw_identity = if session_titles.is_empty() {
+            None
+        } else {
+            raw_session_identity(plan.captured_path())?
+        };
+        let indexed_title = raw_identity.as_ref().and_then(|identity| {
+            session_titles.get(&identity.thread_id).or_else(|| {
+                identity
+                    .parent_thread_id
+                    .as_ref()
+                    .and_then(|parent| session_titles.get(parent))
+            })
+        });
         let previous_session_title_hash = existing_cursor
             .as_ref()
             .and_then(|cursor| cursor.session_title_hash);
@@ -224,92 +180,21 @@ pub fn import_codex(
                 cursor.source_node != Some(source_node) || cursor.content_hash_version < 1
             });
 
-        // Decide how to read this rollout. A persisted cursor whose source was
-        // truncated or rewritten is NOT fatal: the file is bumped to a new
-        // deterministic boot generation (persisted per source by the cursor
-        // store) and re-imported whole from byte 0, so its new ops never
-        // collide with the previous generation's ids and unrelated rollouts
-        // keep importing. Exact accepted-prefix hashing detects same-size and
-        // grown rewrites as generation changes.
-        let read = if let Some(cursor) = existing_cursor.as_mut() {
-            match check_file_generation(&rollout.path, cursor) {
-                Ok(true) => {
-                    if needs_normalization_upgrade
-                        || needs_session_title_refresh
-                        || needs_cursor_upgrade
-                    {
-                        ReadState::Reproject {
-                            boot: cursors.get_generation(&state_key)?,
-                            start_seq: cursor.ops_emitted,
-                            new_cursor: cursor.clone(),
-                        }
-                    } else {
-                        // Unchanged and current — idempotent skip.
-                        continue;
-                    }
-                }
-                Ok(false) => {
-                    // Grew — incremental append on the current generation's stream.
-                    let boot = cursors.get_generation(&state_key)?;
-                    let (lines, _bytes_read, new_cursor) =
-                        read_session_file(&rollout.path, Some(cursor))?;
-                    ReadState::Append {
-                        boot,
-                        start_seq: cursor.ops_emitted,
-                        lines,
-                        new_cursor,
-                    }
-                }
-                Err(ImportError::SourceGenerationChanged { .. }) => {
-                    // Truncated/rewritten — bump to a new generation and read
-                    // the whole file from scratch (a fresh read, so the stale
-                    // cursor never re-triggers the generation error).
-                    let generation = cursors.get_generation(&state_key)?.saturating_add(1);
-                    cursors.set_generation(&cursor_key, generation)?;
-                    let (lines, _bytes_read, new_cursor) = read_session_file(&rollout.path, None)?;
-                    ReadState::Rewritten {
-                        boot: generation,
-                        lines,
-                        new_cursor,
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        } else {
-            // First import — generation 0 (unless a reset re-import is
-            // replaying a previously rewritten source).
-            let boot = cursors.get_generation(&cursor_key)?;
-            let (lines, _bytes_read, new_cursor) = read_session_file(&rollout.path, None)?;
-            ReadState::Fresh {
-                boot,
-                lines,
-                new_cursor,
-            }
-        };
-
-        let (boot, start_seq, full_read, lines, mut new_cursor) = match read {
-            ReadState::Fresh {
-                boot,
-                lines,
-                new_cursor,
-            }
-            | ReadState::Rewritten {
-                boot,
-                lines,
-                new_cursor,
-            } => (boot, 0, true, lines, new_cursor),
-            ReadState::Append {
-                boot,
-                start_seq,
-                lines,
-                new_cursor,
-            } => (boot, start_seq, false, lines, new_cursor),
-            ReadState::Reproject {
-                boot,
-                start_seq,
-                new_cursor,
-            } => (boot, start_seq, false, Vec::new(), new_cursor),
-        };
+        if plan.state() == SourceReadState::Unchanged
+            && !needs_normalization_upgrade
+            && !needs_session_title_refresh
+            && !needs_cursor_upgrade
+        {
+            continue;
+        }
+        let boot = plan.generation();
+        let start_seq = plan.start_seq();
+        let full_read = matches!(
+            plan.state(),
+            SourceReadState::Fresh | SourceReadState::Rewritten
+        );
+        let lines = plan.lines();
+        let mut new_cursor = plan.checkpoint().clone();
 
         // Deterministic source stream per physical file (the file path is the
         // owning stream identity). The boot generation separates rewritten
@@ -318,7 +203,8 @@ pub fn import_codex(
         let stream = SourceStream::new(source_node, boot);
         // The bridge counts every physical line it reads, including blank lines
         // and one trailing partial line; align `expected_total` with it.
-        let (has_partial, partial_blank) = trailing_partial(&rollout.path, &new_cursor)?;
+        let has_partial = plan.partial().is_some();
+        let partial_blank = plan.partial() == Some(true);
         let expected_total = start_seq + lines.len() as u64 + u64::from(has_partial);
 
         if expected_total == 0 {
@@ -331,7 +217,7 @@ pub fn import_codex(
             }
             new_cursor.source_node = Some(source_node);
             new_cursor.content_hash_version = 1;
-            if migrates_legacy_key && boot > 0 {
+            if boot > 0 && (migrates_legacy_key || plan.state() == SourceReadState::Rewritten) {
                 cursors.set_generation(&cursor_key, boot)?;
             }
             cursors.set_cursor(&cursor_key, &new_cursor)?;
@@ -352,7 +238,7 @@ pub fn import_codex(
 
         // Run the helper over the whole file and validate/fold its projection
         // BEFORE emitting anything, so a bridge failure leaves no partial state.
-        let stdout = helper.run(&rollout.path)?;
+        let stdout = helper.run_captured(plan.captured_path(), &rollout.path)?;
         let projection =
             parse_projection(&stdout, expected_total, expected_records).map_err(|e| {
                 ImportError::ProjectionProtocol {
@@ -364,7 +250,7 @@ pub fn import_codex(
             })?;
         validate_new_line_records(
             &projection.line_ordinals,
-            &lines,
+            lines,
             start_seq,
             (has_partial && !partial_blank).then_some(expected_total),
             &rollout.path,
@@ -392,7 +278,7 @@ pub fn import_codex(
         // filename stem. Never payload.session_id.
         let owning_thread = match projection.owning_thread.clone() {
             Some(thread) => thread,
-            None => owning_thread_from_rollout(&rollout.path)?
+            None => owning_thread_from_rollout(plan.captured_path())?
                 .unwrap_or_else(|| rollout.session_id.clone()),
         };
         let session_id = derive_session_id(&owning_thread);
@@ -658,7 +544,7 @@ pub fn import_codex(
         }
         new_cursor.source_node = Some(source_node);
         new_cursor.content_hash_version = 1;
-        if migrates_legacy_key && boot > 0 {
+        if boot > 0 && (migrates_legacy_key || plan.state() == SourceReadState::Rewritten) {
             cursors.set_generation(&cursor_key, boot)?;
         }
         cursors.set_cursor(&cursor_key, &new_cursor)?;
@@ -923,18 +809,4 @@ fn validate_new_line_records(
         }),
         None => Ok(()),
     }
-}
-
-/// Detect a trailing partial line (bytes after the last complete line) and
-/// whether it is whitespace-only, mirroring the bridge's physical line count.
-fn trailing_partial(
-    path: &Path,
-    cursor: &crate::sink::CursorValue,
-) -> Result<(bool, bool), ImportError> {
-    if cursor.file_size <= cursor.byte_offset {
-        return Ok((false, false));
-    }
-    let (tail, _hash) = read_new_bytes(path, cursor.byte_offset)?;
-    let blank = tail.iter().all(u8::is_ascii_whitespace);
-    Ok((true, blank))
 }

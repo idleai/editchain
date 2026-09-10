@@ -426,3 +426,41 @@ fn each_rewrite_uses_the_next_durable_generation() {
     let generation_two_raw = stream.op_from_position(SourcePosition::raw(1)).unwrap();
     assert!(ops.ops.iter().any(|op| op.id == generation_two_raw));
 }
+
+#[test]
+fn failed_rewrite_capture_preserves_both_cursor_and_generation_for_retry() {
+    struct FailingBlobSink;
+    impl BlobSink for FailingBlobSink {
+        fn store_blob(&mut self, _bytes: &[u8]) -> Result<(), ImportError> {
+            Err(ImportError::BlobSink("failed capture".into()))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session-1.jsonl");
+    std::fs::write(&path, event_line("a", None, "first")).unwrap();
+    let mut ops = MemoryOpSink::new();
+    let mut cursors = MemoryCursorStore::new();
+    let _report = import(dir.path(), &mut ops, &mut cursors);
+    let key = source_key(dir.path(), &path);
+    let accepted = cursors.get_cursor(&key).unwrap();
+    let count = ops.ops.len();
+    std::fs::write(&path, event_line("b", None, &"x".repeat(INLINE_LIMIT))).unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            import_claude_code(
+                &request(dir.path()),
+                &ImportOptions::default(),
+                &mut ops,
+                &mut FailingBlobSink,
+                &mut cursors
+            ),
+            Err(ImportError::BlobSink(_))
+        ));
+        assert_eq!(cursors.get_cursor(&key).unwrap(), accepted);
+        assert_eq!(cursors.get_generation(&key).unwrap(), 0);
+        assert_eq!(ops.ops.len(), count);
+    }
+    let retry = import(dir.path(), &mut ops, &mut cursors);
+    assert_eq!(retry.raw_ops, 1);
+    assert_eq!(cursors.get_generation(&key).unwrap(), 1);
+}

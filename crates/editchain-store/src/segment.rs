@@ -20,7 +20,7 @@ pub struct SegmentStore {
     /// Next segment sequence number.
     next_seq: u32,
     /// Held for this writer's lifetime; readers do not acquire the lock.
-    _writer_lock: fs::File,
+    writer_lock: fs::File,
 }
 
 impl SegmentStore {
@@ -55,7 +55,7 @@ impl SegmentStore {
         Ok(Self {
             chain_dir,
             next_seq,
-            _writer_lock: writer_lock,
+            writer_lock,
         })
     }
 
@@ -148,6 +148,15 @@ impl SegmentStore {
     fn segment_path(&self, seq: u32) -> PathBuf {
         let filename = format!("{seq:06}.eclog");
         self.chain_dir.join(filename)
+    }
+}
+
+impl Drop for SegmentStore {
+    fn drop(&mut self) {
+        // Closing only this descriptor can leave the lock alive briefly in a
+        // concurrently spawned child before exec closes its inherited copy.
+        // End the lock at the writer's actual lifetime boundary.
+        drop(self.writer_lock.unlock());
     }
 }
 
@@ -315,5 +324,19 @@ mod tests {
     fn sync_parent_dir_accepts_existing_directory() {
         let dir = tempfile::tempdir().unwrap();
         sync_parent_dir(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn dropping_writer_releases_lock_even_with_an_inherited_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SegmentStore::open(dir.path()).unwrap();
+        let inherited = store.writer_lock.try_clone().unwrap();
+        assert!(SegmentStore::open(dir.path()).is_err());
+        drop(store);
+        let reopened = SegmentStore::open(dir.path()).unwrap();
+        drop(inherited);
+        assert!(SegmentStore::open(dir.path()).is_err());
+        drop(reopened);
+        assert!(SegmentStore::open(dir.path()).is_ok());
     }
 }

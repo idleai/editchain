@@ -1442,6 +1442,7 @@ fn reasoning_is_private_and_respects_include_thinking() {
             normalize: true,
             include_thinking: false,
             max_inline_bytes: 4096,
+            ..ImportOptions::default()
         },
     );
     assert_eq!(
@@ -1456,6 +1457,7 @@ fn reasoning_is_private_and_respects_include_thinking() {
             normalize: true,
             include_thinking: true,
             max_inline_bytes: 4096,
+            ..ImportOptions::default()
         },
     );
     assert_eq!(shown.report.normalized_ops, 1);
@@ -1506,6 +1508,7 @@ fn kinds_map_full_content_to_neutral_ops() {
             normalize: true,
             include_thinking: true,
             max_inline_bytes: 4096,
+            ..ImportOptions::default()
         },
     );
     assert_eq!(harness.report.raw_ops, 9);
@@ -2822,4 +2825,101 @@ fn append_after_rewrite_continues_the_new_generation_chain() {
         import_with_options_into(dir.path(), &helper, &ImportOptions::default(), &mut cursors);
     assert_eq!(third.report.files_processed, 0);
     assert!(third.ops.ops.is_empty());
+}
+
+#[test]
+fn helper_projects_captured_bytes_when_the_original_is_rewritten_during_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rollout-1.jsonl");
+    let before = event_line("BEFORE");
+    let after = event_line("AFTER_");
+    assert_eq!(before.len(), after.len());
+    write_rollout(dir.path(), "rollout-1.jsonl", std::slice::from_ref(&before));
+    let replacement = dir.path().join("replacement.txt");
+    std::fs::write(&replacement, ln(&after)).unwrap();
+    let projector = write_fake_helper(dir.path(), "project.sh", &messages_awk("t"));
+    let mutator = dir.path().join("mutate.sh");
+    // Rewrite the live source, then copy exactly the argument seen by the
+    // helper so the test can assert its input independently of ordinal checks.
+    std::fs::write(
+        &mutator,
+        concat!(
+            "cp \"$1\" \"$2\"\n",
+            "cp \"$5\" \"$3\"\n",
+            "sh \"$4\" \"$5\"\n",
+        ),
+    )
+    .unwrap();
+    let observed = dir.path().join("helper-input.txt");
+    let helper = sh_helper(
+        &mutator,
+        &[
+            replacement.to_string_lossy().into_owned(),
+            path.to_string_lossy().into_owned(),
+            observed.to_string_lossy().into_owned(),
+            projector.to_string_lossy().into_owned(),
+        ],
+    );
+    let mut cursors = MemoryCursorStore::new();
+    let first = try_import(dir.path(), &helper, &ImportOptions::default(), &mut cursors).unwrap();
+    assert_eq!(std::fs::read(&observed).unwrap(), ln(&before));
+    assert_eq!(std::fs::read(&path).unwrap(), ln(&after));
+    let raw = first
+        .ops
+        .ops
+        .iter()
+        .find(|op| op.id.seq == 1 << 16)
+        .unwrap();
+    assert_eq!(raw_bytes(raw, &first.blobs), ln(&before));
+    let key = source_key(dir.path(), &path);
+    assert_eq!(
+        cursors.get_cursor(&key).unwrap().unwrap().content_hash,
+        editchain_import::hash_raw(&ln(&before))
+    );
+    let next = try_import(
+        dir.path(),
+        &sh_helper(&projector, &[]),
+        &ImportOptions::default(),
+        &mut cursors,
+    )
+    .unwrap();
+    assert_eq!(next.report.raw_ops, 1);
+    assert_eq!(cursors.get_generation(&key).unwrap(), 1);
+    assert!(next
+        .ops
+        .ops
+        .iter()
+        .all(|new| first.ops.ops.iter().all(|old| new.id != old.id)));
+}
+
+#[test]
+fn failed_rewrite_projection_preserves_both_cursor_and_generation_for_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rollout-1.jsonl");
+    write_rollout(dir.path(), "rollout-1.jsonl", &[event_line("A")]);
+    let good = helper_in(&dir, &messages_awk("t"));
+    let mut cursors = MemoryCursorStore::new();
+    let first = try_import(dir.path(), &good, &ImportOptions::default(), &mut cursors).unwrap();
+    let key = source_key(dir.path(), &path);
+    let accepted = cursors.get_cursor(&key).unwrap();
+    write_rollout(dir.path(), "rollout-1.jsonl", &[event_line("B")]);
+    let script = dir.path().join("fail.sh");
+    std::fs::write(&script, "exit 3\n").unwrap();
+    let bad = sh_helper(&script, &[]);
+    for _ in 0..2 {
+        assert!(matches!(
+            try_import(dir.path(), &bad, &ImportOptions::default(), &mut cursors),
+            Err(ImportError::HelperFailed { .. })
+        ));
+        assert_eq!(cursors.get_cursor(&key).unwrap(), accepted);
+        assert_eq!(cursors.get_generation(&key).unwrap(), 0);
+    }
+    let retry = try_import(dir.path(), &good, &ImportOptions::default(), &mut cursors).unwrap();
+    assert_eq!(retry.report.raw_ops, 1);
+    assert_eq!(cursors.get_generation(&key).unwrap(), 1);
+    assert!(retry
+        .ops
+        .ops
+        .iter()
+        .all(|new| first.ops.ops.iter().all(|old| new.id != old.id)));
 }

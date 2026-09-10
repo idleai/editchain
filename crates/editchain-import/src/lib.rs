@@ -11,8 +11,6 @@ use serde as _;
 use editchain_project as _;
 #[cfg(test)]
 use proptest as _;
-#[cfg(test)]
-use tempfile as _;
 
 /// Cursor-based incremental file reading.
 pub mod cursor;
@@ -26,6 +24,8 @@ pub mod import;
 pub mod model;
 /// Pluggable output sinks (ops, blobs, cursors).
 pub mod sink;
+/// Captured source bytes and shared incremental read plans.
+pub mod source_read;
 /// Validated, provider-neutral source timestamp parsing.
 pub mod source_time;
 

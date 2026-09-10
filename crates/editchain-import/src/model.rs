@@ -24,6 +24,8 @@ pub struct ImportOptions {
     pub include_thinking: bool,
     /// Maximum inline payload size before spilling to blob storage.
     pub max_inline_bytes: usize,
+    /// Bounds on captured sources and individual physical records.
+    pub source_limits: crate::source_read::SourceReadLimits,
 }
 
 impl Default for ImportOptions {
@@ -32,6 +34,7 @@ impl Default for ImportOptions {
             normalize: true,
             include_thinking: false,
             max_inline_bytes: 4096,
+            source_limits: crate::source_read::SourceReadLimits::default(),
         }
     }
 }

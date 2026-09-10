@@ -83,6 +83,18 @@ Completed increments:
   stays unknown while capture preserves the complete raw record. Stored clocks
   remain unchanged; corrected parsing applies to newly captured evidence.
 
+- Source capture: both providers use a shared read plan over one private file
+  copy. Accepted-prefix hashing, new complete records, partial-line status,
+  metadata replay, and Codex helper input share those captured bytes. Live
+  growth is deferred to the next import. A rewritten source proposes a checked
+  generation increment; emission failures leave the previous generation and
+  cursor unchanged. The legacy reader now rejects changed accepted bytes too.
+  Configurable defaults bound a source to 512 MiB, a record to 64 MiB, and a
+  generation to one million complete records. Capturing adds temporary disk IO;
+  unchanged-source cost and aggregate memory still need measurement. Segment
+  writers also release their lock explicitly at drop, even when a concurrently
+  spawned process temporarily retains a duplicate descriptor.
+
 Remaining work, in dependency order:
 
 1. Consolidate typed provider evidence, source lifecycle, and persistence
