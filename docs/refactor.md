@@ -404,6 +404,15 @@ and unit-test function bodies retain identical Rust tokens; only imports,
 module placement, and visibility within the backend changed. The full lint
 suite passes with the existing snapshot, preview, file-diff, and row contracts.
 
+The project crate now keeps construction, ordering, and layout entry points in
+its 567-line root module, down from 3,832 physical lines. Separate modules own
+node identity/presentation, source-record collapse, canonical ancestry, and
+bounded display labels. Content selection calls the label module directly.
+Public types and token-accounting helpers retain their existing root exports;
+the crate keeps its pure core/serde dependency boundary. Moved algorithm bodies
+are unchanged, and the full lint suite passes with existing ancestry, collapse,
+content, and layout regressions.
+
 The planned refactor increments are complete. EC02 and historical operations
 remain readable; the documented protocol, repository-qualified row keys, and
 pre-1.0 Rust API changes require coordinated consumers. Compatibility readers

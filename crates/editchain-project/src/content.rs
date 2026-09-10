@@ -1,6 +1,7 @@
 //! Selected row content, resolved while normalized source children are present.
 //! Authored formatting belongs to the renderer; provider extraction stays here.
 
+use crate::labels;
 use std::collections::HashSet;
 
 use editchain_core::op::{CommandStage, ToolStage};
@@ -72,7 +73,7 @@ impl DisplayContent {
     pub(super) fn with_results(&self, sub_ops: &[std::sync::Arc<Op>]) -> Self {
         let results: Vec<_> = sub_ops
             .iter()
-            .filter_map(|op| super::sub_op_content(op))
+            .filter_map(|op| labels::sub_op_content(op))
             .filter(|text| !text.is_empty())
             .collect();
         if results.is_empty() {
@@ -80,7 +81,7 @@ impl DisplayContent {
         }
         let mut content = self.clone();
         if content.tool_label.is_some() {
-            content.output_preview = Some(ContentText::derived(super::truncate_line(
+            content.output_preview = Some(ContentText::derived(labels::truncate_line(
                 &results.join(" "),
             )));
         } else {
@@ -94,7 +95,7 @@ impl DisplayContent {
                     .filter(|text| !text.is_empty() && *text != "(no summary)")
                     .collect::<Vec<_>>()
                     .join(" ");
-                *target = ContentText::derived(super::truncate_line(&joined));
+                *target = ContentText::derived(labels::truncate_line(&joined));
             }
         }
         content
@@ -141,7 +142,7 @@ impl SelectedContent {
 /// records whether its input payloads are complete, independently of length.
 #[must_use]
 pub fn operation(op: &Op, source_complete: bool) -> SelectedContent {
-    let summary = super::op_summary(op);
+    let summary = labels::op_summary(op);
     match &op.kind {
         OpKind::Message(message) => SelectedContent::authored(ContentText::from_payload(
             summary,
@@ -149,7 +150,7 @@ pub fn operation(op: &Op, source_complete: bool) -> SelectedContent {
             source_complete,
         )),
         OpKind::Tool(tool) => {
-            let label = super::payload_text(&tool.tool_name);
+            let label = labels::payload_text(&tool.tool_name);
             if matches!(tool.stage, ToolStage::Finish) && label.is_empty() {
                 return SelectedContent::output(ContentText::from_payload(
                     summary,
@@ -158,7 +159,7 @@ pub fn operation(op: &Op, source_complete: bool) -> SelectedContent {
                 ));
             }
             let detail =
-                super::normalized_tool_invocation_detail(tool).unwrap_or_else(|| summary.clone());
+                labels::normalized_tool_invocation_detail(tool).unwrap_or_else(|| summary.clone());
             SelectedContent {
                 summary,
                 display: DisplayContent {
@@ -224,7 +225,7 @@ impl ImportParts {
         let complete = !incomplete.contains(&child.id);
         match &child.kind {
             OpKind::Message(message) if empty(self.message.as_ref()) => {
-                let text = super::message_summary(&super::payload_text(&message.content));
+                let text = labels::message_summary(&labels::payload_text(&message.content));
                 self.message = Some(SelectedContent::authored(ContentText::from_payload(
                     text,
                     &message.content,
@@ -232,16 +233,16 @@ impl ImportParts {
                 )));
             }
             OpKind::Tool(tool) if empty(self.tool.as_ref()) => {
-                let label = super::payload_text(&tool.tool_name);
+                let label = labels::payload_text(&tool.tool_name);
                 if matches!(tool.stage, ToolStage::Finish) && label.is_empty() {
-                    let text = super::tool_result_summary(&super::payload_text(&tool.content));
+                    let text = labels::tool_result_summary(&labels::payload_text(&tool.content));
                     self.tool = Some(SelectedContent::output(ContentText::from_payload(
                         text,
                         &tool.content,
                         complete,
                     )));
                 } else {
-                    let detail = super::tool_invocation_detail(raw, tool);
+                    let detail = labels::tool_invocation_detail(raw, tool);
                     self.tool = Some(SelectedContent {
                         summary: label.clone(),
                         display: DisplayContent {
@@ -258,10 +259,10 @@ impl ImportParts {
             }
             OpKind::Command(command) if empty(self.command.as_ref()) => {
                 self.command = Some(if matches!(command.stage, CommandStage::Finish) {
-                    let text = super::command_output_summary(raw, command);
+                    let text = labels::command_output_summary(raw, command);
                     SelectedContent::output(ContentText::derived(text))
                 } else {
-                    let text = super::payload_text(&command.content);
+                    let text = labels::payload_text(&command.content);
                     SelectedContent::authored(ContentText::from_payload(
                         text,
                         &command.content,
@@ -270,8 +271,8 @@ impl ImportParts {
                 });
             }
             OpKind::File(_) if self.file.is_none() => {
-                self.file =
-                    super::annotated_file_path(child, siblings).map(|path| format!("file: {path}"));
+                self.file = labels::annotated_file_path(child, siblings)
+                    .map(|path| format!("file: {path}"));
             }
             OpKind::ChainStart(_)
             | OpKind::Actor(_)
@@ -339,7 +340,7 @@ pub(super) fn collapsed_import(
         }
     }
     parts.select().unwrap_or_else(|| match &raw.kind {
-        OpKind::Import(import) => SelectedContent::summary(super::raw_import_label(import)),
+        OpKind::Import(import) => SelectedContent::summary(labels::raw_import_label(import)),
         OpKind::ChainStart(_)
         | OpKind::Actor(_)
         | OpKind::Message(_)
