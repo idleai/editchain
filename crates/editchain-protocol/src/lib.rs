@@ -3,6 +3,9 @@
 //! These types are serialized over stdio between the thin TypeScript
 //! extension host and the native Rust service.
 
+mod content;
+pub use content::{ContentTextDto, RowContentDto, MAX_ROW_TEXT_BYTES, MAX_TOOL_LABEL_BYTES};
+
 mod error;
 mod snapshot;
 mod validation;
@@ -371,8 +374,11 @@ pub struct HistoryRow {
     /// The repository (for git commits) as an exact decimal `RepositoryId`
     /// string — a string so u64 values above 2^53 round-trip exactly.
     pub repository: Option<String>,
-    /// Display summary text.
+    /// Bounded compatibility summary text.
     pub summary: String,
+    /// Source-selected content roles, absent on legacy services.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<RowContentDto>,
     /// Timestamp in Unix ms (0 if unknown).
     pub timestamp_ms: u64,
     /// Grouping key for block separation (session id for ops, repo id for git).
@@ -899,6 +905,7 @@ mod tests {
     #[test]
     fn history_row_identifiers_serialize_as_exact_strings() {
         let row = HistoryRow {
+            content: None,
             op_id: Some(big_op_id().to_string()),
             git_oid: Some(big_oid().to_hex()),
             repository: Some(OVER_2_53.to_string()),
@@ -1313,6 +1320,7 @@ mod tests {
 
         // Newer services emit the fields; partial WorkUnitDto members default.
         let row = HistoryRow {
+            content: None,
             op_id: Some("1:0:1".to_string()),
             git_oid: None,
             repository: None,

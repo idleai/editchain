@@ -101,3 +101,40 @@ fn decoded_rows_resolve_legacy_content_without_changing_source_identities() {
     );
     assert!(spec.disclosure.is_some());
 }
+
+#[test]
+fn typed_content_preserves_authored_text_and_does_not_parse_summary_prefixes() {
+    let authored = "{\"text\": \"an authored JSON example\"}";
+    let source: editchain_protocol::HistoryRow = serde_json::from_value(json!({
+        "summary": "tool: obsolete_name old payload", "timestamp_ms": 0,
+        "group": "session:1", "node_key": "1:2:3", "op_id": "1:2:3",
+        "parents": [], "is_submodule": false, "kind": "tool",
+        "record_role": "action", "activity_kind": "execute",
+        "content": {
+            "tool_label": {"text": "工具 with spaces", "complete": true},
+            "authored_summary": {"text": authored, "complete": true},
+            "output_preview": {"text": "separate output", "complete": false}
+        }
+    }))
+    .unwrap();
+    let row = RowInput::from(source);
+    let spec =
+        crate::app::rows::RowSpec::from_row(&row, &crate::app::rows::RowContext::for_row(0, false));
+    assert_eq!(spec.display_summary, authored);
+    assert_eq!(spec.summary_source, authored);
+    assert_eq!(
+        spec.content.top.unwrap().heading.unwrap().title,
+        "工具 with spaces"
+    );
+    assert!(
+        row.source
+            .content
+            .as_ref()
+            .unwrap()
+            .authored_summary
+            .as_ref()
+            .unwrap()
+            .complete
+    );
+    assert_eq!(row.source.summary, "tool: obsolete_name old payload");
+}

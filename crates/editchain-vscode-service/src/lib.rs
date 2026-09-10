@@ -38,11 +38,11 @@ use editchain_project::activity_view::{ActivityPresentation, ActivityView};
 use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
 use editchain_protocol::{
-    ErrorCode, ExpansionSpanDto, FileChangeDto, FileChangeSource, FileChangeStatus, FileDiffDto,
-    FileDiffHunkDto, HistoryRow, HistoryWindow, NodeDetails, OpenResponse, ParentRelationDto,
-    ParentRelationKind, Request, RequestBody, ResolvedObject, Response, ResponseBody, ServiceError,
-    SessionMetaDto, SessionSummaryDto, SnapshotId, SnapshotResult, SubOpSummary, WorkUnitDto,
-    PROTOCOL_VERSION,
+    ContentTextDto, ErrorCode, ExpansionSpanDto, FileChangeDto, FileChangeSource, FileChangeStatus,
+    FileDiffDto, FileDiffHunkDto, HistoryRow, HistoryWindow, NodeDetails, OpenResponse,
+    ParentRelationDto, ParentRelationKind, Request, RequestBody, ResolvedObject, Response,
+    ResponseBody, RowContentDto, ServiceError, SessionMetaDto, SessionSummaryDto, SnapshotId,
+    SnapshotResult, SubOpSummary, WorkUnitDto, PROTOCOL_VERSION,
 };
 
 use snapshot::{RenderSnapshot, SnapshotBuilder, SnapshotIdentity, SnapshotManifestData};
@@ -115,6 +115,7 @@ struct ExpandedChildRow {
     git_oid: Option<String>,
     repository: Option<String>,
     summary: String,
+    content: RowContentDto,
     timestamp_ms: u64,
     kind: String,
     author: String,
@@ -564,17 +565,21 @@ const DISPLAY_PREVIEW_CHAR_LIMIT: usize = 1024;
 fn projection_ops_with_previews(
     source_ops: &[Op],
     resolver: &BlobResolver,
-) -> (Vec<Op>, BlobHydrationStats) {
+) -> (Vec<Op>, BlobHydrationStats, std::collections::HashSet<OpId>) {
     let mut stats = BlobHydrationStats::default();
+    let mut incomplete = std::collections::HashSet::new();
     let ops = source_ops
         .iter()
         .map(|source| {
             let mut op = source.clone();
             compact_kind_for_projection(&mut op.kind, resolver, &mut stats);
+            if op.kind != source.kind {
+                let _: bool = incomplete.insert(op.id);
+            }
             op
         })
         .collect();
-    (ops, stats)
+    (ops, stats, incomplete)
 }
 
 /// Replace payloads in one projected operation with bounded display previews.
@@ -2342,7 +2347,8 @@ impl Workspace {
         // payload bytes from being multiplied by collapse/view/layout clones.
         // Details and search hydrate a single source op at a time on demand.
         let resolver = BlobResolver::open(&chain_path)?;
-        let (projection_ops, blob_stats) = projection_ops_with_previews(&source_ops, &resolver);
+        let (projection_ops, blob_stats, incomplete) =
+            projection_ops_with_previews(&source_ops, &resolver);
         let mut diagnostics = OpenDiagnostics {
             chain: chain_stats,
             blobs: blob_stats,
@@ -2351,7 +2357,7 @@ impl Workspace {
                 history_errors: 0,
             },
         };
-        let mut projection = HistoryProjection::from_ops(projection_ops);
+        let mut projection = HistoryProjection::from_preview_ops(projection_ops, &incomplete);
         // Walk each discovered repo's history into the projection.
         for discovery in &repositories {
             let opened = open_repository(discovery);
@@ -2620,7 +2626,8 @@ impl Workspace {
                     op_id: node.op_id().map(|id| id.to_string()),
                     git_oid: node.git_oid().map(|oid| oid.to_hex()),
                     repository: node.repository().map(|rid| rid.0.to_string()),
-                    summary: node.summary(),
+                    summary: ContentTextDto::new(node.summary(), false).text,
+                    content: Some(row_content_dto(node.display_content())),
                     timestamp_ms: node.timestamp_ms(),
                     group: group.clone(),
                     group_end: filtered
@@ -2633,7 +2640,7 @@ impl Workspace {
                         .repository()
                         .is_some_and(|rid| self.repo_is_submodule(rid)),
                     is_system: node_is_system(&node),
-                    author: node_author(&node),
+                    author: ContentTextDto::new(node_author(&node), false).text,
                     commit_id: node_commit_id(&node),
                     kind: node.kind(),
                     lane,
@@ -2702,6 +2709,7 @@ impl Workspace {
                     git_oid: child.git_oid.clone(),
                     repository: child.repository.clone(),
                     summary: child.summary.clone(),
+                    content: Some(child.content.clone()),
                     timestamp_ms: child.timestamp_ms,
                     group: group.clone(),
                     group_end: false,
@@ -3732,7 +3740,10 @@ fn work_unit_dto(marker: &WorkUnitMarker) -> WorkUnitDto {
         id: marker.id.clone(),
         is_start: marker.is_start,
         is_end: marker.is_end,
-        title: marker.title.clone(),
+        title: marker
+            .title
+            .clone()
+            .map(|title| ContentTextDto::new(title, false).text),
         count: marker.count,
     }
 }
@@ -3930,6 +3941,30 @@ fn node_activity_bundle(
     }
 }
 
+fn row_content_dto(content: editchain_project::content::DisplayContent) -> RowContentDto {
+    RowContentDto {
+        tool_label: content
+            .tool_label
+            .map(|text| ContentTextDto::tool_label(text.text, text.complete)),
+        authored_summary: content
+            .authored_summary
+            .map(|text| ContentTextDto::new(text.text, text.complete)),
+        output_preview: content
+            .output_preview
+            .map(|text| ContentTextDto::new(text.text, text.complete)),
+    }
+}
+
+fn child_content_dto(op: Option<&Op>, summary: &str) -> RowContentDto {
+    let content = op
+        .filter(|op| matches!(op.kind, OpKind::Tool(_)))
+        .map_or_else(
+            || editchain_project::content::DisplayContent::summary(summary.to_owned()),
+            |op| editchain_project::content::operation(op, false).display,
+        );
+    row_content_dto(content)
+}
+
 struct ServicePresentation<'a> {
     agent_changes: &'a HashMap<OpId, Vec<FileChangeDto>>,
     git_changes: &'a HashMap<(RepositoryId, GitOid), Vec<FileChangeDto>>,
@@ -3943,10 +3978,11 @@ impl ActivityPresentation for ServicePresentation<'_> {
             op_id: member.op_id().map_or_else(String::new, |id| id.to_string()),
             git_oid: member.git_oid().map(|oid| oid.to_hex()),
             repository: member.repository().map(|id| id.0.to_string()),
-            summary: member.summary(),
+            summary: ContentTextDto::new(member.summary(), false).text,
+            content: row_content_dto(member.display_content()),
             timestamp_ms: member.timestamp_ms(),
             kind: member.kind(),
-            author: node_author(member),
+            author: ContentTextDto::new(node_author(member), false).text,
             commit_id: node_commit_id(member),
             is_system: node_is_system(member),
             record_role: member.record_role(),
@@ -4029,7 +4065,10 @@ fn file_change_rows(
             op_id: change.op_id.clone().unwrap_or_default(),
             git_oid: change.commit_oid.clone(),
             repository: change.repository.clone(),
-            summary: change.path.clone(),
+            summary: ContentTextDto::new(change.path.clone(), true).text,
+            content: row_content_dto(editchain_project::content::DisplayContent::summary(
+                change.path.clone(),
+            )),
             timestamp_ms: node.timestamp_ms(),
             kind: "file".to_string(),
             author: String::new(),
@@ -4067,7 +4106,11 @@ fn flat_op_child_rows(node: &editchain_project::HistoryNode) -> Vec<ExpandedChil
                 op_id: summary.op_id,
                 git_oid: None,
                 repository: None,
-                summary: summary.summary,
+                content: child_content_dto(
+                    node.sub_ops().get(index).map(AsRef::as_ref),
+                    &summary.summary,
+                ),
+                summary: ContentTextDto::new(summary.summary, false).text,
                 timestamp_ms: summary.timestamp_ms,
                 kind: summary.kind,
                 author: String::new(),
@@ -4133,7 +4176,7 @@ fn member_sub_op_summaries(
             if let Some(member) = key_to_node.get(&op_key) {
                 SubOpSummary {
                     op_id: op_key,
-                    summary: member.summary(),
+                    summary: ContentTextDto::new(member.summary(), false).text,
                     kind: member.kind(),
                     timestamp_ms: op.clock.as_u64(),
                 }
@@ -5891,9 +5934,10 @@ mod tests {
             }),
         );
         let resolver = BlobResolver::open(tmp.path()).unwrap();
-        let (projection_ops, stats) =
+        let (projection_ops, stats, incomplete) =
             projection_ops_with_previews(std::slice::from_ref(&source), &resolver);
 
+        assert!(incomplete.contains(&source.id));
         assert_eq!(stats.hydrated, 0);
         assert_eq!(stats.previewed, 1);
         assert_eq!(stats.deferred, 1);
@@ -5916,7 +5960,10 @@ mod tests {
         assert_ne!(preview_len, 0, "expected inline projection preview");
         assert!(preview_len <= DISPLAY_PREVIEW_CHAR_LIMIT.saturating_add(1));
 
-        let projection = HistoryProjection::from_ops(projection_ops);
+        let projection = HistoryProjection::from_preview_ops(projection_ops, &incomplete);
+        let preview = row_content_dto(projection.nodes().first().unwrap().display_content());
+        assert!(!preview.authored_summary.as_ref().unwrap().complete);
+        assert!(preview.is_bounded());
         let mut source_op_index = HashMap::new();
         let _: Option<usize> = source_op_index.insert(source.id, 0);
         let ws = Workspace {

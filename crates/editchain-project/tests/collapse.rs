@@ -242,11 +242,25 @@ fn collapse_reduces_node_count_and_chains() {
 fn collapse_derives_meaningful_summary() {
     let op1 = import_op(1, 1);
     let msg = message_op(1, 3, op1.id, "hello world");
-    let projection = HistoryProjection::from_ops(vec![op1.clone(), msg]);
+    let projection = HistoryProjection::from_ops(vec![op1.clone(), msg.clone()]);
     let nodes = projection.nodes();
     assert_eq!(nodes.len(), 1);
     // Summary should be the message text, not the raw JSONL.
     assert_eq!(nodes.first().unwrap().summary(), "hello world");
+    let content = nodes.first().unwrap().display_content();
+    assert!(content.authored_summary.unwrap().complete);
+    let incomplete = std::collections::HashSet::from([msg.id]);
+    let preview = HistoryProjection::from_preview_ops(vec![op1, msg], &incomplete);
+    assert!(
+        !preview
+            .nodes()
+            .first()
+            .unwrap()
+            .display_content()
+            .authored_summary
+            .unwrap()
+            .complete
+    );
 }
 
 #[test]
@@ -257,6 +271,9 @@ fn collapse_tool_summary_prefixes_tool() {
     let nodes = projection.nodes();
     assert_eq!(nodes.len(), 1);
     assert_eq!(nodes.first().unwrap().summary(), "tool: Bash");
+    let label = nodes.first().unwrap().display_content().tool_label.unwrap();
+    assert_eq!(label.text, "Bash");
+    assert!(label.complete);
 }
 
 #[test]
@@ -413,6 +430,9 @@ fn claude_tool_summary_uses_tool_use_input() {
         projection.nodes().first().expect("tool row").summary(),
         "tool: Read src/lib.rs"
     );
+    let content = projection.nodes().first().unwrap().display_content();
+    assert_eq!(content.tool_label.unwrap().text, "Read");
+    assert_eq!(content.authored_summary.unwrap().text, "src/lib.rs");
 }
 
 #[test]

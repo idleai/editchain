@@ -269,9 +269,24 @@ Completed increments:
   uses shared protocol defaults. Existing typography and action goldens remain
   unchanged. Bounded service content previews follow as a separate contract.
 
+- Typed content previews: projection captures tool labels and authored/output
+  roles while normalized children are available. Service preparation records
+  which source operations were shortened, and text comparisons retain a
+  conservative completeness flag through projection. Derived labels, excerpts,
+  and unavailable payloads never claim complete source text. Current rows carry
+  separate typed fields bounded to 4 KiB per summary/output and 256 bytes per
+  tool label, including any ellipsis and preserving UTF-8 boundaries. The service
+  also bounds compatibility summaries, disclosure summaries, authors, and unit
+  titles. Current renderer rows bypass legacy envelope recovery and preserve
+  explicitly authored JSON. Page ingestion rejects oversized typed content
+  before publication. Source identities, full details, and full search payloads
+  remain intact. Projection revision 55 invalidates older row caches. Existing
+  source/summary contracts and new completeness, content precedence, Unicode,
+  and rejected-page regressions cover the boundary.
+
 Remaining work, in dependency order:
 
-1. Publish typed bounded content previews and finish renderer shell lifetime boundaries.
+1. Add a retained byte budget and finish renderer shell lifetime boundaries.
 2. Retire migrated compatibility machinery and optimize measured repeated work.
 
 Validation uses the existing crate, service, renderer, and extension suites.

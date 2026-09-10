@@ -1366,6 +1366,18 @@ impl HistoryAppState {
                 "History page exceeds its requested bounds or makes no progress.",
             ));
         }
+        if window.rows.iter().any(|row| {
+            row.content.as_ref().is_some_and(|content| {
+                !content.is_bounded()
+                    || row.summary.len() > editchain_protocol::MAX_ROW_TEXT_BYTES
+                    || row
+                        .sub_ops
+                        .iter()
+                        .any(|child| child.summary.len() > editchain_protocol::MAX_ROW_TEXT_BYTES)
+            })
+        }) {
+            return Err(invalid("History content exceeds its display bounds."));
+        }
         if self
             .expansion
             .as_ref()
@@ -1653,8 +1665,13 @@ mod tests {
 
     #[test]
     fn invalid_windows_leave_metadata_and_rows_unpublished_until_retry() {
+        let mut oversized = row(0, "node:0", 0);
+        drop(oversized.as_object_mut().unwrap().insert("content".to_owned(), json!({
+            "tool_label": { "text": "x".repeat(editchain_protocol::MAX_TOOL_LABEL_BYTES + 1), "complete": true }
+        })));
         for changes in [
             json!({"rows": []}),
+            json!({"rows": [oversized]}),
             json!({"total": 0}),
             json!({"total": u64::MAX}),
             json!({"sub_op_counts": [500]}),

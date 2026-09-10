@@ -473,7 +473,7 @@ fn manual_collapsed(
         op: Arc::new(op),
         source_time: EffectiveTime::Observed(0),
         parent_override: None,
-        summary: summary.to_string(),
+        content: editchain_project::content::SelectedContent::summary(summary.to_string()),
         kind: kind.to_string(),
         author: "agent".to_string(),
         sub_ops: Vec::new(),

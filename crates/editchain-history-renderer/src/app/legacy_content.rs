@@ -292,21 +292,7 @@ pub(crate) fn display_summary_for_row(row: &RowInput, value: &str) -> String {
     if !toolish {
         return source;
     }
-    match row.outcome.as_str() {
-        "success" => "Completed".to_owned(),
-        "failure" => "Failed".to_owned(),
-        "warning" => "Completed with warnings".to_owned(),
-        "cancelled" => "Cancelled".to_owned(),
-        _ => {
-            let record_role = row.record_role.as_str();
-            let kind = row.source.kind.as_str();
-            if record_role == "action" || kind == "command" {
-                "Tool request".to_owned()
-            } else {
-                "Tool result".to_owned()
-            }
-        }
-    }
+    row.empty_tool_summary()
 }
 
 /// `/^<[A-Za-z][A-Za-z0-9_.:-]*>\s*/` — one leading inert container tag.

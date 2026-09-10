@@ -9,6 +9,7 @@ use serde as _;
 
 pub mod activity;
 pub mod activity_view;
+pub mod content;
 /// Deterministic lane layout for graph rendering.
 pub mod layout;
 /// Deterministic semantic metadata for projected history rows.
@@ -56,6 +57,8 @@ pub enum HistoryNode {
     EditOperation {
         /// The underlying operation.
         op: Arc<Op>,
+        /// Selected display content and its source completeness.
+        content: content::SelectedContent,
         /// Source time of this record; `Unknown` when the source had none.
         source_time: EffectiveTime,
         /// Final parent keys for a derived view, when filtering or Activity
@@ -76,8 +79,8 @@ pub enum HistoryNode {
         /// Final parent keys for a derived view, when filtering or Activity
         /// contraction rewrites topology without changing canonical evidence.
         parent_override: Option<Vec<NodeKey>>,
-        /// Display summary derived from the normalization children.
-        summary: String,
+        /// Display content selected from normalized children before folding.
+        content: content::SelectedContent,
         /// Dominant child kind (e.g. "tool", "message", "command") for styling.
         kind: String,
         /// Author label derived from the children's tags (`human` / `agent` /
@@ -206,10 +209,10 @@ impl HistoryNode {
     #[must_use]
     pub fn summary(&self) -> String {
         match self {
-            Self::EditOperation { op, .. } => op_summary(op),
+            Self::EditOperation { content, .. } => content.summary.clone(),
             Self::CollapsedImport {
-                summary, sub_ops, ..
-            } => combined_summary(summary, sub_ops),
+                content, sub_ops, ..
+            } => combined_summary(&content.summary, sub_ops),
             Self::ExecuteBundle { summary, .. }
             | Self::PlanBundle { summary, .. }
             | Self::WorkGroup { summary, .. } => summary.clone(),
@@ -217,6 +220,24 @@ impl HistoryNode {
                 Payload::Inline(b) => String::from_utf8_lossy(b).to_string(),
                 Payload::Empty | Payload::Blob(_) => commit.oid.to_hex(),
             },
+        }
+    }
+
+    /// Typed display roles. Tool labels are source fields, never inferred from
+    /// the summary string. Expanded metadata and source actions remain separate.
+    #[must_use]
+    pub fn display_content(&self) -> content::DisplayContent {
+        match self {
+            Self::EditOperation { content, .. } => content.display.clone(),
+            Self::CollapsedImport {
+                content, sub_ops, ..
+            } => content.display.with_results(sub_ops),
+            Self::ExecuteBundle { summary, .. }
+            | Self::PlanBundle { summary, .. }
+            | Self::WorkGroup { summary, .. } => content::DisplayContent::summary(summary.clone()),
+            Self::GitCommit { commit, .. } => {
+                content::git_message(&commit.message, commit.oid.to_hex())
+            }
         }
     }
 
@@ -823,6 +844,13 @@ impl HistoryProjection {
     /// virtual graph edges.
     #[must_use]
     pub fn from_ops(ops: Vec<Op>) -> Self {
+        Self::from_preview_ops(ops, &std::collections::HashSet::new())
+    }
+
+    /// Build from display payloads, recording operations that were shortened or
+    /// unavailable before projection. Source operation identities are unchanged.
+    #[must_use]
+    pub fn from_preview_ops(ops: Vec<Op>, incomplete: &std::collections::HashSet<OpId>) -> Self {
         let provider_relations = provider::resolve(&ops);
         let materialization = materialization::Materialization::from_ops(&ops);
         let mut git = GitProjection::new();
@@ -853,7 +881,7 @@ impl HistoryProjection {
         // Build the canonical collapse eagerly so `relationship_notes` and every
         // layout/view/order path see a stable canonical view from the start
         // and reused by every row/layout path.
-        projection.collapsed_projection = Arc::new(projection.collapsed_ops());
+        projection.collapsed_projection = Arc::new(projection.collapsed_ops(incomplete));
         projection
     }
 
@@ -1182,7 +1210,7 @@ impl HistoryProjection {
     /// Bundling never consults timestamps, input proximity, or a per-source
     /// "last row" cursor, and never rewrites stored `Op.parents` or clocks.
     #[must_use]
-    fn collapsed_ops(&self) -> CollapsedProjection {
+    fn collapsed_ops(&self, incomplete: &std::collections::HashSet<OpId>) -> CollapsedProjection {
         // One-to-one cross-record duplicate-pair state for the response_item /
         // event_msg echo family, computed once in a single O(n) pass over the
         // ops. Response_item rows consume one pair slot per matching event_msg
@@ -1371,7 +1399,7 @@ impl HistoryProjection {
                     continue;
                 }
                 let children = children_of.get(&op.id);
-                let summary = collapsed_import_summary(op, children);
+                let content = content::collapsed_import(op, children, incomplete);
                 let kind = collapsed_import_kind(op, children);
                 let author = collapsed_import_author(children);
                 // Semantic readability metadata is derived deterministically
@@ -1388,7 +1416,7 @@ impl HistoryProjection {
                     op: Arc::new(op.clone()),
                     source_time,
                     parent_override: None,
-                    summary,
+                    content,
                     kind,
                     author,
                     sub_ops: Vec::new(),
@@ -1408,6 +1436,7 @@ impl HistoryProjection {
                 // only collapsed import rows can own imported sub-ops.
                 let source_time = source_time_of(op);
                 result.push(HistoryNode::EditOperation {
+                    content: content::operation(op, !incomplete.contains(&op.id)),
                     op: Arc::new(op.clone()),
                     source_time,
                     parent_override: None,
@@ -2887,114 +2916,6 @@ fn source_time_of(op: &Op) -> EffectiveTime {
     }
 }
 
-/// Derive a display summary for a collapsed import op from its normalized
-/// children.
-///
-/// Prefers the most meaningful content: a message's text, then a tool's name,
-/// then a command's content. Falls back to the raw import reference when there
-/// are no children (e.g. structural lines like `custom-title`).
-#[must_use]
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "Only message/tool/command children contribute to the summary; all other kinds are ignored"
-)]
-fn collapsed_import_summary(op: &Op, children: Option<&Vec<&Op>>) -> String {
-    use editchain_core::OpKind;
-    let mut message = String::new();
-    let mut tool = String::new();
-    let mut tool_detail = String::new();
-    // Whether the tool child is a result (Finish, empty name) — its summary is
-    // the content preview, shown WITHOUT the `tool: ` prefix.
-    let mut tool_is_result = false;
-    let mut command = String::new();
-    // A completed command is an output record. Its Content subtitle comes from
-    // the provider's output field and must not repeat the invocation with a
-    // leading `$`.
-    let mut command_is_result = false;
-    let mut file = String::new();
-    if let Some(children) = children {
-        for child in children {
-            match &child.kind {
-                OpKind::Message(m) if message.is_empty() => {
-                    message = message_summary(&payload_text(&m.content));
-                }
-                OpKind::Tool(t) if tool.is_empty() => {
-                    // A tool_result (Finish, empty name) previews its content;
-                    // a tool call shows its name.
-                    if matches!(t.stage, editchain_core::op::ToolStage::Finish)
-                        && payload_text(&t.tool_name).is_empty()
-                    {
-                        tool = tool_result_summary(&payload_text(&t.content));
-                        tool_is_result = true;
-                    } else {
-                        tool = payload_text(&t.tool_name);
-                        tool_detail = tool_invocation_detail(op, t);
-                    }
-                }
-                OpKind::Command(c) if command.is_empty() => {
-                    command_is_result = matches!(c.stage, editchain_core::op::CommandStage::Finish);
-                    command = if command_is_result {
-                        command_output_summary(op, c)
-                    } else {
-                        payload_text(&c.content)
-                    };
-                }
-                OpKind::File(_) if file.is_empty() => {
-                    if let Some(path) = annotated_file_path(child, Some(children)) {
-                        file = format!("file: {path}");
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    if !message.is_empty() {
-        return message;
-    }
-    if !tool.is_empty() {
-        return if tool_is_result {
-            tool
-        } else {
-            let detail = if tool_detail.is_empty() {
-                command.as_str()
-            } else {
-                tool_detail.as_str()
-            };
-            if detail.is_empty() {
-                format!("tool: {tool}")
-            } else {
-                format!("tool: {tool} {detail}")
-            }
-        };
-    }
-    if !command.is_empty() {
-        return if command_is_result {
-            command
-        } else {
-            format!("$ {command}")
-        };
-    }
-    if !file.is_empty() {
-        return file;
-    }
-    // No meaningful children — fall back to a label derived from the raw record.
-    match &op.kind {
-        OpKind::Import(i) => raw_import_label(i),
-        OpKind::ChainStart(cs) => String::from_utf8_lossy(&cs.name).to_string(),
-        OpKind::Actor(a) => payload_text(&a.label),
-        OpKind::Message(m) => payload_text(&m.content),
-        OpKind::Tool(t) => payload_text(&t.tool_name),
-        OpKind::Command(c) => payload_text(&c.content),
-        OpKind::File(f) => format!("file:{}", f.path.0),
-        OpKind::Reflection(r) => payload_text(&r.summary),
-        OpKind::Note(n) => payload_text(&n.content),
-        OpKind::Error(e) => payload_text(&e.message),
-        OpKind::GitCommit(c) => payload_text(&c.message),
-        OpKind::GitLink(l) => format!("git:{}", l.target_oid),
-        OpKind::Unknown(u) => format!("unknown kind={}", u.kind_discriminant),
-    }
-}
-
 /// Resolve the readable payload for one completed command row.
 ///
 /// Current Codex command-completion envelopes retain the command and its
@@ -3280,8 +3201,7 @@ fn compact_tool_text(value: &str) -> String {
 /// annotation — e.g. Claude attachment rows, which carry no file path — fall
 /// through to the raw-record label, preserving existing Claude behavior.
 #[must_use]
-fn annotated_file_path(file_op: &Op, children: Option<&Vec<&Op>>) -> Option<String> {
-    let children = children?;
+fn annotated_file_path(file_op: &Op, children: &[&Op]) -> Option<String> {
     for child in children {
         if let editchain_core::OpKind::Note(note) = &child.kind {
             if note.relationship == NoteRelationship::Explains

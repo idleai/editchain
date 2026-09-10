@@ -72,6 +72,9 @@ impl From<HistoryRow> for RowInput {
 
 impl RowInput {
     pub(crate) fn summary_source(&self) -> &str {
+        if self.source.content.is_some() {
+            return &self.display_summary;
+        }
         if self.source.summary.is_empty() {
             "(no summary)"
         } else {
@@ -80,8 +83,39 @@ impl RowInput {
     }
 
     fn resolve_content(&mut self) {
+        if let Some(content) = &self.source.content {
+            self.tool_label = content
+                .tool_label
+                .as_ref()
+                .map(|label| label.text.clone())
+                .filter(|label| !label.is_empty());
+            self.display_summary = content
+                .display_text()
+                .map(|text| text.text.clone())
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| {
+                    if self.tool_label.is_some() {
+                        self.empty_tool_summary()
+                    } else {
+                        "(no summary)".to_owned()
+                    }
+                });
+            return;
+        }
         self.display_summary = display_summary_for_row(self, self.summary_source());
         self.tool_label = tool_name_from_summary(self.summary_source());
+    }
+
+    pub(super) fn empty_tool_summary(&self) -> String {
+        match self.outcome.as_str() {
+            "success" => "Completed",
+            "failure" => "Failed",
+            "warning" => "Completed with warnings",
+            "cancelled" => "Cancelled",
+            _ if self.record_role == "action" || self.source.kind == "command" => "Tool request",
+            _ => "Tool result",
+        }
+        .to_owned()
     }
 
     pub(crate) fn lane(&self) -> u32 {
