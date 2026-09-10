@@ -1,11 +1,15 @@
-//! Editchain ingestion CLI, Git reconciliation, and segment storage.
+//! Native `EditChain` application: ingestion, history queries, and framed stdio.
+//!
+//! The two executables share the [`commands`] and [`history`] facades. [`Server`]
+//! adapts protocol requests to that history backend. Persistence belongs to
+//! `editchain_store`; reconciliation and transport remain internal modules.
 
-/// CLI command implementations.
 pub mod commands;
-/// Read-only Git relationship planning over canonical provider evidence.
-pub mod reconcile;
-/// Segment file storage.
-pub mod segment;
+pub mod history;
+mod reconcile;
+mod transport;
+
+pub use transport::Server;
 
 use ctrlc as _;
 use serde as _;

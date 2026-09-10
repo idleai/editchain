@@ -387,12 +387,12 @@ contracts pass, including missing directories, corrupt bytes, unsupported
 addresses, preview limits, and idempotent writes.
 
 The shared native backend is now exposed under
-`editchain_vscode_service::history`; CLI imports and `prepare-view` call this
+`editchain_node::history`; CLI imports and `prepare-view` call this
 namespace directly. A separate transport module owns framed-request dispatch.
 It uses backend methods and read accessors rather than reaching into private
 workspace fields. Explicit refresh identity generation belongs to
 `Workspace::refresh`, so native callers receive the same cache-bypass and token
-retirement semantics. Root-level exports retain the existing Rust API and the
+retirement semantics. History entry points have an explicit namespace, and the
 service executable keeps its name. Existing snapshot, refresh, search, detail,
 and import regressions pass with the full lint suite.
 
@@ -422,27 +422,74 @@ production and unit-test function bodies retain identical Rust tokens. Native
 and WASM checks, 44 browser/host tests, and both real VS Code renderer tests pass
 with the regenerated production assets and rebuilt native service.
 
-This ownership follow-up retains all 11 workspace crates and their existing
+That ownership follow-up retained all 11 workspace packages and their existing
 native/WASM dependency boundaries. Shared blob storage has one implementation,
 CLI history preparation has an explicit backend API, and the service, project,
 and renderer now group their largest modules by responsibility. It does not
 claim a measured runtime or build-time improvement from moving modules.
 
-The subsequent package consolidation targets eight workspace packages. The
+The subsequent package consolidation reaches eight workspace packages. The
 codec package is now part of `editchain-store`, with an explicit `format` API
 for operation encoding and supported EC02/EC03 formats. Page-scanner types are
 internal to storage; cursor inspection used only by scanner tests is test-only.
 All frame, page, corruption, and property tests moved with the implementation.
 In-repo callers now use `editchain_store::format`; the old codec package path
-is retired. This first merge passes the full lint suite, with ten packages and
+is retired. This first merge passed the full lint suite, with ten packages and
 19 direct production dependencies between workspace packages.
 
 The index package is now private to the history backend's search module.
 Deterministic chunking and the Tantivy index moved with all their tests; raw
 candidate identities are inspected only within that module's test boundary.
-Callers retain the opaque history-search interface. This second merge passes
+Callers retain the opaque history-search interface. This second merge passed
 the full lint suite, with nine packages and 17 direct production dependencies
 between workspace packages.
+
+The final merge moves the history backend and stdio adapter into
+`editchain-node`, which builds both `editchain` and `editchain-vscode-service`.
+The CLI remains the package's default executable. Build commands and the
+existing CI job now target that package; both executable names, CLI arguments,
+EC02/EC03 formats, protocol version 2, and snapshot revision 56 are preserved.
+The native executables share the package's dependency set and build boundary.
+Core, Git, project, protocol, and renderer package contents are unchanged by
+this consolidation; all 312 external locked packages retain their versions
+and checksums.
+
+The resulting packages are core, store, import, Git, project, protocol, node,
+and history-renderer. Public API migration is explicit:
+
+| Previous surface | Retained or retired surface |
+| --- | --- |
+| Codec frame/page API | `editchain_store::format` retains `decode_op`, `encode_op`, `encoded_op_len`, `detect_format`, `decode_ec03`, `encode_ec03`, `Ec03Frame`, `FrameFormat`, `EC03_FORMAT_VERSION`, `decode_page`, `encode_page`, `Page`, `PageEncodeError`, `Record`, and `MAX_RECORD_BYTES`. |
+| Codec implementation exports | The `frame`, `page`, and `scan` modules, `EC03_MAGIC`, `PAGE_MAGIC`, `ScanItem`, `RecordRef`, `ScanErrorKind`, `ScanError`, and `PageScanner` are internal. |
+| Index package API | `ChunkOptions`, `TextChunks`, `chunk_text`, `DocumentId`, `SearchDocument`, `LexicalHit`, `LexicalIndexBuilder`, `LexicalIndex`, `LexicalQuery`, `CandidatePage`, and `MAX_CANDIDATES` are internal to history search. Raw `SearchIndexState::index` inspection is test-only. |
+| Service backend API | `editchain_node::history` retains `Workspace`, `HistoryWindowOptions`, `OpenDiagnostics`, `GitReadStats`, `BlobHydrationStats`, `RenderSnapshotReport`, `SearchIndexState`, `build_lexical_index`, `prepare_render_snapshot`, `parse_git_oid`, `parse_repository_id`, and `resolve_git_commit`, with their existing public methods and fields. |
+| Service root and storage aliases | `Server` moves to `editchain_node::Server`. Duplicate root history exports are retired. `BlobResolver` callers use `editchain_store::BlobReader`; `BlobResolution` and `ChainReadStats` are named through store. Bulk `hydrate_blob_payloads` is test-only. |
+| Node implementation exports | `commands::import`, `commands::prepare_view`, their handlers, and `reconcile` are internal. The existing public CLI arguments/dispatch facade remains. The `segment::SegmentStore` alias is retired; callers use `editchain_store::SegmentStore`. |
+
+Other package APIs retain their existing surfaces. No compatibility package or
+wildcard re-export preserves a retired package path. The before/after inventory
+compares the accepted baseline `8b252e2` with the completed consolidation:
+
+| Measure | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| Workspace packages | 11 | 8 | -3 |
+| Direct production dependencies between workspace packages | 23 | 13 | -10 |
+| Explicit public definitions | 1,343 | 1,284 | -59 |
+| Public re-export statements | 53 | 51 | -2 |
+| Production Rust code lines | 33,178 | 33,148 | -30 |
+| Named Rust test declarations | 753 | 753 | 0 |
+
+Public definitions count explicit `pub` types, fields, functions/methods,
+constants, traits, and modules in non-test source. They exclude restricted
+visibility and macro-generated declarations. Re-export counts are statements,
+not the number of names exported; the migration table records their meaning.
+Rust code lines are measured with cloc after syntax-based removal of tests,
+including recursively nested test modules, and exclude blank/comment lines.
+The scope is workspace Rust source; the standalone exporter, TypeScript,
+generated assets, and documentation are excluded. All 753 named test
+declarations, including property tests, remain; test/support Rust code grows
+from 32,959 to 33,015 lines through module and fixture migration. This is a
+reduction in package and API boundaries with nearly unchanged code volume.
 
 The planned refactor increments are complete. EC02 and historical operations
 remain readable; the documented protocol, repository-qualified row keys, and

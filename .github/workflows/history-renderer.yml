@@ -62,7 +62,7 @@ jobs:
 
       - name: Build native service and fixture importer (release)
         timeout-minutes: 25
-        run: cargo build --release -p editchain-vscode-service -p editchain-node
+        run: cargo build --release -p editchain-node --bins
 
       - name: Build deterministic history fixture
         run: |

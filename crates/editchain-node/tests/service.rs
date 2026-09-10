@@ -10,6 +10,9 @@
 
 // Crate-level dependency markers (used by Cargo for feature resolution).
 use blake3 as _;
+use clap as _;
+use ctrlc as _;
+use dirs as _;
 use editchain_git as _;
 use editchain_import as _;
 use editchain_project as _;
@@ -25,15 +28,15 @@ use editchain_core::{
     Payload, ReflectionOp, ScopeRef, SessionId, Tags, ToolOp, ToolStage,
 };
 use editchain_import::{derive_path_id, BlobSink as _};
+use editchain_node::history::{
+    parse_git_oid, parse_repository_id, prepare_render_snapshot, resolve_git_commit,
+    HistoryWindowOptions, Workspace,
+};
 use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
 use editchain_protocol::{
     ActivityBundleKind, FileChangeDto, FileDiffDto, HistoryRow, HistoryWindow, Request,
     RequestBody, ResponseBody,
-};
-use editchain_vscode_service::{
-    parse_git_oid, parse_repository_id, prepare_render_snapshot, resolve_git_commit,
-    HistoryWindowOptions, Workspace,
 };
 use std::io::{Read, Write};
 use std::path::Path;
@@ -124,12 +127,12 @@ fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() 
 
     // Direct callers must materialize the pinned source before publishing an
     // index too; a cached workspace initially has no decoded source corpus.
-    let direct = editchain_vscode_service::build_lexical_index(&mut cached).unwrap();
+    let direct = editchain_node::history::build_lexical_index(&mut cached).unwrap();
     let found = direct.find(&mut cached, "snapshot", 10).unwrap();
     assert_eq!(found.matches.len(), 2);
     assert!(!found.more);
 
-    let mut materialized = editchain_vscode_service::Server::new();
+    let mut materialized = editchain_node::Server::new();
     materialized.workspace =
         Some(Workspace::open(tmp.path().to_str().unwrap(), ".editchain").unwrap());
     let before_search = materialized
@@ -183,7 +186,7 @@ fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() 
         serde_json::to_value(after_search).unwrap()
     );
 
-    let mut server = editchain_vscode_service::Server::new();
+    let mut server = editchain_node::Server::new();
     let open = server
         .handle(&Request {
             id: 1,
@@ -274,7 +277,7 @@ fn recovered_blob_invalidates_cached_rows_and_lazy_search_without_a_chain_append
     page.add_record(0, editchain_store::format::encode_op(&op).unwrap());
     write_page(&chain, &page);
     let before = prepare_render_snapshot(tmp.path(), Path::new(".editchain")).unwrap();
-    let mut server = editchain_vscode_service::Server::new();
+    let mut server = editchain_node::Server::new();
     server.workspace = Some(Workspace::open(tmp.path().to_str().unwrap(), ".editchain").unwrap());
     let _: editchain_core::BlobRef = store_blob(&chain, bytes);
     let error = server
@@ -404,7 +407,7 @@ fn msg_op(node: u64, seq: u64, text: &[u8]) -> Op {
 
 #[test]
 fn invalid_search_limit_returns_a_typed_error_without_building_an_index() {
-    let mut server = editchain_vscode_service::Server::new();
+    let mut server = editchain_node::Server::new();
     server.workspace = Some(Workspace::from_projection(HistoryProjection::from_ops(
         vec![msg_op(1, 1, b"needle")],
     )));
@@ -485,7 +488,7 @@ fn imported_agent_edit_rows_materialize_recorded_snippets_without_fabricating_fi
     page.add_record(0, editchain_store::format::encode_op(&edit).unwrap());
     write_page(&chain_dir, &page);
 
-    let mut server = editchain_vscode_service::Server::new();
+    let mut server = editchain_node::Server::new();
     let open = server
         .handle(&Request {
             id: 1,
@@ -613,7 +616,7 @@ fn agent_edit_uses_exact_session_git_baseline_when_available() {
     }
     write_page(&chain_dir, &page);
 
-    let mut server = editchain_vscode_service::Server::new();
+    let mut server = editchain_node::Server::new();
     let open = server
         .handle(&Request {
             id: 1,
@@ -756,7 +759,7 @@ fn legacy_codex_multi_file_record_recovers_every_path_from_raw_evidence() {
     }
     write_page(&chain_dir, &page);
 
-    let mut server = editchain_vscode_service::Server::new();
+    let mut server = editchain_node::Server::new();
     let open = server
         .handle(&Request {
             id: 1,
@@ -868,7 +871,7 @@ fn git_commit_rows_expand_to_files_and_materialize_exact_native_diff_sides() {
     let commit_oid = git_stdout(&repo, &["rev-parse", "HEAD"]);
     std::fs::create_dir_all(repo.join(".editchain")).expect("chain directory");
 
-    let mut server = editchain_vscode_service::Server::new();
+    let mut server = editchain_node::Server::new();
     let open = server
         .handle(&Request {
             id: 1,
@@ -1070,7 +1073,7 @@ fn find_in_history_protocol_path_resolves_visible_rows_and_reports_truncation() 
     page.add_record(0, editchain_store::format::encode_op(&second).unwrap());
     write_page(&chain_dir, &page);
 
-    let mut server = editchain_vscode_service::Server::new();
+    let mut server = editchain_node::Server::new();
     let open = server
         .handle(&Request {
             id: 1,
@@ -1153,7 +1156,7 @@ fn find_in_history_distinguishes_colliding_operation_and_git_ids() {
     page.add_record(0, editchain_store::format::encode_op(&message).unwrap());
     write_page(&repo.join(".editchain"), &page);
 
-    let mut server = editchain_vscode_service::Server::new();
+    let mut server = editchain_node::Server::new();
     let open = server
         .handle(&Request {
             id: 1,
@@ -1244,7 +1247,7 @@ fn git_resolve_uses_exact_string_ids_and_rejects_invalid_input() {
     assert_eq!(details.repository.as_deref(), Some(repo_str.as_str()));
 
     // The protocol path must return Error for invalid IDs, never coerce them.
-    let mut server = editchain_vscode_service::Server::new();
+    let mut server = editchain_node::Server::new();
     let open = server
         .handle(&Request {
             id: 1,

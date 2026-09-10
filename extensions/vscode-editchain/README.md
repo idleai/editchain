@@ -16,7 +16,7 @@ Prerequisites:
 From the repository root:
 
 ```sh
-cargo build -p editchain-vscode-service
+cargo build -p editchain-node --bin editchain-vscode-service
 
 cd extensions/vscode-editchain
 npm ci

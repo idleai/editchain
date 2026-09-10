@@ -12,6 +12,10 @@
     reason = "Binary stdio loop; frame offsets and lengths are bounded by the input buffer"
 )]
 
+use clap as _;
+use ctrlc as _;
+use dirs as _;
+use editchain_import as _;
 use std::io::{self, Read, Write};
 
 // Crate-level dependency markers (used by Cargo for feature resolution).
@@ -24,12 +28,10 @@ use serde as _;
 use tantivy as _;
 
 #[cfg(test)]
-use editchain_import as _;
-#[cfg(test)]
 use tempfile as _;
 
+use editchain_node::Server;
 use editchain_protocol::{Request, Response, ServiceError, MAX_REQUEST_FRAME_BYTES};
-use editchain_vscode_service::Server;
 
 /// Read a single length-prefixed frame from a reader.
 ///

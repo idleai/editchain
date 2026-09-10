@@ -618,16 +618,19 @@ dependencies = [
 name = "editchain-node"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "clap",
  "ctrlc",
  "dirs",
  "editchain-core",
  "editchain-git",
  "editchain-import",
+ "editchain-project",
+ "editchain-protocol",
  "editchain-store",
- "editchain-vscode-service",
  "serde",
  "serde_json",
+ "tantivy",
  "tempfile",
 ]
 
@@ -659,23 +662,6 @@ dependencies = [
  "postcard",
  "proptest",
  "serde",
- "tempfile",
-]
-
-[[package]]
-name = "editchain-vscode-service"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "editchain-core",
- "editchain-git",
- "editchain-import",
- "editchain-project",
- "editchain-protocol",
- "editchain-store",
- "serde",
- "serde_json",
- "tantivy",
  "tempfile",
 ]
 

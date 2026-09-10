@@ -32,10 +32,11 @@ pub struct BlobHydrationStats {
 /// with inline content; every other blob stays a [`Payload::Blob`] reference
 /// and is counted in the returned stats. Blob references with no inline
 /// representation (`FileEdit::Blob`) are validated and preserved unchanged.
-/// Full detail reads use this adapter; display and search select their own
-/// required fields before reading payloads.
+/// This fixture exercises the per-kind hydration used by full detail reads;
+/// display and search select their required fields before reading payloads.
 #[must_use]
-pub fn hydrate_blob_payloads(ops: &mut [Op], resolver: &BlobResolver) -> BlobHydrationStats {
+#[cfg(test)]
+pub(super) fn hydrate_blob_payloads(ops: &mut [Op], resolver: &BlobResolver) -> BlobHydrationStats {
     let mut stats = BlobHydrationStats::default();
     for op in ops {
         hydrate_kind(&mut op.kind, resolver, &mut stats);

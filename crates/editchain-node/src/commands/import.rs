@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 
 use super::Provider;
 use crate::reconcile::{reconcile_git_links, GitReconciliation, SessionBaselines};
-use crate::segment::SegmentStore;
 use editchain_import::batch::ImportBatch;
 use editchain_import::codex::{import_codex, CodexDiscoveryRequest, HelperCommand};
 use editchain_import::import::import_claude_code;
@@ -15,6 +14,7 @@ use editchain_import::model::{DiscoveryRequest, ImportOptions};
 use editchain_import::sink::{
     BlobSink, CursorStore, FsBlobSink, FsCursorStore, MemoryBlobSink, MemoryCursorStore,
 };
+use editchain_store::SegmentStore;
 
 /// Default Codex helper program, resolved from `PATH` when unconfigured.
 const DEFAULT_CODEX_HELPER: &str = "codex-session-exporter";
@@ -35,7 +35,7 @@ const DEFAULT_CODEX_HELPER: &str = "codex-session-exporter";
     clippy::print_stdout,
     reason = "CLI command reports durable import outcomes to stdout"
 )]
-pub fn run(
+pub(super) fn run(
     request: super::ImportCommand,
     options: &ImportOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -164,10 +164,8 @@ pub fn run(
         } else {
             std::env::current_dir()?.join(&chain_path)
         };
-        let snapshot = editchain_vscode_service::history::prepare_render_snapshot(
-            &workspace_path,
-            &snapshot_chain_path,
-        );
+        let snapshot =
+            crate::history::prepare_render_snapshot(&workspace_path, &snapshot_chain_path);
         match snapshot {
             Ok(snapshot) => println!(
                 "Render snapshot {}: {} rows at {}",

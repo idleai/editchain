@@ -21,8 +21,10 @@ mod snapshot;
 
 pub(crate) use details::resolved_object_from_commit;
 use editchain_store::OpRecordLocation;
-pub use editchain_store::{BlobReader as BlobResolver, BlobResolution, ChainReadStats};
-pub use payloads::{hydrate_blob_payloads, BlobHydrationStats};
+pub(crate) use editchain_store::{BlobReader as BlobResolver, BlobResolution, ChainReadStats};
+#[cfg(test)]
+use payloads::hydrate_blob_payloads;
+pub use payloads::BlobHydrationStats;
 pub use search::{build_lexical_index, SearchIndexState};
 pub use snapshot::RenderSnapshotReport;
 use snapshot::{RenderSnapshot, SnapshotBuilder, SnapshotIdentity, SnapshotManifestData};

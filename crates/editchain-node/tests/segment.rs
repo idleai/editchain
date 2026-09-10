@@ -1,18 +1,22 @@
 //! Segment store tests.
 
+use blake3 as _;
 use clap as _;
 use ctrlc as _;
 use dirs as _;
 use editchain_core as _;
 use editchain_git as _;
 use editchain_import as _;
-use editchain_vscode_service as _;
+use editchain_node as _;
+use editchain_project as _;
+use editchain_protocol as _;
 use serde as _;
 use serde_json as _;
+use tantivy as _;
 
-use editchain_node::segment::SegmentStore;
 use editchain_store::format::Page;
 use editchain_store::CanonicalChain;
+use editchain_store::SegmentStore;
 
 #[test]
 fn open_creates_directory() {

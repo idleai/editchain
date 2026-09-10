@@ -9,7 +9,7 @@ The primary UI lives in [`extensions/vscode-editchain/`](./extensions/vscode-edi
 Build the native service and the extension:
 
 ```sh
-cargo build -p editchain-vscode-service
+cargo build -p editchain-node --bin editchain-vscode-service
 cd extensions/vscode-editchain
 npm install
 npm run compile

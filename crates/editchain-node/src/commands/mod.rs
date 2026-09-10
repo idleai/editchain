@@ -1,7 +1,7 @@
 //! CLI command implementations.
 
-pub mod import;
-pub mod prepare_view;
+mod import;
+mod prepare_view;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

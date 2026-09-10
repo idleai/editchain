@@ -17,7 +17,7 @@ use editchain_store::CanonicalChain;
 
 /// Optional historical session-baseline inference, distinct from exact commit output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionBaselines {
+pub(crate) enum SessionBaselines {
     /// Reconcile successful produced-commit evidence only.
     Disabled,
     /// Also infer top-level Claude session baselines from covered branch reflogs.
@@ -26,11 +26,11 @@ pub enum SessionBaselines {
 
 /// Missing links proposed by one complete reconciliation pass.
 #[derive(Debug)]
-pub struct GitReconciliation {
+pub(crate) struct GitReconciliation {
     /// Inferred Claude session baselines, carrying the existing inferred tag.
-    pub base_links: Vec<Op>,
+    pub(crate) base_links: Vec<Op>,
     /// Exact links supported by successful provider command completion output.
-    pub produced_links: Vec<Op>,
+    pub(crate) produced_links: Vec<Op>,
 }
 
 /// Reconcile accepted stored and newly captured operations without writing.
@@ -45,7 +45,7 @@ pub struct GitReconciliation {
 ///
 /// Returns canonical chain, payload-store, repository discovery, or repository
 /// open errors. Incomplete discovery cannot establish cross-repository uniqueness.
-pub fn reconcile_git_links(
+pub(crate) fn reconcile_git_links(
     workspace: &Path,
     chain: &Path,
     imported: &[Op],
@@ -108,9 +108,9 @@ fn reconciliation_ops(chain: &Path, imported: &[Op]) -> Result<Vec<Op>, std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::segment::SegmentStore;
     use editchain_store::format::encode_op;
     use editchain_store::format::Page;
+    use editchain_store::SegmentStore;
 
     #[test]
     fn reconciliation_and_viewer_share_conflict_admission() {
@@ -155,11 +155,9 @@ mod tests {
             }
             store.append_page(&next_page).unwrap();
             let reconciled = reconciliation_ops(&chain, &[]).unwrap();
-            let viewer = editchain_vscode_service::history::Workspace::open(
-                dir.path().to_str().unwrap(),
-                ".editchain",
-            )
-            .unwrap();
+            let viewer =
+                crate::history::Workspace::open(dir.path().to_str().unwrap(), ".editchain")
+                    .unwrap();
             assert_eq!(reconciled, vec![stable.clone()]);
             assert_eq!(viewer.projection().ops(), reconciled);
             assert_eq!(viewer.diagnostics.chain.quarantined, 2);

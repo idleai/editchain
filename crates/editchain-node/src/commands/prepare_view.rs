@@ -13,8 +13,8 @@ use std::path::PathBuf;
     clippy::print_stdout,
     reason = "CLI command consumes paths and reports the generated artifact"
 )]
-pub fn run(workspace: PathBuf, chain: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let report = editchain_vscode_service::history::prepare_render_snapshot(&workspace, &chain)?;
+pub(super) fn run(workspace: PathBuf, chain: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let report = crate::history::prepare_render_snapshot(&workspace, &chain)?;
     println!(
         "Render snapshot {}: {} rows ({} top-level), {} bytes at {}",
         if report.reused { "reused" } else { "generated" },
