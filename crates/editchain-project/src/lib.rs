@@ -8,6 +8,7 @@
 use serde as _;
 
 pub mod activity;
+pub mod activity_view;
 /// Deterministic lane layout for graph rendering.
 pub mod layout;
 /// Deterministic semantic metadata for projected history rows.
@@ -739,7 +740,7 @@ pub struct HistoryProjection {
     /// `lifted_parent_keys`, layout, Activity view, windowed edges) reads a stable
     /// canonical view without rebuilding it per row. The collapse is ~linear in
     /// op count and cheap relative to the per-row consumers that reuse it.
-    collapsed_projection: CollapsedProjection,
+    collapsed_projection: Arc<CollapsedProjection>,
 }
 
 /// Result of collapsing raw imports into top-level history rows.
@@ -792,6 +793,8 @@ struct CollapsedProjection {
     /// used to decide whether a lifted/raw parent resolves to a rendered row).
     /// Built once here so per-row paths (lift/layout) don't rebuild it each call.
     present: std::collections::HashSet<String>,
+    /// Inert relationship evidence with no resolvable projected anchor.
+    unresolved_relations: std::collections::HashSet<OpId>,
 }
 
 impl HistoryProjection {
@@ -802,7 +805,7 @@ impl HistoryProjection {
             ops: Vec::new(),
             git: GitProjection::new(),
             relationship_notes: HashMap::new(),
-            collapsed_projection: CollapsedProjection::default(),
+            collapsed_projection: Arc::default(),
         }
     }
 
@@ -831,12 +834,12 @@ impl HistoryProjection {
             ops,
             git,
             relationship_notes,
-            collapsed_projection: CollapsedProjection::default(),
+            collapsed_projection: Arc::default(),
         };
         // Build the canonical collapse eagerly so `relationship_notes` and every
         // layout/view/order path see a stable canonical view from the start
         // and reused by every row/layout path.
-        projection.collapsed_projection = projection.collapsed_ops();
+        projection.collapsed_projection = Arc::new(projection.collapsed_ops());
         projection
     }
 
@@ -890,27 +893,17 @@ impl HistoryProjection {
         self.ordered_nodes()
     }
 
-    /// Returns the fixed VS Code Activity-view nodes (newest-first).
+    /// Returns Activity candidates before presentation grouping (newest-first).
     ///
     /// Timestamp-less metadata and semantic trace rows are removed, with their
     /// causal edges reconnected to the nearest visible ancestors. Dated
     /// structural relationship rows remain visible. The result keeps the same
-    /// canonical order as [`Self::nodes`].
+    /// canonical order as [`Self::nodes`]. Advanced pass tests may use these
+    /// candidates directly. Normal consumers should call [`Self::build_activity_view`]
+    /// for complete grouping, expansion, and source-to-row ownership.
     #[must_use]
     pub fn activity_nodes(&self) -> Vec<HistoryNode> {
-        let nodes = self.ordered_nodes();
-        let graph = self.resolved_graph(&nodes);
-        let mut structural = self.structural_row_keys(&nodes);
-        // Preserve dated producing rows even when their commit is unavailable.
-        structural.extend(
-            self.git
-                .links
-                .values()
-                .flatten()
-                .filter(|link| link.kind == GitLinkKind::ProducedBy)
-                .filter_map(|link| self.visible_op_id(link.source).map(NodeKey::Op)),
-        );
-        view::apply(nodes, &graph, &structural)
+        self.activity_nodes_with_omissions().0
     }
 
     /// Resolve an operation id to the canonical op id of the visible top-level
@@ -1455,11 +1448,21 @@ impl HistoryProjection {
             "every ordinary op must render as a row or resolve through the canonical representative map"
         );
 
+        let unresolved_relations = self
+            .ops
+            .iter()
+            .filter(|op| {
+                is_hidden_relation_fact(op)
+                    && canonical_op_id(op.id, &representative, &present).is_none()
+            })
+            .map(|op| op.id)
+            .collect();
         CollapsedProjection {
             present,
             nodes: result,
             representative,
             canonical_notes,
+            unresolved_relations,
         }
     }
 

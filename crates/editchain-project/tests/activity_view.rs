@@ -14,6 +14,133 @@ use editchain_core::{
 };
 use editchain_project::HistoryProjection;
 
+struct NoDetails;
+
+impl editchain_project::activity_view::ActivityPresentation for NoDetails {
+    type Row = ();
+
+    fn activity(&self, _: &editchain_project::HistoryNode) {}
+
+    fn details(&self, _: &editchain_project::HistoryNode) -> Vec<()> {
+        Vec::new()
+    }
+}
+
+#[test]
+fn complete_view_retains_explicit_dispositions_for_every_accepted_source() {
+    use editchain_project::activity_view::{OmissionReason, SourceDisposition};
+    use editchain_project::NodeKey;
+
+    let visible = msg_op(70, 1, 1_000, None, "visible");
+    let undated = msg_op(70, 2, 0, Some(visible.id), "undated");
+    let trace = Op {
+        kind: OpKind::Import(ImportOp {
+            raw_ref: Payload::Inline(br#"{"type":"response_item","payload":{}}"#.to_vec()),
+            raw_hash: None,
+        }),
+        tags: Tags::IMPORT,
+        ..msg_op(70, 3, 3_000, None, "trace")
+    };
+    let unresolved = subagent_note(OpId::new(NodeId(998), 0, 1), OpId::new(NodeId(999), 0, 1));
+    let sources = vec![
+        visible.clone(),
+        undated.clone(),
+        trace.clone(),
+        unresolved.clone(),
+    ];
+    let projection = HistoryProjection::from_ops(sources.clone());
+    let view = projection.build_activity_view(|_| true, &NoDetails);
+    assert_eq!(
+        view.source_disposition(NodeKey::Op(visible.id)),
+        Some(SourceDisposition::Row(0))
+    );
+    for (source, reason) in [
+        (undated.id, OmissionReason::UnknownTime),
+        (trace.id, OmissionReason::Trace),
+        (unresolved.id, OmissionReason::UnresolvedRelationship),
+    ] {
+        assert_eq!(
+            view.source_disposition(NodeKey::Op(source)),
+            Some(SourceDisposition::Omitted(reason))
+        );
+        assert_eq!(view.source_row(NodeKey::Op(source)), None);
+    }
+    assert_eq!(
+        view.source_disposition(NodeKey::Op(OpId::new(NodeId(500), 0, 1))),
+        None
+    );
+    assert_eq!(projection.ops(), &sources);
+}
+
+#[test]
+fn complete_view_repository_selection_preserves_qualified_identity_and_graph() {
+    use editchain_core::{GitAvailability, GitCommitEntity, GitObjectFormat, GitSignature};
+    use editchain_project::activity_view::{OmissionReason, SourceDisposition};
+    use editchain_project::NodeKey;
+
+    let signature = GitSignature {
+        name: Payload::Empty,
+        email: Payload::Empty,
+        when: 1,
+    };
+    let visible = GitCommitEntity {
+        repository: RepositoryId(1),
+        object_format: GitObjectFormat::Sha1,
+        oid: GitOid::from_sha1([7; 20]),
+        imported_record: None,
+        availability: GitAvailability::LiveOnly,
+        tree: GitOid::from_sha1([8; 20]),
+        parents: Vec::new(),
+        author: signature.clone(),
+        committer: signature,
+        authored_at: 1,
+        committed_at: 1,
+        message: Payload::Inline(b"commit".to_vec()),
+        imported_refs: Vec::new(),
+        live_refs: Vec::new(),
+        changed_paths: Vec::new(),
+    };
+    let hidden = GitCommitEntity {
+        repository: RepositoryId(2),
+        ..visible.clone()
+    };
+    let source = msg_op(80, 1, 2_000, None, "based on a hidden repository");
+    let link = Op {
+        id: OpId::new(NodeId(80), 0, 2),
+        clock: Clock::None,
+        kind: OpKind::GitLink(GitLink {
+            source: source.id,
+            target_repo: hidden.repository,
+            target_oid: hidden.oid,
+            kind: GitLinkKind::BasedOn,
+        }),
+        ..source.clone()
+    };
+    let mut projection = HistoryProjection::from_ops(vec![source.clone(), link]);
+    projection.merge_git_commits(vec![visible.clone(), hidden.clone()]);
+    let view = projection.build_activity_view(|id| id == RepositoryId(1), &NoDetails);
+    assert!(view.source_row(NodeKey::Git(visible.key())).is_some());
+    assert_eq!(
+        view.source_disposition(NodeKey::Git(hidden.key())),
+        Some(SourceDisposition::Omitted(OmissionReason::HiddenRepository))
+    );
+    assert!(view.graph().parents(NodeKey::Op(source.id)).is_empty());
+    assert!(!view.graph().keys().contains(&NodeKey::Git(hidden.key())));
+    let layout = view.ensure_layout();
+    assert!(layout
+        .parents
+        .get(&source.id.to_string())
+        .is_none_or(Vec::is_empty));
+    // The built view owns its original observation after its source projection
+    // receives a later repository update.
+    projection.merge_git_commits(vec![GitCommitEntity {
+        oid: GitOid::from_sha1([9; 20]),
+        ..visible
+    }]);
+    assert_eq!(view.entries().len(), 2);
+    assert_eq!(view.graph().keys().len(), 2);
+}
+
 /// Build a message op with a given clock and parent.
 fn msg_op(node: u64, seq: u64, clock_ms: u64, parent: Option<OpId>, text: &str) -> Op {
     Op {

@@ -29,6 +29,126 @@ use editchain_project::meta::NodeMeta;
 use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use editchain_project::{EffectiveTime, HistoryNode, HistoryProjection};
 
+struct IdentityPresentation;
+
+impl editchain_project::activity_view::ActivityPresentation for IdentityPresentation {
+    type Row = editchain_project::NodeKey;
+
+    fn activity(&self, node: &HistoryNode) -> Self::Row {
+        node.key()
+    }
+
+    fn details(&self, node: &HistoryNode) -> Vec<Self::Row> {
+        node.sub_ops()
+            .iter()
+            .map(|op| editchain_project::NodeKey::Op(op.id))
+            .collect()
+    }
+}
+
+#[test]
+fn complete_activity_view_shares_tree_coordinates_and_source_owners() {
+    let mut ops = linear_chain(
+        1,
+        "request",
+        &[
+            row_spec(40, 2, "tool", Some("completed"), 7),
+            row_spec(40, 3, "tool", Some("completed"), 7),
+            row_spec(40, 4, "tool", Some("completed"), 7),
+            row_spec(40, 5, "file", None, 7),
+            row_spec(40, 6, "message", None, 7),
+        ],
+    );
+    let tool_id = OpId::new(NodeId(40), 0, 40);
+    ops.push(world_state_import_op(40, 70, tool_id));
+    let projection = HistoryProjection::from_ops(ops.clone());
+    let view = projection.build_activity_view(|_| true, &IdentityPresentation);
+    let entries = view.entries();
+    assert_eq!(entries.len(), 3, "answer / work / request");
+    assert!(view.layout().is_none(), "layout remains deferred");
+    let group = &entries[1];
+    assert_eq!(group.node().activity_kind(), ActivityKind::Work);
+    assert_eq!(group.node().represented_activity_count(), 4);
+    assert_eq!(
+        group.children(0).count(),
+        3,
+        "edit, state-bearing tool, and nested execute bundle"
+    );
+    let nested = group
+        .descendants()
+        .iter()
+        .position(|row| {
+            *row.content() == editchain_project::NodeKey::Op(OpId::new(NodeId(40), 0, 30))
+        })
+        .expect("nested bundle");
+    let nested_row = &group.descendants()[nested];
+    assert_eq!(nested_row.depth(), 1);
+    assert_eq!(
+        nested_row.descendant_count(),
+        2,
+        "the two earlier tools stay bundled"
+    );
+    assert_eq!(group.children(nested + 1).count(), 2);
+    for (index, row) in group.descendants().iter().enumerate().skip(nested + 1) {
+        assert_eq!(row.parent_relative(), nested + 1);
+        assert_eq!(row.depth(), 2);
+        assert_eq!(group.children(index + 1).count(), 0);
+    }
+    assert_eq!(view.starts(), &[0, 1, 8, 9]);
+    assert_eq!(view.expanded_total(), 9);
+    assert_eq!(view.sub_op_counts(), vec![0, 6, 0]);
+    assert_eq!(
+        view.expansion_spans(),
+        vec![
+            editchain_project::activity_view::ExpansionSpan {
+                row: 1,
+                descendant_count: 6
+            },
+            editchain_project::activity_view::ExpansionSpan {
+                row: 3,
+                descendant_count: 1
+            },
+            editchain_project::activity_view::ExpansionSpan {
+                row: 5,
+                descendant_count: 2
+            },
+        ]
+    );
+    for op in &ops {
+        assert!(
+            view.source_disposition(editchain_project::NodeKey::Op(op.id))
+                .is_some(),
+            "accepted source {} has an owner",
+            op.id
+        );
+    }
+    assert_eq!(
+        view.source_row(editchain_project::NodeKey::Op(tool_id)),
+        Some(1)
+    );
+    let layout = view.ensure_layout();
+    for key in view.graph().keys() {
+        assert_eq!(
+            layout
+                .parents
+                .get(&key.to_string())
+                .cloned()
+                .unwrap_or_default(),
+            view.graph()
+                .parents(*key)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(std::ptr::eq(layout, view.ensure_layout()));
+    assert_eq!(
+        projection.ops(),
+        &ops,
+        "view construction preserves every source envelope"
+    );
+}
+
 /// Raw JSONL for an import row with an optional structured tool/command status.
 fn raw_line(status: Option<&str>) -> String {
     match status {

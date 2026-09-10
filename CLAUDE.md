@@ -51,7 +51,7 @@ npm run test:harness
 ## Architecture
 
 EditChain is a read-only VS Code history explorer backed by a native Rust
-service. The Cargo workspace has ten crates:
+service. The Cargo workspace has eleven crates:
 
 ```text
 Claude/Codex JSONL

@@ -30,9 +30,11 @@ use editchain_git::{
     RepositoryHandle,
 };
 use editchain_index::{LexicalHit, LexicalIndex, LexicalSource};
-use editchain_project::activity::{ActivityRowAnnotation, SessionSummaryMarker, WorkUnitMarker};
+use editchain_project::activity::{SessionSummaryMarker, WorkUnitMarker};
+use editchain_project::activity_view::{ActivityPresentation, ActivityView};
 use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
+use editchain_project::NodeKey;
 use editchain_protocol::{
     ErrorCode, ExpansionSpanDto, FileChangeDto, FileChangeSource, FileChangeStatus, FileDiffDto,
     FileDiffHunkDto, FindInHistoryMatch, FindInHistoryResponse, HistoryRow, HistoryWindow,
@@ -84,7 +86,7 @@ pub struct Workspace {
     /// Exactly one backend owns the fixed row order at a time.
     backend: WorkspaceBackend,
     /// The fixed Activity-view snapshot shared by window and find requests.
-    current_view: Option<ViewSnapshot>,
+    current_view: Option<ActivityView<ExpandedChildRow>>,
 }
 
 #[derive(Debug)]
@@ -104,53 +106,7 @@ pub struct HistoryWindowOptions {
     pub include_layout: bool,
 }
 
-/// Immutable fixed Activity projection consumed by history and layout paging.
-#[derive(Debug)]
-struct ViewSnapshot {
-    /// Canonical top-level rows in display order.
-    nodes: Vec<editchain_project::HistoryNode>,
-    /// Per-row Activity-view annotations (work-unit markers + promotion),
-    /// parallel to `nodes` 1:1.
-    annotations: Vec<ActivityRowAnnotation>,
-    /// Graph geometry over `nodes`, built only after the first row window has
-    /// painted. `None` is a valid provisional row-only snapshot.
-    context: Option<editchain_project::layout::LayoutContext>,
-    /// Total depth-first descendant count attached to each top-level row.
-    sub_op_counts: Vec<usize>,
-    /// Precomputed depth-first descendants for each top-level row. Existing
-    /// bundles nested in a work group retain their own direct children.
-    expansions: Vec<NodeExpansion>,
-    /// Global absolute expandable intervals, shipped once with offset zero.
-    expansion_spans: Vec<ExpansionSpanDto>,
-    /// Expanded absolute slot where each top-level row starts, plus a sentinel.
-    starts: Vec<usize>,
-    /// Total number of fully expanded slots.
-    expanded_total: usize,
-    /// Maximum graph lane in this view.
-    max_lane: usize,
-    /// Cached op id → visible top-level row index for every op represented by
-    /// this snapshot: each row's own op id (or bundle anchor) plus every
-    /// bundled sub-op/member op id. Built lazily on the first Find-in-Chain
-    /// request so arrow-key navigation never rebuilds an O(V) map per keypress.
-    op_rows: Option<HashMap<OpId, usize>>,
-    /// Cached git `(repository, oid)` → visible top-level row index for the
-    /// git commits in this snapshot (submodule rows are absent when the view
-    /// hides them). Built lazily together with [`Self::op_rows`].
-    git_rows: Option<HashMap<(RepositoryId, GitOid), usize>>,
-}
-
-/// One top-level row's fully expanded, depth-first presentation descendants.
-#[derive(Debug)]
-struct NodeExpansion {
-    /// Direct children advertised on the top-level row for disclosure chrome.
-    direct: Vec<SubOpSummary>,
-    /// All descendants in stable depth-first slot order.
-    rows: Vec<ExpandedChildRow>,
-}
-
-/// One nested presentation row. It is not a graph node; `parent_relative`
-/// points at its direct parent within the enclosing top-level block (`0` is
-/// the top-level row, descendants start at relative slot `1`).
+/// Display content supplied to the project-owned presentation tree.
 #[derive(Debug)]
 struct ExpandedChildRow {
     op_id: String,
@@ -171,10 +127,6 @@ struct ExpandedChildRow {
     promoted: bool,
     activity_bundle: Option<editchain_protocol::ActivityBundleDto>,
     file_change: Option<FileChangeDto>,
-    direct: Vec<SubOpSummary>,
-    parent_relative: usize,
-    depth: u8,
-    descendant_count: usize,
 }
 
 pub use editchain_store::ChainReadStats;
@@ -2547,7 +2499,7 @@ impl Workspace {
         clippy::arithmetic_side_effects,
         clippy::indexing_slicing,
         clippy::needless_borrow,
-        reason = "expanded-slot prefix sums are bounded by node count; indexing is bounds-checked by partition_point; node is a &HistoryNode reference"
+        reason = "expanded-slot prefix sums are bounded by node count; indexing is bounds-checked by partition_point; node is a &editchain_project::HistoryNode reference"
     )]
     fn projection_history_window(&mut self, options: HistoryWindowOptions) -> HistoryWindow {
         let HistoryWindowOptions {
@@ -2559,9 +2511,6 @@ impl Workspace {
         let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
 
         self.ensure_view_snapshot();
-        if include_layout {
-            self.ensure_view_layout();
-        }
         let Some(snapshot) = self.current_view.as_ref() else {
             return HistoryWindow {
                 snapshot_id: self.snapshot_id.clone(),
@@ -2574,15 +2523,19 @@ impl Workspace {
                 layout_ready: include_layout,
             };
         };
-        let filtered = &snapshot.nodes;
-        let ctx = snapshot.context.as_ref();
+        let filtered = snapshot.entries();
+        let ctx = if include_layout {
+            Some(snapshot.ensure_layout())
+        } else {
+            snapshot.layout()
+        };
 
         // The service emits a FIXED fully-expanded depth-first list: every
         // top-level graph node always occupies one parent slot followed by all
         // presentation descendants. Fetch/cache indices therefore never move;
         // collapse/expand is purely a client decision driven by expansion spans.
-        let starts = &snapshot.starts;
-        let expanded_total = snapshot.expanded_total;
+        let starts = snapshot.starts();
+        let expanded_total = snapshot.expanded_total();
 
         // Find the first top-level node whose expanded block overlaps [offset, end).
         let end_usize = offset_usize.saturating_add(limit_usize);
@@ -2595,8 +2548,8 @@ impl Workspace {
             if starts[abs_idx] >= end_usize {
                 break;
             }
-            let node = &filtered[abs_idx];
-            let expansion = &snapshot.expansions[abs_idx];
+            let entry = &filtered[abs_idx];
+            let node = entry.node();
             let block_start = starts[abs_idx];
             // Per-row graph geometry from the layout context (absolute row index
             // into the full sorted list).
@@ -2646,29 +2599,19 @@ impl Workspace {
             let session_meta = self.session_metadata.get(&group).cloned();
             // Emit the parent row if it falls inside the window.
             if block_start >= offset_usize && block_start < end_usize {
-                // Parents come from the cached LayoutContext for THIS exact
-                // filtered snapshot (not the full projection), so a parent
-                // that resolves to a row hidden by the Activity view is never
-                // emitted as a dangling key. Relations are derived by the
-                // projection from these same final parent keys, so every
-                // relation's parent is guaranteed to be a rendered parent.
-                let parents = ctx.map_or_else(
-                    || self.projection.lifted_parent_keys(node),
-                    |layout| {
-                        layout
-                            .parents
-                            .get(&node.node_key())
-                            .cloned()
-                            .unwrap_or_default()
-                    },
-                );
-                let parent_relations = self
-                    .projection
-                    .parent_relations_for(&node, &parents)
-                    .into_iter()
-                    .map(|r| ParentRelationDto {
-                        parent: r.parent,
-                        kind: protocol_relation_kind(r.kind),
+                let parents = snapshot
+                    .graph()
+                    .parents(node.key())
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect();
+                let parent_relations = snapshot
+                    .graph()
+                    .relations(node.key())
+                    .iter()
+                    .map(|relation| ParentRelationDto {
+                        parent: relation.parent.to_string(),
+                        kind: protocol_relation_kind(relation.kind),
                     })
                     .collect();
                 rows.push(HistoryRow {
@@ -2680,7 +2623,7 @@ impl Workspace {
                     group: group.clone(),
                     group_end: filtered
                         .get(abs_idx.saturating_add(1))
-                        .is_none_or(|next| next.group() != group),
+                        .is_none_or(|next| next.node().group() != group),
                     node_key: node.node_key(),
                     parents,
                     parent_relations,
@@ -2698,7 +2641,10 @@ impl Workspace {
                     muted_above,
                     muted_below,
                     muted_transitions,
-                    sub_ops: expansion.direct.clone(),
+                    sub_ops: entry
+                        .children(0)
+                        .map(ExpandedChildRow::summary_dto)
+                        .collect(),
                     is_subop: false,
                     hierarchy_depth: 0,
                     parent_row: None,
@@ -2710,19 +2656,13 @@ impl Workspace {
                     chain_state: node.chain_state(),
                     turn_id: node.turn_id().map(|id| id.0.to_string()),
                     session_meta: session_meta.clone(),
-                    session_summary: snapshot
-                        .annotations
-                        .get(abs_idx)
-                        .and_then(|annotation| annotation.session_summary.as_ref())
+                    session_summary: entry
+                        .annotation()
+                        .session_summary
+                        .as_ref()
                         .map(session_summary_dto),
-                    work_unit: snapshot
-                        .annotations
-                        .get(abs_idx)
-                        .map(|annotation| work_unit_dto(&annotation.work_unit)),
-                    promoted: snapshot
-                        .annotations
-                        .get(abs_idx)
-                        .is_some_and(|annotation| annotation.promoted),
+                    work_unit: Some(work_unit_dto(&entry.annotation().work_unit)),
+                    promoted: entry.annotation().promoted,
                     activity_bundle: node_activity_bundle(node),
                     file_change: None,
                 });
@@ -2749,7 +2689,8 @@ impl Workspace {
                 .and_then(|layout| layout.row_muted_above.get(abs_idx + 1))
                 .map_or(&[][..], Vec::as_slice);
             let muted_region_lanes = intersect_sorted(muted_below_parent, muted_above_next);
-            for (i, child) in expansion.rows.iter().enumerate() {
+            for (i, presentation_row) in entry.descendants().iter().enumerate() {
+                let child = presentation_row.content();
                 let slot = block_start + 1 + i;
                 if slot < offset_usize || slot >= end_usize {
                     continue;
@@ -2781,10 +2722,13 @@ impl Workspace {
                     muted_above: muted_region_lanes.clone(),
                     muted_below: muted_region_lanes.clone(),
                     muted_transitions: Vec::new(),
-                    sub_ops: child.direct.clone(),
+                    sub_ops: entry
+                        .children(i.saturating_add(1))
+                        .map(ExpandedChildRow::summary_dto)
+                        .collect(),
                     is_subop: true,
-                    hierarchy_depth: child.depth,
-                    parent_row: Some(parent_row.saturating_add(child.parent_relative)),
+                    hierarchy_depth: presentation_row.depth(),
+                    parent_row: Some(parent_row.saturating_add(presentation_row.parent_relative())),
                     subop_kind: Some(subop_semantic_class(&child.kind)),
                     record_role: child.record_role,
                     activity_kind: child.activity_kind,
@@ -2806,13 +2750,19 @@ impl Workspace {
             rows,
             total: u64::try_from(expanded_total).unwrap_or(u64::MAX),
             chain_generation: u64::try_from(self.projection.ops().len()).unwrap_or(u64::MAX),
-            max_lane: snapshot.max_lane,
+            max_lane: snapshot.max_lane(),
             // The renderer always establishes snapshot state from offset zero;
             // ship the O(V) expansion index once for that snapshot, not with
             // every O(window) page.
-            sub_op_counts: (offset == 0).then(|| snapshot.sub_op_counts.clone()),
-            expansion_spans: (offset == 0).then(|| snapshot.expansion_spans.clone()),
-            layout_ready: snapshot.context.is_some(),
+            sub_op_counts: (offset == 0).then(|| snapshot.sub_op_counts()),
+            expansion_spans: (offset == 0).then(|| {
+                snapshot
+                    .expansion_spans()
+                    .into_iter()
+                    .map(expansion_span_dto)
+                    .collect()
+            }),
+            layout_ready: snapshot.layout().is_some(),
         }
     }
 
@@ -2821,146 +2771,20 @@ impl Workspace {
         if self.current_view.is_some() {
             return;
         }
-        let all_nodes = self.projection.activity_nodes();
-        let nodes: Vec<_> = all_nodes
-            .into_iter()
-            .filter(|node| {
-                !node
-                    .repository()
-                    .is_some_and(|repository| self.repo_is_submodule(repository))
-            })
-            .collect();
-        // Activity-view semantics keep context-compaction checkpoints inline,
-        // group adjacent repeated Plan headings, fold safe low-signal execute
-        // runs, then wrap every linear non-chat interval in an outer work group.
-        // Annotations are recomputed on the final list so bundle rows carry
-        // their own unit markers.
-        let structural = self.projection.structural_row_keys(&nodes);
-        let nodes =
-            editchain_project::activity::inline_context_compaction_checkpoints(nodes, &structural);
-        // Plan repeats group before promotion is computed: the newest member
-        // may itself be the unit-final narrative, and the resulting bundle —
-        // not an arbitrary duplicate member — should carry that significance.
-        let nodes = editchain_project::activity::bundle_activity_plan_repeats(nodes, &structural);
-        let mut annotations = editchain_project::activity::annotate_activity_rows(&nodes);
-        let nodes = editchain_project::activity::bundle_activity_execute_runs(
-            nodes,
-            &annotations,
-            &structural,
-        );
-        let nodes =
-            editchain_project::activity::bundle_claude_response_tool_fragments(nodes, &structural);
-        let nodes = editchain_project::activity::bundle_activity_work_groups(nodes, &structural);
-        annotations = editchain_project::activity::annotate_activity_rows(&nodes);
-        let expansions: Vec<NodeExpansion> = nodes
-            .iter()
-            .map(|node| node_expansion(node, &self.agent_file_changes, &self.git_file_changes))
-            .collect();
-        let sub_op_counts: Vec<usize> = expansions
-            .iter()
-            .map(|expansion| expansion.rows.len())
-            .collect();
-        let mut starts = Vec::with_capacity(nodes.len().saturating_add(1));
-        starts.push(0usize);
-        for &count in &sub_op_counts {
-            starts.push(
-                starts
-                    .last()
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add(1)
-                    .saturating_add(count),
-            );
-        }
-        let expanded_total = starts.last().copied().unwrap_or(0);
-        let mut expansion_spans = Vec::new();
-        for (index, expansion) in expansions.iter().enumerate() {
-            let block_start = starts.get(index).copied().unwrap_or(0);
-            if !expansion.rows.is_empty() {
-                expansion_spans.push(ExpansionSpanDto {
-                    row: u64::try_from(block_start).unwrap_or(u64::MAX),
-                    descendant_count: u64::try_from(expansion.rows.len()).unwrap_or(u64::MAX),
-                });
-            }
-            for (child_index, child) in expansion.rows.iter().enumerate() {
-                if child.descendant_count == 0 {
-                    continue;
-                }
-                expansion_spans.push(ExpansionSpanDto {
-                    row: u64::try_from(block_start.saturating_add(1).saturating_add(child_index))
-                        .unwrap_or(u64::MAX),
-                    descendant_count: u64::try_from(child.descendant_count).unwrap_or(u64::MAX),
-                });
-            }
-        }
-        self.current_view = Some(ViewSnapshot {
-            nodes,
-            annotations,
-            context: None,
-            sub_op_counts,
-            expansions,
-            expansion_spans,
-            starts,
-            expanded_total,
-            max_lane: 0,
-            op_rows: None,
-            git_rows: None,
-        });
-    }
-
-    /// Build global graph geometry for the current row snapshot on demand.
-    fn ensure_view_layout(&mut self) {
-        let projection = &self.projection;
-        let Some(snapshot) = self.current_view.as_mut() else {
-            return;
+        let presentation = ServicePresentation {
+            agent_changes: &self.agent_file_changes,
+            git_changes: &self.git_file_changes,
         };
-        if snapshot.context.is_some() {
-            return;
-        }
-        let context = projection.layout_context(&snapshot.nodes);
-        snapshot.max_lane = context.lanes.iter().map(|row| row.lane).max().unwrap_or(0);
-        snapshot.context = Some(context);
-    }
-
-    /// Build (once) the cached op→row / git→row maps for the current view
-    /// snapshot, so repeated Find-in-Chain requests reuse the O(V) mapping
-    /// instead of rebuilding it per arrow press.
-    ///
-    /// The op map indexes every op this snapshot renders: each top-level row's
-    /// own op id (or bundle anchor) plus every bundled sub-op/member op id, so
-    /// a hit inside a folded META sub-op, tool result, execute-run member, or
-    /// plan-repeat member resolves directly to its containing top-level row.
-    /// The git map indexes visible git commits by `(repository, oid)`; rows
-    /// hidden by the fixed Activity view are simply absent, so
-    /// hits with no row in the active view are filtered out downstream.
-    fn build_find_row_maps(&mut self) {
-        let Some(snapshot) = self.current_view.as_mut() else {
-            return;
-        };
-        if snapshot.op_rows.is_some() && snapshot.git_rows.is_some() {
-            return;
-        }
-        let mut op_rows = HashMap::with_capacity(snapshot.nodes.len());
-        let mut git_rows = HashMap::new();
-        for (row, node) in snapshot.nodes.iter().enumerate() {
-            if let Some(id) = node.op_id() {
-                let _: Option<usize> = op_rows.insert(id, row);
-            }
-            if let (Some(oid), Some(repository)) = (node.git_oid(), node.repository()) {
-                let _: Option<usize> = git_rows.insert((repository, oid), row);
-            }
-            for op in node.sub_ops() {
-                let _: Option<usize> = op_rows.insert(op.id, row);
-            }
-        }
-        snapshot.op_rows = Some(op_rows);
-        snapshot.git_rows = Some(git_rows);
+        self.current_view = Some(self.projection.build_activity_view(
+            |repository| !self.repo_is_submodule(repository),
+            &presentation,
+        ));
     }
 
     /// Resolve scored search chunks to distinct visible top-level rows of the
     /// fixed Activity view, deduplicating by row and keeping the best BM25 score.
     ///
-    /// The resolution reuses the cached `ViewSnapshot`. Every
+    /// The resolution reuses the cached `ActivityView`. Every
     /// returned match carries the row's stable real `node_key` and its absolute
     /// expanded-history parent-row offset (from the snapshot's `starts` prefix
     /// sums), so the viewer can cycle matches without auto-expanding anything.
@@ -2974,27 +2798,24 @@ impl Workspace {
         git_identities: &std::collections::BTreeMap<OpId, GitHitIdentity>,
     ) -> Vec<FindInHistoryMatch> {
         self.ensure_view_snapshot();
-        self.build_find_row_maps();
         let Some(snapshot) = self.current_view.as_ref() else {
             return Vec::new();
         };
-        let Some(op_rows) = snapshot.op_rows.as_ref() else {
-            return Vec::new();
-        };
-        let Some(git_rows) = snapshot.git_rows.as_ref() else {
-            return Vec::new();
-        };
-        let projection = &self.projection;
         // Distinct visible rows → best (highest) score for that row.
         let mut best: HashMap<usize, f64> = HashMap::new();
         for chunk in chunks {
-            let Some(row) = resolve_chunk_row(
-                op_rows,
-                git_rows,
-                git_identities,
-                &|op_id| projection.visible_op_id(op_id),
-                chunk,
-            ) else {
+            let source = if chunk.source == LexicalSource::Git {
+                let Some(identity) = git_identities.get(&chunk.op_id) else {
+                    continue;
+                };
+                NodeKey::Git(editchain_core::GitCommitKey::new(
+                    identity.repository_id,
+                    identity.oid,
+                ))
+            } else {
+                NodeKey::Op(chunk.op_id)
+            };
+            let Some(row) = snapshot.source_row(source) else {
                 continue;
             };
             let entry = best.entry(row).or_insert(chunk.score);
@@ -3002,7 +2823,7 @@ impl Workspace {
                 *entry = chunk.score;
             }
         }
-        let starts = &snapshot.starts;
+        let starts = snapshot.starts();
         let mut ranked: Vec<(usize, f64)> = best.into_iter().collect();
         // Ranked: best score first; ties break to the newest visible row so the
         // ordering is deterministic for the viewer's cycle.
@@ -3015,7 +2836,7 @@ impl Workspace {
         ranked
             .into_iter()
             .filter_map(|(row, _)| {
-                let node = snapshot.nodes.get(row)?;
+                let node = snapshot.entries().get(row)?.node();
                 Some(FindInHistoryMatch {
                     node_key: node.node_key(),
                     row: u64::try_from(starts.get(row).copied().unwrap_or(0)).unwrap_or(u64::MAX),
@@ -3863,38 +3684,6 @@ pub fn parse_git_oid(s: &str) -> Result<GitOid, String> {
     GitOid::from_hex(s).ok_or_else(|| format!("invalid git oid: {s:?}"))
 }
 
-/// Resolve one scored chunk to its visible top-level row index in the active
-/// view snapshot, or `None` when the hit has no row in that view.
-///
-/// `EditChain` hits resolve directly when the op (or a bundled sub-op/member
-/// that shares the row) is in `op_rows`, otherwise through the projection's
-/// semantic-collapse representative map (`visible_op_id`) to the canonical row
-/// that renders the op — a folded normalized child, META sub-op, tool result,
-/// or copied provider occurrence. A canonical row that is absent from `op_rows`
-/// is hidden by the Activity view and dropped. `Git` hits resolve by real
-/// `(repository, oid)` identity from `git_identities` (never the synthetic
-/// index-only op id), so nested-repository rows are absent
-/// from `git_rows` and dropped.
-#[must_use]
-fn resolve_chunk_row(
-    op_rows: &HashMap<OpId, usize>,
-    git_rows: &HashMap<(RepositoryId, GitOid), usize>,
-    git_identities: &std::collections::BTreeMap<OpId, GitHitIdentity>,
-    visible_op_id: &impl Fn(OpId) -> Option<OpId>,
-    chunk: &LexicalHit,
-) -> Option<usize> {
-    if chunk.source == LexicalSource::Git {
-        let identity = git_identities.get(&chunk.op_id)?;
-        return git_rows
-            .get(&(identity.repository_id, identity.oid))
-            .copied();
-    }
-    if let Some(&row) = op_rows.get(&chunk.op_id) {
-        return Some(row);
-    }
-    visible_op_id(chunk.op_id).and_then(|canonical| op_rows.get(&canonical).copied())
-}
-
 /// Whether a history node is a system-generated artifact (tool results, raw
 /// import records) rather than user-facing text.
 ///
@@ -4179,13 +3968,10 @@ fn node_activity_bundle(
     node: &editchain_project::HistoryNode,
 ) -> Option<editchain_protocol::ActivityBundleDto> {
     match node {
-        editchain_project::HistoryNode::WorkGroup { member_nodes, .. } => {
+        editchain_project::HistoryNode::WorkGroup { .. } => {
             Some(editchain_protocol::ActivityBundleDto {
                 kind: editchain_protocol::ActivityBundleKind::WorkGroup,
-                member_count: member_nodes
-                    .iter()
-                    .map(node_leaf_activity_count)
-                    .fold(0u64, u64::saturating_add),
+                member_count: u64::try_from(node.represented_activity_count()).unwrap_or(u64::MAX),
             })
         }
         editchain_project::HistoryNode::ExecuteBundle { member_nodes, .. } => {
@@ -4206,76 +3992,16 @@ fn node_activity_bundle(
     }
 }
 
-/// Original activity-row count represented by a possibly nested synthetic
-/// node. Work-group count labels describe source activities, not display rows.
-#[must_use]
-fn node_leaf_activity_count(node: &editchain_project::HistoryNode) -> u64 {
-    match node {
-        editchain_project::HistoryNode::ExecuteBundle { member_nodes, .. }
-        | editchain_project::HistoryNode::PlanBundle { member_nodes, .. }
-        | editchain_project::HistoryNode::WorkGroup { member_nodes, .. } => member_nodes
-            .iter()
-            .map(node_leaf_activity_count)
-            .fold(0u64, u64::saturating_add),
-        editchain_project::HistoryNode::EditOperation { .. }
-        | editchain_project::HistoryNode::CollapsedImport { .. }
-        | editchain_project::HistoryNode::GitCommit { .. } => 1,
-    }
+struct ServicePresentation<'a> {
+    agent_changes: &'a HashMap<OpId, Vec<FileChangeDto>>,
+    git_changes: &'a HashMap<(RepositoryId, GitOid), Vec<FileChangeDto>>,
 }
 
-/// Build the fixed depth-first expansion tree for one top-level graph row.
-///
-/// Ordinary rows and top-level execute/plan bundles retain their established
-/// one-level details. A `WorkGroup` exposes each direct activity as a depth-1
-/// row. The projection flattens a sole nested synthetic group before this
-/// point, while nested groups that accompany other work retain depth-2 rows.
-#[must_use]
-fn node_expansion(
-    node: &editchain_project::HistoryNode,
-    agent_changes: &HashMap<OpId, Vec<FileChangeDto>>,
-    git_changes: &HashMap<(RepositoryId, GitOid), Vec<FileChangeDto>>,
-) -> NodeExpansion {
-    let editchain_project::HistoryNode::WorkGroup { member_nodes, .. } = node else {
-        let file_changes = node_file_changes(node, agent_changes, git_changes);
-        let mut direct = node_sub_op_summaries(node);
-        direct.extend(
-            file_changes
-                .iter()
-                .map(|change| file_change_summary(change, node)),
-        );
-        let mut rows = flat_op_child_rows(node, 0, 1);
-        let file_row_context = FileChangeRowContext {
-            parent_relative: 0,
-            depth: 1,
-            timestamp_ms: node.timestamp_ms(),
-            chain_state: node.chain_state(),
-            turn_id: node.turn_id().map(|id| id.0.to_string()),
-        };
-        rows.extend(file_change_rows(&file_changes, &file_row_context));
-        return NodeExpansion { direct, rows };
-    };
+impl ActivityPresentation for ServicePresentation<'_> {
+    type Row = ExpandedChildRow;
 
-    let direct = member_nodes.iter().map(node_summary_dto).collect();
-    let mut rows = Vec::new();
-    for member in member_nodes {
-        let member_relative = rows.len().saturating_add(1);
-        let file_changes = node_file_changes(member, agent_changes, git_changes);
-        let mut member_direct = node_sub_op_summaries(member);
-        member_direct.extend(
-            file_changes
-                .iter()
-                .map(|change| file_change_summary(change, member)),
-        );
-        let mut descendants = flat_op_child_rows(member, member_relative, 2);
-        let file_row_context = FileChangeRowContext {
-            parent_relative: member_relative,
-            depth: 2,
-            timestamp_ms: member.timestamp_ms(),
-            chain_state: member.chain_state(),
-            turn_id: member.turn_id().map(|id| id.0.to_string()),
-        };
-        descendants.extend(file_change_rows(&file_changes, &file_row_context));
-        rows.push(ExpandedChildRow {
+    fn activity(&self, member: &editchain_project::HistoryNode) -> ExpandedChildRow {
+        ExpandedChildRow {
             op_id: member.op_id().map_or_else(String::new, |id| id.to_string()),
             git_oid: member.git_oid().map(|oid| oid.to_hex()),
             repository: member.repository().map(|id| id.0.to_string()),
@@ -4300,14 +4026,33 @@ fn node_expansion(
             ),
             activity_bundle: node_activity_bundle(member),
             file_change: None,
-            direct: member_direct,
-            parent_relative: 0,
-            depth: 1,
-            descendant_count: descendants.len(),
-        });
-        rows.extend(descendants);
+        }
     }
-    NodeExpansion { direct, rows }
+
+    fn details(&self, node: &editchain_project::HistoryNode) -> Vec<ExpandedChildRow> {
+        let mut rows = flat_op_child_rows(node);
+        let changes = node_file_changes(node, self.agent_changes, self.git_changes);
+        rows.extend(file_change_rows(&changes, node));
+        rows
+    }
+}
+
+impl ExpandedChildRow {
+    fn summary_dto(&self) -> SubOpSummary {
+        SubOpSummary {
+            op_id: self.op_id.clone(),
+            summary: self.summary.clone(),
+            kind: self.kind.clone(),
+            timestamp_ms: self.timestamp_ms,
+        }
+    }
+}
+
+fn expansion_span_dto(span: editchain_project::activity_view::ExpansionSpan) -> ExpansionSpanDto {
+    ExpansionSpanDto {
+        row: u64::try_from(span.row).unwrap_or(u64::MAX),
+        descendant_count: u64::try_from(span.descendant_count).unwrap_or(u64::MAX),
+    }
 }
 
 /// File changes represented by one row, recursively collecting synthetic
@@ -4335,29 +4080,9 @@ fn node_file_changes(
     }
 }
 
-fn file_change_summary(
-    change: &FileChangeDto,
-    node: &editchain_project::HistoryNode,
-) -> SubOpSummary {
-    SubOpSummary {
-        op_id: change.op_id.clone().unwrap_or_default(),
-        summary: change.path.clone(),
-        kind: "file".to_string(),
-        timestamp_ms: node.timestamp_ms(),
-    }
-}
-
-struct FileChangeRowContext {
-    parent_relative: usize,
-    depth: u8,
-    timestamp_ms: u64,
-    chain_state: ChainState,
-    turn_id: Option<String>,
-}
-
 fn file_change_rows(
     changes: &[FileChangeDto],
-    context: &FileChangeRowContext,
+    node: &editchain_project::HistoryNode,
 ) -> Vec<ExpandedChildRow> {
     changes
         .iter()
@@ -4367,7 +4092,7 @@ fn file_change_rows(
             git_oid: change.commit_oid.clone(),
             repository: change.repository.clone(),
             summary: change.path.clone(),
-            timestamp_ms: context.timestamp_ms,
+            timestamp_ms: node.timestamp_ms(),
             kind: "file".to_string(),
             author: String::new(),
             commit_id: String::new(),
@@ -4376,37 +4101,18 @@ fn file_change_rows(
             activity_kind: ActivityKind::Change,
             visibility: Visibility::Supporting,
             outcome: Outcome::Unknown,
-            chain_state: context.chain_state,
-            turn_id: context.turn_id.clone(),
+            chain_state: node.chain_state(),
+            turn_id: node.turn_id().map(|id| id.0.to_string()),
             promoted: false,
             activity_bundle: None,
             file_change: Some(change),
-            direct: Vec::new(),
-            parent_relative: context.parent_relative,
-            depth: context.depth,
-            descendant_count: 0,
         })
         .collect()
 }
 
-/// One node as a direct-child summary advertised by its enclosing `WorkGroup`.
-#[must_use]
-fn node_summary_dto(node: &editchain_project::HistoryNode) -> SubOpSummary {
-    SubOpSummary {
-        op_id: node.op_id().map_or_else(String::new, |id| id.to_string()),
-        summary: node.summary(),
-        kind: node.kind(),
-        timestamp_ms: node.timestamp_ms(),
-    }
-}
-
 /// Established flat detail/member rows for one ordinary or inner bundle node.
 #[must_use]
-fn flat_op_child_rows(
-    node: &editchain_project::HistoryNode,
-    parent_relative: usize,
-    depth: u8,
-) -> Vec<ExpandedChildRow> {
+fn flat_op_child_rows(node: &editchain_project::HistoryNode) -> Vec<ExpandedChildRow> {
     let summaries = node_sub_op_summaries(node);
     let member_meta = node_sub_op_meta_index(node);
     summaries
@@ -4438,10 +4144,6 @@ fn flat_op_child_rows(
                 promoted: false,
                 activity_bundle: None,
                 file_change: None,
-                direct: Vec::new(),
-                parent_relative,
-                depth,
-                descendant_count: 0,
             }
         })
         .collect()
@@ -7311,7 +7013,7 @@ mod tests {
         assert!(ws
             .current_view
             .as_ref()
-            .is_some_and(|snapshot| snapshot.context.is_none()));
+            .is_some_and(|snapshot| snapshot.layout().is_none()));
 
         let laid_out = ws
             .history_window(HistoryWindowOptions {
@@ -7323,10 +7025,19 @@ mod tests {
         assert!(laid_out.layout_ready);
         assert_eq!(laid_out.rows.len(), provisional.rows.len());
         assert_eq!(laid_out.rows[0].node_key, provisional.rows[0].node_key);
+        for (before, after) in provisional.rows.iter().zip(&laid_out.rows) {
+            assert_eq!(before.parents, after.parents);
+            assert_eq!(before.parent_relations, after.parent_relations);
+            assert_eq!(before.parent_row, after.parent_row);
+            assert_eq!(
+                serde_json::to_value(&before.sub_ops).unwrap(),
+                serde_json::to_value(&after.sub_ops).unwrap()
+            );
+        }
         assert!(ws
             .current_view
             .as_ref()
-            .is_some_and(|snapshot| snapshot.context.is_some()));
+            .is_some_and(|snapshot| snapshot.layout().is_some()));
     }
 
     /// Build a ranked lexical hit.
@@ -7363,90 +7074,69 @@ mod tests {
         assert_eq!(matches.len(), 1, "all three chunks dedupe into one row");
         assert_eq!(matches[0].node_key, turn.id.to_string());
         assert_eq!(matches[0].row, 0);
-        // The O(V) op→row map is built once and cached on the view snapshot.
-        assert!(ws
-            .current_view
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.op_rows.is_some()));
+        let entries = ws.current_view.as_ref().unwrap().entries().as_ptr();
         let again = ws.find_in_history(&chunks, &BTreeMap::new());
+        assert_eq!(
+            entries,
+            ws.current_view.as_ref().unwrap().entries().as_ptr(),
+            "Find reuses the opened view"
+        );
         assert_eq!(again.len(), 1);
         assert_eq!(again[0].node_key, turn.id.to_string());
     }
 
     #[test]
     fn find_in_history_maps_bundle_members_and_subops_to_containing_parent() {
-        // An Activity-view execute-run bundle folds two member rows into one
-        // top-level row; a hit inside any member (or a member's own bundled
-        // metadata sub-op) must resolve to the containing bundle row and its
-        // absolute parent-row offset — never auto-expand anything.
-        let anchor = op_envelope(
-            1,
-            1,
-            OpKind::Tool(editchain_core::op::ToolOp {
-                tool_call_id: Payload::Empty,
-                tool_name: Payload::Inline(b"Bash".to_vec()),
-                stage: editchain_core::op::ToolStage::Start,
-                content: Payload::Empty,
-            }),
-        );
-        let member_a = op_envelope(
-            1,
-            2,
-            OpKind::Tool(editchain_core::op::ToolOp {
-                tool_call_id: Payload::Empty,
-                tool_name: Payload::Inline(b"Bash".to_vec()),
-                stage: editchain_core::op::ToolStage::Start,
-                content: Payload::Empty,
-            }),
-        );
-        let member_b = op_envelope(
-            1,
-            3,
-            OpKind::Tool(editchain_core::op::ToolOp {
-                tool_call_id: Payload::Empty,
-                tool_name: Payload::Inline(b"Bash".to_vec()),
-                stage: editchain_core::op::ToolStage::Start,
-                content: Payload::Empty,
-            }),
-        );
-        let meta_of_b = import_op(1, 4, true);
-        let bundle = editchain_project::HistoryNode::ExecuteBundle {
-            anchor: std::sync::Arc::new(anchor.clone()),
-            source_time: editchain_project::EffectiveTime::Observed(1_000),
-            parent_override: None,
-            member_nodes: Vec::new(),
-            members: vec![
-                std::sync::Arc::new(member_a.clone()),
-                std::sync::Arc::new(member_b.clone()),
-                std::sync::Arc::new(meta_of_b.clone()),
-            ],
-            summary: "2 tool steps".to_string(),
-            kind: "tool".to_string(),
-            author: "agent".to_string(),
-            meta: editchain_project::meta::NodeMeta::default(),
+        // Build the actual Activity view from two adjacent tool imports and a
+        // folded metadata record. Find must resolve every source through the
+        // same tree used for history windows.
+        let mut member_a = import_op(1, 1, false);
+        let mut member_b = import_op(1, 2, false);
+        member_b.parents = ParentSet::One(member_a.id);
+        for member in [&mut member_a, &mut member_b] {
+            member.kind = OpKind::Import(ImportOp {
+                raw_ref: Payload::Inline(br#"{"type":"response_item","payload":{"type":"function_call","status":"completed"}}"#.to_vec()),
+                raw_hash: None,
+            });
+        }
+        let tool_child = |seq, parent| Op {
+            parents: ParentSet::One(parent),
+            tags: Tags::AGENT | Tags::TOOL,
+            ..op_envelope(
+                2,
+                seq,
+                OpKind::Tool(editchain_core::ToolOp {
+                    tool_call_id: Payload::Empty,
+                    tool_name: Payload::Inline(b"Bash".to_vec()),
+                    stage: editchain_core::ToolStage::Start,
+                    content: Payload::Empty,
+                }),
+            )
         };
-        let projection = HistoryProjection::from_ops(vec![anchor.clone()]);
+        let meta_of_b = Op {
+            parents: ParentSet::One(member_b.id),
+            ..import_op(1, 3, true)
+        };
+        let projection = HistoryProjection::from_ops(vec![
+            member_a.clone(),
+            tool_child(1, member_a.id),
+            member_b.clone(),
+            tool_child(2, member_b.id),
+            meta_of_b.clone(),
+        ]);
         let mut ws = Workspace::from_projection(projection);
-        let expansion = node_expansion(&bundle, &HashMap::new(), &HashMap::new());
-        // Hand-build the cached snapshot so the mapping test exercises the exact
-        // Activity-view shape (bundle row + two expanded member slots).
-        ws.current_view = Some(ViewSnapshot {
-            nodes: vec![bundle],
-            annotations: Vec::new(),
-            context: None,
-            sub_op_counts: vec![3],
-            expansions: vec![expansion],
-            expansion_spans: vec![ExpansionSpanDto {
-                row: 0,
-                descendant_count: 3,
-            }],
-            starts: vec![0, 4],
-            expanded_total: 4,
-            max_lane: 0,
-            op_rows: None,
-            git_rows: None,
-        });
-
+        let window = ws
+            .history_window(HistoryWindowOptions {
+                offset: 0,
+                limit: 20,
+                include_layout: false,
+            })
+            .unwrap();
+        let owner = window.rows.iter().find(|row| !row.is_subop).unwrap();
+        assert_eq!(
+            owner.activity_bundle.as_ref().unwrap().kind,
+            editchain_protocol::ActivityBundleKind::WorkGroup
+        );
         let chunks = vec![
             lexical_hit(member_a.id, 2.0),
             lexical_hit(member_b.id, 1.0),
@@ -7455,8 +7145,8 @@ mod tests {
         let matches = ws.find_in_history(&chunks, &BTreeMap::new());
 
         assert_eq!(matches.len(), 1, "members dedupe into the bundle row");
-        assert_eq!(matches[0].node_key, anchor.id.to_string());
-        assert_eq!(matches[0].row, 0, "bundle parent row offset");
+        assert_eq!(matches[0].node_key, owner.node_key);
+        assert_eq!(matches[0].row, 0, "group parent row offset");
     }
 
     #[test]

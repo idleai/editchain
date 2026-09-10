@@ -68,14 +68,21 @@ Completed increments:
   are read-only through their public API. Hidden ancestry uses an iterative
   traversal; a 20,000-record regression protects it. Revision 50 invalidates
   caches from the earlier parent-rewrite implementation.
+- Activity ownership: project now builds the complete view in one pass order.
+  An immutable presentation tree supplies descendants, direct-child summaries,
+  expansion intervals, and row offsets. The same retained graph supplies
+  provisional rows and lazy layout. Find resolves source identities through
+  the view's lazy ownership map; omitted sources retain explicit reasons.
+  Service supplies display content and file details through an adapter. The
+  former service snapshot, parallel expansion state, and hierarchy builder are
+  removed. Revision 51 binds derived caches to this view contract.
 
 Remaining work, in dependency order:
 
-1. Move complete Activity assembly and presentation-tree ownership into project.
-2. Consolidate typed provider evidence, source lifecycle, and persistence
+1. Consolidate typed provider evidence, source lifecycle, and persistence
    checkpoints; preserve compatibility with existing normalized records.
-3. Simplify search document identity and renderer request/cache state.
-4. Retire migrated compatibility machinery and optimize measured repeated work.
+2. Simplify search document identity and renderer request/cache state.
+3. Retire migrated compatibility machinery and optimize measured repeated work.
 
 Validation uses the existing crate, service, renderer, and extension suites.
 Every completed code increment must pass `./scripts/lint.sh`. Regression tests

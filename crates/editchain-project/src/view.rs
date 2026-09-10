@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 
+use crate::activity_view::OmissionReason;
 use crate::taxonomy::Visibility;
 use crate::{HistoryNode, NodeKey, ResolvedGraph};
 
@@ -22,11 +23,7 @@ pub(crate) fn apply(
 
     let hidden: HashSet<NodeKey> = nodes
         .iter()
-        .filter(|node| {
-            node.timestamp_ms() == 0
-                || (node.visibility() == Visibility::Trace
-                    && !structural_keys.contains(&node.key()))
-        })
+        .filter(|node| omission_reason(node, structural_keys).is_some())
         .map(HistoryNode::key)
         .collect();
 
@@ -45,6 +42,19 @@ pub(crate) fn apply(
         result.push(node);
     }
     result
+}
+
+pub(crate) fn omission_reason(
+    node: &HistoryNode,
+    structural_keys: &HashSet<NodeKey>,
+) -> Option<OmissionReason> {
+    if node.timestamp_ms() == 0 {
+        Some(OmissionReason::UnknownTime)
+    } else if node.visibility() == Visibility::Trace && !structural_keys.contains(&node.key()) {
+        Some(OmissionReason::Trace)
+    } else {
+        None
+    }
 }
 
 /// Find nearest visible ancestors iteratively, preserving depth-first parent
