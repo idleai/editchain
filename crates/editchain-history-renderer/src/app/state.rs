@@ -13,8 +13,6 @@
 //! the exact production interactions (scroll paging, find navigation,
 //! stale-response races) deterministically.
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use editchain_protocol::{
     ErrorCode, FindInHistoryMatch, FindInHistoryResponse, GetWindowRequest, HistoryWindow,
     OpenResponse, RequestBody, ServiceError, SnapshotId,
@@ -24,10 +22,10 @@ use serde_json::{json, Value};
 use super::host::{self, find_in_history, get_window, HostMessage, Id, Send, Unwrapped};
 
 use super::cache::{PageCache, RetentionPriority, MAX_CACHED_ROWS};
+pub(crate) use super::coordinates::ROW_H;
+use super::coordinates::{ExpandedRow, Pixels, VisibleRow, MAX_RENDER_ROWS};
+use super::expansion::ExpansionIndex;
 use super::requests::RequestRegistry;
-
-/// Fixed row height in CSS pixels (`ROW_H = 34` — contract value).
-pub(crate) const ROW_H: i64 = 34;
 
 /// Rows fetched per request (`PAGE`).
 pub(crate) const PAGE: i64 = 500;
@@ -38,15 +36,15 @@ pub(crate) const FIND_TOP_K: i64 = 50;
 /// Viewport measurements the renderer observes (CSS pixels).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Viewport {
-    pub(crate) scroll_top: i64,
-    pub(crate) client_height: i64,
+    pub(crate) scroll_top: Pixels,
+    pub(crate) client_height: Pixels,
 }
 
 impl Viewport {
     pub(crate) fn new(scroll_top: i64, client_height: i64) -> Viewport {
         Viewport {
-            scroll_top,
-            client_height,
+            scroll_top: Pixels::new(scroll_top),
+            client_height: Pixels::new(client_height),
         }
     }
 }
@@ -54,14 +52,14 @@ impl Viewport {
 /// A normalized find-in-chain match.
 #[derive(Debug, Clone)]
 pub(crate) struct FindMatch {
-    pub(crate) row: i64,
+    pub(crate) row: ExpandedRow,
     pub(crate) node_key: String,
 }
 
 /// A find jump awaiting its target window in cache.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct FindTarget {
-    pub(crate) abs: i64,
+    pub(crate) abs: ExpandedRow,
     pub(crate) index: usize,
 }
 
@@ -131,7 +129,7 @@ pub(crate) enum FindCounterState {
 
 /// One state transition: host sends, ordered DOM ops, and optional persisted
 /// webview state (`vscode.setState`). Renderer readiness is owned solely by
-/// [`ViewFlags::data_ready`] (the shell reads the authoritative flag, so no
+/// [`HistoryAppState::data_ready`] (the shell reads the authoritative phase, so no
 /// per-step copy exists here).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Step {
@@ -146,13 +144,14 @@ impl Step {
     }
 }
 
-/// Read-only view-mode flags (grouped so the struct stays under the
-/// `struct_excessive_bools` gate and reads as one unit).
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct ViewFlags {
-    /// Harness/parity readiness: true once a terminal event correlated with
-    /// actual content has been processed.
-    pub(crate) data_ready: bool,
+/// One authoritative lifecycle for row readiness, layout, and terminal errors.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum SnapshotPhase {
+    #[default]
+    Opening,
+    RowsReady,
+    LayoutReady,
+    Failed,
 }
 
 /// Find-in-chain session flags.
@@ -162,17 +161,6 @@ pub(crate) struct FindFlags {
     pub(crate) active: bool,
     /// More visible matches exist or may remain beyond the scan budget.
     pub(crate) more: bool,
-}
-
-/// Snapshot/layout readiness flags for the current view generation.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct SessionFlags {
-    /// The offset-0 expansion snapshot has been received for this view.
-    pub(crate) snapshot_established: bool,
-    /// Global lane geometry has been received (two-pass hydration done).
-    pub(crate) layout_ready: bool,
-    /// The initial "Loaded N history rows" announcement was made.
-    pub(crate) announced_initial_load: bool,
 }
 
 /// The full view state machine.
@@ -196,15 +184,9 @@ pub(crate) struct HistoryAppState {
     /// Persisted webview state from `vscode.getState()` (`topRow` only).
     pub(crate) persisted: Option<Value>,
     // --- expansion snapshot -----------------------------------------------
-    pub(crate) session_flags: SessionFlags,
-    pub(crate) sub_op_counts: Vec<u32>,
-    pub(crate) block_starts: Vec<i64>,
-    /// Absolute expanded-row index to contiguous descendant count.
-    pub(crate) expansion_spans: BTreeMap<i64, u32>,
-    /// Absolute expandable rows whose direct children are currently visible.
-    pub(crate) expanded_rows: BTreeSet<i64>,
-    /// Visible-index to absolute-index map after applying nested disclosure.
-    pub(crate) visible_abs: Vec<i64>,
+    pub(crate) phase: SnapshotPhase,
+    pub(super) announced_initial_load: bool,
+    pub(crate) expansion: Option<ExpansionIndex>,
     // --- render window (visible indices) ----------------------------------
     pub(crate) render_top: i64,
     pub(crate) render_bottom: i64,
@@ -220,17 +202,17 @@ pub(crate) struct HistoryAppState {
     pub(crate) find_index: usize,
     pub(crate) pending_find_target: Option<FindTarget>,
     // --- find query and renderer readiness ----------------------------------
-    pub(crate) view_flags: ViewFlags,
     pub(crate) search_query: String,
 }
 
 impl Default for HistoryAppState {
     fn default() -> Self {
-        let mut state = HistoryAppState {
+        HistoryAppState {
             requests: RequestRegistry::default(),
             view_gen: 0,
             snapshot_id: SnapshotId::default(),
-            session_flags: SessionFlags::default(),
+            phase: SnapshotPhase::Opening,
+            announced_initial_load: false,
             search_epoch: 0,
             current_search_epoch: None,
             total: None,
@@ -239,11 +221,7 @@ impl Default for HistoryAppState {
             max_lane: 2,
             open_warnings: Vec::new(),
             persisted: None,
-            sub_op_counts: Vec::new(),
-            block_starts: Vec::new(),
-            expansion_spans: BTreeMap::new(),
-            expanded_rows: BTreeSet::new(),
-            visible_abs: Vec::new(),
+            expansion: None,
             render_top: 0,
             render_bottom: -1,
             selected_key: None,
@@ -253,11 +231,8 @@ impl Default for HistoryAppState {
             find_total: 0,
             find_index: 0,
             pending_find_target: None,
-            view_flags: ViewFlags::default(),
             search_query: String::new(),
-        };
-        state.recompute_expansion();
-        state
+        }
     }
 }
 
@@ -265,142 +240,50 @@ impl HistoryAppState {
     // --- expansion mapping ---------------------------------------------------
 
     fn clear_expansion_state(&mut self) {
-        self.sub_op_counts.clear();
-        self.block_starts.clear();
-        self.expansion_spans.clear();
-        self.expanded_rows.clear();
-        self.visible_abs.clear();
+        self.expansion = None;
     }
 
-    pub(crate) fn recompute_expansion(&mut self) {
-        let n = self.sub_op_counts.len();
-        let mut starts = Vec::with_capacity(n);
-        let mut acc: i64 = 0;
-        for count in &self.sub_op_counts {
-            starts.push(acc);
-            acc = acc.saturating_add(1).saturating_add(i64::from(*count));
-        }
-        self.block_starts = starts;
-
-        // Older services expose only one-level top-level counts. Derive the
-        // equivalent generalized spans so the same walker handles both wire
-        // versions. A current service supplies explicit spans, including inner
-        // bundle rows nested under a work group.
-        if self.expansion_spans.is_empty() {
-            for (index, count) in self.sub_op_counts.iter().copied().enumerate() {
-                if count > 0 {
-                    if let Some(start) = self.block_starts.get(index).copied() {
-                        let _: Option<u32> = self.expansion_spans.insert(start, count);
-                    }
-                }
-            }
-        }
-        self.expanded_rows
-            .retain(|row| self.expansion_spans.contains_key(row));
-
-        self.visible_abs.clear();
-        let expansion_index_ready = self.session_flags.snapshot_established
-            || !self.sub_op_counts.is_empty()
-            || !self.expansion_spans.is_empty();
-        if !expansion_index_ready {
-            return;
-        }
-        let total = self.total.unwrap_or(0).max(0);
-        let mut abs = 0i64;
-        while abs < total {
-            self.visible_abs.push(abs);
-            if let Some(descendants) = self.expansion_spans.get(&abs).copied() {
-                if !self.expanded_rows.contains(&abs) {
-                    abs = abs.saturating_add(1).saturating_add(i64::from(descendants));
-                    continue;
-                }
-            }
-            abs = abs.saturating_add(1);
-        }
+    pub(crate) fn data_ready(&self) -> bool {
+        self.phase != SnapshotPhase::Opening
     }
 
-    /// Total number of visible rows given the current reveal state.
+    pub(crate) fn layout_ready(&self) -> bool {
+        self.phase == SnapshotPhase::LayoutReady
+    }
+
+    /// Total rows used for the virtual spacer, including its empty placeholder.
     pub(crate) fn visible_total(&self) -> i64 {
-        if self.session_flags.snapshot_established
-            || !self.sub_op_counts.is_empty()
-            || !self.expansion_spans.is_empty()
-        {
-            return i64::try_from(self.visible_abs.len())
-                .unwrap_or(i64::MAX)
-                .max(1);
-        }
-        self.total.unwrap_or(0).max(1)
+        self.expansion
+            .as_ref()
+            .map_or_else(|| self.total.unwrap_or(0), ExpansionIndex::visible_total)
+            .max(1)
     }
 
-    /// Map a visible index back to its absolute slot index (or `None` for a
-    /// hidden collapsed sub-op slot). Identity before the snapshot arrives.
+    /// DOM/diagnostics adapter from visible coordinates to expanded row slots.
     pub(crate) fn abs_index_for_visible(&self, vis: i64) -> Option<i64> {
-        if vis < 0 {
-            return None;
-        }
-        if self.session_flags.snapshot_established
-            || !self.sub_op_counts.is_empty()
-            || !self.expansion_spans.is_empty()
-        {
-            return usize::try_from(vis)
-                .ok()
-                .and_then(|index| self.visible_abs.get(index).copied());
-        }
-        Some(vis)
+        let visible = VisibleRow::new(vis)?;
+        self.expansion.as_ref().map_or_else(
+            || Some(vis),
+            |index| index.expanded_for(visible).map(ExpandedRow::get),
+        )
     }
 
-    /// Map an absolute slot index back to its visible index (inverse of
-    /// `abs_index_for_visible`); `None` for a hidden collapsed sub-op slot.
+    /// DOM/diagnostics adapter; hidden descendants have no visible coordinate.
     pub(crate) fn visible_index_for_abs(&self, abs: i64) -> Option<i64> {
-        if self.session_flags.snapshot_established
-            || !self.sub_op_counts.is_empty()
-            || !self.expansion_spans.is_empty()
-        {
-            return self
-                .visible_abs
-                .binary_search(&abs)
-                .ok()
-                .and_then(|index| i64::try_from(index).ok());
-        }
-        Some(abs)
+        let absolute = ExpandedRow::new(abs)?;
+        self.expansion.as_ref().map_or_else(
+            || Some(abs),
+            |index| index.visible_for(absolute).map(VisibleRow::get),
+        )
     }
 
-    /// Index of the top-level node whose block starts at `abs_parent_row`.
-    #[cfg(test)]
-    pub(crate) fn block_index_of_abs(&self, abs_parent_row: i64) -> Option<usize> {
-        let mut lo = 0usize;
-        let mut hi = self.block_starts.len();
-        while lo < hi {
-            let mid = lo.saturating_add(hi) >> 1;
-            if self.block_starts.get(mid).copied().unwrap_or(0) <= abs_parent_row {
-                lo = lo.saturating_add(1);
-            } else {
-                hi = mid;
-            }
-        }
-        if lo == 0 {
-            return None;
-        }
-        let b = lo.saturating_sub(1);
-        if b < self.block_starts.len()
-            && self.block_starts.get(b).copied().unwrap_or(0) == abs_parent_row
-        {
-            Some(b)
-        } else {
-            None
-        }
-    }
-
-    /// Toggle any expandable row by absolute expanded-history index.
+    /// Toggle any expandable row supplied by the DOM's absolute data index.
     pub(crate) fn toggle_expanded(&mut self, abs_parent_row: i64) -> bool {
-        if !self.expansion_spans.contains_key(&abs_parent_row) {
-            return false;
-        }
-        if !self.expanded_rows.remove(&abs_parent_row) {
-            let _: bool = self.expanded_rows.insert(abs_parent_row);
-        }
-        self.recompute_expansion();
-        true
+        ExpandedRow::new(abs_parent_row).is_some_and(|row| {
+            self.expansion
+                .as_mut()
+                .is_some_and(|index| index.toggle(row))
+        })
     }
 
     /// `toggleExpandFor` — toggle a row's reveal state and plan the
@@ -430,7 +313,7 @@ impl HistoryAppState {
 
     /// Visible row index of the top of the viewport.
     pub(crate) fn viewport_visible_top(viewport: &Viewport) -> i64 {
-        viewport.scroll_top.saturating_div(ROW_H).max(0)
+        viewport.scroll_top.row().get()
     }
 
     /// Visible row index just below the bottom of the viewport.
@@ -438,7 +321,8 @@ impl HistoryAppState {
         let top = Self::viewport_visible_top(viewport);
         let bottom = viewport
             .scroll_top
-            .saturating_add(viewport.client_height)
+            .get()
+            .saturating_add(viewport.client_height.get())
             .saturating_div(ROW_H)
             .max(top);
         self.visible_total().saturating_sub(1).min(bottom)
@@ -504,22 +388,28 @@ impl HistoryAppState {
     }
 
     /// Fetch a sparse window around an absolute find destination.
-    pub(crate) fn fetch_window_around(&mut self, abs_row: i64, step: &mut Step) {
+    pub(crate) fn fetch_window_around(&mut self, abs_row: ExpandedRow, step: &mut Step) {
         let total = self.total.unwrap_or(0);
         if total <= 0 {
             return;
         }
-        let top = abs_row.saturating_sub(BUFFER).max(0);
-        let bottom = total.saturating_sub(1).min(abs_row.saturating_add(BUFFER));
+        let top = abs_row.get().saturating_sub(BUFFER).max(0);
+        let bottom = total
+            .saturating_sub(1)
+            .min(abs_row.get().saturating_add(BUFFER));
         self.fetch_range(top, bottom, step);
     }
 
     /// Both viewport paging and find use the same snapshot-first scheduling.
     fn fetch_range(&mut self, top: i64, bottom: i64, step: &mut Step) {
-        if self.requests.pending_window().is_some() || self.total == Some(0) || top > bottom {
+        if self.phase == SnapshotPhase::Failed
+            || self.requests.pending_window().is_some()
+            || self.total == Some(0)
+            || top > bottom
+        {
             return;
         }
-        let force_snapshot = !self.session_flags.snapshot_established;
+        let force_snapshot = self.expansion.is_none();
         let range_top = if force_snapshot { 0 } else { top };
         let range_bottom = if force_snapshot {
             PAGE.saturating_sub(1).min(bottom)
@@ -530,26 +420,27 @@ impl HistoryAppState {
             return;
         }
         let start = if force_snapshot {
-            self.cache.first_missing(range_top..=range_bottom)
+            self.cache
+                .first_missing((range_top..=range_bottom).filter_map(ExpandedRow::new))
+        } else if let (Some(index), Some(top), Some(bottom)) = (
+            &self.expansion,
+            ExpandedRow::new(range_top),
+            ExpandedRow::new(range_bottom),
+        ) {
+            self.cache.first_missing(index.visible_between(top, bottom))
         } else {
-            let first = self.visible_abs.partition_point(|row| *row < range_top);
-            let visible = self.visible_abs.get(first..).unwrap_or(&[]);
-            self.cache.first_missing(
-                visible
-                    .iter()
-                    .copied()
-                    .take_while(|row| *row <= range_bottom),
-            )
+            None
         };
         let Some(start) = start else {
             return;
         };
+        let start = start.get();
         let limit = PAGE.min(range_bottom.saturating_sub(start).saturating_add(1));
         let body = get_window(
             &self.snapshot_id,
             u64::try_from(start).unwrap_or(0),
             u64::try_from(limit).unwrap_or(0),
-            self.session_flags.layout_ready,
+            self.layout_ready(),
         );
         let _: Option<u64> = self.issue_request(&body, None, step);
     }
@@ -562,38 +453,35 @@ impl HistoryAppState {
             .saturating_add(self.viewport_visible_bottom(viewport))
             / 2;
         let center_abs = self.abs_index_for_visible(center).unwrap_or(0);
-        let ready = self.session_flags.snapshot_established
-            || !self.sub_op_counts.is_empty()
-            || !self.expansion_spans.is_empty();
-        let visible_abs = &self.visible_abs;
-        self.cache.retain(
-            top.saturating_sub(BUFFER),
-            bottom.saturating_add(BUFFER),
-            |row| {
-                let visible = if ready {
-                    visible_abs
-                        .binary_search(&row)
-                        .ok()
-                        .and_then(|index| i64::try_from(index).ok())
-                } else {
-                    Some(row)
-                };
-                match visible {
-                    Some(visible) if row >= top && row <= bottom => {
-                        RetentionPriority::Requested(visible.abs_diff(center))
-                    }
-                    Some(visible) => RetentionPriority::Visible(visible.abs_diff(center)),
-                    None => RetentionPriority::Hidden(row.abs_diff(center_abs)),
+        let expansion = &self.expansion;
+        let Some(keep_top) = ExpandedRow::new(top.saturating_sub(BUFFER).max(0)) else {
+            return;
+        };
+        let Some(keep_bottom) =
+            ExpandedRow::new(bottom.saturating_add(BUFFER).min(MAX_RENDER_ROWS))
+        else {
+            return;
+        };
+        self.cache.retain(keep_top, keep_bottom, |row| {
+            let visible = expansion.as_ref().map_or_else(
+                || Some(row.get()),
+                |index| index.visible_for(row).map(VisibleRow::get),
+            );
+            match visible {
+                Some(visible) if row.get() >= top && row.get() <= bottom => {
+                    RetentionPriority::Requested(visible.abs_diff(center))
                 }
-            },
-        );
+                Some(visible) => RetentionPriority::Visible(visible.abs_diff(center)),
+                None => RetentionPriority::Hidden(row.get().abs_diff(center_abs)),
+            }
+        });
     }
 
     /// `syncWindow` — extend/trim the rendered window to the desired visible
     /// range, pushing DOM ops onto `step`. Mirrors the production additive
     /// virtual scroll.
     pub(crate) fn sync_window(&mut self, viewport: &Viewport, step: &mut Step) {
-        if self.total.unwrap_or(0) <= 0 {
+        if self.phase == SnapshotPhase::Failed || self.total.unwrap_or(0) <= 0 {
             return;
         }
         let (want_top, want_bottom) = self.desired_visible_range(viewport);
@@ -620,7 +508,7 @@ impl HistoryAppState {
         if self.render_top > want_top
             || self
                 .abs_index_for_visible(self.render_top.saturating_sub(1))
-                .is_some_and(|i| self.cache.contains_key(i))
+                .is_some_and(|i| self.cache.get_by_index(i).is_some())
         {
             let (from, to, added) =
                 self.prepend_rows_above(self.render_top.saturating_sub(want_top).max(1));
@@ -651,7 +539,7 @@ impl HistoryAppState {
                 vis = vis.saturating_add(1);
                 continue;
             };
-            if !self.cache.contains_key(abs) {
+            if self.cache.get_by_index(abs).is_none() {
                 break; // stop at first gap — keep contiguous
             }
             if from < 0 {
@@ -683,7 +571,7 @@ impl HistoryAppState {
                 vis = vis.saturating_add(1);
                 continue;
             };
-            if !self.cache.contains_key(abs) {
+            if self.cache.get_by_index(abs).is_none() {
                 break;
             }
             if from < 0 {
@@ -819,17 +707,13 @@ impl HistoryAppState {
         self.current_search_epoch
     }
 
-    /// Whether the top-level block at `block_index` is expanded.
-    #[cfg(test)]
-    pub(crate) fn is_block_expanded(&self, block_index: usize) -> bool {
-        self.block_starts
-            .get(block_index)
-            .is_some_and(|row| self.expanded_rows.contains(row))
-    }
-
     /// Whether an arbitrary expandable row is expanded.
     pub(crate) fn is_row_expanded(&self, abs: i64) -> bool {
-        self.expanded_rows.contains(&abs)
+        ExpandedRow::new(abs).is_some_and(|row| {
+            self.expansion
+                .as_ref()
+                .is_some_and(|index| index.is_expanded(row))
+        })
     }
 
     // --- selection / roving focus --------------------------------------------------
@@ -848,7 +732,7 @@ impl HistoryAppState {
     /// Rows are rebuilt by virtual scroll, so every render re-applies the
     /// selected class from this key (via [`HistoryAppState::row_context`]).
     pub(crate) fn select_row(&mut self, abs: i64) {
-        let Some(row) = self.cache.get(abs) else {
+        let Some(row) = self.cache.get_by_index(abs) else {
             return;
         };
         self.selected_key = Some(host::row::owned_str(row, "node_key"));
@@ -874,7 +758,7 @@ impl HistoryAppState {
     ) -> super::rows::RowContext {
         let find_current = self
             .current_find_match()
-            .is_some_and(|found| found.row == abs_index);
+            .is_some_and(|found| found.row.get() == abs_index);
         let expanded = self.is_row_expanded(abs_index);
         super::rows::RowContext {
             abs_index,
@@ -892,9 +776,9 @@ impl HistoryAppState {
 
     /// `normalizeFindMatch` — keep only finite, whole, in-range coordinates.
     fn normalize_find_match(&self, matched: FindInHistoryMatch) -> Option<FindMatch> {
-        let row = i64::try_from(matched.row).ok()?;
+        let row = i64::try_from(matched.row).ok().and_then(ExpandedRow::new)?;
         let total = self.total.unwrap_or(0).max(0);
-        if row >= total || matched.node_key.is_empty() {
+        if row.get() >= total || matched.node_key.is_empty() {
             return None;
         }
         Some(FindMatch {
@@ -1044,7 +928,7 @@ impl HistoryAppState {
         }
         let target = self.pending_find_target?;
         let total = self.total.unwrap_or(0).max(0);
-        if target.abs >= total {
+        if target.abs.get() >= total {
             self.pending_find_target = None;
             self.fetch_window(viewport, step);
             return None;
@@ -1059,25 +943,32 @@ impl HistoryAppState {
             return None;
         }
         self.pending_find_target = None;
-        let Some(vis) = self.visible_index_for_abs(target.abs) else {
+        let Some(vis) = self.visible_index_for_abs(target.abs.get()) else {
             return None; // hidden slot — backend only targets top-level rows
         };
         let half_viewport_rows = viewport
             .client_height
+            .get()
             .saturating_div(ROW_H)
             .saturating_div(2);
-        let target_top = vis
-            .saturating_mul(ROW_H)
+        let visible = VisibleRow::new(vis)?;
+        let target_top = visible
+            .pixel_offset()
+            .get()
             .saturating_sub(half_viewport_rows.saturating_mul(ROW_H))
             .max(0);
         step.ops.push(DomOp::SetScrollTop(target_top));
         let post_scroll_viewport = Viewport {
-            scroll_top: target_top,
+            scroll_top: Pixels::new(target_top),
             ..*viewport
         };
         self.sync_window(&post_scroll_viewport, step);
-        step.ops.push(DomOp::SetFindHighlight { abs: target.abs });
-        step.ops.push(DomOp::RevealRow { abs: target.abs });
+        step.ops.push(DomOp::SetFindHighlight {
+            abs: target.abs.get(),
+        });
+        step.ops.push(DomOp::RevealRow {
+            abs: target.abs.get(),
+        });
         step.sends.push(Send::StatusText(format!(
             "Match {} of {}{}",
             target.index.saturating_add(1),
@@ -1112,10 +1003,9 @@ impl HistoryAppState {
         step.ops.push(DomOp::FindCounter(FindCounterState::Hidden));
         self.total = None; // -1 semantics
         self.view_gen = self.view_gen.saturating_add(1);
-        self.session_flags.snapshot_established = false;
-        self.session_flags.layout_ready = false;
+        self.phase = SnapshotPhase::Opening;
+        self.announced_initial_load = false;
         self.clear_expansion_state();
-        self.recompute_expansion();
         self.requests.clear();
         self.cache.clear();
         self.total_fetched = 0;
@@ -1124,7 +1014,6 @@ impl HistoryAppState {
         step.ops.push(DomOp::SetScrollTop(0));
         self.clear_selection();
         self.roving_abs = -1;
-        self.view_flags.data_ready = false;
         Self::show_view_message(step, "Loading history…", false);
         self.fetch_window(viewport, step);
     }
@@ -1205,7 +1094,7 @@ impl HistoryAppState {
     /// error pane is the settled terminal UI, so readiness flips on (main.js
     /// sets `window.__editchainDataReady = true` in `showRequestError`).
     pub(crate) fn show_request_error(&mut self, step: &mut Step, text: &str, retry: RetryAction) {
-        self.view_flags.data_ready = true;
+        self.phase = SnapshotPhase::Failed;
         step.ops.push(DomOp::ShowRequestError {
             text: text.to_owned(),
             retry,
@@ -1256,20 +1145,28 @@ impl HistoryAppState {
                     })
                     .and_then(|opened| {
                         opened.validate()?;
+                        if i64::try_from(opened.nodes)
+                            .ok()
+                            .is_none_or(|nodes| nodes > MAX_RENDER_ROWS)
+                        {
+                            return Err(ServiceError::new(
+                                ErrorCode::InvalidInput,
+                                "History coordinates exceed the exact pixel range.",
+                            ));
+                        }
                         Ok(opened)
                     });
                 let opened = match opened {
                     Ok(opened) => opened,
                     Err(error) => {
                         self.invalidate_snapshot();
-                        self.view_flags.data_ready = true;
+                        self.phase = SnapshotPhase::Failed;
                         step.ops.push(DomOp::ProgressiveLoader(false));
                         Self::show_view_message(step, &error.message, true);
                         return;
                     }
                 };
                 self.snapshot_id = opened.snapshot_id;
-                self.view_flags.data_ready = false;
                 self.search_query.clear();
                 self.reset_find_state();
                 self.clear_selection();
@@ -1281,11 +1178,10 @@ impl HistoryAppState {
                 self.requests.clear();
                 self.cache.clear();
                 self.total_fetched = 0;
-                self.session_flags.layout_ready = false;
+                self.phase = SnapshotPhase::Opening;
+                self.announced_initial_load = false;
                 self.current_search_epoch = None;
-                self.session_flags.snapshot_established = false;
                 self.clear_expansion_state();
-                self.recompute_expansion();
                 self.open_warnings = Self::collect_open_warnings(&value);
                 if !self.open_warnings.is_empty() {
                     step.sends.push(Send::Log(format!(
@@ -1299,7 +1195,7 @@ impl HistoryAppState {
                     .push(Send::Log(format!("open: {nodes} nodes, {repos} repos")));
                 self.total = Some(nodes);
                 if nodes == 0 {
-                    self.view_flags.data_ready = true;
+                    self.phase = SnapshotPhase::LayoutReady;
                     Self::show_view_message(step, "No history found in this workspace", false);
                     return;
                 }
@@ -1329,7 +1225,7 @@ impl HistoryAppState {
                 let err_text = String::from("unknown error");
                 step.sends
                     .push(Send::Log(format!("open error: {err_text}")));
-                self.view_flags.data_ready = true;
+                self.phase = SnapshotPhase::Failed;
                 step.ops.push(DomOp::ProgressiveLoader(false));
                 Self::show_view_message(step, &format!("Failed to open history: {err_text}"), true);
                 drop(value);
@@ -1338,7 +1234,7 @@ impl HistoryAppState {
                 self.invalidate_snapshot();
                 step.sends
                     .push(Send::Log(format!("open error: {err_text}")));
-                self.view_flags.data_ready = true;
+                self.phase = SnapshotPhase::Failed;
                 step.ops.push(DomOp::ProgressiveLoader(false));
                 Self::show_view_message(step, &format!("Failed to open history: {err_text}"), true);
             }
@@ -1348,9 +1244,8 @@ impl HistoryAppState {
     fn handle_reveal(&mut self, viewport: &Viewport, step: &mut Step) {
         let top_row = self.restore_state();
         self.view_gen = self.view_gen.saturating_add(1);
-        self.session_flags.snapshot_established = false;
+        self.phase = SnapshotPhase::Opening;
         self.clear_expansion_state();
-        self.recompute_expansion();
         step.sends.push(Send::Log(format!(
             "reveal: topRow={top_row} total={}",
             self.total.unwrap_or(-1)
@@ -1490,6 +1385,7 @@ impl HistoryAppState {
 
     fn invalidate_snapshot(&mut self) {
         self.snapshot_id = SnapshotId::default();
+        self.phase = SnapshotPhase::Failed;
         self.requests.clear();
         self.cache.clear();
         self.reset_find_state();
@@ -1498,8 +1394,75 @@ impl HistoryAppState {
 
     fn fail_snapshot(&mut self, step: &mut Step, message: &str) {
         self.invalidate_snapshot();
+        step.sends
+            .retain(|send| !matches!(send, Send::Request { .. }));
         self.show_request_error(step, message, RetryAction::RefreshSnapshot);
         step.ops.push(DomOp::ProgressiveLoader(false));
+    }
+
+    /// Check the entire page before it can change layout, cache, or disclosure.
+    fn validate_window(
+        &self,
+        window: &HistoryWindow,
+        request: &GetWindowRequest,
+    ) -> Result<Option<ExpansionIndex>, ServiceError> {
+        let invalid = |message| ServiceError::new(ErrorCode::InvalidInput, message);
+        let total = i64::try_from(window.total)
+            .ok()
+            .filter(|total| (0..=MAX_RENDER_ROWS).contains(total))
+            .ok_or_else(|| invalid("History coordinates exceed the exact pixel range."))?;
+        let count = u64::try_from(window.rows.len()).map_err(|error| {
+            ServiceError::new(
+                ErrorCode::InvalidInput,
+                format!("Invalid history page length: {error}"),
+            )
+        })?;
+        if count > request.limit
+            || request
+                .offset
+                .checked_add(count)
+                .is_none_or(|end| end > window.total)
+            || (count == 0 && request.offset < window.total)
+            || u32::try_from(window.max_lane).is_err()
+        {
+            return Err(invalid(
+                "History page exceeds its requested bounds or makes no progress.",
+            ));
+        }
+        if self
+            .expansion
+            .as_ref()
+            .is_some_and(|index| index.total() != total)
+            || (self.total_fetched > 0 && self.total != Some(total))
+        {
+            return Err(invalid("History total changed within the same snapshot."));
+        }
+        let has_metadata = window.sub_op_counts.is_some() || window.expansion_spans.is_some();
+        if !has_metadata {
+            if self.expansion.is_none() && (window.layout_ready || request.include_layout) {
+                return Err(invalid("Missing history expansion metadata."));
+            }
+            return Ok(None);
+        }
+        if request.offset != 0 {
+            return Err(invalid(
+                "History expansion metadata requires an offset-zero page.",
+            ));
+        }
+        let candidate = ExpansionIndex::from_metadata(
+            total,
+            window.sub_op_counts.as_deref(),
+            window.expansion_spans.as_deref(),
+        )?;
+        if let Some(current) = &self.expansion {
+            if !current.same_snapshot(&candidate) {
+                return Err(invalid(
+                    "History expansion metadata changed within the same snapshot.",
+                ));
+            }
+            return Ok(None);
+        }
+        Ok(Some(candidate))
     }
 
     /// `GetWindow` response handling — the production two-pass hydration flow
@@ -1511,9 +1474,16 @@ impl HistoryAppState {
         viewport: &Viewport,
         step: &mut Step,
     ) {
+        let expansion = match self.validate_window(&window, request) {
+            Ok(expansion) => expansion,
+            Err(error) => {
+                self.fail_response(&RequestBody::GetWindow(request.clone()), &error, step);
+                return;
+            }
+        };
         let response_layout_ready = window.layout_ready;
         if response_layout_ready {
-            self.session_flags.layout_ready = true;
+            self.phase = SnapshotPhase::LayoutReady;
         }
         self.total = Some(i64::try_from(window.total).unwrap_or(i64::MAX));
         if response_layout_ready {
@@ -1525,34 +1495,32 @@ impl HistoryAppState {
             }
         }
         // The offset-zero page establishes the fixed expansion coordinates.
-        if let Some(counts) = window.sub_op_counts {
-            self.sub_op_counts = counts
-                .into_iter()
-                .map(|count| u32::try_from(count).unwrap_or(0))
-                .collect();
-            self.expansion_spans.clear();
-            if let Some(spans) = window.expansion_spans {
-                for span in spans {
-                    if let (Ok(row), Ok(descendants)) = (
-                        i64::try_from(span.row),
-                        u32::try_from(span.descendant_count),
-                    ) {
-                        if descendants > 0 {
-                            let _: Option<u32> = self.expansion_spans.insert(row, descendants);
-                        }
-                    }
-                }
-            }
-            self.session_flags.snapshot_established = true;
-            self.recompute_expansion();
+        if let Some(expansion) = expansion {
+            self.expansion = Some(expansion);
             step.ops.push(DomOp::Reanchor {
                 top: self.render_top,
                 bottom: self.render_bottom,
             });
         }
+        // Claim hydration before a find jump or viewport sync can schedule
+        // another page, including when collapsed descendants create a gap.
+        let hydrate = !response_layout_ready && !request.include_layout;
+        if hydrate {
+            let body = RequestBody::GetWindow(GetWindowRequest {
+                include_layout: true,
+                ..request.clone()
+            });
+            if self.issue_request(&body, None, step).is_none() {
+                return;
+            }
+        }
         let base = i64::try_from(request.offset).unwrap_or(i64::MAX);
         for (index, row) in window.rows.into_iter().enumerate() {
-            let abs = base.saturating_add(i64::try_from(index).unwrap_or(0));
+            let Some(abs) =
+                ExpandedRow::new(base.saturating_add(i64::try_from(index).unwrap_or(0)))
+            else {
+                continue;
+            };
             if !self.cache.contains_key(abs) {
                 self.total_fetched = self.total_fetched.saturating_add(1);
             }
@@ -1580,10 +1548,12 @@ impl HistoryAppState {
         }
         self.evict_far_windows(&effective_viewport);
         self.sync_window(&effective_viewport, step);
-        self.view_flags.data_ready = true;
+        if self.phase == SnapshotPhase::Opening {
+            self.phase = SnapshotPhase::RowsReady;
+        }
         let total = self.total.unwrap_or(0);
-        if !self.session_flags.announced_initial_load && total > 0 {
-            self.session_flags.announced_initial_load = true;
+        if !self.announced_initial_load && total > 0 {
+            self.announced_initial_load = true;
             Self::announce(
                 &format!("Loaded {} history rows", self.visible_total()),
                 step,
@@ -1600,12 +1570,7 @@ impl HistoryAppState {
         )));
         self.report_status(viewport, step);
         step.save_state = Some(Self::persisted_state(viewport));
-        if !response_layout_ready && !request.include_layout {
-            let body = RequestBody::GetWindow(GetWindowRequest {
-                include_layout: true,
-                ..request.clone()
-            });
-            let _: Option<u64> = self.issue_request(&body, None, step);
+        if hydrate {
             return;
         }
         if let Some(target) = self.pending_find_target {
@@ -1619,7 +1584,26 @@ impl HistoryAppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use editchain_protocol::ExpansionSpanDto;
     use serde_json::json;
+
+    fn abs(row: i64) -> ExpandedRow {
+        ExpandedRow::new(row).unwrap()
+    }
+
+    fn flat_expansion(total: i64) -> ExpansionIndex {
+        ExpansionIndex::from_metadata(total, None, Some(&[])).unwrap()
+    }
+
+    fn counted_expansion(total: i64, counts: &[usize]) -> ExpansionIndex {
+        ExpansionIndex::from_metadata(total, Some(counts), None).unwrap()
+    }
+
+    fn visible_rows(state: &HistoryAppState) -> Vec<i64> {
+        (0..state.visible_total())
+            .filter_map(|row| state.abs_index_for_visible(row))
+            .collect()
+    }
 
     fn vp() -> Viewport {
         Viewport::new(0, 800)
@@ -1731,6 +1715,126 @@ mod tests {
     }
 
     #[test]
+    fn invalid_windows_leave_metadata_and_rows_unpublished_until_retry() {
+        for changes in [
+            json!({"rows": []}),
+            json!({"total": 0}),
+            json!({"total": u64::MAX}),
+            json!({"sub_op_counts": [500]}),
+            json!({"sub_op_counts": null}),
+            json!({"expansion_spans": [{"row": 499, "descendant_count": 1}]}),
+        ] {
+            let mut state = fixture_state();
+            state.handle_host_message(open_msg(500), &vp(), &mut Step::new());
+            let id = state.requests.pending_window().unwrap();
+            let mut response = window_response(0, 1, 500, Some((9, Some(&vec![0; 500]))));
+            response
+                .get_mut("Ok")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .extend(changes.as_object().unwrap().clone());
+            let mut step = Step::new();
+            state.handle_host_message(resp(id, &response), &vp(), &mut step);
+            assert!(state.cache.is_empty());
+            assert!(state.expansion.is_none());
+            assert_eq!(state.total, Some(500));
+            assert_eq!(state.max_lane, 2);
+            assert_eq!(state.total_fetched, 0);
+            assert_eq!(state.phase, SnapshotPhase::Failed);
+            assert!(step
+                .ops
+                .iter()
+                .any(|op| matches!(op, DomOp::ShowRequestError { .. })));
+            state.fetch_window(&vp(), &mut step);
+            assert!(!step
+                .sends
+                .iter()
+                .any(|send| matches!(send, Send::Request { .. })));
+            state.reset_history(&vp(), &mut step);
+            assert_eq!(state.phase, SnapshotPhase::Opening);
+            assert!(state.requests.pending_window().is_some());
+        }
+    }
+
+    #[test]
+    fn page_length_and_snapshot_topology_are_checked_before_replacement() {
+        let mut state = fixture_state();
+        state.handle_host_message(open_msg(500), &vp(), &mut Step::new());
+        let id = state.requests.pending_window().unwrap();
+        let oversized = window_response(0, 425, 500, Some((2, Some(&vec![0; 500]))));
+        state.handle_host_message(resp(id, &oversized), &vp(), &mut Step::new());
+        assert!(state.cache.is_empty());
+        assert_eq!(state.phase, SnapshotPhase::Failed);
+
+        let mut state = HistoryAppState {
+            total: Some(6),
+            expansion: Some(counted_expansion(6, &[2, 0, 1])),
+            ..fixture_state()
+        };
+        assert!(state.toggle_expanded(0));
+        for (offset, total, counts) in [
+            (0, 7, vec![3, 0, 1]),
+            (0, 6, vec![0; 6]),
+            (1, 6, vec![2, 0, 1]),
+        ] {
+            let response = window_response(offset, 1, total, Some((2, Some(&counts))));
+            let envelope = resp(1, &response).body.unwrap();
+            let window: HistoryWindow = host::decode(envelope.get("Ok").unwrap().clone()).unwrap();
+            let request = GetWindowRequest {
+                snapshot_id: state.snapshot_id.clone(),
+                offset: u64::try_from(offset).unwrap(),
+                limit: 1,
+                include_layout: true,
+            };
+            assert!(state.validate_window(&window, &request).is_err());
+        }
+        assert_eq!(visible_rows(&state), vec![0, 1, 2, 3, 4]);
+        assert!(state.is_row_expanded(0));
+    }
+
+    #[test]
+    fn collapsed_provisional_page_claims_hydration_before_filling_a_distant_gap() {
+        let mut state = fixture_state();
+        state.handle_host_message(open_msg(2), &vp(), &mut Step::new());
+        let id = state.requests.pending_window().unwrap();
+        let mut response = window_response(0, 2, 1002, Some((0, Some(&vec![1000, 0]))));
+        *response
+            .get_mut("Ok")
+            .unwrap()
+            .get_mut("layout_ready")
+            .unwrap() = json!(false);
+        let mut step = Step::new();
+        state.handle_host_message(resp(id, &response), &vp(), &mut step);
+        assert_eq!(state.phase, SnapshotPhase::RowsReady);
+        assert_eq!(state.visible_total(), 2);
+        assert_eq!(last_get_window(&state)["offset"], 0);
+        assert_eq!(last_get_window(&state)["include_layout"], true);
+        assert_eq!(
+            step.sends
+                .iter()
+                .filter(|send| matches!(send, Send::Request { .. }))
+                .count(),
+            1
+        );
+        assert!(state.toggle_expanded(0));
+        let hydration = state.requests.pending_window().unwrap();
+        *response
+            .get_mut("Ok")
+            .unwrap()
+            .get_mut("layout_ready")
+            .unwrap() = json!(true);
+        state.handle_host_message(resp(hydration, &response), &vp(), &mut Step::new());
+        assert_eq!(state.phase, SnapshotPhase::LayoutReady);
+        assert_eq!(state.visible_total(), 1002);
+        assert!(
+            state.is_row_expanded(0),
+            "identical layout metadata retains local disclosure"
+        );
+        assert_eq!(last_get_window(&state)["offset"], 2);
+    }
+
+    #[test]
     fn current_request_rejects_another_snapshot_and_refresh_starts_a_new_open() {
         let mut state = HistoryAppState::default();
         let mut step = Step::new();
@@ -1795,13 +1899,9 @@ mod tests {
     fn offscreen_find_checks_the_node_key_when_its_page_arrives() {
         let mut state = HistoryAppState {
             total: Some(2000),
-            session_flags: SessionFlags {
-                snapshot_established: true,
-                ..SessionFlags::default()
-            },
+            expansion: Some(flat_expansion(2000)),
             ..fixture_state()
         };
-        state.recompute_expansion();
         let mut search = Step::new();
         state.submit_find("needle", &mut search);
         let id = state.requests.log().last().unwrap().id;
@@ -1860,7 +1960,7 @@ mod tests {
         state.handle_host_message(open_msg(1200), &vp(), &mut step);
 
         assert_eq!(state.total, Some(1200));
-        assert!(!state.view_flags.data_ready);
+        assert!(!state.data_ready());
         // The scaffold is re-anchored immediately (placeholders fill in later):
         // visible bottom (row 23 at 800px / ROW_H 34) + BUFFER 400 = 423,
         // matching main.js `desiredVisibleRange()` at open.
@@ -1907,7 +2007,7 @@ mod tests {
         // Pass 1: rows only (no layout), offset 0.
         let mut step2 = Step::new();
         state.handle_host_message(
-            resp(pending, &window_response(0, 500, 1200, None)),
+            resp(pending, &window_response(0, 424, 1200, None)),
             &vp(),
             &mut step2,
         );
@@ -1916,10 +2016,10 @@ mod tests {
             Some(2),
             "the pending slot is synchronously re-claimed by the layout hydration re-issue"
         );
-        assert_eq!(state.cache.len(), 500, "rows land at the requested offset");
-        assert!(state.cache.contains_key(499));
-        assert!(!state.cache.contains_key(500));
-        assert!(!state.session_flags.layout_ready);
+        assert_eq!(state.cache.len(), 424, "rows land at the requested offset");
+        assert!(state.cache.contains_key(abs(423)));
+        assert!(!state.cache.contains_key(abs(424)));
+        assert!(!state.layout_ready());
         // ...and the exact same page is re-issued with include_layout=true.
         let hydration = state
             .requests
@@ -1962,13 +2062,13 @@ mod tests {
         state.handle_host_message(
             resp(
                 pending,
-                &window_response(0, 500, 1200, Some((5, Some(&vec![0; 1200])))),
+                &window_response(0, 424, 1200, Some((5, Some(&vec![0; 1200])))),
             ),
             &vp(),
             &mut step3,
         );
-        assert!(state.session_flags.snapshot_established);
-        assert!(state.session_flags.layout_ready);
+        assert!(state.expansion.is_some());
+        assert!(state.layout_ready());
         assert_eq!(state.max_lane, 5);
         assert!(step3
             .ops
@@ -1979,10 +2079,10 @@ mod tests {
             .iter()
             .any(|op| matches!(op, DomOp::Reanchor { .. })));
         assert!(
-            state.view_flags.data_ready,
-            "readiness is owned by the authoritative ViewFlags flag"
+            state.data_ready(),
+            "readiness follows the installed snapshot phase"
         );
-        assert_eq!(state.cache.len(), 500);
+        assert_eq!(state.cache.len(), 424);
         // The desired cache range (viewport 0..23 + BUFFER 400) is fully
         // cached after this page, so no further window request is issued; the
         // last request log entry stays the layout hydration of the same page.
@@ -1993,7 +2093,7 @@ mod tests {
         assert_eq!(next.len(), 4);
         assert!(step3.sends.iter().any(|s| matches!(
             s,
-            Send::Log(text) if text.starts_with("cached 500/1200 nodes (fetched 500)")
+            Send::Log(text) if text.starts_with("cached 424/1200 nodes (fetched 424)")
         )));
     }
 
@@ -2077,7 +2177,7 @@ mod tests {
         let mut state = fixture_state();
         let mut step = Step::new();
         state.handle_host_message(open_msg(1200), &vp(), &mut step);
-        state.session_flags.snapshot_established = true; // skip further window fetches
+        state.expansion = Some(flat_expansion(1200)); // skip further window fetches
 
         let mut step2 = Step::new();
         state.submit_find("needle", &mut step2);
@@ -2152,7 +2252,7 @@ mod tests {
             &mut step4,
         );
         assert_eq!(state.find_matches.len(), 1);
-        assert_eq!(state.find_matches.first().map(|m| m.row), Some(4));
+        assert_eq!(state.find_matches.first().map(|m| m.row.get()), Some(4));
     }
 
     #[test]
@@ -2163,16 +2263,12 @@ mod tests {
         let live_viewport = Viewport::new(12_000, 400);
         let mut state = HistoryAppState {
             total: Some(5000),
-            session_flags: SessionFlags {
-                layout_ready: true,
-                snapshot_established: true, // identity mapping, no sub-op blocks
-                ..SessionFlags::default()
-            },
+            phase: SnapshotPhase::LayoutReady,
+            expansion: Some(flat_expansion(5000)),
             ..fixture_state()
         };
-        state.recompute_expansion();
         for i in 0..500i64 {
-            drop(state.cache.insert(i, row(i, &format!("node:{i}"), 1)));
+            drop(state.cache.insert(abs(i), row(i, &format!("node:{i}"), 1)));
         }
 
         let mut step = Step::new();
@@ -2201,7 +2297,7 @@ mod tests {
         assert_eq!(
             state.pending_find_target,
             Some(FindTarget {
-                abs: 2500,
+                abs: abs(2500),
                 index: 0
             })
         );
@@ -2235,7 +2331,7 @@ mod tests {
             &live_viewport,
             &mut step3,
         );
-        assert!(state.cache.contains_key(2500), "target row is cached");
+        assert!(state.cache.contains_key(abs(2500)), "target row is cached");
         assert_eq!(
             state.pending_find_target, None,
             "jump completes once cached"
@@ -2292,15 +2388,11 @@ mod tests {
         let live_viewport = Viewport::new(0, 400);
         let mut state = HistoryAppState {
             total: Some(500),
-            session_flags: SessionFlags {
-                snapshot_established: true, // identity mapping
-                ..SessionFlags::default()
-            },
+            expansion: Some(flat_expansion(500)),
             ..fixture_state()
         };
-        state.recompute_expansion();
         for i in 0..500i64 {
-            drop(state.cache.insert(i, row(i, &format!("node:{i}"), 1)));
+            drop(state.cache.insert(abs(i), row(i, &format!("node:{i}"), 1)));
         }
 
         let mut step = Step::new();
@@ -2347,15 +2439,11 @@ mod tests {
     fn find_navigation_wraps_and_counter_text_matches_production() {
         let mut state = HistoryAppState {
             total: Some(10),
-            session_flags: SessionFlags {
-                snapshot_established: true,
-                ..SessionFlags::default()
-            },
+            expansion: Some(flat_expansion(10)),
             ..fixture_state()
         };
-        state.recompute_expansion();
         for i in 0..10i64 {
-            drop(state.cache.insert(i, row(i, &format!("node:{i}"), 1)));
+            drop(state.cache.insert(abs(i), row(i, &format!("node:{i}"), 1)));
         }
         let mut step = Step::new();
         state.submit_find("needle", &mut step);
@@ -2371,7 +2459,7 @@ mod tests {
         assert_eq!(state.find_index(), 0);
         assert_eq!(state.find_total(), 3);
         assert!(!state.find_more(), "returned all candidates");
-        assert_eq!(state.current_find_match().map(|m| m.row), Some(0));
+        assert_eq!(state.current_find_match().map(|m| m.row.get()), Some(0));
         assert_eq!(
             HistoryAppState::find_counter_text(&FindCounterState::Settled {
                 index: 0,
@@ -2384,15 +2472,21 @@ mod tests {
         state.navigate_find(1, &vp(), &mut step2);
         assert_eq!(state.find_index, 1);
         assert_eq!(state.find_index(), 1);
-        assert_eq!(state.current_find_match().map(|m| m.row), Some(5));
+        assert_eq!(state.current_find_match().map(|m| m.row.get()), Some(5));
         assert_eq!(
-            state.find_matches.get(state.find_index).map(|m| m.row),
+            state
+                .find_matches
+                .get(state.find_index)
+                .map(|m| m.row.get()),
             Some(5)
         );
         state.navigate_find(1, &vp(), &mut step2);
         assert_eq!(state.find_index, 2);
         assert_eq!(
-            state.find_matches.get(state.find_index).map(|m| m.row),
+            state
+                .find_matches
+                .get(state.find_index)
+                .map(|m| m.row.get()),
             Some(9)
         );
         state.navigate_find(1, &vp(), &mut step2);
@@ -2480,23 +2574,58 @@ mod tests {
     }
 
     #[test]
+    fn million_row_disclosure_preserves_rank_at_distant_boundaries() {
+        use std::{hint::black_box, io::Write, time::Instant};
+
+        let mut counts = vec![0; 1_000_000];
+        *counts.get_mut(100).unwrap() = 5;
+        *counts.get_mut(999_900).unwrap() = 5;
+        let mut state = HistoryAppState {
+            total: Some(1_000_010),
+            ..fixture_state()
+        };
+        let installed = Instant::now();
+        state.expansion = Some(counted_expansion(1_000_010, &counts));
+        let install_time = installed.elapsed();
+        let toggled = Instant::now();
+        for _ in 0..20 {
+            assert_eq!(state.visible_total(), 1_000_000);
+            assert_eq!(state.abs_index_for_visible(101), Some(106));
+            assert_eq!(state.visible_index_for_abs(105), None);
+            assert_eq!(state.abs_index_for_visible(999_999), Some(1_000_009));
+            assert!(state.toggle_expanded(100));
+            assert_eq!(state.visible_total(), 1_000_005);
+            assert_eq!(state.abs_index_for_visible(105), Some(105));
+            assert_eq!(state.visible_index_for_abs(1_000_009), Some(1_000_004));
+            assert_eq!(state.visible_index_for_abs(999_906), None);
+            let _: &HistoryAppState = black_box(&state);
+            assert!(state.toggle_expanded(100));
+        }
+        let toggle_time = toggled.elapsed();
+        assert_eq!(state.total, Some(1_000_010));
+        if std::env::var_os("EDITCHAIN_MEASURE_RENDERER").is_some() {
+            writeln!(
+                std::io::stdout(),
+                "million-row disclosure: install={install_time:?}, 40 toggles={toggle_time:?}"
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
     fn expansion_prefix_sums_mapping_and_toggle_never_change_total() {
         let mut state = HistoryAppState {
             total: Some(6),
-            sub_op_counts: vec![2, 0, 1],
+            expansion: Some(counted_expansion(6, &[2, 0, 1])),
             ..fixture_state()
         };
-        state.recompute_expansion();
-        assert_eq!(state.block_starts, vec![0, 3, 4]);
-        assert_eq!(state.block_index_of_abs(0), Some(0));
-        assert_eq!(state.block_index_of_abs(3), Some(1));
-        assert_eq!(state.block_index_of_abs(4), Some(2));
+        assert_eq!(visible_rows(&state), vec![0, 3, 4]);
         assert_eq!(
             state.visible_total(),
             3,
             "collapsed view hides 3 sub-op slots"
         );
-        assert!(!state.is_block_expanded(0), "collapsed by default");
+        assert!(!state.is_row_expanded(0), "collapsed by default");
         assert_eq!(state.abs_index_for_visible(0), Some(0));
         assert_eq!(
             state.abs_index_for_visible(1),
@@ -2511,7 +2640,7 @@ mod tests {
         );
 
         assert!(state.toggle_expanded(0), "top-level bundle toggles open");
-        assert!(state.is_block_expanded(0));
+        assert!(state.is_row_expanded(0));
         assert_eq!(state.visible_total(), 5);
         assert_eq!(state.abs_index_for_visible(1), Some(1));
         assert_eq!(state.abs_index_for_visible(2), Some(2));
@@ -2530,7 +2659,7 @@ mod tests {
         );
 
         assert!(state.toggle_expanded(0), "toggles back closed");
-        assert!(!state.is_block_expanded(0));
+        assert!(!state.is_row_expanded(0));
         assert_eq!(state.visible_total(), 3);
         assert_eq!(state.abs_index_for_visible(1), Some(3));
         assert_eq!(
@@ -2538,7 +2667,7 @@ mod tests {
             Some(6),
             "expansion is a rendering decision only"
         );
-        assert_eq!(state.block_index_of_abs(1), None);
+        assert_eq!(state.visible_index_for_abs(1), None);
         assert!(!state.toggle_expanded(1));
     }
 
@@ -2546,31 +2675,41 @@ mod tests {
     fn nested_expansion_spans_hide_inner_children_until_both_levels_are_open() {
         let mut state = HistoryAppState {
             total: Some(7),
-            session_flags: SessionFlags {
-                snapshot_established: true,
-                ..SessionFlags::default()
-            },
-            sub_op_counts: vec![5, 0],
-            expansion_spans: BTreeMap::from([(0, 5), (1, 2)]),
+            expansion: Some(
+                ExpansionIndex::from_metadata(
+                    7,
+                    Some(&[5, 0]),
+                    Some(&[
+                        ExpansionSpanDto {
+                            row: 0,
+                            descendant_count: 5,
+                        },
+                        ExpansionSpanDto {
+                            row: 1,
+                            descendant_count: 2,
+                        },
+                    ]),
+                )
+                .unwrap(),
+            ),
             ..fixture_state()
         };
-        state.recompute_expansion();
-        assert_eq!(state.visible_abs, vec![0, 6]);
+        assert_eq!(visible_rows(&state), vec![0, 6]);
 
         assert!(state.toggle_expanded(0));
         assert_eq!(
-            state.visible_abs,
+            visible_rows(&state),
             vec![0, 1, 4, 5, 6],
             "opening the work group reveals activities but keeps an inner bundle collapsed"
         );
         assert_eq!(state.visible_index_for_abs(2), None);
 
         assert!(state.toggle_expanded(1));
-        assert_eq!(state.visible_abs, vec![0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(visible_rows(&state), vec![0, 1, 2, 3, 4, 5, 6]);
         assert_eq!(state.visible_index_for_abs(2), Some(2));
 
         assert!(state.toggle_expanded(0));
-        assert_eq!(state.visible_abs, vec![0, 6]);
+        assert_eq!(visible_rows(&state), vec![0, 6]);
         assert!(
             state.is_row_expanded(1),
             "inner disclosure state is retained"
@@ -2615,13 +2754,12 @@ mod tests {
 
     #[test]
     fn desired_cache_range_maps_visible_window_plus_buffer_after_snapshot() {
-        let mut state = HistoryAppState {
+        let state = HistoryAppState {
             total: Some(6),
-            sub_op_counts: vec![0, 1, 0, 1],
+            expansion: Some(counted_expansion(6, &[0, 1, 0, 1])),
             ..fixture_state()
         };
-        state.recompute_expansion();
-        assert_eq!(state.block_starts, vec![0, 1, 3, 4]);
+        assert_eq!(visible_rows(&state), vec![0, 1, 3, 4]);
         assert_eq!(state.visible_total(), 4);
         // Deep scroll into visible slots 2..3 (absolute slot 2 and a hidden
         // collapsed sub-op slot of block 3).
@@ -2640,32 +2778,28 @@ mod tests {
     fn evict_far_windows_bounds_the_cache_around_the_desired_range() {
         let mut state = HistoryAppState {
             total: Some(2000),
-            session_flags: SessionFlags {
-                snapshot_established: true,
-                ..SessionFlags::default()
-            },
+            expansion: Some(flat_expansion(2000)),
             ..fixture_state()
         };
-        state.recompute_expansion();
         for i in 0..2000i64 {
-            drop(state.cache.insert(i, row(i, &format!("node:{i}"), 1)));
+            drop(state.cache.insert(abs(i), row(i, &format!("node:{i}"), 1)));
         }
         state.evict_far_windows(&vp());
-        assert!(!state.cache.contains_key(1500), "far rows evicted");
-        assert!(state.cache.contains_key(0));
+        assert!(!state.cache.contains_key(abs(1500)), "far rows evicted");
+        assert!(state.cache.contains_key(abs(0)));
         // Desired cache range bottom is viewport bottom (row 23) + BUFFER 400
         // = absolute 423 (identity mapping); main.js `evictFarWindows` keeps
         // an extra BUFFER margin, so everything beyond 423 + 400 = 823 drops.
         assert!(
-            state.cache.contains_key(423),
+            state.cache.contains_key(abs(423)),
             "the desired-range bottom stays cached"
         );
         assert!(
-            state.cache.contains_key(823),
+            state.cache.contains_key(abs(823)),
             "the eviction BUFFER margin stays cached"
         );
         assert!(
-            !state.cache.contains_key(824),
+            !state.cache.contains_key(abs(824)),
             "rows past the eviction BUFFER margin are evicted"
         );
         assert_eq!(state.cache.len(), 824);
@@ -2675,16 +2809,11 @@ mod tests {
     fn paging_skips_large_collapsed_spans_and_retains_visible_rows_first() {
         let mut state = HistoryAppState {
             total: Some(50_002),
-            session_flags: SessionFlags {
-                snapshot_established: true,
-                layout_ready: true,
-                ..SessionFlags::default()
-            },
-            sub_op_counts: vec![50_000, 0],
+            phase: SnapshotPhase::LayoutReady,
+            expansion: Some(counted_expansion(50_002, &[50_000, 0])),
             ..fixture_state()
         };
-        state.recompute_expansion();
-        drop(state.cache.insert(0, row(0, "first", 1)));
+        drop(state.cache.insert(abs(0), row(0, "first", 1)));
         let mut step = Step::new();
         state.fetch_window(&vp(), &mut step);
         let pending = state.requests.pending_window().unwrap();
@@ -2704,7 +2833,7 @@ mod tests {
             "skip hidden descendants before requesting another page"
         );
         assert_eq!(request.limit, 1);
-        state.fetch_window_around(50_001, &mut step);
+        state.fetch_window_around(abs(50_001), &mut step);
         assert_eq!(
             state.requests.len(),
             1,
@@ -2725,13 +2854,13 @@ mod tests {
         );
         assert_eq!(state.requests.log().len(), 1);
         for hidden in 1..5000 {
-            drop(state.cache.insert(hidden, row(hidden, "hidden", 1)));
+            drop(state.cache.insert(abs(hidden), row(hidden, "hidden", 1)));
         }
         state.evict_far_windows(&vp());
         assert_eq!(state.cache.len(), MAX_CACHED_ROWS);
-        assert!(state.cache.contains_key(0));
+        assert!(state.cache.contains_key(abs(0)));
         assert!(
-            state.cache.contains_key(50_001),
+            state.cache.contains_key(abs(50_001)),
             "visible rows outrank nearby hidden payloads"
         );
     }
@@ -2740,14 +2869,10 @@ mod tests {
     fn forward_and_backward_paging_stays_within_the_cache_budget() {
         let mut state = HistoryAppState {
             total: Some(20_000),
-            session_flags: SessionFlags {
-                snapshot_established: true,
-                layout_ready: true,
-                ..SessionFlags::default()
-            },
+            phase: SnapshotPhase::LayoutReady,
+            expansion: Some(flat_expansion(20_000)),
             ..fixture_state()
         };
-        state.recompute_expansion();
         for (top, height) in [
             (0_i64, 800),
             (5000, 800),
@@ -2794,7 +2919,7 @@ mod tests {
                 "paging converges at viewport {top}"
             );
             assert!(
-                state.cache.contains_key(top),
+                state.cache.contains_key(abs(top)),
                 "visible content stays cached at {top}"
             );
         }
@@ -2804,16 +2929,12 @@ mod tests {
     fn sync_window_reanchors_when_offscreen_window_moves() {
         let mut state = HistoryAppState {
             total: Some(2000),
-            session_flags: SessionFlags {
-                snapshot_established: true,
-                layout_ready: true,
-                ..SessionFlags::default()
-            },
+            phase: SnapshotPhase::LayoutReady,
+            expansion: Some(flat_expansion(2000)),
             ..fixture_state()
         };
-        state.recompute_expansion();
         for i in 0..2000i64 {
-            drop(state.cache.insert(i, row(i, &format!("node:{i}"), 1)));
+            drop(state.cache.insert(abs(i), row(i, &format!("node:{i}"), 1)));
         }
         state.render_top = 0;
         state.render_bottom = 399;
@@ -2844,7 +2965,7 @@ mod tests {
         let mut state = fixture_state();
         let mut step = Step::new();
         state.handle_host_message(open_msg(0), &vp(), &mut step);
-        assert!(state.view_flags.data_ready);
+        assert!(state.data_ready());
         assert!(step.ops.iter().any(|op| matches!(
             op,
             DomOp::ShowMessage { text, error: false } if text == "No history found in this workspace"
@@ -2865,7 +2986,7 @@ mod tests {
             &vp(),
             &mut step2,
         );
-        assert!(state2.view_flags.data_ready);
+        assert!(state2.data_ready());
         assert!(step2.ops.iter().any(|op| matches!(
             op,
             DomOp::ShowMessage { text, error: true } if text == "Failed to open history: service unavailable"
@@ -2918,10 +3039,7 @@ mod tests {
             op,
             DomOp::FindCounter(FindCounterState::Error(e)) if e == "find service error"
         )));
-        assert!(
-            !state.view_flags.data_ready,
-            "find errors never flip readiness"
-        );
+        assert!(!state.data_ready(), "find errors never flip readiness");
 
         let mut step3 = Step::new();
         state.show_request_error(
@@ -2934,22 +3052,18 @@ mod tests {
             DomOp::ShowRequestError { text, retry: RetryAction::ResetHistory }
                 if text == "Failed to load history rows: dead service"
         )));
-        assert!(state.view_flags.data_ready);
+        assert!(state.data_ready());
     }
 
     #[test]
     fn find_navigation_enabled_guards_the_exact_submitted_query() {
         let mut state = HistoryAppState {
             total: Some(10),
-            session_flags: SessionFlags {
-                snapshot_established: true,
-                ..SessionFlags::default()
-            },
+            expansion: Some(flat_expansion(10)),
             ..fixture_state()
         };
-        state.recompute_expansion();
         for i in 0..10i64 {
-            drop(state.cache.insert(i, row(i, &format!("node:{i}"), 1)));
+            drop(state.cache.insert(abs(i), row(i, &format!("node:{i}"), 1)));
         }
         let mut step = Step::new();
         state.submit_find("needle", &mut step);
@@ -2995,16 +3109,11 @@ mod tests {
     fn selection_and_roving_state_feed_the_live_row_context() {
         let mut state = HistoryAppState {
             total: Some(6),
-            session_flags: SessionFlags {
-                snapshot_established: true,
-                ..SessionFlags::default()
-            },
-            sub_op_counts: vec![2, 0],
+            expansion: Some(counted_expansion(6, &[2, 0, 0, 0])),
             ..fixture_state()
         };
-        state.recompute_expansion();
         for i in 0..6i64 {
-            drop(state.cache.insert(i, row(i, &format!("node:{i}"), 1)));
+            drop(state.cache.insert(abs(i), row(i, &format!("node:{i}"), 1)));
         }
         // Select row 1 and pin the roving anchor to row 3.
         state.select_row(1);
@@ -3014,8 +3123,10 @@ mod tests {
         let context = state.row_context(1, false);
         assert_eq!(context.selected_key.as_deref(), Some("node:1"));
         assert_eq!(context.roving_abs, Some(3));
-        let selected_spec =
-            super::super::rows::RowSpec::from_value(state.cache.get(1).expect("row 1"), &context);
+        let selected_spec = super::super::rows::RowSpec::from_value(
+            state.cache.get(abs(1)).expect("row 1"),
+            &context,
+        );
         assert!(selected_spec.classes().contains("row-selected"));
         let unselected = state.row_context(2, false);
         assert_eq!(
@@ -3029,7 +3140,7 @@ mod tests {
             "the context carries the roving anchor for every row"
         );
         let unselected_spec = super::super::rows::RowSpec::from_value(
-            state.cache.get(2).expect("row 2"),
+            state.cache.get(abs(2)).expect("row 2"),
             &unselected,
         );
         assert!(
@@ -3041,7 +3152,7 @@ mod tests {
             "only the roving anchor row is tabbable"
         );
         let anchor_spec = super::super::rows::RowSpec::from_value(
-            state.cache.get(3).expect("row 3"),
+            state.cache.get(abs(3)).expect("row 3"),
             &state.row_context(3, false),
         );
         assert_eq!(anchor_spec.aria.tabindex, 0);
@@ -3073,21 +3184,16 @@ mod tests {
     fn toggle_expanded_ui_reanchors_the_desired_window_and_fetches() {
         let mut state = HistoryAppState {
             total: Some(11),
-            session_flags: SessionFlags {
-                snapshot_established: true,
-                ..SessionFlags::default()
-            },
-            sub_op_counts: vec![4, 0, 4],
+            expansion: Some(counted_expansion(11, &[4, 0, 4])),
             ..fixture_state()
         };
-        state.recompute_expansion();
         for i in [0, 5, 6] {
-            drop(state.cache.insert(i, row(i, &format!("node:{i}"), 1)));
+            drop(state.cache.insert(abs(i), row(i, &format!("node:{i}"), 1)));
         }
         let viewport = Viewport::new(0, 800);
         let mut step = Step::new();
         state.toggle_expanded_ui(0, &viewport, &mut step);
-        assert!(state.is_block_expanded(0), "the parent block toggles open");
+        assert!(state.is_row_expanded(0), "the parent block toggles open");
         let (want_top, want_bottom) = state.desired_visible_range(&viewport);
         assert_eq!(state.render_top, want_top);
         assert_eq!(state.render_bottom, want_bottom);
@@ -3109,7 +3215,7 @@ mod tests {
         // A non-expandable row never toggles.
         let mut step2 = Step::new();
         state.toggle_expanded_ui(1, &viewport, &mut step2);
-        assert!(!state.is_block_expanded(1));
+        assert!(!state.is_row_expanded(5));
         assert!(step2.ops.is_empty());
     }
 }

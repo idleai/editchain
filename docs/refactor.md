@@ -232,9 +232,27 @@ Completed increments:
   races. Native renderer tests, WASM clippy, and the browser/host harness pass;
   generated production WASM assets are included.
 
+- Renderer snapshot geometry: validated expansion spans replace the per-row
+  visibility vector and repeated top-level prefix sums. Disclosure visits spans
+  and stores visible intervals; rank/select and sparse paging cross collapsed
+  gaps without walking hidden rows. Expanded row, visible row, and pixel types
+  separate cache/find coordinates from DOM measurements. Page ingestion checks
+  request bounds, progress, exact pixel coordinates, count totals, duplicate and
+  crossing spans, and unchanged snapshot topology before publishing metadata or
+  rows. Layout hydration retains disclosure and claims the request slot before
+  viewport paging. Explicit Opening, RowsReady, LayoutReady, and Failed phases
+  replace independently mutable readiness flags; terminal page failures wait
+  for Retry. The existing native million-row regression measured 40 toggles at
+  229.8 ms before and 0.010 ms after, with initial installation at 18.6 ms and
+  4.0 ms respectively. These are local release measurements with two expandable
+  spans, not browser or dense-tree benchmarks. Regressions cover every disclosure
+  combination in a nested forest, distant page boundaries, malformed metadata,
+  same-snapshot changes, provisional hydration, and constant storage for a plain
+  range at the supported coordinate limit.
+
 Remaining work, in dependency order:
 
-1. Simplify renderer request/cache state and content adapters.
+1. Finish renderer find/selection ownership, content adapters, and shell lifetime boundaries.
 2. Retire migrated compatibility machinery and optimize measured repeated work.
 
 Validation uses the existing crate, service, renderer, and extension suites.

@@ -1,5 +1,6 @@
 //! Sparse rows staged by a response and bounded before the reducer publishes it.
 
+use super::coordinates::ExpandedRow;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -18,14 +19,18 @@ pub(super) enum RetentionPriority {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PageCache {
-    rows: BTreeMap<i64, Value>,
+    rows: BTreeMap<ExpandedRow, Value>,
 }
 
 impl PageCache {
-    pub(crate) fn get(&self, row: i64) -> Option<&Value> {
+    pub(crate) fn get_by_index(&self, row: i64) -> Option<&Value> {
+        self.get(ExpandedRow::new(row)?)
+    }
+
+    pub(crate) fn get(&self, row: ExpandedRow) -> Option<&Value> {
         self.rows.get(&row)
     }
-    pub(crate) fn contains_key(&self, row: i64) -> bool {
+    pub(crate) fn contains_key(&self, row: ExpandedRow) -> bool {
         self.rows.contains_key(&row)
     }
     pub(crate) fn len(&self) -> usize {
@@ -41,11 +46,14 @@ impl PageCache {
 
     /// Stage the arriving page, allowing a pending find target to resolve
     /// before the reducer prunes against the resulting viewport.
-    pub(super) fn insert(&mut self, row: i64, value: Value) -> Option<Value> {
+    pub(super) fn insert(&mut self, row: ExpandedRow, value: Value) -> Option<Value> {
         self.rows.insert(row, value)
     }
 
-    pub(super) fn first_missing(&self, mut rows: impl Iterator<Item = i64>) -> Option<i64> {
+    pub(super) fn first_missing(
+        &self,
+        mut rows: impl Iterator<Item = ExpandedRow>,
+    ) -> Option<ExpandedRow> {
         rows.find(|row| !self.rows.contains_key(row))
     }
 
@@ -53,9 +61,9 @@ impl PageCache {
     /// the hard cap. The owner supplies visibility/distance priorities.
     pub(super) fn retain(
         &mut self,
-        top: i64,
-        bottom: i64,
-        priority: impl Fn(i64) -> RetentionPriority,
+        top: ExpandedRow,
+        bottom: ExpandedRow,
+        priority: impl Fn(ExpandedRow) -> RetentionPriority,
     ) {
         self.rows.retain(|row, _| *row >= top && *row <= bottom);
         if self.rows.len() <= MAX_CACHED_ROWS {
@@ -78,26 +86,30 @@ impl PageCache {
 mod tests {
     use super::*;
 
+    fn abs(row: i64) -> ExpandedRow {
+        ExpandedRow::new(row).unwrap()
+    }
+
     #[test]
     fn every_far_row_is_evicted_and_retained_size_is_a_hard_bound() {
         let mut cache = PageCache::default();
         for row in 0..10_000 {
-            drop(cache.insert(row, Value::Null));
+            drop(cache.insert(abs(row), Value::Null));
         }
-        cache.retain(0, 1000, |row| {
-            RetentionPriority::Requested(row.abs_diff(500))
+        cache.retain(abs(0), abs(1000), |row| {
+            RetentionPriority::Requested(row.get().abs_diff(500))
         });
         assert_eq!(cache.len(), 1001);
-        assert!(!cache.contains_key(9999));
+        assert!(!cache.contains_key(abs(9999)));
         for row in 0..10_000 {
-            drop(cache.insert(row, Value::Null));
+            drop(cache.insert(abs(row), Value::Null));
         }
-        cache.retain(0, 9999, |row| {
-            RetentionPriority::Requested(row.abs_diff(5000))
+        cache.retain(abs(0), abs(9999), |row| {
+            RetentionPriority::Requested(row.get().abs_diff(5000))
         });
         assert_eq!(cache.len(), MAX_CACHED_ROWS);
-        assert!(cache.contains_key(5000));
-        assert!(!cache.contains_key(0));
-        assert!(!cache.contains_key(9999));
+        assert!(cache.contains_key(abs(5000)));
+        assert!(!cache.contains_key(abs(0)));
+        assert!(!cache.contains_key(abs(9999)));
     }
 }

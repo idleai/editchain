@@ -787,7 +787,7 @@ pub(crate) fn window_rows_from(
         let Some(abs) = state.abs_index_for_visible(vis) else {
             continue; // hidden sub-op slot — no drawable row
         };
-        let Some(row) = state.cache.get(abs) else {
+        let Some(row) = state.cache.get_by_index(abs) else {
             rows.push(WindowRow {
                 vis,
                 spec: RowSpec::placeholder(abs),
@@ -2383,7 +2383,10 @@ mod tests {
         };
         for (index, value) in rows.iter().enumerate() {
             let key = i64::try_from(index).unwrap_or(0);
-            drop(state.cache.insert(key, value.clone()));
+            drop(state.cache.insert(
+                super::super::coordinates::ExpandedRow::new(key).unwrap(),
+                value.clone(),
+            ));
         }
         state
     }
@@ -2535,7 +2538,10 @@ mod tests {
         for index in 0..5 {
             let key = i64::from(index);
             let value = row_value("repo:a", &format!("k{index}"));
-            drop(state.cache.insert(key, value));
+            drop(state.cache.insert(
+                super::super::coordinates::ExpandedRow::new(key).unwrap(),
+                value,
+            ));
         }
         state.render_top = 0;
         state.render_bottom = 4;
@@ -3019,12 +3025,14 @@ mod tests {
 
     #[test]
     fn rows_outside_visible_maps_bounds_through_collapsed_slots() {
-        let mut state = HistoryAppState {
+        let state = HistoryAppState {
             total: Some(6),
-            sub_op_counts: vec![2, 0, 1],
+            expansion: Some(
+                super::super::expansion::ExpansionIndex::from_metadata(6, Some(&[2, 0, 1]), None)
+                    .unwrap(),
+            ),
             ..HistoryAppState::default()
         };
-        state.recompute_expansion();
         assert_eq!(state.visible_total(), 3, "collapsed view hides 3 slots");
         // Rendered window [vis 0..=2] = abs [0, 3, 4]. Keeping vis 2 must drop
         // abs 0 (vis 0) AND abs 3 (vis 1) — comparing the visible bound 2 to
