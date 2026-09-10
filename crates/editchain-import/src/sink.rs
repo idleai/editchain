@@ -143,6 +143,17 @@ pub trait CursorStore {
     }
 }
 
+/// Accepted coverage of a named semantic derivation over a source prefix.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MaterializationCheckpoint {
+    /// Named provider derivation contract, separate from metadata migrations.
+    pub contract: String,
+    /// Last physical record covered by this derivation checkpoint.
+    pub through: u64,
+    /// Whether private reasoning has been captured through the accepted prefix.
+    pub includes_thinking: bool,
+}
+
 /// A cursor value representing how far we've read in a source file.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CursorValue {
@@ -174,6 +185,9 @@ pub struct CursorValue {
     /// Older cursor JSON omits this field and therefore upgrades from zero.
     #[serde(default)]
     pub normalization_version: u32,
+    /// Accepted semantic derivation, when normalization has been requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialization: Option<MaterializationCheckpoint>,
     /// Content hash of the provider-owned session-title record last captured
     /// for this source. Codex titles live beside rollouts rather than inside
     /// them, so this lets an unchanged rollout reproject when only its title
@@ -295,7 +309,7 @@ impl CursorStore for MemoryCursorStore {
     }
 
     fn reserve_checkpoint(&mut self, key: &str, cursor: &CursorValue) -> Result<(), ImportError> {
-        let _: Option<CursorValue> = self.reservations.insert(key.to_string(), cursor.clone());
+        drop(self.reservations.insert(key.to_string(), cursor.clone()));
         Ok(())
     }
 
@@ -304,9 +318,9 @@ impl CursorStore for MemoryCursorStore {
     }
 
     fn set_cursor(&mut self, path: &str, cursor: &CursorValue) -> Result<(), ImportError> {
-        let _: Option<CursorValue> = self.cursors.insert(path.to_string(), cursor.clone());
+        drop(self.cursors.insert(path.to_string(), cursor.clone()));
         if self.reservations.get(path) == Some(cursor) {
-            let _: Option<CursorValue> = self.reservations.remove(path);
+            drop(self.reservations.remove(path));
         }
         Ok(())
     }
@@ -582,7 +596,7 @@ impl CursorStore for FsCursorStore {
     fn set_cursor(&mut self, path: &str, cursor: &CursorValue) -> Result<(), ImportError> {
         // Buffer in memory; nothing reaches disk until `commit()` runs after
         // the operations this cursor covers have been durably appended.
-        let _: Option<CursorValue> = self.staged.insert(path.to_string(), cursor.clone());
+        drop(self.staged.insert(path.to_string(), cursor.clone()));
         Ok(())
     }
 
@@ -673,7 +687,7 @@ impl FsCursorStore {
             }
             // Only remove after the durable write succeeded, so a retry after
             // a partial failure still commits the remaining entries.
-            let _: Option<CursorValue> = self.staged.remove(&path);
+            drop(self.staged.remove(&path));
         }
         let journal = self.journal_path();
         match fs::remove_file(&journal) {
@@ -869,6 +883,7 @@ mod tests {
             content_hash_version: 1,
             source_node: Some(NodeId(9)),
             normalization_version: 0,
+            materialization: None,
             session_title_hash: None,
         };
 
@@ -929,6 +944,7 @@ mod tests {
             content_hash_version: 1,
             source_node: Some(NodeId(9)),
             normalization_version: 0,
+            materialization: None,
             session_title_hash: None,
         };
 

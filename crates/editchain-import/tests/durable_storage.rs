@@ -258,9 +258,9 @@ fn incremental_append_after_restart_reads_only_new_bytes() {
     assert_eq!(second.report.files_discovered, 1);
     assert_eq!(second.report.files_processed, 1);
     assert_eq!(second.report.raw_ops, 1);
-    // The appended raw record, its normalized item, and the new source extent.
-    assert_eq!(second.ops.ops.len(), 3);
-    assert_eq!(second.report.evidence_ops, 1);
+    // The appended raw record, its normalized item, derivation, and source extent.
+    assert_eq!(second.ops.ops.len(), 4);
+    assert_eq!(second.report.evidence_ops, 2);
     // Only the appended line is emitted, byte-exact, from the durable store.
     assert_eq!(
         spilled_raw_bytes(&second.ops.ops[0], &second.blobs),
@@ -474,6 +474,7 @@ fn commit_journals_the_paired_checkpoint_before_materializing_legacy_files() {
         content_hash_version: 1,
         source_node: Some(editchain_core::NodeId(7)),
         normalization_version: 0,
+        materialization: None,
         session_title_hash: None,
     };
     let new_cursor = CursorValue {
@@ -485,6 +486,7 @@ fn commit_journals_the_paired_checkpoint_before_materializing_legacy_files() {
         content_hash_version: 1,
         source_node: Some(editchain_core::NodeId(7)),
         normalization_version: 0,
+        materialization: None,
         session_title_hash: None,
     };
 

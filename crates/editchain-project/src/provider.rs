@@ -46,9 +46,9 @@ impl ProviderRelations {
 }
 
 #[derive(Debug)]
-struct EvidenceRecord<'a> {
-    op: &'a Op,
-    payload: ProviderEvidence,
+pub(super) struct EvidenceRecord<'a> {
+    pub(super) op: &'a Op,
+    pub(super) payload: ProviderEvidence,
 }
 
 #[derive(Debug)]
@@ -126,7 +126,7 @@ pub(super) fn resolve(ops: &[Op]) -> ProviderRelations {
     resolved
 }
 
-fn decode_evidence(op: &Op) -> Option<EvidenceRecord<'_>> {
+pub(super) fn decode_evidence(op: &Op) -> Option<EvidenceRecord<'_>> {
     let OpKind::Note(note) = &op.kind else {
         return None;
     };

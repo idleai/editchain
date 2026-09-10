@@ -212,9 +212,13 @@ pub struct Projection {
     pub line_ordinals: Vec<u64>,
     /// Final logical items, ordered by `(first_seen, item_id, turn_id)`.
     pub final_items: Vec<FinalItem>,
-    /// Tool and activity upserts in physical order, before removals or final
-    /// folding. Each retains its activation anchor and its witnessing ordinal.
-    pub lifecycle_items: Vec<FinalItem>,
+    /// All upserts in physical order before removals or final folding.
+    /// Each retains its incarnation anchor and its witnessing ordinal.
+    pub item_occurrences: Vec<FinalItem>,
+    /// Turn metadata at its witnessing ordinal and current item count.
+    pub turn_occurrences: Vec<(u64, TurnMeta, usize)>,
+    /// Turn removals at the physical occurrence that reported them.
+    pub removed_turns: Vec<(u64, String)>,
     /// Inter-agent communication lines in physical order (deterministic
     /// per-line note lanes).
     pub inter_agent_lines: Vec<InterAgentLine>,
@@ -329,6 +333,9 @@ pub fn parse_projection(
                 }
                 for removed in &record.removed_turn_ids {
                     items.retain(|(turn_id, _), _item| turn_id != removed);
+                    projection
+                        .removed_turns
+                        .push((record.source_ordinal, removed.clone()));
                 }
                 for change in record.changed_items {
                     let candidate = FinalItem {
@@ -343,13 +350,11 @@ pub fn parse_projection(
                     // Fold key order is (turn_id, item_id) so turn-scoped
                     // removals retain by the first tuple element.
                     let key = (candidate.turn_id.clone(), candidate.item_id.clone());
-                    if matches!(candidate.kind, ProjectionKind::Tool | ProjectionKind::Note) {
-                        let mut occurrence = candidate.clone();
-                        if let Some(existing) = items.get(&key) {
-                            occurrence.first_seen = existing.first_seen;
-                        }
-                        projection.lifecycle_items.push(occurrence);
+                    let mut occurrence = candidate.clone();
+                    if let Some(existing) = items.get(&key) {
+                        occurrence.first_seen = existing.first_seen;
                     }
+                    projection.item_occurrences.push(occurrence);
                     let _unused: &mut FinalItem = items
                         .entry(key)
                         .and_modify(|existing| {
@@ -359,6 +364,12 @@ pub fn parse_projection(
                             existing.last_seen = candidate.first_seen;
                         })
                         .or_insert(candidate);
+                }
+                for turn in &record.changed_turns {
+                    let count = items.keys().filter(|(id, _)| id == &turn.turn_id).count();
+                    projection
+                        .turn_occurrences
+                        .push((record.source_ordinal, turn.clone(), count));
                 }
                 if let Some(inter_agent) = record.inter_agent {
                     projection.inter_agent_lines.push(inter_agent);

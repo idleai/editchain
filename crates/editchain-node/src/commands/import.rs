@@ -497,6 +497,7 @@ mod tests {
                     content_hash_version: 0,
                     source_node: None,
                     normalization_version: 0,
+                    materialization: None,
                     session_title_hash: None,
                 },
             )
@@ -520,6 +521,7 @@ mod tests {
                     content_hash_version: 0,
                     source_node: None,
                     normalization_version: 0,
+                    materialization: None,
                     session_title_hash: None,
                 },
             )

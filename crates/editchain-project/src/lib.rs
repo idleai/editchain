@@ -19,8 +19,10 @@ pub mod taxonomy;
 mod view;
 
 mod graph;
+mod materialization;
 mod provider;
 pub use graph::{NodeKey, ResolvedGraph, ResolvedRelation};
+pub use materialization::CodexLogicalItem;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -727,6 +729,8 @@ fn bundle_group(anchor: &Op) -> String {
 pub struct HistoryProjection {
     /// `EditChain` operations in canonical causal order (oldest-first).
     ops: Vec<Op>,
+    /// Selected occurrence revisions and their recomputed logical item state.
+    materialization: materialization::Materialization,
     /// `Git` commits keyed by `(RepositoryId, GitOid)`.
     git: GitProjection,
     /// Typed relationship facts keyed by the raw occurrence they annotate, as
@@ -804,6 +808,7 @@ impl HistoryProjection {
     pub fn new() -> Self {
         Self {
             ops: Vec::new(),
+            materialization: materialization::Materialization::default(),
             git: GitProjection::new(),
             relationship_notes: HashMap::new(),
             collapsed_projection: Arc::default(),
@@ -819,6 +824,7 @@ impl HistoryProjection {
     #[must_use]
     pub fn from_ops(ops: Vec<Op>) -> Self {
         let provider_relations = provider::resolve(&ops);
+        let materialization = materialization::Materialization::from_ops(&ops);
         let mut git = GitProjection::new();
         let mut relationship_notes: HashMap<OpId, Vec<Op>> = HashMap::new();
         for op in &ops {
@@ -839,6 +845,7 @@ impl HistoryProjection {
         }
         let mut projection = Self {
             ops,
+            materialization,
             git,
             relationship_notes,
             collapsed_projection: Arc::default(),
@@ -854,6 +861,13 @@ impl HistoryProjection {
     #[must_use]
     pub fn ops(&self) -> &[Op] {
         &self.ops
+    }
+
+    /// Current Codex logical items after replaying admitted upserts and removals.
+    /// Historical revisions remain available through [`Self::ops`] and the view.
+    #[must_use]
+    pub fn codex_logical_items(&self) -> &[CodexLogicalItem] {
+        &self.materialization.items
     }
 
     /// Observed Git facts. New commits enter through `merge_git_commits`.
@@ -1225,7 +1239,7 @@ impl HistoryProjection {
                 }
             }
         }
-        let mut representative: HashMap<OpId, OpId> = HashMap::new();
+        let mut representative = self.materialization.representatives.clone();
         let mut duplicate_event_occurrences: std::collections::HashSet<OpId> =
             std::collections::HashSet::new();
         let imports_by_id: HashMap<OpId, &editchain_core::op::ImportOp> = self
@@ -1302,7 +1316,10 @@ impl HistoryProjection {
         // are dropped), versus standalone ops that must be kept.
         let mut folded: std::collections::HashSet<OpId> = std::collections::HashSet::new();
         for op in &self.ops {
-            if matches!(op.kind, editchain_core::OpKind::Import(_)) || is_hidden_relation_fact(op) {
+            if matches!(op.kind, editchain_core::OpKind::Import(_))
+                || is_hidden_relation_fact(op)
+                || self.materialization.hidden.contains(&op.id)
+            {
                 continue;
             }
             for &parent in &op.parents {
@@ -1314,6 +1331,25 @@ impl HistoryProjection {
             }
         }
 
+        for children in children_of.values_mut() {
+            if !children
+                .iter()
+                .any(|op| self.materialization.output_order.contains_key(&op.id))
+            {
+                continue;
+            }
+            children.sort_by_key(|op| {
+                (
+                    self.materialization
+                        .output_order
+                        .get(&op.id)
+                        .copied()
+                        .unwrap_or(usize::MAX),
+                    op.id,
+                )
+            });
+        }
+
         // Build every raw import as a top-level node first. Metadata folding is a
         // separate exact-parent contraction pass below, after every possible
         // endpoint exists. This avoids making topology depend on input order.
@@ -1323,7 +1359,7 @@ impl HistoryProjection {
             // pure edge bookkeeping — they never render as rows themselves, only
             // their virtual edges do. They remain addressable in the OpSet and
             // indexed in `relationship_notes`.
-            if is_hidden_relation_fact(op) {
+            if is_hidden_relation_fact(op) || self.materialization.hidden.contains(&op.id) {
                 continue;
             }
             if matches!(op.kind, editchain_core::OpKind::Import(_)) {

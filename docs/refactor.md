@@ -142,9 +142,25 @@ Completed increments:
   arrival orders, terminal growth, ambiguity, missing records, removal, and
   restart replay.
 
+- Codex semantic revisions: the named `codex-occurrences-v1` contract preserves
+  every upsert and explicit turn removal at its witnessing physical record.
+  Separate item namespaces prevent sibling lane shifts or cursor-dependent
+  content reuse. Source-bound manifests list complete outputs and logical
+  changes. Projection rebuilds active logical items, treats post-removal reuse
+  as a new incarnation, and retains historical revisions. The compatibility
+  view suppresses covered legacy content without changing its stored bytes;
+  missing or ambiguous replacement evidence leaves logical state unresolved.
+  Named semantic checkpoints track coverage independently of raw and metadata
+  progress, allowing one-time normalization or reasoning backfill. Enabling
+  reasoning preserves public operation IDs, and disabling capture retains
+  previously captured evidence. Output order is explicit in the manifest.
+  Revision 53 invalidates earlier projection caches. Regressions compare
+  one-shot and multiple append boundaries, input order, logical removal and
+  reuse, incomplete evidence, legacy migration, and option changes.
+
 Remaining work, in dependency order:
 
-1. Finish normalized revision/replay policy, shared payload handling, and
+1. Finish shared capture/payload replay policy, Claude materialization, and
    bounded admission; preserve compatibility with existing normalized records.
 2. Simplify search document identity and renderer request/cache state.
 3. Retire migrated compatibility machinery and optimize measured repeated work.

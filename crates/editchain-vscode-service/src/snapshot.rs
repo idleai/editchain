@@ -156,7 +156,9 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 /// row coordinates, source ownership, and provisional or laid-out row metadata.
 /// Revision 52 resolves Codex lifecycle endpoints from admitted provider
 /// evidence across source captures, replacing covered legacy resolved notes.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 52;
+/// Revision 53 uses immutable occurrence materializations and explicit logical
+/// removals, retaining legacy records through the compatibility view.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 53;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

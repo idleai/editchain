@@ -352,13 +352,13 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
     );
     assert_eq!(harness.report.malformed, 0, "no bridge decode errors");
     assert_eq!(
-        harness.report.evidence_ops, 10,
-        "4 source extents + 6 lifecycle observations"
+        harness.report.evidence_ops, 22,
+        "4 source extents + 6 lifecycle observations + 12 occurrence derivations"
     );
     assert_eq!(
         harness.ops.ops.len(),
-        37,
-        "12 raw + 15 normalized + 10 provider evidence ops"
+        49,
+        "12 raw + 15 normalized + 22 provider evidence ops"
     );
 
     // Deterministic source streams per physical rollout.
@@ -885,7 +885,7 @@ fn embedded_parent_session_meta_does_not_hijack_child_identity_or_scope() {
     let child_first = child.op_from_position(SourcePosition::raw(1)).unwrap();
     let child_embedded_meta = child.op_from_position(SourcePosition::raw(2)).unwrap();
 
-    // Every op emitted from the child file (same node) stays in the child's
+    // Every raw/content op anchored in the child file stays in the child's
     // session scope; the raw lane is never hijacked by the embedded parent
     // meta, and no child op leaks into the parent session.
     let child_node = child_first.node;
@@ -893,7 +893,12 @@ fn embedded_parent_session_meta_does_not_hijack_child_identity_or_scope() {
         .ops
         .ops
         .iter()
-        .filter(|o| o.id.node == child_node)
+        .filter(|o| {
+            !is_note(o, NoteRelationship::ProviderEvidence)
+                && (o.id.node == child_node
+                    || o.parents.iter().any(|parent| parent.node == child_node))
+                && !is_note(o, NoteRelationship::ForkedFrom)
+        })
         .collect();
     assert_eq!(child_ops.len(), 4, "3 raw + 1 message");
     for op in &child_ops {

@@ -189,6 +189,7 @@ impl CapturedSource {
                 content_hash_version: 1,
                 source_node: cursor.and_then(|value| value.source_node),
                 normalization_version: cursor.map_or(0, |value| value.normalization_version),
+                materialization: cursor.and_then(|value| value.materialization.clone()),
                 session_title_hash: cursor.and_then(|value| value.session_title_hash),
             },
         })
@@ -413,6 +414,10 @@ impl SourceReadPlan {
     /// Returns IO/limit errors reading the captured copy.
     pub fn all_lines(&self) -> Result<Vec<LineWithHash>, ImportError> {
         Ok(self.source.read(None)?.lines)
+    }
+
+    pub(crate) fn check_cancellation(&self) -> Result<(), ImportError> {
+        self.source.cancellation.check(&self.source.original)
     }
 }
 

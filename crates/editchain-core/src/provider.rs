@@ -38,6 +38,53 @@ pub enum ProviderFact {
     CodexSource(Box<CodexSourceEvidence>),
     /// One lifecycle observation carried by a Codex projection change.
     CodexLifecycle(CodexLifecycleEvidence),
+    /// Versioned semantic materialization of one complete physical record.
+    CodexDerivation(CodexDerivationEvidence),
+}
+
+/// Named semantic derivation contract, independent of metadata migrations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CodexDerivationContract {
+    /// Every upsert and removal is preserved at its witnessing occurrence.
+    #[serde(rename = "codex-occurrences-v1")]
+    OccurrencesV1,
+}
+
+/// Materialized operations and logical changes from one physical occurrence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexDerivationEvidence {
+    /// Full owning execution identity.
+    pub thread: CodexThreadId,
+    /// Named derivation semantics.
+    pub contract: CodexDerivationContract,
+    /// Whether this materialization includes requested private reasoning.
+    pub includes_thinking: bool,
+    /// Complete operation set produced for this occurrence.
+    pub outputs: Vec<OpId>,
+    /// Provider logical changes, in the order reported on this occurrence.
+    pub changes: Vec<CodexLogicalChange>,
+}
+
+/// An immutable change from which current logical item state can be rebuilt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CodexLogicalChange {
+    /// Remove every active item in this turn; historical revisions remain.
+    RemoveTurn {
+        /// Full provider turn identity within the execution.
+        turn: String,
+    },
+    /// Replace the active state of one logical item.
+    Upsert {
+        /// Full provider turn identity within the execution.
+        turn: String,
+        /// Full provider item identity within the turn.
+        item: String,
+        /// First occurrence since the most recent removal of this turn.
+        incarnation: OpId,
+        /// Materialized operations belonging to this revision of the item.
+        outputs: Vec<OpId>,
+    },
 }
 
 /// Execution identity and the complete prefix captured from one source.

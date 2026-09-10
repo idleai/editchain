@@ -251,6 +251,26 @@ impl std::fmt::Debug for NormalizeContext<'_> {
     }
 }
 
+pub(super) fn normalized_ops_for_occurrence(
+    item: &FinalItem,
+    clock: Clock,
+    ctx: &mut NormalizeContext<'_>,
+) -> Result<Vec<Op>, ImportError> {
+    let mut ops = normalized_ops_for_item(item, ItemAnchor::LastSeen, clock, clock, ctx)?;
+    if item.first_seen < item.last_seen
+        && (item.payload.get("result").is_some() || item.payload.get("errorMessage").is_some())
+    {
+        for op in &mut ops {
+            if let OpKind::Tool(tool) = &mut op.kind {
+                tool.stage = ToolStage::Finish;
+                tool.tool_name = Payload::Empty;
+                tool.content = tool_result_payload(&item.payload, ctx.blobs)?;
+            }
+        }
+    }
+    Ok(ops)
+}
+
 /// Build the normalized ops for one folded final item.
 ///
 /// The mapping is source-neutral and reads bridge `camelCase` payload fields:

@@ -1,4 +1,4 @@
-//! Codex (OpenAI) session import — discover, bridge, fold, and normalize.
+//! Codex (OpenAI) session import — capture, bridge, and materialize occurrences.
 //!
 //! The importer never parses Codex conversation semantics itself. A
 //! configurable helper process (`tools/codex-session-exporter` today, or a
@@ -8,7 +8,7 @@
 //! JSONL bytes remain canonical and are preserved byte-exact, one raw
 //! `ImportOp` per complete physical line. Like the shared Claude Code reader,
 //! a newline-unterminated EOF record remains pending until the source grows;
-//! durable partial-record recovery is deferred to the cursor/storage redesign.
+//! only complete physical records can advance capture or derivation checkpoints.
 //!
 //! # Wire contract (editchain-v1 projection)
 //!
@@ -60,30 +60,32 @@
 //! non-fatal and remain raw-only. `projection.removedTurnIds` is the remove
 //! lane (turn rollback).
 //!
-//! The bridge folds `event_msg`/`response_item` message echoes,
-//! `item_completed` repeats, and post-compaction re-embedded items into
-//! `changedItems` upserts of the same stable item id, so the importer sees one
-//! logical row per final item — never deduplicated across physical files.
+//! The bridge correlates message echoes, completion repeats, and compaction
+//! replays through stable logical item IDs. The importer preserves every
+//! reported change at its witnessing physical occurrence.
 //!
-//! ## Item lifecycle folding
+//! ## Immutable revisions and logical state
 //!
-//! Within one physical file, the importer folds `changedItems` upserts keyed
-//! by `(turnId, item.id)`, preserving both the item's first-seen ordinal and
-//! its last-seen ordinal; `removedTurnIds` deletes every item of that turn.
-//! Unknown item kinds are forward-compatible raw-only lanes and never appear
-//! in final items. Final items are emitted in `(first_seen, item_id, turn_id)`
-//! order: fresh items anchor one or more normalized ops at the raw op of the
-//! first-seen line, while an item first seen before the cursor and changed
-//! after it gets a deterministic update op anchored at its last-seen line, so
-//! no stale content is left behind on incremental appends. A lifecycle item
-//! that spans lines (tool call or command with both input and output) splits
-//! into `Start`/`Finish` ops anchored at the appropriate first/last ordinals;
-//! every derived lane at an ordinal is allocated deterministically and never
-//! collides with sibling ops or the raw lane.
-//! Turn removals apply while folding a complete projection. On an incremental
-//! append they cannot retract immutable ops emitted by an earlier batch; a
-//! provider-neutral tombstone/removal fact is deferred to the later topology
-//! and storage redesign.
+//! The named `codex-occurrences-v1` materialization retains all item upserts,
+//! turn metadata changes, and explicit turn removals. Operation namespaces
+//! separate items and line-content roles from legacy numeric lanes, so cursor
+//! boundaries and reasoning inclusion cannot shift a sibling operation's ID.
+//! Tool results refer to the record that actually reported their result;
+//! later changes never rewrite an earlier revision's content.
+//!
+//! Typed evidence binds each materialization to the raw record hash and lists
+//! its complete outputs and logical changes. Projection replays those changes
+//! to rebuild current logical items; removing a turn retires its active items
+//! while preserving their history. Reuse after removal begins a new incarnation.
+//! Older normalized operations remain stored and readable through a compatibility
+//! view. A one-time derivation backfill supersedes their display content without
+//! regenerating their IDs. Incomplete replacement evidence leaves logical state
+//! unresolved and cannot revive stale legacy content.
+//!
+//! Semantic coverage is checkpointed separately from raw capture and metadata
+//! upgrades. Enabling normalization or private reasoning later replays complete
+//! captured occurrences. Disabling capture does not erase already stored data.
+//! Repeated backfills retain the same IDs and operation bytes.
 //!
 //! ## Session scope
 //!
@@ -175,6 +177,7 @@ pub mod helper;
 pub mod import;
 /// Exact cross-thread execution-topology facts.
 pub mod link;
+mod materialize;
 /// Normalization of raw lines and projection items into editchain ops.
 pub mod normalize;
 /// Projection parsing, validation, and item folding.

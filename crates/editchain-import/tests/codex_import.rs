@@ -73,6 +73,31 @@ fn source_stream(root: &Path, path: &Path, boot: u32) -> SourceStream {
     derive_keyed_source_stream(&source_key(root, path), boot)
 }
 
+fn assert_occurrence_anchor(op: &editchain_core::Op, stream: &SourceStream, ordinal: u64) {
+    assert_eq!(
+        op.parents,
+        ParentSet::One(
+            stream
+                .op_from_position(SourcePosition::raw(ordinal))
+                .unwrap()
+        ),
+        "revision references its witnessing raw occurrence"
+    );
+    assert_eq!(
+        op.id.seq >> 16,
+        ordinal,
+        "revision keeps the physical ordinal"
+    );
+    assert_eq!(
+        op.id.boot, stream.boot,
+        "revision keeps the physical generation"
+    );
+    assert_ne!(
+        op.id.node, stream.node,
+        "new revisions cannot reuse legacy numeric lanes"
+    );
+}
+
 /// Line bytes with trailing newline, as stored in the raw lane.
 fn ln(s: &str) -> Vec<u8> {
     let mut v = s.as_bytes().to_vec();
@@ -156,6 +181,317 @@ fn projection_bytes(records: &[serde_json::Value]) -> Vec<u8> {
         out.push(b'\n');
     }
     out
+}
+
+fn derivation_records() -> Vec<serde_json::Value> {
+    let item = |text: &str| {
+        serde_json::json!({
+            "turnId": "turn-1", "item": {"kind": "agentMessage", "id": "message-1", "text": text}
+        })
+    };
+    let mut removed = line_record(4, Vec::new(), None);
+    removed["projection"]["removedTurnIds"] = serde_json::json!(["turn-1"]);
+    vec![
+        line_record(
+            1,
+            Vec::new(),
+            Some(serde_json::json!({"threadId": "thread-1"})),
+        ),
+        line_record(2, vec![item("original")], None),
+        line_record(3, vec![item("updated")], None),
+        removed,
+        line_record(5, vec![item("reused identity")], None),
+    ]
+}
+
+fn import_projection_prefix(
+    dir: &tempfile::TempDir,
+    records: &[serde_json::Value],
+    options: &ImportOptions,
+    cursors: &mut MemoryCursorStore,
+) -> Harness {
+    let raw: Vec<_> = records
+        .iter()
+        .map(|record| event_line(&record["sourceOrdinal"].to_string()))
+        .collect();
+    write_rollout(dir.path(), "rollout-revisions.jsonl", &raw);
+    let helper = fixed_helper(dir, &projection_bytes(records));
+    import_with_options_into(dir.path(), &helper, options, cursors)
+}
+
+fn canonical_revisions(ops: &[editchain_core::Op]) -> Vec<editchain_core::Op> {
+    let mut by_id = std::collections::BTreeMap::new();
+    for op in ops {
+        let extent = match &op.kind {
+            OpKind::Note(note) if is_provider_evidence(op) => match &note.content {
+                Payload::Inline(content) => {
+                    serde_json::from_slice::<editchain_core::provider::ProviderEvidence>(content)
+                        .ok()
+                        .is_some_and(|evidence| {
+                            matches!(
+                                evidence.fact,
+                                editchain_core::provider::ProviderFact::CodexSource(_)
+                            )
+                        })
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if extent {
+            continue;
+        }
+        if let Some(existing) = by_id.insert(op.id, op.clone()) {
+            assert_eq!(
+                existing, *op,
+                "replay cannot assign different content to an existing ID"
+            );
+        }
+    }
+    by_id.into_values().collect()
+}
+
+#[test]
+fn occurrence_revisions_and_logical_removals_are_independent_of_append_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let records = derivation_records();
+    let options = ImportOptions::default();
+    let single = import_projection_prefix(&dir, &records, &options, &mut MemoryCursorStore::new());
+    let expected = canonical_revisions(&single.ops.ops);
+    let expected_view = editchain_project::HistoryProjection::from_ops(expected.clone());
+    let messages: Vec<_> = expected
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::Message(_)))
+        .collect();
+    assert_eq!(
+        messages.len(),
+        3,
+        "all immutable revisions survive a later removal"
+    );
+    let item = expected_view.codex_logical_items().first().unwrap();
+    assert_eq!(expected_view.codex_logical_items().len(), 1);
+    assert_eq!(
+        item.incarnation.seq,
+        5 << 16,
+        "reusing an item after removal starts a new incarnation"
+    );
+    for boundaries in [&[2, 3, 4, 5][..], &[1, 5][..], &[3, 5][..]] {
+        let mut cursors = MemoryCursorStore::new();
+        let mut accumulated = Vec::new();
+        for &end in boundaries {
+            let batch = import_projection_prefix(&dir, &records[..end], &options, &mut cursors);
+            accumulated.extend(batch.ops.ops);
+            if end == 4 {
+                let view = editchain_project::HistoryProjection::from_ops(canonical_revisions(
+                    &accumulated,
+                ));
+                assert!(
+                    view.codex_logical_items().is_empty(),
+                    "removal retires the logical item"
+                );
+            }
+        }
+        let actual = canonical_revisions(&accumulated);
+        assert_eq!(
+            actual, expected,
+            "same immutable revisions for boundaries {boundaries:?}"
+        );
+        let mut reversed = actual.clone();
+        reversed.reverse();
+        let view = editchain_project::HistoryProjection::from_ops(reversed);
+        assert_eq!(
+            view.codex_logical_items(),
+            expected_view.codex_logical_items()
+        );
+        assert_eq!(
+            view.ops().len(),
+            actual.len(),
+            "projection retains every admitted operation"
+        );
+    }
+}
+
+#[test]
+fn occurrence_materialization_replaces_legacy_content_and_rejects_incomplete_revisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let records = derivation_records();
+    let imported = import_projection_prefix(
+        &dir,
+        &records,
+        &ImportOptions::default(),
+        &mut MemoryCursorStore::new(),
+    );
+    let mut ops = canonical_revisions(&imported.ops.ops);
+    let mut legacy = ops
+        .iter()
+        .find(|op| matches!(op.kind, OpKind::Message(_)))
+        .unwrap()
+        .clone();
+    let source = *legacy.parents.iter().next().unwrap();
+    legacy.id = editchain_core::OpId {
+        seq: source.seq | 1,
+        ..source
+    };
+    if let OpKind::Message(message) = &mut legacy.kind {
+        message.content = Payload::Inline(b"stale legacy fold".to_vec());
+    }
+    ops.push(legacy.clone());
+    let view = editchain_project::HistoryProjection::from_ops(ops.clone());
+    assert!(view
+        .nodes()
+        .iter()
+        .all(|node| !node.summary().contains("stale legacy fold")));
+    assert!(
+        view.ops().contains(&legacy),
+        "compatibility does not rewrite or delete the old record"
+    );
+    let latest = view.codex_logical_items().first().unwrap().outputs[0];
+    let missing_header: Vec<_> = ops
+        .iter()
+        .filter(|op| !(matches!(op.kind, OpKind::Import(_)) && op.id.seq == 1 << 16))
+        .cloned()
+        .collect();
+    assert!(
+        editchain_project::HistoryProjection::from_ops(missing_header)
+            .codex_logical_items()
+            .is_empty(),
+        "an incomplete physical prefix cannot establish current logical state"
+    );
+    ops.retain(|op| op.id != latest);
+    let incomplete = editchain_project::HistoryProjection::from_ops(ops);
+    assert!(
+        incomplete.codex_logical_items().is_empty(),
+        "missing materialized evidence cannot revive prior logical state"
+    );
+    assert!(incomplete
+        .nodes()
+        .iter()
+        .all(|node| !node.summary().contains("stale legacy fold")));
+}
+
+#[test]
+fn reasoning_and_raw_only_backfills_preserve_public_revision_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut records = derivation_records();
+    records.truncate(3);
+    records[1]["projection"]["changedItems"].as_array_mut().unwrap().insert(0, serde_json::json!({
+        "turnId": "turn-1", "item": {"kind": "reasoning", "id": "reasoning-1", "summary": ["private summary"]}
+    }));
+    let mut cursors = MemoryCursorStore::new();
+    let hidden =
+        import_projection_prefix(&dir, &records[..2], &ImportOptions::default(), &mut cursors);
+    assert!(!hidden
+        .ops
+        .ops
+        .iter()
+        .any(|op| matches!(op.kind, OpKind::Reflection(_))));
+    let shown_options = ImportOptions {
+        include_thinking: true,
+        ..ImportOptions::default()
+    };
+    let shown = import_projection_prefix(&dir, &records[..2], &shown_options, &mut cursors);
+    assert_eq!(shown.report.raw_ops, 0);
+    assert!(shown
+        .ops
+        .ops
+        .iter()
+        .any(|op| matches!(op.kind, OpKind::Reflection(_))));
+    let public: Vec<_> = hidden
+        .ops
+        .ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::Message(_)))
+        .collect();
+    for op in public {
+        assert!(
+            shown.ops.ops.contains(op),
+            "reasoning backfill keeps public IDs and bytes"
+        );
+    }
+    let raw_only = ImportOptions {
+        normalize: false,
+        ..ImportOptions::default()
+    };
+    let appended = import_projection_prefix(&dir, &records, &raw_only, &mut cursors);
+    assert_eq!(appended.report.raw_ops, 1);
+    assert_eq!(appended.report.normalized_ops, 0);
+    let replay = import_projection_prefix(&dir, &records, &shown_options, &mut cursors);
+    assert_eq!(replay.report.raw_ops, 0);
+    assert_eq!(
+        replay.report.files_processed, 1,
+        "raw progress cannot advance semantic coverage"
+    );
+    let accumulated: Vec<_> = [
+        hidden.ops.ops,
+        shown.ops.ops,
+        appended.ops.ops,
+        replay.ops.ops,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let canonical = canonical_revisions(&accumulated);
+    let view = editchain_project::HistoryProjection::from_ops(canonical);
+    assert_eq!(view.codex_logical_items().len(), 2);
+    let repeated = import_projection_prefix(&dir, &records, &shown_options, &mut cursors);
+    assert!(
+        repeated.ops.ops.is_empty(),
+        "completed semantic backfill is one-shot"
+    );
+}
+
+#[test]
+fn named_materialization_backfills_independently_of_legacy_metadata_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let records = derivation_records();
+    let options = ImportOptions::default();
+    let mut cursors = MemoryCursorStore::new();
+    let captured = import_projection_prefix(&dir, &records, &options, &mut cursors);
+    let key = source_key(dir.path(), &dir.path().join("rollout-revisions.jsonl"));
+    let mut legacy = cursors.get_cursor(&key).unwrap().unwrap();
+    legacy.materialization = None;
+    cursors.set_cursor(&key, &legacy).unwrap();
+    let upgrade = import_projection_prefix(&dir, &records, &options, &mut cursors);
+    assert_eq!(upgrade.report.raw_ops, 0);
+    assert_eq!(
+        upgrade.report.normalized_ops, 4,
+        "three historical revisions and their turn removal"
+    );
+    for op in upgrade
+        .ops
+        .ops
+        .iter()
+        .filter(|op| !is_provider_evidence(op))
+    {
+        assert!(
+            captured.ops.ops.contains(op),
+            "backfill replays the exact named contract"
+        );
+    }
+    let mut checkpoint = cursors.get_cursor(&key).unwrap().unwrap();
+    assert_eq!(
+        checkpoint.normalization_version,
+        legacy.normalization_version
+    );
+    assert_eq!(checkpoint.materialization.as_ref().unwrap().through, 5);
+    assert!(
+        import_projection_prefix(&dir, &records, &options, &mut cursors)
+            .ops
+            .ops
+            .is_empty()
+    );
+    checkpoint.materialization.as_mut().unwrap().contract = "codex-occurrences-v99".into();
+    cursors.set_cursor(&key, &checkpoint).unwrap();
+    let missing_helper = HelperCommand::new(
+        "/nonexistent/materialization-must-be-checked-first",
+        Vec::new(),
+    );
+    let error = try_import(dir.path(), &missing_helper, &options, &mut cursors).unwrap_err();
+    assert!(
+        matches!(error, ImportError::CursorStore(_)),
+        "unsupported derivation cannot silently replay an older contract"
+    );
+    assert_eq!(cursors.get_cursor(&key).unwrap(), Some(checkpoint));
 }
 
 #[test]
@@ -531,8 +867,8 @@ fn full_import_preserves_raw_bytes_and_spills_blobs() {
     assert_eq!(harness.report.raw_ops, 3);
     assert_eq!(harness.report.normalized_ops, 2);
     assert_eq!(harness.report.malformed, 0);
-    assert_eq!(harness.ops.ops.len(), 6);
-    assert_eq!(harness.report.evidence_ops, 1);
+    assert_eq!(harness.ops.ops.len(), 9);
+    assert_eq!(harness.report.evidence_ops, 4);
 
     // Raw lane: session_meta inline, big lines spilled to blobs, byte-exact.
     assert_eq!(raw_bytes(&harness.ops.ops[0], &harness.blobs), ln(&line1));
@@ -570,12 +906,16 @@ fn full_import_preserves_raw_bytes_and_spills_blobs() {
         Clock::UnixMs(parse_source_time("2026-08-26T12:00:00.000Z").unwrap())
     );
 
-    // Normalized messages anchored to their first-seen raw ops and scoped to
+    // Normalized messages anchored to their witnessing raw ops and scoped to
     // their persisted turn identity (thread:turn-1).
     let turn_scope = ScopeRef::Turn(derive_turn_id("thread-1:turn-1"));
-    for (i, expected_text) in [(3usize, "line-2"), (4, "line-3")] {
-        let op = &harness.ops.ops[i];
-        assert_eq!(op.parents, ParentSet::One(harness.ops.ops[i - 2].id));
+    let messages = harness
+        .ops
+        .ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::Message(_)));
+    for (op, (raw_index, expected_text)) in messages.zip([(1, "line-2"), (2, "line-3")]) {
+        assert_eq!(op.parents, ParentSet::One(harness.ops.ops[raw_index].id));
         assert_eq!(op.scope, turn_scope);
         assert!(op.tags.matches_all(Tags::AGENT | Tags::MESSAGE));
         match &op.kind {
@@ -777,8 +1117,8 @@ fn session_fallback_to_rollout_filename_stem() {
 "#;
     let harness = import(dir.path(), &helper_in(&dir, no_meta_awk));
     let scope = ScopeRef::Session(derive_session_id("rollout-solo-1"));
-    assert_eq!(harness.ops.ops.len(), 3);
-    assert_eq!(harness.report.evidence_ops, 1);
+    assert_eq!(harness.ops.ops.len(), 4);
+    assert_eq!(harness.report.evidence_ops, 2);
     for op in &harness.ops.ops {
         let expected = if matches!(op.kind, OpKind::Import(_)) || is_provider_evidence(op) {
             scope
@@ -805,7 +1145,7 @@ fn bridge_thread_beats_raw_session_meta() {
 }
 
 #[test]
-fn repeated_upserts_fold_echo_and_completion_repeats() {
+fn repeated_upserts_preserve_revisions_and_fold_current_logical_items() {
     let dir = tempfile::tempdir().unwrap();
     write_rollout(
         dir.path(),
@@ -832,8 +1172,8 @@ fn repeated_upserts_fold_echo_and_completion_repeats() {
     let harness = import(dir.path(), &helper_in(&dir, awk));
     assert_eq!(harness.report.raw_ops, 6);
     assert_eq!(
-        harness.report.normalized_ops, 2,
-        "echo pair + compaction replay fold to one item each"
+        harness.report.normalized_ops, 5,
+        "each witnessed upsert remains an immutable revision"
     );
     let messages: Vec<_> = harness
         .ops
@@ -841,7 +1181,7 @@ fn repeated_upserts_fold_echo_and_completion_repeats() {
         .iter()
         .filter(|op| matches!(op.kind, OpKind::Message(_)))
         .collect();
-    assert_eq!(messages.len(), 2);
+    assert_eq!(messages.len(), 5);
     let message_text = |op: &editchain_core::Op| match &op.kind {
         OpKind::Message(m) => match &m.content {
             Payload::Inline(b) => String::from_utf8_lossy(b).into_owned(),
@@ -849,23 +1189,24 @@ fn repeated_upserts_fold_echo_and_completion_repeats() {
         },
         _ => panic!("expected message op"),
     };
-    assert_eq!(message_text(messages[0]), "first second");
-    assert_eq!(message_text(messages[1]), "b-final");
-    // Anchored at first-seen ordinals: derived(2,1) and derived(4,1).
+    let texts: Vec<_> = messages.iter().map(|op| message_text(op)).collect();
+    assert_eq!(
+        texts,
+        ["first", "first second", "b-first", "b-final", "b-final"]
+    );
     let path = dir.path().join("rollout-1.jsonl");
     let stream = source_stream(dir.path(), &path, 0);
-    assert_eq!(
-        messages[0].id,
-        stream
-            .op_from_position(SourcePosition::derived(2, 1))
-            .unwrap()
-    );
-    assert_eq!(
-        messages[1].id,
-        stream
-            .op_from_position(SourcePosition::derived(4, 1))
-            .unwrap()
-    );
+    for (message, ordinal) in messages.iter().zip(2..=6) {
+        assert_occurrence_anchor(message, &stream, ordinal);
+    }
+    let view = editchain_project::HistoryProjection::from_ops(harness.ops.ops.clone());
+    assert_eq!(view.codex_logical_items().len(), 2);
+    let latest: Vec<_> = view
+        .codex_logical_items()
+        .iter()
+        .map(|item| item.source.seq >> 16)
+        .collect();
+    assert_eq!(latest, [3, 6]);
 }
 
 #[test]
@@ -892,20 +1233,21 @@ fn removed_turn_ids_rollback_items() {
 }
 "#;
     let harness = import(dir.path(), &helper_in(&dir, awk));
-    assert_eq!(harness.report.normalized_ops, 1);
+    assert_eq!(
+        harness.report.normalized_ops, 4,
+        "three revisions and an explicit removal"
+    );
     let messages: Vec<_> = harness
         .ops
         .ops
         .iter()
         .filter(|op| matches!(op.kind, OpKind::Message(_)))
         .collect();
-    assert_eq!(messages.len(), 1);
-    match &messages[0].kind {
-        OpKind::Message(m) => {
-            assert_eq!(m.content, Payload::Inline(b"c".to_vec()));
-        }
-        _ => panic!("expected message op"),
-    }
+    assert_eq!(messages.len(), 3, "removal retains historical revisions");
+    let view = editchain_project::HistoryProjection::from_ops(harness.ops.ops.clone());
+    assert_eq!(view.codex_logical_items().len(), 1);
+    assert_eq!(view.codex_logical_items()[0].turn, "turn-2");
+    assert_eq!(view.codex_logical_items()[0].item, "c");
 }
 
 #[test]
@@ -997,13 +1339,7 @@ fn legacy_and_paginated_physical_ordinals() {
         .iter()
         .find(|op| matches!(&op.kind, OpKind::Message(m) if m.content == Payload::Inline(b"line-2".to_vec())))
         .unwrap();
-    assert_eq!(
-        paged_msg.id,
-        stream
-            .op_from_position(SourcePosition::derived(2, 1))
-            .unwrap(),
-        "normalized op uses the physical line ordinal, not the Codex ordinal"
-    );
+    assert_occurrence_anchor(paged_msg, &stream, 2);
 }
 
 #[test]
@@ -1183,12 +1519,7 @@ fn incremental_append_emits_deterministic_update_for_item_changed_after_cursor()
         .iter()
         .find(|o| matches!(o.kind, OpKind::Message(_)))
         .expect("initial message op");
-    assert_eq!(
-        original.id,
-        stream
-            .op_from_position(SourcePosition::derived(2, 1))
-            .unwrap()
-    );
+    assert_occurrence_anchor(original, &stream, 2);
     match &original.kind {
         OpKind::Message(m) => {
             assert_eq!(m.content, Payload::Inline(b"first".to_vec()));
@@ -1217,13 +1548,7 @@ fn incremental_append_emits_deterministic_update_for_item_changed_after_cursor()
         .iter()
         .find(|o| matches!(o.kind, OpKind::Message(_)))
         .expect("update op");
-    assert_eq!(
-        update.id,
-        stream
-            .op_from_position(SourcePosition::derived(3, 1))
-            .unwrap(),
-        "update anchored at the change ordinal (last_seen)"
-    );
+    assert_occurrence_anchor(update, &stream, 3);
     assert_eq!(
         update.parents,
         ParentSet::One(stream.op_from_position(SourcePosition::raw(3)).unwrap())
@@ -1253,12 +1578,7 @@ fn incremental_append_emits_deterministic_update_for_item_changed_after_cursor()
         .iter()
         .find(|o| matches!(o.kind, OpKind::Message(_)))
         .expect("update op");
-    assert_eq!(
-        update3.id,
-        stream
-            .op_from_position(SourcePosition::derived(4, 1))
-            .unwrap()
-    );
+    assert_occurrence_anchor(update3, &stream, 4);
     match &update3.kind {
         OpKind::Message(m) => {
             assert_eq!(
@@ -1633,9 +1953,15 @@ fn reasoning_is_private_and_respects_include_thinking() {
         },
     );
     assert_eq!(shown.report.normalized_ops, 1);
-    match &shown.ops.ops[2].kind {
+    let reflection = shown
+        .ops
+        .ops
+        .iter()
+        .find(|op| matches!(op.kind, OpKind::Reflection(_)))
+        .unwrap();
+    match &reflection.kind {
         OpKind::Reflection(r) => {
-            assert!(shown.ops.ops[2]
+            assert!(reflection
                 .tags
                 .matches_all(Tags::PRIVATE | Tags::REFLECTION));
             assert_eq!(r.summary, Payload::Inline(b"step one\nstep two".to_vec()));
@@ -1895,7 +2221,7 @@ fn multi_path_file_change_retains_one_edit_and_path_note_per_file() {
 }
 
 #[test]
-fn tool_lifecycle_split_uses_first_and_last_seen_lanes() {
+fn tool_lifecycle_preserves_arguments_and_result_at_their_witnessing_occurrences() {
     let dir = tempfile::tempdir().unwrap();
     write_rollout(
         dir.path(),
@@ -1927,13 +2253,7 @@ fn tool_lifecycle_split_uses_first_and_last_seen_lanes() {
         .iter()
         .find(|o| matches!(&o.kind, OpKind::Tool(t) if t.stage == ToolStage::Start))
         .expect("start op");
-    assert_eq!(
-        start.id,
-        stream
-            .op_from_position(SourcePosition::derived(2, 1))
-            .unwrap(),
-        "start anchored at first-seen ordinal"
-    );
+    assert_occurrence_anchor(start, &stream, 2);
     assert_eq!(
         start.parents,
         ParentSet::One(stream.op_from_position(SourcePosition::raw(2)).unwrap())
@@ -1959,13 +2279,7 @@ fn tool_lifecycle_split_uses_first_and_last_seen_lanes() {
         .iter()
         .find(|o| matches!(&o.kind, OpKind::Tool(t) if t.stage == ToolStage::Finish))
         .expect("finish op");
-    assert_eq!(
-        finish.id,
-        stream
-            .op_from_position(SourcePosition::derived(3, 1))
-            .unwrap(),
-        "finish anchored at last-seen ordinal with a deterministic lane"
-    );
+    assert_occurrence_anchor(finish, &stream, 3);
     assert_eq!(
         finish.parents,
         ParentSet::One(stream.op_from_position(SourcePosition::raw(3)).unwrap())
@@ -2030,15 +2344,9 @@ fn inter_agent_and_compaction_lines_normalize_to_note_and_reflection() {
 
     let note = ops
         .iter()
-        .find(|o| matches!(o.kind, OpKind::Note(_)))
+        .find(|o| matches!(o.kind, OpKind::Note(_)) && !is_provider_evidence(o))
         .expect("inter-agent note");
-    assert_eq!(
-        note.id,
-        stream
-            .op_from_position(SourcePosition::derived(2, 1))
-            .unwrap(),
-        "inter-agent note anchored at its physical line with a deterministic lane"
-    );
+    assert_occurrence_anchor(note, &stream, 2);
     assert_eq!(
         note.parents,
         ParentSet::One(stream.op_from_position(SourcePosition::raw(2)).unwrap())
@@ -2060,13 +2368,7 @@ fn inter_agent_and_compaction_lines_normalize_to_note_and_reflection() {
         .iter()
         .find(|o| matches!(o.kind, OpKind::Reflection(_)))
         .expect("compaction reflection");
-    assert_eq!(
-        reflection.id,
-        stream
-            .op_from_position(SourcePosition::derived(3, 1))
-            .unwrap(),
-        "compaction reflection anchored at its physical line"
-    );
+    assert_occurrence_anchor(reflection, &stream, 3);
     assert!(reflection.tags.matches_all(Tags::REFLECTION));
     assert!(
         !reflection.tags.matches_any(Tags::PRIVATE),
@@ -2084,7 +2386,7 @@ fn inter_agent_and_compaction_lines_normalize_to_note_and_reflection() {
 }
 
 #[test]
-fn normalized_items_on_the_same_line_use_distinct_derived_lanes() {
+fn normalized_items_on_the_same_line_use_distinct_item_namespaces() {
     let dir = tempfile::tempdir().unwrap();
     write_rollout(
         dir.path(),
@@ -2108,18 +2410,30 @@ fn normalized_items_on_the_same_line_use_distinct_derived_lanes() {
         .collect::<Vec<_>>();
     ids.sort_unstable();
 
-    let mut expected = vec![
-        stream
-            .op_from_position(SourcePosition::derived(2, 1))
-            .unwrap(),
-        stream
-            .op_from_position(SourcePosition::derived(2, 2))
-            .unwrap(),
-    ];
-    expected.sort_unstable();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1], "same-line item IDs must not collide");
+    for op in harness
+        .ops
+        .ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::Message(_)))
+    {
+        assert_occurrence_anchor(op, &stream, 2);
+    }
+    let expected = editchain_project::HistoryProjection::from_ops(harness.ops.ops.clone());
+    let mut reversed = harness.ops.ops.clone();
+    reversed.reverse();
+    let reversed = editchain_project::HistoryProjection::from_ops(reversed);
+    let summaries = |view: &editchain_project::HistoryProjection| {
+        view.nodes()
+            .iter()
+            .map(|node| (node.node_key(), node.summary()))
+            .collect::<Vec<_>>()
+    };
     assert_eq!(
-        ids, expected,
-        "same-line normalized op ids must not collide"
+        summaries(&expected),
+        summaries(&reversed),
+        "stored output order determines presentation"
     );
 }
 
@@ -2565,13 +2879,7 @@ fn turn_identity_is_persisted_on_ops_with_a_turn_metadata_note() {
     assert_eq!(turn_note.scope, turn_scope);
     let path = dir.path().join("rollout-1.jsonl");
     let stream = source_stream(dir.path(), &path, 0);
-    assert_eq!(
-        turn_note.id,
-        stream
-            .op_from_position(SourcePosition::derived(2, 3))
-            .unwrap(),
-        "turn note takes the lane after the two same-line item lanes"
-    );
+    assert_occurrence_anchor(turn_note, &stream, 2);
 }
 
 /// Build a one-record projection carrying a `sessionMeta` with an optional cwd.
@@ -2712,8 +3020,8 @@ fn workspace_filter_includes_equal_nested_and_missing_cwd() {
     assert_eq!(harness.report.raw_ops, 4);
     assert_eq!(harness.report.normalized_ops, 0);
     assert_eq!(harness.report.malformed, 0);
-    assert_eq!(harness.ops.ops.len(), 8);
-    assert_eq!(harness.report.evidence_ops, 4);
+    assert_eq!(harness.ops.ops.len(), 12);
+    assert_eq!(harness.report.evidence_ops, 8);
     let raw: Vec<_> = harness
         .ops
         .ops

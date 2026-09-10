@@ -166,7 +166,7 @@ impl CursorStore for PendingCursors<'_> {
     }
 
     fn set_cursor(&mut self, key: &str, cursor: &CursorValue) -> Result<(), ImportError> {
-        let _: Option<CursorValue> = self.changes.cursors.insert(key.to_string(), cursor.clone());
+        drop(self.changes.cursors.insert(key.to_string(), cursor.clone()));
         Ok(())
     }
 

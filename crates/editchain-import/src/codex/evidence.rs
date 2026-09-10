@@ -33,7 +33,7 @@ pub(super) fn source_evidence_ops(
     let last = stream.op_from_position(SourcePosition::raw(plan.checkpoint().ops_emitted))?;
     let first = stream.op_from_position(SourcePosition::raw(1))?;
     let mut notes = Vec::new();
-    for item in &projection.lifecycle_items {
+    for item in &projection.item_occurrences {
         if item.last_seen <= start || item.last_seen > plan.checkpoint().ops_emitted {
             continue;
         }
@@ -123,7 +123,7 @@ fn lifecycle_events(
     Ok(events)
 }
 
-fn evidence_note(thread: &str, evidence: &ProviderEvidence) -> Result<Op, ImportError> {
+pub(super) fn evidence_note(thread: &str, evidence: &ProviderEvidence) -> Result<Op, ImportError> {
     let content = serde_json::to_string(&evidence)?;
     let id = derive_external_entity_id("codex:provider-evidence:v1", &content);
     Ok(Op {

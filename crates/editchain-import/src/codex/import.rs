@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use editchain_core::clock::Clock;
 use serde_json::Value;
 
 use crate::cursor::resolve_source_cursor;
@@ -19,9 +18,8 @@ use super::link::{
     SPAWN_SIGNAL_SUBAGENT_ACTIVITY,
 };
 use super::normalize::{
-    build_raw_op, completed_agent_paths_from_tool, is_blank_line, normalized_ops_for_compaction,
-    normalized_ops_for_inter_agent, normalized_ops_for_item, normalized_ops_for_turn,
-    owning_thread_from_raw_line, ItemAnchor, NormalizeContext,
+    build_raw_op, completed_agent_paths_from_tool, is_blank_line, owning_thread_from_raw_line,
+    NormalizeContext,
 };
 use super::projection::{parse_projection, FinalItem, ProjectionKind};
 use super::session_git::session_git_link_op;
@@ -65,9 +63,9 @@ pub struct CodexDiscoveryRequest {
 ///    deterministic (see [`rollout_in_workspace`]);
 /// 5. Emits one byte-exact raw `ImportOp` per new physical line, chained into
 ///    the per-file raw chain;
-/// 6. Folds the projection's upsert/remove records to final logical items and
-///    emits one normalized op per final item first seen in this batch;
-/// 7. Persists the cursor and normalization version only after the whole file
+/// 6. Captures immutable normalized revisions and logical removals at their
+///    witnessing records, backfilling a named materialization when required;
+/// 7. Persists capture and materialization checkpoints only after the whole file
 ///    succeeded.
 ///
 /// Session scope is the owning thread id: bridge metadata first, then raw
@@ -90,11 +88,6 @@ pub struct CodexDiscoveryRequest {
 /// longer abort the import: they are re-imported under a new generation. On
 /// error the affected file's cursor is not advanced.
 ///
-/// # Panics
-///
-/// Panics if a folded item's first-seen ordinal falls outside the current
-/// batch's line range — guarded by projection validation, so unreachable in
-/// practice.
 #[expect(
     clippy::arithmetic_side_effects,
     clippy::as_conversions,
@@ -103,10 +96,6 @@ pub struct CodexDiscoveryRequest {
 #[expect(
     clippy::too_many_arguments,
     reason = "import orchestrator takes the request, options, helper bridge, and three sinks"
-)]
-#[expect(
-    clippy::expect_used,
-    reason = "first-seen ordinals are validated against the batch's line range by parse_projection"
 )]
 pub fn import_codex(
     request: &CodexDiscoveryRequest,
@@ -187,11 +176,18 @@ pub fn import_codex(
                     || cursor.content_hash_version < 1
                     || cursor.accepted_generation.is_none()
             });
+        let needs_materialization_replay = options.normalize
+            && super::materialize::needs_replay(
+                plan.checkpoint().materialization.as_ref(),
+                options.include_thinking,
+                plan.start_seq(),
+            )?;
 
         if plan.state() == SourceReadState::Unchanged
             && !needs_normalization_upgrade
             && !needs_session_title_refresh
             && !needs_cursor_upgrade
+            && !needs_materialization_replay
         {
             continue;
         }
@@ -222,6 +218,11 @@ pub fn import_codex(
                 new_cursor.normalization_version = new_cursor
                     .normalization_version
                     .max(CODEX_NORMALIZATION_VERSION);
+                new_cursor.materialization = Some(crate::sink::MaterializationCheckpoint {
+                    contract: super::materialize::CONTRACT.to_owned(),
+                    through: new_cursor.ops_emitted,
+                    includes_thinking: options.include_thinking,
+                });
             }
             new_cursor.source_node = Some(source_node);
             new_cursor.content_hash_version = 1;
@@ -342,7 +343,6 @@ pub fn import_codex(
         } else {
             None
         };
-        let mut clocks: Vec<Clock> = Vec::with_capacity(lines.len());
         for (i, line) in lines.iter().enumerate() {
             options.cancellation.check(&rollout.path)?;
             let seq = start_seq + i as u64 + 1;
@@ -356,7 +356,6 @@ pub fn import_codex(
                 prev_raw_id,
                 blobs,
             )?;
-            clocks.push(op.clock);
             let _: bool = ops.accept_op(&op)?;
             report.raw_ops += 1;
             prev_raw_id = Some(op.id);
@@ -414,137 +413,30 @@ pub fn import_codex(
             }
         }
 
-        // Emit normalized ops: fresh items (first seen after the cursor)
-        // anchored at their first-seen ordinal, deterministic update ops for
-        // items first seen before the cursor but changed after it (anchored at
-        // their last-seen ordinal), and per-line inter-agent/compaction lanes.
-        // All normalized ops at one ordinal share the derived lane counters so
-        // ids never collide and stay deterministic across repeated runs.
         if options.normalize {
-            let batch_end = start_seq + lines.len() as u64;
-            let clock_at = |ordinal: u64| -> Clock {
-                let clock_idx = usize::try_from(ordinal - start_seq - 1)
-                    .expect("anchor ordinal fits usize and is within the batch");
-                *clocks
-                    .get(clock_idx)
-                    .expect("anchor ordinal validated against batch line range")
-            };
-            let mut ctx = NormalizeContext {
+            let mut context = NormalizeContext {
                 stream: &stream,
                 thread: &owning_thread,
                 session_id,
                 lanes: std::collections::HashMap::new(),
-                batch_end,
+                batch_end: new_cursor.ops_emitted,
                 include_thinking: options.include_thinking,
                 blobs,
             };
-            for item in &projection.final_items {
-                options.cancellation.check(&rollout.path)?;
-                if item.first_seen > start_seq {
-                    // Fresh item: anchor at first-seen. Items anchored to a
-                    // trailing partial line emit on a later run once the line
-                    // completes (fold state is recomputed per run).
-                    if item.first_seen > batch_end {
-                        continue;
-                    }
-                    let first_seen_clock = clock_at(item.first_seen);
-                    let last_seen_clock = if item.last_seen <= batch_end {
-                        clock_at(item.last_seen)
-                    } else {
-                        first_seen_clock
-                    };
-                    let item_ops = normalized_ops_for_item(
-                        item,
-                        ItemAnchor::FirstSeen,
-                        first_seen_clock,
-                        last_seen_clock,
-                        &mut ctx,
-                    )?;
-                    for op in &item_ops {
-                        let _: bool = ops.accept_op(op)?;
-                        report.normalized_ops += 1;
-                    }
-                } else if item.last_seen > start_seq {
-                    // Deterministic update: first seen before the cursor,
-                    // changed after it. Emit the final state anchored at the
-                    // change ordinal so no stale content is left behind.
-                    if item.last_seen > batch_end {
-                        continue;
-                    }
-                    let item_ops = normalized_ops_for_item(
-                        item,
-                        ItemAnchor::LastSeen,
-                        clock_at(item.last_seen),
-                        clock_at(item.last_seen),
-                        &mut ctx,
-                    )?;
-                    for op in &item_ops {
-                        let _: bool = ops.accept_op(op)?;
-                        report.normalized_ops += 1;
-                    }
-                }
-            }
-            for line in &projection.inter_agent_lines {
-                if line.source_ordinal <= start_seq || line.source_ordinal > batch_end {
-                    continue;
-                }
-                let line_ops =
-                    normalized_ops_for_inter_agent(line, clock_at(line.source_ordinal), &mut ctx)?;
-                for op in &line_ops {
-                    let _: bool = ops.accept_op(op)?;
-                    report.normalized_ops += 1;
-                }
-            }
-            for line in &projection.compacted_lines {
-                if line.source_ordinal <= start_seq || line.source_ordinal > batch_end {
-                    continue;
-                }
-                let line_ops =
-                    normalized_ops_for_compaction(line, clock_at(line.source_ordinal), &mut ctx)?;
-                for op in &line_ops {
-                    let _: bool = ops.accept_op(op)?;
-                    report.normalized_ops += 1;
-                }
-            }
-            // Persist turn identity and metadata: one provider-neutral note per
-            // fresh turn, anchored at the turn's first-seen ordinal. Lanes are
-            // allocated after the item/inter-agent/compaction lanes at that
-            // ordinal, so op ids stay deterministic and existing anchors are
-            // untouched.
-            let mut items_by_turn: std::collections::HashMap<&str, (u64, usize)> =
-                std::collections::HashMap::new();
-            for item in &projection.final_items {
-                if item.first_seen <= start_seq {
-                    continue;
-                }
-                let entry = items_by_turn
-                    .entry(item.turn_id.as_str())
-                    .or_insert((item.first_seen, 0));
-                entry.0 = entry.0.min(item.first_seen);
-                entry.1 += 1;
-            }
-            for turn in &projection.turns {
-                let Some((first_ordinal, item_count)) = items_by_turn.get(turn.turn_id.as_str())
-                else {
-                    continue;
-                };
-                let first_ordinal = *first_ordinal;
-                let item_count = *item_count;
-                if first_ordinal > batch_end {
-                    continue;
-                }
-                let turn_ops = normalized_ops_for_turn(
-                    turn,
-                    first_ordinal,
-                    item_count,
-                    clock_at(first_ordinal),
-                    &mut ctx,
-                )?;
-                for op in &turn_ops {
-                    let _: bool = ops.accept_op(op)?;
-                    report.normalized_ops += 1;
-                }
-            }
+            let (normalized, evidence) = super::materialize::emit_occurrences(
+                &projection,
+                &plan,
+                &mut context,
+                ops,
+                needs_materialization_replay,
+            )?;
+            report.normalized_ops = report.normalized_ops.saturating_add(normalized);
+            report.evidence_ops = report.evidence_ops.saturating_add(evidence);
+            new_cursor.materialization = Some(crate::sink::MaterializationCheckpoint {
+                contract: super::materialize::CONTRACT.to_owned(),
+                through: new_cursor.ops_emitted,
+                includes_thinking: options.include_thinking,
+            });
         }
 
         // Only persist the cursor after the whole file succeeded. The version
