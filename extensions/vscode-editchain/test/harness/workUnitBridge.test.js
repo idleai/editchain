@@ -41,6 +41,9 @@ require(path.join(__dirname, 'fixtureBridge.js'));
 require(path.join(__dirname, 'fixtures.js'));
 
 function request(body) {
+  window.__editchainStart();
+  const snapshot = capturedEvents.findLast((ev) => ev.data?.id === 'open').data.body.Ok.snapshot_id;
+  for (const request of Object.values(body)) request.snapshot_id = snapshot;
   const id = nextReqId++;
   capturedEvents.length = 0;
   window.vscode.postMessage({ id, body });

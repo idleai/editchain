@@ -387,7 +387,7 @@ test('rust-only adapter boots in headless Chrome and renders (merge)', { skip: S
     // Requests carry only the fixed Activity-view window fields.
     assert.ok(state.windowRequests.length >= 1, 'boot issued a GetWindow');
     assert.ok(state.windowRequests.every((request) =>
-      JSON.stringify(request.keys) === JSON.stringify(['include_layout', 'limit', 'offset'])),
+      JSON.stringify(request.keys) === JSON.stringify(['include_layout', 'limit', 'offset', 'snapshot_id'])),
     'every window uses the minimal protocol shape');
     // laneXAll is invariant across graph column / available-width changes.
     const laneXBefore = state.laneXAll;
@@ -1002,6 +1002,7 @@ test('row keyboard disclosure, double-click identity, and divider drag remain co
       state = await driver.readState(page);
       assert.deepEqual(state.openJsonLog.at(-1), {
         type: 'openJson',
+        snapshot_id: await page.evaluate(() => window.__editchainRequestLog[0].GetWindow.snapshot_id),
         op_id: null,
         git_oid: expected.git_oid,
         repository: expected.repository,

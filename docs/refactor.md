@@ -52,15 +52,22 @@ Completed increments:
   ref labels, shallow metadata, and blob/object availability inventories in
   cache identity. Window read failures remain errors, and cached offset and
   expansion indices are checked before use.
+- Snapshot protocol: version 2 negotiates an opaque identity in Open and
+  requires it on window, search, detail, object, and diff requests. Typed result
+  decoding checks both the requested identity and the active view; search jumps
+  also verify the destination row key. The host carries each row action's
+  original identity. Explicit refresh bypasses derived caches and retires old
+  tokens even when the cache fingerprint is unchanged. Old services receive
+  the unchanged Open request and produce a visible version error. Rust, browser,
+  and host regressions cover stale responses and refresh ownership.
 
 Remaining work, in dependency order:
 
-1. Bind service windows, search, layout, and renderer requests to one snapshot.
-2. Move complete Activity assembly and presentation-tree ownership into project.
-3. Consolidate typed provider evidence, source lifecycle, and persistence
+1. Move complete Activity assembly and presentation-tree ownership into project.
+2. Consolidate typed provider evidence, source lifecycle, and persistence
    checkpoints; preserve compatibility with existing normalized records.
-4. Simplify search document identity and renderer request/cache state.
-5. Retire migrated compatibility machinery and optimize measured repeated work.
+3. Simplify search document identity and renderer request/cache state.
+4. Retire migrated compatibility machinery and optimize measured repeated work.
 
 Validation uses the existing crate, service, renderer, and extension suites.
 Every completed code increment must pass `./scripts/lint.sh`. Regression tests

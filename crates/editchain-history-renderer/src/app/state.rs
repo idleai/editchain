@@ -15,6 +15,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use editchain_protocol::{
+    ErrorCode, FindInHistoryMatch, FindInHistoryResponse, GetWindowRequest, HistoryWindow,
+    OpenResponse, RequestBody, ServiceError, SnapshotId,
+};
 use serde_json::{json, Value};
 
 use super::host::{
@@ -49,7 +53,7 @@ impl Viewport {
 /// An in-flight service request (correlated by id).
 #[derive(Debug, Clone)]
 pub(crate) struct InFlight {
-    pub(crate) body: Value,
+    pub(crate) body: RequestBody,
     pub(crate) gen_tag: u64,
     pub(crate) search_epoch: Option<u64>,
 }
@@ -58,10 +62,7 @@ pub(crate) struct InFlight {
 #[derive(Debug, Clone)]
 pub(crate) struct FindMatch {
     pub(crate) row: i64,
-    #[cfg(test)]
     pub(crate) node_key: String,
-    #[cfg(test)]
-    pub(crate) summary: String,
 }
 
 /// A find jump awaiting its target window in cache.
@@ -117,6 +118,8 @@ pub(crate) enum DomOp {
 pub(crate) enum RetryAction {
     /// `resetHistory()` — reload the full history from the top.
     ResetHistory,
+    /// Open current authoritative sources before issuing more row requests.
+    RefreshSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -187,6 +190,8 @@ pub(crate) struct HistoryAppState {
     pub(crate) in_flight: BTreeMap<u64, InFlight>,
     pub(crate) pending_window_req_id: Option<u64>,
     pub(crate) view_gen: u64,
+    /// Server source/view identity negotiated by the latest successful Open.
+    pub(crate) snapshot_id: SnapshotId,
     // --- search epoch (find/search correlation) ---------------------------
     pub(crate) search_epoch: u64,
     pub(crate) current_search_epoch: Option<u64>,
@@ -237,6 +242,7 @@ impl Default for HistoryAppState {
             in_flight: BTreeMap::new(),
             pending_window_req_id: None,
             view_gen: 0,
+            snapshot_id: SnapshotId::default(),
             session_flags: SessionFlags::default(),
             search_epoch: 0,
             current_search_epoch: None,
@@ -490,17 +496,25 @@ impl HistoryAppState {
     /// arrives inside `postMessage`) correlates correctly.
     fn issue_request(
         &mut self,
-        body: Value,
+        body: RequestBody,
         is_window: bool,
         search_epoch: Option<u64>,
         step: &mut Step,
-    ) -> u64 {
+    ) -> Option<u64> {
+        if self.snapshot_id.is_empty() {
+            return None;
+        }
+        if let Err(error) = body.validate() {
+            self.fail_response(&body, &error, step);
+            return None;
+        }
         let id = self.next_req_id;
         self.next_req_id = self.next_req_id.saturating_add(1);
+        let wire_body = json!(&body);
         drop(self.in_flight.insert(
             id,
             InFlight {
-                body: body.clone(),
+                body,
                 gen_tag: self.view_gen,
                 search_epoch,
             },
@@ -510,10 +524,13 @@ impl HistoryAppState {
         }
         self.request_log.push(LoggedRequest {
             id,
-            body: body.clone(),
+            body: wire_body.clone(),
         });
-        step.sends.push(Send::Request { id, body });
-        id
+        step.sends.push(Send::Request {
+            id,
+            body: wire_body,
+        });
+        Some(id)
     }
 
     /// `fetchWindow` — fetch a window of rows around the cacheable range.
@@ -540,8 +557,13 @@ impl HistoryAppState {
         let start = (range_top..=range_bottom).find(|i| !self.cache.contains_key(i));
         let Some(start) = start else { return };
         let limit = PAGE.min(range_bottom.saturating_sub(start).saturating_add(1));
-        let body = get_window(start, limit, self.session_flags.layout_ready);
-        let _: u64 = self.issue_request(body, true, None, step);
+        let body = get_window(
+            &self.snapshot_id,
+            u64::try_from(start).unwrap_or(0),
+            u64::try_from(limit).unwrap_or(0),
+            self.session_flags.layout_ready,
+        );
+        let _: Option<u64> = self.issue_request(body, true, None, step);
     }
 
     /// `fetchWindowAround` — fetch the sparse window around an absolute row.
@@ -568,8 +590,13 @@ impl HistoryAppState {
         let start = (range_top..=range_bottom).find(|i| !self.cache.contains_key(i));
         let Some(start) = start else { return };
         let limit = PAGE.min(range_bottom.saturating_sub(start).saturating_add(1));
-        let body = get_window(start, limit, self.session_flags.layout_ready);
-        let _: u64 = self.issue_request(body, true, None, step);
+        let body = get_window(
+            &self.snapshot_id,
+            u64::try_from(start).unwrap_or(0),
+            u64::try_from(limit).unwrap_or(0),
+            self.session_flags.layout_ready,
+        );
+        let _: Option<u64> = self.issue_request(body, true, None, step);
     }
 
     /// `evictFarWindows` — drop cached rows far outside the desired range.
@@ -892,24 +919,15 @@ impl HistoryAppState {
     // --- find-in-chain -----------------------------------------------------------
 
     /// `normalizeFindMatch` — keep only finite, whole, in-range coordinates.
-    fn normalize_find_match(&self, m: &Value) -> Option<FindMatch> {
-        let raw = m.get("row").cloned().unwrap_or(Value::Null);
-        let row = match &raw {
-            Value::Number(n) => n.as_i64(),
-            Value::String(s) => s.parse::<i64>().ok(),
-            Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => None,
-        };
-        let row = row?;
+    fn normalize_find_match(&self, matched: FindInHistoryMatch) -> Option<FindMatch> {
+        let row = i64::try_from(matched.row).ok()?;
         let total = self.total.unwrap_or(0).max(0);
-        if row >= total {
+        if row >= total || matched.node_key.is_empty() {
             return None;
         }
         Some(FindMatch {
             row,
-            #[cfg(test)]
-            node_key: host::row::owned_str(m, "node_key"),
-            #[cfg(test)]
-            summary: host::row::owned_str(m, "summary"),
+            node_key: matched.node_key,
         })
     }
 
@@ -934,6 +952,10 @@ impl HistoryAppState {
 
     /// `submitFind` — issue a `FindInHistory` request for the trimmed query.
     pub(crate) fn submit_find(&mut self, query: &str, step: &mut Step) {
+        if self.snapshot_id.is_empty() {
+            self.show_find_error("Open history before searching.", step);
+            return;
+        }
         query.clone_into(&mut self.search_query);
         self.reset_find_state();
         step.ops.push(DomOp::ClearFindHighlight);
@@ -943,8 +965,12 @@ impl HistoryAppState {
         step.ops.push(DomOp::FindCounter(FindCounterState::Pending));
         step.sends
             .push(Send::StatusText(format!("Searching for \"{query}\"")));
-        let body = find_in_history(query, FIND_TOP_K);
-        let _: u64 = self.issue_request(body, false, Some(epoch), step);
+        let body = find_in_history(
+            &self.snapshot_id,
+            query,
+            usize::try_from(FIND_TOP_K).unwrap_or(0),
+        );
+        let _: Option<u64> = self.issue_request(body, false, Some(epoch), step);
     }
 
     /// `applyFindResponse` — settle a `FindInHistory` response in place. The
@@ -952,22 +978,19 @@ impl HistoryAppState {
     /// post-jump cache/sync decisions match the real scroll position.
     pub(crate) fn apply_find_response(
         &mut self,
-        response: &Value,
+        response: FindInHistoryResponse,
         viewport: &Viewport,
         step: &mut Step,
     ) {
         let matches = response
-            .get("matches")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
+            .matches
             .into_iter()
-            .filter_map(|m| self.normalize_find_match(&m))
+            .filter_map(|matched| self.normalize_find_match(matched))
             .collect::<Vec<_>>();
         let count = matches.len();
         self.find_matches = matches;
         self.find_total = count;
-        self.find_flags.more = host::row::bool(response, "more");
+        self.find_flags.more = response.more;
         self.find_flags.active = true;
         self.find_index = 0;
         self.current_search_epoch = None;
@@ -1044,6 +1067,9 @@ impl HistoryAppState {
         viewport: &Viewport,
         step: &mut Step,
     ) -> Option<Viewport> {
+        if self.snapshot_id.is_empty() {
+            return None;
+        }
         let target = self.pending_find_target?;
         let total = self.total.unwrap_or(0).max(0);
         if target.abs >= total {
@@ -1051,7 +1077,13 @@ impl HistoryAppState {
             self.fetch_window(viewport, step);
             return None;
         }
-        if !self.cache.contains_key(&target.abs) {
+        let cached = self.cache.get(&target.abs)?;
+        let expected = self.find_matches.get(target.index)?;
+        if host::row::str(cached, "node_key") != expected.node_key {
+            self.fail_snapshot(
+                step,
+                "The search result no longer matches this history row. Refresh history.",
+            );
             return None;
         }
         self.pending_find_target = None;
@@ -1123,6 +1155,14 @@ impl HistoryAppState {
         self.view_flags.data_ready = false;
         Self::show_view_message(step, "Loading history…", false);
         self.fetch_window(viewport, step);
+    }
+
+    /// Invalidate local requests before asking the host for a new opened source.
+    pub(crate) fn refresh_snapshot(&mut self, viewport: &Viewport, step: &mut Step) {
+        self.snapshot_id = SnapshotId::default();
+        self.in_flight.clear();
+        self.reset_history(viewport, step);
+        step.sends.push(Send::RefreshHistory);
     }
 
     // --- open warnings ----------------------------------------------------------
@@ -1236,6 +1276,28 @@ impl HistoryAppState {
                 Self::show_view_message(step, "Loading history…", false);
             }
             Unwrapped::Ok(value) if value.is_object() => {
+                let opened = serde_json::from_value::<OpenResponse>(value.clone())
+                    .map_err(|error| {
+                        ServiceError::new(
+                            ErrorCode::InvalidInput,
+                            format!("Invalid Open response: {error}"),
+                        )
+                    })
+                    .and_then(|opened| {
+                        opened.validate()?;
+                        Ok(opened)
+                    });
+                let opened = match opened {
+                    Ok(opened) => opened,
+                    Err(error) => {
+                        self.invalidate_snapshot();
+                        self.view_flags.data_ready = true;
+                        step.ops.push(DomOp::ProgressiveLoader(false));
+                        Self::show_view_message(step, &error.message, true);
+                        return;
+                    }
+                };
+                self.snapshot_id = opened.snapshot_id;
                 self.view_flags.data_ready = false;
                 self.search_query.clear();
                 self.reset_find_state();
@@ -1261,12 +1323,8 @@ impl HistoryAppState {
                         self.open_warnings.join(" | ")
                     )));
                 }
-                let nodes = value
-                    .get("nodes")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0)
-                    .max(0);
-                let repos = value.get("repos").and_then(Value::as_i64).unwrap_or(0);
+                let nodes = i64::try_from(opened.nodes).unwrap_or(i64::MAX);
+                let repos = opened.repos;
                 step.sends
                     .push(Send::Log(format!("open: {nodes} nodes, {repos} repos")));
                 self.total = Some(nodes);
@@ -1297,17 +1355,21 @@ impl HistoryAppState {
                 self.report_status(viewport, step);
             }
             Unwrapped::Ok(value) => {
+                self.invalidate_snapshot();
                 let err_text = String::from("unknown error");
                 step.sends
                     .push(Send::Log(format!("open error: {err_text}")));
                 self.view_flags.data_ready = true;
+                step.ops.push(DomOp::ProgressiveLoader(false));
                 Self::show_view_message(step, &format!("Failed to open history: {err_text}"), true);
                 drop(value);
             }
             Unwrapped::Err(err_text) => {
+                self.invalidate_snapshot();
                 step.sends
                     .push(Send::Log(format!("open error: {err_text}")));
                 self.view_flags.data_ready = true;
+                step.ops.push(DomOp::ProgressiveLoader(false));
                 Self::show_view_message(step, &format!("Failed to open history: {err_text}"), true);
             }
         }
@@ -1377,85 +1439,140 @@ impl HistoryAppState {
                 return;
             }
         }
-        let unwrapped = host::unwrap(body);
-        match unwrapped {
-            Unwrapped::Err(err_text) => {
-                step.sends
-                    .push(Send::Log(format!("request error: {err_text}")));
-                if was_pending_window || req.body.get("GetWindow").is_some() {
-                    self.show_request_error(
+        match host::unwrap(body) {
+            Unwrapped::Err(error) => self.fail_response(&req.body, &error, step),
+            Unwrapped::Ok(value) => match &req.body {
+                RequestBody::GetWindow(request) => match host::decode::<HistoryWindow>(value) {
+                    Ok(window) => {
+                        if let Err(error) =
+                            self.check_response_snapshot(&req.body, &window.snapshot_id)
+                        {
+                            self.fail_response(&req.body, &error, step);
+                        } else {
+                            self.handle_window_response(window, request, viewport, step);
+                        }
+                    }
+                    Err(error) => self.fail_response(&req.body, &error, step),
+                },
+                RequestBody::FindInHistory(_) => {
+                    match host::decode::<FindInHistoryResponse>(value) {
+                        Ok(found) => {
+                            if let Err(error) =
+                                self.check_response_snapshot(&req.body, &found.snapshot_id)
+                            {
+                                self.fail_response(&req.body, &error, step);
+                            } else {
+                                self.apply_find_response(found, viewport, step);
+                            }
+                        }
+                        Err(error) => self.fail_response(&req.body, &error, step),
+                    }
+                }
+                RequestBody::Open(_)
+                | RequestBody::Refresh(_)
+                | RequestBody::GetNodeDetails(_)
+                | RequestBody::ResolveObject(_)
+                | RequestBody::GetFileDiff(_) => {
+                    self.fail_response(
+                        &req.body,
+                        &ServiceError::new(
+                            ErrorCode::InvalidInput,
+                            "Unexpected response for a history renderer request.",
+                        ),
                         step,
-                        &format!("Failed to load history rows: {err_text}"),
-                        RetryAction::ResetHistory,
                     );
-                    return;
                 }
-                if req.body.get("FindInHistory").is_some() {
-                    self.show_find_error(&err_text, step);
-                }
-            }
-            Unwrapped::Ok(value) if value.is_object() => {
-                // FindInHistory response — in-place find, never replaces the view.
-                if value.get("matches").and_then(Value::as_array).is_some() {
-                    self.apply_find_response(&value, viewport, step);
-                    return;
-                }
-                if value.get("rows").and_then(Value::as_array).is_some() {
-                    self.handle_window_response(&value, &req.body, viewport, step);
-                }
-            }
-            Unwrapped::Ok(_) => {}
+            },
         }
+    }
+
+    fn check_response_snapshot(
+        &self,
+        request: &RequestBody,
+        observed: &SnapshotId,
+    ) -> Result<(), ServiceError> {
+        if observed.is_empty()
+            || observed != &self.snapshot_id
+            || request.snapshot_id() != Some(observed)
+        {
+            return Err(ServiceError::new(
+                ErrorCode::StaleSnapshot,
+                "This result belongs to a different history snapshot. Refresh history.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn fail_response(&mut self, request: &RequestBody, error: &ServiceError, step: &mut Step) {
+        step.sends
+            .push(Send::Log(format!("request error: {error}")));
+        if matches!(
+            error.code,
+            ErrorCode::StaleSnapshot | ErrorCode::UnsupportedProtocol
+        ) {
+            self.fail_snapshot(step, &error.message);
+        } else if matches!(request, RequestBody::FindInHistory(_)) {
+            self.show_find_error(&error.message, step);
+        } else {
+            self.show_request_error(
+                step,
+                &format!("Failed to load history rows: {error}"),
+                RetryAction::ResetHistory,
+            );
+        }
+    }
+
+    fn invalidate_snapshot(&mut self) {
+        self.snapshot_id = SnapshotId::default();
+        self.in_flight.clear();
+        self.pending_window_req_id = None;
+        self.cache.clear();
+        self.reset_find_state();
+        self.current_search_epoch = None;
+    }
+
+    fn fail_snapshot(&mut self, step: &mut Step, message: &str) {
+        self.invalidate_snapshot();
+        self.show_request_error(step, message, RetryAction::RefreshSnapshot);
+        step.ops.push(DomOp::ProgressiveLoader(false));
     }
 
     /// `GetWindow` response handling — the production two-pass hydration flow
     /// (rows first, then the layout geometry pass for the same page).
     fn handle_window_response(
         &mut self,
-        value: &Value,
-        req_body: &Value,
+        window: HistoryWindow,
+        request: &GetWindowRequest,
         viewport: &Viewport,
         step: &mut Step,
     ) {
-        let response_layout_ready = value
-            .get("layout_ready")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
+        let response_layout_ready = window.layout_ready;
         if response_layout_ready {
             self.session_flags.layout_ready = true;
         }
-        if let Some(total) = value.get("total").and_then(Value::as_i64) {
-            self.total = Some(total.max(0));
-        }
+        self.total = Some(i64::try_from(window.total).unwrap_or(i64::MAX));
         if response_layout_ready {
-            if let Some(max_lane) = value.get("max_lane").and_then(Value::as_i64) {
-                if let Ok(max_lane) = u32::try_from(max_lane.max(0)) {
-                    if max_lane != self.max_lane {
-                        self.max_lane = max_lane;
-                        step.ops.push(DomOp::RefreshHeader);
-                    }
+            if let Ok(max_lane) = u32::try_from(window.max_lane) {
+                if max_lane != self.max_lane {
+                    self.max_lane = max_lane;
+                    step.ops.push(DomOp::RefreshHeader);
                 }
             }
         }
-        // Expansion indices ship only with the offset-0 window. Rebuild the
-        // depth-first visibility map and re-anchor (the identity-mapped first
-        // paint is now stale). `sub_op_counts` remains the compatibility path
-        // for one-level services; current services also send nested spans.
-        if let Some(counts) = value.get("sub_op_counts").and_then(Value::as_array) {
+        // The offset-zero page establishes the fixed expansion coordinates.
+        if let Some(counts) = window.sub_op_counts {
             self.sub_op_counts = counts
-                .iter()
-                .map(|c| c.as_i64().and_then(|n| u32::try_from(n).ok()).unwrap_or(0))
+                .into_iter()
+                .map(|count| u32::try_from(count).unwrap_or(0))
                 .collect();
             self.expansion_spans.clear();
-            if let Some(spans) = value.get("expansion_spans").and_then(Value::as_array) {
+            if let Some(spans) = window.expansion_spans {
                 for span in spans {
-                    let row = span.get("row").and_then(Value::as_i64);
-                    let descendants = span
-                        .get("descendant_count")
-                        .and_then(Value::as_i64)
-                        .and_then(|count| u32::try_from(count).ok());
-                    if let (Some(row), Some(descendants)) = (row, descendants) {
-                        if row >= 0 && descendants > 0 {
+                    if let (Ok(row), Ok(descendants)) = (
+                        i64::try_from(span.row),
+                        u32::try_from(span.descendant_count),
+                    ) {
+                        if descendants > 0 {
                             let _: Option<u32> = self.expansion_spans.insert(row, descendants);
                         }
                     }
@@ -1468,25 +1585,17 @@ impl HistoryAppState {
                 bottom: self.render_bottom,
             });
         }
-        let base = req_body
-            .get("GetWindow")
-            .and_then(|w| w.get("offset"))
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        if let Some(rows) = value.get("rows").and_then(Value::as_array) {
-            for (i, row) in rows.iter().enumerate() {
-                let abs = base.saturating_add(i64::try_from(i).unwrap_or(0));
-                if !self.cache.contains_key(&abs) {
-                    self.total_fetched = self.total_fetched.saturating_add(1);
-                }
-                drop(self.cache.insert(abs, row.clone()));
+        let base = i64::try_from(request.offset).unwrap_or(i64::MAX);
+        for (index, row) in window.rows.into_iter().enumerate() {
+            let abs = base.saturating_add(i64::try_from(index).unwrap_or(0));
+            if !self.cache.contains_key(&abs) {
+                self.total_fetched = self.total_fetched.saturating_add(1);
             }
+            // The presentation adapter still consumes flat rows; defaults and
+            // wire types have already been decoded once by the shared protocol.
+            drop(self.cache.insert(abs, json!(row)));
         }
-        // A find jump target's window has arrived: move the viewport to it
-        // BEFORE eviction (eviction keys off the current viewport). The
-        // post-scroll viewport becomes the effective viewport for the rest of
-        // this response, mirroring main.js where `rowsEl.scrollTop` is applied
-        // before `evictFarWindows()`/`syncWindow()`.
+        // Complete a pending find jump before eviction changes the viewport.
         let mut effective_viewport = *viewport;
         if let Some(target) = self.pending_find_target {
             if self.cache.contains_key(&target.abs) {
@@ -1495,18 +1604,14 @@ impl HistoryAppState {
                 }
             }
         }
-        if response_layout_ready {
-            let include_layout = req_body
-                .get("GetWindow")
-                .and_then(|w| w.get("include_layout"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if include_layout {
-                step.ops.push(DomOp::Reanchor {
-                    top: self.render_top,
-                    bottom: self.render_bottom,
-                });
-            }
+        if self.snapshot_id.is_empty() {
+            return;
+        }
+        if response_layout_ready && request.include_layout {
+            step.ops.push(DomOp::Reanchor {
+                top: self.render_top,
+                bottom: self.render_bottom,
+            });
         }
         self.evict_far_windows(&effective_viewport);
         self.sync_window(&effective_viewport, step);
@@ -1530,29 +1635,16 @@ impl HistoryAppState {
         )));
         self.report_status(viewport, step);
         step.save_state = Some(Self::persisted_state(viewport));
-        if !response_layout_ready {
-            let include_layout = req_body
-                .get("GetWindow")
-                .and_then(|w| w.get("include_layout"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if !include_layout {
-                let Some(window) = req_body.get("GetWindow") else {
-                    return;
-                };
-                let body = get_window(
-                    window.get("offset").and_then(Value::as_i64).unwrap_or(0),
-                    window.get("limit").and_then(Value::as_i64).unwrap_or(0),
-                    true,
-                );
-                let _: u64 = self.issue_request(body, true, None, step);
-                return;
-            }
+        if !response_layout_ready && !request.include_layout {
+            let body = RequestBody::GetWindow(GetWindowRequest {
+                include_layout: true,
+                ..request.clone()
+            });
+            let _: Option<u64> = self.issue_request(body, true, None, step);
+            return;
         }
-        if self.pending_find_target.is_some() {
-            if let Some(target) = self.pending_find_target {
-                self.fetch_window_around(target.abs, step);
-            }
+        if let Some(target) = self.pending_find_target {
+            self.fetch_window_around(target.abs, step);
         } else {
             self.fetch_window(&effective_viewport, step);
         }
@@ -1570,12 +1662,38 @@ mod tests {
 
     fn open_msg(nodes: i64) -> HostMessage {
         HostMessage::parse(
-            &json!({ "id": "open", "body": { "Ok": { "nodes": nodes, "repos": 1 } } }),
+            &json!({ "id": "open", "body": { "Ok": { "protocol_version": 2, "snapshot_id": "fixture", "nodes": nodes, "repos": 1 } } }),
         )
         .unwrap()
     }
 
+    fn fixture_state() -> HistoryAppState {
+        HistoryAppState {
+            snapshot_id: SnapshotId::new("fixture"),
+            ..HistoryAppState::default()
+        }
+    }
+
     fn resp(id: u64, body: &Value) -> HostMessage {
+        let mut body = body.clone();
+        if let Some(ok) = body.get_mut("Ok").and_then(Value::as_object_mut) {
+            let _: &mut Value = ok.entry("snapshot_id").or_insert(json!("fixture"));
+            if ok.contains_key("rows") {
+                let _: &mut Value = ok.entry("chain_generation").or_insert(json!(0));
+                let _: &mut Value = ok.entry("layout_ready").or_insert(json!(true));
+            }
+            if let Some(matches) = ok.get_mut("matches").and_then(Value::as_array_mut) {
+                for matched in matches {
+                    if let Some(fields) = matched.as_object_mut() {
+                        if let Some(row) = fields.get("row").and_then(Value::as_u64) {
+                            let _: &mut Value = fields
+                                .entry("node_key")
+                                .or_insert(json!(format!("node:{row}")));
+                        }
+                    }
+                }
+            }
+        }
         HostMessage::parse(&json!({ "id": id, "body": body })).unwrap()
     }
 
@@ -1647,8 +1765,130 @@ mod tests {
     }
 
     #[test]
-    fn open_establishes_view_and_issues_first_window() {
+    fn current_request_rejects_another_snapshot_and_refresh_starts_a_new_open() {
         let mut state = HistoryAppState::default();
+        let mut step = Step::new();
+        state.handle_host_message(open_msg(500), &vp(), &mut step);
+        let id = state.pending_window_req_id.unwrap();
+        let mut window = window_response(0, 1, 500, None);
+        drop(
+            window
+                .get_mut("Ok")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("snapshot_id".to_owned(), json!("another-snapshot")),
+        );
+        let mut rejected = Step::new();
+        state.handle_host_message(resp(id, &window), &vp(), &mut rejected);
+        assert!(state.cache.is_empty());
+        assert!(state.snapshot_id.is_empty());
+        assert!(rejected.ops.iter().any(|op| matches!(
+            op,
+            DomOp::ShowRequestError {
+                retry: RetryAction::RefreshSnapshot,
+                ..
+            }
+        )));
+        let mut refresh = Step::new();
+        state.refresh_snapshot(&vp(), &mut refresh);
+        assert!(refresh.sends.contains(&Send::RefreshHistory));
+        assert!(!refresh
+            .sends
+            .iter()
+            .any(|send| matches!(send, Send::Request { .. })));
+        assert!(state.in_flight.is_empty());
+        state.handle_host_message(open_msg(500), &vp(), &mut refresh);
+        assert_eq!(state.snapshot_id.as_str(), "fixture");
+        assert!(state.pending_window_req_id.is_some());
+    }
+
+    #[test]
+    fn malformed_and_wrong_result_types_end_the_pending_request_explicitly() {
+        for body in [
+            json!({"Ok": null}),
+            json!({"Ok": {"matches": [], "more": false}}),
+            json!({"Ok": {"rows": "invalid"}}),
+        ] {
+            let mut state = HistoryAppState::default();
+            let mut open = Step::new();
+            state.handle_host_message(open_msg(500), &vp(), &mut open);
+            let id = state.pending_window_req_id.unwrap();
+            let mut failed = Step::new();
+            state.handle_host_message(resp(id, &body), &vp(), &mut failed);
+            assert!(state.pending_window_req_id.is_none());
+            assert!(state.cache.is_empty());
+            assert!(failed
+                .ops
+                .iter()
+                .any(|op| matches!(op, DomOp::ShowRequestError { .. })));
+        }
+    }
+
+    #[test]
+    fn offscreen_find_checks_the_node_key_when_its_page_arrives() {
+        let mut state = HistoryAppState {
+            total: Some(2000),
+            session_flags: SessionFlags {
+                snapshot_established: true,
+                ..SessionFlags::default()
+            },
+            ..fixture_state()
+        };
+        let mut search = Step::new();
+        state.submit_find("needle", &mut search);
+        let id = state.request_log.last().unwrap().id;
+        state.handle_host_message(
+            resp(
+                id,
+                &json!({"Ok": {"matches": [
+            {"row": 700, "node_key": "wrong-key"}], "more": false}}),
+            ),
+            &vp(),
+            &mut search,
+        );
+        let window_id = state.pending_window_req_id.unwrap();
+        let mut arrived = Step::new();
+        state.handle_host_message(
+            resp(window_id, &window_response(300, 500, 2000, Some((2, None)))),
+            &vp(),
+            &mut arrived,
+        );
+        assert!(state.snapshot_id.is_empty());
+        assert!(state.cache.is_empty());
+        assert!(arrived.ops.iter().any(|op| matches!(
+            op,
+            DomOp::ShowRequestError {
+                retry: RetryAction::RefreshSnapshot,
+                ..
+            }
+        )));
+        assert!(!arrived
+            .ops
+            .iter()
+            .any(|op| matches!(op, DomOp::SetFindHighlight { .. })));
+    }
+
+    #[test]
+    fn legacy_open_is_rejected_before_sending_snapshot_requests() {
+        let mut state = HistoryAppState::default();
+        let mut step = Step::new();
+        state.handle_host_message(
+            HostMessage::parse(&json!({"id": "open", "body": {"Ok": {"nodes": 10}}})).unwrap(),
+            &vp(),
+            &mut step,
+        );
+        assert!(state.snapshot_id.is_empty());
+        assert!(state.in_flight.is_empty());
+        assert!(step
+            .ops
+            .iter()
+            .any(|op| matches!(op, DomOp::ShowMessage { error: true, .. })));
+    }
+
+    #[test]
+    fn open_establishes_view_and_issues_first_window() {
+        let mut state = fixture_state();
         let mut step = Step::new();
         state.handle_host_message(open_msg(1200), &vp(), &mut step);
 
@@ -1667,7 +1907,7 @@ mod tests {
         assert_eq!(window["offset"], 0);
         assert_eq!(window["limit"], 424);
         assert_eq!(window["include_layout"], false);
-        assert_eq!(window.len(), 3);
+        assert_eq!(window.len(), 4);
         // The pending-window slot is claimed BEFORE the send is emitted so a
         // synchronous fixture response correlates (reentrancy contract).
         assert_eq!(state.pending_window_req_id, Some(1));
@@ -1692,7 +1932,7 @@ mod tests {
 
     #[test]
     fn first_window_flow_does_the_two_pass_layout_hydration() {
-        let mut state = HistoryAppState::default();
+        let mut state = fixture_state();
         let mut step = Step::new();
         state.handle_host_message(open_msg(1200), &vp(), &mut step);
         let pending = state.pending_window_req_id.expect("window in flight");
@@ -1776,7 +2016,7 @@ mod tests {
         assert_eq!(next["offset"], 0);
         assert_eq!(next["limit"], 424);
         assert_eq!(next["include_layout"], true);
-        assert_eq!(next.len(), 3);
+        assert_eq!(next.len(), 4);
         assert!(step3.sends.iter().any(|s| matches!(
             s,
             Send::Log(text) if text.starts_with("cached 500/1200 nodes (fetched 500)")
@@ -1785,7 +2025,7 @@ mod tests {
 
     #[test]
     fn stale_window_response_is_dropped_and_self_heals() {
-        let mut state = HistoryAppState::default();
+        let mut state = fixture_state();
         let mut step = Step::new();
         state.handle_host_message(open_msg(1200), &vp(), &mut step);
         let stale_id = state.pending_window_req_id.expect("window in flight");
@@ -1830,7 +2070,7 @@ mod tests {
 
     #[test]
     fn open_clears_in_flight_so_old_responses_drop_silently() {
-        let mut state = HistoryAppState::default();
+        let mut state = fixture_state();
         let mut step = Step::new();
         state.handle_host_message(open_msg(1200), &vp(), &mut step);
         let old_id = state.pending_window_req_id.expect("window in flight");
@@ -1860,7 +2100,7 @@ mod tests {
 
     #[test]
     fn stale_search_epoch_response_is_dropped() {
-        let mut state = HistoryAppState::default();
+        let mut state = fixture_state();
         let mut step = Step::new();
         state.handle_host_message(open_msg(1200), &vp(), &mut step);
         state.session_flags.snapshot_established = true; // skip further window fetches
@@ -1952,7 +2192,7 @@ mod tests {
                 snapshot_established: true, // identity mapping, no sub-op blocks
                 ..SessionFlags::default()
             },
-            ..Default::default()
+            ..fixture_state()
         };
         state.recompute_expansion();
         for i in 0..500i64 {
@@ -1977,8 +2217,8 @@ mod tests {
             "match normalization keeps the stable node key"
         );
         assert_eq!(
-            state.find_matches.first().map(|m| m.summary.as_str()),
-            Some("needle hit")
+            state.find_matches.first().map(|m| m.node_key.as_str()),
+            Some("node:2500")
         );
         // Off-cache target triggers fetchWindowAround(2500) — a sparse jump,
         // not a linear scan from offset 0.
@@ -2076,7 +2316,7 @@ mod tests {
                 snapshot_established: true, // identity mapping
                 ..SessionFlags::default()
             },
-            ..Default::default()
+            ..fixture_state()
         };
         state.recompute_expansion();
         for i in 0..500i64 {
@@ -2131,7 +2371,7 @@ mod tests {
                 snapshot_established: true,
                 ..SessionFlags::default()
             },
-            ..Default::default()
+            ..fixture_state()
         };
         state.recompute_expansion();
         for i in 0..10i64 {
@@ -2202,7 +2442,7 @@ mod tests {
     fn find_zero_matches_and_compact_error_keep_the_chain_visible() {
         let mut state = HistoryAppState {
             total: Some(10),
-            ..Default::default()
+            ..fixture_state()
         };
         let mut step = Step::new();
         state.submit_find("absent term", &mut step);
@@ -2243,12 +2483,12 @@ mod tests {
     fn open_restores_top_row_and_reset_starts_at_the_top() {
         let mut state = HistoryAppState {
             persisted: Some(json!({ "topRow": 12 })),
-            ..HistoryAppState::default()
+            ..fixture_state()
         };
         let mut step = Step::new();
         state.handle_host_message(open_msg(500), &vp(), &mut step);
         assert_eq!(state.restore_state(), 12);
-        assert_eq!(last_get_window(&state).len(), 3);
+        assert_eq!(last_get_window(&state).len(), 4);
         let saved = step.save_state.expect("open persists state");
         assert_eq!(saved, json!({ "topRow": 0 }));
 
@@ -2256,7 +2496,7 @@ mod tests {
         let mut reset_step = Step::new();
         state.reset_history(&vp(), &mut reset_step);
         assert_eq!(state.view_gen, previous_generation.saturating_add(1));
-        assert_eq!(last_get_window(&state).len(), 3);
+        assert_eq!(last_get_window(&state).len(), 4);
     }
 
     #[test]
@@ -2264,7 +2504,7 @@ mod tests {
         let mut state = HistoryAppState {
             total: Some(6),
             sub_op_counts: vec![2, 0, 1],
-            ..Default::default()
+            ..fixture_state()
         };
         state.recompute_expansion();
         assert_eq!(state.block_starts, vec![0, 3, 4]);
@@ -2332,7 +2572,7 @@ mod tests {
             },
             sub_op_counts: vec![5, 0],
             expansion_spans: BTreeMap::from([(0, 5), (1, 2)]),
-            ..Default::default()
+            ..fixture_state()
         };
         state.recompute_expansion();
         assert_eq!(state.visible_abs, vec![0, 6]);
@@ -2383,7 +2623,7 @@ mod tests {
 
     #[test]
     fn restore_and_save_state_round_trip() {
-        let mut state = HistoryAppState::default();
+        let mut state = fixture_state();
         assert_eq!(state.restore_state(), -1);
         state.persisted = Some(json!({ "topRow": 12 }));
         assert_eq!(state.restore_state(), 12);
@@ -2398,7 +2638,7 @@ mod tests {
         let mut state = HistoryAppState {
             total: Some(6),
             sub_op_counts: vec![0, 1, 0, 1],
-            ..Default::default()
+            ..fixture_state()
         };
         state.recompute_expansion();
         assert_eq!(state.block_starts, vec![0, 1, 3, 4]);
@@ -2424,7 +2664,7 @@ mod tests {
                 snapshot_established: true,
                 ..SessionFlags::default()
             },
-            ..Default::default()
+            ..fixture_state()
         };
         state.recompute_expansion();
         for i in 0..2000i64 {
@@ -2460,7 +2700,7 @@ mod tests {
                 layout_ready: true,
                 ..SessionFlags::default()
             },
-            ..Default::default()
+            ..fixture_state()
         };
         state.recompute_expansion();
         for i in 0..2000i64 {
@@ -2491,7 +2731,7 @@ mod tests {
 
     #[test]
     fn open_error_is_visible_and_empty_open_shows_empty_state_without_fetching() {
-        let mut state = HistoryAppState::default();
+        let mut state = fixture_state();
         let mut step = Step::new();
         state.handle_host_message(open_msg(0), &vp(), &mut step);
         assert!(state.view_flags.data_ready);
@@ -2505,7 +2745,7 @@ mod tests {
         );
         assert_eq!(state.pending_window_req_id, None);
 
-        let mut state2 = HistoryAppState::default();
+        let mut state2 = fixture_state();
         let mut step2 = Step::new();
         state2.handle_host_message(
             HostMessage::parse(
@@ -2524,13 +2764,35 @@ mod tests {
             state2.request_log.is_empty(),
             "a failed open never fetches a window"
         );
+        assert!(state2.snapshot_id.is_empty());
+
+        let mut pending = fixture_state();
+        pending.handle_host_message(open_msg(500), &vp(), &mut Step::new());
+        let old_request = pending.pending_window_req_id.unwrap();
+        pending.handle_host_message(
+            HostMessage::parse(&json!({"id": "open", "body": {"Error": "reopen failed"}})).unwrap(),
+            &vp(),
+            &mut Step::new(),
+        );
+        pending.handle_host_message(
+            resp(old_request, &window_response(0, 1, 500, None)),
+            &vp(),
+            &mut Step::new(),
+        );
+        assert!(pending.snapshot_id.is_empty());
+        assert!(
+            pending.cache.is_empty(),
+            "a late window cannot overwrite an Open error"
+        );
+        assert!(pending.in_flight.is_empty());
+        assert!(pending.pending_window_req_id.is_none());
     }
 
     #[test]
     fn request_error_paths_render_retry_and_never_poison_state() {
         let mut state = HistoryAppState {
             total: Some(10),
-            ..Default::default()
+            ..fixture_state()
         };
         let mut step = Step::new();
         state.submit_find("q", &mut step);
@@ -2573,7 +2835,7 @@ mod tests {
                 snapshot_established: true,
                 ..SessionFlags::default()
             },
-            ..Default::default()
+            ..fixture_state()
         };
         state.recompute_expansion();
         for i in 0..10i64 {
@@ -2628,7 +2890,7 @@ mod tests {
                 ..SessionFlags::default()
             },
             sub_op_counts: vec![2, 0],
-            ..Default::default()
+            ..fixture_state()
         };
         state.recompute_expansion();
         for i in 0..6i64 {
@@ -2706,7 +2968,7 @@ mod tests {
                 ..SessionFlags::default()
             },
             sub_op_counts: vec![4, 0, 4],
-            ..Default::default()
+            ..fixture_state()
         };
         state.recompute_expansion();
         for i in [0, 5, 6] {

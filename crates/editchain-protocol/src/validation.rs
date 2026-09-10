@@ -42,6 +42,7 @@ impl RequestBody {
                 }
             }
             Self::Open(_)
+            | Self::Refresh(_)
             | Self::GetNodeDetails(_)
             | Self::ResolveObject(_)
             | Self::GetFileDiff(_) => {}

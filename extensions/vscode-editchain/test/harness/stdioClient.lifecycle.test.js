@@ -287,7 +287,7 @@ test('a request issued when the service is not running rejects immediately', asy
   assert.match(rejection, /service is not running/);
 });
 
-test('serviceBridge startup Open forwards timeout 0; regular requests keep the bounded default', () => {
+test('serviceBridge Open and Refresh forward timeout 0; regular requests keep the bounded default', async () => {
   // Load serviceBridge.js in a VM "browser" whose __editchainService records
   // every send(body, timeoutMs) call, then drive the startup handshake and a
   // regular request through window.vscode.
@@ -298,7 +298,7 @@ test('serviceBridge startup Open forwards timeout 0; regular requests keep the b
     __editchainService: {
       send(body, timeoutMs) {
         calls.push({ kind: 'send', body, timeoutMs });
-        return Promise.resolve({ Ok: {} });
+        return Promise.resolve({ Ok: { protocol_version: 2, snapshot_id: 'fixture' } });
       },
     },
     MessageEvent: class MessageEvent {
@@ -322,6 +322,13 @@ test('serviceBridge startup Open forwards timeout 0; regular requests keep the b
   assert.ok(open, 'startup handshake must issue an Open request');
   assert.equal(open.body.Open.workspace_path, '/ws');
   assert.equal(open.timeoutMs, 0, 'startup Open must be unbounded (timeout 0)');
+
+  await Promise.resolve();
+  sandbox.vscode.postMessage({ type: 'refreshHistory' });
+  const refresh = calls.find((c) => c.body.Refresh !== undefined);
+  assert.ok(refresh, 'negotiated renderer can refresh the opened snapshot');
+  assert.equal(refresh.body.Refresh.workspace_path, '/ws');
+  assert.equal(refresh.timeoutMs, 0);
 
   sandbox.vscode.postMessage({ id: 7, body: { Query: {} } });
   const regular = calls.find((c) => c.body.Query !== undefined);

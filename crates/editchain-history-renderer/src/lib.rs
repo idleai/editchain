@@ -301,9 +301,12 @@ mod shell {
             let Some(row) = self.state.cache.get(&abs) else {
                 return false;
             };
-            let Some(envelope) = rows::open_diff_envelope(row) else {
+            let Some(mut envelope) = rows::open_diff_envelope(row) else {
                 return false;
             };
+            if let Some(fields) = envelope.as_object_mut() {
+                drop(fields.insert("snapshot_id".to_owned(), json!(self.state.snapshot_id)));
+            }
             step.sends.push(Send::OpenDiff(envelope));
             true
         }
@@ -314,7 +317,10 @@ mod shell {
             let Some(row) = self.state.cache.get(&abs) else {
                 return;
             };
-            if let Some(envelope) = rows::open_json_envelope(row) {
+            if let Some(mut envelope) = rows::open_json_envelope(row) {
+                if let Some(fields) = envelope.as_object_mut() {
+                    drop(fields.insert("snapshot_id".to_owned(), json!(self.state.snapshot_id)));
+                }
                 step.sends.push(Send::OpenJson(envelope));
             } else {
                 step.sends.push(Send::StatusText(
@@ -703,6 +709,7 @@ mod shell {
     /// bridge may re-enter the listener synchronously).
     fn execute_send(send: &Send) {
         match send {
+            Send::RefreshHistory => post_envelope(&json!({ "type": "refreshHistory" })),
             Send::Request { id, body } => {
                 let envelope = json!({ "id": *id, "body": body });
                 post_envelope(&envelope);
@@ -810,6 +817,7 @@ mod shell {
             let mut step = Step::new();
             match action {
                 RetryAction::ResetHistory => shell.state.reset_history(&viewport, &mut step),
+                RetryAction::RefreshSnapshot => shell.state.refresh_snapshot(&viewport, &mut step),
             }
             shell.apply_step_ops(&step);
             TransitionOutput {

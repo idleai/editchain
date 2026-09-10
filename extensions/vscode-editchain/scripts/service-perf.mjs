@@ -154,6 +154,7 @@ async function main() {
       Open: { workspace_path: args.workspace, chain_dir: args.chainDir },
     });
     const windowBase = {
+      snapshot_id: opened.snapshot_id,
       offset: 0,
       limit: args.limit,
     };

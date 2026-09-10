@@ -108,6 +108,7 @@ async function installHarnessSpies(page) {
       if (msg && msg.type === 'openJson') {
         window.__editchainOpenJsonLog.push({
           type: 'openJson',
+          snapshot_id: msg.snapshot_id,
           op_id: msg.op_id !== undefined ? msg.op_id : null,
           git_oid: msg.git_oid !== undefined ? msg.git_oid : null,
           repository: msg.repository !== undefined ? msg.repository : null,

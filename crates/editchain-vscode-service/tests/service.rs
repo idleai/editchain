@@ -140,6 +140,12 @@ fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() 
         .handle(&Request {
             id: 1,
             body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
+                snapshot_id: materialized
+                    .workspace
+                    .as_ref()
+                    .unwrap()
+                    .snapshot_id()
+                    .clone(),
                 query: "snapshot".to_owned(),
                 top_k: 10,
             }),
@@ -194,6 +200,7 @@ fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() 
         .handle(&Request {
             id: 2,
             body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                 query: "invalidation".to_owned(),
                 top_k: 10,
             }),
@@ -211,6 +218,7 @@ fn prepared_snapshot_matches_live_projection_supports_details_and_invalidates() 
         .handle(&Request {
             id: 3,
             body: RequestBody::GetWindow(editchain_protocol::GetWindowRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                 offset: 0,
                 limit: 100,
                 include_layout: true,
@@ -267,6 +275,7 @@ fn recovered_blob_invalidates_cached_rows_and_lazy_search_without_a_chain_append
         .handle(&Request {
             id: 1,
             body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                 query: "recoveredneedle".to_owned(),
                 top_k: 10,
             }),
@@ -400,6 +409,7 @@ fn invalid_search_limit_returns_a_typed_error_without_building_an_index() {
         .handle(&Request {
             id: 1,
             body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                 query: "needle".to_owned(),
                 top_k: 0,
             }),
@@ -487,6 +497,7 @@ fn imported_agent_edit_rows_materialize_recorded_snippets_without_fabricating_fi
         .handle(&Request {
             id: 2,
             body: RequestBody::GetWindow(editchain_protocol::GetWindowRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                 offset: 0,
                 limit: 100,
                 include_layout: true,
@@ -512,7 +523,10 @@ fn imported_agent_edit_rows_materialize_recorded_snippets_without_fabricating_fi
     let response = server
         .handle(&Request {
             id: 3,
-            body: RequestBody::GetFileDiff(editchain_protocol::GetFileDiffRequest { change }),
+            body: RequestBody::GetFileDiff(editchain_protocol::GetFileDiffRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
+                change,
+            }),
         })
         .expect("materialize agent diff");
     let ResponseBody::Ok(value) = response.body else {
@@ -611,6 +625,7 @@ fn agent_edit_uses_exact_session_git_baseline_when_available() {
         .handle(&Request {
             id: 2,
             body: RequestBody::GetWindow(editchain_protocol::GetWindowRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                 offset: 0,
                 limit: 100,
                 include_layout: true,
@@ -638,7 +653,10 @@ fn agent_edit_uses_exact_session_git_baseline_when_available() {
     let response = server
         .handle(&Request {
             id: 3,
-            body: RequestBody::GetFileDiff(editchain_protocol::GetFileDiffRequest { change }),
+            body: RequestBody::GetFileDiff(editchain_protocol::GetFileDiffRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
+                change,
+            }),
         })
         .expect("materialize Git-anchored agent diff");
     let ResponseBody::Ok(value) = response.body else {
@@ -750,6 +768,7 @@ fn legacy_codex_multi_file_record_recovers_every_path_from_raw_evidence() {
         .handle(&Request {
             id: 2,
             body: RequestBody::GetWindow(editchain_protocol::GetWindowRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                 offset: 0,
                 limit: 100,
                 include_layout: true,
@@ -789,6 +808,7 @@ fn legacy_codex_multi_file_record_recovers_every_path_from_raw_evidence() {
         .handle(&Request {
             id: 3,
             body: RequestBody::GetFileDiff(editchain_protocol::GetFileDiffRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                 change: changes[0].clone(),
             }),
         })
@@ -809,6 +829,7 @@ fn legacy_codex_multi_file_record_recovers_every_path_from_raw_evidence() {
         .handle(&Request {
             id: 4,
             body: RequestBody::GetFileDiff(editchain_protocol::GetFileDiffRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                 change: changes[1].clone(),
             }),
         })
@@ -859,6 +880,7 @@ fn git_commit_rows_expand_to_files_and_materialize_exact_native_diff_sides() {
         .handle(&Request {
             id: 2,
             body: RequestBody::GetWindow(editchain_protocol::GetWindowRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                 offset: 0,
                 limit: 100,
                 include_layout: true,
@@ -898,6 +920,7 @@ fn git_commit_rows_expand_to_files_and_materialize_exact_native_diff_sides() {
         .handle(&Request {
             id: 3,
             body: RequestBody::GetFileDiff(editchain_protocol::GetFileDiffRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                 change: change.clone(),
             }),
         })
@@ -918,6 +941,7 @@ fn git_commit_rows_expand_to_files_and_materialize_exact_native_diff_sides() {
         .handle(&Request {
             id: 4,
             body: RequestBody::GetFileDiff(editchain_protocol::GetFileDiffRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                 change: tampered,
             }),
         })
@@ -1096,6 +1120,7 @@ fn op_identifiers_above_2_53_round_trip_exactly_through_window_details_and_find(
         .handle(&Request {
             id: 2,
             body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                 query: "needle-exact-id".to_string(),
                 top_k: 5,
             }),
@@ -1138,6 +1163,7 @@ fn find_in_history_protocol_path_resolves_visible_rows_and_reports_truncation() 
         .handle(&Request {
             id: 2,
             body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                 query: "needle-fi".to_string(),
                 top_k: 50,
             }),
@@ -1171,6 +1197,7 @@ fn find_in_history_protocol_path_resolves_visible_rows_and_reports_truncation() 
         .handle(&Request {
             id: 3,
             body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                 query: "needle-fi".to_string(),
                 top_k: 1,
             }),
@@ -1224,6 +1251,7 @@ fn find_in_history_distinguishes_colliding_operation_and_git_ids() {
             .handle(&Request {
                 id: 2,
                 body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
+                    snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                     query: query.to_string(),
                     top_k: 50,
                 }),
@@ -1311,6 +1339,7 @@ fn git_resolve_uses_exact_string_ids_and_rejects_invalid_input() {
             .handle(&Request {
                 id: 2,
                 body: RequestBody::ResolveObject(editchain_protocol::ResolveObjectRequest {
+                    snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                     repository,
                     oid,
                 }),
@@ -1328,6 +1357,7 @@ fn git_resolve_uses_exact_string_ids_and_rejects_invalid_input() {
         .handle(&Request {
             id: 2,
             body: RequestBody::ResolveObject(editchain_protocol::ResolveObjectRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
                 repository: repo_str,
                 oid: missing,
             }),
@@ -1583,11 +1613,30 @@ fn get_window_geometry_identical_across_independent_processes() {
             open_json["body"]["Ok"]["nodes"].as_u64().unwrap_or(0) >= 7,
             "chain must project at least the seven test ops"
         );
+        assert_eq!(
+            open_json["body"]["Ok"]["protocol_version"],
+            editchain_protocol::PROTOCOL_VERSION
+        );
+        for (snapshot_id, code) in [
+            (None, "unsupported_protocol"),
+            (Some("obsolete"), "stale_snapshot"),
+        ] {
+            let mut request = serde_json::json!({"id": 2, "body": {"GetWindow": {
+                "offset": 0, "limit": 500, "include_layout": true,
+            }}});
+            if let Some(snapshot_id) = snapshot_id {
+                request["body"]["GetWindow"]["snapshot_id"] = serde_json::json!(snapshot_id);
+            }
+            write_frame(stdin, &request);
+            let error: serde_json::Value = serde_json::from_slice(&read_frame(stdout)).unwrap();
+            assert_eq!(error["body"]["Error"]["code"], code);
+        }
         write_frame(
             stdin,
             &serde_json::json!({
                 "id": 2,
                 "body": {"GetWindow": {
+                    "snapshot_id": open_json["body"]["Ok"]["snapshot_id"],
                     "offset": 0,
                     "limit": 500,
                     "include_layout": true,
@@ -1617,6 +1666,86 @@ fn get_window_geometry_identical_across_independent_processes() {
             "process {i} returned different GetWindow lane geometry"
         );
     }
+}
+
+#[test]
+fn stdio_refresh_replaces_snapshot_and_rejects_old_coordinates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let chain_dir = tmp.path().join(".editchain");
+    let mut page = editchain_codec::page::Page::new(0);
+    page.add_record(
+        0,
+        editchain_codec::frame::encode_op(&msg_op(51, 1, b"snapshot first")).unwrap(),
+    );
+    write_page(&chain_dir, &page);
+    assert!(
+        !prepare_render_snapshot(tmp.path(), Path::new(".editchain"))
+            .unwrap()
+            .reused
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_editchain-vscode-service"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut request = |body: serde_json::Value| {
+        write_frame(
+            child.stdin.as_mut().unwrap(),
+            &serde_json::json!({"id": 1, "body": body}),
+        );
+        let result: serde_json::Value =
+            serde_json::from_slice(&read_frame(child.stdout.as_mut().unwrap())).unwrap();
+        result["body"].clone()
+    };
+    let open = serde_json::json!({"workspace_path": tmp.path(), "chain_dir": ".editchain"});
+    let before = request(serde_json::json!({"Open": open}));
+    assert_eq!(before["Ok"]["render_snapshot"], "hit");
+    let old_id = before["Ok"]["snapshot_id"].clone();
+    let old_window = serde_json::json!({"GetWindow": {
+        "snapshot_id": old_id, "offset": 0, "limit": 100, "include_layout": true,
+    }});
+    let pinned = request(old_window.clone());
+
+    let mut appended = editchain_codec::page::Page::new(1);
+    appended.add_record(
+        0,
+        editchain_codec::frame::encode_op(&msg_op(51, 2, b"snapshot appended")).unwrap(),
+    );
+    write_page_sequence(&chain_dir, 1, &appended);
+    let stale = request(serde_json::json!({"FindInHistory": {
+        "snapshot_id": old_id, "query": "snapshot", "top_k": 10,
+    }}));
+    assert_eq!(stale["Error"]["code"], "stale_snapshot");
+    assert_eq!(
+        request(old_window.clone()),
+        pinned,
+        "cached rows stay pinned"
+    );
+
+    let refreshed = request(serde_json::json!({"Refresh": open}));
+    let new_id = refreshed["Ok"]["snapshot_id"].clone();
+    assert!(new_id.as_str().is_some_and(|id| !id.is_empty()));
+    assert_ne!(new_id, old_id);
+    assert_eq!(request(old_window)["Error"]["code"], "stale_snapshot");
+    let window = request(serde_json::json!({"GetWindow": {
+        "snapshot_id": new_id, "offset": 0, "limit": 100, "include_layout": true,
+    }}));
+    let found = request(serde_json::json!({"FindInHistory": {
+        "snapshot_id": new_id, "query": "snapshot", "top_k": 10,
+    }}));
+    assert_eq!(window["Ok"]["snapshot_id"], new_id);
+    assert_eq!(found["Ok"]["snapshot_id"], new_id);
+    let matches = found["Ok"]["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 2);
+    for hit in matches {
+        let row = usize::try_from(hit["row"].as_u64().unwrap()).unwrap();
+        assert_eq!(window["Ok"]["rows"][row]["node_key"], hit["node_key"]);
+    }
+    let refreshed_again = request(serde_json::json!({"Refresh": open}));
+    assert_ne!(refreshed_again["Ok"]["snapshot_id"], new_id);
+    child.kill().unwrap();
+    let _: std::process::ExitStatus = child.wait().unwrap();
 }
 
 /// Build a raw import op carrying one raw JSONL line (Codex-style envelope).

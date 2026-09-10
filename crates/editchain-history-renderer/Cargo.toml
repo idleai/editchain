@@ -18,6 +18,7 @@ crate-type = ["cdylib", "rlib"]
 # The HistoryApp application core is pure std + serde_json and compiles for
 # both native tests and the wasm32 webview target.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+editchain-protocol = { path = "../editchain-protocol" }
 serde = { workspace = true, features = ["alloc"] }
 serde_json = { workspace = true }
 wasm-bindgen = { workspace = true }
@@ -52,5 +53,6 @@ web-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+editchain-protocol = { path = "../editchain-protocol" }
 serde = { workspace = true, features = ["alloc"] }
 serde_json = { workspace = true }

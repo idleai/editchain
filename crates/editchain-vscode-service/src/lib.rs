@@ -36,9 +36,9 @@ use editchain_project::HistoryProjection;
 use editchain_protocol::{
     ErrorCode, ExpansionSpanDto, FileChangeDto, FileChangeSource, FileChangeStatus, FileDiffDto,
     FileDiffHunkDto, FindInHistoryMatch, FindInHistoryResponse, HistoryRow, HistoryWindow,
-    NodeDetails, ParentRelationDto, ParentRelationKind, Request, RequestBody, ResolvedObject,
-    Response, ResponseBody, ServiceError, SessionMetaDto, SessionSummaryDto, SubOpSummary,
-    WorkUnitDto,
+    NodeDetails, OpenResponse, ParentRelationDto, ParentRelationKind, Request, RequestBody,
+    ResolvedObject, Response, ResponseBody, ServiceError, SessionMetaDto, SessionSummaryDto,
+    SnapshotId, SnapshotResult, SubOpSummary, WorkUnitDto, PROTOCOL_VERSION,
 };
 
 use snapshot::{RenderSnapshot, SnapshotBuilder, SnapshotIdentity, SnapshotManifestData};
@@ -79,6 +79,8 @@ pub struct Workspace {
     chain_path: PathBuf,
     /// Inputs pinned at open; absent only for an in-memory projection.
     source_identity: Option<SnapshotIdentity>,
+    /// Cached wire identity, computed once for this opened source version.
+    snapshot_id: SnapshotId,
     /// Exactly one backend owns the fixed row order at a time.
     backend: WorkspaceBackend,
     /// The fixed Activity-view snapshot shared by window and find requests.
@@ -2267,6 +2269,12 @@ fn agent_repository_path(
 }
 
 impl Workspace {
+    /// Identity that scopes every request and response for this opened view.
+    #[must_use]
+    pub const fn snapshot_id(&self) -> &SnapshotId {
+        &self.snapshot_id
+    }
+
     /// Read the loaded projection without allowing independent cache mutation.
     #[must_use]
     pub const fn projection(&self) -> &HistoryProjection {
@@ -2303,6 +2311,7 @@ impl Workspace {
             root_path: PathBuf::new(),
             chain_path: PathBuf::new(),
             source_identity: None,
+            snapshot_id: unique_snapshot_id("memory"),
             backend: WorkspaceBackend::Projected,
             current_view: None,
         }
@@ -2314,6 +2323,14 @@ impl Workspace {
     ///
     /// Returns an error if the chain cannot be read or repos cannot be discovered.
     pub fn open(workspace_path: &str, chain_dir: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::open_with_cache(workspace_path, chain_dir, true)
+    }
+
+    fn open_with_cache(
+        workspace_path: &str,
+        chain_dir: &str,
+        reuse_cache: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // Resolve the chain directory relative to the workspace when it is a
         // relative path (e.g. ".editchain"). The service process's CWD is not
         // necessarily the workspace root, so we must join explicitly.
@@ -2324,8 +2341,7 @@ impl Workspace {
         };
         let workspace_path = PathBuf::from(workspace_path);
         let repositories = RepositoryCatalog::discover(&workspace_path)?;
-        if let Some(identity) = repositories
-            .is_complete()
+        if let Some(identity) = (reuse_cache && repositories.is_complete())
             .then(|| {
                 SnapshotIdentity::capture(&workspace_path, &chain_path, repositories.entries())
             })
@@ -2346,6 +2362,7 @@ impl Workspace {
                     diagnostics,
                     root_path: workspace_path,
                     chain_path,
+                    snapshot_id: snapshot.snapshot_id(),
                     source_identity: Some(identity),
                     backend: WorkspaceBackend::Cached(Box::new(snapshot)),
                     current_view: None,
@@ -2435,6 +2452,7 @@ impl Workspace {
             diagnostics,
             root_path: workspace_path,
             chain_path,
+            snapshot_id: SnapshotId::new(identity.hash()?),
             source_identity: Some(identity),
             backend: WorkspaceBackend::Projected,
             current_view: None,
@@ -2546,6 +2564,7 @@ impl Workspace {
         }
         let Some(snapshot) = self.current_view.as_ref() else {
             return HistoryWindow {
+                snapshot_id: self.snapshot_id.clone(),
                 rows: Vec::new(),
                 total: 0,
                 chain_generation: u64::try_from(self.projection.ops.len()).unwrap_or(u64::MAX),
@@ -2783,6 +2802,7 @@ impl Workspace {
             }
         }
         HistoryWindow {
+            snapshot_id: self.snapshot_id.clone(),
             rows,
             total: u64::try_from(expanded_total).unwrap_or(u64::MAX),
             chain_generation: u64::try_from(self.projection.ops.len()).unwrap_or(u64::MAX),
@@ -4901,6 +4921,8 @@ pub struct GitHitIdentity {
 /// alongside it, so search responses stay deterministic and exact.
 #[derive(Debug)]
 pub struct SearchIndexState {
+    /// Opened snapshot whose canonical documents were indexed.
+    snapshot_id: SnapshotId,
     /// The underlying Tantivy lexical index.
     pub index: LexicalIndex,
     /// Map from each synthetic indexed `OpId` to the real git commit identity
@@ -4960,6 +4982,7 @@ pub fn build_lexical_index(
     index.commit()?;
     workspace.ensure_sources_current()?;
     Ok(SearchIndexState {
+        snapshot_id: workspace.snapshot_id.clone(),
         index,
         git_identities,
     })
@@ -5061,8 +5084,21 @@ impl Server {
                 body: ResponseBody::Error(error),
             });
         }
+        if let Some(requested) = request.body.snapshot_id() {
+            let workspace = self.workspace.as_ref().ok_or_else(no_workspace)?;
+            if requested.is_empty() {
+                return Err(ServiceError::new(
+                    ErrorCode::UnsupportedProtocol,
+                    "This request requires the snapshot_id returned by Open protocol version 2.",
+                )
+                .into());
+            }
+            if requested != workspace.snapshot_id() {
+                return Err(stale_snapshot().into());
+            }
+        }
         let reads_sources = match &request.body {
-            RequestBody::Open(_) | RequestBody::GetWindow(_) => false,
+            RequestBody::Open(_) | RequestBody::Refresh(_) | RequestBody::GetWindow(_) => false,
             RequestBody::FindInHistory(_) => self.lexical.is_none(),
             RequestBody::GetNodeDetails(_)
             | RequestBody::ResolveObject(_)
@@ -5075,26 +5111,39 @@ impl Server {
                 .ensure_sources_current()?;
         }
         let body = match &request.body {
-            RequestBody::Open(req) => {
-                let workspace = Workspace::open(&req.workspace_path, &req.chain_dir)?;
+            RequestBody::Open(req) | RequestBody::Refresh(req) => {
+                let mut workspace = Workspace::open_with_cache(
+                    &req.workspace_path,
+                    &req.chain_dir,
+                    matches!(&request.body, RequestBody::Open(_)),
+                )?;
+                if matches!(&request.body, RequestBody::Refresh(_)) {
+                    // Explicit refresh also covers availability outside the
+                    // cache fingerprint (for example an alternate object store).
+                    // Retire all previous request tokens even if that fingerprint
+                    // is unchanged.
+                    workspace.snapshot_id =
+                        unique_snapshot_id(&format!("refresh:{}", workspace.snapshot_id.as_str()));
+                }
                 let diagnostics = workspace.diagnostics;
                 let warnings = workspace.diagnostics.warnings();
+                let response = OpenResponse {
+                    protocol_version: PROTOCOL_VERSION,
+                    snapshot_id: workspace.snapshot_id.clone(),
+                    workspace: req.workspace_path.clone(),
+                    chain: req.chain_dir.clone(),
+                    repos: workspace.repositories.len(),
+                    nodes: workspace.node_count(),
+                    chain_generation: workspace.chain_generation(),
+                    render_snapshot: workspace.render_snapshot_status().to_owned(),
+                    diagnostics: serde_json::to_value(diagnostics)?,
+                    warnings,
+                };
                 // The lexical index is built lazily on first find request (it is
                 // expensive for large chains and unnecessary for the graph view).
                 self.workspace = Some(workspace);
                 self.lexical = None;
-                ResponseBody::Ok(serde_json::json!({
-                    "workspace": req.workspace_path,
-                    "chain": req.chain_dir,
-                    "repos": self.workspace.as_ref().map_or(0, |w| w.repositories.len()),
-                    "nodes": self.workspace.as_ref().map_or(0, Workspace::node_count),
-                    "chain_generation": self.workspace.as_ref().map_or(0, Workspace::chain_generation),
-                    "render_snapshot": self.workspace.as_ref().map_or("miss", Workspace::render_snapshot_status),
-                    // Canonicalization + lazy blob access outcomes for this open.
-                    // New keys: backward-compatible; older clients ignore them.
-                    "diagnostics": serde_json::to_value(diagnostics)?,
-                    "warnings": warnings,
-                }))
+                ResponseBody::Ok(serde_json::to_value(response)?)
             }
             RequestBody::GetWindow(req) => {
                 let ws = self.workspace.as_mut().ok_or_else(no_workspace)?;
@@ -5108,7 +5157,10 @@ impl Server {
             RequestBody::GetNodeDetails(req) => {
                 let ws = self.workspace.as_ref().ok_or_else(no_workspace)?;
                 match ws.node_details(Some(req.op_id.clone()), None) {
-                    Some(details) => ResponseBody::Ok(serde_json::to_value(details)?),
+                    Some(details) => ResponseBody::Ok(serde_json::to_value(SnapshotResult {
+                        snapshot_id: ws.snapshot_id.clone(),
+                        value: details,
+                    })?),
                     None => ResponseBody::Error(ServiceError::new(
                         ErrorCode::UnavailableObject,
                         "node not found",
@@ -5123,9 +5175,12 @@ impl Server {
                 match parsed {
                     Ok((repository_id, oid)) => {
                         match resolve_git_commit(ws, repository_id, &oid)? {
-                            Some(commit) => ResponseBody::Ok(serde_json::to_value(
-                                resolved_object_from_commit(&commit),
-                            )?),
+                            Some(commit) => {
+                                ResponseBody::Ok(serde_json::to_value(SnapshotResult {
+                                    snapshot_id: ws.snapshot_id.clone(),
+                                    value: resolved_object_from_commit(&commit),
+                                })?)
+                            }
                             None => ResponseBody::Error(ServiceError::new(
                                 ErrorCode::UnavailableObject,
                                 "object not found",
@@ -5143,7 +5198,10 @@ impl Server {
                     ws.ensure_projection_loaded()?;
                 }
                 match ws.file_diff(&req.change) {
-                    Ok(diff) => ResponseBody::Ok(serde_json::to_value(diff)?),
+                    Ok(diff) => ResponseBody::Ok(serde_json::to_value(SnapshotResult {
+                        snapshot_id: ws.snapshot_id.clone(),
+                        value: diff,
+                    })?),
                     Err(message) => ResponseBody::Error(ServiceError::new(
                         ErrorCode::UnavailableObject,
                         message,
@@ -5158,13 +5216,26 @@ impl Server {
                     self.lexical = Some(build_lexical_index(ws)?);
                 }
                 let lexical = self.lexical.as_ref().ok_or("no index built")?;
+                if self
+                    .workspace
+                    .as_ref()
+                    .ok_or_else(no_workspace)?
+                    .snapshot_id()
+                    != &lexical.snapshot_id
+                {
+                    return Err(stale_snapshot().into());
+                }
                 let chunks = lexical.index.search_internal(&req.query, req.top_k)?;
                 let ws = self.workspace.as_mut().ok_or_else(no_workspace)?;
                 let matches = ws.find_in_history(&chunks, &lexical.git_identities);
                 // `more` reports only whether the candidate/top_k limit may have
                 // truncated retrieval; the response never claims an exact total.
                 let more = req.top_k > 0 && chunks.len() >= req.top_k;
-                let response = FindInHistoryResponse { more, matches };
+                let response = FindInHistoryResponse {
+                    snapshot_id: ws.snapshot_id.clone(),
+                    more,
+                    matches,
+                };
                 ResponseBody::Ok(serde_json::to_value(response)?)
             }
         };
@@ -5193,6 +5264,12 @@ fn stale_snapshot() -> ServiceError {
 
 fn no_workspace() -> ServiceError {
     ServiceError::new(ErrorCode::NoWorkspace, "no workspace open")
+}
+
+fn unique_snapshot_id(prefix: &str) -> SnapshotId {
+    static NEXT_SNAPSHOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let serial = NEXT_SNAPSHOT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SnapshotId::new(format!("{prefix}:{}:{serial}", std::process::id()))
 }
 
 /// Produce a short summary for an `EditChain` operation.
@@ -6315,6 +6392,7 @@ mod tests {
             root_path: PathBuf::new(),
             chain_path: tmp.path().to_path_buf(),
             source_identity: None,
+            snapshot_id: unique_snapshot_id("memory"),
             backend: WorkspaceBackend::Projected,
             current_view: None,
         };

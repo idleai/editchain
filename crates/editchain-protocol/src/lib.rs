@@ -4,8 +4,10 @@
 //! extension host and the native Rust service.
 
 mod error;
+mod snapshot;
 mod validation;
 pub use error::{ErrorCode, ServiceError};
+pub use snapshot::{OpenResponse, SnapshotId, SnapshotResult, PROTOCOL_VERSION};
 pub use validation::{
     MAX_QUERY_BYTES, MAX_REQUEST_FRAME_BYTES, MAX_SEARCH_RESULTS, MAX_WINDOW_ROWS,
 };
@@ -28,6 +30,8 @@ pub struct Request {
 pub enum RequestBody {
     /// Open a workspace and load its chain + git repositories.
     Open(OpenRequest),
+    /// Reopen authoritative sources, bypassing derived caches after negotiation.
+    Refresh(OpenRequest),
     /// Get a window of history rows.
     GetWindow(GetWindowRequest),
     /// Get details for a specific node.
@@ -77,7 +81,8 @@ pub enum ResponseBody {
 ///   (duplicates, quarantines, missing/corrupt blobs), so a client can surface
 ///   hydration gaps without silently treating preserved `BlobRef`s as content.
 ///
-/// Older clients ignore both keys; they are never required to open a chain.
+/// The request keeps its legacy shape. Clients validate [`OpenResponse`] before
+/// issuing requests that require the negotiated snapshot identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenRequest {
@@ -91,6 +96,9 @@ pub struct OpenRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GetWindowRequest {
+    /// Snapshot returned by Open. Empty legacy tokens are rejected by the service.
+    #[serde(default)]
+    pub snapshot_id: SnapshotId,
     /// Cursor offset into the history (0 = newest).
     pub offset: u64,
     /// Number of rows to return.
@@ -106,6 +114,9 @@ pub struct GetWindowRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GetNodeDetailsRequest {
+    /// Snapshot that advertised this operation identity.
+    #[serde(default)]
+    pub snapshot_id: SnapshotId,
     /// The operation ID to inspect, in display form `"node:boot:seq"`.
     ///
     /// Stored as a string so it round-trips through JavaScript without precision
@@ -130,6 +141,9 @@ pub struct GetNodeDetailsRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FindInHistoryRequest {
+    /// Snapshot whose row coordinates must be used for every match.
+    #[serde(default)]
+    pub snapshot_id: SnapshotId,
     /// The query string (BM25 lexical search only).
     pub query: String,
     /// Number of candidate chunks to retrieve from the index before row
@@ -142,6 +156,9 @@ pub struct FindInHistoryRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolveObjectRequest {
+    /// Snapshot whose repository catalog advertised this identity.
+    #[serde(default)]
+    pub snapshot_id: SnapshotId,
     /// Repository identity as an exact decimal `RepositoryId` string (u64
     /// values above 2^53 must not be rounded by JavaScript).
     pub repository: String,
@@ -154,6 +171,9 @@ pub struct ResolveObjectRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GetFileDiffRequest {
+    /// Snapshot that advertised this change identity.
+    #[serde(default)]
+    pub snapshot_id: SnapshotId,
     /// Complete identity of the advertised change. The service revalidates it
     /// against Git objects or the canonical source operation before returning
     /// any content.
@@ -363,7 +383,7 @@ pub struct HistoryRow {
     /// so clients never infer a false boundary at a virtual-window edge.
     #[serde(default)]
     pub group_end: bool,
-    /// Stable node key for graph wiring (op id string or git oid hex).
+    /// Stable graph key: operation ID or repository-qualified Git commit key.
     pub node_key: String,
     /// Parent node keys (for drawing graph edges).
     pub parents: Vec<String>,
@@ -691,16 +711,21 @@ pub struct SubOpSummary {
     /// The operation ID (display form `"node:boot:seq"`).
     pub op_id: String,
     /// Display summary (e.g. the record type or a short label).
+    #[serde(default)]
     pub summary: String,
     /// Short type tag (e.g. "last-prompt", "mode", "permission-mode").
+    #[serde(default)]
     pub kind: String,
     /// Timestamp in Unix ms (0 if unknown).
+    #[serde(default)]
     pub timestamp_ms: u64,
 }
 
 /// A window of history rows with generation counters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryWindow {
+    /// Exact opened source/view identity shared by rows, expansion, and layout.
+    pub snapshot_id: SnapshotId,
     /// The rows in this window (newest-first).
     pub rows: Vec<HistoryRow>,
     /// Total number of rows available.
@@ -795,6 +820,8 @@ pub struct FindInHistoryMatch {
 /// response never claims an exact total.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindInHistoryResponse {
+    /// Snapshot whose fixed expanded coordinates are returned below.
+    pub snapshot_id: SnapshotId,
     /// Distinct visible matches, one per top-level history row, ranked by best
     /// BM25 score (highest first; ties broken by newest row first).
     pub matches: Vec<FindInHistoryMatch>,
@@ -1041,6 +1068,7 @@ mod tests {
     #[test]
     fn resolve_object_request_round_trips_exact_strings() {
         let req = ResolveObjectRequest {
+            snapshot_id: SnapshotId::new("fixture"),
             repository: OVER_2_53.to_string(),
             oid: big_oid().to_hex(),
         };
@@ -1119,6 +1147,7 @@ mod tests {
     #[test]
     fn find_in_history_wire_shape_is_minimal_and_exact() {
         let request = RequestBody::FindInHistory(FindInHistoryRequest {
+            snapshot_id: SnapshotId::new("fixture"),
             query: "needle".to_string(),
             top_k: 25,
         });
@@ -1127,6 +1156,7 @@ mod tests {
         assert_eq!(request_json["FindInHistory"]["top_k"], 25usize);
 
         let response = FindInHistoryResponse {
+            snapshot_id: SnapshotId::new("fixture"),
             matches: vec![FindInHistoryMatch {
                 node_key: big_op_id().to_string(),
                 row: 900_719_925_474_099,
@@ -1162,6 +1192,7 @@ mod tests {
             new_mode: Some("blob".to_string()),
         };
         let body = RequestBody::GetFileDiff(GetFileDiffRequest {
+            snapshot_id: SnapshotId::new("fixture"),
             change: change.clone(),
         });
         let json = serde_json::to_value(&body).expect("serialize file diff request");
@@ -1175,7 +1206,7 @@ mod tests {
             serde_json::from_value(json).expect("deserialize file diff request");
         assert!(matches!(
             back,
-            RequestBody::GetFileDiff(GetFileDiffRequest { change: parsed }) if parsed == change
+            RequestBody::GetFileDiff(GetFileDiffRequest { change: parsed, .. }) if parsed == change
         ));
 
         let diff = FileDiffDto {

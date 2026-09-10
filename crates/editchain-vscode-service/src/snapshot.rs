@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use editchain_core::OpId;
 use editchain_git::RepositoryDiscovery;
-use editchain_protocol::{ExpansionSpanDto, HistoryRow, HistoryWindow};
+use editchain_protocol::{ExpansionSpanDto, HistoryRow, HistoryWindow, SnapshotId};
 use serde::{Deserialize, Serialize};
 
 use crate::{hash_raw, hex_string, OpRecordLocation, OpenDiagnostics, SnapshotOpLocator};
@@ -528,6 +528,9 @@ pub(crate) struct RenderSnapshot {
 }
 
 impl RenderSnapshot {
+    pub(crate) fn snapshot_id(&self) -> SnapshotId {
+        SnapshotId::new(self.manifest.identity_hash.clone())
+    }
     /// Open the exact snapshot for `identity`; return `None` on a cache miss.
     pub(crate) fn open(
         chain_dir: &Path,
@@ -667,6 +670,7 @@ impl RenderSnapshot {
             None
         };
         Ok(HistoryWindow {
+            snapshot_id: self.snapshot_id(),
             rows,
             total: self.manifest.expanded_rows,
             chain_generation: self.manifest.chain_generation,

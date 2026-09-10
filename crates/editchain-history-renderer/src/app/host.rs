@@ -1,12 +1,13 @@
 //! Host protocol: parsing inbound host messages and building the exact request
 //! envelopes the production renderer sends.
 //!
-//! The service protocol speaks JSON with camelCase field names (the wire shape
-//! is authoritative; see `crates/editchain-protocol`). Like the production
-//! renderer, we read fields defensively with the same defaults JavaScript
-//! applies, so fixture and real-service payloads behave identically.
+//! Shared protocol types own service payloads. This adapter retains the host's
+//! control messages and legacy error-envelope compatibility.
 
-use serde_json::{json, Value};
+use editchain_protocol::{
+    ErrorCode, FindInHistoryRequest, GetWindowRequest, RequestBody, ServiceError, SnapshotId,
+};
+use serde_json::Value;
 
 /// A message delivered by the extension host (or fixture bridge).
 #[derive(Debug, Clone)]
@@ -60,7 +61,7 @@ impl HostMessage {
 #[derive(Debug, Clone)]
 pub(crate) enum Unwrapped {
     Ok(Value),
-    Err(String),
+    Err(ServiceError),
 }
 
 /// Unwrap a service response body exactly like `main.js unwrap()`.
@@ -71,16 +72,11 @@ pub(crate) fn unwrap(body: Option<Value>) -> Unwrapped {
             if let Some(value) = body.get("Ok") {
                 Unwrapped::Ok(value.clone())
             } else if let Some(error) = body.get("Error") {
-                Unwrapped::Err(
-                    error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .map_or_else(|| as_string(error), str::to_owned),
-                )
+                Unwrapped::Err(decode_error(error))
             } else if let Some(error) = body.get("error") {
                 // Legacy lowercase envelope (old extension hosts posted
                 // transport exceptions this way).
-                Unwrapped::Err(as_string(error))
+                Unwrapped::Err(decode_error(error))
             } else {
                 Unwrapped::Ok(body)
             }
@@ -88,35 +84,46 @@ pub(crate) fn unwrap(body: Option<Value>) -> Unwrapped {
     }
 }
 
-fn as_string(value: &Value) -> String {
-    match value {
-        Value::String(s) => s.clone(),
-        other @ (Value::Null
-        | Value::Bool(_)
-        | Value::Number(_)
-        | Value::Array(_)
-        | Value::Object(_)) => other.to_string(),
-    }
+fn decode_error(value: &Value) -> ServiceError {
+    serde_json::from_value(value.clone()).unwrap_or_else(|error| {
+        ServiceError::new(
+            ErrorCode::InvalidInput,
+            format!("Invalid service error: {error}"),
+        )
+    })
+}
+
+/// Decode the result type selected by the correlated request.
+pub(crate) fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T, ServiceError> {
+    serde_json::from_value(value).map_err(|error| {
+        ServiceError::new(
+            ErrorCode::InvalidInput,
+            format!("Invalid service response: {error}"),
+        )
+    })
 }
 
 /// Build a `GetWindow` request body with the exact production shape.
-pub(crate) fn get_window(offset: i64, limit: i64, include_layout: bool) -> Value {
-    json!({
-        "GetWindow": {
-            "offset": offset,
-            "limit": limit,
-            "include_layout": include_layout,
-        }
+pub(crate) fn get_window(
+    snapshot_id: &SnapshotId,
+    offset: u64,
+    limit: u64,
+    include_layout: bool,
+) -> RequestBody {
+    RequestBody::GetWindow(GetWindowRequest {
+        snapshot_id: snapshot_id.clone(),
+        offset,
+        limit,
+        include_layout,
     })
 }
 
 /// Build a `FindInHistory` request body with the exact production shape.
-pub(crate) fn find_in_history(query: &str, top_k: i64) -> Value {
-    json!({
-        "FindInHistory": {
-            "query": query,
-            "top_k": top_k,
-        }
+pub(crate) fn find_in_history(snapshot_id: &SnapshotId, query: &str, top_k: usize) -> RequestBody {
+    RequestBody::FindInHistory(FindInHistoryRequest {
+        snapshot_id: snapshot_id.clone(),
+        query: query.to_owned(),
+        top_k,
     })
 }
 
@@ -124,6 +131,8 @@ pub(crate) fn find_in_history(query: &str, top_k: i64) -> Value {
 /// against the acquired VS Code API; pure tests assert on them directly.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Send {
+    /// Ask the host to open current sources as a fresh snapshot.
+    RefreshHistory,
     /// A correlated service request `{ id, body }`.
     Request { id: u64, body: Value },
     /// Renderer diagnostics / log lines (`{ type: 'log', text }`).
@@ -277,14 +286,14 @@ mod tests {
             Unwrapped::Ok(v) if v.get("total").and_then(Value::as_i64) == Some(3)
         ));
         assert!(
-            matches!(unwrap(Some(json!({ "Error": "boom" }))), Unwrapped::Err(e) if e == "boom")
+            matches!(unwrap(Some(json!({ "Error": "boom" }))), Unwrapped::Err(e) if e.message == "boom")
         );
         assert!(
-            matches!(unwrap(Some(json!({ "error": "legacy" }))), Unwrapped::Err(e) if e == "legacy")
+            matches!(unwrap(Some(json!({ "error": "legacy" }))), Unwrapped::Err(e) if e.message == "legacy")
         );
         assert!(
             matches!(unwrap(Some(json!({"Error": {"code": "stale_snapshot", "message": "Reopen history"}}))),
-            Unwrapped::Err(message) if message == "Reopen history")
+            Unwrapped::Err(message) if message.code == ErrorCode::StaleSnapshot && message.message == "Reopen history")
         );
         // Missing body is treated as a success with a null value (handshake).
         assert!(matches!(unwrap(None), Unwrapped::Ok(v) if v.is_null()));
@@ -293,16 +302,17 @@ mod tests {
     #[test]
     fn get_window_envelope_matches_production_shape_exactly() {
         assert_eq!(
-            get_window(0, 500, false),
+            json!(get_window(&SnapshotId::new("fixture"), 0, 500, false)),
             json!({
                 "GetWindow": {
+                    "snapshot_id": "fixture",
                     "offset": 0,
                     "limit": 500,
                     "include_layout": false,
                 }
             })
         );
-        let raw = get_window(42, 100, true);
+        let raw = json!(get_window(&SnapshotId::new("fixture"), 42, 100, true));
         let window = raw.get("GetWindow").expect("GetWindow envelope");
         assert_eq!(window.get("offset").and_then(Value::as_i64), Some(42));
         assert_eq!(window.get("limit").and_then(Value::as_i64), Some(100));
@@ -310,16 +320,16 @@ mod tests {
             window.get("include_layout").and_then(Value::as_bool),
             Some(true)
         );
-        assert_eq!(window.as_object().map(serde_json::Map::len), Some(3));
+        assert_eq!(window.as_object().map(serde_json::Map::len), Some(4));
     }
 
     #[test]
     fn find_in_history_envelope_matches_production_shape() {
-        let body = find_in_history("hello", 50);
+        let body = json!(find_in_history(&SnapshotId::new("fixture"), "hello", 50));
         let find = body.get("FindInHistory").expect("FindInHistory envelope");
         assert_eq!(find.get("query").and_then(Value::as_str), Some("hello"));
         assert_eq!(find.get("top_k").and_then(Value::as_i64), Some(50));
-        assert_eq!(find.as_object().map(serde_json::Map::len), Some(2));
+        assert_eq!(find.as_object().map(serde_json::Map::len), Some(3));
     }
 
     #[test]

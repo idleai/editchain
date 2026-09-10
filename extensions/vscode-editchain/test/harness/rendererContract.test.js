@@ -67,7 +67,7 @@ test('production host forwards an exact read-only allowlist and rejects mutating
     'production openJson control remains handled');
   assert.match(EXTENSION_SOURCE, /msg\.type === 'openDiff'/,
     'production openDiff control remains explicitly handled');
-  assert.match(EXTENSION_SOURCE, /\{ GetFileDiff: \{ change: msg\.change \} \}/,
+  assert.match(EXTENSION_SOURCE, /\{ GetFileDiff: \{ snapshot_id: msg\.snapshot_id, change: msg\.change \} \}/,
     'openDiff materializes only the service-advertised file-change identity');
 });
 

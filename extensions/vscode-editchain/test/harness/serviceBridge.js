@@ -15,6 +15,8 @@
 
   let persistedState = undefined;
   let reqId = 0;
+  let negotiated = false;
+  let openPending = false;
 
   // The Node host injects this before the renderer runs. Resolve lazily so
   // the bridge can be defined before the shim is wired.
@@ -34,6 +36,10 @@
 
   window.vscode = {
     postMessage(msg) {
+      if (msg?.type === 'refreshHistory' && negotiated && !openPending) {
+        window.__editchainStart(true);
+        return;
+      }
       if (msg && msg.body !== undefined) {
         // The renderer tags every request with a client-generated id; fall
         // back to assigning one for older callers.
@@ -56,22 +62,28 @@
   };
 
   // Emulate the extension host startup handshake: Open then ready.
-  window.__editchainStart = function () {
+  window.__editchainStart = function (refresh = false) {
     // Open is unbounded (0 = no deadline): building the chain + git graph can
     // take minutes on a large workspace, so the harness must not apply the
     // bounded default used for regular requests. The Node-side client forwards
     // the timeout through the injected browser shim.
-    svc().send({ Open: { workspace_path: window.__editchainWorkspace, chain_dir: window.__editchainChainDir } }, 0)
+    openPending = true;
+    const request = { workspace_path: window.__editchainWorkspace, chain_dir: window.__editchainChainDir };
+    svc().send(refresh ? { Refresh: request } : { Open: request }, 0)
       .then((body) => {
+        openPending = false;
+        negotiated = body?.Ok?.protocol_version === 2 && Boolean(body.Ok.snapshot_id);
         window.dispatchEvent(new MessageEvent('message', { data: { id: 'open', body } }));
         // Mirror the extension host: `ready` (which makes the renderer fetch
         // its first window) is only sent after a SUCCESSFUL Open — an Open
         // Error surfaces visibly and must not trigger a window fetch.
-        if (body && body.Ok !== undefined && body.Ok !== null) {
+        if (negotiated) {
           window.dispatchEvent(new MessageEvent('message', { data: { id: 'ready', body: { Ok: {} } } }));
         }
       })
       .catch((err) => {
+        openPending = false;
+        negotiated = false;
         window.dispatchEvent(new MessageEvent('message', {
           data: { id: 'open', body: { Error: errMsg(err) } },
         }));

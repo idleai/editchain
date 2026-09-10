@@ -18,7 +18,7 @@ let statusItem: vscode.StatusBarItem | undefined = undefined;
 // The last successful Open response body. Held so command reuse or a genuinely
 // recreated Rust renderer instance can receive the authoritative `open` + `ready`
 // handshake without rebuilding the workspace.
-let lastOpenBody: any = null;
+let lastOpenBody: { Ok: NegotiatedOpen } | null = null;
 // The most recent terminal Open error. Successful bodies and errors are kept
 // separately because only a success permits command reuse without another
 // Open, while a recreated renderer still needs the current error replayed.
@@ -55,6 +55,20 @@ let diffDocumentSerial = 0;
 // a visible error in the webview and suspends the progressive loader until the
 // user explicitly retries or re-opens.
 const NON_OPEN_TIMEOUT_MS = 120_000;
+// Matches editchain_protocol::PROTOCOL_VERSION. Open keeps its legacy request
+// shape so an older service can return a visible negotiation error.
+const PROTOCOL_VERSION = 2;
+
+type NegotiatedOpen = {
+  protocol_version: number;
+  snapshot_id: string;
+};
+
+function isNegotiatedOpen(value: unknown): value is NegotiatedOpen {
+  return value !== null && typeof value === 'object' &&
+    'protocol_version' in value && value.protocol_version === PROTOCOL_VERSION &&
+    'snapshot_id' in value && typeof value.snapshot_id === 'string' && value.snapshot_id.length > 0;
+}
 
 type RecordedDiffHunk = Readonly<{
   header: string;
@@ -252,6 +266,12 @@ function openHistoryView(
       deliverOpenState(panel);
       return;
     }
+    if (msg.type === 'refreshHistory') {
+      if (panel === historyPanel && lastOpenBody !== null && !openPending) {
+        startOpen(client, panel, true);
+      }
+      return;
+    }
     // File children open VS Code's native diff editor. The webview sends only
     // the identity advertised by the service; the service revalidates it and
     // resolves immutable Git blobs or retained agent-edit evidence.
@@ -361,7 +381,7 @@ function chainDir(): string {
  * when the service exits or is stopped, so it can never hang forever. Used on
  * first load AND on command reuse after a service crash (recovery).
  */
-function startOpen(client: StdioClient, panel: vscode.WebviewPanel): void {
+function startOpen(client: StdioClient, panel: vscode.WebviewPanel, refresh = false): void {
   // Claim ownership of the Open lifecycle: this Open (and this panel) is now
   // authoritative, and any older in-flight Open becomes a no-op. A response is
   // honored only while this epoch is still current — a newer startOpen or a
@@ -376,8 +396,9 @@ function startOpen(client: StdioClient, panel: vscode.WebviewPanel): void {
   // Opening a workspace builds the chain + git graph and can take minutes on a
   // large repo — never apply the request timeout to it. The request is rejected
   // if the service exits or is stopped, so it cannot hang indefinitely.
+  const request = { workspace_path: workspacePath(), chain_dir: chainDir() };
   client.request(
-    { Open: { workspace_path: workspacePath(), chain_dir: chainDir() } },
+    refresh ? { Refresh: request } : { Open: request },
     { timeoutMs: 0 }
   ).then((resp) => {
     // Late response from a superseded Open: drop it entirely. It must neither
@@ -400,6 +421,12 @@ function startOpen(client: StdioClient, panel: vscode.WebviewPanel): void {
       output?.appendLine('[startOpen] open returned an error: ' + errText);
       lastOpenBody = null;
       lastOpenError = errText;
+      openPending = false;
+      deliverOpenState(panel);
+      return;
+    }
+    if (!isNegotiatedOpen(resp.Ok)) {
+      lastOpenError = 'Unsupported history protocol. Rebuild the EditChain service and renderer together, then reopen history.';
       openPending = false;
       deliverOpenState(panel);
       return;
@@ -464,27 +491,25 @@ function deliverOpenState(panel: vscode.WebviewPanel): void {
 async function openJsonEditor(
   client: StdioClient,
   jsonProvider: JsonContentProvider,
-  msg: { op_id?: string; git_oid?: string; repository?: string }
+  msg: { snapshot_id: string; op_id?: string; git_oid?: string; repository?: string }
 ): Promise<void> {
   try {
     // Fetch the node details from the service.
     let details: any;
     if (msg.git_oid) {
       const resp = await client.request(
-        { ResolveObject: { repository: msg.repository, oid: msg.git_oid } },
+        { ResolveObject: { snapshot_id: msg.snapshot_id, repository: msg.repository, oid: msg.git_oid } },
         { timeoutMs: NON_OPEN_TIMEOUT_MS }
       );
       // A service Error envelope must SURFACE as an error, never be opened as
       // a JSON document of the error object.
-      if (resp && resp.Error !== undefined) throw new Error(serviceErrorMessage(resp.Error));
-      details = resp?.Ok ?? resp;
+      details = snapshotValue(resp, msg.snapshot_id);
     } else if (msg.op_id) {
       const resp = await client.request(
-        { GetNodeDetails: { op_id: msg.op_id } },
+        { GetNodeDetails: { snapshot_id: msg.snapshot_id, op_id: msg.op_id } },
         { timeoutMs: NON_OPEN_TIMEOUT_MS }
       );
-      if (resp && resp.Error !== undefined) throw new Error(serviceErrorMessage(resp.Error));
-      details = resp?.Ok ?? resp;
+      details = snapshotValue(resp, msg.snapshot_id);
     } else {
       return;
     }
@@ -517,22 +542,31 @@ function serviceErrorMessage(error: unknown): string {
   return String(error);
 }
 
+/** Detail and diff actions retain the identity captured when their row was shown. */
+function snapshotValue(resp: any, snapshotId: string): any {
+  if (resp && resp.Error !== undefined) throw new Error(serviceErrorMessage(resp.Error));
+  const value = resp?.Ok;
+  if (!snapshotId || !value || value.snapshot_id !== snapshotId) {
+    throw new Error('History snapshot changed. Refresh history before opening this record.');
+  }
+  return value;
+}
+
 /** Materialize one advertised file change and open VS Code's native diff UI. */
 async function openDiffEditor(
   client: StdioClient,
   diffProvider: DiffContentProvider,
-  msg: { change?: any }
+  msg: { snapshot_id: string; change?: any }
 ): Promise<void> {
   try {
     if (!msg.change || typeof msg.change !== 'object' || Array.isArray(msg.change)) {
       throw new Error('missing file-change identity');
     }
     const resp = await client.request(
-      { GetFileDiff: { change: msg.change } },
+      { GetFileDiff: { snapshot_id: msg.snapshot_id, change: msg.change } },
       { timeoutMs: NON_OPEN_TIMEOUT_MS }
     );
-    if (resp && resp.Error !== undefined) throw new Error(serviceErrorMessage(resp.Error));
-    const diff = resp?.Ok ?? resp;
+    const diff = snapshotValue(resp, msg.snapshot_id);
     if (!diff || typeof diff !== 'object') {
       throw new Error('service returned no file diff');
     }

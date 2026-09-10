@@ -6,6 +6,8 @@
   'use strict';
 
   let persistedState;
+  let snapshotSerial = 0;
+  const snapshotId = () => 'fixture:' + snapshotSerial;
 
   function fixedRows(fixture) {
     const source = fixture.rows || [];
@@ -122,7 +124,7 @@
     return output;
   }
 
-  function windowResponse(fixture, request) {
+  function windowResponse(fixture, request, snapshot) {
     const offset = request.offset || 0;
     const limit = request.limit || 0;
     const rows = fixedRows(fixture).map((row, index, all) => ({
@@ -156,6 +158,7 @@
     const maxLane = fixture.max_lane ?? (fixture.layoutRows || [])
       .reduce((maximum, row) => Math.max(maximum, row.lane || 0), 0);
     return {
+      snapshot_id: snapshot,
       rows: slice,
       total: expanded.length,
       chain_generation: 0,
@@ -166,7 +169,7 @@
     };
   }
 
-  function findInHistoryResponse(fixture, request) {
+  function findInHistoryResponse(fixture, request, snapshot) {
     const query = String(request.query || '').toLowerCase();
     const rows = fixedRows(fixture);
     const topK = typeof request.top_k === 'number' && request.top_k > 0 ? request.top_k : 25;
@@ -180,6 +183,7 @@
     }
     const capped = candidates.slice(0, topK);
     return {
+      snapshot_id: snapshot,
       matches: capped.map((row) => ({
         node_key: row.node_key,
         row: starts.get(row.node_key),
@@ -197,8 +201,13 @@
     if (!body || typeof body !== 'object') return;
     window.__editchainRequestLog.push(body);
     const requestName = Object.keys(body)[0];
+    const snapshot = snapshotId();
+    if (body[requestName]?.snapshot_id !== snapshot) {
+      respond(id, { Error: { code: 'stale_snapshot', message: 'Fixture snapshot changed.' } });
+      return;
+    }
     if (requestName === 'GetWindow') {
-      const respondNow = () => respond(id, { Ok: windowResponse(fixture, body.GetWindow) });
+      const respondNow = () => respond(id, { Ok: windowResponse(fixture, body.GetWindow, snapshot) });
       const layoutHold = window.__editchainHoldLayoutWindow;
       if (body.GetWindow.include_layout === true && layoutHold && !layoutHold.taken) {
         layoutHold.taken = true;
@@ -220,7 +229,7 @@
         return;
       }
       const respondNow = () => respond(id, {
-        Ok: findInHistoryResponse(fixture, body.FindInHistory),
+        Ok: findInHistoryResponse(fixture, body.FindInHistory, snapshot),
       });
       const hold = window.__editchainHoldFind;
       if (hold && !hold.taken) {
@@ -236,6 +245,11 @@
 
   window.vscode = {
     postMessage(message) {
+      if (message?.type === 'refreshHistory') {
+        snapshotSerial++;
+        window.__editchainStart();
+        return;
+      }
       if (message?.body !== undefined) {
         const id = typeof message.id === 'number'
           ? message.id
@@ -266,6 +280,7 @@
     const all = window.__editchainFixtures || {};
     if (!all[name]) throw new Error('unknown scenario: ' + name);
     window.__editchainFixture = all[name]();
+    snapshotSerial++;
     window.__editchainScenarioName = name;
     persistedState = undefined;
     window.__editchainRequestLog = [];
@@ -277,6 +292,8 @@
       ? { Error: fixture.openError }
       : {
         Ok: {
+          protocol_version: 2,
+          snapshot_id: snapshotId(),
           nodes: fixedRows(fixture).length,
           repos: 1,
           ...(fixture.openWarnings ? { warnings: fixture.openWarnings } : {}),

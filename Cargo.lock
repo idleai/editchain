@@ -560,6 +560,7 @@ dependencies = [
 name = "editchain-history-renderer"
 version = "0.1.0"
 dependencies = [
+ "editchain-protocol",
  "js-sys",
  "serde",
  "serde_json",
