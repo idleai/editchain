@@ -38,6 +38,7 @@ pub(crate) fn try_import(
     let mut ops_sink = MemoryOpSink::new();
     let mut blobs_sink = ContentAddressedBlobSink::new();
     let request = CodexDiscoveryRequest {
+        repositories: &(),
         workspace_path: PathBuf::from("/workspace"),
         raw_root: root.to_path_buf(),
     };

@@ -1,6 +1,7 @@
 //! Import agent sessions (Claude Code or Codex) into the edit chain.
 
 mod claude_session_git;
+mod codex_repositories;
 mod git_commit_links;
 mod persistence;
 
@@ -90,7 +91,10 @@ pub fn run(
                     } else {
                         PathBuf::from(&sessions_dir)
                     };
+                    let repositories =
+                        codex_repositories::ImportRepositories::discover(Path::new(&workspace))?;
                     let request = CodexDiscoveryRequest {
+                        repositories: &repositories,
                         workspace_path: PathBuf::from(&workspace),
                         raw_root,
                     };

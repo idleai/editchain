@@ -185,11 +185,20 @@ Completed increments:
   append boundaries, raw-only gaps, failed derived blob writes, legacy and
   incomplete replacements, and content beyond the old 16-bit lane capacity.
 
+- Provider Git identity: Codex metadata accepts a neutral repository lookup
+  supplied by its host. The CLI adapter uses the shared repository catalog,
+  preserving marker-derived IDs for ordinary, nested, sibling, and linked
+  worktrees. The importer no longer walks Git markers or duplicates repository
+  ID hashing. Missing repositories produce no Git claim; incomplete discovery
+  returns an error before the batch can persist its source checkpoint. Tests
+  cover catalog identities, supplied/absent lookups, failure, and retry.
+  A Git marker inside a skipped directory leaves that cwd unresolved instead
+  of assigning the containing repository's identity.
+
 Remaining work, in dependency order:
 
-1. Finish moving provider Git metadata onto the repository catalog.
-2. Simplify search document identity and renderer request/cache state.
-3. Retire migrated compatibility machinery and optimize measured repeated work.
+1. Simplify search document identity and renderer request/cache state.
+2. Retire migrated compatibility machinery and optimize measured repeated work.
 
 Validation uses the existing crate, service, renderer, and extension suites.
 Every completed code increment must pass `./scripts/lint.sh`. Regression tests

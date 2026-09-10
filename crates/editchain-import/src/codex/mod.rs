@@ -125,13 +125,15 @@
 //!
 //! Codex's `session_meta.git.commit_hash` is the sole source of session-to-Git
 //! anchoring. When that value is a full SHA-1/SHA-256 OID and the projected
-//! `sessionMeta.cwd` resolves to an actual repository marker inside the
-//! workspace, the importer emits one durable `GitLinkKind::BasedOn` relation
+//! `sessionMeta.cwd` resolves through the host-supplied repository catalog,
+//! the importer emits one durable `GitLinkKind::BasedOn` relation
 //! from the raw `session_meta` op to that exact commit. Missing/invalid metadata
 //! yields no relation. Command text, operation timestamps, and later turns are
 //! never inspected or matched to commits. A versioned cursor checkpoint runs
 //! this as a metadata-only one-time backfill for already-imported rollouts,
 //! without replaying their raw or conversational rows.
+//! The CLI supplies its shared Git catalog; library callers explicitly supply
+//! a [`RepositoryLookup`] (or `()` when no live repository is available).
 //!
 //! ## Structural topology
 //!
@@ -199,3 +201,4 @@ pub use projection::{
     parse_projection, CompactedLine, FinalItem, InterAgentLine, Projection, ProjectionError,
     ProjectionItem, ProjectionKind, SessionGitMeta, SessionMeta, TurnMeta,
 };
+pub use session_git::RepositoryLookup;

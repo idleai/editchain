@@ -100,6 +100,7 @@ fn run_import_inner(
     let mut blobs = FsBlobSink::new(chain.join("blobs")).unwrap();
     let mut cursors = FsCursorStore::new(chain.join("cursors")).unwrap();
     let request = CodexDiscoveryRequest {
+        repositories: &(),
         workspace_path: PathBuf::from("/workspace"),
         raw_root: root.to_path_buf(),
     };
@@ -633,6 +634,7 @@ fn batch_limit_failure_discards_completed_files_and_retry_preserves_bytes() {
     let mut blobs = FsBlobSink::new(dir.path().join("blobs")).unwrap();
     let helper = helper_in(&dir, &messages_awk("thread"));
     let request = CodexDiscoveryRequest {
+        repositories: &(),
         workspace_path: "/workspace".into(),
         raw_root: root,
     };
@@ -721,6 +723,7 @@ fn both_checkpoint_crash_windows_preserve_generation_identity() {
     assert_eq!(accepted.accepted_generation, Some(0));
     write_rollout(&root, "rollout-1.jsonl", &[big_event_line('B', 1)]);
     let request = CodexDiscoveryRequest {
+        repositories: &(),
         workspace_path: "/workspace".into(),
         raw_root: root.clone(),
     };

@@ -30,7 +30,7 @@ const CODEX_GIT_NORMALIZATION_VERSION: u32 = 1;
 
 /// Configuration for a Codex rollout discovery/import request.
 #[derive(Debug, Clone)]
-pub struct CodexDiscoveryRequest {
+pub struct CodexDiscoveryRequest<'a> {
     /// Path to the workspace root. Used for deterministic source stream IDs
     /// and as the conservative project filter: a rollout is included when its
     /// projected `sessionMeta.cwd` is equal to or nested within this path, and
@@ -39,6 +39,8 @@ pub struct CodexDiscoveryRequest {
     /// Root directory containing raw Codex rollout JSONL files, recursively
     /// (e.g. `~/.codex/sessions`; date trees are discovered automatically).
     pub raw_root: PathBuf,
+    /// Host-owned catalog used for exact session-start Git repository identity.
+    pub repositories: &'a dyn super::session_git::RepositoryLookup,
 }
 
 /// Import all Codex rollouts under a raw sessions root into editchain ops.
@@ -98,7 +100,7 @@ pub struct CodexDiscoveryRequest {
     reason = "import orchestrator takes the request, options, helper bridge, and three sinks"
 )]
 pub fn import_codex(
-    request: &CodexDiscoveryRequest,
+    request: &CodexDiscoveryRequest<'_>,
     options: &ImportOptions,
     helper: &HelperCommand,
     ops: &mut dyn OpSink,
@@ -399,7 +401,7 @@ pub fn import_codex(
             ) {
                 if source_ordinal <= raw_batch_end {
                     if let Some(op) = session_git_link_op(
-                        &request.workspace_path,
+                        request.repositories,
                         meta,
                         source_ordinal,
                         &stream,

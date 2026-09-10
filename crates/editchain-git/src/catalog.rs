@@ -112,14 +112,16 @@ impl RepositoryCatalog {
         self.entries.iter().find(|entry| entry.id == id)
     }
 
-    /// Nearest containing worktree for an existing absolute cwd.
+    /// Nearest cataloged worktree for an existing absolute cwd. An intervening
+    /// uncataloged Git marker or an unreadable path leaves identity unresolved.
     #[must_use]
     pub fn repository_for_path(&self, path: &Path) -> Option<&RepositoryDiscovery> {
         if !path.is_absolute() {
             return None;
         }
         let path = path.canonicalize().ok()?;
-        self.entries
+        let repository = self
+            .entries
             .iter()
             .filter_map(|entry| {
                 let root = entry.worktree_root.as_ref()?;
@@ -127,7 +129,15 @@ impl RepositoryCatalog {
                     .then_some((root.components().count(), entry))
             })
             .max_by_key(|(depth, _)| *depth)
-            .map(|(_, entry)| entry)
+            .map(|(_, entry)| entry)?;
+        let root = repository.worktree_root.as_ref()?;
+        for ancestor in path.ancestors().take_while(|ancestor| *ancestor != root) {
+            match std::fs::symlink_metadata(ancestor.join(".git")) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) | Err(_) => return None,
+            }
+        }
+        Some(repository)
     }
 
     /// Whether this worktree is strictly within another discovered worktree.

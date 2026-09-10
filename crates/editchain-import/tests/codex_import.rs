@@ -19,7 +19,7 @@ use process_wrap as _;
 use proptest as _;
 use serde as _;
 use serde_json as _;
-use sha2::{Digest, Sha256};
+use sha2 as _;
 use std::io::Write;
 use std::path::Path;
 use tempfile as _;
@@ -499,8 +499,7 @@ fn named_materialization_backfills_independently_of_legacy_metadata_versions() {
 fn session_start_git_metadata_emits_one_exact_based_on_link() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
-    let git_marker = workspace.join(".git");
-    std::fs::create_dir_all(&git_marker).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
     let rollouts = dir.path().join("rollouts");
     std::fs::create_dir_all(&rollouts).unwrap();
     write_rollout(
@@ -548,23 +547,90 @@ fn session_start_git_metadata_emits_one_exact_based_on_link() {
     );
     assert!(matches!(link.kind, editchain_core::GitLinkKind::BasedOn));
 
-    let canonical_marker = git_marker.canonicalize().unwrap();
-    let digest = Sha256::digest(canonical_marker.to_string_lossy().as_bytes());
-    let mut repository_bytes = [0u8; 8];
-    repository_bytes.copy_from_slice(&digest[..8]);
-    assert_eq!(
-        link.target_repo,
-        editchain_core::RepositoryId(u64::from_le_bytes(repository_bytes))
-    );
+    assert_eq!(link.target_repo, editchain_core::RepositoryId(7));
     assert_eq!(imported.report.raw_ops, 1);
     assert_eq!(imported.report.normalized_ops, 1);
+}
+
+#[test]
+fn repository_lookup_failure_discards_capture_and_absence_emits_no_git_claim() {
+    use editchain_import::batch::ImportBatch;
+
+    #[derive(Debug)]
+    struct FailedCatalog;
+    impl editchain_import::codex::RepositoryLookup for FailedCatalog {
+        fn repository_for_cwd(
+            &self,
+            _cwd: &Path,
+        ) -> Result<Option<editchain_core::RepositoryId>, ImportError> {
+            Err(ImportError::OpSink("catalog unavailable".into()))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let path = root.join("rollout-1.jsonl");
+    write_rollout(
+        root,
+        "rollout-1.jsonl",
+        &[session_meta_line("thread", "session")],
+    );
+    let helper = fixed_helper(
+        &dir,
+        &projection_bytes(&[line_record(
+            1,
+            Vec::new(),
+            Some(serde_json::json!({
+                "threadId": "thread", "cwd": root,
+                "git": { "commitHash": "0123456789abcdef0123456789abcdef01234567" }
+            })),
+        )]),
+    );
+    let base = MemoryCursorStore::new();
+    let options = ImportOptions::default();
+    let capture = |repositories: &dyn editchain_import::codex::RepositoryLookup| {
+        let request = CodexDiscoveryRequest {
+            repositories,
+            workspace_path: root.into(),
+            raw_root: root.into(),
+        };
+        ImportBatch::capture(&base, |ops, pending| {
+            import_codex(
+                &request,
+                &options,
+                &helper,
+                ops,
+                &mut ContentAddressedBlobSink::new(),
+                pending,
+            )
+        })
+    };
+    assert!(matches!(
+        capture(&FailedCatalog),
+        Err(ImportError::OpSink(_))
+    ));
+    let key = source_key(root, &path);
+    assert!(base.get_cursor(&key).unwrap().is_none());
+    assert!(base.get_reservation(&key).unwrap().is_none());
+    assert_eq!(base.get_generation(&key).unwrap(), 0);
+    let without_repository = capture(&()).unwrap();
+    assert_eq!(without_repository.report().raw_ops, 1);
+    assert!(!without_repository
+        .operations()
+        .iter()
+        .any(|op| matches!(op.kind, OpKind::GitLink(_))));
+    let with_repository = capture(&FixtureRepository(root)).unwrap();
+    assert!(with_repository
+        .operations()
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::GitLink(link)
+        if link.target_repo == editchain_core::RepositoryId(7))));
 }
 
 #[test]
 fn legacy_cursor_backfills_session_git_link_once_without_replaying_rows() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
-    std::fs::create_dir_all(workspace.join(".git")).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
     let rollouts = dir.path().join("rollouts");
     std::fs::create_dir_all(&rollouts).unwrap();
     let rollout = rollouts.join("rollout-thread-1.jsonl");
@@ -630,7 +696,7 @@ fn legacy_cursor_backfills_session_git_link_once_without_replaying_rows() {
 fn version_one_cursor_upgrades_topology_without_replaying_git_link() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
-    std::fs::create_dir_all(workspace.join(".git")).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
     let rollouts = dir.path().join("rollouts");
     std::fs::create_dir_all(&rollouts).unwrap();
     let rollout = rollouts.join("rollout-thread-1.jsonl");
@@ -2889,6 +2955,20 @@ fn session_projection(thread: &str, cwd: Option<&str>) -> Vec<u8> {
     projection_bytes(&[line_record(1, Vec::new(), Some(meta))])
 }
 
+#[derive(Debug)]
+struct FixtureRepository<'a>(&'a Path);
+
+impl editchain_import::codex::RepositoryLookup for FixtureRepository<'_> {
+    fn repository_for_cwd(
+        &self,
+        cwd: &Path,
+    ) -> Result<Option<editchain_core::RepositoryId>, ImportError> {
+        Ok(cwd
+            .starts_with(self.0)
+            .then_some(editchain_core::RepositoryId(7)))
+    }
+}
+
 /// Import a raw root with a custom workspace (fresh cursors).
 fn import_workspace(root: &Path, workspace: &Path, helper: &HelperCommand) -> Harness {
     let mut cursors = MemoryCursorStore::new();
@@ -2912,7 +2992,9 @@ fn import_workspace_into(
 ) -> Result<Harness, ImportError> {
     let mut ops_sink = MemoryOpSink::new();
     let mut blobs = ContentAddressedBlobSink::new();
+    let repository = FixtureRepository(workspace);
     let request = CodexDiscoveryRequest {
+        repositories: &repository,
         workspace_path: workspace.to_path_buf(),
         raw_root: root.to_path_buf(),
     };
