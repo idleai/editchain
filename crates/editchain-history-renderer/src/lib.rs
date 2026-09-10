@@ -289,7 +289,7 @@ mod shell {
             if self.open_diff_for_abs(abs, step) {
                 return;
             }
-            let expandable = self.state.cache.get(&abs).is_some_and(rows::has_sub_ops);
+            let expandable = self.state.cache.get(abs).is_some_and(rows::has_sub_ops);
             if expandable {
                 self.state.toggle_expanded_ui(abs, viewport, step);
             }
@@ -298,7 +298,7 @@ mod shell {
         /// Post the exact advertised file-change identity for host-side native
         /// diff materialization. Returns whether this row is a file row.
         fn open_diff_for_abs(&self, abs: i64, step: &mut Step) -> bool {
-            let Some(row) = self.state.cache.get(&abs) else {
+            let Some(row) = self.state.cache.get(abs) else {
                 return false;
             };
             let Some(mut envelope) = rows::open_diff_envelope(row) else {
@@ -314,7 +314,7 @@ mod shell {
         /// `openRawJson` — post the exact `openJson` identity envelope
         /// (`git_oid`+`repository` or `op_id`), or announce the absence.
         fn open_json_for_abs(&mut self, abs: i64, step: &mut Step) {
-            let Some(row) = self.state.cache.get(&abs) else {
+            let Some(row) = self.state.cache.get(abs) else {
                 return;
             };
             if let Some(mut envelope) = rows::open_json_envelope(row) {
@@ -399,7 +399,7 @@ mod shell {
             let col_style = self.col_style();
             let graph = self.graph_cell_spec();
             for abs in self.dom.placeholder_abs() {
-                let Some(row) = self.state.cache.get(&abs) else {
+                let Some(row) = self.state.cache.get(abs) else {
                     continue;
                 };
                 let prev_group = self.previous_rendered_group(abs);
@@ -416,7 +416,7 @@ mod shell {
             let prev = self.dom.previous_row_abs(abs)?;
             self.state
                 .cache
-                .get(&prev)
+                .get(prev)
                 .map(|row| host::row::owned_str(row, "group"))
         }
 
@@ -424,7 +424,7 @@ mod shell {
             let abs = self.dom.last_row_abs()?;
             self.state
                 .cache
-                .get(&abs)
+                .get(abs)
                 .map(|row| host::row::owned_str(row, "group"))
         }
 
@@ -482,7 +482,7 @@ mod shell {
                 }
                 DomOp::RevealRow { abs } => self.dom.reveal_row(*abs),
                 DomOp::SetFindHighlight { abs } => {
-                    let Some(row) = self.state.cache.get(abs) else {
+                    let Some(row) = self.state.cache.get(*abs) else {
                         return Ok(());
                     };
                     let node_key = host::row::owned_str(row, "node_key");
@@ -1155,7 +1155,7 @@ mod shell {
                 });
                 let wants_toggle = SHELL_DATA.with(|cell| {
                     cell.borrow().as_ref().is_some_and(|shell| {
-                        let row = shell.state.cache.get(&abs);
+                        let row = shell.state.cache.get(abs);
                         let Some(row) = row else {
                             return false;
                         };
@@ -1176,7 +1176,7 @@ mod shell {
                 }
                 let expandable = SHELL_DATA.with(|cell| {
                     cell.borrow().as_ref().is_some_and(|shell| {
-                        shell.state.cache.get(&abs).is_some_and(rows::has_sub_ops)
+                        shell.state.cache.get(abs).is_some_and(rows::has_sub_ops)
                     })
                 });
                 if expandable {
@@ -1460,7 +1460,7 @@ mod shell {
                     return JsValue::NULL;
                 };
                 let index = dom::f64_round_to_i64(abs);
-                let Some(row) = shell.state.cache.get(&index) else {
+                let Some(row) = shell.state.cache.get(index) else {
                     return JsValue::NULL;
                 };
                 js_sys::JSON::parse(&row.to_string()).unwrap_or(JsValue::NULL)
@@ -1547,7 +1547,7 @@ mod shell {
         set_window_prop("__editchainDataReady", &JsValue::from_bool(ready));
         set_window_prop(
             "__editchainInFlightCount",
-            &js_sys::Number::from(u32::try_from(shell.state.in_flight.len()).unwrap_or(u32::MAX))
+            &js_sys::Number::from(u32::try_from(shell.state.requests.len()).unwrap_or(u32::MAX))
                 .into(),
         );
         set_window_prop(
@@ -1972,7 +1972,7 @@ mod shell {
         SHELL_DATA.with(|cell| {
             cell.borrow()
                 .as_ref()
-                .and_then(|shell| u64::try_from(shell.state.in_flight.len()).ok())
+                .and_then(|shell| u64::try_from(shell.state.requests.len()).ok())
                 .unwrap_or(u64::MAX)
         })
     }
@@ -1995,7 +1995,7 @@ mod shell {
         SHELL_DATA.with(|cell| {
             cell.borrow()
                 .as_ref()
-                .and_then(|shell| shell.state.cache.get(&abs))
+                .and_then(|shell| shell.state.cache.get(abs))
                 .map_or_else(|| "null".to_owned(), Value::to_string)
         })
     }

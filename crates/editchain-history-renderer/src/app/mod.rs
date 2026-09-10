@@ -59,6 +59,9 @@ impl ChainState {
     }
 }
 
+mod cache;
+mod requests;
+
 pub(crate) mod host;
 
 pub(crate) mod rows;

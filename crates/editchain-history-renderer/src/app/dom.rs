@@ -787,7 +787,7 @@ pub(crate) fn window_rows_from(
         let Some(abs) = state.abs_index_for_visible(vis) else {
             continue; // hidden sub-op slot — no drawable row
         };
-        let Some(row) = state.cache.get(&abs) else {
+        let Some(row) = state.cache.get(abs) else {
             rows.push(WindowRow {
                 vis,
                 spec: RowSpec::placeholder(abs),

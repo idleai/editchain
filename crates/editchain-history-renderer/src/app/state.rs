@@ -21,9 +21,10 @@ use editchain_protocol::{
 };
 use serde_json::{json, Value};
 
-use super::host::{
-    self, find_in_history, get_window, HostMessage, Id, LoggedRequest, Send, Unwrapped,
-};
+use super::host::{self, find_in_history, get_window, HostMessage, Id, Send, Unwrapped};
+
+use super::cache::{PageCache, RetentionPriority, MAX_CACHED_ROWS};
+use super::requests::RequestRegistry;
 
 /// Fixed row height in CSS pixels (`ROW_H = 34` — contract value).
 pub(crate) const ROW_H: i64 = 34;
@@ -32,7 +33,7 @@ pub(crate) const ROW_H: i64 = 34;
 pub(crate) const PAGE: i64 = 500;
 /// Rows kept rendered past each edge of the viewport (`BUFFER`).
 pub(crate) const BUFFER: i64 = 400;
-/// Candidate cap for find-in-chain (`FIND_TOP_K`).
+/// Distinct visible match limit for find-in-chain (`FIND_TOP_K`).
 pub(crate) const FIND_TOP_K: i64 = 50;
 /// Viewport measurements the renderer observes (CSS pixels).
 #[derive(Debug, Clone, Copy)]
@@ -48,14 +49,6 @@ impl Viewport {
             client_height,
         }
     }
-}
-
-/// An in-flight service request (correlated by id).
-#[derive(Debug, Clone)]
-pub(crate) struct InFlight {
-    pub(crate) body: RequestBody,
-    pub(crate) gen_tag: u64,
-    pub(crate) search_epoch: Option<u64>,
 }
 
 /// A normalized find-in-chain match.
@@ -167,7 +160,7 @@ pub(crate) struct ViewFlags {
 pub(crate) struct FindFlags {
     /// A find session has settled.
     pub(crate) active: bool,
-    /// The response was truncated by the candidate cap (`more`).
+    /// More visible matches exist or may remain beyond the scan budget.
     pub(crate) more: bool,
 }
 
@@ -186,9 +179,7 @@ pub(crate) struct SessionFlags {
 #[derive(Debug, Clone)]
 pub(crate) struct HistoryAppState {
     // --- request correlation ----------------------------------------------
-    pub(crate) next_req_id: u64,
-    pub(crate) in_flight: BTreeMap<u64, InFlight>,
-    pub(crate) pending_window_req_id: Option<u64>,
+    pub(crate) requests: RequestRegistry,
     pub(crate) view_gen: u64,
     /// Server source/view identity negotiated by the latest successful Open.
     pub(crate) snapshot_id: SnapshotId,
@@ -198,7 +189,7 @@ pub(crate) struct HistoryAppState {
     // --- view state -------------------------------------------------------
     /// Authoritative total; `None` = unknown (fresh view / after a reset).
     pub(crate) total: Option<i64>,
-    pub(crate) cache: BTreeMap<i64, Value>,
+    pub(crate) cache: PageCache,
     pub(crate) total_fetched: u64,
     pub(crate) max_lane: u32,
     pub(crate) open_warnings: Vec<String>,
@@ -231,23 +222,19 @@ pub(crate) struct HistoryAppState {
     // --- find query and renderer readiness ----------------------------------
     pub(crate) view_flags: ViewFlags,
     pub(crate) search_query: String,
-    // --- debug / harness parity ----------------------------------------------
-    pub(crate) request_log: Vec<LoggedRequest>,
 }
 
 impl Default for HistoryAppState {
     fn default() -> Self {
         let mut state = HistoryAppState {
-            next_req_id: 1,
-            in_flight: BTreeMap::new(),
-            pending_window_req_id: None,
+            requests: RequestRegistry::default(),
             view_gen: 0,
             snapshot_id: SnapshotId::default(),
             session_flags: SessionFlags::default(),
             search_epoch: 0,
             current_search_epoch: None,
             total: None,
-            cache: BTreeMap::new(),
+            cache: PageCache::default(),
             total_fetched: 0,
             max_lane: 2,
             open_warnings: Vec::new(),
@@ -268,7 +255,6 @@ impl Default for HistoryAppState {
             pending_find_target: None,
             view_flags: ViewFlags::default(),
             search_query: String::new(),
-            request_log: Vec::new(),
         };
         state.recompute_expansion();
         state
@@ -461,13 +447,7 @@ impl HistoryAppState {
     /// The absolute index range we want cached: viewport ± BUFFER in visible
     /// space mapped to absolute slots.
     pub(crate) fn desired_cache_range(&self, viewport: &Viewport) -> (i64, i64) {
-        let v_top = Self::viewport_visible_top(viewport)
-            .saturating_sub(BUFFER)
-            .max(0);
-        let v_bottom = self
-            .viewport_visible_bottom(viewport)
-            .saturating_add(BUFFER)
-            .min(self.visible_total().saturating_sub(1));
+        let (v_top, v_bottom) = self.desired_visible_range(viewport);
         let top_abs = self.abs_index_for_visible(v_top);
         let bottom_abs = self.abs_index_for_visible(v_bottom);
         (
@@ -478,14 +458,16 @@ impl HistoryAppState {
 
     /// The visible index range we want rendered.
     pub(crate) fn desired_visible_range(&self, viewport: &Viewport) -> (i64, i64) {
-        (
-            Self::viewport_visible_top(viewport)
-                .saturating_sub(BUFFER)
-                .max(0),
-            self.viewport_visible_bottom(viewport)
-                .saturating_add(BUFFER)
-                .min(self.visible_total().saturating_sub(1)),
-        )
+        let top = Self::viewport_visible_top(viewport)
+            .saturating_sub(BUFFER)
+            .max(0);
+        let capacity = i64::try_from(MAX_CACHED_ROWS).unwrap_or(i64::MAX);
+        let bottom = self
+            .viewport_visible_bottom(viewport)
+            .saturating_add(BUFFER)
+            .min(self.visible_total().saturating_sub(1))
+            .min(top.saturating_add(capacity).saturating_sub(1));
+        (top, bottom)
     }
 
     // --- request issuing ---------------------------------------------------------
@@ -496,99 +478,72 @@ impl HistoryAppState {
     /// arrives inside `postMessage`) correlates correctly.
     fn issue_request(
         &mut self,
-        body: RequestBody,
-        is_window: bool,
+        body: &RequestBody,
         search_epoch: Option<u64>,
         step: &mut Step,
     ) -> Option<u64> {
         if self.snapshot_id.is_empty() {
             return None;
         }
-        if let Err(error) = body.validate() {
-            self.fail_response(&body, &error, step);
-            return None;
+        match self.requests.register(body, self.view_gen, search_epoch) {
+            Ok((id, send)) => {
+                step.sends.push(send);
+                Some(id)
+            }
+            Err(error) => {
+                self.fail_response(body, &error, step);
+                None
+            }
         }
-        let id = self.next_req_id;
-        self.next_req_id = self.next_req_id.saturating_add(1);
-        let wire_body = json!(&body);
-        drop(self.in_flight.insert(
-            id,
-            InFlight {
-                body,
-                gen_tag: self.view_gen,
-                search_epoch,
-            },
-        ));
-        if is_window {
-            self.pending_window_req_id = Some(id);
-        }
-        self.request_log.push(LoggedRequest {
-            id,
-            body: wire_body.clone(),
-        });
-        step.sends.push(Send::Request {
-            id,
-            body: wire_body,
-        });
-        Some(id)
     }
 
-    /// `fetchWindow` — fetch a window of rows around the cacheable range.
-    /// Returns the request id, or `None` when nothing should be fetched.
+    /// Fetch missing visible rows around the viewport.
     pub(crate) fn fetch_window(&mut self, viewport: &Viewport, step: &mut Step) {
-        if self.pending_window_req_id.is_some() || self.total == Some(0) {
-            return;
-        }
         let (top, bottom) = self.desired_cache_range(viewport);
-        if top > bottom {
-            return;
-        }
-        // The expansion snapshot ships only with the offset-0 window.
-        let force_snapshot = !self.session_flags.snapshot_established;
-        let range_top = if force_snapshot { 0 } else { top };
-        let range_bottom = if force_snapshot {
-            (PAGE - 1).min(bottom)
-        } else {
-            bottom
-        };
-        if range_top > range_bottom {
-            return;
-        }
-        let start = (range_top..=range_bottom).find(|i| !self.cache.contains_key(i));
-        let Some(start) = start else { return };
-        let limit = PAGE.min(range_bottom.saturating_sub(start).saturating_add(1));
-        let body = get_window(
-            &self.snapshot_id,
-            u64::try_from(start).unwrap_or(0),
-            u64::try_from(limit).unwrap_or(0),
-            self.session_flags.layout_ready,
-        );
-        let _: Option<u64> = self.issue_request(body, true, None, step);
+        self.fetch_range(top, bottom, step);
     }
 
-    /// `fetchWindowAround` — fetch the sparse window around an absolute row.
+    /// Fetch a sparse window around an absolute find destination.
     pub(crate) fn fetch_window_around(&mut self, abs_row: i64, step: &mut Step) {
-        if self.pending_window_req_id.is_some() {
-            return;
-        }
         let total = self.total.unwrap_or(0);
         if total <= 0 {
             return;
         }
-        let force_snapshot = !self.session_flags.snapshot_established;
         let top = abs_row.saturating_sub(BUFFER).max(0);
         let bottom = total.saturating_sub(1).min(abs_row.saturating_add(BUFFER));
+        self.fetch_range(top, bottom, step);
+    }
+
+    /// Both viewport paging and find use the same snapshot-first scheduling.
+    fn fetch_range(&mut self, top: i64, bottom: i64, step: &mut Step) {
+        if self.requests.pending_window().is_some() || self.total == Some(0) || top > bottom {
+            return;
+        }
+        let force_snapshot = !self.session_flags.snapshot_established;
         let range_top = if force_snapshot { 0 } else { top };
         let range_bottom = if force_snapshot {
-            (PAGE - 1).min(bottom)
+            PAGE.saturating_sub(1).min(bottom)
         } else {
             bottom
         };
         if range_top > range_bottom {
             return;
         }
-        let start = (range_top..=range_bottom).find(|i| !self.cache.contains_key(i));
-        let Some(start) = start else { return };
+        let start = if force_snapshot {
+            self.cache.first_missing(range_top..=range_bottom)
+        } else {
+            let first = self.visible_abs.partition_point(|row| *row < range_top);
+            let visible = self.visible_abs.get(first..).unwrap_or(&[]);
+            self.cache.first_missing(
+                visible
+                    .iter()
+                    .copied()
+                    .take_while(|row| *row <= range_bottom),
+            )
+        };
+        let Some(start) = start else {
+            return;
+        };
         let limit = PAGE.min(range_bottom.saturating_sub(start).saturating_add(1));
         let body = get_window(
             &self.snapshot_id,
@@ -596,25 +551,42 @@ impl HistoryAppState {
             u64::try_from(limit).unwrap_or(0),
             self.session_flags.layout_ready,
         );
-        let _: Option<u64> = self.issue_request(body, true, None, step);
+        let _: Option<u64> = self.issue_request(&body, None, step);
     }
 
-    /// `evictFarWindows` — drop cached rows far outside the desired range.
+    /// Drop every far row, then prefer visible rows nearest the viewport up to
+    /// the retained-row budget. Hidden rows can be fetched again on disclosure.
     pub(crate) fn evict_far_windows(&mut self, viewport: &Viewport) {
         let (top, bottom) = self.desired_cache_range(viewport);
-        let keep_min = top.saturating_sub(BUFFER);
-        let keep_max = bottom.saturating_add(BUFFER);
-        let keys: Vec<i64> = self.cache.keys().copied().collect();
-        for (index, key) in keys.iter().enumerate() {
-            if *key < keep_min || *key > keep_max {
-                drop(self.cache.remove(key));
-            }
-            if index.saturating_add(1)
-                > usize::try_from(PAGE.saturating_mul(4)).unwrap_or(usize::MAX)
-            {
-                break; // hard cap on retained rows
-            }
-        }
+        let center = Self::viewport_visible_top(viewport)
+            .saturating_add(self.viewport_visible_bottom(viewport))
+            / 2;
+        let center_abs = self.abs_index_for_visible(center).unwrap_or(0);
+        let ready = self.session_flags.snapshot_established
+            || !self.sub_op_counts.is_empty()
+            || !self.expansion_spans.is_empty();
+        let visible_abs = &self.visible_abs;
+        self.cache.retain(
+            top.saturating_sub(BUFFER),
+            bottom.saturating_add(BUFFER),
+            |row| {
+                let visible = if ready {
+                    visible_abs
+                        .binary_search(&row)
+                        .ok()
+                        .and_then(|index| i64::try_from(index).ok())
+                } else {
+                    Some(row)
+                };
+                match visible {
+                    Some(visible) if row >= top && row <= bottom => {
+                        RetentionPriority::Requested(visible.abs_diff(center))
+                    }
+                    Some(visible) => RetentionPriority::Visible(visible.abs_diff(center)),
+                    None => RetentionPriority::Hidden(row.abs_diff(center_abs)),
+                }
+            },
+        );
     }
 
     /// `syncWindow` — extend/trim the rendered window to the desired visible
@@ -648,7 +620,7 @@ impl HistoryAppState {
         if self.render_top > want_top
             || self
                 .abs_index_for_visible(self.render_top.saturating_sub(1))
-                .is_some_and(|i| self.cache.contains_key(&i))
+                .is_some_and(|i| self.cache.contains_key(i))
         {
             let (from, to, added) =
                 self.prepend_rows_above(self.render_top.saturating_sub(want_top).max(1));
@@ -679,7 +651,7 @@ impl HistoryAppState {
                 vis = vis.saturating_add(1);
                 continue;
             };
-            if !self.cache.contains_key(&abs) {
+            if !self.cache.contains_key(abs) {
                 break; // stop at first gap — keep contiguous
             }
             if from < 0 {
@@ -711,7 +683,7 @@ impl HistoryAppState {
                 vis = vis.saturating_add(1);
                 continue;
             };
-            if !self.cache.contains_key(&abs) {
+            if !self.cache.contains_key(abs) {
                 break;
             }
             if from < 0 {
@@ -837,7 +809,7 @@ impl HistoryAppState {
         self.find_total
     }
 
-    /// Whether the backend truncated the candidate list (`more`).
+    /// Whether additional visible matches exist or may remain unscanned (`more`).
     pub(crate) fn find_more(&self) -> bool {
         self.find_flags.more
     }
@@ -876,7 +848,7 @@ impl HistoryAppState {
     /// Rows are rebuilt by virtual scroll, so every render re-applies the
     /// selected class from this key (via [`HistoryAppState::row_context`]).
     pub(crate) fn select_row(&mut self, abs: i64) {
-        let Some(row) = self.cache.get(&abs) else {
+        let Some(row) = self.cache.get(abs) else {
             return;
         };
         self.selected_key = Some(host::row::owned_str(row, "node_key"));
@@ -970,7 +942,7 @@ impl HistoryAppState {
             query,
             usize::try_from(FIND_TOP_K).unwrap_or(0),
         );
-        let _: Option<u64> = self.issue_request(body, false, Some(epoch), step);
+        let _: Option<u64> = self.issue_request(&body, Some(epoch), step);
     }
 
     /// `applyFindResponse` — settle a `FindInHistory` response in place. The
@@ -1050,7 +1022,7 @@ impl HistoryAppState {
             more: self.find_flags.more,
         }));
         self.pending_find_target = Some(FindTarget { abs, index });
-        if self.cache.contains_key(&abs) {
+        if self.cache.contains_key(abs) {
             let _: Option<Viewport> = self.complete_find_jump(viewport, step);
         } else {
             self.fetch_window_around(abs, step);
@@ -1077,7 +1049,7 @@ impl HistoryAppState {
             self.fetch_window(viewport, step);
             return None;
         }
-        let cached = self.cache.get(&target.abs)?;
+        let cached = self.cache.get(target.abs)?;
         let expected = self.find_matches.get(target.index)?;
         if host::row::str(cached, "node_key") != expected.node_key {
             self.fail_snapshot(
@@ -1144,7 +1116,7 @@ impl HistoryAppState {
         self.session_flags.layout_ready = false;
         self.clear_expansion_state();
         self.recompute_expansion();
-        self.pending_window_req_id = None;
+        self.requests.clear();
         self.cache.clear();
         self.total_fetched = 0;
         self.render_top = 0;
@@ -1160,7 +1132,6 @@ impl HistoryAppState {
     /// Invalidate local requests before asking the host for a new opened source.
     pub(crate) fn refresh_snapshot(&mut self, viewport: &Viewport, step: &mut Step) {
         self.snapshot_id = SnapshotId::default();
-        self.in_flight.clear();
         self.reset_history(viewport, step);
         step.sends.push(Send::RefreshHistory);
     }
@@ -1307,10 +1278,9 @@ impl HistoryAppState {
                 // A fresh chain is a new view generation; drop stale responses
                 // and re-establish the offset-0 snapshot from scratch.
                 self.view_gen = self.view_gen.saturating_add(1);
-                self.in_flight.clear();
+                self.requests.clear();
                 self.cache.clear();
                 self.total_fetched = 0;
-                self.pending_window_req_id = None;
                 self.session_flags.layout_ready = false;
                 self.current_search_epoch = None;
                 self.session_flags.snapshot_established = false;
@@ -1412,13 +1382,9 @@ impl HistoryAppState {
         viewport: &Viewport,
         step: &mut Step,
     ) {
-        let Some(req) = self.in_flight.remove(&id) else {
-            return; // unknown id (e.g. a replayed open response replay) — drop
+        let Some((req, was_pending_window)) = self.requests.take(id) else {
+            return; // unknown or retired request — drop without changing ownership
         };
-        let was_pending_window = self.pending_window_req_id == Some(id);
-        if was_pending_window {
-            self.pending_window_req_id = None;
-        }
         // Stale-view rejection: a response issued under an older view
         // generation must never poison the new view. Self-heal by re-requesting
         // the current view's window when the stale response was the pending one.
@@ -1524,8 +1490,7 @@ impl HistoryAppState {
 
     fn invalidate_snapshot(&mut self) {
         self.snapshot_id = SnapshotId::default();
-        self.in_flight.clear();
-        self.pending_window_req_id = None;
+        self.requests.clear();
         self.cache.clear();
         self.reset_find_state();
         self.current_search_epoch = None;
@@ -1588,7 +1553,7 @@ impl HistoryAppState {
         let base = i64::try_from(request.offset).unwrap_or(i64::MAX);
         for (index, row) in window.rows.into_iter().enumerate() {
             let abs = base.saturating_add(i64::try_from(index).unwrap_or(0));
-            if !self.cache.contains_key(&abs) {
+            if !self.cache.contains_key(abs) {
                 self.total_fetched = self.total_fetched.saturating_add(1);
             }
             // The presentation adapter still consumes flat rows; defaults and
@@ -1598,7 +1563,7 @@ impl HistoryAppState {
         // Complete a pending find jump before eviction changes the viewport.
         let mut effective_viewport = *viewport;
         if let Some(target) = self.pending_find_target {
-            if self.cache.contains_key(&target.abs) {
+            if self.cache.contains_key(target.abs) {
                 if let Some(post_scroll) = self.complete_find_jump(viewport, step) {
                     effective_viewport = post_scroll;
                 }
@@ -1640,7 +1605,7 @@ impl HistoryAppState {
                 include_layout: true,
                 ..request.clone()
             });
-            let _: Option<u64> = self.issue_request(body, true, None, step);
+            let _: Option<u64> = self.issue_request(&body, None, step);
             return;
         }
         if let Some(target) = self.pending_find_target {
@@ -1752,7 +1717,8 @@ mod tests {
 
     fn last_get_window(state: &HistoryAppState) -> &serde_json::Map<String, Value> {
         state
-            .request_log
+            .requests
+            .log()
             .iter()
             .rev()
             .find(|req| req.body.get("GetWindow").is_some())
@@ -1769,7 +1735,7 @@ mod tests {
         let mut state = HistoryAppState::default();
         let mut step = Step::new();
         state.handle_host_message(open_msg(500), &vp(), &mut step);
-        let id = state.pending_window_req_id.unwrap();
+        let id = state.requests.pending_window().unwrap();
         let mut window = window_response(0, 1, 500, None);
         drop(
             window
@@ -1797,10 +1763,10 @@ mod tests {
             .sends
             .iter()
             .any(|send| matches!(send, Send::Request { .. })));
-        assert!(state.in_flight.is_empty());
+        assert!(state.requests.is_empty());
         state.handle_host_message(open_msg(500), &vp(), &mut refresh);
         assert_eq!(state.snapshot_id.as_str(), "fixture");
-        assert!(state.pending_window_req_id.is_some());
+        assert!(state.requests.pending_window().is_some());
     }
 
     #[test]
@@ -1813,10 +1779,10 @@ mod tests {
             let mut state = HistoryAppState::default();
             let mut open = Step::new();
             state.handle_host_message(open_msg(500), &vp(), &mut open);
-            let id = state.pending_window_req_id.unwrap();
+            let id = state.requests.pending_window().unwrap();
             let mut failed = Step::new();
             state.handle_host_message(resp(id, &body), &vp(), &mut failed);
-            assert!(state.pending_window_req_id.is_none());
+            assert!(state.requests.pending_window().is_none());
             assert!(state.cache.is_empty());
             assert!(failed
                 .ops
@@ -1835,9 +1801,10 @@ mod tests {
             },
             ..fixture_state()
         };
+        state.recompute_expansion();
         let mut search = Step::new();
         state.submit_find("needle", &mut search);
-        let id = state.request_log.last().unwrap().id;
+        let id = state.requests.log().last().unwrap().id;
         state.handle_host_message(
             resp(
                 id,
@@ -1847,7 +1814,7 @@ mod tests {
             &vp(),
             &mut search,
         );
-        let window_id = state.pending_window_req_id.unwrap();
+        let window_id = state.requests.pending_window().unwrap();
         let mut arrived = Step::new();
         state.handle_host_message(
             resp(window_id, &window_response(300, 500, 2000, Some((2, None)))),
@@ -1879,7 +1846,7 @@ mod tests {
             &mut step,
         );
         assert!(state.snapshot_id.is_empty());
-        assert!(state.in_flight.is_empty());
+        assert!(state.requests.is_empty());
         assert!(step
             .ops
             .iter()
@@ -1902,7 +1869,7 @@ mod tests {
         // First fetch under the pre-layout view: offset 0, limited to the
         // desired cache range (visible bottom 23 + BUFFER 400 = 423 rows, so
         // limit 424 under a clientHeight of 800), with layout disabled.
-        assert_eq!(state.request_log.len(), 1);
+        assert_eq!(state.requests.log().len(), 1);
         let window = last_get_window(&state);
         assert_eq!(window["offset"], 0);
         assert_eq!(window["limit"], 424);
@@ -1910,7 +1877,7 @@ mod tests {
         assert_eq!(window.len(), 4);
         // The pending-window slot is claimed BEFORE the send is emitted so a
         // synchronous fixture response correlates (reentrancy contract).
-        assert_eq!(state.pending_window_req_id, Some(1));
+        assert_eq!(state.requests.pending_window(), Some(1));
         assert!(step
             .sends
             .contains(&Send::Log("open: 1200 nodes, 1 repos".to_owned())));
@@ -1935,7 +1902,7 @@ mod tests {
         let mut state = fixture_state();
         let mut step = Step::new();
         state.handle_host_message(open_msg(1200), &vp(), &mut step);
-        let pending = state.pending_window_req_id.expect("window in flight");
+        let pending = state.requests.pending_window().expect("window in flight");
 
         // Pass 1: rows only (no layout), offset 0.
         let mut step2 = Step::new();
@@ -1945,16 +1912,20 @@ mod tests {
             &mut step2,
         );
         assert_eq!(
-            state.pending_window_req_id,
+            state.requests.pending_window(),
             Some(2),
             "the pending slot is synchronously re-claimed by the layout hydration re-issue"
         );
         assert_eq!(state.cache.len(), 500, "rows land at the requested offset");
-        assert!(state.cache.contains_key(&499));
-        assert!(!state.cache.contains_key(&500));
+        assert!(state.cache.contains_key(499));
+        assert!(!state.cache.contains_key(500));
         assert!(!state.session_flags.layout_ready);
         // ...and the exact same page is re-issued with include_layout=true.
-        let hydration = state.request_log.last().expect("layout hydration issued");
+        let hydration = state
+            .requests
+            .log()
+            .last()
+            .expect("layout hydration issued");
         assert_eq!(
             hydration
                 .body
@@ -1983,7 +1954,10 @@ mod tests {
         // Pass 2: layout hydration for the same page; maxLane bumps a header
         // refresh op and the offset-0 snapshot re-anchors the stale identity
         // paint; the window continues paging forward under layout.
-        let pending = state.pending_window_req_id.expect("hydration in flight");
+        let pending = state
+            .requests
+            .pending_window()
+            .expect("hydration in flight");
         let mut step3 = Step::new();
         state.handle_host_message(
             resp(
@@ -2028,7 +2002,7 @@ mod tests {
         let mut state = fixture_state();
         let mut step = Step::new();
         state.handle_host_message(open_msg(1200), &vp(), &mut step);
-        let stale_id = state.pending_window_req_id.expect("window in flight");
+        let stale_id = state.requests.pending_window().expect("window in flight");
 
         // A `reveal` (recreated webview context) starts a new view generation
         // WITHOUT clearing the in-flight window or the pending slot.
@@ -2042,7 +2016,7 @@ mod tests {
             "open and reveal each start a new view generation"
         );
         assert_eq!(
-            state.request_log.len(),
+            state.requests.log().len(),
             1,
             "reveal reuses the pending window"
         );
@@ -2061,7 +2035,7 @@ mod tests {
         // view immediately re-requests its window (self-heal without waiting
         // for the progressive loader timer).
         assert_eq!(
-            state.request_log.len(),
+            state.requests.log().len(),
             2,
             "self-heal re-issues the current view's window"
         );
@@ -2073,11 +2047,11 @@ mod tests {
         let mut state = fixture_state();
         let mut step = Step::new();
         state.handle_host_message(open_msg(1200), &vp(), &mut step);
-        let old_id = state.pending_window_req_id.expect("window in flight");
+        let old_id = state.requests.pending_window().expect("window in flight");
         // A second open clears the request table entirely (authoritative view).
         state.handle_host_message(open_msg(1200), &vp(), &mut step);
-        assert_eq!(state.request_log.len(), 2);
-        assert_eq!(state.pending_window_req_id, Some(2));
+        assert_eq!(state.requests.log().len(), 2);
+        assert_eq!(state.requests.pending_window(), Some(2));
 
         let mut step2 = Step::new();
         state.handle_host_message(
@@ -2087,12 +2061,12 @@ mod tests {
         );
         assert!(state.cache.is_empty());
         assert_eq!(
-            state.request_log.len(),
+            state.requests.log().len(),
             2,
             "unknown ids are dropped silently"
         );
         assert_eq!(
-            state.pending_window_req_id,
+            state.requests.pending_window(),
             Some(2),
             "the current pending window survives"
         );
@@ -2107,7 +2081,7 @@ mod tests {
 
         let mut step2 = Step::new();
         state.submit_find("needle", &mut step2);
-        let older_id = state.request_log.last().expect("find request issued").id;
+        let older_id = state.requests.log().last().expect("find request issued").id;
         assert_eq!(state.current_search_epoch, Some(1));
         assert_eq!(
             state.current_search_epoch(),
@@ -2115,13 +2089,14 @@ mod tests {
             "accessor mirrors the epoch"
         );
         // The pending query renders the searching counter and posts the exact
-        // production FindInHistory envelope (query and candidate cap only).
+        // production FindInHistory envelope (query and visible result limit).
         assert!(step2
             .ops
             .iter()
             .any(|op| matches!(op, DomOp::FindCounter(FindCounterState::Pending))));
         let find_env = state
-            .request_log
+            .requests
+            .log()
             .last()
             .expect("find request issued")
             .body
@@ -2136,14 +2111,15 @@ mod tests {
             Some(FIND_TOP_K)
         );
         assert_eq!(
-            state.in_flight.get(&older_id).and_then(|f| f.search_epoch),
+            state.requests.get(older_id).and_then(|f| f.search_epoch),
             Some(1),
             "the in-flight entry carries the epoch for correlation"
         );
         // A newer query supersedes epoch 1 before its response lands.
         state.submit_find("newer", &mut step2);
         let current_id = state
-            .request_log
+            .requests
+            .log()
             .last()
             .expect("newer find request issued")
             .id;
@@ -2201,7 +2177,7 @@ mod tests {
 
         let mut step = Step::new();
         state.submit_find("needle", &mut step);
-        let find_id = state.request_log.last().expect("find request issued").id;
+        let find_id = state.requests.log().last().expect("find request issued").id;
         let mut step2 = Step::new();
         state.handle_host_message(
             resp(find_id, &json!({ "Ok": { "matches": [{ "row": 2500, "node_key": "node:2500", "summary": "needle hit" }], "returned": 1, "more": true } })),
@@ -2231,7 +2207,8 @@ mod tests {
         );
         assert_eq!(
             state
-                .request_log
+                .requests
+                .log()
                 .last()
                 .expect("jump window issued")
                 .body
@@ -2242,7 +2219,10 @@ mod tests {
         );
 
         // The jump's window arrives with rows at absolute offsets 2100..2599.
-        let jump_id = state.pending_window_req_id.expect("jump window in flight");
+        let jump_id = state
+            .requests
+            .pending_window()
+            .expect("jump window in flight");
         let rows: Vec<Value> = (2100..2600)
             .map(|i| row(i, &format!("node:{i}"), 1))
             .collect();
@@ -2255,7 +2235,7 @@ mod tests {
             &live_viewport,
             &mut step3,
         );
-        assert!(state.cache.contains_key(&2500), "target row is cached");
+        assert!(state.cache.contains_key(2500), "target row is cached");
         assert_eq!(
             state.pending_find_target, None,
             "jump completes once cached"
@@ -2325,7 +2305,7 @@ mod tests {
 
         let mut step = Step::new();
         state.submit_find("needle", &mut step);
-        let find_id = state.request_log.last().expect("find request issued").id;
+        let find_id = state.requests.log().last().expect("find request issued").id;
         let mut step2 = Step::new();
         state.handle_host_message(
             resp(
@@ -2356,11 +2336,11 @@ mod tests {
         assert_eq!(state.pending_find_target, None, "jump completed in place");
         // The fully-cached post-scroll range issues no extra window request.
         assert_eq!(
-            state.request_log.len(),
+            state.requests.log().len(),
             1,
             "no fetch after an on-cache jump"
         );
-        assert_eq!(state.pending_window_req_id, None);
+        assert_eq!(state.requests.pending_window(), None);
     }
 
     #[test]
@@ -2379,7 +2359,7 @@ mod tests {
         }
         let mut step = Step::new();
         state.submit_find("needle", &mut step);
-        let find_id = state.request_log.last().expect("find request").id;
+        let find_id = state.requests.log().last().expect("find request").id;
         let mut step2 = Step::new();
         state.handle_host_message(
             resp(find_id, &json!({ "Ok": { "matches": [{ "row": 0 }, { "row": 5 }, { "row": 9 }], "returned": 3, "more": false } })),
@@ -2446,7 +2426,7 @@ mod tests {
         };
         let mut step = Step::new();
         state.submit_find("absent term", &mut step);
-        let find_id = state.request_log.last().expect("find request").id;
+        let find_id = state.requests.log().last().expect("find request").id;
         let mut step2 = Step::new();
         state.handle_host_message(
             resp(
@@ -2671,24 +2651,153 @@ mod tests {
             drop(state.cache.insert(i, row(i, &format!("node:{i}"), 1)));
         }
         state.evict_far_windows(&vp());
-        assert!(!state.cache.contains_key(&1500), "far rows evicted");
-        assert!(state.cache.contains_key(&0));
+        assert!(!state.cache.contains_key(1500), "far rows evicted");
+        assert!(state.cache.contains_key(0));
         // Desired cache range bottom is viewport bottom (row 23) + BUFFER 400
         // = absolute 423 (identity mapping); main.js `evictFarWindows` keeps
         // an extra BUFFER margin, so everything beyond 423 + 400 = 823 drops.
         assert!(
-            state.cache.contains_key(&423),
+            state.cache.contains_key(423),
             "the desired-range bottom stays cached"
         );
         assert!(
-            state.cache.contains_key(&823),
+            state.cache.contains_key(823),
             "the eviction BUFFER margin stays cached"
         );
         assert!(
-            !state.cache.contains_key(&824),
+            !state.cache.contains_key(824),
             "rows past the eviction BUFFER margin are evicted"
         );
         assert_eq!(state.cache.len(), 824);
+    }
+
+    #[test]
+    fn paging_skips_large_collapsed_spans_and_retains_visible_rows_first() {
+        let mut state = HistoryAppState {
+            total: Some(50_002),
+            session_flags: SessionFlags {
+                snapshot_established: true,
+                layout_ready: true,
+                ..SessionFlags::default()
+            },
+            sub_op_counts: vec![50_000, 0],
+            ..fixture_state()
+        };
+        state.recompute_expansion();
+        drop(state.cache.insert(0, row(0, "first", 1)));
+        let mut step = Step::new();
+        state.fetch_window(&vp(), &mut step);
+        let pending = state.requests.pending_window().unwrap();
+        let request = state
+            .requests
+            .get(pending)
+            .and_then(|flight| {
+                if let RequestBody::GetWindow(request) = &flight.body {
+                    Some(request)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            request.offset, 50_001,
+            "skip hidden descendants before requesting another page"
+        );
+        assert_eq!(request.limit, 1);
+        state.fetch_window_around(50_001, &mut step);
+        assert_eq!(
+            state.requests.len(),
+            1,
+            "viewport and find share one window owner"
+        );
+        state.handle_host_message(
+            resp(
+                pending,
+                &window_response(50_001, 1, 50_002, Some((2, None))),
+            ),
+            &vp(),
+            &mut step,
+        );
+        assert_eq!(
+            state.requests.pending_window(),
+            None,
+            "no repeated fetches for hidden rows"
+        );
+        assert_eq!(state.requests.log().len(), 1);
+        for hidden in 1..5000 {
+            drop(state.cache.insert(hidden, row(hidden, "hidden", 1)));
+        }
+        state.evict_far_windows(&vp());
+        assert_eq!(state.cache.len(), MAX_CACHED_ROWS);
+        assert!(state.cache.contains_key(0));
+        assert!(
+            state.cache.contains_key(50_001),
+            "visible rows outrank nearby hidden payloads"
+        );
+    }
+
+    #[test]
+    fn forward_and_backward_paging_stays_within_the_cache_budget() {
+        let mut state = HistoryAppState {
+            total: Some(20_000),
+            session_flags: SessionFlags {
+                snapshot_established: true,
+                layout_ready: true,
+                ..SessionFlags::default()
+            },
+            ..fixture_state()
+        };
+        state.recompute_expansion();
+        for (top, height) in [
+            (0_i64, 800),
+            (5000, 800),
+            (10_000, 800),
+            (19_000, 800),
+            (10_000, 800),
+            (5500, 800),
+            (4000, 100_000),
+            (0, 800),
+        ] {
+            let viewport = Viewport::new(top.saturating_mul(ROW_H), height);
+            let mut step = Step::new();
+            state.fetch_window(&viewport, &mut step);
+            for _ in 0..5 {
+                let Some(id) = state.requests.pending_window() else {
+                    break;
+                };
+                let request = state
+                    .requests
+                    .get(id)
+                    .and_then(|flight| {
+                        if let RequestBody::GetWindow(request) = &flight.body {
+                            Some(request)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap();
+                let offset = i64::try_from(request.offset).unwrap();
+                let limit = i64::try_from(request.limit).unwrap();
+                state.handle_host_message(
+                    resp(id, &window_response(offset, limit, 20_000, Some((2, None)))),
+                    &viewport,
+                    &mut step,
+                );
+                assert!(
+                    state.cache.len() <= MAX_CACHED_ROWS,
+                    "published cache at viewport {top}"
+                );
+            }
+            assert_eq!(
+                state.requests.pending_window(),
+                None,
+                "paging converges at viewport {top}"
+            );
+            assert!(
+                state.cache.contains_key(top),
+                "visible content stays cached at {top}"
+            );
+        }
     }
 
     #[test]
@@ -2724,7 +2833,8 @@ mod tests {
         );
         assert_eq!(state.render_bottom, 1423);
         assert_eq!(
-            state.pending_window_req_id, None,
+            state.requests.pending_window(),
+            None,
             "fully-cached window issues no fetch"
         );
     }
@@ -2740,10 +2850,10 @@ mod tests {
             DomOp::ShowMessage { text, error: false } if text == "No history found in this workspace"
         )));
         assert!(
-            state.request_log.is_empty(),
+            state.requests.log().is_empty(),
             "an empty chain never fetches a window"
         );
-        assert_eq!(state.pending_window_req_id, None);
+        assert_eq!(state.requests.pending_window(), None);
 
         let mut state2 = fixture_state();
         let mut step2 = Step::new();
@@ -2761,14 +2871,14 @@ mod tests {
             DomOp::ShowMessage { text, error: true } if text == "Failed to open history: service unavailable"
         )));
         assert!(
-            state2.request_log.is_empty(),
+            state2.requests.log().is_empty(),
             "a failed open never fetches a window"
         );
         assert!(state2.snapshot_id.is_empty());
 
         let mut pending = fixture_state();
         pending.handle_host_message(open_msg(500), &vp(), &mut Step::new());
-        let old_request = pending.pending_window_req_id.unwrap();
+        let old_request = pending.requests.pending_window().unwrap();
         pending.handle_host_message(
             HostMessage::parse(&json!({"id": "open", "body": {"Error": "reopen failed"}})).unwrap(),
             &vp(),
@@ -2784,8 +2894,8 @@ mod tests {
             pending.cache.is_empty(),
             "a late window cannot overwrite an Open error"
         );
-        assert!(pending.in_flight.is_empty());
-        assert!(pending.pending_window_req_id.is_none());
+        assert!(pending.requests.is_empty());
+        assert!(pending.requests.pending_window().is_none());
     }
 
     #[test]
@@ -2796,7 +2906,7 @@ mod tests {
         };
         let mut step = Step::new();
         state.submit_find("q", &mut step);
-        let find_id = state.request_log.last().expect("find request").id;
+        let find_id = state.requests.log().last().expect("find request").id;
         let mut step2 = Step::new();
         state.handle_host_message(
             resp(find_id, &json!({ "Error": "find service error" })),
@@ -2843,7 +2953,7 @@ mod tests {
         }
         let mut step = Step::new();
         state.submit_find("needle", &mut step);
-        let find_id = state.request_log.last().expect("find request").id;
+        let find_id = state.requests.log().last().expect("find request").id;
         let mut step2 = Step::new();
         state.handle_host_message(
             resp(
@@ -2905,7 +3015,7 @@ mod tests {
         assert_eq!(context.selected_key.as_deref(), Some("node:1"));
         assert_eq!(context.roving_abs, Some(3));
         let selected_spec =
-            super::super::rows::RowSpec::from_value(state.cache.get(&1).expect("row 1"), &context);
+            super::super::rows::RowSpec::from_value(state.cache.get(1).expect("row 1"), &context);
         assert!(selected_spec.classes().contains("row-selected"));
         let unselected = state.row_context(2, false);
         assert_eq!(
@@ -2919,7 +3029,7 @@ mod tests {
             "the context carries the roving anchor for every row"
         );
         let unselected_spec = super::super::rows::RowSpec::from_value(
-            state.cache.get(&2).expect("row 2"),
+            state.cache.get(2).expect("row 2"),
             &unselected,
         );
         assert!(
@@ -2931,7 +3041,7 @@ mod tests {
             "only the roving anchor row is tabbable"
         );
         let anchor_spec = super::super::rows::RowSpec::from_value(
-            state.cache.get(&3).expect("row 3"),
+            state.cache.get(3).expect("row 3"),
             &state.row_context(3, false),
         );
         assert_eq!(anchor_spec.aria.tabindex, 0);
@@ -2939,7 +3049,7 @@ mod tests {
         // A settled find match marks the row as find-current.
         let mut step = Step::new();
         state.submit_find("needle", &mut step);
-        let find_id = state.request_log.last().expect("find request").id;
+        let find_id = state.requests.log().last().expect("find request").id;
         let mut step2 = Step::new();
         state.handle_host_message(
             resp(

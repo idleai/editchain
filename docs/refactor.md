@@ -217,6 +217,21 @@ Completed increments:
   invalid limits, and snapshot mismatch. Search remains ephemeral, so existing
   rendered row caches and persisted source bytes do not require a version change.
 
+- Renderer requests and paging: one registry owns request IDs, correlation,
+  and the pending window before any effect can send it. IDs stop at JavaScript's
+  exact integer bound without reuse; reset clears both ownership structures.
+  Correlation envelopes and request diagnostics each retain at most 128 entries,
+  preserving the pending window and latest query. Viewport and find paging share
+  one snapshot-first planner and skip collapsed descendants when choosing the
+  next missing visible row. A sparse cache removes every out-of-range row and
+  enforces a 2,000-row publication limit, prioritizing requested visible rows
+  before prefetch or collapsed payloads. This is a row-count bound; typed content
+  and expansion-state work follow separately. Tests cover 1,000 unanswered
+  requests, ID exhaustion, large collapsed spans, scrolling in both directions,
+  viewport sizes beyond the cache budget, and the existing snapshot/find/layout
+  races. Native renderer tests, WASM clippy, and the browser/host harness pass;
+  generated production WASM assets are included.
+
 Remaining work, in dependency order:
 
 1. Simplify renderer request/cache state and content adapters.
