@@ -1,17 +1,4 @@
-use editchain_core::{
-    clock::Clock,
-    op::{
-        CommandOp, CommandStage, FileEdit, FileOp, FileStage, FrontierSet, ImportOp, MessageOp,
-        NoteOp, NoteRelationship, OpKind, ReflectionOp, ToolOp, ToolStage, WindowRef,
-    },
-    parents::ParentSet,
-    payload::Payload,
-    scope::ScopeRef,
-    tags::Tags,
-    Op,
-};
-
-use serde_json::Value;
+use editchain_core::{Clock, ImportOp, Op, OpKind, ParentSet, ScopeRef, Tags};
 
 use super::envelope::{CcContentBlock, CcEnvelope};
 use crate::error::ImportError;
@@ -151,32 +138,12 @@ fn is_whitespace_only_assistant(env: &CcEnvelope) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`ImportError`] if the complete raw record cannot be stored.
+/// Returns [`ImportError`] if payload storage or legacy lane allocation fails.
 /// No operations from this record are returned on a storage failure.
 ///
-/// # Panics
-///
-/// Panics if the source position overflows — this should never happen
-/// in practice since sequence numbers are bounded by file size.
 #[expect(
     clippy::too_many_arguments,
     reason = "all arguments are required for normalization"
-)]
-#[expect(
-    clippy::unwrap_used,
-    reason = "source positions are always valid — derived from bounded u64/u16 values"
-)]
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "normalized.len() is bounded by content block count (<65536)"
-)]
-#[expect(
-    clippy::as_conversions,
-    reason = "usize to u16 is safe for normalized op count"
-)]
-#[expect(
-    clippy::arithmetic_side_effects,
-    reason = "normalized.len() + 1 is bounded by content block count"
 )]
 pub fn normalize_envelope(
     env: &CcEnvelope,
@@ -189,7 +156,7 @@ pub fn normalize_envelope(
     fallback_session_id: &str,
 ) -> Result<(Op, Vec<Op>), ImportError> {
     let raw_pos = SourcePosition::raw(seq);
-    let op_id = stream.op_from_position(raw_pos).unwrap();
+    let op_id = stream.op_from_position(raw_pos)?;
     let timestamp = parse_source_time(&env.timestamp);
     // `parse_source_time` returns `None` when the source timestamp is absent or
     // unparseable. Keep `Clock::UnixMs(0)` for codec/ordering compatibility but
@@ -260,342 +227,13 @@ pub fn normalize_envelope(
         return Ok((raw_op, vec![]));
     }
 
-    // Normalized ops — use SourcePosition for collision-free ID allocation.
-    let mut normalized = Vec::new();
-
-    match env.record_type.as_str() {
-        "user" => {
-            if let Some(ref msg) = env.message {
-                let has_tool_results = msg
-                    .content
-                    .iter()
-                    .any(|b| matches!(b, CcContentBlock::ToolResult { .. }));
-                let has_text = msg
-                    .content
-                    .iter()
-                    .any(|b| matches!(b, CcContentBlock::Text { .. }));
-
-                if has_tool_results {
-                    for block in &msg.content {
-                        if let CcContentBlock::ToolResult {
-                            tool_use_id,
-                            content,
-                            is_error: _,
-                        } = block
-                        {
-                            let tool_op = Op {
-                                id: stream
-                                    .op_from_position(SourcePosition::derived(
-                                        seq,
-                                        (normalized.len() + 1) as u16,
-                                    ))
-                                    .unwrap(),
-                                parents: ParentSet::One(op_id),
-                                actor,
-                                clock,
-                                scope: ScopeRef::Session(session_id),
-                                tags: Tags::HUMAN | Tags::TOOL,
-                                kind: OpKind::Tool(ToolOp {
-                                    tool_call_id: Payload::Inline(tool_use_id.as_bytes().to_vec()),
-                                    tool_name: Payload::Empty,
-                                    stage: ToolStage::Finish,
-                                    content: Payload::Inline(content.as_bytes().to_vec()),
-                                }),
-                            };
-                            normalized.push(tool_op);
-                        }
-                    }
-                }
-
-                if has_text || !has_tool_results {
-                    let text = extract_text_content(&msg.content);
-                    if !text.is_empty() {
-                        let msg_op = Op {
-                            id: stream
-                                .op_from_position(SourcePosition::derived(
-                                    seq,
-                                    (normalized.len() + 1) as u16,
-                                ))
-                                .unwrap(),
-                            parents: ParentSet::One(op_id),
-                            actor,
-                            clock,
-                            scope: ScopeRef::Session(session_id),
-                            tags: Tags::HUMAN | Tags::MESSAGE,
-                            kind: OpKind::Message(MessageOp {
-                                content: Payload::Inline(text.as_bytes().to_vec()),
-                                content_type: Payload::Inline(b"text/markdown".to_vec()),
-                            }),
-                        };
-                        normalized.push(msg_op);
-                    }
-                }
-            }
-        }
-
-        "assistant" => {
-            if let Some(ref msg) = env.message {
-                for block in &msg.content {
-                    match block {
-                        CcContentBlock::Text { text } if !text.trim().is_empty() => {
-                            let msg_op = Op {
-                                id: stream
-                                    .op_from_position(SourcePosition::derived(
-                                        seq,
-                                        (normalized.len() + 1) as u16,
-                                    ))
-                                    .unwrap(),
-                                parents: ParentSet::One(op_id),
-                                actor,
-                                clock,
-                                scope: ScopeRef::Session(session_id),
-                                tags: Tags::AGENT | Tags::MESSAGE,
-                                kind: OpKind::Message(MessageOp {
-                                    content: Payload::Inline(text.as_bytes().to_vec()),
-                                    content_type: Payload::Inline(b"text/markdown".to_vec()),
-                                }),
-                            };
-                            normalized.push(msg_op);
-                        }
-                        CcContentBlock::ToolUse { id, name, input } => {
-                            let input_str = serde_json::to_string(input).unwrap_or_default();
-                            let tool_op = Op {
-                                id: stream
-                                    .op_from_position(SourcePosition::derived(
-                                        seq,
-                                        (normalized.len() + 1) as u16,
-                                    ))
-                                    .unwrap(),
-                                parents: ParentSet::One(op_id),
-                                actor,
-                                clock,
-                                scope: ScopeRef::Session(session_id),
-                                tags: Tags::AGENT | Tags::TOOL,
-                                kind: OpKind::Tool(ToolOp {
-                                    tool_call_id: Payload::Inline(id.as_bytes().to_vec()),
-                                    tool_name: Payload::Inline(name.as_bytes().to_vec()),
-                                    stage: ToolStage::Start,
-                                    content: Payload::Inline(input_str.as_bytes().to_vec()),
-                                }),
-                            };
-                            normalized.push(tool_op);
-
-                            if name == "Bash" || name == "PowerShell" {
-                                let cmd =
-                                    input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-                                let cmd_op = Op {
-                                    id: stream
-                                        .op_from_position(SourcePosition::derived(
-                                            seq,
-                                            (normalized.len() + 1) as u16,
-                                        ))
-                                        .unwrap(),
-                                    parents: ParentSet::One(op_id),
-                                    actor,
-                                    clock,
-                                    scope: ScopeRef::Session(session_id),
-                                    tags: Tags::AGENT | Tags::COMMAND,
-                                    kind: OpKind::Command(CommandOp {
-                                        command_id: Payload::Inline(id.as_bytes().to_vec()),
-                                        content: Payload::Inline(cmd.as_bytes().to_vec()),
-                                        stage: CommandStage::Start,
-                                    }),
-                                };
-                                normalized.push(cmd_op);
-                            }
-                        }
-                        CcContentBlock::Thinking { thinking, .. }
-                            if options.include_thinking && !thinking.trim().is_empty() =>
-                        {
-                            let thinking_op = Op {
-                                id: stream
-                                    .op_from_position(SourcePosition::derived(
-                                        seq,
-                                        (normalized.len() + 1) as u16,
-                                    ))
-                                    .unwrap(),
-                                parents: ParentSet::One(op_id),
-                                actor,
-                                clock,
-                                scope: ScopeRef::Session(session_id),
-                                tags: Tags::PRIVATE | Tags::MESSAGE,
-                                kind: OpKind::Message(MessageOp {
-                                    content: Payload::Inline(thinking.as_bytes().to_vec()),
-                                    content_type: Payload::Inline(b"text/markdown".to_vec()),
-                                }),
-                            };
-                            normalized.push(thinking_op);
-                        }
-                        CcContentBlock::Text { .. }
-                        | CcContentBlock::ToolResult { .. }
-                        | CcContentBlock::Thinking { .. } => {}
-                    }
-                }
-            }
-        }
-
-        "attachment" => {
-            // File-content attachments surface file contents into the transcript.
-            if env.attachment_type == "file" || env.attachment_type == "file_content" {
-                let file_op = Op {
-                    id: stream
-                        .op_from_position(SourcePosition::derived(
-                            seq,
-                            (normalized.len() + 1) as u16,
-                        ))
-                        .unwrap(),
-                    parents: ParentSet::One(op_id),
-                    actor,
-                    clock,
-                    scope: ScopeRef::Session(session_id),
-                    tags: Tags::FILE | Tags::IMPORT,
-                    kind: OpKind::File(FileOp {
-                        path: crate::ids::derive_path_id(""),
-                        stage: FileStage::Observed,
-                        base: None,
-                        after: None,
-                        edit: FileEdit::None,
-                    }),
-                };
-                normalized.push(file_op);
-            }
-            // IDE/file-context attachments carry a filename worth recording.
-            if matches!(
-                env.attachment_type.as_str(),
-                "opened_file_in_ide"
-                    | "selected_lines_in_ide"
-                    | "already_read_file"
-                    | "plan_mode_reentry"
-            ) {
-                let note_op = Op {
-                    id: stream
-                        .op_from_position(SourcePosition::derived(
-                            seq,
-                            (normalized.len() + 1) as u16,
-                        ))
-                        .unwrap(),
-                    parents: ParentSet::One(op_id),
-                    actor,
-                    clock,
-                    scope: ScopeRef::Session(session_id),
-                    tags: Tags::FILE | Tags::IMPORT | Tags::NOTE,
-                    kind: OpKind::Note(NoteOp {
-                        target_ids: Vec::new(),
-                        relationship: NoteRelationship::Explains,
-                        content: Payload::Inline(
-                            format!("attachment={}", env.attachment_type).into_bytes(),
-                        ),
-                    }),
-                };
-                normalized.push(note_op);
-            }
-        }
-
-        "system" => match env.subtype.as_str() {
-            "compact_boundary" | "away_summary" => {
-                let reflection_op = Op {
-                    id: stream
-                        .op_from_position(SourcePosition::derived(
-                            seq,
-                            (normalized.len() + 1) as u16,
-                        ))
-                        .unwrap(),
-                    parents: ParentSet::One(op_id),
-                    actor,
-                    clock,
-                    scope: ScopeRef::Session(session_id),
-                    tags: Tags::REFLECTION | Tags::IMPORT,
-                    kind: OpKind::Reflection(ReflectionOp {
-                        scope: ScopeRef::Session(session_id),
-                        covers: FrontierSet(Vec::new()),
-                        window: WindowRef {
-                            start_seq: 0,
-                            end_seq: 0,
-                        },
-                        summary: Payload::Empty,
-                        anchors: Payload::Empty,
-                    }),
-                };
-                normalized.push(reflection_op);
-            }
-            // API errors and informational system events carry prose worth keeping.
-            "api_error" | "informational" => {
-                if let Some(err) = &env.error {
-                    let text = err.get("message").and_then(Value::as_str).unwrap_or("");
-                    if !text.is_empty() {
-                        let note_op = Op {
-                            id: stream
-                                .op_from_position(SourcePosition::derived(
-                                    seq,
-                                    (normalized.len() + 1) as u16,
-                                ))
-                                .unwrap(),
-                            parents: ParentSet::One(op_id),
-                            actor,
-                            clock,
-                            scope: ScopeRef::Session(session_id),
-                            tags: Tags::ERROR | Tags::IMPORT,
-                            kind: OpKind::Note(NoteOp {
-                                target_ids: Vec::new(),
-                                relationship: NoteRelationship::Explains,
-                                content: Payload::Inline(text.as_bytes().to_vec()),
-                            }),
-                        };
-                        normalized.push(note_op);
-                    }
-                }
-            }
-            _ => {}
-        },
-
-        // Mode changes (e.g. normal/plan) — record as a note.
-        "mode" => {
-            if !env.mode.is_empty() {
-                let note_op = Op {
-                    id: stream
-                        .op_from_position(SourcePosition::derived(
-                            seq,
-                            (normalized.len() + 1) as u16,
-                        ))
-                        .unwrap(),
-                    parents: ParentSet::One(op_id),
-                    actor,
-                    clock,
-                    scope: ScopeRef::Session(session_id),
-                    tags: Tags::IMPORT | Tags::NOTE,
-                    kind: OpKind::Note(NoteOp {
-                        target_ids: Vec::new(),
-                        relationship: NoteRelationship::Explains,
-                        content: Payload::Inline(format!("mode={}", env.mode).into_bytes()),
-                    }),
-                };
-                normalized.push(note_op);
-            }
-        }
-
-        // AI-generated session titles — record as a note.
-        "ai-title" if !env.ai_title.is_empty() => {
-            let note_op = Op {
-                id: stream
-                    .op_from_position(SourcePosition::derived(seq, (normalized.len() + 1) as u16))
-                    .unwrap(),
-                parents: ParentSet::One(op_id),
-                actor,
-                clock,
-                scope: ScopeRef::Session(session_id),
-                tags: Tags::IMPORT | Tags::NOTE,
-                kind: OpKind::Note(NoteOp {
-                    target_ids: Vec::new(),
-                    relationship: NoteRelationship::Explains,
-                    content: Payload::Inline(env.ai_title.as_bytes().to_vec()),
-                }),
-            };
-            normalized.push(note_op);
-        }
-
-        _ => {}
-    }
-
+    let normalized = super::content::normalize_content(
+        env,
+        &raw_op,
+        options.include_thinking,
+        super::content::Contract::Legacy,
+        blobs,
+    )?;
     Ok((raw_op, normalized))
 }
 
@@ -615,18 +253,6 @@ impl Default for NormalizeOptions {
             include_thinking: false,
         }
     }
-}
-
-fn extract_text_content(blocks: &[CcContentBlock]) -> String {
-    blocks
-        .iter()
-        .filter_map(|b| match b {
-            CcContentBlock::Text { text } => Some(text.clone()),
-            CcContentBlock::ToolUse { .. }
-            | CcContentBlock::ToolResult { .. }
-            | CcContentBlock::Thinking { .. } => None,
-        })
-        .collect()
 }
 
 /// Parse a timestamp string into Unix milliseconds.

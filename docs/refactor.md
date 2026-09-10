@@ -170,10 +170,24 @@ Completed increments:
   Regressions cover two-file limit failure, exact retry, duplicate admission at
   capacity, conflict retention, and truncated or corrupted existing blobs.
 
+- Claude materialization: the named `claude-blocks-v1` contract assigns content
+  slots independently of preceding output counts. Reasoning backfill preserves
+  public IDs and bytes; raw-only gaps trigger both content and relationship
+  replay. Complete per-record manifests select the displayed replacement while
+  all legacy operations remain stored. Both providers use the same manifest
+  validation and coverage rules. The shared Claude content builder retains the
+  legacy representation for compatibility callers and checks lane exhaustion.
+  New derived payloads use the shared fallible 4096-byte spill policy. The unused
+  inline-size option was removed because changing representation requires an
+  explicit derivation version. Malformed Claude raw records retain their legacy
+  inline encoding under the existing source and admission bounds. Revision 54
+  invalidates earlier projection caches. Regressions cover reasoning replay,
+  append boundaries, raw-only gaps, failed derived blob writes, legacy and
+  incomplete replacements, and content beyond the old 16-bit lane capacity.
+
 Remaining work, in dependency order:
 
-1. Finish shared capture/payload replay policy and Claude materialization;
-   preserve compatibility with existing normalized records.
+1. Finish moving provider Git metadata onto the repository catalog.
 2. Simplify search document identity and renderer request/cache state.
 3. Retire migrated compatibility machinery and optimize measured repeated work.
 

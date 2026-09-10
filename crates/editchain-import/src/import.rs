@@ -1,10 +1,8 @@
 //! Main import orchestrator — ties together discovery, reading, and normalization.
 
-use editchain_core::Op;
-
 use crate::claude_code::discover::discover_sessions;
 use crate::claude_code::envelope::parse_envelope;
-use crate::claude_code::normalize::{normalize_envelope, NormalizeOptions};
+use crate::claude_code::materialize::{raw_record, record_outputs, CONTRACT};
 use crate::claude_code::topology::{
     occurrence_fingerprint_fact, relation_facts_for_envelope, spawn_fact,
     CLAUDE_NORMALIZATION_VERSION,
@@ -13,7 +11,9 @@ use crate::cursor::resolve_source_cursor;
 use crate::error::ImportError;
 use crate::ids::{derive_session_id, SourcePosition, SourceStream};
 use crate::model::{DiscoveryRequest, ImportOptions, ImportReport};
-use crate::sink::{emit_op, BlobSink, CursorStore, EmissionKind, OpSink};
+use crate::sink::{
+    emit_op, BlobSink, CursorStore, EmissionKind, MaterializationCheckpoint, OpSink,
+};
 use crate::source_read::{SourceReadPlan, SourceReadState};
 
 /// Version that first emitted the complete provider topology. Version-2
@@ -93,9 +93,17 @@ pub fn import_claude_code(
             cursors.get_reservation(&cursor_key)?.as_ref(),
             &options.source_control(),
         )?;
+        let needs_materialization_replay = options.normalize
+            && MaterializationCheckpoint::needs_replay(
+                plan.checkpoint().materialization.as_ref(),
+                CONTRACT,
+                options.include_thinking,
+                plan.start_seq(),
+            )?;
         if plan.state() == SourceReadState::Unchanged
             && !needs_topology_upgrade
             && !needs_cursor_upgrade
+            && !needs_materialization_replay
         {
             continue;
         }
@@ -118,60 +126,52 @@ pub fn import_claude_code(
         // relocation never changes existing operation IDs.
         let stream = SourceStream::new(source_node, boot);
 
-        let norm_opts = NormalizeOptions {
-            normalize: options.normalize,
-            include_thinking: options.include_thinking,
-        };
-
-        // Chain raw import ops into a single linear chain per session file: each
-        // line's raw op parents to the previous physical occurrence, including
-        // across cursor boundaries. Provider parentage remains a separate typed
-        // relation emitted below.
-        let mut prev_raw_id = if start_seq > 0 {
-            Some(stream.op_from_position(SourcePosition::raw(start_seq))?)
-        } else {
-            None
-        };
-        for (i, line) in lines.iter().enumerate() {
+        let replay_lines = (needs_materialization_replay && start_seq > 0)
+            .then(|| plan.all_lines())
+            .transpose()?;
+        let content_lines = replay_lines.as_deref().unwrap_or(lines);
+        let content_start = if replay_lines.is_some() { 0 } else { start_seq };
+        for (index, line) in content_lines.iter().enumerate() {
             options.cancellation.check(&session.path)?;
-            let seq = start_seq + i as u64 + 1;
-
-            // Parse envelope for normalization.
-            let env = parse_envelope(&line.data);
-
-            if let Some(ref envelope) = env {
-                let (mut raw_op, normalized_ops) = normalize_envelope(
-                    envelope,
+            let seq = content_start
+                .checked_add(u64::try_from(index).map_err(std::io::Error::other)?)
+                .and_then(|ordinal| ordinal.checked_add(1))
+                .ok_or_else(|| {
+                    ImportError::CursorStore("Claude record ordinal exhausted".into())
+                })?;
+            let envelope = parse_envelope(&line.data);
+            let raw = raw_record(
+                envelope.as_ref(),
+                line,
+                stream.op_from_position(SourcePosition::raw(seq))?,
+                &session.session_id,
+                blobs,
+            )?;
+            let derived = if options.normalize {
+                record_outputs(
+                    envelope.as_ref(),
+                    &raw,
                     line.hash,
-                    &line.data,
-                    &stream,
-                    seq,
-                    &norm_opts,
+                    options.include_thinking,
                     blobs,
-                    &session.session_id,
-                )?;
-
-                // Chain this raw op to the previous line's raw op.
-                if let Some(prev) = prev_raw_id {
-                    raw_op.parents = editchain_core::parents::ParentSet::One(prev);
-                }
-
-                // Emit raw import op.
-                emit_op(&raw_op, ops, &mut report, EmissionKind::Raw)?;
-                prev_raw_id = Some(raw_op.id);
-
-                // Emit normalized ops.
-                for norm_op in &normalized_ops {
-                    emit_op(norm_op, ops, &mut report, EmissionKind::Derived)?;
-                }
-
-                // Current-version incremental/fresh import: emit exact provider
-                // facts for this batch directly from the parsed envelope. A
-                // pre-v2 upgrade replays complete topology below; a v2 upgrade
-                // still emits complete facts for newly appended records while
-                // historical records receive only the collision-free
-                // fingerprint supplement.
-                if options.normalize && (!needs_full_topology_replay || topology_replay.is_none()) {
+                )?
+            } else {
+                Vec::new()
+            };
+            if seq > start_seq {
+                emit_op(&raw, ops, &mut report, EmissionKind::Raw)?;
+                report.malformed = report
+                    .malformed
+                    .saturating_add(usize::from(envelope.is_none()));
+            }
+            for op in &derived {
+                emit_op(op, ops, &mut report, EmissionKind::Derived)?;
+            }
+            if seq > start_seq
+                && options.normalize
+                && (!needs_full_topology_replay || topology_replay.is_none())
+            {
+                if let Some(envelope) = &envelope {
                     for fact in relation_facts_for_envelope(
                         envelope,
                         &line.data,
@@ -182,28 +182,6 @@ pub fn import_claude_code(
                         emit_op(&fact, ops, &mut report, EmissionKind::Derived)?;
                     }
                 }
-            } else {
-                // Unparseable line — still emit as raw ImportOp, chained to the
-                // previous line's raw op using the same ID scheme (seq << 16).
-                let op_id = stream.op_from_position(SourcePosition::raw(seq))?;
-                let mut raw_op = Op {
-                    id: op_id,
-                    parents: editchain_core::parents::ParentSet::None,
-                    actor: editchain_core::ActorId(0),
-                    clock: editchain_core::clock::Clock::None,
-                    scope: editchain_core::scope::ScopeRef::None,
-                    tags: editchain_core::tags::Tags::IMPORT | editchain_core::tags::Tags::ERROR,
-                    kind: editchain_core::op::OpKind::Import(editchain_core::op::ImportOp {
-                        raw_ref: editchain_core::payload::Payload::Inline(line.data.clone()),
-                        raw_hash: Some(line.hash),
-                    }),
-                };
-                if let Some(prev) = prev_raw_id {
-                    raw_op.parents = editchain_core::parents::ParentSet::One(prev);
-                }
-                emit_op(&raw_op, ops, &mut report, EmissionKind::Raw)?;
-                report.malformed += 1;
-                prev_raw_id = Some(op_id);
             }
         }
 
@@ -272,9 +250,19 @@ pub fn import_claude_code(
                 }
             }
 
+            new_cursor.materialization = Some(MaterializationCheckpoint {
+                contract: CONTRACT.to_owned(),
+                through: new_cursor.ops_emitted,
+                includes_thinking: options.include_thinking,
+            });
             new_cursor.normalization_version = new_cursor
                 .normalization_version
                 .max(CLAUDE_NORMALIZATION_VERSION);
+        }
+        if !options.normalize && new_cursor.ops_emitted > start_seq {
+            // The metadata version no longer covers the full accepted raw
+            // prefix. Replaying exact facts fills this gap on normalization.
+            new_cursor.normalization_version = 0;
         }
         new_cursor.source_node = Some(source_node);
         new_cursor.content_hash_version = 1;

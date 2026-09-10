@@ -22,8 +22,6 @@ pub struct ImportOptions {
     pub normalize: bool,
     /// Whether to include thinking content (default: false — private).
     pub include_thinking: bool,
-    /// Maximum inline payload size before spilling to blob storage.
-    pub max_inline_bytes: usize,
     /// Bounds on captured sources and individual physical records.
     pub source_limits: crate::source_read::SourceReadLimits,
     /// Bounds on helper output and elapsed execution time.
@@ -39,7 +37,6 @@ impl Default for ImportOptions {
         Self {
             normalize: true,
             include_thinking: false,
-            max_inline_bytes: 4096,
             source_limits: crate::source_read::SourceReadLimits::default(),
             helper_limits: crate::codex::helper::HelperLimits::default(),
             batch_limits: crate::sink::BatchLimits::default(),

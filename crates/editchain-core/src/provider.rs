@@ -40,6 +40,28 @@ pub enum ProviderFact {
     CodexLifecycle(CodexLifecycleEvidence),
     /// Versioned semantic materialization of one complete physical record.
     CodexDerivation(CodexDerivationEvidence),
+    /// Versioned content-block materialization of one Claude physical record.
+    ClaudeDerivation(ClaudeDerivationEvidence),
+}
+
+/// Named Claude content derivation contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClaudeDerivationContract {
+    /// Stable block slots, bounded payloads, and explicit reasoning backfill.
+    #[serde(rename = "claude-blocks-v1")]
+    BlocksV1,
+}
+
+/// Complete materialized outputs from one Claude physical occurrence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClaudeDerivationEvidence {
+    /// Named derivation semantics and payload representation.
+    pub contract: ClaudeDerivationContract,
+    /// Whether requested private reasoning is included.
+    pub includes_thinking: bool,
+    /// Complete operation set in provider content order.
+    pub outputs: Vec<OpId>,
 }
 
 /// Named semantic derivation contract, independent of metadata migrations.

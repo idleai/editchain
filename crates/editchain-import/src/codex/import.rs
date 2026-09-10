@@ -177,8 +177,9 @@ pub fn import_codex(
                     || cursor.accepted_generation.is_none()
             });
         let needs_materialization_replay = options.normalize
-            && super::materialize::needs_replay(
+            && crate::sink::MaterializationCheckpoint::needs_replay(
                 plan.checkpoint().materialization.as_ref(),
+                super::materialize::CONTRACT,
                 options.include_thinking,
                 plan.start_seq(),
             )?;
@@ -455,6 +456,11 @@ pub fn import_codex(
             if let Some(title) = session_title {
                 new_cursor.session_title_hash = Some(title.source_hash);
             }
+        }
+        if !options.normalize && new_cursor.ops_emitted > start_seq {
+            // The metadata version no longer covers the full accepted raw
+            // prefix. Replaying exact facts fills this gap on normalization.
+            new_cursor.normalization_version = 0;
         }
         new_cursor.source_node = Some(source_node);
         new_cursor.content_hash_version = 1;

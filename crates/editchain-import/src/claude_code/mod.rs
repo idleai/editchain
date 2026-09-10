@@ -1,9 +1,11 @@
 //! Claude Code session import — discover, read, parse, and normalize.
 
+mod content;
 /// Session file discovery in the Claude Code data directory.
 pub mod discover;
 /// Envelope parsing for Claude Code JSONL records.
 pub mod envelope;
+pub(crate) mod materialize;
 /// Normalization of envelopes into editchain operations.
 pub mod normalize;
 /// Streaming reader for session files.

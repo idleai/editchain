@@ -3,7 +3,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use editchain_core::provider::{
-    CodexDerivationEvidence, CodexLogicalChange, CodexThreadId, ProviderFact,
+    ClaudeDerivationEvidence, CodexDerivationEvidence, CodexLogicalChange, CodexThreadId,
+    ProviderFact,
 };
 use editchain_core::{Op, OpId, OpKind, ParentSet};
 
@@ -29,6 +30,36 @@ pub struct CodexLogicalItem {
 type SourceKey = (u64, u32);
 type LogicalTurns = BTreeMap<String, BTreeMap<String, CodexLogicalItem>>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Derivation<'a> {
+    Codex(&'a CodexDerivationEvidence),
+    Claude(&'a ClaudeDerivationEvidence),
+}
+
+impl<'a> Derivation<'a> {
+    fn from_fact(fact: &'a ProviderFact) -> Option<Self> {
+        match fact {
+            ProviderFact::CodexDerivation(meta) => Some(Self::Codex(meta)),
+            ProviderFact::ClaudeDerivation(meta) => Some(Self::Claude(meta)),
+            ProviderFact::CodexSource(_) | ProviderFact::CodexLifecycle(_) => None,
+        }
+    }
+
+    fn outputs(self) -> &'a [OpId] {
+        match self {
+            Self::Codex(meta) => &meta.outputs,
+            Self::Claude(meta) => &meta.outputs,
+        }
+    }
+
+    fn includes_thinking(self) -> bool {
+        match self {
+            Self::Codex(meta) => meta.includes_thinking,
+            Self::Claude(meta) => meta.includes_thinking,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct Materialization {
     pub(super) hidden: HashSet<OpId>,
@@ -43,13 +74,12 @@ impl Materialization {
         let records: Vec<_> = ops.iter().filter_map(decode_evidence).collect();
         let mut by_source: BTreeMap<OpId, Vec<&EvidenceRecord<'_>>> = BTreeMap::new();
         for record in &records {
-            if let ProviderFact::CodexDerivation(_) = &record.payload.fact {
-                if valid_source(record, &by_id) {
-                    by_source
-                        .entry(record.payload.source)
-                        .or_default()
-                        .push(record);
-                }
+            if Derivation::from_fact(&record.payload.fact).is_some() && valid_source(record, &by_id)
+            {
+                by_source
+                    .entry(record.payload.source)
+                    .or_default()
+                    .push(record);
             }
         }
         let mut result = Self::default();
@@ -57,17 +87,19 @@ impl Materialization {
         let mut blocked = HashSet::new();
         for (source, records) in &by_source {
             result.track_outputs(*source, records, &by_id);
-            let selected = select(records).filter(|meta| complete_outputs(meta, *source, &by_id));
+            let selected = select(records).filter(|meta| complete_outputs(*meta, *source, &by_id));
             if let Some(meta) = selected {
-                for (index, output) in meta.outputs.iter().enumerate() {
+                for (index, output) in meta.outputs().iter().enumerate() {
                     let _: bool = result.hidden.remove(output);
                     let _: Option<usize> = result.output_order.insert(*output, index);
                 }
-                apply_changes(
-                    logical.entry(source_key(*source)).or_default(),
-                    *source,
-                    meta,
-                );
+                if let Derivation::Codex(meta) = meta {
+                    apply_changes(
+                        logical.entry(source_key(*source)).or_default(),
+                        *source,
+                        meta,
+                    );
+                }
             } else {
                 let _: bool = blocked.insert(source_key(*source));
             }
@@ -105,9 +137,9 @@ impl Materialization {
         by_id: &HashMap<OpId, &Op>,
     ) {
         for record in records {
-            if let ProviderFact::CodexDerivation(meta) = &record.payload.fact {
-                let outputs = meta.outputs.iter().copied().collect();
-                for output in &meta.outputs {
+            if let Some(meta) = Derivation::from_fact(&record.payload.fact) {
+                let outputs = meta.outputs().iter().copied().collect();
+                for output in meta.outputs() {
                     if !reaches_source(*output, source, &outputs, by_id) {
                         continue;
                     }
@@ -158,33 +190,30 @@ fn valid_source(record: &EvidenceRecord<'_>, by_id: &HashMap<OpId, &Op>) -> bool
     })
 }
 
-fn select<'a>(records: &[&'a EvidenceRecord<'_>]) -> Option<&'a CodexDerivationEvidence> {
+fn select<'a>(records: &[&'a EvidenceRecord<'_>]) -> Option<Derivation<'a>> {
     let candidates: Vec<_> = records
         .iter()
-        .filter_map(|record| match &record.payload.fact {
-            ProviderFact::CodexDerivation(meta) => Some(meta),
-            ProviderFact::CodexSource(_) | ProviderFact::CodexLifecycle(_) => None,
-        })
+        .filter_map(|record| Derivation::from_fact(&record.payload.fact))
         .collect();
-    // Turning capture off cannot erase already captured reasoning. A later
-    // request to include it backfills the same occurrence contract and adds
-    // only that item's outputs; sibling operation identities stay unchanged.
-    let includes_thinking = candidates.iter().any(|meta| meta.includes_thinking);
+    let first = candidates.first()?;
+    if candidates
+        .iter()
+        .any(|candidate| std::mem::discriminant(candidate) != std::mem::discriminant(first))
+    {
+        return None;
+    }
+    // Disabling capture cannot erase already captured reasoning.
+    let includes_thinking = candidates.iter().any(|meta| meta.includes_thinking());
     let mut eligible = candidates
         .into_iter()
-        .filter(|meta| meta.includes_thinking == includes_thinking);
+        .filter(|meta| meta.includes_thinking() == includes_thinking);
     let first = eligible.next()?;
     eligible.all(|meta| meta == first).then_some(first)
 }
 
-fn complete_outputs(
-    meta: &CodexDerivationEvidence,
-    source: OpId,
-    by_id: &HashMap<OpId, &Op>,
-) -> bool {
-    let outputs: HashSet<OpId> = meta.outputs.iter().copied().collect();
-    if meta.thread.0.is_empty() || outputs.len() != meta.outputs.len() || outputs.contains(&source)
-    {
+fn complete_outputs(meta: Derivation<'_>, source: OpId, by_id: &HashMap<OpId, &Op>) -> bool {
+    let outputs: HashSet<OpId> = meta.outputs().iter().copied().collect();
+    if outputs.len() != meta.outputs().len() || outputs.contains(&source) {
         return false;
     }
     if !outputs
@@ -193,6 +222,20 @@ fn complete_outputs(
     {
         return false;
     }
+    match meta {
+        Derivation::Claude(_) => true,
+        Derivation::Codex(meta) => {
+            !meta.thread.0.is_empty() && valid_changes(meta, source, &outputs, by_id)
+        }
+    }
+}
+
+fn valid_changes(
+    meta: &CodexDerivationEvidence,
+    source: OpId,
+    outputs: &HashSet<OpId>,
+    by_id: &HashMap<OpId, &Op>,
+) -> bool {
     meta.changes.iter().all(|change| match change {
         CodexLogicalChange::RemoveTurn { turn } => !turn.is_empty(),
         CodexLogicalChange::Upsert {

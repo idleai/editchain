@@ -78,7 +78,8 @@ pub trait BlobSink {
     }
 }
 
-/// Inline payload threshold — payloads above this size are spilled to blobs.
+/// Inline payload threshold in the current stored representation contract.
+/// Changing this value requires versioning operation materialization.
 pub const INLINE_LIMIT: usize = 4096;
 
 /// Choose between inline and blob storage based on payload size.
@@ -182,6 +183,26 @@ pub struct MaterializationCheckpoint {
     pub through: u64,
     /// Whether private reasoning has been captured through the accepted prefix.
     pub includes_thinking: bool,
+}
+
+impl MaterializationCheckpoint {
+    pub(crate) fn needs_replay(
+        checkpoint: Option<&Self>,
+        contract: &str,
+        includes_thinking: bool,
+        accepted_records: u64,
+    ) -> Result<bool, ImportError> {
+        match checkpoint {
+            None => Ok(true),
+            Some(checkpoint) if checkpoint.contract == contract => Ok(checkpoint.through
+                < accepted_records
+                || (includes_thinking && !checkpoint.includes_thinking)),
+            Some(checkpoint) => Err(ImportError::CursorStore(format!(
+                "unsupported materialization contract {}",
+                checkpoint.contract
+            ))),
+        }
+    }
 }
 
 /// A cursor value representing how far we've read in a source file.

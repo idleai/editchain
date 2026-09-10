@@ -16,28 +16,11 @@ use super::normalize::{
 };
 use super::projection::{CompactedLine, FinalItem, InterAgentLine, Projection, TurnMeta};
 use crate::ids::{derive_node_id, SourcePosition, SourceStream};
-use crate::sink::{emit_op, EmissionKind, MaterializationCheckpoint, OpSink};
+use crate::sink::{emit_op, EmissionKind, OpSink};
 use crate::source_read::SourceReadPlan;
 use crate::ImportError;
 
 pub(super) const CONTRACT: &str = "codex-occurrences-v1";
-
-pub(super) fn needs_replay(
-    checkpoint: Option<&MaterializationCheckpoint>,
-    includes_thinking: bool,
-    accepted_records: u64,
-) -> Result<bool, ImportError> {
-    match checkpoint {
-        None => Ok(true),
-        Some(checkpoint) if checkpoint.contract == CONTRACT => Ok(checkpoint.through
-            < accepted_records
-            || (includes_thinking && !checkpoint.includes_thinking)),
-        Some(checkpoint) => Err(ImportError::CursorStore(format!(
-            "unsupported Codex materialization contract {}",
-            checkpoint.contract
-        ))),
-    }
-}
 
 #[derive(Debug, Default)]
 struct RecordProjection<'a> {

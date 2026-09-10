@@ -1934,7 +1934,6 @@ fn reasoning_is_private_and_respects_include_thinking() {
         &ImportOptions {
             normalize: true,
             include_thinking: false,
-            max_inline_bytes: 4096,
             ..ImportOptions::default()
         },
     );
@@ -1949,7 +1948,6 @@ fn reasoning_is_private_and_respects_include_thinking() {
         &ImportOptions {
             normalize: true,
             include_thinking: true,
-            max_inline_bytes: 4096,
             ..ImportOptions::default()
         },
     );
@@ -2006,7 +2004,6 @@ fn kinds_map_full_content_to_neutral_ops() {
         &ImportOptions {
             normalize: true,
             include_thinking: true,
-            max_inline_bytes: 4096,
             ..ImportOptions::default()
         },
     );
