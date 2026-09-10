@@ -396,6 +396,14 @@ retirement semantics. Root-level exports retain the existing Rust API and the
 service executable keeps its name. Existing snapshot, refresh, search, detail,
 and import regressions pass with the full lint suite.
 
+History backend modules now separate workspace lifetime/source guards from
+payload hydration, bounded legacy previews, file-change discovery and diff
+materialization, session provenance, node details, and Activity row presentation.
+The workspace module fell from 4,584 to 784 physical lines. Existing production
+and unit-test function bodies retain identical Rust tokens; only imports,
+module placement, and visibility within the backend changed. The full lint
+suite passes with the existing snapshot, preview, file-diff, and row contracts.
+
 The planned refactor increments are complete. EC02 and historical operations
 remain readable; the documented protocol, repository-qualified row keys, and
 pre-1.0 Rust API changes require coordinated consumers. Compatibility readers
