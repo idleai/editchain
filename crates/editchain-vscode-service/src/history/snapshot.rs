@@ -15,7 +15,7 @@ use editchain_git::RepositoryDiscovery;
 use editchain_protocol::{ExpansionSpanDto, HistoryRow, HistoryWindow, SnapshotId};
 use serde::{Deserialize, Serialize};
 
-use crate::{hash_raw, hex_string, OpRecordLocation, OpenDiagnostics, SnapshotOpLocator};
+use super::{hash_raw, hex_string, OpRecordLocation, OpenDiagnostics, SnapshotOpLocator};
 
 /// On-disk schema for the immutable render snapshot.
 pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;

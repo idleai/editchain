@@ -164,7 +164,7 @@ pub fn run(
         } else {
             std::env::current_dir()?.join(&chain_path)
         };
-        let snapshot = editchain_vscode_service::prepare_render_snapshot(
+        let snapshot = editchain_vscode_service::history::prepare_render_snapshot(
             &workspace_path,
             &snapshot_chain_path,
         );

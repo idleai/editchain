@@ -386,6 +386,16 @@ protocol are unchanged. The full lint suite and shared-store reader/writer
 contracts pass, including missing directories, corrupt bytes, unsupported
 addresses, preview limits, and idempotent writes.
 
+The shared native backend is now exposed under
+`editchain_vscode_service::history`; CLI imports and `prepare-view` call this
+namespace directly. A separate transport module owns framed-request dispatch.
+It uses backend methods and read accessors rather than reaching into private
+workspace fields. Explicit refresh identity generation belongs to
+`Workspace::refresh`, so native callers receive the same cache-bypass and token
+retirement semantics. Root-level exports retain the existing Rust API and the
+service executable keeps its name. Existing snapshot, refresh, search, detail,
+and import regressions pass with the full lint suite.
+
 The planned refactor increments are complete. EC02 and historical operations
 remain readable; the documented protocol, repository-qualified row keys, and
 pre-1.0 Rust API changes require coordinated consumers. Compatibility readers

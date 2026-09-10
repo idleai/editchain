@@ -14,7 +14,7 @@ use std::path::PathBuf;
     reason = "CLI command consumes paths and reports the generated artifact"
 )]
 pub fn run(workspace: PathBuf, chain: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let report = editchain_vscode_service::prepare_render_snapshot(&workspace, &chain)?;
+    let report = editchain_vscode_service::history::prepare_render_snapshot(&workspace, &chain)?;
     println!(
         "Render snapshot {}: {} rows ({} top-level), {} bytes at {}",
         if report.reused { "reused" } else { "generated" },

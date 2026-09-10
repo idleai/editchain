@@ -155,7 +155,7 @@ mod tests {
             }
             store.append_page(&next_page).unwrap();
             let reconciled = reconciliation_ops(&chain, &[]).unwrap();
-            let viewer = editchain_vscode_service::Workspace::open(
+            let viewer = editchain_vscode_service::history::Workspace::open(
                 dir.path().to_str().unwrap(),
                 ".editchain",
             )
