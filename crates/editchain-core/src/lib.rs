@@ -24,6 +24,8 @@ pub mod op;
 pub mod parents;
 /// Payload types (`ContentId`, `BlobRef`, Payload).
 pub mod payload;
+/// Typed provider identity and immutable source/lifecycle evidence.
+pub mod provider;
 /// Scope reference types (chain, session, turn, file).
 pub mod scope;
 /// State types (`OpSet`, `BlobSet`, `ChainState`, reducers).

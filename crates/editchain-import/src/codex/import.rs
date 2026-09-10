@@ -177,6 +177,10 @@ pub fn import_codex(
             && existing_cursor
                 .as_ref()
                 .is_some_and(|cursor| cursor.normalization_version < CODEX_NORMALIZATION_VERSION);
+        let needs_evidence_upgrade = options.normalize
+            && existing_cursor.as_ref().is_some_and(|cursor| {
+                cursor.normalization_version < super::link::CODEX_PROVIDER_EVIDENCE_VERSION
+            });
         let needs_cursor_upgrade = migrates_legacy_key
             || existing_cursor.as_ref().is_some_and(|cursor| {
                 cursor.source_node != Some(source_node)
@@ -547,6 +551,17 @@ pub fn import_codex(
         // checkpoint makes metadata-only upgrades one-shot while preserving a
         // future version written by a newer importer.
         if options.normalize {
+            for evidence in super::evidence::source_evidence_ops(
+                &projection,
+                &plan,
+                &stream,
+                &owning_thread,
+                full_read || needs_evidence_upgrade,
+            )? {
+                options.cancellation.check(&rollout.path)?;
+                let _: bool = ops.accept_op(&evidence)?;
+                report.evidence_ops = report.evidence_ops.saturating_add(1);
+            }
             new_cursor.normalization_version = new_cursor
                 .normalization_version
                 .max(CODEX_NORMALIZATION_VERSION);
@@ -584,7 +599,7 @@ pub fn import_codex(
 /// source occurrences keeps relation identity independent from normalized lane
 /// allocation. Evidence on a trailing partial line is ignored until that line
 /// becomes a durable raw occurrence on a later import.
-fn collect_topology_evidence(
+pub(super) fn collect_topology_evidence(
     items: &[FinalItem],
     stream: &SourceStream,
     topology: &mut ThreadTopology,

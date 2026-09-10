@@ -212,6 +212,9 @@ pub struct Projection {
     pub line_ordinals: Vec<u64>,
     /// Final logical items, ordered by `(first_seen, item_id, turn_id)`.
     pub final_items: Vec<FinalItem>,
+    /// Tool and activity upserts in physical order, before removals or final
+    /// folding. Each retains its activation anchor and its witnessing ordinal.
+    pub lifecycle_items: Vec<FinalItem>,
     /// Inter-agent communication lines in physical order (deterministic
     /// per-line note lanes).
     pub inter_agent_lines: Vec<InterAgentLine>,
@@ -340,6 +343,13 @@ pub fn parse_projection(
                     // Fold key order is (turn_id, item_id) so turn-scoped
                     // removals retain by the first tuple element.
                     let key = (candidate.turn_id.clone(), candidate.item_id.clone());
+                    if matches!(candidate.kind, ProjectionKind::Tool | ProjectionKind::Note) {
+                        let mut occurrence = candidate.clone();
+                        if let Some(existing) = items.get(&key) {
+                            occurrence.first_seen = existing.first_seen;
+                        }
+                        projection.lifecycle_items.push(occurrence);
+                    }
                     let _unused: &mut FinalItem = items
                         .entry(key)
                         .and_modify(|existing| {

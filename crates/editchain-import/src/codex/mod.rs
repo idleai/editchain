@@ -168,6 +168,7 @@
 
 /// Rollout file discovery in a raw Codex sessions root.
 pub mod discover;
+mod evidence;
 /// Helper process bridge configuration and invocation.
 pub mod helper;
 /// Top-level import orchestrator for Codex rollouts.

@@ -351,7 +351,15 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
         "8 content ops + 3 SpawnedBy + 1 ReconnectsTo + 3 ForkedFrom facts"
     );
     assert_eq!(harness.report.malformed, 0, "no bridge decode errors");
-    assert_eq!(harness.ops.ops.len(), 27, "12 raw + 15 normalized ops");
+    assert_eq!(
+        harness.report.evidence_ops, 10,
+        "4 source extents + 6 lifecycle observations"
+    );
+    assert_eq!(
+        harness.ops.ops.len(),
+        37,
+        "12 raw + 15 normalized + 10 provider evidence ops"
+    );
 
     // Deterministic source streams per physical rollout.
     let parent = stream_for(dir.path(), "rollout-parent.jsonl");

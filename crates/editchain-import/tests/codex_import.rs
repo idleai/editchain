@@ -280,7 +280,7 @@ fn legacy_cursor_backfills_session_git_link_once_without_replaying_rows() {
             .unwrap()
             .unwrap()
             .normalization_version,
-        5
+        6
     );
 
     let current =
@@ -354,7 +354,7 @@ fn version_one_cursor_upgrades_topology_without_replaying_git_link() {
             .unwrap()
             .unwrap()
             .normalization_version,
-        5
+        6
     );
 }
 
@@ -531,7 +531,8 @@ fn full_import_preserves_raw_bytes_and_spills_blobs() {
     assert_eq!(harness.report.raw_ops, 3);
     assert_eq!(harness.report.normalized_ops, 2);
     assert_eq!(harness.report.malformed, 0);
-    assert_eq!(harness.ops.ops.len(), 5);
+    assert_eq!(harness.ops.ops.len(), 6);
+    assert_eq!(harness.report.evidence_ops, 1);
 
     // Raw lane: session_meta inline, big lines spilled to blobs, byte-exact.
     assert_eq!(raw_bytes(&harness.ops.ops[0], &harness.blobs), ln(&line1));
@@ -695,7 +696,7 @@ fn session_scope_uses_bridge_thread_not_payload_session_id() {
     let scope = ScopeRef::Session(derive_session_id("thread-1"));
     let turn_scope = ScopeRef::Turn(derive_turn_id("thread-1:turn-1"));
     for op in &harness.ops.ops {
-        let expected = if matches!(op.kind, OpKind::Import(_)) {
+        let expected = if matches!(op.kind, OpKind::Import(_)) || is_provider_evidence(op) {
             scope
         } else {
             turn_scope
@@ -738,7 +739,7 @@ fn raw_session_meta_fallback_when_bridge_has_no_thread_metadata() {
     let scope = ScopeRef::Session(derive_session_id("thread-1"));
     let turn_scope = ScopeRef::Turn(derive_turn_id("thread-1:turn-1"));
     for op in &harness.ops.ops {
-        let expected = if matches!(op.kind, OpKind::Import(_)) {
+        let expected = if matches!(op.kind, OpKind::Import(_)) || is_provider_evidence(op) {
             scope
         } else {
             turn_scope
@@ -753,7 +754,7 @@ fn raw_session_meta_fallback_when_bridge_has_no_thread_metadata() {
     let appended =
         import_with_options_into(dir.path(), &helper, &ImportOptions::default(), &mut cursors);
     for op in &appended.ops.ops {
-        let expected = if matches!(op.kind, OpKind::Import(_)) {
+        let expected = if matches!(op.kind, OpKind::Import(_)) || is_provider_evidence(op) {
             scope
         } else {
             turn_scope
@@ -776,9 +777,10 @@ fn session_fallback_to_rollout_filename_stem() {
 "#;
     let harness = import(dir.path(), &helper_in(&dir, no_meta_awk));
     let scope = ScopeRef::Session(derive_session_id("rollout-solo-1"));
-    assert_eq!(harness.ops.ops.len(), 2);
+    assert_eq!(harness.ops.ops.len(), 3);
+    assert_eq!(harness.report.evidence_ops, 1);
     for op in &harness.ops.ops {
-        let expected = if matches!(op.kind, OpKind::Import(_)) {
+        let expected = if matches!(op.kind, OpKind::Import(_)) || is_provider_evidence(op) {
             scope
         } else {
             ScopeRef::Turn(derive_turn_id("rollout-solo-1:turn-1"))
@@ -2710,21 +2712,29 @@ fn workspace_filter_includes_equal_nested_and_missing_cwd() {
     assert_eq!(harness.report.raw_ops, 4);
     assert_eq!(harness.report.normalized_ops, 0);
     assert_eq!(harness.report.malformed, 0);
-    assert_eq!(harness.ops.ops.len(), 4);
+    assert_eq!(harness.ops.ops.len(), 8);
+    assert_eq!(harness.report.evidence_ops, 4);
+    let raw: Vec<_> = harness
+        .ops
+        .ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::Import(_)))
+        .collect();
+    assert_eq!(raw.len(), 4);
     assert_eq!(
-        raw_bytes(&harness.ops.ops[0], &harness.blobs),
+        raw_bytes(raw[0], &harness.blobs),
         ln(&session_meta_line("equal-1", "s"))
     );
     assert_eq!(
-        raw_bytes(&harness.ops.ops[1], &harness.blobs),
+        raw_bytes(raw[1], &harness.blobs),
         ln(&session_meta_line("nested-1", "s"))
     );
     assert_eq!(
-        raw_bytes(&harness.ops.ops[2], &harness.blobs),
+        raw_bytes(raw[2], &harness.blobs),
         ln(&session_meta_line("nocwd-1", "s"))
     );
     assert_eq!(
-        raw_bytes(&harness.ops.ops[3], &harness.blobs),
+        raw_bytes(raw[3], &harness.blobs),
         ln(&session_meta_line("relative-1", "s"))
     );
 }
@@ -2832,7 +2842,13 @@ fn rewritten_rollout_reimports_at_new_generation_and_is_idempotent() {
         import_with_options_into(dir.path(), &helper, &ImportOptions::default(), &mut cursors);
     assert_eq!(first.report.raw_ops, 3);
     assert!(
-        first.ops.ops.iter().all(|op| op.id.boot == 0),
+        first.ops.ops.iter().all(|op| {
+            if is_provider_evidence(op) {
+                op.parents.iter().all(|source| source.boot == 0)
+            } else {
+                op.id.boot == 0
+            }
+        }),
         "original import uses generation 0"
     );
 
@@ -2852,7 +2868,13 @@ fn rewritten_rollout_reimports_at_new_generation_and_is_idempotent() {
     assert_eq!(second.report.files_processed, 1);
     assert_eq!(second.report.raw_ops, 2);
     assert!(
-        second.ops.ops.iter().all(|op| op.id.boot == 1),
+        second.ops.ops.iter().all(|op| {
+            if is_provider_evidence(op) {
+                op.parents.iter().all(|source| source.boot == 1)
+            } else {
+                op.id.boot == 1
+            }
+        }),
         "rewritten file re-imports under a new deterministic boot generation"
     );
     // New generation op ids never collide with the old generation's ids.
@@ -3092,4 +3114,427 @@ fn failed_rewrite_projection_preserves_both_cursor_and_generation_for_retry() {
         .ops
         .iter()
         .all(|new| first.ops.ops.iter().all(|old| new.id != old.id)));
+}
+
+fn is_provider_evidence(op: &editchain_core::Op) -> bool {
+    matches!(&op.kind, OpKind::Note(note) if note.relationship == editchain_core::NoteRelationship::ProviderEvidence)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopologySource {
+    Parent,
+    Child,
+}
+
+fn topology_projection(source: TopologySource, extra: bool) -> Vec<u8> {
+    let parent = source == TopologySource::Parent;
+    let (thread, parent_thread) = if parent {
+        ("parent", None)
+    } else {
+        ("child", Some("parent"))
+    };
+    let mut records = vec![line_record(
+        1,
+        Vec::new(),
+        Some(serde_json::json!({
+            "threadId": thread, "parentThreadId": parent_thread
+        })),
+    )];
+    if parent {
+        records.push(line_record(
+            2,
+            vec![serde_json::json!({
+                "turnId": "turn", "item": {
+                    "id": "spawn", "kind": "collabToolCall", "tool": "spawnAgent",
+                    "senderThreadId": "parent", "receiverThreadIds": ["child"]
+                }
+            })],
+            None,
+        ));
+        records.push(line_record(
+            3,
+            vec![serde_json::json!({
+                "turnId": "turn", "item": {
+                    "id": "wait", "kind": "collabToolCall", "tool": "wait",
+                    "agentsStates": {"child": {"status": "completed"}}
+                }
+            })],
+            None,
+        ));
+        if extra {
+            records.push(line_record(
+                4,
+                vec![serde_json::json!({
+                    "turnId": "turn", "item": {
+                        "id": "another-spawn", "kind": "collabToolCall", "tool": "spawnAgent",
+                        "senderThreadId": "parent", "receiverThreadIds": ["child"]
+                    }
+                })],
+                None,
+            ));
+        }
+    } else {
+        records.push(line_record(
+            2,
+            vec![serde_json::json!({
+                "turnId": "turn", "item": {"id": "work", "kind": "agentMessage", "text": "work"}
+            })],
+            None,
+        ));
+        if extra {
+            records.push(line_record(
+                3,
+                vec![serde_json::json!({
+                    "turnId": "turn", "item": {"id": "more", "kind": "agentMessage", "text": "more"}
+                })],
+                None,
+            ));
+        }
+    }
+    projection_bytes(&records)
+}
+
+fn topology_helper(dir: &tempfile::TempDir, extended: &[TopologySource]) -> HelperCommand {
+    let script = write_dispatching_helper(
+        dir.path(),
+        "topology.sh",
+        &[
+            (
+                "rollout-parent.jsonl",
+                &topology_projection(
+                    TopologySource::Parent,
+                    extended.contains(&TopologySource::Parent),
+                ),
+            ),
+            (
+                "rollout-child.jsonl",
+                &topology_projection(
+                    TopologySource::Child,
+                    extended.contains(&TopologySource::Child),
+                ),
+            ),
+        ],
+    );
+    sh_helper(&script, &[])
+}
+
+fn topology_lines(parent: bool) -> Vec<String> {
+    if parent {
+        vec![
+            session_meta_line("parent", "s"),
+            event_line("spawn"),
+            event_line("wait"),
+        ]
+    } else {
+        vec![session_meta_line("child", "s"), event_line("work")]
+    }
+}
+
+fn projected_lifecycle_edges(
+    ops: &[editchain_core::Op],
+) -> std::collections::BTreeSet<(editchain_core::OpId, u8, editchain_core::OpId)> {
+    let projection = editchain_project::HistoryProjection::from_ops(ops.to_vec());
+    let mut edges = std::collections::BTreeSet::new();
+    for op in projection.relationship_notes().values().flatten() {
+        let OpKind::Note(note) = &op.kind else {
+            continue;
+        };
+        let kind = match note.relationship {
+            editchain_core::NoteRelationship::SpawnedBy => 1,
+            editchain_core::NoteRelationship::ReconnectsTo => 2,
+            _ => continue,
+        };
+        if let Some(source) = op.parents.iter().next() {
+            for target in &note.target_ids {
+                let _: bool = edges.insert((*source, kind, *target));
+            }
+        }
+    }
+    edges
+}
+
+#[test]
+fn lifecycle_resolves_across_imports_in_both_source_arrival_orders() {
+    for child_first in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = topology_helper(&dir, &[]);
+        let first_name = if child_first {
+            "rollout-child.jsonl"
+        } else {
+            "rollout-parent.jsonl"
+        };
+        let second_name = if child_first {
+            "rollout-parent.jsonl"
+        } else {
+            "rollout-child.jsonl"
+        };
+        write_rollout(dir.path(), first_name, &topology_lines(!child_first));
+        let mut cursors = MemoryCursorStore::new();
+        let first =
+            try_import(dir.path(), &helper, &ImportOptions::default(), &mut cursors).unwrap();
+        assert!(projected_lifecycle_edges(&first.ops.ops).is_empty());
+        write_rollout(dir.path(), second_name, &topology_lines(child_first));
+        let second =
+            try_import(dir.path(), &helper, &ImportOptions::default(), &mut cursors).unwrap();
+        assert_eq!(
+            second.report.files_processed, 1,
+            "unchanged source is not re-projected"
+        );
+        let mut accepted = first.ops.ops;
+        accepted.extend(second.ops.ops);
+        let incremental = projected_lifecycle_edges(&accepted);
+        assert_eq!(
+            incremental.len(),
+            2,
+            "both spawn and completion resolve from durable evidence"
+        );
+        let parent = source_stream(dir.path(), &dir.path().join("rollout-parent.jsonl"), 0);
+        let child = source_stream(dir.path(), &dir.path().join("rollout-child.jsonl"), 0);
+        assert!(incremental.contains(&(
+            child.op_from_position(SourcePosition::raw(1)).unwrap(),
+            1,
+            parent.op_from_position(SourcePosition::raw(2)).unwrap(),
+        )));
+        assert!(incremental.contains(&(
+            parent.op_from_position(SourcePosition::raw(3)).unwrap(),
+            2,
+            child.op_from_position(SourcePosition::raw(2)).unwrap(),
+        )));
+        let one_shot = import(dir.path(), &helper);
+        assert_eq!(incremental, projected_lifecycle_edges(&one_shot.ops.ops));
+        accepted.reverse();
+        assert_eq!(
+            incremental,
+            projected_lifecycle_edges(&accepted),
+            "arrival ordering supplies no graph evidence"
+        );
+        let projection = editchain_project::HistoryProjection::from_ops(accepted.clone());
+        let nodes = projection.nodes();
+        let graph = projection.resolved_graph(&nodes);
+        assert!(graph.keys().iter().any(|key| graph
+            .relations(*key)
+            .iter()
+            .any(|relation| relation.evidence.len() >= 2)));
+        assert_eq!(
+            projection.ops(),
+            accepted,
+            "resolution preserves canonical operation envelopes"
+        );
+    }
+}
+
+#[test]
+fn appended_evidence_updates_terminals_and_retires_ambiguous_legacy_links() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rollout(dir.path(), "rollout-parent.jsonl", &topology_lines(true));
+    write_rollout(dir.path(), "rollout-child.jsonl", &topology_lines(false));
+    let mut cursors = MemoryCursorStore::new();
+    let first = try_import(
+        dir.path(),
+        &topology_helper(&dir, &[]),
+        &ImportOptions::default(),
+        &mut cursors,
+    )
+    .unwrap();
+    let mut accepted = first.ops.ops;
+    assert_eq!(projected_lifecycle_edges(&accepted).len(), 2);
+    let child_path = dir.path().join("rollout-child.jsonl");
+    let parent_path = dir.path().join("rollout-parent.jsonl");
+    let mut child_file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&child_path)
+        .unwrap();
+    writeln!(child_file, "{}", event_line("more")).unwrap();
+    drop(child_file);
+    let appended = try_import(
+        dir.path(),
+        &topology_helper(&dir, &[TopologySource::Child]),
+        &ImportOptions::default(),
+        &mut cursors,
+    )
+    .unwrap();
+    assert_eq!(appended.report.files_processed, 1);
+    accepted.extend(appended.ops.ops);
+    let parent = source_stream(dir.path(), &parent_path, 0);
+    let child = source_stream(dir.path(), &child_path, 0);
+    let complete = parent.op_from_position(SourcePosition::raw(3)).unwrap();
+    let terminal = child.op_from_position(SourcePosition::raw(3)).unwrap();
+    let edges = projected_lifecycle_edges(&accepted);
+    assert!(edges.contains(&(complete, 2, terminal)));
+    assert!(!edges.contains(&(
+        complete,
+        2,
+        child.op_from_position(SourcePosition::raw(2)).unwrap()
+    )));
+    // A conflicted or missing source occurrence is absent from admitted history.
+    let missing: Vec<_> = accepted
+        .iter()
+        .filter(|op| op.id != terminal)
+        .cloned()
+        .collect();
+    assert!(
+        projected_lifecycle_edges(&missing).is_empty(),
+        "an older prefix cannot replace a missing terminal"
+    );
+
+    let mut parent_file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&parent_path)
+        .unwrap();
+    writeln!(parent_file, "{}", event_line("second-spawn")).unwrap();
+    drop(parent_file);
+    let ambiguous = try_import(
+        dir.path(),
+        &topology_helper(&dir, &[TopologySource::Parent, TopologySource::Child]),
+        &ImportOptions::default(),
+        &mut cursors,
+    )
+    .unwrap();
+    accepted.extend(ambiguous.ops.ops);
+    let edges = projected_lifecycle_edges(&accepted);
+    assert!(
+        edges.iter().all(|(_, kind, _)| *kind != 1),
+        "two activations cannot reuse the earlier resolved spawn note"
+    );
+    assert!(edges.contains(&(complete, 2, terminal)));
+}
+
+#[test]
+fn lifecycle_occurrences_survive_removal_and_match_across_append_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent_bytes = topology_projection(TopologySource::Parent, false);
+    let mut records: Vec<serde_json::Value> = parent_bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    let mut removed = line_record(4, Vec::new(), None);
+    removed["projection"]["removedTurnIds"] = serde_json::json!(["turn"]);
+    records.push(removed);
+    let complete = projection_bytes(&records);
+    let initial = projection_bytes(records.get(..2).unwrap());
+    let child = topology_projection(TopologySource::Child, false);
+    let make_helper = |parent: &[u8]| {
+        let script = write_dispatching_helper(
+            dir.path(),
+            "rollback.sh",
+            &[
+                ("rollout-parent.jsonl", parent),
+                ("rollout-child.jsonl", &child),
+            ],
+        );
+        sh_helper(&script, &[])
+    };
+    let raw = topology_lines(true);
+    write_rollout(dir.path(), "rollout-parent.jsonl", raw.get(..2).unwrap());
+    write_rollout(dir.path(), "rollout-child.jsonl", &topology_lines(false));
+    let mut cursors = MemoryCursorStore::new();
+    let first = try_import(
+        dir.path(),
+        &make_helper(&initial),
+        &ImportOptions::default(),
+        &mut cursors,
+    )
+    .unwrap();
+    let parent_path = dir.path().join("rollout-parent.jsonl");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&parent_path)
+        .unwrap();
+    writeln!(file, "{}", raw.get(2).unwrap()).unwrap();
+    writeln!(file, "{}", event_line("rollback")).unwrap();
+    drop(file);
+    let second = try_import(
+        dir.path(),
+        &make_helper(&complete),
+        &ImportOptions::default(),
+        &mut cursors,
+    )
+    .unwrap();
+    assert_eq!(second.report.files_processed, 1);
+    let mut accepted = first.ops.ops;
+    accepted.extend(second.ops.ops);
+    let one_shot = import(dir.path(), &make_helper(&complete));
+    let lifecycle = |ops: &[editchain_core::Op]| {
+        let mut evidence: Vec<_> = ops
+            .iter()
+            .filter(|op| {
+                if let OpKind::Note(note) = &op.kind {
+                    if let Payload::Inline(content) = &note.content {
+                        return serde_json::from_slice::<
+                                editchain_core::provider::ProviderEvidence,
+                            >(content)
+                            .ok()
+                            .is_some_and(|evidence| {
+                                matches!(
+                                    evidence.fact,
+                                    editchain_core::provider::ProviderFact::CodexLifecycle(_)
+                                )
+                            });
+                    }
+                }
+                false
+            })
+            .cloned()
+            .collect();
+        evidence.sort_by_key(|op| op.id);
+        evidence
+    };
+    assert_eq!(
+        lifecycle(&accepted),
+        lifecycle(&one_shot.ops.ops),
+        "physical lifecycle facts are batch-invariant"
+    );
+    let edges = projected_lifecycle_edges(&accepted);
+    assert_eq!(
+        edges.len(),
+        2,
+        "turn removal does not erase captured activations or completed states"
+    );
+    assert_eq!(edges, projected_lifecycle_edges(&one_shot.ops.ops));
+}
+
+#[test]
+fn legacy_sources_backfill_provider_evidence_once_without_replaying_content() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rollout(dir.path(), "rollout-parent.jsonl", &topology_lines(true));
+    write_rollout(dir.path(), "rollout-child.jsonl", &topology_lines(false));
+    let helper = topology_helper(&dir, &[]);
+    let mut cursors = MemoryCursorStore::new();
+    let first = try_import(dir.path(), &helper, &ImportOptions::default(), &mut cursors).unwrap();
+    let mut accepted: Vec<_> = first
+        .ops
+        .ops
+        .into_iter()
+        .filter(|op| !is_provider_evidence(op))
+        .collect();
+    for name in ["rollout-parent.jsonl", "rollout-child.jsonl"] {
+        let key = source_key(dir.path(), &dir.path().join(name));
+        let mut legacy = cursors.get_cursor(&key).unwrap().unwrap();
+        legacy.normalization_version = 5;
+        cursors.set_cursor(&key, &legacy).unwrap();
+    }
+    let upgrade = try_import(dir.path(), &helper, &ImportOptions::default(), &mut cursors).unwrap();
+    assert_eq!(upgrade.report.raw_ops, 0);
+    assert_eq!(upgrade.report.evidence_ops, 4);
+    assert!(
+        upgrade
+            .ops
+            .ops
+            .iter()
+            .all(|op| matches!(op.kind, OpKind::Note(_))),
+        "metadata upgrade cannot regenerate content lanes"
+    );
+    accepted.extend(upgrade.ops.ops);
+    assert_eq!(projected_lifecycle_edges(&accepted).len(), 2);
+    let unavailable = HelperCommand::new("/not-an-installed-helper", Vec::new());
+    let unchanged = try_import(
+        dir.path(),
+        &unavailable,
+        &ImportOptions::default(),
+        &mut cursors,
+    )
+    .unwrap();
+    assert_eq!(unchanged.report.files_processed, 0);
+    assert!(unchanged.ops.ops.is_empty());
 }

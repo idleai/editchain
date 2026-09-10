@@ -33,12 +33,16 @@ use editchain_core::{ActorId, Op, OpId, SessionId};
 use crate::error::ImportError;
 use crate::ids::{derive_external_entity_id, derive_session_id};
 
-/// Cursor checkpoint for Codex normalized metadata. Version five retains one
+/// Cursor checkpoint for Codex normalized metadata. Version six captures typed
+/// source/lifecycle evidence for resolution across imports. Version five retains one
 /// path-specific `FileOp` for every entry in a multi-file change; version four
 /// recognized exact `collabToolCall.spawnAgent` topology, version three added
 /// portable capture of out-of-band session titles, and version two added exact
 /// topology facts.
-pub const CODEX_NORMALIZATION_VERSION: u32 = 5;
+pub const CODEX_NORMALIZATION_VERSION: u32 = 6;
+
+/// First checkpoint with source extents and occurrence-bound lifecycle facts.
+pub(crate) const CODEX_PROVIDER_EVIDENCE_VERSION: u32 = 6;
 
 /// Resolver identifier retained in every emitted evidence payload.
 pub const CODEX_TOPOLOGY_RESOLVER: &str = "codex-topology-v2";
@@ -394,7 +398,8 @@ const fn relationship_key(relationship: NoteRelationship) -> &'static str {
         | NoteRelationship::ProviderParent
         | NoteRelationship::LogicalParent
         | NoteRelationship::Contains
-        | NoteRelationship::ToolResultOf => "unsupported",
+        | NoteRelationship::ToolResultOf
+        | NoteRelationship::ProviderEvidence => "unsupported",
     }
 }
 

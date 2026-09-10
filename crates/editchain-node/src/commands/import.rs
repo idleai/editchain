@@ -178,9 +178,9 @@ pub fn run(
 
 fn capture_report(report: &editchain_import::ImportReport) -> String {
     format!(
-        "  Files discovered: {}\n  Files processed: {}\n  Captured raw ops: {}\n  Derived ops: {}\n  Malformed source records: {}",
+        "  Files discovered: {}\n  Files processed: {}\n  Captured raw ops: {}\n  Derived ops: {}\n  Provider evidence: {}\n  Malformed source records: {}",
         report.files_discovered, report.files_processed, report.raw_ops,
-        report.normalized_ops, report.malformed,
+        report.normalized_ops, report.evidence_ops, report.malformed,
     )
 }
 
@@ -678,6 +678,14 @@ mod tests {
         };
         let sessions_str = sessions.to_string_lossy().into_owned();
         let chain_str = chain.to_string_lossy().into_owned();
+        let captured_generation = |op: &Op| {
+            if matches!(&op.kind, editchain_core::OpKind::Note(note) if note.relationship == editchain_core::NoteRelationship::ProviderEvidence)
+            {
+                op.parents.iter().next().unwrap().boot
+            } else {
+                op.id.boot
+            }
+        };
 
         // Nonempty source: boot-0 ops land in the chain and the cursor is
         // committed by the command.
@@ -685,7 +693,7 @@ mod tests {
         import(&sessions_str, &chain_str);
         let first = read_chain_ops(&chain);
         assert!(!first.is_empty(), "first import must emit ops");
-        assert!(first.iter().all(|op| op.id.boot == 0));
+        assert!(first.iter().all(|op| captured_generation(op) == 0));
 
         // Truncate to empty and import: zero ops are emitted, but the staged
         // generation bump (1) and empty-file cursor must still be committed
@@ -713,12 +721,16 @@ mod tests {
         );
         import(&sessions_str, &chain_str);
         let all = read_chain_ops(&chain);
-        let regrown: Vec<Op> = all.iter().filter(|op| op.id.boot == 1).cloned().collect();
+        let regrown: Vec<Op> = all
+            .iter()
+            .filter(|op| captured_generation(op) == 1)
+            .cloned()
+            .collect();
         assert!(!regrown.is_empty(), "regrown content must emit boot-1 ops");
         assert_eq!(all.len(), first.len() + regrown.len());
         let boot0: HashSet<_> = all
             .iter()
-            .filter(|op| op.id.boot == 0)
+            .filter(|op| captured_generation(op) == 0)
             .map(|op| op.id)
             .collect();
         for op in &regrown {

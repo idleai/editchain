@@ -154,7 +154,9 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 /// Revision 50 uses typed derived edges without rewriting source parents.
 /// Revision 51 uses one project-owned Activity tree and resolved graph for all
 /// row coordinates, source ownership, and provisional or laid-out row metadata.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 51;
+/// Revision 52 resolves Codex lifecycle endpoints from admitted provider
+/// evidence across source captures, replacing covered legacy resolved notes.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 52;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

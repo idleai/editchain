@@ -19,6 +19,7 @@ pub mod taxonomy;
 mod view;
 
 mod graph;
+mod provider;
 pub use graph::{NodeKey, ResolvedGraph, ResolvedRelation};
 
 use std::collections::HashMap;
@@ -817,17 +818,23 @@ impl HistoryProjection {
     /// virtual graph edges.
     #[must_use]
     pub fn from_ops(ops: Vec<Op>) -> Self {
+        let provider_relations = provider::resolve(&ops);
         let mut git = GitProjection::new();
         let mut relationship_notes: HashMap<OpId, Vec<Op>> = HashMap::new();
         for op in &ops {
             git.reduce(op);
-            if is_projected_relation_fact(op) {
+            if is_projected_relation_fact(op) && !provider_relations.replaces_legacy_note(op) {
                 if let Some(parent) = op.parents.iter().next() {
                     relationship_notes
                         .entry(*parent)
                         .or_default()
                         .push(op.clone());
                 }
+            }
+        }
+        for note in provider_relations.notes {
+            if let Some(parent) = note.parents.iter().next() {
+                relationship_notes.entry(*parent).or_default().push(note);
             }
         }
         let mut projection = Self {
@@ -2228,7 +2235,8 @@ fn relation_kind(relationship: NoteRelationship) -> Option<RelationKind> {
         | NoteRelationship::LogicalParent
         | NoteRelationship::ForkedFrom
         | NoteRelationship::Contains
-        | NoteRelationship::ToolResultOf => None,
+        | NoteRelationship::ToolResultOf
+        | NoteRelationship::ProviderEvidence => None,
     }
 }
 
@@ -2771,6 +2779,7 @@ fn is_hidden_relation_fact(op: &Op) -> bool {
                         | NoteRelationship::ForkedFrom
                         | NoteRelationship::Contains
                         | NoteRelationship::ToolResultOf
+                        | NoteRelationship::ProviderEvidence
                 )
     )
 }

@@ -46,6 +46,22 @@ struct DurableRun {
     blobs: FsBlobSink,
 }
 
+fn assert_generation(ops: &[Op], generation: u32) {
+    assert!(!ops.is_empty(), "capture must emit operations");
+    for op in ops {
+        if matches!(&op.kind, OpKind::Note(note) if note.relationship == editchain_core::NoteRelationship::ProviderEvidence)
+        {
+            assert_eq!(op.parents.iter().count(), 1, "evidence has one source");
+            assert!(
+                op.parents.iter().all(|source| source.boot == generation),
+                "evidence must reference the captured generation"
+            );
+        } else {
+            assert_eq!(op.id.boot, generation, "physical generation must match");
+        }
+    }
+}
+
 /// Run a full Codex import with durable blob/cursor stores rooted at `chain`.
 ///
 /// Each call constructs brand-new store instances over the same directories,
@@ -242,8 +258,9 @@ fn incremental_append_after_restart_reads_only_new_bytes() {
     assert_eq!(second.report.files_discovered, 1);
     assert_eq!(second.report.files_processed, 1);
     assert_eq!(second.report.raw_ops, 1);
-    // 1 raw op for the appended line + 1 normalized op for its item.
-    assert_eq!(second.ops.ops.len(), 2);
+    // The appended raw record, its normalized item, and the new source extent.
+    assert_eq!(second.ops.ops.len(), 3);
+    assert_eq!(second.report.evidence_ops, 1);
     // Only the appended line is emitted, byte-exact, from the durable store.
     assert_eq!(
         spilled_raw_bytes(&second.ops.ops[0], &second.blobs),
@@ -347,7 +364,7 @@ fn rewritten_rollout_reimport_is_deterministic_across_restarts() {
     );
     let first = run_import(&raw_root, &helper, &options, &chain);
     assert_eq!(first.report.raw_ops, 3);
-    assert!(first.ops.ops.iter().all(|op| op.id.boot == 0));
+    assert_generation(&first.ops.ops, 0);
     let original_size = std::fs::metadata(&rollout).unwrap().len();
 
     // Rewrite the source: truncated and replaced with different content.
@@ -364,7 +381,7 @@ fn rewritten_rollout_reimport_is_deterministic_across_restarts() {
     // but never committed. Re-running must re-emit the exact same op ids.
     let crash1 = run_import_without_commit(&raw_root, &helper, &options, &chain);
     assert_eq!(crash1.report.raw_ops, 2);
-    assert!(crash1.ops.ops.iter().all(|op| op.id.boot == 1));
+    assert_generation(&crash1.ops.ops, 1);
 
     // The staged cursor and generation never reached disk: the durable cursor
     // is still the pre-rewrite generation-0 one (the file's committed size and
@@ -424,7 +441,7 @@ fn cursor_reset_reimports_source_with_current_generation_ids() {
     );
     let rewritten = run_import(&raw_root, &helper, &options, &chain);
     assert_eq!(rewritten.report.raw_ops, 1);
-    assert!(rewritten.ops.ops.iter().all(|op| op.id.boot == 1));
+    assert_generation(&rewritten.ops.ops, 1);
 
     // Reset procedure: delete the source's cursor file only. The generation
     // counter is retained, so the re-import replays at the current generation's

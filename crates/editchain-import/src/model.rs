@@ -65,6 +65,8 @@ pub struct ImportReport {
     pub raw_ops: usize,
     /// Number of normalized ops emitted.
     pub normalized_ops: usize,
+    /// Number of typed provider source/lifecycle evidence notes emitted.
+    pub evidence_ops: usize,
     /// Number of duplicate lines skipped.
     pub duplicates: usize,
     /// Number of malformed lines skipped.

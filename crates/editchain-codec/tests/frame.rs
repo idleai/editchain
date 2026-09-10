@@ -19,6 +19,34 @@ const MESSAGE_V1: &[u8] = &[
 ];
 
 #[test]
+fn relationship_wire_tags_retain_legacy_ordinals() {
+    for (tag, relationship) in [
+        (0, NoteRelationship::Corrects),
+        (1, NoteRelationship::Supersedes),
+        (2, NoteRelationship::Rejects),
+        (3, NoteRelationship::Redacts),
+        (4, NoteRelationship::Explains),
+        (5, NoteRelationship::ForkOf),
+        (6, NoteRelationship::SubagentOf),
+        (7, NoteRelationship::ReconnectsTo),
+        (8, NoteRelationship::OccurrenceOf),
+        (9, NoteRelationship::ProviderParent),
+        (10, NoteRelationship::LogicalParent),
+        (11, NoteRelationship::ForkedFrom),
+        (12, NoteRelationship::SpawnedBy),
+        (13, NoteRelationship::Contains),
+        (14, NoteRelationship::ToolResultOf),
+        (15, NoteRelationship::ProviderEvidence),
+    ] {
+        assert_eq!(postcard::to_stdvec(&relationship).unwrap(), vec![tag]);
+        assert_eq!(
+            postcard::from_bytes::<NoteRelationship>(&[tag]).unwrap(),
+            relationship
+        );
+    }
+}
+
+#[test]
 fn operation_decode_requires_complete_schema_consumption() {
     let mut extended = MESSAGE_V1.to_vec();
     extended.push(0);

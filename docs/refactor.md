@@ -127,10 +127,25 @@ Completed increments:
   are retained in the lockfile. Windows job behavior is not runtime-tested in
   the Linux suite.
 
+- Provider evidence: versioned metadata records capture complete source extents
+  and each lifecycle observation before final-item folding or turn removal.
+  Projection resolves exact activation and completion endpoints across the
+  complete admitted corpus, independent of source arrival order. Missing or
+  ambiguous evidence leaves the relationship unresolved; extending a child
+  source updates its terminal. Relations retain the supporting occurrence and
+  extent IDs without modifying stored operations. Older normalized sources
+  receive evidence once without replaying their content. Covered sources stop
+  using legacy materialized topology notes, while older chains retain their
+  compatibility path. Appending the metadata relationship preserves all prior
+  Postcard tags, now pinned by fixed byte assertions. Revision 52 invalidates
+  earlier projection caches. Import and projection regressions cover both
+  arrival orders, terminal growth, ambiguity, missing records, removal, and
+  restart replay.
+
 Remaining work, in dependency order:
 
-1. Consolidate typed provider evidence, source lifecycle, and persistence
-   checkpoints; preserve compatibility with existing normalized records.
+1. Finish normalized revision/replay policy, shared payload handling, and
+   bounded admission; preserve compatibility with existing normalized records.
 2. Simplify search document identity and renderer request/cache state.
 3. Retire migrated compatibility machinery and optimize measured repeated work.
 

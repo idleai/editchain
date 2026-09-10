@@ -418,6 +418,10 @@ pub enum NoteRelationship {
     /// diamonds. Provider conversation ancestry is carried independently by
     /// [`Self::ProviderParent`].
     ToolResultOf,
+    /// Versioned provider source or lifecycle evidence. The note's parent is
+    /// its physical raw occurrence; content follows [`crate::provider`]. These
+    /// observations do not themselves assert a resolved graph edge.
+    ProviderEvidence,
 }
 
 // ---------------------------------------------------------------------------
