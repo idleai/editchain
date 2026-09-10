@@ -5,19 +5,15 @@ use editchain_core::{
 };
 
 use crate::discover::RepositoryHandle;
-
-/// The outcome of resolving a commit from a live repository.
-#[derive(Debug, Clone)]
-pub struct CommitResolution {
-    /// The resolved commit entity.
-    pub commit: GitCommitEntity,
-    /// Whether the object was found in the object database.
-    pub found: bool,
-}
+use crate::{HistoryRead, HistoryReadIssue, RefSnapshot};
 
 /// Errors that can occur during object resolution.
 #[derive(Debug)]
 pub enum ResolutionError {
+    /// Prefix syntax or length is outside the supported 7–64 hex characters.
+    InvalidPrefix(String),
+    /// More than one object matches the requested hexadecimal prefix.
+    AmbiguousPrefix(String),
     /// The repository could not be opened.
     Open(String),
     /// The object could not be found in the object database.
@@ -36,6 +32,8 @@ pub enum ResolutionError {
 impl core::fmt::Display for ResolutionError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::InvalidPrefix(prefix) => write!(f, "invalid Git object prefix: {prefix}"),
+            Self::AmbiguousPrefix(prefix) => write!(f, "ambiguous Git object prefix: {prefix}"),
             Self::Open(e) => write!(f, "failed to open repository: {e}"),
             Self::NotFound(e) => write!(f, "object not found: {e}"),
             Self::Decode(e) => write!(f, "failed to decode object: {e}"),
@@ -61,7 +59,16 @@ impl std::error::Error for ResolutionError {}
 pub fn resolve_commit(
     handle: &RepositoryHandle,
     oid: &GitOid,
-) -> Result<CommitResolution, ResolutionError> {
+) -> Result<GitCommitEntity, ResolutionError> {
+    let refs = RefSnapshot::capture(handle)?;
+    resolve_commit_with_refs(handle, oid, &refs)
+}
+
+fn resolve_commit_with_refs(
+    handle: &RepositoryHandle,
+    oid: &GitOid,
+    refs: &RefSnapshot,
+) -> Result<GitCommitEntity, ResolutionError> {
     let gix_oid = git_oid_from(oid)?;
     let id = handle.repo.find_object(gix_oid).map_err(|e| match e {
         gix_object::find::existing::Error::NotFound { .. } => {
@@ -89,20 +96,7 @@ pub fn resolve_commit(
     let parents = parsed.parents().map(|p| git_oid_from_gix(&p)).collect();
     let tree = git_oid_from_gix(&parsed.tree());
 
-    // Collect refs pointing at this commit.
-    let mut refs = Vec::new();
-    if let Ok(references) = handle.repo.references() {
-        if let Ok(all) = references.all() {
-            for r in all.flatten() {
-                // Skip symbolic refs (e.g. HEAD -> refs/heads/main).
-                if r.target().try_id().is_some() && r.id() == gix_oid {
-                    refs.push(Payload::Inline(r.name().as_bstr().to_vec()));
-                }
-            }
-        }
-    }
-
-    let commit_entity = GitCommitEntity {
+    Ok(GitCommitEntity {
         repository: handle.discovery.id,
         object_format: oid.format,
         oid: *oid,
@@ -124,13 +118,13 @@ pub fn resolve_commit(
         committed_at: committer.time().map_or(0, |t| t.seconds),
         message: Payload::Inline(parsed.message.to_vec()),
         imported_refs: Vec::new(),
-        live_refs: refs,
+        live_refs: refs
+            .refs_for(oid)
+            .iter()
+            .cloned()
+            .map(Payload::Inline)
+            .collect(),
         changed_paths: Vec::new(),
-    };
-
-    Ok(CommitResolution {
-        commit: commit_entity,
-        found: true,
     })
 }
 
@@ -139,22 +133,41 @@ pub fn resolve_commit(
 /// Git's normal commit output uses an abbreviated object ID. This helper asks
 /// the repository object database to disambiguate that prefix, rejects matches
 /// to non-commit objects, and then returns the same fully populated resolution
-/// as [`resolve_commit`]. Invalid, missing, ambiguous, and non-commit prefixes
-/// all return `None` rather than inventing an association.
-#[must_use]
-pub fn resolve_commit_prefix(handle: &RepositoryHandle, prefix: &str) -> Option<CommitResolution> {
+/// as [`resolve_commit`]. `Ok(None)` means no matching object exists.
+///
+/// # Errors
+///
+/// Invalid and ambiguous prefixes, wrong object kinds, and unavailable or
+/// corrupt object data remain distinct errors. Callers must not use an error
+/// as evidence that a prefix is unique in another repository.
+pub fn resolve_commit_prefix(
+    handle: &RepositoryHandle,
+    prefix: &str,
+) -> Result<Option<GitCommitEntity>, ResolutionError> {
+    let width = handle.repo.object_hash().len_in_hex();
     if prefix.len() < 7 || prefix.len() > 64 || !prefix.as_bytes().iter().all(u8::is_ascii_hexdigit)
     {
-        return None;
+        return Err(ResolutionError::InvalidPrefix(prefix.to_owned()));
     }
-    let id = handle.repo.rev_parse_single(prefix).ok()?;
-    let object = id.object().ok()?;
-    if object.kind != gix_object::Kind::Commit {
-        return None;
+    if prefix.len() > width {
+        // A valid SHA-256 abbreviation cannot match a shorter SHA-1 object.
+        return Ok(None);
     }
-    let oid = git_oid_from_gix(&object.id);
-    drop(object);
-    resolve_commit(handle, &oid).ok()
+    let padded = format!("{prefix:0<width$}");
+    let oid = gix::hash::ObjectId::from_hex(padded.as_bytes())
+        .map_err(|error| ResolutionError::Decode(error.to_string()))?;
+    let lookup = gix::hash::Prefix::new(&oid, prefix.len())
+        .map_err(|error| ResolutionError::Decode(error.to_string()))?;
+    let candidate = handle
+        .repo
+        .objects
+        .lookup_prefix(lookup, None)
+        .map_err(|error| ResolutionError::Decode(error.to_string()))?;
+    match candidate {
+        None => Ok(None),
+        Some(Err(())) => Err(ResolutionError::AmbiguousPrefix(prefix.to_owned())),
+        Some(Ok(oid)) => resolve_commit(handle, &git_oid_from_gix(&oid)).map(Some),
+    }
 }
 
 /// Resolve the commit at the tip of a local branch at a historical wall time.
@@ -173,7 +186,7 @@ pub fn resolve_branch_tip_at_time(
     handle: &RepositoryHandle,
     branch: &str,
     unix_ms: u64,
-) -> Option<CommitResolution> {
+) -> Option<GitCommitEntity> {
     if branch.is_empty() || branch == "HEAD" {
         return None;
     }
@@ -210,7 +223,8 @@ pub fn resolve_branch_tip_at_time(
 /// Walk the commit history of a repository from HEAD, resolving each commit.
 ///
 /// Returns commits newest-first. `limit` bounds the number of commits walked
-/// (0 = unlimited). Missing objects are skipped rather than aborting the walk.
+/// (0 = unlimited). Available commits survive a partial read; ref errors,
+/// missing/corrupt ancestors, shallow boundaries, and limits remain observable.
 ///
 /// # Errors
 ///
@@ -218,13 +232,25 @@ pub fn resolve_branch_tip_at_time(
 pub fn walk_history(
     handle: &RepositoryHandle,
     limit: usize,
-) -> Result<Vec<GitCommitEntity>, ResolutionError> {
+) -> Result<HistoryRead, ResolutionError> {
+    let mut result = HistoryRead::default();
+    match RefSnapshot::capture(handle) {
+        Ok(refs) => result.refs = refs,
+        Err(error) => result.issues.push(HistoryReadIssue { oid: None, error }),
+    }
+    match handle.repo.shallow_commits() {
+        Ok(boundary) => result.shallow = boundary.is_some(),
+        Err(error) => result.issues.push(HistoryReadIssue {
+            oid: None,
+            error: ResolutionError::Decode(error.to_string()),
+        }),
+    }
     let head = handle
         .repo
         .head()
         .map_err(|e| ResolutionError::Open(e.to_string()))?;
     let Some(head_id) = head.id() else {
-        return Ok(Vec::new()); // unborn HEAD
+        return Ok(result); // unborn HEAD
     };
 
     let walk = head_id
@@ -232,17 +258,31 @@ pub fn walk_history(
         .all()
         .map_err(|e| ResolutionError::Decode(e.to_string()))?;
 
-    let mut commits = Vec::new();
-    for info in walk.flatten() {
-        if limit > 0 && commits.len() >= limit {
+    for info in walk {
+        if limit > 0 && result.commits.len() >= limit {
+            result.truncated = true;
             break;
         }
+        let info = match info {
+            Ok(info) => info,
+            Err(error) => {
+                result.issues.push(HistoryReadIssue {
+                    oid: None,
+                    error: ResolutionError::Decode(error.to_string()),
+                });
+                continue;
+            }
+        };
         let git_oid = git_oid_from_gix(&info.id);
-        if let Ok(res) = resolve_commit(handle, &git_oid) {
-            commits.push(res.commit);
+        match resolve_commit_with_refs(handle, &git_oid, &result.refs) {
+            Ok(commit) => result.commits.push(commit),
+            Err(error) => result.issues.push(HistoryReadIssue {
+                oid: Some(git_oid),
+                error,
+            }),
         }
     }
-    Ok(commits)
+    Ok(result)
 }
 
 /// Convert an `editchain_core::GitOid` to a `gix::hash::ObjectId`.

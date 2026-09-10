@@ -218,7 +218,7 @@ pub struct OpenDiagnostics {
 pub struct GitReadStats {
     /// Repository markers or directories that could not be inspected or opened.
     pub unavailable_repositories: usize,
-    /// History reads that failed or were incomplete.
+    /// Incomplete history reads or unavailable exact linked commit targets.
     pub history_errors: usize,
 }
 
@@ -235,7 +235,7 @@ impl OpenDiagnostics {
         }
         if self.git.history_errors > 0 {
             warnings.push(format!(
-                "{} Git history read(s) were incomplete",
+                "{} Git history read(s) or linked target(s) were incomplete",
                 self.git.history_errors
             ));
         }
@@ -2365,8 +2365,12 @@ impl Workspace {
                 continue;
             };
             let walked = walk_history(&handle, 0);
-            if let Ok(commits) = walked {
-                projection.merge_git_commits(commits);
+            if let Ok(history) = walked {
+                if !history.is_complete() {
+                    diagnostics.git.history_errors =
+                        diagnostics.git.history_errors.saturating_add(1);
+                }
+                projection.merge_git_commits(history.commits);
             } else {
                 diagnostics.git.history_errors = diagnostics.git.history_errors.saturating_add(1);
             }
@@ -2374,7 +2378,12 @@ impl Workspace {
         // A session may have started on a commit that is no longer reachable
         // from the repository's current HEAD. Resolve only the exact OIDs
         // carried by durable GitLink ops; never guess from timestamps or text.
-        merge_exact_git_link_targets(&mut projection, repositories.entries());
+        let unresolved_targets =
+            merge_exact_git_link_targets(&mut projection, repositories.entries());
+        diagnostics.git.history_errors = diagnostics
+            .git
+            .history_errors
+            .saturating_add(unresolved_targets);
         let source_op_index = source_ops
             .iter()
             .enumerate()
@@ -4943,12 +4952,11 @@ pub fn resolve_git_commit(
     else {
         return Ok(None);
     };
-    let Ok(handle) = open_repository(discovery) else {
-        return Ok(None);
-    };
+    let handle = open_repository(discovery)?;
     match resolve_commit(&handle, oid) {
-        Ok(res) => Ok(Some(res.commit)),
-        Err(_) => Ok(None),
+        Ok(commit) => Ok(Some(commit)),
+        Err(editchain_git::ResolutionError::NotFound(_)) => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -4957,7 +4965,7 @@ pub fn resolve_git_commit(
 fn merge_exact_git_link_targets(
     projection: &mut HistoryProjection,
     repositories: &[editchain_git::RepositoryDiscovery],
-) {
+) -> usize {
     let targets: std::collections::BTreeSet<(RepositoryId, GitOid)> = projection
         .git
         .links
@@ -4967,6 +4975,7 @@ fn merge_exact_git_link_targets(
         .filter(|target| !projection.git.commits.contains_key(target))
         .collect();
 
+    let mut unresolved = targets.len();
     for discovery in repositories {
         let repository_targets: Vec<GitOid> = targets
             .iter()
@@ -4980,14 +4989,12 @@ fn merge_exact_git_link_targets(
         };
         let commits: Vec<_> = repository_targets
             .iter()
-            .filter_map(|oid| {
-                resolve_commit(&handle, oid)
-                    .ok()
-                    .map(|result| result.commit)
-            })
+            .filter_map(|oid| resolve_commit(&handle, oid).ok())
             .collect();
+        unresolved = unresolved.saturating_sub(commits.len());
         projection.merge_git_commits(commits);
     }
+    unresolved
 }
 
 /// A stateful server that owns a loaded workspace across requests.

@@ -17,7 +17,7 @@ use sha2 as _;
 use editchain_core::{GitAvailability, GitObjectFormat, GitOid, Payload};
 use editchain_git::{
     discover_repositories, repository_id_from_path, resolve_commit, resolve_commit_prefix,
-    RepositoryCatalog, RepositoryHandle,
+    walk_history, RefSnapshot, RepositoryCatalog, RepositoryHandle, ResolutionError,
 };
 
 /// Create a temporary git repository with one commit and return its path.
@@ -101,12 +101,11 @@ fn resolve_commit_reads_fields() {
     };
 
     let resolution = resolve_commit(&handle, &oid).expect("resolve");
-    assert!(resolution.found);
-    assert_eq!(resolution.commit.availability, GitAvailability::Resolved);
-    assert_eq!(resolution.commit.oid, oid);
-    assert_eq!(resolution.commit.object_format, GitObjectFormat::Sha1);
+    assert_eq!(resolution.availability, GitAvailability::Resolved);
+    assert_eq!(resolution.oid, oid);
+    assert_eq!(resolution.object_format, GitObjectFormat::Sha1);
     // Message should contain the commit subject.
-    match &resolution.commit.message {
+    match &resolution.message {
         Payload::Inline(b) => {
             assert!(String::from_utf8_lossy(b).contains("initial commit"));
         }
@@ -145,14 +144,22 @@ fn resolve_commit_prefix_requires_an_unambiguous_commit_object() {
 
     let full = oid.to_hex();
     let prefix = full.get(..7).expect("seven-character prefix");
-    let resolved = resolve_commit_prefix(&handle, prefix).expect("unique commit prefix");
-    assert_eq!(resolved.commit.oid, oid);
+    let resolved = resolve_commit_prefix(&handle, prefix)
+        .expect("read prefix")
+        .expect("unique commit prefix");
+    assert_eq!(resolved.oid, oid);
     assert!(
-        resolve_commit_prefix(&handle, "123").is_none(),
+        matches!(
+            resolve_commit_prefix(&handle, "123"),
+            Err(ResolutionError::InvalidPrefix(_))
+        ),
         "too-short prefixes are not strong identity evidence"
     );
     assert!(
-        resolve_commit_prefix(&handle, "not-hexadecimal").is_none(),
+        matches!(
+            resolve_commit_prefix(&handle, "not-hexadecimal"),
+            Err(ResolutionError::InvalidPrefix(_))
+        ),
         "non-hexadecimal strings are not object prefixes"
     );
 }
@@ -174,12 +181,197 @@ fn full_commit_lookup_rejects_blob_and_tree_objects_without_panicking() {
         let oid = GitOid::from_hex(hex.trim()).unwrap();
         assert!(matches!(
             resolve_commit(&handle, &oid),
-            Err(editchain_git::ResolutionError::WrongKind {
+            Err(ResolutionError::WrongKind {
+                expected: "commit",
+                ..
+            })
+        ));
+        assert!(matches!(
+            resolve_commit_prefix(&handle, &oid.to_hex()),
+            Err(ResolutionError::WrongKind {
                 expected: "commit",
                 ..
             })
         ));
     }
+}
+
+#[test]
+fn history_observes_refs_once_and_distinguishes_limits_from_exhaustion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_repo(tmp.path());
+    let first = head_oid(&repo);
+    run(&repo, &["branch", "observed"]);
+    run(
+        &repo,
+        &[
+            "-c",
+            "user.name=Alice",
+            "-c",
+            "user.email=alice@example.com",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "second",
+        ],
+    );
+    let descriptor = editchain_git::RepositoryDiscovery::from_path(&repo).unwrap();
+    let handle = editchain_git::open_repository(&descriptor).unwrap();
+    let history = walk_history(&handle, 0).unwrap();
+    assert!(history.is_complete());
+    assert_eq!(history.commits.len(), 2);
+    assert_eq!(history.commits[0].oid, head_oid(&repo));
+    assert_eq!(
+        history.refs.refs_for(&first),
+        &[b"refs/heads/observed".to_vec()]
+    );
+    assert_eq!(
+        history.commits[1].live_refs,
+        vec![Payload::Inline(b"refs/heads/observed".to_vec())]
+    );
+
+    run(&repo, &["branch", "-f", "observed", "HEAD"]);
+    assert_eq!(
+        history.refs.refs_for(&first),
+        &[b"refs/heads/observed".to_vec()]
+    );
+    let later = RefSnapshot::capture(&handle).unwrap();
+    assert!(later.refs_for(&first).is_empty());
+    assert!(later
+        .refs_for(&head_oid(&repo))
+        .contains(&b"refs/heads/observed".to_vec()));
+
+    let limited = walk_history(&handle, 1).unwrap();
+    assert_eq!(limited.commits.len(), 1);
+    assert!(limited.truncated);
+    assert!(!limited.is_complete());
+    assert!(walk_history(&handle, 2).unwrap().is_complete());
+}
+
+#[test]
+fn history_retains_available_commits_when_an_ancestor_is_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_repo(tmp.path());
+    let first = head_oid(&repo).to_hex();
+    run(
+        &repo,
+        &[
+            "-c",
+            "user.name=Alice",
+            "-c",
+            "user.email=alice@example.com",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "second",
+        ],
+    );
+    std::fs::remove_file(
+        repo.join(".git/objects")
+            .join(first.get(..2).unwrap())
+            .join(first.get(2..).unwrap()),
+    )
+    .unwrap();
+    let descriptor = editchain_git::RepositoryDiscovery::from_path(&repo).unwrap();
+    let handle = editchain_git::open_repository(&descriptor).unwrap();
+    let history = walk_history(&handle, 0).unwrap();
+    assert!(!history.is_complete());
+    assert!(!history.issues.is_empty());
+    assert_eq!(history.commits.len(), 1);
+    assert_eq!(history.commits[0].oid, head_oid(&repo));
+}
+
+#[test]
+fn history_reports_shallow_boundaries_and_ref_failures() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_repo(tmp.path());
+    run(
+        &repo,
+        &[
+            "-c",
+            "user.name=Alice",
+            "-c",
+            "user.email=alice@example.com",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "second",
+        ],
+    );
+    let shallow = tmp.path().join("shallow");
+    run(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            "--no-local",
+            "--depth=1",
+            repo.to_str().unwrap(),
+            shallow.to_str().unwrap(),
+        ],
+    );
+    let descriptor = editchain_git::RepositoryDiscovery::from_path(&shallow).unwrap();
+    let handle = editchain_git::open_repository(&descriptor).unwrap();
+    let history = walk_history(&handle, 0).unwrap();
+    assert!(history.shallow);
+    assert!(!history.truncated);
+    assert!(history.issues.is_empty());
+    assert!(!history.is_complete());
+    assert_eq!(history.commits.len(), 1);
+
+    std::fs::write(shallow.join(".git/refs/heads/broken"), b"invalid ref\n").unwrap();
+    let handle = editchain_git::open_repository(&descriptor).unwrap();
+    let history = walk_history(&handle, 0).unwrap();
+    assert!(!history.issues.is_empty());
+    assert_eq!(history.commits.len(), 1);
+}
+
+#[test]
+fn prefix_lookup_distinguishes_absence_ambiguity_and_corruption() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = make_repo(tmp.path());
+    let descriptor = editchain_git::RepositoryDiscovery::from_path(&repo).unwrap();
+    let handle = editchain_git::open_repository(&descriptor).unwrap();
+    let oid = head_oid(&repo).to_hex();
+    // A hexadecimal branch name is not object identity evidence.
+    run(&repo, &["branch", "0000000"]);
+    assert!(resolve_commit_prefix(&handle, "0000000").unwrap().is_none());
+    assert!(resolve_commit_prefix(&handle, &"0".repeat(64))
+        .unwrap()
+        .is_none());
+
+    // A second loose-object name suffices to make the prefix ambiguous; neither
+    // matching object's contents may be used to choose an arbitrary winner.
+    let other = format!(
+        "{}{}",
+        oid.get(..39).unwrap(),
+        if oid.ends_with('0') { '1' } else { '0' }
+    );
+    let other_path = repo
+        .join(".git/objects")
+        .join(other.get(..2).unwrap())
+        .join(other.get(2..).unwrap());
+    std::fs::write(&other_path, b"unreadable object").unwrap();
+    assert!(matches!(
+        resolve_commit_prefix(&handle, oid.get(..7).unwrap()),
+        Err(ResolutionError::AmbiguousPrefix(_))
+    ));
+    std::fs::remove_file(other_path).unwrap();
+
+    let object = repo
+        .join(".git/objects")
+        .join(oid.get(..2).unwrap())
+        .join(oid.get(2..).unwrap());
+    std::fs::remove_file(&object).unwrap();
+    std::fs::write(object, b"unreadable object").unwrap();
+    let handle = editchain_git::open_repository(&descriptor).unwrap();
+    assert!(matches!(
+        resolve_commit_prefix(&handle, oid.get(..7).unwrap()),
+        Err(ResolutionError::Decode(_))
+    ));
 }
 
 #[test]
@@ -233,7 +425,6 @@ fn catalog_describes_worktrees_and_bare_repositories_without_changing_ids() {
     assert_eq!(
         resolve_commit(&handle, &head_oid(&repo))
             .unwrap()
-            .commit
             .repository,
         linked_repo.id
     );

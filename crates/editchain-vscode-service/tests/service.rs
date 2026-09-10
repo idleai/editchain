@@ -2342,7 +2342,7 @@ fn cancelled_branch_rows_ship_muted_node_and_child_owned_edge_geometry() {
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_forty_seven() {
+fn prepared_snapshot_manifest_records_projection_revision_forty_eight() {
     // Stale snapshots from earlier projection revisions (before trace hiding,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
@@ -2369,7 +2369,7 @@ fn prepared_snapshot_manifest_records_projection_revision_forty_seven() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 47u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 48u64);
 }
 
 #[test]
@@ -2758,7 +2758,7 @@ fn prepared_snapshot_serves_flattened_activity_view_and_records_current_revision
         &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["identity"]["projection_revision"], 47u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 48u64);
 
     let mut cached =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");

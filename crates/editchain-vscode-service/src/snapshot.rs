@@ -149,7 +149,9 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 ///
 /// Revision 47 uses explicit repository roots and component-wise nesting.
 /// Prefix-related sibling repositories remain visible as independent sources.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 47;
+///
+/// Revision 48 retains Git history gaps and observes refs once per history read.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 48;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

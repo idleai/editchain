@@ -35,16 +35,20 @@ Completed increments:
   repositories. Open diagnostics report unavailable repositories, and full-OID
   commit resolution rejects tree/blob objects without panicking. Projection
   revision 47 invalidates caches built with string-prefix nesting.
+- Git observations: history captures ref labels once and retains traversal,
+  decode, shallow-boundary, and truncation outcomes with available commits.
+  Prefix lookup distinguishes absence, ambiguity, wrong object kind, and read
+  failure; an incomplete repository set cannot establish global uniqueness.
+  Projection revision 48 invalidates caches that omitted history diagnostics.
 
 Remaining work, in dependency order:
 
-1. Separate immutable Git reads from ref observations and expose history completeness.
-2. Bind service windows, search, layout, and renderer requests to one snapshot.
-3. Move complete Activity assembly and presentation-tree ownership into project.
-4. Consolidate typed provider evidence, source lifecycle, and persistence
+1. Bind service windows, search, layout, and renderer requests to one snapshot.
+2. Move complete Activity assembly and presentation-tree ownership into project.
+3. Consolidate typed provider evidence, source lifecycle, and persistence
    checkpoints; preserve compatibility with existing normalized records.
-5. Simplify search document identity and renderer request/cache state.
-6. Retire migrated compatibility machinery and optimize measured repeated work.
+4. Simplify search document identity and renderer request/cache state.
+5. Retire migrated compatibility machinery and optimize measured repeated work.
 
 Validation uses the existing crate, service, renderer, and extension suites.
 Every completed code increment must pass `./scripts/lint.sh`. Regression tests

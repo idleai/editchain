@@ -118,7 +118,7 @@ pub(super) fn derive_session_base_links(
             continue;
         };
         let target_repo = repository.discovery.id;
-        let target_oid = commit.commit.oid;
+        let target_oid = commit.oid;
         let id = based_on_link_id(root.id, target_repo, target_oid);
         if existing_ids.contains(&id) {
             continue;

@@ -8,6 +8,8 @@ use tempfile as _;
 
 mod catalog;
 pub use catalog::{DiscoveryIssue, RepositoryCatalog};
+mod observation;
+pub use observation::{HistoryRead, HistoryReadIssue, RefSnapshot};
 
 /// Commit tree diffs and immutable blob resolution.
 pub mod diff;
@@ -23,7 +25,7 @@ pub use diff::{
 pub use discover::{discover_repositories, open_repository, RepositoryDiscovery, RepositoryHandle};
 pub use resolve::{
     resolve_branch_tip_at_time, resolve_commit, resolve_commit_prefix, walk_history,
-    CommitResolution, ResolutionError,
+    ResolutionError,
 };
 
 use editchain_core::RepositoryId;

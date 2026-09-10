@@ -124,8 +124,8 @@ pub(super) fn derive_produced_commit_links(
     Ok(links)
 }
 
-/// Open every repository discovered under the workspace, skipping individual
-/// repositories that cannot currently be opened.
+/// Open every repository discovered under the workspace. A failed discovery or
+/// open prevents claims of uniqueness across the workspace.
 pub(super) fn open_repositories(
     workspace: &Path,
 ) -> Result<Vec<RepositoryHandle>, Box<dyn std::error::Error>> {
@@ -138,13 +138,14 @@ fn unique_commit(
     repositories: &[RepositoryHandle],
     prefix: &str,
 ) -> Option<(RepositoryId, GitOid)> {
-    let matches: BTreeSet<(RepositoryId, GitOid)> = repositories
-        .iter()
-        .filter_map(|repository| {
-            resolve_commit_prefix(repository, prefix)
-                .map(|resolved| (repository.discovery.id, resolved.commit.oid))
-        })
-        .collect();
+    let mut matches = BTreeSet::new();
+    for repository in repositories {
+        // An unreadable or ambiguous repository makes the entire uniqueness
+        // claim unresolved; it must not disappear as a local non-match.
+        if let Some(commit) = resolve_commit_prefix(repository, prefix).ok()? {
+            let _: bool = matches.insert((repository.discovery.id, commit.oid));
+        }
+    }
     if matches.len() == 1 {
         matches.into_iter().next()
     } else {
@@ -759,6 +760,38 @@ mod tests {
                 .is_empty(),
             "a cross-repository ambiguous prefix must not choose an arbitrary target"
         );
+    }
+
+    #[test]
+    fn an_unreadable_repository_cannot_establish_cross_repository_uniqueness() {
+        let temp = tempfile::tempdir().unwrap();
+        let (repo, _, oid) = committed_repo(temp.path());
+        let clone = temp.path().join("repo-copy");
+        drop(run_git(
+            temp.path(),
+            &[
+                "clone",
+                "-q",
+                repo.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+        ));
+        let object = clone
+            .join(".git/objects")
+            .join(oid.get(..2).unwrap())
+            .join(oid.get(2..).unwrap());
+        // Unlink the clone's hard link before writing corrupt fixture bytes.
+        std::fs::remove_file(&object).unwrap();
+        std::fs::write(object, b"corrupt object").unwrap();
+        let repositories = open_repositories(temp.path()).unwrap();
+        assert!(unique_commit(&repositories, oid.get(..7).unwrap()).is_none());
+        let good = repositories
+            .iter()
+            .find(|handle| handle.discovery.worktree_root.as_ref() == Some(&repo))
+            .unwrap();
+        assert!(resolve_commit_prefix(good, oid.get(..7).unwrap())
+            .unwrap()
+            .is_some());
     }
 
     #[test]
