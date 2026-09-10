@@ -27,8 +27,9 @@ use time as _;
 use tokio as _;
 
 use editchain_core::clock::Clock;
-use editchain_core::op::{CommandStage, OpKind, ToolStage};
+use editchain_core::op::{CommandStage, NoteRelationship, OpKind, ToolStage};
 use editchain_core::payload::Payload;
+use editchain_core::provider::{CodexLifecycleEvent, CodexSpawnSignal, ProviderFact};
 use editchain_core::scope::ScopeRef;
 use editchain_core::tags::Tags;
 
@@ -225,16 +226,11 @@ fn canonical_revisions(ops: &[editchain_core::Op]) -> Vec<editchain_core::Op> {
     for op in ops {
         let extent = match &op.kind {
             OpKind::Note(note) if is_provider_evidence(op) => match &note.content {
-                Payload::Inline(content) => {
-                    serde_json::from_slice::<editchain_core::provider::ProviderEvidence>(content)
-                        .ok()
-                        .is_some_and(|evidence| {
-                            matches!(
-                                evidence.fact,
-                                editchain_core::provider::ProviderFact::CodexSource(_)
-                            )
-                        })
-                }
+                Payload::Inline(content) => serde_json::from_slice::<
+                    editchain_core::provider::ProviderEvidence,
+                >(content)
+                .ok()
+                .is_some_and(|evidence| matches!(evidence.fact, ProviderFact::CodexSource(_))),
                 _ => false,
             },
             _ => false,
@@ -2268,11 +2264,7 @@ fn multi_path_file_change_retains_one_edit_and_path_note_per_file() {
         .ops
         .iter()
         .filter_map(|op| match &op.kind {
-            OpKind::Note(note)
-                if note.relationship == editchain_core::op::NoteRelationship::Explains =>
-            {
-                Some(note)
-            }
+            OpKind::Note(note) if note.relationship == NoteRelationship::Explains => Some(note),
             _ => None,
         })
         .collect();
@@ -2596,85 +2588,51 @@ fn current_collab_spawn_links_exact_child_and_reconnects_to() {
     );
     let harness = import(dir.path(), &sh_helper(&helper, &[]));
 
-    // SpawnedBy: causal parent = the subagent thread's first raw occurrence;
-    // target = the parent thread's exact raw `spawnAgent` occurrence.
-    let spawned_by = harness
-        .ops
-        .ops
-        .iter()
-        .find(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::SpawnedBy)
-        })
-        .expect("SpawnedBy fact");
+    let projection = editchain_project::HistoryProjection::from_ops(harness.ops.ops.clone());
     let sub_stream = source_stream(dir.path(), &dir.path().join("rollout-sub.jsonl"), 0);
     let parent_stream = source_stream(dir.path(), &dir.path().join("rollout-parent.jsonl"), 0);
+    let first = sub_stream.op_from_position(SourcePosition::raw(1)).unwrap();
+    let activation = parent_stream
+        .op_from_position(SourcePosition::raw(2))
+        .unwrap();
+    let completion = parent_stream
+        .op_from_position(SourcePosition::raw(3))
+        .unwrap();
+    let terminal = sub_stream.op_from_position(SourcePosition::raw(2)).unwrap();
     assert_eq!(
-        spawned_by.parents,
-        ParentSet::One(sub_stream.op_from_position(SourcePosition::raw(1)).unwrap())
+        relationship_edges(&projection, NoteRelationship::SpawnedBy),
+        [(first, activation)].into()
     );
-    match &spawned_by.kind {
-        OpKind::Note(note) => {
-            assert_eq!(
-                note.target_ids,
-                vec![parent_stream
-                    .op_from_position(SourcePosition::raw(2))
-                    .unwrap()]
-            );
-            assert!(matches!(&note.content, Payload::Inline(bytes)
-                if String::from_utf8_lossy(bytes).contains("collabToolCall.spawnAgent")));
-        }
-        _ => panic!("expected note op"),
-    }
-    // Relationship notes are session-scoped, never turn-scoped.
     assert_eq!(
-        spawned_by.scope,
-        ScopeRef::Session(derive_session_id("sub-1"))
+        relationship_edges(&projection, NoteRelationship::ReconnectsTo),
+        [(completion, terminal)].into()
     );
 
-    // ReconnectsTo: causal parent = the raw occurrence whose agentsStates marks
-    // the child completed; target = the child's last physical occurrence.
-    let reconnects_to = harness
-        .ops
-        .ops
-        .iter()
-        .find(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ReconnectsTo)
-        })
-        .expect("ReconnectsTo note");
+    let facts = provider_facts(&harness.ops.ops);
+    assert!(facts.iter().any(|(op, evidence)| matches!(&evidence.fact,
+        ProviderFact::CodexLifecycle(meta)
+            if matches!(&meta.event, CodexLifecycleEvent::Spawn { activation: id, signal: CodexSpawnSignal::CollabTool, child, .. }
+                if *id == activation && child.0 == "sub-1")
+                && op.scope == ScopeRef::Session(derive_session_id("parent-1")))));
+    assert!(facts.iter().any(|(op, evidence)| matches!(&evidence.fact,
+        ProviderFact::CodexLifecycle(meta)
+            if matches!(&meta.event, CodexLifecycleEvent::Completed { child } if child.0 == "sub-1")
+                && evidence.source == completion
+                && op.scope == ScopeRef::Session(derive_session_id("parent-1")))));
+    assert!(facts.iter().any(|(op, evidence)| matches!(&evidence.fact,
+        ProviderFact::CodexSource(meta)
+            if meta.first == first && meta.thread.0 == "sub-1"
+                && meta.forked_from.as_ref().is_some_and(|thread| thread.0 == "parent-1")
+                && op.scope == ScopeRef::Session(derive_session_id("sub-1")))));
+    assert!(relationship_edges(&projection, NoteRelationship::ForkOf).is_empty());
+    assert!(!harness.ops.ops.iter().any(|op| matches!(&op.kind, OpKind::Note(note)
+        if matches!(note.relationship, NoteRelationship::SpawnedBy | NoteRelationship::ReconnectsTo | NoteRelationship::ForkedFrom))),
+        "capture persists independent facts without materializing relationships");
     assert_eq!(
-        reconnects_to.parents,
-        ParentSet::One(
-            parent_stream
-                .op_from_position(SourcePosition::raw(3))
-                .unwrap()
-        )
+        projection.ops(),
+        harness.ops.ops,
+        "resolution preserves source envelopes"
     );
-    match &reconnects_to.kind {
-        OpKind::Note(note) => {
-            assert_eq!(
-                note.target_ids,
-                vec![sub_stream.op_from_position(SourcePosition::raw(2)).unwrap()]
-            );
-        }
-        _ => panic!("expected note op"),
-    }
-    assert_eq!(
-        reconnects_to.scope,
-        ScopeRef::Session(derive_session_id("parent-1")),
-        "relationship notes are session-scoped to the owning thread"
-    );
-
-    // The copied forkedFromId is retained as an execution fact, but never
-    // converted into guessed row geometry.
-    assert!(
-        !harness.ops.ops.iter().any(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ForkOf)
-        }),
-        "forkedFromId must not manufacture ForkOf row geometry"
-    );
-    assert!(harness.ops.ops.iter().any(|o| {
-        matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ForkedFrom)
-    }));
 }
 
 #[test]
@@ -2720,36 +2678,32 @@ fn fork_metadata_emits_exact_execution_fact_without_clock_boundary() {
 "#;
     let harness = import(dir.path(), &helper_in(&dir, awk));
 
-    let forked_from = harness
-        .ops
-        .ops
-        .iter()
-        .find(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ForkedFrom)
-        })
-        .expect("ForkedFrom fact");
     let branch_stream = source_stream(dir.path(), &dir.path().join("rollout-branch.jsonl"), 0);
-    // The child execution occurrence is exact; the target is a stable execution
-    // entity, not whichever trunk row happened to precede the branch clock.
-    assert_eq!(
-        forked_from.parents,
-        ParentSet::One(
-            branch_stream
-                .op_from_position(SourcePosition::raw(1))
-                .unwrap()
-        )
+    let first = branch_stream
+        .op_from_position(SourcePosition::raw(1))
+        .unwrap();
+    let last = branch_stream
+        .op_from_position(SourcePosition::raw(2))
+        .unwrap();
+    let facts = provider_facts(&harness.ops.ops);
+    let (op, evidence) = facts
+        .iter()
+        .find(|(_, evidence)| {
+            matches!(&evidence.fact,
+        ProviderFact::CodexSource(meta) if meta.thread.0 == "branch-1")
+        })
+        .expect("branch source evidence");
+    assert!(matches!(&evidence.fact, ProviderFact::CodexSource(meta)
+        if meta.first == first && meta.last == last
+            && meta.forked_from.as_ref().is_some_and(|thread| thread.0 == "trunk-1")));
+    assert_eq!(op.parents, ParentSet::One(last));
+    assert_eq!(op.scope, ScopeRef::Session(derive_session_id("branch-1")));
+    assert_eq!(op.clock, Clock::None);
+    let projection = editchain_project::HistoryProjection::from_ops(harness.ops.ops.clone());
+    assert!(
+        relationship_edges(&projection, NoteRelationship::ForkOf).is_empty(),
+        "execution identity supplies no physical divergence boundary"
     );
-    match &forked_from.kind {
-        OpKind::Note(note) => {
-            assert_eq!(note.target_ids.len(), 1);
-            assert!(matches!(&note.content, Payload::Inline(bytes)
-                if String::from_utf8_lossy(bytes).contains("codex-topology-v2")));
-        }
-        _ => panic!("expected note op"),
-    }
-    assert!(!harness.ops.ops.iter().any(|o| {
-        matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ForkOf)
-    }));
 }
 
 #[test]
@@ -2849,58 +2803,31 @@ fn legacy_list_agents_completion_links_via_started_marker_agent_path() {
     let harness = import(dir.path(), &sh_helper(&helper, &[]));
     let sub_stream = source_stream(dir.path(), &dir.path().join("rollout-sub.jsonl"), 0);
 
-    let reconnects: Vec<_> = harness
-        .ops
-        .ops
-        .iter()
-        .filter(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ReconnectsTo)
-        })
-        .collect();
-    assert_eq!(reconnects.len(), 1, "only the completed agent reconnects");
+    let projection = editchain_project::HistoryProjection::from_ops(harness.ops.ops.clone());
+    let parent_stream = source_stream(dir.path(), &dir.path().join("rollout-parent.jsonl"), 0);
+    let completion = parent_stream
+        .op_from_position(SourcePosition::raw(3))
+        .unwrap();
+    let terminal = sub_stream.op_from_position(SourcePosition::raw(2)).unwrap();
     assert_eq!(
-        reconnects[0].parents,
-        ParentSet::One(
-            source_stream(dir.path(), &dir.path().join("rollout-parent.jsonl"), 0)
-                .op_from_position(SourcePosition::raw(3))
-                .unwrap()
-        ),
-        "the physical list_agents result occurrence is the completion endpoint"
+        relationship_edges(&projection, NoteRelationship::ReconnectsTo),
+        [(completion, terminal)].into(),
+        "only the completed agent reconnects at its exact physical occurrence"
     );
-    match &reconnects[0].kind {
-        OpKind::Note(note) => {
-            assert_eq!(
-                note.target_ids,
-                vec![sub_stream.op_from_position(SourcePosition::raw(2)).unwrap()]
-            );
-        }
-        _ => panic!("expected note op"),
-    }
-
-    // The raw started occurrence is the exact SpawnedBy target.
-    let spawned_by = harness
-        .ops
-        .ops
-        .iter()
-        .find(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::SpawnedBy)
-        })
-        .expect("SpawnedBy fact");
-    match &spawned_by.kind {
-        OpKind::Note(note) => assert_eq!(
-            note.target_ids,
-            vec![
-                source_stream(dir.path(), &dir.path().join("rollout-parent.jsonl"), 0,)
-                    .op_from_position(SourcePosition::raw(2))
-                    .unwrap()
-            ]
-        ),
-        _ => panic!("expected note op"),
-    }
     assert_eq!(
-        spawned_by.parents,
-        ParentSet::One(sub_stream.op_from_position(SourcePosition::raw(1)).unwrap())
+        relationship_edges(&projection, NoteRelationship::SpawnedBy),
+        [(
+            sub_stream.op_from_position(SourcePosition::raw(1)).unwrap(),
+            parent_stream
+                .op_from_position(SourcePosition::raw(2))
+                .unwrap(),
+        )]
+        .into()
     );
+    assert!(provider_facts(&harness.ops.ops).iter().any(|(_, evidence)| matches!(&evidence.fact,
+        ProviderFact::CodexLifecycle(meta)
+            if evidence.source == completion
+                && matches!(&meta.event, CodexLifecycleEvent::LegacyCompleted { agent_path } if agent_path == "/root/sub"))));
 }
 
 #[test]
@@ -3505,7 +3432,7 @@ fn failed_rewrite_projection_preserves_both_cursor_and_generation_for_retry() {
 }
 
 fn is_provider_evidence(op: &editchain_core::Op) -> bool {
-    matches!(&op.kind, OpKind::Note(note) if note.relationship == editchain_core::NoteRelationship::ProviderEvidence)
+    matches!(&op.kind, OpKind::Note(note) if note.relationship == NoteRelationship::ProviderEvidence)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3628,8 +3555,8 @@ fn projected_lifecycle_edges(
             continue;
         };
         let kind = match note.relationship {
-            editchain_core::NoteRelationship::SpawnedBy => 1,
-            editchain_core::NoteRelationship::ReconnectsTo => 2,
+            NoteRelationship::SpawnedBy => 1,
+            NoteRelationship::ReconnectsTo => 2,
             _ => continue,
         };
         if let Some(source) = op.parents.iter().next() {
@@ -3639,6 +3566,31 @@ fn projected_lifecycle_edges(
         }
     }
     edges
+}
+
+// Old chains stored resolved notes with this payload. Keep the fixture
+// independent of the retired producer so compatibility stays exercised.
+fn legacy_lifecycle_notes(root: &Path) -> Vec<editchain_core::Op> {
+    let parent = source_stream(root, &root.join("rollout-parent.jsonl"), 0);
+    let child = source_stream(root, &root.join("rollout-child.jsonl"), 0);
+    [
+        (6001, child.op_from_position(SourcePosition::raw(1)).unwrap(),
+            parent.op_from_position(SourcePosition::raw(2)).unwrap(), NoteRelationship::SpawnedBy, "child"),
+        (6002, parent.op_from_position(SourcePosition::raw(3)).unwrap(),
+            child.op_from_position(SourcePosition::raw(2)).unwrap(), NoteRelationship::ReconnectsTo, "parent"),
+    ].into_iter().map(|(node, anchor, target, relationship, thread)| editchain_core::Op {
+        id: editchain_core::OpId::new(editchain_core::NodeId(node), 0, 1),
+        parents: ParentSet::One(anchor),
+        actor: editchain_core::ActorId(0),
+        clock: Clock::None,
+        scope: ScopeRef::Session(derive_session_id(thread)),
+        tags: Tags::META | Tags::IMPORT,
+        kind: OpKind::Note(editchain_core::NoteOp {
+            target_ids: vec![target],
+            relationship,
+            content: Payload::Inline(br#"{"confidence":"exact","details":{},"provider":"codex","resolver":"codex-topology-v2"}"#.to_vec()),
+        }),
+    }).collect()
 }
 
 #[test]
@@ -3725,6 +3677,7 @@ fn appended_evidence_updates_terminals_and_retires_ambiguous_legacy_links() {
     )
     .unwrap();
     let mut accepted = first.ops.ops;
+    accepted.extend(legacy_lifecycle_notes(dir.path()));
     assert_eq!(projected_lifecycle_edges(&accepted).len(), 2);
     let child_path = dir.path().join("rollout-child.jsonl");
     let parent_path = dir.path().join("rollout-parent.jsonl");
@@ -3844,26 +3797,10 @@ fn lifecycle_occurrences_survive_removal_and_match_across_append_boundaries() {
     accepted.extend(second.ops.ops);
     let one_shot = import(dir.path(), &make_helper(&complete));
     let lifecycle = |ops: &[editchain_core::Op]| {
-        let mut evidence: Vec<_> = ops
-            .iter()
-            .filter(|op| {
-                if let OpKind::Note(note) = &op.kind {
-                    if let Payload::Inline(content) = &note.content {
-                        return serde_json::from_slice::<
-                                editchain_core::provider::ProviderEvidence,
-                            >(content)
-                            .ok()
-                            .is_some_and(|evidence| {
-                                matches!(
-                                    evidence.fact,
-                                    editchain_core::provider::ProviderFact::CodexLifecycle(_)
-                                )
-                            });
-                    }
-                }
-                false
-            })
-            .cloned()
+        let mut evidence: Vec<_> = provider_facts(ops)
+            .into_iter()
+            .filter(|(_, evidence)| matches!(evidence.fact, ProviderFact::CodexLifecycle(_)))
+            .map(|(op, _)| op.clone())
             .collect();
         evidence.sort_by_key(|op| op.id);
         evidence
@@ -3896,6 +3833,13 @@ fn legacy_sources_backfill_provider_evidence_once_without_replaying_content() {
         .into_iter()
         .filter(|op| !is_provider_evidence(op))
         .collect();
+    let legacy = legacy_lifecycle_notes(dir.path());
+    accepted.extend(legacy.clone());
+    assert_eq!(
+        projected_lifecycle_edges(&accepted).len(),
+        2,
+        "historical notes resolve before typed provider evidence exists"
+    );
     for name in ["rollout-parent.jsonl", "rollout-child.jsonl"] {
         let key = source_key(dir.path(), &dir.path().join(name));
         let mut legacy = cursors.get_cursor(&key).unwrap().unwrap();
@@ -3915,6 +3859,10 @@ fn legacy_sources_backfill_provider_evidence_once_without_replaying_content() {
     );
     accepted.extend(upgrade.ops.ops);
     assert_eq!(projected_lifecycle_edges(&accepted).len(), 2);
+    assert!(
+        legacy.iter().all(|op| accepted.contains(op)),
+        "migration preserves the stored old notes"
+    );
     let unavailable = HelperCommand::new("/not-an-installed-helper", Vec::new());
     let unchanged = try_import(
         dir.path(),

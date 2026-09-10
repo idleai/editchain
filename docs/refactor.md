@@ -336,9 +336,22 @@ Completed increments:
   for the workspace's pre-1.0 crates; downstream users must migrate to admission
   and project rather than the retired materialization facade.
 
+- Codex producer retirement: the importer captures lifecycle events directly
+  into the existing typed evidence format. The former per-import topology pass,
+  its temporary thread model, and the public `codex::link` producer API are
+  removed. Current imports emit no materialized spawn, completion, or fork notes;
+  the shared projector resolves edges from admitted facts. Fork execution
+  identity stays in source evidence. Version-six payloads, IDs, and checkpoints
+  retain their contract without replay. Existing integration suites now check
+  projected endpoints and supporting source envelopes; independent old-note
+  fixtures retain historical read/migration coverage. Event byte pins, duplicate
+  provider representations, ambiguous child sources, and replay checks cover
+  direct capture. The retired producer's resolver cases are exercised through
+  the live import/project path.
+
 Remaining work, in dependency order:
 
-1. Retire migrated producer compatibility machinery.
+1. Finish the reusable Git reconciliation boundary in the node library.
 2. Measure and reduce repeated work.
 
 Validation uses the existing crate, service, renderer, and extension suites.

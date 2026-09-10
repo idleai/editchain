@@ -1,7 +1,4 @@
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-
-use serde_json::Value;
 
 use crate::cursor::resolve_source_cursor;
 use crate::error::ImportError;
@@ -12,18 +9,13 @@ use crate::source_read::{SourceReadPlan, SourceReadState};
 
 use super::discover::discover_rollouts;
 use super::helper::HelperCommand;
-use super::link::{
-    emit_codex_relationship_notes, ActivityMarker, CompletionEvidence, LegacyCompletionEvidence,
-    ThreadTopology, CODEX_NORMALIZATION_VERSION, SPAWN_SIGNAL_COLLAB_TOOL,
-    SPAWN_SIGNAL_SUBAGENT_ACTIVITY,
-};
 use super::normalize::{
-    build_raw_op, completed_agent_paths_from_tool, is_blank_line, owning_thread_from_raw_line,
-    NormalizeContext,
+    build_raw_op, is_blank_line, owning_thread_from_raw_line, NormalizeContext,
 };
-use super::projection::{parse_projection, FinalItem, ProjectionKind};
+use super::projection::parse_projection;
 use super::session_git::session_git_link_op;
 use super::title::{load_session_titles, raw_session_identity, session_title_op};
+use super::CODEX_NORMALIZATION_VERSION;
 
 /// Normalization version that introduced exact session-start Git links.
 const CODEX_GIT_NORMALIZATION_VERSION: u32 = 1;
@@ -109,8 +101,6 @@ pub fn import_codex(
 ) -> Result<ImportReport, ImportError> {
     options.cancellation.check(&request.raw_root)?;
     let mut report = ImportReport::new();
-    // Per-thread exact topology for the sink-independent relationship pass.
-    let mut topology: Vec<ThreadTopology> = Vec::new();
     let session_titles = if options.normalize {
         load_session_titles(&request.raw_root)?
     } else {
@@ -170,7 +160,7 @@ pub fn import_codex(
                 .is_some_and(|cursor| cursor.normalization_version < CODEX_NORMALIZATION_VERSION);
         let needs_evidence_upgrade = options.normalize
             && existing_cursor.as_ref().is_some_and(|cursor| {
-                cursor.normalization_version < super::link::CODEX_PROVIDER_EVIDENCE_VERSION
+                cursor.normalization_version < super::evidence::CODEX_PROVIDER_EVIDENCE_VERSION
             });
         let needs_cursor_upgrade = migrates_legacy_key
             || existing_cursor.as_ref().is_some_and(|cursor| {
@@ -307,39 +297,6 @@ pub fn import_codex(
                 .and_then(|meta| meta.parent_thread_id.as_ref())
                 .and_then(|parent| session_titles.get(parent))
         });
-        let mut topo = ThreadTopology {
-            thread_id: owning_thread.clone(),
-            parent_thread_id: projection
-                .session_meta
-                .as_ref()
-                .and_then(|m| m.parent_thread_id.clone()),
-            forked_from_id: projection
-                .session_meta
-                .as_ref()
-                .and_then(|m| m.forked_from_id.clone()),
-            agent_path: projection
-                .session_meta
-                .as_ref()
-                .and_then(|m| m.agent_path.clone()),
-            first_raw: (new_cursor.ops_emitted > 0)
-                .then(|| stream.op_from_position(SourcePosition::raw(1)))
-                .transpose()?,
-            last_raw: (new_cursor.ops_emitted > 0)
-                .then(|| stream.op_from_position(SourcePosition::raw(new_cursor.ops_emitted)))
-                .transpose()?,
-            markers: Vec::new(),
-            completions: Vec::new(),
-            legacy_completions: Vec::new(),
-        };
-
-        // Capture exact lifecycle endpoints from the complete helper
-        // projection, including metadata-only version upgrades. Endpoints are
-        // physical source occurrences, so their IDs do not depend on derived
-        // lane allocation or on whether this batch replayed normalized rows.
-        if options.normalize {
-            collect_topology_evidence(&projection.final_items, &stream, &mut topo)?;
-        }
-
         // Emit raw ops for the new lines, chaining across the cursor boundary.
         let mut prev_raw_id = if start_seq > 0 {
             Some(stream.op_from_position(SourcePosition::raw(start_seq))?)
@@ -471,157 +428,9 @@ pub fn import_codex(
             cursors.set_generation(&cursor_key, boot)?;
         }
         cursors.set_cursor(&cursor_key, &new_cursor)?;
-        if options.normalize {
-            topology.push(topo);
-        }
-    }
-
-    // Sink-independent exact topology pass. Missing or ambiguous visible
-    // endpoints remain unlinked; no timestamp/file-order fallback is allowed.
-    let relationship_notes = emit_codex_relationship_notes(&topology)?;
-    for note in &relationship_notes {
-        emit_op(note, ops, &mut report, EmissionKind::Derived)?;
     }
 
     Ok(report)
-}
-
-/// Collect exact lifecycle endpoints from a complete helper projection.
-///
-/// The bridge projection is always computed over the whole rollout, including
-/// on an incremental append or metadata-only upgrade. Anchoring evidence to raw
-/// source occurrences keeps relation identity independent from normalized lane
-/// allocation. Evidence on a trailing partial line is ignored until that line
-/// becomes a durable raw occurrence on a later import.
-pub(super) fn collect_topology_evidence(
-    items: &[FinalItem],
-    stream: &SourceStream,
-    topology: &mut ThreadTopology,
-) -> Result<(), ImportError> {
-    let last_complete_ordinal = topology.last_raw.map_or(0, |op| op.seq >> 16);
-    for item in items {
-        if collect_subagent_activity_marker(item, stream, topology, last_complete_ordinal)? {
-            continue;
-        }
-        collect_collab_spawn_markers(item, stream, topology, last_complete_ordinal)?;
-
-        if item.kind != ProjectionKind::Tool
-            || item.last_seen == 0
-            || item.last_seen > last_complete_ordinal
-        {
-            continue;
-        }
-        let evidence_op = stream.op_from_position(SourcePosition::raw(item.last_seen))?;
-        if let Some(agents_states) = item.payload.get("agentsStates").and_then(Value::as_object) {
-            for (child_thread, state) in agents_states {
-                let completed = state
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .is_some_and(|status| status.eq_ignore_ascii_case("completed"));
-                if completed {
-                    topology.completions.push(CompletionEvidence {
-                        agent_thread_id: child_thread.clone(),
-                        op_id: evidence_op,
-                    });
-                }
-            }
-        }
-        if item.payload.get("tool").and_then(Value::as_str) == Some("list_agents") {
-            for agent_path in completed_agent_paths_from_tool(&item.payload) {
-                topology.legacy_completions.push(LegacyCompletionEvidence {
-                    agent_path,
-                    op_id: evidence_op,
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Preserve the older dedicated subagent-activity activation signal.
-fn collect_subagent_activity_marker(
-    item: &FinalItem,
-    stream: &SourceStream,
-    topology: &mut ThreadTopology,
-    last_complete_ordinal: u64,
-) -> Result<bool, ImportError> {
-    if item.kind != ProjectionKind::Note
-        || item.first_seen == 0
-        || item.first_seen > last_complete_ordinal
-    {
-        return Ok(false);
-    }
-    let Some(agent_thread) = item
-        .payload
-        .get("agentThreadId")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(true);
-    };
-    topology.markers.push(ActivityMarker {
-        agent_thread_id: agent_thread.to_string(),
-        agent_path: item
-            .payload
-            .get("agentPath")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string),
-        op_id: stream.op_from_position(SourcePosition::raw(item.first_seen))?,
-        started: item
-            .payload
-            .get("activityKind")
-            .and_then(Value::as_str)
-            .is_some_and(|kind| kind.eq_ignore_ascii_case("started")),
-        signal: SPAWN_SIGNAL_SUBAGENT_ACTIVITY,
-    });
-    Ok(true)
-}
-
-/// Capture the exact activation shape emitted by current Codex rollouts.
-fn collect_collab_spawn_markers(
-    item: &FinalItem,
-    stream: &SourceStream,
-    topology: &mut ThreadTopology,
-    last_complete_ordinal: u64,
-) -> Result<(), ImportError> {
-    if item.kind != ProjectionKind::Tool
-        || item.first_seen == 0
-        || item.first_seen > last_complete_ordinal
-        || item
-            .payload
-            .get("tool")
-            .and_then(Value::as_str)
-            .is_none_or(|tool| tool != "spawnAgent")
-        || item.payload.get("senderThreadId").and_then(Value::as_str)
-            != Some(topology.thread_id.as_str())
-    {
-        return Ok(());
-    }
-    let Some(receivers) = item
-        .payload
-        .get("receiverThreadIds")
-        .and_then(Value::as_array)
-    else {
-        return Ok(());
-    };
-    let occurrence = stream.op_from_position(SourcePosition::raw(item.first_seen))?;
-    let receiver_threads: BTreeSet<String> = receivers
-        .iter()
-        .filter_map(Value::as_str)
-        .filter(|thread| !thread.is_empty())
-        .map(ToString::to_string)
-        .collect();
-    for agent_thread_id in receiver_threads {
-        topology.markers.push(ActivityMarker {
-            agent_thread_id,
-            agent_path: None,
-            op_id: occurrence,
-            started: true,
-            signal: SPAWN_SIGNAL_COLLAB_TOOL,
-        });
-    }
-    Ok(())
 }
 
 /// Decide whether a rollout belongs to the requested workspace.

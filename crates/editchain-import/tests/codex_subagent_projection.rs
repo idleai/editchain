@@ -4,7 +4,7 @@
 //! `subAgentActivity` markers), all three complete via one `collabToolCall`
 //! whose per-child `agentsStates` is `completed`, and the parent's context
 //! compacts. The full importer path (raw rollouts -> `import_codex` ->
-//! relationship notes) is then fed through `editchain_project`'s collapsed
+//! provider evidence) is then fed through `editchain_project`'s collapsed
 //! `HistoryProjection` to prove:
 //!
 //! - visible rows retain branch (`SpawnedBy`) and reconnect (`ReconnectsTo`)
@@ -38,13 +38,17 @@ use tokio as _;
 
 use editchain_core::op::{NoteRelationship, OpKind};
 use editchain_core::parents::ParentSet;
+use editchain_core::provider::ProviderFact;
 use editchain_core::scope::ScopeRef;
 use editchain_core::{Op, OpId};
 use editchain_import::codex::HelperCommand;
 use editchain_import::ids::{derive_session_id, SourcePosition, SourceStream};
 use editchain_project::{HistoryNode, HistoryProjection};
 
-use common::{import, raw_bytes, sh_helper, write_dispatching_helper, write_rollout};
+use common::{
+    import, provider_facts, raw_bytes, relationship_edges, sh_helper, write_dispatching_helper,
+    write_rollout,
+};
 
 /// (child index, parent spawn-line ordinal, thread id, agent path).
 const CHILDREN: [(u32, u64, &str, &str); 3] = [
@@ -331,16 +335,14 @@ fn is_note(op: &Op, relationship: NoteRelationship) -> bool {
 #[test]
 #[expect(
     clippy::indexing_slicing,
-    clippy::panic,
-    clippy::wildcard_enum_match_arm,
     reason = "this single end-to-end test asserts directly on deterministic, known-shape fixture data"
 )]
 fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse() {
     let dir = tempfile::tempdir().unwrap();
     let harness = import(dir.path(), &fixture(dir.path()));
 
-    // Import shape: 4 rollouts, 12 raw lines, 15 normalized ops (8 content +
-    // 7 exact relationship facts), no malformed bridge records.
+    // Import shape: 4 rollouts, 12 raw lines, 8 normalized content ops,
+    // and source/lifecycle/derivation facts for independent projection.
     assert_eq!(
         harness.report.files_discovered, 4,
         "one parent + three children discovered"
@@ -348,8 +350,8 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
     assert_eq!(harness.report.files_processed, 4, "every rollout processed");
     assert_eq!(harness.report.raw_ops, 12, "6 parent lines + 2 per child");
     assert_eq!(
-        harness.report.normalized_ops, 15,
-        "8 content ops + 3 SpawnedBy + 1 ReconnectsTo + 3 ForkedFrom facts"
+        harness.report.normalized_ops, 8,
+        "only the 8 content operations are normalized"
     );
     assert_eq!(harness.report.malformed, 0, "no bridge decode errors");
     assert_eq!(
@@ -358,100 +360,60 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
     );
     assert_eq!(
         harness.ops.ops.len(),
-        49,
-        "12 raw + 15 normalized + 22 provider evidence ops"
+        42,
+        "12 raw + 8 normalized + 22 provider evidence ops"
     );
 
     // Deterministic source streams per physical rollout.
     let parent = stream_for(dir.path(), "rollout-parent.jsonl");
     let child = |n: u32| stream_for(dir.path(), &format!("rollout-child-{n}.jsonl"));
 
-    // --- Op-level topology -------------------------------------------------
-    // The importer emits exactly one SpawnedBy fact per child and one grouped
-    // ReconnectsTo note for the collab completion.
-    let spawned_by: Vec<&Op> = harness
-        .ops
-        .ops
-        .iter()
-        .filter(|o| is_note(o, NoteRelationship::SpawnedBy))
-        .collect();
-    let reconnects_to: Vec<&Op> = harness
-        .ops
-        .ops
-        .iter()
-        .filter(|o| is_note(o, NoteRelationship::ReconnectsTo))
-        .collect();
-    assert_eq!(
-        spawned_by.len(),
-        3,
-        "one exact SpawnedBy fact per spawned child"
-    );
+    let projection = HistoryProjection::from_ops(harness.ops.ops.clone());
+    let spawned_by = relationship_edges(&projection, NoteRelationship::SpawnedBy);
+    let reconnects_to = relationship_edges(&projection, NoteRelationship::ReconnectsTo);
+    assert_eq!(spawned_by.len(), 3, "one exact spawn per child");
     assert_eq!(
         reconnects_to.len(),
-        1,
-        "one grouped ReconnectsTo note for the completion tool call"
+        3,
+        "completion resolves each child's terminal"
     );
-
-    // SpawnedBy: causal parent = the child's first raw op; target = the parent
-    // thread's physical occurrence carrying the real `started` marker.
-    for (n, spawn_ordinal, thread, _path) in CHILDREN {
-        let child_stream = child(n);
-        let expected_parent = child_stream
-            .op_from_position(SourcePosition::raw(1))
-            .unwrap();
-        // Notes are sorted by their causal parent's node id (a path hash), so
-        // locate each child's note by its causal parent rather than by index.
-        let note = spawned_by
-            .iter()
-            .find(|note| note.parents == ParentSet::One(expected_parent))
-            .unwrap_or_else(|| panic!("missing SpawnedBy fact for {thread}"));
-        let expected_target = parent
-            .op_from_position(SourcePosition::raw(spawn_ordinal))
-            .unwrap();
-        match &note.kind {
-            OpKind::Note(note) => assert_eq!(
-                note.target_ids,
-                vec![expected_target],
-                "SpawnedBy target is the parent's exact started occurrence for {thread}"
-            ),
-            _ => panic!("expected a note op"),
-        }
-    }
-
-    // ReconnectsTo: causal parent = the physical completion occurrence;
-    // targets = each child's last raw op, sorted.
-    let reconnect = reconnects_to[0];
-    assert_eq!(
-        reconnect.parents,
-        ParentSet::One(parent.op_from_position(SourcePosition::raw(5)).unwrap()),
-        "ReconnectsTo causal parent is the exact completion occurrence"
-    );
-    let mut expected_reconnect_targets: Vec<OpId> = CHILDREN
-        .iter()
-        .map(|(n, _, _, _)| child(*n).op_from_position(SourcePosition::raw(2)).unwrap())
-        .collect();
-    expected_reconnect_targets.sort_unstable();
-    match &reconnect.kind {
-        OpKind::Note(note) => assert_eq!(
-            note.target_ids, expected_reconnect_targets,
-            "ReconnectsTo targets are each child's last raw op"
-        ),
-        _ => panic!("expected a note op"),
+    for (n, spawn_ordinal, thread, _) in CHILDREN {
+        assert!(
+            spawned_by.contains(&(
+                child(n).op_from_position(SourcePosition::raw(1)).unwrap(),
+                parent
+                    .op_from_position(SourcePosition::raw(spawn_ordinal))
+                    .unwrap(),
+            )),
+            "exact spawn endpoint for {thread}"
+        );
+        assert!(
+            reconnects_to.contains(&(
+                parent.op_from_position(SourcePosition::raw(5)).unwrap(),
+                child(n).op_from_position(SourcePosition::raw(2)).unwrap(),
+            )),
+            "exact completion endpoint for {thread}"
+        );
     }
 
     // Every relationship endpoint resolves to an emitted op (causal parent,
     // every target, and the note itself).
     let op_ids: HashSet<OpId> = harness.ops.ops.iter().map(|op| op.id).collect();
-    for op in harness.ops.ops.iter().filter(|o| {
-        matches!(
-            &o.kind,
-            OpKind::Note(n)
-                if matches!(
-                    n.relationship,
-                    NoteRelationship::SpawnedBy | NoteRelationship::ReconnectsTo
-                )
-        )
-    }) {
+    for op in projection
+        .relationship_notes()
+        .values()
+        .flatten()
+        .filter(|o| {
+            matches!(
+                &o.kind,
+                OpKind::Note(n)
+                    if matches!(
+                        n.relationship,
+                        NoteRelationship::SpawnedBy | NoteRelationship::ReconnectsTo
+                    )
+            )
+        })
+    {
         for parent in &op.parents {
             assert!(
                 op_ids.contains(parent),
@@ -468,15 +430,14 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
         }
         assert!(
             op_ids.contains(&op.id),
-            "the relationship note {} itself is emitted",
+            "the relationship proof {} itself is emitted",
             op.id
         );
     }
 
     // --- Collapsed projection rows -----------------------------------------
-    let projection = HistoryProjection::from_ops(harness.ops.ops.clone());
     let nodes = projection.nodes();
-    assert_eq!(nodes.len(), 9, "27 ops collapse to 9 Activity rows");
+    assert_eq!(nodes.len(), 9, "42 operations collapse to 9 Activity rows");
     let row_by_key: HashMap<String, &HistoryNode> =
         nodes.iter().map(|n| (n.node_key(), n)).collect();
     for node in &nodes {
@@ -489,11 +450,7 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
         .ops
         .ops
         .iter()
-        .filter(|o| {
-            is_note(o, NoteRelationship::SpawnedBy)
-                || is_note(o, NoteRelationship::ReconnectsTo)
-                || is_note(o, NoteRelationship::ForkedFrom)
-        })
+        .filter(|o| is_note(o, NoteRelationship::ProviderEvidence))
         .map(|o| o.id.to_string())
         .collect();
     for node in &nodes {
@@ -741,48 +698,33 @@ fn markerless_subagents_stay_unlinked_regardless_of_clocks() {
     assert_eq!(harness.report.files_processed, 6, "every rollout processed");
     assert_eq!(harness.report.raw_ops, 15, "5 parent lines + 2 per child");
     assert_eq!(
-        harness.report.normalized_ops, 10,
-        "5 child messages + 5 hidden ForkedFrom facts"
+        harness.report.normalized_ops, 5,
+        "5 child messages; fork identity stays in source evidence"
     );
     assert_eq!(harness.report.malformed, 0, "no bridge decode errors");
 
-    let spawned_by: Vec<&Op> = harness
-        .ops
-        .ops
-        .iter()
-        .filter(|o| is_note(o, NoteRelationship::SpawnedBy))
-        .collect();
-    assert!(spawned_by.is_empty(), "no exact spawn marker means no edge");
+    let projection = HistoryProjection::from_ops(harness.ops.ops.clone());
+    assert!(
+        relationship_edges(&projection, NoteRelationship::SpawnedBy).is_empty(),
+        "no exact spawn marker means no edge"
+    );
     assert_eq!(
-        harness
-            .ops
-            .ops
+        provider_facts(&harness.ops.ops)
             .iter()
-            .filter(|o| is_note(o, NoteRelationship::ForkedFrom))
+            .filter(|(_, evidence)| matches!(&evidence.fact,
+        ProviderFact::CodexSource(meta) if meta.forked_from.is_some()))
             .count(),
         5,
         "exact fork metadata remains inspectable without row geometry"
     );
+    assert!(relationship_edges(&projection, NoteRelationship::ForkOf).is_empty());
     assert!(
-        !harness
-            .ops
-            .ops
-            .iter()
-            .any(|o| is_note(o, NoteRelationship::ForkOf)),
-        "no fork geometry"
-    );
-    assert!(
-        !harness
-            .ops
-            .ops
-            .iter()
-            .any(|o| is_note(o, NoteRelationship::ReconnectsTo)),
+        relationship_edges(&projection, NoteRelationship::ReconnectsTo).is_empty(),
         "no completion evidence in this fixture"
     );
 
     // Every child remains an independent source root in the visible projection;
     // neither known nor unknown timestamps create provenance.
-    let projection = HistoryProjection::from_ops(harness.ops.ops.clone());
     let rows: HashMap<String, HistoryNode> = projection
         .nodes()
         .into_iter()
@@ -898,7 +840,6 @@ fn embedded_parent_session_meta_does_not_hijack_child_identity_or_scope() {
             !is_note(o, NoteRelationship::ProviderEvidence)
                 && (o.id.node == child_node
                     || o.parents.iter().any(|parent| parent.node == child_node))
-                && !is_note(o, NoteRelationship::ForkedFrom)
         })
         .collect();
     assert_eq!(child_ops.len(), 4, "3 raw + 1 message");
@@ -928,28 +869,21 @@ fn embedded_parent_session_meta_does_not_hijack_child_identity_or_scope() {
         "embedded parent meta is preserved byte-exact (with its newline) in the child's raw lane"
     );
 
-    // With no exact started marker, parentThreadId does not manufacture a row
-    // edge from either the parent clock or the embedded copy.
-    assert!(!harness
-        .ops
-        .ops
+    // The source identity and scope survive the embedded parent metadata.
+    let projection = HistoryProjection::from_ops(harness.ops.ops.clone());
+    assert!(relationship_edges(&projection, NoteRelationship::SpawnedBy).is_empty());
+    assert!(relationship_edges(&projection, NoteRelationship::ForkOf).is_empty());
+    let facts = provider_facts(&harness.ops.ops);
+    let (op, evidence) = facts
         .iter()
-        .any(|o| is_note(o, NoteRelationship::SpawnedBy)));
-
-    // The explicit fork field is still retained as a hidden execution fact,
-    // anchored to the child's own first occurrence and scope.
-    let note = harness
-        .ops
-        .ops
-        .iter()
-        .find(|o| is_note(o, NoteRelationship::ForkedFrom))
-        .expect("ForkedFrom fact");
-    assert_eq!(note.parents, ParentSet::One(child_first));
-    assert_eq!(
-        note.scope, child_session,
-        "relationship note is child-scoped"
-    );
-    assert!(matches!(&note.kind, OpKind::Note(fact)
-        if fact.target_ids.len() == 1
-            && !fact.target_ids.contains(&child_embedded_meta)));
+        .find(|(_, evidence)| {
+            matches!(&evidence.fact,
+        ProviderFact::CodexSource(meta) if meta.thread.0 == "emb-child")
+        })
+        .expect("child source evidence");
+    assert_eq!(op.scope, child_session);
+    assert_eq!(op.parents, ParentSet::One(evidence.source));
+    assert!(matches!(&evidence.fact, ProviderFact::CodexSource(meta)
+        if meta.first == child_first && meta.first != child_embedded_meta
+            && meta.forked_from.as_ref().is_some_and(|thread| thread.0 == "parent-emb")));
 }

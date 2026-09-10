@@ -137,7 +137,8 @@
 //!
 //! ## Structural topology
 //!
-//! Relationship facts come only from explicit bridge evidence:
+//! Capture preserves typed source extents and lifecycle observations; project
+//! resolves relationships from all admitted evidence, across import batches:
 //!
 //! - `sessionMeta.parentThreadId` yields a visible `SpawnedBy` edge only when
 //!   exactly one matching current `collabToolCall.spawnAgent` occurrence (or
@@ -152,8 +153,8 @@
 //!   `agents[{agent_name, agent_status:{completed:...}}]`) yield
 //!   `ReconnectsTo` edges by mapping each completed `agent_name` to exactly
 //!   one `started` marker's `agentPath` in the same thread;
-//! - `sessionMeta.forkedFromId` yields a hidden `ForkedFrom` execution fact,
-//!   never a timestamp-selected row-level `ForkOf` edge.
+//! - `sessionMeta.forkedFromId` stays in the typed source evidence, without
+//!   supplying a timestamp-selected row-level `ForkOf` edge.
 //!
 //! Missing and ambiguous endpoints stay unlinked. The resolver never uses
 //! timestamps, file order, content, names, or proximity as provenance.
@@ -177,8 +178,6 @@ mod evidence;
 pub mod helper;
 /// Top-level import orchestrator for Codex rollouts.
 pub mod import;
-/// Exact cross-thread execution-topology facts.
-pub mod link;
 mod materialize;
 /// Normalization of raw lines and projection items into editchain ops.
 pub mod normalize;
@@ -191,7 +190,6 @@ mod title;
 pub use discover::{discover_rollouts, RolloutFile};
 pub use helper::HelperCommand;
 pub use import::{import_codex, CodexDiscoveryRequest};
-pub use link::{emit_codex_relationship_notes, ActivityMarker, ThreadTopology};
 pub use normalize::{
     build_raw_op, completed_agent_paths_from_tool, inter_agent_summary,
     normalized_ops_for_compaction, normalized_ops_for_inter_agent, normalized_ops_for_item,
@@ -202,3 +200,9 @@ pub use projection::{
     ProjectionItem, ProjectionKind, SessionGitMeta, SessionMeta, TurnMeta,
 };
 pub use session_git::RepositoryLookup;
+
+/// Cursor checkpoint for Codex normalized metadata. Version six captures typed
+/// source/lifecycle evidence for resolution across imports. Version five retains
+/// path-specific file changes; version four recognized current collab spawns,
+/// version three added session titles, and version two added topology notes.
+pub const CODEX_NORMALIZATION_VERSION: u32 = 6;
