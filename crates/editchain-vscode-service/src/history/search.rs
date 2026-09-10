@@ -2,17 +2,19 @@
 //! known file paths, Git messages/refs/full OIDs, and Git-link labels. Raw JSON,
 //! private operations, file bodies, and auxiliary payloads are not searchable.
 
+pub(super) mod index;
+
 use std::collections::HashMap;
 
 use editchain_core::{GitCommitEntity, GitCommitKey, Op, OpId, OpKind, Payload, Tags};
-use editchain_index::{
-    ChunkOptions, DocumentId, LexicalHit, LexicalIndex, LexicalIndexBuilder, SearchDocument,
-};
 use editchain_project::activity_view::ActivityView;
 use editchain_project::NodeKey;
 use editchain_protocol::{
     FileChangeDto, FindInHistoryMatch, FindInHistoryResponse, SnapshotId, MAX_QUERY_BYTES,
     MAX_SEARCH_RESULTS,
+};
+use index::{
+    ChunkOptions, DocumentId, LexicalHit, LexicalIndex, LexicalIndexBuilder, SearchDocument,
 };
 
 use super::{stale_snapshot, BlobResolution, ExpandedChildRow, Workspace};
@@ -238,7 +240,8 @@ impl Workspace {
 impl SearchIndexState {
     /// Inspect real candidate identities without changing the published index.
     #[must_use]
-    pub const fn index(&self) -> &LexicalIndex {
+    #[cfg(test)]
+    pub(super) const fn index(&self) -> &LexicalIndex {
         &self.index
     }
 

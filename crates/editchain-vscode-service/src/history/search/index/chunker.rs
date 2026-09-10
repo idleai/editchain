@@ -1,11 +1,12 @@
 //! Deterministic overlapping UTF-8 text ranges, independent of source identity.
 
+#[cfg(test)]
 use std::io;
 use std::ops::Range;
 
 /// Validated chunk sizes, using the existing estimate of four bytes per token.
 #[derive(Debug, Clone, Copy)]
-pub struct ChunkOptions {
+pub(crate) struct ChunkOptions {
     window_bytes: usize,
     stride_bytes: usize,
 }
@@ -16,7 +17,8 @@ impl ChunkOptions {
     /// # Errors
     ///
     /// Rejects invalid or unrepresentable sizes before chunking any text.
-    pub fn new(window_tokens: u32, overlap_tokens: u32) -> Result<Self, io::Error> {
+    #[cfg(test)]
+    pub(crate) fn new(window_tokens: u32, overlap_tokens: u32) -> Result<Self, io::Error> {
         if window_tokens == 0 || overlap_tokens >= window_tokens {
             return Err(io::Error::other(
                 "chunk overlap must be smaller than a positive window",
@@ -49,7 +51,7 @@ impl Default for ChunkOptions {
 
 /// Borrowed text ranges whose endpoints are already valid UTF-8 boundaries.
 #[derive(Debug)]
-pub struct TextChunks<'a> {
+pub(crate) struct TextChunks<'a> {
     text: &'a str,
     options: ChunkOptions,
     start: usize,
@@ -57,7 +59,7 @@ pub struct TextChunks<'a> {
 
 /// Chunk text lazily without allocating chunk records or source identifiers.
 #[must_use]
-pub const fn chunk_text(text: &str, options: ChunkOptions) -> TextChunks<'_> {
+pub(crate) const fn chunk_text(text: &str, options: ChunkOptions) -> TextChunks<'_> {
     TextChunks {
         text,
         options,

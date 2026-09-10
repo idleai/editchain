@@ -437,6 +437,13 @@ In-repo callers now use `editchain_store::format`; the old codec package path
 is retired. This first merge passes the full lint suite, with ten packages and
 19 direct production dependencies between workspace packages.
 
+The index package is now private to the history backend's search module.
+Deterministic chunking and the Tantivy index moved with all their tests; raw
+candidate identities are inspected only within that module's test boundary.
+Callers retain the opaque history-search interface. This second merge passes
+the full lint suite, with nine packages and 17 direct production dependencies
+between workspace packages.
+
 The planned refactor increments are complete. EC02 and historical operations
 remain readable; the documented protocol, repository-qualified row keys, and
 pre-1.0 Rust API changes require coordinated consumers. Compatibility readers

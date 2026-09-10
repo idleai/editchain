@@ -5,6 +5,7 @@ use super::legacy_preview::{
 };
 use super::payloads::DISPLAY_PREVIEW_READ_LIMIT;
 use super::presentation::{row_content_dto, sub_op_label};
+use super::search::index::{DocumentId, LexicalHit};
 use super::*;
 use crate::Server;
 use editchain_core::{
@@ -13,7 +14,6 @@ use editchain_core::{
 };
 use editchain_import::BlobSink as _;
 use editchain_import::FsBlobSink;
-use editchain_index::{DocumentId, LexicalHit};
 use editchain_protocol::{
     ParentRelationDto, ParentRelationKind, Request, RequestBody, ResponseBody,
 };
@@ -2229,4 +2229,101 @@ fn find_in_history_excludes_nested_repository_git_hits() {
     // row and is dropped rather than mapped to a phantom offset.
     let hidden = ws.find_in_history(&chunks);
     assert!(hidden.is_empty());
+}
+
+#[test]
+fn op_identifiers_above_2_53_round_trip_exactly_through_window_details_and_find() {
+    let big_op = Op {
+        id: OpId::new(NodeId(OVER_2_53), 0, 42),
+        parents: ParentSet::None,
+        actor: ActorId(1),
+        clock: Clock::UnixMs(1_700_000_042),
+        scope: ScopeRef::None,
+        tags: Tags::MESSAGE,
+        kind: OpKind::Message(MessageOp {
+            content: Payload::Inline(b"needle-exact-id".to_vec()),
+            content_type: Payload::Empty,
+        }),
+    };
+    let projection = HistoryProjection::from_ops(vec![big_op.clone()]);
+    let mut ws = Workspace::from_projection(projection);
+
+    // History window: the op id must be the exact decimal string, never a
+    // number that JavaScript could round.
+    let window = ws
+        .history_window(HistoryWindowOptions {
+            offset: 0,
+            limit: 10,
+            include_layout: true,
+        })
+        .unwrap();
+    let row = window
+        .rows
+        .iter()
+        .find(|r| r.op_id.is_some())
+        .expect("op row");
+    assert_eq!(row.op_id.as_deref(), Some(big_op.id.to_string().as_str()));
+    assert_eq!(row.op_id.as_deref(), Some("9007199254740993:0:42"));
+
+    // Node details resolve from the exact string and echo it back exactly.
+    let details = ws
+        .node_details(Some(big_op.id.to_string()), None)
+        .expect("details");
+    assert_eq!(details.op_id.as_deref(), Some("9007199254740993:0:42"));
+    assert_eq!(
+        details.parents,
+        big_op
+            .parents
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+    );
+
+    // The lexical index retains the exact operation identity internally.
+    let state = build_lexical_index(&mut ws).unwrap();
+    let results = state
+        .index()
+        .candidates("needle-exact-id", 5)
+        .unwrap()
+        .next_page(5)
+        .unwrap()
+        .hits;
+    let hit = results
+        .iter()
+        .find(|r| r.document == DocumentId::Operation(big_op.id))
+        .expect("search hit for big op");
+    assert_eq!(hit.document, DocumentId::Operation(big_op.id));
+
+    // The full protocol path (Server::handle over a real chain dir) must
+    // return the same exact strings inside an Ok envelope.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let chain_dir = tmp.path().join(".editchain");
+    write_chain(&chain_dir, std::slice::from_ref(&big_op));
+    let mut server = Server::new();
+    let open = server
+        .handle(&Request {
+            id: 1,
+            body: RequestBody::Open(editchain_protocol::OpenRequest {
+                workspace_path: tmp.path().to_str().expect("utf8").to_string(),
+                chain_dir: ".editchain".to_string(),
+            }),
+        })
+        .expect("open");
+    assert!(matches!(open.body, ResponseBody::Ok(_)));
+    let find = server
+        .handle(&Request {
+            id: 2,
+            body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
+                snapshot_id: server.workspace.as_ref().unwrap().snapshot_id().clone(),
+                query: "needle-exact-id".to_string(),
+                top_k: 5,
+            }),
+        })
+        .expect("find");
+    let value = match find.body {
+        ResponseBody::Ok(value) => Some(value),
+        ResponseBody::Error(_) => None,
+    }
+    .expect("expected Ok find response");
+    assert_eq!(value["matches"][0]["node_key"], "9007199254740993:0:42");
 }

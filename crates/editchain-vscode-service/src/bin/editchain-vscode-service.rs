@@ -18,10 +18,10 @@ use std::io::{self, Read, Write};
 use blake3 as _;
 use editchain_core as _;
 use editchain_git as _;
-use editchain_index as _;
 use editchain_project as _;
 use editchain_store as _;
 use serde as _;
+use tantivy as _;
 
 #[cfg(test)]
 use editchain_import as _;

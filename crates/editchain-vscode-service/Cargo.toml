@@ -21,7 +21,7 @@ editchain-store = { path = "../editchain-store" }
 editchain-git = { path = "../editchain-git" }
 editchain-project = { path = "../editchain-project" }
 editchain-protocol = { path = "../editchain-protocol" }
-editchain-index = { path = "../editchain-index" }
+tantivy = { version = "0.22", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,7 +1,7 @@
 #![doc = "Validated deterministic chunk ranges. Content policy is tested in service."]
 
+use super::super::{chunk_text, ChunkOptions};
 use editchain_core as _;
-use editchain_index::chunker::{chunk_text, ChunkOptions};
 use tantivy as _;
 
 #[test]

@@ -9,11 +9,11 @@ use tantivy::{doc, Index, IndexReader, IndexWriter, ReloadPolicy, Searcher, Tant
 
 use editchain_core::{GitCommitKey, OpId};
 
-use crate::chunker::{chunk_text, ChunkOptions};
+use super::chunker::{chunk_text, ChunkOptions};
 
 /// Real source identity, retained exactly through chunking and retrieval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum DocumentId {
+pub(crate) enum DocumentId {
     /// A persisted operation in the chain.
     Operation(OpId),
     /// A commit qualified by repository, including its full object format/OID.
@@ -22,22 +22,22 @@ pub enum DocumentId {
 
 /// Searchable text selected and resolved by the application before indexing.
 #[derive(Debug)]
-pub struct SearchDocument<'a> {
+pub(crate) struct SearchDocument<'a> {
     /// Identity used by the application to resolve a visible row.
-    pub id: DocumentId,
+    pub(crate) id: DocumentId,
     /// Prepared text; privacy and payload access belong to the application.
-    pub text: &'a str,
+    pub(crate) text: &'a str,
     /// Complete identifiers or paths that also need exact-token matching.
-    pub exact_terms: &'a [&'a str],
+    pub(crate) exact_terms: &'a [&'a str],
 }
 
 /// A ranked chunk. Visible-row resolution and deduplication belong to the host.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LexicalHit {
+pub(crate) struct LexicalHit {
     /// Real identity of the document containing this chunk.
-    pub document: DocumentId,
+    pub(crate) document: DocumentId,
     /// Tantivy BM25 score; larger values are more relevant.
-    pub score: f64,
+    pub(crate) score: f64,
 }
 
 #[derive(Debug)]
@@ -67,7 +67,7 @@ fn build_schema() -> (Schema, LexicalFields) {
 }
 
 /// Fallible construction of an unpublished index; queries require publication.
-pub struct LexicalIndexBuilder {
+pub(crate) struct LexicalIndexBuilder {
     fields: LexicalFields,
     index: Index,
     writer: IndexWriter,
@@ -91,7 +91,7 @@ impl LexicalIndexBuilder {
     /// # Errors
     ///
     /// Returns an error when Tantivy cannot create its writer.
-    pub fn new(chunks: ChunkOptions) -> Result<Self, Box<dyn std::error::Error>> {
+    pub(crate) fn new(chunks: ChunkOptions) -> Result<Self, Box<dyn std::error::Error>> {
         let (schema, fields) = build_schema();
         let index = Index::create_in_ram(schema);
         let writer = index.writer(50_000_000)?;
@@ -109,7 +109,7 @@ impl LexicalIndexBuilder {
     /// # Errors
     ///
     /// Returns an error when a document cannot be represented or indexed.
-    pub fn add_document(
+    pub(crate) fn add_document(
         &mut self,
         document: &SearchDocument<'_>,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -140,7 +140,7 @@ impl LexicalIndexBuilder {
     /// # Errors
     ///
     /// Returns an error when Tantivy cannot commit or open the committed reader.
-    pub fn publish(mut self) -> Result<LexicalIndex, Box<dyn std::error::Error>> {
+    pub(crate) fn publish(mut self) -> Result<LexicalIndex, Box<dyn std::error::Error>> {
         let _opstamp = self.writer.commit()?;
         let reader = self
             .index
@@ -157,7 +157,7 @@ impl LexicalIndexBuilder {
 }
 
 /// Read-only BM25 index. There is no partially committed query/update state.
-pub struct LexicalIndex {
+pub(crate) struct LexicalIndex {
     fields: LexicalFields,
     index: Index,
     reader: IndexReader,
@@ -174,7 +174,7 @@ impl std::fmt::Debug for LexicalIndex {
 }
 
 /// Maximum number of ranked chunks one query may retrieve, across all pages.
-pub const MAX_CANDIDATES: usize = 65_536;
+pub(crate) const MAX_CANDIDATES: usize = 65_536;
 
 impl LexicalIndex {
     /// Parse a query once and retain a fixed searcher for bounded continuation.
@@ -182,7 +182,7 @@ impl LexicalIndex {
     /// # Errors
     ///
     /// Rejects a zero/excessive scan budget or a query Tantivy cannot parse.
-    pub fn candidates(
+    pub(crate) fn candidates(
         &self,
         query: &str,
         budget: usize,
@@ -206,14 +206,14 @@ impl LexicalIndex {
 
     /// Number of committed chunks.
     #[must_use]
-    pub fn num_docs(&self) -> usize {
+    pub(crate) fn num_docs(&self) -> usize {
         usize::try_from(self.reader.searcher().num_docs()).unwrap_or(usize::MAX)
     }
 }
 
 /// Continuation over one immutable index and one parsed query.
 #[derive(Debug)]
-pub struct LexicalQuery<'a> {
+pub(crate) struct LexicalQuery<'a> {
     parsed: Box<dyn Query>,
     searcher: Searcher,
     documents: &'a [DocumentId],
@@ -224,17 +224,17 @@ pub struct LexicalQuery<'a> {
 
 /// One candidate page; exhaustion is measured before visible-row filtering.
 #[derive(Debug)]
-pub struct CandidatePage {
+pub(crate) struct CandidatePage {
     /// Chunks ranked by descending BM25 score.
-    pub hits: Vec<LexicalHit>,
+    pub(crate) hits: Vec<LexicalHit>,
     /// Matching chunks remain, possibly beyond the query's scan budget.
-    pub more: bool,
+    pub(crate) more: bool,
 }
 
 impl LexicalQuery<'_> {
     /// Remaining chunks permitted by this query's aggregate scan budget.
     #[must_use]
-    pub const fn remaining_budget(&self) -> usize {
+    pub(crate) const fn remaining_budget(&self) -> usize {
         self.budget.saturating_sub(self.offset)
     }
 
@@ -244,7 +244,10 @@ impl LexicalQuery<'_> {
     ///
     /// Rejects a zero page size or exhausted budget and reports Tantivy failures
     /// or invalid stored document references as errors rather than guessed IDs.
-    pub fn next_page(&mut self, limit: usize) -> Result<CandidatePage, Box<dyn std::error::Error>> {
+    pub(crate) fn next_page(
+        &mut self,
+        limit: usize,
+    ) -> Result<CandidatePage, Box<dyn std::error::Error>> {
         let limit = limit.min(self.remaining_budget());
         if limit == 0 {
             return Err(

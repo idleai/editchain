@@ -2,10 +2,10 @@
 
 use std::collections::HashSet;
 
-use editchain_core::{GitCommitKey, GitOid, NodeId, OpId, RepositoryId};
-use editchain_index::{
+use super::super::{
     ChunkOptions, DocumentId, LexicalIndex, LexicalIndexBuilder, SearchDocument, MAX_CANDIDATES,
 };
+use editchain_core::{GitCommitKey, GitOid, NodeId, OpId, RepositoryId};
 use tantivy as _;
 
 fn index(documents: &[SearchDocument<'_>]) -> Result<LexicalIndex, Box<dyn std::error::Error>> {

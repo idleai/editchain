@@ -615,14 +615,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "editchain-index"
-version = "0.1.0"
-dependencies = [
- "editchain-core",
- "tantivy",
-]
-
-[[package]]
 name = "editchain-node"
 version = "0.1.0"
 dependencies = [
@@ -678,12 +670,12 @@ dependencies = [
  "editchain-core",
  "editchain-git",
  "editchain-import",
- "editchain-index",
  "editchain-project",
  "editchain-protocol",
  "editchain-store",
  "serde",
  "serde_json",
+ "tantivy",
  "tempfile",
 ]
 
