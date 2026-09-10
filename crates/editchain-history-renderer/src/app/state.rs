@@ -696,7 +696,7 @@ impl HistoryAppState {
         let Some(row) = self.cache.get_by_index(abs) else {
             return;
         };
-        self.selection.select(host::row::str(row, "node_key"));
+        self.selection.select(&row.source.node_key);
     }
 
     /// `clearSelection` — drop the inline selection.
@@ -885,7 +885,7 @@ impl HistoryAppState {
         }
         let cached = self.cache.get(target.abs)?;
         let expected = self.find.matches().get(target.index)?;
-        if host::row::str(cached, "node_key") != expected.node_key {
+        if cached.source.node_key != expected.node_key {
             self.fail_snapshot(
                 step,
                 "The search result no longer matches this history row. Refresh history.",
@@ -1461,9 +1461,9 @@ impl HistoryAppState {
             if !self.cache.contains_key(abs) {
                 self.total_fetched = self.total_fetched.saturating_add(1);
             }
-            // The presentation adapter still consumes flat rows; defaults and
-            // wire types have already been decoded once by the shared protocol.
-            drop(self.cache.insert(abs, json!(row)));
+            // Resolve compatibility presentation once; retain the decoded DTO
+            // for subsequent rendering and exact source actions.
+            drop(self.cache.insert(abs, row.into()));
         }
         // Complete a pending find jump before eviction changes the viewport.
         let mut effective_viewport = *viewport;
@@ -2208,7 +2208,11 @@ mod tests {
             ..fixture_state()
         };
         for i in 0..500i64 {
-            drop(state.cache.insert(abs(i), row(i, &format!("node:{i}"), 1)));
+            drop(
+                state
+                    .cache
+                    .insert_legacy(abs(i), &row(i, &format!("node:{i}"), 1)),
+            );
         }
 
         let mut step = Step::new();
@@ -2333,7 +2337,11 @@ mod tests {
             ..fixture_state()
         };
         for i in 0..500i64 {
-            drop(state.cache.insert(abs(i), row(i, &format!("node:{i}"), 1)));
+            drop(
+                state
+                    .cache
+                    .insert_legacy(abs(i), &row(i, &format!("node:{i}"), 1)),
+            );
         }
 
         let mut step = Step::new();
@@ -2384,7 +2392,11 @@ mod tests {
             ..fixture_state()
         };
         for i in 0..10i64 {
-            drop(state.cache.insert(abs(i), row(i, &format!("node:{i}"), 1)));
+            drop(
+                state
+                    .cache
+                    .insert_legacy(abs(i), &row(i, &format!("node:{i}"), 1)),
+            );
         }
         let mut step = Step::new();
         state.submit_find("needle", &mut step);
@@ -2462,7 +2474,7 @@ mod tests {
             expansion: Some(flat_expansion(10)),
             ..fixture_state()
         };
-        drop(state.cache.insert(abs(3), row(3, "node:3", 0)));
+        drop(state.cache.insert_legacy(abs(3), &row(3, "node:3", 0)));
         state.select_row(3);
         state.submit_find("hidden", &mut Step::new());
         assert_eq!(
@@ -2787,7 +2799,11 @@ mod tests {
             ..fixture_state()
         };
         for i in 0..2000i64 {
-            drop(state.cache.insert(abs(i), row(i, &format!("node:{i}"), 1)));
+            drop(
+                state
+                    .cache
+                    .insert_legacy(abs(i), &row(i, &format!("node:{i}"), 1)),
+            );
         }
         state.evict_far_windows(&vp());
         assert!(!state.cache.contains_key(abs(1500)), "far rows evicted");
@@ -2818,7 +2834,7 @@ mod tests {
             expansion: Some(counted_expansion(50_002, &[50_000, 0])),
             ..fixture_state()
         };
-        drop(state.cache.insert(abs(0), row(0, "first", 1)));
+        drop(state.cache.insert_legacy(abs(0), &row(0, "first", 1)));
         let mut step = Step::new();
         state.fetch_window(&vp(), &mut step);
         let pending = state.requests.pending_window().unwrap();
@@ -2859,7 +2875,11 @@ mod tests {
         );
         assert_eq!(state.requests.log().len(), 1);
         for hidden in 1..5000 {
-            drop(state.cache.insert(abs(hidden), row(hidden, "hidden", 1)));
+            drop(
+                state
+                    .cache
+                    .insert_legacy(abs(hidden), &row(hidden, "hidden", 1)),
+            );
         }
         state.evict_far_windows(&vp());
         assert_eq!(state.cache.len(), MAX_CACHED_ROWS);
@@ -2939,7 +2959,11 @@ mod tests {
             ..fixture_state()
         };
         for i in 0..2000i64 {
-            drop(state.cache.insert(abs(i), row(i, &format!("node:{i}"), 1)));
+            drop(
+                state
+                    .cache
+                    .insert_legacy(abs(i), &row(i, &format!("node:{i}"), 1)),
+            );
         }
         state.render_top = 0;
         state.render_bottom = 399;
@@ -3068,7 +3092,11 @@ mod tests {
             ..fixture_state()
         };
         for i in 0..10i64 {
-            drop(state.cache.insert(abs(i), row(i, &format!("node:{i}"), 1)));
+            drop(
+                state
+                    .cache
+                    .insert_legacy(abs(i), &row(i, &format!("node:{i}"), 1)),
+            );
         }
         let mut step = Step::new();
         state.submit_find("needle", &mut step);
@@ -3118,7 +3146,11 @@ mod tests {
             ..fixture_state()
         };
         for i in 0..6i64 {
-            drop(state.cache.insert(abs(i), row(i, &format!("node:{i}"), 1)));
+            drop(
+                state
+                    .cache
+                    .insert_legacy(abs(i), &row(i, &format!("node:{i}"), 1)),
+            );
         }
         // Select row 1 and pin the roving anchor to row 3.
         state.select_row(1);
@@ -3128,7 +3160,7 @@ mod tests {
         let context = state.row_context(1, false);
         assert_eq!(context.selected_key.as_deref(), Some("node:1"));
         assert_eq!(context.roving_abs, Some(3));
-        let selected_spec = super::super::rows::RowSpec::from_value(
+        let selected_spec = super::super::rows::RowSpec::from_row(
             state.cache.get(abs(1)).expect("row 1"),
             &context,
         );
@@ -3144,7 +3176,7 @@ mod tests {
             Some(3),
             "the context carries the roving anchor for every row"
         );
-        let unselected_spec = super::super::rows::RowSpec::from_value(
+        let unselected_spec = super::super::rows::RowSpec::from_row(
             state.cache.get(abs(2)).expect("row 2"),
             &unselected,
         );
@@ -3156,7 +3188,7 @@ mod tests {
             unselected_spec.aria.tabindex, -1,
             "only the roving anchor row is tabbable"
         );
-        let anchor_spec = super::super::rows::RowSpec::from_value(
+        let anchor_spec = super::super::rows::RowSpec::from_row(
             state.cache.get(abs(3)).expect("row 3"),
             &state.row_context(3, false),
         );
@@ -3193,7 +3225,11 @@ mod tests {
             ..fixture_state()
         };
         for i in [0, 5, 6] {
-            drop(state.cache.insert(abs(i), row(i, &format!("node:{i}"), 1)));
+            drop(
+                state
+                    .cache
+                    .insert_legacy(abs(i), &row(i, &format!("node:{i}"), 1)),
+            );
         }
         let viewport = Viewport::new(0, 800);
         let mut step = Step::new();

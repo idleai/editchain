@@ -1,7 +1,7 @@
 //! Sparse rows staged by a response and bounded before the reducer publishes it.
 
 use super::coordinates::ExpandedRow;
-use serde_json::Value;
+use super::row_input::RowInput;
 use std::collections::BTreeMap;
 
 /// Four ordinary request pages. This bounds retained rows, independently of
@@ -19,15 +19,15 @@ pub(super) enum RetentionPriority {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PageCache {
-    rows: BTreeMap<ExpandedRow, Value>,
+    rows: BTreeMap<ExpandedRow, RowInput>,
 }
 
 impl PageCache {
-    pub(crate) fn get_by_index(&self, row: i64) -> Option<&Value> {
+    pub(crate) fn get_by_index(&self, row: i64) -> Option<&RowInput> {
         self.get(ExpandedRow::new(row)?)
     }
 
-    pub(crate) fn get(&self, row: ExpandedRow) -> Option<&Value> {
+    pub(crate) fn get(&self, row: ExpandedRow) -> Option<&RowInput> {
         self.rows.get(&row)
     }
     pub(crate) fn contains_key(&self, row: ExpandedRow) -> bool {
@@ -46,8 +46,17 @@ impl PageCache {
 
     /// Stage the arriving page, allowing a pending find target to resolve
     /// before the reducer prunes against the resulting viewport.
-    pub(super) fn insert(&mut self, row: ExpandedRow, value: Value) -> Option<Value> {
+    pub(super) fn insert(&mut self, row: ExpandedRow, value: RowInput) -> Option<RowInput> {
         self.rows.insert(row, value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_legacy(
+        &mut self,
+        row: ExpandedRow,
+        value: &serde_json::Value,
+    ) -> Option<RowInput> {
+        self.insert(row, RowInput::from_legacy(value))
     }
 
     pub(super) fn first_missing(
@@ -94,7 +103,7 @@ mod tests {
     fn every_far_row_is_evicted_and_retained_size_is_a_hard_bound() {
         let mut cache = PageCache::default();
         for row in 0..10_000 {
-            drop(cache.insert(abs(row), Value::Null));
+            drop(cache.insert_legacy(abs(row), &serde_json::Value::Null));
         }
         cache.retain(abs(0), abs(1000), |row| {
             RetentionPriority::Requested(row.get().abs_diff(500))
@@ -102,7 +111,7 @@ mod tests {
         assert_eq!(cache.len(), 1001);
         assert!(!cache.contains_key(abs(9999)));
         for row in 0..10_000 {
-            drop(cache.insert(abs(row), Value::Null));
+            drop(cache.insert_legacy(abs(row), &serde_json::Value::Null));
         }
         cache.retain(abs(0), abs(9999), |row| {
             RetentionPriority::Requested(row.get().abs_diff(5000))

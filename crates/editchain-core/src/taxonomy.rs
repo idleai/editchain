@@ -133,3 +133,55 @@ impl ChainState {
         matches!(self, Self::Active)
     }
 }
+
+impl RecordRole {
+    /// Stable wire label for display adapters.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Narrative => "narrative",
+            Self::Action => "action",
+            Self::Result => "result",
+            Self::Artifact => "artifact",
+            Self::Lifecycle => "lifecycle",
+            Self::Echo => "echo",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl ActivityKind {
+    /// Stable wire label for display adapters.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Work => "work",
+            Self::Conversation => "conversation",
+            Self::Plan => "plan",
+            Self::Explore => "explore",
+            Self::Execute => "execute",
+            Self::Change => "change",
+            Self::Verify => "verify",
+            Self::Diagnose => "diagnose",
+            Self::Coordinate => "coordinate",
+            Self::SourceControl => "source_control",
+            Self::External => "external",
+            Self::System => "system",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl Outcome {
+    /// Stable wire label for display adapters.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Warning => "warning",
+            Self::Failure => "failure",
+            Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
+        }
+    }
+}

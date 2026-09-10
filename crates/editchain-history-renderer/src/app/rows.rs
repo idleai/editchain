@@ -1,8 +1,8 @@
-//! Pure row presentation model for one `HistoryRow` JSON value.
+//! Pure row presentation model for one decoded `HistoryRow`.
 //!
 //! This module ports the row-presentation half of the legacy JS controller
 //! into a deterministic, target-independent layer. Given a raw cached row
-//! ([`RowSpec::from_value`]) it resolves every presentation input the DOM
+//! ([`RowSpec::from_row`]) it resolves every presentation input the DOM
 //! shell needs:
 //!
 //! - stable identity/`data-key` semantics for top-level rows and bundled
@@ -46,12 +46,11 @@
 //! - `esc`/`codicon` glyph rendering, `data-*` attribute writing, and the
 //!   `fillPlaceholders` DOM pass are shell concerns built on the values here.
 
-use std::collections::VecDeque;
-
 use serde_json::Value;
 
-use super::host::row as wire;
+use super::row_input::RowInput;
 use super::ChainState;
+use editchain_protocol::{FileChangeSource, FileChangeStatus, ParentRelationKind};
 
 /// Shell-owned state a row build depends on (selection, find highlight,
 /// expansion, roving tabindex, and group boundary).
@@ -143,28 +142,6 @@ const RECORD_ROLE_CLASSES: [&str; 7] = [
     "unknown",
 ];
 
-/// `TOOL_PAYLOAD_TEXT_KEYS` — BFS visit order for tool envelopes.
-const TOOL_PAYLOAD_TEXT_KEYS: [&str; 18] = [
-    "text",
-    "output_text",
-    "input_text",
-    "message",
-    "summary",
-    "stdout",
-    "formatted_output",
-    "formattedOutput",
-    "output",
-    "content",
-    "status",
-    "completed",
-    "failed",
-    "error",
-    "cmd",
-    "command",
-    "query",
-    "path",
-];
-
 /// The `esc`-style HTML-escape map used by the DOM layer's renderer; the
 /// escape implementation itself lives in the DOM shell.
 ///
@@ -184,52 +161,6 @@ pub(crate) fn html_escape(input: &str) -> String {
         }
     }
     out
-}
-
-/// JS truthiness for wire values (`||`/`?:` semantics in `main.js`).
-fn js_truthy(value: &Value) -> bool {
-    match value {
-        Value::Null => false,
-        Value::Bool(flag) => *flag,
-        Value::Number(number) => number.as_f64().is_some_and(|f| f != 0.0 && !f.is_nan()),
-        Value::String(text) => !text.is_empty(),
-        Value::Array(_) | Value::Object(_) => true,
-    }
-}
-
-/// JS `String(value)` coercion (used where `main.js` stringifies a row field).
-fn js_string(value: &Value) -> String {
-    match value {
-        Value::Null => "null".to_owned(),
-        Value::Bool(flag) => flag.to_string(),
-        Value::Number(number) => number.to_string(),
-        Value::String(text) => text.clone(),
-        Value::Array(items) => items
-            .iter()
-            .map(js_array_element)
-            .collect::<Vec<String>>()
-            .join(","),
-        Value::Object(_) => "[object Object]".to_owned(),
-    }
-}
-
-/// `Array.prototype.toString` element rule: `null`/`undefined` become empty.
-fn js_array_element(value: &Value) -> String {
-    if value.is_null() {
-        String::new()
-    } else {
-        js_string(value)
-    }
-}
-
-/// Read a row string field as JS would (missing/undefined -> empty).
-fn row_str(value: &Value, key: &str) -> String {
-    wire::owned_str(value, key)
-}
-
-/// Read a row numeric field with JS `||` semantics (0/missing -> 0).
-fn row_ms(value: &Value, key: &str) -> i64 {
-    value.get(key).and_then(Value::as_i64).unwrap_or(0)
 }
 
 /// Shorten a raw 64-bit identifier for display (`shortId`: keep the tail).
@@ -284,11 +215,11 @@ pub(crate) fn group_label_text(
 /// from above, while child-anchored bends start at the dot toward below. A
 /// graph subtitle belongs only on a true tip or root, never merely on a group
 /// boundary that happens to lie inside a continuing chain.
-fn is_graph_endpoint(row: &Value) -> bool {
-    let lane = wire::lane(row);
-    let above = wire::above(row);
-    let below = wire::below(row);
-    let transitions = wire::transitions(row);
+fn is_graph_endpoint(row: &RowInput) -> bool {
+    let lane = row.lane();
+    let above = row.above();
+    let below = row.below();
+    let transitions = row.transitions();
     let connected_above =
         above.contains(&lane) || transitions.iter().any(|&(_, to_lane)| to_lane == lane);
     let connected_below =
@@ -297,50 +228,36 @@ fn is_graph_endpoint(row: &Value) -> bool {
     !connected_above || !connected_below
 }
 
-fn session_meta_field<'a>(row: &'a Value, field: &str) -> Option<&'a str> {
-    row.get("session_meta")
-        .and_then(|meta| meta.get(field))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-}
-
 /// `shortCommitId` — display value for the Commit/ID column.
-pub(crate) fn short_commit_id(row: &Value) -> String {
-    let git_oid = row_str(row, "git_oid");
-    let commit_id = row_str(row, "commit_id");
-    let op_id = row_str(row, "op_id");
-    let turn_id = row_str(row, "turn_id");
-    let is_subop = wire::bool(row, "is_subop");
-    if !git_oid.is_empty() {
-        let preferred = if commit_id.is_empty() {
+pub(crate) fn short_commit_id(row: &RowInput) -> String {
+    let source = &row.source;
+    let git_oid = source.git_oid.as_deref().unwrap_or_default();
+    let op_id = source.op_id.as_deref().unwrap_or_default();
+    let turn_id = source.turn_id.as_deref().unwrap_or_default();
+    let preferred = if !git_oid.is_empty() {
+        if source.commit_id.is_empty() {
             git_oid
         } else {
-            commit_id
-        };
-        return short_id(&preferred);
-    }
-    if is_subop {
-        return short_id(&op_id);
-    }
-    if !turn_id.is_empty() {
-        return short_id(&turn_id);
-    }
-    let preferred = if commit_id.is_empty() {
+            &source.commit_id
+        }
+    } else if source.is_subop {
+        op_id
+    } else if !turn_id.is_empty() {
+        turn_id
+    } else if source.commit_id.is_empty() {
         op_id
     } else {
-        commit_id
+        &source.commit_id
     };
-    short_id(&preferred)
+    short_id(preferred)
 }
 
 /// Commit/ID column hover title (`row.commit_id || row.op_id || ''`).
-pub(crate) fn commit_cell_title(row: &Value) -> String {
-    let commit_id = row_str(row, "commit_id");
-    if commit_id.is_empty() {
-        row_str(row, "op_id")
+pub(crate) fn commit_cell_title(row: &RowInput) -> String {
+    if row.source.commit_id.is_empty() {
+        row.source.op_id.clone().unwrap_or_default()
     } else {
-        commit_id
+        row.source.commit_id.clone()
     }
 }
 
@@ -1050,8 +967,8 @@ pub(crate) struct RowSummary {
 }
 
 /// Split a Git conventional prefix from the first colon (`gitSummaryParts`).
-pub(crate) fn git_summary_parts(row: &Value, value: &str) -> Option<(String, String)> {
-    if row_str(row, "git_oid").is_empty() {
+pub(crate) fn git_summary_parts(row: &RowInput, value: &str) -> Option<(String, String)> {
+    if row.source.git_oid.as_deref().unwrap_or_default().is_empty() {
         return None;
     }
     let chars: Vec<char> = value.chars().collect();
@@ -1075,7 +992,7 @@ pub(crate) fn git_summary_parts(row: &Value, value: &str) -> Option<(String, Str
 
 impl RowSummary {
     /// Parse the content summary and its separate Tags-column Git prefix.
-    pub(crate) fn parse(row: &Value, display_summary: &str) -> RowSummary {
+    pub(crate) fn parse(row: &RowInput, display_summary: &str) -> RowSummary {
         if let Some((prefix, content)) = git_summary_parts(row, display_summary) {
             let plain_content = if content.is_empty() {
                 None
@@ -1112,7 +1029,7 @@ impl RowSummary {
 }
 
 /// `plainRowSummary` — plain text of the display summary (colon absent too).
-pub(crate) fn plain_row_summary(row: &Value, value: &str) -> String {
+pub(crate) fn plain_row_summary(row: &RowInput, value: &str) -> String {
     if let Some((prefix, content)) = git_summary_parts(row, value) {
         let combined = if content.is_empty() {
             prefix
@@ -1599,359 +1516,6 @@ fn parse_fence(line: &str) -> Option<(String, String)> {
     Some((language, content))
 }
 
-// --- Tool-payload display compaction (displaySummaryForRow) -----------------
-
-/// The JS truthiness check for a summary source (`row.summary || …`).
-fn summary_source(row: &Value) -> String {
-    match row.get("summary") {
-        Some(value) if js_truthy(value) => js_string(value),
-        _ => "(no summary)".to_owned(),
-    }
-}
-
-/// `toolishRow` — the row shapes whose payloads get compacted.
-fn toolish_row(row: &Value) -> bool {
-    let record_role = row_str(row, "record_role");
-    let kind = row_str(row, "kind");
-    let is_system = wire::bool(row, "is_system");
-    let activity_kind = row_str(row, "activity_kind");
-    let is_action_or_tool =
-        record_role == "action" || record_role == "result" || kind == "tool" || kind == "command";
-    let operational =
-        activity_kind == "execute" || is_system || kind == "tool" || kind == "command";
-    is_action_or_tool && operational
-}
-
-/// JSON-ish start test (`jsonish` regex) on a payload.
-fn jsonish(payload: &str) -> bool {
-    let mut chars = payload.chars().filter(|c| !c.is_whitespace());
-    match chars.next() {
-        Some('[') => matches!(chars.next(), Some('{' | '"' | ']')),
-        Some('{') => matches!(chars.next(), Some('"' | '}')),
-        Some('"') => true,
-        _ => false,
-    }
-}
-
-/// The nested-envelope JSON-ish start test (no bare-string alternative).
-fn nested_jsonish(payload: &str) -> bool {
-    let mut chars = payload.chars().filter(|c| !c.is_whitespace());
-    match chars.next() {
-        Some('[') => matches!(chars.next(), Some('{' | '"' | ']')),
-        Some('{') => matches!(chars.next(), Some('"' | '}')),
-        _ => false,
-    }
-}
-
-/// `decodedToolPayloadText` — decode a JSON tool payload with the narrow
-/// truncated-summary recovery path.
-fn decoded_tool_payload_text(value: &str) -> String {
-    let source = value.trim();
-    match serde_json::from_str::<Value>(source) {
-        Ok(parsed) => {
-            // Some adapters serialize a JSON envelope as a JSON string; unwrap
-            // at most once (the JS `try` also covers this parse).
-            if let Value::String(inner) = &parsed {
-                let trimmed = inner.trim();
-                if nested_jsonish(trimmed) {
-                    match serde_json::from_str::<Value>(trimmed) {
-                        Ok(inner_value) => return first_tool_payload_text(&inner_value),
-                        Err(_) => return recovery_text(source),
-                    }
-                }
-            }
-            first_tool_payload_text(&parsed)
-        }
-        Err(_) => recovery_text(source),
-    }
-}
-
-/// BFS over the tool envelope's text-bearing keys with the visit budget.
-fn first_tool_payload_text(value: &Value) -> String {
-    let mut pending: VecDeque<&Value> = VecDeque::new();
-    pending.push_back(value);
-    let mut visits = 0usize;
-    while let Some(current) = pending.pop_front() {
-        visits = visits.saturating_add(1);
-        if visits >= 48 {
-            break;
-        }
-        if let Value::String(text) = current {
-            if !text.trim().is_empty() {
-                return text.clone();
-            }
-        }
-        match current {
-            Value::Array(items) => {
-                for item in items {
-                    pending.push_back(item);
-                }
-            }
-            Value::Object(map) => {
-                for key in TOOL_PAYLOAD_TEXT_KEYS {
-                    if let Some(item) = map.get(key) {
-                        pending.push_back(item);
-                    }
-                }
-            }
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-        }
-    }
-    String::new()
-}
-
-/// The truncated-summary recovery path (regex + escape recovery in main.js).
-fn recovery_text(source: &str) -> String {
-    let chars: Vec<char> = source.chars().collect();
-    let mut index = 0usize;
-    while index < chars.len() {
-        if chars.get(index) == Some(&'"') {
-            let mut cursor = index.saturating_add(1);
-            // Keyword match: one of TOOL_PAYLOAD_TEXT_KEYS followed by `"`.
-            let mut keyword = None;
-            for key in TOOL_PAYLOAD_TEXT_KEYS {
-                let key_chars: Vec<char> = key.chars().collect();
-                let matches = key_chars
-                    .iter()
-                    .enumerate()
-                    .all(|(k, c)| chars.get(cursor.saturating_add(k)) == Some(c));
-                if matches && chars.get(cursor.saturating_add(key_chars.len())) == Some(&'"') {
-                    keyword = Some(key);
-                    break;
-                }
-            }
-            if let Some(keyword) = keyword {
-                cursor = cursor
-                    .saturating_add(keyword.chars().count())
-                    .saturating_add(1);
-                while chars.get(cursor).is_some_and(|c| c.is_whitespace()) {
-                    cursor = cursor.saturating_add(1);
-                }
-                if chars.get(cursor) == Some(&':') {
-                    cursor = cursor.saturating_add(1);
-                    while chars.get(cursor).is_some_and(|c| c.is_whitespace()) {
-                        cursor = cursor.saturating_add(1);
-                    }
-                    if chars.get(cursor) == Some(&'"') {
-                        cursor = cursor.saturating_add(1);
-                        let mut encoded = String::new();
-                        let mut done = false;
-                        while cursor < chars.len() {
-                            let c = char_at(&chars, cursor);
-                            if c == '\\' {
-                                if let Some(&next) = chars.get(cursor.saturating_add(1)) {
-                                    encoded.push(c);
-                                    encoded.push(next);
-                                    cursor = cursor.saturating_add(2);
-                                    continue;
-                                }
-                            } else if c == '"' {
-                                done = true;
-                                break;
-                            }
-                            encoded.push(c);
-                            cursor = cursor.saturating_add(1);
-                        }
-                        if done {
-                            return unescape_recovered(&encoded);
-                        }
-                    }
-                }
-            }
-        }
-        index = index.saturating_add(1);
-    }
-    String::new()
-}
-
-/// The three ordered escape recoveries (JS `replace` chain).
-fn unescape_recovered(encoded: &str) -> String {
-    let mut out = encoded
-        .replace("\\r\\n", "\n")
-        .replace("\\n", "\n")
-        .replace("\\r", "\n");
-    out = out.replace("\\\"", "\"");
-    out.replace("\\\\", "\\")
-}
-
-/// `conciseToolText` — reduce multi-line execution envelopes to their first
-/// meaningful status or output line.
-fn concise_tool_text(value: &str) -> String {
-    let normalized = value.replace("\r\n", "\n").replace('\r', "\n");
-    let lines: Vec<&str> = normalized
-        .split('\n')
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-    let status = lines.iter().find(|line| is_script_status(line)).copied();
-    if status.is_some_and(|line| script_status_kind(line) == Some("completed")) {
-        return "Script completed".to_owned();
-    }
-    if status.is_some_and(|line| script_status_kind(line) == Some("failed")) {
-        return "Script failed".to_owned();
-    }
-    if status.is_some_and(|line| script_status_kind(line) == Some("running")) {
-        return "Script running".to_owned();
-    }
-    match lines.first() {
-        Some(first) => first.split_whitespace().collect::<Vec<&str>>().join(" "),
-        None => String::new(),
-    }
-}
-
-/// `/^Script\s+(?:completed|failed|running)\b/i` test.
-fn is_script_status(line: &str) -> bool {
-    script_status_kind(line).is_some()
-}
-
-fn script_status_kind(line: &str) -> Option<&'static str> {
-    let lower = line.to_ascii_lowercase();
-    let rest = lower.strip_prefix("script")?;
-    let rest = rest.trim_start();
-    for (word, kind) in [
-        ("completed", "completed"),
-        ("failed", "failed"),
-        ("running", "running"),
-    ] {
-        if let Some(after) = rest.strip_prefix(word) {
-            // \b — the following char must not be a word char.
-            if after.chars().next().is_none_or(|c| !is_word_char(c)) {
-                return Some(kind);
-            }
-        }
-    }
-    None
-}
-
-fn is_word_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
-}
-
-/// `displaySummaryForRow` — presentation-only compaction of action/result
-/// payloads. Human narrative is left untouched for Markdown rendering.
-pub(crate) fn display_summary_for_row(row: &Value, value: &str) -> String {
-    let source = value.to_owned();
-    let toolish = toolish_row(row);
-    let trimmed = source.trim();
-    // Leading inert container tag (`<…>`), as in main.js.
-    let container_len = leading_container_tag_len(trimmed);
-    let candidate = if let Some(len) = container_len {
-        trimmed.get(len..).unwrap_or("").trim().to_owned()
-    } else {
-        trimmed.to_owned()
-    };
-    // `tool:` wrapper prefix.
-    let wrapper_len = tool_wrapper_len(&candidate);
-    let payload = if let Some(len) = wrapper_len {
-        candidate.get(len..).unwrap_or("").trim().to_owned()
-    } else {
-        candidate.clone()
-    };
-    let jsonish = jsonish(&payload);
-    if !toolish && !jsonish {
-        return source;
-    }
-    if toolish && wrapper_len.is_none() && !jsonish {
-        return source;
-    }
-    let decoded = if jsonish {
-        decoded_tool_payload_text(&payload)
-    } else {
-        payload
-    };
-    let concise = concise_tool_text(&decoded);
-    if !concise.is_empty() {
-        return concise;
-    }
-    // A narrative JSON sample with no recognized envelope stays authored
-    // content; generic labels are reserved for operational rows.
-    if !toolish {
-        return source;
-    }
-    match row_str(row, "outcome").as_str() {
-        "success" => "Completed".to_owned(),
-        "failure" => "Failed".to_owned(),
-        "warning" => "Completed with warnings".to_owned(),
-        "cancelled" => "Cancelled".to_owned(),
-        _ => {
-            let record_role = row_str(row, "record_role");
-            let kind = row_str(row, "kind");
-            if record_role == "action" || kind == "command" {
-                "Tool request".to_owned()
-            } else {
-                "Tool result".to_owned()
-            }
-        }
-    }
-}
-
-/// `/^<[A-Za-z][A-Za-z0-9_.:-]*>\s*/` — one leading inert container tag.
-fn leading_container_tag_len(trimmed: &str) -> Option<usize> {
-    let chars: Vec<char> = trimmed.chars().collect();
-    if chars.first() != Some(&'<') {
-        return None;
-    }
-    let first = chars.get(1).copied()?;
-    if !first.is_ascii_alphabetic() {
-        return None;
-    }
-    let mut cursor = 2usize;
-    while let Some(c) = chars.get(cursor).copied() {
-        if c == '>' {
-            let mut after = cursor.saturating_add(1);
-            while chars.get(after).is_some_and(|c| c.is_whitespace()) {
-                after = after.saturating_add(1);
-            }
-            return Some(after);
-        }
-        if !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-')) {
-            return None;
-        }
-        cursor = cursor.saturating_add(1);
-    }
-    None
-}
-
-/// `/^tool:\s*[A-Za-z0-9_.:-]+(?:\s+|$)/i` — consumed-prefix length.
-fn tool_wrapper_len(candidate: &str) -> Option<usize> {
-    let chars: Vec<char> = candidate.chars().collect();
-    let mut lower = chars.iter().map(char::to_ascii_lowercase);
-    if !lower.by_ref().take(4).eq("tool".chars()) {
-        return None;
-    }
-    if chars.get(4) != Some(&':') {
-        return None;
-    }
-    let mut cursor = 5usize;
-    while chars.get(cursor).is_some_and(|c| c.is_whitespace()) {
-        cursor = cursor.saturating_add(1);
-    }
-    let mut name_len = 0usize;
-    while let Some(c) = chars.get(cursor).copied() {
-        if !(c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '-')) {
-            break;
-        }
-        name_len = name_len.saturating_add(1);
-        cursor = cursor.saturating_add(1);
-    }
-    if name_len == 0 {
-        return None;
-    }
-    let after = chars.get(cursor).copied();
-    let at_end = cursor == chars.len();
-    let has_space = after.is_some_and(char::is_whitespace);
-    if !at_end && !has_space {
-        return None;
-    }
-    let mut consumed = cursor;
-    if has_space {
-        while chars.get(consumed).is_some_and(|c| c.is_whitespace()) {
-            consumed = consumed.saturating_add(1);
-        }
-    }
-    Some(consumed)
-}
-
 // --- Badge / chrome layer ---------------------------------------------------
 
 /// One assembled row tag (DOM-ready exact class list, text, and labels).
@@ -1987,15 +1551,6 @@ pub(crate) enum RelationKind {
 }
 
 impl RelationKind {
-    pub(crate) fn from_wire(kind: &str) -> Option<RelationKind> {
-        match kind {
-            "subagent" => Some(RelationKind::Subagent),
-            "reconnect" => Some(RelationKind::Reconnect),
-            "fork" => Some(RelationKind::Fork),
-            _ => None,
-        }
-    }
-
     pub(crate) fn class(self) -> &'static str {
         match self {
             RelationKind::Subagent => "rel-subagent",
@@ -2030,16 +1585,16 @@ impl RelationKind {
 }
 
 /// `relationBadges` — compact badges for a row's parent relations, de-duped.
-pub(crate) fn relation_badges(row: &Value) -> Vec<ChromeItem> {
-    let Some(relations) = row.get("parent_relations").and_then(Value::as_array) else {
-        return Vec::new();
-    };
+pub(crate) fn relation_badges(row: &RowInput) -> Vec<ChromeItem> {
+    let relations = &row.source.parent_relations;
     let mut seen: Vec<RelationKind> = Vec::new();
     let mut out = Vec::new();
     for relation in relations {
-        let kind = relation.get("kind").and_then(Value::as_str).unwrap_or("");
-        let Some(kind) = RelationKind::from_wire(kind) else {
-            continue;
+        let kind = match relation.kind {
+            ParentRelationKind::Subagent => RelationKind::Subagent,
+            ParentRelationKind::Reconnect => RelationKind::Reconnect,
+            ParentRelationKind::Fork => RelationKind::Fork,
+            ParentRelationKind::ProducedCommit | ParentRelationKind::Unknown => continue,
         };
         if seen.contains(&kind) {
             continue;
@@ -2330,15 +1885,15 @@ fn classification_fallback(value: &str) -> String {
 /// Resolve the stable Activity-column value. Semantic activity wins, except
 /// that Git identity is authoritative even for sparse/older rows; then kind,
 /// record role, and a final `other` label guarantee a populated real row.
-pub(crate) fn row_classification(row: &Value) -> RowClassification {
-    let kind = row_str(row, "kind");
-    let activity = row_str(row, "activity_kind");
-    let git_oid = row_str(row, "git_oid");
+pub(crate) fn row_classification(row: &RowInput) -> RowClassification {
+    let kind = row.source.kind.as_str();
+    let activity = row.activity_kind.as_str();
+    let git_oid = row.source.git_oid.as_deref().unwrap_or_default();
     if !git_oid.is_empty() || kind == "git" {
         return if activity == "source_control" {
             RowClassification::new("git", "activity_kind", "source_control")
         } else if !git_oid.is_empty() {
-            RowClassification::new("git", "git_oid", &git_oid)
+            RowClassification::new("git", "git_oid", git_oid)
         } else {
             RowClassification::new("git", "kind", "git")
         };
@@ -2346,7 +1901,7 @@ pub(crate) fn row_classification(row: &Value) -> RowClassification {
 
     if let Some(activity_kind) = ActivityKind::from_wire(activity.trim()) {
         let label = if activity_kind == ActivityKind::Conversation
-            && matches!(row_str(row, "author").trim(), "human" | "user")
+            && matches!(row.source.author.trim(), "human" | "user")
         {
             "user"
         } else {
@@ -2355,15 +1910,15 @@ pub(crate) fn row_classification(row: &Value) -> RowClassification {
         return RowClassification::new(label, "activity_kind", activity.trim());
     }
 
-    if wire::bool(row, "is_system") {
+    if row.source.is_system {
         return RowClassification::new("meta", "is_system", "true");
     }
-    if let Some(kind) = classification_token(&kind) {
+    if let Some(kind) = classification_token(kind) {
         return RowClassification::new(&classification_fallback(kind), "kind", kind);
     }
 
-    let role = row_str(row, "record_role");
-    if let Some(role) = classification_token(&role) {
+    let role = row.record_role.as_str();
+    if let Some(role) = classification_token(role) {
         return RowClassification::new(&classification_fallback(role), "record_role", role);
     }
 
@@ -2419,12 +1974,12 @@ impl OutcomeKind {
 }
 
 /// `outcomeBadge` with the frozen visibility switches.
-pub(crate) fn outcome_badge(row: &Value, options: BadgeOptions) -> Option<ChromeItem> {
-    let wire_outcome = row_str(row, "outcome");
+pub(crate) fn outcome_badge(row: &RowInput, options: BadgeOptions) -> Option<ChromeItem> {
+    let wire_outcome = row.outcome.as_str();
     if wire_outcome == "success" && !options.show_success_outcome {
         return None;
     }
-    let outcome = OutcomeKind::from_wire(&wire_outcome)?;
+    let outcome = OutcomeKind::from_wire(wire_outcome)?;
     Some(ChromeItem::new(
         &format!("out-badge {}", outcome.class()),
         outcome.text(),
@@ -2435,11 +1990,11 @@ pub(crate) fn outcome_badge(row: &Value, options: BadgeOptions) -> Option<Chrome
 
 /// `relationBadges` + a consequential outcome badge. Structural relations
 /// take over the semantic-tag slot; Activity remains in its own column.
-fn relation_chrome(row: &Value, options: BadgeOptions) -> Vec<ChromeItem> {
+fn relation_chrome(row: &RowInput, options: BadgeOptions) -> Vec<ChromeItem> {
     let mut items = relation_badges(row);
     if !items.is_empty() {
-        let outcome = row_str(row, "outcome");
-        if matches!(outcome.as_str(), "warning" | "failure" | "cancelled") {
+        let outcome = row.outcome.as_str();
+        if matches!(outcome, "warning" | "failure" | "cancelled") {
             if let Some(badge) = outcome_badge(row, options) {
                 items.push(badge);
             }
@@ -2451,7 +2006,7 @@ fn relation_chrome(row: &Value, options: BadgeOptions) -> Vec<ChromeItem> {
 /// `rowSemanticChrome` — restrained row tags. Activity is rendered in its own
 /// grid column and is intentionally absent here.
 pub(crate) fn row_semantic_chrome(
-    row: &Value,
+    row: &RowInput,
     is_bundle: bool,
     options: BadgeOptions,
 ) -> Vec<ChromeItem> {
@@ -2518,45 +2073,25 @@ fn work_unit_fallback(activity_kind: &str) -> Option<&'static str> {
 }
 
 /// `workUnitOf` — the row's Activity work-unit payload (never on sub-ops).
-pub(crate) fn work_unit_of(row: &Value) -> Option<WorkUnitData> {
-    if wire::bool(row, "is_subop") {
+pub(crate) fn work_unit_of(row: &RowInput) -> Option<WorkUnitData> {
+    if row.source.is_subop {
         return None;
     }
-    let wu = row.get("work_unit").filter(|value| js_truthy(value))?;
-    Some(WorkUnitData {
-        id: wu
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned(),
-        title: wu
-            .get("title")
-            .and_then(Value::as_str)
-            .filter(|title| !title.is_empty())
-            .map(str::to_owned),
-        count: wu.get("count").and_then(Value::as_u64),
-        is_start: wu.get("is_start").and_then(Value::as_bool).unwrap_or(false),
-        is_end: wu.get("is_end").and_then(Value::as_bool).unwrap_or(false),
-    })
+    row.work_unit.clone()
 }
 
 /// Read the explicit whole-session marker emitted on the session's true newest
 /// visible row. Work-unit identity is intentionally irrelevant: Codex mixes
 /// turn-scoped rows with session-scoped lifecycle rows.
-pub(crate) fn session_summary_of(row: &Value) -> Option<SessionSummaryData> {
-    if wire::bool(row, "is_subop") {
+pub(crate) fn session_summary_of(row: &RowInput) -> Option<SessionSummaryData> {
+    if row.source.is_subop {
         return None;
     }
-    let summary = row
-        .get("session_summary")
-        .filter(|value| js_truthy(value))?;
-    Some(SessionSummaryData {
-        count: summary.get("count").and_then(Value::as_u64),
-    })
+    row.session_summary.clone()
 }
 
 /// `workUnitTitle` — DTO title's first meaningful line, else human fallbacks.
-pub(crate) fn work_unit_title(row: &Value) -> String {
+pub(crate) fn work_unit_title(row: &RowInput) -> String {
     if let Some(wu) = work_unit_of(row) {
         if let Some(title) = wu.title {
             let first_line = title
@@ -2570,15 +2105,15 @@ pub(crate) fn work_unit_title(row: &Value) -> String {
             }
         }
     }
-    let activity_kind = row_str(row, "activity_kind");
-    if let Some(fallback) = work_unit_fallback(&activity_kind) {
+    let activity_kind = row.activity_kind.as_str();
+    if let Some(fallback) = work_unit_fallback(activity_kind) {
         return fallback.to_owned();
     }
-    let kind = row_str(row, "kind");
+    let kind = row.source.kind.as_str();
     if kind == "message" || kind == "command" {
         return "Request".to_owned();
     }
-    group_label_text(&row_str(row, "group"), None, None)
+    group_label_text(&row.source.group, None, None)
 }
 
 /// `workUnitCountText` — human count text for a unit header.
@@ -2587,8 +2122,8 @@ pub(crate) fn work_unit_count_text(count: u64) -> String {
 }
 
 /// `showWorkUnitCount` — keep grouping counts sparse.
-pub(crate) fn show_work_unit_count(row: &Value, wu: &WorkUnitData) -> bool {
-    wu.count.is_some_and(|count| count > 1) && row_str(row, "activity_kind") != "source_control"
+pub(crate) fn show_work_unit_count(row: &RowInput, wu: &WorkUnitData) -> bool {
+    wu.count.is_some_and(|count| count > 1) && row.activity_kind != "source_control"
 }
 
 /// `workUnitCountTitle` — tooltip explaining what the count measures.
@@ -2610,12 +2145,12 @@ pub(crate) struct SessionChip {
 }
 
 /// `sessionMetaValues` — the small, display-safe session provenance.
-pub(crate) fn session_meta_values(row: &Value) -> Vec<SessionChip> {
+pub(crate) fn session_meta_values(row: &RowInput) -> Vec<SessionChip> {
     let mut out = Vec::new();
-    let Some(meta) = row.get("session_meta").filter(|value| js_truthy(value)) else {
+    let Some(meta) = &row.source.session_meta else {
         return out;
     };
-    if let Some(provider) = meta.get("model_provider").and_then(Value::as_str) {
+    if let Some(provider) = meta.model_provider.as_deref() {
         let trimmed = provider.trim();
         if !trimmed.is_empty() {
             out.push(SessionChip {
@@ -2625,7 +2160,7 @@ pub(crate) fn session_meta_values(row: &Value) -> Vec<SessionChip> {
             });
         }
     }
-    if let Some(agent) = meta.get("agent_nickname").and_then(Value::as_str) {
+    if let Some(agent) = meta.agent_nickname.as_deref() {
         let trimmed = agent.trim();
         if !trimmed.is_empty() {
             out.push(SessionChip {
@@ -2639,7 +2174,7 @@ pub(crate) fn session_meta_values(row: &Value) -> Vec<SessionChip> {
 }
 
 /// `sessionMetaDescription` — accessible prose for the visible chips.
-pub(crate) fn session_meta_description(row: &Value) -> String {
+pub(crate) fn session_meta_description(row: &RowInput) -> String {
     session_meta_values(row)
         .iter()
         .map(|chip| format!("{} {}", chip.title, chip.label))
@@ -2663,40 +2198,27 @@ impl BundleKind {
             BundleKind::PlanRepeat => "plan-repeat",
         }
     }
-
-    pub(crate) fn from_wire(kind: &str) -> Option<BundleKind> {
-        match kind {
-            "work-group" => Some(BundleKind::WorkGroup),
-            "execute-run" => Some(BundleKind::ExecuteRun),
-            "plan-repeat" => Some(BundleKind::PlanRepeat),
-            _ => None,
-        }
-    }
 }
 
 /// `activityBundleKind` — the recognized typed bundle kind of a row.
-pub(crate) fn activity_bundle_kind(row: &Value) -> Option<BundleKind> {
-    let bundle = row
-        .get("activity_bundle")
-        .filter(|value| js_truthy(value))?;
-    let kind = bundle.get("kind").and_then(Value::as_str).unwrap_or("");
-    BundleKind::from_wire(kind)
+pub(crate) fn activity_bundle_kind(row: &RowInput) -> Option<BundleKind> {
+    row.bundle_kind
 }
 
 /// `isActivityBundle` — any recognized typed bundle row.
 #[cfg(test)]
-pub(crate) fn is_activity_bundle(row: &Value) -> bool {
+pub(crate) fn is_activity_bundle(row: &RowInput) -> bool {
     activity_bundle_kind(row).is_some()
 }
 
 /// `isExecuteRunBundle`.
-pub(crate) fn is_execute_run_bundle(row: &Value) -> bool {
+pub(crate) fn is_execute_run_bundle(row: &RowInput) -> bool {
     activity_bundle_kind(row) == Some(BundleKind::ExecuteRun)
 }
 
 /// `isPlanRepeatBundle`.
 #[cfg(test)]
-pub(crate) fn is_plan_repeat_bundle(row: &Value) -> bool {
+pub(crate) fn is_plan_repeat_bundle(row: &RowInput) -> bool {
     activity_bundle_kind(row) == Some(BundleKind::PlanRepeat)
 }
 
@@ -2710,15 +2232,11 @@ pub(crate) struct BundleInfo {
 }
 
 /// `bundleCountText` — one concise label for a typed bundle row.
-pub(crate) fn bundle_count_text(row: &Value) -> String {
+pub(crate) fn bundle_count_text(row: &RowInput) -> String {
     let Some(kind) = activity_bundle_kind(row) else {
         return String::new();
     };
-    let Some(member_count) = row
-        .get("activity_bundle")
-        .and_then(|bundle| bundle.get("member_count"))
-        .and_then(Value::as_u64)
-    else {
+    let Some(member_count) = row.bundle_count else {
         return String::new();
     };
     if kind == BundleKind::WorkGroup {
@@ -2733,7 +2251,7 @@ pub(crate) fn bundle_count_text(row: &Value) -> String {
             if member_count == 1 { "" } else { "s" }
         );
     }
-    let command = row_str(row, "kind") == "command";
+    let command = row.source.kind == "command";
     if command {
         format!(
             "{member_count} command{}",
@@ -2748,12 +2266,12 @@ pub(crate) fn bundle_count_text(row: &Value) -> String {
 }
 
 /// `bundleChrome` — count label plus the execute-specific status glyph.
-pub(crate) fn bundle_chrome(row: &Value, _options: BadgeOptions) -> Vec<ChromeItem> {
+pub(crate) fn bundle_chrome(row: &RowInput, _options: BadgeOptions) -> Vec<ChromeItem> {
     let count_text = bundle_count_text(row);
     if count_text.is_empty() {
         return Vec::new();
     }
-    let success = is_execute_run_bundle(row) && row_str(row, "outcome") == "success";
+    let success = is_execute_run_bundle(row) && row.outcome == "success";
     let title = if success {
         format!("{count_text}, completed")
     } else {
@@ -2796,17 +2314,16 @@ impl PromotedKind {
 }
 
 /// `promotedClasses` for the Activity view (sub-ops are never promoted).
-pub(crate) fn promoted_kind(row: &Value) -> Option<PromotedKind> {
-    let promoted =
-        !wire::bool(row, "is_subop") && row.get("promoted").and_then(Value::as_bool) == Some(true);
+pub(crate) fn promoted_kind(row: &RowInput) -> Option<PromotedKind> {
+    let promoted = !row.source.is_subop && row.source.promoted;
     if !promoted {
         return None;
     }
-    match row_str(row, "outcome").as_str() {
+    match row.outcome.as_str() {
         "failure" => Some(PromotedKind::Failure),
         "warning" => Some(PromotedKind::Warning),
         "cancelled" => Some(PromotedKind::Cancelled),
-        _ => match row_str(row, "activity_kind").as_str() {
+        _ => match row.activity_kind.as_str() {
             "change" => Some(PromotedKind::Change),
             "verify" => Some(PromotedKind::Verify),
             _ => Some(PromotedKind::Rail),
@@ -2817,14 +2334,14 @@ pub(crate) fn promoted_kind(row: &Value) -> Option<PromotedKind> {
 /// Resolve the semantic icon used by an ordinary Content row. The explicit
 /// activity taxonomy is authoritative; kind/sub-op fallbacks keep older and
 /// forward-compatible rows inside the same visual grammar.
-fn content_icon(row: &Value) -> ActivityIcon {
+fn content_icon(row: &RowInput) -> ActivityIcon {
     if let Some(icon) = ActivityIcon::from_label(&row_classification(row).label) {
         return icon;
     }
-    match row_str(row, "subop_kind").as_str() {
+    match row.source.subop_kind.as_deref().unwrap_or_default() {
         "edit" => return ActivityIcon::Change,
         "msg" => {
-            return if matches!(row_str(row, "author").trim(), "human" | "user") {
+            return if matches!(row.source.author.trim(), "human" | "user") {
                 ActivityIcon::User
             } else {
                 ActivityIcon::Agent
@@ -2834,11 +2351,11 @@ fn content_icon(row: &Value) -> ActivityIcon {
         "meta" | "" => {}
         _ => return ActivityIcon::System,
     }
-    match row_str(row, "kind").as_str() {
+    match row.source.kind.as_str() {
         "git" => ActivityIcon::SourceControl,
         "file" => ActivityIcon::Change,
         "message" => {
-            if matches!(row_str(row, "author").trim(), "human" | "user") {
+            if matches!(row.source.author.trim(), "human" | "user") {
                 ActivityIcon::User
             } else {
                 ActivityIcon::Agent
@@ -2847,25 +2364,10 @@ fn content_icon(row: &Value) -> ActivityIcon {
         "reflection" => ActivityIcon::Plan,
         "command" | "tool" | "tool_result" => ActivityIcon::Execute,
         "error" => ActivityIcon::Diagnose,
-        "import" if row_str(row, "record_role") == "artifact" => ActivityIcon::Change,
-        "import" if row_str(row, "record_role") == "narrative" => ActivityIcon::Plan,
+        "import" if row.record_role == "artifact" => ActivityIcon::Change,
+        "import" if row.record_role == "narrative" => ActivityIcon::Plan,
         _ => ActivityIcon::System,
     }
-}
-
-/// Recover a provider's tool name from the established `tool: NAME …`
-/// summary wrapper. The display-summary compactor removes that wrapper from
-/// the subtitle, making the name a natural compact title rather than repeated
-/// prose.
-fn tool_name_from_summary(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    let candidate = leading_container_tag_len(trimmed)
-        .and_then(|len| trimmed.get(len..))
-        .unwrap_or(trimmed)
-        .trim();
-    let wrapper_len = tool_wrapper_len(candidate)?;
-    let wrapped = candidate.get(5..wrapper_len)?.trim();
-    (!wrapped.is_empty()).then(|| wrapped.to_owned())
 }
 
 /// Humanize a forward-compatible kind token without inventing provider
@@ -2888,15 +2390,15 @@ fn humanize_content_kind(value: &str) -> String {
 /// summary. Commit, message, and aggregate work rows omit the redundant noun;
 /// tool wrappers can provide a more useful concrete tool name for less obvious
 /// activity.
-fn content_title(row: &Value, summary_source: &str) -> String {
-    let kind = row_str(row, "kind");
-    let role = row_str(row, "record_role");
-    if kind == "git" || !row_str(row, "git_oid").is_empty() {
+fn content_title(row: &RowInput) -> String {
+    let kind = row.source.kind.as_str();
+    let role = row.record_role.as_str();
+    if kind == "git" || !row.source.git_oid.as_deref().unwrap_or_default().is_empty() {
         return String::new();
     }
     if kind == "tool" {
-        if let Some(tool_name) = tool_name_from_summary(summary_source) {
-            return tool_name;
+        if let Some(tool_name) = &row.tool_label {
+            return tool_name.clone();
         }
         return if role == "result" {
             "Tool result".to_owned()
@@ -2904,7 +2406,7 @@ fn content_title(row: &Value, summary_source: &str) -> String {
             "Tool".to_owned()
         };
     }
-    match kind.as_str() {
+    match kind {
         "message" | "work-group" => String::new(),
         "command" if role == "result" => "Command output".to_owned(),
         "command" => "Command".to_owned(),
@@ -2924,7 +2426,7 @@ fn content_title(row: &Value, summary_source: &str) -> String {
         "turn_aborted" => "Turn aborted".to_owned(),
         "execute-run" => "Run".to_owned(),
         "plan-repeat" => "Plan".to_owned(),
-        "" => match role.as_str() {
+        "" => match role {
             "narrative" => String::new(),
             "action" => "Action".to_owned(),
             "result" => "Result".to_owned(),
@@ -2937,18 +2439,16 @@ fn content_title(row: &Value, summary_source: &str) -> String {
     }
 }
 
-fn content_heading(row: &Value, summary_source: &str) -> ContentHeading {
+fn content_heading(row: &RowInput) -> ContentHeading {
     ContentHeading {
         icon: content_icon(row),
-        title: content_title(row, summary_source),
+        title: content_title(row),
     }
 }
 
 /// `hasSubOps` — whether a top-level row carries bundled metadata sub-ops.
-pub(crate) fn has_sub_ops(row: &Value) -> bool {
-    row.get("sub_ops")
-        .and_then(Value::as_array)
-        .is_some_and(|sub_ops| !sub_ops.is_empty())
+pub(crate) fn has_sub_ops(row: &RowInput) -> bool {
+    !row.source.sub_ops.is_empty()
 }
 
 // --- RowSpec assembly (buildRowHtml's presentation model) -------------------
@@ -3038,18 +2538,6 @@ pub(crate) enum FileRowStatus {
 }
 
 impl FileRowStatus {
-    fn from_wire(value: &str) -> Self {
-        match value {
-            "added" => Self::Added,
-            "modified" => Self::Modified,
-            "deleted" => Self::Deleted,
-            "renamed" => Self::Renamed,
-            "copied" => Self::Copied,
-            "type_changed" => Self::TypeChanged,
-            _ => Self::Unknown,
-        }
-    }
-
     pub(crate) const fn code(self) -> &'static str {
         match self {
             Self::Added => "A",
@@ -3240,12 +2728,17 @@ impl RowSpec {
     /// The production placeholder class list for `.row-placeholder` rows.
     pub(crate) const PLACEHOLDER_CLASSES: &'static str = "row row-placeholder";
 
-    /// Build the full presentation model for one cached row value.
+    #[cfg(test)]
     pub(crate) fn from_value(row: &Value, context: &RowContext) -> RowSpec {
-        let is_subop = wire::bool(row, "is_subop");
+        Self::from_row(&RowInput::from_legacy(row), context)
+    }
+
+    /// Build the full presentation model for one cached row value.
+    pub(crate) fn from_row(row: &RowInput, context: &RowContext) -> RowSpec {
+        let is_subop = row.source.is_subop;
         let file_content = file_content(row);
         let is_file = file_content.is_some();
-        let node_key = row_str(row, "node_key");
+        let node_key = row.source.node_key.clone();
         let selected = context
             .selected_key
             .as_deref()
@@ -3272,8 +2765,8 @@ impl RowSpec {
         let has_session_meta = !is_subop && !session.is_empty();
         let session_description = session_meta_description(row);
         let promoted = promoted_kind(row);
-        let summary_source = summary_source(row);
-        let display_summary = display_summary_for_row(row, &summary_source);
+        let summary_source = row.summary_source().to_owned();
+        let display_summary = row.display_summary.clone();
         let plain_summary = plain_row_summary(row, &display_summary);
         let plain_summary = if plain_summary.is_empty() {
             "(no summary)".to_owned()
@@ -3291,10 +2784,7 @@ impl RowSpec {
         } else {
             String::new()
         };
-        let sub_op_count = row
-            .get("sub_ops")
-            .and_then(Value::as_array)
-            .map_or(0usize, Vec::len);
+        let sub_op_count = row.source.sub_ops.len();
         let has_subs = has_sub_ops(row);
         let expanded_state = has_subs && context.expanded;
         let expandable = has_subs;
@@ -3406,7 +2896,7 @@ impl RowSpec {
             }
         }
         let has_badges = !tags.is_empty();
-        let structured_heading = (!is_file).then(|| content_heading(row, &summary_source));
+        let structured_heading = (!is_file).then(|| content_heading(row));
         let row_content = if let Some(file) = file_content.clone() {
             RowContent {
                 file: Some(file),
@@ -3438,9 +2928,15 @@ impl RowSpec {
         let group_start = context.is_group_start && !has_boundary_header;
         let group_label = if !is_subop && is_graph_endpoint(row) {
             Some(group_label_text(
-                &row_str(row, "group"),
-                session_meta_field(row, "session_title"),
-                session_meta_field(row, "agent_nickname"),
+                &row.source.group,
+                row.source
+                    .session_meta
+                    .as_ref()
+                    .and_then(|meta| meta.session_title.as_deref()),
+                row.source
+                    .session_meta
+                    .as_ref()
+                    .and_then(|meta| meta.agent_nickname.as_deref()),
             ))
         } else {
             None
@@ -3448,10 +2944,7 @@ impl RowSpec {
         // aria-label composition, mirroring buildRowHtml exactly.
         let mut aria_label = plain_summary.clone();
         if is_bundle {
-            let member_count = row
-                .get("activity_bundle")
-                .and_then(|bundle| bundle.get("member_count"))
-                .and_then(Value::as_u64);
+            let member_count = row.bundle_count;
             let label = match bundle_kind {
                 Some(BundleKind::WorkGroup) => "Work group",
                 Some(BundleKind::PlanRepeat) => "Plan group",
@@ -3470,7 +2963,7 @@ impl RowSpec {
                 };
                 format!("{count}{noun}")
             }));
-            if is_execute_run && row_str(row, "outcome") == "success" {
+            if is_execute_run && row.outcome == "success" {
                 aria_label.push_str(", completed");
             }
             if is_plan_repeat || is_work_group {
@@ -3507,12 +3000,9 @@ impl RowSpec {
         if let Some(kind) = bundle_kind {
             bundle_info = Some(BundleInfo {
                 kind,
-                member_count: row
-                    .get("activity_bundle")
-                    .and_then(|bundle| bundle.get("member_count"))
-                    .and_then(Value::as_u64),
+                member_count: row.bundle_count,
                 count_text: bundle_count_text(row),
-                status_success: is_execute_run && row_str(row, "outcome") == "success",
+                status_success: is_execute_run && row.outcome == "success",
             });
         }
         RowSpec {
@@ -3520,41 +3010,37 @@ impl RowSpec {
                 abs_index: context.abs_index,
                 node_key: node_key.clone(),
                 is_subop,
-                hierarchy_depth: row
-                    .get("hierarchy_depth")
-                    .and_then(Value::as_u64)
-                    .and_then(|depth| u8::try_from(depth).ok())
-                    .unwrap_or(u8::from(is_subop)),
-                subop_kind: row_str(row, "subop_kind"),
-                op_id: row_str(row, "op_id"),
-                git_oid: row_str(row, "git_oid"),
-                repository: row_str(row, "repository"),
-                commit_id: row_str(row, "commit_id"),
-                turn_id: row_str(row, "turn_id"),
+                hierarchy_depth: row.source.hierarchy_depth,
+                subop_kind: row.source.subop_kind.clone().unwrap_or_default(),
+                op_id: row.source.op_id.clone().unwrap_or_default(),
+                git_oid: row.source.git_oid.clone().unwrap_or_default(),
+                repository: row.source.repository.clone().unwrap_or_default(),
+                commit_id: row.source.commit_id.clone(),
+                turn_id: row.source.turn_id.clone().unwrap_or_default(),
             },
             graph: GraphData {
-                lane: wire::lane(row),
-                above: wire::above(row),
-                below: wire::below(row),
-                transitions: wire::transitions(row),
-                muted_above: wire::muted_above(row),
-                muted_below: wire::muted_below(row),
-                muted_transitions: wire::muted_transitions(row),
-                chain_state: ChainState::from_wire(&row_str(row, "chain_state")),
+                lane: row.lane(),
+                above: row.above(),
+                below: row.below(),
+                transitions: row.transitions(),
+                muted_above: row.muted_above(),
+                muted_below: row.muted_below(),
+                muted_transitions: row.muted_transitions(),
+                chain_state: row.chain_state,
                 is_subop,
                 is_bundle,
                 expanded: expanded_state,
             },
-            kind: row_str(row, "kind"),
-            record_role: row_str(row, "record_role"),
-            activity_kind: row_str(row, "activity_kind"),
+            kind: row.source.kind.clone(),
+            record_role: row.record_role.clone(),
+            activity_kind: row.activity_kind.clone(),
             classification,
-            outcome: row_str(row, "outcome"),
-            group: row_str(row, "group"),
+            outcome: row.outcome.clone(),
+            group: row.source.group.clone(),
             kind_class: kind_class_of(row),
             role_class: role_class_of(row),
             flags: RowFlags {
-                human: row_str(row, "author") == "human",
+                human: row.source.author == "human",
                 selected,
                 find_current: context.find_current,
             },
@@ -3570,8 +3056,8 @@ impl RowSpec {
                     .is_some_and(|header| header.title_only),
                 has_badges,
             },
-            author_text: row_str(row, "author"),
-            date_text: format_date(row_ms(row, "timestamp_ms")),
+            author_text: row.source.author.clone(),
+            date_text: format_date(i64::try_from(row.source.timestamp_ms).unwrap_or(0)),
             commit_text: short_commit_id(row),
             commit_title: commit_cell_title(row),
             summary_source: summary_source.clone(),
@@ -3678,9 +3164,9 @@ impl RowSpec {
     }
 }
 
-fn file_content(row: &Value) -> Option<FileContent> {
-    let change = row.get("file_change")?.as_object()?;
-    let path = change.get("path")?.as_str()?.trim().replace('\\', "/");
+fn file_content(row: &RowInput) -> Option<FileContent> {
+    let change = row.source.file_change.as_ref()?;
+    let path = change.path.trim().replace('\\', "/");
     if path.is_empty() {
         return None;
     }
@@ -3688,25 +3174,23 @@ fn file_content(row: &Value) -> Option<FileContent> {
         || (String::new(), path.clone()),
         |(directory, name)| (directory.to_owned(), name.to_owned()),
     );
-    let status = FileRowStatus::from_wire(
-        change
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown"),
-    );
-    let source = change
-        .get("source")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_owned();
-    let binary = change
-        .get("binary")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let partial = change
-        .get("partial")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let status = match change.status {
+        FileChangeStatus::Added => FileRowStatus::Added,
+        FileChangeStatus::Modified => FileRowStatus::Modified,
+        FileChangeStatus::Deleted => FileRowStatus::Deleted,
+        FileChangeStatus::Renamed => FileRowStatus::Renamed,
+        FileChangeStatus::Copied => FileRowStatus::Copied,
+        FileChangeStatus::TypeChanged => FileRowStatus::TypeChanged,
+        FileChangeStatus::Unknown => FileRowStatus::Unknown,
+    };
+    let source = match change.source {
+        FileChangeSource::Git => "git",
+        FileChangeSource::Agent => "agent",
+        FileChangeSource::Unknown => "unknown",
+    }
+    .to_owned();
+    let binary = change.binary;
+    let partial = change.partial;
     let fidelity = if binary {
         "binary"
     } else if partial {
@@ -3715,10 +3199,7 @@ fn file_content(row: &Value) -> Option<FileContent> {
         ""
     }
     .to_owned();
-    let old_path = change
-        .get("old_path")
-        .and_then(Value::as_str)
-        .filter(|old| !old.is_empty());
+    let old_path = change.old_path.as_deref().filter(|old| !old.is_empty());
     let mut title = format!("{} · {path}", status.label());
     if let Some(old_path) = old_path {
         title.push_str(" ← ");
@@ -3772,11 +3253,11 @@ fn sub_op_label(sub_op_count: usize) -> String {
 }
 
 /// The `kindClass` mapping (system -> tool, message/command -> none, else dim).
-fn kind_class_of(row: &Value) -> KindClass {
-    if wire::bool(row, "is_system") {
+fn kind_class_of(row: &RowInput) -> KindClass {
+    if row.source.is_system {
         KindClass::Tool
     } else {
-        let kind = row_str(row, "kind");
+        let kind = row.source.kind.as_str();
         if kind == "message" || kind == "command" {
             KindClass::Plain
         } else {
@@ -3786,8 +3267,8 @@ fn kind_class_of(row: &Value) -> KindClass {
 }
 
 /// `RECORD_ROLE_CLASSES` whitelist lookup (suffix after `row-role-`).
-fn role_class_of(row: &Value) -> Option<&'static str> {
-    let record_role = row_str(row, "record_role");
+fn role_class_of(row: &RowInput) -> Option<&'static str> {
+    let record_role = row.record_role.clone();
     RECORD_ROLE_CLASSES
         .iter()
         .find(|candidate| **candidate == record_role)
@@ -3795,50 +3276,43 @@ fn role_class_of(row: &Value) -> Option<&'static str> {
 }
 
 /// `openDiff` identity envelope for a source-control-style file row.
-pub(crate) fn open_diff_envelope(row: &Value) -> Option<Value> {
-    let change = row.get("file_change")?.as_object()?;
-    if change
-        .get("path")
-        .and_then(Value::as_str)
-        .is_none_or(str::is_empty)
-    {
+pub(crate) fn open_diff_envelope(row: &RowInput) -> Option<Value> {
+    let change = row.source.file_change.as_ref()?;
+    if change.path.is_empty() {
         return None;
     }
-    let mut envelope = serde_json::Map::new();
-    drop(envelope.insert("type".to_owned(), Value::String("openDiff".to_owned())));
-    drop(envelope.insert("change".to_owned(), Value::Object(change.clone())));
-    Some(Value::Object(envelope))
+    Some(serde_json::json!({ "type": "openDiff", "change": change }))
 }
 
 /// `openJson` identity envelope for eligible rows (exact production shape).
-pub(crate) fn open_json_envelope(row: &Value) -> Option<Value> {
-    if let Some(git_oid) = row.get("git_oid").filter(|value| js_truthy(value)).cloned() {
-        let mut envelope = serde_json::Map::new();
-        drop(envelope.insert("type".to_owned(), Value::String("openJson".to_owned())));
-        drop(envelope.insert("git_oid".to_owned(), git_oid));
-        if let Some(repository) = row.get("repository").cloned() {
-            drop(envelope.insert("repository".to_owned(), repository));
-        }
-        return Some(Value::Object(envelope));
+pub(crate) fn open_json_envelope(row: &RowInput) -> Option<Value> {
+    if let Some(git_oid) = row
+        .source
+        .git_oid
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        return Some(serde_json::json!({
+            "type": "openJson", "git_oid": git_oid, "repository": row.source.repository,
+        }));
     }
-    if let Some(op_id) = row.get("op_id").filter(|value| js_truthy(value)).cloned() {
-        let mut envelope = serde_json::Map::new();
-        drop(envelope.insert("type".to_owned(), Value::String("openJson".to_owned())));
-        drop(envelope.insert("op_id".to_owned(), op_id));
-        return Some(Value::Object(envelope));
-    }
-    None
+    row.source
+        .op_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(|op_id| serde_json::json!({ "type": "openJson", "op_id": op_id }))
 }
 
 /// Whether a row is eligible for the raw-JSON editor activation.
 #[cfg(test)]
-pub(crate) fn is_open_json_eligible(row: &Value) -> bool {
+pub(crate) fn is_open_json_eligible(row: &RowInput) -> bool {
     open_json_envelope(row).is_some()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::legacy_content::display_summary_for_row;
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
@@ -4566,36 +4040,48 @@ mod tests {
     #[test]
     fn commit_and_id_labels_match_short_commit_id() {
         assert_eq!(
-            short_commit_id(&git_row()),
+            short_commit_id(&RowInput::from_legacy(&git_row())),
             "git:abc123d",
             "git rows keep the abbreviated commit id"
         );
-        assert_eq!(short_commit_id(&subop_row()), "ode:1::sub:0");
         assert_eq!(
-            short_commit_id(&with(
+            short_commit_id(&RowInput::from_legacy(&subop_row())),
+            "ode:1::sub:0"
+        );
+        assert_eq!(
+            short_commit_id(&RowInput::from_legacy(&with(
                 &base_row(),
                 &[("turn_id", json!("turn:abcdefghijklmnop"))]
-            )),
+            ))),
             "efghijklmnop"
         );
         assert_eq!(
-            short_commit_id(&with(
+            short_commit_id(&RowInput::from_legacy(&with(
                 &base_row(),
                 &[
                     ("op_id", json!("node:1234567890abcdef")),
                     ("commit_id", json!("")),
                     ("turn_id", json!("")),
                 ]
-            )),
+            ))),
             "567890abcdef"
         );
-        assert_eq!(commit_cell_title(&git_row()), "git:abc123d");
         assert_eq!(
-            commit_cell_title(&with(&base_row(), &[("op_id", json!("node:1"))])),
+            commit_cell_title(&RowInput::from_legacy(&git_row())),
+            "git:abc123d"
+        );
+        assert_eq!(
+            commit_cell_title(&RowInput::from_legacy(&with(
+                &base_row(),
+                &[("op_id", json!("node:1"))]
+            ))),
             "node:1"
         );
         assert_eq!(
-            commit_cell_title(&with(&base_row(), &[("op_id", Value::Null)])),
+            commit_cell_title(&RowInput::from_legacy(&with(
+                &base_row(),
+                &[("op_id", Value::Null)]
+            ))),
             ""
         );
     }
@@ -4611,7 +4097,7 @@ mod tests {
                 ("summary", json!("tool: exec inspect the workspace")),
             ],
         );
-        let heading = content_heading(&tool, &summary_source(&tool));
+        let heading = content_heading(&RowInput::from_legacy(&tool));
         assert_eq!(heading.icon.name(), "tools");
         assert_eq!(heading.title, "exec");
 
@@ -4622,7 +4108,7 @@ mod tests {
                 ("activity_kind", json!("unknown")),
             ],
         );
-        let heading = content_heading(&future, &summary_source(&future));
+        let heading = content_heading(&RowInput::from_legacy(&future));
         assert_eq!(heading.icon.name(), "settings");
         assert_eq!(heading.title, "Future kind");
     }
@@ -4657,14 +4143,14 @@ mod tests {
                 &[("kind", json!(kind)), ("record_role", json!(role))],
             );
             assert_eq!(
-                content_title(&row, &summary_source(&row)),
+                content_title(&RowInput::from_legacy(&row)),
                 expected,
                 "{kind}"
             );
         }
 
         let git = git_row();
-        assert_eq!(content_title(&git, &summary_source(&git)), "");
+        assert_eq!(content_title(&RowInput::from_legacy(&git)), "");
     }
 
     #[test]
@@ -4785,9 +4271,12 @@ mod tests {
                 ),
             ],
         );
-        assert_eq!(work_unit_title(&titled), "Run the integration suite");
         assert_eq!(
-            work_unit_title(&with(
+            work_unit_title(&RowInput::from_legacy(&titled)),
+            "Run the integration suite"
+        );
+        assert_eq!(
+            work_unit_title(&RowInput::from_legacy(&with(
                 &titled,
                 &[(
                     "work_unit",
@@ -4795,11 +4284,11 @@ mod tests {
                         "id": "u", "title": "", "is_start": true, "count": 3
                     })
                 )]
-            )),
+            ))),
             "Run"
         );
         assert_eq!(
-            work_unit_title(&with(
+            work_unit_title(&RowInput::from_legacy(&with(
                 &titled,
                 &[
                     ("activity_kind", json!("conversation")),
@@ -4809,11 +4298,11 @@ mod tests {
                         json!({ "id": "u", "title": "", "is_start": true, "count": 3 })
                     ),
                 ]
-            )),
+            ))),
             "Request"
         );
         assert_eq!(
-            work_unit_title(&with(
+            work_unit_title(&RowInput::from_legacy(&with(
                 &titled,
                 &[
                     ("activity_kind", json!("future_kind")),
@@ -4824,7 +4313,7 @@ mod tests {
                         json!({ "id": "u", "title": "", "is_start": true, "count": 3 })
                     ),
                 ]
-            )),
+            ))),
             "Git · repo 199254740993"
         );
     }
@@ -4844,13 +4333,19 @@ mod tests {
             is_start: true,
             is_end: false,
         };
-        assert!(show_work_unit_count(&base_row(), &wu));
-        assert!(!show_work_unit_count(
-            &with(&base_row(), &[("activity_kind", json!("source_control"))]),
+        assert!(show_work_unit_count(
+            &RowInput::from_legacy(&base_row()),
             &wu
         ));
         assert!(!show_work_unit_count(
-            &base_row(),
+            &RowInput::from_legacy(&with(
+                &base_row(),
+                &[("activity_kind", json!("source_control"))]
+            )),
+            &wu
+        ));
+        assert!(!show_work_unit_count(
+            &RowInput::from_legacy(&base_row()),
             &WorkUnitData {
                 count: Some(1),
                 ..wu.clone()
@@ -4860,33 +4355,42 @@ mod tests {
 
     #[test]
     fn bundle_count_text_matches_the_dto_count_contract() {
-        assert_eq!(bundle_count_text(&bundle_row()), "2 commands");
         assert_eq!(
-            bundle_count_text(&with(
+            bundle_count_text(&RowInput::from_legacy(&bundle_row())),
+            "2 commands"
+        );
+        assert_eq!(
+            bundle_count_text(&RowInput::from_legacy(&with(
                 &bundle_row(),
                 &[(
                     "activity_bundle",
                     json!({ "kind": "execute-run", "member_count": 1 })
                 )]
-            )),
+            ))),
             "1 command"
         );
-        assert_eq!(bundle_count_text(&bundle_plan_row()), "3 updates");
         assert_eq!(
-            bundle_count_text(&with(
+            bundle_count_text(&RowInput::from_legacy(&bundle_plan_row())),
+            "3 updates"
+        );
+        assert_eq!(
+            bundle_count_text(&RowInput::from_legacy(&with(
                 &bundle_plan_row(),
                 &[(
                     "activity_bundle",
                     json!({ "kind": "plan-repeat", "member_count": 1 })
                 )]
-            )),
+            ))),
             "1 update"
         );
         assert_eq!(
-            bundle_count_text(&with(&bundle_row(), &[("kind", json!("tool"))])),
+            bundle_count_text(&RowInput::from_legacy(&with(
+                &bundle_row(),
+                &[("kind", json!("tool"))]
+            ))),
             "2 tool steps"
         );
-        assert_eq!(bundle_count_text(&base_row()), "");
+        assert_eq!(bundle_count_text(&RowInput::from_legacy(&base_row())), "");
     }
 
     #[test]
@@ -4958,15 +4462,15 @@ mod tests {
 
     #[test]
     fn chrome_items_match_exact_span_contracts() {
-        let rel = relation_badges(&with(
+        let rel = relation_badges(&RowInput::from_legacy(&with(
             &base_row(),
             &[("parent_relations", json!([{ "kind": "subagent" }]))],
-        ));
+        )));
         assert_eq!(
             render_chrome_html(&rel),
             "<span class=\"rel-badge rel-subagent\" title=\"Starts a subagent branch\" aria-label=\"Starts a subagent branch\">↳ subagent</span>"
         );
-        let all = relation_badges(&with(
+        let all = relation_badges(&RowInput::from_legacy(&with(
             &base_row(),
             &[(
                 "parent_relations",
@@ -4977,20 +4481,20 @@ mod tests {
                     { "kind": "unknown-kind" },
                 ]),
             )],
-        ));
+        )));
         assert_eq!(
             render_chrome_html(&all),
             "<span class=\"rel-badge rel-subagent\" title=\"Starts a subagent branch\" aria-label=\"Starts a subagent branch\">↳ subagent</span>\
              <span class=\"rel-badge rel-reconnect\" title=\"Completion returns into the subagent branch\" aria-label=\"Completion returns into the subagent branch\">↩ return</span>\
              <span class=\"rel-badge rel-fork\" title=\"Branches off the target row at a fork boundary\" aria-label=\"Branches off the target row at a fork boundary\">⇉ fork</span>"
         );
-        let dup = relation_badges(&with(
+        let dup = relation_badges(&RowInput::from_legacy(&with(
             &base_row(),
             &[(
                 "parent_relations",
                 json!([{ "kind": "fork" }, { "kind": "fork" }]),
             )],
-        ));
+        )));
         assert_eq!(dup.len(), 1);
     }
 
@@ -5012,73 +4516,80 @@ mod tests {
         ];
         for (wire, label, icon) in cases {
             let row = with(&base_row(), &[("activity_kind", json!(wire))]);
-            let classification = row_classification(&row);
+            let classification = row_classification(&RowInput::from_legacy(&row));
             assert_eq!(classification.label, label, "{wire} label");
-            assert_eq!(content_icon(&row).name(), icon, "{wire} Content icon");
+            assert_eq!(
+                content_icon(&RowInput::from_legacy(&row)).name(),
+                icon,
+                "{wire} Content icon"
+            );
             assert_eq!(classification.source, "activity_kind", "{wire} source");
             let title_value = if wire == "system" { "meta" } else { wire };
             assert_eq!(classification.title, format!("Activity: {title_value}"));
         }
 
         let user_row = with(&base_row(), &[("author", json!("human"))]);
-        let user = row_classification(&user_row);
+        let user = row_classification(&RowInput::from_legacy(&user_row));
         assert_eq!(user.label, "user");
-        assert_eq!(content_icon(&user_row).name(), "account");
+        assert_eq!(
+            content_icon(&RowInput::from_legacy(&user_row)).name(),
+            "account"
+        );
         assert_eq!(user.source, "activity_kind");
         assert_eq!(user.title, "Activity: conversation");
 
-        let git = row_classification(&with(
+        let git = row_classification(&RowInput::from_legacy(&with(
             &base_row(),
             &[
                 ("kind", json!("message")),
                 ("activity_kind", json!("unknown")),
                 ("git_oid", json!("abc123")),
             ],
-        ));
+        )));
         assert_eq!(git.label, "git", "Git identity is authoritative");
         assert_eq!(git.source, "git_oid");
 
-        let system = row_classification(&with(
+        let system = row_classification(&RowInput::from_legacy(&with(
             &base_row(),
             &[
                 ("activity_kind", json!("unknown")),
                 ("kind", json!("unknown")),
                 ("is_system", json!(true)),
             ],
-        ));
+        )));
         assert_eq!(system.label, "meta");
         assert_eq!(system.source, "is_system");
         assert_eq!(system.title, "Activity: meta");
 
-        let kind = row_classification(&with(
+        let kind = row_classification(&RowInput::from_legacy(&with(
             &base_row(),
             &[
                 ("activity_kind", json!("unknown")),
                 ("kind", json!("tool_result")),
             ],
-        ));
+        )));
         assert_eq!(kind.label, "tool-result");
         assert_eq!(kind.source, "kind");
 
-        let role = row_classification(&with(
+        let role = row_classification(&RowInput::from_legacy(&with(
             &base_row(),
             &[
                 ("activity_kind", json!("unknown")),
                 ("kind", json!("unknown")),
                 ("record_role", json!("artifact")),
             ],
-        ));
+        )));
         assert_eq!(role.label, "artifact");
         assert_eq!(role.source, "record_role");
 
-        let other = row_classification(&with(
+        let other = row_classification(&RowInput::from_legacy(&with(
             &base_row(),
             &[
                 ("activity_kind", json!("unknown")),
                 ("kind", json!("unknown")),
                 ("record_role", json!("unknown")),
             ],
-        ));
+        )));
         assert_eq!(other.label, "other");
         assert!(!other.label.is_empty());
     }
@@ -5133,12 +4644,12 @@ mod tests {
     #[test]
     fn chrome_suppressions_match_the_frozen_badge_options() {
         assert!(outcome_badge(
-            &with(&base_row(), &[("outcome", json!("success"))]),
+            &RowInput::from_legacy(&with(&base_row(), &[("outcome", json!("success"))])),
             BadgeOptions::default()
         )
         .is_none());
         let warning = outcome_badge(
-            &with(&base_row(), &[("outcome", json!("warning"))]),
+            &RowInput::from_legacy(&with(&base_row(), &[("outcome", json!("warning"))])),
             BadgeOptions::default(),
         )
         .expect("warning badge");
@@ -5147,7 +4658,7 @@ mod tests {
             "<span class=\"out-badge outcome-warning\" title=\"outcome: warning\" aria-label=\"outcome: warn\">warn</span>"
         );
         let failure = outcome_badge(
-            &with(&base_row(), &[("outcome", json!("failure"))]),
+            &RowInput::from_legacy(&with(&base_row(), &[("outcome", json!("failure"))])),
             BadgeOptions::default(),
         )
         .expect("failure badge");
@@ -5156,7 +4667,7 @@ mod tests {
             "<span class=\"out-badge outcome-failure\" title=\"outcome: failure\" aria-label=\"outcome: failed\">✕</span>"
         );
         let cancelled = outcome_badge(
-            &with(&base_row(), &[("outcome", json!("cancelled"))]),
+            &RowInput::from_legacy(&with(&base_row(), &[("outcome", json!("cancelled"))])),
             BadgeOptions::default(),
         )
         .expect("cancelled badge");
@@ -5165,7 +4676,7 @@ mod tests {
             "<span class=\"out-badge outcome-neutral\" title=\"outcome: cancelled\" aria-label=\"outcome: cancelled\">cancelled</span>"
         );
         assert!(outcome_badge(
-            &with(&base_row(), &[("outcome", json!("unknown"))]),
+            &RowInput::from_legacy(&with(&base_row(), &[("outcome", json!("unknown"))])),
             BadgeOptions::default()
         )
         .is_none());
@@ -5174,25 +4685,25 @@ mod tests {
     #[test]
     fn semantic_chrome_order_and_bundle_priority_match_production() {
         let relations = row_semantic_chrome(
-            &with(
+            &RowInput::from_legacy(&with(
                 &base_row(),
                 &[
                     ("parent_relations", json!([{ "kind": "fork" }])),
                     ("outcome", json!("unknown")),
                 ],
-            ),
+            )),
             false,
             BadgeOptions::default(),
         );
         assert_eq!(relations.len(), 1);
         let relations_warning = row_semantic_chrome(
-            &with(
+            &RowInput::from_legacy(&with(
                 &base_row(),
                 &[
                     ("parent_relations", json!([{ "kind": "fork" }])),
                     ("outcome", json!("warning")),
                 ],
-            ),
+            )),
             false,
             BadgeOptions::default(),
         );
@@ -5202,13 +4713,13 @@ mod tests {
              <span class=\"out-badge outcome-warning\" title=\"outcome: warning\" aria-label=\"outcome: warn\">warn</span>"
         );
         let activity = row_semantic_chrome(
-            &with(
+            &RowInput::from_legacy(&with(
                 &base_row(),
                 &[
                     ("activity_kind", json!("plan")),
                     ("outcome", json!("success")),
                 ],
-            ),
+            )),
             false,
             BadgeOptions::default(),
         );
@@ -5216,14 +4727,18 @@ mod tests {
             activity.is_empty(),
             "activity lives in its own column and common success stays suppressed"
         );
-        let bundle = row_semantic_chrome(&bundle_row(), true, BadgeOptions::default());
+        let bundle = row_semantic_chrome(
+            &RowInput::from_legacy(&bundle_row()),
+            true,
+            BadgeOptions::default(),
+        );
         assert_eq!(
             render_chrome_html(&bundle),
             "<span class=\"bundle-count\" title=\"2 commands, completed\">2 commands</span>\
              <span class=\"bundle-status bundle-status-success\" title=\"completed\" aria-label=\"completed\">✓</span>"
         );
         let bundle_unknown_outcome = row_semantic_chrome(
-            &with(&bundle_row(), &[("outcome", json!("unknown"))]),
+            &RowInput::from_legacy(&with(&bundle_row(), &[("outcome", json!("unknown"))])),
             true,
             BadgeOptions::default(),
         );
@@ -5236,7 +4751,7 @@ mod tests {
     #[test]
     fn session_chips_trim_labels_and_describe_provenance() {
         let row = session_meta_row();
-        let chips = session_meta_values(&row);
+        let chips = session_meta_values(&RowInput::from_legacy(&row));
         assert_eq!(chips.len(), 2);
         let model = chips.first().expect("model chip");
         assert_eq!(model.class, "session-chip session-chip-model");
@@ -5247,54 +4762,54 @@ mod tests {
         assert_eq!(agent.label, "Harvey");
         assert_eq!(agent.title, "Agent");
         assert_eq!(
-            session_meta_description(&row),
+            session_meta_description(&RowInput::from_legacy(&row)),
             "Model provider sglang_dsv4, Agent Harvey"
         );
-        let partial = session_meta_values(&with(
+        let partial = session_meta_values(&RowInput::from_legacy(&with(
             &base_row(),
             &[(
                 "session_meta",
                 json!({ "model_provider": "   ", "agent_nickname": "Harvey" }),
             )],
-        ));
+        )));
         assert_eq!(partial.len(), 1);
         assert_eq!(partial.first().expect("agent chip").label, "Harvey");
-        assert!(session_meta_values(&base_row()).is_empty());
+        assert!(session_meta_values(&RowInput::from_legacy(&base_row())).is_empty());
     }
 
     #[test]
     fn promoted_classes_match_the_rail_contract() {
         assert_eq!(
-            promoted_kind(&promoted_failure_row()).expect("failure"),
+            promoted_kind(&RowInput::from_legacy(&promoted_failure_row())).expect("failure"),
             PromotedKind::Failure
         );
         assert_eq!(
-            promoted_kind(&with(
+            promoted_kind(&RowInput::from_legacy(&with(
                 &promoted_failure_row(),
                 &[
                     ("promoted", json!(true)),
                     ("outcome", json!("unknown")),
                     ("activity_kind", json!("change")),
                 ]
-            )),
+            ))),
             Some(PromotedKind::Change)
         );
         assert_eq!(
-            promoted_kind(&with(
+            promoted_kind(&RowInput::from_legacy(&with(
                 &promoted_failure_row(),
                 &[
                     ("promoted", json!(true)),
                     ("outcome", json!("unknown")),
                     ("activity_kind", json!("verify")),
                 ]
-            )),
+            ))),
             Some(PromotedKind::Verify)
         );
         assert_eq!(
-            promoted_kind(&with(
+            promoted_kind(&RowInput::from_legacy(&with(
                 &promoted_failure_row(),
                 &[("promoted", json!(true)), ("outcome", json!("unknown")),]
-            )),
+            ))),
             Some(PromotedKind::Rail)
         );
         assert_eq!(
@@ -5336,7 +4851,7 @@ mod tests {
     }
 
     fn work_unit_class_of(row: &Value) -> Option<WorkUnitClass> {
-        let wu = work_unit_of(row)?;
+        let wu = work_unit_of(&RowInput::from_legacy(row))?;
         if wu.is_start {
             Some(WorkUnitClass::Start)
         } else if wu.is_end {
@@ -5349,14 +4864,26 @@ mod tests {
     #[test]
     fn git_summary_parts_split_the_conventional_prefix_exactly() {
         assert_eq!(
-            git_summary_parts(&git_row(), "feat: add thing"),
+            git_summary_parts(&RowInput::from_legacy(&git_row()), "feat: add thing"),
             Some(("feat".to_owned(), "add thing".to_owned()))
         );
-        assert_eq!(git_summary_parts(&git_row(), "no prefix here"), None);
-        assert_eq!(git_summary_parts(&git_row(), ": leading colon"), None);
-        assert_eq!(git_summary_parts(&base_row(), "feat: add thing"), None);
         assert_eq!(
-            git_summary_parts(&git_row(), "  fix  :  spaced  prefix  "),
+            git_summary_parts(&RowInput::from_legacy(&git_row()), "no prefix here"),
+            None
+        );
+        assert_eq!(
+            git_summary_parts(&RowInput::from_legacy(&git_row()), ": leading colon"),
+            None
+        );
+        assert_eq!(
+            git_summary_parts(&RowInput::from_legacy(&base_row()), "feat: add thing"),
+            None
+        );
+        assert_eq!(
+            git_summary_parts(
+                &RowInput::from_legacy(&git_row()),
+                "  fix  :  spaced  prefix  "
+            ),
             Some(("fix".to_owned(), "spaced  prefix  ".to_owned()))
         );
     }
@@ -5364,12 +4891,18 @@ mod tests {
     #[test]
     fn plain_summaries_drop_the_colon_and_markdown_decoration() {
         assert_eq!(
-            plain_row_summary(&git_row(), "feat: add thing"),
+            plain_row_summary(&RowInput::from_legacy(&git_row()), "feat: add thing"),
             "feat add thing"
         );
-        assert_eq!(plain_row_summary(&git_row(), "feat:"), "feat");
         assert_eq!(
-            plain_row_summary(&base_row(), "# Hello **world**\n- item"),
+            plain_row_summary(&RowInput::from_legacy(&git_row()), "feat:"),
+            "feat"
+        );
+        assert_eq!(
+            plain_row_summary(
+                &RowInput::from_legacy(&base_row()),
+                "# Hello **world**\n- item"
+            ),
             "Hello world · item"
         );
     }
@@ -5392,37 +4925,43 @@ mod tests {
             )
         };
         assert_eq!(
-            display_summary_for_row(&tool(&[]), "tool result: {\"text\": \"did thing\"}"),
+            display_summary_for_row(
+                &RowInput::from_legacy(&tool(&[])),
+                "tool result: {\"text\": \"did thing\"}"
+            ),
             "tool result: {\"text\": \"did thing\"}"
         );
         assert_eq!(
-            display_summary_for_row(&tool(&[]), "{\"text\": \"did thing\"}"),
+            display_summary_for_row(
+                &RowInput::from_legacy(&tool(&[])),
+                "{\"text\": \"did thing\"}"
+            ),
             "did thing"
         );
         assert_eq!(
             display_summary_for_row(
-                &tool(&[("outcome", json!("success"))]),
+                &RowInput::from_legacy(&tool(&[("outcome", json!("success"))])),
                 "{\"opaque\": true}"
             ),
             "Completed"
         );
         assert_eq!(
             display_summary_for_row(
-                &tool(&[("outcome", json!("failure"))]),
+                &RowInput::from_legacy(&tool(&[("outcome", json!("failure"))])),
                 "{\"opaque\": true}"
             ),
             "Failed"
         );
         assert_eq!(
             display_summary_for_row(
-                &with(
+                &RowInput::from_legacy(&with(
                     &base_row(),
                     &[
                         ("kind", json!("command")),
                         ("record_role", json!("action")),
                         ("activity_kind", json!("execute")),
                     ]
-                ),
+                )),
                 "{\"opaque\": true}"
             ),
             "Tool request"
@@ -5437,27 +4976,27 @@ mod tests {
         );
         assert_eq!(
             display_summary_for_row(
-                &command_output,
+                &RowInput::from_legacy(&command_output),
                 "{\"output\":\"transport fallback\",\"stdout\":\"actual stdout\"}"
             ),
             "actual stdout"
         );
         assert_eq!(
             display_summary_for_row(
-                &command_output,
+                &RowInput::from_legacy(&command_output),
                 "{\"formatted_output\":\"formatted fallback\"}"
             ),
             "formatted fallback"
         );
         assert_eq!(
             display_summary_for_row(
-                &with(
+                &RowInput::from_legacy(&with(
                     &base_row(),
                     &[
                         ("record_role", json!("result")),
                         ("activity_kind", json!("execute")),
                     ],
-                ),
+                )),
                 "{\"opaque\": true}"
             ),
             "Tool result"
@@ -5471,16 +5010,19 @@ mod tests {
             ],
         );
         assert_eq!(
-            display_summary_for_row(&narrative, "{\"narrative\": \"authored\"}"),
+            display_summary_for_row(
+                &RowInput::from_legacy(&narrative),
+                "{\"narrative\": \"authored\"}"
+            ),
             "{\"narrative\": \"authored\"}"
         );
         assert_eq!(
-            display_summary_for_row(&narrative, "just prose **bold**"),
+            display_summary_for_row(&RowInput::from_legacy(&narrative), "just prose **bold**"),
             "just prose **bold**"
         );
         assert_eq!(
             display_summary_for_row(
-                &tool(&[]),
+                &RowInput::from_legacy(&tool(&[])),
                 "Script completed in 12.3s\nwall time 12s\ncell 5"
             ),
             "Script completed in 12.3s\nwall time 12s\ncell 5",
@@ -5974,9 +5516,11 @@ mod tests {
             "<span class=\"bundle-count\" title=\"2 commands, completed\">2 commands</span><span class=\"bundle-status bundle-status-success\" title=\"completed\" aria-label=\"completed\">\u{2713}</span>"
         );
         assert_eq!(spec.aria.aria_label, "Execute run, 2 steps, completed");
-        assert!(is_activity_bundle(&bundle_row()));
-        assert!(is_execute_run_bundle(&bundle_row()));
-        assert!(!is_plan_repeat_bundle(&bundle_row()));
+        assert!(is_activity_bundle(&RowInput::from_legacy(&bundle_row())));
+        assert!(is_execute_run_bundle(&RowInput::from_legacy(&bundle_row())));
+        assert!(!is_plan_repeat_bundle(
+            &RowInput::from_legacy(&bundle_row())
+        ));
         let bundle = spec.bundle.as_ref().expect("bundle info");
         assert_eq!(bundle.kind, BundleKind::ExecuteRun);
         assert_eq!(bundle.member_count, Some(2));
@@ -6000,7 +5544,9 @@ mod tests {
             plan.bundle.as_ref().expect("bundle").kind,
             BundleKind::PlanRepeat
         );
-        assert!(is_plan_repeat_bundle(&bundle_plan_row()));
+        assert!(is_plan_repeat_bundle(&RowInput::from_legacy(
+            &bundle_plan_row()
+        )));
         assert!(
             plan.content
                 .top
@@ -6288,7 +5834,7 @@ mod tests {
         let git = git_row();
         let spec = RowSpec::from_value(&git, &context(1, false));
         assert!(spec.open_json.is_some());
-        let envelope = open_json_envelope(&git).expect("git envelope");
+        let envelope = open_json_envelope(&RowInput::from_legacy(&git)).expect("git envelope");
         assert_eq!(
             envelope.get("type").and_then(Value::as_str),
             Some("openJson")
@@ -6303,7 +5849,7 @@ mod tests {
         );
 
         let op_row = with(&base_row(), &[("op_id", json!("node:1"))]);
-        let envelope = open_json_envelope(&op_row).expect("op envelope");
+        let envelope = open_json_envelope(&RowInput::from_legacy(&op_row)).expect("op envelope");
         assert_eq!(
             envelope.get("type").and_then(Value::as_str),
             Some("openJson")
@@ -6317,7 +5863,7 @@ mod tests {
         // Sub-ops carry their own op_id and stay eligible on their own key.
         let sub = subop_row();
         assert_eq!(
-            open_json_envelope(&sub)
+            open_json_envelope(&RowInput::from_legacy(&sub))
                 .expect("subop")
                 .get("op_id")
                 .and_then(Value::as_str),
@@ -6326,11 +5872,14 @@ mod tests {
 
         // A row with neither identifier is ineligible.
         let empty = with(&base_row(), &[("op_id", Value::Null)]);
-        assert_eq!(open_json_envelope(&empty), None);
-        assert!(!is_open_json_eligible(&empty));
+        assert_eq!(open_json_envelope(&RowInput::from_legacy(&empty)), None);
+        assert!(!is_open_json_eligible(&RowInput::from_legacy(&empty)));
         // Falsy identifiers are ineligible exactly like JS truthiness.
         assert_eq!(
-            open_json_envelope(&with(&base_row(), &[("op_id", json!(""))])),
+            open_json_envelope(&RowInput::from_legacy(&with(
+                &base_row(),
+                &[("op_id", json!(""))]
+            ))),
             None
         );
     }

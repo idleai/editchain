@@ -31,6 +31,7 @@ mod shell {
 
     use crate::app::dom::{self, ColKey, HistoryDom};
     use crate::app::host::{self, Send};
+    use crate::app::row_input::RowInput;
     use crate::app::rows::{self, RowContext, RowSpec};
     use crate::app::state::{DomOp, HistoryAppState, RetryAction, Step, Viewport, ROW_H};
 
@@ -407,10 +408,10 @@ mod shell {
                     continue;
                 };
                 let prev_group = self.previous_rendered_group(abs);
-                let group = host::row::str(row, "group");
+                let group = row.source.group.as_str();
                 let is_group_start = prev_group.as_deref().is_none_or(|prev| prev != group);
                 let context = self.row_context(abs, is_group_start);
-                let spec = RowSpec::from_value(row, &context);
+                let spec = RowSpec::from_row(row, &context);
                 self.dom.replace_row_abs(abs, &spec, &col_style, &graph)?;
             }
             Ok(())
@@ -421,7 +422,7 @@ mod shell {
             self.state
                 .cache
                 .get_by_index(prev)
-                .map(|row| host::row::owned_str(row, "group"))
+                .map(|row| row.source.group.clone())
         }
 
         fn last_rendered_group(&self) -> Option<String> {
@@ -429,7 +430,7 @@ mod shell {
             self.state
                 .cache
                 .get_by_index(abs)
-                .map(|row| host::row::owned_str(row, "group"))
+                .map(|row| row.source.group.clone())
         }
 
         fn refresh_header(&mut self) -> Result<(), JsValue> {
@@ -1465,7 +1466,7 @@ mod shell {
                 let Some(row) = shell.state.cache.get_by_index(index) else {
                     return JsValue::NULL;
                 };
-                js_sys::JSON::parse(&row.to_string()).unwrap_or(JsValue::NULL)
+                js_sys::JSON::parse(&row.wire_json()).unwrap_or(JsValue::NULL)
             })
         }));
         set_window_prop("__editchainGetTotal", get_total.as_ref().unchecked_ref());
@@ -1998,7 +1999,7 @@ mod shell {
             cell.borrow()
                 .as_ref()
                 .and_then(|shell| shell.state.cache.get_by_index(abs))
-                .map_or_else(|| "null".to_owned(), Value::to_string)
+                .map_or_else(|| "null".to_owned(), RowInput::wire_json)
         })
     }
 

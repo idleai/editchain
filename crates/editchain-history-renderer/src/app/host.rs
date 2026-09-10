@@ -163,6 +163,7 @@ pub(crate) struct LoggedRequest {
 
 /// Helpers for reading `HistoryRow` fields with the same defaults `main.js`
 /// applies (missing/undefined fields fall back, numbers are coerced).
+#[cfg(test)]
 pub(crate) mod row {
     use super::Value;
 

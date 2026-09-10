@@ -31,7 +31,6 @@
 #[cfg(test)]
 use serde_json::Value;
 
-use super::host::row as row_reader;
 use super::rows::{GraphData, RowSpec};
 use super::state::{HistoryAppState, ROW_H};
 #[cfg(test)]
@@ -794,14 +793,14 @@ pub(crate) fn window_rows_from(
             });
             continue;
         };
-        let group = row_reader::str(row, "group");
+        let group = row.source.group.as_str();
         let is_group_start = last_group.is_none_or(|last| last != group);
         if is_group_start {
             last_group = Some(group);
         }
         rows.push(WindowRow {
             vis,
-            spec: RowSpec::from_value(row, &state.row_context(abs, is_group_start)),
+            spec: RowSpec::from_row(row, &state.row_context(abs, is_group_start)),
         });
     }
     rows
@@ -2389,9 +2388,9 @@ mod tests {
         };
         for (index, value) in rows.iter().enumerate() {
             let key = i64::try_from(index).unwrap_or(0);
-            drop(state.cache.insert(
+            drop(state.cache.insert_legacy(
                 super::super::coordinates::ExpandedRow::new(key).unwrap(),
-                value.clone(),
+                value,
             ));
         }
         state
@@ -2544,9 +2543,9 @@ mod tests {
         for index in 0..5 {
             let key = i64::from(index);
             let value = row_value("repo:a", &format!("k{index}"));
-            drop(state.cache.insert(
+            drop(state.cache.insert_legacy(
                 super::super::coordinates::ExpandedRow::new(key).unwrap(),
-                value,
+                &value,
             ));
         }
         state.render_top = 0;

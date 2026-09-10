@@ -259,9 +259,19 @@ Completed increments:
   for a narrower query, with navigation disabled. Existing query-race and focus
   tests and a new limited-result/selection regression cover these transitions.
 
+- Renderer row ingestion: the sparse cache retains decoded protocol rows.
+  A presentation adapter resolves legacy tool envelopes, summary wrappers,
+  labels, and additive metadata defaults once at ingestion. RowSpec, selection,
+  grouping, and action routing consume typed fields; the full source DTO remains
+  available to diagnostic hooks and exact JSON/diff actions. Legacy envelope
+  traversal bounds both visits and its pending queue. Historical presentation
+  fixtures keep their sparse defaults through a test adapter, while production
+  uses shared protocol defaults. Existing typography and action goldens remain
+  unchanged. Bounded service content previews follow as a separate contract.
+
 Remaining work, in dependency order:
 
-1. Finish renderer find/selection ownership, content adapters, and shell lifetime boundaries.
+1. Publish typed bounded content previews and finish renderer shell lifetime boundaries.
 2. Retire migrated compatibility machinery and optimize measured repeated work.
 
 Validation uses the existing crate, service, renderer, and extension suites.

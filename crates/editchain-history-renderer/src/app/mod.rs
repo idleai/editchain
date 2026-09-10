@@ -42,16 +42,6 @@ pub(crate) enum ChainState {
 }
 
 impl ChainState {
-    /// Parse the compact wire value without allocating.
-    #[must_use]
-    pub(crate) fn from_wire(value: &str) -> Self {
-        if value == "muted" {
-            Self::Muted
-        } else {
-            Self::Active
-        }
-    }
-
     /// Whether muted graph styling applies.
     #[must_use]
     pub(crate) const fn is_muted(self) -> bool {
@@ -63,7 +53,9 @@ mod cache;
 mod coordinates;
 mod expansion;
 mod find;
+mod legacy_content;
 mod requests;
+pub(crate) mod row_input;
 mod selection;
 
 pub(crate) mod host;
