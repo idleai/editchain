@@ -287,6 +287,25 @@ impl SourceReadPlan {
             ImportError::CursorStore("source reservation has no generation".into())
         })?;
         match source.read(Some(reservation)) {
+            Ok(records) if cursor == Some(reservation) => {
+                // A committed reservation and accepted cursor commonly match.
+                // This read has already checked the exact captured prefix and
+                // collected its complete tail. Reuse it only when all cursor
+                // metadata matches as well, so an older reservation cannot
+                // replace a newer derivation or title checkpoint.
+                let state = if records.lines.is_empty() {
+                    SourceReadState::Unchanged
+                } else {
+                    SourceReadState::Append
+                };
+                Ok(Self::from_records(
+                    source,
+                    records,
+                    state,
+                    reserved_generation,
+                    reservation.ops_emitted,
+                ))
+            }
             Ok(_) => {
                 if cursor.is_some() && reserved_generation != accepted_generation {
                     let mut plan =
@@ -320,7 +339,7 @@ impl SourceReadPlan {
         generation: u32,
         generation_floor: u32,
     ) -> Result<Self, ImportError> {
-        let (mut records, state, generation, start_seq) = match source.read(cursor) {
+        let (records, state, generation, start_seq) = match source.read(cursor) {
             Ok(records) => {
                 let state = match cursor {
                     None => SourceReadState::Fresh,
@@ -354,14 +373,26 @@ impl SourceReadPlan {
             }
             Err(error) => return Err(error),
         };
+        Ok(Self::from_records(
+            source, records, state, generation, start_seq,
+        ))
+    }
+
+    fn from_records(
+        source: CapturedSource,
+        mut records: CapturedRecords,
+        state: SourceReadState,
+        generation: u32,
+        start_seq: u64,
+    ) -> Self {
         records.checkpoint.accepted_generation = Some(generation);
-        Ok(Self {
+        Self {
             source,
             records,
             state,
             generation,
             start_seq,
-        })
+        }
     }
 
     /// Source continuity established by byte-exact accepted-prefix validation.

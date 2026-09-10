@@ -233,3 +233,79 @@ fn source_record_and_generation_limits_fail_explicitly() {
         })
     ));
 }
+
+#[test]
+fn reserved_reads_preserve_large_unchanged_and_appended_sources() {
+    use editchain_import::source_read::{SourceReadLimits, SourceReadPlan, SourceReadState};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.jsonl");
+    let record = format!("{}\n", "a".repeat(65_535));
+    let complete = record.repeat(512);
+    let expected_hash = editchain_import::hash_raw(complete.as_bytes());
+    std::fs::write(&path, format!("{complete}partial")).unwrap();
+    drop(complete);
+    let initial = SourceReadPlan::capture(&path, None, 3, SourceReadLimits::default()).unwrap();
+    let cursor = initial.checkpoint().clone();
+    assert_eq!(cursor.content_hash, expected_hash);
+    assert_eq!(cursor.ops_emitted, 512);
+    drop(initial);
+
+    // A persisted reservation normally equals the accepted cursor. Repeated
+    // unchanged imports still validate the captured prefix and retain its tail.
+    for _ in 0..8 {
+        let plan = SourceReadPlan::capture_reserved(
+            &path,
+            Some(&cursor),
+            3,
+            Some(&cursor),
+            SourceReadLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.state(), SourceReadState::Unchanged);
+        assert_eq!(plan.checkpoint(), &cursor);
+        assert_eq!(plan.partial(), Some(false));
+        assert!(plan.lines().is_empty());
+    }
+
+    // The reservation must never substitute its older metadata for the cursor.
+    let mut updated = cursor.clone();
+    updated.normalization_version = 7;
+    let plan = SourceReadPlan::capture_reserved(
+        &path,
+        Some(&updated),
+        3,
+        Some(&cursor),
+        SourceReadLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(plan.checkpoint().normalization_version, 7);
+    drop(plan);
+
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(b"\nnext\n").unwrap();
+    drop(file);
+    let reserved = SourceReadPlan::capture_reserved(
+        &path,
+        Some(&cursor),
+        3,
+        Some(&cursor),
+        SourceReadLimits::default(),
+    )
+    .unwrap();
+    let unreserved =
+        SourceReadPlan::capture(&path, Some(&cursor), 3, SourceReadLimits::default()).unwrap();
+    assert_eq!(reserved.state(), SourceReadState::Append);
+    assert_eq!(reserved.generation(), 3);
+    assert_eq!(reserved.checkpoint(), unreserved.checkpoint());
+    assert_eq!(reserved.partial(), None);
+    assert_eq!(reserved.start_seq(), 512);
+    assert_eq!(reserved.lines().len(), 2);
+    for (actual, expected) in reserved.lines().iter().zip(unreserved.lines()) {
+        assert_eq!(actual.data, expected.data);
+        assert_eq!(actual.hash, expected.hash);
+    }
+}

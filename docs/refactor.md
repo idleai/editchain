@@ -91,7 +91,7 @@ Completed increments:
   cursor unchanged. The legacy reader now rejects changed accepted bytes too.
   Configurable defaults bound a source to 512 MiB, a record to 64 MiB, and a
   generation to one million complete records. Capturing adds temporary disk IO;
-  unchanged-source cost and aggregate memory still need measurement. Segment
+  the source-read measurements below cover unchanged reopen cost. Segment
   writers also release their lock explicitly at drop, even when a concurrently
   spawned process temporarily retains a duplicate descriptor.
 
@@ -225,9 +225,9 @@ Completed increments:
   one snapshot-first planner and skip collapsed descendants when choosing the
   next missing visible row. A sparse cache removes every out-of-range row and
   enforces a 2,000-row publication limit, prioritizing requested visible rows
-  before prefetch or collapsed payloads. This is a row-count bound; typed content
-  and expansion-state work follow separately. Tests cover 1,000 unanswered
-  requests, ID exhaustion, large collapsed spans, scrolling in both directions,
+  before prefetch or collapsed payloads. This increment established a row-count
+  bound; subsequent increments add typed content and byte bounds. Tests cover
+  1,000 unanswered requests, ID exhaustion, large collapsed spans, scrolling in both directions,
   viewport sizes beyond the cache budget, and the existing snapshot/find/layout
   races. Native renderer tests, WASM clippy, and the browser/host harness pass;
   generated production WASM assets are included.
@@ -267,7 +267,7 @@ Completed increments:
   traversal bounds both visits and its pending queue. Historical presentation
   fixtures keep their sparse defaults through a test adapter, while production
   uses shared protocol defaults. Existing typography and action goldens remain
-  unchanged. Bounded service content previews follow as a separate contract.
+  unchanged. The typed content preview contract is described below.
 
 - Typed content previews: projection captures tool labels and authored/output
   roles while normalized children are available. Service preparation records
@@ -362,9 +362,41 @@ Completed increments:
   The public API also verifies baseline selection, replay, and absence of writes
   when planning against a missing chain.
 
-Remaining work: measure and reduce repeated work.
+- Measured source reads: when the complete durable reservation equals the
+  accepted cursor, capture reuses its validated prefix and collected tail. It
+  avoids the second read/hash pass while retaining captured-file isolation,
+  partial-line deferral, bounds, cancellation, and rewrite/recovery behavior.
+  Exact cursor equality includes derivation/title metadata; an older reservation
+  cannot replace it. A 32 MiB regression covers eight unchanged reopens, differing
+  metadata, and append parity with an unreserved read. Across five local release
+  runs, median process time fell from 0.61 s (0.59–0.62 s) to 0.50 s
+  (0.49–0.51 s), about 18%; peak RSS stayed around 66 MiB. These measurements
+  include fixture creation and assertions and do not measure Codex helper work.
+
+The planned refactor increments are complete. EC02 and historical operations
+remain readable; the documented protocol, repository-qualified row keys, and
+pre-1.0 Rust API changes require coordinated consumers. Compatibility readers
+remain where they still serve stored data or older provider shapes.
+
+The existing service performance probe also passed against the seeded VS Code
+checkout (21 accepted source operations and 2,382 expanded rows, mostly Git),
+using 500-row pages. The cache-miss sample reached first rows in 898.1 ms and
+layout in 916.0 ms, with 22,596 KiB peak RSS. After `prepare-view`, the cache-hit
+sample reached first rows in 41.4 ms and layout in 65.3 ms, with 14,512 KiB peak
+RSS. A subsequent deep page took 23.6 ms. These are separate current startup
+modes, not before/after refactor speedups. Both retained identical provisional
+and laid-out row identities; responses were about 698 KB. The earlier million-row
+disclosure measurement covers the larger virtual-coordinate case. Dense trees,
+large helper projections, and Windows runtime behavior are not benchmarked here.
 
 Validation uses the existing crate, service, renderer, and extension suites.
 Every completed code increment must pass `./scripts/lint.sh`. Regression tests
 belong alongside the production contracts they exercise; no separate audit
 harness is required.
+
+Final Linux verification passed: `./scripts/lint.sh` exited 0 with `RESULT: PASS`;
+renderer WASM clippy passed with warnings denied; production WASM regeneration
+matched the committed assets; the extension compiled; all 44 browser/host tests
+passed with no skips; and the real VS Code renderer suite passed both tests
+against the seeded checkout with the rebuilt service. No lint policy or threshold
+was weakened, and no new suppression was introduced.

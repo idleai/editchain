@@ -459,7 +459,7 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 /// One provider record that can recover a session's historical branch tip.
 #[derive(Debug)]
 pub struct ClaudeStartEvidence {
-    /// Physical ordinal of the record carrying the observation.
+    /// Stored source sequence of the record carrying the observation.
     pub source_seq: u64,
     /// Validated owning provider session.
     pub session: SessionId,
