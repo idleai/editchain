@@ -76,6 +76,12 @@ Completed increments:
   Service supplies display content and file details through an adapter. The
   former service snapshot, parallel expansion state, and hierarchy builder are
   removed. Revision 51 binds derived caches to this view contract.
+- Source time: Claude, Codex, title capture, and Git reconciliation share a
+  neutral RFC 3339 parser using the already-locked `time` dependency. Calendar,
+  digit, separator, offset, and pre-epoch validation replaces unchecked date
+  arithmetic. Fractions retain their millisecond precision. Invalid source time
+  stays unknown while capture preserves the complete raw record. Stored clocks
+  remain unchanged; corrected parsing applies to newly captured evidence.
 
 Remaining work, in dependency order:
 

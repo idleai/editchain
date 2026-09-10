@@ -26,6 +26,8 @@ pub mod import;
 pub mod model;
 /// Pluggable output sinks (ops, blobs, cursors).
 pub mod sink;
+/// Validated, provider-neutral source timestamp parsing.
+pub mod source_time;
 
 /// Claude Code session import pipeline.
 pub mod claude_code;

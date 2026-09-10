@@ -11,12 +11,12 @@ use editchain_core::{ActorId, Op, OpId, SessionId};
 use serde_json::Value;
 
 use super::projection::{CompactedLine, FinalItem, InterAgentLine, ProjectionKind, TurnMeta};
-use crate::claude_code::normalize::parse_source_time;
 use crate::error::ImportError;
 use crate::ids::{
     derive_actor_id, derive_path_id, derive_turn_id, IdError, SourcePosition, SourceStream,
 };
 use crate::sink::{payload_for, BlobSink};
+use crate::source_time::parse_source_time;
 use std::collections::HashMap;
 
 /// Minimal top-level metadata extracted from a raw Codex JSONL line.

@@ -8,9 +8,9 @@ use editchain_core::{
     RepositoryId, ScopeRef, SessionId, Tags,
 };
 use editchain_git::{resolve_branch_tip_at_time, RepositoryHandle};
-use editchain_import::claude_code::normalize::parse_source_time;
 use editchain_import::ids::derive_session_id;
 use editchain_import::sink::FsBlobSink;
+use editchain_import::source_time::parse_source_time;
 use serde_json::Value;
 
 use super::git_commit_links::{open_repositories, payload_bytes};

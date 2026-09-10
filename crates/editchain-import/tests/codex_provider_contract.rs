@@ -42,6 +42,7 @@ use serde as _;
 use serde_json as _;
 use sha2 as _;
 use tempfile as _;
+use time as _;
 
 #[expect(
     dead_code,

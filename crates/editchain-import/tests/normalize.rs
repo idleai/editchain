@@ -7,6 +7,9 @@ use serde as _;
 use serde_json as _;
 use sha2 as _;
 use tempfile as _;
+use time as _;
+
+use editchain_import::source_time::parse_source_time;
 
 use editchain_core::{op::OpKind, payload::Payload, tags::Tags};
 use editchain_import::claude_code::envelope::parse_envelope;
@@ -35,6 +38,105 @@ fn test_empty_timestamp() {
         editchain_import::claude_code::normalize::parse_timestamp(""),
         0
     );
+}
+
+#[test]
+fn source_time_normalizes_offsets_and_preserves_fractional_milliseconds() {
+    for (text, expected) in [
+        ("1970-01-01T00:00:00Z", 0),
+        ("1970-01-01T01:00:00+01:00", 0),
+        ("1969-12-31T23:00:00-01:00", 0),
+        ("1970-01-01T00:00:01.9Z", 1_900),
+        ("1970-01-01T00:00:01.98Z", 1_980),
+        ("1970-01-01T00:00:01.987654321Z", 1_987),
+        ("1970-01-01t00:00:01.987z", 1_987),
+        ("1970-01-01T05:30:01.987654321+05:30", 1_987),
+        ("1969-12-31T18:30:01.987654321-05:30", 1_987),
+        ("2016-12-31T23:59:60Z", 1_483_228_799_999),
+    ] {
+        assert_eq!(parse_source_time(text), Some(expected), "{text}");
+        assert_eq!(
+            editchain_import::codex::normalize::raw_clock(Some(text)),
+            (editchain_core::Clock::UnixMs(expected), false)
+        );
+    }
+    assert_eq!(
+        parse_source_time("2000-02-29T12:34:56Z"),
+        parse_source_time("2000-02-29T07:34:56-05:00")
+    );
+    assert!(parse_source_time("2000-02-29T12:34:56Z").is_some());
+}
+
+#[test]
+fn malformed_and_pre_epoch_source_times_stay_unknown_without_panicking() {
+    for text in [
+        "",
+        "not a time",
+        "2026-07-09",
+        "2026/07/09T18:56:19Z",
+        "2026-07-09T18:56:19",
+        "2026-07-09T18:56:19Z trailing",
+        "2026-07-09T18:56:19.badZ",
+        "2026-07-09T18:56:19.Z",
+        "2026-07-09T18:56:19+25:00",
+        "2026-07-09T18:56:19+01:60",
+        "2026-00-09T18:56:19Z",
+        "2026-13-09T18:56:19Z",
+        "2026-07-00T18:56:19Z",
+        "2026-04-31T18:56:19Z",
+        "2026-02-29T18:56:19Z",
+        "2100-02-29T18:56:19Z",
+        "2026-07-09T24:00:00Z",
+        "2026-07-09T18:60:00Z",
+        "2026-07-09T18:56:61Z",
+        "2026-07-09T18:56:19+0100",
+        "202/-07-09T18:56:19Z",
+        "2026-0/-09T18:56:19Z",
+        "２０２６-07-09T18:56:19Z",
+        "1969-12-31T23:59:59.999999999Z",
+        "1970-01-01T00:00:00+00:01",
+    ] {
+        assert_eq!(parse_source_time(text), None, "{text}");
+        assert_eq!(
+            editchain_import::codex::normalize::raw_clock(Some(text)),
+            (editchain_core::Clock::UnixMs(0), true)
+        );
+    }
+}
+
+#[test]
+fn claude_capture_preserves_raw_bytes_when_source_time_is_invalid() {
+    for (timestamp, expected_ms, unknown) in [
+        ("2026-02-30T12:00:00Z", 0, true),
+        ("202/-07-09T18:56:19Z", 0, true),
+        ("1970-01-01T05:30:01.987654321+05:30", 1_987, false),
+    ] {
+        let raw_bytes = serde_json::to_vec(&serde_json::json!({
+            "type": "user", "uuid": "event", "sessionId": "session",
+            "timestamp": timestamp, "message": { "role": "user", "content": "hello" },
+        }))
+        .unwrap();
+        let envelope = parse_envelope(&raw_bytes).unwrap();
+        let stream = SourceStream::new(derive_node_id("/test"), 0);
+        let (raw, normalized) = normalize_envelope(
+            &envelope,
+            hash_raw(&raw_bytes),
+            &raw_bytes,
+            &stream,
+            1,
+            &NormalizeOptions::default(),
+            &mut MemoryBlobSink::new(),
+            "session",
+        )
+        .unwrap();
+        assert_eq!(raw.clock, editchain_core::Clock::UnixMs(expected_ms));
+        assert_eq!(raw.tags.matches_any(Tags::SOURCE_TIME_UNKNOWN), unknown);
+        assert!(
+            matches!(&raw.kind, OpKind::Import(import) if import.raw_ref == Payload::Inline(raw_bytes))
+        );
+        assert!(!normalized.is_empty());
+        assert!(normalized.iter().all(|op| op.clock == raw.clock));
+    }
 }
 
 #[test]

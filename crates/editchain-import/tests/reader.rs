@@ -7,6 +7,7 @@ use proptest as _;
 use serde as _;
 use serde_json as _;
 use sha2 as _;
+use time as _;
 
 use editchain_import::claude_code::reader::read_session_file;
 use std::io::Write;

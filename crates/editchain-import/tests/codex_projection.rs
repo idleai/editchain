@@ -13,6 +13,7 @@ use serde as _;
 use serde_json as _;
 use sha2 as _;
 use tempfile as _;
+use time as _;
 
 use editchain_import::codex::projection::{parse_projection, ProjectionError, ProjectionKind};
 

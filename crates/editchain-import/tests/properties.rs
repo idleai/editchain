@@ -11,6 +11,7 @@ use serde as _;
 use serde_json as _;
 use sha2 as _;
 use tempfile as _;
+use time as _;
 
 use editchain_import::ids::derive_source_stream;
 use proptest::prelude::*;

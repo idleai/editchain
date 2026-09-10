@@ -17,10 +17,10 @@ use editchain_core::tags::Tags;
 use editchain_core::{Op, OpId, SessionId};
 use serde_json::Value;
 
-use crate::claude_code::normalize::parse_source_time;
 use crate::error::ImportError;
 use crate::ids::{derive_actor_id, derive_external_entity_id, hash_raw};
 use crate::sink::{payload_for, BlobSink};
+use crate::source_time::parse_source_time;
 
 /// Latest provider-owned title record for one Codex thread.
 #[derive(Debug, Clone, PartialEq, Eq)]

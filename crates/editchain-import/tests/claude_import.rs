@@ -7,6 +7,7 @@
 
 use std::io::Write as _;
 use std::path::Path;
+use time as _;
 
 use blake3 as _;
 use editchain_core::{NoteRelationship, OpKind, ParentSet};

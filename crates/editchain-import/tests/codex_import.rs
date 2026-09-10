@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::Path;
 use tempfile as _;
+use time as _;
 
 use editchain_core::clock::Clock;
 use editchain_core::op::{CommandStage, OpKind, ToolStage};
@@ -29,7 +30,6 @@ use editchain_core::scope::ScopeRef;
 use editchain_core::tags::Tags;
 
 use editchain_core::parents::ParentSet;
-use editchain_import::claude_code::normalize::parse_source_time;
 use editchain_import::codex::{import_codex, CodexDiscoveryRequest, HelperCommand};
 use editchain_import::cursor::canonical_source_key;
 use editchain_import::error::ImportError;
@@ -41,6 +41,7 @@ use editchain_import::model::ImportOptions;
 use editchain_import::sink::{
     ContentAddressedBlobSink, CursorStore, MemoryCursorStore, MemoryOpSink,
 };
+use editchain_import::source_time::parse_source_time;
 
 use common::*;
 

@@ -31,6 +31,7 @@ use serde as _;
 use sha2 as _;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use time as _;
 
 use editchain_core::op::{NoteRelationship, OpKind};
 use editchain_core::parents::ParentSet;
