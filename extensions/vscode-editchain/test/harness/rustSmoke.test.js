@@ -1071,6 +1071,44 @@ test('row keyboard disclosure, double-click identity, and divider drag remain co
         resizedFixedColumns.tags.before) <= 1, 'Tags width restores');
       await settleRust(page);
 
+      const replacedDrag = await page.evaluate(() => {
+        const add = window.addEventListener;
+        const remove = window.removeEventListener;
+        const active = { mousemove: new Set(), mouseup: new Set() };
+        window.addEventListener = function (type, callback, options) {
+          active[type]?.add(callback);
+          return add.call(this, type, callback, options);
+        };
+        window.removeEventListener = function (type, callback, options) {
+          active[type]?.delete(callback);
+          return remove.call(this, type, callback, options);
+        };
+        try {
+          const handle = document.querySelector('.col-resize-handle[data-col="graph"]');
+          const during = [];
+          for (let replacement = 0; replacement < 3; replacement++) {
+            handle.dispatchEvent(new MouseEvent('mousedown', {
+              bubbles: true, cancelable: true, clientX: 100,
+            }));
+            during.push([active.mousemove.size, active.mouseup.size]);
+          }
+          window.dispatchEvent(new MouseEvent('mousemove', { clientX: 100 }));
+          window.dispatchEvent(new MouseEvent('mouseup', { clientX: 100 }));
+          return {
+            during,
+            after: [active.mousemove.size, active.mouseup.size],
+            resizing: document.body.classList.contains('col-resizing'),
+          };
+        } finally {
+          window.addEventListener = add;
+          window.removeEventListener = remove;
+        }
+      });
+      assert.deepEqual(replacedDrag.during, [[1, 1], [1, 1], [1, 1]],
+        'a new drag replaces the previous window listeners');
+      assert.deepEqual(replacedDrag.after, [0, 0], 'mouseup releases both listeners');
+      assert.equal(replacedDrag.resizing, false);
+
       const before = await rustState(page);
       const handle = await page.$('.col-resize-handle[data-col="graph"]');
       assert.ok(handle, 'graph resize handle exists');
@@ -1119,6 +1157,101 @@ test('row keyboard disclosure, double-click identity, and divider drag remain co
       await merge.page.close();
   }
 });
+
+test('a DOM failure is reported without reborrowing or disabling the shell',
+  { skip: SKIP }, async () => {
+    const { page, errors } = await openRustPage('merge');
+    try {
+      const injected = await page.evaluate(() => {
+        const rows = document.getElementById('rows');
+        const query = rows.querySelectorAll;
+        let injected = false;
+        rows.querySelectorAll = function (selector) {
+          if (!injected && selector === '.row.row-selected') {
+            injected = true;
+            throw new Error('fixture selection failure');
+          }
+          return query.call(this, selector);
+        };
+        try {
+          rows.querySelector('.row[data-row="0"]').dispatchEvent(new MouseEvent('click', {
+            bubbles: true, cancelable: true, detail: 1,
+          }));
+          return injected;
+        } finally {
+          rows.querySelectorAll = query;
+        }
+      });
+      assert.equal(injected, true, 'the production selection effect encounters the failure');
+      await settleRust(page);
+      assert.deepEqual(errors.page, [], 'diagnostics do not panic inside a borrowed shell');
+      assert.equal(errors.console.length, 1);
+      assert.match(errors.console[0], /^selection apply failed:/);
+      errors.console.length = 0;
+      await page.click('.row[data-row="1"] .text-cell');
+      await settleRust(page);
+      assert.equal(await page.$eval('.row[data-row="1"]',
+        (row) => row.getAttribute('aria-selected')), 'true', 'later transitions still run');
+      assertRustHealthy(await rustState(page), 'after a recoverable DOM failure');
+      assertNoErrors(errors, 'recovered DOM effects');
+    } finally {
+      await page.close();
+    }
+  });
+
+test('repeated Retry panes retire their listeners before the next history load',
+  { skip: SKIP }, async () => {
+    const { page, errors } = await openRustPage('merge');
+    try {
+      await page.evaluate(() => {
+        const add = EventTarget.prototype.addEventListener;
+        const remove = EventTarget.prototype.removeEventListener;
+        window.__retryListeners = new Set();
+        EventTarget.prototype.addEventListener = function (type, callback, options) {
+          if (type === 'click' && this instanceof HTMLElement && this.matches('.retry-btn')) {
+            window.__retryListeners.add(callback);
+          }
+          return add.call(this, type, callback, options);
+        };
+        EventTarget.prototype.removeEventListener = function (type, callback, options) {
+          window.__retryListeners.delete(callback);
+          return remove.call(this, type, callback, options);
+        };
+      });
+      for (let attempt = 0; attempt < 3; attempt++) {
+        await page.evaluate(() => {
+          window.__editchainFixture.rows[0].content = {
+            tool_label: { text: 'x'.repeat(257), complete: true },
+          };
+          window.__editchainStart();
+        });
+        await driver.waitFor(page, () => !!document.querySelector('.retry-btn'),
+          { timeout: driver.IDLE_TIMEOUT_MS });
+        assert.equal(await page.evaluate(() => window.__retryListeners.size), 1);
+        await page.evaluate(() => {
+          delete window.__editchainFixture.rows[0].content;
+          window.__retiredRetry = document.querySelector('.retry-btn');
+          window.__retiredRetry.click();
+        });
+        await driver.waitFor(page, () => !!document.querySelector('.row[data-key]'),
+          { timeout: driver.IDLE_TIMEOUT_MS });
+        await settleRust(page);
+        const retired = await page.evaluate(() => {
+          const before = window.__editchainRequestLog.length;
+          window.__retiredRetry.click();
+          return { active: window.__retryListeners.size, before };
+        });
+        assert.equal(retired.active, 0, 'the removed pane owns no live click listener');
+        await settleRust(page);
+        assert.equal(await page.evaluate(() => window.__editchainRequestLog.length),
+          retired.before, 'a detached Retry button cannot restart history');
+      }
+      assertRustHealthy(await rustState(page), 'after repeated Retry');
+      assertNoErrors(errors, 'Retry lifetime');
+    } finally {
+      await page.close();
+    }
+  });
 
 test('Git and agent parents reveal column-aligned file rows whose click opens an exact diff identity',
   { skip: SKIP }, async () => {

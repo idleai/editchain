@@ -297,10 +297,26 @@ Completed increments:
   cover heterogeneous metadata, replacement accounting, forward/backward
   scrolling, hydration, distant find, oversized pages, and terminal recovery.
 
+- Renderer shell: browser input, message/effect execution, diagnostics, and
+  replaceable registrations have separate owners. The existing message queue,
+  transition guard, DOM-before-send ordering, and deferred host posts retain
+  their synchronous-bridge contract. Timers now own their callbacks and cancel
+  on replacement; resize observation owns its callback and disconnects on drop.
+  Retry panes and column drags remove their listeners when retired, including
+  replacement of an unfinished drag. Application-lifetime listeners and the
+  existing diagnostic exports retain their startup contract. Error reporting
+  no longer reborrows the shell from a failed DOM effect. Browser regressions
+  cover repeated drag replacement, retired Retry buttons, and recovery after a
+  forced selection error alongside the existing focus/resize/bridge checks.
+  The real VS Code suite also passes against its seeded CI checkout with the
+  current native service and generated renderer assets.
+
 Remaining work, in dependency order:
 
-1. Finish renderer shell lifetime boundaries.
-2. Retire migrated compatibility machinery and optimize measured repeated work.
+1. Finish core observed-time and Git identity validation, and retire the unused
+   materialization API.
+2. Retire migrated producer compatibility machinery.
+3. Measure and reduce repeated work.
 
 Validation uses the existing crate, service, renderer, and extension suites.
 Every completed code increment must pass `./scripts/lint.sh`. Regression tests

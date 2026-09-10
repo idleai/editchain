@@ -104,6 +104,14 @@ The harness verifies the exact minimal request envelopes, virtual paging,
 two-pass layout, row semantics, accessibility, selection, disclosure,
 find-in-history, JSON/diff identities, and the absence of a canvas renderer.
 
+The renderer VS Code suite expects Git history and the imported Claude session
+in `test/fixtures/claude`, as prepared by CI. Use a disposable checkout for that
+fixture import, set `EDITCHAIN_RENDERER_E2E_WORKSPACE` to its path, and set
+`EDITCHAIN_RENDERER_E2E_SERVICE` to the freshly built native service. The suite
+loads this extension's current generated renderer assets. Its initial viewport
+must contain both Git commits and an agent work group; an arbitrary working
+chain may not contain the required rows there.
+
 For repository-wide Rust formatting, clippy, tests, docs, and dependency
 policy, run `./scripts/lint.sh` from the repository root.
 
