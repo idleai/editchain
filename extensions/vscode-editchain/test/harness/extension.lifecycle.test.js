@@ -324,26 +324,28 @@ test('disposing the current panel invalidates its in-flight Open', async () => {
 });
 
 test('Open Error surfaces without ready and command reuse retries', async () => {
-  const env = loadExtension();
+  for (const error of ['boom', { code: 'stale_snapshot', message: 'boom' }]) {
+    const env = loadExtension();
 
-  env.open(); // panel A, Open A pending
-  const panelA = env.panels[0];
-  const openA = env.client.openRequests[0];
-  await rendererReady(panelA);
+    env.open(); // panel A, Open A pending
+    const panelA = env.panels[0];
+    const openA = env.client.openRequests[0];
+    await rendererReady(panelA);
 
-  // Error on the CURRENT Open: surfaced to the webview, no `ready`, no body
-  // cached (so command reuse retries instead of replaying).
-  openA.resolve({ Error: 'boom' });
-  await flush();
-  assert.deepEqual(panelA.webview.messages, [{ id: 'open', body: { Error: 'boom' } }]);
+    // Error on the CURRENT Open: surfaced to the webview, no `ready`, no body
+    // cached (so command reuse retries instead of replaying).
+    openA.resolve({ Error: error });
+    await flush();
+    assert.deepEqual(panelA.webview.messages, [{ id: 'open', body: { Error: 'boom' } }]);
 
-  env.open(); // reuse: no successful body -> retry with a fresh Open
-  assert.equal(env.client.openRequests.length, 2, 'command reuse retries after Error');
-  const openA2 = env.client.openRequests[1];
-  openA2.resolve({ Ok: { workspace: 'A' } });
-  await flush();
-  assert.deepEqual(panelA.webview.messages[1], { id: 'open', body: { Ok: { workspace: 'A' } } });
-  assert.deepEqual(panelA.webview.messages[2], { id: 'ready' });
+    env.open(); // reuse: no successful body -> retry with a fresh Open
+    assert.equal(env.client.openRequests.length, 2, 'command reuse retries after Error');
+    const openA2 = env.client.openRequests[1];
+    openA2.resolve({ Ok: { workspace: 'A' } });
+    await flush();
+    assert.deepEqual(panelA.webview.messages[1], { id: 'open', body: { Ok: { workspace: 'A' } } });
+    assert.deepEqual(panelA.webview.messages[2], { id: 'ready' });
+  }
 });
 
 test('history panel retains its bounded renderer context across raw JSON navigation', async () => {

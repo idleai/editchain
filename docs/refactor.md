@@ -40,6 +40,11 @@ Completed increments:
   Prefix lookup distinguishes absence, ambiguity, wrong object kind, and read
   failure; an incomplete repository set cannot establish global uniqueness.
   Projection revision 48 invalidates caches that omitted history diagnostics.
+- Protocol boundary: shared classification types live in core, so protocol no
+  longer depends on projection algorithms. Errors retain machine-readable codes
+  inside the existing envelope; clients accept both structured and legacy string
+  errors. Requests validate page, search, query, and exact-coordinate limits.
+  The stdio reader rejects frames above 8 MiB before allocating their payloads.
 
 Remaining work, in dependency order:
 

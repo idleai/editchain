@@ -30,7 +30,7 @@ use editchain_import as _;
 #[cfg(test)]
 use tempfile as _;
 
-use editchain_protocol::{Request, Response};
+use editchain_protocol::{Request, Response, ServiceError, MAX_REQUEST_FRAME_BYTES};
 use editchain_vscode_service::Server;
 
 /// Read a single length-prefixed frame from a reader.
@@ -53,6 +53,12 @@ fn read_frame(reader: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
         filled += n;
     }
     let len = u32::from_le_bytes(len_buf) as usize;
+    if len > MAX_REQUEST_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request frame exceeds 8 MiB",
+        ));
+    }
     let mut payload = vec![0u8; len];
     reader.read_exact(&mut payload)?;
     Ok(Some(payload))
@@ -60,7 +66,8 @@ fn read_frame(reader: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
 
 /// Write a length-prefixed frame to a writer.
 fn write_frame(writer: &mut impl Write, payload: &[u8]) -> io::Result<()> {
-    let len = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+    let len = u32::try_from(payload.len())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     writer.write_all(&len.to_le_bytes())?;
     writer.write_all(payload)?;
     writer.flush()
@@ -96,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(resp) => resp,
             Err(e) => Response {
                 id: request.id,
-                body: editchain_protocol::ResponseBody::Error(e.to_string()),
+                body: editchain_protocol::ResponseBody::Error(ServiceError::from_error(e.as_ref())),
             },
         };
 
@@ -105,4 +112,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_reader_checks_the_advertised_limit_before_reading_payload() {
+        let oversized = u32::try_from(MAX_REQUEST_FRAME_BYTES.saturating_add(1)).unwrap();
+        let bytes = oversized.to_le_bytes();
+        assert_eq!(
+            read_frame(&mut bytes.as_slice()).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(read_frame(&mut [].as_slice()).unwrap().is_none());
+        assert_eq!(
+            read_frame(&mut [1, 0].as_slice()).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            read_frame(&mut [1, 0, 0, 0].as_slice()).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            read_frame(&mut [1, 0, 0, 0, b'x'].as_slice()).unwrap(),
+            Some(vec![b'x'])
+        );
+    }
 }

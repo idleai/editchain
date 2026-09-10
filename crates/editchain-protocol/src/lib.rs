@@ -1,8 +1,14 @@
 //! Request/response DTOs for the `EditChain` VS Code service.
 //!
 //! These types are serialized over stdio between the thin TypeScript
-//! extension host and the native Rust service. Every response carries
-//! generation counters so stale windows and results can be detected.
+//! extension host and the native Rust service.
+
+mod error;
+mod validation;
+pub use error::{ErrorCode, ServiceError};
+pub use validation::{
+    MAX_QUERY_BYTES, MAX_REQUEST_FRAME_BYTES, MAX_SEARCH_RESULTS, MAX_WINDOW_ROWS,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -52,8 +58,8 @@ pub struct Response {
 pub enum ResponseBody {
     /// Successful result with a value.
     Ok(serde_json::Value),
-    /// An error message.
-    Error(String),
+    /// A structured error; readers also accept legacy string errors.
+    Error(ServiceError),
 }
 
 /// Open a workspace and load its chain + git repositories.
@@ -455,27 +461,27 @@ pub struct HistoryRow {
     /// lifecycle/echo/unknown). Serialized as a lowercase `snake_case` string;
     /// unknown values deserialize to `Unknown` for forward compatibility.
     #[serde(default)]
-    pub record_role: editchain_project::taxonomy::RecordRole,
+    pub record_role: editchain_core::taxonomy::RecordRole,
     /// Provider-neutral activity kind (conversation/plan/execute/change/...).
     /// Serialized as a lowercase `snake_case` string; unknown values deserialize
     /// to `Unknown` for forward compatibility.
     #[serde(default)]
-    pub activity_kind: editchain_project::taxonomy::ActivityKind,
+    pub activity_kind: editchain_core::taxonomy::ActivityKind,
     /// Render prominence (primary/supporting/trace). Trace rows are omitted
     /// from the fixed Activity view.
     #[serde(default)]
-    pub visibility: editchain_project::taxonomy::Visibility,
+    pub visibility: editchain_core::taxonomy::Visibility,
     /// Concluded outcome (success/warning/failure/cancelled/unknown). Unknown
     /// is the default — success is never inferred without structured evidence.
     #[serde(default)]
-    pub outcome: editchain_project::taxonomy::Outcome,
+    pub outcome: editchain_core::taxonomy::Outcome,
     /// Reusable presentation state for this row and its child-owned graph edge.
     /// Active is the backward-compatible default and is omitted on the wire.
     #[serde(
         default,
-        skip_serializing_if = "editchain_project::taxonomy::ChainState::is_active"
+        skip_serializing_if = "editchain_core::taxonomy::ChainState::is_active"
     )]
-    pub chain_state: editchain_project::taxonomy::ChainState,
+    pub chain_state: editchain_core::taxonomy::ChainState,
     /// Provider-neutral turn identity as an exact decimal string (u64 values
     /// above 2^53 round-trip through JavaScript without precision loss).
     /// `None` when the row is not turn-scoped.
@@ -808,6 +814,47 @@ mod tests {
     /// 2^53 + 1 — the first integer JavaScript's IEEE-754 doubles round.
     const OVER_2_53: u64 = 9_007_199_254_740_993;
 
+    #[test]
+    fn request_limits_reject_zero_oversize_and_inexact_coordinates() {
+        for body in [
+            serde_json::json!({"GetWindow": {"offset": 0, "limit": 0, "include_layout": false}}),
+            serde_json::json!({"GetWindow": {"offset": 0, "limit": 10001, "include_layout": false}}),
+            serde_json::json!({"GetWindow": {"offset": OVER_2_53, "limit": 1, "include_layout": false}}),
+            serde_json::json!({"GetWindow": {"offset": u64::MAX, "limit": 1, "include_layout": false}}),
+            serde_json::json!({"FindInHistory": {"query": "needle", "top_k": 0}}),
+            serde_json::json!({"FindInHistory": {"query": "needle", "top_k": 1001}}),
+            serde_json::json!({"FindInHistory": {"query": "x".repeat(MAX_QUERY_BYTES.saturating_add(1)), "top_k": 1}}),
+        ] {
+            let request: RequestBody = serde_json::from_value(body).unwrap();
+            assert_eq!(
+                request.validate().unwrap_err().code,
+                ErrorCode::InvalidInput
+            );
+        }
+        for body in [
+            serde_json::json!({"GetWindow": {"offset": 0, "limit": MAX_WINDOW_ROWS, "include_layout": true}}),
+            serde_json::json!({"FindInHistory": {"query": "x".repeat(MAX_QUERY_BYTES), "top_k": MAX_SEARCH_RESULTS}}),
+        ] {
+            let request: RequestBody = serde_json::from_value(body).unwrap();
+            assert!(request.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn structured_errors_preserve_codes_and_accept_legacy_messages() {
+        let body = ResponseBody::Error(ServiceError::new(
+            ErrorCode::StaleSnapshot,
+            "reopen history",
+        ));
+        let value = serde_json::to_value(body).unwrap();
+        assert_eq!(value["Error"]["code"], "stale_snapshot");
+        assert_eq!(value["Error"]["message"], "reopen history");
+        let legacy: ResponseBody =
+            serde_json::from_value(serde_json::json!({"Error": "old service"})).unwrap();
+        assert!(matches!(legacy, ResponseBody::Error(error)
+            if error.code == ErrorCode::Internal && error.message == "old service"));
+    }
+
     fn big_op_id() -> OpId {
         OpId::new(NodeId(OVER_2_53), 7, 42)
     }
@@ -857,11 +904,11 @@ mod tests {
             hierarchy_depth: 0,
             parent_row: None,
             subop_kind: None,
-            record_role: editchain_project::taxonomy::RecordRole::Artifact,
-            activity_kind: editchain_project::taxonomy::ActivityKind::SourceControl,
-            visibility: editchain_project::taxonomy::Visibility::Primary,
-            outcome: editchain_project::taxonomy::Outcome::Success,
-            chain_state: editchain_project::taxonomy::ChainState::Active,
+            record_role: editchain_core::taxonomy::RecordRole::Artifact,
+            activity_kind: editchain_core::taxonomy::ActivityKind::SourceControl,
+            visibility: editchain_core::taxonomy::Visibility::Primary,
+            outcome: editchain_core::taxonomy::Outcome::Success,
+            chain_state: editchain_core::taxonomy::ChainState::Active,
             turn_id: Some(OVER_2_53.to_string()),
             session_meta: None,
             session_summary: None,
@@ -900,7 +947,7 @@ mod tests {
         assert_eq!(round_trip["turn_id"], "9007199254740993");
         assert_eq!(
             back.record_role,
-            editchain_project::taxonomy::RecordRole::Artifact
+            editchain_core::taxonomy::RecordRole::Artifact
         );
         assert_eq!(back.turn_id.as_deref(), Some("9007199254740993"));
     }
@@ -926,23 +973,20 @@ mod tests {
         // Newer provider-neutral fields default safely on sparse payloads.
         assert_eq!(
             sparse.record_role,
-            editchain_project::taxonomy::RecordRole::Unknown
+            editchain_core::taxonomy::RecordRole::Unknown
         );
         assert_eq!(
             sparse.activity_kind,
-            editchain_project::taxonomy::ActivityKind::Unknown
+            editchain_core::taxonomy::ActivityKind::Unknown
         );
         assert_eq!(
             sparse.visibility,
-            editchain_project::taxonomy::Visibility::Unknown
+            editchain_core::taxonomy::Visibility::Unknown
         );
-        assert_eq!(
-            sparse.outcome,
-            editchain_project::taxonomy::Outcome::Unknown
-        );
+        assert_eq!(sparse.outcome, editchain_core::taxonomy::Outcome::Unknown);
         assert_eq!(
             sparse.chain_state,
-            editchain_project::taxonomy::ChainState::Active
+            editchain_core::taxonomy::ChainState::Active
         );
         assert!(sparse.muted_above.is_empty());
         assert!(sparse.muted_below.is_empty());
@@ -1190,20 +1234,20 @@ mod tests {
         .expect("unknown taxonomy tolerated");
         assert_eq!(
             row.record_role,
-            editchain_project::taxonomy::RecordRole::Unknown
+            editchain_core::taxonomy::RecordRole::Unknown
         );
         assert_eq!(
             row.activity_kind,
-            editchain_project::taxonomy::ActivityKind::Unknown
+            editchain_core::taxonomy::ActivityKind::Unknown
         );
         assert_eq!(
             row.visibility,
-            editchain_project::taxonomy::Visibility::Unknown
+            editchain_core::taxonomy::Visibility::Unknown
         );
-        assert_eq!(row.outcome, editchain_project::taxonomy::Outcome::Unknown);
+        assert_eq!(row.outcome, editchain_core::taxonomy::Outcome::Unknown);
         assert_eq!(
             row.chain_state,
-            editchain_project::taxonomy::ChainState::Active
+            editchain_core::taxonomy::ChainState::Active
         );
         assert_eq!(row.turn_id.as_deref(), Some("9007199254740993"));
         let reserialized = serde_json::to_string(&row).expect("serialize row");
@@ -1267,11 +1311,11 @@ mod tests {
             hierarchy_depth: 0,
             parent_row: None,
             subop_kind: None,
-            record_role: editchain_project::taxonomy::RecordRole::Action,
-            activity_kind: editchain_project::taxonomy::ActivityKind::Execute,
-            visibility: editchain_project::taxonomy::Visibility::Primary,
-            outcome: editchain_project::taxonomy::Outcome::Success,
-            chain_state: editchain_project::taxonomy::ChainState::Muted,
+            record_role: editchain_core::taxonomy::RecordRole::Action,
+            activity_kind: editchain_core::taxonomy::ActivityKind::Execute,
+            visibility: editchain_core::taxonomy::Visibility::Primary,
+            outcome: editchain_core::taxonomy::Outcome::Success,
+            chain_state: editchain_core::taxonomy::ChainState::Muted,
             turn_id: Some(OVER_2_53.to_string()),
             session_meta: Some(SessionMetaDto {
                 session_title: Some("r8".to_string()),
@@ -1323,7 +1367,7 @@ mod tests {
         assert_eq!(back.session_summary, Some(SessionSummaryDto { count: 87 }));
         assert_eq!(
             back.chain_state,
-            editchain_project::taxonomy::ChainState::Muted
+            editchain_core::taxonomy::ChainState::Muted
         );
         assert_eq!(
             back.session_meta

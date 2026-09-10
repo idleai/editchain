@@ -395,7 +395,7 @@ function startOpen(client: StdioClient, panel: vscode.WebviewPanel): void {
     // leaves lastOpenBody null so command reuse retries.
     if (!resp || resp.Ok === undefined || resp.Ok === null) {
       const errText = resp && resp.Error !== undefined
-        ? String(resp.Error)
+        ? serviceErrorMessage(resp.Error)
         : String(resp);
       output?.appendLine('[startOpen] open returned an error: ' + errText);
       lastOpenBody = null;
@@ -476,14 +476,14 @@ async function openJsonEditor(
       );
       // A service Error envelope must SURFACE as an error, never be opened as
       // a JSON document of the error object.
-      if (resp && resp.Error !== undefined) throw new Error(String(resp.Error));
+      if (resp && resp.Error !== undefined) throw new Error(serviceErrorMessage(resp.Error));
       details = resp?.Ok ?? resp;
     } else if (msg.op_id) {
       const resp = await client.request(
         { GetNodeDetails: { op_id: msg.op_id } },
         { timeoutMs: NON_OPEN_TIMEOUT_MS }
       );
-      if (resp && resp.Error !== undefined) throw new Error(String(resp.Error));
+      if (resp && resp.Error !== undefined) throw new Error(serviceErrorMessage(resp.Error));
       details = resp?.Ok ?? resp;
     } else {
       return;
@@ -509,6 +509,14 @@ async function openJsonEditor(
   }
 }
 
+/** Decode current structured errors and legacy string envelopes. */
+function serviceErrorMessage(error: unknown): string {
+  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') {
+    return error.message;
+  }
+  return String(error);
+}
+
 /** Materialize one advertised file change and open VS Code's native diff UI. */
 async function openDiffEditor(
   client: StdioClient,
@@ -523,7 +531,7 @@ async function openDiffEditor(
       { GetFileDiff: { change: msg.change } },
       { timeoutMs: NON_OPEN_TIMEOUT_MS }
     );
-    if (resp && resp.Error !== undefined) throw new Error(String(resp.Error));
+    if (resp && resp.Error !== undefined) throw new Error(serviceErrorMessage(resp.Error));
     const diff = resp?.Ok ?? resp;
     if (!diff || typeof diff !== 'object') {
       throw new Error('service returned no file diff');

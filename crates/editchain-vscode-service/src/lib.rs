@@ -34,10 +34,11 @@ use editchain_project::activity::{ActivityRowAnnotation, SessionSummaryMarker, W
 use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
 use editchain_project::HistoryProjection;
 use editchain_protocol::{
-    ExpansionSpanDto, FileChangeDto, FileChangeSource, FileChangeStatus, FileDiffDto,
+    ErrorCode, ExpansionSpanDto, FileChangeDto, FileChangeSource, FileChangeStatus, FileDiffDto,
     FileDiffHunkDto, FindInHistoryMatch, FindInHistoryResponse, HistoryRow, HistoryWindow,
     NodeDetails, ParentRelationDto, ParentRelationKind, Request, RequestBody, ResolvedObject,
-    Response, ResponseBody, SessionMetaDto, SessionSummaryDto, SubOpSummary, WorkUnitDto,
+    Response, ResponseBody, ServiceError, SessionMetaDto, SessionSummaryDto, SubOpSummary,
+    WorkUnitDto,
 };
 
 use snapshot::{RenderSnapshot, SnapshotBuilder, SnapshotIdentity, SnapshotManifestData};
@@ -5024,6 +5025,12 @@ impl Server {
     /// Returns an error if the request cannot be handled.
     pub fn handle(&mut self, request: &Request) -> Result<Response, Box<dyn std::error::Error>> {
         let id = request.id;
+        if let Err(error) = request.body.validate() {
+            return Ok(Response {
+                id,
+                body: ResponseBody::Error(error),
+            });
+        }
         let body = match &request.body {
             RequestBody::Open(req) => {
                 let workspace = Workspace::open(&req.workspace_path, &req.chain_dir)?;
@@ -5059,7 +5066,10 @@ impl Server {
                 let ws = self.workspace.as_ref().ok_or("no workspace open")?;
                 match ws.node_details(Some(req.op_id.clone()), None) {
                     Some(details) => ResponseBody::Ok(serde_json::to_value(details)?),
-                    None => ResponseBody::Error("node not found".to_string()),
+                    None => ResponseBody::Error(ServiceError::new(
+                        ErrorCode::UnavailableObject,
+                        "node not found",
+                    )),
                 }
             }
             RequestBody::ResolveObject(req) => {
@@ -5073,10 +5083,15 @@ impl Server {
                             Some(commit) => ResponseBody::Ok(serde_json::to_value(
                                 resolved_object_from_commit(&commit),
                             )?),
-                            None => ResponseBody::Error("object not found".to_string()),
+                            None => ResponseBody::Error(ServiceError::new(
+                                ErrorCode::UnavailableObject,
+                                "object not found",
+                            )),
                         }
                     }
-                    Err(msg) => ResponseBody::Error(msg),
+                    Err(msg) => {
+                        ResponseBody::Error(ServiceError::new(ErrorCode::InvalidInput, msg))
+                    }
                 }
             }
             RequestBody::GetFileDiff(req) => {
@@ -5086,7 +5101,10 @@ impl Server {
                 }
                 match ws.file_diff(&req.change) {
                     Ok(diff) => ResponseBody::Ok(serde_json::to_value(diff)?),
-                    Err(message) => ResponseBody::Error(message),
+                    Err(message) => ResponseBody::Error(ServiceError::new(
+                        ErrorCode::UnavailableObject,
+                        message,
+                    )),
                 }
             }
             RequestBody::FindInHistory(req) => {

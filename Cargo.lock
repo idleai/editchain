@@ -621,7 +621,6 @@ name = "editchain-protocol"
 version = "0.1.0"
 dependencies = [
  "editchain-core",
- "editchain-project",
  "serde",
  "serde_json",
 ]

@@ -172,6 +172,26 @@ fn msg_op(node: u64, seq: u64, text: &[u8]) -> Op {
 /// 2^53 + 1 — the first integer JavaScript's IEEE-754 doubles round.
 const OVER_2_53: u64 = 9_007_199_254_740_993;
 
+#[test]
+fn invalid_search_limit_returns_a_typed_error_without_building_an_index() {
+    let mut server = editchain_vscode_service::Server::new();
+    server.workspace = Some(Workspace::from_projection(HistoryProjection::from_ops(
+        vec![msg_op(1, 1, b"needle")],
+    )));
+    let response = server
+        .handle(&Request {
+            id: 1,
+            body: RequestBody::FindInHistory(editchain_protocol::FindInHistoryRequest {
+                query: "needle".to_owned(),
+                top_k: 0,
+            }),
+        })
+        .unwrap();
+    assert!(matches!(response.body, ResponseBody::Error(error)
+        if error.code == editchain_protocol::ErrorCode::InvalidInput));
+    assert!(server.lexical.is_none());
+}
+
 /// Create a temporary git repository with one commit and return its path.
 fn make_git_repo(dir: &Path) -> std::path::PathBuf {
     let repo = dir.join("repo");

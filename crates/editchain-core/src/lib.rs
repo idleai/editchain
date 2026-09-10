@@ -30,6 +30,8 @@ pub mod scope;
 pub mod state;
 /// Tag bitflags for operation filtering.
 pub mod tags;
+/// Shared provider-neutral history classifications; no projection algorithms.
+pub mod taxonomy;
 
 // Re-exports for convenience.
 pub use admission::*;

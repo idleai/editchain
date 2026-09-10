@@ -71,7 +71,12 @@ pub(crate) fn unwrap(body: Option<Value>) -> Unwrapped {
             if let Some(value) = body.get("Ok") {
                 Unwrapped::Ok(value.clone())
             } else if let Some(error) = body.get("Error") {
-                Unwrapped::Err(as_string(error))
+                Unwrapped::Err(
+                    error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map_or_else(|| as_string(error), str::to_owned),
+                )
             } else if let Some(error) = body.get("error") {
                 // Legacy lowercase envelope (old extension hosts posted
                 // transport exceptions this way).
@@ -276,6 +281,10 @@ mod tests {
         );
         assert!(
             matches!(unwrap(Some(json!({ "error": "legacy" }))), Unwrapped::Err(e) if e == "legacy")
+        );
+        assert!(
+            matches!(unwrap(Some(json!({"Error": {"code": "stale_snapshot", "message": "Reopen history"}}))),
+            Unwrapped::Err(message) if message == "Reopen history")
         );
         // Missing body is treated as a success with a null value (handshake).
         assert!(matches!(unwrap(None), Unwrapped::Ok(v) if v.is_null()));
