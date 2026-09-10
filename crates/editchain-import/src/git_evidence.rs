@@ -1,25 +1,28 @@
-//! Durable links from successful imported shell commands to Git commits.
+//! Typed Git-related observations extracted from accepted provider records.
+//!
+//! These adapters read provider bytes without opening repositories or emitting
+//! relationships. Missing or unverified payloads contribute no evidence.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::PathBuf;
 
-use editchain_core::{
-    ContentId, GitLink, GitLinkKind, GitOid, NodeId, Op, OpId, OpKind, ParentSet, Payload,
-    RepositoryId, Tags,
-};
-use editchain_git::{
-    discover_repositories, open_repository, resolve_commit_prefix, RepositoryHandle,
-};
-use editchain_import::sink::FsBlobSink;
+use editchain_core::{ContentId, NodeId, Op, OpKind, Payload, ScopeRef, SessionId};
 use serde_json::Value;
+
+use crate::ids::derive_session_id;
+use crate::sink::FsBlobSink;
+use crate::source_time::parse_source_time;
 
 /// Exact evidence that one imported completion record produced commit objects.
 #[derive(Debug)]
-struct CommitEvidence<'a> {
-    source: &'a Op,
-    command: String,
-    prefixes: Vec<String>,
+pub struct CommitEvidence<'a> {
+    /// Physical successful completion carrying the Git output.
+    pub source: &'a Op,
+    /// Recorded shell command, correlated by exact provider call identity.
+    pub command: String,
+    /// Git-issued commit abbreviations, without repository resolution.
+    pub prefixes: Vec<String>,
 }
 
 /// Provider call identity scoped to one imported source generation.
@@ -38,123 +41,21 @@ struct ClaudeResult<'a> {
     prefixes: Vec<String>,
 }
 
-/// Derive missing durable `ProducedBy` links from imported provider evidence.
-///
-/// A relation is emitted only when all of these facts are present:
-///
-/// - the provider recorded a successful command completion;
-/// - the command actually invokes `git commit` at a shell command boundary;
-/// - Git's standard success output carries an abbreviated commit OID; and
-/// - that prefix resolves uniquely to a commit across repositories discovered
-///   inside the imported workspace.
-///
-/// Existing relations make this pass idempotent. The returned operations are
-/// deterministic functions of the completion record and immutable Git target.
-pub(super) fn derive_produced_commit_links(
-    workspace: &Path,
-    ops: &[Op],
-    blobs: Option<&FsBlobSink>,
-) -> Result<Vec<Op>, Box<dyn std::error::Error>> {
-    let repositories = open_repositories(workspace)?;
-    if repositories.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let evidence = collect_evidence(ops, blobs);
-    let existing: HashSet<(OpId, RepositoryId, GitOid)> = ops
-        .iter()
-        .filter_map(|op| match &op.kind {
-            OpKind::GitLink(link) if link.kind == GitLinkKind::ProducedBy => {
-                Some((link.source, link.target_repo, link.target_oid))
-            }
-            OpKind::ChainStart(_)
-            | OpKind::Actor(_)
-            | OpKind::Message(_)
-            | OpKind::Tool(_)
-            | OpKind::Command(_)
-            | OpKind::File(_)
-            | OpKind::Reflection(_)
-            | OpKind::Import(_)
-            | OpKind::Note(_)
-            | OpKind::Error(_)
-            | OpKind::GitCommit(_)
-            | OpKind::GitLink(_)
-            | OpKind::Unknown(_) => None,
-        })
-        .collect();
-    let existing_ids: HashSet<OpId> = ops.iter().map(|op| op.id).collect();
-    let mut relations: BTreeMap<(OpId, RepositoryId, GitOid), &Op> = BTreeMap::new();
-
-    for item in &evidence {
-        if !command_invokes_git_commit(&item.command) {
-            continue;
-        }
-        for prefix in &item.prefixes {
-            let Some((repository, oid)) = unique_commit(&repositories, prefix) else {
-                continue;
-            };
-            let key = (item.source.id, repository, oid);
-            if !existing.contains(&key) {
-                let _: &mut &Op = relations.entry(key).or_insert(item.source);
-            }
-        }
-    }
-
-    let mut links = Vec::with_capacity(relations.len());
-    for ((source, target_repo, target_oid), source_op) in relations {
-        let id = produced_link_id(source, target_repo, target_oid);
-        if existing_ids.contains(&id) {
-            continue;
-        }
-        links.push(Op {
-            id,
-            parents: ParentSet::One(source),
-            actor: source_op.actor,
-            clock: source_op.clock,
-            scope: source_op.scope,
-            tags: Tags::IMPORT | Tags::META,
-            kind: OpKind::GitLink(GitLink {
-                source,
-                target_repo,
-                target_oid,
-                kind: GitLinkKind::ProducedBy,
-            }),
-        });
-    }
-    Ok(links)
-}
-
-/// Open every repository discovered under the workspace. A failed discovery or
-/// open prevents claims of uniqueness across the workspace.
-pub(super) fn open_repositories(
-    workspace: &Path,
-) -> Result<Vec<RepositoryHandle>, Box<dyn std::error::Error>> {
-    let discoveries = discover_repositories(workspace)?;
-    discoveries.iter().map(open_repository).collect()
-}
-
-/// Resolve one Git-issued abbreviation uniquely across all workspace repos.
-fn unique_commit(
-    repositories: &[RepositoryHandle],
-    prefix: &str,
-) -> Option<(RepositoryId, GitOid)> {
-    let mut matches = BTreeSet::new();
-    for repository in repositories {
-        // An unreadable or ambiguous repository makes the entire uniqueness
-        // claim unresolved; it must not disappear as a local non-match.
-        if let Some(commit) = resolve_commit_prefix(repository, prefix).ok()? {
-            let _: bool = matches.insert((repository.discovery.id, commit.oid));
-        }
-    }
-    if matches.len() == 1 {
-        matches.into_iter().next()
-    } else {
-        None
+impl CommitEvidence<'_> {
+    /// Whether the recorded script executes Git's commit subcommand at a
+    /// supported shell command boundary. Textual mentions are insufficient.
+    #[must_use]
+    pub fn invokes_git_commit(&self) -> bool {
+        command_invokes_git_commit(&self.command)
     }
 }
 
 /// Collect provider-neutral commit evidence from byte-exact raw imports.
-fn collect_evidence<'a>(ops: &'a [Op], blobs: Option<&FsBlobSink>) -> Vec<CommitEvidence<'a>> {
+#[must_use]
+pub fn collect_commit_evidence<'a>(
+    ops: &'a [Op],
+    blobs: Option<&FsBlobSink>,
+) -> Vec<CommitEvidence<'a>> {
     let mut evidence = Vec::new();
     let mut claude_calls: HashMap<ClaudeCallKey, Vec<String>> = HashMap::new();
     let mut claude_results = Vec::new();
@@ -526,7 +427,8 @@ fn git_subcommand(args: &[String]) -> Option<&str> {
 }
 
 /// Read one inline or verified content-addressed payload.
-pub(super) fn payload_bytes<'a>(
+#[must_use]
+pub fn payload_bytes<'a>(
     payload: &'a Payload,
     blobs: Option<&FsBlobSink>,
 ) -> Option<Cow<'a, [u8]>> {
@@ -538,9 +440,7 @@ pub(super) fn payload_bytes<'a>(
                 return None;
             };
             let bytes = blobs?.get(&hash).ok()??;
-            if usize::try_from(blob.len).ok()? != bytes.len()
-                || editchain_import::hash_raw(&bytes) != hash
-            {
+            if usize::try_from(blob.len).ok()? != bytes.len() || crate::hash_raw(&bytes) != hash {
                 return None;
             }
             Some(Cow::Owned(bytes))
@@ -556,243 +456,62 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
-/// Derive a stable operation ID from the immutable relation endpoints.
-fn produced_link_id(source: OpId, repository: RepositoryId, oid: GitOid) -> OpId {
-    let digest = editchain_import::hash_raw(
-        format!(
-            "editchain:git-link:produced-by:v1:{source}:{}:{}",
-            repository.0,
-            oid.to_hex()
-        )
-        .as_bytes(),
-    );
-    let node = digest
-        .get(0..8)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map_or(0, u64::from_le_bytes);
-    let boot = digest
-        .get(8..12)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map_or(0, u32::from_le_bytes);
-    let seq = digest
-        .get(12..20)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map_or(0, u64::from_le_bytes);
-    OpId::new(NodeId(node), boot, seq)
+/// One provider record that can recover a session's historical branch tip.
+#[derive(Debug)]
+pub struct ClaudeStartEvidence {
+    /// Physical ordinal of the record carrying the observation.
+    pub source_seq: u64,
+    /// Validated owning provider session.
+    pub session: SessionId,
+    /// Recorded working directory.
+    pub cwd: PathBuf,
+    /// Recorded active branch name.
+    pub branch: String,
+    /// Validated observed event time in milliseconds.
+    pub unix_ms: u64,
+}
+
+/// Parse only the exact Claude fields required by the historical resolver.
+#[must_use]
+pub fn claude_start_evidence(op: &Op, raw: &[u8]) -> Option<ClaudeStartEvidence> {
+    let value: Value = serde_json::from_slice(raw).ok()?;
+    if !matches!(
+        value.get("type").and_then(Value::as_str),
+        Some("user" | "assistant" | "system")
+    ) {
+        return None;
+    }
+    if value.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        || value
+            .get("agentId")
+            .and_then(Value::as_str)
+            .is_some_and(|agent| !agent.is_empty())
+    {
+        return None;
+    }
+    let session_text = value.get("sessionId").and_then(Value::as_str)?;
+    let session = derive_session_id(session_text);
+    if op.scope != ScopeRef::Session(session) {
+        return None;
+    }
+    let cwd = value.get("cwd").and_then(Value::as_str)?;
+    let branch = value.get("gitBranch").and_then(Value::as_str)?;
+    let timestamp = value.get("timestamp").and_then(Value::as_str)?;
+    if cwd.is_empty() || branch.is_empty() {
+        return None;
+    }
+    Some(ClaudeStartEvidence {
+        source_seq: op.id.seq,
+        session,
+        cwd: PathBuf::from(cwd),
+        branch: branch.to_owned(),
+        unix_ms: parse_source_time(timestamp)?,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
-
-    use editchain_core::{ActorId, Clock, ImportOp, ScopeRef, SessionId};
-
     use super::*;
-
-    fn run_git(repo: &Path, args: &[&str]) -> std::process::Output {
-        let output = Command::new("git")
-            .current_dir(repo)
-            .args(args)
-            .output()
-            .expect("run git fixture command");
-        assert!(
-            output.status.success(),
-            "git fixture command failed: {args:?}"
-        );
-        output
-    }
-
-    fn import_op(seq: u64, value: &Value) -> Op {
-        Op {
-            id: OpId::new(NodeId(1), 0, seq),
-            parents: if seq == 1 {
-                ParentSet::None
-            } else {
-                ParentSet::One(OpId::new(NodeId(1), 0, seq.saturating_sub(1)))
-            },
-            actor: ActorId(7),
-            clock: Clock::UnixMs(seq),
-            scope: ScopeRef::Session(SessionId(9)),
-            tags: Tags::IMPORT,
-            kind: OpKind::Import(ImportOp {
-                raw_ref: Payload::Inline(serde_json::to_vec(value).unwrap()),
-                raw_hash: None,
-            }),
-        }
-    }
-
-    fn committed_repo(root: &Path) -> (std::path::PathBuf, String, String) {
-        let repo = root.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        drop(run_git(&repo, &["init", "-q"]));
-        std::fs::write(repo.join("file.txt"), b"content\n").unwrap();
-        drop(run_git(&repo, &["add", "file.txt"]));
-        let commit = run_git(
-            &repo,
-            &[
-                "-c",
-                "user.name=Agent",
-                "-c",
-                "user.email=agent@example.com",
-                "commit",
-                "-m",
-                "fixture commit",
-            ],
-        );
-        let output = String::from_utf8(commit.stdout).unwrap();
-        let oid = String::from_utf8(run_git(&repo, &["rev-parse", "HEAD"]).stdout)
-            .unwrap()
-            .trim()
-            .to_string();
-        (repo, output, oid)
-    }
-
-    #[test]
-    fn derives_codex_and_claude_links_and_is_idempotent() {
-        let temp = tempfile::tempdir().unwrap();
-        let (repo, output, oid) = committed_repo(temp.path());
-        let codex = import_op(
-            1,
-            &serde_json::json!({
-                "type": "event_msg",
-                "payload": {
-                    "type": "item_completed",
-                    "item": {
-                        "type": "CommandExecution",
-                        "command": ["/bin/bash", "-lc", "git commit -m 'fixture commit'"],
-                        "cwd": repo,
-                        "status": "completed",
-                        "exit_code": 0,
-                        "stdout": output,
-                    },
-                },
-            }),
-        );
-        let claude_call = import_op(
-            2,
-            &serde_json::json!({
-                "type": "assistant",
-                "message": {"content": [{
-                    "type": "tool_use",
-                    "id": "call-1",
-                    "name": "Bash",
-                    "input": {"command": "git -c advice.detachedHead=false commit -m fixture"},
-                }]},
-            }),
-        );
-        let claude_result = import_op(
-            3,
-            &serde_json::json!({
-                "type": "user",
-                "message": {"content": [{
-                    "type": "tool_result",
-                    "tool_use_id": "call-1",
-                    "content": output,
-                    "is_error": false,
-                }]},
-            }),
-        );
-        let mut ops = vec![codex.clone(), claude_call, claude_result.clone()];
-
-        let links = derive_produced_commit_links(temp.path(), &ops, None).unwrap();
-        assert_eq!(
-            links.len(),
-            2,
-            "both provider completion shapes should link"
-        );
-        let targets: Vec<_> = links
-            .iter()
-            .filter_map(|op| {
-                let OpKind::GitLink(link) = &op.kind else {
-                    return None;
-                };
-                Some((link.source, link.target_oid.to_hex()))
-            })
-            .collect();
-        assert!(
-            targets.contains(&(codex.id, oid.clone())),
-            "Codex completion should be the causal source"
-        );
-        assert!(
-            targets.contains(&(claude_result.id, oid)),
-            "Claude tool result should be the causal source"
-        );
-
-        ops.extend(links);
-        assert!(
-            derive_produced_commit_links(temp.path(), &ops, None)
-                .unwrap()
-                .is_empty(),
-            "reconciliation must not append duplicate durable links"
-        );
-    }
-
-    #[test]
-    fn skips_a_commit_prefix_that_resolves_in_multiple_workspace_repositories() {
-        let temp = tempfile::tempdir().unwrap();
-        let (repo, output, _) = committed_repo(temp.path());
-        let clone = temp.path().join("repo-copy");
-        let clone_arg = clone.to_string_lossy().into_owned();
-        drop(run_git(
-            temp.path(),
-            &["clone", "-q", repo.to_str().unwrap(), &clone_arg],
-        ));
-        let command = import_op(
-            1,
-            &serde_json::json!({
-                "type": "event_msg",
-                "payload": {
-                    "type": "item_completed",
-                    "item": {
-                        "type": "CommandExecution",
-                        "command": ["/bin/bash", "-lc", "git commit -m fixture"],
-                        "status": "completed",
-                        "exit_code": 0,
-                        "stdout": output,
-                    },
-                },
-            }),
-        );
-
-        assert!(
-            derive_produced_commit_links(temp.path(), &[command], None)
-                .unwrap()
-                .is_empty(),
-            "a cross-repository ambiguous prefix must not choose an arbitrary target"
-        );
-    }
-
-    #[test]
-    fn an_unreadable_repository_cannot_establish_cross_repository_uniqueness() {
-        let temp = tempfile::tempdir().unwrap();
-        let (repo, _, oid) = committed_repo(temp.path());
-        let clone = temp.path().join("repo-copy");
-        drop(run_git(
-            temp.path(),
-            &[
-                "clone",
-                "-q",
-                repo.to_str().unwrap(),
-                clone.to_str().unwrap(),
-            ],
-        ));
-        let object = clone
-            .join(".git/objects")
-            .join(oid.get(..2).unwrap())
-            .join(oid.get(2..).unwrap());
-        // Unlink the clone's hard link before writing corrupt fixture bytes.
-        std::fs::remove_file(&object).unwrap();
-        std::fs::write(object, b"corrupt object").unwrap();
-        let repositories = open_repositories(temp.path()).unwrap();
-        assert!(unique_commit(&repositories, oid.get(..7).unwrap()).is_none());
-        let good = repositories
-            .iter()
-            .find(|handle| handle.discovery.worktree_root.as_ref() == Some(&repo))
-            .unwrap();
-        assert!(resolve_commit_prefix(good, oid.get(..7).unwrap())
-            .unwrap()
-            .is_some());
-    }
 
     #[test]
     fn unsuccessful_provider_completions_are_not_evidence() {

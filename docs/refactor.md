@@ -349,10 +349,20 @@ Completed increments:
   direct capture. The retired producer's resolver cases are exercised through
   the live import/project path.
 
-Remaining work, in dependency order:
+- Git reconciliation boundary: provider decoding, exact Claude call/result
+  correlation, command recognition, verified payload reads, and typed session
+  start observations now live in `editchain_import::git_evidence`. The node
+  library exposes a read-only reconciliation API over accepted stored and newly
+  captured operations, with explicit baseline policy and proposed link groups.
+  The CLI selects that policy and persists the proposals in its existing import
+  transaction. Both inference policies share one fully opened repository catalog.
+  Versioned link IDs, exact versus inferred tags, ambiguity handling, and
+  conservative reflog rules remain unchanged. Parser tests moved to the importer;
+  real-Git and conflict-admission tests moved with the reconciliation component.
+  The public API also verifies baseline selection, replay, and absence of writes
+  when planning against a missing chain.
 
-1. Finish the reusable Git reconciliation boundary in the node library.
-2. Measure and reduce repeated work.
+Remaining work: measure and reduce repeated work.
 
 Validation uses the existing crate, service, renderer, and extension suites.
 Every completed code increment must pass `./scripts/lint.sh`. Regression tests

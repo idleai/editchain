@@ -8,28 +8,16 @@ use editchain_core::{
     RepositoryId, ScopeRef, SessionId, Tags,
 };
 use editchain_git::{resolve_branch_tip_at_time, RepositoryHandle};
-use editchain_import::ids::derive_session_id;
+use editchain_import::git_evidence::{claude_start_evidence, payload_bytes, ClaudeStartEvidence};
 use editchain_import::sink::FsBlobSink;
-use editchain_import::source_time::parse_source_time;
-use serde_json::Value;
 
-use super::git_commit_links::{open_repositories, payload_bytes};
-
-/// One provider record that can recover a session's historical branch tip.
-#[derive(Debug)]
-struct StartEvidence {
-    source_seq: u64,
-    session: SessionId,
-    cwd: PathBuf,
-    branch: String,
-    unix_ms: u64,
-}
+use super::Repositories;
 
 /// Raw records owned by one immutable imported source generation.
 #[derive(Debug)]
 struct SourceEvidence<'a> {
     root: &'a Op,
-    start: Option<StartEvidence>,
+    start: Option<ClaudeStartEvidence>,
 }
 
 /// Derive missing Claude `BasedOn` links from provider and local Git evidence.
@@ -42,21 +30,14 @@ struct SourceEvidence<'a> {
 /// of the source so metadata prepended by Claude does not create a second
 /// junction after the session has already started.
 pub(super) fn derive_session_base_links(
-    workspace: &Path,
+    repositories: &Repositories,
     ops: &[Op],
     blobs: Option<&FsBlobSink>,
-) -> Result<Vec<Op>, Box<dyn std::error::Error>> {
-    let repositories = open_repositories(workspace)?;
-    if repositories.is_empty() {
-        return Ok(Vec::new());
+) -> Vec<Op> {
+    if repositories.handles.is_empty() {
+        return Vec::new();
     }
 
-    let catalog = editchain_git::RepositoryCatalog::from_entries(
-        repositories
-            .iter()
-            .map(|repository| repository.discovery.clone())
-            .collect(),
-    );
     let mut based_sessions: HashSet<SessionId> = ops
         .iter()
         .filter_map(|op| match (&op.scope, &op.kind) {
@@ -109,8 +90,12 @@ pub(super) fn derive_session_base_links(
         if based_sessions.contains(&start.session) {
             continue;
         }
-        let Some(repository) = repository_for_cwd(workspace, &start.cwd, &catalog, &repositories)
-        else {
+        let Some(repository) = repository_for_cwd(
+            &repositories.workspace,
+            &start.cwd,
+            &repositories.catalog,
+            &repositories.handles,
+        ) else {
             continue;
         };
         let Some(commit) = resolve_branch_tip_at_time(repository, &start.branch, start.unix_ms)
@@ -139,44 +124,7 @@ pub(super) fn derive_session_base_links(
         });
         let _inserted = based_sessions.insert(start.session);
     }
-    Ok(links)
-}
-
-/// Parse only the exact Claude fields required by the historical resolver.
-fn claude_start_evidence(op: &Op, raw: &[u8]) -> Option<StartEvidence> {
-    let value: Value = serde_json::from_slice(raw).ok()?;
-    if !matches!(
-        value.get("type").and_then(Value::as_str),
-        Some("user" | "assistant" | "system")
-    ) {
-        return None;
-    }
-    if value.get("isSidechain").and_then(Value::as_bool) == Some(true)
-        || value
-            .get("agentId")
-            .and_then(Value::as_str)
-            .is_some_and(|agent| !agent.is_empty())
-    {
-        return None;
-    }
-    let session_text = value.get("sessionId").and_then(Value::as_str)?;
-    let session = derive_session_id(session_text);
-    if op.scope != ScopeRef::Session(session) {
-        return None;
-    }
-    let cwd = value.get("cwd").and_then(Value::as_str)?;
-    let branch = value.get("gitBranch").and_then(Value::as_str)?;
-    let timestamp = value.get("timestamp").and_then(Value::as_str)?;
-    if cwd.is_empty() || branch.is_empty() {
-        return None;
-    }
-    Some(StartEvidence {
-        source_seq: op.id.seq,
-        session,
-        cwd: PathBuf::from(cwd),
-        branch: branch.to_owned(),
-        unix_ms: parse_source_time(timestamp)?,
-    })
+    links
 }
 
 /// Select the deepest workspace repository containing the recorded cwd.
@@ -232,6 +180,8 @@ fn based_on_link_id(source: OpId, repository: RepositoryId, oid: GitOid) -> OpId
 
 #[cfg(test)]
 mod tests {
+    use editchain_import::ids::derive_session_id;
+    use serde_json::Value;
     use std::process::Command;
 
     use editchain_core::{ImportOp, Payload};
@@ -341,8 +291,25 @@ mod tests {
         let (repo, first_oid, second_oid) = repository(temp.path());
         let mut ops = session_ops(&repo, "2026-07-10T00:05:00.500Z", &serde_json::json!({}));
 
-        let links = derive_session_base_links(temp.path(), &ops, None).expect("derive link");
-
+        let chain = temp.path().join(".editchain");
+        let proposed = crate::reconcile::reconcile_git_links(
+            temp.path(),
+            &chain,
+            &ops,
+            crate::reconcile::SessionBaselines::ClaudeReflog,
+        )
+        .expect("plan historical baseline");
+        assert!(proposed.produced_links.is_empty());
+        assert!(!chain.exists(), "planning must not create a missing chain");
+        let disabled = crate::reconcile::reconcile_git_links(
+            temp.path(),
+            &chain,
+            &ops,
+            crate::reconcile::SessionBaselines::Disabled,
+        )
+        .expect("exact evidence only");
+        assert!(disabled.base_links.is_empty());
+        let links = proposed.base_links;
         assert_eq!(links.len(), 1);
         let (link_op, link) = links
             .iter()
@@ -378,9 +345,15 @@ mod tests {
 
         ops.extend(links);
         assert!(
-            derive_session_base_links(temp.path(), &ops, None)
-                .expect("repeat reconciliation")
-                .is_empty(),
+            crate::reconcile::reconcile_git_links(
+                temp.path(),
+                &chain,
+                &ops,
+                crate::reconcile::SessionBaselines::ClaudeReflog
+            )
+            .expect("replay plan")
+            .base_links
+            .is_empty(),
             "an existing session baseline makes reconciliation idempotent"
         );
     }
@@ -389,24 +362,19 @@ mod tests {
     fn rejects_uncovered_same_second_and_subagent_evidence() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (repo, _, _) = repository(temp.path());
+        let repositories = Repositories::discover(temp.path()).expect("complete repository set");
 
         let before_reflog = session_ops(&repo, "2026-07-09T23:59:59.000Z", &serde_json::json!({}));
-        assert!(derive_session_base_links(temp.path(), &before_reflog, None)
-            .expect("uncovered lookup")
-            .is_empty());
+        assert!(derive_session_base_links(&repositories, &before_reflog, None).is_empty());
 
         let same_second = session_ops(&repo, "2026-07-10T00:10:00.500Z", &serde_json::json!({}));
-        assert!(derive_session_base_links(temp.path(), &same_second, None)
-            .expect("ambiguous lookup")
-            .is_empty());
+        assert!(derive_session_base_links(&repositories, &same_second, None).is_empty());
 
         let sidechain = session_ops(
             &repo,
             "2026-07-10T00:05:00.500Z",
             &serde_json::json!({"isSidechain": true, "agentId": "agent-1"}),
         );
-        assert!(derive_session_base_links(temp.path(), &sidechain, None)
-            .expect("sidechain lookup")
-            .is_empty());
+        assert!(derive_session_base_links(&repositories, &sidechain, None).is_empty());
     }
 }

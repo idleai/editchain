@@ -20,6 +20,8 @@ pub mod cancellation;
 pub mod cursor;
 /// Import error types.
 pub mod error;
+/// Typed provider observations for host-owned Git reconciliation.
+pub mod git_evidence;
 /// Deterministic ID derivation for import.
 pub mod ids;
 /// Main import orchestrator.
