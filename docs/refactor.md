@@ -413,6 +413,21 @@ the crate keeps its pure core/serde dependency boundary. Moved algorithm bodies
 are unchanged, and the full lint suite passes with existing ancestry, collapse,
 content, and layout regressions.
 
+Renderer row assembly now delegates markdown normalization/token parsing,
+badges/icons/session and bundle labels, and file-row presentation to dedicated
+modules. The main row module is 1,133 physical lines, down from 6,269 with its
+inline tests; the existing tests now occupy a separate 2,960-line file. This is
+an ownership split, not a claim that those moved lines were removed. All 201
+production and unit-test function bodies retain identical Rust tokens. Native
+and WASM checks, 44 browser/host tests, and both real VS Code renderer tests pass
+with the regenerated production assets and rebuilt native service.
+
+This ownership follow-up retains all 11 workspace crates and their existing
+native/WASM dependency boundaries. Shared blob storage has one implementation,
+CLI history preparation has an explicit backend API, and the service, project,
+and renderer now group their largest modules by responsibility. It does not
+claim a measured runtime or build-time improvement from moving modules.
+
 The planned refactor increments are complete. EC02 and historical operations
 remain readable; the documented protocol, repository-qualified row keys, and
 pre-1.0 Rust API changes require coordinated consumers. Compatibility readers
@@ -435,8 +450,8 @@ belong alongside the production contracts they exercise; no separate audit
 harness is required.
 
 Final Linux verification passed: `./scripts/lint.sh` exited 0 with `RESULT: PASS`;
-renderer WASM clippy passed with warnings denied; production WASM regeneration
-matched the committed assets; the extension compiled; all 44 browser/host tests
+renderer WASM clippy passed with warnings denied; production WASM assets were
+regenerated; the extension compiled; all 44 browser/host tests
 passed with no skips; and the real VS Code renderer suite passed both tests
 against the seeded checkout with the rebuilt service. No lint policy or threshold
 was weakened, and no new suppression was introduced.
