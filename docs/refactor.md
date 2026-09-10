@@ -250,6 +250,15 @@ Completed increments:
   same-snapshot changes, provisional hydration, and constant storage for a plain
   range at the supported coordinate limit.
 
+- Renderer find ownership: a private Idle/Pending/Settled/Failed lifecycle owns
+  the query, epoch, matches, and cursor. Result totals and pending destinations
+  are derived from that state; clearing or failing a search cannot retain a
+  separate stale target. Selection and the typed roving tab stop have one owner,
+  and reducer transitions update selection before publishing highlight effects.
+  An exhausted search budget with no visible matches displays `0 of 0+` and asks
+  for a narrower query, with navigation disabled. Existing query-race and focus
+  tests and a new limited-result/selection regression cover these transitions.
+
 Remaining work, in dependency order:
 
 1. Finish renderer find/selection ownership, content adapters, and shell lifetime boundaries.

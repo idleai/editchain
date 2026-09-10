@@ -62,7 +62,9 @@ impl ChainState {
 mod cache;
 mod coordinates;
 mod expansion;
+mod find;
 mod requests;
+mod selection;
 
 pub(crate) mod host;
 

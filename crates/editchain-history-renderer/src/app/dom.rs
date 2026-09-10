@@ -1522,11 +1522,17 @@ mod web {
                     drop(element.set_attribute("aria-busy", "true"));
                     drop(element.remove_attribute("title"));
                 }
-                FindCounterState::Zero => {
+                FindCounterState::Zero { more } => {
                     drop(element.class_list().add_1("search-counter-zero"));
                     drop(element.remove_attribute("aria-label"));
                     drop(element.remove_attribute("aria-busy"));
-                    drop(element.remove_attribute("title"));
+                    if *more {
+                        let detail = "Search limit reached. Refine your query.";
+                        drop(element.set_attribute("title", detail));
+                        drop(element.set_attribute("aria-label", detail));
+                    } else {
+                        drop(element.remove_attribute("title"));
+                    }
                 }
                 FindCounterState::Error(detail) => {
                     drop(element.class_list().add_1("search-counter-error"));

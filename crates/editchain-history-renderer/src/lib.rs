@@ -239,7 +239,7 @@ mod shell {
                 return;
             };
             if anchor != self.state.roving_abs() {
-                self.state.roving_abs = anchor;
+                self.state.set_roving_abs(anchor);
             }
             let anchor_text = anchor.to_string();
             for index in 0..list.length() {
@@ -486,16 +486,10 @@ mod shell {
                 }
                 DomOp::RevealRow { abs } => self.dom.reveal_row(*abs),
                 DomOp::SetFindHighlight { abs } => {
-                    let Some(row) = self.state.cache.get_by_index(*abs) else {
-                        return Ok(());
-                    };
-                    let node_key = host::row::owned_str(row, "node_key");
-                    self.state.selected_key = Some(node_key);
                     self.dom.apply_selection(*abs)?;
                     self.dom.set_find_highlight(*abs)
                 }
                 DomOp::ClearFindHighlight => {
-                    self.state.clear_selection();
                     self.dom.clear_selection_ui()?;
                     self.dom.clear_find_highlight()
                 }
@@ -878,7 +872,7 @@ mod shell {
             }
             let same_settled = SHELL_DATA.with(|cell| {
                 cell.borrow().as_ref().is_some_and(|shell| {
-                    shell.state.find_active() && trimmed == shell.state.search_query
+                    shell.state.find_active() && trimmed == shell.state.search_query()
                 })
             });
             if same_settled {
@@ -1055,7 +1049,7 @@ mod shell {
             return;
         };
         run_transition(|shell| {
-            if abs != shell.state.roving_abs {
+            if abs != shell.state.roving_abs() {
                 shell.state.set_roving_abs(abs);
                 shell.apply_roving_tabindex();
             }

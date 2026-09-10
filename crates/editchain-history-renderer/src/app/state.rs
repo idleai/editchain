@@ -25,7 +25,11 @@ use super::cache::{PageCache, RetentionPriority, MAX_CACHED_ROWS};
 pub(crate) use super::coordinates::ROW_H;
 use super::coordinates::{ExpandedRow, Pixels, VisibleRow, MAX_RENDER_ROWS};
 use super::expansion::ExpansionIndex;
+#[cfg(test)]
+use super::find::FindTarget;
+use super::find::{FindMatch, FindSession};
 use super::requests::RequestRegistry;
+use super::selection::SelectionState;
 
 /// Rows fetched per request (`PAGE`).
 pub(crate) const PAGE: i64 = 500;
@@ -47,20 +51,6 @@ impl Viewport {
             client_height: Pixels::new(client_height),
         }
     }
-}
-
-/// A normalized find-in-chain match.
-#[derive(Debug, Clone)]
-pub(crate) struct FindMatch {
-    pub(crate) row: ExpandedRow,
-    pub(crate) node_key: String,
-}
-
-/// A find jump awaiting its target window in cache.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct FindTarget {
-    pub(crate) abs: ExpandedRow,
-    pub(crate) index: usize,
 }
 
 /// What the DOM shell should do after a state transition. The shell owns DOM
@@ -117,7 +107,9 @@ pub(crate) enum RetryAction {
 pub(crate) enum FindCounterState {
     /// A find query is in flight (searching state).
     Pending,
-    Zero,
+    Zero {
+        more: bool,
+    },
     Error(String),
     Settled {
         index: usize,
@@ -154,15 +146,6 @@ pub(crate) enum SnapshotPhase {
     Failed,
 }
 
-/// Find-in-chain session flags.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct FindFlags {
-    /// A find session has settled.
-    pub(crate) active: bool,
-    /// More visible matches exist or may remain beyond the scan budget.
-    pub(crate) more: bool,
-}
-
 /// The full view state machine.
 #[derive(Debug, Clone)]
 pub(crate) struct HistoryAppState {
@@ -171,9 +154,6 @@ pub(crate) struct HistoryAppState {
     pub(crate) view_gen: u64,
     /// Server source/view identity negotiated by the latest successful Open.
     pub(crate) snapshot_id: SnapshotId,
-    // --- search epoch (find/search correlation) ---------------------------
-    pub(crate) search_epoch: u64,
-    pub(crate) current_search_epoch: Option<u64>,
     // --- view state -------------------------------------------------------
     /// Authoritative total; `None` = unknown (fresh view / after a reset).
     pub(crate) total: Option<i64>,
@@ -190,19 +170,8 @@ pub(crate) struct HistoryAppState {
     // --- render window (visible indices) ----------------------------------
     pub(crate) render_top: i64,
     pub(crate) render_bottom: i64,
-    // --- selection / roving focus -----------------------------------------
-    /// The selected row's stable `node_key` (`selectedRowKey`), if any.
-    pub(crate) selected_key: Option<String>,
-    /// The roving-tabindex row's absolute index (`rovingAbs`); `-1` = unset.
-    pub(crate) roving_abs: i64,
-    // --- find-in-chain ------------------------------------------------------
-    pub(crate) find_flags: FindFlags,
-    pub(crate) find_matches: Vec<FindMatch>,
-    pub(crate) find_total: usize,
-    pub(crate) find_index: usize,
-    pub(crate) pending_find_target: Option<FindTarget>,
-    // --- find query and renderer readiness ----------------------------------
-    pub(crate) search_query: String,
+    pub(super) selection: SelectionState,
+    pub(super) find: FindSession,
 }
 
 impl Default for HistoryAppState {
@@ -213,8 +182,6 @@ impl Default for HistoryAppState {
             snapshot_id: SnapshotId::default(),
             phase: SnapshotPhase::Opening,
             announced_initial_load: false,
-            search_epoch: 0,
-            current_search_epoch: None,
             total: None,
             cache: PageCache::default(),
             total_fetched: 0,
@@ -224,14 +191,8 @@ impl Default for HistoryAppState {
             expansion: None,
             render_top: 0,
             render_bottom: -1,
-            selected_key: None,
-            roving_abs: -1,
-            find_flags: FindFlags::default(),
-            find_matches: Vec::new(),
-            find_total: 0,
-            find_index: 0,
-            pending_find_target: None,
-            search_query: String::new(),
+            selection: SelectionState::default(),
+            find: FindSession::default(),
         }
     }
 }
@@ -652,7 +613,7 @@ impl HistoryAppState {
 
     pub(crate) fn find_counter_text(state: &FindCounterState) -> String {
         match state {
-            FindCounterState::Zero => "0 of 0".to_owned(),
+            FindCounterState::Zero { more } => if *more { "0 of 0+" } else { "0 of 0" }.to_owned(),
             FindCounterState::Error(_) => "error".to_owned(),
             FindCounterState::Settled {
                 index, total, more, ..
@@ -669,42 +630,42 @@ impl HistoryAppState {
 
     /// `findNavigationEnabled` — exactly the production guard.
     pub(crate) fn find_navigation_enabled(&self, search_value: &str) -> bool {
-        self.find_flags.active
-            && !self.find_matches.is_empty()
-            && self.current_search_epoch.is_none()
-            && search_value.trim() == self.search_query
+        self.find.active()
+            && !self.find.matches().is_empty()
+            && self.find.pending_epoch().is_none()
+            && search_value.trim() == self.find.query()
     }
 
     // --- read-only find/expansion accessors (shell-facing) -----------------------
 
     /// The settled find session is active (matches received, not cleared).
     pub(crate) fn find_active(&self) -> bool {
-        self.find_flags.active
+        self.find.active()
     }
 
     /// The current find match (the one the viewport is on), if any.
     pub(crate) fn current_find_match(&self) -> Option<&FindMatch> {
-        self.find_matches.get(self.find_index)
+        self.find.matches().get(self.find.index())
     }
 
     /// The current find cursor index into the settled match list.
     pub(crate) fn find_index(&self) -> usize {
-        self.find_index
+        self.find.index()
     }
 
     /// Total matches in the settled session.
     pub(crate) fn find_total(&self) -> usize {
-        self.find_total
+        self.find.matches().len()
     }
 
     /// Whether additional visible matches exist or may remain unscanned (`more`).
     pub(crate) fn find_more(&self) -> bool {
-        self.find_flags.more
+        self.find.more()
     }
 
     /// The in-flight find/search epoch, if a query is still pending.
     pub(crate) fn current_search_epoch(&self) -> Option<u64> {
-        self.current_search_epoch
+        self.find.pending_epoch()
     }
 
     /// Whether an arbitrary expandable row is expanded.
@@ -720,12 +681,12 @@ impl HistoryAppState {
 
     /// The selected row's stable `node_key`, if any.
     pub(crate) fn selected_key(&self) -> Option<&str> {
-        self.selected_key.as_deref()
+        self.selection.key()
     }
 
     /// The roving-tabindex row's absolute index (`-1` = unset).
     pub(crate) fn roving_abs(&self) -> i64 {
-        self.roving_abs
+        self.selection.roving().map_or(-1, ExpandedRow::get)
     }
 
     /// `selectRow` — mark the cached row at `abs` as the inline selection.
@@ -735,17 +696,17 @@ impl HistoryAppState {
         let Some(row) = self.cache.get_by_index(abs) else {
             return;
         };
-        self.selected_key = Some(host::row::owned_str(row, "node_key"));
+        self.selection.select(host::row::str(row, "node_key"));
     }
 
     /// `clearSelection` — drop the inline selection.
     pub(crate) fn clear_selection(&mut self) {
-        self.selected_key = None;
+        self.selection.clear();
     }
 
     /// `setRovingAbs` — re-pin the single tab stop to `abs`.
     pub(crate) fn set_roving_abs(&mut self, abs: i64) {
-        self.roving_abs = abs;
+        self.selection.set_roving(ExpandedRow::new(abs));
     }
 
     /// Build the live shell-facing [`RowContext`] for one rendered row:
@@ -789,20 +750,22 @@ impl HistoryAppState {
 
     /// `resetFindState` — drop every piece of find state.
     pub(crate) fn reset_find_state(&mut self) {
-        self.find_flags.active = false;
-        self.find_matches.clear();
-        self.find_total = 0;
-        self.find_flags.more = false;
-        self.find_index = 0;
-        self.pending_find_target = None;
+        self.find.clear();
+    }
+
+    fn clear_find_highlight(&mut self, step: &mut Step) {
+        self.clear_selection();
+        step.ops.push(DomOp::ClearFindHighlight);
+    }
+
+    pub(crate) fn search_query(&self) -> &str {
+        self.find.query()
     }
 
     /// `clearFind` — end the session without reloading history.
     pub(crate) fn clear_find(&mut self, step: &mut Step) {
         self.reset_find_state();
-        self.search_query.clear();
-        self.current_search_epoch = None;
-        step.ops.push(DomOp::ClearFindHighlight);
+        self.clear_find_highlight(step);
         step.ops.push(DomOp::FindCounter(FindCounterState::Hidden));
     }
 
@@ -812,12 +775,8 @@ impl HistoryAppState {
             self.show_find_error("Open history before searching.", step);
             return;
         }
-        query.clone_into(&mut self.search_query);
-        self.reset_find_state();
-        step.ops.push(DomOp::ClearFindHighlight);
-        let epoch = self.search_epoch.saturating_add(1);
-        self.search_epoch = epoch;
-        self.current_search_epoch = Some(epoch);
+        let epoch = self.find.begin(query);
+        self.clear_find_highlight(step);
         step.ops.push(DomOp::FindCounter(FindCounterState::Pending));
         step.sends
             .push(Send::StatusText(format!("Searching for \"{query}\"")));
@@ -844,38 +803,35 @@ impl HistoryAppState {
             .filter_map(|matched| self.normalize_find_match(matched))
             .collect::<Vec<_>>();
         let count = matches.len();
-        self.find_matches = matches;
-        self.find_total = count;
-        self.find_flags.more = response.more;
-        self.find_flags.active = true;
-        self.find_index = 0;
-        self.current_search_epoch = None;
-        self.pending_find_target = None;
-        step.ops.push(DomOp::ClearFindHighlight);
+        self.find.settle(matches, response.more);
+        self.clear_find_highlight(step);
         if count == 0 {
-            step.ops.push(DomOp::FindCounter(FindCounterState::Zero));
-            step.sends.push(Send::StatusText(format!(
-                "No matches for \"{}\"",
-                self.search_query
-            )));
+            step.ops.push(DomOp::FindCounter(FindCounterState::Zero {
+                more: response.more,
+            }));
+            step.sends.push(Send::StatusText(if response.more {
+                "Search limit reached. Refine your query.".to_owned()
+            } else {
+                format!("No matches for \"{}\"", self.find.query())
+            }));
             step.sends.push(Send::Log(format!(
                 "find: 0 match(es) for \"{}\"",
-                self.search_query
+                self.find.query()
             )));
             return;
         }
         step.sends.push(Send::Log(format!(
             "find: {} match(es) for \"{}\"",
-            self.find_total, self.search_query
+            self.find.matches().len(),
+            self.find.query()
         )));
         self.jump_to_find_match(0, viewport, step);
     }
 
     /// `showFindError` — compact, non-disruptive find error.
     pub(crate) fn show_find_error(&mut self, err_text: &str, step: &mut Step) {
-        self.reset_find_state();
-        self.current_search_epoch = None;
-        step.ops.push(DomOp::ClearFindHighlight);
+        self.find.fail();
+        self.clear_find_highlight(step);
         step.ops.push(DomOp::FindCounter(FindCounterState::Error(
             err_text.to_owned(),
         )));
@@ -892,20 +848,14 @@ impl HistoryAppState {
         viewport: &Viewport,
         step: &mut Step,
     ) {
-        if index >= self.find_matches.len() {
-            return;
-        }
-        self.find_index = index;
-        let Some(found) = self.find_matches.get(index) else {
+        let Some(abs) = self.find.focus(index) else {
             return;
         };
-        let abs = found.row;
         step.ops.push(DomOp::FindCounter(FindCounterState::Settled {
             index,
-            total: self.find_total,
-            more: self.find_flags.more,
+            total: self.find.matches().len(),
+            more: self.find.more(),
         }));
-        self.pending_find_target = Some(FindTarget { abs, index });
         if self.cache.contains_key(abs) {
             let _: Option<Viewport> = self.complete_find_jump(viewport, step);
         } else {
@@ -926,15 +876,15 @@ impl HistoryAppState {
         if self.snapshot_id.is_empty() {
             return None;
         }
-        let target = self.pending_find_target?;
+        let target = self.find.pending_target()?;
         let total = self.total.unwrap_or(0).max(0);
         if target.abs.get() >= total {
-            self.pending_find_target = None;
+            self.find.complete_jump();
             self.fetch_window(viewport, step);
             return None;
         }
         let cached = self.cache.get(target.abs)?;
-        let expected = self.find_matches.get(target.index)?;
+        let expected = self.find.matches().get(target.index)?;
         if host::row::str(cached, "node_key") != expected.node_key {
             self.fail_snapshot(
                 step,
@@ -942,7 +892,7 @@ impl HistoryAppState {
             );
             return None;
         }
-        self.pending_find_target = None;
+        self.find.complete_jump();
         let Some(vis) = self.visible_index_for_abs(target.abs.get()) else {
             return None; // hidden slot — backend only targets top-level rows
         };
@@ -962,6 +912,7 @@ impl HistoryAppState {
             scroll_top: Pixels::new(target_top),
             ..*viewport
         };
+        self.select_row(target.abs.get());
         self.sync_window(&post_scroll_viewport, step);
         step.ops.push(DomOp::SetFindHighlight {
             abs: target.abs.get(),
@@ -972,33 +923,21 @@ impl HistoryAppState {
         step.sends.push(Send::StatusText(format!(
             "Match {} of {}{}",
             target.index.saturating_add(1),
-            self.find_total,
-            if self.find_flags.more { "+" } else { "" }
+            self.find.matches().len(),
+            if self.find.more() { "+" } else { "" }
         )));
         Some(post_scroll_viewport)
     }
 
     /// `navigateFind` — move the find cursor by `delta`, wrapping.
     pub(crate) fn navigate_find(&mut self, delta: isize, viewport: &Viewport, step: &mut Step) {
-        if !self.find_flags.active || self.find_matches.is_empty() {
-            return;
+        if let Some(next) = self.find.next_index(delta) {
+            self.jump_to_find_match(next, viewport, step);
         }
-        let len = self.find_matches.len();
-        let moved = if delta >= 0 {
-            self.find_index.saturating_add(delta.unsigned_abs())
-        } else {
-            self.find_index
-                .saturating_add(len)
-                .saturating_sub(delta.unsigned_abs())
-        };
-        let next = moved.rem_euclid(len);
-        self.jump_to_find_match(next, viewport, step);
     }
 
     /// `resetHistory` — reset to the full history view and reload from the top.
     pub(crate) fn reset_history(&mut self, viewport: &Viewport, step: &mut Step) {
-        self.search_query.clear();
-        self.current_search_epoch = None;
         self.reset_find_state();
         step.ops.push(DomOp::FindCounter(FindCounterState::Hidden));
         self.total = None; // -1 semantics
@@ -1013,7 +952,7 @@ impl HistoryAppState {
         self.render_bottom = -1;
         step.ops.push(DomOp::SetScrollTop(0));
         self.clear_selection();
-        self.roving_abs = -1;
+        self.selection.set_roving(None);
         Self::show_view_message(step, "Loading history…", false);
         self.fetch_window(viewport, step);
     }
@@ -1167,10 +1106,9 @@ impl HistoryAppState {
                     }
                 };
                 self.snapshot_id = opened.snapshot_id;
-                self.search_query.clear();
                 self.reset_find_state();
                 self.clear_selection();
-                self.roving_abs = -1;
+                self.selection.set_roving(None);
                 step.ops.push(DomOp::FindCounter(FindCounterState::Hidden));
                 // A fresh chain is a new view generation; drop stale responses
                 // and re-establish the offset-0 snapshot from scratch.
@@ -1180,7 +1118,6 @@ impl HistoryAppState {
                 self.total_fetched = 0;
                 self.phase = SnapshotPhase::Opening;
                 self.announced_initial_load = false;
-                self.current_search_epoch = None;
                 self.clear_expansion_state();
                 self.open_warnings = Self::collect_open_warnings(&value);
                 if !self.open_warnings.is_empty() {
@@ -1291,10 +1228,11 @@ impl HistoryAppState {
         }
         // Latest-query-wins for search responses (epoch correlation).
         if let Some(epoch) = req.search_epoch {
-            if self.current_search_epoch != Some(epoch) {
+            if self.find.pending_epoch() != Some(epoch) {
                 step.sends.push(Send::Log(format!(
                     "dropping stale search response (epoch {epoch} of {})",
-                    self.current_search_epoch
+                    self.find
+                        .pending_epoch()
                         .map_or_else(|| "none".to_owned(), |e| e.to_string())
                 )));
                 return;
@@ -1389,7 +1327,6 @@ impl HistoryAppState {
         self.requests.clear();
         self.cache.clear();
         self.reset_find_state();
-        self.current_search_epoch = None;
     }
 
     fn fail_snapshot(&mut self, step: &mut Step, message: &str) {
@@ -1530,7 +1467,7 @@ impl HistoryAppState {
         }
         // Complete a pending find jump before eviction changes the viewport.
         let mut effective_viewport = *viewport;
-        if let Some(target) = self.pending_find_target {
+        if let Some(target) = self.find.pending_target() {
             if self.cache.contains_key(target.abs) {
                 if let Some(post_scroll) = self.complete_find_jump(viewport, step) {
                     effective_viewport = post_scroll;
@@ -1573,7 +1510,7 @@ impl HistoryAppState {
         if hydrate {
             return;
         }
-        if let Some(target) = self.pending_find_target {
+        if let Some(target) = self.find.pending_target() {
             self.fetch_window_around(target.abs, step);
         } else {
             self.fetch_window(&effective_viewport, step);
@@ -2182,7 +2119,7 @@ mod tests {
         let mut step2 = Step::new();
         state.submit_find("needle", &mut step2);
         let older_id = state.requests.log().last().expect("find request issued").id;
-        assert_eq!(state.current_search_epoch, Some(1));
+        assert_eq!(state.current_search_epoch(), Some(1));
         assert_eq!(
             state.current_search_epoch(),
             Some(1),
@@ -2223,7 +2160,7 @@ mod tests {
             .last()
             .expect("newer find request issued")
             .id;
-        assert_eq!(state.current_search_epoch, Some(2));
+        assert_eq!(state.current_search_epoch(), Some(2));
 
         // The older epoch's response must be dropped (latest-query-wins).
         let mut step3 = Step::new();
@@ -2235,7 +2172,10 @@ mod tests {
             &vp(),
             &mut step3,
         );
-        assert!(state.find_matches.is_empty(), "stale find response dropped");
+        assert!(
+            state.find.matches().is_empty(),
+            "stale find response dropped"
+        );
         assert!(step3.sends.iter().any(|s| matches!(
             s,
             Send::Log(text) if text.contains("dropping stale search response (epoch 1 of 2)")
@@ -2251,8 +2191,8 @@ mod tests {
             &vp(),
             &mut step4,
         );
-        assert_eq!(state.find_matches.len(), 1);
-        assert_eq!(state.find_matches.first().map(|m| m.row.get()), Some(4));
+        assert_eq!(state.find.matches().len(), 1);
+        assert_eq!(state.find.matches().first().map(|m| m.row.get()), Some(4));
     }
 
     #[test]
@@ -2280,22 +2220,22 @@ mod tests {
             &live_viewport,
             &mut step2,
         );
-        assert_eq!(state.find_index, 0);
-        assert!(state.find_flags.more);
-        assert_eq!(state.find_total, 1);
+        assert_eq!(state.find_index(), 0);
+        assert!(state.find.more());
+        assert_eq!(state.find_total(), 1);
         assert_eq!(
-            state.find_matches.first().map(|m| m.node_key.as_str()),
+            state.find.matches().first().map(|m| m.node_key.as_str()),
             Some("node:2500"),
             "match normalization keeps the stable node key"
         );
         assert_eq!(
-            state.find_matches.first().map(|m| m.node_key.as_str()),
+            state.find.matches().first().map(|m| m.node_key.as_str()),
             Some("node:2500")
         );
         // Off-cache target triggers fetchWindowAround(2500) — a sparse jump,
         // not a linear scan from offset 0.
         assert_eq!(
-            state.pending_find_target,
+            state.find.pending_target(),
             Some(FindTarget {
                 abs: abs(2500),
                 index: 0
@@ -2333,7 +2273,8 @@ mod tests {
         );
         assert!(state.cache.contains_key(abs(2500)), "target row is cached");
         assert_eq!(
-            state.pending_find_target, None,
+            state.find.pending_target(),
+            None,
             "jump completes once cached"
         );
         // targetTop centers the visible row in the LIVE viewport: the half-
@@ -2425,7 +2366,7 @@ mod tests {
             .sends
             .iter()
             .any(|s| matches!(s, Send::StatusText(text) if text == "Match 1 of 1")));
-        assert_eq!(state.pending_find_target, None, "jump completed in place");
+        assert_eq!(state.find.pending_target(), None, "jump completed in place");
         // The fully-cached post-scroll range issues no extra window request.
         assert_eq!(
             state.requests.log().len(),
@@ -2454,7 +2395,7 @@ mod tests {
             &vp(),
             &mut step2,
         );
-        assert_eq!(state.find_total, 3);
+        assert_eq!(state.find_total(), 3);
         assert!(state.find_active(), "settled session is active");
         assert_eq!(state.find_index(), 0);
         assert_eq!(state.find_total(), 3);
@@ -2470,29 +2411,31 @@ mod tests {
         );
 
         state.navigate_find(1, &vp(), &mut step2);
-        assert_eq!(state.find_index, 1);
+        assert_eq!(state.find_index(), 1);
         assert_eq!(state.find_index(), 1);
         assert_eq!(state.current_find_match().map(|m| m.row.get()), Some(5));
         assert_eq!(
             state
-                .find_matches
-                .get(state.find_index)
+                .find
+                .matches()
+                .get(state.find_index())
                 .map(|m| m.row.get()),
             Some(5)
         );
         state.navigate_find(1, &vp(), &mut step2);
-        assert_eq!(state.find_index, 2);
+        assert_eq!(state.find_index(), 2);
         assert_eq!(
             state
-                .find_matches
-                .get(state.find_index)
+                .find
+                .matches()
+                .get(state.find_index())
                 .map(|m| m.row.get()),
             Some(9)
         );
         state.navigate_find(1, &vp(), &mut step2);
-        assert_eq!(state.find_index, 0, "next wraps to the first match");
+        assert_eq!(state.find_index(), 0, "next wraps to the first match");
         state.navigate_find(-1, &vp(), &mut step2);
-        assert_eq!(state.find_index, 2, "previous wraps to the last match");
+        assert_eq!(state.find_index(), 2, "previous wraps to the last match");
         // more=true appends the truncation marker to the counter text.
         assert_eq!(
             HistoryAppState::find_counter_text(&FindCounterState::Settled {
@@ -2503,13 +2446,75 @@ mod tests {
             "1 of 3+"
         );
         assert_eq!(
-            HistoryAppState::find_counter_text(&FindCounterState::Zero),
+            HistoryAppState::find_counter_text(&FindCounterState::Zero { more: false }),
             "0 of 0"
         );
         assert_eq!(
             HistoryAppState::find_counter_text(&FindCounterState::Error("boom".to_owned())),
             "error"
         );
+    }
+
+    #[test]
+    fn limited_empty_find_and_selection_are_complete_before_dom_effects_run() {
+        let mut state = HistoryAppState {
+            total: Some(10),
+            expansion: Some(flat_expansion(10)),
+            ..fixture_state()
+        };
+        drop(state.cache.insert(abs(3), row(3, "node:3", 0)));
+        state.select_row(3);
+        state.submit_find("hidden", &mut Step::new());
+        assert_eq!(
+            state.selected_key(),
+            None,
+            "selection clears in the reducer"
+        );
+        let pending = state.requests.log().last().unwrap().id;
+        let mut step = Step::new();
+        state.handle_host_message(
+            resp(
+                pending,
+                &json!({"Ok": {"matches": [], "returned": 0, "more": true}}),
+            ),
+            &vp(),
+            &mut step,
+        );
+        assert!(state.find_active());
+        assert!(state.find_more());
+        assert!(!state.find_navigation_enabled("hidden"));
+        assert_eq!(state.find.pending_target(), None);
+        assert_eq!(
+            HistoryAppState::find_counter_text(&FindCounterState::Zero { more: true }),
+            "0 of 0+"
+        );
+        assert!(step.sends.contains(&Send::StatusText(
+            "Search limit reached. Refine your query.".to_owned()
+        )));
+
+        state.submit_find("visible", &mut Step::new());
+        let pending = state.requests.log().last().unwrap().id;
+        let mut step = Step::new();
+        state.handle_host_message(
+            resp(
+                pending,
+                &json!({"Ok": {"matches": [{"row": 3}], "returned": 1, "more": false}}),
+            ),
+            &vp(),
+            &mut step,
+        );
+        assert_eq!(
+            state.selected_key(),
+            Some("node:3"),
+            "selection precedes DOM highlighting"
+        );
+        assert!(step.ops.contains(&DomOp::SetFindHighlight { abs: 3 }));
+        state.show_find_error("failed", &mut Step::new());
+        assert_eq!(state.selected_key(), None);
+        assert_eq!(state.current_search_epoch(), None);
+        assert!(!state.find_active());
+        assert_eq!(state.find_total(), 0);
+        assert_eq!(state.find.pending_target(), None);
     }
 
     #[test]
@@ -2530,11 +2535,11 @@ mod tests {
             &vp(),
             &mut step2,
         );
-        assert!(state.find_flags.active && state.find_matches.is_empty());
-        assert!(step2
-            .ops
-            .iter()
-            .any(|op| matches!(op, DomOp::FindCounter(FindCounterState::Zero))));
+        assert!(state.find.active() && state.find.matches().is_empty());
+        assert!(step2.ops.iter().any(|op| matches!(
+            op,
+            DomOp::FindCounter(FindCounterState::Zero { more: false })
+        )));
         assert!(step2.sends.iter().any(|s| matches!(
             s,
             Send::StatusText(text) if text == "No matches for \"absent term\""
@@ -2542,7 +2547,7 @@ mod tests {
 
         let mut step3 = Step::new();
         state.show_find_error("service hiccup", &mut step3);
-        assert!(!state.find_flags.active);
+        assert!(!state.find.active());
         assert!(step3.ops.iter().any(|op| matches!(
             op,
             DomOp::FindCounter(FindCounterState::Error(e)) if e == "service hiccup"
@@ -3034,7 +3039,7 @@ mod tests {
             &vp(),
             &mut step2,
         );
-        assert!(!state.find_flags.active);
+        assert!(!state.find.active());
         assert!(step2.ops.iter().any(|op| matches!(
             op,
             DomOp::FindCounter(FindCounterState::Error(e)) if e == "find service error"
@@ -3094,10 +3099,10 @@ mod tests {
         // scroll position (the chain was never replaced).
         let mut step3 = Step::new();
         state.clear_find(&mut step3);
-        assert!(!state.find_flags.active);
-        assert!(state.find_matches.is_empty());
-        assert_eq!(state.search_query, "");
-        assert_eq!(state.current_search_epoch, None);
+        assert!(!state.find.active());
+        assert!(state.find.matches().is_empty());
+        assert_eq!(state.search_query(), "");
+        assert_eq!(state.current_search_epoch(), None);
         assert!(step3
             .ops
             .iter()
