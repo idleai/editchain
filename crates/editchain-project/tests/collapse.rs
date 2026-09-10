@@ -1073,7 +1073,7 @@ fn derived_parent_override_wins_over_provider_notes_without_mutating_canonical_t
     );
     assert!(
         derived
-            .parent_keys(&projection.git().links, projection.relationship_notes())
+            .parent_keys(projection.git().links(), projection.relationship_notes())
             .is_empty(),
         "a derived view must not silently reintroduce immutable provider edges"
     );
@@ -1115,7 +1115,7 @@ fn derived_git_edges_preserve_source_and_every_mixed_parent() {
     assert_eq!(
         projection
             .git()
-            .commits
+            .commits()
             .get(&(commit.repository, commit.oid)),
         Some(&commit)
     );
@@ -1253,10 +1253,10 @@ fn produced_commit_link_branches_from_folded_source_without_rewriting_agent_chai
     assert!(structural.contains(&editchain_project::NodeKey::Git(commit.key())));
 
     let raw_commit_parents =
-        committed.parent_keys(&projection.git().links, projection.relationship_notes());
+        committed.parent_keys(projection.git().links(), projection.relationship_notes());
     assert_eq!(raw_commit_parents, vec![meta.id.to_string()]);
     let raw_source_parents =
-        source.parent_keys(&projection.git().links, projection.relationship_notes());
+        source.parent_keys(projection.git().links(), projection.relationship_notes());
     assert!(
         !raw_source_parents.contains(&commit.key().to_string()),
         "the source operation never treats its produced commit as an ancestor"
@@ -1456,13 +1456,17 @@ fn exact_spawn_parent_suppresses_only_the_inherited_git_graph_edge() {
         .into_iter()
         .find(|node| node.node_key() == child.id.to_string())
         .expect("child row");
-    assert!(projection.git().links.get(&child.id).is_some_and(|links| {
-        links.iter().any(|link| {
-            link.kind == GitLinkKind::BasedOn
-                && link.target_repo == commit.repository
-                && link.target_oid == commit.oid
-        })
-    }));
+    assert!(projection
+        .git()
+        .links()
+        .get(&child.id)
+        .is_some_and(|links| {
+            links.iter().any(|link| {
+                link.kind == GitLinkKind::BasedOn
+                    && link.target_repo == commit.repository
+                    && link.target_oid == commit.oid
+            })
+        }));
     assert_eq!(
         projection.lifted_parent_keys(&child_row),
         vec![spawn.id.to_string()],
@@ -1503,7 +1507,7 @@ fn projection_does_not_infer_links_from_git_command_text_or_timestamps() {
     projection.merge_git_commits(vec![commit]);
 
     assert!(
-        projection.git().links.is_empty(),
+        projection.git().links().is_empty(),
         "only durable GitLink ops may connect sessions to Git"
     );
 }

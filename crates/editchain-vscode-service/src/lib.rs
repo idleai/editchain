@@ -1976,7 +1976,7 @@ fn git_file_change_index(
         };
         for commit in projection
             .git()
-            .commits
+            .commits()
             .values()
             .filter(|commit| commit.repository == discovery.id)
         {
@@ -2807,7 +2807,7 @@ impl Workspace {
             let commit = self
                 .projection
                 .git()
-                .commits
+                .commits()
                 .values()
                 .find(|c| c.oid == oid)?;
             return Some(node_details_from_commit(commit));
@@ -4621,11 +4621,11 @@ fn merge_exact_git_link_targets(
 ) -> usize {
     let targets: std::collections::BTreeSet<(RepositoryId, GitOid)> = projection
         .git()
-        .links
+        .links()
         .values()
         .flatten()
         .map(|link| (link.target_repo, link.target_oid))
-        .filter(|target| !projection.git().commits.contains_key(target))
+        .filter(|target| !projection.git().commits().contains_key(target))
         .collect();
 
     let mut unresolved = targets.len();

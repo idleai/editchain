@@ -1,9 +1,7 @@
 use core::cmp::Ordering;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 use crate::ids::{OpId, PathId};
-use crate::op::{Op, OpKind};
 use crate::payload::Payload;
 
 // ---------------------------------------------------------------------------
@@ -366,78 +364,5 @@ impl Ord for RepositoryId {
 impl PartialOrd for RepositoryId {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Deterministic git projection
-// ---------------------------------------------------------------------------
-
-/// A deterministic projection of git history from a set of operations.
-///
-/// Recomputable from any replica with the same operations: commits are keyed
-/// by `(RepositoryId, GitOid)` and links are keyed by their source `OpId`.
-/// This projection is the git analogue of `CanonicalView`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct GitProjection {
-    /// Commits keyed by `(RepositoryId, GitOid)`.
-    pub commits: BTreeMap<(RepositoryId, GitOid), GitCommitEntity>,
-    /// Explicit links keyed by source `OpId`.
-    pub links: BTreeMap<OpId, Vec<GitLink>>,
-}
-
-impl GitProjection {
-    /// Create an empty projection.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            commits: BTreeMap::new(),
-            links: BTreeMap::new(),
-        }
-    }
-
-    /// Reduce a single operation into this projection.
-    ///
-    /// Handles `OpKind::GitCommit` and `OpKind::GitLink`; all other kinds are
-    /// ignored. A later commit with the same `(RepositoryId, GitOid)` replaces
-    /// an earlier one (last-writer-wins by iteration order).
-    #[expect(
-        clippy::wildcard_enum_match_arm,
-        reason = "GitProjection only handles git kinds; all other kinds are silently ignored"
-    )]
-    pub fn reduce(&mut self, op: &Op) {
-        match &op.kind {
-            OpKind::GitCommit(commit) => {
-                let key = (commit.repository, commit.oid);
-                drop(self.commits.insert(key, (**commit).clone()));
-            }
-            OpKind::GitLink(link) => {
-                let entry = self.links.entry(link.source).or_default();
-                entry.push(link.clone());
-            }
-            _ => {}
-        }
-    }
-
-    /// Reduce a sequence of operations into this projection.
-    #[must_use]
-    pub fn from_ops(ops: &[Op]) -> Self {
-        let mut proj = Self::new();
-        for op in ops {
-            proj.reduce(op);
-        }
-        proj
-    }
-
-    /// Returns the commit for a given repository and OID, if present.
-    #[must_use]
-    pub fn commit(&self, repository: RepositoryId, oid: &GitOid) -> Option<&GitCommitEntity> {
-        self.commits.get(&(repository, *oid))
-    }
-
-    /// Returns the explicit links originating from an operation.
-    #[must_use]
-    pub fn links_from(&self, source: &OpId) -> &[GitLink] {
-        self.links.get(source).map_or(&[], Vec::as_slice)
     }
 }

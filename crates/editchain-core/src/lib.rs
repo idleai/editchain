@@ -1,9 +1,4 @@
-#![doc = "Editchain core types — CRDT schema, IDs, merge, and canonical reducers."]
-// Public API types are consumed by other workspace crates; not dead code.
-#![allow(
-    dead_code,
-    reason = "Public API types consumed by other workspace crates"
-)]
+#![doc = "Editchain immutable operation schema, identities, and canonical admission."]
 
 #[cfg(test)]
 use postcard as _;
@@ -28,8 +23,6 @@ pub mod payload;
 pub mod provider;
 /// Scope reference types (chain, session, turn, file).
 pub mod scope;
-/// State types (`OpSet`, `BlobSet`, `ChainState`, reducers).
-pub mod state;
 /// Tag bitflags for operation filtering.
 pub mod tags;
 /// Shared provider-neutral history classifications; no projection algorithms.
@@ -44,5 +37,4 @@ pub use op::*;
 pub use parents::*;
 pub use payload::*;
 pub use scope::*;
-pub use state::*;
 pub use tags::*;

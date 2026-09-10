@@ -670,7 +670,7 @@ fn filtered_layout_resolves_folded_relationship_endpoints() {
         .find(|n| n.node_key() == sub_later.id.to_string())
         .expect("later subagent row kept");
     assert_eq!(
-        later.parent_keys(&projection.git().links, projection.relationship_notes()),
+        later.parent_keys(projection.git().links(), projection.relationship_notes()),
         vec![sub_import.id.to_string()],
         "splice must reconnect across the hidden undated row"
     );

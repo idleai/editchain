@@ -64,7 +64,7 @@ pub fn build_lexical_index(
             exact_terms: &exact_terms,
         })?;
     }
-    for commit in workspace.projection.git().commits.values() {
+    for commit in workspace.projection.git().commits().values() {
         let source = source_commits.get(&commit.key()).copied();
         if source.is_some_and(|(op, _)| op.tags.matches_any(Tags::PRIVATE)) {
             continue;

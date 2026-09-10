@@ -537,7 +537,7 @@ fn parent_subagent_projection_keeps_branch_and_reconnect_topology_after_collapse
         .get(&collab_row_key)
         .expect("parent collab row present");
     let actual_collab_parents =
-        collab_row.parent_keys(&projection.git().links, projection.relationship_notes());
+        collab_row.parent_keys(projection.git().links(), projection.relationship_notes());
     let lifted_collab_parents = projection.lifted_parent_keys(collab_row);
     assert!(
         !actual_collab_parents.is_empty(),

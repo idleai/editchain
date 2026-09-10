@@ -259,7 +259,7 @@ impl HistoryProjection {
         // A dated producing row survives even if its linked commit is unavailable.
         structural.extend(
             self.git
-                .links
+                .links()
                 .values()
                 .flatten()
                 .filter(|link| link.kind == editchain_core::GitLinkKind::ProducedBy)

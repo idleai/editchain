@@ -10,6 +10,7 @@ use serde as _;
 pub mod activity;
 pub mod activity_view;
 pub mod content;
+pub mod git;
 /// Deterministic lane layout for graph rendering.
 pub mod layout;
 /// Deterministic semantic metadata for projected history rows.
@@ -22,6 +23,7 @@ mod view;
 mod graph;
 mod materialization;
 mod provider;
+pub use git::GitProjection;
 pub use graph::{NodeKey, ResolvedGraph, ResolvedRelation};
 pub use materialization::CodexLogicalItem;
 
@@ -30,8 +32,7 @@ use std::sync::Arc;
 
 use editchain_core::op::NoteRelationship;
 use editchain_core::{
-    GitCommitEntity, GitCommitKey, GitLinkKind, GitOid, GitProjection, Op, OpId, Payload,
-    RepositoryId,
+    GitCommitEntity, GitCommitKey, GitLinkKind, GitOid, Op, OpId, Payload, RepositoryId,
 };
 
 use crate::layout::{GraphLayout, GraphRow};
@@ -923,7 +924,7 @@ impl HistoryProjection {
     /// Returns the number of history nodes (ops + git commits).
     #[must_use]
     pub fn len(&self) -> usize {
-        self.ops.len().saturating_add(self.git.commits.len())
+        self.ops.len().saturating_add(self.git.commits().len())
     }
 
     /// Returns true if the projection is empty.
@@ -985,7 +986,7 @@ impl HistoryProjection {
     #[must_use]
     pub fn independent_chains(&self) -> usize {
         let mut nodes: Vec<HistoryNode> = self.collapsed_projection.nodes.clone();
-        for commit in self.git.commits.values() {
+        for commit in self.git.commits().values() {
             nodes.push(HistoryNode::GitCommit {
                 commit: Box::new(commit.clone()),
                 parent_override: None,
@@ -997,7 +998,7 @@ impl HistoryProjection {
             .filter(|node| {
                 ordering_parent_keys(
                     node,
-                    &self.git.links,
+                    self.git.links(),
                     self.relationship_notes(),
                     &self.collapsed_projection.representative,
                     &present,
@@ -1054,7 +1055,7 @@ impl HistoryProjection {
         for op in self.collapsed_projection.nodes.iter().rev() {
             nodes.push(op.clone());
         }
-        for commit in self.git.commits.values() {
+        for commit in self.git.commits().values() {
             nodes.push(HistoryNode::GitCommit {
                 commit: Box::new(commit.clone()),
                 parent_override: None,
@@ -1100,7 +1101,7 @@ impl HistoryProjection {
             // fail to resolve are dropped so a phantom can never block the sort.
             for parent in ordering_parent_keys(
                 node,
-                &self.git.links,
+                self.git.links(),
                 self.relationship_notes(),
                 &self.collapsed_projection.representative,
                 &present,
@@ -1884,7 +1885,7 @@ impl HistoryProjection {
                 continue;
             };
             let visible_parents = canonicalize_parents(
-                n.parent_keys(&self.git.links, relationship_notes),
+                n.parent_keys(self.git.links(), relationship_notes),
                 representative,
                 &present,
                 &n.node_key(),
@@ -2038,11 +2039,7 @@ impl HistoryProjection {
     /// same key replaces an earlier one.
     pub fn merge_git_commits(&mut self, commits: Vec<GitCommitEntity>) {
         for commit in commits {
-            drop(
-                self.git
-                    .commits
-                    .insert((commit.repository, commit.oid), commit),
-            );
+            self.git.observe_commit(commit);
         }
     }
 
@@ -2093,7 +2090,7 @@ impl HistoryProjection {
             .map(|node| {
                 let parents = ordering_parent_keys(
                     node,
-                    &self.git.links,
+                    self.git.links(),
                     self.relationship_notes(),
                     &self.collapsed_projection.representative,
                     &present,
@@ -2122,14 +2119,14 @@ impl HistoryProjection {
     #[must_use]
     pub fn lifted_parent_keys(&self, node: &HistoryNode) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
-        node.parent_nodes(&self.git.links, self.relationship_notes())
+        node.parent_nodes(self.git.links(), self.relationship_notes())
             .into_iter()
             .filter_map(|parent| {
                 let resolved = match parent {
                     NodeKey::Op(id) => self.visible_op_id(id).map(NodeKey::Op),
                     NodeKey::Git(key) => self
                         .git
-                        .commits
+                        .commits()
                         .contains_key(&(key.repository, key.oid))
                         .then_some(parent),
                 }?;
@@ -2193,7 +2190,7 @@ impl HistoryProjection {
         };
         if let HistoryNode::GitCommit { commit, .. } = node {
             for &parent in parents {
-                for link in self.git.links.values().flatten().filter(|link| {
+                for link in self.git.links().values().flatten().filter(|link| {
                     link.kind == GitLinkKind::ProducedBy
                         && link.target_key() == commit.key()
                         && self
@@ -2242,7 +2239,7 @@ impl HistoryProjection {
         let representative = &self.collapsed_projection.representative;
         let present: std::collections::HashSet<NodeKey> =
             nodes.iter().map(HistoryNode::key).collect();
-        for link in self.git.links.values().flatten().filter(|link| {
+        for link in self.git.links().values().flatten().filter(|link| {
             link.kind == GitLinkKind::ProducedBy
                 && present.contains(&NodeKey::Git(link.target_key()))
         }) {

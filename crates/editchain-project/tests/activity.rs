@@ -377,7 +377,7 @@ fn context_compaction_stays_visible_and_is_inlined_without_changing_raw() {
         .find(|node| node.node_key() == continuation.id.to_string())
         .unwrap_or_else(|| panic!("raw continuation missing"));
     assert_eq!(
-        raw_continuation.parent_keys(&projection.git().links, projection.relationship_notes()),
+        raw_continuation.parent_keys(projection.git().links(), projection.relationship_notes()),
         vec![root.id.to_string()],
         "Raw keeps the imported sibling topology"
     );
@@ -393,7 +393,7 @@ fn context_compaction_stays_visible_and_is_inlined_without_changing_raw() {
     assert_eq!(checkpoint.visibility(), Visibility::Primary);
     assert_eq!(checkpoint.activity_kind(), ActivityKind::Plan);
     assert_eq!(
-        checkpoint.parent_keys(&projection.git().links, projection.relationship_notes()),
+        checkpoint.parent_keys(projection.git().links(), projection.relationship_notes()),
         vec![root.id.to_string()]
     );
     let activity_continuation = activity
@@ -401,7 +401,8 @@ fn context_compaction_stays_visible_and_is_inlined_without_changing_raw() {
         .find(|node| node.node_key() == continuation.id.to_string())
         .unwrap_or_else(|| panic!("Activity continuation missing"));
     assert_eq!(
-        activity_continuation.parent_keys(&projection.git().links, projection.relationship_notes()),
+        activity_continuation
+            .parent_keys(projection.git().links(), projection.relationship_notes()),
         vec![compacted.id.to_string()],
         "Activity inserts the continuation after the visible checkpoint"
     );
@@ -438,7 +439,7 @@ fn context_compaction_does_not_rewire_a_structural_continuation() {
         .find(|node| node.node_key() == continuation.id.to_string())
         .unwrap_or_else(|| panic!("structural continuation missing"));
     assert_eq!(
-        kept.parent_keys(&projection.git().links, projection.relationship_notes()),
+        kept.parent_keys(projection.git().links(), projection.relationship_notes()),
         vec![root.id.to_string()],
         "structural fork/subagent/reconnect endpoints are never rewritten"
     );

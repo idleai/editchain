@@ -224,7 +224,7 @@ fn virtual_subagent_parent_is_not_duplicated_after_activity_projection() {
         .find(|n| n.node_key() == sub_first.id.to_string())
         .expect("subagent first op kept");
 
-    let parents = sub.parent_keys(&projection.git().links, projection.relationship_notes());
+    let parents = sub.parent_keys(projection.git().links(), projection.relationship_notes());
     assert_eq!(
         parents,
         vec![spawn_marker.id.to_string()],
@@ -257,7 +257,7 @@ fn activity_view_splices_edges_across_undated_rows() {
         .iter()
         .find(|n| n.summary() == "gamma")
         .expect("gamma kept");
-    let parents = c_node.parent_keys(&projection.git().links, projection.relationship_notes());
+    let parents = c_node.parent_keys(projection.git().links(), projection.relationship_notes());
     assert_eq!(parents.len(), 1);
     assert_eq!(parents[0], a_id.to_string());
     assert!(
@@ -372,7 +372,7 @@ fn activity_view_splices_through_undated_structural_endpoints() {
         .find(|node| node.node_key() == branch_work.id.to_string())
         .expect("dated subagent work remains visible");
     assert_eq!(
-        work.parent_keys(&projection.git().links, projection.relationship_notes()),
+        work.parent_keys(projection.git().links(), projection.relationship_notes()),
         vec![trunk.id.to_string()],
         "the stored structural relationship must splice onto dated endpoints"
     );

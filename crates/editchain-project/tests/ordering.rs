@@ -20,6 +20,54 @@ use editchain_core::{
 };
 use editchain_project::{HistoryNode, HistoryProjection};
 
+#[test]
+fn file_observations_and_proposals_retain_their_own_history() {
+    use editchain_core::{ContentId, FileEdit, FileOp, FileStage, PathId};
+    let path = PathId(42);
+    let mut sources = Vec::new();
+    let mut parent = None;
+    for (seq, ms, stage) in [
+        (1, 300, FileStage::Applied),
+        (2, 200, FileStage::Observed),
+        (3, 100, FileStage::Proposed),
+    ] {
+        let op = Op {
+            kind: OpKind::File(FileOp {
+                path,
+                stage,
+                base: None,
+                after: Some(ContentId::Local {
+                    node: NodeId(1),
+                    seq,
+                }),
+                edit: FileEdit::None,
+            }),
+            scope: ScopeRef::File(path),
+            tags: Tags::FILE,
+            ..msg_op(1, seq, 0, ms, parent)
+        };
+        parent = Some(op.id);
+        sources.push(op);
+    }
+    let projection = HistoryProjection::from_ops(sources.clone());
+    let nodes = projection.nodes();
+    let expected: Vec<_> = sources.iter().rev().map(|op| op.id.to_string()).collect();
+    assert_eq!(
+        nodes.iter().map(HistoryNode::node_key).collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(projection.ops(), &sources);
+    let graph = projection.resolved_graph(&nodes);
+    for pair in sources.windows(2) {
+        let parent = pair.first().unwrap();
+        let child = pair.get(1).unwrap();
+        assert_eq!(
+            graph.parents(editchain_project::NodeKey::Op(child.id)),
+            &[editchain_project::NodeKey::Op(parent.id)]
+        );
+    }
+}
+
 /// A standalone message op (its own row).
 fn msg_op(node: u64, seq: u64, session: u64, clock_ms: u64, parent: Option<OpId>) -> Op {
     Op {

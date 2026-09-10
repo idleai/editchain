@@ -323,12 +323,23 @@ Completed increments:
   Regressions cover wire bytes, each unused SHA-1 byte, visible topology across
   logical-clock records, observed-time echo pairing, and prepared metadata rows.
 
+- Core API retirement: removed the unused `state` module (`BlobSet`,
+  `CausalKey`, `CanonicalView`, file/message reducers, and core `ChainState`).
+  Admission remains in core; immutable operation bytes retain their existing
+  format. The retired facade's materialization tests are replaced by file-fact
+  retention and project topology checks. Admission/property tests and operation
+  round trips remain. `GitProjection` now lives in `editchain_project::git`,
+  with private maps, read accessors, and explicit observation updates. Its
+  existing input-order replacement and stored-link ordering are documented;
+  Git graph/link tests moved with the implementation. Live observation updates
+  leave accepted source facts unchanged. These are Rust API removals and moves
+  for the workspace's pre-1.0 crates; downstream users must migrate to admission
+  and project rather than the retired materialization facade.
+
 Remaining work, in dependency order:
 
-1. Retire the unused core materialization API and move Git projection policy
-   to project.
-2. Retire migrated producer compatibility machinery.
-3. Measure and reduce repeated work.
+1. Retire migrated producer compatibility machinery.
+2. Measure and reduce repeated work.
 
 Validation uses the existing crate, service, renderer, and extension suites.
 Every completed code increment must pass `./scripts/lint.sh`. Regression tests
