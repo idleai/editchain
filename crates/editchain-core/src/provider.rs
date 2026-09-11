@@ -70,6 +70,9 @@ pub enum CodexDerivationContract {
     /// Every upsert and removal is preserved at its witnessing occurrence.
     #[serde(rename = "codex-occurrences-v1")]
     OccurrencesV1,
+    /// Occurrences with bidirectional legacy user-message echo correlation.
+    #[serde(rename = "codex-occurrences-v2")]
+    OccurrencesV2,
 }
 
 /// Materialized operations and logical changes from one physical occurrence.

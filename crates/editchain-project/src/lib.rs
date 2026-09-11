@@ -148,8 +148,32 @@ impl HistoryProjection {
     /// unavailable before projection. Source operation identities are unchanged.
     #[must_use]
     pub fn from_preview_ops(ops: Vec<Op>, incomplete: &std::collections::HashSet<OpId>) -> Self {
+        let messages = materialization::source_messages(&ops, incomplete);
+        let materialization = materialization::Materialization::from_ops(&ops, &messages);
+        Self::from_previews(ops, incomplete, materialization)
+    }
+
+    /// Build bounded display rows while retaining exact source message payload
+    /// identities and derivation evidence for echo comparison. Equal shortened
+    /// previews never prove equality; durable blob references or complete inline
+    /// sources do. Evidence must also remain complete to validate source coverage.
+    #[must_use]
+    pub fn from_source_previews(
+        sources: &[Op],
+        previews: Vec<Op>,
+        incomplete: &std::collections::HashSet<OpId>,
+    ) -> Self {
+        let messages = materialization::source_messages(sources, &std::collections::HashSet::new());
+        let materialization = materialization::Materialization::from_ops(sources, &messages);
+        Self::from_previews(previews, incomplete, materialization)
+    }
+
+    fn from_previews(
+        ops: Vec<Op>,
+        incomplete: &std::collections::HashSet<OpId>,
+        materialization: materialization::Materialization,
+    ) -> Self {
         let provider_relations = provider::resolve(&ops);
-        let materialization = materialization::Materialization::from_ops(&ops);
         let mut git = GitProjection::new();
         let mut relationship_notes: HashMap<OpId, Vec<Op>> = HashMap::new();
         for op in &ops {

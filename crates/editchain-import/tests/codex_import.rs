@@ -309,6 +309,410 @@ fn occurrence_revisions_and_logical_removals_are_independent_of_append_boundarie
 }
 
 #[test]
+fn user_message_echoes_fold_without_erasing_edits_repetition_or_new_incarnations() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = |ordinal, id, text| {
+        line_record(
+            ordinal,
+            vec![serde_json::json!({
+                "turnId": "turn-1", "item": {"kind": "userMessage", "id": id, "text": text}
+            })],
+            None,
+        )
+    };
+    let mut removed = line_record(7, Vec::new(), None);
+    removed["projection"]["removedTurnIds"] = serde_json::json!(["turn-1"]);
+    let records = [
+        line_record(
+            1,
+            Vec::new(),
+            Some(serde_json::json!({"threadId": "thread-1"})),
+        ),
+        user(2, "message-1", "prompt A"),
+        user(3, "message-1", "prompt A"),
+        user(4, "message-1", "prompt B"),
+        user(5, "message-1", "prompt A"),
+        user(6, "message-2", "prompt A"),
+        removed,
+        user(8, "message-1", "prompt A"),
+    ];
+    let mut cursors = MemoryCursorStore::new();
+    let mut ops = Vec::new();
+    for end in [2, 3, 6, 8] {
+        ops.extend(
+            import_projection_prefix(
+                &dir,
+                &records[..end],
+                &ImportOptions::default(),
+                &mut cursors,
+            )
+            .ops
+            .ops,
+        );
+    }
+    let ops = canonical_revisions(&ops);
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(op.kind, OpKind::Message(_)))
+            .count(),
+        6
+    );
+    for input in [ops.clone(), ops.iter().rev().cloned().collect()] {
+        let view = editchain_project::HistoryProjection::from_ops(input);
+        assert_eq!(
+            view.nodes()
+                .iter()
+                .filter(|node| node.summary() == "prompt A")
+                .count(),
+            4
+        );
+        assert_eq!(
+            view.nodes()
+                .iter()
+                .filter(|node| node.summary() == "prompt B")
+                .count(),
+            1
+        );
+        assert_eq!(
+            view.ops().len(),
+            ops.len(),
+            "all immutable evidence is retained"
+        );
+    }
+}
+
+#[test]
+fn user_echo_comparison_uses_full_source_payloads_instead_of_equal_previews() {
+    let dir = tempfile::tempdir().unwrap();
+    let prefix = "same prefix ".repeat(700);
+    let user = |ordinal, suffix| {
+        line_record(
+            ordinal,
+            vec![serde_json::json!({
+                "turnId": "turn-1", "item": {"kind": "userMessage", "id": "message-1", "text": format!("{prefix}{suffix}")}
+            })],
+            None,
+        )
+    };
+    let records = vec![
+        line_record(
+            1,
+            Vec::new(),
+            Some(serde_json::json!({"threadId": "thread-1"})),
+        ),
+        user(2, "A"),
+        user(3, "A"),
+        user(4, "B"),
+        user(5, "B"),
+    ];
+    let imported = import_projection_prefix(
+        &dir,
+        &records,
+        &ImportOptions::default(),
+        &mut MemoryCursorStore::new(),
+    );
+    let sources = canonical_revisions(&imported.ops.ops);
+    let mut previews = sources.clone();
+    let mut incomplete = std::collections::HashSet::new();
+    for op in &mut previews {
+        if let OpKind::Message(message) = &mut op.kind {
+            message.content = Payload::Inline(b"same preview".to_vec());
+            let _: bool = incomplete.insert(op.id);
+        }
+    }
+    let conservative =
+        editchain_project::HistoryProjection::from_preview_ops(previews.clone(), &incomplete);
+    assert_eq!(
+        conservative
+            .nodes()
+            .iter()
+            .filter(|node| node.summary() == "same preview")
+            .count(),
+        4
+    );
+    let exact =
+        editchain_project::HistoryProjection::from_source_previews(&sources, previews, &incomplete);
+    assert_eq!(
+        exact
+            .nodes()
+            .iter()
+            .filter(|node| node.summary() == "same preview")
+            .count(),
+        2
+    );
+    assert_eq!(exact.ops().len(), sources.len());
+}
+
+#[test]
+fn bounded_evidence_previews_do_not_break_user_echo_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = |ordinal| {
+        line_record(
+            ordinal,
+            vec![serde_json::json!({
+                "turnId": "turn-1", "item": {"kind": "userMessage", "id": "message-1", "text": "one prompt"}
+            })],
+            None,
+        )
+    };
+    let changes: Vec<_> = (0..40)
+        .map(|index| serde_json::json!({
+            "turnId": "turn-1", "item": {"kind": "agentMessage", "id": format!("message-{index}"), "text": "earlier output"}
+        }))
+        .collect();
+    let records = [
+        line_record(
+            1,
+            changes,
+            Some(serde_json::json!({"threadId": "thread-1"})),
+        ),
+        user(2),
+        user(3),
+    ];
+    let imported = import_projection_prefix(
+        &dir,
+        &records,
+        &ImportOptions::default(),
+        &mut MemoryCursorStore::new(),
+    );
+    let sources = canonical_revisions(&imported.ops.ops);
+    let mut previews = sources.clone();
+    let mut incomplete = std::collections::HashSet::new();
+    for op in &mut previews {
+        if let OpKind::Note(note) = &mut op.kind {
+            if let Payload::Inline(bytes) = &mut note.content {
+                if bytes.len() > 4096 {
+                    bytes.truncate(4096);
+                    let _: bool = incomplete.insert(op.id);
+                }
+            }
+        }
+    }
+    assert!(
+        !incomplete.is_empty(),
+        "the multi-item proof exceeds the preview budget"
+    );
+    let conservative =
+        editchain_project::HistoryProjection::from_preview_ops(previews.clone(), &incomplete);
+    assert_eq!(
+        conservative
+            .nodes()
+            .iter()
+            .filter(|node| node.summary() == "one prompt")
+            .count(),
+        2
+    );
+    let exact =
+        editchain_project::HistoryProjection::from_source_previews(&sources, previews, &incomplete);
+    assert_eq!(
+        exact
+            .nodes()
+            .iter()
+            .filter(|node| node.summary() == "one prompt")
+            .count(),
+        1
+    );
+    assert_eq!(exact.ops().len(), sources.len());
+}
+
+fn legacy_user_derivation(ops: &[editchain_core::Op]) -> Vec<editchain_core::Op> {
+    use editchain_core::provider::{CodexDerivationContract, CodexLogicalChange, ProviderEvidence};
+    let shifted = |mut id: editchain_core::OpId| {
+        id.node.0 ^= 1 << 63;
+        id
+    };
+    let mut outputs = std::collections::HashSet::new();
+    let mut legacy = ops.to_vec();
+    for op in &mut legacy {
+        let OpKind::Note(note) = &mut op.kind else {
+            continue;
+        };
+        let Payload::Inline(bytes) = &mut note.content else {
+            continue;
+        };
+        let Ok(mut evidence) = serde_json::from_slice::<ProviderEvidence>(bytes) else {
+            continue;
+        };
+        let ProviderFact::CodexDerivation(meta) = &mut evidence.fact else {
+            continue;
+        };
+        meta.contract = CodexDerivationContract::OccurrencesV1;
+        for output in &mut meta.outputs {
+            let _: bool = outputs.insert(*output);
+            *output = shifted(*output);
+        }
+        for change in &mut meta.changes {
+            if let CodexLogicalChange::Upsert {
+                item,
+                incarnation,
+                outputs,
+                ..
+            } = change
+            {
+                *item = format!("legacy-{}-{item}", evidence.source.seq);
+                *incarnation = evidence.source;
+                for id in outputs {
+                    *id = shifted(*id);
+                }
+            }
+        }
+        *bytes = serde_json::to_vec(&evidence).unwrap();
+        op.id = shifted(op.id);
+    }
+    for op in &mut legacy {
+        if outputs.contains(&op.id) {
+            op.id = shifted(op.id);
+            if let ParentSet::One(parent) = &mut op.parents {
+                if outputs.contains(parent) {
+                    *parent = shifted(*parent);
+                }
+            }
+        }
+    }
+    legacy
+}
+
+#[test]
+fn corrected_user_identities_backfill_without_conflicts_or_stale_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = |ordinal| {
+        line_record(
+            ordinal,
+            vec![serde_json::json!({
+                "turnId": "turn-1", "item": {"kind": "userMessage", "id": "message-1", "text": "one prompt"}
+            })],
+            None,
+        )
+    };
+    let records = vec![
+        line_record(
+            1,
+            Vec::new(),
+            Some(serde_json::json!({"threadId": "thread-1"})),
+        ),
+        user(2),
+        user(3),
+    ];
+    let mut cursors = MemoryCursorStore::new();
+    let captured =
+        import_projection_prefix(&dir, &records, &ImportOptions::default(), &mut cursors);
+    let legacy = legacy_user_derivation(&canonical_revisions(&captured.ops.ops));
+    let old_view = editchain_project::HistoryProjection::from_ops(legacy.clone());
+    assert_eq!(
+        old_view
+            .nodes()
+            .iter()
+            .filter(|node| node.summary() == "one prompt")
+            .count(),
+        2
+    );
+    let key = source_key(dir.path(), &dir.path().join("rollout-revisions.jsonl"));
+    let mut checkpoint = cursors.get_cursor(&key).unwrap().unwrap();
+    checkpoint.materialization.as_mut().unwrap().contract = "codex-occurrences-v1".into();
+    cursors.set_cursor(&key, &checkpoint).unwrap();
+    let upgrade = import_projection_prefix(&dir, &records, &ImportOptions::default(), &mut cursors);
+    assert_eq!(upgrade.report.raw_ops, 0);
+    let combined = canonical_revisions(&[legacy.clone(), upgrade.ops.ops.clone()].concat());
+    let view = editchain_project::HistoryProjection::from_ops(combined.clone());
+    assert_eq!(
+        view.nodes()
+            .iter()
+            .filter(|node| node.summary() == "one prompt")
+            .count(),
+        1
+    );
+    assert_eq!(view.codex_logical_items().len(), 1);
+    for old in legacy {
+        assert!(view.ops().contains(&old));
+    }
+    let missing = upgrade
+        .ops
+        .ops
+        .iter()
+        .find(|op| matches!(op.kind, OpKind::Message(_)))
+        .unwrap()
+        .id;
+    let broken = editchain_project::HistoryProjection::from_ops(
+        combined.into_iter().filter(|op| op.id != missing).collect(),
+    );
+    assert!(
+        broken.codex_logical_items().is_empty(),
+        "an incomplete upgrade cannot revive legacy logical state"
+    );
+    let repeated =
+        import_projection_prefix(&dir, &records, &ImportOptions::default(), &mut cursors);
+    assert!(repeated.ops.ops.is_empty());
+}
+
+#[test]
+fn contract_upgrade_retains_captured_reasoning_without_enabling_it_for_new_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let reasoning = |ordinal, text| {
+        line_record(
+            ordinal,
+            vec![serde_json::json!({
+                "turnId": "turn-1", "item": {"kind": "reasoning", "id": "reasoning-1", "summary": [text]}
+            })],
+            None,
+        )
+    };
+    let mut records = vec![
+        line_record(
+            1,
+            Vec::new(),
+            Some(serde_json::json!({"threadId": "thread-1"})),
+        ),
+        reasoning(2, "already captured"),
+    ];
+    let mut cursors = MemoryCursorStore::new();
+    let shown = ImportOptions {
+        include_thinking: true,
+        ..ImportOptions::default()
+    };
+    let captured = import_projection_prefix(&dir, &records, &shown, &mut cursors);
+    let legacy = legacy_user_derivation(&canonical_revisions(&captured.ops.ops));
+    let key = source_key(dir.path(), &dir.path().join("rollout-revisions.jsonl"));
+    let mut checkpoint = cursors.get_cursor(&key).unwrap().unwrap();
+    checkpoint.materialization.as_mut().unwrap().contract = "codex-occurrences-v1".into();
+    cursors.set_cursor(&key, &checkpoint).unwrap();
+    let upgrade = import_projection_prefix(&dir, &records, &ImportOptions::default(), &mut cursors);
+    assert!(upgrade
+        .ops
+        .ops
+        .iter()
+        .any(|op| matches!(op.kind, OpKind::Reflection(_))));
+    assert!(
+        cursors
+            .get_cursor(&key)
+            .unwrap()
+            .unwrap()
+            .materialization
+            .unwrap()
+            .includes_thinking
+    );
+    let view = editchain_project::HistoryProjection::from_ops(canonical_revisions(
+        &[legacy, upgrade.ops.ops].concat(),
+    ));
+    let [item] = view.codex_logical_items() else {
+        panic!("the upgrade must select exactly one logical reasoning item");
+    };
+    assert_eq!(item.item, "reasoning-1");
+    assert!(view.ops().iter().any(|op| {
+        item.outputs.contains(&op.id)
+            && matches!(&op.kind, OpKind::Reflection(reflection)
+                if reflection.summary == Payload::Inline(b"already captured".to_vec()))
+    }));
+    records.push(reasoning(3, "not requested"));
+    let appended =
+        import_projection_prefix(&dir, &records, &ImportOptions::default(), &mut cursors);
+    assert!(!appended
+        .ops
+        .ops
+        .iter()
+        .any(|op| matches!(op.kind, OpKind::Reflection(_))));
+}
+
+#[test]
 fn occurrence_materialization_replaces_legacy_content_and_rejects_incomplete_revisions() {
     let dir = tempfile::tempdir().unwrap();
     let records = derivation_records();

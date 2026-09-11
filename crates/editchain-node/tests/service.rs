@@ -2669,7 +2669,7 @@ fn cancelled_branch_rows_ship_muted_node_and_child_owned_edge_geometry() {
 }
 
 #[test]
-fn prepared_snapshot_manifest_records_projection_revision_fifty_six() {
+fn prepared_snapshot_manifest_records_projection_revision_fifty_seven() {
     // Stale snapshots from earlier projection revisions (before trace hiding,
     // pre cross-record response_item/event_msg duplicate pairing, pre
     // response_item label/compact summary changes, pre truncated-echo-text
@@ -2679,7 +2679,8 @@ fn prepared_snapshot_manifest_records_projection_revision_fifty_six() {
     // token-usage contraction, correlation-only tool results, exact Claude
     // response contraction, authoritative view-parent rewrites, and causal
     // produced-commit branch edges, default timestamp-zero omission,
-    // source-control file rows, and singleton nested-work flattening) must not
+    // source-control file rows, singleton nested-work flattening, and exact
+    // Codex user-message revision folding) must not
     // be served silently: the revision participates in the snapshot identity
     // hash.
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -2696,7 +2697,7 @@ fn prepared_snapshot_manifest_records_projection_revision_fifty_six() {
     )
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
-    assert_eq!(manifest["identity"]["projection_revision"], 56u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 57u64);
 }
 
 #[test]
@@ -3105,7 +3106,7 @@ fn prepared_snapshot_serves_flattened_activity_view_and_records_current_revision
         &std::fs::read(report.path.join("manifest.json")).expect("read manifest"),
     )
     .expect("parse manifest");
-    assert_eq!(manifest["identity"]["projection_revision"], 56u64);
+    assert_eq!(manifest["identity"]["projection_revision"], 57u64);
 
     let mut cached =
         Workspace::open(tmp.path().to_str().unwrap(), ".editchain").expect("cached open");

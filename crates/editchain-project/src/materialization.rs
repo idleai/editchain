@@ -3,12 +3,15 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use editchain_core::provider::{
-    ClaudeDerivationEvidence, CodexDerivationEvidence, CodexLogicalChange, CodexThreadId,
-    ProviderFact,
+    ClaudeDerivationEvidence, CodexDerivationContract, CodexDerivationEvidence, CodexLogicalChange,
+    CodexThreadId, ProviderFact,
 };
 use editchain_core::{Op, OpId, OpKind, ParentSet};
 
 use crate::provider::{decode_evidence, EvidenceRecord};
+
+mod message_echoes;
+pub(super) use message_echoes::source_messages;
 
 /// Current state of a Codex logical item, rebuilt from immutable occurrences.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +61,13 @@ impl<'a> Derivation<'a> {
             Self::Claude(meta) => meta.includes_thinking,
         }
     }
+
+    fn revision(self) -> u8 {
+        match self {
+            Self::Codex(meta) if meta.contract == CodexDerivationContract::OccurrencesV2 => 2,
+            Self::Codex(_) | Self::Claude(_) => 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -66,10 +76,11 @@ pub(super) struct Materialization {
     pub(super) representatives: HashMap<OpId, OpId>,
     pub(super) output_order: HashMap<OpId, usize>,
     pub(super) items: Vec<CodexLogicalItem>,
+    pub(super) message_echoes: HashMap<OpId, OpId>,
 }
 
 impl Materialization {
-    pub(super) fn from_ops(ops: &[Op]) -> Self {
+    pub(super) fn from_ops(ops: &[Op], messages: &HashMap<OpId, Op>) -> Self {
         let by_id: HashMap<OpId, &Op> = ops.iter().map(|op| (op.id, op)).collect();
         let records: Vec<_> = ops.iter().filter_map(decode_evidence).collect();
         let mut by_source: BTreeMap<OpId, Vec<&EvidenceRecord<'_>>> = BTreeMap::new();
@@ -85,6 +96,7 @@ impl Materialization {
         let mut result = Self::default();
         let mut logical: BTreeMap<SourceKey, LogicalTurns> = BTreeMap::new();
         let mut blocked = HashSet::new();
+        let mut echoes = message_echoes::MessageEchoes::default();
         for (source, records) in &by_source {
             result.track_outputs(*source, records, &by_id);
             let selected = select(records).filter(|meta| complete_outputs(*meta, *source, &by_id));
@@ -94,6 +106,7 @@ impl Materialization {
                     let _: Option<usize> = result.output_order.insert(*output, index);
                 }
                 if let Derivation::Codex(meta) = meta {
+                    echoes.observe(*source, meta, messages, &by_id);
                     apply_changes(
                         logical.entry(source_key(*source)).or_default(),
                         *source,
@@ -105,6 +118,7 @@ impl Materialization {
             }
         }
         blocked.extend(incomplete_sources(&by_source, &by_id));
+        result.message_echoes = echoes.finish(&blocked);
         // A covered record's legacy numeric lanes remain stored and
         // addressable, but their cursor-dependent fold no longer supplies
         // display content. Incomplete replacements do not revive stale data.
@@ -204,9 +218,14 @@ fn select<'a>(records: &[&'a EvidenceRecord<'_>]) -> Option<Derivation<'a>> {
     }
     // Disabling capture cannot erase already captured reasoning.
     let includes_thinking = candidates.iter().any(|meta| meta.includes_thinking());
-    let mut eligible = candidates
-        .into_iter()
-        .filter(|meta| meta.includes_thinking() == includes_thinking);
+    let revision = candidates
+        .iter()
+        .filter(|meta| meta.includes_thinking() == includes_thinking)
+        .map(|meta| meta.revision())
+        .max()?;
+    let mut eligible = candidates.into_iter().filter(|meta| {
+        meta.revision() == revision && meta.includes_thinking() == includes_thinking
+    });
     let first = eligible.next()?;
     eligible.all(|meta| meta == first).then_some(first)
 }

@@ -74,6 +74,15 @@ pub struct SessionProjector {
     turn_context: TurnContext,
     response_item_message_count: u64,
     decoded_count: u64,
+    pending_user: Option<PendingUserEcho>,
+    user_aliases: HashMap<String, String>,
+}
+
+struct PendingUserEcho {
+    ordinal: u64,
+    turn: String,
+    item: String,
+    text: String,
 }
 
 impl Default for SessionProjector {
@@ -91,6 +100,8 @@ impl SessionProjector {
             turn_context: TurnContext::default(),
             response_item_message_count: 0,
             decoded_count: 0,
+            pending_user: None,
+            user_aliases: HashMap::new(),
         }
     }
 
@@ -148,7 +159,9 @@ impl SessionProjector {
                 self.turn_context
                     .observe(&line.item, self.decoded_count.saturating_sub(1));
                 let mut projection = project_change_set(changes);
+                self.fold_legacy_user_echo(&mut projection, &line.item, source_ordinal);
                 self.project_response_item(&mut projection, &line.item, source_ordinal);
+                self.remember_user_response(&projection, &line.item, source_ordinal);
                 self.project_item_completed_supplement(&mut projection, &line.item);
                 enrich_projection(&mut projection, &line.item);
                 LineRecord {
@@ -177,8 +190,86 @@ impl SessionProjector {
     /// Finalizes the underlying thread-history builder into turns, returning
     /// the turns and the response-derived registry for final reconciliation.
     pub fn finish(self) -> (Vec<Turn>, ResponseRegistry) {
-        let turns = self.builder.finish();
+        let mut turns = self.builder.finish();
+        for turn in &mut turns {
+            for item in &mut turn.items {
+                if let ThreadItem::UserMessage { id, .. } = item {
+                    if let Some(canonical) = self.user_aliases.get(id) {
+                        *id = canonical.clone();
+                    }
+                }
+            }
+        }
         (turns, self.registry)
+    }
+
+    fn fold_legacy_user_echo(
+        &mut self,
+        projection: &mut ProjectionRecord,
+        item: &RolloutItem,
+        ordinal: u64,
+    ) {
+        let Some(pending) = self.pending_user.take() else {
+            return;
+        };
+        if !matches!(item, RolloutItem::EventMsg(EventMsg::UserMessage(_)))
+            || pending.ordinal.checked_add(1) != Some(ordinal)
+        {
+            return;
+        }
+        for change in &mut projection.changed_items {
+            let ItemProjection::UserMessage { id, text, .. } = &mut change.item else {
+                continue;
+            };
+            if change.turn_id != pending.turn || text.trim_end_matches('\n') != pending.text {
+                continue;
+            }
+            // Consume one adjacent transport echo, preserving the builder's
+            // richer content (including attachments) under the response identity.
+            let builder_id = id.clone();
+            *id = pending.item.clone();
+            self.user_aliases
+                .insert(builder_id.clone(), pending.item.clone());
+            if let Some(entry) = self.echo.entries.get_mut(&builder_id) {
+                entry.projection = change.item.clone();
+                entry.echoed = true;
+            }
+            self.registry
+                .upsert_projection(&pending.item, change.item.clone());
+            break;
+        }
+    }
+
+    fn remember_user_response(
+        &mut self,
+        projection: &ProjectionRecord,
+        item: &RolloutItem,
+        ordinal: u64,
+    ) {
+        let RolloutItem::ResponseItem(envelope) = item else {
+            return;
+        };
+        if !matches!(&envelope.item, ResponseItem::Message { role, .. } if role == "user") {
+            return;
+        }
+        for change in &projection.changed_items {
+            let ItemProjection::UserMessage { id, text, .. } = &change.item else {
+                continue;
+            };
+            // A response already folded onto a builder event must not consume
+            // a second, intentionally repeated user event.
+            if self.registry.get(id).is_some()
+                && self.echo.get(id).is_none()
+                && !self.user_aliases.values().any(|canonical| canonical == id)
+            {
+                self.pending_user = Some(PendingUserEcho {
+                    ordinal,
+                    turn: change.turn_id.clone(),
+                    item: id.clone(),
+                    text: text.trim_end_matches('\n').to_string(),
+                });
+            }
+        }
     }
 
     /// Response-derived items created by this projector (stable per file).
@@ -1883,6 +1974,55 @@ mod tests {
             "item_completed echo must fold onto the response item"
         );
         assert_eq!(projector.registry().entries().len(), 1);
+    }
+
+    #[test]
+    fn legacy_user_echoes_correlate_in_both_orders_without_eating_repeated_prompts() {
+        let started = r#"{"timestamp":"t","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","model_context_window":null}}"#;
+        let response = r#"{"timestamp":"t","type":"response_item","payload":{"type":"message","id":"msg_user","role":"user","content":[{"type":"input_text","text":"audit the tree"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}}"#;
+        let event = r#"{"timestamp":"t","type":"event_msg","payload":{"type":"user_message","message":"audit the tree","images":[],"local_images":[],"text_elements":[]}}"#;
+        for lines in [
+            [started, response, event, event],
+            [started, event, response, event],
+        ] {
+            let (records, projector) = project_lines(&lines);
+            let id = |index: usize| {
+                records[index].projection.changed_items[0]
+                    .item
+                    .id()
+                    .to_owned()
+            };
+            assert_eq!(
+                id(1),
+                id(2),
+                "the transport echo reuses the original identity"
+            );
+            assert_ne!(id(2), id(3), "a repeated user event is a separate prompt");
+            let (turns, _) = projector.finish();
+            assert!(turns
+                .iter()
+                .flat_map(|turn| &turn.items)
+                .any(|item| item.id() == id(1)));
+        }
+    }
+
+    #[test]
+    fn response_first_user_echo_requires_adjacent_record_exact_turn_and_text() {
+        let started = r#"{"timestamp":"t","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1","model_context_window":null}}"#;
+        let response = r#"{"timestamp":"t","type":"response_item","payload":{"type":"message","id":"msg_user","role":"user","content":[{"type":"input_text","text":"audit the tree"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn-1"}}}"#;
+        let event = r#"{"timestamp":"t","type":"event_msg","payload":{"type":"user_message","message":"audit the tree","images":[],"local_images":[],"text_elements":[]}}"#;
+        let other_turn = response.replace("turn-1", "turn-2");
+        let other_text = event.replace("audit the tree", "audit the tree again");
+        for lines in [
+            vec![started, &other_turn, event],
+            vec![started, response, &other_text],
+            vec![started, response, started, event],
+        ] {
+            let (records, _) = project_lines(&lines);
+            let first = &records[1].projection.changed_items[0].item;
+            let last = &records.last().unwrap().projection.changed_items[0].item;
+            assert_ne!(first.id(), last.id());
+        }
     }
 
     #[test]
