@@ -386,7 +386,8 @@ impl Workspace {
                 history_errors: 0,
             },
         };
-        let mut projection = HistoryProjection::from_preview_ops(projection_ops, &incomplete);
+        let mut projection =
+            HistoryProjection::from_source_previews(&source_ops, projection_ops, &incomplete);
         // Walk each discovered repo's history into the projection.
         for discovery in &repositories {
             let opened = open_repository(discovery);

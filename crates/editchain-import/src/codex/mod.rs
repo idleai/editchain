@@ -66,7 +66,7 @@
 //!
 //! ## Immutable revisions and logical state
 //!
-//! The named `codex-occurrences-v1` materialization retains all item upserts,
+//! The named `codex-occurrences-v2` materialization retains all item upserts,
 //! turn metadata changes, and explicit turn removals. Operation namespaces
 //! separate items and line-content roles from legacy numeric lanes, so cursor
 //! boundaries and reasoning inclusion cannot shift a sibling operation's ID.
@@ -77,6 +77,9 @@
 //! its complete outputs and logical changes. Projection replays those changes
 //! to rebuild current logical items; removing a turn retires its active items
 //! while preserving their history. Reuse after removal begins a new incarnation.
+//! Version two correlates legacy user-message echoes in both arrival orders.
+//! Version-one records remain immutable; a separate namespace backfills the
+//! corrected logical identities without conflicting with existing operations.
 //! Older normalized operations remain stored and readable through a compatibility
 //! view. A one-time derivation backfill supersedes their display content without
 //! regenerating their IDs. Incomplete replacement evidence leaves logical state

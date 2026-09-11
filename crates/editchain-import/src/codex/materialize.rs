@@ -20,7 +20,7 @@ use crate::sink::{emit_op, EmissionKind, OpSink};
 use crate::source_read::SourceReadPlan;
 use crate::ImportError;
 
-pub(super) const CONTRACT: &str = "codex-occurrences-v1";
+pub(super) const CONTRACT: &str = "codex-occurrences-v2";
 
 #[derive(Debug, Default)]
 struct RecordProjection<'a> {
@@ -86,6 +86,13 @@ pub(super) fn emit_occurrences(
     let start = if replay { 0 } else { plan.start_seq() };
     let mut records = RecordProjection::index(projection);
     let mut report = crate::model::ImportReport::default();
+    let requested_thinking = context.include_thinking;
+    let retained_thinking = plan
+        .checkpoint()
+        .materialization
+        .as_ref()
+        .filter(|checkpoint| checkpoint.includes_thinking)
+        .map_or(0, |checkpoint| checkpoint.through);
     for (index, line) in lines.iter().enumerate() {
         plan.check_cancellation()?;
         let ordinal = start
@@ -97,6 +104,7 @@ pub(super) fn emit_occurrences(
             .op_from_position(SourcePosition::raw(ordinal))?;
         let clock = raw_clock(parse_raw_line_meta(&line.data).timestamp.as_deref()).0;
         let record = records.remove(&ordinal).unwrap_or_default();
+        context.include_thinking = requested_thinking || ordinal <= retained_thinking;
         let output = materialize_record(&record, ordinal, clock, context, plan)?;
         let proof = evidence_note(
             context.thread,
@@ -106,7 +114,7 @@ pub(super) fn emit_occurrences(
                 raw_hash: line.hash,
                 fact: ProviderFact::CodexDerivation(CodexDerivationEvidence {
                     thread: CodexThreadId(context.thread.to_owned()),
-                    contract: CodexDerivationContract::OccurrencesV1,
+                    contract: CodexDerivationContract::OccurrencesV2,
                     includes_thinking: context.include_thinking,
                     outputs: output.ops.iter().map(|op| op.id).collect(),
                     changes: output.changes,
@@ -119,6 +127,7 @@ pub(super) fn emit_occurrences(
         }
         emit_op(&proof, sink, &mut report, EmissionKind::Derived)?;
     }
+    context.include_thinking = requested_thinking;
     Ok(report)
 }
 

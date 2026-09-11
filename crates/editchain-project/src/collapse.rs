@@ -94,8 +94,13 @@ impl HistoryProjection {
             }
         }
         let mut representative = self.materialization.representatives.clone();
-        let mut duplicate_event_occurrences: std::collections::HashSet<OpId> =
-            std::collections::HashSet::new();
+        representative.extend(&self.materialization.message_echoes);
+        let mut duplicate_event_occurrences: std::collections::HashSet<OpId> = self
+            .materialization
+            .message_echoes
+            .keys()
+            .copied()
+            .collect();
         let imports_by_id: HashMap<OpId, &editchain_core::op::ImportOp> = self
             .ops
             .iter()

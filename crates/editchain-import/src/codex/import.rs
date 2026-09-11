@@ -391,7 +391,15 @@ pub fn import_codex(
             new_cursor.materialization = Some(crate::sink::MaterializationCheckpoint {
                 contract: super::materialize::CONTRACT.to_owned(),
                 through: new_cursor.ops_emitted,
-                includes_thinking: options.include_thinking,
+                includes_thinking: options.include_thinking
+                    || plan
+                        .checkpoint()
+                        .materialization
+                        .as_ref()
+                        .is_some_and(|checkpoint| {
+                            checkpoint.includes_thinking
+                                && checkpoint.through >= new_cursor.ops_emitted
+                        }),
             });
         }
 

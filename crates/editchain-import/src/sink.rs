@@ -199,6 +199,12 @@ impl MaterializationCheckpoint {
             Some(checkpoint) if checkpoint.contract == contract => Ok(checkpoint.through
                 < accepted_records
                 || (includes_thinking && !checkpoint.includes_thinking)),
+            Some(checkpoint)
+                if checkpoint.contract == "codex-occurrences-v1"
+                    && contract == "codex-occurrences-v2" =>
+            {
+                Ok(true)
+            }
             Some(checkpoint) => Err(ImportError::CursorStore(format!(
                 "unsupported materialization contract {}",
                 checkpoint.contract
