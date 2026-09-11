@@ -7,13 +7,17 @@
 use blake3 as _;
 use editchain_core as _;
 use editchain_project as _;
+use editchain_store as _;
 use serde as _;
 use serde_json as _;
 use sha2 as _;
 use tempfile as _;
+use time as _;
 
 use editchain_import::ids::derive_source_stream;
+use process_wrap as _;
 use proptest::prelude::*;
+use tokio as _;
 
 proptest! {
     #![proptest_config(ProptestConfig {

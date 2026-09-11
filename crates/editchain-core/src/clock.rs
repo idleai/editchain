@@ -23,8 +23,21 @@ pub enum Clock {
 }
 
 impl Clock {
-    /// Returns the clock value as a u64 for ordering purposes.
-    /// For `None`, returns 0 (always ordered before any real clock).
+    /// Observed Unix milliseconds, independent of logical ordering.
+    ///
+    /// Logical counters do not identify wall time. Zero in either wall-clock
+    /// variant is the legacy undated marker, so it also returns `None`.
+    #[must_use]
+    pub const fn observed_unix_ms(&self) -> Option<u64> {
+        match self {
+            Self::None | Self::Lamport(_) | Self::UnixMs(0) | Self::Hybrid { ms: 0, .. } => None,
+            Self::UnixMs(ms) | Self::Hybrid { ms, .. } => Some(*ms),
+        }
+    }
+
+    /// Numeric ordering value for consumers that deliberately compare clock
+    /// domains. This is not a timestamp; use [`Self::observed_unix_ms`] for
+    /// observed time. `None` sorts as zero under this numeric policy.
     #[must_use]
     pub const fn as_u64(&self) -> u64 {
         match self {

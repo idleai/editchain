@@ -109,8 +109,8 @@ pub fn commit_file_changes(
 
     let mut files = changes
         .into_iter()
-        .filter_map(|change| change_from_gix(handle, change))
-        .collect::<Vec<_>>();
+        .filter_map(|change| change_from_gix(handle, change).transpose())
+        .collect::<Result<Vec<_>, _>>()?;
     files.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
@@ -173,7 +173,7 @@ pub fn resolve_path_at_commit(
     if mode.is_tree() {
         return Ok(None);
     }
-    let oid = git_oid_from_gix(&entry.object_id());
+    let oid = git_oid_from_gix(&entry.object_id())?;
     let blob = if mode.is_commit() {
         None
     } else {
@@ -189,40 +189,50 @@ pub fn resolve_path_at_commit(
 fn change_from_gix(
     handle: &RepositoryHandle,
     change: gix::diff::tree_with_rewrites::Change,
-) -> Option<GitFileChange> {
+) -> Result<Option<GitFileChange>, ResolutionError> {
     use gix::diff::tree_with_rewrites::Change;
 
-    match change {
+    let file = match change {
         Change::Addition {
             location,
             entry_mode,
             id,
             ..
-        } => (!entry_mode.is_tree()).then(|| GitFileChange {
-            path: path_text(location.as_ref()),
-            old_path: None,
-            status: GitFileStatus::Added,
-            old_oid: None,
-            new_oid: Some(git_oid_from_gix(&id)),
-            old_mode: None,
-            new_mode: Some(entry_mode.as_str().to_owned()),
-            binary: object_is_binary(handle, id, entry_mode),
-        }),
+        } => {
+            if entry_mode.is_tree() {
+                return Ok(None);
+            }
+            GitFileChange {
+                path: path_text(location.as_ref()),
+                old_path: None,
+                status: GitFileStatus::Added,
+                old_oid: None,
+                new_oid: Some(git_oid_from_gix(&id)?),
+                old_mode: None,
+                new_mode: Some(entry_mode.as_str().to_owned()),
+                binary: object_is_binary(handle, id, entry_mode),
+            }
+        }
         Change::Deletion {
             location,
             entry_mode,
             id,
             ..
-        } => (!entry_mode.is_tree()).then(|| GitFileChange {
-            path: path_text(location.as_ref()),
-            old_path: None,
-            status: GitFileStatus::Deleted,
-            old_oid: Some(git_oid_from_gix(&id)),
-            new_oid: None,
-            old_mode: Some(entry_mode.as_str().to_owned()),
-            new_mode: None,
-            binary: object_is_binary(handle, id, entry_mode),
-        }),
+        } => {
+            if entry_mode.is_tree() {
+                return Ok(None);
+            }
+            GitFileChange {
+                path: path_text(location.as_ref()),
+                old_path: None,
+                status: GitFileStatus::Deleted,
+                old_oid: Some(git_oid_from_gix(&id)?),
+                new_oid: None,
+                old_mode: Some(entry_mode.as_str().to_owned()),
+                new_mode: None,
+                binary: object_is_binary(handle, id, entry_mode),
+            }
+        }
         Change::Modification {
             location,
             previous_entry_mode,
@@ -231,24 +241,24 @@ fn change_from_gix(
             id,
         } => {
             if previous_entry_mode.is_tree() && entry_mode.is_tree() {
-                return None;
+                return Ok(None);
             }
             let status = if previous_entry_mode.kind() == entry_mode.kind() {
                 GitFileStatus::Modified
             } else {
                 GitFileStatus::TypeChanged
             };
-            Some(GitFileChange {
+            GitFileChange {
                 path: path_text(location.as_ref()),
                 old_path: None,
                 status,
-                old_oid: Some(git_oid_from_gix(&previous_id)),
-                new_oid: Some(git_oid_from_gix(&id)),
+                old_oid: Some(git_oid_from_gix(&previous_id)?),
+                new_oid: Some(git_oid_from_gix(&id)?),
                 old_mode: Some(previous_entry_mode.as_str().to_owned()),
                 new_mode: Some(entry_mode.as_str().to_owned()),
                 binary: object_is_binary(handle, previous_id, previous_entry_mode)
                     || object_is_binary(handle, id, entry_mode),
-            })
+            }
         }
         Change::Rewrite {
             source_location,
@@ -259,7 +269,7 @@ fn change_from_gix(
             location,
             copy,
             ..
-        } => Some(GitFileChange {
+        } => GitFileChange {
             path: path_text(location.as_ref()),
             old_path: Some(path_text(source_location.as_ref())),
             status: if copy {
@@ -267,14 +277,15 @@ fn change_from_gix(
             } else {
                 GitFileStatus::Renamed
             },
-            old_oid: Some(git_oid_from_gix(&source_id)),
-            new_oid: Some(git_oid_from_gix(&id)),
+            old_oid: Some(git_oid_from_gix(&source_id)?),
+            new_oid: Some(git_oid_from_gix(&id)?),
             old_mode: Some(source_entry_mode.as_str().to_owned()),
             new_mode: Some(entry_mode.as_str().to_owned()),
             binary: object_is_binary(handle, source_id, source_entry_mode)
                 || object_is_binary(handle, id, entry_mode),
-        }),
-    }
+        },
+    };
+    Ok(Some(file))
 }
 
 fn path_text(bytes: &[u8]) -> String {

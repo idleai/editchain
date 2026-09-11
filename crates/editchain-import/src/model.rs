@@ -22,8 +22,14 @@ pub struct ImportOptions {
     pub normalize: bool,
     /// Whether to include thinking content (default: false — private).
     pub include_thinking: bool,
-    /// Maximum inline payload size before spilling to blob storage.
-    pub max_inline_bytes: usize,
+    /// Bounds on captured sources and individual physical records.
+    pub source_limits: crate::source_read::SourceReadLimits,
+    /// Bounds on helper output and elapsed execution time.
+    pub helper_limits: crate::codex::helper::HelperLimits,
+    /// Aggregate operation count and encoded-byte bounds for one capture batch.
+    pub batch_limits: crate::sink::BatchLimits,
+    /// Shared cancellation signal for capture and derivation.
+    pub cancellation: crate::cancellation::ImportCancellation,
 }
 
 impl Default for ImportOptions {
@@ -31,7 +37,19 @@ impl Default for ImportOptions {
         Self {
             normalize: true,
             include_thinking: false,
-            max_inline_bytes: 4096,
+            source_limits: crate::source_read::SourceReadLimits::default(),
+            helper_limits: crate::codex::helper::HelperLimits::default(),
+            batch_limits: crate::sink::BatchLimits::default(),
+            cancellation: crate::cancellation::ImportCancellation::default(),
+        }
+    }
+}
+
+impl ImportOptions {
+    pub(crate) fn source_control(&self) -> crate::source_read::SourceReadControl {
+        crate::source_read::SourceReadControl {
+            limits: self.source_limits,
+            cancellation: self.cancellation.clone(),
         }
     }
 }
@@ -43,16 +61,18 @@ pub struct ImportReport {
     pub files_discovered: usize,
     /// Number of source files processed.
     pub files_processed: usize,
-    /// Number of raw `ImportOps` emitted.
+    /// Number of distinct raw operation variants retained by the capture sink.
     pub raw_ops: usize,
-    /// Number of normalized ops emitted.
+    /// Number of distinct normalized variants retained by the capture sink.
     pub normalized_ops: usize,
-    /// Number of duplicate lines skipped.
+    /// Number of distinct typed provider evidence variants retained.
+    pub evidence_ops: usize,
+    /// Number of exact operation variants already retained by the capture sink.
     pub duplicates: usize,
     /// Number of malformed lines skipped.
     pub malformed: usize,
-    /// Number of UUID collisions detected.
-    pub uuid_collisions: usize,
+    /// New conflicting operation variants retained by the capture sink.
+    pub op_conflicts: usize,
 }
 
 impl ImportReport {
@@ -60,6 +80,14 @@ impl ImportReport {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn merge_emissions(&mut self, other: &Self) {
+        self.raw_ops = self.raw_ops.saturating_add(other.raw_ops);
+        self.normalized_ops = self.normalized_ops.saturating_add(other.normalized_ops);
+        self.evidence_ops = self.evidence_ops.saturating_add(other.evidence_ops);
+        self.duplicates = self.duplicates.saturating_add(other.duplicates);
+        self.op_conflicts = self.op_conflicts.saturating_add(other.op_conflicts);
     }
 }
 

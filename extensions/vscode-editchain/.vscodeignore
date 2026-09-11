@@ -1,4 +1,10 @@
 node_modules/**
+src/**
+scripts/**
+test/**
+out/**/*.map
+tsconfig.json
+.gitignore
 repro*.js
 *.vsix
 .ui-out/**

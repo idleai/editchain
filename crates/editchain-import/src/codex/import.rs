@@ -1,38 +1,28 @@
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use editchain_core::clock::Clock;
-use serde_json::Value;
-
-use crate::claude_code::reader::read_session_file;
-use crate::cursor::{check_file_generation, read_new_bytes, resolve_source_cursor};
+use crate::cursor::resolve_source_cursor;
 use crate::error::ImportError;
 use crate::ids::{derive_session_id, SourcePosition, SourceStream};
 use crate::model::{ImportOptions, ImportReport};
-use crate::sink::{BlobSink, CursorStore, OpSink};
+use crate::sink::{emit_op, BlobSink, CursorStore, EmissionKind, OpSink};
+use crate::source_read::{SourceReadPlan, SourceReadState};
 
 use super::discover::discover_rollouts;
 use super::helper::HelperCommand;
-use super::link::{
-    emit_codex_relationship_notes, ActivityMarker, CompletionEvidence, LegacyCompletionEvidence,
-    ThreadTopology, CODEX_NORMALIZATION_VERSION, SPAWN_SIGNAL_COLLAB_TOOL,
-    SPAWN_SIGNAL_SUBAGENT_ACTIVITY,
-};
 use super::normalize::{
-    build_raw_op, completed_agent_paths_from_tool, is_blank_line, normalized_ops_for_compaction,
-    normalized_ops_for_inter_agent, normalized_ops_for_item, normalized_ops_for_turn,
-    owning_thread_from_raw_line, ItemAnchor, NormalizeContext,
+    build_raw_op, is_blank_line, owning_thread_from_raw_line, NormalizeContext,
 };
-use super::projection::{parse_projection, FinalItem, ProjectionKind};
+use super::projection::parse_projection;
 use super::session_git::session_git_link_op;
 use super::title::{load_session_titles, raw_session_identity, session_title_op};
+use super::CODEX_NORMALIZATION_VERSION;
 
 /// Normalization version that introduced exact session-start Git links.
 const CODEX_GIT_NORMALIZATION_VERSION: u32 = 1;
 
 /// Configuration for a Codex rollout discovery/import request.
 #[derive(Debug, Clone)]
-pub struct CodexDiscoveryRequest {
+pub struct CodexDiscoveryRequest<'a> {
     /// Path to the workspace root. Used for deterministic source stream IDs
     /// and as the conservative project filter: a rollout is included when its
     /// projected `sessionMeta.cwd` is equal to or nested within this path, and
@@ -41,56 +31,8 @@ pub struct CodexDiscoveryRequest {
     /// Root directory containing raw Codex rollout JSONL files, recursively
     /// (e.g. `~/.codex/sessions`; date trees are discovered automatically).
     pub raw_root: PathBuf,
-}
-
-/// How one rollout's raw bytes are read for this run.
-///
-/// [`ReadState::Fresh`] and [`ReadState::Rewritten`] re-read the whole file
-/// from byte 0 (a "full read": the exact non-blank line set is known and the
-/// projection record count is enforced); [`ReadState::Append`] reads only the
-/// bytes past the persisted cursor; [`ReadState::Reproject`] reads no raw bytes
-/// and upgrades only deterministic normalized metadata.
-enum ReadState {
-    /// First import (or a reset re-import) of the source.
-    Fresh {
-        /// Boot generation for the deterministic source stream.
-        boot: u32,
-        /// Complete lines read from the whole file.
-        lines: Vec<crate::claude_code::reader::LineWithHash>,
-        /// Cursor covering the whole file.
-        new_cursor: crate::sink::CursorValue,
-    },
-    /// The source grew since the last read; same generation, incremental read.
-    Append {
-        /// Boot generation of the current generation (unchanged by appends).
-        boot: u32,
-        /// First ordinal of this batch (one past the cursor's emitted count).
-        start_seq: u64,
-        /// Complete lines read past the cursor.
-        lines: Vec<crate::claude_code::reader::LineWithHash>,
-        /// Cursor covering the old plus new bytes.
-        new_cursor: crate::sink::CursorValue,
-    },
-    /// Source bytes are unchanged, but an older normalized projection needs a
-    /// deterministic exact-fact upgrade. No raw/content rows are replayed.
-    Reproject {
-        /// Existing boot generation of the source stream.
-        boot: u32,
-        /// Number of raw records already emitted for this source.
-        start_seq: u64,
-        /// Unchanged source cursor, upgraded only after projection succeeds.
-        new_cursor: crate::sink::CursorValue,
-    },
-    /// The source was truncated/rewritten; bumped to a new generation and
-    /// re-read whole from byte 0.
-    Rewritten {
-        /// New boot generation, persisted by the cursor store.
-        boot: u32,
-        /// Complete lines read from the whole rewritten file.
-        lines: Vec<crate::claude_code::reader::LineWithHash>,
-        /// Cursor covering the whole rewritten file.
-        new_cursor: crate::sink::CursorValue,
-    },
+    /// Host-owned catalog used for exact session-start Git repository identity.
+    pub repositories: &'a dyn super::session_git::RepositoryLookup,
 }
 
 /// Import all Codex rollouts under a raw sessions root into editchain ops.
@@ -115,9 +57,9 @@ enum ReadState {
 ///    deterministic (see [`rollout_in_workspace`]);
 /// 5. Emits one byte-exact raw `ImportOp` per new physical line, chained into
 ///    the per-file raw chain;
-/// 6. Folds the projection's upsert/remove records to final logical items and
-///    emits one normalized op per final item first seen in this batch;
-/// 7. Persists the cursor and normalization version only after the whole file
+/// 6. Captures immutable normalized revisions and logical removals at their
+///    witnessing records, backfilling a named materialization when required;
+/// 7. Persists capture and materialization checkpoints only after the whole file
 ///    succeeded.
 ///
 /// Session scope is the owning thread id: bridge metadata first, then raw
@@ -140,11 +82,6 @@ enum ReadState {
 /// longer abort the import: they are re-imported under a new generation. On
 /// error the affected file's cursor is not advanced.
 ///
-/// # Panics
-///
-/// Panics if a folded item's first-seen ordinal falls outside the current
-/// batch's line range — guarded by projection validation, so unreachable in
-/// practice.
 #[expect(
     clippy::arithmetic_side_effects,
     clippy::as_conversions,
@@ -154,21 +91,16 @@ enum ReadState {
     clippy::too_many_arguments,
     reason = "import orchestrator takes the request, options, helper bridge, and three sinks"
 )]
-#[expect(
-    clippy::expect_used,
-    reason = "first-seen ordinals are validated against the batch's line range by parse_projection"
-)]
 pub fn import_codex(
-    request: &CodexDiscoveryRequest,
+    request: &CodexDiscoveryRequest<'_>,
     options: &ImportOptions,
     helper: &HelperCommand,
     ops: &mut dyn OpSink,
     blobs: &mut dyn BlobSink,
     cursors: &mut dyn CursorStore,
 ) -> Result<ImportReport, ImportError> {
+    options.cancellation.check(&request.raw_root)?;
     let mut report = ImportReport::new();
-    // Per-thread exact topology for the sink-independent relationship pass.
-    let mut topology: Vec<ThreadTopology> = Vec::new();
     let session_titles = if options.normalize {
         load_session_titles(&request.raw_root)?
     } else {
@@ -180,19 +112,6 @@ pub fn import_codex(
     let workspace_str = request.workspace_path.to_str().unwrap_or("/workspace");
 
     for rollout in &rollouts {
-        let raw_identity = if session_titles.is_empty() {
-            None
-        } else {
-            raw_session_identity(&rollout.path)?
-        };
-        let indexed_title = raw_identity.as_ref().and_then(|identity| {
-            session_titles.get(&identity.thread_id).or_else(|| {
-                identity
-                    .parent_thread_id
-                    .as_ref()
-                    .and_then(|parent| session_titles.get(parent))
-            })
-        });
         let resolved = resolve_source_cursor(
             cursors,
             "codex",
@@ -204,7 +123,27 @@ pub fn import_codex(
         let state_key = resolved.state_key;
         let source_node = resolved.source_node;
         let migrates_legacy_key = cursor_key != state_key;
-        let mut existing_cursor = resolved.cursor;
+        let existing_cursor = resolved.cursor;
+        let plan = SourceReadPlan::capture_controlled(
+            &rollout.path,
+            existing_cursor.as_ref(),
+            cursors.get_generation(&state_key)?,
+            cursors.get_reservation(&cursor_key)?.as_ref(),
+            &options.source_control(),
+        )?;
+        let raw_identity = if session_titles.is_empty() {
+            None
+        } else {
+            raw_session_identity(plan.captured_path())?
+        };
+        let indexed_title = raw_identity.as_ref().and_then(|identity| {
+            session_titles.get(&identity.thread_id).or_else(|| {
+                identity
+                    .parent_thread_id
+                    .as_ref()
+                    .and_then(|parent| session_titles.get(parent))
+            })
+        });
         let previous_session_title_hash = existing_cursor
             .as_ref()
             .and_then(|cursor| cursor.session_title_hash);
@@ -219,97 +158,40 @@ pub fn import_codex(
             && existing_cursor
                 .as_ref()
                 .is_some_and(|cursor| cursor.normalization_version < CODEX_NORMALIZATION_VERSION);
+        let needs_evidence_upgrade = options.normalize
+            && existing_cursor.as_ref().is_some_and(|cursor| {
+                cursor.normalization_version < super::evidence::CODEX_PROVIDER_EVIDENCE_VERSION
+            });
         let needs_cursor_upgrade = migrates_legacy_key
             || existing_cursor.as_ref().is_some_and(|cursor| {
-                cursor.source_node != Some(source_node) || cursor.content_hash_version < 1
+                cursor.source_node != Some(source_node)
+                    || cursor.content_hash_version < 1
+                    || cursor.accepted_generation.is_none()
             });
+        let needs_materialization_replay = options.normalize
+            && crate::sink::MaterializationCheckpoint::needs_replay(
+                plan.checkpoint().materialization.as_ref(),
+                super::materialize::CONTRACT,
+                options.include_thinking,
+                plan.start_seq(),
+            )?;
 
-        // Decide how to read this rollout. A persisted cursor whose source was
-        // truncated or rewritten is NOT fatal: the file is bumped to a new
-        // deterministic boot generation (persisted per source by the cursor
-        // store) and re-imported whole from byte 0, so its new ops never
-        // collide with the previous generation's ids and unrelated rollouts
-        // keep importing. Exact accepted-prefix hashing detects same-size and
-        // grown rewrites as generation changes.
-        let read = if let Some(cursor) = existing_cursor.as_mut() {
-            match check_file_generation(&rollout.path, cursor) {
-                Ok(true) => {
-                    if needs_normalization_upgrade
-                        || needs_session_title_refresh
-                        || needs_cursor_upgrade
-                    {
-                        ReadState::Reproject {
-                            boot: cursors.get_generation(&state_key)?,
-                            start_seq: cursor.ops_emitted,
-                            new_cursor: cursor.clone(),
-                        }
-                    } else {
-                        // Unchanged and current — idempotent skip.
-                        continue;
-                    }
-                }
-                Ok(false) => {
-                    // Grew — incremental append on the current generation's stream.
-                    let boot = cursors.get_generation(&state_key)?;
-                    let (lines, _bytes_read, new_cursor) =
-                        read_session_file(&rollout.path, Some(cursor))?;
-                    ReadState::Append {
-                        boot,
-                        start_seq: cursor.ops_emitted,
-                        lines,
-                        new_cursor,
-                    }
-                }
-                Err(ImportError::SourceGenerationChanged { .. }) => {
-                    // Truncated/rewritten — bump to a new generation and read
-                    // the whole file from scratch (a fresh read, so the stale
-                    // cursor never re-triggers the generation error).
-                    let generation = cursors.get_generation(&state_key)?.saturating_add(1);
-                    cursors.set_generation(&cursor_key, generation)?;
-                    let (lines, _bytes_read, new_cursor) = read_session_file(&rollout.path, None)?;
-                    ReadState::Rewritten {
-                        boot: generation,
-                        lines,
-                        new_cursor,
-                    }
-                }
-                Err(e) => return Err(e),
-            }
-        } else {
-            // First import — generation 0 (unless a reset re-import is
-            // replaying a previously rewritten source).
-            let boot = cursors.get_generation(&cursor_key)?;
-            let (lines, _bytes_read, new_cursor) = read_session_file(&rollout.path, None)?;
-            ReadState::Fresh {
-                boot,
-                lines,
-                new_cursor,
-            }
-        };
-
-        let (boot, start_seq, full_read, lines, mut new_cursor) = match read {
-            ReadState::Fresh {
-                boot,
-                lines,
-                new_cursor,
-            }
-            | ReadState::Rewritten {
-                boot,
-                lines,
-                new_cursor,
-            } => (boot, 0, true, lines, new_cursor),
-            ReadState::Append {
-                boot,
-                start_seq,
-                lines,
-                new_cursor,
-            } => (boot, start_seq, false, lines, new_cursor),
-            ReadState::Reproject {
-                boot,
-                start_seq,
-                new_cursor,
-            } => (boot, start_seq, false, Vec::new(), new_cursor),
-        };
+        if plan.state() == SourceReadState::Unchanged
+            && !needs_normalization_upgrade
+            && !needs_session_title_refresh
+            && !needs_cursor_upgrade
+            && !needs_materialization_replay
+        {
+            continue;
+        }
+        let boot = plan.generation();
+        let start_seq = plan.start_seq();
+        let full_read = matches!(
+            plan.state(),
+            SourceReadState::Fresh | SourceReadState::Rewritten
+        );
+        let lines = plan.lines();
+        let mut new_cursor = plan.checkpoint().clone();
 
         // Deterministic source stream per physical file (the file path is the
         // owning stream identity). The boot generation separates rewritten
@@ -318,7 +200,8 @@ pub fn import_codex(
         let stream = SourceStream::new(source_node, boot);
         // The bridge counts every physical line it reads, including blank lines
         // and one trailing partial line; align `expected_total` with it.
-        let (has_partial, partial_blank) = trailing_partial(&rollout.path, &new_cursor)?;
+        let has_partial = plan.partial().is_some();
+        let partial_blank = plan.partial() == Some(true);
         let expected_total = start_seq + lines.len() as u64 + u64::from(has_partial);
 
         if expected_total == 0 {
@@ -328,10 +211,16 @@ pub fn import_codex(
                 new_cursor.normalization_version = new_cursor
                     .normalization_version
                     .max(CODEX_NORMALIZATION_VERSION);
+                new_cursor.materialization = Some(crate::sink::MaterializationCheckpoint {
+                    contract: super::materialize::CONTRACT.to_owned(),
+                    through: new_cursor.ops_emitted,
+                    includes_thinking: options.include_thinking,
+                });
             }
             new_cursor.source_node = Some(source_node);
             new_cursor.content_hash_version = 1;
-            if migrates_legacy_key && boot > 0 {
+            options.cancellation.check(&rollout.path)?;
+            if boot > 0 {
                 cursors.set_generation(&cursor_key, boot)?;
             }
             cursors.set_cursor(&cursor_key, &new_cursor)?;
@@ -352,7 +241,12 @@ pub fn import_codex(
 
         // Run the helper over the whole file and validate/fold its projection
         // BEFORE emitting anything, so a bridge failure leaves no partial state.
-        let stdout = helper.run(&rollout.path)?;
+        let stdout = helper.run_captured(
+            plan.captured_path(),
+            &rollout.path,
+            options.helper_limits,
+            &options.cancellation,
+        )?;
         let projection =
             parse_projection(&stdout, expected_total, expected_records).map_err(|e| {
                 ImportError::ProjectionProtocol {
@@ -364,7 +258,7 @@ pub fn import_codex(
             })?;
         validate_new_line_records(
             &projection.line_ordinals,
-            &lines,
+            lines,
             start_seq,
             (has_partial && !partial_blank).then_some(expected_total),
             &rollout.path,
@@ -392,7 +286,7 @@ pub fn import_codex(
         // filename stem. Never payload.session_id.
         let owning_thread = match projection.owning_thread.clone() {
             Some(thread) => thread,
-            None => owning_thread_from_rollout(&rollout.path)?
+            None => owning_thread_from_rollout(plan.captured_path())?
                 .unwrap_or_else(|| rollout.session_id.clone()),
         };
         let session_id = derive_session_id(&owning_thread);
@@ -403,47 +297,14 @@ pub fn import_codex(
                 .and_then(|meta| meta.parent_thread_id.as_ref())
                 .and_then(|parent| session_titles.get(parent))
         });
-        let mut topo = ThreadTopology {
-            thread_id: owning_thread.clone(),
-            parent_thread_id: projection
-                .session_meta
-                .as_ref()
-                .and_then(|m| m.parent_thread_id.clone()),
-            forked_from_id: projection
-                .session_meta
-                .as_ref()
-                .and_then(|m| m.forked_from_id.clone()),
-            agent_path: projection
-                .session_meta
-                .as_ref()
-                .and_then(|m| m.agent_path.clone()),
-            first_raw: (new_cursor.ops_emitted > 0)
-                .then(|| stream.op_from_position(SourcePosition::raw(1)))
-                .transpose()?,
-            last_raw: (new_cursor.ops_emitted > 0)
-                .then(|| stream.op_from_position(SourcePosition::raw(new_cursor.ops_emitted)))
-                .transpose()?,
-            markers: Vec::new(),
-            completions: Vec::new(),
-            legacy_completions: Vec::new(),
-        };
-
-        // Capture exact lifecycle endpoints from the complete helper
-        // projection, including metadata-only version upgrades. Endpoints are
-        // physical source occurrences, so their IDs do not depend on derived
-        // lane allocation or on whether this batch replayed normalized rows.
-        if options.normalize {
-            collect_topology_evidence(&projection.final_items, &stream, &mut topo)?;
-        }
-
         // Emit raw ops for the new lines, chaining across the cursor boundary.
         let mut prev_raw_id = if start_seq > 0 {
             Some(stream.op_from_position(SourcePosition::raw(start_seq))?)
         } else {
             None
         };
-        let mut clocks: Vec<Clock> = Vec::with_capacity(lines.len());
         for (i, line) in lines.iter().enumerate() {
+            options.cancellation.check(&rollout.path)?;
             let seq = start_seq + i as u64 + 1;
             let op = build_raw_op(
                 &line.data,
@@ -455,9 +316,7 @@ pub fn import_codex(
                 prev_raw_id,
                 blobs,
             )?;
-            clocks.push(op.clock);
-            let _: bool = ops.accept_op(&op)?;
-            report.raw_ops += 1;
+            emit_op(&op, ops, &mut report, EmissionKind::Raw)?;
             prev_raw_id = Some(op.id);
         }
 
@@ -480,8 +339,7 @@ pub fn import_codex(
             ) {
                 let title_op =
                     session_title_op(title, &owning_thread, session_id, first_raw, blobs)?;
-                let accepted = ops.accept_op(&title_op)?;
-                report.normalized_ops = report.normalized_ops.saturating_add(usize::from(accepted));
+                emit_op(&title_op, ops, &mut report, EmissionKind::Derived)?;
             }
         }
 
@@ -500,155 +358,57 @@ pub fn import_codex(
             ) {
                 if source_ordinal <= raw_batch_end {
                     if let Some(op) = session_git_link_op(
-                        &request.workspace_path,
+                        request.repositories,
                         meta,
                         source_ordinal,
                         &stream,
                         session_id,
                     )? {
-                        let _: bool = ops.accept_op(&op)?;
-                        report.normalized_ops += 1;
+                        emit_op(&op, ops, &mut report, EmissionKind::Derived)?;
                     }
                 }
             }
         }
 
-        // Emit normalized ops: fresh items (first seen after the cursor)
-        // anchored at their first-seen ordinal, deterministic update ops for
-        // items first seen before the cursor but changed after it (anchored at
-        // their last-seen ordinal), and per-line inter-agent/compaction lanes.
-        // All normalized ops at one ordinal share the derived lane counters so
-        // ids never collide and stay deterministic across repeated runs.
         if options.normalize {
-            let batch_end = start_seq + lines.len() as u64;
-            let clock_at = |ordinal: u64| -> Clock {
-                let clock_idx = usize::try_from(ordinal - start_seq - 1)
-                    .expect("anchor ordinal fits usize and is within the batch");
-                *clocks
-                    .get(clock_idx)
-                    .expect("anchor ordinal validated against batch line range")
-            };
-            let mut ctx = NormalizeContext {
+            let mut context = NormalizeContext {
                 stream: &stream,
                 thread: &owning_thread,
                 session_id,
                 lanes: std::collections::HashMap::new(),
-                batch_end,
+                batch_end: new_cursor.ops_emitted,
                 include_thinking: options.include_thinking,
                 blobs,
             };
-            for item in &projection.final_items {
-                if item.first_seen > start_seq {
-                    // Fresh item: anchor at first-seen. Items anchored to a
-                    // trailing partial line emit on a later run once the line
-                    // completes (fold state is recomputed per run).
-                    if item.first_seen > batch_end {
-                        continue;
-                    }
-                    let first_seen_clock = clock_at(item.first_seen);
-                    let last_seen_clock = if item.last_seen <= batch_end {
-                        clock_at(item.last_seen)
-                    } else {
-                        first_seen_clock
-                    };
-                    let item_ops = normalized_ops_for_item(
-                        item,
-                        ItemAnchor::FirstSeen,
-                        first_seen_clock,
-                        last_seen_clock,
-                        &mut ctx,
-                    )?;
-                    for op in &item_ops {
-                        let _: bool = ops.accept_op(op)?;
-                        report.normalized_ops += 1;
-                    }
-                } else if item.last_seen > start_seq {
-                    // Deterministic update: first seen before the cursor,
-                    // changed after it. Emit the final state anchored at the
-                    // change ordinal so no stale content is left behind.
-                    if item.last_seen > batch_end {
-                        continue;
-                    }
-                    let item_ops = normalized_ops_for_item(
-                        item,
-                        ItemAnchor::LastSeen,
-                        clock_at(item.last_seen),
-                        clock_at(item.last_seen),
-                        &mut ctx,
-                    )?;
-                    for op in &item_ops {
-                        let _: bool = ops.accept_op(op)?;
-                        report.normalized_ops += 1;
-                    }
-                }
-            }
-            for line in &projection.inter_agent_lines {
-                if line.source_ordinal <= start_seq || line.source_ordinal > batch_end {
-                    continue;
-                }
-                let line_ops =
-                    normalized_ops_for_inter_agent(line, clock_at(line.source_ordinal), &mut ctx)?;
-                for op in &line_ops {
-                    let _: bool = ops.accept_op(op)?;
-                    report.normalized_ops += 1;
-                }
-            }
-            for line in &projection.compacted_lines {
-                if line.source_ordinal <= start_seq || line.source_ordinal > batch_end {
-                    continue;
-                }
-                let line_ops =
-                    normalized_ops_for_compaction(line, clock_at(line.source_ordinal), &mut ctx)?;
-                for op in &line_ops {
-                    let _: bool = ops.accept_op(op)?;
-                    report.normalized_ops += 1;
-                }
-            }
-            // Persist turn identity and metadata: one provider-neutral note per
-            // fresh turn, anchored at the turn's first-seen ordinal. Lanes are
-            // allocated after the item/inter-agent/compaction lanes at that
-            // ordinal, so op ids stay deterministic and existing anchors are
-            // untouched.
-            let mut items_by_turn: std::collections::HashMap<&str, (u64, usize)> =
-                std::collections::HashMap::new();
-            for item in &projection.final_items {
-                if item.first_seen <= start_seq {
-                    continue;
-                }
-                let entry = items_by_turn
-                    .entry(item.turn_id.as_str())
-                    .or_insert((item.first_seen, 0));
-                entry.0 = entry.0.min(item.first_seen);
-                entry.1 += 1;
-            }
-            for turn in &projection.turns {
-                let Some((first_ordinal, item_count)) = items_by_turn.get(turn.turn_id.as_str())
-                else {
-                    continue;
-                };
-                let first_ordinal = *first_ordinal;
-                let item_count = *item_count;
-                if first_ordinal > batch_end {
-                    continue;
-                }
-                let turn_ops = normalized_ops_for_turn(
-                    turn,
-                    first_ordinal,
-                    item_count,
-                    clock_at(first_ordinal),
-                    &mut ctx,
-                )?;
-                for op in &turn_ops {
-                    let _: bool = ops.accept_op(op)?;
-                    report.normalized_ops += 1;
-                }
-            }
+            let derived = super::materialize::emit_occurrences(
+                &projection,
+                &plan,
+                &mut context,
+                ops,
+                needs_materialization_replay,
+            )?;
+            report.merge_emissions(&derived);
+            new_cursor.materialization = Some(crate::sink::MaterializationCheckpoint {
+                contract: super::materialize::CONTRACT.to_owned(),
+                through: new_cursor.ops_emitted,
+                includes_thinking: options.include_thinking,
+            });
         }
 
         // Only persist the cursor after the whole file succeeded. The version
         // checkpoint makes metadata-only upgrades one-shot while preserving a
         // future version written by a newer importer.
         if options.normalize {
+            for evidence in super::evidence::source_evidence_ops(
+                &projection,
+                &plan,
+                &stream,
+                &owning_thread,
+                full_read || needs_evidence_upgrade,
+            )? {
+                options.cancellation.check(&rollout.path)?;
+                emit_op(&evidence, ops, &mut report, EmissionKind::Derived)?;
+            }
             new_cursor.normalization_version = new_cursor
                 .normalization_version
                 .max(CODEX_NORMALIZATION_VERSION);
@@ -656,164 +416,21 @@ pub fn import_codex(
                 new_cursor.session_title_hash = Some(title.source_hash);
             }
         }
+        if !options.normalize && new_cursor.ops_emitted > start_seq {
+            // The metadata version no longer covers the full accepted raw
+            // prefix. Replaying exact facts fills this gap on normalization.
+            new_cursor.normalization_version = 0;
+        }
         new_cursor.source_node = Some(source_node);
         new_cursor.content_hash_version = 1;
-        if migrates_legacy_key && boot > 0 {
+        options.cancellation.check(&rollout.path)?;
+        if boot > 0 {
             cursors.set_generation(&cursor_key, boot)?;
         }
         cursors.set_cursor(&cursor_key, &new_cursor)?;
-        if options.normalize {
-            topology.push(topo);
-        }
-    }
-
-    // Sink-independent exact topology pass. Missing or ambiguous visible
-    // endpoints remain unlinked; no timestamp/file-order fallback is allowed.
-    let relationship_notes = emit_codex_relationship_notes(&topology)?;
-    for note in &relationship_notes {
-        let _: bool = ops.accept_op(note)?;
-        report.normalized_ops += 1;
     }
 
     Ok(report)
-}
-
-/// Collect exact lifecycle endpoints from a complete helper projection.
-///
-/// The bridge projection is always computed over the whole rollout, including
-/// on an incremental append or metadata-only upgrade. Anchoring evidence to raw
-/// source occurrences keeps relation identity independent from normalized lane
-/// allocation. Evidence on a trailing partial line is ignored until that line
-/// becomes a durable raw occurrence on a later import.
-fn collect_topology_evidence(
-    items: &[FinalItem],
-    stream: &SourceStream,
-    topology: &mut ThreadTopology,
-) -> Result<(), ImportError> {
-    let last_complete_ordinal = topology.last_raw.map_or(0, |op| op.seq >> 16);
-    for item in items {
-        if collect_subagent_activity_marker(item, stream, topology, last_complete_ordinal)? {
-            continue;
-        }
-        collect_collab_spawn_markers(item, stream, topology, last_complete_ordinal)?;
-
-        if item.kind != ProjectionKind::Tool
-            || item.last_seen == 0
-            || item.last_seen > last_complete_ordinal
-        {
-            continue;
-        }
-        let evidence_op = stream.op_from_position(SourcePosition::raw(item.last_seen))?;
-        if let Some(agents_states) = item.payload.get("agentsStates").and_then(Value::as_object) {
-            for (child_thread, state) in agents_states {
-                let completed = state
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .is_some_and(|status| status.eq_ignore_ascii_case("completed"));
-                if completed {
-                    topology.completions.push(CompletionEvidence {
-                        agent_thread_id: child_thread.clone(),
-                        op_id: evidence_op,
-                    });
-                }
-            }
-        }
-        if item.payload.get("tool").and_then(Value::as_str) == Some("list_agents") {
-            for agent_path in completed_agent_paths_from_tool(&item.payload) {
-                topology.legacy_completions.push(LegacyCompletionEvidence {
-                    agent_path,
-                    op_id: evidence_op,
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Preserve the older dedicated subagent-activity activation signal.
-fn collect_subagent_activity_marker(
-    item: &FinalItem,
-    stream: &SourceStream,
-    topology: &mut ThreadTopology,
-    last_complete_ordinal: u64,
-) -> Result<bool, ImportError> {
-    if item.kind != ProjectionKind::Note
-        || item.first_seen == 0
-        || item.first_seen > last_complete_ordinal
-    {
-        return Ok(false);
-    }
-    let Some(agent_thread) = item
-        .payload
-        .get("agentThreadId")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(true);
-    };
-    topology.markers.push(ActivityMarker {
-        agent_thread_id: agent_thread.to_string(),
-        agent_path: item
-            .payload
-            .get("agentPath")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(ToString::to_string),
-        op_id: stream.op_from_position(SourcePosition::raw(item.first_seen))?,
-        started: item
-            .payload
-            .get("activityKind")
-            .and_then(Value::as_str)
-            .is_some_and(|kind| kind.eq_ignore_ascii_case("started")),
-        signal: SPAWN_SIGNAL_SUBAGENT_ACTIVITY,
-    });
-    Ok(true)
-}
-
-/// Capture the exact activation shape emitted by current Codex rollouts.
-fn collect_collab_spawn_markers(
-    item: &FinalItem,
-    stream: &SourceStream,
-    topology: &mut ThreadTopology,
-    last_complete_ordinal: u64,
-) -> Result<(), ImportError> {
-    if item.kind != ProjectionKind::Tool
-        || item.first_seen == 0
-        || item.first_seen > last_complete_ordinal
-        || item
-            .payload
-            .get("tool")
-            .and_then(Value::as_str)
-            .is_none_or(|tool| tool != "spawnAgent")
-        || item.payload.get("senderThreadId").and_then(Value::as_str)
-            != Some(topology.thread_id.as_str())
-    {
-        return Ok(());
-    }
-    let Some(receivers) = item
-        .payload
-        .get("receiverThreadIds")
-        .and_then(Value::as_array)
-    else {
-        return Ok(());
-    };
-    let occurrence = stream.op_from_position(SourcePosition::raw(item.first_seen))?;
-    let receiver_threads: BTreeSet<String> = receivers
-        .iter()
-        .filter_map(Value::as_str)
-        .filter(|thread| !thread.is_empty())
-        .map(ToString::to_string)
-        .collect();
-    for agent_thread_id in receiver_threads {
-        topology.markers.push(ActivityMarker {
-            agent_thread_id,
-            agent_path: None,
-            op_id: occurrence,
-            started: true,
-            signal: SPAWN_SIGNAL_COLLAB_TOOL,
-        });
-    }
-    Ok(())
 }
 
 /// Decide whether a rollout belongs to the requested workspace.
@@ -923,18 +540,4 @@ fn validate_new_line_records(
         }),
         None => Ok(()),
     }
-}
-
-/// Detect a trailing partial line (bytes after the last complete line) and
-/// whether it is whitespace-only, mirroring the bridge's physical line count.
-fn trailing_partial(
-    path: &Path,
-    cursor: &crate::sink::CursorValue,
-) -> Result<(bool, bool), ImportError> {
-    if cursor.file_size <= cursor.byte_offset {
-        return Ok((false, false));
-    }
-    let (tail, _hash) = read_new_bytes(path, cursor.byte_offset)?;
-    let blank = tail.iter().all(u8::is_ascii_whitespace);
-    Ok((true, blank))
 }

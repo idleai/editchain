@@ -11,13 +11,17 @@ use serde as _;
 use editchain_project as _;
 #[cfg(test)]
 use proptest as _;
-#[cfg(test)]
-use tempfile as _;
 
+/// Capture batches and ordered operation/checkpoint persistence.
+pub mod batch;
+/// Cooperative cancellation of source capture and helper execution.
+pub mod cancellation;
 /// Cursor-based incremental file reading.
 pub mod cursor;
 /// Import error types.
 pub mod error;
+/// Typed provider observations for host-owned Git reconciliation.
+pub mod git_evidence;
 /// Deterministic ID derivation for import.
 pub mod ids;
 /// Main import orchestrator.
@@ -26,6 +30,10 @@ pub mod import;
 pub mod model;
 /// Pluggable output sinks (ops, blobs, cursors).
 pub mod sink;
+/// Captured source bytes and shared incremental read plans.
+pub mod source_read;
+/// Validated, provider-neutral source timestamp parsing.
+pub mod source_time;
 
 /// Claude Code session import pipeline.
 pub mod claude_code;

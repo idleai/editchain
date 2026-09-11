@@ -12,10 +12,7 @@ use gix_object as _;
 use sha2 as _;
 
 use editchain_core::GitOid;
-use editchain_git::{
-    commit_file_changes, repository_id_from_path, resolve_blob, GitFileStatus, RepositoryDiscovery,
-    RepositoryHandle,
-};
+use editchain_git::{commit_file_changes, resolve_blob, GitFileStatus, RepositoryHandle};
 
 fn run(repo: &std::path::Path, args: &[&str]) {
     let status = Command::new("git")
@@ -62,11 +59,8 @@ fn oid(repo: &std::path::Path, revision: &str) -> GitOid {
 fn handle(repo: &std::path::Path) -> RepositoryHandle {
     RepositoryHandle {
         repo: gix::open(repo).expect("open repository"),
-        discovery: RepositoryDiscovery {
-            id: repository_id_from_path(repo),
-            path: repo.to_path_buf(),
-            is_worktree: false,
-        },
+        discovery: editchain_git::RepositoryDiscovery::from_path(repo)
+            .expect("describe repository"),
     }
 }
 

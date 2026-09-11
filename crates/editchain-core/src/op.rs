@@ -1,5 +1,3 @@
-#[cfg(not(feature = "use-std"))]
-use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 use crate::clock::Clock;
@@ -38,6 +36,20 @@ pub struct Op {
 }
 
 impl Op {
+    /// Observed source time, respecting explicit unknown-time provenance.
+    ///
+    /// `SOURCE_TIME_UNKNOWN` overrides the stored clock. Absent clocks,
+    /// logical counters, and legacy zero wall times are also undated. Reading
+    /// this adapter never rewrites the immutable clock or tags.
+    #[must_use]
+    pub const fn observed_unix_ms(&self) -> Option<u64> {
+        if self.tags.matches_any(Tags::SOURCE_TIME_UNKNOWN) {
+            None
+        } else {
+            self.clock.observed_unix_ms()
+        }
+    }
+
     /// Create a new operation with the given fields.
     #[expect(
         clippy::too_many_arguments,
@@ -420,6 +432,10 @@ pub enum NoteRelationship {
     /// diamonds. Provider conversation ancestry is carried independently by
     /// [`Self::ProviderParent`].
     ToolResultOf,
+    /// Versioned provider source or lifecycle evidence. The note's parent is
+    /// its physical raw occurrence; content follows [`crate::provider`]. These
+    /// observations do not themselves assert a resolved graph edge.
+    ProviderEvidence,
 }
 
 // ---------------------------------------------------------------------------

@@ -10,13 +10,16 @@
     reason = "Test file; dependencies used by library macros"
 )]
 
-use editchain_core::{NodeId, OpId, OpSet};
+use editchain_core::{Admission, NodeId, OpId, OpSet};
 use proptest::prelude::*;
 
 /// Generate an arbitrary `OpId`.
 fn arb_opid() -> impl Strategy<Value = OpId> {
-    (any::<u64>(), any::<u32>(), any::<u64>())
-        .prop_map(|(node, boot, seq)| OpId::new(NodeId(node), boot, seq))
+    prop_oneof![
+        4 => (0u64..2, 0u32..2, 0u64..3),
+        1 => (any::<u64>(), any::<u32>(), any::<u64>()),
+    ]
+    .prop_map(|(node, boot, seq)| OpId::new(NodeId(node), boot, seq))
 }
 
 /// Generate an arbitrary encoded operation (just random bytes keyed by `OpId`).
@@ -35,8 +38,8 @@ fn arb_opset(max_ops: usize) -> impl Strategy<Value = OpSet> {
     proptest::collection::vec(arb_op_entry(), 0..max_ops).prop_map(|entries| {
         let mut opset = OpSet::new();
         for (id, bytes) in entries {
-            // Ignore duplicates and quarantined entries — we just want valid inserts.
-            let _: Option<bool> = opset.insert(id, bytes).ok();
+            // Retain conflicts too: merge laws must cover all evidence.
+            let _: Admission = opset.insert(id, bytes);
         }
         opset
     })
@@ -69,8 +72,9 @@ proptest! {
         let _ = merged_ba.merge(&a);
 
         // Both orders should result in the same set of accepted ops.
+        prop_assert_eq!(&merged_ab, &merged_ba);
         prop_assert_eq!(merged_ab.len(), merged_ba.len());
-        prop_assert_eq!(merged_ab.quarantined().len(), merged_ba.quarantined().len());
+        prop_assert_eq!(merged_ab.conflicts().count(), merged_ba.conflicts().count());
 
         // Every op in merged_ab should be in merged_ba and vice versa.
         for (id, bytes) in merged_ab.iter() {
@@ -109,8 +113,9 @@ proptest! {
         let _ = right.merge(&a);
         let _ = right.merge(&bc);
 
+        prop_assert_eq!(&left, &right);
         prop_assert_eq!(left.len(), right.len());
-        prop_assert_eq!(left.quarantined().len(), right.quarantined().len());
+        prop_assert_eq!(left.conflicts().count(), right.conflicts().count());
 
         for (id, bytes) in left.iter() {
             let id_str = format!("{id}");
@@ -135,32 +140,30 @@ proptest! {
         let _ = merged.merge(&a);
 
         // Merging again should not change anything.
-        let len_before = merged.len();
-        let qlen_before = merged.quarantined().len();
+        let evidence_before = merged.evidence().count();
         let (accepted, duplicates, quarantined) = merged.merge(&a);
         prop_assert_eq!(accepted, 0);
-        prop_assert_eq!(duplicates, len_before);
-        prop_assert_eq!(quarantined, qlen_before);
+        prop_assert_eq!(duplicates, evidence_before);
+        prop_assert_eq!(quarantined, 0);
+        prop_assert_eq!(merged, a);
     }
 
     // -----------------------------------------------------------------------
-    // Insert-then-contains: every inserted op is visible
+    // Every record survives; visibility requires unambiguous bytes.
     // -----------------------------------------------------------------------
     #[test]
-    fn insert_then_contains(
+    fn insert_retains_evidence_and_excludes_conflicts(
         entries in proptest::collection::vec(arb_op_entry(), 0..20),
     ) {
         let mut opset = OpSet::new();
-        let mut expected_ids: Vec<OpId> = Vec::new();
-
         for (id, bytes) in &entries {
-            let id_str = format!("{id}");
-            if opset.insert(*id, bytes.clone()).unwrap_or(false) {
-                expected_ids.push(*id);
-            }
-            prop_assert!(opset.contains(id), "op {} not found after insert", id_str);
+            let _: Admission = opset.insert(*id, bytes.clone());
         }
-
-        prop_assert_eq!(opset.len(), expected_ids.len());
+        for (id, bytes) in &entries {
+            prop_assert!(opset.evidence().any(|(key, value)| key == id && value == bytes));
+            let has_conflict = entries.iter().any(|(other_id, other_bytes)| other_id == id && other_bytes != bytes);
+            prop_assert_eq!(opset.contains(id), !has_conflict);
+        }
+        prop_assert_eq!(opset.len(), opset.iter().count());
     }
 }

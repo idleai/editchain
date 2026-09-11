@@ -1,12 +1,11 @@
 //! Exact Codex session-start Git anchoring.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use editchain_core::{
     ActorId, Clock, GitLink, GitLinkKind, GitOid, Op, OpKind, ParentSet, RepositoryId, ScopeRef,
     SessionId, Tags,
 };
-use sha2::{Digest, Sha256};
 
 use super::projection::SessionMeta;
 use crate::error::ImportError;
@@ -18,13 +17,30 @@ use crate::ids::{SourcePosition, SourceStream};
 /// immediately below them avoids collisions with ordinary normalized lanes.
 const SESSION_GIT_LINK_LANE: u16 = 0xFFF9;
 
+/// Repository identity supplied by the host's catalog, independent of the
+/// source-format importer. The unit implementation supplies no repositories.
+pub trait RepositoryLookup: std::fmt::Debug {
+    /// Resolve an exact recorded working directory to a repository identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when incomplete discovery cannot establish identity.
+    fn repository_for_cwd(&self, cwd: &Path) -> Result<Option<RepositoryId>, ImportError>;
+}
+
+impl RepositoryLookup for () {
+    fn repository_for_cwd(&self, _cwd: &Path) -> Result<Option<RepositoryId>, ImportError> {
+        Ok(None)
+    }
+}
+
 /// Build the exact `session_meta.git.commit_hash` relation for one Codex file.
 ///
 /// No fallback is inferred. The link exists only when Codex supplied a valid
 /// full SHA-1/SHA-256 hash and the recorded session cwd resolves to an actual
 /// repository inside the imported workspace.
 pub(super) fn session_git_link_op(
-    workspace: &Path,
+    repositories: &dyn RepositoryLookup,
     meta: &SessionMeta,
     source_ordinal: u64,
     stream: &SourceStream,
@@ -39,7 +55,11 @@ pub(super) fn session_git_link_op(
     let Some(cwd) = meta.cwd.as_deref() else {
         return Ok(None);
     };
-    let Some(repository_marker) = repository_marker(workspace, cwd) else {
+    let cwd = Path::new(cwd);
+    if !cwd.is_absolute() {
+        return Ok(None);
+    }
+    let Some(target_repo) = repositories.repository_for_cwd(cwd)? else {
         return Ok(None);
     };
 
@@ -57,60 +77,9 @@ pub(super) fn session_git_link_op(
         tags: Tags::META | Tags::IMPORT,
         kind: OpKind::GitLink(GitLink {
             source,
-            target_repo: repository_id_from_path(&repository_marker),
+            target_repo,
             target_oid,
             kind: GitLinkKind::BasedOn,
         }),
     }))
-}
-
-/// Resolve the nearest repository marker at or above the recorded cwd, never
-/// escaping the imported workspace. This is path identity, not guesswork: if
-/// the marker is absent, the session gets no Git relation.
-fn repository_marker(workspace: &Path, cwd: &str) -> Option<PathBuf> {
-    let cwd = Path::new(cwd);
-    if cwd.is_relative() {
-        return None;
-    }
-    let workspace = canonical_or_literal(&absolute_workspace(workspace));
-    let mut current = canonical_or_literal(cwd);
-    if !current.starts_with(&workspace) {
-        return None;
-    }
-
-    loop {
-        let marker = current.join(".git");
-        if marker.exists() {
-            return Some(marker);
-        }
-        if current == workspace || !current.pop() {
-            return None;
-        }
-    }
-}
-
-fn absolute_workspace(workspace: &Path) -> PathBuf {
-    if workspace.is_absolute() {
-        workspace.to_path_buf()
-    } else {
-        std::env::current_dir().map_or_else(|_| workspace.to_path_buf(), |cwd| cwd.join(workspace))
-    }
-}
-
-fn canonical_or_literal(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// Mirror `editchain_git::repository_id_from_path` without coupling the
-/// source-format importer to the live Git/object-resolution crate.
-#[expect(
-    clippy::indexing_slicing,
-    reason = "SHA-256 output is always at least 8 bytes"
-)]
-fn repository_id_from_path(path: &Path) -> RepositoryId {
-    let canonical = canonical_or_literal(path);
-    let digest = Sha256::digest(canonical.to_string_lossy().as_bytes());
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&digest[..8]);
-    RepositoryId(u64::from_le_bytes(bytes))
 }

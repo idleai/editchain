@@ -7,8 +7,8 @@ use serde as _;
 
 use editchain_core::{
     ActorId, Clock, GitAvailability, GitCommitEntity, GitLink, GitLinkKind, GitObjectFormat,
-    GitOid, GitProjection, GitSignature, NodeId, Op, OpId, OpKind, ParentSet, PathId, Payload,
-    RepositoryId, ScopeRef, Tags,
+    GitOid, GitSignature, NodeId, Op, OpId, OpKind, ParentSet, PathId, Payload, RepositoryId,
+    ScopeRef, Tags,
 };
 
 fn sha1(bytes: [u8; 20]) -> GitOid {
@@ -20,21 +20,57 @@ fn sha256(bytes: [u8; 32]) -> GitOid {
 }
 
 #[test]
+fn qualified_commit_keys_preserve_full_repository_identity() {
+    use editchain_core::GitCommitKey;
+    let oid = sha1([0xab; 20]);
+    let key = GitCommitKey::new(RepositoryId(u64::MAX), oid);
+    assert_eq!(GitCommitKey::from_display_str(&key.to_string()), Some(key));
+    assert!(GitCommitKey::from_display_str(&oid.to_hex()).is_none());
+    assert_ne!(
+        key.to_string(),
+        GitCommitKey::new(RepositoryId(1), oid).to_string()
+    );
+}
+
+#[test]
 fn oid_sha1_pads_to_32_bytes() {
     let oid = sha1([0xab; 20]);
-    assert_eq!(oid.format, GitObjectFormat::Sha1);
+    assert_eq!(oid.format(), GitObjectFormat::Sha1);
     assert_eq!(oid.digest_len(), 20);
     // First 20 bytes are the digest; the rest are zero.
-    assert_eq!(&oid.bytes[..20], &[0xab; 20]);
-    assert_eq!(&oid.bytes[20..], &[0u8; 12]);
+    assert_eq!(&oid.as_bytes()[..20], &[0xab; 20]);
+    assert_eq!(&oid.as_bytes()[20..], &[0u8; 12]);
 }
 
 #[test]
 fn oid_sha256_uses_all_bytes() {
     let oid = sha256([0xcd; 32]);
-    assert_eq!(oid.format, GitObjectFormat::Sha256);
+    assert_eq!(oid.format(), GitObjectFormat::Sha256);
     assert_eq!(oid.digest_len(), 32);
-    assert_eq!(&oid.bytes[..], &[0xcd; 32]);
+    assert_eq!(&oid.as_bytes()[..], &[0xcd; 32]);
+}
+
+#[test]
+fn oid_decode_preserves_canonical_wire_bytes_and_rejects_sha1_aliases() {
+    for (format_tag, oid) in [(0, sha1([0xab; 20])), (1, sha256([0xcd; 32]))] {
+        let mut bytes = vec![format_tag];
+        bytes.extend_from_slice(oid.as_bytes());
+        assert_eq!(postcard::to_stdvec(&oid).unwrap(), bytes);
+        assert_eq!(postcard::from_bytes::<GitOid>(&bytes).unwrap(), oid);
+        assert_eq!(GitOid::new(oid.format(), *oid.as_bytes()), Some(oid));
+    }
+    for padding_index in 20..32 {
+        let mut storage = *sha1([0xab; 20]).as_bytes();
+        *storage.get_mut(padding_index).unwrap() = 1;
+        assert_eq!(GitOid::new(GitObjectFormat::Sha1, storage), None);
+        let bytes = postcard::to_stdvec(&(GitObjectFormat::Sha1, storage)).unwrap();
+        assert!(postcard::from_bytes::<GitOid>(&bytes).is_err());
+        // The same bytes are significant and valid under SHA-256.
+        assert_eq!(
+            GitOid::new(GitObjectFormat::Sha256, storage),
+            Some(sha256(storage))
+        );
+    }
 }
 
 #[test]
@@ -152,129 +188,4 @@ fn git_link_kind_custom_payload() {
     let encoded = postcard::to_stdvec(&link).expect("encode failed");
     let decoded: GitLink = postcard::from_bytes(&encoded).expect("decode failed");
     assert_eq!(decoded.kind, link.kind);
-}
-
-fn commit_op(id: OpId, repo: RepositoryId, oid: GitOid) -> Op {
-    let commit = GitCommitEntity {
-        repository: repo,
-        object_format: oid.format,
-        oid,
-        imported_record: Some(id),
-        availability: GitAvailability::ImportedOnly,
-        tree: sha1([0x02; 20]),
-        parents: Vec::new(),
-        author: GitSignature {
-            name: Payload::Inline(b"Alice".to_vec()),
-            email: Payload::Inline(b"alice@example.com".to_vec()),
-            when: 1_700_000_000,
-        },
-        committer: GitSignature {
-            name: Payload::Inline(b"Alice".to_vec()),
-            email: Payload::Inline(b"alice@example.com".to_vec()),
-            when: 1_700_000_100,
-        },
-        authored_at: 1_700_000_000,
-        committed_at: 1_700_000_100,
-        message: Payload::Inline(b"commit".to_vec()),
-        imported_refs: Vec::new(),
-        live_refs: Vec::new(),
-        changed_paths: Vec::new(),
-    };
-    Op {
-        id,
-        parents: ParentSet::None,
-        actor: ActorId(3),
-        clock: Clock::UnixMs(1_700_000_000),
-        scope: ScopeRef::None,
-        tags: Tags::IMPORT,
-        kind: OpKind::GitCommit(Box::new(commit)),
-    }
-}
-
-#[test]
-fn projection_dedups_same_commit_by_repo_and_oid() {
-    // Two different ops importing the same (repo, oid) collapse to one entity.
-    let oid = sha1([0x01; 20]);
-    let repo = RepositoryId(7);
-    let op_a = commit_op(OpId::new(NodeId(1), 0, 5), repo, oid);
-    let op_b = commit_op(OpId::new(NodeId(2), 0, 9), repo, oid);
-
-    let proj = GitProjection::from_ops(&[op_a, op_b]);
-    assert_eq!(proj.commits.len(), 1);
-    assert!(proj.commit(repo, &oid).is_some());
-}
-
-#[test]
-fn projection_distinguishes_repositories() {
-    // Same OID in two different repositories are distinct entities.
-    let oid = sha1([0x01; 20]);
-    let op_a = commit_op(OpId::new(NodeId(1), 0, 5), RepositoryId(7), oid);
-    let op_b = commit_op(OpId::new(NodeId(2), 0, 9), RepositoryId(8), oid);
-
-    let proj = GitProjection::from_ops(&[op_a, op_b]);
-    assert_eq!(proj.commits.len(), 2);
-}
-
-#[test]
-fn projection_groups_links_by_source() {
-    let source = OpId::new(NodeId(1), 0, 5);
-    let link_a = GitLink {
-        source,
-        target_repo: RepositoryId(7),
-        target_oid: sha1([0x01; 20]),
-        kind: GitLinkKind::CommittedAs,
-    };
-    let link_b = GitLink {
-        source,
-        target_repo: RepositoryId(7),
-        target_oid: sha1([0x02; 20]),
-        kind: GitLinkKind::BasedOn,
-    };
-    let op_a = Op {
-        id: OpId::new(NodeId(2), 0, 10),
-        parents: ParentSet::None,
-        actor: ActorId(3),
-        clock: Clock::UnixMs(1_700_000_000),
-        scope: ScopeRef::None,
-        tags: Tags::NOTE,
-        kind: OpKind::GitLink(link_a),
-    };
-    let op_b = Op {
-        id: OpId::new(NodeId(2), 0, 11),
-        parents: ParentSet::None,
-        actor: ActorId(3),
-        clock: Clock::UnixMs(1_700_000_000),
-        scope: ScopeRef::None,
-        tags: Tags::NOTE,
-        kind: OpKind::GitLink(link_b),
-    };
-
-    let proj = GitProjection::from_ops(&[op_a, op_b]);
-    assert_eq!(proj.links_from(&source).len(), 2);
-}
-
-#[test]
-fn projection_link_is_not_a_causal_parent() {
-    // A git link op must not appear as a causal parent of the commit it links.
-    let source = OpId::new(NodeId(1), 0, 5);
-    let link_op = Op {
-        id: OpId::new(NodeId(2), 0, 10),
-        parents: ParentSet::None,
-        actor: ActorId(3),
-        clock: Clock::UnixMs(1_700_000_000),
-        scope: ScopeRef::None,
-        tags: Tags::NOTE,
-        kind: OpKind::GitLink(GitLink {
-            source,
-            target_repo: RepositoryId(7),
-            target_oid: sha1([0x01; 20]),
-            kind: GitLinkKind::CommittedAs,
-        }),
-    };
-
-    // The link's own causal parents are empty; the projection stores it under
-    // `links`, never under `commits` or as a parent edge.
-    assert!(matches!(link_op.parents, ParentSet::None));
-    let proj = GitProjection::from_ops(&[link_op]);
-    assert!(proj.commits.is_empty());
 }

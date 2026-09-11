@@ -14,22 +14,26 @@ mod common;
 use blake3 as _;
 use editchain_core as _;
 use editchain_project as _;
+use editchain_store as _;
+use process_wrap as _;
 use proptest as _;
 use serde as _;
 use serde_json as _;
-use sha2::{Digest, Sha256};
+use sha2 as _;
 use std::io::Write;
 use std::path::Path;
 use tempfile as _;
+use time as _;
+use tokio as _;
 
 use editchain_core::clock::Clock;
-use editchain_core::op::{CommandStage, OpKind, ToolStage};
+use editchain_core::op::{CommandStage, NoteRelationship, OpKind, ToolStage};
 use editchain_core::payload::Payload;
+use editchain_core::provider::{CodexLifecycleEvent, CodexSpawnSignal, ProviderFact};
 use editchain_core::scope::ScopeRef;
 use editchain_core::tags::Tags;
 
 use editchain_core::parents::ParentSet;
-use editchain_import::claude_code::normalize::parse_source_time;
 use editchain_import::codex::{import_codex, CodexDiscoveryRequest, HelperCommand};
 use editchain_import::cursor::canonical_source_key;
 use editchain_import::error::ImportError;
@@ -41,6 +45,7 @@ use editchain_import::model::ImportOptions;
 use editchain_import::sink::{
     ContentAddressedBlobSink, CursorStore, MemoryCursorStore, MemoryOpSink,
 };
+use editchain_import::source_time::parse_source_time;
 
 use common::*;
 
@@ -68,6 +73,31 @@ fn source_key(root: &Path, path: &Path) -> String {
 
 fn source_stream(root: &Path, path: &Path, boot: u32) -> SourceStream {
     derive_keyed_source_stream(&source_key(root, path), boot)
+}
+
+fn assert_occurrence_anchor(op: &editchain_core::Op, stream: &SourceStream, ordinal: u64) {
+    assert_eq!(
+        op.parents,
+        ParentSet::One(
+            stream
+                .op_from_position(SourcePosition::raw(ordinal))
+                .unwrap()
+        ),
+        "revision references its witnessing raw occurrence"
+    );
+    assert_eq!(
+        op.id.seq >> 16,
+        ordinal,
+        "revision keeps the physical ordinal"
+    );
+    assert_eq!(
+        op.id.boot, stream.boot,
+        "revision keeps the physical generation"
+    );
+    assert_ne!(
+        op.id.node, stream.node,
+        "new revisions cannot reuse legacy numeric lanes"
+    );
 }
 
 /// Line bytes with trailing newline, as stored in the raw lane.
@@ -155,12 +185,317 @@ fn projection_bytes(records: &[serde_json::Value]) -> Vec<u8> {
     out
 }
 
+fn derivation_records() -> Vec<serde_json::Value> {
+    let item = |text: &str| {
+        serde_json::json!({
+            "turnId": "turn-1", "item": {"kind": "agentMessage", "id": "message-1", "text": text}
+        })
+    };
+    let mut removed = line_record(4, Vec::new(), None);
+    removed["projection"]["removedTurnIds"] = serde_json::json!(["turn-1"]);
+    vec![
+        line_record(
+            1,
+            Vec::new(),
+            Some(serde_json::json!({"threadId": "thread-1"})),
+        ),
+        line_record(2, vec![item("original")], None),
+        line_record(3, vec![item("updated")], None),
+        removed,
+        line_record(5, vec![item("reused identity")], None),
+    ]
+}
+
+fn import_projection_prefix(
+    dir: &tempfile::TempDir,
+    records: &[serde_json::Value],
+    options: &ImportOptions,
+    cursors: &mut MemoryCursorStore,
+) -> Harness {
+    let raw: Vec<_> = records
+        .iter()
+        .map(|record| event_line(&record["sourceOrdinal"].to_string()))
+        .collect();
+    write_rollout(dir.path(), "rollout-revisions.jsonl", &raw);
+    let helper = fixed_helper(dir, &projection_bytes(records));
+    import_with_options_into(dir.path(), &helper, options, cursors)
+}
+
+fn canonical_revisions(ops: &[editchain_core::Op]) -> Vec<editchain_core::Op> {
+    let mut by_id = std::collections::BTreeMap::new();
+    for op in ops {
+        let extent = match &op.kind {
+            OpKind::Note(note) if is_provider_evidence(op) => match &note.content {
+                Payload::Inline(content) => serde_json::from_slice::<
+                    editchain_core::provider::ProviderEvidence,
+                >(content)
+                .ok()
+                .is_some_and(|evidence| matches!(evidence.fact, ProviderFact::CodexSource(_))),
+                _ => false,
+            },
+            _ => false,
+        };
+        if extent {
+            continue;
+        }
+        if let Some(existing) = by_id.insert(op.id, op.clone()) {
+            assert_eq!(
+                existing, *op,
+                "replay cannot assign different content to an existing ID"
+            );
+        }
+    }
+    by_id.into_values().collect()
+}
+
+#[test]
+fn occurrence_revisions_and_logical_removals_are_independent_of_append_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let records = derivation_records();
+    let options = ImportOptions::default();
+    let single = import_projection_prefix(&dir, &records, &options, &mut MemoryCursorStore::new());
+    let expected = canonical_revisions(&single.ops.ops);
+    let expected_view = editchain_project::HistoryProjection::from_ops(expected.clone());
+    let messages: Vec<_> = expected
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::Message(_)))
+        .collect();
+    assert_eq!(
+        messages.len(),
+        3,
+        "all immutable revisions survive a later removal"
+    );
+    let item = expected_view.codex_logical_items().first().unwrap();
+    assert_eq!(expected_view.codex_logical_items().len(), 1);
+    assert_eq!(
+        item.incarnation.seq,
+        5 << 16,
+        "reusing an item after removal starts a new incarnation"
+    );
+    for boundaries in [&[2, 3, 4, 5][..], &[1, 5][..], &[3, 5][..]] {
+        let mut cursors = MemoryCursorStore::new();
+        let mut accumulated = Vec::new();
+        for &end in boundaries {
+            let batch = import_projection_prefix(&dir, &records[..end], &options, &mut cursors);
+            accumulated.extend(batch.ops.ops);
+            if end == 4 {
+                let view = editchain_project::HistoryProjection::from_ops(canonical_revisions(
+                    &accumulated,
+                ));
+                assert!(
+                    view.codex_logical_items().is_empty(),
+                    "removal retires the logical item"
+                );
+            }
+        }
+        let actual = canonical_revisions(&accumulated);
+        assert_eq!(
+            actual, expected,
+            "same immutable revisions for boundaries {boundaries:?}"
+        );
+        let mut reversed = actual.clone();
+        reversed.reverse();
+        let view = editchain_project::HistoryProjection::from_ops(reversed);
+        assert_eq!(
+            view.codex_logical_items(),
+            expected_view.codex_logical_items()
+        );
+        assert_eq!(
+            view.ops().len(),
+            actual.len(),
+            "projection retains every admitted operation"
+        );
+    }
+}
+
+#[test]
+fn occurrence_materialization_replaces_legacy_content_and_rejects_incomplete_revisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let records = derivation_records();
+    let imported = import_projection_prefix(
+        &dir,
+        &records,
+        &ImportOptions::default(),
+        &mut MemoryCursorStore::new(),
+    );
+    let mut ops = canonical_revisions(&imported.ops.ops);
+    let mut legacy = ops
+        .iter()
+        .find(|op| matches!(op.kind, OpKind::Message(_)))
+        .unwrap()
+        .clone();
+    let source = *legacy.parents.iter().next().unwrap();
+    legacy.id = editchain_core::OpId {
+        seq: source.seq | 1,
+        ..source
+    };
+    if let OpKind::Message(message) = &mut legacy.kind {
+        message.content = Payload::Inline(b"stale legacy fold".to_vec());
+    }
+    ops.push(legacy.clone());
+    let view = editchain_project::HistoryProjection::from_ops(ops.clone());
+    assert!(view
+        .nodes()
+        .iter()
+        .all(|node| !node.summary().contains("stale legacy fold")));
+    assert!(
+        view.ops().contains(&legacy),
+        "compatibility does not rewrite or delete the old record"
+    );
+    let latest = view.codex_logical_items().first().unwrap().outputs[0];
+    let missing_header: Vec<_> = ops
+        .iter()
+        .filter(|op| !(matches!(op.kind, OpKind::Import(_)) && op.id.seq == 1 << 16))
+        .cloned()
+        .collect();
+    assert!(
+        editchain_project::HistoryProjection::from_ops(missing_header)
+            .codex_logical_items()
+            .is_empty(),
+        "an incomplete physical prefix cannot establish current logical state"
+    );
+    ops.retain(|op| op.id != latest);
+    let incomplete = editchain_project::HistoryProjection::from_ops(ops);
+    assert!(
+        incomplete.codex_logical_items().is_empty(),
+        "missing materialized evidence cannot revive prior logical state"
+    );
+    assert!(incomplete
+        .nodes()
+        .iter()
+        .all(|node| !node.summary().contains("stale legacy fold")));
+}
+
+#[test]
+fn reasoning_and_raw_only_backfills_preserve_public_revision_ids() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut records = derivation_records();
+    records.truncate(3);
+    records[1]["projection"]["changedItems"].as_array_mut().unwrap().insert(0, serde_json::json!({
+        "turnId": "turn-1", "item": {"kind": "reasoning", "id": "reasoning-1", "summary": ["private summary"]}
+    }));
+    let mut cursors = MemoryCursorStore::new();
+    let hidden =
+        import_projection_prefix(&dir, &records[..2], &ImportOptions::default(), &mut cursors);
+    assert!(!hidden
+        .ops
+        .ops
+        .iter()
+        .any(|op| matches!(op.kind, OpKind::Reflection(_))));
+    let shown_options = ImportOptions {
+        include_thinking: true,
+        ..ImportOptions::default()
+    };
+    let shown = import_projection_prefix(&dir, &records[..2], &shown_options, &mut cursors);
+    assert_eq!(shown.report.raw_ops, 0);
+    assert!(shown
+        .ops
+        .ops
+        .iter()
+        .any(|op| matches!(op.kind, OpKind::Reflection(_))));
+    let public: Vec<_> = hidden
+        .ops
+        .ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::Message(_)))
+        .collect();
+    for op in public {
+        assert!(
+            shown.ops.ops.contains(op),
+            "reasoning backfill keeps public IDs and bytes"
+        );
+    }
+    let raw_only = ImportOptions {
+        normalize: false,
+        ..ImportOptions::default()
+    };
+    let appended = import_projection_prefix(&dir, &records, &raw_only, &mut cursors);
+    assert_eq!(appended.report.raw_ops, 1);
+    assert_eq!(appended.report.normalized_ops, 0);
+    let replay = import_projection_prefix(&dir, &records, &shown_options, &mut cursors);
+    assert_eq!(replay.report.raw_ops, 0);
+    assert_eq!(
+        replay.report.files_processed, 1,
+        "raw progress cannot advance semantic coverage"
+    );
+    let accumulated: Vec<_> = [
+        hidden.ops.ops,
+        shown.ops.ops,
+        appended.ops.ops,
+        replay.ops.ops,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let canonical = canonical_revisions(&accumulated);
+    let view = editchain_project::HistoryProjection::from_ops(canonical);
+    assert_eq!(view.codex_logical_items().len(), 2);
+    let repeated = import_projection_prefix(&dir, &records, &shown_options, &mut cursors);
+    assert!(
+        repeated.ops.ops.is_empty(),
+        "completed semantic backfill is one-shot"
+    );
+}
+
+#[test]
+fn named_materialization_backfills_independently_of_legacy_metadata_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let records = derivation_records();
+    let options = ImportOptions::default();
+    let mut cursors = MemoryCursorStore::new();
+    let captured = import_projection_prefix(&dir, &records, &options, &mut cursors);
+    let key = source_key(dir.path(), &dir.path().join("rollout-revisions.jsonl"));
+    let mut legacy = cursors.get_cursor(&key).unwrap().unwrap();
+    legacy.materialization = None;
+    cursors.set_cursor(&key, &legacy).unwrap();
+    let upgrade = import_projection_prefix(&dir, &records, &options, &mut cursors);
+    assert_eq!(upgrade.report.raw_ops, 0);
+    assert_eq!(
+        upgrade.report.normalized_ops, 4,
+        "three historical revisions and their turn removal"
+    );
+    for op in upgrade
+        .ops
+        .ops
+        .iter()
+        .filter(|op| !is_provider_evidence(op))
+    {
+        assert!(
+            captured.ops.ops.contains(op),
+            "backfill replays the exact named contract"
+        );
+    }
+    let mut checkpoint = cursors.get_cursor(&key).unwrap().unwrap();
+    assert_eq!(
+        checkpoint.normalization_version,
+        legacy.normalization_version
+    );
+    assert_eq!(checkpoint.materialization.as_ref().unwrap().through, 5);
+    assert!(
+        import_projection_prefix(&dir, &records, &options, &mut cursors)
+            .ops
+            .ops
+            .is_empty()
+    );
+    checkpoint.materialization.as_mut().unwrap().contract = "codex-occurrences-v99".into();
+    cursors.set_cursor(&key, &checkpoint).unwrap();
+    let missing_helper = HelperCommand::new(
+        "/nonexistent/materialization-must-be-checked-first",
+        Vec::new(),
+    );
+    let error = try_import(dir.path(), &missing_helper, &options, &mut cursors).unwrap_err();
+    assert!(
+        matches!(error, ImportError::CursorStore(_)),
+        "unsupported derivation cannot silently replay an older contract"
+    );
+    assert_eq!(cursors.get_cursor(&key).unwrap(), Some(checkpoint));
+}
+
 #[test]
 fn session_start_git_metadata_emits_one_exact_based_on_link() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
-    let git_marker = workspace.join(".git");
-    std::fs::create_dir_all(&git_marker).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
     let rollouts = dir.path().join("rollouts");
     std::fs::create_dir_all(&rollouts).unwrap();
     write_rollout(
@@ -208,23 +543,90 @@ fn session_start_git_metadata_emits_one_exact_based_on_link() {
     );
     assert!(matches!(link.kind, editchain_core::GitLinkKind::BasedOn));
 
-    let canonical_marker = git_marker.canonicalize().unwrap();
-    let digest = Sha256::digest(canonical_marker.to_string_lossy().as_bytes());
-    let mut repository_bytes = [0u8; 8];
-    repository_bytes.copy_from_slice(&digest[..8]);
-    assert_eq!(
-        link.target_repo,
-        editchain_core::RepositoryId(u64::from_le_bytes(repository_bytes))
-    );
+    assert_eq!(link.target_repo, editchain_core::RepositoryId(7));
     assert_eq!(imported.report.raw_ops, 1);
     assert_eq!(imported.report.normalized_ops, 1);
+}
+
+#[test]
+fn repository_lookup_failure_discards_capture_and_absence_emits_no_git_claim() {
+    use editchain_import::batch::ImportBatch;
+
+    #[derive(Debug)]
+    struct FailedCatalog;
+    impl editchain_import::codex::RepositoryLookup for FailedCatalog {
+        fn repository_for_cwd(
+            &self,
+            _cwd: &Path,
+        ) -> Result<Option<editchain_core::RepositoryId>, ImportError> {
+            Err(ImportError::OpSink("catalog unavailable".into()))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let path = root.join("rollout-1.jsonl");
+    write_rollout(
+        root,
+        "rollout-1.jsonl",
+        &[session_meta_line("thread", "session")],
+    );
+    let helper = fixed_helper(
+        &dir,
+        &projection_bytes(&[line_record(
+            1,
+            Vec::new(),
+            Some(serde_json::json!({
+                "threadId": "thread", "cwd": root,
+                "git": { "commitHash": "0123456789abcdef0123456789abcdef01234567" }
+            })),
+        )]),
+    );
+    let base = MemoryCursorStore::new();
+    let options = ImportOptions::default();
+    let capture = |repositories: &dyn editchain_import::codex::RepositoryLookup| {
+        let request = CodexDiscoveryRequest {
+            repositories,
+            workspace_path: root.into(),
+            raw_root: root.into(),
+        };
+        ImportBatch::capture(&base, |ops, pending| {
+            import_codex(
+                &request,
+                &options,
+                &helper,
+                ops,
+                &mut ContentAddressedBlobSink::new(),
+                pending,
+            )
+        })
+    };
+    assert!(matches!(
+        capture(&FailedCatalog),
+        Err(ImportError::OpSink(_))
+    ));
+    let key = source_key(root, &path);
+    assert!(base.get_cursor(&key).unwrap().is_none());
+    assert!(base.get_reservation(&key).unwrap().is_none());
+    assert_eq!(base.get_generation(&key).unwrap(), 0);
+    let without_repository = capture(&()).unwrap();
+    assert_eq!(without_repository.report().raw_ops, 1);
+    assert!(!without_repository
+        .operations()
+        .iter()
+        .any(|op| matches!(op.kind, OpKind::GitLink(_))));
+    let with_repository = capture(&FixtureRepository(root)).unwrap();
+    assert!(with_repository
+        .operations()
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::GitLink(link)
+        if link.target_repo == editchain_core::RepositoryId(7))));
 }
 
 #[test]
 fn legacy_cursor_backfills_session_git_link_once_without_replaying_rows() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
-    std::fs::create_dir_all(workspace.join(".git")).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
     let rollouts = dir.path().join("rollouts");
     std::fs::create_dir_all(&rollouts).unwrap();
     let rollout = rollouts.join("rollout-thread-1.jsonl");
@@ -277,7 +679,7 @@ fn legacy_cursor_backfills_session_git_link_once_without_replaying_rows() {
             .unwrap()
             .unwrap()
             .normalization_version,
-        5
+        6
     );
 
     let current =
@@ -290,7 +692,7 @@ fn legacy_cursor_backfills_session_git_link_once_without_replaying_rows() {
 fn version_one_cursor_upgrades_topology_without_replaying_git_link() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("workspace");
-    std::fs::create_dir_all(workspace.join(".git")).unwrap();
+    std::fs::create_dir_all(&workspace).unwrap();
     let rollouts = dir.path().join("rollouts");
     std::fs::create_dir_all(&rollouts).unwrap();
     let rollout = rollouts.join("rollout-thread-1.jsonl");
@@ -351,7 +753,7 @@ fn version_one_cursor_upgrades_topology_without_replaying_git_link() {
             .unwrap()
             .unwrap()
             .normalization_version,
-        5
+        6
     );
 }
 
@@ -528,7 +930,8 @@ fn full_import_preserves_raw_bytes_and_spills_blobs() {
     assert_eq!(harness.report.raw_ops, 3);
     assert_eq!(harness.report.normalized_ops, 2);
     assert_eq!(harness.report.malformed, 0);
-    assert_eq!(harness.ops.ops.len(), 5);
+    assert_eq!(harness.ops.ops.len(), 9);
+    assert_eq!(harness.report.evidence_ops, 4);
 
     // Raw lane: session_meta inline, big lines spilled to blobs, byte-exact.
     assert_eq!(raw_bytes(&harness.ops.ops[0], &harness.blobs), ln(&line1));
@@ -566,12 +969,16 @@ fn full_import_preserves_raw_bytes_and_spills_blobs() {
         Clock::UnixMs(parse_source_time("2026-08-26T12:00:00.000Z").unwrap())
     );
 
-    // Normalized messages anchored to their first-seen raw ops and scoped to
+    // Normalized messages anchored to their witnessing raw ops and scoped to
     // their persisted turn identity (thread:turn-1).
     let turn_scope = ScopeRef::Turn(derive_turn_id("thread-1:turn-1"));
-    for (i, expected_text) in [(3usize, "line-2"), (4, "line-3")] {
-        let op = &harness.ops.ops[i];
-        assert_eq!(op.parents, ParentSet::One(harness.ops.ops[i - 2].id));
+    let messages = harness
+        .ops
+        .ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::Message(_)));
+    for (op, (raw_index, expected_text)) in messages.zip([(1, "line-2"), (2, "line-3")]) {
+        assert_eq!(op.parents, ParentSet::One(harness.ops.ops[raw_index].id));
         assert_eq!(op.scope, turn_scope);
         assert!(op.tags.matches_all(Tags::AGENT | Tags::MESSAGE));
         match &op.kind {
@@ -640,11 +1047,7 @@ fn token_usage_and_terminal_events_fold_into_the_last_semantic_turn() {
         "top-level usage records belong to the system metadata lane"
     );
 
-    let opts = editchain_project::ProjectionOptions {
-        bundle_metadata: true,
-    };
-    let history =
-        editchain_project::HistoryProjection::from_ops_with(harness.ops.ops.clone(), opts);
+    let history = editchain_project::HistoryProjection::from_ops(harness.ops.ops.clone());
     let semantic_key = raw[1].id.to_string();
     let semantic = history
         .nodes()
@@ -696,7 +1099,7 @@ fn session_scope_uses_bridge_thread_not_payload_session_id() {
     let scope = ScopeRef::Session(derive_session_id("thread-1"));
     let turn_scope = ScopeRef::Turn(derive_turn_id("thread-1:turn-1"));
     for op in &harness.ops.ops {
-        let expected = if matches!(op.kind, OpKind::Import(_)) {
+        let expected = if matches!(op.kind, OpKind::Import(_)) || is_provider_evidence(op) {
             scope
         } else {
             turn_scope
@@ -739,7 +1142,7 @@ fn raw_session_meta_fallback_when_bridge_has_no_thread_metadata() {
     let scope = ScopeRef::Session(derive_session_id("thread-1"));
     let turn_scope = ScopeRef::Turn(derive_turn_id("thread-1:turn-1"));
     for op in &harness.ops.ops {
-        let expected = if matches!(op.kind, OpKind::Import(_)) {
+        let expected = if matches!(op.kind, OpKind::Import(_)) || is_provider_evidence(op) {
             scope
         } else {
             turn_scope
@@ -754,7 +1157,7 @@ fn raw_session_meta_fallback_when_bridge_has_no_thread_metadata() {
     let appended =
         import_with_options_into(dir.path(), &helper, &ImportOptions::default(), &mut cursors);
     for op in &appended.ops.ops {
-        let expected = if matches!(op.kind, OpKind::Import(_)) {
+        let expected = if matches!(op.kind, OpKind::Import(_)) || is_provider_evidence(op) {
             scope
         } else {
             turn_scope
@@ -777,9 +1180,10 @@ fn session_fallback_to_rollout_filename_stem() {
 "#;
     let harness = import(dir.path(), &helper_in(&dir, no_meta_awk));
     let scope = ScopeRef::Session(derive_session_id("rollout-solo-1"));
-    assert_eq!(harness.ops.ops.len(), 2);
+    assert_eq!(harness.ops.ops.len(), 4);
+    assert_eq!(harness.report.evidence_ops, 2);
     for op in &harness.ops.ops {
-        let expected = if matches!(op.kind, OpKind::Import(_)) {
+        let expected = if matches!(op.kind, OpKind::Import(_)) || is_provider_evidence(op) {
             scope
         } else {
             ScopeRef::Turn(derive_turn_id("rollout-solo-1:turn-1"))
@@ -804,7 +1208,7 @@ fn bridge_thread_beats_raw_session_meta() {
 }
 
 #[test]
-fn repeated_upserts_fold_echo_and_completion_repeats() {
+fn repeated_upserts_preserve_revisions_and_fold_current_logical_items() {
     let dir = tempfile::tempdir().unwrap();
     write_rollout(
         dir.path(),
@@ -831,8 +1235,8 @@ fn repeated_upserts_fold_echo_and_completion_repeats() {
     let harness = import(dir.path(), &helper_in(&dir, awk));
     assert_eq!(harness.report.raw_ops, 6);
     assert_eq!(
-        harness.report.normalized_ops, 2,
-        "echo pair + compaction replay fold to one item each"
+        harness.report.normalized_ops, 5,
+        "each witnessed upsert remains an immutable revision"
     );
     let messages: Vec<_> = harness
         .ops
@@ -840,7 +1244,7 @@ fn repeated_upserts_fold_echo_and_completion_repeats() {
         .iter()
         .filter(|op| matches!(op.kind, OpKind::Message(_)))
         .collect();
-    assert_eq!(messages.len(), 2);
+    assert_eq!(messages.len(), 5);
     let message_text = |op: &editchain_core::Op| match &op.kind {
         OpKind::Message(m) => match &m.content {
             Payload::Inline(b) => String::from_utf8_lossy(b).into_owned(),
@@ -848,23 +1252,24 @@ fn repeated_upserts_fold_echo_and_completion_repeats() {
         },
         _ => panic!("expected message op"),
     };
-    assert_eq!(message_text(messages[0]), "first second");
-    assert_eq!(message_text(messages[1]), "b-final");
-    // Anchored at first-seen ordinals: derived(2,1) and derived(4,1).
+    let texts: Vec<_> = messages.iter().map(|op| message_text(op)).collect();
+    assert_eq!(
+        texts,
+        ["first", "first second", "b-first", "b-final", "b-final"]
+    );
     let path = dir.path().join("rollout-1.jsonl");
     let stream = source_stream(dir.path(), &path, 0);
-    assert_eq!(
-        messages[0].id,
-        stream
-            .op_from_position(SourcePosition::derived(2, 1))
-            .unwrap()
-    );
-    assert_eq!(
-        messages[1].id,
-        stream
-            .op_from_position(SourcePosition::derived(4, 1))
-            .unwrap()
-    );
+    for (message, ordinal) in messages.iter().zip(2..=6) {
+        assert_occurrence_anchor(message, &stream, ordinal);
+    }
+    let view = editchain_project::HistoryProjection::from_ops(harness.ops.ops.clone());
+    assert_eq!(view.codex_logical_items().len(), 2);
+    let latest: Vec<_> = view
+        .codex_logical_items()
+        .iter()
+        .map(|item| item.source.seq >> 16)
+        .collect();
+    assert_eq!(latest, [3, 6]);
 }
 
 #[test]
@@ -891,20 +1296,21 @@ fn removed_turn_ids_rollback_items() {
 }
 "#;
     let harness = import(dir.path(), &helper_in(&dir, awk));
-    assert_eq!(harness.report.normalized_ops, 1);
+    assert_eq!(
+        harness.report.normalized_ops, 4,
+        "three revisions and an explicit removal"
+    );
     let messages: Vec<_> = harness
         .ops
         .ops
         .iter()
         .filter(|op| matches!(op.kind, OpKind::Message(_)))
         .collect();
-    assert_eq!(messages.len(), 1);
-    match &messages[0].kind {
-        OpKind::Message(m) => {
-            assert_eq!(m.content, Payload::Inline(b"c".to_vec()));
-        }
-        _ => panic!("expected message op"),
-    }
+    assert_eq!(messages.len(), 3, "removal retains historical revisions");
+    let view = editchain_project::HistoryProjection::from_ops(harness.ops.ops.clone());
+    assert_eq!(view.codex_logical_items().len(), 1);
+    assert_eq!(view.codex_logical_items()[0].turn, "turn-2");
+    assert_eq!(view.codex_logical_items()[0].item, "c");
 }
 
 #[test]
@@ -996,13 +1402,7 @@ fn legacy_and_paginated_physical_ordinals() {
         .iter()
         .find(|op| matches!(&op.kind, OpKind::Message(m) if m.content == Payload::Inline(b"line-2".to_vec())))
         .unwrap();
-    assert_eq!(
-        paged_msg.id,
-        stream
-            .op_from_position(SourcePosition::derived(2, 1))
-            .unwrap(),
-        "normalized op uses the physical line ordinal, not the Codex ordinal"
-    );
+    assert_occurrence_anchor(paged_msg, &stream, 2);
 }
 
 #[test]
@@ -1182,12 +1582,7 @@ fn incremental_append_emits_deterministic_update_for_item_changed_after_cursor()
         .iter()
         .find(|o| matches!(o.kind, OpKind::Message(_)))
         .expect("initial message op");
-    assert_eq!(
-        original.id,
-        stream
-            .op_from_position(SourcePosition::derived(2, 1))
-            .unwrap()
-    );
+    assert_occurrence_anchor(original, &stream, 2);
     match &original.kind {
         OpKind::Message(m) => {
             assert_eq!(m.content, Payload::Inline(b"first".to_vec()));
@@ -1216,13 +1611,7 @@ fn incremental_append_emits_deterministic_update_for_item_changed_after_cursor()
         .iter()
         .find(|o| matches!(o.kind, OpKind::Message(_)))
         .expect("update op");
-    assert_eq!(
-        update.id,
-        stream
-            .op_from_position(SourcePosition::derived(3, 1))
-            .unwrap(),
-        "update anchored at the change ordinal (last_seen)"
-    );
+    assert_occurrence_anchor(update, &stream, 3);
     assert_eq!(
         update.parents,
         ParentSet::One(stream.op_from_position(SourcePosition::raw(3)).unwrap())
@@ -1252,12 +1641,7 @@ fn incremental_append_emits_deterministic_update_for_item_changed_after_cursor()
         .iter()
         .find(|o| matches!(o.kind, OpKind::Message(_)))
         .expect("update op");
-    assert_eq!(
-        update3.id,
-        stream
-            .op_from_position(SourcePosition::derived(4, 1))
-            .unwrap()
-    );
+    assert_occurrence_anchor(update3, &stream, 4);
     match &update3.kind {
         OpKind::Message(m) => {
             assert_eq!(
@@ -1300,6 +1684,174 @@ fn helper_nonzero_exit_is_error_without_cursor() {
         cursors.get_cursor(&key).unwrap().is_none(),
         "cursor not persisted on helper failure"
     );
+}
+
+#[test]
+fn helper_output_limits_preserve_checkpoints_and_allow_retry() {
+    for (redirection, resource) in [("", "helper stdout bytes"), (">&2", "helper stderr bytes")] {
+        let dir = tempfile::tempdir().unwrap();
+        write_rollout(dir.path(), "rollout-1.jsonl", &[event_line("A")]);
+        let path = dir.path().join("rollout-1.jsonl");
+        let script = dir.path().join("flood.sh");
+        std::fs::write(
+            &script,
+            format!("head -c 65536 /dev/zero {redirection}\nsleep 30\n"),
+        )
+        .unwrap();
+        let options = ImportOptions {
+            helper_limits: editchain_import::codex::helper::HelperLimits {
+                stdout_bytes: 1024,
+                stderr_bytes: 1024,
+                timeout: std::time::Duration::from_secs(5),
+            },
+            ..ImportOptions::default()
+        };
+        let mut cursors = MemoryCursorStore::new();
+        let started = std::time::Instant::now();
+        let error =
+            try_import(dir.path(), &sh_helper(&script, &[]), &options, &mut cursors).unwrap_err();
+        assert!(
+            matches!(error, ImportError::ResourceLimit { path: failed, resource: actual, limit: 1024 }
+            if failed == path && actual == resource)
+        );
+        assert!(started.elapsed() < options.helper_limits.timeout);
+        let key = source_key(dir.path(), &path);
+        assert!(cursors.get_cursor(&key).unwrap().is_none());
+        assert!(cursors.get_reservation(&key).unwrap().is_none());
+        assert_eq!(cursors.get_generation(&key).unwrap(), 0);
+        let retry = try_import(
+            dir.path(),
+            &helper_in(&dir, &messages_awk("thread-1")),
+            &ImportOptions::default(),
+            &mut cursors,
+        )
+        .unwrap();
+        assert_eq!(retry.report.raw_ops, 1);
+    }
+}
+
+#[test]
+fn helper_accepts_exact_output_bounds_inside_an_existing_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.jsonl");
+    std::fs::write(&source, "{}\n").unwrap();
+    let script = dir.path().join("exact.sh");
+    std::fs::write(
+        &script,
+        "head -c 1024 /dev/zero\nhead -c 1024 /dev/zero >&2\n",
+    )
+    .unwrap();
+    let limits = editchain_import::codex::helper::HelperLimits {
+        stdout_bytes: 1024,
+        stderr_bytes: 1024,
+        ..editchain_import::codex::helper::HelperLimits::default()
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let output = sh_helper(&script, &[])
+            .run_with_control(
+                &source,
+                limits,
+                &editchain_import::cancellation::ImportCancellation::default(),
+            )
+            .unwrap();
+        assert_eq!(output, vec![0; 1024]);
+    });
+}
+
+#[test]
+fn helper_deadline_covers_pipes_inherited_by_descendants() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.jsonl");
+    std::fs::write(&source, "x\n").unwrap();
+    let script = dir.path().join("inherited-pipe.sh");
+    let child_pid = dir.path().join("child.pid");
+    std::fs::write(&script, "sleep 30 &\nprintf '%s' \"$!\" > \"$1\"\nexit 0\n").unwrap();
+    let limits = editchain_import::codex::helper::HelperLimits {
+        timeout: std::time::Duration::from_millis(250),
+        ..editchain_import::codex::helper::HelperLimits::default()
+    };
+    let started = std::time::Instant::now();
+    let error = sh_helper(&script, &[child_pid.to_string_lossy().into_owned()])
+        .run_with_control(
+            &source,
+            limits,
+            &editchain_import::cancellation::ImportCancellation::default(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, ImportError::ResourceLimit { path, resource: "helper elapsed milliseconds", limit: 250 }
+        if path == source)
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_process_stopped(&child_pid);
+}
+
+fn assert_process_stopped(pid_file: &Path) {
+    let pid = std::fs::read_to_string(pid_file).unwrap();
+    let deadline = std::time::Instant::now()
+        .checked_add(std::time::Duration::from_secs(5))
+        .unwrap();
+    loop {
+        let status = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid.trim()])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&status.stdout);
+        if state.trim().is_empty() || state.trim().starts_with('Z') {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "helper descendant {pid} still runs: {state}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn helper_cancellation_after_startup_kills_children_without_accepting_a_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rollout(dir.path(), "rollout-1.jsonl", &[event_line("A")]);
+    let source = dir.path().join("rollout-1.jsonl");
+    let child_pid = dir.path().join("child.pid");
+    let script = dir.path().join("cancel.sh");
+    std::fs::write(&script, "sleep 30 &\nprintf '%s' \"$!\" > \"$1\"\nwait\n").unwrap();
+    let helper = sh_helper(&script, &[child_pid.to_string_lossy().into_owned()]);
+    let options = ImportOptions::default();
+    let mut cursors = MemoryCursorStore::new();
+    std::thread::scope(|scope| {
+        let cancel = scope.spawn(|| {
+            let deadline = std::time::Instant::now()
+                .checked_add(std::time::Duration::from_secs(5))
+                .unwrap();
+            while !child_pid.exists() {
+                if std::time::Instant::now() >= deadline {
+                    options.cancellation.cancel();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            options.cancellation.cancel();
+        });
+        let error = try_import(dir.path(), &helper, &options, &mut cursors).unwrap_err();
+        assert!(matches!(error, ImportError::Cancelled { path } if path == source));
+        cancel.join().unwrap();
+    });
+    assert_process_stopped(&child_pid);
+    let key = source_key(dir.path(), &source);
+    assert!(cursors.get_cursor(&key).unwrap().is_none());
+    assert!(cursors.get_reservation(&key).unwrap().is_none());
+    assert_eq!(cursors.get_generation(&key).unwrap(), 0);
+    // A cancelled signal remains cancelled, including before a later spawn.
+    std::fs::remove_file(&child_pid).unwrap();
+    assert!(matches!(
+        try_import(dir.path(), &helper, &options, &mut cursors),
+        Err(ImportError::Cancelled { .. })
+    ));
+    assert!(!child_pid.exists());
 }
 
 #[test]
@@ -1444,7 +1996,7 @@ fn reasoning_is_private_and_respects_include_thinking() {
         &ImportOptions {
             normalize: true,
             include_thinking: false,
-            max_inline_bytes: 4096,
+            ..ImportOptions::default()
         },
     );
     assert_eq!(
@@ -1458,13 +2010,19 @@ fn reasoning_is_private_and_respects_include_thinking() {
         &ImportOptions {
             normalize: true,
             include_thinking: true,
-            max_inline_bytes: 4096,
+            ..ImportOptions::default()
         },
     );
     assert_eq!(shown.report.normalized_ops, 1);
-    match &shown.ops.ops[2].kind {
+    let reflection = shown
+        .ops
+        .ops
+        .iter()
+        .find(|op| matches!(op.kind, OpKind::Reflection(_)))
+        .unwrap();
+    match &reflection.kind {
         OpKind::Reflection(r) => {
-            assert!(shown.ops.ops[2]
+            assert!(reflection
                 .tags
                 .matches_all(Tags::PRIVATE | Tags::REFLECTION));
             assert_eq!(r.summary, Payload::Inline(b"step one\nstep two".to_vec()));
@@ -1508,7 +2066,7 @@ fn kinds_map_full_content_to_neutral_ops() {
         &ImportOptions {
             normalize: true,
             include_thinking: true,
-            max_inline_bytes: 4096,
+            ..ImportOptions::default()
         },
     );
     assert_eq!(harness.report.raw_ops, 9);
@@ -1706,11 +2264,7 @@ fn multi_path_file_change_retains_one_edit_and_path_note_per_file() {
         .ops
         .iter()
         .filter_map(|op| match &op.kind {
-            OpKind::Note(note)
-                if note.relationship == editchain_core::op::NoteRelationship::Explains =>
-            {
-                Some(note)
-            }
+            OpKind::Note(note) if note.relationship == NoteRelationship::Explains => Some(note),
             _ => None,
         })
         .collect();
@@ -1723,7 +2277,7 @@ fn multi_path_file_change_retains_one_edit_and_path_note_per_file() {
 }
 
 #[test]
-fn tool_lifecycle_split_uses_first_and_last_seen_lanes() {
+fn tool_lifecycle_preserves_arguments_and_result_at_their_witnessing_occurrences() {
     let dir = tempfile::tempdir().unwrap();
     write_rollout(
         dir.path(),
@@ -1755,13 +2309,7 @@ fn tool_lifecycle_split_uses_first_and_last_seen_lanes() {
         .iter()
         .find(|o| matches!(&o.kind, OpKind::Tool(t) if t.stage == ToolStage::Start))
         .expect("start op");
-    assert_eq!(
-        start.id,
-        stream
-            .op_from_position(SourcePosition::derived(2, 1))
-            .unwrap(),
-        "start anchored at first-seen ordinal"
-    );
+    assert_occurrence_anchor(start, &stream, 2);
     assert_eq!(
         start.parents,
         ParentSet::One(stream.op_from_position(SourcePosition::raw(2)).unwrap())
@@ -1787,13 +2335,7 @@ fn tool_lifecycle_split_uses_first_and_last_seen_lanes() {
         .iter()
         .find(|o| matches!(&o.kind, OpKind::Tool(t) if t.stage == ToolStage::Finish))
         .expect("finish op");
-    assert_eq!(
-        finish.id,
-        stream
-            .op_from_position(SourcePosition::derived(3, 1))
-            .unwrap(),
-        "finish anchored at last-seen ordinal with a deterministic lane"
-    );
+    assert_occurrence_anchor(finish, &stream, 3);
     assert_eq!(
         finish.parents,
         ParentSet::One(stream.op_from_position(SourcePosition::raw(3)).unwrap())
@@ -1858,15 +2400,9 @@ fn inter_agent_and_compaction_lines_normalize_to_note_and_reflection() {
 
     let note = ops
         .iter()
-        .find(|o| matches!(o.kind, OpKind::Note(_)))
+        .find(|o| matches!(o.kind, OpKind::Note(_)) && !is_provider_evidence(o))
         .expect("inter-agent note");
-    assert_eq!(
-        note.id,
-        stream
-            .op_from_position(SourcePosition::derived(2, 1))
-            .unwrap(),
-        "inter-agent note anchored at its physical line with a deterministic lane"
-    );
+    assert_occurrence_anchor(note, &stream, 2);
     assert_eq!(
         note.parents,
         ParentSet::One(stream.op_from_position(SourcePosition::raw(2)).unwrap())
@@ -1888,13 +2424,7 @@ fn inter_agent_and_compaction_lines_normalize_to_note_and_reflection() {
         .iter()
         .find(|o| matches!(o.kind, OpKind::Reflection(_)))
         .expect("compaction reflection");
-    assert_eq!(
-        reflection.id,
-        stream
-            .op_from_position(SourcePosition::derived(3, 1))
-            .unwrap(),
-        "compaction reflection anchored at its physical line"
-    );
+    assert_occurrence_anchor(reflection, &stream, 3);
     assert!(reflection.tags.matches_all(Tags::REFLECTION));
     assert!(
         !reflection.tags.matches_any(Tags::PRIVATE),
@@ -1912,7 +2442,7 @@ fn inter_agent_and_compaction_lines_normalize_to_note_and_reflection() {
 }
 
 #[test]
-fn normalized_items_on_the_same_line_use_distinct_derived_lanes() {
+fn normalized_items_on_the_same_line_use_distinct_item_namespaces() {
     let dir = tempfile::tempdir().unwrap();
     write_rollout(
         dir.path(),
@@ -1936,18 +2466,30 @@ fn normalized_items_on_the_same_line_use_distinct_derived_lanes() {
         .collect::<Vec<_>>();
     ids.sort_unstable();
 
-    let mut expected = vec![
-        stream
-            .op_from_position(SourcePosition::derived(2, 1))
-            .unwrap(),
-        stream
-            .op_from_position(SourcePosition::derived(2, 2))
-            .unwrap(),
-    ];
-    expected.sort_unstable();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1], "same-line item IDs must not collide");
+    for op in harness
+        .ops
+        .ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::Message(_)))
+    {
+        assert_occurrence_anchor(op, &stream, 2);
+    }
+    let expected = editchain_project::HistoryProjection::from_ops(harness.ops.ops.clone());
+    let mut reversed = harness.ops.ops.clone();
+    reversed.reverse();
+    let reversed = editchain_project::HistoryProjection::from_ops(reversed);
+    let summaries = |view: &editchain_project::HistoryProjection| {
+        view.nodes()
+            .iter()
+            .map(|node| (node.node_key(), node.summary()))
+            .collect::<Vec<_>>()
+    };
     assert_eq!(
-        ids, expected,
-        "same-line normalized op ids must not collide"
+        summaries(&expected),
+        summaries(&reversed),
+        "stored output order determines presentation"
     );
 }
 
@@ -2046,85 +2588,51 @@ fn current_collab_spawn_links_exact_child_and_reconnects_to() {
     );
     let harness = import(dir.path(), &sh_helper(&helper, &[]));
 
-    // SpawnedBy: causal parent = the subagent thread's first raw occurrence;
-    // target = the parent thread's exact raw `spawnAgent` occurrence.
-    let spawned_by = harness
-        .ops
-        .ops
-        .iter()
-        .find(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::SpawnedBy)
-        })
-        .expect("SpawnedBy fact");
+    let projection = editchain_project::HistoryProjection::from_ops(harness.ops.ops.clone());
     let sub_stream = source_stream(dir.path(), &dir.path().join("rollout-sub.jsonl"), 0);
     let parent_stream = source_stream(dir.path(), &dir.path().join("rollout-parent.jsonl"), 0);
+    let first = sub_stream.op_from_position(SourcePosition::raw(1)).unwrap();
+    let activation = parent_stream
+        .op_from_position(SourcePosition::raw(2))
+        .unwrap();
+    let completion = parent_stream
+        .op_from_position(SourcePosition::raw(3))
+        .unwrap();
+    let terminal = sub_stream.op_from_position(SourcePosition::raw(2)).unwrap();
     assert_eq!(
-        spawned_by.parents,
-        ParentSet::One(sub_stream.op_from_position(SourcePosition::raw(1)).unwrap())
+        relationship_edges(&projection, NoteRelationship::SpawnedBy),
+        [(first, activation)].into()
     );
-    match &spawned_by.kind {
-        OpKind::Note(note) => {
-            assert_eq!(
-                note.target_ids,
-                vec![parent_stream
-                    .op_from_position(SourcePosition::raw(2))
-                    .unwrap()]
-            );
-            assert!(matches!(&note.content, Payload::Inline(bytes)
-                if String::from_utf8_lossy(bytes).contains("collabToolCall.spawnAgent")));
-        }
-        _ => panic!("expected note op"),
-    }
-    // Relationship notes are session-scoped, never turn-scoped.
     assert_eq!(
-        spawned_by.scope,
-        ScopeRef::Session(derive_session_id("sub-1"))
+        relationship_edges(&projection, NoteRelationship::ReconnectsTo),
+        [(completion, terminal)].into()
     );
 
-    // ReconnectsTo: causal parent = the raw occurrence whose agentsStates marks
-    // the child completed; target = the child's last physical occurrence.
-    let reconnects_to = harness
-        .ops
-        .ops
-        .iter()
-        .find(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ReconnectsTo)
-        })
-        .expect("ReconnectsTo note");
+    let facts = provider_facts(&harness.ops.ops);
+    assert!(facts.iter().any(|(op, evidence)| matches!(&evidence.fact,
+        ProviderFact::CodexLifecycle(meta)
+            if matches!(&meta.event, CodexLifecycleEvent::Spawn { activation: id, signal: CodexSpawnSignal::CollabTool, child, .. }
+                if *id == activation && child.0 == "sub-1")
+                && op.scope == ScopeRef::Session(derive_session_id("parent-1")))));
+    assert!(facts.iter().any(|(op, evidence)| matches!(&evidence.fact,
+        ProviderFact::CodexLifecycle(meta)
+            if matches!(&meta.event, CodexLifecycleEvent::Completed { child } if child.0 == "sub-1")
+                && evidence.source == completion
+                && op.scope == ScopeRef::Session(derive_session_id("parent-1")))));
+    assert!(facts.iter().any(|(op, evidence)| matches!(&evidence.fact,
+        ProviderFact::CodexSource(meta)
+            if meta.first == first && meta.thread.0 == "sub-1"
+                && meta.forked_from.as_ref().is_some_and(|thread| thread.0 == "parent-1")
+                && op.scope == ScopeRef::Session(derive_session_id("sub-1")))));
+    assert!(relationship_edges(&projection, NoteRelationship::ForkOf).is_empty());
+    assert!(!harness.ops.ops.iter().any(|op| matches!(&op.kind, OpKind::Note(note)
+        if matches!(note.relationship, NoteRelationship::SpawnedBy | NoteRelationship::ReconnectsTo | NoteRelationship::ForkedFrom))),
+        "capture persists independent facts without materializing relationships");
     assert_eq!(
-        reconnects_to.parents,
-        ParentSet::One(
-            parent_stream
-                .op_from_position(SourcePosition::raw(3))
-                .unwrap()
-        )
+        projection.ops(),
+        harness.ops.ops,
+        "resolution preserves source envelopes"
     );
-    match &reconnects_to.kind {
-        OpKind::Note(note) => {
-            assert_eq!(
-                note.target_ids,
-                vec![sub_stream.op_from_position(SourcePosition::raw(2)).unwrap()]
-            );
-        }
-        _ => panic!("expected note op"),
-    }
-    assert_eq!(
-        reconnects_to.scope,
-        ScopeRef::Session(derive_session_id("parent-1")),
-        "relationship notes are session-scoped to the owning thread"
-    );
-
-    // The copied forkedFromId is retained as an execution fact, but never
-    // converted into guessed row geometry.
-    assert!(
-        !harness.ops.ops.iter().any(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ForkOf)
-        }),
-        "forkedFromId must not manufacture ForkOf row geometry"
-    );
-    assert!(harness.ops.ops.iter().any(|o| {
-        matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ForkedFrom)
-    }));
 }
 
 #[test]
@@ -2170,36 +2678,32 @@ fn fork_metadata_emits_exact_execution_fact_without_clock_boundary() {
 "#;
     let harness = import(dir.path(), &helper_in(&dir, awk));
 
-    let forked_from = harness
-        .ops
-        .ops
-        .iter()
-        .find(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ForkedFrom)
-        })
-        .expect("ForkedFrom fact");
     let branch_stream = source_stream(dir.path(), &dir.path().join("rollout-branch.jsonl"), 0);
-    // The child execution occurrence is exact; the target is a stable execution
-    // entity, not whichever trunk row happened to precede the branch clock.
-    assert_eq!(
-        forked_from.parents,
-        ParentSet::One(
-            branch_stream
-                .op_from_position(SourcePosition::raw(1))
-                .unwrap()
-        )
+    let first = branch_stream
+        .op_from_position(SourcePosition::raw(1))
+        .unwrap();
+    let last = branch_stream
+        .op_from_position(SourcePosition::raw(2))
+        .unwrap();
+    let facts = provider_facts(&harness.ops.ops);
+    let (op, evidence) = facts
+        .iter()
+        .find(|(_, evidence)| {
+            matches!(&evidence.fact,
+        ProviderFact::CodexSource(meta) if meta.thread.0 == "branch-1")
+        })
+        .expect("branch source evidence");
+    assert!(matches!(&evidence.fact, ProviderFact::CodexSource(meta)
+        if meta.first == first && meta.last == last
+            && meta.forked_from.as_ref().is_some_and(|thread| thread.0 == "trunk-1")));
+    assert_eq!(op.parents, ParentSet::One(last));
+    assert_eq!(op.scope, ScopeRef::Session(derive_session_id("branch-1")));
+    assert_eq!(op.clock, Clock::None);
+    let projection = editchain_project::HistoryProjection::from_ops(harness.ops.ops.clone());
+    assert!(
+        relationship_edges(&projection, NoteRelationship::ForkOf).is_empty(),
+        "execution identity supplies no physical divergence boundary"
     );
-    match &forked_from.kind {
-        OpKind::Note(note) => {
-            assert_eq!(note.target_ids.len(), 1);
-            assert!(matches!(&note.content, Payload::Inline(bytes)
-                if String::from_utf8_lossy(bytes).contains("codex-topology-v2")));
-        }
-        _ => panic!("expected note op"),
-    }
-    assert!(!harness.ops.ops.iter().any(|o| {
-        matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ForkOf)
-    }));
 }
 
 #[test]
@@ -2299,58 +2803,31 @@ fn legacy_list_agents_completion_links_via_started_marker_agent_path() {
     let harness = import(dir.path(), &sh_helper(&helper, &[]));
     let sub_stream = source_stream(dir.path(), &dir.path().join("rollout-sub.jsonl"), 0);
 
-    let reconnects: Vec<_> = harness
-        .ops
-        .ops
-        .iter()
-        .filter(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::ReconnectsTo)
-        })
-        .collect();
-    assert_eq!(reconnects.len(), 1, "only the completed agent reconnects");
+    let projection = editchain_project::HistoryProjection::from_ops(harness.ops.ops.clone());
+    let parent_stream = source_stream(dir.path(), &dir.path().join("rollout-parent.jsonl"), 0);
+    let completion = parent_stream
+        .op_from_position(SourcePosition::raw(3))
+        .unwrap();
+    let terminal = sub_stream.op_from_position(SourcePosition::raw(2)).unwrap();
     assert_eq!(
-        reconnects[0].parents,
-        ParentSet::One(
-            source_stream(dir.path(), &dir.path().join("rollout-parent.jsonl"), 0)
-                .op_from_position(SourcePosition::raw(3))
-                .unwrap()
-        ),
-        "the physical list_agents result occurrence is the completion endpoint"
+        relationship_edges(&projection, NoteRelationship::ReconnectsTo),
+        [(completion, terminal)].into(),
+        "only the completed agent reconnects at its exact physical occurrence"
     );
-    match &reconnects[0].kind {
-        OpKind::Note(note) => {
-            assert_eq!(
-                note.target_ids,
-                vec![sub_stream.op_from_position(SourcePosition::raw(2)).unwrap()]
-            );
-        }
-        _ => panic!("expected note op"),
-    }
-
-    // The raw started occurrence is the exact SpawnedBy target.
-    let spawned_by = harness
-        .ops
-        .ops
-        .iter()
-        .find(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == editchain_core::op::NoteRelationship::SpawnedBy)
-        })
-        .expect("SpawnedBy fact");
-    match &spawned_by.kind {
-        OpKind::Note(note) => assert_eq!(
-            note.target_ids,
-            vec![
-                source_stream(dir.path(), &dir.path().join("rollout-parent.jsonl"), 0,)
-                    .op_from_position(SourcePosition::raw(2))
-                    .unwrap()
-            ]
-        ),
-        _ => panic!("expected note op"),
-    }
     assert_eq!(
-        spawned_by.parents,
-        ParentSet::One(sub_stream.op_from_position(SourcePosition::raw(1)).unwrap())
+        relationship_edges(&projection, NoteRelationship::SpawnedBy),
+        [(
+            sub_stream.op_from_position(SourcePosition::raw(1)).unwrap(),
+            parent_stream
+                .op_from_position(SourcePosition::raw(2))
+                .unwrap(),
+        )]
+        .into()
     );
+    assert!(provider_facts(&harness.ops.ops).iter().any(|(_, evidence)| matches!(&evidence.fact,
+        ProviderFact::CodexLifecycle(meta)
+            if evidence.source == completion
+                && matches!(&meta.event, CodexLifecycleEvent::LegacyCompleted { agent_path } if agent_path == "/root/sub"))));
 }
 
 #[test]
@@ -2393,13 +2870,7 @@ fn turn_identity_is_persisted_on_ops_with_a_turn_metadata_note() {
     assert_eq!(turn_note.scope, turn_scope);
     let path = dir.path().join("rollout-1.jsonl");
     let stream = source_stream(dir.path(), &path, 0);
-    assert_eq!(
-        turn_note.id,
-        stream
-            .op_from_position(SourcePosition::derived(2, 3))
-            .unwrap(),
-        "turn note takes the lane after the two same-line item lanes"
-    );
+    assert_occurrence_anchor(turn_note, &stream, 2);
 }
 
 /// Build a one-record projection carrying a `sessionMeta` with an optional cwd.
@@ -2409,6 +2880,20 @@ fn session_projection(thread: &str, cwd: Option<&str>) -> Vec<u8> {
         meta["cwd"] = serde_json::json!(cwd);
     }
     projection_bytes(&[line_record(1, Vec::new(), Some(meta))])
+}
+
+#[derive(Debug)]
+struct FixtureRepository<'a>(&'a Path);
+
+impl editchain_import::codex::RepositoryLookup for FixtureRepository<'_> {
+    fn repository_for_cwd(
+        &self,
+        cwd: &Path,
+    ) -> Result<Option<editchain_core::RepositoryId>, ImportError> {
+        Ok(cwd
+            .starts_with(self.0)
+            .then_some(editchain_core::RepositoryId(7)))
+    }
 }
 
 /// Import a raw root with a custom workspace (fresh cursors).
@@ -2434,7 +2919,9 @@ fn import_workspace_into(
 ) -> Result<Harness, ImportError> {
     let mut ops_sink = MemoryOpSink::new();
     let mut blobs = ContentAddressedBlobSink::new();
+    let repository = FixtureRepository(workspace);
     let request = CodexDiscoveryRequest {
+        repositories: &repository,
         workspace_path: workspace.to_path_buf(),
         raw_root: root.to_path_buf(),
     };
@@ -2540,21 +3027,29 @@ fn workspace_filter_includes_equal_nested_and_missing_cwd() {
     assert_eq!(harness.report.raw_ops, 4);
     assert_eq!(harness.report.normalized_ops, 0);
     assert_eq!(harness.report.malformed, 0);
-    assert_eq!(harness.ops.ops.len(), 4);
+    assert_eq!(harness.ops.ops.len(), 12);
+    assert_eq!(harness.report.evidence_ops, 8);
+    let raw: Vec<_> = harness
+        .ops
+        .ops
+        .iter()
+        .filter(|op| matches!(op.kind, OpKind::Import(_)))
+        .collect();
+    assert_eq!(raw.len(), 4);
     assert_eq!(
-        raw_bytes(&harness.ops.ops[0], &harness.blobs),
+        raw_bytes(raw[0], &harness.blobs),
         ln(&session_meta_line("equal-1", "s"))
     );
     assert_eq!(
-        raw_bytes(&harness.ops.ops[1], &harness.blobs),
+        raw_bytes(raw[1], &harness.blobs),
         ln(&session_meta_line("nested-1", "s"))
     );
     assert_eq!(
-        raw_bytes(&harness.ops.ops[2], &harness.blobs),
+        raw_bytes(raw[2], &harness.blobs),
         ln(&session_meta_line("nocwd-1", "s"))
     );
     assert_eq!(
-        raw_bytes(&harness.ops.ops[3], &harness.blobs),
+        raw_bytes(raw[3], &harness.blobs),
         ln(&session_meta_line("relative-1", "s"))
     );
 }
@@ -2662,7 +3157,13 @@ fn rewritten_rollout_reimports_at_new_generation_and_is_idempotent() {
         import_with_options_into(dir.path(), &helper, &ImportOptions::default(), &mut cursors);
     assert_eq!(first.report.raw_ops, 3);
     assert!(
-        first.ops.ops.iter().all(|op| op.id.boot == 0),
+        first.ops.ops.iter().all(|op| {
+            if is_provider_evidence(op) {
+                op.parents.iter().all(|source| source.boot == 0)
+            } else {
+                op.id.boot == 0
+            }
+        }),
         "original import uses generation 0"
     );
 
@@ -2682,7 +3183,13 @@ fn rewritten_rollout_reimports_at_new_generation_and_is_idempotent() {
     assert_eq!(second.report.files_processed, 1);
     assert_eq!(second.report.raw_ops, 2);
     assert!(
-        second.ops.ops.iter().all(|op| op.id.boot == 1),
+        second.ops.ops.iter().all(|op| {
+            if is_provider_evidence(op) {
+                op.parents.iter().all(|source| source.boot == 1)
+            } else {
+                op.id.boot == 1
+            }
+        }),
         "rewritten file re-imports under a new deterministic boot generation"
     );
     // New generation op ids never collide with the old generation's ids.
@@ -2825,4 +3332,545 @@ fn append_after_rewrite_continues_the_new_generation_chain() {
         import_with_options_into(dir.path(), &helper, &ImportOptions::default(), &mut cursors);
     assert_eq!(third.report.files_processed, 0);
     assert!(third.ops.ops.is_empty());
+}
+
+#[test]
+fn helper_projects_captured_bytes_when_the_original_is_rewritten_during_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rollout-1.jsonl");
+    let before = event_line("BEFORE");
+    let after = event_line("AFTER_");
+    assert_eq!(before.len(), after.len());
+    write_rollout(dir.path(), "rollout-1.jsonl", std::slice::from_ref(&before));
+    let replacement = dir.path().join("replacement.txt");
+    std::fs::write(&replacement, ln(&after)).unwrap();
+    let projector = write_fake_helper(dir.path(), "project.sh", &messages_awk("t"));
+    let mutator = dir.path().join("mutate.sh");
+    // Rewrite the live source, then copy exactly the argument seen by the
+    // helper so the test can assert its input independently of ordinal checks.
+    std::fs::write(
+        &mutator,
+        concat!(
+            "cp \"$1\" \"$2\"\n",
+            "cp \"$5\" \"$3\"\n",
+            "sh \"$4\" \"$5\"\n",
+        ),
+    )
+    .unwrap();
+    let observed = dir.path().join("helper-input.txt");
+    let helper = sh_helper(
+        &mutator,
+        &[
+            replacement.to_string_lossy().into_owned(),
+            path.to_string_lossy().into_owned(),
+            observed.to_string_lossy().into_owned(),
+            projector.to_string_lossy().into_owned(),
+        ],
+    );
+    let mut cursors = MemoryCursorStore::new();
+    let first = try_import(dir.path(), &helper, &ImportOptions::default(), &mut cursors).unwrap();
+    assert_eq!(std::fs::read(&observed).unwrap(), ln(&before));
+    assert_eq!(std::fs::read(&path).unwrap(), ln(&after));
+    let raw = first
+        .ops
+        .ops
+        .iter()
+        .find(|op| op.id.seq == 1 << 16)
+        .unwrap();
+    assert_eq!(raw_bytes(raw, &first.blobs), ln(&before));
+    let key = source_key(dir.path(), &path);
+    assert_eq!(
+        cursors.get_cursor(&key).unwrap().unwrap().content_hash,
+        editchain_import::hash_raw(&ln(&before))
+    );
+    let next = try_import(
+        dir.path(),
+        &sh_helper(&projector, &[]),
+        &ImportOptions::default(),
+        &mut cursors,
+    )
+    .unwrap();
+    assert_eq!(next.report.raw_ops, 1);
+    assert_eq!(cursors.get_generation(&key).unwrap(), 1);
+    assert!(next
+        .ops
+        .ops
+        .iter()
+        .all(|new| first.ops.ops.iter().all(|old| new.id != old.id)));
+}
+
+#[test]
+fn failed_rewrite_projection_preserves_both_cursor_and_generation_for_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rollout-1.jsonl");
+    write_rollout(dir.path(), "rollout-1.jsonl", &[event_line("A")]);
+    let good = helper_in(&dir, &messages_awk("t"));
+    let mut cursors = MemoryCursorStore::new();
+    let first = try_import(dir.path(), &good, &ImportOptions::default(), &mut cursors).unwrap();
+    let key = source_key(dir.path(), &path);
+    let accepted = cursors.get_cursor(&key).unwrap();
+    write_rollout(dir.path(), "rollout-1.jsonl", &[event_line("B")]);
+    let script = dir.path().join("fail.sh");
+    std::fs::write(&script, "exit 3\n").unwrap();
+    let bad = sh_helper(&script, &[]);
+    for _ in 0..2 {
+        assert!(matches!(
+            try_import(dir.path(), &bad, &ImportOptions::default(), &mut cursors),
+            Err(ImportError::HelperFailed { .. })
+        ));
+        assert_eq!(cursors.get_cursor(&key).unwrap(), accepted);
+        assert_eq!(cursors.get_generation(&key).unwrap(), 0);
+    }
+    let retry = try_import(dir.path(), &good, &ImportOptions::default(), &mut cursors).unwrap();
+    assert_eq!(retry.report.raw_ops, 1);
+    assert_eq!(cursors.get_generation(&key).unwrap(), 1);
+    assert!(retry
+        .ops
+        .ops
+        .iter()
+        .all(|new| first.ops.ops.iter().all(|old| new.id != old.id)));
+}
+
+fn is_provider_evidence(op: &editchain_core::Op) -> bool {
+    matches!(&op.kind, OpKind::Note(note) if note.relationship == NoteRelationship::ProviderEvidence)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopologySource {
+    Parent,
+    Child,
+}
+
+fn topology_projection(source: TopologySource, extra: bool) -> Vec<u8> {
+    let parent = source == TopologySource::Parent;
+    let (thread, parent_thread) = if parent {
+        ("parent", None)
+    } else {
+        ("child", Some("parent"))
+    };
+    let mut records = vec![line_record(
+        1,
+        Vec::new(),
+        Some(serde_json::json!({
+            "threadId": thread, "parentThreadId": parent_thread
+        })),
+    )];
+    if parent {
+        records.push(line_record(
+            2,
+            vec![serde_json::json!({
+                "turnId": "turn", "item": {
+                    "id": "spawn", "kind": "collabToolCall", "tool": "spawnAgent",
+                    "senderThreadId": "parent", "receiverThreadIds": ["child"]
+                }
+            })],
+            None,
+        ));
+        records.push(line_record(
+            3,
+            vec![serde_json::json!({
+                "turnId": "turn", "item": {
+                    "id": "wait", "kind": "collabToolCall", "tool": "wait",
+                    "agentsStates": {"child": {"status": "completed"}}
+                }
+            })],
+            None,
+        ));
+        if extra {
+            records.push(line_record(
+                4,
+                vec![serde_json::json!({
+                    "turnId": "turn", "item": {
+                        "id": "another-spawn", "kind": "collabToolCall", "tool": "spawnAgent",
+                        "senderThreadId": "parent", "receiverThreadIds": ["child"]
+                    }
+                })],
+                None,
+            ));
+        }
+    } else {
+        records.push(line_record(
+            2,
+            vec![serde_json::json!({
+                "turnId": "turn", "item": {"id": "work", "kind": "agentMessage", "text": "work"}
+            })],
+            None,
+        ));
+        if extra {
+            records.push(line_record(
+                3,
+                vec![serde_json::json!({
+                    "turnId": "turn", "item": {"id": "more", "kind": "agentMessage", "text": "more"}
+                })],
+                None,
+            ));
+        }
+    }
+    projection_bytes(&records)
+}
+
+fn topology_helper(dir: &tempfile::TempDir, extended: &[TopologySource]) -> HelperCommand {
+    let script = write_dispatching_helper(
+        dir.path(),
+        "topology.sh",
+        &[
+            (
+                "rollout-parent.jsonl",
+                &topology_projection(
+                    TopologySource::Parent,
+                    extended.contains(&TopologySource::Parent),
+                ),
+            ),
+            (
+                "rollout-child.jsonl",
+                &topology_projection(
+                    TopologySource::Child,
+                    extended.contains(&TopologySource::Child),
+                ),
+            ),
+        ],
+    );
+    sh_helper(&script, &[])
+}
+
+fn topology_lines(parent: bool) -> Vec<String> {
+    if parent {
+        vec![
+            session_meta_line("parent", "s"),
+            event_line("spawn"),
+            event_line("wait"),
+        ]
+    } else {
+        vec![session_meta_line("child", "s"), event_line("work")]
+    }
+}
+
+fn projected_lifecycle_edges(
+    ops: &[editchain_core::Op],
+) -> std::collections::BTreeSet<(editchain_core::OpId, u8, editchain_core::OpId)> {
+    let projection = editchain_project::HistoryProjection::from_ops(ops.to_vec());
+    let mut edges = std::collections::BTreeSet::new();
+    for op in projection.relationship_notes().values().flatten() {
+        let OpKind::Note(note) = &op.kind else {
+            continue;
+        };
+        let kind = match note.relationship {
+            NoteRelationship::SpawnedBy => 1,
+            NoteRelationship::ReconnectsTo => 2,
+            _ => continue,
+        };
+        if let Some(source) = op.parents.iter().next() {
+            for target in &note.target_ids {
+                let _: bool = edges.insert((*source, kind, *target));
+            }
+        }
+    }
+    edges
+}
+
+// Old chains stored resolved notes with this payload. Keep the fixture
+// independent of the retired producer so compatibility stays exercised.
+fn legacy_lifecycle_notes(root: &Path) -> Vec<editchain_core::Op> {
+    let parent = source_stream(root, &root.join("rollout-parent.jsonl"), 0);
+    let child = source_stream(root, &root.join("rollout-child.jsonl"), 0);
+    [
+        (6001, child.op_from_position(SourcePosition::raw(1)).unwrap(),
+            parent.op_from_position(SourcePosition::raw(2)).unwrap(), NoteRelationship::SpawnedBy, "child"),
+        (6002, parent.op_from_position(SourcePosition::raw(3)).unwrap(),
+            child.op_from_position(SourcePosition::raw(2)).unwrap(), NoteRelationship::ReconnectsTo, "parent"),
+    ].into_iter().map(|(node, anchor, target, relationship, thread)| editchain_core::Op {
+        id: editchain_core::OpId::new(editchain_core::NodeId(node), 0, 1),
+        parents: ParentSet::One(anchor),
+        actor: editchain_core::ActorId(0),
+        clock: Clock::None,
+        scope: ScopeRef::Session(derive_session_id(thread)),
+        tags: Tags::META | Tags::IMPORT,
+        kind: OpKind::Note(editchain_core::NoteOp {
+            target_ids: vec![target],
+            relationship,
+            content: Payload::Inline(br#"{"confidence":"exact","details":{},"provider":"codex","resolver":"codex-topology-v2"}"#.to_vec()),
+        }),
+    }).collect()
+}
+
+#[test]
+fn lifecycle_resolves_across_imports_in_both_source_arrival_orders() {
+    for child_first in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = topology_helper(&dir, &[]);
+        let first_name = if child_first {
+            "rollout-child.jsonl"
+        } else {
+            "rollout-parent.jsonl"
+        };
+        let second_name = if child_first {
+            "rollout-parent.jsonl"
+        } else {
+            "rollout-child.jsonl"
+        };
+        write_rollout(dir.path(), first_name, &topology_lines(!child_first));
+        let mut cursors = MemoryCursorStore::new();
+        let first =
+            try_import(dir.path(), &helper, &ImportOptions::default(), &mut cursors).unwrap();
+        assert!(projected_lifecycle_edges(&first.ops.ops).is_empty());
+        write_rollout(dir.path(), second_name, &topology_lines(child_first));
+        let second =
+            try_import(dir.path(), &helper, &ImportOptions::default(), &mut cursors).unwrap();
+        assert_eq!(
+            second.report.files_processed, 1,
+            "unchanged source is not re-projected"
+        );
+        let mut accepted = first.ops.ops;
+        accepted.extend(second.ops.ops);
+        let incremental = projected_lifecycle_edges(&accepted);
+        assert_eq!(
+            incremental.len(),
+            2,
+            "both spawn and completion resolve from durable evidence"
+        );
+        let parent = source_stream(dir.path(), &dir.path().join("rollout-parent.jsonl"), 0);
+        let child = source_stream(dir.path(), &dir.path().join("rollout-child.jsonl"), 0);
+        assert!(incremental.contains(&(
+            child.op_from_position(SourcePosition::raw(1)).unwrap(),
+            1,
+            parent.op_from_position(SourcePosition::raw(2)).unwrap(),
+        )));
+        assert!(incremental.contains(&(
+            parent.op_from_position(SourcePosition::raw(3)).unwrap(),
+            2,
+            child.op_from_position(SourcePosition::raw(2)).unwrap(),
+        )));
+        let one_shot = import(dir.path(), &helper);
+        assert_eq!(incremental, projected_lifecycle_edges(&one_shot.ops.ops));
+        accepted.reverse();
+        assert_eq!(
+            incremental,
+            projected_lifecycle_edges(&accepted),
+            "arrival ordering supplies no graph evidence"
+        );
+        let projection = editchain_project::HistoryProjection::from_ops(accepted.clone());
+        let nodes = projection.nodes();
+        let graph = projection.resolved_graph(&nodes);
+        assert!(graph.keys().iter().any(|key| graph
+            .relations(*key)
+            .iter()
+            .any(|relation| relation.evidence.len() >= 2)));
+        assert_eq!(
+            projection.ops(),
+            accepted,
+            "resolution preserves canonical operation envelopes"
+        );
+    }
+}
+
+#[test]
+fn appended_evidence_updates_terminals_and_retires_ambiguous_legacy_links() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rollout(dir.path(), "rollout-parent.jsonl", &topology_lines(true));
+    write_rollout(dir.path(), "rollout-child.jsonl", &topology_lines(false));
+    let mut cursors = MemoryCursorStore::new();
+    let first = try_import(
+        dir.path(),
+        &topology_helper(&dir, &[]),
+        &ImportOptions::default(),
+        &mut cursors,
+    )
+    .unwrap();
+    let mut accepted = first.ops.ops;
+    accepted.extend(legacy_lifecycle_notes(dir.path()));
+    assert_eq!(projected_lifecycle_edges(&accepted).len(), 2);
+    let child_path = dir.path().join("rollout-child.jsonl");
+    let parent_path = dir.path().join("rollout-parent.jsonl");
+    let mut child_file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&child_path)
+        .unwrap();
+    writeln!(child_file, "{}", event_line("more")).unwrap();
+    drop(child_file);
+    let appended = try_import(
+        dir.path(),
+        &topology_helper(&dir, &[TopologySource::Child]),
+        &ImportOptions::default(),
+        &mut cursors,
+    )
+    .unwrap();
+    assert_eq!(appended.report.files_processed, 1);
+    accepted.extend(appended.ops.ops);
+    let parent = source_stream(dir.path(), &parent_path, 0);
+    let child = source_stream(dir.path(), &child_path, 0);
+    let complete = parent.op_from_position(SourcePosition::raw(3)).unwrap();
+    let terminal = child.op_from_position(SourcePosition::raw(3)).unwrap();
+    let edges = projected_lifecycle_edges(&accepted);
+    assert!(edges.contains(&(complete, 2, terminal)));
+    assert!(!edges.contains(&(
+        complete,
+        2,
+        child.op_from_position(SourcePosition::raw(2)).unwrap()
+    )));
+    // A conflicted or missing source occurrence is absent from admitted history.
+    let missing: Vec<_> = accepted
+        .iter()
+        .filter(|op| op.id != terminal)
+        .cloned()
+        .collect();
+    assert!(
+        projected_lifecycle_edges(&missing).is_empty(),
+        "an older prefix cannot replace a missing terminal"
+    );
+
+    let mut parent_file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&parent_path)
+        .unwrap();
+    writeln!(parent_file, "{}", event_line("second-spawn")).unwrap();
+    drop(parent_file);
+    let ambiguous = try_import(
+        dir.path(),
+        &topology_helper(&dir, &[TopologySource::Parent, TopologySource::Child]),
+        &ImportOptions::default(),
+        &mut cursors,
+    )
+    .unwrap();
+    accepted.extend(ambiguous.ops.ops);
+    let edges = projected_lifecycle_edges(&accepted);
+    assert!(
+        edges.iter().all(|(_, kind, _)| *kind != 1),
+        "two activations cannot reuse the earlier resolved spawn note"
+    );
+    assert!(edges.contains(&(complete, 2, terminal)));
+}
+
+#[test]
+fn lifecycle_occurrences_survive_removal_and_match_across_append_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent_bytes = topology_projection(TopologySource::Parent, false);
+    let mut records: Vec<serde_json::Value> = parent_bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    let mut removed = line_record(4, Vec::new(), None);
+    removed["projection"]["removedTurnIds"] = serde_json::json!(["turn"]);
+    records.push(removed);
+    let complete = projection_bytes(&records);
+    let initial = projection_bytes(records.get(..2).unwrap());
+    let child = topology_projection(TopologySource::Child, false);
+    let make_helper = |parent: &[u8]| {
+        let script = write_dispatching_helper(
+            dir.path(),
+            "rollback.sh",
+            &[
+                ("rollout-parent.jsonl", parent),
+                ("rollout-child.jsonl", &child),
+            ],
+        );
+        sh_helper(&script, &[])
+    };
+    let raw = topology_lines(true);
+    write_rollout(dir.path(), "rollout-parent.jsonl", raw.get(..2).unwrap());
+    write_rollout(dir.path(), "rollout-child.jsonl", &topology_lines(false));
+    let mut cursors = MemoryCursorStore::new();
+    let first = try_import(
+        dir.path(),
+        &make_helper(&initial),
+        &ImportOptions::default(),
+        &mut cursors,
+    )
+    .unwrap();
+    let parent_path = dir.path().join("rollout-parent.jsonl");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&parent_path)
+        .unwrap();
+    writeln!(file, "{}", raw.get(2).unwrap()).unwrap();
+    writeln!(file, "{}", event_line("rollback")).unwrap();
+    drop(file);
+    let second = try_import(
+        dir.path(),
+        &make_helper(&complete),
+        &ImportOptions::default(),
+        &mut cursors,
+    )
+    .unwrap();
+    assert_eq!(second.report.files_processed, 1);
+    let mut accepted = first.ops.ops;
+    accepted.extend(second.ops.ops);
+    let one_shot = import(dir.path(), &make_helper(&complete));
+    let lifecycle = |ops: &[editchain_core::Op]| {
+        let mut evidence: Vec<_> = provider_facts(ops)
+            .into_iter()
+            .filter(|(_, evidence)| matches!(evidence.fact, ProviderFact::CodexLifecycle(_)))
+            .map(|(op, _)| op.clone())
+            .collect();
+        evidence.sort_by_key(|op| op.id);
+        evidence
+    };
+    assert_eq!(
+        lifecycle(&accepted),
+        lifecycle(&one_shot.ops.ops),
+        "physical lifecycle facts are batch-invariant"
+    );
+    let edges = projected_lifecycle_edges(&accepted);
+    assert_eq!(
+        edges.len(),
+        2,
+        "turn removal does not erase captured activations or completed states"
+    );
+    assert_eq!(edges, projected_lifecycle_edges(&one_shot.ops.ops));
+}
+
+#[test]
+fn legacy_sources_backfill_provider_evidence_once_without_replaying_content() {
+    let dir = tempfile::tempdir().unwrap();
+    write_rollout(dir.path(), "rollout-parent.jsonl", &topology_lines(true));
+    write_rollout(dir.path(), "rollout-child.jsonl", &topology_lines(false));
+    let helper = topology_helper(&dir, &[]);
+    let mut cursors = MemoryCursorStore::new();
+    let first = try_import(dir.path(), &helper, &ImportOptions::default(), &mut cursors).unwrap();
+    let mut accepted: Vec<_> = first
+        .ops
+        .ops
+        .into_iter()
+        .filter(|op| !is_provider_evidence(op))
+        .collect();
+    let legacy = legacy_lifecycle_notes(dir.path());
+    accepted.extend(legacy.clone());
+    assert_eq!(
+        projected_lifecycle_edges(&accepted).len(),
+        2,
+        "historical notes resolve before typed provider evidence exists"
+    );
+    for name in ["rollout-parent.jsonl", "rollout-child.jsonl"] {
+        let key = source_key(dir.path(), &dir.path().join(name));
+        let mut legacy = cursors.get_cursor(&key).unwrap().unwrap();
+        legacy.normalization_version = 5;
+        cursors.set_cursor(&key, &legacy).unwrap();
+    }
+    let upgrade = try_import(dir.path(), &helper, &ImportOptions::default(), &mut cursors).unwrap();
+    assert_eq!(upgrade.report.raw_ops, 0);
+    assert_eq!(upgrade.report.evidence_ops, 4);
+    assert!(
+        upgrade
+            .ops
+            .ops
+            .iter()
+            .all(|op| matches!(op.kind, OpKind::Note(_))),
+        "metadata upgrade cannot regenerate content lanes"
+    );
+    accepted.extend(upgrade.ops.ops);
+    assert_eq!(projected_lifecycle_edges(&accepted).len(), 2);
+    assert!(
+        legacy.iter().all(|op| accepted.contains(op)),
+        "migration preserves the stored old notes"
+    );
+    let unavailable = HelperCommand::new("/not-an-installed-helper", Vec::new());
+    let unchanged = try_import(
+        dir.path(),
+        &unavailable,
+        &ImportOptions::default(),
+        &mut cursors,
+    )
+    .unwrap();
+    assert_eq!(unchanged.report.files_processed, 0);
+    assert!(unchanged.ops.ops.is_empty());
 }

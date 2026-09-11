@@ -174,8 +174,7 @@ async function readState(): Promise<Record<string, unknown>> {
     const visibleDateCells = Array.from(document.querySelectorAll<HTMLElement>('.date-cell'))
       .filter((cell) => (cell.textContent ?? '').trim() !== '' &&
         getComputedStyle(cell).display !== 'none');
-    const profileFn = (window as any).__editchainGetProfile;
-    const debug = (window as any).__editchainGpuDebug;
+    const debug = (window as any).__editchainRendererDebug;
     const metrics = typeof debug?.metrics === 'function' ? debug.metrics() : null;
     // Per-row SVG graph fragments: exactly one aria-hidden
     // svg.graph-row-fragment per hydrated row, centred on the row's middle.
@@ -227,7 +226,6 @@ async function readState(): Promise<Record<string, unknown>> {
     return {
       loader: debug?.loader ?? null,
       backend: typeof debug?.backend === 'function' ? debug.backend() : null,
-      profile: typeof profileFn === 'function' ? profileFn() : null,
       dataReady: (window as any).__editchainDataReady === true,
       inFlight: Number((window as any).__editchainInFlightCount ?? -1),
       total: typeof (window as any).__editchainGetTotal === 'function'
@@ -249,7 +247,6 @@ async function readState(): Promise<Record<string, unknown>> {
         ? debug.laneXAll()
         : null,
       renderCount: metrics?.renderCount ?? 0,
-      vertexCount: metrics?.vertexCount ?? 0,
       fragmentCount,
       fragmentMissing: rows.length - fragmentCount,
       fragmentIssues,
@@ -260,10 +257,7 @@ async function readState(): Promise<Record<string, unknown>> {
       visibleDateCount: visibleDateCells.length,
       clippedDateCount: visibleDateCells.filter((cell) =>
         cell.scrollWidth > cell.clientWidth + 1).length,
-      canvasCount: document.querySelectorAll('#gpu-canvas-host canvas').length,
-      foreignCanvasCount: document.querySelectorAll(
-        'canvas:not(#gpu-canvas-host canvas)'
-      ).length,
+      canvasCount: document.querySelectorAll('canvas').length,
       gridRole: document.querySelector('.tbl-grid')?.getAttribute('role') ?? null,
       gridRowCount: document.querySelector('.tbl-grid')?.getAttribute('aria-rowcount') ?? null,
     };
@@ -397,7 +391,6 @@ describe('EditChain History visual state matrix', () => {
     rendererInstanceId = initial.rendererInstanceId as string;
     expect(initial.loader).toBe('rust-history');
     expect(initial.backend).toBe('svg');
-    expect(initial.profile).toBe('activity');
     expect(initial.dataReady).toBe(true);
     expect((initial.rowCount as number)).toBeGreaterThan(0);
     expect(initial.uniqueRowCount).toBe(initial.rowCount);
@@ -408,9 +401,7 @@ describe('EditChain History visual state matrix', () => {
     expect((initial.visibleDateCount as number)).toBeGreaterThan(0);
     expect(initial.clippedDateCount).toBe(0);
     expect(initial.canvasCount).toBe(0);
-    expect(initial.foreignCanvasCount).toBe(0);
     expect((initial.renderCount as number)).toBeGreaterThan(0);
-    expect((initial.vertexCount as number)).toBe(0);
     expect((initial.fragmentCount as number)).toBe(initial.rowCount as number);
     expect((initial.fragmentMissing as number)).toBe(0);
     expect((initial.maxAlignDelta as number)).toBeLessThanOrEqual(1);
@@ -426,19 +417,6 @@ describe('EditChain History visual state matrix', () => {
     expect(laneXBaseline).toBeTruthy();
     expect(naturalGraphWidth).toBeTruthy();
     await capture('initial-activity', true, initial);
-
-    const profileSurface = await browser.execute(() => ({
-      control: !!document.getElementById('profile-control'),
-      activity: !!document.getElementById('profile-activity'),
-      raw: !!document.getElementById('profile-raw'),
-      setter: typeof (window as any).__editchainSetProfile,
-    }));
-    expect(profileSurface).toEqual({
-      control: false,
-      activity: false,
-      raw: false,
-      setter: 'undefined',
-    });
 
     // --- find-current / find-next ---------------------------------------------
     await browser.$('#search').setValue(QUERY);
@@ -1070,7 +1048,7 @@ describe('EditChain History visual state matrix', () => {
         window.dispatchEvent(new MouseEvent('mouseup', {
           bubbles: true, cancelable: true,
         }));
-        return (window as any).__editchainGpuDebug.graphState().graphWidth;
+        return (window as any).__editchainRendererDebug.graphState().graphWidth;
       }, deltaX);
     const expectPointerWidth = (actual: number, expected: number): void => {
       // MouseEvent.clientX is integer-valued in Chromium, while the natural

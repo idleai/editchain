@@ -2,7 +2,7 @@
 // fixture bridge: work_unit / session_summary / promoted / activity_bundle fidelity.
 //
 // Loads test/harness/fixtureBridge.js (a browser IIFE) in a sandboxed global
-// and drives GetWindow / GetLayout against the `workUnits` fixture, asserting:
+// and drives GetWindow against the `workUnits` fixture, asserting:
 //   - the bridge faithfully PASSES THROUGH authored work_unit /
 //     session_summary / promoted / activity_bundle metadata and DEFAULTS them
 //     on rows that
@@ -12,16 +12,10 @@
 //     other string maps
 //     to "unknown" (forward compatibility), so clients style only recognized
 //     typed bundles;
-//   - the Raw profile (hide_trace=false on the wire) is served the unbundled
-//     raw stream: members are top-level rows again, activity_bundle is None
-//     everywhere, while work_unit/promoted metadata is still present (the
-//     service annotates raw views too);
 //   - the fixture itself satisfies the view-wide invariants the renderer
 //     relies on: exactly one is_start/is_end per unit id, counts equal the
 //     per-view tallies, exact bundle member_counts, exact promoted sets, and
-//     fallback (title null) for units without narrative evidence;
-//   - GetLayout stays coherent with the profile's window rows (raw layout
-//     matches raw rows; edges only reference kept nodes).
+//     fallback (title null) for units without narrative evidence.
 //
 // Run: node --test test/harness/workUnitBridge.test.js
 'use strict';
@@ -47,6 +41,9 @@ require(path.join(__dirname, 'fixtureBridge.js'));
 require(path.join(__dirname, 'fixtures.js'));
 
 function request(body) {
+  window.__editchainStart();
+  const snapshot = capturedEvents.findLast((ev) => ev.data?.id === 'open').data.body.Ok.snapshot_id;
+  for (const request of Object.values(body)) request.snapshot_id = snapshot;
   const id = nextReqId++;
   capturedEvents.length = 0;
   window.vscode.postMessage({ id, body });
@@ -55,10 +52,10 @@ function request(body) {
   return matches[0].data.body;
 }
 
-function windowRows(fixtureName, filter) {
+function windowRows(fixtureName) {
   window.__editchainSetScenario(fixtureName);
   const resp = request({
-    GetWindow: { offset: 0, limit: 1000, filter: filter || {} },
+    GetWindow: { offset: 0, limit: 1000, include_layout: true },
   });
   assert.ok(resp.Ok, 'GetWindow must succeed: ' + JSON.stringify(resp.Error || resp));
   return resp.Ok;
@@ -72,53 +69,34 @@ before(() => {
 });
 
 test('fixture view-wide invariants: one start/end per unit id, exact counts, titles', () => {
-  for (const [rows, label] of [[fixture.rows, 'activity'], [fixture.rawRows, 'raw']]) {
-    const first = new Map();
-    const last = new Map();
-    const counts = new Map();
-    rows.forEach((r, i) => {
-      const id = r.work_unit.id;
-      assert.ok(id && typeof id === 'string', label + ' row ' + i + ' work_unit.id');
-      if (!first.has(id)) first.set(id, i);
-      last.set(id, i);
-      counts.set(id, (counts.get(id) || 0) + 1);
-    });
-    for (const [id, i] of first) {
-      const starts = rows.filter((r) => r.work_unit.id === id && r.work_unit.is_start);
-      const ends = rows.filter((r) => r.work_unit.id === id && r.work_unit.is_end);
-      assert.equal(starts.length, 1, label + ' unit ' + id + ' has exactly one start');
-      assert.equal(ends.length, 1, label + ' unit ' + id + ' has exactly one end');
-      assert.equal(starts[0].work_unit.count, counts.get(id), label + ' start count matches per-view tally');
-      assert.equal(starts[0].work_unit.is_start, true);
-      assert.equal(starts[0].work_unit.is_end, false);
-      assert.equal(ends[0].work_unit.is_end, true);
-      assert.equal(ends[0].work_unit.is_start, false);
-    }
-    // Exact authored tallies (Activity 7/4/2, Raw 14/5/2).
-    const expected = label === 'activity'
-      ? { 'session:s1/turn:t1': 7, 'session:s1/turn:t2': 4, 'repo:ops': 2 }
-      : { 'session:s1/turn:t1': 14, 'session:s1/turn:t2': 5, 'repo:ops': 2 };
-    assert.deepEqual(Object.fromEntries(counts), expected, label + ' per-unit counts');
-
-    const sessionRows = rows.filter((r) => r.group.startsWith('session:'));
-    const summaries = sessionRows.filter((r) => r.session_summary);
-    assert.equal(summaries.length, 1, label + ' has one whole-session marker');
-    assert.equal(summaries[0], sessionRows[0], label + ' marker is on the newest session row');
-    assert.equal(summaries[0].session_summary.count, sessionRows.length,
-      label + ' session count spans every turn and session-scoped row');
+  const rows = fixture.rows;
+  const counts = new Map();
+  rows.forEach((row, index) => {
+    const id = row.work_unit.id;
+    assert.ok(id && typeof id === 'string', 'row ' + index + ' work_unit.id');
+    counts.set(id, (counts.get(id) || 0) + 1);
+  });
+  for (const id of counts.keys()) {
+    const starts = rows.filter((row) => row.work_unit.id === id && row.work_unit.is_start);
+    const ends = rows.filter((row) => row.work_unit.id === id && row.work_unit.is_end);
+    assert.equal(starts.length, 1, 'unit ' + id + ' has exactly one start');
+    assert.equal(ends.length, 1, 'unit ' + id + ' has exactly one end');
+    assert.equal(starts[0].work_unit.count, counts.get(id));
   }
-  // Titled units carry the oldest narrative summary verbatim on the wire
-  // (Markdown cleanup is a renderer concern); the fallback ops unit with no
-  // narrative evidence has title null in BOTH views.
-  for (const rows of [fixture.rows, fixture.rawRows]) {
-    const title = (id) => {
-      const r = rows.find((x) => x.work_unit.id === id);
-      return r && r.work_unit.title;
-    };
-    assert.equal(title('session:s1/turn:t1'), '**User asks** to fix `the build`');
-    assert.equal(title('session:s1/turn:t2'), 'User asks to check the result');
-    assert.equal(title('repo:ops'), null);
-  }
+  assert.deepEqual(Object.fromEntries(counts), {
+    'session:s1/turn:t1': 7,
+    'session:s1/turn:t2': 4,
+    'repo:ops': 2,
+  });
+  const sessionRows = rows.filter((row) => row.group.startsWith('session:'));
+  const summaries = sessionRows.filter((row) => row.session_summary);
+  assert.equal(summaries.length, 1);
+  assert.equal(summaries[0], sessionRows[0]);
+  assert.equal(summaries[0].session_summary.count, sessionRows.length);
+  const title = (id) => rows.find((row) => row.work_unit.id === id)?.work_unit.title;
+  assert.equal(title('session:s1/turn:t1'), '**User asks** to fix `the build`');
+  assert.equal(title('session:s1/turn:t2'), 'User asks to check the result');
+  assert.equal(title('repo:ops'), null);
 });
 
 test('exact bundle metadata: member_count matches folded members; promoted sets exact', () => {
@@ -145,27 +123,15 @@ test('exact bundle metadata: member_count matches folded members; promoted sets 
   assert.equal(byKey.get('wu:execsub').activity_bundle, null,
     'ordinary execute-with-subops row must not carry activity_bundle');
   assert.ok((byKey.get('wu:execsub').sub_ops || []).length === 2);
-  // Raw view: bundles unfolded, activity_bundle None everywhere, metadata kept.
-  const rawByKey = new Map(fixture.rawRows.map((r) => [r.node_key, r]));
-  for (const key of ['wu:a1', 'wu:a2', 'wu:a3', 'wu:b1', 'wu:b2', 'wu:p1', 'wu:p2', 'wu:p3', 'wu:x1', 'wu:x2', 'wu:x3', 'wu:x4']) {
-    const r = rawByKey.get(key);
-    assert.ok(r, key + ' must exist unfolded in raw rows');
-    assert.equal(r.activity_bundle, null, key + ' raw rows never bundle');
-    assert.ok(r.work_unit && r.work_unit.id, key + ' raw rows keep work_unit metadata');
-  }
-  assert.equal(fixture.rawRows.some((r) => r.activity_bundle), false, 'no raw row carries activity_bundle');
   const expectedPromoted = ['wu:req1', 'wu:req2', 'wu:fail', 'wu:chg', 'wu:ver'];
-  for (const rows of [fixture.rows, fixture.rawRows]) {
-    assert.deepEqual(
-      rows.filter((r) => r.promoted).map((r) => r.node_key),
-      expectedPromoted,
-      'promoted set must be identical across profiles'
-    );
-  }
+  assert.deepEqual(
+    fixture.rows.filter((row) => row.promoted).map((row) => row.node_key),
+    expectedPromoted
+  );
 });
 
-test('bridge PASSES THROUGH authored activity metadata in GetWindow (Activity profile)', () => {
-  const ok = windowRows(FIXTURE, { hide_trace: true });
+test('bridge PASSES THROUGH authored activity metadata in the fixed Activity view', () => {
+  const ok = windowRows(FIXTURE);
   assert.equal(ok.rows.filter((r) => !r.is_subop).length, 13,
     'activity view serves 13 top-level rows (plus expanded sub-op rows)');
   const subopRows = ok.rows.filter((r) => r.is_subop);
@@ -215,7 +181,7 @@ test('bridge DEFAULTS additive fields and coerces the bundle kind enum (serde pa
     layoutRows: [{ node: legacy.node_key, lane: 0 }],
     edges: [],
   };
-  const ok = request({ GetWindow: { offset: 0, limit: 10, filter: {} } }).Ok;
+  const ok = request({ GetWindow: { offset: 0, limit: 10, include_layout: true } }).Ok;
   assert.equal(ok.rows.length, 1);
   const row = ok.rows[0];
   assert.equal(row.work_unit, null, 'missing work_unit defaults to null (serde default)');
@@ -238,7 +204,7 @@ test('bridge DEFAULTS additive fields and coerces the bundle kind enum (serde pa
     layoutRows: [],
     edges: [],
   };
-  const coerced = request({ GetWindow: { offset: 0, limit: 10, filter: {} } }).Ok.rows;
+  const coerced = request({ GetWindow: { offset: 0, limit: 10, include_layout: true } }).Ok.rows;
   assert.equal(coerced.find((r) => r.node_key === 'b:1').activity_bundle.kind, 'execute-run',
     'typed kind survives the enum round trip');
   assert.equal(coerced.find((r) => r.node_key === 'b:2').activity_bundle.kind, 'plan-repeat',
@@ -247,30 +213,4 @@ test('bridge DEFAULTS additive fields and coerces the bundle kind enum (serde pa
     'typed work-group kind survives the enum round trip');
   assert.equal(coerced.find((r) => r.node_key === 'b:3').activity_bundle.kind, 'unknown',
     'unknown wire strings coerce to the Unknown variant (forward compatibility)');
-});
-
-test('bridge serves the raw stream for hide_trace=false and keeps GetLayout coherent', () => {
-  const rawWindow = windowRows(FIXTURE, { hide_trace: false });
-  assert.equal(rawWindow.rows.length, 21, 'raw profile serves 21 top-level rows');
-  assert.equal(rawWindow.rows.filter((r) => r.activity_bundle).length, 0, 'raw rows never carry bundle rows');
-  assert.ok(rawWindow.rows.every((r) => r.work_unit && r.work_unit.id !== undefined), 'raw rows keep work_unit');
-  assert.ok(rawWindow.rows.some((r) => r.promoted), 'raw rows keep promotion metadata');
-  // Unit markers are raw-view-wide (counts recomputed over the raw list).
-  const run1member = rawWindow.rows.find((r) => r.node_key === 'wu:a2');
-  assert.equal(run1member.work_unit.count, 14, 'raw member unit count uses the raw view tally');
-
-  const rawLayout = request({ GetLayout: { offset: 0, limit: 1000, filter: { hide_trace: false } } }).Ok;
-  assert.equal(rawLayout.rows.length, 21, 'raw layout matches raw row count');
-  const layoutKeys = new Set(rawLayout.rows.map((r) => r.node));
-  assert.equal(layoutKeys.size, 21);
-  for (const e of rawLayout.edges) {
-    assert.ok(layoutKeys.has(e.child), 'edge child ' + e.child + ' must exist in raw layout rows');
-    assert.ok(layoutKeys.has(e.parent), 'edge parent ' + e.parent + ' must exist in raw layout rows');
-  }
-  // And the Activity profile (hide_trace true / absent) keeps its own layout.
-  const actLayout = request({ GetLayout: { offset: 0, limit: 1000, filter: { hide_trace: true } } }).Ok;
-  assert.equal(actLayout.rows.length, 13);
-  for (const e of actLayout.edges) {
-    assert.ok(new Set(actLayout.rows.map((r) => r.node)).has(e.child));
-  }
 });

@@ -5,7 +5,6 @@
 //! the lane count.
 
 // Crate-level dependency markers (used by Cargo for feature resolution).
-use regex as _;
 use serde as _;
 use serde_json as _;
 
@@ -126,26 +125,6 @@ fn msg_op(node: u64, seq: u64, session: u64, clock_ms: u64, parent: Option<OpId>
         kind: OpKind::Message(MessageOp {
             content: Payload::Inline(format!("msg {node}:{seq}").into_bytes()),
             content_type: Payload::Inline(b"text/plain".to_vec()),
-        }),
-    }
-}
-
-/// A standalone Tool op (its own row; used for include-kind filter scenarios
-/// where the structural anchor/target rows are tool-kind rows that "messages
-/// only" would otherwise exclude).
-fn tool_op_row(node: u64, seq: u64, session: u64, clock_ms: u64, parent: Option<OpId>) -> Op {
-    Op {
-        id: OpId::new(NodeId(node), 0, seq),
-        parents: parent.map_or(ParentSet::None, ParentSet::One),
-        actor: ActorId(1),
-        clock: Clock::UnixMs(clock_ms),
-        scope: ScopeRef::Session(SessionId(session)),
-        tags: Tags::AGENT | Tags::TOOL,
-        kind: OpKind::Tool(ToolOp {
-            tool_call_id: Payload::Empty,
-            tool_name: Payload::Inline(b"Bash".to_vec()),
-            stage: ToolStage::Start,
-            content: Payload::Empty,
         }),
     }
 }
@@ -640,9 +619,9 @@ fn legacy_inferred_claude_fork_note_is_inert() {
         .all(|edge| edge.child != edge.parent));
 }
 
-/// Filtered + windowed layout: after the default (hide-undated, splice) filter
-/// and a virtual `SubagentOf` edge, every emitted edge must resolve to a row that
-/// is present in the filtered layout, and the splice must reconnect across the
+/// Activity + windowed layout: after omitting and splicing an undated row and
+/// adding a virtual `SubagentOf` edge, every emitted edge must resolve to a row
+/// that is present in the Activity layout, and the splice must reconnect across the
 /// hidden undated row.
 #[test]
 fn filtered_layout_resolves_folded_relationship_endpoints() {
@@ -650,14 +629,11 @@ fn filtered_layout_resolves_folded_relationship_endpoints() {
     let spawn_marker = child_message_op(2, 1, parent_import.id, "spawned subagent");
     let sub_import = import_op(3, 1, 20, 3_000);
     let sub_first = child_message_op(4, 1, sub_import.id, "sub work");
-    // An intermediate row on the subagent backbone whose summary matches the
-    // hide pattern; it is not an endpoint (it has a parent and a child), so the
-    // pattern-based hide truncation removes it and splice reconnects across it.
+    // An undated intermediate row on the subagent backbone is omitted by the
+    // Activity view, which must splice its dated neighbors back together.
     let mut sub_middle = import_op(3, 2, 20, 3_500);
     sub_middle.parents = ParentSet::One(sub_import.id);
-    if let OpKind::Import(i) = &mut sub_middle.kind {
-        i.raw_ref = Payload::Inline(b"HIDE_ME".to_vec());
-    }
+    sub_middle.clock = Clock::UnixMs(0);
     let mut sub_later = import_op(3, 3, 20, 4_000);
     sub_later.parents = ParentSet::One(sub_middle.id);
     let note = relation_note(
@@ -678,22 +654,14 @@ fn filtered_layout_resolves_folded_relationship_endpoints() {
         note,
     ]);
 
-    let filter = editchain_project::filter::ChainFilter::new(
-        "HIDE_ME".to_string(),
-        String::new(),
-        String::new(),
-        false,
-        true,
-        false,
-    );
-    let nodes = projection.filtered_nodes(&filter);
+    let nodes = projection.activity_nodes();
     let keys: Vec<String> = nodes
         .iter()
         .map(editchain_project::HistoryNode::node_key)
         .collect();
     assert!(
         !keys.contains(&sub_middle.id.to_string()),
-        "pattern row hidden"
+        "undated row hidden"
     );
 
     // Splice reconnects the later subagent row to the kept anchor row.
@@ -702,7 +670,7 @@ fn filtered_layout_resolves_folded_relationship_endpoints() {
         .find(|n| n.node_key() == sub_later.id.to_string())
         .expect("later subagent row kept");
     assert_eq!(
-        later.parent_keys(&projection.git.links, projection.relationship_notes()),
+        later.parent_keys(projection.git().links(), projection.relationship_notes()),
         vec![sub_import.id.to_string()],
         "splice must reconnect across the hidden undated row"
     );
@@ -735,90 +703,6 @@ fn filtered_layout_resolves_folded_relationship_endpoints() {
     assert_eq!(max_lane, 0, "no relationship endpoint may inflate lanes");
 }
 
-/// Include-kind ("messages only") filtering must preserve structural relation
-/// anchor and target rows even when their kind (tool) matches the exclusion:
-/// the rows that carry or point at a structural note are graph-topology-critical
-/// and keep branch geometry visible in the filtered view. The relation's parent
-/// must be one of the row's final parents AND be drawn in the filtered layout.
-#[test]
-fn include_kind_filter_preserves_structural_anchor_and_target_rows() {
-    // The parent thread's spawn marker is a Tool op row (kind "tool"); the
-    // subagent's first op is also a Tool op row (kind "tool"). Both would be
-    // excluded by an INCLUSIVE "^message$" kind constraint unless the filter
-    // preserves structural anchors/targets.
-    let spawn = tool_op_row(1, 1, 10, 1_000, None);
-    let sub_first = tool_op_row(2, 1, 20, 2_000, None);
-    let note = relation_note(5, 1, sub_first.id, spawn.id, NoteRelationship::SubagentOf);
-
-    let projection = HistoryProjection::from_ops(vec![spawn.clone(), sub_first.clone(), note]);
-
-    let filter = editchain_project::filter::ChainFilter::new(
-        String::new(),
-        String::new(),
-        "^message$".to_string(),
-        false,
-        true,
-        false,
-    );
-    let nodes = projection.filtered_nodes(&filter);
-    let keys: Vec<String> = nodes
-        .iter()
-        .map(editchain_project::HistoryNode::node_key)
-        .collect();
-    assert!(
-        keys.contains(&sub_first.id.to_string()),
-        "structural anchor row must survive messages-only filtering; got {keys:?}"
-    );
-    assert!(
-        keys.contains(&spawn.id.to_string()),
-        "structural target row must survive messages-only filtering; got {keys:?}"
-    );
-
-    // The relation.parent is one of the anchor row's final parents in the
-    // filtered view.
-    let sub = nodes
-        .iter()
-        .find(|n| n.node_key() == sub_first.id.to_string())
-        .expect("subagent first op kept");
-    let parents = sub.parent_keys(&projection.git.links, projection.relationship_notes());
-    assert!(
-        parents.contains(&spawn.id.to_string()),
-        "relation.parent {} must be in row.parents {parents:?}",
-        spawn.id
-    );
-
-    // The filtered layout draws the SubagentOf edge, and every emitted edge
-    // endpoint is a row present in the filtered layout (no phantom keys).
-    let ctx = projection.layout_context(&nodes);
-    let edges = ctx.edges_for_window(0, nodes.len());
-    assert!(
-        edges
-            .iter()
-            .any(|e| { e.child == sub_first.id.to_string() && e.parent == spawn.id.to_string() }),
-        "filtered windowed layout must draw the SubagentOf edge to a visible row; got {:#?}",
-        edges
-            .iter()
-            .map(|e| (e.child.as_str(), e.parent.as_str()))
-            .collect::<Vec<_>>()
-    );
-    let present: std::collections::HashSet<String> = keys.iter().cloned().collect();
-    for edge in &edges {
-        assert!(
-            present.contains(&edge.child),
-            "child {} must be a visible row",
-            edge.child
-        );
-        assert!(
-            present.contains(&edge.parent),
-            "parent {} must be a visible row",
-            edge.parent
-        );
-    }
-}
-
-/// The canonical representative map covers every folded op: relationship notes
-/// are keyed by visible anchors, and every edge the projection draws (layout,
-/// lifted parents) resolves to a visible row — never to a folded op id.
 #[test]
 fn canonical_notes_reference_only_visible_rows() {
     let parent_import = import_op(1, 1, 10, 1_000);
@@ -877,6 +761,7 @@ fn parent_relations_for_emits_every_distinct_kind_per_parent() {
     let sub_note = relation_note(6, 2, b1.id, t1.id, NoteRelationship::SubagentOf);
     let dup_sub_note = relation_note(7, 3, b1.id, t1.id, NoteRelationship::SubagentOf);
 
+    let evidence = [fork_note.id, sub_note.id, dup_sub_note.id];
     let projection = HistoryProjection::from_ops(vec![
         t1.clone(),
         b1.clone(),
@@ -907,4 +792,15 @@ fn parent_relations_for_emits_every_distinct_kind_per_parent() {
         ],
         "every distinct (parent, kind) must be emitted once"
     );
+    let graph = projection.resolved_graph(&projection.nodes());
+    let relations = graph.relations(editchain_project::NodeKey::Op(b1.id));
+    assert_eq!(relations.len(), 2);
+    assert_eq!(relations.first().unwrap().evidence, vec![evidence[0]]);
+    assert_eq!(
+        relations.last().unwrap().evidence,
+        vec![evidence[1], evidence[2]]
+    );
+    assert!(relations.iter().all(|relation| graph
+        .parents(editchain_project::NodeKey::Op(b1.id))
+        .contains(&relation.parent)));
 }

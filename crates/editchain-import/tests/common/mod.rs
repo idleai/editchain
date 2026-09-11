@@ -8,9 +8,9 @@
 
 use std::path::{Path, PathBuf};
 
-use editchain_core::op::{ImportOp, OpKind};
+use editchain_core::op::{ImportOp, NoteRelationship, OpKind};
 use editchain_core::payload::{ContentId, Payload};
-use editchain_core::Op;
+use editchain_core::{Op, OpId};
 
 use editchain_import::codex::{import_codex, CodexDiscoveryRequest, HelperCommand};
 use editchain_import::error::ImportError;
@@ -28,6 +28,44 @@ pub(crate) struct Harness {
     pub blobs: ContentAddressedBlobSink,
 }
 
+/// Exact resolved endpoints, coalescing the annotations for each supporting fact.
+pub(crate) fn relationship_edges(
+    projection: &editchain_project::HistoryProjection,
+    relationship: NoteRelationship,
+) -> std::collections::BTreeSet<(OpId, OpId)> {
+    projection
+        .relationship_notes()
+        .values()
+        .flatten()
+        .filter_map(|op| match &op.kind {
+            OpKind::Note(note) if note.relationship == relationship => Some((op, note)),
+            _ => None,
+        })
+        .flat_map(|(op, note)| {
+            op.parents.iter().flat_map(move |source| {
+                note.target_ids.iter().map(move |target| (*source, *target))
+            })
+        })
+        .collect()
+}
+
+/// Typed persisted evidence and its unchanged source envelope.
+pub(crate) fn provider_facts(ops: &[Op]) -> Vec<(&Op, editchain_core::provider::ProviderEvidence)> {
+    ops.iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Note(note) if note.relationship == NoteRelationship::ProviderEvidence => {
+                match &note.content {
+                    Payload::Inline(content) => {
+                        Some((op, serde_json::from_slice(content).unwrap()))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Run an import with explicit cursors, returning any error.
 pub(crate) fn try_import(
     root: &Path,
@@ -38,6 +76,7 @@ pub(crate) fn try_import(
     let mut ops_sink = MemoryOpSink::new();
     let mut blobs_sink = ContentAddressedBlobSink::new();
     let request = CodexDiscoveryRequest {
+        repositories: &(),
         workspace_path: PathBuf::from("/workspace"),
         raw_root: root.to_path_buf(),
     };

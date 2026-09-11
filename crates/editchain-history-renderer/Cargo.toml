@@ -1,0 +1,58 @@
+[package]
+name = "editchain-history-renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# The HistoryApp application core is pure std + serde_json and compiles for
+# both native tests and the wasm32 webview target.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+editchain-protocol = { path = "../editchain-protocol" }
+serde = { workspace = true, features = ["alloc"] }
+serde_json = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+js-sys = { version = "=0.3.104", default-features = false }
+web-sys = { workspace = true, features = [
+    "CssStyleDeclaration",
+    "Document",
+    "DocumentFragment",
+    "DomRect",
+    "DomTokenList",
+    "Element",
+    "Event",
+    "EventTarget",
+    "FocusOptions",
+    "HtmlButtonElement",
+    "HtmlDivElement",
+    "HtmlElement",
+    "HtmlInputElement",
+    "KeyboardEvent",
+    "Location",
+    "MessageEvent",
+    "MouseEvent",
+    "Node",
+    "NodeList",
+    "Performance",
+    "ResizeObserver",
+    "ResizeObserverEntry",
+    "Text",
+    "Window",
+    "console",
+] }
+
+[dev-dependencies]
+editchain-protocol = { path = "../editchain-protocol" }
+serde = { workspace = true, features = ["alloc"] }
+serde_json = { workspace = true }

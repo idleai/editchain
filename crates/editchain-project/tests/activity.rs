@@ -10,7 +10,6 @@
 )]
 
 // Crate-level dependency markers (used by Cargo for feature resolution).
-use regex as _;
 use serde as _;
 use serde_json as _;
 
@@ -26,21 +25,128 @@ use editchain_project::activity::{
     bundle_activity_work_groups, bundle_claude_response_tool_fragments,
     inline_context_compaction_checkpoints, ActivityRowAnnotation,
 };
-use editchain_project::filter::ChainFilter;
 use editchain_project::meta::NodeMeta;
 use editchain_project::taxonomy::{ActivityKind, ChainState, Outcome, RecordRole, Visibility};
-use editchain_project::{EffectiveTime, HistoryNode, HistoryProjection, ProjectionOptions};
+use editchain_project::{EffectiveTime, HistoryNode, HistoryProjection};
 
-/// The Activity view filter the service uses for its fixed default profile.
-fn activity_filter() -> ChainFilter {
-    ChainFilter::new(
-        String::new(),
-        String::new(),
-        String::new(),
-        false,
-        true,
-        true,
-    )
+struct IdentityPresentation;
+
+impl editchain_project::activity_view::ActivityPresentation for IdentityPresentation {
+    type Row = editchain_project::NodeKey;
+
+    fn activity(&self, node: &HistoryNode) -> Self::Row {
+        node.key()
+    }
+
+    fn details(&self, node: &HistoryNode) -> Vec<Self::Row> {
+        node.sub_ops()
+            .iter()
+            .map(|op| editchain_project::NodeKey::Op(op.id))
+            .collect()
+    }
+}
+
+#[test]
+fn complete_activity_view_shares_tree_coordinates_and_source_owners() {
+    let mut ops = linear_chain(
+        1,
+        "request",
+        &[
+            row_spec(40, 2, "tool", Some("completed"), 7),
+            row_spec(40, 3, "tool", Some("completed"), 7),
+            row_spec(40, 4, "tool", Some("completed"), 7),
+            row_spec(40, 5, "file", None, 7),
+            row_spec(40, 6, "message", None, 7),
+        ],
+    );
+    let tool_id = OpId::new(NodeId(40), 0, 40);
+    ops.push(world_state_import_op(40, 70, tool_id));
+    let projection = HistoryProjection::from_ops(ops.clone());
+    let view = projection.build_activity_view(|_| true, &IdentityPresentation);
+    let entries = view.entries();
+    assert_eq!(entries.len(), 3, "answer / work / request");
+    assert!(view.layout().is_none(), "layout remains deferred");
+    let group = &entries[1];
+    assert_eq!(group.node().activity_kind(), ActivityKind::Work);
+    assert_eq!(group.node().represented_activity_count(), 4);
+    assert_eq!(
+        group.children(0).count(),
+        3,
+        "edit, state-bearing tool, and nested execute bundle"
+    );
+    let nested = group
+        .descendants()
+        .iter()
+        .position(|row| {
+            *row.content() == editchain_project::NodeKey::Op(OpId::new(NodeId(40), 0, 30))
+        })
+        .expect("nested bundle");
+    let nested_row = &group.descendants()[nested];
+    assert_eq!(nested_row.depth(), 1);
+    assert_eq!(
+        nested_row.descendant_count(),
+        2,
+        "the two earlier tools stay bundled"
+    );
+    assert_eq!(group.children(nested + 1).count(), 2);
+    for (index, row) in group.descendants().iter().enumerate().skip(nested + 1) {
+        assert_eq!(row.parent_relative(), nested + 1);
+        assert_eq!(row.depth(), 2);
+        assert_eq!(group.children(index + 1).count(), 0);
+    }
+    assert_eq!(view.starts(), &[0, 1, 8, 9]);
+    assert_eq!(view.expanded_total(), 9);
+    assert_eq!(view.sub_op_counts(), vec![0, 6, 0]);
+    assert_eq!(
+        view.expansion_spans(),
+        vec![
+            editchain_project::activity_view::ExpansionSpan {
+                row: 1,
+                descendant_count: 6
+            },
+            editchain_project::activity_view::ExpansionSpan {
+                row: 3,
+                descendant_count: 1
+            },
+            editchain_project::activity_view::ExpansionSpan {
+                row: 5,
+                descendant_count: 2
+            },
+        ]
+    );
+    for op in &ops {
+        assert!(
+            view.source_disposition(editchain_project::NodeKey::Op(op.id))
+                .is_some(),
+            "accepted source {} has an owner",
+            op.id
+        );
+    }
+    assert_eq!(
+        view.source_row(editchain_project::NodeKey::Op(tool_id)),
+        Some(1)
+    );
+    let layout = view.ensure_layout();
+    for key in view.graph().keys() {
+        assert_eq!(
+            layout
+                .parents
+                .get(&key.to_string())
+                .cloned()
+                .unwrap_or_default(),
+            view.graph()
+                .parents(*key)
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+    }
+    assert!(std::ptr::eq(layout, view.ensure_layout()));
+    assert_eq!(
+        projection.ops(),
+        &ops,
+        "view construction preserves every source envelope"
+    );
 }
 
 /// Raw JSONL for an import row with an optional structured tool/command status.
@@ -234,7 +340,7 @@ fn linear_chain(root_seq: u64, root_text: &str, rows: &[RowSpec]) -> Vec<Op> {
 /// Project ops and return the Activity-filtered node list + annotations.
 fn activity_view(ops: Vec<Op>) -> (Vec<HistoryNode>, Vec<ActivityRowAnnotation>) {
     let projection = HistoryProjection::from_ops(ops);
-    let nodes = projection.filtered_nodes(&activity_filter());
+    let nodes = projection.activity_nodes();
     let annotations = annotate_activity_rows(&nodes);
     (nodes, annotations)
 }
@@ -271,12 +377,12 @@ fn context_compaction_stays_visible_and_is_inlined_without_changing_raw() {
         .find(|node| node.node_key() == continuation.id.to_string())
         .unwrap_or_else(|| panic!("raw continuation missing"));
     assert_eq!(
-        raw_continuation.parent_keys(&projection.git.links, projection.relationship_notes()),
+        raw_continuation.parent_keys(projection.git().links(), projection.relationship_notes()),
         vec![root.id.to_string()],
         "Raw keeps the imported sibling topology"
     );
 
-    let filtered = projection.filtered_nodes(&activity_filter());
+    let filtered = projection.activity_nodes();
     let structural = projection.structural_row_keys(&filtered);
     let activity = inline_context_compaction_checkpoints(filtered, &structural);
     assert_eq!(activity.len(), 3, "the checkpoint remains a visible row");
@@ -287,7 +393,7 @@ fn context_compaction_stays_visible_and_is_inlined_without_changing_raw() {
     assert_eq!(checkpoint.visibility(), Visibility::Primary);
     assert_eq!(checkpoint.activity_kind(), ActivityKind::Plan);
     assert_eq!(
-        checkpoint.parent_keys(&projection.git.links, projection.relationship_notes()),
+        checkpoint.parent_keys(projection.git().links(), projection.relationship_notes()),
         vec![root.id.to_string()]
     );
     let activity_continuation = activity
@@ -295,7 +401,8 @@ fn context_compaction_stays_visible_and_is_inlined_without_changing_raw() {
         .find(|node| node.node_key() == continuation.id.to_string())
         .unwrap_or_else(|| panic!("Activity continuation missing"));
     assert_eq!(
-        activity_continuation.parent_keys(&projection.git.links, projection.relationship_notes()),
+        activity_continuation
+            .parent_keys(projection.git().links(), projection.relationship_notes()),
         vec![compacted.id.to_string()],
         "Activity inserts the continuation after the visible checkpoint"
     );
@@ -324,15 +431,15 @@ fn context_compaction_does_not_rewire_a_structural_continuation() {
         continuation.clone(),
         continuation_message,
     ]);
-    let filtered = projection.filtered_nodes(&activity_filter());
-    let structural = HashSet::from([continuation.id.to_string()]);
+    let filtered = projection.activity_nodes();
+    let structural = HashSet::from([editchain_project::NodeKey::Op(continuation.id)]);
     let activity = inline_context_compaction_checkpoints(filtered, &structural);
     let kept = activity
         .iter()
         .find(|node| node.node_key() == continuation.id.to_string())
         .unwrap_or_else(|| panic!("structural continuation missing"));
     assert_eq!(
-        kept.parent_keys(&projection.git.links, projection.relationship_notes()),
+        kept.parent_keys(projection.git().links(), projection.relationship_notes()),
         vec![root.id.to_string()],
         "structural fork/subagent/reconnect endpoints are never rewritten"
     );
@@ -367,7 +474,7 @@ fn manual_collapsed(
         op: Arc::new(op),
         source_time: EffectiveTime::Observed(0),
         parent_override: None,
-        summary: summary.to_string(),
+        content: editchain_project::content::SelectedContent::summary(summary.to_string()),
         kind: kind.to_string(),
         author: "agent".to_string(),
         sub_ops: Vec::new(),
@@ -471,17 +578,12 @@ fn session_start_rows_remain_metadata_instead_of_becoming_a_work_group() {
         );
     }
 
-    let projection = HistoryProjection::from_ops_with(
-        vec![
-            session_meta.clone(),
-            task_started.clone(),
-            session_title.clone(),
-        ],
-        ProjectionOptions {
-            bundle_metadata: true,
-        },
-    );
-    let nodes = projection.filtered_nodes(&activity_filter());
+    let projection = HistoryProjection::from_ops(vec![
+        session_meta.clone(),
+        task_started.clone(),
+        session_title.clone(),
+    ]);
+    let nodes = projection.activity_nodes();
     let structural = projection.structural_row_keys(&nodes);
     let grouped = bundle_activity_work_groups(nodes, &structural);
 
@@ -761,7 +863,7 @@ fn plan_repeat_grouping_never_crosses_content_group_or_structural_boundaries() {
         plan(import_op(22, 2, None, None), "Structural heading"),
         plan(import_op(22, 1, None, None), "Structural heading"),
     ];
-    let structural = HashSet::from([structural_pair[0].node_key()]);
+    let structural = HashSet::from([structural_pair[0].key()]);
     let preserved = bundle_activity_plan_repeats(structural_pair, &structural);
     assert!(
         preserved
@@ -900,13 +1002,11 @@ fn bundles_parallel_claude_tool_blocks_from_one_exact_response() {
         panic!("expected continuation row");
     };
     assert_eq!(
-        op.parents
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>(),
+        bundled[0].parent_keys(&empty_links, &empty_notes),
         vec![bundle.node_key()],
-        "the response continuation must follow the bundle, not form a sibling"
+        "the response continuation follows the bundle"
     );
+    assert_eq!(op.as_ref(), &continuation, "source envelope is retained");
 }
 
 #[test]
@@ -1448,8 +1548,10 @@ fn claude_response_fragment_with_structural_topology_stays_visible() {
         ),
     ];
 
-    let bundled =
-        bundle_claude_response_tool_fragments(nodes, &HashSet::from([tool.id.to_string()]));
+    let bundled = bundle_claude_response_tool_fragments(
+        nodes,
+        &HashSet::from([editchain_project::NodeKey::Op(tool.id)]),
+    );
 
     assert_eq!(bundled.len(), 4);
     assert!(bundled
@@ -1795,13 +1897,8 @@ fn world_state_subop_member_breaks_runs() {
         tool_child(402, 1030, a_stateful.id, "Bash", 1),
         meta.clone(),
     ];
-    let projection = HistoryProjection::from_ops_with(
-        ops,
-        ProjectionOptions {
-            bundle_metadata: true,
-        },
-    );
-    let nodes = projection.filtered_nodes(&activity_filter());
+    let projection = HistoryProjection::from_ops(ops);
+    let nodes = projection.activity_nodes();
     assert_eq!(nodes.len(), 3);
     let bundled = bundle(nodes);
     let stateful_row = bundled
@@ -2214,7 +2311,12 @@ fn bundle_parents_rewire_to_the_anchor_key() {
     let HistoryNode::CollapsedImport { op, .. } = kept_message else {
         panic!("expected kept CollapsedImport message row");
     };
-    let parent_keys: Vec<String> = op.parents.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        op.parents,
+        ParentSet::One(tool_op_3.id),
+        "source parent is retained"
+    );
+    let parent_keys = kept_message.parent_keys(&BTreeMap::new(), &HashMap::new());
     assert_eq!(parent_keys, vec![tool_op_4.id.to_string()]);
     let HistoryNode::ExecuteBundle { .. } = &bundled[0] else {
         panic!("expected ExecuteBundle at the run slot");

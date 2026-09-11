@@ -21,27 +21,28 @@
 //!   older `started` occurrence;
 //! - copied `forkedFromId` metadata is retained as an execution fact and never
 //!   converted into timestamp-selected `ForkOf` geometry;
-//! - relationship notes are session-scoped.
+//! - persisted source and lifecycle evidence is session-scoped.
 #![cfg(unix)]
 #![expect(
     clippy::arithmetic_side_effects,
     clippy::as_conversions,
-    clippy::indexing_slicing,
     clippy::needless_pass_by_value,
-    clippy::panic,
     clippy::unwrap_used,
-    clippy::wildcard_enum_match_arm,
     reason = "test helpers index/panic/cast/unwrap on known-length fixture vectors"
 )]
 
 use blake3 as _;
 use editchain_core as _;
 use editchain_project as _;
+use editchain_store as _;
+use process_wrap as _;
 use proptest as _;
 use serde as _;
 use serde_json as _;
 use sha2 as _;
 use tempfile as _;
+use time as _;
+use tokio as _;
 
 #[expect(
     dead_code,
@@ -50,9 +51,10 @@ use tempfile as _;
 mod common;
 
 use editchain_core::op::{NoteRelationship, OpKind};
-use editchain_core::parents::ParentSet;
 use editchain_core::payload::Payload;
+use editchain_core::provider::{CodexLifecycleEvent, CodexSpawnSignal, ProviderFact};
 use editchain_core::scope::ScopeRef;
+use editchain_project::HistoryProjection;
 
 use editchain_import::codex::HelperCommand;
 use editchain_import::cursor::canonical_source_key;
@@ -214,6 +216,7 @@ fn real_subagent_activity_schema_pins_link_geometry_and_summary() {
         ],
     );
     let harness = import(dir.path(), &helper_in(&helper));
+    let projection = HistoryProjection::from_ops(harness.ops.ops.clone());
 
     // Real activity kinds render truthfully: `started` reads as readable spawn
     // prose, `interacted` renders verbatim — never invented completion prose.
@@ -238,52 +241,32 @@ fn real_subagent_activity_schema_pins_link_geometry_and_summary() {
         "real activity kinds never fabricate completion prose"
     );
 
-    // No invented reconnect: `started`/`interacted` are not completion
-    // signals, so no ReconnectsTo note may exist for this run.
     assert!(
-        !harness.ops.ops.iter().any(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == NoteRelationship::ReconnectsTo)
-        }),
+        relationship_edges(&projection, NoteRelationship::ReconnectsTo).is_empty(),
         "real SubAgentActivity kinds must not fabricate a ReconnectsTo edge"
     );
-
-    // SpawnedBy: causal parent = the subagent thread's first occurrence;
-    // target = the exact raw occurrence carrying `started`.
-    let spawned_by = harness
-        .ops
-        .ops
-        .iter()
-        .find(
-            |o| matches!(&o.kind, OpKind::Note(n) if n.relationship == NoteRelationship::SpawnedBy),
-        )
-        .expect("SpawnedBy fact from exact started marker");
-    assert_eq!(spawned_by.parents, ParentSet::One(sub_stream(&dir)));
-    match &spawned_by.kind {
-        OpKind::Note(note) => {
-            let parent = source_stream(&dir, "rollout-parent.jsonl");
-            assert_eq!(
-                note.target_ids,
-                vec![parent.op_from_position(SourcePosition::raw(2)).unwrap()]
-            );
-        }
-        _ => panic!("expected note op"),
-    }
+    let parent = source_stream(&dir, "rollout-parent.jsonl");
     assert_eq!(
-        spawned_by.scope,
-        ScopeRef::Session(derive_session_id("sub-1")),
-        "relationship notes are session-scoped"
+        relationship_edges(&projection, NoteRelationship::SpawnedBy),
+        [(
+            sub_stream(&dir),
+            parent.op_from_position(SourcePosition::raw(2)).unwrap()
+        )]
+        .into()
     );
-
-    // The copied fork field stays inspectable without guessed row geometry.
+    let facts = provider_facts(&harness.ops.ops);
+    assert!(facts.iter().any(|(op, evidence)| matches!(&evidence.fact,
+        ProviderFact::CodexSource(meta) if meta.first == sub_stream(&dir)
+            && meta.forked_from.as_ref().is_some_and(|thread| thread.0 == "parent-1")
+            && op.scope == ScopeRef::Session(derive_session_id("sub-1")))));
+    assert!(facts.iter().any(|(op, evidence)| matches!(&evidence.fact,
+        ProviderFact::CodexLifecycle(meta)
+            if matches!(meta.event, CodexLifecycleEvent::Spawn { signal: CodexSpawnSignal::SubagentActivity, .. })
+                && op.scope == ScopeRef::Session(derive_session_id("parent-1")))));
     assert!(
-        !harness.ops.ops.iter().any(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == NoteRelationship::ForkOf)
-        }),
+        relationship_edges(&projection, NoteRelationship::ForkOf).is_empty(),
         "forkedFromId must not manufacture ForkOf"
     );
-    assert!(harness.ops.ops.iter().any(|o| {
-        matches!(&o.kind, OpKind::Note(n) if n.relationship == NoteRelationship::ForkedFrom)
-    }));
 }
 
 #[test]
@@ -323,43 +306,25 @@ fn structured_agent_states_drive_reconnect_but_old_payloads_do_not() {
         ],
     );
     let harness = import(dir.path(), &helper_in(&helper));
+    let projection = HistoryProjection::from_ops(harness.ops.ops.clone());
 
-    let reconnects: Vec<_> = harness
-        .ops
-        .ops
+    let completion = source_stream(&dir, "rollout-parent.jsonl")
+        .op_from_position(SourcePosition::raw(3))
+        .unwrap();
+    let terminal = source_stream(&dir, "rollout-sub.jsonl")
+        .op_from_position(SourcePosition::raw(2))
+        .unwrap();
+    assert_eq!(
+        relationship_edges(&projection, NoteRelationship::ReconnectsTo),
+        [(completion, terminal)].into(),
+        "only the explicit child completion reconnects at its exact physical occurrence"
+    );
+    assert!(provider_facts(&harness.ops.ops)
         .iter()
-        .filter(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == NoteRelationship::ReconnectsTo)
-        })
-        .collect();
-    assert_eq!(
-        reconnects.len(),
-        1,
-        "only the explicit agentsStates completion reconnects"
-    );
-    assert_eq!(
-        reconnects[0].parents,
-        ParentSet::One(
-            source_stream(&dir, "rollout-parent.jsonl")
-                .op_from_position(SourcePosition::raw(3))
-                .unwrap()
-        ),
-        "the agentsStates-carrying physical occurrence is the endpoint"
-    );
-    match &reconnects[0].kind {
-        OpKind::Note(note) => {
-            let sub = source_stream(&dir, "rollout-sub.jsonl");
-            assert_eq!(
-                note.target_ids,
-                vec![sub.op_from_position(SourcePosition::raw(2)).unwrap()]
-            );
-        }
-        _ => panic!("expected note op"),
-    }
-    assert_eq!(
-        reconnects[0].scope,
-        ScopeRef::Session(derive_session_id("parent-1"))
-    );
+        .any(|(op, evidence)| matches!(&evidence.fact,
+        ProviderFact::CodexLifecycle(meta) if evidence.source == completion
+            && !matches!(meta.event, CodexLifecycleEvent::Spawn { .. })
+            && op.scope == ScopeRef::Session(derive_session_id("parent-1")))));
 }
 
 #[test]
@@ -391,38 +356,25 @@ fn legacy_list_agents_completion_maps_agent_path_to_started_marker() {
         ],
     );
     let harness = import(dir.path(), &helper_in(&helper));
+    let projection = HistoryProjection::from_ops(harness.ops.ops.clone());
 
-    let reconnects: Vec<_> = harness
-        .ops
-        .ops
+    let completion = source_stream(&dir, "rollout-parent.jsonl")
+        .op_from_position(SourcePosition::raw(3))
+        .unwrap();
+    let terminal = source_stream(&dir, "rollout-sub.jsonl")
+        .op_from_position(SourcePosition::raw(2))
+        .unwrap();
+    assert_eq!(
+        relationship_edges(&projection, NoteRelationship::ReconnectsTo),
+        [(completion, terminal)].into(),
+        "only the explicit child completion reconnects at its exact physical occurrence"
+    );
+    assert!(provider_facts(&harness.ops.ops)
         .iter()
-        .filter(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == NoteRelationship::ReconnectsTo)
-        })
-        .collect();
-    assert_eq!(reconnects.len(), 1, "only the completed agent reconnects");
-    assert_eq!(
-        reconnects[0].parents,
-        ParentSet::One(
-            source_stream(&dir, "rollout-parent.jsonl")
-                .op_from_position(SourcePosition::raw(3))
-                .unwrap()
-        )
-    );
-    match &reconnects[0].kind {
-        OpKind::Note(note) => {
-            let sub = source_stream(&dir, "rollout-sub.jsonl");
-            assert_eq!(
-                note.target_ids,
-                vec![sub.op_from_position(SourcePosition::raw(2)).unwrap()]
-            );
-        }
-        _ => panic!("expected note op"),
-    }
-    assert_eq!(
-        reconnects[0].scope,
-        ScopeRef::Session(derive_session_id("parent-1"))
-    );
+        .any(|(op, evidence)| matches!(&evidence.fact,
+        ProviderFact::CodexLifecycle(meta) if evidence.source == completion
+            && !matches!(meta.event, CodexLifecycleEvent::Spawn { .. })
+            && op.scope == ScopeRef::Session(derive_session_id("parent-1")))));
 }
 
 #[test]
@@ -453,10 +405,9 @@ fn legacy_list_agents_missing_or_ambiguous_evidence_means_no_edge() {
         ],
     );
     let harness = import(dir.path(), &helper_in(&helper));
+    let projection = HistoryProjection::from_ops(harness.ops.ops.clone());
     assert!(
-        !harness.ops.ops.iter().any(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == NoteRelationship::ReconnectsTo)
-        }),
+        relationship_edges(&projection, NoteRelationship::ReconnectsTo).is_empty(),
         "a completed agent_name with no matching started marker must not edge"
     );
 
@@ -529,10 +480,82 @@ fn legacy_list_agents_missing_or_ambiguous_evidence_means_no_edge() {
         ],
     );
     let harness2 = import(dir2.path(), &helper_in(&helper2));
+    let projection2 = HistoryProjection::from_ops(harness2.ops.ops);
     assert!(
-        !harness2.ops.ops.iter().any(|o| {
-            matches!(&o.kind, OpKind::Note(n) if n.relationship == NoteRelationship::ReconnectsTo)
-        }),
+        relationship_edges(&projection2, NoteRelationship::ReconnectsTo).is_empty(),
         "ambiguous agentPath evidence must not fabricate an edge"
     );
+}
+
+#[test]
+fn legacy_activation_survives_duplicate_current_representation_and_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let helper = write_parent_and_sub(
+        &dir,
+        &[
+            started_item("sub-1", "/root/sub", "spawn-1"),
+            serde_json::json!({"turnId": "turn-1", "item": {
+                "kind": "collabToolCall", "id": "current-spawn", "tool": "spawnAgent",
+                "senderThreadId": "parent-1", "receiverThreadIds": ["sub-1", "sub-1", "", null]
+            }}),
+        ],
+    );
+    let first = import(dir.path(), &helper_in(&helper));
+    let replay = import(dir.path(), &helper_in(&helper));
+    assert_eq!(
+        first.ops.ops, replay.ops.ops,
+        "fact IDs and bytes survive replay"
+    );
+    let activation = source_stream(&dir, "rollout-parent.jsonl")
+        .op_from_position(SourcePosition::raw(2))
+        .unwrap();
+    let facts = provider_facts(&first.ops.ops);
+    assert_eq!(
+        facts
+            .iter()
+            .filter(
+                |(_, evidence)| matches!(&evidence.fact, ProviderFact::CodexLifecycle(meta)
+        if matches!(meta.event, CodexLifecycleEvent::Spawn { .. }))
+            )
+            .count(),
+        2,
+        "both provider representations remain durable; duplicate receivers add no evidence"
+    );
+    let projection = HistoryProjection::from_ops(first.ops.ops);
+    assert_eq!(
+        relationship_edges(&projection, NoteRelationship::SpawnedBy),
+        [(sub_stream(&dir), activation)].into()
+    );
+}
+
+#[test]
+fn duplicate_child_sources_leave_spawn_and_completion_unresolved() {
+    let dir = tempfile::tempdir().unwrap();
+    let helper = write_parent_and_sub(
+        &dir,
+        &[
+            started_item("sub-1", "/root/sub", "spawn-1"),
+            serde_json::json!({"turnId": "turn-1", "item": {
+                "kind": "collabToolCall", "id": "wait", "tool": "wait",
+                "agentsStates": {"sub-1": {"status": "completed"}}
+            }}),
+        ],
+    );
+    let first = import(dir.path(), &helper_in(&helper));
+    let projection = HistoryProjection::from_ops(first.ops.ops);
+    assert_eq!(
+        relationship_edges(&projection, NoteRelationship::ReconnectsTo).len(),
+        1
+    );
+    let other = dir.path().join("another-source");
+    std::fs::create_dir(&other).unwrap();
+    let _: u64 = std::fs::copy(
+        dir.path().join("rollout-sub.jsonl"),
+        other.join("rollout-sub.jsonl"),
+    )
+    .unwrap();
+    let ambiguous = import(dir.path(), &helper_in(&helper));
+    let projection = HistoryProjection::from_ops(ambiguous.ops.ops);
+    assert!(relationship_edges(&projection, NoteRelationship::SpawnedBy).is_empty());
+    assert!(relationship_edges(&projection, NoteRelationship::ReconnectsTo).is_empty());
 }

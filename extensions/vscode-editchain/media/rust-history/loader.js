@@ -13,7 +13,7 @@
 // This file owns no app state, events, DOM rendering, frame assembly, or
 // host-request logic: the Rust shell owns all of those. It only mirrors the
 // Rust shell's wasm-bindgen debug exports as a read-only
-// `window.__editchainGpuDebug` facade for harness/e2e runners, tagged
+// `window.__editchainRendererDebug` facade for harness/e2e runners, tagged
 // `loader: 'rust-history'` so suites can prove which loader produced it.
 import init, {
   debugBackend,
@@ -24,7 +24,6 @@ import init, {
   debugInFlightCount,
   debugLaneXAll,
   debugMetrics,
-  debugProfile,
   debugRenderCount,
   debugRendererInstanceId,
   debugRowAt,
@@ -32,9 +31,9 @@ import init, {
   debugTotal,
   debugViewGen,
   startHistoryView,
-} from './pkg/editchain_gpu_preview.js';
+} from './pkg/editchain_history_renderer.js';
 
-const WASM_URL = new URL('./pkg/editchain_gpu_preview_bg.wasm', import.meta.url);
+const WASM_URL = new URL('./pkg/editchain_history_renderer_bg.wasm', import.meta.url);
 
 // Clear wasm-started/error marker (body[data-rust-wasm] +
 // window.__editchainRustLoader + the harness status bar).
@@ -97,7 +96,7 @@ function whenIdle(timeoutMs) {
 }
 
 // Read-only debug facade over the Rust shell's generated exports.
-window.__editchainGpuDebug = {
+window.__editchainRendererDebug = {
   loader: 'rust-history',
   get dataReady() {
     return debugDataReady();
@@ -106,7 +105,6 @@ window.__editchainGpuDebug = {
     return window.__editchainLastError || null;
   },
   backend: () => debugBackend(),
-  profile: () => debugProfile(),
   total: () => debugTotal(),
   laneXAll: () => parseJson(debugLaneXAll()) || [],
   graphState: () => parseJson(debugGraphState()),

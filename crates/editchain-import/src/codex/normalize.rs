@@ -11,12 +11,12 @@ use editchain_core::{ActorId, Op, OpId, SessionId};
 use serde_json::Value;
 
 use super::projection::{CompactedLine, FinalItem, InterAgentLine, ProjectionKind, TurnMeta};
-use crate::claude_code::normalize::parse_source_time;
 use crate::error::ImportError;
 use crate::ids::{
     derive_actor_id, derive_path_id, derive_turn_id, IdError, SourcePosition, SourceStream,
 };
 use crate::sink::{payload_for, BlobSink};
+use crate::source_time::parse_source_time;
 use std::collections::HashMap;
 
 /// Minimal top-level metadata extracted from a raw Codex JSONL line.
@@ -249,6 +249,26 @@ impl std::fmt::Debug for NormalizeContext<'_> {
             .field("blobs", &"<dyn BlobSink>")
             .finish()
     }
+}
+
+pub(super) fn normalized_ops_for_occurrence(
+    item: &FinalItem,
+    clock: Clock,
+    ctx: &mut NormalizeContext<'_>,
+) -> Result<Vec<Op>, ImportError> {
+    let mut ops = normalized_ops_for_item(item, ItemAnchor::LastSeen, clock, clock, ctx)?;
+    if item.first_seen < item.last_seen
+        && (item.payload.get("result").is_some() || item.payload.get("errorMessage").is_some())
+    {
+        for op in &mut ops {
+            if let OpKind::Tool(tool) = &mut op.kind {
+                tool.stage = ToolStage::Finish;
+                tool.tool_name = Payload::Empty;
+                tool.content = tool_result_payload(&item.payload, ctx.blobs)?;
+            }
+        }
+    }
+    Ok(ops)
 }
 
 /// Build the normalized ops for one folded final item.

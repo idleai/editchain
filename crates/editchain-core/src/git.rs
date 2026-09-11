@@ -1,14 +1,7 @@
-#[cfg(not(feature = "use-std"))]
-use alloc::collections::BTreeMap;
-#[cfg(not(feature = "use-std"))]
-use alloc::{string::String, vec::Vec};
 use core::cmp::Ordering;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "use-std")]
-use std::collections::BTreeMap;
 
 use crate::ids::{OpId, PathId};
-use crate::op::{Op, OpKind};
 use crate::payload::Payload;
 
 // ---------------------------------------------------------------------------
@@ -17,11 +10,47 @@ use crate::payload::Payload;
 
 /// A repository identifier — 64 bits wide.
 ///
-/// Derived deterministically from the canonical workspace root plus the
-/// repository-relative path, so the same repository always maps to the same
-/// `RepositoryId` across imports and live resolution.
+/// The live Git adapter and importers preserve the legacy SHA-256 path-derived
+/// ID of the repository's `.git` marker. Relocating a repository requires an
+/// explicit mapping when existing durable links must retain their identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RepositoryId(pub u64);
+
+/// A Git commit identity qualified by its repository.
+///
+/// Clones and linked worktrees may contain the same OID while remaining
+/// distinct history sources. Graph, search, and display keys retain both parts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GitCommitKey {
+    /// Repository supplying this commit's history and live observations.
+    pub repository: RepositoryId,
+    /// Full commit object identity.
+    pub oid: GitOid,
+}
+
+impl GitCommitKey {
+    /// Create a repository-qualified identity.
+    #[must_use]
+    pub const fn new(repository: RepositoryId, oid: GitOid) -> Self {
+        Self { repository, oid }
+    }
+
+    /// Parse the display key. Bare OIDs are ambiguous and are rejected.
+    #[must_use]
+    pub fn from_display_str(value: &str) -> Option<Self> {
+        let (repository, oid) = value.strip_prefix("git:")?.split_once(':')?;
+        Some(Self::new(
+            RepositoryId(repository.parse().ok()?),
+            GitOid::from_hex(oid)?,
+        ))
+    }
+}
+
+impl core::fmt::Display for GitCommitKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "git:{}:{}", self.repository.0, self.oid)
+    }
+}
 
 /// The object format of a Git repository (SHA-1 or SHA-256).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
@@ -37,19 +66,36 @@ pub enum GitObjectFormat {
 /// The `bytes` field always holds 32 bytes: SHA-256 uses all 32; SHA-1 uses
 /// the first 20 bytes and leaves the remainder zero. This keeps the type a
 /// fixed size regardless of object format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub struct GitOid {
     /// Object format this OID was produced under.
-    pub format: GitObjectFormat,
+    format: GitObjectFormat,
     /// Full OID bytes (32 bytes; SHA-1 occupies the first 20).
-    pub bytes: [u8; 32],
+    bytes: [u8; 32],
 }
 
 impl GitOid {
-    /// Create a new `GitOid` from a full 32-byte digest.
+    /// Validate a padded 32-byte digest. SHA-1 requires a zero unused tail;
+    /// otherwise the same displayed hash could compare as different keys.
     #[must_use]
-    pub const fn new(format: GitObjectFormat, bytes: [u8; 32]) -> Self {
-        Self { format, bytes }
+    pub fn new(format: GitObjectFormat, bytes: [u8; 32]) -> Option<Self> {
+        if format == GitObjectFormat::Sha1 && bytes.iter().skip(20).any(|byte| *byte != 0) {
+            None
+        } else {
+            Some(Self { format, bytes })
+        }
+    }
+
+    /// Object format this identifier was produced under.
+    #[must_use]
+    pub const fn format(&self) -> GitObjectFormat {
+        self.format
+    }
+
+    /// Fixed-width storage, including the canonical zero tail for SHA-1.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.bytes
     }
 
     /// Create a `GitOid` from a 20-byte SHA-1 digest.
@@ -108,6 +154,21 @@ impl GitOid {
             out.push(HEX[(b & 0x0f) as usize]);
         }
         out
+    }
+}
+
+impl<'de> Deserialize<'de> for GitOid {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Keep the existing named fields and Postcard sequence unchanged.
+        #[derive(Deserialize)]
+        #[serde(rename = "GitOid")]
+        struct WireOid {
+            format: GitObjectFormat,
+            bytes: [u8; 32],
+        }
+        let wire = WireOid::deserialize(deserializer)?;
+        Self::new(wire.format, wire.bytes)
+            .ok_or_else(|| serde::de::Error::custom("SHA-1 OID has nonzero padding"))
     }
 }
 
@@ -226,6 +287,14 @@ pub struct GitCommitEntity {
     pub changed_paths: Vec<PathId>,
 }
 
+impl GitCommitEntity {
+    /// Repository-qualified identity used by graph and view consumers.
+    #[must_use]
+    pub const fn key(&self) -> GitCommitKey {
+        GitCommitKey::new(self.repository, self.oid)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Explicit EditChain-to-Git links
 // ---------------------------------------------------------------------------
@@ -264,6 +333,14 @@ pub struct GitLink {
     pub kind: GitLinkKind,
 }
 
+impl GitLink {
+    /// Repository-qualified target, shared by ancestry and display adapters.
+    #[must_use]
+    pub const fn target_key(&self) -> GitCommitKey {
+        GitCommitKey::new(self.target_repo, self.target_oid)
+    }
+}
+
 impl Ord for GitOid {
     fn cmp(&self, other: &Self) -> Ordering {
         self.format
@@ -287,78 +364,5 @@ impl Ord for RepositoryId {
 impl PartialOrd for RepositoryId {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Deterministic git projection
-// ---------------------------------------------------------------------------
-
-/// A deterministic projection of git history from a set of operations.
-///
-/// Recomputable from any replica with the same operations: commits are keyed
-/// by `(RepositoryId, GitOid)` and links are keyed by their source `OpId`.
-/// This projection is the git analogue of `CanonicalView`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct GitProjection {
-    /// Commits keyed by `(RepositoryId, GitOid)`.
-    pub commits: BTreeMap<(RepositoryId, GitOid), GitCommitEntity>,
-    /// Explicit links keyed by source `OpId`.
-    pub links: BTreeMap<OpId, Vec<GitLink>>,
-}
-
-impl GitProjection {
-    /// Create an empty projection.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            commits: BTreeMap::new(),
-            links: BTreeMap::new(),
-        }
-    }
-
-    /// Reduce a single operation into this projection.
-    ///
-    /// Handles `OpKind::GitCommit` and `OpKind::GitLink`; all other kinds are
-    /// ignored. A later commit with the same `(RepositoryId, GitOid)` replaces
-    /// an earlier one (last-writer-wins by iteration order).
-    #[expect(
-        clippy::wildcard_enum_match_arm,
-        reason = "GitProjection only handles git kinds; all other kinds are silently ignored"
-    )]
-    pub fn reduce(&mut self, op: &Op) {
-        match &op.kind {
-            OpKind::GitCommit(commit) => {
-                let key = (commit.repository, commit.oid);
-                drop(self.commits.insert(key, (**commit).clone()));
-            }
-            OpKind::GitLink(link) => {
-                let entry = self.links.entry(link.source).or_default();
-                entry.push(link.clone());
-            }
-            _ => {}
-        }
-    }
-
-    /// Reduce a sequence of operations into this projection.
-    #[must_use]
-    pub fn from_ops(ops: &[Op]) -> Self {
-        let mut proj = Self::new();
-        for op in ops {
-            proj.reduce(op);
-        }
-        proj
-    }
-
-    /// Returns the commit for a given repository and OID, if present.
-    #[must_use]
-    pub fn commit(&self, repository: RepositoryId, oid: &GitOid) -> Option<&GitCommitEntity> {
-        self.commits.get(&(repository, *oid))
-    }
-
-    /// Returns the explicit links originating from an operation.
-    #[must_use]
-    pub fn links_from(&self, source: &OpId) -> &[GitLink] {
-        self.links.get(source).map_or(&[], Vec::as_slice)
     }
 }

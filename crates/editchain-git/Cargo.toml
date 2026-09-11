@@ -13,7 +13,13 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-gix = { version = "0.86", features = ["sha256"] }
+gix = { version = "0.86", default-features = false, features = [
+    "blob-diff",
+    "max-performance-safe",
+    "revision",
+    "sha1",
+    "sha256",
+] }
 gix-object = "0.63"
 sha2 = "0.10"
 editchain-core = { path = "../editchain-core" }

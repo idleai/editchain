@@ -1,5 +1,6 @@
 [package]
 name = "editchain-node"
+default-run = "editchain"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,15 +17,16 @@ workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
+ctrlc = { version = "3.5", features = ["termination"] }
 dirs = "6"
 editchain-core = { path = "../editchain-core" }
-editchain-codec = { path = "../editchain-codec" }
+editchain-store = { path = "../editchain-store" }
 editchain-import = { path = "../editchain-import" }
 editchain-git = { path = "../editchain-git" }
-editchain-query = { path = "../editchain-query" }
-editchain-index = { path = "../editchain-index" }
-editchain-embed = { path = "../editchain-embed" }
-editchain-vscode-service = { path = "../editchain-vscode-service" }
+editchain-project = { path = "../editchain-project" }
+editchain-protocol = { path = "../editchain-protocol" }
+blake3 = "1"
+tantivy = { version = "0.22", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

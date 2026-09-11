@@ -1,3 +1,0 @@
-[submodule "externals/claude-code-trace"]
-	path = externals/claude-code-trace
-	url = https://github.com/delexw/claude-code-trace.git

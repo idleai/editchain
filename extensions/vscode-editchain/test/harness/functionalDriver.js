@@ -4,7 +4,7 @@
 // media/rust-history/loader.js as its only bootstrap, the Rust shell owns the
 // DOM, the per-row SVG graph fragments, and find-in-chain, and the loader
 // mirrors the wasm-bindgen debug exports as a read-only
-// window.__editchainGpuDebug facade (loader: 'rust-history', dataReady,
+// window.__editchainRendererDebug facade (loader: 'rust-history', dataReady,
 // lastError, backend, snapshot, metrics, laneXAll, whenIdle).
 //
 // Everything waits on concrete renderer state (debug whenIdle / DOM
@@ -23,8 +23,8 @@ const DEFAULT_CHROME =
   '/mnt/hot/ambientlight/.cache/puppeteer/chrome/linux-151.0.7922.71/chrome-linux64/chrome';
 const CHROME = process.env.CHROME_PATH || DEFAULT_CHROME;
 
-const BOOT_TIMEOUT_MS = Number(process.env.GPU_BOOT_TIMEOUT_MS) || 60_000;
-const IDLE_TIMEOUT_MS = Number(process.env.GPU_IDLE_TIMEOUT_MS) || 60_000;
+const BOOT_TIMEOUT_MS = Number(process.env.RENDERER_BOOT_TIMEOUT_MS) || 60_000;
+const IDLE_TIMEOUT_MS = Number(process.env.RENDERER_IDLE_TIMEOUT_MS) || 60_000;
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -75,8 +75,7 @@ function startServer(rootDir) {
   });
 }
 
-/** Headless Chrome with the deterministic software-rasterized WebGL backend
- * (never requires hardware WebGPU). */
+/** Headless Chrome for the deterministic SVG renderer tests. */
 function launchBrowser() {
   return puppeteer.launch({
     executablePath: CHROME,
@@ -84,11 +83,6 @@ function launchBrowser() {
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
-      '--use-angle=swiftshader',
-      '--enable-unsafe-swiftshader',
-      '--ignore-gpu-blocklist',
-      '--enable-webgl',
-      '--disable-gpu-sandbox',
     ],
   });
 }
@@ -104,11 +98,9 @@ async function waitFor(page, fn, opts) {
   }, ...(opts.args || []));
 }
 
-/** Wrap postMessage on a page so raw-JSON identity is captured and (optionally)
- * FindInHistory requests are rewritten down the harness's legacy Search path
- * (which the Rust shell also serves). */
-async function installHarnessSpies(page, { legacySearch = false } = {}) {
-  await page.evaluate((rewrite) => {
+/** Wrap postMessage on a page so raw-JSON and diff identities are captured. */
+async function installHarnessSpies(page) {
+  await page.evaluate(() => {
     const orig = window.vscode.postMessage.bind(window.vscode);
     window.__editchainOpenJsonLog = [];
     window.__editchainOpenDiffLog = [];
@@ -116,6 +108,7 @@ async function installHarnessSpies(page, { legacySearch = false } = {}) {
       if (msg && msg.type === 'openJson') {
         window.__editchainOpenJsonLog.push({
           type: 'openJson',
+          snapshot_id: msg.snapshot_id,
           op_id: msg.op_id !== undefined ? msg.op_id : null,
           git_oid: msg.git_oid !== undefined ? msg.git_oid : null,
           repository: msg.repository !== undefined ? msg.repository : null,
@@ -124,15 +117,9 @@ async function installHarnessSpies(page, { legacySearch = false } = {}) {
       if (msg && msg.type === 'openDiff') {
         window.__editchainOpenDiffLog.push(msg);
       }
-      if (rewrite && msg && msg.body && msg.body.FindInHistory) {
-        const f = msg.body.FindInHistory;
-        msg.body = {
-          Search: { query: f.query, mode: 'Lexical', top_k: f.top_k, filters: f.filters || {} },
-        };
-      }
       return orig(msg);
     };
-  }, legacySearch);
+  });
 }
 
 /** Fill + Enter on the real #search control (the keyboard path). */
@@ -194,7 +181,7 @@ async function pressRowKey(page, key, absRow) {
 }
 
 /** Read the full functional state of the rust.html page (production DOM +
- * the Rust loader's __editchainGpuDebug facade). */
+ * the Rust loader's __editchainRendererDebug facade). */
 async function readState(page) {
   return page.evaluate(() => {
     const rows = [];
@@ -215,14 +202,11 @@ async function readState(page) {
     const selected = document.querySelector('.row.row-selected');
     const findCurrent = document.querySelector('.row.row-find-current');
     const messageEl = document.querySelector('#rows .view-message');
-    const bannerEl = document.querySelector('.search-banner');
     const log = window.__editchainRequestLog || [];
     const windowOffsets = [];
-    const windowHideTraces = [];
     for (const req of log) {
       if (req && typeof req === 'object' && req.GetWindow) {
         windowOffsets.push(req.GetWindow.offset);
-        if (req.GetWindow.filter) windowHideTraces.push(req.GetWindow.filter.hide_trace);
       }
     }
     const activeRow = document.activeElement && document.activeElement.closest
@@ -232,7 +216,6 @@ async function readState(page) {
         })()
       : null;
     return {
-      profile: typeof window.__editchainGetProfile === 'function' ? window.__editchainGetProfile() : null,
       total: typeof window.__editchainGetTotal === 'function' ? window.__editchainGetTotal() : -1,
       rows,
       rowKeys: Array.from(document.querySelectorAll('#rows .row')).map((r) => r.getAttribute('data-key')),
@@ -240,7 +223,6 @@ async function readState(page) {
       placeholderCount: document.querySelectorAll('#rows .row-placeholder').length,
       counter: counter ? (counter.textContent || '').trim() : '',
       counterBusy: counter ? (counter.getAttribute('aria-busy') || '') : '',
-      searchBanner: bannerEl ? (bannerEl.textContent || '').trim() : '',
       header: !!document.querySelector('#rows .tbl-header'),
       warningBanner: !!document.querySelector('#rows .open-warning'),
       message: messageEl
@@ -252,7 +234,6 @@ async function readState(page) {
       findCurrentRow: findCurrent ? Number(findCurrent.getAttribute('data-row')) : null,
       activeRow,
       windowOffsets,
-      windowHideTraces,
       openJsonLog: window.__editchainOpenJsonLog || [],
       openDiffLog: window.__editchainOpenDiffLog || [],
     };

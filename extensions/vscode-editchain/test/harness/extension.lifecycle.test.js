@@ -29,6 +29,7 @@ after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // Let any queued promise microtasks (and one macrotask) run.
 const flush = () => sleep(0);
+const openBody = (workspace) => ({ Ok: { protocol_version: 2, snapshot_id: workspace, workspace } });
 
 const uri = (s) => ({ toString: () => s, fsPath: s.replace(/^file:\/\//, '') });
 
@@ -44,10 +45,11 @@ function writeFakeVscode() {
 const providers = [];
 const executedCommands = [];
 const warnings = [];
+const errors = [];
 module.exports = {
   __esModule: true,
   workspace: {
-    workspaceFolders: [{ uri: ${uri.toString()}('/ws') }],
+    workspaceFolders: [{ uri: (${uri.toString()})('/ws') }],
     getConfiguration: () => ({ get: (_key, def) => def }),
     registerTextDocumentContentProvider: (scheme, provider) => {
       providers.push({ scheme, provider });
@@ -60,7 +62,7 @@ module.exports = {
     createStatusBarItem: () => ({ text: '', command: null, tooltip: null, show() {}, hide() {}, dispose() {} }),
     createWebviewPanel: () => { throw new Error('createWebviewPanel must be intercepted by the test harness'); },
     showTextDocument: async () => ({}),
-    showErrorMessage: () => undefined,
+    showErrorMessage: (message) => { errors.push(message); },
     showWarningMessage: async (message) => { warnings.push(message); },
   },
   commands: {
@@ -68,8 +70,8 @@ module.exports = {
     executeCommand: async (...args) => { executedCommands.push(args); },
   },
   Uri: {
-    parse: (s) => ${uri.toString()}(s),
-    joinPath: (...p) => ${uri.toString()}(p.map(String).join('/')),
+    parse: (s) => (${uri.toString()})(s),
+    joinPath: (...p) => (${uri.toString()})(p.map(String).join('/')),
     from: (parts) => (${uri.toString()})(parts.scheme + '://' + (parts.authority || '') +
       (parts.path || '') + (parts.query ? '?' + parts.query : '')),
   },
@@ -78,6 +80,7 @@ module.exports = {
   __providers: providers,
   __executedCommands: executedCommands,
   __warnings: warnings,
+  __errors: errors,
 };
 `
   );
@@ -105,7 +108,7 @@ class FakeStdioClient {
   request(body, opts) {
     const rec = { body, opts, resolve: null, promise: null };
     rec.promise = new Promise((resolve) => { rec.resolve = resolve; });
-    if (body && body.Open) {
+    if (body && (body.Open || body.Refresh)) {
       this.openRequests.push(rec);
     } else {
       this.requests.push(rec);
@@ -220,7 +223,7 @@ test('late Open response from a superseded panel is dropped', async () => {
 
   // A's response lands LATE, after B's Open is already pending. It must be
   // dropped: it may not post into A (dead) or B, and must not cache A's body.
-  openA.resolve({ Ok: { workspace: 'A' } });
+  openA.resolve(openBody('A'));
   await flush();
   assert.equal(panelA.webview.messages.length, 0, 'A is disposed: no delivery to A');
   assert.equal(panelB.webview.messages.length, 0, 'A stale body must not reach B');
@@ -231,9 +234,9 @@ test('late Open response from a superseded panel is dropped', async () => {
   assert.equal(panelB.webview.messages.length, 0, 'reveal must wait for B own Open');
 
   // B's authoritative response lands and is the ONLY body cached/replayed.
-  openB.resolve({ Ok: { workspace: 'B' } });
+  openB.resolve(openBody('B'));
   await flush();
-  assert.deepEqual(panelB.webview.messages[0], { id: 'open', body: { Ok: { workspace: 'B' } } });
+  assert.deepEqual(panelB.webview.messages[0], { id: 'open', body: openBody('B') });
   assert.deepEqual(panelB.webview.messages[1], { id: 'ready' });
 
   panelB.handlers.viewState({ webviewPanel: { active: true } });
@@ -242,7 +245,7 @@ test('late Open response from a superseded panel is dropped', async () => {
   // A genuinely recreated webview renderer context announces a NEW identity
   // after its listener exists and gets the authoritative state exactly once.
   await rendererReady(panelB, 'renderer-B-recreated');
-  assert.deepEqual(panelB.webview.messages[2], { id: 'open', body: { Ok: { workspace: 'B' } } });
+  assert.deepEqual(panelB.webview.messages[2], { id: 'open', body: openBody('B') });
   assert.deepEqual(panelB.webview.messages[3], { id: 'ready' });
   await rendererReady(panelB, 'renderer-B-recreated');
   assert.equal(panelB.webview.messages.length, 4, 'same renderer identity is not replayed twice');
@@ -288,9 +291,9 @@ test('stale dispose and stale error must not clear a newer panel state', async (
   assert.equal(panelB.webview.messages.length, 0, 'reveal must wait for B own Open');
 
   // B's authoritative response still lands normally.
-  openB.resolve({ Ok: { workspace: 'B' } });
+  openB.resolve(openBody('B'));
   await flush();
-  assert.deepEqual(panelB.webview.messages[0], { id: 'open', body: { Ok: { workspace: 'B' } } });
+  assert.deepEqual(panelB.webview.messages[0], { id: 'open', body: openBody('B') });
   assert.deepEqual(panelB.webview.messages[1], { id: 'ready' });
 });
 
@@ -305,7 +308,7 @@ test('disposing the current panel invalidates its in-flight Open', async () => {
   // Disposing the CURRENT panel invalidates its outstanding Open: a late Ok
   // response must not be cached for replay by a later panel.
   panelA.handlers.dispose();
-  openA.resolve({ Ok: { workspace: 'A' } });
+  openA.resolve(openBody('A'));
   await flush();
   assert.equal(panelA.webview.messages.length, 0, 'disposed panel must not receive its late Open');
 
@@ -317,33 +320,35 @@ test('disposing the current panel invalidates its in-flight Open', async () => {
   panelB.handlers.viewState({ webviewPanel: { active: true } });
   assert.equal(panelB.webview.messages.length, 0, 'new panel must not replay the disposed panel body');
 
-  openB.resolve({ Ok: { workspace: 'B' } });
+  openB.resolve(openBody('B'));
   await flush();
-  assert.deepEqual(panelB.webview.messages[0], { id: 'open', body: { Ok: { workspace: 'B' } } });
+  assert.deepEqual(panelB.webview.messages[0], { id: 'open', body: openBody('B') });
   assert.deepEqual(panelB.webview.messages[1], { id: 'ready' });
 });
 
 test('Open Error surfaces without ready and command reuse retries', async () => {
-  const env = loadExtension();
+  for (const error of ['boom', { code: 'stale_snapshot', message: 'boom' }]) {
+    const env = loadExtension();
 
-  env.open(); // panel A, Open A pending
-  const panelA = env.panels[0];
-  const openA = env.client.openRequests[0];
-  await rendererReady(panelA);
+    env.open(); // panel A, Open A pending
+    const panelA = env.panels[0];
+    const openA = env.client.openRequests[0];
+    await rendererReady(panelA);
 
-  // Error on the CURRENT Open: surfaced to the webview, no `ready`, no body
-  // cached (so command reuse retries instead of replaying).
-  openA.resolve({ Error: 'boom' });
-  await flush();
-  assert.deepEqual(panelA.webview.messages, [{ id: 'open', body: { Error: 'boom' } }]);
+    // Error on the CURRENT Open: surfaced to the webview, no `ready`, no body
+    // cached (so command reuse retries instead of replaying).
+    openA.resolve({ Error: error });
+    await flush();
+    assert.deepEqual(panelA.webview.messages, [{ id: 'open', body: { Error: 'boom' } }]);
 
-  env.open(); // reuse: no successful body -> retry with a fresh Open
-  assert.equal(env.client.openRequests.length, 2, 'command reuse retries after Error');
-  const openA2 = env.client.openRequests[1];
-  openA2.resolve({ Ok: { workspace: 'A' } });
-  await flush();
-  assert.deepEqual(panelA.webview.messages[1], { id: 'open', body: { Ok: { workspace: 'A' } } });
-  assert.deepEqual(panelA.webview.messages[2], { id: 'ready' });
+    env.open(); // reuse: no successful body -> retry with a fresh Open
+    assert.equal(env.client.openRequests.length, 2, 'command reuse retries after Error');
+    const openA2 = env.client.openRequests[1];
+    openA2.resolve(openBody('A'));
+    await flush();
+    assert.deepEqual(panelA.webview.messages[1], { id: 'open', body: openBody('A') });
+    assert.deepEqual(panelA.webview.messages[2], { id: 'ready' });
+  }
 });
 
 test('history panel retains its bounded renderer context across raw JSON navigation', async () => {
@@ -358,7 +363,7 @@ test('history panel retains its bounded renderer context across raw JSON navigat
   );
 
   await rendererReady(panel);
-  env.client.openRequests[0].resolve({ Ok: { workspace: 'A' } });
+  env.client.openRequests[0].resolve(openBody('A'));
   await flush();
   assert.equal(panel.webview.messages.length, 2);
 
@@ -366,6 +371,90 @@ test('history panel retains its bounded renderer context across raw JSON navigat
   panel.handlers.viewState({ webviewPanel: { active: true } });
   assert.equal(panel.webview.messages.length, 2, 'Back must display retained rows without replaying Open');
   assert.equal(env.client.openRequests.length, 1, 'Back must not rebuild the workspace');
+});
+
+test('incompatible Open never sends ready or enables the new Refresh request', async () => {
+  for (const value of [
+    { workspace: 'legacy' },
+    { protocol_version: 2, snapshot_id: '' },
+    { protocol_version: 3, snapshot_id: 'future' },
+  ]) {
+    const env = loadExtension();
+    env.open();
+    const panel = env.panels[0];
+    await rendererReady(panel);
+    assert.deepEqual(env.client.openRequests[0].body, {
+      Open: { workspace_path: '/ws', chain_dir: '.editchain' },
+    }, 'the initial request remains parseable by an old service');
+    env.client.openRequests[0].resolve({ Ok: value });
+    await flush();
+    assert.equal(panel.webview.messages.length, 1);
+    assert.match(panel.webview.messages[0].body.Error, /Unsupported history protocol/);
+    await panel.handlers.message({ type: 'refreshHistory' });
+    assert.equal(env.client.openRequests.length, 1, 'Refresh requires successful negotiation');
+    env.open();
+    assert.equal(env.client.openRequests.length, 2, 'command reuse retries negotiation');
+  }
+});
+
+test('refresh requests one fresh snapshot and replaces the replayed Open result', async () => {
+  const env = loadExtension();
+  env.open();
+  const panel = env.panels[0];
+  await rendererReady(panel);
+  env.client.openRequests[0].resolve(openBody('A'));
+  await flush();
+
+  await panel.handlers.message({ type: 'refreshHistory' });
+  await panel.handlers.message({ type: 'refreshHistory' });
+  assert.equal(env.client.openRequests.length, 2);
+  const refresh = env.client.openRequests[1];
+  assert.deepEqual(refresh.body, {
+    Refresh: { workspace_path: '/ws', chain_dir: '.editchain' },
+  });
+  assert.equal(refresh.opts.timeoutMs, 0);
+  await rendererReady(panel, 'renderer-recreated-during-refresh');
+  assert.equal(panel.webview.messages.length, 2, 'pending refresh cannot replay A');
+  refresh.resolve(openBody('B'));
+  await flush();
+  assert.deepEqual(panel.webview.messages.slice(2), [
+    { id: 'open', body: openBody('B') }, { id: 'ready' },
+  ]);
+  await rendererReady(panel, 'renderer-after-refresh');
+  assert.deepEqual(panel.webview.messages[4], { id: 'open', body: openBody('B') });
+});
+
+test('delayed row actions retain their original snapshot and reject mismatched results', async () => {
+  const env = loadExtension();
+  env.open();
+  const panel = env.panels[0];
+  await rendererReady(panel);
+  env.client.openRequests[0].resolve(openBody('A'));
+  await flush();
+  await panel.handlers.message({ type: 'refreshHistory' });
+  env.client.openRequests[1].resolve(openBody('B'));
+  await flush();
+
+  env.client.nextResponse = { Error: { code: 'stale_snapshot', message: 'Refresh history' } };
+  await panel.handlers.message({ type: 'openJson', snapshot_id: 'A', op_id: 'op:1' });
+  assert.deepEqual(env.client.requests[0].body, {
+    GetNodeDetails: { snapshot_id: 'A', op_id: 'op:1' },
+  });
+  assert.match(env.vscode.__errors[0], /Refresh history/);
+
+  env.client.nextResponse = { Ok: { snapshot_id: 'B', before: 'wrong', after: 'view' } };
+  await panel.handlers.message({ type: 'openDiff', snapshot_id: 'A', change: { source: 'git' } });
+  assert.equal(env.client.requests[1].body.GetFileDiff.snapshot_id, 'A');
+  assert.equal(env.vscode.__executedCommands.length, 0, 'no editor opens for mismatched content');
+  assert.match(env.vscode.__errors[1], /History snapshot changed/);
+
+  env.client.nextResponse = { Ok: { snapshot_id: 'B', oid: 'abc' } };
+  await panel.handlers.message({ type: 'openJson', snapshot_id: 'B', git_oid: 'abc', repository: '42' });
+  assert.deepEqual(env.client.requests[2].body, {
+    ResolveObject: { snapshot_id: 'B', oid: 'abc', repository: '42' },
+  });
+  const provider = env.vscode.__providers.find((entry) => entry.scheme === 'editchain-json').provider;
+  assert.equal(JSON.parse(provider.provideTextDocumentContent(uri('editchain-json:abc.json'))).oid, 'abc');
 });
 
 test('openDiff resolves service content into VS Code native virtual documents', async () => {
@@ -388,6 +477,7 @@ test('openDiff resolves service content into VS Code native virtual documents', 
   };
   env.client.nextResponse = {
     Ok: {
+      snapshot_id: 'fixture',
       path: 'src/lib.rs',
       status: 'modified',
       binary: false,
@@ -397,9 +487,9 @@ test('openDiff resolves service content into VS Code native virtual documents', 
     },
   };
 
-  await panel.handlers.message({ type: 'openDiff', change });
+  await panel.handlers.message({ type: 'openDiff', snapshot_id: 'fixture', change });
   await flush();
-  assert.deepEqual(env.client.requests[0].body, { GetFileDiff: { change } });
+  assert.deepEqual(env.client.requests[0].body, { GetFileDiff: { snapshot_id: 'fixture', change } });
   assert.equal(env.client.requests[0].opts.timeoutMs, 120_000);
 
   const command = env.vscode.__executedCommands[0];
@@ -428,6 +518,7 @@ test('openDiff keeps one structured hunk flat in the ordinary diff editor', asyn
   };
   env.client.nextResponse = {
     Ok: {
+      snapshot_id: 'fixture',
       path: 'src/lib.rs',
       status: 'modified',
       binary: false,
@@ -444,7 +535,7 @@ test('openDiff keeps one structured hunk flat in the ordinary diff editor', asyn
     },
   };
 
-  await panel.handlers.message({ type: 'openDiff', change });
+  await panel.handlers.message({ type: 'openDiff', snapshot_id: 'fixture', change });
   await flush();
 
   const command = env.vscode.__executedCommands[0];
@@ -469,6 +560,7 @@ test('openDiff presents recorded hunks as independent VS Code changes entries', 
   };
   env.client.nextResponse = {
     Ok: {
+      snapshot_id: 'fixture',
       path: 'src/lib.rs',
       status: 'modified',
       binary: false,
@@ -491,7 +583,7 @@ test('openDiff presents recorded hunks as independent VS Code changes entries', 
     },
   };
 
-  await panel.handlers.message({ type: 'openDiff', change });
+  await panel.handlers.message({ type: 'openDiff', snapshot_id: 'fixture', change });
   await flush();
 
   const command = env.vscode.__executedCommands[0];

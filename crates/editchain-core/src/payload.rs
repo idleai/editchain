@@ -1,5 +1,3 @@
-#[cfg(not(feature = "use-std"))]
-use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::NodeId;

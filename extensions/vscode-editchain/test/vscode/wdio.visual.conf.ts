@@ -36,16 +36,6 @@ export const config: Options.Testrunner = {
         extensionPath: __dirname + '/../..',
         // Open the editchain repo so the extension finds .editchain/ and git.
         workspacePath: '/mnt/hot/ambientlight/repos/editchain',
-        // The default panel renders the Rust/WASM view with per-row SVG graph
-        // fragments (no canvas surface). SwiftShader WebGL stays enabled so
-        // any other webview/GPU surfaces still work under headless Xvfb.
-        vscodeArgs: {
-          useAngle: 'swiftshader',
-          enableUnsafeSwiftshader: true,
-          ignoreGpuBlocklist: true,
-          enableWebgl: true,
-          disableGpuSandbox: true,
-        },
         userSettings: {
           // Point the extension at the built Rust service binary.
           'editchain-history.servicePath':

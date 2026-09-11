@@ -1,0 +1,268 @@
+#![doc = "Frame encoding round-trip tests."]
+
+use crc as _;
+use postcard as _;
+use proptest as _;
+use serde as _;
+
+use crate::format::{
+    decode_ec03, decode_op, detect_format, encode_ec03, encode_op, Ec03Frame, FrameFormat,
+    EC03_FORMAT_VERSION,
+};
+use editchain_core::*;
+
+// Pin the unversioned Postcard message representation used by EC02 at
+// bb3fb12; an encoder/decoder round trip alone cannot detect schema drift.
+const MESSAGE_V1: &[u8] = &[
+    1, 0, 42, 0, 1, 2, 128, 208, 149, 255, 188, 49, 0, 8, 2, 1, 11, b'h', b'e', b'l', b'l', b'o',
+    b' ', b'w', b'o', b'r', b'l', b'd', 0,
+];
+
+#[test]
+fn relationship_wire_tags_retain_legacy_ordinals() {
+    for (tag, relationship) in [
+        (0, NoteRelationship::Corrects),
+        (1, NoteRelationship::Supersedes),
+        (2, NoteRelationship::Rejects),
+        (3, NoteRelationship::Redacts),
+        (4, NoteRelationship::Explains),
+        (5, NoteRelationship::ForkOf),
+        (6, NoteRelationship::SubagentOf),
+        (7, NoteRelationship::ReconnectsTo),
+        (8, NoteRelationship::OccurrenceOf),
+        (9, NoteRelationship::ProviderParent),
+        (10, NoteRelationship::LogicalParent),
+        (11, NoteRelationship::ForkedFrom),
+        (12, NoteRelationship::SpawnedBy),
+        (13, NoteRelationship::Contains),
+        (14, NoteRelationship::ToolResultOf),
+        (15, NoteRelationship::ProviderEvidence),
+    ] {
+        assert_eq!(postcard::to_stdvec(&relationship).unwrap(), vec![tag]);
+        assert_eq!(
+            postcard::from_bytes::<NoteRelationship>(&[tag]).unwrap(),
+            relationship
+        );
+    }
+}
+
+#[test]
+fn operation_decode_requires_complete_schema_consumption() {
+    let mut extended = MESSAGE_V1.to_vec();
+    extended.push(0);
+    assert!(decode_op(&extended).is_err());
+    assert!(decode_op(MESSAGE_V1).is_ok());
+}
+
+#[test]
+#[expect(clippy::panic, reason = "test assertion")]
+fn round_trip_message_op() {
+    let op = Op {
+        id: OpId::new(NodeId(1), 0, 42),
+        parents: ParentSet::None,
+        actor: ActorId(1),
+        clock: Clock::UnixMs(1_700_000_000_000),
+        scope: ScopeRef::None,
+        tags: Tags::MESSAGE,
+        kind: OpKind::Message(MessageOp {
+            content: Payload::Inline(b"hello world".to_vec()),
+            content_type: Payload::Empty,
+        }),
+    };
+
+    let encoded = encode_op(&op).unwrap();
+    assert_eq!(encoded, MESSAGE_V1);
+    assert_eq!(decode_op(MESSAGE_V1).unwrap(), op);
+    let decoded: Op = decode_op(&encoded).unwrap();
+
+    assert_eq!(op.id, decoded.id);
+    assert_eq!(op.actor, decoded.actor);
+    assert_eq!(op.clock, decoded.clock);
+    assert_eq!(op.tags, decoded.tags);
+
+    match (&op.kind, &decoded.kind) {
+        (OpKind::Message(a), OpKind::Message(b)) => {
+            assert_eq!(a.content, b.content);
+        }
+        _ => panic!("kind mismatch"),
+    }
+}
+
+#[test]
+#[expect(clippy::panic, reason = "test assertion")]
+fn round_trip_file_op() {
+    let op = Op {
+        id: OpId::new(NodeId(2), 1, 7),
+        parents: ParentSet::None,
+        actor: ActorId(0),
+        clock: Clock::Lamport(99),
+        scope: ScopeRef::File(PathId(42)),
+        tags: Tags::FILE,
+        kind: OpKind::File(FileOp {
+            path: PathId(42),
+            stage: FileStage::Applied,
+            base: None,
+            after: Some(ContentId::Hash128([0xAB; 16])),
+            edit: FileEdit::None,
+        }),
+    };
+
+    let encoded = encode_op(&op).unwrap();
+    let decoded: Op = decode_op(&encoded).unwrap();
+
+    assert_eq!(op.id, decoded.id);
+    match (&op.kind, &decoded.kind) {
+        (OpKind::File(a), OpKind::File(b)) => {
+            assert_eq!(a.path, b.path);
+            assert_eq!(a.stage, b.stage);
+            assert_eq!(a.after, b.after);
+        }
+        _ => panic!("kind mismatch"),
+    }
+}
+
+#[test]
+#[expect(clippy::panic, reason = "test assertion")]
+fn round_trip_git_commit_op() {
+    let commit = GitCommitEntity {
+        repository: RepositoryId(7),
+        object_format: GitObjectFormat::Sha1,
+        oid: GitOid::from_sha1([0x01; 20]),
+        imported_record: Some(OpId::new(NodeId(1), 0, 5)),
+        availability: GitAvailability::Resolved,
+        tree: GitOid::from_sha1([0x02; 20]),
+        parents: vec![GitOid::from_sha1([0x03; 20])],
+        author: GitSignature {
+            name: Payload::Inline(b"Alice".to_vec()),
+            email: Payload::Inline(b"alice@example.com".to_vec()),
+            when: 1_700_000_000,
+        },
+        committer: GitSignature {
+            name: Payload::Inline(b"Alice".to_vec()),
+            email: Payload::Inline(b"alice@example.com".to_vec()),
+            when: 1_700_000_100,
+        },
+        authored_at: 1_700_000_000,
+        committed_at: 1_700_000_100,
+        message: Payload::Inline(b"feat: add git support".to_vec()),
+        imported_refs: vec![Payload::Inline(b"refs/heads/main".to_vec())],
+        live_refs: Vec::new(),
+        changed_paths: vec![PathId(9)],
+    };
+
+    let op = Op {
+        id: OpId::new(NodeId(2), 0, 10),
+        parents: ParentSet::None,
+        actor: ActorId(3),
+        clock: Clock::UnixMs(1_700_000_000),
+        scope: ScopeRef::None,
+        tags: Tags::IMPORT,
+        kind: OpKind::GitCommit(Box::new(commit)),
+    };
+
+    let encoded = encode_op(&op).unwrap();
+    let decoded = decode_op(&encoded).unwrap();
+
+    match (&op.kind, &decoded.kind) {
+        (OpKind::GitCommit(a), OpKind::GitCommit(b)) => {
+            assert_eq!(a.oid, b.oid);
+            assert_eq!(a.parents, b.parents);
+            assert_eq!(a.message, b.message);
+        }
+        _ => panic!("kind mismatch"),
+    }
+}
+
+#[test]
+#[expect(clippy::panic, reason = "test assertion")]
+fn round_trip_git_link_op() {
+    let link = GitLink {
+        source: OpId::new(NodeId(1), 0, 5),
+        target_repo: RepositoryId(7),
+        target_oid: GitOid::from_sha1([0x01; 20]),
+        kind: GitLinkKind::CommittedAs,
+    };
+
+    let op = Op {
+        id: OpId::new(NodeId(2), 0, 11),
+        parents: ParentSet::None,
+        actor: ActorId(3),
+        clock: Clock::UnixMs(1_700_000_000),
+        scope: ScopeRef::None,
+        tags: Tags::NOTE,
+        kind: OpKind::GitLink(link),
+    };
+
+    let encoded = encode_op(&op).unwrap();
+    let decoded = decode_op(&encoded).unwrap();
+
+    match (&op.kind, &decoded.kind) {
+        (OpKind::GitLink(a), OpKind::GitLink(b)) => {
+            assert_eq!(a.source, b.source);
+            assert_eq!(a.target_repo, b.target_repo);
+            assert_eq!(a.target_oid, b.target_oid);
+            assert_eq!(a.kind, b.kind);
+        }
+        _ => panic!("kind mismatch"),
+    }
+}
+
+#[test]
+fn ec03_round_trip_empty() {
+    let frame = Ec03Frame::new(0, 0);
+    let encoded = encode_ec03(&frame);
+    let decoded = decode_ec03(&encoded).unwrap();
+
+    assert_eq!(decoded.format_version, EC03_FORMAT_VERSION);
+    assert_eq!(decoded.page_sequence, 0);
+    assert_eq!(decoded.commit_generation, 0);
+    assert_eq!(decoded.records.len(), 0);
+    assert_eq!(decoded.record_count, 0);
+}
+
+#[test]
+#[expect(
+    clippy::indexing_slicing,
+    reason = "test assertions on known-length vec"
+)]
+fn ec03_round_trip_with_records() {
+    let mut frame = Ec03Frame::new(42, 7);
+    frame.add_record(vec![1, 2, 3]);
+    frame.add_record(vec![4, 5, 6, 7]);
+    frame.add_record(vec![8]);
+
+    let encoded = encode_ec03(&frame);
+    let decoded = decode_ec03(&encoded).unwrap();
+
+    assert_eq!(decoded.page_sequence, 42);
+    assert_eq!(decoded.commit_generation, 7);
+    assert_eq!(decoded.records.len(), 3);
+    assert_eq!(decoded.records[0], vec![1, 2, 3]);
+    assert_eq!(decoded.records[1], vec![4, 5, 6, 7]);
+    assert_eq!(decoded.records[2], vec![8]);
+    assert_eq!(decoded.record_count, 3);
+}
+
+#[test]
+fn ec03_detect_format() {
+    let mut frame = Ec03Frame::new(0, 0);
+    frame.add_record(vec![1]);
+    let encoded = encode_ec03(&frame);
+
+    assert_eq!(detect_format(&encoded), Some(FrameFormat::Ec03));
+    assert_eq!(detect_format(b"EC02"), Some(FrameFormat::Ec02));
+    assert_eq!(detect_format(b"XXXX"), None);
+    assert_eq!(detect_format(b""), None);
+}
+
+#[test]
+fn ec03_power_loss_partial_frame() {
+    let mut frame = Ec03Frame::new(0, 0);
+    frame.add_record(vec![1, 2, 3]);
+    let mut encoded = encode_ec03(&frame);
+
+    // Truncate in the middle of the payload.
+    encoded.truncate(encoded.len() - 6);
+
+    assert!(decode_ec03(&encoded).is_none());
+}

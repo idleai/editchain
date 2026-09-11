@@ -8,14 +8,13 @@
 // acquires window.acquireVsCodeApi() (capital C — the fixture bridge supplies
 // it), installs the host-message listener, renders real .row[data-row][data-key]
 // DOM with grid ARIA into #rows, paints every hydrated row's own aria-hidden
-// svg.graph-row-fragment inside its .graph-cell, and mirrors the frame rows
-// into #gpu-rows. No canvas surface is created anywhere.
+// svg.graph-row-fragment inside its .graph-cell. No canvas surface is created.
 //
 // Run:  CHROME_PATH=... node --test test/harness/rustSmoke.test.js
 //
 // The runtime tests SKIP (never fail) when Chrome or the built rust-history
 // assets are missing, so the generic `npm run test:harness` suite stays green
-// without GPU build artifacts. The static source test always runs.
+// without renderer build artifacts. The static source test always runs.
 
 'use strict';
 
@@ -34,11 +33,11 @@ function rustPrereqs() {
   }
   for (const rel of [
     'media/rust-history/loader.js',
-    'media/rust-history/pkg/editchain_gpu_preview.js',
-    'media/rust-history/pkg/editchain_gpu_preview_bg.wasm',
+    'media/rust-history/pkg/editchain_history_renderer.js',
+    'media/rust-history/pkg/editchain_history_renderer_bg.wasm',
   ]) {
     if (!fs.existsSync(path.join(driver.EXT_ROOT, rel))) {
-      return { ok: false, reason: 'missing rust-history asset ' + rel + ' (run npm run build:gpu first)' };
+      return { ok: false, reason: 'missing rust-history asset ' + rel + ' (run npm run build:renderer first)' };
     }
   }
   return { ok: true, reason: '' };
@@ -74,21 +73,16 @@ test('rust.html shares the scaffold but loads neither main.js nor the gpu-previe
     'loads fixtureBridge.js with the exact relative src used by the other harness pages');
   assert.match(RUST_HTML, /<link rel="stylesheet" href="\.\.\/\.\.\/media\/main\.css">/,
     'links the shared production media/main.css');
-  assert.match(RUST_HTML, /<link rel="stylesheet" href="\.\.\/\.\.\/media\/gpu-preview\/gpu-preview\.css">/,
-    'links the shared renderer scaffold stylesheet');
+  assert.doesNotMatch(RUST_HTML, /gpu-preview\.css/,
+    'the removed GPU scaffold stylesheet is not loaded');
   assert.match(RUST_HTML, /--vscode-editor-background/, 'ships the VS Code theme tokens');
   // Production scaffold IDs shared with the shipped webview scaffold.
   for (const id of [
     'controls', 'search-control', 'search', 'search-counter', 'search-prev', 'search-next',
-    'layout', 'rows', 'gpu-canvas-host', 'status-live',
+    'layout', 'rows', 'status-live',
   ]) {
     assert.ok(RUST_HTML.includes('id="' + id + '"'), 'rust.html missing production id #' + id);
   }
-  assert.doesNotMatch(
-    RUST_HTML,
-    /id="profile-control"|id="profile-activity"|id="profile-raw"/,
-    'the Activity-only extension has no profile toggle',
-  );
   assert.doesNotMatch(RUST_HTML, /id="gpu-toolbar"|id="gpu-backend"|id="gpu-status"/,
     'the harness has no visible renderer-status toolbar');
   // The Rust-only loader module is the page's bootstrap.
@@ -166,14 +160,14 @@ async function openRustPage(scenario, viewport) {
   await driver.waitFor(page, () => window.__editchainDataReady === true,
     { timeout: driver.BOOT_TIMEOUT_MS });
   await page.bringToFront();
-  await page.evaluate((ms) => window.__editchainGpuDebug.whenIdle(ms), driver.IDLE_TIMEOUT_MS);
+  await page.evaluate((ms) => window.__editchainRendererDebug.whenIdle(ms), driver.IDLE_TIMEOUT_MS);
   return { page, errors };
 }
 
 /** Read the rust-only runtime state snapshot for assertions. */
 async function rustState(page) {
   return page.evaluate(() => {
-    const gpu = window.__editchainGpuDebug;
+    const gpu = window.__editchainRendererDebug;
     const hydrated = Array.from(document.querySelectorAll(
       '#rows .row[data-row][data-key]:not(.row-placeholder)'));
     const grid = document.querySelector('#rows .tbl-grid');
@@ -183,7 +177,7 @@ async function rustState(page) {
       .filter(Boolean)
       .map((getWindow) => ({
         offset: getWindow.offset,
-        hideTrace: !!(getWindow.filter && getWindow.filter.hide_trace),
+        keys: Object.keys(getWindow).sort(),
       }));
     // Per-row SVG graph fragments: the production contract is exactly one
     // aria-hidden svg.graph-row-fragment per hydrated row, whose geometry
@@ -249,7 +243,6 @@ async function rustState(page) {
       rendererReady: window.__editchainRendererReady === true,
       dataReady: window.__editchainDataReady === true,
       loader: gpu ? gpu.loader : null,
-      profile: typeof gpu.profile === 'function' ? gpu.profile() : null,
       total: typeof gpu.total === 'function' ? gpu.total() : -1,
       lastError: gpu ? gpu.lastError : null,
       backend: typeof gpu.backend === 'function' ? gpu.backend() : null,
@@ -266,9 +259,7 @@ async function rustState(page) {
       maxAlignDelta: Math.round(maxAlignDelta * 100) / 100,
       alignExamples,
       placeholderCount: document.querySelectorAll('#rows .row-placeholder').length,
-      canvasHostCount: document.querySelectorAll('#gpu-canvas-host canvas').length,
-      foreignCanvasCount: document.querySelectorAll('canvas:not(#gpu-canvas-host canvas)').length,
-      mirrorRows: document.querySelectorAll('#gpu-rows [data-row][data-key]').length,
+      canvasCount: document.querySelectorAll('canvas').length,
       rowsWidth: document.getElementById('rows') ? document.getElementById('rows').clientWidth : -1,
       seenIds: (window.__editchainSeenMessages || []).map((entry) => entry.id),
       windowRequests,
@@ -288,18 +279,15 @@ function assertNoErrors(errors, label) {
 }
 
 function assertRustHealthy(state, label) {
-  assert.equal(state.loader, 'rust-history', label + ': __editchainGpuDebug must be the rust loader');
+  assert.equal(state.loader, 'rust-history', label + ': __editchainRendererDebug must be the rust loader');
   assert.equal(state.wasmReady, true, label + ': __editchainWasmReady');
   assert.equal(state.rendererReady, true, label + ': renderer ready');
   assert.equal(state.dataReady, true, label + ': dataReady');
   assert.equal(state.lastError, null, label + ': no renderer error');
   assert.equal(state.backend, 'svg', label + ': the Rust shell reports the per-row SVG backend');
-  assert.equal(state.canvasHostCount, 0, label + ': no canvas inside #gpu-canvas-host');
-  assert.equal(state.foreignCanvasCount, 0, label + ': no foreign canvases');
+  assert.equal(state.canvasCount, 0, label + ': no canvas renderer exists');
   assert.ok(state.metrics && state.metrics.renderCount > 0,
     label + ': renderCount > 0, got ' + JSON.stringify(state.metrics));
-  assert.equal(state.metrics && state.metrics.vertexCount, 0,
-    label + ': vertexCount is 0 for the SVG renderer, got ' + JSON.stringify(state.metrics));
   assert.equal(state.fragmentCount, state.rows.length,
     label + ': every hydrated row owns exactly one svg.graph-row-fragment');
   assert.equal(state.fragmentMissing, 0,
@@ -315,7 +303,7 @@ function assertRustHealthy(state, label) {
 
 async function settleRust(page) {
   await page.bringToFront();
-  await page.evaluate((ms) => window.__editchainGpuDebug.whenIdle(ms),
+  await page.evaluate((ms) => window.__editchainRendererDebug.whenIdle(ms),
     driver.IDLE_TIMEOUT_MS);
 }
 
@@ -370,9 +358,7 @@ test('rust-only adapter boots in headless Chrome and renders (merge)', { skip: S
       assert.ok(row.key && row.key.startsWith('git:'), 'row ' + row.index + ' has a data-key');
       assert.ok(row.gridcellCount >= 1, 'row ' + row.index + ' has grid cells');
     }
-    assert.equal(state.mirrorRows, state.rows.length, '#gpu-rows mirror matches frame rows');
-
-    // Renderer health (svg backend, zero canvases/vertices, one per-row
+    // Renderer health (SVG backend, zero canvases, one per-row
     // fragment, fragment centres on the row centres).
     assertRustHealthy(state, 'boot');
 
@@ -398,23 +384,11 @@ test('rust-only adapter boots in headless Chrome and renders (merge)', { skip: S
     assert.deepEqual(visibleChrome.clippedDates, [],
       'the default Date column renders complete timestamps without ellipsis');
 
-    // The shipped extension is permanently Activity: no profile controls or
-    // hidden mutating parity hook exist, and every window hides trace rows.
-    assert.equal(state.profile, 'activity', 'boots and remains in Activity');
+    // Requests carry only the fixed Activity-view window fields.
     assert.ok(state.windowRequests.length >= 1, 'boot issued a GetWindow');
-    assert.ok(state.windowRequests.every((request) => request.hideTrace === true),
-      'every Activity window sends hide_trace=true');
-    const profileSurface = await page.evaluate(() => ({
-      control: document.getElementById('profile-control'),
-      activity: document.getElementById('profile-activity'),
-      raw: document.getElementById('profile-raw'),
-      setterType: typeof window.__editchainSetProfile,
-    }));
-    assert.equal(profileSurface.control, null, 'profile control is absent');
-    assert.equal(profileSurface.activity, null, 'Activity button is absent');
-    assert.equal(profileSurface.raw, null, 'Raw button is absent');
-    assert.equal(profileSurface.setterType, 'undefined', 'no hidden profile setter remains');
-
+    assert.ok(state.windowRequests.every((request) =>
+      JSON.stringify(request.keys) === JSON.stringify(['include_layout', 'limit', 'offset', 'snapshot_id'])),
+    'every window uses the minimal protocol shape');
     // laneXAll is invariant across graph column / available-width changes.
     const laneXBefore = state.laneXAll;
     assert.ok(Array.isArray(laneXBefore) && laneXBefore.length >= 2,
@@ -435,7 +409,7 @@ test('rust-only adapter boots in headless Chrome and renders (merge)', { skip: S
       const rows = document.getElementById('rows');
       rows.scrollTop = 0;
     });
-    await page.evaluate((ms) => window.__editchainGpuDebug.whenIdle(ms), driver.IDLE_TIMEOUT_MS);
+    await page.evaluate((ms) => window.__editchainRendererDebug.whenIdle(ms), driver.IDLE_TIMEOUT_MS);
     state = await rustState(page);
     assert.notEqual(state.rowsWidth, rowsWidthBefore,
       'the available width actually changed');
@@ -635,10 +609,6 @@ test('find-in-chain, row selection, and disclosure interactions settle in real D
         'function',
         '__editchainGetTotal parity hook');
       assert.equal(
-        await page.evaluate(() => typeof window.__editchainGetProfile),
-        'function',
-        '__editchainGetProfile parity hook');
-      assert.equal(
         await page.evaluate(() => typeof window.__editchainRowAt),
         'function',
         '__editchainRowAt parity hook');
@@ -663,7 +633,7 @@ test('find-in-chain, row selection, and disclosure interactions settle in real D
       while (state.findCurrentRow <= 500 && guard < 40) {
         await driver.clickNav(page, 'next');
         await page.bringToFront();
-        await page.evaluate((ms) => window.__editchainGpuDebug.whenIdle(ms), driver.IDLE_TIMEOUT_MS);
+        await page.evaluate((ms) => window.__editchainRendererDebug.whenIdle(ms), driver.IDLE_TIMEOUT_MS);
         state = await driver.readState(page);
         guard += 1;
       }
@@ -674,7 +644,7 @@ test('find-in-chain, row selection, and disclosure interactions settle in real D
 
       await driver.clearSearch(page);
       await page.bringToFront();
-      await page.evaluate((ms) => window.__editchainGpuDebug.whenIdle(ms), driver.IDLE_TIMEOUT_MS);
+      await page.evaluate((ms) => window.__editchainRendererDebug.whenIdle(ms), driver.IDLE_TIMEOUT_MS);
       state = await driver.readState(page);
       assert.equal(state.counter, '', 'cleared find empties the counter');
       assert.equal(state.findCurrentRow, null, 'cleared find removes the current marker');
@@ -748,7 +718,7 @@ test('find-in-chain, row selection, and disclosure interactions settle in real D
       await page.evaluate((n) => document
         .querySelector('.row[data-row="' + n + '"] .subop-chevron')?.click(), expandable);
       await page.bringToFront();
-      await page.evaluate((ms) => window.__editchainGpuDebug.whenIdle(ms), driver.IDLE_TIMEOUT_MS);
+      await page.evaluate((ms) => window.__editchainRendererDebug.whenIdle(ms), driver.IDLE_TIMEOUT_MS);
       const aria = await page.evaluate((n) =>
         document.querySelector('.row[data-row="' + n + '"]')?.getAttribute('aria-expanded'),
       expandable);
@@ -816,7 +786,7 @@ test('find-in-chain, row selection, and disclosure interactions settle in real D
         'exactly one tabbable row');
 
       // Read-only find facade reflects the session.
-      const findState = await page.evaluate(() => window.__editchainGpuDebug.findState());
+      const findState = await page.evaluate(() => window.__editchainRendererDebug.findState());
       assert.equal(findState.active, false, 'find facade reports the cleared session');
       assertNoErrors(errors, 'rust smoke (interactions)');
     } finally {
@@ -824,7 +794,7 @@ test('find-in-chain, row selection, and disclosure interactions settle in real D
     }
   });
 
-test('search keyboard, pending/zero/error ARIA, and legacy Search are functional',
+test('find keyboard and pending/zero/error ARIA are functional',
   { skip: SKIP }, async () => {
     const current = await openRustPage('workUnitsDeep');
     try {
@@ -955,35 +925,6 @@ test('search keyboard, pending/zero/error ARIA, and legacy Search are functional
       await current.page.close();
     }
 
-    const legacy = await openRustPage('badges');
-    try {
-      const { page, errors } = legacy;
-      const historyTotal = (await driver.readState(page)).total;
-      await driver.installHarnessSpies(page, { legacySearch: true });
-      await driver.runSearch(page, 'the');
-      await driver.waitFor(page, () =>
-        !!document.querySelector('.search-banner') &&
-        document.querySelectorAll('#rows .row:not(.row-placeholder)').length > 0,
-      { timeout: driver.IDLE_TIMEOUT_MS });
-      let state = await driver.readState(page);
-      assert.match(state.searchBanner, /^\d+ results? for "the"$/);
-      assert.equal(state.counter, '', 'legacy results hide the find counter');
-      await pressSearchKey(page, 'ArrowDown');
-      state = await driver.readState(page);
-      assert.equal(state.activeRow, 0, 'legacy ArrowDown focuses the first result');
-      await pressSearchKey(page, 'ArrowUp');
-      state = await driver.readState(page);
-      assert.equal(state.activeRow, state.total - 1, 'legacy ArrowUp focuses the last result');
-      await saveParityScreenshot(page, 'legacy-search');
-      await driver.clearSearch(page);
-      await settleRust(page);
-      state = await driver.readState(page);
-      assert.equal(state.searchBanner, '', 'clearing legacy search restores history');
-      assert.equal(state.total, historyTotal, 'history total is restored');
-      assertNoErrors(errors, 'rust legacy search');
-    } finally {
-      await legacy.page.close();
-    }
   });
 
 test('row keyboard disclosure, double-click identity, and divider drag remain coherent',
@@ -1061,6 +1002,7 @@ test('row keyboard disclosure, double-click identity, and divider drag remain co
       state = await driver.readState(page);
       assert.deepEqual(state.openJsonLog.at(-1), {
         type: 'openJson',
+        snapshot_id: await page.evaluate(() => window.__editchainRequestLog[0].GetWindow.snapshot_id),
         op_id: null,
         git_oid: expected.git_oid,
         repository: expected.repository,
@@ -1129,6 +1071,44 @@ test('row keyboard disclosure, double-click identity, and divider drag remain co
         resizedFixedColumns.tags.before) <= 1, 'Tags width restores');
       await settleRust(page);
 
+      const replacedDrag = await page.evaluate(() => {
+        const add = window.addEventListener;
+        const remove = window.removeEventListener;
+        const active = { mousemove: new Set(), mouseup: new Set() };
+        window.addEventListener = function (type, callback, options) {
+          active[type]?.add(callback);
+          return add.call(this, type, callback, options);
+        };
+        window.removeEventListener = function (type, callback, options) {
+          active[type]?.delete(callback);
+          return remove.call(this, type, callback, options);
+        };
+        try {
+          const handle = document.querySelector('.col-resize-handle[data-col="graph"]');
+          const during = [];
+          for (let replacement = 0; replacement < 3; replacement++) {
+            handle.dispatchEvent(new MouseEvent('mousedown', {
+              bubbles: true, cancelable: true, clientX: 100,
+            }));
+            during.push([active.mousemove.size, active.mouseup.size]);
+          }
+          window.dispatchEvent(new MouseEvent('mousemove', { clientX: 100 }));
+          window.dispatchEvent(new MouseEvent('mouseup', { clientX: 100 }));
+          return {
+            during,
+            after: [active.mousemove.size, active.mouseup.size],
+            resizing: document.body.classList.contains('col-resizing'),
+          };
+        } finally {
+          window.addEventListener = add;
+          window.removeEventListener = remove;
+        }
+      });
+      assert.deepEqual(replacedDrag.during, [[1, 1], [1, 1], [1, 1]],
+        'a new drag replaces the previous window listeners');
+      assert.deepEqual(replacedDrag.after, [0, 0], 'mouseup releases both listeners');
+      assert.equal(replacedDrag.resizing, false);
+
       const before = await rustState(page);
       const handle = await page.$('.col-resize-handle[data-col="graph"]');
       assert.ok(handle, 'graph resize handle exists');
@@ -1177,6 +1157,101 @@ test('row keyboard disclosure, double-click identity, and divider drag remain co
       await merge.page.close();
   }
 });
+
+test('a DOM failure is reported without reborrowing or disabling the shell',
+  { skip: SKIP }, async () => {
+    const { page, errors } = await openRustPage('merge');
+    try {
+      const injected = await page.evaluate(() => {
+        const rows = document.getElementById('rows');
+        const query = rows.querySelectorAll;
+        let injected = false;
+        rows.querySelectorAll = function (selector) {
+          if (!injected && selector === '.row.row-selected') {
+            injected = true;
+            throw new Error('fixture selection failure');
+          }
+          return query.call(this, selector);
+        };
+        try {
+          rows.querySelector('.row[data-row="0"]').dispatchEvent(new MouseEvent('click', {
+            bubbles: true, cancelable: true, detail: 1,
+          }));
+          return injected;
+        } finally {
+          rows.querySelectorAll = query;
+        }
+      });
+      assert.equal(injected, true, 'the production selection effect encounters the failure');
+      await settleRust(page);
+      assert.deepEqual(errors.page, [], 'diagnostics do not panic inside a borrowed shell');
+      assert.equal(errors.console.length, 1);
+      assert.match(errors.console[0], /^selection apply failed:/);
+      errors.console.length = 0;
+      await page.click('.row[data-row="1"] .text-cell');
+      await settleRust(page);
+      assert.equal(await page.$eval('.row[data-row="1"]',
+        (row) => row.getAttribute('aria-selected')), 'true', 'later transitions still run');
+      assertRustHealthy(await rustState(page), 'after a recoverable DOM failure');
+      assertNoErrors(errors, 'recovered DOM effects');
+    } finally {
+      await page.close();
+    }
+  });
+
+test('repeated Retry panes retire their listeners before the next history load',
+  { skip: SKIP }, async () => {
+    const { page, errors } = await openRustPage('merge');
+    try {
+      await page.evaluate(() => {
+        const add = EventTarget.prototype.addEventListener;
+        const remove = EventTarget.prototype.removeEventListener;
+        window.__retryListeners = new Set();
+        EventTarget.prototype.addEventListener = function (type, callback, options) {
+          if (type === 'click' && this instanceof HTMLElement && this.matches('.retry-btn')) {
+            window.__retryListeners.add(callback);
+          }
+          return add.call(this, type, callback, options);
+        };
+        EventTarget.prototype.removeEventListener = function (type, callback, options) {
+          window.__retryListeners.delete(callback);
+          return remove.call(this, type, callback, options);
+        };
+      });
+      for (let attempt = 0; attempt < 3; attempt++) {
+        await page.evaluate(() => {
+          window.__editchainFixture.rows[0].content = {
+            tool_label: { text: 'x'.repeat(257), complete: true },
+          };
+          window.__editchainStart();
+        });
+        await driver.waitFor(page, () => !!document.querySelector('.retry-btn'),
+          { timeout: driver.IDLE_TIMEOUT_MS });
+        assert.equal(await page.evaluate(() => window.__retryListeners.size), 1);
+        await page.evaluate(() => {
+          delete window.__editchainFixture.rows[0].content;
+          window.__retiredRetry = document.querySelector('.retry-btn');
+          window.__retiredRetry.click();
+        });
+        await driver.waitFor(page, () => !!document.querySelector('.row[data-key]'),
+          { timeout: driver.IDLE_TIMEOUT_MS });
+        await settleRust(page);
+        const retired = await page.evaluate(() => {
+          const before = window.__editchainRequestLog.length;
+          window.__retiredRetry.click();
+          return { active: window.__retryListeners.size, before };
+        });
+        assert.equal(retired.active, 0, 'the removed pane owns no live click listener');
+        await settleRust(page);
+        assert.equal(await page.evaluate(() => window.__editchainRequestLog.length),
+          retired.before, 'a detached Retry button cannot restart history');
+      }
+      assertRustHealthy(await rustState(page), 'after repeated Retry');
+      assertNoErrors(errors, 'Retry lifetime');
+    } finally {
+      await page.close();
+    }
+  });
 
 test('Git and agent parents reveal column-aligned file rows whose click opens an exact diff identity',
   { skip: SKIP }, async () => {
@@ -1349,7 +1424,7 @@ test('deep scroll pages the large window with bounded offsets and settles', { sk
           last !== undefined && Number(last.getAttribute('data-row')) === 599;
       }, { timeout: driver.IDLE_TIMEOUT_MS, polling: 50 });
     }
-    await page.evaluate((ms) => window.__editchainGpuDebug.whenIdle(ms), driver.IDLE_TIMEOUT_MS);
+    await page.evaluate((ms) => window.__editchainRendererDebug.whenIdle(ms), driver.IDLE_TIMEOUT_MS);
     state = await rustState(page);
 
     const offsets = state.windowRequests.map((request) => request.offset);

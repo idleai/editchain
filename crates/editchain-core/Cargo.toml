@@ -12,13 +12,9 @@ categories.workspace = true
 [lints]
 workspace = true
 
-[features]
-default = ["use-std"]
-use-std = ["serde/std", "postcard/use-std"]
-
 [dependencies]
 serde.workspace = true
-postcard.workspace = true
 
 [dev-dependencies]
 proptest = "1"
+postcard.workspace = true
