@@ -1,49 +1,125 @@
-# editchain
+# EditChain
 
-CRDT-based edit chain built from agent session history, browsed through the **EditChain History** VS Code extension. WIP / experiment.
+EditChain brings agent sessions and Git history into one read-only view in
+VS Code. It imports activity from Claude Code and Codex so you can follow the
+conversation, commands, and file changes alongside the repository's commits.
 
-## VS Code extension
+This is an experimental project that you build and run locally.
 
-The primary UI lives in [`extensions/vscode-editchain/`](./extensions/vscode-editchain/): a read-only unified history explorer that overlays EditChain operations with live Git history. The history view is **Rust/WASM — the sole renderer**: `editchain-history.open` opens one panel titled **"EditChain History"** bootstrapped by the tiny `media/rust-history/loader.js` + generated wasm-bindgen glue, with the `editchain-history-renderer` crate owning the view state (`HistoryAppState`), row model (`RowSpec`), and the web-sys DOM/accessibility surface (each row's graph is an inline `svg.graph-row-fragment`; no canvas overlay). The webview loads no other scripts, and the renderer is exercised headlessly by `test/harness/rust.html` (rustSmoke) and in real VS Code by the e2e/visual suites — full details in the extension README.
+## Explore your project's history
 
-Build the native service and the extension:
+The **EditChain History** extension lets you:
+
+- Browse agent activity and Git commits in a shared history graph.
+- Expand work groups and commits to inspect their file changes.
+- Search session text and Git messages, then jump to a matching activity.
+- Inspect record details and open file changes in VS Code's diff editors.
+
+Git history is available without importing sessions. Import Claude Code or
+Codex sessions to add agent activity to the same view.
+
+## Build and run the extension
+
+You need VS Code, Node.js 20 or newer, and Rust installed through rustup.
+The repository pins its Rust toolchain in
+[`rust-toolchain.toml`](./rust-toolchain.toml).
+
+From the repository root:
 
 ```sh
-cargo build -p editchain-node --bin editchain-vscode-service
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.127 --locked
+cargo build --release -p editchain-node --bins --locked
+
 cd extensions/vscode-editchain
-npm install
+npm ci
+npm run build:renderer
 npm run compile
+npm run package
 ```
 
-Then open the folder in VS Code and press F5, or package a `.vsix` — full instructions in [`extensions/vscode-editchain/README.md`](./extensions/vscode-editchain/README.md). Open the viewer via the command palette → **"EditChain: Open History Explorer"**.
+In VS Code, run **Extensions: Install from VSIX…** and select the generated
+`.vsix` file in `extensions/vscode-editchain`. Open the project you want to
+explore, then run **EditChain: Open History Explorer** from the command palette.
 
-## Ingestion CLI
+Set **`editchain-history.servicePath`** to the absolute path of the native
+service you built: `<editchain-checkout>/target/release/editchain-vscode-service`.
+When this setting is empty, the extension looks for a release build, then a
+debug build, under the open workspace's `target` directory.
 
-The native CLI keeps only the two workflows that feed the extension: importing
-session history and preparing its immutable render snapshot.
+The extension reads imported history from `.editchain` in the open workspace.
+Use **`editchain-history.chainDir`** to select another directory. The
+[extension guide](./extensions/vscode-editchain/README.md) covers configuration,
+packaging, and tests in more detail.
+
+## Import agent sessions
+
+Run these commands from the EditChain repository root. Use the same project
+directory that you open in VS Code, and write its chain to that project's
+`.editchain` directory.
+
+For Claude Code, point `--sessions-dir` at the project's session directory:
 
 ```sh
-cargo build
-cargo run --bin editchain -- import \
-  --sessions-dir /path/to/cc-sessions --workspace /path/to/repo --chain ./outputs/cc-chain
-cargo build --manifest-path tools/codex-session-exporter/Cargo.toml
-cargo run --bin editchain -- import --provider codex \
-  --sessions-dir ~/.codex/sessions --workspace /path/to/repo --chain ./outputs/codex-chain \
-  --codex-helper ./tools/codex-session-exporter/target/debug/codex-session-exporter
-cargo run --bin editchain -- prepare-view \
-  --workspace /path/to/repo --chain .editchain
+./target/release/editchain import \
+  --provider claude \
+  --sessions-dir /path/to/claude/project-sessions \
+  --workspace /path/to/project \
+  --chain /path/to/project/.editchain
 ```
 
-Codex import currently uses an isolated local bridge against a sibling `codex` checkout; see [the exporter contract](./tools/codex-session-exporter/README.md). The bridge boundary is versioned so it can later move behind a native Codex command without coupling the chain or viewer schemas to Codex internals.
+For Codex, first build the local
+[session exporter](./tools/codex-session-exporter/README.md#build-and-run-contract-local-only).
+It requires a sibling Codex source checkout; its setup is separate from the
+main workspace. Then pass the helper executable to the importer:
 
-Non-dry imports persist content-addressed blobs and per-source cursors under the chain directory (`blobs/`, `cursors/`); `--dry-run` keeps both stores in memory. Claude and Codex are explicit, additive provider passes: importing one never recursively imports records embedded by the other. Cursor identity is the provider plus the exact path relative to its sessions root, so copying an unchanged source tree between an archive root and a live root does not replay it. Legacy absolute-path cursors migrate once while retaining their original operation-ID node. A cursor (and any persisted rewrite generation) is committed only after its operation page is appended and synced — including a directory sync so a brand-new segment file's entry is durable first — and a cursor is also committed when an empty or truncated-to-empty source staged one with zero ops. A newline-unterminated EOF record stays pending until the source completes it on a later import.
+```sh
+./target/release/editchain import \
+  --provider codex \
+  --sessions-dir ~/.codex/sessions \
+  --codex-helper ./tools/codex-session-exporter/target/release/codex-session-exporter \
+  --workspace /path/to/project \
+  --chain /path/to/project/.editchain
+```
 
-**Durability is at-least-once, not atomic.** If the process crashes after the append but before the cursor commit, the next import re-reads the same sources and appends an exact replay of the same ops (same deterministic ids); opening the chain canonicalizes exact replays through the core `OpSet`. No atomicity is claimed across the log and the cursor files — a crash between them can leave the log ahead of the cursors, never behind. Within a cursor-store commit, a persisted rewrite generation is written before any cursor file that depends on it, so a crash or write error between the two can leave a generation with no cursor, but never a cursor ahead of its generation.
+Imports are incremental and can be repeated. Run each provider separately to
+include both in one chain. Add `--dry-run` to preview an import without changing
+stored history. After importing, refresh the history panel in VS Code.
 
-**Rewrites.** For both providers, every cursor stores direct BLAKE3 over exactly the accepted byte prefix. Before an append, the importer re-hashes that prefix; truncation, same-size replacement, and a changed prefix followed by growth therefore start a new deterministic boot generation. The per-source generation counter is persisted with the cursor, so rewritten sources never collide with earlier operation IDs or abort unrelated files. File size alone never establishes continuity.
+Imports also prepare the display cache. To rebuild it separately, run:
 
-**Safe reset.** Deleting a source's cursor file re-imports that source and appends replay records to the physical log (deduplicated by `OpSet` on open). Its provider-independent generation counter is retained, so a rewritten source stays in its current ID space. Deleting the whole `cursors/` directory also resets the generation counters: a rewritten source can then reuse earlier IDs with different bytes. All versions of a conflicted ID are retained as evidence and excluded from accepted history. The viewer and import reconciliation share this rule through `editchain-store`. Missing or corrupt blobs, undecodable records, and incomplete segment tails are reported in the `Open` diagnostics.
+```sh
+./target/release/editchain prepare-view \
+  --workspace /path/to/project \
+  --chain .editchain
+```
 
-## Models used
+## How it works
 
-See [MODELS.md](./MODELS.md) for the model timeline and the source-task/hybrid workflow provenance.
+EditChain stores imported activity as a durable operation log with associated
+payloads and import checkpoints under `.editchain`. The native service combines
+that history with Git and answers the viewer's window, search, detail, and diff
+requests. Display snapshots and the search index are derived from those sources.
+
+| Component | Role |
+| --- | --- |
+| [`editchain-node`](./crates/editchain-node/) | Builds the `editchain` import CLI and the `editchain-vscode-service` native backend. |
+| [`editchain-history-renderer`](./crates/editchain-history-renderer/) | Renders the history view in Rust/WASM, including the graph, paging, search navigation, and selection. |
+| [VS Code extension](./extensions/vscode-editchain/) | Hosts the renderer, connects it to the service over framed stdio, and opens details and diffs in VS Code. |
+
+The viewer is read-only; the CLI writes imports. Keep the chain's operation
+files, blobs, and checkpoints together when backing up imported history.
+
+## Development
+
+Run the repository's Rust checks from the root:
+
+```sh
+cargo install cargo-deny --locked
+./scripts/lint.sh
+```
+
+For extension and browser tests, see the
+[extension test guide](./extensions/vscode-editchain/README.md#tests).
+[Implementation notes](./docs/refactor.md) describe storage, import, and API
+contracts. [MODELS.md](./MODELS.md) records the project's model provenance.

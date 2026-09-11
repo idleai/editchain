@@ -16,7 +16,7 @@ Prerequisites:
 From the repository root:
 
 ```sh
-cargo build -p editchain-node --bin editchain-vscode-service
+cargo build --release -p editchain-node --bin editchain-vscode-service --locked
 
 cd extensions/vscode-editchain
 npm ci
@@ -27,11 +27,13 @@ npm run compile
 `build:renderer` builds `crates/editchain-history-renderer` for wasm32 and writes
 the single generated bundle under `media/rust-history/pkg/`.
 
-Run the extension with F5 from the repository and invoke **EditChain: Open
-History Explorer**. The settings are:
+Follow the [packaging instructions](#packaging) to install the extension, open
+the project you want to explore, and invoke **EditChain: Open History Explorer**.
+The settings are:
 
-- `editchain-history.servicePath`: native service binary; release and then
-  debug builds under the workspace are used when empty.
+- `editchain-history.servicePath`: absolute path to the native service binary.
+  Release and then debug builds under the open workspace are used when empty;
+  set this explicitly when viewing a project outside the EditChain checkout.
 - `editchain-history.chainDir`: EditChain data directory relative to the open
   workspace, defaulting to `.editchain`.
 
@@ -61,11 +63,12 @@ handwritten renderer script loaded by the panel.
 
 ## Service protocol
 
-The native service supports six request bodies:
+The native service supports seven request bodies:
 
 - `Open`
-- `GetWindow { offset, limit, include_layout }`
-- `FindInHistory { query, top_k }`
+- `Refresh`
+- `GetWindow { snapshot_id, offset, limit, include_layout }`
+- `FindInHistory { snapshot_id, query, top_k }`
 - `GetNodeDetails`
 - `ResolveObject`
 - `GetFileDiff`
@@ -122,6 +125,10 @@ npm run build:renderer
 npm run compile
 npm run package
 ```
+
+Run **Extensions: Install from VSIX…** in VS Code and select the generated
+`.vsix` file. Configure `editchain-history.servicePath` to point to the native
+service build; the service binary is built separately from the extension.
 
 The generated `media/rust-history/pkg` artifacts are committed and CI verifies
 that regeneration is deterministic.
