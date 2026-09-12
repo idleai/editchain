@@ -232,7 +232,7 @@ impl HistoryProjection {
                 let children = children_of.get(&op.id);
                 let content = content::collapsed_import(op, children, incomplete);
                 let kind = collapsed_import_kind(op, children);
-                let author = collapsed_import_author(children);
+                let author = collapsed_import_author(op, children);
                 // Semantic readability metadata is derived deterministically
                 // here, where the raw envelope and its normalized children are
                 // both available.

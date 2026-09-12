@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import { HumanWorkHost } from './humanWork';
+let humanWork: HumanWorkHost | undefined;
 import { resolveServicePath, StdioClient } from './stdioClient';
 import { createLiveSync, LiveProviderRequest } from './liveHost';
 import { LiveSync } from './liveSync';
@@ -106,6 +108,7 @@ export function activate(context: vscode.ExtensionContext): void {
   output = out;
   context.subscriptions.push(out);
   client.setLog((line) => out.appendLine(line));
+  humanWork = new HumanWorkHost(context, out);
 
   // Read-only JSON content provider: documents opened under the
   // `editchain-json:` scheme are read-only by default (content providers cannot
@@ -824,6 +827,33 @@ function snapshotValue(resp: any, snapshotId: string): any {
   return value;
 }
 
+/** Retry a raced live revision once, preserving the complete advertised edit identity. */
+async function resolveFileDiff(client: StdioClient, msg: { snapshot_id: string; change: any }): Promise<any> {
+  const owner = openEpoch;
+  const epoch = lastOpenBody?.Ok.live?.epoch;
+  const fromLive = typeof epoch === 'string' && typeof msg.snapshot_id === 'string'
+    && (msg.snapshot_id === epoch || (msg.snapshot_id.startsWith(`${epoch}:`)
+      && /^\d+$/.test(msg.snapshot_id.slice(epoch.length + 1))));
+  const response = await client.request(
+    { GetFileDiff: { snapshot_id: msg.snapshot_id, change: msg.change } },
+    { timeoutMs: NON_OPEN_TIMEOUT_MS }
+  );
+  if (response?.Error?.code !== 'stale_snapshot' || !fromLive) return snapshotValue(response, msg.snapshot_id);
+  const diff = await queueLive(async () => {
+    if (owner !== openEpoch || lastOpenBody?.Ok.live?.epoch !== epoch) return;
+    const snapshot = lastOpenBody.Ok.snapshot_id;
+    if (snapshot === msg.snapshot_id) return;
+    output?.appendLine('[diff] Revalidating the recorded edit after a live revision advanced.');
+    const retry = await client.request(
+      { GetFileDiff: { snapshot_id: snapshot, change: msg.change } },
+      { timeoutMs: NON_OPEN_TIMEOUT_MS }
+    );
+    return snapshotValue(retry, snapshot);
+  });
+  if (!diff) throw new Error(serviceErrorMessage(response.Error));
+  return diff;
+}
+
 /** Materialize one advertised file change and open VS Code's native diff UI. */
 async function openDiffEditor(
   client: StdioClient,
@@ -834,11 +864,7 @@ async function openDiffEditor(
     if (!msg.change || typeof msg.change !== 'object' || Array.isArray(msg.change)) {
       throw new Error('missing file-change identity');
     }
-    const resp = await client.request(
-      { GetFileDiff: { snapshot_id: msg.snapshot_id, change: msg.change } },
-      { timeoutMs: NON_OPEN_TIMEOUT_MS }
-    );
-    const diff = snapshotValue(resp, msg.snapshot_id);
+    const diff = await resolveFileDiff(client, { snapshot_id: msg.snapshot_id, change: msg.change });
     if (!diff || typeof diff !== 'object') {
       throw new Error('service returned no file diff');
     }
@@ -854,7 +880,7 @@ async function openDiffEditor(
 
     const serial = ++diffDocumentSerial;
     const currentPath = typeof diff.path === 'string' && diff.path ? diff.path : 'edit.txt';
-    const source = msg.change.source === 'git' ? 'Git' : 'agent';
+    const source = msg.change.source === 'git' ? 'Git' : msg.change.source === 'human' ? 'human' : 'agent';
     if (hunks.length > 1) {
       await openRecordedHunks(diffProvider, serial, currentPath, source, hunks);
     } else {
@@ -1122,4 +1148,4 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 </html>`;
 }
 
-export function deactivate(): void {}
+export async function deactivate(): Promise<void> { await humanWork?.stop(); }

@@ -40,6 +40,35 @@ fn assert_parent(changes: &[(String, Vec<String>)], key: &str, parent: &str) {
 }
 
 #[test]
+fn a_visible_work_occurrence_tracks_late_git_baselines_and_their_removal() {
+    let mut projection = LiveProjection::default();
+    let _changes = projection.apply(vec![operation(1, None), operation(2, Some(1))], &[]);
+    let mut ancestry = Ancestry::default();
+    ancestry.put(&row("first", 1, 1), &projection);
+    ancestry.put(&row("next", 2, 2), &projection);
+    assert_parent(&ancestry.changed(&projection), "next", "first");
+    let baseline = GitLink {
+        source: id(1),
+        target_repo: editchain_core::RepositoryId(1),
+        target_oid: editchain_core::GitOid::from_hex("1111111111111111111111111111111111111111")
+            .expect("fixture oid"),
+        kind: GitLinkKind::BasedOn,
+    };
+    let target = baseline.target_key().to_string();
+    let mut proof = operation(10, None);
+    proof.kind = OpKind::GitLink(baseline);
+    ancestry.observe_links(std::slice::from_ref(&proof), &[]);
+    let changes = ancestry.changed(&projection);
+    assert_parent(&changes, "first", &target);
+    assert_parent(&changes, "next", "first");
+    ancestry.observe_links(&[], &[proof.id]);
+    assert!(ancestry
+        .changed(&projection)
+        .iter()
+        .any(|(key, parents)| key == "first" && parents.is_empty()));
+}
+
+#[test]
 fn tool_completion_does_not_fork_the_next_activity_away_from_intervening_commands() {
     for incremental in [false, true] {
         let mut projection = LiveProjection::default();

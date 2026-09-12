@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "types": [
+      "node",
+      "@wdio/globals/types",
+      "@wdio/mocha-framework",
+      "wdio-vscode-service"
+    ],
+    "target": "ES2022",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true
+  },
+  "include": [
+    "wdio.capture.conf.ts",
+    "editor-capture.e2e.ts",
+    "wdio.work.conf.ts",
+    "human-work.e2e.ts"
+  ]
+}

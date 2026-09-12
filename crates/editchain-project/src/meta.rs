@@ -223,6 +223,9 @@ impl NodeMeta {
 #[must_use]
 pub(crate) fn for_edit_operation(op: &Op) -> NodeMeta {
     use editchain_core::op::{CommandStage, ToolStage};
+    if editchain_core::human::is_observation_marker(op) {
+        return NodeMeta::trace(RecordRole::Lifecycle, ActivityKind::System);
+    }
     let turn_id = turn_id_of_scope(op.scope);
     let (record_role, activity_kind) = match &op.kind {
         OpKind::Message(_) => (RecordRole::Narrative, ActivityKind::Conversation),
@@ -289,6 +292,32 @@ pub(crate) fn for_collapsed_import(
     children: Option<&[&Op]>,
     duplicate_of_event_msg: bool,
 ) -> NodeMeta {
+    if children.is_some_and(|children| {
+        children
+            .iter()
+            .any(|child| editchain_core::human::is_observation_marker(child))
+    }) {
+        return NodeMeta::trace(RecordRole::Lifecycle, ActivityKind::System);
+    }
+    if let Some(record) = crate::human::work_record(op) {
+        use editchain_core::human::HumanWorkKind;
+        return NodeMeta {
+            record_role: RecordRole::Action,
+            activity_kind: match record.kind {
+                HumanWorkKind::Edit => ActivityKind::Change,
+                HumanWorkKind::Read | HumanWorkKind::Exposure => ActivityKind::Explore,
+                HumanWorkKind::Gap => ActivityKind::Diagnose,
+            },
+            visibility: Visibility::Primary,
+            outcome: if record.kind == HumanWorkKind::Gap {
+                Outcome::Warning
+            } else {
+                Outcome::Unknown
+            },
+            chain_state: ChainState::Active,
+            turn_id: Some(TurnId(record.turn)),
+        };
+    }
     let turn_id = children.and_then(|cs| cs.iter().find_map(|c| turn_id_of_scope(c.scope)));
     let Some(value) = raw_import_json(op) else {
         return children_based_meta(children, None, turn_id);

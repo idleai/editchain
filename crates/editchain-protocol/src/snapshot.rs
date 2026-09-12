@@ -110,7 +110,10 @@ impl RequestBody {
     #[must_use]
     pub const fn snapshot_id(&self) -> Option<&SnapshotId> {
         match self {
-            Self::Open(_)
+            Self::RecordEditorEvents(_)
+            | Self::GetHumanWork(_)
+            | Self::GetEditorContext(_)
+            | Self::Open(_)
             | Self::OpenLive(_)
             | Self::OpenLivePaged(_)
             | Self::SyncLive(_)

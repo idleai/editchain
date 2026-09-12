@@ -4,6 +4,7 @@
 //! extension host and the native Rust service.
 
 mod content;
+pub mod editor;
 pub use content::{ContentTextDto, RowContentDto, MAX_ROW_TEXT_BYTES, MAX_TOOL_LABEL_BYTES};
 
 mod error;
@@ -39,6 +40,12 @@ pub struct Request {
 /// The body of a request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RequestBody {
+    /// Append durable editor observations without opening the history panel.
+    RecordEditorEvents(editor::RecordEditorEvents),
+    /// Measure recorded human work against retained AI file evidence.
+    GetHumanWork(OpenRequest),
+    /// Observe current Git context for the independent editor recorder.
+    GetEditorContext(OpenRequest),
     /// Open a workspace and load its chain + git repositories.
     Open(OpenRequest),
     /// Bootstrap the retained live activity view once.
@@ -267,6 +274,8 @@ pub enum FileChangeSource {
     Git,
     /// An imported Claude/Codex operation.
     Agent,
+    /// A keyboard-indicated edit with retained buffer revisions.
+    Human,
     /// Forward-compatible unknown source.
     #[serde(other)]
     Unknown,

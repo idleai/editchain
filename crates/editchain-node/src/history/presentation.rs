@@ -427,7 +427,15 @@ fn node_author(node: &editchain_project::HistoryNode) -> String {
         editchain_project::HistoryNode::CollapsedImport { author, .. }
         | editchain_project::HistoryNode::ExecuteBundle { author, .. }
         | editchain_project::HistoryNode::PlanBundle { author, .. } => author.clone(),
-        editchain_project::HistoryNode::WorkGroup { .. } => "agent".to_string(),
+        editchain_project::HistoryNode::WorkGroup { member_nodes, .. } => if member_nodes
+            .iter()
+            .all(|member| node_author(member) == "human")
+        {
+            "human"
+        } else {
+            "agent"
+        }
+        .to_string(),
         editchain_project::HistoryNode::GitCommit { commit, .. } => {
             payload_text(&commit.author.name)
         }

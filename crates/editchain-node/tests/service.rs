@@ -3521,3 +3521,6 @@ fn prepared_snapshot_serves_flattened_activity_view_and_records_current_revision
         "snapshot rows must match the live bundled Activity projection byte-for-byte"
     );
 }
+
+#[path = "service/editor_work.rs"]
+mod editor_work;

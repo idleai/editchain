@@ -22,7 +22,7 @@ impl Workspace {
     pub(crate) fn file_diff(&self, change: &FileChangeDto) -> Result<FileDiffDto, String> {
         match change.source {
             FileChangeSource::Git => self.git_file_diff(change),
-            FileChangeSource::Agent => self.agent_file_diff(change),
+            FileChangeSource::Agent | FileChangeSource::Human => self.agent_file_diff(change),
             FileChangeSource::Unknown => Err("unknown file-change source".to_string()),
         }
     }
@@ -320,20 +320,21 @@ pub(super) fn agent_file_change_index(
             OpKind::File(file) if file.base.is_some() && file.after.is_some()
         );
         let owner_op = op_by_id.get(&owner).copied().unwrap_or(op);
-        changes
-            .entry(owner)
-            .or_default()
-            .push(agent_file_change_dto(
-                op.id,
-                owner_op,
-                &path,
-                AgentFileEvidence {
-                    status,
-                    binary: false,
-                    partial,
-                },
-                &index_context,
-            ));
+        let mut change = agent_file_change_dto(
+            op.id,
+            owner_op,
+            &path,
+            AgentFileEvidence {
+                status,
+                binary: false,
+                partial,
+            },
+            &index_context,
+        );
+        if op.tags.matches_any(editchain_core::Tags::HUMAN) {
+            change.source = FileChangeSource::Human;
+        }
+        changes.entry(owner).or_default().push(change);
     }
     for rows in changes.values_mut() {
         rows.sort_by(|left, right| {

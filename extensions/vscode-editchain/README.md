@@ -38,6 +38,60 @@ The settings are:
 - `editchain-history.chainDir`: EditChain data directory relative to the open
   workspace, defaulting to `.editchain`.
 
+## Human work on AI-generated code
+
+Human-work tracking starts automatically in trusted local workspace folders,
+independently of the History panel. It records buffer snapshots, exact edits,
+saves, renames, text tabs, selections, active editors, visible ranges, and
+continuous code exposure. Unsaved edits are included. Each workspace folder
+writes to its own configured chain. Untitled buffers belong to the first folder.
+
+History shows human work as a connected series alongside agent work, anchored
+to independently recorded Git context. Live episodes have the same disclosure
+controls as agent tasks. Expand an edit's file row to open its exact recorded
+before/after buffer diff, including unsaved changes. Static History keeps human
+fragments as connected graph rows. Raw capture details stay in Trace.
+
+Git context is sampled every 15 seconds and recorded when it changes. Its saved
+workspace location and HEAD are used during replay; today's HEAD cannot rewrite
+old work. These are shared working-tree activity branches, not isolated
+snapshots. External changes can occur between observations.
+
+Open **EditChain: Show Human Work Coverage** from the Command Palette or the
+tracking status item. The report compares imported AI file evidence with current
+saved files and shows nonblank AI-origin lines with reading indicators, human
+edits, their overlap, and brief exposure. Historical counts retain work on lines
+that were later changed or deleted, including unsaved human edits. Populate AI
+evidence using the existing import or Live History workflow; missing provenance
+is reported as unknown, never as zero human review of the whole codebase.
+
+- **EditChain: Pause Human Work Tracking** and **Resume Human Work Tracking**
+  control recording without changing the History panel.
+- `editchain-history.tracking.enabled` defaults to `true`.
+- `editchain-history.tracking.readDwellMs` defaults to `2000`. Reading requires
+  one continuous qualifying interval at the same buffer revision and viewport.
+  Shorter intervals remain exposure/skimming indicators.
+- `editchain-history.tracking.maxFileBytes` defaults to `262144`. Binary and
+  larger buffers produce explicit capture gaps.
+
+Keyboard-correlated edits are human-work indicators under the intentional-user
+assumption. The stable VS Code API does not authenticate authorship. Other text
+changes remain observed changes. Focus is used only to pause exposure timers;
+**no window-focus events or focus history are stored**. Visible code is an
+opportunity to read, not proof of comprehension. Only the active visible editor
+qualifies; folding gaps and navigation jumps are never filled in.
+
+Events remain local: a bounded outbox in VS Code workspace storage retries
+`RecordEditorEvents` until the service acknowledges durable chain writes.
+Failures appear in the tracking status item and EditChain History output.
+The outbox persists once per second and on orderly shutdown; a sudden host or
+machine failure can lose the not-yet-persisted tail. Outbox overflow pauses
+recording with a gap event. Raw snapshots include code contents and are retained
+in the append-only chain, so storage grows with editing activity.
+
+See [the event and measurement contract](../../docs/vscode-human-work.md) for
+matching rules, supported evidence, limitations, and test commands.
+
 ## Live Codex history
 
 Open **EditChain: Open History Explorer** in a trusted workspace. Live updates
@@ -172,6 +226,9 @@ The native service supports these request bodies:
 - `GetNodeDetails`
 - `ResolveObject`
 - `GetFileDiff`
+- `RecordEditorEvents` (recorder host only)
+- `GetEditorContext` (independent Git observation)
+- `GetHumanWork` (coverage report)
 
 The generic webview bridge permits only `GetWindow`, `LocateRows`, and `FindInHistory` and
 requires an exact one-key request envelope. Details and file diffs are explicit
@@ -204,6 +261,8 @@ npm run ui:vscode
 npm run ui:vscode:renderer
 npm run ui:vscode:visual
 npm run ui:vscode:live
+npm run test:capture:types
+npm run ui:vscode:work
 ```
 
 The harness verifies the exact minimal request envelopes, virtual paging,

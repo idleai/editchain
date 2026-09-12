@@ -914,6 +914,15 @@ pub(super) fn sub_op_content(op: &Op) -> Option<String> {
 )]
 pub(super) fn collapsed_import_kind(op: &Op, children: Option<&Vec<&Op>>) -> String {
     use editchain_core::OpKind;
+    if let Some(record) = crate::human::work_record(op) {
+        return match record.kind {
+            editchain_core::human::HumanWorkKind::Edit => "file",
+            editchain_core::human::HumanWorkKind::Read => "read",
+            editchain_core::human::HumanWorkKind::Exposure => "exposure",
+            editchain_core::human::HumanWorkKind::Gap => "error",
+        }
+        .to_string();
+    }
     if let Some(children) = children {
         for child in children {
             match &child.kind {
@@ -945,8 +954,11 @@ pub(super) fn collapsed_import_kind(op: &Op, children: Option<&Vec<&Op>>) -> Str
 /// lives on the normalized children. Prefers `human`, then `agent`, and falls
 /// back to `system` when no child carries a role tag.
 #[must_use]
-pub(super) fn collapsed_import_author(children: Option<&Vec<&Op>>) -> String {
+pub(super) fn collapsed_import_author(op: &Op, children: Option<&Vec<&Op>>) -> String {
     use editchain_core::Tags;
+    if crate::human::work_record(op).is_some() {
+        return "human".to_string();
+    }
     if let Some(children) = children {
         for child in children {
             if child.tags.matches_any(Tags::HUMAN) {

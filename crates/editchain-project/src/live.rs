@@ -531,12 +531,25 @@ impl LiveProjection {
             .chain(outputs)
             .filter_map(|id| self.ops.get(id).cloned())
             .collect();
+        let task = self
+            .ops
+            .get(&anchor)
+            .and_then(|op| crate::human::work_record(op))
+            .map(|record| TaskIdentity {
+                key: format!("human:{}:{}", record.session, record.turn),
+                thread: record.session,
+                turn: record.turn.to_string(),
+                boundary: OpId {
+                    seq: 0,
+                    ..incarnation
+                },
+            });
         LiveRow {
             key,
             anchor,
             incarnation,
             operations,
-            task: None,
+            task,
         }
     }
 

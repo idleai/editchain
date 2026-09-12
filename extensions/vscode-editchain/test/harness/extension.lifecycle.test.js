@@ -680,6 +680,60 @@ test('openDiff resolves service content into VS Code native virtual documents', 
   assert.equal(registration.provider.provideTextDocumentContent(command[2]), 'fn new() {}\n');
 });
 
+test('a live diff race waits for publication and revalidates the same recorded edit once', async t => {
+  const env = loadExtension({});
+  env.vscode.workspace.isTrusted = true;
+  env.open();
+  const panel = env.panels[0];
+  t.after(() => panel.handlers.dispose());
+  await rendererReady(panel);
+  env.client.openRequests[0].resolve(liveBody('epoch:0'));
+  await flush();
+  env.client.nextResponse = deltaBody(1);
+  await panel.handlers.message({ type: 'toggleDisclosure', key: 'human:1', task: true });
+  await flush();
+  const change = { source: 'human', path: 'ai.ts', op_id: '1:1:2', base: 'before', after: 'after' };
+  env.client.nextResponse = { Error: { code: 'stale_snapshot', message: 'History advanced' } };
+  const clicked = panel.handlers.message({ type: 'openDiff', snapshot_id: 'epoch:0', change });
+  await flush();
+  assert.equal(env.client.requests.filter(request => request.body.GetFileDiff).length, 1);
+  assert.equal(env.vscode.__executedCommands.length, 0, 'retry waits for the renderer acknowledgement');
+  env.client.nextResponse = { Ok: { snapshot_id: 'epoch:1', path: 'ai.ts', before: 'AI\n', after: 'human\n' } };
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'epoch:1', error: null });
+  await clicked;
+  assert.deepEqual(env.client.requests.filter(request => request.body.GetFileDiff).map(request => request.body.GetFileDiff), [
+    { snapshot_id: 'epoch:0', change }, { snapshot_id: 'epoch:1', change },
+  ]);
+  const command = env.vscode.__executedCommands[0];
+  assert.equal(command[3], 'ai.ts (human)');
+  const provider = env.vscode.__providers.find(entry => entry.scheme === 'editchain-diff').provider;
+  assert.equal(provider.provideTextDocumentContent(command[1]), 'AI\n');
+  assert.equal(provider.provideTextDocumentContent(command[2]), 'human\n');
+  env.client.nextResponse = { Error: { code: 'stale_snapshot', message: 'Unrelated view' } };
+  await panel.handlers.message({ type: 'openDiff', snapshot_id: 'other:0', change });
+  assert.equal(env.client.requests.filter(request => request.body.GetFileDiff).length, 3, 'an unrelated epoch never retries');
+  assert.equal(env.vscode.__executedCommands.length, 1);
+});
+
+test('disposing a live panel cancels its pending diff revalidation', async () => {
+  const env = loadExtension({});
+  env.open();
+  const panel = env.panels[0];
+  await rendererReady(panel);
+  env.client.openRequests[0].resolve(liveBody('epoch:0'));
+  await flush();
+  env.client.nextResponse = deltaBody(1);
+  await panel.handlers.message({ type: 'toggleDisclosure', key: 'human:1', task: true });
+  await flush();
+  env.client.nextResponse = { Error: { code: 'stale_snapshot', message: 'History advanced' } };
+  const clicked = panel.handlers.message({ type: 'openDiff', snapshot_id: 'epoch:0', change: { source: 'human' } });
+  await flush();
+  panel.handlers.dispose();
+  await clicked;
+  assert.equal(env.client.requests.filter(request => request.body.GetFileDiff).length, 1);
+  assert.equal(env.vscode.__executedCommands.length, 0, 'a replaced view cannot open an edit from a newer view');
+});
+
 test('openDiff keeps one structured hunk flat in the ordinary diff editor', async () => {
   const env = loadExtension();
   env.open();

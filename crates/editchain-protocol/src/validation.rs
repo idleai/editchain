@@ -21,6 +21,7 @@ impl RequestBody {
     /// Returns `InvalidInput` for unsupported limits or inexact coordinates.
     pub fn validate(&self) -> Result<(), ServiceError> {
         match self {
+            Self::RecordEditorEvents(request) => request.validate()?,
             Self::ViewportLive(request) => {
                 if request.snapshot_id.is_empty()
                     || request.capacity == 0
@@ -81,7 +82,9 @@ impl RequestBody {
                     return Err(invalid("search query exceeds 16384 bytes"));
                 }
             }
-            Self::Open(_)
+            Self::GetHumanWork(_)
+            | Self::GetEditorContext(_)
+            | Self::Open(_)
             | Self::OpenLive(_)
             | Self::OpenLivePaged(_)
             | Self::Refresh(_)

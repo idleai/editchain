@@ -4,6 +4,16 @@
 use super::{BundleKind, RowContext, RowInput};
 use std::borrow::Cow;
 
+fn title(task: &editchain_protocol::TaskGroupDto) -> String {
+    let title = task.title.as_deref().unwrap_or("Codex task");
+    if task.task_id.starts_with("human:") && task.status == editchain_protocol::TaskStatus::Unknown
+    {
+        title.to_owned()
+    } else {
+        format!("{title} · {}", task.status.label())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TaskView {
     pub(crate) expanded: bool,
@@ -37,10 +47,9 @@ pub(super) fn disclosure(row: &RowInput, context: &RowContext) -> Option<TaskDis
         folded,
         text: format!("{glyph} {} activities", task.member_count),
         label: format!(
-            "{action} {} activities · {} · {}",
+            "{action} {} activities · {}",
             task.member_count,
-            task.title.as_deref().unwrap_or("Codex task"),
-            task.status.label()
+            title(task)
         ),
     })
 }
@@ -58,11 +67,7 @@ pub(super) fn presentation<'a>(
     let mut folded = row.clone();
     folded.bundle_kind = Some(BundleKind::WorkGroup);
     folded.bundle_count = Some(task.member_count);
-    folded.display_summary = format!(
-        "{} · {}",
-        task.title.as_deref().unwrap_or("Codex task"),
-        task.status.label()
-    );
+    folded.display_summary = title(task);
     Cow::Owned(folded)
 }
 

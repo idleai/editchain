@@ -91,6 +91,8 @@ impl Ancestry {
             }
             self.pending
                 .extend(self.root_users.get(&id).into_iter().flatten().cloned());
+            self.pending
+                .extend(self.owners.get(&id).into_iter().flatten().cloned());
             self.pending.extend(self.structural.users(id).cloned());
             pending.extend(self.users.remove(&id).into_iter().flatten());
             drop(self.memo.remove(&id));
@@ -207,6 +209,16 @@ impl Ancestry {
             }
             let ids = self.owned.get(&key).cloned().unwrap_or_default();
             let mut structural_targets = BTreeSet::new();
+            // A baseline can name a visible occurrence directly, in addition
+            // to a hidden predecessor traversed by `resolve`.
+            for id in &ids {
+                parents.extend(
+                    self.based
+                        .get(id)
+                        .into_iter()
+                        .flat_map(|links| links.values().cloned()),
+                );
+            }
             for id in ids {
                 let mut extra = BTreeSet::new();
                 for target in self.structural.targets(id) {

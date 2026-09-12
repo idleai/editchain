@@ -11,6 +11,8 @@ pub mod admission;
 pub mod clock;
 /// Git identity, commit, and explicit-link types.
 pub mod git;
+/// Human work episodes and exact observed buffer revisions.
+pub mod human;
 /// Identifier types (`NodeId`, `ActorId`, `OpId`, etc.).
 pub mod ids;
 /// Operation envelope and all operation kinds.

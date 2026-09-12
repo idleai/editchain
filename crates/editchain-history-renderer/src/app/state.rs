@@ -1481,7 +1481,10 @@ impl HistoryAppState {
                         Err(error) => self.fail_response(&req.body, &error, step),
                     }
                 }
-                RequestBody::Open(_)
+                RequestBody::RecordEditorEvents(_)
+                | RequestBody::GetHumanWork(_)
+                | RequestBody::GetEditorContext(_)
+                | RequestBody::Open(_)
                 | RequestBody::OpenLive(_)
                 | RequestBody::OpenLivePaged(_)
                 | RequestBody::SyncLive(_)

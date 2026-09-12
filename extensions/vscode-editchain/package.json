@@ -17,7 +17,8 @@
   ],
   "activationEvents": [
     "onCommand:editchain-history.open",
-    "onCommand:editchain-history.startLive"
+    "onCommand:editchain-history.startLive",
+    "onStartupFinished"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -43,6 +44,18 @@
       {
         "command": "editchain-history.stopLive",
         "title": "EditChain: Pause Live History"
+      },
+      {
+        "command": "editchain-history.humanWork",
+        "title": "EditChain: Show Human Work Coverage"
+      },
+      {
+        "command": "editchain-history.startTracking",
+        "title": "EditChain: Resume Human Work Tracking"
+      },
+      {
+        "command": "editchain-history.stopTracking",
+        "title": "EditChain: Pause Human Work Tracking"
       }
     ],
     "configuration": {
@@ -77,6 +90,25 @@
           "type": "string",
           "default": "",
           "description": "Path to codex-session-exporter. Defaults to the workspace helper release build, then PATH."
+        },
+        "editchain-history.tracking.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Record local workspace code edits, editor activity, and code exposure in EditChain. Focus only pauses timers; no focus events are stored."
+        },
+        "editchain-history.tracking.readDwellMs": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 500,
+          "maximum": 30000,
+          "description": "Continuous foreground visibility required for a reading indicator. Visibility does not prove comprehension."
+        },
+        "editchain-history.tracking.maxFileBytes": {
+          "type": "number",
+          "default": 262144,
+          "minimum": 1024,
+          "maximum": 524288,
+          "description": "Maximum buffer size to capture. Skipped binary or oversized buffers produce explicit coverage gaps."
         }
       }
     }
@@ -93,7 +125,11 @@
     "build:gpu": "npm run build:renderer",
     "test:harness": "node --test test/harness/*.test.js",
     "test:rust-smoke": "node --test --test-reporter=tap test/harness/rustSmoke.test.js",
-    "ui:vscode:live": "xvfb-run -a npx wdio run ./test/vscode/wdio.live.conf.ts"
+    "ui:vscode:live": "xvfb-run -a npx wdio run ./test/vscode/wdio.live.conf.ts",
+    "ui:vscode:capture": "xvfb-run -a -s '-screen 0 1440x1000x24' npx wdio run ./test/vscode/wdio.capture.conf.ts",
+    "ui:vscode:capture:baseline": "bash scripts/test-capture-baseline.sh",
+    "test:capture:types": "tsc -p test/vscode/tsconfig.capture.json && node --check test/vscode/capture-probe/extension.js",
+    "ui:vscode:work": "xvfb-run -a -s '-screen 0 1440x1000x24' npx wdio run ./test/vscode/wdio.work.conf.ts"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

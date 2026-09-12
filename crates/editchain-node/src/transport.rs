@@ -13,6 +13,7 @@ use crate::history::{
 /// A stateful server that owns a loaded workspace across requests.
 #[derive(Debug)]
 pub struct Server {
+    editor: crate::editor::EditorStore,
     live: Option<crate::history::LiveWorkspace>,
     /// The currently loaded workspace (None until `Open`).
     pub workspace: Option<Workspace>,
@@ -24,9 +25,10 @@ pub struct Server {
 impl Server {
     /// Create a new empty server.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             live: None,
+            editor: crate::editor::EditorStore::default(),
             workspace: None,
             lexical: None,
         }
@@ -91,6 +93,24 @@ impl Server {
                 body: ResponseBody::Error(error),
             });
         }
+        if let RequestBody::GetEditorContext(open) = &request.body {
+            return Ok(Response {
+                id,
+                body: ResponseBody::Ok(crate::editor::observe_context(open)?),
+            });
+        }
+        if let RequestBody::RecordEditorEvents(batch) = &request.body {
+            return Ok(Response {
+                id,
+                body: ResponseBody::Ok(self.editor.record(batch)?),
+            });
+        }
+        if let RequestBody::GetHumanWork(open) = &request.body {
+            return Ok(Response {
+                id,
+                body: ResponseBody::Ok(crate::history::human_work::report(open)?),
+            });
+        }
         if let RequestBody::OpenLivePaged(open) = &request.body {
             self.live = None;
             let live = crate::history::LiveWorkspace::open_paged(open)?;
@@ -131,7 +151,10 @@ impl Server {
             }
         }
         let reads_sources = match &request.body {
-            RequestBody::Open(_)
+            RequestBody::RecordEditorEvents(_)
+            | RequestBody::GetHumanWork(_)
+            | RequestBody::GetEditorContext(_)
+            | RequestBody::Open(_)
             | RequestBody::OpenLive(_)
             | RequestBody::OpenLivePaged(_)
             | RequestBody::SyncLive(_)
@@ -152,7 +175,10 @@ impl Server {
                 .ensure_sources_current()?;
         }
         let body = match &request.body {
-            RequestBody::OpenLive(_)
+            RequestBody::RecordEditorEvents(_)
+            | RequestBody::GetHumanWork(_)
+            | RequestBody::GetEditorContext(_)
+            | RequestBody::OpenLive(_)
             | RequestBody::OpenLivePaged(_)
             | RequestBody::ToggleLive(_)
             | RequestBody::ViewportLive(_)
@@ -238,7 +264,10 @@ impl Server {
             }
             RequestBody::GetFileDiff(req) => {
                 let ws = self.workspace.as_mut().ok_or_else(no_workspace)?;
-                if req.change.source == FileChangeSource::Agent {
+                if matches!(
+                    req.change.source,
+                    FileChangeSource::Agent | FileChangeSource::Human
+                ) {
                     ws.ensure_projection_loaded()?;
                 }
                 match ws.file_diff(&req.change) {

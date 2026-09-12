@@ -88,6 +88,15 @@ pub(super) fn session_metadata_index(ops: &[Op]) -> HashMap<String, SessionMetaD
 /// records' source ordering.
 #[must_use]
 fn session_metadata_from_op(op: &Op) -> Option<(SessionMetaDto, u8)> {
+    if editchain_project::human::work_record(op).is_some() {
+        return Some((
+            SessionMetaDto {
+                session_title: Some("Human work · VS Code".into()),
+                ..SessionMetaDto::default()
+            },
+            2,
+        ));
+    }
     let OpKind::Import(import) = &op.kind else {
         return None;
     };

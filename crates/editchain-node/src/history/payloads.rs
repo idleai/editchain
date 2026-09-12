@@ -183,7 +183,9 @@ pub(super) fn projection_ops_with_previews(
         .iter()
         .map(|source| {
             let mut op = source.clone();
-            compact_kind_for_projection(&mut op.kind, resolver, &mut stats);
+            if editchain_project::human::work_record(source).is_none() {
+                compact_kind_for_projection(&mut op.kind, resolver, &mut stats);
+            }
             if op.kind != source.kind {
                 let _: bool = incomplete.insert(op.id);
             }
