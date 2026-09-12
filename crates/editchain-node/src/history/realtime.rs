@@ -1,11 +1,17 @@
 //! Resident native workspace: canonical tail, logical items, and keyed row blocks.
 
 mod ancestry;
+mod checkpoint;
 mod collector;
+mod disclosure;
 mod git;
+mod open;
 mod queries;
+mod regroup;
 mod rows;
+mod storage;
 mod tasks;
+use storage::{RowStore, StoredBlock};
 
 use editchain_core::OpId;
 use editchain_git::RepositoryCatalog;
@@ -16,12 +22,14 @@ use editchain_protocol::{
     LiveBaseline, LiveBlock, LiveDelta, LiveUpdate, LiveWork, OpenRequest, OpenResponse,
     SnapshotId, SyncLiveRequest, PROTOCOL_VERSION,
 };
-use editchain_store::{CanonicalTail, ChainDelta};
+use editchain_store::{ChainDelta, IndexedTail};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     path::{Path, PathBuf},
     time::Instant,
 };
+
+use editchain_index::Map as HashMap;
 
 type Order = editchain_protocol::LiveOrder;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -29,16 +37,22 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// State is created once by `OpenLive`, then updated by canonical deltas.
 #[derive(Debug)]
 pub(crate) struct LiveWorkspace {
+    reused_checkpoint: bool,
+    coordinates: editchain_protocol::rank::Axis,
+    preparing: bool,
+    disclosure: disclosure::Disclosure,
+    checkpoint_store: std::rc::Rc<editchain_index::Storage>,
     root: PathBuf,
     chain: PathBuf,
-    tail: CanonicalTail,
+    tail: IndexedTail,
+    blobs: editchain_store::BlobReader,
     pending: ChainDelta,
     poisoned: bool,
     projection: LiveProjection,
     catalog: RepositoryCatalog,
     git: git::GitTracker,
     codex: Option<(String, LiveCodex)>,
-    blocks: RankTree<Order, LiveBlock>,
+    blocks: RankTree<Order, StoredBlock>,
     orders: HashMap<String, Order>,
     inputs: HashMap<String, LiveRow>,
     owners: HashMap<OpId, String>,
@@ -47,7 +61,8 @@ pub(crate) struct LiveWorkspace {
     revision: u64,
     journal: VecDeque<LiveDelta>,
     journal_bytes: usize,
-    search: queries::LiveSearch,
+    search: Option<queries::LiveSearch>,
+    rows: RowStore,
     ancestry: ancestry::Ancestry,
     graph: editchain_protocol::live_graph::LiveGraph,
     reconciliation: crate::reconcile::LiveReconciliation,
@@ -56,18 +71,45 @@ pub(crate) struct LiveWorkspace {
 
 impl LiveWorkspace {
     pub(crate) fn open(request: &OpenRequest) -> Result<Self> {
-        let root = PathBuf::from(&request.workspace_path);
+        editchain_index::boundary(|| Self::open_inner(request, false))?
+    }
+
+    fn open_inner(request: &OpenRequest, prepare: bool) -> Result<Self> {
+        let root = std::fs::canonicalize(&request.workspace_path)?;
         let chain = if Path::new(&request.chain_dir).is_absolute() {
             PathBuf::from(&request.chain_dir)
         } else {
             root.join(&request.chain_dir)
         };
-        let tail = CanonicalTail::open(&chain)?;
+        std::fs::create_dir_all(&chain)?;
+        let chain = std::fs::canonicalize(chain)?;
+        let checkpoint_path = chain.join("live-v1");
+        let checkpoint_store = editchain_index::Storage::open(&checkpoint_path)?;
+        let saved = checkpoint::load(&checkpoint_store)?;
+        if !prepare
+            && saved
+                .as_ref()
+                .is_some_and(|saved| saved.version < checkpoint::VERSION)
+        {
+            return Err("history graph checkpoint needs preparation; run editchain prepare-view --workspace <workspace> --chain <chain>".into());
+        }
+
+        let tail = if saved.is_some() {
+            IndexedTail::empty(&chain)
+        } else {
+            IndexedTail::open(&chain)?
+        };
         let catalog = RepositoryCatalog::discover(&root)?;
         let epoch = super::unique_snapshot_id("live");
         let git = git::GitTracker::new(&catalog)?;
         let reconciliation = crate::reconcile::LiveReconciliation::new(&catalog)?;
         let mut workspace = Self {
+            reused_checkpoint: saved.is_some(),
+            coordinates: editchain_protocol::rank::Axis::Expanded,
+            preparing: true,
+            disclosure: disclosure::Disclosure::default(),
+            checkpoint_store,
+            blobs: editchain_store::BlobReader::open(&chain)?,
             root,
             chain,
             tail,
@@ -86,33 +128,75 @@ impl LiveWorkspace {
             revision: 0,
             journal: VecDeque::new(),
             journal_bytes: 0,
-            search: queries::LiveSearch::new()?,
+            search: Some(queries::LiveSearch::open(
+                &checkpoint_path.join("search"),
+                saved.is_none(),
+            )?),
+            rows: RowStore::open(&checkpoint_path.join("rows"))?,
             ancestry: ancestry::Ancestry::default(),
             graph: editchain_protocol::live_graph::LiveGraph::default(),
             reconciliation,
             tasks: tasks::Tasks::default(),
         };
-        let initial: Vec<_> = workspace
-            .tail
-            .chain()
-            .located_ops()
-            .map(|(op, _)| op.clone())
-            .collect();
+        if let Some(saved) = saved {
+            let repair = saved.version < checkpoint::VERSION;
+            let regroup = saved.version == 1;
+            workspace.adopt(saved, true)?;
+            if regroup {
+                workspace.regroup();
+            }
+            if repair {
+                workspace.repair_graph()?;
+            }
+            workspace.preparing = false;
+            return Ok(workspace);
+        }
+        let initial: Vec<_> = workspace.tail.chain().shared_ops().collect();
         let blobs = editchain_import::FsBlobSink::open_read_only(workspace.chain.join("blobs"))?;
-        workspace
-            .reconciliation
-            .observe(&initial, std::iter::empty(), blobs.as_ref());
-        workspace.ancestry.observe_links(&initial, &[]);
-        workspace.git.follow_links(&initial);
-        let changes = workspace.projection.apply(initial, &[]);
+        for chunk in initial.chunks(1024) {
+            let ops: Vec<_> = chunk.iter().map(|op| op.as_ref().clone()).collect();
+            workspace
+                .reconciliation
+                .observe(&ops, std::iter::empty(), blobs.as_ref());
+            workspace.ancestry.observe_links(&ops, &[]);
+            workspace.git.follow_links(&ops);
+        }
+        let changes = workspace.projection.apply_shared(initial, &[]);
         let (removed, mut upserts) = workspace.apply_blocks(changes)?;
         let initial_git = workspace.git.poll()?;
         upserts.extend(workspace.apply_git(initial_git)?);
-        let _changed = workspace.connect(&removed, upserts)?;
+        drop(workspace.connect(&removed, upserts)?);
+        workspace.preparing = false;
+        workspace.checkpoint()?;
         Ok(workspace)
     }
 
-    pub(crate) fn opened(&self) -> OpenResponse {
+    pub(crate) fn prepare(request: &OpenRequest) -> Result<Self> {
+        let mut workspace = editchain_index::boundary(|| Self::open_inner(request, true))??;
+        workspace.coordinates = editchain_protocol::rank::Axis::Visible;
+        Ok(workspace)
+    }
+
+    pub(crate) fn open_paged(request: &OpenRequest) -> Result<Self> {
+        let mut workspace = Self::open(request)?;
+        workspace.coordinates = editchain_protocol::rank::Axis::Visible;
+        Ok(workspace)
+    }
+
+    fn paged(&self) -> bool {
+        matches!(self.coordinates, editchain_protocol::rank::Axis::Visible)
+    }
+
+    fn total(&self) -> u64 {
+        let measure = self.blocks.measure();
+        if self.paged() {
+            measure.visible
+        } else {
+            measure.expanded
+        }
+    }
+
+    fn open_metadata(&self) -> OpenResponse {
         OpenResponse {
             protocol_version: PROTOCOL_VERSION,
             live_updates: true,
@@ -120,25 +204,54 @@ impl LiveWorkspace {
             workspace: self.root.to_string_lossy().into_owned(),
             chain: self.chain.to_string_lossy().into_owned(),
             repos: self.catalog.len(),
-            nodes: self.blocks.measure().expanded,
+            nodes: self.total(),
             chain_generation: u64::try_from(self.tail.chain().stats().accepted).unwrap_or(u64::MAX),
             render_snapshot: "retained-live".into(),
-            diagnostics: serde_json::json!({ "chain": self.tail.chain().stats() }),
+            diagnostics: serde_json::json!({ "chain": self.tail.chain().stats(), "checkpoint": self.reused_checkpoint, "open_chain_records": if self.reused_checkpoint { 0 } else { self.tail.chain().stats().records } }),
             warnings: Vec::new(),
-            live: Some(LiveBaseline {
-                epoch: self.epoch.clone(),
-                revision: self.revision,
-                total: self.blocks.measure().expanded,
-                blocks: self
-                    .blocks
-                    .iter()
-                    .map(|(_, block)| block.meta.clone())
-                    .collect(),
-            }),
+            live: None,
         }
     }
 
+    pub(crate) fn opened(&self) -> OpenResponse {
+        let mut response = self.open_metadata();
+        response.live = Some(LiveBaseline {
+            paged: self.paged(),
+            epoch: self.epoch.clone(),
+            revision: self.revision,
+            total: self.total(),
+            blocks: if self.paged() {
+                Vec::new()
+            } else {
+                self.blocks
+                    .iter()
+                    .map(|(_, block)| block.meta.clone())
+                    .collect()
+            },
+        });
+        response
+    }
+
     pub(crate) fn sync(&mut self, request: &SyncLiveRequest) -> Result<LiveUpdate> {
+        match editchain_index::boundary(|| {
+            let before = self.revision;
+            let result = self.sync_inner(request)?;
+            if self.revision != before || result.work.chain_bytes > 0 {
+                self.checkpoint()?;
+            } else {
+                self.unload()?;
+            }
+            Ok(result)
+        }) {
+            Ok(result) => result,
+            Err(error) => {
+                self.poisoned = true;
+                Err(error.into())
+            }
+        }
+    }
+
+    fn sync_inner(&mut self, request: &SyncLiveRequest) -> Result<LiveUpdate> {
         self.validate_cursor(request)?;
         let capture_start = Instant::now();
         self.queue_tail()?;
@@ -157,7 +270,7 @@ impl LiveWorkspace {
             .pending
             .added
             .values()
-            .map(|(op, _)| op.clone())
+            .map(|(op, _)| op.as_ref().clone())
             .collect();
         let blobs = editchain_import::FsBlobSink::open_read_only(self.chain.join("blobs"))?;
         self.reconciliation.observe(
@@ -189,11 +302,11 @@ impl LiveWorkspace {
                 &admitted
                     .added
                     .values()
-                    .map(|(op, _)| op.clone())
+                    .map(|(op, _)| op.as_ref().clone())
                     .collect::<Vec<_>>(),
                 &admitted.removed.iter().copied().collect::<Vec<_>>(),
             );
-            let changes = self.projection.apply(
+            let changes = self.projection.apply_shared(
                 admitted.added.into_values().map(|(op, _)| op).collect(),
                 &admitted.removed.into_iter().collect::<Vec<_>>(),
             );
@@ -202,7 +315,11 @@ impl LiveWorkspace {
             work.occurrences = changes.work.occurrences;
             let (removed, mut upserts) = self.apply_blocks(changes)?;
             upserts.extend(self.apply_git(commits)?);
-            let (removed, upserts) = self.connect(&removed, upserts)?;
+            let (removed, stored) = self.connect(&removed, upserts)?;
+            let upserts = stored
+                .iter()
+                .map(|block| self.load_block(block))
+                .collect::<Result<Vec<_>>>()?;
             work.blocks = removed.len().saturating_add(upserts.len());
             work.projection_ms = millis(projection_start.elapsed());
             self.publish(removed, upserts, work)?;
@@ -236,14 +353,10 @@ impl LiveWorkspace {
         Ok(())
     }
 
-    fn apply_blocks(&mut self, changes: LiveChanges) -> Result<(Vec<String>, Vec<LiveBlock>)> {
+    fn apply_blocks(&mut self, changes: LiveChanges) -> Result<(Vec<String>, Vec<StoredBlock>)> {
+        self.blobs = editchain_store::BlobReader::open(&self.chain)?;
         self.tasks.observe(&changes, &self.projection);
-        // Prepare every changed block before publishing any mutation.
-        let upserts = changes
-            .upserts
-            .values()
-            .map(|row| self.present(row).map(|block| (row.clone(), block)))
-            .collect::<Result<Vec<_>>>()?;
+        self.ancestry.observe_relationships(changes.relationships);
         let mut removed = Vec::new();
         let mut replacements = Vec::new();
         for key in changes.removed {
@@ -251,14 +364,16 @@ impl LiveWorkspace {
                 removed.push(key);
             }
         }
-        for (input, block) in upserts {
-            let key = input.key.clone();
+        // A failed transaction poisons this epoch. Keep only one item's row
+        // payload in memory while bootstrapping, rather than staging all rows.
+        for (key, input) in changes.upserts {
+            let block = self.present(&input)?;
             let previous = self
                 .orders
                 .get(&key)
                 .and_then(|order| self.blocks.get(order));
             if let (Some(previous), Some(block)) = (previous, &block) {
-                if serde_json::to_vec(previous)? == serde_json::to_vec(block)? {
+                if previous.matches(block)? {
                     continue;
                 }
             }
@@ -269,9 +384,12 @@ impl LiveWorkspace {
                     drop(self.owners.insert(op.id, key.clone()));
                 }
                 drop(self.inputs.insert(key.clone(), input));
+                if let Some(search) = &mut self.search {
+                    search.put(&block)?;
+                }
+                let block = self.rows.put(block)?;
                 let order = block.meta.order();
                 drop(self.orders.insert(key, order.clone()));
-                self.search.put(&block)?;
                 drop(self.blocks.insert(
                     order,
                     block.clone(),
@@ -286,6 +404,21 @@ impl LiveWorkspace {
             }
         }
         Ok((removed, replacements))
+    }
+
+    fn load_block(&self, block: &StoredBlock) -> Result<LiveBlock> {
+        let mut rows = self.rows.rows(block)?;
+        for (slot, row) in rows.iter_mut().enumerate() {
+            self.graph
+                .decorate(&block.meta.key, u64::try_from(slot)?, row);
+            if slot == 0 {
+                row.task_group.clone_from(&block.meta.task_summary);
+            }
+        }
+        Ok(LiveBlock {
+            meta: block.meta.clone(),
+            rows,
+        })
     }
 
     fn queue_tail(&mut self) -> Result<()> {
@@ -305,9 +438,13 @@ impl LiveWorkspace {
         let Some(order) = self.orders.remove(key) else {
             return false;
         };
-        drop(self.blocks.remove(&order));
+        if let Some(block) = self.blocks.remove(&order) {
+            self.rows.remove(&block);
+        }
         self.ancestry.remove(key);
-        self.search.remove(key);
+        if let Some(search) = &mut self.search {
+            search.remove(key);
+        }
         if let Some(input) = self.inputs.remove(key) {
             for op in input.operations {
                 if self.owners.get(&op.id).is_some_and(|owner| owner == key) {
@@ -331,6 +468,7 @@ impl LiveWorkspace {
             .ok_or("live revision exhausted")?;
         self.snapshot_id = SnapshotId::new(format!("{}:{}", self.epoch.as_str(), self.revision));
         let delta = LiveDelta {
+            visible_total: Some(self.blocks.measure().visible),
             base_revision,
             revision: self.revision,
             snapshot_id: self.snapshot_id.clone(),
@@ -360,8 +498,8 @@ impl LiveWorkspace {
     fn connect(
         &mut self,
         removed: &[String],
-        upserts: Vec<LiveBlock>,
-    ) -> Result<(Vec<String>, Vec<LiveBlock>)> {
+        upserts: Vec<StoredBlock>,
+    ) -> Result<(Vec<String>, Vec<StoredBlock>)> {
         let mut changed: std::collections::BTreeMap<_, _> = upserts
             .into_iter()
             .map(|block| (block.meta.key.clone(), block))
@@ -387,13 +525,26 @@ impl LiveWorkspace {
             .values()
             .map(|block| block.meta.clone())
             .collect::<Vec<_>>();
-        self.graph.edit(removed, &metas);
-        let groups = self.tasks.update(removed, &metas, &self.inputs);
-        let mut removed = removed.to_vec();
-        for key in groups.removed {
-            if self.remove_block(&key) {
-                removed.push(key);
+        let metas = self.graph.causal_updates(&metas)?;
+        for meta in &metas {
+            if let Some(block) = changed.get_mut(&meta.key) {
+                block.meta = meta.clone();
+            } else if let Some(block) = self
+                .orders
+                .get(&meta.key)
+                .and_then(|order| self.blocks.get(order))
+            {
+                let mut block = block.clone();
+                block.meta = meta.clone();
+                drop(changed.insert(meta.key.clone(), block));
             }
+        }
+        self.graph.edit(removed, &metas);
+        let groups = self
+            .tasks
+            .update(removed, &metas, &self.inputs, &self.graph);
+        for key in groups.removed {
+            self.disclosure.forget_group(&key);
         }
         for (key, group) in groups.membership {
             if !changed.contains_key(&key) {
@@ -409,24 +560,29 @@ impl LiveWorkspace {
                 block.meta.task_group = group;
             }
         }
-        self.graph.set_headers(&removed, &groups.headers);
-        for meta in groups.headers {
-            let block = self.task_header(meta, &changed)?;
-            if let Some(previous) = self
-                .orders
-                .insert(block.meta.key.clone(), block.meta.order())
-            {
-                drop(self.blocks.remove(&previous));
+        for (key, summary) in groups.summaries {
+            if !changed.contains_key(&key) {
+                if let Some(block) = self
+                    .orders
+                    .get(&key)
+                    .and_then(|order| self.blocks.get(order))
+                {
+                    drop(changed.insert(key.clone(), block.clone()));
+                }
             }
-            drop(changed.insert(block.meta.key.clone(), block));
+            if let Some(block) = changed.get_mut(&key) {
+                block.meta.task_summary = summary;
+            }
         }
-        for block in changed.values_mut() {
-            for (slot, row) in block.rows.iter_mut().enumerate() {
-                self.graph
-                    .decorate(&block.meta.key, u64::try_from(slot)?, row);
+        for block in changed.values() {
+            let order = block.meta.order();
+            if let Some(old) = self.orders.insert(block.meta.key.clone(), order.clone()) {
+                if old != order {
+                    drop(self.blocks.remove(&old));
+                }
             }
             drop(self.blocks.insert(
-                block.meta.order(),
+                order,
                 block.clone(),
                 Measure {
                     expanded: block.meta.row_count,
@@ -434,7 +590,8 @@ impl LiveWorkspace {
                 },
             ));
         }
-        Ok((removed, changed.into_values().collect()))
+        self.update_disclosure(removed, &changed.keys().cloned().collect::<Vec<_>>())?;
+        Ok((removed.to_vec(), changed.into_values().collect()))
     }
 }
 

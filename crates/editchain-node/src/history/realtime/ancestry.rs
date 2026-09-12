@@ -1,14 +1,18 @@
 //! Lift source order through first appearances; resolve references through revisions.
 
 use editchain_core::{GitCommitKey, GitLink, GitLinkKind, Op, OpId, OpKind};
+use editchain_index::Map as HashMap;
 use editchain_project::{live::LiveProjection, live::LiveRow};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
+mod relations;
 
 #[cfg(test)]
 mod tests;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Ancestry {
+    #[serde(default)]
+    structural: relations::Structural,
     owners: HashMap<OpId, BTreeSet<String>>,
     owned: HashMap<String, Vec<OpId>>,
     appearances: HashMap<OpId, BTreeSet<String>>,
@@ -87,6 +91,7 @@ impl Ancestry {
             }
             self.pending
                 .extend(self.root_users.get(&id).into_iter().flatten().cloned());
+            self.pending.extend(self.structural.users(id).cloned());
             pending.extend(self.users.remove(&id).into_iter().flatten());
             drop(self.memo.remove(&id));
             for dependency in self.dependencies.remove(&id).into_iter().flatten() {
@@ -101,6 +106,7 @@ impl Ancestry {
         if !self.owned.contains_key(key) {
             return;
         }
+        self.structural.watch(key, BTreeSet::new());
         self.pending
             .extend(self.reference_users.get(key).into_iter().flatten().cloned());
         for root in self.roots.remove(key).into_iter().flatten() {
@@ -199,6 +205,20 @@ impl Ancestry {
                     parents.extend(references);
                 }
             }
+            let ids = self.owned.get(&key).cloned().unwrap_or_default();
+            let mut structural_targets = BTreeSet::new();
+            for id in ids {
+                let mut extra = BTreeSet::new();
+                for target in self.structural.targets(id) {
+                    extra.extend(self.reference(target, projection));
+                    let _: bool = structural_targets.insert(target);
+                }
+                if self.structural.spawn(id) && !extra.is_empty() {
+                    parents.retain(|parent| !parent.starts_with("git:"));
+                }
+                parents.extend(extra);
+            }
+            self.structural.watch(&key, structural_targets);
             let _: bool = parents.remove(&key);
             result.push((key, parents.into_iter().collect()));
         }
@@ -218,21 +238,26 @@ impl Ancestry {
                 .into_iter()
                 .flatten()
                 .cloned()
-                .chain(
-                    self.based
-                        .get(&id)
-                        .into_iter()
-                        .flat_map(|links| links.values().cloned()),
-                )
                 .collect();
             if !owners.is_empty() {
                 drop(self.memo.insert(id, owners));
                 continue;
             }
-            let dependencies: Vec<_> = projection
-                .operation(id)
-                .map(|op| op.parents.iter().copied().collect())
-                .unwrap_or_default();
+            let based: BTreeSet<_> = self
+                .based
+                .get(&id)
+                .into_iter()
+                .flat_map(|links| links.values().cloned())
+                .collect();
+            let mut dependencies: Vec<_> = if based.is_empty() {
+                projection
+                    .operation(id)
+                    .map(|op| op.parents.iter().copied().collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let targets = self.structural.targets(id);
             if !finish {
                 if !visiting.insert(id) {
                     continue;
@@ -241,14 +266,31 @@ impl Ancestry {
                 stack.extend(
                     dependencies
                         .iter()
+                        .chain(targets.iter().filter(|target| {
+                            self.reference_owners(**target, projection).is_empty()
+                        }))
                         .filter(|parent| !visiting.contains(parent))
                         .map(|parent| (*parent, false)),
                 );
                 continue;
             }
             let mut owners = BTreeSet::new();
+            for target in &targets {
+                let references = self.reference_owners(*target, projection);
+                if references.is_empty() {
+                    owners.extend(self.memo.get(target).into_iter().flatten().cloned());
+                } else {
+                    owners.extend(references);
+                }
+            }
+            if !self.structural.spawn(id) || owners.is_empty() {
+                owners.extend(based);
+            }
             for dependency in &dependencies {
                 owners.extend(self.memo.get(dependency).into_iter().flatten().cloned());
+            }
+            dependencies.extend(targets);
+            for dependency in &dependencies {
                 let _: bool = self.users.entry(*dependency).or_default().insert(id);
             }
             drop(self.dependencies.insert(id, dependencies));

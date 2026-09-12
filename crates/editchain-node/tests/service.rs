@@ -15,6 +15,7 @@ use ctrlc as _;
 use dirs as _;
 use editchain_git as _;
 use editchain_import as _;
+use editchain_index as _;
 use editchain_project as _;
 use editchain_protocol as _;
 use editchain_store as _;
@@ -66,6 +67,261 @@ fn live_request(server: &mut editchain_node::Server, body: serde_json::Value) ->
         panic!("live request failed")
     };
     value
+}
+
+#[test]
+fn prepared_live_restarts_page_without_replay_and_keep_quarantine_after_rotation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let chain = tmp.path().join(".editchain");
+    let mut page = editchain_store::format::Page::new(0);
+    for seq in 1..=1000 {
+        page.add_record(
+            0,
+            editchain_store::format::encode_op(&msg_op(58, seq, b"prepared history")).unwrap(),
+        );
+    }
+    write_page(&chain, &page);
+    let _prepared = editchain_node::history::prepare_live_checkpoint(tmp.path(), &chain).unwrap();
+    let open = serde_json::json!({"OpenLivePaged": {"workspace_path": tmp.path(), "chain_dir": ".editchain"}});
+    let mut server = editchain_node::Server::new();
+    let opened = live_request(&mut server, open.clone());
+    assert_eq!(opened["diagnostics"]["open_chain_records"], 0);
+    assert_eq!(opened["live"]["blocks"], serde_json::json!([]));
+    assert_eq!(opened["nodes"], 1000);
+    let distant = live_request(
+        &mut server,
+        serde_json::json!({"GetWindow": {
+            "snapshot_id": opened["snapshot_id"], "offset": 600, "limit": 32, "include_layout": true
+        }}),
+    );
+    assert_eq!(distant["rows"].as_array().unwrap().len(), 32);
+    assert!(
+        distant["expansion_spans"].is_null(),
+        "distant pages must not reset viewport metadata"
+    );
+    let next = msg_op(58, 1001, b"afterrestartneedle");
+    let mut successor = editchain_store::format::Page::new(0);
+    successor.add_record(0, editchain_store::format::encode_op(&next).unwrap());
+    write_page_sequence(&chain, 1, &successor);
+    let update = live_request(
+        &mut server,
+        serde_json::json!({"SyncLive": {
+        "epoch": opened["live"]["epoch"], "after_revision": 0, "codex": null }}),
+    );
+    assert_eq!(update["work"]["chain_records"], 1);
+    assert_eq!(update["work"]["presentation_ops"], 1);
+    assert_eq!(update["deltas"][0]["visible_total"], 1001);
+    drop(server);
+    let mut server = editchain_node::Server::new();
+    let reopened = live_request(&mut server, open.clone());
+    assert_eq!(reopened["diagnostics"]["open_chain_records"], 0);
+    let found = live_request(
+        &mut server,
+        serde_json::json!({"FindInHistory": {
+        "snapshot_id": reopened["snapshot_id"], "query": "afterrestartneedle", "top_k": 5 }}),
+    );
+    assert_eq!(found["matches"].as_array().unwrap().len(), 1);
+    let mut conflict = editchain_store::format::Page::new(1);
+    conflict.add_record(
+        0,
+        editchain_store::format::encode_op(&msg_op(58, 1001, b"different bytes")).unwrap(),
+    );
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(chain.join("000001.eclog"))
+        .unwrap()
+        .write_all(&editchain_store::format::encode_page(&conflict).unwrap())
+        .unwrap();
+    let update = live_request(
+        &mut server,
+        serde_json::json!({"SyncLive": {
+        "epoch": reopened["live"]["epoch"], "after_revision": 0, "codex": null }}),
+    );
+    assert_eq!(update["work"]["chain_records"], 1);
+    assert_eq!(update["deltas"][0]["removed"].as_array().unwrap().len(), 1);
+    drop(server);
+    let mut server = editchain_node::Server::new();
+    let reopened = live_request(&mut server, open.clone());
+    assert_eq!(reopened["nodes"], 1000);
+    assert_eq!(reopened["diagnostics"]["chain"]["quarantined"], 2);
+    drop(server);
+    // A changed sealed prefix invalidates the checkpoint before serving a row.
+    std::fs::write(chain.join("000000.eclog"), b"replaced source").unwrap();
+    assert!(editchain_node::Server::new()
+        .handle(&Request {
+            id: 1,
+            body: serde_json::from_value(open).unwrap()
+        })
+        .is_err());
+}
+
+#[test]
+fn encoded_live_baseline_matches_dispatch_and_keeps_its_paging_epoch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let chain = tmp.path().join(".editchain");
+    let mut page = editchain_store::format::Page::new(0);
+    for seq in 1..=3 {
+        page.add_record(
+            0,
+            editchain_store::format::encode_op(&msg_op(53, seq, b"wire parity")).unwrap(),
+        );
+    }
+    write_page(&chain, &page);
+    let _prepared = editchain_node::history::prepare_live_checkpoint(tmp.path(), &chain).unwrap();
+    let body =
+        serde_json::json!({"OpenLive": {"workspace_path": tmp.path(), "chain_dir": ".editchain"}});
+    let expected = live_request(&mut editchain_node::Server::new(), body.clone());
+    let mut server = editchain_node::Server::new();
+    let encoded = server
+        .handle_encoded(&Request {
+            id: 42,
+            body: serde_json::from_value(body).unwrap(),
+        })
+        .unwrap();
+    let response: editchain_protocol::Response = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(response.id, 42);
+    let ResponseBody::Ok(mut actual) = response.body else {
+        panic!("encoded open failed")
+    };
+    let snapshot = actual["snapshot_id"].clone();
+    actual["snapshot_id"] = expected["snapshot_id"].clone();
+    actual["live"]["epoch"] = expected["live"]["epoch"].clone();
+    assert_eq!(
+        actual, expected,
+        "borrowed serialization preserves every protocol field"
+    );
+    let window = live_request(
+        &mut server,
+        serde_json::json!({"GetWindow": {
+        "snapshot_id": snapshot, "offset": 0, "limit": 10, "include_layout": true}}),
+    );
+    assert_eq!(window["rows"].as_array().unwrap().len(), 3);
+    assert_eq!(window["snapshot_id"], snapshot);
+}
+
+#[test]
+fn live_workspace_reads_blobs_created_after_an_empty_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let chain = tmp.path().join(".editchain");
+    let mut server = editchain_node::Server::new();
+    let opened = live_request(
+        &mut server,
+        serde_json::json!({"OpenLive": {
+        "workspace_path": tmp.path(), "chain_dir": ".editchain"}}),
+    );
+    let blob = store_blob(&chain, b"newblobpayloadmarker");
+    let mut op = msg_op(54, 1, b"");
+    let OpKind::Message(message) = &mut op.kind else {
+        panic!("message fixture")
+    };
+    message.content = Payload::Blob(blob);
+    let mut page = editchain_store::format::Page::new(0);
+    page.add_record(0, editchain_store::format::encode_op(&op).unwrap());
+    write_page(&chain, &page);
+    let update = live_request(
+        &mut server,
+        serde_json::json!({"SyncLive": {
+        "epoch": opened["live"]["epoch"], "after_revision": 0, "codex": null}}),
+    );
+    let window = live_request(
+        &mut server,
+        serde_json::json!({"GetWindow": {
+        "snapshot_id": update["deltas"][0]["snapshot_id"], "offset": 0,
+        "limit": 10, "include_layout": true}}),
+    );
+    assert!(window["rows"][0]["summary"]
+        .as_str()
+        .unwrap()
+        .contains("newblobpayloadmarker"));
+}
+
+#[test]
+fn paged_live_rows_and_lazy_search_follow_appends_and_quarantine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let chain = tmp.path().join(".editchain");
+    let mut store = editchain_store::SegmentStore::open(&chain).unwrap();
+    let mut append = |op: &Op| {
+        let mut page = editchain_store::format::Page::new(0);
+        page.add_record(0, editchain_store::format::encode_op(op).unwrap());
+        store.append_page(&page).unwrap();
+    };
+    let first = msg_op(52, 1, b"oldneedle");
+    append(&first);
+    let mut server = editchain_node::Server::new();
+    let opened = live_request(
+        &mut server,
+        serde_json::json!({"OpenLive": {
+        "workspace_path": tmp.path(), "chain_dir": ".editchain"}}),
+    );
+    let epoch = opened["live"]["epoch"].clone();
+    let find = |server: &mut editchain_node::Server, snapshot: &serde_json::Value, query: &str| {
+        live_request(
+            server,
+            serde_json::json!({"FindInHistory": {
+            "snapshot_id": snapshot, "query": query, "top_k": 5}}),
+        )
+    };
+    assert_eq!(
+        find(&mut server, &opened["snapshot_id"], "oldneedle")["matches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let next = msg_op(52, 2, b"newneedle");
+    append(&next);
+    let update = live_request(
+        &mut server,
+        serde_json::json!({"SyncLive": {
+        "epoch": epoch, "after_revision": 0, "codex": null}}),
+    );
+    let snapshot = update["deltas"][0]["snapshot_id"].clone();
+    assert_eq!(
+        find(&mut server, &snapshot, "newneedle")["matches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    append(&msg_op(52, 1, b"conflicting old record"));
+    let removal = live_request(
+        &mut server,
+        serde_json::json!({"SyncLive": {
+        "epoch": epoch, "after_revision": 1, "codex": null}}),
+    );
+    let snapshot = removal["deltas"][0]["snapshot_id"].clone();
+    assert_eq!(
+        find(&mut server, &snapshot, "oldneedle")["matches"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        find(&mut server, &snapshot, "newneedle")["matches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let window = live_request(
+        &mut server,
+        serde_json::json!({"GetWindow": {
+        "snapshot_id": snapshot, "offset": 0, "limit": 10, "include_layout": true}}),
+    );
+    assert_eq!(window["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(window["rows"][0]["op_id"], next.id.to_string());
+    assert!(window["rows"][0]["summary"]
+        .as_str()
+        .unwrap()
+        .contains("newneedle"));
+    let replay = live_request(
+        &mut server,
+        serde_json::json!({"SyncLive": {
+        "epoch": epoch, "after_revision": 0, "codex": null}}),
+    );
+    assert_eq!(
+        replay["deltas"][0], update["deltas"][0],
+        "paging and reclamation cannot alter journaled rows"
+    );
 }
 
 #[test]

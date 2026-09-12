@@ -108,6 +108,19 @@ impl LiveUpdate {
 }
 
 impl HistoryAppState {
+    pub(super) fn locate_remote_anchors(&mut self, step: &mut Step) {
+        let Some(live) = &mut self.live else {
+            return;
+        };
+        live.stage = Stage::Locating;
+        live.locations.clear();
+        live.viewport = None;
+        let request = RequestBody::LocateRows(LocateRowsRequest {
+            snapshot_id: self.snapshot_id.clone(),
+            keys: live.keys(),
+        });
+        let _issued = self.issue_request(&request, None, step);
+    }
     pub(super) fn pause_live(&mut self, viewport: &Viewport, step: &mut Step) {
         if self.live.is_some() {
             return;
@@ -159,6 +172,12 @@ impl HistoryAppState {
         self.reset_find_state();
         self.cache.clear();
         self.expansion = None;
+        if let Some(baseline) = opened.live.as_ref().filter(|baseline| baseline.paged) {
+            if let Err(error) = self.open_remote(baseline) {
+                self.fail_snapshot(step, &error.message);
+                return;
+            }
+        }
         self.total = Some(i64::try_from(opened.nodes).unwrap_or(0));
         self.total_fetched = 0;
         self.phase = SnapshotPhase::Opening;
@@ -199,6 +218,15 @@ impl HistoryAppState {
         }
         live.locations = response.rows;
         live.stage = Stage::Loading;
+        if self.remote.is_some() {
+            let state = live.clone();
+            let viewport = self.restore_live_anchors(&state);
+            if let Some(live) = &mut self.live {
+                live.viewport = Some(viewport);
+            }
+            self.fetch_window(&viewport, step);
+            return;
+        }
         let request = get_window(
             &self.snapshot_id,
             0,
@@ -210,7 +238,7 @@ impl HistoryAppState {
 
     fn restore_live_anchors(&mut self, live: &LiveUpdate) -> Viewport {
         self.expanded_keys.clear();
-        if let Some(index) = &mut self.expansion {
+        if let Some(index) = self.expansion.as_mut().filter(|_| self.remote.is_none()) {
             for location in &live.locations {
                 if live.expanded.contains(&location.key) {
                     if let Some(row) = i64::try_from(location.row).ok().and_then(ExpandedRow::new) {
@@ -296,6 +324,7 @@ impl HistoryAppState {
         self.render_top = top;
         self.render_bottom = bottom;
         self.phase = SnapshotPhase::LayoutReady;
+        step.ops.push(DomOp::RefreshHeader);
         if self.total == Some(0) {
             Self::show_view_message(step, "No history found in this workspace", false);
         } else {
@@ -313,6 +342,7 @@ impl HistoryAppState {
         });
         Self::announce("History updated", step);
         self.report_status(&viewport, step);
+        self.finish_remote_find(&viewport, step);
     }
 
     pub(super) fn fail_live(&mut self, message: &str, step: &mut Step) {

@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, Metadata};
 use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use editchain_core::{Admission, Op, OpId};
 
@@ -27,12 +28,60 @@ pub struct TailWork {
 #[derive(Debug, Default)]
 pub struct ChainDelta {
     /// Newly accepted operations, after conflicts within this batch are removed.
-    pub added: BTreeMap<OpId, (Op, OpRecordLocation)>,
+    pub added: BTreeMap<OpId, (Arc<Op>, OpRecordLocation)>,
     /// Identities quarantined by newly encountered conflicting evidence.
     pub removed: BTreeSet<OpId>,
     /// Observable work used by scaling tests and live diagnostics.
     pub work: TailWork,
 }
+
+/// Admission storage used by an append frontier.
+///
+/// Implementations must retain every distinct byte representation and keep
+/// conflicted identities permanently inert for this frontier's lifetime.
+pub trait TailCorpus: std::fmt::Debug {
+    /// Create an empty corpus backed by the specified chain directory.
+    fn empty(root: &Path) -> Self;
+    /// Admit the bytes at a durable record location.
+    ///
+    /// # Errors
+    /// Returns errors if retained evidence cannot be read.
+    fn admit_record(
+        &mut self,
+        op: Arc<Op>,
+        encoded: &[u8],
+        location: OpRecordLocation,
+    ) -> io::Result<Admission>;
+    /// Count an undecodable complete record.
+    fn record_undecodable(&mut self);
+    /// Track whether the active frontier ends with an incomplete record.
+    fn record_tail_change(&mut self, incomplete: bool);
+}
+
+impl TailCorpus for CanonicalChain {
+    fn empty(_root: &Path) -> Self {
+        Self::default()
+    }
+    fn admit_record(
+        &mut self,
+        op: Arc<Op>,
+        encoded: &[u8],
+        location: OpRecordLocation,
+    ) -> io::Result<Admission> {
+        Ok(self.admit(op.as_ref().clone(), encoded.to_vec(), Some(location)))
+    }
+    fn record_undecodable(&mut self) {
+        self.record_undecodable();
+    }
+    fn record_tail_change(&mut self, incomplete: bool) {
+        self.record_tail_change(incomplete);
+    }
+}
+
+/// Append frontier retaining a portable in-memory evidence set.
+pub type CanonicalTail = Tail<CanonicalChain>;
+/// Append frontier retaining exact evidence in its immutable segment records.
+pub type IndexedTail = Tail<crate::IndexedChain>;
 
 /// A canonical chain retained across append reads.
 ///
@@ -41,18 +90,19 @@ pub struct ChainDelta {
 /// it does not inventory or decode sealed history on each poll. A caller that
 /// observes an external replacement of sealed history must reopen the reader.
 /// Active-file replacement, truncation and same-size modification are rejected.
-#[derive(Debug)]
-pub struct CanonicalTail {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct Tail<C: TailCorpus> {
     root: PathBuf,
-    chain: CanonicalChain,
+    chain: C,
     segment: u32,
     offset: u64,
     page: Option<u32>,
-    observed: Option<Metadata>,
+    observed: Option<FileStamp>,
+    sealed: editchain_index::OrderedMap<u32, FileStamp>,
     incomplete: bool,
 }
 
-impl CanonicalTail {
+impl<C: TailCorpus> Tail<C> {
     /// Load the existing chain once and retain its admission state and frontier.
     ///
     /// # Errors
@@ -60,15 +110,7 @@ impl CanonicalTail {
     /// Rejects gaps, unreadable records and corrupt framing as the full reader does.
     pub fn open(root: &Path) -> io::Result<Self> {
         let _sequences = segment_sequences(root)?;
-        let mut tail = Self {
-            root: root.to_path_buf(),
-            chain: CanonicalChain::default(),
-            segment: 0,
-            offset: 0,
-            page: None,
-            observed: None,
-            incomplete: false,
-        };
+        let mut tail = Self::empty(root);
         loop {
             let before = (tail.segment, tail.offset);
             drop(tail.poll()?);
@@ -79,9 +121,24 @@ impl CanonicalTail {
         Ok(tail)
     }
 
+    /// Create an empty admission frontier, ready to read from the first record.
+    #[must_use]
+    pub fn empty(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            chain: C::empty(root),
+            segment: 0,
+            offset: 0,
+            page: None,
+            observed: None,
+            sealed: editchain_index::OrderedMap::new(),
+            incomplete: false,
+        }
+    }
+
     /// The retained byte-admission corpus.
     #[must_use]
-    pub const fn chain(&self) -> &CanonicalChain {
+    pub const fn chain(&self) -> &C {
         &self.chain
     }
 
@@ -155,7 +212,7 @@ impl CanonicalTail {
                 self.chain.record_tail_change(incomplete);
             }
             self.incomplete = incomplete;
-            self.observed = Some(metadata);
+            self.observed = Some(FileStamp::read(&metadata)?);
             if self.offset > previous_offset {
                 return Ok(delta);
             }
@@ -166,6 +223,9 @@ impl CanonicalTail {
             if !self.root.join(format!("{next:06}.eclog")).try_exists()? {
                 return Ok(delta);
             }
+            if let Some(stamp) = self.observed.take() {
+                let _previous = self.sealed.insert(self.segment, stamp);
+            }
             self.segment = next;
             self.offset = 0;
             self.page = None;
@@ -174,12 +234,34 @@ impl CanonicalTail {
         }
     }
 
+    /// Validate a saved frontier without decoding sealed records. Older segments
+    /// must still be identical; only the active segment may have grown.
+    /// # Errors
+    /// Rejects source replacement, truncation, missing segments or IO errors.
+    pub fn resume(&self, root: &Path) -> io::Result<()> {
+        if self.root != root {
+            return Err(invalid("checkpoint belongs to another chain"));
+        }
+        for (index, stamp) in self.sealed.iter() {
+            let metadata = std::fs::metadata(root.join(format!("{index:06}.eclog")))?;
+            if &FileStamp::read(&metadata)? != stamp {
+                return Err(invalid("sealed checkpoint segment changed"));
+            }
+        }
+        if self.observed.is_some() {
+            self.validate_frontier(&std::fs::metadata(
+                root.join(format!("{:06}.eclog", self.segment)),
+            )?)?;
+        }
+        Ok(())
+    }
+
     fn validate_frontier(&self, metadata: &Metadata) -> io::Result<()> {
         if let Some(previous) = &self.observed {
-            if !same_file(previous, metadata)
-                || metadata.len() < previous.len()
-                || (metadata.len() == previous.len()
-                    && metadata.modified()? != previous.modified()?)
+            let current = FileStamp::read(metadata)?;
+            if current.identity != previous.identity
+                || current.length < previous.length
+                || (current.length == previous.length && current.modified != previous.modified)
             {
                 return Err(invalid(
                     "chain frontier changed non-monotonically; reload required",
@@ -216,9 +298,10 @@ impl CanonicalTail {
                     .ok_or_else(|| invalid("record offset exhausted"))?,
                 data_len: u32::try_from(record.data.len()).map_err(io::Error::other)?,
             };
+            let op = Arc::new(op);
             match self
                 .chain
-                .admit(op.clone(), record.data.to_vec(), Some(location))
+                .admit_record(Arc::clone(&op), record.data, location)?
             {
                 Admission::Accepted => {
                     drop(delta.added.insert(op.id, (op, location)));
@@ -243,13 +326,31 @@ fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-#[cfg(unix)]
-fn same_file(left: &Metadata, right: &Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    left.dev() == right.dev() && left.ino() == right.ino()
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FileStamp {
+    identity: (u64, u64),
+    length: u64,
+    modified: std::time::SystemTime,
 }
-
-#[cfg(not(unix))]
-fn same_file(left: &Metadata, right: &Metadata) -> bool {
-    left.created().ok() == right.created().ok()
+impl FileStamp {
+    fn read(metadata: &Metadata) -> io::Result<Self> {
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt as _;
+            (metadata.dev(), metadata.ino())
+        };
+        #[cfg(not(unix))]
+        let identity = {
+            let created = metadata
+                .created()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(io::Error::other)?;
+            (created.as_secs(), u64::from(created.subsec_nanos()))
+        };
+        Ok(Self {
+            identity,
+            length: metadata.len(),
+            modified: metadata.modified()?,
+        })
+    }
 }

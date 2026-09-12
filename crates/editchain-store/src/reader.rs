@@ -29,7 +29,7 @@ pub struct ChainReadStats {
 }
 
 /// Exact location of one encoded operation inside an append-only segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OpRecordLocation {
     /// Numeric sequence from `<sequence>.eclog`.
     pub segment_seq: u32,
@@ -193,6 +193,11 @@ impl CanonicalChain {
 ///
 /// Returns an error if the location is oversized, unreadable, or undecodable.
 pub fn read_op_at(chain_dir: &Path, location: OpRecordLocation) -> io::Result<Op> {
+    decode_op(&read_encoded_at(chain_dir, location)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+pub(crate) fn read_encoded_at(chain_dir: &Path, location: OpRecordLocation) -> io::Result<Vec<u8>> {
     if location.data_len > MAX_RECORD_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -204,5 +209,5 @@ pub fn read_op_at(chain_dir: &Path, location: OpRecordLocation) -> io::Result<Op
     let _: u64 = file.seek(SeekFrom::Start(location.data_offset))?;
     let mut encoded = vec![0u8; usize::try_from(location.data_len).map_err(io::Error::other)?];
     file.read_exact(&mut encoded)?;
-    decode_op(&encoded).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    Ok(encoded)
 }

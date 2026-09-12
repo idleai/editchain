@@ -1,4 +1,4 @@
-//! Pregenerate the immutable VS Code render snapshot.
+//! Prepare the resumable native live checkpoint.
 
 use std::path::PathBuf;
 
@@ -14,14 +14,10 @@ use std::path::PathBuf;
     reason = "CLI command consumes paths and reports the generated artifact"
 )]
 pub(super) fn run(workspace: PathBuf, chain: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let report = crate::history::prepare_render_snapshot(&workspace, &chain)?;
+    let report = crate::history::prepare_live_checkpoint(&workspace, &chain)?;
     println!(
-        "Render snapshot {}: {} rows ({} top-level), {} bytes at {}",
-        if report.reused { "reused" } else { "generated" },
-        report.rows,
-        report.top_level_rows,
-        report.bytes,
-        report.path.display()
+        "Live checkpoint ready: {} visible rows, {} operations at {}/live-v1",
+        report.nodes, report.chain_generation, report.chain
     );
     Ok(())
 }

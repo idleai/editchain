@@ -21,6 +21,14 @@ impl RequestBody {
     /// Returns `InvalidInput` for unsupported limits or inexact coordinates.
     pub fn validate(&self) -> Result<(), ServiceError> {
         match self {
+            Self::ToggleLive(request) => {
+                if request.snapshot_id.is_empty()
+                    || request.key.is_empty()
+                    || request.key.len() > 2048
+                {
+                    return Err(invalid("invalid disclosure identity"));
+                }
+            }
             Self::SyncLive(request) => {
                 if request.epoch.is_empty() || request.after_revision > MAX_EXACT_COORDINATE {
                     return Err(invalid("invalid live epoch or revision"));
@@ -60,6 +68,7 @@ impl RequestBody {
             }
             Self::Open(_)
             | Self::OpenLive(_)
+            | Self::OpenLivePaged(_)
             | Self::Refresh(_)
             | Self::GetNodeDetails(_)
             | Self::ResolveObject(_)

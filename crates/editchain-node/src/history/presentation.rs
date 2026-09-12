@@ -187,6 +187,7 @@ impl Workspace {
                     })
                     .collect();
                 rows.push(HistoryRow {
+                    native_expanded: None,
                     op_id: node.op_id().map(|id| id.to_string()),
                     git_oid: node.git_oid().map(|oid| oid.to_hex()),
                     repository: node.repository().map(|rid| rid.0.to_string()),
@@ -275,6 +276,7 @@ impl Workspace {
                     continue;
                 }
                 rows.push(HistoryRow {
+                    native_expanded: None,
                     op_id: (!child.op_id.is_empty()).then(|| child.op_id.clone()),
                     git_oid: child.git_oid.clone(),
                     repository: child.repository.clone(),

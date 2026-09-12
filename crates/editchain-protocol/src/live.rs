@@ -3,7 +3,7 @@
 use crate::{ExpansionSpanDto, HistoryRow, SnapshotId};
 use serde::{Deserialize, Serialize};
 
-/// Chronological item order, with a slot immediately before an item for its header.
+/// Causally scheduled physical item order. The final slot is retained for disk compatibility.
 pub type LiveOrder = (std::cmp::Reverse<u64>, String, u8);
 
 /// Host-authorized provider capture configuration, never accepted from a webview.
@@ -35,7 +35,8 @@ pub struct SyncLiveRequest {
 pub struct LiveBlockMeta {
     /// Stable item/block identity.
     pub key: String,
-    /// Newest-first sort timestamp; key breaks equal-time ties deterministically.
+    /// Monotone ordering clock, raised only to keep present parents below children.
+    /// Physical row timestamps remain the original provider timestamps.
     pub sort_time: u64,
     /// Number of fully expanded rows in this block.
     pub row_count: u64,
@@ -53,15 +54,19 @@ pub struct LiveBlockMeta {
     /// Task section owning this independent item; absent for ungrouped rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_group: Option<String>,
-    /// A presentation header, never a new causal graph node.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_header: Option<TaskGroupDto>,
+    /// Task path annotation on an existing physical item; never a separate row.
+    #[serde(
+        default,
+        alias = "task_header",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub task_summary: Option<TaskGroupDto>,
     /// Failure, warning, cancellation or unresolved work that must stay exposed.
     #[serde(default)]
     pub task_protected: bool,
 }
 
-/// Native task summary for one contiguous section of its activity.
+/// Native task summary for one connected, non-branching path of its activity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskGroupDto {
     /// Full stable task incarnation identity shared by continued sections.
@@ -77,8 +82,14 @@ pub struct TaskGroupDto {
     pub title: Option<String>,
     /// Number of independently retained items in this section.
     pub member_count: u64,
-    /// First item in display order; the header occupies its preceding slot.
+    /// Existing physical item carrying the path summary.
     pub anchor: String,
+    /// Native disclosure state, supplied on paged rows and absent in stored metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expanded: Option<bool>,
+    /// This settled anchor currently represents its folded path. Fresh anchors keep their own content.
+    #[serde(default)]
+    pub summarized: bool,
 }
 
 /// Task lifecycle supplied by the provider's persisted turn metadata.
@@ -116,11 +127,7 @@ impl LiveBlockMeta {
     /// Stable order key; rank is derived rather than stored in each later row.
     #[must_use]
     pub fn order(&self) -> LiveOrder {
-        let (key, slot) = self
-            .task_header
-            .as_ref()
-            .map_or((&self.key, 1), |task| (&task.anchor, 0));
-        (std::cmp::Reverse(self.sort_time), key.clone(), slot)
+        (std::cmp::Reverse(self.sort_time), self.key.clone(), 1)
     }
 }
 
@@ -136,6 +143,9 @@ pub struct LiveBlock {
 /// One-time live topology bootstrap; row content remains paged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveBaseline {
+    /// Native visible coordinates; the baseline carries no global topology.
+    #[serde(default)]
+    pub paged: bool,
     /// Stable runtime epoch, replaced only by an explicit new bootstrap.
     pub epoch: SnapshotId,
     /// Revision represented by the bootstrap.
@@ -179,6 +189,9 @@ pub struct LiveWork {
 /// Atomic view edit relative to a known revision in one epoch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveDelta {
+    /// Visible total for clients using native disclosure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible_total: Option<u64>,
     /// Revision required before applying this edit.
     pub base_revision: u64,
     /// Revision after applying this edit.

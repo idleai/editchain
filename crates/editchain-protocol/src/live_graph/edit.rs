@@ -8,18 +8,7 @@ impl LiveGraph {
     /// Apply keyed edits without replaying the rest of the lane assignment.
     pub fn edit(&mut self, removed: &[String], upserts: &[LiveBlockMeta]) {
         self.changed.clear();
-        self.set_headers(removed, upserts);
-        let removed = removed
-            .iter()
-            .filter(|key| self.nodes.contains_key(*key))
-            .cloned()
-            .collect::<Vec<_>>();
-        let upserts = upserts
-            .iter()
-            .filter(|meta| meta.task_header.is_none())
-            .cloned()
-            .collect::<Vec<_>>();
-        self.edit_nodes(&removed, &upserts);
+        self.edit_nodes(removed, upserts);
     }
 
     fn edit_nodes(&mut self, removed: &[String], upserts: &[LiveBlockMeta]) {
@@ -149,24 +138,38 @@ impl LiveGraph {
             }
         }
         let start = node.order();
-        let parent = node.parents.iter().find_map(|key| self.nodes.get(key));
+        let parent = node
+            .parents
+            .iter()
+            .filter_map(|key| self.nodes.get(key))
+            .find(|parent| same_source(&node, parent))
+            .or_else(|| node.parents.iter().find_map(|key| self.nodes.get(key)));
         let end = parent
             .map_or_else(|| start.clone(), LiveBlockMeta::order)
             .max(start.clone());
         let inherited = parent.and_then(|parent| self.lanes.node(&parent.key));
+        let avoid = parent
+            .filter(|parent| !same_source(&node, parent))
+            .and(inherited);
         let lane = if is_git(&node) {
             Lane::Git
         } else if let Some(lane @ Lane::Operation(_)) = inherited {
-            if self.lanes.coverage(lane).available(&start, &end) {
+            if avoid.is_none() && self.lanes.coverage(lane).available(&start, &end) {
                 lane
             } else {
-                self.lanes.allocate(false, &start, &end)
+                self.lanes.allocate(false, &start, &end, avoid)
             }
         } else {
-            self.lanes.allocate(false, &start, &end)
+            self.lanes.allocate(false, &start, &end, avoid)
         };
         self.lanes.put(&node, lane);
         self.add_paths(key);
         let _: bool = visiting.remove(key);
     }
+}
+
+fn same_source(left: &LiveBlockMeta, right: &LiveBlockMeta) -> bool {
+    editchain_core::OpId::from_display_str(&left.node_key)
+        .zip(editchain_core::OpId::from_display_str(&right.node_key))
+        .is_none_or(|(left, right)| (left.node, left.boot) == (right.node, right.boot))
 }

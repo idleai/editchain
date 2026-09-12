@@ -1,5 +1,6 @@
 //! Git projection identity, observation order, and stored-link contracts.
 
+use editchain_index as _;
 use serde as _;
 use serde_json as _;
 

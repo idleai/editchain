@@ -9,11 +9,17 @@ fn meta(key: &str, time: u64, parents: &[&str]) -> LiveBlockMeta {
     .unwrap()
 }
 
-fn header(anchor: &str, time: u64, status: TaskStatus) -> LiveBlockMeta {
-    let mut meta = meta("section", time, &[]);
-    meta.task_group = None;
-    meta.task_header = Some(TaskGroupDto {
+fn summary(anchor: &str, time: u64, status: TaskStatus) -> LiveBlockMeta {
+    let parent = match anchor {
+        "d" => "c",
+        "e" => "d",
+        _ => "",
+    };
+    let mut meta = meta(anchor, time, &[parent]);
+    meta.task_summary = Some(TaskGroupDto {
         title: None,
+        expanded: None,
+        summarized: false,
         task_id: "task".into(),
         thread_id: "thread".into(),
         turn_id: "turn".into(),
@@ -26,12 +32,12 @@ fn header(anchor: &str, time: u64, status: TaskStatus) -> LiveBlockMeta {
 
 fn baseline(status: TaskStatus) -> LiveBaseline {
     LiveBaseline {
+        paged: false,
         epoch: SnapshotId::new("epoch"),
         revision: 0,
-        total: 5,
+        total: 4,
         blocks: vec![
-            header("d", 4, status),
-            meta("d", 4, &["c"]),
+            summary("d", 4, status),
             meta("c", 3, &["b"]),
             meta("b", 2, &["a"]),
             meta("a", 1, &[]),
@@ -70,6 +76,7 @@ fn delta(index: &mut LiveIndex, metas: &[LiveBlockMeta]) {
     index
         .apply(
             &LiveDelta {
+                visible_total: None,
                 base_revision: index.revision,
                 revision: index.revision.saturating_add(1),
                 snapshot_id: index.epoch.clone(),
@@ -91,10 +98,10 @@ fn delta(index: &mut LiveIndex, metas: &[LiveBlockMeta]) {
 #[test]
 fn completed_history_folds_only_straight_interiors_and_rank_select_skips_them() {
     let mut index = LiveIndex::new(&baseline(TaskStatus::Completed)).unwrap();
-    assert_eq!(visible(&index), ["section", "d", "a"]);
-    assert_eq!(index.visible_total(), 3);
-    for start in 0..5 {
-        for end in start..5 {
+    assert_eq!(visible(&index), ["d", "a"]);
+    assert_eq!(index.visible_total(), 2);
+    for start in 0..4 {
+        for end in start..4 {
             let rows = index
                 .visible_between(
                     ExpandedRow::new(start).unwrap(),
@@ -104,18 +111,18 @@ fn completed_history_folds_only_straight_interiors_and_rank_select_skips_them() 
                 .collect::<Vec<_>>();
             assert_eq!(
                 rows,
-                [0, 1, 4]
+                [0, 3]
                     .into_iter()
                     .filter(|row| *row >= start && *row <= end)
                     .collect::<Vec<_>>()
             );
         }
     }
-    assert!(index.toggle(ExpandedRow::new(0).unwrap()));
-    assert_eq!(visible(&index), ["section", "d", "c", "b", "a"]);
-    assert!(index.toggle(ExpandedRow::new(0).unwrap()));
-    index.reveal(ExpandedRow::new(3).unwrap());
-    assert_eq!(visible(&index), ["section", "d", "b", "a"]);
+    assert!(index.toggle_task(ExpandedRow::new(0).unwrap()));
+    assert_eq!(visible(&index), ["d", "c", "b", "a"]);
+    assert!(index.toggle_task(ExpandedRow::new(0).unwrap()));
+    index.reveal(ExpandedRow::new(2).unwrap());
+    assert_eq!(visible(&index), ["d", "b", "a"]);
 }
 
 #[test]
@@ -123,20 +130,21 @@ fn new_and_revised_members_stay_visible_even_in_a_completed_folded_task() {
     let mut index = LiveIndex::new(&baseline(TaskStatus::Completed)).unwrap();
     delta(
         &mut index,
-        &[header("e", 5, TaskStatus::Completed), meta("e", 5, &["d"])],
+        &[summary("e", 5, TaskStatus::Completed), meta("d", 4, &["c"])],
     );
-    assert_eq!(visible(&index), ["section", "e", "a"]);
+    assert_eq!(visible(&index), ["e", "d", "a"]);
     delta(&mut index, &[meta("b", 2, &["a"])]);
-    assert_eq!(visible(&index), ["section", "e", "b", "a"]);
-    assert!(!index.is_expanded(ExpandedRow::new(0).unwrap()));
+    assert_eq!(visible(&index), ["e", "d", "b", "a"]);
+    assert!(!index.task_expanded(ExpandedRow::new(0).unwrap()));
 }
 
 #[test]
 fn completion_never_collapses_a_task_already_visible_in_this_view() {
     let mut index = LiveIndex::new(&baseline(TaskStatus::InProgress)).unwrap();
-    delta(&mut index, &[header("d", 4, TaskStatus::Completed)]);
-    assert_eq!(visible(&index), ["section", "d", "c", "b", "a"]);
+    delta(&mut index, &[summary("d", 4, TaskStatus::Completed)]);
+    assert_eq!(visible(&index), ["d", "c", "b", "a"]);
     let mut empty = LiveIndex::new(&LiveBaseline {
+        paged: false,
         epoch: SnapshotId::new("e"),
         revision: 0,
         total: 0,
@@ -144,7 +152,7 @@ fn completion_never_collapses_a_task_already_visible_in_this_view() {
     })
     .unwrap();
     delta(&mut empty, &baseline(TaskStatus::Completed).blocks);
-    assert_eq!(visible(&empty), ["section", "d", "c", "b", "a"]);
+    assert_eq!(visible(&empty), ["d", "c", "b", "a"]);
 }
 
 #[test]
@@ -157,8 +165,8 @@ fn late_forks_reveal_hidden_attachments_without_moving_existing_lanes() {
     assert!(visible(&index).iter().any(|key| key == "b"));
     assert_eq!(geometry(&index, "b").lane, before.lane);
     let folded = geometry(&index, "b");
-    let header = index.absolute(&("section".into(), 0)).unwrap();
-    assert!(index.toggle(ExpandedRow::new(header).unwrap()));
+    let anchor = index.absolute(&("d".into(), 0)).unwrap();
+    assert!(index.toggle_task(ExpandedRow::new(anchor).unwrap()));
     assert_eq!(
         serde_json::to_value(geometry(&index, "b")).unwrap(),
         serde_json::to_value(folded).unwrap()

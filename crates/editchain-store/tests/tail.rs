@@ -2,6 +2,7 @@
 
 use blake3 as _;
 use crc as _;
+use editchain_index as _;
 use postcard as _;
 use proptest as _;
 use serde as _;
@@ -12,7 +13,7 @@ use editchain_core::{
     ActorId, Clock, MessageOp, NodeId, Op, OpId, OpKind, ParentSet, Payload, ScopeRef, Tags,
 };
 use editchain_store::format::{encode_op, encode_page, Page};
-use editchain_store::{CanonicalChain, CanonicalTail, SegmentStore};
+use editchain_store::{CanonicalChain, CanonicalTail, IndexedTail, SegmentStore};
 
 fn check(condition: bool, message: &str) -> io::Result<()> {
     if condition {
@@ -68,13 +69,13 @@ fn one_append_reads_only_one_record_at_different_history_sizes() -> io::Result<(
         store.append_page(&page(
             &(0..size).map(|seq| message(seq, "old")).collect::<Vec<_>>(),
         )?)?;
-        let mut tail = CanonicalTail::open(dir.path())?;
+        let mut tail = IndexedTail::open(dir.path())?;
         let op = message(20_000, "one new operation");
         store.append_page(&page(std::slice::from_ref(&op))?)?;
         let delta = tail.poll()?;
         equal(delta.added.len(), 1, "exactly one operation is added")?;
         equal(
-            delta.added.get(&op.id).map(|(op, _)| op),
+            delta.added.get(&op.id).map(|(op, _)| op.as_ref()),
             Some(&op),
             "the appended value is retained",
         )?;
@@ -112,6 +113,12 @@ fn partial_records_replays_conflicts_and_new_segments_match_full_replay() -> io:
             .ok_or_else(|| io::Error::other("prefix"))?,
     )?;
     let mut tail = CanonicalTail::open(dir.path())?;
+    let mut indexed = IndexedTail::open(dir.path())?;
+    equal(
+        indexed.chain().stats().incomplete_tails,
+        1,
+        "indexed incomplete tail",
+    )?;
     check(
         tail.chain().get(one.id).is_none(),
         "an incomplete record is not admitted",
@@ -139,6 +146,27 @@ fn partial_records_replays_conflicts_and_new_segments_match_full_replay() -> io:
         0,
         "completion clears the pending diagnostic",
     )?;
+    let admitted = indexed.poll()?;
+    equal(admitted.added.len(), 1, "indexed completion")?;
+    equal(
+        indexed.chain().stats().incomplete_tails,
+        0,
+        "indexed tail completed",
+    )?;
+    let shared = indexed
+        .chain()
+        .shared_ops()
+        .next()
+        .ok_or_else(|| io::Error::other("no shared operation"))?;
+    let delta_op = &admitted
+        .added
+        .get(&one.id)
+        .ok_or_else(|| io::Error::other("no admitted operation"))?
+        .0;
+    check(
+        std::sync::Arc::ptr_eq(&shared, delta_op),
+        "tail deltas share the admitted allocation",
+    )?;
     let mut store = SegmentStore::open(dir.path())?;
     let conflicting = message(1, "conflict");
     store.append_page(&page(&[
@@ -157,7 +185,51 @@ fn partial_records_replays_conflicts_and_new_segments_match_full_replay() -> io:
         1,
         "only the unconflicted identity is added",
     )?;
+    let indexed_delta = indexed.poll()?;
+    equal(
+        &indexed_delta.added,
+        &delta.added,
+        "indexed admissions match byte evidence",
+    )?;
+    equal(
+        &indexed_delta.removed,
+        &delta.removed,
+        "indexed retractions match byte evidence",
+    )?;
     let full = CanonicalChain::read(dir.path())?;
+    equal(
+        indexed.chain().stats().accepted,
+        full.stats().accepted,
+        "indexed accepted count",
+    )?;
+    equal(
+        indexed.chain().stats().quarantined,
+        full.stats().quarantined,
+        "indexed quarantined count",
+    )?;
+    equal(
+        indexed.chain().stats().duplicates,
+        full.stats().duplicates,
+        "indexed duplicate count",
+    )?;
+    for (id, bytes) in full.evidence().evidence() {
+        equal(
+            indexed.chain().classify(*id, bytes)?,
+            editchain_core::Admission::Duplicate,
+            "all quarantined variants remain known",
+        )?;
+    }
+    // Replaying an older variant can never revive a quarantined operation.
+    store.append_page(&page(std::slice::from_ref(&one))?)?;
+    let replay = indexed.poll()?;
+    check(
+        replay.added.is_empty() && replay.removed.is_empty(),
+        "quarantined replay is inert",
+    )?;
+    check(
+        indexed.chain().get(one.id).is_none(),
+        "quarantine survives old replay",
+    )?;
     equal(
         tail.chain().evidence(),
         full.evidence(),
@@ -173,7 +245,12 @@ fn partial_records_replays_conflicts_and_new_segments_match_full_replay() -> io:
         full.stats().duplicates,
         "duplicates remain idempotent",
     )?;
+    drop(tail.poll()?);
     std::fs::write(dir.path().join("000001.eclog"), b"EC02")?;
+    check(
+        indexed.poll().is_err(),
+        "indexed corrupt successor is rejected",
+    )?;
     check(
         tail.poll().is_err(),
         "truncation requires explicit recovery",

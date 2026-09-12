@@ -6,9 +6,12 @@ use super::{
 };
 use editchain_core::{GitCommitEntity, GitOid, Payload, RepositoryId};
 use editchain_git::{open_repository, RefSnapshot, RepositoryCatalog, RepositoryHandle};
+use editchain_index::Map as HashMap;
 use editchain_project::HistoryProjection;
 use editchain_protocol::{rank::Measure, LiveBlock, LiveBlockMeta};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
+mod checkpoint;
+pub(super) use checkpoint::Saved;
 
 #[derive(Debug)]
 struct Repository {
@@ -172,21 +175,24 @@ impl LiveWorkspace {
         workspace
     }
 
-    pub(super) fn apply_git(&mut self, commits: Vec<GitCommitEntity>) -> Result<Vec<LiveBlock>> {
+    pub(super) fn apply_git(
+        &mut self,
+        commits: Vec<GitCommitEntity>,
+    ) -> Result<Vec<super::StoredBlock>> {
         let mut blocks = Vec::new();
         for commit in commits {
             let mut workspace = self.git_workspace(&commit);
             let window = workspace.history_window(HistoryWindowOptions {
                 offset: 0,
                 limit: u64::MAX,
-                include_layout: true,
+                include_layout: false,
             })?;
             let Some(first) = window.rows.first() else {
                 continue;
             };
             let meta = LiveBlockMeta {
                 task_group: None,
-                task_header: None,
+                task_summary: None,
                 task_protected: true,
                 key: first.node_key.clone(),
                 sort_time: first.timestamp_ms,
@@ -216,7 +222,10 @@ impl LiveWorkspace {
                 };
             }
             let _existed = self.remove_block(&block.meta.key);
-            self.search.put(&block)?;
+            if let Some(search) = &mut self.search {
+                search.put(&block)?;
+            }
+            let block = self.rows.put(block)?;
             let order = block.meta.order();
             drop(self.orders.insert(block.meta.key.clone(), order.clone()));
             drop(self.blocks.insert(

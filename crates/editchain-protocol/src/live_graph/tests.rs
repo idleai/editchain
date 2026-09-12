@@ -5,7 +5,7 @@ use editchain_project::layout::LayoutContext;
 fn node(key: &str, time: u64, parents: &[&str]) -> LiveBlockMeta {
     LiveBlockMeta {
         task_group: None,
-        task_header: None,
+        task_summary: None,
         task_protected: false,
         key: key.into(),
         sort_time: time,
@@ -25,6 +25,90 @@ fn row(graph: &LiveGraph, key: &str, slot: u64) -> HistoryRow {
     .unwrap();
     graph.decorate(key, slot, &mut row);
     row
+}
+
+#[test]
+fn causal_order_preserves_tied_and_skewed_sibling_edges_through_incremental_arrival() {
+    let nodes = [
+        node("git:base", 100, &[]),
+        node("spawn", 99, &["git:base"]),
+        node("a:196608", 100, &["spawn"]),
+        node("a:262144", 100, &["a:196608"]),
+        node("b:196608", 98, &["spawn"]),
+        node("b:262144", 98, &["b:196608"]),
+        node("merge", 100, &["a:262144", "b:262144"]),
+    ];
+    for size in [1, nodes.len()] {
+        let mut graph = LiveGraph::default();
+        for batch in nodes.chunks(size) {
+            let before: Vec<_> = graph
+                .nodes
+                .keys()
+                .map(|key| (key.clone(), row(&graph, key, 0).lane))
+                .collect();
+            let scheduled = graph.causal_updates(batch).unwrap();
+            graph.edit(&[], &scheduled);
+            for (key, lane) in before {
+                assert_eq!(row(&graph, &key, 0).lane, lane);
+            }
+            for node in graph.nodes.values() {
+                for parent in &node.parents {
+                    assert!(node.order() < graph.nodes.get(parent).unwrap().order());
+                    assert!(graph
+                        .paths
+                        .contains_key(&(node.key.clone(), parent.clone())));
+                }
+            }
+        }
+        let update = graph
+            .causal_updates(&[node("fresh", 200, &["merge"])])
+            .unwrap();
+        assert_eq!(update.len(), 1);
+        assert!(graph
+            .causal_updates(&[node("spawn", 99, &["merge"])])
+            .is_err());
+    }
+}
+
+#[test]
+fn repairing_a_late_parent_moves_only_the_causally_affected_descendants() {
+    let mut graph = LiveGraph::default();
+    graph.edit(
+        &[],
+        &[
+            node("child", 10, &["missing"]),
+            node("tip", 11, &["child"]),
+            node("unrelated", 12, &[]),
+        ],
+    );
+    let before = row(&graph, "child", 0).lane;
+    let scheduled = graph.causal_updates(&[node("missing", 20, &[])]).unwrap();
+    assert_eq!(scheduled.len(), 3);
+    graph.edit(&[], &scheduled);
+    assert_eq!(row(&graph, "child", 0).lane, before);
+    assert_eq!(graph.nodes.get("unrelated").unwrap().sort_time, 12);
+    assert!(graph.nodes.get("tip").unwrap().order() < graph.nodes.get("child").unwrap().order());
+}
+
+#[test]
+fn a_child_arriving_first_cannot_take_the_parent_execution_lane() {
+    let mut graph = LiveGraph::default();
+    let mut spawn = node("spawn", 1, &[]);
+    spawn.node_key = "1:0:1".into();
+    graph.edit(&[], &[spawn]);
+    let main_lane = row(&graph, "spawn", 0).lane;
+    let mut child = node("child", 2, &["spawn"]);
+    child.node_key = "2:0:1".into();
+    graph.edit(&[], &[child]);
+    assert_ne!(row(&graph, "child", 0).lane, main_lane);
+    let mut next = node("next", 3, &["spawn"]);
+    next.node_key = "1:0:2".into();
+    graph.edit(&[], &[next]);
+    assert_eq!(row(&graph, "next", 0).lane, main_lane);
+    let mut merge = node("merge", 4, &["child", "next"]);
+    merge.node_key = "1:0:3".into();
+    graph.edit(&[], &[merge]);
+    assert_eq!(row(&graph, "merge", 0).lane, main_lane);
 }
 
 fn assert_activity_geometry(graph: &LiveGraph) {

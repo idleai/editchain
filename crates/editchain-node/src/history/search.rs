@@ -296,6 +296,7 @@ impl SearchIndexState {
             if !page.more || candidates.remaining_budget() == 0 || (enough && crossed_boundary) {
                 ranked.truncate(top_k);
                 return Ok(FindInHistoryResponse {
+                    live: None,
                     snapshot_id: self.snapshot_id.clone(),
                     matches: resolve_rows(view, &ranked),
                     more: enough || page.more,

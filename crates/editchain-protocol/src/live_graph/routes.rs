@@ -2,7 +2,7 @@
 
 use super::{is_git, Lane, LiveGraph, Order, Point};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Path {
     pub(super) runs: Vec<(Lane, Point, Point)>,
     pub(super) bends: Vec<(Order, Lane, Lane)>,

@@ -24,7 +24,7 @@ pub struct Cli {
 pub enum Commands {
     /// Import agent sessions (Claude Code or Codex) into the edit chain
     Import(ImportCommand),
-    /// Pregenerate the fixed-view VS Code render snapshot
+    /// Prepare or incrementally advance the resumable live history checkpoint
     PrepareView {
         /// Path to the workspace root
         #[arg(long, default_value = ".")]

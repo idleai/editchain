@@ -1,0 +1,21 @@
+[package]
+name = "editchain-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["rc"] }
+ciborium = "0.2.2"
+blake3 = "1"
+
+[dev-dependencies]
+tempfile = "3"

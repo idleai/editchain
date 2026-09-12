@@ -7,6 +7,7 @@ use ctrlc as _;
 use dirs as _;
 use editchain_core as _;
 use editchain_git as _;
+use editchain_index as _;
 use editchain_node as _;
 use editchain_project as _;
 use editchain_protocol as _;

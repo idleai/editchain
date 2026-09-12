@@ -4,9 +4,11 @@ use editchain_core::{
     provider::CodexDerivationContract, NoteRelationship, OpId, OpKind, Payload, ScopeRef,
 };
 use editchain_import::{derive_node_id, derive_turn_id};
+use editchain_index::Map as HashMap;
+use editchain_index::OrderedMap as BTreeMap;
 use editchain_project::live::{LiveProjection, LiveRow, TaskIdentity};
 use editchain_protocol::TaskStatus;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
 type Turn = (u64, u32, String, String);
 
@@ -19,16 +21,19 @@ fn turn(task: &TaskIdentity) -> Turn {
     )
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Metadata {
     records: HashMap<String, Vec<(Turn, OpId)>>,
     versions: HashMap<Turn, BTreeMap<OpId, TaskStatus>>,
-    sections: HashMap<Turn, BTreeSet<String>>,
+    sections: HashMap<Turn, editchain_index::OrderedSet<String>>,
     prompts: HashMap<Turn, BTreeMap<OpId, String>>,
     prompt_records: HashMap<String, (Turn, OpId)>,
 }
 
 impl Metadata {
+    pub(super) fn reset_sections(&mut self) {
+        self.sections.clear();
+    }
     pub(super) fn title(&self, task: &TaskIdentity) -> Option<String> {
         self.prompts
             .get(&turn(task))?

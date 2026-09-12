@@ -110,7 +110,12 @@ impl RequestBody {
     #[must_use]
     pub const fn snapshot_id(&self) -> Option<&SnapshotId> {
         match self {
-            Self::Open(_) | Self::OpenLive(_) | Self::SyncLive(_) | Self::Refresh(_) => None,
+            Self::Open(_)
+            | Self::OpenLive(_)
+            | Self::OpenLivePaged(_)
+            | Self::SyncLive(_)
+            | Self::Refresh(_) => None,
+            Self::ToggleLive(request) => Some(&request.snapshot_id),
             Self::GetWindow(request) => Some(&request.snapshot_id),
             Self::LocateRows(request) => Some(&request.snapshot_id),
             Self::FindInHistory(request) => Some(&request.snapshot_id),

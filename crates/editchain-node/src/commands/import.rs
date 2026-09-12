@@ -170,16 +170,15 @@ pub(super) fn run(
             std::env::current_dir()?.join(&chain_path)
         };
         let snapshot =
-            crate::history::prepare_render_snapshot(&workspace_path, &snapshot_chain_path);
+            crate::history::prepare_live_checkpoint(&workspace_path, &snapshot_chain_path);
         match snapshot {
             Ok(snapshot) => println!(
-                "Render snapshot {}: {} rows at {}",
-                if snapshot.reused { "reused" } else { "generated" },
-                snapshot.rows,
-                snapshot.path.display()
+                "Live checkpoint ready: {} visible rows at {}/live-v1",
+                snapshot.nodes,
+                snapshot.chain
             ),
             Err(error) => println!(
-                "Render snapshot preparation failed (import remains durable; run prepare-view to retry): {error}"
+                "Live checkpoint preparation failed (import remains durable; run prepare-view to retry): {error}"
             ),
         }
     } else {

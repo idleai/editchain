@@ -26,10 +26,7 @@ fn row(key: &str, first: u64, current: u64) -> LiveRow {
         key: key.into(),
         anchor: id(current),
         incarnation: id(first),
-        operations: vec![operation(
-            current,
-            current.checked_sub(1).filter(|n| *n > 0),
-        )],
+        operations: vec![operation(current, current.checked_sub(1).filter(|n| *n > 0)).into()],
     }
 }
 
@@ -70,7 +67,7 @@ fn tool_completion_does_not_fork_the_next_activity_away_from_intervening_command
         // A real second child remains a branch, even within the same session.
         let _changes = projection.apply(vec![operation(5, Some(2))], &[]);
         let mut branch = row("branch", 5, 5);
-        branch.operations = vec![operation(5, Some(2))];
+        branch.operations = vec![operation(5, Some(2)).into()];
         ancestry.put(&branch, &projection);
         assert_parent(&ancestry.changed(&projection), "branch", "command");
 
@@ -122,4 +119,96 @@ fn produced_commit_references_the_tool_result_without_changing_chronological_flo
         .changed(&projection)
         .iter()
         .any(|(key, parents)| key == &commit && parents.is_empty()));
+}
+
+#[test]
+fn sibling_spawns_replace_inherited_git_and_completion_keeps_both_real_parents() {
+    use editchain_project::live::topology::{RelationChanges, RelationEdge};
+    let mut projection = LiveProjection::default();
+    let _changes = projection.apply(
+        vec![
+            operation(1, None),
+            operation(2, Some(1)),
+            operation(3, Some(2)),
+            operation(4, Some(3)),
+            operation(5, Some(4)),
+            operation(10, None),
+            operation(11, Some(10)),
+            operation(12, Some(11)),
+            operation(20, None),
+            operation(21, Some(20)),
+        ],
+        &[],
+    );
+    let mut ancestry = Ancestry::default();
+    for input in [
+        row("main", 1, 1),
+        row("spawn", 2, 2),
+        row("next", 3, 3),
+        row("wait", 4, 5),
+        row("child-a", 11, 12),
+        row("child-b", 21, 21),
+    ] {
+        ancestry.put(&input, &projection);
+    }
+    for root in [10, 20] {
+        let link = GitLink {
+            source: id(root),
+            target_repo: editchain_core::RepositoryId(1),
+            target_oid: editchain_core::GitOid::from_hex(
+                "1111111111111111111111111111111111111111",
+            )
+            .unwrap(),
+            kind: GitLinkKind::BasedOn,
+        };
+        let mut proof = operation(root + 100, None);
+        proof.kind = OpKind::GitLink(link);
+        ancestry.observe_links(&[proof], &[]);
+    }
+    let _before = ancestry.changed(&projection);
+    let spawns: Vec<_> = [10, 20]
+        .map(|root| RelationEdge {
+            anchor: id(root),
+            target: id(2),
+            spawn: true,
+        })
+        .into();
+    ancestry.observe_relationships(RelationChanges {
+        added: spawns.clone(),
+        removed: Vec::new(),
+    });
+    let branches = ancestry.changed(&projection);
+    assert_parent(&branches, "child-a", "spawn");
+    assert_parent(&branches, "child-b", "spawn");
+    let complete = RelationEdge {
+        anchor: id(5),
+        target: id(12),
+        spawn: false,
+    };
+    ancestry.observe_relationships(RelationChanges {
+        added: vec![complete],
+        removed: Vec::new(),
+    });
+    let merged = ancestry.changed(&projection);
+    assert!(
+        merged
+            .iter()
+            .any(|(key, parents)| key == "wait"
+                && parents == &["child-a".to_owned(), "next".to_owned()]),
+        "{merged:?}"
+    );
+    ancestry.observe_relationships(RelationChanges {
+        added: Vec::new(),
+        removed: vec![complete],
+    });
+    assert_parent(&ancestry.changed(&projection), "wait", "next");
+    ancestry.observe_relationships(RelationChanges {
+        added: Vec::new(),
+        removed: spawns,
+    });
+    let retracted = ancestry.changed(&projection);
+    assert!(retracted
+        .iter()
+        .filter(|(key, _)| key.starts_with("child-"))
+        .all(|(_, parents)| parents.len() == 1 && parents.first().unwrap().starts_with("git:")));
 }

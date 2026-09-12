@@ -5,6 +5,7 @@ use ctrlc as _;
 use dirs as _;
 use editchain_git as _;
 use editchain_import as _;
+use editchain_index as _;
 use editchain_project as _;
 use serde as _;
 use tantivy as _;
@@ -55,6 +56,9 @@ fn request(server: &mut editchain_node::Server, body: Value) -> Result<Value> {
 }
 
 fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--append") {
+        return append_fixture();
+    }
     let count = std::env::args()
         .nth(1)
         .map_or(Ok(1_000_000_u64), |value| value.parse())?;
@@ -109,5 +113,22 @@ fn main() -> Result<()> {
         json!({"operations_before": count, "rows_before": opened.get("nodes"), "bootstrap_ms": bootstrap_ms, "delta_ms": delta_ms,
         "delta_bytes": serde_json::to_vec(&update)?.len(), "work": work})
     )?;
+    Ok(())
+}
+
+/// Append exactly one independent record to an explicitly owned scale fixture.
+fn append_fixture() -> Result<()> {
+    let chain = std::env::args().nth(2).ok_or("missing fixture chain")?;
+    let seq = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?;
+    let mut op = operation(seq);
+    op.id = OpId::new(NodeId(0xed17_ca11), 0, seq);
+    op.parents = ParentSet::None;
+    let mut page = Page::new(0);
+    page.add_record(0, encode_op(&op)?);
+    SegmentStore::open(std::path::Path::new(&chain))?.append_page(&page)?;
     Ok(())
 }

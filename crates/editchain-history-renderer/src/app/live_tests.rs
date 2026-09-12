@@ -7,20 +7,25 @@ fn grouped_meta(index: usize) -> Value {
     })
 }
 
-fn grouped_header(index: usize) -> Value {
-    json!({"key": "section", "node_key": "section", "sort_time": index, "row_count": 1, "spans": [],
-        "task_header": {"task_id":"task", "thread_id":"thread", "turn_id":"turn", "status":"completed",
-            "member_count": index.saturating_add(1), "anchor": format!("item:{index}")},
-    })
+fn grouped_summary(index: usize) -> Value {
+    let mut meta = grouped_meta(index);
+    let summary = json!({"task_id":"task", "thread_id":"thread", "turn_id":"turn", "status":"completed",
+        "member_count": index.saturating_add(1), "anchor": format!("item:{index}")});
+    drop(
+        meta.as_object_mut()
+            .unwrap()
+            .insert("task_summary".into(), summary),
+    );
+    meta
 }
 
 fn grouped_state() -> HistoryAppState {
-    let baseline = serde_json::from_value(json!({"epoch":"live", "revision":0, "total":4,
-        "blocks":[grouped_header(2), grouped_meta(2), grouped_meta(1), grouped_meta(0)]}))
+    let baseline = serde_json::from_value(json!({"epoch":"live", "revision":0, "total":3,
+        "blocks":[grouped_summary(2), grouped_meta(1), grouped_meta(0)]}))
     .unwrap();
     HistoryAppState {
         snapshot_id: SnapshotId::new("live"),
-        total: Some(4),
+        total: Some(3),
         phase: SnapshotPhase::LayoutReady,
         expansion: Some(ExpansionIndex::from_live(&baseline).unwrap()),
         ..HistoryAppState::default()
@@ -30,7 +35,7 @@ fn grouped_state() -> HistoryAppState {
 #[test]
 fn appending_keeps_a_previously_exposed_endpoint_and_the_readers_pixel_anchor() {
     let mut state = grouped_state();
-    for (absolute, key) in [(1, 2), (3, 0)] {
+    for (absolute, key) in [(0, 2), (2, 0)] {
         drop(
             state
                 .cache
@@ -43,15 +48,15 @@ fn appending_keeps_a_previously_exposed_endpoint_and_the_readers_pixel_anchor() 
         json!("delta"),
         json!({"Ok": {"epoch":"live", "revision":1,
         "work": editchain_protocol::LiveWork::default(), "deltas":[{
-            "base_revision":0, "revision":1, "snapshot_id":"live:1", "removed":[], "total":5,
+            "base_revision":0, "revision":1, "snapshot_id":"live:1", "removed":[], "total":4,
             "chain_generation":1, "max_lane":1, "work":editchain_protocol::LiveWork::default(),
-            "upserts":[{"meta":grouped_header(3), "rows":[row(99)]}, {"meta":grouped_meta(3), "rows":[row(3)]}],
+            "upserts":[{"meta":grouped_meta(2), "rows":[row(2)]}, {"meta":grouped_summary(3), "rows":[row(3)]}],
         }]}}),
         &viewport,
     );
     assert_eq!(
-        state.visible_index_for_abs(2),
-        Some(2),
+        state.visible_index_for_abs(1),
+        Some(1),
         "the old endpoint stays exposed after gaining a child"
     );
     assert!(
@@ -67,7 +72,7 @@ fn appending_keeps_a_previously_exposed_endpoint_and_the_readers_pixel_anchor() 
 #[test]
 fn search_reveals_an_uncached_folded_member_before_scheduling_its_page() {
     let mut state = grouped_state();
-    assert_eq!(state.visible_index_for_abs(2), None);
+    assert_eq!(state.visible_index_for_abs(1), None);
     let mut step = Step::new();
     state.submit_find("needle", &mut step);
     let request = state.requests.log().last().unwrap().id;
@@ -75,11 +80,11 @@ fn search_reveals_an_uncached_folded_member_before_scheduling_its_page() {
         &mut state,
         json!(request),
         json!({"Ok":{
-            "snapshot_id":"live", "matches":[{"row":2, "node_key":"node:1", "summary":"needle"}], "returned":1, "more":false,
+            "snapshot_id":"live", "matches":[{"row":1, "node_key":"node:1", "summary":"needle"}], "returned":1, "more":false,
         }}),
         &Viewport::new(0, 100),
     );
-    assert!(state.visible_index_for_abs(2).is_some());
+    assert!(state.visible_index_for_abs(1).is_some());
     assert!(!state.is_row_expanded(0));
     let page = state
         .requests
@@ -91,7 +96,7 @@ fn search_reveals_an_uncached_folded_member_before_scheduling_its_page() {
         .unwrap();
     let start = page.get("offset").unwrap().as_u64().unwrap();
     let limit = page.get("limit").unwrap().as_u64().unwrap();
-    assert!(start <= 2 && start.saturating_add(limit) > 2);
+    assert!(start <= 1 && start.saturating_add(limit) > 1);
 }
 
 fn row(key: usize) -> Value {
@@ -421,4 +426,131 @@ fn operation_deltas_retain_cached_rows_pixel_anchor_selection_and_replay_cursor(
     }]}});
     let rejected = message(&mut state, json!("delta"), gap, &viewport);
     assert!(rejected.sends.iter().any(|send| matches!(send, Send::LiveSettled { snapshot_id, error: Some(_), .. } if snapshot_id == "live:3")));
+}
+
+#[test]
+fn native_pages_restore_a_distant_anchor_before_acknowledging() {
+    let viewport = Viewport::new(34_007, 102);
+    let mut state = HistoryAppState {
+        snapshot_id: SnapshotId::new("native"),
+        total: Some(10_000),
+        phase: SnapshotPhase::LayoutReady,
+        ..HistoryAppState::default()
+    };
+    state
+        .open_remote(
+            &serde_json::from_value(json!({
+                "paged": true, "epoch": "native", "revision": 0, "total": 10_000, "blocks": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    for index in 1000..1010 {
+        drop(state.cache.insert_legacy(
+            ExpandedRow::new(index).unwrap(),
+            &row(usize::try_from(index).unwrap()),
+        ));
+    }
+    state.select_row(1000);
+    state.selection.set_roving(ExpandedRow::new(1000));
+    let step = message(
+        &mut state,
+        json!("delta"),
+        json!({"Ok": {
+            "epoch": "native", "revision": 1, "work": editchain_protocol::LiveWork::default(),
+            "deltas": [{"base_revision":0, "revision":1, "snapshot_id":"native:1",
+                "total":10_001, "visible_total":10_001, "chain_generation":1, "max_lane":2,
+                "removed":[], "upserts":[], "work":editchain_protocol::LiveWork::default()}]
+        }}),
+        &viewport,
+    );
+    assert!(!step
+        .sends
+        .iter()
+        .any(|send| matches!(send, Send::LiveSettled { .. })));
+    assert!(!step.ops.iter().any(|op| matches!(op, DomOp::RefreshHeader)));
+    let locate = state.requests.log().last().unwrap().clone();
+    assert!(locate.body.get("LocateRows").is_some());
+    let _step = message(
+        &mut state,
+        json!(locate.id),
+        json!({"Ok": {
+            "snapshot_id":"native:1", "rows":[{"key":"item:1000", "node_key":"revised:1000", "row":1001}]
+        }}),
+        &viewport,
+    );
+    let page = state.requests.log().last().unwrap().clone();
+    let bounds = page.body.get("GetWindow").unwrap();
+    let offset = usize::try_from(bounds.get("offset").unwrap().as_u64().unwrap()).unwrap();
+    let limit = usize::try_from(bounds.get("limit").unwrap().as_u64().unwrap()).unwrap();
+    assert!(offset > 0 && offset <= 1001 && offset.saturating_add(limit) > 1004);
+    assert!(limit <= 500);
+    let rows: Vec<_> = (offset..offset.saturating_add(limit))
+        .map(|index| {
+            let mut row = row(index.saturating_sub(1));
+            if index == 1001 {
+                *row.get_mut("node_key").unwrap() = json!("revised:1000");
+            }
+            row
+        })
+        .collect();
+    let step = message(
+        &mut state,
+        json!(page.id),
+        json!({"Ok": {
+            "snapshot_id":"native:1", "rows":rows, "total":10_001, "chain_generation":1,
+            "max_lane":2, "layout_ready":true, "expansion_spans":null
+        }}),
+        &viewport,
+    );
+    assert_eq!(state.selected_key(), Some("revised:1000"));
+    assert_eq!(state.roving_abs(), 1001);
+    assert!(step.ops.iter().any(|op| matches!(
+        op,
+        DomOp::ReanchorLive {
+            scroll_top: 34_041,
+            ..
+        }
+    )));
+    assert!(step
+        .sends
+        .iter()
+        .any(|send| matches!(send, Send::LiveSettled { error: None, .. })));
+    let duplicate = message(
+        &mut state,
+        json!("delta"),
+        json!({"Ok": {
+            "epoch":"native", "revision":1, "deltas":[], "work":editchain_protocol::LiveWork::default()
+        }}),
+        &viewport,
+    );
+    assert!(!duplicate
+        .ops
+        .iter()
+        .any(|op| matches!(op, DomOp::ReanchorLive { .. })));
+}
+
+#[test]
+fn task_control_opens_the_physical_path_without_toggling_item_details() {
+    let mut state = grouped_state();
+    let mut content = row(2);
+    drop(content.as_object_mut().unwrap().insert(
+        "task_group".into(),
+        grouped_summary(2).get("task_summary").unwrap().clone(),
+    ));
+    drop(
+        state
+            .cache
+            .insert_legacy(ExpandedRow::new(0).unwrap(), &content),
+    );
+    assert!(state.is_task_summary(0));
+    let mut step = Step::new();
+    state.toggle_expanded_ui(0, &Viewport::new(0, 100), &mut step);
+    assert!(state.row_context(0, false).task.expanded);
+    assert!(!state.is_row_expanded(0));
+    assert_eq!(state.visible_total(), 3);
+    assert!(step
+        .ops
+        .iter()
+        .any(|op| matches!(op, DomOp::ReanchorLive { .. })));
 }

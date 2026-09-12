@@ -13,6 +13,13 @@ pub(crate) struct LiveReconciliation {
 }
 
 impl LiveReconciliation {
+    pub(crate) fn checkpoint(&self) -> (&HashMap<OpId, Op>, bool) {
+        (&self.pending, self.dirty)
+    }
+
+    pub(crate) fn restore(&mut self, saved: (HashMap<OpId, Op>, bool)) {
+        (self.pending, self.dirty) = saved;
+    }
     pub(crate) fn new(catalog: &RepositoryCatalog) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             repositories: Repositories {

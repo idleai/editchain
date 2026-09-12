@@ -14,7 +14,7 @@ mod message_echoes;
 pub(super) use message_echoes::source_messages;
 
 /// Current state of a Codex logical item, rebuilt from immutable occurrences.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodexLogicalItem {
     /// Full owning provider execution identity.
     pub thread: CodexThreadId,
@@ -185,7 +185,7 @@ impl Materialization {
     }
 }
 
-trait OpLookup {
+pub(super) trait OpLookup {
     fn get(&self, id: &OpId) -> Option<&Op>;
 }
 
@@ -195,16 +195,16 @@ impl OpLookup for HashMap<OpId, &Op> {
     }
 }
 
-impl OpLookup for HashMap<OpId, Op> {
+impl OpLookup for editchain_index::Map<OpId, std::sync::Arc<Op>> {
     fn get(&self, id: &OpId) -> Option<&Op> {
-        Self::get(self, id)
+        Self::get(self, id).map(AsRef::as_ref)
     }
 }
 
 pub(super) fn selected_codex<'a>(
     source: OpId,
     facts: impl Iterator<Item = &'a Op>,
-    by_id: &HashMap<OpId, Op>,
+    by_id: &impl OpLookup,
 ) -> Option<CodexDerivationEvidence> {
     let records: Vec<_> = facts
         .filter_map(decode_evidence)

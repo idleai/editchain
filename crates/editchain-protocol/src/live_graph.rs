@@ -5,11 +5,13 @@
 mod edit;
 mod events;
 mod lanes;
+mod order;
 mod routes;
 #[cfg(test)]
 mod tests;
 
 use crate::{HistoryRow, LiveBlockMeta};
+use editchain_index::{Map, OrderedMap, OrderedSet};
 use lanes::{Lane, Lanes};
 use routes::Path;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -18,7 +20,7 @@ type Order = crate::LiveOrder;
 type Edge = (String, String);
 type Point = (Order, u8);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 enum Change {
     Add,
     Remove,
@@ -33,13 +35,13 @@ impl Change {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct Owners {
     active: u64,
     muted: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Spine {
     lane: Lane,
     start: Order,
@@ -64,30 +66,20 @@ impl Owners {
 }
 
 /// Causal lanes and edge events retained across operation deltas.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LiveGraph {
-    nodes: HashMap<String, LiveBlockMeta>,
-    order: BTreeSet<Order>,
-    incoming: HashMap<String, BTreeSet<String>>,
+    nodes: Map<String, LiveBlockMeta>,
+    order: OrderedSet<Order>,
+    incoming: Map<String, BTreeSet<String>>,
     lanes: Lanes,
-    paths: HashMap<Edge, Path>,
-    bends: BTreeMap<Order, BTreeMap<(Lane, Lane), Owners>>,
-    spines: HashMap<String, Spine>,
-    headers: HashMap<String, LiveBlockMeta>,
+    paths: Map<Edge, Path>,
+    bends: OrderedMap<Order, BTreeMap<(Lane, Lane), Owners>>,
+    spines: Map<String, Spine>,
+    #[serde(skip)]
     changed: BTreeSet<String>,
 }
 
 impl LiveGraph {
-    /// Presentation headers participate in paging but never in causal topology.
-    pub fn set_headers(&mut self, removed: &[String], upserts: &[LiveBlockMeta]) {
-        for key in removed {
-            drop(self.headers.remove(key));
-        }
-        for meta in upserts.iter().filter(|meta| meta.task_header.is_some()) {
-            drop(self.headers.insert(meta.key.clone(), meta.clone()));
-        }
-    }
-
     /// Endpoints whose disclosure safety may have changed in the last edit.
     pub fn changed_boundaries(&self) -> impl Iterator<Item = &String> {
         self.changed.iter()
@@ -97,21 +89,33 @@ impl LiveGraph {
     /// every routing bend (including passing lanes), and protected outcomes.
     #[must_use]
     pub fn foldable(&self, key: &str) -> bool {
-        let Some(node) = self.nodes.get(key) else {
-            return false;
-        };
+        self.task_member(key).is_some()
+            && self
+                .incoming
+                .get(key)
+                .is_some_and(|children| children.len() == 1)
+    }
+
+    /// A task path may end at an active tip, but never cross a junction, Git
+    /// attachment, protected outcome or routing bend. Callers still verify
+    /// each exact parent edge and native task identity before joining members.
+    #[must_use]
+    pub fn task_member(&self, key: &str) -> Option<&LiveBlockMeta> {
+        let node = self.nodes.get(key)?;
         let children = self.incoming.get(key);
-        !is_git(node)
+        (!is_git(node)
             && !node.task_protected
             && node.parents.len() == 1
-            && children.is_some_and(|children| children.len() == 1)
+            && children.is_none_or(|children| children.len() <= 1)
             && !self.bends.contains_key(&node.order())
             && node
                 .parents
                 .iter()
                 .chain(children.into_iter().flatten())
-                .all(|key| self.nodes.get(key).is_some_and(|node| !is_git(node)))
+                .all(|key| self.nodes.get(key).is_some_and(|node| !is_git(node))))
+        .then_some(node)
     }
+
     /// Highest occupied lane, including shared session-to-Git routing spines.
     #[must_use]
     pub fn max_lane(&self) -> usize {
@@ -120,17 +124,13 @@ impl LiveGraph {
 
     /// Decorate a root or detail row with the same graph contract as Activity.
     pub fn decorate(&self, key: &str, slot: u64, row: &mut HistoryRow) {
-        let Some(meta) = self.nodes.get(key).or_else(|| self.headers.get(key)) else {
+        let Some(meta) = self.nodes.get(key) else {
             return;
         };
         let order = meta.order();
-        let anchor = meta
-            .task_header
-            .as_ref()
-            .map_or(key, |task| task.anchor.as_str());
         row.lane = self
             .lanes
-            .node(anchor)
+            .node(key)
             .map_or(0, |lane| self.lanes.display(lane));
         row.above.clear();
         row.below.clear();
@@ -140,18 +140,8 @@ impl LiveGraph {
         row.muted_transitions.clear();
         for (lane, coverage) in self.lanes.iter() {
             let lane = self.lanes.display(lane);
-            let header = meta.task_header.is_some();
-            let above = coverage.at(&(
-                order.clone(),
-                if header {
-                    1
-                } else if slot == 0 {
-                    0
-                } else {
-                    2
-                },
-            ));
-            let below = coverage.at(&(order.clone(), if header { 1 } else { 2 }));
+            let above = coverage.at(&(order.clone(), if slot == 0 { 0 } else { 2 }));
+            let below = coverage.at(&(order.clone(), 2));
             if above.present() {
                 row.above.push(lane);
             }
@@ -165,7 +155,7 @@ impl LiveGraph {
                 row.muted_below.push(lane);
             }
         }
-        if slot == 0 && meta.task_header.is_none() {
+        if slot == 0 {
             row.parents = meta
                 .parents
                 .iter()

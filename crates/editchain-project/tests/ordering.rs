@@ -11,6 +11,7 @@
 //! below its child while cross-lane transition geometry still renders.
 
 // Crate-level dependency markers (used by Cargo for feature resolution).
+use editchain_index as _;
 use serde as _;
 use serde_json as _;
 

@@ -19,6 +19,7 @@ struct Block {
     index: ExpansionIndex,
     exposed: bool,
     hidden: bool,
+    summarized: bool,
 }
 
 impl Block {
@@ -32,6 +33,7 @@ impl Block {
             meta: meta.clone(),
             exposed: false,
             hidden: false,
+            summarized: false,
             index: ExpansionIndex::from_metadata(total, None, Some(&meta.spans))?,
         })
     }
@@ -41,6 +43,8 @@ impl Block {
             expanded: self.meta.row_count,
             visible: if self.hidden {
                 0
+            } else if self.summarized {
+                1
             } else {
                 u64::try_from(self.index.visible_total()).unwrap_or(0)
             },
@@ -134,6 +138,9 @@ impl LiveIndex {
                 .get()
                 .saturating_sub(i64::try_from(start.expanded).ok()?),
         )?;
+        if block.summarized && local.get() > 0 {
+            return None;
+        }
         VisibleRow::new(
             i64::try_from(start.visible)
                 .ok()?
@@ -164,7 +171,7 @@ impl LiveIndex {
                 .saturating_sub(i64::try_from(start.expanded).ok()?),
         )?;
         let last = ExpandedRow::new(block.index.total().saturating_sub(1))?;
-        let next = (!block.hidden)
+        let next = (!(block.hidden || block.summarized && local.get() > 0))
             .then(|| block.index.visible_between(local, last).next())
             .flatten()
             .and_then(|row| block.index.visible_for(row))
@@ -180,9 +187,6 @@ impl LiveIndex {
         self.position(row.get())
             .and_then(|(key, relative)| {
                 let block = self.tree.get(self.orders.get(&key)?)?;
-                if block.meta.task_header.is_some() {
-                    return Some(self.groups.get(&key).is_some_and(|group| !group.collapsed));
-                }
                 Some(
                     block
                         .index
@@ -192,18 +196,43 @@ impl LiveIndex {
             .unwrap_or(false)
     }
 
+    fn group_for(&self, row: ExpandedRow) -> Option<&str> {
+        let (key, slot) = self.position(row.get())?;
+        let block = self.tree.get(self.orders.get(&key)?)?;
+        (slot == 0 && block.meta.task_summary.is_some())
+            .then_some(block.meta.task_group.as_deref())
+            .flatten()
+    }
+
+    pub(in crate::app) fn task_expanded(&self, row: ExpandedRow) -> bool {
+        self.group_for(row)
+            .and_then(|key| self.groups.get(key))
+            .is_some_and(|group| !group.collapsed)
+    }
+
+    pub(in crate::app) fn task_folded(&self, row: ExpandedRow) -> bool {
+        let Some((key, _)) = self.position(row.get()) else {
+            return false;
+        };
+        !self.task_expanded(row)
+            && self
+                .orders
+                .get(&key)
+                .and_then(|order| self.tree.get(order))
+                .is_some_and(|block| !block.exposed && block.meta.task_summary.is_some())
+    }
+
+    pub(in crate::app) fn toggle_task(&mut self, row: ExpandedRow) -> bool {
+        let Some(group) = self.group_for(row).map(str::to_owned) else {
+            return false;
+        };
+        self.toggle_group(&group)
+    }
+
     pub(in crate::app) fn toggle(&mut self, row: ExpandedRow) -> bool {
         let Some((key, relative)) = self.position(row.get()) else {
             return false;
         };
-        if self
-            .orders
-            .get(&key)
-            .and_then(|order| self.tree.get(order))
-            .is_some_and(|block| block.meta.task_header.is_some())
-        {
-            return self.toggle_group(&key);
-        }
         let Some(order) = self.orders.get(&key).cloned() else {
             return false;
         };
@@ -254,7 +283,8 @@ impl LiveIndex {
         }
         for key in &touched {
             if let Some(order) = self.orders.remove(key) {
-                if let Some(old) = self.tree.remove(&order) {
+                let old = self.tree.remove(&order);
+                if let Some(old) = old {
                     self.forget_member(&old.meta);
                 }
             }

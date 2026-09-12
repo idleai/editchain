@@ -2,9 +2,10 @@
 
 ## Implemented path
 
-Live Codex history now uses a resident native workspace. After bootstrap, an
-ordinary append does not invoke the import CLI, replay the source prefix, open
-a replacement snapshot, or sort and lay out the whole history.
+Live Codex history uses a persistent, lazily paged native workspace. A prepared
+checkpoint opens without replaying canonical history. After provider bootstrap,
+an ordinary append does not invoke the import CLI, replay the source prefix,
+open a replacement snapshot, or sort and lay out the whole history.
 
 ```text
 Codex rollout append
@@ -13,7 +14,8 @@ Codex rollout append
   -> canonical additions / conflict retractions
   -> changed logical items and exact ancestor dependencies
   -> revisioned keyed blocks
-  -> retained rank index, row cache and DOM animation
+  -> additive durable checkpoint, native visible rank/select
+  -> bounded viewport and keyed DOM animation
 ```
 
 | Stage | Retained state and update behavior |
@@ -21,14 +23,16 @@ Codex rollout append
 | Source | `editchain-import/src/source_read/live.rs` retains BLAKE3 state, file identity and a physical cursor. A pass accepts at most 512 records or 4 MiB; an incomplete final line remains pending. A backlog is drained even without a later file-stamp change. |
 | Codex | `codex-session-exporter --stream` keeps the provider's `ThreadHistoryBuilder` and EditChain's occurrence projector alive. Each request identifies a source, generation and preceding ordinal. The helper only reduces the supplied new lines. |
 | Durability | `realtime/collector.rs` takes the writer lock, checks external appends, stages through `ImportBatch`, and advances checkpoints after durable append. Failures discard speculative reducer state. |
-| Canonical evidence | `CanonicalTail` retains framing position and the byte-admission index. Exact duplicates make no semantic edit; conflicting identities retract the previously accepted operation. Segment rotation and incomplete framing are tested against full canonical replay. |
-| Logical state | `editchain-project::live::LiveProjection` indexes occurrence proofs, logical item revisions, source coverage and turn removals. Changed witnesses invalidate their actual dependents. |
+| Canonical evidence | `IndexedTail` retains framing position and record locations; exact evidence stays in the durable segments. Exact duplicates make no semantic edit; conflicting identities retract the previously accepted operation. Segment rotation and incomplete framing are tested against full canonical replay. |
+| Logical state | `editchain-project::live::LiveProjection` indexes occurrence proofs, logical item revisions, source coverage and turn removals. Changed witnesses invalidate their actual dependents. Immutable operation allocations are shared with the live reader and item inputs; single-user reverse dependencies stay inline. |
+| Provider relationships | Indexed raw-prefix counts and lifecycle evidence feed the same endpoint resolver as Activity. Affected threads publish exact spawn/completion edge changes independently of content. A resolved spawn replaces the child's inherited Git base; completion adds the child terminal alongside the parent's continuation. |
 | Git | The native tracker retains commit objects, refs and unresolved targets. Traversal stops at known commits. Successful Codex commit observations feed retained reconciliation; exact `BasedOn` and `ProducedBy` links feed ancestry. |
 | Graph | Hidden operation ancestry is memoized with reverse dependencies. Bootstrap uses Activity's original compact lane planner: Git leftmost, causal session lanes, forks, merges and shared Git-anchor spines. Retained edge-boundary indexes update affected routes and preserve existing node lanes; native paging and WASM use the same implementation. |
-| Ordering | Both processes use the shared weighted AVL `RankTree`. Insertion, removal and rank/select avoid shifting every later row coordinate. Disclosure changes only the owning block. |
-| Publication | `OpenLive` establishes the baseline once. `SyncLive` returns `LiveUpdate` with a bounded replay journal. Ordinary updates never prepare a render snapshot. |
-| Transport | The extension assembles each length-prefixed frame in one buffer, copying each incoming byte once. Large baselines no longer repeatedly copy their entire received prefix. Framing is isolated per native process generation. |
-| Renderer | Block edits relocate the bounded cache by stable identity. Keyed DOM reconciliation retains rows, unchanged content cells, and existing SVG segments with their animation clocks. Animation reads positions in one phase and writes styles in another, only near the viewport. Graph width includes the rendered window's nodes and crossing edges. All lanes keep a 14.76px pitch and 4px node radius; dense graphs scroll horizontally with readable content instead of compressing their tracks. |
+| Presentation | Row payloads live in checksummed durable pages referenced by the checkpoint. Only requested windows and outgoing delta blocks receive graph geometry. Blob access is shared per workspace and refreshed after capture. |
+| Ordering | Monotone causal clocks keep every present parent below its child, including tied or skewed provider timestamps. Only a new constraint and affected descendants move; physical row timestamps stay unchanged. Native weighted AVL pages own expanded and visible rank/select. Local disclosure changes its block; task folding visits its section. The paged renderer keeps an identity mapping over visible coordinates. |
+| Publication | `OpenLivePaged` returns an epoch, revision and visible total without global metadata. `SyncLive` returns a bounded journal; affected pages are checkpointed before publication. Legacy `OpenLive` remains supported. |
+| Transport | Paged Open sends a small control frame; viewport reads and affected delta blocks carry content. Legacy baseline serialization borrows metadata. Framing is isolated per native process generation. |
+| Renderer | Native deltas locate stable anchors and fetch their replacement viewport while the old keyed DOM remains visible. Keyed DOM reconciliation retains rows, unchanged content cells, and existing SVG segments with their animation clocks. Animation reads positions in one phase and writes styles in another, only near the viewport. Graph width includes the rendered window's nodes and crossing edges. All lanes keep a 14.76px pitch and 4px node radius; dense graphs scroll horizontally with readable content instead of compressing their tracks. |
 
 Live presentation shows each current logical item and its details directly.
 The normal offline Activity view retains historical work-group contractions.
@@ -37,10 +41,14 @@ reconstruction of the offline Activity row list. All immutable occurrences
 remain in the chain. Logical-item state is checked against the full projection
 oracle after individual admissions, retractions and restorations.
 
-The missing conversational work grouping is a regression in the default live
-experience. The [progressive grouping proposal](realtime-grouping-research.md)
-compares alternatives for keeping arrivals exposed while folding older work,
-with group membership updated independently of item content and disclosure.
+Native thread/turn identities and rollback boundaries own task membership.
+Only exact non-branching causal paths fold. Their summaries annotate existing
+physical items; grouping adds no rows or synthetic graph nodes. Concurrent
+sessions can interleave without creating repeated task headers. New/revised
+members stay readable, including a fresh anchor inside a collapsed path.
+Item details and task paths have separate controls. See the
+[grouping contract](realtime-grouping-research.md) for path boundaries and
+checkpoint migration.
 
 Chronological graph connections stop at an item's first appearance. A later
 tool result revises that same item but does not become another appearance:
@@ -59,16 +67,21 @@ that opened without Git reserves the new leftmost Git column.
 
 ## Protocol and recovery
 
-`OpenResponse.live` negotiates an epoch, revision, expanded total and block
-metadata. Content remains paged. Each `LiveDelta` contains `base_revision`,
+`OpenResponse.live.paged` negotiates native paging: an epoch, revision, visible
+total and empty block list. In legacy mode its total remains expanded and its
+block metadata is complete. Content remains paged. Each `LiveDelta` contains `base_revision`,
 `revision`, a new request `snapshot_id`, removed keys, upserted blocks, totals,
 lane extent and work counters. Block metadata includes stable ordering,
 disclosure spans and exact parent block keys. Parent row coordinates inside an
-upsert are block-relative.
+upsert are block-relative. Native pages use visible coordinates, with
+`native_expanded` carrying disclosure; only offset-zero pages carry expansion
+metadata. `LiveDelta.visible_total` supplies the new visible rank space.
 
 `SyncLive` is an extension-host capability. The webview's read-only request
 allowlist does not permit provider capture or helper execution. The host waits
-for `liveSettled` before advancing its applied cursor. Duplicate revisions are
+for the first saved viewport before starting capture, and for `liveSettled`
+before advancing each applied cursor. Task toggles and search-induced disclosure
+share the publication queue; page/anchor reads remain available to finish it. Duplicate revisions are
 acknowledged without reanimation; old window responses cannot overwrite newer
 state. The journal retains up to 32 revisions or 16 MiB, retaining at least one
 revision. Missing replay, renderer recreation, rejected topology or invalidated
@@ -90,18 +103,23 @@ Setting `editchain-history.live.enabled` to `false` opts into static history.
   recapture. Arbitrary rewrite-and-append cannot be ruled out without rereading
   the old prefix. Sealed segments are immutable for a live epoch; reopen after
   deliberate historical replacement.
-- Initial canonical load and a source's cold bootstrap remain whole-input work.
-  The native request loop serializes capture with reads; a slow cold helper can
+- Canonical history is loaded only during first preparation; prepared opens
+  adopt its saved frontier and lazy indexes. A source's cold helper bootstrap
+  still replays that source prefix. Native capture shares the read request loop; a slow cold helper can
   delay new paging requests, while already-rendered rows stay visible.
 - The repository catalog is captured at open. Reopen after adding/removing a
   repository. Git tracking follows HEAD ancestry and exact recorded link targets.
-- Live search retains its index across edits and currently indexes displayed
-  block summaries. Full historical search remains available in normal history.
+- Live search is persisted during preparation and changes with affected blocks.
+  It indexes displayed summaries. Full historical search remains available in
+  normal history.
   Out-of-band Codex title-index changes are not yet materialized by the retained
   importer; this adapter follows rollout content.
 - Claude live collection, app-server ownership, and activity-only hook signals
   remain the next provider integration. Unrecorded filesystem writes are not
   treated as agent edit evidence.
+
+Checkpoint storage, prepared-open and +1 measurements, recovery and remaining
+provider/transaction memory limits are described in [native-memory.md](native-memory.md).
 
 ## Verification and reproduction
 
@@ -124,6 +142,12 @@ The VS Code fixture also requires a straight session track beside Git lane zero.
 the real helper and live service, one record per update. It requires stable
 item identities, mounted rows and lanes, no duplicate rows on completion,
 and no false forks or repeated session endpoint chips within that path.
+`wdio.subagents.conf.ts` imports three real-shaped child rollouts incrementally,
+including equal-time startup records and a child arriving before the parent
+continues. It checks exact spawn roots, all three completion edges plus the
+main continuation, row-boundary continuity, causal row ordering and fixed lanes.
+Native tests compare relationship deltas against the earlier Activity resolver
+across arrival batches, missing records, conflicting spawns and proof repair.
 The September 11 branching repair was also checked by reopening the existing
 chain in an independent read-only service: the same 244 activity identities
 had 50 in-sample fork points before the repair and zero afterward. The newest
@@ -163,8 +187,9 @@ and a 43 ms +1 request:
 50 chain bytes read, one record decoded, one presentation input, one changed
 block, and a 1,553-byte response. This is native request latency, not an
 end-to-end paint measurement. Work counters are also asserted with 1 and
-10,000 existing operations. Bootstrap cost and retained memory still scale with
-the corpus; ordinary delta work follows changed evidence and its dependencies.
+10,000 existing operations. That historical run used the full in-memory baseline. Preparation still scales
+with the corpus; current prepared-open and +1 measurements are in
+[native-memory.md](native-memory.md).
 
 The real VS Code fixture opens the normal History command without a live opt-in
 and checks edits before turn completion, a stationary 600-line backlog, Git

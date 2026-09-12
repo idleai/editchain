@@ -125,6 +125,9 @@ fn schedule_post_flush() {
 /// bridge may re-enter the listener synchronously).
 pub(super) fn execute_send(send: &Send) {
     match send {
+        Send::ToggleDisclosure { key, task } => {
+            post_envelope(&json!({ "type": "toggleDisclosure", "key": key, "task": task }));
+        }
         Send::LiveSettled { snapshot_id, error } => post_envelope(&json!({
             "type": "liveSettled", "snapshot_id": snapshot_id, "error": error,
         })),

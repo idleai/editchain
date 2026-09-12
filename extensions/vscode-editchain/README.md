@@ -64,7 +64,7 @@ Set `editchain-history.live.enabled` to `false` to open static history by defaul
 - Import and publication are serialized. Complete source records and durable
   checkpoints remain the history authority; edits arriving during a pass trigger
   a later pass. Restarting reuses native checkpoints instead of duplicating nodes.
-- Revisioned block changes update retained native and WASM indexes, caches,
+- Revisioned block changes update persistent native indexes and bounded WASM caches,
   and DOM rows. Surviving selection, disclosure, focus and pixel scroll anchors
   remain attached to item identities. Staying at the top follows incoming
   history. New branch and merge connections grow from their attachment points,
@@ -72,18 +72,18 @@ Set `editchain-history.live.enabled` to `false` to open static history by defaul
   their animation clocks through later deltas. Lane spacing stays at 14.76px;
   dense graphs scroll horizontally. Reduced motion shows the final geometry
   immediately. Manual Refresh establishes a new baseline.
-- Live Codex items are grouped by native task within their thread, with stable
-  prompt titles, status and activity counts. Completed historical tasks start
-  folded; live arrivals stay exposed, including new items inside a collapsed
-  task. Completion does not automatically fold work already on screen. Use a
-  task's chevron to expand/collapse it; search reveals an exact hidden item.
+- Live Codex items fold along connected causal paths within their native task.
+  Grouping adds no graph rows: task controls annotate existing activities;
+  a collapsed summary replaces that physical path in the same anchor row.
+  Singletons remain ordinary activities. Completed historical paths start
+  folded; live arrivals keep their own content visible even inside a collapsed
+  task. Completion does not automatically fold open work. The activity-count
+  button toggles the task path; each item's file/output chevron remains separate.
   Forks, merges, Git attachments and unresolved/error activity remain visible.
-  Interleaving may create multiple sections of the same task, preserving history
-  order. Each item retains its own file/details disclosure. Ordinary updates
-  change independent items and small headers; they do not resend a whole task.
-  Normal offline history retains historical work-group aggregation. The first
-  load and explicit recovery still require bootstrap work. See the
-  [grouping design](../../docs/realtime-grouping-research.md) for the contract.
+  Concurrent tasks retain chronological order without repeated header rows.
+  Ordinary updates edit individual items and affected anchors, without resending
+  a whole task. Search reveals the exact hidden item. See the
+  [grouping contract](../../docs/realtime-grouping-research.md).
 
 **Output → EditChain History** logs startup, per-delta source bytes, decoded
 records, changed blocks and native timings. Automatic startup keeps the history
@@ -104,6 +104,27 @@ than the polling interval. The status bar shows startup, queued imports, and
 update progress; its tooltip also shows collection failures and retries.
 Rollout `.jsonl.zst` archives are outside the importer's supported live input.
 
+### Prepare a large history
+
+Run from the repository root before opening a large workspace:
+
+```sh
+./target/release/editchain prepare-view --workspace /absolute/workspace \
+  --chain /absolute/workspace/.editchain
+```
+
+This creates `CHAIN/live-v1`, including admission state, graph, task disclosure,
+row pages and search. Later runs advance its saved frontier additively.
+After upgrading task grouping or graph checkpoint semantics, run this command once
+to migrate the existing checkpoint; it reuses saved rows and canonical indexes. Schema
+3 restores exact subagent spawn/completion connections and causal ordering for tied
+timestamps. The
+extension opens the saved viewport first and starts collection after it renders.
+Prepared native opening plus 500 rows took 0.24–0.40 seconds on the local
+2.42-million-operation samples; these timings exclude VS Code startup.
+Initial preparation remains expensive and uses disk space. A cold Codex helper
+still rebuilds its source reducer. See [measurements and recovery](../../docs/native-memory.md).
+
 ## Runtime architecture
 
 ```text
@@ -111,7 +132,7 @@ VS Code extension.ts
   ├─ starts editchain-vscode-service over framed stdio
   ├─ opens one "EditChain History" webview
   ├─ forwards GetWindow, LocateRows, and FindInHistory from the webview
-  ├─ bootstraps OpenLive and serializes SyncLive capture and delta publication
+  ├─ opens OpenLivePaged and serializes capture, disclosure and delta publication
   └─ handles openJson/openDiff through service-validated identities
 
 media/rust-history/loader.js
@@ -131,10 +152,13 @@ handwritten renderer script loaded by the panel.
 
 ## Service protocol
 
-The native service supports ten request bodies:
+The native service supports these request bodies:
 
 - `Open`
 - `OpenLive`
+- `OpenLivePaged`
+- `ToggleLive { snapshot_id, key, task }` (`task: true` for the task path,
+  `false` for the physical item's own details)
 - `SyncLive { epoch, after_revision, codex }`
 - `Refresh`
 - `GetWindow { snapshot_id, offset, limit, include_layout }`
@@ -149,11 +173,12 @@ requires an exact one-key request envelope. Details and file diffs are explicit
 host actions, so arbitrary service requests cannot be tunneled through the
 webview.
 
-`GetWindow` uses a two-pass first paint: rows are requested without graph
+Paged live `GetWindow` returns visible coordinates and native geometry together.
+Static history uses a two-pass first paint: rows are requested without graph
 layout, then the same page is hydrated with lane geometry. Normal history uses
 the fixed Activity projection; live mode uses current item blocks and retained
 graph intervals. Both hide nested-repository rows.
-`FindInHistory` runs the in-memory Tantivy BM25 index and resolves candidates
+`FindInHistory` uses Tantivy BM25 (persisted for live checkpoints) and resolves candidates
 back to visible top-level row coordinates.
 
 The `.editchain` segment log and blob store are authoritative. The render

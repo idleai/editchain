@@ -13,7 +13,7 @@ use editchain_import::{
 use editchain_protocol::{CodexLiveRequest, LiveWork};
 use editchain_store::{
     format::{encode_op, Page},
-    CanonicalChain, SegmentStore,
+    IndexedChain, SegmentStore,
 };
 use std::{io, path::PathBuf};
 
@@ -115,7 +115,7 @@ impl RepositoryLookup for Repositories<'_> {
 
 struct Writer<'a> {
     store: &'a mut SegmentStore,
-    canonical: &'a CanonicalChain,
+    canonical: &'a IndexedChain,
 }
 
 impl DurableOpSink for Writer<'_> {
@@ -129,7 +129,7 @@ impl DurableOpSink for Writer<'_> {
         let mut bytes = 0usize;
         for op in operations {
             let encoded = encode_op(op).map_err(io::Error::other)?;
-            let known = self.canonical.evidence().classify(op.id, &encoded);
+            let known = self.canonical.classify(op.id, &encoded)?;
             if known == Admission::Duplicate {
                 result.duplicates = result.duplicates.saturating_add(1);
                 continue;

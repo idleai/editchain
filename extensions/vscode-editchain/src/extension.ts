@@ -30,6 +30,8 @@ let lastOpenError: string | null = null;
 // its response will deliver the real state. The stale body is cleared before
 // the pending Open is issued, so the replay path is doubly safe.
 let openPending = false;
+let liveViewportReady = false;
+let livePublication: Promise<unknown> = Promise.resolve();
 // Monotonic ownership token for Open requests and the CURRENT panel. Bumped on
 // every startOpen and on every disposal of the current panel. An async Open
 // response captures the epoch it was issued under and only mutates the shared
@@ -71,7 +73,7 @@ type NegotiatedOpen = {
   protocol_version: number;
   snapshot_id: string;
   live_updates?: boolean;
-  live?: { epoch: string; revision: number; total: number; blocks: unknown[] };
+  live?: { paged?: boolean; epoch: string; revision: number; total: number; blocks: unknown[] };
 };
 
 function isNegotiatedOpen(value: unknown): value is NegotiatedOpen {
@@ -338,7 +340,17 @@ function openHistoryView(
       ensureLive(client, panel);
       return;
     }
+    if (msg.type === 'toggleDisclosure') {
+      if (typeof msg.key === 'string' && msg.key.length > 0 && msg.key.length <= 2048 && !openPending) {
+        void syncNative(client, panel, undefined, { key: msg.key, task: msg.task === true }).catch(error => output?.appendLine('[live] Disclosure failed: ' + String(error)));
+      }
+      return;
+    }
     if (msg.type === 'liveSettled') {
+      if (panel === historyPanel && !msg.error && msg.snapshot_id === lastOpenBody?.Ok.snapshot_id) {
+        liveViewportReady = true;
+        ensureLive(client, panel);
+      }
       if (panel === historyPanel && liveBarrier && liveBarrier.snapshot === msg.snapshot_id) {
         if (msg.error) output?.appendLine('[live] ' + msg.error);
         liveBarrier.settle(!msg.error);
@@ -417,6 +429,23 @@ function openHistoryView(
       return;
     }
     try {
+      if (hasOwnProperty(body, 'FindInHistory') && lastOpenBody?.Ok.live?.paged) {
+        await queueLive(async () => {
+          const owner = openEpoch;
+          if (body.FindInHistory.snapshot_id !== lastOpenBody?.Ok.snapshot_id) return;
+          const response = await client.request(body, { timeoutMs: NON_OPEN_TIMEOUT_MS });
+          if (owner !== openEpoch || panel !== historyPanel) return;
+          if (response?.Ok?.live) {
+            // Search can expose folded rows. Publish that coordinate change
+            // unconditionally; the renderer then repeats its current query.
+            // A cancelled search request must not strand the live barrier.
+            await publishNative(client, panel, { Ok: response.Ok.live }, owner);
+          } else {
+            panel.webview.postMessage({ id, body: response });
+          }
+        });
+        return;
+      }
       // Non-Open calls get a generous finite deadline (see NON_OPEN_TIMEOUT_MS):
       // a hung window/search surfaces visibly in the webview (which suspends
       // retries until explicit recovery) instead of spinning forever. Open
@@ -468,7 +497,7 @@ function ensureLive(client: StdioClient, panel: vscode.WebviewPanel): void {
     setLiveStatus('Workspace trust is required for live history.');
     return;
   }
-  if (openPending || liveBarrier) {
+  if (openPending || liveBarrier || !liveViewportReady) {
     setLiveStatus('Waiting for history to finish opening…');
     return;
   }
@@ -486,12 +515,34 @@ function ensureLive(client: StdioClient, panel: vscode.WebviewPanel): void {
   liveSync.wake();
 }
 
-async function syncNative(client: StdioClient, panel: vscode.WebviewPanel, codex?: LiveProviderRequest): Promise<boolean | void> {
+function syncNative(client: StdioClient, panel: vscode.WebviewPanel, codex?: LiveProviderRequest, disclosure?: { key: string; task: boolean }): Promise<boolean | void> {
+  return queueLive(() => syncNativeSerial(client, panel, codex, disclosure));
+}
+
+function queueLive<T>(operation: () => Promise<T>): Promise<T | void> {
+  const owner = openEpoch;
+  const work = async () => {
+    if (owner !== openEpoch || openPending) return;
+    return operation();
+  };
+  const result = livePublication.then(work, work);
+  livePublication = result.then(() => undefined, () => undefined);
+  return result;
+}
+
+async function syncNativeSerial(client: StdioClient, panel: vscode.WebviewPanel, codex?: LiveProviderRequest, disclosure?: { key: string; task: boolean }): Promise<boolean | void> {
   if (panel !== historyPanel || !lastOpenBody?.Ok.live) return;
   const owner = openEpoch;
   const cursor = lastOpenBody.Ok.live;
-  const response = await client.request({ SyncLive: { epoch: cursor.epoch, after_revision: cursor.revision, codex: codex || null } }, { timeoutMs: 0 });
-  if (owner !== openEpoch || panel !== historyPanel) return;
+  const body = disclosure ? { ToggleLive: { snapshot_id: lastOpenBody.Ok.snapshot_id, ...disclosure } }
+    : { SyncLive: { epoch: cursor.epoch, after_revision: cursor.revision, codex: codex || null } };
+  const response = await client.request(body, { timeoutMs: 0 });
+  return publishNative(client, panel, response, owner);
+}
+
+async function publishNative(client: StdioClient, panel: vscode.WebviewPanel, response: any, owner: number): Promise<boolean | void> {
+  if (owner !== openEpoch || panel !== historyPanel || !lastOpenBody?.Ok.live) return;
+  const cursor = lastOpenBody.Ok.live;
   if (!response?.Ok) {
     if (response?.Error?.code === 'stale_snapshot') {
       output?.appendLine('[live] Revision replay is unavailable; bootstrapping the live view.');
@@ -521,7 +572,7 @@ async function syncNative(client: StdioClient, panel: vscode.WebviewPanel, codex
     if (owner === openEpoch && lastOpenBody?.Ok.live?.epoch === update.epoch) {
       lastOpenBody.Ok.snapshot_id = latest.snapshot_id;
       lastOpenBody.Ok.live.revision = update.revision;
-      lastOpenBody.Ok.live.total = latest.total;
+      lastOpenBody.Ok.live.total = lastOpenBody.Ok.live.paged ? latest.visible_total : latest.total;
     }
     return update.work?.provider_pending === true;
   } finally {
@@ -565,6 +616,7 @@ function startOpen(client: StdioClient, panel: vscode.WebviewPanel, refresh = fa
   // Never replay a stale open body while this Open is pending, and never let a
   // previous workspace's body survive a restart that may fail.
   openPending = true;
+  liveViewportReady = false;
   lastOpenBody = null;
   lastOpenError = null;
   openDeliveredToRenderer = null;
@@ -573,7 +625,7 @@ function startOpen(client: StdioClient, panel: vscode.WebviewPanel, refresh = fa
   // if the service exits or is stopped, so it cannot hang indefinitely.
   const request = { workspace_path: workspacePath(), chain_dir: chainDir() };
   return client.request(
-    liveRequested ? { OpenLive: request } : refresh ? { Refresh: request } : { Open: request },
+    liveRequested ? { OpenLivePaged: request } : refresh ? { Refresh: request } : { Open: request },
     { timeoutMs: 0 }
   ).then(async (resp) => {
     // Late response from a superseded Open: drop it entirely. It must neither

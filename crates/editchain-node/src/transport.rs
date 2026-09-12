@@ -32,12 +32,58 @@ impl Server {
         }
     }
 
+    /// Encode a response for the stdio transport. Large live baselines borrow
+    /// the retained topology instead of cloning it into a generic JSON tree.
+    ///
+    /// # Errors
+    /// Returns request, workspace and serialization errors.
+    pub fn handle_encoded(
+        &mut self,
+        request: &Request,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        match editchain_index::boundary(|| self.handle_encoded_inner(request)) {
+            Ok(result) => result,
+            Err(error) => {
+                self.live = None;
+                Err(error.into())
+            }
+        }
+    }
+
+    fn handle_encoded_inner(
+        &mut self,
+        request: &Request,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        if let RequestBody::OpenLive(open) = &request.body {
+            if request.body.validate().is_ok() {
+                self.live = None;
+                let live = crate::history::LiveWorkspace::open(open)?;
+                let encoded = live.encode_opened(request.id)?;
+                self.live = Some(live);
+                self.workspace = None;
+                self.lexical = None;
+                return Ok(encoded);
+            }
+        }
+        Ok(serde_json::to_vec(&self.handle(request)?)?)
+    }
+
     /// Handle a single request against the current state.
     ///
     /// # Errors
     ///
     /// Returns an error if the request cannot be handled.
     pub fn handle(&mut self, request: &Request) -> Result<Response, Box<dyn std::error::Error>> {
+        match editchain_index::boundary(|| self.handle_inner(request)) {
+            Ok(result) => result,
+            Err(error) => {
+                self.live = None;
+                Err(error.into())
+            }
+        }
+    }
+
+    fn handle_inner(&mut self, request: &Request) -> Result<Response, Box<dyn std::error::Error>> {
         let id = request.id;
         if let Err(error) = request.body.validate() {
             return Ok(Response {
@@ -45,7 +91,17 @@ impl Server {
                 body: ResponseBody::Error(error),
             });
         }
+        if let RequestBody::OpenLivePaged(open) = &request.body {
+            self.live = None;
+            let live = crate::history::LiveWorkspace::open_paged(open)?;
+            let body = ResponseBody::Ok(serde_json::to_value(live.opened())?);
+            self.live = Some(live);
+            self.workspace = None;
+            self.lexical = None;
+            return Ok(Response { id, body });
+        }
         if let RequestBody::OpenLive(open) = &request.body {
+            self.live = None;
             let live = crate::history::LiveWorkspace::open(open)?;
             let body = ResponseBody::Ok(serde_json::to_value(live.opened())?);
             self.live = Some(live);
@@ -77,10 +133,12 @@ impl Server {
         let reads_sources = match &request.body {
             RequestBody::Open(_)
             | RequestBody::OpenLive(_)
+            | RequestBody::OpenLivePaged(_)
             | RequestBody::SyncLive(_)
             | RequestBody::Refresh(_)
             | RequestBody::GetWindow(_)
-            | RequestBody::LocateRows(_) => false,
+            | RequestBody::LocateRows(_)
+            | RequestBody::ToggleLive(_) => false,
             RequestBody::FindInHistory(_) => self.lexical.is_none(),
             RequestBody::GetNodeDetails(_)
             | RequestBody::ResolveObject(_)
@@ -93,9 +151,10 @@ impl Server {
                 .ensure_sources_current()?;
         }
         let body = match &request.body {
-            RequestBody::OpenLive(_) | RequestBody::SyncLive(_) => {
-                return Err(no_workspace().into())
-            }
+            RequestBody::OpenLive(_)
+            | RequestBody::OpenLivePaged(_)
+            | RequestBody::ToggleLive(_)
+            | RequestBody::SyncLive(_) => return Err(no_workspace().into()),
             RequestBody::Open(req) | RequestBody::Refresh(req) => {
                 let workspace = if matches!(&request.body, RequestBody::Open(_)) {
                     Workspace::open(&req.workspace_path, &req.chain_dir)?

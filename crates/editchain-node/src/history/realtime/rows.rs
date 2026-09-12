@@ -9,47 +9,20 @@ use super::{
 };
 use editchain_project::{live::LiveRow, HistoryProjection};
 use editchain_protocol::{LiveBlock, LiveBlockMeta};
-use editchain_store::BlobReader;
 
 impl LiveWorkspace {
-    pub(super) fn task_header(
-        &self,
-        meta: LiveBlockMeta,
-        changed: &std::collections::BTreeMap<String, LiveBlock>,
-    ) -> Result<LiveBlock> {
-        let task = meta
-            .task_header
-            .as_ref()
-            .ok_or("task header metadata is missing")?;
-        let member = changed
-            .get(&task.anchor)
-            .or_else(|| {
-                self.orders
-                    .get(&task.anchor)
-                    .and_then(|order| self.blocks.get(order))
-            })
-            .and_then(|block| block.rows.first());
-        let row = serde_json::from_value(serde_json::json!({
-            "summary": format!("{} · {}", task.title.as_deref().unwrap_or("Codex task"), task.status.label()),
-            "timestamp_ms": meta.sort_time, "group": member.map(|row| row.group.clone()).unwrap_or_default(),
-            "node_key": meta.key, "continuity_key": meta.key, "parents": [], "is_submodule": false,
-            "kind": "task", "record_role": "lifecycle", "activity_kind": "plan",
-            "task_group": task, "turn_id": task.turn_id,
-            "activity_bundle": {"kind": "work-group", "member_count": task.member_count},
-        }))?;
-        Ok(LiveBlock {
-            meta,
-            rows: vec![row],
-        })
-    }
-
-    pub(super) fn local_workspace(&self, input: &LiveRow) -> Result<Workspace> {
-        let resolver = BlobReader::open(&self.chain)?;
-        let (previews, _, incomplete) = projection_ops_with_previews(&input.operations, &resolver);
+    pub(super) fn local_workspace(&self, input: &LiveRow) -> Workspace {
+        let resolver = self.blobs.clone();
+        let operations: Vec<_> = input
+            .operations
+            .iter()
+            .map(|op| op.as_ref().clone())
+            .collect();
+        let (previews, _, incomplete) = projection_ops_with_previews(&operations, &resolver);
         let projection =
-            HistoryProjection::from_source_previews(&input.operations, previews, &incomplete);
+            HistoryProjection::from_source_previews(&operations, previews, &incomplete);
         let mut workspace = Workspace::from_projection(projection);
-        workspace.source_ops.clone_from(&input.operations);
+        workspace.source_ops.clone_from(&operations);
         workspace.source_op_index = input
             .operations
             .iter()
@@ -57,7 +30,7 @@ impl LiveWorkspace {
             .map(|(index, op)| (op.id, index))
             .collect();
         workspace.agent_file_changes = agent_file_change_index(
-            &input.operations,
+            &operations,
             &self.root,
             Some(&resolver),
             self.catalog.entries(),
@@ -75,19 +48,19 @@ impl LiveWorkspace {
                     std::slice::from_ref(meta),
                 ));
         }
-        Ok(workspace)
+        workspace
     }
 
     pub(super) fn present(&self, input: &LiveRow) -> Result<Option<LiveBlock>> {
         if super::tasks::Tasks::metadata_only(input, &self.projection) {
             return Ok(None);
         }
-        let mut workspace = self.local_workspace(input)?;
+        let mut workspace = self.local_workspace(input);
         workspace.prepare_live_item_view();
         let mut window = workspace.history_window(HistoryWindowOptions {
             offset: 0,
             limit: u64::MAX,
-            include_layout: true,
+            include_layout: false,
         })?;
         if window.rows.is_empty() {
             return Ok(None);
@@ -113,7 +86,7 @@ impl LiveWorkspace {
         Ok(Some(LiveBlock {
             meta: LiveBlockMeta {
                 task_group: None,
-                task_header: None,
+                task_summary: None,
                 task_protected: unresolved(input)
                     || window.rows.iter().any(|row| {
                         matches!(

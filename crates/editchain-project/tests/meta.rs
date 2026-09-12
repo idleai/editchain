@@ -5,6 +5,7 @@
     reason = "Tests index into freshly built vectors"
 )]
 // Crate-level dependency markers (used by Cargo for feature resolution).
+use editchain_index as _;
 use serde as _;
 use serde_json as _;
 

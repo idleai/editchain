@@ -43,6 +43,10 @@ pub enum RequestBody {
     Open(OpenRequest),
     /// Bootstrap the retained live activity view once.
     OpenLive(OpenRequest),
+    /// Open a checkpoint with native paging and disclosure.
+    OpenLivePaged(OpenRequest),
+    /// Toggle a native disclosure row in the current revision.
+    ToggleLive(ToggleLiveRequest),
     /// Capture provider appends and replay revisioned changes since a cursor.
     SyncLive(SyncLiveRequest),
     /// Reopen authoritative sources, bypassing derived caches after negotiation.
@@ -107,6 +111,19 @@ pub struct OpenRequest {
     pub workspace_path: String,
     /// Path to the chain directory (may be empty if none).
     pub chain_dir: String,
+}
+
+/// A native disclosure action by stable row identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToggleLiveRequest {
+    /// Toggle its task path instead of the row's own details.
+    #[serde(default)]
+    pub task: bool,
+    /// Current view revision.
+    pub snapshot_id: SnapshotId,
+    /// Stable presentation identity of the physical parent row.
+    pub key: String,
 }
 
 /// Get a window of history rows (cursor-based paging).
@@ -438,6 +455,9 @@ pub struct HistoryRow {
     /// Graph edges and detail actions continue to use their immutable IDs.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub continuity_key: String,
+    /// Native disclosure state when the service owns visible coordinates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_expanded: Option<bool>,
     /// Parent node keys (for drawing graph edges).
     pub parents: Vec<String>,
     /// Provider-neutral relationship kinds for the edges in [`Self::parents`].
@@ -583,7 +603,7 @@ pub struct HistoryRow {
     /// windows. `None` only on older services that predate the field.
     #[serde(default)]
     pub work_unit: Option<WorkUnitDto>,
-    /// Native task section header; item contents remain in independent blocks.
+    /// Task path annotation on its physical anchor; item contents remain independent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_group: Option<TaskGroupDto>,
     /// Conservative promotion marker: `true` when this row is significant
@@ -875,6 +895,9 @@ pub struct FindInHistoryMatch {
 /// because the scan budget was reached; it never claims an exact total.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindInHistoryResponse {
+    /// Native disclosure edits exposing the returned matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<LiveUpdate>,
     /// Snapshot whose fixed expanded coordinates are returned below.
     pub snapshot_id: SnapshotId,
     /// Distinct visible matches, one per top-level history row, ranked by best
@@ -956,6 +979,7 @@ mod tests {
     #[test]
     fn history_row_identifiers_serialize_as_exact_strings() {
         let row = HistoryRow {
+            native_expanded: None,
             content: None,
             op_id: Some(big_op_id().to_string()),
             git_oid: Some(big_oid().to_hex()),
@@ -1214,6 +1238,7 @@ mod tests {
         assert_eq!(request_json["FindInHistory"]["top_k"], 25usize);
 
         let response = FindInHistoryResponse {
+            live: None,
             snapshot_id: SnapshotId::new("fixture"),
             matches: vec![FindInHistoryMatch {
                 node_key: big_op_id().to_string(),
@@ -1373,6 +1398,7 @@ mod tests {
 
         // Newer services emit the fields; partial WorkUnitDto members default.
         let row = HistoryRow {
+            native_expanded: None,
             content: None,
             op_id: Some("1:0:1".to_string()),
             git_oid: None,

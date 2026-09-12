@@ -1,4 +1,4 @@
-//! Viewer-owned task disclosure. Appends touch only the changed member and
+//! Viewer-owned causal path disclosure. Appends touch only the changed member and
 //! graph boundaries; only an explicit user toggle walks a section's members.
 
 use super::{ExpandedRow, LiveBlockMeta, LiveIndex};
@@ -16,11 +16,13 @@ impl LiveIndex {
         for meta in blocks {
             self.register_member(meta);
             if meta
-                .task_header
+                .task_summary
                 .as_ref()
                 .is_some_and(|task| task.status == TaskStatus::Completed)
             {
-                self.groups.entry(meta.key.clone()).or_default().collapsed = true;
+                if let Some(group) = &meta.task_group {
+                    self.groups.entry(group.clone()).or_default().collapsed = true;
+                }
             }
         }
         for meta in blocks {
@@ -36,9 +38,6 @@ impl LiveIndex {
                 .or_default()
                 .members
                 .insert(meta.key.clone());
-        }
-        if meta.task_header.is_some() {
-            let _group = self.groups.entry(meta.key.clone()).or_default();
         }
     }
 
@@ -60,7 +59,16 @@ impl LiveIndex {
             return;
         };
         block.hidden = !block.exposed
+            && block.meta.task_summary.is_none()
             && self.graph.foldable(key)
+            && block
+                .meta
+                .task_group
+                .as_ref()
+                .and_then(|key| self.groups.get(key))
+                .is_some_and(|group| group.collapsed);
+        block.summarized = !block.exposed
+            && block.meta.task_summary.is_some()
             && block
                 .meta
                 .task_group
@@ -99,6 +107,7 @@ impl LiveIndex {
         if let Some(mut block) = self.tree.remove(order) {
             block.exposed = true;
             block.hidden = false;
+            block.summarized = false;
             self.insert(block);
         }
     }

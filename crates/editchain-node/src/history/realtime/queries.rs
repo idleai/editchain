@@ -32,12 +32,23 @@ impl std::fmt::Debug for LiveSearch {
 }
 
 impl LiveSearch {
-    pub(super) fn new() -> Result<Self> {
+    pub(super) fn open(path: &std::path::Path, fresh: bool) -> Result<Self> {
         let mut schema = Schema::builder();
         let key = schema.add_text_field("key", STRING | STORED);
         let text = schema.add_text_field("text", TEXT);
-        let index = Index::create_in_ram(schema.build());
+        std::fs::create_dir_all(path)?;
+        let index = if path.join("meta.json").try_exists()? {
+            Index::open_in_dir(path)?
+        } else {
+            if !fresh {
+                return Err("live search checkpoint is missing; close History, remove the derived live-v1 directory and run prepare-view".into());
+            }
+            Index::create_in_dir(path, schema.build())?
+        };
         let writer = index.writer_with_num_threads(1, 20_000_000)?;
+        if fresh {
+            let _stamp = writer.delete_all_documents()?;
+        }
         let reader = index.reader()?;
         Ok(Self {
             index,
@@ -45,7 +56,7 @@ impl LiveSearch {
             reader,
             key,
             text,
-            dirty: false,
+            dirty: fresh,
         })
     }
 
@@ -71,12 +82,17 @@ impl LiveSearch {
         self.dirty = true;
     }
 
-    fn find(&mut self, query: &str, limit: usize) -> Result<Vec<String>> {
+    pub(super) fn flush(&mut self) -> Result<()> {
         if self.dirty {
             let _stamp = self.writer.commit()?;
             self.reader.reload()?;
             self.dirty = false;
         }
+        Ok(())
+    }
+
+    fn find(&mut self, query: &str, limit: usize) -> Result<Vec<String>> {
+        self.flush()?;
         let parser = QueryParser::for_index(&self.index, vec![self.text]);
         let query = parser.parse_query(query)?;
         let searcher = self.reader.searcher();
@@ -97,6 +113,22 @@ impl LiveSearch {
 
 impl LiveWorkspace {
     pub(crate) fn handle(&mut self, request: &RequestBody) -> Result<ResponseBody> {
+        match editchain_index::boundary(|| {
+            let result = self.handle_inner(request)?;
+            if !matches!(request, RequestBody::SyncLive(_)) {
+                self.unload()?;
+            }
+            Ok(result)
+        }) {
+            Ok(result) => result,
+            Err(error) => {
+                self.poisoned = true;
+                Err(error.into())
+            }
+        }
+    }
+
+    fn handle_inner(&mut self, request: &RequestBody) -> Result<ResponseBody> {
         if self.poisoned {
             return Err(super::super::stale_snapshot().into());
         }
@@ -107,9 +139,27 @@ impl LiveWorkspace {
             return Err(super::super::stale_snapshot().into());
         }
         let value = match request {
+            RequestBody::ToggleLive(request) => {
+                if !self.paged() {
+                    return Err("native disclosure was not negotiated".into());
+                }
+                let revision = self.revision;
+                self.toggle_disclosure(&request.key, request.task)?;
+                serde_json::to_value(editchain_protocol::LiveUpdate {
+                    epoch: self.epoch.clone(),
+                    revision: self.revision,
+                    deltas: self
+                        .journal
+                        .iter()
+                        .filter(|delta| delta.revision > revision)
+                        .cloned()
+                        .collect(),
+                    work: editchain_protocol::LiveWork::default(),
+                })?
+            }
             RequestBody::SyncLive(request) => serde_json::to_value(self.sync(request)?)?,
-            RequestBody::GetWindow(request) => serde_json::to_value(self.window(request))?,
-            RequestBody::LocateRows(request) => serde_json::to_value(self.locate(&request.keys))?,
+            RequestBody::GetWindow(request) => serde_json::to_value(self.window(request)?)?,
+            RequestBody::LocateRows(request) => serde_json::to_value(self.locate(&request.keys)?)?,
             RequestBody::FindInHistory(request) => {
                 serde_json::to_value(self.find(&request.query, request.top_k)?)?
             }
@@ -172,7 +222,10 @@ impl LiveWorkspace {
                     value: super::super::resolved_object_from_commit(commit),
                 })?
             }
-            RequestBody::Open(_) | RequestBody::OpenLive(_) | RequestBody::Refresh(_) => {
+            RequestBody::Open(_)
+            | RequestBody::OpenLive(_)
+            | RequestBody::OpenLivePaged(_)
+            | RequestBody::Refresh(_) => {
                 return Err(ServiceError::new(
                     ErrorCode::InvalidInput,
                     "open must establish a new live runtime",
@@ -186,7 +239,7 @@ impl LiveWorkspace {
     fn details_workspace(&self, id: &str) -> Result<super::super::Workspace> {
         let id = editchain_core::OpId::from_display_str(id).ok_or("invalid operation identity")?;
         if let Some(input) = self.owners.get(&id).and_then(|key| self.inputs.get(key)) {
-            return self.local_workspace(input);
+            return Ok(self.local_workspace(input));
         }
         let op = self
             .tail
@@ -194,16 +247,19 @@ impl LiveWorkspace {
             .get(id)
             .ok_or("live operation unavailable")?
             .clone();
-        self.local_workspace(&LiveRow {
+        Ok(self.local_workspace(&LiveRow {
             task: None,
             key: id.to_string(),
             anchor: id,
             incarnation: id,
-            operations: vec![op],
-        })
+            operations: vec![std::sync::Arc::new(op)],
+        }))
     }
 
-    fn window(&self, request: &GetWindowRequest) -> HistoryWindow {
+    fn window(&self, request: &GetWindowRequest) -> Result<HistoryWindow> {
+        if self.paged() {
+            return self.paged_window(request);
+        }
         let mut offset = request.offset;
         let end = offset
             .saturating_add(request.limit)
@@ -216,7 +272,8 @@ impl LiveWorkspace {
             let first =
                 usize::try_from(offset.saturating_sub(start.expanded)).unwrap_or(usize::MAX);
             let count = usize::try_from(end.saturating_sub(offset)).unwrap_or(usize::MAX);
-            for source in block.rows.iter().skip(first).take(count) {
+            let content = self.rows.rows(block)?;
+            for source in content.iter().skip(first).take(count) {
                 let mut row = source.clone();
                 row.parent_row = row
                     .parent_row
@@ -226,11 +283,14 @@ impl LiveWorkspace {
                     offset.saturating_sub(start.expanded),
                     &mut row,
                 );
+                if offset == start.expanded {
+                    row.task_group.clone_from(&block.meta.task_summary);
+                }
                 rows.push(row);
                 offset = offset.saturating_add(1);
             }
         }
-        HistoryWindow {
+        Ok(HistoryWindow {
             snapshot_id: self.snapshot_id.clone(),
             rows,
             total: self.blocks.measure().expanded,
@@ -239,43 +299,159 @@ impl LiveWorkspace {
             sub_op_counts: None,
             expansion_spans: None,
             layout_ready: true,
-        }
+        })
     }
 
-    fn locate(&self, keys: &[String]) -> LocateRowsResponse {
-        let rows = keys
-            .iter()
-            .filter_map(|key| {
-                let order = self.orders.get(key)?;
-                let block = self.blocks.get(order)?;
-                Some(RowLocation {
-                    key: key.clone(),
-                    node_key: block.rows.first()?.node_key.clone(),
-                    row: self.blocks.rank(order)?.expanded,
-                })
-            })
-            .collect();
-        LocateRowsResponse {
+    fn locate(&self, keys: &[String]) -> Result<LocateRowsResponse> {
+        let mut rows = Vec::new();
+        for key in keys {
+            let (block_key, slot) = if self.paged() {
+                let Some((block, slot)) = self.disclosure.position(key) else {
+                    continue;
+                };
+                (block.as_str(), *slot)
+            } else {
+                (key.as_str(), 0)
+            };
+            let Some(order) = self.orders.get(block_key) else {
+                continue;
+            };
+            let Some(block) = self.blocks.get(order) else {
+                continue;
+            };
+            let Some(rank) = self.blocks.rank(order) else {
+                continue;
+            };
+            let (row, node_key) = if self.paged() {
+                let Ok(visible) = self.disclosure.slots(block_key).binary_search(&slot) else {
+                    continue;
+                };
+                let content = self.rows.rows(block)?;
+                let node_key = content
+                    .get(usize::try_from(slot)?)
+                    .ok_or("anchor slot exceeds block rows")?
+                    .node_key
+                    .clone();
+                (
+                    rank.visible.saturating_add(u64::try_from(visible)?),
+                    node_key,
+                )
+            } else {
+                (rank.expanded, block.meta.node_key.clone())
+            };
+            rows.push(RowLocation {
+                key: key.clone(),
+                node_key,
+                row,
+            });
+        }
+        Ok(LocateRowsResponse {
             snapshot_id: self.snapshot_id.clone(),
             rows,
+        })
+    }
+
+    fn paged_window(&self, request: &GetWindowRequest) -> Result<HistoryWindow> {
+        let mut offset = request.offset;
+        let total = self.blocks.measure().visible;
+        let end = offset.saturating_add(request.limit).min(total);
+        let mut rows = Vec::new();
+        while offset < end {
+            let Some((_, block, start)) = self.blocks.select(offset, Axis::Visible) else {
+                break;
+            };
+            let slots = self.disclosure.slots(&block.meta.key);
+            let first = usize::try_from(offset.saturating_sub(start.visible))?;
+            let content = self.rows.rows(block)?;
+            for slot in slots
+                .iter()
+                .skip(first)
+                .take(usize::try_from(end.saturating_sub(offset))?)
+            {
+                let mut row = content
+                    .get(usize::try_from(*slot)?)
+                    .cloned()
+                    .ok_or("visible slot exceeds block rows")?;
+                row.parent_row = row
+                    .parent_row
+                    .and_then(|parent| slots.binary_search(&u64::try_from(parent).ok()?).ok())
+                    .and_then(|parent| usize::try_from(start.visible).ok()?.checked_add(parent));
+                self.graph.decorate(&block.meta.key, *slot, &mut row);
+                row.native_expanded = Some(self.disclosure.expanded(&block.meta.key, *slot));
+                if *slot == 0 {
+                    row.task_group = block.meta.task_summary.clone().map(|mut task| {
+                        task.expanded = block
+                            .meta
+                            .task_group
+                            .as_ref()
+                            .map(|group| self.disclosure.group_expanded(group));
+                        task.summarized = task.expanded == Some(false)
+                            && self.disclosure.settled(&block.meta.key);
+                        task
+                    });
+                }
+                rows.push(row);
+                offset = offset.saturating_add(1);
+            }
         }
+        Ok(HistoryWindow {
+            snapshot_id: self.snapshot_id.clone(),
+            rows,
+            total,
+            chain_generation: u64::try_from(self.tail.chain().stats().accepted)?,
+            max_lane: self.graph.max_lane(),
+            sub_op_counts: None,
+            expansion_spans: (request.offset == 0).then(Vec::new),
+            layout_ready: true,
+        })
     }
 
     fn find(&mut self, query: &str, limit: usize) -> Result<FindInHistoryResponse> {
-        let keys = self.search.find(query, limit.saturating_add(1))?;
+        let keys = self
+            .search
+            .as_mut()
+            .ok_or("live search unavailable")?
+            .find(query, limit.saturating_add(1))?;
         let more = keys.len() > limit;
+        let before = self.revision;
+        if self.paged()
+            && self.reveal_matches(&keys.iter().take(limit).cloned().collect::<Vec<_>>())
+        {
+            self.poisoned = true;
+            self.publish(
+                Vec::new(),
+                Vec::new(),
+                editchain_protocol::LiveWork::default(),
+            )?;
+            self.checkpoint()?;
+        }
         let matches = keys
             .iter()
             .take(limit)
             .filter_map(|key| {
                 let order = self.orders.get(key)?;
                 Some(FindInHistoryMatch {
-                    node_key: self.blocks.get(order)?.rows.first()?.node_key.clone(),
-                    row: self.blocks.rank(order)?.expanded,
+                    node_key: self.blocks.get(order)?.meta.node_key.clone(),
+                    row: if self.paged() {
+                        self.blocks.rank(order)?.visible
+                    } else {
+                        self.blocks.rank(order)?.expanded
+                    },
                 })
             })
             .collect();
         Ok(FindInHistoryResponse {
+            live: (self.revision != before).then(|| editchain_protocol::LiveUpdate {
+                epoch: self.epoch.clone(),
+                revision: self.revision,
+                deltas: self
+                    .journal
+                    .iter()
+                    .filter(|delta| delta.revision > before)
+                    .cloned()
+                    .collect(),
+                work: editchain_protocol::LiveWork::default(),
+            }),
             snapshot_id: self.snapshot_id.clone(),
             matches,
             more,

@@ -11,10 +11,11 @@ impl HistoryAppState {
     /// Frame the retained window at ordinary lane pitch. Distant historical
     /// branches must not compress the current tracks or reserve empty columns.
     pub(crate) fn graph_max_lane(&self) -> u32 {
-        if self
-            .expansion
-            .as_ref()
-            .is_none_or(|index| index.live.is_none())
+        if self.remote.is_none()
+            && self
+                .expansion
+                .as_ref()
+                .is_none_or(|index| index.live.is_none())
         {
             return self.max_lane;
         }
@@ -66,6 +67,9 @@ impl HistoryAppState {
         viewport: &Viewport,
         step: &mut Step,
     ) -> Result<(), ServiceError> {
+        if self.remote.is_some() {
+            return self.apply_remote_update(update, viewport, step);
+        }
         let index = self
             .expansion
             .as_ref()

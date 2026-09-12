@@ -31,9 +31,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const flush = () => sleep(0);
 const openBody = (workspace) => ({ Ok: { protocol_version: 2, snapshot_id: workspace, workspace, live_updates: true } });
 const liveBody = (snapshot, revision = 0) => ({ Ok: { ...openBody(snapshot).Ok,
-  live: { epoch: 'epoch', revision, total: 0, blocks: [] } } });
+  live: { paged: true, epoch: 'epoch', revision, total: 0, blocks: [] } } });
 const deltaBody = (revision) => ({ Ok: { epoch: 'epoch', revision, work: {}, deltas: [{
-  base_revision: revision - 1, revision, snapshot_id: `epoch:${revision}`, total: 0,
+  base_revision: revision - 1, revision, snapshot_id: `epoch:${revision}`, total: 0, visible_total: 0,
   removed: [], upserts: [],
 }] } });
 
@@ -121,7 +121,7 @@ class FakeStdioClient {
   request(body, opts) {
     const rec = { body, opts, resolve: null, promise: null };
     rec.promise = new Promise((resolve) => { rec.resolve = resolve; });
-    if (body && (body.Open || body.Refresh || body.OpenLive)) {
+    if (body && (body.Open || body.Refresh || body.OpenLivePaged)) {
       this.openRequests.push(rec);
     } else {
       this.requests.push(rec);
@@ -284,9 +284,11 @@ test('history opens live by default, waits for delta acknowledgement, and resume
   const panel = env.panels[0];
   t.after(() => panel.handlers.dispose());
   await rendererReady(panel);
-  assert.ok(env.client.openRequests[0].body.OpenLive);
+  assert.ok(env.client.openRequests[0].body.OpenLivePaged);
   env.client.openRequests[0].resolve(liveBody('base'));
   await flush();
+  assert.equal(env.live.length, 0, 'capture waits for the saved first viewport');
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'base', error: null });
   assert.equal(env.live.length, 1);
   env.live[0].status('Importing Codex changes (32/65 queued)…');
   await panel.handlers.message({ type: 'status', loaded: 5, total: 90 });
@@ -319,6 +321,46 @@ test('history opens live by default, waits for delta acknowledgement, and resume
   assert.equal(panel.webview.messages.length, count, 'idle polling causes no renderer update');
 });
 
+test('native disclosure and search publish serially behind the viewport acknowledgement', async t => {
+  const env = loadExtension({});
+  env.vscode.workspace.isTrusted = true;
+  env.open();
+  const panel = env.panels[0];
+  t.after(() => panel.handlers.dispose());
+  await rendererReady(panel);
+  env.client.openRequests[0].resolve(liveBody('base'));
+  await flush();
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'base', error: null });
+  env.client.nextResponse = deltaBody(1);
+  const publication = env.live[0].publish();
+  await flush();
+  const beforeToggle = env.client.requests.length;
+  await panel.handlers.message({ type: 'toggleDisclosure', key: 'item:4', task: true });
+  assert.equal(env.client.requests.length, beforeToggle, 'toggle waits for the in-flight viewport');
+  env.client.nextResponse = deltaBody(2);
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'epoch:1', error: null });
+  await publication;
+  await flush();
+  assert.deepEqual(env.client.requests.at(-1).body, { ToggleLive: { snapshot_id: 'epoch:1', key: 'item:4', task: true } });
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'epoch:2', error: null });
+  await flush();
+  env.client.nextResponse = { Ok: { snapshot_id: 'epoch:3', matches: [], more: false, live: deltaBody(3).Ok } };
+  const search = panel.handlers.message({ id: 90, body: { FindInHistory: { snapshot_id: 'epoch:2', query: 'needle', top_k: 50 } } });
+  await flush();
+  assert.equal(panel.webview.messages.at(-1).id, 'delta', 'disclosure is published even if the original search is cancelled');
+  assert.equal(panel.webview.messages.some(message => message.id === 90), false);
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'epoch:3', error: null });
+  await search;
+  env.client.nextResponse = { Ok: { snapshot_id: 'epoch:3', matches: [{ row: 0, node_key: 'needle' }], more: false } };
+  await panel.handlers.message({ id: 91, body: { FindInHistory: { snapshot_id: 'epoch:3', query: 'needle', top_k: 50 } } });
+  assert.equal(panel.webview.messages.at(-1).id, 91, 'the repeated query uses the published coordinates');
+  env.client.nextResponse = deltaBody(4);
+  await panel.handlers.message({ type: 'toggleDisclosure', key: 'item:4', task: false });
+  await flush();
+  assert.deepEqual(env.client.requests.at(-1).body, { ToggleLive: { snapshot_id: 'epoch:3', key: 'item:4', task: false } });
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'epoch:4', error: null });
+});
+
 test('live startup explains missing workspace and trust requirements immediately', t => {
   for (const workspaceMissing of [true, false]) {
     const env = loadExtension();
@@ -339,12 +381,14 @@ test('renderer recreation bootstraps a fresh live baseline, and old services fai
   await rendererReady(panel);
   env.client.openRequests[0].resolve(liveBody('base'));
   await flush();
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'base', error: null });
   await rendererReady(panel, 'recreated');
   assert.equal(env.live[0].disposed, true);
-  assert.ok(env.client.openRequests[1].body.OpenLive);
+  assert.ok(env.client.openRequests[1].body.OpenLivePaged);
   env.client.openRequests[1].resolve(liveBody('fresh'));
   await flush();
   assert.deepEqual(panel.webview.messages.at(-2), { id: 'open', body: liveBody('fresh') });
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'fresh', error: null });
   assert.equal(env.live.length, 2);
   env.client.nextResponse = { Error: { code: 'stale_snapshot', message: 'bootstrap' } };
   const unsupported = env.live[1].publish();

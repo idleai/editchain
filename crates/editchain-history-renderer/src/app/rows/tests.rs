@@ -2944,6 +2944,7 @@ fn find_match_and_expanded_states_apply_classes_and_aria() {
             find_current: true,
             expanded: true,
             roving_abs: Some(0),
+            task: TaskView::default(),
         },
     );
     assert!(expanded.classes().contains("row-find-current"));

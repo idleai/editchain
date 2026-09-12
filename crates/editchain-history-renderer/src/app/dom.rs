@@ -31,7 +31,7 @@
 #[cfg(test)]
 use serde_json::Value;
 
-use super::rows::{GraphData, GraphRole, RowSpec};
+use super::rows::{GraphData, RowSpec};
 use super::state::{HistoryAppState, ROW_H};
 #[cfg(test)]
 use super::ChainState;
@@ -349,17 +349,16 @@ pub(crate) fn row_graph_items(graph: &GraphData, cell: &GraphCellSpec) -> Vec<Sv
     // Only a folded group summary owns the capsule. Once unfolded, its summary
     // row and every revealed member use ordinary dots, including members that
     // are themselves nested bundles.
-    let bundle =
-        if graph.role == GraphRole::Node && graph.is_bundle && !graph.is_subop && !graph.expanded {
-            Some(BundleGlyph {
-                term_r: (cell.dot_radius * BUNDLE_TERMINAL_RATIO_CSS_PX)
-                    .max(BUNDLE_TERMINAL_MIN_CSS_PX),
-                entry_y: mid_y - BUNDLE_HALF_HEIGHT_CSS_PX,
-                exit_y: mid_y + BUNDLE_HALF_HEIGHT_CSS_PX,
-            })
-        } else {
-            None
-        };
+    let bundle = if graph.is_bundle && !graph.is_subop && !graph.expanded {
+        Some(BundleGlyph {
+            term_r: (cell.dot_radius * BUNDLE_TERMINAL_RATIO_CSS_PX)
+                .max(BUNDLE_TERMINAL_MIN_CSS_PX),
+            entry_y: mid_y - BUNDLE_HALF_HEIGHT_CSS_PX,
+            exit_y: mid_y + BUNDLE_HALF_HEIGHT_CSS_PX,
+        })
+    } else {
+        None
+    };
     // Resolve each transition's real anchors before drawing anything (same
     // rules as production): a side is dot-anchored when the transition starts
     // or ends on this row's own node; a boundary-anchored side must be backed
@@ -440,9 +439,6 @@ pub(crate) fn row_graph_items(graph: &GraphData, cell: &GraphCellSpec) -> Vec<Sv
             mid_y,
             muted,
         ));
-    }
-    if graph.role == GraphRole::PassThrough {
-        return items;
     }
     let colour = graph_color_hex(node_lane, graph.chain_state.is_muted());
     if let Some(glyph) = bundle {
@@ -2522,6 +2518,18 @@ mod web {
         spec: &RowSpec,
     ) -> Result<(), JsValue> {
         let parent_node = node_of(parent)?;
+        if let Some(task) = &spec.task_disclosure {
+            let button = make_element(document, "button", "task-chevron", Some(&task.text))?;
+            button.set_attribute("type", "button")?;
+            button.set_attribute("title", &task.label)?;
+            button.set_attribute("aria-label", &task.label)?;
+            button.set_attribute("aria-expanded", &task.expanded.to_string())?;
+            drop(
+                parent_node
+                    .append_child(&node_of(&button)?)
+                    .map_err(js_err_from)?,
+            );
+        }
         for item in &spec.tags {
             let tag = make_element(document, "span", &item.classes, Some(&item.text))?;
             tag.set_attribute("title", &item.title)?;
@@ -2724,21 +2732,31 @@ mod tests {
     }
 
     #[test]
-    fn task_header_draws_continuous_passing_lanes_without_a_dot_or_capsule() {
-        let graph = GraphData {
-            role: GraphRole::PassThrough,
+    fn task_anchor_keeps_a_physical_dot_when_open_and_a_connected_capsule_when_folded() {
+        let mut graph = GraphData {
             lane: 1,
             above: vec![1],
             below: vec![1],
             is_bundle: true,
+            expanded: true,
             ..GraphData::default()
         };
         let cell = graph_cell_spec(vec![14.76, 29.52], 4.0, 44.28);
-        let items = row_graph_items(&graph, &cell);
-        assert_eq!(items.len(), 2);
-        assert!(items
-            .iter()
-            .all(|item| matches!(item, SvgItem::Line { .. })));
+        assert!(row_graph_items(&graph, &cell).iter().any(|item| matches!(
+            item,
+            SvgItem::Circle {
+                class: "graphDot",
+                ..
+            }
+        )));
+        graph.expanded = false;
+        assert!(row_graph_items(&graph, &cell).iter().any(|item| matches!(
+            item,
+            SvgItem::Rect {
+                class: "graphBundleCapsule",
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -3009,7 +3027,6 @@ mod tests {
         transitions: Vec<(u32, u32)>,
     ) -> GraphData {
         GraphData {
-            role: GraphRole::Node,
             lane,
             above,
             below,

@@ -2,12 +2,12 @@
 
 use super::{Change, Order, Owners, Point};
 use crate::rank::{Measure, RankTree};
-use std::collections::BTreeSet;
+use editchain_index::OrderedSet;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct Events {
     weights: RankTree<Point, Measure>,
-    keys: BTreeSet<Point>,
+    keys: OrderedSet<Point>,
 }
 
 impl Events {
@@ -36,11 +36,11 @@ impl Events {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Coverage {
     active: Events,
     muted: Events,
-    pub(super) dots: BTreeSet<Order>,
+    pub(super) dots: OrderedSet<Order>,
 }
 
 impl Coverage {

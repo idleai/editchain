@@ -6,7 +6,7 @@ use editchain_core::provider::{
     CodexLifecycleEvent, CodexLifecycleEvidence, CodexSourceEvidence, CodexSpawnSignal,
     CodexThreadId, ProviderEvidence, ProviderFact,
 };
-use editchain_core::{NoteRelationship, Op, OpId, OpKind, ParentSet, Payload, Tags};
+use editchain_core::{NoteRelationship, Op, OpId, OpKind, ParentSet, Payload, ScopeRef, Tags};
 
 type SourceKey = (u64, u32);
 
@@ -71,8 +71,47 @@ pub(super) fn resolve(ops: &[Op]) -> ProviderRelations {
         .map(|op| (op.id, op))
         .collect();
     let records: Vec<_> = ops.iter().filter_map(decode_evidence).collect();
+    resolve_records(&records, &raw)
+}
+
+/// Both offline and incremental resolution use the same endpoint rules. The
+/// latter supplies indexed prefix coverage instead of scanning historical raw ops.
+pub(crate) trait RawCorpus {
+    fn matches(&self, source: OpId, hash: [u8; 32]) -> bool;
+    fn complete(&self, meta: &CodexSourceEvidence, scope: ScopeRef) -> bool;
+}
+
+impl RawCorpus for BTreeMap<OpId, &Op> {
+    fn matches(&self, source: OpId, hash: [u8; 32]) -> bool {
+        self.get(&source).is_some_and(
+            |op| matches!(&op.kind, OpKind::Import(import) if import.raw_hash == Some(hash)),
+        )
+    }
+
+    fn complete(&self, meta: &CodexSourceEvidence, scope: ScopeRef) -> bool {
+        let present: Vec<_> = self
+            .range(
+                meta.first..=OpId {
+                    seq: u64::MAX,
+                    ..meta.last
+                },
+            )
+            .filter(|(id, _)| source_key(**id) == source_key(meta.first))
+            .collect();
+        u64::try_from(present.len()).ok() == Some(meta.last.seq >> 16)
+            && present.last().map(|(id, _)| **id) == Some(meta.last)
+            && present
+                .iter()
+                .all(|(id, raw)| id.seq.trailing_zeros() >= 16 && raw.scope == scope)
+    }
+}
+
+pub(crate) fn resolve_records(
+    records: &[EvidenceRecord<'_>],
+    raw: &impl RawCorpus,
+) -> ProviderRelations {
     let mut prefixes: BTreeMap<SourceKey, Vec<&EvidenceRecord<'_>>> = BTreeMap::new();
-    for record in &records {
+    for record in records {
         if matches!(record.payload.fact, ProviderFact::CodexSource(_)) {
             prefixes
                 .entry(source_key(record.payload.source))
@@ -87,7 +126,7 @@ pub(super) fn resolve(ops: &[Op]) -> ProviderRelations {
     let mut blocked = BTreeSet::new();
     let mut sources = Vec::new();
     for prefixes in prefixes.values() {
-        if let Some(source) = select_source(prefixes, &raw) {
+        if let Some(source) = select_source(prefixes, raw) {
             sources.push(source);
         } else {
             for record in prefixes {
@@ -104,7 +143,7 @@ pub(super) fn resolve(ops: &[Op]) -> ProviderRelations {
                 return None;
             };
             let source = record.payload.source;
-            (valid_occurrence(record, &raw)
+            (valid_occurrence(record, raw)
                 && sources.iter().any(|candidate| {
                     source_key(candidate.meta.first) == source_key(source)
                         && candidate.meta.thread == meta.thread
@@ -147,15 +186,13 @@ fn source_key(id: OpId) -> SourceKey {
     (id.node.0, id.boot)
 }
 
-fn valid_occurrence(record: &EvidenceRecord<'_>, raw: &BTreeMap<OpId, &Op>) -> bool {
-    raw.get(&record.payload.source).is_some_and(|op| {
-        matches!(&op.kind, OpKind::Import(import) if import.raw_hash == Some(record.payload.raw_hash))
-    })
+fn valid_occurrence(record: &EvidenceRecord<'_>, raw: &impl RawCorpus) -> bool {
+    raw.matches(record.payload.source, record.payload.raw_hash)
 }
 
 fn select_source<'a>(
     prefixes: &[&'a EvidenceRecord<'_>],
-    raw: &BTreeMap<OpId, &Op>,
+    raw: &impl RawCorpus,
 ) -> Option<Source<'a>> {
     let latest = prefixes
         .iter()
@@ -182,23 +219,9 @@ fn select_source<'a>(
     {
         return None;
     }
-    let present: Vec<_> = raw
-        .range(
-            meta.first..=OpId {
-                seq: u64::MAX,
-                ..meta.last
-            },
-        )
-        .filter(|(id, _)| source_key(**id) == source_key(meta.first))
-        .collect();
     // A missing/conflicted record or a partially appended later prefix cannot
     // turn an older source extent into an apparently current child terminal.
-    if u64::try_from(present.len()).ok()? != meta.last.seq >> 16
-        || present.last().map(|(id, _)| **id) != Some(meta.last)
-        || present
-            .iter()
-            .any(|(id, raw)| id.seq.trailing_zeros() < 16 || raw.scope != first.op.scope)
-    {
+    if !raw.complete(meta, first.op.scope) {
         return None;
     }
     Some(Source {

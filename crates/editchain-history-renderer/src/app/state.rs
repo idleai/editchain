@@ -38,6 +38,8 @@ mod live;
 #[cfg(test)]
 #[path = "live_tests.rs"]
 mod live_tests;
+#[path = "remote.rs"]
+mod remote;
 
 /// Rows fetched per request (`PAGE`).
 pub(crate) const PAGE: i64 = 500;
@@ -187,6 +189,7 @@ pub(crate) struct HistoryAppState {
     pub(super) selection: SelectionState,
     pub(super) find: FindSession,
     pub(super) live: Option<live::LiveUpdate>,
+    pub(super) remote: Option<remote::Remote>,
     pub(super) expanded_keys: std::collections::BTreeSet<String>,
 }
 
@@ -210,6 +213,7 @@ impl Default for HistoryAppState {
             selection: SelectionState::default(),
             find: FindSession::default(),
             live: None,
+            remote: None,
             expanded_keys: std::collections::BTreeSet::new(),
         }
     }
@@ -220,6 +224,7 @@ impl HistoryAppState {
 
     fn clear_expansion_state(&mut self) {
         self.expansion = None;
+        self.remote = None;
         self.expanded_keys.clear();
     }
 
@@ -281,15 +286,65 @@ impl HistoryAppState {
     /// full desired-window rebuild (`reanchorTo(desiredVisibleRange())` plus
     /// `ensureFilled()`), so every newly revealed sub-op slot fills the
     /// viewport instead of only the pre-expansion slice.
+    pub(crate) fn is_task_summary(&self, abs: i64) -> bool {
+        self.cache
+            .get_by_index(abs)
+            .and_then(|row| row.source.task_group.as_ref())
+            .is_some_and(|task| {
+                task.expanded.map_or_else(
+                    || self.row_context(abs, false).task.folded,
+                    |_| task.summarized,
+                )
+            })
+    }
+
     pub(crate) fn toggle_expanded_ui(
         &mut self,
         abs_parent_row: i64,
         viewport: &Viewport,
         step: &mut Step,
     ) {
+        if self.is_task_summary(abs_parent_row) {
+            self.toggle_task_ui(abs_parent_row, viewport, step);
+            return;
+        }
+        if self.remote.is_some() {
+            if let Some(row) = self.cache.get_by_index(abs_parent_row) {
+                step.sends.push(Send::ToggleDisclosure {
+                    task: false,
+                    key: row.continuity_key().to_owned(),
+                });
+            }
+            return;
+        }
         if !self.toggle_expanded(abs_parent_row) {
             return;
         }
+        self.refresh_disclosure(viewport, step);
+    }
+
+    pub(crate) fn toggle_task_ui(&mut self, abs: i64, viewport: &Viewport, step: &mut Step) {
+        if self.remote.is_some() {
+            if let Some(row) = self.cache.get_by_index(abs) {
+                step.sends.push(Send::ToggleDisclosure {
+                    key: row.continuity_key().to_owned(),
+                    task: true,
+                });
+            }
+            return;
+        }
+        let changed = ExpandedRow::new(abs).is_some_and(|row| {
+            self.expansion
+                .as_mut()
+                .and_then(|index| index.live.as_mut())
+                .is_some_and(|live| live.toggle_task(row))
+        });
+        if changed {
+            self.refresh_disclosure(viewport, step);
+        }
+    }
+
+    fn refresh_disclosure(&mut self, viewport: &Viewport, step: &mut Step) {
         let (top, bottom) = self.desired_visible_range(viewport);
         // Reanchor replaces the DOM with exactly this visible range. Keep the
         // reducer's rendered-window bounds in lockstep so the next sync does
@@ -748,6 +803,12 @@ impl HistoryAppState {
 
     /// Whether an arbitrary expandable row is expanded.
     pub(crate) fn is_row_expanded(&self, abs: i64) -> bool {
+        if self.remote.is_some() {
+            return self
+                .cache
+                .get_by_index(abs)
+                .is_some_and(|row| row.source.native_expanded == Some(true));
+        }
         ExpandedRow::new(abs).is_some_and(|row| {
             self.expansion
                 .as_ref()
@@ -814,6 +875,20 @@ impl HistoryAppState {
             selected_key: self.selected_key().map(str::to_owned),
             find_current,
             expanded,
+            task: super::rows::TaskView {
+                folded: ExpandedRow::new(abs_index).is_some_and(|row| {
+                    self.expansion
+                        .as_ref()
+                        .and_then(|index| index.live.as_ref())
+                        .is_some_and(|live| live.task_folded(row))
+                }),
+                expanded: ExpandedRow::new(abs_index).is_some_and(|row| {
+                    self.expansion
+                        .as_ref()
+                        .and_then(|index| index.live.as_ref())
+                        .is_some_and(|live| live.task_expanded(row))
+                }),
+            },
             roving_abs: (self.roving_abs() >= 0).then_some(self.roving_abs()),
         }
     }
@@ -1224,7 +1299,19 @@ impl HistoryAppState {
                 self.announced_initial_load = false;
                 self.clear_expansion_state();
                 if let Some(baseline) = &opened.live {
-                    match ExpansionIndex::from_live(baseline) {
+                    let index = if baseline.paged {
+                        self.open_remote(baseline).and_then(|()| {
+                            self.expansion.clone().ok_or_else(|| {
+                                ServiceError::new(
+                                    ErrorCode::InvalidInput,
+                                    "Native paging index is missing.",
+                                )
+                            })
+                        })
+                    } else {
+                        ExpansionIndex::from_live(baseline)
+                    };
+                    match index {
                         Ok(index) => self.expansion = Some(index),
                         Err(error) => {
                             self.fail_snapshot(step, &error.message);
@@ -1246,6 +1333,10 @@ impl HistoryAppState {
                 self.total = Some(nodes);
                 if nodes == 0 {
                     self.phase = SnapshotPhase::LayoutReady;
+                    step.sends.push(Send::LiveSettled {
+                        snapshot_id: self.snapshot_id.as_str().to_owned(),
+                        error: None,
+                    });
                     Self::show_view_message(step, "No history found in this workspace", false);
                     return;
                 }
@@ -1354,6 +1445,9 @@ impl HistoryAppState {
         match host::unwrap(body) {
             Unwrapped::Err(error) => self.fail_response(&req.body, &error, step),
             Unwrapped::Ok(value) => match &req.body {
+                RequestBody::ToggleLive(_) => {
+                    self.handle_delta(Some(serde_json::json!({ "Ok": value })), viewport, step);
+                }
                 RequestBody::LocateRows(_) => self.handle_live_locations(value, step),
                 RequestBody::GetWindow(request) => match host::decode::<HistoryWindow>(value) {
                     Ok(window) => {
@@ -1370,7 +1464,11 @@ impl HistoryAppState {
                 RequestBody::FindInHistory(_) => {
                     match host::decode::<FindInHistoryResponse>(value) {
                         Ok(found) => {
-                            if let Err(error) =
+                            if found.live.is_some() && self.remote.is_some() {
+                                if let Err(error) = self.apply_remote_find(found, viewport, step) {
+                                    self.fail_response(&req.body, &error, step);
+                                }
+                            } else if let Err(error) =
                                 self.check_response_snapshot(&req.body, &found.snapshot_id)
                             {
                                 self.fail_response(&req.body, &error, step);
@@ -1383,6 +1481,7 @@ impl HistoryAppState {
                 }
                 RequestBody::Open(_)
                 | RequestBody::OpenLive(_)
+                | RequestBody::OpenLivePaged(_)
                 | RequestBody::SyncLive(_)
                 | RequestBody::Refresh(_)
                 | RequestBody::GetNodeDetails(_)
@@ -1642,6 +1741,10 @@ impl HistoryAppState {
         let total = self.total.unwrap_or(0);
         if !self.announced_initial_load && total > 0 {
             self.announced_initial_load = true;
+            step.sends.push(Send::LiveSettled {
+                snapshot_id: self.snapshot_id.as_str().to_owned(),
+                error: None,
+            });
             Self::announce(
                 &format!("Loaded {} history rows", self.visible_total()),
                 step,

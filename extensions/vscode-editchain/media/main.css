@@ -1742,3 +1742,17 @@ body {
 /* Native task headers use the same row height and fixed graph lane pitch. */
 .row-task-group .summary { font-weight: 600; }
 .row-task-group { border-top-color: var(--ec-hairline-strong); }
+
+/* Task disclosure belongs to the physical row; item details keep their own control. */
+.task-chevron {
+  border: 1px solid var(--vscode-widget-border, #354052);
+  border-radius: 3px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  padding: 1px 5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.task-chevron:hover { background: var(--vscode-toolbar-hoverBackground); }
+.task-chevron:focus-visible { outline: 1px solid var(--vscode-focusBorder); }

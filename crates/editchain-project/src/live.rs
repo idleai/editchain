@@ -8,15 +8,23 @@ use crate::{materialization::selected_codex, provider::decode_evidence, CodexLog
 use editchain_core::provider::{CodexDerivationEvidence, CodexLogicalChange, ProviderFact};
 use editchain_core::{Op, OpId, OpKind};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
+
+use editchain_index::{Map, OrderedMap, OrderedSet};
+
+mod neighbors;
+use neighbors::Neighbors;
+/// Incremental provider spawn and completion relationships.
+pub mod topology;
 
 type Stream = (u64, u32);
 type Turn = (Stream, String);
 type Item = (Turn, String);
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Coverage {
-    raw: BTreeSet<u64>,
-    ready: BTreeSet<u64>,
+    raw: OrderedSet<u64>,
+    ready: OrderedSet<u64>,
 }
 
 impl Coverage {
@@ -28,7 +36,7 @@ impl Coverage {
 }
 
 /// Content inputs for one independent, stable presentation block.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LiveRow {
     /// Stable presentation identity; physical operation IDs remain separate.
     pub key: String,
@@ -37,13 +45,13 @@ pub struct LiveRow {
     /// First occurrence of the current logical incarnation.
     pub incarnation: OpId,
     /// Only the operations required to present this block.
-    pub operations: Vec<Op>,
+    pub operations: Vec<Arc<Op>>,
     /// Native task membership, independent of a row's presentation scope.
     pub task: Option<TaskIdentity>,
 }
 
 /// A provider task incarnation. Rollback/reuse cannot inherit old disclosure.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TaskIdentity {
     /// Stable opaque identity within one captured source generation.
     pub key: String,
@@ -56,7 +64,7 @@ pub struct TaskIdentity {
 }
 
 /// Work counters used to detect accidental global rebuilds.
-#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+#[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct LiveProjectWork {
     /// Incoming canonical additions and retractions.
     pub admissions: usize,
@@ -69,8 +77,10 @@ pub struct LiveProjectWork {
 }
 
 /// Keyed changes; a key appears in at most one of the two lanes.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct LiveChanges {
+    /// Exact structural changes, including changes without a new content row.
+    pub relationships: topology::RelationChanges,
     /// Added or revised logical blocks.
     pub upserts: BTreeMap<String, LiveRow>,
     /// Retired block identities.
@@ -80,32 +90,47 @@ pub struct LiveChanges {
 }
 
 /// Retained current-item projection over canonically admitted operations.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct LiveProjection {
-    ops: HashMap<OpId, Op>,
-    owners: HashMap<OpId, Option<OpId>>,
-    children: HashMap<OpId, HashSet<OpId>>,
-    facts: HashMap<OpId, HashSet<OpId>>,
-    dependents: HashMap<OpId, HashSet<OpId>>,
-    selected: HashMap<OpId, CodexDerivationEvidence>,
-    coverage: HashMap<Stream, Coverage>,
-    items: HashMap<Item, BTreeMap<OpId, CodexLogicalItem>>,
-    turns: HashMap<Turn, HashSet<Item>>,
-    source_items: HashMap<Stream, HashSet<Item>>,
-    removals: HashMap<Turn, BTreeSet<OpId>>,
-    published: HashMap<Item, String>,
+    #[serde(default)]
+    topology: topology::Topology,
+    ops: Map<OpId, Arc<Op>>,
+    owners: Map<OpId, Option<OpId>>,
+    children: Map<OpId, Neighbors>,
+    facts: Map<OpId, Neighbors>,
+    dependents: Map<OpId, Neighbors>,
+    selected: Map<OpId, CodexDerivationEvidence>,
+    coverage: Map<Stream, Coverage>,
+    items: Map<Item, OrderedMap<OpId, CodexLogicalItem>>,
+    turns: Map<Turn, OrderedSet<Item>>,
+    source_items: Map<Stream, OrderedSet<Item>>,
+    removals: Map<Turn, OrderedSet<OpId>>,
+    published: Map<Item, String>,
 }
 
 impl LiveProjection {
     /// Apply admitted additions/retractions. Exact duplicates are filtered by
     /// canonical admission before this API. Only dependency closures are read.
     pub fn apply(&mut self, added: Vec<Op>, removed: &[OpId]) -> LiveChanges {
+        self.apply_shared(added.into_iter().map(Arc::new).collect(), removed)
+    }
+
+    /// Apply shared immutable operations from a retained canonical reader.
+    pub fn apply_shared(&mut self, added: Vec<Arc<Op>>, removed: &[OpId]) -> LiveChanges {
         let changed: HashSet<_> = added
             .iter()
             .map(|op| op.id)
             .chain(removed.iter().copied())
             .collect();
         let mut result = LiveChanges::default();
+        for id in &changed {
+            if let Some(op) = self.ops.get(id) {
+                self.topology.observe(op, false);
+            }
+        }
+        for op in &added {
+            self.topology.observe(op, true);
+        }
         result.work.admissions = changed.len();
         let mut sources = HashSet::new();
         let mut streams = HashMap::new();
@@ -172,13 +197,23 @@ impl LiveProjection {
             .values()
             .map(|row| row.operations.len())
             .sum();
+        result.relationships = self.topology.resolve(&self.ops);
         result
+    }
+
+    /// Prepare missing derived topology from retained operations, without replaying materialization.
+    pub fn prepare_relationships(&mut self) -> topology::RelationChanges {
+        self.topology = topology::Topology::default();
+        for op in self.ops.values() {
+            self.topology.observe(op, true);
+        }
+        self.topology.resolve(&self.ops)
     }
 
     /// Accepted immutable source lookup, also used by detail adapters.
     #[must_use]
     pub fn operation(&self, id: OpId) -> Option<&Op> {
-        self.ops.get(&id)
+        self.ops.get(&id).map(AsRef::as_ref)
     }
 
     /// Complete accepted occurrence proof, for adapters reading persisted metadata.
@@ -232,7 +267,7 @@ impl LiveProjection {
             return None;
         }
         let (source, item) = self.items.get(key)?.last_key_value()?;
-        let removed = self.removals.get(&key.0).and_then(BTreeSet::last);
+        let removed = self.removals.get(&key.0).and_then(OrderedSet::last);
         (removed.is_none_or(|removed| source > removed)).then_some(item)
     }
 
@@ -248,7 +283,7 @@ impl LiveProjection {
 
     fn index_op(
         &mut self,
-        op: Op,
+        op: Arc<Op>,
         sources: &mut HashSet<OpId>,
         streams: &mut HashMap<Stream, bool>,
     ) {
@@ -351,7 +386,7 @@ impl LiveProjection {
                 .get(&source)
                 .into_iter()
                 .flatten()
-                .filter_map(|id| self.ops.get(id)),
+                .filter_map(|id| self.ops.get(id).map(AsRef::as_ref)),
             &self.ops,
         );
         if next.as_ref() == self.selected.get(&source) {
@@ -469,7 +504,7 @@ impl LiveProjection {
         let boundary = self
             .removals
             .get(&key.0)
-            .and_then(BTreeSet::last)
+            .and_then(OrderedSet::last)
             .copied()
             .unwrap_or(OpId {
                 seq: 0,

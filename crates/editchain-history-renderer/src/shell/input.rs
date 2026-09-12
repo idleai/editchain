@@ -224,7 +224,8 @@ pub(super) fn on_row_click(event: &web_sys::Event) {
     let Some(abs) = closest_row_abs(&target) else {
         return; // header / handles / spacer are never row targets
     };
-    let chevron = target_inside(&target, ".subop-chevron");
+    let task = target_inside(&target, ".task-chevron");
+    let chevron = task || target_inside(&target, ".subop-chevron");
     let in_button = target_inside(&target, "button");
     if chevron {
         mouse.prevent_default();
@@ -235,7 +236,11 @@ pub(super) fn on_row_click(event: &web_sys::Event) {
     run_transition(|shell| {
         let viewport = shell.dom.viewport();
         let mut step = Step::new();
-        shell.row_select_and_toggle(abs, &viewport, &mut step);
+        if task {
+            shell.state.toggle_task_ui(abs, &viewport, &mut step);
+        } else {
+            shell.row_select_and_toggle(abs, &viewport, &mut step);
+        }
         shell.apply_step_ops(&step);
         TransitionOutput {
             sends: std::mem::take(&mut step.sends),
@@ -392,7 +397,7 @@ pub(super) fn on_row_keydown(event: &web_sys::KeyboardEvent) {
                     let Some(row) = row else {
                         return false;
                     };
-                    if !rows::has_sub_ops(row) {
+                    if !rows::has_sub_ops(row) && !shell.state.is_task_summary(abs) {
                         return false;
                     }
                     (key == "ArrowRight" && !expanded) || (key == "ArrowLeft" && expanded)
@@ -414,6 +419,7 @@ pub(super) fn on_row_keydown(event: &web_sys::KeyboardEvent) {
                         .cache
                         .get_by_index(abs)
                         .is_some_and(rows::has_sub_ops)
+                        || shell.state.is_task_summary(abs)
                 })
             });
             if expandable {

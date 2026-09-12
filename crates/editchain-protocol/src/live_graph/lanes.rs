@@ -1,18 +1,21 @@
 //! Stable lane identities and columns; new shared anchors use free columns.
 
 use super::{events::Coverage, is_git, LiveBlockMeta, Order};
-use std::collections::{BTreeMap, HashMap};
+use editchain_index::Map;
+use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub(super) enum Lane {
     Git,
     Spine(usize),
     Operation(usize),
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Lanes {
-    nodes: HashMap<String, Lane>,
+    nodes: Map<String, Lane>,
     git: Coverage,
     git_present: bool,
     spines: BTreeMap<usize, Coverage>,
@@ -25,7 +28,7 @@ impl Lanes {
     pub(super) fn bootstrap(
         &mut self,
         plan: &editchain_project::layout::LanePlan,
-        nodes: &HashMap<String, LiveBlockMeta>,
+        nodes: &Map<String, LiveBlockMeta>,
     ) {
         self.git_present = nodes.values().any(is_git);
         for index in 0..plan.spine_count {
@@ -81,7 +84,13 @@ impl Lanes {
         };
         collection.entry(index).or_default()
     }
-    pub(super) fn allocate(&mut self, spine: bool, start: &Order, end: &Order) -> Lane {
+    pub(super) fn allocate(
+        &mut self,
+        spine: bool,
+        start: &Order,
+        end: &Order,
+        avoid: Option<Lane>,
+    ) -> Lane {
         let collection = if spine {
             &mut self.spines
         } else {
@@ -89,7 +98,14 @@ impl Lanes {
         };
         let index = collection
             .iter()
-            .find_map(|(index, lane)| lane.available(start, end).then_some(*index))
+            .find_map(|(index, lane)| {
+                let identity = if spine {
+                    Lane::Spine(*index)
+                } else {
+                    Lane::Operation(*index)
+                };
+                (avoid != Some(identity) && lane.available(start, end)).then_some(*index)
+            })
             .unwrap_or(collection.len());
         let _: &mut Coverage = collection.entry(index).or_default();
         if spine {

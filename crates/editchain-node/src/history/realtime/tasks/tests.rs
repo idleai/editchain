@@ -1,5 +1,5 @@
 use super::*;
-use editchain_core::OpId;
+use editchain_core::{NodeId, OpId};
 use std::cmp::Reverse;
 
 fn task(turn: &str) -> TaskIdentity {
@@ -7,155 +7,149 @@ fn task(turn: &str) -> TaskIdentity {
         key: format!("thread:{turn}"),
         thread: "thread".into(),
         turn: turn.into(),
-        boundary: OpId::new(editchain_core::NodeId(1), 0, 0),
+        boundary: OpId::new(NodeId(1), 0, 0),
     }
 }
 
-fn put(runs: &mut runs::Runs, time: u64, turn: Option<&str>) {
-    let key = format!("item:{time}");
-    runs.put(key.clone(), (Reverse(time), key, 1), turn.map(task));
+fn put(runs: &mut runs::Runs, time: u64, turn: &str, parent: u64) {
+    let key = format!("{turn}:{time}");
+    runs.put(
+        key.clone(),
+        (Reverse(time), key, 1),
+        task(turn),
+        format!("{turn}:{parent}"),
+    );
 }
 
 #[test]
 fn append_and_revision_have_bounded_membership_work_at_any_task_size() {
     for size in [10, 1_000, 100_000] {
         let mut runs = runs::Runs::default();
-        for time in 0..size {
-            put(&mut runs, time, Some("a"));
+        for time in 1..=size {
+            put(&mut runs, time, "a", time - 1);
         }
         let original = runs.sections.keys().next().unwrap().clone();
         runs.dirty.clear();
         runs.membership.clear();
-        put(&mut runs, size, Some("a"));
+        put(&mut runs, size + 1, "a", size);
         assert_eq!(runs.sections.len(), 1);
         assert_eq!(
             runs.sections.get(&original).unwrap().members.len(),
-            usize::try_from(size).unwrap().saturating_add(1)
+            usize::try_from(size).unwrap() + 1
         );
         assert_eq!(runs.dirty.len(), 1);
         assert_eq!(runs.membership.len(), 1);
         assert_eq!(
-            runs.membership
-                .get(&format!("item:{size}"))
-                .unwrap()
-                .clone(),
-            Some(original.clone())
+            runs.section(&format!("a:{}", size + 1)),
+            Some(original.as_str())
         );
         runs.dirty.clear();
         runs.membership.clear();
-        put(&mut runs, size, Some("a"));
-        assert!(
-            runs.dirty.is_empty(),
-            "a content revision does not rebuild its header"
-        );
+        put(&mut runs, size + 1, "a", size);
+        assert!(runs.dirty.is_empty());
         assert_eq!(runs.membership.len(), 1);
-        assert_eq!(
-            runs.membership
-                .get(&format!("item:{size}"))
-                .unwrap()
-                .clone(),
-            Some(original)
-        );
     }
 }
 
 #[test]
-fn late_interleaving_splits_only_its_contiguous_section_without_reordering() {
+fn interleaved_tasks_keep_exact_paths_without_moving_members() {
     let mut runs = runs::Runs::default();
-    for time in [10, 20, 30, 40] {
-        put(&mut runs, time, Some("a"));
+    for (time, parent) in [(10, 0), (20, 10), (30, 20), (40, 30)] {
+        put(&mut runs, time, "a", parent);
     }
-    let original = runs.sections.keys().next().unwrap().clone();
-    runs.dirty.clear();
+    let original = runs.section("a:40").unwrap().to_owned();
     runs.membership.clear();
-    put(&mut runs, 25, Some("b"));
-    assert_eq!(runs.sections.len(), 3);
-    assert_eq!(
-        runs.sections
-            .get(&original)
-            .unwrap()
-            .members
-            .iter()
-            .map(|at| at.0 .0)
-            .collect::<Vec<_>>(),
-        [20, 10]
-    );
-    assert_eq!(
-        runs.membership.len(),
-        3,
-        "only the new item and split prefix move"
-    );
-    let newer = runs
-        .membership
-        .get("item:40")
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .clone();
-    assert_eq!(
-        runs.sections
-            .get(&newer)
-            .unwrap()
-            .members
-            .iter()
-            .map(|at| at.0 .0)
-            .collect::<Vec<_>>(),
-        [40, 30]
-    );
-    runs.remove("item:25");
-    put(&mut runs, 50, Some("a"));
-    assert_eq!(runs.membership.get("item:50").unwrap().clone(), Some(newer));
-    assert_eq!(
-        runs.sections.get(&original).unwrap().members.len(),
-        2,
-        "removing a barrier does not rename established sections"
-    );
+    put(&mut runs, 15, "b", 0);
+    put(&mut runs, 25, "b", 15);
+    assert_eq!(runs.sections.len(), 2);
+    assert_eq!(runs.membership.len(), 2);
+    assert_eq!(runs.sections.get(&original).unwrap().members.len(), 4);
+    assert_eq!(runs.section("a:40"), Some(original.as_str()));
 }
 
 #[test]
-fn ungrouped_records_and_rollback_incarnations_are_section_boundaries() {
+fn disconnected_members_and_task_incarnations_never_join() {
     let mut runs = runs::Runs::default();
-    put(&mut runs, 10, Some("a"));
-    put(&mut runs, 20, None);
-    put(&mut runs, 30, Some("a"));
-    assert_eq!(runs.sections.len(), 2);
+    put(&mut runs, 10, "a", 0);
+    put(&mut runs, 20, "a", 0);
+    assert_ne!(runs.section("a:10"), runs.section("a:20"));
     let mut restored = task("a");
     restored.key.push_str(":restored");
-    restored.boundary = OpId::new(editchain_core::NodeId(1), 0, 35);
+    restored.boundary.seq = 30;
     runs.put(
-        "item:40".into(),
-        (Reverse(40), "item:40".into(), 1),
-        Some(restored),
+        "a:30".into(),
+        (Reverse(30), "a:30".into(), 1),
+        restored,
+        "a:20".into(),
     );
-    assert_eq!(runs.sections.len(), 3);
+    assert_ne!(runs.section("a:30"), runs.section("a:20"));
 }
 
 #[test]
-fn splitting_after_an_older_backfill_cannot_reuse_the_original_section_key() {
+fn removed_interior_splits_and_an_exact_late_edge_can_rejoin() {
     let mut runs = runs::Runs::default();
-    put(&mut runs, 40, Some("a"));
-    let original = runs.sections.keys().next().unwrap().clone();
-    put(&mut runs, 10, Some("a"));
-    put(&mut runs, 25, Some("b"));
-    assert_eq!(runs.sections.len(), 3);
-    assert_eq!(
-        runs.sections
-            .values()
-            .map(|run| run.members.len())
-            .sum::<usize>(),
-        3
-    );
-    assert_eq!(
-        runs.sections
-            .get(&original)
-            .unwrap()
-            .members
-            .first()
-            .unwrap()
-            .1,
-        "item:10"
-    );
-    let newer = runs.membership.get("item:40").unwrap().as_ref().unwrap();
-    assert_ne!(newer, &original);
-    assert_eq!(runs.sections.get(newer).unwrap().members.len(), 1);
+    for (time, parent) in [(10, 0), (20, 10), (30, 20), (40, 30)] {
+        put(&mut runs, time, "a", parent);
+    }
+    runs.remove("a:30");
+    assert_ne!(runs.section("a:40"), runs.section("a:20"));
+    put(&mut runs, 40, "a", 20);
+    assert_eq!(runs.section("a:40"), runs.section("a:20"));
+}
+
+fn meta(key: &str, time: u64, parents: &[&str]) -> LiveBlockMeta {
+    serde_json::from_value(
+        serde_json::json!({"key":key, "node_key":key, "sort_time":time,
+        "parents":parents, "row_count":1, "spans":[]}),
+    )
+    .unwrap()
+}
+
+#[test]
+fn summaries_are_physical_and_late_forks_split_protected_attachments() {
+    let mut groups = Tasks::default();
+    let mut graph = editchain_protocol::live_graph::LiveGraph::default();
+    let mut inputs = HashMap::new();
+    let nodes = vec![
+        meta("root", 0, &[]),
+        meta("a", 1, &["root"]),
+        meta("b", 2, &["a"]),
+        meta("c", 3, &["b"]),
+        meta("d", 4, &["c"]),
+        meta("e", 5, &["d"]),
+    ];
+    for node in &nodes {
+        drop(inputs.insert(
+            node.key.clone(),
+            LiveRow {
+                key: node.key.clone(),
+                anchor: OpId::new(NodeId(1), 0, node.sort_time),
+                incarnation: OpId::new(NodeId(1), 0, node.sort_time),
+                operations: Vec::new(),
+                task: Some(task("a")),
+            },
+        ));
+    }
+    graph.edit(&[], &nodes);
+    let changes = groups.update(&[], &nodes, &inputs, &graph);
+    let summary = changes.summaries.get("e").unwrap().as_ref().unwrap();
+    assert_eq!(summary.member_count, 5);
+    assert_eq!(summary.anchor, "e");
+    assert_eq!(changes.summaries.len(), 1);
+    assert!(!changes.membership.contains_key("root"));
+    let fork = meta("subagent", 6, &["c"]);
+    graph.edit(&[], std::slice::from_ref(&fork));
+    let changes = groups.update(&[], &[fork], &inputs, &graph);
+    assert!(!graph.foldable("c"));
+    assert!(groups.runs.section("c").is_none());
+    assert_ne!(groups.runs.section("a"), groups.runs.section("e"));
+    for (anchor, summary) in changes
+        .summaries
+        .iter()
+        .filter_map(|(key, summary)| summary.as_ref().map(|summary| (key, summary)))
+    {
+        assert_eq!(anchor, &summary.anchor);
+        assert!(nodes.iter().any(|node| &node.key == anchor));
+        assert!(summary.member_count > 1);
+    }
 }

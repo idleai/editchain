@@ -250,7 +250,7 @@ impl ShellData {
             .cache
             .get_by_index(abs)
             .is_some_and(rows::has_sub_ops);
-        if expandable {
+        if expandable || self.state.is_task_summary(abs) {
             self.state.toggle_expanded_ui(abs, viewport, step);
         }
     }
