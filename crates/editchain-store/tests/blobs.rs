@@ -1,5 +1,6 @@
 //! Contracts shared by import writers and history readers.
 
+use editchain_index as _;
 use std::error::Error;
 use std::fmt::Debug;
 use std::fs;

@@ -194,6 +194,16 @@
       return largeHistory();
     },
 
+    liveGraph() {
+      const rows = Array.from({ length: 40 }, (_, index) => ({
+        ...opRow('live:row:' + index, 'Retained operation ' + index, {
+          ts: NOW - index * 1000, parents: index < 39 ? ['live:row:' + (index + 1)] : [],
+        }),
+        lane: 0, above: index > 0 ? [0] : [], below: index < 39 ? [0] : [], transitions: [],
+      }));
+      return { live: true, rows, max_lane: 0 };
+    },
+
     // A long virtual window with three explicit group runs at KNOWN absolute
     // boundaries (rows 0..99 = repo:a, 100..199 = repo:b, 200+ = session:s1).
     // The deterministic prepend regression scrolls down past the boundary and

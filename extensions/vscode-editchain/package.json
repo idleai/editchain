@@ -1,7 +1,7 @@
 {
   "name": "editchain-history",
   "displayName": "EditChain History",
-  "description": "Unified engineering history explorer — EditChain operations overlaid with live Git history.",
+  "description": "Unified engineering history explorer \u2014 EditChain operations overlaid with live Git history.",
   "version": "0.1.0",
   "publisher": "ambientlight",
   "license": "MIT",
@@ -16,7 +16,8 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:editchain-history.open"
+    "onCommand:editchain-history.open",
+    "onCommand:editchain-history.startLive"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -34,6 +35,14 @@
       {
         "command": "editchain-history.open",
         "title": "EditChain: Open History Explorer"
+      },
+      {
+        "command": "editchain-history.startLive",
+        "title": "EditChain: Resume Live History"
+      },
+      {
+        "command": "editchain-history.stopLive",
+        "title": "EditChain: Pause Live History"
       }
     ],
     "configuration": {
@@ -48,6 +57,26 @@
           "type": "string",
           "default": ".editchain",
           "description": "Path to the EditChain directory relative to the workspace root."
+        },
+        "editchain-history.live.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Keep history up to date automatically while the panel is open, following Codex sessions and Git refs. Disable to open static history instead."
+        },
+        "editchain-history.live.sessionsPath": {
+          "type": "string",
+          "default": "",
+          "description": "Codex sessions directory. Defaults to CODEX_HOME/sessions or ~/.codex/sessions. Relative paths use the workspace root."
+        },
+        "editchain-history.live.cliPath": {
+          "type": "string",
+          "default": "",
+          "description": "Compatibility setting for the earlier live prototype. Retained live mode imports through the history service and does not use this binary."
+        },
+        "editchain-history.live.codexHelperPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to codex-session-exporter. Defaults to the workspace helper release build, then PATH."
         }
       }
     }
@@ -63,7 +92,8 @@
     "build:renderer": "bash scripts/build-history-renderer.sh",
     "build:gpu": "npm run build:renderer",
     "test:harness": "node --test test/harness/*.test.js",
-    "test:rust-smoke": "node --test --test-reporter=tap test/harness/rustSmoke.test.js"
+    "test:rust-smoke": "node --test --test-reporter=tap test/harness/rustSmoke.test.js",
+    "ui:vscode:live": "xvfb-run -a npx wdio run ./test/vscode/wdio.live.conf.ts"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

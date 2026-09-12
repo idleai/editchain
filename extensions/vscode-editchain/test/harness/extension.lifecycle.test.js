@@ -29,7 +29,41 @@ after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // Let any queued promise microtasks (and one macrotask) run.
 const flush = () => sleep(0);
-const openBody = (workspace) => ({ Ok: { protocol_version: 2, snapshot_id: workspace, workspace } });
+const openBody = (workspace) => ({ Ok: { protocol_version: 2, snapshot_id: workspace, workspace, live_updates: true } });
+const liveBody = (snapshot, revision = 0) => ({ Ok: { ...openBody(snapshot).Ok,
+  live: { paged: true, epoch: 'epoch', revision, total: 0, blocks: [] } } });
+const deltaBody = (revision) => ({ Ok: { epoch: 'epoch', revision, work: {}, deltas: [{
+  base_revision: revision - 1, revision, snapshot_id: `epoch:${revision}`, total: 0, visible_total: 0,
+  removed: [], upserts: [],
+}] } });
+
+test('viewport reports coalesce behind a live publication and obsolete snapshots are dropped', async () => {
+  const env = loadExtension();
+  env.open();
+  const panel = env.panels[0];
+  await rendererReady(panel);
+  env.client.openRequests[0].resolve(liveBody('epoch:0'));
+  await flush();
+  env.client.nextResponse = deltaBody(1);
+  await panel.handlers.message({ type: 'toggleDisclosure', key: 'item:1', task: true });
+  await flush();
+  const viewport = (snapshot, key) => ({ type: 'liveViewport', viewport: {
+    snapshot_id: snapshot, keys: [key], capacity: 24, at_head: false,
+  } });
+  await panel.handlers.message(viewport('epoch:1', 'item:10'));
+  await panel.handlers.message(viewport('epoch:1', 'item:20'));
+  await panel.handlers.message(viewport('epoch:1', 'item:30'));
+  assert.equal(env.client.requests.filter(request => request.body.ViewportLive).length, 0);
+  env.client.nextResponse = { Ok: { epoch: 'epoch', revision: 1, deltas: [], work: {} } };
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'epoch:1', error: null });
+  await flush();
+  const reports = env.client.requests.filter(request => request.body.ViewportLive);
+  assert.equal(reports.length, 1);
+  assert.deepEqual(reports[0].body.ViewportLive.keys, ['item:30']);
+  await panel.handlers.message(viewport('epoch:0', 'item:old'));
+  await flush();
+  assert.equal(env.client.requests.filter(request => request.body.ViewportLive).length, 1);
+});
 
 const uri = (s) => ({ toString: () => s, fsPath: s.replace(/^file:\/\//, '') });
 
@@ -37,6 +71,7 @@ const uri = (s) => ({ toString: () => s, fsPath: s.replace(/^file:\/\//, '') });
 // them through the normal resolution hook.
 const fakeVscodePath = path.join(tmpDir, 'fake-vscode.js');
 const fakeStdioPath = path.join(tmpDir, 'fake-stdio-client.js');
+const fakeLivePath = path.join(tmpDir, 'fake-live-host.js');
 
 function writeFakeVscode() {
   fs.writeFileSync(
@@ -46,9 +81,13 @@ const providers = [];
 const executedCommands = [];
 const warnings = [];
 const errors = [];
+const outputLines = [];
+const outputShows = [];
 module.exports = {
   __esModule: true,
   workspace: {
+    onDidChangeWorkspaceFolders: () => ({ dispose() {} }),
+    onDidChangeConfiguration: () => ({ dispose() {} }),
     workspaceFolders: [{ uri: (${uri.toString()})('/ws') }],
     getConfiguration: () => ({ get: (_key, def) => def }),
     registerTextDocumentContentProvider: (scheme, provider) => {
@@ -58,7 +97,7 @@ module.exports = {
     openTextDocument: async () => ({}),
   },
   window: {
-    createOutputChannel: () => ({ appendLine() {} }),
+    createOutputChannel: () => ({ appendLine(line) { outputLines.push(line); }, show(preserveFocus) { outputShows.push(preserveFocus); } }),
     createStatusBarItem: () => ({ text: '', command: null, tooltip: null, show() {}, hide() {}, dispose() {} }),
     createWebviewPanel: () => { throw new Error('createWebviewPanel must be intercepted by the test harness'); },
     showTextDocument: async () => ({}),
@@ -81,6 +120,8 @@ module.exports = {
   __executedCommands: executedCommands,
   __warnings: warnings,
   __errors: errors,
+  __outputLines: outputLines,
+  __outputShows: outputShows,
 };
 `
   );
@@ -108,7 +149,7 @@ class FakeStdioClient {
   request(body, opts) {
     const rec = { body, opts, resolve: null, promise: null };
     rec.promise = new Promise((resolve) => { rec.resolve = resolve; });
-    if (body && (body.Open || body.Refresh)) {
+    if (body && (body.Open || body.Refresh || body.OpenLivePaged)) {
       this.openRequests.push(rec);
     } else {
       this.requests.push(rec);
@@ -158,13 +199,20 @@ async function rendererReady(panel, instanceId = 'renderer-' + panel.index) {
 // Install stubs, load the compiled extension fresh (module globals reset per
 // test), and activate it against a fake context. Returns the pieces the tests
 // drive: the open command, the fake panels, the fake client, and status item.
-function loadExtension() {
+// Snapshot lifecycle cases opt out explicitly; pass {} to exercise the shipped defaults.
+function loadExtension(settings = { 'live.enabled': false }) {
   writeFakeVscode();
   writeFakeStdioClient();
+  fs.writeFileSync(fakeLivePath, `const instances = [];
+exports.createLiveSync = (_service, publish, status) => {
+  const live = { publish, status, wakes: 0, disposed: false, wake() { this.wakes++; status('Scanning Codex sessions…'); }, dispose() { this.disposed = true; } };
+  instances.push(live); return live;
+}; exports.instances = instances;`);
   const origResolveFilename = Module._resolveFilename;
   Module._resolveFilename = function (request, ...rest) {
     if (request === 'vscode') return fakeVscodePath;
     if (request === './stdioClient') return fakeStdioPath;
+    if (request === './liveHost') return fakeLivePath;
     return origResolveFilename.call(this, request, ...rest);
   };
 
@@ -177,7 +225,9 @@ function loadExtension() {
   delete require.cache[extPath];
   delete require.cache[fakeVscodePath];
   delete require.cache[fakeStdioPath];
+  delete require.cache[fakeLivePath];
   const fakeVscode = require(fakeVscodePath);
+  fakeVscode.workspace.getConfiguration = () => ({ get: (key, fallback) => settings[key] ?? fallback });
   fakeVscode.window.createWebviewPanel = (type, title, column, options) => {
     const panel = fakePanel(panels.length, registeredCommands);
     panel.options = options;
@@ -197,6 +247,9 @@ function loadExtension() {
 
   return {
     open: registeredCommands['editchain-history.open'],
+    startLive: registeredCommands['editchain-history.startLive'],
+    stopLive: registeredCommands['editchain-history.stopLive'],
+    live: require(fakeLivePath).instances,
     panels,
     client,
     statusItem,
@@ -249,6 +302,128 @@ test('late Open response from a superseded panel is dropped', async () => {
   assert.deepEqual(panelB.webview.messages[3], { id: 'ready' });
   await rendererReady(panelB, 'renderer-B-recreated');
   assert.equal(panelB.webview.messages.length, 4, 'same renderer identity is not replayed twice');
+});
+
+test('history opens live by default, waits for delta acknowledgement, and resumes once without Open', async t => {
+  const env = loadExtension({});
+  env.vscode.workspace.isTrusted = true;
+  env.open();
+  assert.deepEqual(env.vscode.__outputShows, [], 'automatic collection leaves the history panel in focus');
+  const panel = env.panels[0];
+  t.after(() => panel.handlers.dispose());
+  await rendererReady(panel);
+  assert.ok(env.client.openRequests[0].body.OpenLivePaged);
+  env.client.openRequests[0].resolve(liveBody('base'));
+  await flush();
+  assert.equal(env.live.length, 0, 'capture waits for the saved first viewport');
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'base', error: null });
+  assert.equal(env.live.length, 1);
+  env.live[0].status('Importing Codex changes (32/65 queued)…');
+  await panel.handlers.message({ type: 'status', loaded: 5, total: 90 });
+  assert.match(env.statusItem.text, /5 \/ 90 nodes.*32\/65 queued/, 'row-count updates retain import progress');
+  let completed = false;
+  env.client.nextResponse = deltaBody(1);
+  const publish = env.live[0].publish().then(() => { completed = true; });
+  await flush();
+  assert.equal(panel.webview.messages.at(-1).id, 'delta');
+  assert.deepEqual(env.client.requests.at(-1).body.SyncLive, { epoch: 'epoch', after_revision: 0, codex: null });
+  env.stopLive();
+  assert.match(env.statusItem.text, /Live updates paused/);
+  env.startLive();
+  assert.deepEqual(env.vscode.__outputShows, [true], 'explicit resume reveals diagnostics without taking focus');
+  assert.equal(env.live.length, 1, 'restart waits for the in-flight delta');
+  assert.equal(completed, false, 'service delta alone does not complete publication');
+  await panel.handlers.message({ type: 'refreshHistory' });
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'obsolete', error: null });
+  assert.equal(env.client.openRequests.length, 1, 'manual refresh cannot overlap publication');
+  assert.equal(completed, false);
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'epoch:1', error: null });
+  await publish;
+  assert.equal(env.live[0].disposed, true);
+  assert.equal(env.live.length, 2, 'the pending restart creates exactly one collector');
+  assert.equal(env.live[1].wakes, 1);
+  env.client.nextResponse = { Ok: { epoch: 'epoch', revision: 1, deltas: [], work: {} } };
+  const count = panel.webview.messages.length;
+  await env.live[1].publish();
+  assert.equal(env.client.requests.at(-1).body.SyncLive.after_revision, 1);
+  assert.equal(panel.webview.messages.length, count, 'idle polling causes no renderer update');
+});
+
+test('native disclosure and search publish serially behind the viewport acknowledgement', async t => {
+  const env = loadExtension({});
+  env.vscode.workspace.isTrusted = true;
+  env.open();
+  const panel = env.panels[0];
+  t.after(() => panel.handlers.dispose());
+  await rendererReady(panel);
+  env.client.openRequests[0].resolve(liveBody('base'));
+  await flush();
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'base', error: null });
+  env.client.nextResponse = deltaBody(1);
+  const publication = env.live[0].publish();
+  await flush();
+  const beforeToggle = env.client.requests.length;
+  await panel.handlers.message({ type: 'toggleDisclosure', key: 'item:4', task: true });
+  assert.equal(env.client.requests.length, beforeToggle, 'toggle waits for the in-flight viewport');
+  env.client.nextResponse = deltaBody(2);
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'epoch:1', error: null });
+  await publication;
+  await flush();
+  assert.deepEqual(env.client.requests.at(-1).body, { ToggleLive: { snapshot_id: 'epoch:1', key: 'item:4', task: true } });
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'epoch:2', error: null });
+  await flush();
+  env.client.nextResponse = { Ok: { snapshot_id: 'epoch:3', matches: [], more: false, live: deltaBody(3).Ok } };
+  const search = panel.handlers.message({ id: 90, body: { FindInHistory: { snapshot_id: 'epoch:2', query: 'needle', top_k: 50 } } });
+  await flush();
+  assert.equal(panel.webview.messages.at(-1).id, 'delta', 'disclosure is published even if the original search is cancelled');
+  assert.equal(panel.webview.messages.some(message => message.id === 90), false);
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'epoch:3', error: null });
+  await search;
+  env.client.nextResponse = { Ok: { snapshot_id: 'epoch:3', matches: [{ row: 0, node_key: 'needle' }], more: false } };
+  await panel.handlers.message({ id: 91, body: { FindInHistory: { snapshot_id: 'epoch:3', query: 'needle', top_k: 50 } } });
+  assert.equal(panel.webview.messages.at(-1).id, 91, 'the repeated query uses the published coordinates');
+  env.client.nextResponse = deltaBody(4);
+  await panel.handlers.message({ type: 'toggleDisclosure', key: 'item:4', task: false });
+  await flush();
+  assert.deepEqual(env.client.requests.at(-1).body, { ToggleLive: { snapshot_id: 'epoch:3', key: 'item:4', task: false } });
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'epoch:4', error: null });
+});
+
+test('live startup explains missing workspace and trust requirements immediately', t => {
+  for (const workspaceMissing of [true, false]) {
+    const env = loadExtension();
+    if (workspaceMissing) env.vscode.workspace.workspaceFolders = [];
+    env.startLive();
+    t.after(() => env.panels[0].handlers.dispose());
+    assert.equal(env.live.length, 0);
+    assert.match(env.statusItem.text, workspaceMissing ? /Open a workspace folder/ : /Workspace trust/);
+  }
+});
+
+test('renderer recreation bootstraps a fresh live baseline, and old services fail visibly', async t => {
+  const env = loadExtension();
+  env.vscode.workspace.isTrusted = true;
+  env.startLive();
+  const panel = env.panels[0];
+  t.after(() => panel.handlers.dispose());
+  await rendererReady(panel);
+  env.client.openRequests[0].resolve(liveBody('base'));
+  await flush();
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'base', error: null });
+  await rendererReady(panel, 'recreated');
+  assert.equal(env.live[0].disposed, true);
+  assert.ok(env.client.openRequests[1].body.OpenLivePaged);
+  env.client.openRequests[1].resolve(liveBody('fresh'));
+  await flush();
+  assert.deepEqual(panel.webview.messages.at(-2), { id: 'open', body: liveBody('fresh') });
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'fresh', error: null });
+  assert.equal(env.live.length, 2);
+  env.client.nextResponse = { Error: { code: 'stale_snapshot', message: 'bootstrap' } };
+  const unsupported = env.live[1].publish();
+  await flush();
+  env.client.openRequests[2].resolve({ Ok: { protocol_version: 2, snapshot_id: 'older-service' } });
+  await unsupported;
+  assert.match(panel.webview.messages.at(-1).body.Error, /Rebuild/);
 });
 
 test('stale dispose and stale error must not clear a newer panel state', async () => {

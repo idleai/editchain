@@ -21,6 +21,9 @@ pub(crate) struct HostMessage {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Id {
     Open,
+    Updating,
+    Update,
+    Delta,
     Ready,
     Reveal,
     Request(u64),
@@ -39,6 +42,9 @@ impl HostMessage {
         }
         let id = match value.get("id") {
             Some(Value::String(s)) if s == "open" => Id::Open,
+            Some(Value::String(s)) if s == "updating" => Id::Updating,
+            Some(Value::String(s)) if s == "update" => Id::Update,
+            Some(Value::String(s)) if s == "delta" => Id::Delta,
             Some(Value::String(s)) if s == "ready" => Id::Ready,
             Some(Value::String(s)) if s == "reveal" => Id::Reveal,
             Some(Value::String(s)) => Id::Unknown(s.clone()),
@@ -131,6 +137,15 @@ pub(crate) fn find_in_history(snapshot_id: &SnapshotId, query: &str, top_k: usiz
 /// against the acquired VS Code API; pure tests assert on them directly.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Send {
+    /// Actual painted identities; prefetched rows never count as exposure.
+    LiveViewport(editchain_protocol::ViewportLiveRequest),
+    /// Serialize native disclosure with live publication in the extension host.
+    ToggleDisclosure { key: String, task: bool },
+    /// Complete the host's publication barrier after the new viewport paints.
+    LiveSettled {
+        snapshot_id: String,
+        error: Option<String>,
+    },
     /// Ask the host to open current sources as a fresh snapshot.
     RefreshHistory,
     /// A correlated service request `{ id, body }`.

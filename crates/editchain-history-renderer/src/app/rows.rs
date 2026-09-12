@@ -49,6 +49,8 @@
 mod chrome;
 mod files;
 mod markdown;
+mod tasks;
+pub(crate) use tasks::{TaskDisclosure, TaskView};
 
 pub(crate) use chrome::{
     ActivityIcon, BundleKind, ContentHeading, SessionSummaryData, WorkUnitData,
@@ -81,6 +83,7 @@ pub(crate) struct RowContext {
     pub(crate) find_current: bool,
     /// Whether this row's descendant span is revealed.
     pub(crate) expanded: bool,
+    pub(crate) task: TaskView,
     /// The roving-tabindex row (`rovingAbs`); exactly one per window is 0.
     pub(crate) roving_abs: Option<i64>,
 }
@@ -108,6 +111,7 @@ pub(crate) struct RowIdentity {
     pub(crate) abs_index: i64,
     /// Stable wire identity (`data-key`; selection compares on it).
     pub(crate) node_key: String,
+    pub(crate) continuity_key: String,
     pub(crate) is_subop: bool,
     /// Presentation hierarchy depth (`0` top-level, `1` work member, `2`
     /// existing detail/bundle member nested beneath that work member).
@@ -538,6 +542,7 @@ pub(crate) struct RowSpec {
     pub(crate) state: StateFlags,
     /// Activity-column disclosure rendered immediately after the activity label.
     pub(crate) disclosure: Option<Disclosure>,
+    pub(crate) task_disclosure: Option<TaskDisclosure>,
     pub(crate) content_flags: ContentFlags,
     pub(crate) author_text: String,
     pub(crate) date_text: String,
@@ -579,6 +584,7 @@ impl Default for RowSpec {
             flags: RowFlags::default(),
             state: StateFlags::default(),
             disclosure: None,
+            task_disclosure: None,
             content_flags: ContentFlags::default(),
             author_text: String::new(),
             date_text: String::new(),
@@ -635,6 +641,9 @@ impl RowSpec {
 
     /// Build the full presentation model for one cached row value.
     pub(crate) fn from_row(row: &RowInput, context: &RowContext) -> RowSpec {
+        let task_disclosure = tasks::disclosure(row, context);
+        let presentation = tasks::presentation(row, task_disclosure.as_ref());
+        let row = presentation.as_ref();
         let is_subop = row.source.is_subop;
         let file_content = file_content(row);
         let is_file = file_content.is_some();
@@ -654,7 +663,9 @@ impl RowSpec {
         let is_execute_run = bundle_kind == Some(BundleKind::ExecuteRun);
         let is_plan_repeat = bundle_kind == Some(BundleKind::PlanRepeat);
         let semantic_tags = row_semantic_chrome(row, is_bundle, BadgeOptions::default());
-        let classification = if is_file {
+        let classification = if task_disclosure.as_ref().is_some_and(|task| task.folded) {
+            RowClassification::new("task", "activity_kind", "task")
+        } else if is_file {
             RowClassification::new("change", "activity_kind", "change")
         } else if is_session_summary {
             RowClassification::session_summary()
@@ -685,7 +696,8 @@ impl RowSpec {
             String::new()
         };
         let sub_op_count = row.source.sub_ops.len();
-        let has_subs = has_sub_ops(row);
+        let has_subs =
+            has_sub_ops(row) && !task_disclosure.as_ref().is_some_and(|task| task.folded);
         let expanded_state = has_subs && context.expanded;
         let expandable = has_subs;
         let child_label = if is_bundle {
@@ -746,6 +758,9 @@ impl RowSpec {
         // then add summary/session provenance that previously occupied several
         // different positions inside Content.
         let mut tags = semantic_tags;
+        if task_disclosure.is_some() {
+            tags.retain(|tag| tag.classes != "bundle-count");
+        }
         if let Some(header) = work_unit_header.as_ref().filter(|header| header.show_count) {
             tags.push(ChromeItem::new(
                 "work-unit-count",
@@ -909,6 +924,7 @@ impl RowSpec {
             identity: RowIdentity {
                 abs_index: context.abs_index,
                 node_key: node_key.clone(),
+                continuity_key: row.continuity_key().to_owned(),
                 is_subop,
                 hierarchy_depth: row.source.hierarchy_depth,
                 subop_kind: row.source.subop_kind.clone().unwrap_or_default(),
@@ -949,6 +965,7 @@ impl RowSpec {
                 expandable,
             },
             disclosure,
+            task_disclosure,
             content_flags: ContentFlags {
                 work_unit_block: has_boundary_header,
                 work_unit_title_only: work_unit_header
@@ -1035,6 +1052,9 @@ impl RowSpec {
         }
         if self.bundle.is_some() {
             classes.push_str(" row-activity-bundle");
+        }
+        if self.kind == "task" {
+            classes.push_str(" row-task-group");
         }
         if self.state.expandable {
             classes.push_str(" row-expandable");

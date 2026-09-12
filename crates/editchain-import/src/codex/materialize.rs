@@ -15,6 +15,7 @@ use super::normalize::{
     normalized_ops_for_turn, parse_raw_line_meta, raw_clock, NormalizeContext,
 };
 use super::projection::{CompactedLine, FinalItem, InterAgentLine, Projection, TurnMeta};
+use super::records::RecordBatch;
 use crate::ids::{derive_node_id, SourcePosition, SourceStream};
 use crate::sink::{emit_op, EmissionKind, OpSink};
 use crate::source_read::SourceReadPlan;
@@ -84,18 +85,38 @@ pub(super) fn emit_occurrences(
         .transpose()?;
     let lines = historical.as_deref().unwrap_or_else(|| plan.lines());
     let start = if replay { 0 } else { plan.start_seq() };
+    emit_batch(
+        projection,
+        &RecordBatch {
+            lines,
+            start,
+            checkpoint: plan.checkpoint(),
+            check: &|| plan.check_cancellation(),
+        },
+        context,
+        sink,
+    )
+}
+
+pub(super) fn emit_batch(
+    projection: &Projection,
+    batch: &RecordBatch<'_>,
+    context: &mut NormalizeContext<'_>,
+    sink: &mut dyn OpSink,
+) -> Result<crate::model::ImportReport, ImportError> {
     let mut records = RecordProjection::index(projection);
     let mut report = crate::model::ImportReport::default();
     let requested_thinking = context.include_thinking;
-    let retained_thinking = plan
-        .checkpoint()
+    let retained_thinking = batch
+        .checkpoint
         .materialization
         .as_ref()
         .filter(|checkpoint| checkpoint.includes_thinking)
         .map_or(0, |checkpoint| checkpoint.through);
-    for (index, line) in lines.iter().enumerate() {
-        plan.check_cancellation()?;
-        let ordinal = start
+    for (index, line) in batch.lines.iter().enumerate() {
+        batch.check_cancellation()?;
+        let ordinal = batch
+            .start
             .checked_add(u64::try_from(index).map_err(std::io::Error::other)?)
             .and_then(|value| value.checked_add(1))
             .ok_or_else(|| ImportError::CursorStore("derivation ordinal exhausted".into()))?;
@@ -105,7 +126,7 @@ pub(super) fn emit_occurrences(
         let clock = raw_clock(parse_raw_line_meta(&line.data).timestamp.as_deref()).0;
         let record = records.remove(&ordinal).unwrap_or_default();
         context.include_thinking = requested_thinking || ordinal <= retained_thinking;
-        let output = materialize_record(&record, ordinal, clock, context, plan)?;
+        let output = materialize_record(&record, ordinal, clock, context, batch)?;
         let proof = evidence_note(
             context.thread,
             &ProviderEvidence {
@@ -122,7 +143,7 @@ pub(super) fn emit_occurrences(
             },
         )?;
         for op in &output.ops {
-            plan.check_cancellation()?;
+            batch.check_cancellation()?;
             emit_op(op, sink, &mut report, EmissionKind::Derived)?;
         }
         emit_op(&proof, sink, &mut report, EmissionKind::Derived)?;
@@ -136,11 +157,11 @@ fn materialize_record(
     ordinal: u64,
     clock: Clock,
     context: &mut NormalizeContext<'_>,
-    plan: &SourceReadPlan,
+    batch: &RecordBatch<'_>,
 ) -> Result<RecordOutput, ImportError> {
     let mut output = RecordOutput::default();
     for (index, turn) in record.removed.iter().enumerate() {
-        plan.check_cancellation()?;
+        batch.check_cancellation()?;
         output.changes.push(CodexLogicalChange::RemoveTurn {
             turn: (*turn).to_owned(),
         });
@@ -159,7 +180,7 @@ fn materialize_record(
             .extend(remap(ops, Slot::Removed(turn, index), context.stream)?);
     }
     for (index, item) in record.items.iter().enumerate() {
-        plan.check_cancellation()?;
+        batch.check_cancellation()?;
         context.lanes.clear();
         let ops = normalized_ops_for_occurrence(item, clock, context)?;
         let ops = remap(
@@ -178,7 +199,7 @@ fn materialize_record(
         output.ops.extend(ops);
     }
     for (index, (turn, count)) in record.turns.iter().enumerate() {
-        plan.check_cancellation()?;
+        batch.check_cancellation()?;
         context.lanes.clear();
         let ops = normalized_ops_for_turn(turn, ordinal, *count, clock, context)?;
         output.ops.extend(remap(

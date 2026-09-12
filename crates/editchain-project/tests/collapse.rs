@@ -9,6 +9,7 @@
     reason = "Tests index into vectors whose length is asserted immediately before"
 )]
 // Crate-level dependency markers (used by Cargo for feature resolution).
+use editchain_index as _;
 use serde as _;
 use serde_json as _;
 

@@ -41,6 +41,8 @@ export const config: Options.Testrunner = {
         extensionPath: path.resolve(__dirname, '../..'),
         workspacePath: repositoryPath,
         userSettings: {
+          // This fixture asserts historical Activity work-group presentation.
+          'editchain-history.live.enabled': false,
           'editchain-history.servicePath': servicePath,
           'editchain-history.chainDir': '.editchain',
         },

@@ -17,18 +17,18 @@ use ctrlc as _;
 use dirs as _;
 use editchain_import as _;
 use std::io::{self, Read, Write};
+#[cfg(test)]
+use tempfile as _;
 
 // Crate-level dependency markers (used by Cargo for feature resolution).
 use blake3 as _;
 use editchain_core as _;
 use editchain_git as _;
+use editchain_index as _;
 use editchain_project as _;
 use editchain_store as _;
 use serde as _;
 use tantivy as _;
-
-#[cfg(test)]
-use tempfile as _;
 
 use editchain_node::Server;
 use editchain_protocol::{Request, Response, ServiceError, MAX_REQUEST_FRAME_BYTES};
@@ -99,15 +99,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let response: Response = match server.handle(&request) {
-            Ok(resp) => resp,
-            Err(e) => Response {
+        let payload = match server.handle_encoded(&request) {
+            Ok(payload) => payload,
+            Err(e) => serde_json::to_vec(&Response {
                 id: request.id,
                 body: editchain_protocol::ResponseBody::Error(ServiceError::from_error(e.as_ref())),
-            },
+            })?,
         };
-
-        let payload = serde_json::to_vec(&response)?;
         write_frame(&mut writer, &payload)?;
     }
 

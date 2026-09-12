@@ -63,12 +63,13 @@ struct ShellData {
     retry_listener: Option<EventListener>,
     /// User-dragged column widths (divider state; `None` = natural).
     col_widths: dom::ColWidths,
+    drawn_graph: Option<dom::GraphCellSpec>,
 }
 
 impl ShellData {
     fn layout(&self) -> dom::GraphLayout {
         dom::graph_layout(
-            self.state.max_lane,
+            self.state.graph_max_lane(),
             self.dom.rows_client_width_css(),
             self.dom.window_inner_width_css(),
         )
@@ -120,6 +121,10 @@ impl ShellData {
     }
 
     fn reanchor_window(&mut self, top: i64, bottom: i64) -> Result<(), JsValue> {
+        self.render_window(top, bottom, false)
+    }
+
+    fn render_window(&mut self, top: i64, bottom: i64, live: bool) -> Result<(), JsValue> {
         self.retry_listener = None;
         let specs = dom::window_specs(&self.state, top, bottom);
         let col_style = self.col_style();
@@ -132,7 +137,12 @@ impl ShellData {
             graph,
             status: self.pane_status(),
         };
-        self.dom.reanchor(&specs, &col_style, &options)?;
+        if live {
+            self.dom.patch_live(&specs, &col_style, &options)?;
+        } else {
+            self.dom.reanchor(&specs, &col_style, &options)?;
+        }
+        self.drawn_graph = Some(options.graph);
         self.install_resize_handles()?;
         Ok(())
     }
@@ -240,7 +250,7 @@ impl ShellData {
             .cache
             .get_by_index(abs)
             .is_some_and(rows::has_sub_ops);
-        if expandable {
+        if expandable || self.state.is_task_summary(abs) {
             self.state.toggle_expanded_ui(abs, viewport, step);
         }
     }
@@ -387,6 +397,20 @@ impl ShellData {
     /// Apply one reducer DOM op.
     fn apply_op(&mut self, op: &DomOp) -> Result<(), JsValue> {
         match op {
+            DomOp::ReanchorLive {
+                top,
+                bottom,
+                scroll_top,
+            } => {
+                let before = self.dom.capture_live_rows()?;
+                let focused = self.dom.has_row_focus().then(|| self.state.roving_abs());
+                self.render_window(*top, *bottom, true)?;
+                self.dom.set_scroll_top(*scroll_top);
+                if let Some(absolute) = focused {
+                    self.dom.focus_live_row(absolute)?;
+                }
+                self.dom.animate_live_rows(&before)
+            }
             DomOp::ShowMessage { text, error } => {
                 self.retry_listener = None;
                 self.dom.show_message(text, *error)
@@ -453,8 +477,27 @@ impl ShellData {
                 record_error(&message);
             }
         }
+        if let Err(error) = self.sync_graph_frame() {
+            record_error(&format!(
+                "Graph frame update failed: {}",
+                js_value_text(&error)
+            ));
+        }
         self.apply_roving_tabindex();
         self.sync_find_nav();
+    }
+
+    fn sync_graph_frame(&mut self) -> Result<(), JsValue> {
+        if self.state.data_ready()
+            && self.dom.wrap().is_some()
+            && self
+                .drawn_graph
+                .as_ref()
+                .is_some_and(|graph| *graph != self.graph_cell_spec())
+        {
+            self.render_window(self.state.render_top, self.state.render_bottom, true)?;
+        }
+        Ok(())
     }
 
     fn start_progressive_loader(&mut self) {
@@ -516,6 +559,7 @@ fn install_shell() -> Result<(), JsValue> {
         resize_observer: None,
         retry_listener: None,
         col_widths: dom::ColWidths::default(),
+        drawn_graph: None,
     };
     shell.dom.set_status("idle");
     shell.dom.set_find_nav(false);

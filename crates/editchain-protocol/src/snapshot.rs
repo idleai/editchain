@@ -45,6 +45,12 @@ pub struct OpenResponse {
     /// Opaque identity required on every following request.
     #[serde(default)]
     pub snapshot_id: SnapshotId,
+    /// Additive capability for presentation identities and `LocateRows`.
+    #[serde(default)]
+    pub live_updates: bool,
+    /// Retained live topology. Absent for the immutable historical Activity view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<crate::LiveBaseline>,
     /// Workspace path opened by the service.
     #[serde(default)]
     pub workspace: String,
@@ -104,8 +110,15 @@ impl RequestBody {
     #[must_use]
     pub const fn snapshot_id(&self) -> Option<&SnapshotId> {
         match self {
-            Self::Open(_) | Self::Refresh(_) => None,
+            Self::Open(_)
+            | Self::OpenLive(_)
+            | Self::OpenLivePaged(_)
+            | Self::SyncLive(_)
+            | Self::Refresh(_) => None,
+            Self::ToggleLive(request) => Some(&request.snapshot_id),
+            Self::ViewportLive(request) => Some(&request.snapshot_id),
             Self::GetWindow(request) => Some(&request.snapshot_id),
+            Self::LocateRows(request) => Some(&request.snapshot_id),
             Self::FindInHistory(request) => Some(&request.snapshot_id),
             Self::GetNodeDetails(request) => Some(&request.snapshot_id),
             Self::ResolveObject(request) => Some(&request.snapshot_id),

@@ -8,6 +8,8 @@ use std::collections::BTreeSet;
 use editchain_protocol::{ErrorCode, ExpansionSpanDto, ServiceError};
 
 use super::coordinates::{ExpandedRow, VisibleRow, MAX_RENDER_ROWS};
+mod live;
+pub(in crate::app) use live::LiveIndex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Span {
@@ -24,6 +26,7 @@ struct VisibleRun {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExpansionIndex {
+    pub(in crate::app) live: Option<Box<LiveIndex>>,
     total: i64,
     spans: Vec<Span>,
     expanded: BTreeSet<ExpandedRow>,
@@ -32,6 +35,13 @@ pub(crate) struct ExpansionIndex {
 }
 
 impl ExpansionIndex {
+    pub(in crate::app) fn from_live(
+        baseline: &editchain_protocol::LiveBaseline,
+    ) -> Result<Self, ServiceError> {
+        let mut index = Self::from_metadata(0, None, Some(&[]))?;
+        index.live = Some(Box::new(LiveIndex::new(baseline)?));
+        Ok(index)
+    }
     pub(super) fn from_metadata(
         total: i64,
         counts: Option<&[usize]>,
@@ -48,6 +58,7 @@ impl ExpansionIndex {
             None => roots.ok_or_else(|| invalid("Missing history expansion metadata."))?,
         };
         let mut index = Self {
+            live: None,
             total,
             spans,
             expanded: BTreeSet::new(),
@@ -62,15 +73,22 @@ impl ExpansionIndex {
         self.total == other.total && self.spans == other.spans
     }
 
-    pub(super) const fn total(&self) -> i64 {
-        self.total
+    pub(super) fn total(&self) -> i64 {
+        self.live.as_ref().map_or(self.total, |live| {
+            i64::try_from(live.total()).unwrap_or(i64::MAX)
+        })
     }
 
-    pub(super) const fn visible_total(&self) -> i64 {
-        self.visible_total
+    pub(super) fn visible_total(&self) -> i64 {
+        self.live.as_ref().map_or(self.visible_total, |live| {
+            i64::try_from(live.visible_total()).unwrap_or(i64::MAX)
+        })
     }
 
     pub(super) fn expanded_for(&self, visible: VisibleRow) -> Option<ExpandedRow> {
+        if let Some(live) = &self.live {
+            return live.expanded_for(visible);
+        }
         let next = self.runs.partition_point(|run| run.rank <= visible);
         let run = self.runs.get(next.checked_sub(1)?)?;
         let absolute = run
@@ -83,6 +101,9 @@ impl ExpansionIndex {
     }
 
     pub(super) fn visible_for(&self, absolute: ExpandedRow) -> Option<VisibleRow> {
+        if let Some(live) = &self.live {
+            return live.visible_for(absolute);
+        }
         let next = self.runs.partition_point(|run| run.first <= absolute);
         let run = self.runs.get(next.checked_sub(1)?)?;
         (absolute.get() < run.end)
@@ -100,23 +121,34 @@ impl ExpansionIndex {
         &self,
         top: ExpandedRow,
         bottom: ExpandedRow,
-    ) -> impl Iterator<Item = ExpandedRow> + '_ {
+    ) -> Box<dyn Iterator<Item = ExpandedRow> + '_> {
+        if let Some(live) = &self.live {
+            return Box::new(live.visible_between(top, bottom));
+        }
         let first = self.runs.partition_point(|run| run.end <= top.get());
-        self.runs
-            .iter()
-            .skip(first)
-            .take_while(move |run| run.first <= bottom)
-            .flat_map(move |run| {
-                run.first.get().max(top.get())..run.end.min(bottom.get().saturating_add(1))
-            })
-            .filter_map(ExpandedRow::new)
+        Box::new(
+            self.runs
+                .iter()
+                .skip(first)
+                .take_while(move |run| run.first <= bottom)
+                .flat_map(move |run| {
+                    run.first.get().max(top.get())..run.end.min(bottom.get().saturating_add(1))
+                })
+                .filter_map(ExpandedRow::new),
+        )
     }
 
     pub(super) fn is_expanded(&self, row: ExpandedRow) -> bool {
+        if let Some(live) = &self.live {
+            return live.is_expanded(row);
+        }
         self.expanded.contains(&row)
     }
 
     pub(super) fn toggle(&mut self, row: ExpandedRow) -> bool {
+        if let Some(live) = &mut self.live {
+            return live.toggle(row);
+        }
         if self
             .spans
             .binary_search_by_key(&row, |span| span.row)

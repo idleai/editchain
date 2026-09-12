@@ -2,6 +2,9 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+mod live;
+pub use live::LiveProjection;
+
 /// The `editchain-v1` projection schema version required by this importer.
 pub const SCHEMA_VERSION: &str = "editchain-v1";
 

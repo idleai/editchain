@@ -14,7 +14,7 @@ mod message_echoes;
 pub(super) use message_echoes::source_messages;
 
 /// Current state of a Codex logical item, rebuilt from immutable occurrences.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CodexLogicalItem {
     /// Full owning provider execution identity.
     pub thread: CodexThreadId,
@@ -76,6 +76,7 @@ pub(super) struct Materialization {
     pub(super) representatives: HashMap<OpId, OpId>,
     pub(super) output_order: HashMap<OpId, usize>,
     pub(super) items: Vec<CodexLogicalItem>,
+    pub(super) continuity_keys: HashMap<OpId, String>,
     pub(super) message_echoes: HashMap<OpId, OpId>,
 }
 
@@ -141,6 +142,25 @@ impl Materialization {
             .flat_map(|(_, turns)| turns.into_values())
             .flat_map(BTreeMap::into_values)
             .collect();
+        for item in &result.items {
+            for (index, output) in item.outputs.iter().enumerate() {
+                // File order can change when a patch adds another path. A
+                // path's identity must not follow its old array position.
+                let slot = match by_id.get(output).map(|op| &op.kind) {
+                    Some(OpKind::File(file)) => format!("file:{}", file.path.0),
+                    _ => format!("output:{index}"),
+                };
+                let key = format!(
+                    "codex:{}:{}:{}:{}:{}:{slot}",
+                    item.incarnation,
+                    item.turn.len(),
+                    item.turn,
+                    item.item.len(),
+                    item.item
+                );
+                drop(result.continuity_keys.insert(*output, key));
+            }
+        }
         result
     }
 
@@ -162,6 +182,38 @@ impl Materialization {
                 }
             }
         }
+    }
+}
+
+pub(super) trait OpLookup {
+    fn get(&self, id: &OpId) -> Option<&Op>;
+}
+
+impl OpLookup for HashMap<OpId, &Op> {
+    fn get(&self, id: &OpId) -> Option<&Op> {
+        Self::get(self, id).copied()
+    }
+}
+
+impl OpLookup for editchain_index::Map<OpId, std::sync::Arc<Op>> {
+    fn get(&self, id: &OpId) -> Option<&Op> {
+        Self::get(self, id).map(AsRef::as_ref)
+    }
+}
+
+pub(super) fn selected_codex<'a>(
+    source: OpId,
+    facts: impl Iterator<Item = &'a Op>,
+    by_id: &impl OpLookup,
+) -> Option<CodexDerivationEvidence> {
+    let records: Vec<_> = facts
+        .filter_map(decode_evidence)
+        .filter(|record| record.payload.source == source && valid_source(record, by_id))
+        .collect();
+    let references: Vec<_> = records.iter().collect();
+    match select(&references).filter(|meta| complete_outputs(*meta, source, by_id))? {
+        Derivation::Codex(meta) => Some(meta.clone()),
+        Derivation::Claude(_) => None,
     }
 }
 
@@ -195,7 +247,7 @@ fn incomplete_sources(
     blocked
 }
 
-fn valid_source(record: &EvidenceRecord<'_>, by_id: &HashMap<OpId, &Op>) -> bool {
+fn valid_source(record: &EvidenceRecord<'_>, by_id: &impl OpLookup) -> bool {
     record.payload.source.seq > 0
         && record.payload.source.seq.trailing_zeros() >= 16
         && by_id.get(&record.payload.source).is_some_and(|raw| {
@@ -230,7 +282,7 @@ fn select<'a>(records: &[&'a EvidenceRecord<'_>]) -> Option<Derivation<'a>> {
     eligible.all(|meta| meta == first).then_some(first)
 }
 
-fn complete_outputs(meta: Derivation<'_>, source: OpId, by_id: &HashMap<OpId, &Op>) -> bool {
+fn complete_outputs(meta: Derivation<'_>, source: OpId, by_id: &impl OpLookup) -> bool {
     let outputs: HashSet<OpId> = meta.outputs().iter().copied().collect();
     if outputs.len() != meta.outputs().len() || outputs.contains(&source) {
         return false;
@@ -253,7 +305,7 @@ fn valid_changes(
     meta: &CodexDerivationEvidence,
     source: OpId,
     outputs: &HashSet<OpId>,
-    by_id: &HashMap<OpId, &Op>,
+    by_id: &impl OpLookup,
 ) -> bool {
     meta.changes.iter().all(|change| match change {
         CodexLogicalChange::RemoveTurn { turn } => !turn.is_empty(),
@@ -280,7 +332,7 @@ fn reaches_source(
     mut id: OpId,
     source: OpId,
     outputs: &HashSet<OpId>,
-    by_id: &HashMap<OpId, &Op>,
+    by_id: &impl OpLookup,
 ) -> bool {
     if id.node == source.node || id.boot != source.boot || id.seq >> 16 != source.seq >> 16 {
         return false;

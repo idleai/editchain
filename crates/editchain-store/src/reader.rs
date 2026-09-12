@@ -29,7 +29,7 @@ pub struct ChainReadStats {
 }
 
 /// Exact location of one encoded operation inside an append-only segment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OpRecordLocation {
     /// Numeric sequence from `<sequence>.eclog`.
     pub segment_seq: u32,
@@ -115,8 +115,14 @@ impl CanonicalChain {
         Ok(self.admit(op, encoded, None))
     }
 
-    fn admit(&mut self, op: Op, encoded: Vec<u8>, location: Option<OpRecordLocation>) -> Admission {
+    pub(crate) fn admit(
+        &mut self,
+        op: Op,
+        encoded: Vec<u8>,
+        location: Option<OpRecordLocation>,
+    ) -> Admission {
         self.stats.records = self.stats.records.saturating_add(1);
+        let was_accepted = self.evidence.contains(&op.id);
         let result = self.evidence.insert(op.id, encoded);
         match result {
             Admission::Accepted => {
@@ -127,6 +133,10 @@ impl CanonicalChain {
             }
             Admission::Conflict => {
                 drop(self.accepted.remove(&op.id));
+                self.stats.quarantined =
+                    self.stats
+                        .quarantined
+                        .saturating_add(if was_accepted { 2 } else { 1 });
             }
         }
         result
@@ -137,11 +147,6 @@ impl CanonicalChain {
     pub fn stats(&self) -> ChainReadStats {
         ChainReadStats {
             accepted: self.accepted.len(),
-            quarantined: self
-                .evidence
-                .conflicts()
-                .map(|(_, variants)| variants.len())
-                .sum(),
             ..self.stats
         }
     }
@@ -150,6 +155,29 @@ impl CanonicalChain {
     #[must_use]
     pub const fn evidence(&self) -> &OpSet {
         &self.evidence
+    }
+
+    /// Read one accepted identity without scanning the retained corpus.
+    #[must_use]
+    pub fn get(&self, id: OpId) -> Option<&Op> {
+        self.accepted.get(&id).map(|(op, _)| op)
+    }
+
+    /// Iterate retained accepted operations without consuming the admission index.
+    pub fn located_ops(&self) -> impl Iterator<Item = (&Op, Option<OpRecordLocation>)> {
+        self.accepted.values().map(|(op, location)| (op, *location))
+    }
+
+    pub(crate) fn record_undecodable(&mut self) {
+        self.stats.undecodable = self.stats.undecodable.saturating_add(1);
+    }
+
+    pub(crate) fn record_tail_change(&mut self, is_incomplete: bool) {
+        if is_incomplete {
+            self.stats.incomplete_tails = self.stats.incomplete_tails.saturating_add(1);
+        } else {
+            self.stats.incomplete_tails = self.stats.incomplete_tails.saturating_sub(1);
+        }
     }
 
     /// Consume accepted operations and their first durable locations in ID order.
@@ -165,6 +193,11 @@ impl CanonicalChain {
 ///
 /// Returns an error if the location is oversized, unreadable, or undecodable.
 pub fn read_op_at(chain_dir: &Path, location: OpRecordLocation) -> io::Result<Op> {
+    decode_op(&read_encoded_at(chain_dir, location)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+pub(crate) fn read_encoded_at(chain_dir: &Path, location: OpRecordLocation) -> io::Result<Vec<u8>> {
     if location.data_len > MAX_RECORD_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -176,5 +209,5 @@ pub fn read_op_at(chain_dir: &Path, location: OpRecordLocation) -> io::Result<Op
     let _: u64 = file.seek(SeekFrom::Start(location.data_offset))?;
     let mut encoded = vec![0u8; usize::try_from(location.data_len).map_err(io::Error::other)?];
     file.read_exact(&mut encoded)?;
-    decode_op(&encoded).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    Ok(encoded)
 }

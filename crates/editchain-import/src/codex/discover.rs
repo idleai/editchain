@@ -66,3 +66,72 @@ fn is_rollout_name(path: &Path) -> bool {
         name.starts_with("rollout-") && name.ends_with(".jsonl")
     })
 }
+
+/// Select changed files without changing the provider-relative cursor root.
+pub(super) fn selected_rollouts(
+    root: &Path,
+    selected: &[PathBuf],
+) -> Result<Vec<RolloutFile>, String> {
+    let mut paths: Vec<_> = selected
+        .iter()
+        .map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                root.join(path)
+            }
+        })
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .map(|path| {
+            drop(
+                crate::cursor::canonical_source_key("codex", root, &path)
+                    .map_err(|error| error.to_string())?,
+            );
+            let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            if !metadata.is_file() || !is_rollout_name(&path) {
+                return Err(format!("{} is not a regular Codex rollout", path.display()));
+            }
+            let session_id = path
+                .file_stem()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+            Ok(RolloutFile {
+                path,
+                file_size: metadata.len(),
+                session_id,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_paths_keep_the_full_tree_identity_and_deduplicate_wakeups() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("2026/09/11");
+        std::fs::create_dir_all(&nested).unwrap();
+        let path = nested.join("rollout-live.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+        let all = discover_rollouts(dir.path()).unwrap();
+        let selected = selected_rollouts(dir.path(), &[path.clone(), path]).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected.first().unwrap().path, all.first().unwrap().path);
+        assert_eq!(
+            selected.first().unwrap().session_id,
+            all.first().unwrap().session_id
+        );
+    }
+
+    #[test]
+    fn selected_paths_cannot_escape_the_cursor_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let selected = vec![PathBuf::from("../rollout-outside.jsonl")];
+        assert!(selected_rollouts(dir.path(), &selected).is_err());
+    }
+}

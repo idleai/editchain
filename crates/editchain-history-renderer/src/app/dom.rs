@@ -36,6 +36,13 @@ use super::state::{HistoryAppState, ROW_H};
 #[cfg(test)]
 use super::ChainState;
 
+#[cfg(any(target_arch = "wasm32", test))]
+#[path = "graph_growth.rs"]
+mod graph_growth;
+#[cfg(target_arch = "wasm32")]
+#[path = "graph_motion.rs"]
+mod graph_motion;
+
 // ---------------------------------------------------------------------------
 // Pure graph/lane geometry (exact production constants)
 // ---------------------------------------------------------------------------
@@ -54,10 +61,7 @@ pub(crate) const LANE_W_PULSE_SCALE: f64 = 0.82;
 #[cfg(test)]
 pub(crate) const PULSE_LANE_PITCH: f64 = 14.76;
 
-/// Production `MIN_LANE_W`: lane-spacing floor under dense compression.
-pub(crate) const MIN_LANE_W: f64 = 1.5;
-
-/// Production `DOT_R`: node-dot radius before compression shrinking.
+/// Production `DOT_R`: fixed node-dot radius.
 pub(crate) const DOT_R: f64 = 4.0;
 
 /// Production bundle glyph half-height/span (CSS px).
@@ -171,7 +175,7 @@ pub(crate) const SVG_NS: &str = "http://www.w3.org/2000/svg";
 pub(crate) struct GraphCellSpec {
     /// Lane-center X positions (CSS px, from the natural layout).
     pub(crate) lane_x: Vec<f64>,
-    /// Node-dot radius (CSS px, compressed with dense lanes).
+    /// Fixed node-dot radius (CSS px).
     pub(crate) dot_radius: f64,
     /// Rendered cell width (CSS px; divider override or natural).
     pub(crate) width: f64,
@@ -198,6 +202,8 @@ pub(crate) enum SvgItem {
         class: &'static str,
         d: String,
         stroke: &'static str,
+        start: (f64, f64),
+        end: (f64, f64),
     },
     /// A node dot or a typed Activity-bundle terminal.
     Circle {
@@ -217,6 +223,39 @@ pub(crate) enum SvgItem {
         rx: f64,
         fill: &'static str,
     },
+}
+
+#[cfg(target_arch = "wasm32")]
+impl SvgItem {
+    fn motion_identity(&self) -> (String, Vec<f64>) {
+        match self {
+            Self::Line { x1, y1, x2, y2, .. } => (
+                format!("line:{x1}:{y1}:{x2}:{y2}"),
+                vec![*x1, *y1, *x2, *y2],
+            ),
+            Self::Path {
+                class,
+                d,
+                start,
+                end,
+                ..
+            } => (format!("{class}:{d}"), vec![start.0, start.1, end.0, end.1]),
+            Self::Circle {
+                class, cx, cy, r, ..
+            } => (format!("{class}:{cx}:{cy}:{r}"), vec![*cx, *cy]),
+            Self::Rect {
+                class,
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => (
+                format!("{class}:{x}:{y}:{width}:{height}"),
+                vec![x + width / 2.0, y + height / 2.0],
+            ),
+        }
+    }
 }
 
 /// The bundle glyph metrics for a recognized typed Activity-bundle row
@@ -500,11 +539,15 @@ fn transition_items(
             class: "graphTransition graphTransitionSrc",
             d: quadratic_path_d(start, src_control, seam),
             stroke: graph_color_hex(transition.from_lane, muted),
+            start,
+            end: seam,
         },
         SvgItem::Path {
             class: "graphTransition graphTransitionDst",
             d: quadratic_path_d(seam, dst_control, end),
             stroke: graph_color_hex(transition.to_lane, muted),
+            start: seam,
+            end,
         },
     ]
 }
@@ -514,11 +557,11 @@ fn transition_items(
 pub(crate) struct GraphLayout {
     /// Lane-center X positions for lanes `0..=max_lane` (CSS px, fixed).
     pub(crate) lane_x: Vec<f64>,
-    /// Effective per-lane width (CSS px); 14.76 unless dense compression.
+    /// Fixed per-lane width (14.76 CSS px).
     pub(crate) lane_width: f64,
-    /// Node-dot radius (CSS px), compressed with dense lanes.
+    /// Fixed node-dot radius (CSS px).
     pub(crate) dot_radius: f64,
-    /// The graph column's CSS width (natural lane width, budget-capped).
+    /// The graph column's natural CSS width; wide graphs scroll horizontally.
     pub(crate) column_width: f64,
 }
 
@@ -556,31 +599,21 @@ fn graph_width_budget(rows_client_width: f64, window_inner_width: f64) -> f64 {
 /// `LANE_W * LANE_W_PULSE_SCALE` (14.76 CSS px) and `lane_x[l] = (l + 1) * pitch`.
 pub(crate) fn graph_layout(
     max_lane: u32,
-    rows_client_width: f64,
-    window_inner_width: f64,
+    _rows_client_width: f64,
+    _window_inner_width: f64,
 ) -> GraphLayout {
     let num_lanes = f64::from(max_lane.saturating_add(1));
-    let budget = graph_width_budget(rows_client_width, window_inner_width);
-    let lane_width = (LANE_W * LANE_W_PULSE_SCALE)
-        .min(budget / (num_lanes + 1.0))
-        .max(MIN_LANE_W);
-    let natural = ((num_lanes + 1.0) * lane_width).max(32.0).min(budget);
+    let lane_width = LANE_W * LANE_W_PULSE_SCALE;
+    let natural = ((num_lanes + 1.0) * lane_width).max(32.0);
     let column_width = round2(natural);
     let lane_x = (0..=max_lane)
-        .map(|lane| {
-            let index = f64::from(lane);
-            if num_lanes * lane_width <= column_width {
-                (index + 1.0) * lane_width
-            } else {
-                (index + 0.5) * (column_width / num_lanes)
-            }
-        })
+        .map(|lane| (f64::from(lane) + 1.0) * lane_width)
         .map(round2)
         .collect();
     GraphLayout {
         lane_x,
         lane_width,
-        dot_radius: (lane_width / 2.0).clamp(1.5, DOT_R),
+        dot_radius: DOT_R,
         column_width,
     }
 }
@@ -744,6 +777,19 @@ pub(crate) fn col_style(
             continue;
         }
         parts.push(format!("--{}-w:{}px", col.as_str(), widths.width(col)));
+    }
+    if graph_width_css > graph_width_budget(window_inner_width, window_inner_width) {
+        let date = if hidden.contains(&ColKey::Date) {
+            0.0
+        } else {
+            widths.width(ColKey::Date)
+        };
+        let minimum = graph_width_css
+            + widths.width(ColKey::Activity)
+            + widths.width(ColKey::Tags)
+            + date
+            + widths.content.unwrap_or(MIN_CONTENT_W);
+        parts.push(format!("min-width:{}px", round2(minimum)));
     }
     parts.join(";")
 }
@@ -938,7 +984,7 @@ mod web {
         pub(crate) status: PaneStatus,
     }
 
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::fmt;
 
     use wasm_bindgen::prelude::*;
@@ -994,6 +1040,110 @@ mod web {
         /// Measured once: the smallest graph column width that renders the
         /// "Graph" columnheader label without clipping (`graphLabelMinW`).
         graph_label_min_width: Cell<Option<f64>>,
+        live_specs: RefCell<std::collections::HashMap<String, RowSpec>>,
+        live_graph: RefCell<Option<GraphCellSpec>>,
+    }
+
+    /// Bounded to the rendered window; measured before keyed reconciliation.
+    pub(crate) struct LiveRows {
+        rows: std::collections::HashMap<String, (i64, String)>,
+        graph: super::graph_motion::Capture,
+    }
+
+    impl HistoryDom {
+        pub(crate) fn has_row_focus(&self) -> bool {
+            web_sys::window()
+                .and_then(|window| window.document())
+                .and_then(|document| document.active_element())
+                .is_some_and(|active| {
+                    self.rows.contains(Some(&active))
+                        && active.closest(".row").ok().flatten().is_some()
+                })
+        }
+
+        pub(crate) fn focus_live_row(&self, absolute: i64) -> Result<(), JsValue> {
+            if let Some(row) = self
+                .rows
+                .query_selector(&format!(".row[data-row=\"{absolute}\"]"))?
+                .and_then(|row| row.dyn_into::<web_sys::HtmlElement>().ok())
+            {
+                let options = web_sys::FocusOptions::new();
+                options.set_prevent_scroll(true);
+                row.focus_with_options(&options)?;
+            }
+            Ok(())
+        }
+
+        pub(crate) fn capture_live_rows(&self) -> Result<LiveRows, JsValue> {
+            let rows = self.rows.query_selector_all(".row[data-continuity]")?;
+            let mut before = std::collections::HashMap::new();
+            for index in 0..rows.length() {
+                let Some(row) = rows
+                    .item(index)
+                    .and_then(|node| node.dyn_into::<web_sys::HtmlElement>().ok())
+                else {
+                    continue;
+                };
+                let key = row.get_attribute("data-continuity").unwrap_or_default();
+                drop(before.insert(
+                    key,
+                    (
+                        f64_round_to_i64(row.get_bounding_client_rect().y()),
+                        row.get_attribute("aria-label").unwrap_or_default(),
+                    ),
+                ));
+            }
+            Ok(LiveRows {
+                rows: before,
+                graph: super::graph_motion::capture(&self.rows)?,
+            })
+        }
+
+        pub(crate) fn animate_live_rows(&self, before: &LiveRows) -> Result<(), JsValue> {
+            let rows = self.rows.query_selector_all(".row[data-continuity]")?;
+            let viewport = self.rows.get_bounding_client_rect();
+            let top = f64_round_to_i64(viewport.top()).saturating_sub(ROW_H);
+            let bottom = f64_round_to_i64(viewport.bottom()).saturating_add(ROW_H);
+            let mut frames = Vec::new();
+            for index in 0..rows.length() {
+                let Some(row) = rows
+                    .item(index)
+                    .and_then(|node| node.dyn_into::<web_sys::HtmlElement>().ok())
+                else {
+                    continue;
+                };
+                let key = row.get_attribute("data-continuity").unwrap_or_default();
+                let current_y = f64_round_to_i64(row.get_bounding_client_rect().y());
+                let was_visible = before
+                    .rows
+                    .get(&key)
+                    .is_some_and(|(y, _)| *y >= top && *y <= bottom);
+                if !was_visible && (current_y < top || current_y > bottom) {
+                    continue;
+                }
+                let (offset, changed) = before.rows.get(&key).map_or((12, true), |(y, label)| {
+                    (
+                        y.saturating_sub(current_y).clamp(-2048, 2048),
+                        *label != row.get_attribute("aria-label").unwrap_or_default(),
+                    )
+                });
+                frames.push((row, offset, changed));
+            }
+            // Read every position before changing animation styles. Interleaved
+            // reads/writes forced a layout for every row in the overscan window.
+            super::graph_motion::animate(&self.rows, &before.graph)?;
+            for (row, offset, changed) in frames {
+                if offset != 0 {
+                    row.style()
+                        .set_property("--live-offset", &format!("{offset}px"))?;
+                    row.class_list().add_1("row-live-moved")?;
+                }
+                if changed {
+                    row.class_list().add_1("row-live-changed")?;
+                }
+            }
+            Ok(())
+        }
     }
 
     impl fmt::Debug for HistoryDom {
@@ -1027,6 +1177,8 @@ mod web {
                 search_prev,
                 search_next,
                 graph_label_min_width: Cell::new(None),
+                live_specs: RefCell::new(std::collections::HashMap::new()),
+                live_graph: RefCell::new(None),
             })
         }
 
@@ -1359,6 +1511,150 @@ mod web {
                         drop(restored.focus_with_options(&options));
                     }
                 }
+            }
+            self.remember_live_specs(specs, graph);
+            Ok(())
+        }
+
+        fn remember_live_specs(&self, specs: &[RowSpec], graph: &GraphCellSpec) {
+            *self.live_specs.borrow_mut() = specs
+                .iter()
+                .map(|spec| (spec.identity.continuity_key.clone(), spec.clone()))
+                .collect();
+            *self.live_graph.borrow_mut() = Some(graph.clone());
+        }
+
+        /// Reconcile the existing bounded row window by stable identity.
+        /// Unchanged cells and row elements remain mounted across a prepend.
+        pub(crate) fn patch_live(
+            &self,
+            specs: &[RowSpec],
+            col_style: &str,
+            options: &RebuildOptions,
+        ) -> Result<(), JsValue> {
+            let Some(wrap) = self.wrap() else {
+                return self.reanchor(specs, col_style, options);
+            };
+            let document = Self::document()?;
+            wrap.set_attribute("style", col_style)?;
+            if let Some(header) = self.rows.query_selector(".tbl-header")? {
+                let replacement =
+                    build_header(self, &document, col_style, options.graph_width_css)?;
+                drop(
+                    self.rows
+                        .query_selector(".tbl-grid")?
+                        .map(|grid| grid.replace_child(&replacement, &header))
+                        .transpose()?,
+                );
+            }
+            let mut existing = std::collections::HashMap::new();
+            let rows = wrap.query_selector_all(".row")?;
+            for index in 0..rows.length() {
+                let Some(row) = rows
+                    .item(index)
+                    .and_then(|row| row.dyn_into::<web_sys::HtmlElement>().ok())
+                else {
+                    continue;
+                };
+                let key = row.get_attribute("data-continuity").unwrap_or_default();
+                if key.is_empty() {
+                    row.remove();
+                } else {
+                    drop(existing.insert(key, row));
+                }
+            }
+            let mut cursor = wrap.first_child();
+            for spec in specs {
+                let retained = existing.remove(&spec.identity.continuity_key);
+                let row = if let Some(row) = retained {
+                    self.patch_live_row(&row, spec, col_style, &options.graph)?;
+                    row
+                } else {
+                    build_row(&document, spec, col_style, &options.graph)?.into()
+                };
+                if cursor
+                    .as_ref()
+                    .is_some_and(|cursor| row.is_same_node(Some(cursor)))
+                {
+                    cursor = row.next_sibling();
+                } else {
+                    drop(wrap.insert_before(&row, cursor.as_ref())?);
+                }
+            }
+            for row in existing.into_values() {
+                row.remove();
+            }
+            self.set_wrap_top(options.wrap_top_px)?;
+            if let Some(spacer) = self
+                .rows
+                .query_selector(".scroll-spacer")?
+                .and_then(|node| node.dyn_into::<web_sys::HtmlElement>().ok())
+            {
+                spacer
+                    .style()
+                    .set_property("height", &format!("{}px", options.spacer_height_px))?;
+            }
+            if let Some(grid) = self.rows.query_selector(".tbl-grid")? {
+                grid.set_attribute("aria-rowcount", &options.aria_rowcount.to_string())?;
+            }
+            self.remember_live_specs(specs, &options.graph);
+            Ok(())
+        }
+
+        fn patch_live_row(
+            &self,
+            row: &web_sys::HtmlElement,
+            spec: &RowSpec,
+            col_style: &str,
+            graph: &GraphCellSpec,
+        ) -> Result<(), JsValue> {
+            let document = Self::document()?;
+            let previous = self
+                .live_specs
+                .borrow()
+                .get(&spec.identity.continuity_key)
+                .cloned();
+            let graph_changed = self.live_graph.borrow().as_ref() != Some(graph)
+                || previous
+                    .as_ref()
+                    .is_none_or(|previous| previous.graph != spec.graph);
+            let same_content = previous.is_some_and(|mut previous| {
+                previous.identity.abs_index = spec.identity.abs_index;
+                previous.graph.clone_from(&spec.graph);
+                previous == *spec
+            });
+            if same_content {
+                row.set_attribute("data-row", &spec.identity.abs_index.to_string())?;
+                row.set_class_name(&spec.classes());
+                row.set_attribute("tabindex", &spec.aria.tabindex.to_string())?;
+                row.set_attribute("aria-selected", &spec.aria.aria_selected.to_string())?;
+                row.set_attribute("style", col_style)?;
+                if graph_changed {
+                    if let Some(cell) = row.query_selector(".graph-cell")? {
+                        let svg = build_graph_svg(&document, graph, &spec.graph)?;
+                        super::graph_motion::patch_cell(&cell, &svg)?;
+                    }
+                }
+            } else {
+                let replacement = build_row(&document, spec, col_style, graph)?;
+                for name in row
+                    .get_attribute_names()
+                    .iter()
+                    .filter_map(|name| name.as_string())
+                {
+                    row.remove_attribute(&name)?;
+                }
+                for name in replacement
+                    .get_attribute_names()
+                    .iter()
+                    .filter_map(|name| name.as_string())
+                {
+                    row.set_attribute(
+                        &name,
+                        &replacement.get_attribute(&name).unwrap_or_default(),
+                    )?;
+                }
+                super::graph_motion::patch_row(row, &replacement)?;
             }
             Ok(())
         }
@@ -1916,6 +2212,7 @@ mod web {
         row.set_attribute("title", &spec.aria.title)?;
         row.set_attribute("data-base-aria-label", &spec.aria.base_aria_label)?;
         row.set_attribute("data-key", &spec.identity.node_key)?;
+        row.set_attribute("data-continuity", &spec.identity.continuity_key)?;
         row.set_attribute(
             "data-hierarchy-depth",
             &spec.identity.hierarchy_depth.to_string(),
@@ -2118,7 +2415,9 @@ mod web {
                     ("style", format!("stroke:{stroke}")),
                 ],
             ),
-            SvgItem::Path { class, d, stroke } => (
+            SvgItem::Path {
+                class, d, stroke, ..
+            } => (
                 "path",
                 vec![
                     ("class", class.to_string()),
@@ -2164,6 +2463,17 @@ mod web {
             ),
         };
         let element = document.create_element_ns(Some(SVG_NS), tag)?;
+        let (identity, points) = item.motion_identity();
+        element.set_attribute("data-graph-key", &identity)?;
+        let coordinates = points
+            .into_iter()
+            .map(super::svg_number)
+            .collect::<Vec<_>>()
+            .join(" ");
+        element.set_attribute("data-graph-points", &coordinates)?;
+        if tag == "line" || tag == "path" {
+            element.set_attribute("pathLength", "1")?;
+        }
         for (name, value) in attributes {
             element.set_attribute(name, &value)?;
         }
@@ -2208,6 +2518,18 @@ mod web {
         spec: &RowSpec,
     ) -> Result<(), JsValue> {
         let parent_node = node_of(parent)?;
+        if let Some(task) = &spec.task_disclosure {
+            let button = make_element(document, "button", "task-chevron", Some(&task.text))?;
+            button.set_attribute("type", "button")?;
+            button.set_attribute("title", &task.label)?;
+            button.set_attribute("aria-label", &task.label)?;
+            button.set_attribute("aria-expanded", &task.expanded.to_string())?;
+            drop(
+                parent_node
+                    .append_child(&node_of(&button)?)
+                    .map_err(js_err_from)?,
+            );
+        }
         for item in &spec.tags {
             let tag = make_element(document, "span", &item.classes, Some(&item.text))?;
             tag.set_attribute("title", &item.title)?;
@@ -2410,6 +2732,34 @@ mod tests {
     }
 
     #[test]
+    fn task_anchor_keeps_a_physical_dot_when_open_and_a_connected_capsule_when_folded() {
+        let mut graph = GraphData {
+            lane: 1,
+            above: vec![1],
+            below: vec![1],
+            is_bundle: true,
+            expanded: true,
+            ..GraphData::default()
+        };
+        let cell = graph_cell_spec(vec![14.76, 29.52], 4.0, 44.28);
+        assert!(row_graph_items(&graph, &cell).iter().any(|item| matches!(
+            item,
+            SvgItem::Circle {
+                class: "graphDot",
+                ..
+            }
+        )));
+        graph.expanded = false;
+        assert!(row_graph_items(&graph, &cell).iter().any(|item| matches!(
+            item,
+            SvgItem::Rect {
+                class: "graphBundleCapsule",
+                ..
+            }
+        )));
+    }
+
+    #[test]
     fn lane_positions_are_fixed_and_never_rescale_with_column_width() {
         let wide = graph_layout(1, 1440.0, 1440.0);
         assert_eq!(wide.lane_x.len(), 2, "lanes 0..=max_lane are present");
@@ -2434,34 +2784,30 @@ mod tests {
     }
 
     #[test]
-    fn dense_lanes_compress_inside_the_budget_without_moving_fixed_columns() {
-        let layout = graph_layout(40, 1440.0, 1440.0);
-        assert!(
-            layout.column_width <= 720.0,
-            "graph never exceeds half the viewport"
-        );
-        assert_eq!(layout.lane_x.len(), 41, "every lane has a position");
-        assert!(
-            layout.lane_x.windows(2).all(|pair| {
-                pair.get(1).copied().unwrap_or(0.0) > pair.first().copied().unwrap_or(0.0)
-            }),
-            "lane centers stay monotonic under compression"
-        );
+    fn dense_lanes_keep_their_centers_and_radius_even_in_a_narrow_panel() {
+        for count in [40, 190, 1000] {
+            let wide = graph_layout(count, 1440.0, 1440.0);
+            let narrow = graph_layout(count, 300.0, 300.0);
+            assert_eq!(wide.lane_x, narrow.lane_x);
+            assert!((wide.dot_radius - DOT_R).abs() < f64::EPSILON);
+            assert!(
+                wide.lane_x.windows(2).all(|pair| {
+                    (pair.get(1).copied().unwrap() - pair.first().copied().unwrap() - 14.76).abs()
+                        < 1e-9
+                }),
+                "every lane keeps its pitch; density never squeezes connections"
+            );
+        }
     }
 
     #[test]
-    fn dense_wide_panel_reserves_readable_content_after_fixed_columns() {
+    fn dense_graphs_scroll_with_readable_content_instead_of_squeezing_lanes() {
         let panel_width = 917.0;
         let layout = graph_layout(34, panel_width, panel_width);
-        let content_width =
-            panel_width - layout.column_width - ACTIVITY_COL_W - TAGS_COL_W - DEFAULT_COL_W_DATE;
+        assert!((layout.lane_width - 14.76).abs() < 1e-9);
         assert!(
-            content_width >= MIN_CONTENT_W,
-            "35 graph lanes leave the fixed Activity/Tags/Date tracks plus readable Content"
-        );
-        assert!(
-            (layout.column_width - 329.0).abs() < 1e-9,
-            "the rail consumes only the width left after fixed tracks and Content"
+            col_style(layout.column_width, panel_width, &ColWidths::default())
+                .contains("min-width:1119.36px")
         );
     }
 
@@ -2989,7 +3335,10 @@ mod tests {
             matches!(src, SvgItem::Path { .. }),
             "expected a path, got {src:?}"
         );
-        if let SvgItem::Path { class, d, stroke } = src {
+        if let SvgItem::Path {
+            class, d, stroke, ..
+        } = src
+        {
             assert_eq!(*class, "graphTransition graphTransitionSrc");
             assert_eq!(*d, "M 14.76 17 Q 22.14 17 25.83 21.25");
             assert_eq!(*stroke, "#48f1dc");
@@ -2999,7 +3348,10 @@ mod tests {
             matches!(dst, SvgItem::Path { .. }),
             "expected a path, got {dst:?}"
         );
-        if let SvgItem::Path { class, d, stroke } = dst {
+        if let SvgItem::Path {
+            class, d, stroke, ..
+        } = dst
+        {
             assert_eq!(*class, "graphTransition graphTransitionDst");
             assert_eq!(*d, "M 25.83 21.25 Q 29.52 25.5 29.52 34");
             assert_eq!(*stroke, "#a18aff");

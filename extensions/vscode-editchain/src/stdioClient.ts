@@ -2,6 +2,7 @@ import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
 import { existsSync } from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { FrameDecoder } from './frameDecoder';
 
 /**
  * A minimal framed stdio client for the native Rust service.
@@ -75,7 +76,7 @@ export class StdioClient {
     // Fresh framing state (and id space) for this process: stale bytes from a
     // killed child must never be parsed into the replacement's buffer, and a
     // late response can never collide with a new request's id.
-    this.framing = { gen, buffer: Buffer.alloc(0) };
+    this.framing = { gen, decoder: new FrameDecoder() };
     this.nextId = 1;
     child.stdout.on('data', (chunk: Buffer) => this.onData(gen, child, chunk));
     child.stderr.on('data', (chunk: Buffer) => {
@@ -242,16 +243,10 @@ export class StdioClient {
   ): void {
     const framing = this.framing;
     if (!framing || framing.gen !== gen || this.proc !== child) return;
-    framing.buffer = Buffer.concat([framing.buffer, chunk]);
-    while (framing.buffer.length >= 4) {
-      const len = framing.buffer.readUInt32LE(0);
-      if (framing.buffer.length < 4 + len) {
-        break;
-      }
-      const payload = framing.buffer.subarray(4, 4 + len).toString('utf8');
-      framing.buffer = framing.buffer.subarray(4 + len);
+    for (const payload of framing.decoder.push(chunk)) {
+      if (this.framing !== framing || this.proc !== child) return;
       try {
-        const msg = JSON.parse(payload);
+        const msg = JSON.parse(payload.toString('utf8'));
         if (msg.id !== undefined) {
           const req = this.pending.get(msg.id);
           // Responses with an id that matches no pending request (e.g. a stale
@@ -275,7 +270,7 @@ export class StdioClient {
 interface Framing {
   /** Process generation this framing state belongs to. */
   gen: number;
-  buffer: Buffer;
+  decoder: FrameDecoder;
 }
 
 interface PendingRequest {

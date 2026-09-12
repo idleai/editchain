@@ -16,6 +16,66 @@ use editchain_import::claude_code::reader::read_session_file;
 use std::io::Write;
 
 #[test]
+fn retained_source_reads_only_new_lines_and_drains_a_stationary_backlog() {
+    use editchain_import::source_read::{
+        LiveRead, SourceReadControl, SourceReadLimits, SourceReadPlan,
+    };
+    for count in [1, 10_000] {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.jsonl");
+        std::fs::write(&source, b"{}\n".repeat(count)).unwrap();
+        let plan = SourceReadPlan::capture(&source, None, 0, SourceReadLimits::default()).unwrap();
+        let (read, _) = LiveRead::bootstrap(&source, &plan).unwrap();
+        let mut output = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&source)
+            .unwrap();
+        output.write_all(b"{\"new\":true}\npartial").unwrap();
+        let batch = read.poll(&source, &SourceReadControl::default()).unwrap();
+        assert_eq!(batch.lines.len(), 1);
+        assert_eq!(batch.bytes_read, 20);
+        assert_eq!(
+            batch
+                .next
+                .poll(&source, &SourceReadControl::default())
+                .unwrap()
+                .bytes_read,
+            0
+        );
+        output.write_all(b"\n").unwrap();
+        output.write_all(&b"{}\n".repeat(600)).unwrap();
+        let first = batch
+            .next
+            .poll(&source, &SourceReadControl::default())
+            .unwrap();
+        assert_eq!(first.lines.len(), 512);
+        assert!(first.next.has_more());
+        let last = first
+            .next
+            .poll(&source, &SourceReadControl::default())
+            .unwrap();
+        assert_eq!(last.lines.len(), 89);
+        assert!(!last.next.has_more());
+        assert_eq!(
+            last.next.checkpoint().content_hash,
+            *blake3::hash(&std::fs::read(&source).unwrap()).as_bytes()
+        );
+        assert_eq!(
+            last.next
+                .poll(&source, &SourceReadControl::default())
+                .unwrap()
+                .bytes_read,
+            0
+        );
+        std::fs::write(&source, b"{}\n").unwrap();
+        assert!(last
+            .next
+            .poll(&source, &SourceReadControl::default())
+            .is_err());
+    }
+}
+
+#[test]
 fn read_empty_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("empty.jsonl");

@@ -62,7 +62,12 @@ pub fn resolve_commit(
     resolve_commit_with_refs(handle, oid, &refs)
 }
 
-fn resolve_commit_with_refs(
+/// Resolve one immutable commit using a previously captured ref observation.
+/// This avoids rereading refs for each object in an incremental history walk.
+///
+/// # Errors
+/// Returns object lookup or decoding errors.
+pub fn resolve_commit_with_refs(
     handle: &RepositoryHandle,
     oid: &GitOid,
     refs: &RefSnapshot,

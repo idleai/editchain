@@ -24,7 +24,7 @@ pub struct Cli {
 pub enum Commands {
     /// Import agent sessions (Claude Code or Codex) into the edit chain
     Import(ImportCommand),
-    /// Pregenerate the fixed-view VS Code render snapshot
+    /// Prepare or incrementally advance the resumable live history checkpoint
     PrepareView {
         /// Path to the workspace root
         #[arg(long, default_value = ".")]
@@ -53,6 +53,10 @@ pub struct ImportCommand {
     /// path (repeatable); requires `--provider codex`
     #[arg(long, action = clap::ArgAction::Append, allow_hyphen_values = true)]
     pub codex_helper_arg: Vec<String>,
+    /// Reconcile only this rollout beneath --sessions-dir, retaining the same
+    /// cursor identity as a full import (repeatable; requires --provider codex)
+    #[arg(long, action = clap::ArgAction::Append)]
+    pub codex_rollout: Vec<PathBuf>,
     /// Path to the workspace root
     #[arg(long, default_value = ".")]
     pub workspace: String,

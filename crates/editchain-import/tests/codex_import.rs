@@ -309,6 +309,96 @@ fn occurrence_revisions_and_logical_removals_are_independent_of_append_boundarie
 }
 
 #[test]
+fn historical_item_references_follow_revisions_but_not_recreated_incarnations() {
+    let dir = tempfile::tempdir().unwrap();
+    let records = derivation_records();
+    let mut cursors = MemoryCursorStore::new();
+    let mut projection = editchain_project::live::LiveProjection::default();
+    let mut original = None;
+    for end in 1..=records.len() {
+        let batch = import_projection_prefix(
+            &dir,
+            &records[..end],
+            &ImportOptions::default(),
+            &mut cursors,
+        );
+        let changes = projection.apply(canonical_revisions(&batch.ops.ops), &[]);
+        if end == 2 {
+            original = changes
+                .upserts
+                .values()
+                .find(|row| row.key.starts_with("item:"))
+                .cloned();
+        }
+        if let Some(original) = &original {
+            for occurrence in original.operations.iter().map(|op| op.id) {
+                let owners = projection.item_owners(occurrence);
+                if end <= 3 {
+                    assert_eq!(
+                        owners,
+                        vec![original.key.clone()],
+                        "old occurrence must still reference its current logical item"
+                    );
+                } else {
+                    assert!(
+                        owners.is_empty(),
+                        "removed incarnation must never reference a recreated item"
+                    );
+                }
+            }
+        }
+    }
+    assert!(original.is_some());
+}
+
+#[test]
+fn retained_logical_projection_matches_replay_after_every_admission_and_retraction() {
+    let dir = tempfile::tempdir().unwrap();
+    let imported = import_projection_prefix(
+        &dir,
+        &derivation_records(),
+        &ImportOptions::default(),
+        &mut MemoryCursorStore::new(),
+    );
+    let mut ops = canonical_revisions(&imported.ops.ops);
+    for reversed in [false, true] {
+        if reversed {
+            ops.reverse();
+        }
+        let mut live = editchain_project::live::LiveProjection::default();
+        let mut admitted = std::collections::BTreeMap::new();
+        let compare =
+            |live: &editchain_project::live::LiveProjection,
+             admitted: &std::collections::BTreeMap<_, editchain_core::Op>| {
+                let offline = editchain_project::HistoryProjection::from_ops(
+                    admitted.values().cloned().collect(),
+                );
+                let key = |item: &editchain_project::CodexLogicalItem| {
+                    (item.source, item.turn.clone(), item.item.clone())
+                };
+                let mut actual = live.current_items();
+                let mut expected = offline.codex_logical_items().to_vec();
+                actual.sort_by_key(key);
+                expected.sort_by_key(key);
+                assert_eq!(actual, expected);
+            };
+        for op in &ops {
+            drop(admitted.insert(op.id, op.clone()));
+            let _changes = live.apply(vec![op.clone()], &[]);
+            compare(&live, &admitted);
+        }
+        for op in &ops {
+            drop(admitted.remove(&op.id));
+            let _changes = live.apply(Vec::new(), &[op.id]);
+            compare(&live, &admitted);
+            drop(admitted.insert(op.id, op.clone()));
+            let _changes = live.apply(vec![op.clone()], &[]);
+            compare(&live, &admitted);
+        }
+    }
+}
+
+#[test]
 fn user_message_echoes_fold_without_erasing_edits_repetition_or_new_incarnations() {
     let dir = tempfile::tempdir().unwrap();
     let user = |ordinal, id, text| {
@@ -989,6 +1079,7 @@ fn repository_lookup_failure_discards_capture_and_absence_emits_no_git_claim() {
     let options = ImportOptions::default();
     let capture = |repositories: &dyn editchain_import::codex::RepositoryLookup| {
         let request = CodexDiscoveryRequest {
+            selected_paths: Vec::new(),
             repositories,
             workspace_path: root.into(),
             raw_root: root.into(),
@@ -1635,6 +1726,7 @@ fn repeated_upserts_preserve_revisions_and_fold_current_logical_items() {
   if ($0 ~ /"token":"COMPACT_B_REPEAT"/) { printf "{\"schemaVersion\":\"editchain-v1\",\"recordType\":\"line\",\"sourcePath\":\"x\",\"sourceOrdinal\":%d,\"decode\":{\"status\":\"ok\",\"kind\":\"responseItem\"},\"projection\":{\"changedItems\":[{\"turnId\":\"turn-1\",\"item\":{\"kind\":\"agentMessage\",\"id\":\"item-b\",\"text\":\"b-final\"}}],\"changedTurns\":[],\"removedTurnIds\":[]}}\n", NR; next }
   printf "{\"schemaVersion\":\"editchain-v1\",\"recordType\":\"line\",\"sourcePath\":\"x\",\"sourceOrdinal\":%d,\"decode\":{\"status\":\"ok\",\"kind\":\"sessionMeta\"},\"projection\":{\"changedItems\":[],\"changedTurns\":[],\"removedTurnIds\":[]}}\n", NR
 }
+
 "#;
     let harness = import(dir.path(), &helper_in(&dir, awk));
     assert_eq!(harness.report.raw_ops, 6);
@@ -1674,6 +1766,94 @@ fn repeated_upserts_preserve_revisions_and_fold_current_logical_items() {
         .map(|item| item.source.seq >> 16)
         .collect();
     assert_eq!(latest, [3, 6]);
+    // A live reader must identify the same logical message across different
+    // immutable output IDs and across whole-directory / single-file discovery.
+    write_rollout(
+        dir.path(),
+        "rollout-1.jsonl",
+        &[
+            session_meta_line("thread-1", "s"),
+            event_line("ECHO_A_FIRST"),
+        ],
+    );
+    let early = try_import_selected(
+        dir.path(),
+        vec![path],
+        &helper_in(&dir, awk),
+        &ImportOptions::default(),
+        &mut MemoryCursorStore::new(),
+    )
+    .unwrap();
+    let early_view = editchain_project::HistoryProjection::from_ops(early.ops.ops);
+    let early_id = *early_view
+        .codex_logical_items()
+        .first()
+        .unwrap()
+        .outputs
+        .first()
+        .unwrap();
+    let latest_id = *view
+        .codex_logical_items()
+        .first()
+        .unwrap()
+        .outputs
+        .first()
+        .unwrap();
+    assert_ne!(early_id, latest_id);
+    assert_eq!(
+        early_view.continuity_key(early_id),
+        view.continuity_key(latest_id)
+    );
+    assert!(view.continuity_key(latest_id).is_some());
+}
+
+#[test]
+fn live_file_identity_survives_another_path_inserted_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = |path: &str| serde_json::json!({ "path": path, "kind": "update", "diff": "@@ -1 +1 @@\n-old\n+new" });
+    let item = |changes: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "turnId": "turn-1", "item": { "kind": "fileChange", "id": "patch-1", "status": "completed", "changes": changes },
+        })
+    };
+    let records = vec![
+        line_record(
+            1,
+            Vec::new(),
+            Some(serde_json::json!({"threadId": "thread-1"})),
+        ),
+        line_record(2, vec![item(vec![file("/workspace/b.txt")])], None),
+        line_record(
+            3,
+            vec![item(vec![
+                file("/workspace/a.txt"),
+                file("/workspace/b.txt"),
+            ])],
+            None,
+        ),
+    ];
+    let mut cursors = MemoryCursorStore::new();
+    let first = import_projection_prefix(
+        &dir,
+        records.get(..2).unwrap(),
+        &ImportOptions::default(),
+        &mut cursors,
+    );
+    let early = editchain_project::HistoryProjection::from_ops(first.ops.ops.clone());
+    let added = import_projection_prefix(&dir, &records, &ImportOptions::default(), &mut cursors);
+    let later = editchain_project::HistoryProjection::from_ops(
+        first.ops.ops.into_iter().chain(added.ops.ops).collect(),
+    );
+    let retained = |projection: &editchain_project::HistoryProjection| {
+        let item = projection.codex_logical_items().first().unwrap();
+        projection.ops().iter().find(|op| item.outputs.contains(&op.id)
+            && matches!(&op.kind, OpKind::File(file) if file.path == derive_path_id("/workspace/b.txt"))).unwrap().id
+    };
+    let before = retained(&early);
+    let after = retained(&later);
+    assert_ne!(before, after);
+    assert_eq!(early.continuity_key(before), later.continuity_key(after));
+    assert!(later.continuity_key(after).is_some());
 }
 
 #[test]
@@ -3325,6 +3505,7 @@ fn import_workspace_into(
     let mut blobs = ContentAddressedBlobSink::new();
     let repository = FixtureRepository(workspace);
     let request = CodexDiscoveryRequest {
+        selected_paths: Vec::new(),
         repositories: &repository,
         workspace_path: workspace.to_path_buf(),
         raw_root: root.to_path_buf(),

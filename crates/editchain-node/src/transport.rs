@@ -13,6 +13,7 @@ use crate::history::{
 /// A stateful server that owns a loaded workspace across requests.
 #[derive(Debug)]
 pub struct Server {
+    live: Option<crate::history::LiveWorkspace>,
     /// The currently loaded workspace (None until `Open`).
     pub workspace: Option<Workspace>,
     /// The immutable lexical search index bound to the opened snapshot (built
@@ -25,9 +26,46 @@ impl Server {
     #[must_use]
     pub const fn new() -> Self {
         Self {
+            live: None,
             workspace: None,
             lexical: None,
         }
+    }
+
+    /// Encode a response for the stdio transport. Large live baselines borrow
+    /// the retained topology instead of cloning it into a generic JSON tree.
+    ///
+    /// # Errors
+    /// Returns request, workspace and serialization errors.
+    pub fn handle_encoded(
+        &mut self,
+        request: &Request,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        match editchain_index::boundary(|| self.handle_encoded_inner(request)) {
+            Ok(result) => result,
+            Err(error) => {
+                self.live = None;
+                Err(error.into())
+            }
+        }
+    }
+
+    fn handle_encoded_inner(
+        &mut self,
+        request: &Request,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        if let RequestBody::OpenLive(open) = &request.body {
+            if request.body.validate().is_ok() {
+                self.live = None;
+                let live = crate::history::LiveWorkspace::open(open)?;
+                let encoded = live.encode_opened(request.id)?;
+                self.live = Some(live);
+                self.workspace = None;
+                self.lexical = None;
+                return Ok(encoded);
+            }
+        }
+        Ok(serde_json::to_vec(&self.handle(request)?)?)
     }
 
     /// Handle a single request against the current state.
@@ -36,11 +74,47 @@ impl Server {
     ///
     /// Returns an error if the request cannot be handled.
     pub fn handle(&mut self, request: &Request) -> Result<Response, Box<dyn std::error::Error>> {
+        match editchain_index::boundary(|| self.handle_inner(request)) {
+            Ok(result) => result,
+            Err(error) => {
+                self.live = None;
+                Err(error.into())
+            }
+        }
+    }
+
+    fn handle_inner(&mut self, request: &Request) -> Result<Response, Box<dyn std::error::Error>> {
         let id = request.id;
         if let Err(error) = request.body.validate() {
             return Ok(Response {
                 id,
                 body: ResponseBody::Error(error),
+            });
+        }
+        if let RequestBody::OpenLivePaged(open) = &request.body {
+            self.live = None;
+            let live = crate::history::LiveWorkspace::open_paged(open)?;
+            let body = ResponseBody::Ok(serde_json::to_value(live.opened())?);
+            self.live = Some(live);
+            self.workspace = None;
+            self.lexical = None;
+            return Ok(Response { id, body });
+        }
+        if let RequestBody::OpenLive(open) = &request.body {
+            self.live = None;
+            let live = crate::history::LiveWorkspace::open(open)?;
+            let body = ResponseBody::Ok(serde_json::to_value(live.opened())?);
+            self.live = Some(live);
+            self.workspace = None;
+            self.lexical = None;
+            return Ok(Response { id, body });
+        }
+        if matches!(request.body, RequestBody::Open(_) | RequestBody::Refresh(_)) {
+            self.live = None;
+        } else if let Some(live) = &mut self.live {
+            return Ok(Response {
+                id,
+                body: live.handle(&request.body)?,
             });
         }
         if let Some(requested) = request.body.snapshot_id() {
@@ -57,7 +131,15 @@ impl Server {
             }
         }
         let reads_sources = match &request.body {
-            RequestBody::Open(_) | RequestBody::Refresh(_) | RequestBody::GetWindow(_) => false,
+            RequestBody::Open(_)
+            | RequestBody::OpenLive(_)
+            | RequestBody::OpenLivePaged(_)
+            | RequestBody::SyncLive(_)
+            | RequestBody::Refresh(_)
+            | RequestBody::GetWindow(_)
+            | RequestBody::LocateRows(_)
+            | RequestBody::ToggleLive(_)
+            | RequestBody::ViewportLive(_) => false,
             RequestBody::FindInHistory(_) => self.lexical.is_none(),
             RequestBody::GetNodeDetails(_)
             | RequestBody::ResolveObject(_)
@@ -70,6 +152,11 @@ impl Server {
                 .ensure_sources_current()?;
         }
         let body = match &request.body {
+            RequestBody::OpenLive(_)
+            | RequestBody::OpenLivePaged(_)
+            | RequestBody::ToggleLive(_)
+            | RequestBody::ViewportLive(_)
+            | RequestBody::SyncLive(_) => return Err(no_workspace().into()),
             RequestBody::Open(req) | RequestBody::Refresh(req) => {
                 let workspace = if matches!(&request.body, RequestBody::Open(_)) {
                     Workspace::open(&req.workspace_path, &req.chain_dir)?
@@ -79,7 +166,9 @@ impl Server {
                 let diagnostics = workspace.diagnostics;
                 let warnings = workspace.diagnostics.warnings();
                 let response = OpenResponse {
+                    live: None,
                     protocol_version: PROTOCOL_VERSION,
+                    live_updates: true,
                     snapshot_id: workspace.snapshot_id().clone(),
                     workspace: req.workspace_path.clone(),
                     chain: req.chain_dir.clone(),
@@ -104,6 +193,10 @@ impl Server {
                     include_layout: req.include_layout,
                 })?;
                 ResponseBody::Ok(serde_json::to_value(window)?)
+            }
+            RequestBody::LocateRows(req) => {
+                let ws = self.workspace.as_mut().ok_or_else(no_workspace)?;
+                ResponseBody::Ok(serde_json::to_value(ws.locate_rows(&req.keys)?)?)
             }
             RequestBody::GetNodeDetails(req) => {
                 let ws = self.workspace.as_ref().ok_or_else(no_workspace)?;

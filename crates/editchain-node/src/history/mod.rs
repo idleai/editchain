@@ -13,6 +13,9 @@ use tempfile as _;
 mod details;
 mod files;
 mod legacy_preview;
+mod live;
+mod realtime;
+pub(crate) use realtime::LiveWorkspace;
 mod payloads;
 mod presentation;
 mod search;
@@ -646,6 +649,33 @@ pub fn prepare_render_snapshot(
         &expansion_spans,
         &workspace.source_op_locations,
     )
+}
+
+/// Prepare or incrementally advance the native live checkpoint used by VS Code.
+/// Existing checkpoints resume their admission frontier and hydrate index pages
+/// on demand. Source records remain authoritative.
+///
+/// # Errors
+/// Returns source, checkpoint validation, locking or durable IO errors.
+pub fn prepare_live_checkpoint(
+    workspace_path: &Path,
+    chain_dir: &Path,
+) -> Result<editchain_protocol::OpenResponse, Box<dyn std::error::Error>> {
+    editchain_index::boundary(|| {
+        let mut workspace = LiveWorkspace::prepare(&editchain_protocol::OpenRequest {
+            workspace_path: workspace_path.to_string_lossy().into_owned(),
+            chain_dir: chain_dir.to_string_lossy().into_owned(),
+        })?;
+        let opened = workspace.opened();
+        if let Some(baseline) = opened.live {
+            let _update = workspace.sync(&editchain_protocol::SyncLiveRequest {
+                epoch: baseline.epoch,
+                after_revision: baseline.revision,
+                codex: None,
+            })?;
+        }
+        Ok(workspace.opened())
+    })?
 }
 
 /// Parse an exact decimal `RepositoryId` string, rejecting anything else.

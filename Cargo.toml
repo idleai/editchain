@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/editchain-index",
     "crates/editchain-core",
     "crates/editchain-store",
     "crates/editchain-node",

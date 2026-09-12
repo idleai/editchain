@@ -37,6 +37,8 @@ export const config: Options.Testrunner = {
         // Open the editchain repo so the extension finds .editchain/ and git.
         workspacePath: '/mnt/hot/ambientlight/repos/editchain',
         userSettings: {
+          // Keep the historical Activity matrix fixed; default live has its own suite.
+          'editchain-history.live.enabled': false,
           // Point the extension at the built Rust service binary.
           'editchain-history.servicePath':
             '/mnt/hot/ambientlight/repos/editchain/target/release/editchain-vscode-service',

@@ -73,9 +73,20 @@ pub(crate) fn try_import(
     options: &ImportOptions,
     cursors: &mut MemoryCursorStore,
 ) -> Result<Harness, ImportError> {
+    try_import_selected(root, Vec::new(), helper, options, cursors)
+}
+
+pub(crate) fn try_import_selected(
+    root: &Path,
+    selected_paths: Vec<PathBuf>,
+    helper: &HelperCommand,
+    options: &ImportOptions,
+    cursors: &mut MemoryCursorStore,
+) -> Result<Harness, ImportError> {
     let mut ops_sink = MemoryOpSink::new();
     let mut blobs_sink = ContentAddressedBlobSink::new();
     let request = CodexDiscoveryRequest {
+        selected_paths,
         repositories: &(),
         workspace_path: PathBuf::from("/workspace"),
         raw_root: root.to_path_buf(),

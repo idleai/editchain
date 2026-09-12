@@ -47,9 +47,13 @@ pub(super) fn run(
         provider,
         codex_helper,
         codex_helper_arg: codex_helper_args,
+        codex_rollout,
     } = request;
     options.cancellation.check(Path::new(&sessions_dir))?;
     check_codex_only_helper_args(provider, codex_helper.as_deref(), &codex_helper_args)?;
+    if provider != Provider::Codex && !codex_rollout.is_empty() {
+        return Err("--codex-rollout requires --provider codex".into());
+    }
 
     let chain_path = PathBuf::from(&chain);
     // Hold the writer lock before reading cursors, capturing sources, or
@@ -94,6 +98,7 @@ pub(super) fn run(
                         repositories: &repositories,
                         workspace_path: PathBuf::from(&workspace),
                         raw_root,
+                        selected_paths: codex_rollout.clone(),
                     };
                     let helper = codex_helper_command(codex_helper, codex_helper_args);
 
@@ -165,16 +170,15 @@ pub(super) fn run(
             std::env::current_dir()?.join(&chain_path)
         };
         let snapshot =
-            crate::history::prepare_render_snapshot(&workspace_path, &snapshot_chain_path);
+            crate::history::prepare_live_checkpoint(&workspace_path, &snapshot_chain_path);
         match snapshot {
             Ok(snapshot) => println!(
-                "Render snapshot {}: {} rows at {}",
-                if snapshot.reused { "reused" } else { "generated" },
-                snapshot.rows,
-                snapshot.path.display()
+                "Live checkpoint ready: {} visible rows at {}/live-v1",
+                snapshot.nodes,
+                snapshot.chain
             ),
             Err(error) => println!(
-                "Render snapshot preparation failed (import remains durable; run prepare-view to retry): {error}"
+                "Live checkpoint preparation failed (import remains durable; run prepare-view to retry): {error}"
             ),
         }
     } else {
@@ -424,6 +428,7 @@ mod tests {
         let held = SegmentStore::open(&chain).unwrap();
         let error = run(
             ImportCommand {
+                codex_rollout: Vec::new(),
                 sessions_dir: dir
                     .path()
                     .join("missing-sources")
@@ -583,6 +588,7 @@ mod tests {
         let import = |sessions: &str, chain: &str| {
             run(
                 ImportCommand {
+                    codex_rollout: Vec::new(),
                     sessions_dir: sessions.to_string(),
                     workspace: "/workspace".to_string(),
                     chain: chain.to_string(),
