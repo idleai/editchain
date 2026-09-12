@@ -34,7 +34,7 @@ async function rows() {
     const rows = Array.from({ length: 300 }, (_, index) => ({ index, row: window.__editchainRowAt?.(index) }))
       .filter(entry => entry.row && !entry.row.is_subop)
       .map(({ index, row }) => ({ index, key: row!.continuity_key, node: row!.node_key, lane: row!.lane,
-        parents: row!.parents, above: row!.above, below: row!.below, transitions: row!.transitions }));
+        parents: row!.parents, above: row!.above, below: row!.below, transitions: row!.transitions, task: row!.task_group }));
     for (const row of rows) identities[row.node] = row.key;
     return rows.map(row => ({ ...row, parents: row.parents.map(parent => identities[parent] || parent) }));
   });
@@ -133,6 +133,17 @@ describe('Physical Codex subagent branches', () => {
     message(source, 'main-after-join', 'Main session integrates the three completed investigations');
     await item('main-after-join');
     await idle();
+    // Offscreen paths now fold by default. Explicitly open them before
+    // comparing every physical node and edge across the full branch history.
+    for (const folded of (await rows()).filter(row => row.task?.expanded === false)) {
+      await browser.execute(key => {
+        const row = Array.from(document.querySelectorAll('.row[data-continuity]'))
+          .find(row => row.getAttribute('data-continuity') === key);
+        (row?.querySelector('.task-chevron') as HTMLButtonElement)?.click();
+      }, folded.key);
+      await browser.waitUntil(async () => (await rows()).find(row => row.key === folded.key)?.task?.expanded === true, { timeout: 30000 });
+      await idle();
+    }
     const merged = await rows();
     validateTopology(merged);
     for (const row of [...original, ...branched]) expect(merged.find(current => current.key === row.key)?.lane).toBe(row.lane);

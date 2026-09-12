@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, rc::Rc};
 
 // Increment when reducer, routing, task or disk-index semantics change.
-pub(super) const VERSION: u64 = 3;
+pub(super) const VERSION: u64 = 4;
 
 #[derive(Serialize)]
 struct Borrowed<'a> {

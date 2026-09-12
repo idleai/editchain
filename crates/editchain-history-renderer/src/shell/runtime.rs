@@ -125,6 +125,9 @@ fn schedule_post_flush() {
 /// bridge may re-enter the listener synchronously).
 pub(super) fn execute_send(send: &Send) {
     match send {
+        Send::LiveViewport(viewport) => {
+            post_envelope(&json!({ "type": "liveViewport", "viewport": viewport }));
+        }
         Send::ToggleDisclosure { key, task } => {
             post_envelope(&json!({ "type": "toggleDisclosure", "key": key, "task": task }));
         }

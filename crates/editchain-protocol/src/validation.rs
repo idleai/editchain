@@ -21,6 +21,21 @@ impl RequestBody {
     /// Returns `InvalidInput` for unsupported limits or inexact coordinates.
     pub fn validate(&self) -> Result<(), ServiceError> {
         match self {
+            Self::ViewportLive(request) => {
+                if request.snapshot_id.is_empty()
+                    || request.capacity == 0
+                    || request.capacity > 256
+                    || request.keys.len() > 256
+                    || request
+                        .keys
+                        .iter()
+                        .any(|key| key.is_empty() || key.len() > 2048)
+                {
+                    return Err(invalid(
+                        "viewport exceeds 256 identities or 2048 bytes per identity",
+                    ));
+                }
+            }
             Self::ToggleLive(request) => {
                 if request.snapshot_id.is_empty()
                     || request.key.is_empty()

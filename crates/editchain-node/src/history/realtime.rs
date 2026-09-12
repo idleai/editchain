@@ -41,6 +41,7 @@ pub(crate) struct LiveWorkspace {
     coordinates: editchain_protocol::rank::Axis,
     preparing: bool,
     disclosure: disclosure::Disclosure,
+    viewport: Option<disclosure::Viewport>,
     checkpoint_store: std::rc::Rc<editchain_index::Storage>,
     root: PathBuf,
     chain: PathBuf,
@@ -108,6 +109,7 @@ impl LiveWorkspace {
             coordinates: editchain_protocol::rank::Axis::Expanded,
             preparing: true,
             disclosure: disclosure::Disclosure::default(),
+            viewport: None,
             checkpoint_store,
             blobs: editchain_store::BlobReader::open(&chain)?,
             root,
@@ -139,7 +141,8 @@ impl LiveWorkspace {
             tasks: tasks::Tasks::default(),
         };
         if let Some(saved) = saved {
-            let repair = saved.version < checkpoint::VERSION;
+            let repair = saved.version < 3;
+            let disclosure = saved.version < 4;
             let regroup = saved.version == 1;
             workspace.adopt(saved, true)?;
             if regroup {
@@ -148,6 +151,11 @@ impl LiveWorkspace {
             if repair {
                 workspace.repair_graph()?;
             }
+            if disclosure {
+                workspace.regroup_disclosure();
+                workspace.checkpoint()?;
+            }
+            workspace.expire_viewport()?;
             workspace.preparing = false;
             return Ok(workspace);
         }
@@ -504,6 +512,7 @@ impl LiveWorkspace {
             .into_iter()
             .map(|block| (block.meta.key.clone(), block))
             .collect();
+        let arrivals = changed.keys().cloned().collect();
         for (key, mut parents) in self.ancestry.changed(&self.projection) {
             parents.extend(self.git.parent_keys(&key));
             parents.sort();
@@ -590,7 +599,11 @@ impl LiveWorkspace {
                 },
             ));
         }
-        self.update_disclosure(removed, &changed.keys().cloned().collect::<Vec<_>>())?;
+        self.update_disclosure(
+            removed,
+            &changed.keys().cloned().collect::<Vec<_>>(),
+            &arrivals,
+        )?;
         Ok((removed.to_vec(), changed.into_values().collect()))
     }
 }

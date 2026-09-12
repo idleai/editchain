@@ -44,8 +44,22 @@ oracle after individual admissions, retractions and restorations.
 Native thread/turn identities and rollback boundaries own task membership.
 Only exact non-branching causal paths fold. Their summaries annotate existing
 physical items; grouping adds no rows or synthetic graph nodes. Concurrent
-sessions can interleave without creating repeated task headers. New/revised
-members stay readable, including a fresh anchor inside a collapsed path.
+sessions can interleave without creating repeated task headers. Native task
+paths start folded offscreen. On the first viewport at the head, the latest
+task's visible paths open by default. `ViewportLive` reports at most 256 actual
+visible row identities and a viewport capacity, separately from page prefetch.
+New/revised members in that viewport open their entire path, with the ribbon
+and content sharing the same expanded state. Automatic paths stay open while
+any member remains visible, even after completion or the ribbon leaving view.
+Explicit opens and closes remain durable. Viewport membership checks inspect
+only reported rows and the automatic group set. A fold transition remeasures
+that path; subsequent +1 appends still visit only changed boundaries. A burst
+limits candidate paths by viewport capacity, but an opened path is fully open
+and content remains virtualized.
+The host coalesces scroll reports behind its existing live publication barrier
+and drops reports from obsolete snapshots. After a path folds offscreen,
+scrolling back alone does not reopen it. The legacy full-topology client
+retains its earlier policy.
 Item details and task paths have separate controls. See the
 [grouping contract](realtime-grouping-research.md) for path boundaries and
 checkpoint migration.

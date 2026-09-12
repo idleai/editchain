@@ -137,6 +137,8 @@ pub(crate) fn find_in_history(snapshot_id: &SnapshotId, query: &str, top_k: usiz
 /// against the acquired VS Code API; pure tests assert on them directly.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Send {
+    /// Actual painted identities; prefetched rows never count as exposure.
+    LiveViewport(editchain_protocol::ViewportLiveRequest),
     /// Serialize native disclosure with live publication in the extension host.
     ToggleDisclosure { key: String, task: bool },
     /// Complete the host's publication barrier after the new viewport paints.

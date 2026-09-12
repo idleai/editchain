@@ -37,6 +37,34 @@ const deltaBody = (revision) => ({ Ok: { epoch: 'epoch', revision, work: {}, del
   removed: [], upserts: [],
 }] } });
 
+test('viewport reports coalesce behind a live publication and obsolete snapshots are dropped', async () => {
+  const env = loadExtension();
+  env.open();
+  const panel = env.panels[0];
+  await rendererReady(panel);
+  env.client.openRequests[0].resolve(liveBody('epoch:0'));
+  await flush();
+  env.client.nextResponse = deltaBody(1);
+  await panel.handlers.message({ type: 'toggleDisclosure', key: 'item:1', task: true });
+  await flush();
+  const viewport = (snapshot, key) => ({ type: 'liveViewport', viewport: {
+    snapshot_id: snapshot, keys: [key], capacity: 24, at_head: false,
+  } });
+  await panel.handlers.message(viewport('epoch:1', 'item:10'));
+  await panel.handlers.message(viewport('epoch:1', 'item:20'));
+  await panel.handlers.message(viewport('epoch:1', 'item:30'));
+  assert.equal(env.client.requests.filter(request => request.body.ViewportLive).length, 0);
+  env.client.nextResponse = { Ok: { epoch: 'epoch', revision: 1, deltas: [], work: {} } };
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'epoch:1', error: null });
+  await flush();
+  const reports = env.client.requests.filter(request => request.body.ViewportLive);
+  assert.equal(reports.length, 1);
+  assert.deepEqual(reports[0].body.ViewportLive.keys, ['item:30']);
+  await panel.handlers.message(viewport('epoch:0', 'item:old'));
+  await flush();
+  assert.equal(env.client.requests.filter(request => request.body.ViewportLive).length, 1);
+});
+
 const uri = (s) => ({ toString: () => s, fsPath: s.replace(/^file:\/\//, '') });
 
 // Stub modules are written to disk so the compiled extension.js can `require`

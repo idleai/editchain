@@ -531,6 +531,54 @@ fn native_pages_restore_a_distant_anchor_before_acknowledging() {
 }
 
 #[test]
+fn native_exposure_reports_only_actual_viewport_rows_and_deduplicates_prefetch_ticks() {
+    let mut state = HistoryAppState {
+        snapshot_id: SnapshotId::new("native"),
+        total: Some(1000),
+        phase: SnapshotPhase::LayoutReady,
+        ..HistoryAppState::default()
+    };
+    state
+        .open_remote(
+            &serde_json::from_value(json!({
+                "paged":true, "epoch":"native", "revision":0, "total":1000, "blocks":[]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    for index in 0..500 {
+        drop(state.cache.insert_legacy(
+            ExpandedRow::new(index).unwrap(),
+            &row(usize::try_from(index).unwrap()),
+        ));
+    }
+    let mut step = Step::new();
+    state.report_live_viewport(&Viewport::new(34 * 100, 68), &mut step);
+    let report = step
+        .sends
+        .iter()
+        .find_map(|send| {
+            if let Send::LiveViewport(report) = send {
+                Some(report)
+            } else {
+                None
+            }
+        })
+        .expect("missing viewport report");
+    assert!(!report.at_head);
+    assert!(
+        report.keys.len() <= 3,
+        "the 500 prefetched rows are not on screen"
+    );
+    assert_eq!(report.keys.first().unwrap(), "item:100");
+    assert!(report.keys.last().unwrap() == "item:101" || report.keys.last().unwrap() == "item:102");
+    state.report_live_viewport(&Viewport::new(34 * 100, 68), &mut step);
+    assert_eq!(step.sends.len(), 1);
+    state.report_live_viewport(&Viewport::new(0, 68), &mut step);
+    assert!(matches!(step.sends.get(1), Some(Send::LiveViewport(report)) if report.at_head));
+}
+
+#[test]
 fn task_control_opens_the_physical_path_without_toggling_item_details() {
     let mut state = grouped_state();
     let mut content = row(2);

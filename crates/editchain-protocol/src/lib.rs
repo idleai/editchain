@@ -47,6 +47,8 @@ pub enum RequestBody {
     OpenLivePaged(OpenRequest),
     /// Toggle a native disclosure row in the current revision.
     ToggleLive(ToggleLiveRequest),
+    /// Report the actual visible rows, independently of prefetched pages.
+    ViewportLive(ViewportLiveRequest),
     /// Capture provider appends and replay revisioned changes since a cursor.
     SyncLive(SyncLiveRequest),
     /// Reopen authoritative sources, bypassing derived caches after negotiation.
@@ -124,6 +126,20 @@ pub struct ToggleLiveRequest {
     pub snapshot_id: SnapshotId,
     /// Stable presentation identity of the physical parent row.
     pub key: String,
+}
+
+/// Bounded viewport identities used to expire automatic live exposure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewportLiveRequest {
+    /// Revision whose visible coordinates the viewer painted.
+    pub snapshot_id: SnapshotId,
+    /// Physical row identities actually on screen, in display order.
+    pub keys: Vec<String>,
+    /// Maximum rows fitting in the viewport, excluding prefetch buffers.
+    pub capacity: u16,
+    /// Newest arrivals enter the viewport when it follows the head.
+    pub at_head: bool,
 }
 
 /// Get a window of history rows (cursor-based paging).

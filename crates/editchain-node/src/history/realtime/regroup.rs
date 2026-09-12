@@ -69,6 +69,6 @@ impl LiveWorkspace {
         }
         drop(self.connect(&[], blocks)?);
         self.regroup_disclosure();
-        self.checkpoint()
+        Ok(())
     }
 }

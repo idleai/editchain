@@ -572,6 +572,7 @@ impl HistoryAppState {
     /// range, pushing DOM ops onto `step`. Mirrors the production additive
     /// virtual scroll.
     pub(crate) fn sync_window(&mut self, viewport: &Viewport, step: &mut Step) {
+        self.report_live_viewport(viewport, step);
         if self.live.is_some() {
             return;
         }
@@ -1333,6 +1334,7 @@ impl HistoryAppState {
                 self.total = Some(nodes);
                 if nodes == 0 {
                     self.phase = SnapshotPhase::LayoutReady;
+                    self.report_live_viewport(viewport, step);
                     step.sends.push(Send::LiveSettled {
                         snapshot_id: self.snapshot_id.as_str().to_owned(),
                         error: None,
@@ -1445,7 +1447,7 @@ impl HistoryAppState {
         match host::unwrap(body) {
             Unwrapped::Err(error) => self.fail_response(&req.body, &error, step),
             Unwrapped::Ok(value) => match &req.body {
-                RequestBody::ToggleLive(_) => {
+                RequestBody::ToggleLive(_) | RequestBody::ViewportLive(_) => {
                     self.handle_delta(Some(serde_json::json!({ "Ok": value })), viewport, step);
                 }
                 RequestBody::LocateRows(_) => self.handle_live_locations(value, step),

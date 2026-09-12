@@ -32,6 +32,9 @@ let lastOpenError: string | null = null;
 let openPending = false;
 let liveViewportReady = false;
 let livePublication: Promise<unknown> = Promise.resolve();
+type LiveViewport = { snapshot_id: string; keys: string[]; capacity: number; at_head: boolean };
+let pendingViewport: LiveViewport | undefined;
+let viewportQueued = false;
 // Monotonic ownership token for Open requests and the CURRENT panel. Bumped on
 // every startOpen and on every disposal of the current panel. An async Open
 // response captures the epoch it was issued under and only mutates the shared
@@ -346,6 +349,17 @@ function openHistoryView(
       }
       return;
     }
+    if (msg.type === 'liveViewport') {
+      const viewport = msg.viewport;
+      if (panel === historyPanel && typeof viewport?.snapshot_id === 'string'
+        && Array.isArray(viewport.keys) && viewport.keys.length <= 256
+        && viewport.keys.every((key: unknown) => typeof key === 'string' && key.length > 0 && key.length <= 2048)
+        && Number.isInteger(viewport.capacity) && viewport.capacity > 0 && viewport.capacity <= 256
+        && typeof viewport.at_head === 'boolean') {
+        queueViewport(client, panel, viewport);
+      }
+      return;
+    }
     if (msg.type === 'liveSettled') {
       if (panel === historyPanel && !msg.error && msg.snapshot_id === lastOpenBody?.Ok.snapshot_id) {
         liveViewportReady = true;
@@ -519,6 +533,26 @@ function syncNative(client: StdioClient, panel: vscode.WebviewPanel, codex?: Liv
   return queueLive(() => syncNativeSerial(client, panel, codex, disclosure));
 }
 
+function queueViewport(client: StdioClient, panel: vscode.WebviewPanel, viewport: LiveViewport): void {
+  pendingViewport = viewport;
+  if (viewportQueued) return;
+  viewportQueued = true;
+  const owner = openEpoch;
+  void queueLive(async () => {
+    const report = pendingViewport;
+    pendingViewport = undefined;
+    if (panel !== historyPanel || !lastOpenBody?.Ok.live?.paged
+      || report?.snapshot_id !== lastOpenBody.Ok.snapshot_id) return;
+    const response = await client.request({ ViewportLive: report }, { timeoutMs: NON_OPEN_TIMEOUT_MS });
+    await publishNative(client, panel, response, owner);
+  }).catch(error => output?.appendLine('[live] Viewport disclosure failed: ' + String(error)))
+    .finally(() => {
+      if (owner !== openEpoch) return;
+      viewportQueued = false;
+      if (pendingViewport) queueViewport(client, panel, pendingViewport);
+    });
+}
+
 function queueLive<T>(operation: () => Promise<T>): Promise<T | void> {
   const owner = openEpoch;
   const work = async () => {
@@ -617,6 +651,8 @@ function startOpen(client: StdioClient, panel: vscode.WebviewPanel, refresh = fa
   // previous workspace's body survive a restart that may fail.
   openPending = true;
   liveViewportReady = false;
+  pendingViewport = undefined;
+  viewportQueued = false;
   lastOpenBody = null;
   lastOpenError = null;
   openDeliveredToRenderer = null;

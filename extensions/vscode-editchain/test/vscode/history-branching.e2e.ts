@@ -70,6 +70,15 @@ describe('Stable live Codex branching', () => {
       try { view = await workbench.getWebviewByTitle('EditChain History'); return true; } catch { return false; }
     }, { timeout: 30000 });
     await view!.open();
+    await browser.waitUntil(() => browser.execute(() => !!document.querySelector('.task-chevron')), { timeout: 90000 });
+    await browser.waitUntil(() => browser.execute(() => !!document.querySelector('.task-chevron[aria-expanded="true"]')),
+      { timeout: 30000 });
+    // Explicitly reopen the initial task so this full-lane comparison stays
+    // expanded even after all of its members leave the actual viewport.
+    await browser.execute(() => (document.querySelector('.task-chevron[aria-expanded="true"]') as HTMLButtonElement)?.click());
+    await browser.waitUntil(() => browser.execute(() => !!document.querySelector('.task-chevron[aria-expanded="false"]')),
+      { timeout: 30000 });
+    await browser.execute(() => (document.querySelector('.task-chevron[aria-expanded="false"]') as HTMLButtonElement)?.click());
     await browser.waitUntil(async () => (await snapshot()).length > 70, { timeout: 90000 });
     const original = await snapshot();
     const evidence = [];

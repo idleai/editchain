@@ -116,6 +116,7 @@ impl RequestBody {
             | Self::SyncLive(_)
             | Self::Refresh(_) => None,
             Self::ToggleLive(request) => Some(&request.snapshot_id),
+            Self::ViewportLive(request) => Some(&request.snapshot_id),
             Self::GetWindow(request) => Some(&request.snapshot_id),
             Self::LocateRows(request) => Some(&request.snapshot_id),
             Self::FindInHistory(request) => Some(&request.snapshot_id),

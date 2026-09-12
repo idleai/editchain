@@ -53,7 +53,7 @@ async function toggle(key: string) {
 }
 
 describe('Native task disclosure in live Codex history', () => {
-  it('folds completed history, keeps new items visible, preserves physical identities and lanes, and finds hidden work', async () => {
+  it('opens the latest task, respects explicit folds, preserves physical identities and lanes, and finds hidden work', async () => {
     await browser.executeWorkbench(async vscode => {
       await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
       await vscode.commands.executeCommand('workbench.action.closeSidebar');
@@ -69,6 +69,8 @@ describe('Native task disclosure in live Codex history', () => {
     await browser.waitUntil(async () => (await state()).visible.filter(row => row.header).length === 2,
       { timeout: 90000, timeoutMsg: 'native task path controls did not reach the view' });
     await idle();
+    await browser.waitUntil(async () => (await state()).cached.find(row => row.task?.turn_id === 'task-live')?.task.expanded === true,
+      { timeout: 30000, timeoutMsg: 'latest task did not open by default' });
     const initial = await state();
     fs.writeFileSync(path.resolve('trace/task-path-initial.json'), JSON.stringify(initial, null, 2));
     expect(initial.cached.every(row => row.kind !== 'task' && !row.key.startsWith('task:'))).toBe(true);
@@ -124,8 +126,8 @@ describe('Native task disclosure in live Codex history', () => {
     const late = await state();
     const lateTask = late.cached.find(row => row.task?.turn_id === 'task-live')!;
     expect(lateTask.task.expanded).toBe(false);
-    expect(lateTask.task.summarized).toBe(false);
-    expect(late.visible.find(row => row.key === lateTask.key)?.text).toContain('Live incremental item live-new-2');
+    expect(lateTask.task.summarized).toBe(true);
+    expect(late.visible.find(row => row.key === lateTask.key)?.text).toContain(lateTask.task.title);
     expect(late.visible.some(row => row.key?.endsWith(':live-1'))).toBe(false);
     expect(late.visible.find(row => row.key === history.key)?.expanded).toBe('false');
     for (const row of initial.cached.filter(row => !row.task)) {
@@ -134,13 +136,19 @@ describe('Native task disclosure in live Codex history', () => {
     }
     expect(late.centers).toEqual(initial.centers);
     fs.writeFileSync(path.resolve('trace/task-grouping-geometry.json'), JSON.stringify(late, null, 2));
-    expect(late.visible.filter(row => row.key?.includes('live-new')).every(row => row.dots.length === 1 && row.dots[0].contained)).toBe(true);
+    expect(await browser.execute(key => {
+      const row = Array.from(document.querySelectorAll('.row[data-continuity]'))
+        .find(row => row.getAttribute('data-continuity') === key);
+      const capsule = row?.querySelector('.graphBundleCapsule')?.getBoundingClientRect();
+      const cell = row?.querySelector('.graph-cell')?.getBoundingClientRect();
+      return !!capsule && !!cell && capsule.width > 0 && capsule.left >= cell.left && capsule.right <= cell.right;
+    }, lateTask.key)).toBe(true);
     await browser.waitUntil(() => browser.execute(() => {
       const row = Array.from(document.querySelectorAll('.row[data-continuity]'))
         .find(row => row.getAttribute('data-continuity')?.endsWith(':live-new-2'));
-      const dot = row?.querySelector('.graphDot');
-      return !!dot && getComputedStyle(dot).opacity === '1';
-    }), { timeout: 5000, timeoutMsg: 'the new activity node did not finish appearing' });
+      const capsule = row?.querySelector('.graphBundleCapsule');
+      return !!capsule && getComputedStyle(capsule).opacity === '1';
+    }), { timeout: 5000, timeoutMsg: 'the folded physical path did not finish appearing' });
     await browser.saveScreenshot(path.resolve('trace/task-grouping-live.png'));
 
     await browser.$('#search').setValue('historicalneedle');
@@ -168,6 +176,7 @@ describe('Native task disclosure in live Codex history', () => {
     // verify that those rows retained their lanes across folding and appends.
     await toggle(lateTask.key);
     const reopened = await state();
+    expect(reopened.visible.find(row => row.key === lateTask.key)?.dots.length).toBe(1);
     for (const row of initial.cached.filter(row => !row.task)) {
       expect(reopened.cached.find(candidate => candidate.key === row.key)?.lane).toBe(row.lane);
     }

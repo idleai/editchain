@@ -1,17 +1,30 @@
-//! Native rank/select and disclosure for a bounded webview. Only an explicit
-//! task toggle visits that section; ordinary appends touch changed boundaries.
+//! Native rank/select and disclosure for a bounded webview. Task fold
+//! transitions visit that path; ordinary appends touch changed boundaries.
 
 use super::{LiveWorkspace, Result};
 use editchain_index::Map;
-use editchain_protocol::{rank::Measure, ExpansionSpanDto, LiveWork, TaskStatus};
+use editchain_protocol::{rank::Measure, ExpansionSpanDto, LiveWork};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+
+mod viewport;
+pub(super) use viewport::Viewport;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub(super) struct Disclosure {
     views: Map<String, View>,
     groups: Map<String, bool>,
     positions: Map<String, (String, u64)>,
+    /// Automatically opened paths close only when all members leave the viewport.
+    #[serde(default)]
+    automatic: BTreeSet<String>,
+    /// User closes override future arrivals, just as explicit opens survive scrolling.
+    #[serde(default)]
+    explicitly_closed: Map<String, ()>,
+    /// Legacy per-row exposure, drained once on reopen without a schema migration.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    transient: BTreeSet<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -63,9 +76,11 @@ impl Disclosure {
     }
     pub(super) fn forget_group(&mut self, group: &str) {
         let _old = self.groups.remove(group);
+        let _old = self.automatic.remove(group);
+        let _old = self.explicitly_closed.remove(group);
     }
     pub(super) fn group_expanded(&self, group: &str) -> bool {
-        !self.groups.get(group).copied().unwrap_or(false)
+        !self.groups.get(group).copied().unwrap_or(true)
     }
     pub(super) fn settled(&self, key: &str) -> bool {
         self.views.get(key).is_some_and(|view| !view.exposed)
@@ -78,6 +93,7 @@ impl Disclosure {
         })
     }
     pub(super) fn remove(&mut self, key: &str) {
+        let _removed = self.transient.remove(key);
         if let Some(view) = self.views.remove(key) {
             for identity in view.keys {
                 if self
@@ -103,7 +119,10 @@ impl LiveWorkspace {
                 .get(key)
                 .is_some_and(|view| view.hidden || view.summarized)
             {
-                self.remeasure(key, true);
+                if let Some(view) = self.disclosure.views.get_mut(key) {
+                    view.exposed = true;
+                }
+                let _changed = self.remeasure(key);
                 changed = true;
             }
         }
@@ -113,12 +132,12 @@ impl LiveWorkspace {
         &mut self,
         removed: &[String],
         changed: &[String],
+        arrivals: &BTreeSet<String>,
     ) -> Result<()> {
         for key in removed {
             self.disclosure.remove(key);
         }
-        let exposed: BTreeSet<_> = self.graph.changed_boundaries().cloned().collect();
-        let mut dirty = exposed.clone();
+        let mut dirty: BTreeSet<_> = self.graph.changed_boundaries().cloned().collect();
         for key in changed {
             let Some(block) = self
                 .orders
@@ -135,7 +154,6 @@ impl LiveWorkspace {
             view.keys = rows.iter().map(|row| row.continuity_key.clone()).collect();
             view.spans.clone_from(&block.meta.spans);
             view.open.retain(|key| view.keys.contains(key));
-            view.exposed |= !self.preparing && exposed.contains(key);
             view.rebuild();
             for (slot, identity) in view.keys.iter().enumerate() {
                 drop(
@@ -144,29 +162,29 @@ impl LiveWorkspace {
                         .insert(identity.clone(), (key.clone(), u64::try_from(slot)?)),
                 );
             }
-            if let Some((task, group)) = block
+            if let Some((_task, group)) = block
                 .meta
                 .task_summary
                 .as_ref()
                 .zip(block.meta.task_group.as_ref())
             {
-                let _collapsed = self
-                    .disclosure
-                    .groups
-                    .entry(group.clone())
-                    .or_insert(self.preparing && task.status == TaskStatus::Completed);
+                let _collapsed = self.disclosure.groups.entry(group.clone()).or_insert(true);
             }
             drop(self.disclosure.views.insert(key.clone(), view));
             let _inserted = dirty.insert(key.clone());
         }
+        dirty.extend(self.open_arrivals(arrivals));
         for key in dirty {
-            self.remeasure(&key, !self.preparing && exposed.contains(&key));
+            let _changed = self.remeasure(&key);
         }
         Ok(())
     }
 
     pub(super) fn regroup_disclosure(&mut self) {
         self.disclosure.groups.clear();
+        self.disclosure.automatic.clear();
+        self.disclosure.explicitly_closed.clear();
+        self.disclosure.transient.clear();
         let keys: Vec<_> = self.orders.keys().cloned().collect();
         for key in &keys {
             if let Some(view) = self.disclosure.views.get_mut(key) {
@@ -177,48 +195,46 @@ impl LiveWorkspace {
                 .get(key)
                 .and_then(|order| self.blocks.get(order))
             {
-                if let Some((task, group)) = block
+                if let Some((_task, group)) = block
                     .meta
                     .task_summary
                     .as_ref()
                     .zip(block.meta.task_group.as_ref())
                 {
-                    let _old = self
-                        .disclosure
-                        .groups
-                        .insert(group.clone(), task.status == TaskStatus::Completed);
+                    let _old = self.disclosure.groups.insert(group.clone(), true);
                 }
             }
         }
         for key in keys {
-            self.remeasure(&key, false);
+            let _changed = self.remeasure(&key);
         }
     }
 
-    fn remeasure(&mut self, key: &str, expose: bool) {
+    fn remeasure(&mut self, key: &str) -> bool {
         let Some(order) = self.orders.get(key).cloned() else {
-            return;
+            return false;
         };
         let Some(block) = self.blocks.get(&order).cloned() else {
-            return;
+            return false;
         };
         let Some(view) = self.disclosure.views.get_mut(key) else {
-            return;
+            return false;
         };
-        view.exposed |= expose;
-        view.hidden = !view.exposed
+        let old = (view.hidden, view.summarized);
+        let exposed = view.exposed;
+        view.hidden = !exposed
             && block.meta.task_summary.is_none()
             && self.graph.foldable(key)
             && block
                 .meta
                 .task_group
                 .as_ref()
-                .is_some_and(|key| self.disclosure.groups.get(key).copied().unwrap_or(false));
+                .is_some_and(|key| self.disclosure.groups.get(key).copied().unwrap_or(true));
         view.summarized =
-            !view.exposed
+            !exposed
                 && block.meta.task_summary.is_some()
                 && block.meta.task_group.as_ref().is_some_and(|group| {
-                    self.disclosure.groups.get(group).copied().unwrap_or(false)
+                    self.disclosure.groups.get(group).copied().unwrap_or(true)
                 });
         let measure = Measure {
             expanded: block.meta.row_count,
@@ -230,7 +246,9 @@ impl LiveWorkspace {
                 u64::try_from(view.slots.len()).unwrap_or(u64::MAX)
             },
         };
+        let changed = old != (view.hidden, view.summarized);
         drop(self.blocks.insert(order, block, measure));
+        changed
     }
 
     pub(super) fn toggle_disclosure(&mut self, key: &str, task: bool) -> Result<()> {
@@ -256,11 +274,18 @@ impl LiveWorkspace {
                 .get_mut(&group)
                 .ok_or("task path is unavailable")?;
             *collapsed = !*collapsed;
+            if *collapsed {
+                let _old = self.disclosure.explicitly_closed.insert(group.clone(), ());
+            } else {
+                let _old = self.disclosure.explicitly_closed.remove(&group);
+            }
+            let _removed = self.disclosure.automatic.remove(&group);
             for member in self.tasks.member_keys(&group) {
+                let _removed = self.disclosure.transient.remove(&member);
                 if let Some(view) = self.disclosure.views.get_mut(&member) {
                     view.exposed = false;
                 }
-                self.remeasure(&member, false);
+                let _changed = self.remeasure(&member);
             }
         } else {
             let view = self
@@ -275,7 +300,7 @@ impl LiveWorkspace {
                 let _inserted = view.open.insert(key.to_owned());
             }
             view.rebuild();
-            self.remeasure(&block, false);
+            let _changed = self.remeasure(&block);
         }
         self.publish(Vec::new(), Vec::new(), LiveWork::default())?;
         self.checkpoint()

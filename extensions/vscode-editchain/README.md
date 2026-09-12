@@ -75,9 +75,14 @@ Set `editchain-history.live.enabled` to `false` to open static history by defaul
 - Live Codex items fold along connected causal paths within their native task.
   Grouping adds no graph rows: task controls annotate existing activities;
   a collapsed summary replaces that physical path in the same anchor row.
-  Singletons remain ordinary activities. Completed historical paths start
-  folded; live arrivals keep their own content visible even inside a collapsed
-  task. Completion does not automatically fold open work. The activity-count
+  Singletons remain ordinary activities. The latest task opens by default when
+  History first displays the head. Arrivals in the actual viewport open their
+  task path with an expanded ribbon and animated physical rows. Automatically
+  opened paths fold only after every member leaves the viewport; completion
+  and moving just the ribbon offscreen do not fold them. Offscreen activity
+  starts folded, and scrolling back alone does not reopen it. Prefetched rows
+  do not count as viewed. Explicit opens and closes persist across scrolling,
+  new records and restarts. The activity-count
   button toggles the task path; each item's file/output chevron remains separate.
   Forks, merges, Git attachments and unresolved/error activity remain visible.
   Concurrent tasks retain chronological order without repeated header rows.

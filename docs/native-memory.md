@@ -74,10 +74,11 @@ block list. Native rank/select, disclosure and graph decoration serve bounded
 `GetWindow` requests. `LocateRows` resolves continuity keys in the current
 visible coordinates, including the actual identity of a detail row.
 
-Task and local detail toggles run natively. Completed history initially folds;
-new/revised items remain exposed, existing task disclosure persists, and folds
-preserve graph junctions. Search is built during preparation and updated on each
-block edit. Finding a folded member exposes it through a revisioned update.
+Task and local detail toggles run natively. Offscreen history starts folded;
+the latest task and visible arrivals open their paths by default. Explicit
+choices persist, and folds preserve graph junctions. Search is built during
+preparation and updated on each block edit. Finding a folded member exposes
+it through a revisioned update.
 
 The host serializes capture, toggles and search-induced disclosure publication.
 It waits for the renderer to acknowledge the replacement viewport before moving
@@ -120,6 +121,27 @@ and peaked at 7,309,564 KiB RSS; this offline preparation remains expensive.
 Prepared native opening plus 500 rows then took 0.243 s with 31,244 KiB retained
 RSS (35,060 KiB peak), decoded no old chain records, and idle sync did no work.
 Evidence is in `.ui-out/subagent-repair-20260912T183902Z` under the extension.
+
+Disclosure schema 4 defaults offscreen task paths to folded. Upgrading schema 3
+through import or `prepare-view`
+remeasures saved disclosure and visible rank weights; it does not rebuild
+canonical admission, provider relationships, graph lanes, row content or search.
+Legacy group choices reset once because they did not distinguish automatic
+opening from a user choice. Explicit opens made with schema 4 persist. The latest
+task now opens on the first head viewport, and visible arrivals open their whole
+path. Automatic paths close only after all members leave view, or on restart
+before the new viewport is known. Added optional fields track automatic opens
+and explicit closes; existing schema-4 checkpoints need no preparation or global
+reset. Old per-row exposure is cleared by its bounded saved key set on reopen.
+Viewport membership checks inspect reported rows and automatic groups. Only an
+actual open/close transition visits the affected path; +1 appends to an open
+path remain incremental, and the webview still fetches bounded pages.
+On the 2,431,272-operation workspace this disclosure-only upgrade took 17.02 s
+and peaked at 1,165,796 KiB RSS. Prepared native opening plus 500 visible rows
+then took 0.440 s with 35,792 KiB retained RSS (39,992 KiB peak); no historical
+chain records were replayed and idle sync did no work. These timings exclude
+VS Code startup and cold provider-helper reconstruction. Evidence is under the
+extension's `.ui-out/offscreen-folding-20260912T193233Z`.
 
 For unsupported schema changes, corruption or deliberate history replacement,
 close History, remove only the derived `CHAIN/live-v1` directory and run

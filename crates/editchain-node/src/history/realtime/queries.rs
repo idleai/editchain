@@ -139,6 +139,24 @@ impl LiveWorkspace {
             return Err(super::super::stale_snapshot().into());
         }
         let value = match request {
+            RequestBody::ViewportLive(viewport) => {
+                if !self.paged() {
+                    return Err("native disclosure was not negotiated".into());
+                }
+                let revision = self.revision;
+                self.observe_viewport(viewport)?;
+                serde_json::to_value(editchain_protocol::LiveUpdate {
+                    epoch: self.epoch.clone(),
+                    revision: self.revision,
+                    deltas: self
+                        .journal
+                        .iter()
+                        .filter(|delta| delta.revision > revision)
+                        .cloned()
+                        .collect(),
+                    work: editchain_protocol::LiveWork::default(),
+                })?
+            }
             RequestBody::ToggleLive(request) => {
                 if !self.paged() {
                     return Err("native disclosure was not negotiated".into());

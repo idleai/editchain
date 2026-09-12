@@ -336,6 +336,7 @@ impl HistoryAppState {
         }
         step.ops.push(DomOp::ProgressiveLoader(true));
         step.save_state = Some(Self::persisted_state(&viewport));
+        self.report_live_viewport(&viewport, step);
         step.sends.push(Send::LiveSettled {
             snapshot_id: self.snapshot_id.as_str().to_owned(),
             error: None,
