@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use super::{hash_raw, hex_string, OpRecordLocation, OpenDiagnostics, SnapshotOpLocator};
 
 /// On-disk schema for the immutable render snapshot.
-pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
+pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 /// Revision of projection/default-view semantics represented by this schema.
 ///
 /// Bumped when the fixed default view's semantics change so stale snapshots

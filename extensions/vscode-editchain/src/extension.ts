@@ -1,5 +1,7 @@
 import * as vscode from 'vscode';
 import { resolveServicePath, StdioClient } from './stdioClient';
+import { createLiveSync, LiveProviderRequest } from './liveHost';
+import { LiveSync } from './liveSync';
 
 // The single history panel. Reused across `open` invocations so we never create
 // two webviews of the same type (which races VS Code's service-worker
@@ -46,6 +48,12 @@ let openDeliveredToRenderer: string | null = null;
 // Unique virtual-document namespace for native diff tabs. Reusing a URI would
 // let VS Code retain stale text from an earlier click on the same path.
 let diffDocumentSerial = 0;
+let liveSync: LiveSync | undefined;
+let liveRequested = false;
+let liveStatus: string | null = null;
+let statusCounts = '';
+let updateRenderer: string | null = null;
+let liveBarrier: { snapshot: string; settle: (ok: boolean) => void } | null = null;
 
 // Generous finite deadline for NON-Open service requests (window fetches,
 // search and object resolution). The measured first-window time on a large
@@ -62,6 +70,8 @@ const PROTOCOL_VERSION = 2;
 type NegotiatedOpen = {
   protocol_version: number;
   snapshot_id: string;
+  live_updates?: boolean;
+  live?: { epoch: string; revision: number; total: number; blocks: unknown[] };
 };
 
 function isNegotiatedOpen(value: unknown): value is NegotiatedOpen {
@@ -109,6 +119,45 @@ export function activate(context: vscode.ExtensionContext): void {
     openHistoryView(context, client, jsonProvider, diffProvider);
   });
   context.subscriptions.push(openCommand);
+  liveRequested = vscode.workspace.getConfiguration('editchain-history').get<boolean>('live.enabled', true);
+  context.subscriptions.push(
+    { dispose: () => { stopLive(); liveBarrier?.settle(false); } },
+    vscode.commands.registerCommand('editchain-history.startLive', () => {
+      liveRequested = true;
+      output?.appendLine('[live] Start requested.');
+      output?.show(true);
+      if (!liveSync) setLiveStatus('Starting live history…');
+      else output?.appendLine('[live] ' + liveStatus);
+      openHistoryView(context, client, jsonProvider, diffProvider);
+      if (historyPanel) ensureLive(client, historyPanel);
+    }),
+    vscode.commands.registerCommand('editchain-history.stopLive', () => {
+      liveRequested = false;
+      stopLive();
+      setLiveStatus('Live updates paused');
+      output?.appendLine('[live] Stop requested; any active durable transaction will finish before collection stops.');
+    }),
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      stopLive();
+      if (historyPanel) {
+        client.stop();
+        client.ensureStarted(resolveServicePath());
+        void startOpen(client, historyPanel);
+      }
+    }),
+    vscode.workspace.onDidChangeConfiguration(event => {
+      if (!event.affectsConfiguration('editchain-history')) return;
+      stopLive();
+      if (event.affectsConfiguration('editchain-history.live.enabled')) {
+        liveRequested = vscode.workspace.getConfiguration('editchain-history').get<boolean>('live.enabled', true);
+      }
+      if (historyPanel) {
+        client.stop();
+        client.ensureStarted(resolveServicePath());
+        void startOpen(client, historyPanel);
+      }
+    }),
+  );
 
   // Status bar item for the loaded/total node count. Created once and shown only
   // while the history viewer is open; hidden when the panel closes.
@@ -129,9 +178,23 @@ export function activate(context: vscode.ExtensionContext): void {
  * closes so it doesn't linger after the viewer is gone.
  */
 function updateStatusBar(loaded: number, total: number): void {
+  statusCounts = `$(list-ordered) ${loaded} / ${total} nodes`;
+  renderStatusBar();
+}
+
+function renderStatusBar(): void {
   if (!statusItem) return;
-  statusItem.text = `$(list-ordered) ${loaded} / ${total} nodes`;
-  statusItem.show();
+  const label = liveStatus?.startsWith('Live retry:') ? 'Live retry' :
+    liveStatus?.startsWith('Live ·') ? 'Live' : liveStatus;
+  statusItem.text = [statusCounts, label].filter(Boolean).join(' · ');
+  statusItem.tooltip = liveStatus || 'EditChain History — loaded / total nodes';
+  if (historyPanel) statusItem.show();
+}
+
+function setLiveStatus(text: string): void {
+  if (text !== liveStatus) output?.appendLine('[live] ' + text);
+  liveStatus = text;
+  renderStatusBar();
 }
 
 /**
@@ -203,6 +266,8 @@ function openHistoryView(
   panel.onDidDispose(() => {
     output?.appendLine('[panel] disposed');
     if (historyPanel === panel) {
+      stopLive();
+      liveBarrier?.settle(false);
       historyPanel = undefined;
       // Disposing the CURRENT panel invalidates any outstanding Open for it:
       // its response must not be delivered to a dead webview or mutate state
@@ -259,15 +324,29 @@ function openHistoryView(
       const instanceId = typeof msg.instanceId === 'string' ? msg.instanceId : '';
       if (!instanceId) return;
       if (rendererInstanceId !== instanceId) {
+        const recreatedLive = rendererInstanceId !== null && lastOpenBody?.Ok.live;
         rendererInstanceId = instanceId;
         openDeliveredToRenderer = null;
         output?.appendLine('[webview] renderer ready: ' + instanceId);
+        if (recreatedLive && !openPending) {
+          stopLive();
+          void startOpen(client, panel);
+          return;
+        }
       }
       deliverOpenState(panel);
+      ensureLive(client, panel);
+      return;
+    }
+    if (msg.type === 'liveSettled') {
+      if (panel === historyPanel && liveBarrier && liveBarrier.snapshot === msg.snapshot_id) {
+        if (msg.error) output?.appendLine('[live] ' + msg.error);
+        liveBarrier.settle(!msg.error);
+      }
       return;
     }
     if (msg.type === 'refreshHistory') {
-      if (panel === historyPanel && lastOpenBody !== null && !openPending) {
+      if (panel === historyPanel && lastOpenBody !== null && !openPending && !liveBarrier) {
         startOpen(client, panel, true);
       }
       return;
@@ -308,7 +387,7 @@ function openHistoryView(
     }
     // The Rust/WASM renderer speaks the production generic bridge: numeric-id
     // { body: <one-key envelope> } frames. ONLY the read-only envelopes the
-    // renderer issues are forwarded (GetWindow and FindInHistory);
+    // renderer issues are forwarded (GetWindow, LocateRows and FindInHistory);
     // anything else (Open, ResolveObject, GetNodeDetails, ...) is rejected
     // visibly instead of reaching a non-read-only service call. The explicitly
     // handled openJson UI action above remains outside this bridge.
@@ -323,16 +402,16 @@ function openHistoryView(
       typeof body === 'object' &&
       !Array.isArray(body) &&
       Object.keys(body).length === 1 &&
-      (hasOwnProperty(body, 'GetWindow') || hasOwnProperty(body, 'FindInHistory'));
+      (hasOwnProperty(body, 'GetWindow') || hasOwnProperty(body, 'FindInHistory') || hasOwnProperty(body, 'LocateRows'));
     if (id === null || !isForwardable) {
       output?.appendLine(
-        '[webview] rejected request (only GetWindow/FindInHistory are forwarded): ' +
+        '[webview] rejected request (only GetWindow/FindInHistory/LocateRows are forwarded): ' +
           JSON.stringify(msg)
       );
       panel.webview.postMessage({
         id: id === null ? -1 : id,
         body: {
-          Error: 'EditChain History: only GetWindow and FindInHistory requests are forwarded by the host',
+          Error: 'EditChain History: only GetWindow, FindInHistory and LocateRows requests are forwarded by the host',
         },
       });
       return;
@@ -372,6 +451,99 @@ function chainDir(): string {
     .get<string>('chainDir', '.editchain');
 }
 
+function stopLive(): void {
+  liveSync?.dispose();
+  liveSync = undefined;
+  liveStatus = null;
+  renderStatusBar();
+}
+
+function ensureLive(client: StdioClient, panel: vscode.WebviewPanel): void {
+  if (!liveRequested || liveSync || panel !== historyPanel) return;
+  if (!workspacePath()) {
+    setLiveStatus('Open a workspace folder to start live history.');
+    return;
+  }
+  if (!vscode.workspace.isTrusted) {
+    setLiveStatus('Workspace trust is required for live history.');
+    return;
+  }
+  if (openPending || liveBarrier) {
+    setLiveStatus('Waiting for history to finish opening…');
+    return;
+  }
+  if (!lastOpenBody?.Ok.live) {
+    if (lastOpenError) setLiveStatus(lastOpenError);
+    else if (lastOpenBody) void startOpen(client, panel);
+    return;
+  }
+  if (!rendererInstanceId || openDeliveredToRenderer !== rendererInstanceId) {
+    setLiveStatus('Waiting for the history renderer…');
+    return;
+  }
+  liveSync = createLiveSync(resolveServicePath(), provider => syncNative(client, panel, provider),
+    setLiveStatus, text => output?.appendLine('[live] ' + text));
+  liveSync.wake();
+}
+
+async function syncNative(client: StdioClient, panel: vscode.WebviewPanel, codex?: LiveProviderRequest): Promise<boolean | void> {
+  if (panel !== historyPanel || !lastOpenBody?.Ok.live) return;
+  const owner = openEpoch;
+  const cursor = lastOpenBody.Ok.live;
+  const response = await client.request({ SyncLive: { epoch: cursor.epoch, after_revision: cursor.revision, codex: codex || null } }, { timeoutMs: 0 });
+  if (owner !== openEpoch || panel !== historyPanel) return;
+  if (!response?.Ok) {
+    if (response?.Error?.code === 'stale_snapshot') {
+      output?.appendLine('[live] Revision replay is unavailable; bootstrapping the live view.');
+      stopLive();
+      await startOpen(client, panel);
+      return;
+    }
+    throw new Error(serviceErrorMessage(response?.Error));
+  }
+  const update = response.Ok;
+  if (update.epoch !== cursor.epoch || !Array.isArray(update.deltas) || !Number.isSafeInteger(update.revision)) {
+    throw new Error('Invalid live revision response.');
+  }
+  if (!update.deltas.length) return update.work?.provider_pending === true;
+  const latest = update.deltas[update.deltas.length - 1];
+  output?.appendLine('[live] delta ' + JSON.stringify({ revision: update.revision, ...update.work }));
+  const applied = waitForLive(latest.snapshot_id);
+  panel.webview.postMessage({ id: 'delta', body: response });
+  try {
+    if (!await applied) {
+      if (owner !== openEpoch || panel !== historyPanel) return;
+      output?.appendLine('[live] Renderer rejected the revision; bootstrapping the live view.');
+      stopLive();
+      await startOpen(client, panel);
+      return;
+    }
+    if (owner === openEpoch && lastOpenBody?.Ok.live?.epoch === update.epoch) {
+      lastOpenBody.Ok.snapshot_id = latest.snapshot_id;
+      lastOpenBody.Ok.live.revision = update.revision;
+      lastOpenBody.Ok.live.total = latest.total;
+    }
+    return update.work?.provider_pending === true;
+  } finally {
+    ensureLive(client, panel);
+  }
+}
+
+function waitForLive(snapshot: string): Promise<boolean> {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => barrier.settle(false), NON_OPEN_TIMEOUT_MS);
+    const barrier = {
+      snapshot,
+      settle(ok: boolean) {
+        clearTimeout(timer);
+        if (liveBarrier === barrier) liveBarrier = null;
+        resolve(ok);
+      },
+    };
+    liveBarrier = barrier;
+  });
+}
+
 /**
  * Run the Open request against the service and push the handshake to the
  * webview (open body, then `ready` to fetch the first window).
@@ -381,11 +553,14 @@ function chainDir(): string {
  * when the service exits or is stopped, so it can never hang forever. Used on
  * first load AND on command reuse after a service crash (recovery).
  */
-function startOpen(client: StdioClient, panel: vscode.WebviewPanel, refresh = false): void {
+function startOpen(client: StdioClient, panel: vscode.WebviewPanel, refresh = false, live = false): Promise<boolean> {
   // Claim ownership of the Open lifecycle: this Open (and this panel) is now
   // authoritative, and any older in-flight Open becomes a no-op. A response is
   // honored only while this epoch is still current — a newer startOpen or a
   // disposal of the current panel bumps the epoch and invalidates it.
+  liveBarrier?.settle(false);
+  updateRenderer = live ? rendererInstanceId : null;
+  if (updateRenderer) panel.webview.postMessage({ id: 'updating' });
   const epoch = ++openEpoch;
   // Never replay a stale open body while this Open is pending, and never let a
   // previous workspace's body survive a restart that may fail.
@@ -397,10 +572,10 @@ function startOpen(client: StdioClient, panel: vscode.WebviewPanel, refresh = fa
   // large repo — never apply the request timeout to it. The request is rejected
   // if the service exits or is stopped, so it cannot hang indefinitely.
   const request = { workspace_path: workspacePath(), chain_dir: chainDir() };
-  client.request(
-    refresh ? { Refresh: request } : { Open: request },
+  return client.request(
+    liveRequested ? { OpenLive: request } : refresh ? { Refresh: request } : { Open: request },
     { timeoutMs: 0 }
-  ).then((resp) => {
+  ).then(async (resp) => {
     // Late response from a superseded Open: drop it entirely. It must neither
     // mutate the shared cache/pending state (a newer Open may still be in
     // flight, or the panel may be gone) nor post into a dead or stale webview.
@@ -408,7 +583,7 @@ function startOpen(client: StdioClient, panel: vscode.WebviewPanel, refresh = fa
       output?.appendLine(
         `[startOpen] dropping stale open response (epoch ${epoch}, current ${openEpoch})`
       );
-      return;
+      return false;
     }
     // Only a successful Open { Ok } is authoritative: it is the ONLY body ever
     // cached/replayed, and it is the only path that sends `ready` (which makes
@@ -423,13 +598,13 @@ function startOpen(client: StdioClient, panel: vscode.WebviewPanel, refresh = fa
       lastOpenError = errText;
       openPending = false;
       deliverOpenState(panel);
-      return;
+      return false;
     }
-    if (!isNegotiatedOpen(resp.Ok)) {
+    if (!isNegotiatedOpen(resp.Ok) || (liveRequested && (!resp.Ok.live || resp.Ok.live_updates !== true))) {
       lastOpenError = 'Unsupported history protocol. Rebuild the EditChain service and renderer together, then reopen history.';
       openPending = false;
       deliverOpenState(panel);
-      return;
+      return false;
     }
     output?.appendLine('[startOpen] sending open message');
     // Hold the last open body so a genuinely recreated renderer can replay it
@@ -438,13 +613,15 @@ function startOpen(client: StdioClient, panel: vscode.WebviewPanel, refresh = fa
     lastOpenBody = resp;
     lastOpenError = null;
     openPending = false;
+    const applied = updateRenderer ? waitForLive(resp.Ok.snapshot_id) : Promise.resolve(true);
     deliverOpenState(panel);
+    return applied;
   }).catch((e) => {
     if (epoch !== openEpoch || panel !== historyPanel) {
       output?.appendLine(
         `[startOpen] dropping stale open failure (epoch ${epoch}, current ${openEpoch})`
       );
-      return;
+      return false;
     }
     output?.appendLine('[startOpen] open failed: ' + String(e));
     // A failed open must not be replayed as an authoritative body later.
@@ -452,6 +629,11 @@ function startOpen(client: StdioClient, panel: vscode.WebviewPanel, refresh = fa
     lastOpenError = String(e);
     openPending = false;
     deliverOpenState(panel);
+    return false;
+  }).finally(() => {
+    // Start/restart requested while an older publication was settling waits
+    // for that viewport handover, including stop/start during a slow Open.
+    if (epoch === openEpoch && panel === historyPanel) ensureLive(client, panel);
   });
 }
 
@@ -468,7 +650,9 @@ function deliverOpenState(panel: vscode.WebviewPanel): void {
 
   if (lastOpenBody !== null) {
     openDeliveredToRenderer = rendererInstanceId;
-    panel.webview.postMessage({ id: 'open', body: lastOpenBody });
+    const id = updateRenderer === rendererInstanceId ? 'update' : 'open';
+    panel.webview.postMessage({ id, body: lastOpenBody });
+    if (id === 'open') liveBarrier?.settle(true);
     // Kept for protocol compatibility with older renderers. The current
     // renderer begins its first window from `open` itself.
     panel.webview.postMessage({ id: 'ready' });
@@ -477,7 +661,7 @@ function deliverOpenState(panel: vscode.WebviewPanel): void {
 
   if (lastOpenError !== null) {
     openDeliveredToRenderer = rendererInstanceId;
-    panel.webview.postMessage({ id: 'open', body: { Error: lastOpenError } });
+    panel.webview.postMessage({ id: updateRenderer === rendererInstanceId ? 'update' : 'open', body: { Error: lastOpenError } });
   }
 }
 

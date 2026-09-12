@@ -12,6 +12,39 @@ use editchain_protocol::{
 };
 use std::collections::HashMap;
 
+fn compact_continuity_key(key: &str) -> String {
+    format!("item:{}", blake3::hash(key.as_bytes()).to_hex())
+}
+
+fn child_continuity_key(
+    projection: &editchain_project::HistoryProjection,
+    child: &ExpandedChildRow,
+    parent: &str,
+    ordinal: usize,
+) -> String {
+    let mut parts = child.op_id.split(':');
+    let id = (|| {
+        Some(OpId {
+            node: editchain_core::NodeId(parts.next()?.parse().ok()?),
+            boot: parts.next()?.parse().ok()?,
+            seq: parts.next()?.parse().ok()?,
+        })
+    })();
+    let logical = id.and_then(|id| projection.continuity_key(id));
+    let owner = logical.unwrap_or_else(|| {
+        if child.op_id.is_empty() {
+            parent
+        } else {
+            &child.op_id
+        }
+    });
+    let suffix = child.file_change.as_ref().map_or_else(
+        || format!("{}:{ordinal}", child.kind),
+        |change| format!("file:{}", change.path),
+    );
+    compact_continuity_key(&format!("child:{owner}:{suffix}"))
+}
+
 impl Workspace {
     /// Get a window from the fixed opened Activity view.
     ///
@@ -165,6 +198,11 @@ impl Workspace {
                         .get(abs_idx.saturating_add(1))
                         .is_none_or(|next| next.node().group() != group),
                     node_key: node.node_key(),
+                    continuity_key: node
+                        .op_id()
+                        .and_then(|id| self.projection.continuity_key(id))
+                        .map(compact_continuity_key)
+                        .unwrap_or_default(),
                     parents,
                     parent_relations,
                     is_submodule: node
@@ -201,6 +239,7 @@ impl Workspace {
                         .session_summary
                         .as_ref()
                         .map(session_summary_dto),
+                    task_group: None,
                     work_unit: Some(work_unit_dto(&entry.annotation().work_unit)),
                     promoted: entry.annotation().promoted,
                     activity_bundle: node_activity_bundle(node),
@@ -247,6 +286,12 @@ impl Workspace {
                     // Nested rows are not graph nodes; stable synthetic keys
                     // keep group-start detection and click routing unambiguous.
                     node_key: format!("{}::child:{i}", node.node_key()),
+                    continuity_key: child_continuity_key(
+                        &self.projection,
+                        child,
+                        &node.node_key(),
+                        i,
+                    ),
                     parents: Vec::new(),
                     parent_relations: Vec::new(),
                     is_submodule: false,
@@ -279,6 +324,7 @@ impl Workspace {
                     turn_id: child.turn_id.clone(),
                     session_meta: session_meta.clone(),
                     session_summary: None,
+                    task_group: None,
                     work_unit: None,
                     promoted: child.promoted,
                     activity_bundle: child.activity_bundle.clone(),
@@ -320,6 +366,14 @@ impl Workspace {
             |repository| !self.repo_is_submodule(repository),
             &presentation,
         ));
+    }
+
+    pub(super) fn prepare_live_item_view(&mut self) {
+        let presentation = ServicePresentation {
+            agent_changes: &self.agent_file_changes,
+            git_changes: &self.git_file_changes,
+        };
+        self.current_view = Some(self.projection.build_item_view(&presentation));
     }
 }
 

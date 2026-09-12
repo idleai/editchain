@@ -7,10 +7,12 @@ pub mod durable;
 pub mod format;
 mod reader;
 mod segment;
+mod tail;
 
 pub use blob::{BlobPreviewResolution, BlobReader, BlobResolution, BlobStore};
 pub use reader::{read_op_at, CanonicalChain, ChainReadStats, OpRecordLocation};
 pub use segment::SegmentStore;
+pub use tail::{CanonicalTail, ChainDelta, TailWork};
 
 #[cfg(test)]
 use tempfile as _;

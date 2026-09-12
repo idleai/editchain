@@ -272,6 +272,188 @@ async function rustState(page) {
   });
 }
 
+test('live insertion and revision preserve selection and the scroll anchor without background flashes', { skip: SKIP }, async () => {
+  const { page, errors } = await openRustPage('large');
+  try {
+    await page.evaluate(() => {
+      const rows = document.getElementById('rows');
+      rows.scrollTop = 1707;
+      rows.dispatchEvent(new Event('scroll'));
+    });
+    await settleRust(page);
+    const before = await page.evaluate(() => {
+      const anchor = document.querySelector('.row[data-row="50"]');
+      const selected = document.querySelector('.row[data-row="52"]');
+      window.__liveAnchorNode = anchor;
+      window.__liveAnchorCell = anchor.querySelector('.text-cell');
+      window.__liveSelectedNode = selected;
+      selected.click();
+      selected.focus({ preventScroll: true });
+      return { anchor: anchor.dataset.continuity, y: anchor.getBoundingClientRect().y,
+        selected: selected.dataset.continuity, scroll: document.getElementById('rows').scrollTop };
+    });
+    await page.evaluate(({ selected }) => {
+      const fixture = window.__editchainFixture;
+      const existing = fixture.rows.map(row => ({ ...row, continuity_key: row.node_key,
+        ...(row.node_key === selected ? { node_key: row.node_key + ':revision', summary: 'Updated during the same Codex turn' } : {}) }));
+      fixture.rows = Array.from({ length: 3 }, (_, i) => ({ ...existing[0],
+        node_key: 'live-new-' + i, continuity_key: 'live-new-' + i, summary: 'New live edit ' + i,
+      })).concat(existing);
+      window.__editchainLiveUpdate();
+    }, before);
+    await driver.waitFor(page, () => window.__editchainLiveResult !== null);
+    const after = await page.evaluate(({ anchor }) => {
+      const anchorRow = [...document.querySelectorAll('.row[data-continuity]')].find(row => row.dataset.continuity === anchor);
+      const selectedRow = document.querySelector('.row[aria-selected="true"]');
+      return { result: window.__editchainLiveResult, selected: selectedRow?.dataset.continuity,
+        focused: document.activeElement?.closest('.row')?.dataset.continuity,
+        key: selectedRow?.dataset.key, y: anchorRow.getBoundingClientRect().y,
+        reusedAnchor: anchorRow === window.__liveAnchorNode,
+        reusedContent: anchorRow.querySelector('.text-cell') === window.__liveAnchorCell,
+        reusedSelection: selectedRow === window.__liveSelectedNode,
+        scroll: document.getElementById('rows').scrollTop,
+        animations: [...document.querySelectorAll('.row-live-changed')].map(row => getComputedStyle(row).animationName),
+        selectedAnimation: getComputedStyle(selectedRow).animationName };
+    }, before);
+    assert.equal(after.result.error, null);
+    assert.equal(after.reusedAnchor, true);
+    assert.equal(after.reusedContent, true);
+    assert.equal(after.reusedSelection, true);
+    assert.equal(after.selected, before.selected);
+    assert.equal(after.focused, before.selected);
+    assert.equal(after.key, before.selected + ':revision');
+    assert.equal(after.scroll, before.scroll + 102);
+    assert.ok(Math.abs(after.y - before.y) < 1, 'the same logical anchor stays at the same screen position');
+    assert.ok(after.animations.every(name => name === 'none' || name === 'ec-live-move'));
+    assert.equal(after.selectedAnimation, 'none');
+    await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
+    const reduced = await page.evaluate(() => [...document.querySelectorAll('.row-live-moved')].every(row => getComputedStyle(row).animationName === 'none'));
+    assert.equal(reduced, true);
+    assert.deepEqual(errors.page, []);
+    assert.deepEqual(errors.console, []);
+  } finally { await page.close(); }
+});
+
+test('one-operation forks and merges grow connections and retain SVG animation clocks across another delta', { skip: SKIP }, async () => {
+  const { page, errors } = await openRustPage('liveGraph');
+  try {
+    const before = await page.evaluate(() => {
+      window.__graphOriginal = document.querySelector('.row[data-key="live:row:0"] .graphDot');
+      if (!window.__graphOriginal) throw new Error(JSON.stringify({
+        row: window.__editchainRowAt(0), html: document.getElementById('rows').innerHTML.slice(0, 3000),
+      }));
+      const head = window.__editchainFixture.rows[0];
+      window.__editchainLiveDelta([{ ...head, node_key: 'live:fork', op_id: 'live:fork',
+        timestamp_ms: head.timestamp_ms + 1000, summary: 'Fork from the shared parent',
+        parents: ['live:row:1'] }]);
+      return { x: window.__graphOriginal.getAttribute('cx') };
+    });
+    await driver.waitFor(page, () => window.__editchainLiveResult !== null);
+    const fork = await page.evaluate(() => {
+      window.__graphSegments = Array.from(document.querySelectorAll('.graph-live-edge'));
+      window.__graphAnimations = window.__graphSegments.map(part => part.getAnimations()[0]);
+      for (const animation of window.__graphAnimations) {
+        const timing = animation.effect.getTiming();
+        animation.pause();
+        animation.currentTime = timing.delay + timing.duration / 2;
+      }
+      return { result: window.__editchainLiveResult, total: window.__editchainGetTotal(),
+        paths: window.__graphSegments.filter(part => part.tagName === 'path').length,
+        offsets: window.__graphSegments.map(part => parseFloat(getComputedStyle(part).strokeDashoffset)),
+        originalConnected: window.__graphOriginal.isConnected,
+        originalX: window.__graphOriginal.getAttribute('cx'),
+        laneCenters: window.__editchainRendererDebug.laneXAll() };
+    });
+    assert.equal(fork.result.error, null);
+    assert.equal(fork.total, 41, '+1 operation, no snapshot replacement');
+    assert.ok(fork.paths >= 2, 'the fork has curved connection halves');
+    assert.ok(fork.offsets.length >= 4);
+    assert.ok(fork.offsets.every(offset => Math.abs(offset + 0.5) < 0.01), 'each SVG stroke is partially drawn halfway through its animation');
+    assert.equal(fork.originalConnected, true);
+    assert.equal(fork.originalX, before.x);
+    assert.deepEqual(fork.laneCenters.slice(0, 2), [14.76, 29.52]);
+    await page.evaluate(() => {
+      const fork = window.__editchainFixture.rows.find(row => row.node_key === 'live:fork');
+      window.__editchainLiveDelta([{ ...fork, summary: 'Fork content revised while its connection grows' }]);
+    });
+    await driver.waitFor(page, () => window.__editchainLiveResult !== null);
+    const retained = await page.evaluate(() => window.__graphSegments.map((part, index) => ({
+      connected: part.isConnected,
+      clock: part.getAnimations()[0] === window.__graphAnimations[index],
+      offset: parseFloat(getComputedStyle(part).strokeDashoffset),
+    })));
+    assert.ok(retained.every(part => part.connected && part.clock && Math.abs(part.offset + 0.5) < 0.01),
+      'revising row content preserves every connection element and its in-flight clock');
+    await page.evaluate(() => {
+      window.__editchainLiveResult = null;
+      window.dispatchEvent(new MessageEvent('message', { data: window.__editchainLastDelta }));
+    });
+    await driver.waitFor(page, () => window.__editchainLiveResult !== null);
+    assert.equal(await page.evaluate(() => window.__graphSegments.every((part, index) =>
+      part.getAnimations()[0] === window.__graphAnimations[index])), true, 'replay does not restart growth');
+    await page.evaluate(() => {
+      for (const animation of window.__graphAnimations) animation.finish();
+      const fork = window.__editchainFixture.rows[0];
+      window.__editchainLiveDelta([{ ...fork, node_key: 'live:merge', op_id: 'live:merge',
+        timestamp_ms: fork.timestamp_ms + 1000, summary: 'Merge both branches',
+        parents: ['live:row:0', 'live:fork'] }]);
+    });
+    await driver.waitFor(page, () => window.__editchainLiveResult !== null);
+    const merged = await page.evaluate(() => ({
+      result: window.__editchainLiveResult, total: window.__editchainGetTotal(),
+      paths: document.querySelectorAll('.row[data-key="live:merge"] path.graph-live-edge').length,
+      x: window.__graphOriginal.getAttribute('cx'),
+      radius: window.__graphOriginal.getAttribute('r'),
+      animations: document.getAnimations().filter(animation => animation.animationName === 'ec-graph-grow').length,
+    }));
+    assert.equal(merged.result.error, null);
+    assert.equal(merged.total, 42);
+    assert.ok(merged.paths > 0, 'the merge grows its curved connection');
+    assert.ok(merged.animations > 0);
+    assert.equal(merged.x, before.x);
+    assert.equal(merged.radius, '4');
+    await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
+    assert.equal(await page.evaluate(() => Array.from(document.querySelectorAll('.graph-live-edge')).every(part =>
+      part.getAnimations().length === 0 && getComputedStyle(part).strokeDasharray === 'none')), true);
+    assertNoErrors(errors);
+  } finally { await page.close(); }
+});
+
+test('dense graphs preserve lane spacing and scroll horizontally with aligned readable columns', { skip: SKIP }, async () => {
+  const { page, errors } = await openRustPage('large');
+  try {
+    await page.evaluate(() => {
+      window.__editchainFixture.max_lane = 190;
+      window.__editchainFixture.rows[0].lane = 190;
+      window.__editchainLiveUpdate();
+    });
+    await driver.waitFor(page, () => window.__editchainLiveResult !== null);
+    for (const width of [1440, 380]) {
+      await page.setViewport({ width, height: 900 });
+      await settleRust(page);
+      const layout = await page.evaluate(() => {
+        const rows = document.getElementById('rows');
+        rows.scrollLeft = rows.scrollWidth;
+        const first = rows.querySelector('.row[data-row="0"]');
+        const content = first.querySelector('.text-cell').getBoundingClientRect();
+        const header = rows.querySelector('.tbl-header .th.content').getBoundingClientRect();
+        const dot = first.querySelector('.graphDot');
+        return { centers: window.__editchainRendererDebug.laneXAll(), scroll: rows.scrollLeft,
+          contentWidth: content.width, columnError: content.x - header.x,
+          x: Number(dot.getAttribute('cx')), radius: Number(dot.getAttribute('r')) };
+      });
+      assert.equal(layout.centers.length, 191);
+      assert.ok(layout.centers.slice(1).every((x, index) => Math.abs(x - layout.centers[index] - 14.76) < 0.01));
+      assert.ok(Math.abs(layout.x - 2819.16) < 0.01);
+      assert.equal(layout.radius, 4);
+      assert.ok(layout.scroll > 0, 'all lanes remain reachable by horizontal scrolling');
+      assert.ok(layout.contentWidth >= 159, 'summary text retains readable width');
+      assert.ok(Math.abs(layout.columnError) < 1, 'header and row columns scroll together');
+    }
+    assertNoErrors(errors);
+  } finally { await page.close(); }
+});
+
 function assertNoErrors(errors, label) {
   assert.deepEqual(errors.page, [], (label || 'page') + ' errors: ' + JSON.stringify(errors.page));
   assert.deepEqual(errors.console, [],

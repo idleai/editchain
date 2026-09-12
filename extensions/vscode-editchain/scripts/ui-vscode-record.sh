@@ -25,6 +25,7 @@ OUT="${1:-$EXT_ROOT/.ui-out/vscode-session.mp4}"
 CONFIG="${2:-./test/vscode/wdio.conf.ts}"
 DISPLAY_NUM="${DISPLAY_NUM:-99}"
 RES="${RES:-1440x900}"
+FPS="${FPS:-15}"
 
 mkdir -p "$(dirname "$OUT")"
 
@@ -67,7 +68,7 @@ done
 
 echo "==> Recording to $OUT"
 ffmpeg -y -hide_banner -loglevel error \
-  -f x11grab -video_size "$RES" -framerate 15 \
+  -f x11grab -video_size "$RES" -framerate "$FPS" \
   -i ":$DISPLAY_NUM" \
   -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
   "$OUT" &

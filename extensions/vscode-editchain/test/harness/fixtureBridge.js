@@ -9,6 +9,11 @@
   let snapshotSerial = 0;
   const snapshotId = () => 'fixture:' + snapshotSerial;
 
+  function blockMeta(row) {
+    return { key: row.continuity_key || row.node_key, node_key: row.node_key,
+      sort_time: row.timestamp_ms, row_count: 1, spans: [], parents: row.parents || [] };
+  }
+
   function fixedRows(fixture) {
     const source = fixture.rows || [];
     const parents = new Map(source.map((row) => [
@@ -131,7 +136,7 @@
       ...row,
       group_end: !all[index + 1] || all[index + 1].group !== row.group,
     }));
-    const subOpCounts = offset === 0
+    const subOpCounts = offset === 0 && !fixture.live
       ? rows.map((row) => (row.sub_ops || []).length)
       : null;
     let expansionSpans = null;
@@ -206,6 +211,15 @@
       respond(id, { Error: { code: 'stale_snapshot', message: 'Fixture snapshot changed.' } });
       return;
     }
+    if (requestName === 'LocateRows') {
+      const keys = new Set(body.LocateRows.keys);
+      const rows = expandSubOps(fixedRows(fixture)).flatMap((row, index) => {
+        const key = row.continuity_key || row.node_key;
+        return keys.has(key) ? [{ key, node_key: row.node_key, row: index }] : [];
+      });
+      respond(id, { Ok: { snapshot_id: snapshot, rows } });
+      return;
+    }
     if (requestName === 'GetWindow') {
       const respondNow = () => respond(id, { Ok: windowResponse(fixture, body.GetWindow, snapshot) });
       const layoutHold = window.__editchainHoldLayoutWindow;
@@ -245,6 +259,10 @@
 
   window.vscode = {
     postMessage(message) {
+      if (message?.type === 'liveSettled') {
+        window.__editchainLiveResult = message;
+        return;
+      }
       if (message?.type === 'refreshHistory') {
         snapshotSerial++;
         window.__editchainStart();
@@ -288,6 +306,8 @@
 
   window.__editchainStart = function () {
     const fixture = window.__editchainFixture || {};
+    if (fixture.live) fixture.live = { epoch: snapshotId(), revision: 0,
+      total: fixture.rows.length, blocks: fixture.rows.map(blockMeta) };
     const body = fixture.openError
       ? { Error: fixture.openError }
       : {
@@ -296,6 +316,7 @@
           snapshot_id: snapshotId(),
           nodes: fixedRows(fixture).length,
           repos: 1,
+          ...(fixture.live ? { live: fixture.live } : {}),
           ...(fixture.openWarnings ? { warnings: fixture.openWarnings } : {}),
           ...(fixture.diagnostics ? { diagnostics: fixture.diagnostics } : {}),
         },
@@ -308,5 +329,34 @@
         data: { id: 'ready', body: { Ok: {} } },
       }));
     }
+  };
+  window.__editchainLiveUpdate = function () {
+    window.__editchainLiveResult = null;
+    window.dispatchEvent(new MessageEvent('message', { data: { id: 'updating' } }));
+    snapshotSerial++;
+    window.dispatchEvent(new MessageEvent('message', { data: {
+      id: 'update', body: { Ok: { protocol_version: 2, snapshot_id: snapshotId(),
+        nodes: fixedRows(window.__editchainFixture).length, repos: 1 } },
+    } }));
+  };
+  // Retained production protocol: each transaction carries only changed blocks.
+  window.__editchainLiveDelta = function (rows, removed = []) {
+    const fixture = window.__editchainFixture;
+    const live = fixture.live;
+    const changed = new Set([...removed, ...rows.map(row => blockMeta(row).key)]);
+    fixture.rows = fixture.rows.filter(row => !changed.has(blockMeta(row).key)).concat(rows)
+      .sort((a, b) => b.timestamp_ms - a.timestamp_ms || a.node_key.localeCompare(b.node_key));
+    const work = { source_bytes: 0, provider_records: 0, provider_bootstraps: 0,
+      chain_bytes: 0, chain_records: rows.length, presentation_ops: rows.length,
+      items: rows.length, occurrences: 0, blocks: rows.length, capture_ms: 0, projection_ms: 0 };
+    const base = live.revision++;
+    snapshotSerial++;
+    const data = { id: 'delta', body: { Ok: { epoch: live.epoch, revision: live.revision, work,
+      deltas: [{ base_revision: base, revision: live.revision, snapshot_id: snapshotId(),
+        removed, upserts: rows.map(row => ({ meta: blockMeta(row), rows: [row] })),
+        total: fixture.rows.length, chain_generation: live.revision, max_lane: 0, work }] } } };
+    window.__editchainLiveResult = null;
+    window.__editchainLastDelta = data;
+    window.dispatchEvent(new MessageEvent('message', { data }));
   };
 })();

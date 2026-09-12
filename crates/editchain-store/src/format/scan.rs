@@ -94,10 +94,23 @@ impl<'a> PageScanner<'a> {
     }
 
     /// Bytes consumed through the last complete header or record.
-    #[cfg(test)]
     #[must_use]
     pub(crate) const fn consumed(&self) -> usize {
         self.offset
+    }
+
+    /// Resume at a complete-record boundary inside an already opened page.
+    pub(crate) const fn resume(bytes: &'a [u8], page_sequence: Option<u32>) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            page_sequence,
+            finished: false,
+        }
+    }
+
+    pub(crate) const fn page_sequence(&self) -> Option<u32> {
+        self.page_sequence
     }
 
     const fn error(&self, kind: ScanErrorKind) -> ScanError {

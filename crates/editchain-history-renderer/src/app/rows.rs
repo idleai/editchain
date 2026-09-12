@@ -108,6 +108,7 @@ pub(crate) struct RowIdentity {
     pub(crate) abs_index: i64,
     /// Stable wire identity (`data-key`; selection compares on it).
     pub(crate) node_key: String,
+    pub(crate) continuity_key: String,
     pub(crate) is_subop: bool,
     /// Presentation hierarchy depth (`0` top-level, `1` work member, `2`
     /// existing detail/bundle member nested beneath that work member).
@@ -121,10 +122,19 @@ pub(crate) struct RowIdentity {
     pub(crate) turn_id: String,
 }
 
+/// A task header carries passing edges but does not invent a graph node.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GraphRole {
+    #[default]
+    Node,
+    PassThrough,
+}
+
 /// Graph fields the row-local SVG renderer and retained frame contract consume,
 /// verbatim from the wire row.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct GraphData {
+    pub(crate) role: GraphRole,
     pub(crate) lane: u32,
     pub(crate) above: Vec<u32>,
     pub(crate) below: Vec<u32>,
@@ -422,6 +432,11 @@ pub(crate) fn plain_row_summary(row: &RowInput, value: &str) -> String {
 /// `hasSubOps` — whether a top-level row carries bundled metadata sub-ops.
 pub(crate) fn has_sub_ops(row: &RowInput) -> bool {
     !row.source.sub_ops.is_empty()
+        || row
+            .source
+            .task_group
+            .as_ref()
+            .is_some_and(|task| task.member_count > 0)
 }
 
 // --- RowSpec assembly (buildRowHtml's presentation model) -------------------
@@ -654,7 +669,9 @@ impl RowSpec {
         let is_execute_run = bundle_kind == Some(BundleKind::ExecuteRun);
         let is_plan_repeat = bundle_kind == Some(BundleKind::PlanRepeat);
         let semantic_tags = row_semantic_chrome(row, is_bundle, BadgeOptions::default());
-        let classification = if is_file {
+        let classification = if row.source.task_group.is_some() {
+            RowClassification::new("task", "activity_kind", "task")
+        } else if is_file {
             RowClassification::new("change", "activity_kind", "change")
         } else if is_session_summary {
             RowClassification::session_summary()
@@ -826,7 +843,8 @@ impl RowSpec {
             }
         };
         let group_start = context.is_group_start && !has_boundary_header;
-        let group_label = if !is_subop && is_graph_endpoint(row) {
+        let group_label = if !is_subop && row.source.task_group.is_none() && is_graph_endpoint(row)
+        {
             Some(group_label_text(
                 &row.source.group,
                 row.source
@@ -909,6 +927,7 @@ impl RowSpec {
             identity: RowIdentity {
                 abs_index: context.abs_index,
                 node_key: node_key.clone(),
+                continuity_key: row.continuity_key().to_owned(),
                 is_subop,
                 hierarchy_depth: row.source.hierarchy_depth,
                 subop_kind: row.source.subop_kind.clone().unwrap_or_default(),
@@ -919,6 +938,11 @@ impl RowSpec {
                 turn_id: row.source.turn_id.clone().unwrap_or_default(),
             },
             graph: GraphData {
+                role: if row.source.task_group.is_some() {
+                    GraphRole::PassThrough
+                } else {
+                    GraphRole::Node
+                },
                 lane: row.lane(),
                 above: row.above(),
                 below: row.below(),
@@ -1035,6 +1059,9 @@ impl RowSpec {
         }
         if self.bundle.is_some() {
             classes.push_str(" row-activity-bundle");
+        }
+        if self.kind == "task" {
+            classes.push_str(" row-task-group");
         }
         if self.state.expandable {
             classes.push_str(" row-expandable");

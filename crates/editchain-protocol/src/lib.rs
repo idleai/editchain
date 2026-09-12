@@ -7,6 +7,14 @@ mod content;
 pub use content::{ContentTextDto, RowContentDto, MAX_ROW_TEXT_BYTES, MAX_TOOL_LABEL_BYTES};
 
 mod error;
+mod live;
+pub mod live_graph;
+/// Shared mutable ordering and rank/select for native and WASM live views.
+pub mod rank;
+pub use live::{
+    CodexLiveRequest, LiveBaseline, LiveBlock, LiveBlockMeta, LiveDelta, LiveOrder, LiveUpdate,
+    LiveWork, SyncLiveRequest, TaskGroupDto, TaskStatus,
+};
 mod snapshot;
 mod validation;
 pub use error::{ErrorCode, ServiceError};
@@ -33,10 +41,16 @@ pub struct Request {
 pub enum RequestBody {
     /// Open a workspace and load its chain + git repositories.
     Open(OpenRequest),
+    /// Bootstrap the retained live activity view once.
+    OpenLive(OpenRequest),
+    /// Capture provider appends and replay revisioned changes since a cursor.
+    SyncLive(SyncLiveRequest),
     /// Reopen authoritative sources, bypassing derived caches after negotiation.
     Refresh(OpenRequest),
     /// Get a window of history rows.
     GetWindow(GetWindowRequest),
+    /// Resolve presentation identities to coordinates in the current snapshot.
+    LocateRows(LocateRowsRequest),
     /// Get details for a specific node.
     GetNodeDetails(GetNodeDetailsRequest),
     /// Find ranked lexical hits resolved to visible top-level history rows.
@@ -111,6 +125,36 @@ pub struct GetWindowRequest {
     /// The production viewer sends `false` for its first page so content rows
     /// can paint before O(V) layout, then repeats that window with `true`.
     pub include_layout: bool,
+}
+
+/// Bounded anchor lookup used when a live view changes snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocateRowsRequest {
+    /// Snapshot whose coordinates are requested.
+    pub snapshot_id: SnapshotId,
+    /// Presentation identities, falling back to graph keys for legacy rows.
+    pub keys: Vec<String>,
+}
+
+/// A surviving presentation anchor; absent identities are omitted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RowLocation {
+    /// Requested presentation identity.
+    pub key: String,
+    /// Current immutable graph/action identity.
+    pub node_key: String,
+    /// Fully expanded row coordinate in this snapshot.
+    pub row: u64,
+}
+
+/// Snapshot-bound result of a live anchor lookup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocateRowsResponse {
+    /// Snapshot that owns these coordinates.
+    pub snapshot_id: SnapshotId,
+    /// Located anchors in history order.
+    pub rows: Vec<RowLocation>,
 }
 
 /// Get details for a specific node.
@@ -390,6 +434,10 @@ pub struct HistoryRow {
     pub group_end: bool,
     /// Stable graph key: operation ID or repository-qualified Git commit key.
     pub node_key: String,
+    /// Stable presentation identity across revisions of a provider item.
+    /// Graph edges and detail actions continue to use their immutable IDs.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub continuity_key: String,
     /// Parent node keys (for drawing graph edges).
     pub parents: Vec<String>,
     /// Provider-neutral relationship kinds for the edges in [`Self::parents`].
@@ -535,6 +583,9 @@ pub struct HistoryRow {
     /// windows. `None` only on older services that predate the field.
     #[serde(default)]
     pub work_unit: Option<WorkUnitDto>,
+    /// Native task section header; item contents remain in independent blocks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_group: Option<TaskGroupDto>,
     /// Conservative promotion marker: `true` when this row is significant
     /// enough that the Activity projection must never fold it into a bundled
     /// execute run (warning/failure/cancelled outcome, change/verify activity,
@@ -914,6 +965,7 @@ mod tests {
             group: "repo:big".to_string(),
             group_end: true,
             node_key: big_op_id().to_string(),
+            continuity_key: String::new(),
             parents: vec![big_op_id().to_string()],
             parent_relations: vec![ParentRelationDto {
                 parent: big_op_id().to_string(),
@@ -944,6 +996,7 @@ mod tests {
             turn_id: Some(OVER_2_53.to_string()),
             session_meta: None,
             session_summary: None,
+            task_group: None,
             work_unit: None,
             promoted: false,
             activity_bundle: None,
@@ -1329,6 +1382,7 @@ mod tests {
             group: "session:1".to_string(),
             group_end: true,
             node_key: "1:0:1".to_string(),
+            continuity_key: String::new(),
             parents: Vec::new(),
             parent_relations: Vec::new(),
             is_submodule: false,
@@ -1360,6 +1414,7 @@ mod tests {
                 agent_nickname: Some("Harvey".to_string()),
             }),
             session_summary: Some(SessionSummaryDto { count: 87 }),
+            task_group: None,
             work_unit: Some(WorkUnitDto {
                 id: format!("session:1/turn:{OVER_2_53}"),
                 is_start: true,

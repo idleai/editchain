@@ -31,6 +31,9 @@ pub struct CodexDiscoveryRequest<'a> {
     /// Root directory containing raw Codex rollout JSONL files, recursively
     /// (e.g. `~/.codex/sessions`; date trees are discovered automatically).
     pub raw_root: PathBuf,
+    /// Optional changed rollouts to reconcile, relative to `raw_root` or absolute
+    /// beneath it. Empty selects the entire tree; the cursor root never changes.
+    pub selected_paths: Vec<PathBuf>,
     /// Host-owned catalog used for exact session-start Git repository identity.
     pub repositories: &'a dyn super::session_git::RepositoryLookup,
 }
@@ -107,7 +110,12 @@ pub fn import_codex(
         std::collections::HashMap::new()
     };
 
-    let rollouts = discover_rollouts(&request.raw_root).map_err(ImportError::OpSink)?;
+    let rollouts = if request.selected_paths.is_empty() {
+        discover_rollouts(&request.raw_root)
+    } else {
+        super::discover::selected_rollouts(&request.raw_root, &request.selected_paths)
+    }
+    .map_err(ImportError::OpSink)?;
     report.files_discovered = rollouts.len();
     let workspace_str = request.workspace_path.to_str().unwrap_or("/workspace");
 
@@ -456,7 +464,7 @@ pub fn import_codex(
 /// misclassified as foreign. A relative workspace is resolved against the
 /// current directory first.
 #[must_use]
-fn rollout_in_workspace(workspace: &Path, cwd: &str) -> bool {
+pub(super) fn rollout_in_workspace(workspace: &Path, cwd: &str) -> bool {
     let cwd_path = Path::new(cwd);
     if cwd_path.as_os_str().is_empty() || cwd_path.is_relative() {
         // Unclassifiable — conservative include.

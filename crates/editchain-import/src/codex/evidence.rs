@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use super::normalize::completed_agent_paths_from_tool;
 use super::projection::{FinalItem, Projection, ProjectionKind};
+use super::records::RecordBatch;
 use crate::ids::{derive_external_entity_id, derive_session_id, SourcePosition, SourceStream};
 use crate::source_read::SourceReadPlan;
 use crate::ImportError;
@@ -32,15 +33,36 @@ pub(super) fn source_evidence_ops(
         .then(|| plan.all_lines())
         .transpose()?;
     let records = historical.as_deref().unwrap_or_else(|| plan.lines());
+    let start = if replay { 0 } else { plan.start_seq() };
+    batch_evidence(
+        projection,
+        &RecordBatch {
+            lines: records,
+            start,
+            checkpoint: plan.checkpoint(),
+            check: &|| plan.check_cancellation(),
+        },
+        stream,
+        thread,
+    )
+}
+
+pub(super) fn batch_evidence(
+    projection: &Projection,
+    batch: &RecordBatch<'_>,
+    stream: &SourceStream,
+    thread: &str,
+) -> Result<Vec<Op>, ImportError> {
+    let records = batch.lines;
+    let start = batch.start;
     let Some(last_record) = records.last() else {
         return Ok(Vec::new());
     };
-    let start = if replay { 0 } else { plan.start_seq() };
-    let last = stream.op_from_position(SourcePosition::raw(plan.checkpoint().ops_emitted))?;
+    let last = stream.op_from_position(SourcePosition::raw(batch.checkpoint.ops_emitted))?;
     let first = stream.op_from_position(SourcePosition::raw(1))?;
     let mut notes = Vec::new();
     for item in &projection.item_occurrences {
-        if item.last_seen <= start || item.last_seen > plan.checkpoint().ops_emitted {
+        if item.last_seen <= start || item.last_seen > batch.checkpoint.ops_emitted {
             continue;
         }
         let index = item.last_seen.saturating_sub(start).saturating_sub(1);
@@ -49,7 +71,7 @@ pub(super) fn source_evidence_ops(
             .and_then(|index| records.get(index))
             .ok_or_else(|| ImportError::OpSink("lifecycle source occurrence missing".into()))?;
         let source = stream.op_from_position(SourcePosition::raw(item.last_seen))?;
-        for event in lifecycle_events(item, stream, thread, plan.checkpoint().ops_emitted)? {
+        for event in lifecycle_events(item, stream, thread, batch.checkpoint.ops_emitted)? {
             notes.push(evidence_note(
                 thread,
                 &ProviderEvidence {
@@ -84,7 +106,7 @@ pub(super) fn source_evidence_ops(
                 agent_path: meta.and_then(|meta| meta.agent_path.clone()),
                 first,
                 last,
-                prefix_hash: plan.checkpoint().content_hash,
+                prefix_hash: batch.checkpoint.content_hash,
             })),
         },
     )?);

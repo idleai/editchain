@@ -47,9 +47,13 @@ pub(super) fn run(
         provider,
         codex_helper,
         codex_helper_arg: codex_helper_args,
+        codex_rollout,
     } = request;
     options.cancellation.check(Path::new(&sessions_dir))?;
     check_codex_only_helper_args(provider, codex_helper.as_deref(), &codex_helper_args)?;
+    if provider != Provider::Codex && !codex_rollout.is_empty() {
+        return Err("--codex-rollout requires --provider codex".into());
+    }
 
     let chain_path = PathBuf::from(&chain);
     // Hold the writer lock before reading cursors, capturing sources, or
@@ -94,6 +98,7 @@ pub(super) fn run(
                         repositories: &repositories,
                         workspace_path: PathBuf::from(&workspace),
                         raw_root,
+                        selected_paths: codex_rollout.clone(),
                     };
                     let helper = codex_helper_command(codex_helper, codex_helper_args);
 
@@ -424,6 +429,7 @@ mod tests {
         let held = SegmentStore::open(&chain).unwrap();
         let error = run(
             ImportCommand {
+                codex_rollout: Vec::new(),
                 sessions_dir: dir
                     .path()
                     .join("missing-sources")
@@ -583,6 +589,7 @@ mod tests {
         let import = |sessions: &str, chain: &str| {
             run(
                 ImportCommand {
+                    codex_rollout: Vec::new(),
                     sessions_dir: sessions.to_string(),
                     workspace: "/workspace".to_string(),
                     chain: chain.to_string(),

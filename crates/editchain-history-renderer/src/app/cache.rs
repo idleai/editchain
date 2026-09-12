@@ -38,6 +38,25 @@ pub(super) struct CacheEntry {
 }
 
 impl CacheEntry {
+    pub(in crate::app) fn decorate(
+        mut self,
+        graph: &editchain_protocol::live_graph::LiveGraph,
+        position: &(String, u64),
+    ) -> Result<Self, ServiceError> {
+        graph.decorate(&position.0, position.1, &mut self.row.source);
+        Self::new(self.row)
+    }
+    pub(in crate::app) fn relocate(
+        mut self,
+        old: ExpandedRow,
+        new: ExpandedRow,
+    ) -> Result<Self, ServiceError> {
+        self.row.source.parent_row = self.row.source.parent_row.and_then(|parent| {
+            let distance = old.get().checked_sub(i64::try_from(parent).ok()?)?;
+            usize::try_from(new.get().checked_sub(distance)?).ok()
+        });
+        Self::new(self.row)
+    }
     fn new(row: RowInput) -> Result<Self, ServiceError> {
         let bytes = row.cache_bytes().map_err(|error| {
             ServiceError::new(
@@ -56,6 +75,14 @@ impl CacheEntry {
 }
 
 impl PageCache {
+    pub(in crate::app) fn indices(&self) -> impl Iterator<Item = ExpandedRow> + '_ {
+        self.rows.keys().copied()
+    }
+
+    pub(in crate::app) fn take_entries(&mut self) -> BTreeMap<ExpandedRow, CacheEntry> {
+        self.bytes = 0;
+        std::mem::take(&mut self.rows)
+    }
     /// Resolve and validate the entire response before any row or snapshot
     /// metadata is published. Serialization counts bytes without allocating JSON.
     pub(super) fn prepare(rows: Vec<HistoryRow>) -> Result<Vec<CacheEntry>, ServiceError> {

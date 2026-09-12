@@ -223,6 +223,7 @@ pub fn debug_graph_state() -> String {
             "renderTop": shell.state.render_top,
             "renderBottom": shell.state.render_bottom,
             "maxLane": shell.state.max_lane,
+            "windowMaxLane": shell.state.graph_max_lane(),
             "layoutReady": shell.state.layout_ready(),
             "graphWidth": shell.current_graph_width(),
         })

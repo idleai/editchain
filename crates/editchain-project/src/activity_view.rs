@@ -175,6 +175,17 @@ impl HistoryNode {
 }
 
 impl HistoryProjection {
+    /// Present current live items with their details, without contracting
+    /// separate logical identities into historical work groups.
+    #[must_use]
+    pub fn build_item_view<P: ActivityPresentation>(
+        &self,
+        presentation: &P,
+    ) -> ActivityView<P::Row> {
+        let (nodes, omissions) = self.activity_nodes_with_omissions();
+        self.assemble_activity_view(nodes, omissions, presentation)
+    }
+
     /// Build the complete fixed Activity view, in the canonical pass order.
     ///
     /// Repository selection precedes Activity grouping. The adapter supplies

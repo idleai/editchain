@@ -6,7 +6,9 @@
 //! existing append/checkpoint transaction, and no CLI or transport is required.
 
 mod claude_baseline;
+mod live;
 mod produced;
+pub(crate) use live::LiveReconciliation;
 
 use std::path::{Path, PathBuf};
 
@@ -70,6 +72,7 @@ pub(crate) fn reconcile_git_links(
 }
 
 /// Fully opened catalog shared by every policy within one reconciliation.
+#[derive(Debug)]
 struct Repositories {
     workspace: PathBuf,
     catalog: RepositoryCatalog,

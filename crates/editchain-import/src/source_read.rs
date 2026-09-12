@@ -9,6 +9,9 @@ use crate::error::ImportError;
 use crate::ids::hash_raw;
 use crate::sink::CursorValue;
 
+mod live;
+pub use live::{LiveRead, LiveReadBatch};
+
 /// Bounds checked before allocating source records or capturing source bytes.
 #[derive(Debug, Clone, Copy)]
 pub struct SourceReadLimits {

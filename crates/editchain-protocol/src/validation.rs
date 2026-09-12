@@ -21,6 +21,23 @@ impl RequestBody {
     /// Returns `InvalidInput` for unsupported limits or inexact coordinates.
     pub fn validate(&self) -> Result<(), ServiceError> {
         match self {
+            Self::SyncLive(request) => {
+                if request.epoch.is_empty() || request.after_revision > MAX_EXACT_COORDINATE {
+                    return Err(invalid("invalid live epoch or revision"));
+                }
+                if request.codex.as_ref().is_some_and(|codex| {
+                    codex.paths.len() > 32 || codex.paths.iter().any(|path| path.len() > 16384)
+                }) {
+                    return Err(invalid("live capture exceeds source batch bounds"));
+                }
+            }
+            Self::LocateRows(request) => {
+                if request.keys.len() > 2000 || request.keys.iter().any(|key| key.len() > 2048) {
+                    return Err(invalid(
+                        "anchor lookup exceeds 2000 keys or 2048 bytes per key",
+                    ));
+                }
+            }
             Self::GetWindow(request) => {
                 if request.limit == 0 || request.limit > MAX_WINDOW_ROWS {
                     return Err(invalid("window limit must be between 1 and 10000"));
@@ -42,6 +59,7 @@ impl RequestBody {
                 }
             }
             Self::Open(_)
+            | Self::OpenLive(_)
             | Self::Refresh(_)
             | Self::GetNodeDetails(_)
             | Self::ResolveObject(_)

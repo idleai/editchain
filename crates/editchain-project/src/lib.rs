@@ -13,6 +13,8 @@ pub mod content;
 pub mod git;
 /// Deterministic lane layout for graph rendering.
 pub mod layout;
+/// Mutable logical-item projection for the live activity view.
+pub mod live;
 /// Deterministic semantic metadata for projected history rows.
 pub mod meta;
 /// Provider-neutral readability taxonomy shared with the protocol layer.
@@ -217,6 +219,15 @@ impl HistoryProjection {
     #[must_use]
     pub fn codex_logical_items(&self) -> &[CodexLogicalItem] {
         &self.materialization.items
+    }
+
+    /// Presentation identity retained when an immutable provider occurrence is revised.
+    #[must_use]
+    pub fn continuity_key(&self, id: OpId) -> Option<&str> {
+        self.materialization
+            .continuity_keys
+            .get(&id)
+            .map(String::as_str)
     }
 
     /// Observed Git facts. New commits enter through `merge_git_commits`.

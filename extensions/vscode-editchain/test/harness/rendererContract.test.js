@@ -132,18 +132,16 @@ test('production webview is Rust-only: rust-history loader, never main.js or the
     'the removed GPU overlay stylesheet is not loaded');
 });
 
-test('extension contributes exactly one public history command (editchain-history.open)', () => {
-  // The shipped UI is the single default history view: exactly one public
-  // command opens it, and the side-by-side preview command must not exist.
+test('extension contributes one history view with explicit live start/stop controls', () => {
+  // Live controls operate the same history panel; no companion preview exists.
   assert.ok(PACKAGE.activationEvents.includes('onCommand:editchain-history.open'),
     'the default history command activates the extension');
   assert.ok(!PACKAGE.activationEvents.some((event) => event.includes('openGpuPreview')),
     'no side-by-side GPU preview activation event may remain');
   const commands = PACKAGE.contributes.commands;
-  assert.ok(Array.isArray(commands) && commands.length === 1,
-    'exactly one public command must be contributed, got ' + JSON.stringify(commands));
-  assert.equal(commands[0].command, 'editchain-history.open',
-    'the one public command is the default history open');
+  assert.deepEqual(commands.map(entry => entry.command), [
+    'editchain-history.open', 'editchain-history.startLive', 'editchain-history.stopLive',
+  ]);
   assert.doesNotMatch(EXTENSION_SOURCE, /openGpuPreview/,
     'the extension host must not register or reference an openGpuPreview command');
 });

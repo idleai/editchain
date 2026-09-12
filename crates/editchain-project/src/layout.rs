@@ -372,6 +372,41 @@ struct SessionGitSpines {
     lane_count: usize,
 }
 
+/// The established Git-style lane plan, without allocating per-row geometry.
+/// Retained views use the same planner as fixed Activity snapshots at bootstrap.
+#[derive(Debug)]
+pub struct LanePlan {
+    /// Node lanes, including Git's reserved leftmost lane.
+    pub nodes: HashMap<String, usize>,
+    /// Exact session-to-Git edges sharing a routing spine.
+    pub spines: HashMap<(String, String), usize>,
+    /// Number of routing lanes between Git and operation lanes.
+    pub spine_count: usize,
+}
+
+/// Plan compact causal lanes and shared Git anchors using the Activity rules.
+#[must_use]
+pub fn plan_lanes<S: std::hash::BuildHasher>(
+    nodes: &[String],
+    parents: &HashMap<String, Vec<String>, S>,
+    is_git: &impl Fn(&str) -> bool,
+) -> LanePlan {
+    let row_of = build_row_of(nodes);
+    let spines = compute_session_git_spines(nodes, &row_of, parents, is_git);
+    let lanes = compute_lane_map_reuse(
+        nodes,
+        &|key| parents.get(key).cloned().unwrap_or_default(),
+        is_git,
+        spines.lane_count,
+        &spines.shared_parents,
+    );
+    LanePlan {
+        nodes: lanes,
+        spines: spines.edge_lanes,
+        spine_count: spines.lane_count,
+    }
+}
+
 /// Assign edge-only routing lanes to exact session→Git anchors.
 ///
 /// Two or more sessions based on one commit share one spine. A commit with one
@@ -380,10 +415,10 @@ struct SessionGitSpines {
 /// after its previous spine has ended; overlapping targets therefore never
 /// appear connected. Absolute spine lanes begin at one because Git owns lane
 /// zero.
-fn compute_session_git_spines(
+fn compute_session_git_spines<S: std::hash::BuildHasher>(
     nodes: &[String],
     row_of: &HashMap<String, usize>,
-    parents: &HashMap<String, Vec<String>>,
+    parents: &HashMap<String, Vec<String>, S>,
     is_git: &impl Fn(&str) -> bool,
 ) -> SessionGitSpines {
     #[derive(Debug)]
@@ -572,7 +607,12 @@ impl LayoutContext {
         let row_of = build_row_of(nodes);
         let parents: HashMap<String, Vec<String>> =
             nodes.iter().map(|k| (k.clone(), parents_of(k))).collect();
-        let session_git_spines = compute_session_git_spines(nodes, &row_of, &parents, is_git);
+        let plan = plan_lanes(nodes, &parents, is_git);
+        let session_git_spines = SessionGitSpines {
+            edge_lanes: plan.spines,
+            lane_count: plan.spine_count,
+            shared_parents: HashSet::new(),
+        };
 
         // Compute lanes from a TOPOLOGICAL ordering of the nodes (parents before
         // children), so each causal chain gets contiguous lanes regardless of the
@@ -582,13 +622,7 @@ impl LayoutContext {
         // (e.g. separate sessions) share columns instead of each claiming a
         // permanent fresh lane. `nodes` are newest-first, which is the display
         // order the reuse algorithm needs to detect non-overlapping intervals.
-        let lane_of = compute_lane_map_reuse(
-            nodes,
-            parents_of,
-            is_git,
-            session_git_spines.lane_count,
-            &session_git_spines.shared_parents,
-        );
+        let lane_of = plan.nodes;
         // Per-row lanes in the given (possibly time-sorted) node order.
         let lanes: Vec<GraphRow> = nodes
             .iter()

@@ -103,21 +103,7 @@ pub fn process_lines(
             Err(_) => {
                 failed_lines += 1;
                 failed_ordinals.push(physical_lines);
-                let record = LineRecord {
-                    schema_version: SCHEMA_VERSION.to_string(),
-                    record_type: RECORD_TYPE_LINE.to_string(),
-                    source_path: source_path.to_string(),
-                    source_ordinal: physical_lines,
-                    decode: DecodeInfo {
-                        status: DECODE_ERROR.to_string(),
-                        diagnostic: Some("line is not valid UTF-8".to_string()),
-                        kind: KIND_UNKNOWN_JSON.to_string(),
-                        event_type: None,
-                        rollout_ordinal: None,
-                        timestamp: None,
-                    },
-                    projection: ProjectionRecord::default(),
-                };
+                let record = invalid_utf8_record(source_path, physical_lines);
                 write_record(out, &record)?;
                 records_written += 1;
                 continue;
@@ -180,6 +166,24 @@ pub fn process_lines(
         failed_lines,
         records_written,
     })
+}
+
+pub(crate) fn invalid_utf8_record(source_path: &str, source_ordinal: u64) -> LineRecord {
+    LineRecord {
+        schema_version: SCHEMA_VERSION.to_string(),
+        record_type: RECORD_TYPE_LINE.to_string(),
+        source_path: source_path.to_string(),
+        source_ordinal,
+        decode: DecodeInfo {
+            status: DECODE_ERROR.to_string(),
+            diagnostic: Some("line is not valid UTF-8".to_string()),
+            kind: KIND_UNKNOWN_JSON.to_string(),
+            event_type: None,
+            rollout_ordinal: None,
+            timestamp: None,
+        },
+        projection: ProjectionRecord::default(),
+    }
 }
 
 fn write_record(out: &mut impl Write, record: &impl Serialize) -> io::Result<()> {

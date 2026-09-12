@@ -34,6 +34,7 @@ fn print_usage() {
          \n\
          OPTIONS:\n\
          \x20 --final     emit a per-file final-session snapshot record after each file\n\
+         \x20 --stream    retain reducers; exchange editchain-stream-v1 batches on stdin/stdout\n\
          \x20 --schema    print the editchain-v1 schema summary as JSON and exit\n\
          \x20 -h, --help  show this help\n\
          \x20 -V, --version  show version",
@@ -46,11 +47,13 @@ fn main() -> ExitCode {
     let mut emit_final = false;
     let mut show_schema = false;
     let mut only_paths = false;
+    let mut stream = false;
 
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--" => only_paths = true,
             "--final" => emit_final = true,
+            "--stream" => stream = true,
             "--schema" => show_schema = true,
             "-h" | "--help" => {
                 print_usage();
@@ -72,6 +75,22 @@ fn main() -> ExitCode {
     if show_schema {
         println!("{SCHEMA_DOCUMENT}");
         return ExitCode::SUCCESS;
+    }
+    if stream {
+        if !paths.is_empty() || emit_final {
+            eprintln!("--stream accepts framed stdin batches, not file paths or --final");
+            return ExitCode::FAILURE;
+        }
+        return match codex_session_exporter::stream::serve(
+            std::io::stdin().lock(),
+            std::io::stdout().lock(),
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("stream: {error}");
+                ExitCode::FAILURE
+            }
+        };
     }
     if paths.is_empty() {
         eprintln!("codex-session-exporter: no rollout path given (schema: {SCHEMA_VERSION})");

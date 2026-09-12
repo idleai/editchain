@@ -13,6 +13,7 @@ use crate::history::{
 /// A stateful server that owns a loaded workspace across requests.
 #[derive(Debug)]
 pub struct Server {
+    live: Option<crate::history::LiveWorkspace>,
     /// The currently loaded workspace (None until `Open`).
     pub workspace: Option<Workspace>,
     /// The immutable lexical search index bound to the opened snapshot (built
@@ -25,6 +26,7 @@ impl Server {
     #[must_use]
     pub const fn new() -> Self {
         Self {
+            live: None,
             workspace: None,
             lexical: None,
         }
@@ -43,6 +45,22 @@ impl Server {
                 body: ResponseBody::Error(error),
             });
         }
+        if let RequestBody::OpenLive(open) = &request.body {
+            let live = crate::history::LiveWorkspace::open(open)?;
+            let body = ResponseBody::Ok(serde_json::to_value(live.opened())?);
+            self.live = Some(live);
+            self.workspace = None;
+            self.lexical = None;
+            return Ok(Response { id, body });
+        }
+        if matches!(request.body, RequestBody::Open(_) | RequestBody::Refresh(_)) {
+            self.live = None;
+        } else if let Some(live) = &mut self.live {
+            return Ok(Response {
+                id,
+                body: live.handle(&request.body)?,
+            });
+        }
         if let Some(requested) = request.body.snapshot_id() {
             let workspace = self.workspace.as_ref().ok_or_else(no_workspace)?;
             if requested.is_empty() {
@@ -57,7 +75,12 @@ impl Server {
             }
         }
         let reads_sources = match &request.body {
-            RequestBody::Open(_) | RequestBody::Refresh(_) | RequestBody::GetWindow(_) => false,
+            RequestBody::Open(_)
+            | RequestBody::OpenLive(_)
+            | RequestBody::SyncLive(_)
+            | RequestBody::Refresh(_)
+            | RequestBody::GetWindow(_)
+            | RequestBody::LocateRows(_) => false,
             RequestBody::FindInHistory(_) => self.lexical.is_none(),
             RequestBody::GetNodeDetails(_)
             | RequestBody::ResolveObject(_)
@@ -70,6 +93,9 @@ impl Server {
                 .ensure_sources_current()?;
         }
         let body = match &request.body {
+            RequestBody::OpenLive(_) | RequestBody::SyncLive(_) => {
+                return Err(no_workspace().into())
+            }
             RequestBody::Open(req) | RequestBody::Refresh(req) => {
                 let workspace = if matches!(&request.body, RequestBody::Open(_)) {
                     Workspace::open(&req.workspace_path, &req.chain_dir)?
@@ -79,7 +105,9 @@ impl Server {
                 let diagnostics = workspace.diagnostics;
                 let warnings = workspace.diagnostics.warnings();
                 let response = OpenResponse {
+                    live: None,
                     protocol_version: PROTOCOL_VERSION,
+                    live_updates: true,
                     snapshot_id: workspace.snapshot_id().clone(),
                     workspace: req.workspace_path.clone(),
                     chain: req.chain_dir.clone(),
@@ -104,6 +132,10 @@ impl Server {
                     include_layout: req.include_layout,
                 })?;
                 ResponseBody::Ok(serde_json::to_value(window)?)
+            }
+            RequestBody::LocateRows(req) => {
+                let ws = self.workspace.as_mut().ok_or_else(no_workspace)?;
+                ResponseBody::Ok(serde_json::to_value(ws.locate_rows(&req.keys)?)?)
             }
             RequestBody::GetNodeDetails(req) => {
                 let ws = self.workspace.as_ref().ok_or_else(no_workspace)?;

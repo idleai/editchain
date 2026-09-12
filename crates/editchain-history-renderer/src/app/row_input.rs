@@ -71,6 +71,30 @@ impl From<HistoryRow> for RowInput {
 }
 
 impl RowInput {
+    pub(crate) fn max_graph_lane(&self) -> usize {
+        let row = &self.source;
+        std::iter::once(row.lane)
+            .chain(row.above.iter().copied())
+            .chain(row.below.iter().copied())
+            .chain(row.muted_above.iter().copied())
+            .chain(row.muted_below.iter().copied())
+            .chain(
+                row.transitions
+                    .iter()
+                    .chain(&row.muted_transitions)
+                    .flat_map(|(from, to)| [*from, *to]),
+            )
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn continuity_key(&self) -> &str {
+        if self.source.continuity_key.is_empty() {
+            &self.source.node_key
+        } else {
+            &self.source.continuity_key
+        }
+    }
     /// Charge the encoded DTO and copied presentation text once at ingestion.
     /// This measures retained evidence, not allocator overhead or process RSS.
     pub(super) fn cache_bytes(&self) -> Result<u64, serde_json::Error> {

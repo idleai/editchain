@@ -31,6 +31,14 @@ use super::find::{FindMatch, FindSession};
 use super::requests::RequestRegistry;
 use super::selection::SelectionState;
 
+#[path = "delta.rs"]
+mod delta;
+#[path = "live.rs"]
+mod live;
+#[cfg(test)]
+#[path = "live_tests.rs"]
+mod live_tests;
+
 /// Rows fetched per request (`PAGE`).
 pub(crate) const PAGE: i64 = 500;
 /// Rows kept rendered past each edge of the viewport (`BUFFER`).
@@ -57,6 +65,12 @@ impl Viewport {
 /// node mutation; the state machine owns the index/pixel decisions.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DomOp {
+    /// Atomically replace a live viewport, restore its anchor, and animate keyed rows.
+    ReanchorLive {
+        top: i64,
+        bottom: i64,
+        scroll_top: i64,
+    },
     /// Replace `#rows` with a full-pane message.
     ShowMessage { text: String, error: bool },
     /// Replace `#rows` with a request error + Retry button; `retry` names the
@@ -172,6 +186,8 @@ pub(crate) struct HistoryAppState {
     pub(crate) render_bottom: i64,
     pub(super) selection: SelectionState,
     pub(super) find: FindSession,
+    pub(super) live: Option<live::LiveUpdate>,
+    pub(super) expanded_keys: std::collections::BTreeSet<String>,
 }
 
 impl Default for HistoryAppState {
@@ -193,6 +209,8 @@ impl Default for HistoryAppState {
             render_bottom: -1,
             selection: SelectionState::default(),
             find: FindSession::default(),
+            live: None,
+            expanded_keys: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -202,10 +220,11 @@ impl HistoryAppState {
 
     fn clear_expansion_state(&mut self) {
         self.expansion = None;
+        self.expanded_keys.clear();
     }
 
     pub(crate) fn data_ready(&self) -> bool {
-        self.phase != SnapshotPhase::Opening
+        self.phase != SnapshotPhase::Opening && self.live.is_none()
     }
 
     pub(crate) fn layout_ready(&self) -> bool {
@@ -240,11 +259,22 @@ impl HistoryAppState {
 
     /// Toggle any expandable row supplied by the DOM's absolute data index.
     pub(crate) fn toggle_expanded(&mut self, abs_parent_row: i64) -> bool {
-        ExpandedRow::new(abs_parent_row).is_some_and(|row| {
+        let changed = ExpandedRow::new(abs_parent_row).is_some_and(|row| {
             self.expansion
                 .as_mut()
                 .is_some_and(|index| index.toggle(row))
-        })
+        });
+        if changed {
+            if let Some(row) = self.cache.get_by_index(abs_parent_row) {
+                let key = row.continuity_key().to_owned();
+                if self.is_row_expanded(abs_parent_row) {
+                    let _: bool = self.expanded_keys.insert(key);
+                } else {
+                    let _: bool = self.expanded_keys.remove(&key);
+                }
+            }
+        }
+        changed
     }
 
     /// `toggleExpandFor` — toggle a row's reveal state and plan the
@@ -266,7 +296,19 @@ impl HistoryAppState {
         // not append the newly exposed bottom row a second time.
         self.render_top = top;
         self.render_bottom = bottom;
-        step.ops.push(DomOp::Reanchor { top, bottom });
+        if self
+            .expansion
+            .as_ref()
+            .is_some_and(|index| index.live.is_some())
+        {
+            step.ops.push(DomOp::ReanchorLive {
+                top,
+                bottom,
+                scroll_top: viewport.scroll_top.get(),
+            });
+        } else {
+            step.ops.push(DomOp::Reanchor { top, bottom });
+        }
         self.fetch_window(viewport, step);
     }
 
@@ -327,7 +369,10 @@ impl HistoryAppState {
         search_epoch: Option<u64>,
         step: &mut Step,
     ) -> Option<u64> {
-        if self.snapshot_id.is_empty() {
+        if self.snapshot_id.is_empty()
+            || (self.live.is_some()
+                && !matches!(body, RequestBody::GetWindow(_) | RequestBody::LocateRows(_)))
+        {
             return None;
         }
         match self.requests.register(body, self.view_gen, search_epoch) {
@@ -344,6 +389,8 @@ impl HistoryAppState {
 
     /// Fetch missing visible rows around the viewport.
     pub(crate) fn fetch_window(&mut self, viewport: &Viewport, step: &mut Step) {
+        let live_viewport = self.live.as_ref().and_then(|live| live.viewport);
+        let viewport = live_viewport.as_ref().unwrap_or(viewport);
         let (top, bottom) = if self.cache.byte_limited() {
             let (top, bottom) = self.viewport_range(viewport);
             (
@@ -382,7 +429,11 @@ impl HistoryAppState {
 
     /// Both viewport paging and find use the same snapshot-first scheduling.
     fn fetch_range(&mut self, top: i64, bottom: i64, step: &mut Step) {
-        if self.phase == SnapshotPhase::Failed
+        if self
+            .live
+            .as_ref()
+            .is_some_and(live::LiveUpdate::awaiting_open_or_locations)
+            || self.phase == SnapshotPhase::Failed
             || self.requests.pending_window().is_some()
             || self.total == Some(0)
             || top > bottom
@@ -466,6 +517,9 @@ impl HistoryAppState {
     /// range, pushing DOM ops onto `step`. Mirrors the production additive
     /// virtual scroll.
     pub(crate) fn sync_window(&mut self, viewport: &Viewport, step: &mut Step) {
+        if self.live.is_some() {
+            return;
+        }
         if self.phase == SnapshotPhase::Failed || self.total.unwrap_or(0) <= 0 {
             return;
         }
@@ -720,7 +774,16 @@ impl HistoryAppState {
         let Some(row) = self.cache.get_by_index(abs) else {
             return;
         };
-        self.selection.select(&row.source.node_key);
+        self.selection
+            .select_with_continuity(&row.source.node_key, row.continuity_key());
+        if let (Some(live), Some(abs)) = (
+            self.expansion
+                .as_mut()
+                .and_then(|index| index.live.as_mut()),
+            ExpandedRow::new(abs),
+        ) {
+            live.reveal(abs);
+        }
     }
 
     /// `clearSelection` — drop the inline selection.
@@ -875,6 +938,13 @@ impl HistoryAppState {
         let Some(abs) = self.find.focus(index) else {
             return;
         };
+        if let Some(live) = self
+            .expansion
+            .as_mut()
+            .and_then(|index| index.live.as_mut())
+        {
+            live.reveal(abs);
+        }
         step.ops.push(DomOp::FindCounter(FindCounterState::Settled {
             index,
             total: self.find.matches().len(),
@@ -916,10 +986,15 @@ impl HistoryAppState {
             );
             return None;
         }
+        if let Some(live) = self
+            .expansion
+            .as_mut()
+            .and_then(|index| index.live.as_mut())
+        {
+            live.reveal(target.abs);
+        }
         self.find.complete_jump();
-        let Some(vis) = self.visible_index_for_abs(target.abs.get()) else {
-            return None; // hidden slot — backend only targets top-level rows
-        };
+        let vis = self.visible_index_for_abs(target.abs.get())?;
         let half_viewport_rows = viewport
             .client_height
             .get()
@@ -1085,6 +1160,9 @@ impl HistoryAppState {
     ) {
         match msg.id {
             Id::Open => self.handle_open(msg.body, viewport, step),
+            Id::Delta => self.handle_delta(msg.body, viewport, step),
+            Id::Updating => self.pause_live(viewport, step),
+            Id::Update => self.handle_live_open(msg.body, viewport, step),
             Id::Reveal => self.handle_reveal(viewport, step),
             Id::Ready | Id::Unknown(_) => {} // compatibility handshake / unknown ids
             Id::Request(id) => self.handle_response(id, msg.body, viewport, step),
@@ -1092,6 +1170,8 @@ impl HistoryAppState {
     }
 
     fn handle_open(&mut self, body: Option<Value>, viewport: &Viewport, step: &mut Step) {
+        self.live = None;
+        self.expanded_keys.clear();
         let unwrapped = host::unwrap(body);
         match unwrapped {
             Unwrapped::Ok(value) if value.is_null() => {
@@ -1143,6 +1223,15 @@ impl HistoryAppState {
                 self.phase = SnapshotPhase::Opening;
                 self.announced_initial_load = false;
                 self.clear_expansion_state();
+                if let Some(baseline) = &opened.live {
+                    match ExpansionIndex::from_live(baseline) {
+                        Ok(index) => self.expansion = Some(index),
+                        Err(error) => {
+                            self.fail_snapshot(step, &error.message);
+                            return;
+                        }
+                    }
+                }
                 self.open_warnings = Self::collect_open_warnings(&value);
                 if !self.open_warnings.is_empty() {
                     step.sends.push(Send::Log(format!(
@@ -1265,6 +1354,7 @@ impl HistoryAppState {
         match host::unwrap(body) {
             Unwrapped::Err(error) => self.fail_response(&req.body, &error, step),
             Unwrapped::Ok(value) => match &req.body {
+                RequestBody::LocateRows(_) => self.handle_live_locations(value, step),
                 RequestBody::GetWindow(request) => match host::decode::<HistoryWindow>(value) {
                     Ok(window) => {
                         if let Err(error) =
@@ -1292,6 +1382,8 @@ impl HistoryAppState {
                     }
                 }
                 RequestBody::Open(_)
+                | RequestBody::OpenLive(_)
+                | RequestBody::SyncLive(_)
                 | RequestBody::Refresh(_)
                 | RequestBody::GetNodeDetails(_)
                 | RequestBody::ResolveObject(_)
@@ -1327,6 +1419,7 @@ impl HistoryAppState {
     }
 
     fn fail_response(&mut self, request: &RequestBody, error: &ServiceError, step: &mut Step) {
+        self.fail_live(&error.message, step);
         step.sends
             .push(Send::Log(format!("request error: {error}")));
         if matches!(
@@ -1354,6 +1447,7 @@ impl HistoryAppState {
     }
 
     fn fail_snapshot(&mut self, step: &mut Step, message: &str) {
+        self.fail_live(message, step);
         self.invalidate_snapshot();
         step.sends
             .retain(|send| !matches!(send, Send::Request { .. }));
@@ -1505,6 +1599,10 @@ impl HistoryAppState {
                 self.total_fetched = self.total_fetched.saturating_add(1);
             }
             drop(self.cache.insert(abs, row));
+        }
+        if self.live.is_some() {
+            self.apply_live_window(step);
+            return;
         }
         // Complete a pending find jump before eviction changes the viewport.
         let mut effective_viewport = *viewport;

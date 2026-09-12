@@ -8,6 +8,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::cancellation::ImportCancellation;
 use crate::error::ImportError;
 
+mod stream;
+pub use stream::{LiveHelper, LiveHelperInput, LiveHelperReply};
+
 /// Independent limits on one helper invocation, including output draining.
 #[derive(Debug, Clone, Copy)]
 pub struct HelperLimits {

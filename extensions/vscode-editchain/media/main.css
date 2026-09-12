@@ -128,6 +128,34 @@ body {
   border-radius: 50%;
   animation: ec-search-spin 0.8s linear infinite;
 }
+@keyframes ec-live-move {
+  from { transform: translateY(var(--live-offset, 0)); }
+  to { transform: translateY(0); }
+}
+.row.row-live-moved { animation: ec-live-move 360ms ease-out; }
+@keyframes ec-graph-grow {
+  from { stroke-dashoffset: -1; }
+  to { stroke-dashoffset: 0; }
+}
+@keyframes ec-graph-node {
+  from { opacity: 0; transform: scale(.65); }
+  to { opacity: 1; transform: scale(1); }
+}
+.graph-live-edge {
+  stroke-dasharray: 1;
+  animation: ec-graph-grow var(--graph-duration) linear var(--graph-delay) both;
+}
+.graph-live-node {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: ec-graph-node 180ms ease-out var(--graph-delay) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .row.row-live-moved { animation: none; }
+  .graph-live-edge, .graph-live-node { animation: none; }
+  .graph-live-edge { stroke-dasharray: none; stroke-dashoffset: 0; }
+}
+
 @keyframes ec-search-spin {
   to {
     transform: rotate(360deg);
@@ -183,7 +211,7 @@ body {
   cursor: default;
 }
 #layout { display: flex; flex: 1; min-height: 0; width: 100%; }
-#rows { flex: 1; overflow-y: auto; position: relative; min-width: 0; }
+#rows { flex: 1; overflow: auto; position: relative; min-width: 0; }
 
 /* Scroll spacer gives #rows a scrollbar spanning the FULL history height even
    though only a viewport slice is rendered. The rendered slice (table-wrap) is
@@ -1353,9 +1381,7 @@ body {
   background: transparent;
 }
 
-/* Outer chat-to-chat work groups are presentation-only linear aggregates.
-   Their restrained rail distinguishes the summarized interval without
-   implying a graph branch; actual fork/merge nodes remain outside them. */
+/* Group headers identify presentation sections without implying a branch. */
 .row-activity-bundle[data-activity-bundle='work-group'] {
   box-shadow: inset 2px 0 0 color-mix(in srgb, var(--vscode-focusBorder) 48%, transparent);
   background: color-mix(in srgb, var(--vscode-focusBorder) 3%, transparent);
@@ -1712,3 +1738,7 @@ body {
       minmax(0, 96px) minmax(0, 1fr);
   }
 }
+
+/* Native task headers use the same row height and fixed graph lane pitch. */
+.row-task-group .summary { font-weight: 600; }
+.row-task-group { border-top-color: var(--ec-hairline-strong); }

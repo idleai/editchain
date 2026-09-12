@@ -44,6 +44,7 @@ Usage:
 codex-session-exporter [OPTIONS] <ROLLOUT_JSONL>...
   --final     emit a per-file final-session snapshot record after each file
   --schema    print the editchain-v1 schema summary as JSON and exit
+  --stream    retain source reducers; read editchain-stream-v1 batches on stdin
 ```
 
 The sibling checkout must be present at `../../../codex` relative to this
@@ -52,6 +53,27 @@ workspace's `[patch.crates-io]` forks and pins `rama-*` to the same
 `0.3.0-alpha.4` prereleases its lockfile resolves (the stable `0.3.0` crates
 are not source-compatible with `rama-core` used transitively by
 codex-network-proxy).
+
+For realtime collection, `--stream` accepts one JSON batch per physical stdin
+line and flushes one reply per batch. It does not open source files:
+
+```json
+{"schema":"editchain-stream-v1","source":"rollout-id","generation":0,"after":0,"reset":true,"lines":["{}\n"]}
+```
+
+`after` is the number of complete physical source lines already accepted by
+this reducer; subsequent requests advance it by `lines.length`. Every string
+includes exactly one terminating newline. A null entry denotes one complete
+invalid-UTF-8 line whose exact bytes the collector retains separately. Blank
+lines advance the cursor without producing a projection record.
+
+Replies contain `schema`, `through`, `records`, `recordsProjected` and `error`.
+`records` uses the same `editchain-v1` occurrence schema as offline export.
+An exact retry of the last batch returns the same records with zero new
+projection work. A missing reducer, generation mismatch or ordinal gap requires
+an explicit reset from ordinal zero. The process retains at most 64 source
+reducers using LRU eviction. The native collector, rather than this helper,
+owns durable admission and checkpoint ordering.
 
 Plain `.jsonl` and gzip-compressed rollouts (magic `1f 8b`) are accepted. A
 known `flate2`/`BufRead` interaction surfaces clean stream end as

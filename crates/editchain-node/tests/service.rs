@@ -55,6 +55,86 @@ fn write_page_sequence(chain_dir: &Path, sequence: u32, page: &editchain_store::
     .expect("write segment");
 }
 
+fn live_request(server: &mut editchain_node::Server, body: serde_json::Value) -> serde_json::Value {
+    let response = server
+        .handle(&Request {
+            id: 1,
+            body: serde_json::from_value(body).expect("valid live request"),
+        })
+        .expect("successful live request");
+    let ResponseBody::Ok(value) = response.body else {
+        panic!("live request failed")
+    };
+    value
+}
+
+#[test]
+fn retained_native_delta_reads_one_record_and_replays_without_reopening() {
+    for count in [1_u64, 10_000] {
+        let tmp = tempfile::tempdir().unwrap();
+        let chain = tmp.path().join(".editchain");
+        let mut page = editchain_store::format::Page::new(0);
+        for seq in 1..=count {
+            let mut op = msg_op(51, seq, b"existing message");
+            if seq > 1 {
+                op.parents = ParentSet::One(OpId::new(NodeId(51), 0, seq - 1));
+            }
+            page.add_record(0, editchain_store::format::encode_op(&op).unwrap());
+        }
+        write_page(&chain, &page);
+        let mut server = editchain_node::Server::new();
+        let opened = live_request(
+            &mut server,
+            serde_json::json!({"OpenLive": {"workspace_path": tmp.path(), "chain_dir": ".editchain"}}),
+        );
+        let epoch = opened["live"]["epoch"].clone();
+        assert_eq!(opened["nodes"], count);
+        let mut next = msg_op(51, count + 1, b"incremental searchable needle");
+        next.parents = ParentSet::One(OpId::new(NodeId(51), 0, count));
+        let mut page = editchain_store::format::Page::new(1);
+        page.add_record(0, editchain_store::format::encode_op(&next).unwrap());
+        let encoded = editchain_store::format::encode_page(&page).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(chain.join("000000.eclog"))
+            .unwrap()
+            .write_all(&encoded)
+            .unwrap();
+        let sync =
+            serde_json::json!({"SyncLive": {"epoch": epoch, "after_revision": 0, "codex": null}});
+        let first = live_request(&mut server, sync.clone());
+        assert_eq!(first["work"]["chain_records"], 1);
+        assert_eq!(first["work"]["chain_bytes"], encoded.len());
+        assert_eq!(first["work"]["presentation_ops"], 1);
+        assert_eq!(first["deltas"][0]["total"], count + 1);
+        assert_eq!(first["deltas"][0]["upserts"].as_array().unwrap().len(), 1);
+        let replay = live_request(&mut server, sync);
+        assert_eq!(replay["work"]["chain_records"], 0);
+        assert_eq!(first["deltas"], replay["deltas"]);
+        let snapshot = first["deltas"][0]["snapshot_id"].clone();
+        let found = live_request(
+            &mut server,
+            serde_json::json!({"FindInHistory": {"snapshot_id": snapshot, "query": "needle", "top_k": 5}}),
+        );
+        assert_eq!(found["matches"].as_array().unwrap().len(), 1);
+        let window = live_request(
+            &mut server,
+            serde_json::json!({"GetWindow": {"snapshot_id": snapshot, "offset": 0, "limit": 3, "include_layout": true}}),
+        );
+        assert_eq!(
+            window["rows"][0]["parents"],
+            serde_json::json!([OpId::new(NodeId(51), 0, count).to_string()])
+        );
+        assert!(!window["rows"][0]["below"].as_array().unwrap().is_empty());
+        assert_eq!(window["rows"][0]["above"], serde_json::json!([]));
+        let idle = live_request(
+            &mut server,
+            serde_json::json!({"SyncLive": {"epoch": epoch, "after_revision": 1, "codex": null}}),
+        );
+        assert_eq!(idle["deltas"], serde_json::json!([]));
+    }
+}
+
 /// Find the rendered Activity row that represents one source operation.
 ///
 /// Work groups reuse an anchor id for their synthetic top-level row, so prefer
@@ -2698,6 +2778,68 @@ fn prepared_snapshot_manifest_records_projection_revision_fifty_seven() {
     .expect("parse manifest");
     assert_eq!(manifest["format"], "editchain-render-snapshot");
     assert_eq!(manifest["identity"]["projection_revision"], 57u64);
+}
+
+#[test]
+fn live_anchor_lookup_uses_snapshot_coordinates_on_projected_and_cached_views() {
+    let tmp = tempfile::tempdir().unwrap();
+    let chain_dir = tmp.path().join(".editchain");
+    let mut page = editchain_store::format::Page::new(0);
+    for seq in 1..=8 {
+        page.add_record(
+            0,
+            editchain_store::format::encode_op(&msg_op(91, seq, b"live anchor")).unwrap(),
+        );
+    }
+    write_page(&chain_dir, &page);
+    for cached in [false, true] {
+        if cached {
+            drop(prepare_render_snapshot(tmp.path(), Path::new(".editchain")).unwrap());
+        }
+        let mut ws = Workspace::open(tmp.path().to_str().unwrap(), ".editchain").unwrap();
+        let window = ws
+            .history_window(HistoryWindowOptions {
+                offset: 0,
+                limit: 100,
+                include_layout: true,
+            })
+            .unwrap();
+        let keys: Vec<_> = window
+            .rows
+            .iter()
+            .map(|row| {
+                if row.continuity_key.is_empty() {
+                    row.node_key.clone()
+                } else {
+                    row.continuity_key.clone()
+                }
+            })
+            .collect();
+        let located = ws.locate_rows(&keys).unwrap();
+        assert_eq!(located.snapshot_id, window.snapshot_id);
+        assert_eq!(located.rows.len(), window.rows.len());
+        for (index, location) in located.rows.iter().enumerate() {
+            assert_eq!(location.row, u64::try_from(index).unwrap());
+            assert_eq!(location.node_key, window.rows[index].node_key);
+        }
+        let mut server = editchain_node::Server::new();
+        server.workspace = Some(ws);
+        let request = Request {
+            id: 1,
+            body: RequestBody::LocateRows(editchain_protocol::LocateRowsRequest {
+                snapshot_id: editchain_protocol::SnapshotId::new("retired"),
+                keys,
+            }),
+        };
+        let error = server.handle(&request).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<editchain_protocol::ServiceError>()
+                .unwrap()
+                .code,
+            editchain_protocol::ErrorCode::StaleSnapshot
+        );
+    }
 }
 
 #[test]

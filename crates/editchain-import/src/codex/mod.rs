@@ -181,11 +181,14 @@ mod evidence;
 pub mod helper;
 /// Top-level import orchestrator for Codex rollouts.
 pub mod import;
+/// Persistent Codex capture for the native live workspace runtime.
+pub mod live;
 mod materialize;
 /// Normalization of raw lines and projection items into editchain ops.
 pub mod normalize;
 /// Projection parsing, validation, and item folding.
 pub mod projection;
+mod records;
 /// Exact session-start Git anchoring from Codex metadata.
 mod session_git;
 mod title;
