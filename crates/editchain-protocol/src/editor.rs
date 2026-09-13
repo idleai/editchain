@@ -69,6 +69,46 @@ pub struct EditorChange {
     pub text: String,
 }
 
+/// Bounded mechanism evidence from VS Code's optional detailed-change API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorChangeOrigin {
+    /// Reported source, including unknown sources without a human claim.
+    pub source: String,
+    /// Cursor operation kind, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Input source or editor command, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detailed_source: Option<String>,
+    /// Mechanism name, for example a formatting operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Reported provider extension, without a verified authorship claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_id: Option<String>,
+}
+
+impl EditorChangeOrigin {
+    fn validate(&self) -> Result<(), &'static str> {
+        for value in [
+            Some(&self.source),
+            self.kind.as_ref(),
+            self.detailed_source.as_ref(),
+            self.name.as_ref(),
+            self.extension_id.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if value.is_empty() || value.len() > 512 {
+                return Err("invalid editor change origin");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Stable editor observations and explicit human-work indicators.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -121,8 +161,11 @@ pub enum EditorEventKind {
         changes: Vec<EditorChange>,
         /// Stable reason: undo, redo, or absent.
         reason: Option<String>,
+        /// Optional detailed mechanism; absence retains legacy observations.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<EditorChangeOrigin>,
     },
-    /// Human intent inferred from keyboard selection or undo/redo.
+    /// Human intent inferred from editor input, keyboard selection, or undo/redo.
     HumanEdit {
         /// Earlier document-change sequence in this recorder incarnation.
         change: u64,
@@ -316,7 +359,11 @@ impl EditorEvent {
                 after,
                 changes,
                 reason,
+                origin,
             } => {
+                if let Some(origin) = origin {
+                    origin.validate()?;
+                }
                 if *before_version >= document.version
                     || changes.is_empty()
                     || changes.len() > 10000
@@ -349,7 +396,10 @@ impl EditorEvent {
                 }
             }
             EditorEventKind::HumanEdit { signal, .. } => {
-                if !matches!(signal.as_str(), "keyboard_selection" | "undo" | "redo") {
+                if !matches!(
+                    signal.as_str(),
+                    "editor_input" | "keyboard_selection" | "undo" | "redo"
+                ) {
                     return Err("unknown human edit signal");
                 }
             }

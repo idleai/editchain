@@ -72,7 +72,14 @@ export class HumanWorkHost {
           }, message => this.updateStatus(message));
         const dwell = Math.max(500, Math.min(30000, configuration.get<number>('tracking.readDwellMs', 2000)));
         const maxBytes = Math.max(1024, Math.min(524288, configuration.get<number>('tracking.maxFileBytes', 262144)));
-        const capture = new EditorCapture(folder, dwell, maxBytes, event => outbox.push(event),
+        let attributionLogged = false;
+        const capture = new EditorCapture(folder, dwell, maxBytes, event => {
+          if (!attributionLogged && event.event.type === 'document_changed') {
+            attributionLogged = true;
+            this.log.appendLine(`[capture] Edit attribution: ${event.event.origin ? 'detailed editor reasons' : 'stable selection hints (partial coverage)'}`);
+          }
+          return outbox.push(event);
+        },
           workspaceIdentity(guid, folder.uri.toString(), folder.uri.fsPath, chain));
         const context = observeEditorContext(capture, () => {
           client.ensureStarted(resolveServicePath());
@@ -152,6 +159,7 @@ export function formatReport(report: any): string {
     ...report.files.map((file: any) => `| ${escape(file.path)} | ${file.ai_lines} | ${file.read_lines} | ${file.edited_lines} |`), '',
     `Historical evidence: ${report.historical_ai_lines} generated lines; ${report.historical_ai_lines_read} with reading indicators; ${report.historical_ai_lines_edited} edited (including subsequently deleted lines).`,
     `Captured ${report.human_changes} human-indicated changes and ${report.events} events.`, '',
+    `Observed changes without human attribution: ${report.unattributed_changes ?? 0}.`, '',
     `Coverage gaps: ${report.capture_gaps}. Unsupported AI changes: ${report.unsupported_ai_changes}. Unavailable files: ${report.unavailable_files}.`, '',
     ...report.limitations.map((note: string) => `- ${note}`), '',
     'Run **EditChain: Show Human Work Coverage** again to refresh. Tracking can be paused or resumed from the Command Palette.', ''].join('\n');

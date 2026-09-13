@@ -9,7 +9,7 @@ type WorkRow = { author: string; parents: string[]; node_key: string; is_subop: 
   sub_ops?: { kind: string }[]; file_change?: { source: string; path: string; op_id: string };
   task_group?: { task_id: string; expanded: boolean; member_count: number } };
 
-const output = path.resolve('trace', `work-${process.env.EDITCHAIN_CAPTURE_VSCODE || '1.137.0'}`);
+const output = process.env.EDITCHAIN_WORK_OUTPUT || path.resolve('trace', `work-${process.env.EDITCHAIN_CAPTURE_VSCODE || '1.137.0'}`);
 async function show(line = 0): Promise<void> {
   await browser.executeWorkbench(async (vscode, line) => {
     const doc = await vscode.workspace.openTextDocument(vscode.Uri.joinPath(vscode.workspace.workspaceFolders[0].uri, 'ai.ts'));
@@ -227,12 +227,16 @@ describe('production human-work capture', () => {
         .filter(row => row.getClientRects().length).map(row => row.getBoundingClientRect().top).sort((a, b) => a - b);
       return rows.length >= 4 && rows.every((top, i) => i === 0 || top - rows[i - 1] < 120);
     }), { timeout: 10000, timeoutMsg: 'folded human episodes left blank space between graph rows' });
-    await browser.waitUntil(async () => (await readRows()).some(row => row.parents.some(parent => parent.startsWith('git:'))),
+    let overview: WorkRow[] = [];
+    await browser.waitUntil(async () => {
+      // Keep the hydrated sample; a second read can race a live publication.
+      overview = await readRows();
+      return overview.some(row => row.parents.some(parent => parent.startsWith('git:')));
+    },
       { timeout: 10000, timeoutMsg: 'folding did not restore hydrated Git connections' }).catch(async error => {
       fs.writeFileSync(path.join(output, 'human-folded-failed.json'), JSON.stringify(await readRows(), null, 2));
       throw error;
     });
-    const overview = await readRows();
     await waitForGraph(overview.filter(row => !row.is_subop).map(row => row.node_key));
     await browser.saveScreenshot(path.join(output, 'human-edits-graph.png'));
     await browser.$('body').saveScreenshot(path.join(output, 'human-edits-graph-webview.png'));

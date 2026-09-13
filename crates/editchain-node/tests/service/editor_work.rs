@@ -8,6 +8,9 @@ use std::path::Path;
 #[path = "editor_work/graph.rs"]
 mod graph;
 
+#[path = "editor_work/attribution.rs"]
+mod attribution;
+
 const SESSION: &str = "11111111-1111-4111-8111-111111111111";
 
 fn event(sequence: u64, data: Value) -> Value {

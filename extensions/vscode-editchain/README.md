@@ -79,9 +79,10 @@ is reported as unknown, never as zero human review of the whole codebase.
 - `editchain-history.tracking.maxFileBytes` defaults to `262144`. Binary and
   larger buffers produce explicit capture gaps.
 
-Keyboard-correlated edits are human-work indicators under the intentional-user
-assumption. The stable VS Code API does not authenticate authorship. Other text
-changes remain observed changes. Focus is used only to pause exposure timers;
+Editor-input and keyboard-correlated edits are human-work indicators under the
+intentional-user assumption. The VS Code API does not authenticate physical
+authorship. Other text changes remain observed changes. Focus gates attribution
+and pauses exposure timers;
 **no window-focus events or focus history are stored**. Visible code is an
 opportunity to read, not proof of comprehension. Only the active visible editor
 qualifies; folding gaps and navigation jumps are never filled in.
@@ -100,6 +101,22 @@ retained.
 Install the current VSIX and reload VS Code to activate an updated recorder.
 The native service selected by `editchain-history.servicePath` must be rebuilt
 from the same branch; updating only one component leaves an incompatible pair.
+
+Version 0.1.5 ties keyboard fallback to one exact revision, editor, and resulting
+cursor positions. Navigation or a later keystroke cannot claim an earlier
+candidate after its selection update, save, or focus/activation boundary.
+Saving records the revision without creating another edit. Coverage also reports
+how many observed changes have no human attribution.
+
+The optional local build from `npm run package:editor-origins` uses VS Code's
+proposed `textDocumentChangeReason` API when enabled. It captures Backspace,
+Delete, Tab, and other editor input directly, and retains explicit origins for
+programmatic, formatting, disk, and completion changes without counting them as
+human-written code. The ordinary package stays on stable APIs and has partial
+coverage: unspecified selection events cannot safely distinguish deletion from
+automatic changes. See [local setup and attribution rules](../../docs/vscode-human-work.md#optional-local-build-with-editor-origins).
+The output channel reports the loaded extension version/path and the attribution
+mode observed on the first change.
 
 Version 0.1.4 retains the read receipt for an unchanged document revision and
 viewport across interruptions, including replacement editor objects when a tab

@@ -107,6 +107,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const out = vscode.window.createOutputChannel('EditChain History');
   output = out;
   context.subscriptions.push(out);
+  out.appendLine(`[extension] EditChain ${context.extension?.packageJSON.version ?? 'development'} (${context.extensionPath})`);
   client.setLog((line) => out.appendLine(line));
   humanWork = new HumanWorkHost(context, out);
 

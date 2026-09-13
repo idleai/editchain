@@ -21,7 +21,7 @@ of loading a document. Split tabs have separate identities.
 | `tracking_gap` | Skipped buffer, missing baseline, or capacity pause. |
 | `document_snapshot` | Exact initial/recovered text, including unsaved text. |
 | `document_changed` | Before/after revisions and raw replacements in emitted order. |
-| `human_edit` | Reference to a change with keyboard-selection, undo, or redo evidence. |
+| `human_edit` | Reference to a change with explicit editor-input, keyboard-selection, undo, or redo evidence. |
 | `document_saved` | Saved buffer revision. |
 | `document_renamed` | Explicit file/directory rename within the workspace. |
 | `editor_opened` / `editor_closed` | Text tab lifecycle, tab ID, URI, and captured relative path, including preview tabs. |
@@ -66,12 +66,41 @@ Orderly recorder shutdown flushes a pending qualified read and records
 `tracking_stopped`; it does not manufacture tab closes. Abrupt process exits can
 leave lifecycle intervals incomplete.
 
-The intentionally cooperative user assumption applies to edit attribution:
-keyboard selection correlated with changes within 250 ms marks those changes
-as human work; focused active-editor undo/redo also qualifies. Typing, deletion,
-and paste work through stable API events, without overriding VS Code commands.
-Programmatic changes remain observations unless they also produce the same
-human indicators. This is a heuristic, not verified authorship.
+Version 0.1.5 records the observable basis for attribution, under the cooperative
+assumption of intentional human work. Both paths require the focused active
+document and retain exact changes before saving:
+
+- With the optional `textDocumentChangeReason` API enabled, `cursor` origins
+  with typing, paste, cut, composition, or editor-command kinds emit
+  `human_edit` immediately with signal `editor_input`. Backspace, Delete, Tab,
+  and selected-text deletion qualify even without a keyboard selection event.
+  `document_changed.origin` retains bounded source, kind, detailed source,
+  mechanism name, and provider extension fields when reported. Known non-input
+  origins, missing reasons, and unfamiliar kinds stay unattributed regardless
+  of nearby keyboard activity. Ordinary undo/redo has `applyEdits` origin and
+  retains its separate signal.
+- On stable APIs, the first selection update must be keyboard-caused, belong
+  to the same editor and exact buffer revision, arrive within 250 ms, and end
+  at the replacement's resulting UTF-16 caret positions. It consumes only that
+  candidate, including when rejected. A newer mutation replaces the candidate;
+  save, activation, focus, and document-close boundaries clear it. This path
+  deliberately leaves ambiguous deletions and other unsupported actions
+  unattributed. Focused active-editor undo/redo also qualifies.
+
+Saving records `document_saved` without inventing or duplicating an edit.
+Formatting on save, `WorkspaceEdit`, `TextEditor.edit`, disk reloads, and provider
+completion acceptance are observations with no automatic human attribution.
+The coverage report includes `unattributed_changes`, the count of observed
+mutations without a human indicator. This includes both automated changes and
+uncertain changes; it is not an additional AI-origin count.
+
+Stable VS Code reports the same unspecified selection kind for Backspace and
+some programmatic edits; widening that filter alone would misattribute work.
+The proposed API provides mechanism evidence, not verified authorship: an
+extension invoking the built-in `type` command can still produce the same
+origin as physical input. See the [VS Code source mapping](https://github.com/microsoft/vscode/blob/1.136.2/src/vs/workbench/api/common/extHostTypes.ts#L690),
+[edit-origin definitions](https://github.com/microsoft/vscode/blob/1.136.2/src/vs/editor/common/textModelEditSource.ts),
+and [prior runtime counterexample](vscode-editor-capture-results.md#attribution).
 
 ## Durable integration
 
@@ -363,3 +392,26 @@ identity across recorder sessions (0.1.1 introduced lifecycle graph rows).
 Installing a VSIX updates disk files; reload the VS Code window to replace an
 already-running older recorder and its service clients. Historical brief
 exposure records remain retained even after new capture stops producing them.
+
+### Optional local build with editor origins
+
+`npm run package` keeps the extension on stable APIs. After compiling, run
+`npm run package:editor-origins` to produce
+`outputs/editchain-history-0.1.5-editor-origins.vsix` from an isolated staging
+directory. Its manifest declares only `textDocumentChangeReason`; packaging
+does not change the ordinary manifest or enable APIs in an existing VS Code.
+The native service must also be rebuilt to accept retained origin metadata.
+
+Install that VSIX and launch VS Code with
+`--enable-proposed-api ambientlight.editchain-history`. For persistent local
+opt-in, merge `"enable-proposed-api": ["ambientlight.editchain-history"]` into
+the runtime arguments opened by **Preferences: Configure Runtime Arguments**,
+preserving other entries, then quit and relaunch VS Code. These are local
+development builds; Microsoft's [proposed-API guidance](https://code.visualstudio.com/api/advanced-topics/using-proposed-api)
+does not permit publishing them to the Marketplace.
+
+The EditChain output channel logs the loaded version/path on activation and,
+after the first mutation, either `detailed editor reasons` or
+`stable selection hints (partial coverage)`. Without runtime opt-in the local
+build falls back to stable observations. Old recorded changes are not
+retroactively relabeled from timing guesses.

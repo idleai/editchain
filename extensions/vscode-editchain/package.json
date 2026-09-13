@@ -2,7 +2,7 @@
   "name": "editchain-history",
   "displayName": "EditChain History",
   "description": "Unified engineering history explorer \u2014 EditChain operations overlaid with live Git history.",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "publisher": "ambientlight",
   "license": "MIT",
   "repository": {
@@ -117,6 +117,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "package": "vsce package",
+    "package:editor-origins": "node scripts/package-editor-origins.mjs",
     "perf:service": "node scripts/service-perf.mjs",
     "ui:vscode": "xvfb-run -a npx wdio run ./test/vscode/wdio.conf.ts",
     "ui:vscode:renderer": "xvfb-run -a npx wdio run ./test/vscode/wdio.renderer.conf.ts",

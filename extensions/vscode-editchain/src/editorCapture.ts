@@ -5,13 +5,14 @@ import { performance } from 'node:perf_hooks';
 import { setTimeout, clearTimeout } from 'node:timers';
 import { EditorEvent } from './editorOutbox';
 import type { HumanIdentity } from './humanIdentity';
+import { editorOrigin, isEditorInput } from './editorOrigin';
 
 type Document = { id: string; uri: string; path: string | null; version: number };
 type Range = { start: [number, number]; end: [number, number] };
 type BufferState = { document: Document; text: string };
 type Exposure = { document: Document; editor: string; ranges: Range[]; started_ms: number; monotonic: number; reported: boolean };
 
-/** Stable VS Code API observer; no proposed APIs and no persisted focus history. */
+/** VS Code observations, with optional change-origin evidence and local focus guards. */
 export class EditorCapture {
   private readonly session = randomUUID();
   private sequence = 0;
@@ -20,7 +21,9 @@ export class EditorCapture {
   private readonly ids = new WeakMap<object, string>();
   private readonly documents = new Map<vscode.TextDocument, BufferState>();
   private readonly subscriptions: vscode.Disposable[] = [];
-  private readonly pending = new Map<vscode.TextDocument, { sequence: number; version: number; at: number }[]>();
+  private readonly pending = new Map<vscode.TextDocument, {
+    sequence: number; version: number; at: number; editor: vscode.TextEditor; carets: number[];
+  }>();
   private readonly skipped = new Set<string>();
   // Keep the last view's receipt when focus/activation/context ends its timer.
   // A hidden tab can return with a new TextEditor object for the same document.
@@ -41,6 +44,7 @@ export class EditorCapture {
       }),
       vscode.workspace.onDidChangeTextDocument(event => this.changed(event)),
       vscode.workspace.onDidSaveTextDocument(document => {
+        this.pending.delete(document);
         const state = this.documents.get(document);
         if (state) this.record({ type: 'document_saved', document: state.document });
       }),
@@ -51,6 +55,7 @@ export class EditorCapture {
         }
       }),
       vscode.window.onDidChangeActiveTextEditor(editor => {
+        for (const [document, change] of this.pending) if (change.editor !== editor) this.pending.delete(document);
         if (!editor || (this.exposure && (this.exposure.editor !== this.identity(editor)
           || !this.sameView(this.exposure, editor)))) this.endExposure();
         const state = editor && this.baseline(editor.document);
@@ -60,8 +65,11 @@ export class EditorCapture {
       vscode.window.onDidChangeVisibleTextEditors(() => this.viewport()),
       vscode.window.onDidChangeTextEditorVisibleRanges(() => this.viewport()),
       vscode.window.onDidChangeTextEditorSelection(event => this.selection(event)),
-      // Focus is an in-memory timer guard only; deliberately emit no event.
-      vscode.window.onDidChangeWindowState(() => this.viewport()),
+      // Focus guards local state only; activity notifications need not lose focus.
+      vscode.window.onDidChangeWindowState(() => {
+        if (!vscode.window.state.focused) this.pending.clear();
+        this.viewport();
+      }),
       vscode.window.tabGroups.onDidChangeTabs(event => {
         if (event.closed.length) this.viewport();
         for (const tab of event.opened) this.tab(tab, 'editor_opened');
@@ -115,6 +123,7 @@ export class EditorCapture {
 
   private changed(event: vscode.TextDocumentChangeEvent): void {
     if (!this.tracked(event.document) || !event.contentChanges.length) return;
+    this.pending.delete(event.document);
     if (this.exposure?.document.id === this.documents.get(event.document)?.document.id) this.endExposure();
     const before = this.documents.get(event.document);
     const after = event.document.getText();
@@ -129,33 +138,41 @@ export class EditorCapture {
       path: this.relative(event.document.uri), version: event.document.version };
     const reason = event.reason === vscode.TextDocumentChangeReason.Undo ? 'undo'
       : event.reason === vscode.TextDocumentChangeReason.Redo ? 'redo' : null;
+    const origin = editorOrigin(event);
     const sequence = this.record({ type: 'document_changed', document, before_version: before.document.version,
-      before: before.text, after, reason, changes: event.contentChanges.map(change => ({
+      before: before.text, after, reason, ...(origin ? { origin } : {}), changes: event.contentChanges.map(change => ({
         offset: change.rangeOffset, length: change.rangeLength, text: change.text,
       })) });
     this.documents.set(event.document, { document, text: after });
     if (sequence && vscode.window.state.focused && vscode.window.activeTextEditor?.document === event.document) {
-      if (reason) this.record({ type: 'human_edit', change: sequence, signal: reason });
-      else {
-        const pending = this.pending.get(event.document) ?? [];
-        pending.push({ sequence, version: document.version, at: performance.now() });
-        this.pending.set(event.document, pending.filter(change => performance.now() - change.at <= 250));
+      // A known non-input origin takes precedence over timing/selection hints.
+      // Undo/redo of ordinary editor history reports applyEdits in this API.
+      const signal = reason && (!origin || origin.source === 'applyEdits') ? reason
+        : origin && isEditorInput(origin) ? 'editor_input' : undefined;
+      if (signal) this.record({ type: 'human_edit', change: sequence, signal });
+      else if (!origin) {
+        this.pending.set(event.document, { sequence, version: document.version, at: performance.now(),
+          editor: vscode.window.activeTextEditor, carets: editCarets(event.contentChanges) });
       }
     }
     this.viewport();
   }
 
   private selection(event: vscode.TextEditorSelectionChangeEvent): void {
+    const change = this.pending.get(event.textEditor.document);
+    // A selection update belongs to one revision. An unknown/command update
+    // consumes it too, so later navigation cannot claim an automatic edit.
+    this.pending.delete(event.textEditor.document);
     const state = this.baseline(event.textEditor.document);
-    if (!state) return;
+    if (!state || !change) return;
     const keyboard = event.kind === vscode.TextEditorSelectionChangeKind.Keyboard;
-    if (keyboard && vscode.window.state.focused) {
-      for (const change of this.pending.get(event.textEditor.document) ?? []) {
-        if (change.version <= state.document.version && performance.now() - change.at <= 250) {
-          this.record({ type: 'human_edit', change: change.sequence, signal: 'keyboard_selection' });
-        }
-      }
-      this.pending.delete(event.textEditor.document);
+    const carets = event.selections.filter(selection => selection.isEmpty)
+      .map(selection => event.textEditor.document.offsetAt(selection.active)).sort((a, b) => a - b);
+    if (keyboard && vscode.window.state.focused && event.textEditor === vscode.window.activeTextEditor
+      && event.textEditor === change.editor && change.version === state.document.version
+      && performance.now() - change.at <= 250 && carets.length === event.selections.length
+      && JSON.stringify(carets) === JSON.stringify(change.carets)) {
+      this.record({ type: 'human_edit', change: change.sequence, signal: 'keyboard_selection' });
     }
   }
 
@@ -257,4 +274,18 @@ export class EditorCapture {
 
 function range(value: vscode.Range): Range {
   return { start: [value.start.line, value.start.character], end: [value.end.line, value.end.character] };
+}
+
+/** Endpoints after replaying replacements in their original UTF-16 order. */
+function editCarets(changes: readonly vscode.TextDocumentContentChangeEvent[]): number[] {
+  const carets: number[] = [];
+  for (const change of changes) {
+    const end = change.rangeOffset + change.rangeLength;
+    for (let index = 0; index < carets.length; index++) {
+      if (carets[index] >= end) carets[index] += change.text.length - change.rangeLength;
+      else if (carets[index] >= change.rangeOffset) carets[index] = change.rangeOffset + change.text.length;
+    }
+    carets.push(change.rangeOffset + change.text.length);
+  }
+  return carets.sort((a, b) => a - b);
 }

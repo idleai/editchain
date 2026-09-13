@@ -17,7 +17,8 @@ function harness(dwell = 2000, identity) {
   const signals = {};
   const on = name => listener => { signals[name] = listener; return { dispose() { delete signals[name]; } }; };
   const uri = { scheme: 'file', fsPath: '/workspace/a.ts', toString: () => 'file:///workspace/a.ts' };
-  const document = { uri, version: 1, isUntitled: false, text: 'one\ntwo\nthree\nfour\nfive\n', getText() { return this.text; } };
+  const document = { uri, version: 1, isUntitled: false, text: 'one\ntwo\nthree\nfour\nfive\n', getText() { return this.text; },
+    offsetAt(position) { return this.text.split('\n').slice(0, position.line).reduce((size, line) => size + line.length + 1, 0) + position.character; } };
   const range = (start, end) => ({ start: { line: start, character: 0 }, end: { line: end, character: 0 } });
   const editor = { document, visibleRanges: [range(0, 1), range(3, 5)] };
   const vscode = {
@@ -60,7 +61,8 @@ function harness(dwell = 2000, identity) {
     }
     now = until;
   };
-  return { capture, events, vscode, document, editor, tab, signals, range, timers, tick,
+  const selection = (offset, end = offset) => ({ isEmpty: offset === end, active: { line: 0, character: end } });
+  return { capture, events, vscode, document, editor, tab, signals, range, selection, timers, tick,
     elapse: ms => { now += ms; }, reads: () => events.filter(event => event.event.type === 'code_read') };
 }
 
@@ -116,7 +118,7 @@ test('human indicators reference raw versioned changes; automatic changes stay u
     const before = env.document.text;
     env.document.text = 'human ' + before; env.document.version = 2;
     env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: 0, rangeLength: 0, text: 'human ' }] });
-    env.signals.selection({ textEditor: env.editor, kind: 1, selections: [env.range(0, 0)] });
+    env.signals.selection({ textEditor: env.editor, kind: 1, selections: [env.selection(6)] });
     env.tick(300);
     env.document.text += 'automatic\n'; env.document.version = 3;
     env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: before.length + 6, rangeLength: 0, text: 'automatic\n' }] });
@@ -134,6 +136,117 @@ test('human indicators reference raw versioned changes; automatic changes stay u
     assert.equal(env.reads()[0].event.document.version, 3, 'read is bound to the new buffer version');
     assert.ok(env.events.every(event => event.event.type !== 'selection_changed'));
   } finally { env.capture.dispose(); }
+});
+
+test('rapid interleaved automatic and keyboard changes attribute only the matching revision once', () => {
+  const env = harness();
+  try {
+    env.document.text = 'agent\n'; env.document.version++;
+    env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: 0, rangeLength: 24, text: 'agent\n' }] });
+    const automatic = env.events.at(-1);
+    env.document.text = 'agent!\n'; env.document.version++;
+    env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: 5, rangeLength: 0, text: '!' }] });
+    const typed = env.events.at(-1);
+    const event = { textEditor: env.editor, kind: 1, selections: [env.selection(6)] };
+    env.signals.selection(event); env.signals.selection(event);
+    env.signals.save(env.document);
+    assert.deepEqual(env.events.filter(event => event.event.type === 'human_edit').map(event => event.event.change), [typed.sequence]);
+    assert.equal(automatic.event.type, 'document_changed');
+    assert.equal(env.events.at(-1).event.type, 'document_saved');
+  } finally { env.capture.dispose(); }
+});
+
+test('unrelated navigation and interruptions cannot claim an earlier programmatic change', () => {
+  for (const boundary of ['unknown selection', 'command selection', 'wrong caret', 'range selection', 'save', 'focus', 'activation', 'split']) {
+    const env = harness();
+    try {
+      env.document.text = 'agent'; env.document.version++;
+      env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: 0, rangeLength: 24, text: 'agent' }] });
+      const matching = { textEditor: env.editor, kind: 1, selections: [env.selection(5)] };
+      if (boundary === 'unknown selection') env.signals.selection({ ...matching, kind: undefined });
+      if (boundary === 'command selection') env.signals.selection({ ...matching, kind: 3 });
+      if (boundary === 'wrong caret') env.signals.selection({ ...matching, selections: [env.selection(2)] });
+      if (boundary === 'range selection') env.signals.selection({ ...matching, selections: [env.selection(0, 5)] });
+      if (boundary === 'save') env.signals.save(env.document);
+      if (boundary === 'focus') {
+        env.vscode.window.state.focused = false; env.signals.focus(); env.vscode.window.state.focused = true;
+      }
+      if (boundary === 'activation') env.signals.active(undefined);
+      if (boundary === 'split') env.signals.selection({ ...matching, textEditor: { ...env.editor } });
+      env.signals.selection(matching);
+      assert.equal(env.events.filter(event => event.event.type === 'human_edit').length, 0, boundary);
+    } finally { env.capture.dispose(); }
+  }
+});
+
+test('multi-cursor keyboard edits use the resulting UTF-16 caret positions', () => {
+  const env = harness();
+  try {
+    env.document.text = 'A😀B'; env.document.version++;
+    env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: 0, rangeLength: 24, text: 'A😀B' }] });
+    env.document.text = 'A😀!B?'; env.document.version++;
+    env.signals.change({ document: env.document, contentChanges: [
+      { rangeOffset: 4, rangeLength: 0, text: '?' }, { rangeOffset: 3, rangeLength: 0, text: '!' },
+    ] });
+    env.signals.active(env.editor); env.signals.focus();
+    env.signals.selection({ textEditor: env.editor, kind: 1, selections: [env.selection(4), env.selection(6)] });
+    assert.equal(env.events.filter(event => event.event.type === 'human_edit').length, 1);
+  } finally { env.capture.dispose(); }
+});
+
+test('explicit editor input attributes the exact change without a selection or save', () => {
+  for (const kind of ['type', 'paste', 'cut', 'compositionType', 'compositionEnd', 'executeCommand', 'executeCommands']) {
+    const env = harness();
+    try {
+      env.document.text = 'ne\ntwo\nthree\nfour\nfive\n'; env.document.version++;
+      env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: 0, rangeLength: 1, text: '' }],
+        detailedReason: { source: 'cursor', metadata: { kind, detailedSource: 'deleteRight' } } });
+      const changed = env.events.find(event => event.event.type === 'document_changed');
+      assert.equal(changed.event.origin.source, 'cursor');
+      assert.equal(changed.event.origin.kind, kind);
+      const human = env.events.filter(event => event.event.type === 'human_edit');
+      assert.deepEqual(human.map(event => event.event), [{ type: 'human_edit', change: changed.sequence, signal: 'editor_input' }]);
+      env.signals.selection({ textEditor: env.editor, kind: 1, selections: [env.selection(0)] });
+      env.signals.save(env.document);
+      assert.deepEqual(env.events.filter(event => event.event.type === 'human_edit'), human, kind);
+    } finally { env.capture.dispose(); }
+  }
+});
+
+test('programmatic, provider, missing and unfamiliar origins cannot be promoted by nearby keyboard input', () => {
+  for (const detailedReason of [undefined, null, 42,
+    ...['unknown', 'reloadFromDisk', 'inlineCompletionAccept', 'inlineCompletionPartialAccept',
+      'Chat.applyEdits', 'inlineChat.applyEdits', 'Chat.undoEdits', 'snippet', 'suggest', 'codeAction', 'future-source']
+      .map(source => ({ source, metadata: { name: 'formatEditsCommand', $extensionId: 'fixture.agent' } })),
+    { source: 'cursor', metadata: { kind: 'future-operation' } }, { source: 'cursor', metadata: null },
+  ]) {
+    const env = harness();
+    try {
+      env.document.text = 'agent'; env.document.version++;
+      env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: 0, rangeLength: 24, text: 'agent' }], detailedReason });
+      env.signals.selection({ textEditor: env.editor, kind: 1, selections: [env.selection(5)] });
+      env.signals.save(env.document);
+      assert.equal(env.events.filter(event => event.event.type === 'human_edit').length, 0, JSON.stringify(detailedReason));
+      assert.ok(env.events.find(event => event.event.type === 'document_changed').event.origin);
+    } finally { env.capture.dispose(); }
+  }
+});
+
+test('origin-based input still requires the focused active document; undo and redo retain their reason', () => {
+  for (const mode of ['unfocused', 'background', 'undo', 'redo', 'agent undo']) {
+    const env = harness();
+    try {
+      if (mode === 'unfocused') env.vscode.window.state.focused = false;
+      if (mode === 'background') env.vscode.window.activeTextEditor = undefined;
+      env.document.text = 'one'; env.document.version++;
+      const reason = mode === 'redo' ? 2 : mode.includes('undo') ? 1 : undefined;
+      const source = mode === 'agent undo' ? 'Chat.undoEdits' : reason ? 'applyEdits' : 'cursor';
+      env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: 3, rangeLength: 21, text: '' }],
+        reason, detailedReason: { source, metadata: { kind: 'type' } } });
+      assert.deepEqual(env.events.filter(event => event.event.type === 'human_edit').map(event => event.event.signal),
+        mode === 'undo' || mode === 'redo' ? [mode] : [], mode);
+    } finally { env.capture.dispose(); }
+  }
 });
 
 test('closed and reopened document objects receive a new incarnation and hidden tabs earn no reads', () => {

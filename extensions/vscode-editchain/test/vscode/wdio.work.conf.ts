@@ -10,7 +10,10 @@ const fixture = process.env.EDITCHAIN_WORK_FIXTURE || fs.mkdtempSync(path.join(o
 process.env.EDITCHAIN_WORK_FIXTURE = fixture;
 const workspace = path.join(fixture, 'workspace');
 const version = process.env.EDITCHAIN_CAPTURE_VSCODE || '1.137.0';
-const output = path.resolve('trace', `work-${version}`);
+const proposed = process.env.EDITCHAIN_CAPTURE_PROPOSED === '1';
+const output = path.resolve('trace', `work-${version}${proposed ? '-proposed' : ''}`);
+process.env.EDITCHAIN_WORK_OUTPUT = output;
+let extension = path.resolve(__dirname, '../..');
 if (owner) {
   fs.mkdirSync(workspace);
   fs.mkdirSync(path.join(fixture, 'sessions'));
@@ -18,13 +21,23 @@ if (owner) {
   fs.rmSync(output, { recursive: true, force: true });
 }
 fs.mkdirSync(output, { recursive: true });
+if (proposed) {
+  // Only this disposable development host enables the experimental capability.
+  extension = path.join(fixture, 'extension');
+  fs.mkdirSync(extension, { recursive: true });
+  for (const name of ['out', 'media']) fs.cpSync(path.resolve(__dirname, '../..', name), path.join(extension, name), { recursive: true });
+  const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../package.json'), 'utf8'));
+  manifest.enabledApiProposals = ['textDocumentChangeReason'];
+  fs.writeFileSync(path.join(extension, 'package.json'), JSON.stringify(manifest));
+}
 export const config: WebdriverIO.Config = {
-  outputDir: output, specs: ['./human-work.e2e.ts'], maxInstances: 1,
+  outputDir: output, specs: ['./human-work.e2e.ts', './human-attribution.e2e.ts'], maxInstances: 1,
   capabilities: [{ browserName: 'vscode', browserVersion: version,
     'wdio:enforceWebDriverClassic': true,
     'wdio:vscodeOptions': {
-      extensionPath: path.resolve(__dirname, '../..'), workspacePath: workspace,
+      extensionPath: extension, workspacePath: workspace,
       storagePath: path.join(fixture, 'profile'),
+      vscodeArgs: proposed ? { enableProposedApi: ['ambientlight.editchain-history'] } : {},
       userSettings: {
         'security.workspace.trust.enabled': false, 'telemetry.telemetryLevel': 'off',
         'editchain-history.servicePath': path.join(repository, 'target/debug/editchain-vscode-service'),
@@ -39,7 +52,7 @@ export const config: WebdriverIO.Config = {
     },
   }], services: ['vscode'], framework: 'mocha', mochaOpts: { ui: 'bdd', timeout: 120000 }, logLevel: 'warn',
   onComplete(exitCode) {
-    fs.writeFileSync(path.join(output, 'run.json'), JSON.stringify({ version, exitCode }));
+    fs.writeFileSync(path.join(output, 'run.json'), JSON.stringify({ version, proposed, exitCode }));
     // Keep the tiny synthetic chain with the trace as a reproducible artifact.
     if (owner) {
       fs.cpSync(path.join(workspace, '.editchain'), path.join(output, 'chain'), { recursive: true });
