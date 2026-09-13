@@ -1,9 +1,11 @@
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import type { HumanIdentity } from './humanIdentity';
 
 export type EditorEvent = {
   schema: 1; session: string; sequence: number; time_ms: number;
+  identity?: HumanIdentity;
   event: { type: string; [key: string]: unknown };
 };
 type Batch = { workspace_path: string; chain_dir: string; events: EditorEvent[] };

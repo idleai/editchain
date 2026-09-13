@@ -5,6 +5,7 @@ import { EditorCapture } from './editorCapture';
 import { EditorOutbox } from './editorOutbox';
 import { observeEditorContext } from './editorContext';
 import { StdioClient, resolveServicePath } from './stdioClient';
+import { unsignedIdentity, workspaceIdentity } from './humanIdentity';
 
 type Recorder = { capture: EditorCapture; context: { dispose(): void }; outbox: EditorOutbox; client: StdioClient; folder: vscode.WorkspaceFolder; chain: string };
 
@@ -15,6 +16,7 @@ export class HumanWorkHost {
   private disposed = false;
   private readonly status: vscode.StatusBarItem;
   private reportText = '';
+  private configurationKey: string | undefined;
 
   constructor(private readonly context: vscode.ExtensionContext, private readonly log: vscode.OutputChannel) {
     this.status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
@@ -22,14 +24,8 @@ export class HumanWorkHost {
     context.subscriptions.push(this.status,
       vscode.workspace.registerTextDocumentContentProvider('editchain-work', { provideTextDocumentContent: () => this.reportText }),
       vscode.commands.registerCommand('editchain-history.humanWork', () => this.showReport()),
-      vscode.commands.registerCommand('editchain-history.startTracking', async () => {
-        await vscode.workspace.getConfiguration('editchain-history').update('tracking.enabled', true, vscode.ConfigurationTarget.Workspace);
-        await this.restart();
-      }),
-      vscode.commands.registerCommand('editchain-history.stopTracking', async () => {
-        await vscode.workspace.getConfiguration('editchain-history').update('tracking.enabled', false, vscode.ConfigurationTarget.Workspace);
-        await this.restart();
-      }),
+      vscode.commands.registerCommand('editchain-history.startTracking', () => this.setTracking(true)),
+      vscode.commands.registerCommand('editchain-history.stopTracking', () => this.setTracking(false)),
       vscode.workspace.onDidChangeWorkspaceFolders(() => { void this.restart(); }),
       vscode.workspace.onDidChangeConfiguration(event => {
         if (['tracking', 'chainDir', 'servicePath'].some(key => event.affectsConfiguration(`editchain-history.${key}`))) void this.restart();
@@ -42,14 +38,27 @@ export class HumanWorkHost {
     void this.restart();
   }
 
-  private restart(): Promise<void> {
+  private async setTracking(enabled: boolean): Promise<void> {
+    const configuration = vscode.workspace.getConfiguration('editchain-history');
+    if (configuration.get<boolean>('tracking.enabled', true) === enabled) return await this.restart(true);
+    await configuration.update('tracking.enabled', enabled, vscode.ConfigurationTarget.Workspace);
+    await this.restart();
+  }
+
+  private restart(force = false): Promise<void> {
     this.lifecycle = this.lifecycle.then(async () => {
+      const configuration = vscode.workspace.getConfiguration('editchain-history');
+      const key = JSON.stringify([vscode.workspace.isTrusted, (vscode.workspace.workspaceFolders ?? []).map(folder => folder.uri.toString()),
+        ...['tracking.enabled', 'tracking.readDwellMs', 'tracking.maxFileBytes', 'chainDir', 'servicePath'].map(name => configuration.get(name))]);
+      if (!force && key === this.configurationKey) return;
+      this.configurationKey = undefined;
       await this.stopRecorders();
       if (this.disposed || !vscode.workspace.isTrusted || !this.context.storageUri) return;
-      const configuration = vscode.workspace.getConfiguration('editchain-history');
       if (!configuration.get<boolean>('tracking.enabled', true)) {
+        this.configurationKey = key;
         this.updateStatus('Human-work tracking paused'); return;
       }
+      const guid = await unsignedIdentity(this.context.globalStorageUri.fsPath);
       for (const folder of vscode.workspace.workspaceFolders ?? []) {
         if (folder.uri.scheme !== 'file') continue;
         const chain = configuration.get<string>('chainDir', '.editchain');
@@ -63,13 +72,15 @@ export class HumanWorkHost {
           }, message => this.updateStatus(message));
         const dwell = Math.max(500, Math.min(30000, configuration.get<number>('tracking.readDwellMs', 2000)));
         const maxBytes = Math.max(1024, Math.min(524288, configuration.get<number>('tracking.maxFileBytes', 262144)));
-        const capture = new EditorCapture(folder, dwell, maxBytes, event => outbox.push(event));
+        const capture = new EditorCapture(folder, dwell, maxBytes, event => outbox.push(event),
+          workspaceIdentity(guid, folder.uri.toString(), folder.uri.fsPath, chain));
         const context = observeEditorContext(capture, () => {
           client.ensureStarted(resolveServicePath());
           return client.request({ GetEditorContext: { workspace_path: folder.uri.fsPath, chain_dir: chain } }, { timeoutMs: 30000 });
         }, message => this.log.appendLine(`[capture] ${message}`));
         this.recorders.push({ capture, context, outbox, client, folder, chain });
       }
+      this.configurationKey = key;
       if (this.recorders.length) this.updateStatus('Tracking human work');
     }).catch(error => this.updateStatus(`Tracking failed: ${String(error)}`));
     return this.lifecycle;

@@ -4,6 +4,7 @@ import path from 'node:path';
 import type { Tab, TabGroup, TabInputText } from 'vscode';
 
 type WorkRow = { author: string; parents: string[]; node_key: string; is_subop: boolean;
+  group: string;
   activity_kind: string; summary: string; timestamp_ms: number; kind: string; is_system: boolean;
   sub_ops?: { kind: string }[]; file_change?: { source: string };
   task_group?: { task_id: string; expanded: boolean; member_count: number } };
@@ -38,6 +39,18 @@ async function toggleEpisode(task: string): Promise<void> {
     button?.click();
     return !!button;
   }, task), { timeout: 10000, timeoutMsg: `episode disclosure is not rendered: ${task}` });
+}
+
+async function lifecycleFile(name: string): Promise<void> {
+  await browser.executeWorkbench(async (vscode, name) => {
+    const uri = vscode.Uri.joinPath(vscode.workspace.workspaceFolders[0].uri, name);
+    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode('export const lifecycle = true;\n'));
+    await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(uri), { preview: false });
+    const tab = vscode.window.tabGroups.all.flatMap((group: TabGroup) => group.tabs).find((tab: Tab) =>
+      tab.input instanceof vscode.TabInputText && (tab.input as TabInputText).uri.toString() === uri.toString());
+    if (!tab || !await vscode.window.tabGroups.close(tab)) throw new Error('test tab did not close');
+  }, name);
+  await report();
 }
 
 async function typeSuffix(text: string): Promise<void> {
@@ -253,6 +266,87 @@ describe('production human-work capture', () => {
       return tops.length > 1 && tops.every((top, i) => i === 0 || top - tops[i - 1] >= 30);
     }), { timeout: 10000, timeoutMsg: 'lifecycle rows overlapped after disclosure animation' });
     await browser.saveScreenshot(path.join(output, 'editor-lifecycle-graph.png'));
+    await webview.close();
+  });
+
+  it('keeps one unsigned human branch across a full VS Code restart with the same profile', async () => {
+    await lifecycleFile('identity-before.ts');
+    await browser.executeWorkbench(async vscode => vscode.commands.executeCommand('editchain-history.open'));
+    let webview = await (await browser.getWorkbench()).getWebviewByTitle('EditChain History');
+    await webview.open();
+    await browser.execute(() => { document.getElementById('rows')!.scrollTop = 0; });
+    await browser.waitUntil(async () => (await readRows()).some(row => row.kind === 'editor_closed' && row.summary.includes('identity-before.ts')), { timeout: 30000 });
+    const previous = (await readRows()).find(row => row.kind === 'editor_closed' && row.summary.includes('identity-before.ts'))!;
+    await webview.close();
+    const identityPath = path.join(process.env.EDITCHAIN_WORK_FIXTURE!, 'profile/settings/User/globalStorage/ambientlight.editchain-history/unsigned-human-identity.json');
+    const identity = JSON.parse(fs.readFileSync(identityPath, 'utf8'));
+    const oldPid = await browser.executeWorkbench(() => process.pid);
+    // The extension-test host exits on workbench.action.reloadWindow. Restart
+    // the application through WebDriver, retaining the same profile/chain.
+    await browser.reloadSession();
+    await browser.waitUntil(async () => {
+      try {
+        return await browser.executeWorkbench((vscode, oldPid) => process.pid !== oldPid && vscode.extensions.getExtension('ambientlight.editchain-history')?.isActive, oldPid);
+      } catch { return false; }
+    }, { timeout: 60000, interval: 250, timeoutMsg: 'VS Code extension host did not restart' });
+    assert.deepEqual(JSON.parse(fs.readFileSync(identityPath, 'utf8')), identity);
+    await lifecycleFile('identity-after.ts');
+    await browser.executeWorkbench(async vscode => {
+      await vscode.commands.executeCommand('workbench.action.closeSidebar');
+      await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
+      await vscode.commands.executeCommand('notifications.clearAll');
+    });
+    await browser.executeWorkbench(async vscode => vscode.commands.executeCommand('editchain-history.open'));
+    webview = await (await browser.getWorkbench()).getWebviewByTitle('EditChain History');
+    await webview.open();
+    await browser.execute(() => { document.getElementById('rows')!.scrollTop = 0; });
+    let next: WorkRow | undefined;
+    await browser.waitUntil(async () => {
+      next = (await readRows()).find(row => row.kind === 'editor_closed' && row.summary.includes('identity-after.ts'));
+      return !!next;
+    }, { timeout: 30000 });
+    assert.ok(next);
+    // Work IDs remain recorder-qualified even when a short episode has no
+    // task disclosure metadata. The graph group is the persistent identity.
+    const incarnation = next.node_key.split(':')[0];
+    const expanded = new Set<string>();
+    for (let count = 0; count < 8; count++) {
+      const header = (await readRows()).find(row => row.node_key.split(':')[0] === incarnation
+        && row.task_group && !row.task_group.expanded && !expanded.has(row.task_group.task_id));
+      if (!header) break;
+      const task = header.task_group!.task_id;
+      expanded.add(task);
+      await toggleEpisode(task);
+      await browser.waitUntil(async () => (await readRows()).some(row => row.task_group?.task_id === task && row.task_group.expanded), { timeout: 10000 });
+      await browser.execute(() => { document.getElementById('rows')!.scrollTop = 0; });
+    }
+    await browser.execute(() => (window as any).__editchainRendererDebug.whenIdle(10000));
+    await browser.waitUntil(async () => (await readRows()).some(row => row.node_key === next!.node_key), { timeout: 10000 });
+    const rows = await readRows();
+    fs.writeFileSync(path.join(output, 'human-identity-reload.json'), JSON.stringify({ identity, previous, next, rows }, null, 2));
+    assert.equal(next.group, previous.group, 'persistent identity owns the same graph group');
+    assert.notEqual(incarnation, previous.node_key.split(':')[0], 'restart creates a fresh recorder incarnation');
+    const byId = new Map(rows.map(row => [row.node_key, row]));
+    let cursor: WorkRow | undefined = next;
+    const seen = new Set<string>();
+    while (cursor && cursor.node_key !== previous.node_key && !seen.has(cursor.node_key)) {
+      seen.add(cursor.node_key);
+      cursor = cursor.parents.map(parent => byId.get(parent)).find(parent => parent?.author === 'human');
+    }
+    assert.equal(cursor?.node_key, previous.node_key, 'new recording continues the prior human work path');
+    assert.ok(rows.every(row => row.kind !== 'exposure'));
+    await browser.execute(() => (window as any).__editchainRendererDebug.whenIdle(10000));
+    await browser.waitUntil(async () => browser.execute(keys => keys.every(key => {
+      const row = Array.from(document.querySelectorAll<HTMLElement>('#rows .row[data-row]')).find(element =>
+        (window as any).__editchainRowAt?.(Number(element.dataset.row))?.node_key === key);
+      const cell = row?.querySelector('.graph-cell');
+      const dot = cell?.querySelector('circle[data-graph-key]');
+      if (!cell || !dot || getComputedStyle(dot).opacity !== '1') return false;
+      const bounds = dot.getBoundingClientRect(), frame = cell.getBoundingClientRect();
+      return bounds.width > 0 && bounds.left >= frame.left && bounds.right <= frame.right
+        && Array.from(cell.querySelectorAll('[data-graph-key]')).every(part => part.getAnimations().every(animation => animation.playState === 'finished'));
+    }), [next!.node_key, previous.node_key]), { timeout: 10000, timeoutMsg: 'human continuation graph did not finish drawing' });
+    await browser.saveScreenshot(path.join(output, 'human-identity-reload.png'));
     await webview.close();
   });
 });

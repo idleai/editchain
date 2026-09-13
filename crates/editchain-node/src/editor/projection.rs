@@ -1,11 +1,12 @@
 //! Append missing derivations on bootstrap and process only new observations thereafter.
 
-use editchain_core::{Admission, Op, OpKind, OpSet, Payload, Tags};
+use editchain_core::{Admission, Op, OpId, OpKind, OpSet, ParentSet, Payload, Tags};
 use editchain_protocol::editor::EditorEvent;
 use editchain_store::{
     format::{encode_op, Page},
     BlobReader, BlobStore, CanonicalTail, SegmentStore,
 };
+use std::collections::BTreeMap;
 use std::path::Path;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -18,6 +19,35 @@ pub(super) struct Projection {
 }
 
 impl Projection {
+    pub(super) fn source(
+        &self,
+        event: &EditorEvent,
+        raw: &[u8],
+        staged: &BTreeMap<OpId, Op>,
+    ) -> Result<Op> {
+        let mut op = super::event_op(event, raw)?;
+        if let Some(identity) = &event.identity {
+            op.parents = self
+                .tail
+                .chain()
+                .get(op.id)
+                .or_else(|| staged.get(&op.id))
+                .map_or_else(
+                    || {
+                        self.normalizer
+                            .frontier(identity)
+                            .map_or(ParentSet::None, ParentSet::One)
+                    },
+                    |retained| retained.parents.clone(),
+                );
+        }
+        Ok(op)
+    }
+
+    pub(super) fn admitted(&mut self, event: &EditorEvent, source: OpId) {
+        self.normalizer.admitted(event, source);
+    }
+
     pub(super) fn open(chain: &Path) -> Result<Self> {
         let tail = CanonicalTail::open(chain)?;
         let pending = tail
@@ -53,7 +83,8 @@ impl Projection {
         self.refresh()?;
         let chain = Path::new(&request.workspace_path).join(&request.chain_dir);
         let mut sources = std::mem::take(&mut self.pending);
-        sources.sort_by_key(|op| op.id);
+        sources.retain(|op| op.tags.matches_all(Tags::IMPORT | Tags::HUMAN));
+        let sources = super::order::sources(sources)?;
         let reader = BlobReader::open(&chain)?;
         let mut staged = OpSet::new();
         let mut page = Page::new(0);

@@ -20,12 +20,20 @@ fn operation(event: &EditorEvent, lane: u32, parent: Option<OpId>, kind: OpKind,
     Op {
         id: identity(event, lane),
         parents: parent.map_or(ParentSet::None, ParentSet::One),
-        actor: ActorId(editchain_import::derive_node_id(&event.session).0),
+        actor: event.identity.as_ref().map_or_else(
+            || ActorId(editchain_import::derive_node_id(&event.session).0),
+            super::super::identity::actor,
+        ),
         clock: Clock::UnixMs(event.time_ms),
-        scope: ScopeRef::Session(editchain_import::derive_session_id(&format!(
-            "vscode:{}",
-            event.session
-        ))),
+        scope: event.identity.as_ref().map_or_else(
+            || {
+                ScopeRef::Session(editchain_import::derive_session_id(&format!(
+                    "vscode:{}",
+                    event.session
+                )))
+            },
+            super::super::identity::scope,
+        ),
         tags: tags | Tags::HUMAN,
         kind,
     }

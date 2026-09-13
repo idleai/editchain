@@ -2,7 +2,7 @@
   "name": "editchain-history",
   "displayName": "EditChain History",
   "description": "Unified engineering history explorer \u2014 EditChain operations overlaid with live Git history.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "ambientlight",
   "license": "MIT",
   "repository": {

@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { setTimeout, clearTimeout } from 'node:timers';
 import { EditorEvent } from './editorOutbox';
+import type { HumanIdentity } from './humanIdentity';
 
 type Document = { id: string; uri: string; path: string | null; version: number };
 type Range = { start: [number, number]; end: [number, number] };
@@ -26,8 +27,9 @@ export class EditorCapture {
   private timer: NodeJS.Timeout | undefined;
 
   constructor(private readonly folder: vscode.WorkspaceFolder, private readonly dwell: number,
-    private readonly maxFileBytes: number, private readonly emit: (event: EditorEvent) => boolean) {
-    this.record({ type: 'tracking_started', dwell_ms: dwell, vscode_version: vscode.version, activity_schema: 2 });
+    private readonly maxFileBytes: number, private readonly emit: (event: EditorEvent) => boolean,
+    private readonly attribution?: HumanIdentity) {
+    this.record({ type: 'tracking_started', dwell_ms: dwell, vscode_version: vscode.version, activity_schema: attribution ? 3 : 2 });
     this.subscriptions.push(
       vscode.workspace.onDidOpenTextDocument(document => { this.baseline(document); }),
       vscode.workspace.onDidCloseTextDocument(document => {
@@ -218,7 +220,7 @@ export class EditorCapture {
     if (this.stopped) return undefined;
     this.time = Math.max(this.time, Date.now());
     const sequence = this.sequence + 1;
-    if (!this.emit({ schema: 1, session: this.session, sequence, time_ms: this.time, event })) {
+    if (!this.emit({ schema: 1, session: this.session, ...(this.attribution ? { identity: this.attribution } : {}), sequence, time_ms: this.time, event })) {
       this.stopped = true; return undefined;
     }
     this.sequence = sequence;

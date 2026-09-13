@@ -14,6 +14,7 @@ fn version_four_opens_with_cached_exposure_removed_and_other_rows_retained() {
         source: "vscode.work".into(),
         schema: 1,
         session: "legacy-window".into(),
+        identity: None,
         turn: 1,
         source_event: OpId::new(NodeId(2), 0, 4),
         kind: HumanWorkKind::Exposure,

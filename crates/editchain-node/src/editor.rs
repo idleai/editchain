@@ -1,7 +1,9 @@
 //! Durable admission of versioned VS Code observations.
 
 mod context;
+mod identity;
 mod normalize;
+mod order;
 mod projection;
 pub(crate) use context::observe_context;
 
@@ -19,16 +21,15 @@ use editchain_store::{
     BlobStore, SegmentStore,
 };
 
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
 #[derive(Debug, Default)]
 pub(crate) struct EditorStore {
     projections: BTreeMap<PathBuf, projection::Projection>,
 }
 
 impl EditorStore {
-    pub(crate) fn record(
-        &mut self,
-        request: &RecordEditorEvents,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    pub(crate) fn record(&mut self, request: &RecordEditorEvents) -> Result<serde_json::Value> {
         let result = self.record_inner(request);
         if result.is_err() {
             let root = PathBuf::from(&request.workspace_path).join(&request.chain_dir);
@@ -37,10 +38,7 @@ impl EditorStore {
         result
     }
 
-    fn record_inner(
-        &mut self,
-        request: &RecordEditorEvents,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    fn record_inner(&mut self, request: &RecordEditorEvents) -> Result<serde_json::Value> {
         let root = PathBuf::from(&request.workspace_path).join(&request.chain_dir);
         // Serialize with live imports. Re-read the tail *after* taking the lock.
         let mut store = SegmentStore::open(&root)?;
@@ -56,14 +54,17 @@ impl EditorStore {
             .ok_or("editor projection unavailable")?;
         projection.refresh()?;
         let mut blobs = BlobStore::new(root.join("blobs"))?;
+        identity::repair(&request.events, projection.tail.chain(), &mut blobs)?;
+        projection.synchronize(&mut store, &mut blobs, request)?;
         let mut staged = editchain_core::OpSet::new();
+        let mut sources = BTreeMap::new();
         let mut page = Page::new(0);
         let mut accepted = 0_u64;
         let mut replayed = 0_u64;
         for event in &request.events {
             let raw =
                 serde_json::to_vec(&serde_json::json!({"source":"vscode.editor", "event":event}))?;
-            let op = event_op(event, &raw)?;
+            let op = projection.source(event, &raw, &sources)?;
             let encoded = encode_op(&op)?;
             let admission = match projection.tail.chain().evidence().classify(op.id, &encoded) {
                 Admission::Accepted => staged.insert(op.id, encoded.clone()),
@@ -84,17 +85,9 @@ impl EditorStore {
                     .into())
                 }
                 Admission::Accepted => {
-                    if let Some(parent) = op.parents.iter().next() {
-                        if !projection.tail.chain().evidence().contains(parent)
-                            && !staged.contains(parent)
-                        {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                "editor stream has a sequence gap; replay the pending outbox first",
-                            )
-                            .into());
-                        }
-                    }
+                    identity::validate_sequence(event, &op, projection.tail.chain(), &sources)?;
+                    projection.admitted(event, op.id);
+                    drop(sources.insert(op.id, op.clone()));
                     blobs.write(&raw)?;
                     // A live reader can stop at any complete record. Admit the
                     // source classification first so a raw buffer observation
@@ -170,9 +163,15 @@ fn event_op(event: &EditorEvent, raw: &[u8]) -> io::Result<Op> {
                 ..id
             })
         },
-        actor: ActorId(id.node.0),
+        actor: event
+            .identity
+            .as_ref()
+            .map_or(ActorId(id.node.0), identity::actor),
         clock: Clock::UnixMs(event.time_ms),
-        scope: ScopeRef::None,
+        scope: event
+            .identity
+            .as_ref()
+            .map_or(ScopeRef::None, identity::scope),
         tags: Tags::IMPORT
             | Tags::HUMAN
             | if matches!(event.event, EditorEventKind::HumanEdit { .. }) {

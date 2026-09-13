@@ -3,6 +3,26 @@
 use crate::{ContentId, Op, OpId, OpKind, Payload};
 use serde::{Deserialize, Serialize};
 
+/// Local attribution, without a signature or a verified account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanIdentityKind {
+    /// A locally generated GUID, not an authentication claim.
+    Unsigned,
+}
+
+/// Persistent person identity, with an independent workspace/chain binding.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanIdentity {
+    /// Attribution assurance.
+    pub kind: HumanIdentityKind,
+    /// Full local GUID; recorder restarts never replace it.
+    pub guid: String,
+    /// Opaque workspace/chain binding; different worktrees retain separate paths.
+    pub stream: String,
+}
+
 /// Git context observed independently of editing and tool execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HumanGitContext {
@@ -54,6 +74,9 @@ pub struct HumanWorkRecord {
     pub schema: u32,
     /// Full recorder incarnation; different windows remain distinct.
     pub session: String,
+    /// Persistent unsigned identity; absent in legacy recorder sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<HumanIdentity>,
     /// First observation in this bounded work episode.
     pub turn: u64,
     /// Raw event supporting this work fragment.

@@ -98,6 +98,16 @@ Install the current VSIX and reload VS Code to activate an updated recorder.
 The native service selected by `editchain-history.servicePath` must be rebuilt
 from the same branch; updating only one component leaves an incompatible pair.
 
+Version 0.1.2 keeps one unsigned human identity GUID in the extension's local
+profile storage. A reload starts a new capture session, while its reads, edits,
+and tab lifecycle continue the same human branch for that workspace and chain.
+Pauses and 30-second episode boundaries do not replace the identity. The GUID
+requires no account or signature. Different profiles and worktrees stay
+separate; historical sessions without a GUID retain their original attribution.
+The stored file is `unsigned-human-identity.json` under the extension's global
+storage directory. Tracking remains enabled by default; an explicit pause is
+still respected.
+
 Events remain local: a bounded outbox in VS Code workspace storage retries
 `RecordEditorEvents` until the service acknowledges durable chain writes.
 Failures appear in the tracking status item and EditChain History output.

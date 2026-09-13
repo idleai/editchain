@@ -3,7 +3,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('node:module');
 
-function harness(dwell = 2000) {
+function harness(dwell = 2000, identity) {
   let now = 0;
   const timers = new Set();
   const clock = {
@@ -49,7 +49,7 @@ function harness(dwell = 2000) {
   let capture;
   try {
     const { EditorCapture } = require(filename);
-    capture = new EditorCapture({ uri: { fsPath: '/workspace' }, index: 0 }, dwell, 262144, event => { events.push(event); return true; });
+    capture = new EditorCapture({ uri: { fsPath: '/workspace' }, index: 0 }, dwell, 262144, event => { events.push(event); return true; }, identity);
   } finally { Module._load = original; }
   const tick = ms => {
     const until = now + ms;
@@ -63,6 +63,21 @@ function harness(dwell = 2000) {
   return { capture, events, vscode, document, editor, tab, signals, range, timers, tick,
     elapse: ms => { now += ms; }, reads: () => events.filter(event => event.event.type === 'code_read') };
 }
+
+test('fresh capture sessions retain the same unsigned identity on every event', () => {
+  const identity = { kind: 'unsigned', guid: '99999999-9999-4999-8999-999999999999', stream: 'a'.repeat(24) };
+  const first = harness(2000, identity);
+  first.tick(2500); first.capture.dispose();
+  const second = harness(2000, identity);
+  second.tick(2500); second.capture.dispose();
+  assert.notEqual(first.events[0].session, second.events[0].session);
+  for (const events of [first.events, second.events]) {
+    assert.equal(events[0].sequence, 1);
+    assert.equal(events[0].event.activity_schema, 3);
+    assert.ok(events.every(event => JSON.stringify(event.identity) === JSON.stringify(identity)));
+    assert.ok(events.some(event => event.event.type === 'code_read'));
+  }
+});
 
 test('focus only gates local timing; only qualified reads with disjoint visible ranges are recorded', () => {
   const env = harness();

@@ -115,8 +115,30 @@ shows human work instead of transport envelopes. For new captures, the annotatio
 is appended before the source record; even a live reader stopping at that record
 boundary cannot display a temporary transport row. Trace retains the source facts.
 
-Each VS Code recorder has its own connected work series. Edits and read indicators
-continue the previous fragment. Work episodes start after more than 30 seconds
+Tracking is enabled by default. Version 0.1.2 creates an unsigned local identity
+GUID once in the extension's profile storage (`globalStorageUri`, file
+`unsigned-human-identity.json`). Concurrent first activations publish one complete
+identity file atomically; an invalid file is reported rather than silently
+rotating the identity. The GUID identifies local attribution, without a login,
+signature, or claim that a real-world identity has been verified.
+
+Every activation/reload still creates a fresh recorder session UUID and resets
+its sequence to one. Source observations and semantic work retain both that
+incarnation and `{kind: "unsigned", guid, stream}`. The opaque stream binds the
+workspace URI and resolved chain location; the same person in another worktree
+has a separate path. The GUID supplies the stable actor, while GUID plus stream
+supplies the graph group. No Git name, email, or machine identifier is used.
+
+Within a stream, the service records each new source's predecessor under the
+chain writer lock, across reloads, pauses, and interleaved recorder windows.
+This is durable admission order, not a claim that buffer changes happened in
+that order or used isolated workspace snapshots. Recorder-local sequence checks
+remain independent. Normalization follows those captured parents, so retries,
+backfill after a crash, and UUID/wall-clock ordering cannot rearrange existing
+work. New semantic work continues the previous human fragment across sessions;
+different unsigned identities and workspace bindings remain separate.
+
+Work episodes start after more than 30 seconds
 without a work fragment, at observed context changes, renames, stops, and capture
 gaps. Live History uses native task disclosure to fold these episodes while
 preserving their physical parent path. In static History, human fragments stay
@@ -139,7 +161,9 @@ Successful context changes enter the recorder's ordered stream with the observed
 workspace path, repository identity, worktree root, HEAD, and observation time.
 The first work fragment under a changed context links to that recorded commit;
 subsequent work continues its own series. A changed HEAD adds a new baseline
-without removing the predecessor. Edits retain the context observed when their
+without removing the predecessor. Identity-bearing sessions avoid adding the
+same Git link again on reload; a temporarily unknown context remains unknown on
+the record without discarding the stream's last established Git link. Edits retain the context observed when their
 text changed, even if keyboard confirmation arrives after a new context
 observation. No current-HEAD or current-workspace-path substitution is made
 during replay. An unborn, missing, or unavailable context stays unanchored.
@@ -161,12 +185,15 @@ reads, confirmed human edits, and gaps. Legacy brief-exposure work is retained
 as Trace evidence and omitted from the Activity graph. Legacy exposure that
 qualified as a read remains visible as a reading indicator.
 
-Version 0.1.1 recorders declare `activity_schema: 2` at session start. That
-contract includes tab lifecycle in the work series and episode boundaries.
+Version 0.1.1 recorders declare `activity_schema: 2` at session start. Version
+0.1.2 declares `activity_schema: 3` and requires the persistent unsigned identity
+on every event. Both contracts include tab lifecycle in the work series and episode boundaries.
 Older sessions keep their original normalization, including their immutable
 parents and episode IDs; their raw open/close records remain evidence rather
-than being inserted retroactively into existing chains. Restarting capture
-creates a new session and observes currently open tabs under the new contract.
+than being inserted retroactively into existing chains. Existing anonymous
+sessions are not reassigned to a newly created GUID. Restarting capture creates
+a new session and observes currently open tabs under the new contract, while
+identity-bearing sessions continue the same human branch.
 Episode folding does not assert that a person completed a task or understood a
 file.
 
@@ -263,10 +290,16 @@ through WebDriver, checks unsaved and saved coverage, navigates briefly to a
 distant viewport, and pauses/resumes recording. The original four capture
 scenarios passed on both releases. A fifth scenario exercises the live graph,
 episode folding, updates while the panel is open, and the native human diff. The
-complete six-scenario suite passed on 1.137.0 with the reduced event stream and
+complete seven-scenario suite passed on 1.137.0 with the reduced event stream and
 visible tab lifecycle. The sixth scenario opens and closes a real text tab,
 checks unchanged coverage and connected graph rows, and waits for layout to
-settle before saving its screenshot. The
+settle before saving its screenshot. The seventh restarts the complete VS Code
+application with the same profile and chain, verifies a fresh recorder and the
+same GUID/group, walks the graph path back to the prior recording, and waits for
+visible graph dots and completed connection animations before its screenshot.
+The test uses WebDriver's application restart because direct window reload
+terminates its extension-test proxy. Three capture sessions retain one unsigned
+identity; the retained source stream contains no exposure events. The
 sample measured 39 reading-indicated lines and one edited line; the brief
 distant jump added no reading or exposure coverage, with zero capture gaps. Exact viewport
 counts vary with layout. Synthetic chains and reports are in ignored
@@ -296,16 +329,21 @@ byte-identical legacy replay. Native service tests check exact read revisions,
 recorded dwell policies, lifecycle records without inferred work, and the number
 of canonical records created by a read.
 
-Validation on 2026-09-12: 17 focused editor service tests and the version-4 cache
-upgrade regression passed; all 79 extension
+Validation on 2026-09-12: all 21 editor service tests and the version-4 cache
+upgrade regression passed; all 83 extension
 harness tests passed; extension compilation and capture-test type checks passed;
-the production WASM renderer built; all six real VS Code scenarios passed;
+the production WASM renderer built; all seven real VS Code scenarios passed;
 `./scripts/lint.sh` exited 0 with **`RESULT: PASS`**. The lint command completed
 format, check, clippy, workspace tests, doc tests, and dependency checks without
 policy changes or new suppressions.
 
-Validation logs and actual VS Code screenshots for visible editor lifecycle are
-retained under `outputs/vscode-capture/editor-lifecycle/`. Build and test the current checkout
+Identity regression tests cover concurrent GUID creation, restart coalescing,
+interleaved recorder processes, disagreeing wall clocks, independent people and
+workspace streams, mid-session identity rejection, repeated batches, and exact
+source-only recovery after missing-payload repair.
+
+Validation logs and actual VS Code screenshots for persistent human identity are
+retained under `outputs/vscode-capture/human-identity/`. Build and test the current checkout
 with the commands above; the native service and extension renderer must come
 from the same build.
 
@@ -315,7 +353,8 @@ already running an older binary must be restarted before the new extension
 sends reads. Set `editchain-history.servicePath` to the matching build when the
 open workspace is a different checkout.
 
-The installed extension must be version 0.1.1 or later for lifecycle graph rows.
+The installed extension must be version 0.1.2 or later for persistent human
+identity across recorder sessions (0.1.1 introduced lifecycle graph rows).
 Installing a VSIX updates disk files; reload the VS Code window to replace an
 already-running older recorder and its service clients. Historical brief
 exposure records remain retained even after new capture stops producing them.

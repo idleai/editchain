@@ -23,6 +23,9 @@ mod reads;
 #[path = "tabs.rs"]
 mod tabs;
 
+#[path = "identities.rs"]
+mod identities;
+
 fn git(root: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)

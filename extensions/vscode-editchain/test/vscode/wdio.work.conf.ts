@@ -28,7 +28,7 @@ export const config: WebdriverIO.Config = {
       userSettings: {
         'security.workspace.trust.enabled': false, 'telemetry.telemetryLevel': 'off',
         'editchain-history.servicePath': path.join(repository, 'target/debug/editchain-vscode-service'),
-        'editchain-history.live.enabled': true, 'editchain-history.tracking.enabled': true,
+        'editchain-history.live.enabled': true,
         'editchain-history.live.sessionsPath': path.join(fixture, 'sessions'),
         'editchain-history.tracking.readDwellMs': 2000,
         'workbench.startupEditor': 'none', 'files.autoSave': 'off', 'files.hotExit': 'off',

@@ -22,6 +22,9 @@ pub struct EditorEvent {
     pub schema: u32,
     /// Random recorder incarnation, shared by all events until restart.
     pub session: String,
+    /// Persistent local attribution, independent of the recorder incarnation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<editchain_core::human::HumanIdentity>,
     /// Strictly increasing, one-based identity within the incarnation.
     pub sequence: u64,
     /// Observer wall time. Duration measurements use a monotonic clock.
@@ -218,6 +221,27 @@ impl RecordEditorEvents {
             return Err(invalid("editor batch must contain 1..128 events"));
         }
         for event in &self.events {
+            if let Some(identity) = &event.identity {
+                let guid = identity.guid.as_bytes();
+                if guid.len() != 36
+                    || !guid.iter().enumerate().all(|(index, byte)| {
+                        if [8, 13, 18, 23].contains(&index) {
+                            *byte == b'-'
+                        } else {
+                            byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+                        }
+                    })
+                    || identity.stream.len() != 24
+                    || !identity
+                        .stream
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                {
+                    return Err(invalid(
+                        "invalid unsigned human identity or workspace stream",
+                    ));
+                }
+            }
             if event.schema != 1
                 || event.sequence == 0
                 || event.sequence > 9_007_199_254_740_991
@@ -279,7 +303,9 @@ impl EditorEvent {
                 if !(500..=30000).contains(dwell_ms) {
                     return Err("invalid reading dwell threshold");
                 }
-                if activity_schema.is_some_and(|schema| schema != 2) {
+                if activity_schema.is_some_and(|schema| schema != 2 && schema != 3)
+                    || (*activity_schema == Some(3)) != self.identity.is_some()
+                {
                     return Err("unsupported editor activity schema");
                 }
             }

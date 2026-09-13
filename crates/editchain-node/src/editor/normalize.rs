@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use editchain_core::{
-    human::{HumanGitContext, HumanRevision, HumanWorkKind, HumanWorkRecord},
+    human::{HumanGitContext, HumanIdentity, HumanRevision, HumanWorkKind, HumanWorkRecord},
     ContentId, Op, OpId,
 };
 use editchain_protocol::editor::{EditorDocument, EditorEvent, EditorEventKind};
@@ -18,6 +18,14 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 #[derive(Debug, Default)]
 pub(super) struct Normalizer {
     sessions: BTreeMap<String, Session>,
+    streams: BTreeMap<HumanIdentity, Stream>,
+}
+
+#[derive(Debug, Default)]
+struct Stream {
+    source: Option<OpId>,
+    work: Option<OpId>,
+    linked_context: Option<HumanGitContext>,
 }
 
 #[derive(Debug, Default)]
@@ -52,6 +60,16 @@ struct ObservedContext {
 }
 
 impl Normalizer {
+    pub(super) fn frontier(&self, identity: &HumanIdentity) -> Option<OpId> {
+        self.streams.get(identity).and_then(|stream| stream.source)
+    }
+
+    pub(super) fn admitted(&mut self, event: &EditorEvent, source: OpId) {
+        if let Some(identity) = &event.identity {
+            self.streams.entry(identity.clone()).or_default().source = Some(source);
+        }
+    }
+
     pub(super) fn observe(
         &mut self,
         event: &EditorEvent,
@@ -63,6 +81,13 @@ impl Normalizer {
             return Ok(Vec::new());
         }
         session.sequence = event.sequence;
+        let mut stream = event
+            .identity
+            .as_ref()
+            .map(|identity| self.streams.entry(identity.clone()).or_default());
+        if let Some(stream) = stream.as_mut() {
+            stream.source = Some(source);
+        }
         let mut result = vec![observation(event, source)];
         let work = session.observe(event, source, blobs)?;
         if let Some(Work {
@@ -86,6 +111,7 @@ impl Normalizer {
                 source: "vscode.work".into(),
                 schema: 1,
                 session: event.session.clone(),
+                identity: event.identity.clone(),
                 turn: session.turn,
                 source_event: source,
                 kind,
@@ -96,9 +122,22 @@ impl Normalizer {
                 context_observed_ms: context.time_ms,
                 summary: summary.chars().take(240).collect(),
             };
-            let link = git != session.linked_context;
-            let ops = operations::work(event, &record, session.previous, link)?;
+            let link = stream
+                .as_ref()
+                .map_or(git != session.linked_context, |stream| {
+                    git.is_some() && git != stream.linked_context
+                });
+            let previous = stream
+                .as_ref()
+                .map_or(session.previous, |stream| stream.work);
+            let ops = operations::work(event, &record, previous, link)?;
             session.previous = ops.first().map(|op| op.id);
+            if let Some(stream) = stream {
+                stream.work = session.previous;
+                if git.is_some() {
+                    stream.linked_context.clone_from(&git);
+                }
+            }
             session.linked_context = git;
             session.last_work_ms = event.time_ms;
             if kind == HumanWorkKind::Gap {
@@ -149,7 +188,7 @@ impl Session {
                 ..
             } => {
                 self.dwell = *dwell_ms;
-                self.lifecycle_activity = *activity_schema == Some(2);
+                self.lifecycle_activity = matches!(activity_schema, Some(2 | 3));
             }
             EditorEventKind::WorkspaceContext {
                 observed_ms,
