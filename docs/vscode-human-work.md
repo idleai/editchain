@@ -35,15 +35,20 @@ posted. The service still accepts and replays these legacy events unchanged.
 
 A one-shot timer emits `code_read` when the active visible editor reaches the
 recorded dwell threshold (2 seconds by default). An unchanged view emits only
-one read, even over ten minutes. There is no read heartbeat. Checkpoints may
+one read, even over ten minutes. The last view of each loaded document retains
+its read receipt across focus loss, tab reactivation (including a replacement
+`TextEditor` object), and Git context changes. A viewport or buffer revision
+change rearms reading. There is no read heartbeat. Checkpoints may
 flush a qualified interval but never split it or duplicate its read. Recorded
 duration is evidence at qualification, not total reading time; delayed callbacks
 are capped at 60 seconds. Short intervals are discarded rather than accumulated.
 
-Intervals end on changes to the viewed buffer, viewport, active editor, focus,
-captured Git context, or shutdown. Scroll, reveal, folding, and layout changes
-all use local viewport observations. Duplicate viewport notifications and edits
-to background files do not reset the timer. Hidden tabs and background windows
+Unqualified intervals end on changes to the viewed buffer, viewport, active
+editor, focus, captured Git context, or shutdown; separate short visits are never
+added together. Ending an interval does not clear an already-qualified receipt.
+Scroll, reveal, folding, and layout changes all use local viewport observations.
+Duplicate viewport/activation notifications and edits to background files do not
+reset the timer. Hidden tabs and background windows
 earn no reads. Horizontal clipping, terminal or sidebar keyboard focus, gaze,
 and comprehension are not observable guarantees.
 

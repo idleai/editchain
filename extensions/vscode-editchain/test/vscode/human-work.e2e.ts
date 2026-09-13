@@ -25,6 +25,17 @@ async function report(): Promise<any> {
   return value;
 }
 
+function storedReads(): any[] {
+  // Inspect durable source receipts after the production report flushes capture.
+  const blobs = path.join(process.env.EDITCHAIN_WORK_FIXTURE!, 'workspace', '.editchain', 'blobs');
+  return fs.readdirSync(blobs).filter(name => /^[a-f0-9]{64}$/.test(name)).flatMap(name => {
+    const text = fs.readFileSync(path.join(blobs, name), 'utf8');
+    let source;
+    try { source = JSON.parse(text); } catch { return []; } // File-content blobs need not be JSON.
+    return source?.source === 'vscode.editor' && source.event?.event?.type === 'code_read' ? [source.event] : [];
+  }).sort((left, right) => left.sequence - right.sequence);
+}
+
 async function readRows(): Promise<WorkRow[]> {
   return await browser.execute(() => Array.from(document.querySelectorAll('#rows .row[data-row]'))
     .map(row => (window as any).__editchainRowAt?.(Number(row.getAttribute('data-row')))).filter(Boolean)) as unknown as WorkRow[];
@@ -90,6 +101,29 @@ describe('production human-work capture', () => {
     assert.equal(value.ai_lines, 200);
     assert.ok(value.read_lines > 0 && value.read_lines < 100, 'only the visible part of the file qualified');
     assert.equal(value.edited_lines, 0);
+  });
+
+  it('records one read while a stationary viewport is revisited and another only after scrolling', async () => {
+    const before = storedReads();
+    assert.equal(before.length, 1, 'startup produced one durable read');
+    for (let visit = 0; visit < 2; visit++) {
+      await show();
+      await browser.pause(2500);
+      await report();
+      assert.deepEqual(storedReads(), before, 'switching back from the coverage report does not reread the same view');
+    }
+    await show();
+    await browser.pause(6500);
+    await report();
+    assert.deepEqual(storedReads(), before, 'several dwell periods at the same scroll position add no read');
+    await show(100);
+    await browser.pause(2500);
+    await report();
+    const after = storedReads();
+    assert.equal(after.length, 2, 'a genuinely different viewport can qualify once');
+    assert.notDeepEqual(after[1].event.ranges, before[0].event.ranges);
+    assert.deepEqual(after[1].event.document, before[0].event.document);
+    fs.writeFileSync(path.join(output, 'human-read-once.json'), JSON.stringify({ before, after }, null, 2));
   });
 
   it('tracks real typing before save and retains human edited AI origins after save', async () => {

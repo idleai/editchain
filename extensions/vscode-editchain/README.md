@@ -72,8 +72,10 @@ is reported as unknown, never as zero human review of the whole codebase.
 - `editchain-history.tracking.enabled` defaults to `true`.
 - `editchain-history.tracking.readDwellMs` defaults to `2000`. Reading requires
   one continuous qualifying interval at the same buffer revision and viewport.
-  Each stable viewing interval emits one read at that threshold; shorter visits
-  are discarded. An unchanged view produces no repeating read events.
+  Each view emits one read at that threshold; shorter visits are discarded.
+  The last view of each loaded document stays read through focus changes,
+  switching tabs, and Git context updates. Scrolling or a new buffer revision
+  rearms reading; elapsed time and repeated notifications alone do not.
 - `editchain-history.tracking.maxFileBytes` defaults to `262144`. Binary and
   larger buffers produce explicit capture gaps.
 
@@ -98,6 +100,11 @@ retained.
 Install the current VSIX and reload VS Code to activate an updated recorder.
 The native service selected by `editchain-history.servicePath` must be rebuilt
 from the same branch; updating only one component leaves an incompatible pair.
+
+Version 0.1.4 retains the read receipt for an unchanged document revision and
+viewport across interruptions, including replacement editor objects when a tab
+returns. A qualified view has no recurring timer. Reloading VS Code still starts
+a fresh recording, and a newly loaded document starts a new incarnation.
 
 Version 0.1.3 removes the extra file disclosure from each human edit. The file
 name and status appear directly on its connected graph row; one click opens

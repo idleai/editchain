@@ -22,6 +22,9 @@ export class EditorCapture {
   private readonly subscriptions: vscode.Disposable[] = [];
   private readonly pending = new Map<vscode.TextDocument, { sequence: number; version: number; at: number }[]>();
   private readonly skipped = new Set<string>();
+  // Keep the last view's receipt when focus/activation/context ends its timer.
+  // A hidden tab can return with a new TextEditor object for the same document.
+  private readonly views = new WeakMap<vscode.TextDocument, Exposure>();
   private exposure: Exposure | undefined;
   private stopped = false;
   private timer: NodeJS.Timeout | undefined;
@@ -48,10 +51,11 @@ export class EditorCapture {
         }
       }),
       vscode.window.onDidChangeActiveTextEditor(editor => {
-        this.endExposure();
+        if (!editor || (this.exposure && (this.exposure.editor !== this.identity(editor)
+          || !this.sameView(this.exposure, editor)))) this.endExposure();
         const state = editor && this.baseline(editor.document);
         this.record({ type: 'editor_activated', document: state?.document ?? null });
-        this.beginExposure();
+        this.viewport();
       }),
       vscode.window.onDidChangeVisibleTextEditors(() => this.viewport()),
       vscode.window.onDidChangeTextEditorVisibleRanges(() => this.viewport()),
@@ -166,11 +170,15 @@ export class EditorCapture {
     const editor = vscode.window.activeTextEditor;
     const current = this.exposure;
     if (current && editor && vscode.window.state.focused && vscode.window.visibleTextEditors.includes(editor)
-      && current.editor === this.identity(editor) && current.document.id === this.documents.get(editor.document)?.document.id
-      && current.document.version === editor.document.version
-      && JSON.stringify(current.ranges) === JSON.stringify(editor.visibleRanges.map(range))) return;
+      && current.editor === this.identity(editor) && this.sameView(current, editor)) return;
     this.endExposure();
     this.beginExposure();
+  }
+
+  private sameView(view: Exposure, editor: vscode.TextEditor): boolean {
+    return view.document.id === this.documents.get(editor.document)?.document.id
+      && view.document.version === editor.document.version
+      && JSON.stringify(view.ranges) === JSON.stringify(editor.visibleRanges.map(range));
   }
 
   private beginExposure(): void {
@@ -179,9 +187,12 @@ export class EditorCapture {
     if (!editor || !vscode.window.visibleTextEditors.includes(editor)) return;
     const state = this.baseline(editor.document);
     if (!state || !editor.visibleRanges.length) return;
+    const previous = this.views.get(editor.document);
+    const reported = !!previous?.reported && this.sameView(previous, editor);
     this.exposure = { document: { ...state.document }, editor: this.identity(editor), ranges: editor.visibleRanges.map(range),
-      started_ms: Date.now(), monotonic: performance.now(), reported: false };
-    this.scheduleRead(this.dwell);
+      started_ms: Date.now(), monotonic: performance.now(), reported };
+    this.views.set(editor.document, this.exposure);
+    if (!reported) this.scheduleRead(this.dwell);
   }
 
   private scheduleRead(delay: number): void {

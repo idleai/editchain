@@ -95,16 +95,16 @@ test('focus only gates local timing; only qualified reads with disjoint visible 
   } finally { env.capture.dispose(); }
 });
 
-test('a changed Git observation splits read intervals without changing buffer identity', () => {
+test('a changed Git observation flushes a qualified read without rereading the unchanged view', () => {
   const env = harness();
   try {
     env.elapse(2200);
     env.capture.context({ observed_ms: 2200, repositories: [{ repository: '1', root: '/workspace', head: 'a'.repeat(40) }] });
     env.tick(2300); env.capture.checkpoint();
     const events = env.events.filter(event => ['code_read', 'workspace_context'].includes(event.event.type));
-    assert.deepEqual(events.map(event => event.event.type), ['code_read', 'workspace_context', 'code_read']);
-    assert.deepEqual([events[0].event.duration_ms, events[2].event.duration_ms], [2200, 2000]);
-    assert.deepEqual(events[0].event.document, events[2].event.document);
+    assert.deepEqual(events.map(event => event.event.type), ['code_read', 'workspace_context']);
+    assert.equal(events[0].event.duration_ms, 2200);
+    assert.equal(env.timers.size, 0, 'Git metadata alone does not rearm reading');
     assert.ok(events.every((event, i) => i === 0 || event.sequence > events[i - 1].sequence));
   } finally { env.capture.dispose(); }
 });
@@ -165,6 +165,48 @@ test('ten minutes at an unchanged viewport emit one read automatically, includin
     assert.equal(env.reads().length, 1, 'no heartbeat or duplicate notification reads');
     assert.equal(env.timers.size, 0, 'no recurring viewing timer after qualification');
     assert.equal(env.events.length, 4, 'only startup, baseline, tab open, and one read');
+  } finally { env.capture.dispose(); }
+});
+
+test('an unchanged view stays read through ten minutes of focus, activation, Git changes, and editor switches', () => {
+  const env = harness();
+  try {
+    env.tick(2000);
+    for (let minute = 0; minute < 10; minute++) {
+      env.signals.active(env.editor);
+      env.vscode.window.state.focused = false; env.signals.focus();
+      env.tick(1000);
+      env.vscode.window.state.focused = true; env.signals.focus();
+      env.vscode.window.activeTextEditor = undefined; env.signals.active(undefined);
+      env.tick(1000);
+      // VS Code may replace the TextEditor wrapper when a hidden tab returns.
+      const editor = { ...env.editor };
+      env.vscode.window.visibleTextEditors = [editor];
+      env.vscode.window.activeTextEditor = editor; env.signals.active(editor);
+      env.capture.context({ observed_ms: minute * 60000, repositories: [{ head: String(minute).repeat(40) }] });
+      env.tick(58000); env.capture.checkpoint();
+      assert.equal(env.reads().length, 1);
+      assert.equal(env.timers.size, 0, 'already read view has no pending timer');
+    }
+  } finally { env.capture.dispose(); }
+});
+
+test('scroll and buffer revisions rearm reading, while repeated activation preserves pending dwell', () => {
+  const env = harness();
+  try {
+    env.tick(1500); env.signals.active(env.editor); env.tick(500);
+    assert.equal(env.reads().length, 1, 'same-editor notification cannot restart a pending timer');
+    env.editor.visibleRanges = [env.range(2, 3)]; env.signals.viewport();
+    env.tick(1999); assert.equal(env.reads().length, 1);
+    env.tick(1); assert.equal(env.reads().length, 2, 'new viewport must qualify');
+    const before = env.document.text;
+    env.document.text = 'changed\n' + before; env.document.version = 2;
+    env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: 0, rangeLength: 0, text: 'changed\n' }] });
+    env.tick(2000);
+    assert.equal(env.reads().length, 3, 'new code revision can qualify at the same scroll position');
+    assert.equal(env.reads().at(-1).event.document.version, 2);
+    env.tick(600000); env.capture.checkpoint();
+    assert.equal(env.reads().length, 3);
   } finally { env.capture.dispose(); }
 });
 
