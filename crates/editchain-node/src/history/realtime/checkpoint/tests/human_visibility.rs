@@ -11,6 +11,7 @@ fn version_four_opens_with_cached_exposure_removed_and_other_rows_retained() {
     let mut workspace = fixture(root.path()).unwrap();
     let id = OpId::new(NodeId(1), 0, 4);
     let work = HumanWorkRecord {
+        edit_group: None,
         source: "vscode.work".into(),
         schema: 1,
         session: "legacy-window".into(),

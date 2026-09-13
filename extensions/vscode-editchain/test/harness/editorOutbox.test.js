@@ -10,6 +10,25 @@ const event = sequence => ({ schema: 1, session: '11111111-1111-4111-8111-111111
   sequence, time_ms: 1234, event: { type: sequence === 1 ? 'tracking_started' : 'tracking_stopped' } });
 const ack = request => ({ Ok: { schema: 1, ack: request.RecordEditorEvents.events.map(event => [event.session, event.sequence]) } });
 
+test('input and saves deliver without a report, and writer contention retries promptly', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'editchain-outbox-'));
+  const delivered = [];
+  let attempts = 0, notifications = 0;
+  const outbox = new EditorOutbox(directory, '/workspace', '.editchain', async request => {
+    if (++attempts === 1) throw new Error('operation would block');
+    delivered.push(...request.RecordEditorEvents.events); return ack(request);
+  }, () => {}, () => { notifications++; });
+  try {
+    const start = Date.now();
+    outbox.push(event(1));
+    outbox.push({ ...event(2), event: { type: 'document_saved', document: { id: 'buffer', version: 2 } } });
+    while (delivered.length < 2 && Date.now() - start < 500) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.deepEqual(delivered.map(value => value.sequence), [1, 2]);
+    assert.equal(attempts, 2);
+    assert.equal(notifications, 1, 'only acknowledged work wakes history');
+  } finally { await outbox.stop(); await fs.rm(directory, { recursive: true, force: true }); }
+});
+
 test('a save arriving during acknowledgement is included in the requested flush', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'editchain-outbox-'));
   const delivered = [];

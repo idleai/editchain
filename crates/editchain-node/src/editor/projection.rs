@@ -1,19 +1,25 @@
 //! Append missing derivations on bootstrap and process only new observations thereafter.
 
 use editchain_core::{Admission, Op, OpId, OpKind, OpSet, ParentSet, Payload, Tags};
+use editchain_index::Storage;
 use editchain_protocol::editor::EditorEvent;
 use editchain_store::{
     format::{encode_op, Page},
-    BlobReader, BlobStore, CanonicalTail, SegmentStore,
+    BlobReader, BlobStore, IndexedTail, SegmentStore,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::rc::Rc;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct Projection {
-    pub(super) tail: CanonicalTail,
+    #[serde(skip)]
+    pub(super) bootstrapped: bool,
+    #[serde(skip)]
+    pub(super) records_decoded: u64,
+    pub(super) tail: IndexedTail,
     normalizer: super::normalize::Normalizer,
     pending: Vec<Op>,
 }
@@ -48,22 +54,45 @@ impl Projection {
         self.normalizer.admitted(event, source);
     }
 
-    pub(super) fn open(chain: &Path) -> Result<Self> {
-        let tail = CanonicalTail::open(chain)?;
+    pub(super) fn open(chain: &Path, storage: &Rc<Storage>) -> Result<Self> {
+        match storage.load::<Self>() {
+            Ok(saved) if saved.tail.resume(chain).is_ok() => return Ok(saved),
+            // A moved or repaired source invalidates only this derived index.
+            // Rebuild admission from the authoritative records in that case.
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let tail = IndexedTail::open(chain)?;
         let pending = tail
             .chain()
-            .located_ops()
-            .map(|(op, _)| op.clone())
+            .shared_ops()
+            .filter(|op| op.tags.matches_all(Tags::IMPORT | Tags::HUMAN))
+            .map(|op| op.as_ref().clone())
             .collect();
-        Ok(Self {
+        let projection = Self {
+            bootstrapped: true,
+            records_decoded: u64::try_from(tail.chain().stats().records)?,
             tail,
             normalizer: super::normalize::Normalizer::default(),
             pending,
-        })
+        };
+        // Preserve a completed cold scan even if an external writer is busy.
+        projection.checkpoint(storage)?;
+        Ok(projection)
+    }
+
+    pub(super) fn checkpoint(&self, storage: &Rc<Storage>) -> Result<()> {
+        let saved: Self = storage.commit(self)?;
+        drop(saved);
+        Ok(())
     }
 
     pub(super) fn refresh(&mut self) -> Result<()> {
         let delta = self.tail.drain()?;
+        self.records_decoded = self
+            .records_decoded
+            .saturating_add(delta.work.records_decoded);
         if !delta.removed.is_empty() {
             return Err("editor history contains newly conflicting source evidence".into());
         }
@@ -95,7 +124,7 @@ impl Projection {
             };
             for op in self.normalizer.observe(&event, source.id, blobs)? {
                 let encoded = encode_op(&op)?;
-                let admission = match self.tail.chain().evidence().classify(op.id, &encoded) {
+                let admission = match self.tail.chain().classify(op.id, &encoded)? {
                     Admission::Accepted => staged.insert(op.id, encoded.clone()),
                     other @ (Admission::Duplicate | Admission::Conflict) => other,
                 };

@@ -18,7 +18,8 @@ export class HumanWorkHost {
   private reportText = '';
   private configurationKey: string | undefined;
 
-  constructor(private readonly context: vscode.ExtensionContext, private readonly log: vscode.OutputChannel) {
+  constructor(private readonly context: vscode.ExtensionContext, private readonly log: vscode.OutputChannel,
+    private readonly delivered: () => void = () => {}) {
     this.status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
     this.status.command = 'editchain-history.humanWork';
     context.subscriptions.push(this.status,
@@ -69,7 +70,7 @@ export class HumanWorkHost {
           folder.uri.fsPath, chain, body => {
             client.ensureStarted(resolveServicePath());
             return client.request(body, { timeoutMs: 30000 });
-          }, message => this.updateStatus(message));
+          }, message => this.updateStatus(message), this.delivered);
         const dwell = Math.max(500, Math.min(30000, configuration.get<number>('tracking.readDwellMs', 2000)));
         const maxBytes = Math.max(1024, Math.min(524288, configuration.get<number>('tracking.maxFileBytes', 262144)));
         let attributionLogged = false;

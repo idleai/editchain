@@ -20,6 +20,7 @@ export class EditorOutbox {
   private diskBytes = 0;
   private stopped = false;
   private readonly timer: NodeJS.Timeout;
+  private wake: NodeJS.Timeout | undefined;
   private error: string | undefined;
   private persistenceFailed = false;
   private retryAt = 0;
@@ -27,7 +28,8 @@ export class EditorOutbox {
 
   constructor(private readonly directory: string, private readonly workspace: string,
     private readonly chain: string, private readonly send: Send,
-    private readonly status: (message: string) => void) {
+    private readonly status: (message: string) => void,
+    private readonly delivered: () => void = () => {}) {
     this.timer = setInterval(() => { void this.flush(false); }, 1000);
     this.timer.unref();
   }
@@ -45,6 +47,11 @@ export class EditorOutbox {
     }
     this.bytes += size;
     this.queue.push(event);
+    // Coalesce one short input frame, without waiting for the recovery interval.
+    if (!this.wake) {
+      this.wake = setTimeout(() => { this.wake = undefined; void this.flush(false); }, 25);
+      this.wake.unref();
+    }
     return true;
   }
 
@@ -57,12 +64,23 @@ export class EditorOutbox {
     });
     await this.persisting;
     if (this.persistenceFailed) return false;
-    if (!force && Date.now() < this.retryAt) return false;
+    if (!force && Date.now() < this.retryAt) {
+      if (!this.wake) {
+        this.wake = setTimeout(() => { this.wake = undefined; void this.flush(false); }, this.retryAt - Date.now());
+        this.wake.unref();
+      }
+      return false;
+    }
     if (!this.running) {
       this.running = this.drain().catch(error => {
         this.error = String(error);
-        this.retryAt = Date.now() + this.retryDelay;
-        this.retryDelay = Math.min(30000, this.retryDelay * 2);
+        const busy = this.error.includes('operation would block');
+        this.retryAt = Date.now() + (busy ? 50 : this.retryDelay);
+        if (!busy) this.retryDelay = Math.min(30000, this.retryDelay * 2);
+        if (!this.wake) {
+          this.wake = setTimeout(() => { this.wake = undefined; void this.flush(false); }, Math.max(0, this.retryAt - Date.now()));
+          this.wake.unref();
+        }
         this.status(`Tracking pending: ${this.error}`);
       }).finally(() => { this.running = undefined; });
     }
@@ -117,6 +135,7 @@ export class EditorOutbox {
       }
       await fs.rm(location, { force: true });
       this.diskBytes = Math.max(0, this.diskBytes - Buffer.byteLength(raw));
+      this.delivered();
     }
     this.retryAt = 0;
     this.retryDelay = 1000;
@@ -136,9 +155,12 @@ export class EditorOutbox {
 
   async stop(): Promise<void> {
     clearInterval(this.timer);
+    if (this.wake) clearTimeout(this.wake);
     await this.flush();
     // A drain already in progress may have snapshotted its queue before stop.
     if (this.queue.length) await this.flush();
     this.stopped = true;
+    if (this.wake) clearTimeout(this.wake);
+    this.wake = undefined;
   }
 }

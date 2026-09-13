@@ -79,6 +79,9 @@ pub struct HumanWorkRecord {
     pub identity: Option<HumanIdentity>,
     /// First observation in this bounded work episode.
     pub turn: u64,
+    /// Stable first raw change of a continuously published edit, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_group: Option<OpId>,
     /// Raw event supporting this work fragment.
     pub source_event: OpId,
     /// Activity classification.

@@ -200,18 +200,21 @@ describe('production human-work capture', () => {
     assert.ok(after.historical_ai_lines_edited >= 2);
     await browser.executeWorkbench(async vscode => vscode.commands.executeCommand('editchain-history.open'));
     await webview.open();
+    let rows: WorkRow[] = [];
     await browser.waitUntil(async () => {
-      const rows = await readRows();
+      // Keep one hydrated sample; another read can land between live pages.
+      rows = await readRows();
       return rows.some(row => row.author === 'human' && row.timestamp_ms >= typedAt && !initialKeys.includes(row.node_key))
         // The fixture's agent Import owns its generated file and stays visible.
         // Every other Import here would be leaked editor transport evidence.
-        && rows.every(row => row.kind !== 'import' || row.node_key === '83:0:1');
+        && rows.every(row => row.kind !== 'import' || row.node_key === '83:0:1')
+        && rows.some(row => row.author === 'agent' || row.file_change?.source === 'agent')
+        && rows.some(row => row.author === 'human' && row.activity_kind === 'explore');
     }, { timeout: 30000, timeoutMsg: 'new human work did not reach the open panel without raw transport rows' }).catch(async error => {
       fs.writeFileSync(path.join(output, 'stalled-rows.json'), JSON.stringify({ typedAt, initialKeys, rows: await readRows() }, null, 2));
       throw error;
     });
     fs.appendFileSync(path.join(output, 'graph-steps.log'), 'live delta visible\n');
-    const rows = await readRows();
     assert.ok(rows.some(row => row.author === 'agent' || row.file_change?.source === 'agent'));
     assert.ok(rows.some(row => row.author === 'human' && row.activity_kind === 'explore'), 'revision-bound reading indicators are visible');
     fs.writeFileSync(path.join(output, 'human-graph-rows.json'), JSON.stringify(rows, null, 2));
@@ -241,24 +244,17 @@ describe('production human-work capture', () => {
     await browser.saveScreenshot(path.join(output, 'human-edits-graph.png'));
     await browser.$('body').saveScreenshot(path.join(output, 'human-edits-graph-webview.png'));
     assert.ok(overview.some(row => row.parents.some(parent => parent.startsWith('git:'))), 'folding preserves visible Git connections');
-    const episode = overview.find(row => row.author === 'human' && (row.task_group?.member_count ?? 0) > 1);
-    assert.ok(episode, 'human work uses native episode disclosure');
-    const task = episode.task_group!.task_id;
-    // Clicking a folded edit's summary opens its episode, not one hidden diff.
-    await browser.execute(task => {
-      const row = Array.from(document.querySelectorAll<HTMLElement>('#rows .row[data-row]')).find(element =>
-        (window as any).__editchainRowAt?.(Number(element.dataset.row))?.task_group?.task_id === task);
-      if (!row || row.classList.contains('row-file')) throw new Error('folded episode must present its summary');
-      row.click();
-    }, task);
-    await browser.waitUntil(async () => (await readRows()).find(row => row.task_group?.task_id === task)?.task_group?.expanded === true, { timeout: 10000 });
+    // Streamed edits must already be visible as file rows. Lifecycle/read
+    // episode disclosure remains covered below, but cannot hide these edits.
+    assert.ok(overview.some(row => row.file_change?.source === 'human' && !row.task_group),
+      'the live edit is directly visible without opening an episode');
     await browser.$('.row-file[data-file-source="human"]').waitForExist({ timeout: 10000 });
     let edits: WorkRow[] = [];
     await browser.waitUntil(async () => {
       edits = (await readRows()).filter(row => row.file_change?.source === 'human');
       return edits.length > 0;
-    }, { timeout: 10000, timeoutMsg: 'expanded episode did not hydrate direct human file rows' });
-    assert.ok(edits.length > 0, 'opening the episode directly exposes file rows');
+    }, { timeout: 10000, timeoutMsg: 'live history did not hydrate direct human file rows' });
+    assert.ok(edits.length > 0, 'live edit groups expose their file rows directly');
     for (const edit of edits) {
       assert.equal(edit.is_subop, false, 'the edit keeps its physical graph row');
       assert.equal(edit.author, 'human');
@@ -267,7 +263,7 @@ describe('production human-work capture', () => {
     }
     assert.equal(new Set(edits.map(row => row.file_change!.op_id)).size, edits.length, 'one row per actual edit');
     const compact = await browser.execute(() => Array.from(document.querySelectorAll('.row-file[data-file-source="human"]')).every(row =>
-      !row.querySelector('.subop-chevron') && row.querySelector('.file-name')?.textContent === 'ai.ts'));
+      !row.querySelector('.subop-chevron, .task-chevron') && row.querySelector('.file-name')?.textContent === 'ai.ts'));
     assert.ok(compact, 'each visible edit shows its file name without an extra disclosure');
     fs.writeFileSync(path.join(output, 'human-compact-rows.json'), JSON.stringify(edits, null, 2));
     await browser.execute(() => (window as any).__editchainRendererDebug.whenIdle(10000));

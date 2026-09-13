@@ -43,6 +43,7 @@ function harness(dwell = 2000, identity) {
   const filename = require.resolve('../../out/editorCapture');
   delete require.cache[filename];
   delete require.cache[require.resolve('../../out/editorEdits')];
+  delete require.cache[require.resolve('../../out/editorTabs')];
   Module._load = function(name, ...args) {
     if (name === 'vscode') return vscode;
     if (name === 'node:perf_hooks') return { performance: { now: () => now } };
@@ -70,14 +71,72 @@ function harness(dwell = 2000, identity) {
 
 function type(env, text, explicit = false) {
   const offset = env.document.text.indexOf('\n');
+  env.editor.selections = [env.selection(offset)];
   env.document.text = env.document.text.slice(0, offset) + text + env.document.text.slice(offset);
   env.document.version++;
   env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: offset, rangeLength: 0, text }],
     ...(explicit ? { detailedReason: { source: 'cursor', metadata: { kind: 'type' } } } : {}) });
   env.signals.selection({ textEditor: env.editor, kind: 1, selections: [env.selection(offset + text.length)] });
+  env.editor.selections = [env.selection(offset + text.length)];
 }
 
 const editEvents = env => env.events.filter(event => ['human_edit', 'human_edit_batch'].includes(event.event.type));
+const receipts = env => editEvents(env).flatMap(event => event.event.type === 'human_edit' ? [event]
+  : event.event.edits.map(edit => ({ ...event, event: { type: 'human_edit', ...edit } })));
+const editGroups = env => {
+  const groups = new Map();
+  for (const event of editEvents(env)) {
+    const key = event.event.group ?? event.sequence;
+    groups.set(key, [...(groups.get(key) ?? []), ...(event.event.edits ?? [event.event])]);
+  }
+  return [...groups.values()];
+};
+
+test('corrections of just-typed text remain in one edit without claiming existing or agent-deleted code', () => {
+  for (const explicitAgent of [false, true]) {
+    const env = harness();
+    try {
+      type(env, '😀x');
+      const offset = env.document.text.indexOf('\n') - 1;
+      env.document.text = env.document.text.slice(0, offset) + env.document.text.slice(offset + 1);
+      env.document.version++;
+      env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: offset, rangeLength: 1, text: '' }],
+        ...(explicitAgent ? { detailedReason: { source: 'applyEdits' } } : {}) });
+      env.tick(100);
+      assert.deepEqual(receipts(env).map(value => value.event.signal),
+        explicitAgent ? ['keyboard_selection'] : ['keyboard_selection', 'typing_correction']);
+      assert.equal(editGroups(env).length, 1);
+      env.document.text = env.document.text.slice(1); env.document.version++;
+      env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: 0, rangeLength: 1, text: '' }] });
+      env.signals.selection({ textEditor: env.editor, kind: undefined, selections: [env.selection(0)] });
+      env.signals.save(env.document);
+      assert.equal(receipts(env).length, explicitAgent ? 1 : 2, 'deleting pre-existing code never inherits a typing receipt');
+    } finally { env.capture.dispose(); }
+  }
+});
+
+test('reading and background save/disposal do not end the active edit', () => {
+  const env = harness();
+  try {
+    type(env, 'a'); env.tick(2200);
+    assert.equal(env.reads()[0].event.group, editEvents(env)[0].event.group);
+    const other = { ...env.document, uri: { scheme: 'file', fsPath: '/workspace/b.ts', toString: () => 'file:///workspace/b.ts' } };
+    env.signals.open(other);
+    const length = other.text.length;
+    other.text = 'agent'; other.version++;
+    env.signals.change({ document: other, contentChanges: [{ rangeOffset: 0, rangeLength: length, text: 'agent' }],
+      detailedReason: { source: 'applyEdits' } });
+    env.signals.save(other);
+    env.signals.close(other);
+    env.signals.close({ uri: { scheme: 'output', toString: () => 'output:internal' } });
+    type(env, 'b'); env.tick(100);
+    assert.equal(editGroups(env).length, 1);
+    assert.equal(receipts(env).length, 2);
+    env.signals.save(env.document);
+    type(env, 'c');
+    assert.equal(editGroups(env).length, 2, 'saving the edited file finishes that edit');
+  } finally { env.capture.dispose(); }
+});
 
 test('a typing burst produces one edit with every raw revision, then one read without a heartbeat', () => {
   for (const explicit of [false, true]) {
@@ -86,17 +145,17 @@ test('a typing burst produces one edit with every raw revision, then one read wi
       for (const char of 'humanwork') {
         type(env, char, explicit); env.signals.active(env.editor); env.tick(100);
       }
-      assert.equal(editEvents(env).length, 0, 'burst remains open until idle or a boundary');
-      env.tick(899); assert.equal(editEvents(env).length, 0);
-      env.tick(1);
+      assert.equal(receipts(env).length, 9, 'every input is published while typing');
+      env.tick(1000);
       const changes = env.events.filter(event => event.event.type === 'document_changed');
       assert.equal(changes.length, 9);
-      const edits = editEvents(env);
+      const edits = editGroups(env);
       assert.equal(edits.length, 1);
-      assert.deepEqual(edits[0].event.edits, changes.map(event => ({ change: event.sequence, signal: explicit ? 'editor_input' : 'keyboard_selection' })));
+      assert.deepEqual(edits[0], changes.map(event => ({ change: event.sequence, signal: explicit ? 'editor_input' : 'keyboard_selection' })));
       env.signals.save(env.document);
       env.tick(600000); env.capture.checkpoint();
-      assert.equal(editEvents(env).length, 1, 'save and elapsed time do not duplicate the edit');
+      assert.equal(editGroups(env).length, 1, 'save and elapsed time do not duplicate the edit');
+      assert.equal(receipts(env).length, 9);
       assert.equal(env.reads().length, 1);
       assert.equal(env.timers.size, 0);
     } finally { env.capture.dispose(); }
@@ -116,9 +175,9 @@ test('an automatic or unconfirmed mutation splits typing bursts without gaining 
       type(env, 'c', explicit); env.tick(100); type(env, 'd', explicit);
       env.signals.save(env.document);
       const changes = env.events.filter(event => event.event.type === 'document_changed');
-      const edits = editEvents(env);
+      const edits = editGroups(env);
       assert.equal(edits.length, 2);
-      assert.deepEqual(edits.map(event => event.event.edits.map(edit => edit.change)),
+      assert.deepEqual(edits.map(group => group.map(edit => edit.change)),
         [[changes[0].sequence, changes[1].sequence], [changes[3].sequence, changes[4].sequence]]);
     } finally { env.capture.dispose(); }
   }
@@ -138,21 +197,26 @@ test('save, focus, editor, context, capture gaps and shutdown finalize pending t
         env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: 0, rangeLength: 26, text: env.document.text }] });
       }
       if (boundary === 'shutdown') env.capture.dispose();
-      assert.equal(editEvents(env).length, 1, boundary);
-      assert.equal(editEvents(env)[0].event.edits.length, 2);
-      env.tick(60000); assert.equal(editEvents(env).length, 1, 'no timer duplicates the completed burst');
+      assert.equal(editGroups(env).length, 1, boundary);
+      assert.equal(editGroups(env)[0].length, 2);
+      env.tick(60000); assert.equal(editGroups(env).length, 1, 'no timer duplicates the completed burst');
     } finally { env.capture.dispose(); }
   }
 });
 
-test('uninterrupted typing has a bounded thirty-second publication delay', () => {
+test('uninterrupted typing publishes immediately and retains one group across ordinary pauses', () => {
   const env = harness();
   try {
-    for (let index = 0; index < 60; index++) { type(env, 'x'); env.tick(500); }
-    assert.equal(editEvents(env).length, 1);
-    assert.equal(editEvents(env)[0].event.edits.length, 60);
+    for (let index = 0; index < 60; index++) {
+      type(env, 'x'); env.tick(100);
+      assert.equal(receipts(env).length, index + 1, 'publication follows input within one frame');
+      env.tick(400);
+    }
+    assert.equal(editGroups(env).length, 1);
+    assert.equal(editGroups(env)[0].length, 60);
     type(env, 'y'); env.tick(1000);
-    assert.equal(editEvents(env).length, 2);
+    assert.equal(editGroups(env).length, 1);
+    assert.equal(receipts(env).length, 61);
   } finally { env.capture.dispose(); }
 });
 
@@ -216,7 +280,7 @@ test('human indicators reference raw versioned changes; automatic changes stay u
     env.tick(300);
     env.signals.selection({ textEditor: env.editor, kind: 1, selections: [env.range(1, 1)] });
     const changes = env.events.filter(event => event.event.type === 'document_changed');
-    const human = env.events.filter(event => event.event.type === 'human_edit');
+    const human = receipts(env);
     assert.equal(changes.length, 2);
     assert.equal(changes[0].event.before, before);
     assert.equal(changes[0].event.before_version, 1);
@@ -241,7 +305,7 @@ test('rapid interleaved automatic and keyboard changes attribute only the matchi
     const event = { textEditor: env.editor, kind: 1, selections: [env.selection(6)] };
     env.signals.selection(event); env.signals.selection(event);
     env.signals.save(env.document);
-    assert.deepEqual(env.events.filter(event => event.event.type === 'human_edit').map(event => event.event.change), [typed.sequence]);
+    assert.deepEqual(receipts(env).map(event => event.event.change), [typed.sequence]);
     assert.equal(automatic.event.type, 'document_changed');
     assert.equal(env.events.at(-1).event.type, 'document_saved');
   } finally { env.capture.dispose(); }
@@ -266,7 +330,7 @@ test('unrelated navigation and interruptions cannot claim an earlier programmati
       if (boundary === 'context') env.capture.context({ observed_ms: 0, repositories: [] });
       if (boundary === 'split') env.signals.selection({ ...matching, textEditor: { ...env.editor } });
       env.signals.selection(matching);
-      assert.equal(env.events.filter(event => event.event.type === 'human_edit').length, 0, boundary);
+      assert.equal(receipts(env).length, 0, boundary);
     } finally { env.capture.dispose(); }
   }
 });
@@ -283,7 +347,7 @@ test('multi-cursor keyboard edits use the resulting UTF-16 caret positions', () 
     env.signals.active(env.editor); env.signals.focus();
     env.signals.selection({ textEditor: env.editor, kind: 1, selections: [env.selection(4), env.selection(6)] });
     env.tick(1000);
-    assert.equal(env.events.filter(event => event.event.type === 'human_edit').length, 1);
+    assert.equal(receipts(env).length, 1);
   } finally { env.capture.dispose(); }
 });
 
@@ -298,11 +362,11 @@ test('explicit editor input attributes the exact change without a selection or s
       assert.equal(changed.event.origin.source, 'cursor');
       assert.equal(changed.event.origin.kind, kind);
       env.tick(1000);
-      const human = env.events.filter(event => event.event.type === 'human_edit');
+      const human = receipts(env);
       assert.deepEqual(human.map(event => event.event), [{ type: 'human_edit', change: changed.sequence, signal: 'editor_input' }]);
       env.signals.selection({ textEditor: env.editor, kind: 1, selections: [env.selection(0)] });
       env.signals.save(env.document);
-      assert.deepEqual(env.events.filter(event => event.event.type === 'human_edit'), human, kind);
+      assert.deepEqual(receipts(env), human, kind);
     } finally { env.capture.dispose(); }
   }
 });
@@ -320,7 +384,7 @@ test('programmatic, provider, missing and unfamiliar origins cannot be promoted 
       env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: 0, rangeLength: 24, text: 'agent' }], detailedReason });
       env.signals.selection({ textEditor: env.editor, kind: 1, selections: [env.selection(5)] });
       env.signals.save(env.document);
-      assert.equal(env.events.filter(event => event.event.type === 'human_edit').length, 0, JSON.stringify(detailedReason));
+      assert.equal(receipts(env).length, 0, JSON.stringify(detailedReason));
       assert.ok(env.events.find(event => event.event.type === 'document_changed').event.origin);
     } finally { env.capture.dispose(); }
   }
@@ -337,7 +401,7 @@ test('origin-based input still requires the focused active document; undo and re
       const source = mode === 'agent undo' ? 'Chat.undoEdits' : reason ? 'applyEdits' : 'cursor';
       env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: 3, rangeLength: 21, text: '' }],
         reason, detailedReason: { source, metadata: { kind: 'type' } } });
-      assert.deepEqual(env.events.filter(event => event.event.type === 'human_edit').map(event => event.event.signal),
+      assert.deepEqual(receipts(env).map(event => event.event.signal),
         mode === 'undo' || mode === 'redo' ? [mode] : [], mode);
     } finally { env.capture.dispose(); }
   }
@@ -456,6 +520,7 @@ test('tab close records lifecycle, flushes a delayed qualified read, and does no
       env.elapse(duration);
       env.vscode.window.activeTextEditor = undefined;
       env.vscode.window.visibleTextEditors = [];
+      env.vscode.window.tabGroups.all = [{ tabs: [] }];
       env.signals.tabs({ opened: [], closed: [env.tab] });
       const opened = env.events.find(event => event.event.type === 'editor_opened');
       const closed = env.events.find(event => event.event.type === 'editor_closed');
@@ -472,19 +537,31 @@ test('tab close records lifecycle, flushes a delayed qualified read, and does no
   }
 });
 
-test('split tabs have independent open/close identities and closing a background split preserves the active interval', () => {
+test('split tabs and duplicate notifications produce one file lifecycle and preserve reading', () => {
   const env = harness();
   try {
     const tab = { input: new env.vscode.TabInputText(env.document.uri) };
+    env.vscode.window.tabGroups.all[0].tabs.push(tab);
     env.signals.tabs({ opened: [tab], closed: [] });
-    env.tick(1500); env.signals.tabs({ opened: [], closed: [tab] });
+    env.signals.tabs({ opened: [tab], closed: [] });
+    env.tick(1500);
+    env.vscode.window.tabGroups.all[0].tabs.pop();
+    env.signals.tabs({ opened: [], closed: [tab] });
     env.tick(500);
     const opened = env.events.filter(event => event.event.type === 'editor_opened');
     const closed = env.events.find(event => event.event.type === 'editor_closed');
-    assert.notEqual(opened[0].event.editor, opened[1].event.editor);
-    assert.equal(closed.event.editor, opened[1].event.editor);
+    assert.equal(opened.length, 1);
+    assert.equal(opened[0].event.restored, true, 'startup inventory is not a fresh open action');
+    assert.equal(closed, undefined, 'file remains open in the first split');
     assert.equal(env.reads().length, 1);
     assert.equal(env.reads()[0].event.duration_ms, 2000);
+    env.vscode.window.tabGroups.all[0].tabs = [];
+    env.signals.tabs({ opened: [], closed: [env.tab] });
+    env.vscode.window.tabGroups.all[0].tabs = [tab];
+    env.signals.tabs({ opened: [tab], closed: [] });
+    env.signals.tabs({ opened: [tab], closed: [] });
+    assert.equal(env.events.filter(event => event.event.type === 'editor_closed').length, 1);
+    assert.equal(env.events.filter(event => event.event.type === 'editor_opened' && !event.event.restored).length, 1);
   } finally { env.capture.dispose(); }
 });
 

@@ -31,7 +31,7 @@ if (proposed) {
   fs.writeFileSync(path.join(extension, 'package.json'), JSON.stringify(manifest));
 }
 export const config: WebdriverIO.Config = {
-  outputDir: output, specs: ['./human-work.e2e.ts', './human-attribution.e2e.ts'], maxInstances: 1,
+  outputDir: output, specs: ['./human-work.e2e.ts', './human-attribution.e2e.ts', './human-realtime.e2e.ts'], maxInstances: 1,
   capabilities: [{ browserName: 'vscode', browserVersion: version,
     'wdio:enforceWebDriverClassic': true,
     'wdio:vscodeOptions': {

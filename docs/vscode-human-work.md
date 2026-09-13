@@ -11,7 +11,7 @@ implementation or its tests. The [research](vscode-editor-capture-plan.md) and
 recorder session, a strictly increasing sequence, observer wall time, and typed
 payload. Each document carries URI, workspace-relative path when available,
 incarnation identity, and exact buffer version. Opening an editor is independent
-of loading a document. Split tabs have separate identities.
+of loading a document. Since 0.1.7, split tabs share one file lifecycle identity.
 
 | Stored event | Meaning |
 | --- | --- |
@@ -22,12 +22,12 @@ of loading a document. Split tabs have separate identities.
 | `document_snapshot` | Exact initial/recovered text, including unsaved text. |
 | `document_changed` | Before/after revisions and raw replacements in emitted order. |
 | `human_edit` | Reference to a change with explicit editor-input, keyboard-selection, undo, or redo evidence. |
-| `human_edit_batch` | One contiguous typing burst: ordered change references and an input signal for every constituent revision. |
+| `human_edit_batch` | Ordered change references and input signals; optional `group` identifies the first change of a live editing episode. |
 | `document_saved` | Saved buffer revision. |
 | `document_renamed` | Explicit file/directory rename within the workspace. |
-| `editor_opened` / `editor_closed` | Text tab lifecycle, tab ID, URI, and captured relative path, including preview tabs. |
+| `editor_opened` / `editor_closed` | First-tab / last-tab file lifecycle, identity, URI, and relative path. Startup opens carry `restored: true`. |
 | `editor_activated` | Active tracked document, or no tracked active editor. |
-| `code_read` | One qualified interval: exact revision, disjoint visible ranges, start time, and monotonic duration at qualification. |
+| `code_read` | One qualified interval: exact revision, disjoint visible ranges, start time, and monotonic duration at qualification. Optional `group` attaches it to an ongoing edit. |
 
 Window focus is **not** an event or a stored field. An in-memory focus guard
 pauses exposure timing. Cursor/selection and viewport observations stay local;
@@ -53,15 +53,17 @@ reset the timer. Hidden tabs and background windows
 earn no reads. Horizontal clipping, terminal or sidebar keyboard focus, gaze,
 and comprehension are not observable guarantees.
 
-Opening a text tab stores `editor_opened`; loading its document establishes an
+Opening a file's first text tab stores `editor_opened`; loading its document establishes an
 exact baseline if needed. Opening a background tab alone does not start reading.
 Activation of a visible editor starts its local timer. Closing a tab stores
-`editor_closed` with the same tab identity; removing the viewed editor ends its
+`editor_closed` with the same lifecycle identity only when the final tab closes;
+removing the viewed editor ends its
 interval and flushes a qualified read if its timer was delayed. A close before
 the threshold produces no read. Closing one split does not close the shared
-document or end another split's active interval. New recorder sessions also
-produce **Editor opened** and **Editor closed** graph rows in the same connected
-human series as reads and edits. These lifecycle rows never contribute read or
+document or end another split's active interval. Startup records existing tabs
+with `restored: true` as raw inventory, without new open activities. Genuine
+opens and final closes produce graph rows in the same connected human series
+as reads and edits. These lifecycle rows never contribute read or
 edit coverage and do not claim a buffer modification.
 Orderly recorder shutdown flushes a pending qualified read and records
 `tracking_stopped`; it does not manufacture tab closes. Abrupt process exits can
@@ -85,8 +87,12 @@ document and retain exact changes before saving:
   at the replacement's resulting UTF-16 caret positions. It consumes only that
   candidate, including when rejected. A newer mutation replaces the candidate;
   save, activation, focus, and document-close boundaries clear it. This path
-  deliberately leaves ambiguous deletions and other unsupported actions
-  unattributed. Focused active-editor undo/redo also qualifies.
+  leaves ambiguous deletions of pre-existing text and other unsupported actions
+  unattributed. A deletion wholly inside text already introduced by confirmed
+  input in the active edit can instead emit `typing_correction`; known non-input
+  origins never qualify. This cooperative inference cannot distinguish an unknown
+  automatic retraction of that same newly typed text. Focused active-editor
+  undo/redo also qualifies.
 
 Saving records `document_saved` without inventing or duplicating an edit.
 Formatting on save, `WorkspaceEdit`, `TextEditor.edit`, disk reloads, and provider
@@ -95,17 +101,20 @@ The coverage report includes `unattributed_changes`, the count of observed
 mutations without a human indicator. This includes both automated changes and
 uncertain changes; it is not an additional AI-origin count.
 
-Since 0.1.6, confirmed input is grouped until **1000 ms of inactivity**, save,
-active-editor/focus/lifecycle/context boundaries, a qualified read, or an
-automatic/unconfirmed mutation. Undo and redo are separate immediate edits.
-The recorder also finalizes after **30000 ms of uninterrupted typing** or
-**1024 changes**, bounding publication latency and pending receipts. One-change
-bursts use `human_edit`; longer bursts use `human_edit_batch`. A coverage query
-and orderly shutdown flush the current burst. Raw `document_changed` evidence
-is queued immediately; the graph receives one edit with the first before-buffer
-and last after-buffer. This is independent of transport batch sizes.
+Since 0.1.7, the first confirmed input publishes immediately. Further receipts
+publish every **100 ms** or **128 changes**, updating one stable live row. Save,
+active-editor/focus/lifecycle/context boundaries, a new input after **30000 ms
+idle**, or an automatic/unconfirmed mutation of the edited file finishes its
+group. Undo and redo are separate immediate edits. Reads during an edit retain
+their own coverage evidence under that row; neither reads nor mutations/saves of
+background files end the group. Disposing a background or internal VS Code
+document does not end it either. A coverage query and orderly shutdown flush it.
+Raw `document_changed` evidence is queued immediately; each grouped receipt has
+an exact cumulative diff from the first before-buffer to its latest after-buffer.
+This is independent of transport batch sizes. The 0.1.6 idle/continuous publication
+delays no longer apply.
 
-The native derivation requires every intervening change, exact document and
+The native derivation requires every intervening change to that document, exact document and
 revision continuity, and unchanged recorded context/boundaries. Discontinuous
 or missing burst references produce a visible gap, never a composite human
 diff. Coverage accepts receipts only from successfully derived edits and still
@@ -139,8 +148,12 @@ Stable reason metadata is retained; dirty-only events do not manufacture edits.
 
 The outbox writes atomic local batches, fsyncs them, then sends bounded requests.
 Persistence continues while an earlier service request waits. Offline retries
-back off to 30 seconds. New records keep their original identities on replay.
-The service acquires the existing chain writer lock, refreshes its canonical
+back off to 30 seconds; a busy writer retries after 50 ms. New records keep their
+original identities on replay. A durable incremental `editor-v1` checkpoint
+retains admission and normalization state across recorder processes. Its first
+full scan runs before acquiring the chain append lock; contention cannot discard
+that completed scan. Each request releases checkpoint ownership for other windows.
+The service acquires the existing chain writer lock, refreshes its indexed
 tail, rejects conflicting identities and sequence gaps, writes content-addressed
 blobs, and acknowledges only after durable segment append. Retrying after a
 lost acknowledgement is a duplicate, not another human action. Other windows
@@ -157,7 +170,9 @@ Limits: 128 events and approximately 4 MiB per outbound batch; 32 MiB queued
 memory and 64 MiB pending disk data per recorder; 256 KiB default buffer limit.
 Capacity failures record a final gap and pause recording until resumed. Code
 snapshots are local retained evidence; chain disk usage grows with work. Atomic
-outbox publication runs every second and during shutdown. An abrupt failure can
+outbox publication is scheduled 25 ms after enqueue, with a one-second recovery
+poll and an orderly-shutdown flush. Acknowledgement wakes live History before
+provider backlog processing. An abrupt failure can
 lose its unpersisted tail; absence of `tracking_stopped` does not distinguish a
 live recorder from an interrupted one. Remnants before atomic publication are
 not silently presented as complete events.
@@ -320,6 +335,23 @@ continuity. Full snapshots preserve code for later re-analysis as those cases
 gain support.
 
 ## Verification
+
+The 0.1.7 regression suite exercises real keyboard input in VS Code 1.136.2
+with code and History simultaneously visible. It observes stored events and
+rendered rows without calling coverage or forcing capture to flush. The measured
+run showed the first unsaved edit in 354 ms and saved-event persistence in 21 ms
+(47 ms including the test's keyboard dispatch and polling). Seven changes,
+including a Backspace correction, retained seven receipts and one live edit row.
+Split tabs produced one open/final close, and restarting the recorder with split
+tabs present retained one inventory entry without another open activity. The
+existing host-restart test separately checks persistent identity and ancestry.
+
+A release-service replay on the existing 1.7 GB source history (2,438,873 records)
+took 43.6 seconds to create the first capture checkpoint. Two fresh service
+processes then acknowledged the same already-recorded event in 64.4 and 60.2 ms,
+each decoding zero source records. All requests accepted zero new events and
+replayed one; the check did not inject artificial human work. These are local
+measurements, not a latency guarantee during arbitrary external writer activity.
 
 Build the native service, synthetic fixture generator, and extension:
 

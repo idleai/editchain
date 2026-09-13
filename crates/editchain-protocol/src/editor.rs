@@ -187,6 +187,9 @@ pub enum EditorEventKind {
     },
     /// One bounded typing burst, preserving each constituent input receipt.
     HumanEditBatch {
+        /// First change in this live edit; subsequent receipts update its row.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<u64>,
         /// Strict source order, without gaps in buffer revision continuity.
         edits: Vec<EditorEditAttribution>,
     },
@@ -204,6 +207,9 @@ pub enum EditorEventKind {
     },
     /// A text tab opened; this alone does not indicate exposure.
     EditorOpened {
+        /// Startup inventory describes an existing open file, not a new action.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restored: Option<bool>,
         /// Tab identity, distinguishing split views.
         editor: String,
         /// Document URI.
@@ -262,6 +268,9 @@ pub enum EditorEventKind {
     },
     /// One reading indicator after a stable foreground view reaches its dwell threshold.
     CodeRead {
+        /// Reading during an open edit is supporting evidence for that activity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group: Option<u64>,
         /// Exact buffer revision.
         document: EditorDocument,
         /// Visible editor identity.
@@ -335,6 +344,14 @@ impl RecordEditorEvents {
 impl EditorEvent {
     fn validate_content(&self) -> Result<(), &'static str> {
         self.validate_document()?;
+        if let EditorEventKind::CodeRead {
+            group: Some(group), ..
+        } = &self.event
+        {
+            if *group == 0 || *group >= self.sequence {
+                return Err("reading group must refer to an earlier edit");
+            }
+        }
         match &self.event {
             EditorEventKind::WorkspaceContext {
                 repositories,
@@ -423,14 +440,19 @@ impl EditorEvent {
             EditorEventKind::HumanEdit { signal, .. } => {
                 if !matches!(
                     signal.as_str(),
-                    "editor_input" | "keyboard_selection" | "undo" | "redo"
+                    "editor_input" | "keyboard_selection" | "typing_correction" | "undo" | "redo"
                 ) {
                     return Err("unknown human edit signal");
                 }
             }
-            EditorEventKind::HumanEditBatch { edits } => {
+            EditorEventKind::HumanEditBatch { edits, group } => {
                 if edits.is_empty() || edits.len() > 1024 {
                     return Err("human edit batch must contain 1..1024 changes");
+                }
+                if group.is_some_and(|group| {
+                    group == 0 || edits.first().is_none_or(|edit| group > edit.change)
+                }) {
+                    return Err("human edit group must begin at an earlier input receipt");
                 }
                 let mut previous = 0;
                 for edit in edits {
@@ -439,7 +461,10 @@ impl EditorEvent {
                             "human edit batch must reference earlier changes in source order",
                         );
                     }
-                    if !matches!(edit.signal.as_str(), "editor_input" | "keyboard_selection") {
+                    if !matches!(
+                        edit.signal.as_str(),
+                        "editor_input" | "keyboard_selection" | "typing_correction"
+                    ) {
                         return Err(
                             "human edit batch requires input signals; undo/redo remain separate",
                         );

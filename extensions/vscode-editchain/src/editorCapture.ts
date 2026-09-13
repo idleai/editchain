@@ -7,6 +7,8 @@ import { EditorEvent } from './editorOutbox';
 import type { HumanIdentity } from './humanIdentity';
 import { editorOrigin, isEditorInput } from './editorOrigin';
 import { EditorEdits } from './editorEdits';
+import { EditorTabs } from './editorTabs';
+import type { InputChange } from './editorInput';
 
 type Document = { id: string; uri: string; path: string | null; version: number };
 type Range = { start: [number, number]; end: [number, number] };
@@ -23,7 +25,7 @@ export class EditorCapture {
   private readonly documents = new Map<vscode.TextDocument, BufferState>();
   private readonly subscriptions: vscode.Disposable[] = [];
   private readonly pending = new Map<vscode.TextDocument, {
-    sequence: number; beforeVersion: number; version: number; at: number; editor: vscode.TextEditor; carets: number[];
+    sequence: number; beforeVersion: number; version: number; at: number; editor: vscode.TextEditor; carets: number[]; changes: readonly InputChange[];
   }>();
   private readonly skipped = new Set<string>();
   // Keep the last view's receipt when focus/activation/context ends its timer.
@@ -38,19 +40,23 @@ export class EditorCapture {
     private readonly maxFileBytes: number, private readonly emit: (event: EditorEvent) => boolean,
     private readonly attribution?: HumanIdentity) {
     const version = vscode.extensions?.getExtension('ambientlight.editchain-history')?.packageJSON.version;
+    const tabs = new EditorTabs(uri => this.relative(uri), tab => this.identity(tab), event => {
+      this.pending.clear(); this.edits.flush(); this.record(event);
+    }, folder.index === 0);
     this.record({ type: 'tracking_started', dwell_ms: dwell, vscode_version: vscode.version,
       ...(typeof version === 'string' ? { extension_version: version } : {}), activity_schema: attribution ? 3 : 2 });
     this.subscriptions.push(
       vscode.workspace.onDidOpenTextDocument(document => { this.baseline(document); }),
       vscode.workspace.onDidCloseTextDocument(document => {
-        this.pending.clear();
-        this.edits.flush();
+        // VS Code also disposes background/internal documents while typing.
+        // Their lifetime must not split the active file's edit or input receipt.
+        this.edits.interrupt(document);
         if (this.exposure?.document.id === this.documents.get(document)?.document.id) this.endExposure();
         this.documents.delete(document); this.pending.delete(document);
       }),
       vscode.workspace.onDidChangeTextDocument(event => this.changed(event)),
       vscode.workspace.onDidSaveTextDocument(document => {
-        this.edits.flush();
+        this.edits.interrupt(document);
         this.pending.delete(document);
         const state = this.documents.get(document);
         if (state) this.record({ type: 'document_saved', document: state.document });
@@ -82,12 +88,11 @@ export class EditorCapture {
       }),
       vscode.window.tabGroups.onDidChangeTabs(event => {
         if (event.closed.length) this.viewport();
-        for (const tab of event.opened) this.tab(tab, 'editor_opened');
-        for (const tab of event.closed) this.tab(tab, 'editor_closed');
+        tabs.sync();
       }),
     );
     for (const document of vscode.workspace.textDocuments) this.baseline(document);
-    for (const group of vscode.window.tabGroups.all) for (const tab of group.tabs) this.tab(tab, 'editor_opened');
+    tabs.sync(true);
     this.viewport();
   }
 
@@ -135,7 +140,7 @@ export class EditorCapture {
 
   private changed(event: vscode.TextDocumentChangeEvent): void {
     if (!this.tracked(event.document) || !event.contentChanges.length) return;
-    if (this.pending.has(event.document)) this.edits.flush();
+    if (this.pending.has(event.document)) this.edits.interrupt(event.document);
     this.pending.delete(event.document);
     if (this.exposure?.document.id === this.documents.get(event.document)?.document.id) this.endExposure();
     const before = this.documents.get(event.document);
@@ -153,7 +158,7 @@ export class EditorCapture {
     const reason = event.reason === vscode.TextDocumentChangeReason.Undo ? 'undo'
       : event.reason === vscode.TextDocumentChangeReason.Redo ? 'redo' : null;
     const origin = editorOrigin(event);
-    if (reason || (origin && !isEditorInput(origin))) this.edits.flush();
+    if (reason || (origin && !isEditorInput(origin))) this.edits.interrupt(event.document);
     const sequence = this.record({ type: 'document_changed', document, before_version: before.document.version,
       before: before.text, after, reason, ...(origin ? { origin } : {}), changes: event.contentChanges.map(change => ({
         offset: change.rangeOffset, length: change.rangeLength, text: change.text,
@@ -163,11 +168,12 @@ export class EditorCapture {
       // A known non-input origin takes precedence over timing/selection hints.
       // Undo/redo of ordinary editor history reports applyEdits in this API.
       const signal = reason && (!origin || origin.source === 'applyEdits') ? reason
-        : origin && isEditorInput(origin) ? 'editor_input' : undefined;
-      if (signal) this.edits.add(event.document, vscode.window.activeTextEditor, before.document.version, document.version, sequence, signal);
+        : origin && isEditorInput(origin) ? 'editor_input'
+        : !origin && this.edits.corrects(event.document, before.document.version, event.contentChanges) ? 'typing_correction' : undefined;
+      if (signal) this.edits.add(event.document, vscode.window.activeTextEditor, before.document.version, document.version, sequence, signal, event.contentChanges);
       else if (!origin) {
         this.pending.set(event.document, { sequence, beforeVersion: before.document.version, version: document.version, at: performance.now(),
-          editor: vscode.window.activeTextEditor, carets: editCarets(event.contentChanges) });
+          editor: vscode.window.activeTextEditor, carets: editCarets(event.contentChanges), changes: event.contentChanges });
       }
     }
     this.viewport();
@@ -187,17 +193,9 @@ export class EditorCapture {
       && event.textEditor === change.editor && change.version === state.document.version
       && performance.now() - change.at <= 250 && carets.length === event.selections.length
       && JSON.stringify(carets) === JSON.stringify(change.carets)) {
-      this.edits.add(event.textEditor.document, event.textEditor, change.beforeVersion, change.version, change.sequence, 'keyboard_selection');
-    } else this.edits.flush();
-  }
-
-  private tab(tab: vscode.Tab, type: string): void {
-    if (!(tab.input instanceof vscode.TabInputText)) return;
-    const uri = tab.input.uri;
-    if (this.relative(uri) === null && !(uri.scheme === 'untitled' && this.folder.index === 0)) return;
-    this.pending.clear();
-    this.edits.flush();
-    this.record({ type, editor: this.identity(tab), uri: uri.toString(), path: this.relative(uri) });
+      this.edits.add(event.textEditor.document, event.textEditor, change.beforeVersion, change.version, change.sequence,
+        'keyboard_selection', change.changes);
+    } else this.edits.interrupt(event.textEditor.document);
   }
 
   private viewport(): void {
@@ -247,9 +245,11 @@ export class EditorCapture {
     if (!exposure || exposure.reported) return;
     const duration_ms = Math.max(0, Math.min(60000, Math.floor(performance.now() - exposure.monotonic)));
     if (duration_ms < this.dwell) return;
-    this.edits.flush();
     const { document, editor, ranges, started_ms } = exposure;
-    this.record({ type: 'code_read', document, editor, ranges, started_ms, duration_ms });
+    const active = vscode.window.activeTextEditor;
+    const group = active && this.edits.read(active.document, document.version);
+    this.record({ type: 'code_read', document, editor, ranges, started_ms, duration_ms,
+      ...(group ? { group } : {}) });
     exposure.reported = true;
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;

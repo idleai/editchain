@@ -76,9 +76,9 @@ describe('production edit attribution', () => {
     const result = await evidence('burst');
     assert.equal(result.changes.length, 9, 'real key events retain all nine buffer revisions');
     assert.equal(result.human.length, 9);
-    assert.equal(result.edits.length, 1, 'one graph activity instead of nine keystroke edits');
+    assert.equal(new Set(result.edits.map(value => value.event.group)).size, 1, 'one logical edit while receipts stream');
     assert.equal(result.edits[0].event.type, 'human_edit_batch');
-    assert.deepEqual(result.edits[0].event.edits.map((edit: any) => edit.change), result.changes.map(value => value.sequence));
+    assert.deepEqual(result.human.map(value => value.event.change).sort((a, b) => a - b), result.changes.map(value => value.sequence));
     assert.equal(result.changes[0].event.before, 'baseline');
     assert.equal(result.changes.at(-1).event.after, 'baselinehumanwork');
     const again = await evidence('burst');
@@ -99,10 +99,28 @@ describe('production edit attribution', () => {
     const result = await evidence('burst-agent');
     assert.equal(result.changes.length, 5);
     assert.equal(result.human.length, 4);
-    assert.equal(result.edits.length, 2);
-    assert.deepEqual(result.edits.sort((a, b) => a.sequence - b.sequence).map(value => value.event.edits.map((edit: any) => edit.change)),
+    const grouped = new Map<number, number[]>();
+    for (const value of result.edits.sort((a, b) => a.sequence - b.sequence)) {
+      grouped.set(value.event.group, [...(grouped.get(value.event.group) ?? []), ...value.event.edits.map((edit: any) => edit.change)]);
+    }
+    assert.equal(grouped.size, 2);
+    assert.deepEqual([...grouped.values()],
       [[result.changes[0].sequence, result.changes[1].sequence], [result.changes[3].sequence, result.changes[4].sequence]]);
     assert.ok(result.changes[3].event.before.startsWith('AGENT '), 'second human burst starts after the agent revision');
+  });
+
+  it('does not attribute a WorkspaceEdit deletion at the active caret to keyboard input', async () => {
+    await fixture('agent-delete');
+    await caret(4);
+    await browser.executeWorkbench(async vscode => {
+      const editor = vscode.window.activeTextEditor;
+      const edit = new vscode.WorkspaceEdit();
+      edit.delete(editor.document.uri, new vscode.Range(0, 3, 0, 4));
+      await vscode.workspace.applyEdit(edit);
+    });
+    const result = await evidence('agent-delete');
+    assert.equal(result.changes.length, 1);
+    assert.equal(result.human.length, 0, 'agent deletion is not a physical keyboard receipt');
   });
 
   for (const key of ['Backspace', 'Delete', 'Enter', 'Tab']) {
@@ -117,7 +135,7 @@ describe('production edit attribution', () => {
         assert.equal(result.human.length, 1);
         assert.equal(result.human[0].event.signal, 'editor_input');
       } else if (key === 'Backspace' || key === 'Delete') {
-        assert.equal(result.human.length, 0, 'stable API leaves the ambiguous deletion unattributed');
+        assert.equal(result.human.length, 0, 'deleting existing text is ambiguous in the stable API');
       }
     });
   }

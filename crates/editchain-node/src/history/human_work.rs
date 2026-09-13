@@ -73,7 +73,7 @@ pub(crate) fn report(request: &OpenRequest) -> Result<Value, Box<dyn std::error:
         .flat_map(|event| {
             let changes = match event.event {
                 EditorEventKind::HumanEdit { change, .. } => vec![change],
-                EditorEventKind::HumanEditBatch { edits } => {
+                EditorEventKind::HumanEditBatch { edits, .. } => {
                     edits.into_iter().map(|edit| edit.change).collect()
                 }
                 EditorEventKind::WorkspaceContext { .. }

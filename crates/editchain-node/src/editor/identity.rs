@@ -2,7 +2,7 @@
 
 use editchain_core::{human::HumanIdentity, ActorId, Op, OpId, ScopeRef};
 use editchain_protocol::editor::EditorEvent;
-use editchain_store::{format::encode_op, BlobStore, CanonicalChain};
+use editchain_store::{format::encode_op, BlobStore, IndexedChain};
 use std::collections::BTreeMap;
 
 pub(super) fn actor(identity: &HumanIdentity) -> ActorId {
@@ -19,7 +19,7 @@ pub(super) fn scope(identity: &HumanIdentity) -> ScopeRef {
 /// Repair acknowledged payloads before bootstrapping their ordered derivations.
 pub(super) fn repair(
     events: &[EditorEvent],
-    chain: &CanonicalChain,
+    chain: &IndexedChain,
     blobs: &mut BlobStore,
 ) -> super::Result<()> {
     for event in events {
@@ -43,7 +43,7 @@ pub(super) fn repair(
 pub(super) fn validate_sequence(
     event: &EditorEvent,
     op: &Op,
-    chain: &CanonicalChain,
+    chain: &IndexedChain,
     staged: &BTreeMap<OpId, Op>,
 ) -> super::Result<()> {
     if event.sequence == 1 {

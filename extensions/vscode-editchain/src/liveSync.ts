@@ -24,6 +24,7 @@ export class LiveSync {
   private dirty = false;
   private failures = 0;
   private started = false;
+  private humanPending = false;
   private abort = new AbortController();
 
   constructor(private actions: LiveActions, private intervalMs = 1500) {}
@@ -35,6 +36,12 @@ export class LiveSync {
     if (!this.running) void this.run();
   }
 
+  /** Durable editor activity must not wait for a provider's retry timer. */
+  humanChanged(): void {
+    this.humanPending = true;
+    this.wake();
+  }
+
   dispose(): void {
     this.abort.abort();
     if (this.timer) clearTimeout(this.timer);
@@ -44,6 +51,11 @@ export class LiveSync {
     this.running = true;
     this.dirty = false;
     try {
+      if (this.humanPending) {
+        this.humanPending = false;
+        try { await this.actions.publish(); }
+        catch (error) { this.humanPending = true; throw error; }
+      }
       if (!this.started) {
         this.started = true;
         this.actions.status('Scanning Codex sessions…');
@@ -83,7 +95,7 @@ export class LiveSync {
         : captured.sessions.size ? 'Live · Codex + Git' : 'Live · waiting for Codex sessions');
     } catch (error) {
       if (!this.abort.signal.aborted) {
-        this.failures++;
+        this.failures = String(error).includes('operation would block') ? 0 : this.failures + 1;
         this.actions.status(`Live retry: ${String(error)}`);
       }
     } finally {

@@ -16,20 +16,20 @@ use editchain_store::BlobStore;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Normalizer {
     sessions: BTreeMap<String, Session>,
     streams: BTreeMap<HumanIdentity, Stream>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Stream {
     source: Option<OpId>,
     work: Option<OpId>,
     linked_context: Option<HumanGitContext>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct Session {
     sequence: u64,
     dwell: u64,
@@ -45,20 +45,27 @@ struct Session {
     changes: BTreeMap<u64, Change>,
     confirmed: BTreeSet<u64>,
     edit_boundary: u64,
+    #[serde(default)]
+    group_boundary: u64,
+    #[serde(default)]
+    saved: BTreeMap<String, u64>,
     last_change: Option<u64>,
+    edit_group: Option<(u64, Change, u64)>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Change {
     path: Option<String>,
     before: HumanRevision,
     after: HumanRevision,
     context: ObservedContext,
     boundary: u64,
+    #[serde(default)]
+    group_boundary: u64,
     previous: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct ObservedContext {
     git: Option<HumanGitContext>,
     time_ms: Option<u64>,
@@ -118,6 +125,10 @@ impl Normalizer {
                 session: event.session.clone(),
                 identity: event.identity.clone(),
                 turn: session.turn,
+                edit_group: session.group(event, kind).map(|group| OpId {
+                    seq: group,
+                    ..source
+                }),
                 source_event: source,
                 kind,
                 path,
@@ -199,6 +210,14 @@ impl Session {
                 | EditorEventKind::CodeExposure { .. }
         ) {
             self.edit_boundary = event.sequence;
+            if let EditorEventKind::DocumentSaved { document } = &event.event {
+                let _previous = self.saved.insert(document.id.clone(), event.sequence);
+            } else if !matches!(
+                event.event,
+                EditorEventKind::CodeRead { group: Some(_), .. }
+            ) {
+                self.group_boundary = event.sequence;
+            }
         }
         match &event.event {
             EditorEventKind::TrackingStarted {
@@ -241,17 +260,22 @@ impl Session {
                     .unwrap_or(old);
                 let after = revision(document, document.version, after, Some(source), blobs)?;
                 drop(self.revisions.insert(document.id.clone(), after.clone()));
-                drop(self.changes.insert(
-                    event.sequence,
-                    Change {
-                        path: document.path.clone(),
-                        before,
-                        after,
-                        context: self.context(document.path.as_deref()),
-                        boundary: self.edit_boundary,
-                        previous: self.last_change,
-                    },
-                ));
+                drop(
+                    self.changes.insert(
+                        event.sequence,
+                        Change {
+                            path: document.path.clone(),
+                            before,
+                            after,
+                            context: self.context(document.path.as_deref()),
+                            boundary: self.edit_boundary,
+                            group_boundary: self
+                                .group_boundary
+                                .max(self.saved.get(&document.id).copied().unwrap_or(0)),
+                            previous: self.last_change,
+                        },
+                    ),
+                );
                 self.last_change = Some(event.sequence);
             }
             EditorEventKind::HumanEdit { change, .. } => {
@@ -271,7 +295,9 @@ impl Session {
                 };
                 return Ok(Some(Work::edit(change)));
             }
-            EditorEventKind::HumanEditBatch { edits } => return Ok(Some(self.edit_batch(edits))),
+            EditorEventKind::HumanEditBatch { edits, group } => {
+                return Ok(Some(self.edit_batch(edits, *group)))
+            }
             EditorEventKind::CodeExposure {
                 document,
                 duration_ms,
@@ -344,7 +370,15 @@ impl Session {
             | EditorEventKind::EditorClosed { path, uri, .. } => {
                 // Older sessions retain byte-identical parents and episode IDs.
                 // New sessions explicitly include tab lifecycle in their series.
-                if !self.lifecycle_activity {
+                if !self.lifecycle_activity
+                    || matches!(
+                        event.event,
+                        EditorEventKind::EditorOpened {
+                            restored: Some(true),
+                            ..
+                        }
+                    )
+                {
                     return Ok(None);
                 }
                 return Ok(Some(Work {

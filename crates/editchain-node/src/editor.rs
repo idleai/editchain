@@ -23,113 +23,94 @@ use editchain_store::{
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-#[derive(Debug, Default)]
-pub(crate) struct EditorStore {
-    projections: BTreeMap<PathBuf, projection::Projection>,
+pub(crate) fn record(request: &RecordEditorEvents) -> Result<serde_json::Value> {
+    editchain_index::boundary(|| record_inner(request))?
 }
 
-impl EditorStore {
-    pub(crate) fn record(&mut self, request: &RecordEditorEvents) -> Result<serde_json::Value> {
-        let result = self.record_inner(request);
-        if result.is_err() {
-            let root = PathBuf::from(&request.workspace_path).join(&request.chain_dir);
-            drop(self.projections.remove(&root));
-        }
-        result
-    }
-
-    fn record_inner(&mut self, request: &RecordEditorEvents) -> Result<serde_json::Value> {
-        let root = PathBuf::from(&request.workspace_path).join(&request.chain_dir);
-        // Serialize with live imports. Re-read the tail *after* taking the lock.
-        let mut store = SegmentStore::open(&root)?;
-        if !self.projections.contains_key(&root) {
-            drop(
-                self.projections
-                    .insert(root.clone(), projection::Projection::open(&root)?),
-            );
-        }
-        let projection = self
-            .projections
-            .get_mut(&root)
-            .ok_or("editor projection unavailable")?;
-        projection.refresh()?;
-        let mut blobs = BlobStore::new(root.join("blobs"))?;
-        identity::repair(&request.events, projection.tail.chain(), &mut blobs)?;
-        projection.synchronize(&mut store, &mut blobs, request)?;
-        let mut staged = editchain_core::OpSet::new();
-        let mut sources = BTreeMap::new();
-        let mut page = Page::new(0);
-        let mut accepted = 0_u64;
-        let mut replayed = 0_u64;
-        for event in &request.events {
-            let raw =
-                serde_json::to_vec(&serde_json::json!({"source":"vscode.editor", "event":event}))?;
-            let op = projection.source(event, &raw, &sources)?;
-            let encoded = encode_op(&op)?;
-            let admission = match projection.tail.chain().evidence().classify(op.id, &encoded) {
-                Admission::Accepted => staged.insert(op.id, encoded.clone()),
-                other @ (Admission::Duplicate | Admission::Conflict) => other,
-            };
-            match admission {
-                Admission::Duplicate => {
-                    // A retry can repair a missing payload. A corrupt existing
-                    // blob must fail visibly rather than receive a durable ack.
-                    blobs.write(&raw)?;
-                    replayed = replayed.saturating_add(1);
-                }
-                Admission::Conflict => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "editor identity reused with different content",
-                    )
-                    .into())
-                }
-                Admission::Accepted => {
-                    identity::validate_sequence(event, &op, projection.tail.chain(), &sources)?;
-                    projection.admitted(event, op.id);
-                    drop(sources.insert(op.id, op.clone()));
-                    blobs.write(&raw)?;
-                    // A live reader can stop at any complete record. Admit the
-                    // source classification first so a raw buffer observation
-                    // never temporarily becomes a primary activity row.
-                    let marker = normalize::observation(event, op.id);
-                    let marker_bytes = encode_op(&marker)?;
-                    let marker_admission = match projection
-                        .tail
-                        .chain()
-                        .evidence()
-                        .classify(marker.id, &marker_bytes)
-                    {
+fn record_inner(request: &RecordEditorEvents) -> Result<serde_json::Value> {
+    let root = PathBuf::from(&request.workspace_path).join(&request.chain_dir);
+    // Capture processes share a durable, incrementally paged index. Release
+    // its ownership after every batch so another editor window can record.
+    let checkpoint = editchain_index::Storage::open(&root.join("editor-v1"))?;
+    let mut projection = projection::Projection::open(&root, &checkpoint)?;
+    // Serialize with live imports. Re-read the tail *after* taking the lock.
+    // Cold indexing happens before this lock; contention never destroys it.
+    let mut store = SegmentStore::open(&root)?;
+    projection.refresh()?;
+    let mut blobs = BlobStore::new(root.join("blobs"))?;
+    identity::repair(&request.events, projection.tail.chain(), &mut blobs)?;
+    projection.synchronize(&mut store, &mut blobs, request)?;
+    let mut staged = editchain_core::OpSet::new();
+    let mut sources = BTreeMap::new();
+    let mut page = Page::new(0);
+    let mut accepted = 0_u64;
+    let mut replayed = 0_u64;
+    for event in &request.events {
+        let raw =
+            serde_json::to_vec(&serde_json::json!({"source":"vscode.editor", "event":event}))?;
+        let op = projection.source(event, &raw, &sources)?;
+        let encoded = encode_op(&op)?;
+        let admission = match projection.tail.chain().classify(op.id, &encoded)? {
+            Admission::Accepted => staged.insert(op.id, encoded.clone()),
+            other @ (Admission::Duplicate | Admission::Conflict) => other,
+        };
+        match admission {
+            Admission::Duplicate => {
+                // A retry can repair a missing payload. A corrupt existing
+                // blob must fail visibly rather than receive a durable ack.
+                blobs.write(&raw)?;
+                replayed = replayed.saturating_add(1);
+            }
+            Admission::Conflict => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "editor identity reused with different content",
+                )
+                .into())
+            }
+            Admission::Accepted => {
+                identity::validate_sequence(event, &op, projection.tail.chain(), &sources)?;
+                projection.admitted(event, op.id);
+                drop(sources.insert(op.id, op.clone()));
+                blobs.write(&raw)?;
+                // A live reader can stop at any complete record. Admit the
+                // source classification first so a raw buffer observation
+                // never temporarily becomes a primary activity row.
+                let marker = normalize::observation(event, op.id);
+                let marker_bytes = encode_op(&marker)?;
+                let marker_admission =
+                    match projection.tail.chain().classify(marker.id, &marker_bytes)? {
                         Admission::Accepted => staged.insert(marker.id, marker_bytes.clone()),
                         other @ (Admission::Duplicate | Admission::Conflict) => other,
                     };
-                    match marker_admission {
-                        Admission::Accepted => page.add_record(0, marker_bytes),
-                        Admission::Duplicate => {}
-                        Admission::Conflict => {
-                            return Err(
-                                "editor observation marker conflicts with retained evidence".into(),
-                            )
-                        }
+                match marker_admission {
+                    Admission::Accepted => page.add_record(0, marker_bytes),
+                    Admission::Duplicate => {}
+                    Admission::Conflict => {
+                        return Err(
+                            "editor observation marker conflicts with retained evidence".into()
+                        )
                     }
-                    page.add_record(0, encoded);
-                    accepted = accepted.saturating_add(1);
                 }
+                page.add_record(0, encoded);
+                accepted = accepted.saturating_add(1);
             }
         }
-        if accepted > 0 {
-            store.append_page(&page)?;
-        }
-        // Raw retries repair missing payloads before any derived replay reads them.
-        projection.synchronize(&mut store, &mut blobs, request)?;
-        // An acknowledgement is returned only after blob and segment fsync.
-        Ok(
-            serde_json::json!({"schema":1, "accepted":accepted, "replayed":replayed,
-            "ack":request.events.iter().map(|event| (&event.session, event.sequence)).collect::<Vec<_>>() }),
-        )
     }
+    if accepted > 0 {
+        store.append_page(&page)?;
+    }
+    // Raw retries repair missing payloads before any derived replay reads them.
+    projection.synchronize(&mut store, &mut blobs, request)?;
+    drop(store);
+    projection.checkpoint(&checkpoint)?;
+    // An acknowledgement is returned only after blob and segment fsync.
+    Ok(
+        serde_json::json!({"schema":1, "accepted":accepted, "replayed":replayed,
+            "work":{"bootstrap":projection.bootstrapped,"records_decoded":projection.records_decoded},
+            "ack":request.events.iter().map(|event| (&event.session, event.sequence)).collect::<Vec<_>>() }),
+    )
 }
-
 fn event_op(event: &EditorEvent, raw: &[u8]) -> io::Result<Op> {
     let digest = blake3::derive_key(
         "editchain.vscode.editor.session.v1",

@@ -54,11 +54,12 @@ row; click it to open the exact recorded before/after buffer diff, including
 unsaved changes. Static History keeps human fragments as connected graph rows.
 Raw capture details stay in Trace.
 
-Version 0.1.6 groups consecutive confirmed typing into one edit row with the
-first before-buffer and final after-buffer. A burst finishes after **1 second
-without input**, on save, editor/focus/context/lifecycle boundaries, or before
-an automatic or unconfirmed mutation. Undo and redo remain separate operations.
-Uninterrupted typing publishes at most every **30 seconds** (or 1024 changes).
+Version 0.1.7 publishes the first confirmed input immediately and updates the
+same live edit row at **100 ms** intervals while typing. Its diff runs from the
+first before-buffer to the latest after-buffer. Save finishes the edit; so do
+editor/focus/context/lifecycle boundaries, an automatic or unconfirmed mutation
+of that file, or a new input after **30 seconds** idle. Reads and changes to
+background files do not finish the active edit. Undo and redo remain separate.
 Each raw change and its input receipt are retained; coverage still measures
 individual changed AI-origin lines. Saving an already recorded edit adds no
 duplicate edit row. Older per-keystroke recordings remain unchanged.
@@ -96,10 +97,12 @@ and pauses exposure timers;
 opportunity to read, not proof of comprehension. Only the active visible editor
 qualifies; folding gaps and navigation jumps are never filled in.
 
-Opening or closing a text tab records lifecycle evidence, including separate
-identities for split tabs. Opening starts a local read timer only when that
-editor is active and visible. Closing ends its viewing interval; neither action
-alone marks code as read. Old exposure events remain supported for replay.
+Opening the first text tab for a file records one open; closing its last tab
+records one close. Split tabs share this file lifecycle. Tabs already open when
+the recorder starts are retained as restored inventory without another open
+activity. Opening starts a local read timer only when that editor is active and
+visible; neither opening nor closing alone marks code as read. Old exposure
+events remain supported for replay.
 
 Version 0.1.1 shows **Editor opened** and **Editor closed** in the same human
 graph series as reads and edits. Expand a human episode to see its individual
@@ -123,7 +126,9 @@ Delete, Tab, and other editor input directly, and retains explicit origins for
 programmatic, formatting, disk, and completion changes without counting them as
 human-written code. The ordinary package stays on stable APIs and has partial
 coverage: unspecified selection events cannot safely distinguish deletion from
-automatic changes. See [local setup and attribution rules](../../docs/vscode-human-work.md#optional-local-build-with-editor-origins).
+automatic changes. Corrections that remove only text already typed in the active
+human edit are retained as `typing_correction` indicators. Deletion of pre-existing
+code still requires stronger input evidence. See [local setup and attribution rules](../../docs/vscode-human-work.md#optional-local-build-with-editor-origins).
 The output channel reports the loaded extension version/path and the attribution
 mode observed on the first change.
 
@@ -151,8 +156,12 @@ still respected.
 Events remain local: a bounded outbox in VS Code workspace storage retries
 `RecordEditorEvents` until the service acknowledges durable chain writes.
 Failures appear in the tracking status item and EditChain History output.
-The outbox persists once per second and on orderly shutdown; a sudden host or
-machine failure can lose the not-yet-persisted tail. Outbox overflow pauses
+The outbox schedules persistence after **25 ms**, with a one-second recovery
+poll and a **50 ms** retry for writer contention. Acknowledged human work wakes
+History ahead of provider backlog processing. The native service retains an
+incremental `editor-v1` checkpoint across recorder processes, avoiding repeated
+full-history scans. A sudden host or machine failure can lose the not-yet-persisted
+tail. Outbox overflow pauses
 recording with a gap event. Raw snapshots include code contents and are retained
 in the append-only chain, so storage grows with editing activity.
 

@@ -13,7 +13,6 @@ use crate::history::{
 /// A stateful server that owns a loaded workspace across requests.
 #[derive(Debug)]
 pub struct Server {
-    editor: crate::editor::EditorStore,
     live: Option<crate::history::LiveWorkspace>,
     /// The currently loaded workspace (None until `Open`).
     pub workspace: Option<Workspace>,
@@ -28,7 +27,6 @@ impl Server {
     pub fn new() -> Self {
         Self {
             live: None,
-            editor: crate::editor::EditorStore::default(),
             workspace: None,
             lexical: None,
         }
@@ -102,7 +100,7 @@ impl Server {
         if let RequestBody::RecordEditorEvents(batch) = &request.body {
             return Ok(Response {
                 id,
-                body: ResponseBody::Ok(self.editor.record(batch)?),
+                body: ResponseBody::Ok(crate::editor::record(batch)?),
             });
         }
         if let RequestBody::GetHumanWork(open) = &request.body {
