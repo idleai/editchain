@@ -24,6 +24,7 @@ pub(super) struct Normalizer {
 struct Session {
     sequence: u64,
     dwell: u64,
+    lifecycle_activity: bool,
     previous: Option<OpId>,
     turn: u64,
     last_work_ms: u64,
@@ -142,7 +143,14 @@ impl Session {
         blobs: &mut BlobStore,
     ) -> Result<Option<Work>> {
         match &event.event {
-            EditorEventKind::TrackingStarted { dwell_ms, .. } => self.dwell = *dwell_ms,
+            EditorEventKind::TrackingStarted {
+                dwell_ms,
+                activity_schema,
+                ..
+            } => {
+                self.dwell = *dwell_ms;
+                self.lifecycle_activity = *activity_schema == Some(2);
+            }
             EditorEventKind::WorkspaceContext {
                 observed_ms,
                 repositories,
@@ -281,10 +289,28 @@ impl Session {
                 self.revisions.clear();
                 self.changes.clear();
             }
+            EditorEventKind::EditorOpened { path, uri, .. }
+            | EditorEventKind::EditorClosed { path, uri, .. } => {
+                // Older sessions retain byte-identical parents and episode IDs.
+                // New sessions explicitly include tab lifecycle in their series.
+                if !self.lifecycle_activity {
+                    return Ok(None);
+                }
+                return Ok(Some(Work {
+                    kind: if matches!(event.event, EditorEventKind::EditorOpened { .. }) {
+                        HumanWorkKind::EditorOpened
+                    } else {
+                        HumanWorkKind::EditorClosed
+                    },
+                    path: path.clone(),
+                    before: None,
+                    after: None,
+                    summary: path.as_ref().unwrap_or(uri).clone(),
+                    context: None,
+                }));
+            }
             EditorEventKind::DocumentRenamed { .. } => self.turn = 0,
             EditorEventKind::DocumentSaved { .. }
-            | EditorEventKind::EditorOpened { .. }
-            | EditorEventKind::EditorClosed { .. }
             | EditorEventKind::EditorActivated { .. }
             | EditorEventKind::SelectionChanged { .. }
             | EditorEventKind::VisibleRangesChanged { .. } => {}

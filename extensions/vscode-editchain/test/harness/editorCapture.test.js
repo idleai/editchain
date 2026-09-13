@@ -197,6 +197,9 @@ test('tab close records lifecycle, flushes a delayed qualified read, and does no
       const closed = env.events.find(event => event.event.type === 'editor_closed');
       assert.equal(closed.event.editor, opened.event.editor);
       assert.equal(closed.event.uri, opened.event.uri);
+      assert.equal(closed.event.path, 'a.ts');
+      assert.equal(opened.event.path, 'a.ts');
+      assert.equal(env.events[0].event.activity_schema, 2);
       assert.equal(env.reads().length, duration >= 2000 ? 1 : 0);
       if (env.reads().length) assert.ok(env.reads()[0].sequence < closed.sequence);
       env.tick(10000); env.capture.checkpoint();

@@ -88,6 +88,16 @@ identities for split tabs. Opening starts a local read timer only when that
 editor is active and visible. Closing ends its viewing interval; neither action
 alone marks code as read. Old exposure events remain supported for replay.
 
+Version 0.1.1 shows **Editor opened** and **Editor closed** in the same human
+graph series as reads and edits. Expand a human episode to see its individual
+activities. Historical brief-exposure rows are hidden from Activity; qualifying
+historical reads remain visible. Old source records and their identities are
+retained.
+
+Install the current VSIX and reload VS Code to activate an updated recorder.
+The native service selected by `editchain-history.servicePath` must be rebuilt
+from the same branch; updating only one component leaves an incompatible pair.
+
 Events remain local: a bounded outbox in VS Code workspace storage retries
 `RecordEditorEvents` until the service acknowledges durable chain writes.
 Failures appear in the tracking status item and EditChain History output.

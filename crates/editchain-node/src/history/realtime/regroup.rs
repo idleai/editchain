@@ -6,6 +6,29 @@ use super::{LiveWorkspace, Result};
 use editchain_protocol::rank::Measure;
 
 impl LiveWorkspace {
+    pub(super) fn refresh_human_visibility(&mut self) -> Result<()> {
+        self.poisoned = true;
+        let upserts = self
+            .inputs
+            .iter()
+            .filter(|(_, input)| {
+                input.operations.iter().any(|op| {
+                    editchain_project::human::work_record(op).is_some_and(|work| {
+                        work.kind == editchain_core::human::HumanWorkKind::Exposure
+                    })
+                })
+            })
+            .map(|(key, input)| (key.clone(), input.clone()))
+            .collect();
+        let (removed, blocks) = self.apply_blocks(editchain_project::live::LiveChanges {
+            upserts,
+            ..Default::default()
+        })?;
+        drop(self.connect(&removed, blocks)?);
+        self.regroup_disclosure();
+        Ok(())
+    }
+
     pub(super) fn regroup(&mut self) {
         self.poisoned = true;
         self.tasks.reset_paths();

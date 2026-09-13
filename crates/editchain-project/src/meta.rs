@@ -302,13 +302,27 @@ pub(crate) fn for_collapsed_import(
     if let Some(record) = crate::human::work_record(op) {
         use editchain_core::human::HumanWorkKind;
         return NodeMeta {
-            record_role: RecordRole::Action,
+            record_role: if matches!(
+                record.kind,
+                HumanWorkKind::EditorOpened | HumanWorkKind::EditorClosed
+            ) {
+                RecordRole::Lifecycle
+            } else {
+                RecordRole::Action
+            },
             activity_kind: match record.kind {
                 HumanWorkKind::Edit => ActivityKind::Change,
-                HumanWorkKind::Read | HumanWorkKind::Exposure => ActivityKind::Explore,
+                HumanWorkKind::Read
+                | HumanWorkKind::Exposure
+                | HumanWorkKind::EditorOpened
+                | HumanWorkKind::EditorClosed => ActivityKind::Explore,
                 HumanWorkKind::Gap => ActivityKind::Diagnose,
             },
-            visibility: Visibility::Primary,
+            visibility: if record.kind == HumanWorkKind::Exposure {
+                Visibility::Trace
+            } else {
+                Visibility::Primary
+            },
             outcome: if record.kind == HumanWorkKind::Gap {
                 Outcome::Warning
             } else {

@@ -90,7 +90,9 @@ impl LiveWorkspace {
         if !prepare
             && saved
                 .as_ref()
-                .is_some_and(|saved| saved.version < checkpoint::VERSION)
+                // Version 4 only needs a bounded human-row visibility upgrade.
+                // Older graph/disclosure migrations still require preparation.
+                .is_some_and(|saved| saved.version < 4)
         {
             return Err("history graph checkpoint needs preparation; run editchain prepare-view --workspace <workspace> --chain <chain>".into());
         }
@@ -144,6 +146,7 @@ impl LiveWorkspace {
             let repair = saved.version < 3;
             let disclosure = saved.version < 4;
             let regroup = saved.version == 1;
+            let human_visibility = saved.version < 5;
             workspace.adopt(saved, true)?;
             if regroup {
                 workspace.regroup();
@@ -153,6 +156,12 @@ impl LiveWorkspace {
             }
             if disclosure {
                 workspace.regroup_disclosure();
+            }
+            if human_visibility {
+                workspace.refresh_human_visibility()?;
+            }
+            if disclosure || human_visibility {
+                // Publish the new version only after every migration completed.
                 workspace.checkpoint()?;
             }
             workspace.expire_viewport()?;

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { Tab, TabGroup } from 'vscode';
+import type { Tab, TabGroup, TabInputText } from 'vscode';
 
 type WorkRow = { author: string; parents: string[]; node_key: string; is_subop: boolean;
   activity_kind: string; summary: string; timestamp_ms: number; kind: string; is_system: boolean;
@@ -22,6 +22,22 @@ async function report(): Promise<any> {
   const value = await browser.executeWorkbench(async vscode => vscode.commands.executeCommand('editchain-history.humanWork'));
   assert.ok(value, 'production coverage command returned a report');
   return value;
+}
+
+async function readRows(): Promise<WorkRow[]> {
+  return await browser.execute(() => Array.from(document.querySelectorAll('#rows .row[data-row]'))
+    .map(row => (window as any).__editchainRowAt?.(Number(row.getAttribute('data-row')))).filter(Boolean)) as unknown as WorkRow[];
+}
+
+async function toggleEpisode(task: string): Promise<void> {
+  await browser.waitUntil(async () => browser.execute(task => {
+    // Live arrivals can move the header; episode identity stays stable.
+    const element = Array.from(document.querySelectorAll<HTMLElement>('#rows .row[data-row]')).find(row =>
+      (window as any).__editchainRowAt?.(Number(row.dataset.row))?.task_group?.task_id === task);
+    const button = element?.querySelector<HTMLElement>('.task-chevron');
+    button?.click();
+    return !!button;
+  }, task), { timeout: 10000, timeoutMsg: `episode disclosure is not rendered: ${task}` });
 }
 
 async function typeSuffix(text: string): Promise<void> {
@@ -104,8 +120,6 @@ describe('production human-work capture', () => {
     const workbench = await browser.getWorkbench();
     const webview = await workbench.getWebviewByTitle('EditChain History');
     await webview.open();
-    const readRows = async (): Promise<WorkRow[]> => await browser.execute(() => Array.from(document.querySelectorAll('#rows .row[data-row]'))
-      .map(row => (window as any).__editchainRowAt?.(Number(row.getAttribute('data-row')))).filter(Boolean)) as unknown as WorkRow[];
     await browser.waitUntil(async () => (await readRows()).some(row => row.author === 'human'), { timeout: 30000, timeoutMsg: 'live history did not project human work' });
     fs.appendFileSync(path.join(output, 'graph-steps.log'), 'initial rows received\n');
     const initial = await readRows();
@@ -141,16 +155,6 @@ describe('production human-work capture', () => {
     assert.ok(rows.some(row => row.author === 'agent' || row.file_change?.source === 'agent'));
     assert.ok(rows.some(row => row.author === 'human' && row.activity_kind === 'explore'), 'revision-bound reading indicators are visible');
     fs.writeFileSync(path.join(output, 'human-graph-rows.json'), JSON.stringify(rows, null, 2));
-    const toggleEpisode = async (task: string) => {
-      await browser.waitUntil(async () => browser.execute(task => {
-        // Live arrivals can move the header to a newer fragment; episode identity stays stable.
-        const element = Array.from(document.querySelectorAll<HTMLElement>('#rows .row[data-row]')).find(row =>
-          (window as any).__editchainRowAt?.(Number(row.dataset.row))?.task_group?.task_id === task);
-        const button = element?.querySelector<HTMLElement>('.task-chevron');
-        button?.click();
-        return !!button;
-      }, task), { timeout: 10000, timeoutMsg: `episode disclosure is not rendered: ${task}` });
-    };
     for (const row of rows.filter(row => row.task_group?.expanded)) {
       const task = row.task_group!.task_id;
       await toggleEpisode(task);
@@ -202,5 +206,53 @@ describe('production human-work capture', () => {
     assert.ok(diff.after.length > diff.before.length, 'the real inserted text appears on the after side');
     fs.writeFileSync(path.join(output, 'human-native-diff.json'), JSON.stringify(diff, null, 2));
     await browser.saveScreenshot(path.join(output, 'human-native-diff.png'));
+  });
+
+  it('shows genuine tab open and close events in the connected graph without claiming human review', async () => {
+    const before = await report();
+    await browser.executeWorkbench(async vscode => {
+      const uri = vscode.Uri.joinPath(vscode.workspace.workspaceFolders[0].uri, 'lifecycle.ts');
+      await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode('export const lifecycle = true;\n'));
+      await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(uri), { preview: false });
+    });
+    await browser.waitUntil(async () => browser.executeWorkbench(vscode =>
+      vscode.window.tabGroups.all.some((group: TabGroup) => group.tabs.some((tab: Tab) =>
+        tab.input instanceof vscode.TabInputText && (tab.input as TabInputText).uri.path.endsWith('/lifecycle.ts')))), { timeout: 10000 });
+    const closed = await browser.executeWorkbench(async vscode => {
+      const tab = vscode.window.tabGroups.all.flatMap((group: TabGroup) => group.tabs).find((tab: Tab) =>
+        tab.input instanceof vscode.TabInputText && (tab.input as TabInputText).uri.path.endsWith('/lifecycle.ts'));
+      return await vscode.window.tabGroups.close(tab);
+    });
+    assert.equal(closed, true);
+    const after = await report();
+    assert.equal(after.human_changes, before.human_changes);
+    assert.equal(after.read_lines, before.read_lines);
+    assert.equal(after.edited_lines, before.edited_lines);
+    await browser.executeWorkbench(async vscode => vscode.commands.executeCommand('editchain-history.open'));
+    const webview = await (await browser.getWorkbench()).getWebviewByTitle('EditChain History');
+    await webview.open();
+    await browser.execute(() => { document.getElementById('rows')!.scrollTop = 0; });
+    await browser.waitUntil(async () => (await readRows()).some(row => row.kind === 'editor_closed' && row.summary.includes('lifecycle.ts')),
+      { timeout: 30000, timeoutMsg: 'closed editor never appeared in History' });
+    const header = (await readRows()).find(row => row.kind === 'editor_closed' && row.summary.includes('lifecycle.ts'));
+    if (header?.task_group && !header.task_group.expanded) await toggleEpisode(header.task_group.task_id);
+    await browser.waitUntil(async () => (await readRows()).some(row => row.kind === 'editor_opened' && row.summary.includes('lifecycle.ts')),
+      { timeout: 10000, timeoutMsg: 'opened editor was missing from its expanded human episode' });
+    const rows = await readRows();
+    const opened = rows.find(row => row.kind === 'editor_opened' && row.summary.includes('lifecycle.ts'))!;
+    const finished = rows.find(row => row.kind === 'editor_closed' && row.summary.includes('lifecycle.ts'))!;
+    assert.ok(finished.parents.includes(opened.node_key), 'close follows the matching open in the human series');
+    assert.ok(rows.every(row => row.kind !== 'exposure'));
+    fs.writeFileSync(path.join(output, 'editor-lifecycle-rows.json'), JSON.stringify(rows, null, 2));
+    await browser.execute(() => (window as any).__editchainRendererDebug.whenIdle(10000));
+    await browser.waitUntil(async () => browser.execute(() => {
+      const viewport = document.getElementById('rows')!.getBoundingClientRect();
+      const tops = Array.from(document.querySelectorAll('#rows .row[data-row]:not(.row-placeholder)'))
+        .map(row => row.getBoundingClientRect()).filter(rect => rect.bottom > viewport.top && rect.top < viewport.bottom)
+        .map(rect => rect.top).sort((a, b) => a - b);
+      return tops.length > 1 && tops.every((top, i) => i === 0 || top - tops[i - 1] >= 30);
+    }), { timeout: 10000, timeoutMsg: 'lifecycle rows overlapped after disclosure animation' });
+    await browser.saveScreenshot(path.join(output, 'editor-lifecycle-graph.png'));
+    await webview.close();
   });
 });

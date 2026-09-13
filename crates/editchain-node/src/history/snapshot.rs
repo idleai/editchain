@@ -164,7 +164,7 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 3;
 /// of row timestamps and observed-time duplicate pairing.
 /// Revision 57 folds exact Codex user-message echoes by logical incarnation
 /// and complete source payload identity, including bounded display previews.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 57;
+const SNAPSHOT_PROJECTION_REVISION: u32 = 58;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

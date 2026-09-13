@@ -27,7 +27,7 @@ export class EditorCapture {
 
   constructor(private readonly folder: vscode.WorkspaceFolder, private readonly dwell: number,
     private readonly maxFileBytes: number, private readonly emit: (event: EditorEvent) => boolean) {
-    this.record({ type: 'tracking_started', dwell_ms: dwell, vscode_version: vscode.version });
+    this.record({ type: 'tracking_started', dwell_ms: dwell, vscode_version: vscode.version, activity_schema: 2 });
     this.subscriptions.push(
       vscode.workspace.onDidOpenTextDocument(document => { this.baseline(document); }),
       vscode.workspace.onDidCloseTextDocument(document => {
@@ -157,7 +157,7 @@ export class EditorCapture {
     if (!(tab.input instanceof vscode.TabInputText)) return;
     const uri = tab.input.uri;
     if (this.relative(uri) === null && !(uri.scheme === 'untitled' && this.folder.index === 0)) return;
-    this.record({ type, editor: this.identity(tab), uri: uri.toString() });
+    this.record({ type, editor: this.identity(tab), uri: uri.toString(), path: this.relative(uri) });
   }
 
   private viewport(): void {

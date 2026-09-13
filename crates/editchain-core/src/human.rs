@@ -31,6 +31,10 @@ pub struct HumanRevision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HumanWorkKind {
+    /// A text tab opened, without implying reading or editing.
+    EditorOpened,
+    /// A text tab closed, without implying reading or editing.
+    EditorClosed,
     /// An edit with a retained keyboard/undo/redo indicator.
     Edit,
     /// Continuous visibility qualifying under the recorded dwell policy.

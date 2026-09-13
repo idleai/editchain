@@ -15,7 +15,7 @@ of loading a document. Split tabs have separate identities.
 
 | Stored event | Meaning |
 | --- | --- |
-| `tracking_started` | Recorder incarnation, VS Code version, dwell policy. |
+| `tracking_started` | Recorder incarnation, VS Code version, dwell policy, activity derivation contract. |
 | `workspace_context` | Observed workspace location and worktree-qualified Git HEADs; this is not a working-tree snapshot. |
 | `tracking_stopped` | Orderly shutdown. |
 | `tracking_gap` | Skipped buffer, missing baseline, or capacity pause. |
@@ -24,7 +24,7 @@ of loading a document. Split tabs have separate identities.
 | `human_edit` | Reference to a change with keyboard-selection, undo, or redo evidence. |
 | `document_saved` | Saved buffer revision. |
 | `document_renamed` | Explicit file/directory rename within the workspace. |
-| `editor_opened` / `editor_closed` | Text tab lifecycle, including preview tabs. |
+| `editor_opened` / `editor_closed` | Text tab lifecycle, tab ID, URI, and captured relative path, including preview tabs. |
 | `editor_activated` | Active tracked document, or no tracked active editor. |
 | `code_read` | One qualified interval: exact revision, disjoint visible ranges, start time, and monotonic duration at qualification. |
 
@@ -53,8 +53,10 @@ Activation of a visible editor starts its local timer. Closing a tab stores
 `editor_closed` with the same tab identity; removing the viewed editor ends its
 interval and flushes a qualified read if its timer was delayed. A close before
 the threshold produces no read. Closing one split does not close the shared
-document or end another split's active interval. Open/close records remain raw
-lifecycle evidence and do not produce human-work graph nodes by themselves.
+document or end another split's active interval. New recorder sessions also
+produce **Editor opened** and **Editor closed** graph rows in the same connected
+human series as reads and edits. These lifecycle rows never contribute read or
+edit coverage and do not claim a buffer modification.
 Orderly recorder shutdown flushes a pending qualified read and records
 `tracking_stopped`; it does not manufacture tab closes. Abrupt process exits can
 leave lifecycle intervals incomplete.
@@ -154,11 +156,25 @@ This implementation does not build a global workspace-state DAG or guarantee
 replay of every external mutation. Historical context can outlive the worktree
 or commit objects needed to render its Git node.
 
-New capture contributes graph activity only for qualified reads, confirmed
-human edits, and gaps. For compatibility, legacy exposure records still produce
-their original activity at 250 ms and become reading indicators at the recorded
-dwell threshold. Existing history is not rewritten. Episode folding does not
-assert that a person completed a task or understood a file.
+New capture contributes graph activity for editor opens/closes, qualified
+reads, confirmed human edits, and gaps. Legacy brief-exposure work is retained
+as Trace evidence and omitted from the Activity graph. Legacy exposure that
+qualified as a read remains visible as a reading indicator.
+
+Version 0.1.1 recorders declare `activity_schema: 2` at session start. That
+contract includes tab lifecycle in the work series and episode boundaries.
+Older sessions keep their original normalization, including their immutable
+parents and episode IDs; their raw open/close records remain evidence rather
+than being inserted retroactively into existing chains. Restarting capture
+creates a new session and observes currently open tabs under the new contract.
+Episode folding does not assert that a person completed a task or understood a
+file.
+
+Static snapshots use projection revision 58. Retained live checkpoint version 5
+upgrades version-4 caches when opened: cached brief-exposure rows are removed,
+ancestry and task disclosure are reconnected, and other rows are retained.
+This does not rewrite canonical evidence or replay the complete source history.
+Earlier graph/disclosure checkpoint migrations still use explicit prepare-view.
 
 When a recorder next submits a batch, the service backfills older canonical raw
 captures and appends only missing derivations. It repairs replayed source payloads
@@ -207,8 +223,9 @@ Each source event creates a raw import plus an observation annotation. A read
 also creates one semantic work record (three chain records total), with a Git
 link when its context first needs anchoring. A typical keyboard change creates
 two source events plus a work record, FileOp, and path annotation (seven chain
-records). Startup, editor lifecycle, saves, and context changes add their own
-records. Ten minutes on one unchanged view produce one read, plus lifecycle
+records). Each new editor open/close also creates three records: a source,
+annotation, and lifecycle activity, plus a Git link when needed. Startup, saves,
+and context changes add their own records. Ten minutes on one unchanged view produce one read, plus lifecycle
 overhead; typing still produces exact versioned change evidence.
 
 The metric is line based. It neither proves comprehension nor measures the
@@ -246,7 +263,10 @@ through WebDriver, checks unsaved and saved coverage, navigates briefly to a
 distant viewport, and pauses/resumes recording. The original four capture
 scenarios passed on both releases. A fifth scenario exercises the live graph,
 episode folding, updates while the panel is open, and the native human diff. The
-complete five-scenario suite passed on 1.137.0 with the reduced event stream. The
+complete six-scenario suite passed on 1.137.0 with the reduced event stream and
+visible tab lifecycle. The sixth scenario opens and closes a real text tab,
+checks unchanged coverage and connected graph rows, and waits for layout to
+settle before saving its screenshot. The
 sample measured 39 reading-indicated lines and one edited line; the brief
 distant jump added no reading or exposure coverage, with zero capture gaps. Exact viewport
 counts vary with layout. Synthetic chains and reports are in ignored
@@ -276,20 +296,26 @@ byte-identical legacy replay. Native service tests check exact read revisions,
 recorded dwell policies, lifecycle records without inferred work, and the number
 of canonical records created by a read.
 
-Validation on 2026-09-12: 15 focused editor service tests passed; all 79 extension
+Validation on 2026-09-12: 17 focused editor service tests and the version-4 cache
+upgrade regression passed; all 79 extension
 harness tests passed; extension compilation and capture-test type checks passed;
-the production WASM renderer built; all five real VS Code scenarios passed;
+the production WASM renderer built; all six real VS Code scenarios passed;
 `./scripts/lint.sh` exited 0 with **`RESULT: PASS`**. The lint command completed
 format, check, clippy, workspace tests, doc tests, and dependency checks without
 policy changes or new suppressions.
 
-Validation logs and actual VS Code screenshots for the reduced event stream are
-retained under `outputs/vscode-capture/human-reads/`. Build and test the current checkout
+Validation logs and actual VS Code screenshots for visible editor lifecycle are
+retained under `outputs/vscode-capture/editor-lifecycle/`. Build and test the current checkout
 with the commands above; the native service and extension renderer must come
 from the same build.
 
 After updating this branch, rebuild the native service as well as the extension:
-the new `code_read` payload requires a service that recognizes it. A process
+the new `code_read` payload and activity contract require a service that recognizes them. A process
 already running an older binary must be restarted before the new extension
 sends reads. Set `editchain-history.servicePath` to the matching build when the
 open workspace is a different checkout.
+
+The installed extension must be version 0.1.1 or later for lifecycle graph rows.
+Installing a VSIX updates disk files; reload the VS Code window to replace an
+already-running older recorder and its service clients. Historical brief
+exposure records remain retained even after new capture stops producing them.

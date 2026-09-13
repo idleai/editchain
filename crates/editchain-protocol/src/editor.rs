@@ -86,6 +86,9 @@ pub enum EditorEventKind {
         dwell_ms: u64,
         /// VS Code version.
         vscode_version: String,
+        /// Activity derivation contract; absent retains the original work series.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity_schema: Option<u32>,
     },
     /// Normal recorder shutdown.
     TrackingStopped,
@@ -141,6 +144,9 @@ pub enum EditorEventKind {
         editor: String,
         /// Document URI.
         uri: String,
+        /// Captured workspace-relative path; absent for legacy/untitled tabs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
     },
     /// A text tab closed.
     EditorClosed {
@@ -148,6 +154,9 @@ pub enum EditorEventKind {
         editor: String,
         /// Document URI.
         uri: String,
+        /// Captured workspace-relative path; absent for legacy/untitled tabs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
     },
     /// The active text editor changed.
     EditorActivated {
@@ -262,9 +271,16 @@ impl EditorEvent {
                     return Err("invalid recorded Git context");
                 }
             }
-            EditorEventKind::TrackingStarted { dwell_ms, .. } => {
+            EditorEventKind::TrackingStarted {
+                dwell_ms,
+                activity_schema,
+                ..
+            } => {
                 if !(500..=30000).contains(dwell_ms) {
                     return Err("invalid reading dwell threshold");
+                }
+                if activity_schema.is_some_and(|schema| schema != 2) {
+                    return Err("unsupported editor activity schema");
                 }
             }
             EditorEventKind::DocumentChanged {
@@ -361,19 +377,24 @@ impl EditorEvent {
             | EditorEventKind::EditorOpened { .. }
             | EditorEventKind::EditorClosed { .. } => None,
         };
-        if document.is_some_and(|document| {
-            document.id.is_empty()
-                || document.id.len() > 256
-                || document.path.as_ref().is_some_and(|path| {
-                    let parsed = std::path::Path::new(path);
-                    path.is_empty()
-                        || path.len() > 4096
-                        || parsed.is_absolute()
-                        || parsed
-                            .components()
-                            .any(|part| part == std::path::Component::ParentDir)
-                })
-        }) {
+        let path = if let EditorEventKind::EditorOpened { path, .. }
+        | EditorEventKind::EditorClosed { path, .. } = &self.event
+        {
+            path.as_ref()
+        } else {
+            document.and_then(|document| document.path.as_ref())
+        };
+        if document.is_some_and(|document| document.id.is_empty() || document.id.len() > 256)
+            || path.is_some_and(|path| {
+                let parsed = std::path::Path::new(path);
+                path.is_empty()
+                    || path.len() > 4096
+                    || parsed.is_absolute()
+                    || parsed
+                        .components()
+                        .any(|part| part == std::path::Component::ParentDir)
+            })
+        {
             return Err("invalid editor document identity or workspace-relative path");
         }
         Ok(())

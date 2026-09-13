@@ -20,6 +20,9 @@ mod lifecycle;
 #[path = "reads.rs"]
 mod reads;
 
+#[path = "tabs.rs"]
+mod tabs;
+
 fn git(root: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)

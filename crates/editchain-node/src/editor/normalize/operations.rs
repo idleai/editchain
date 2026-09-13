@@ -59,7 +59,15 @@ pub(super) fn work(
             raw_ref: Payload::Inline(serde_json::to_vec(record)?),
             raw_hash: None,
         }),
-        Tags::IMPORT | Tags::INFERRED,
+        Tags::IMPORT
+            | if matches!(
+                record.kind,
+                HumanWorkKind::EditorOpened | HumanWorkKind::EditorClosed
+            ) {
+                Tags::NONE
+            } else {
+                Tags::INFERRED
+            },
     );
     let source = anchor.id;
     let mut ops = vec![anchor];
