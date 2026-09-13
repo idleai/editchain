@@ -147,6 +147,7 @@ impl LiveWorkspace {
             let disclosure = saved.version < 4;
             let regroup = saved.version == 1;
             let human_visibility = saved.version < 5;
+            let human_rows = saved.version < 6;
             workspace.adopt(saved, true)?;
             if regroup {
                 workspace.regroup();
@@ -157,10 +158,10 @@ impl LiveWorkspace {
             if disclosure {
                 workspace.regroup_disclosure();
             }
-            if human_visibility {
-                workspace.refresh_human_visibility()?;
+            if human_rows {
+                workspace.refresh_human_rows(human_visibility)?;
             }
-            if disclosure || human_visibility {
+            if disclosure || human_rows {
                 // Publish the new version only after every migration completed.
                 workspace.checkpoint()?;
             }

@@ -6,7 +6,7 @@ import type { Tab, TabGroup, TabInputText } from 'vscode';
 type WorkRow = { author: string; parents: string[]; node_key: string; is_subop: boolean;
   group: string;
   activity_kind: string; summary: string; timestamp_ms: number; kind: string; is_system: boolean;
-  sub_ops?: { kind: string }[]; file_change?: { source: string };
+  sub_ops?: { kind: string }[]; file_change?: { source: string; path: string; op_id: string };
   task_group?: { task_id: string; expanded: boolean; member_count: number } };
 
 const output = path.resolve('trace', `work-${process.env.EDITCHAIN_CAPTURE_VSCODE || '1.137.0'}`);
@@ -28,6 +28,19 @@ async function report(): Promise<any> {
 async function readRows(): Promise<WorkRow[]> {
   return await browser.execute(() => Array.from(document.querySelectorAll('#rows .row[data-row]'))
     .map(row => (window as any).__editchainRowAt?.(Number(row.getAttribute('data-row')))).filter(Boolean)) as unknown as WorkRow[];
+}
+
+async function waitForGraph(keys: string[]): Promise<void> {
+  await browser.waitUntil(async () => browser.execute(keys => keys.every(key => {
+    const row = Array.from(document.querySelectorAll<HTMLElement>('#rows .row[data-row]')).find(element =>
+      (window as any).__editchainRowAt?.(Number(element.dataset.row))?.node_key === key);
+    const cell = row?.querySelector('.graph-cell');
+    const dot = cell?.querySelector('circle[data-graph-key]');
+    if (!cell || !dot || getComputedStyle(dot).opacity !== '1') return false;
+    const bounds = dot.getBoundingClientRect(), frame = cell.getBoundingClientRect();
+    return bounds.width > 0 && bounds.left >= frame.left && bounds.right <= frame.right
+      && Array.from(cell.querySelectorAll('[data-graph-key]')).every(part => part.getAnimations().every(animation => animation.playState === 'finished'));
+  }), keys), { timeout: 10000, timeoutMsg: 'human graph did not finish drawing' });
 }
 
 async function toggleEpisode(task: string): Promise<void> {
@@ -180,24 +193,47 @@ describe('production human-work capture', () => {
         .filter(row => row.getClientRects().length).map(row => row.getBoundingClientRect().top).sort((a, b) => a - b);
       return rows.length >= 4 && rows.every((top, i) => i === 0 || top - rows[i - 1] < 120);
     }), { timeout: 10000, timeoutMsg: 'folded human episodes left blank space between graph rows' });
+    await browser.waitUntil(async () => (await readRows()).some(row => row.parents.some(parent => parent.startsWith('git:'))),
+      { timeout: 10000, timeoutMsg: 'folding did not restore hydrated Git connections' }).catch(async error => {
+      fs.writeFileSync(path.join(output, 'human-folded-failed.json'), JSON.stringify(await readRows(), null, 2));
+      throw error;
+    });
+    const overview = await readRows();
+    await waitForGraph(overview.filter(row => !row.is_subop).map(row => row.node_key));
     await browser.saveScreenshot(path.join(output, 'human-edits-graph.png'));
     await browser.$('body').saveScreenshot(path.join(output, 'human-edits-graph-webview.png'));
-    const overview = await readRows();
     assert.ok(overview.some(row => row.parents.some(parent => parent.startsWith('git:'))), 'folding preserves visible Git connections');
     const episode = overview.find(row => row.author === 'human' && (row.task_group?.member_count ?? 0) > 1);
     assert.ok(episode, 'human work uses native episode disclosure');
     const task = episode.task_group!.task_id;
-    await toggleEpisode(task);
+    // Clicking a folded edit's summary opens its episode, not one hidden diff.
+    await browser.execute(task => {
+      const row = Array.from(document.querySelectorAll<HTMLElement>('#rows .row[data-row]')).find(element =>
+        (window as any).__editchainRowAt?.(Number(element.dataset.row))?.task_group?.task_id === task);
+      if (!row || row.classList.contains('row-file')) throw new Error('folded episode must present its summary');
+      row.click();
+    }, task);
     await browser.waitUntil(async () => (await readRows()).find(row => row.task_group?.task_id === task)?.task_group?.expanded === true, { timeout: 10000 });
-    const editKey = await browser.waitUntil(async () => browser.execute(() => {
-      const row = Array.from(document.querySelectorAll<HTMLElement>('#rows .row[data-row]')).find(element => {
-        const wire = (window as any).__editchainRowAt?.(Number(element.dataset.row));
-        return element.querySelector('.subop-chevron') && wire?.author === 'human' && wire?.sub_ops?.some((op: any) => op.kind === 'file');
-      });
-      return row?.dataset.key;
-    }), { timeout: 10000, timeoutMsg: 'expanded human episode did not expose an edit disclosure' });
-    await browser.execute(key => document.querySelector<HTMLElement>(`.row[data-key="${key}"] .subop-chevron`)?.click(), editKey);
     await browser.$('.row-file[data-file-source="human"]').waitForExist({ timeout: 10000 });
+    let edits: WorkRow[] = [];
+    await browser.waitUntil(async () => {
+      edits = (await readRows()).filter(row => row.file_change?.source === 'human');
+      return edits.length > 0;
+    }, { timeout: 10000, timeoutMsg: 'expanded episode did not hydrate direct human file rows' });
+    assert.ok(edits.length > 0, 'opening the episode directly exposes file rows');
+    for (const edit of edits) {
+      assert.equal(edit.is_subop, false, 'the edit keeps its physical graph row');
+      assert.equal(edit.author, 'human');
+      assert.equal(edit.file_change!.path, 'ai.ts');
+      assert.deepEqual(edit.sub_ops, [], 'no per-edit file fold');
+    }
+    assert.equal(new Set(edits.map(row => row.file_change!.op_id)).size, edits.length, 'one row per actual edit');
+    const compact = await browser.execute(() => Array.from(document.querySelectorAll('.row-file[data-file-source="human"]')).every(row =>
+      !row.querySelector('.subop-chevron') && row.querySelector('.file-name')?.textContent === 'ai.ts'));
+    assert.ok(compact, 'each visible edit shows its file name without an extra disclosure');
+    fs.writeFileSync(path.join(output, 'human-compact-rows.json'), JSON.stringify(edits, null, 2));
+    await browser.execute(() => (window as any).__editchainRendererDebug.whenIdle(10000));
+    await waitForGraph(edits.slice(0, 3).map(row => row.node_key));
     await browser.saveScreenshot(path.join(output, 'human-edits-detail.png'));
     await browser.$('.row-file[data-file-source="human"]').click();
     await webview.close();
@@ -336,16 +372,7 @@ describe('production human-work capture', () => {
     assert.equal(cursor?.node_key, previous.node_key, 'new recording continues the prior human work path');
     assert.ok(rows.every(row => row.kind !== 'exposure'));
     await browser.execute(() => (window as any).__editchainRendererDebug.whenIdle(10000));
-    await browser.waitUntil(async () => browser.execute(keys => keys.every(key => {
-      const row = Array.from(document.querySelectorAll<HTMLElement>('#rows .row[data-row]')).find(element =>
-        (window as any).__editchainRowAt?.(Number(element.dataset.row))?.node_key === key);
-      const cell = row?.querySelector('.graph-cell');
-      const dot = cell?.querySelector('circle[data-graph-key]');
-      if (!cell || !dot || getComputedStyle(dot).opacity !== '1') return false;
-      const bounds = dot.getBoundingClientRect(), frame = cell.getBoundingClientRect();
-      return bounds.width > 0 && bounds.left >= frame.left && bounds.right <= frame.right
-        && Array.from(cell.querySelectorAll('[data-graph-key]')).every(part => part.getAnimations().every(animation => animation.playState === 'finished'));
-    }), [next!.node_key, previous.node_key]), { timeout: 10000, timeoutMsg: 'human continuation graph did not finish drawing' });
+    await waitForGraph([next!.node_key, previous.node_key]);
     await browser.saveScreenshot(path.join(output, 'human-identity-reload.png'));
     await webview.close();
   });

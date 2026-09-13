@@ -258,6 +258,9 @@ impl ShellData {
     /// Post the exact advertised file-change identity for host-side native
     /// diff materialization. Returns whether this row is a file row.
     fn open_diff_for_abs(&self, abs: i64, step: &mut Step) -> bool {
+        if self.state.is_task_summary(abs) {
+            return false;
+        }
         let Some(row) = self.state.cache.get_by_index(abs) else {
             return false;
         };

@@ -109,7 +109,8 @@ fn tabs_reads_and_edits_share_a_connected_human_series_beside_agent_work() {
     for mode in ["Open", "OpenLive", "OpenLivePaged"] {
         let mut history = Server::new();
         let response = live_request(&mut history, json!({mode:open}));
-        let mut rows = window(&mut history, &response["snapshot_id"]);
+        let mut snapshot = response["snapshot_id"].clone();
+        let mut rows = window(&mut history, &snapshot);
         if mode == "OpenLivePaged" {
             let header = rows
                 .iter()
@@ -121,12 +122,13 @@ fn tabs_reads_and_edits_share_a_connected_human_series_beside_agent_work() {
                     "snapshot_id":response["snapshot_id"],"key":header["continuity_key"],"task":true
                 }}),
             );
-            let snapshot = &update["deltas"]
+            snapshot = update["deltas"]
                 .as_array()
                 .expect("deltas")
                 .last()
-                .expect("disclosure delta")["snapshot_id"];
-            rows = window(&mut history, snapshot);
+                .expect("disclosure delta")["snapshot_id"]
+                .clone();
+            rows = window(&mut history, &snapshot);
         }
         for (index, (op, work)) in human.iter().enumerate() {
             let row = rows
@@ -153,6 +155,27 @@ fn tabs_reads_and_edits_share_a_connected_human_series_beside_agent_work() {
                 assert_eq!(row["parents"], json!([key]));
             }
             let expected = serde_json::to_value(work.kind).expect("kind");
+            if work.kind == HumanWorkKind::Edit {
+                assert_eq!(row["file_change"]["source"], "human", "{mode}");
+                assert_eq!(row["file_change"]["path"], "ai.txt", "{mode}");
+                assert_eq!(row["is_subop"], false, "{mode}");
+                assert_eq!(row["sub_ops"], json!([]), "{mode}");
+                assert_eq!(
+                    rows.iter()
+                        .filter(|row| row["file_change"]["source"] == "human")
+                        .count(),
+                    1,
+                    "{mode}: no duplicate child"
+                );
+                let diff = live_request(
+                    &mut history,
+                    json!({"GetFileDiff":{
+                        "snapshot_id":snapshot, "change":row["file_change"]
+                    }}),
+                );
+                assert_eq!(diff["before"], "base\nAI\n");
+                assert_eq!(diff["after"], "base\nhuman\n");
+            }
             if matches!(
                 work.kind,
                 HumanWorkKind::EditorOpened | HumanWorkKind::EditorClosed
@@ -162,9 +185,18 @@ fn tabs_reads_and_edits_share_a_connected_human_series_beside_agent_work() {
                 assert_eq!(row["summary"], "ai.txt");
             }
         }
-        assert!(rows
+        let agent_row = rows
             .iter()
-            .any(|row| row["node_key"] == agent_id.to_string()));
+            .find(|row| row["node_key"] == agent_id.to_string())
+            .expect("agent row");
+        assert!(
+            agent_row["file_change"].is_null(),
+            "{mode}: agent disclosure is unchanged"
+        );
+        assert!(!agent_row["sub_ops"]
+            .as_array()
+            .expect("agent details")
+            .is_empty());
         assert!(rows.iter().all(|row| row["kind"] != "exposure"));
     }
     assert_eq!(live_request(&mut Server::new(), request)["replayed"], 10);

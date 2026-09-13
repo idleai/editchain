@@ -6,6 +6,7 @@ use editchain_protocol::{
 };
 use std::cmp::Reverse;
 
+mod human_edits;
 mod human_visibility;
 
 fn request(root: &std::path::Path) -> OpenRequest {

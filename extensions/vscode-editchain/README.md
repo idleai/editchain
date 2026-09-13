@@ -49,9 +49,10 @@ writes to its own configured chain. Untitled buffers belong to the first folder.
 
 History shows human work as a connected series alongside agent work, anchored
 to independently recorded Git context. Live episodes have the same disclosure
-controls as agent tasks. Expand an edit's file row to open its exact recorded
-before/after buffer diff, including unsaved changes. Static History keeps human
-fragments as connected graph rows. Raw capture details stay in Trace.
+controls as agent tasks. Each human edit shows its file directly on one graph
+row; click it to open the exact recorded before/after buffer diff, including
+unsaved changes. Static History keeps human fragments as connected graph rows.
+Raw capture details stay in Trace.
 
 Git context is sampled every 15 seconds and recorded when it changes. Its saved
 workspace location and HEAD are used during replay; today's HEAD cannot rewrite
@@ -97,6 +98,12 @@ retained.
 Install the current VSIX and reload VS Code to activate an updated recorder.
 The native service selected by `editchain-history.servicePath` must be rebuilt
 from the same branch; updating only one component leaves an incompatible pair.
+
+Version 0.1.3 removes the extra file disclosure from each human edit. The file
+name and status appear directly on its connected graph row; one click opens
+the retained diff. Episode folding still summarizes the full human episode.
+The native service upgrades human edit rows from the 0.1.2 live cache without
+rewriting recordings or resetting explicit episode disclosure choices.
 
 Version 0.1.2 keeps one unsigned human identity GUID in the extension's local
 profile storage. A reload starts a new capture session, while its reads, edits,
@@ -164,7 +171,8 @@ Set `editchain-history.live.enabled` to `false` to open static history by defaul
   starts folded, and scrolling back alone does not reopen it. Prefetched rows
   do not count as viewed. Explicit opens and closes persist across scrolling,
   new records and restarts. The activity-count
-  button toggles the task path; each item's file/output chevron remains separate.
+  button toggles the task path. Human edits show the file on the activity row;
+  agent file/output details retain their own chevron.
   Forks, merges, Git attachments and unresolved/error activity remain visible.
   Concurrent tasks retain chronological order without repeated header rows.
   Ordinary updates edit individual items and affected anchors, without resending

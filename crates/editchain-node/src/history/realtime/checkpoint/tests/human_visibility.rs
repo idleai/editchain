@@ -94,7 +94,10 @@ fn version_four_opens_with_cached_exposure_removed_and_other_rows_retained() {
         .rows
         .iter()
         .all(|row| row.kind != "exposure"));
-    assert_eq!(load(&resumed.checkpoint_store).unwrap().unwrap().version, 5);
+    assert_eq!(
+        load(&resumed.checkpoint_store).unwrap().unwrap().version,
+        VERSION
+    );
     drop(resumed);
     let mut reopened = LiveWorkspace::open_paged(&request(root.path())).unwrap();
     assert!(reopened.reused_checkpoint);

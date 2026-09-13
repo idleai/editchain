@@ -244,7 +244,7 @@ impl Workspace {
                     work_unit: Some(work_unit_dto(&entry.annotation().work_unit)),
                     promoted: entry.annotation().promoted,
                     activity_bundle: node_activity_bundle(node),
-                    file_change: None,
+                    file_change: human_edit_file(node, &self.agent_file_changes).cloned(),
                 });
             }
             // Emit the fixed depth-first descendant rows immediately after the
@@ -610,16 +610,37 @@ impl ActivityPresentation for ServicePresentation<'_> {
                 ActivityKind::Change | ActivityKind::Verify
             ),
             activity_bundle: node_activity_bundle(member),
-            file_change: None,
+            file_change: human_edit_file(member, self.agent_changes).cloned(),
         }
     }
 
     fn details(&self, node: &editchain_project::HistoryNode) -> Vec<ExpandedChildRow> {
         let mut rows = flat_op_child_rows(node);
-        let changes = node_file_changes(node, self.agent_changes, self.git_changes);
-        rows.extend(file_change_rows(&changes, node));
+        if human_edit_file(node, self.agent_changes).is_none() {
+            let changes = node_file_changes(node, self.agent_changes, self.git_changes);
+            rows.extend(file_change_rows(&changes, node));
+        }
         rows
     }
+}
+
+/// A human edit already owns a graph row. Present its single file there while
+/// retaining the work anchor's ancestry and the `FileOp`'s exact diff identity.
+fn human_edit_file<'a>(
+    node: &editchain_project::HistoryNode,
+    changes: &'a HashMap<OpId, Vec<FileChangeDto>>,
+) -> Option<&'a FileChangeDto> {
+    if !matches!(
+        node,
+        editchain_project::HistoryNode::EditOperation { .. }
+            | editchain_project::HistoryNode::CollapsedImport { .. }
+    ) {
+        return None;
+    }
+    let [change] = changes.get(&node.op_id()?)?.as_slice() else {
+        return None;
+    };
+    (change.source == editchain_protocol::FileChangeSource::Human).then_some(change)
 }
 
 impl ExpandedChildRow {

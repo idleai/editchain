@@ -68,6 +68,7 @@ pub(super) fn presentation<'a>(
     folded.bundle_kind = Some(BundleKind::WorkGroup);
     folded.bundle_count = Some(task.member_count);
     folded.display_summary = title(task);
+    folded.source.file_change = None;
     Cow::Owned(folded)
 }
 

@@ -296,6 +296,15 @@ fn human_and_agent_series_share_git_but_keep_exact_intermediate_edits() {
         .filter(|row| row["file_change"]["source"] == "human")
         .collect();
     assert_eq!(files.len(), 2);
+    for row in &files {
+        assert_eq!(row["author"], "human");
+        assert_eq!(row["is_subop"], false, "edits are physical graph rows");
+        assert_eq!(row["sub_ops"], json!([]), "no redundant file disclosure");
+        assert_ne!(
+            row["op_id"], row["file_change"]["op_id"],
+            "diff retains its FileOp identity"
+        );
+    }
     // A click can retain the displayed revision while another writer advances
     // the live view. Reject that revision without poisoning subsequent reads.
     let stale = history

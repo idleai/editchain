@@ -53,7 +53,7 @@ impl FileRowStatus {
     }
 }
 
-/// Column-aligned SCM content for one expandable Git, agent, or human edit child.
+/// Column-aligned SCM content for a file change, including a human graph row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileContent {
     pub(crate) path: String,

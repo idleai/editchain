@@ -2522,6 +2522,65 @@ fn file_rows_match_native_scm_content_and_open_diff_contract() {
 }
 
 #[test]
+fn human_file_activity_is_directly_clickable_and_episode_folding_restores_the_summary() {
+    let change = with(
+        file_row().get("file_change").unwrap(),
+        &[("source", json!("human")), ("partial", json!(false))],
+    );
+    let task = json!({"task_id":"human:episode", "thread_id":"capture", "turn_id":"turn",
+        "status":"unknown", "title":"Human work · lib.rs", "member_count":3,
+        "anchor":"human-work", "expanded":true, "summarized":false});
+    let row = with(
+        &file_row(),
+        &[
+            ("is_subop", json!(false)),
+            ("parent_row", Value::Null),
+            ("hierarchy_depth", json!(0)),
+            ("author", json!("human")),
+            ("record_role", json!("action")),
+            ("node_key", json!("human-work")),
+            ("op_id", json!("human-work")),
+            ("file_change", change.clone()),
+            ("task_group", task.clone()),
+        ],
+    );
+    let open = RowSpec::from_value(&row, &context(4, false));
+    assert!(!open.graph.is_subop);
+    assert!(open.flags.human);
+    assert!(open.disclosure.is_none(), "no extra fold on the edit");
+    assert!(open.content.file.is_some());
+    assert!(render_content_html(&open).contains("file-name"));
+    assert!(open.aria.aria_label.contains("human edit"));
+    assert_eq!(
+        open.open_diff.as_ref().unwrap().get("change"),
+        Some(&change)
+    );
+    assert_ne!(row.get("op_id"), change.get("op_id"));
+    let folded_task = with(
+        &task,
+        &[("expanded", json!(false)), ("summarized", json!(true))],
+    );
+    let folded_row = with(&row, &[("task_group", folded_task)]);
+    let folded = RowSpec::from_value(&folded_row, &context(4, false));
+    assert_eq!(open.identity, folded.identity);
+    assert!(folded.task_disclosure.as_ref().unwrap().folded);
+    assert!(folded.content.file.is_none());
+    assert!(
+        folded.open_diff.is_none(),
+        "a task summary must not open one edit's diff"
+    );
+    assert!(render_content_html(&folded).contains("Human work"));
+    // A fresh arrival in a collapsed path still presents its actual file.
+    let fresh_row = with(
+        &row,
+        &[("task_group", with(&task, &[("expanded", json!(false))]))],
+    );
+    let fresh = RowSpec::from_value(&fresh_row, &context(4, false));
+    assert_eq!(open.content.file, fresh.content.file);
+    assert_eq!(open.open_diff, fresh.open_diff);
+}
+
+#[test]
 fn open_json_envelopes_are_exact_and_eligibility_is_strict() {
     let git = git_row();
     let spec = RowSpec::from_value(&git, &context(1, false));
