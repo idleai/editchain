@@ -1,5 +1,6 @@
 //! Deterministic source-order replay; no filesystem state is read here.
 
+mod edits;
 mod operations;
 pub(super) use operations::observation;
 
@@ -43,6 +44,8 @@ struct Session {
     revisions: BTreeMap<String, HumanRevision>,
     changes: BTreeMap<u64, Change>,
     confirmed: BTreeSet<u64>,
+    edit_boundary: u64,
+    last_change: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,9 +54,11 @@ struct Change {
     before: HumanRevision,
     after: HumanRevision,
     context: ObservedContext,
+    boundary: u64,
+    previous: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ObservedContext {
     git: Option<HumanGitContext>,
     time_ms: Option<u64>,
@@ -181,6 +186,20 @@ impl Session {
         source: OpId,
         blobs: &mut BlobStore,
     ) -> Result<Option<Work>> {
+        if matches!(
+            event.event,
+            EditorEventKind::WorkspaceContext { .. }
+                | EditorEventKind::TrackingGap { .. }
+                | EditorEventKind::TrackingStopped
+                | EditorEventKind::DocumentSaved { .. }
+                | EditorEventKind::DocumentRenamed { .. }
+                | EditorEventKind::EditorOpened { .. }
+                | EditorEventKind::EditorClosed { .. }
+                | EditorEventKind::CodeRead { .. }
+                | EditorEventKind::CodeExposure { .. }
+        ) {
+            self.edit_boundary = event.sequence;
+        }
         match &event.event {
             EditorEventKind::TrackingStarted {
                 dwell_ms,
@@ -229,8 +248,11 @@ impl Session {
                         before,
                         after,
                         context: self.context(document.path.as_deref()),
+                        boundary: self.edit_boundary,
+                        previous: self.last_change,
                     },
                 ));
+                self.last_change = Some(event.sequence);
             }
             EditorEventKind::HumanEdit { change, .. } => {
                 if !self.confirmed.insert(*change) {
@@ -247,19 +269,9 @@ impl Session {
                         context: None,
                     }));
                 };
-                let summary = format!(
-                    "Human edit · {}",
-                    change.path.as_deref().unwrap_or("Untitled buffer")
-                );
-                return Ok(Some(Work {
-                    kind: HumanWorkKind::Edit,
-                    path: change.path,
-                    before: Some(change.before),
-                    after: Some(change.after),
-                    summary,
-                    context: Some(change.context),
-                }));
+                return Ok(Some(Work::edit(change)));
             }
+            EditorEventKind::HumanEditBatch { edits } => return Ok(Some(self.edit_batch(edits))),
             EditorEventKind::CodeExposure {
                 document,
                 duration_ms,

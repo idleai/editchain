@@ -174,7 +174,10 @@ fn event_op(event: &EditorEvent, raw: &[u8]) -> io::Result<Op> {
             .map_or(ScopeRef::None, identity::scope),
         tags: Tags::IMPORT
             | Tags::HUMAN
-            | if matches!(event.event, EditorEventKind::HumanEdit { .. }) {
+            | if matches!(
+                event.event,
+                EditorEventKind::HumanEdit { .. } | EditorEventKind::HumanEditBatch { .. }
+            ) {
                 Tags::INFERRED
             } else {
                 Tags::NONE

@@ -10,6 +10,24 @@ const event = sequence => ({ schema: 1, session: '11111111-1111-4111-8111-111111
   sequence, time_ms: 1234, event: { type: sequence === 1 ? 'tracking_started' : 'tracking_stopped' } });
 const ack = request => ({ Ok: { schema: 1, ack: request.RecordEditorEvents.events.map(event => [event.session, event.sequence]) } });
 
+test('a save arriving during acknowledgement is included in the requested flush', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'editchain-outbox-'));
+  const delivered = [];
+  const saved = { ...event(2), event: { type: 'document_saved', document: { id: 'buffer', version: 2 } } };
+  const outbox = new EditorOutbox(directory, '/workspace', '.editchain', async request => {
+    const events = request.RecordEditorEvents.events;
+    delivered.push(...events);
+    if (events.some(item => item.sequence === 1)) outbox.push(saved);
+    return ack(request);
+  }, () => {});
+  try {
+    outbox.push(event(1));
+    assert.equal(await outbox.flush(), true, 'in-flight save must not produce a false pending/error report');
+    assert.deepEqual(delivered.map(item => item.sequence), [1, 2]);
+    assert.deepEqual(await fs.readdir(directory), []);
+  } finally { await outbox.stop(); await fs.rm(directory, { recursive: true, force: true }); }
+});
+
 test('outbox preserves failed batches across recreation and verifies exact acknowledgement', async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'editchain-outbox-'));
   let outbox;

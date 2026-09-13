@@ -109,6 +109,16 @@ impl EditorChangeOrigin {
     }
 }
 
+/// An individual input receipt retained within a typing burst.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditorEditAttribution {
+    /// Earlier document-change sequence in this recorder incarnation.
+    pub change: u64,
+    /// Input evidence supporting this individual change.
+    pub signal: String,
+}
+
 /// Stable editor observations and explicit human-work indicators.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -129,6 +139,9 @@ pub enum EditorEventKind {
         dwell_ms: u64,
         /// VS Code version.
         vscode_version: String,
+        /// Loaded recorder package version, absent in older recordings.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extension_version: Option<String>,
         /// Activity derivation contract; absent retains the original work series.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         activity_schema: Option<u32>,
@@ -171,6 +184,11 @@ pub enum EditorEventKind {
         change: u64,
         /// Observable basis, not a verified author identity.
         signal: String,
+    },
+    /// One bounded typing burst, preserving each constituent input receipt.
+    HumanEditBatch {
+        /// Strict source order, without gaps in buffer revision continuity.
+        edits: Vec<EditorEditAttribution>,
     },
     /// Saved revision. An edit does not imply a save.
     DocumentSaved {
@@ -341,6 +359,7 @@ impl EditorEvent {
             EditorEventKind::TrackingStarted {
                 dwell_ms,
                 activity_schema,
+                extension_version,
                 ..
             } => {
                 if !(500..=30000).contains(dwell_ms) {
@@ -350,6 +369,12 @@ impl EditorEvent {
                     || (*activity_schema == Some(3)) != self.identity.is_some()
                 {
                     return Err("unsupported editor activity schema");
+                }
+                if extension_version
+                    .as_ref()
+                    .is_some_and(|version| version.is_empty() || version.len() > 64)
+                {
+                    return Err("invalid recorder extension version");
                 }
             }
             EditorEventKind::DocumentChanged {
@@ -403,6 +428,25 @@ impl EditorEvent {
                     return Err("unknown human edit signal");
                 }
             }
+            EditorEventKind::HumanEditBatch { edits } => {
+                if edits.is_empty() || edits.len() > 1024 {
+                    return Err("human edit batch must contain 1..1024 changes");
+                }
+                let mut previous = 0;
+                for edit in edits {
+                    if edit.change <= previous || edit.change >= self.sequence {
+                        return Err(
+                            "human edit batch must reference earlier changes in source order",
+                        );
+                    }
+                    if !matches!(edit.signal.as_str(), "editor_input" | "keyboard_selection") {
+                        return Err(
+                            "human edit batch requires input signals; undo/redo remain separate",
+                        );
+                    }
+                    previous = edit.change;
+                }
+            }
             EditorEventKind::SelectionChanged { ranges, .. }
             | EditorEventKind::VisibleRangesChanged { ranges, .. }
             | EditorEventKind::CodeExposure { ranges, .. }
@@ -449,6 +493,7 @@ impl EditorEvent {
             | EditorEventKind::TrackingStopped
             | EditorEventKind::TrackingGap { .. }
             | EditorEventKind::HumanEdit { .. }
+            | EditorEventKind::HumanEditBatch { .. }
             | EditorEventKind::DocumentRenamed { .. }
             | EditorEventKind::EditorOpened { .. }
             | EditorEventKind::EditorClosed { .. } => None,

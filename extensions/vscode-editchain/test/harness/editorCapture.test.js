@@ -23,6 +23,7 @@ function harness(dwell = 2000, identity) {
   const editor = { document, visibleRanges: [range(0, 1), range(3, 5)] };
   const vscode = {
     version: '1.85.0',
+    extensions: { getExtension: () => ({ packageJSON: { version: '0.1.6' } }) },
     TextDocumentChangeReason: { Undo: 1, Redo: 2 }, TextEditorSelectionChangeKind: { Keyboard: 1 },
     TabInputText: class { constructor(uri) { this.uri = uri; } },
     workspace: {
@@ -41,6 +42,7 @@ function harness(dwell = 2000, identity) {
   const original = Module._load;
   const filename = require.resolve('../../out/editorCapture');
   delete require.cache[filename];
+  delete require.cache[require.resolve('../../out/editorEdits')];
   Module._load = function(name, ...args) {
     if (name === 'vscode') return vscode;
     if (name === 'node:perf_hooks') return { performance: { now: () => now } };
@@ -66,6 +68,94 @@ function harness(dwell = 2000, identity) {
     elapse: ms => { now += ms; }, reads: () => events.filter(event => event.event.type === 'code_read') };
 }
 
+function type(env, text, explicit = false) {
+  const offset = env.document.text.indexOf('\n');
+  env.document.text = env.document.text.slice(0, offset) + text + env.document.text.slice(offset);
+  env.document.version++;
+  env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: offset, rangeLength: 0, text }],
+    ...(explicit ? { detailedReason: { source: 'cursor', metadata: { kind: 'type' } } } : {}) });
+  env.signals.selection({ textEditor: env.editor, kind: 1, selections: [env.selection(offset + text.length)] });
+}
+
+const editEvents = env => env.events.filter(event => ['human_edit', 'human_edit_batch'].includes(event.event.type));
+
+test('a typing burst produces one edit with every raw revision, then one read without a heartbeat', () => {
+  for (const explicit of [false, true]) {
+    const env = harness();
+    try {
+      for (const char of 'humanwork') {
+        type(env, char, explicit); env.signals.active(env.editor); env.tick(100);
+      }
+      assert.equal(editEvents(env).length, 0, 'burst remains open until idle or a boundary');
+      env.tick(899); assert.equal(editEvents(env).length, 0);
+      env.tick(1);
+      const changes = env.events.filter(event => event.event.type === 'document_changed');
+      assert.equal(changes.length, 9);
+      const edits = editEvents(env);
+      assert.equal(edits.length, 1);
+      assert.deepEqual(edits[0].event.edits, changes.map(event => ({ change: event.sequence, signal: explicit ? 'editor_input' : 'keyboard_selection' })));
+      env.signals.save(env.document);
+      env.tick(600000); env.capture.checkpoint();
+      assert.equal(editEvents(env).length, 1, 'save and elapsed time do not duplicate the edit');
+      assert.equal(env.reads().length, 1);
+      assert.equal(env.timers.size, 0);
+    } finally { env.capture.dispose(); }
+  }
+});
+
+test('an automatic or unconfirmed mutation splits typing bursts without gaining human attribution', () => {
+  for (const explicit of [false, true]) {
+    const env = harness();
+    try {
+      type(env, 'a', explicit); env.tick(100); type(env, 'b', explicit);
+      const offset = env.document.text.length;
+      env.document.text += 'AGENT\n'; env.document.version++;
+      env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: offset, rangeLength: 0, text: 'AGENT\n' }],
+        ...(explicit ? { detailedReason: { source: 'unknown' } } : {}) });
+      env.signals.selection({ textEditor: env.editor, kind: undefined, selections: [env.selection(5)] });
+      type(env, 'c', explicit); env.tick(100); type(env, 'd', explicit);
+      env.signals.save(env.document);
+      const changes = env.events.filter(event => event.event.type === 'document_changed');
+      const edits = editEvents(env);
+      assert.equal(edits.length, 2);
+      assert.deepEqual(edits.map(event => event.event.edits.map(edit => edit.change)),
+        [[changes[0].sequence, changes[1].sequence], [changes[3].sequence, changes[4].sequence]]);
+    } finally { env.capture.dispose(); }
+  }
+});
+
+test('save, focus, editor, context, capture gaps and shutdown finalize pending typing', () => {
+  for (const boundary of ['save', 'focus', 'editor', 'context', 'gap', 'shutdown']) {
+    const env = harness();
+    try {
+      type(env, 'a'); env.tick(100); type(env, 'b');
+      if (boundary === 'save') env.signals.save(env.document);
+      if (boundary === 'focus') { env.vscode.window.state.focused = false; env.signals.focus(); }
+      if (boundary === 'editor') env.signals.active(undefined);
+      if (boundary === 'context') env.capture.context({ observed_ms: 100, repositories: [] });
+      if (boundary === 'gap') {
+        env.document.text = 'x'.repeat(262145); env.document.version++;
+        env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: 0, rangeLength: 26, text: env.document.text }] });
+      }
+      if (boundary === 'shutdown') env.capture.dispose();
+      assert.equal(editEvents(env).length, 1, boundary);
+      assert.equal(editEvents(env)[0].event.edits.length, 2);
+      env.tick(60000); assert.equal(editEvents(env).length, 1, 'no timer duplicates the completed burst');
+    } finally { env.capture.dispose(); }
+  }
+});
+
+test('uninterrupted typing has a bounded thirty-second publication delay', () => {
+  const env = harness();
+  try {
+    for (let index = 0; index < 60; index++) { type(env, 'x'); env.tick(500); }
+    assert.equal(editEvents(env).length, 1);
+    assert.equal(editEvents(env)[0].event.edits.length, 60);
+    type(env, 'y'); env.tick(1000);
+    assert.equal(editEvents(env).length, 2);
+  } finally { env.capture.dispose(); }
+});
+
 test('fresh capture sessions retain the same unsigned identity on every event', () => {
   const identity = { kind: 'unsigned', guid: '99999999-9999-4999-8999-999999999999', stream: 'a'.repeat(24) };
   const first = harness(2000, identity);
@@ -76,6 +166,7 @@ test('fresh capture sessions retain the same unsigned identity on every event', 
   for (const events of [first.events, second.events]) {
     assert.equal(events[0].sequence, 1);
     assert.equal(events[0].event.activity_schema, 3);
+    assert.equal(events[0].event.extension_version, '0.1.6');
     assert.ok(events.every(event => JSON.stringify(event.identity) === JSON.stringify(identity)));
     assert.ok(events.some(event => event.event.type === 'code_read'));
   }
@@ -157,7 +248,7 @@ test('rapid interleaved automatic and keyboard changes attribute only the matchi
 });
 
 test('unrelated navigation and interruptions cannot claim an earlier programmatic change', () => {
-  for (const boundary of ['unknown selection', 'command selection', 'wrong caret', 'range selection', 'save', 'focus', 'activation', 'split']) {
+  for (const boundary of ['unknown selection', 'command selection', 'wrong caret', 'range selection', 'save', 'focus', 'activation', 'split', 'context']) {
     const env = harness();
     try {
       env.document.text = 'agent'; env.document.version++;
@@ -172,6 +263,7 @@ test('unrelated navigation and interruptions cannot claim an earlier programmati
         env.vscode.window.state.focused = false; env.signals.focus(); env.vscode.window.state.focused = true;
       }
       if (boundary === 'activation') env.signals.active(undefined);
+      if (boundary === 'context') env.capture.context({ observed_ms: 0, repositories: [] });
       if (boundary === 'split') env.signals.selection({ ...matching, textEditor: { ...env.editor } });
       env.signals.selection(matching);
       assert.equal(env.events.filter(event => event.event.type === 'human_edit').length, 0, boundary);
@@ -190,6 +282,7 @@ test('multi-cursor keyboard edits use the resulting UTF-16 caret positions', () 
     ] });
     env.signals.active(env.editor); env.signals.focus();
     env.signals.selection({ textEditor: env.editor, kind: 1, selections: [env.selection(4), env.selection(6)] });
+    env.tick(1000);
     assert.equal(env.events.filter(event => event.event.type === 'human_edit').length, 1);
   } finally { env.capture.dispose(); }
 });
@@ -204,6 +297,7 @@ test('explicit editor input attributes the exact change without a selection or s
       const changed = env.events.find(event => event.event.type === 'document_changed');
       assert.equal(changed.event.origin.source, 'cursor');
       assert.equal(changed.event.origin.kind, kind);
+      env.tick(1000);
       const human = env.events.filter(event => event.event.type === 'human_edit');
       assert.deepEqual(human.map(event => event.event), [{ type: 'human_edit', change: changed.sequence, signal: 'editor_input' }]);
       env.signals.selection({ textEditor: env.editor, kind: 1, selections: [env.selection(0)] });

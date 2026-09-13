@@ -15,13 +15,14 @@ of loading a document. Split tabs have separate identities.
 
 | Stored event | Meaning |
 | --- | --- |
-| `tracking_started` | Recorder incarnation, VS Code version, dwell policy, activity derivation contract. |
+| `tracking_started` | Recorder incarnation, VS Code version, loaded `extension_version` (since 0.1.6), dwell policy, activity derivation contract. |
 | `workspace_context` | Observed workspace location and worktree-qualified Git HEADs; this is not a working-tree snapshot. |
 | `tracking_stopped` | Orderly shutdown. |
 | `tracking_gap` | Skipped buffer, missing baseline, or capacity pause. |
 | `document_snapshot` | Exact initial/recovered text, including unsaved text. |
 | `document_changed` | Before/after revisions and raw replacements in emitted order. |
 | `human_edit` | Reference to a change with explicit editor-input, keyboard-selection, undo, or redo evidence. |
+| `human_edit_batch` | One contiguous typing burst: ordered change references and an input signal for every constituent revision. |
 | `document_saved` | Saved buffer revision. |
 | `document_renamed` | Explicit file/directory rename within the workspace. |
 | `editor_opened` / `editor_closed` | Text tab lifecycle, tab ID, URI, and captured relative path, including preview tabs. |
@@ -72,7 +73,7 @@ document and retain exact changes before saving:
 
 - With the optional `textDocumentChangeReason` API enabled, `cursor` origins
   with typing, paste, cut, composition, or editor-command kinds emit
-  `human_edit` immediately with signal `editor_input`. Backspace, Delete, Tab,
+  an input receipt with signal `editor_input`. Backspace, Delete, Tab,
   and selected-text deletion qualify even without a keyboard selection event.
   `document_changed.origin` retains bounded source, kind, detailed source,
   mechanism name, and provider extension fields when reported. Known non-input
@@ -93,6 +94,28 @@ completion acceptance are observations with no automatic human attribution.
 The coverage report includes `unattributed_changes`, the count of observed
 mutations without a human indicator. This includes both automated changes and
 uncertain changes; it is not an additional AI-origin count.
+
+Since 0.1.6, confirmed input is grouped until **1000 ms of inactivity**, save,
+active-editor/focus/lifecycle/context boundaries, a qualified read, or an
+automatic/unconfirmed mutation. Undo and redo are separate immediate edits.
+The recorder also finalizes after **30000 ms of uninterrupted typing** or
+**1024 changes**, bounding publication latency and pending receipts. One-change
+bursts use `human_edit`; longer bursts use `human_edit_batch`. A coverage query
+and orderly shutdown flush the current burst. Raw `document_changed` evidence
+is queued immediately; the graph receives one edit with the first before-buffer
+and last after-buffer. This is independent of transport batch sizes.
+
+The native derivation requires every intervening change, exact document and
+revision continuity, and unchanged recorded context/boundaries. Discontinuous
+or missing burst references produce a visible gap, never a composite human
+diff. Coverage accepts receipts only from successfully derived edits and still
+replays each constituent change, so grouping cannot swallow an agent revision
+or erase work that was edited and then reverted within a burst. Existing raw
+and derived records retain their original bytes and per-keystroke rows.
+
+An abrupt process exit can lose the pending burst's attribution receipts (up to
+the bounds above); any already persisted raw changes remain unattributed.
+Ordinary reload/shutdown flushes both the burst and the durable outbox.
 
 Stable VS Code reports the same unspecified selection kind for Backspace and
 some programmatic edits; widening that filter alone would misattribute work.
@@ -397,7 +420,7 @@ exposure records remain retained even after new capture stops producing them.
 
 `npm run package` keeps the extension on stable APIs. After compiling, run
 `npm run package:editor-origins` to produce
-`outputs/editchain-history-0.1.5-editor-origins.vsix` from an isolated staging
+`outputs/editchain-history-0.1.6-editor-origins.vsix` from an isolated staging
 directory. Its manifest declares only `textDocumentChangeReason`; packaging
 does not change the ordinary manifest or enable APIs in an existing VS Code.
 The native service must also be rebuilt to accept retained origin metadata.

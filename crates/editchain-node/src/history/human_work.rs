@@ -57,18 +57,44 @@ pub(crate) fn report(request: &OpenRequest) -> Result<Value, Box<dyn std::error:
         .filter(|op| op.tags.matches_all(Tags::IMPORT | Tags::HUMAN))
         .collect();
     operations.sort_by_key(|op| (op.observed_unix_ms(), op.id));
+    let accepted: BTreeSet<_> = operations
+        .iter()
+        .filter_map(|op| editchain_project::human::work_record(op))
+        .filter(|work| work.kind == editchain_core::human::HumanWorkKind::Edit)
+        .map(|work| work.source_event)
+        .collect();
     // Read the small indicator lane first, then hydrate one observation at a
     // time. A long typing session must not retain every full buffer in RAM.
     let human: BTreeSet<_> = operations
         .iter()
         .filter(|op| op.tags.matches_any(Tags::INFERRED))
+        .filter(|op| accepted.contains(&op.id))
         .filter_map(|op| editor_event(&workspace, op))
-        .filter_map(|event| {
-            if let EditorEventKind::HumanEdit { change, .. } = event.event {
-                Some((event.session, change))
-            } else {
-                None
-            }
+        .flat_map(|event| {
+            let changes = match event.event {
+                EditorEventKind::HumanEdit { change, .. } => vec![change],
+                EditorEventKind::HumanEditBatch { edits } => {
+                    edits.into_iter().map(|edit| edit.change).collect()
+                }
+                EditorEventKind::WorkspaceContext { .. }
+                | EditorEventKind::TrackingStarted { .. }
+                | EditorEventKind::TrackingStopped
+                | EditorEventKind::TrackingGap { .. }
+                | EditorEventKind::DocumentSnapshot { .. }
+                | EditorEventKind::DocumentChanged { .. }
+                | EditorEventKind::DocumentSaved { .. }
+                | EditorEventKind::DocumentRenamed { .. }
+                | EditorEventKind::EditorOpened { .. }
+                | EditorEventKind::EditorClosed { .. }
+                | EditorEventKind::EditorActivated { .. }
+                | EditorEventKind::SelectionChanged { .. }
+                | EditorEventKind::VisibleRangesChanged { .. }
+                | EditorEventKind::CodeExposure { .. }
+                | EditorEventKind::CodeRead { .. } => Vec::new(),
+            };
+            changes
+                .into_iter()
+                .map(move |change| (event.session.clone(), change))
         })
         .collect();
     let mut count = 0_usize;
@@ -343,6 +369,7 @@ impl Measurement {
             }
             EditorEventKind::WorkspaceContext { .. }
             | EditorEventKind::HumanEdit { .. }
+            | EditorEventKind::HumanEditBatch { .. }
             | EditorEventKind::DocumentSaved { .. }
             | EditorEventKind::EditorOpened { .. }
             | EditorEventKind::EditorClosed { .. }

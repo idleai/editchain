@@ -67,7 +67,9 @@ export class EditorOutbox {
       }).finally(() => { this.running = undefined; });
     }
     await this.running;
-    if (!this.error && (await fs.readdir(this.directory)).some(name => name.endsWith('.json'))) return this.flush();
+    // Save/selection callbacks can enqueue more evidence while an ack is in flight.
+    // Complete that tail too instead of reporting a false capture failure.
+    if (!this.error && ((await fs.readdir(this.directory)).some(name => name.endsWith('.json')) || this.queue.length)) return this.flush();
     return !this.error && this.queue.length === 0;
   }
 

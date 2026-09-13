@@ -54,6 +54,15 @@ row; click it to open the exact recorded before/after buffer diff, including
 unsaved changes. Static History keeps human fragments as connected graph rows.
 Raw capture details stay in Trace.
 
+Version 0.1.6 groups consecutive confirmed typing into one edit row with the
+first before-buffer and final after-buffer. A burst finishes after **1 second
+without input**, on save, editor/focus/context/lifecycle boundaries, or before
+an automatic or unconfirmed mutation. Undo and redo remain separate operations.
+Uninterrupted typing publishes at most every **30 seconds** (or 1024 changes).
+Each raw change and its input receipt are retained; coverage still measures
+individual changed AI-origin lines. Saving an already recorded edit adds no
+duplicate edit row. Older per-keystroke recordings remain unchanged.
+
 Git context is sampled every 15 seconds and recorded when it changes. Its saved
 workspace location and HEAD are used during replay; today's HEAD cannot rewrite
 old work. These are shared working-tree activity branches, not isolated
@@ -345,6 +354,30 @@ For repository-wide Rust formatting, clippy, tests, docs, and dependency
 policy, run `./scripts/lint.sh` from the repository root.
 
 ## Packaging
+
+To build and install the current checkout together with its native service:
+
+```sh
+npm run install:local
+```
+
+This rebuilds the service, renderer, and host, packages the version in
+`package.json`, installs that exact VSIX, and verifies VS Code selected it.
+Then run **Developer: Reload Window**. Check **Output → EditChain History** for
+the loaded version/path. New recordings also retain `extension_version` in
+`tracking_started`. A command ending in an older filename such as
+`--install-extension ./editchain-history-0.1.0.vsix` reinstalls the old recorder,
+even after successfully building a newer package.
+
+To target a particular VS Code installation/profile, pass its CLI and options:
+
+```sh
+npm run install:local -- /path/to/code --user-data-dir /path/to/profile --extensions-dir /path/to/extensions
+```
+
+The service path printed by the installer must match
+`editchain-history.servicePath` when that setting is explicitly configured.
+For packaging without installation:
 
 ```sh
 npm run build:renderer

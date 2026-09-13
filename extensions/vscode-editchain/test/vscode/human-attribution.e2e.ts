@@ -23,7 +23,7 @@ async function caret(column: number, anchor = column): Promise<void> {
     .some(item => item.textContent.includes(expected)), `Ln 1, Col ${column + 1}`), { timeout: 10000 });
 }
 
-async function evidence(name: string): Promise<{ changes: any[]; human: any[]; saves: any[] }> {
+async function evidence(name: string): Promise<{ changes: any[]; human: any[]; saves: any[]; edits: any[] }> {
   const report = await browser.executeWorkbench(async vscode => vscode.commands.executeCommand('editchain-history.humanWork'));
   assert.ok(report, 'production coverage query durably flushed capture');
   const root = path.join(process.env.EDITCHAIN_WORK_FIXTURE!, 'workspace', '.editchain', 'blobs');
@@ -35,9 +35,12 @@ async function evidence(name: string): Promise<{ changes: any[]; human: any[]; s
   const changes = events.filter(value => value.event.type === 'document_changed'
     && value.event.document.path === `attribution-${name}.txt`).sort((a, b) => a.sequence - b.sequence);
   const keys = new Set(changes.map(value => `${value.session}:${value.sequence}`));
-  const human = events.filter(value => value.event.type === 'human_edit' && keys.has(`${value.session}:${value.event.change}`));
+  const edits = events.filter(value => (value.event.type === 'human_edit' && keys.has(`${value.session}:${value.event.change}`))
+    || (value.event.type === 'human_edit_batch' && value.event.edits.some((edit: any) => keys.has(`${value.session}:${edit.change}`))));
+  const human = edits.flatMap(value => value.event.type === 'human_edit' ? [value]
+    : value.event.edits.map((edit: any) => ({ ...value, event: { type: 'human_edit', ...edit } })));
   const saves = events.filter(value => value.event.type === 'document_saved' && value.event.document.path === `attribution-${name}.txt`);
-  const result = { changes, human, saves };
+  const result = { changes, human, saves, edits };
   observations.push({ name, proposed, ...result });
   return result;
 }
@@ -64,6 +67,42 @@ describe('production edit attribution', () => {
     const after = await evidence('typing');
     assert.deepEqual(after.human, before.human);
     assert.equal(after.saves.length, 1);
+  });
+
+  it('groups consecutive real keystrokes into one saved edit', async () => {
+    await fixture('burst');
+    await browser.keys('humanwork');
+    await browser.keys(['Control', 's']);
+    const result = await evidence('burst');
+    assert.equal(result.changes.length, 9, 'real key events retain all nine buffer revisions');
+    assert.equal(result.human.length, 9);
+    assert.equal(result.edits.length, 1, 'one graph activity instead of nine keystroke edits');
+    assert.equal(result.edits[0].event.type, 'human_edit_batch');
+    assert.deepEqual(result.edits[0].event.edits.map((edit: any) => edit.change), result.changes.map(value => value.sequence));
+    assert.equal(result.changes[0].event.before, 'baseline');
+    assert.equal(result.changes.at(-1).event.after, 'baselinehumanwork');
+    const again = await evidence('burst');
+    assert.deepEqual(again.edits, result.edits, 'save and report do not duplicate the burst');
+  });
+
+  it('splits typing bursts around a real agent-style WorkspaceEdit', async () => {
+    await fixture('burst-agent');
+    await browser.keys('hi');
+    await browser.executeWorkbench(async vscode => {
+      const editor = vscode.window.activeTextEditor;
+      const edit = new vscode.WorkspaceEdit();
+      edit.insert(editor.document.uri, new vscode.Position(0, 0), 'AGENT ');
+      await vscode.workspace.applyEdit(edit);
+    });
+    await browser.keys('ok');
+    await browser.keys(['Control', 's']);
+    const result = await evidence('burst-agent');
+    assert.equal(result.changes.length, 5);
+    assert.equal(result.human.length, 4);
+    assert.equal(result.edits.length, 2);
+    assert.deepEqual(result.edits.sort((a, b) => a.sequence - b.sequence).map(value => value.event.edits.map((edit: any) => edit.change)),
+      [[result.changes[0].sequence, result.changes[1].sequence], [result.changes[3].sequence, result.changes[4].sequence]]);
+    assert.ok(result.changes[3].event.before.startsWith('AGENT '), 'second human burst starts after the agent revision');
   });
 
   for (const key of ['Backspace', 'Delete', 'Enter', 'Tab']) {
