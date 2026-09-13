@@ -218,10 +218,20 @@ impl Session {
                 duration_ms,
                 ranges,
                 ..
+            }
+            | EditorEventKind::CodeRead {
+                document,
+                duration_ms,
+                ranges,
+                ..
             } => {
-                // Keep micro-exposures between keystrokes in raw evidence and
-                // coverage, without a separate activity dot for each interval.
-                if *duration_ms < 250 || ranges.is_empty() {
+                // Preserve legacy exposure derivations. New read events must
+                // satisfy the recorder's policy before they enter the graph.
+                let qualified = *duration_ms >= self.dwell && self.dwell > 0;
+                if *duration_ms < 250
+                    || ranges.is_empty()
+                    || (matches!(event.event, EditorEventKind::CodeRead { .. }) && !qualified)
+                {
                     return Ok(None);
                 }
                 let known = self
@@ -229,7 +239,7 @@ impl Session {
                     .get(&document.id)
                     .filter(|revision| revision.version == document.version)
                     .cloned();
-                let kind = if *duration_ms >= self.dwell && self.dwell > 0 {
+                let kind = if qualified {
                     HumanWorkKind::Read
                 } else {
                     HumanWorkKind::Exposure

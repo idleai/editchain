@@ -154,7 +154,7 @@ pub enum EditorEventKind {
         /// Active document, absent when no tracked editor is active.
         document: Option<EditorDocument>,
     },
-    /// Cursor or selection movement.
+    /// Legacy cursor or selection movement; new recorders keep this local.
     SelectionChanged {
         /// Exact buffer revision.
         document: EditorDocument,
@@ -165,7 +165,7 @@ pub enum EditorEventKind {
         /// Whether the API reported keyboard input.
         keyboard: bool,
     },
-    /// Viewport geometry changed; the API does not identify a scroll cause.
+    /// Legacy viewport geometry; new recorders keep this local.
     VisibleRangesChanged {
         /// Exact buffer revision.
         document: EditorDocument,
@@ -174,7 +174,7 @@ pub enum EditorEventKind {
         /// Disjoint visible ranges; folded gaps remain excluded.
         ranges: Vec<EditorRange>,
     },
-    /// Continuous exposure in an active editor while the window is foreground.
+    /// Legacy exposure, retained for ingestion and replay of older recorders.
     CodeExposure {
         /// Exact buffer revision.
         document: EditorDocument,
@@ -185,6 +185,19 @@ pub enum EditorEventKind {
         /// Wall time at interval start.
         started_ms: u64,
         /// Monotonic elapsed duration, bounded by the recorder heartbeat.
+        duration_ms: u64,
+    },
+    /// One reading indicator after a stable foreground view reaches its dwell threshold.
+    CodeRead {
+        /// Exact buffer revision.
+        document: EditorDocument,
+        /// Visible editor identity.
+        editor: String,
+        /// Disjoint ranges visible throughout the qualifying interval.
+        ranges: Vec<EditorRange>,
+        /// Wall time at interval start.
+        started_ms: u64,
+        /// Monotonic duration at qualification, not the total time spent reading.
         duration_ms: u64,
     },
 }
@@ -300,7 +313,8 @@ impl EditorEvent {
             }
             EditorEventKind::SelectionChanged { ranges, .. }
             | EditorEventKind::VisibleRangesChanged { ranges, .. }
-            | EditorEventKind::CodeExposure { ranges, .. } => {
+            | EditorEventKind::CodeExposure { ranges, .. }
+            | EditorEventKind::CodeRead { ranges, .. } => {
                 for range in ranges {
                     if range.start > range.end
                         || range.end.into_iter().any(|value| value > 1_048_576)
@@ -308,9 +322,11 @@ impl EditorEvent {
                         return Err("invalid editor range");
                     }
                 }
-                if let EditorEventKind::CodeExposure { duration_ms, .. } = self.event {
+                if let EditorEventKind::CodeExposure { duration_ms, .. }
+                | EditorEventKind::CodeRead { duration_ms, .. } = self.event
+                {
                     if duration_ms > 60000 {
-                        return Err("exposure exceeds heartbeat bound");
+                        return Err("editor viewing interval exceeds duration bound");
                     }
                 }
             }
@@ -333,7 +349,8 @@ impl EditorEvent {
             | EditorEventKind::DocumentSaved { document }
             | EditorEventKind::SelectionChanged { document, .. }
             | EditorEventKind::VisibleRangesChanged { document, .. }
-            | EditorEventKind::CodeExposure { document, .. } => Some(document),
+            | EditorEventKind::CodeExposure { document, .. }
+            | EditorEventKind::CodeRead { document, .. } => Some(document),
             EditorEventKind::EditorActivated { document } => document.as_ref(),
             EditorEventKind::WorkspaceContext { .. }
             | EditorEventKind::TrackingStarted { .. }

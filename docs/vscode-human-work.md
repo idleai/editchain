@@ -26,17 +26,38 @@ of loading a document. Split tabs have separate identities.
 | `document_renamed` | Explicit file/directory rename within the workspace. |
 | `editor_opened` / `editor_closed` | Text tab lifecycle, including preview tabs. |
 | `editor_activated` | Active tracked document, or no tracked active editor. |
-| `selection_changed` | Cursor/selection ranges and keyboard-kind indicator. |
-| `visible_ranges_changed` | Disjoint viewport ranges; the API does not identify scroll cause. |
-| `code_exposure` | Revision-bound ranges, start time, and monotonic duration. |
+| `code_read` | One qualified interval: exact revision, disjoint visible ranges, start time, and monotonic duration at qualification. |
 
 Window focus is **not** an event or a stored field. An in-memory focus guard
-pauses exposure. Intervals also end on document changes, viewport changes, active
-editor changes, captured Git-context changes, checkpoints, and shutdown. A
-heartbeat bounds each interval.
-Scroll, reveal, folding, and layout changes all use the viewport event. Hidden
-tabs and background windows earn no exposure. Horizontal clipping, terminal or
-sidebar keyboard focus, gaze, and comprehension are not observable guarantees.
+pauses exposure timing. Cursor/selection and viewport observations stay local;
+`selection_changed`, `visible_ranges_changed`, and `code_exposure` are no longer
+posted. The service still accepts and replays these legacy events unchanged.
+
+A one-shot timer emits `code_read` when the active visible editor reaches the
+recorded dwell threshold (2 seconds by default). An unchanged view emits only
+one read, even over ten minutes. There is no read heartbeat. Checkpoints may
+flush a qualified interval but never split it or duplicate its read. Recorded
+duration is evidence at qualification, not total reading time; delayed callbacks
+are capped at 60 seconds. Short intervals are discarded rather than accumulated.
+
+Intervals end on changes to the viewed buffer, viewport, active editor, focus,
+captured Git context, or shutdown. Scroll, reveal, folding, and layout changes
+all use local viewport observations. Duplicate viewport notifications and edits
+to background files do not reset the timer. Hidden tabs and background windows
+earn no reads. Horizontal clipping, terminal or sidebar keyboard focus, gaze,
+and comprehension are not observable guarantees.
+
+Opening a text tab stores `editor_opened`; loading its document establishes an
+exact baseline if needed. Opening a background tab alone does not start reading.
+Activation of a visible editor starts its local timer. Closing a tab stores
+`editor_closed` with the same tab identity; removing the viewed editor ends its
+interval and flushes a qualified read if its timer was delayed. A close before
+the threshold produces no read. Closing one split does not close the shared
+document or end another split's active interval. Open/close records remain raw
+lifecycle evidence and do not produce human-work graph nodes by themselves.
+Orderly recorder shutdown flushes a pending qualified read and records
+`tracking_stopped`; it does not manufacture tab closes. Abrupt process exits can
+leave lifecycle intervals incomplete.
 
 The intentionally cooperative user assumption applies to edit attribution:
 keyboard selection correlated with changes within 250 ms marks those changes
@@ -133,12 +154,11 @@ This implementation does not build a global workspace-state DAG or guarantee
 replay of every external mutation. Historical context can outlive the worktree
 or commit objects needed to render its Git node.
 
-Continuous exposure of at least 250 ms appears as a graph activity. Shorter
-intervals, including those between keystrokes, stay in raw evidence and still
-contribute to exposure coverage; they do not create a dot per interval. The
-recorded reading threshold (2 seconds by default) separately determines reading
-indicators. Episode folding does not assert that a person completed a task or
-understood a file.
+New capture contributes graph activity only for qualified reads, confirmed
+human edits, and gaps. For compatibility, legacy exposure records still produce
+their original activity at 250 ms and become reading indicators at the recorded
+dwell threshold. Existing history is not rewritten. Episode folding does not
+assert that a person completed a task or understood a file.
 
 When a recorder next submits a batch, the service backfills older canonical raw
 captures and appends only missing derivations. It repairs replayed source payloads
@@ -166,16 +186,30 @@ The editor command shows it as a native read-only Markdown document.
    Unchanged lines retain origins. Human replacement descendants retain the
    touched AI origins; deleted origins remain in historical edited counts.
    Unattributed replacement text does not inherit removed AI origins.
-5. Join exposure to its document incarnation and exact revision. Count distinct
-   AI origins at any duration as exposed, and at the recorded dwell threshold
-   as having a reading indicator. Repeated reads do not inflate line coverage.
+5. Join reads to their document incarnation and exact revision. Count distinct
+   AI origins at the recorded dwell threshold as having a reading indicator.
+   The service checks the recorded policy rather than trusting the event name.
+   Repeated reads do not inflate line coverage.
    AI source time must precede the observation; importing that evidence later
    still allows retrospective measurement.
-6. Report current **saved** file line counts, read, edited, overlap, and exposure.
+6. Report current **saved** file line counts, read, edited, and overlap.
    Historical totals separately retain unsaved work and deleted lines. Current
    counts use matched AI-origin lines as their denominator; they are not a claim
    that all repository code has known provenance. Zero known AI lines means
    “not yet measurable.”
+
+The report API retains `exposed_lines` and `exposure_ms` for older consumers.
+They include qualified reads and legacy exposure records; with current capture
+alone, exposed-line coverage equals read-line coverage. They no longer measure
+skimming or total viewing duration and are not shown as such in the report.
+
+Each source event creates a raw import plus an observation annotation. A read
+also creates one semantic work record (three chain records total), with a Git
+link when its context first needs anchoring. A typical keyboard change creates
+two source events plus a work record, FileOp, and path annotation (seven chain
+records). Startup, editor lifecycle, saves, and context changes add their own
+records. Ten minutes on one unchanged view produce one read, plus lifecycle
+overhead; typing still produces exact versioned change evidence.
 
 The metric is line based. It neither proves comprehension nor measures the
 fraction of characters read within a line. Explicit renames maintain path
@@ -193,6 +227,7 @@ cargo build -p editchain-node --bins --example editor_work_fixture --locked
 cd extensions/vscode-editchain
 npm run compile
 npm run test:capture:types
+npm run build:renderer
 npm run test:harness
 npm run ui:vscode:work
 ```
@@ -211,9 +246,9 @@ through WebDriver, checks unsaved and saved coverage, navigates briefly to a
 distant viewport, and pauses/resumes recording. The original four capture
 scenarios passed on both releases. A fifth scenario exercises the live graph,
 episode folding, updates while the panel is open, and the native human diff. The
-complete five-scenario suite passed on 1.137.0 after graph integration. The
-1.137.0 sample measured 39 reading-indicated lines, one edited line, and 71
-exposed lines after the distant jump, with zero capture gaps. Exact viewport
+complete five-scenario suite passed on 1.137.0 with the reduced event stream. The
+sample measured 39 reading-indicated lines and one edited line; the brief
+distant jump added no reading or exposure coverage, with zero capture gaps. Exact viewport
 counts vary with layout. Synthetic chains and reports are in ignored
 `extensions/vscode-editchain/trace/work-<version>/` directories.
 
@@ -230,17 +265,31 @@ before-and-after state, two human windows and two agents sharing Git, external
 HEAD movement, static and paged-live ancestry, byte-identical replay, legacy
 backfill after payload repair, relocation, and stale-diff rejection followed by
 exact revalidation. Browser-host tests cover context poll failure/recovery,
-disposal, overlapping requests, exposure boundaries, and serialized diff retries
+disposal, overlapping requests, reading boundaries, and serialized diff retries
 that cannot cross live epochs or replaced panels.
 
-Validation on 2026-09-12: 13 focused editor service tests passed; all 73 extension
+Read-capture regressions cover ten minutes without duplicate reads, local-only
+selection and viewport observations, brief visits that cannot accumulate,
+configured dwell thresholds, early/delayed timer callbacks, active/background
+tab closure, split identities, background agent edits, orderly shutdown, and
+byte-identical legacy replay. Native service tests check exact read revisions,
+recorded dwell policies, lifecycle records without inferred work, and the number
+of canonical records created by a read.
+
+Validation on 2026-09-12: 15 focused editor service tests passed; all 79 extension
 harness tests passed; extension compilation and capture-test type checks passed;
 the production WASM renderer built; all five real VS Code scenarios passed;
 `./scripts/lint.sh` exited 0 with **`RESULT: PASS`**. The lint command completed
 format, check, clippy, workspace tests, doc tests, and dependency checks without
 policy changes or new suppressions.
 
-Integration validation logs and actual VS Code screenshots are retained under
-`outputs/vscode-capture/human-integration/`. Build and test the current checkout
+Validation logs and actual VS Code screenshots for the reduced event stream are
+retained under `outputs/vscode-capture/human-reads/`. Build and test the current checkout
 with the commands above; the native service and extension renderer must come
 from the same build.
+
+After updating this branch, rebuild the native service as well as the extension:
+the new `code_read` payload requires a service that recognizes it. A process
+already running an older binary must be restarted before the new extension
+sends reads. Set `editchain-history.servicePath` to the matching build when the
+open workspace is a different checkout.

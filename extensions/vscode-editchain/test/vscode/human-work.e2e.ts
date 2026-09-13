@@ -67,11 +67,13 @@ describe('production human-work capture', () => {
     assert.equal(saved.capture_gaps, 0);
   });
 
-  it('counts a brief distant viewport as exposure without treating the skipped middle as read', async () => {
+  it('discards a brief distant viewport without adding exposure or treating the skipped middle as read', async () => {
+    const before = await report();
     await show(170);
     await browser.pause(100);
     const value = await report();
-    assert.ok(value.exposed_lines > value.read_lines, 'brief distant exposure is separate from reading');
+    assert.equal(value.read_lines, before.read_lines, 'brief visibility produces no read');
+    assert.equal(value.exposed_lines, value.read_lines, 'new capture sends no skimming evidence');
     assert.ok(value.read_lines < 100, 'navigation does not fill the skipped line interval');
     fs.writeFileSync(path.join(output, 'final-report.json'), JSON.stringify(value, null, 2));
   });

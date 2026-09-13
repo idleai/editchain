@@ -94,7 +94,7 @@
         "editchain-history.tracking.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Record local workspace code edits, editor activity, and code exposure in EditChain. Focus only pauses timers; no focus events are stored."
+          "description": "Record local workspace code edits, editor lifecycle, and qualifying reads in EditChain. Focus only pauses timers; no focus events are stored."
         },
         "editchain-history.tracking.readDwellMs": {
           "type": "number",

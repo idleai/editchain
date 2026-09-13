@@ -278,7 +278,18 @@ impl Measurement {
                 duration_ms,
                 started_ms,
                 ..
+            }
+            | EditorEventKind::CodeRead {
+                document,
+                ranges,
+                duration_ms,
+                started_ms,
+                ..
             } => {
+                let qualified = *duration_ms >= *self.dwell.get(&event.session).unwrap_or(&2000);
+                if matches!(event.event, EditorEventKind::CodeRead { .. }) && !qualified {
+                    return;
+                }
                 self.exposure_ms = self.exposure_ms.saturating_add(*duration_ms);
                 let key = (event.session.clone(), document.id.clone());
                 if let Some((_, revision)) = self
@@ -299,7 +310,7 @@ impl Measurement {
                             .is_some_and(|time| time <= started_ms)
                     });
                     self.skimmed.extend(ids.iter().copied());
-                    if *duration_ms >= *self.dwell.get(&event.session).unwrap_or(&2000) {
+                    if qualified {
                         self.read.extend(ids);
                     }
                 } else {
@@ -427,7 +438,8 @@ impl Measurement {
             "human_changes":self.human_changes, "exposure_ms":self.exposure_ms, "events":event_count,
             "capture_gaps":self.gaps, "unsupported_ai_changes":self.unsupported_ai, "unavailable_files":unavailable,
             "files":files,
-            "limitations":["Reading and skimming are visibility indicators, not proof of comprehension.",
+            "limitations":["Reading indicators measure qualifying visibility, not comprehension or total reading time.",
+                "Brief visits are not recorded by current capture.",
                 "Keyboard-correlated edits assume intentional human work; the stable VS Code API cannot verify authorship.",
                 "AI origins follow unchanged lines from retained full snapshots or exact unique hunk matches. Unmatched code has unknown provenance.",
                 "Only retained, dated AI changes are measurable. Missing imports and unsupported evidence are not zero human coverage."]})

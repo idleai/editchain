@@ -42,8 +42,9 @@ The settings are:
 
 Human-work tracking starts automatically in trusted local workspace folders,
 independently of the History panel. It records buffer snapshots, exact edits,
-saves, renames, text tabs, selections, active editors, visible ranges, and
-continuous code exposure. Unsaved edits are included. Each workspace folder
+saves, renames, text-tab lifecycle, active editors, and qualified reading
+indicators. Exposure timing, selections, and viewport changes stay local.
+Unsaved edits are included. Each workspace folder
 writes to its own configured chain. Untitled buffers belong to the first folder.
 
 History shows human work as a connected series alongside agent work, anchored
@@ -60,7 +61,7 @@ snapshots. External changes can occur between observations.
 Open **EditChain: Show Human Work Coverage** from the Command Palette or the
 tracking status item. The report compares imported AI file evidence with current
 saved files and shows nonblank AI-origin lines with reading indicators, human
-edits, their overlap, and brief exposure. Historical counts retain work on lines
+edits, and their overlap. Historical counts retain work on lines
 that were later changed or deleted, including unsaved human edits. Populate AI
 evidence using the existing import or Live History workflow; missing provenance
 is reported as unknown, never as zero human review of the whole codebase.
@@ -70,7 +71,8 @@ is reported as unknown, never as zero human review of the whole codebase.
 - `editchain-history.tracking.enabled` defaults to `true`.
 - `editchain-history.tracking.readDwellMs` defaults to `2000`. Reading requires
   one continuous qualifying interval at the same buffer revision and viewport.
-  Shorter intervals remain exposure/skimming indicators.
+  Each stable viewing interval emits one read at that threshold; shorter visits
+  are discarded. An unchanged view produces no repeating read events.
 - `editchain-history.tracking.maxFileBytes` defaults to `262144`. Binary and
   larger buffers produce explicit capture gaps.
 
@@ -80,6 +82,11 @@ changes remain observed changes. Focus is used only to pause exposure timers;
 **no window-focus events or focus history are stored**. Visible code is an
 opportunity to read, not proof of comprehension. Only the active visible editor
 qualifies; folding gaps and navigation jumps are never filled in.
+
+Opening or closing a text tab records lifecycle evidence, including separate
+identities for split tabs. Opening starts a local read timer only when that
+editor is active and visible. Closing ends its viewing interval; neither action
+alone marks code as read. Old exposure events remain supported for replay.
 
 Events remain local: a bounded outbox in VS Code workspace storage retries
 `RecordEditorEvents` until the service acknowledges durable chain writes.

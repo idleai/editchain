@@ -2,12 +2,13 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
+import { setTimeout, clearTimeout } from 'node:timers';
 import { EditorEvent } from './editorOutbox';
 
 type Document = { id: string; uri: string; path: string | null; version: number };
 type Range = { start: [number, number]; end: [number, number] };
 type BufferState = { document: Document; text: string };
-type Exposure = { document: Document; editor: string; ranges: Range[]; started_ms: number; monotonic: number };
+type Exposure = { document: Document; editor: string; ranges: Range[]; started_ms: number; monotonic: number; reported: boolean };
 
 /** Stable VS Code API observer; no proposed APIs and no persisted focus history. */
 export class EditorCapture {
@@ -22,7 +23,7 @@ export class EditorCapture {
   private readonly skipped = new Set<string>();
   private exposure: Exposure | undefined;
   private stopped = false;
-  private readonly timer: NodeJS.Timeout;
+  private timer: NodeJS.Timeout | undefined;
 
   constructor(private readonly folder: vscode.WorkspaceFolder, private readonly dwell: number,
     private readonly maxFileBytes: number, private readonly emit: (event: EditorEvent) => boolean) {
@@ -54,8 +55,9 @@ export class EditorCapture {
       vscode.window.onDidChangeTextEditorVisibleRanges(() => this.viewport()),
       vscode.window.onDidChangeTextEditorSelection(event => this.selection(event)),
       // Focus is an in-memory timer guard only; deliberately emit no event.
-      vscode.window.onDidChangeWindowState(() => { this.endExposure(); this.beginExposure(); }),
+      vscode.window.onDidChangeWindowState(() => this.viewport()),
       vscode.window.tabGroups.onDidChangeTabs(event => {
+        if (event.closed.length) this.viewport();
         for (const tab of event.opened) this.tab(tab, 'editor_opened');
         for (const tab of event.closed) this.tab(tab, 'editor_closed');
       }),
@@ -63,8 +65,6 @@ export class EditorCapture {
     for (const document of vscode.workspace.textDocuments) this.baseline(document);
     for (const group of vscode.window.tabGroups.all) for (const tab of group.tabs) this.tab(tab, 'editor_opened');
     this.viewport();
-    this.timer = setInterval(() => { this.endExposure(); this.beginExposure(); }, Math.max(15000, dwell));
-    this.timer.unref();
   }
 
   private identity(object: object): string {
@@ -109,15 +109,15 @@ export class EditorCapture {
 
   private changed(event: vscode.TextDocumentChangeEvent): void {
     if (!this.tracked(event.document) || !event.contentChanges.length) return;
-    this.endExposure();
+    if (this.exposure?.document.id === this.documents.get(event.document)?.document.id) this.endExposure();
     const before = this.documents.get(event.document);
     const after = event.document.getText();
     if (!this.withinLimit(event.document, after)) {
-      this.documents.delete(event.document); this.pending.delete(event.document); this.beginExposure(); return;
+      this.documents.delete(event.document); this.pending.delete(event.document); this.viewport(); return;
     }
     if (!before) {
       this.record({ type: 'tracking_gap', reason: `Change preceded buffer baseline: ${event.document.uri.toString()}` });
-      this.baseline(event.document); this.beginExposure(); return;
+      this.baseline(event.document); this.viewport(); return;
     }
     const document = { ...before.document, uri: event.document.uri.toString(),
       path: this.relative(event.document.uri), version: event.document.version };
@@ -136,15 +136,13 @@ export class EditorCapture {
         this.pending.set(event.document, pending.filter(change => performance.now() - change.at <= 250));
       }
     }
-    this.beginExposure();
+    this.viewport();
   }
 
   private selection(event: vscode.TextEditorSelectionChangeEvent): void {
     const state = this.baseline(event.textEditor.document);
     if (!state) return;
     const keyboard = event.kind === vscode.TextEditorSelectionChangeKind.Keyboard;
-    this.record({ type: 'selection_changed', document: state.document, editor: this.identity(event.textEditor),
-      ranges: event.selections.map(range), keyboard });
     if (keyboard && vscode.window.state.focused) {
       for (const change of this.pending.get(event.textEditor.document) ?? []) {
         if (change.version <= state.document.version && performance.now() - change.at <= 250) {
@@ -163,12 +161,13 @@ export class EditorCapture {
   }
 
   private viewport(): void {
+    const editor = vscode.window.activeTextEditor;
+    const current = this.exposure;
+    if (current && editor && vscode.window.state.focused && vscode.window.visibleTextEditors.includes(editor)
+      && current.editor === this.identity(editor) && current.document.id === this.documents.get(editor.document)?.document.id
+      && current.document.version === editor.document.version
+      && JSON.stringify(current.ranges) === JSON.stringify(editor.visibleRanges.map(range))) return;
     this.endExposure();
-    for (const editor of vscode.window.visibleTextEditors) {
-      const state = this.baseline(editor.document);
-      if (state) this.record({ type: 'visible_ranges_changed', document: state.document,
-        editor: this.identity(editor), ranges: editor.visibleRanges.map(range) });
-    }
     this.beginExposure();
   }
 
@@ -179,16 +178,40 @@ export class EditorCapture {
     const state = this.baseline(editor.document);
     if (!state || !editor.visibleRanges.length) return;
     this.exposure = { document: { ...state.document }, editor: this.identity(editor), ranges: editor.visibleRanges.map(range),
-      started_ms: Date.now(), monotonic: performance.now() };
+      started_ms: Date.now(), monotonic: performance.now(), reported: false };
+    this.scheduleRead(this.dwell);
+  }
+
+  private scheduleRead(delay: number): void {
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      this.publishRead();
+      const exposure = this.exposure;
+      if (exposure && !exposure.reported && !this.stopped) {
+        // Timers can fire just before the measured dwell reaches a whole millisecond.
+        this.scheduleRead(Math.max(1, this.dwell - (performance.now() - exposure.monotonic)));
+      }
+    }, delay);
+    this.timer.unref();
+  }
+
+  private publishRead(): void {
+    const exposure = this.exposure;
+    if (!exposure || exposure.reported) return;
+    const duration_ms = Math.max(0, Math.min(60000, Math.floor(performance.now() - exposure.monotonic)));
+    if (duration_ms < this.dwell) return;
+    const { document, editor, ranges, started_ms } = exposure;
+    this.record({ type: 'code_read', document, editor, ranges, started_ms, duration_ms });
+    exposure.reported = true;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
   }
 
   private endExposure(): void {
-    const exposure = this.exposure;
+    this.publishRead();
     this.exposure = undefined;
-    if (!exposure) return;
-    const { monotonic, ...observation } = exposure;
-    const duration_ms = Math.max(0, Math.min(60000, Math.floor(performance.now() - monotonic)));
-    if (duration_ms) this.record({ type: 'code_exposure', ...observation, duration_ms });
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
   }
 
   private record(event: EditorEvent['event']): number | undefined {
@@ -202,7 +225,7 @@ export class EditorCapture {
     return sequence;
   }
 
-  checkpoint(): void { this.endExposure(); this.beginExposure(); }
+  checkpoint(): void { this.publishRead(); }
 
   context(context: { observed_ms: number; workspace_path?: string; repositories: unknown[] }): void {
     this.endExposure();
@@ -211,7 +234,6 @@ export class EditorCapture {
   }
 
   dispose(): void {
-    clearInterval(this.timer);
     this.endExposure();
     this.record({ type: 'tracking_stopped' });
     this.stopped = true;

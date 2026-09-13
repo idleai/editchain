@@ -17,6 +17,9 @@ use std::{path::Path, process::Command};
 #[path = "lifecycle.rs"]
 mod lifecycle;
 
+#[path = "reads.rs"]
+mod reads;
+
 fn git(root: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
