@@ -5,6 +5,7 @@
 //! `editchain_store`; reconciliation and transport remain internal modules.
 
 pub mod commands;
+mod editor;
 pub mod history;
 mod reconcile;
 mod transport;

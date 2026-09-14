@@ -44,7 +44,8 @@ Completed increments:
   longer depends on projection algorithms. Errors retain machine-readable codes
   inside the existing envelope; clients accept both structured and legacy string
   errors. Requests validate page, search, query, and exact-coordinate limits.
-  The stdio reader rejects frames above 8 MiB before allocating their payloads.
+  The stdio reader rejects frames above 160 MiB before allocating their payloads
+  (including worst-case JSON expansion of large editor snapshots).
 - Opened source lifetime: cached rows remain fixed. Lazy projection and search
   compare the pinned source version before and after reading, and report
   `StaleSnapshot` on a change. A complete computed backend replaces the cached

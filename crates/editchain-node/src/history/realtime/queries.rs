@@ -240,7 +240,10 @@ impl LiveWorkspace {
                     value: super::super::resolved_object_from_commit(commit),
                 })?
             }
-            RequestBody::Open(_)
+            RequestBody::RecordEditorEvents(_)
+            | RequestBody::GetHumanWork(_)
+            | RequestBody::GetEditorContext(_)
+            | RequestBody::Open(_)
             | RequestBody::OpenLive(_)
             | RequestBody::OpenLivePaged(_)
             | RequestBody::Refresh(_) => {

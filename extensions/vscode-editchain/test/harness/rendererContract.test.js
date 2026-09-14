@@ -141,6 +141,7 @@ test('extension contributes one history view with explicit live start/stop contr
   const commands = PACKAGE.contributes.commands;
   assert.deepEqual(commands.map(entry => entry.command), [
     'editchain-history.open', 'editchain-history.startLive', 'editchain-history.stopLive',
+    'editchain-history.humanWork', 'editchain-history.startTracking', 'editchain-history.stopTracking',
   ]);
   assert.doesNotMatch(EXTENSION_SOURCE, /openGpuPreview/,
     'the extension host must not register or reference an openGpuPreview command');

@@ -47,6 +47,12 @@ impl Metadata {
             return;
         };
         let text = row.operations.iter().find_map(|op| {
+            if let Some(work) = editchain_project::human::work_record(op) {
+                return Some(format!(
+                    "Human work · {}",
+                    work.path.as_deref().unwrap_or("Untitled buffer")
+                ));
+            }
             if !op.tags.matches_all(editchain_core::Tags::HUMAN) {
                 return None;
             }
@@ -56,7 +62,7 @@ impl Metadata {
             let Payload::Inline(bytes) = &message.content else {
                 return None;
             };
-            std::str::from_utf8(bytes).ok()
+            std::str::from_utf8(bytes).ok().map(ToOwned::to_owned)
         });
         let Some(text) = text else {
             return;

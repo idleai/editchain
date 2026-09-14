@@ -3,7 +3,9 @@
 use crate::{ErrorCode, RequestBody, ServiceError};
 
 /// Maximum encoded request frame; checked before allocating its payload.
-pub const MAX_REQUEST_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// An editor event can include three 8 MiB texts (before, after, replacement),
+/// each expanding sixfold in JSON, plus bounded metadata.
+pub const MAX_REQUEST_FRAME_BYTES: usize = 160 * 1024 * 1024;
 /// Maximum expanded rows requested in one page.
 pub const MAX_WINDOW_ROWS: u64 = 10_000;
 /// Maximum ranked visible matches requested by a client.
@@ -21,6 +23,7 @@ impl RequestBody {
     /// Returns `InvalidInput` for unsupported limits or inexact coordinates.
     pub fn validate(&self) -> Result<(), ServiceError> {
         match self {
+            Self::RecordEditorEvents(request) => request.validate()?,
             Self::ViewportLive(request) => {
                 if request.snapshot_id.is_empty()
                     || request.capacity == 0
@@ -81,7 +84,9 @@ impl RequestBody {
                     return Err(invalid("search query exceeds 16384 bytes"));
                 }
             }
-            Self::Open(_)
+            Self::GetHumanWork(_)
+            | Self::GetEditorContext(_)
+            | Self::Open(_)
             | Self::OpenLive(_)
             | Self::OpenLivePaged(_)
             | Self::Refresh(_)

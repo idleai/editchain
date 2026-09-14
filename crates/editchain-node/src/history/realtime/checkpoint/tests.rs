@@ -6,6 +6,9 @@ use editchain_protocol::{
 };
 use std::cmp::Reverse;
 
+mod human_edits;
+mod human_visibility;
+
 fn request(root: &std::path::Path) -> OpenRequest {
     OpenRequest {
         workspace_path: root.to_string_lossy().into_owned(),

@@ -39,6 +39,9 @@ impl LiveWorkspace {
         workspace.repositories = self.catalog.clone();
         workspace.root_path.clone_from(&self.root);
         workspace.chain_path.clone_from(&self.chain);
+        workspace
+            .session_metadata
+            .extend(super::super::sessions::session_metadata_index(&operations));
         let first =
             editchain_core::OpId::new(input.incarnation.node, input.incarnation.boot, 1 << 16);
         if let Some(meta) = self.projection.operation(first) {

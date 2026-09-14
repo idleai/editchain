@@ -12,6 +12,7 @@ use tempfile as _;
 
 mod details;
 mod files;
+pub(crate) mod human_work;
 mod legacy_preview;
 mod live;
 mod realtime;

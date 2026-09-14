@@ -875,6 +875,10 @@ pub fn bundle_activity_work_groups<S: std::hash::BuildHasher>(
                 && !is_session_start_boundary(node)
                 && !branch_boundaries.contains(key)
                 && node_anchor_op(node).is_some()
+                // Static nested details do not carry graph ancestry. Keep
+                // human revisions on the physical path here; retained live
+                // task disclosure folds their episodes without losing edges.
+                && node_anchor_op(node).and_then(crate::human::work_record).is_none()
         })
         .collect();
 

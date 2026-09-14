@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use editchain_index::{Map, OrderedMap, OrderedSet};
 
+mod human;
 mod neighbors;
 use neighbors::Neighbors;
 /// Incremental provider spawn and completion relationships.
@@ -93,6 +94,8 @@ pub struct LiveChanges {
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct LiveProjection {
     #[serde(default)]
+    human: human::HumanEdits,
+    #[serde(default)]
     topology: topology::Topology,
     ops: Map<OpId, Arc<Op>>,
     owners: Map<OpId, Option<OpId>>,
@@ -163,7 +166,12 @@ impl LiveProjection {
             sources.extend(self.raw_owner(*id));
         }
         let mut items = HashSet::new();
+        let mut human = BTreeSet::new();
         for source in &sources {
+            human.extend(
+                self.human
+                    .observe(*source, self.ops.get(source).map(AsRef::as_ref)),
+            );
             let key = stream(*source);
             let _: &mut bool = streams
                 .entry(key)
@@ -188,6 +196,9 @@ impl LiveProjection {
         }
         for source in sources {
             self.publish_record(source, &mut result);
+        }
+        for group in human {
+            self.publish_human(group, &mut result);
         }
         for id in changed.into_iter().chain(descendants) {
             self.publish_standalone(id, &mut result);
@@ -228,6 +239,9 @@ impl LiveProjection {
     #[must_use]
     pub fn item_owners(&self, id: OpId) -> Vec<String> {
         let source = self.raw_owner(id).unwrap_or(id);
+        if let Some(group) = self.human.group(source) {
+            return vec![format!("human-edit:{group}")];
+        }
         self.selected
             .get(&source)
             .into_iter()
@@ -531,18 +545,34 @@ impl LiveProjection {
             .chain(outputs)
             .filter_map(|id| self.ops.get(id).cloned())
             .collect();
+        let task = self
+            .ops
+            .get(&anchor)
+            .and_then(|op| crate::human::work_record(op))
+            .map(|record| TaskIdentity {
+                key: format!("human:{}:{}", record.session, record.turn),
+                thread: record.session,
+                turn: record.turn.to_string(),
+                boundary: OpId {
+                    seq: 0,
+                    ..incarnation
+                },
+            });
         LiveRow {
             key,
             anchor,
             incarnation,
             operations,
-            task: None,
+            task,
         }
     }
 
     fn publish_record(&self, source: OpId, output: &mut LiveChanges) {
         let key = format!("record:{source}");
         retire(key.clone(), output);
+        if self.human.group(source).is_some() {
+            return;
+        }
         if !self
             .ops
             .get(&source)

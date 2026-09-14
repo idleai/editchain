@@ -53,7 +53,7 @@ impl FileRowStatus {
     }
 }
 
-/// Column-aligned SCM content for one expandable Git/agent edit child.
+/// Column-aligned SCM content for a file change, including a human graph row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileContent {
     pub(crate) path: String,
@@ -90,12 +90,16 @@ pub(super) fn file_content(row: &RowInput) -> Option<FileContent> {
     let source = match change.source {
         FileChangeSource::Git => "git",
         FileChangeSource::Agent => "agent",
+        FileChangeSource::Human => "human",
+        FileChangeSource::Editor => "editor",
         FileChangeSource::Unknown => "unknown",
     }
     .to_owned();
     let binary = change.binary;
     let partial = change.partial;
-    let fidelity = if binary {
+    let fidelity = if source == "editor" {
+        "unattributed"
+    } else if binary {
         "binary"
     } else if partial {
         "recorded"
@@ -118,6 +122,10 @@ pub(super) fn file_content(row: &RowInput) -> Option<FileContent> {
     }
     let source_label = if source == "git" {
         "Git commit"
+    } else if source == "human" {
+        "human edit"
+    } else if source == "editor" {
+        "editor change without human or agent attribution"
     } else if partial {
         "recorded agent edit"
     } else {

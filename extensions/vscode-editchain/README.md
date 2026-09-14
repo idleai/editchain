@@ -38,6 +38,168 @@ The settings are:
 - `editchain-history.chainDir`: EditChain data directory relative to the open
   workspace, defaulting to `.editchain`.
 
+## Human work on AI-generated code
+
+Human-work tracking starts automatically in trusted local workspace folders,
+independently of the History panel. It records buffer snapshots, exact edits,
+saves, renames, text-tab lifecycle, active editors, and qualified reading
+indicators. Exposure timing, selections, and viewport changes stay local.
+Unsaved edits are included. Each workspace folder
+writes to its own configured chain. Untitled buffers belong to the first folder.
+
+History shows human work as a connected series alongside agent work, anchored
+to independently recorded Git context. Live episodes have the same disclosure
+controls as agent tasks. Each human edit shows its file directly on one graph
+row; click it to open the exact recorded before/after buffer diff, including
+unsaved changes. Static History keeps human fragments as connected graph rows.
+Raw capture details stay in Trace.
+
+Version 0.1.7 publishes the first confirmed input immediately and updates the
+same live edit row at **100 ms** intervals while typing. Its diff runs from the
+first before-buffer to the latest after-buffer. Save finishes the edit; so do
+editor/focus/context/lifecycle boundaries, an automatic or unconfirmed mutation
+of that file, or a new input after **30 seconds** idle. Reads and changes to
+background files do not finish the active edit. Undo and redo remain separate.
+Each raw change and its input receipt are retained; coverage still measures
+individual changed AI-origin lines. Saving an already recorded edit adds no
+duplicate edit row. Older per-keystroke recordings remain unchanged.
+
+Git context is sampled every 15 seconds and recorded when it changes. Its saved
+workspace location and HEAD are used during replay; today's HEAD cannot rewrite
+old work. These are shared working-tree activity branches, not isolated
+snapshots. External changes can occur between observations.
+
+Open **EditChain: Show Human Work Coverage** from the Command Palette. The
+tracking status item opens **EditChain: Show Tracking Status**, a lightweight
+runtime diagnostic in the output channel. The coverage report compares imported
+AI file evidence with current saved files and shows nonblank AI-origin lines with reading indicators, human
+edits, and their overlap. Historical counts retain work on lines
+that were later changed or deleted, including unsaved human edits. Populate AI
+evidence using the existing import or Live History workflow; missing provenance
+is reported as unknown, never as zero human review of the whole codebase.
+
+- **EditChain: Pause Human Work Tracking** and **Resume Human Work Tracking**
+  control recording without changing the History panel.
+- `editchain-history.tracking.enabled` defaults to `true`.
+- `editchain-history.tracking.readDwellMs` defaults to `2000`. Reading requires
+  one continuous qualifying interval at the same buffer revision and viewport.
+  Each view emits one read at that threshold; shorter visits are discarded.
+  The last view of each loaded document stays read through focus changes,
+  switching tabs, and Git context updates. Scrolling or a new buffer revision
+  rearms reading; elapsed time and repeated notifications alone do not.
+- `editchain-history.tracking.maxFileBytes` defaults to `8388608` (8 MiB), also
+  the supported maximum. This measures the entire unsaved buffer in UTF-8 bytes.
+  NUL-containing and oversized buffers produce separate capture-gap reasons.
+
+Editor-input and keyboard-correlated edits are human-work indicators under the
+intentional-user assumption. The VS Code API does not authenticate physical
+authorship. Other text changes remain observed changes. Focus gates attribution
+and pauses exposure timers;
+**no window-focus events or focus history are stored**. Visible code is an
+opportunity to read, not proof of comprehension. Only the active visible editor
+qualifies; folding gaps and navigation jumps are never filled in.
+
+Opening the first text tab for a file records one open; closing its last tab
+records one close. Split tabs share this file lifecycle. Tabs already open when
+the recorder starts are retained as restored inventory without another open
+activity. Opening starts a local read timer only when that editor is active and
+visible; neither opening nor closing alone marks code as read. Old exposure
+events remain supported for replay.
+
+Version 0.1.1 shows **Editor opened** and **Editor closed** in the same human
+graph series as reads and edits. Expand a human episode to see its individual
+activities. Historical brief-exposure rows are hidden from Activity; qualifying
+historical reads remain visible. Old source records and their identities are
+retained.
+
+Install the current VSIX and reload VS Code to activate an updated recorder.
+The native service selected by `editchain-history.servicePath` must be rebuilt
+from the same branch; updating only one component leaves an incompatible pair.
+
+Version 0.1.5 ties keyboard fallback to one exact revision, editor, and resulting
+cursor positions. Navigation or a later keystroke cannot claim an earlier
+candidate after its selection update, save, or focus/activation boundary.
+Saving records the revision without creating another edit. Coverage also reports
+how many observed changes have no human attribution.
+
+The recommended local build from `npm run install:local:editor-origins` uses VS Code's
+proposed `textDocumentChangeReason` API when enabled. It captures Backspace,
+Delete, Tab, and other editor input directly, and retains explicit origins for
+programmatic, formatting, disk, and completion changes without counting them as
+human-written code. The ordinary package stays on stable APIs and has partial
+coverage: unspecified selection events cannot safely distinguish deletion from
+automatic changes. Corrections that remove only text already typed in the active
+human edit are retained as `typing_correction` indicators. Deletion of pre-existing
+code still requires stronger input evidence. See [local setup and attribution rules](../../docs/vscode-human-work.md#optional-local-build-with-editor-origins).
+The output channel reports the loaded extension version/path and the attribution
+mode observed on the first change.
+
+Version 0.1.8 keeps unconfirmed changes visible as **unattributed** file rows
+with their exact diffs. They coalesce separately from human input, never count
+as human edits, and never become additional AI-origin code in coverage reports.
+Direct input reasons bypass the selection timer entirely. The stable fallback
+waits at most 250 ms for a matching selection, then publishes an unattributed
+edit instead of silently omitting it. The status bar explicitly identifies
+limited attribution. The read-only `editchain-history.trackingStatus` command
+returns the observed mode and capture counters without flushing pending work.
+
+Version 0.1.9 gives coverage reports, Git-context observation, and edit recording
+separate native connections. A slow coverage replay no longer queues typing or
+saves behind it. Repeated report requests share one worker, which is released
+when the report finishes or the extension stops. Slow capture deliveries log
+queue time, request time, and the oldest event's age; renderer timings remain
+separate. The status diagnostic includes the running VS Code client, extension
+version, proposal declarations, and the input mode actually observed.
+
+Version 0.1.4 retains the read receipt for an unchanged document revision and
+viewport across interruptions, including replacement editor objects when a tab
+returns. A qualified view has no recurring timer. Reloading VS Code still starts
+a fresh recording, and a newly loaded document starts a new incarnation.
+
+Version 0.1.3 removes the extra file disclosure from each human edit. The file
+name and status appear directly on its connected graph row; one click opens
+the retained diff. Episode folding still summarizes the full human episode.
+The native service upgrades human edit rows from the 0.1.2 live cache without
+rewriting recordings or resetting explicit episode disclosure choices.
+
+Version 0.1.2 keeps one unsigned human identity GUID in the extension's local
+profile storage. A reload starts a new capture session, while its reads, edits,
+and tab lifecycle continue the same human branch for that workspace and chain.
+Pauses and 30-second episode boundaries do not replace the identity. The GUID
+requires no account or signature. Different profiles and worktrees stay
+separate; historical sessions without a GUID retain their original attribution.
+The stored file is `unsigned-human-identity.json` under the extension's global
+storage directory. Tracking remains enabled by default; an explicit pause is
+still respected.
+
+Events remain local: a bounded outbox in VS Code workspace storage retries
+`RecordEditorEvents` until the service acknowledges durable chain writes.
+Version 0.1.10 retains full before/after snapshots for files up to 8 MiB, with
+matching native replay, coverage-report, and transport limits. Unchanged text
+reuses the previous snapshot's JSON encoding, while each event still carries
+both complete snapshots. The outbox sends its saved UTF-8 bytes directly; a
+snapshot event above the normal 4 MiB batch target travels alone. Each durable
+batch can deliver while later snapshots are written. Journal writes submit the
+full buffer and retry short writes. Reading the next pending journal overlaps
+the current request; transport avoids decoding and re-encoding the saved JSON.
+Freshly persisted source events are reused by native projection without another
+disk read and JSON decode. Ordinary single-range validation compares complete
+text regions without allocating whole-buffer UTF-16 copies. Historical replay
+still verifies retained blobs.
+Queued serialized data is capped at 256 MiB and pending disk data at 512 MiB.
+Failures appear in the tracking status item and EditChain History output.
+The outbox schedules persistence after **25 ms**, with a one-second recovery
+poll and a **50 ms** retry for writer contention. Acknowledged human work wakes
+History ahead of provider backlog processing. The native service retains an
+incremental `editor-v1` checkpoint across recorder processes, avoiding repeated
+full-history scans. A sudden host or machine failure can lose the not-yet-persisted
+tail. Outbox overflow pauses
+recording with a gap event. Raw snapshots include code contents and are retained
+in the append-only chain, so storage grows with editing activity.
+
+See [the event and measurement contract](../../docs/vscode-human-work.md) for
+matching rules, supported evidence, limitations, and test commands.
+
 ## Live Codex history
 
 Open **EditChain: Open History Explorer** in a trusted workspace. Live updates
@@ -83,7 +245,8 @@ Set `editchain-history.live.enabled` to `false` to open static history by defaul
   starts folded, and scrolling back alone does not reopen it. Prefetched rows
   do not count as viewed. Explicit opens and closes persist across scrolling,
   new records and restarts. The activity-count
-  button toggles the task path; each item's file/output chevron remains separate.
+  button toggles the task path. Human edits show the file on the activity row;
+  agent file/output details retain their own chevron.
   Forks, merges, Git attachments and unresolved/error activity remain visible.
   Concurrent tasks retain chronological order without repeated header rows.
   Ordinary updates edit individual items and affected anchors, without resending
@@ -172,6 +335,9 @@ The native service supports these request bodies:
 - `GetNodeDetails`
 - `ResolveObject`
 - `GetFileDiff`
+- `RecordEditorEvents` (recorder host only)
+- `GetEditorContext` (independent Git observation)
+- `GetHumanWork` (coverage report)
 
 The generic webview bridge permits only `GetWindow`, `LocateRows`, and `FindInHistory` and
 requires an exact one-key request envelope. Details and file diffs are explicit
@@ -204,6 +370,8 @@ npm run ui:vscode
 npm run ui:vscode:renderer
 npm run ui:vscode:visual
 npm run ui:vscode:live
+npm run test:capture:types
+npm run ui:vscode:work
 ```
 
 The harness verifies the exact minimal request envelopes, virtual paging,
@@ -227,6 +395,46 @@ For repository-wide Rust formatting, clippy, tests, docs, and dependency
 policy, run `./scripts/lint.sh` from the repository root.
 
 ## Packaging
+
+For direct input attribution in a local VSIX installation:
+
+```sh
+npm run install:local:editor-origins -- --runtime-args "$HOME/.vscode/argv.json"
+```
+
+Use the runtime-arguments file opened by **Preferences: Configure Runtime
+Arguments** for your VS Code installation. The installer preserves comments,
+existing settings and other opt-ins, backs up an existing file, and enables
+`textDocumentChangeReason` only for `ambientlight.editchain-history`. It builds
+and installs the matching service, renderer and extension. **Quit and reopen
+VS Code** afterward: changing runtime arguments requires a full application
+restart. The next edit must report `direct document change reasons` in Output.
+This locally enabled API is still proposed; the ordinary Marketplace-compatible
+package retains the stable fallback. [Microsoft's distribution guidance](https://code.visualstudio.com/api/advanced-topics/using-proposed-api).
+
+To build and install the current checkout together with its native service:
+
+```sh
+npm run install:local
+```
+
+This rebuilds the service, renderer, and host, packages the version in
+`package.json`, installs that exact VSIX, and verifies VS Code selected it.
+Then run **Developer: Reload Window**. Check **Output → EditChain History** for
+the loaded version/path. New recordings also retain `extension_version` in
+`tracking_started`. A command ending in an older filename such as
+`--install-extension ./editchain-history-0.1.0.vsix` reinstalls the old recorder,
+even after successfully building a newer package.
+
+To target a particular VS Code installation/profile, pass its CLI and options:
+
+```sh
+npm run install:local -- /path/to/code --user-data-dir /path/to/profile --extensions-dir /path/to/extensions
+```
+
+The service path printed by the installer must match
+`editchain-history.servicePath` when that setting is explicitly configured.
+For packaging without installation:
 
 ```sh
 npm run build:renderer

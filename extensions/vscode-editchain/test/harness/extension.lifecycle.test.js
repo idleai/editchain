@@ -37,6 +37,25 @@ const deltaBody = (revision) => ({ Ok: { epoch: 'epoch', revision, work: {}, del
   removed: [], upserts: [],
 }] } });
 
+test('changing recorder settings preserves the retained History service', async () => {
+  const env = loadExtension();
+  env.open();
+  const panel = env.panels[0];
+  await rendererReady(panel);
+  env.client.openRequests[0].resolve(openBody('workspace'));
+  await flush();
+  const fire = key => env.vscode.workspace.configurationChanged({
+    affectsConfiguration: name => key === name || key.startsWith(name + '.'),
+  });
+  fire('editchain-history.tracking.enabled');
+  fire('editchain-history.tracking.readDwellMs');
+  assert.equal(env.client.openRequests.length, 1, 'tracking does not rebuild History');
+  fire('editchain-history.chainDir');
+  assert.equal(env.client.openRequests.length, 2, 'a different chain still reopens History');
+  env.client.openRequests[1].resolve(openBody('other'));
+  await flush();
+});
+
 test('viewport reports coalesce behind a live publication and obsolete snapshots are dropped', async () => {
   const env = loadExtension();
   env.open();
@@ -87,7 +106,7 @@ module.exports = {
   __esModule: true,
   workspace: {
     onDidChangeWorkspaceFolders: () => ({ dispose() {} }),
-    onDidChangeConfiguration: () => ({ dispose() {} }),
+    onDidChangeConfiguration: callback => { module.exports.workspace.configurationChanged = callback; return { dispose() {} }; },
     workspaceFolders: [{ uri: (${uri.toString()})('/ws') }],
     getConfiguration: () => ({ get: (_key, def) => def }),
     registerTextDocumentContentProvider: (scheme, provider) => {
@@ -205,7 +224,7 @@ function loadExtension(settings = { 'live.enabled': false }) {
   writeFakeStdioClient();
   fs.writeFileSync(fakeLivePath, `const instances = [];
 exports.createLiveSync = (_service, publish, status) => {
-  const live = { publish, status, wakes: 0, disposed: false, wake() { this.wakes++; status('Scanning Codex sessions…'); }, dispose() { this.disposed = true; } };
+  const live = { publish, status, wakes: 0, humanWakes: 0, disposed: false, wake() { this.wakes++; status('Scanning Codex sessions…'); }, humanChanged() { this.humanWakes++; this.wake(); }, dispose() { this.disposed = true; } };
   instances.push(live); return live;
 }; exports.instances = instances;`);
   const origResolveFilename = Module._resolveFilename;
@@ -318,6 +337,7 @@ test('history opens live by default, waits for delta acknowledgement, and resume
   assert.equal(env.live.length, 0, 'capture waits for the saved first viewport');
   await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'base', error: null });
   assert.equal(env.live.length, 1);
+  assert.equal(env.live[0].humanWakes, 1, 'initial attach consumes editor work acknowledged before the panel was ready');
   env.live[0].status('Importing Codex changes (32/65 queued)…');
   await panel.handlers.message({ type: 'status', loaded: 5, total: 90 });
   assert.match(env.statusItem.text, /5 \/ 90 nodes.*32\/65 queued/, 'row-count updates retain import progress');
@@ -678,6 +698,60 @@ test('openDiff resolves service content into VS Code native virtual documents', 
   assert.ok(registration, 'the read-only diff content provider is registered');
   assert.equal(registration.provider.provideTextDocumentContent(command[1]), 'fn old() {}\n');
   assert.equal(registration.provider.provideTextDocumentContent(command[2]), 'fn new() {}\n');
+});
+
+test('a live diff race waits for publication and revalidates the same recorded edit once', async t => {
+  const env = loadExtension({});
+  env.vscode.workspace.isTrusted = true;
+  env.open();
+  const panel = env.panels[0];
+  t.after(() => panel.handlers.dispose());
+  await rendererReady(panel);
+  env.client.openRequests[0].resolve(liveBody('epoch:0'));
+  await flush();
+  env.client.nextResponse = deltaBody(1);
+  await panel.handlers.message({ type: 'toggleDisclosure', key: 'human:1', task: true });
+  await flush();
+  const change = { source: 'human', path: 'ai.ts', op_id: '1:1:2', base: 'before', after: 'after' };
+  env.client.nextResponse = { Error: { code: 'stale_snapshot', message: 'History advanced' } };
+  const clicked = panel.handlers.message({ type: 'openDiff', snapshot_id: 'epoch:0', change });
+  await flush();
+  assert.equal(env.client.requests.filter(request => request.body.GetFileDiff).length, 1);
+  assert.equal(env.vscode.__executedCommands.length, 0, 'retry waits for the renderer acknowledgement');
+  env.client.nextResponse = { Ok: { snapshot_id: 'epoch:1', path: 'ai.ts', before: 'AI\n', after: 'human\n' } };
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'epoch:1', error: null });
+  await clicked;
+  assert.deepEqual(env.client.requests.filter(request => request.body.GetFileDiff).map(request => request.body.GetFileDiff), [
+    { snapshot_id: 'epoch:0', change }, { snapshot_id: 'epoch:1', change },
+  ]);
+  const command = env.vscode.__executedCommands[0];
+  assert.equal(command[3], 'ai.ts (human)');
+  const provider = env.vscode.__providers.find(entry => entry.scheme === 'editchain-diff').provider;
+  assert.equal(provider.provideTextDocumentContent(command[1]), 'AI\n');
+  assert.equal(provider.provideTextDocumentContent(command[2]), 'human\n');
+  env.client.nextResponse = { Error: { code: 'stale_snapshot', message: 'Unrelated view' } };
+  await panel.handlers.message({ type: 'openDiff', snapshot_id: 'other:0', change });
+  assert.equal(env.client.requests.filter(request => request.body.GetFileDiff).length, 3, 'an unrelated epoch never retries');
+  assert.equal(env.vscode.__executedCommands.length, 1);
+});
+
+test('disposing a live panel cancels its pending diff revalidation', async () => {
+  const env = loadExtension({});
+  env.open();
+  const panel = env.panels[0];
+  await rendererReady(panel);
+  env.client.openRequests[0].resolve(liveBody('epoch:0'));
+  await flush();
+  env.client.nextResponse = deltaBody(1);
+  await panel.handlers.message({ type: 'toggleDisclosure', key: 'human:1', task: true });
+  await flush();
+  env.client.nextResponse = { Error: { code: 'stale_snapshot', message: 'History advanced' } };
+  const clicked = panel.handlers.message({ type: 'openDiff', snapshot_id: 'epoch:0', change: { source: 'human' } });
+  await flush();
+  panel.handlers.dispose();
+  await clicked;
+  assert.equal(env.client.requests.filter(request => request.body.GetFileDiff).length, 1);
+  assert.equal(env.vscode.__executedCommands.length, 0, 'a replaced view cannot open an edit from a newer view');
 });
 
 test('openDiff keeps one structured hunk flat in the ordinary diff editor', async () => {

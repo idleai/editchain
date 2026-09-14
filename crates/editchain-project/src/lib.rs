@@ -11,6 +11,8 @@ pub mod activity;
 pub mod activity_view;
 pub mod content;
 pub mod git;
+/// Human work semantics shared by historical and live projections.
+pub mod human;
 /// Deterministic lane layout for graph rendering.
 pub mod layout;
 /// Mutable logical-item projection for the live activity view.

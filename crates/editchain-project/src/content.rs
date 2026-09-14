@@ -333,6 +333,9 @@ pub(super) fn collapsed_import(
     children: Option<&Vec<&Op>>,
     incomplete: &HashSet<OpId>,
 ) -> SelectedContent {
+    if let Some(record) = crate::human::work_record(raw) {
+        return SelectedContent::summary(record.summary);
+    }
     let mut parts = ImportParts::default();
     if let Some(children) = children {
         for child in children {

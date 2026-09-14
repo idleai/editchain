@@ -446,15 +446,19 @@ impl HistoryAppState {
     pub(crate) fn fetch_window(&mut self, viewport: &Viewport, step: &mut Step) {
         let live_viewport = self.live.as_ref().and_then(|live| live.viewport);
         let viewport = live_viewport.as_ref().unwrap_or(viewport);
-        let (top, bottom) = if self.cache.byte_limited() {
-            let (top, bottom) = self.viewport_range(viewport);
-            (
-                self.abs_index_for_visible(top).unwrap_or(0),
-                self.abs_index_for_visible(bottom).unwrap_or(0),
-            )
-        } else {
-            self.desired_cache_range(viewport)
-        };
+        // A native live handoff needs only the replacement viewport before
+        // acknowledging. Loading the 400-row prefetch margin here delays every
+        // edit; the progressive loader fills that margin after publication.
+        let (top, bottom) =
+            if self.cache.byte_limited() || (self.remote.is_some() && self.live.is_some()) {
+                let (top, bottom) = self.viewport_range(viewport);
+                (
+                    self.abs_index_for_visible(top).unwrap_or(0),
+                    self.abs_index_for_visible(bottom).unwrap_or(0),
+                )
+            } else {
+                self.desired_cache_range(viewport)
+            };
         self.fetch_range(top, bottom, step);
     }
 
@@ -1481,7 +1485,10 @@ impl HistoryAppState {
                         Err(error) => self.fail_response(&req.body, &error, step),
                     }
                 }
-                RequestBody::Open(_)
+                RequestBody::RecordEditorEvents(_)
+                | RequestBody::GetHumanWork(_)
+                | RequestBody::GetEditorContext(_)
+                | RequestBody::Open(_)
                 | RequestBody::OpenLive(_)
                 | RequestBody::OpenLivePaged(_)
                 | RequestBody::SyncLive(_)

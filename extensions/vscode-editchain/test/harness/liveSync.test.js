@@ -13,6 +13,20 @@ async function until(predicate) {
   assert.ok(predicate(), 'live transition completed');
 }
 
+test('acknowledged human work publishes before a failing provider backlog retries', async t => {
+  const order = [];
+  const loop = new LiveSync({
+    capture: async () => ({ sessions: new Map([['archive', '1']]), titles: '', history: '' }),
+    importFiles: async () => { order.push('import'); throw new Error('provider unavailable'); },
+    publish: async () => { order.push('human'); }, status() {}, pollNative: true,
+  }, 60000);
+  t.after(() => loop.dispose());
+  loop.wake(); await until(() => order.length === 1);
+  loop.humanChanged();
+  await until(() => order.length === 3);
+  assert.deepEqual(order, ['import', 'human', 'import']);
+});
+
 test('growth during import and publication coalesces without overlapping work or losing the next edit', async t => {
   let stamp = 'first'; let history = 'empty';
   const importing = deferred(); const publishing = deferred();
