@@ -125,6 +125,11 @@ describe('realtime human work without forced flushing', () => {
     }, { timeout: 1000, interval: 25 });
     assert.equal((await rows('realtime-edit.ts', started)).length, 1);
     await webview.close();
+    // Switching WebDriver frames does not focus the code editor. Route the
+    // actual save shortcut to that editor after inspecting the History frame.
+    await browser.executeWorkbench(vscode => vscode.commands.executeCommand('workbench.action.focusFirstEditorGroup'));
+    await browser.waitUntil(async () => browser.execute(() => !!document.activeElement?.closest('.monaco-editor')),
+      { timeout: 1000, timeoutMsg: 'code editor did not receive focus before save' });
     const savedAt = Date.now();
     await browser.keys(['Control', 's']);
     let saved: any;
@@ -193,8 +198,8 @@ describe('realtime human work without forced flushing', () => {
       const row = (await rows('realtime-delete.ts', 0, first.continuity_key))[0];
       return !!row?.file_change && row.file_change.op_id !== first.file_change.op_id;
     }, { timeout: 1000, interval: 25 });
-    assert.equal((await rows('realtime-delete.ts', started)).length, 1);
     await browser.execute(() => (window as any).__editchainRendererDebug.whenIdle(10000));
+    assert.equal((await rows('realtime-delete.ts', started)).length, 1);
     await browser.saveScreenshot(path.join(output, 'existing-code-deletions.png'));
     await webview.close();
   });

@@ -14,6 +14,7 @@ use crate::history::{
 #[derive(Debug)]
 pub struct Server {
     live: Option<crate::history::LiveWorkspace>,
+    editor_encoding: crate::editor::Encoding,
     /// The currently loaded workspace (None until `Open`).
     pub workspace: Option<Workspace>,
     /// The immutable lexical search index bound to the opened snapshot (built
@@ -27,6 +28,7 @@ impl Server {
     pub fn new() -> Self {
         Self {
             live: None,
+            editor_encoding: crate::editor::Encoding::default(),
             workspace: None,
             lexical: None,
         }
@@ -100,7 +102,7 @@ impl Server {
         if let RequestBody::RecordEditorEvents(batch) = &request.body {
             return Ok(Response {
                 id,
-                body: ResponseBody::Ok(crate::editor::record(batch)?),
+                body: ResponseBody::Ok(crate::editor::record(batch, &mut self.editor_encoding)?),
             });
         }
         if let RequestBody::GetHumanWork(open) = &request.body {

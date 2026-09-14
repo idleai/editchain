@@ -56,7 +56,7 @@ fn read_frame(reader: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
     if len > MAX_REQUEST_FRAME_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "request frame exceeds 8 MiB",
+            format!("request frame exceeds {MAX_REQUEST_FRAME_BYTES} bytes"),
         ));
     }
     let mut payload = vec![0u8; len];

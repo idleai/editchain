@@ -158,13 +158,36 @@ export class StdioClient {
    * killed by a fixed 10s timeout.
    */
   request(body: any, opts?: { timeoutMs?: number }): Promise<any> {
+    return this.writeRequest(() => JSON.stringify(body), opts);
+  }
+
+  /** Send an already serialized durable body without re-encoding its snapshots. */
+  requestJson(body: Buffer | Buffer[], opts?: { timeoutMs?: number }): Promise<any> {
+    return this.writeRequest(() => body, opts);
+  }
+
+  private writeRequest(serialize: () => string | Buffer | Buffer[], opts?: { timeoutMs?: number }): Promise<any> {
     const proc = this.proc;
     if (!this.running || !proc) {
       return Promise.reject(new Error('[editchain] service is not running'));
     }
     const id = this.nextId++;
-    const msg = { id, body };
     return new Promise((resolve, reject) => {
+      const body = serialize();
+      const parts = Array.isArray(body) ? body : [body];
+      const prefix = `{"id":${id},"body":`;
+      const prefixLength = Buffer.byteLength(prefix);
+      const length = prefixLength + parts.reduce((total, part) => total + Buffer.byteLength(part), 0) + 1;
+      // Encode straight into the final frame; large snapshots need no second
+      // full payload allocation/copy just to prepend their four-byte length.
+      const frame = Buffer.allocUnsafe(4 + length);
+      frame.writeUInt32LE(length, 0);
+      frame.write(prefix, 4, 'utf8');
+      let offset = 4 + prefixLength;
+      for (const part of parts) {
+        offset += typeof part === 'string' ? frame.write(part, offset, 'utf8') : part.copy(frame, offset);
+      }
+      frame[frame.length - 1] = 0x7d;
       const req: PendingRequest = {
         resolve,
         reject,
@@ -180,11 +203,8 @@ export class StdioClient {
         }, timeoutMs);
       }
       this.pending.set(id, req);
-      const payload = Buffer.from(JSON.stringify(msg), 'utf8');
-      const header = Buffer.alloc(4);
-      header.writeUInt32LE(payload.length, 0);
       try {
-        proc.stdin.write(Buffer.concat([header, payload]));
+        proc.stdin.write(frame);
       } catch (e) {
         // The write failed synchronously (e.g. writing to a destroyed stdin
         // stream). The process can no longer receive requests, so tear down

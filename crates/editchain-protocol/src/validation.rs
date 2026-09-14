@@ -3,7 +3,9 @@
 use crate::{ErrorCode, RequestBody, ServiceError};
 
 /// Maximum encoded request frame; checked before allocating its payload.
-pub const MAX_REQUEST_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// An editor event can include three 8 MiB texts (before, after, replacement),
+/// each expanding sixfold in JSON, plus bounded metadata.
+pub const MAX_REQUEST_FRAME_BYTES: usize = 160 * 1024 * 1024;
 /// Maximum expanded rows requested in one page.
 pub const MAX_WINDOW_ROWS: u64 = 10_000;
 /// Maximum ranked visible matches requested by a client.

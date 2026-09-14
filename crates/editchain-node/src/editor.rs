@@ -1,11 +1,15 @@
 //! Durable admission of versioned VS Code observations.
 
 mod context;
+mod encoding;
+#[cfg(test)]
+mod encoding_tests;
 mod identity;
 mod normalize;
 mod order;
 mod projection;
 pub(crate) use context::observe_context;
+pub(crate) use encoding::Encoding;
 
 use std::collections::BTreeMap;
 use std::io;
@@ -23,11 +27,18 @@ use editchain_store::{
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-pub(crate) fn record(request: &RecordEditorEvents) -> Result<serde_json::Value> {
-    editchain_index::boundary(|| record_inner(request))?
+pub(crate) fn record(
+    request: &RecordEditorEvents,
+    encoding: &mut Encoding,
+) -> Result<serde_json::Value> {
+    editchain_index::boundary(|| record_inner(request, encoding))?
 }
 
-fn record_inner(request: &RecordEditorEvents) -> Result<serde_json::Value> {
+fn record_inner(
+    request: &RecordEditorEvents,
+    encoding: &mut Encoding,
+) -> Result<serde_json::Value> {
+    let started = std::time::Instant::now();
     let root = PathBuf::from(&request.workspace_path).join(&request.chain_dir);
     // Capture processes share a durable, incrementally paged index. Release
     // its ownership after every batch so another editor window can record.
@@ -39,15 +50,16 @@ fn record_inner(request: &RecordEditorEvents) -> Result<serde_json::Value> {
     projection.refresh()?;
     let mut blobs = BlobStore::new(root.join("blobs"))?;
     identity::repair(&request.events, projection.tail.chain(), &mut blobs)?;
-    projection.synchronize(&mut store, &mut blobs, request)?;
+    projection.synchronize(&mut store, &mut blobs, request, &BTreeMap::new())?;
+    let prepared_ms = started.elapsed().as_millis();
     let mut staged = editchain_core::OpSet::new();
     let mut sources = BTreeMap::new();
+    let mut fresh = BTreeMap::new();
     let mut page = Page::new(0);
     let mut accepted = 0_u64;
     let mut replayed = 0_u64;
     for event in &request.events {
-        let raw =
-            serde_json::to_vec(&serde_json::json!({"source":"vscode.editor", "event":event}))?;
+        let raw = encoding.encode(event)?;
         let op = projection.source(event, &raw, &sources)?;
         let encoded = encode_op(&op)?;
         let admission = match projection.tail.chain().classify(op.id, &encoded)? {
@@ -73,6 +85,7 @@ fn record_inner(request: &RecordEditorEvents) -> Result<serde_json::Value> {
                 projection.admitted(event, op.id);
                 drop(sources.insert(op.id, op.clone()));
                 blobs.write(&raw)?;
+                let _previous = fresh.insert(op.id, event);
                 // A live reader can stop at any complete record. Admit the
                 // source classification first so a raw buffer observation
                 // never temporarily becomes a primary activity row.
@@ -100,18 +113,21 @@ fn record_inner(request: &RecordEditorEvents) -> Result<serde_json::Value> {
     if accepted > 0 {
         store.append_page(&page)?;
     }
+    let stored_ms = started.elapsed().as_millis();
     // Raw retries repair missing payloads before any derived replay reads them.
-    projection.synchronize(&mut store, &mut blobs, request)?;
+    projection.synchronize(&mut store, &mut blobs, request, &fresh)?;
     drop(store);
     projection.checkpoint(&checkpoint)?;
     // An acknowledgement is returned only after blob and segment fsync.
     Ok(
         serde_json::json!({"schema":1, "accepted":accepted, "replayed":replayed,
-            "work":{"bootstrap":projection.bootstrapped,"records_decoded":projection.records_decoded},
+            "work":{"bootstrap":projection.bootstrapped,"records_decoded":projection.records_decoded,
+                "prepare_ms":prepared_ms,"store_ms":stored_ms.saturating_sub(prepared_ms),
+                "project_ms":started.elapsed().as_millis().saturating_sub(stored_ms)},
             "ack":request.events.iter().map(|event| (&event.session, event.sequence)).collect::<Vec<_>>() }),
     )
 }
-fn event_op(event: &EditorEvent, raw: &[u8]) -> io::Result<Op> {
+fn event_id(event: &EditorEvent) -> io::Result<OpId> {
     let digest = blake3::derive_key(
         "editchain.vscode.editor.session.v1",
         event.session.as_bytes(),
@@ -128,11 +144,15 @@ fn event_op(event: &EditorEvent, raw: &[u8]) -> io::Result<Op> {
             .get(8..12)
             .ok_or_else(|| io::Error::other("invalid hash"))?,
     );
-    let id = OpId {
+    Ok(OpId {
         node: NodeId(u64::from_le_bytes(node)),
         boot: u32::from_le_bytes(boot),
         seq: event.sequence,
-    };
+    })
+}
+
+fn event_op(event: &EditorEvent, raw: &[u8]) -> io::Result<Op> {
+    let id = event_id(event)?;
     let hash = *blake3::hash(raw).as_bytes();
     Ok(Op {
         id,

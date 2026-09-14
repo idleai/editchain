@@ -7,7 +7,7 @@ use std::path::{Component, Path};
 
 use editchain_core::{Op, OpKind, Payload, Tags};
 use editchain_protocol::{
-    editor::{EditorDocument, EditorEvent, EditorEventKind, EditorRange},
+    editor::{EditorDocument, EditorEvent, EditorEventKind, EditorRange, MAX_EDITOR_BUFFER_BYTES},
     OpenRequest,
 };
 use serde_json::{json, Value};
@@ -514,8 +514,11 @@ fn current_file(root: &Path, relative: &str) -> Option<String> {
         return None;
     }
     let path = root.join(relative).canonicalize().ok()?;
-    if !path.starts_with(root.canonicalize().ok()?) || path.metadata().ok()?.len() > 1_048_576 {
+    if !path.starts_with(root.canonicalize().ok()?)
+        || path.metadata().ok()?.len() > u64::try_from(MAX_EDITOR_BUFFER_BYTES).ok()?
+    {
         return None;
     }
-    std::fs::read_to_string(path).ok()
+    let text = std::fs::read_to_string(path).ok()?;
+    (text.len() <= MAX_EDITOR_BUFFER_BYTES).then_some(text)
 }

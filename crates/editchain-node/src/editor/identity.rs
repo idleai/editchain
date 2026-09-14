@@ -23,10 +23,12 @@ pub(super) fn repair(
     blobs: &mut BlobStore,
 ) -> super::Result<()> {
     for event in events {
-        let raw =
-            serde_json::to_vec(&serde_json::json!({"source":"vscode.editor", "event":event}))?;
-        let mut expected = super::event_op(event, &raw)?;
-        if let Some(retained) = chain.get(expected.id) {
+        // New observations have nothing to repair. Avoid encoding and hashing
+        // their full snapshots a second time just to look up a recorder ID.
+        if let Some(retained) = chain.get(super::event_id(event)?) {
+            let raw =
+                serde_json::to_vec(&serde_json::json!({"source":"vscode.editor", "event":event}))?;
+            let mut expected = super::event_op(event, &raw)?;
             if event.identity.is_some() {
                 expected.parents = retained.parents.clone();
             }

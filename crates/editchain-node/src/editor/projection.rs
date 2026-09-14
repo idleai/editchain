@@ -7,6 +7,7 @@ use editchain_store::{
     format::{encode_op, Page},
     BlobReader, BlobStore, IndexedTail, SegmentStore,
 };
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::rc::Rc;
@@ -108,6 +109,7 @@ impl Projection {
         store: &mut SegmentStore,
         blobs: &mut BlobStore,
         request: &editchain_protocol::editor::RecordEditorEvents,
+        fresh: &BTreeMap<OpId, &EditorEvent>,
     ) -> Result<()> {
         self.refresh()?;
         let chain = Path::new(&request.workspace_path).join(&request.chain_dir);
@@ -119,8 +121,15 @@ impl Projection {
         let mut page = Page::new(0);
         let mut count = 0_usize;
         for source in &sources {
-            let Some(event) = event(source, &reader)? else {
-                continue;
+            // Newly persisted observations already have validated, exact text
+            // in this request. Historical replay still verifies stored blobs.
+            let event = if let Some(event) = fresh.get(&source.id) {
+                Cow::Borrowed(*event)
+            } else {
+                let Some(event) = event(source, &reader)? else {
+                    continue;
+                };
+                Cow::Owned(event)
             };
             for op in self.normalizer.observe(&event, source.id, blobs)? {
                 let encoded = encode_op(&op)?;

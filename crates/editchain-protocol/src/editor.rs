@@ -2,6 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 
+mod replay;
+
+/// Maximum UTF-8 snapshot size; shared with the VS Code recorder's limit.
+pub const MAX_EDITOR_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+
 /// One durable, replayable batch from a workspace recorder.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -410,6 +415,8 @@ impl EditorEvent {
                 reason,
                 origin,
             } => {
+                validate_snapshot(before)?;
+                validate_snapshot(after)?;
                 if let Some(origin) = origin {
                     origin.validate()?;
                 }
@@ -422,27 +429,7 @@ impl EditorEvent {
                 {
                     return Err("invalid document change revision or reason");
                 }
-                let mut text: Vec<_> = before.encode_utf16().collect();
-                for change in changes {
-                    let start =
-                        usize::try_from(change.offset).map_err(|_error| "invalid edit offset")?;
-                    let end = start
-                        .checked_add(
-                            usize::try_from(change.length)
-                                .map_err(|_error| "invalid edit length")?,
-                        )
-                        .ok_or("edit overflow")?;
-                    if start > end || end > text.len() {
-                        return Err("edit outside source buffer");
-                    }
-                    drop(text.splice(start..end, change.text.encode_utf16()));
-                    if text.len() > 1_048_576 {
-                        return Err("editor buffer exceeds capture limit");
-                    }
-                }
-                if !text.iter().copied().eq(after.encode_utf16()) {
-                    return Err("editor changes do not replay to recorded after text");
-                }
+                replay::validate(before, after, changes)?;
             }
             EditorEventKind::HumanEdit { signal, .. } => {
                 if !matches!(
@@ -499,7 +486,10 @@ impl EditorEvent {
             | EditorEventKind::CodeRead { ranges, .. } => {
                 for range in ranges {
                     if range.start > range.end
-                        || range.end.into_iter().any(|value| value > 1_048_576)
+                        || range.end.into_iter().any(|value| {
+                            usize::try_from(value)
+                                .map_or(true, |value| value > MAX_EDITOR_BUFFER_BYTES)
+                        })
                     {
                         return Err("invalid editor range");
                     }
@@ -512,9 +502,9 @@ impl EditorEvent {
                     }
                 }
             }
+            EditorEventKind::DocumentSnapshot { text, .. } => validate_snapshot(text)?,
             EditorEventKind::TrackingStopped
             | EditorEventKind::TrackingGap { .. }
-            | EditorEventKind::DocumentSnapshot { .. }
             | EditorEventKind::DocumentSaved { .. }
             | EditorEventKind::DocumentRenamed { .. }
             | EditorEventKind::EditorOpened { .. }
@@ -567,4 +557,11 @@ impl EditorEvent {
         }
         Ok(())
     }
+}
+
+fn validate_snapshot(text: &str) -> Result<(), &'static str> {
+    if text.len() > MAX_EDITOR_BUFFER_BYTES {
+        return Err("editor snapshot exceeds 8 MiB capture limit");
+    }
+    Ok(())
 }

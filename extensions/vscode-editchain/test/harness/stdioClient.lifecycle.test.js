@@ -139,6 +139,23 @@ test('default service path falls back to debug when release is absent', () => {
   assert.equal(resolveDefaultServicePath(root, () => false), debug);
 });
 
+test('serialized UTF-8 capture frames preserve exact text and can interleave with object requests', async (t) => {
+  const client = new StdioClient();
+  t.after(() => client.stop());
+  client.start(RESPONDER);
+  const body = { before: '😀 é\n\\"\u0001'.repeat(10000), after: 'human 🦀 edit' };
+  const bytes = Buffer.from(JSON.stringify(body));
+  bytes.toString = () => { throw new Error('durable UTF-8 must not be decoded for transport'); };
+  const [captured, ordinary, fragmented] = await Promise.all([
+    client.requestJson(bytes, { timeoutMs: 5000 }), client.request({ ping: true }),
+    client.requestJson([Buffer.from('{"nested":'), bytes, Buffer.from('}')], { timeoutMs: 5000 }),
+  ]);
+  assert.deepEqual(captured.echo, body);
+  assert.deepEqual(ordinary.echo, { ping: true });
+  assert.notEqual(captured.id, ordinary.id);
+  assert.deepEqual(fragmented.echo, { nested: body });
+});
+
 test('killed child\'s late exit event cannot tear down a replacement process', async (t) => {
   const client = new StdioClient();
   t.after(() => client.stop());

@@ -19,8 +19,9 @@ async function caret(column: number, anchor = column): Promise<void> {
   await browser.executeWorkbench((vscode, column, anchor) => {
     vscode.window.activeTextEditor.selection = new vscode.Selection(0, anchor, 0, column);
   }, column, anchor);
-  await browser.waitUntil(async () => browser.execute(expected => Array.from(document.querySelectorAll('.statusbar-item'))
-    .some(item => item.textContent.includes(expected)), `Ln 1, Col ${column + 1}`), { timeout: 10000 });
+  await browser.waitUntil(async () => browser.execute((expected, selected) => Array.from(document.querySelectorAll('.statusbar-item'))
+    .some(item => item.textContent.includes(expected) && (!selected || item.textContent.includes(`${selected} selected`))),
+  `Ln 1, Col ${column + 1}`, Math.abs(column - anchor)), { timeout: 10000 });
 }
 
 async function evidence(name: string): Promise<{ changes: any[]; human: any[]; saves: any[]; edits: any[] }> {
@@ -144,10 +145,17 @@ describe('production edit attribution', () => {
     await fixture('clipboard');
     await browser.executeWorkbench(async vscode => vscode.env.clipboard.writeText(' PASTED'));
     await browser.keys(['Control', 'v']);
+    // Paste is asynchronous. Its final caret update must land before setting
+    // the selection, or Backspace can remove pasted text instead of baseline.
+    await browser.waitUntil(async () => browser.executeWorkbench(vscode =>
+      vscode.window.activeTextEditor.document.getText() === 'baseline PASTED'), { timeout: 1000 });
+    await browser.waitUntil(async () => browser.execute(() => Array.from(document.querySelectorAll('.statusbar-item'))
+      .some(item => item.textContent.includes('Ln 1, Col 16'))), { timeout: 1000 });
     await caret(8, 0);
     await browser.keys('Backspace');
     const result = await evidence('clipboard');
     assert.equal(result.changes.length, 2);
+    assert.equal(result.changes[1].event.after, ' PASTED', 'the selected baseline was deleted');
     assert.equal(result.human.length, proposed ? 2 : 1);
   });
 

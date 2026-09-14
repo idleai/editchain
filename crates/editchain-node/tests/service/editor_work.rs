@@ -11,6 +11,9 @@ mod graph;
 #[path = "editor_work/attribution.rs"]
 mod attribution;
 
+#[path = "editor_work/large_snapshots.rs"]
+mod large_snapshots;
+
 const SESSION: &str = "11111111-1111-4111-8111-111111111111";
 
 fn event(sequence: u64, data: Value) -> Value {

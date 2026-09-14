@@ -7,6 +7,7 @@ import { observeEditorContext } from './editorContext';
 import { StdioClient, resolveServicePath } from './stdioClient';
 import { unsignedIdentity, workspaceIdentity } from './humanIdentity';
 import { EditorHealth } from './editorHealth';
+import { MAX_EDITOR_BUFFER_BYTES } from './editorLimits';
 
 type Recorder = { capture: EditorCapture; context: { dispose(): void }; contextClient: StdioClient; outbox: EditorOutbox; client: StdioClient; folder: vscode.WorkspaceFolder; chain: string; health: EditorHealth };
 
@@ -80,11 +81,12 @@ export class HumanWorkHost {
         const outbox = new EditorOutbox(path.join(this.context.storageUri.fsPath, 'editor-outbox', namespace),
           folder.uri.fsPath, chain, body => {
             client.ensureStarted(resolveServicePath());
-            return client.request(body, { timeoutMs: 30000 });
+            return client.requestJson(body, { timeoutMs: 30000 });
           }, message => this.updateStatus(message), this.delivered,
           timing => this.log.appendLine(`[capture] delivery ${JSON.stringify(timing)}`));
         const dwell = Math.max(500, Math.min(30000, configuration.get<number>('tracking.readDwellMs', 2000)));
-        const maxBytes = Math.max(1024, Math.min(524288, configuration.get<number>('tracking.maxFileBytes', 262144)));
+        const maxBytes = Math.max(1024, Math.min(MAX_EDITOR_BUFFER_BYTES,
+          configuration.get<number>('tracking.maxFileBytes', MAX_EDITOR_BUFFER_BYTES)));
         const health = new EditorHealth();
         const capture = new EditorCapture(folder, dwell, maxBytes, event => {
           const accepted = outbox.push(event);
@@ -166,8 +168,11 @@ export class HumanWorkHost {
       let response;
       try {
         client.ensureStarted(resolveServicePath());
-        response = await client.request({ GetHumanWork: { workspace_path: folder.uri.fsPath,
-          chain_dir: vscode.workspace.getConfiguration('editchain-history').get<string>('chainDir', '.editchain') } }, { timeoutMs: 120000 });
+        for (let attempt = 0; attempt < 3 && !this.disposed; attempt++) {
+          response = await client.request({ GetHumanWork: { workspace_path: folder.uri.fsPath,
+            chain_dir: vscode.workspace.getConfiguration('editchain-history').get<string>('chainDir', '.editchain') } }, { timeoutMs: 120000 });
+          if (response?.Error?.code !== 'stale_snapshot') break;
+        }
       } finally { client.stop(); this.reportClient = undefined; }
       if (this.disposed) return undefined;
       if (!response?.Ok || response.Ok.schema !== 1) throw new Error(JSON.stringify(response?.Error ?? response));
@@ -177,7 +182,7 @@ export class HumanWorkHost {
       return response.Ok;
     } catch (error) {
       this.log.appendLine(`[capture report] ${String(error)}`);
-      if (!this.disposed) await vscode.window.showErrorMessage(`EditChain human work: ${String(error)}`);
+      if (!this.disposed) void vscode.window.showErrorMessage(`EditChain human work: ${String(error)}`);
       return undefined;
     }
   }

@@ -2,8 +2,9 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('node:module');
+const { MAX_EDITOR_BUFFER_BYTES } = require('../../out/editorLimits');
 
-function harness(dwell = 2000, identity) {
+function harness(dwell = 2000, identity, options = {}) {
   let now = 0;
   const timers = new Set();
   const clock = {
@@ -17,7 +18,7 @@ function harness(dwell = 2000, identity) {
   const signals = {};
   const on = name => listener => { signals[name] = listener; return { dispose() { delete signals[name]; } }; };
   const uri = { scheme: 'file', fsPath: '/workspace/a.ts', toString: () => 'file:///workspace/a.ts' };
-  const document = { uri, version: 1, isUntitled: false, text: 'one\ntwo\nthree\nfour\nfive\n', getText() { return this.text; },
+  const document = { uri, version: 1, isUntitled: false, text: options.text ?? 'one\ntwo\nthree\nfour\nfive\n', getText() { return this.text; },
     offsetAt(position) { return this.text.split('\n').slice(0, position.line).reduce((size, line) => size + line.length + 1, 0) + position.character; } };
   const range = (start, end) => ({ start: { line: start, character: 0 }, end: { line: end, character: 0 } });
   const editor = { document, visibleRanges: [range(0, 1), range(3, 5)] };
@@ -54,7 +55,7 @@ function harness(dwell = 2000, identity) {
   let capture;
   try {
     const { EditorCapture } = require(filename);
-    capture = new EditorCapture({ uri: { fsPath: '/workspace' }, index: 0 }, dwell, 262144, event => { events.push(event); return true; }, identity);
+    capture = new EditorCapture({ uri: { fsPath: '/workspace' }, index: 0 }, dwell, options.maxBytes ?? MAX_EDITOR_BUFFER_BYTES, event => { events.push(event); return true; }, identity);
   } finally { Module._load = original; }
   const tick = ms => {
     const until = now + ms;
@@ -92,6 +93,40 @@ const editGroups = env => {
   }
   return [...groups.values()];
 };
+
+test('large buffers retain full snapshots, exact input, save, and reading evidence', () => {
+  const text = ('one\n// 😀\n').padEnd(MAX_EDITOR_BUFFER_BYTES - 16, 'x');
+  const env = harness(2000, undefined, { text });
+  try {
+    env.tick(2100);
+    assert.equal(env.reads().length, 1);
+    type(env, 'human', true);
+    env.signals.save(env.document);
+    const changed = env.events.find(event => event.event.type === 'document_changed').event;
+    assert.equal(changed.before, text);
+    assert.equal(changed.after, text.replace('one', 'onehuman'));
+    assert.equal(receipts(env).length, 1);
+    assert.ok(env.events.some(event => event.event.type === 'document_saved'));
+    assert.ok(!env.events.some(event => event.event.type === 'tracking_gap'));
+  } finally { env.capture.dispose(); }
+});
+
+test('the exact byte limit is accepted and skip diagnostics distinguish size from NUL', () => {
+  for (const [text, reason] of [
+    ['x'.repeat(MAX_EDITOR_BUFFER_BYTES), undefined],
+    ['é'.repeat(MAX_EDITOR_BUFFER_BYTES / 2 + 1), /8388610 bytes exceeds the configured 8388608-byte/],
+    ['small\0buffer', /NUL character/],
+  ]) {
+    const env = harness(2000, undefined, { text });
+    try {
+      env.signals.open(env.document);
+      const gaps = env.events.filter(event => event.event.type === 'tracking_gap');
+      assert.equal(gaps.length, reason ? 1 : 0, 'one diagnostic per skipped buffer');
+      if (reason) assert.match(gaps[0].event.reason, reason);
+      assert.equal(env.events.some(event => event.event.type === 'document_snapshot'), !reason);
+    } finally { env.capture.dispose(); }
+  }
+});
 
 test('deleting existing code uses direct events without selections or stays visible as unattributed', () => {
   for (const direct of [false, true]) {
@@ -254,7 +289,7 @@ test('save, focus, editor, context, capture gaps and shutdown finalize pending t
       if (boundary === 'editor') env.signals.active(undefined);
       if (boundary === 'context') env.capture.context({ observed_ms: 100, repositories: [] });
       if (boundary === 'gap') {
-        env.document.text = 'x'.repeat(262145); env.document.version++;
+        env.document.text = 'x'.repeat(MAX_EDITOR_BUFFER_BYTES + 1); env.document.version++;
         env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: 0, rangeLength: 26, text: env.document.text }] });
       }
       if (boundary === 'shutdown') env.capture.dispose();

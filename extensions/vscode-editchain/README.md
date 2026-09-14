@@ -87,8 +87,9 @@ is reported as unknown, never as zero human review of the whole codebase.
   The last view of each loaded document stays read through focus changes,
   switching tabs, and Git context updates. Scrolling or a new buffer revision
   rearms reading; elapsed time and repeated notifications alone do not.
-- `editchain-history.tracking.maxFileBytes` defaults to `262144`. Binary and
-  larger buffers produce explicit capture gaps.
+- `editchain-history.tracking.maxFileBytes` defaults to `8388608` (8 MiB), also
+  the supported maximum. This measures the entire unsaved buffer in UTF-8 bytes.
+  NUL-containing and oversized buffers produce separate capture-gap reasons.
 
 Editor-input and keyboard-correlated edits are human-work indicators under the
 intentional-user assumption. The VS Code API does not authenticate physical
@@ -173,6 +174,19 @@ still respected.
 
 Events remain local: a bounded outbox in VS Code workspace storage retries
 `RecordEditorEvents` until the service acknowledges durable chain writes.
+Version 0.1.10 retains full before/after snapshots for files up to 8 MiB, with
+matching native replay, coverage-report, and transport limits. Unchanged text
+reuses the previous snapshot's JSON encoding, while each event still carries
+both complete snapshots. The outbox sends its saved UTF-8 bytes directly; a
+snapshot event above the normal 4 MiB batch target travels alone. Each durable
+batch can deliver while later snapshots are written. Journal writes submit the
+full buffer and retry short writes. Reading the next pending journal overlaps
+the current request; transport avoids decoding and re-encoding the saved JSON.
+Freshly persisted source events are reused by native projection without another
+disk read and JSON decode. Ordinary single-range validation compares complete
+text regions without allocating whole-buffer UTF-16 copies. Historical replay
+still verifies retained blobs.
+Queued serialized data is capped at 256 MiB and pending disk data at 512 MiB.
 Failures appear in the tracking status item and EditChain History output.
 The outbox schedules persistence after **25 ms**, with a one-second recovery
 poll and a **50 ms** retry for writer contention. Acknowledged human work wakes

@@ -20,6 +20,7 @@
     "wdio.work.conf.ts",
     "human-work.e2e.ts",
     "human-attribution.e2e.ts",
-    "human-realtime.e2e.ts"
+    "human-realtime.e2e.ts",
+    "human-large-files.e2e.ts"
   ]
 }

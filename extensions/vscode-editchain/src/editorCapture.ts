@@ -120,12 +120,16 @@ export class EditorCapture {
   }
 
   private withinLimit(document: vscode.TextDocument, text: string): boolean {
-    if (Buffer.byteLength(text) <= this.maxFileBytes && !text.includes('\0')) return true;
+    const bytes = Buffer.byteLength(text);
+    const binary = text.includes('\0');
+    if (bytes <= this.maxFileBytes && !binary) return true;
     const uri = document.uri.toString();
     if (!this.skipped.has(uri)) {
       this.skipped.add(uri);
       this.edits.flush();
-      this.record({ type: 'tracking_gap', reason: `Buffer skipped (binary or over ${this.maxFileBytes} bytes): ${uri}` });
+      const reason = binary ? 'contains a NUL character (binary heuristic)'
+        : `${bytes} bytes exceeds the configured ${this.maxFileBytes}-byte capture limit`;
+      this.record({ type: 'tracking_gap', reason: `Buffer skipped: ${reason}: ${uri}` });
     }
     return false;
   }

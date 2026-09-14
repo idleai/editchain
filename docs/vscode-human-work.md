@@ -137,6 +137,74 @@ and [prior runtime counterexample](vscode-editor-capture-results.md#attribution)
 
 ## Durable integration
 
+### Larger full snapshots (0.1.10)
+
+The default and supported maximum buffer size are 8 MiB of UTF-8 text, including
+unsaved content. Every edit still retains complete before/after text and the
+original UTF-16 changes. Historical diffs resolve those retained revisions even
+after another editor or agent changes the working file. Explicit smaller user
+limits remain respected. Skip diagnostics identify either the measured byte
+size and configured limit or the NUL-character binary heuristic. Current saved
+files up to the same 8 MiB limit participate in human-work coverage reports.
+
+Large snapshot events travel alone above the normal 4 MiB batch target. The
+145 MiB event bound and 160 MiB native frame bound accommodate before, after,
+and a full replacement for an 8 MiB buffer, including worst-case sixfold JSON
+escaping and metadata. Native validation checks both full snapshots, initial
+snapshots, UTF-16 replay, and large viewport coordinates. Intermediate replay
+is bounded to twice the maximum buffer's UTF-16 length.
+
+The outbox freezes each event into UTF-8 JSON once and sends those persisted
+bytes directly, with acknowledgement metadata cached separately. A single
+previous snapshot encoding is reused for unchanged text in a validated single
+replacement. Each event still contains both complete independent snapshots;
+multi-range edits, mismatches, and surrogate-interior offsets use full encoding.
+Recovered journals are decoded once to restore acknowledgement metadata.
+Delivery starts after each durable batch, while later batches are written. At
+most one durable batch stays in memory ahead of the active request, avoiding
+an immediate disk reread. When older batches are queued on disk, reading the
+next journal overlaps the current request; failed reads leave evidence pending
+for retry. Recovery still reads and verifies pending journals.
+Journal writes submit the full buffer and retry short writes, avoiding repeated
+512 KiB write continuations on a busy editor event loop. Transport copies the
+saved bytes into the final frame without a UTF-8 decode/encode round trip.
+
+The native connection also keeps one previous snapshot encoding and reuses its
+unchanged JSON regions. Its source encoder produces bytes identical to the
+established sorted JSON format, preserving source hashes and replay identities.
+Native retry repair checks the recorder ID before encoding payloads; new input
+needs no repair. After durable admission, projection reuses the validated request
+event instead of reading and decoding its just-written blob. Ordinary single
+replacements compare the full prefix, inserted text, and suffix directly;
+multi-range changes and offsets inside surrogate pairs retain UTF-16 replay.
+Retained encodings, identities, full snapshots, and exact acknowledgements are
+unchanged; restart/recovery still reads and verifies canonical evidence. Native
+acknowledgements include preparation, storage, and projection timings for slow
+delivery diagnostics; the outbox also reports journal and read times. Rebuild
+the native service as well as the extension when
+upgrading from the earlier frame and replay limits.
+
+The large-file UI test types 14 real keys into 2 MiB and 8 MiB files, checks
+every retained revision, saves without forcing capture, and opens a native
+VS Code diff with both complete expected texts. It also waits for the actual
+edit to paint. A release-build reference run on VS Code 1.137.0 without the
+proposed API measured:
+
+| Buffer | First edit row | Save observed in durable history | Intermediate revisions |
+| --- | ---: | ---: | ---: |
+| 2 MiB | 219 ms | 86 ms | 14/14 |
+| 8 MiB | 376 ms | 774 ms | 14/14 |
+
+These timings describe this test host and typing workload. Coverage and exact
+diff tests separately cover maximum-size files, restart/retry, external edits,
+and later working-file drift. Unicode tests compare optimized source bytes
+against the established canonical serialization and verify UTF-16 boundaries.
+
+If capture changes the history snapshot during a coverage query, the independent
+report worker makes at most three attempts. Persistent errors return promptly
+without waiting for their notification to be dismissed, allowing another report
+to start while that notification remains visible.
+
 ### Independent capture and coverage (0.1.9)
 
 Coverage reports replay the entire retained history. Previously the status-bar
@@ -260,8 +328,10 @@ the human. No permanent core operation-code allocation was needed. The query
 hydrates editor events sequentially and retains one revision per document
 incarnation rather than every historical buffer in memory.
 
-Limits: 128 events and approximately 4 MiB per outbound batch; 32 MiB queued
-memory and 64 MiB pending disk data per recorder; 256 KiB default buffer limit.
+Limits: 128 events and approximately 4 MiB per normal outbound batch; a larger
+event travels alone, up to 145 MiB encoded. The outbox allows 256 MiB of queued
+serialized data and 512 MiB pending disk data per recorder; the default and
+maximum buffer limit are 8 MiB. These are payload bounds, not process RSS limits.
 Capacity failures record a final gap and pause recording until resumed. Code
 snapshots are local retained evidence; chain disk usage grows with work. Atomic
 outbox publication is scheduled 25 ms after enqueue, with a one-second recovery
@@ -546,7 +616,7 @@ exposure records remain retained even after new capture stops producing them.
 
 `npm run package` keeps the extension on stable APIs. After compiling, run
 `npm run package:editor-origins` to produce
-`outputs/editchain-history-0.1.9-editor-origins.vsix` from an isolated staging
+`outputs/editchain-history-0.1.10-editor-origins.vsix` from an isolated staging
 directory. Its manifest declares only `textDocumentChangeReason`; packaging
 does not change the ordinary manifest or enable APIs in an existing VS Code.
 The native service must also be rebuilt to accept retained origin metadata.

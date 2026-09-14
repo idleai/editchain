@@ -10,7 +10,7 @@ async function harness() {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'editchain-human-host-'));
   const captures = [], clients = [], contexts = [], outboxes = [], statuses = [], logs = [];
   const commands = new Map(), settings = new Map();
-  const report = { calls: 0, release: undefined };
+  const report = { calls: 0, release: undefined, responses: [] };
   report.promise = new Promise(resolve => { report.release = resolve; });
   let listener;
   const disposable = () => ({ dispose() {} });
@@ -34,16 +34,17 @@ async function harness() {
   }
   class Outbox {
     constructor(_directory, workspace, chain, send) { this.send = send; this.workspace = workspace; this.chain = chain; outboxes.push(this); }
-    push(event) { this.delivery = this.send({ RecordEditorEvents: { events: [event] } }); return true; }
+    push(event) { this.delivery = this.send([Buffer.from(JSON.stringify({ RecordEditorEvents: { events: [event] } }))]); return true; }
     async flush() { await this.delivery; return true; } async stop() {}
   }
   class Client {
     constructor() { this.tail = Promise.resolve(); this.requests = []; clients.push(this); }
     setLog() {} ensureStarted() {} stop() { this.stopped = true; }
+    requestJson(body) { return this.request(JSON.parse(Buffer.concat(body))); }
     request(body) {
       this.requests.push(body);
       this.tail = this.tail.then(async () => {
-        if (body.GetHumanWork) { report.calls++; await report.promise; return { Ok: { schema: 1, files: [], limitations: [] } }; }
+        if (body.GetHumanWork) { report.calls++; await report.promise; return report.responses.shift() ?? { Ok: { schema: 1, files: [], limitations: [] } }; }
         return { Ok: { observed_ms: 1, repositories: [], ack: body.RecordEditorEvents?.events.map(event => [event.session, event.sequence]) } };
       });
       return this.tail;
@@ -63,7 +64,7 @@ async function harness() {
   let HumanWorkHost;
   try { ({ HumanWorkHost } = require(filename)); } finally { Module._load = original; }
   const context = () => ({ subscriptions: [], storageUri: { fsPath: directory }, globalStorageUri: { fsPath: directory } });
-  return { captures, clients, contexts, outboxes, statuses, logs, commands, report,
+  return { captures, clients, contexts, outboxes, statuses, logs, commands, report, vscode,
     create: () => new HumanWorkHost(context(), { appendLine: line => logs.push(line), show() { logs.push('output shown'); } }),
     cleanup: () => fs.rm(directory, { recursive: true, force: true }) };
 }
@@ -132,6 +133,42 @@ test('tracking status shows runtime diagnostics without replaying history or flu
     assert.ok(env.logs.includes('output shown'));
     assert.ok(env.logs.some(line => line.includes('[capture] Runtime')));
   } finally { await host.stop(); await env.cleanup(); }
+});
+
+test('coverage retries a changing source snapshot on its independent worker', async () => {
+  const env = await harness(), host = env.create();
+  try {
+    await host.lifecycle;
+    env.report.responses.push({ Error: { code: 'stale_snapshot', message: 'new capture arrived' } });
+    env.report.release();
+    const result = await env.commands.get('editchain-history.humanWork')();
+    assert.equal(result.schema, 1);
+    assert.equal(env.report.calls, 2);
+    assert.equal(env.clients.filter(client => client.requests.some(request => request.GetHumanWork)).length, 1);
+    assert.ok(env.clients.filter(client => !client.requests.some(request => request.GetHumanWork)).every(client => !client.stopped));
+  } finally { env.report.release(); await host.stop(); await env.cleanup(); }
+});
+
+test('persistent coverage errors settle after bounded retries without waiting for notification dismissal', async () => {
+  const env = await harness(), host = env.create();
+  let notified, dismiss, pending;
+  const shown = new Promise(resolve => { notified = resolve; });
+  const notification = new Promise(resolve => { dismiss = resolve; });
+  env.vscode.window.showErrorMessage = message => { env.logs.push(message); notified(); return notification; };
+  try {
+    await host.lifecycle;
+    env.report.responses.push(...Array.from({ length: 3 }, () => ({ Error: { code: 'stale_snapshot' } })));
+    env.report.release();
+    let settled = false;
+    pending = env.commands.get('editchain-history.humanWork')().then(result => { settled = true; return result; });
+    await shown;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(env.report.calls, 3);
+    assert.ok(settled, 'an undismissed notification cannot keep the command pending');
+    assert.equal(await pending, undefined);
+    const next = await env.commands.get('editchain-history.humanWork')();
+    assert.equal(next.schema, 1, 'another report can start while the notification is still visible');
+  } finally { dismiss(); env.report.release(); await pending; await host.stop(); await env.cleanup(); }
 });
 
 test('stopping the extension terminates the coverage worker without disturbing report completion', async () => {
