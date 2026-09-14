@@ -24,6 +24,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const driver = require('./functionalDriver.js');
 const { installNativeWindowFixture } = require('./nativeWindowFixture.js');
+const { installWidthProbe } = require('./widthAnimationProbe.js');
 
 const HARNESS_DIR = __dirname;
 const RUST_HTML = fs.readFileSync(path.join(HARNESS_DIR, 'rust.html'), 'utf8');
@@ -521,6 +522,7 @@ test('native refresh preserves graph width until missing prefetch rows arrive', 
       respond('ready', {});
     });
     await driver.waitFor(page, () => window.__editchainDataReady && document.querySelector('.row[data-key="paged:30"]'));
+    await page.evaluate(() => Promise.all(document.getElementById('rows').getAnimations().map(animation => animation.finished)));
     const before = await page.evaluate(() => {
       window.__pagedMotion.header = document.querySelector('.tbl-header');
       const width = document.querySelector('.graph-cell').getBoundingClientRect().width;
@@ -551,6 +553,134 @@ test('native refresh preserves graph width until missing prefetch rows arrive', 
     }), true, 'user disclosure renders newly revealed connections immediately');
     await page.evaluate(() => { window.__pagedMotion.hold = false; window.__pagedMotion.release(); });
     await driver.waitFor(page, () => document.querySelector('.graph-cell').getBoundingClientRect().width < 50);
+    assertNoErrors(errors);
+  } finally { await page.close(); }
+});
+
+function assertWidthAlignment(frame) {
+  assert.ok(frame.rowWidths.length > 20, 'inspect the whole mounted window');
+  assert.ok(frame.rowWidths.every(width => Math.abs(width - frame.graph) < 0.1),
+    'header and every row share the same animated graph width');
+  assert.ok(frame.columnErrors.every(error => error < 0.1), 'all column boundaries stay aligned');
+  assert.ok(frame.dividers.every(divider => divider.error < 0.1),
+    'resize handles track animated boundaries: ' + JSON.stringify(frame.dividers));
+  assert.ok(Math.abs(frame.table - frame.wrap) < 0.1, 'header and row window share the overflow extent');
+}
+
+for (const width of [1440, 420]) {
+  test(`native graph width animates together through growth, insertion, disclosure and drag at ${width}px`, { skip: SKIP }, async () => {
+    const { page, errors } = await openRustPage('large', { width, height: 900 });
+    try {
+      await installNativeWindowFixture(page);
+      await driver.waitFor(page, () => document.querySelector('.row[data-key="native:0"]'));
+      await settleRust(page);
+      await page.evaluate(() => Promise.all(document.getElementById('rows').getAnimations().map(animation => animation.finished)));
+      await installWidthProbe(page);
+      const before = await page.evaluate(() => window.__widthProbe.read());
+      assert.equal(before.graph, 40);
+      assertWidthAlignment(before);
+      await saveParityScreenshot(page, `width-${width}-before`);
+
+      await page.evaluate(() => {
+        window.__nativeWindow.rows[1].lane = 9;
+        return window.__nativeWindow.update(1);
+      });
+      const start = await page.evaluate(() => window.__widthProbe.at(0));
+      assert.ok(Math.abs(start.graph - before.graph) < 0.1, 'growth starts at the displayed width');
+      assert.equal(start.target, 162.36);
+      assert.ok(start.timing.some(timing => timing.property === '--graph-display-width'));
+      assert.ok(start.timing.every(timing => timing.duration === 120 && timing.easing === 'ease-out'),
+        'automatic resizing uses a short 120ms ease-out transition');
+      const frames = [];
+      for (const time of [20, 40, 60, 80]) {
+        const frame = await page.evaluate(time => window.__widthProbe.at(time), time);
+        assertWidthAlignment(frame);
+        assert.ok(frame.graph > before.graph && frame.graph < frame.target);
+        assert.equal(frame.renderCount, start.renderCount, 'interpolation never re-enters the renderer');
+        frames.push(frame);
+      }
+      assert.ok(frames.every((frame, index) => index === 0 || frame.graph > frames[index - 1].graph),
+        'growth is monotonic');
+      const middle = await page.evaluate(() => window.__widthProbe.at(60));
+      if (width === 420) {
+        assert.ok(middle.table > before.table && middle.table < middle.minimum,
+          'overflow grows smoothly alongside the graph');
+      }
+      await saveParityScreenshot(page, `width-${width}-growing`);
+
+      await page.evaluate(() => window.__nativeWindow.prepend());
+      const inserted = await page.evaluate(() => window.__widthProbe.read());
+      assertWidthAlignment(inserted);
+      assert.equal(inserted.transitions, middle.transitions, 'new rows do not restart the shared clock');
+      assert.ok(Math.abs(inserted.graph - middle.graph) < 0.1, 'inserted rows inherit the in-flight width');
+
+      // Hide the only wide lane while growth is still halfway through.
+      await page.evaluate(() => document.querySelector('.row[data-key="native:0"] .task-chevron').click());
+      await driver.waitFor(page, () => !window.__nativeWindow.expanded &&
+        window.__nativeWindow.settled === window.__nativeWindow.revision);
+      const reversed = await page.evaluate(() => window.__widthProbe.at(0));
+      assert.equal(reversed.target, 40);
+      assert.ok(Math.abs(reversed.graph - middle.graph) < 0.1, 'rapid reversal starts at the current width');
+      assert.ok(reversed.timing.every(timing => timing.duration > 0 && timing.duration <= 120));
+      const shrinking = await page.evaluate(() => window.__widthProbe.at(30));
+      assertWidthAlignment(shrinking);
+      assert.ok(shrinking.graph < reversed.graph && shrinking.graph > 40);
+      await saveParityScreenshot(page, `width-${width}-shrinking`);
+      const collapsed = await page.evaluate(() => window.__widthProbe.finish());
+      assertWidthAlignment(collapsed);
+      assert.equal(collapsed.graph, 40);
+      assert.ok(Math.abs(collapsed.table - before.table) < 0.1);
+
+      await page.evaluate(() => document.querySelector('.row[data-key="native:0"] .task-chevron').click());
+      await driver.waitFor(page, () => window.__nativeWindow.expanded &&
+        window.__nativeWindow.settled === window.__nativeWindow.revision);
+      const expanded = await page.evaluate(() => window.__widthProbe.finish());
+      assertWidthAlignment(expanded);
+      assert.ok(Math.abs(expanded.graph - 162.36) < 0.1);
+      assert.ok(expanded.dotX.includes('14.76'), 'existing lane centers remain pinned');
+      await saveParityScreenshot(page, `width-${width}-after`);
+
+      // Interrupt another growth with a real divider gesture.
+      await page.evaluate(() => {
+        const index = window.__nativeWindow.rows.findIndex(row => row.node_key === 'native:1');
+        window.__nativeWindow.rows[index].lane = 18;
+        return window.__nativeWindow.update(index);
+      });
+      const drag = await page.evaluate(() => {
+        const before = window.__widthProbe.at(40);
+        const handle = document.querySelector('.col-resize-handle[data-col="graph"]');
+        handle.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 100 }));
+        const grabbed = window.__widthProbe.read();
+        window.dispatchEvent(new MouseEvent('mousemove', { clientX: 125 }));
+        const moved = window.__widthProbe.read();
+        window.dispatchEvent(new MouseEvent('mouseup', { clientX: 125 }));
+        return { before, grabbed, moved, animations: document.getElementById('rows').getAnimations().length };
+      });
+      assert.ok(Math.abs(drag.grabbed.graph - drag.before.graph) < 0.1, 'drag takes over without jumping to the target');
+      assert.ok(Math.abs(drag.moved.graph - drag.before.graph - 25) < 0.1, 'manual resizing follows the pointer immediately');
+      assert.equal(drag.animations, 0);
+      assertWidthAlignment(drag.moved);
+      assertNoErrors(errors);
+    } finally { await page.close(); }
+  });
+}
+
+test('native graph width respects reduced motion', { skip: SKIP }, async () => {
+  const { page, errors } = await openRustPage('large');
+  try {
+    await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
+    await installNativeWindowFixture(page);
+    await driver.waitFor(page, () => document.querySelector('.row[data-key="native:0"]'));
+    await settleRust(page);
+    await installWidthProbe(page);
+    await page.evaluate(() => {
+      window.__nativeWindow.rows[1].lane = 9;
+      return window.__nativeWindow.update(1);
+    });
+    const frame = await page.evaluate(() => window.__widthProbe.read());
+    assertWidthAlignment(frame);
+    assert.ok(Math.abs(frame.graph - frame.target) < 0.1, 'reduced motion applies the final width immediately');
+    assert.equal(frame.transitions, 0);
     assertNoErrors(errors);
   } finally { await page.close(); }
 });

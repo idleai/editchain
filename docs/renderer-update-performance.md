@@ -6,6 +6,15 @@ margin independently of its data cache. Host responses commit one final row
 window per animation frame. Native control messages start requests immediately;
 input feedback does not wait for the next frame or for native publication.
 
+Automatic graph width changes use a 120 ms ease-out CSS transition. The scroll
+root owns the interpolated graph width and table overflow extent; headers,
+retained rows, inserted rows, and column dividers share that geometry. Rapid
+updates retarget from the current displayed width without calling the renderer
+on each animation frame. Lane centers remain fixed, and incomplete windows
+still retain the previous width until their geometry is ready. Initial layout,
+manual divider dragging, and reduced-motion mode apply widths immediately.
+Grabbing the graph divider during a transition pins its displayed width.
+
 ## Local comparison
 
 Measured on September 14, 2026 with Chrome 151.0.7922.71, a 1440 × 900 viewport,
@@ -82,3 +91,10 @@ reuse, stale response suppression, unchanged SVG animation clocks, reduced
 motion, and six rapid prepends whose retargeting starts within 1.5 pixels of the
 current visual position. Delayed-window tests require both disclosure clicks to
 survive retired coordinates and pending feedback to clear after completion.
+
+Width animation tests sample intermediate frames at 1440 px and 420 px, checking
+column and divider alignment, continuous overflow, insertion without restarting
+the transition, reversal during group disclosure, and manual drag takeover.
+They also check reduced motion and that interpolation adds no renderer passes.
+Run `node --test test/harness/rustSmoke.test.js`; before, intermediate, and final
+screenshots are written to `trace/rust-parity/width-*.png`.

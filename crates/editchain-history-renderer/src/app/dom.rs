@@ -778,20 +778,31 @@ pub(crate) fn col_style(
         }
         parts.push(format!("--{}-w:{}px", col.as_str(), widths.width(col)));
     }
-    if graph_width_css > graph_width_budget(window_inner_width, window_inner_width) {
-        let date = if hidden.contains(&ColKey::Date) {
-            0.0
-        } else {
-            widths.width(ColKey::Date)
-        };
-        let minimum = graph_width_css
-            + widths.width(ColKey::Activity)
-            + widths.width(ColKey::Tags)
-            + date
-            + widths.content.unwrap_or(MIN_CONTENT_W);
-        parts.push(format!("min-width:{}px", round2(minimum)));
-    }
     parts.join(";")
+}
+
+/// Overflow extent, animated alongside the graph track on the shared scroll
+/// root. Start at the viewport width so crossing into overflow stays continuous.
+pub(crate) fn table_min_width(
+    graph_width: f64,
+    viewport_width: f64,
+    window_width: f64,
+    widths: &ColWidths,
+) -> f64 {
+    if graph_width <= graph_width_budget(window_width, window_width) {
+        return viewport_width;
+    }
+    let date = if hidden_columns(window_width).contains(&ColKey::Date) {
+        0.0
+    } else {
+        widths.width(ColKey::Date)
+    };
+    let minimum = graph_width
+        + widths.width(ColKey::Activity)
+        + widths.width(ColKey::Tags)
+        + date
+        + widths.content.unwrap_or(MIN_CONTENT_W);
+    round2(minimum).max(viewport_width)
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,6 +1237,31 @@ mod web {
         /// The scroll container element.
         pub(crate) fn rows(&self) -> web_sys::HtmlDivElement {
             self.rows.clone()
+        }
+
+        /// One inherited animated value keeps retained rows, newly mounted rows,
+        /// and rebuilt headers on the same clock. No renderer work per frame.
+        pub(crate) fn set_column_widths(
+            &self,
+            graph: f64,
+            minimum: f64,
+            animate: bool,
+        ) -> Result<(), JsValue> {
+            self.rows
+                .set_attribute("data-animate-width", if animate { "true" } else { "false" })?;
+            let style = self.rows.style();
+            style.set_property("--graph-display-width", &format!("{graph}px"))?;
+            style.set_property("--table-display-width", &format!("{minimum}px"))
+        }
+
+        /// A graph drag takes over both interpolated widths without rebuilding
+        /// the header under the pointer or snapping to the animation's target.
+        pub(crate) fn freeze_graph_width(&self, graph: f64) -> Result<(), JsValue> {
+            let minimum = self.rows.query_selector(".tbl-header")?.map_or_else(
+                || f64::from(self.rows.client_width()),
+                |header| header.get_bounding_client_rect().width(),
+            );
+            self.set_column_widths(graph, minimum, false)
         }
 
         /// The current scroll viewport (CSS px).
@@ -2024,7 +2060,7 @@ mod web {
         }
 
         /// The rendered header cell's on-screen width for a column (the drag
-        /// start position for non-graph columns, production `currentColumnWidth`).
+        /// start position, including an interrupted graph width animation).
         pub(crate) fn header_cell_width(&self, col: ColKey) -> f64 {
             let selector = format!(".tbl-header .th.{}", col.as_str());
             self.rows
@@ -2032,7 +2068,7 @@ mod web {
                 .ok()
                 .flatten()
                 .and_then(|cell| cell.dyn_into::<web_sys::HtmlElement>().ok())
-                .map_or(0.0, |cell| f64::from(cell.offset_width()))
+                .map_or(0.0, |cell| cell.get_bounding_client_rect().width())
         }
 
         /// `graphLabelMinW` — measure the narrowest graph column that renders
@@ -2105,16 +2141,7 @@ mod web {
             if !hidden.contains(&ColKey::Date) {
                 columns.push(ColKey::Date);
             }
-            let header_width = f64::from(header.client_width());
-            for col in columns {
-                let selector = format!(".th.{}", col.as_str());
-                let Some(cell) = header.query_selector(&selector).map_err(js_err_from)? else {
-                    continue;
-                };
-                let Some(cell) = cell.dyn_into::<web_sys::HtmlElement>().ok() else {
-                    continue;
-                };
-                let boundary = f64::from(cell.offset_left()) + f64::from(cell.offset_width());
+            for (index, col) in columns.iter().enumerate() {
                 let handle: web_sys::HtmlDivElement = document
                     .create_element("div")?
                     .dyn_into()
@@ -2123,8 +2150,15 @@ mod web {
                 handle.set_attribute("data-col", col.as_str())?;
                 handle
                     .set_attribute("title", &format!("Drag to resize {} column", col.as_str()))?;
-                let left = (boundary - 3.0).min((header_width - 6.0).max(0.0));
-                handle.style().set_property("left", &format!("{left}px"))?;
+                // An absolute grid item follows its track during width animation
+                // without measuring or repositioning the divider every frame.
+                handle.style().set_property(
+                    "grid-column",
+                    &format!("{} / span 1", index.saturating_add(1)),
+                )?;
+                if index.saturating_add(1) == columns.len() {
+                    handle.style().set_property("right", "0px")?;
+                }
                 drop(header.append_child(&handle).map_err(js_err_from)?);
             }
             Ok(())
@@ -2846,8 +2880,14 @@ mod tests {
         let layout = graph_layout(34, panel_width, panel_width);
         assert!((layout.lane_width - 14.76).abs() < 1e-9);
         assert!(
-            col_style(layout.column_width, panel_width, &ColWidths::default())
-                .contains("min-width:1119.36px")
+            (table_min_width(
+                layout.column_width,
+                panel_width,
+                panel_width,
+                &ColWidths::default()
+            ) - 1119.36)
+                .abs()
+                < 1e-9
         );
     }
 

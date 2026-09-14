@@ -524,26 +524,23 @@ pub(super) fn on_rows_mousedown(event: &web_sys::Event) {
 }
 
 /// The current effective width of a resizable column (drag start).
-fn column_start_width(shell: &ShellData, col: ColKey) -> f64 {
-    match col {
-        ColKey::Graph => shell.current_graph_width(),
-        ColKey::Activity
-        | ColKey::Tags
-        | ColKey::Content
-        | ColKey::Date
-        | ColKey::Author
-        | ColKey::Commit => shell.dom.header_cell_width(col).max(col.min_width()),
+fn column_start_width(shell: &mut ShellData, col: ColKey) -> Result<f64, JsValue> {
+    let width = shell.dom.header_cell_width(col).max(col.min_width());
+    if col == ColKey::Graph {
+        shell.col_widths.set(col, Some(width));
+        shell.dom.freeze_graph_width(width)?;
     }
+    Ok(width)
 }
 
 /// Begin a divider drag: pin the start geometry, mark the body, and
 /// install window-level move/up listeners (removed on mouseup).
 fn start_column_drag(col: ColKey, client_x: f64) -> Result<(), JsValue> {
     let start_w = SHELL_DATA.with(|cell| {
-        cell.borrow()
-            .as_ref()
-            .map_or(0.0, |shell| column_start_width(shell, col))
-    });
+        cell.borrow_mut()
+            .as_mut()
+            .map_or(Ok(0.0), |shell| column_start_width(shell, col))
+    })?;
     let Some(window) = web_sys::window() else {
         return Ok(());
     };
@@ -583,6 +580,10 @@ fn on_column_move(event: &web_sys::Event) {
         return;
     };
     let next = (start_w + f64::from(mouse.client_x()) - start_x).max(col.min_width());
+    resize_column(col, next);
+}
+
+fn resize_column(col: ColKey, next: f64) {
     run_transition(|shell| {
         shell.col_widths.set(col, Some(next));
         let viewport = shell.dom.viewport();

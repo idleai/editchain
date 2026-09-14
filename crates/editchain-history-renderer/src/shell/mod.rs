@@ -137,6 +137,17 @@ impl ShellData {
             self.dom.window_inner_width_css(),
             &self.col_widths,
         );
+        let minimum = dom::table_min_width(
+            graph.width,
+            self.dom.rows_client_width_css(),
+            self.dom.window_inner_width_css(),
+            &self.col_widths,
+        );
+        self.dom.set_column_widths(
+            graph.width,
+            minimum,
+            self.drawn_graph.is_some() && self.col_widths.graph.is_none(),
+        )?;
         let options = dom::RebuildOptions {
             spacer_height_px: self.spacer_height_px(),
             wrap_top_px: top.saturating_mul(ROW_H),
