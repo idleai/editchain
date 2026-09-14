@@ -233,10 +233,32 @@ pub(super) fn on_row_click(event: &web_sys::Event) {
     } else if in_button || mouse.detail() > 1 {
         return;
     }
+    let key = target
+        .clone()
+        .dyn_into::<web_sys::Element>()
+        .ok()
+        .and_then(|element| element.closest(".row").ok().flatten())
+        .and_then(|row| row.get_attribute("data-continuity"));
     run_transition(|shell| {
         let viewport = shell.dom.viewport();
         let mut step = Step::new();
-        if task {
+        if let Some(key) = key
+            .as_ref()
+            .filter(|_| chevron && shell.state.reconciles_rows())
+        {
+            if !task && !shell.state.live_window_pending() {
+                shell.state.select_row(abs);
+                if let Err(error) = shell.dom.apply_selection(abs) {
+                    record_error(&format!(
+                        "selection apply failed: {}",
+                        js_value_text(&error)
+                    ));
+                }
+            }
+            shell
+                .state
+                .request_disclosure_key(key.clone(), task, &mut step);
+        } else if task {
             shell.state.toggle_task_ui(abs, &viewport, &mut step);
         } else {
             shell.row_select_and_toggle(abs, &viewport, &mut step);

@@ -3,6 +3,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+const CONNECTION_MS: f64 = 240.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct Point {
     pub(super) x: i64,
@@ -86,14 +88,14 @@ fn grow_component(component: &[(usize, Segment)], growth: &mut Growth) {
     }
     for (index, _) in ordered {
         if let Some(timing) = growth.segments.get_mut(index) {
-            timing.delay *= 520.0 / total;
-            timing.duration *= 520.0 / total;
+            timing.delay *= CONNECTION_MS / total;
+            timing.duration *= CONNECTION_MS / total;
         }
     }
     growth.arrivals.extend(
         distance
             .into_iter()
-            .map(|(point, distance)| (point, distance * 520.0 / total)),
+            .map(|(point, distance)| (point, distance * CONNECTION_MS / total)),
     );
 }
 
@@ -124,7 +126,7 @@ mod tests {
         assert!(bottom.delay.abs() < 0.01);
         assert!((bottom.duration - middle.delay).abs() < 0.01);
         assert!((middle.delay + middle.duration - top.delay).abs() < 0.01);
-        assert!((top.delay + top.duration - 520.0).abs() < 0.01);
+        assert!((top.delay + top.duration - CONNECTION_MS).abs() < 0.01);
     }
 
     #[test]
@@ -141,8 +143,8 @@ mod tests {
         let independent = growth.segments.get(3).unwrap();
         assert!((left.duration - right.duration).abs() < 0.01);
         assert!((trunk.delay - left.duration).abs() < 0.01);
-        assert!((trunk.delay + trunk.duration - 520.0).abs() < 0.01);
+        assert!((trunk.delay + trunk.duration - CONNECTION_MS).abs() < 0.01);
         assert!(independent.delay.abs() < 0.01);
-        assert!((independent.duration - 520.0).abs() < 0.01);
+        assert!((independent.duration - CONNECTION_MS).abs() < 0.01);
     }
 }

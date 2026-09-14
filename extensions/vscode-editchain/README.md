@@ -226,13 +226,23 @@ Set `editchain-history.live.enabled` to `false` to open static history by defaul
 - Import and publication are serialized. Complete source records and durable
   checkpoints remain the history authority; edits arriving during a pass trigger
   a later pass. Restarting reuses native checkpoints instead of duplicating nodes.
+- Group toggles give immediate pending feedback and run ahead of queued background
+  capture after the active transaction finishes. Repeated clicks keep their order
+  while replacement rows are loading.
+- Native conditional windows retain unchanged decoded content between revisions.
+  The DOM mounts a 16-row margin per edge, independently of the 400-row data
+  prefetch margin, and commits burst responses once per animation frame.
+  `npm run perf:renderer` runs the frontend-only comparison harness; see
+  [measurements and limits](../../docs/renderer-update-performance.md).
 - Revisioned block changes update persistent native indexes and bounded WASM caches,
   and DOM rows. Surviving selection, disclosure, focus and pixel scroll anchors
   remain attached to item identities. Staying at the top follows incoming
   history. New branch and merge connections grow from their attachment points,
   with continuous drawing across row boundaries. Existing SVG segments keep
   their animation clocks through later deltas. Lane spacing stays at 14.76px;
-  dense graphs scroll horizontally. Reduced motion shows the final geometry
+  dense graphs scroll horizontally, and incomplete prefetch cannot shrink the
+  graph column. User disclosure uses a brief row transition with connections
+  immediately visible. Reduced motion shows the final geometry
   immediately. Manual Refresh establishes a new baseline.
 - Live Codex items fold along connected causal paths within their native task.
   Grouping adds no graph rows: task controls annotate existing activities;
@@ -245,7 +255,8 @@ Set `editchain-history.live.enabled` to `false` to open static history by defaul
   starts folded, and scrolling back alone does not reopen it. Prefetched rows
   do not count as viewed. Explicit opens and closes persist across scrolling,
   new records and restarts. The activity-count
-  button toggles the task path. Human edits show the file on the activity row;
+  button toggles the task path. Single imported file edits and human edits show
+  the file directly on the Change activity row, without an Import wrapper;
   agent file/output details retain their own chevron.
   Forks, merges, Git attachments and unresolved/error activity remain visible.
   Concurrent tasks retain chronological order without repeated header rows.

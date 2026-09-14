@@ -32,6 +32,7 @@ fn summary(anchor: &str, time: u64, status: TaskStatus) -> LiveBlockMeta {
 
 fn baseline(status: TaskStatus) -> LiveBaseline {
     LiveBaseline {
+        reconcile_rows: false,
         paged: false,
         epoch: SnapshotId::new("epoch"),
         revision: 0,
@@ -144,6 +145,7 @@ fn completion_never_collapses_a_task_already_visible_in_this_view() {
     delta(&mut index, &[summary("d", 4, TaskStatus::Completed)]);
     assert_eq!(visible(&index), ["d", "c", "b", "a"]);
     let mut empty = LiveIndex::new(&LiveBaseline {
+        reconcile_rows: false,
         paged: false,
         epoch: SnapshotId::new("e"),
         revision: 0,

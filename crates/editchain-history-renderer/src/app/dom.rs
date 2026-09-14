@@ -1074,7 +1074,38 @@ mod web {
             Ok(())
         }
 
-        pub(crate) fn capture_live_rows(&self) -> Result<LiveRows, JsValue> {
+        pub(crate) fn disclosure_pending(
+            &self,
+            key: &str,
+            selector: &str,
+            pending: bool,
+        ) -> Result<(), JsValue> {
+            let rows = self.rows.query_selector_all(".row[data-continuity]")?;
+            for index in 0..rows.length() {
+                let Some(row) = rows
+                    .item(index)
+                    .and_then(|row| row.dyn_into::<web_sys::Element>().ok())
+                else {
+                    continue;
+                };
+                if row.get_attribute("data-continuity").as_deref() != Some(key) {
+                    continue;
+                }
+                let button = row.query_selector(selector)?;
+                if let Some(button) = button {
+                    let value = if pending { "true" } else { "false" };
+                    if button.get_attribute("aria-busy").as_deref() != Some(value) {
+                        button.set_attribute("aria-busy", value)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        pub(crate) fn capture_live_rows(
+            &self,
+            animate_connections: bool,
+        ) -> Result<LiveRows, JsValue> {
             let rows = self.rows.query_selector_all(".row[data-continuity]")?;
             let mut before = std::collections::HashMap::new();
             for index in 0..rows.length() {
@@ -1095,11 +1126,19 @@ mod web {
             }
             Ok(LiveRows {
                 rows: before,
-                graph: super::graph_motion::capture(&self.rows)?,
+                graph: if animate_connections {
+                    super::graph_motion::capture(&self.rows)?
+                } else {
+                    super::graph_motion::Capture::new()
+                },
             })
         }
 
-        pub(crate) fn animate_live_rows(&self, before: &LiveRows) -> Result<(), JsValue> {
+        pub(crate) fn animate_live_rows(
+            &self,
+            before: &LiveRows,
+            animate_connections: bool,
+        ) -> Result<(), JsValue> {
             let rows = self.rows.query_selector_all(".row[data-continuity]")?;
             let viewport = self.rows.get_bounding_client_rect();
             let top = f64_round_to_i64(viewport.top()).saturating_sub(ROW_H);
@@ -1131,7 +1170,9 @@ mod web {
             }
             // Read every position before changing animation styles. Interleaved
             // reads/writes forced a layout for every row in the overscan window.
-            super::graph_motion::animate(&self.rows, &before.graph)?;
+            if animate_connections {
+                super::graph_motion::animate(&self.rows, &before.graph)?;
+            }
             for (row, offset, changed) in frames {
                 if offset != 0 {
                     row.style()
@@ -1538,14 +1579,9 @@ mod web {
             let document = Self::document()?;
             wrap.set_attribute("style", col_style)?;
             if let Some(header) = self.rows.query_selector(".tbl-header")? {
-                let replacement =
-                    build_header(self, &document, col_style, options.graph_width_css)?;
-                drop(
-                    self.rows
-                        .query_selector(".tbl-grid")?
-                        .map(|grid| grid.replace_child(&replacement, &header))
-                        .transpose()?,
-                );
+                if header.get_attribute("style").as_deref() != Some(col_style) {
+                    self.refresh_header(col_style, options.graph_width_css)?;
+                }
             }
             let mut existing = std::collections::HashMap::new();
             let rows = wrap.query_selector_all(".row")?;
@@ -1618,6 +1654,12 @@ mod web {
                 || previous
                     .as_ref()
                     .is_none_or(|previous| previous.graph != spec.graph);
+            if !graph_changed
+                && previous.as_ref() == Some(spec)
+                && row.get_attribute("style").as_deref() == Some(col_style)
+            {
+                return Ok(());
+            }
             let same_content = previous.is_some_and(|mut previous| {
                 previous.identity.abs_index = spec.identity.abs_index;
                 previous.graph.clone_from(&spec.graph);
@@ -2032,11 +2074,15 @@ mod web {
             &self,
             window_inner_width: f64,
         ) -> Result<(), JsValue> {
-            let Some(wrap) = self.wrap() else {
+            let Some(header) = self.rows.query_selector(".tbl-header")? else {
                 return Ok(());
             };
+            let width = window_inner_width.to_string();
+            if header.get_attribute("data-resize-width").as_deref() == Some(width.as_str()) {
+                return Ok(());
+            }
             let document = Self::document()?;
-            let list = wrap
+            let list = header
                 .query_selector_all(".col-resize-handle")
                 .map_err(js_err_from)?;
             for index in 0..list.length() {
@@ -2048,13 +2094,7 @@ mod web {
                     handle.remove();
                 }
             }
-            let Some(header) = self
-                .rows
-                .query_selector(".tbl-header")
-                .map_err(js_err_from)?
-            else {
-                return Ok(());
-            };
+            header.set_attribute("data-resize-width", &width)?;
             let hidden = super::hidden_columns(window_inner_width);
             let mut columns = vec![
                 ColKey::Graph,

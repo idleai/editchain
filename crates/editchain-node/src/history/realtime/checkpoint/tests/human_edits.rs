@@ -48,10 +48,10 @@ fn legacy_edits(workspace: &mut LiveWorkspace) -> Vec<String> {
         .inputs
         .iter()
         .filter(|(_, input)| {
-            input.operations.iter().any(|op| {
-                editchain_project::human::work_record(op)
-                    .is_some_and(|work| work.kind == editchain_core::human::HumanWorkKind::Edit)
-            })
+            input
+                .operations
+                .iter()
+                .any(|op| matches!(op.kind, editchain_core::OpKind::File(_)))
         })
         .map(|(key, _)| key.clone())
         .collect();
@@ -60,6 +60,9 @@ fn legacy_edits(workspace: &mut LiveWorkspace) -> Vec<String> {
         let mut old = workspace.load_block(&block(workspace, key)).unwrap();
         let row = old.rows.first_mut().unwrap();
         let change = row.file_change.take().unwrap();
+        if change.source == FileChangeSource::Agent {
+            row.kind = "import".into();
+        }
         let mut child = row.clone();
         child.op_id.clone_from(&change.op_id);
         child.node_key = format!("{}::child:0", row.node_key);
@@ -203,4 +206,108 @@ fn version_five_compacts_retained_edits_preserving_graph_diffs_and_explicit_epis
             "canonical records remain byte-for-byte identical"
         );
     }
+}
+
+fn capture_agent(root: &std::path::Path) {
+    use editchain_core::{
+        ActorId, Clock, FileEdit, FileOp, FileStage, ImportOp, OpKind, ParentSet, Payload,
+        ScopeRef, SessionId, Tags,
+    };
+    let raw = Op {
+        id: OpId::new(NodeId(73), 0, 1),
+        parents: ParentSet::None,
+        actor: ActorId(73),
+        clock: Clock::UnixMs(1000),
+        scope: ScopeRef::Session(SessionId(73)),
+        tags: Tags::IMPORT,
+        kind: OpKind::Import(ImportOp {
+            raw_ref: Payload::Inline(
+                json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                    "type":"FileChange","id":"edit","status":"completed",
+                    "changes":{"a.rs":{"type":"add","content":"AI\n"}}
+                }}})
+                .to_string()
+                .into_bytes(),
+            ),
+            raw_hash: None,
+        }),
+    };
+    let file = Op {
+        id: OpId::new(NodeId(73), 0, 2),
+        parents: ParentSet::One(raw.id),
+        tags: Tags::AGENT | Tags::FILE,
+        kind: OpKind::File(FileOp {
+            path: editchain_import::derive_path_id("a.rs"),
+            stage: FileStage::Applied,
+            base: None,
+            after: None,
+            edit: FileEdit::None,
+        }),
+        ..raw.clone()
+    };
+    let mut page = editchain_store::format::Page::new(0);
+    for op in [raw, file] {
+        page.add_record(0, editchain_store::format::encode_op(&op).unwrap());
+    }
+    editchain_store::SegmentStore::open(root.join(".editchain"))
+        .unwrap()
+        .append_page(&page)
+        .unwrap();
+}
+
+#[test]
+fn version_six_replaces_import_wrappers_with_single_changes_without_rewriting_history() {
+    let root = tempfile::tempdir().unwrap();
+    capture_agent(root.path());
+    let original = canonical(root.path());
+    let mut workspace = LiveWorkspace::open_paged(&request(root.path())).unwrap();
+    let keys = legacy_edits(&mut workspace);
+    let key = keys.first().unwrap();
+    let old = window(&mut workspace)
+        .unwrap()
+        .rows
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(old.kind, "import");
+    workspace.rows.flush().unwrap();
+    let mut saved = workspace.saved();
+    saved.version = 6;
+    drop(
+        workspace
+            .checkpoint_store
+            .commit::<_, Saved>(&saved)
+            .unwrap(),
+    );
+    drop(workspace);
+
+    let mut resumed = LiveWorkspace::open_paged(&request(root.path())).unwrap();
+    assert!(resumed.reused_checkpoint);
+    let current = window(&mut resumed).unwrap();
+    let row = current.rows.first().unwrap();
+    assert_eq!(current.rows.len(), 1);
+    assert_eq!(row.kind, "file");
+    assert_eq!(row.node_key, old.node_key);
+    assert_eq!(row.continuity_key, old.continuity_key);
+    assert_eq!(row.parents, old.parents);
+    assert_eq!(row.lane, old.lane);
+    assert!(row.sub_ops.is_empty());
+    assert_eq!(block(&resumed, key).meta.row_count, 1);
+    assert_eq!(row.file_change.as_ref().unwrap().path, "a.rs");
+    let diff = resumed
+        .handle(
+            &serde_json::from_value(json!({"GetFileDiff":{
+                "snapshot_id":resumed.snapshot_id,"change":row.file_change
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+    assert!(matches!(diff, ResponseBody::Ok(_)));
+    drop(resumed);
+    let mut reopened = LiveWorkspace::open_paged(&request(root.path())).unwrap();
+    assert_eq!(
+        serde_json::to_value(window(&mut reopened).unwrap().rows).unwrap(),
+        serde_json::to_value(current.rows).unwrap()
+    );
+    assert_eq!(canonical(root.path()), original);
 }

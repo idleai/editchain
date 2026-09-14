@@ -7,7 +7,7 @@
 use super::diagnostics::{js_value_text, record_error, sync_debug_props_locked};
 use super::{ShellData, SHELL_DATA};
 use crate::app::host::{self, Send};
-use crate::app::state::Step;
+use crate::app::state::{FrameBatch, Step};
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -23,11 +23,13 @@ extern "C" {
 }
 
 thread_local! {
-    /// Pending host messages (structured-clone data payloads).
-    static MSG_QUEUE: RefCell<VecDeque<JsValue>> = const { RefCell::new(VecDeque::new()) };
+    /// Pending host messages, parsed once at the bridge boundary.
+    static MSG_QUEUE: RefCell<VecDeque<host::HostMessage>> = const { RefCell::new(VecDeque::new()) };
     /// True while the pump drains the queue (reentrancy guard for the
     /// synchronous fixture bridge dispatch inside `postMessage`).
     static PUMP_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static FRAME_QUEUED: Cell<bool> = const { Cell::new(false) };
+    static CONTROL_QUEUED: Cell<bool> = const { Cell::new(false) };
     /// Host envelopes queued for deferred dispatch (see
     /// [`schedule_post_flush`]: wasm-bindgen `Closure`s reject recursive
     /// invocation, and the harness fixture bridge dispatches correlated
@@ -216,54 +218,135 @@ pub(super) fn run_transition(transition: impl FnOnce(&mut ShellData) -> Transiti
 /// ordering deterministic.
 pub(super) fn on_message_event(event: web_sys::Event) {
     let message: web_sys::MessageEvent = event.unchecked_into();
-    MSG_QUEUE.with(|queue| queue.borrow_mut().push_back(message.data()));
-    pump_messages();
+    let parsed = host::HostMessage::parse(&message_value(&message.data()));
+    if let Some(message) = parsed {
+        MSG_QUEUE.with(|queue| queue.borrow_mut().push_back(message));
+        schedule_controls();
+    }
 }
 
-/// Drain queued host messages and any synchronous responses they trigger.
-fn pump_messages() {
+fn native_control(message: &host::HostMessage) -> bool {
+    matches!(
+        message.id,
+        host::Id::Delta | host::Id::Disclosure | host::Id::DisclosureDone
+    )
+}
+
+/// A native revision only invalidates coordinates and starts a window request.
+/// Let those requests run immediately; waiting for a paint here adds an entire
+/// frame before the native service can begin. Never pass an earlier response.
+fn schedule_controls() {
+    if CONTROL_QUEUED.replace(true) {
+        return;
+    }
+    wasm_bindgen_futures::spawn_local(async {
+        CONTROL_QUEUED.set(false);
+        let native = SHELL_DATA.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .is_some_and(|shell| shell.state.reconciles_rows())
+        });
+        let control = MSG_QUEUE.with(|queue| queue.borrow().front().is_some_and(native_control));
+        if native && control {
+            pump_messages(true);
+        } else if MSG_QUEUE.with(|queue| !queue.borrow().is_empty()) {
+            schedule_frame();
+        }
+    });
+}
+
+/// One presentation commit per frame, with a fallback for hidden webviews.
+fn schedule_frame() {
+    if FRAME_QUEUED.replace(true) {
+        return;
+    }
+    wasm_bindgen_futures::spawn_local(async {
+        if let Some(window) = web_sys::window() {
+            let timeout = Cell::new(None);
+            let animation = Cell::new(None);
+            let frame = js_sys::Promise::new(&mut |resolve, _| {
+                timeout.set(
+                    window
+                        .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 50)
+                        .ok(),
+                );
+                animation.set(window.request_animation_frame(&resolve).ok());
+                if timeout.get().is_none() && animation.get().is_none() {
+                    drop(resolve.call0(&JsValue::UNDEFINED));
+                }
+            });
+            let _completed = wasm_bindgen_futures::JsFuture::from(frame).await;
+            if let Some(handle) = timeout.get() {
+                window.clear_timeout_with_handle(handle);
+            }
+            if let Some(handle) = animation.get() {
+                drop(window.cancel_animation_frame(handle));
+            }
+        }
+        FRAME_QUEUED.set(false);
+        pump_messages(false);
+    });
+}
+
+/// Reduce every message in order, then reconcile the final window once.
+fn pump_messages(controls_only: bool) {
     if PUMP_ACTIVE.with(Cell::get) || TRANSITION_ACTIVE.with(Cell::get) {
         return;
     }
     PUMP_ACTIVE.with(|cell| cell.set(true));
     TRANSITION_ACTIVE.with(|cell| cell.set(true));
-    loop {
-        let message = MSG_QUEUE.with(|queue| queue.borrow_mut().pop_front());
-        let Some(message) = message else {
-            break;
+    let mut output = SHELL_DATA.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let Some(shell) = borrow.as_mut() else {
+            return TransitionOutput::default();
         };
-        let mut output = SHELL_DATA.with(|cell| {
-            let mut borrow = cell.borrow_mut();
-            let Some(shell) = borrow.as_mut() else {
-                return TransitionOutput::default();
+        let mut batch = FrameBatch::new(shell.dom.viewport());
+        for _ in 0..64 {
+            let next = MSG_QUEUE.with(|queue| {
+                let mut queue = queue.borrow_mut();
+                if controls_only && !queue.front().is_some_and(native_control) {
+                    None
+                } else {
+                    queue.pop_front()
+                }
+            });
+            let Some(parsed) = next else {
+                break;
             };
-            let Some(parsed) = host::HostMessage::parse(&message_value(&message)) else {
-                return TransitionOutput::default();
-            };
-            let viewport = shell.dom.viewport();
             let mut step = Step::new();
             shell
                 .state
-                .handle_host_message(parsed, &viewport, &mut step);
-            shell.apply_step_ops(&step);
-            TransitionOutput {
-                sends: std::mem::take(&mut step.sends),
-                save_state: step.save_state.take(),
+                .handle_host_message(parsed, &batch.viewport, &mut step);
+            batch.push(step);
+        }
+        let mut step = batch.finish(
+            shell.state.render_top,
+            shell.state.render_bottom,
+            shell.state.live_window_pending(),
+        );
+        step.sends.retain(
+            |send| !matches!(send, Send::Request { id, .. } if !shell.state.owns_request(*id)),
+        );
+        shell.apply_step_ops(&step);
+        TransitionOutput {
+            sends: step.sends,
+            save_state: step.save_state,
+        }
+    });
+    execute_sends(std::mem::take(&mut output.sends));
+    if let Some(saved) = output.save_state {
+        SHELL_DATA.with(|cell| {
+            if let Some(shell) = cell.borrow().as_ref() {
+                shell.persist(&saved);
             }
         });
-        let sends = std::mem::take(&mut output.sends);
-        execute_sends(sends);
-        if let Some(save_state) = output.save_state.take() {
-            SHELL_DATA.with(|cell| {
-                if let Some(shell) = cell.borrow_mut().as_mut() {
-                    shell.persist(&save_state);
-                }
-            });
-        }
     }
     PUMP_ACTIVE.with(|cell| cell.set(false));
     TRANSITION_ACTIVE.with(|cell| cell.set(false));
     after_transition();
+    if MSG_QUEUE.with(|queue| !queue.borrow().is_empty()) {
+        schedule_frame();
+    }
 }
 
 /// Post-step sync: mirror readiness flags to the window debug properties

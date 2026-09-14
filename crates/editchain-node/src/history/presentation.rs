@@ -244,7 +244,7 @@ impl Workspace {
                     work_unit: Some(work_unit_dto(&entry.annotation().work_unit)),
                     promoted: entry.annotation().promoted,
                     activity_bundle: node_activity_bundle(node),
-                    file_change: human_edit_file(node, &self.agent_file_changes).cloned(),
+                    file_change: single_edit_file(node, &self.agent_file_changes).cloned(),
                 });
             }
             // Emit the fixed depth-first descendant rows immediately after the
@@ -610,13 +610,13 @@ impl ActivityPresentation for ServicePresentation<'_> {
                 ActivityKind::Change | ActivityKind::Verify
             ),
             activity_bundle: node_activity_bundle(member),
-            file_change: human_edit_file(member, self.agent_changes).cloned(),
+            file_change: single_edit_file(member, self.agent_changes).cloned(),
         }
     }
 
     fn details(&self, node: &editchain_project::HistoryNode) -> Vec<ExpandedChildRow> {
         let mut rows = flat_op_child_rows(node);
-        if human_edit_file(node, self.agent_changes).is_none() {
+        if single_edit_file(node, self.agent_changes).is_none() {
             let changes = node_file_changes(node, self.agent_changes, self.git_changes);
             rows.extend(file_change_rows(&changes, node));
         }
@@ -624,9 +624,9 @@ impl ActivityPresentation for ServicePresentation<'_> {
     }
 }
 
-/// A human edit already owns a graph row. Present its single file there while
-/// retaining the work anchor's ancestry and the `FileOp`'s exact diff identity.
-fn human_edit_file<'a>(
+/// A single edit is the activity itself, rather than a child of its import.
+/// Retain the source anchor's ancestry and the `FileOp`'s exact diff identity.
+fn single_edit_file<'a>(
     node: &editchain_project::HistoryNode,
     changes: &'a HashMap<OpId, Vec<FileChangeDto>>,
 ) -> Option<&'a FileChangeDto> {
@@ -640,10 +640,12 @@ fn human_edit_file<'a>(
     let [change] = changes.get(&node.op_id()?)?.as_slice() else {
         return None;
     };
-    matches!(
-        change.source,
-        editchain_protocol::FileChangeSource::Human | editchain_protocol::FileChangeSource::Editor
-    )
+    (node.kind() == "file"
+        || matches!(
+            change.source,
+            editchain_protocol::FileChangeSource::Human
+                | editchain_protocol::FileChangeSource::Editor
+        ))
     .then_some(change)
 }
 

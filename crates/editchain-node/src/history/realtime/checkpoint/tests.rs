@@ -8,6 +8,7 @@ use std::cmp::Reverse;
 
 mod human_edits;
 mod human_visibility;
+mod reconciliation;
 
 fn request(root: &std::path::Path) -> OpenRequest {
     OpenRequest {

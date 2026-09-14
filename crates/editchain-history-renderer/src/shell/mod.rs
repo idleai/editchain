@@ -68,8 +68,11 @@ struct ShellData {
 
 impl ShellData {
     fn layout(&self) -> dom::GraphLayout {
+        let previous = self.drawn_graph.as_ref().map_or(0, |graph| {
+            u32::try_from(graph.lane_x.len().saturating_sub(1)).unwrap_or(0)
+        });
         dom::graph_layout(
-            self.state.graph_max_lane(),
+            self.state.graph_frame_max_lane(previous),
             self.dom.rows_client_width_css(),
             self.dom.window_inner_width_css(),
         )
@@ -88,10 +91,11 @@ impl ShellData {
     /// override or natural), and the fixed `ROW_H` cell height.
     fn graph_cell_spec(&self) -> dom::GraphCellSpec {
         let layout = self.layout();
+        let width = dom::current_graph_width(&layout, &self.col_widths);
         dom::GraphCellSpec {
-            lane_x: layout.lane_x.clone(),
+            lane_x: layout.lane_x,
             dot_radius: layout.dot_radius,
-            width: self.current_graph_width(),
+            width,
             height: dom::i64_to_f64(ROW_H),
         }
     }
@@ -127,13 +131,17 @@ impl ShellData {
     fn render_window(&mut self, top: i64, bottom: i64, live: bool) -> Result<(), JsValue> {
         self.retry_listener = None;
         let specs = dom::window_specs(&self.state, top, bottom);
-        let col_style = self.col_style();
         let graph = self.graph_cell_spec();
+        let col_style = dom::col_style(
+            graph.width,
+            self.dom.window_inner_width_css(),
+            &self.col_widths,
+        );
         let options = dom::RebuildOptions {
             spacer_height_px: self.spacer_height_px(),
             wrap_top_px: top.saturating_mul(ROW_H),
             aria_rowcount: self.state.visible_total(),
-            graph_width_css: self.current_graph_width(),
+            graph_width_css: graph.width,
             graph,
             status: self.pane_status(),
         };
@@ -212,14 +220,14 @@ impl ShellData {
             else {
                 continue;
             };
-            drop(element.set_attribute(
-                "tabindex",
-                if abs.to_string() == anchor_text {
-                    "0"
-                } else {
-                    "-1"
-                },
-            ));
+            let value = if abs.to_string() == anchor_text {
+                "0"
+            } else {
+                "-1"
+            };
+            if element.get_attribute("tabindex").as_deref() != Some(value) {
+                drop(element.set_attribute("tabindex", value));
+            }
         }
     }
 
@@ -400,22 +408,32 @@ impl ShellData {
     /// Apply one reducer DOM op.
     fn apply_op(&mut self, op: &DomOp) -> Result<(), JsValue> {
         match op {
+            DomOp::DisclosurePending { key, task, pending } => {
+                let selector = if *task {
+                    ".task-chevron"
+                } else {
+                    ".subop-chevron"
+                };
+                self.dom.disclosure_pending(key, selector, *pending)
+            }
             DomOp::ReanchorLive {
                 top,
                 bottom,
                 scroll_top,
+                animate_connections,
             } => {
-                let before = self.dom.capture_live_rows()?;
+                let before = self.dom.capture_live_rows(*animate_connections)?;
                 let focused = self.dom.has_row_focus().then(|| self.state.roving_abs());
                 self.render_window(*top, *bottom, true)?;
                 self.dom.set_scroll_top(*scroll_top);
                 if let Some(absolute) = focused {
                     self.dom.focus_live_row(absolute)?;
                 }
-                self.dom.animate_live_rows(&before)
+                self.dom.animate_live_rows(&before, *animate_connections)
             }
             DomOp::ShowMessage { text, error } => {
                 self.retry_listener = None;
+                self.drawn_graph = None;
                 self.dom.show_message(text, *error)
             }
             DomOp::ShowRequestError { text, retry } => {
@@ -428,6 +446,7 @@ impl ShellData {
                 Ok(())
             }
             DomOp::Reanchor { top, bottom } => self.reanchor_window(*top, *bottom),
+            DomOp::PatchWindow { top, bottom } => self.render_window(*top, *bottom, true),
             DomOp::AppendBelow { from, to } => self.append_window(*from, *to),
             DomOp::PrependAbove { from, to } => self.prepend_window(*from, *to),
             DomOp::TrimTop { keep_top } => self.trim_top(*keep_top),
@@ -488,6 +507,20 @@ impl ShellData {
         }
         self.apply_roving_tabindex();
         self.sync_find_nav();
+        for (key, task) in self.state.pending_disclosures.keys() {
+            let selector = if *task {
+                ".task-chevron"
+            } else {
+                ".subop-chevron"
+            };
+            let result = self.dom.disclosure_pending(key, selector, true);
+            if let Err(error) = result {
+                record_error(&format!(
+                    "Disclosure feedback failed: {}",
+                    js_value_text(&error)
+                ));
+            }
+        }
     }
 
     fn sync_graph_frame(&mut self) -> Result<(), JsValue> {

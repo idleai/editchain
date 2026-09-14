@@ -161,6 +161,7 @@ impl Server {
             | RequestBody::Refresh(_)
             | RequestBody::GetWindow(_)
             | RequestBody::LocateRows(_)
+            | RequestBody::ReconcileRows(_)
             | RequestBody::ToggleLive(_)
             | RequestBody::ViewportLive(_) => false,
             RequestBody::FindInHistory(_) => self.lexical.is_none(),
@@ -182,7 +183,8 @@ impl Server {
             | RequestBody::OpenLivePaged(_)
             | RequestBody::ToggleLive(_)
             | RequestBody::ViewportLive(_)
-            | RequestBody::SyncLive(_) => return Err(no_workspace().into()),
+            | RequestBody::SyncLive(_)
+            | RequestBody::ReconcileRows(_) => return Err(no_workspace().into()),
             RequestBody::Open(req) | RequestBody::Refresh(req) => {
                 let workspace = if matches!(&request.body, RequestBody::Open(_)) {
                     Workspace::open(&req.workspace_path, &req.chain_dir)?

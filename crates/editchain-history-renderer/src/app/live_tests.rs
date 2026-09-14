@@ -116,6 +116,125 @@ fn message(state: &mut HistoryAppState, id: Value, body: Value, viewport: &Viewp
     step
 }
 
+fn conditional_reply(
+    state: &mut HistoryAppState,
+    id: u64,
+    rows: &[Value],
+    viewport: &Viewport,
+) -> Step {
+    message(
+        state,
+        json!(id),
+        json!({"Ok": {
+            "snapshot_id":state.snapshot_id, "offset":0, "locations":[], "total":rows.len(),
+            "chain_generation":1, "max_lane":0, "rows":rows,
+        }}),
+        viewport,
+    )
+}
+
+#[test]
+fn conditional_updates_reuse_content_and_retire_only_coordinates_in_one_round_trip() {
+    let viewport = Viewport::new(0, 68);
+    let mut state = HistoryAppState::default();
+    let opened = message(
+        &mut state,
+        json!("open"),
+        json!({"Ok": {
+            "protocol_version":2,"snapshot_id":"native:0","nodes":3,"repos":1,
+            "live":{"paged":true,"reconcile_rows":true,"epoch":"native","revision":0,"total":3,"blocks":[]}
+        }}),
+        &viewport,
+    );
+    let id = opened
+        .sends
+        .iter()
+        .find_map(|send| {
+            if let Send::Request { id, body } = send {
+                body.get("ReconcileRows").map(|_| *id)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    assert!(state.owns_request(id));
+    let version = "a".repeat(64);
+    let rows: Vec<_> = (0..3)
+        .map(
+            |index| json!({"key":format!("item:{index}"), "version":version, "content":row(index)}),
+        )
+        .collect();
+    let _ready = conditional_reply(&mut state, id, &rows, &viewport);
+    assert!(!state.owns_request(id));
+    let retained = state.cache.get_by_index(1).unwrap().source.summary.as_ptr();
+    let update = json!({"Ok":{"epoch":"native","revision":1,"work":editchain_protocol::LiveWork::default(),"deltas":[{
+        "base_revision":0,"revision":1,"snapshot_id":"native:1","removed":[],"upserts":[],"total":4,
+        "visible_total":4,"chain_generation":1,"max_lane":0,"work":editchain_protocol::LiveWork::default()
+    }]}});
+    let step = message(&mut state, json!("delta"), update.clone(), &viewport);
+    assert!(state.live_window_pending());
+    assert!(state.cache.is_empty(), "retired coordinates cannot be read");
+    assert_eq!(
+        state.cache.known_rows().len(),
+        3,
+        "content survives for validation"
+    );
+    let requests: Vec<_> = step
+        .sends
+        .iter()
+        .filter_map(|send| {
+            if let Send::Request { id, body } = send {
+                Some((*id, body))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(requests.len(), 1);
+    let (id, request) = requests.first().unwrap();
+    assert_eq!(
+        request
+            .get("ReconcileRows")
+            .unwrap()
+            .get("known")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let mut rows = vec![json!({"key":"item:3","version":"b".repeat(64),"content":row(3)})];
+    rows.extend((0..3).map(|index| json!({"key":format!("item:{index}"),"version":version})));
+    let applied = conditional_reply(&mut state, *id, &rows, &viewport);
+    assert!(!state.live_window_pending());
+    assert_eq!(
+        state.cache.get_by_index(2).unwrap().source.summary.as_ptr(),
+        retained
+    );
+    assert!(applied.sends.iter().any(|send| matches!(send, Send::LiveSettled { snapshot_id, error: None } if snapshot_id == "native:1")));
+    assert!(!applied
+        .sends
+        .iter()
+        .any(|send| matches!(send, Send::Request { .. })));
+    let replay = message(&mut state, json!("delta"), update, &viewport);
+    assert!(!replay
+        .ops
+        .iter()
+        .any(|op| matches!(op, DomOp::ReanchorLive { .. })));
+    assert_eq!(state.cache.len(), 4);
+}
+
+#[test]
+fn mounted_margin_is_independent_of_the_prefetch_budget() {
+    let state = HistoryAppState {
+        total: Some(10_000),
+        ..Default::default()
+    };
+    let viewport = Viewport::new(34_000, 680);
+    assert_eq!(state.desired_visible_range(&viewport), (984, 1036));
+    assert_eq!(state.desired_cache_range(&viewport), (600, 1420));
+}
+
 fn opened(snapshot: &str, nodes: usize) -> Value {
     json!({"Ok": {"protocol_version": 2, "snapshot_id": snapshot, "nodes": nodes}})
 }
@@ -429,7 +548,66 @@ fn operation_deltas_retain_cached_rows_pixel_anchor_selection_and_replay_cursor(
 }
 
 #[test]
+fn incomplete_native_windows_preserve_width_but_complete_windows_can_shrink() {
+    let mut state = HistoryAppState {
+        snapshot_id: SnapshotId::new("native"),
+        total: Some(4),
+        render_top: 0,
+        render_bottom: 3,
+        phase: SnapshotPhase::LayoutReady,
+        ..HistoryAppState::default()
+    };
+    state
+        .open_remote(
+            &serde_json::from_value(json!({
+                "paged":true, "epoch":"native", "revision":0, "total":4, "blocks":[]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    drop(
+        state
+            .cache
+            .insert_legacy(ExpandedRow::new(0).unwrap(), &row(0)),
+    );
+    assert_eq!(
+        state.graph_frame_max_lane(9),
+        9,
+        "prefetch is still missing"
+    );
+    let mut wide = row(1);
+    *wide.get_mut("lane").unwrap() = json!(12);
+    drop(
+        state
+            .cache
+            .insert_legacy(ExpandedRow::new(1).unwrap(), &wide),
+    );
+    assert_eq!(
+        state.graph_frame_max_lane(9),
+        12,
+        "new lanes grow immediately"
+    );
+    for index in 1..4 {
+        drop(state.cache.insert_legacy(
+            ExpandedRow::new(index).unwrap(),
+            &row(usize::try_from(index).unwrap()),
+        ));
+    }
+    assert_eq!(
+        state.graph_frame_max_lane(12),
+        0,
+        "complete narrow window shrinks"
+    );
+}
+
+#[test]
 fn native_pages_restore_a_distant_anchor_before_acknowledging() {
+    for (message_id, animate_connections) in [("delta", true), ("disclosure", false)] {
+        assert_native_handover(message_id, animate_connections);
+    }
+}
+
+fn assert_native_handover(message_id: &str, animate_connections: bool) {
     let viewport = Viewport::new(34_007, 102);
     let mut state = HistoryAppState {
         snapshot_id: SnapshotId::new("native"),
@@ -455,7 +633,7 @@ fn native_pages_restore_a_distant_anchor_before_acknowledging() {
     state.selection.set_roving(ExpandedRow::new(1000));
     let step = message(
         &mut state,
-        json!("delta"),
+        json!(message_id),
         json!({"Ok": {
             "epoch": "native", "revision": 1, "work": editchain_protocol::LiveWork::default(),
             "deltas": [{"base_revision":0, "revision":1, "snapshot_id":"native:1",
@@ -513,8 +691,9 @@ fn native_pages_restore_a_distant_anchor_before_acknowledging() {
         op,
         DomOp::ReanchorLive {
             scroll_top: 34_041,
+            animate_connections: actual,
             ..
-        }
+        } if *actual == animate_connections
     )));
     assert!(step
         .sends

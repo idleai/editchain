@@ -132,7 +132,11 @@ body {
   from { transform: translateY(var(--live-offset, 0)); }
   to { transform: translateY(0); }
 }
-.row.row-live-moved { animation: ec-live-move 360ms ease-out; }
+.row.row-live-moved { animation: ec-live-move 160ms ease-out; }
+.task-chevron[aria-busy="true"], .subop-chevron[aria-busy="true"] {
+  opacity: 0.55;
+  cursor: progress;
+}
 @keyframes ec-graph-grow {
   from { stroke-dashoffset: -1; }
   to { stroke-dashoffset: 0; }
@@ -148,7 +152,7 @@ body {
 .graph-live-node {
   transform-box: fill-box;
   transform-origin: center;
-  animation: ec-graph-node 180ms ease-out var(--graph-delay) both;
+  animation: ec-graph-node var(--graph-duration) ease-out var(--graph-delay) both;
 }
 @media (prefers-reduced-motion: reduce) {
   .row.row-live-moved { animation: none; }

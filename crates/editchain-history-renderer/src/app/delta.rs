@@ -8,6 +8,26 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 
 impl HistoryAppState {
+    /// Missing prefetch rows are not evidence that the displayed lanes vanished.
+    /// Grow immediately, but shrink only once the replacement window is complete.
+    pub(crate) fn graph_frame_max_lane(&self, previous: u32) -> u32 {
+        let current = self.graph_max_lane();
+        if current >= previous {
+            return current;
+        }
+        let complete = self.data_ready()
+            && self.layout_ready()
+            && (self.render_top..=self.render_bottom).all(|visible| {
+                self.abs_index_for_visible(visible)
+                    .is_some_and(|abs| self.cache.get_by_index(abs).is_some())
+            });
+        if complete {
+            current
+        } else {
+            previous
+        }
+    }
+
     /// Frame the retained window at ordinary lane pitch. Distant historical
     /// branches must not compress the current tracks or reserve empty columns.
     pub(crate) fn graph_max_lane(&self) -> u32 {
@@ -39,7 +59,9 @@ impl HistoryAppState {
         body: Option<Value>,
         viewport: &Viewport,
         step: &mut Step,
+        animate_connections: bool,
     ) {
+        self.animate_connections = animate_connections;
         let decoded = match host::unwrap(body) {
             Unwrapped::Ok(value) => host::decode::<LiveUpdate>(value),
             Unwrapped::Err(error) => Err(error),

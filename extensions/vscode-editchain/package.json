@@ -125,6 +125,7 @@
     "install:local:editor-origins": "node scripts/install-local.mjs --editor-origins",
     "package:editor-origins": "node scripts/package-editor-origins.mjs",
     "perf:service": "node scripts/service-perf.mjs",
+    "perf:renderer": "node scripts/renderer-update-perf.cjs",
     "ui:vscode": "xvfb-run -a npx wdio run ./test/vscode/wdio.conf.ts",
     "ui:vscode:renderer": "xvfb-run -a npx wdio run ./test/vscode/wdio.renderer.conf.ts",
     "ui:vscode:visual": "xvfb-run -a npx wdio run ./test/vscode/wdio.visual.conf.ts",

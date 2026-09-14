@@ -6,18 +6,19 @@ use super::{LiveWorkspace, Result};
 use editchain_protocol::rank::Measure;
 
 impl LiveWorkspace {
-    pub(super) fn refresh_human_rows(&mut self, include_exposure: bool) -> Result<()> {
+    pub(super) fn refresh_edit_rows(&mut self, include_exposure: bool) -> Result<()> {
         self.poisoned = true;
         let upserts = self
             .inputs
             .iter()
             .filter(|(_, input)| {
                 input.operations.iter().any(|op| {
-                    editchain_project::human::work_record(op).is_some_and(|work| {
-                        work.kind == editchain_core::human::HumanWorkKind::Edit
-                            || (include_exposure
-                                && work.kind == editchain_core::human::HumanWorkKind::Exposure)
-                    })
+                    matches!(op.kind, editchain_core::OpKind::File(_))
+                        || editchain_project::human::work_record(op).is_some_and(|work| {
+                            work.kind == editchain_core::human::HumanWorkKind::Edit
+                                || (include_exposure
+                                    && work.kind == editchain_core::human::HumanWorkKind::Exposure)
+                        })
                 })
             })
             .map(|(key, input)| (key.clone(), input.clone()))

@@ -7,6 +7,7 @@ mod disclosure;
 mod git;
 mod open;
 mod queries;
+mod reconcile;
 mod regroup;
 mod rows;
 mod storage;
@@ -147,7 +148,7 @@ impl LiveWorkspace {
             let disclosure = saved.version < 4;
             let regroup = saved.version == 1;
             let human_visibility = saved.version < 5;
-            let human_rows = saved.version < 6;
+            let edit_rows = saved.version < 7;
             workspace.adopt(saved, true)?;
             if regroup {
                 workspace.regroup();
@@ -158,10 +159,10 @@ impl LiveWorkspace {
             if disclosure {
                 workspace.regroup_disclosure();
             }
-            if human_rows {
-                workspace.refresh_human_rows(human_visibility)?;
+            if edit_rows {
+                workspace.refresh_edit_rows(human_visibility)?;
             }
-            if disclosure || human_rows {
+            if disclosure || edit_rows {
                 // Publish the new version only after every migration completed.
                 workspace.checkpoint()?;
             }
@@ -234,6 +235,7 @@ impl LiveWorkspace {
     pub(crate) fn opened(&self) -> OpenResponse {
         let mut response = self.open_metadata();
         response.live = Some(LiveBaseline {
+            reconcile_rows: self.paged(),
             paged: self.paged(),
             epoch: self.epoch.clone(),
             revision: self.revision,

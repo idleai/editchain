@@ -122,6 +122,7 @@ impl RequestBody {
             Self::ViewportLive(request) => Some(&request.snapshot_id),
             Self::GetWindow(request) => Some(&request.snapshot_id),
             Self::LocateRows(request) => Some(&request.snapshot_id),
+            Self::ReconcileRows(request) => Some(&request.snapshot_id),
             Self::FindInHistory(request) => Some(&request.snapshot_id),
             Self::GetNodeDetails(request) => Some(&request.snapshot_id),
             Self::ResolveObject(request) => Some(&request.snapshot_id),
