@@ -11,7 +11,8 @@ test('local editor-origin enablement preserves JSONC comments, other settings, a
   const { parse } = require('jsonc-parser');
   assert.deepEqual(parse(result)['enable-proposed-api'], ['another.extension', 'ambientlight.editchain-history']);
   assert.equal(withEditorOrigins(result, 'ambientlight.editchain-history'), result);
-  assert.equal(withEditorOrigins('{"enable-proposed-api":[]}', 'ambientlight.editchain-history'), '{"enable-proposed-api":[]}');
+  assert.deepEqual(parse(withEditorOrigins('{"enable-proposed-api":[]}', 'ambientlight.editchain-history'))['enable-proposed-api'],
+    ['ambientlight.editchain-history'], 'argv.json needs an explicit extension ID, including when the list was empty');
   assert.throws(() => withEditorOrigins('{broken', 'ambientlight.editchain-history'), /valid JSONC/);
   assert.throws(() => withEditorOrigins('{"enable-proposed-api":true}', 'ambientlight.editchain-history'), /Invalid/);
 });

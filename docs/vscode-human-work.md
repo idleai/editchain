@@ -137,6 +137,30 @@ and [prior runtime counterexample](vscode-editor-capture-results.md#attribution)
 
 ## Durable integration
 
+### Independent capture and coverage (0.1.9)
+
+Coverage reports replay the entire retained history. Previously the status-bar
+click ran that query on the recorder's serial native connection, blocking both
+`RecordEditorEvents` and `GetEditorContext`. In a reported 1.7 GB history, retained
+edit timestamps showed a 92-second delay before blob persistence. A diagnostic
+coverage request blocked a queued context observation for over 35 seconds; the
+same context request alone completed in 12 ms.
+
+Coverage now owns a separate short-lived client. Repeated requests coalesce,
+and disposal stops the report worker. Git-context observation also has its own
+client. The status bar opens **EditChain: Show Tracking Status**, which reads
+runtime diagnostics without a coverage scan or capture flush. Explicit coverage
+remains available in the Command Palette. Slow delivery logs separate outbox
+queue time, native request duration, and total event age from renderer latency.
+This does not make full-history coverage scans or cold index builds inexpensive.
+
+The input path remains event-driven: VS Code document events enter a 25 ms
+outbox frame, durable acknowledgements wake live history, and subsequent edit
+receipts publish within 100 ms. The live collector's 250 ms fallback poll and
+the 15-second Git-context poll do not gate acknowledged human work. Runtime
+API enablement is independent of this transport fix; retained unattributed
+observations keep their original evidence.
+
 ### Direct attribution and visible uncertainty (0.1.8)
 
 Capture and attribution now have separate owners. `EditorCapture` retains exact
@@ -522,7 +546,7 @@ exposure records remain retained even after new capture stops producing them.
 
 `npm run package` keeps the extension on stable APIs. After compiling, run
 `npm run package:editor-origins` to produce
-`outputs/editchain-history-0.1.8-editor-origins.vsix` from an isolated staging
+`outputs/editchain-history-0.1.9-editor-origins.vsix` from an isolated staging
 directory. Its manifest declares only `textDocumentChangeReason`; packaging
 does not change the ordinary manifest or enable APIs in an existing VS Code.
 The native service must also be rebuilt to accept retained origin metadata.
@@ -534,6 +558,11 @@ the runtime arguments opened by **Preferences: Configure Runtime Arguments**,
 preserving other entries, then quit and relaunch VS Code. These are local
 development builds; Microsoft's [proposed-API guidance](https://code.visualstudio.com/api/advanced-topics/using-proposed-api)
 does not permit publishing them to the Marketplace.
+
+An empty `enable-proposed-api` array in `argv.json` enables no extensions; the
+helper adds EditChain's ID even when that array already exists. VS Code expands
+each array entry into a startup flag, so this differs from passing the CLI flag
+without an ID. See [VS Code's runtime-argument expansion](https://github.com/microsoft/vscode/blob/645f29cc3176500b4b5762ba887cf2a7f0ffdf2c/src/main.ts).
 
 The EditChain output channel logs the loaded version/path on activation and,
 after the first mutation, either `direct document change reasons` or

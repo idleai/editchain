@@ -10,6 +10,7 @@ export type EditorEvent = {
 };
 type Batch = { workspace_path: string; chain_dir: string; events: EditorEvent[] };
 type Send = (body: { RecordEditorEvents: Batch }) => Promise<unknown>;
+type DeliveryTiming = { events: number; queue_ms: number; request_ms: number; oldest_event_ms: number };
 
 /** Local write-ahead outbox. Never remove a batch before an exact durable ack. */
 export class EditorOutbox {
@@ -29,7 +30,8 @@ export class EditorOutbox {
   constructor(private readonly directory: string, private readonly workspace: string,
     private readonly chain: string, private readonly send: Send,
     private readonly status: (message: string) => void,
-    private readonly delivered: () => void = () => {}) {
+    private readonly delivered: () => void = () => {},
+    private readonly slowDelivery: (timing: DeliveryTiming) => void = () => {}) {
     this.timer = setInterval(() => { void this.flush(false); }, 1000);
     this.timer.unref();
   }
@@ -128,6 +130,7 @@ export class EditorOutbox {
       try { raw = await fs.readFile(location, 'utf8'); }
       catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
       const batch = JSON.parse(raw) as Batch;
+      const started = Date.now();
       const response = await this.send({ RecordEditorEvents: batch }) as { Ok?: { schema: number; ack: [string, number][] }; Error?: unknown };
       const expected = batch.events.map(event => [event.session, event.sequence]);
       if (response?.Ok?.schema !== 1 || JSON.stringify(response.Ok.ack) !== JSON.stringify(expected)) {
@@ -135,6 +138,12 @@ export class EditorOutbox {
       }
       await fs.rm(location, { force: true });
       this.diskBytes = Math.max(0, this.diskBytes - Buffer.byteLength(raw));
+      const finished = Date.now();
+      const oldest = Math.min(...batch.events.map(event => event.time_ms));
+      if (finished - started >= 250 || finished - oldest >= 1000) {
+        this.slowDelivery({ events: batch.events.length, queue_ms: Math.max(0, started - oldest),
+          request_ms: finished - started, oldest_event_ms: Math.max(0, finished - oldest) });
+      }
       this.delivered();
     }
     this.retryAt = 0;

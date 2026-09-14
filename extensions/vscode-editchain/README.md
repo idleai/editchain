@@ -69,9 +69,10 @@ workspace location and HEAD are used during replay; today's HEAD cannot rewrite
 old work. These are shared working-tree activity branches, not isolated
 snapshots. External changes can occur between observations.
 
-Open **EditChain: Show Human Work Coverage** from the Command Palette or the
-tracking status item. The report compares imported AI file evidence with current
-saved files and shows nonblank AI-origin lines with reading indicators, human
+Open **EditChain: Show Human Work Coverage** from the Command Palette. The
+tracking status item opens **EditChain: Show Tracking Status**, a lightweight
+runtime diagnostic in the output channel. The coverage report compares imported
+AI file evidence with current saved files and shows nonblank AI-origin lines with reading indicators, human
 edits, and their overlap. Historical counts retain work on lines
 that were later changed or deleted, including unsaved human edits. Populate AI
 evidence using the existing import or Live History workflow; missing provenance
@@ -140,6 +141,14 @@ waits at most 250 ms for a matching selection, then publishes an unattributed
 edit instead of silently omitting it. The status bar explicitly identifies
 limited attribution. The read-only `editchain-history.trackingStatus` command
 returns the observed mode and capture counters without flushing pending work.
+
+Version 0.1.9 gives coverage reports, Git-context observation, and edit recording
+separate native connections. A slow coverage replay no longer queues typing or
+saves behind it. Repeated report requests share one worker, which is released
+when the report finishes or the extension stops. Slow capture deliveries log
+queue time, request time, and the oldest event's age; renderer timings remain
+separate. The status diagnostic includes the running VS Code client, extension
+version, proposal declarations, and the input mode actually observed.
 
 Version 0.1.4 retains the read receipt for an unchanged document revision and
 viewport across interruptions, including replacement editor objects when a tab

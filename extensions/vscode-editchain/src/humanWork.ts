@@ -8,7 +8,7 @@ import { StdioClient, resolveServicePath } from './stdioClient';
 import { unsignedIdentity, workspaceIdentity } from './humanIdentity';
 import { EditorHealth } from './editorHealth';
 
-type Recorder = { capture: EditorCapture; context: { dispose(): void }; outbox: EditorOutbox; client: StdioClient; folder: vscode.WorkspaceFolder; chain: string; health: EditorHealth };
+type Recorder = { capture: EditorCapture; context: { dispose(): void }; contextClient: StdioClient; outbox: EditorOutbox; client: StdioClient; folder: vscode.WorkspaceFolder; chain: string; health: EditorHealth };
 
 /** Capture lifecycle is independent of whether the History panel is open. */
 export class HumanWorkHost {
@@ -19,14 +19,17 @@ export class HumanWorkHost {
   private reportText = '';
   private configurationKey: string | undefined;
   private transportStatus = 'Tracking human work';
+  private reporting: Promise<unknown> | undefined;
+  private reportClient: StdioClient | undefined;
 
   constructor(private readonly context: vscode.ExtensionContext, private readonly log: vscode.OutputChannel,
     private readonly delivered: () => void = () => {}) {
     this.status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
-    this.status.command = 'editchain-history.humanWork';
+    this.status.command = 'editchain-history.showTrackingStatus';
     context.subscriptions.push(this.status,
       vscode.workspace.registerTextDocumentContentProvider('editchain-work', { provideTextDocumentContent: () => this.reportText }),
       vscode.commands.registerCommand('editchain-history.humanWork', () => this.showReport()),
+      vscode.commands.registerCommand('editchain-history.showTrackingStatus', () => this.showStatus()),
       vscode.commands.registerCommand('editchain-history.trackingStatus', async () => {
         await this.lifecycle;
         return this.recorders.map(({ folder, health }) => ({ workspace: folder.uri.fsPath, ...health }));
@@ -72,11 +75,14 @@ export class HumanWorkHost {
         const namespace = createHash('sha256').update(folder.uri.toString() + '\0' + chain).digest('hex').slice(0, 24);
         const client = new StdioClient();
         client.setLog(line => this.log.appendLine(`[capture] ${line}`));
+        const contextClient = new StdioClient();
+        contextClient.setLog(line => this.log.appendLine(`[capture context] ${line}`));
         const outbox = new EditorOutbox(path.join(this.context.storageUri.fsPath, 'editor-outbox', namespace),
           folder.uri.fsPath, chain, body => {
             client.ensureStarted(resolveServicePath());
             return client.request(body, { timeoutMs: 30000 });
-          }, message => this.updateStatus(message), this.delivered);
+          }, message => this.updateStatus(message), this.delivered,
+          timing => this.log.appendLine(`[capture] delivery ${JSON.stringify(timing)}`));
         const dwell = Math.max(500, Math.min(30000, configuration.get<number>('tracking.readDwellMs', 2000)));
         const maxBytes = Math.max(1024, Math.min(524288, configuration.get<number>('tracking.maxFileBytes', 262144)));
         const health = new EditorHealth();
@@ -94,10 +100,10 @@ export class HumanWorkHost {
         },
           workspaceIdentity(guid, folder.uri.toString(), folder.uri.fsPath, chain));
         const context = observeEditorContext(capture, () => {
-          client.ensureStarted(resolveServicePath());
-          return client.request({ GetEditorContext: { workspace_path: folder.uri.fsPath, chain_dir: chain } }, { timeoutMs: 30000 });
+          contextClient.ensureStarted(resolveServicePath());
+          return contextClient.request({ GetEditorContext: { workspace_path: folder.uri.fsPath, chain_dir: chain } }, { timeoutMs: 30000 });
         }, message => this.log.appendLine(`[capture] ${message}`));
-        this.recorders.push({ capture, context, outbox, client, folder, chain, health });
+        this.recorders.push({ capture, context, contextClient, outbox, client, folder, chain, health });
       }
       this.configurationKey = key;
       if (this.recorders.length) this.updateStatus('Tracking human work');
@@ -120,7 +126,27 @@ export class HumanWorkHost {
     if (changed) this.log.appendLine(`[capture] ${tooltip.replaceAll('\n', ' · ')}`);
   }
 
-  private async showReport(): Promise<unknown> {
+  private async showStatus(): Promise<void> {
+    await this.lifecycle;
+    this.log.appendLine(`[capture] Runtime ${JSON.stringify({ vscode: vscode.version,
+      client: vscode.env?.appHost, remote: vscode.env?.remoteName,
+      extension: this.context.extension?.packageJSON.version,
+      enabled_proposals: this.context.extension?.packageJSON.enabledApiProposals ?? [],
+      workspaces: this.recorders.map(({ folder, health }) => ({ workspace: folder.uri.fsPath, ...health })),
+    })}`);
+    this.log.appendLine(`[capture] ${this.transportStatus}`);
+    if (this.recorders.some(recorder => recorder.health.mode === 'limited')) {
+      this.log.appendLine('[capture] Direct input metadata is absent in this session. In the desktop client, use Preferences: Configure Runtime Arguments, add "enable-proposed-api": ["ambientlight.editchain-history"], then fully quit and reopen the client. Workspace settings and a remote host\'s argv.json do not configure a different client.');
+    }
+    this.log.show(true);
+  }
+
+  private showReport(): Promise<unknown> {
+    this.reporting ??= this.buildReport().finally(() => { this.reporting = undefined; });
+    return this.reporting;
+  }
+
+  private async buildReport(): Promise<unknown> {
     await this.lifecycle;
     try {
       const folders = vscode.workspace.workspaceFolders ?? [];
@@ -131,13 +157,19 @@ export class HumanWorkHost {
         recorder.capture.checkpoint();
         if (!await recorder.outbox.flush()) throw new Error('Capture is still pending. Restore the service and retry the report.');
       }
-      const client = recorder?.client ?? new StdioClient();
-      client.ensureStarted(resolveServicePath());
+      if (this.disposed) return undefined;
+      // Coverage replays the complete history. Never put it ahead of live input
+      // on the recorder's serial native connection, even while the report waits.
+      const client = new StdioClient();
+      this.reportClient = client;
+      client.setLog(line => this.log.appendLine(`[capture report] ${line}`));
       let response;
       try {
+        client.ensureStarted(resolveServicePath());
         response = await client.request({ GetHumanWork: { workspace_path: folder.uri.fsPath,
           chain_dir: vscode.workspace.getConfiguration('editchain-history').get<string>('chainDir', '.editchain') } }, { timeoutMs: 120000 });
-      } finally { if (!recorder) client.stop(); }
+      } finally { client.stop(); this.reportClient = undefined; }
+      if (this.disposed) return undefined;
       if (!response?.Ok || response.Ok.schema !== 1) throw new Error(JSON.stringify(response?.Error ?? response));
       this.reportText = formatReport(response.Ok);
       const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(`editchain-work:/human-work-${Date.now()}.md`));
@@ -145,7 +177,7 @@ export class HumanWorkHost {
       return response.Ok;
     } catch (error) {
       this.log.appendLine(`[capture report] ${String(error)}`);
-      await vscode.window.showErrorMessage(`EditChain human work: ${String(error)}`);
+      if (!this.disposed) await vscode.window.showErrorMessage(`EditChain human work: ${String(error)}`);
       return undefined;
     }
   }
@@ -153,7 +185,9 @@ export class HumanWorkHost {
   private async stopRecorders(): Promise<void> {
     const recorders = this.recorders;
     this.recorders = [];
-    for (const recorder of recorders) { recorder.context.dispose(); recorder.capture.dispose(); }
+    for (const recorder of recorders) {
+      recorder.context.dispose(); recorder.contextClient.stop(); recorder.capture.dispose();
+    }
     for (const recorder of recorders) {
       try { await recorder.outbox.stop(); } finally { recorder.client.stop(); }
     }
@@ -161,6 +195,7 @@ export class HumanWorkHost {
 
   async stop(): Promise<void> {
     this.disposed = true;
+    this.reportClient?.stop();
     await this.lifecycle;
     await this.stopRecorders();
   }

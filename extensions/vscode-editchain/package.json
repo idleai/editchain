@@ -1,8 +1,8 @@
 {
   "name": "editchain-history",
   "displayName": "EditChain History",
-  "description": "Unified engineering history explorer \u2014 EditChain operations overlaid with live Git history.",
-  "version": "0.1.8",
+  "description": "Unified engineering history explorer — EditChain operations overlaid with live Git history.",
+  "version": "0.1.9",
   "publisher": "ambientlight",
   "license": "MIT",
   "repository": {
@@ -44,6 +44,10 @@
       {
         "command": "editchain-history.stopLive",
         "title": "EditChain: Pause Live History"
+      },
+      {
+        "command": "editchain-history.showTrackingStatus",
+        "title": "EditChain: Show Tracking Status"
       },
       {
         "command": "editchain-history.humanWork",

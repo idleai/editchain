@@ -13,8 +13,8 @@ export function withEditorOrigins(text, extension) {
   if (enabled !== undefined && (!Array.isArray(enabled) || enabled.some(value => typeof value !== 'string'))) {
     throw new Error('Invalid enable-proposed-api list; no settings were changed.');
   }
-  // An existing empty array already enables all proposals; preserve its scope.
-  if (enabled && (!enabled.length || enabled.some(value => value.toLowerCase() === extension.toLowerCase()))) return text;
+  // argv.json expands each entry into a CLI flag; an empty array enables none.
+  if (enabled?.some(value => value.toLowerCase() === extension.toLowerCase())) return text;
   return applyEdits(text, modify(text, ['enable-proposed-api'], [...(enabled ?? []), extension], {
     formattingOptions: { insertSpaces: true, tabSize: 2, eol: text.includes('\r\n') ? '\r\n' : '\n' },
   }));
