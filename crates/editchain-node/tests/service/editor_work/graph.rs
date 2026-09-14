@@ -32,6 +32,9 @@ mod bursts;
 #[path = "live_edits.rs"]
 mod live_edits;
 
+#[path = "observed_edits.rs"]
+mod observed_edits;
+
 fn git(root: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)

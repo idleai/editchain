@@ -51,6 +51,8 @@ struct Session {
     saved: BTreeMap<String, u64>,
     last_change: Option<u64>,
     edit_group: Option<(u64, Change, u64)>,
+    #[serde(default)]
+    observed_group: Option<(u64, Change, u64)>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -293,10 +295,24 @@ impl Session {
                         context: None,
                     }));
                 };
-                return Ok(Some(Work::edit(change)));
+                return Ok(Some(Work::edit(change, HumanWorkKind::Edit)));
             }
             EditorEventKind::HumanEditBatch { edits, group } => {
-                return Ok(Some(self.edit_batch(edits, *group)))
+                return Ok(Some(self.edit_batch(edits, *group, HumanWorkKind::Edit)))
+            }
+            EditorEventKind::ObservedEditBatch { changes, group } => {
+                let edits: Vec<_> = changes
+                    .iter()
+                    .map(|change| editchain_protocol::editor::EditorEditAttribution {
+                        change: *change,
+                        signal: String::new(),
+                    })
+                    .collect();
+                return Ok(Some(self.edit_batch(
+                    &edits,
+                    Some(*group),
+                    HumanWorkKind::ObservedEdit,
+                )));
             }
             EditorEventKind::CodeExposure {
                 document,

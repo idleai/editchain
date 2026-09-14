@@ -82,6 +82,7 @@ pub(crate) fn report(request: &OpenRequest) -> Result<Value, Box<dyn std::error:
                 | EditorEventKind::TrackingGap { .. }
                 | EditorEventKind::DocumentSnapshot { .. }
                 | EditorEventKind::DocumentChanged { .. }
+                | EditorEventKind::ObservedEditBatch { .. }
                 | EditorEventKind::DocumentSaved { .. }
                 | EditorEventKind::DocumentRenamed { .. }
                 | EditorEventKind::EditorOpened { .. }
@@ -370,6 +371,7 @@ impl Measurement {
             EditorEventKind::WorkspaceContext { .. }
             | EditorEventKind::HumanEdit { .. }
             | EditorEventKind::HumanEditBatch { .. }
+            | EditorEventKind::ObservedEditBatch { .. }
             | EditorEventKind::DocumentSaved { .. }
             | EditorEventKind::EditorOpened { .. }
             | EditorEventKind::EditorClosed { .. }

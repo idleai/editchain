@@ -91,12 +91,15 @@ pub(super) fn file_content(row: &RowInput) -> Option<FileContent> {
         FileChangeSource::Git => "git",
         FileChangeSource::Agent => "agent",
         FileChangeSource::Human => "human",
+        FileChangeSource::Editor => "editor",
         FileChangeSource::Unknown => "unknown",
     }
     .to_owned();
     let binary = change.binary;
     let partial = change.partial;
-    let fidelity = if binary {
+    let fidelity = if source == "editor" {
+        "unattributed"
+    } else if binary {
         "binary"
     } else if partial {
         "recorded"
@@ -121,6 +124,8 @@ pub(super) fn file_content(row: &RowInput) -> Option<FileContent> {
         "Git commit"
     } else if source == "human" {
         "human edit"
+    } else if source == "editor" {
+        "editor change without human or agent attribution"
     } else if partial {
         "recorded agent edit"
     } else {

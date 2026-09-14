@@ -155,7 +155,8 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }),
     vscode.workspace.onDidChangeConfiguration(event => {
-      if (!event.affectsConfiguration('editchain-history')) return;
+      // Recorder settings must not interrupt the retained graph or its writer.
+      if (!['chainDir', 'servicePath', 'live'].some(key => event.affectsConfiguration(`editchain-history.${key}`))) return;
       stopLive();
       if (event.affectsConfiguration('editchain-history.live.enabled')) {
         liveRequested = vscode.workspace.getConfiguration('editchain-history').get<boolean>('live.enabled', true);
@@ -530,7 +531,9 @@ function ensureLive(client: StdioClient, panel: vscode.WebviewPanel): void {
   }
   liveSync = createLiveSync(resolveServicePath(), provider => syncNative(client, panel, provider),
     setLiveStatus, text => output?.appendLine('[live] ' + text));
-  liveSync.wake();
+  // Capture can be acknowledged before the panel has a live collector. Read
+  // that durable tail before walking the provider archive on initial attach.
+  liveSync.humanChanged();
 }
 
 function syncNative(client: StdioClient, panel: vscode.WebviewPanel, codex?: LiveProviderRequest, disclosure?: { key: string; task: boolean }): Promise<boolean | void> {
@@ -574,7 +577,10 @@ async function syncNativeSerial(client: StdioClient, panel: vscode.WebviewPanel,
   const cursor = lastOpenBody.Ok.live;
   const body = disclosure ? { ToggleLive: { snapshot_id: lastOpenBody.Ok.snapshot_id, ...disclosure } }
     : { SyncLive: { epoch: cursor.epoch, after_revision: cursor.revision, codex: codex || null } };
+  const requestedAt = Date.now();
   const response = await client.request(body, { timeoutMs: 0 });
+  const elapsed = Date.now() - requestedAt;
+  if (elapsed >= 250) output?.appendLine('[live] native ' + JSON.stringify({ request: Object.keys(body)[0], elapsed_ms: elapsed }));
   return publishNative(client, panel, response, owner);
 }
 
@@ -596,6 +602,7 @@ async function publishNative(client: StdioClient, panel: vscode.WebviewPanel, re
   }
   if (!update.deltas.length) return update.work?.provider_pending === true;
   const latest = update.deltas[update.deltas.length - 1];
+  const publishedAt = Date.now();
   output?.appendLine('[live] delta ' + JSON.stringify({ revision: update.revision, ...update.work }));
   const applied = waitForLive(latest.snapshot_id);
   panel.webview.postMessage({ id: 'delta', body: response });
@@ -608,6 +615,7 @@ async function publishNative(client: StdioClient, panel: vscode.WebviewPanel, re
       return;
     }
     if (owner === openEpoch && lastOpenBody?.Ok.live?.epoch === update.epoch) {
+      output?.appendLine('[live] renderer ' + JSON.stringify({ revision: update.revision, acknowledge_ms: Date.now() - publishedAt }));
       lastOpenBody.Ok.snapshot_id = latest.snapshot_id;
       lastOpenBody.Ok.live.revision = update.revision;
       lastOpenBody.Ok.live.total = lastOpenBody.Ok.live.paged ? latest.visible_total : latest.total;

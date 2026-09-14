@@ -79,7 +79,10 @@ pub(super) fn work(
     );
     let source = anchor.id;
     let mut ops = vec![anchor];
-    if record.kind == HumanWorkKind::Edit {
+    if matches!(
+        record.kind,
+        HumanWorkKind::Edit | HumanWorkKind::ObservedEdit
+    ) {
         if let (Some(path), Some(before), Some(after)) =
             (&record.path, &record.before, &record.after)
         {
@@ -127,6 +130,11 @@ pub(super) fn work(
                     Tags::META,
                 ));
             }
+        }
+    }
+    if record.kind == HumanWorkKind::ObservedEdit {
+        for op in &mut ops {
+            op.tags = Tags(op.tags.0 & !(Tags::HUMAN | Tags::INFERRED).0);
         }
     }
     Ok(ops)

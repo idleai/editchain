@@ -918,7 +918,8 @@ pub(super) fn collapsed_import_kind(op: &Op, children: Option<&Vec<&Op>>) -> Str
         return match record.kind {
             editchain_core::human::HumanWorkKind::EditorOpened => "editor_opened",
             editchain_core::human::HumanWorkKind::EditorClosed => "editor_closed",
-            editchain_core::human::HumanWorkKind::Edit => "file",
+            editchain_core::human::HumanWorkKind::Edit
+            | editchain_core::human::HumanWorkKind::ObservedEdit => "file",
             editchain_core::human::HumanWorkKind::Read => "read",
             editchain_core::human::HumanWorkKind::Exposure => "exposure",
             editchain_core::human::HumanWorkKind::Gap => "error",

@@ -8,10 +8,11 @@ impl Session {
         &mut self,
         edits: &[EditorEditAttribution],
         group: Option<u64>,
+        kind: HumanWorkKind,
     ) -> Work {
         let change = self
             .batch_change(edits, group.is_some())
-            .and_then(|change| self.continue_edit(change, edits, group));
+            .and_then(|change| self.continue_edit(change, edits, group, kind));
         let Some(change) = change else {
             self.turn = 0;
             return Work {
@@ -28,7 +29,7 @@ impl Session {
             let _new = self.confirmed.insert(edit.change);
             drop(self.changes.remove(&edit.change));
         }
-        Work::edit(change)
+        Work::edit(change, kind)
     }
 
     fn continue_edit(
@@ -36,13 +37,19 @@ impl Session {
         mut change: Change,
         edits: &[EditorEditAttribution],
         group: Option<u64>,
+        kind: HumanWorkKind,
     ) -> Option<Change> {
         let Some(group) = group else {
             return Some(change);
         };
         let first = edits.first()?.change;
+        let retained = if kind == HumanWorkKind::ObservedEdit {
+            &mut self.observed_group
+        } else {
+            &mut self.edit_group
+        };
         if group != first {
-            let (known, previous, _) = self.edit_group.as_ref()?;
+            let (known, previous, _) = retained.as_ref()?;
             if *known != group
                 || previous.after != change.before
                 || previous.path != change.path
@@ -53,7 +60,7 @@ impl Session {
             }
             change.before.clone_from(&previous.before);
         }
-        self.edit_group = Some((group, change.clone(), edits.last()?.change));
+        *retained = Some((group, change.clone(), edits.last()?.change));
         Some(change)
     }
 
@@ -91,6 +98,9 @@ impl Session {
         if let EditorEventKind::HumanEditBatch { group, .. } = &event.event {
             return group.filter(|_| kind == HumanWorkKind::Edit);
         }
+        if let EditorEventKind::ObservedEditBatch { group, .. } = &event.event {
+            return (kind == HumanWorkKind::ObservedEdit).then_some(*group);
+        }
         if let EditorEventKind::CodeRead {
             group: Some(group),
             document,
@@ -113,13 +123,18 @@ impl Session {
 }
 
 impl Work {
-    pub(super) fn edit(change: Change) -> Self {
+    pub(super) fn edit(change: Change, kind: HumanWorkKind) -> Self {
+        let label = if kind == HumanWorkKind::ObservedEdit {
+            "Unattributed edit"
+        } else {
+            "Human edit"
+        };
         let summary = format!(
-            "Human edit · {}",
+            "{label} · {}",
             change.path.as_deref().unwrap_or("Untitled buffer")
         );
         Self {
-            kind: HumanWorkKind::Edit,
+            kind,
             path: change.path,
             before: Some(change.before),
             after: Some(change.after),

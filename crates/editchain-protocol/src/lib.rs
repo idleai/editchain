@@ -276,6 +276,8 @@ pub enum FileChangeSource {
     Agent,
     /// A keyboard-indicated edit with retained buffer revisions.
     Human,
+    /// An observed editor-buffer change without human or agent attribution.
+    Editor,
     /// Forward-compatible unknown source.
     #[serde(other)]
     Unknown,

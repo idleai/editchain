@@ -797,7 +797,9 @@ impl RowSpec {
                 Some(file.status.label()),
             ));
             if !file.fidelity.is_empty() {
-                let fidelity_title = if file.binary {
+                let fidelity_title = if file.source == "editor" {
+                    "Observed editor change; human or agent attribution is unavailable"
+                } else if file.binary {
                     "Binary file content"
                 } else {
                     "Recorded agent edit"

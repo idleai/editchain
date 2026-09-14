@@ -640,7 +640,11 @@ fn human_edit_file<'a>(
     let [change] = changes.get(&node.op_id()?)?.as_slice() else {
         return None;
     };
-    (change.source == editchain_protocol::FileChangeSource::Human).then_some(change)
+    matches!(
+        change.source,
+        editchain_protocol::FileChangeSource::Human | editchain_protocol::FileChangeSource::Editor
+    )
+    .then_some(change)
 }
 
 impl ExpandedChildRow {

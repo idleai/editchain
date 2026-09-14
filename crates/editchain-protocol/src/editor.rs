@@ -193,6 +193,13 @@ pub enum EditorEventKind {
         /// Strict source order, without gaps in buffer revision continuity.
         edits: Vec<EditorEditAttribution>,
     },
+    /// A visible edit whose source observations carry no human-input receipt.
+    ObservedEditBatch {
+        /// First source change in this continuously published edit.
+        group: u64,
+        /// Earlier changes, in strict source order and buffer continuity.
+        changes: Vec<u64>,
+    },
     /// Saved revision. An edit does not imply a save.
     DocumentSaved {
         /// Saved buffer identity.
@@ -472,6 +479,20 @@ impl EditorEvent {
                     previous = edit.change;
                 }
             }
+            EditorEventKind::ObservedEditBatch { changes, group } => {
+                if changes.is_empty()
+                    || changes.len() > 1024
+                    || *group == 0
+                    || changes.first().is_none_or(|first| group > first)
+                    || changes.last().is_none_or(|last| *last >= self.sequence)
+                    || changes
+                        .iter()
+                        .zip(changes.iter().skip(1))
+                        .any(|(left, right)| left >= right)
+                {
+                    return Err("observed edit must reference earlier changes in source order");
+                }
+            }
             EditorEventKind::SelectionChanged { ranges, .. }
             | EditorEventKind::VisibleRangesChanged { ranges, .. }
             | EditorEventKind::CodeExposure { ranges, .. }
@@ -519,6 +540,7 @@ impl EditorEvent {
             | EditorEventKind::TrackingGap { .. }
             | EditorEventKind::HumanEdit { .. }
             | EditorEventKind::HumanEditBatch { .. }
+            | EditorEventKind::ObservedEditBatch { .. }
             | EditorEventKind::DocumentRenamed { .. }
             | EditorEventKind::EditorOpened { .. }
             | EditorEventKind::EditorClosed { .. } => None,

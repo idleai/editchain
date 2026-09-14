@@ -22,7 +22,9 @@ impl Workspace {
     pub(crate) fn file_diff(&self, change: &FileChangeDto) -> Result<FileDiffDto, String> {
         match change.source {
             FileChangeSource::Git => self.git_file_diff(change),
-            FileChangeSource::Agent | FileChangeSource::Human => self.agent_file_diff(change),
+            FileChangeSource::Agent | FileChangeSource::Human | FileChangeSource::Editor => {
+                self.agent_file_diff(change)
+            }
             FileChangeSource::Unknown => Err("unknown file-change source".to_string()),
         }
     }
@@ -331,7 +333,11 @@ pub(super) fn agent_file_change_index(
             },
             &index_context,
         );
-        if op.tags.matches_any(editchain_core::Tags::HUMAN) {
+        if editchain_project::human::work_record(owner_op)
+            .is_some_and(|work| work.kind == editchain_core::human::HumanWorkKind::ObservedEdit)
+        {
+            change.source = FileChangeSource::Editor;
+        } else if op.tags.matches_any(editchain_core::Tags::HUMAN) {
             change.source = FileChangeSource::Human;
         }
         changes.entry(owner).or_default().push(change);

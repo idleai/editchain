@@ -37,6 +37,25 @@ const deltaBody = (revision) => ({ Ok: { epoch: 'epoch', revision, work: {}, del
   removed: [], upserts: [],
 }] } });
 
+test('changing recorder settings preserves the retained History service', async () => {
+  const env = loadExtension();
+  env.open();
+  const panel = env.panels[0];
+  await rendererReady(panel);
+  env.client.openRequests[0].resolve(openBody('workspace'));
+  await flush();
+  const fire = key => env.vscode.workspace.configurationChanged({
+    affectsConfiguration: name => key === name || key.startsWith(name + '.'),
+  });
+  fire('editchain-history.tracking.enabled');
+  fire('editchain-history.tracking.readDwellMs');
+  assert.equal(env.client.openRequests.length, 1, 'tracking does not rebuild History');
+  fire('editchain-history.chainDir');
+  assert.equal(env.client.openRequests.length, 2, 'a different chain still reopens History');
+  env.client.openRequests[1].resolve(openBody('other'));
+  await flush();
+});
+
 test('viewport reports coalesce behind a live publication and obsolete snapshots are dropped', async () => {
   const env = loadExtension();
   env.open();
@@ -87,7 +106,7 @@ module.exports = {
   __esModule: true,
   workspace: {
     onDidChangeWorkspaceFolders: () => ({ dispose() {} }),
-    onDidChangeConfiguration: () => ({ dispose() {} }),
+    onDidChangeConfiguration: callback => { module.exports.workspace.configurationChanged = callback; return { dispose() {} }; },
     workspaceFolders: [{ uri: (${uri.toString()})('/ws') }],
     getConfiguration: () => ({ get: (_key, def) => def }),
     registerTextDocumentContentProvider: (scheme, provider) => {
@@ -205,7 +224,7 @@ function loadExtension(settings = { 'live.enabled': false }) {
   writeFakeStdioClient();
   fs.writeFileSync(fakeLivePath, `const instances = [];
 exports.createLiveSync = (_service, publish, status) => {
-  const live = { publish, status, wakes: 0, disposed: false, wake() { this.wakes++; status('Scanning Codex sessions…'); }, dispose() { this.disposed = true; } };
+  const live = { publish, status, wakes: 0, humanWakes: 0, disposed: false, wake() { this.wakes++; status('Scanning Codex sessions…'); }, humanChanged() { this.humanWakes++; this.wake(); }, dispose() { this.disposed = true; } };
   instances.push(live); return live;
 }; exports.instances = instances;`);
   const origResolveFilename = Module._resolveFilename;
@@ -318,6 +337,7 @@ test('history opens live by default, waits for delta acknowledgement, and resume
   assert.equal(env.live.length, 0, 'capture waits for the saved first viewport');
   await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'base', error: null });
   assert.equal(env.live.length, 1);
+  assert.equal(env.live[0].humanWakes, 1, 'initial attach consumes editor work acknowledged before the panel was ready');
   env.live[0].status('Importing Codex changes (32/65 queued)…');
   await panel.handlers.message({ type: 'status', loaded: 5, total: 90 });
   assert.match(env.statusItem.text, /5 \/ 90 nodes.*32\/65 queued/, 'row-count updates retain import progress');

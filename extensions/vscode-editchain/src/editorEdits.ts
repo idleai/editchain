@@ -6,12 +6,12 @@ import { insertedRanges, retractsInserted, type InputChange } from './editorInpu
 type Receipt = { change: number; signal: string };
 type Burst = { document: object; editor: object; version: number; group: number; last: number; edits: Receipt[]; inserted: [number, number][] };
 
-/** Group only confirmed, contiguous input. Raw buffer revisions remain separate evidence. */
+/** Group contiguous edits of one attribution class; retain every raw revision. */
 export class EditorEdits {
   private burst: Burst | undefined;
   private timer: NodeJS.Timeout | undefined;
 
-  constructor(private readonly emit: (event: EditorEvent['event']) => void) {}
+  constructor(private readonly emit: (event: EditorEvent['event']) => void, private readonly human = true) {}
 
   beforeChange(document: object, version: number, editor: object | undefined): void {
     const burst = this.burst;
@@ -72,7 +72,8 @@ export class EditorEdits {
     this.timer = undefined;
     const burst = this.burst;
     if (!burst?.edits.length) return;
-    this.emit({ type: 'human_edit_batch', group: burst.group, edits: burst.edits });
+    this.emit(this.human ? { type: 'human_edit_batch', group: burst.group, edits: burst.edits }
+      : { type: 'observed_edit_batch', group: burst.group, changes: burst.edits.map(edit => edit.change) });
     burst.edits = [];
   }
 }

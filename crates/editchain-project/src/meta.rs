@@ -311,7 +311,7 @@ pub(crate) fn for_collapsed_import(
                 RecordRole::Action
             },
             activity_kind: match record.kind {
-                HumanWorkKind::Edit => ActivityKind::Change,
+                HumanWorkKind::Edit | HumanWorkKind::ObservedEdit => ActivityKind::Change,
                 HumanWorkKind::Read
                 | HumanWorkKind::Exposure
                 | HumanWorkKind::EditorOpened

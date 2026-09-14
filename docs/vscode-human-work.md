@@ -23,6 +23,7 @@ of loading a document. Since 0.1.7, split tabs share one file lifecycle identity
 | `document_changed` | Before/after revisions and raw replacements in emitted order. |
 | `human_edit` | Reference to a change with explicit editor-input, keyboard-selection, undo, or redo evidence. |
 | `human_edit_batch` | Ordered change references and input signals; optional `group` identifies the first change of a live editing episode. |
+| `observed_edit_batch` | Ordered change references without human attribution; one cumulative file row marked unattributed, excluded from human and AI-origin coverage. |
 | `document_saved` | Saved buffer revision. |
 | `document_renamed` | Explicit file/directory rename within the workspace. |
 | `editor_opened` / `editor_closed` | First-tab / last-tab file lifecycle, identity, URI, and relative path. Startup opens carry `restored: true`. |
@@ -135,6 +136,75 @@ origin as physical input. See the [VS Code source mapping](https://github.com/mi
 and [prior runtime counterexample](vscode-editor-capture-results.md#attribution).
 
 ## Durable integration
+
+### Direct attribution and visible uncertainty (0.1.8)
+
+Capture and attribution now have separate owners. `EditorCapture` retains exact
+document changes; `EditorAttribution` consumes direct reasons from that same
+event and publishes human input immediately. Selection correlation is only the
+limited stable fallback. A missing, rejected or late selection resolves to an
+`observed_edit_batch` within 250 ms plus its bounded publication frame, instead
+of dropping the change from Activity. Saves and shutdown resolve remaining
+candidates before their lifecycle boundary.
+
+Observed edits derive `vscode.work` records with kind `observed_edit`, exact
+before/after `FileOp`s, and file source `editor`. Their semantic operations carry
+neither HUMAN nor INFERRED tags. Activity displays a single cumulative file row
+with an **unattributed** badge. Human and observed groups are separate, so an
+automatic mutation cannot become part of a human diff; a background observed
+edit cannot replace the active human group's normalization state. The coverage
+query continues to count only valid human receipts and imported agent origins.
+Older raw observations are retained as originally recorded; this change does
+not retroactively assign them authorship or manufacture new receipts.
+
+The appropriate passive API is `workspace.onDidChangeTextDocument`. Its stable
+`reason` identifies undo/redo. The proposed `textDocumentChangeReason` capability
+adds `detailedReason` to this event with a source and mechanism metadata. It
+does not require keyboard interception, command replacement, an agent tool
+hook, or waiting for save. There is no public stable general command-execution
+observer in the checked VS Code 1.136.2 extension API. The installed source gate
+selects a different event emitter for enabled extensions; a TypeScript cast
+cannot unlock it. See [the proposal](https://github.com/microsoft/vscode/blob/1.136.2/src/vscode-dts/vscode.proposed.textDocumentChangeReason.d.ts)
+and [the runtime gate](https://github.com/microsoft/vscode/blob/1.136.2/src/vs/workbench/api/common/extHost.api.impl.ts#L1326).
+
+Use `npm run install:local:editor-origins -- --runtime-args PATH` from the
+extension directory for local installations. PATH is the JSONC file opened by
+Preferences: Configure Runtime Arguments. The installer stages the proposal in
+the VSIX manifest and preserves existing runtime preferences while adding this
+extension's opt-in. A full VS Code restart is required. A read-only
+`editchain-history.trackingStatus` query verifies the mode actually observed on
+events (`direct`, `limited`, or `unverified`), with observed and attributed
+change counts. Packaging a proposal alone does not prove runtime enablement.
+
+The live log now records renderer acknowledgement duration separately from
+native capture/projection time. Source-blob timestamps alone are not an
+end-to-end UI latency measurement.
+
+The delivery path is direct document event → local outbox (25 ms frame) →
+durable native append → live projection → replacement viewport. The recorder
+has its own native client; its acknowledgement wakes History. On initial
+attachment, History consumes the durable tail before scanning the provider
+archive, including editor events acknowledged before the panel was ready.
+Changing recorder settings leaves the History service running.
+
+Native live handoffs fetch the actual visible rows before acknowledging the
+revision. Previously they loaded the 400-row off-screen margin first, adding
+hundreds of milliseconds to every revision in a large history. Normal prefetch
+still fills that margin after the viewport publishes. Snapshot validation,
+selection and scroll-anchor restoration remain part of the handoff.
+
+The VS Code 1.136.2 regression run used an owned copy of a 1.7 GB canonical
+chain (2.44 million records), its source blobs, and 481 provider headers. With
+derived indexes prepared, History became ready in 3.58 seconds; the first typed
+edit appeared in 312 ms and deletion of existing code in 450 ms. All 16 input
+changes were attributed and grouped correctly. The save payload's write timestamp
+was 70 ms after the event; the filesystem observer found it within 470 ms of
+Save (neither timing is the native acknowledgement timestamp). No coverage query
+or forced flush was used. The initial rebuild of the
+copied indexes took 44.5 seconds for capture and 332.4 seconds for the graph;
+these cold rebuild costs remain. Provider headers exercise discovery and native
+startup, not full concurrent replay of every historical rollout. These are
+local measurements, not a latency guarantee under arbitrary provider or disk load.
 
 The recorder activates on startup in trusted local workspace folders, with its
 own service client and lifetime. It does not require a History panel or its
@@ -452,7 +522,7 @@ exposure records remain retained even after new capture stops producing them.
 
 `npm run package` keeps the extension on stable APIs. After compiling, run
 `npm run package:editor-origins` to produce
-`outputs/editchain-history-0.1.6-editor-origins.vsix` from an isolated staging
+`outputs/editchain-history-0.1.8-editor-origins.vsix` from an isolated staging
 directory. Its manifest declares only `textDocumentChangeReason`; packaging
 does not change the ordinary manifest or enable APIs in an existing VS Code.
 The native service must also be rebuilt to accept retained origin metadata.
@@ -466,7 +536,7 @@ development builds; Microsoft's [proposed-API guidance](https://code.visualstudi
 does not permit publishing them to the Marketplace.
 
 The EditChain output channel logs the loaded version/path on activation and,
-after the first mutation, either `detailed editor reasons` or
-`stable selection hints (partial coverage)`. Without runtime opt-in the local
+after the first mutation, either `direct document change reasons` or
+`limited; unconfirmed edits remain visible as unattributed`. Without runtime opt-in the local
 build falls back to stable observations. Old recorded changes are not
 retroactively relabeled from timing guesses.

@@ -6,8 +6,9 @@ import { EditorOutbox } from './editorOutbox';
 import { observeEditorContext } from './editorContext';
 import { StdioClient, resolveServicePath } from './stdioClient';
 import { unsignedIdentity, workspaceIdentity } from './humanIdentity';
+import { EditorHealth } from './editorHealth';
 
-type Recorder = { capture: EditorCapture; context: { dispose(): void }; outbox: EditorOutbox; client: StdioClient; folder: vscode.WorkspaceFolder; chain: string };
+type Recorder = { capture: EditorCapture; context: { dispose(): void }; outbox: EditorOutbox; client: StdioClient; folder: vscode.WorkspaceFolder; chain: string; health: EditorHealth };
 
 /** Capture lifecycle is independent of whether the History panel is open. */
 export class HumanWorkHost {
@@ -17,6 +18,7 @@ export class HumanWorkHost {
   private readonly status: vscode.StatusBarItem;
   private reportText = '';
   private configurationKey: string | undefined;
+  private transportStatus = 'Tracking human work';
 
   constructor(private readonly context: vscode.ExtensionContext, private readonly log: vscode.OutputChannel,
     private readonly delivered: () => void = () => {}) {
@@ -25,6 +27,10 @@ export class HumanWorkHost {
     context.subscriptions.push(this.status,
       vscode.workspace.registerTextDocumentContentProvider('editchain-work', { provideTextDocumentContent: () => this.reportText }),
       vscode.commands.registerCommand('editchain-history.humanWork', () => this.showReport()),
+      vscode.commands.registerCommand('editchain-history.trackingStatus', async () => {
+        await this.lifecycle;
+        return this.recorders.map(({ folder, health }) => ({ workspace: folder.uri.fsPath, ...health }));
+      }),
       vscode.commands.registerCommand('editchain-history.startTracking', () => this.setTracking(true)),
       vscode.commands.registerCommand('editchain-history.stopTracking', () => this.setTracking(false)),
       vscode.workspace.onDidChangeWorkspaceFolders(() => { void this.restart(); }),
@@ -73,20 +79,25 @@ export class HumanWorkHost {
           }, message => this.updateStatus(message), this.delivered);
         const dwell = Math.max(500, Math.min(30000, configuration.get<number>('tracking.readDwellMs', 2000)));
         const maxBytes = Math.max(1024, Math.min(524288, configuration.get<number>('tracking.maxFileBytes', 262144)));
-        let attributionLogged = false;
+        const health = new EditorHealth();
         const capture = new EditorCapture(folder, dwell, maxBytes, event => {
-          if (!attributionLogged && event.event.type === 'document_changed') {
-            attributionLogged = true;
-            this.log.appendLine(`[capture] Edit attribution: ${event.event.origin ? 'detailed editor reasons' : 'stable selection hints (partial coverage)'}`);
+          const accepted = outbox.push(event);
+          if (accepted) {
+            const previous = health.mode;
+            health.observe(event);
+            if (previous !== health.mode) {
+              this.log.appendLine(`[capture] Edit attribution: ${health.mode === 'direct' ? 'direct document change reasons' : 'limited; unconfirmed edits remain visible as unattributed'}`);
+              this.updateStatus(this.transportStatus);
+            }
           }
-          return outbox.push(event);
+          return accepted;
         },
           workspaceIdentity(guid, folder.uri.toString(), folder.uri.fsPath, chain));
         const context = observeEditorContext(capture, () => {
           client.ensureStarted(resolveServicePath());
           return client.request({ GetEditorContext: { workspace_path: folder.uri.fsPath, chain_dir: chain } }, { timeoutMs: 30000 });
         }, message => this.log.appendLine(`[capture] ${message}`));
-        this.recorders.push({ capture, context, outbox, client, folder, chain });
+        this.recorders.push({ capture, context, outbox, client, folder, chain, health });
       }
       this.configurationKey = key;
       if (this.recorders.length) this.updateStatus('Tracking human work');
@@ -95,11 +106,18 @@ export class HumanWorkHost {
   }
 
   private updateStatus(message: string): void {
-    const changed = this.status.tooltip !== message;
-    this.status.text = message === 'Tracking human work' ? '$(edit) EditChain tracking' : '$(info) EditChain tracking';
-    this.status.tooltip = message;
+    this.transportStatus = message;
+    const limited = this.recorders.some(recorder => recorder.health.mode === 'limited');
+    const attribution = limited ? 'Limited attribution: enable direct editor reasons to count all supported human input. Unconfirmed edits remain visible as unattributed.'
+      : this.recorders.some(recorder => recorder.health.mode === 'direct') ? 'Attribution uses direct VS Code document-change reasons.'
+      : 'Waiting for the first document change to verify input attribution.';
+    const tooltip = message === 'Tracking human work' ? `${message}\n${attribution}` : message;
+    const changed = this.status.tooltip !== tooltip;
+    this.status.text = message === 'Tracking human work' && !limited ? '$(edit) EditChain tracking'
+      : limited && message === 'Tracking human work' ? '$(info) EditChain · limited attribution' : '$(info) EditChain tracking';
+    this.status.tooltip = tooltip;
     if (!this.disposed) this.status.show();
-    if (changed) this.log.appendLine(`[capture] ${message}`);
+    if (changed) this.log.appendLine(`[capture] ${tooltip.replaceAll('\n', ' · ')}`);
   }
 
   private async showReport(): Promise<unknown> {

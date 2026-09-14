@@ -11,7 +11,7 @@ process.env.EDITCHAIN_WORK_FIXTURE = fixture;
 const workspace = path.join(fixture, 'workspace');
 const version = process.env.EDITCHAIN_CAPTURE_VSCODE || '1.137.0';
 const proposed = process.env.EDITCHAIN_CAPTURE_PROPOSED === '1';
-const output = path.resolve('trace', `work-${version}${proposed ? '-proposed' : ''}`);
+const output = path.resolve(process.env.EDITCHAIN_WORK_OUTPUT || path.join('trace', `work-${version}${proposed ? '-proposed' : ''}`));
 process.env.EDITCHAIN_WORK_OUTPUT = output;
 let extension = path.resolve(__dirname, '../..');
 if (owner) {
@@ -40,7 +40,7 @@ export const config: WebdriverIO.Config = {
       vscodeArgs: proposed ? { enableProposedApi: ['ambientlight.editchain-history'] } : {},
       userSettings: {
         'security.workspace.trust.enabled': false, 'telemetry.telemetryLevel': 'off',
-        'editchain-history.servicePath': path.join(repository, 'target/debug/editchain-vscode-service'),
+        'editchain-history.servicePath': process.env.EDITCHAIN_WORK_SERVICE || path.join(repository, 'target/debug/editchain-vscode-service'),
         'editchain-history.live.enabled': true,
         'editchain-history.live.sessionsPath': path.join(fixture, 'sessions'),
         'editchain-history.tracking.readDwellMs': 2000,

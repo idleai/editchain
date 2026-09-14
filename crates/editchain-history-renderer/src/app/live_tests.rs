@@ -484,7 +484,11 @@ fn native_pages_restore_a_distant_anchor_before_acknowledging() {
     let offset = usize::try_from(bounds.get("offset").unwrap().as_u64().unwrap()).unwrap();
     let limit = usize::try_from(bounds.get("limit").unwrap().as_u64().unwrap()).unwrap();
     assert!(offset > 0 && offset <= 1001 && offset.saturating_add(limit) > 1004);
-    assert!(limit <= 500);
+    assert_eq!(
+        (offset, limit),
+        (1001, 4),
+        "live handoff loads the visible rows before off-screen prefetch"
+    );
     let rows: Vec<_> = (offset..offset.saturating_add(limit))
         .map(|index| {
             let mut row = row(index.saturating_sub(1));

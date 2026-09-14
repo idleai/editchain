@@ -43,6 +43,7 @@ function harness(dwell = 2000, identity) {
   const filename = require.resolve('../../out/editorCapture');
   delete require.cache[filename];
   delete require.cache[require.resolve('../../out/editorEdits')];
+  delete require.cache[require.resolve('../../out/editorAttribution')];
   delete require.cache[require.resolve('../../out/editorTabs')];
   Module._load = function(name, ...args) {
     if (name === 'vscode') return vscode;
@@ -91,6 +92,66 @@ const editGroups = env => {
   }
   return [...groups.values()];
 };
+
+test('deleting existing code uses direct events without selections or stays visible as unattributed', () => {
+  for (const direct of [false, true]) {
+    const env = harness();
+    try {
+      for (let index = 0; index < 3; index++) {
+        const offset = env.document.text.indexOf('\n') - 1;
+        env.document.text = env.document.text.slice(0, offset) + env.document.text.slice(offset + 1);
+        env.document.version++;
+        env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: offset, rangeLength: 1, text: '' }],
+          ...(direct ? { detailedReason: { source: 'cursor', metadata: { kind: 'executeCommands', detailedSource: 'deleteLeft' } } } : {}) });
+        env.tick(300);
+      }
+      env.tick(100); // Allow the last bounded publication frame after classification.
+      const human = receipts(env);
+      const observed = env.events.filter(event => event.event.type === 'observed_edit_batch');
+      assert.equal(human.length, direct ? 3 : 0);
+      assert.equal(observed.flatMap(event => event.event.changes).length, direct ? 0 : 3);
+      assert.equal(new Set((direct ? editEvents(env) : observed).map(event => event.event.group)).size, 1);
+      const recorded = env.events.length;
+      env.tick(10000);
+      assert.equal(env.events.filter(event => event.event.type === 'observed_edit_batch').length, observed.length);
+      assert.ok(env.events.length <= recorded + 1, 'only a newly qualified read may follow');
+    } finally { env.capture.dispose(); }
+  }
+});
+
+test('a late selection cannot promote an already visible unattributed revision', () => {
+  const env = harness();
+  try {
+    env.document.text = 'changed'; env.document.version++;
+    env.signals.change({ document: env.document, contentChanges: [{ rangeOffset: 0, rangeLength: 24, text: 'changed' }] });
+    env.tick(250);
+    env.signals.selection({ textEditor: env.editor, kind: 1, selections: [env.selection(7)] });
+    env.signals.save(env.document);
+    assert.equal(receipts(env).length, 0);
+    assert.equal(env.events.filter(event => event.event.type === 'observed_edit_batch').length, 1);
+  } finally { env.capture.dispose(); }
+});
+
+test('background observed edits coalesce without splitting the active human group', () => {
+  const env = harness();
+  try {
+    const document = { ...env.document, uri: { scheme: 'file', fsPath: '/workspace/b.ts', toString: () => 'file:///workspace/b.ts' } };
+    env.signals.open(document);
+    type(env, 'human', true);
+    for (let index = 0; index < 2; index++) {
+      document.text = 'b' + document.text; document.version++;
+      env.signals.change({ document, contentChanges: [{ rangeOffset: 0, rangeLength: 0, text: 'b' }],
+        detailedReason: { source: 'applyEdits', metadata: {} } });
+      env.tick(100);
+    }
+    type(env, ' input', true); env.tick(100);
+    const observed = env.events.filter(event => event.event.type === 'observed_edit_batch');
+    assert.equal(observed.flatMap(event => event.event.changes).length, 2);
+    assert.equal(new Set(observed.map(event => event.event.group)).size, 1);
+    assert.equal(editGroups(env).length, 1);
+    assert.equal(receipts(env).length, 2);
+  } finally { env.capture.dispose(); }
+});
 
 test('corrections of just-typed text remain in one edit without claiming existing or agent-deleted code', () => {
   for (const explicitAgent of [false, true]) {

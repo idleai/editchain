@@ -120,7 +120,7 @@ candidate after its selection update, save, or focus/activation boundary.
 Saving records the revision without creating another edit. Coverage also reports
 how many observed changes have no human attribution.
 
-The optional local build from `npm run package:editor-origins` uses VS Code's
+The recommended local build from `npm run install:local:editor-origins` uses VS Code's
 proposed `textDocumentChangeReason` API when enabled. It captures Backspace,
 Delete, Tab, and other editor input directly, and retains explicit origins for
 programmatic, formatting, disk, and completion changes without counting them as
@@ -131,6 +131,15 @@ human edit are retained as `typing_correction` indicators. Deletion of pre-exist
 code still requires stronger input evidence. See [local setup and attribution rules](../../docs/vscode-human-work.md#optional-local-build-with-editor-origins).
 The output channel reports the loaded extension version/path and the attribution
 mode observed on the first change.
+
+Version 0.1.8 keeps unconfirmed changes visible as **unattributed** file rows
+with their exact diffs. They coalesce separately from human input, never count
+as human edits, and never become additional AI-origin code in coverage reports.
+Direct input reasons bypass the selection timer entirely. The stable fallback
+waits at most 250 ms for a matching selection, then publishes an unattributed
+edit instead of silently omitting it. The status bar explicitly identifies
+limited attribution. The read-only `editchain-history.trackingStatus` command
+returns the observed mode and capture counters without flushing pending work.
 
 Version 0.1.4 retains the read receipt for an unchanged document revision and
 viewport across interruptions, including replacement editor objects when a tab
@@ -363,6 +372,22 @@ For repository-wide Rust formatting, clippy, tests, docs, and dependency
 policy, run `./scripts/lint.sh` from the repository root.
 
 ## Packaging
+
+For direct input attribution in a local VSIX installation:
+
+```sh
+npm run install:local:editor-origins -- --runtime-args "$HOME/.vscode/argv.json"
+```
+
+Use the runtime-arguments file opened by **Preferences: Configure Runtime
+Arguments** for your VS Code installation. The installer preserves comments,
+existing settings and other opt-ins, backs up an existing file, and enables
+`textDocumentChangeReason` only for `ambientlight.editchain-history`. It builds
+and installs the matching service, renderer and extension. **Quit and reopen
+VS Code** afterward: changing runtime arguments requires a full application
+restart. The next edit must report `direct document change reasons` in Output.
+This locally enabled API is still proposed; the ordinary Marketplace-compatible
+package retains the stable fallback. [Microsoft's distribution guidance](https://code.visualstudio.com/api/advanced-topics/using-proposed-api).
 
 To build and install the current checkout together with its native service:
 

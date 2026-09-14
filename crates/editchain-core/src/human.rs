@@ -57,6 +57,8 @@ pub enum HumanWorkKind {
     EditorClosed,
     /// An edit with a retained keyboard/undo/redo indicator.
     Edit,
+    /// An observed buffer edit without evidence of human authorship.
+    ObservedEdit,
     /// Continuous visibility qualifying under the recorded dwell policy.
     Read,
     /// Shorter visibility, including skimming.

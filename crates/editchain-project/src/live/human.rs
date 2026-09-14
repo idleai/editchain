@@ -23,7 +23,11 @@ impl HumanEdits {
         if let Some(work) = op.and_then(crate::human::work_record) {
             if let Some(group) = work.edit_group {
                 let _old = self.sources.insert(source, group);
-                if work.kind == editchain_core::human::HumanWorkKind::Edit {
+                if matches!(
+                    work.kind,
+                    editchain_core::human::HumanWorkKind::Edit
+                        | editchain_core::human::HumanWorkKind::ObservedEdit
+                ) {
                     let _new = self.groups.entry(group).or_default().insert(source);
                 }
                 let _new = changed.insert(group);
