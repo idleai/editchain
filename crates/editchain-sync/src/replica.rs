@@ -6,7 +6,7 @@ use std::io::{self, Read};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::path::{Path, PathBuf};
 
-use editchain_core::{Admission, OpId};
+use editchain_core::{Admission, ContentId, OpId, Payload};
 use editchain_store::durable::{atomic_write, sync_parent_dir};
 use editchain_store::format::{decode_op, Page};
 use editchain_store::{BlobStore, CanonicalChain, SegmentStore};
@@ -59,6 +59,10 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    pub(crate) fn received_blob(&mut self, hash: [u8; 32]) {
+        let _: bool = self.received_blobs.insert(hash);
+    }
+
     /// Read at most one page following an exclusive, stable record cursor.
     #[must_use]
     pub fn page(&self, after: Option<RecordKey>) -> (Vec<RecordKey>, bool) {
@@ -104,9 +108,8 @@ impl Snapshot {
         Ok(content::hashes(&op))
     }
 
-    fn permits_blob(&self, key: RecordKey, hash: [u8; 32]) -> io::Result<bool> {
-        Ok(self.blob_hashes(key)?.contains(&hash)
-            && (!self.received.contains(&key) || self.received_blobs.contains(&hash)))
+    fn permits_blob(&self, key: RecordKey, hash: [u8; 32]) -> bool {
+        !self.received.contains(&key) || self.received_blobs.contains(&hash)
     }
 }
 
@@ -216,15 +219,24 @@ impl Replica {
         let mut known = chain.evidence().clone();
         let mut scope = self.load_scope()?;
         let mut page = Page::new(0);
+        let mut scope_changed = false;
         for (key, bytes) in records {
+            // An independently supplied exact baseline record is now shared
+            // evidence, but cannot expose this device's preexisting blobs.
+            if scope.excluded.remove(key) {
+                let _: bool = scope.received.insert(*key);
+                scope_changed = true;
+            }
             if known.classify(key.id, bytes) != Admission::Duplicate {
                 let _: bool = scope.received.insert(*key);
                 let _: Admission = known.insert(key.id, bytes.clone());
                 page.add_record(0, bytes.clone());
             }
         }
-        if !page.records.is_empty() {
+        if scope_changed || !page.records.is_empty() {
             self.save_scope(&scope)?;
+        }
+        if !page.records.is_empty() {
             writer.append_page(&page)?;
         }
         Ok(records.iter().map(|(key, _)| *key).collect())
@@ -267,7 +279,50 @@ impl Replica {
         key: RecordKey,
         hash: [u8; 32],
     ) -> io::Result<Option<Vec<u8>>> {
-        if !snapshot.permits_blob(key, hash)? {
+        if !snapshot.permits_blob(key, hash) {
+            return Ok(None);
+        }
+        let references = self.references(snapshot, key)?;
+        self.read_content(&references, hash)
+    }
+
+    /// Resolve typed content references, including retained human-work revisions.
+    /// Missing structured payloads are hydrated before their child references.
+    ///
+    /// # Errors
+    /// Rejects records outside the scope, corrupt metadata or content.
+    pub fn blob_hashes(
+        &self,
+        snapshot: &Snapshot,
+        key: RecordKey,
+    ) -> io::Result<BTreeSet<[u8; 32]>> {
+        Ok(self.references(snapshot, key)?.into_keys().collect())
+    }
+
+    fn references(&self, snapshot: &Snapshot, key: RecordKey) -> io::Result<content::References> {
+        let encoded = snapshot
+            .record(key)
+            .ok_or_else(|| invalid("record outside scope"))?;
+        let op = decode_op(encoded).map_err(io::Error::other)?;
+        let mut references = content::references(&op);
+        if let Some(Payload::Blob(reference)) = content::structured_payload(&op) {
+            if let ContentId::Hash256(hash) = reference.id {
+                if snapshot.permits_blob(key, hash) {
+                    if let Some(bytes) = self.read_content(&references, hash)? {
+                        content::nested(&mut references, &bytes);
+                    }
+                }
+            }
+        }
+        Ok(references)
+    }
+
+    fn read_content(
+        &self,
+        references: &content::References,
+        hash: [u8; 32],
+    ) -> io::Result<Option<Vec<u8>>> {
+        if !references.contains_key(&hash) {
             return Ok(None);
         }
         let Some(store) = BlobStore::open_read_only(self.root.join("blobs"))? else {
@@ -279,13 +334,7 @@ impl Replica {
             Err(error) => return Err(error),
         };
         let length = file.metadata()?.len();
-        let op = decode_op(
-            snapshot
-                .record(key)
-                .ok_or_else(|| invalid("record outside scope"))?,
-        )
-        .map_err(io::Error::other)?;
-        if !content::matches_len(&op, hash, length) {
+        if !content::matches_len(references, hash, length) {
             return Err(invalid("blob reference length mismatch"));
         }
         if length > u64::try_from(MAX_OBJECT_BYTES).map_err(io::Error::other)? {
@@ -314,14 +363,15 @@ impl Replica {
         let _writer = SegmentStore::open(&self.root)?;
         let mut scope = self.load_scope()?;
         let chain = CanonicalChain::read(&self.root)?;
-        let records = evidence(&chain);
-        let encoded = records
-            .get(&key)
-            .filter(|_| !scope.excluded.contains(&key))
-            .ok_or_else(|| invalid("blob record outside scope"))?;
-        let op = decode_op(encoded).map_err(io::Error::other)?;
+        let mut records = evidence(&chain);
+        records.retain(|key, _| !scope.excluded.contains(key));
+        let snapshot = Snapshot {
+            records,
+            received: scope.received.clone(),
+            received_blobs: scope.received_blobs.clone(),
+        };
         if !content::matches_len(
-            &op,
+            &self.references(&snapshot, key)?,
             hash,
             u64::try_from(bytes.len()).map_err(io::Error::other)?,
         ) {

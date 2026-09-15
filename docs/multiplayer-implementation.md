@@ -24,8 +24,8 @@ committed locally using `astramax(f1/multiplayer):`.
 | Checkpoint | Required evidence | Status |
 | --- | --- | --- |
 | 0. Architecture and execution contract | Source links and repository state checked | Complete |
-| 1. Durable replication kernel | Gap/conflict convergence, blob validation, scope and replay/restart tests; root lint | In progress |
-| 2. Authenticated native peers | Separate processes, pinned certificates, rejection before inventory, bounded IPC; root lint | Pending |
+| 1. Durable replication kernel | Gap/conflict convergence, blob validation, scope and replay/restart tests; root lint | Complete |
+| 2. Authenticated native peers | Separate processes, pinned certificates, rejection before inventory, bounded IPC; root lint | In progress |
 | 3. Extension Host/Join and live relay | Real relay between separate native replicas, lifecycle and cleanup, UI commands and packaging tests; root lint | Pending |
 | 4. Reconnect, discovery and three peers | Offline catch-up, revocation, stale discovery, third-party forwarding; root lint | Pending |
 | 5. Full extension E2E | Actual VS Code history visibility, packaged build, final regression checks | Pending |
@@ -48,3 +48,15 @@ such; they are not evidence of a second network.
   forged remote references. `cargo clippy -p editchain-sync --all-targets --locked
   -- -D warnings` exited 0. `./scripts/lint.sh` exited 0: `RESULT: PASS`.
   Peer scheduling and nested structured-content hydration follow in 1b.
+- Checkpoint 1b: pull-based peer sessions negotiate the space and both encoding
+  versions, batch durable records, bound each transfer, and hydrate known
+  `vscode.work` revision references. Records and blobs have separate durable
+  acknowledgments. All 15 tests passed: fragmented frames, paginated exact
+  convergence, conflict quarantine, three replicas, mid-blob disconnect, lost
+  acknowledgment, late content, private-content boundaries and writer contention.
+  `./scripts/lint.sh` exited 0: `RESULT: PASS`.
+- Identity audit: editor operation IDs derive from the recorder's full session
+  identity and sequence; normalized records use separate deterministic lanes.
+  Human attribution is explicitly unsigned and retained unchanged. Provider
+  import streams use provider-owned source keys for portable identity. Peer
+  authentication will identify a supplying device, not assert record authorship.

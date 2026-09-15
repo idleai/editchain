@@ -2,21 +2,55 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use editchain_core::{ContentId, FileEdit, GitLinkKind, Op, OpKind, Payload};
+use editchain_core::{
+    human::HumanWorkRecord, ContentId, FileEdit, GitLinkKind, Op, OpKind, Payload,
+};
 
 pub(crate) fn hashes(op: &Op) -> BTreeSet<[u8; 32]> {
     references(op).into_keys().collect()
 }
 
-pub(crate) fn matches_len(op: &Op, hash: [u8; 32], length: u64) -> bool {
-    references(op).get(&hash).is_some_and(|lengths| {
+pub(crate) type References = BTreeMap<[u8; 32], BTreeSet<u32>>;
+
+pub(crate) fn matches_len(references: &References, hash: [u8; 32], length: u64) -> bool {
+    references.get(&hash).is_some_and(|lengths| {
         lengths
             .iter()
             .all(|expected| u64::from(*expected) == length)
     })
 }
 
-fn references(op: &Op) -> BTreeMap<[u8; 32], BTreeSet<u32>> {
+pub(crate) fn structured_payload(op: &Op) -> Option<&Payload> {
+    match &op.kind {
+        OpKind::Import(value) => Some(&value.raw_ref),
+        OpKind::Note(value) => Some(&value.content),
+        OpKind::ChainStart(_)
+        | OpKind::Actor(_)
+        | OpKind::Message(_)
+        | OpKind::Tool(_)
+        | OpKind::Command(_)
+        | OpKind::File(_)
+        | OpKind::Reflection(_)
+        | OpKind::Error(_)
+        | OpKind::GitCommit(_)
+        | OpKind::GitLink(_)
+        | OpKind::Unknown(_) => None,
+    }
+}
+
+pub(crate) fn nested(found: &mut References, bytes: &[u8]) {
+    // Parse only the retained schema: a coincidental hash in a message, path,
+    // unknown source or future schema never expands the content capability.
+    if let Ok(work) = serde_json::from_slice::<HumanWorkRecord>(bytes) {
+        if work.source == "vscode.work" && work.schema == 1 {
+            for revision in [work.before, work.after].into_iter().flatten() {
+                insert(found, revision.content, None);
+            }
+        }
+    }
+}
+
+pub(crate) fn references(op: &Op) -> References {
     let mut found = BTreeMap::new();
     let mut payloads = Vec::new();
     match &op.kind {
@@ -65,6 +99,9 @@ fn references(op: &Op) -> BTreeMap<[u8; 32], BTreeSet<u32>> {
         if let Payload::Blob(reference) = payload {
             insert(&mut found, reference.id, Some(reference.len));
         }
+    }
+    if let Some(Payload::Inline(bytes)) = structured_payload(op) {
+        nested(&mut found, bytes);
     }
     found
 }

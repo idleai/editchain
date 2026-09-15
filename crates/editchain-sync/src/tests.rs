@@ -22,6 +22,8 @@ macro_rules! check_eq {
     };
 }
 
+mod session_tests;
+
 use std::io;
 use std::path::Path;
 

@@ -5,9 +5,12 @@
 
 mod content;
 mod replica;
+mod session;
+mod transfer;
 mod wire;
 
 pub use replica::{RecordKey, Replica, Snapshot};
+pub use session::{Progress, Session};
 pub use wire::{decode_message, encode_message, FrameDecoder, Message};
 
 /// Largest operation or blob accepted by the first replication protocol.
