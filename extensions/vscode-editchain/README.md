@@ -68,13 +68,24 @@ deletes this window's hosted tunnel. Existing records and received copies stay
 on their respective devices. **EditChain: Clean Up Multiplayer Tunnels** retries
 cleanup of inactive resources for the current workspace and account.
 
+Dropped connections retry automatically and catch up from durable history.
+Reloading an enabled workspace resumes its approved connections. Invitations are
+kept in VS Code SecretStorage; reconnect can use an already approved grant until
+the service expires it. **EditChain: Resume / Reconnect Shared History** retries
+after a network or account change. An expired grant needs a new invitation.
+Host reloads retain the same private tunnel resource and device identity, with
+a fresh endpoint. Closing VS Code leaves that resource available for resume
+until its service expiry (up to one day); **Stop Sharing History** deletes it
+and disables automatic resume.
+
 `npm run build:native` builds and stages both native binaries for this platform.
 For a custom development build, `editchain-history.peerPath` can select a worker
 explicitly; otherwise it is found beside the service or in the package.
 
-The automated live relay check uses two native processes, synthetic workspaces,
+The automated live relay check uses three native processes, synthetic workspaces,
 and the production Host/Join manager. It needs an authenticated GitHub CLI and
-creates and deletes a temporary private tunnel:
+creates and deletes temporary private tunnels. It covers restart catch-up,
+third-party forwarding with the original source offline, and live revocation:
 
 ```sh
 cargo build -p editchain-node --bin editchain-vscode-service --locked

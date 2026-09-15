@@ -47,7 +47,7 @@ fn record_inner(
     let mut projection = projection::Projection::open(&root, &checkpoint)?;
     // Serialize with live imports. Re-read the tail *after* taking the lock.
     // Cold indexing happens before this lock; contention never destroys it.
-    let mut store = SegmentStore::open(&root)?;
+    let mut store = SegmentStore::open_wait(&root, std::time::Duration::from_secs(2))?;
     projection.refresh()?;
     let mut blobs = BlobStore::new(root.join("blobs"))?;
     identity::repair(&request.events, projection.tail.chain(), &mut blobs)?;

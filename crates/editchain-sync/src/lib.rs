@@ -39,18 +39,7 @@ fn invalid(message: &'static str) -> std::io::Error {
 // A persistently busy writer still fails without an acknowledgment; reconnect
 // can repair from the durable inventory.
 fn writer(root: &std::path::Path) -> std::io::Result<editchain_store::SegmentStore> {
-    let started = std::time::Instant::now();
-    loop {
-        match editchain_store::SegmentStore::open(root) {
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    && started.elapsed() < std::time::Duration::from_secs(2) =>
-            {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            result => return result,
-        }
-    }
+    editchain_store::SegmentStore::open_wait(root, std::time::Duration::from_secs(2))
 }
 
 #[cfg(test)]

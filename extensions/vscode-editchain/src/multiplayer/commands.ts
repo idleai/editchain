@@ -3,7 +3,7 @@ import * as path from 'node:path';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { resolveServicePath } from '../stdioClient';
-import type { MultiplayerManager, SharingStatus } from './manager';
+import type { MultiplayerManager, SavedSharing, SharingStatus } from './manager';
 import { NativePeerError } from './native';
 import { ProbeError } from '../devTunnels/probe';
 
@@ -11,9 +11,11 @@ class CommandError extends Error {}
 
 const PENDING = 'editchain.multiplayer.pending.';
 const SPACE = 'editchain.multiplayer.space.';
+const SESSION = 'editchain.multiplayer.session.';
+const ENABLED = 'editchain.multiplayer.enabled.';
 const SCOPES = ['read:user', 'read:org'];
 
-export type MultiplayerCommands = { stop(): Promise<void> };
+export type MultiplayerCommands = { stop(): Promise<void>; suspend(): Promise<void> };
 
 /** Registration has no account, network, or native-process side effects. */
 export function registerMultiplayerCommands(context: vscode.ExtensionContext, received: () => void): MultiplayerCommands {
@@ -48,7 +50,11 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
     remember: async (marker: string) => {
       if (!account) throw new CommandError('GitHub host session is unavailable.');
       const record: JournalRecord = { account: account.account.id, workspace: folder?.uri.toString(), owner, leaseUntil: Date.now() + 90_000 };
-      await journalWrite(async () => { await context.globalState.update(PENDING + marker, record); ownedMarkers.add(marker); });
+      await journalWrite(async () => {
+        const current = context.globalState.get<JournalRecord>(PENDING + marker);
+        if (current && current.owner !== owner && current.leaseUntil > Date.now()) throw new CommandError('This hosting session is active in another window. Close that window before resuming here.');
+        await context.globalState.update(PENDING + marker, record); ownedMarkers.add(marker);
+      });
       leaseTimer ??= setInterval(() => {
         void journalWrite(async () => {
           for (const marker of ownedMarkers) {
@@ -64,11 +70,11 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
     },
   };
 
-  const getManager = async (): Promise<MultiplayerManager> => {
+  const getManager = async (selected?: vscode.WorkspaceFolder): Promise<MultiplayerManager> => {
     if (!vscode.workspace.isTrusted) throw new CommandError('Trust this workspace before enabling history sharing.');
     if (manager) return manager;
     const folders = vscode.workspace.workspaceFolders ?? [];
-    folder = folders.length === 1 ? folders[0] : (await vscode.window.showQuickPick(folders.map(value => ({ label: value.name, description: value.uri.fsPath, folder: value })), { title: 'Choose the workspace history to share' }))?.folder;
+    folder = selected ?? (folders.length === 1 ? folders[0] : (await vscode.window.showQuickPick(folders.map(value => ({ label: value.name, description: value.uri.fsPath, folder: value })), { title: 'Choose the workspace history to share' }))?.folder);
     if (!folder || folder.uri.scheme !== 'file') throw new CommandError('Choose a local workspace folder for sharing.');
     const configuration = vscode.workspace.getConfiguration('editchain-history', folder.uri);
     const chain = path.resolve(folder.uri.fsPath, configuration.get<string>('chainDir', '.editchain'));
@@ -77,11 +83,22 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
     const bundled = context.asAbsolutePath(path.join('bin', `${process.platform}-${process.arch}`, `editchain-peer${suffix}`));
     const binary = configuration.get<string>('peerPath', '') || (existsSync(sibling) ? sibling : bundled);
     const key = SPACE + folder.uri.toString();
+    const sessionKey = SESSION + folder.uri.toString();
+    const enabledKey = ENABLED + folder.uri.toString();
     const { MultiplayerManager } = await import('./manager');
     manager = new MultiplayerManager({ binary, chain,
       // Device credentials live in private application storage, never the workspace or VSIX.
       deviceDirectory: path.join(context.globalStorageUri.fsPath, 'multiplayer-device'),
       space: context.workspaceState.get<string>(key), saveSpace: async space => { await context.workspaceState.update(key, space); }, journal,
+      saveSession: async session => {
+        if (session) {
+          await context.secrets.store(sessionKey, JSON.stringify({ account: account?.account.id, session }));
+          await context.workspaceState.update(enabledKey, true);
+        } else {
+          await context.workspaceState.update(enabledKey, undefined);
+          await context.secrets.delete(sessionKey);
+        }
+      },
       githubToken: async () => {
         const current = await vscode.authentication.getSession('github', SCOPES, { silent: true });
         if (!current || !account || current.account.id !== account.account.id) throw new CommandError('GitHub host session changed. Start hosting again.');
@@ -113,6 +130,33 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
     } finally { active = false; }
   };
   const stop = async () => { stopVersion++; await manager?.stop(); };
+  const suspend = async () => {
+    stopVersion++;
+    await manager?.suspend();
+    clearInterval(leaseTimer); leaseTimer = undefined;
+    await journalWrite(async () => {
+      for (const marker of ownedMarkers) {
+        const current = context.globalState.get<JournalRecord>(PENDING + marker);
+        if (current?.owner === owner) await context.globalState.update(PENDING + marker, { ...current, leaseUntil: 0 });
+      }
+    });
+  };
+  const restore = async (interactive: boolean, selected?: vscode.WorkspaceFolder) => {
+    const version = stopVersion;
+    const current = await getManager(selected);
+    const stored = await context.secrets.get(SESSION + folder!.uri.toString());
+    if (!stored) throw new CommandError('No saved sharing session. Host or join to enable sharing.');
+    if (stored.length > 512 * 1024) throw new CommandError('Saved sharing session exceeds the limit.');
+    let envelope: { account?: string; session: SavedSharing };
+    try { envelope = JSON.parse(stored); } catch { throw new CommandError('Saved sharing session is invalid.'); }
+    if (envelope.session?.host) {
+      account = await vscode.authentication.getSession('github', SCOPES, interactive ? { createIfNone: true } : { silent: true });
+      if (!account || account.account.id !== envelope.account) throw new CommandError('Sign in with the original host GitHub account, then resume sharing.');
+    }
+    if (version !== stopVersion) return;
+    await current.resume(envelope.session);
+    await current.reconnect();
+  };
   const command = (name: string, action: () => Promise<unknown>) => vscode.commands.registerCommand(`editchain-history.${name}`, () => execute(action));
 
   context.subscriptions.push(
@@ -159,6 +203,7 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       const device = await vscode.window.showQuickPick((await current.devices()).map(device => ({ label: device.fingerprint, device })), { title: 'Remove an approved device from this replica' });
       if (device) await current.revoke(device.device.fingerprint);
     }),
+    command('multiplayerResume', () => restore(true)),
     // Stop is always available even while a sign-in or connection command waits.
     vscode.commands.registerCommand('editchain-history.multiplayerStop', () => stop().then(() => ({ ok: true }), () => {
       void vscode.window.showErrorMessage('Sharing stopped; run EditChain: Clean Up Multiplayer Tunnels to retry cleanup.');
@@ -181,7 +226,7 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
         void vscode.window.showInformationMessage('Inactive pending multiplayer tunnels cleaned up for this workspace.');
       } finally { await management.dispose(); }
     }),
-    { dispose: () => { void stop().catch(() => {}); clearInterval(leaseTimer); status?.dispose(); output?.dispose(); } },
+    { dispose: () => { void suspend().catch(() => {}); clearInterval(leaseTimer); status?.dispose(); output?.dispose(); } },
   );
   const reset = () => {
     const previous = manager;
@@ -202,5 +247,8 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       if (!current || current.account.id !== account?.account.id) return stop();
     }, () => stop()).catch(() => {});
   }));
-  return { stop };
+  // Only a workspace explicitly enabled earlier can initiate background activity.
+  const selected = vscode.workspace.workspaceFolders?.find(value => context.workspaceState.get<boolean>(ENABLED + value.uri.toString()));
+  if (selected && vscode.workspace.isTrusted) void execute(() => restore(false, selected));
+  return { stop, suspend };
 }

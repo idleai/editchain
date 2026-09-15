@@ -287,7 +287,8 @@ exports.createLiveSync = (_service, publish, status) => {
   fakeVscode.window.createStatusBarItem = () => statusItem;
 
   const ext = require(extPath);
-  const context = { subscriptions: [], extensionUri: uri('file:///ext') };
+  const context = { subscriptions: [], extensionUri: uri('file:///ext'),
+    workspaceState: { get: () => undefined, update: async () => {} } };
   ext.activate(context);
   const client = require(fakeStdioPath).__instances[0];
 

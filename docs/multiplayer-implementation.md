@@ -86,6 +86,19 @@ such; they are not evidence of a second network.
   content blobs, received History rows and exact before/after diff verified,
   working tree unchanged, tunnel deleted. This used one machine and one host
   GitHub account; no different-network claim is made.
+- Checkpoint 4a: automatic peer/host reconnect with bounded backoff, deterministic
+  opposite-connection resolution, and workspace restart recovery are implemented.
+  Approved grants are stored in VS Code SecretStorage; restoring a saved session
+  rechecks current local membership and never reenrolls a removed device. Host
+  resources survive reload with fresh endpoints; explicit Stop deletes them and
+  disables resume. Capture, live imports and sync now share the same bounded
+  writer-acquisition helper after the full extension suite exposed a capture-side
+  contention race. All 166 extension tests passed. `./scripts/lint.sh` exited 0:
+  `RESULT: PASS`. The real relay test passed with three independent stores,
+  host/guest restart, offline catch-up, exact historical diffs forwarded through
+  a second replica while the source was offline, and live revocation. Setup was
+  3,563 ms; total 27,448 ms; both temporary tunnels were deleted. Optional directory
+  discovery and the two-window VS Code UI run remain for checkpoints 4b and 5.
 
 ## Native peer interface
 

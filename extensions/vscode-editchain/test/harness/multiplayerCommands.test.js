@@ -6,7 +6,11 @@ const Module = require('node:module');
 const { until } = require('./multiplayerFixture');
 
 async function environment(options, body) {
-  const registered = new Map(), stored = new Map(), workspace = new Map(), logs = [], calls = [];
+  const registered = new Map(), stored = new Map(), workspace = new Map(), secrets = new Map(), logs = [], calls = [];
+  if (options.saved) {
+    workspace.set('editchain.multiplayer.enabled.file:///fixture/workspace', true);
+    secrets.set('editchain.multiplayer.session.file:///fixture/workspace', JSON.stringify(options.saved));
+  }
   const uri = { fsPath: '/fixture/workspace', scheme: 'file', toString: () => 'file:///fixture/workspace' };
   const folder = { name: 'workspace', uri };
   const session = { account: { id: 'account-id' }, accessToken: 'secret-user-token' };
@@ -43,10 +47,14 @@ async function environment(options, body) {
       calls.push({ host: true, backfill });
       assert.equal(await managerOptions.githubToken(), session.accessToken);
       await managerOptions.journal.remember('editchain-multiplayer-' + '1'.repeat(24));
+      await managerOptions.saveSession({ version: 1, space: 'space', peers: ['private-invite-secret'] });
       return 'private-invite-secret';
     }
     status() { return { hosting: false, peers: [] }; }
-    async stop() { calls.push({ stop: true }); await managerOptions.journal.forget('editchain-multiplayer-' + '1'.repeat(24)); }
+    async stop() { calls.push({ stop: true }); await managerOptions.saveSession(undefined); await managerOptions.journal.forget('editchain-multiplayer-' + '1'.repeat(24)); }
+    async suspend() { calls.push({ suspend: true }); }
+    async resume() { calls.push({ resume: true }); }
+    async reconnect() { calls.push({ reconnect: true }); }
   }
   const original = Module._load;
   Module._load = function (name, parent, ...rest) {
@@ -60,11 +68,12 @@ async function environment(options, body) {
   const file = require.resolve('../../out/multiplayer/commands');
   delete require.cache[file];
   const context = { subscriptions: [], globalState: state(stored), workspaceState: state(workspace),
+    secrets: { get: async key => secrets.get(key), store: async (key, value) => { secrets.set(key, value); }, delete: async key => { secrets.delete(key); } },
     asAbsolutePath: path => '/fixture/extension/' + path, globalStorageUri: { fsPath: '/fixture/private-storage' } };
   try {
-    require(file).registerMultiplayerCommands(context, () => {});
+    const commands = require(file).registerMultiplayerCommands(context, () => {});
     await body({ invoke: name => registered.get('editchain-history.' + name)(), stored, logs, calls,
-      loads: () => managerLoads, clipboard: () => clipboard, resolveAuth: () => resolveAuth?.(session), authPending: () => !!resolveAuth });
+      loads: () => managerLoads, clipboard: () => clipboard, resolveAuth: () => resolveAuth?.(session), authPending: () => !!resolveAuth, secrets, workspace, commands });
   } finally {
     for (const subscription of context.subscriptions) subscription.dispose();
     Module._load = original;
@@ -83,8 +92,28 @@ test('multiplayer activation is offline and explicit hosting defaults to new rec
     assert.equal(env.stored.size, 1);
     assert.ok(!JSON.stringify(env.logs).includes('secret-user-token'));
     assert.ok(!JSON.stringify(env.logs).includes('private-invite-secret'));
+    assert.ok(!JSON.stringify([...env.workspace.values(), ...env.stored.values()]).includes('private-invite-secret'));
+    assert.ok([...env.secrets.values()].some(value => value.includes('private-invite-secret')));
     await env.invoke('multiplayerStop');
     assert.equal(env.stored.size, 0);
+    assert.equal(env.secrets.size, 0);
+  });
+});
+
+test('enabled workspace resumes with silent account lookup; deactivation keeps private state', async () => {
+  await environment({ saved: { account: 'account-id', session: { host: {}, peers: [] } } }, async env => {
+    await until(() => env.calls.some(call => call.reconnect), 'saved sharing did not resume');
+    assert.deepEqual(env.calls.filter(call => call.provider).map(call => call.request), [{ silent: true }]);
+    await env.commands.suspend();
+    assert.equal(env.secrets.size, 1);
+    assert.ok(!env.calls.some(call => call.stop));
+  });
+});
+
+test('a changed host account cannot resume a saved tunnel', async () => {
+  await environment({ saved: { account: 'other-account', session: { host: {}, peers: [] } } }, async env => {
+    await until(() => env.logs.some(line => line.includes('original host')), 'missing account mismatch notice');
+    assert.ok(!env.calls.some(call => call.resume));
   });
 });
 

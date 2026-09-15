@@ -54,16 +54,25 @@ export function validateEndpoint(value: unknown): RelayEndpoint {
 }
 
 export function parseInvitation(text: string, now = Date.now()): Invitation {
-  const value = decode(text);
+  return validateInvitation(decode(text), now, false);
+}
+
+/** Previously approved invitations may reconnect until the service grant expires. */
+export function savedInvitation(value: unknown, now = Date.now()): Invitation {
+  return validateInvitation(value, now, true);
+}
+
+function validateInvitation(input: unknown, now: number, enrolled: boolean): Invitation {
+  const value = input as Partial<Invitation> | null;
   if (value?.version !== 1 || value.kind !== 'invite' || typeof value.space !== 'string' || !/^[a-zA-Z0-9-]{1,128}$/.test(value.space) ||
     typeof value.guest !== 'string' || !/^[a-f0-9]{64}$/.test(value.guest) || typeof value.connectToken !== 'string' || value.connectToken.length > 8192 ||
-    !Number.isSafeInteger(value.expiresAt) || value.expiresAt <= now || value.expiresAt > now + 24 * 60 * 60 * 1000) {
+    !Number.isSafeInteger(value.expiresAt) || (!enrolled && value.expiresAt! <= now) || value.expiresAt! > now + 24 * 60 * 60 * 1000) {
     throw new ProbeError('Invalid or expired EditChain invitation. Ask the host for a new invitation.');
   }
   const expiration = TunnelAccessTokenProperties.tryParse(value.connectToken)?.expiration?.getTime();
-  if (!expiration || expiration <= now || expiration < value.expiresAt) throw new ProbeError('The invitation connect grant is expired or invalid.');
+  if (!expiration || expiration <= now || expiration < value.expiresAt!) throw new ProbeError('The invitation connect grant is expired or invalid.');
   return { version: 1, kind: 'invite', space: value.space, host: publicDevice(value.host), guest: value.guest,
-    endpoint: validateEndpoint(value.endpoint), connectToken: value.connectToken, expiresAt: value.expiresAt };
+    endpoint: validateEndpoint(value.endpoint), connectToken: value.connectToken, expiresAt: value.expiresAt! };
 }
 
 export function invitationTunnel(invitation: Invitation): Tunnel {

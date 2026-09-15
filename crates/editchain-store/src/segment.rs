@@ -59,6 +59,33 @@ impl SegmentStore {
         })
     }
 
+    /// Wait for a short competing transaction before opening a writer.
+    ///
+    /// Sleeps without holding the writer lock. Callers must still keep their
+    /// resulting transaction short and release it before any network I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::open`], including `WouldBlock` when
+    /// the timeout expires while another writer still owns the chain.
+    pub fn open_wait(
+        chain_dir: impl Into<PathBuf>,
+        timeout: std::time::Duration,
+    ) -> io::Result<Self> {
+        let chain_dir = chain_dir.into();
+        let started = std::time::Instant::now();
+        loop {
+            match Self::open(&chain_dir) {
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && started.elapsed() < timeout =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => return result,
+            }
+        }
+    }
+
     /// Append a page of operations to the current segment.
     ///
     /// # Errors
@@ -337,6 +364,27 @@ mod tests {
         drop(inherited);
         assert!(SegmentStore::open(dir.path()).is_err());
         drop(reopened);
+        assert!(SegmentStore::open(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn competing_transactions_wait_boundedly_without_stealing_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = SegmentStore::open(dir.path()).unwrap();
+        assert_eq!(
+            SegmentStore::open_wait(dir.path(), std::time::Duration::from_millis(20))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            drop(held);
+        });
+        let next = SegmentStore::open_wait(dir.path(), std::time::Duration::from_secs(2)).unwrap();
+        assert!(SegmentStore::open(dir.path()).is_err());
+        release.join().unwrap();
+        drop(next);
         assert!(SegmentStore::open(dir.path()).is_ok());
     }
 }

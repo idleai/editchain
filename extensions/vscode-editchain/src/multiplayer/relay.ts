@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { Duplex } from 'node:stream';
-import { TunnelRelayTunnelClient, TunnelRelayTunnelHost } from '@microsoft/dev-tunnels-connections';
+import { ConnectionStatus, TunnelRelayTunnelClient, TunnelRelayTunnelHost } from '@microsoft/dev-tunnels-connections';
 import { Tunnel, TunnelAccessScopes, TunnelProtocol, TunnelRelayTunnelEndpoint } from '@microsoft/dev-tunnels-contracts';
 import { ManagementApiVersions, TunnelAccessTokenProperties, TunnelManagementHttpClient } from '@microsoft/dev-tunnels-management';
 import { CancellationToken, CancellationTokenSource } from 'vscode-jsonrpc';
@@ -8,6 +8,9 @@ import { bounded, encryptedHostStream, encryptedStream, encryptedV1SessionId, pi
 import { Invitation, invitationTunnel, MULTIPLAYER_PORT, RelayEndpoint, validateEndpoint } from './invitation';
 
 export type RelayJournal = { remember(marker: string): Promise<void>; forget(marker: string): Promise<void> };
+export type HostLease = { marker: string; tunnelId: string; clusterId: string };
+export type HostTransport = Pick<RelayHost, 'start' | 'descriptor' | 'lease' | 'stop' | 'suspend'>;
+export type ClientTransport = Pick<RelayClient, 'connect' | 'stop'>;
 const DEADLINE = 60_000;
 const CLEANUP = 15_000;
 const OPTIONS = { enableRetry: false, enableReconnect: false };
@@ -21,31 +24,39 @@ export function managementClient(token: () => Promise<string>): TunnelManagement
 export class RelayHost {
   private readonly host: TunnelRelayTunnelHost;
   private readonly cancellation = new CancellationTokenSource();
-  private readonly marker = `editchain-multiplayer-${randomBytes(12).toString('hex')}`;
+  private marker = `editchain-multiplayer-${randomBytes(12).toString('hex')}`;
   private tunnel?: Tunnel;
   private recorded = false;
   private closed = false;
   private subscription?: { dispose(): void };
+  private statusSubscription?: { dispose(): void };
   private streams = new Set<Duplex>();
   private stopped?: Promise<void>;
   private creationRejected = false;
 
   constructor(private readonly management: TunnelManagementHttpClient, private readonly journal: RelayJournal,
-    private readonly incoming: (stream: Duplex) => void, private readonly failed: (message: string) => void) {
+    private readonly incoming: (stream: Duplex) => void, private readonly failed: (message: string, disconnected?: boolean) => void) {
     this.host = new TunnelRelayTunnelHost(management);
     this.host.forwardConnectionsToLocalPorts = false;
     this.host.enableE2EEncryption = true;
     void this.cancellation.token;
   }
 
-  async start(): Promise<void> {
+  async start(previous?: HostLease): Promise<void> {
+    if (previous) this.marker = validateLease(previous).marker;
     try {
       await bounded(async token => {
         await this.journal.remember(this.marker);
         this.recorded = true;
         try {
-          this.tunnel = await this.management.createTunnel({ labels: ['editchain-multiplayer', this.marker], customExpiration: 86400,
-            ports: [{ portNumber: MULTIPLAYER_PORT, protocol: TunnelProtocol.Auto }] }, { tokenScopes: [TunnelAccessScopes.Host] }, token);
+          if (previous) {
+            const tunnel = await this.management.getTunnel(previous, { includePorts: true, tokenScopes: [TunnelAccessScopes.Host] }, token);
+            if (!tunnel?.labels?.includes(this.marker)) throw new ProbeError('Saved hosting resource is unavailable. Host again to issue a new invitation.');
+            this.tunnel = tunnel;
+          } else {
+            this.tunnel = await this.management.createTunnel({ labels: ['editchain-multiplayer', this.marker], customExpiration: 86400,
+              ports: [{ portNumber: MULTIPLAYER_PORT, protocol: TunnelProtocol.Auto }] }, { tokenScopes: [TunnelAccessScopes.Host] }, token);
+          }
         } catch (error) {
           this.creationRejected = [400, 403].includes((error as { response?: { status?: number } })?.response?.status ?? 0);
           throw error;
@@ -66,13 +77,23 @@ export class RelayHost {
           });
           void event.transformPromise.catch(() => this.failed('An incoming relay stream failed encryption checks.'));
         });
-        await this.host.connect(this.tunnel, OPTIONS, token);
+        this.statusSubscription = this.host.connectionStatusChanged(event => {
+          if (this.closed) return;
+          if (event.status === ConnectionStatus.Connecting) this.failed('Connecting the hosting relay…');
+          if (event.status === ConnectionStatus.Connected) this.failed('Hosting relay connected.');
+          if (event.status === ConnectionStatus.Disconnected) this.failed('Hosting relay disconnected; waiting to reconnect.', true);
+        });
+        await this.host.connect(this.tunnel, { enableRetry: true, enableReconnect: true }, token);
       }, this.cancellation.token, DEADLINE);
     } catch (error) {
       const message = safeFailure('Starting multiplayer relay', error);
-      try { await this.stop(); } catch { throw new ProbeError(`${message} Temporary tunnel cleanup is pending.`); }
+      try { await (previous ? this.suspend() : this.stop()); } catch { throw new ProbeError(`${message} Temporary tunnel cleanup is pending.`); }
       throw new ProbeError(message);
     }
+  }
+
+  lease(): HostLease {
+    return validateLease({ marker: this.marker, tunnelId: this.tunnel?.tunnelId, clusterId: this.tunnel?.clusterId });
   }
 
   async descriptor(): Promise<{ endpoint: RelayEndpoint; connectToken: string; expiresAt: number }> {
@@ -92,27 +113,42 @@ export class RelayHost {
   }
 
   stop(): Promise<void> {
-    this.stopped ??= this.dispose();
+    this.stopped ??= this.dispose(true);
     return this.stopped;
   }
 
-  private async dispose(): Promise<void> {
+  suspend(): Promise<void> {
+    this.stopped ??= this.dispose(false);
+    return this.stopped;
+  }
+
+  private async dispose(remove: boolean): Promise<void> {
     this.closed = true;
     this.cancellation.cancel();
     this.subscription?.dispose();
+    this.statusSubscription?.dispose();
     for (const stream of this.streams) stream.destroy();
     this.streams.clear();
     const errors: string[] = [];
     try { await bounded(() => this.host.dispose(), CancellationToken.None, CLEANUP); }
     catch { errors.push('Closing the relay host failed.'); }
     try {
-      if (this.recorded) await cleanupRelay(this.management, this.marker, this.journal, this.tunnel, this.creationRejected);
+      if (remove && this.recorded) await cleanupRelay(this.management, this.marker, this.journal, this.tunnel, this.creationRejected);
     } catch { errors.push('Tunnel cleanup is pending; run EditChain: Clean Up Multiplayer Tunnels.'); }
     try { await bounded(() => this.management.dispose(), CancellationToken.None, CLEANUP); }
     catch { errors.push('Closing relay management failed.'); }
     this.cancellation.dispose();
     if (errors.length) throw new ProbeError(errors.join(' '));
   }
+}
+
+export function validateLease(input: unknown): HostLease {
+  const value = input as Partial<HostLease> | null;
+  if (!value || typeof value.marker !== 'string' || !/^editchain-multiplayer-[a-f0-9]{24}$/.test(value.marker) ||
+    ![value.tunnelId, value.clusterId].every(id => typeof id === 'string' && /^[a-zA-Z0-9-]{1,128}$/.test(id))) {
+    throw new ProbeError('Invalid saved hosting resource.');
+  }
+  return { marker: value.marker, tunnelId: value.tunnelId!, clusterId: value.clusterId! };
 }
 
 export async function cleanupRelay(management: TunnelManagementHttpClient, marker: string, journal: RelayJournal, locator?: Tunnel, allowMissing = true): Promise<void> {
@@ -142,6 +178,7 @@ export class RelayClient {
   private stopped?: Promise<void>;
   private closed = false;
   private v2Encrypted = false;
+  private readonly management = new TunnelManagementHttpClient({ name: 'editchain-multiplayer', version: '0.1.0' }, ManagementApiVersions.Version20230927preview);
 
   constructor() { void this.cancellation.token; }
 
@@ -158,7 +195,17 @@ export class RelayClient {
     });
     try {
       return await bounded(async token => {
-        await this.client.connect(invitationTunnel(invitation), OPTIONS, token);
+        // The connect-only grant can read this same tunnel's public endpoints.
+        // This supports a fresh host process/SSH key while Rust still pins the
+        // originally approved device certificate before any history exchange.
+        const resolved = await this.management.getTunnel(invitationTunnel(invitation), { includePorts: true }, token);
+        if (resolved?.tunnelId !== invitation.endpoint.tunnelId || resolved.clusterId !== invitation.endpoint.clusterId) throw new ProbeError('Approved relay resource is unavailable.');
+        const endpoints = resolved.endpoints?.filter(endpoint => endpoint.connectionMode === 'TunnelRelay') ?? [];
+        if (endpoints.length !== 1) throw new ProbeError('Approved host endpoint is unavailable or ambiguous.');
+        const relay = endpoints[0] as TunnelRelayTunnelEndpoint;
+        const endpoint = validateEndpoint({ tunnelId: resolved.tunnelId, clusterId: resolved.clusterId,
+          hostId: relay.hostId, clientRelayUri: relay.clientRelayUri, hostPublicKeys: relay.hostPublicKeys });
+        await this.client.connect(invitationTunnel({ ...invitation, endpoint }), OPTIONS, token);
         await this.client.waitForForwardedPort(MULTIPLAYER_PORT, token);
         const stream = await this.client.connectToForwardedPort(MULTIPLAYER_PORT, token);
         stream.on('error', () => {});
@@ -182,7 +229,7 @@ export class RelayClient {
     this.cancellation.cancel();
     this.subscription?.dispose();
     this.stream?.destroy();
-    try { await bounded(() => this.client.dispose(), CancellationToken.None, CLEANUP); }
+    try { await bounded(async () => { await this.client.dispose(); await this.management.dispose(); }, CancellationToken.None, CLEANUP); }
     finally { this.cancellation.dispose(); }
   }
 }

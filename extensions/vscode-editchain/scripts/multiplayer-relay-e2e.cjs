@@ -12,7 +12,8 @@ const { fixture, binaries, until, blobs, rows, diffs } = require('../test/harnes
 
 async function run() {
   const files = fixture();
-  const a = files.workspace('alice'), b = files.workspace('bob');
+  const a = files.workspace('alice'), b = files.workspace('bob'), c = files.workspace('carol');
+  const saved = new Map(), spaces = new Map();
   const pending = new Set();
   const managers = [];
   let githubToken;
@@ -23,14 +24,15 @@ async function run() {
   const create = local => {
     const manager = new MultiplayerManager({ binary: binaries.peer, chain: local.chain, deviceDirectory: local.device,
       githubToken: token, journal: { remember: async marker => { pending.add(marker); }, forget: async marker => { pending.delete(marker); } },
-      saveSpace: async () => {}, changed: () => {} });
+      space: spaces.get(local.root), saveSpace: async space => { spaces.set(local.root, space); },
+      saveSession: async session => { saved.set(local.root, session); }, changed: () => {} });
     managers.push(manager); return manager;
   };
   const start = Date.now();
   let summary;
   try {
-    await a.start(); await b.start();
-    const host = create(a), guest = create(b);
+    await a.start(); await b.start(); await c.start();
+    let host = create(a), guest = create(b);
     console.log('Creating private relay and exchanging pinned device invitations.');
     const invitation = await host.hostHistory(await guest.joinRequest(), true);
     await guest.joinHistory(invitation, true);
@@ -45,8 +47,33 @@ async function run() {
     await b.edit('bob original\n', 'bob relay contribution\n');
     await until(() => blobs(b.chain).every(name => blobs(a.chain).includes(name)), 'return relay content did not hydrate', 90_000);
     assert.equal(fs.readFileSync(path.join(b.root, 'shared.ts'), 'utf8'), 'Working tree stays local.\n');
-    summary = { setupMs, totalMs: Date.now() - start, contentBlobs: blobs(a.chain).length,
-      nativeProcesses: 2, historiesVisible: true, historicalDiffVerified: true, workingTreeUnchanged: true, scope: 'same-account, same-machine, real Microsoft relay' };
+    console.log('Restarting both managers; reopening the same host resource with saved device pins.');
+    await guest.suspend(); await host.suspend();
+    managers.splice(managers.indexOf(host), 1); managers.splice(managers.indexOf(guest), 1);
+    await a.edit('offline before\n', 'offline contribution\n');
+    host = create(a); guest = create(b);
+    await host.resume(saved.get(a.root)); await guest.resume(saved.get(b.root));
+    await until(() => blobs(a.chain).every(name => blobs(b.chain).includes(name)), 'restart catch-up failed', 90_000);
+    await guest.reconnect();
+    await until(() => guest.status().peers.some(peer => peer.state === 'Live'), 'explicit reconnect failed', 90_000);
+    console.log('Connecting a third replica, then taking the original source offline.');
+    const third = create(c);
+    const forward = await guest.hostHistory(await third.joinRequest(), true);
+    await host.stop();
+    await third.joinHistory(forward, true);
+    await until(() => blobs(a.chain).every(name => blobs(c.chain).includes(name)), 'third-party forwarding failed', 90_000);
+    assert.ok((await diffs(c)).some(diff => diff.before === 'original source\n' && diff.after === 'Shared relay revision\n'.repeat(12_000)));
+    assert.ok((await diffs(c)).some(diff => diff.after === 'offline contribution\n'));
+    console.log('Revoking the third device and checking that reconnect cannot read later history.');
+    const thirdDevice = (await guest.inspectRequest(await third.joinRequest())).device;
+    await guest.revoke(thirdDevice.fingerprint);
+    await b.edit('private after revoke\n', 'must remain at bob\n');
+    await third.reconnect();
+    await new Promise(resolve => setTimeout(resolve, 4000));
+    assert.ok(!(await diffs(c)).some(diff => diff.after === 'must remain at bob\n'));
+    assert.ok(!guest.status().peers.some(peer => peer.fingerprint === thirdDevice.fingerprint && peer.state === 'Live'));
+    summary = { restartCatchUp: true, reconnect: true, thirdPartyForwarding: true, revocation: true, setupMs, totalMs: Date.now() - start, contentBlobs: blobs(a.chain).length,
+      nativeProcesses: 3, historiesVisible: true, historicalDiffVerified: true, workingTreeUnchanged: true, scope: 'same-account, same-machine, real Microsoft relay' };
   } finally {
     const closed = await Promise.allSettled(managers.map(manager => manager.stop()));
     githubToken = undefined;

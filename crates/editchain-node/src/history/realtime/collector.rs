@@ -19,7 +19,7 @@ use std::{io, path::PathBuf};
 
 impl LiveWorkspace {
     pub(super) fn append_links(&mut self, links: &[Op]) -> Result<()> {
-        let mut store = SegmentStore::open(&self.chain)?;
+        let mut store = SegmentStore::open_wait(&self.chain, std::time::Duration::from_secs(2))?;
         self.queue_tail()?;
         let _admission = Writer {
             store: &mut store,
@@ -46,7 +46,7 @@ impl LiveWorkspace {
                 LiveCodex::start(&HelperCommand::new(&request.helper, Vec::new()))?,
             ));
         }
-        let mut store = SegmentStore::open(&self.chain)?;
+        let mut store = SegmentStore::open_wait(&self.chain, std::time::Duration::from_secs(2))?;
         // Recheck external appends after acquiring the writer lock. Keep their
         // view delta queued even if this provider transaction subsequently fails.
         self.queue_tail()?;

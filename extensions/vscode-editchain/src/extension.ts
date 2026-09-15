@@ -1170,5 +1170,5 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 }
 
 export async function deactivate(): Promise<void> {
-  await Promise.allSettled([humanWork?.stop(), multiplayer?.stop()]);
+  await Promise.allSettled([humanWork?.stop(), multiplayer?.suspend()]);
 }
