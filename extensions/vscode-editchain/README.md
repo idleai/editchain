@@ -313,30 +313,50 @@ run may ask you to sign in or allow this extension to use the account with
 is required by the implementation. Service acceptance of this account/token
 flow is part of the live experiment.
 
-The command creates one private, randomly named tunnel and one logical TCP
-port. It connects a host and client through Microsoft's relay, requires the
-SDK's encrypted V2 stream and a matching host key, exchanges 16 KiB of
+The command creates one private tunnel with a generated ID and one logical TCP
+port with the service's `auto` protocol setting. The service rejects the SDK's
+`tcp` value; its supported settings are `auto`, `http`, and `https`
+([port configuration](https://learn.microsoft.com/en-us/azure/developer/dev-tunnels/cli-commands#advanced-manage-dev-tunnel-ports)).
+The service's custom DNS `name` field is omitted because custom names are disabled;
+a random label identifies the tunnel for recovery instead.
+It connects a host and client through Microsoft's relay, requires end-to-end
+encryption and a matching host key, exchanges 16 KiB of
 synthetic data in each direction, then measures 20 echo round trips. Neither
 endpoint opens a local TCP listener. No workspace files or history are sent.
+The SDK can negotiate V1 (an encrypted SSH session directly between peers) or
+V2 (a separate encrypted `SecureStream` for each forwarded connection)
+([SDK client implementation](https://github.com/microsoft/dev-tunnels/blob/main/ts/src/connections/tunnelRelayTunnelClient.ts)).
+For V1, the spike checks authentication, active encryption and message integrity
+in both directions, and identical SSH exchange IDs at the two endpoints. For V2,
+it requires the SDK's `SecureStream` transform on both ends. Unencrypted streams,
+unverified host keys, and mixed relay protocol versions are refused.
 Both endpoints run in the current Node.js extension host, including the remote
 machine in a Remote SSH/container workspace. This first spike measures a
 **same-account relay path**, without testing cross-account admission,
 cross-network latency, durable replication, or reconnect behavior.
 
 Open **Output → EditChain Dev Tunnels Spike** for the account label, stages,
-payload counts, setup time, and RTT min/p50/p95/max. A `PASS` is emitted only
-after the payload checks and tunnel deletion succeed. The network phase has
+negotiated relay protocol, payload counts, setup time, and RTT min/p50/p95/max.
+A `PASS` is emitted only after the payload checks and tunnel deletion succeed. The network phase has
 a 90-second deadline; cancellation still attempts cleanup with fresh deadlines.
 The 20 samples are a smoke test, not a representative latency benchmark.
 
-Only pending resource names and their account IDs are stored in extension
+Recognized protocol-validation, custom-name, and service-disabled responses include
+fixed diagnostic hints; raw SDK errors and response bodies remain hidden.
+An HTTP 400 or 403 rejection clears its recovery record once a separate cleanup
+check confirms there is no resource. Uncertain requests and failed cleanup
+checks retain recovery records.
+
+Only pending recovery markers and their account IDs are stored in extension
 global state. Credentials and payloads are not stored or logged. After an
 interrupted run, **EditChain: Clean Up Dev Tunnels Spike** retries deletion for
 that account; starting another spike also performs recovery first. The tunnel
 requests a one-hour inactivity expiry as a fallback for an abrupt process exit.
+Cleanup also recognizes records from the earlier build that used custom names.
 
 The connections/management/contracts packages are pinned to `1.3.56`, with
-SSH/SSH-TCP `3.12.42`. Local tests exercise actual SDK encrypted streams, HTTP
+SSH/SSH-TCP `3.12.42`. Local tests exercise actual V1 SSH sessions and V2 SDK
+encrypted streams, rejection of mismatched host keys and SSH sessions, HTTP
 authorization construction with a stub service, VS Code authentication through
 a stub provider, integrity failures, downgrade rejection, and cleanup. Run:
 
