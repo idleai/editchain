@@ -23,6 +23,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const driver = require('./functionalDriver.js');
+const { installNativeWindowFixture } = require('./nativeWindowFixture.js');
+const { installWidthProbe } = require('./widthAnimationProbe.js');
 
 const HARNESS_DIR = __dirname;
 const RUST_HTML = fs.readFileSync(path.join(HARNESS_DIR, 'rust.html'), 'utf8');
@@ -334,6 +336,355 @@ test('live insertion and revision preserve selection and the scroll anchor witho
   } finally { await page.close(); }
 });
 
+test('native bursts reconcile one small mounted window and reuse unchanged content', { skip: SKIP }, async () => {
+  const { page, errors } = await openRustPage('large');
+  try {
+    await installNativeWindowFixture(page);
+    await driver.waitFor(page, () => document.querySelector('.row[data-key="native:0"]'));
+    await settleRust(page);
+    await page.evaluate(() => {
+      const state = window.__nativeWindow;
+      state.node = document.querySelector('.row[data-key="native:1"]');
+      state.cell = state.node.querySelector('.text-cell');
+      state.requests = []; state.sentRows = 0; state.reusedRows = 0;
+    });
+    await page.evaluate(async () => {
+      const updates = Array.from({ length: 20 }, () => window.__nativeWindow.update());
+      await Promise.all(updates);
+    });
+    const burst = await page.evaluate(() => ({
+      sent: window.__nativeWindow.sentRows, reused: window.__nativeWindow.reusedRows,
+      handoffs: window.__nativeWindow.requests.filter(request => request.type === 'ReconcileRows' && request.keys.length).length,
+      rows: document.querySelectorAll('.row[data-row]').length,
+      sameRow: document.querySelector('.row[data-key="native:1"]') === window.__nativeWindow.node,
+      sameContent: document.querySelector('.row[data-key="native:1"] .text-cell') === window.__nativeWindow.cell,
+      text: document.querySelector('.row[data-key="native:0"]').textContent,
+      handles: [...document.querySelectorAll('.col-resize-handle')].map(handle => handle.dataset.col),
+    }));
+    assert.equal(burst.sent, 1, 'twenty revisions send only the latest changed row content');
+    assert.ok(burst.reused > 20);
+    assert.equal(burst.handoffs, 1, 'a burst locates anchors and reconciles once');
+    assert.ok(burst.rows < 80, 'prefetched rows do not enlarge the DOM');
+    assert.equal(burst.sameRow, true);
+    assert.equal(burst.sameContent, true);
+    assert.match(burst.text, /Revision 20/);
+    assert.equal(new Set(burst.handles).size, burst.handles.length, 'retained headers never accumulate resize handles');
+    const offscreen = await page.evaluate(async () => {
+      const state = window.__nativeWindow;
+      state.sentRows = 0;
+      let mutations = 0;
+      const observer = new MutationObserver(records => {
+        mutations += records.filter(record => record.target.closest?.('.row[data-key]')).length;
+      });
+      observer.observe(document.getElementById('rows'), { subtree: true, childList: true, attributes: true, characterData: true });
+      await state.update(state.rows.length - 1);
+      observer.disconnect();
+      return { sent: state.sentRows, mutations };
+    });
+    assert.equal(offscreen.sent, 0, 'an offscreen edit reuses all visible content');
+    assert.equal(offscreen.mutations, 0, 'unchanged visible rows receive no DOM mutations');
+    assertNoErrors(errors);
+  } finally { await page.close(); }
+});
+
+test('native superseded windows retain DOM and rapid prepends retarget the active animation', { skip: SKIP }, async () => {
+  const { page, errors } = await openRustPage('large');
+  try {
+    await installNativeWindowFixture(page);
+    await driver.waitFor(page, () => document.querySelector('.row[data-key="native:0"]'));
+    await settleRust(page);
+    const continuity = await page.evaluate(async () => {
+      const state = window.__nativeWindow;
+      const retained = document.querySelector('.row[data-key="native:1"]');
+      const post = window.vscode.postMessage;
+      let newer;
+      let injected = false;
+      window.vscode.postMessage = message => {
+        post(message);
+        if (message.body?.ReconcileRows && !injected) {
+          injected = true;
+          // A new revision arrives after a response but before its DOM frame.
+          newer = state.update();
+        }
+      };
+      await state.update();
+      await newer;
+      window.vscode.postMessage = post;
+      return { retained: document.querySelector('.row[data-key="native:1"]') === retained,
+        revision: state.settled, placeholders: document.querySelectorAll('.row-placeholder').length };
+    });
+    assert.deepEqual(continuity, { retained: true, revision: 2, placeholders: 0 });
+    const jumps = await page.evaluate(async () => {
+      const probe = document.querySelector('.row[data-key="native:0"]');
+      const insert = Node.prototype.insertBefore;
+      let before;
+      const jumps = [];
+      Node.prototype.insertBefore = function (node, reference) {
+        if (node.dataset?.key?.startsWith('inserted:')) before = probe.getBoundingClientRect().y;
+        return insert.call(this, node, reference);
+      };
+      try {
+        for (let i = 0; i < 6; i++) {
+          await window.__nativeWindow.prepend();
+          jumps.push(Math.abs(probe.getBoundingClientRect().y - before));
+        }
+      } finally { Node.prototype.insertBefore = insert; }
+      return jumps;
+    });
+    assert.ok(jumps.every(jump => jump <= 1.5), 'each retarget starts at its current visual position (pixel rounding only): ' + jumps);
+    assertNoErrors(errors);
+  } finally { await page.close(); }
+});
+
+test('native disclosure gives immediate feedback and applies only the authoritative group change', { skip: SKIP }, async () => {
+  const { page, errors } = await openRustPage('large');
+  try {
+    await installNativeWindowFixture(page);
+    await driver.waitFor(page, () => document.querySelector('.row[data-key="native:0"] .task-chevron'));
+    await settleRust(page);
+    await page.evaluate(() => { window.__nativeWindow.holdToggle = true; });
+    await page.click('.row[data-key="native:0"] .task-chevron');
+    assert.equal(await page.$eval('.row[data-key="native:0"] .task-chevron', button => button.getAttribute('aria-busy')), 'true');
+    assert.equal(await page.evaluate(() => window.__nativeWindow.revision), 0, 'feedback precedes the native response');
+    await driver.waitFor(page, () => window.__nativeWindow.held);
+    await page.evaluate(() => window.__nativeWindow.held());
+    await driver.waitFor(page, () => document.querySelector('.row[data-key="native:0"] .task-chevron')?.getAttribute('aria-busy') === 'false');
+    assert.equal(await page.$eval('.row[data-key="native:0"] .task-chevron', button => button.getAttribute('aria-expanded')), 'false');
+    assert.equal(await page.$('.row[data-key="native:1"]'), null);
+    await page.evaluate(() => { window.__nativeWindow.holdToggle = false; });
+    await page.click('.row[data-key="native:0"] .task-chevron');
+    await driver.waitFor(page, () => document.querySelector('.row[data-key="native:1"]'));
+    assert.equal(await page.$eval('.row[data-key="native:0"] .task-chevron', button => button.getAttribute('aria-expanded')), 'true');
+    await settleRust(page);
+    await page.evaluate(() => {
+      const state = window.__nativeWindow;
+      state.post = window.vscode.postMessage;
+      state.heldWindows = [];
+      window.vscode.postMessage = message => {
+        if (message.body?.ReconcileRows) state.heldWindows.push(message);
+        else state.post(message);
+      };
+    });
+    await page.click('.row[data-key="native:0"] .task-chevron');
+    await driver.waitFor(page, () => window.__nativeWindow.heldWindows.length === 1);
+    await page.click('.row[data-key="native:0"] .task-chevron');
+    await driver.waitFor(page, () => window.__nativeWindow.heldWindows.length === 2);
+    assert.equal(await page.evaluate(() => window.__nativeWindow.revision), 4, 'both clicks survive retired coordinates');
+    await page.evaluate(() => {
+      const state = window.__nativeWindow;
+      window.vscode.postMessage = state.post;
+      state.post(state.heldWindows.at(-1));
+    });
+    await driver.waitFor(page, () => document.querySelector('.row[data-key="native:0"] .task-chevron')?.getAttribute('aria-busy') === 'false');
+    assert.equal(await page.$eval('.row[data-key="native:0"] .task-chevron', button => button.getAttribute('aria-expanded')), 'true');
+    assertNoErrors(errors);
+  } finally { await page.close(); }
+});
+
+test('native refresh preserves graph width until missing prefetch rows arrive', { skip: SKIP }, async () => {
+  const { page, errors } = await openRustPage('large');
+  try {
+    await page.evaluate(() => {
+      const base = window.__editchainFixture.rows[0];
+      const rows = Array.from({ length: 600 }, (_, index) => ({ ...base,
+        node_key: 'paged:' + index, continuity_key: 'paged:' + index, summary: 'Row ' + index,
+        lane: index === 30 ? 9 : 0, above: [], below: [], transitions: [], parents: [], sub_ops: [], is_subop: false,
+      }));
+      const probe = window.__pagedMotion = { rows, revision: 0, hold: false, widths: [] };
+      const respond = (id, value) => window.dispatchEvent(new MessageEvent('message', { data: { id, body: { Ok: value } } }));
+      window.vscode.postMessage = message => {
+        const snapshot = 'paged:' + probe.revision;
+        if (message.type === 'liveSettled') probe.settled = message;
+        if (message.body?.GetWindow) {
+          const request = message.body.GetWindow;
+          const send = () => respond(message.id, { snapshot_id: snapshot, total: rows.length,
+            chain_generation: 0, max_lane: 9, layout_ready: true, sub_op_counts: null,
+            expansion_spans: request.offset === 0 ? [] : null, rows: rows.slice(request.offset, request.offset + request.limit) });
+          if (probe.hold && request.offset > 0) probe.release = send;
+          else send();
+        } else if (message.body?.LocateRows) {
+          respond(message.id, { snapshot_id: snapshot, rows: message.body.LocateRows.keys.map(key => ({
+            key, node_key: key, row: rows.findIndex(row => row.continuity_key === key),
+          })).filter(row => row.row >= 0) });
+        }
+      };
+      probe.update = (disclosure = false) => {
+        const base_revision = probe.revision++;
+        probe.hold = true; probe.release = null; probe.settled = null;
+        const work = { source_bytes: 0, provider_records: 0, provider_bootstraps: 0, chain_bytes: 0,
+          chain_records: 0, presentation_ops: 0, items: 0, occurrences: 0, blocks: 0, capture_ms: 0, projection_ms: 0 };
+        respond(disclosure ? 'disclosure' : 'delta', { epoch: 'paged', revision: probe.revision, work, deltas: [{ base_revision,
+          revision: probe.revision, snapshot_id: 'paged:' + probe.revision, removed: [], upserts: [],
+          total: rows.length, visible_total: rows.length, chain_generation: 1, max_lane: 9, work }] });
+      };
+      respond('open', { protocol_version: 2, snapshot_id: 'paged:0', nodes: rows.length, repos: 1,
+        live: { epoch: 'paged', revision: 0, total: rows.length, blocks: [], paged: true } });
+      respond('ready', {});
+    });
+    await driver.waitFor(page, () => window.__editchainDataReady && document.querySelector('.row[data-key="paged:30"]'));
+    await page.evaluate(() => Promise.all(document.getElementById('rows').getAnimations().map(animation => animation.finished)));
+    const before = await page.evaluate(() => {
+      window.__pagedMotion.header = document.querySelector('.tbl-header');
+      const width = document.querySelector('.graph-cell').getBoundingClientRect().width;
+      new MutationObserver(() => window.__pagedMotion.widths.push(
+        document.querySelector('.graph-cell').getBoundingClientRect().width,
+      )).observe(document.getElementById('rows'), { subtree: true, attributes: true, childList: true });
+      window.__pagedMotion.update();
+      return width;
+    });
+    await driver.waitFor(page, () => window.__pagedMotion.release && window.__pagedMotion.settled);
+    const during = await page.evaluate(() => ({ width: document.querySelector('.graph-cell').getBoundingClientRect().width,
+      retainedHeader: document.querySelector('.tbl-header') === window.__pagedMotion.header, widths: window.__pagedMotion.widths }));
+    assert.equal(during.width, before, 'viewport-only data must not shrink the graph before prefetch');
+    assert.ok(during.widths.every(width => Math.abs(width - before) < 1), 'no intermediate width flash');
+    assert.equal(during.retainedHeader, true, 'an unchanged header stays mounted');
+    await page.evaluate(() => { window.__pagedMotion.hold = false; window.__pagedMotion.release(); });
+    await driver.waitFor(page, () => document.querySelector('.row[data-key="paged:30"]'));
+    await page.evaluate(() => {
+      window.__pagedMotion.rows[30].lane = 0;
+      window.__pagedMotion.rows[0].above = [0];
+      window.__pagedMotion.update(true);
+    });
+    await driver.waitFor(page, () => window.__pagedMotion.release && window.__pagedMotion.settled);
+    assert.equal(await page.evaluate(() => document.querySelector('.graph-cell').getBoundingClientRect().width), before);
+    assert.equal(await page.evaluate(() => {
+      const row = document.querySelector('.row[data-key="paged:0"]');
+      return Boolean(row.querySelector('line')) && !row.querySelector('.graph-live-edge');
+    }), true, 'user disclosure renders newly revealed connections immediately');
+    await page.evaluate(() => { window.__pagedMotion.hold = false; window.__pagedMotion.release(); });
+    await driver.waitFor(page, () => document.querySelector('.graph-cell').getBoundingClientRect().width < 50);
+    assertNoErrors(errors);
+  } finally { await page.close(); }
+});
+
+function assertWidthAlignment(frame) {
+  assert.ok(frame.rowWidths.length > 20, 'inspect the whole mounted window');
+  assert.ok(frame.rowWidths.every(width => Math.abs(width - frame.graph) < 0.1),
+    'header and every row share the same animated graph width');
+  assert.ok(frame.columnErrors.every(error => error < 0.1), 'all column boundaries stay aligned');
+  assert.ok(frame.dividers.every(divider => divider.error < 0.1),
+    'resize handles track animated boundaries: ' + JSON.stringify(frame.dividers));
+  assert.ok(Math.abs(frame.table - frame.wrap) < 0.1, 'header and row window share the overflow extent');
+}
+
+for (const width of [1440, 420]) {
+  test(`native graph width animates together through growth, insertion, disclosure and drag at ${width}px`, { skip: SKIP }, async () => {
+    const { page, errors } = await openRustPage('large', { width, height: 900 });
+    try {
+      await installNativeWindowFixture(page);
+      await driver.waitFor(page, () => document.querySelector('.row[data-key="native:0"]'));
+      await settleRust(page);
+      await page.evaluate(() => Promise.all(document.getElementById('rows').getAnimations().map(animation => animation.finished)));
+      await installWidthProbe(page);
+      const before = await page.evaluate(() => window.__widthProbe.read());
+      assert.equal(before.graph, 40);
+      assertWidthAlignment(before);
+      await saveParityScreenshot(page, `width-${width}-before`);
+
+      await page.evaluate(() => {
+        window.__nativeWindow.rows[1].lane = 9;
+        return window.__nativeWindow.update(1);
+      });
+      const start = await page.evaluate(() => window.__widthProbe.at(0));
+      assert.ok(Math.abs(start.graph - before.graph) < 0.1, 'growth starts at the displayed width');
+      assert.equal(start.target, 162.36);
+      assert.ok(start.timing.some(timing => timing.property === '--graph-display-width'));
+      assert.ok(start.timing.every(timing => timing.duration === 120 && timing.easing === 'ease-out'),
+        'automatic resizing uses a short 120ms ease-out transition');
+      const frames = [];
+      for (const time of [20, 40, 60, 80]) {
+        const frame = await page.evaluate(time => window.__widthProbe.at(time), time);
+        assertWidthAlignment(frame);
+        assert.ok(frame.graph > before.graph && frame.graph < frame.target);
+        assert.equal(frame.renderCount, start.renderCount, 'interpolation never re-enters the renderer');
+        frames.push(frame);
+      }
+      assert.ok(frames.every((frame, index) => index === 0 || frame.graph > frames[index - 1].graph),
+        'growth is monotonic');
+      const middle = await page.evaluate(() => window.__widthProbe.at(60));
+      if (width === 420) {
+        assert.ok(middle.table > before.table && middle.table < middle.minimum,
+          'overflow grows smoothly alongside the graph');
+      }
+      await saveParityScreenshot(page, `width-${width}-growing`);
+
+      await page.evaluate(() => window.__nativeWindow.prepend());
+      const inserted = await page.evaluate(() => window.__widthProbe.read());
+      assertWidthAlignment(inserted);
+      assert.equal(inserted.transitions, middle.transitions, 'new rows do not restart the shared clock');
+      assert.ok(Math.abs(inserted.graph - middle.graph) < 0.1, 'inserted rows inherit the in-flight width');
+
+      // Hide the only wide lane while growth is still halfway through.
+      await page.evaluate(() => document.querySelector('.row[data-key="native:0"] .task-chevron').click());
+      await driver.waitFor(page, () => !window.__nativeWindow.expanded &&
+        window.__nativeWindow.settled === window.__nativeWindow.revision);
+      const reversed = await page.evaluate(() => window.__widthProbe.at(0));
+      assert.equal(reversed.target, 40);
+      assert.ok(Math.abs(reversed.graph - middle.graph) < 0.1, 'rapid reversal starts at the current width');
+      assert.ok(reversed.timing.every(timing => timing.duration > 0 && timing.duration <= 120));
+      const shrinking = await page.evaluate(() => window.__widthProbe.at(30));
+      assertWidthAlignment(shrinking);
+      assert.ok(shrinking.graph < reversed.graph && shrinking.graph > 40);
+      await saveParityScreenshot(page, `width-${width}-shrinking`);
+      const collapsed = await page.evaluate(() => window.__widthProbe.finish());
+      assertWidthAlignment(collapsed);
+      assert.equal(collapsed.graph, 40);
+      assert.ok(Math.abs(collapsed.table - before.table) < 0.1);
+
+      await page.evaluate(() => document.querySelector('.row[data-key="native:0"] .task-chevron').click());
+      await driver.waitFor(page, () => window.__nativeWindow.expanded &&
+        window.__nativeWindow.settled === window.__nativeWindow.revision);
+      const expanded = await page.evaluate(() => window.__widthProbe.finish());
+      assertWidthAlignment(expanded);
+      assert.ok(Math.abs(expanded.graph - 162.36) < 0.1);
+      assert.ok(expanded.dotX.includes('14.76'), 'existing lane centers remain pinned');
+      await saveParityScreenshot(page, `width-${width}-after`);
+
+      // Interrupt another growth with a real divider gesture.
+      await page.evaluate(() => {
+        const index = window.__nativeWindow.rows.findIndex(row => row.node_key === 'native:1');
+        window.__nativeWindow.rows[index].lane = 18;
+        return window.__nativeWindow.update(index);
+      });
+      const drag = await page.evaluate(() => {
+        const before = window.__widthProbe.at(40);
+        const handle = document.querySelector('.col-resize-handle[data-col="graph"]');
+        handle.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 100 }));
+        const grabbed = window.__widthProbe.read();
+        window.dispatchEvent(new MouseEvent('mousemove', { clientX: 125 }));
+        const moved = window.__widthProbe.read();
+        window.dispatchEvent(new MouseEvent('mouseup', { clientX: 125 }));
+        return { before, grabbed, moved, animations: document.getElementById('rows').getAnimations().length };
+      });
+      assert.ok(Math.abs(drag.grabbed.graph - drag.before.graph) < 0.1, 'drag takes over without jumping to the target');
+      assert.ok(Math.abs(drag.moved.graph - drag.before.graph - 25) < 0.1, 'manual resizing follows the pointer immediately');
+      assert.equal(drag.animations, 0);
+      assertWidthAlignment(drag.moved);
+      assertNoErrors(errors);
+    } finally { await page.close(); }
+  });
+}
+
+test('native graph width respects reduced motion', { skip: SKIP }, async () => {
+  const { page, errors } = await openRustPage('large');
+  try {
+    await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
+    await installNativeWindowFixture(page);
+    await driver.waitFor(page, () => document.querySelector('.row[data-key="native:0"]'));
+    await settleRust(page);
+    await installWidthProbe(page);
+    await page.evaluate(() => {
+      window.__nativeWindow.rows[1].lane = 9;
+      return window.__nativeWindow.update(1);
+    });
+    const frame = await page.evaluate(() => window.__widthProbe.read());
+    assertWidthAlignment(frame);
+    assert.ok(Math.abs(frame.graph - frame.target) < 0.1, 'reduced motion applies the final width immediately');
+    assert.equal(frame.transitions, 0);
+    assertNoErrors(errors);
+  } finally { await page.close(); }
+});
+
 test('one-operation forks and merges grow connections and retain SVG animation clocks across another delta', { skip: SKIP }, async () => {
   const { page, errors } = await openRustPage('liveGraph');
   try {
@@ -362,6 +713,7 @@ test('one-operation forks and merges grow connections and retain SVG animation c
         offsets: window.__graphSegments.map(part => parseFloat(getComputedStyle(part).strokeDashoffset)),
         originalConnected: window.__graphOriginal.isConnected,
         originalX: window.__graphOriginal.getAttribute('cx'),
+        longestMs: Math.max(...document.getAnimations().map(animation => animation.effect.getComputedTiming().endTime)),
         laneCenters: window.__editchainRendererDebug.laneXAll() };
     });
     assert.equal(fork.result.error, null);
@@ -371,6 +723,7 @@ test('one-operation forks and merges grow connections and retain SVG animation c
     assert.ok(fork.offsets.every(offset => Math.abs(offset + 0.5) < 0.01), 'each SVG stroke is partially drawn halfway through its animation');
     assert.equal(fork.originalConnected, true);
     assert.equal(fork.originalX, before.x);
+    assert.ok(fork.longestMs <= 321, 'live arrival motion finishes within 320 ms');
     assert.deepEqual(fork.laneCenters.slice(0, 2), [14.76, 29.52]);
     await page.evaluate(() => {
       const fork = window.__editchainFixture.rows.find(row => row.node_key === 'live:fork');
@@ -833,6 +1186,8 @@ test('find-in-chain, row selection, and disclosure interactions settle in real D
       assert.equal(state.total, 2592, 'clearing never replaces the chain');
 
       // Row selection + roving keyboard + raw-JSON identity (real controls).
+      await page.evaluate(() => { document.getElementById('rows').scrollTop = 0; });
+      await driver.waitFor(page, () => document.querySelector('.row[data-row="1"]'));
       await driver.clickRow(page, 1);
       state = await driver.readState(page);
       assert.equal(state.selectedRow, 1, 'click selects the row');
@@ -1581,15 +1936,16 @@ test('deep scroll pages the large window with bounded offsets and settles', { sk
   try {
     let state = await rustState(page);
     assert.equal(state.total, 600, 'large fixture total');
-    assert.ok(state.rows.length >= 400 && state.rows.length <= 500,
-      'first window renders the viewport±BUFFER window, got ' + state.rows.length);
+    const mountedLimit = await page.evaluate(() => Math.ceil(document.getElementById('rows').clientHeight / 34) + 2 + 32);
+    assert.ok(state.rows.length >= 16 && state.rows.length <= mountedLimit,
+      'first window mounts the viewport with a small margin, got ' + state.rows.length);
     assert.ok(state.windowRequests.length >= 1, 'boot issued a GetWindow');
     assert.equal(state.windowRequests[0].offset, 0, 'boot fetches from offset 0');
     const renderCountBefore = state.metrics.renderCount;
 
     // Scroll to the bottom through the real #rows scroll handler; paging must
     // stay bounded (small set of window offsets, rows never exceed the
-    // viewport ± BUFFER cap).
+    // viewport with its independent mounted margin).
     await page.bringToFront();
     for (let i = 0; i < 80; i++) {
       await page.evaluate(() => {
@@ -1618,8 +1974,8 @@ test('deep scroll pages the large window with bounded offsets and settles', { sk
       assert.ok(offsets[i] <= 599, 'offset stays inside the dataset');
     }
     assert.ok(offsets.at(-1) > 0, 'the final window is past offset 0');
-    assert.ok(state.rows.length <= 900, 'rendered rows stay bounded, got ' + state.rows.length);
-    assert.ok(state.rows.length >= 400, 'deep window still renders a real window');
+    assert.ok(state.rows.length <= mountedLimit, 'rendered rows stay bounded, got ' + state.rows.length);
+    assert.ok(state.rows.length >= 16, 'deep window retains the mounted margin');
     assert.equal(state.rows.at(-1).index, 599, 'last dataset row is rendered');
     assert.equal(state.placeholderCount, 0, 'no placeholders after settle');
     assert.ok(state.metrics.renderCount > renderCountBefore,

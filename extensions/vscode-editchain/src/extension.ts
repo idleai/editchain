@@ -4,6 +4,7 @@ let humanWork: HumanWorkHost | undefined;
 import { resolveServicePath, StdioClient } from './stdioClient';
 import { createLiveSync, LiveProviderRequest } from './liveHost';
 import { LiveSync } from './liveSync';
+import { LiveQueue } from './liveQueue';
 
 // The single history panel. Reused across `open` invocations so we never create
 // two webviews of the same type (which races VS Code's service-worker
@@ -33,7 +34,7 @@ let lastOpenError: string | null = null;
 // the pending Open is issued, so the replay path is doubly safe.
 let openPending = false;
 let liveViewportReady = false;
-let livePublication: Promise<unknown> = Promise.resolve();
+const livePublication = new LiveQueue();
 type LiveViewport = { snapshot_id: string; keys: string[]; capacity: number; at_head: boolean };
 let pendingViewport: LiveViewport | undefined;
 let viewportQueued = false;
@@ -350,7 +351,15 @@ function openHistoryView(
     }
     if (msg.type === 'toggleDisclosure') {
       if (typeof msg.key === 'string' && msg.key.length > 0 && msg.key.length <= 2048 && !openPending) {
-        void syncNative(client, panel, undefined, { key: msg.key, task: msg.task === true }).catch(error => output?.appendLine('[live] Disclosure failed: ' + String(error)));
+        const owner = openEpoch;
+        const action = { key: msg.key, task: msg.task === true };
+        const done = (error: string | null) => {
+          if (owner === openEpoch && panel === historyPanel) panel.webview.postMessage({ id: 'disclosureDone', body: { ...action, error } });
+        };
+        void syncNative(client, panel, undefined, action).then(() => done(null), error => {
+          output?.appendLine('[live] Disclosure failed: ' + String(error));
+          done(String(error));
+        });
       }
       return;
     }
@@ -418,7 +427,7 @@ function openHistoryView(
     }
     // The Rust/WASM renderer speaks the production generic bridge: numeric-id
     // { body: <one-key envelope> } frames. ONLY the read-only envelopes the
-    // renderer issues are forwarded (GetWindow, LocateRows and FindInHistory);
+    // renderer issues are forwarded (GetWindow, ReconcileRows, LocateRows and FindInHistory);
     // anything else (Open, ResolveObject, GetNodeDetails, ...) is rejected
     // visibly instead of reaching a non-read-only service call. The explicitly
     // handled openJson UI action above remains outside this bridge.
@@ -433,16 +442,16 @@ function openHistoryView(
       typeof body === 'object' &&
       !Array.isArray(body) &&
       Object.keys(body).length === 1 &&
-      (hasOwnProperty(body, 'GetWindow') || hasOwnProperty(body, 'FindInHistory') || hasOwnProperty(body, 'LocateRows'));
+      (hasOwnProperty(body, 'GetWindow') || hasOwnProperty(body, 'FindInHistory') || hasOwnProperty(body, 'LocateRows') || hasOwnProperty(body, 'ReconcileRows'));
     if (id === null || !isForwardable) {
       output?.appendLine(
-        '[webview] rejected request (only GetWindow/FindInHistory/LocateRows are forwarded): ' +
+        '[webview] rejected request (only GetWindow/ReconcileRows/FindInHistory/LocateRows are forwarded): ' +
           JSON.stringify(msg)
       );
       panel.webview.postMessage({
         id: id === null ? -1 : id,
         body: {
-          Error: 'EditChain History: only GetWindow, FindInHistory and LocateRows requests are forwarded by the host',
+          Error: 'EditChain History: only GetWindow, ReconcileRows, FindInHistory and LocateRows requests are forwarded by the host',
         },
       });
       return;
@@ -462,7 +471,7 @@ function openHistoryView(
           } else {
             panel.webview.postMessage({ id, body: response });
           }
-        });
+        }, true);
         return;
       }
       // Non-Open calls get a generous finite deadline (see NON_OPEN_TIMEOUT_MS):
@@ -537,7 +546,7 @@ function ensureLive(client: StdioClient, panel: vscode.WebviewPanel): void {
 }
 
 function syncNative(client: StdioClient, panel: vscode.WebviewPanel, codex?: LiveProviderRequest, disclosure?: { key: string; task: boolean }): Promise<boolean | void> {
-  return queueLive(() => syncNativeSerial(client, panel, codex, disclosure));
+  return queueLive(() => syncNativeSerial(client, panel, codex, disclosure), !!disclosure);
 }
 
 function queueViewport(client: StdioClient, panel: vscode.WebviewPanel, viewport: LiveViewport): void {
@@ -560,15 +569,13 @@ function queueViewport(client: StdioClient, panel: vscode.WebviewPanel, viewport
     });
 }
 
-function queueLive<T>(operation: () => Promise<T>): Promise<T | void> {
+function queueLive<T>(operation: () => Promise<T>, interactive = false): Promise<T | void> {
   const owner = openEpoch;
   const work = async () => {
     if (owner !== openEpoch || openPending) return;
     return operation();
   };
-  const result = livePublication.then(work, work);
-  livePublication = result.then(() => undefined, () => undefined);
-  return result;
+  return livePublication.enqueue(work, interactive);
 }
 
 async function syncNativeSerial(client: StdioClient, panel: vscode.WebviewPanel, codex?: LiveProviderRequest, disclosure?: { key: string; task: boolean }): Promise<boolean | void> {
@@ -581,10 +588,10 @@ async function syncNativeSerial(client: StdioClient, panel: vscode.WebviewPanel,
   const response = await client.request(body, { timeoutMs: 0 });
   const elapsed = Date.now() - requestedAt;
   if (elapsed >= 250) output?.appendLine('[live] native ' + JSON.stringify({ request: Object.keys(body)[0], elapsed_ms: elapsed }));
-  return publishNative(client, panel, response, owner);
+  return publishNative(client, panel, response, owner, !disclosure);
 }
 
-async function publishNative(client: StdioClient, panel: vscode.WebviewPanel, response: any, owner: number): Promise<boolean | void> {
+async function publishNative(client: StdioClient, panel: vscode.WebviewPanel, response: any, owner: number, animateConnections = true): Promise<boolean | void> {
   if (owner !== openEpoch || panel !== historyPanel || !lastOpenBody?.Ok.live) return;
   const cursor = lastOpenBody.Ok.live;
   if (!response?.Ok) {
@@ -605,7 +612,7 @@ async function publishNative(client: StdioClient, panel: vscode.WebviewPanel, re
   const publishedAt = Date.now();
   output?.appendLine('[live] delta ' + JSON.stringify({ revision: update.revision, ...update.work }));
   const applied = waitForLive(latest.snapshot_id);
-  panel.webview.postMessage({ id: 'delta', body: response });
+  panel.webview.postMessage({ id: animateConnections ? 'delta' : 'disclosure', body: response });
   try {
     if (!await applied) {
       if (owner !== openEpoch || panel !== historyPanel) return;
@@ -858,7 +865,7 @@ async function resolveFileDiff(client: StdioClient, msg: { snapshot_id: string; 
       { timeoutMs: NON_OPEN_TIMEOUT_MS }
     );
     return snapshotValue(retry, snapshot);
-  });
+  }, true);
   if (!diff) throw new Error(serviceErrorMessage(response.Error));
   return diff;
 }

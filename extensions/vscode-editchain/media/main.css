@@ -132,7 +132,11 @@ body {
   from { transform: translateY(var(--live-offset, 0)); }
   to { transform: translateY(0); }
 }
-.row.row-live-moved { animation: ec-live-move 360ms ease-out; }
+.row.row-live-moved { animation: ec-live-move 160ms ease-out; }
+.task-chevron[aria-busy="true"], .subop-chevron[aria-busy="true"] {
+  opacity: 0.55;
+  cursor: progress;
+}
 @keyframes ec-graph-grow {
   from { stroke-dashoffset: -1; }
   to { stroke-dashoffset: 0; }
@@ -148,7 +152,7 @@ body {
 .graph-live-node {
   transform-box: fill-box;
   transform-origin: center;
-  animation: ec-graph-node 180ms ease-out var(--graph-delay) both;
+  animation: ec-graph-node var(--graph-duration) ease-out var(--graph-delay) both;
 }
 @media (prefers-reduced-motion: reduce) {
   .row.row-live-moved { animation: none; }
@@ -211,7 +215,27 @@ body {
   cursor: default;
 }
 #layout { display: flex; flex: 1; min-height: 0; width: 100%; }
+/* Animate on the persistent scroll root: replacement headers and inserted rows
+   inherit the current frame's width instead of starting separate transitions. */
+@property --graph-display-width {
+  syntax: '<length>';
+  inherits: true;
+  initial-value: 40px;
+}
+@property --table-display-width {
+  syntax: '<length>';
+  inherits: true;
+  initial-value: 0px;
+}
 #rows { flex: 1; overflow: auto; position: relative; min-width: 0; }
+#rows[data-animate-width="true"] {
+  transition: --graph-display-width 120ms ease-out, --table-display-width 120ms ease-out;
+}
+body.col-resizing #rows { transition: none; }
+@media (prefers-reduced-motion: reduce) {
+  #rows[data-animate-width] { transition: none; }
+}
+.table-wrap, .tbl-header, .row { min-width: var(--table-display-width); }
 
 /* Scroll spacer gives #rows a scrollbar spanning the FULL history height even
    though only a viewport slice is rendered. The rendered slice (table-wrap) is
@@ -226,7 +250,7 @@ body {
 .tbl-header {
   display: grid;
   grid-template-columns:
-    var(--graph-w, auto) var(--activity-w, 88px)
+    var(--graph-display-width) var(--activity-w, 88px)
     var(--tags-w, 180px)
     var(--content-w, minmax(0,1fr))
     var(--date-w, auto) var(--author-w, auto) var(--commit-w, auto);
@@ -308,7 +332,7 @@ body {
 .row {
   display: grid;
   grid-template-columns:
-    var(--graph-w, auto) var(--activity-w, 88px)
+    var(--graph-display-width) var(--activity-w, 88px)
     var(--tags-w, 180px)
     var(--content-w, minmax(0,1fr))
     var(--date-w, auto) var(--author-w, auto) var(--commit-w, auto);
@@ -880,6 +904,8 @@ body {
    resizable boundary remains discoverable without covering row interactions. */
 .col-resize-handle {
   position: absolute;
+  grid-row: 1;
+  right: -3px;
   top: 0;
   bottom: 0;
   width: 6px;
@@ -982,7 +1008,7 @@ body.col-resizing .col-resize-handle::after {
   .tbl-header,
   .row {
     grid-template-columns:
-      var(--graph-w, auto) var(--activity-w, 88px)
+      var(--graph-display-width) var(--activity-w, 88px)
       minmax(0, var(--tags-w, 180px)) minmax(0, 1fr)
       minmax(0, var(--date-w, 160px))
       minmax(0, var(--author-w, 100px))
@@ -1009,7 +1035,7 @@ body.col-resizing .col-resize-handle::after {
   .tbl-header,
   .row {
     grid-template-columns:
-      var(--graph-w, auto) var(--activity-w, 88px)
+      var(--graph-display-width) var(--activity-w, 88px)
       minmax(0, var(--tags-w, 180px)) minmax(0, 1fr)
       minmax(0, var(--date-w, 160px))
       minmax(0, var(--author-w, 100px));
@@ -1020,15 +1046,12 @@ body.col-resizing .col-resize-handle::after {
   }
 }
 @media (max-width: 480px) {
-  /* At <=480px the Rust shell caps the graph rail at GRAPH_MAX_W_NARROW (see
-     graph_width_budget in crates/editchain-history-renderer/src/app/dom.rs), so the
-     CSS grid here just keeps the --graph-w var authoritative. The rail stays
-     VISIBLE — lanes compress into the compact track instead of being hidden or
-     smearing Content. */
+  /* Keep lane spacing fixed in narrow panels. The shared animated width can
+     overflow horizontally with the table instead of compressing the graph. */
   .tbl-header,
   .row {
     grid-template-columns:
-      var(--graph-w, auto) var(--activity-w, 88px)
+      var(--graph-display-width) var(--activity-w, 88px)
       minmax(0, 120px) minmax(0, 1fr)
       minmax(0, var(--date-w, 160px));
   }
@@ -1044,7 +1067,7 @@ body.col-resizing .col-resize-handle::after {
   .tbl-header,
   .row {
     grid-template-columns:
-      var(--graph-w, auto) var(--activity-w, 88px)
+      var(--graph-display-width) var(--activity-w, 88px)
       minmax(0, 96px) minmax(0, 1fr);
   }
   .th.date,
@@ -1172,7 +1195,7 @@ body {
 .tbl-header,
 .row {
   grid-template-columns:
-    var(--graph-w, auto) var(--activity-w, 88px)
+    var(--graph-display-width) var(--activity-w, 88px)
     var(--tags-w, 180px) minmax(0, 1fr)
     minmax(0, var(--date-w, 160px));
 }
@@ -1724,7 +1747,7 @@ body {
   .tbl-header,
   .row {
     grid-template-columns:
-      var(--graph-w, auto) var(--activity-w, 88px)
+      var(--graph-display-width) var(--activity-w, 88px)
       minmax(0, 120px) minmax(0, 1fr)
       minmax(0, var(--date-w, 160px));
   }
@@ -1734,7 +1757,7 @@ body {
   .tbl-header,
   .row {
     grid-template-columns:
-      var(--graph-w, auto) var(--activity-w, 88px)
+      var(--graph-display-width) var(--activity-w, 88px)
       minmax(0, 96px) minmax(0, 1fr);
   }
 }

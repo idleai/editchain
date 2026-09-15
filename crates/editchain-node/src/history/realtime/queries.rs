@@ -178,6 +178,9 @@ impl LiveWorkspace {
             RequestBody::SyncLive(request) => serde_json::to_value(self.sync(request)?)?,
             RequestBody::GetWindow(request) => serde_json::to_value(self.window(request)?)?,
             RequestBody::LocateRows(request) => serde_json::to_value(self.locate(&request.keys)?)?,
+            RequestBody::ReconcileRows(request) => {
+                serde_json::to_value(self.reconcile_rows(request)?)?
+            }
             RequestBody::FindInHistory(request) => {
                 serde_json::to_value(self.find(&request.query, request.top_k)?)?
             }
@@ -323,7 +326,7 @@ impl LiveWorkspace {
         })
     }
 
-    fn locate(&self, keys: &[String]) -> Result<LocateRowsResponse> {
+    pub(super) fn locate(&self, keys: &[String]) -> Result<LocateRowsResponse> {
         let mut rows = Vec::new();
         for key in keys {
             let (block_key, slot) = if self.paged() {
@@ -372,7 +375,7 @@ impl LiveWorkspace {
         })
     }
 
-    fn paged_window(&self, request: &GetWindowRequest) -> Result<HistoryWindow> {
+    pub(super) fn paged_window(&self, request: &GetWindowRequest) -> Result<HistoryWindow> {
         let mut offset = request.offset;
         let total = self.blocks.measure().visible;
         let end = offset.saturating_add(request.limit).min(total);

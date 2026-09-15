@@ -37,6 +37,32 @@ const deltaBody = (revision) => ({ Ok: { epoch: 'epoch', revision, work: {}, del
   removed: [], upserts: [],
 }] } });
 
+test('conditional row reads pass through the host during a live publication', async () => {
+  const env = loadExtension();
+  env.open();
+  const panel = env.panels[0];
+  await rendererReady(panel);
+  env.client.openRequests[0].resolve(liveBody('epoch:0'));
+  await flush();
+  env.client.nextResponse = deltaBody(1);
+  await panel.handlers.message({ type: 'toggleDisclosure', key: 'item:1', task: true });
+  await flush();
+  const body = { ReconcileRows: { snapshot_id: 'epoch:1', keys: ['item:1'], anchors: [],
+    offset: 0, before: 0, limit: 40, known: [] } };
+  const response = { Ok: { snapshot_id: 'epoch:1', offset: 0, rows: [], total: 0 } };
+  env.client.nextResponse = response;
+  await panel.handlers.message({ id: 41, body });
+  assert.deepEqual(env.client.requests.at(-1).body, body, 'a window can finish the active publication');
+  assert.deepEqual(panel.webview.messages.at(-1), { id: 41, body: response });
+  const count = env.client.requests.length;
+  await panel.handlers.message({ id: 42, body: { ...body, SyncLive: {} } });
+  assert.equal(env.client.requests.length, count, 'multiple request keys stay rejected');
+  assert.ok(panel.webview.messages.at(-1).body.Error);
+  await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'epoch:1', error: null });
+  await flush();
+  assert.ok(panel.webview.messages.some(message => message.id === 'disclosureDone' && message.body.error === null));
+});
+
 test('changing recorder settings preserves the retained History service', async () => {
   const env = loadExtension();
   env.open();
@@ -390,6 +416,7 @@ test('native disclosure and search publish serially behind the viewport acknowle
   await publication;
   await flush();
   assert.deepEqual(env.client.requests.at(-1).body, { ToggleLive: { snapshot_id: 'epoch:1', key: 'item:4', task: true } });
+  assert.equal(panel.webview.messages.at(-1).id, 'disclosure', 'user toggles do not replay arrival animations');
   await panel.handlers.message({ type: 'liveSettled', snapshot_id: 'epoch:2', error: null });
   await flush();
   env.client.nextResponse = { Ok: { snapshot_id: 'epoch:3', matches: [], more: false, live: deltaBody(3).Ok } };

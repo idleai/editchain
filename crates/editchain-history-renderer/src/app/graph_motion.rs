@@ -170,18 +170,18 @@ pub(super) fn animate(root: &HtmlDivElement, before: &Capture) -> Result<(), JsV
             &element,
             "graph-live-node",
             growth.arrivals.get(&point).copied().unwrap_or(0.0),
-            180.0,
+            80.0,
         )?;
     }
     Ok(())
 }
 
 fn start_motion(element: &Element, class: &str, delay: f64, duration: f64) -> Result<(), JsValue> {
-    // The existing rows first settle into their new slots, then the connection
-    // grows from the parent. Later deltas retain these SVG nodes and clocks.
+    // Movement and connection growth start together. Later deltas retain
+    // these SVG nodes and clocks instead of delaying every interaction.
     let motion = format!(
         "--graph-delay:{}ms;--graph-duration:{}ms",
-        super::round2(360.0 + delay),
+        super::round2(delay),
         super::round2(duration)
     );
     let style = element.get_attribute("style").unwrap_or_default();

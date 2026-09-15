@@ -90,6 +90,44 @@ fn seed_ai(root: &Path, content: &str) {
 }
 
 #[test]
+fn single_imported_file_edit_is_the_primary_change_activity() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_ai(tmp.path(), "AI\n");
+    let mut server = editchain_node::Server::new();
+    let opened = live_request(
+        &mut server,
+        json!({"OpenLivePaged":{"workspace_path":tmp.path(),"chain_dir":".editchain"}}),
+    );
+    let window = live_request(
+        &mut server,
+        json!({"GetWindow":{"snapshot_id":opened["snapshot_id"],"offset":0,"limit":100,"include_layout":true}}),
+    );
+    let rows = window["rows"].as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "one edit must not need an import disclosure: {rows:?}"
+    );
+    let row = &rows[0];
+    assert_eq!(row["kind"], "file");
+    assert_eq!(row["activity_kind"], "change");
+    assert_eq!(row["is_subop"], false);
+    assert_eq!(row["sub_ops"], json!([]));
+    assert_eq!(row["file_change"]["path"], "ai.txt");
+    assert_eq!(row["op_id"], OpId::new(NodeId(73), 0, 1).to_string());
+    assert_eq!(
+        row["file_change"]["op_id"],
+        OpId::new(NodeId(73), 0, 1).to_string()
+    );
+    assert_eq!(row["file_change"]["source"], "agent");
+    let diff = live_request(
+        &mut server,
+        json!({"GetFileDiff":{"snapshot_id":opened["snapshot_id"],"change":row["file_change"]}}),
+    );
+    assert_eq!(diff["path"], "ai.txt");
+}
+
+#[test]
 fn late_ai_imports_join_prior_exposure_and_hunks_do_not_claim_untouched_lines() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let text = "human heading\nai generated\nhuman footer\n";

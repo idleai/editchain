@@ -18,11 +18,13 @@ pub use live::{
 };
 mod snapshot;
 mod validation;
+mod window;
 pub use error::{ErrorCode, ServiceError};
 pub use snapshot::{OpenResponse, SnapshotId, SnapshotResult, PROTOCOL_VERSION};
 pub use validation::{
     MAX_QUERY_BYTES, MAX_REQUEST_FRAME_BYTES, MAX_SEARCH_RESULTS, MAX_WINDOW_ROWS,
 };
+pub use window::{CachedRow, ReconcileRowsRequest, ReconciledRow, ReconciledWindow};
 
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +66,8 @@ pub enum RequestBody {
     GetWindow(GetWindowRequest),
     /// Resolve presentation identities to coordinates in the current snapshot.
     LocateRows(LocateRowsRequest),
+    /// Reconcile a native viewport using validated retained content.
+    ReconcileRows(ReconcileRowsRequest),
     /// Get details for a specific node.
     GetNodeDetails(GetNodeDetailsRequest),
     /// Find ranked lexical hits resolved to visible top-level history rows.

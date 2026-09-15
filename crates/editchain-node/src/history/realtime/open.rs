@@ -25,6 +25,7 @@ struct Opened<'a> {
 #[derive(Serialize)]
 struct Baseline<'a> {
     paged: bool,
+    reconcile_rows: bool,
     epoch: &'a SnapshotId,
     revision: u64,
     total: u64,
@@ -56,6 +57,7 @@ impl LiveWorkspace {
                 metadata: self.open_metadata(),
                 live: Baseline {
                     paged: self.paged(),
+                    reconcile_rows: self.paged(),
                     epoch: &self.epoch,
                     revision: self.revision,
                     total: self.total(),

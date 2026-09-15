@@ -64,6 +64,37 @@ impl RequestBody {
                     ));
                 }
             }
+            Self::ReconcileRows(request) => {
+                if request.snapshot_id.is_empty()
+                    || request.limit == 0
+                    || request.limit > 1000
+                    || request.before >= request.limit
+                    || request
+                        .offset
+                        .checked_add(u64::from(request.limit))
+                        .is_none_or(|end| end > MAX_EXACT_COORDINATE)
+                    || request.keys.len() > 2000
+                    || request.anchors.len() > 8
+                    || request.known.len() > 2000
+                    || request
+                        .keys
+                        .iter()
+                        .chain(&request.anchors)
+                        .any(|key| key.is_empty() || key.len() > 2048)
+                    || request
+                        .anchors
+                        .iter()
+                        .any(|key| !request.keys.contains(key))
+                    || request.known.iter().any(|row| {
+                        row.key.is_empty()
+                            || row.key.len() > 2048
+                            || row.version.len() != 64
+                            || !row.version.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                {
+                    return Err(invalid("invalid conditional window bounds or identities"));
+                }
+            }
             Self::GetWindow(request) => {
                 if request.limit == 0 || request.limit > MAX_WINDOW_ROWS {
                     return Err(invalid("window limit must be between 1 and 10000"));

@@ -32,7 +32,7 @@ Codex rollout append
 | Ordering | Monotone causal clocks keep every present parent below its child, including tied or skewed provider timestamps. Only a new constraint and affected descendants move; physical row timestamps stay unchanged. Native weighted AVL pages own expanded and visible rank/select. Local disclosure changes its block; task folding visits its section. The paged renderer keeps an identity mapping over visible coordinates. |
 | Publication | `OpenLivePaged` returns an epoch, revision and visible total without global metadata. `SyncLive` returns a bounded journal; affected pages are checkpointed before publication. Legacy `OpenLive` remains supported. |
 | Transport | Paged Open sends a small control frame; viewport reads and affected delta blocks carry content. Legacy baseline serialization borrows metadata. Framing is isolated per native process generation. |
-| Renderer | Native deltas locate stable anchors and fetch their replacement viewport while the old keyed DOM remains visible. Keyed DOM reconciliation retains rows, unchanged content cells, and existing SVG segments with their animation clocks. Animation reads positions in one phase and writes styles in another, only near the viewport. Graph width includes the rendered window's nodes and crossing edges. All lanes keep a 14.76px pitch and 4px node radius; dense graphs scroll horizontally with readable content instead of compressing their tracks. |
+| Renderer | Native deltas reconcile anchors and a bounded window in one request while the old keyed DOM remains visible. Native fingerprints validate reuse of decoded row content across revisions. The DOM mounts the viewport plus 16 rows per edge, independently of the 400-row data prefetch margin. Row responses commit once per animation frame; native control messages start requests immediately. Keyed reconciliation retains rows, unchanged content cells, and SVG segments with their animation clocks. Animation reads positions in one phase and writes styles in another. Graph width includes the mounted window's nodes and crossing edges. All lanes keep a 14.76px pitch and 4px node radius; dense graphs scroll horizontally with readable content instead of compressing their tracks. |
 
 Live presentation shows each current logical item and its details directly.
 The normal offline Activity view retains historical work-group contractions.
@@ -91,11 +91,36 @@ upsert are block-relative. Native pages use visible coordinates, with
 `native_expanded` carrying disclosure; only offset-zero pages carry expansion
 metadata. `LiveDelta.visible_total` supplies the new visible rank space.
 
+`OpenResponse.live.reconcile_rows` negotiates conditional native windows. A
+`ReconcileRows` request names the revision, ordered fallback anchors, selection
+and focus keys, a bounded window, and known row identity/fingerprint pairs. Its
+response atomically supplies current anchor locations and contiguous rows. The
+service hashes each complete decorated row, including source identity, disclosure
+and graph geometry; unchanged content is omitted only on an exact fingerprint
+match. The renderer retires coordinates on every revision but retains decoded
+content for this validation. Retired and current rows share the existing 2,000-row
+and 16 MiB budgets. The service still reads, decorates and hashes the bounded
+window; this does not introduce a native cache of final row fingerprints. Older
+services retain the `LocateRows`/`GetWindow` path.
+
+The browser reduces messages in order, with at most 64 messages per pass. Native
+revision controls run in a microtask to start requests promptly. Row responses
+coalesce to the final window for an animation frame, with a 50 ms fallback when
+the webview is hidden. Obsolete requests are dropped before sending, and a
+superseded response cannot render retired coordinates. Acknowledgements follow
+the DOM commit; animation completion never gates publication. Direct input runs
+immediately. The data cache prefetches independently of mounted DOM rows, with
+both margins reduced when a large viewport approaches the cache's hard limit.
+
 `SyncLive` is an extension-host capability. The webview's read-only request
 allowlist does not permit provider capture or helper execution. The host waits
 for the first saved viewport before starting capture, and for `liveSettled`
 before advancing each applied cursor. Task toggles and search-induced disclosure
-share the publication queue; page/anchor reads remain available to finish it. Duplicate revisions are
+take priority over queued background publications; the active transaction still
+finishes first. Every queued toggle retains its order. Native chevrons show
+pending feedback immediately and target the displayed stable identity even
+during a coordinate handoff. Page/anchor reads remain available to finish the
+active publication. Duplicate revisions are
 acknowledged without reanimation; old window responses cannot overwrite newer
 state. The journal retains up to 32 revisions or 16 MiB, retaining at least one
 revision. Missing replay, renderer recreation, rejected topology or invalidated
@@ -147,6 +172,12 @@ logical state versus full replay, AVL coordinates versus a sorted oracle,
 revision replay and gaps, search after append, exact ancestry, viewport anchors,
 selection, DOM reuse and reduced motion.
 
+The [renderer update benchmark](renderer-update-performance.md) separates
+frontend work from native capture/checkpoint latency. Browser regressions cover
+burst coalescing, zero visible-row mutations for offscreen changes, graph-width
+stability, superseded responses, rapid animation retargeting, and repeated
+disclosure clicks while replacement coordinates are pending.
+
 Graph regression tests compare bootstrap node lanes, straight segments, bends
 and muted geometry against the established Activity layout for forks, merges,
 concurrent sessions and shared Git anchors. Warm updates cover lane retention,
@@ -172,9 +203,12 @@ when their endpoints are outside the window. Large-history observation waits
 for the initial delta to finish rendering before capturing nodes for reuse.
 
 New visible connections grow from the parent attachment toward the new endpoint.
-After the 360 ms row movement, connected SVG segments draw in sequence across
-row boundaries over 520 ms. Independent branches run in parallel; nodes appear
-as the connection reaches them. Unchanged segments stay mounted, including when
+The 160 ms row movement and 240 ms connection growth start together. Connected
+SVG segments draw in sequence across row boundaries; independent branches run
+in parallel. Nodes finish appearing within another 80 ms. User disclosure uses
+only the row movement and shows revealed connections immediately. Graph width
+can grow immediately, but does not shrink while replacement prefetch rows are
+missing. Unchanged headers, rows, and segments stay mounted, including when
 row text is revised during an animation. Reduced motion renders the final
 geometry immediately. The browser checks +1 forks and merges, intermediate
 stroke lengths, preserved animation objects during revisions, duplicate replay,

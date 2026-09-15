@@ -3,7 +3,9 @@
 
 use std::collections::{BTreeSet, HashSet};
 
-use editchain_protocol::{LocateRowsRequest, LocateRowsResponse, RowLocation};
+use editchain_protocol::{
+    LocateRowsRequest, LocateRowsResponse, ReconcileRowsRequest, RowLocation,
+};
 
 use super::{
     get_window, host, DomOp, ExpandedRow, FindCounterState, HistoryAppState, OpenResponse,
@@ -108,17 +110,45 @@ impl LiveUpdate {
 }
 
 impl HistoryAppState {
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub(crate) fn live_window_pending(&self) -> bool {
+        self.live.is_some()
+    }
+
     pub(super) fn locate_remote_anchors(&mut self, step: &mut Step) {
+        let reconcile = self.reconciles_rows();
         let Some(live) = &mut self.live else {
             return;
         };
         live.stage = Stage::Locating;
         live.locations.clear();
         live.viewport = None;
-        let request = RequestBody::LocateRows(LocateRowsRequest {
-            snapshot_id: self.snapshot_id.clone(),
-            keys: live.keys(),
-        });
+        let request = if reconcile {
+            let viewport = live.previous_viewport;
+            RequestBody::ReconcileRows(ReconcileRowsRequest {
+                snapshot_id: self.snapshot_id.clone(),
+                keys: live.keys(),
+                anchors: live.anchors.clone(),
+                offset: u64::try_from(Self::viewport_visible_top(&viewport)).unwrap_or(0),
+                before: u16::try_from(super::RENDER_BUFFER).unwrap_or(16),
+                limit: u16::try_from(
+                    viewport
+                        .client_height
+                        .get()
+                        .saturating_div(ROW_H)
+                        .saturating_add(2)
+                        .saturating_add(super::RENDER_BUFFER.saturating_mul(2)),
+                )
+                .unwrap_or(1000)
+                .min(1000),
+                known: self.cache.known_rows(),
+            })
+        } else {
+            RequestBody::LocateRows(LocateRowsRequest {
+                snapshot_id: self.snapshot_id.clone(),
+                keys: live.keys(),
+            })
+        };
         let _issued = self.issue_request(&request, None, step);
     }
     pub(super) fn pause_live(&mut self, viewport: &Viewport, step: &mut Step) {
@@ -324,7 +354,6 @@ impl HistoryAppState {
         self.render_top = top;
         self.render_bottom = bottom;
         self.phase = SnapshotPhase::LayoutReady;
-        step.ops.push(DomOp::RefreshHeader);
         if self.total == Some(0) {
             Self::show_view_message(step, "No history found in this workspace", false);
         } else {
@@ -332,8 +361,10 @@ impl HistoryAppState {
                 top,
                 bottom,
                 scroll_top: viewport.scroll_top.get(),
+                animate_connections: self.animate_connections,
             });
         }
+        self.animate_connections = true;
         step.ops.push(DomOp::ProgressiveLoader(true));
         step.save_state = Some(Self::persisted_state(&viewport));
         self.report_live_viewport(&viewport, step);

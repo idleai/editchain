@@ -143,6 +143,9 @@ pub struct LiveBlock {
 /// One-time live topology bootstrap; row content remains paged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveBaseline {
+    /// Supports conditional windows and atomic anchor lookup.
+    #[serde(default)]
+    pub reconcile_rows: bool,
     /// Native visible coordinates; the baseline carries no global topology.
     #[serde(default)]
     pub paged: bool,

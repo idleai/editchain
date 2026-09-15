@@ -935,6 +935,12 @@ pub(super) fn collapsed_import_kind(op: &Op, children: Option<&Vec<&Op>>) -> Str
                 _ => {}
             }
         }
+        if children
+            .iter()
+            .any(|child| matches!(child.kind, OpKind::File(_)))
+        {
+            return "file".to_string();
+        }
     }
     match &op.kind {
         OpKind::Import(import) => match &import.raw_ref {

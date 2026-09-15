@@ -778,20 +778,31 @@ pub(crate) fn col_style(
         }
         parts.push(format!("--{}-w:{}px", col.as_str(), widths.width(col)));
     }
-    if graph_width_css > graph_width_budget(window_inner_width, window_inner_width) {
-        let date = if hidden.contains(&ColKey::Date) {
-            0.0
-        } else {
-            widths.width(ColKey::Date)
-        };
-        let minimum = graph_width_css
-            + widths.width(ColKey::Activity)
-            + widths.width(ColKey::Tags)
-            + date
-            + widths.content.unwrap_or(MIN_CONTENT_W);
-        parts.push(format!("min-width:{}px", round2(minimum)));
-    }
     parts.join(";")
+}
+
+/// Overflow extent, animated alongside the graph track on the shared scroll
+/// root. Start at the viewport width so crossing into overflow stays continuous.
+pub(crate) fn table_min_width(
+    graph_width: f64,
+    viewport_width: f64,
+    window_width: f64,
+    widths: &ColWidths,
+) -> f64 {
+    if graph_width <= graph_width_budget(window_width, window_width) {
+        return viewport_width;
+    }
+    let date = if hidden_columns(window_width).contains(&ColKey::Date) {
+        0.0
+    } else {
+        widths.width(ColKey::Date)
+    };
+    let minimum = graph_width
+        + widths.width(ColKey::Activity)
+        + widths.width(ColKey::Tags)
+        + date
+        + widths.content.unwrap_or(MIN_CONTENT_W);
+    round2(minimum).max(viewport_width)
 }
 
 // ---------------------------------------------------------------------------
@@ -1074,7 +1085,38 @@ mod web {
             Ok(())
         }
 
-        pub(crate) fn capture_live_rows(&self) -> Result<LiveRows, JsValue> {
+        pub(crate) fn disclosure_pending(
+            &self,
+            key: &str,
+            selector: &str,
+            pending: bool,
+        ) -> Result<(), JsValue> {
+            let rows = self.rows.query_selector_all(".row[data-continuity]")?;
+            for index in 0..rows.length() {
+                let Some(row) = rows
+                    .item(index)
+                    .and_then(|row| row.dyn_into::<web_sys::Element>().ok())
+                else {
+                    continue;
+                };
+                if row.get_attribute("data-continuity").as_deref() != Some(key) {
+                    continue;
+                }
+                let button = row.query_selector(selector)?;
+                if let Some(button) = button {
+                    let value = if pending { "true" } else { "false" };
+                    if button.get_attribute("aria-busy").as_deref() != Some(value) {
+                        button.set_attribute("aria-busy", value)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        pub(crate) fn capture_live_rows(
+            &self,
+            animate_connections: bool,
+        ) -> Result<LiveRows, JsValue> {
             let rows = self.rows.query_selector_all(".row[data-continuity]")?;
             let mut before = std::collections::HashMap::new();
             for index in 0..rows.length() {
@@ -1095,11 +1137,19 @@ mod web {
             }
             Ok(LiveRows {
                 rows: before,
-                graph: super::graph_motion::capture(&self.rows)?,
+                graph: if animate_connections {
+                    super::graph_motion::capture(&self.rows)?
+                } else {
+                    super::graph_motion::Capture::new()
+                },
             })
         }
 
-        pub(crate) fn animate_live_rows(&self, before: &LiveRows) -> Result<(), JsValue> {
+        pub(crate) fn animate_live_rows(
+            &self,
+            before: &LiveRows,
+            animate_connections: bool,
+        ) -> Result<(), JsValue> {
             let rows = self.rows.query_selector_all(".row[data-continuity]")?;
             let viewport = self.rows.get_bounding_client_rect();
             let top = f64_round_to_i64(viewport.top()).saturating_sub(ROW_H);
@@ -1131,7 +1181,9 @@ mod web {
             }
             // Read every position before changing animation styles. Interleaved
             // reads/writes forced a layout for every row in the overscan window.
-            super::graph_motion::animate(&self.rows, &before.graph)?;
+            if animate_connections {
+                super::graph_motion::animate(&self.rows, &before.graph)?;
+            }
             for (row, offset, changed) in frames {
                 if offset != 0 {
                     row.style()
@@ -1185,6 +1237,31 @@ mod web {
         /// The scroll container element.
         pub(crate) fn rows(&self) -> web_sys::HtmlDivElement {
             self.rows.clone()
+        }
+
+        /// One inherited animated value keeps retained rows, newly mounted rows,
+        /// and rebuilt headers on the same clock. No renderer work per frame.
+        pub(crate) fn set_column_widths(
+            &self,
+            graph: f64,
+            minimum: f64,
+            animate: bool,
+        ) -> Result<(), JsValue> {
+            self.rows
+                .set_attribute("data-animate-width", if animate { "true" } else { "false" })?;
+            let style = self.rows.style();
+            style.set_property("--graph-display-width", &format!("{graph}px"))?;
+            style.set_property("--table-display-width", &format!("{minimum}px"))
+        }
+
+        /// A graph drag takes over both interpolated widths without rebuilding
+        /// the header under the pointer or snapping to the animation's target.
+        pub(crate) fn freeze_graph_width(&self, graph: f64) -> Result<(), JsValue> {
+            let minimum = self.rows.query_selector(".tbl-header")?.map_or_else(
+                || f64::from(self.rows.client_width()),
+                |header| header.get_bounding_client_rect().width(),
+            );
+            self.set_column_widths(graph, minimum, false)
         }
 
         /// The current scroll viewport (CSS px).
@@ -1538,14 +1615,9 @@ mod web {
             let document = Self::document()?;
             wrap.set_attribute("style", col_style)?;
             if let Some(header) = self.rows.query_selector(".tbl-header")? {
-                let replacement =
-                    build_header(self, &document, col_style, options.graph_width_css)?;
-                drop(
-                    self.rows
-                        .query_selector(".tbl-grid")?
-                        .map(|grid| grid.replace_child(&replacement, &header))
-                        .transpose()?,
-                );
+                if header.get_attribute("style").as_deref() != Some(col_style) {
+                    self.refresh_header(col_style, options.graph_width_css)?;
+                }
             }
             let mut existing = std::collections::HashMap::new();
             let rows = wrap.query_selector_all(".row")?;
@@ -1618,6 +1690,12 @@ mod web {
                 || previous
                     .as_ref()
                     .is_none_or(|previous| previous.graph != spec.graph);
+            if !graph_changed
+                && previous.as_ref() == Some(spec)
+                && row.get_attribute("style").as_deref() == Some(col_style)
+            {
+                return Ok(());
+            }
             let same_content = previous.is_some_and(|mut previous| {
                 previous.identity.abs_index = spec.identity.abs_index;
                 previous.graph.clone_from(&spec.graph);
@@ -1982,7 +2060,7 @@ mod web {
         }
 
         /// The rendered header cell's on-screen width for a column (the drag
-        /// start position for non-graph columns, production `currentColumnWidth`).
+        /// start position, including an interrupted graph width animation).
         pub(crate) fn header_cell_width(&self, col: ColKey) -> f64 {
             let selector = format!(".tbl-header .th.{}", col.as_str());
             self.rows
@@ -1990,7 +2068,7 @@ mod web {
                 .ok()
                 .flatten()
                 .and_then(|cell| cell.dyn_into::<web_sys::HtmlElement>().ok())
-                .map_or(0.0, |cell| f64::from(cell.offset_width()))
+                .map_or(0.0, |cell| cell.get_bounding_client_rect().width())
         }
 
         /// `graphLabelMinW` — measure the narrowest graph column that renders
@@ -2032,11 +2110,15 @@ mod web {
             &self,
             window_inner_width: f64,
         ) -> Result<(), JsValue> {
-            let Some(wrap) = self.wrap() else {
+            let Some(header) = self.rows.query_selector(".tbl-header")? else {
                 return Ok(());
             };
+            let width = window_inner_width.to_string();
+            if header.get_attribute("data-resize-width").as_deref() == Some(width.as_str()) {
+                return Ok(());
+            }
             let document = Self::document()?;
-            let list = wrap
+            let list = header
                 .query_selector_all(".col-resize-handle")
                 .map_err(js_err_from)?;
             for index in 0..list.length() {
@@ -2048,13 +2130,7 @@ mod web {
                     handle.remove();
                 }
             }
-            let Some(header) = self
-                .rows
-                .query_selector(".tbl-header")
-                .map_err(js_err_from)?
-            else {
-                return Ok(());
-            };
+            header.set_attribute("data-resize-width", &width)?;
             let hidden = super::hidden_columns(window_inner_width);
             let mut columns = vec![
                 ColKey::Graph,
@@ -2065,16 +2141,7 @@ mod web {
             if !hidden.contains(&ColKey::Date) {
                 columns.push(ColKey::Date);
             }
-            let header_width = f64::from(header.client_width());
-            for col in columns {
-                let selector = format!(".th.{}", col.as_str());
-                let Some(cell) = header.query_selector(&selector).map_err(js_err_from)? else {
-                    continue;
-                };
-                let Some(cell) = cell.dyn_into::<web_sys::HtmlElement>().ok() else {
-                    continue;
-                };
-                let boundary = f64::from(cell.offset_left()) + f64::from(cell.offset_width());
+            for (index, col) in columns.iter().enumerate() {
                 let handle: web_sys::HtmlDivElement = document
                     .create_element("div")?
                     .dyn_into()
@@ -2083,8 +2150,15 @@ mod web {
                 handle.set_attribute("data-col", col.as_str())?;
                 handle
                     .set_attribute("title", &format!("Drag to resize {} column", col.as_str()))?;
-                let left = (boundary - 3.0).min((header_width - 6.0).max(0.0));
-                handle.style().set_property("left", &format!("{left}px"))?;
+                // An absolute grid item follows its track during width animation
+                // without measuring or repositioning the divider every frame.
+                handle.style().set_property(
+                    "grid-column",
+                    &format!("{} / span 1", index.saturating_add(1)),
+                )?;
+                if index.saturating_add(1) == columns.len() {
+                    handle.style().set_property("right", "0px")?;
+                }
                 drop(header.append_child(&handle).map_err(js_err_from)?);
             }
             Ok(())
@@ -2806,8 +2880,14 @@ mod tests {
         let layout = graph_layout(34, panel_width, panel_width);
         assert!((layout.lane_width - 14.76).abs() < 1e-9);
         assert!(
-            col_style(layout.column_width, panel_width, &ColWidths::default())
-                .contains("min-width:1119.36px")
+            (table_min_width(
+                layout.column_width,
+                panel_width,
+                panel_width,
+                &ColWidths::default()
+            ) - 1119.36)
+                .abs()
+                < 1e-9
         );
     }
 

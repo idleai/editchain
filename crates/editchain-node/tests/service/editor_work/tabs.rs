@@ -189,14 +189,15 @@ fn tabs_reads_and_edits_share_a_connected_human_series_beside_agent_work() {
             .iter()
             .find(|row| row["node_key"] == agent_id.to_string())
             .expect("agent row");
-        assert!(
-            agent_row["file_change"].is_null(),
-            "{mode}: agent disclosure is unchanged"
+        assert_eq!(agent_row["kind"], "file", "{mode}: single agent change");
+        assert_eq!(agent_row["file_change"]["source"], "agent", "{mode}");
+        assert_eq!(agent_row["sub_ops"], json!([]), "{mode}: no import wrapper");
+        let diff = live_request(
+            &mut history,
+            json!({"GetFileDiff":{"snapshot_id":snapshot,"change":agent_row["file_change"]}}),
         );
-        assert!(!agent_row["sub_ops"]
-            .as_array()
-            .expect("agent details")
-            .is_empty());
+        assert_eq!(diff["before"], "base\n");
+        assert_eq!(diff["after"], "base\nAI\n");
         assert!(rows.iter().all(|row| row["kind"] != "exposure"));
     }
     assert_eq!(live_request(&mut Server::new(), request)["replayed"], 10);

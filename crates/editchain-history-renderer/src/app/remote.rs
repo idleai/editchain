@@ -5,6 +5,7 @@ use editchain_protocol::{ErrorCode, LiveBaseline, LiveUpdate, ServiceError, Snap
 
 #[derive(Debug, Clone)]
 pub(in crate::app) struct Remote {
+    pub(super) reconcile_rows: bool,
     epoch: SnapshotId,
     revision: u64,
     pending_find: Option<editchain_protocol::FindInHistoryResponse>,
@@ -56,6 +57,7 @@ impl HistoryAppState {
             i64::try_from(baseline.total).map_err(|_overflow| invalid("Live total overflow."))?;
         self.expansion = Some(ExpansionIndex::from_metadata(total, None, Some(&[]))?);
         self.remote = Some(Remote {
+            reconcile_rows: baseline.reconcile_rows,
             epoch: baseline.epoch.clone(),
             revision: baseline.revision,
             pending_find: None,
@@ -162,7 +164,11 @@ impl HistoryAppState {
         self.snapshot_id.clone_from(&delta.snapshot_id);
         self.view_gen = self.view_gen.saturating_add(1);
         self.requests.clear();
-        self.cache.clear();
+        if self.reconciles_rows() {
+            self.cache.retire_coordinates();
+        } else {
+            self.cache.clear();
+        }
         self.total = Some(total);
         self.expansion = Some(index);
         self.phase = SnapshotPhase::Opening;

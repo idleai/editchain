@@ -42,6 +42,9 @@ impl Default for RequestRegistry {
 }
 
 impl RequestRegistry {
+    pub(super) fn contains(&self, id: u64) -> bool {
+        self.in_flight.contains_key(&id)
+    }
     pub(super) fn register(
         &mut self,
         body: &RequestBody,
@@ -49,7 +52,10 @@ impl RequestRegistry {
         search_epoch: Option<u64>,
     ) -> Result<(u64, Send), ServiceError> {
         body.validate()?;
-        let is_window = matches!(body, RequestBody::GetWindow(_));
+        let is_window = matches!(
+            body,
+            RequestBody::GetWindow(_) | RequestBody::ReconcileRows(_)
+        );
         if is_window && self.window.is_some() {
             return Err(invalid("A history window is already in flight."));
         }

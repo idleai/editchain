@@ -33,20 +33,37 @@ use super::selection::SelectionState;
 
 #[path = "delta.rs"]
 mod delta;
+#[cfg(any(target_arch = "wasm32", test))]
+#[path = "frame.rs"]
+mod frame;
 #[path = "live.rs"]
 mod live;
 #[cfg(test)]
 #[path = "live_tests.rs"]
 mod live_tests;
+#[path = "reconcile.rs"]
+mod reconcile;
 #[path = "remote.rs"]
 mod remote;
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) use frame::FrameBatch;
 
 /// Rows fetched per request (`PAGE`).
 pub(crate) const PAGE: i64 = 500;
-/// Rows kept rendered past each edge of the viewport (`BUFFER`).
+/// Rows prefetched past each edge of the viewport (`BUFFER`).
 pub(crate) const BUFFER: i64 = 400;
+/// Mounted rows remain small while the data cache prefetches independently.
+pub(crate) const RENDER_BUFFER: i64 = 16;
 /// Distinct visible match limit for find-in-chain (`FIND_TOP_K`).
 pub(crate) const FIND_TOP_K: i64 = 50;
+
+#[derive(Clone, Copy)]
+pub(super) enum WindowPass {
+    Content,
+    Layout,
+    Hydrating,
+}
+
 /// Viewport measurements the renderer observes (CSS pixels).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Viewport {
@@ -67,11 +84,18 @@ impl Viewport {
 /// node mutation; the state machine owns the index/pixel decisions.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DomOp {
+    /// Immediate feedback while a native disclosure action is queued or running.
+    DisclosurePending {
+        key: String,
+        task: bool,
+        pending: bool,
+    },
     /// Atomically replace a live viewport, restore its anchor, and animate keyed rows.
     ReanchorLive {
         top: i64,
         bottom: i64,
         scroll_top: i64,
+        animate_connections: bool,
     },
     /// Replace `#rows` with a full-pane message.
     ShowMessage { text: String, error: bool },
@@ -80,6 +104,8 @@ pub(crate) enum DomOp {
     ShowRequestError { text: String, retry: RetryAction },
     /// Rebuild the whole rendered window `[top, bottom]` (visible indices).
     Reanchor { top: i64, bottom: i64 },
+    /// Reconcile the final window once after a batch of host messages.
+    PatchWindow { top: i64, bottom: i64 },
     /// Append contiguous visible rows `[from, to]` below the window.
     AppendBelow { from: i64, to: i64 },
     /// Prepend contiguous visible rows `[from, to]` above the window.
@@ -189,6 +215,8 @@ pub(crate) struct HistoryAppState {
     pub(super) selection: SelectionState,
     pub(super) find: FindSession,
     pub(super) live: Option<live::LiveUpdate>,
+    pub(super) animate_connections: bool,
+    pub(crate) pending_disclosures: std::collections::BTreeMap<(String, bool), u32>,
     pub(super) remote: Option<remote::Remote>,
     pub(super) expanded_keys: std::collections::BTreeSet<String>,
 }
@@ -213,6 +241,8 @@ impl Default for HistoryAppState {
             selection: SelectionState::default(),
             find: FindSession::default(),
             live: None,
+            animate_connections: true,
+            pending_disclosures: std::collections::BTreeMap::new(),
             remote: None,
             expanded_keys: std::collections::BTreeSet::new(),
         }
@@ -223,6 +253,7 @@ impl HistoryAppState {
     // --- expansion mapping ---------------------------------------------------
 
     fn clear_expansion_state(&mut self) {
+        self.pending_disclosures.clear();
         self.expansion = None;
         self.remote = None;
         self.expanded_keys.clear();
@@ -309,12 +340,7 @@ impl HistoryAppState {
             return;
         }
         if self.remote.is_some() {
-            if let Some(row) = self.cache.get_by_index(abs_parent_row) {
-                step.sends.push(Send::ToggleDisclosure {
-                    task: false,
-                    key: row.continuity_key().to_owned(),
-                });
-            }
+            self.request_disclosure(abs_parent_row, false, step);
             return;
         }
         if !self.toggle_expanded(abs_parent_row) {
@@ -325,12 +351,7 @@ impl HistoryAppState {
 
     pub(crate) fn toggle_task_ui(&mut self, abs: i64, viewport: &Viewport, step: &mut Step) {
         if self.remote.is_some() {
-            if let Some(row) = self.cache.get_by_index(abs) {
-                step.sends.push(Send::ToggleDisclosure {
-                    key: row.continuity_key().to_owned(),
-                    task: true,
-                });
-            }
+            self.request_disclosure(abs, true, step);
             return;
         }
         let changed = ExpandedRow::new(abs).is_some_and(|row| {
@@ -360,6 +381,7 @@ impl HistoryAppState {
                 top,
                 bottom,
                 scroll_top: viewport.scroll_top.get(),
+                animate_connections: false,
             });
         } else {
             step.ops.push(DomOp::Reanchor { top, bottom });
@@ -389,7 +411,7 @@ impl HistoryAppState {
     /// The absolute index range we want cached: viewport ± BUFFER in visible
     /// space mapped to absolute slots.
     pub(crate) fn desired_cache_range(&self, viewport: &Viewport) -> (i64, i64) {
-        let (v_top, v_bottom) = self.desired_visible_range(viewport);
+        let (v_top, v_bottom) = self.visible_range_with_buffer(viewport, BUFFER);
         let top_abs = self.abs_index_for_visible(v_top);
         let bottom_abs = self.abs_index_for_visible(v_bottom);
         (
@@ -400,13 +422,22 @@ impl HistoryAppState {
 
     /// The visible index range we want rendered.
     pub(crate) fn desired_visible_range(&self, viewport: &Viewport) -> (i64, i64) {
-        let top = Self::viewport_visible_top(viewport)
-            .saturating_sub(BUFFER)
-            .max(0);
+        self.visible_range_with_buffer(viewport, RENDER_BUFFER)
+    }
+
+    fn visible_range_with_buffer(&self, viewport: &Viewport, buffer: i64) -> (i64, i64) {
         let capacity = i64::try_from(MAX_CACHED_ROWS).unwrap_or(i64::MAX);
+        let visible = self
+            .viewport_visible_bottom(viewport)
+            .saturating_sub(Self::viewport_visible_top(viewport))
+            .saturating_add(1);
+        let buffer = buffer.min(capacity.saturating_sub(visible).max(0) / 2);
+        let top = Self::viewport_visible_top(viewport)
+            .saturating_sub(buffer)
+            .max(0);
         let bottom = self
             .viewport_visible_bottom(viewport)
-            .saturating_add(BUFFER)
+            .saturating_add(buffer)
             .min(self.visible_total().saturating_sub(1))
             .min(top.saturating_add(capacity).saturating_sub(1));
         (top, bottom)
@@ -414,11 +445,15 @@ impl HistoryAppState {
 
     // --- request issuing ---------------------------------------------------------
 
+    pub(crate) fn owns_request(&self, id: u64) -> bool {
+        self.requests.contains(id)
+    }
+
     /// Register an in-flight request, record the envelope, and push the
     /// correlated `Send`. Window requests also claim the pending-window slot
     /// BEFORE the send is emitted, so a synchronous fixture response (which
     /// arrives inside `postMessage`) correlates correctly.
-    fn issue_request(
+    pub(super) fn issue_request(
         &mut self,
         body: &RequestBody,
         search_epoch: Option<u64>,
@@ -426,7 +461,12 @@ impl HistoryAppState {
     ) -> Option<u64> {
         if self.snapshot_id.is_empty()
             || (self.live.is_some()
-                && !matches!(body, RequestBody::GetWindow(_) | RequestBody::LocateRows(_)))
+                && !matches!(
+                    body,
+                    RequestBody::GetWindow(_)
+                        | RequestBody::LocateRows(_)
+                        | RequestBody::ReconcileRows(_)
+                ))
         {
             return None;
         }
@@ -526,12 +566,24 @@ impl HistoryAppState {
         };
         let start = start.get();
         let limit = PAGE.min(range_bottom.saturating_sub(start).saturating_add(1));
-        let body = get_window(
-            &self.snapshot_id,
-            u64::try_from(start).unwrap_or(0),
-            u64::try_from(limit).unwrap_or(0),
-            self.layout_ready(),
-        );
+        let body = if self.reconciles_rows() {
+            RequestBody::ReconcileRows(editchain_protocol::ReconcileRowsRequest {
+                snapshot_id: self.snapshot_id.clone(),
+                keys: Vec::new(),
+                anchors: Vec::new(),
+                offset: u64::try_from(start).unwrap_or(0),
+                before: 0,
+                limit: u16::try_from(limit).unwrap_or(500),
+                known: self.cache.known_rows(),
+            })
+        } else {
+            get_window(
+                &self.snapshot_id,
+                u64::try_from(start).unwrap_or(0),
+                u64::try_from(limit).unwrap_or(0),
+                self.layout_ready(),
+            )
+        };
         let _: Option<u64> = self.issue_request(&body, None, step);
     }
 
@@ -1240,7 +1292,9 @@ impl HistoryAppState {
     ) {
         match msg.id {
             Id::Open => self.handle_open(msg.body, viewport, step),
-            Id::Delta => self.handle_delta(msg.body, viewport, step),
+            Id::Delta => self.handle_delta(msg.body, viewport, step, true),
+            Id::Disclosure => self.handle_delta(msg.body, viewport, step, false),
+            Id::DisclosureDone => self.disclosure_done(msg.body, step),
             Id::Updating => self.pause_live(viewport, step),
             Id::Update => self.handle_live_open(msg.body, viewport, step),
             Id::Reveal => self.handle_reveal(viewport, step),
@@ -1452,9 +1506,17 @@ impl HistoryAppState {
             Unwrapped::Err(error) => self.fail_response(&req.body, &error, step),
             Unwrapped::Ok(value) => match &req.body {
                 RequestBody::ToggleLive(_) | RequestBody::ViewportLive(_) => {
-                    self.handle_delta(Some(serde_json::json!({ "Ok": value })), viewport, step);
+                    self.handle_delta(
+                        Some(serde_json::json!({ "Ok": value })),
+                        viewport,
+                        step,
+                        !matches!(req.body, RequestBody::ToggleLive(_)),
+                    );
                 }
                 RequestBody::LocateRows(_) => self.handle_live_locations(value, step),
+                RequestBody::ReconcileRows(request) => {
+                    self.handle_reconciled_window(value, request, viewport, step);
+                }
                 RequestBody::GetWindow(request) => match host::decode::<HistoryWindow>(value) {
                     Ok(window) => {
                         if let Err(error) =
@@ -1526,7 +1588,12 @@ impl HistoryAppState {
         Ok(())
     }
 
-    fn fail_response(&mut self, request: &RequestBody, error: &ServiceError, step: &mut Step) {
+    pub(super) fn fail_response(
+        &mut self,
+        request: &RequestBody,
+        error: &ServiceError,
+        step: &mut Step,
+    ) {
         self.fail_live(&error.message, step);
         step.sends
             .push(Send::Log(format!("request error: {error}")));
@@ -1712,6 +1779,22 @@ impl HistoryAppState {
             self.apply_live_window(step);
             return;
         }
+        let pass = if hydrate {
+            WindowPass::Hydrating
+        } else if response_layout_ready && request.include_layout {
+            WindowPass::Layout
+        } else {
+            WindowPass::Content
+        };
+        self.finish_window_response(viewport, step, pass);
+    }
+
+    pub(super) fn finish_window_response(
+        &mut self,
+        viewport: &Viewport,
+        step: &mut Step,
+        pass: WindowPass,
+    ) {
         // Complete a pending find jump before eviction changes the viewport.
         let mut effective_viewport = *viewport;
         if let Some(target) = self.find.pending_target() {
@@ -1724,7 +1807,7 @@ impl HistoryAppState {
         if self.snapshot_id.is_empty() {
             return;
         }
-        if response_layout_ready && request.include_layout {
+        if matches!(pass, WindowPass::Layout) {
             step.ops.push(DomOp::Reanchor {
                 top: self.render_top,
                 bottom: self.render_bottom,
@@ -1771,7 +1854,7 @@ impl HistoryAppState {
         )));
         self.report_status(viewport, step);
         step.save_state = Some(Self::persisted_state(viewport));
-        if hydrate {
+        if matches!(pass, WindowPass::Hydrating) {
             return;
         }
         if let Some(target) = self.find.pending_target() {
@@ -2173,10 +2256,9 @@ mod tests {
         assert_eq!(state.total, Some(1200));
         assert!(!state.data_ready());
         // The scaffold is re-anchored immediately (placeholders fill in later):
-        // visible bottom (row 23 at 800px / ROW_H 34) + BUFFER 400 = 423,
-        // matching main.js `desiredVisibleRange()` at open.
+        // Visible bottom (row 23 at 800px / ROW_H 34) + mounted margin 16.
         assert_eq!(state.render_top, 0);
-        assert_eq!(state.render_bottom, 423);
+        assert_eq!(state.render_bottom, 39);
         // First fetch under the pre-layout view: offset 0, limited to the
         // desired cache range (visible bottom 23 + BUFFER 400 = 423 rows, so
         // limit 424 under a clientHeight of 800), with layout disabled.
@@ -2192,13 +2274,10 @@ mod tests {
         assert!(step
             .sends
             .contains(&Send::Log("open: 1200 nodes, 1 repos".to_owned())));
-        assert!(step.ops.iter().any(|op| matches!(
-            op,
-            DomOp::Reanchor {
-                top: 0,
-                bottom: 423
-            }
-        )));
+        assert!(step
+            .ops
+            .iter()
+            .any(|op| matches!(op, DomOp::Reanchor { top: 0, bottom: 39 })));
         assert!(step
             .ops
             .iter()
@@ -2595,8 +2674,8 @@ mod tests {
             Some(500),
             "the post-jump page is capped at PAGE"
         );
-        assert_eq!(state.render_top, 2095);
-        assert_eq!(state.render_bottom, 2906);
+        assert_eq!(state.render_top, 2479);
+        assert_eq!(state.render_bottom, 2522);
     }
 
     #[test]
@@ -3398,15 +3477,15 @@ mod tests {
         assert!(step.ops.iter().any(|op| matches!(
             op,
             DomOp::Reanchor {
-                top: 600,
-                bottom: 1423
+                top: 984,
+                bottom: 1039
             }
         )));
         assert_eq!(
-            state.render_top, 600,
-            "window re-anchors with BUFFER margins"
+            state.render_top, 984,
+            "window re-anchors with mounted margins"
         );
-        assert_eq!(state.render_bottom, 1423);
+        assert_eq!(state.render_bottom, 1039);
         assert_eq!(
             state.requests.pending_window(),
             None,
