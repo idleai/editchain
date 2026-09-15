@@ -25,8 +25,8 @@ committed locally using `astramax(f1/multiplayer):`.
 | --- | --- | --- |
 | 0. Architecture and execution contract | Source links and repository state checked | Complete |
 | 1. Durable replication kernel | Gap/conflict convergence, blob validation, scope and replay/restart tests; root lint | Complete |
-| 2. Authenticated native peers | Separate processes, pinned certificates, rejection before inventory, bounded IPC; root lint | In progress |
-| 3. Extension Host/Join and live relay | Real relay between separate native replicas, lifecycle and cleanup, UI commands and packaging tests; root lint | Pending |
+| 2. Authenticated native peers | Separate processes, pinned certificates, rejection before inventory, bounded IPC; root lint | Complete |
+| 3. Extension Host/Join and live relay | Real relay between separate native replicas, lifecycle and cleanup, UI commands and packaging tests; root lint | In progress |
 | 4. Reconnect, discovery and three peers | Offline catch-up, revocation, stale discovery, third-party forwarding; root lint | Pending |
 | 5. Full extension E2E | Actual VS Code history visibility, packaged build, final regression checks | Pending |
 
@@ -60,3 +60,27 @@ such; they are not evidence of a second network.
   Human attribution is explicitly unsigned and retained unchanged. Provider
   import streams use provider-owned source keys for portable identity. Peer
   authentication will identify a supplying device, not assert record authorship.
+- Checkpoint 2: added the dedicated `editchain-peer` executable. Device keys stay
+  in application-private local storage, outside replicated chains; Unix files are
+  mode 0600 in a mode 0700 directory. Rustls 0.23.45 and rcgen 0.14.10 implement
+  TLS 1.3 with mutual certificate validation, byte-exact pins and required ALPN.
+  Resumption and early data are disabled. Each local turn rechecks approval.
+  Twenty unit tests plus one real separate-process E2E test passed. Wrong client,
+  wrong server, wrong space, ciphertext tampering, raw history-RPC injection,
+  restart and live revocation were exercised. `./scripts/lint.sh` exited 0:
+  `RESULT: PASS`. The extension packaging checkpoint will ship both binaries.
+
+## Native peer interface
+
+`editchain-peer` reads local JSON frames with a four-byte little-endian length
+bounded to 512 KiB. Commands are `identity`, `configure`, `approve`, `revoke`,
+`devices`, `open`, `turn`, and `close`. One worker owns one peer connection.
+Network input is base64 inside `turn`, decoded with a 64 KiB bound, and passed
+only to TLS. A turn returns up to 256 KiB of opaque output plus public identity
+and durable progress. Errors expose fixed codes, not payloads or credentials.
+Use a new connection after a failed turn; durable inventories repair replay.
+
+The implementation uses the ordinary certificate verifiers and byte-stream
+APIs in [Rustls](https://docs.rs/rustls/latest/rustls/client/struct.ClientConnection.html),
+including its [mandatory client certificate verifier](https://docs.rs/rustls/latest/rustls/server/struct.WebPkiClientVerifier.html).
+It does not implement a custom signature or certificate-verification algorithm.

@@ -22,6 +22,7 @@ macro_rules! check_eq {
     };
 }
 
+mod secure_tests;
 mod session_tests;
 
 use std::io;

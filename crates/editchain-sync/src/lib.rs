@@ -4,12 +4,20 @@
 //! authentication must finish before its replication protocol is exposed.
 
 mod content;
+mod identity;
+mod ipc;
+mod membership;
 mod replica;
+mod secure;
 mod session;
 mod transfer;
 mod wire;
 
+pub use identity::{DeviceIdentity, PublicDevice};
+pub use ipc::{run_worker, MAX_CONTROL_BYTES};
+pub use membership::{Membership, MAX_DEVICES};
 pub use replica::{RecordKey, Replica, Snapshot};
+pub use secure::{SecurePeer, MAX_BRIDGE_BYTES, MAX_BRIDGE_OUTPUT};
 pub use session::{Progress, Session};
 pub use wire::{decode_message, encode_message, FrameDecoder, Message};
 

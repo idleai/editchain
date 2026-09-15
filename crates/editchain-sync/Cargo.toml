@@ -19,7 +19,9 @@ blake3 = "1"
 serde.workspace = true
 serde_json.workspace = true
 postcard.workspace = true
+base64 = "0.22"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 
 [dev-dependencies]
 tempfile = "3"
-
