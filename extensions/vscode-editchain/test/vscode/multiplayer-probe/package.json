@@ -1,0 +1,10 @@
+{
+  "name": "editchain-multiplayer-probe",
+  "publisher": "ambientlight",
+  "version": "0.0.1",
+  "private": true,
+  "engines": { "vscode": "^1.85.0" },
+  "main": "./extension.js",
+  "activationEvents": ["onStartupFinished", "onAuthenticationRequest:github"],
+  "contributes": { "authentication": [{ "id": "github", "label": "GitHub relay test fixture" }] }
+}

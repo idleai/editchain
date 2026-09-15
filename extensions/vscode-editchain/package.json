@@ -141,6 +141,8 @@
   "scripts": {
     "build:native": "node scripts/build-native.mjs",
     "test:multiplayer:relay": "node scripts/multiplayer-relay-e2e.cjs",
+    "ui:vscode:multiplayer": "node scripts/multiplayer-vscode-e2e.cjs",
+    "test:multiplayer:types": "tsc -p test/vscode/tsconfig.multiplayer.json && node --check test/vscode/multiplayer-probe/extension.js && node --check scripts/multiplayer-vscode-e2e.cjs",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "package": "vsce package",

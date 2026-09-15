@@ -110,6 +110,28 @@ This check identifies itself as a same-machine test. A second network remains
 a separate observation. See [implementation checkpoints](../../docs/multiplayer-implementation.md)
 for current validation and remaining work.
 
+For the packaged two-window UI test, build and package from this directory:
+
+```sh
+npm run build:native
+npm run build:renderer
+npm run compile
+npx vsce package --out ../../outputs/editchain-history-multiplayer.vsix
+npm run ui:vscode:multiplayer
+```
+
+The Linux harness needs Xvfb, unzip, Python 3 and a signed-in GitHub CLI. It
+installs that VSIX into two temporary profiles, drives Host/Join approval and
+actual typing, verifies remote History rows and exact native diffs, restarts the
+host, and deletes its temporary tunnels. A test-only authentication provider
+uses the CLI credential inside those isolated profiles. The provider and
+automation bridge are excluded from the VSIX. This tests one account/machine;
+it does not replace the different-account/network check or the built-in GitHub
+sign-in spike. Screenshots and results are under `trace/multiplayer/`. The runner
+checks its logs for credential material and removes its private fixture files.
+Set `EDITCHAIN_MULTIPLAYER_UI_VSIX` or `EDITCHAIN_MULTIPLAYER_UI_VERSION` to test
+another package or VS Code release; the default release is 1.132.0.
+
 ## Human work on AI-generated code
 
 Human-work tracking starts automatically in trusted local workspace folders,

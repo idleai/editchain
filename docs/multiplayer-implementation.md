@@ -109,6 +109,17 @@ such; they are not evidence of a second network.
   rerun passed without exclusions or changes to that test. `./scripts/lint.sh`
   exited 0: `RESULT: PASS`. Directory HTTP behavior is tested through controlled
   API responses; no real repository variable has been written during this work.
+- Checkpoint 5a: the VSIX passed the two-window UI E2E in VS Code 1.132.0.
+  Both instances loaded the package from separate profile installations, used
+  the real approval dialogs and captured actual typing. Both remote History rows
+  opened exact native before/after diffs without changing receiving working
+  files. The host process restarted with its profile and chain; another guest
+  edit arrived without a new invitation. The run took 111 seconds, including
+  recovery from the previous window's ownership lease. Both test cases passed,
+  tunnel cleanup completed, and the artifact audit found no credentials in logs.
+  The test-only GitHub provider used the CLI account; it is not shipped.
+  `./scripts/lint.sh` exited 0: `RESULT: PASS`. Final review is checking the
+  avoidable lease delay following an abrupt application exit.
 
 ## Native peer interface
 
