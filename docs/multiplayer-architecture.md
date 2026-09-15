@@ -1,8 +1,9 @@
 # Multiplayer architecture sketch
 
-**Status:** Architecture accepted for implementation. Initially sketched on
-September 14, 2026 from `92be7c9` and the successful VS Code spike. See the
-[implementation log](multiplayer-implementation.md) for tested checkpoints.
+**Status:** Implemented through the packaged two-window VS Code E2E. Initially
+sketched on September 14, 2026 from `92be7c9` and the successful VS Code spike.
+See the [implementation log](multiplayer-implementation.md) for checkpoint
+evidence and remaining validation across accounts and networks.
 
 ## 1. What the spike establishes
 
@@ -13,11 +14,12 @@ exchanged 17,024 bytes each way, and deleted the tunnel. Setup took 2,211 ms;
 previous pending marker. These are smoke-test observations from one extension
 host, rather than a latency target for other networks.
 
-This is enough to design around the Dev Tunnels adapter. Separate machines,
-different accounts, peer enrollment, sustained transfer, and durable history
-replication remain to be tested. The spike's host-key and SSH-session comparison
-benefits from having both endpoints in one process; remote peers need their own
-trust establishment.
+This established the Dev Tunnels adapter's feasibility. The implementation now
+tests peer enrollment, sustained transfer and durable replication in independent
+processes and two VS Code instances. Separate machines and different accounts
+still need validation. The spike's host-key and SSH-session comparison benefits
+from having both endpoints in one process; remote peers use the device trust
+establishment described below.
 
 ## 2. Product boundary
 
@@ -57,8 +59,8 @@ flowchart LR
 
 | Component | Responsibility and starting point |
 | --- | --- |
-| Extension session manager | GitHub session lifecycle, start/join/leave, tunnel cleanup and retries; grow from [the spike](../extensions/vscode-editchain/src/devTunnels/spike.ts). |
-| Discovery adapter | Resolve candidate endpoints through invitations initially; add repository advertisements independently of replication. |
+| Extension session manager | GitHub session lifecycle, start/join/leave, tunnel cleanup and retries in [the manager](../extensions/vscode-editchain/src/multiplayer/manager.ts). |
+| Discovery adapter | Resolve candidate endpoints through invitations and optional repository advertisements independently of replication. |
 | Rust peer admission | Authenticate a device and authorize its collaboration space before exposing inventory. |
 | `editchain-sync` crate | Transport-independent protocol, inventory comparison, transfer scheduling and reconnect repair, plus the dedicated `editchain-peer` native worker. |
 | Rust node integration | Dedicated peer handlers and serialized durable writes, reusing [storage](../crates/editchain-store/src/lib.rs) and [admission](../crates/editchain-core/src/admission.rs). |
@@ -163,12 +165,13 @@ explicitly missing; fetching dependencies must not expand sharing implicitly.
 Receive → validate encoding, bounds and scope → classify exact evidence →
 persist new records → acknowledge → notify the local projection.
 
-Reuse the writer lock and durable page append behavior in
+The implementation reuses the writer lock and durable page append behavior in
 [SegmentStore](../crates/editchain-store/src/segment.rs), with short serialized
-transactions coordinated with editor capture and provider imports. The existing
-[import writer](../crates/editchain-node/src/commands/import/persistence.rs) shows
-admission and durable append, but its decoded-operation interface needs an
-explicit exact-byte path for replicated evidence.
+transactions coordinated with editor capture and provider imports through the
+same bounded writer-acquisition helper. The peer's exact-byte ingestion path
+preserves immutable received evidence. The editor recorder skips normalization
+of that received source evidence, preventing duplicate local derivations while
+still admitting independently captured work.
 
 Operations and blobs have separate completion states. A record can be durable
 while its content is still missing. After a crash, rebuild synchronization
@@ -211,6 +214,9 @@ The kernel, invitation flow, private relay, recovery and directory are now
 implemented. Real relay tests cover independent native processes, exact recorded
 diffs, restart catch-up, revocation and three-party forwarding with the source
 offline. Directory tests exercise the API contract through controlled responses;
-they have not published to a real repository. The next checkpoint exercises the
-packaged extension in two real VS Code instances. Different accounts and networks
-remain a separate validation item requiring another authorized environment.
+they have not published to a real repository. The packaged extension also passed
+the two-window VS Code test: actual approval dialogs and typing, received History
+rows and exact diffs in both directions, unchanged receiving working files, and
+another edit after a full host restart without a new invitation. Different
+accounts and networks remain a separate validation item requiring another
+authorized environment.

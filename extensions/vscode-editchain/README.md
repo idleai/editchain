@@ -78,6 +78,12 @@ a fresh endpoint. Closing VS Code leaves that resource available for resume
 until its service expiry (up to one day); **Stop Sharing History** deletes it
 and disables automatic resume.
 
+A hard process exit can leave the other peer waiting for its 90-second liveness
+deadline before reconnecting. The packaged restart test observed this delay;
+normal socket disconnects retry sooner. An exited extension host releases its
+local ownership lease immediately; cleanup preserves another live window's
+lease and requires this window to stop sharing first.
+
 **EditChain: Configure Multiplayer Repository Discovery** optionally publishes
 public device certificates, relay endpoints, versions and ten-minute expiry in
 GitHub repository variables. It asks for a repository and GitHub `repo` access;

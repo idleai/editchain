@@ -92,16 +92,21 @@ export class PeerBridge {
 
   async start(): Promise<void> {
     try {
-      const result = await this.worker.request<PeerTurn>({ type: 'open', ...this.options, remote: this.options.remote ?? null });
-      await this.result(result);
-      if (this.closed) return;
+      let ready = false;
+      // Watch the opening handshake and pending writes too. Backpressure must
+      // not disable the deadline that releases an unresponsive connection.
       this.timer = setInterval(() => {
-        if (this.closed || this.queued) return;
+        if (this.closed) return;
         if ((!this.lastProgress?.accepted && Date.now() - this.started > 30_000) || Date.now() - this.lastInput > 90_000) {
           this.stop(new NativePeerError('Multiplayer peer stopped responding.')); return;
         }
+        if (!ready || this.queued) return;
         void this.turn(Buffer.alloc(0), true).catch(error => this.stop(error));
       }, this.intervalMs);
+      const result = await this.worker.request<PeerTurn>({ type: 'open', ...this.options, remote: this.options.remote ?? null });
+      await this.result(result);
+      if (this.closed) return;
+      ready = true;
       void this.read().catch(() => this.stop(new NativePeerError('Multiplayer transport read failed.')));
     } catch (error) { this.stop(controlledError(error)); throw controlledError(error); }
   }

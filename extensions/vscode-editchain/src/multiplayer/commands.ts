@@ -16,6 +16,18 @@ const SESSION = 'editchain.multiplayer.session.';
 const ENABLED = 'editchain.multiplayer.enabled.';
 const DIRECTORY = 'editchain.multiplayer.directory.';
 const SCOPES = ['read:user', 'read:org'];
+type JournalRecord = { account: string; workspace?: string; owner: string; leaseUntil: number; process?: number };
+
+function liveLease(record: JournalRecord): boolean {
+  if (record.leaseUntil <= Date.now()) return false;
+  if (!Number.isSafeInteger(record.process) || record.process! <= 0) return true;
+  try { process.kill(record.process!, 0); return true; }
+  catch (error) {
+    // Signal zero only checks existence. Other errors (including permissions)
+    // retain the lease; PID reuse conservatively waits for ordinary expiry.
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
 
 export type MultiplayerCommands = { stop(): Promise<void>; suspend(): Promise<void> };
 
@@ -34,7 +46,6 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
   const ownedMarkers = new Set<string>();
   let leaseTimer: NodeJS.Timeout | undefined;
   let journalTail = Promise.resolve();
-  type JournalRecord = { account: string; workspace?: string; owner: string; leaseUntil: number };
   const journalWrite = (action: () => Promise<void>) => {
     const work = journalTail.then(action);
     journalTail = work.catch(() => {});
@@ -72,10 +83,10 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
   const journal = {
     remember: async (marker: string) => {
       if (!account) throw new CommandError('GitHub host session is unavailable.');
-      const record: JournalRecord = { account: account.account.id, workspace: folder?.uri.toString(), owner, leaseUntil: Date.now() + 90_000 };
+      const record: JournalRecord = { account: account.account.id, workspace: folder?.uri.toString(), owner, leaseUntil: Date.now() + 90_000, process: process.pid };
       await journalWrite(async () => {
         const current = context.globalState.get<JournalRecord>(PENDING + marker);
-        if (current && current.owner !== owner && current.leaseUntil > Date.now()) throw new CommandError('This hosting session is active in another window. Close that window before resuming here.');
+        if (current && current.owner !== owner && liveLease(current)) throw new CommandError('This hosting session is active in another window. Close that window before resuming here.');
         await context.globalState.update(PENDING + marker, record); ownedMarkers.add(marker);
       });
       leaseTimer ??= setInterval(() => {
@@ -266,7 +277,7 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       return { ok: false };
     })),
     command('multiplayerCleanup', async () => {
-      if (manager?.status().hosting) throw new CommandError('Stop hosting in this window before cleaning up its tunnels.');
+      if (manager?.status().enabled) throw new CommandError('Stop sharing in this window before cleaning up its tunnels.');
       account = await vscode.authentication.getSession('github', SCOPES, { createIfNone: true });
       const { managementClient, cleanupRelay } = await import('./relay');
       const management = managementClient(async () => account!.accessToken);
@@ -276,7 +287,7 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
           if (!key.startsWith(PENDING)) return false;
           const entry = context.globalState.get<JournalRecord>(key);
           return entry?.account === account!.account.id && workspaces.has(entry.workspace || '') &&
-            (entry.owner === owner || entry.leaseUntil < Date.now());
+            (entry.owner === owner || !liveLease(entry));
         });
         for (const key of keys) await cleanupRelay(management, key.slice(PENDING.length), journal);
         void vscode.window.showInformationMessage('Inactive pending multiplayer tunnels cleaned up for this workspace.');

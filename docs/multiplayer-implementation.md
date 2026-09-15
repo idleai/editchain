@@ -28,7 +28,7 @@ committed locally using `astramax(f1/multiplayer):`.
 | 2. Authenticated native peers | Separate processes, pinned certificates, rejection before inventory, bounded IPC; root lint | Complete |
 | 3. Extension Host/Join and live relay | Real relay between separate native replicas, lifecycle and cleanup, UI commands and packaging tests; root lint | Complete |
 | 4. Reconnect, discovery and three peers | Offline catch-up, revocation, stale discovery, third-party forwarding; root lint | Complete |
-| 5. Full extension E2E | Actual VS Code history visibility, packaged build, final regression checks | In progress |
+| 5. Full extension E2E | Actual VS Code history visibility, packaged build, final regression checks | Complete on one machine |
 
 The final different-account/different-network observation requires a second
 authorized account and machine. That input has been requested while local and
@@ -115,11 +115,61 @@ such; they are not evidence of a second network.
   opened exact native before/after diffs without changing receiving working
   files. The host process restarted with its profile and chain; another guest
   edit arrived without a new invitation. The run took 111 seconds, including
-  recovery from the previous window's ownership lease. Both test cases passed,
+  recovery after the application restart. Both test cases passed,
   tunnel cleanup completed, and the artifact audit found no credentials in logs.
   The test-only GitHub provider used the CLI account; it is not shipped.
-  `./scripts/lint.sh` exited 0: `RESULT: PASS`. Final review is checking the
-  avoidable lease delay following an abrupt application exit.
+  `./scripts/lint.sh` exited 0: `RESULT: PASS`. Later timing separated the
+  application restart from the longer peer reconnect, as recorded below.
+- Checkpoint 5b: cleanup now claims saved-resource ownership before contacting
+  the service, checks actual service labels, preserves another live process's
+  lease, and refuses cleanup while this window is enabled but reconnecting.
+  A missing extension-host process permits immediate lease takeover. The native
+  watchdog also covers opening handshakes and pending transport writes; the
+  blocked-handshake regression failed before the fix. Both blocked handshakes
+  and blocked writes between authenticated native peers now time out and release
+  their processes/streams. All 177 extension tests passed, with no failures or
+  skips; TypeScript compilation and the UI harness type/syntax checks passed.
+  `./scripts/lint.sh` exited 0: `RESULT: PASS` (fmt, check, clippy, tests, doc tests,
+  deny). No quality policies or suppressions changed.
+- Final release-binary relay run: three replicas passed large-content transfer,
+  exact historical diffs, restart catch-up, explicit reconnect, forwarding while
+  the source was offline, and revocation. Setup was 1,806 ms; total 14,574 ms;
+  19 content blobs were retained and both temporary tunnels were deleted.
+- Final packaged UI run: both VS Code cases passed in about 105 seconds of
+  scenario execution. Actual device approval, typing, received History rows,
+  exact native diffs, unchanged receiving files and recovery after a full host
+  restart all passed. Tunnel cleanup completed; the log audit found no account
+  token, connect grant or private invitation material. The VSIX contains both
+  executable Linux x64 binaries and the current runtime, and excludes the test
+  provider and automation scripts. Local artifacts:
+  [VSIX](../outputs/editchain-history-multiplayer.vsix),
+  [run result](../extensions/vscode-editchain/trace/multiplayer/run.json),
+  [host observations](../extensions/vscode-editchain/trace/multiplayer/host/observations.json),
+  [diff after restart](../extensions/vscode-editchain/trace/multiplayer/host/received-after-reload-diff.png).
+  VSIX SHA-256: `d57eaf860a37821c9927df8db85b849bf39eed8c85e5d43badc2cbd69fc32546`.
+
+## Remaining validation and known limits
+
+- Different-account and different-network joins need another authorized
+  environment. Use the [Host/Join steps](../extensions/vscode-editchain/README.md#multiplayer-history),
+  verify both fingerprints, type on both devices, inspect the received diffs,
+  interrupt one connection, and confirm catch-up and Stop cleanup.
+- Repository discovery has contract tests against controlled HTTP responses.
+  A live check should publish and withdraw advertisements in an authorized test
+  repository and verify that stale or unknown devices gain no access. No live
+  repository variable was created in this implementation session.
+- The packaged UI run uses Linux x64, VS Code 1.132.0, one machine and one CLI
+  account through a test-only provider. Other platform packages and the built-in
+  sign-in flow across different accounts still need their own observations.
+- A hard process exit can take about 90 seconds to recover through the current
+  peer liveness deadline. The final run measured 1,075 ms for WebDriver
+  restart, 3,505 ms for extension readiness and 89,502 ms for peer reconnect.
+  The replacement process reclaimed the tunnel lease immediately; the long wait
+  was in peer recovery. Normal closed-socket recovery is exercised separately.
+- Exact inventories and scoped metadata scan retained history. Very large
+  history performance remains unmeasured; no latency or large-team scalability
+  target is claimed. Each connection bounds frames and transfers, and each
+  workspace limits active streams to eight and approved devices to 32.
 
 ## Native peer interface
 

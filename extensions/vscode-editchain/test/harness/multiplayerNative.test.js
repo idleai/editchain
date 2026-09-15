@@ -84,3 +84,64 @@ test('native client rejects oversized responses before allocation and is cancell
   worker.stop();
   await assert.rejects(pending, /stopped/);
 });
+
+test('a blocked handshake write cannot keep an unresponsive native peer alive', { timeout: 5000 }, async t => {
+  const files = fixture();
+  const local = files.workspace('stalled');
+  let bridge, opening;
+  try {
+    await local.start();
+    const remote = await control({ type: 'identity', device_dir: path.join(files.directory, 'remote-device') });
+    await control({ type: 'configure', chain_dir: local.chain, space: 'stalled-space', backfill: true });
+    await control({ type: 'approve', chain_dir: local.chain, space: 'stalled-space', certificate: remote.certificate });
+    let wrote;
+    const blocked = new Promise(resolve => { wrote = resolve; });
+    const stream = new Duplex({ read() {}, write() { wrote(); } });
+    const failures = [];
+    t.mock.timers.enable({ apis: ['Date', 'setInterval'], now: Date.now() });
+    bridge = new PeerBridge(binaries.peer, stream, {
+      chain_dir: local.chain, device_dir: local.device, space: 'stalled-space', remote: remote.certificate,
+    }, () => {}, error => failures.push(error?.message));
+    opening = assert.rejects(bridge.start(), /closed during a write/);
+    await blocked;
+    t.mock.timers.tick(31_500);
+    assert.equal(stream.destroyed, true, 'the handshake deadline must close even a pending transport write');
+    assert.deepEqual(failures, ['Multiplayer peer stopped responding.']);
+  } finally {
+    bridge?.stop(); await opening;
+    t.mock.timers.reset(); files.stop();
+  }
+});
+
+test('accepted peers time out when transport backpressure holds a queued write forever', { timeout: 5000 }, async t => {
+  const files = fixture(), bridges = [], progress = [], failures = [];
+  try {
+    const locals = [files.workspace('left'), files.workspace('right')];
+    await Promise.all(locals.map(local => local.start()));
+    const devices = await Promise.all(locals.map(local => control({ type: 'identity', device_dir: local.device })));
+    for (const [index, local] of locals.entries()) {
+      await control({ type: 'configure', chain_dir: local.chain, space: 'backpressure-space', backfill: true });
+      await control({ type: 'approve', chain_dir: local.chain, space: 'backpressure-space', certificate: devices[1 - index].certificate });
+    }
+    let stall = false, wrote;
+    const blocked = new Promise(resolve => { wrote = resolve; });
+    const streams = [0, 1].map(index => new Duplex({ read() {}, write(bytes, _encoding, done) {
+      if (stall) { wrote(); return; }
+      streams[1 - index].push(bytes); done();
+    } }));
+    t.mock.timers.enable({ apis: ['Date', 'setInterval'], now: Date.now() });
+    for (const [index, local] of locals.entries()) bridges.push(new PeerBridge(binaries.peer, streams[index], {
+      chain_dir: local.chain, device_dir: local.device, space: 'backpressure-space', remote: index ? devices[0].certificate : undefined,
+    }, value => { progress[index] = value; }, error => failures.push(error?.message)));
+    await Promise.all(bridges.map(bridge => bridge.start()));
+    await until(() => progress.length === 2 && progress.every(value => value?.accepted), 'peers did not authenticate');
+    stall = true;
+    t.mock.timers.tick(1500); await blocked;
+    t.mock.timers.tick(91_500);
+    assert.ok(streams.every(stream => stream.destroyed), 'queued writes must not suppress the idle deadline');
+    assert.deepEqual(failures, ['Multiplayer peer stopped responding.', 'Multiplayer peer stopped responding.']);
+  } finally {
+    for (const bridge of bridges) bridge.stop();
+    t.mock.timers.reset(); files.stop();
+  }
+});

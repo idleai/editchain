@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Duplex } from 'node:stream';
 import { NativeWorker, PeerBridge, PeerOptions, PeerProgress, PublicDevice } from './native';
 import { encodeInvitation, Invitation, JoinRequest, parseInvitation, parseRequest, savedInvitation } from './invitation';
-import { ClientTransport, HostLease, HostTransport, cleanupRelay, managementClient, RelayClient, RelayHost, RelayJournal, validateLease } from './relay';
+import { ClientTransport, HostLease, HostTransport, managementClient, RelayClient, RelayHost, RelayJournal, removeSavedRelay, validateLease } from './relay';
 import { ProbeError } from '../devTunnels/probe';
 import { advertisement, Advertisement } from './discovery';
 
@@ -48,11 +48,7 @@ export class MultiplayerManager {
     this.relay = options.relay ?? {
       host: (incoming, failed) => new RelayHost(managementClient(options.githubToken), options.journal, incoming, failed),
       client: () => new RelayClient(),
-      remove: async lease => {
-        const management = managementClient(options.githubToken);
-        try { await cleanupRelay(management, lease.marker, options.journal, { ...lease, labels: [lease.marker] }); }
-        finally { await management.dispose(); }
-      },
+      remove: lease => removeSavedRelay(lease, options.journal, options.githubToken),
     };
   }
 

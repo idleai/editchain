@@ -48,8 +48,11 @@ function privateArtifacts(root) {
     if (fs.existsSync(file)) values.push(fs.readFileSync(file, 'utf8').trim());
   }
   const invitation = values.find(value => value.startsWith('editchain:'));
-  if (invitation) values.push(JSON.parse(Buffer.from(invitation.slice(10), 'base64url')).connectToken);
   let clean = true;
+  if (invitation) {
+    try { values.push(JSON.parse(Buffer.from(invitation.slice(10), 'base64url')).connectToken); }
+    catch { clean = false; }
+  }
   const inspect = directory => {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
       const file = path.join(directory, entry.name);
@@ -84,6 +87,7 @@ async function run() {
       const installed = path.join(root, role + '-profile/extensions', `${manifest.publisher}.${manifest.name}-${manifest.version}`);
       fs.cpSync(path.join(root, 'package/extension'), installed, { recursive: true });
       execFileSync('git', ['-c', 'init.defaultBranch=main', 'init', '--quiet', workspace], { stdio: 'pipe' });
+      fs.writeFileSync(path.join(workspace, '.gitignore'), '.editchain/\n');
       for (const name of ['from-host.ts', 'from-guest.ts']) fs.writeFileSync(path.join(workspace, name), `export const owner = '${role}'; // \n`);
     }
     const token = execFileSync('gh', ['auth', 'token', '--hostname', 'github.com'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();

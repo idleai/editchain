@@ -20,6 +20,17 @@ export function managementClient(token: () => Promise<string>): TunnelManagement
     ManagementApiVersions.Version20230927preview, async () => `github ${await token()}`);
 }
 
+/** Claim ownership before deleting a saved resource without an active host. */
+export async function removeSavedRelay(lease: HostLease, journal: RelayJournal, token: () => Promise<string>): Promise<void> {
+  validateLease(lease);
+  await journal.remember(lease.marker);
+  const management = managementClient(token);
+  try {
+    // Resolve the actual service label instead of trusting a saved locator.
+    await cleanupRelay(management, lease.marker, journal);
+  } finally { await management.dispose(); }
+}
+
 /** Host resources belong to exactly one explicit sharing session. */
 export class RelayHost {
   private readonly host: TunnelRelayTunnelHost;

@@ -3,6 +3,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('node:module');
+const { spawnSync } = require('node:child_process');
 const { until } = require('./multiplayerFixture');
 
 async function environment(options, body) {
@@ -188,4 +189,38 @@ test('cleanup skips other active windows and other workspaces', async () => {
     assert.ok(env.stored.has(prefix + 'active'));
     assert.ok(env.stored.has(prefix + 'other-workspace'));
   });
+});
+
+test('an exited extension host releases its lease immediately while a live process stays protected', async () => {
+  const exited = spawnSync(process.execPath, ['-e', '']);
+  assert.equal(exited.status, 0);
+  await environment({}, async env => {
+    const prefix = 'editchain.multiplayer.pending.';
+    const current = { account: 'account-id', workspace: 'file:///fixture/workspace', owner: 'different-window', leaseUntil: Date.now() + 90_000 };
+    env.stored.set(prefix + 'live-process', { ...current, process: process.pid });
+    env.stored.set(prefix + 'exited-process', { ...current, process: exited.pid });
+    await env.invoke('multiplayerCleanup');
+    assert.deepEqual(env.calls.filter(call => call.cleanup), [{ cleanup: 'exited-process' }]);
+    assert.ok(env.stored.has(prefix + 'live-process'));
+  });
+});
+
+test('cleanup cannot delete a current session while it is waiting to reconnect', async () => {
+  await environment({ sharing: true }, async env => {
+    await env.invoke('multiplayerRequest');
+    const result = await env.invoke('multiplayerCleanup');
+    assert.equal(result.ok, false);
+    assert.match(result.message, /Stop sharing/);
+    assert.ok(!env.calls.some(call => call.provider || call.cleanup));
+  });
+});
+
+test('saved-resource deletion requires ownership before any account or service access', async () => {
+  const { removeSavedRelay } = require('../../out/multiplayer/relay');
+  let accessed = false;
+  const lease = { marker: 'editchain-multiplayer-' + 'a'.repeat(24), tunnelId: 'saved-resource', clusterId: 'use' };
+  await assert.rejects(removeSavedRelay(lease, {
+    remember: async () => { throw new Error('owned by another active window'); }, forget: async () => { throw new Error('must remain recorded'); },
+  }, async () => { accessed = true; return 'secret'; }), /another active window/);
+  assert.equal(accessed, false);
 });
