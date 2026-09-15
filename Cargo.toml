@@ -4,6 +4,7 @@ members = [
     "crates/editchain-index",
     "crates/editchain-core",
     "crates/editchain-store",
+    "crates/editchain-sync",
     "crates/editchain-node",
     "crates/editchain-import",
     "crates/editchain-git",

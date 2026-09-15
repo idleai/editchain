@@ -41,3 +41,10 @@ such; they are not evidence of a second network.
   encrypted V1 transport, 20 round trips, and successful tunnel deletion.
 - Checkpoint 0: existing research files preserved; architecture references and
   checkpoint scope reviewed against the current tree. No runtime change.
+- Checkpoint 1a: added `editchain-sync` with exact conflict-aware inventories,
+  durable scoped record/blob ingestion, persistent new-history exclusions, and
+  bounded incremental framing. Seven real-store/framing tests passed, including
+  writer contention, restart/replay, pagination, and private-blob access through
+  forged remote references. `cargo clippy -p editchain-sync --all-targets --locked
+  -- -D warnings` exited 0. `./scripts/lint.sh` exited 0: `RESULT: PASS`.
+  Peer scheduling and nested structured-content hydration follow in 1b.
