@@ -9,7 +9,7 @@ use editchain_store::{
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -23,6 +23,8 @@ pub(super) struct Projection {
     pub(super) tail: IndexedTail,
     normalizer: super::normalize::Normalizer,
     pending: Vec<Op>,
+    #[serde(skip)]
+    root: PathBuf,
 }
 
 impl Projection {
@@ -57,7 +59,10 @@ impl Projection {
 
     pub(super) fn open(chain: &Path, storage: &Rc<Storage>) -> Result<Self> {
         match storage.load::<Self>() {
-            Ok(saved) if saved.tail.resume(chain).is_ok() => return Ok(saved),
+            Ok(mut saved) if saved.tail.resume(chain).is_ok() => {
+                chain.clone_into(&mut saved.root);
+                return Ok(saved);
+            }
             // A moved or repaired source invalidates only this derived index.
             // Rebuild admission from the authoritative records in that case.
             Ok(_) => {}
@@ -77,6 +82,7 @@ impl Projection {
             tail,
             normalizer: super::normalize::Normalizer::default(),
             pending,
+            root: chain.to_owned(),
         };
         // Preserve a completed cold scan even if an external writer is busy.
         projection.checkpoint(storage)?;
@@ -94,8 +100,11 @@ impl Projection {
         self.records_decoded = self
             .records_decoded
             .saturating_add(delta.work.records_decoded);
-        if !delta.removed.is_empty() {
-            return Err("editor history contains newly conflicting source evidence".into());
+        let receipts = super::remote::Receipts::read(&self.root)?;
+        for id in &delta.removed {
+            if !receipts.foreign(self.tail.chain(), &self.root, *id)? {
+                return Err("editor history contains newly conflicting source evidence".into());
+            }
         }
         self.pending
             .extend(delta.added.into_values().map(|(op, _)| op.as_ref().clone()));
@@ -115,7 +124,14 @@ impl Projection {
         let chain = Path::new(&request.workspace_path).join(&request.chain_dir);
         let mut sources = std::mem::take(&mut self.pending);
         sources.retain(|op| op.tags.matches_all(Tags::IMPORT | Tags::HUMAN));
-        let sources = super::order::sources(sources)?;
+        let receipts = super::remote::Receipts::read(&chain)?;
+        let mut local = Vec::new();
+        for source in sources {
+            if !receipts.foreign(self.tail.chain(), &chain, source.id)? {
+                local.push(source);
+            }
+        }
+        let sources = super::order::sources(local)?;
         let reader = BlobReader::open(&chain)?;
         let mut staged = OpSet::new();
         let mut page = Page::new(0);

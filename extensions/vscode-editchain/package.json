@@ -33,6 +33,13 @@
       }
     ],
     "commands": [
+      { "command": "editchain-history.multiplayerRequest", "title": "EditChain: Create Multiplayer Join Request" },
+      { "command": "editchain-history.multiplayerHost", "title": "EditChain: Host Shared History / Invite Device" },
+      { "command": "editchain-history.multiplayerJoin", "title": "EditChain: Join Shared History" },
+      { "command": "editchain-history.multiplayerStatus", "title": "EditChain: Show Multiplayer Status" },
+      { "command": "editchain-history.multiplayerRemove", "title": "EditChain: Remove Shared Device" },
+      { "command": "editchain-history.multiplayerStop", "title": "EditChain: Stop Sharing History" },
+      { "command": "editchain-history.multiplayerCleanup", "title": "EditChain: Clean Up Multiplayer Tunnels" },
       {
         "command": "editchain-history.devTunnelsSpike",
         "title": "EditChain: Run Dev Tunnels Spike"
@@ -73,6 +80,10 @@
     "configuration": {
       "title": "EditChain History",
       "properties": {
+        "editchain-history.peerPath": {
+          "type": "string", "default": "",
+          "description": "Optional path to editchain-peer. Defaults to the peer beside the native history service, then the bundled worker."
+        },
         "editchain-history.servicePath": {
           "type": "string",
           "default": "",
@@ -126,6 +137,8 @@
     }
   },
   "scripts": {
+    "build:native": "node scripts/build-native.mjs",
+    "test:multiplayer:relay": "node scripts/multiplayer-relay-e2e.cjs",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "package": "vsce package",

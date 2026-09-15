@@ -26,8 +26,8 @@ committed locally using `astramax(f1/multiplayer):`.
 | 0. Architecture and execution contract | Source links and repository state checked | Complete |
 | 1. Durable replication kernel | Gap/conflict convergence, blob validation, scope and replay/restart tests; root lint | Complete |
 | 2. Authenticated native peers | Separate processes, pinned certificates, rejection before inventory, bounded IPC; root lint | Complete |
-| 3. Extension Host/Join and live relay | Real relay between separate native replicas, lifecycle and cleanup, UI commands and packaging tests; root lint | In progress |
-| 4. Reconnect, discovery and three peers | Offline catch-up, revocation, stale discovery, third-party forwarding; root lint | Pending |
+| 3. Extension Host/Join and live relay | Real relay between separate native replicas, lifecycle and cleanup, UI commands and packaging tests; root lint | Complete |
+| 4. Reconnect, discovery and three peers | Offline catch-up, revocation, stale discovery, third-party forwarding; root lint | In progress |
 | 5. Full extension E2E | Actual VS Code history visibility, packaged build, final regression checks | Pending |
 
 The final different-account/different-network observation requires a second
@@ -69,11 +69,28 @@ such; they are not evidence of a second network.
   wrong server, wrong space, ciphertext tampering, raw history-RPC injection,
   restart and live revocation were exercised. `./scripts/lint.sh` exited 0:
   `RESULT: PASS`. The extension packaging checkpoint will ship both binaries.
+- Checkpoint 3: production Host/Join commands, private connect-only invitations,
+  endpoint validation, device approval/removal, bounded native stream bridge,
+  workspace/account lifecycle and leased cleanup journals are wired. Received
+  editor source evidence is excluded from local normalization; foreign conflicts
+  still quarantine without blocking independent local capture. Native peers wait
+  up to two seconds for a short local writer transaction before reconnect is
+  required, after the concurrent-capture test exposed premature disconnection.
+  All 161 extension tests passed (no skips), including simultaneous large
+  transfers, exact historical diffs, credential-safe errors and Stop during login.
+  `./scripts/lint.sh` exited 0: `RESULT: PASS`.
+- Checkpoint 3 package: staged both release binaries and production dependencies
+  in `outputs/editchain-history-multiplayer-checkpoint-3.vsix`. Verified executable
+  permissions after extracting the VSIX. The extracted package completed the
+  real relay E2E with two native processes: setup 2,411 ms, total 5,482 ms, 14
+  content blobs, received History rows and exact before/after diff verified,
+  working tree unchanged, tunnel deleted. This used one machine and one host
+  GitHub account; no different-network claim is made.
 
 ## Native peer interface
 
 `editchain-peer` reads local JSON frames with a four-byte little-endian length
-bounded to 512 KiB. Commands are `identity`, `configure`, `approve`, `revoke`,
+bounded to 512 KiB. Commands are `identity`, `verify`, `configure`, `approve`, `revoke`,
 `devices`, `open`, `turn`, and `close`. One worker owns one peer connection.
 Network input is base64 inside `turn`, decoded with a 64 KiB bound, and passed
 only to TLS. A turn returns up to 256 KiB of opaque output plus public identity

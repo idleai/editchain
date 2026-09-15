@@ -9,6 +9,7 @@ outputs/
 node_modules/
 extensions/vscode-editchain/node_modules/
 extensions/vscode-editchain/out/
+extensions/vscode-editchain/bin/
 extensions/vscode-editchain/*.vsix
 
 # Editor / IDE

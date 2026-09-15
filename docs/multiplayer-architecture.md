@@ -1,7 +1,8 @@
 # Multiplayer architecture sketch
 
-**Status:** Draft for discussion, September 14, 2026. Based on branch commit
-`92be7c9` and the successful VS Code spike reported by the developer.
+**Status:** Architecture accepted for implementation. Initially sketched on
+September 14, 2026 from `92be7c9` and the successful VS Code spike. See the
+[implementation log](multiplayer-implementation.md) for tested checkpoints.
 
 ## 1. What the spike establishes
 
@@ -59,7 +60,7 @@ flowchart LR
 | Extension session manager | GitHub session lifecycle, start/join/leave, tunnel cleanup and retries; grow from [the spike](../extensions/vscode-editchain/src/devTunnels/spike.ts). |
 | Discovery adapter | Resolve candidate endpoints through invitations initially; add repository advertisements independently of replication. |
 | Rust peer admission | Authenticate a device and authorize its collaboration space before exposing inventory. |
-| Proposed `editchain-sync` crate | Transport-independent protocol, inventory comparison, transfer scheduling and reconnect repair. This crate does **not** exist in this checkout; the earlier research's skeleton is historical. |
+| `editchain-sync` crate | Transport-independent protocol, inventory comparison, transfer scheduling and reconnect repair, plus the dedicated `editchain-peer` native worker. |
 | Rust node integration | Dedicated peer handlers and serialized durable writes, reusing [storage](../crates/editchain-store/src/lib.rs) and [admission](../crates/editchain-core/src/admission.rs). |
 | Local projection and UI | Reuse the [retained history projection](../crates/editchain-node/src/history/realtime.rs) to expose received additions and quarantine retractions. |
 

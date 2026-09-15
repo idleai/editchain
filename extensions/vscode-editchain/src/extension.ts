@@ -6,6 +6,8 @@ import { createLiveSync, LiveProviderRequest } from './liveHost';
 import { LiveSync } from './liveSync';
 import { LiveQueue } from './liveQueue';
 import { registerDevTunnelsCommands } from './devTunnels/commands';
+import { registerMultiplayerCommands, MultiplayerCommands } from './multiplayer/commands';
+let multiplayer: MultiplayerCommands | undefined;
 
 // The single history panel. Reused across `open` invocations so we never create
 // two webviews of the same type (which races VS Code's service-worker
@@ -113,6 +115,7 @@ export function activate(context: vscode.ExtensionContext): void {
   out.appendLine(`[extension] EditChain ${context.extension?.packageJSON.version ?? 'development'} (${context.extensionPath})`);
   client.setLog((line) => out.appendLine(line));
   humanWork = new HumanWorkHost(context, out, () => liveSync?.humanChanged());
+  multiplayer = registerMultiplayerCommands(context, () => liveSync?.humanChanged());
 
   // Read-only JSON content provider: documents opened under the
   // `editchain-json:` scheme are read-only by default (content providers cannot
@@ -1166,4 +1169,6 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 </html>`;
 }
 
-export async function deactivate(): Promise<void> { await humanWork?.stop(); }
+export async function deactivate(): Promise<void> {
+  await Promise.allSettled([humanWork?.stop(), multiplayer?.stop()]);
+}

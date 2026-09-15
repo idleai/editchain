@@ -27,6 +27,15 @@ pub struct IndexedChain {
 }
 
 impl IndexedChain {
+    /// Exact durable locations for every retained variant of an identity.
+    pub fn evidence_locations(&self, id: OpId) -> impl Iterator<Item = OpRecordLocation> + '_ {
+        self.entries
+            .get(&id)
+            .map(|entry| entry.location)
+            .into_iter()
+            .chain(self.conflicts.get(&id).into_iter().flatten().copied())
+    }
+
     /// Classify against exact durable bytes, including every quarantined variant.
     ///
     /// # Errors

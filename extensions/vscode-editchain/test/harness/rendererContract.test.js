@@ -140,6 +140,10 @@ test('extension contributes one history view with live, tracking, and Dev Tunnel
     'no side-by-side GPU preview activation event may remain');
   const commands = PACKAGE.contributes.commands;
   assert.deepEqual(commands.map(entry => entry.command), [
+    'editchain-history.multiplayerRequest', 'editchain-history.multiplayerHost',
+    'editchain-history.multiplayerJoin', 'editchain-history.multiplayerStatus',
+    'editchain-history.multiplayerRemove', 'editchain-history.multiplayerStop',
+    'editchain-history.multiplayerCleanup',
     'editchain-history.devTunnelsSpike', 'editchain-history.devTunnelsCleanup',
     'editchain-history.open', 'editchain-history.startLive', 'editchain-history.stopLive',
     'editchain-history.showTrackingStatus',

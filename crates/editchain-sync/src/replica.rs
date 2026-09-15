@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use editchain_core::{Admission, ContentId, OpId, Payload};
 use editchain_store::durable::{atomic_write, sync_parent_dir};
 use editchain_store::format::{decode_op, Page};
-use editchain_store::{BlobStore, CanonicalChain, SegmentStore};
+use editchain_store::{BlobStore, CanonicalChain};
 use serde::{Deserialize, Serialize};
 
 use crate::{content, invalid, CHUNK_BYTES, INVENTORY_PAGE, MAX_OBJECT_BYTES};
@@ -139,7 +139,7 @@ impl Replica {
             root: root.to_owned(),
             space: space.to_owned(),
         };
-        let _writer = SegmentStore::open(root)?;
+        let _writer = crate::writer(root)?;
         if replica.scope_path().exists() {
             let _scope = replica.load_scope()?;
         } else {
@@ -171,7 +171,7 @@ impl Replica {
     /// # Errors
     /// Returns writer contention, scope, or canonical storage errors.
     pub fn snapshot(&self) -> io::Result<Snapshot> {
-        let _writer = SegmentStore::open(&self.root)?;
+        let _writer = crate::writer(&self.root)?;
         let scope = self.load_scope()?;
         let chain = CanonicalChain::read(&self.root)?;
         let mut records = evidence(&chain);
@@ -188,7 +188,7 @@ impl Replica {
     /// # Errors
     /// Returns writer contention or a failed durable scope update.
     pub fn include_backfill(&self) -> io::Result<()> {
-        let _writer = SegmentStore::open(&self.root)?;
+        let _writer = crate::writer(&self.root)?;
         let mut scope = self.load_scope()?;
         scope.excluded.clear();
         self.save_scope(&scope)
@@ -214,7 +214,7 @@ impl Replica {
                 return Err(invalid("record identity or digest mismatch"));
             }
         }
-        let mut writer = SegmentStore::open(&self.root)?;
+        let mut writer = crate::writer(&self.root)?;
         let chain = CanonicalChain::read(&self.root)?;
         let mut known = chain.evidence().clone();
         let mut scope = self.load_scope()?;
@@ -360,7 +360,7 @@ impl Replica {
         if bytes.len() > MAX_OBJECT_BYTES || blake3::hash(bytes).as_bytes() != &hash {
             return Err(invalid("received blob hash or length mismatch"));
         }
-        let _writer = SegmentStore::open(&self.root)?;
+        let _writer = crate::writer(&self.root)?;
         let mut scope = self.load_scope()?;
         let chain = CanonicalChain::read(&self.root)?;
         let mut records = evidence(&chain);

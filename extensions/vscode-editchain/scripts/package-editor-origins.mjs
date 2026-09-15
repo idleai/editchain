@@ -14,6 +14,7 @@ try {
   for (const name of ['out', 'media', 'README.md', 'LICENSE.md', '.vscodeignore', 'package-lock.json']) {
     fs.cpSync(path.join(extension, name), path.join(stage, name), { recursive: true });
   }
+  if (fs.existsSync(path.join(extension, 'bin'))) fs.cpSync(path.join(extension, 'bin'), path.join(stage, 'bin'), { recursive: true });
   // Stage the production dependency tree exactly as vsce selects it (npm list --production),
   // so runtime dependencies such as @microsoft/dev-tunnels-* ship like the regular package.
   const npmList = execFileSync(

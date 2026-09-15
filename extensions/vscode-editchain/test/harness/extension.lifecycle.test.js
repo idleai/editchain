@@ -130,6 +130,7 @@ const outputLines = [];
 const outputShows = [];
 module.exports = {
   __esModule: true,
+  authentication: { onDidChangeSessions: () => ({ dispose() {} }) },
   workspace: {
     onDidChangeWorkspaceFolders: () => ({ dispose() {} }),
     onDidChangeConfiguration: callback => { module.exports.workspace.configurationChanged = callback; return { dispose() {} }; },

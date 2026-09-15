@@ -12,7 +12,7 @@ mod tail;
 
 pub use blob::{BlobPreviewResolution, BlobReader, BlobResolution, BlobStore};
 pub use indexed::IndexedChain;
-pub use reader::{read_op_at, CanonicalChain, ChainReadStats, OpRecordLocation};
+pub use reader::{read_encoded_at, read_op_at, CanonicalChain, ChainReadStats, OpRecordLocation};
 pub use segment::SegmentStore;
 pub use tail::{CanonicalTail, ChainDelta, IndexedTail, Tail, TailCorpus, TailWork};
 

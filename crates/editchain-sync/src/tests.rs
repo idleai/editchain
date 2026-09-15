@@ -265,6 +265,34 @@ fn malformed_record_batches_do_not_write_or_acknowledge() -> io::Result<()> {
 }
 
 #[test]
+fn a_short_local_capture_transaction_delays_peer_publication_without_disconnect() -> io::Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let replica = Replica::open(dir.path(), "space-1", true)?;
+    let local = SegmentStore::open(dir.path())?;
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        drop(local);
+    });
+    let entry = record(1, b"wait for local capture")?;
+    let acks = replica.ingest_records(std::slice::from_ref(&entry))?;
+    release
+        .join()
+        .map_err(|_error| io::Error::other("capture thread failed"))?;
+    check_eq!(
+        acks,
+        [entry.0],
+        "short writer contention is retried before an ack"
+    );
+    check_eq!(
+        CanonicalChain::read(dir.path())?.stats().accepted,
+        1,
+        "delayed publication remains durable"
+    );
+    Ok(())
+}
+
+#[test]
 fn remote_references_cannot_read_preexisting_private_blobs() -> io::Result<()> {
     let dir = tempfile::tempdir()?;
     let private = b"private bytes absent from published operations";

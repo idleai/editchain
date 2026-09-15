@@ -21,6 +21,7 @@ cargo build --release -p editchain-node --bins --locked
 
 cd extensions/vscode-editchain
 npm ci
+npm run build:native
 npm run build:renderer
 npm run compile
 ```
@@ -33,10 +34,59 @@ the project you want to explore, and invoke **EditChain: Open History Explorer**
 The settings are:
 
 - `editchain-history.servicePath`: absolute path to the native service binary.
-  Release and then debug builds under the open workspace are used when empty;
-  set this explicitly when viewing a project outside the EditChain checkout.
+  Release and then debug builds under the open workspace are preferred when
+  empty, followed by the service bundled for the package's platform.
 - `editchain-history.chainDir`: EditChain data directory relative to the open
   workspace, defaulting to `.editchain`.
+
+## Multiplayer history
+
+Each participant opens a separate workspace and keeps a durable local history.
+Sharing exchanges immutable records and their referenced content. Your working
+files stay under your control; a received history row opens its recorded diff.
+
+1. On the joining device, run **EditChain: Create Multiplayer Join Request**.
+   Give the copied public request to the host through your trusted channel.
+2. On the host, run **EditChain: Host Shared History / Invite Device**. Paste the
+   request, choose new records or explicit backfill, and approve the device
+   fingerprint. Sign in to GitHub when prompted.
+3. Give the copied private invitation to that device. It contains a connect-only
+   grant and expires within one hour. Keep it out of issue trackers and logs.
+4. On the joining device, run **EditChain: Join Shared History**, paste the
+   invitation, choose its outgoing history scope, and approve the host identity.
+5. Open **EditChain: Open History Explorer** on both sides. The Sharing status
+   item distinguishes authentication, catch-up, live data and missing content.
+
+The joining device uses the invitation grant; it does not receive the host's
+GitHub credential. Persistent device keys stay in VS Code's private application
+storage. For two replicas on one machine, use separate VS Code user-data
+profiles so they receive distinct device identities.
+
+**EditChain: Remove Shared Device** removes this replica's approval and closes
+that connection. **EditChain: Stop Sharing History** disconnects peers and
+deletes this window's hosted tunnel. Existing records and received copies stay
+on their respective devices. **EditChain: Clean Up Multiplayer Tunnels** retries
+cleanup of inactive resources for the current workspace and account.
+
+`npm run build:native` builds and stages both native binaries for this platform.
+For a custom development build, `editchain-history.peerPath` can select a worker
+explicitly; otherwise it is found beside the service or in the package.
+
+The automated live relay check uses two native processes, synthetic workspaces,
+and the production Host/Join manager. It needs an authenticated GitHub CLI and
+creates and deletes a temporary private tunnel:
+
+```sh
+cargo build -p editchain-node --bin editchain-vscode-service --locked
+cargo build -p editchain-sync --bin editchain-peer --locked
+cd extensions/vscode-editchain
+npm run compile
+npm run test:multiplayer:relay
+```
+
+This check identifies itself as a same-machine test. A second network remains
+a separate observation. See [implementation checkpoints](../../docs/multiplayer-implementation.md)
+for current validation and remaining work.
 
 ## Human work on AI-generated code
 

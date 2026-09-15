@@ -7,7 +7,9 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::{invalid, DeviceIdentity, Membership, Replica, SecurePeer, MAX_BRIDGE_BYTES};
+use crate::{
+    invalid, DeviceIdentity, Membership, PublicDevice, Replica, SecurePeer, MAX_BRIDGE_BYTES,
+};
 
 /// Limit checked before allocating a native peer control frame.
 pub const MAX_CONTROL_BYTES: usize = 512 * 1024;
@@ -15,6 +17,9 @@ pub const MAX_CONTROL_BYTES: usize = 512 * 1024;
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
+    Verify {
+        certificate: String,
+    },
     Identity {
         device_dir: PathBuf,
     },
@@ -58,6 +63,7 @@ struct Worker {
 impl Worker {
     fn handle(&mut self, request: Request) -> io::Result<Value> {
         match request {
+            Request::Verify { certificate } => Ok(json!(PublicDevice::parse(&certificate)?)),
             Request::Identity { device_dir } => {
                 Ok(json!(DeviceIdentity::load_or_create(&device_dir)?.public()))
             }

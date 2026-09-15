@@ -44,9 +44,9 @@ export function createSpikeServices(githubToken: () => Promise<string>): SpikeSe
 }
 
 /** Retain the SDK's V2 SecureStream transform; refuse unencrypted channels. */
-export async function encryptedStream(event: ForwardedPortConnectingEventArgs): Promise<Duplex | null> {
+export async function encryptedStream(event: ForwardedPortConnectingEventArgs, port = SPIKE_PORT): Promise<Duplex | null> {
   const transformed = await event.transformPromise;
-  if (event.port !== SPIKE_PORT || !(transformed instanceof SecureStream)) {
+  if (event.port !== port || !(transformed instanceof SecureStream)) {
     transformed?.destroy();
     throw new ProbeError('Expected an encrypted V2 stream on the spike port.');
   }
@@ -54,7 +54,7 @@ export async function encryptedStream(event: ForwardedPortConnectingEventArgs): 
 }
 
 /** V1 encrypts the entire peer SSH session, rather than each forwarded stream. */
-function encryptedV1SessionId(stream: Duplex): Buffer {
+export function encryptedV1SessionId(stream: Duplex): Buffer {
   if (stream instanceof SshStream) {
     const session = stream.channel.session;
     const algorithms = session.algorithms;
@@ -67,9 +67,9 @@ function encryptedV1SessionId(stream: Duplex): Buffer {
   throw new ProbeError('Expected an authenticated, encrypted V1 SSH session.');
 }
 
-async function encryptedHostStream(event: ForwardedPortConnectingEventArgs, protocol?: string): Promise<Duplex | null> {
-  if (protocol !== 'tunnel-relay-host') return encryptedStream(event);
-  if (event.port !== SPIKE_PORT) {
+export async function encryptedHostStream(event: ForwardedPortConnectingEventArgs, protocol?: string, port = SPIKE_PORT): Promise<Duplex | null> {
+  if (protocol !== 'tunnel-relay-host') return encryptedStream(event, port);
+  if (event.port !== port) {
     event.stream.destroy();
     throw new ProbeError('Unexpected forwarded port.');
   }

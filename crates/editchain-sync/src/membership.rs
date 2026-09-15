@@ -6,7 +6,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use editchain_store::durable::atomic_write;
-use editchain_store::SegmentStore;
 use serde::{Deserialize, Serialize};
 
 use crate::{invalid, PublicDevice, Replica};
@@ -59,7 +58,7 @@ impl Membership {
     /// Rejects malformed certificates, the device bound, contention or failed fsync.
     pub fn approve(&self, certificate: &str) -> io::Result<PublicDevice> {
         let device = PublicDevice::parse(certificate)?;
-        let _writer = SegmentStore::open(&self.root)?;
+        let _writer = crate::writer(&self.root)?;
         let mut members = self.load()?;
         drop(
             members
@@ -78,7 +77,7 @@ impl Membership {
     /// # Errors
     /// Returns metadata, writer contention or failed fsync errors.
     pub fn revoke(&self, fingerprint: &str) -> io::Result<()> {
-        let _writer = SegmentStore::open(&self.root)?;
+        let _writer = crate::writer(&self.root)?;
         let mut members = self.load()?;
         drop(members.devices.remove(fingerprint));
         self.save(&members)
