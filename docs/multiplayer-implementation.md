@@ -27,8 +27,8 @@ committed locally using `astramax(f1/multiplayer):`.
 | 1. Durable replication kernel | Gap/conflict convergence, blob validation, scope and replay/restart tests; root lint | Complete |
 | 2. Authenticated native peers | Separate processes, pinned certificates, rejection before inventory, bounded IPC; root lint | Complete |
 | 3. Extension Host/Join and live relay | Real relay between separate native replicas, lifecycle and cleanup, UI commands and packaging tests; root lint | Complete |
-| 4. Reconnect, discovery and three peers | Offline catch-up, revocation, stale discovery, third-party forwarding; root lint | In progress |
-| 5. Full extension E2E | Actual VS Code history visibility, packaged build, final regression checks | Pending |
+| 4. Reconnect, discovery and three peers | Offline catch-up, revocation, stale discovery, third-party forwarding; root lint | Complete |
+| 5. Full extension E2E | Actual VS Code history visibility, packaged build, final regression checks | In progress |
 
 The final different-account/different-network observation requires a second
 authorized account and machine. That input has been requested while local and
@@ -99,6 +99,16 @@ such; they are not evidence of a second network.
   a second replica while the source was offline, and live revocation. Setup was
   3,563 ms; total 27,448 ms; both temporary tunnels were deleted. Optional directory
   discovery and the two-window VS Code UI run remain for checkpoints 4b and 5.
+- Checkpoint 4b: optional repository-variable discovery is implemented with
+  explicit repository/scope consent, public-only advertisements, serialized
+  polling, cancellation and withdrawal. Tests verify pagination, stale/wrong-space
+  entries, altered certificates, unknown devices, oversized responses, safe
+  errors and Stop during authentication/publication. A grant cannot move to
+  another tunnel. All 172 extension tests passed. One earlier full run hit the
+  existing renderer harness's Chrome `Promise was collected` error; the complete
+  rerun passed without exclusions or changes to that test. `./scripts/lint.sh`
+  exited 0: `RESULT: PASS`. Directory HTTP behavior is tested through controlled
+  API responses; no real repository variable has been written during this work.
 
 ## Native peer interface
 

@@ -10,7 +10,7 @@ const { fixture, binaries, until, blobs, diffs } = require('./multiplayerFixture
 // Fault-inject only the byte transport. Managers, TLS, native workers and stores are real.
 function network() {
   const hosts = new Map(), streams = new Set();
-  let attempts = 0, starts = 0;
+  let attempts = 0, starts = 0, lastEndpoint;
   const provider = {
     host(incoming, failed) {
       let lease;
@@ -39,6 +39,7 @@ function network() {
       return {
         async connect(invitation) {
           attempts++;
+          lastEndpoint = invitation.endpoint;
           const host = hosts.get(invitation.endpoint.tunnelId);
           if (!host) throw new Error('fixture host offline');
           const a = new PassThrough({ highWaterMark: 1024 }), b = new PassThrough({ highWaterMark: 1024 });
@@ -56,7 +57,7 @@ function network() {
     async remove(lease) { hosts.delete(lease.tunnelId); },
   };
   return { provider, drop() { for (const stream of streams) stream.destroy(); }, attempts: () => attempts,
-    terminateHost() { for (const host of [...hosts.values()]) host.failed('terminal fixture disconnect', true); }, starts: () => starts };
+    terminateHost() { for (const host of [...hosts.values()]) host.failed('terminal fixture disconnect', true); }, starts: () => starts, endpoint: () => lastEndpoint };
 }
 
 function environment() {
@@ -127,5 +128,33 @@ test('saved grants outlive the initial approval window but expired grants cannot
     assert.throws(() => parseInvitation(encoded, later), /expired/);
     assert.equal(savedInvitation(invitation, later).guest, invitation.guest);
     assert.throws(() => savedInvitation(invitation, later + 7200_000), /expired/);
+  } finally { await env.stop(); }
+});
+
+test('discovery refreshes a known endpoint without admitting unknown devices or moving a grant to another tunnel', { timeout: 30_000 }, async () => {
+  const env = environment();
+  try {
+    const a = env.files.workspace('a'), b = env.files.workspace('b'), c = env.files.workspace('c');
+    const host = env.create(a), guest = env.create(b), stranger = env.create(c);
+    await guest.joinHistory(await host.hostHistory(await guest.joinRequest(), true), true);
+    await until(() => live(guest) === 1, 'initial discovery edge');
+    const ad = await host.describe();
+    assert.ok(ad);
+    assert.ok(!('connectToken' in ad));
+    const unknown = (await stranger.inspectRequest(await stranger.joinRequest())).device;
+    await guest.discover([
+      { ...ad, device: unknown },
+      { ...ad, device: { ...ad.device, fingerprint: 'f'.repeat(64) } },
+      { ...ad, space: 'wrong-space' },
+      { ...ad, endpoint: { ...ad.endpoint, tunnelId: 'another-resource' } },
+      { ...ad, expiresAt: 1 },
+    ]);
+    assert.deepEqual(await guest.devices(), [ad.device]);
+    assert.equal(guest.status().peers.length, 1);
+    const refreshed = { ...ad, endpoint: { ...ad.endpoint, hostId: 'fresh-host-instance' } };
+    await guest.discover([refreshed]);
+    await guest.reconnect();
+    await until(() => live(guest) === 1 && env.wire.endpoint().hostId === 'fresh-host-instance', 'known endpoint did not refresh');
+    assert.equal(env.wire.endpoint().tunnelId, ad.endpoint.tunnelId);
   } finally { await env.stop(); }
 });

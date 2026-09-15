@@ -39,6 +39,7 @@
       { "command": "editchain-history.multiplayerStatus", "title": "EditChain: Show Multiplayer Status" },
       { "command": "editchain-history.multiplayerRemove", "title": "EditChain: Remove Shared Device" },
       { "command": "editchain-history.multiplayerResume", "title": "EditChain: Resume / Reconnect Shared History" },
+      { "command": "editchain-history.multiplayerDiscovery", "title": "EditChain: Configure Multiplayer Repository Discovery" },
       { "command": "editchain-history.multiplayerStop", "title": "EditChain: Stop Sharing History" },
       { "command": "editchain-history.multiplayerCleanup", "title": "EditChain: Clean Up Multiplayer Tunnels" },
       {

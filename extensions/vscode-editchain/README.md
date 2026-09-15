@@ -78,6 +78,17 @@ a fresh endpoint. Closing VS Code leaves that resource available for resume
 until its service expiry (up to one day); **Stop Sharing History** deletes it
 and disables automatic resume.
 
+**EditChain: Configure Multiplayer Repository Discovery** optionally publishes
+public device certificates, relay endpoints, versions and ten-minute expiry in
+GitHub repository variables. It asks for a repository and GitHub `repo` access;
+you need collaborator access to that repository. Discovery polls once a minute,
+ignores expired or incompatible entries, and refreshes only an approved device's
+existing tunnel grant. Each new pair still exchanges and approves an invitation.
+No account tokens or invitation grants are published. Directory failure does not
+stop synchronization. Disable discovery through the same command to withdraw
+this window's advertisement. If cleanup fails, the stale variable remains but
+its endpoint is ignored after expiry.
+
 `npm run build:native` builds and stages both native binaries for this platform.
 For a custom development build, `editchain-history.peerPath` can select a worker
 explicitly; otherwise it is found beside the service or in the package.

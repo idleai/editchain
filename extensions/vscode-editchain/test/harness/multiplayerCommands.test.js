@@ -31,7 +31,7 @@ async function environment(options, body) {
       return session;
     } },
     window: {
-      showInputBox: async () => 'join-request', showQuickPick: async items => items[0],
+      showInputBox: async () => options.input || 'join-request', showQuickPick: async items => items[0],
       showWarningMessage: async (_message, _options, choice) => choice,
       createOutputChannel: () => ({ appendLine: value => logs.push(value), show() {}, dispose() {} }),
       showInformationMessage: async value => { logs.push(value); },
@@ -50,7 +50,7 @@ async function environment(options, body) {
       await managerOptions.saveSession({ version: 1, space: 'space', peers: ['private-invite-secret'] });
       return 'private-invite-secret';
     }
-    status() { return { hosting: false, peers: [] }; }
+    status() { return { hosting: false, peers: [], enabled: !!options.sharing, space: options.sharing ? 'space' : undefined }; }
     async stop() { calls.push({ stop: true }); await managerOptions.saveSession(undefined); await managerOptions.journal.forget('editchain-multiplayer-' + '1'.repeat(24)); }
     async suspend() { calls.push({ suspend: true }); }
     async resume() { calls.push({ resume: true }); }
@@ -62,6 +62,16 @@ async function environment(options, body) {
     if (name === './manager' && parent.filename.endsWith('/multiplayer/commands.js')) { managerLoads++; return { MultiplayerManager: FakeManager }; }
     if (name === './relay' && parent.filename.endsWith('/multiplayer/commands.js')) return {
       managementClient: () => ({ async dispose() {} }), cleanupRelay: async (_management, marker, journal) => { calls.push({ cleanup: marker }); await journal.forget(marker); },
+    };
+    if (name === './discovery' && parent.filename.endsWith('/multiplayer/commands.js')) return {
+      repositoryName: value => value,
+      GitHubDirectory: class { constructor(repository, token) { this.repository = repository; this.token = token; } },
+      DirectorySync: class {
+        constructor(directory) { this.directory = directory; }
+        async start() { await this.directory.token(); calls.push({ discovery: this.directory.repository }); }
+        async stop() { calls.push({ discoveryStop: true }); }
+        async refresh() {}
+      },
     };
     return original.call(this, name, parent, ...rest);
   };
@@ -114,6 +124,28 @@ test('a changed host account cannot resume a saved tunnel', async () => {
   await environment({ saved: { account: 'other-account', session: { host: {}, peers: [] } } }, async env => {
     await until(() => env.logs.some(line => line.includes('original host')), 'missing account mismatch notice');
     assert.ok(!env.calls.some(call => call.resume));
+  });
+});
+
+test('repository discovery requests repo access only after explicit configuration', async () => {
+  await environment({ sharing: true, input: 'owner/repository' }, async env => {
+    assert.deepEqual(env.calls, []);
+    assert.equal((await env.invoke('multiplayerDiscovery')).ok, true);
+    assert.deepEqual(env.calls.filter(call => call.provider).map(call => call.scopes), [['repo'], ['repo']]);
+    assert.ok(env.calls.some(call => call.discovery === 'owner/repository'));
+    assert.ok(!JSON.stringify([...env.workspace.values()]).includes('secret-user-token'));
+    await env.commands.stop();
+    assert.ok(env.calls.some(call => call.discoveryStop));
+  });
+});
+
+test('Stop during discovery sign-in prevents later publication', async () => {
+  await environment({ sharing: true, input: 'owner/repository', delayAuth: true }, async env => {
+    const enabling = env.invoke('multiplayerDiscovery');
+    await until(env.authPending, 'discovery sign-in was not requested');
+    await env.invoke('multiplayerStop'); env.resolveAuth(); await enabling;
+    assert.ok(!env.calls.some(call => call.discovery));
+    assert.ok(![...env.workspace.keys()].some(key => key.includes('.directory.')));
   });
 });
 

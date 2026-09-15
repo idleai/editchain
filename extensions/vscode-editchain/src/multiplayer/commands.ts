@@ -6,6 +6,7 @@ import { resolveServicePath } from '../stdioClient';
 import type { MultiplayerManager, SavedSharing, SharingStatus } from './manager';
 import { NativePeerError } from './native';
 import { ProbeError } from '../devTunnels/probe';
+import type { DirectorySync, DiscoveryStatus } from './discovery';
 
 class CommandError extends Error {}
 
@@ -13,6 +14,7 @@ const PENDING = 'editchain.multiplayer.pending.';
 const SPACE = 'editchain.multiplayer.space.';
 const SESSION = 'editchain.multiplayer.session.';
 const ENABLED = 'editchain.multiplayer.enabled.';
+const DIRECTORY = 'editchain.multiplayer.directory.';
 const SCOPES = ['read:user', 'read:org'];
 
 export type MultiplayerCommands = { stop(): Promise<void>; suspend(): Promise<void> };
@@ -24,6 +26,8 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
   let output: vscode.OutputChannel | undefined;
   let status: vscode.StatusBarItem | undefined;
   let account: vscode.AuthenticationSession | undefined;
+  let directory: DirectorySync | undefined;
+  let directoryStatus: DiscoveryStatus | undefined;
   let active = false;
   let stopVersion = 0;
   const owner = randomUUID();
@@ -42,9 +46,28 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
     status.command = 'editchain-history.multiplayerStatus';
     const live = value.peers.filter(peer => peer.state === 'Live').length;
     status.text = value.hosting || value.peers.length ? `$(broadcast) Sharing · ${live}/${value.peers.length} live` : '$(broadcast) Sharing stopped';
-    status.tooltip = value.message || value.peers.map(peer => `${peer.fingerprint?.slice(0, 12) || 'Device'}: ${peer.state}`).join('\n');
+    status.tooltip = [value.message || value.peers.map(peer => `${peer.fingerprint?.slice(0, 12) || 'Device'}: ${peer.state}`).join('\n'),
+      directoryStatus ? `Discovery: ${directoryStatus.state}` : ''].filter(Boolean).join('\n');
     status.show();
     if (durableChange) received();
+  };
+
+  const startDirectory = async (current: MultiplayerManager) => {
+    const settings = context.workspaceState.get<{ repository: string; account: string }>(DIRECTORY + folder!.uri.toString());
+    if (!settings) return;
+    if (directory) { await directory.refresh(); return; }
+    const { GitHubDirectory, DirectorySync } = await import('./discovery');
+    const github = new GitHubDirectory(settings.repository, async () => {
+      const session = await vscode.authentication.getSession('github', ['repo'], { silent: true });
+      if (!session || session.account.id !== settings.account) throw new CommandError('Repository discovery account is unavailable.');
+      return session.accessToken;
+    });
+    const sync = new DirectorySync(github, { describe: () => current.describe(), discover: values => current.discover(values),
+      space: () => current.status().space }, value => {
+      if (directory === sync) { directoryStatus = value; update(current.status(), false); }
+    });
+    directory = sync;
+    await sync.start();
   };
   const journal = {
     remember: async (marker: string) => {
@@ -129,10 +152,16 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       return { ok: false, message };
     } finally { active = false; }
   };
-  const stop = async () => { stopVersion++; await manager?.stop(); };
+  const stop = async () => {
+    stopVersion++;
+    const previous = directory; directory = undefined; directoryStatus = undefined;
+    const results = await Promise.allSettled([previous?.stop(), manager?.stop()]);
+    if (results.some(result => result.status === 'rejected')) throw new CommandError('Sharing cleanup is pending.');
+  };
   const suspend = async () => {
     stopVersion++;
-    await manager?.suspend();
+    const previous = directory; directory = undefined;
+    await Promise.allSettled([previous?.stop(), manager?.suspend()]);
     clearInterval(leaseTimer); leaseTimer = undefined;
     await journalWrite(async () => {
       for (const marker of ownedMarkers) {
@@ -156,6 +185,7 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
     if (version !== stopVersion) return;
     await current.resume(envelope.session);
     await current.reconnect();
+    if (version === stopVersion) await startDirectory(current);
   };
   const command = (name: string, action: () => Promise<unknown>) => vscode.commands.registerCommand(`editchain-history.${name}`, () => execute(action));
 
@@ -179,6 +209,7 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       const invitation = await current.hostHistory(text, include);
       await vscode.env.clipboard.writeText(invitation);
       void vscode.window.showInformationMessage('Private invitation copied. Give it to the approved device. It expires in at most one hour.');
+      if (version === stopVersion) await startDirectory(current);
     }),
     command('multiplayerJoin', async () => {
       const version = stopVersion;
@@ -191,9 +222,10 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       if (approved !== 'Join space') return;
       if (version !== stopVersion) return;
       await current.joinHistory(text, include);
+      if (version === stopVersion) await startDirectory(current);
     }),
     command('multiplayerStatus', async () => {
-      const value = manager?.status() ?? { hosting: false, peers: [], message: 'Sharing is disabled.' };
+      const value = { ...(manager?.status() ?? { hosting: false, peers: [], message: 'Sharing is disabled.' }), discovery: directoryStatus };
       output!.show(true);
       output!.appendLine(JSON.stringify(value, null, 2));
       return value;
@@ -204,6 +236,30 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       if (device) await current.revoke(device.device.fingerprint);
     }),
     command('multiplayerResume', () => restore(true)),
+    command('multiplayerDiscovery', async () => {
+      const version = stopVersion;
+      const current = await getManager();
+      if (!current.status().space || !current.status().enabled) throw new CommandError('Host or join a space before enabling discovery.');
+      const choice = await vscode.window.showQuickPick([
+        { label: 'Enable repository discovery', value: true }, { label: 'Disable repository discovery', value: false },
+      ], { title: 'Optional GitHub peer discovery' });
+      if (!choice) return;
+      const key = DIRECTORY + folder!.uri.toString();
+      const previous = directory; directory = undefined; directoryStatus = undefined;
+      await previous?.stop();
+      await context.workspaceState.update(key, undefined);
+      if (!choice.value) return;
+      const text = await vscode.window.showInputBox({ title: 'GitHub repository for discovery', prompt: 'owner/repository (collaborator access required)', ignoreFocusOut: true });
+      if (!text) return;
+      const { repositoryName } = await import('./discovery');
+      const repository = repositoryName(text.trim());
+      const approved = await vscode.window.showWarningMessage(`Publish this space’s public device identity and relay endpoint in ${repository}? Repository discovery requests GitHub repo access. Invitations still control peer enrollment.`, { modal: true }, 'Enable discovery');
+      if (approved !== 'Enable discovery') return;
+      const session = await vscode.authentication.getSession('github', ['repo'], { createIfNone: true });
+      if (version !== stopVersion) return;
+      await context.workspaceState.update(key, { repository, account: session.account.id });
+      await startDirectory(current);
+    }),
     // Stop is always available even while a sign-in or connection command waits.
     vscode.commands.registerCommand('editchain-history.multiplayerStop', () => stop().then(() => ({ ok: true }), () => {
       void vscode.window.showErrorMessage('Sharing stopped; run EditChain: Clean Up Multiplayer Tunnels to retry cleanup.');
@@ -230,10 +286,12 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
   );
   const reset = () => {
     const previous = manager;
+    const discovery = directory; directory = undefined; directoryStatus = undefined;
     manager = undefined;
     folder = undefined;
     stopVersion++;
     void previous?.stop().catch(() => {});
+    void discovery?.stop().catch(() => {});
   };
   context.subscriptions.push(
     vscode.workspace.onDidChangeWorkspaceFolders(reset),

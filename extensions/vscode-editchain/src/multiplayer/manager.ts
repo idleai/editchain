@@ -4,8 +4,9 @@ import { NativeWorker, PeerBridge, PeerOptions, PeerProgress, PublicDevice } fro
 import { encodeInvitation, Invitation, JoinRequest, parseInvitation, parseRequest, savedInvitation } from './invitation';
 import { ClientTransport, HostLease, HostTransport, cleanupRelay, managementClient, RelayClient, RelayHost, RelayJournal, validateLease } from './relay';
 import { ProbeError } from '../devTunnels/probe';
+import { advertisement, Advertisement } from './discovery';
 
-export type SharingStatus = { space?: string; hosting: boolean; peers: { fingerprint?: string; state: string; progress?: PeerProgress }[]; message?: string };
+export type SharingStatus = { space?: string; enabled?: boolean; hosting: boolean; peers: { fingerprint?: string; state: string; progress?: PeerProgress }[]; message?: string };
 /** Contains bearer grants: store only in private application secret storage. */
 export type SavedSharing = { version: 1; space: string; host?: HostLease; peers: Invitation[] };
 export type RelayProvider = {
@@ -146,6 +147,35 @@ export class MultiplayerManager {
     return this.control({ type: 'devices', chain_dir: this.options.chain, space: this.space });
   }
 
+  /** A public endpoint description deliberately excludes the connect grant. */
+  async describe(): Promise<Advertisement | undefined> {
+    const host = this.host, generation = this.generation;
+    if (!this.enabled || !host || !this.lease) return undefined;
+    const { endpoint } = await host.descriptor();
+    if (generation !== this.generation || host !== this.host) return undefined;
+    return advertisement({ version: 1, protocol: 1, encoding: 1, space: this.requiredSpace(),
+      device: await this.device(), instance: this.lease.marker, endpoint, expiresAt: Date.now() + 10 * 60_000 });
+  }
+
+  /** Discovery refreshes existing grants only; it cannot approve a new device. */
+  async discover(candidates: Advertisement[]): Promise<void> {
+    if (!this.enabled) return;
+    const generation = this.generation, approved = await this.devices();
+    for (const input of candidates.slice(0, 32)) {
+      try {
+        const candidate = advertisement(input);
+        if (candidate.space !== this.space) continue;
+        const device = await this.verify(candidate.device);
+        if (!approved.some(known => known.certificate === device.certificate)) continue;
+        const peer = this.peers.get(device.fingerprint);
+        if (!peer || candidate.endpoint.tunnelId !== peer.invitation.endpoint.tunnelId || candidate.endpoint.clusterId !== peer.invitation.endpoint.clusterId) continue;
+        if (!this.enabled || generation !== this.generation) return;
+        peer.invitation = { ...peer.invitation, endpoint: candidate.endpoint };
+        this.schedule(device.fingerprint, 0);
+      } catch { /* Untrusted or stale directory metadata has no authority. */ }
+    }
+  }
+
   async revoke(fingerprint: string): Promise<void> {
     await this.control({ type: 'revoke', chain_dir: this.options.chain, space: this.requiredSpace(), fingerprint });
     clearTimeout(this.peers.get(fingerprint)?.timer);
@@ -164,7 +194,7 @@ export class MultiplayerManager {
 
   status(): SharingStatus {
     const edges = [...this.edges.values()];
-    return { space: this.space, hosting: !!this.host, message: this.message,
+    return { space: this.space, enabled: this.enabled, hosting: !!this.host, message: this.message,
       peers: [ ...edges.map(edge => ({ fingerprint: edge.device?.fingerprint ?? edge.clientKey,
         state: !edge.progress?.accepted ? 'Authenticating' : edge.progress.synchronizing ? 'Catching up'
           : edge.progress.unavailable ? 'Waiting for content' : 'Live', progress: edge.progress })),

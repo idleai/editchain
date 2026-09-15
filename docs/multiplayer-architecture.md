@@ -85,12 +85,12 @@ branch name or local path does not establish space membership. Audit existing
 node/actor/session ID generation before merging independently captured chains;
 preserve original operation IDs, parents, clocks and payload bytes.
 
-Proposed first enrollment flow: exchange an invitation through a trusted channel
+Enrollment flow: exchange an invitation through a trusted channel
 and explicitly approve the device identity. The invitation binds the space,
 endpoint and expected device fingerprint. Use a reviewed mutually authenticated
-secure channel in Rust; [TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html#section-4.4)
-with pinned device certificates is the proposed
-starting point, subject to library and IPC selection during the admission work.
+secure channel in Rust. The implementation uses Rustls
+[TLS 1.3](https://www.rfc-editor.org/rfc/rfc8446.html#section-4.4)
+with pinned device certificates on the dedicated native peer interface.
 Keep the SDK's transport encryption checks as well. This avoids building peer
 identity around the spike's same-process SSH-session comparison.
 
@@ -108,20 +108,31 @@ Repository-variable access through OAuth requires `repo` scope and collaborator
 access, beyond the spike's scopes.
 ([GitHub variable API](https://docs.github.com/en/rest/actions/variables#list-repository-variables))
 
+The implemented directory uses API version `2026-03-10`, polls once per minute,
+and publishes ten-minute advertisements in one variable per hosting resource.
+It validates the public schema, versions, expiry, space and certificate, and can
+refresh only an existing approved grant for the same tunnel and cluster. Unknown
+devices still require invitations. It cannot move a bearer grant to a different
+resource or reenroll a revoked device. API reads, page counts and response sizes
+are bounded. Deactivation/Stop withdraw the local advertisement; failed cleanup
+leaves stale metadata that expires at the application layer.
+
 ## 5. Replication contract
 
 Use a versioned, length-prefixed protocol with bounded frames, batches and
 in-flight bytes. Negotiate both peer-protocol and operation-encoding versions.
-The initial messages are proposed interfaces:
+The implemented messages are defined in [wire.rs](../crates/editchain-sync/src/wire.rs):
 
 | Message | Meaning |
 | --- | --- |
-| `Hello` / `Accept` | Agree on space, export scope, protocol and resource limits after device authentication. |
-| `Inventory` | Page through retained record identities and content digests in that scope. |
-| `NeedRecords` / `Records` | Request and transfer complete missing encoded operations. |
-| `NeedBlobs` / `BlobChunk` | Hydrate permitted references in bounded chunks. |
-| `AckRecords` / `AckBlobs` | Acknowledge only items persisted durably. |
-| `Ping` / `Close` / `Error` | Liveness, orderly teardown and bounded diagnostic codes. |
+| `Hello` | Check the space and both protocol/encoding versions after device authentication. |
+| `Inventory` / `Page` | Request a page of exact record identities and digests in that scope. |
+| `Need` / `Chunk` | Transfer one bounded record or permitted blob, including explicit offsets. |
+| `Missing` | Leave unavailable content pending for a later reconciliation round. |
+| `Ack` | Acknowledge a record or blob only after durable ingestion. |
+
+Idle sessions start another reconciliation round. The native bridge detects
+unresponsive peers and resets their connection; TLS owns authenticated shutdown.
 
 **Inventory must include evidence, not just accepted IDs.** The current
 [OpSet](../crates/editchain-core/src/admission.rs) retains every distinct encoded
@@ -196,12 +207,10 @@ received copies cannot be recalled.
 | **3. Live history vertical slice** | Attach the tunnel adapter to the kernel; a complete newly persisted operation appears in the other local History UI; offline work catches up after reconnect without reimporting source logs. |
 | **4. Discovery and three peers** | Add optional GitHub advertisements; Bob supplies Alice's previously received history to Carol while Alice is offline; duplicate connections and stale advertisements recover predictably. |
 
-Milestones 1 and 2 can proceed independently once space identity and the peer
-interface are agreed. Milestone 3 joins their results. The immediate next slice
-is **Host/Join in separate extension hosts with dummy payloads**, while defining
-the Rust record-inventory and durable-ack contracts.
-
-Before implementation, settle the initial export scope/backfill behavior,
-enrollment and revocation authority, and the Rust secure-channel/local-IPC
-combination. These are design choices; the successful relay spike does not
-decide them.
+The kernel, invitation flow, private relay, recovery and directory are now
+implemented. Real relay tests cover independent native processes, exact recorded
+diffs, restart catch-up, revocation and three-party forwarding with the source
+offline. Directory tests exercise the API contract through controlled responses;
+they have not published to a real repository. The next checkpoint exercises the
+packaged extension in two real VS Code instances. Different accounts and networks
+remain a separate validation item requiring another authorized environment.
