@@ -132,7 +132,7 @@ test('production webview is Rust-only: rust-history loader, never main.js or the
     'the removed GPU overlay stylesheet is not loaded');
 });
 
-test('extension contributes one history view with explicit live start/stop controls', () => {
+test('extension contributes one history view with live, tracking, and Dev Tunnels commands', () => {
   // Live controls operate the same history panel; no companion preview exists.
   assert.ok(PACKAGE.activationEvents.includes('onCommand:editchain-history.open'),
     'the default history command activates the extension');
@@ -140,6 +140,7 @@ test('extension contributes one history view with explicit live start/stop contr
     'no side-by-side GPU preview activation event may remain');
   const commands = PACKAGE.contributes.commands;
   assert.deepEqual(commands.map(entry => entry.command), [
+    'editchain-history.devTunnelsSpike', 'editchain-history.devTunnelsCleanup',
     'editchain-history.open', 'editchain-history.startLive', 'editchain-history.stopLive',
     'editchain-history.showTrackingStatus',
     'editchain-history.humanWork', 'editchain-history.startTracking', 'editchain-history.stopTracking',

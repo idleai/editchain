@@ -304,6 +304,52 @@ Prepared native opening plus 500 rows took 0.24–0.40 seconds on the local
 Initial preparation remains expensive and uses disk space. A cold Codex helper
 still rebuilds its source reducer. See [measurements and recovery](../../docs/native-memory.md).
 
+## Dev Tunnels spike
+
+Run **EditChain: Run Dev Tunnels Spike** from the Command Palette in the built
+extension. VS Code's built-in GitHub provider supplies the session; the first
+run may ask you to sign in or allow this extension to use the account with
+`read:user` and `read:org`. No personal access token, tunnel CLI, or `repo` scope
+is required by the implementation. Service acceptance of this account/token
+flow is part of the live experiment.
+
+The command creates one private, randomly named tunnel and one logical TCP
+port. It connects a host and client through Microsoft's relay, requires the
+SDK's encrypted V2 stream and a matching host key, exchanges 16 KiB of
+synthetic data in each direction, then measures 20 echo round trips. Neither
+endpoint opens a local TCP listener. No workspace files or history are sent.
+Both endpoints run in the current Node.js extension host, including the remote
+machine in a Remote SSH/container workspace. This first spike measures a
+**same-account relay path**, without testing cross-account admission,
+cross-network latency, durable replication, or reconnect behavior.
+
+Open **Output → EditChain Dev Tunnels Spike** for the account label, stages,
+payload counts, setup time, and RTT min/p50/p95/max. A `PASS` is emitted only
+after the payload checks and tunnel deletion succeed. The network phase has
+a 90-second deadline; cancellation still attempts cleanup with fresh deadlines.
+The 20 samples are a smoke test, not a representative latency benchmark.
+
+Only pending resource names and their account IDs are stored in extension
+global state. Credentials and payloads are not stored or logged. After an
+interrupted run, **EditChain: Clean Up Dev Tunnels Spike** retries deletion for
+that account; starting another spike also performs recovery first. The tunnel
+requests a one-hour inactivity expiry as a fallback for an abrupt process exit.
+
+The connections/management/contracts packages are pinned to `1.3.56`, with
+SSH/SSH-TCP `3.12.42`. Local tests exercise actual SDK encrypted streams, HTTP
+authorization construction with a stub service, VS Code authentication through
+a stub provider, integrity failures, downgrade rejection, and cleanup. Run:
+
+```sh
+npm run compile
+node --test test/harness/devTunnels*.test.js
+```
+
+The pinned SDK currently brings a moderate npm advisory through its `uuid` 3
+dependency ([GHSA-w5hq-g745-h8pq](https://github.com/advisories/GHSA-w5hq-g745-h8pq)).
+The advisory concerns buffered v3/v5/v6 calls; the inspected SDK uses v4. No
+dependency override or audit suppression is applied in this spike.
+
 ## Runtime architecture
 
 ```text

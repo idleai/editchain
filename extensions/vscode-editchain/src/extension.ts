@@ -5,6 +5,7 @@ import { resolveServicePath, StdioClient } from './stdioClient';
 import { createLiveSync, LiveProviderRequest } from './liveHost';
 import { LiveSync } from './liveSync';
 import { LiveQueue } from './liveQueue';
+import { registerDevTunnelsCommands } from './devTunnels/commands';
 
 // The single history panel. Reused across `open` invocations so we never create
 // two webviews of the same type (which races VS Code's service-worker
@@ -101,6 +102,7 @@ type RecordedDiffHunk = Readonly<{
  * messages between the webview and the service, and owns the webview lifecycle.
  */
 export function activate(context: vscode.ExtensionContext): void {
+  registerDevTunnelsCommands(context);
   const client = new StdioClient();
   context.subscriptions.push({ dispose: () => client.stop() });
 
