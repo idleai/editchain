@@ -23,6 +23,9 @@ enum Request {
     Identity {
         device_dir: PathBuf,
     },
+    Scope {
+        chain_dir: PathBuf,
+    },
     Configure {
         chain_dir: PathBuf,
         space: String,
@@ -66,6 +69,9 @@ impl Worker {
             Request::Verify { certificate } => Ok(json!(PublicDevice::parse(&certificate)?)),
             Request::Identity { device_dir } => {
                 Ok(json!(DeviceIdentity::load_or_create(&device_dir)?.public()))
+            }
+            Request::Scope { chain_dir } => {
+                Ok(json!({ "space": Replica::bound_space(&chain_dir)? }))
             }
             Request::Configure {
                 chain_dir,

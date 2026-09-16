@@ -148,9 +148,9 @@ such; they are not evidence of a second network.
   [diff after restart](../extensions/vscode-editchain/trace/multiplayer/host/received-after-reload-diff.png).
   VSIX SHA-256: `d57eaf860a37821c9927df8db85b849bf39eed8c85e5d43badc2cbd69fc32546`.
 
-## Remaining validation and known limits
+## Recovery review checkpoints
 
-### Recovery review: local capture
+### Local capture
 
 - A conflicting received variant no longer permanently blocks the editor
   checkpoint. The recorder rebuilds its derived state from canonical sources,
@@ -163,6 +163,20 @@ such; they are not evidence of a second network.
 - Regression coverage includes a conflict at the recorder frontier, loss of a
   previously used snapshot, exact retries, and rebuilding the derived cache.
   `./scripts/lint.sh`: exit 0, `RESULT: PASS`.
+
+### Durable space recovery
+
+- The read-only native `scope` command returns the existing on-disk binding.
+  Host and Resume recover it when VS Code workspace metadata is missing,
+  including after moving a chain. Inspection cannot create storage or widen
+  the history baseline. Corrupt or unsupported metadata fails explicitly.
+- A conflicting cached space still requires a separate replica; recovery
+  never silently rebinds history or changes device approvals.
+- Native scope validation and 11 extension/native recovery tests passed,
+  including baseline preservation, moved storage and stale metadata.
+  `./scripts/lint.sh`: exit 0, `RESULT: PASS`.
+
+## Remaining validation and known limits
 
 - Different-account and different-network joins need another authorized
   environment. Use the [Host/Join steps](../extensions/vscode-editchain/README.md#multiplayer-history),
@@ -188,7 +202,7 @@ such; they are not evidence of a second network.
 ## Native peer interface
 
 `editchain-peer` reads local JSON frames with a four-byte little-endian length
-bounded to 512 KiB. Commands are `identity`, `verify`, `configure`, `approve`, `revoke`,
+bounded to 512 KiB. Commands are `identity`, `verify`, `scope`, `configure`, `approve`, `revoke`,
 `devices`, `open`, `turn`, and `close`. One worker owns one peer connection.
 Network input is base64 inside `turn`, decoded with a 64 KiB bound, and passed
 only to TLS. A turn returns up to 256 KiB of opaque output plus public identity

@@ -2,6 +2,8 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { randomUUID, randomBytes } = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
 const { Duplex, PassThrough } = require('node:stream');
 const { MultiplayerManager } = require('../../out/multiplayer/manager');
 const { parseInvitation, savedInvitation } = require('../../out/multiplayer/invitation');
@@ -72,6 +74,50 @@ function environment() {
   return { files, wire, saved, spaces, create, async stop() { await Promise.all([...managers].map(manager => manager.stop())); files.stop(); } };
 }
 const live = manager => manager.status().peers.filter(peer => peer.state === 'Live').length;
+
+test('durable space and private baseline survive lost workspace metadata and a moved chain', async () => {
+  const env = environment();
+  try {
+    const a = env.files.workspace('a'), b = env.files.workspace('b');
+    await a.start();
+    const host = env.create(a), guest = env.create(b), request = await guest.joinRequest();
+    const first = parseInvitation(await host.hostHistory(request, false));
+    const ledger = fs.readFileSync(path.join(a.chain, 'multiplayer/scope.json'));
+    assert.ok(JSON.parse(ledger).excluded.length > 0);
+    await host.suspend();
+    env.spaces.delete(a.root);
+    const restored = env.create(a);
+    const second = parseInvitation(await restored.hostHistory(request, false));
+    assert.equal(second.space, first.space);
+    assert.deepEqual(fs.readFileSync(path.join(a.chain, 'multiplayer/scope.json')), ledger);
+    const saved = env.saved.get(a.root);
+    await restored.suspend();
+    const moved = { ...a, chain: path.join(env.files.directory, 'moved-chain') };
+    fs.renameSync(a.chain, moved.chain);
+    env.spaces.delete(a.root);
+    const resumed = env.create(moved);
+    await resumed.resume(saved);
+    assert.equal(resumed.status().space, first.space);
+    assert.equal(resumed.status().hosting, true);
+    assert.equal((await resumed.devices()).length, 1);
+    assert.deepEqual(fs.readFileSync(path.join(moved.chain, 'multiplayer/scope.json')), ledger);
+  } finally { await env.stop(); }
+});
+
+test('stale workspace metadata cannot replace a durable space binding', async () => {
+  const env = environment();
+  try {
+    const a = env.files.workspace('a'), b = env.files.workspace('b');
+    const host = env.create(a), guest = env.create(b), request = await guest.joinRequest();
+    await host.hostHistory(request, false);
+    await host.suspend();
+    const ledger = fs.readFileSync(path.join(a.chain, 'multiplayer/scope.json'));
+    env.spaces.set(a.root, 'wrong-space');
+    const stale = env.create(a);
+    await assert.rejects(stale.hostHistory(request, false), /different collaboration space/);
+    assert.deepEqual(fs.readFileSync(path.join(a.chain, 'multiplayer/scope.json')), ledger);
+  } finally { await env.stop(); }
+});
 
 test('automatic reconnect repairs a broken stream; restart never reenrolls a removed device', { timeout: 30_000 }, async () => {
   const env = environment();

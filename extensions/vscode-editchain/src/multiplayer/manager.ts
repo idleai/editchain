@@ -72,7 +72,7 @@ export class MultiplayerManager {
     const guest = (await this.inspectRequest(requestText)).device;
     const identity = await this.device();
     if (guest.fingerprint === identity.fingerprint) throw new ProbeError('Use a different VS Code profile or device for the joining replica.');
-    await this.configure(this.space ?? randomUUID(), backfill);
+    await this.configure(undefined, backfill);
     await this.approve(guest);
     this.requireGeneration(generation);
     this.enabled = true;
@@ -103,10 +103,11 @@ export class MultiplayerManager {
   /** Reopen only an already bound space and its still-approved devices. */
   async resume(input: SavedSharing): Promise<void> {
     if (this.enabled) return;
-    if (input?.version !== 1 || !this.space || input.space !== this.space || !Array.isArray(input.peers) || input.peers.length > 32) {
+    const generation = this.generation;
+    if (input?.version !== 1 || typeof input.space !== 'string' || !input.space || !Array.isArray(input.peers) || input.peers.length > 32 ||
+      input.space !== await this.recoverSpace()) {
       throw new ProbeError('Saved sharing does not match this workspace.');
     }
-    const generation = this.generation;
     const approved = await this.devices();
     await this.device();
     const peers: Invitation[] = [];
@@ -139,6 +140,7 @@ export class MultiplayerManager {
   }
 
   async devices(): Promise<PublicDevice[]> {
+    if (!this.space) await this.recoverSpace();
     if (!this.space) return [];
     return this.control({ type: 'devices', chain_dir: this.options.chain, space: this.space });
   }
@@ -327,7 +329,19 @@ export class MultiplayerManager {
     return invitation;
   }
 
-  private async configure(space: string, backfill: boolean): Promise<void> {
+  private async recoverSpace(): Promise<string | undefined> {
+    const binding = await this.control<{ space: string | null }>({ type: 'scope', chain_dir: this.options.chain });
+    if (binding.space) {
+      if (this.space && this.space !== binding.space) throw new ProbeError('This workspace is already bound to a different collaboration space. Use a separate workspace replica.');
+      this.space = binding.space;
+      await this.options.saveSpace(this.space);
+    }
+    return binding.space ?? undefined;
+  }
+
+  private async configure(space: string | undefined, backfill: boolean): Promise<void> {
+    const durable = await this.recoverSpace();
+    space ??= durable ?? this.space ?? randomUUID();
     if (this.space && this.space !== space) throw new ProbeError('This workspace is already bound to a different collaboration space. Use a separate workspace replica.');
     await this.control({ type: 'configure', chain_dir: this.options.chain, space, backfill });
     this.space = space;

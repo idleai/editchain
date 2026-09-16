@@ -50,6 +50,40 @@ struct Scope {
     received_blobs: BTreeSet<[u8; 32]>,
 }
 
+impl Scope {
+    fn read(root: &Path) -> io::Result<Self> {
+        const LIMIT: u64 = 128 * 1024 * 1024;
+        let file = fs::File::open(root.join("multiplayer/scope.json"))?;
+        if file.metadata()?.len() > LIMIT {
+            return Err(invalid("scope metadata exceeds limit"));
+        }
+        let mut bytes = Vec::new();
+        let _read = file.take(LIMIT.saturating_add(1)).read_to_end(&mut bytes)?;
+        if u64::try_from(bytes.len()).map_err(io::Error::other)? > LIMIT {
+            return Err(invalid("scope metadata exceeds limit"));
+        }
+        let scope: Self =
+            serde_json::from_slice(&bytes).map_err(|_error| invalid("invalid scope metadata"))?;
+        if scope.version != 1 {
+            return Err(invalid("unsupported scope version"));
+        }
+        validate_space(&scope.space)?;
+        Ok(scope)
+    }
+}
+
+fn validate_space(space: &str) -> io::Result<()> {
+    if space.is_empty()
+        || space.len() > 128
+        || !space
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(invalid("invalid collaboration space"));
+    }
+    Ok(())
+}
+
 /// Stable inventory and exact bytes for one bounded reconciliation round.
 #[derive(Debug, Default)]
 pub struct Snapshot {
@@ -121,20 +155,25 @@ pub struct Replica {
 }
 
 impl Replica {
+    /// Inspect the durable binding without creating storage or changing consent.
+    ///
+    /// # Errors
+    /// Rejects unreadable, oversized, invalid or unsupported scope metadata.
+    pub fn bound_space(root: &Path) -> io::Result<Option<String>> {
+        match Scope::read(root) {
+            Ok(scope) => Ok(Some(scope.space)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Enable a space, capturing an exclusion baseline unless backfill was chosen.
     /// Existing scope decisions persist across reconnects and process restarts.
     ///
     /// # Errors
     /// Rejects invalid/mismatched spaces, a busy writer, or failed durable metadata.
     pub fn open(root: &Path, space: &str, backfill: bool) -> io::Result<Self> {
-        if space.is_empty()
-            || space.len() > 128
-            || !space
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        {
-            return Err(invalid("invalid collaboration space"));
-        }
+        validate_space(space)?;
         let replica = Self {
             root: root.to_owned(),
             space: space.to_owned(),
@@ -388,12 +427,8 @@ impl Replica {
     }
 
     fn load_scope(&self) -> io::Result<Scope> {
-        let path = self.scope_path();
-        if fs::metadata(&path)?.len() > 128 * 1024 * 1024 {
-            return Err(invalid("scope metadata exceeds limit"));
-        }
-        let scope: Scope = serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)?;
-        if scope.version != 1 || scope.space != self.space {
+        let scope = Scope::read(&self.root)?;
+        if scope.space != self.space {
             return Err(invalid(
                 "workspace belongs to a different collaboration space",
             ));

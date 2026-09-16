@@ -164,6 +164,52 @@ fn independent_stores_converge_gaps_conflicts_replays_and_restart() -> io::Resul
 }
 
 #[test]
+fn scope_inspection_is_read_only_and_rejects_damaged_bindings() -> io::Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().join("chain");
+    check_eq!(
+        Replica::bound_space(&root)?,
+        None,
+        "unconfigured chain has no binding"
+    );
+    check!(!root.exists(), "inspection cannot create storage");
+    let _replica = Replica::open(&root, "bound-space", false)?;
+    let path = root.join("multiplayer/scope.json");
+    let original = std::fs::read(&path)?;
+    check_eq!(
+        Replica::bound_space(&root)?,
+        Some("bound-space".to_owned()),
+        "binding is recoverable"
+    );
+    check_eq!(
+        &std::fs::read(&path)?,
+        &original,
+        "inspection preserves the full ledger"
+    );
+    for (field, value) in [
+        ("version", serde_json::json!(2)),
+        ("space", serde_json::json!("")),
+    ] {
+        let mut damaged: serde_json::Value = serde_json::from_slice(&original)?;
+        let target = damaged
+            .get_mut(field)
+            .ok_or_else(|| io::Error::other("fixture field"))?;
+        *target = value;
+        std::fs::write(&path, serde_json::to_vec(&damaged)?)?;
+        check!(
+            Replica::bound_space(&root).is_err(),
+            "unsupported metadata cannot be mistaken for an unconfigured chain"
+        );
+    }
+    std::fs::write(&path, b"incomplete")?;
+    check!(
+        Replica::bound_space(&root).is_err(),
+        "corruption cannot mint a new space"
+    );
+    Ok(())
+}
+
+#[test]
 fn new_history_scope_persists_and_backfill_is_explicit() -> io::Result<()> {
     let dir = tempfile::tempdir()?;
     seed(dir.path(), &[record(1, b"private history")?])?;
