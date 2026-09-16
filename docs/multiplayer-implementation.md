@@ -150,6 +150,20 @@ such; they are not evidence of a second network.
 
 ## Remaining validation and known limits
 
+### Recovery review: local capture
+
+- A conflicting received variant no longer permanently blocks the editor
+  checkpoint. The recorder rebuilds its derived state from canonical sources,
+  retains conflicting derivations as evidence, and settles replay before
+  admitting the next observation. Quarantined snapshots cannot supply future
+  revisions.
+- Exact local retries and sequence checks can consult a unique retained local
+  variant, distinguished by the received-byte receipts. This never restores
+  that variant to canonical history or acknowledges changed retry content.
+- Regression coverage includes a conflict at the recorder frontier, loss of a
+  previously used snapshot, exact retries, and rebuilding the derived cache.
+  `./scripts/lint.sh`: exit 0, `RESULT: PASS`.
+
 - Different-account and different-network joins need another authorized
   environment. Use the [Host/Join steps](../extensions/vscode-editchain/README.md#multiplayer-history),
   verify both fingerprints, type on both devices, inspect the received diffs,

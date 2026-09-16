@@ -1,5 +1,7 @@
 //! Durable admission of versioned VS Code observations.
 
+#[cfg(test)]
+mod conflict_tests;
 mod context;
 mod encoding;
 #[cfg(test)]
@@ -50,7 +52,7 @@ fn record_inner(
     let mut store = SegmentStore::open_wait(&root, std::time::Duration::from_secs(2))?;
     projection.refresh()?;
     let mut blobs = BlobStore::new(root.join("blobs"))?;
-    identity::repair(&request.events, projection.tail.chain(), &mut blobs)?;
+    identity::repair(&request.events, projection.tail.chain(), &root, &mut blobs)?;
     projection.synchronize(&mut store, &mut blobs, request, &BTreeMap::new())?;
     let prepared_ms = started.elapsed().as_millis();
     let mut staged = editchain_core::OpSet::new();
@@ -82,7 +84,7 @@ fn record_inner(
                 .into())
             }
             Admission::Accepted => {
-                identity::validate_sequence(event, &op, projection.tail.chain(), &sources)?;
+                identity::validate_sequence(event, &op, projection.tail.chain(), &root, &sources)?;
                 projection.admitted(event, op.id);
                 drop(sources.insert(op.id, op.clone()));
                 blobs.write(&raw)?;
@@ -98,13 +100,8 @@ fn record_inner(
                         other @ (Admission::Duplicate | Admission::Conflict) => other,
                     };
                 match marker_admission {
-                    Admission::Accepted => page.add_record(0, marker_bytes),
+                    Admission::Accepted | Admission::Conflict => page.add_record(0, marker_bytes),
                     Admission::Duplicate => {}
-                    Admission::Conflict => {
-                        return Err(
-                            "editor observation marker conflicts with retained evidence".into()
-                        )
-                    }
                 }
                 page.add_record(0, encoded);
                 accepted = accepted.saturating_add(1);

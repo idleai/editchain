@@ -36,10 +36,9 @@ impl Projection {
     ) -> Result<Op> {
         let mut op = super::event_op(event, raw)?;
         if let Some(identity) = &event.identity {
-            op.parents = self
-                .tail
-                .chain()
-                .get(op.id)
+            let retained = super::remote::retained_source(self.tail.chain(), &self.root, op.id)?;
+            op.parents = retained
+                .as_ref()
                 .or_else(|| staged.get(&op.id))
                 .map_or_else(
                     || {
@@ -103,7 +102,18 @@ impl Projection {
         let receipts = super::remote::Receipts::read(&self.root)?;
         for id in &delta.removed {
             if !receipts.foreign(self.tail.chain(), &self.root, *id)? {
-                return Err("editor history contains newly conflicting source evidence".into());
+                // Invalidate cached revisions, parent frontiers and attribution
+                // when their evidence leaves canonical admission. The records
+                // remain retained; replay must not select either variant.
+                self.normalizer = super::normalize::Normalizer::default();
+                self.pending = self
+                    .tail
+                    .chain()
+                    .shared_ops()
+                    .filter(|op| op.tags.matches_all(Tags::IMPORT | Tags::HUMAN))
+                    .map(|op| op.as_ref().clone())
+                    .collect();
+                return Ok(());
             }
         }
         self.pending
@@ -121,6 +131,23 @@ impl Projection {
         fresh: &BTreeMap<OpId, &EditorEvent>,
     ) -> Result<()> {
         self.refresh()?;
+        // Replaying after a source conflict can quarantine an old derivation.
+        // Settle that invalidation before using the normalizer's frontier for
+        // the next source admission. Exact duplicate results end the replay.
+        while !self.pending.is_empty() {
+            self.derive(store, blobs, request, fresh)?;
+            self.refresh()?;
+        }
+        Ok(())
+    }
+
+    fn derive(
+        &mut self,
+        store: &mut SegmentStore,
+        blobs: &mut BlobStore,
+        request: &editchain_protocol::editor::RecordEditorEvents,
+        fresh: &BTreeMap<OpId, &EditorEvent>,
+    ) -> Result<()> {
         let chain = Path::new(&request.workspace_path).join(&request.chain_dir);
         let mut sources = std::mem::take(&mut self.pending);
         sources.retain(|op| op.tags.matches_all(Tags::IMPORT | Tags::HUMAN));
@@ -154,14 +181,14 @@ impl Projection {
                     other @ (Admission::Duplicate | Admission::Conflict) => other,
                 };
                 match admission {
-                    Admission::Accepted => {
+                    Admission::Accepted | Admission::Conflict => {
+                        // A peer may have supplied a conflicting derivation,
+                        // or replay may now lack a quarantined source. Retain
+                        // both exact results without blocking unrelated work.
                         page.add_record(0, encoded);
                         count = count.saturating_add(1);
                     }
                     Admission::Duplicate => {}
-                    Admission::Conflict => {
-                        return Err("human work derivation conflicts with retained evidence".into())
-                    }
                 }
                 if count >= 128 {
                     store.append_page(&page)?;
@@ -173,7 +200,7 @@ impl Projection {
         if count > 0 {
             store.append_page(&page)?;
         }
-        self.refresh()
+        Ok(())
     }
 }
 

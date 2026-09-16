@@ -5,14 +5,44 @@ use std::fs::File;
 use std::io::{self, Read as _};
 use std::path::Path;
 
-use editchain_core::OpId;
-use editchain_store::{read_encoded_at, IndexedChain};
+use editchain_core::{Op, OpId};
+use editchain_store::{format::decode_op, read_encoded_at, IndexedChain};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 struct Receipt {
     id: OpId,
     digest: [u8; 32],
+}
+
+/// Recover the exact local admission for retries and sequence checks only.
+/// This does not restore a quarantined operation to the canonical projection.
+pub(super) fn retained_source(
+    chain: &IndexedChain,
+    root: &Path,
+    id: OpId,
+) -> io::Result<Option<Op>> {
+    if let Some(op) = chain.get(id) {
+        return Ok(Some(op.clone()));
+    }
+    let locations: Vec<_> = chain.evidence_locations(id).collect();
+    if locations.is_empty() {
+        return Ok(None);
+    }
+    let receipts = Receipts::read(root)?;
+    let mut local = None;
+    for location in locations {
+        let encoded = read_encoded_at(root, location)?;
+        let digest = *blake3::hash(&encoded).as_bytes();
+        if !receipts.received.contains(&Receipt { id, digest }) {
+            // Without a unique local admission there is no safe retry parent.
+            if local.is_some() {
+                return Ok(None);
+            }
+            local = Some(decode_op(&encoded).map_err(io::Error::other)?);
+        }
+    }
+    Ok(local)
 }
 
 /// Read only the versioned receipt fields of the multiplayer scope ledger.
