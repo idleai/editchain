@@ -90,12 +90,10 @@ impl Membership {
     pub fn require(&self, certificate: &[u8]) -> io::Result<PublicDevice> {
         let key = crate::identity::fingerprint(certificate);
         let members = self.load()?;
-        let device = members.devices.get(&key).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "device is not approved for this space",
-            )
-        })?;
+        let device = members
+            .devices
+            .get(&key)
+            .ok_or_else(|| crate::authentication_failed("device is not approved for this space"))?;
         if crate::identity::certificate_der(&device.certificate)?.as_ref() != certificate {
             return Err(invalid("device certificate pin mismatch"));
         }

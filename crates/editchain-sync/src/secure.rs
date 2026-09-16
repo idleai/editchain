@@ -280,8 +280,5 @@ impl SecurePeer {
 
 fn tls_error(_error: rustls::Error) -> io::Error {
     // No certificate, content bytes, or underlying library diagnostics cross IPC.
-    io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        "peer TLS authentication or protocol failed",
-    )
+    crate::authentication_failed("peer TLS authentication or protocol failed")
 }

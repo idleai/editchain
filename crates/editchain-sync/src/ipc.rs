@@ -181,8 +181,13 @@ pub fn run_worker(reader: &mut impl Read, writer: &mut impl Write) -> io::Result
 
 fn error_code(error: &io::Error) -> &'static str {
     let kind = error.kind();
-    if kind == io::ErrorKind::PermissionDenied {
+    if error
+        .get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<crate::AuthenticationFailure>)
+    {
         "authentication_failed"
+    } else if kind == io::ErrorKind::PermissionDenied {
+        "storage_permission_denied"
     } else if kind == io::ErrorKind::WouldBlock {
         "storage_busy"
     } else if matches!(

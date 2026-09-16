@@ -192,6 +192,17 @@ such; they are not evidence of a second network.
   guard recording zero socket, fetch or GitHub CLI attempts.
   `./scripts/lint.sh`: exit 0, `RESULT: PASS`.
 
+### Permission diagnostics
+
+- Native peer authentication failures now carry a distinct internal error type.
+  A local filesystem permission failure returns `storage_permission_denied`,
+  while an unapproved/revoked device or TLS failure retains
+  `authentication_failed`. Neither response exposes paths or credentials.
+- Real worker probes with unreadable membership metadata and an unwritable
+  policy directory returned the storage code. The production extension decoder
+  preserved it. Existing TLS/pin/revocation tests, all 189 extension tests,
+  multiplayer type checks and `./scripts/lint.sh` passed (exit 0, `RESULT: PASS`).
+
 ## Remaining validation and known limits
 
 - Different-account and different-network joins need another authorized

@@ -34,6 +34,24 @@ fn invalid(message: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
+#[derive(Debug)]
+struct AuthenticationFailure(&'static str);
+
+impl std::fmt::Display for AuthenticationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for AuthenticationFailure {}
+
+fn authentication_failed(message: &'static str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        AuthenticationFailure(message),
+    )
+}
+
 // Local capture and peer workers serialize short durable transactions. Wait in
 // this native worker, without holding a lock or blocking the extension host.
 // A persistently busy writer still fails without an acknowledgment; reconnect

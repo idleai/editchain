@@ -35,7 +35,7 @@ export class NativeWorker {
           clearTimeout(pending.timer);
           if (value.ok) pending.resolve(value.result);
           else {
-            const codes = ['authentication_failed', 'storage_busy', 'invalid_request_or_peer_data', 'connection_closed', 'storage_or_transport_failure'];
+            const codes = ['authentication_failed', 'storage_permission_denied', 'storage_busy', 'invalid_request_or_peer_data', 'connection_closed', 'storage_or_transport_failure'];
             const code = codes.includes(value.error) ? value.error : 'invalid_native_response';
             pending.reject(new NativePeerError(`Native multiplayer: ${code}`));
           }
