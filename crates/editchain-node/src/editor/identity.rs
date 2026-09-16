@@ -61,12 +61,12 @@ pub(super) fn validate_sequence(
         ..op.id
     };
     let retained = super::remote::retained_source(chain, root, previous)?;
-    let previous = staged
-        .get(&previous)
-        .or(retained.as_ref())
-        .ok_or("editor stream has a sequence gap; replay the pending outbox first")?;
-    if previous.actor != op.actor || previous.scope != op.scope {
-        return Err("editor identity cannot change within a recorder session".into());
+    if let Some(previous) = staged.get(&previous).or(retained.as_ref()) {
+        if previous.actor != op.actor || previous.scope != op.scope {
+            return Err("editor identity cannot change within a recorder session".into());
+        }
+    } else if !super::remote::predecessor_matches(chain, root, previous, op)? {
+        return Err("editor stream has a sequence gap or disputed identity; replay the pending outbox first".into());
     }
     Ok(())
 }

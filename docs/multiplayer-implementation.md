@@ -131,11 +131,11 @@ such; they are not evidence of a second network.
   skips; TypeScript compilation and the UI harness type/syntax checks passed.
   `./scripts/lint.sh` exited 0: `RESULT: PASS` (fmt, check, clippy, tests, doc tests,
   deny). No quality policies or suppressions changed.
-- Final release-binary relay run: three replicas passed large-content transfer,
+- Initial release-binary relay run: three replicas passed large-content transfer,
   exact historical diffs, restart catch-up, explicit reconnect, forwarding while
   the source was offline, and revocation. Setup was 1,806 ms; total 14,574 ms;
   19 content blobs were retained and both temporary tunnels were deleted.
-- Final packaged UI run: both VS Code cases passed in about 105 seconds of
+- Initial packaged UI run: both VS Code cases passed in about 105 seconds of
   scenario execution. Actual device approval, typing, received History rows,
   exact native diffs, unchanged receiving files and recovery after a full host
   restart all passed. Tunnel cleanup completed; the log audit found no account
@@ -146,7 +146,9 @@ such; they are not evidence of a second network.
   [run result](../extensions/vscode-editchain/trace/multiplayer/run.json),
   [host observations](../extensions/vscode-editchain/trace/multiplayer/host/observations.json),
   [diff after restart](../extensions/vscode-editchain/trace/multiplayer/host/received-after-reload-diff.png).
-  VSIX SHA-256: `d57eaf860a37821c9927df8db85b849bf39eed8c85e5d43badc2cbd69fc32546`.
+  That UI run used VSIX SHA-256
+  `d57eaf860a37821c9927df8db85b849bf39eed8c85e5d43badc2cbd69fc32546`;
+  the rebuilt recovery package is verified below.
 
 ## Recovery review checkpoints
 
@@ -158,8 +160,11 @@ such; they are not evidence of a second network.
   admitting the next observation. Quarantined snapshots cannot supply future
   revisions.
 - Exact local retries and sequence checks can consult a unique retained local
-  variant, distinguished by the received-byte receipts. This never restores
-  that variant to canonical history or acknowledges changed retry content.
+  variant, distinguished by the received-byte receipts. A retry can also match
+  complete retained source bytes when all variants have received receipts.
+  Sequence checks require an undisputed actor/stream when a unique local
+  admission is unavailable. Neither operation restores a variant to canonical
+  history or acknowledges new conflicting retry content.
 - Regression coverage includes a conflict at the recorder frontier, loss of a
   previously used snapshot, exact retries, and rebuilding the derived cache.
   `./scripts/lint.sh`: exit 0, `RESULT: PASS`.
@@ -202,6 +207,31 @@ such; they are not evidence of a second network.
   policy directory returned the storage code. The production extension decoder
   preserved it. Existing TLS/pin/revocation tests, all 189 extension tests,
   multiplayer type checks and `./scripts/lint.sh` passed (exit 0, `RESULT: PASS`).
+
+### Final recovery validation
+
+- An additional regression covered a local baseline that a peer independently
+  supplied before conflicting with it. Every new quarantine now invalidates
+  cached recorder state, regardless of received receipts. Both receipt cases
+  cover continued recording, exact retries, cold recovery and rejection of
+  changed retry content or recorder identity.
+- Final `./scripts/lint.sh`: exit 0, `RESULT: PASS`; no quality policy,
+  thresholds, exclusions or suppressions changed. The extension build, all
+  189 harness tests and multiplayer type checks passed.
+- Extracted the rebuilt VSIX and ran 58 multiplayer/Dev Tunnels tests against
+  its actual runtime and native binaries. All passed, with zero skips and zero
+  socket/fetch/GitHub CLI attempts under the offline guard. The packaged service
+  also accepted new capture and exact retries after a conflicting record was
+  injected through the public replication API, including after service restart.
+- Verified all 29 packaged runtime files and both executable binaries against
+  the fresh build; test automation remains excluded. Current
+  [VSIX](../outputs/editchain-history-multiplayer.vsix) SHA-256:
+  `26b761be08d0a3c565c3d56ca549532ef53d6a412495574076ea01882ac132ee`.
+  [Package verification](../outputs/multiplayer-recovery-verification.json).
+- These recovery checks used disposable local fixtures and controlled byte
+  transports. They did not rerun the live relay or VS Code UI scenarios, create
+  cloud tunnels, or access an account token. Different-account/network testing
+  remains outstanding.
 
 ## Remaining validation and known limits
 

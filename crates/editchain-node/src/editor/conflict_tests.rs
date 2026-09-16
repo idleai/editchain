@@ -52,6 +52,19 @@ fn conflict(root: &Path, original: &Op) -> Result<()> {
     Ok(())
 }
 
+fn receive_original(root: &Path, source: &Op) -> Result<()> {
+    let ledger = root.join("multiplayer/scope.json");
+    let mut value: Value = serde_json::from_slice(&std::fs::read(&ledger)?)?;
+    let received = value
+        .get_mut("received")
+        .and_then(Value::as_array_mut)
+        .ok_or("receipts")?;
+    received
+        .push(json!({ "id": source.id, "digest": blake3::hash(&encode_op(source)?).as_bytes() }));
+    atomic_write(&ledger, &serde_json::to_vec(&value)?)?;
+    Ok(())
+}
+
 fn work(root: &Path, sequence: u64) -> Result<HumanWorkRecord> {
     for (op, _) in CanonicalChain::read(root)?.located_ops() {
         if let OpKind::Import(import) = &op.kind {
@@ -69,6 +82,15 @@ fn work(root: &Path, sequence: u64) -> Result<HumanWorkRecord> {
 
 #[test]
 fn local_source_conflict_recovers_capture_without_reusing_quarantined_snapshot() -> Result<()> {
+    recover_snapshot(false)
+}
+
+#[test]
+fn independently_received_baseline_still_invalidates_a_cached_local_snapshot() -> Result<()> {
+    recover_snapshot(true)
+}
+
+fn recover_snapshot(received_baseline: bool) -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let root = temporary.path().join(".editchain");
     let document = json!({ "id": "buffer", "uri": "file:///a.rs", "path": "a.rs", "version": 1 });
@@ -101,6 +123,11 @@ fn local_source_conflict_recovers_capture_without_reusing_quarantined_snapshot()
         .ok_or("local source")?
         .0;
     conflict(&root, source)?;
+    if received_baseline {
+        // A peer can independently provide an exact private-baseline record.
+        // Its received receipt does not mean the local recorder never used it.
+        receive_original(&root, source)?;
+    }
     let continued = request(temporary.path(), vec![read(4)?]);
     check(
         record(&continued, &mut Encoding::default())?.get("accepted") == Some(&json!(1)),
@@ -121,7 +148,7 @@ fn local_source_conflict_recovers_capture_without_reusing_quarantined_snapshot()
     )?;
     check(
         record(&initial, &mut Encoding::default())?.get("replayed") == Some(&json!(3)),
-        "exact local retries keep their admitted parents",
+        "exact retries keep their admitted parents even with received receipts",
     )?;
     check(
         CanonicalChain::read(&root)?.stats().quarantined >= 2,
@@ -142,6 +169,15 @@ fn local_source_conflict_recovers_capture_without_reusing_quarantined_snapshot()
 
 #[test]
 fn conflict_at_recorder_frontier_does_not_create_a_false_sequence_gap() -> Result<()> {
+    recover_frontier(false)
+}
+
+#[test]
+fn received_variants_preserve_sequence_and_exact_retries_without_changing_identity() -> Result<()> {
+    recover_frontier(true)
+}
+
+fn recover_frontier(received_baseline: bool) -> Result<()> {
     let temporary = tempfile::tempdir()?;
     let root = temporary.path().join(".editchain");
     let started = event(
@@ -157,6 +193,32 @@ fn conflict_at_recorder_frontier_does_not_create_a_false_sequence_gap() -> Resul
         .ok_or("local source")?
         .0;
     conflict(&root, source)?;
+    if received_baseline {
+        receive_original(&root, source)?;
+    }
+    let mut altered = event(
+        1,
+        &json!({"type":"tracking_started", "dwell_ms":2000, "vscode_version":"1.85.0"}),
+    )?;
+    altered.time_ms = 42;
+    check(
+        record(
+            &request(temporary.path(), vec![altered]),
+            &mut Encoding::default(),
+        )
+        .is_err(),
+        "quarantine cannot acknowledge a changed retry",
+    )?;
+    let mut other_identity = event(2, &json!({"type":"tracking_stopped"}))?;
+    other_identity.identity.as_mut().ok_or("identity")?.guid = "another-person".into();
+    check(
+        record(
+            &request(temporary.path(), vec![other_identity]),
+            &mut Encoding::default(),
+        )
+        .is_err(),
+        "quarantined content cannot permit changing recorder identity",
+    )?;
     let next = request(
         temporary.path(),
         vec![event(2, &json!({"type":"tracking_stopped"}))?],

@@ -6,7 +6,10 @@ use std::io::{self, Read as _};
 use std::path::Path;
 
 use editchain_core::{Op, OpId};
-use editchain_store::{format::decode_op, read_encoded_at, IndexedChain};
+use editchain_store::{
+    format::{decode_op, encode_op},
+    read_encoded_at, IndexedChain,
+};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -43,6 +46,47 @@ pub(super) fn retained_source(
         }
     }
     Ok(local)
+}
+
+/// An exact retry can acknowledge already durable bytes even when every
+/// variant has a received receipt. The event must match beyond just its ID.
+pub(super) fn retry_source(
+    chain: &IndexedChain,
+    root: &Path,
+    expected: &Op,
+) -> io::Result<Option<Op>> {
+    if let Some(local) = retained_source(chain, root, expected.id)? {
+        return Ok(Some(local));
+    }
+    for location in chain.evidence_locations(expected.id) {
+        let encoded = read_encoded_at(root, location)?;
+        let retained = decode_op(&encoded).map_err(io::Error::other)?;
+        let mut retry = expected.clone();
+        retry.parents = retained.parents.clone();
+        if encode_op(&retry).map_err(io::Error::other)? == encoded {
+            return Ok(Some(retained));
+        }
+    }
+    Ok(None)
+}
+
+/// Quarantine of content need not invent a recorder sequence gap when all
+/// retained variants still agree on the predecessor's actor and stream.
+pub(super) fn predecessor_matches(
+    chain: &IndexedChain,
+    root: &Path,
+    id: OpId,
+    next: &Op,
+) -> io::Result<bool> {
+    let mut found = false;
+    for location in chain.evidence_locations(id) {
+        found = true;
+        let previous = decode_op(&read_encoded_at(root, location)?).map_err(io::Error::other)?;
+        if previous.actor != next.actor || previous.scope != next.scope {
+            return Ok(false);
+        }
+    }
+    Ok(found)
 }
 
 /// Read only the versioned receipt fields of the multiplayer scope ledger.
@@ -106,11 +150,7 @@ mod tests {
     use super::*;
     use crate::editor::{event_op, record, Encoding};
     use editchain_protocol::editor::{EditorEvent, RecordEditorEvents};
-    use editchain_store::{
-        durable::atomic_write,
-        format::{encode_op, Page},
-        CanonicalChain, SegmentStore,
-    };
+    use editchain_store::{durable::atomic_write, format::Page, CanonicalChain, SegmentStore};
     use serde_json::json;
 
     fn check(condition: bool, message: &'static str) -> super::super::Result<()> {

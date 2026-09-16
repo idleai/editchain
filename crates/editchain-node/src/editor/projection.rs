@@ -36,7 +36,7 @@ impl Projection {
     ) -> Result<Op> {
         let mut op = super::event_op(event, raw)?;
         if let Some(identity) = &event.identity {
-            let retained = super::remote::retained_source(self.tail.chain(), &self.root, op.id)?;
+            let retained = super::remote::retry_source(self.tail.chain(), &self.root, &op)?;
             op.parents = retained
                 .as_ref()
                 .or_else(|| staged.get(&op.id))
@@ -99,22 +99,19 @@ impl Projection {
         self.records_decoded = self
             .records_decoded
             .saturating_add(delta.work.records_decoded);
-        let receipts = super::remote::Receipts::read(&self.root)?;
-        for id in &delta.removed {
-            if !receipts.foreign(self.tail.chain(), &self.root, *id)? {
-                // Invalidate cached revisions, parent frontiers and attribution
-                // when their evidence leaves canonical admission. The records
-                // remain retained; replay must not select either variant.
-                self.normalizer = super::normalize::Normalizer::default();
-                self.pending = self
-                    .tail
-                    .chain()
-                    .shared_ops()
-                    .filter(|op| op.tags.matches_all(Tags::IMPORT | Tags::HUMAN))
-                    .map(|op| op.as_ref().clone())
-                    .collect();
-                return Ok(());
-            }
+        if !delta.removed.is_empty() {
+            // Any newly quarantined ID can invalidate cached revisions or
+            // frontiers. A received receipt does not prove the recorder never
+            // used those bytes: a peer may have supplied an exact local baseline.
+            self.normalizer = super::normalize::Normalizer::default();
+            self.pending = self
+                .tail
+                .chain()
+                .shared_ops()
+                .filter(|op| op.tags.matches_all(Tags::IMPORT | Tags::HUMAN))
+                .map(|op| op.as_ref().clone())
+                .collect();
+            return Ok(());
         }
         self.pending
             .extend(delta.added.into_values().map(|(op, _)| op.as_ref().clone()));
