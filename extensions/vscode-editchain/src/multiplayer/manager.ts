@@ -123,7 +123,7 @@ export class MultiplayerManager {
     for (const invitation of peers) this.peers.set(invitation.host.fingerprint, { invitation, attempts: 0, state: 'Reconnecting' });
     if (this.lease) {
       try { await this.startHost(generation); }
-      catch { this.message = 'Hosting could not resume. Check the host account, then resume sharing.'; }
+      catch { this.message = 'Hosting is unavailable; retrying automatically.'; }
     }
     this.requireGeneration(generation);
     for (const key of this.peers.keys()) this.schedule(key, 0);
@@ -133,10 +133,15 @@ export class MultiplayerManager {
   /** Restart connections from their durable inventories; also useful after network changes. */
   async reconnect(): Promise<void> {
     if (!this.enabled) throw new ProbeError('Sharing is stopped. Join or host to enable it.');
-    if (this.lease && !this.host) await this.startHost(this.generation);
+    const generation = this.generation;
+    if (this.lease && !this.host) {
+      try { await this.startHost(generation); }
+      catch { /* Hosting retries independently of outbound peer connections. */ }
+    }
+    this.requireGeneration(generation);
     for (const edge of [...this.edges.values()]) edge.bridge.stop();
     for (const key of this.peers.keys()) this.schedule(key, 0);
-    this.message = 'Reconnecting approved devices…'; this.publish();
+    this.message = this.lease && !this.host ? 'Hosting is unavailable; retrying automatically. Reconnecting approved devices…' : 'Reconnecting approved devices…'; this.publish();
   }
 
   async devices(): Promise<PublicDevice[]> {
@@ -218,7 +223,7 @@ export class MultiplayerManager {
     this.message = 'Starting private relay…'; this.publish();
     try {
       await host.start(this.lease);
-      if (generation !== this.generation) { await host.stop(); throw new ProbeError('Sharing was stopped.'); }
+      if (generation !== this.generation) { await (this.lease ? host.suspend() : host.stop()); throw new ProbeError('Sharing was stopped.'); }
       this.lease = host.lease();
       this.hostAttempts = 0;
       await this.persist();

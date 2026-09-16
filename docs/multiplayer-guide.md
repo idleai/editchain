@@ -41,6 +41,9 @@ device's working file stays as it was. Repeat in the opposite direction.
 
 - Connections retry automatically. Reopening an enabled workspace resumes
   sharing; a hard process exit can take about 90 seconds to recover.
+- Updating the native worker paths restarts sharing with the saved session.
+  Adding another workspace folder leaves the current session running. Changing
+  the shared chain or removing its folder stops that session.
 - Run **EditChain: Show Multiplayer Status** to inspect the connection, or
   **EditChain: Resume / Reconnect Shared History** to retry. An expired grant
   needs a fresh invitation from the host.
@@ -50,6 +53,9 @@ device's working file stays as it was. Repeat in the opposite direction.
   replica. Previously received copies remain with that participant.
 - If cleanup failed, stop sharing first, then run
   **EditChain: Clean Up Multiplayer Tunnels** in the same workspace/account.
+- If VS Code forgets the workspace settings, Host can recover the space from
+  the chain on disk. If the saved invitation or device identity is also gone,
+  exchange a fresh join request and invitation.
 
 ## Optional repository discovery
 
@@ -57,3 +63,4 @@ After connecting, **EditChain: Configure Multiplayer Repository Discovery** can
 publish public connection metadata in an `owner/repository` you can collaborate
 on. It requests GitHub `repo` access. Each new pair still needs an invitation;
 use the same command to disable discovery.
+Cancelling a configuration change keeps the previous discovery setup.

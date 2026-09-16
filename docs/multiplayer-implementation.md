@@ -176,6 +176,22 @@ such; they are not evidence of a second network.
   including baseline preservation, moved storage and stale metadata.
   `./scripts/lint.sh`: exit 0, `RESULT: PASS`.
 
+### Session lifecycle and discovery
+
+- Changes to worker paths suspend and resume the existing session. Unrelated
+  folders/settings leave it running; changing the actual chain or removing its
+  folder closes that session. Serialized restarts retain Stop cancellation and
+  ignore status callbacks from replaced managers.
+- Resume starts saved discovery without a redundant host connection attempt.
+  Hosting failures retry independently of outbound connections. Cancelling or
+  failing discovery input/authentication keeps the previous configuration.
+  Stop during sign-in, resume or restart cannot restart sharing or display a
+  stale command error.
+- Extension compilation, all 189 harness tests and multiplayer type checks
+  passed. The targeted command/native recovery run also passed with an offline
+  guard recording zero socket, fetch or GitHub CLI attempts.
+  `./scripts/lint.sh`: exit 0, `RESULT: PASS`.
+
 ## Remaining validation and known limits
 
 - Different-account and different-network joins need another authorized

@@ -42,6 +42,10 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
   let directoryStatus: DiscoveryStatus | undefined;
   let active = false;
   let stopVersion = 0;
+  let configuredChain: string | undefined;
+  let transition = Promise.resolve();
+  let resumeAfterSettings = false;
+  const retiring = new Map<MultiplayerManager, number>();
   const owner = randomUUID();
   const ownedMarkers = new Set<string>();
   let leaseTimer: NodeJS.Timeout | undefined;
@@ -64,10 +68,13 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
   };
 
   const startDirectory = async (current: MultiplayerManager) => {
-    const settings = context.workspaceState.get<{ repository: string; account: string }>(DIRECTORY + folder!.uri.toString());
+    const version = stopVersion, selected = folder;
+    if (!selected || manager !== current || !current.status().enabled) return;
+    const settings = context.workspaceState.get<{ repository: string; account: string }>(DIRECTORY + selected.uri.toString());
     if (!settings) return;
     if (directory) { await directory.refresh(); return; }
     const { GitHubDirectory, DirectorySync } = await import('./discovery');
+    if (version !== stopVersion || manager !== current || !current.status().enabled) return;
     const github = new GitHubDirectory(settings.repository, async () => {
       const session = await vscode.authentication.getSession('github', ['repo'], { silent: true });
       if (!session || session.account.id !== settings.account) throw new CommandError('Repository discovery account is unavailable.');
@@ -81,9 +88,9 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
     await sync.start();
   };
   const journal = {
-    remember: async (marker: string) => {
+    remember: async (marker: string, workspace = folder?.uri.toString()) => {
       if (!account) throw new CommandError('GitHub host session is unavailable.');
-      const record: JournalRecord = { account: account.account.id, workspace: folder?.uri.toString(), owner, leaseUntil: Date.now() + 90_000, process: process.pid };
+      const record: JournalRecord = { account: account.account.id, workspace, owner, leaseUntil: Date.now() + 90_000, process: process.pid };
       await journalWrite(async () => {
         const current = context.globalState.get<JournalRecord>(PENDING + marker);
         if (current && current.owner !== owner && liveLease(current)) throw new CommandError('This hosting session is active in another window. Close that window before resuming here.');
@@ -107,8 +114,11 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
   const getManager = async (selected?: vscode.WorkspaceFolder): Promise<MultiplayerManager> => {
     if (!vscode.workspace.isTrusted) throw new CommandError('Trust this workspace before enabling history sharing.');
     if (manager) return manager;
+    const version = stopVersion;
     const folders = vscode.workspace.workspaceFolders ?? [];
-    folder = selected ?? (folders.length === 1 ? folders[0] : (await vscode.window.showQuickPick(folders.map(value => ({ label: value.name, description: value.uri.fsPath, folder: value })), { title: 'Choose the workspace history to share' }))?.folder);
+    const chosen = selected ?? (folders.length === 1 ? folders[0] : (await vscode.window.showQuickPick(folders.map(value => ({ label: value.name, description: value.uri.fsPath, folder: value })), { title: 'Choose the workspace history to share' }))?.folder);
+    if (version !== stopVersion) throw new CommandError('Sharing was stopped.');
+    folder = chosen;
     if (!folder || folder.uri.scheme !== 'file') throw new CommandError('Choose a local workspace folder for sharing.');
     const configuration = vscode.workspace.getConfiguration('editchain-history', folder.uri);
     const chain = path.resolve(folder.uri.fsPath, configuration.get<string>('chainDir', '.editchain'));
@@ -120,10 +130,13 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
     const sessionKey = SESSION + folder.uri.toString();
     const enabledKey = ENABLED + folder.uri.toString();
     const { MultiplayerManager } = await import('./manager');
-    manager = new MultiplayerManager({ binary, chain,
+    if (version !== stopVersion) throw new CommandError('Sharing was stopped.');
+    const workspace = folder.uri.toString();
+    const created: MultiplayerManager = new MultiplayerManager({ binary, chain,
       // Device credentials live in private application storage, never the workspace or VSIX.
       deviceDirectory: path.join(context.globalStorageUri.fsPath, 'multiplayer-device'),
-      space: context.workspaceState.get<string>(key), saveSpace: async space => { await context.workspaceState.update(key, space); }, journal,
+      space: context.workspaceState.get<string>(key), saveSpace: async space => { await context.workspaceState.update(key, space); },
+      journal: { remember: marker => journal.remember(marker, workspace), forget: journal.forget },
       saveSession: async session => {
         if (session) {
           await context.secrets.store(sessionKey, JSON.stringify({ account: account?.account.id, session }));
@@ -137,7 +150,9 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
         const current = await vscode.authentication.getSession('github', SCOPES, { silent: true });
         if (!current || !account || current.account.id !== account.account.id) throw new CommandError('GitHub host session changed. Start hosting again.');
         return current.accessToken;
-      }, changed: update });
+      }, changed: (value, durable) => { if (manager === created) update(value, durable); } });
+    configuredChain = chain;
+    manager = created;
     return manager;
   };
 
@@ -152,9 +167,16 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
   const execute = async (action: () => Promise<unknown>) => {
     if (active) return { ok: false, message: 'A multiplayer command is already running.' };
     active = true;
+    const version = stopVersion;
     output ??= vscode.window.createOutputChannel('EditChain Multiplayer');
-    try { const value = await action(); return { ok: true, value }; }
+    try {
+      await transition;
+      if (version !== stopVersion) return { ok: true };
+      const value = await action();
+      return { ok: true, value };
+    }
     catch (error) {
+      if (version !== stopVersion) return { ok: true };
       // Only UI and controlled adapter errors escape the manager.
       const message = error instanceof CommandError || error instanceof ProbeError || error instanceof NativePeerError
         ? error.message : 'Multiplayer command failed. Account and service details were omitted.';
@@ -165,14 +187,18 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
   };
   const stop = async () => {
     stopVersion++;
+    resumeAfterSettings = false;
     const previous = directory; directory = undefined; directoryStatus = undefined;
-    const results = await Promise.allSettled([previous?.stop(), manager?.stop()]);
+    const current = new Set([...retiring.keys(), ...(manager ? [manager] : [])]);
+    const results = await Promise.allSettled([previous?.stop(), ...[...current].map(value => value.stop())]);
     if (results.some(result => result.status === 'rejected')) throw new CommandError('Sharing cleanup is pending.');
   };
   const suspend = async () => {
     stopVersion++;
+    resumeAfterSettings = false;
     const previous = directory; directory = undefined;
-    await Promise.allSettled([previous?.stop(), manager?.suspend()]);
+    const current = new Set([...retiring.keys(), ...(manager ? [manager] : [])]);
+    await Promise.allSettled([previous?.stop(), ...[...current].map(value => value.suspend())]);
     clearInterval(leaseTimer); leaseTimer = undefined;
     await journalWrite(async () => {
       for (const marker of ownedMarkers) {
@@ -194,8 +220,10 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       if (!account || account.account.id !== envelope.account) throw new CommandError('Sign in with the original host GitHub account, then resume sharing.');
     }
     if (version !== stopVersion) return;
+    const wasEnabled = current.status().enabled;
     await current.resume(envelope.session);
-    await current.reconnect();
+    if (version !== stopVersion) return;
+    if (wasEnabled) await current.reconnect();
     if (version === stopVersion) await startDirectory(current);
   };
   const command = (name: string, action: () => Promise<unknown>) => vscode.commands.registerCommand(`editchain-history.${name}`, () => execute(action));
@@ -256,10 +284,13 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       ], { title: 'Optional GitHub peer discovery' });
       if (!choice) return;
       const key = DIRECTORY + folder!.uri.toString();
-      const previous = directory; directory = undefined; directoryStatus = undefined;
-      await previous?.stop();
-      await context.workspaceState.update(key, undefined);
-      if (!choice.value) return;
+      if (!choice.value) {
+        if (version !== stopVersion) return;
+        await context.workspaceState.update(key, undefined);
+        const previous = directory; directory = undefined; directoryStatus = undefined;
+        await previous?.stop();
+        return;
+      }
       const text = await vscode.window.showInputBox({ title: 'GitHub repository for discovery', prompt: 'owner/repository (collaborator access required)', ignoreFocusOut: true });
       if (!text) return;
       const { repositoryName } = await import('./discovery');
@@ -269,7 +300,9 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       const session = await vscode.authentication.getSession('github', ['repo'], { createIfNone: true });
       if (version !== stopVersion) return;
       await context.workspaceState.update(key, { repository, account: session.account.id });
-      await startDirectory(current);
+      const previous = directory; directory = undefined; directoryStatus = undefined;
+      await previous?.stop();
+      if (version === stopVersion) await startDirectory(current);
     }),
     // Stop is always available even while a sign-in or connection command waits.
     vscode.commands.registerCommand('editchain-history.multiplayerStop', () => stop().then(() => ({ ok: true }), () => {
@@ -295,19 +328,39 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
     }),
     { dispose: () => { void suspend().catch(() => {}); clearInterval(leaseTimer); status?.dispose(); output?.dispose(); } },
   );
-  const reset = () => {
-    const previous = manager;
+  const reset = (preserve: boolean) => {
+    const previous = manager, selected = folder;
+    if (!previous || !selected) { stopVersion++; return; }
+    const version = ++stopVersion;
+    resumeAfterSettings = preserve && (resumeAfterSettings || !!previous.status().enabled);
     const discovery = directory; directory = undefined; directoryStatus = undefined;
-    manager = undefined;
-    folder = undefined;
-    stopVersion++;
-    void previous?.stop().catch(() => {});
-    void discovery?.stop().catch(() => {});
+    retiring.set(previous, (retiring.get(previous) ?? 0) + 1);
+    transition = transition.then(async () => {
+      const results = await Promise.allSettled([preserve ? previous.suspend() : previous.stop(), discovery?.stop()]);
+      if (version !== stopVersion) return;
+      if (results.some(result => result.status === 'rejected')) throw new CommandError('Sharing could not restart. Check the worker settings, then resume sharing.');
+      manager = undefined; folder = undefined; configuredChain = undefined;
+      if (resumeAfterSettings && vscode.workspace.isTrusted && vscode.workspace.workspaceFolders?.some(value => value.uri.toString() === selected.uri.toString())) {
+        await restore(false, selected);
+      }
+      if (version === stopVersion) resumeAfterSettings = false;
+    }).catch(() => {
+      if (version === stopVersion) void vscode.window.showErrorMessage('EditChain Multiplayer: Sharing could not restart. Check the worker settings, then resume sharing.');
+    }).finally(() => {
+      const count = (retiring.get(previous) ?? 1) - 1;
+      if (count) retiring.set(previous, count); else retiring.delete(previous);
+    });
   };
   context.subscriptions.push(
-    vscode.workspace.onDidChangeWorkspaceFolders(reset),
+    vscode.workspace.onDidChangeWorkspaceFolders(event => {
+      if (folder && event.removed.some(value => value.uri.toString() === folder!.uri.toString())) reset(false);
+    }),
     vscode.workspace.onDidChangeConfiguration(event => {
-      if (['chainDir', 'servicePath', 'peerPath'].some(key => event.affectsConfiguration(`editchain-history.${key}`))) reset();
+      if (!folder) return;
+      const affects = (key: string) => event.affectsConfiguration(`editchain-history.${key}`, folder!.uri);
+      const chain = path.resolve(folder.uri.fsPath, vscode.workspace.getConfiguration('editchain-history', folder.uri).get<string>('chainDir', '.editchain'));
+      if (affects('chainDir') && chain !== configuredChain) reset(false);
+      else if (affects('servicePath') || affects('peerPath')) reset(true);
     }),
   );
   if (vscode.authentication.onDidChangeSessions) context.subscriptions.push(vscode.authentication.onDidChangeSessions(event => {

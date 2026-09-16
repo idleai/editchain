@@ -12,7 +12,7 @@ const { fixture, binaries, until, blobs, diffs } = require('./multiplayerFixture
 // Fault-inject only the byte transport. Managers, TLS, native workers and stores are real.
 function network() {
   const hosts = new Map(), streams = new Set();
-  let attempts = 0, starts = 0, lastEndpoint;
+  let attempts = 0, starts = 0, lastEndpoint, failedStarts = 0;
   const provider = {
     host(incoming, failed) {
       let lease;
@@ -24,6 +24,7 @@ function network() {
       return {
         async start(previous) {
           starts++;
+          if (failedStarts > 0) { failedStarts--; throw new Error('fixture relay unavailable'); }
           lease = previous ?? { marker: 'editchain-multiplayer-' + randomBytes(12).toString('hex'), tunnelId: randomUUID(), clusterId: 'use' };
           hosts.set(lease.tunnelId, { incoming, owned, failed });
         },
@@ -59,6 +60,7 @@ function network() {
     async remove(lease) { hosts.delete(lease.tunnelId); },
   };
   return { provider, drop() { for (const stream of streams) stream.destroy(); }, attempts: () => attempts,
+    failHosts: count => { failedStarts = count; },
     terminateHost() { for (const host of [...hosts.values()]) host.failed('terminal fixture disconnect', true); }, starts: () => starts, endpoint: () => lastEndpoint };
 }
 
@@ -142,6 +144,32 @@ test('automatic reconnect repairs a broken stream; restart never reenrolls a rem
     await restarted.resume(snapshot);
     assert.deepEqual(await restarted.devices(), []);
     assert.deepEqual(restarted.status().peers, []);
+  } finally { await env.stop(); }
+});
+
+test('failed hosting cannot block outbound reconnect and automatically recovers', { timeout: 30_000 }, async () => {
+  const env = environment();
+  try {
+    const a = env.files.workspace('a'), b = env.files.workspace('b');
+    await a.start(); await b.start();
+    const host = env.create(a), guest = env.create(b);
+    await guest.joinHistory(await host.hostHistory(await guest.joinRequest(), true), true);
+    await host.joinHistory(await guest.hostHistory(await host.joinRequest(), true), true);
+    await until(() => live(host) === 1 && live(guest) === 1, 'initial bidirectional connection');
+    const saved = env.saved.get(a.root);
+    await host.suspend();
+    env.wire.failHosts(2);
+    const restarted = env.create(a);
+    await restarted.resume(saved);
+    assert.equal(restarted.status().enabled, true);
+    assert.equal(restarted.status().hosting, false);
+    await restarted.reconnect();
+    assert.match(restarted.status().message, /retrying automatically/);
+    assert.equal(restarted.status().hosting, false);
+    await b.edit('before outage\n', 'outbound recovery\n');
+    await until(() => live(restarted) === 1 && blobs(b.chain).every(name => blobs(a.chain).includes(name)), 'outbound recovery did not transfer');
+    await until(() => restarted.status().hosting, 'hosting did not recover automatically');
+    assert.ok((await diffs(a)).some(diff => diff.after === 'outbound recovery\n'));
   } finally { await env.stop(); }
 });
 

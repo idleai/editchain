@@ -12,17 +12,20 @@ async function environment(options, body) {
     workspace.set('editchain.multiplayer.enabled.file:///fixture/workspace', true);
     secrets.set('editchain.multiplayer.session.file:///fixture/workspace', JSON.stringify(options.saved));
   }
+  if (options.directory) workspace.set('editchain.multiplayer.directory.file:///fixture/workspace', options.directory);
   const uri = { fsPath: '/fixture/workspace', scheme: 'file', toString: () => 'file:///fixture/workspace' };
   const folder = { name: 'workspace', uri };
   const session = { account: { id: 'account-id' }, accessToken: 'secret-user-token' };
-  let managerLoads = 0, managerOptions, clipboard, resolveAuth;
+  let managerLoads = 0, clipboard, resolveAuth, configurationChanged, foldersChanged, resolveSuspend, resolveResume;
+  const configuration = new Map();
   const state = values => ({ keys: () => [...values.keys()], get: key => values.get(key),
     async update(key, value) { if (value === undefined) values.delete(key); else values.set(key, value); } });
   const fake = {
     StatusBarAlignment: { Left: 1 },
     workspace: { isTrusted: options.trusted !== false, workspaceFolders: [folder],
-      onDidChangeWorkspaceFolders: () => ({ dispose() {} }), onDidChangeConfiguration: () => ({ dispose() {} }),
-      getConfiguration: () => ({ get: (_key, fallback) => fallback }) },
+      onDidChangeWorkspaceFolders: callback => { foldersChanged = callback; return { dispose() {} }; },
+      onDidChangeConfiguration: callback => { configurationChanged = callback; return { dispose() {} }; },
+      getConfiguration: () => ({ get: (key, fallback) => configuration.get(key) ?? fallback }) },
     env: { clipboard: { async writeText(text) { clipboard = text; } } },
     commands: { registerCommand(name, callback) { registered.set(name, callback); return { dispose() {} }; } },
     authentication: { async getSession(provider, scopes, request) {
@@ -32,7 +35,8 @@ async function environment(options, body) {
       return session;
     } },
     window: {
-      showInputBox: async () => options.input || 'join-request', showQuickPick: async items => items[0],
+      showInputBox: async () => Object.hasOwn(options, 'input') ? options.input : 'join-request',
+      showQuickPick: async items => options.disableDiscovery ? items.find(item => item.label === 'Disable repository discovery') : items[0],
       showWarningMessage: async (_message, _options, choice) => choice,
       createOutputChannel: () => ({ appendLine: value => logs.push(value), show() {}, dispose() {} }),
       showInformationMessage: async value => { logs.push(value); },
@@ -41,21 +45,27 @@ async function environment(options, body) {
     },
   };
   class FakeManager {
-    constructor(value) { managerOptions = value; }
+    constructor(value) { this.options = value; this.enabled = !!options.sharing; }
     joinRequest() { return Promise.resolve('public-request'); }
     inspectRequest() { return Promise.resolve({ device: { fingerprint: 'a'.repeat(64) } }); }
     async hostHistory(_request, backfill) {
+      this.enabled = true;
       calls.push({ host: true, backfill });
-      assert.equal(await managerOptions.githubToken(), session.accessToken);
-      await managerOptions.journal.remember('editchain-multiplayer-' + '1'.repeat(24));
-      await managerOptions.saveSession({ version: 1, space: 'space', peers: ['private-invite-secret'] });
+      assert.equal(await this.options.githubToken(), session.accessToken);
+      await this.options.journal.remember('editchain-multiplayer-' + '1'.repeat(24));
+      await this.options.saveSession({ version: 1, space: 'space', host: {}, peers: ['private-invite-secret'] });
       return 'private-invite-secret';
     }
-    status() { return { hosting: false, peers: [], enabled: !!options.sharing, space: options.sharing ? 'space' : undefined }; }
-    async stop() { calls.push({ stop: true }); await managerOptions.saveSession(undefined); await managerOptions.journal.forget('editchain-multiplayer-' + '1'.repeat(24)); }
-    async suspend() { calls.push({ suspend: true }); }
-    async resume() { calls.push({ resume: true }); }
-    async reconnect() { calls.push({ reconnect: true }); }
+    status() { return { hosting: false, peers: [], enabled: this.enabled, space: this.enabled ? 'space' : undefined }; }
+    async stop() { this.enabled = false; calls.push({ stop: true }); await this.options.saveSession(undefined); await this.options.journal.forget('editchain-multiplayer-' + '1'.repeat(24)); }
+    async suspend() { this.enabled = false; calls.push({ suspend: true }); if (options.delaySuspend) await new Promise(resolve => { resolveSuspend = resolve; }); }
+    async resume() {
+      calls.push({ resume: true });
+      if (options.delayResume) await new Promise(resolve => { resolveResume = resolve; });
+      if (options.resumeStopped) throw new Error('Sharing was stopped.');
+      this.enabled = true;
+    }
+    async reconnect() { calls.push({ reconnect: true }); if (options.reconnectThrows) throw new Error('host temporarily offline'); }
   }
   const original = Module._load;
   Module._load = function (name, parent, ...rest) {
@@ -65,7 +75,7 @@ async function environment(options, body) {
       managementClient: () => ({ async dispose() {} }), cleanupRelay: async (_management, marker, journal) => { calls.push({ cleanup: marker }); await journal.forget(marker); },
     };
     if (name === './discovery' && parent.filename.endsWith('/multiplayer/commands.js')) return {
-      repositoryName: value => value,
+      repositoryName: value => require('../../out/multiplayer/discovery').repositoryName(value),
       GitHubDirectory: class { constructor(repository, token) { this.repository = repository; this.token = token; } },
       DirectorySync: class {
         constructor(directory) { this.directory = directory; }
@@ -84,7 +94,16 @@ async function environment(options, body) {
   try {
     const commands = require(file).registerMultiplayerCommands(context, () => {});
     await body({ invoke: name => registered.get('editchain-history.' + name)(), stored, logs, calls,
-      loads: () => managerLoads, clipboard: () => clipboard, resolveAuth: () => resolveAuth?.(session), authPending: () => !!resolveAuth, secrets, workspace, commands });
+      loads: () => managerLoads, clipboard: () => clipboard, resolveAuth: () => resolveAuth?.(session), authPending: () => !!resolveAuth, secrets, workspace, commands,
+      configure: (values, affected = uri) => {
+        for (const [key, value] of Object.entries(values)) configuration.set(key, value);
+        const keys = new Set(Object.keys(values).map(key => 'editchain-history.' + key));
+        configurationChanged({ affectsConfiguration: (key, scope) => keys.has(key) && (!scope || scope === affected) });
+      },
+      folders: (removed = [], added = []) => { fake.workspace.workspaceFolders = [folder, ...added].filter(value => !removed.includes(value)); foldersChanged({ added, removed }); },
+      folder, resolveSuspend: () => { options.delaySuspend = false; resolveSuspend?.(); },
+      resolveResume: () => resolveResume?.(), resumePending: () => !!resolveResume,
+    });
   } finally {
     for (const subscription of context.subscriptions) subscription.dispose();
     Module._load = original;
@@ -113,7 +132,7 @@ test('multiplayer activation is offline and explicit hosting defaults to new rec
 
 test('enabled workspace resumes with silent account lookup; deactivation keeps private state', async () => {
   await environment({ saved: { account: 'account-id', session: { host: {}, peers: [] } } }, async env => {
-    await until(() => env.calls.some(call => call.reconnect), 'saved sharing did not resume');
+    await until(() => env.calls.some(call => call.resume), 'saved sharing did not resume');
     assert.deepEqual(env.calls.filter(call => call.provider).map(call => call.request), [{ silent: true }]);
     await env.commands.suspend();
     assert.equal(env.secrets.size, 1);
@@ -177,6 +196,15 @@ test('Stop during sign-in prevents a late host start', async () => {
   });
 });
 
+test('an immediate Stop cancels a command before it starts account activity', async () => {
+  await environment({}, async env => {
+    const host = env.invoke('multiplayerHost');
+    await env.invoke('multiplayerStop');
+    await host;
+    assert.ok(!env.calls.some(call => call.host || call.provider));
+  });
+});
+
 test('cleanup skips other active windows and other workspaces', async () => {
   await environment({}, async env => {
     const prefix = 'editchain.multiplayer.pending.';
@@ -223,4 +251,114 @@ test('saved-resource deletion requires ownership before any account or service a
     remember: async () => { throw new Error('owned by another active window'); }, forget: async () => { throw new Error('must remain recorded'); },
   }, async () => { accessed = true; return 'secret'; }), /another active window/);
   assert.equal(accessed, false);
+});
+
+test('binary setting changes resume the same session; unrelated settings and folders leave it running', async () => {
+  await environment({}, async env => {
+    assert.equal((await env.invoke('multiplayerHost')).ok, true);
+    const saved = [...env.secrets.values()];
+    env.folders([], [{ name: 'other', uri: { toString: () => 'file:///other' } }]);
+    env.configure({ peerPath: '/other/peer' }, { fsPath: '/other' });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.ok(!env.calls.some(call => call.stop || call.suspend));
+    env.configure({ peerPath: '/new/peer' });
+    await until(() => env.loads() === 2 && env.calls.some(call => call.resume), 'new worker did not resume sharing');
+    assert.deepEqual([...env.secrets.values()], saved);
+    assert.ok(env.workspace.get('editchain.multiplayer.enabled.file:///fixture/workspace'));
+    assert.ok(!env.calls.some(call => call.stop));
+  });
+});
+
+test('changing the shared chain or removing its folder closes only that sharing session', async () => {
+  for (const change of [env => env.configure({ chainDir: '.another-history' }), env => env.folders([env.folder])]) {
+    await environment({}, async env => {
+      await env.invoke('multiplayerHost');
+      change(env);
+      await until(() => env.calls.some(call => call.stop) && env.secrets.size === 0, 'old chain did not stop');
+      assert.ok(!env.calls.some(call => call.resume));
+    });
+  }
+});
+
+test('Stop during a binary restart removes the preserved session and prevents late resume', async () => {
+  await environment({ delaySuspend: true }, async env => {
+    await env.invoke('multiplayerHost');
+    env.configure({ servicePath: '/new/service' });
+    await until(() => env.calls.some(call => call.suspend), 'worker was not suspended');
+    await env.invoke('multiplayerStop');
+    env.resolveSuspend();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(env.secrets.size, 0);
+    assert.ok(!env.calls.some(call => call.resume));
+  });
+});
+
+test('consecutive binary changes coalesce into one resume with the saved session', async () => {
+  await environment({ delaySuspend: true }, async env => {
+    await env.invoke('multiplayerHost');
+    env.configure({ peerPath: '/first/peer' });
+    await until(() => env.calls.some(call => call.suspend), 'first restart did not begin');
+    env.configure({ peerPath: '/second/peer' });
+    env.resolveSuspend();
+    await until(() => env.calls.some(call => call.resume), 'consecutive changes lost resume intent');
+    assert.equal(env.calls.filter(call => call.resume).length, 1);
+    assert.equal(env.secrets.size, 1);
+    assert.ok(!env.calls.some(call => call.stop));
+  });
+});
+
+test('saved discovery starts without a redundant reconnect after resume', async () => {
+  await environment({ saved: { account: 'account-id', session: { host: {}, peers: [] } },
+    directory: { repository: 'owner/repository', account: 'account-id' }, reconnectThrows: true }, async env => {
+    await until(() => env.calls.some(call => call.discovery), 'saved discovery did not resume');
+    assert.ok(!env.calls.some(call => call.reconnect));
+  });
+});
+
+test('Stop during native resume is quiet and prevents discovery from restarting', async () => {
+  const options = { saved: { account: 'account-id', session: { host: {}, peers: [] } },
+    directory: { repository: 'owner/repository', account: 'account-id' }, delayResume: true };
+  await environment(options, async env => {
+    await until(env.resumePending, 'native resume was not reached');
+    await env.invoke('multiplayerStop');
+    options.resumeStopped = true;
+    env.resolveResume();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.ok(!env.calls.some(call => call.reconnect || call.discovery));
+    assert.deepEqual(env.logs, []);
+  });
+});
+
+test('cancelled, invalid and denied discovery changes preserve the working directory', async () => {
+  for (const failure of ['cancel', 'invalid', 'denied']) {
+    const options = { saved: { account: 'account-id', session: { host: {}, peers: [] } },
+      directory: { repository: 'owner/repository', account: 'account-id' } };
+    await environment(options, async env => {
+      await until(() => env.calls.some(call => call.discovery), 'initial discovery did not start');
+      options.input = failure === 'cancel' ? undefined : failure === 'invalid' ? 'not a repo name' : 'another/repository';
+      options.authError = failure === 'denied';
+      const result = await env.invoke('multiplayerDiscovery');
+      assert.equal(result.ok, failure === 'cancel');
+      assert.deepEqual(env.workspace.get('editchain.multiplayer.directory.file:///fixture/workspace'), options.directory);
+      assert.ok(!env.calls.some(call => call.discoveryStop));
+      assert.equal(env.calls.filter(call => call.discovery).length, 1);
+    });
+  }
+});
+
+test('confirmed discovery replacement switches directories and explicit disable withdraws it', async () => {
+  const options = { saved: { account: 'account-id', session: { host: {}, peers: [] } },
+    directory: { repository: 'owner/repository', account: 'account-id' }, input: 'another/repository' };
+  await environment(options, async env => {
+    await until(() => env.calls.some(call => call.discovery), 'initial discovery did not start');
+    assert.equal((await env.invoke('multiplayerDiscovery')).ok, true);
+    assert.equal(env.workspace.get('editchain.multiplayer.directory.file:///fixture/workspace').repository, 'another/repository');
+    assert.deepEqual(env.calls.filter(call => call.discovery || call.discoveryStop), [
+      { discovery: 'owner/repository' }, { discoveryStop: true }, { discovery: 'another/repository' },
+    ]);
+    options.disableDiscovery = true;
+    assert.equal((await env.invoke('multiplayerDiscovery')).ok, true);
+    assert.ok(!env.workspace.has('editchain.multiplayer.directory.file:///fixture/workspace'));
+    assert.equal(env.calls.filter(call => call.discoveryStop).length, 2);
+  });
 });
