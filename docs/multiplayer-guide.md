@@ -49,6 +49,8 @@ device's working file stays as it was. Repeat in the opposite direction.
   needs a fresh invitation from the host.
 - Run **EditChain: Stop Sharing History** to disconnect, delete your hosted
   tunnel and disable automatic resume. Received history stays on each device.
+  Stop is final: it also takes effect if a start, join or cleanup is still in
+  progress. Use Host or Join to enable a new sharing session after Stop.
 - Use **EditChain: Remove Shared Device** to revoke a device's access to your
   replica. Previously received copies remain with that participant.
 - If cleanup failed, stop sharing first, then run
@@ -64,3 +66,17 @@ publish public connection metadata in an `owner/repository` you can collaborate
 on. It requests GitHub `repo` access. Each new pair still needs an invitation;
 use the same command to disable discovery.
 Cancelling a configuration change keeps the previous discovery setup.
+
+## Compatibility
+
+Install the same EditChain build on every device: the extension, the Rust
+service and the native peer worker ship together and are not meant to be mixed.
+Update all devices together.
+
+- A workspace whose sharing ledger was written by the updated build is rejected
+  by an older peer worker, which fails closed instead of continuing.
+- Older capture code ignores the added ledger field, so mixing versions can
+  keep the earlier behavior that treated a peer's copy of your own history as
+  peer-authored.
+- Updating prevents new problems of that kind. It does not repair or restore
+  history that was already quarantined by the earlier behavior.

@@ -30,10 +30,15 @@ committed locally using `astramax(f1/multiplayer):`.
 | 4. Reconnect, discovery and three peers | Offline catch-up, revocation, stale discovery, third-party forwarding; root lint | Complete |
 | 5. Full extension E2E | Actual VS Code history visibility, packaged build, final regression checks | Complete on one machine |
 
+Three follow-up corrections landed after checkpoint 5 and are recorded in the
+validation log below: `3b84515` preserves durable local provenance for received
+baselines, `8c6dfdf` makes Stop final across pending sharing operations, and
+`0e0f1d6` makes interrupted relay cleanup retryable.
+
 The final different-account/different-network observation requires a second
-authorized account and machine. That input has been requested while local and
-relay automation proceed. Automated same-machine tests will be identified as
-such; they are not evidence of a second network.
+authorized account and machine and is deferred at the user's request. The
+follow-up fixes were verified locally; the validation record identifies
+earlier live relay runs separately from offline regression checks.
 
 ## Validation record
 
@@ -140,15 +145,33 @@ such; they are not evidence of a second network.
   exact native diffs, unchanged receiving files and recovery after a full host
   restart all passed. Tunnel cleanup completed; the log audit found no account
   token, connect grant or private invitation material. The VSIX contains both
-  executable Linux x64 binaries and the current runtime, and excludes the test
-  provider and automation scripts. Local artifacts:
-  [VSIX](../outputs/editchain-history-multiplayer.vsix),
+  executable Linux x64 binaries and the runtime it was built with, and excludes
+  the test provider and automation scripts. Local evidence:
   [run result](../extensions/vscode-editchain/trace/multiplayer/run.json),
   [host observations](../extensions/vscode-editchain/trace/multiplayer/host/observations.json),
   [diff after restart](../extensions/vscode-editchain/trace/multiplayer/host/received-after-reload-diff.png).
   That UI run used VSIX SHA-256
   `d57eaf860a37821c9927df8db85b849bf39eed8c85e5d43badc2cbd69fc32546`;
-  the rebuilt recovery package is verified below.
+  a later rebuilt recovery package is verified in the recovery checkpoints
+  below. The latest package has its own final verification record.
+- Baseline provenance (`3b84515`): the replication ledger now records durable
+  local provenance separately from received-byte receipts. An exact copy of a
+  withheld local baseline that a peer supplies makes the record shareable but
+  no longer makes the editor treat it as peer-authored, so a rebuilt capture
+  cache keeps deriving from it instead of quarantining correct rows. Three new
+  ledger tests in `crates/editchain-sync` cover mixed local and foreign provenance,
+  blob access, retransmission and version-1 compatibility. A fourth test drives
+  the real public recorder and `Replica`
+  ingestion through a cold rebuild. `cargo clippy` on the affected crates and
+  `cargo test --workspace --all-features` passed locally; the canonical root
+  lint later passed independently.
+- Stop finality (`8c6dfdf`): a Stop request issued while a start, host, join or
+  cleanup operation is pending is no longer undone when that operation
+  completes. The session stays disabled until the user hosts or joins again. Eleven
+  lifecycle tests cover the pending-operation cases.
+- Independent verification: the canonical `./scripts/lint.sh` passed all six
+  gates in an isolated checkout, and 12 new tests passed under a zero-outbound
+  guard: one real native-TLS provenance test and 11 lifecycle tests.
 
 ## Recovery review checkpoints
 
@@ -159,15 +182,35 @@ such; they are not evidence of a second network.
   retains conflicting derivations as evidence, and settles replay before
   admitting the next observation. Quarantined snapshots cannot supply future
   revisions.
-- Exact local retries and sequence checks can consult a unique retained local
-  variant, distinguished by the received-byte receipts. A retry can also match
-  complete retained source bytes when all variants have received receipts.
-  Sequence checks require an undisputed actor/stream when a unique local
-  admission is unavailable. Neither operation restores a variant to canonical
-  history or acknowledges new conflicting retry content.
+- Exact local retries and sequence checks consult a unique retained local
+  variant using received-byte receipts together with durable local provenance.
+  A retry can also match complete retained source
+  bytes when all variants have received receipts. Sequence checks require an
+  undisputed actor/stream when a unique local admission is unavailable. Neither
+  operation restores a variant to canonical history or acknowledges new
+  conflicting retry content.
 - Regression coverage includes a conflict at the recorder frontier, loss of a
   previously used snapshot, exact retries, and rebuilding the derived cache.
   `./scripts/lint.sh`: exit 0, `RESULT: PASS`.
+
+### Received-baseline provenance
+
+- The replication ledger records two independent facts per exact record key:
+  whether a peer supplied it (`received`, with `received_blobs` for its content)
+  and whether this device retained it locally before any peer supplied it
+  (`local`). Record export still follows `excluded`; blob access still follows
+  `received` and `received_blobs`. Capture also consults local provenance.
+- When a peer independently supplies the exact bytes of a previously withheld
+  local baseline, the record leaves the withheld set and becomes shareable, its
+  preexisting blobs stay unexportable until their content is supplied through
+  the space, and its local provenance is preserved. A rebuilt capture cache
+  therefore still derives from it instead of quarantining rows that legitimately
+  used it. Genuinely peer-authored sources with no local bytes remain skipped.
+- Regression coverage: the ledger schema, mixed local and foreign provenance,
+  retransmission, version-1 compatibility, and an end-to-end cold rebuild that
+  drives the real public recorder and `Replica` ingestion. A real native-TLS
+  provenance harness test and 11 lifecycle tests passed under a zero-outbound
+  guard. `./scripts/lint.sh`: exit 0, `RESULT: PASS` (all six gates).
 
 ### Durable space recovery
 
@@ -196,6 +239,30 @@ such; they are not evidence of a second network.
   passed. The targeted command/native recovery run also passed with an offline
   guard recording zero socket, fetch or GitHub CLI attempts.
   `./scripts/lint.sh`: exit 0, `RESULT: PASS`.
+- Stop is final (`8c6dfdf`): a stop request issued while a start, host, join or
+  cleanup operation is pending is no longer undone when that operation
+  completes, and the session stays disabled until the user hosts or joins
+  again. Eleven lifecycle tests cover the pending-operation cases and passed
+  under the zero-outbound guard.
+
+### Relay cleanup after interrupted startup
+
+- Fixed in `0e0f1d6`. A disconnect callback may suspend the relay host before its
+  initial connect rejects. Suspension and resource removal now have separate
+  completion states, so the failed startup can still delete its tunnel.
+- Stop owns and awaits the starting host through cleanup retries. Failed
+  removals remain reachable for retry; successful resource deletion is not
+  repeated when only management-client disposal needs retrying. A production
+  management-client factory permits cleanup after suspension released the
+  original client.
+- Cleanup failures retain the ownership marker for **EditChain: Clean Up
+  Multiplayer Tunnels**. Errors from the SDK remain sanitized. Successful
+  suspension still preserves the tunnel for workspace reload.
+- Sixteen regressions cover callback ordering, Stop during cleanup and deletion
+  retry, failed disposal, retained ownership, suspension/reload, sanitized
+  errors, and stopped status after a resumed startup fails. The management API
+  and SDK host are controlled stubs; the manager, relay lifecycle, journal
+  handling and native storage are real.
 
 ### Permission diagnostics
 
@@ -208,24 +275,24 @@ such; they are not evidence of a second network.
   preserved it. Existing TLS/pin/revocation tests, all 189 extension tests,
   multiplayer type checks and `./scripts/lint.sh` passed (exit 0, `RESULT: PASS`).
 
-### Final recovery validation
+### Recovery validation before the provenance fix
 
 - An additional regression covered a local baseline that a peer independently
   supplied before conflicting with it. Every new quarantine now invalidates
   cached recorder state, regardless of received receipts. Both receipt cases
   cover continued recording, exact retries, cold recovery and rejection of
   changed retry content or recorder identity.
-- Final `./scripts/lint.sh`: exit 0, `RESULT: PASS`; no quality policy,
-  thresholds, exclusions or suppressions changed. The extension build, all
-  189 harness tests and multiplayer type checks passed.
+- That checkpoint's `./scripts/lint.sh`: exit 0, `RESULT: PASS`; no quality
+  policy, thresholds, exclusions or suppressions changed. The extension build,
+  all 189 harness tests and multiplayer type checks passed.
 - Extracted the rebuilt VSIX and ran 58 multiplayer/Dev Tunnels tests against
   its actual runtime and native binaries. All passed, with zero skips and zero
   socket/fetch/GitHub CLI attempts under the offline guard. The packaged service
   also accepted new capture and exact retries after a conflicting record was
   injected through the public replication API, including after service restart.
 - Verified all 29 packaged runtime files and both executable binaries against
-  the fresh build; test automation remains excluded. Current
-  [VSIX](../outputs/editchain-history-multiplayer.vsix) SHA-256:
+  the fresh build; test automation remains excluded. That checkpoint's
+  [VSIX](../outputs/editchain-history-multiplayer-before-20260919.vsix) SHA-256:
   `26b761be08d0a3c565c3d56ca549532ef53d6a412495574076ea01882ac132ee`.
   [Package verification](../outputs/multiplayer-recovery-verification.json).
 - These recovery checks used disposable local fixtures and controlled byte
@@ -233,16 +300,64 @@ such; they are not evidence of a second network.
   cloud tunnels, or access an account token. Different-account/network testing
   remains outstanding.
 
+### Final verification — September 19, 2026
+
+- All three fixes are included in the current package. Canonical
+  `./scripts/lint.sh`: exit 0, `RESULT: PASS` across all six gates in an isolated
+  checkout. No quality policies, thresholds, exclusions or suppressions changed;
+  unrelated edits in the developer's checkout were preserved.
+- TypeScript compilation, multiplayer type/syntax checks and all **217**
+  extension harness tests passed, with zero failures or skips. Both release
+  binaries were rebuilt.
+- Extracted the new VSIX and ran **86** multiplayer/Dev Tunnels tests against
+  its actual runtime and bundled native binaries. All passed, with zero skips
+  and zero socket/fetch/GitHub CLI attempts under the offline guard. This
+  includes native mutual-TLS history replication, the cold-cache provenance
+  regression, command/manager lifecycle tests and the controlled SDK cleanup
+  failures. The packaged service also passed capture, exact retries and restart
+  after a conflict injected through the public replication API.
+- All **29** packaged runtime files and both executable binaries match the
+  fresh build; test automation is excluded. Current
+  [VSIX](../outputs/editchain-history-multiplayer.vsix) SHA-256:
+  `24155bca29486114f5463f718ca694abc12c2e09925e7abc14fd041873acd7d8`.
+  [Verification report](../outputs/multiplayer-fixes-20260919-verification.json).
+- These checks use disposable local fixtures. The earlier live relay and VS
+  Code multiplayer UI runs were not repeated for this package. Two-account,
+  different-network and live repository-discovery checks remain deferred.
+
+## Migration and compatibility
+
+- `multiplayer/scope.json` stays at version 1 and gains one optional array,
+  `local`, holding the exact record keys this device retained before a peer
+  independently supplied them. It is independent of `received` and
+  `received_blobs`: those still mean "a peer supplied this" and still gate
+  export of preexisting blob content, unchanged. Capture uses `local` when
+  selecting sources for replay and exact retries.
+- A version-1 ledger written before the field existed still loads; `local`
+  defaults to empty. Keys the earlier code already moved to `received` are
+  indistinguishable from genuinely peer-authored records, so their lost local
+  provenance is **not** reconstructed and no authorship is inferred for them.
+- There is no automatic unquarantine or repair of damage the earlier behavior
+  already caused. Rows quarantined before the fix stay quarantined; re-deriving
+  an already retained variant does not remove its conflicting evidence.
+- Mixed builds are unsupported. An older replication worker rejects the added
+  field and fails closed (`invalid scope metadata`) rather than continuing.
+  Older capture code ignores the unknown field, so it does not fail — it keeps
+  the previous behavior. Use the service and peer binaries from the same
+  updated build on every device.
+
 ## Remaining validation and known limits
 
 - Different-account and different-network joins need another authorized
-  environment. Use the [Host/Join steps](../extensions/vscode-editchain/README.md#multiplayer-history),
+  environment and are explicitly deferred at the user's request. When they are
+  run, use the [Host/Join steps](../extensions/vscode-editchain/README.md#multiplayer-history),
   verify both fingerprints, type on both devices, inspect the received diffs,
   interrupt one connection, and confirm catch-up and Stop cleanup.
 - Repository discovery has contract tests against controlled HTTP responses.
-  A live check should publish and withdraw advertisements in an authorized test
-  repository and verify that stale or unknown devices gain no access. No live
-  repository variable was created in this implementation session.
+  A live check remains pending: publish and withdraw advertisements in an
+  authorized test repository and verify that stale or unknown devices gain no
+  access. No live repository variable was created in this implementation
+  session.
 - The packaged UI run uses Linux x64, VS Code 1.132.0, one machine and one CLI
   account through a test-only provider. Other platform packages and the built-in
   sign-in flow across different accounts still need their own observations.

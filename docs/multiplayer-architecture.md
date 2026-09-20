@@ -87,6 +87,10 @@ branch name or local path does not establish space membership. Audit existing
 node/actor/session ID generation before merging independently captured chains;
 preserve original operation IDs, parents, clocks and payload bytes.
 
+The converse also holds: a peer supplying an exact copy of a record this device
+already retained does not make that record peer-authored. Local provenance is a
+separate durable fact from what a peer supplied.
+
 Enrollment flow: exchange an invitation through a trusted channel
 and explicitly approve the device identity. The invitation binds the space,
 endpoint and expected device fingerprint. Use a reviewed mutually authenticated
@@ -160,6 +164,11 @@ Authorize both inventory and content against the agreed scope. Knowing a blob
 hash is insufficient authorization. Missing parents outside the scope remain
 explicitly missing; fetching dependencies must not expand sharing implicitly.
 
+An independently supplied exact copy of a withheld baseline record becomes
+shareable evidence, but its preexisting content blobs stay gated: permission to
+export and evidence of authorship are separate durable facts, and the first is
+never inferred from the second.
+
 ## 6. Durability and live updates
 
 Receive → validate encoding, bounds and scope → classify exact evidence →
@@ -170,8 +179,13 @@ The implementation reuses the writer lock and durable page append behavior in
 transactions coordinated with editor capture and provider imports through the
 same bounded writer-acquisition helper. The peer's exact-byte ingestion path
 preserves immutable received evidence. The editor recorder skips normalization
-of that received source evidence, preventing duplicate local derivations while
-still admitting independently captured work.
+of peer-authored source evidence, preventing duplicate local derivations while
+still admitting independently captured work. A record this device retained
+locally keeps that provenance even when a peer independently supplies the exact
+same bytes, so capture still derives from it and a rebuilt cache cannot
+quarantine rows that legitimately used it. The scope ledger therefore stores
+received receipts for export gating and local provenance for capture as
+separate sets.
 
 Operations and blobs have separate completion states. A record can be durable
 while its content is still missing. After a crash, rebuild synchronization
@@ -200,6 +214,15 @@ endpoint freshness. A local membership removal closes that device's sessions
 and rejects further admission; distributed revocation and its offline policy
 need a defined authority before automatic team discovery ships. Previously
 received copies cannot be recalled.
+
+Stop is final: a stop request issued while a start, host, join or cleanup
+operation is pending must not be undone when that operation completes, and the
+session stays disabled until the user explicitly hosts or joins again. Relay
+teardown and resource deletion have independent, retryable completion states,
+so a disconnect-triggered pause cannot prevent cleanup after a failed initial
+connection. Stop waits for the starting host's cleanup, including a deletion
+retry. Persistent cleanup failures retain the ownership marker for the manual
+cleanup command and report sanitized errors.
 
 ## 8. Implementation sequence
 
