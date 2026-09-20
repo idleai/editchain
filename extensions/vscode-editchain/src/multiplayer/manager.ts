@@ -34,6 +34,8 @@ export class MultiplayerManager {
   private lease?: HostLease;
   private hostTimer?: NodeJS.Timeout;
   private hostAttempts = 0;
+  private pendingCleanup = new Set<HostTransport>();
+  private starting?: HostTransport;
   private readonly relay: RelayProvider;
   private clients = new Map<string, ClientTransport>();
   private edges = new Map<string, Edge>();
@@ -46,7 +48,7 @@ export class MultiplayerManager {
   constructor(private readonly options: ManagerOptions) {
     this.space = options.space;
     this.relay = options.relay ?? {
-      host: (incoming, failed) => new RelayHost(managementClient(options.githubToken), options.journal, incoming, failed),
+      host: (incoming, failed) => new RelayHost(() => managementClient(options.githubToken), options.journal, incoming, failed),
       client: () => new RelayClient(),
       remove: lease => removeSavedRelay(lease, options.journal, options.githubToken),
     };
@@ -123,7 +125,7 @@ export class MultiplayerManager {
     for (const invitation of peers) this.peers.set(invitation.host.fingerprint, { invitation, attempts: 0, state: 'Reconnecting' });
     if (this.lease) {
       try { await this.startHost(generation); }
-      catch { this.message = 'Hosting is unavailable; retrying automatically.'; }
+      catch { if (generation === this.generation) this.message = 'Hosting is unavailable; retrying automatically.'; }
     }
     this.requireGeneration(generation);
     for (const key of this.peers.keys()) this.schedule(key, 0);
@@ -226,18 +228,31 @@ export class MultiplayerManager {
       }
     });
     this.host = host;
+    // Own the host from creation: a Stop issued while a first connect is still
+    // unwinding must be able to reach and await its resource cleanup.
+    this.starting = host;
     this.message = 'Starting private relay…'; this.publish();
     try {
       await host.start(this.lease);
       if (generation !== this.generation) { await (this.lease ? host.suspend() : host.stop()); throw new ProbeError('Sharing was stopped.'); }
       this.lease = host.lease();
       this.hostAttempts = 0;
+      if (this.starting === host) this.starting = undefined;
       await this.persist();
     } catch (error) {
       if (this.host === host) this.host = undefined;
-      await (this.lease ? host.suspend() : host.stop()).catch(() => {});
-      this.scheduleHost(generation);
-      this.message = 'Hosting failed.'; this.publish();
+      const removing = !this.lease;
+      try { await (removing ? host.stop() : host.suspend()); }
+      catch {
+        // Keep the only reference to a resource whose removal failed so an explicit
+        // Stop can retry the deletion instead of leaking the tunnel.
+        if (removing) this.pendingCleanup.add(host);
+      }
+      if (this.starting === host) this.starting = undefined;
+      if (generation === this.generation) {
+        this.scheduleHost(generation);
+        this.message = 'Hosting failed.'; this.publish();
+      }
       throw error;
     }
   }
@@ -311,6 +326,12 @@ export class MultiplayerManager {
     const host = this.host, lease = this.lease;
     this.host = undefined;
     const clients = [...this.clients.values()]; this.clients.clear();
+    // A host created by an in-flight start is owned until its cleanup finishes, even
+    // after the disconnect callback cleared this.host and before its lease exists.
+    const pending = remove
+      ? [...new Set([...this.pendingCleanup, ...(this.starting ? [this.starting] : [])])].filter(value => value !== host)
+      : [];
+    if (remove) { this.pendingCleanup.clear(); this.starting = undefined; }
     for (const edge of [...this.edges.values()]) edge.bridge.stop();
     this.edges.clear();
     if (remove) { this.peers.clear(); this.lease = undefined; }
@@ -318,8 +339,13 @@ export class MultiplayerManager {
     const results = await Promise.allSettled([
       remove ? this.persist(true) : this.saved,
       host ? (remove ? host.stop() : host.suspend()) : remove && lease ? this.relay.remove(lease) : undefined,
+      ...pending.map(value => value.stop()),
       ...clients.map(client => client.stop()),
     ]);
+    // Index 0 is the saved session and index 1 the active host; a failed removal
+    // stays tracked so the next explicit Stop retries it instead of leaking.
+    pending.forEach((value, index) => { if (results[2 + index].status === 'rejected') this.pendingCleanup.add(value); });
+    if (remove && host && results[1].status === 'rejected') this.pendingCleanup.add(host);
     if (results.some(result => result.status === 'rejected')) {
       this.message = 'Sharing closed; saved state or tunnel cleanup needs attention.'; this.publish();
       throw new ProbeError('Sharing closed; run EditChain: Clean Up Multiplayer Tunnels if cleanup is pending.');

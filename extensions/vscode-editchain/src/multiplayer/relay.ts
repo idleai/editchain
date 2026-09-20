@@ -35,19 +35,38 @@ export async function removeSavedRelay(lease: HostLease, journal: RelayJournal, 
 export class RelayHost {
   private readonly host: TunnelRelayTunnelHost;
   private readonly cancellation = new CancellationTokenSource();
+  private readonly journal: RelayJournal;
+  private readonly incoming: (stream: Duplex) => void;
+  private readonly failed: (message: string, disconnected?: boolean) => void;
+  private readonly createManagement?: () => TunnelManagementHttpClient;
+  private management: TunnelManagementHttpClient;
   private marker = `editchain-multiplayer-${randomBytes(12).toString('hex')}`;
   private tunnel?: Tunnel;
   private recorded = false;
   private closed = false;
+  private hostDisposed = false;
+  private managementDisposed = false;
+  private managementDisposing?: Promise<void>;
+  private resourceRemoved = false;
+  private removeRequested = false;
+  private closing?: Promise<void>;
+  private removal?: Promise<void>;
   private subscription?: { dispose(): void };
   private statusSubscription?: { dispose(): void };
   private streams = new Set<Duplex>();
-  private stopped?: Promise<void>;
   private creationRejected = false;
 
-  constructor(private readonly management: TunnelManagementHttpClient, private readonly journal: RelayJournal,
-    private readonly incoming: (stream: Duplex) => void, private readonly failed: (message: string, disconnected?: boolean) => void) {
-    this.host = new TunnelRelayTunnelHost(management);
+  // The management client is injected either ready to use or as a factory. A factory
+  // lets a Stop recreate the client after a suspend released it, so deletion never
+  // depends on the client surviving the pause.
+  constructor(management: TunnelManagementHttpClient | (() => TunnelManagementHttpClient), journal: RelayJournal,
+    incoming: (stream: Duplex) => void, failed: (message: string, disconnected?: boolean) => void) {
+    this.createManagement = typeof management === 'function' ? management : undefined;
+    this.management = typeof management === 'function' ? management() : management;
+    this.journal = journal;
+    this.incoming = incoming;
+    this.failed = failed;
+    this.host = new TunnelRelayTunnelHost(this.management);
     this.host.forwardConnectionsToLocalPorts = false;
     this.host.enableE2EEncryption = true;
     void this.cancellation.token;
@@ -123,33 +142,76 @@ export class RelayHost {
     } catch (error) { throw new ProbeError(safeFailure('Creating multiplayer invitation', error)); }
   }
 
+  /** Stop hosting and delete the relay resource. A failed removal stays retryable. */
   stop(): Promise<void> {
-    this.stopped ??= this.dispose(true);
-    return this.stopped;
+    this.removeRequested = true;
+    return this.retire(true);
   }
 
+  /** Pause hosting while keeping the relay resource for a later reload. */
   suspend(): Promise<void> {
-    this.stopped ??= this.dispose(false);
-    return this.stopped;
+    return this.retire(false);
   }
 
-  private async dispose(remove: boolean): Promise<void> {
+  private async retire(remove: boolean): Promise<void> {
+    const errors: string[] = [];
+    // Only our own ProbeError text is trusted; SDK failures keep fixed credential-safe wording.
+    try { await (this.closing ??= this.teardown().catch(error => { this.closing = undefined; throw error; })); }
+    catch (error) { errors.push(error instanceof ProbeError ? error.message : 'Closing the relay host failed.'); }
+    if (remove) {
+      try { await (this.removal ??= this.deleteResource().catch(error => { this.removal = undefined; throw error; })); }
+      catch (error) { errors.push(error instanceof ProbeError ? error.message : 'Tunnel cleanup is pending; run EditChain: Clean Up Multiplayer Tunnels.'); }
+    }
+    if (errors.length) throw new ProbeError(errors.join(' '));
+  }
+
+  // Teardown is idempotent and re-runnable so a failed close can be retried.
+  private async teardown(): Promise<void> {
     this.closed = true;
-    this.cancellation.cancel();
-    this.subscription?.dispose();
-    this.statusSubscription?.dispose();
+    try { this.cancellation.cancel(); } catch { /* An already disposed source is cancelled. */ }
+    this.subscription?.dispose(); this.subscription = undefined;
+    this.statusSubscription?.dispose(); this.statusSubscription = undefined;
     for (const stream of this.streams) stream.destroy();
     this.streams.clear();
     const errors: string[] = [];
-    try { await bounded(() => this.host.dispose(), CancellationToken.None, CLEANUP); }
-    catch { errors.push('Closing the relay host failed.'); }
-    try {
-      if (remove && this.recorded) await cleanupRelay(this.management, this.marker, this.journal, this.tunnel, this.creationRejected);
-    } catch { errors.push('Tunnel cleanup is pending; run EditChain: Clean Up Multiplayer Tunnels.'); }
-    try { await bounded(() => this.management.dispose(), CancellationToken.None, CLEANUP); }
-    catch { errors.push('Closing relay management failed.'); }
-    this.cancellation.dispose();
+    // Completion, not the attempt, is recorded so a failed disposal is retried.
+    if (!this.hostDisposed) {
+      try { await bounded(() => this.host.dispose(), CancellationToken.None, CLEANUP); this.hostDisposed = true; }
+      catch { errors.push('Closing the relay host failed.'); }
+    }
+    try { this.cancellation.dispose(); } catch { /* Already disposed. */ }
+    // The client is only needed when a removal may still follow and no factory can
+    // recreate it; an unowned host has nothing to remove, so release it either way.
+    if (!this.recorded || (this.createManagement && !this.removeRequested)) {
+      try { await this.disposeManagement(); }
+      catch { errors.push('Closing relay management failed.'); }
+    }
     if (errors.length) throw new ProbeError(errors.join(' '));
+  }
+
+  private async deleteResource(): Promise<void> {
+    if (!this.recorded) return;
+    if (this.managementDisposed) {
+      if (!this.createManagement) throw new ProbeError('Relay cleanup needs a management client; run EditChain: Clean Up Multiplayer Tunnels.');
+      this.management = this.createManagement();
+      this.managementDisposed = false;
+      this.managementDisposing = undefined;
+    }
+    // Removal and client release are separate: a failed release must not re-delete.
+    if (!this.resourceRemoved) {
+      await cleanupRelay(this.management, this.marker, this.journal, this.tunnel, this.creationRejected);
+      this.resourceRemoved = true;
+    }
+    await this.disposeManagement();
+  }
+
+  private disposeManagement(): Promise<void> {
+    if (this.managementDisposed) return Promise.resolve();
+    this.managementDisposing ??= (async () => {
+      await bounded(() => this.management.dispose(), CancellationToken.None, CLEANUP);
+      this.managementDisposed = true;
+    })().catch(error => { this.managementDisposing = undefined; throw error; });
+    return this.managementDisposing;
   }
 }
 
