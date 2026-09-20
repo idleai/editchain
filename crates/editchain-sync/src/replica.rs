@@ -48,6 +48,15 @@ struct Scope {
     excluded: BTreeSet<RecordKey>,
     received: BTreeSet<RecordKey>,
     received_blobs: BTreeSet<[u8; 32]>,
+    /// Exact records this device retained locally before a peer independently
+    /// supplied the same bytes. Kept separate from `received` so that export
+    /// permission and blob gating never imply peer authorship.
+    ///
+    /// Version-1 ledgers written before this field existed default to empty.
+    /// Their received-but-formerly-excluded entries are ambiguous and are not
+    /// retroactively attributed to this device.
+    #[serde(default)]
+    local: BTreeSet<RecordKey>,
 }
 
 impl Scope {
@@ -194,6 +203,7 @@ impl Replica {
                 excluded,
                 received: BTreeSet::new(),
                 received_blobs: BTreeSet::new(),
+                local: BTreeSet::new(),
             })?;
         }
         Ok(replica)
@@ -262,8 +272,12 @@ impl Replica {
         for (key, bytes) in records {
             // An independently supplied exact baseline record is now shared
             // evidence, but cannot expose this device's preexisting blobs.
+            // Its local provenance is retained separately: the bytes existed
+            // here before a peer supplied them, so capture must keep deriving
+            // from them even though export now needs a receipt.
             if scope.excluded.remove(key) {
                 let _: bool = scope.received.insert(*key);
+                let _: bool = scope.local.insert(*key);
                 scope_changed = true;
             }
             if known.classify(key.id, bytes) != Admission::Duplicate {

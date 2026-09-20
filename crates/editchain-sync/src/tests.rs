@@ -22,6 +22,7 @@ macro_rules! check_eq {
     };
 }
 
+mod provenance_tests;
 mod secure_tests;
 mod session_tests;
 
@@ -32,6 +33,7 @@ use editchain_core::{
     ActorId, BlobRef, Clock, ContentId, MessageOp, NodeId, Op, OpId, OpKind, ParentSet, Payload,
     ScopeRef, Tags,
 };
+use editchain_store::durable::atomic_write;
 use editchain_store::format::{encode_op, Page};
 use editchain_store::{BlobStore, CanonicalChain, SegmentStore};
 
@@ -451,6 +453,144 @@ fn framing_accepts_fragmentation_and_rejects_oversize_truncation_and_trailing_by
     check!(
         crate::decode_message(&payload).is_err(),
         "future trailing fields cannot masquerade as a supported message"
+    );
+    Ok(())
+}
+
+#[test]
+fn echoed_local_baseline_records_local_provenance_without_exposing_blobs() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let private = b"preexisting private baseline bytes";
+    let baseline = blob_record(
+        1,
+        private,
+        u32::try_from(private.len()).map_err(io::Error::other)?,
+    )?;
+    let hash = *blake3::hash(private).as_bytes();
+    BlobStore::new(dir.path().join("blobs"))?.write(private)?;
+    seed(dir.path(), std::slice::from_ref(&baseline))?;
+    let foreign = blob_record(9, b"peer content", 12)?;
+    let replica = Replica::open(dir.path(), "space-1", false)?;
+    check_eq!(
+        replica.snapshot()?.len(),
+        0,
+        "consent withholds the local baseline"
+    );
+    let acks = replica.ingest_records(&[baseline.clone(), foreign.clone()])?;
+    check_eq!(
+        acks,
+        vec![baseline.0, foreign.0],
+        "both independently supplied records are acknowledged"
+    );
+    let snapshot = replica.snapshot()?;
+    check_eq!(
+        snapshot.len(),
+        2,
+        "echoed baseline and foreign evidence are shareable"
+    );
+    check!(
+        snapshot.contains(baseline.0) && snapshot.contains(foreign.0),
+        "both records leave the withheld baseline"
+    );
+    check!(
+        replica.read_blob(&snapshot, baseline.0, hash)?.is_none(),
+        "preexisting private content stays unexportable"
+    );
+    let baseline_json = serde_json::to_value(baseline.0).map_err(io::Error::other)?;
+    let foreign_json = serde_json::to_value(foreign.0).map_err(io::Error::other)?;
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("multiplayer/scope.json"))?)?;
+    let local = ledger
+        .get("local")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| io::Error::other("missing local provenance set"))?;
+    check_eq!(
+        local.len(),
+        1,
+        "only the echoed baseline is locally authored"
+    );
+    check!(
+        local.contains(&baseline_json),
+        "the echoed baseline keeps its local provenance"
+    );
+    check!(
+        !local.contains(&foreign_json),
+        "a genuinely foreign record never becomes local provenance"
+    );
+    drop(replica);
+    let replica = Replica::open(dir.path(), "space-1", false)?;
+    let snapshot = replica.snapshot()?;
+    check_eq!(snapshot.len(), 2, "scope decisions survive reopening");
+    check!(
+        replica.read_blob(&snapshot, baseline.0, hash)?.is_none(),
+        "blob gating survives reopening"
+    );
+    replica.ingest_blob(baseline.0, hash, private)?;
+    check_eq!(
+        replica.read_blob(&replica.snapshot()?, baseline.0, hash)?,
+        Some(private.to_vec()),
+        "content supplied through this space can still be forwarded"
+    );
+    Ok(())
+}
+
+#[test]
+fn retransmitted_foreign_records_never_gain_local_provenance() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let replica = Replica::open(dir.path(), "space-1", false)?;
+    let foreign = blob_record(1, b"peer bytes", 10)?;
+    let _acks = replica.ingest_records(std::slice::from_ref(&foreign))?;
+    let _acks = replica.ingest_records(std::slice::from_ref(&foreign))?;
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("multiplayer/scope.json"))?)?;
+    check_eq!(
+        ledger
+            .get("received")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(1),
+        "retransmission keeps one receipt"
+    );
+    check_eq!(
+        ledger
+            .get("local")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(0),
+        "retransmission never invents local authorship"
+    );
+    Ok(())
+}
+
+#[test]
+fn version_one_ledgers_without_local_provenance_still_load() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    seed(dir.path(), &[record(1, b"legacy history")?])?;
+    std::fs::create_dir_all(dir.path().join("multiplayer"))?;
+    atomic_write(
+        &dir.path().join("multiplayer/scope.json"),
+        &serde_json::to_vec(&serde_json::json!({
+            "version": 1, "space": "space-1", "excluded": [], "received": [],
+            "received_blobs": [],
+        }))?,
+    )?;
+    let replica = Replica::open(dir.path(), "space-1", true)?;
+    check_eq!(
+        replica.snapshot()?.len(),
+        1,
+        "a version-1 ledger without local provenance still loads"
+    );
+    let entry = record(2, b"new shared history")?;
+    let _acks = replica.ingest_records(std::slice::from_ref(&entry))?;
+    let ledger: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("multiplayer/scope.json"))?)?;
+    check_eq!(
+        ledger
+            .get("local")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(0),
+        "no authorship is invented for legacy receipts"
     );
     Ok(())
 }

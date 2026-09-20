@@ -25,3 +25,7 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "rin
 
 [dev-dependencies]
 tempfile = "3"
+# Exercise the real public editor recorder against this crate's replication
+# API. Kept as dev-only edges; the library graph stays acyclic.
+editchain-node = { path = "../editchain-node" }
+editchain-protocol = { path = "../editchain-protocol" }

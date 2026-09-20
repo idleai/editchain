@@ -793,6 +793,8 @@ dependencies = [
  "base64",
  "blake3",
  "editchain-core",
+ "editchain-node",
+ "editchain-protocol",
  "editchain-store",
  "postcard",
  "rcgen",

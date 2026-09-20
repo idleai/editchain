@@ -37,7 +37,7 @@ pub(super) fn retained_source(
     for location in locations {
         let encoded = read_encoded_at(root, location)?;
         let digest = *blake3::hash(&encoded).as_bytes();
-        if !receipts.received.contains(&Receipt { id, digest }) {
+        if receipts.locally_retained(id, digest) {
             // Without a unique local admission there is no safe retry parent.
             if local.is_some() {
                 return Ok(None);
@@ -95,6 +95,14 @@ pub(super) fn predecessor_matches(
 pub(super) struct Receipts {
     version: u16,
     received: BTreeSet<Receipt>,
+    /// Exact records retained here before a peer independently supplied the
+    /// same bytes. Such a variant also has a received receipt, so authorship
+    /// must be read from this set rather than inferred from the receipt.
+    ///
+    /// Version-1 ledgers written before this field existed default to empty;
+    /// their ambiguous receipts are never retroactively treated as local.
+    #[serde(default)]
+    local: BTreeSet<Receipt>,
 }
 
 impl Receipts {
@@ -116,10 +124,18 @@ impl Receipts {
         Ok(receipts)
     }
 
+    /// Whether this exact variant is known to have been retained locally,
+    /// independent of any received receipt. Only bytes that were never
+    /// supplied by a peer, or were held before a peer supplied them, are
+    /// evidence of local authorship.
+    fn locally_retained(&self, id: OpId, digest: [u8; 32]) -> bool {
+        let receipt = Receipt { id, digest };
+        self.local.contains(&receipt) || !self.received.contains(&receipt)
+    }
+
     pub(super) fn foreign(&self, chain: &IndexedChain, root: &Path, id: OpId) -> io::Result<bool> {
-        if self
-            .received
-            .range(
+        let any_receipt = |set: &BTreeSet<Receipt>| {
+            set.range(
                 Receipt {
                     id,
                     digest: [0; 32],
@@ -129,15 +145,18 @@ impl Receipts {
                 },
             )
             .next()
-            .is_none()
-        {
+            .is_some()
+        };
+        if !any_receipt(&self.received) && !any_receipt(&self.local) {
             return Ok(false);
         }
         let mut found = false;
         for location in chain.evidence_locations(id) {
             found = true;
             let digest = *blake3::hash(&read_encoded_at(root, location)?).as_bytes();
-            if !self.received.contains(&Receipt { id, digest }) {
+            // A locally retained variant, including a baseline a peer later
+            // supplied exactly, must still be derived on this device.
+            if self.locally_retained(id, digest) {
                 return Ok(false);
             }
         }
