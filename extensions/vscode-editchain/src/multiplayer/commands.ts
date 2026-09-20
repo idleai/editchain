@@ -138,6 +138,9 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       space: context.workspaceState.get<string>(key), saveSpace: async space => { await context.workspaceState.update(key, space); },
       journal: { remember: marker => journal.remember(marker, workspace), forget: journal.forget },
       saveSession: async session => {
+        // A retired manager (Stop, chain change, window replacement) must never
+        // rewrite the saved session or the auto-resume flag of a newer manager.
+        if (manager !== created) return;
         if (session) {
           await context.secrets.store(sessionKey, JSON.stringify({ account: account?.account.id, session }));
           await context.workspaceState.update(enabledKey, true);
@@ -190,8 +193,21 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
     resumeAfterSettings = false;
     const previous = directory; directory = undefined; directoryStatus = undefined;
     const current = new Set([...retiring.keys(), ...(manager ? [manager] : [])]);
-    const results = await Promise.allSettled([previous?.stop(), ...[...current].map(value => value.stop())]);
-    if (results.some(result => result.status === 'rejected')) throw new CommandError('Sharing cleanup is pending.');
+    // Cancel synchronously so Stop always wins, then make the awaited cleanup part of
+    // the transition every execute() waits on. A Host started while cleanup is pending
+    // must wait for retirement instead of grabbing the stopped manager and being
+    // discarded (or leaked) by this Stop's cleanup.
+    const cleanup = Promise.allSettled([previous?.stop(), ...[...current].map(value => value.stop())])
+      .then(results => {
+        if (results.some(result => result.status === 'rejected')) throw new CommandError('Sharing cleanup is pending.');
+      })
+      .finally(() => {
+        // An explicit Stop retires the session for good. Clearing the manager keeps a
+        // later settings change from suspending it and promising a resume it cannot honor.
+        if (manager && current.has(manager)) { manager = undefined; folder = undefined; configuredChain = undefined; }
+      });
+    transition = transition.then(() => cleanup, () => cleanup).catch(() => {});
+    await cleanup;
   };
   const suspend = async () => {
     stopVersion++;

@@ -180,13 +180,19 @@ export class MultiplayerManager {
   }
 
   async revoke(fingerprint: string): Promise<void> {
+    const generation = this.generation;
     await this.control({ type: 'revoke', chain_dir: this.options.chain, space: this.requiredSpace(), fingerprint });
+    // A Stop or suspend during the native revocation retires this session: close()
+    // has already cleared or preserved its state, so the late Remove must not delete
+    // peers, stop transports, or rewrite a possibly newer saved session.
+    if (generation !== this.generation) return;
     clearTimeout(this.peers.get(fingerprint)?.timer);
     this.peers.delete(fingerprint);
     for (const edge of [...this.edges.values()]) if (edge.device?.fingerprint === fingerprint || edge.clientKey === fingerprint) edge.bridge.stop();
     const client = this.clients.get(fingerprint);
     this.clients.delete(fingerprint);
     await client?.stop();
+    if (generation !== this.generation) return;
     await this.persist();
     this.message = 'Device removed from this replica. Previously shared copies remain with participants.';
     this.publish();
@@ -255,7 +261,11 @@ export class MultiplayerManager {
     peer.state = 'Connecting'; this.publish();
     try {
       const invitation = savedInvitation(peer.invitation);
-      if (!(await this.devices()).some(device => device.certificate === invitation.host.certificate)) {
+      const approved = await this.devices();
+      // A Stop or suspend during the approval check retires this session (possibly
+      // reusing this manager); a stale attempt must not delete a newer peer entry.
+      if (generation !== this.generation || this.peers.get(key) !== peer) return;
+      if (!approved.some(device => device.certificate === invitation.host.certificate)) {
         this.peers.delete(key); await this.persist(); return;
       }
       const stream = await client.connect(invitation);
@@ -411,6 +421,9 @@ export class MultiplayerManager {
   }
 
   private persist(remove = false): Promise<void> {
+    // Only an active session owns saved state. A stopped or paused session is
+    // cleared (remove) or preserved by close(), never rewritten by late work.
+    if (!remove && !this.enabled) return Promise.resolve();
     const snapshot: SavedSharing | undefined = remove || !this.space ? undefined : {
       version: 1, space: this.space, host: this.lease, peers: [...this.peers.values()].map(peer => peer.invitation),
     };
