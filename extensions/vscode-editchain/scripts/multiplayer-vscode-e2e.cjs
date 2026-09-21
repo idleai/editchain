@@ -88,8 +88,17 @@ async function run() {
       fs.cpSync(path.join(root, 'package/extension'), installed, { recursive: true });
       execFileSync('git', ['-c', 'init.defaultBranch=main', 'init', '--quiet', workspace], { stdio: 'pipe' });
       fs.writeFileSync(path.join(workspace, '.gitignore'), '.editchain/\n');
+      fs.writeFileSync(path.join(root, 'sessions', `rollout-${role}.jsonl`), JSON.stringify({
+        type: 'session_meta', payload: { cwd: workspace },
+      }) + '\n');
       for (const name of ['from-host.ts', 'from-guest.ts']) fs.writeFileSync(path.join(workspace, name), `export const owner = '${role}'; // \n`);
     }
+    // Populate the shared browser cache once. Parallel first downloads otherwise
+    // remove each other's extraction directories before either instance starts.
+    await require('@vscode/test-electron').download({
+      version: process.env.EDITCHAIN_MULTIPLAYER_UI_VERSION || '1.132.0',
+      cachePath: path.join(extension, '.wdio-vscode-service'),
+    });
     const token = execFileSync('gh', ['auth', 'token', '--hostname', 'github.com'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
     fs.writeFileSync(path.join(root, 'github-token'), token, { mode: 0o600 });
     console.log('Starting two isolated VS Code instances with the packaged extension and real relay.');

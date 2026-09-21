@@ -86,6 +86,19 @@ async function type(file: string, text: string): Promise<void> {
   await browser.waitUntil(() => fs.readFileSync(path.join(fixture, role, file), 'utf8').includes(text), { timeout: 10000 });
 }
 
+async function openLiveHistory(): Promise<void> {
+  await browser.executeWorkbench(vscode => vscode.commands.executeCommand('editchain-history.open'));
+  const view = await (await browser.getWorkbench()).getWebviewByTitle('EditChain History');
+  await view.open();
+  await browser.waitUntil(() => browser.execute(() => !!(window as any).__editchainRendererDebug?.dataReady), { timeout: 30000 });
+  await browser.execute(() => (window as any).__editchainRendererDebug.whenIdle(10000));
+  report.historyInstance = await browser.execute(() => (window as any).__editchainRendererDebug.instanceId());
+  await view.close();
+  await browser.waitUntil(() => browser.execute(() => Array.from(document.querySelectorAll('.statusbar-item'))
+    .some(item => item.textContent?.includes('Codex retry'))), { timeout: 20000, timeoutMsg: 'Missing helper must report Codex retry while history stays live' });
+  report.providerRetryVisible = true;
+}
+
 async function receivedDiff(file: string, expected: string, artifact: string): Promise<{ before: string; after: string }> {
   const deadline = Date.now() + 60000;
   for (;;) {
@@ -98,6 +111,8 @@ async function receivedDiff(file: string, expected: string, artifact: string): P
     await browser.waitUntil(async () => browser.execute(file => Array.from(document.querySelectorAll('#rows .row-file'))
       .some(row => row.getAttribute('data-file-path') === file), file), { timeout: 60000, interval: 200, timeoutMsg: 'Remote captured edit did not appear in History' });
     await browser.execute(() => (window as any).__editchainRendererDebug.whenIdle(10000));
+    assert.equal(await browser.execute(() => (window as any).__editchainRendererDebug.instanceId()), report.historyInstance,
+      'received rows update the History view opened before this transfer');
     const rows = await browser.execute(file => Array.from(document.querySelectorAll('#rows .row[data-row]'))
       .filter(row => row.getAttribute('data-file-path') === file)
       .map(row => (window as any).__editchainRowAt?.(Number(row.getAttribute('data-row')))), file);
@@ -148,6 +163,7 @@ describe('packaged multiplayer in independent VS Code instances', () => {
     report.version = await browser.executeWorkbench(vscode => vscode.version);
     report.installedPackage = await browser.executeWorkbench(vscode => vscode.extensions.getExtension('ambientlight.editchain-history')?.extensionUri.path.includes('-profile/extensions/ambientlight.editchain-history-'));
     assert.equal(report.installedPackage, true, 'the VSIX must load from the isolated profile installation');
+    await openLiveHistory();
     const started = Date.now();
     if (role === 'guest') {
       assert.equal((await browser.executeWorkbench(vscode => vscode.commands.executeCommand('editchain-history.multiplayerRequest')) as any).ok, true);
@@ -173,6 +189,10 @@ describe('packaged multiplayer in independent VS Code instances', () => {
       assert.equal(first.before, "export const owner = 'guest'; // \n");
       assert.equal(fs.readFileSync(path.join(fixture, role, 'from-guest.ts'), 'utf8'), "export const owner = 'host'; // \n");
       report.workingTreeUnchanged = true;
+      const progress = (await status()).peers[0].progress;
+      assert.ok(progress.sent_records > 0 && progress.sent_blobs > 0, 'outgoing status confirms the guest saved host history');
+      assert.ok(progress.records > 0 && progress.blobs > 0, 'incoming status confirms host saved guest history');
+      report.transfers = progress;
       const oldPid = await browser.executeWorkbench(() => process.pid);
       console.log(`[host] full VS Code restart, retaining profile and chain; previous extension host ${oldPid}`);
       const restartingAt = Date.now();
@@ -181,6 +201,7 @@ describe('packaged multiplayer in independent VS Code instances', () => {
       console.log(`[host] WebDriver session restarted in ${report.reloadSessionMs} ms`);
       const preparingAt = Date.now();
       await ready();
+      await openLiveHistory();
       report.extensionReadyMs = Date.now() - preparingAt;
       assert.notEqual(await browser.executeWorkbench(() => process.pid), oldPid);
       const reconnectingAt = Date.now();

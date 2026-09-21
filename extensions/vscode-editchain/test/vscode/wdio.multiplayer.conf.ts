@@ -22,6 +22,7 @@ export const config: WebdriverIO.Config = {
         'window.dialogStyle': 'custom',
         'editchain-history.live.enabled': true,
         'editchain-history.live.sessionsPath': path.join(fixture, 'sessions'),
+        'editchain-history.live.codexHelperPath': path.join(fixture, 'missing-codex-session-exporter'),
         'editchain-history.tracking.readDwellMs': 2000,
         'workbench.startupEditor': 'none', 'files.autoSave': 'off', 'files.hotExit': 'off',
         'editor.minimap.enabled': false, 'editor.quickSuggestions': false, 'editor.wordWrap': 'off',
