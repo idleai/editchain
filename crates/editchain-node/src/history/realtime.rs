@@ -273,6 +273,9 @@ impl LiveWorkspace {
 
     fn sync_inner(&mut self, request: &SyncLiveRequest) -> Result<LiveUpdate> {
         self.validate_cursor(request)?;
+        // Peer content can arrive without another operation. In particular, a
+        // live view opened before blobs/ existed must start resolving its files.
+        self.blobs = editchain_store::BlobReader::open(&self.chain)?;
         let capture_start = Instant::now();
         self.queue_tail()?;
         let mut work = LiveWork::default();

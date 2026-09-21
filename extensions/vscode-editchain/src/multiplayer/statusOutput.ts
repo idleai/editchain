@@ -42,7 +42,14 @@ export class MultiplayerStatusOutput {
     value.peers.forEach((peer, index) => {
       const key = peer.connection ?? peer.fingerprint ?? `unidentified-${index}`;
       present.add(key);
-      const previous = this.peers.get(key);
+      let previous = this.peers.get(key);
+      // A joining device is listed by fingerprint while connecting, then gains
+      // an edge ID. Retain that observation rather than logging a disconnect.
+      if (!previous && peer.fingerprint) {
+        const prior = [...this.peers].find(([, value]) => value.peer.fingerprint === peer.fingerprint &&
+          (!value.peer.connection || !peer.connection));
+        if (prior) { previous = prior[1]; this.peers.delete(prior[0]); }
+      }
       const before = previous?.peer.progress, after = peer.progress;
       const reset = !!before !== !!after || (before && after &&
         (after.accepted !== before.accepted || after.records < before.records || after.blobs < before.blobs || after.rounds < before.rounds ||

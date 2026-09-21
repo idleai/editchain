@@ -139,3 +139,15 @@ test('authentication identifies an existing connection without reporting a disco
   assert.match(lines[0], /No new saved-data update observed in 1s/);
   assert.ok(!lines.some(line => line.includes('connection no longer listed')));
 });
+
+test('a joining peer can acquire and retire its connection ID without a false disappearance', t => {
+  const { lines, output, tick } = observe(t, status([{ fingerprint, state: 'Connecting' }]));
+  lines.length = 0;
+  output.update(status([{ ...peer(), connection: 'outgoing-edge' }]));
+  tick(1000);
+  assert.match(lines.at(-1), /Peer d0e961294271: Connected/);
+  output.update(status([{ fingerprint, state: 'Waiting to reconnect' }]));
+  tick(1000);
+  assert.match(lines.at(-1), /Waiting to reconnect/);
+  assert.ok(!lines.some(line => line.includes('connection no longer listed')));
+});

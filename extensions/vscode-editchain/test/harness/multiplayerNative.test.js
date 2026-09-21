@@ -10,7 +10,7 @@ const { MultiplayerManager } = require('../../out/multiplayer/manager');
 const { MultiplayerStatusOutput } = require('../../out/multiplayer/statusOutput');
 const { encodeInvitation, parseRequest, parseInvitation, validateEndpoint } = require('../../out/multiplayer/invitation');
 const { FrameDecoder } = require('../../out/frameDecoder');
-const { fixture, binaries, until, blobs, rows, diffs } = require('./multiplayerFixture');
+const { fixture, binaries, until, blobs } = require('./multiplayerFixture');
 
 async function control(body) {
   const worker = new NativeWorker(binaries.peer);
@@ -35,12 +35,25 @@ test('opaque production bridges deliver captured history and historical content 
     }
     await a.edit('before\n', 'A shared revision\n'.repeat(12_000));
     await b.edit('before B\n', 'B simultaneous revision\n'.repeat(12_000));
+    const opened = await b.call({ OpenLivePaged: { workspace_path: b.root, chain_dir: '.editchain' } });
+    let snapshot = opened.snapshot_id, revision = opened.live.revision, receivedUpdates = Promise.resolve();
+    const liveRows = [];
+    const refreshReceived = () => {
+      receivedUpdates = receivedUpdates.then(async () => {
+        const update = await b.call({ SyncLive: { epoch: opened.live.epoch, after_revision: revision, codex: null } });
+        revision = update.revision;
+        if (update.deltas.length) snapshot = update.deltas.at(-1).snapshot_id;
+        const window = await b.call({ GetWindow: { snapshot_id: snapshot, offset: 0, limit: 200, include_layout: false } });
+        liveRows.splice(0, liveRows.length, ...window.rows);
+      }).catch(error => failures.push(error.message));
+    };
     const left = new PassThrough({ highWaterMark: 1024 }), right = new PassThrough({ highWaterMark: 1024 });
     const streams = [Duplex.from({ readable: left, writable: right }), Duplex.from({ readable: right, writable: left })];
     for (const [index, local, remote] of [[0, a, undefined], [1, b, ai.certificate]]) {
       const bridge = new PeerBridge(binaries.peer, streams[index], { chain_dir: local.chain, device_dir: local.device, space: 'bridge-space', remote },
-        value => {
+        (value, _device, durableChange) => {
           progress.set(local.root, value);
+          if (index === 1 && durableChange) refreshReceived();
           if (index === 1) liveOutput.update({ enabled: true, hosting: false, space: 'bridge-space', peers: [{
             fingerprint: ai.fingerprint, state: !value.accepted ? 'Authenticating' : value.synchronizing ? 'Catching up'
               : value.unavailable ? 'Waiting for content' : 'Live', progress: value,
@@ -61,9 +74,14 @@ test('opaque production bridges deliver captured history and historical content 
     await until(() => statusLines.some(line => /Received here: [1-9]\d* records, [1-9]\d* content objects/.test(line)),
       'saved native history did not appear automatically in the live output');
     assert.deepEqual(failures, []);
-    const visible = await rows(b);
-    assert.ok(visible.some(row => row.file_change?.path === 'shared.ts'), 'remote history has its native file-change affordance');
-    assert.ok((await diffs(b)).some(diff => diff.before === 'before\n' && diff.after === 'A shared revision\n'.repeat(12_000)), 'native historical diff resolves exact remote revisions');
+    await receivedUpdates;
+    assert.ok(revision > opened.live.revision, 'remote receipts publish into the already open live view');
+    let remoteDiff;
+    for (const row of liveRows.filter(row => row.file_change)) {
+      const value = await b.call({ GetFileDiff: { snapshot_id: snapshot, change: row.file_change } });
+      if (value.before === 'before\n') remoteDiff = value;
+    }
+    assert.equal(remoteDiff?.after, 'A shared revision\n'.repeat(12_000), 'live diff hydrates exact remote content without an Open');
     assert.equal(fs.readFileSync(path.join(b.root, 'shared.ts'), 'utf8'), 'Working tree stays local.\n');
     // Local capture must still work while received source blobs/derivations exist.
     await b.edit('bob before\n', 'bob after\n');

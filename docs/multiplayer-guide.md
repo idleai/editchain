@@ -40,6 +40,10 @@ Run the commands below from the Command Palette (`Ctrl+Shift+P` or `Cmd+Shift+P`
 Edit and save a text file on one device. On the other, find the new History row
 and click its file change to open the recorded before/after diff. The receiving
 device's working file stays as it was. Repeat in the opposite direction.
+Keep History in live mode (**EditChain: Resume Live History** if it was paused).
+Saved multiplayer receipts wake the open live view; a slow outgoing reply does
+not delay that notification. Recorded diffs become available as their content
+arrives, including when the view was opened before its content store existed.
 
 ## Reconnect or stop
 

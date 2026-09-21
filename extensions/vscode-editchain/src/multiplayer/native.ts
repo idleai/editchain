@@ -152,11 +152,13 @@ export class PeerBridge {
       throw new NativePeerError('Invalid native multiplayer progress.');
     }
     const bytes = Buffer.from(result.bytes, 'base64');
-    if (bytes.length) await write(this.stream, bytes);
     const changed = result.progress.records !== this.previous.records || result.progress.blobs !== this.previous.blobs;
     this.previous = result.progress;
     this.lastProgress = result.progress;
+    // Local persistence is already complete. Publish it before an outgoing ACK
+    // or reply can block/fail, so the view never depends on remote backpressure.
     this.changed(result.progress, result.device, changed);
+    if (!this.closed && bytes.length) await write(this.stream, bytes);
   }
 }
 
