@@ -117,6 +117,12 @@ async function receivedDiff(file: string, expected: string, artifact: string): P
       .filter(row => row.getAttribute('data-file-path') === file)
       .map(row => (window as any).__editchainRowAt?.(Number(row.getAttribute('data-row')))), file);
     fs.writeFileSync(path.join(output, artifact + '-rows.json'), JSON.stringify(rows, null, 2));
+    assert.ok(rows.some((row: any) => row.session_meta?.session_title === `Human work · ${other}-user`),
+      'received activity carries the original account name');
+    assert.ok(await browser.execute(name => Array.from(document.querySelectorAll('#rows .group-label'))
+      .some(header => header.textContent === `Human work · ${name}`), `${other}-user`),
+      'the visible session header identifies the other user');
+    report.namedRemoteHeader = `Human work · ${other}-user`;
     await browser.saveScreenshot(path.join(output, artifact + '-history.png'));
     await browser.$(`.row-file[data-file-path="${file}"]`).click();
     await webview.close();

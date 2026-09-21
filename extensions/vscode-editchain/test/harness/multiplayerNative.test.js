@@ -19,7 +19,7 @@ async function control(body) {
 
 test('opaque production bridges deliver captured history and historical content between independent stores', { timeout: 30_000 }, async () => {
   const files = fixture();
-  const a = files.workspace('alice'), b = files.workspace('bob');
+  const a = files.workspace('alice', 'alice'), b = files.workspace('bob', 'bob');
   const bridges = [];
   const failures = [];
   const progress = new Map();
@@ -79,7 +79,11 @@ test('opaque production bridges deliver captured history and historical content 
     let remoteDiff;
     for (const row of liveRows.filter(row => row.file_change)) {
       const value = await b.call({ GetFileDiff: { snapshot_id: snapshot, change: row.file_change } });
-      if (value.before === 'before\n') remoteDiff = value;
+      if (value.before === 'before\n') {
+        remoteDiff = value;
+        assert.equal(row.session_meta.session_title, 'Human work · alice', 'received work keeps the original user name');
+      }
+      if (value.before === 'before B\n') assert.equal(row.session_meta.session_title, 'Human work · bob');
     }
     assert.equal(remoteDiff?.after, 'A shared revision\n'.repeat(12_000), 'live diff hydrates exact remote content without an Open');
     assert.equal(fs.readFileSync(path.join(b.root, 'shared.ts'), 'utf8'), 'Working tree stays local.\n');

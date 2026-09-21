@@ -17,7 +17,8 @@ exports.activate = context => {
     console.error('Multiplayer automation bridge failed to start');
   });
   const events = new vscode.EventEmitter();
-  const session = scopes => ({ id: 'relay-fixture', account: { id: 'relay-fixture-account', label: 'Relay test account' },
+  // Distinct display metadata exercises attribution; the real relay token is still same-account.
+  const session = scopes => ({ id: 'relay-fixture', account: { id: 'relay-fixture-account', label: process.env.EDITCHAIN_MULTIPLAYER_UI_ROLE + '-user' },
     scopes: [...(scopes || ['read:user', 'read:org'])], accessToken: fs.readFileSync(path.join(root, 'github-token'), 'utf8') });
   context.subscriptions.push(events, vscode.authentication.registerAuthenticationProvider('github', 'GitHub relay test fixture', {
     onDidChangeSessions: events.event,

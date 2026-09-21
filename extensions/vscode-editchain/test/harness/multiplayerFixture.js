@@ -26,7 +26,7 @@ const binaries = {
 function fixture() {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'editchain-multiplayer-'));
   const clients = [];
-  const workspace = name => {
+  const workspace = (name, userName) => {
     const root = path.join(directory, name);
     fs.mkdirSync(root);
     execFileSync('git', ['-c', 'init.defaultBranch=main', 'init', '--quiet', root], { stdio: 'pipe' });
@@ -41,7 +41,7 @@ function fixture() {
       return response.Ok;
     };
     const send = events => call({ RecordEditorEvents: { workspace_path: root, chain_dir: '.editchain', events:
-      events.map(event => ({ schema: 1, session, sequence: ++sequence, time_ms: Date.now(), event })) } });
+      events.map(event => ({ schema: 1, session, ...(userName ? { user_name: userName } : {}), sequence: ++sequence, time_ms: Date.now(), event })) } });
     const start = () => send([{ type: 'tracking_started', dwell_ms: 2000, vscode_version: '1.137.0', activity_schema: 2 },
       { type: 'workspace_context', workspace_path: root, observed_ms: Date.now(), repositories: [] }]);
     const edit = async (before, after) => {
