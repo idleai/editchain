@@ -165,6 +165,8 @@ test('status command follows peer changes automatically and stops reporting when
       accepted: true, synchronizing: true, rounds: 0, records: 128, blobs: 5, unavailable: 0,
     } }];
     current.options.changed(current.status(), true);
+    assert.equal(env.statusItem().text, '$(broadcast) Sharing · 1/1 connected · syncing');
+    assert.match(env.statusItem().tooltip, /Connected; syncing shared history \(first pass\)/);
     t.mock.timers.tick(1000);
     assert.ok(env.logs.some(line => /Peer dddddddddddd.*Received here: 128 records, 5 content objects/.test(line)));
     const snapshot = await env.invoke('multiplayerStatus');
@@ -175,7 +177,16 @@ test('status command follows peer changes automatically and stops reporting when
     assert.match(env.logs[0], /No new saved-data update observed in 16s/);
     assert.ok(!JSON.stringify(env.logs).includes('secret-user-token'));
     assert.ok(!JSON.stringify(env.logs).includes('private-invite-secret'));
+    current.peers[0].progress.synchronizing = false;
+    current.peers[0].progress.rounds = 1;
+    current.peers[0].state = 'Live';
+    current.options.changed(current.status(), false);
+    assert.equal(env.statusItem().text, '$(broadcast) Sharing · 1/1 connected');
+    current.peers[0] = { fingerprint: 'd'.repeat(64), state: 'Waiting to reconnect' };
+    current.options.changed(current.status(), false);
+    assert.equal(env.statusItem().text, '$(broadcast) Sharing · reconnecting');
     await env.invoke('multiplayerStop');
+    assert.equal(env.statusItem().text, '$(broadcast) Sharing stopped');
     assert.match(env.logs.at(-1), /Sharing stopped/);
     env.logs.length = 0;
     t.mock.timers.tick(60_000);

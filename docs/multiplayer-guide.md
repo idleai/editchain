@@ -34,8 +34,10 @@ Run the commands below from the Command Palette (`Ctrl+Shift+P` or `Cmd+Shift+P`
 4. **Joining person:** run **EditChain: Join Shared History**, paste the
    invitation, choose which of your history to share, approve the host, and sign
    in to your own GitHub account.
-5. **Both:** wait for **Sharing · 1/1 live** in the status bar, then run
-   **EditChain: Open History Explorer**.
+5. **Both:** wait for **Sharing · 1/1 connected** in the status bar, then run
+   **EditChain: Open History Explorer**. A **syncing** suffix means the connection
+   is working and shared history is still being checked or transferred. Received
+   rows appear as they are saved; you can keep editing during this check.
 
 ## Try it
 
@@ -88,6 +90,11 @@ available account name.
   exchange a fresh join request and invitation.
 
 ## Watch synchronization progress
+
+The status bar counts authenticated **connections**, including peers that are
+syncing. **Reconnecting** means the connection was lost; **waiting for content**
+means some referenced revision data was unavailable at the last check. A connected
+peer without either suffix has finished its latest incoming history check.
 
 Run **EditChain: Show Multiplayer Status** once. The **EditChain Multiplayer**
 Output channel prints a JSON snapshot, then follows progress automatically.

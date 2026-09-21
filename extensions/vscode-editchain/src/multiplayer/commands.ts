@@ -8,6 +8,7 @@ import { NativePeerError } from './native';
 import { ProbeError } from '../devTunnels/probe';
 import type { DirectorySync, DiscoveryStatus } from './discovery';
 import { MultiplayerStatusOutput } from './statusOutput';
+import { sharingDetails, sharingLabel } from './statusBar';
 import { HUMAN_ACCOUNT_SCOPES as SCOPES } from '../humanAccount';
 
 class CommandError extends Error {}
@@ -63,9 +64,8 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
     liveOutput?.update({ ...value, discovery: directoryStatus });
     status ??= vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
     status.command = 'editchain-history.multiplayerStatus';
-    const live = value.peers.filter(peer => peer.state === 'Live').length;
-    status.text = value.hosting || value.peers.length ? `$(broadcast) Sharing · ${live}/${value.peers.length} live` : '$(broadcast) Sharing stopped';
-    status.tooltip = [value.message || value.peers.map(peer => `${peer.fingerprint?.slice(0, 12) || 'Device'}: ${peer.state}`).join('\n'),
+    status.text = `$(broadcast) ${sharingLabel(value)}`;
+    status.tooltip = [sharingDetails(value),
       directoryStatus ? `Discovery: ${directoryStatus.state}` : ''].filter(Boolean).join('\n');
     status.show();
     if (durableChange) received();
