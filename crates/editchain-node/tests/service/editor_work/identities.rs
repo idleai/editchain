@@ -55,6 +55,67 @@ fn encoded(root: &Path) -> Vec<Vec<u8>> {
 }
 
 #[test]
+fn human_reload_keeps_its_lane_in_live_updates_and_retained_checkpoints() {
+    for mode in ["OpenLive", "OpenLivePaged"] {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let capture = |session| {
+            live_request(
+                &mut Server::new(),
+                batch(root, vec![start(session), tab(session, 2, "editor_opened")]),
+            )
+        };
+        let _recorded = capture(FIRST);
+        let query = json!({mode:{"workspace_path":root,"chain_dir":".editchain"}});
+        let mut history = Server::new();
+        let opened = live_request(&mut history, query.clone());
+        let before = window(&mut history, &opened["snapshot_id"]);
+        let previous = before.iter().find(|row| row["author"] == "human").unwrap();
+        let _recorded = capture(SECOND);
+        let update = live_request(
+            &mut history,
+            json!({"SyncLive":{"epoch":opened["live"]["epoch"],"after_revision":0,"codex":null}}),
+        );
+        let snapshot = &update["deltas"].as_array().unwrap().last().unwrap()["snapshot_id"];
+        let after = window(&mut history, snapshot);
+        let next = after
+            .iter()
+            .find(|row| row["node_key"] != previous["node_key"])
+            .unwrap();
+        assert_eq!(next["group"], previous["group"]);
+        assert_eq!(next["parents"], json!([previous["node_key"]]));
+        assert_eq!(
+            next["lane"], previous["lane"],
+            "reload must continue its lane: {mode}"
+        );
+        assert_eq!(next["transitions"], json!([]));
+        drop(history);
+
+        let mut reopened = Server::new();
+        let opened = live_request(&mut reopened, query);
+        assert_eq!(opened["diagnostics"]["open_chain_records"], 0);
+        let rows = window(&mut reopened, &opened["snapshot_id"]);
+        assert!(rows.iter().all(|row| row["lane"] == previous["lane"]));
+        let _recorded = capture(GUID);
+        let update = live_request(
+            &mut reopened,
+            json!({"SyncLive":{"epoch":opened["live"]["epoch"],"after_revision":0,"codex":null}}),
+        );
+        let snapshot = &update["deltas"].as_array().unwrap().last().unwrap()["snapshot_id"];
+        let rows = window(&mut reopened, snapshot);
+        let newest = records(root)
+            .into_iter()
+            .find(|(_, work)| work.session == GUID)
+            .unwrap()
+            .0
+            .id
+            .to_string();
+        assert!(rows.iter().any(|row| row["node_key"] == newest));
+        assert!(rows.iter().all(|row| row["lane"] == previous["lane"]));
+    }
+}
+
+#[test]
 fn unsigned_identity_connects_reloads_and_interleaved_recorders_beside_agents() {
     let temporary = tempfile::tempdir().expect("workspace");
     let root = temporary.path();

@@ -6,6 +6,30 @@ use super::{LiveWorkspace, Result};
 use editchain_protocol::rank::Measure;
 
 impl LiveWorkspace {
+    pub(super) fn restore_human_streams(&mut self) -> Result<()> {
+        self.poisoned = true;
+        let mut blocks: Vec<_> = self
+            .inputs
+            .iter()
+            .filter_map(|(key, input)| {
+                let stream = super::rows::human_stream(input)?;
+                let order = self.orders.get(key)?;
+                let mut block = self.blocks.get(order)?.clone();
+                block.meta.human_stream = Some(stream);
+                Some(block)
+            })
+            .collect();
+        // Start from tips so linked recorder runs reserve their path before an
+        // unrelated human root reuses a free column. Other lanes stay in place.
+        blocks.sort_by_key(|block| block.meta.order());
+        let keys: Vec<_> = blocks.iter().map(|block| block.meta.key.clone()).collect();
+        let metas: Vec<_> = blocks.iter().map(|block| block.meta.clone()).collect();
+        self.graph.edit(&keys, &metas);
+        // These are metadata repairs, not removed rows: retain disclosure state.
+        drop(self.connect(&[], blocks)?);
+        Ok(())
+    }
+
     pub(super) fn refresh_edit_rows(&mut self, include_exposure: bool) -> Result<()> {
         self.poisoned = true;
         let upserts = self

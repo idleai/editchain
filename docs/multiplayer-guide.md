@@ -54,6 +54,10 @@ using the GitHub account name available when the activity was recorded. The
 recorded name travels with shared history, so received work keeps its original
 name. Session IDs and device identities stay unchanged.
 
+Reloading VS Code keeps the same human session and continues its graph lane
+when the extension storage, workspace URI, and chain path stay the same. Existing
+live caches automatically repair recorder-restart lane changes on first open.
+
 Activity without a recorded name uses **VS Code**.
 Names are display metadata, not verified GitHub authorship. Already received
 history is not retroactively attributed to the current account. After updating

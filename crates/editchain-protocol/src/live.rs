@@ -45,6 +45,9 @@ pub struct LiveBlockMeta {
     /// Current physical identity of the top-level row.
     #[serde(default)]
     pub node_key: String,
+    /// Persistent human session, independent of the recorder incarnation or display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_stream: Option<String>,
     /// Exact visible ancestors, expressed as stable block identities.
     #[serde(default)]
     pub parents: Vec<String>,

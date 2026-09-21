@@ -108,6 +108,7 @@ impl LiveWorkspace {
                     .first()
                     .map(|row| row.node_key.clone())
                     .unwrap_or_default(),
+                human_stream: human_stream(input),
                 parents: Vec::new(),
                 chain_state: window
                     .rows
@@ -118,6 +119,17 @@ impl LiveWorkspace {
             rows: window.rows,
         }))
     }
+}
+
+pub(super) fn human_stream(input: &LiveRow) -> Option<String> {
+    input.operations.iter().find_map(|op| {
+        // Legacy captures and provider messages keep their existing source rule.
+        let _identity = editchain_project::human::work_record(op)?.identity?;
+        let editchain_core::ScopeRef::Session(session) = op.scope else {
+            return None;
+        };
+        Some(session.0.to_string())
+    })
 }
 
 /// A completed task may still contain an explicitly unresolved tool/command.

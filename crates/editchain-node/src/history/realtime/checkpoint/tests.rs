@@ -7,6 +7,7 @@ use editchain_protocol::{
 use std::cmp::Reverse;
 
 mod human_edits;
+mod human_streams;
 mod human_visibility;
 mod reconciliation;
 

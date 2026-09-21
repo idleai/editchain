@@ -2,6 +2,8 @@ use super::*;
 use editchain_core::taxonomy::ChainState;
 use editchain_project::layout::LayoutContext;
 
+mod human;
+
 fn node(key: &str, time: u64, parents: &[&str]) -> LiveBlockMeta {
     LiveBlockMeta {
         task_group: None,
@@ -12,6 +14,7 @@ fn node(key: &str, time: u64, parents: &[&str]) -> LiveBlockMeta {
         row_count: 1,
         spans: Vec::new(),
         node_key: key.into(),
+        human_stream: None,
         parents: parents.iter().map(|key| (*key).into()).collect(),
         chain_state: ChainState::Active,
     }
