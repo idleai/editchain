@@ -5,9 +5,13 @@ keeps their own working files and can open the other person's recorded diffs.
 
 ## Before you start
 
-- Install the multiplayer EditChain extension on both devices. For the local
-  build, use **Extensions: Install from VSIX…** and select
-  `outputs/editchain-history-multiplayer.vsix` (currently Linux x64).
+- Install the same multiplayer build on both devices. From this checkout, run
+  `./reinstall-vscode.sh` in the target VS Code window's integrated terminal,
+  then reload that window. This builds and bundles the history service and
+  multiplayer peer worker together.
+- To use the prebuilt test package on another device, choose **Extensions:
+  Install from VSIX…** and select `outputs/editchain-history-multiplayer.vsix`
+  (currently Linux x64).
 - Open and trust a separate workspace or repository checkout on each device.
 - The host signs in to GitHub when prompted. Joining uses the host's invitation.
 - For two copies on one machine, launch VS Code with separate `--user-data-dir`

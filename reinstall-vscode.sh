@@ -56,9 +56,9 @@ if ! "$editchain_code" "$@" --list-extensions >/dev/null; then
 fi
 
 cd "$editchain_root"
-cargo build --release --locked -p editchain-node --bin editchain-vscode-service
 cd extensions/vscode-editchain
 npm ci
+npm run build:native
 npm run build:renderer
 npm run compile
 editchain_version="$(node -p 'require("./package.json").version')"
