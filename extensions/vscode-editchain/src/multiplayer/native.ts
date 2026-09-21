@@ -4,6 +4,7 @@ import { FrameDecoder } from '../frameDecoder';
 
 export const CONTROL_LIMIT = 512 * 1024;
 export const INPUT_LIMIT = 64 * 1024;
+export const PEER_PROTOCOL = 2;
 export class NativePeerError extends Error {}
 export type PublicDevice = { certificate: string; fingerprint: string };
 export type PeerProgress = { accepted: boolean; synchronizing: boolean; rounds: number; records: number; blobs: number; unavailable: number;
@@ -36,9 +37,10 @@ export class NativeWorker {
           clearTimeout(pending.timer);
           if (value.ok) pending.resolve(value.result);
           else {
-            const codes = ['authentication_failed', 'storage_permission_denied', 'storage_busy', 'invalid_request_or_peer_data', 'connection_closed', 'storage_or_transport_failure'];
+            const codes = ['incompatible_peer_protocol', 'authentication_failed', 'storage_permission_denied', 'storage_busy', 'invalid_request_or_peer_data', 'connection_closed', 'storage_or_transport_failure'];
             const code = codes.includes(value.error) ? value.error : 'invalid_native_response';
-            pending.reject(new NativePeerError(`Native multiplayer: ${code}`));
+            pending.reject(new NativePeerError(code === 'incompatible_peer_protocol'
+              ? 'Multiplayer versions differ. Update EditChain on both devices and reconnect.' : `Native multiplayer: ${code}`));
           }
         }
       } catch { this.fail(new NativePeerError('Invalid native multiplayer framing or response.')); }

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { Duplex } from 'node:stream';
-import { NativeWorker, PeerBridge, PeerOptions, PeerProgress, PublicDevice } from './native';
+import { NativeWorker, PeerBridge, PeerOptions, PeerProgress, PublicDevice, PEER_PROTOCOL } from './native';
 import { encodeInvitation, Invitation, JoinRequest, parseInvitation, parseRequest, savedInvitation } from './invitation';
 import { ClientTransport, HostLease, HostTransport, managementClient, RelayClient, RelayHost, RelayJournal, removeSavedRelay, validateLease } from './relay';
 import { ProbeError } from '../devTunnels/probe';
@@ -158,7 +158,7 @@ export class MultiplayerManager {
     if (!this.enabled || !host || !this.lease) return undefined;
     const { endpoint } = await host.descriptor();
     if (generation !== this.generation || host !== this.host) return undefined;
-    return advertisement({ version: 1, protocol: 1, encoding: 1, space: this.requiredSpace(),
+    return advertisement({ version: 1, protocol: PEER_PROTOCOL, encoding: 1, space: this.requiredSpace(),
       device: await this.device(), instance: this.lease.marker, endpoint, expiresAt: Date.now() + 10 * 60_000 });
   }
 

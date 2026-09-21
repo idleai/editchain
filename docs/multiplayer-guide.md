@@ -101,6 +101,14 @@ synchronization passes, missing-content responses, and how
 long since a saved-data update was observed. Counts apply to the current
 connection and reset on reconnect. A's received counts describe B-to-A transfers;
 A's sent counts describe A-to-B transfers. A content object stores recorded revision data.
+Completed passes describe this device's incoming inventory checks; they do not
+mean the other device has finished receiving your history.
+
+During catch-up, older builds could display detached **EditChain ops** command
+results before their session records arrived. They reconnect automatically when
+the missing records arrive. Current builds send shared parents before children
+to avoid this transfer-order gap. Parents outside the approved sharing scope are
+not fetched; new-history-only sharing can therefore start at a real history boundary.
 
 `Checking shared history (first pass)` means the first inventory check has not
 finished. This also happens with new-history-only sharing; it does not indicate
@@ -143,6 +151,11 @@ Cancelling a configuration change keeps the previous discovery setup.
 Install the same EditChain build on every device: the extension, the Rust
 service and the native peer worker ship together and are not meant to be mixed.
 Update all devices together.
+
+Parent-first transfer uses peer protocol 2. Update and reload both devices, then
+run **EditChain: Resume / Reconnect Shared History** on both. Existing device
+approvals, received records, and sharing choices persist. A protocol-1 peer
+cannot synchronize with a protocol-2 peer.
 
 - A workspace whose sharing ledger was written by the updated build is rejected
   by an older peer worker, which fails closed instead of continuing.

@@ -22,6 +22,7 @@ macro_rules! check_eq {
     };
 }
 
+mod inventory_tests;
 mod provenance_tests;
 mod secure_tests;
 mod session_tests;

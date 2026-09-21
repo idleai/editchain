@@ -6,7 +6,9 @@ use std::io;
 use serde::Serialize;
 
 use crate::transfer::{Download, Object, Source};
-use crate::{invalid, Message, RecordKey, Replica, Snapshot, INVENTORY_PAGE, MAX_OBJECT_BYTES};
+use crate::{
+    invalid, Message, RecordKey, Replica, Snapshot, INVENTORY_PAGE, MAX_OBJECT_BYTES, PEER_VERSION,
+};
 
 const BATCH_BYTES: usize = 4 * 1024 * 1024;
 
@@ -45,6 +47,7 @@ pub struct Session {
 #[derive(Debug, Default)]
 struct Pull {
     waiting_page: bool,
+    position: u64,
     after: Option<RecordKey>,
     more: bool,
     keys: Vec<RecordKey>,
@@ -73,7 +76,7 @@ impl Session {
     #[must_use]
     pub fn hello(&self) -> Message {
         Message::Hello {
-            version: 1,
+            version: PEER_VERSION,
             encoding: 1,
             space: self.replica.space().to_owned(),
         }
@@ -111,6 +114,13 @@ impl Session {
     /// object bytes, and any failed durable write. No failed write is acknowledged.
     pub fn receive(&mut self, message: Message) -> io::Result<Vec<Message>> {
         if !self.progress.accepted {
+            if matches!(&message, Message::Hello { version, encoding, .. } if *version != PEER_VERSION || *encoding != 1)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "incompatible peer protocol",
+                ));
+            }
             if message != self.hello() {
                 return Err(invalid("peer version, encoding or space mismatch"));
             }
@@ -132,8 +142,12 @@ impl Session {
                     .need(&self.replica, Object { record, blob }, offset)?,
             ),
             Message::Ack { record, blob } => self.acknowledge(Object { record, blob })?,
-            Message::Page { records, more } => {
-                self.page(records, more)?;
+            Message::Page {
+                offset,
+                records,
+                more,
+            } => {
+                self.page(offset, records, more)?;
                 self.advance(&mut replies)?;
             }
             Message::Chunk {
@@ -176,19 +190,20 @@ impl Session {
         Ok(replies)
     }
 
-    fn page(&mut self, records: Vec<RecordKey>, more: bool) -> io::Result<()> {
+    fn page(&mut self, offset: u64, records: Vec<RecordKey>, more: bool) -> io::Result<()> {
         if !self.pull.waiting_page || records.len() > INVENTORY_PAGE || (more && records.is_empty())
         {
             return Err(invalid("unsolicited or oversized inventory page"));
         }
-        let mut previous = self.pull.after;
-        for key in &records {
-            if previous.is_some_and(|last| last >= *key) {
-                return Err(invalid("inventory keys must strictly increase"));
-            }
-            previous = Some(*key);
+        if offset != self.pull.position
+            || records.iter().collect::<BTreeSet<_>>().len() != records.len()
+        {
+            return Err(invalid("invalid inventory position or duplicate keys"));
         }
-        self.pull.after = previous;
+        self.pull.position = offset
+            .checked_add(u64::try_from(records.len()).map_err(io::Error::other)?)
+            .ok_or_else(|| invalid("inventory position overflow"))?;
+        self.pull.after = records.last().copied();
         self.pull.waiting_page = false;
         self.pull.more = more;
         self.pull.records = records

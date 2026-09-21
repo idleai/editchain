@@ -77,6 +77,8 @@ impl Download {
 #[derive(Debug, Default)]
 pub(crate) struct Source {
     snapshot: Option<Snapshot>,
+    order: Vec<RecordKey>,
+    next: usize,
     cursor: Option<RecordKey>,
     more: bool,
     active: Option<(Object, Vec<u8>, usize)>,
@@ -95,18 +97,30 @@ impl Source {
             ));
         }
         if after.is_none() {
-            self.snapshot = Some(replica.snapshot()?);
+            let snapshot = replica.snapshot()?;
+            self.order = snapshot.ordered_keys()?;
+            self.snapshot = Some(snapshot);
+            self.next = 0;
         } else if after != self.cursor || !self.more {
             return Err(invalid("invalid inventory continuation"));
         }
-        let snapshot = self
-            .snapshot
-            .as_ref()
-            .ok_or_else(|| invalid("missing source snapshot"))?;
-        let (records, more) = snapshot.page(after);
+        let offset = u64::try_from(self.next).map_err(io::Error::other)?;
+        let records: Vec<_> = self
+            .order
+            .iter()
+            .skip(self.next)
+            .take(INVENTORY_PAGE)
+            .copied()
+            .collect();
+        self.next = self.next.saturating_add(records.len());
+        let more = self.next < self.order.len();
         self.cursor = records.last().copied();
         self.more = more;
-        Ok(Message::Page { records, more })
+        Ok(Message::Page {
+            offset,
+            records,
+            more,
+        })
     }
 
     pub(crate) fn need(

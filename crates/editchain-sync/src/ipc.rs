@@ -186,6 +186,8 @@ fn error_code(error: &io::Error) -> &'static str {
         .is_some_and(<dyn std::error::Error + Send + Sync>::is::<crate::AuthenticationFailure>)
     {
         "authentication_failed"
+    } else if kind == io::ErrorKind::Unsupported {
+        "incompatible_peer_protocol"
     } else if kind == io::ErrorKind::PermissionDenied {
         "storage_permission_denied"
     } else if kind == io::ErrorKind::WouldBlock {

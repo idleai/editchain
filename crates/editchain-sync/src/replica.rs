@@ -102,6 +102,10 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    pub(crate) fn ordered_keys(&self) -> io::Result<Vec<RecordKey>> {
+        crate::inventory::parent_first(&self.records)
+    }
+
     pub(crate) fn received_blob(&mut self, hash: [u8; 32]) {
         let _: bool = self.received_blobs.insert(hash);
     }

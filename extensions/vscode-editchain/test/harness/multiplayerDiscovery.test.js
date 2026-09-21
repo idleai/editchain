@@ -9,7 +9,7 @@ async function candidate(files) {
   const worker = new NativeWorker(binaries.peer);
   try {
     const device = await worker.request({ type: 'identity', device_dir: files.directory + '/device' });
-    return { version: 1, protocol: 1, encoding: 1, space: 'known-space', device, instance: 'editchain-multiplayer-' + 'a'.repeat(24),
+    return { version: 1, protocol: 2, encoding: 1, space: 'known-space', device, instance: 'editchain-multiplayer-' + 'a'.repeat(24),
       endpoint: { tunnelId: 'known-tunnel', clusterId: 'use', hostId: 'host', hostPublicKeys: ['YWJj'], clientRelayUri: 'wss://use.rel.tunnels.api.visualstudio.com/tunnel' }, expiresAt: Date.now() + 600_000 };
   } finally { worker.stop(); }
 }
@@ -56,6 +56,7 @@ test('directory ignores stale, incompatible, misnamed and other-space advertisem
     assert.deepEqual(await api.read('known-space'), [ad]);
     assert.equal(pages, 2);
     assert.throws(() => repositoryName('owner/repo/../../secret'), /owner\/repository/);
+    assert.throws(() => advertisement({ ...ad, protocol: 1 }), /Invalid or stale/);
     assert.throws(() => advertisement({ ...ad, endpoint: { ...ad.endpoint, clientRelayUri: 'https://evil.example/' } }), /Microsoft/);
     const oversized = new GitHubDirectory('owner/repo', async () => '', async () => new Response('x'.repeat(2 * 1024 * 1024 + 1)));
     await assert.rejects(oversized.read(ad.space), /limit/);

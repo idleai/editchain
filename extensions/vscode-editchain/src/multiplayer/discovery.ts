@@ -2,8 +2,9 @@ import { createHash } from 'node:crypto';
 import { ProbeError } from '../devTunnels/probe';
 import { publicDevice, RelayEndpoint, validateEndpoint } from './invitation';
 import type { PublicDevice } from './native';
+import { PEER_PROTOCOL } from './native';
 
-export type Advertisement = { version: 1; protocol: 1; encoding: 1; space: string; device: PublicDevice;
+export type Advertisement = { version: 1; protocol: typeof PEER_PROTOCOL; encoding: 1; space: string; device: PublicDevice;
   instance: string; endpoint: RelayEndpoint; expiresAt: number };
 export type DiscoveryStatus = { repository: string; state: string; candidates: number };
 const LIMIT = 32 * 1024;
@@ -20,13 +21,13 @@ export function repositoryName(value: string): string {
 /** Reconstruct only the public schema; never forward arbitrary fields. */
 export function advertisement(input: unknown, now = Date.now()): Advertisement {
   const value = input as Partial<Advertisement> | null;
-  if (value?.version !== 1 || value.protocol !== 1 || value.encoding !== 1 ||
+  if (value?.version !== 1 || value.protocol !== PEER_PROTOCOL || value.encoding !== 1 ||
     typeof value.space !== 'string' || !/^[A-Za-z0-9-]{1,128}$/.test(value.space) ||
     typeof value.instance !== 'string' || !/^editchain-multiplayer-[a-f0-9]{24}$/.test(value.instance) ||
     !Number.isSafeInteger(value.expiresAt) || value.expiresAt! <= now || value.expiresAt! > now + 15 * 60_000) {
     throw new ProbeError('Invalid or stale multiplayer advertisement.');
   }
-  return { version: 1, protocol: 1, encoding: 1, space: value.space, instance: value.instance,
+  return { version: 1, protocol: PEER_PROTOCOL, encoding: 1, space: value.space, instance: value.instance,
     device: publicDevice(value.device), endpoint: validateEndpoint(value.endpoint), expiresAt: value.expiresAt! };
 }
 

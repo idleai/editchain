@@ -10,7 +10,7 @@ use crate::{invalid, RecordKey, MAX_FRAME_BYTES};
 pub enum Message {
     /// Negotiate the space, peer protocol and operation encoding.
     Hello {
-        /// Peer protocol version, currently one.
+        /// Peer protocol version; see [`crate::PEER_VERSION`].
         version: u16,
         /// Exact operation-encoding version, currently one.
         encoding: u16,
@@ -24,7 +24,9 @@ pub enum Message {
     },
     /// One bounded page of exact record identities.
     Page {
-        /// Sorted identities, including quarantined variants.
+        /// Position of the first identity in the stable parent-ordered snapshot.
+        offset: u64,
+        /// Parent-first identities, including quarantined variants.
         records: Vec<RecordKey>,
         /// Whether the stable snapshot has another page.
         more: bool,

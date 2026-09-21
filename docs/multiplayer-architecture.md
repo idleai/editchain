@@ -140,6 +140,15 @@ The implemented messages are defined in [wire.rs](../crates/editchain-sync/src/w
 Idle sessions start another reconciliation round. The native bridge detects
 unresponsive peers and resets their connection; TLS owns authenticated shutdown.
 
+Peer protocol 2 walks the consent-filtered snapshot in deterministic parent-first
+order. Each `Page` includes its checked absolute position; `Inventory.after` is
+the last exact key of the preceding page, rather than a numeric lower bound.
+Available parent variants precede their descendants across page boundaries.
+Missing/excluded parents are not imported into scope, and cycles retain their
+exact evidence with a deterministic traversal break. This prevents normalized
+command results with small hashed IDs from reaching the live graph long before
+their session backbone. Protocol-1 peers fail negotiation before inventory.
+
 **Inventory must include evidence, not just accepted IDs.** The current
 [OpSet](../crates/editchain-core/src/admission.rs) retains every distinct encoded
 variant and quarantines all variants of a conflicted ID. Use a record key such

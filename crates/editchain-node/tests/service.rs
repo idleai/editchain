@@ -3524,3 +3524,6 @@ fn prepared_snapshot_serves_flattened_activity_view_and_records_current_revision
 
 #[path = "service/editor_work.rs"]
 mod editor_work;
+
+#[path = "service/peer_context.rs"]
+mod peer_context;
