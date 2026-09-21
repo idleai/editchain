@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { Duplex } = require('node:stream');
 const { NativeWorker, PeerBridge } = require('../../out/multiplayer/native');
+const { LiveSync } = require('../../out/liveSync');
 const { fixture, binaries, until } = require('./multiplayerFixture');
 
 async function control(body) {
@@ -84,4 +85,37 @@ test('an already open live view resolves content received after records without 
     assert.equal(after.partial, false);
     assert.equal(fs.readFileSync(path.join(b.root, 'shared.ts'), 'utf8'), 'Working tree stays local.\n');
   } finally { files.stop(); }
+});
+
+test('a missing Codex helper names the executable and leaves received rows live', { timeout: 15_000 }, async () => {
+  const files = fixture(), statuses = [];
+  let loop;
+  try {
+    const a = files.workspace('sender'), b = files.workspace('receiver');
+    await a.start(); await a.edit('before\n', 'received while Codex is unavailable\n');
+    const opened = await b.call({ OpenLivePaged: { workspace_path: b.root, chain_dir: '.editchain' } });
+    for (const name of fs.readdirSync(a.chain).filter(name => name.endsWith('.eclog'))) {
+      fs.copyFileSync(path.join(a.chain, name), path.join(b.chain, name));
+    }
+    let revision = opened.live.revision, snapshot = opened.snapshot_id, providerError;
+    const missingHelper = path.join(files.directory, 'missing-codex-session-exporter');
+    const sync = async codex => {
+      const response = await b.client.request({ SyncLive: { epoch: opened.live.epoch, after_revision: revision, codex } });
+      if (response.Error) { providerError = response.Error.message; throw new Error(providerError); }
+      revision = response.Ok.revision;
+      if (response.Ok.deltas.length) snapshot = response.Ok.deltas.at(-1).snapshot_id;
+    };
+    loop = new LiveSync({
+      capture: async () => ({ sessions: new Map([['rollout.jsonl', '1']]), titles: '', history: '' }),
+      importFiles: paths => sync({ sessions_root: files.directory, helper: missingHelper, paths }),
+      publish: () => sync(null), pollNative: true, status: value => statuses.push(value),
+    }, 60_000);
+    loop.wake();
+    await until(() => statuses.at(-1)?.startsWith('Live · Codex import retry:'), 'provider failure did not preserve live history');
+    assert.match(providerError, /codex helper .* could not be spawned/);
+    assert.ok(providerError.includes(missingHelper), 'diagnostic identifies the unavailable executable');
+    assert.ok(revision > opened.live.revision, 'queued external records publish after the failed provider call');
+    const window = await b.call({ GetWindow: { snapshot_id: snapshot, offset: 0, limit: 200, include_layout: false } });
+    assert.ok(window.rows.some(row => row.file_change?.path === 'shared.ts'));
+  } finally { loop?.dispose(); files.stop(); }
 });

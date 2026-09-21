@@ -21,10 +21,42 @@ test('acknowledged human work publishes before a failing provider backlog retrie
     publish: async () => { order.push('human'); }, status() {}, pollNative: true,
   }, 60000);
   t.after(() => loop.dispose());
-  loop.wake(); await until(() => order.length === 1);
+  loop.wake(); await until(() => order.length === 2);
   loop.humanChanged();
-  await until(() => order.length === 3);
-  assert.deepEqual(order, ['import', 'human', 'import']);
+  await until(() => order.length === 5);
+  assert.deepEqual(order, ['import', 'human', 'human', 'import', 'human']);
+});
+
+test('provider failures publish native history, retain pending imports, and recover without reopening', async t => {
+  const imports = [], statuses = [];
+  let failing = true, publishes = 0;
+  const loop = new LiveSync({
+    capture: async () => ({ sessions: new Map([['rollout', '1']]), titles: '', history: '' }),
+    importFiles: async files => { imports.push(files); if (failing) throw new Error('missing exporter'); },
+    publish: async () => { publishes++; }, status: value => statuses.push(value), pollNative: true,
+  }, 60_000);
+  t.after(() => loop.dispose());
+  loop.wake(); await until(() => statuses.at(-1)?.startsWith('Live · Codex import retry:'));
+  assert.equal(publishes, 1, 'queued external history is published even without a receipt notification');
+  loop.wake(); await until(() => publishes === 2);
+  assert.deepEqual(imports, [['rollout'], ['rollout']], 'failed sources stay pending');
+  failing = false; loop.wake(); await until(() => statuses.at(-1) === 'Live · Codex + Git');
+  loop.wake(); await until(() => publishes === 3);
+  assert.equal(imports.length, 3, 'successful import advances the source stamp');
+});
+
+test('a failed fallback publication still reports a history retry', async t => {
+  const statuses = [];
+  const loop = new LiveSync({
+    capture: async () => ({ sessions: new Map([['rollout', '1']]), titles: '', history: '' }),
+    importFiles: async () => { throw new Error('missing exporter'); },
+    publish: async () => { throw new Error('history unavailable'); },
+    status: value => statuses.push(value), pollNative: true,
+  }, 60_000);
+  t.after(() => loop.dispose());
+  loop.wake(); await until(() => statuses.at(-1)?.startsWith('Live retry:'));
+  assert.match(statuses.at(-1), /history unavailable/);
+  assert.ok(!statuses.some(value => value.startsWith('Live ·')));
 });
 
 test('growth during import and publication coalesces without overlapping work or losing the next edit', async t => {

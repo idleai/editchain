@@ -71,7 +71,7 @@ export class LiveSync {
       const files = pending.slice(0, 32);
       if (files.length) {
         this.actions.status(`Importing Codex changes (${files.length}/${pending.length} queued)…`);
-        await this.actions.importFiles(files, this.abort.signal);
+        if (!await this.importBatch(files)) return;
       }
       if (this.abort.signal.aborted) return;
       // Keep the stamps captured BEFORE import. Growth during capture/import
@@ -95,8 +95,7 @@ export class LiveSync {
         : captured.sessions.size ? 'Live · Codex + Git' : 'Live · waiting for Codex sessions');
     } catch (error) {
       if (!this.abort.signal.aborted) {
-        this.failures = String(error).includes('operation would block') ? 0 : this.failures + 1;
-        this.actions.status(`Live retry: ${String(error)}`);
+        this.retry(error, 'Live retry');
       }
     } finally {
       this.running = false;
@@ -106,5 +105,25 @@ export class LiveSync {
         this.timer = setTimeout(() => this.wake(), delay);
       }
     }
+  }
+
+  private async importBatch(files: string[]): Promise<boolean> {
+    try {
+      await this.actions.importFiles(files, this.abort.signal);
+      return true;
+    } catch (error) {
+      if (this.abort.signal.aborted) return false;
+      if (!this.actions.pollNative) throw error;
+      // The retained service may have queued external records before the
+      // provider failed. Publish those without advancing any source stamps.
+      await this.actions.publish();
+      if (!this.abort.signal.aborted) this.retry(error, 'Live · Codex import retry');
+      return false;
+    }
+  }
+
+  private retry(error: unknown, label: string): void {
+    this.failures = String(error).includes('operation would block') ? 0 : this.failures + 1;
+    this.actions.status(`${label}: ${String(error)}`);
   }
 }

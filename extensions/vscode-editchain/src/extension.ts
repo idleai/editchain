@@ -201,6 +201,7 @@ function updateStatusBar(loaded: number, total: number): void {
 function renderStatusBar(): void {
   if (!statusItem) return;
   const label = liveStatus?.startsWith('Live retry:') ? 'Live retry' :
+    liveStatus?.startsWith('Live · Codex import retry:') ? 'Live · Codex retry' :
     liveStatus?.startsWith('Live ·') ? 'Live' : liveStatus;
   statusItem.text = [statusCounts, label].filter(Boolean).join(' · ');
   statusItem.tooltip = liveStatus || 'EditChain History — loaded / total nodes';

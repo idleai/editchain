@@ -79,8 +79,8 @@ Each peer line reports records and content objects **received and saved on this
 device**, records and content **sent and confirmed saved by the peer**, completed
 synchronization passes, missing-content responses, and how
 long since a saved-data update was observed. Counts apply to the current
-connection and reset on reconnect. A's counters describe B-to-A transfers; B's
-describe A-to-B transfers. A content object stores recorded revision data.
+connection and reset on reconnect. A's received counts describe B-to-A transfers;
+A's sent counts describe A-to-B transfers. A content object stores recorded revision data.
 
 `Checking shared history (first pass)` means the first inventory check has not
 finished. This also happens with new-history-only sharing; it does not indicate
@@ -88,6 +88,27 @@ which history was approved for sharing. Total remaining work, percentage, scans,
 downloads are not available yet. A waiting update confirms that status reporting
 is running; unchanged saved counts alone cannot distinguish scanning, downloading,
 or a stalled transfer. Quiet, caught-up peers do not produce repeated lines.
+
+## History says Codex retry
+
+**Live · Codex retry** means local Codex-session import failed while the History
+view can still update from saved records. Hover over the status or open the
+**EditChain History** Output channel for the specific error. Received multiplayer
+history does not require a local Codex exporter.
+
+If the error says `codex helper ... could not be spawned`, build the separate
+exporter from the EditChain checkout:
+
+```sh
+cargo build --release --locked --manifest-path tools/codex-session-exporter/Cargo.toml
+```
+
+This requires the sibling Codex checkout described in the
+[exporter build instructions](../tools/codex-session-exporter/README.md#build-and-run-contract-local-only).
+Reload the VS Code window after building, or set
+`editchain-history.live.codexHelperPath` to an existing exporter executable's
+absolute path. `./reinstall-vscode.sh` does not build this optional helper.
+Failed imports stay queued and retry; their source checkpoints do not advance.
 
 ## Optional repository discovery
 

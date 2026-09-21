@@ -78,7 +78,10 @@ impl LiveHelper {
             let _: &mut CommandWrap = wrap.wrap(process_wrap::tokio::ProcessGroup::leader());
             #[cfg(windows)]
             let _: &mut CommandWrap = wrap.wrap(process_wrap::tokio::JobObject);
-            wrap.spawn()?
+            wrap.spawn().map_err(|source| ImportError::HelperSpawn {
+                program: command.program.clone(),
+                source,
+            })?
         };
         let input = child
             .stdin()
