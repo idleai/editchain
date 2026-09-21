@@ -114,6 +114,21 @@ fn complete_peers_converge_pages_conflicts_large_records_and_nested_content() ->
         "structured metadata and nested revision hydrated"
     );
     check_eq!(b.progress().unavailable, 0, "complete content available");
+    check_eq!(
+        a.progress().sent_records,
+        b.progress().records,
+        "alice's sends match bob's durable receipts"
+    );
+    check_eq!(
+        b.progress().sent_records,
+        a.progress().records,
+        "bob's sends match alice's durable receipts"
+    );
+    check_eq!(
+        a.progress().sent_blobs,
+        b.progress().blobs,
+        "content is counted after remote acknowledgment"
+    );
     let ac = CanonicalChain::read(&ar)?;
     let bc = CanonicalChain::read(&br)?;
     check_eq!(
@@ -170,6 +185,11 @@ fn disconnect_mid_blob_repairs_from_disk_and_later_ticks_follow_offline_work() -
     }
     check_eq!(b.progress().records, 1, "record durable before content");
     check_eq!(b.progress().blobs, 0, "partial content unacknowledged");
+    check_eq!(
+        a.progress().sent_blobs,
+        0,
+        "partial content is not a completed send"
+    );
     drop((a, b, queue));
     let mut a = session(&ar)?;
     let mut b = session(&br)?;
@@ -220,6 +240,11 @@ fn lost_ack_is_repaired_without_a_duplicate_physical_record() -> io::Result<()> 
             .iter()
             .any(|(_, message)| matches!(message, Message::Ack { .. })),
         "connection interrupted before ack delivery"
+    );
+    check_eq!(
+        a.progress().sent_records,
+        0,
+        "unacknowledged sends are not reported as saved remotely"
     );
     check_eq!(
         CanonicalChain::read(&br)?.stats().accepted,

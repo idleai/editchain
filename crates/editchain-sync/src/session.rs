@@ -10,7 +10,7 @@ use crate::{invalid, Message, RecordKey, Replica, Snapshot, INVENTORY_PAGE, MAX_
 
 const BATCH_BYTES: usize = 4 * 1024 * 1024;
 
-/// Credential-free progress of this connection's receiving side.
+/// Credential-free durable progress in both directions of this connection.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Progress {
     /// Space/version negotiation has succeeded over an authenticated channel.
@@ -23,6 +23,10 @@ pub struct Progress {
     pub records: u64,
     /// Content blobs durably received on this connection.
     pub blobs: u64,
+    /// Sent records acknowledged as durable by the authenticated remote peer.
+    pub sent_records: u64,
+    /// Sent blobs acknowledged as durable by the authenticated remote peer.
+    pub sent_blobs: u64,
     /// Missing content responses in the current or most recently completed round.
     pub unavailable: u64,
 }
@@ -127,7 +131,7 @@ impl Session {
                 self.source
                     .need(&self.replica, Object { record, blob }, offset)?,
             ),
-            Message::Ack { record, blob } => self.source.ack(Object { record, blob })?,
+            Message::Ack { record, blob } => self.acknowledge(Object { record, blob })?,
             Message::Page { records, more } => {
                 self.page(records, more)?;
                 self.advance(&mut replies)?;
@@ -194,6 +198,16 @@ impl Session {
             .collect();
         self.pull.keys = records;
         self.pull.tried.clear();
+        Ok(())
+    }
+
+    fn acknowledge(&mut self, object: Object) -> io::Result<()> {
+        self.source.ack(object)?;
+        if object.blob.is_some() {
+            self.progress.sent_blobs = self.progress.sent_blobs.saturating_add(1);
+        } else {
+            self.progress.sent_records = self.progress.sent_records.saturating_add(1);
+        }
         Ok(())
     }
 

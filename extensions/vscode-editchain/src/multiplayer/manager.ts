@@ -6,7 +6,7 @@ import { ClientTransport, HostLease, HostTransport, managementClient, RelayClien
 import { ProbeError } from '../devTunnels/probe';
 import { advertisement, Advertisement } from './discovery';
 
-export type SharingStatus = { space?: string; enabled?: boolean; hosting: boolean; peers: { fingerprint?: string; state: string; progress?: PeerProgress }[]; message?: string };
+export type SharingStatus = { space?: string; enabled?: boolean; hosting: boolean; peers: { connection?: string; fingerprint?: string; state: string; progress?: PeerProgress }[]; message?: string };
 /** Contains bearer grants: store only in private application secret storage. */
 export type SavedSharing = { version: 1; space: string; host?: HostLease; peers: Invitation[] };
 export type RelayProvider = {
@@ -204,12 +204,12 @@ export class MultiplayerManager {
   async suspend(): Promise<void> { await this.close(false); }
 
   status(): SharingStatus {
-    const edges = [...this.edges.values()];
+    const edges = [...this.edges.entries()];
     return { space: this.space, enabled: this.enabled, hosting: !!this.host, message: this.message,
-      peers: [ ...edges.map(edge => ({ fingerprint: edge.device?.fingerprint ?? edge.clientKey,
+      peers: [ ...edges.map(([connection, edge]) => ({ connection, fingerprint: edge.device?.fingerprint ?? edge.clientKey,
         state: !edge.progress?.accepted ? 'Authenticating' : edge.progress.synchronizing ? 'Catching up'
           : edge.progress.unavailable ? 'Waiting for content' : 'Live', progress: edge.progress })),
-      ...[...this.peers.entries()].filter(([key]) => !edges.some(edge => edge.device?.fingerprint === key || edge.clientKey === key))
+      ...[...this.peers.entries()].filter(([key]) => !edges.some(([, edge]) => edge.device?.fingerprint === key || edge.clientKey === key))
         .map(([fingerprint, peer]) => ({ fingerprint, state: peer.state })) ] };
   }
 

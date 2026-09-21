@@ -53,6 +53,11 @@ test('opaque production bridges deliver captured history and historical content 
       assert.deepEqual(failures, [], 'bridge failed before content hydration');
       return progress.get(b.root)?.blobs >= 5 && blobs(a.chain).every(name => blobs(b.chain).includes(name));
     }, 'bridge did not hydrate captured content');
+    await until(() => progress.get(a.root)?.sent_records === progress.get(b.root)?.records &&
+      progress.get(b.root)?.sent_records === progress.get(a.root)?.records &&
+      progress.get(a.root)?.sent_blobs === progress.get(b.root)?.blobs &&
+      progress.get(b.root)?.sent_blobs === progress.get(a.root)?.blobs,
+    'outgoing confirmations did not match the remote durable counters');
     await until(() => statusLines.some(line => /Received here: [1-9]\d* records, [1-9]\d* content objects/.test(line)),
       'saved native history did not appear automatically in the live output');
     assert.deepEqual(failures, []);

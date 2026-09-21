@@ -72,13 +72,15 @@ line every 15 seconds while a peer is catching up or waiting. You do not need to
 run the command again; leave Output's automatic scrolling enabled to follow it.
 
 Each peer line reports records and content objects **received and saved on this
-device**, completed synchronization passes, missing-content responses, and how
+device**, records and content **sent and confirmed saved by the peer**, completed
+synchronization passes, missing-content responses, and how
 long since a saved-data update was observed. Counts apply to the current
 connection and reset on reconnect. A's counters describe B-to-A transfers; B's
 describe A-to-B transfers. A content object stores recorded revision data.
 
-`Initial history sync in progress` means the first pass has not finished, not
-that no history has arrived. Total remaining work, percentage, scans, and partial
+`Checking shared history (first pass)` means the first inventory check has not
+finished. This also happens with new-history-only sharing; it does not indicate
+which history was approved for sharing. Total remaining work, percentage, scans, and partial
 downloads are not available yet. A waiting update confirms that status reporting
 is running; unchanged saved counts alone cannot distinguish scanning, downloading,
 or a stalled transfer. Quiet, caught-up peers do not produce repeated lines.

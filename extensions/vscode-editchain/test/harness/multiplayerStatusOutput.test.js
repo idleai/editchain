@@ -6,7 +6,7 @@ const { MultiplayerStatusOutput } = require('../../out/multiplayer/statusOutput'
 
 const fingerprint = 'd0e9612942717b35e7fc4f566bbd2766132e50214bd50eba3ac0b58b1100a318';
 const peer = (changes = {}) => ({ fingerprint, state: 'Catching up', progress: {
-  accepted: true, records: 128, blobs: 5, rounds: 0, synchronizing: true, unavailable: 0, ...changes,
+  accepted: true, records: 128, blobs: 5, rounds: 0, synchronizing: true, unavailable: 0, sent_records: 0, sent_blobs: 0, ...changes,
 } });
 const status = (peers = [peer()]) => ({ space: 'test-space', enabled: true, hosting: false, peers });
 function observe(t, value = status()) {
@@ -20,7 +20,7 @@ function observe(t, value = status()) {
 test('live status follows incoming saved counts without reopening or inventing a total', t => {
   const { lines, output, tick } = observe(t, status([peer({ records: 0, blobs: 0 })]));
   assert.match(lines.join('\n'), /Total remaining and percentage are unknown/);
-  assert.match(lines.at(-1), /Connected; initial history sync in progress.*Received here: 0 records, 0 content objects/);
+  assert.match(lines.at(-1), /Connected; checking shared history \(first pass\).*Received here: 0 records, 0 content objects/);
   lines.length = 0;
   // Coalesce a burst of worker responses into the latest saved totals.
   for (let blobs = 1; blobs <= 5; blobs++) output.update(status([peer({ blobs })]));
@@ -111,8 +111,31 @@ test('opening twice has one watcher; stop and disposal cancel it, and a later se
   assert.equal(lines.length, 0);
   output.update(status());
   tick(1000);
-  assert.ok(lines.some(line => line.includes('initial history sync in progress')));
+  assert.ok(lines.some(line => line.includes('checking shared history (first pass)')));
   output.dispose(); lines.length = 0;
   tick(60_000); output.update(status()); output.show(status());
   assert.equal(lines.length, 0);
+});
+
+test('outgoing confirmations update the log even when no incoming records change', t => {
+  const { lines, output, tick } = observe(t);
+  lines.length = 0;
+  output.update(status([peer({ sent_records: 26, sent_blobs: 7 })]));
+  tick(1000);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /Received here: 128 records, 5 content objects/);
+  assert.match(lines[0], /Sent \(confirmed saved by peer\): 26 records, 7 content objects/);
+  assert.match(lines[0], /Last send confirmation observed 1s ago/);
+  assert.match(lines[0], /No new saved-data update observed in 1s/);
+});
+
+test('authentication identifies an existing connection without reporting a disconnect', t => {
+  const { lines, output, tick } = observe(t, status([{ connection: 'edge-1', state: 'Authenticating', progress: peer({ accepted: false, records: 0, blobs: 0 }).progress }]));
+  tick(20_000); lines.length = 0;
+  output.update(status([{ ...peer({ records: 0, blobs: 0 }), connection: 'edge-1' }]));
+  tick(1000);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /Peer d0e961294271: Connected/);
+  assert.match(lines[0], /No new saved-data update observed in 1s/);
+  assert.ok(!lines.some(line => line.includes('connection no longer listed')));
 });

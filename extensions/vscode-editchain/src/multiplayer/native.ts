@@ -6,7 +6,8 @@ export const CONTROL_LIMIT = 512 * 1024;
 export const INPUT_LIMIT = 64 * 1024;
 export class NativePeerError extends Error {}
 export type PublicDevice = { certificate: string; fingerprint: string };
-export type PeerProgress = { accepted: boolean; synchronizing: boolean; rounds: number; records: number; blobs: number; unavailable: number };
+export type PeerProgress = { accepted: boolean; synchronizing: boolean; rounds: number; records: number; blobs: number; unavailable: number;
+  sent_records?: number; sent_blobs?: number };
 export type PeerTurn = { bytes: string; device: PublicDevice | null; progress: PeerProgress };
 export type PeerOptions = { chain_dir: string; device_dir: string; space: string; remote?: string };
 
@@ -145,7 +146,9 @@ export class PeerBridge {
   private async result(result: PeerTurn): Promise<void> {
     if (this.closed) return;
     if (!result || typeof result.bytes !== 'string' || result.bytes.length > 350_000 || !result.progress ||
-      !['rounds', 'records', 'blobs', 'unavailable'].every(key => Number.isSafeInteger(result.progress[key as keyof PeerProgress]))) {
+      !['rounds', 'records', 'blobs', 'unavailable'].every(key => Number.isSafeInteger(result.progress[key as keyof PeerProgress])) ||
+      !['sent_records', 'sent_blobs'].every(key => result.progress[key as keyof PeerProgress] === undefined ||
+        Number.isSafeInteger(result.progress[key as keyof PeerProgress]))) {
       throw new NativePeerError('Invalid native multiplayer progress.');
     }
     const bytes = Buffer.from(result.bytes, 'base64');
