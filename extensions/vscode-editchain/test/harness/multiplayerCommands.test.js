@@ -15,7 +15,7 @@ async function environment(options, body) {
   if (options.directory) workspace.set('editchain.multiplayer.directory.file:///fixture/workspace', options.directory);
   const uri = { fsPath: '/fixture/workspace', scheme: 'file', toString: () => 'file:///fixture/workspace' };
   const folder = { name: 'workspace', uri };
-  const session = { account: { id: 'account-id' }, accessToken: 'secret-user-token' };
+  const session = { account: { id: 'account-id', label: 'account-name' }, accessToken: 'secret-user-token' };
   let managerLoads = 0, clipboard, resolveAuth, configurationChanged, foldersChanged, resolveSuspend, resolveResume;
   const configuration = new Map();
   const state = values => ({ keys: () => [...values.keys()], get: key => values.get(key),
@@ -48,6 +48,8 @@ async function environment(options, body) {
     constructor(value) { this.options = value; this.enabled = !!options.sharing; }
     joinRequest() { return Promise.resolve('public-request'); }
     inspectRequest() { return Promise.resolve({ device: { fingerprint: 'a'.repeat(64) } }); }
+    inspectInvitation() { return Promise.resolve({ space: 'space', host: { fingerprint: 'b'.repeat(64) } }); }
+    async joinHistory(_invitation, backfill) { this.enabled = true; calls.push({ join: true, backfill }); }
     async hostHistory(_request, backfill) {
       this.enabled = true;
       calls.push({ host: true, backfill });
@@ -92,7 +94,7 @@ async function environment(options, body) {
     secrets: { get: async key => secrets.get(key), store: async (key, value) => { secrets.set(key, value); }, delete: async key => { secrets.delete(key); } },
     asAbsolutePath: path => '/fixture/extension/' + path, globalStorageUri: { fsPath: '/fixture/private-storage' } };
   try {
-    const commands = require(file).registerMultiplayerCommands(context, () => {});
+    const commands = require(file).registerMultiplayerCommands(context, () => {}, account => calls.push({ identified: account }));
     await body({ invoke: name => registered.get('editchain-history.' + name)(), stored, logs, calls,
       loads: () => managerLoads, clipboard: () => clipboard, resolveAuth: () => resolveAuth?.(session), authPending: () => !!resolveAuth, secrets, workspace, commands,
       configure: (values, affected = uri) => {
@@ -117,6 +119,7 @@ test('multiplayer activation is offline and explicit hosting defaults to new rec
     assert.deepEqual(env.calls, []);
     assert.equal((await env.invoke('multiplayerHost')).ok, true);
     assert.ok(env.calls.some(call => call.host && call.backfill === false));
+    assert.deepEqual(env.calls.find(call => call.identified), { identified: { id: 'account-id', label: 'account-name' } });
     assert.equal(env.clipboard(), 'private-invite-secret');
     assert.deepEqual(env.calls.filter(call => call.provider).map(call => call.scopes), [['read:user', 'read:org'], ['read:user', 'read:org']]);
     assert.equal(env.stored.size, 1);
@@ -360,5 +363,26 @@ test('confirmed discovery replacement switches directories and explicit disable 
     assert.equal((await env.invoke('multiplayerDiscovery')).ok, true);
     assert.ok(!env.workspace.has('editchain.multiplayer.directory.file:///fixture/workspace'));
     assert.equal(env.calls.filter(call => call.discoveryStop).length, 2);
+  });
+});
+
+test('joining labels local work with the joining account before connecting', async () => {
+  await environment({}, async env => {
+    assert.equal((await env.invoke('multiplayerJoin')).ok, true);
+    const identified = env.calls.findIndex(call => call.identified);
+    assert.ok(identified >= 0);
+    assert.deepEqual(env.calls[identified].identified, { id: 'account-id', label: 'account-name' });
+    assert.ok(identified < env.calls.findIndex(call => call.join));
+    assert.deepEqual(env.calls.filter(call => call.provider).map(call => call.request), [{ createIfNone: true }]);
+  });
+});
+
+test('Stop while a join sign-in is pending prevents late attribution and connection', async () => {
+  await environment({ delayAuth: true }, async env => {
+    const joining = env.invoke('multiplayerJoin');
+    await until(env.authPending, 'joining sign-in was not requested');
+    await env.invoke('multiplayerStop');
+    env.resolveAuth(); await joining;
+    assert.ok(!env.calls.some(call => call.identified || call.join));
   });
 });

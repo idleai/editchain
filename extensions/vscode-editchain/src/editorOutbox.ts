@@ -8,6 +8,7 @@ import { MAX_EDITOR_EVENT_BYTES, EDITOR_BATCH_BYTES, EDITOR_QUEUE_BYTES, EDITOR_
 export type EditorEvent = {
   schema: 1; session: string; sequence: number; time_ms: number;
   identity?: HumanIdentity;
+  user_name?: string;
   event: { type: string; [key: string]: unknown };
 };
 type Batch = { workspace_path: string; chain_dir: string; events: EditorEvent[] };

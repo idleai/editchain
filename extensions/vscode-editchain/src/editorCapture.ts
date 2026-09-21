@@ -34,7 +34,7 @@ export class EditorCapture {
 
   constructor(private readonly folder: vscode.WorkspaceFolder, private readonly dwell: number,
     private readonly maxFileBytes: number, private readonly emit: (event: EditorEvent) => boolean,
-    private readonly attribution?: HumanIdentity) {
+    private readonly attribution?: HumanIdentity, private userName?: string) {
     const version = vscode.extensions?.getExtension('ambientlight.editchain-history')?.packageJSON.version;
     const tabs = new EditorTabs(uri => this.relative(uri), tab => this.identity(tab), event => {
       this.edits.flush(); this.record(event);
@@ -229,7 +229,8 @@ export class EditorCapture {
     if (this.stopped) return undefined;
     this.time = Math.max(this.time, Date.now());
     const sequence = this.sequence + 1;
-    if (!this.emit({ schema: 1, session: this.session, ...(this.attribution ? { identity: this.attribution } : {}), sequence, time_ms: this.time, event })) {
+    if (!this.emit({ schema: 1, session: this.session, ...(this.attribution ? { identity: this.attribution } : {}),
+      ...(this.userName ? { user_name: this.userName } : {}), sequence, time_ms: this.time, event })) {
       this.stopped = true; return undefined;
     }
     this.sequence = sequence;
@@ -237,6 +238,16 @@ export class EditorCapture {
   }
 
   checkpoint(): void { this.edits.flush(); this.publishRead(); }
+
+  setUserName(name: string | undefined): void {
+    if (this.stopped || name === this.userName) return;
+    this.edits.flush();
+    this.endExposure();
+    const document = vscode.window.activeTextEditor?.document;
+    if (document) this.views.delete(document);
+    this.userName = name;
+    this.beginExposure();
+  }
 
   context(context: { observed_ms: number; workspace_path?: string; repositories: unknown[] }): void {
     this.edits.flush();

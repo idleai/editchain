@@ -126,6 +126,7 @@ impl Normalizer {
                 schema: 1,
                 session: event.session.clone(),
                 identity: event.identity.clone(),
+                user_name: event.user_name.clone(),
                 turn: session.turn,
                 edit_group: session.group(event, kind).map(|group| OpId {
                     seq: group,

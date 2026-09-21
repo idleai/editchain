@@ -8,6 +8,7 @@ import { NativePeerError } from './native';
 import { ProbeError } from '../devTunnels/probe';
 import type { DirectorySync, DiscoveryStatus } from './discovery';
 import { MultiplayerStatusOutput } from './statusOutput';
+import { HUMAN_ACCOUNT_SCOPES as SCOPES } from '../humanAccount';
 
 class CommandError extends Error {}
 
@@ -16,7 +17,6 @@ const SPACE = 'editchain.multiplayer.space.';
 const SESSION = 'editchain.multiplayer.session.';
 const ENABLED = 'editchain.multiplayer.enabled.';
 const DIRECTORY = 'editchain.multiplayer.directory.';
-const SCOPES = ['read:user', 'read:org'];
 type JournalRecord = { account: string; workspace?: string; owner: string; leaseUntil: number; process?: number };
 
 function liveLease(record: JournalRecord): boolean {
@@ -33,7 +33,8 @@ function liveLease(record: JournalRecord): boolean {
 export type MultiplayerCommands = { stop(): Promise<void>; suspend(): Promise<void> };
 
 /** Registration has no account, network, or native-process side effects. */
-export function registerMultiplayerCommands(context: vscode.ExtensionContext, received: () => void): MultiplayerCommands {
+export function registerMultiplayerCommands(context: vscode.ExtensionContext, received: () => void,
+  identified: (account: vscode.AuthenticationSessionAccountInformation) => void = () => {}): MultiplayerCommands {
   let manager: MultiplayerManager | undefined;
   let folder: vscode.WorkspaceFolder | undefined;
   let output: vscode.OutputChannel | undefined;
@@ -238,7 +239,10 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       account = await vscode.authentication.getSession('github', SCOPES, interactive ? { createIfNone: true } : { silent: true });
       if (!account || account.account.id !== envelope.account) throw new CommandError('Sign in with the original host GitHub account, then resume sharing.');
     }
+    const identity = envelope.session?.host ? account : interactive
+      ? await vscode.authentication.getSession('github', SCOPES, { createIfNone: true }) : undefined;
     if (version !== stopVersion) return;
+    if (identity) identified(identity.account);
     const wasEnabled = current.status().enabled;
     await current.resume(envelope.session);
     if (version !== stopVersion) return;
@@ -264,6 +268,7 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       if (approved !== 'Approve device') return;
       account = await vscode.authentication.getSession('github', SCOPES, { createIfNone: true });
       if (version !== stopVersion) return;
+      identified(account.account);
       const invitation = await current.hostHistory(text, include);
       await vscode.env.clipboard.writeText(invitation);
       void vscode.window.showInformationMessage('Private invitation copied. Give it to the approved device. It expires in at most one hour.');
@@ -278,7 +283,9 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       const include = await backfill(); if (include === undefined) return;
       const approved = await vscode.window.showWarningMessage(`Join space ${invitation.space} with host device ${invitation.host.fingerprint}?`, { modal: true }, 'Join space');
       if (approved !== 'Join space') return;
+      const identity = await vscode.authentication.getSession('github', SCOPES, { createIfNone: true });
       if (version !== stopVersion) return;
+      identified(identity.account);
       await current.joinHistory(text, include);
       if (version === stopVersion) await startDirectory(current);
     }),

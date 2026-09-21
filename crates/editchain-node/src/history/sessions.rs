@@ -88,13 +88,17 @@ pub(super) fn session_metadata_index(ops: &[Op]) -> HashMap<String, SessionMetaD
 /// records' source ordering.
 #[must_use]
 fn session_metadata_from_op(op: &Op) -> Option<(SessionMetaDto, u8)> {
-    if editchain_project::human::work_record(op).is_some() {
+    if let Some(work) = editchain_project::human::work_record(op) {
+        let name = work
+            .user_name
+            .as_deref()
+            .filter(|name| editchain_core::human::valid_user_name(name));
         return Some((
             SessionMetaDto {
-                session_title: Some("Human work · VS Code".into()),
+                session_title: Some(format!("Human work · {}", name.unwrap_or("VS Code"))),
                 ..SessionMetaDto::default()
             },
-            2,
+            if name.is_some() { 3 } else { 2 },
         ));
     }
     let OpKind::Import(import) = &op.kind else {

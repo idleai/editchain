@@ -115,7 +115,7 @@ export function activate(context: vscode.ExtensionContext): void {
   out.appendLine(`[extension] EditChain ${context.extension?.packageJSON.version ?? 'development'} (${context.extensionPath})`);
   client.setLog((line) => out.appendLine(line));
   humanWork = new HumanWorkHost(context, out, () => liveSync?.humanChanged());
-  multiplayer = registerMultiplayerCommands(context, () => liveSync?.humanChanged());
+  multiplayer = registerMultiplayerCommands(context, () => liveSync?.humanChanged(), account => humanWork?.useAccount(account));
 
   // Read-only JSON content provider: documents opened under the
   // `editchain-json:` scheme are read-only by default (content providers cannot

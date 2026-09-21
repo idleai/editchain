@@ -271,3 +271,91 @@ fn unsigned_source_only_recovery_and_missing_payload_repair_preserve_exact_work(
     assert_eq!(live_request(&mut Server::new(), request)["replayed"], 4);
     assert_eq!(encoded(root), original);
 }
+
+#[test]
+fn recorded_names_label_cold_and_live_human_sessions_and_survive_replay() {
+    let temporary = tempfile::tempdir().expect("workspace");
+    let root = temporary.path();
+    drop(git(root, &["init", "-q"]));
+    drop(git(root, &["commit", "--allow-empty", "-qm", "baseline"]));
+    let mut server = Server::new();
+    let mut requests = Vec::new();
+    for (session, name) in [
+        (FIRST, Some("alice")),
+        (SECOND, Some("Zoë <bob>")),
+        (GUID, None),
+    ] {
+        let mut events = vec![start(session), tab(session, 2, "editor_opened")];
+        for event in &mut events {
+            event["identity"] = identity(session, "a");
+            if let Some(name) = name {
+                event["user_name"] = json!(name);
+            }
+        }
+        let request = batch(root, events);
+        assert_eq!(live_request(&mut server, request.clone())["accepted"], 2);
+        requests.push(request);
+    }
+    let work = records(root);
+    assert_eq!(work.len(), 3);
+    for mode in ["Open", "OpenLive"] {
+        let mut history = Server::new();
+        let opened = live_request(
+            &mut history,
+            json!({mode:{"workspace_path":root,"chain_dir":".editchain"}}),
+        );
+        let rows = window(&mut history, &opened["snapshot_id"]);
+        for (session, name) in [
+            (FIRST, Some("alice")),
+            (SECOND, Some("Zoë <bob>")),
+            (GUID, None),
+        ] {
+            let (op, record) = work
+                .iter()
+                .find(|(_, record)| record.session == session)
+                .expect("human activity");
+            assert_eq!(record.user_name.as_deref(), name);
+            let row = rows
+                .iter()
+                .find(|row| row["node_key"] == op.id.to_string())
+                .expect("human row");
+            assert_eq!(
+                row["session_meta"]["session_title"],
+                format!("Human work · {}", name.unwrap_or("VS Code"))
+            );
+        }
+    }
+    let before = encoded(root);
+    for request in requests.into_iter().rev() {
+        assert_eq!(live_request(&mut Server::new(), request)["replayed"], 2);
+    }
+    assert_eq!(
+        encoded(root),
+        before,
+        "retry retains original names and operation IDs"
+    );
+}
+
+#[test]
+fn invalid_display_names_are_rejected_before_capture() {
+    let temporary = tempfile::tempdir().expect("workspace");
+    for name in [
+        String::new(),
+        " padded ".into(),
+        "line\nbreak".into(),
+        "a".repeat(81),
+    ] {
+        let mut first = start(FIRST);
+        first["user_name"] = json!(name);
+        let request = Request {
+            id: 1,
+            body: serde_json::from_value(batch(temporary.path(), vec![first])).expect("request"),
+        };
+        let response = Server::new().handle(&request).expect("validation response");
+        assert!(matches!(
+            response.body,
+            editchain_protocol::ResponseBody::Error(_)
+        ));
+        assert!(!temporary.path().join(".editchain").exists());
+    }
+}

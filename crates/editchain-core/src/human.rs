@@ -79,6 +79,9 @@ pub struct HumanWorkRecord {
     /// Persistent unsigned identity; absent in legacy recorder sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<HumanIdentity>,
+    /// Account display name captured with the activity; not a verified author claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
     /// First observation in this bounded work episode.
     pub turn: u64,
     /// Stable first raw change of a continuously published edit, when known.
@@ -100,6 +103,15 @@ pub struct HumanWorkRecord {
     pub context_observed_ms: Option<u64>,
     /// User-facing summary derived from the observation.
     pub summary: String,
+}
+
+/// Bounded, single-line display metadata. It never changes the persistent identity.
+#[must_use]
+pub fn valid_user_name(value: &str) -> bool {
+    !value.is_empty()
+        && value == value.trim()
+        && value.chars().count() <= 80
+        && !value.chars().any(char::is_control)
 }
 
 /// Explicit annotation identifying raw editor evidence as supporting activity.

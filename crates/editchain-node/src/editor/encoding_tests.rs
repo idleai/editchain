@@ -43,7 +43,11 @@ fn cached_sources_preserve_canonical_bytes_for_unicode_replacements_and_metadata
                     "origin":{"source":"cursor","kind":"type","detailed_source":"keyboard","name":"input","extension_id":"test"}}),
                 );
                 canonical(&mut encoding, &event);
+                event.user_name = Some("Zoë 🦀 <user>".into());
+                canonical(&mut encoding, &event);
                 event.identity = None;
+                canonical(&mut encoding, &event);
+                event.user_name = None;
                 canonical(&mut encoding, &event);
             }
         }

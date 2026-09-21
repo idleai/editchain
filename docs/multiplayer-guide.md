@@ -13,7 +13,8 @@ keeps their own working files and can open the other person's recorded diffs.
   Install from VSIX…** and select `outputs/editchain-history-multiplayer.vsix`
   (currently Linux x64).
 - Open and trust a separate workspace or repository checkout on each device.
-- The host signs in to GitHub when prompted. Joining uses the host's invitation.
+- Both participants sign in to their own GitHub account when prompted. Joining
+  uses the host's invitation; the joining account supplies the name for local work.
 - For two copies on one machine, launch VS Code with separate `--user-data-dir`
   directories so each copy has its own device identity.
 
@@ -31,7 +32,8 @@ Run the commands below from the Command Palette (`Ctrl+Shift+P` or `Cmd+Shift+P`
    within its expiry window (at most one hour); keep it out of public logs and
    issue trackers.
 4. **Joining person:** run **EditChain: Join Shared History**, paste the
-   invitation, choose which of your history to share, and approve the host.
+   invitation, choose which of your history to share, approve the host, and sign
+   in to your own GitHub account.
 5. **Both:** wait for **Sharing · 1/1 live** in the status bar, then run
    **EditChain: Open History Explorer**.
 
@@ -44,6 +46,20 @@ Keep History in live mode (**EditChain: Resume Live History** if it was paused).
 Saved multiplayer receipts wake the open live view; a slow outgoing reply does
 not delay that notification. Recorded diffs become available as their content
 arrives, including when the view was opened before its content store existed.
+
+### Human-session names
+
+New human activity uses session headers such as **Human work · ambientlight**,
+using the GitHub account name available when the activity was recorded. The
+recorded name travels with shared history, so received work keeps its original
+name. Session IDs and device identities stay unchanged.
+
+Activity without a recorded name uses **Human work · VS Code**.
+Names are display metadata, not verified GitHub authorship. Already received
+history is not retroactively attributed to the current account. After updating
+an existing sharing session, use **EditChain: Resume / Reconnect Shared History**
+on both devices and complete sign-in if prompted; subsequent activity uses the
+available account name.
 
 ## Reconnect or stop
 
