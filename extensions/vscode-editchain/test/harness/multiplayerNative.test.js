@@ -81,9 +81,9 @@ test('opaque production bridges deliver captured history and historical content 
       const value = await b.call({ GetFileDiff: { snapshot_id: snapshot, change: row.file_change } });
       if (value.before === 'before\n') {
         remoteDiff = value;
-        assert.equal(row.session_meta.session_title, 'Human work · alice', 'received work keeps the original user name');
+        assert.equal(row.session_meta.session_title, 'alice', 'received work keeps the original user name');
       }
-      if (value.before === 'before B\n') assert.equal(row.session_meta.session_title, 'Human work · bob');
+      if (value.before === 'before B\n') assert.equal(row.session_meta.session_title, 'bob');
     }
     assert.equal(remoteDiff?.after, 'A shared revision\n'.repeat(12_000), 'live diff hydrates exact remote content without an Open');
     assert.equal(fs.readFileSync(path.join(b.root, 'shared.ts'), 'utf8'), 'Working tree stays local.\n');

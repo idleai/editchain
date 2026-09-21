@@ -49,12 +49,12 @@ arrives, including when the view was opened before its content store existed.
 
 ### Human-session names
 
-New human activity uses session headers such as **Human work · ambientlight**,
+New human activity uses session headers such as **ambientlight**,
 using the GitHub account name available when the activity was recorded. The
 recorded name travels with shared history, so received work keeps its original
 name. Session IDs and device identities stay unchanged.
 
-Activity without a recorded name uses **Human work · VS Code**.
+Activity without a recorded name uses **VS Code**.
 Names are display metadata, not verified GitHub authorship. Already received
 history is not retroactively attributed to the current account. After updating
 an existing sharing session, use **EditChain: Resume / Reconnect Shared History**

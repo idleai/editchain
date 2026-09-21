@@ -2454,6 +2454,40 @@ fn placeholders_carry_identity_only() {
 }
 
 #[test]
+fn prepared_human_headers_omit_the_old_prefix_without_changing_provider_titles() {
+    for (author, kind, title, expected) in [
+        ("human", "read", "Human work · ambientlight", "ambientlight"),
+        ("human", "read", "Human work · VS Code", "VS Code"),
+        ("human", "read", "ambientlight", "ambientlight"),
+        (
+            "human",
+            "message",
+            "Human work · project notes",
+            "Human work · project notes",
+        ),
+        (
+            "agent",
+            "message",
+            "Human work · project notes",
+            "Human work · project notes",
+        ),
+    ] {
+        let row = with(
+            &base_row(),
+            &[
+                ("author", json!(author)),
+                ("kind", json!(kind)),
+                ("above", json!([])),
+                ("group", json!("session:123")),
+                ("session_meta", json!({"session_title":title})),
+            ],
+        );
+        let spec = RowSpec::from_value(&row, &context(0, true));
+        assert_eq!(spec.group_label.as_deref(), Some(expected));
+    }
+}
+
+#[test]
 fn file_rows_match_native_scm_content_and_open_diff_contract() {
     let row = file_row();
     let spec = RowSpec::from_value(&row, &context(4, false));

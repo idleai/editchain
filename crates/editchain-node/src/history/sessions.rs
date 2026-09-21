@@ -95,7 +95,7 @@ fn session_metadata_from_op(op: &Op) -> Option<(SessionMetaDto, u8)> {
             .filter(|name| editchain_core::human::valid_user_name(name));
         return Some((
             SessionMetaDto {
-                session_title: Some(format!("Human work · {}", name.unwrap_or("VS Code"))),
+                session_title: Some(name.unwrap_or("VS Code").to_owned()),
                 ..SessionMetaDto::default()
             },
             if name.is_some() { 3 } else { 2 },

@@ -321,7 +321,7 @@ fn recorded_names_label_cold_and_live_human_sessions_and_survive_replay() {
                 .expect("human row");
             assert_eq!(
                 row["session_meta"]["session_title"],
-                format!("Human work · {}", name.unwrap_or("VS Code"))
+                name.unwrap_or("VS Code")
             );
         }
     }
