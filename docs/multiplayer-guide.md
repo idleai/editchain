@@ -63,6 +63,26 @@ device's working file stays as it was. Repeat in the opposite direction.
   the chain on disk. If the saved invitation or device identity is also gone,
   exchange a fresh join request and invitation.
 
+## Watch synchronization progress
+
+Run **EditChain: Show Multiplayer Status** once. The **EditChain Multiplayer**
+Output channel prints a JSON snapshot, then follows progress automatically.
+Updates are timestamped and grouped to at most once per second, with a status
+line every 15 seconds while a peer is catching up or waiting. You do not need to
+run the command again; leave Output's automatic scrolling enabled to follow it.
+
+Each peer line reports records and content objects **received and saved on this
+device**, completed synchronization passes, missing-content responses, and how
+long since a saved-data update was observed. Counts apply to the current
+connection and reset on reconnect. A's counters describe B-to-A transfers; B's
+describe A-to-B transfers. A content object stores recorded revision data.
+
+`Initial history sync in progress` means the first pass has not finished, not
+that no history has arrived. Total remaining work, percentage, scans, and partial
+downloads are not available yet. A waiting update confirms that status reporting
+is running; unchanged saved counts alone cannot distinguish scanning, downloading,
+or a stalled transfer. Quiet, caught-up peers do not produce repeated lines.
+
 ## Optional repository discovery
 
 After connecting, **EditChain: Configure Multiplayer Repository Discovery** can

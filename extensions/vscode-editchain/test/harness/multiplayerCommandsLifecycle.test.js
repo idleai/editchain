@@ -151,6 +151,38 @@ async function commands(options, body) {
 const ENABLED = 'editchain.multiplayer.enabled.file:///fixture/workspace';
 const SESSION = 'editchain.multiplayer.session.file:///fixture/workspace';
 
+test('status command follows peer changes automatically and stops reporting when sharing stops', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setInterval'], now: Date.now() });
+  await commands({}, async env => {
+    const initial = await env.invoke('multiplayerStatus');
+    assert.equal(initial.ok, true);
+    assert.deepEqual(initial.value.peers, []);
+    assert.equal(env.loads(), 0, 'status alone must not load the manager or start native/account activity');
+    assert.deepEqual(env.calls, []);
+    await env.invoke('multiplayerHost');
+    const current = env.instances[0];
+    current.peers = [{ fingerprint: 'd'.repeat(64), state: 'Catching up', progress: {
+      accepted: true, synchronizing: true, rounds: 0, records: 128, blobs: 5, unavailable: 0,
+    } }];
+    current.options.changed(current.status(), true);
+    t.mock.timers.tick(1000);
+    assert.ok(env.logs.some(line => /Peer dddddddddddd.*Received here: 128 records, 5 content objects/.test(line)));
+    const snapshot = await env.invoke('multiplayerStatus');
+    assert.equal(snapshot.value.peers[0].progress.records, 128, 'retain the structured command result');
+    env.logs.length = 0;
+    t.mock.timers.tick(15_000);
+    assert.equal(env.logs.length, 1, 'reopening status must not register duplicate watchers');
+    assert.match(env.logs[0], /No new saved-data update observed in 16s/);
+    assert.ok(!JSON.stringify(env.logs).includes('secret-user-token'));
+    assert.ok(!JSON.stringify(env.logs).includes('private-invite-secret'));
+    await env.invoke('multiplayerStop');
+    assert.match(env.logs.at(-1), /Sharing stopped/);
+    env.logs.length = 0;
+    t.mock.timers.tick(60_000);
+    assert.equal(env.logs.length, 0, 'Stop must cancel the progress timer');
+  });
+});
+
 test('C1: Stop during an in-flight Remove must not resurrect the saved session', async () => {
   await commands({ delayRevoke: true }, async env => {
     await env.invoke('multiplayerHost');

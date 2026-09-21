@@ -7,6 +7,7 @@ const path = require('node:path');
 const { Duplex, PassThrough } = require('node:stream');
 const { NativeWorker, PeerBridge } = require('../../out/multiplayer/native');
 const { MultiplayerManager } = require('../../out/multiplayer/manager');
+const { MultiplayerStatusOutput } = require('../../out/multiplayer/statusOutput');
 const { encodeInvitation, parseRequest, parseInvitation, validateEndpoint } = require('../../out/multiplayer/invitation');
 const { FrameDecoder } = require('../../out/frameDecoder');
 const { fixture, binaries, until, blobs, rows, diffs } = require('./multiplayerFixture');
@@ -22,6 +23,8 @@ test('opaque production bridges deliver captured history and historical content 
   const bridges = [];
   const failures = [];
   const progress = new Map();
+  const statusLines = [], liveOutput = new MultiplayerStatusOutput(line => statusLines.push(line));
+  liveOutput.show({ enabled: true, hosting: false, space: 'bridge-space', peers: [] });
   try {
     await a.start(); await b.start();
     const ai = await control({ type: 'identity', device_dir: a.device });
@@ -36,7 +39,13 @@ test('opaque production bridges deliver captured history and historical content 
     const streams = [Duplex.from({ readable: left, writable: right }), Duplex.from({ readable: right, writable: left })];
     for (const [index, local, remote] of [[0, a, undefined], [1, b, ai.certificate]]) {
       const bridge = new PeerBridge(binaries.peer, streams[index], { chain_dir: local.chain, device_dir: local.device, space: 'bridge-space', remote },
-        value => progress.set(local.root, value), error => { if (error) failures.push(error.message); }, 100);
+        value => {
+          progress.set(local.root, value);
+          if (index === 1) liveOutput.update({ enabled: true, hosting: false, space: 'bridge-space', peers: [{
+            fingerprint: ai.fingerprint, state: !value.accepted ? 'Authenticating' : value.synchronizing ? 'Catching up'
+              : value.unavailable ? 'Waiting for content' : 'Live', progress: value,
+          }] });
+        }, error => { if (error) failures.push(error.message); }, 100);
       bridges.push(bridge);
     }
     await Promise.all(bridges.map(bridge => bridge.start()));
@@ -44,6 +53,8 @@ test('opaque production bridges deliver captured history and historical content 
       assert.deepEqual(failures, [], 'bridge failed before content hydration');
       return progress.get(b.root)?.blobs >= 5 && blobs(a.chain).every(name => blobs(b.chain).includes(name));
     }, 'bridge did not hydrate captured content');
+    await until(() => statusLines.some(line => /Received here: [1-9]\d* records, [1-9]\d* content objects/.test(line)),
+      'saved native history did not appear automatically in the live output');
     assert.deepEqual(failures, []);
     const visible = await rows(b);
     assert.ok(visible.some(row => row.file_change?.path === 'shared.ts'), 'remote history has its native file-change affordance');
@@ -56,7 +67,7 @@ test('opaque production bridges deliver captured history and historical content 
       return blobs(b.chain).every(name => blobs(a.chain).includes(name));
     }, 'bidirectional capture did not settle');
     assert.deepEqual(failures, []);
-  } finally { for (const bridge of bridges) bridge.stop(); files.stop(); }
+  } finally { liveOutput.dispose(); for (const bridge of bridges) bridge.stop(); files.stop(); }
 });
 
 test('invitation parsing refuses arbitrary endpoints, wrong devices and altered fingerprints', async () => {

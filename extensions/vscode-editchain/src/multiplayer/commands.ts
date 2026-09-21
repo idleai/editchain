@@ -7,6 +7,7 @@ import type { MultiplayerManager, SavedSharing, SharingStatus } from './manager'
 import { NativePeerError } from './native';
 import { ProbeError } from '../devTunnels/probe';
 import type { DirectorySync, DiscoveryStatus } from './discovery';
+import { MultiplayerStatusOutput } from './statusOutput';
 
 class CommandError extends Error {}
 
@@ -36,6 +37,7 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
   let manager: MultiplayerManager | undefined;
   let folder: vscode.WorkspaceFolder | undefined;
   let output: vscode.OutputChannel | undefined;
+  let liveOutput: MultiplayerStatusOutput | undefined;
   let status: vscode.StatusBarItem | undefined;
   let account: vscode.AuthenticationSession | undefined;
   let directory: DirectorySync | undefined;
@@ -57,6 +59,7 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
   };
 
   const update = (value: SharingStatus, durableChange: boolean) => {
+    liveOutput?.update({ ...value, discovery: directoryStatus });
     status ??= vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
     status.command = 'editchain-history.multiplayerStatus';
     const live = value.peers.filter(peer => peer.state === 'Live').length;
@@ -283,6 +286,8 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       const value = { ...(manager?.status() ?? { hosting: false, peers: [], message: 'Sharing is disabled.' }), discovery: directoryStatus };
       output!.show(true);
       output!.appendLine(JSON.stringify(value, null, 2));
+      liveOutput ??= new MultiplayerStatusOutput(line => output!.appendLine(line));
+      liveOutput.show(value);
       return value;
     }),
     command('multiplayerRemove', async () => {
@@ -342,7 +347,7 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
         void vscode.window.showInformationMessage('Inactive pending multiplayer tunnels cleaned up for this workspace.');
       } finally { await management.dispose(); }
     }),
-    { dispose: () => { void suspend().catch(() => {}); clearInterval(leaseTimer); status?.dispose(); output?.dispose(); } },
+    { dispose: () => { liveOutput?.dispose(); void suspend().catch(() => {}); clearInterval(leaseTimer); status?.dispose(); output?.dispose(); } },
   );
   const reset = (preserve: boolean) => {
     const previous = manager, selected = folder;
