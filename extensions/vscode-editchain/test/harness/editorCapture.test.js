@@ -55,7 +55,7 @@ function harness(dwell = 2000, identity, options = {}) {
   let capture;
   try {
     const { EditorCapture } = require(filename);
-    capture = new EditorCapture({ uri: { fsPath: '/workspace' }, index: 0 }, dwell, options.maxBytes ?? MAX_EDITOR_BUFFER_BYTES, event => { events.push(event); return true; }, identity, options.userName);
+    capture = new EditorCapture({ uri: { fsPath: '/workspace' }, index: 0 }, dwell, options.maxBytes ?? MAX_EDITOR_BUFFER_BYTES, event => { events.push(event); return true; }, identity, options.userName, options.excluded);
   } finally { Module._load = original; }
   const tick = ms => {
     const until = now + ms;
@@ -696,4 +696,20 @@ test('changing the display name flushes prior input without replacing session or
     assert.equal(new Set(env.events.map(event => event.session)).size, 1);
     assert.ok(env.events.every(event => JSON.stringify(event.identity) === JSON.stringify(identity)));
   } finally { env.capture.dispose(); }
+});
+
+test('an excluded archive output file is never captured', () => {
+  const excluded = harness(2000, undefined, { excluded: file => file === '/workspace/a.ts' });
+  try {
+    excluded.signals.open(excluded.document);
+    type(excluded, 'human', true);
+    assert.equal(excluded.events.filter(event => event.event.type === 'document_snapshot').length, 0);
+    assert.equal(excluded.events.filter(event => event.event.type === 'document_changed').length, 0);
+    assert.equal(excluded.events.filter(event => event.event.type === 'editor_opened').length, 0);
+    assert.ok(excluded.events.some(event => event.event.type === 'tracking_started'), 'tracking itself still starts');
+  } finally { excluded.capture.dispose(); }
+  const included = harness(2000, undefined, { excluded: () => false });
+  try {
+    assert.equal(included.events.filter(event => event.event.type === 'document_snapshot').length, 1);
+  } finally { included.capture.dispose(); }
 });

@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
+import { promises as fs } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { EditorCapture } from './editorCapture';
 import { EditorOutbox } from './editorOutbox';
@@ -9,6 +10,10 @@ import { unsignedIdentity, workspaceIdentity } from './humanIdentity';
 import { EditorHealth } from './editorHealth';
 import { MAX_EDITOR_BUFFER_BYTES } from './editorLimits';
 import { HumanAccount } from './humanAccount';
+import { HistoryArchive, archiveDirectory } from './historyArchive';
+
+/** Settings that change capture itself; archive settings are handled separately. */
+const RESTART_SETTINGS = ['tracking.enabled', 'tracking.readDwellMs', 'tracking.maxFileBytes', 'chainDir', 'servicePath'];
 
 type Recorder = { capture: EditorCapture; context: { dispose(): void }; contextClient: StdioClient; outbox: EditorOutbox; client: StdioClient; folder: vscode.WorkspaceFolder; chain: string; health: EditorHealth };
 
@@ -23,6 +28,10 @@ export class HumanWorkHost {
   private transportStatus = 'Tracking human work';
   private reporting: Promise<unknown> | undefined;
   private reportClient: StdioClient | undefined;
+  private stopping: Promise<void> | undefined;
+  private readonly archives = new Map<string, HistoryArchive>();
+  private archive: HistoryArchive | undefined;
+  private archiveKey: string | undefined;
   private readonly account: HumanAccount;
 
   constructor(private readonly context: vscode.ExtensionContext, private readonly log: vscode.OutputChannel,
@@ -44,7 +53,10 @@ export class HumanWorkHost {
       vscode.commands.registerCommand('editchain-history.stopTracking', () => this.setTracking(false)),
       vscode.workspace.onDidChangeWorkspaceFolders(() => { void this.restart(); }),
       vscode.workspace.onDidChangeConfiguration(event => {
-        if (['tracking', 'chainDir', 'servicePath'].some(key => event.affectsConfiguration(`editchain-history.${key}`))) void this.restart();
+        if (RESTART_SETTINGS.some(name => event.affectsConfiguration(`editchain-history.${name}`))) void this.restart();
+        // A newly enabled archive or a new destination must begin with complete
+        // recorder sequences, so capture restarts after the archive switches.
+        else if (event.affectsConfiguration('editchain-history.tracking.jsonl')) void this.restart(true);
       }),
       this.account, { dispose: () => { void this.stop(); } },
     );
@@ -65,11 +77,14 @@ export class HumanWorkHost {
     this.lifecycle = this.lifecycle.then(async () => {
       const configuration = vscode.workspace.getConfiguration('editchain-history');
       const key = JSON.stringify([vscode.workspace.isTrusted, (vscode.workspace.workspaceFolders ?? []).map(folder => folder.uri.toString()),
-        ...['tracking.enabled', 'tracking.readDwellMs', 'tracking.maxFileBytes', 'chainDir', 'servicePath'].map(name => configuration.get(name))]);
+        ...RESTART_SETTINGS.map(name => configuration.get(name))]);
       if (!force && key === this.configurationKey) return;
       this.configurationKey = undefined;
       await this.stopRecorders();
       if (this.disposed || !vscode.workspace.isTrusted || !this.context.storageUri) return;
+      // Stop the old recorders first so a replaced destination keeps its
+      // session's final event; the new destination starts a fresh session.
+      await this.syncArchive();
       if (!configuration.get<boolean>('tracking.enabled', true)) {
         this.configurationKey = key;
         this.updateStatus('Human-work tracking paused'); return;
@@ -88,7 +103,11 @@ export class HumanWorkHost {
             client.ensureStarted(resolveServicePath());
             return client.requestJson(body, { timeoutMs: 30000 });
           }, message => this.updateStatus(message), this.delivered,
-          timing => this.log.appendLine(`[capture] delivery ${JSON.stringify(timing)}`));
+          timing => this.log.appendLine(`[capture] delivery ${JSON.stringify(timing)}`),
+          // Archive the exact event the outbox admits, so the archive and the
+          // chain agree even when a capacity pause replaces an event with its
+          // gap. The archive still runs before any native delivery.
+          (workspace, event) => this.archive?.append(workspace, event));
         const dwell = Math.max(500, Math.min(30000, configuration.get<number>('tracking.readDwellMs', 2000)));
         const maxBytes = Math.max(1024, Math.min(MAX_EDITOR_BUFFER_BYTES,
           configuration.get<number>('tracking.maxFileBytes', MAX_EDITOR_BUFFER_BYTES)));
@@ -105,7 +124,8 @@ export class HumanWorkHost {
           }
           return accepted;
         },
-          workspaceIdentity(guid, folder.uri.toString(), folder.uri.fsPath, chain), this.account.name);
+          workspaceIdentity(guid, folder.uri.toString(), folder.uri.fsPath, chain), this.account.name,
+          file => this.excludesArchive(file));
         const context = observeEditorContext(capture, () => {
           contextClient.ensureStarted(resolveServicePath());
           return contextClient.request({ GetEditorContext: { workspace_path: folder.uri.fsPath, chain_dir: chain } }, { timeoutMs: 30000 });
@@ -192,6 +212,74 @@ export class HumanWorkHost {
     }
   }
 
+  private archiveFallback(): string | undefined {
+    return this.context.globalStorageUri ? path.join(this.context.globalStorageUri.fsPath, 'human-history') : undefined;
+  }
+
+  private archiveWorkspaces(): string[] {
+    return (vscode.workspace.workspaceFolders ?? [])
+      .filter(folder => folder.uri.scheme === 'file').map(folder => folder.uri.fsPath);
+  }
+
+  private archiveDestination(): { directory: string } | { error: string } {
+    const fallback = this.archiveFallback();
+    if (!fallback) return { error: 'extension global storage is unavailable' };
+    const setting = vscode.workspace.getConfiguration('editchain-history').get<string>('tracking.jsonl.directory', '');
+    return archiveDirectory(setting, this.archiveWorkspaces(), fallback);
+  }
+
+  /** One session file per activation and destination; restarts reuse it. */
+  private async syncArchive(): Promise<void> {
+    const enabled = vscode.workspace.getConfiguration('editchain-history').get<boolean>('tracking.jsonl.enabled', false)
+      && vscode.workspace.isTrusted;
+    const resolved = this.archiveDestination();
+    const key = JSON.stringify([enabled, 'error' in resolved ? resolved.error : resolved.directory]);
+    if (key === this.archiveKey) return;
+    this.archiveKey = key;
+    // Disabling keeps the destination's writer for this activation, so
+    // re-enabling appends to the same file instead of rotating it.
+    if (!enabled) { this.archive = undefined; return; }
+    if ('error' in resolved) { this.archive = undefined; this.reportArchive(resolved.error); return; }
+    const retained = this.archives.get(resolved.directory);
+    if (retained) {
+      // A failed destination keeps its file and handle until shutdown: the
+      // error asks for a reload, and replacing it would allocate a second
+      // same-activation file and leak the failed writer.
+      this.archive = retained;
+      return;
+    }
+    try { await fs.mkdir(resolved.directory, { recursive: true }); }
+    catch (error) {
+      this.archive = undefined;
+      this.reportArchive(`directory ${resolved.directory} is unavailable: ${String(error)}`);
+      return;
+    }
+    const archive = new HistoryArchive({ directory: resolved.directory,
+      log: line => this.log.appendLine(line), report: message => this.reportArchive(message) });
+    this.archives.set(resolved.directory, archive);
+    this.archive = archive;
+    this.log.appendLine(`[capture] Human history archive: ${resolved.directory}`);
+  }
+
+  /** No archive file this activation wrote may be recorded back into the chain. */
+  private excludesArchive(fsPath: string): boolean {
+    for (const archive of this.archives.values()) if (archive.excludes(fsPath)) return true;
+    return false;
+  }
+
+  private async stopArchives(): Promise<void> {
+    const archives = [...this.archives.values()];
+    this.archives.clear();
+    this.archive = undefined;
+    this.archiveKey = undefined;
+    for (const archive of archives) await archive.stop();
+  }
+
+  private reportArchive(message: string): void {
+    this.log.appendLine(`[capture] Human history archive: ${message}`);
+    if (!this.disposed) void vscode.window.showErrorMessage(`EditChain human history archive: ${message}`);
+  }
+
   private async stopRecorders(): Promise<void> {
     const recorders = this.recorders;
     this.recorders = [];
@@ -203,12 +291,21 @@ export class HumanWorkHost {
     }
   }
 
-  async stop(): Promise<void> {
+  /** Subscription disposal and deactivate share one shutdown completion. */
+  stop(): Promise<void> {
     this.disposed = true;
+    this.stopping ??= this.shutdown();
+    return this.stopping;
+  }
+
+  private async shutdown(): Promise<void> {
     this.account.dispose();
     this.reportClient?.stop();
     await this.lifecycle;
     await this.stopRecorders();
+    // Drain every destination used by this activation after the recorders
+    // published their final events.
+    await this.stopArchives();
   }
 
   useAccount(account: vscode.AuthenticationSessionAccountInformation): void { this.account.use(account); }

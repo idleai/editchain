@@ -1,8 +1,8 @@
 # VS Code human-work capture
 
 The production extension records human work in the existing EditChain store and
-provides **EditChain: Show Human Work Coverage**. No subagents were used for this
-implementation or its tests. The [research](vscode-editor-capture-plan.md) and
+provides **EditChain: Show Human Work Coverage**. The
+[research](vscode-editor-capture-plan.md) and
 [API experiments](vscode-editor-capture-results.md) explain the stable API choices.
 
 ## Event contract
@@ -446,6 +446,105 @@ are durable. Older captures without a recorded Git/workspace context remain
 unknown. Repeated batches, service restarts, and relocation of retained evidence
 do not rewrite historical work. Git rendering at a relocated workspace still
 needs the original repository identity to be available.
+
+## Portable human-history archive
+
+Human work is normally recorded only in the chain. An optional archive writes the
+same recorder events to local JSONL, so a rebuilt chain can be re-imported
+without the original chain. Archiving is off by default.
+
+- `editchain-history.tracking.jsonl.enabled` (default `false`) turns the archive on.
+- `editchain-history.tracking.jsonl.directory` (default `""`) selects where the
+  archive files are written. An empty value uses `human-history` under the
+  extension's global storage directory. Absolute paths and `~` / `~/` paths are
+  supported. A relative path resolves against the single workspace folder and is
+  rejected for a multi-root or folderless window. Choose a location outside the
+  `.editchain` chain directory so the archive survives a chain rebuild.
+
+For example:
+
+```json
+{
+  "editchain-history.tracking.enabled": true,
+  "editchain-history.tracking.jsonl.enabled": true,
+  "editchain-history.tracking.jsonl.directory": "~/editchain-human-history"
+}
+```
+
+Archiving requires a trusted workspace and `editchain-history.tracking.enabled`
+(default `true`); disabling tracking disables the archive too. Each line is one
+JSON record with these keys:
+
+- `format`: the constant `editchain-human-history`.
+- `schema`: the archive schema version, currently `1`.
+- `workspace_path`: the absolute workspace path recorded for the event.
+- `event`: the full existing editor event, carrying its source snapshots,
+  before/after text, attribution, sampled Git context, and lifecycle evidence.
+
+The archive retains all source events and embeds text instead of chain blob
+references. A single line can still reference an earlier change or revision in
+the same archive, so it is not on its own a complete reconstruction of the work.
+Like the chain recording, the archive retains code contents and unsaved buffers
+locally, and the existing capture limits apply: the whole unsaved buffer is
+capped at the configured `tracking.maxFileBytes` (8 MiB default and maximum),
+NUL-containing or oversized buffers are skipped with an explicit coverage gap.
+
+One file is written per continuous VS Code activation and archive destination,
+named `YYYY-MM-DD-session-0001.jsonl`. The date is the local calendar day when the
+file is allocated and is kept for that file's life even if it crosses midnight.
+The counter is a per-day, zero-padded number of at least four digits: each new
+file takes the largest existing counter for that day plus one and is created
+exclusively, so two activations cannot collide. Reloading the window ends the
+current file and starts the next one. Within one activation the destination
+keeps its file: restarting tracking (pause and resume), disabling and
+re-enabling the archive, or switching to another destination and back all reuse
+the file already allocated for that destination instead of rotating.
+
+If the archive directory is unwritable or the disk fills, the archiver reports the
+error in the log and an error notification and stops writing archive files; normal
+chain tracking continues. A destination that failed is retained for the rest of
+the activation, so re-enabling it or switching back to it does not restart
+writes; fix the underlying problem and reload the VS Code window to resume, which
+allocates a new file. Separately, exhausting the chain outbox can pause capture
+until it is resumed.
+
+Re-import an archive with the `human` provider, or point the CLI at a directory
+holding many JSONL files:
+
+```sh
+cargo run --release -p editchain-node -- import \
+  --provider human \
+  --sessions-dir /path/to/human-history \
+  --workspace /path/to/project \
+  --chain /path/to/project/.editchain
+```
+
+`--sessions-dir` accepts either one JSONL file or a directory of them. Admission
+is idempotent and uses the normal import path, so re-running over an
+already-imported archive does not duplicate work. Add `--dry-run` to preview
+changes without writing.
+
+The importer captures each file's byte length when it discovers it and reads that
+same bounded prefix twice, in line order: a preflight pass validates the prefix
+before anything is written, and a replay pass then admits the same bytes.
+Preflight checks envelope format and schema, per-event validity, per-session
+sequence continuity, and a stable recorder identity within a session. Malformed
+JSON, an unsupported schema version, an out-of-order sequence, or a truncated
+archive therefore fails the import without writing a partial chain. Because both
+passes stop at the captured length, an archive still being appended to cannot
+inject unvalidated tail records, and records appended past the captured prefix
+wait for the next import. A prefix that ends mid-record fails with an explicit
+error; a complete final JSON line is accepted without a trailing newline.
+
+Cross-record checks that need the chain itself run during replay, so a failure
+there is reported and leaves earlier admitted records durable rather than rolling
+the whole import back; re-running resumes from what was accepted.
+
+Records carry the workspace they were captured in. The importer matches the
+archive's recorded workspace against `--workspace`, preferring a canonical match
+when both paths exist; records for other workspaces are counted and skipped, and
+an archive with no matching records fails. History is not relocated to a
+different workspace.
 
 ## Coverage rules
 

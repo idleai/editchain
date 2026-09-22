@@ -11,6 +11,7 @@ class EditorOutbox extends ProductionOutbox {
   }
 }
 const { MAX_EDITOR_EVENT_BYTES, MAX_EDITOR_BUFFER_BYTES } = require('../../out/editorLimits');
+const { HistoryArchive } = require('../../out/historyArchive');
 
 const event = sequence => ({ schema: 1, session: '11111111-1111-4111-8111-111111111111',
   sequence, time_ms: 1234, event: { type: sequence === 1 ? 'tracking_started' : 'tracking_stopped' } });
@@ -307,5 +308,65 @@ test('a maximum-size escaped full replacement is delivered intact beyond the nor
     assert.equal(outbox.push(event(3)), true);
     assert.equal(await outbox.flush(), true);
     assert.deepEqual(batches, [[1], [2], [3]], 'an oversized batch member neither splits nor blocks the following event');
+  } finally { await outbox.stop(); await fs.rm(directory, { recursive: true, force: true }); }
+});
+
+test('the archive observes the admitted event, so a capacity gap cannot diverge from the chain', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'editchain-outbox-observe-'));
+  const archives = await fs.mkdtemp(path.join(os.tmpdir(), 'editchain-outbox-observe-archive-'));
+  const delivered = [], reports = [];
+  const archive = new HistoryArchive({ directory: archives, log: () => {}, report: message => reports.push(message) });
+  const outbox = new EditorOutbox(directory, '/workspace', '.editchain', async request => {
+    delivered.push(...request.RecordEditorEvents.events); return ack(request);
+  }, () => {}, () => {}, () => {}, (workspace, event) => archive.append(workspace, event));
+  try {
+    const changed = { ...event(1), event: { type: 'document_changed', document: { id: '1', uri: 'file:///workspace/a.ts', path: 'a.ts', version: 2 },
+      before_version: 1, before: 'one\ntwo\n', after: 'one\nhuman\n', changes: [{ offset: 4, length: 3, text: 'human' }] } };
+    assert.equal(outbox.push(changed), true);
+    const oversized = event(2);
+    oversized.event.text = 'x'.repeat(MAX_EDITOR_EVENT_BYTES);
+    assert.equal(outbox.push(oversized), false, 'capacity refuses the event it cannot retain');
+    assert.equal(outbox.push(event(3)), false, 'capture stays stopped after the capacity pause');
+    await outbox.flush();
+    await outbox.stop();
+    await archive.stop();
+    assert.deepEqual(delivered.map(item => item.sequence), [1, 2]);
+    assert.equal(delivered[1].event.type, 'tracking_gap');
+    assert.equal(delivered[1].session, oversized.session);
+    assert.equal(delivered[1].sequence, oversized.sequence);
+    assert.equal(reports.length, 0);
+    const names = (await fs.readdir(archives)).filter(name => name.endsWith('.jsonl'));
+    assert.equal(names.length, 1);
+    const lines = (await fs.readFile(path.join(archives, names[0]), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    assert.deepEqual(lines.map(line => line.event), delivered,
+      'the archived payload is exactly the payload the chain receives, gap included');
+    assert.deepEqual(lines.map(line => line.workspace_path), ['/workspace', '/workspace']);
+    assert.equal(lines[1].event.event.type, 'tracking_gap');
+    assert.equal(lines.length, 2, 'nothing beyond the admitted events is archived');
+  } finally {
+    await outbox.stop(); await archive.stop();
+    await fs.rm(directory, { recursive: true, force: true });
+    await fs.rm(archives, { recursive: true, force: true });
+  }
+});
+
+test('replaying a durable journal re-delivers without re-observing the event', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'editchain-outbox-replay-observe-'));
+  const observed = [];
+  const observe = (_workspace, event) => observed.push([event.session, event.sequence]);
+  let outbox = new EditorOutbox(directory, '/workspace', '.editchain',
+    async () => { throw new Error('offline'); }, () => {}, () => {}, () => {}, observe);
+  try {
+    assert.equal(outbox.push(event(1)), true);
+    assert.equal(await outbox.flush(), false);
+    assert.deepEqual(observed, [[event(1).session, 1]]);
+    await outbox.stop();
+    const delivered = [];
+    outbox = new EditorOutbox(directory, '/workspace', '.editchain',
+      async request => { delivered.push(...request.RecordEditorEvents.events); return ack(request); },
+      () => {}, () => {}, () => {}, observe);
+    assert.equal(await outbox.flush(), true);
+    assert.deepEqual(delivered.map(item => item.sequence), [1], 'the durable journal is replayed to the service');
+    assert.deepEqual(observed, [[event(1).session, 1]], 'a replayed batch is not a new observation');
   } finally { await outbox.stop(); await fs.rm(directory, { recursive: true, force: true }); }
 });
