@@ -1,6 +1,7 @@
 //! Import agent sessions (Claude Code or Codex) into the edit chain.
 
 mod codex_repositories;
+mod human;
 mod persistence;
 
 use std::path::{Path, PathBuf};
@@ -18,6 +19,18 @@ use editchain_store::SegmentStore;
 
 /// Default Codex helper program, resolved from `PATH` when unconfigured.
 const DEFAULT_CODEX_HELPER: &str = "codex-session-exporter";
+
+/// Providers served by the capture/sink import pipeline.
+///
+/// `--provider human` replays through the canonical editor admission path and
+/// never reaches the capture pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentProvider {
+    /// Claude Code sessions.
+    Claude,
+    /// Codex rollouts.
+    Codex,
+}
 
 /// Run the `import` command.
 ///
@@ -54,6 +67,14 @@ pub(super) fn run(
     if provider != Provider::Codex && !codex_rollout.is_empty() {
         return Err("--codex-rollout requires --provider codex".into());
     }
+    // Archived human history replays through the canonical editor admission
+    // path, which owns its own chain writer. Never hold the import writer lock
+    // across that replay.
+    let agent = match provider {
+        Provider::Claude => AgentProvider::Claude,
+        Provider::Codex => AgentProvider::Codex,
+        Provider::Human => return human::run(&sessions_dir, &workspace, &chain, dry_run, options),
+    };
 
     let chain_path = PathBuf::from(&chain);
     // Hold the writer lock before reading cursors, capturing sources, or
@@ -67,8 +88,8 @@ pub(super) fn run(
 
     let mut batch =
         ImportBatch::capture_bounded(cursors.as_ref(), options.batch_limits, |ops, pending| {
-            match provider {
-                Provider::Claude => {
+            match agent {
+                AgentProvider::Claude => {
                     let sessions_path = if sessions_dir.is_empty() {
                         claude_auto_detect_sessions_dir().map_err(|error| {
                             editchain_import::ImportError::OpSink(error.to_string())
@@ -84,7 +105,7 @@ pub(super) fn run(
 
                     import_claude_code(&request, options, ops, blobs.as_mut(), pending)
                 }
-                Provider::Codex => {
+                AgentProvider::Codex => {
                     let raw_root = if sessions_dir.is_empty() {
                         codex_default_sessions_dir().map_err(|error| {
                             editchain_import::ImportError::OpSink(error.to_string())
@@ -112,9 +133,9 @@ pub(super) fn run(
     if let Some(store) = store.as_mut() {
         let mut session_base_links = 0usize;
         let mut produced_links = 0usize;
-        let baselines = match provider {
-            Provider::Claude => SessionBaselines::ClaudeReflog,
-            Provider::Codex => SessionBaselines::Disabled,
+        let baselines = match agent {
+            AgentProvider::Claude => SessionBaselines::ClaudeReflog,
+            AgentProvider::Codex => SessionBaselines::Disabled,
         };
         match reconcile_git_links(
             Path::new(&workspace),
@@ -139,7 +160,7 @@ pub(super) fn run(
         let outcome = batch.persist(&mut persistence::ImportWriter { store }, cursors.as_mut())?;
         println!("Import complete:");
         println!("{}", capture_report(&outcome.report));
-        if provider == Provider::Claude {
+        if agent == AgentProvider::Claude {
             println!("  Claude session Git anchors: {session_base_links}");
         }
         println!("  Produced commit links: {produced_links}");
@@ -258,13 +279,13 @@ fn codex_default_sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(home.join(".codex").join("sessions"))
 }
 
-/// Reject Codex-only helper options when the provider is Claude.
+/// Reject Codex-only helper options for every non-Codex provider.
 fn check_codex_only_helper_args(
     provider: Provider,
     codex_helper: Option<&str>,
     codex_helper_args: &[String],
 ) -> Result<(), String> {
-    if provider == Provider::Claude && (codex_helper.is_some() || !codex_helper_args.is_empty()) {
+    if provider != Provider::Codex && (codex_helper.is_some() || !codex_helper_args.is_empty()) {
         return Err("--codex-helper and --codex-helper-arg require --provider codex".to_string());
     }
     Ok(())
@@ -322,6 +343,12 @@ mod tests {
     }
 
     #[test]
+    fn import_parses_human_provider() {
+        let args = import_args(&["--provider", "human"]).unwrap();
+        assert_eq!(args.provider, Provider::Human);
+    }
+
+    #[test]
     fn import_rejects_unknown_provider() {
         let err = Cli::try_parse_from(["editchain", "import", "--provider", "bogus"])
             .expect_err("unknown provider must fail to parse");
@@ -375,6 +402,16 @@ mod tests {
             &args.codex_helper_arg,
         )
         .is_err());
+    }
+
+    #[test]
+    fn human_rejects_codex_only_helper_options() {
+        let args = import_args(&["--provider", "human"]).unwrap();
+        assert_eq!(args.provider, Provider::Human);
+        assert!(
+            check_codex_only_helper_args(args.provider, Some("codex-session-exporter"), &[],)
+                .is_err()
+        );
     }
 
     #[test]

@@ -190,6 +190,51 @@ is reported as unknown, never as zero human review of the whole codebase.
 - `editchain-history.tracking.maxFileBytes` defaults to `8388608` (8 MiB), also
   the supported maximum. This measures the entire unsaved buffer in UTF-8 bytes.
   NUL-containing and oversized buffers produce separate capture-gap reasons.
+- `editchain-history.tracking.jsonl.enabled` defaults to `false`. When enabled,
+  the recorder also writes its events to local JSONL archives that can be
+  re-imported after a chain is rebuilt. Requires a trusted workspace and
+  `editchain-history.tracking.enabled`.
+- `editchain-history.tracking.jsonl.directory` defaults to `""`, which uses
+  `human-history` under the extension's global storage directory. Absolute paths
+  and `~` / `~/` paths are supported; a relative path resolves against the single
+  workspace folder and is rejected for a multi-root or folderless window. Keep the
+  directory outside the `.editchain` chain directory so archives survive a chain
+  rebuild.
+
+For example, to archive under `~/editchain-human-history`:
+
+```json
+{
+  "editchain-history.tracking.enabled": true,
+  "editchain-history.tracking.jsonl.enabled": true,
+  "editchain-history.tracking.jsonl.directory": "~/editchain-human-history"
+}
+```
+
+The archive writes one file per continuous VS Code activation and destination,
+named `YYYY-MM-DD-session-0001.jsonl`. The date is the local calendar day when
+the file was allocated and is kept across midnight; the counter is the largest
+existing per-day counter plus one, zero-padded to at least four digits and
+created exclusively. Reloading the window starts a new file; within one
+activation each destination keeps its file, so pausing and resuming tracking,
+disabling and re-enabling the archive, or switching to another destination and
+back all reuse it. The archive retains all source events and embeds text instead
+of chain blob references, so it can be re-imported without the chain; an
+individual record may still reference an earlier change or
+revision in the same archive. It retains code and unsaved buffer contents
+locally, and the same capture limits apply: an 8 MiB default and maximum buffer,
+with explicit gaps for skipped binary or oversized buffers. If the directory is
+unwritable or the disk fills, the archiver logs the error and shows an error
+notification, then stops archive writes while normal tracking continues. That
+failed destination is retained for the rest of the activation, so re-enabling it
+or switching back to it does not restart writes: fix the underlying problem and
+reload the VS Code window to resume, which allocates a new file.
+Re-import with `editchain import --provider human`; malformed JSON, an unsupported
+schema, or an out-of-order sequence fails the import, and the importer reads only
+the byte prefix it captured at discovery, so records appended after that wait for
+the next import. The archive's recorded workspace is matched to the import's
+`--workspace` (other workspaces are skipped) without relocation. See the
+[archive and recovery notes](../../docs/vscode-human-work.md#portable-human-history-archive).
 
 Editor-input and keyboard-correlated edits are human-work indicators under the
 intentional-user assumption. The VS Code API does not authenticate physical

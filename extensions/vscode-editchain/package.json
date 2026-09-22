@@ -135,6 +135,16 @@
           "minimum": 1024,
           "maximum": 8388608,
           "description": "Maximum UTF-8 buffer size to capture, including unsaved text (default 8 MiB). Full before/after snapshots are retained for historical diffs. Skipped binary or oversized buffers produce explicit coverage gaps."
+        },
+        "editchain-history.tracking.jsonl.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also write captured human-edit events to local JSONL archives, one file per window activation, so a rebuilt chain can be re-imported without the original chain. Off by default; archives retain code and unsaved buffer contents locally."
+        },
+        "editchain-history.tracking.jsonl.directory": {
+          "type": "string",
+          "default": "",
+          "description": "Directory for human-history JSONL archives. An absolute path or ~ is used as written; a relative path resolves against the workspace root only when one folder is open, otherwise archiving is refused. Empty uses the extension global-storage human-history directory. Keep it outside the chain directory."
         }
       }
     }

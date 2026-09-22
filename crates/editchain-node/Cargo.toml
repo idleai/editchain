@@ -28,5 +28,4 @@ editchain-project = { path = "../editchain-project" }
 editchain-protocol = { path = "../editchain-protocol" }
 blake3 = "1"
 tantivy = { version = "0.22", default-features = false, features = ["mmap"] }
-[dev-dependencies]
 tempfile = "3"

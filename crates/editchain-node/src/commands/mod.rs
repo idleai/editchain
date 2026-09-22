@@ -22,7 +22,7 @@ pub struct Cli {
 /// Available subcommands.
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Import agent sessions (Claude Code or Codex) into the edit chain
+    /// Import agent sessions or archived human editor history into the edit chain
     Import(ImportCommand),
     /// Prepare or incrementally advance the resumable live history checkpoint
     PrepareView {
@@ -39,7 +39,9 @@ pub enum Commands {
 #[derive(clap::Args, Debug)]
 pub struct ImportCommand {
     /// Sessions directory — auto-detected when empty (Claude:
-    /// `~/.claude/projects/<encoded-cwd>`; Codex: `~/.codex/sessions`)
+    /// `~/.claude/projects/<encoded-cwd>`; Codex: `~/.codex/sessions`). For
+    /// `--provider human` this is one JSONL archive file or a directory of them
+    /// and is required.
     #[arg(long, default_value = "")]
     pub sessions_dir: String,
     /// Session provider to import from
@@ -75,6 +77,8 @@ pub enum Provider {
     Claude,
     /// Codex rollouts (`~/.codex/sessions`).
     Codex,
+    /// Locally archived human editor history (`editchain-human-history` JSONL).
+    Human,
 }
 
 /// Dispatch a command to its handler.

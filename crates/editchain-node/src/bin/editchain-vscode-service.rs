@@ -17,7 +17,6 @@ use ctrlc as _;
 use dirs as _;
 use editchain_import as _;
 use std::io::{self, Read, Write};
-#[cfg(test)]
 use tempfile as _;
 
 // Crate-level dependency markers (used by Cargo for feature resolution).

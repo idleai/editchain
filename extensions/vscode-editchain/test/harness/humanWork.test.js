@@ -5,18 +5,25 @@ const Module = require('node:module');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
+const { archiveDay, archiveFileName } = require('../../out/historyArchive');
+// A junction needs no symlink privilege on Windows; 'dir' is the POSIX default.
+const linkDirectory = (target, link) => fs.symlink(target, link, process.platform === 'win32' ? 'junction' : 'dir');
 
-async function harness() {
+async function harness(initial = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'editchain-human-host-'));
   const captures = [], clients = [], contexts = [], outboxes = [], statuses = [], logs = [];
-  const commands = new Map(), settings = new Map();
+  const commands = new Map(), settings = new Map(Object.entries(initial));
   const report = { calls: 0, release: undefined, responses: [] };
   report.promise = new Promise(resolve => { report.release = resolve; });
   let listener;
   const disposable = () => ({ dispose() {} });
   const uri = { scheme: 'file', fsPath: '/workspace', toString: () => 'file:///workspace' };
   const configuration = { get: (key, fallback) => settings.has(key) ? settings.get(key) : fallback,
-    async update(key, value) { settings.set(key, value); listener({ affectsConfiguration: name => name === 'editchain-history.tracking' }); } };
+    async update(key, value) {
+      settings.set(key, value);
+      const changed = `editchain-history.${key}`;
+      listener({ affectsConfiguration: name => changed === name || changed.startsWith(`${name}.`) });
+    } };
   const vscode = {
     authentication: { getSession: async () => undefined, onDidChangeSessions: disposable },
     ConfigurationTarget: { Workspace: 1 }, StatusBarAlignment: { Left: 1 },
@@ -30,13 +37,21 @@ async function harness() {
     commands: { registerCommand: (name, callback) => { commands.set(name, callback); return disposable(); } },
   };
   class Capture {
-    constructor(_folder, _dwell, _bytes, emit, identity, userName) { this.identity = identity; this.userName = userName; this.emit = emit; captures.push(this); }
+    constructor(_folder, _dwell, _bytes, emit, identity, userName, excluded) {
+      this.identity = identity; this.userName = userName; this.emit = emit; this.excluded = excluded; captures.push(this);
+    }
     setUserName(name) { this.userName = name; }
     checkpoint() {} dispose() { this.stopped = true; }
   }
   class Outbox {
-    constructor(_directory, workspace, chain, send) { this.send = send; this.workspace = workspace; this.chain = chain; outboxes.push(this); }
-    push(event) { this.delivery = this.send([Buffer.from(JSON.stringify({ RecordEditorEvents: { events: [event] } }))]); return true; }
+    constructor(_directory, workspace, chain, send, _status, _delivered, _slow, observed) {
+      this.send = send; this.workspace = workspace; this.chain = chain; this.observed = observed; outboxes.push(this);
+    }
+    push(event) {
+      this.observed?.(this.workspace, event);
+      this.delivery = this.send([Buffer.from(JSON.stringify({ RecordEditorEvents: { events: [event] } }))]);
+      return true;
+    }
     async flush() { await this.delivery; return true; } async stop() {}
   }
   class Client {
@@ -67,7 +82,7 @@ async function harness() {
   let HumanWorkHost;
   try { ({ HumanWorkHost } = require(filename)); } finally { Module._load = original; }
   const context = () => ({ subscriptions: [], storageUri: { fsPath: directory }, globalStorageUri: { fsPath: directory } });
-  return { captures, clients, contexts, outboxes, statuses, logs, commands, report, vscode,
+  return { captures, clients, contexts, outboxes, statuses, logs, commands, report, vscode, directory, settings, configuration,
     create: () => new HumanWorkHost(context(), { appendLine: line => logs.push(line), show() { logs.push('output shown'); } }),
     cleanup: () => fs.rm(directory, { recursive: true, force: true }) };
 }
@@ -202,5 +217,171 @@ test('sign-in updates active and restarted recorders without changing the local 
     await env.commands.get('editchain-history.startTracking')();
     assert.equal(env.captures.at(-1).userName, 'ambientlight');
     assert.deepEqual(env.captures.at(-1).identity, identity);
+  } finally { await host.stop(); await env.cleanup(); }
+});
+
+const archiveEvent = (session, sequence, text) => ({ schema: 1, session, sequence, time_ms: 1700000000000 + sequence,
+  identity: { kind: 'unsigned', guid: '22222222-2222-4222-8222-222222222222', stream: 'a'.repeat(24) },
+  event: { type: 'document_snapshot', document: { id: '1', uri: 'file:///workspace/a.ts', path: 'a.ts', version: 1 }, text } });
+
+async function archiveRecords(file) {
+  return (await fs.readFile(file, 'utf8')).split('\n').filter(Boolean).map(line => JSON.parse(line));
+}
+
+test('the human history archive is off by default', async () => {
+  const env = await harness();
+  const host = env.create();
+  try {
+    await host.lifecycle;
+    env.captures.at(-1).emit(archiveEvent('default', 1, 'off'));
+    await host.stop();
+    await assert.rejects(fs.readdir(path.join(env.directory, 'human-history')), { code: 'ENOENT' });
+  } finally { await host.stop(); await env.cleanup(); }
+});
+
+test('an enabled archive keeps one file per activation and destination', async () => {
+  const env = await harness();
+  const host = env.create();
+  const first = path.join(env.directory, 'archives-one');
+  const second = path.join(env.directory, 'archives-two');
+  try {
+    await host.lifecycle;
+    const started = env.captures.length;
+    await env.configuration.update('tracking.jsonl.enabled', true);
+    await host.lifecycle;
+    assert.equal(env.captures.length, started + 1, 'enabling restarts capture so new sequences are complete');
+    await env.configuration.update('tracking.jsonl.directory', first);
+    await host.lifecycle;
+    env.captures.at(-1).emit(archiveEvent('session-a1', 1, 'a1'));
+    await env.configuration.update('tracking.jsonl.enabled', false);
+    await host.lifecycle;
+    env.captures.at(-1).emit(archiveEvent('session-off', 1, 'off'));
+    await env.configuration.update('tracking.jsonl.enabled', true);
+    await host.lifecycle;
+    env.captures.at(-1).emit(archiveEvent('session-a2', 2, 'a2'));
+    await env.configuration.update('tracking.jsonl.directory', second);
+    await host.lifecycle;
+    env.captures.at(-1).emit(archiveEvent('session-b1', 1, 'b1'));
+    await env.configuration.update('tracking.jsonl.directory', first);
+    await host.lifecycle;
+    env.captures.at(-1).emit(archiveEvent('session-a3', 3, 'a3'));
+    await host.stop();
+    const one = (await fs.readdir(first)).sort();
+    const two = (await fs.readdir(second)).sort();
+    assert.deepEqual(one, [archiveFileName(archiveDay(new Date()), 1)], 're-enabling and returning reuse the activation file');
+    assert.deepEqual(two, [archiveFileName(archiveDay(new Date()), 1)]);
+    const records = await archiveRecords(path.join(first, one[0]));
+    assert.deepEqual(records.map(record => record.event.session), ['session-a1', 'session-a2', 'session-a3']);
+    assert.deepEqual(records.map(record => record.workspace_path), ['/workspace', '/workspace', '/workspace']);
+    assert.deepEqual((await archiveRecords(path.join(second, two[0]))).map(record => record.event.session), ['session-b1']);
+  } finally { await host.stop(); await env.cleanup(); }
+});
+
+test('a reload starts the next archive file and keeps earlier files intact', async () => {
+  const env = await harness({ 'tracking.jsonl.enabled': true });
+  let host = env.create();
+  try {
+    await host.lifecycle;
+    env.captures.at(-1).emit(archiveEvent('first', 1, 'first'));
+    await host.stop();
+    host = env.create();
+    await host.lifecycle;
+    env.captures.at(-1).emit(archiveEvent('second', 1, 'second'));
+    await host.stop();
+    const directory = path.join(env.directory, 'human-history');
+    const names = (await fs.readdir(directory)).sort();
+    assert.deepEqual(names, [archiveFileName(archiveDay(new Date()), 1), archiveFileName(archiveDay(new Date()), 2)]);
+    assert.deepEqual((await archiveRecords(path.join(directory, names[0]))).map(record => record.event.session), ['first']);
+    assert.deepEqual((await archiveRecords(path.join(directory, names[1]))).map(record => record.event.session), ['second']);
+  } finally { await host.stop(); await env.cleanup(); }
+});
+
+test('a failed archive destination is retained instead of rotated', async () => {
+  const env = await harness();
+  const host = env.create();
+  const directory = path.join(env.directory, 'archives');
+  try {
+    await host.lifecycle;
+    await fs.mkdir(directory);
+    await env.configuration.update('tracking.jsonl.enabled', true);
+    await env.configuration.update('tracking.jsonl.directory', directory);
+    await host.lifecycle;
+    // Break the destination after its writer exists, then let one write fail.
+    await fs.rm(directory, { recursive: true, force: true });
+    await fs.writeFile(directory, 'not a directory');
+    env.captures.at(-1).emit(archiveEvent('failed', 1, 'x'));
+    const stopped = () => env.logs.filter(line => line.includes('archive archiving stopped')).length;
+    for (let attempt = 0; attempt < 200 && !stopped(); attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.equal(stopped(), 1);
+    assert.equal(env.captures.at(-1).excluded(path.join(directory, archiveFileName(archiveDay(new Date()), 1))), true,
+      'a failed destination stays excluded from capture');
+    await env.configuration.update('tracking.jsonl.enabled', false);
+    await host.lifecycle;
+    await env.configuration.update('tracking.jsonl.enabled', true);
+    await host.lifecycle;
+    env.captures.at(-1).emit(archiveEvent('later', 1, 'y'));
+    await host.stop();
+    assert.equal(stopped(), 1, 'a failed destination is not replaced inside the same activation');
+    assert.equal((await fs.stat(directory)).isFile(), true, 'no second same-activation file was allocated');
+  } finally { await host.stop(); await env.cleanup(); }
+});
+
+test('every archive destination used by the activation stays excluded from capture', async () => {
+  const env = await harness();
+  const host = env.create();
+  const first = path.join(env.directory, 'one');
+  const second = path.join(env.directory, 'two');
+  try {
+    await host.lifecycle;
+    await env.configuration.update('tracking.jsonl.enabled', true);
+    await env.configuration.update('tracking.jsonl.directory', first);
+    await host.lifecycle;
+    await env.configuration.update('tracking.jsonl.directory', second);
+    await host.lifecycle;
+    const excluded = env.captures.at(-1).excluded;
+    const name = archiveFileName(archiveDay(new Date()), 1);
+    assert.equal(excluded(path.join(first, name)), true, 'returning to an earlier destination cannot re-record its file');
+    assert.equal(excluded(path.join(second, name)), true);
+    assert.equal(excluded(path.join(first, 'notes.txt')), false);
+  } finally { await host.stop(); await env.cleanup(); }
+});
+
+test('a symlinked archive destination is excluded at its physical path', async () => {
+  const env = await harness();
+  const host = env.create();
+  const workspace = path.join(env.directory, 'workspace');
+  const physical = path.join(workspace, 'archives');
+  const alias = path.join(env.directory, 'alias');
+  try {
+    await host.lifecycle;
+    await fs.mkdir(physical, { recursive: true });
+    await linkDirectory(physical, alias);
+    await env.configuration.update('tracking.jsonl.enabled', true);
+    await env.configuration.update('tracking.jsonl.directory', alias);
+    await host.lifecycle;
+    const excluded = env.captures.at(-1).excluded;
+    const name = archiveFileName(archiveDay(new Date()), 1);
+    assert.equal(excluded(path.join(alias, name)), true, 'the configured alias');
+    assert.equal(excluded(path.join(physical, name)), true, 'the real path VS Code observes');
+    assert.equal(excluded(path.join(workspace, 'notes.txt')), false, 'ordinary files still capture');
+  } finally { await host.stop(); await env.cleanup(); }
+});
+
+test('concurrent stop callers share one shutdown that drains the archive', async () => {
+  const env = await harness({ 'tracking.jsonl.enabled': true });
+  const host = env.create();
+  try {
+    await host.lifecycle;
+    env.captures.at(-1).emit(archiveEvent('drain', 1, 'x'.repeat(1024 * 1024)));
+    const first = host.stop();
+    assert.equal(host.stop(), first, 'subscription disposal and deactivate share one completion');
+    await first;
+    const directory = path.join(env.directory, 'human-history');
+    const names = await fs.readdir(directory);
+    assert.deepEqual(names, [archiveFileName(archiveDay(new Date()), 1)]);
+    assert.deepEqual((await archiveRecords(path.join(directory, names[0]))).map(record => record.event.session), ['drain'],
+      'the shared shutdown waited for the pending write');
   } finally { await host.stop(); await env.cleanup(); }
 });

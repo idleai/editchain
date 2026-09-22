@@ -13,6 +13,8 @@ export type EditorEvent = {
 };
 type Batch = { workspace_path: string; chain_dir: string; events: EditorEvent[] };
 type Send = (serializedBody: Buffer[]) => Promise<unknown>;
+/** Observer of the exact event admitted to the queue, including a capacity gap. */
+type Observe = (workspace: string, event: EditorEvent) => void;
 type DeliveryTiming = { events: number; queue_ms: number; request_ms: number; oldest_event_ms: number; journal_ms?: number; read_ms: number; native_work?: unknown };
 type QueuedEvent = { session: string; sequence: number; time_ms: number; json: Buffer; bytes: number };
 type BatchMetadata = { ack: [string, number][]; oldest: number; journal_ms?: number };
@@ -40,7 +42,8 @@ export class EditorOutbox {
     private readonly chain: string, private readonly send: Send,
     private readonly status: (message: string) => void,
     private readonly delivered: () => void = () => {},
-    private readonly slowDelivery: (timing: DeliveryTiming) => void = () => {}) {
+    private readonly slowDelivery: (timing: DeliveryTiming) => void = () => {},
+    private readonly observed: Observe = () => {}) {
     this.timer = setInterval(() => { void this.flush(false); }, 1000);
     this.timer.unref();
   }
@@ -67,6 +70,11 @@ export class EditorOutbox {
     // Freeze the observation once, without retaining another full object graph
     // or re-serializing both snapshots for sizing and every persistence pass.
     this.queue.push({ session: event.session, sequence: event.sequence, time_ms: event.time_ms, json, bytes });
+    // Report the admitted event itself, never the transport encoding, so a
+    // source archive cannot disagree with the chain about a session/sequence.
+    // A capacity pause observes its synthesized gap, and replaying a durable
+    // journal below never re-enters here.
+    this.observed(this.workspace, event);
     // Coalesce one short input frame, without waiting for the recovery interval.
     if (!this.wake) {
       this.wake = setTimeout(() => { this.wake = undefined; void this.flush(false); }, 25);

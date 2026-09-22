@@ -34,7 +34,8 @@ export class EditorCapture {
 
   constructor(private readonly folder: vscode.WorkspaceFolder, private readonly dwell: number,
     private readonly maxFileBytes: number, private readonly emit: (event: EditorEvent) => boolean,
-    private readonly attribution?: HumanIdentity, private userName?: string) {
+    private readonly attribution?: HumanIdentity, private userName?: string,
+    private readonly excluded?: (fsPath: string) => boolean) {
     const version = vscode.extensions?.getExtension('ambientlight.editchain-history')?.packageJSON.version;
     const tabs = new EditorTabs(uri => this.relative(uri), tab => this.identity(tab), event => {
       this.edits.flush(); this.record(event);
@@ -97,6 +98,9 @@ export class EditorCapture {
 
   private relative(uri: vscode.Uri): string | null {
     if (uri.scheme !== 'file') return null;
+    // Archive output can live inside the workspace. Recording our own writes
+    // would make every append a new observation and never settle.
+    if (this.excluded?.(uri.fsPath)) return null;
     const relative = path.relative(this.folder.uri.fsPath, uri.fsPath);
     if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
     return relative.split(path.sep).join('/');
