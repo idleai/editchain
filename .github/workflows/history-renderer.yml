@@ -60,9 +60,9 @@ jobs:
         working-directory: extensions/vscode-editchain
         run: npm ci
 
-      - name: Build native service and fixture importer (release)
+      - name: Build native service, peer, and fixture importer (release)
         timeout-minutes: 25
-        run: cargo build --release -p editchain-node --bins
+        run: cargo build --release --locked -p editchain-node -p editchain-sync --bins
 
       - name: Build deterministic history fixture
         run: |
@@ -104,6 +104,9 @@ jobs:
 
       - name: Generic harness tests
         working-directory: extensions/vscode-editchain
+        env:
+          EDITCHAIN_PEER_TEST_BINARY: ${{ github.workspace }}/target/release/editchain-peer
+          EDITCHAIN_SERVICE_TEST_BINARY: ${{ github.workspace }}/target/release/editchain-vscode-service
         run: npm run test:harness
 
       - name: Install Chrome for the Rust smoke harness

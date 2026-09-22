@@ -142,6 +142,7 @@ test('extension contributes one history view with live, tracking, and Dev Tunnel
   assert.deepEqual(commands.map(entry => entry.command), [
     'editchain-history.multiplayerRequest', 'editchain-history.multiplayerHost',
     'editchain-history.multiplayerJoin', 'editchain-history.multiplayerStatus',
+    'editchain-history.multiplayerScope',
     'editchain-history.multiplayerRemove', 'editchain-history.multiplayerResume', 'editchain-history.multiplayerDiscovery', 'editchain-history.multiplayerStop',
     'editchain-history.multiplayerCleanup',
     'editchain-history.devTunnelsSpike', 'editchain-history.devTunnelsCleanup',
