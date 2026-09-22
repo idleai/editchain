@@ -6,6 +6,14 @@ use super::{LiveWorkspace, Result};
 use editchain_protocol::rank::Measure;
 
 impl LiveWorkspace {
+    pub(super) fn restore_legacy_imports(&mut self) -> Result<()> {
+        self.poisoned = true;
+        let changes = self.projection.refresh_legacy_imports();
+        let (removed, blocks) = self.apply_blocks(changes)?;
+        drop(self.connect(&removed, blocks)?);
+        Ok(())
+    }
+
     pub(super) fn restore_codex_items(&mut self) -> Result<()> {
         self.poisoned = true;
         let changes = self.projection.refresh_codex_items();

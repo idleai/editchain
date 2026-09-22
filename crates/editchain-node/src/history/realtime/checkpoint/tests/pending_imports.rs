@@ -282,3 +282,138 @@ fn partial_revisions_keep_validating_item_identity_and_complete_outputs() {
         "missing current output still blocks the revision"
     );
 }
+
+fn legacy_claude_ops() -> Vec<Op> {
+    use editchain_import::claude_code::envelope::parse_envelope;
+    use editchain_import::claude_code::normalize::{normalize_envelope, NormalizeOptions};
+    use editchain_import::ids::{derive_node_id, hash_raw, SourceStream};
+    use editchain_import::sink::MemoryBlobSink;
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "type":"user", "uuid":"event", "sessionId":"session",
+        "timestamp":"2026-09-21T12:00:00Z", "message":{"role":"user", "content":"complete legacy message"}
+    })).unwrap();
+    let (raw, children) = normalize_envelope(
+        &parse_envelope(&bytes).unwrap(),
+        hash_raw(&bytes),
+        &bytes,
+        &SourceStream::new(derive_node_id("legacy-session"), 0),
+        1,
+        &NormalizeOptions::default(),
+        &mut MemoryBlobSink::new(),
+        "session",
+    )
+    .unwrap();
+    assert!(matches!(&raw.kind, OpKind::Import(value) if value.raw_hash.is_some()));
+    assert!(!children.is_empty());
+    std::iter::once(raw).chain(children).collect()
+}
+
+#[test]
+fn complete_legacy_hashed_claude_records_survive_replication() {
+    let ops = legacy_claude_ops();
+    for received in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        codex::append(&root.path().join(".editchain"), &ops).unwrap();
+        if received {
+            ledger(
+                root.path(),
+                &serde_json::json!(ops.iter().map(receipt).collect::<Vec<_>>()),
+                &serde_json::json!([]),
+            );
+        }
+        let mut workspace = LiveWorkspace::open_paged(&request(root.path())).unwrap();
+        let visible = window(&mut workspace).unwrap();
+        assert_eq!(
+            visible.total, 1,
+            "complete legacy normalized history must remain visible; received={received}"
+        );
+    }
+}
+
+#[test]
+fn legacy_hashed_import_waits_for_children_and_recovers_from_version_eleven() {
+    let root = tempfile::tempdir().unwrap();
+    let chain = root.path().join(".editchain");
+    let ops = legacy_claude_ops();
+    ledger(
+        root.path(),
+        &serde_json::json!(ops.iter().map(receipt).collect::<Vec<_>>()),
+        &serde_json::json!([]),
+    );
+    let (raw, children) = ops.split_first().unwrap();
+    codex::append(&chain, std::slice::from_ref(raw)).unwrap();
+    let mut workspace = LiveWorkspace::open_paged(&request(root.path())).unwrap();
+    assert_eq!(window(&mut workspace).unwrap().total, 0);
+    codex::append(&chain, children).unwrap();
+    let update = workspace
+        .sync(&SyncLiveRequest {
+            epoch: workspace.epoch.clone(),
+            after_revision: 0,
+            codex: None,
+        })
+        .unwrap();
+    assert!(!update.deltas.is_empty());
+    assert_eq!(window(&mut workspace).unwrap().total, 1);
+    let canonical = human_edits::canonical(root.path());
+
+    // Older checkpoints retained the complete projection but discarded this row.
+    let keys = workspace
+        .projection
+        .refresh_legacy_imports()
+        .upserts
+        .into_keys()
+        .collect();
+    let (removed, blocks) = workspace
+        .apply_blocks(editchain_project::live::LiveChanges {
+            removed: keys,
+            ..Default::default()
+        })
+        .unwrap();
+    drop(workspace.connect(&removed, blocks).unwrap());
+    assert_eq!(window(&mut workspace).unwrap().total, 0);
+    workspace.rows.flush().unwrap();
+    let mut saved = workspace.saved();
+    saved.version = 11;
+    drop(
+        workspace
+            .checkpoint_store
+            .commit::<_, Saved>(&saved)
+            .unwrap(),
+    );
+    drop(workspace);
+    for _ in 0..2 {
+        let mut reopened = LiveWorkspace::open_paged(&request(root.path())).unwrap();
+        assert!(reopened.reused_checkpoint);
+        let rows = window(&mut reopened).unwrap().rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.first().unwrap().summary, "complete legacy message");
+    }
+    assert_eq!(human_edits::canonical(root.path()), canonical);
+}
+
+#[test]
+fn legacy_children_cannot_bypass_incomplete_current_derivations() {
+    let ops = codex::occurrence(2, 2, "current provider item").unwrap();
+    let (raw, remaining) = ops.split_first().unwrap();
+    let (output, proof) = remaining.split_first().unwrap();
+    let mut legacy = output.clone();
+    legacy.id = OpId {
+        seq: raw.id.seq + 1,
+        ..raw.id
+    };
+    for last in [std::slice::from_ref(output), proof] {
+        let mut live = LiveProjection::default();
+        drop(live.apply(vec![raw.clone(), legacy.clone()], &[]));
+        assert!(
+            live.import_ready(raw.id),
+            "legacy numeric content stands alone"
+        );
+        drop(live.apply(last.to_vec(), &[]));
+        assert!(
+            !live.import_ready(raw.id),
+            "current output/proof requires the rest of the occurrence"
+        );
+        drop(live.apply(remaining.to_vec(), &[]));
+        assert!(live.import_ready(raw.id));
+    }
+}

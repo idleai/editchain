@@ -154,6 +154,7 @@ impl LiveWorkspace {
             let partial_items = saved.version < 9;
             let pending_imports = saved.version < 10;
             let cutoff_items = saved.version < 11;
+            let legacy_imports = saved.version < 12;
             workspace.adopt(saved, true)?;
             if regroup {
                 workspace.regroup();
@@ -179,12 +180,16 @@ impl LiveWorkspace {
             if cutoff_items {
                 workspace.restore_codex_items()?;
             }
+            if legacy_imports {
+                workspace.restore_legacy_imports()?;
+            }
             if disclosure
                 || edit_rows
                 || human_streams
                 || partial_items
                 || pending_imports
                 || cutoff_items
+                || legacy_imports
             {
                 // Publish the new version only after every migration completed.
                 workspace.checkpoint()?;
