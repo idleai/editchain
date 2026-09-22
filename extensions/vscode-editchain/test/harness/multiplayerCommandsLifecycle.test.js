@@ -58,6 +58,8 @@ async function commands(options, body) {
       this.statusText = undefined;
       instances.push(this);
     }
+    async sharingScope() { return options.scope; }
+    async changeScope(backfill) { calls.push({ scopeChange: true, backfill }); }
     joinRequest() { return Promise.resolve('public-request'); }
     inspectRequest() { return Promise.resolve({ device: { fingerprint: 'a'.repeat(64) } }); }
     async hostHistory(_request, backfill) {

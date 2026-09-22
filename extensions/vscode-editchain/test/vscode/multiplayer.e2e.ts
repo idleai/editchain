@@ -96,6 +96,23 @@ async function connect(): Promise<void> {
   assert.equal(result.ok, true, result.message || 'Host/Join failed');
 }
 
+async function selectScope(backfill: boolean): Promise<any> {
+  await probe('run', 'multiplayerScope');
+  await input('Change outgoing history scope for');
+  if (backfill) await browser.keys('ArrowDown');
+  await browser.saveScreenshot(path.join(output, backfill ? 'scope-include-history.png' : 'scope-from-now.png'));
+  await browser.keys('Enter');
+  let result: any;
+  await browser.waitUntil(async () => !!(result = await probe('result')), { timeout: 30000, interval: 100 });
+  assert.equal(result.ok, true, result.message || 'Scope change failed');
+  const scope = (await status()).scope;
+  assert.equal(scope.mode, backfill ? 'all' : 'from_now');
+  assert.equal(scope.active, true);
+  if (!backfill) assert.ok(Number.isSafeInteger(scope.cutoff_ms));
+  await live();
+  return scope;
+}
+
 async function type(file: string, text: string): Promise<void> {
   await browser.executeWorkbench(async (vscode, file) => {
     const document = await vscode.workspace.openTextDocument(vscode.Uri.joinPath(vscode.workspace.workspaceFolders[0].uri, file));
@@ -212,6 +229,11 @@ describe('packaged multiplayer in independent VS Code instances', () => {
     } else {
       await waitFor('request'); await connect(); await probe('clipboard', 'invitation', true);
       await waitFor('guest.joined'); await live();
+      const allScope = await selectScope(true);
+      const cutoff = await selectScope(false);
+      assert.ok(cutoff.revision > allScope.revision, 'the explicit from-now choice replaces earlier all-history consent');
+      report.changedScopeThroughUi = true;
+      report.cutoff = cutoff;
       await type('from-host.ts', 'hostOne');
       await waitFor('guest.edited');
       const first = await receivedDiff('from-guest.ts', 'guestOne', 'received-guest');
@@ -235,6 +257,8 @@ describe('packaged multiplayer in independent VS Code instances', () => {
       assert.notEqual(await browser.executeWorkbench(() => process.pid), oldPid);
       const reconnectingAt = Date.now();
       await live(); mark('host.reloaded');
+      assert.deepEqual((await status()).scope, cutoff, 'automatic restart must preserve the selected boundary');
+      report.cutoffSurvivedRestart = true;
       report.reconnectMs = Date.now() - reconnectingAt;
       report.restartMs = Date.now() - restartingAt;
       await waitFor('guest.edited-again');

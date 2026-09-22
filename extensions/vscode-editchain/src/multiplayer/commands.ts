@@ -9,6 +9,7 @@ import { ProbeError } from '../devTunnels/probe';
 import type { DirectorySync, DiscoveryStatus } from './discovery';
 import { MultiplayerStatusOutput } from './statusOutput';
 import { sharingDetails, sharingLabel } from './statusBar';
+import { describeScope, ScopeChoice } from './scope';
 import { HUMAN_ACCOUNT_SCOPES as SCOPES } from '../humanAccount';
 
 class CommandError extends Error {}
@@ -163,11 +164,14 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
     return manager;
   };
 
-  const backfill = async (): Promise<boolean | undefined> => {
-    const choice = await vscode.window.showQuickPick([
-      { label: 'Share records added from now on', detail: 'Existing records stay private unless they are already shared in this space.', value: false },
+  const backfill = async (current: MultiplayerManager, changing = false): Promise<ScopeChoice | undefined> => {
+    const scope = await current.sharingScope();
+    const choices: { label: string; detail: string; value: ScopeChoice }[] = [
+      { label: 'Share records added from now on', detail: 'Set a new cutoff for this device. Earlier records stop being sent; copies already received by others remain.', value: false },
       { label: 'Include existing history', detail: 'Share all retained operations and their referenced content in this workspace history.', value: true },
-    ], { title: `Share history from ${folder?.name || 'this workspace'}` });
+    ];
+    if (scope?.active && !changing) choices.unshift({ label: 'Keep current sharing scope', detail: describeScope(scope), value: 'keep' });
+    const choice = await vscode.window.showQuickPick(choices, { title: `${changing ? 'Change outgoing history scope for' : 'Share history from'} ${folder?.name || 'this workspace'}` });
     return choice?.value;
   };
 
@@ -263,7 +267,7 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       const text = await vscode.window.showInputBox({ title: 'Host shared history', prompt: 'Paste the joining device’s EditChain join request', ignoreFocusOut: true });
       if (!text) return;
       const request = await current.inspectRequest(text);
-      const include = await backfill(); if (include === undefined) return;
+      const include = await backfill(current); if (include === undefined) return;
       const approved = await vscode.window.showWarningMessage(`Approve device ${request.device.fingerprint} to exchange history with ${folder!.name}?`, { modal: true }, 'Approve device');
       if (approved !== 'Approve device') return;
       account = await vscode.authentication.getSession('github', SCOPES, { createIfNone: true });
@@ -280,7 +284,7 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       const text = await vscode.window.showInputBox({ title: 'Join shared history', prompt: 'Paste the host’s private EditChain invitation', password: true, ignoreFocusOut: true });
       if (!text) return;
       const invitation = await current.inspectInvitation(text);
-      const include = await backfill(); if (include === undefined) return;
+      const include = await backfill(current); if (include === undefined) return;
       const approved = await vscode.window.showWarningMessage(`Join space ${invitation.space} with host device ${invitation.host.fingerprint}?`, { modal: true }, 'Join space');
       if (approved !== 'Join space') return;
       const identity = await vscode.authentication.getSession('github', SCOPES, { createIfNone: true });
@@ -290,12 +294,21 @@ export function registerMultiplayerCommands(context: vscode.ExtensionContext, re
       if (version === stopVersion) await startDirectory(current);
     }),
     command('multiplayerStatus', async () => {
+      if (manager) await manager.sharingScope();
       const value = { ...(manager?.status() ?? { hosting: false, peers: [], message: 'Sharing is disabled.' }), discovery: directoryStatus };
       output!.show(true);
       output!.appendLine(JSON.stringify(value, null, 2));
       liveOutput ??= new MultiplayerStatusOutput(line => output!.appendLine(line));
       liveOutput.show(value);
       return value;
+    }),
+    command('multiplayerScope', async () => {
+      const version = stopVersion;
+      const current = await getManager();
+      const include = await backfill(current, true);
+      if (include === undefined || include === 'keep' || version !== stopVersion) return;
+      await current.changeScope(include);
+      if (version === stopVersion) void vscode.window.showInformationMessage(describeScope(current.status().scope));
     }),
     command('multiplayerRemove', async () => {
       const current = await getManager();

@@ -222,3 +222,19 @@ test('completed checks stay quiet across unchanged passes', t => {
   }
   assert.equal(lines.length, 0, 'completed pass numbers alone must not fill the output');
 });
+
+test('effective outgoing scope is visible and a new cutoff updates without a receipt', t => {
+  const { describeScope, validScope } = require('../../out/multiplayer/scope');
+  const { sharingDetails } = require('../../out/multiplayer/statusBar');
+  const scope = { space: 'test-space', mode: 'all', active: true, revision: 1, cutoff_ms: null, legacy_excluded_records: 0 };
+  const { lines, output, tick } = observe(t, { ...status(), scope });
+  assert.match(lines.join('\n'), /Outgoing history scope: all retained history/);
+  const cutoff = { ...scope, mode: 'from_now', revision: 2, cutoff_ms: Date.UTC(2026, 8, 21) };
+  assert.equal(validScope(cutoff), true);
+  output.update({ ...status(), scope: cutoff }); tick(1000);
+  assert.match(lines.at(-1), /records added after 2026-09-21T00:00:00.000Z/);
+  assert.match(sharingDetails({ ...status(), scope: cutoff }), /records added after/);
+  assert.match(describeScope({ ...scope, mode: 'legacy_from_now', legacy_excluded_records: 235 }), /235 excluded records; selection time unavailable/);
+  assert.match(describeScope({ ...cutoff, active: false }), /change interrupted/);
+  for (const invalid of [{ ...cutoff, cutoff_ms: null }, { ...scope, mode: 'unexpected' }, { ...cutoff, cutoff_ms: 8.65e15 }]) assert.equal(validScope(invalid), false);
+});

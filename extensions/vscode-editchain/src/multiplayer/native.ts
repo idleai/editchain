@@ -38,10 +38,11 @@ export class NativeWorker {
           clearTimeout(pending.timer);
           if (value.ok) pending.resolve(value.result);
           else {
-            const codes = ['incompatible_peer_protocol', 'authentication_failed', 'storage_permission_denied', 'storage_busy', 'invalid_request_or_peer_data', 'connection_closed', 'storage_or_transport_failure'];
+            const codes = ['incompatible_peer_protocol', 'sharing_scope_changed', 'authentication_failed', 'storage_permission_denied', 'storage_busy', 'invalid_request_or_peer_data', 'connection_closed', 'storage_or_transport_failure'];
             const code = codes.includes(value.error) ? value.error : 'invalid_native_response';
             pending.reject(new NativePeerError(code === 'incompatible_peer_protocol'
-              ? 'Multiplayer versions differ. Update EditChain on both devices and reconnect.' : `Native multiplayer: ${code}`));
+              ? 'Multiplayer versions differ. Update EditChain on both devices and reconnect.'
+              : code === 'sharing_scope_changed' ? 'Shared history scope changed; reconnecting with the current cutoff.' : `Native multiplayer: ${code}`));
           }
         }
       } catch { this.fail(new NativePeerError('Invalid native multiplayer framing or response.')); }

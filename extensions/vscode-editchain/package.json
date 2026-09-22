@@ -37,6 +37,7 @@
       { "command": "editchain-history.multiplayerHost", "title": "EditChain: Host Shared History / Invite Device" },
       { "command": "editchain-history.multiplayerJoin", "title": "EditChain: Join Shared History" },
       { "command": "editchain-history.multiplayerStatus", "title": "EditChain: Show Multiplayer Status" },
+      { "command": "editchain-history.multiplayerScope", "title": "EditChain: Change Shared History Scope" },
       { "command": "editchain-history.multiplayerRemove", "title": "EditChain: Remove Shared Device" },
       { "command": "editchain-history.multiplayerResume", "title": "EditChain: Resume / Reconnect Shared History" },
       { "command": "editchain-history.multiplayerDiscovery", "title": "EditChain: Configure Multiplayer Repository Discovery" },

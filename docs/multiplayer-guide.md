@@ -89,6 +89,38 @@ available account name.
   the chain on disk. If the saved invitation or device identity is also gone,
   exchange a fresh join request and invitation.
 
+## Change which history you send
+
+Run **EditChain: Change Shared History Scope** on the device whose outgoing
+history you want to change:
+
+- **Share records added from now on** establishes a **new cutoff**, including
+  when you previously selected **Include existing history**. Records already
+  present on this device stop being offered to peers; newly appended records
+  remain eligible. Choosing it again moves the cutoff forward again.
+- **Include existing history** removes the cutoff and makes the retained
+  history eligible for backfill.
+
+The cutoff applies to all approved peers of this workspace. Connections restart
+to discard inventories prepared under the old scope. Approvals, invitations,
+local history and copies already received by other devices remain intact.
+Reconnecting or reloading preserves the cutoff, including work recorded offline
+after it. New records use their local append order, not their recorded timestamp.
+Stopping backfill mid-transfer can leave earlier received rows missing content;
+selecting **Include existing history** later lets that content finish transferring.
+
+When inviting or joining again, **Keep current sharing scope** preserves the
+saved boundary. Selecting **Share records added from now on** explicitly creates
+a new one. **Show Multiplayer Status** and the status-bar tooltip display the
+effective outgoing scope and cutoff time. Older saved exclusion baselines are
+identified as such until you choose a new scope.
+
+Each device controls its own outgoing scope. To stop historical backfill in both
+directions, select **Share records added from now on** on both devices. A new
+record can still reference content needed to show its recorded before/after diff.
+If a scope change was interrupted, repeat this command to complete it; the old
+inventory is blocked until the policy is consistent again.
+
 ## Watch synchronization progress
 
 The status bar counts authenticated **connections**, including peers that are

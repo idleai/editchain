@@ -26,7 +26,7 @@ exports.activate = context => {
   }, { supportsMultipleAccounts: false }));
   let result;
   context.subscriptions.push(vscode.commands.registerCommand('editchain-multiplayer-test.run', name => {
-    if (!['multiplayerHost', 'multiplayerJoin'].includes(name)) throw new Error('Unsupported fixture command');
+    if (!['multiplayerHost', 'multiplayerJoin', 'multiplayerScope'].includes(name)) throw new Error('Unsupported fixture command');
     result = undefined;
     void vscode.commands.executeCommand('editchain-history.' + name).then(value => {
       result = { ok: value?.ok === true, message: value?.message };

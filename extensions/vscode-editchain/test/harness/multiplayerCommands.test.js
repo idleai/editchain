@@ -36,7 +36,11 @@ async function environment(options, body) {
     } },
     window: {
       showInputBox: async () => Object.hasOwn(options, 'input') ? options.input : 'join-request',
-      showQuickPick: async items => options.disableDiscovery ? items.find(item => item.label === 'Disable repository discovery') : items[0],
+      showQuickPick: async items => {
+        calls.push({ choices: items.map(item => ({ label: item.label, detail: item.detail })) });
+        return options.cancelScope ? undefined : options.scopeChoice ? items.find(item => item.label === options.scopeChoice)
+          : options.disableDiscovery ? items.find(item => item.label === 'Disable repository discovery') : items[0];
+      },
       showWarningMessage: async (_message, _options, choice) => choice,
       createOutputChannel: () => ({ appendLine: value => logs.push(value), show() {}, dispose() {} }),
       showInformationMessage: async value => { logs.push(value); },
@@ -46,6 +50,8 @@ async function environment(options, body) {
   };
   class FakeManager {
     constructor(value) { this.options = value; this.enabled = !!options.sharing; }
+    async sharingScope() { return options.scope; }
+    async changeScope(backfill) { calls.push({ scopeChange: true, backfill }); }
     joinRequest() { return Promise.resolve('public-request'); }
     inspectRequest() { return Promise.resolve({ device: { fingerprint: 'a'.repeat(64) } }); }
     inspectInvitation() { return Promise.resolve({ space: 'space', host: { fingerprint: 'b'.repeat(64) } }); }
@@ -384,5 +390,36 @@ test('Stop while a join sign-in is pending prevents late attribution and connect
     await env.invoke('multiplayerStop');
     env.resolveAuth(); await joining;
     assert.ok(!env.calls.some(call => call.identified || call.join));
+  });
+});
+
+test('existing spaces offer keeping the actual scope and an explicit new cutoff', async () => {
+  const scope = { space: 'space', mode: 'all', active: true, revision: 1, cutoff_ms: null, legacy_excluded_records: 0 };
+  await environment({ scope }, async env => {
+    assert.equal((await env.invoke('multiplayerHost')).ok, true);
+    assert.ok(env.calls.some(call => call.host && call.backfill === 'keep'));
+    const choices = env.calls.find(call => call.choices).choices;
+    assert.equal(choices[0].label, 'Keep current sharing scope');
+    assert.match(choices[0].detail, /all retained history/);
+    assert.match(choices.find(item => item.label === 'Share records added from now on').detail, /Set a new cutoff/);
+  });
+  await environment({ scope, scopeChoice: 'Share records added from now on' }, async env => {
+    assert.equal((await env.invoke('multiplayerHost')).ok, true);
+    assert.ok(env.calls.some(call => call.host && call.backfill === false), 'explicit from-now must reach the manager even for an all-history space');
+  });
+});
+
+test('scope can be changed without repeating invitations, and cancellation preserves it', async () => {
+  const scope = { space: 'space', mode: 'all', active: true, revision: 1, cutoff_ms: null, legacy_excluded_records: 0 };
+  for (const [scopeChoice, expected] of [['Share records added from now on', false], ['Include existing history', true]]) {
+    await environment({ scope, scopeChoice }, async env => {
+      assert.equal((await env.invoke('multiplayerScope')).ok, true);
+      assert.deepEqual(env.calls.filter(call => call.scopeChange), [{ scopeChange: true, backfill: expected }]);
+      assert.ok(!env.calls.some(call => call.host || call.join || call.provider), 'scope selection does not ask for another device or account');
+    });
+  }
+  await environment({ scope, cancelScope: true }, async env => {
+    assert.equal((await env.invoke('multiplayerScope')).ok, true);
+    assert.ok(!env.calls.some(call => call.scopeChange));
   });
 });

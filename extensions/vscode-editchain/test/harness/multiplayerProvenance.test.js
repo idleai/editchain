@@ -18,6 +18,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { Duplex, PassThrough } = require('node:stream');
 const { MultiplayerManager } = require('../../out/multiplayer/manager');
+const { NativeWorker } = require('../../out/multiplayer/native');
 const { fixture, binaries, until, blobs, diffs } = require('./multiplayerFixture');
 
 // Fault-inject only the byte transport. Managers, TLS, native workers and the
@@ -128,7 +129,7 @@ async function open(local) {
   return { opened, rows: window.rows };
 }
 
-test('a peer-supplied copy of a withheld baseline cannot erase recorder state on a cold rebuild', { timeout: 90_000 }, async () => {
+for (const policy of ['legacy', 'cutoff']) test(`a peer-supplied copy of a withheld baseline cannot erase recorder state on a cold rebuild (${policy})`, { timeout: 90_000 }, async () => {
   const env = environment();
   const a = env.files.workspace('a'), b = env.files.workspace('b');
   try {
@@ -150,8 +151,12 @@ test('a peer-supplied copy of a withheld baseline cannot erase recorder state on
     await author.changed('baseline revised\n', 'private draft\n', 3);
 
     const host = env.create(a), guest = env.create(b);
-    const invitation = await host.hostHistory(await guest.joinRequest(), false);
+    // Exercise both the persisted legacy boundary and migration to an explicit cutoff.
+    const worker = new NativeWorker(binaries.peer);
+    try { await worker.request({ type: 'configure', chain_dir: a.chain, space: 'provenance-space', backfill: false }); }
+    finally { worker.stop(); }
     const withheld = ledger(a.chain).excluded.map(keyOf);
+    const invitation = await host.hostHistory(await guest.joinRequest(), policy === 'legacy' ? 'keep' : false);
     assert.ok(withheld.length > 0, 'sharing only new history must withhold the authored baseline');
     assert.equal(ledger(a.chain).received.length, 0, 'nothing has been supplied by the peer yet');
     await guest.joinHistory(invitation, true);
@@ -160,7 +165,7 @@ test('a peer-supplied copy of a withheld baseline cannot erase recorder state on
       const scope = ledger(a.chain);
       return live(host) === 1 && live(guest) === 1 && scope.received.length === baselineRecords
         && scope.received_blobs.length === copiedBlobs.length
-        && scope.received.length + scope.excluded.length === withheld.length;
+        && (policy === 'cutoff' || scope.received.length + scope.excluded.length === withheld.length);
     }, 'the peer never supplied the independently copied baseline');
 
     // Every record the peer held was delivered back as an exact receipt, while
@@ -168,7 +173,11 @@ test('a peer-supplied copy of a withheld baseline cannot erase recorder state on
     const scope = ledger(a.chain);
     assert.ok(scope.received.map(keyOf).every(key => withheld.includes(key)), 'every receipt must match withheld baseline evidence');
     assert.equal(scope.received.length, baselineRecords, 'the peer must supply its complete independently copied baseline');
-    assert.ok(scope.excluded.length > 0, 'the withheld local work must not be published by receiving a copy of it');
+    if (policy === 'legacy') assert.ok(scope.excluded.length > 0, 'the withheld local work must not be published by receiving a copy of it');
+    else {
+      assert.ok(scope.cutoff.first_segment > 0, 'the append cutoff remains in force after receipts');
+      assert.equal(host.status().peers[0].progress.outgoing.total_records, 0, 'independent receipts cannot re-export pre-cutoff work');
+    }
     assert.equal(scope.received_blobs.length, copiedBlobs.length, 'only peer-supplied content may become publishable');
     assert.deepEqual(blobs(b.chain), copiedBlobs, 'the exchange must not publish withheld local blobs to the peer');
     await env.stopSharing();

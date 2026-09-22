@@ -1,5 +1,6 @@
 import type { SharingStatus } from './manager';
 import { checking, checkPercent, describeCheck, describeDownload, missingContent } from './progress';
+import { describeScope } from './scope';
 
 /** Connection health stays visible while an authenticated peer checks history. */
 export function sharingLabel(value: SharingStatus): string {
@@ -29,6 +30,6 @@ export function sharingDetails(value: SharingStatus): string {
     const details = progress?.accepted && progress.incoming ? `\n${describeCheck('Receiving ↓', progress.incoming)}\n${describeCheck('Sending ↑ (peer confirmed)', progress.outgoing)}\n${describeDownload(progress)}` : '';
     return `${peer.fingerprint?.slice(0, 12) || 'Device'}: ${phase}${details}`;
   });
-  return [value.message, ...peers, 'Percentages measure history checks, including already present records. New edits enter the next pass.',
+  return [value.message, value.scope ? describeScope(value.scope) : '', ...peers, 'Percentages measure history checks, including already present records. New edits enter the next pass.',
     'Show Multiplayer Status for automatic transfer updates.'].filter(Boolean).join('\n');
 }

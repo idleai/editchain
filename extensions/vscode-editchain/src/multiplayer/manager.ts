@@ -2,12 +2,13 @@ import { randomUUID } from 'node:crypto';
 import { Duplex } from 'node:stream';
 import { NativeWorker, PeerBridge, PeerOptions, PeerProgress, PublicDevice, PEER_PROTOCOL } from './native';
 import { checking, missingContent } from './progress';
+import { ScopeChoice, SharingScope, validScope } from './scope';
 import { encodeInvitation, Invitation, JoinRequest, parseInvitation, parseRequest, savedInvitation } from './invitation';
 import { ClientTransport, HostLease, HostTransport, managementClient, RelayClient, RelayHost, RelayJournal, removeSavedRelay, validateLease } from './relay';
 import { ProbeError } from '../devTunnels/probe';
 import { advertisement, Advertisement } from './discovery';
 
-export type SharingStatus = { space?: string; enabled?: boolean; hosting: boolean; peers: { connection?: string; fingerprint?: string; state: string; progress?: PeerProgress }[]; message?: string };
+export type SharingStatus = { space?: string; scope?: SharingScope; enabled?: boolean; hosting: boolean; peers: { connection?: string; fingerprint?: string; state: string; progress?: PeerProgress }[]; message?: string };
 /** Contains bearer grants: store only in private application secret storage. */
 export type SavedSharing = { version: 1; space: string; host?: HostLease; peers: Invitation[] };
 export type RelayProvider = {
@@ -45,6 +46,8 @@ export class MultiplayerManager {
   private enabled = false;
   private message?: string;
   private saved = Promise.resolve();
+  private scope?: SharingScope;
+  private changingScope?: number;
 
   constructor(private readonly options: ManagerOptions) {
     this.space = options.space;
@@ -70,12 +73,14 @@ export class MultiplayerManager {
     return this.verifyInvitation(parseInvitation(text));
   }
 
-  async hostHistory(requestText: string, backfill: boolean): Promise<string> {
+  async hostHistory(requestText: string, backfill: ScopeChoice): Promise<string> {
     const generation = this.generation;
     const guest = (await this.inspectRequest(requestText)).device;
     const identity = await this.device();
     if (guest.fingerprint === identity.fingerprint) throw new ProbeError('Use a different VS Code profile or device for the joining replica.');
+    this.requireGeneration(generation);
     await this.configure(undefined, backfill);
+    this.requireGeneration(generation);
     await this.approve(guest);
     this.requireGeneration(generation);
     this.enabled = true;
@@ -88,10 +93,12 @@ export class MultiplayerManager {
       guest: guest.fingerprint, ...descriptor });
   }
 
-  async joinHistory(text: string, backfill: boolean): Promise<void> {
+  async joinHistory(text: string, backfill: ScopeChoice): Promise<void> {
     const generation = this.generation;
     const invitation = await this.inspectInvitation(text);
+    this.requireGeneration(generation);
     await this.configure(invitation.space, backfill);
+    this.requireGeneration(generation);
     await this.approve(invitation.host);
     this.requireGeneration(generation);
     this.enabled = true;
@@ -112,6 +119,7 @@ export class MultiplayerManager {
       throw new ProbeError('Saved sharing does not match this workspace.');
     }
     const approved = await this.devices();
+    if (this.scope?.active === false) throw new ProbeError('The sharing scope change was interrupted. Run Change Shared History Scope to select it again.');
     await this.device();
     const peers: Invitation[] = [];
     for (const value of input.peers) {
@@ -151,6 +159,19 @@ export class MultiplayerManager {
     if (!this.space) await this.recoverSpace();
     if (!this.space) return [];
     return this.control({ type: 'devices', chain_dir: this.options.chain, space: this.space });
+  }
+
+  /** Read the effective policy, including scopes saved by an earlier installation. */
+  async sharingScope(): Promise<SharingScope | undefined> {
+    await this.recoverSpace();
+    return this.scope;
+  }
+
+  /** An explicit selection creates a new boundary; resume never changes it. */
+  async changeScope(backfill: boolean): Promise<void> {
+    const generation = this.generation;
+    await this.recoverSpace();
+    await this.applyScope(this.requiredSpace(), backfill, generation);
   }
 
   /** A public endpoint description deliberately excludes the connect grant. */
@@ -206,7 +227,7 @@ export class MultiplayerManager {
 
   status(): SharingStatus {
     const edges = [...this.edges.entries()];
-    return { space: this.space, enabled: this.enabled, hosting: !!this.host, message: this.message,
+    return { space: this.space, scope: this.scope, enabled: this.enabled, hosting: !!this.host, message: this.message,
       peers: [ ...edges.map(([connection, edge]) => ({ connection, fingerprint: edge.device?.fingerprint ?? edge.clientKey,
         state: !edge.progress?.accepted ? 'Authenticating' : checking(edge.progress) ? 'Catching up'
           : missingContent(edge.progress) ? 'Waiting for content' : 'Live', progress: edge.progress })),
@@ -304,7 +325,7 @@ export class MultiplayerManager {
 
   private schedule(key: string, delay?: number): void {
     const peer = this.peers.get(key);
-    if (!this.enabled || !peer || peer.timer || this.hasEdge(key) || this.clients.has(key) || peer.state === 'Invitation expired') return;
+    if (!this.enabled || this.changingScope !== undefined || !peer || peer.timer || this.hasEdge(key) || this.clients.has(key) || peer.state === 'Invitation expired') return;
     peer.state = 'Waiting to reconnect';
     const generation = this.generation;
     const backoff = Math.min(30_000, 1000 * 2 ** Math.min(peer.attempts, 5));
@@ -372,22 +393,58 @@ export class MultiplayerManager {
   }
 
   private async recoverSpace(): Promise<string | undefined> {
-    const binding = await this.control<{ space: string | null }>({ type: 'scope', chain_dir: this.options.chain });
+    const binding = await this.control<{ space: string | null; scope: SharingScope | null }>({ type: 'scope', chain_dir: this.options.chain });
     if (binding.space) {
       if (this.space && this.space !== binding.space) throw new ProbeError('This workspace is already bound to a different collaboration space. Use a separate workspace replica.');
+      if (!binding.scope || !validScope(binding.scope) || binding.scope.space !== binding.space) throw new ProbeError('Native multiplayer scope reporting is outdated. Rebuild or reinstall EditChain.');
       this.space = binding.space;
+      this.scope = binding.scope;
       await this.options.saveSpace(this.space);
     }
     return binding.space ?? undefined;
   }
 
-  private async configure(space: string | undefined, backfill: boolean): Promise<void> {
+  private async configure(space: string | undefined, backfill: ScopeChoice): Promise<void> {
+    const generation = this.generation;
     const durable = await this.recoverSpace();
     space ??= durable ?? this.space ?? randomUUID();
     if (this.space && this.space !== space) throw new ProbeError('This workspace is already bound to a different collaboration space. Use a separate workspace replica.');
-    await this.control({ type: 'configure', chain_dir: this.options.chain, space, backfill });
-    this.space = space;
-    await this.options.saveSpace(space);
+    this.requireGeneration(generation);
+    if (backfill === 'keep') {
+      if (!durable || this.scope?.active === false) throw new ProbeError('Select a sharing scope before continuing.');
+      return;
+    }
+    await this.applyScope(space, backfill, generation);
+  }
+
+  private async applyScope(space: string, backfill: boolean, generation: number): Promise<void> {
+    this.requireGeneration(generation);
+    this.changingScope = generation;
+    for (const peer of this.peers.values()) { clearTimeout(peer.timer); peer.timer = undefined; }
+    for (const edge of [...this.edges.values()]) edge.bridge.stop();
+    this.message = 'Applying the outgoing history scope…'; this.publish();
+    try {
+      const scope = await this.control<SharingScope>({ type: 'set_scope', chain_dir: this.options.chain, space, backfill });
+      this.requireGeneration(generation);
+      if (!validScope(scope) || scope.space !== space || !scope.active) throw new ProbeError('Invalid native sharing scope. Rebuild or reinstall EditChain.');
+      this.scope = scope; this.space = space;
+      await this.options.saveSpace(space);
+      this.requireGeneration(generation);
+      this.message = this.enabled ? 'Sharing scope updated. Reconnecting approved devices.' : 'Sharing scope updated.';
+    } catch (error) {
+      if (generation === this.generation) {
+        this.scope = undefined;
+        await this.recoverSpace().catch(() => {});
+        this.message = 'Could not apply the sharing scope. Choose it again to retry.';
+      }
+      throw error;
+    } finally {
+      if (this.changingScope === generation) this.changingScope = undefined;
+      if (generation === this.generation) {
+        for (const key of this.peers.keys()) this.schedule(key, 0);
+        this.publish();
+      }
+    }
   }
 
   private async approve(device: PublicDevice): Promise<void> {
@@ -404,7 +461,7 @@ export class MultiplayerManager {
   }
 
   private attach(stream: Duplex, outbound: boolean, remote?: string, clientKey?: string, client?: ClientTransport): void {
-    if (this.edges.size >= 8) { stream.destroy(); return; }
+    if (this.changingScope !== undefined || this.edges.size >= 8) { stream.destroy(); return; }
     const key = randomUUID();
     const options: PeerOptions = { chain_dir: this.options.chain, device_dir: this.options.deviceDirectory, space: this.requiredSpace(), remote };
     const bridge = new PeerBridge(this.options.binary, stream, options, (progress, device, durableChange) => {

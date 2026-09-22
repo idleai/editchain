@@ -1,6 +1,7 @@
 import type { DiscoveryStatus } from './discovery';
 import type { SharingStatus } from './manager';
 import { checking, describeCheck, describeDownload, missingContent, workSignature } from './progress';
+import { describeScope } from './scope';
 
 type Status = SharingStatus & { discovery?: DiscoveryStatus };
 type Peer = SharingStatus['peers'][number];
@@ -85,7 +86,8 @@ export class MultiplayerStatusOutput {
     const value = this.value;
     const summary = [value.enabled ? `Sharing enabled; hosting: ${value.hosting ? 'yes' : 'no'}; ${value.peers.length} peer(s).` : 'Sharing stopped.',
       value.space ? `Space: ${value.space}.` : '', value.message,
-      value.discovery ? `Discovery: ${value.discovery.state}; ${value.discovery.candidates} candidate(s).` : ''].filter(Boolean).join(' ');
+      value.discovery ? `Discovery: ${value.discovery.state}; ${value.discovery.candidates} candidate(s).` : ''].filter(Boolean).join(' ')
+      + (value.scope ? `\n  ${describeScope(value.scope)}` : '');
     if (force || this.printed !== summary) { this.write(summary); this.printed = summary; }
     for (const observation of this.peers.values()) {
       const { peer } = observation, progress = peer.progress;

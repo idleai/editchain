@@ -85,11 +85,11 @@ test('durable space and private baseline survive lost workspace metadata and a m
     const host = env.create(a), guest = env.create(b), request = await guest.joinRequest();
     const first = parseInvitation(await host.hostHistory(request, false));
     const ledger = fs.readFileSync(path.join(a.chain, 'multiplayer/scope.json'));
-    assert.ok(JSON.parse(ledger).excluded.length > 0);
+    assert.ok(JSON.parse(ledger).cutoff.first_segment > 0);
     await host.suspend();
     env.spaces.delete(a.root);
     const restored = env.create(a);
-    const second = parseInvitation(await restored.hostHistory(request, false));
+    const second = parseInvitation(await restored.hostHistory(request, 'keep'));
     assert.equal(second.space, first.space);
     assert.deepEqual(fs.readFileSync(path.join(a.chain, 'multiplayer/scope.json')), ledger);
     const saved = env.saved.get(a.root);
@@ -231,4 +231,80 @@ test('discovery refreshes a known endpoint without admitting unknown devices or 
     await until(() => live(guest) === 1 && env.wire.endpoint().hostId === 'fresh-host-instance', 'known endpoint did not refresh');
     assert.equal(env.wire.endpoint().tunnelId, ad.endpoint.tunnelId);
   } finally { await env.stop(); }
+});
+
+test('explicit from-now replaces an all-history scope and changes survive reconnect and restart', { timeout: 60_000 }, async () => {
+  const env = environment();
+  const sees = async (local, text) => {
+    try { return (await diffs(local)).some(diff => diff.after === text); }
+    catch (error) {
+      // A receipt may replace the service snapshot between Open and GetWindow.
+      if (error.message === 'Native history fixture: stale_snapshot') return false;
+      throw error;
+    }
+  };
+  try {
+    const a = env.files.workspace('a'), b = env.files.workspace('b');
+    await a.start(); await b.start();
+    await a.edit('old before\n', 'old private result\n');
+    const host = env.create(a), guest = env.create(b), request = await guest.joinRequest();
+    await host.hostHistory(request, true);
+    assert.equal(host.status().scope.mode, 'all');
+    const invitation = await host.hostHistory(request, false);
+    const firstCutoff = host.status().scope;
+    assert.equal(firstCutoff.mode, 'from_now');
+    assert.equal(firstCutoff.active, true);
+    await guest.joinHistory(invitation, false);
+    await until(() => live(host) === 1 && live(guest) === 1, 'new cutoff did not connect');
+    assert.equal(host.status().peers[0].progress.outgoing.total_records, 0, 'all prior records must be excluded from the inventory total');
+    assert.deepEqual(await diffs(b), [], 'pre-cutoff edits must not arrive');
+    await a.edit('new before\n', 'new shared result\n');
+    await until(() => sees(b, 'new shared result\n'), 'post-cutoff edit did not arrive');
+    await host.changeScope(true);
+    assert.equal(host.status().scope.mode, 'all');
+    await until(() => sees(b, 'old private result\n'), 'including history did not backfill the earlier edit');
+    await host.changeScope(false);
+    const secondCutoff = host.status().scope;
+    assert.ok(secondCutoff.revision > firstCutoff.revision);
+    // Changing during backfill can leave already received old rows missing content.
+    // The host's new outgoing boundary must hold even while the guest still offers
+    // those older receipts in the other direction.
+    await until(() => host.status().peers.some(peer => peer.progress?.accepted && peer.progress.outgoing.complete
+      && peer.progress.outgoing.total_records === 0), 'replacement cutoff did not exclude the old inventory');
+    assert.equal(host.status().peers[0].progress.outgoing.total_records, 0, 'an earlier receipt cannot undo the replacement cutoff');
+    await until(() => sees(b, 'old private result\n'), 'changing scope must not remove previously received copies');
+    await guest.changeScope(false);
+    await until(() => live(host) === 1 && live(guest) === 1, 'both new cutoffs did not finish checking');
+    assert.equal(guest.status().peers[0].progress.outgoing.total_records, 0, 'each device independently limits its outgoing history');
+    const saved = env.saved.get(a.root);
+    await host.suspend();
+    await a.edit('offline before\n', 'offline after cutoff\n');
+    const restored = env.create(a);
+    await restored.resume(saved);
+    assert.deepEqual(restored.status().scope, secondCutoff, 'resume preserves the actual cutoff rather than resetting it to now');
+    assert.equal((await restored.devices()).length, 1, 'approvals persist across scope changes');
+    await until(() => sees(b, 'offline after cutoff\n'), 'offline post-cutoff work was lost on restart');
+  } finally { await env.stop(); }
+});
+
+test('Stop during device verification cannot establish a later history cutoff', async () => {
+  const env = environment();
+  let release;
+  try {
+    const a = env.files.workspace('a'), b = env.files.workspace('b');
+    await a.start();
+    const host = env.create(a), guest = env.create(b);
+    const control = host.control.bind(host);
+    host.control = async request => {
+      if (request.type === 'verify') await new Promise(resolve => { release = resolve; });
+      return control(request);
+    };
+    const stopped = assert.rejects(host.hostHistory(await guest.joinRequest(), false), /Sharing was stopped/);
+    await until(() => !!release, 'device verification did not start');
+    await host.stop();
+    release();
+    await stopped;
+    assert.equal(fs.existsSync(path.join(a.chain, 'multiplayer/scope.json')), false, 'a cancelled command must not silently select a cutoff');
+    assert.equal(host.status().enabled, false);
+  } finally { release?.(); await env.stop(); }
 });
