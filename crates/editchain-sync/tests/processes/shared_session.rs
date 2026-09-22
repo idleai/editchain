@@ -86,6 +86,15 @@ fn pending_rows(rows: &[Value], count: usize, previous: Option<&Value>) -> io::R
 
 #[test]
 fn ongoing_codex_session_crosses_cutoff_and_updates_the_peer_view_live() -> io::Result<()> {
+    shared_session(2)
+}
+
+#[test]
+fn revised_item_crosses_a_fresh_cutoff_without_its_private_incarnation() -> io::Result<()> {
+    shared_session(1)
+}
+
+fn shared_session(shared_incarnation: u64) -> io::Result<()> {
     let dir = tempfile::tempdir()?;
     let ar = dir.path().join("sender/.editchain");
     let workspace = dir.path().join("receiver");
@@ -100,6 +109,12 @@ fn ongoing_codex_session_crosses_cutoff_and_updates_the_peer_view_live() -> io::
     for (worker, root, identity) in [(&mut a, &ar, &bi), (&mut b, &br, &ai)] {
         let _scope = worker.ok(&json!({"type":"set_scope", "chain_dir":root, "space":"process-space", "backfill":false}))?;
         let _approved = worker.ok(&json!({"type":"approve", "chain_dir":root, "space":"process-space", "certificate":identity.get("certificate")}))?;
+    }
+    // Change an already configured scope without replacing device approvals.
+    if shared_incarnation == 1 {
+        let _scope = a.ok(
+            &json!({"type":"set_scope", "chain_dir":ar, "space":"process-space", "backfill":false}),
+        )?;
     }
     let mut server = Server::new();
     let open_request =
@@ -120,9 +135,9 @@ fn ongoing_codex_session_crosses_cutoff_and_updates_the_peer_view_live() -> io::
     let mut revision = json!(0);
     let mut identity = None;
     for (ordinal, incarnation, text, count) in [
-        (2, 2, "shared session is visible", 1),
+        (2, shared_incarnation, "shared session is visible", 1),
         (3, 3, "another received item stays visible", 2),
-        (4, 2, "shared session updated live", 2),
+        (4, shared_incarnation, "shared session updated live", 2),
     ] {
         // Raw records, outputs and proofs can arrive in separate rounds.
         // Keep the previous verified view until this occurrence is complete.
@@ -133,7 +148,7 @@ fn ongoing_codex_session_crosses_cutoff_and_updates_the_peer_view_live() -> io::
         fixture::append(&ar, std::slice::from_ref(preview))?;
         poll(&mut a, &mut b)?;
         let preview_rows = sync_rows(&mut server, &opened, &mut revision)?;
-        let before = count - usize::from(ordinal == incarnation);
+        let before = count - usize::from(ordinal < 4);
         pending_rows(&preview_rows, before, identity.as_ref())?;
         if ordinal == 2 {
             server = Server::new();
@@ -175,7 +190,7 @@ fn ongoing_codex_session_crosses_cutoff_and_updates_the_peer_view_live() -> io::
             field(row, "group")? == "session:73",
             "the original session groups received work",
         )?;
-        if incarnation == 2 {
+        if incarnation == shared_incarnation {
             if let Some(previous) = &identity {
                 require(
                     previous == field(row, "continuity_key")?,

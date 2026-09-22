@@ -153,6 +153,7 @@ impl LiveWorkspace {
             let human_streams = saved.version < 8;
             let partial_items = saved.version < 9;
             let pending_imports = saved.version < 10;
+            let cutoff_items = saved.version < 11;
             workspace.adopt(saved, true)?;
             if regroup {
                 workspace.regroup();
@@ -175,7 +176,16 @@ impl LiveWorkspace {
             if pending_imports {
                 workspace.remove_pending_imports()?;
             }
-            if disclosure || edit_rows || human_streams || partial_items || pending_imports {
+            if cutoff_items {
+                workspace.restore_codex_items()?;
+            }
+            if disclosure
+                || edit_rows
+                || human_streams
+                || partial_items
+                || pending_imports
+                || cutoff_items
+            {
                 // Publish the new version only after every migration completed.
                 workspace.checkpoint()?;
             }

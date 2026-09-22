@@ -4626,3 +4626,48 @@ fn legacy_sources_backfill_provider_evidence_once_without_replaying_content() {
     assert_eq!(unchanged.report.files_processed, 0);
     assert!(unchanged.ops.ops.is_empty());
 }
+
+#[test]
+fn post_cutoff_revision_of_an_existing_item_is_visible() {
+    let dir = tempfile::tempdir().unwrap();
+    let records = derivation_records();
+    let imported = import_projection_prefix(
+        &dir,
+        &records[..3],
+        &ImportOptions::default(),
+        &mut MemoryCursorStore::new(),
+    );
+    let ops = canonical_revisions(&imported.ops.ops);
+    let mut author = editchain_project::live::LiveProjection::default();
+    let local = author.apply(ops.clone(), &[]);
+    assert_eq!(
+        local
+            .upserts
+            .keys()
+            .filter(|key| key.starts_with("item:"))
+            .count(),
+        1
+    );
+    let post_cutoff: Vec<_> = ops
+        .into_iter()
+        .filter(|op| {
+            let source = if is_provider_evidence(op) {
+                *op.parents.iter().next().unwrap()
+            } else {
+                op.id
+            };
+            source.seq >> 16 == 3
+        })
+        .collect();
+    assert_eq!(
+        post_cutoff
+            .iter()
+            .filter(|op| matches!(op.kind, OpKind::Message(_)))
+            .count(),
+        1
+    );
+    let mut recipient = editchain_project::live::LiveProjection::default();
+    let remote = recipient.apply(post_cutoff, &[]);
+    assert_eq!(remote.upserts.keys().filter(|key| key.starts_with("item:")).count(), 1,
+        "a complete new revision must display even when the item's first occurrence is before the sharing cutoff");
+}

@@ -315,6 +315,22 @@ impl LiveProjection {
         changes
     }
 
+    /// Revalidate retained Codex occurrences once when upgrading presentation rules.
+    /// This reads accepted records only; it cannot recover excluded history.
+    pub fn refresh_codex_items(&mut self) -> LiveChanges {
+        let imports = self
+            .facts
+            .keys()
+            .filter_map(|id| self.ops.get(id).cloned())
+            .collect();
+        let mut changes = self.apply_shared(imports, &[]);
+        let items: Vec<_> = self.items.keys().cloned().collect();
+        for item in items {
+            self.publish_item(&item, &mut changes);
+        }
+        changes
+    }
+
     fn current(&self, key: &Item) -> Option<&CodexLogicalItem> {
         if !self.coverage.get(&key.0 .0).is_some_and(Coverage::complete) {
             return None;

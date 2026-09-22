@@ -200,3 +200,85 @@ fn a_complete_claude_derivation_also_releases_received_imports() {
         .iter()
         .any(|row| row.summary == "received Claude item"));
 }
+
+#[test]
+fn partial_revisions_keep_validating_item_identity_and_complete_outputs() {
+    use editchain_core::{
+        provider::{CodexLogicalChange, ProviderEvidence, ProviderFact},
+        Payload,
+    };
+    let valid = codex::occurrence(3, 1, "new revision of an excluded item").unwrap();
+    let source = valid.first().unwrap().id;
+    let incarnation = OpId {
+        seq: 1 << 16,
+        ..source
+    };
+    for invalid in [
+        OpId {
+            seq: 0,
+            ..incarnation
+        },
+        OpId {
+            seq: (1 << 16) + 1,
+            ..incarnation
+        },
+        OpId {
+            seq: 4 << 16,
+            ..incarnation
+        },
+        OpId {
+            node: NodeId(999),
+            ..incarnation
+        },
+        OpId {
+            boot: 1,
+            ..incarnation
+        },
+    ] {
+        let mut ops = valid.clone();
+        if let OpKind::Note(note) = &mut ops.last_mut().unwrap().kind {
+            if let Payload::Inline(bytes) = &mut note.content {
+                let mut proof: ProviderEvidence = serde_json::from_slice(bytes).unwrap();
+                if let ProviderFact::CodexDerivation(meta) = &mut proof.fact {
+                    for change in &mut meta.changes {
+                        if let CodexLogicalChange::Upsert { incarnation, .. } = change {
+                            *incarnation = invalid;
+                        }
+                    }
+                }
+                *bytes = serde_json::to_vec(&proof).unwrap();
+            }
+        }
+        let mut live = LiveProjection::default();
+        drop(live.apply(ops, &[]));
+        assert!(
+            !live.import_ready(source),
+            "reject malformed incarnation {invalid}"
+        );
+    }
+    let mut live = LiveProjection::default();
+    drop(live.apply(valid.clone(), &[]));
+    assert!(
+        live.import_ready(source),
+        "a missing earlier raw record is allowed"
+    );
+    let output = valid
+        .iter()
+        .find(|op| matches!(op.kind, OpKind::Message(_)))
+        .unwrap();
+    let mut contradictory = output.clone();
+    contradictory.id = incarnation;
+    contradictory.parents = editchain_core::ParentSet::None;
+    drop(live.apply(vec![contradictory], &[]));
+    assert!(
+        !live.import_ready(source),
+        "an existing non-Import incarnation is invalid"
+    );
+    drop(live.apply(Vec::new(), &[incarnation]));
+    assert!(live.import_ready(source));
+    drop(live.apply(Vec::new(), &[output.id]));
+    assert!(
+        !live.import_ready(source),
+        "missing current output still blocks the revision"
+    );
+}

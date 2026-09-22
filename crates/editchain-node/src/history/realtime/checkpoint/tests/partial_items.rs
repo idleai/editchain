@@ -9,10 +9,19 @@ mod codex {
 
 #[test]
 fn version_eight_reveals_received_session_items_without_reimport_or_backfill() {
+    reveals_cached_item(8, 2);
+}
+
+#[test]
+fn version_ten_reveals_items_whose_incarnations_were_excluded() {
+    reveals_cached_item(10, 1);
+}
+
+fn reveals_cached_item(version: u64, incarnation: u64) {
     let root = tempfile::tempdir().unwrap();
     codex::append(
         &root.path().join(".editchain"),
-        &codex::occurrence(2, 2, "received after cutoff").unwrap(),
+        &codex::occurrence(2, incarnation, "received after cutoff").unwrap(),
     )
     .unwrap();
     let canonical = human_edits::canonical(root.path());
@@ -37,7 +46,7 @@ fn version_eight_reveals_received_session_items_without_reimport_or_backfill() {
     );
     workspace.rows.flush().unwrap();
     let mut saved = workspace.saved();
-    saved.version = 8;
+    saved.version = version;
     drop(
         workspace
             .checkpoint_store
