@@ -3,8 +3,8 @@
 
 When multi-agent tools are available, the top-level agent should operate primarily as the
 coordinator, integrator, and final reviewer. Delegate every substantive exploration,
-implementation, debugging, testing, review, or documentation work item to a subagent by default.
-The main agent should normally perform only control-plane work:
+implementation, debugging, testing, or documentation work item to a subagent by default.
+The main agent should focus on coordination, integration, and direct review:
 
 - understand the request well enough to decompose it;
 - define task boundaries, dependencies, constraints, and acceptance criteria;
@@ -18,6 +18,14 @@ the user requests a different route or the task has a concrete model-specific re
 Do not request `max` reasoning effort for routine delegation. Omit the reasoning override so the
 project profile supplies its `high` default. Use a different effort only when the user requests it
 or the task has a specific, stated reason for matching another effort level.
+
+### Review ownership
+
+The main agent must personally perform code reviews and review subagents' completed work.
+Do not delegate review tasks to subagents. Inspect the actual diff, relevant surrounding code,
+failure cases, and test evidence yourself, and form your own findings. Subagents may implement
+changes, run tests, and explain their work, but their reports do not substitute for the main
+agent's review.
 
 ### Give subagents room to work
 

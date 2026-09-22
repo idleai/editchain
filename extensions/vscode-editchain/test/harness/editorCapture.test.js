@@ -2,7 +2,13 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('node:module');
+const fs = require('node:fs/promises');
+const os = require('node:os');
+const path = require('node:path');
 const { MAX_EDITOR_BUFFER_BYTES } = require('../../out/editorLimits');
+const { HistoryArchive, archiveFileName } = require('../../out/historyArchive');
+// A junction needs no symlink privilege on Windows; 'dir' is the POSIX default.
+const linkDirectory = (target, link) => fs.symlink(target, link, process.platform === 'win32' ? 'junction' : 'dir');
 
 function harness(dwell = 2000, identity, options = {}) {
   let now = 0;
@@ -17,7 +23,8 @@ function harness(dwell = 2000, identity, options = {}) {
   const events = [];
   const signals = {};
   const on = name => listener => { signals[name] = listener; return { dispose() { delete signals[name]; } }; };
-  const uri = { scheme: 'file', fsPath: '/workspace/a.ts', toString: () => 'file:///workspace/a.ts' };
+  const filePath = options.filePath ?? '/workspace/a.ts';
+  const uri = { scheme: 'file', fsPath: filePath, toString: () => `file://${filePath}` };
   const document = { uri, version: 1, isUntitled: false, text: options.text ?? 'one\ntwo\nthree\nfour\nfive\n', getText() { return this.text; },
     offsetAt(position) { return this.text.split('\n').slice(0, position.line).reduce((size, line) => size + line.length + 1, 0) + position.character; } };
   const range = (start, end) => ({ start: { line: start, character: 0 }, end: { line: end, character: 0 } });
@@ -55,7 +62,7 @@ function harness(dwell = 2000, identity, options = {}) {
   let capture;
   try {
     const { EditorCapture } = require(filename);
-    capture = new EditorCapture({ uri: { fsPath: '/workspace' }, index: 0 }, dwell, options.maxBytes ?? MAX_EDITOR_BUFFER_BYTES, event => { events.push(event); return true; }, identity, options.userName, options.excluded);
+    capture = new EditorCapture({ uri: { fsPath: options.workspace ?? '/workspace' }, index: 0 }, dwell, options.maxBytes ?? MAX_EDITOR_BUFFER_BYTES, event => { events.push(event); return true; }, identity, options.userName, options.excluded);
   } finally { Module._load = original; }
   const tick = ms => {
     const until = now + ms;
@@ -712,4 +719,48 @@ test('an excluded archive output file is never captured', () => {
   try {
     assert.equal(included.events.filter(event => event.event.type === 'document_snapshot').length, 1);
   } finally { included.capture.dispose(); }
+});
+
+test('a symlinked archive is excluded at the real path VS Code reports', async () => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), 'editchain-capture-link-'));
+  const workspace = path.join(base, 'workspace');
+  const physical = path.join(workspace, 'archives');
+  const alias = path.join(base, 'alias');
+  await fs.mkdir(physical, { recursive: true });
+  await linkDirectory(physical, alias);
+  const reports = [];
+  const archive = new HistoryArchive({ directory: alias, log: () => {},
+    report: message => reports.push(message) });
+  try {
+    await archive.setup();
+    archive.append(workspace, { schema: 1, session: '11111111-1111-4111-8111-111111111111', sequence: 1,
+      time_ms: 1700000000000, event: { type: 'tracking_started', dwell_ms: 2000, vscode_version: '1.85.0' } });
+    await archive.stop();
+    assert.deepEqual(reports, []);
+    const file = await fs.realpath(archive.location);
+    const self = harness(2000, undefined, { text: await fs.readFile(file, 'utf8'), filePath: file,
+      workspace, excluded: candidate => archive.excludes(candidate) });
+    try {
+      self.signals.open(self.document);
+      type(self, 'human', true);
+      assert.equal(self.events.filter(event => event.event.type === 'document_snapshot').length, 0,
+        'the archive never records its own JSONL content');
+      assert.equal(self.events.filter(event => event.event.type === 'document_changed').length, 0);
+    } finally { self.capture.dispose(); }
+    const ordinary = harness(2000, undefined, { text: 'notes\n', filePath: path.join(physical, 'notes.txt'),
+      workspace, excluded: candidate => archive.excludes(candidate) });
+    try {
+      assert.equal(ordinary.events.filter(event => event.event.type === 'document_snapshot').length, 1,
+        'an ordinary file in the archive directory is still captured');
+    } finally { ordinary.capture.dispose(); }
+    const other = path.join(workspace, 'other');
+    await fs.mkdir(other, { recursive: true });
+    const unrelated = harness(2000, undefined, { text: 'notes\n',
+      filePath: path.join(other, archiveFileName('2026-09-22', 1)), workspace,
+      excluded: candidate => archive.excludes(candidate) });
+    try {
+      assert.equal(unrelated.events.filter(event => event.event.type === 'document_snapshot').length, 1,
+        'an archive-shaped name outside the archive directory is still captured');
+    } finally { unrelated.capture.dispose(); }
+  } finally { await archive.stop(); await fs.rm(base, { recursive: true, force: true }); }
 });

@@ -6,6 +6,8 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const { archiveDay, archiveFileName } = require('../../out/historyArchive');
+// A junction needs no symlink privilege on Windows; 'dir' is the POSIX default.
+const linkDirectory = (target, link) => fs.symlink(target, link, process.platform === 'win32' ? 'junction' : 'dir');
 
 async function harness(initial = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'editchain-human-host-'));
@@ -313,6 +315,8 @@ test('a failed archive destination is retained instead of rotated', async () => 
       await new Promise(resolve => setTimeout(resolve, 5));
     }
     assert.equal(stopped(), 1);
+    assert.equal(env.captures.at(-1).excluded(path.join(directory, archiveFileName(archiveDay(new Date()), 1))), true,
+      'a failed destination stays excluded from capture');
     await env.configuration.update('tracking.jsonl.enabled', false);
     await host.lifecycle;
     await env.configuration.update('tracking.jsonl.enabled', true);
@@ -341,6 +345,27 @@ test('every archive destination used by the activation stays excluded from captu
     assert.equal(excluded(path.join(first, name)), true, 'returning to an earlier destination cannot re-record its file');
     assert.equal(excluded(path.join(second, name)), true);
     assert.equal(excluded(path.join(first, 'notes.txt')), false);
+  } finally { await host.stop(); await env.cleanup(); }
+});
+
+test('a symlinked archive destination is excluded at its physical path', async () => {
+  const env = await harness();
+  const host = env.create();
+  const workspace = path.join(env.directory, 'workspace');
+  const physical = path.join(workspace, 'archives');
+  const alias = path.join(env.directory, 'alias');
+  try {
+    await host.lifecycle;
+    await fs.mkdir(physical, { recursive: true });
+    await linkDirectory(physical, alias);
+    await env.configuration.update('tracking.jsonl.enabled', true);
+    await env.configuration.update('tracking.jsonl.directory', alias);
+    await host.lifecycle;
+    const excluded = env.captures.at(-1).excluded;
+    const name = archiveFileName(archiveDay(new Date()), 1);
+    assert.equal(excluded(path.join(alias, name)), true, 'the configured alias');
+    assert.equal(excluded(path.join(physical, name)), true, 'the real path VS Code observes');
+    assert.equal(excluded(path.join(workspace, 'notes.txt')), false, 'ordinary files still capture');
   } finally { await host.stop(); await env.cleanup(); }
 });
 

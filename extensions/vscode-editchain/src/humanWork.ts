@@ -256,6 +256,9 @@ export class HumanWorkHost {
     }
     const archive = new HistoryArchive({ directory: resolved.directory,
       log: line => this.log.appendLine(line), report: message => this.reportArchive(message) });
+    // Exclusions must be physical-directory aware before EditorCapture takes
+    // its first baseline, so canonicalization completes here, not on a write.
+    await archive.setup();
     this.archives.set(resolved.directory, archive);
     this.archive = archive;
     this.log.appendLine(`[capture] Human history archive: ${resolved.directory}`);

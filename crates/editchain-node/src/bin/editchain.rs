@@ -13,7 +13,6 @@ use editchain_store as _;
 use serde as _;
 use serde_json as _;
 use tantivy as _;
-#[cfg(test)]
 use tempfile as _;
 
 use editchain_node::commands::Cli;

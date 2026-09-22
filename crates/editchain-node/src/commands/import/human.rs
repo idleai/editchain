@@ -14,15 +14,20 @@
 //! observations are preserved, and re-importing an unchanged archive is an
 //! exact, idempotent replay.
 //!
-//! Each archive is preflighted and then replayed over the same captured byte
-//! prefix: its exact length at discovery bounds both reads. An archive that is
-//! still being appended to therefore cannot inject unvalidated tail records,
-//! cannot be followed indefinitely, and a prefix that ends mid-record is
-//! rejected with a clear error instead of being parsed. Preflight validates the
-//! prefix in line order — envelope format and schema, per-event canonical
-//! validity, per-session sequence continuity, and stable identity within a
-//! recorder incarnation — before any operation is written, so a malformed,
-//! truncated, or incomplete prefix never produces a partial chain.
+//! Each archive's discovered byte prefix is first copied into a private,
+//! read-only disk snapshot, and preflight and replay both read that snapshot —
+//! never the original pathname. Rewriting, replacing, or deleting the original
+//! between the two passes therefore cannot change which bytes are validated or
+//! replayed, an archive that is still being appended to cannot inject
+//! unvalidated tail records and cannot be followed indefinitely, and a prefix
+//! that ends mid-record is rejected with a clear error instead of being parsed.
+//! Preflight validates the prefix in line order — envelope format and schema,
+//! per-event canonical validity, per-session sequence continuity, and stable
+//! identity within a recorder incarnation — before any operation is written, so
+//! a malformed, truncated, or incomplete prefix never produces a partial chain.
+//! Preflight also freezes the workspace decision for every record, and replay
+//! admits exactly the records preflight selected and validated, so retargeting a
+//! recorded workspace symlink between the passes cannot promote a skipped record.
 //!
 //! Cross-record admission checks that need the chain itself (an identity that
 //! conflicts with already-retained content, for example) still run during the
@@ -37,16 +42,19 @@
 //! history for several workspaces. Matching canonicalizes both paths when they
 //! exist and otherwise compares them lexically, so a workspace that was moved
 //! to a different absolute path no longer matches: rebuild from the original
-//! path, or record again from the new location. The destination chain is
-//! selected solely by `--chain` (relative paths resolve against the current
-//! directory, like the Claude and Codex providers).
+//! path, or record again from the new location. That decision is made once
+//! during preflight and reused for replay, so retargeting a recorded symlink
+//! after preflight cannot change which records are admitted. The destination
+//! chain is selected solely by `--chain` (relative paths resolve against the
+//! current directory, like the Claude and Codex providers).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use editchain_core::human::HumanIdentity;
+use editchain_import::cancellation::ImportCancellation;
 use editchain_import::ImportOptions;
 use editchain_protocol::editor::{EditorEvent, RecordEditorEvents};
 use editchain_protocol::RequestBody;
@@ -69,6 +77,8 @@ const MAX_BATCH_BYTES: usize = 32 * 1024 * 1024;
 const MAX_REPORTED_WORKSPACES: usize = 5;
 /// Largest single JSONL record accepted; one event plus its envelope.
 const MAX_LINE_BYTES: usize = editchain_protocol::MAX_REQUEST_FRAME_BYTES;
+/// Streaming buffer size used when copying one archive snapshot.
+const SNAPSHOT_COPY_BYTES: usize = 64 * 1024;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -96,6 +106,13 @@ struct ArchivePlan {
     sessions: BTreeSet<String>,
     /// Bounded sample of recorded workspaces that did not match.
     foreign: Vec<String>,
+}
+
+impl ArchivePlan {
+    /// Non-blank records preflight read, selected or skipped.
+    fn record_count(&self) -> u64 {
+        self.records.saturating_add(self.skipped)
+    }
 }
 
 /// One parsed archive record plus the exact source bytes it occupied.
@@ -145,13 +162,146 @@ impl BatchBounds {
     }
 }
 
-/// One archive file plus the captured byte prefix both phases may read.
+/// One archive replay request: canonical batch bounds plus the exact record
+/// count preflight read, used to validate the frozen selection stream.
+#[derive(Debug, Clone, Copy)]
+struct ReplayRequest {
+    /// Canonical admission batch bounds.
+    bounds: BatchBounds,
+    /// Non-blank records preflight read from the snapshot.
+    records: u64,
+}
+
+/// One discovered archive path plus the file length observed at discovery.
 #[derive(Debug, Clone)]
-struct ArchiveSource {
-    /// Archive path.
+struct ArchiveFile {
+    /// Archive path, retained so every error names the source the user gave.
     path: PathBuf,
-    /// File length captured at discovery; bounds preflight and replay alike.
+    /// File length captured at discovery; bounds the snapshot copy.
     prefix_len: u64,
+}
+
+/// A private, read-only copy of one archive's discovered byte prefix.
+///
+/// Both preflight and replay read this snapshot, never the original pathname,
+/// so the exact bytes that were validated are the exact bytes that are
+/// replayed even if the original is rewritten, replaced, or deleted. The
+/// snapshot owns a private temporary directory, so dropping it removes the copy.
+#[derive(Debug)]
+struct ArchiveSnapshot {
+    /// Owns the private directory; dropping it deletes the snapshot.
+    _directory: tempfile::TempDir,
+    /// Snapshot path; read by preflight and replay alike.
+    path: PathBuf,
+    /// Preflight's byte-per-record workspace decision, read by replay.
+    selection: PathBuf,
+    /// Number of source bytes captured from the start of the archive.
+    len: u64,
+}
+
+impl ArchiveSnapshot {
+    /// Snapshot path for readers.
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Path of the preflight selection file for this snapshot.
+    fn selection_path(&self) -> &Path {
+        &self.selection
+    }
+
+    /// Exact captured prefix length.
+    const fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+/// One archive file plus the immutable snapshot both phases may read.
+#[derive(Debug)]
+struct ArchiveSource {
+    /// Original path, retained so every error names the user-supplied source.
+    path: PathBuf,
+    /// Immutable private copy of exactly the discovered byte prefix.
+    snapshot: ArchiveSnapshot,
+}
+
+impl ArchiveSource {
+    /// Copy exactly the discovered prefix into a private read-only snapshot.
+    ///
+    /// Cancellation is polled while copying so a large archive stays
+    /// interruptible, and a source that shrank below its discovered length is
+    /// rejected rather than silently truncated.
+    fn capture(file: &ArchiveFile, cancellation: &ImportCancellation) -> Result<Self> {
+        let path = file.path.as_path();
+        cancellation.check(path)?;
+        let mut source = File::open(path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot open human history archive {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        let directory = tempfile::Builder::new()
+            .prefix("editchain-human-")
+            .tempdir()?;
+        let captured_path = directory.path().join("archive.jsonl");
+        let selection_path = directory.path().join("selection.bin");
+        let mut captured = File::create(&captured_path)?;
+        let copied = copy_prefix(
+            (&mut source).take(file.prefix_len),
+            &mut captured,
+            path,
+            cancellation,
+        )?;
+        if copied != file.prefix_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "human history archive {} shrank below its captured length while snapshotting",
+                    path.display()
+                ),
+            )
+            .into());
+        }
+        let mut permissions = captured.metadata()?.permissions();
+        permissions.set_readonly(true);
+        captured.set_permissions(permissions)?;
+        Ok(Self {
+            path: file.path.clone(),
+            snapshot: ArchiveSnapshot {
+                _directory: directory,
+                path: captured_path,
+                selection: selection_path,
+                len: file.prefix_len,
+            },
+        })
+    }
+}
+
+/// Copy a bounded source prefix, polling cancellation for every chunk.
+fn copy_prefix(
+    mut source: impl Read,
+    target: &mut impl Write,
+    path: &Path,
+    cancellation: &ImportCancellation,
+) -> Result<u64> {
+    let mut buffer = vec![0_u8; SNAPSHOT_COPY_BYTES].into_boxed_slice();
+    let mut copied = 0_u64;
+    loop {
+        cancellation.check(path)?;
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(copied);
+        }
+        if let Some(bytes) = buffer.get(..count) {
+            target.write_all(bytes)?;
+        }
+        copied = copied
+            .checked_add(u64::try_from(count)?)
+            .ok_or_else(|| io::Error::other("archive snapshot length exhausted"))?;
+    }
 }
 
 /// Cross-record state for one recorder incarnation within one archive.
@@ -216,9 +366,17 @@ pub(super) fn run(
         return Err("--provider human requires --sessions-dir <jsonl file or directory>".into());
     }
     let source = Path::new(sessions_dir);
-    let archives = discover_archives(source)?;
-    if archives.is_empty() {
+    let files = discover_archives(source)?;
+    if files.is_empty() {
         return Err(format!("no .jsonl human history archives in {}", source.display()).into());
+    }
+    // Snapshot every source before validating or writing anything: preflight
+    // and replay must read identical immutable bytes even if the originals are
+    // rewritten, replaced, or deleted in between.
+    let mut archives = Vec::with_capacity(files.len());
+    for file in &files {
+        options.cancellation.check(&file.path)?;
+        archives.push(ArchiveSource::capture(file, &options.cancellation)?);
     }
     // Validate every captured prefix before writing anything: a broken source
     // never yields a partial chain.
@@ -226,9 +384,12 @@ pub(super) fn run(
         files: u64::try_from(archives.len())?,
         ..Plan::default()
     };
+    let mut expected = Vec::with_capacity(archives.len());
     for archive in &archives {
         options.cancellation.check(&archive.path)?;
-        plan.merge(plan_archive(archive, workspace, options)?);
+        let archive_plan = plan_archive(archive, workspace, options)?;
+        expected.push(archive_plan.record_count());
+        plan.merge(archive_plan);
     }
     if plan.records == 0 {
         let sample = if plan.foreign.is_empty() {
@@ -247,14 +408,17 @@ pub(super) fn run(
         return Ok(());
     }
     let chain_root = resolve_chain_root(chain)?;
-    for archive in &archives {
+    for (archive, records) in archives.iter().zip(&expected) {
         options.cancellation.check(&archive.path)?;
         let outcome = import_archive(
             archive,
             workspace,
             &chain_root,
             options,
-            BatchBounds::default(),
+            ReplayRequest {
+                bounds: BatchBounds::default(),
+                records: *records,
+            },
         )?;
         plan.written = plan.written.saturating_add(outcome.written);
         plan.replayed = plan.replayed.saturating_add(outcome.replayed);
@@ -329,7 +493,7 @@ fn resolve_chain_root(chain: &str) -> Result<PathBuf> {
 /// file, ordered by date prefix and then by the session counter compared
 /// numerically, so an unpadded `-session-9` still precedes `-session-10`.
 /// Names that do not match the convention sort last by name.
-fn discover_archives(source: &Path) -> Result<Vec<ArchiveSource>> {
+fn discover_archives(source: &Path) -> Result<Vec<ArchiveFile>> {
     let metadata = std::fs::metadata(source).map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -340,7 +504,7 @@ fn discover_archives(source: &Path) -> Result<Vec<ArchiveSource>> {
         )
     })?;
     if metadata.is_file() {
-        return Ok(vec![ArchiveSource {
+        return Ok(vec![ArchiveFile {
             path: source.to_path_buf(),
             prefix_len: metadata.len(),
         }]);
@@ -361,7 +525,7 @@ fn discover_archives(source: &Path) -> Result<Vec<ArchiveSource>> {
                 .extension()
                 .is_some_and(|extension| extension == "jsonl")
         {
-            archives.push(ArchiveSource {
+            archives.push(ArchiveFile {
                 prefix_len: entry.metadata()?.len(),
                 path,
             });
@@ -412,19 +576,25 @@ fn is_archive_date(date: &str) -> bool {
 ///
 /// Cancellation is polled for every record, so a long full-buffer preflight
 /// stops promptly instead of parsing to the end of the prefix.
+///
+/// The per-record workspace decision is written one byte at a time to a private
+/// file inside the snapshot, so replay can reuse it without retaining a
+/// history-sized decision vector in memory.
 fn plan_archive(
     source: &ArchiveSource,
     workspace: &str,
     options: &ImportOptions,
 ) -> Result<ArchivePlan> {
     let path = source.path.as_path();
-    let mut reader = ArchiveReader::open(path, source.prefix_len)?;
+    let mut reader = ArchiveReader::open(path, &source.snapshot, options.cancellation.clone())?;
+    let mut selection = BufWriter::new(File::create(source.snapshot.selection_path())?);
     let mut plan = ArchivePlan::default();
     let mut sessions: BTreeMap<String, SessionState> = BTreeMap::new();
     while let Some(record) = reader.next_record()? {
         options.cancellation.check(path)?;
         if !same_workspace(&record.envelope.workspace_path, workspace) {
             plan.skipped = plan.skipped.saturating_add(1);
+            selection.write_all(b"0")?;
             if plan.foreign.len() < MAX_REPORTED_WORKSPACES
                 && !plan.foreign.contains(&record.envelope.workspace_path)
             {
@@ -432,6 +602,7 @@ fn plan_archive(
             }
             continue;
         }
+        selection.write_all(b"1")?;
         let session = record.envelope.event.session.clone();
         let sequence = record.envelope.event.sequence;
         let identity = record.envelope.event.identity.clone();
@@ -463,6 +634,7 @@ fn plan_archive(
         state.next_sequence = state.next_sequence.saturating_add(1);
         plan.records = plan.records.saturating_add(1);
     }
+    selection.flush()?;
     plan.sessions.extend(sessions.into_keys());
     Ok(plan)
 }
@@ -480,24 +652,36 @@ fn validate_event(path: &Path, line: usize, record: ArchiveLine) -> Result<()> {
 }
 
 /// Replay one validated archive through the canonical editor admission path.
+///
+/// Replay reads the per-record workspace decision preflight wrote for this
+/// archive instead of re-evaluating the recorded workspace against the live
+/// filesystem, so a record preflight skipped (and therefore never validated)
+/// stays skipped even if its recorded path is retargeted. A decision stream
+/// that does not line up with the source is an error, never a silent skip;
+/// `records` is the exact non-blank record count preflight read, so a
+/// mismatched decision stream is rejected before any canonical write.
 fn import_archive(
     source: &ArchiveSource,
     workspace: &str,
     chain_root: &Path,
     options: &ImportOptions,
-    bounds: BatchBounds,
+    request: ReplayRequest,
 ) -> Result<ReplayOutcome> {
     let path = source.path.as_path();
-    let mut reader = ArchiveReader::open(path, source.prefix_len)?;
+    let mut reader = ArchiveReader::open(path, &source.snapshot, options.cancellation.clone())?;
+    let mut selection = SelectionReader::open(source, request.records)?;
+    let bounds = request.bounds;
     let mut context = ImportContext::new(workspace, chain_root)?;
     let mut pending: Vec<EditorEvent> = Vec::new();
     let mut pending_bytes = 0usize;
     let mut pending_session: Option<String> = None;
     while let Some(record) = reader.next_record()? {
-        // Polled before the workspace filter so a prefix full of foreign
+        // Polled before the workspace decision so a prefix full of skipped
         // records cannot skip every batch-bound cancellation check.
         options.cancellation.check(path)?;
-        if !same_workspace(&record.envelope.workspace_path, workspace) {
+        // Admit only records preflight selected and validated. Bytes are the
+        // same immutable snapshot, so the decision aligns record for record.
+        if !selection.next(path, record.line)? {
             continue;
         }
         // One batch never mixes recorder incarnations, so the batch bound also
@@ -531,11 +715,94 @@ fn import_archive(
         options.cancellation.check(path)?;
         context.flush(&mut pending)?;
     }
+    selection.finish(path)?;
     Ok(ReplayOutcome {
         written: context.written,
         replayed: context.replayed,
         batches: context.batches,
     })
+}
+
+/// One byte per record, as written by preflight and consumed by replay.
+///
+/// The decisions live in a private file inside the snapshot directory, so
+/// freezing workspace selection costs disk rather than history-sized memory.
+struct SelectionReader {
+    /// Buffered reader over one decision byte per record.
+    reader: BufReader<File>,
+}
+
+impl SelectionReader {
+    /// Open the decision file preflight wrote for `source`.
+    ///
+    /// The file must hold exactly one decision per non-blank record preflight
+    /// read, so a truncated or extended stream fails before replay writes.
+    fn open(source: &ArchiveSource, records: u64) -> Result<Self> {
+        let path = source.snapshot.selection_path();
+        let file = File::open(path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "cannot read preflight selection for {}: {error}",
+                    source.path.display()
+                ),
+            )
+        })?;
+        let decisions = file.metadata()?.len();
+        if decisions != records {
+            return Err(selection_mismatch(
+                &source.path,
+                format!("selection has {decisions} decisions but the source has {records} records"),
+            ));
+        }
+        Ok(Self {
+            reader: BufReader::new(file),
+        })
+    }
+
+    /// Decision for the next record, in snapshot order.
+    fn next(&mut self, source: &Path, line: usize) -> Result<bool> {
+        let mut byte = [0_u8; 1];
+        if self.reader.read(&mut byte)? == 0 {
+            return Err(selection_mismatch(
+                source,
+                format!("selection ended before record {line}"),
+            ));
+        }
+        match byte.first() {
+            Some(&b'1') => Ok(true),
+            Some(&b'0') => Ok(false),
+            _ => Err(selection_mismatch(
+                source,
+                format!("record {line} has an unknown selection byte"),
+            )),
+        }
+    }
+
+    /// Verify replay consumed every decision preflight recorded.
+    fn finish(&mut self, source: &Path) -> Result<()> {
+        let mut byte = [0_u8; 1];
+        if self.reader.read(&mut byte)? == 0 {
+            Ok(())
+        } else {
+            Err(selection_mismatch(
+                source,
+                "selection has more decisions than the source has records",
+            ))
+        }
+    }
+}
+
+/// Build an error for a preflight selection that does not match its source.
+fn selection_mismatch(path: &Path, detail: impl std::fmt::Display) -> Box<dyn std::error::Error> {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "human history preflight selection for {} does not match the source: {detail}",
+            path.display()
+        ),
+    )
+    .into()
 }
 
 /// Canonical admission state shared across every batch of one archive run.
@@ -623,11 +890,11 @@ fn lexical_workspace(path: &Path) -> String {
         .to_string()
 }
 
-/// Bounded, streaming reader for one captured archive prefix.
+/// Bounded, streaming reader for one immutable archive snapshot.
 struct ArchiveReader {
-    /// Archive path, used only for diagnostics.
+    /// Original archive path, used only for diagnostics.
     path: PathBuf,
-    /// Buffered file reader.
+    /// Buffered reader over the private snapshot.
     reader: BufReader<File>,
     /// Bytes left in the captured prefix.
     remaining: u64,
@@ -635,26 +902,36 @@ struct ArchiveReader {
     line: usize,
     /// Reused line buffer.
     buffer: Vec<u8>,
+    /// Shared cancellation signal, polled while reading long records.
+    cancellation: ImportCancellation,
 }
 
 impl ArchiveReader {
-    /// Open `path`, reading at most `prefix_len` bytes from its start.
-    fn open(path: &Path, prefix_len: u64) -> Result<Self> {
-        let file = File::open(path).map_err(|error| {
+    /// Open `snapshot`, reading at most its captured length.
+    ///
+    /// `original` names the user-supplied path so diagnostics keep pointing at
+    /// the source the caller gave rather than the private copy.
+    fn open(
+        original: &Path,
+        snapshot: &ArchiveSnapshot,
+        cancellation: ImportCancellation,
+    ) -> Result<Self> {
+        let file = File::open(snapshot.path()).map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!(
-                    "cannot open human history archive {}: {error}",
-                    path.display()
+                    "cannot open captured human history archive for {}: {error}",
+                    original.display()
                 ),
             )
         })?;
         Ok(Self {
-            path: path.to_path_buf(),
+            path: original.to_path_buf(),
             reader: BufReader::new(file),
-            remaining: prefix_len,
+            remaining: snapshot.len(),
             line: 0,
             buffer: Vec::new(),
+            cancellation,
         })
     }
 
@@ -664,13 +941,9 @@ impl ArchiveReader {
             if self.remaining == 0 {
                 return Ok(None);
             }
-            let outcome = read_bounded_line(
-                &mut self.reader,
-                &mut self.buffer,
-                MAX_LINE_BYTES,
-                &mut self.remaining,
-            )
-            .map_err(|error| archive_error(&self.path, self.line.saturating_add(1), error))?;
+            let outcome = self
+                .read_line()
+                .map_err(|error| archive_error(&self.path, self.line.saturating_add(1), error))?;
             if outcome == LineRead::ShortFile {
                 return Err(archive_error(
                     &self.path,
@@ -726,6 +999,47 @@ impl ArchiveReader {
             }));
         }
     }
+
+    /// Read one newline-terminated line within the remaining captured prefix.
+    ///
+    /// Never exceeds [`MAX_LINE_BYTES`] in the buffer, never reads past the
+    /// prefix, and polls cancellation for every chunk so a single huge record
+    /// cannot delay an interrupt.
+    fn read_line(&mut self) -> io::Result<LineRead> {
+        self.buffer.clear();
+        while self.remaining > 0 {
+            self.cancellation
+                .check(&self.path)
+                .map_err(io::Error::other)?;
+            let available = self.reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(LineRead::ShortFile);
+            }
+            let budget = usize::try_from(self.remaining)
+                .unwrap_or(usize::MAX)
+                .min(available.len());
+            let window = available.get(..budget).unwrap_or(available);
+            let newline = window.iter().position(|byte| *byte == b'\n');
+            let end = newline.unwrap_or(window.len());
+            let chunk = window.get(..end).unwrap_or_default();
+            if self.buffer.len().saturating_add(chunk.len()) > MAX_LINE_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("human history record exceeds {MAX_LINE_BYTES} bytes"),
+                ));
+            }
+            self.buffer.extend_from_slice(chunk);
+            let consumed = newline.map_or(window.len(), |index| index.saturating_add(1));
+            let consumed = u64::try_from(consumed).map_err(io::Error::other)?;
+            self.remaining = self.remaining.saturating_sub(consumed);
+            self.reader
+                .consume(usize::try_from(consumed).unwrap_or(usize::MAX));
+            if newline.is_some() {
+                return Ok(LineRead::Line);
+            }
+        }
+        Ok(LineRead::PrefixEnd)
+    }
 }
 
 /// How one bounded line read ended.
@@ -737,46 +1051,6 @@ enum LineRead {
     PrefixEnd,
     /// The file ended before the captured prefix length was reached.
     ShortFile,
-}
-
-/// Read one newline-terminated line within the remaining captured prefix.
-///
-/// Never exceeds `max_line` bytes in `buffer`, and never reads past the prefix.
-fn read_bounded_line(
-    reader: &mut impl BufRead,
-    buffer: &mut Vec<u8>,
-    max_line: usize,
-    remaining: &mut u64,
-) -> io::Result<LineRead> {
-    buffer.clear();
-    while *remaining > 0 {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
-            return Ok(LineRead::ShortFile);
-        }
-        let budget = usize::try_from(*remaining)
-            .unwrap_or(usize::MAX)
-            .min(available.len());
-        let window = available.get(..budget).unwrap_or(available);
-        let newline = window.iter().position(|byte| *byte == b'\n');
-        let end = newline.unwrap_or(window.len());
-        let chunk = window.get(..end).unwrap_or_default();
-        if buffer.len().saturating_add(chunk.len()) > max_line {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("human history record exceeds {max_line} bytes"),
-            ));
-        }
-        buffer.extend_from_slice(chunk);
-        let consumed = newline.map_or(window.len(), |index| index.saturating_add(1));
-        let consumed = u64::try_from(consumed).map_err(io::Error::other)?;
-        *remaining = remaining.saturating_sub(consumed);
-        reader.consume(usize::try_from(consumed).unwrap_or(usize::MAX));
-        if newline.is_some() {
-            return Ok(LineRead::Line);
-        }
-    }
-    Ok(LineRead::PrefixEnd)
 }
 
 /// Build a path-qualified archive error.
@@ -1000,6 +1274,31 @@ mod tests {
         std::fs::create_dir_all(&sessions).unwrap();
         let chain = tmp.path().join("chain");
         (tmp, workspace, sessions, chain)
+    }
+
+    /// Capture the first `prefix_len` bytes of `path` into a snapshot.
+    fn captured_prefix(path: &Path, prefix_len: u64) -> ArchiveSource {
+        let file = ArchiveFile {
+            path: path.to_path_buf(),
+            prefix_len,
+        };
+        ArchiveSource::capture(&file, &ImportCancellation::default()).unwrap()
+    }
+
+    /// Apply a different event `schema` to every record.
+    ///
+    /// The replacement is byte-length preserving while the schema stays a
+    /// single digit, so a rewritten archive keeps the discovered prefix length.
+    fn with_event_schema(events: Vec<Value>, schema: u64) -> Vec<Value> {
+        events
+            .into_iter()
+            .map(|mut event| {
+                if let Some(object) = event.as_object_mut() {
+                    drop(object.insert(String::from("schema"), json!(schema)));
+                }
+                event
+            })
+            .collect()
     }
 
     #[test]
@@ -1401,7 +1700,13 @@ mod tests {
         let first_line = full.iter().position(|byte| *byte == b'\n').unwrap();
         let prefix_len = u64::try_from(first_line.saturating_add(1)).unwrap();
 
-        let mut bounded = ArchiveReader::open(&path, prefix_len).unwrap();
+        let bounded_source = captured_prefix(&path, prefix_len);
+        let mut bounded = ArchiveReader::open(
+            &bounded_source.path,
+            &bounded_source.snapshot,
+            ImportCancellation::default(),
+        )
+        .unwrap();
         let record = bounded.next_record().unwrap().unwrap();
         assert_eq!(record.envelope.event.sequence, 1);
         assert!(
@@ -1409,7 +1714,13 @@ mod tests {
             "bytes past the captured prefix must never be read"
         );
 
-        let mut mid_record = ArchiveReader::open(&path, prefix_len.saturating_add(8)).unwrap();
+        let mid_source = captured_prefix(&path, prefix_len.saturating_add(8));
+        let mut mid_record = ArchiveReader::open(
+            &mid_source.path,
+            &mid_source.snapshot,
+            ImportCancellation::default(),
+        )
+        .unwrap();
         assert!(mid_record.next_record().unwrap().is_some());
         let error = mid_record.next_record().unwrap_err();
         assert!(error.to_string().contains("mid-record"), "{error}");
@@ -1424,12 +1735,14 @@ mod tests {
             &session_events(&session(90), "cancel\n", "cancel!\n"),
         );
         let archives = discover_archives(&sessions).unwrap();
-        let archive = archives.first().unwrap();
+        let archive =
+            ArchiveSource::capture(archives.first().unwrap(), &ImportCancellation::default())
+                .unwrap();
         let workspace_text = workspace.to_string_lossy().into_owned();
         let options = ImportOptions::default();
         options.cancellation.cancel();
 
-        let error = plan_archive(archive, &workspace_text, &options).unwrap_err();
+        let error = plan_archive(&archive, &workspace_text, &options).unwrap_err();
         assert!(error.to_string().contains("cancelled"), "{error}");
         assert!(!chain.exists());
     }
@@ -1445,17 +1758,27 @@ mod tests {
             &session_events(&session(91), "other\n", "other!\n"),
         );
         let archives = discover_archives(&sessions).unwrap();
-        let archive = archives.first().unwrap();
+        let archive =
+            ArchiveSource::capture(archives.first().unwrap(), &ImportCancellation::default())
+                .unwrap();
         let workspace_text = workspace.to_string_lossy().into_owned();
         let options = ImportOptions::default();
+        let plan = plan_archive(&archive, &workspace_text, &options).unwrap();
+        assert_eq!(
+            plan.records, 0,
+            "the fixture must contain only foreign records"
+        );
         options.cancellation.cancel();
 
         let error = import_archive(
-            archive,
+            &archive,
             &workspace_text,
             &chain,
             &options,
-            BatchBounds::default(),
+            ReplayRequest {
+                bounds: BatchBounds::default(),
+                records: plan.record_count(),
+            },
         )
         .unwrap_err();
         assert!(error.to_string().contains("cancelled"), "{error}");
@@ -1475,13 +1798,19 @@ mod tests {
         let path = sessions.join("2026-09-21-session-0001.jsonl");
         write_archive(&path, &workspace, &events);
         let archives = discover_archives(&sessions).unwrap();
-        let archive = archives.first().unwrap();
+        let archive =
+            ArchiveSource::capture(archives.first().unwrap(), &ImportCancellation::default())
+                .unwrap();
         let workspace_text = workspace.to_string_lossy().into_owned();
 
         // The budget input must be each record's real serialized length, not a
         // per-kind estimate: a bulk range record dwarfs any fixed hint.
-        let prefix_len = std::fs::metadata(&path).unwrap().len();
-        let mut reader = ArchiveReader::open(&path, prefix_len).unwrap();
+        let mut reader = ArchiveReader::open(
+            &archive.path,
+            &archive.snapshot,
+            ImportCancellation::default(),
+        )
+        .unwrap();
         let mut measured = Vec::new();
         while let Some(record) = reader.next_record().unwrap() {
             measured.push(record.bytes);
@@ -1500,14 +1829,23 @@ mod tests {
         // A bound smaller than one bulk record forces real canonical batches:
         // no batch can absorb two records, so every record is admitted alone.
         let options = ImportOptions::default();
+        let plan = plan_archive(&archive, &workspace_text, &options).unwrap();
+        assert_eq!(
+            plan.records,
+            u64::try_from(events.len()).unwrap(),
+            "every bulk record must preflight before replay"
+        );
         let small = import_archive(
-            archive,
+            &archive,
             &workspace_text,
             &chain,
             &options,
-            BatchBounds {
-                events: MAX_BATCH_EVENTS,
-                bytes: 4_096,
+            ReplayRequest {
+                bounds: BatchBounds {
+                    events: MAX_BATCH_EVENTS,
+                    bytes: 4_096,
+                },
+                records: plan.record_count(),
             },
         )
         .unwrap();
@@ -1520,13 +1858,16 @@ mod tests {
 
         // A bound wider than the archive keeps it in a single batch.
         let wide = import_archive(
-            archive,
+            &archive,
             &workspace_text,
             &chain,
             &options,
-            BatchBounds {
-                events: MAX_BATCH_EVENTS,
-                bytes: usize::MAX,
+            ReplayRequest {
+                bounds: BatchBounds {
+                    events: MAX_BATCH_EVENTS,
+                    bytes: usize::MAX,
+                },
+                records: plan.record_count(),
             },
         )
         .unwrap();
@@ -1646,5 +1987,294 @@ mod tests {
             "{error}"
         );
         assert!(!chain.exists());
+    }
+
+    #[test]
+    fn same_length_rewrite_after_preflight_cannot_reach_replay() {
+        let (_tmp, workspace, sessions, chain) = fixture();
+        let recorder = session(100);
+        let path = sessions.join("2026-09-21-session-0001.jsonl");
+        write_archive(
+            &path,
+            &workspace,
+            &session_events(&recorder, "captured", "captured!"),
+        );
+
+        let files = discover_archives(&sessions).unwrap();
+        let archive =
+            ArchiveSource::capture(files.first().unwrap(), &ImportCancellation::default()).unwrap();
+        let workspace_text = workspace.to_string_lossy().into_owned();
+        let options = ImportOptions::default();
+        let plan = plan_archive(&archive, &workspace_text, &options).unwrap();
+        assert_eq!(plan.records, 6, "the fixture must preflight completely");
+
+        // Rewrite the source with the same byte length, but with an event
+        // schema the canonical validator rejects and a distinguishable buffer.
+        let injected = with_event_schema(session_events(&recorder, "injected", "injected!"), 9);
+        let rewritten = archive_text(&workspace, &injected);
+        let original_len = std::fs::metadata(&path).unwrap().len();
+        std::fs::write(&path, &rewritten).unwrap();
+        assert_eq!(
+            u64::try_from(rewritten.len()).unwrap(),
+            original_len,
+            "the regression must rewrite the source without changing its length"
+        );
+
+        let outcome = import_archive(
+            &archive,
+            &workspace_text,
+            &chain,
+            &options,
+            ReplayRequest {
+                bounds: BatchBounds::default(),
+                records: plan.record_count(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.written, plan.records,
+            "replay must admit every preflight-selected record"
+        );
+
+        let raw = raw_events(&chain);
+        assert!(!raw.is_empty(), "the captured prefix must still replay");
+        assert!(
+            raw.iter()
+                .all(|value| { value.pointer("/event/schema").and_then(Value::as_u64) == Some(1) }),
+            "replay must admit the validated schema, never the rewritten one"
+        );
+        assert!(
+            raw.iter().any(|value| {
+                value.pointer("/event/event/text").and_then(Value::as_str) == Some("captured")
+            }),
+            "replay must read the captured buffer text"
+        );
+        assert!(
+            !raw.iter().any(|value| {
+                value.pointer("/event/event/text").and_then(Value::as_str) == Some("injected")
+            }),
+            "rewritten bytes must never reach the chain"
+        );
+
+        // Control: the rewritten bytes really are invalid, so a snapshot taken
+        // after the rewrite is rejected by preflight.
+        let rewritten_archive =
+            ArchiveSource::capture(files.first().unwrap(), &ImportCancellation::default()).unwrap();
+        let error = plan_archive(&rewritten_archive, &workspace_text, &options).unwrap_err();
+        assert!(
+            error.to_string().contains("invalid editor event"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn replacement_and_deletion_after_capture_do_not_change_replay() {
+        let (_tmp, workspace, sessions, chain) = fixture();
+        let recorder = session(101);
+        let path = sessions.join("2026-09-21-session-0001.jsonl");
+        write_archive(
+            &path,
+            &workspace,
+            &session_events(&recorder, "original", "original!"),
+        );
+
+        let files = discover_archives(&sessions).unwrap();
+        let archive =
+            ArchiveSource::capture(files.first().unwrap(), &ImportCancellation::default()).unwrap();
+        let workspace_text = workspace.to_string_lossy().into_owned();
+        let options = ImportOptions::default();
+        let plan = plan_archive(&archive, &workspace_text, &options).unwrap();
+        assert_eq!(plan.records, 6, "the fixture must preflight completely");
+
+        // Replace the pathname with a sibling file's inode, so replay faces a
+        // different file rather than an in-place rewrite of the same one.
+        let replacement = sessions.join("replacement.tmp");
+        std::fs::write(&replacement, b"{\"not\":\"an archive\"}\n").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let outcome = import_archive(
+            &archive,
+            &workspace_text,
+            &chain,
+            &options,
+            ReplayRequest {
+                bounds: BatchBounds::default(),
+                records: plan.record_count(),
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.written, plan.records);
+        let written = read_ops(&chain).len();
+        assert!(written > 0, "the snapshot must still replay");
+        assert!(
+            raw_events(&chain).iter().any(|value| {
+                value.pointer("/event/event/text").and_then(Value::as_str) == Some("original")
+            }),
+            "the captured buffer text must survive replacing the original"
+        );
+
+        // Delete the source entirely; replaying the same snapshot stays exact.
+        std::fs::remove_file(&path).unwrap();
+        let outcome = import_archive(
+            &archive,
+            &workspace_text,
+            &chain,
+            &options,
+            ReplayRequest {
+                bounds: BatchBounds::default(),
+                records: plan.record_count(),
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.replayed, plan.records);
+        assert_eq!(
+            read_ops(&chain).len(),
+            written,
+            "deleting the original must not change replay"
+        );
+    }
+
+    #[test]
+    fn truncation_between_discovery_and_capture_is_rejected() {
+        let (_tmp, workspace, sessions, chain) = fixture();
+        let path = sessions.join("2026-09-21-session-0001.jsonl");
+        write_archive(&path, &workspace, &session_events(&session(102), "a", "ab"));
+        let files = discover_archives(&sessions).unwrap();
+
+        // Shrink the source after discovery but before the snapshot is taken.
+        let full = std::fs::read(&path).unwrap();
+        let truncated = full.get(..full.len().saturating_sub(8)).unwrap_or_default();
+        std::fs::write(&path, truncated).unwrap();
+
+        let error = ArchiveSource::capture(files.first().unwrap(), &ImportCancellation::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("shrank"), "{error}");
+        assert!(!chain.exists());
+    }
+
+    #[test]
+    fn capture_honors_cancellation() {
+        let (_tmp, workspace, sessions, chain) = fixture();
+        write_archive(
+            &sessions.join("2026-09-21-session-0001.jsonl"),
+            &workspace,
+            &session_events(&session(103), "a", "ab"),
+        );
+        let files = discover_archives(&sessions).unwrap();
+        let options = ImportOptions::default();
+        options.cancellation.cancel();
+
+        let error =
+            ArchiveSource::capture(files.first().unwrap(), &options.cancellation).unwrap_err();
+        assert!(error.to_string().contains("cancelled"), "{error}");
+        assert!(!chain.exists());
+    }
+
+    #[test]
+    fn mismatched_preflight_selection_is_rejected_before_writing() {
+        let (_tmp, workspace, sessions, chain) = fixture();
+        let recorder = session(104);
+        let path = sessions.join("2026-09-21-session-0001.jsonl");
+        write_archive(&path, &workspace, &session_events(&recorder, "a", "ab"));
+        let files = discover_archives(&sessions).unwrap();
+        let archive =
+            ArchiveSource::capture(files.first().unwrap(), &ImportCancellation::default()).unwrap();
+        let workspace_text = workspace.to_string_lossy().into_owned();
+        let options = ImportOptions::default();
+        let plan = plan_archive(&archive, &workspace_text, &options).unwrap();
+        assert_eq!(plan.record_count(), 6);
+
+        // Truncate the frozen decisions: replay must refuse before it writes,
+        // rather than treating the missing decisions as "not selected".
+        std::fs::write(archive.snapshot.selection_path(), b"1").unwrap();
+        let error = import_archive(
+            &archive,
+            &workspace_text,
+            &chain,
+            &options,
+            ReplayRequest {
+                bounds: BatchBounds::default(),
+                records: plan.record_count(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("does not match the source"),
+            "{error}"
+        );
+        assert!(
+            !chain.exists(),
+            "a mismatched selection must not write a chain"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retargeted_workspace_alias_cannot_promote_skipped_records() {
+        let (tmp, workspace, sessions, chain) = fixture();
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&other, &alias).unwrap();
+
+        let recorder = session(110);
+        let path = sessions.join("2026-09-21-session-0001.jsonl");
+        // The records name the alias, which points at another workspace during
+        // preflight, and carry an event schema the canonical validator rejects.
+        let events = with_event_schema(session_events(&recorder, "hidden", "hidden!"), 9);
+        write_archive(&path, &alias, &events);
+
+        let files = discover_archives(&sessions).unwrap();
+        let archive =
+            ArchiveSource::capture(files.first().unwrap(), &ImportCancellation::default()).unwrap();
+        let workspace_text = workspace.to_string_lossy().into_owned();
+        let options = ImportOptions::default();
+        let plan = plan_archive(&archive, &workspace_text, &options).unwrap();
+        assert_eq!(plan.records, 0, "the alias is foreign during preflight");
+        assert_eq!(plan.skipped, u64::try_from(events.len()).unwrap());
+
+        // Retarget the alias at the requested workspace between the two passes.
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+
+        let outcome = import_archive(
+            &archive,
+            &workspace_text,
+            &chain,
+            &options,
+            ReplayRequest {
+                bounds: BatchBounds::default(),
+                records: plan.record_count(),
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.batches, 0, "no record was selected for replay");
+        assert!(
+            !chain.exists(),
+            "a record skipped by preflight must never be admitted by replay"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_alias_matching_still_selects_records() {
+        let (tmp, workspace, sessions, chain) = fixture();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+        let recorder = session(111);
+        write_archive(
+            &sessions.join("2026-09-21-session-0001.jsonl"),
+            &alias,
+            &session_events(&recorder, "aliased", "aliased!"),
+        );
+
+        import(&sessions, &workspace, &chain).unwrap();
+
+        assert!(
+            raw_events(&chain).iter().any(|value| {
+                value.pointer("/event/event/text").and_then(Value::as_str) == Some("aliased")
+            }),
+            "an ordinary workspace alias must still match and import"
+        );
     }
 }

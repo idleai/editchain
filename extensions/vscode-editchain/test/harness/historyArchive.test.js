@@ -17,6 +17,8 @@ const event = (sequence, extra = {}) => ({ schema: 1, session: SESSION,
 
 const directory = () => fs.mkdtemp(path.join(os.tmpdir(), 'editchain-archive-'));
 const day = () => archiveDay(new Date());
+// A junction needs no symlink privilege on Windows; 'dir' is the POSIX default.
+const linkDirectory = (target, link) => fs.symlink(target, link, process.platform === 'win32' ? 'junction' : 'dir');
 
 function writer(directoryPath, options = {}) {
   const logs = [], reports = [];
@@ -179,5 +181,65 @@ test('only this directory\'s archive files are excluded from capture', async () 
     assert.equal(archive.excludes(path.join(dir, 'notes.txt')), false);
     assert.equal(archive.excludes(path.join(os.tmpdir(), 'elsewhere', archiveFileName(day(), 1))), false);
     assert.equal(archive.excludes(path.join(dir, '2026-09-21-session-1.jsonl')), false);
+  } finally { await fs.rm(dir, { recursive: true, force: true }); }
+});
+
+test('a symlinked archive directory is excluded at every alias of its real path', async () => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), 'editchain-archive-link-'));
+  const workspace = path.join(base, 'workspace');
+  const physical = path.join(workspace, 'archives');
+  const alias = path.join(base, 'alias');
+  const late = path.join(base, 'late');
+  await fs.mkdir(physical, { recursive: true });
+  await linkDirectory(physical, alias);
+  const { archive } = writer(alias);
+  try {
+    // No append yet: exclusion is ready before capture baselines a document.
+    await archive.setup();
+    // An alias created after setup is still recognized: nothing is cached
+    // against a fixed list of roots.
+    await linkDirectory(physical, late);
+    const name = archiveFileName(day(), 1);
+    assert.equal(archive.excludes(path.join(alias, name)), true, 'the configured alias');
+    assert.equal(archive.excludes(path.join(physical, name)), true, 'the real path VS Code observes');
+    assert.equal(archive.excludes(path.join(late, name)), true, 'an unrelated alias of the same directory');
+    assert.equal(archive.excludes(path.join(physical, 'notes.txt')), false, 'an unrelated file in the archive directory');
+    assert.equal(archive.excludes(path.join(workspace, name)), false, 'a same-named file elsewhere in the workspace');
+  } finally { await fs.rm(base, { recursive: true, force: true }); }
+});
+
+test('exclusion follows a symlinked workspace, including when it is the destination root', async () => {
+  const base = await fs.mkdtemp(path.join(os.tmpdir(), 'editchain-archive-link-'));
+  const realWorkspace = path.join(base, 'real');
+  const physical = path.join(realWorkspace, 'archives');
+  const aliasWorkspace = path.join(base, 'linked');
+  await fs.mkdir(physical, { recursive: true });
+  await linkDirectory(realWorkspace, aliasWorkspace);
+  const name = archiveFileName(day(), 1);
+  const nested = writer(physical);
+  const root = writer(aliasWorkspace);
+  try {
+    await Promise.all([nested.archive.setup(), root.archive.setup()]);
+    assert.equal(nested.archive.excludes(path.join(aliasWorkspace, 'archives', name)), true,
+      'a destination inside a symlinked workspace');
+    assert.equal(root.archive.excludes(path.join(realWorkspace, name)), true,
+      'a destination equal to the workspace root is still matched through the alias');
+    assert.equal(root.archive.excludes(path.join(aliasWorkspace, name)), true, 'the configured root spelling');
+  } finally {
+    await Promise.all([nested.archive.stop(), root.archive.stop()]);
+    await fs.rm(base, { recursive: true, force: true });
+  }
+});
+
+test('case handling follows the filesystem, not a hardcoded platform rule', async () => {
+  const dir = await directory();
+  const { archive } = writer(dir);
+  try {
+    await archive.setup();
+    const variant = path.join(path.dirname(dir), path.basename(dir).toUpperCase());
+    let sameDirectory = false;
+    try { sameDirectory = await fs.realpath(variant) === await fs.realpath(dir); } catch { sameDirectory = false; }
+    assert.equal(archive.excludes(path.join(variant, archiveFileName(day(), 1))), sameDirectory,
+      'a differently-cased spelling is excluded exactly when the filesystem treats it as the same directory');
   } finally { await fs.rm(dir, { recursive: true, force: true }); }
 });

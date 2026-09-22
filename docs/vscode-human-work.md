@@ -524,11 +524,17 @@ is idempotent and uses the normal import path, so re-running over an
 already-imported archive does not duplicate work. Add `--dry-run` to preview
 changes without writing.
 
-The importer captures each file's byte length when it discovers it and reads that
-same bounded prefix twice, in line order: a preflight pass validates the prefix
-before anything is written, and a replay pass then admits the same bytes.
-Preflight checks envelope format and schema, per-event validity, per-session
-sequence continuity, and a stable recorder identity within a session. Malformed
+The importer captures each file's byte length when it discovers it and copies that
+prefix to private temporary storage. Both validation and replay read those copies,
+so rewriting, replacing, or deleting an original file cannot change the bytes
+admitted after validation. Imports, including dry runs, need temporary disk space
+for the captured source bytes; the copies are removed when the import finishes.
+Preflight also preserves its workspace selection for replay, including when a
+workspace symlink changes between the two passes.
+
+All archives are validated before the chain is modified. Preflight checks
+envelope format and schema, per-event validity, per-session sequence continuity,
+and a stable recorder identity within a session. Malformed
 JSON, an unsupported schema version, an out-of-order sequence, or a truncated
 archive therefore fails the import without writing a partial chain. Because both
 passes stop at the captured length, an archive still being appended to cannot

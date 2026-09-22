@@ -1,4 +1,4 @@
-import { promises as fs } from 'node:fs';
+import { promises as fs, realpathSync } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
 import * as path from 'node:path';
 import { homedir } from 'node:os';
@@ -89,6 +89,9 @@ export class HistoryArchive {
   private stopped = false;
   private stopping: Promise<void> | undefined;
   private readonly directory: string;
+  private canonical: string | undefined;
+  private readonly aliases = new Set<string>();
+  private ready: Promise<void> | undefined;
 
   constructor(private readonly options: HistoryArchiveOptions) {
     this.directory = path.resolve(options.directory);
@@ -98,9 +101,35 @@ export class HistoryArchive {
   get location(): string | undefined { return this.file; }
   get failed(): boolean { return this.failure !== undefined; }
 
-  /** Never re-record our own output when the archive lives inside the workspace. */
+  /**
+   * Cache the destination's physical path before capture baselines a document.
+   *
+   * VS Code reports a file's physical path, so a configured archive directory
+   * that is (or contains) a symlink must be recognized by its real path too.
+   * Any other alias of the destination is resolved on demand by `excludes`.
+   */
+  async setup(): Promise<void> {
+    this.ready ??= this.prepare();
+    return this.ready;
+  }
+
+  private async prepare(): Promise<void> {
+    this.canonical = await physicalDirectory(this.directory);
+  }
+
+  /** Never re-record our own output, including through a directory alias. */
   excludes(fsPath: string): boolean {
-    return path.dirname(fsPath) === this.directory && HISTORY_ARCHIVE_NAME.test(path.basename(fsPath));
+    // The filename guard runs first, so ordinary typing never leaves it.
+    if (!HISTORY_ARCHIVE_NAME.test(path.basename(fsPath))) return false;
+    const parent = path.resolve(path.dirname(fsPath));
+    if (parent === this.directory || parent === this.canonical) return true;
+    if (this.aliases.has(parent)) return true;
+    // Any other spelling (a symlinked archive, workspace, or unrelated link)
+    // only needs one physical resolution of its parent directory. Only hits
+    // are remembered so a link created later is still recognized.
+    if (!this.canonical || physicalParent(parent) !== this.canonical) return false;
+    this.aliases.add(parent);
+    return true;
   }
 
   append(workspacePath: string, event: EditorEvent): void {
@@ -164,6 +193,7 @@ export class HistoryArchive {
       this.bytes -= line.length;
       if (!this.handle) {
         await fs.mkdir(this.directory, { recursive: true });
+        await this.setup();
         const allocated = await allocateArchive(this.directory, (this.options.now ?? (() => new Date()))());
         this.handle = allocated.handle;
         this.file = allocated.file;
@@ -218,4 +248,16 @@ async function highestArchiveCounter(directory: string, day: string): Promise<nu
     if (match && match[1] === day) highest = Math.max(highest, Number(match[2]));
   }
   return highest;
+}
+
+/** The real path, or undefined while the directory does not exist yet. */
+async function physicalDirectory(value: string): Promise<string | undefined> {
+  try { return await fs.realpath(value); }
+  catch { return undefined; }
+}
+
+/** The physical parent directory, or undefined when it cannot be resolved. */
+function physicalParent(value: string): string | undefined {
+  try { return realpathSync(value); }
+  catch { return undefined; }
 }
