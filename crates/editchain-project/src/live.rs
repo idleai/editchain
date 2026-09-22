@@ -233,6 +233,28 @@ impl LiveProjection {
         self.selected.get(&source)
     }
 
+    /// Whether an import has authored content ready for display. Hashed
+    /// occurrences need a complete, unambiguous provider derivation; legacy
+    /// unhashed imports need a normalized child instead of a raw-only preview.
+    /// This checks only that occurrence, never an excluded earlier prefix.
+    #[must_use]
+    pub fn import_ready(&self, source: OpId) -> bool {
+        let mut children = self
+            .children
+            .get(&source)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.ops.get(id).map(AsRef::as_ref));
+        if self.ops.get(&source).is_some_and(
+            |op| matches!(&op.kind, OpKind::Import(import) if import.raw_hash.is_none()),
+        ) {
+            return children
+                .any(|op| !matches!(op.kind, OpKind::Import(_)) && decode_evidence(op).is_none());
+        }
+        self.selected.contains_key(&source)
+            || crate::materialization::complete_derivation(source, children, &self.ops)
+    }
+
     /// Current presentation owners of an exact historical item occurrence.
     /// References to old results retain their item identity without making
     /// those results a second chronological appearance of the same item.

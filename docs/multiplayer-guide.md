@@ -37,7 +37,7 @@ Run the commands below from the Command Palette (`Ctrl+Shift+P` or `Cmd+Shift+P`
 5. **Both:** wait for **Sharing · 1/1 connected** in the status bar, then run
    **EditChain: Open History Explorer**. A **syncing** suffix means the connection
    is working and shared history is still being checked or transferred. Received
-   rows appear as they are saved; you can keep editing during this check.
+   rows appear when their supporting records are ready; you can keep editing during this check.
 
 ## Try it
 
@@ -60,8 +60,10 @@ does not prove that a particular conversation was captured or displayed.
 An ongoing Codex session can be shared from a cutoff in its middle. The live
 view shows the latest fully validated item revisions it has received and applies
 received removals, even when earlier parts of the session remain private.
-Temporary **Import** rows become normal conversation rows as their supporting
-records arrive; that transition should not make the received session disappear.
+Incoming raw **Import** placeholders stay hidden until their supporting records
+validate. Completed messages appear directly, while previously received messages
+remain visible during the next transfer. Reopening History after an upgrade also
+clears placeholders saved by earlier builds.
 Older session names and ancestry may be unavailable if their records precede
 the cutoff. Updating this build and reopening History repairs previously hidden
 received items from the local cache; enabling full-history backfill is unnecessary.

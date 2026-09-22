@@ -248,11 +248,21 @@ the export cutoff. Missing outputs or contradictory occurrence proofs still
 retract that item; received turn removals retire it. Complete-source logical
 replay and cross-session topology retain their full-prefix requirements, so a
 visible received revision does not imply that the whole session was shared.
-Raw Import previews are replaced by those verified items as their occurrence
-proofs arrive. A task path can hide members only while its summary exists,
+Exact receipt provenance prevents incoming raw Import previews from entering
+the graph or search before their occurrence proofs and outputs validate. This
+uses the same receipt reader as capture, preserving local fallback rows when
+this device independently retained the exact bytes. Received raw-only imports
+remain hidden until their authored materialization arrives. Human work envelopes
+already carry their semantic record and retain their normal presentation.
+Legacy unhashed imports have no derivation proof, so their normalized child
+records release them; their raw-only placeholders remain hidden too.
+A task path can hide members only while its summary exists,
 so a singleton between streamed arrivals remains directly visible.
 Live checkpoint version 9 republishes these already-retained partial items from
 the reducer indexes, without importing or requesting the excluded history.
+Version 10 removes previously cached incoming placeholders without changing
+canonical history; the retained reducer publishes items as their remaining
+records arrive, including after a restart during transfer.
 
 Operations and blobs have separate completion states. A record can be durable
 while its content is still missing. After a crash, rebuild synchronization

@@ -148,7 +148,7 @@ impl Projection {
         let chain = Path::new(&request.workspace_path).join(&request.chain_dir);
         let mut sources = std::mem::take(&mut self.pending);
         sources.retain(|op| op.tags.matches_all(Tags::IMPORT | Tags::HUMAN));
-        let receipts = super::remote::Receipts::read(&chain)?;
+        let receipts = crate::receipts::Receipts::read(&chain)?;
         let mut local = Vec::new();
         for source in sources {
             if !receipts.foreign(self.tail.chain(), &chain, source.id)? {

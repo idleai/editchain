@@ -217,6 +217,19 @@ pub(super) fn selected_codex<'a>(
     }
 }
 
+pub(super) fn complete_derivation<'a>(
+    source: OpId,
+    facts: impl Iterator<Item = &'a Op>,
+    by_id: &impl OpLookup,
+) -> bool {
+    let records: Vec<_> = facts
+        .filter_map(decode_evidence)
+        .filter(|record| record.payload.source == source && valid_source(record, by_id))
+        .collect();
+    let references: Vec<_> = records.iter().collect();
+    select(&references).is_some_and(|meta| complete_outputs(meta, source, by_id))
+}
+
 fn source_key(source: OpId) -> SourceKey {
     (source.node.0, source.boot)
 }

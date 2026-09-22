@@ -6,6 +6,7 @@ mod collector;
 mod disclosure;
 mod git;
 mod open;
+mod pending;
 mod queries;
 mod reconcile;
 mod regroup;
@@ -151,6 +152,7 @@ impl LiveWorkspace {
             let edit_rows = saved.version < 7;
             let human_streams = saved.version < 8;
             let partial_items = saved.version < 9;
+            let pending_imports = saved.version < 10;
             workspace.adopt(saved, true)?;
             if regroup {
                 workspace.regroup();
@@ -170,7 +172,10 @@ impl LiveWorkspace {
             if partial_items {
                 workspace.restore_partial_items()?;
             }
-            if disclosure || edit_rows || human_streams || partial_items {
+            if pending_imports {
+                workspace.remove_pending_imports()?;
+            }
+            if disclosure || edit_rows || human_streams || partial_items || pending_imports {
                 // Publish the new version only after every migration completed.
                 workspace.checkpoint()?;
             }
@@ -384,7 +389,14 @@ impl LiveWorkspace {
         Ok(())
     }
 
-    fn apply_blocks(&mut self, changes: LiveChanges) -> Result<(Vec<String>, Vec<StoredBlock>)> {
+    fn apply_blocks(
+        &mut self,
+        mut changes: LiveChanges,
+    ) -> Result<(Vec<String>, Vec<StoredBlock>)> {
+        for key in self.pending_imports(changes.upserts.iter())? {
+            drop(changes.upserts.remove(&key));
+            let _removed = changes.removed.insert(key);
+        }
         self.blobs = editchain_store::BlobReader::open(&self.chain)?;
         self.tasks.observe(&changes, &self.projection);
         self.ancestry.observe_relationships(changes.relationships);

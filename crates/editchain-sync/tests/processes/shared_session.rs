@@ -66,6 +66,24 @@ fn sync_rows(server: &mut Server, opened: &Value, revision: &mut Value) -> io::R
     current_rows(server, snapshot)
 }
 
+fn pending_rows(rows: &[Value], count: usize, previous: Option<&Value>) -> io::Result<()> {
+    require(
+        rows.len() == count
+            && rows
+                .iter()
+                .all(|row| row.get("kind") == Some(&json!("message"))),
+        "partial receipts must not publish Import placeholders or unfinished items",
+    )?;
+    if let Some(previous) = previous {
+        require(
+            rows.iter()
+                .any(|row| row.get("continuity_key") == Some(previous)),
+            "later incomplete receipts do not retract a verified item",
+        )?;
+    }
+    Ok(())
+}
+
 #[test]
 fn ongoing_codex_session_crosses_cutoff_and_updates_the_peer_view_live() -> io::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -86,7 +104,7 @@ fn ongoing_codex_session_crosses_cutoff_and_updates_the_peer_view_live() -> io::
     let mut server = Server::new();
     let open_request =
         json!({"OpenLivePaged":{"workspace_path":workspace, "chain_dir":".editchain"}});
-    let opened = view(&mut server, open_request.clone())?;
+    let mut opened = view(&mut server, open_request.clone())?;
     require(
         current_rows(&mut server, field(&opened, "snapshot_id")?)?.is_empty(),
         "empty receiver",
@@ -106,9 +124,8 @@ fn ongoing_codex_session_crosses_cutoff_and_updates_the_peer_view_live() -> io::
         (3, 3, "another received item stays visible", 2),
         (4, 2, "shared session updated live", 2),
     ] {
-        // The relay can deliver raw previews before the occurrence's proof.
-        // A later receipt must replace that preview with a verified item,
-        // without hiding this session or its previously received items.
+        // Raw records, outputs and proofs can arrive in separate rounds.
+        // Keep the previous verified view until this occurrence is complete.
         let ops = fixture::occurrence(ordinal, incarnation, text)?;
         let (preview, materialization) = ops
             .split_first()
@@ -116,24 +133,39 @@ fn ongoing_codex_session_crosses_cutoff_and_updates_the_peer_view_live() -> io::
         fixture::append(&ar, std::slice::from_ref(preview))?;
         poll(&mut a, &mut b)?;
         let preview_rows = sync_rows(&mut server, &opened, &mut revision)?;
-        require(
-            preview_rows.len() == count + usize::from(ordinal != incarnation),
-            "raw preview arrives alongside previously verified items",
-        )?;
-        if let Some(previous) = &identity {
-            require(
-                preview_rows
-                    .iter()
-                    .any(|row| row.get("continuity_key") == Some(previous)),
-                "later incomplete receipts do not retract a verified item",
+        let before = count - usize::from(ordinal == incarnation);
+        pending_rows(&preview_rows, before, identity.as_ref())?;
+        if ordinal == 2 {
+            server = Server::new();
+            opened = view(&mut server, open_request.clone())?;
+            revision = json!(0);
+            pending_rows(
+                &current_rows(&mut server, field(&opened, "snapshot_id")?)?,
+                0,
+                None,
             )?;
         }
-        fixture::append(&ar, materialization)?;
+        let mut remaining = materialization.to_vec();
+        // Cover both output-before-proof and proof-before-output delivery.
+        if ordinal == 3 {
+            remaining.reverse();
+        }
+        let (partial, last) = remaining
+            .split_first()
+            .ok_or_else(|| io::Error::other("materialization fixture"))?;
+        fixture::append(&ar, std::slice::from_ref(partial))?;
+        poll(&mut a, &mut b)?;
+        pending_rows(
+            &sync_rows(&mut server, &opened, &mut revision)?,
+            before,
+            identity.as_ref(),
+        )?;
+        fixture::append(&ar, last)?;
         poll(&mut a, &mut b)?;
         let rows = sync_rows(&mut server, &opened, &mut revision)?;
         require(
             rows.len() == count,
-            "proof replaces the preview instead of making received items disappear",
+            "complete receipts publish the item while retaining earlier received items",
         )?;
         let row = rows
             .iter()

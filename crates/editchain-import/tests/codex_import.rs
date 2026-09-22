@@ -504,6 +504,7 @@ fn shared_session_items_still_require_complete_unambiguous_occurrence_proofs() {
         .find(|op| matches!(op.kind, OpKind::Message(_)))
         .unwrap()
         .clone();
+    let source = *message.parents.iter().next().unwrap();
     let mut conflict = suffix
         .iter()
         .find(|op| is_provider_evidence(op))
@@ -521,7 +522,9 @@ fn shared_session_items_still_require_complete_unambiguous_occurrence_proofs() {
         waiting.upserts.keys().all(|key| !key.starts_with("item:")),
         "missing output stays hidden"
     );
+    assert!(!live.import_ready(source));
     let received = live.apply(vec![message.clone()], &[]);
+    assert!(live.import_ready(source));
     let key = received
         .upserts
         .keys()
@@ -544,14 +547,17 @@ fn shared_session_items_still_require_complete_unambiguous_occurrence_proofs() {
     meta.thread.0 = "contradictory-thread".into();
     *raw = serde_json::to_vec(&evidence).unwrap();
     let disputed = live.apply(vec![conflict.clone()], &[]);
+    assert!(!live.import_ready(source));
     assert!(
         disputed.removed.contains(&key),
         "ambiguous proof retracts the visible item"
     );
     assert!(!disputed.upserts.contains_key(&key));
     let repaired = live.apply(Vec::new(), &[conflict.id]);
+    assert!(live.import_ready(source));
     assert!(repaired.upserts.contains_key(&key));
     let missing = live.apply(Vec::new(), &[message.id]);
+    assert!(!live.import_ready(source));
     assert!(
         missing.removed.contains(&key),
         "lost output retracts the visible item"
