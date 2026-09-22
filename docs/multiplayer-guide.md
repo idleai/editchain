@@ -125,6 +125,8 @@ to discard inventories prepared under the old scope. Approvals, invitations,
 local history and copies already received by other devices remain intact.
 Reconnecting or reloading preserves the cutoff, including work recorded offline
 after it. New records use their local append order, not their recorded timestamp.
+A new revision of an ongoing Codex item can appear on the peer even if the item
+started before the cutoff; its excluded earlier records stay private.
 Stopping backfill mid-transfer can leave earlier received rows missing content;
 selecting **Include existing history** later lets that content finish transferring.
 
@@ -188,8 +190,15 @@ direction is B-to-A; A's sending direction is A-to-B.
 During catch-up, older builds could display detached **EditChain ops** command
 results before their session records arrived. They reconnect automatically when
 the missing records arrive. Current builds send shared parents before children
-to avoid this transfer-order gap. Parents outside the approved sharing scope are
-not fetched; new-history-only sharing can therefore start at a real history boundary.
+to avoid this transfer-order gap. Incomplete imported rows stay out of the view
+until their supporting records arrive; complete legacy imports remain supported.
+Parents outside the approved sharing scope are not fetched; new-history-only
+sharing can therefore start at a real history boundary.
+
+Message summaries and search results refresh automatically when their content
+arrives after the records, including after an editor restart. Existing cached
+rows affected by older builds are repaired when History reopens after upgrading.
+You do not need a new invitation or a wider sharing scope for these repairs.
 
 `Checking shared history (first pass)` means the first inventory check has not
 finished. This also happens with new-history-only sharing; it does not indicate

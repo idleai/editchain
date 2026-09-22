@@ -86,15 +86,44 @@ fn pending_rows(rows: &[Value], count: usize, previous: Option<&Value>) -> io::R
 
 #[test]
 fn ongoing_codex_session_crosses_cutoff_and_updates_the_peer_view_live() -> io::Result<()> {
-    shared_session(2)
+    shared_session(2, false)
 }
 
 #[test]
 fn revised_item_crosses_a_fresh_cutoff_without_its_private_incarnation() -> io::Result<()> {
-    shared_session(1)
+    shared_session(1, false)
 }
 
-fn shared_session(shared_incarnation: u64) -> io::Result<()> {
+#[test]
+fn late_content_crosses_native_peers_and_refreshes_the_open_history_view() -> io::Result<()> {
+    shared_session(1, true)
+}
+
+fn deferred_payloads(ops: &mut [Op]) -> io::Result<Vec<Vec<u8>>> {
+    let mut content = Vec::new();
+    let mut externalize = |payload: &mut Payload| -> io::Result<()> {
+        if let Payload::Inline(bytes) = payload {
+            let blob = BlobRef {
+                id: ContentId::Hash256(*blake3::hash(bytes).as_bytes()),
+                len: u32::try_from(bytes.len()).map_err(io::Error::other)?,
+            };
+            content.push(bytes.clone());
+            *payload = Payload::Blob(blob);
+        }
+        Ok(())
+    };
+    for op in ops {
+        if let OpKind::Import(import) = &mut op.kind {
+            externalize(&mut import.raw_ref)?;
+        }
+        if let OpKind::Message(message) = &mut op.kind {
+            externalize(&mut message.content)?;
+        }
+    }
+    Ok(content)
+}
+
+fn shared_session(shared_incarnation: u64, late_content: bool) -> io::Result<()> {
     let dir = tempfile::tempdir()?;
     let ar = dir.path().join("sender/.editchain");
     let workspace = dir.path().join("receiver");
@@ -135,20 +164,33 @@ fn shared_session(shared_incarnation: u64) -> io::Result<()> {
     let mut revision = json!(0);
     let mut identity = None;
     for (ordinal, incarnation, text, count) in [
-        (2, shared_incarnation, "shared session is visible", 1),
+        (2, shared_incarnation, "shared session is visible", 1usize),
         (3, 3, "another received item stays visible", 2),
         (4, shared_incarnation, "shared session updated live", 2),
     ] {
         // Raw records, outputs and proofs can arrive in separate rounds.
         // Keep the previous verified view until this occurrence is complete.
-        let ops = fixture::occurrence(ordinal, incarnation, text)?;
+        let deferred = late_content && ordinal == 2;
+        let value = if deferred {
+            format!("{text} {}", "large message ".repeat(400))
+        } else {
+            text.into()
+        };
+        let mut ops = fixture::occurrence(ordinal, incarnation, &value)?;
+        let blobs = if deferred {
+            deferred_payloads(&mut ops)?
+        } else {
+            Vec::new()
+        };
         let (preview, materialization) = ops
             .split_first()
             .ok_or_else(|| io::Error::other("occurrence fixture"))?;
         fixture::append(&ar, std::slice::from_ref(preview))?;
         poll(&mut a, &mut b)?;
         let preview_rows = sync_rows(&mut server, &opened, &mut revision)?;
-        let before = count - usize::from(ordinal < 4);
+        let before = count
+            .checked_sub(usize::from(ordinal < 4))
+            .ok_or_else(|| io::Error::other("invalid expected row count"))?;
         pending_rows(&preview_rows, before, identity.as_ref())?;
         if ordinal == 2 {
             server = Server::new();
@@ -177,14 +219,34 @@ fn shared_session(shared_incarnation: u64) -> io::Result<()> {
         )?;
         fixture::append(&ar, last)?;
         poll(&mut a, &mut b)?;
-        let rows = sync_rows(&mut server, &opened, &mut revision)?;
+        let mut rows = sync_rows(&mut server, &opened, &mut revision)?;
+        if deferred {
+            require(
+                rows.iter().all(|row| {
+                    !row.get("summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| summary.starts_with(text))
+                }),
+                "message content has not arrived",
+            )?;
+            let mut store = BlobStore::new(ar.join("blobs"))?;
+            for bytes in blobs {
+                store.write(&bytes)?;
+            }
+            poll(&mut a, &mut b)?;
+            rows = sync_rows(&mut server, &opened, &mut revision)?;
+        }
         require(
             rows.len() == count,
             "complete receipts publish the item while retaining earlier received items",
         )?;
         let row = rows
             .iter()
-            .find(|row| row.get("summary").and_then(Value::as_str) == Some(text))
+            .find(|row| {
+                row.get("summary")
+                    .and_then(Value::as_str)
+                    .is_some_and(|summary| summary.starts_with(text))
+            })
             .ok_or_else(|| io::Error::other("received revision is not visible"))?;
         require(
             field(row, "group")? == "session:73",

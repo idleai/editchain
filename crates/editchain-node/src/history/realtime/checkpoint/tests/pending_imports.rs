@@ -9,12 +9,16 @@ mod codex {
     ));
 }
 
-fn receipt(op: &Op) -> serde_json::Value {
+pub(super) fn receipt(op: &Op) -> serde_json::Value {
     let bytes = editchain_store::format::encode_op(op).unwrap();
     serde_json::json!({"id":op.id, "digest":blake3::hash(&bytes).as_bytes()})
 }
 
-fn ledger(root: &std::path::Path, received: &serde_json::Value, local: &serde_json::Value) {
+pub(super) fn ledger(
+    root: &std::path::Path,
+    received: &serde_json::Value,
+    local: &serde_json::Value,
+) {
     let directory = root.join(".editchain/multiplayer");
     std::fs::create_dir_all(&directory).unwrap();
     editchain_store::durable::atomic_write(
