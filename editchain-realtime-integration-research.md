@@ -1,12 +1,9 @@
 # Realtime Git and coding-agent integration for EditChain
 
-This document records the investigation before the realtime refactor. The
-[implementation and verification notes](docs/realtime-deltas.md) describe the
-completed Codex/Git delta pipeline, benchmarks, actual-session recording, and
-remaining provider boundaries. Repository gap descriptions below refer to the
-inspected baseline.
+This document records the investigation before the realtime refactor. Repository
+gap descriptions below refer to the inspected baseline.
 
-EditChain should observe normally launched Codex sessions and preserve the existing durable import semantics while introducing a retained, incremental processing path. Realtime mode must support `+1 op` changes through admission, projection, layout, transport and rendering after an initial load. Animated snapshot replacement validates interaction behavior but does not fulfill realtime processing. The [operation-delta contract](docs/realtime-deltas.md) records this requirement and the implementation gaps. Codex hooks can supply prompt activity signals and wake the importer; a versioned transcript adapter remains useful for discovery and recovery. A Codex app-server connection is a separate option when EditChain manages the session or can connect to its known runtime.
+EditChain should observe normally launched Codex sessions and preserve the existing durable import semantics while introducing a retained, incremental processing path. Realtime mode must support `+1 op` changes through admission, projection, layout, transport and rendering after an initial load. Animated snapshot replacement validates interaction behavior but does not fulfill realtime processing. Codex hooks can supply prompt activity signals and wake the importer; a versioned transcript adapter remains useful for discovery and recovery. A Codex app-server connection is a separate option when EditChain manages the session or can connect to its known runtime.
 
 The main implementation gap is between capture and presentation. EditChain already handles growing sources, immutable revisions, and replay. It currently presents a fixed history snapshot, and refreshing that snapshot clears selection and expansion. Realtime mode therefore needs coordinated ingestion, snapshot publication, and stable visual identity; installing a hook alone will not deliver it.
 
@@ -106,7 +103,7 @@ Animation should follow semantic state transitions. A pre-tool signal can activa
 
 On each published revision, retain selection by logical key, expanded groups by stable group key, and the visible scroll anchor by item identity rather than row number. Preserve the user's choice to follow new activity or inspect older history. Animate visible insertions, status changes, and position changes; coalesce bursts and skip lengthy replay animations after reconnect. Respect reduced-motion preferences. Existing rows and their details must refer to compatible revisions: either materialize the necessary old detail data, retain the old snapshot backend, or atomically switch view and details together. Keeping stale rows while reading arbitrary new source state would defeat the current consistency checks.
 
-The live processing path must retain the canonical chain and projection in a long-lived runtime, apply newly admitted operations and retractions, update affected item/group/Git indexes, and send versioned view deltas. Incrementality is an initial architectural requirement, not a deferred optimization after snapshot replacement. Full rebuild is reserved for bootstrap and recovery when incremental state cannot be continued safely. The [operation-delta contract](docs/realtime-deltas.md) defines required complexity and end-to-end acceptance evidence.
+The live processing path must retain the canonical chain and projection in a long-lived runtime, apply newly admitted operations and retractions, update affected item/group/Git indexes, and send versioned view deltas. Incrementality is an initial architectural requirement, not a deferred optimization after snapshot replacement. Full rebuild is reserved for bootstrap and recovery when incremental state cannot be continued safely.
 
 Optimizing the Codex helper requires care: its history builder uses preceding records to associate calls with results and maintain item identities. Passing only the newly appended bytes to a fresh builder would lose context. A persistent builder or validated checkpoint/cache can reduce repeated decoding; its restart path must reproduce the same deterministic projection as complete replay. The exporter is also a standalone workspace linked to the sibling Codex checkout, so packaging and version coupling deserve their own compatibility check. [Exporter contract](/mnt/hot/ambientlight/repos/editchain/tools/codex-session-exporter/README.md:1)
 

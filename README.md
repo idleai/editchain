@@ -45,8 +45,6 @@ global storage and accepts absolute, `~`/`~/`, or (single-folder) relative paths
 ```
 
 Archiving requires a trusted workspace and `editchain-history.tracking.enabled`.
-See the
-[human-history archive](./docs/vscode-human-work.md#portable-human-history-archive).
 
 Imports are incremental and idempotent. The human importer validates each
 archive over the byte length captured at discovery and then replays that same
@@ -96,5 +94,4 @@ Rust/WASM view from `editchain-history-renderer`.
 Run `./scripts/lint.sh` for Rust checks; it requires `cargo-deny`.
 
 [Extension tests](./extensions/vscode-editchain/README.md#tests) ·
-[Implementation notes](./docs/refactor.md) ·
 [Model provenance](./MODELS.md)
