@@ -242,6 +242,18 @@ quarantine rows that legitimately used it. The scope ledger therefore stores
 received receipts for export gating and local provenance for capture as
 separate sets.
 
+The live view presents the latest fully validated occurrence it has received
+for each Codex item, including a session slice whose earlier records precede
+the export cutoff. Missing outputs or contradictory occurrence proofs still
+retract that item; received turn removals retire it. Complete-source logical
+replay and cross-session topology retain their full-prefix requirements, so a
+visible received revision does not imply that the whole session was shared.
+Raw Import previews are replaced by those verified items as their occurrence
+proofs arrive. A task path can hide members only while its summary exists,
+so a singleton between streamed arrivals remains directly visible.
+Live checkpoint version 9 republishes these already-retained partial items from
+the reducer indexes, without importing or requesting the excluded history.
+
 Operations and blobs have separate completion states. A record can be durable
 while its content is still missing. After a crash, rebuild synchronization
 progress from durable records and verified blobs. Lost acknowledgments cause

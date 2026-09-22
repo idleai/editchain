@@ -6,6 +6,14 @@ use super::{LiveWorkspace, Result};
 use editchain_protocol::rank::Measure;
 
 impl LiveWorkspace {
+    pub(super) fn restore_partial_items(&mut self) -> Result<()> {
+        self.poisoned = true;
+        let changes = self.projection.refresh_partial_items();
+        let (removed, blocks) = self.apply_blocks(changes)?;
+        drop(self.connect(&removed, blocks)?);
+        Ok(())
+    }
+
     pub(super) fn restore_human_streams(&mut self) -> Result<()> {
         self.poisoned = true;
         let mut blocks: Vec<_> = self

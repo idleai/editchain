@@ -49,6 +49,23 @@ Saved multiplayer receipts wake the open live view; a slow outgoing reply does
 not delay that notification. Recorded diffs become available as their content
 arrives, including when the view was opened before its content store existed.
 
+For a Codex conversation, keep its source device's History view open in live
+mode so the local session importer captures new activity. First confirm that a
+new message or tool result appears locally, then find the same content on the
+other device. **Sent (confirmed saved by peer)** and the other device's
+**Received here** counts show durable delivery; opening the received row checks
+the complete capture → transfer → display path. A completed percentage alone
+does not prove that a particular conversation was captured or displayed.
+
+An ongoing Codex session can be shared from a cutoff in its middle. The live
+view shows the latest fully validated item revisions it has received and applies
+received removals, even when earlier parts of the session remain private.
+Temporary **Import** rows become normal conversation rows as their supporting
+records arrive; that transition should not make the received session disappear.
+Older session names and ancestry may be unavailable if their records precede
+the cutoff. Updating this build and reopening History repairs previously hidden
+received items from the local cache; enabling full-history backfill is unnecessary.
+
 ### Human-session names
 
 New human activity uses session headers such as **ambientlight**,

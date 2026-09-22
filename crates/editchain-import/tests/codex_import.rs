@@ -399,6 +399,167 @@ fn retained_logical_projection_matches_replay_after_every_admission_and_retracti
 }
 
 #[test]
+fn shared_session_suffix_shows_verified_revisions_without_its_private_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let imported = import_projection_prefix(
+        &dir,
+        &derivation_records(),
+        &ImportOptions::default(),
+        &mut MemoryCursorStore::new(),
+    );
+    let ops = canonical_revisions(&imported.ops.ops);
+    let mut live = editchain_project::live::LiveProjection::default();
+    let mut visible = std::collections::BTreeMap::new();
+    let mut first_key = None;
+    let source_ordinal = |op: &editchain_core::Op| {
+        if is_provider_evidence(op) {
+            op.parents.iter().next().unwrap().seq >> 16
+        } else {
+            op.id.seq >> 16
+        }
+    };
+    // The source's first occurrence was retained before the sharing cutoff.
+    // Every later message/revision has its own complete occurrence proof.
+    for ordinal in 2..=5 {
+        let added = ops
+            .iter()
+            .filter(|op| source_ordinal(op) == ordinal)
+            .cloned()
+            .collect();
+        let changes = live.apply(added, &[]);
+        for key in changes.removed {
+            drop(visible.remove(&key));
+        }
+        visible.extend(changes.upserts);
+        let items: Vec<_> = visible
+            .values()
+            .filter(|row| row.key.starts_with("item:"))
+            .collect();
+        assert!(
+            live.current_items().is_empty(),
+            "a received slice must not claim a complete provider replay"
+        );
+        if ordinal == 4 {
+            assert!(items.is_empty(), "a received removal retires the item");
+            continue;
+        }
+        let [item] = <[_; 1]>::try_from(items).unwrap();
+        if ordinal == 2 {
+            first_key = Some(item.key.clone());
+        } else if ordinal == 3 {
+            assert_eq!(Some(&item.key), first_key.as_ref(), "one live revision");
+        } else {
+            assert_ne!(Some(&item.key), first_key.as_ref(), "new incarnation");
+        }
+        assert_eq!(item.anchor.seq >> 16, ordinal);
+        assert_eq!(live.item_owners(item.anchor), vec![item.key.clone()]);
+    }
+    let before: Vec<_> = visible.keys().cloned().collect();
+    let prefix = ops
+        .iter()
+        .filter(|op| source_ordinal(op) == 1)
+        .cloned()
+        .collect();
+    let changes = live.apply(prefix, &[]);
+    for key in changes.removed {
+        drop(visible.remove(&key));
+    }
+    visible.extend(changes.upserts);
+    assert_eq!(
+        live.current_items().len(),
+        1,
+        "later backfill completes replay"
+    );
+    for key in before {
+        assert!(
+            visible.contains_key(&key),
+            "backfill preserves visible identities"
+        );
+    }
+}
+
+#[test]
+fn shared_session_items_still_require_complete_unambiguous_occurrence_proofs() {
+    let dir = tempfile::tempdir().unwrap();
+    let imported = import_projection_prefix(
+        &dir,
+        &derivation_records(),
+        &ImportOptions::default(),
+        &mut MemoryCursorStore::new(),
+    );
+    let ops = canonical_revisions(&imported.ops.ops);
+    let suffix: Vec<_> = ops
+        .into_iter()
+        .filter(|op| {
+            let id = if is_provider_evidence(op) {
+                *op.parents.iter().next().unwrap()
+            } else {
+                op.id
+            };
+            id.seq >> 16 == 5
+        })
+        .collect();
+    let message = suffix
+        .iter()
+        .find(|op| matches!(op.kind, OpKind::Message(_)))
+        .unwrap()
+        .clone();
+    let mut conflict = suffix
+        .iter()
+        .find(|op| is_provider_evidence(op))
+        .unwrap()
+        .clone();
+    let mut live = editchain_project::live::LiveProjection::default();
+    let waiting = live.apply(
+        suffix
+            .into_iter()
+            .filter(|op| op.id != message.id)
+            .collect(),
+        &[],
+    );
+    assert!(
+        waiting.upserts.keys().all(|key| !key.starts_with("item:")),
+        "missing output stays hidden"
+    );
+    let received = live.apply(vec![message.clone()], &[]);
+    let key = received
+        .upserts
+        .keys()
+        .find(|key| key.starts_with("item:"))
+        .unwrap()
+        .clone();
+
+    conflict.id.node = editchain_core::NodeId(991);
+    let OpKind::Note(note) = &mut conflict.kind else {
+        panic!("evidence fixture");
+    };
+    let Payload::Inline(raw) = &mut note.content else {
+        panic!("inline evidence fixture");
+    };
+    let mut evidence: editchain_core::provider::ProviderEvidence =
+        serde_json::from_slice(raw).unwrap();
+    let ProviderFact::CodexDerivation(meta) = &mut evidence.fact else {
+        panic!("derivation fixture");
+    };
+    meta.thread.0 = "contradictory-thread".into();
+    *raw = serde_json::to_vec(&evidence).unwrap();
+    let disputed = live.apply(vec![conflict.clone()], &[]);
+    assert!(
+        disputed.removed.contains(&key),
+        "ambiguous proof retracts the visible item"
+    );
+    assert!(!disputed.upserts.contains_key(&key));
+    let repaired = live.apply(Vec::new(), &[conflict.id]);
+    assert!(repaired.upserts.contains_key(&key));
+    let missing = live.apply(Vec::new(), &[message.id]);
+    assert!(
+        missing.removed.contains(&key),
+        "lost output retracts the visible item"
+    );
+    assert!(!missing.upserts.contains_key(&key));
+}
+
+#[test]
 fn user_message_echoes_fold_without_erasing_edits_repetition_or_new_incarnations() {
     let dir = tempfile::tempdir().unwrap();
     let user = |ordinal, id, text| {

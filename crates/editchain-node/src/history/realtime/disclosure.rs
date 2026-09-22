@@ -222,14 +222,15 @@ impl LiveWorkspace {
         };
         let old = (view.hidden, view.summarized);
         let exposed = view.exposed;
+        // A singleton path has no summary to expand. Keep it visible while
+        // streamed arrivals split or extend the surrounding task paths.
         view.hidden = !exposed
             && block.meta.task_summary.is_none()
             && self.graph.foldable(key)
-            && block
-                .meta
-                .task_group
-                .as_ref()
-                .is_some_and(|key| self.disclosure.groups.get(key).copied().unwrap_or(true));
+            && block.meta.task_group.as_ref().is_some_and(|key| {
+                self.tasks.has_summary(key)
+                    && self.disclosure.groups.get(key).copied().unwrap_or(true)
+            });
         view.summarized =
             !exposed
                 && block.meta.task_summary.is_some()

@@ -23,6 +23,9 @@ use serde as _;
 use editchain_node as _;
 use editchain_protocol as _;
 
+#[path = "processes/shared_session.rs"]
+mod shared_session;
+
 fn require(condition: bool, message: &'static str) -> io::Result<()> {
     if condition {
         Ok(())
