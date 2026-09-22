@@ -149,6 +149,16 @@ exact evidence with a deterministic traversal break. This prevents normalized
 command results with small hashed IDs from reaching the live graph long before
 their session backbone. Protocol-1 peers fail negotiation before inventory.
 
+Each native connection retains an index of exact encoded evidence and follows
+the segment append frontier. Inventories share immutable record bytes; incoming
+receipt pages update only their own keys, and content receipts resolve only the
+record that authorizes them. A receipt no longer replays the entire local chain.
+The first inventory still reads existing history, and each round still compares
+the approved inventory. Cached readers validate segment metadata, and durable
+transactions reread the sharing ledger under the writer lock. Conflicting variants,
+excluded history and private-content receipt requirements retain their existing
+meaning. A failed storage operation cannot produce an acknowledgment.
+
 **Inventory must include evidence, not just accepted IDs.** The current
 [OpSet](../crates/editchain-core/src/admission.rs) retains every distinct encoded
 variant and quarantines all variants of a conflicted ID. Use a record key such

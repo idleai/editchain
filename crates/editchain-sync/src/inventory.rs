@@ -2,9 +2,9 @@
 
 use crate::{invalid, RecordKey};
 use editchain_store::format::decode_op;
-use std::{collections::BTreeMap, io};
+use std::io;
 
-pub(crate) fn parent_first(records: &BTreeMap<RecordKey, Vec<u8>>) -> io::Result<Vec<RecordKey>> {
+pub(crate) fn parent_first(records: &crate::evidence::Records) -> io::Result<Vec<RecordKey>> {
     let keys: Vec<_> = records.keys().copied().collect();
     let mut state = vec![0u8; keys.len()];
     let mut ordered = Vec::with_capacity(keys.len());

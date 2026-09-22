@@ -260,14 +260,15 @@ impl Session {
         if self.pull.staged.is_empty() {
             return Ok(());
         }
-        let acks = self.replica.ingest_records(&self.pull.staged)?;
+        let acks = self
+            .replica
+            .ingest_into(&self.pull.staged, Some(&mut self.local))?;
         for record in acks {
             replies.push(Object { record, blob: None }.ack());
             self.progress.records = self.progress.records.saturating_add(1);
         }
         self.pull.staged.clear();
         self.pull.staged_bytes = 0;
-        self.local = self.replica.snapshot()?;
         Ok(())
     }
 

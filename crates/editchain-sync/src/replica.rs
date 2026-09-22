@@ -1,17 +1,19 @@
 //! Exact evidence, explicit export scope, and durable receiving transactions.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read};
 use std::ops::Bound::{Excluded, Unbounded};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use editchain_core::{Admission, ContentId, OpId, Payload};
+use editchain_core::{ContentId, OpId, Payload};
 use editchain_store::durable::{atomic_write, sync_parent_dir};
 use editchain_store::format::{decode_op, Page};
-use editchain_store::{BlobStore, CanonicalChain};
+use editchain_store::BlobStore;
 use serde::{Deserialize, Serialize};
 
+use crate::evidence::{Evidence, Records};
 use crate::{content, invalid, CHUNK_BYTES, INVENTORY_PAGE, MAX_OBJECT_BYTES};
 
 /// Identity of one exact representation, including quarantined variants.
@@ -96,7 +98,7 @@ fn validate_space(space: &str) -> io::Result<()> {
 /// Stable inventory and exact bytes for one bounded reconciliation round.
 #[derive(Debug, Default)]
 pub struct Snapshot {
-    records: BTreeMap<RecordKey, Vec<u8>>,
+    records: Records,
     received: BTreeSet<RecordKey>,
     received_blobs: BTreeSet<[u8; 32]>,
 }
@@ -122,7 +124,7 @@ impl Snapshot {
     /// Inspect exact bytes without re-encoding an operation.
     #[must_use]
     pub fn record(&self, key: RecordKey) -> Option<&[u8]> {
-        self.records.get(&key).map(Vec::as_slice)
+        self.records.get(&key).map(AsRef::as_ref)
     }
 
     /// Whether this round includes an exact variant.
@@ -165,6 +167,7 @@ impl Snapshot {
 pub struct Replica {
     root: PathBuf,
     space: String,
+    evidence: Evidence,
 }
 
 impl Replica {
@@ -190,16 +193,22 @@ impl Replica {
         let replica = Self {
             root: root.to_owned(),
             space: space.to_owned(),
+            evidence: Evidence::new(root),
         };
         let _writer = crate::writer(root)?;
         if replica.scope_path().exists() {
             let _scope = replica.load_scope()?;
         } else {
-            let chain = CanonicalChain::read(root)?;
             let excluded = if backfill {
                 BTreeSet::new()
             } else {
-                evidence(&chain).keys().copied().collect()
+                replica
+                    .evidence
+                    .read(root)?
+                    .records
+                    .keys()
+                    .copied()
+                    .collect()
             };
             replica.save_scope(&Scope {
                 version: 1,
@@ -224,16 +233,29 @@ impl Replica {
     /// # Errors
     /// Returns writer contention, scope, or canonical storage errors.
     pub fn snapshot(&self) -> io::Result<Snapshot> {
+        self.evidence.warm(&self.root)?;
         let _writer = crate::writer(&self.root)?;
         let scope = self.load_scope()?;
-        let chain = CanonicalChain::read(&self.root)?;
-        let mut records = evidence(&chain);
-        records.retain(|key, _| !scope.excluded.contains(key));
+        let evidence = self.evidence.read(&self.root)?;
+        let records = evidence
+            .records
+            .iter()
+            .filter(|(key, _)| !scope.excluded.contains(key))
+            .map(|(key, bytes)| (*key, Arc::clone(bytes)))
+            .collect();
         Ok(Snapshot {
             records,
             received: scope.received,
             received_blobs: scope.received_blobs,
         })
+    }
+
+    /// Operations decoded from segments by this replica's retained reader.
+    /// In-memory reference inspection is not included. Useful for measuring
+    /// whether small receipts replay previously indexed history.
+    #[must_use]
+    pub fn decoded_records(&self) -> u64 {
+        self.evidence.decoded()
     }
 
     /// Explicitly include previously withheld history in future inventories.
@@ -256,6 +278,14 @@ impl Replica {
     /// Rejects malformed/mismatched records before writing, writer contention,
     /// or any failed fsync. A caller must not acknowledge an error.
     pub fn ingest_records(&self, records: &[(RecordKey, Vec<u8>)]) -> io::Result<Vec<RecordKey>> {
+        self.ingest_into(records, None)
+    }
+
+    pub(crate) fn ingest_into(
+        &self,
+        records: &[(RecordKey, Vec<u8>)],
+        snapshot: Option<&mut Snapshot>,
+    ) -> io::Result<Vec<RecordKey>> {
         let total = records
             .iter()
             .fold(0usize, |size, (_, bytes)| size.saturating_add(bytes.len()));
@@ -267,9 +297,10 @@ impl Replica {
                 return Err(invalid("record identity or digest mismatch"));
             }
         }
+        self.evidence.warm(&self.root)?;
         let mut writer = crate::writer(&self.root)?;
-        let chain = CanonicalChain::read(&self.root)?;
-        let mut known = chain.evidence().clone();
+        let known = self.evidence.read(&self.root)?;
+        let mut staged = BTreeSet::new();
         let mut scope = self.load_scope()?;
         let mut page = Page::new(0);
         let mut scope_changed = false;
@@ -284,9 +315,8 @@ impl Replica {
                 let _: bool = scope.local.insert(*key);
                 scope_changed = true;
             }
-            if known.classify(key.id, bytes) != Admission::Duplicate {
+            if !known.records.contains_key(key) && staged.insert(*key) {
                 let _: bool = scope.received.insert(*key);
-                let _: Admission = known.insert(key.id, bytes.clone());
                 page.add_record(0, bytes.clone());
             }
         }
@@ -295,6 +325,15 @@ impl Replica {
         }
         if !page.records.is_empty() {
             writer.append_page(&page)?;
+        }
+        if let Some(snapshot) = snapshot {
+            // Only the receipt page changes the receiver's view. The outgoing
+            // snapshot and its pagination remain frozen for the entire round.
+            for (key, bytes) in records {
+                drop(snapshot.records.insert(*key, Arc::from(bytes.as_slice())));
+            }
+            snapshot.received = scope.received;
+            snapshot.received_blobs = scope.received_blobs;
         }
         Ok(records.iter().map(|(key, _)| *key).collect())
     }
@@ -360,11 +399,19 @@ impl Replica {
         let encoded = snapshot
             .record(key)
             .ok_or_else(|| invalid("record outside scope"))?;
+        self.record_references(encoded, |hash| snapshot.permits_blob(key, hash))
+    }
+
+    fn record_references(
+        &self,
+        encoded: &[u8],
+        permits_blob: impl Fn([u8; 32]) -> bool,
+    ) -> io::Result<content::References> {
         let op = decode_op(encoded).map_err(io::Error::other)?;
         let mut references = content::references(&op);
         if let Some(Payload::Blob(reference)) = content::structured_payload(&op) {
             if let ContentId::Hash256(hash) = reference.id {
-                if snapshot.permits_blob(key, hash) {
+                if permits_blob(hash) {
                     if let Some(bytes) = self.read_content(&references, hash)? {
                         content::nested(&mut references, &bytes);
                     }
@@ -417,18 +464,20 @@ impl Replica {
         if bytes.len() > MAX_OBJECT_BYTES || blake3::hash(bytes).as_bytes() != &hash {
             return Err(invalid("received blob hash or length mismatch"));
         }
+        self.evidence.warm(&self.root)?;
         let _writer = crate::writer(&self.root)?;
         let mut scope = self.load_scope()?;
-        let chain = CanonicalChain::read(&self.root)?;
-        let mut records = evidence(&chain);
-        records.retain(|key, _| !scope.excluded.contains(key));
-        let snapshot = Snapshot {
-            records,
-            received: scope.received.clone(),
-            received_blobs: scope.received_blobs.clone(),
-        };
+        let evidence = self.evidence.read(&self.root)?;
+        let encoded = evidence
+            .records
+            .get(&key)
+            .filter(|_| !scope.excluded.contains(&key))
+            .ok_or_else(|| invalid("record outside scope"))?;
+        let references = self.record_references(encoded, |hash| {
+            !scope.received.contains(&key) || scope.received_blobs.contains(&hash)
+        })?;
         if !content::matches_len(
-            &self.references(&snapshot, key)?,
+            &references,
             hash,
             u64::try_from(bytes.len()).map_err(io::Error::other)?,
         ) {
@@ -462,20 +511,4 @@ impl Replica {
             &serde_json::to_vec(scope).map_err(io::Error::other)?,
         )
     }
-}
-
-fn evidence(chain: &CanonicalChain) -> BTreeMap<RecordKey, Vec<u8>> {
-    chain
-        .evidence()
-        .evidence()
-        .map(|(id, bytes)| {
-            (
-                RecordKey {
-                    id: *id,
-                    digest: *blake3::hash(bytes).as_bytes(),
-                },
-                bytes.to_vec(),
-            )
-        })
-        .collect()
 }

@@ -4,6 +4,7 @@
 //! authentication must finish before its replication protocol is exposed.
 
 mod content;
+mod evidence;
 mod identity;
 mod inventory;
 mod ipc;

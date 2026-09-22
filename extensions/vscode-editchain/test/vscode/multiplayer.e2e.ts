@@ -36,6 +36,10 @@ async function status(): Promise<any> {
 }
 async function live(): Promise<void> {
   await browser.waitUntil(async () => (await status()).peers.some((peer: any) => peer.state === 'Live'), { timeout: 120000, interval: 500, timeoutMsg: 'Approved relay peer did not become live' });
+  await browser.waitUntil(() => browser.execute(() => Array.from(document.querySelectorAll('.statusbar-item'))
+    .some(item => item.textContent?.includes('Sharing · 1/1 connected'))),
+    { timeout: 10000, interval: 100, timeoutMsg: 'The status bar must count the authenticated connection' });
+  report.connectedStatusVisible = true;
 }
 async function button(label: string): Promise<boolean> {
   return browser.execute(label => {
