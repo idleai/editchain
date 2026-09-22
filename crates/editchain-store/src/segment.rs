@@ -30,6 +30,13 @@ impl SegmentStore {
         &self.chain_dir
     }
 
+    /// Sequence this writer will append to. A newly opened writer starts after
+    /// every existing segment, while holding the exclusive append lock.
+    #[must_use]
+    pub const fn segment_sequence(&self) -> u32 {
+        self.next_seq
+    }
+
     /// Open or create a chain directory.
     ///
     /// # Errors

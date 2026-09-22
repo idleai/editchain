@@ -33,7 +33,8 @@ The History UI renders locally received records and shows missing dependencies
 or content. Working-tree synchronization, simultaneous document editing, remote
 command execution, and remote browsing of local files are separate features.
 
-An initial space has one agreed export scope. Fine-grained redaction needs a
+Each replica has an explicit outgoing export scope, changeable by its owner.
+Fine-grained redaction needs a
 separate design: changing an operation's payload while retaining its ID creates
 conflicting evidence under the current storage rules.
 
@@ -198,10 +199,30 @@ Authorize both inventory and content against the agreed scope. Knowing a blob
 hash is insufficient authorization. Missing parents outside the scope remain
 explicitly missing; fetching dependencies must not expand sharing implicitly.
 
-An independently supplied exact copy of a withheld baseline record becomes
-shareable evidence, but its preexisting content blobs stay gated: permission to
-export and evidence of authorship are separate durable facts, and the first is
-never inferred from the second.
+Legacy exclusion baselines can admit an independently supplied exact copy as
+shareable evidence, with preexisting content still gated by content receipts.
+An explicit append cutoff remains in force even for independently received
+copies of earlier records. Incoming availability includes those receipts so they
+are not repeatedly downloaded, while outgoing inventories continue to exclude
+them. Export permission and local authorship remain separate durable facts.
+
+### Changing the outgoing cutoff
+
+The local `set_scope` control operation explicitly chooses all retained history
+or a fresh append boundary. It holds the writer lock and records the sequence of
+the next segment; selecting a cutoff does not scan the corpus or enumerate a
+large exclusion set. Cached evidence retains the first segment of each exact
+variant, so appending a duplicate or changing recorded clocks cannot move old
+evidence past the boundary. Reconnect and automatic resume only reopen consent.
+
+Each selection increments a durable consent revision. A small `scope-revision`
+fence is synced before the updated scope ledger. Live sessions recheck it before
+processing messages or starting a pass, including buffered content requests;
+the extension also retires active bridges during selection. A crash between the
+fence and ledger writes blocks earlier consent and reports an inactive policy.
+Repeating an explicit selection repairs it. Previously received copies and device
+approvals are preserved. Workers without the new ledger fields reject it rather
+than reopening with broader consent. The network protocol remains version 3.
 
 ## 6. Durability and live updates
 

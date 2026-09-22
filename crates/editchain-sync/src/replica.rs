@@ -1,5 +1,6 @@
 //! Exact evidence, explicit export scope, and durable receiving transactions.
 
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read};
@@ -14,6 +15,8 @@ use editchain_store::BlobStore;
 use serde::{Deserialize, Serialize};
 
 use crate::evidence::{Evidence, Records};
+use crate::scope::{ensure_revision, Scope};
+use crate::SharingScope;
 use crate::{content, invalid, CHUNK_BYTES, INVENTORY_PAGE, MAX_OBJECT_BYTES};
 
 /// Identity of one exact representation, including quarantined variants.
@@ -42,48 +45,7 @@ impl RecordKey {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Scope {
-    version: u16,
-    space: String,
-    excluded: BTreeSet<RecordKey>,
-    received: BTreeSet<RecordKey>,
-    received_blobs: BTreeSet<[u8; 32]>,
-    /// Exact records this device retained locally before a peer independently
-    /// supplied the same bytes. Kept separate from `received` so that export
-    /// permission and blob gating never imply peer authorship.
-    ///
-    /// Version-1 ledgers written before this field existed default to empty.
-    /// Their received-but-formerly-excluded entries are ambiguous and are not
-    /// retroactively attributed to this device.
-    #[serde(default)]
-    local: BTreeSet<RecordKey>,
-}
-
-impl Scope {
-    fn read(root: &Path) -> io::Result<Self> {
-        const LIMIT: u64 = 128 * 1024 * 1024;
-        let file = fs::File::open(root.join("multiplayer/scope.json"))?;
-        if file.metadata()?.len() > LIMIT {
-            return Err(invalid("scope metadata exceeds limit"));
-        }
-        let mut bytes = Vec::new();
-        let _read = file.take(LIMIT.saturating_add(1)).read_to_end(&mut bytes)?;
-        if u64::try_from(bytes.len()).map_err(io::Error::other)? > LIMIT {
-            return Err(invalid("scope metadata exceeds limit"));
-        }
-        let scope: Self =
-            serde_json::from_slice(&bytes).map_err(|_error| invalid("invalid scope metadata"))?;
-        if scope.version != 1 {
-            return Err(invalid("unsupported scope version"));
-        }
-        validate_space(&scope.space)?;
-        Ok(scope)
-    }
-}
-
-fn validate_space(space: &str) -> io::Result<()> {
+pub(crate) fn validate_space(space: &str) -> io::Result<()> {
     if space.is_empty()
         || space.len() > 128
         || !space
@@ -101,6 +63,7 @@ pub struct Snapshot {
     records: Records,
     received: BTreeSet<RecordKey>,
     received_blobs: BTreeSet<[u8; 32]>,
+    scope_revision: u64,
 }
 
 impl Snapshot {
@@ -168,6 +131,7 @@ pub struct Replica {
     root: PathBuf,
     space: String,
     evidence: Evidence,
+    scope_revision: Cell<u64>,
 }
 
 impl Replica {
@@ -178,6 +142,30 @@ impl Replica {
     pub fn bound_space(root: &Path) -> io::Result<Option<String>> {
         match Scope::read(root) {
             Ok(scope) => Ok(Some(scope.space)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Inspect effective sharing consent without reading history or changing it.
+    ///
+    /// # Errors
+    /// Rejects damaged metadata. An interrupted change is reported as inactive.
+    pub fn sharing_scope(root: &Path) -> io::Result<Option<SharingScope>> {
+        match Scope::read(root) {
+            Ok(scope) => {
+                let mut summary = scope.summary();
+                if let Err(error) = ensure_revision(root, scope.revision) {
+                    if error.get_ref().is_some_and(
+                        <dyn std::error::Error + Send + Sync>::is::<crate::scope::ScopeChanged>,
+                    ) {
+                        summary.active = false;
+                    } else {
+                        return Err(error);
+                    }
+                }
+                Ok(Some(summary))
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
@@ -194,10 +182,13 @@ impl Replica {
             root: root.to_owned(),
             space: space.to_owned(),
             evidence: Evidence::new(root),
+            scope_revision: Cell::new(0),
         };
         let _writer = crate::writer(root)?;
         if replica.scope_path().exists() {
-            let _scope = replica.load_scope()?;
+            let scope = Scope::read(root)?;
+            replica.check_space(&scope)?;
+            replica.scope_revision.set(scope.revision);
         } else {
             let excluded = if backfill {
                 BTreeSet::new()
@@ -217,6 +208,8 @@ impl Replica {
                 received: BTreeSet::new(),
                 received_blobs: BTreeSet::new(),
                 local: BTreeSet::new(),
+                revision: 0,
+                cutoff: None,
             })?;
         }
         Ok(replica)
@@ -233,6 +226,15 @@ impl Replica {
     /// # Errors
     /// Returns writer contention, scope, or canonical storage errors.
     pub fn snapshot(&self) -> io::Result<Snapshot> {
+        self.snapshot_for(false)
+    }
+
+    pub(crate) fn receiving_snapshot(&self) -> io::Result<Snapshot> {
+        self.snapshot_for(true)
+    }
+
+    fn snapshot_for(&self, receiving: bool) -> io::Result<Snapshot> {
+        self.ensure_scope()?;
         self.evidence.warm(&self.root)?;
         let _writer = crate::writer(&self.root)?;
         let scope = self.load_scope()?;
@@ -240,13 +242,16 @@ impl Replica {
         let records = evidence
             .records
             .iter()
-            .filter(|(key, _)| !scope.excluded.contains(key))
-            .map(|(key, bytes)| (*key, Arc::clone(bytes)))
+            .filter(|(key, record)| {
+                !scope.excludes(**key, record.segment) || receiving && scope.received.contains(key)
+            })
+            .map(|(key, record)| (*key, Arc::clone(&record.bytes)))
             .collect();
         Ok(Snapshot {
             records,
             received: scope.received,
             received_blobs: scope.received_blobs,
+            scope_revision: scope.revision,
         })
     }
 
@@ -263,10 +268,35 @@ impl Replica {
     /// # Errors
     /// Returns writer contention or a failed durable scope update.
     pub fn include_backfill(&self) -> io::Result<()> {
-        let _writer = crate::writer(&self.root)?;
-        let mut scope = self.load_scope()?;
-        scope.excluded.clear();
-        self.save_scope(&scope)
+        self.set_sharing_scope(true).map(|_| ())
+    }
+
+    /// Explicitly select all retained history or a fresh append cutoff. Reopening
+    /// and reconnecting never call this. Receipts, history and approvals survive.
+    ///
+    /// # Errors
+    /// Returns writer contention or metadata failure. Interrupted selections
+    /// fail closed until the user repeats this explicit selection.
+    pub fn set_sharing_scope(&self, backfill: bool) -> io::Result<SharingScope> {
+        let writer = crate::writer(&self.root)?;
+        let mut scope = Scope::read(&self.root)?;
+        self.check_space(&scope)?;
+        scope.select(&self.root, (!backfill).then(|| writer.segment_sequence()))?;
+        self.save_scope(&scope)?;
+        self.scope_revision.set(scope.revision);
+        Ok(scope.summary())
+    }
+
+    pub(crate) fn ensure_scope(&self) -> io::Result<()> {
+        ensure_revision(&self.root, self.scope_revision.get())
+    }
+
+    fn ensure_snapshot(&self, snapshot: &Snapshot) -> io::Result<()> {
+        self.ensure_scope()?;
+        if snapshot.scope_revision != self.scope_revision.get() {
+            return Err(crate::scope::changed());
+        }
+        Ok(())
     }
 
     /// Persist exact variants, returning only keys whose bytes are now durable.
@@ -302,6 +332,9 @@ impl Replica {
         let known = self.evidence.read(&self.root)?;
         let mut staged = BTreeSet::new();
         let mut scope = self.load_scope()?;
+        if let Some(snapshot) = snapshot.as_ref() {
+            self.ensure_snapshot(snapshot)?;
+        }
         let mut page = Page::new(0);
         let mut scope_changed = false;
         for (key, bytes) in records {
@@ -310,10 +343,17 @@ impl Replica {
             // Its local provenance is retained separately: the bytes existed
             // here before a peer supplied them, so capture must keep deriving
             // from them even though export now needs a receipt.
-            if scope.excluded.remove(key) {
-                let _: bool = scope.received.insert(*key);
-                let _: bool = scope.local.insert(*key);
-                scope_changed = true;
+            let excluded = scope.excluded.remove(key);
+            let withheld = known
+                .records
+                .get(key)
+                .is_some_and(|record| scope.before_cutoff(record.segment));
+            if excluded || withheld {
+                if scope.received.insert(*key) {
+                    let _: bool = scope.local.insert(*key);
+                    scope_changed = true;
+                }
+                scope_changed |= excluded;
             }
             if !known.records.contains_key(key) && staged.insert(*key) {
                 let _: bool = scope.received.insert(*key);
@@ -375,6 +415,7 @@ impl Replica {
         key: RecordKey,
         hash: [u8; 32],
     ) -> io::Result<Option<Vec<u8>>> {
+        self.ensure_snapshot(snapshot)?;
         if !snapshot.permits_blob(key, hash) {
             return Ok(None);
         }
@@ -396,6 +437,7 @@ impl Replica {
     }
 
     fn references(&self, snapshot: &Snapshot, key: RecordKey) -> io::Result<content::References> {
+        self.ensure_snapshot(snapshot)?;
         let encoded = snapshot
             .record(key)
             .ok_or_else(|| invalid("record outside scope"))?;
@@ -471,9 +513,9 @@ impl Replica {
         let encoded = evidence
             .records
             .get(&key)
-            .filter(|_| !scope.excluded.contains(&key))
+            .filter(|record| !scope.excludes(key, record.segment) || scope.received.contains(&key))
             .ok_or_else(|| invalid("record outside scope"))?;
-        let references = self.record_references(encoded, |hash| {
+        let references = self.record_references(&encoded.bytes, |hash| {
             !scope.received.contains(&key) || scope.received_blobs.contains(&hash)
         })?;
         if !content::matches_len(
@@ -494,21 +536,31 @@ impl Replica {
     }
 
     fn load_scope(&self) -> io::Result<Scope> {
+        self.ensure_scope()?;
         let scope = Scope::read(&self.root)?;
+        self.check_space(&scope)?;
+        if scope.revision != self.scope_revision.get() {
+            return Err(crate::scope::changed());
+        }
+        Ok(scope)
+    }
+
+    fn check_space(&self, scope: &Scope) -> io::Result<()> {
         if scope.space != self.space {
             return Err(invalid(
                 "workspace belongs to a different collaboration space",
             ));
         }
-        Ok(scope)
+        Ok(())
     }
 
     fn save_scope(&self, scope: &Scope) -> io::Result<()> {
         fs::create_dir_all(self.root.join("multiplayer"))?;
         sync_parent_dir(&self.root.join("multiplayer"))?;
-        atomic_write(
-            &self.scope_path(),
-            &serde_json::to_vec(scope).map_err(io::Error::other)?,
-        )
+        let bytes = serde_json::to_vec(scope).map_err(io::Error::other)?;
+        if bytes.len() > 128 * 1024 * 1024 {
+            return Err(invalid("scope metadata exceeds limit"));
+        }
+        atomic_write(&self.scope_path(), &bytes)
     }
 }

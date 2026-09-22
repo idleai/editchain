@@ -31,6 +31,11 @@ enum Request {
         space: String,
         backfill: bool,
     },
+    SetScope {
+        chain_dir: PathBuf,
+        space: String,
+        backfill: bool,
+    },
     Approve {
         chain_dir: PathBuf,
         space: String,
@@ -71,7 +76,8 @@ impl Worker {
                 Ok(json!(DeviceIdentity::load_or_create(&device_dir)?.public()))
             }
             Request::Scope { chain_dir } => {
-                Ok(json!({ "space": Replica::bound_space(&chain_dir)? }))
+                let scope = Replica::sharing_scope(&chain_dir)?;
+                Ok(json!({ "space": scope.as_ref().map(|value| &value.space), "scope": scope }))
             }
             Request::Configure {
                 chain_dir,
@@ -83,6 +89,16 @@ impl Worker {
                     replica.include_backfill()?;
                 }
                 Ok(json!({ "space": replica.space() }))
+            }
+            Request::SetScope {
+                chain_dir,
+                space,
+                backfill,
+            } => {
+                // `open` preserves existing consent. Only this explicit local
+                // operation replaces it, including when recovering a failed write.
+                let replica = Replica::open(&chain_dir, &space, true)?;
+                Ok(json!(replica.set_sharing_scope(backfill)?))
             }
             Request::Approve {
                 chain_dir,
@@ -182,6 +198,11 @@ pub fn run_worker(reader: &mut impl Read, writer: &mut impl Write) -> io::Result
 fn error_code(error: &io::Error) -> &'static str {
     let kind = error.kind();
     if error
+        .get_ref()
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<crate::scope::ScopeChanged>)
+    {
+        "sharing_scope_changed"
+    } else if error
         .get_ref()
         .is_some_and(<dyn std::error::Error + Send + Sync>::is::<crate::AuthenticationFailure>)
     {

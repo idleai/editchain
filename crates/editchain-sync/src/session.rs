@@ -72,10 +72,11 @@ impl Session {
     /// # Errors
     /// Returns local storage contention or failure; callers reconnect and retry.
     pub fn tick(&mut self) -> io::Result<Vec<Message>> {
+        self.replica.ensure_scope()?;
         if !self.progress.accepted || self.progress.synchronizing {
             return Ok(Vec::new());
         }
-        self.local = self.replica.snapshot()?;
+        self.local = self.replica.receiving_snapshot()?;
         self.pull = Pull {
             waiting_page: true,
             ..Pull::default()
@@ -96,6 +97,7 @@ impl Session {
     /// Rejects mismatched negotiation, unsolicited or oversized messages, invalid
     /// object bytes, and any failed durable write. No failed write is acknowledged.
     pub fn receive(&mut self, message: Message) -> io::Result<Vec<Message>> {
+        self.replica.ensure_scope()?;
         if !self.progress.accepted {
             if matches!(&message, Message::Hello { version, encoding, .. } if *version != PEER_VERSION || *encoding != 1)
             {

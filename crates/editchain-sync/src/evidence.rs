@@ -13,9 +13,16 @@ use crate::{invalid, RecordKey};
 
 pub(crate) type Records = BTreeMap<RecordKey, Arc<[u8]>>;
 
+#[derive(Debug)]
+pub(crate) struct RetainedRecord {
+    pub bytes: Arc<[u8]>,
+    /// First occurrence, so appending a duplicate cannot bypass a cutoff.
+    pub segment: u32,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct Corpus {
-    pub records: Records,
+    pub records: BTreeMap<RecordKey, RetainedRecord>,
     pub decoded: u64,
 }
 
@@ -28,7 +35,7 @@ impl TailCorpus for Corpus {
         &mut self,
         op: Arc<Op>,
         encoded: &[u8],
-        _location: OpRecordLocation,
+        location: OpRecordLocation,
     ) -> io::Result<Admission> {
         self.decoded = self.decoded.saturating_add(1);
         let key = RecordKey {
@@ -36,7 +43,7 @@ impl TailCorpus for Corpus {
             digest: *blake3::hash(encoded).as_bytes(),
         };
         if let Some(previous) = self.records.get(&key) {
-            if previous.as_ref() != encoded {
+            if previous.bytes.as_ref() != encoded {
                 return Err(invalid("record digest collision"));
             }
             return Ok(Admission::Duplicate);
@@ -54,7 +61,13 @@ impl TailCorpus for Corpus {
         } else {
             Admission::Accepted
         };
-        drop(self.records.insert(key, Arc::from(encoded)));
+        drop(self.records.insert(
+            key,
+            RetainedRecord {
+                bytes: Arc::from(encoded),
+                segment: location.segment_seq,
+            },
+        ));
         Ok(admission)
     }
 
