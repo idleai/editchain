@@ -112,7 +112,7 @@ impl SecurePeer {
         self.authenticated.as_ref()
     }
 
-    /// Only durable replication progress is exposed to the local UI.
+    /// Durable receipt counters and separately labelled in-flight work for the UI.
     #[must_use]
     pub fn progress(&self) -> &Progress {
         self.session.progress()

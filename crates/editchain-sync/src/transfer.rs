@@ -4,7 +4,8 @@ use std::collections::BTreeSet;
 use std::io;
 
 use crate::{
-    invalid, Message, RecordKey, Replica, Snapshot, CHUNK_BYTES, INVENTORY_PAGE, MAX_OBJECT_BYTES,
+    invalid, CheckProgress, DownloadProgress, Message, RecordKey, Replica, Snapshot, CHUNK_BYTES,
+    INVENTORY_PAGE, MAX_OBJECT_BYTES,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -38,6 +39,18 @@ pub(crate) struct Download {
 }
 
 impl Download {
+    pub(crate) fn progress(&self) -> io::Result<DownloadProgress> {
+        Ok(DownloadProgress {
+            content: self.object.blob.is_some(),
+            received_bytes: u64::try_from(self.bytes.len()).map_err(io::Error::other)?,
+            total_bytes: self
+                .total
+                .map(u64::try_from)
+                .transpose()
+                .map_err(io::Error::other)?,
+        })
+    }
+
     pub(crate) fn new(object: Object) -> Self {
         Self {
             object,
@@ -76,6 +89,7 @@ impl Download {
 
 #[derive(Debug, Default)]
 pub(crate) struct Source {
+    pub progress: CheckProgress,
     snapshot: Option<Snapshot>,
     order: Vec<RecordKey>,
     next: usize,
@@ -83,6 +97,7 @@ pub(crate) struct Source {
     more: bool,
     active: Option<(Object, Vec<u8>, usize)>,
     unacked: BTreeSet<Object>,
+    awaiting_check: bool,
 }
 
 impl Source {
@@ -91,7 +106,7 @@ impl Source {
         replica: &Replica,
         after: Option<RecordKey>,
     ) -> io::Result<Message> {
-        if self.active.is_some() || !self.unacked.is_empty() {
+        if self.active.is_some() || !self.unacked.is_empty() || self.awaiting_check {
             return Err(invalid(
                 "inventory before pending transfers were acknowledged",
             ));
@@ -99,6 +114,11 @@ impl Source {
         if after.is_none() {
             let snapshot = replica.snapshot()?;
             self.order = snapshot.ordered_keys()?;
+            self.progress = CheckProgress {
+                pass: self.progress.pass.saturating_add(1),
+                total_records: Some(u64::try_from(self.order.len()).map_err(io::Error::other)?),
+                ..CheckProgress::default()
+            };
             self.snapshot = Some(snapshot);
             self.next = 0;
         } else if after != self.cursor || !self.more {
@@ -116,8 +136,10 @@ impl Source {
         let more = self.next < self.order.len();
         self.cursor = records.last().copied();
         self.more = more;
+        self.awaiting_check = true;
         Ok(Message::Page {
             offset,
+            total: u64::try_from(self.order.len()).map_err(io::Error::other)?,
             records,
             more,
         })
@@ -129,6 +151,9 @@ impl Source {
         object: Object,
         offset: u32,
     ) -> io::Result<Message> {
+        if !self.awaiting_check {
+            return Err(invalid("object request outside an active inventory page"));
+        }
         let offset = usize::try_from(offset).map_err(io::Error::other)?;
         if offset == 0 {
             if self.active.is_some()
@@ -150,6 +175,7 @@ impl Source {
                 Some(encoded.to_vec())
             };
             let Some(bytes) = bytes else {
+                self.progress.unavailable = self.progress.unavailable.saturating_add(1);
                 return Ok(Message::Missing {
                     record: object.record,
                     blob: object.blob,
@@ -190,6 +216,20 @@ impl Source {
         if !self.unacked.remove(&object) {
             return Err(invalid("acknowledgment for an unsent object"));
         }
+        Ok(())
+    }
+
+    pub(crate) fn checked(&mut self, end: u64) -> io::Result<()> {
+        if !self.awaiting_check
+            || self.active.is_some()
+            || !self.unacked.is_empty()
+            || end != u64::try_from(self.next).map_err(io::Error::other)?
+        {
+            return Err(invalid("unexpected inventory check confirmation"));
+        }
+        self.awaiting_check = false;
+        self.progress.checked_records = end;
+        self.progress.complete = !self.more;
         Ok(())
     }
 }

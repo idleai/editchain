@@ -2,14 +2,14 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { GitHubDirectory, DirectorySync, advertisement, advertisementName, repositoryName } = require('../../out/multiplayer/discovery');
-const { NativeWorker } = require('../../out/multiplayer/native');
+const { NativeWorker, PEER_PROTOCOL } = require('../../out/multiplayer/native');
 const { fixture, binaries, until } = require('./multiplayerFixture');
 
 async function candidate(files) {
   const worker = new NativeWorker(binaries.peer);
   try {
     const device = await worker.request({ type: 'identity', device_dir: files.directory + '/device' });
-    return { version: 1, protocol: 2, encoding: 1, space: 'known-space', device, instance: 'editchain-multiplayer-' + 'a'.repeat(24),
+    return { version: 1, protocol: PEER_PROTOCOL, encoding: 1, space: 'known-space', device, instance: 'editchain-multiplayer-' + 'a'.repeat(24),
       endpoint: { tunnelId: 'known-tunnel', clusterId: 'use', hostId: 'host', hostPublicKeys: ['YWJj'], clientRelayUri: 'wss://use.rel.tunnels.api.visualstudio.com/tunnel' }, expiresAt: Date.now() + 600_000 };
   } finally { worker.stop(); }
 }

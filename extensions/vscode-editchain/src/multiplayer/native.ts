@@ -1,13 +1,14 @@
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process';
 import { Duplex } from 'node:stream';
 import { FrameDecoder } from '../frameDecoder';
+import { validWorkProgress, WorkProgress } from './progress';
 
 export const CONTROL_LIMIT = 512 * 1024;
 export const INPUT_LIMIT = 64 * 1024;
-export const PEER_PROTOCOL = 2;
+export const PEER_PROTOCOL = 3;
 export class NativePeerError extends Error {}
 export type PublicDevice = { certificate: string; fingerprint: string };
-export type PeerProgress = { accepted: boolean; synchronizing: boolean; rounds: number; records: number; blobs: number; unavailable: number;
+export type PeerProgress = WorkProgress & { accepted: boolean; synchronizing: boolean; rounds: number; records: number; blobs: number; unavailable: number;
   sent_records?: number; sent_blobs?: number };
 export type PeerTurn = { bytes: string; device: PublicDevice | null; progress: PeerProgress };
 export type PeerOptions = { chain_dir: string; device_dir: string; space: string; remote?: string };
@@ -153,6 +154,10 @@ export class PeerBridge {
         Number.isSafeInteger(result.progress[key as keyof PeerProgress]))) {
       throw new NativePeerError('Invalid native multiplayer progress.');
     }
+    if (!result.progress.incoming || !result.progress.outgoing) {
+      throw new NativePeerError('Native multiplayer worker is outdated. Rebuild or reinstall EditChain.');
+    }
+    if (!validWorkProgress(result.progress)) throw new NativePeerError('Invalid native multiplayer work progress.');
     const bytes = Buffer.from(result.bytes, 'base64');
     const changed = result.progress.records !== this.previous.records || result.progress.blobs !== this.previous.blobs;
     this.previous = result.progress;

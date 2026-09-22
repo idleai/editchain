@@ -26,6 +26,8 @@ pub enum Message {
     Page {
         /// Position of the first identity in the stable parent-ordered snapshot.
         offset: u64,
+        /// Exact total records in this frozen inventory, including known records.
+        total: u64,
         /// Parent-first identities, including quarantined variants.
         records: Vec<RecordKey>,
         /// Whether the stable snapshot has another page.
@@ -66,6 +68,12 @@ pub enum Message {
         record: RecordKey,
         /// Persisted blob, if any.
         blob: Option<[u8; 32]>,
+    },
+    /// The receiver checked the complete page, including content responses.
+    /// This is distinct from an acknowledgment of newly saved bytes.
+    Checked {
+        /// Exclusive end position of the page being confirmed.
+        end: u64,
     },
 }
 

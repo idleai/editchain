@@ -3,35 +3,13 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::io;
 
-use serde::Serialize;
-
 use crate::transfer::{Download, Object, Source};
 use crate::{
-    invalid, Message, RecordKey, Replica, Snapshot, INVENTORY_PAGE, MAX_OBJECT_BYTES, PEER_VERSION,
+    invalid, CheckProgress, Message, Progress, RecordKey, Replica, Snapshot, INVENTORY_PAGE,
+    MAX_OBJECT_BYTES, PEER_VERSION,
 };
 
 const BATCH_BYTES: usize = 4 * 1024 * 1024;
-
-/// Credential-free durable progress in both directions of this connection.
-#[derive(Debug, Default, Clone, Serialize)]
-pub struct Progress {
-    /// Space/version negotiation has succeeded over an authenticated channel.
-    pub accepted: bool,
-    /// A reconciliation round is in progress.
-    pub synchronizing: bool,
-    /// Completed inventory rounds (not a claim about future edits).
-    pub rounds: u64,
-    /// Exact records durably received on this connection.
-    pub records: u64,
-    /// Content blobs durably received on this connection.
-    pub blobs: u64,
-    /// Sent records acknowledged as durable by the authenticated remote peer.
-    pub sent_records: u64,
-    /// Sent blobs acknowledged as durable by the authenticated remote peer.
-    pub sent_blobs: u64,
-    /// Missing content responses in the current or most recently completed round.
-    pub unavailable: u64,
-}
 
 /// Replication state for one already authenticated, authorized peer.
 /// A failed call invalidates the session; reconnect reconstructs from disk.
@@ -82,7 +60,7 @@ impl Session {
         }
     }
 
-    /// Current durable progress; this never includes staged or partial bytes.
+    /// Current work; saved counters remain separate from partial downloads.
     #[must_use]
     pub fn progress(&self) -> &Progress {
         &self.progress
@@ -104,6 +82,11 @@ impl Session {
         };
         self.progress.synchronizing = true;
         self.progress.unavailable = 0;
+        self.progress.incoming = CheckProgress {
+            pass: self.progress.rounds.saturating_add(1),
+            ..CheckProgress::default()
+        };
+        self.update_work()?;
         Ok(vec![Message::Inventory { after: None }])
     }
 
@@ -142,12 +125,14 @@ impl Session {
                     .need(&self.replica, Object { record, blob }, offset)?,
             ),
             Message::Ack { record, blob } => self.acknowledge(Object { record, blob })?,
+            Message::Checked { end } => self.source.checked(end)?,
             Message::Page {
                 offset,
+                total,
                 records,
                 more,
             } => {
-                self.page(offset, records, more)?;
+                self.page(offset, total, records, more)?;
                 self.advance(&mut replies)?;
             }
             Message::Chunk {
@@ -184,13 +169,21 @@ impl Session {
                     ));
                 }
                 self.progress.unavailable = self.progress.unavailable.saturating_add(1);
+                self.progress.incoming.unavailable = self.progress.unavailable;
                 self.advance(&mut replies)?;
             }
         }
+        self.update_work()?;
         Ok(replies)
     }
 
-    fn page(&mut self, offset: u64, records: Vec<RecordKey>, more: bool) -> io::Result<()> {
+    fn page(
+        &mut self,
+        offset: u64,
+        total: u64,
+        records: Vec<RecordKey>,
+        more: bool,
+    ) -> io::Result<()> {
         if !self.pull.waiting_page || records.len() > INVENTORY_PAGE || (more && records.is_empty())
         {
             return Err(invalid("unsolicited or oversized inventory page"));
@@ -200,9 +193,24 @@ impl Session {
         {
             return Err(invalid("invalid inventory position or duplicate keys"));
         }
-        self.pull.position = offset
+        let end = offset
             .checked_add(u64::try_from(records.len()).map_err(io::Error::other)?)
             .ok_or_else(|| invalid("inventory position overflow"))?;
+        // Progress crosses JSON/JavaScript unchanged. Do not accept a total
+        // that cannot be represented there or allocate based on a peer's claim.
+        if total > 9_007_199_254_740_991
+            || end > total
+            || more != (end < total)
+            || self
+                .progress
+                .incoming
+                .total_records
+                .is_some_and(|before| before != total)
+        {
+            return Err(invalid("inconsistent inventory total"));
+        }
+        self.progress.incoming.total_records = Some(total);
+        self.pull.position = end;
         self.pull.after = records.last().copied();
         self.pull.waiting_page = false;
         self.pull.more = more;
@@ -283,6 +291,10 @@ impl Session {
         if let Some(object) = self.pull.blobs.pop_front() {
             return self.download(object, replies);
         }
+        self.progress.incoming.checked_records = self.pull.position;
+        replies.push(Message::Checked {
+            end: self.pull.position,
+        });
         if self.pull.more {
             self.pull.waiting_page = true;
             replies.push(Message::Inventory {
@@ -291,6 +303,7 @@ impl Session {
         } else {
             self.progress.synchronizing = false;
             self.progress.rounds = self.progress.rounds.saturating_add(1);
+            self.progress.incoming.complete = true;
         }
         Ok(())
     }
@@ -319,6 +332,32 @@ impl Session {
     fn download(&mut self, object: Object, replies: &mut Vec<Message>) -> io::Result<()> {
         replies.push(object.need(0)?);
         self.pull.download = Some(Download::new(object));
+        Ok(())
+    }
+
+    fn update_work(&mut self) -> io::Result<()> {
+        self.progress.outgoing = self.source.progress.clone();
+        let downloading = self.pull.download.as_ref().map(|value| value.object);
+        self.progress.pending_records = u64::try_from(
+            self.pull
+                .records
+                .len()
+                .saturating_add(self.pull.staged.len())
+                .saturating_add(usize::from(
+                    downloading.is_some_and(|object| object.blob.is_none()),
+                )),
+        )
+        .map_err(io::Error::other)?;
+        self.progress.pending_blobs = u64::try_from(self.pull.blobs.len().saturating_add(
+            usize::from(downloading.is_some_and(|object| object.blob.is_some())),
+        ))
+        .map_err(io::Error::other)?;
+        self.progress.download = self
+            .pull
+            .download
+            .as_ref()
+            .map(Download::progress)
+            .transpose()?;
         Ok(())
     }
 }

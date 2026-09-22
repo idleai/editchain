@@ -132,7 +132,7 @@ The implemented messages are defined in [wire.rs](../crates/editchain-sync/src/w
 | Message | Meaning |
 | --- | --- |
 | `Hello` | Check the space and both protocol/encoding versions after device authentication. |
-| `Inventory` / `Page` | Request a page of exact record identities and digests in that scope. |
+| `Inventory` / `Page` | Request a page of exact record identities and digests, with the frozen scope's total count. |
 | `Need` / `Chunk` | Transfer one bounded record or permitted blob, including explicit offsets. |
 | `Missing` | Leave unavailable content pending for a later reconciliation round. |
 | `Ack` | Acknowledge a record or blob only after durable ingestion. |
@@ -140,14 +140,29 @@ The implemented messages are defined in [wire.rs](../crates/editchain-sync/src/w
 Idle sessions start another reconciliation round. The native bridge detects
 unresponsive peers and resets their connection; TLS owns authenticated shutdown.
 
-Peer protocol 2 walks the consent-filtered snapshot in deterministic parent-first
+Peer protocol 3 walks the consent-filtered snapshot in deterministic parent-first
 order. Each `Page` includes its checked absolute position; `Inventory.after` is
 the last exact key of the preceding page, rather than a numeric lower bound.
 Available parent variants precede their descendants across page boundaries.
 Missing/excluded parents are not imported into scope, and cycles retain their
 exact evidence with a deterministic traversal break. This prevents normalized
 command results with small hashed IDs from reaching the live graph long before
-their session backbone. Protocol-1 peers fail negotiation before inventory.
+their session backbone. Protocol-1 and protocol-2 peers fail negotiation before inventory.
+
+Every `Page` advertises the same total for that pass. Receivers reject changing
+totals, positions beyond the total and contradictory continuation flags, without
+allocating from the claimed count. `Checked { end }` confirms a complete page
+after its records and content responses finish. The sender accepts it only at
+the offered page's end, with no active object or unacknowledged durable receipts.
+This also measures already-present records, which correctly produce no new
+receipt count. A missing-content response finishes a check but stays visible as
+unavailable work; 100% of a check does not conceal missing revision bytes.
+
+Progress exposes separate incoming and outgoing pass totals, checked counts,
+known queued records/content, and the current download's buffered byte count.
+The UI computes percentages and remaining checks from each fixed total. Buffered
+bytes never count as durable receipts. New appends enter the next pass, and a
+reconnect begins a fresh check against the durable store.
 
 Each native connection retains an index of exact encoded evidence and follows
 the segment append frontier. Inventories share immutable record bytes; incoming

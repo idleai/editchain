@@ -107,6 +107,7 @@ fn source_cursor_positions_stay_stable_across_appends_and_reject_wrong_continuat
     let mut source = Source::default();
     let Message::Page {
         offset,
+        total: advertised_total,
         records,
         more,
     } = source.inventory(&replica, None)?
@@ -114,7 +115,13 @@ fn source_cursor_positions_stay_stable_across_appends_and_reject_wrong_continuat
         return Err(io::Error::other("missing first page"));
     };
     check_eq!(offset, 0, "first page position");
+    check_eq!(
+        advertised_total,
+        300,
+        "a stable total is available before any transfer"
+    );
     check!(more, "fixture spans pages");
+    source.checked(u64::try_from(records.len()).map_err(io::Error::other)?)?;
     check!(
         source
             .inventory(&replica, records.first().copied())
@@ -127,6 +134,7 @@ fn source_cursor_positions_stay_stable_across_appends_and_reject_wrong_continuat
     loop {
         let Message::Page {
             offset,
+            total: advertised_total,
             records,
             more,
         } = source.inventory(&replica, cursor)?
@@ -139,6 +147,12 @@ fn source_cursor_positions_stay_stable_across_appends_and_reject_wrong_continuat
             "page positions increase by the number of records"
         );
         total = total.saturating_add(records.len());
+        check_eq!(
+            advertised_total,
+            300,
+            "concurrent appends cannot move the denominator"
+        );
+        source.checked(u64::try_from(total).map_err(io::Error::other)?)?;
         cursor = records.last().copied();
         if !more {
             break;
@@ -165,16 +179,19 @@ fn receiver_rejects_page_gaps_replays_duplicates_and_empty_continuations() -> io
     for bad in [
         Message::Page {
             offset: 1,
+            total: 1,
             records: vec![key],
             more: false,
         },
         Message::Page {
             offset: 0,
+            total: 2,
             records: vec![key, key],
             more: false,
         },
         Message::Page {
             offset: 0,
+            total: 1,
             records: vec![],
             more: true,
         },
@@ -190,6 +207,7 @@ fn receiver_rejects_page_gaps_replays_duplicates_and_empty_continuations() -> io
     let _hello = peer.receive(peer.hello())?;
     let page = Message::Page {
         offset: 0,
+        total: 2,
         records: vec![key],
         more: true,
     };

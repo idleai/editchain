@@ -9,6 +9,7 @@ mod identity;
 mod inventory;
 mod ipc;
 mod membership;
+mod progress;
 mod replica;
 mod secure;
 mod session;
@@ -18,9 +19,10 @@ mod wire;
 pub use identity::{DeviceIdentity, PublicDevice};
 pub use ipc::{run_worker, MAX_CONTROL_BYTES};
 pub use membership::{Membership, MAX_DEVICES};
+pub use progress::{CheckProgress, DownloadProgress, Progress};
 pub use replica::{RecordKey, Replica, Snapshot};
 pub use secure::{SecurePeer, MAX_BRIDGE_BYTES, MAX_BRIDGE_OUTPUT};
-pub use session::{Progress, Session};
+pub use session::Session;
 pub use wire::{decode_message, encode_message, FrameDecoder, Message};
 
 /// Largest operation or blob accepted by the first replication protocol.
@@ -31,8 +33,8 @@ pub const CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 /// Maximum record identities in one inventory page.
 pub const INVENTORY_PAGE: usize = 128;
-/// Parent-ordered inventories with checked page positions.
-pub const PEER_VERSION: u16 = 2;
+/// Parent-ordered inventories with stable totals and confirmed page checks.
+pub const PEER_VERSION: u16 = 3;
 
 fn invalid(message: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)

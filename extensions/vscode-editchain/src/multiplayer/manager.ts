@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { Duplex } from 'node:stream';
 import { NativeWorker, PeerBridge, PeerOptions, PeerProgress, PublicDevice, PEER_PROTOCOL } from './native';
+import { checking, missingContent } from './progress';
 import { encodeInvitation, Invitation, JoinRequest, parseInvitation, parseRequest, savedInvitation } from './invitation';
 import { ClientTransport, HostLease, HostTransport, managementClient, RelayClient, RelayHost, RelayJournal, removeSavedRelay, validateLease } from './relay';
 import { ProbeError } from '../devTunnels/probe';
@@ -207,8 +208,8 @@ export class MultiplayerManager {
     const edges = [...this.edges.entries()];
     return { space: this.space, enabled: this.enabled, hosting: !!this.host, message: this.message,
       peers: [ ...edges.map(([connection, edge]) => ({ connection, fingerprint: edge.device?.fingerprint ?? edge.clientKey,
-        state: !edge.progress?.accepted ? 'Authenticating' : edge.progress.synchronizing ? 'Catching up'
-          : edge.progress.unavailable ? 'Waiting for content' : 'Live', progress: edge.progress })),
+        state: !edge.progress?.accepted ? 'Authenticating' : checking(edge.progress) ? 'Catching up'
+          : missingContent(edge.progress) ? 'Waiting for content' : 'Live', progress: edge.progress })),
       ...[...this.peers.entries()].filter(([key]) => !edges.some(([, edge]) => edge.device?.fingerprint === key || edge.clientKey === key))
         .map(([fingerprint, peer]) => ({ fingerprint, state: peer.state })) ] };
   }

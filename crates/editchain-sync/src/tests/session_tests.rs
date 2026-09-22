@@ -6,6 +6,7 @@ use super::*;
 use crate::Session;
 
 mod ancestry_tests;
+mod progress_tests;
 
 type Queue = VecDeque<(bool, Message)>;
 type EncodedRecord = (RecordKey, Vec<u8>);
@@ -298,6 +299,8 @@ fn mismatched_hello_and_unsolicited_or_corrupt_transfers_fail_closed() -> io::Re
             check!(
                 peer.receive(Message::Page {
                     offset: 0,
+                    total: u64::try_from(INVENTORY_PAGE.saturating_add(1))
+                        .map_err(io::Error::other)?,
                     records: vec![key; INVENTORY_PAGE.saturating_add(1)],
                     more: false
                 })
@@ -307,6 +310,7 @@ fn mismatched_hello_and_unsolicited_or_corrupt_transfers_fail_closed() -> io::Re
         } else {
             let _replies = peer.receive(Message::Page {
                 offset: 0,
+                total: 1,
                 records: vec![key],
                 more: false,
             })?;
@@ -422,6 +426,7 @@ fn writer_contention_cannot_produce_an_acknowledgment() -> io::Result<()> {
     let (key, bytes) = record(1, b"waiting for writer")?;
     let _replies = peer.receive(Message::Page {
         offset: 0,
+        total: 1,
         records: vec![key],
         more: false,
     })?;
@@ -443,6 +448,7 @@ fn writer_contention_cannot_produce_an_acknowledgment() -> io::Result<()> {
     let _replies = peer.receive(peer.hello())?;
     let _replies = peer.receive(Message::Page {
         offset: 0,
+        total: 1,
         records: vec![key],
         more: false,
     })?;
