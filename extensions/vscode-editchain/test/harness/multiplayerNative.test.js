@@ -73,6 +73,10 @@ test('opaque production bridges deliver captured history and historical content 
     'outgoing confirmations did not match the remote durable counters');
     await until(() => statusLines.some(line => /Received here: [1-9]\d* records, [1-9]\d* content objects/.test(line)),
       'saved native history did not appear automatically in the live output');
+    assert.ok(statusLines.some(line => /Receiving check #\d+: [\d.]+%.*records checked; [\d,]+ remaining to check/.test(line)),
+      'real native inventory totals reach the automatic percentage output');
+    assert.ok(statusLines.some(line => /Sending \(peer confirmed\) check #\d+: [\d.]+%/.test(line)),
+      'the output also follows the remote peer\'s confirmed check');
     assert.deepEqual(failures, []);
     await receivedUpdates;
     assert.ok(revision > opened.live.revision, 'remote receipts publish into the already open live view');

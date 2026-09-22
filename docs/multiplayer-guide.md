@@ -94,7 +94,9 @@ available account name.
 The status bar counts authenticated **connections**, including peers that are
 syncing. **Reconnecting** means the connection was lost; **waiting for content**
 means some referenced revision data was unavailable at the last check. A connected
-peer without either suffix has finished its latest incoming history check.
+peer without either suffix has no active check or reported missing content.
+With one connected peer, **↓25% ↑50%** shows receiving and sending checks.
+Hover over the status bar to see totals and remaining checks in both directions.
 
 Run **EditChain: Show Multiplayer Status** once. The **EditChain Multiplayer**
 Output channel prints a JSON snapshot, then follows progress automatically.
@@ -102,14 +104,35 @@ Updates are timestamped and grouped to at most once per second, with a status
 line every 15 seconds while a peer is catching up or waiting. You do not need to
 run the command again; leave Output's automatic scrolling enabled to follow it.
 
-Each peer line reports records and content objects **received and saved on this
-device**, records and content **sent and confirmed saved by the peer**, completed
-synchronization passes, missing-content responses, and how
-long since a saved-data update was observed. Counts apply to the current
-connection and reset on reconnect. A's received counts describe B-to-A transfers;
-A's sent counts describe A-to-B transfers. A content object stores recorded revision data.
-Completed passes describe this device's incoming inventory checks; they do not
-mean the other device has finished receiving your history.
+Each update shows a separate check in each direction, for example:
+
+```text
+Receiving check #1: 25% — 250/1,000 records checked; 750 remaining to check.
+Sending (peer confirmed) check #1: 50% — 500/1,000 records checked; 500 remaining to check.
+Current receive batch: 0 records to save; 5 known content downloads left (includes the active one).
+Downloading content: 65,536/190,000 bytes (34.4%); not yet saved.
+```
+
+**What the percentage means:** each pass fixes its total to all records in the
+peer's approved sharing scope at the start of that pass. Already-present shared
+records count toward the check without being downloaded again. New edits enter the next
+pass, which has a new number and total. Records are storage entries, not History
+rows; one edit can produce several records.
+
+Checked counts advance after each batch (at most 128 records), including its
+content responses. Sending progress waits for the peer's confirmation. **100%
+means that check finished.** Any unavailable content remains explicitly listed,
+and the status stays **waiting for content** until a later pass repairs it.
+
+Remaining checks are not an estimate of bytes or time left. Content sizes and
+nested references are discovered during transfer, so the queue shows currently
+known downloads, not a fixed total of every content object. Partial byte progress
+applies only to the current object and does not count as saved content.
+
+The saved counters below the check progress are cumulative for this connection:
+records and content **received and saved here**, and **sent and confirmed saved
+by the peer**. They reset on reconnect; saved history persists. A's receiving
+direction is B-to-A; A's sending direction is A-to-B.
 
 During catch-up, older builds could display detached **EditChain ops** command
 results before their session records arrived. They reconnect automatically when
@@ -119,10 +142,10 @@ not fetched; new-history-only sharing can therefore start at a real history boun
 
 `Checking shared history (first pass)` means the first inventory check has not
 finished. This also happens with new-history-only sharing; it does not indicate
-which history was approved for sharing. Total remaining work, percentage, scans, and partial
-downloads are not available yet. A waiting update confirms that status reporting
-is running; unchanged saved counts alone cannot distinguish scanning, downloading,
-or a stalled transfer. Quiet, caught-up peers do not produce repeated lines.
+which history was approved for sharing. Before the first inventory page arrives,
+the total is shown as unknown. Initial local scans have no percentage yet. A
+waiting update confirms that status reporting is running; quiet, caught-up peers
+do not produce repeated lines.
 
 ## History says Codex retry
 
@@ -159,10 +182,10 @@ Install the same EditChain build on every device: the extension, the Rust
 service and the native peer worker ship together and are not meant to be mixed.
 Update all devices together.
 
-Parent-first transfer uses peer protocol 2. Update and reload both devices, then
+Progress totals and confirmations use peer protocol 3. Update and reload both devices, then
 run **EditChain: Resume / Reconnect Shared History** on both. Existing device
-approvals, received records, and sharing choices persist. A protocol-1 peer
-cannot synchronize with a protocol-2 peer.
+approvals, received records, and sharing choices persist. Protocol-1 and protocol-2
+peers cannot synchronize with a protocol-3 peer.
 
 - A workspace whose sharing ledger was written by the updated build is rejected
   by an older peer worker, which fails closed instead of continuing.

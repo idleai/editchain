@@ -19,7 +19,7 @@ function observe(t, value = status()) {
 
 test('live status follows incoming saved counts without reopening or inventing a total', t => {
   const { lines, output, tick } = observe(t, status([peer({ records: 0, blobs: 0 })]));
-  assert.match(lines.join('\n'), /Total remaining and percentage are unknown/);
+  assert.match(lines.join('\n'), /Totals are fixed at the start of each pass/);
   assert.match(lines.at(-1), /Connected; checking shared history \(first pass\).*Received here: 0 records, 0 content objects/);
   lines.length = 0;
   // Coalesce a burst of worker responses into the latest saved totals.
@@ -150,4 +150,75 @@ test('a joining peer can acquire and retire its connection ID without a false di
   tick(1000);
   assert.match(lines.at(-1), /Waiting to reconnect/);
   assert.ok(!lines.some(line => line.includes('connection no longer listed')));
+});
+
+const check = (changes = {}) => ({ pass: 1, total_records: 1000, checked_records: 250, complete: false, unavailable: 0, ...changes });
+const work = (changes = {}) => ({ incoming: check(), outgoing: check({ checked_records: 500 }), pending_records: 0, pending_blobs: 5, download: null, ...changes });
+
+test('both directions show percentages and remaining checks, then update while bytes are still unsaved', t => {
+  const { sharingLabel, sharingDetails } = require('../../out/multiplayer/statusBar');
+  const value = status([peer(work())]);
+  const { lines, output, tick } = observe(t, value);
+  assert.match(lines.at(-1), /Receiving check #1: 25%.*250\/1,000 records checked; 750 remaining/);
+  assert.match(lines.at(-1), /Sending \(peer confirmed\) check #1: 50%.*500\/1,000 records checked; 500 remaining/);
+  assert.match(lines.at(-1), /5 known content downloads left/);
+  assert.equal(sharingLabel(value), 'Sharing · 1/1 connected · ↓25% ↑50%');
+  assert.match(sharingDetails(value), /Receiving ↓ check #1: 25%/);
+  lines.length = 0;
+  output.update(status([peer(work({ download: { content: true, received_bytes: 65536, total_bytes: 190000 } }))]));
+  tick(1000);
+  assert.equal(lines.length, 1, 'byte-only updates are observable without durable counter changes');
+  assert.match(lines[0], /Downloading content: 65,536\/190,000 bytes \(34.4%\); not yet saved/);
+  assert.match(lines[0], /Receiving check #1: 25%/, 'partial content cannot finish its page');
+  assert.match(lines[0], /Received here: 128 records, 5 content objects/, 'partial bytes do not invent durable receipts');
+  output.update(status([peer(work({ incoming: check({ checked_records: 500 }), pending_blobs: 0 }))]));
+  tick(1000);
+  assert.match(lines.at(-1), /Receiving check #1: 50%.*500 remaining/);
+});
+
+test('unknown totals, empty checks, missing content and a new pass have explicit meanings', t => {
+  const { sharingLabel } = require('../../out/multiplayer/statusBar');
+  const unknown = check({ checked_records: 0, total_records: null });
+  const { lines, output, tick } = observe(t, status([peer(work({ incoming: unknown }))]));
+  assert.match(lines.at(-1), /Receiving: waiting for the shared-history total/);
+  assert.ok(!lines.at(-1).includes('Receiving check #1: 0%'), 'unknown total must not become a fabricated zero');
+  const incoming = check({ total_records: 0, checked_records: 0, complete: true });
+  const outgoing = check({ checked_records: 1000, complete: true, unavailable: 2 });
+  const missing = status([{ ...peer({ ...work({ incoming, outgoing, pending_blobs: 0 }), synchronizing: false, rounds: 1 }), state: 'Waiting for content' }]);
+  output.update(missing); tick(1000);
+  assert.match(lines.at(-1), /Receiving check #1: 100%.*0\/0 records checked; 0 remaining/);
+  assert.match(lines.at(-1), /Sending \(peer confirmed\) check #1: 100%.*2 content request\(s\) still unavailable/);
+  assert.equal(sharingLabel(missing), 'Sharing · 1/1 connected · waiting for content');
+  output.update(status([peer({ ...work({ incoming: check({ pass: 2, total_records: 1250, checked_records: 0 }) }), rounds: 1 })]));
+  tick(1000);
+  assert.match(lines.at(-1), /Receiving check #2: 0%.*0\/1,250 records checked; 1,250 remaining/);
+  assert.match(lines.at(-1), /Received here: 128 records, 5 content objects/, 'a new check does not erase cumulative receipts');
+  output.update(status([{ fingerprint, state: 'Waiting to reconnect' }])); tick(1000);
+  output.update(status([peer({ ...work({ incoming: unknown, outgoing: unknown, pending_blobs: 0 }), records: 0, blobs: 0 })])); tick(1000);
+  assert.match(lines.at(-1), /Receiving: waiting for the shared-history total/, 'reconnect does not retain a stale percentage');
+});
+
+test('work validation rejects contradictory counts and percentages never round incomplete work to 100', () => {
+  const { validWorkProgress, checkPercent } = require('../../out/multiplayer/progress');
+  assert.equal(validWorkProgress(work()), true);
+  for (const incoming of [check({ checked_records: 1001 }), check({ checked_records: -1 }), check({ total_records: NaN }),
+    check({ total_records: null, complete: true }), check({ complete: true }), check({ total_records: Number.MAX_SAFE_INTEGER + 1 })]) {
+    assert.equal(validWorkProgress(work({ incoming })), false);
+  }
+  assert.equal(validWorkProgress(work({ download: { content: true, received_bytes: 2, total_bytes: 1 } })), false);
+  assert.equal(validWorkProgress(work({ pending_blobs: -1 })), false);
+  assert.equal(checkPercent(check({ total_records: 10000, checked_records: 9999 })), '99.99%');
+  assert.equal(checkPercent(check({ total_records: 2_500_000, checked_records: 512 })), '0.02%');
+  assert.equal(checkPercent(check({ total_records: Number.MAX_SAFE_INTEGER, checked_records: Number.MAX_SAFE_INTEGER - 1 })), '99.99%');
+});
+
+test('completed checks stay quiet across unchanged passes', t => {
+  const complete = check({ checked_records: 1000, complete: true });
+  const { lines, output, tick } = observe(t, status([{ ...peer({ ...work({ incoming: complete, outgoing: complete, pending_blobs: 0 }), synchronizing: false, rounds: 1 }), state: 'Live' }]));
+  lines.length = 0;
+  for (let pass = 2; pass < 10; pass++) {
+    output.update(status([{ ...peer({ ...work({ incoming: { ...complete, pass }, outgoing: { ...complete, pass }, pending_blobs: 0 }), synchronizing: false, rounds: pass }), state: 'Live' }]));
+    tick(1000);
+  }
+  assert.equal(lines.length, 0, 'completed pass numbers alone must not fill the output');
 });

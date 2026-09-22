@@ -1,5 +1,6 @@
 import type { DiscoveryStatus } from './discovery';
 import type { SharingStatus } from './manager';
+import { checking, describeCheck, describeDownload, missingContent, workSignature } from './progress';
 
 type Status = SharingStatus & { discovery?: DiscoveryStatus };
 type Peer = SharingStatus['peers'][number];
@@ -27,7 +28,8 @@ export class MultiplayerStatusOutput {
     if (this.disposed) return;
     if (!this.started) {
       this.write('Live multiplayer status: progress updates appear automatically, at most once per second; waiting peers are reported every 15s.');
-      this.write('Received counts are saved on THIS device, per connection. Content objects hold recorded revision data. Total remaining and percentage are unknown; scans and partial downloads are not reported.');
+      this.write('Percentages measure the current history check in each direction, including already present records. Totals are fixed at the start of each pass; new edits enter the next pass. Remaining means records left to check, not bytes or time.');
+      this.write('Received counts are saved on THIS device, per connection. Known content downloads and partial bytes are reported separately; additional content may be discovered while checking records.');
       this.write('Sent counts are confirmed saved by the remote peer, per connection. Sending alone does not count until the peer acknowledges it.');
       this.started = true;
     }
@@ -89,7 +91,7 @@ export class MultiplayerStatusOutput {
       const { peer } = observation, progress = peer.progress;
       // Routine empty reconciliation rounds must not fill the log while idle.
       const signature = JSON.stringify([peer.fingerprint, peer.state, progress?.accepted, progress?.records, progress?.blobs, progress?.sent_records, progress?.sent_blobs,
-        progress?.unavailable, !!progress?.rounds]);
+        progress?.unavailable, !!progress?.rounds, ...workSignature(progress)]);
       const waiting = peer.state !== 'Live' && Date.now() - (observation.printedAt ?? 0) >= 15_000;
       if (!force && signature === observation.printed && !waiting) continue;
       this.write(describe(observation));
@@ -105,12 +107,20 @@ function label(peer: Peer): string { return peer.fingerprint ? `Peer ${peer.fing
 function describe(observation: Observation): string {
   const { peer, since, savedAt, sentAt } = observation, progress = peer.progress;
   if (!progress?.accepted) return `${label(peer)}: ${peer.state}.`;
-  const phase = progress.synchronizing ? (progress.rounds ? 'checking shared history' : 'checking shared history (first pass)')
-    : progress.unavailable ? 'waiting for content' : 'caught up at last check';
+  const phase = checking(progress) ? (progress.rounds ? 'checking shared history' : 'checking shared history (first pass)')
+    : missingContent(progress) ? 'waiting for content' : 'caught up at last check';
   const seconds = Math.max(0, Math.floor((Date.now() - (savedAt ?? since)) / 1000));
   const activity = savedAt === undefined ? `No new saved-data update observed in ${seconds}s.` : `Last saved-data update observed ${seconds}s ago.`;
   const sent = progress.sent_records === undefined || progress.sent_blobs === undefined ? 'Send progress unavailable.'
     : `Sent (confirmed saved by peer): ${progress.sent_records} records, ${progress.sent_blobs} content objects.`;
   const sendActivity = sentAt === undefined ? '' : ` Last send confirmation observed ${Math.max(0, Math.floor((Date.now() - sentAt) / 1000))}s ago.`;
+  if (progress.incoming) return [
+    `${label(peer)}: Connected; ${phase}.`,
+    `  ${describeCheck('Receiving', progress.incoming)}`,
+    `  ${describeCheck('Sending (peer confirmed)', progress.outgoing)}`,
+    `  ${describeDownload(progress)}`,
+    `  Received here: ${progress.records} records, ${progress.blobs} content objects (this connection). ${sent}`,
+    `  ${activity}${sendActivity}`,
+  ].join('\n');
   return `${label(peer)}: Connected; ${phase}. Received here: ${progress.records} records, ${progress.blobs} content objects (this connection). ${sent} Completed passes: ${progress.rounds}; missing-content responses: ${progress.unavailable}. ${activity}${sendActivity}`;
 }

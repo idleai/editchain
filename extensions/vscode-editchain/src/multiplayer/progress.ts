@@ -47,9 +47,9 @@ export function describeDownload(value: WorkProgress): string {
   const download = value.download;
   if (!download) return queue;
   const kind = download.content ? 'content' : 'record';
-  if (download.total_bytes === null) return `${queue} Waiting for ${kind} data; size not yet known.`;
+  if (download.total_bytes === null) return `${queue}\n  Waiting for ${kind} data; size not yet known.`;
   const percent = download.total_bytes === 0 ? 100 : Math.floor(1000 * download.received_bytes / download.total_bytes) / 10;
-  return `${queue} Downloading ${kind}: ${number(download.received_bytes)}/${number(download.total_bytes)} bytes (${percent}%); not yet saved.`;
+  return `${queue}\n  Downloading ${kind}: ${number(download.received_bytes)}/${number(download.total_bytes)} bytes (${percent}%); not yet saved.`;
 }
 
 /** Suppress routine completed pass numbers while still printing actual work. */

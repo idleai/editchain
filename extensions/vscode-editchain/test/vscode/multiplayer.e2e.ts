@@ -35,11 +35,30 @@ async function status(): Promise<any> {
   return browser.executeWorkbench(async vscode => (await vscode.commands.executeCommand('editchain-history.multiplayerStatus') as any).value);
 }
 async function live(): Promise<void> {
-  await browser.waitUntil(async () => (await status()).peers.some((peer: any) => peer.state === 'Live'), { timeout: 120000, interval: 500, timeoutMsg: 'Approved relay peer did not become live' });
+  let progress: any;
+  await browser.waitUntil(async () => {
+    const peer = (await status()).peers.find((peer: any) => peer.state === 'Live');
+    progress = peer?.progress;
+    return !!peer && progress.incoming?.total_records !== null && progress.outgoing?.total_records !== null;
+  }, { timeout: 120000, interval: 500, timeoutMsg: 'Approved relay peer did not become live' });
   await browser.waitUntil(() => browser.execute(() => Array.from(document.querySelectorAll('.statusbar-item'))
     .some(item => item.textContent?.includes('Sharing · 1/1 connected'))),
     { timeout: 10000, interval: 100, timeoutMsg: 'The status bar must count the authenticated connection' });
   report.connectedStatusVisible = true;
+  for (const direction of ['incoming', 'outgoing']) {
+    const check = progress[direction];
+    assert.ok(Number.isSafeInteger(check.total_records) && check.checked_records <= check.total_records,
+      `${direction} has a bounded inventory total from the packaged worker`);
+  }
+  const visibleOutput = () => browser.execute(() => (document.querySelector('[id="workbench.parts.panel"]')?.textContent ?? '').replace(/\s+/g, ' '));
+  await browser.waitUntil(async () => {
+    const text = await visibleOutput();
+    return text.includes('Receiving check #') && text.includes('remaining to check');
+  }, { timeout: 10000, interval: 100, timeoutMsg: 'The visible Output panel must show percentage and remaining checks' }).catch(async error => {
+    report.visibleProgressText = (await visibleOutput()).slice(-10000); throw error;
+  });
+  report.percentageOutputVisible = true;
+  await browser.saveScreenshot(path.join(output, 'sync-progress.png'));
 }
 async function button(label: string): Promise<boolean> {
   return browser.execute(label => {
