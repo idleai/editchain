@@ -8,4 +8,4 @@ Before r1, Claude Code v2.1.105 used local inference on [4× RTX6000 Blackwell M
 
 From the r1 implementation commit [faeadd9](https://github.com/idleai/editchain/commit/faeadd961002dc6956a9f46dcf7bcab49eef39a3), the workflow is hybrid: `gpt-5.6-sol` at max reasoning drives the main loop, with local `deepseek-v4-flash-0731` (`dsv4-flash`) subagents.
 
-Source task prompts live in [quests](./quests/). Hybrid runs use the Codex main loop for coordination and local dsv4-flash subagents for delegated work, with outcomes captured in `.result.md`. Raw Claude Code and Codex trajectories live at [editchain-sessions-raw](https://github.com/idleai/editchain-sessions-raw).
+Hybrid runs use the Codex main loop for coordination and local dsv4-flash subagents for delegated work. Raw Claude Code and Codex trajectories live at [editchain-sessions-raw](https://github.com/idleai/editchain-sessions-raw).

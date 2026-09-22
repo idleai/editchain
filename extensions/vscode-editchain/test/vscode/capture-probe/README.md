@@ -68,5 +68,4 @@ The full suite normally takes longer than this wait plus host startup/downloads.
 
 This harness does not implement or validate durable ingestion, crash recovery,
 remote or detached windows, IME composition, actual AI/chat integration, or a
-reading/skimming classifier. See the [research plan](../../../../../docs/vscode-editor-capture-plan.md)
-and [runtime findings](../../../../../docs/vscode-editor-capture-results.md).
+reading/skimming classifier.

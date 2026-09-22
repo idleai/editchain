@@ -113,8 +113,7 @@ npm run test:multiplayer:relay
 ```
 
 This check identifies itself as a same-machine test. A second network remains
-a separate observation. See [implementation checkpoints](../../docs/multiplayer-implementation.md)
-for current validation and remaining work.
+a separate observation.
 
 For the packaged two-window UI test, build and package from this directory:
 
@@ -233,8 +232,7 @@ Re-import with `editchain import --provider human`; malformed JSON, an unsupport
 schema, or an out-of-order sequence fails the import, and the importer reads only
 the byte prefix it captured at discovery, so records appended after that wait for
 the next import. The archive's recorded workspace is matched to the import's
-`--workspace` (other workspaces are skipped) without relocation. See the
-[archive and recovery notes](../../docs/vscode-human-work.md#portable-human-history-archive).
+`--workspace` (other workspaces are skipped) without relocation.
 
 Editor-input and keyboard-correlated edits are human-work indicators under the
 intentional-user assumption. The VS Code API does not authenticate physical
@@ -275,7 +273,7 @@ human-written code. The ordinary package stays on stable APIs and has partial
 coverage: unspecified selection events cannot safely distinguish deletion from
 automatic changes. Corrections that remove only text already typed in the active
 human edit are retained as `typing_correction` indicators. Deletion of pre-existing
-code still requires stronger input evidence. See [local setup and attribution rules](../../docs/vscode-human-work.md#optional-local-build-with-editor-origins).
+code still requires stronger input evidence.
 The output channel reports the loaded extension version/path and the attribution
 mode observed on the first change.
 
@@ -342,9 +340,6 @@ tail. Outbox overflow pauses
 recording with a gap event. Raw snapshots include code contents and are retained
 in the append-only chain, so storage grows with editing activity.
 
-See [the event and measurement contract](../../docs/vscode-human-work.md) for
-matching rules, supported evidence, limitations, and test commands.
-
 ## Live Codex history
 
 Open **EditChain: Open History Explorer** in a trusted workspace. Live updates
@@ -377,8 +372,7 @@ Set `editchain-history.live.enabled` to `false` to open static history by defaul
 - Native conditional windows retain unchanged decoded content between revisions.
   The DOM mounts a 16-row margin per edge, independently of the 400-row data
   prefetch margin, and commits burst responses once per animation frame.
-  `npm run perf:renderer` runs the frontend-only comparison harness; see
-  [measurements and limits](../../docs/renderer-update-performance.md).
+  `npm run perf:renderer` runs the frontend-only comparison harness.
 - Revisioned block changes update persistent native indexes and bounded WASM caches,
   and DOM rows. Surviving selection, disclosure, focus and pixel scroll anchors
   remain attached to item identities. Staying at the top follows incoming
@@ -406,14 +400,11 @@ Set `editchain-history.live.enabled` to `false` to open static history by defaul
   Forks, merges, Git attachments and unresolved/error activity remain visible.
   Concurrent tasks retain chronological order without repeated header rows.
   Ordinary updates edit individual items and affected anchors, without resending
-  a whole task. Search reveals the exact hidden item. See the
-  [grouping contract](../../docs/realtime-grouping-research.md).
+  a whole task. Search reveals the exact hidden item.
 
 **Output → EditChain History** logs startup, per-delta source bytes, decoded
 records, changed blocks and native timings. Automatic startup keeps the history
-panel in focus; the Resume command also reveals the output channel. See
-[the implementation and verification notes](../../docs/realtime-deltas.md) for
-integrity assumptions, current boundaries and the actual-session Xvfb harness.
+panel in focus; the Resume command also reveals the output channel.
 
 This first milestone observes local Codex sessions and the first workspace
 folder's Git HEAD/refs, including shared refs in linked worktrees. It also
@@ -447,7 +438,7 @@ extension opens the saved viewport first and starts collection after it renders.
 Prepared native opening plus 500 rows took 0.24–0.40 seconds on the local
 2.42-million-operation samples; these timings exclude VS Code startup.
 Initial preparation remains expensive and uses disk space. A cold Codex helper
-still rebuilds its source reducer. See [measurements and recovery](../../docs/native-memory.md).
+still rebuilds its source reducer.
 
 ## Dev Tunnels spike
 
