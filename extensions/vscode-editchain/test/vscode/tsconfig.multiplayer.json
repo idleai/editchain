@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.capture.json",
+  "compilerOptions": { "noEmit": true },
+  "include": ["./multiplayer.e2e.ts", "./wdio.multiplayer.conf.ts"]
+}

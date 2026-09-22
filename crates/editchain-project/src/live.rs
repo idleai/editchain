@@ -13,6 +13,7 @@ use std::sync::Arc;
 use editchain_index::{Map, OrderedMap, OrderedSet};
 
 mod human;
+mod imports;
 mod neighbors;
 use neighbors::Neighbors;
 /// Incremental provider spawn and completion relationships.
@@ -260,7 +261,7 @@ impl LiveProjection {
                     return None;
                 }
                 let key = ((stream(source), turn.clone()), item.clone());
-                (self.current(&key)?.incarnation == *incarnation)
+                (self.observed(&key)?.incarnation == *incarnation)
                     .then(|| self.published.get(&key).cloned())
                     .flatten()
             })
@@ -276,10 +277,51 @@ impl LiveProjection {
             .collect()
     }
 
+    /// Republish validated received items hidden by checkpoints that required
+    /// the entire source prefix. This visits retained item identities only;
+    /// it never imports or requests records outside a peer's sharing scope.
+    pub fn refresh_partial_items(&mut self) -> LiveChanges {
+        let keys: Vec<_> = self
+            .items
+            .keys()
+            .filter(|key| !self.coverage.get(&key.0 .0).is_some_and(Coverage::complete))
+            .cloned()
+            .collect();
+        let mut changes = LiveChanges::default();
+        for key in keys {
+            self.publish_item(&key, &mut changes);
+        }
+        changes
+    }
+
+    /// Revalidate retained Codex occurrences once when upgrading presentation rules.
+    /// This reads accepted records only; it cannot recover excluded history.
+    pub fn refresh_codex_items(&mut self) -> LiveChanges {
+        let imports = self
+            .facts
+            .keys()
+            .filter_map(|id| self.ops.get(id).cloned())
+            .collect();
+        let mut changes = self.apply_shared(imports, &[]);
+        let items: Vec<_> = self.items.keys().cloned().collect();
+        for item in items {
+            self.publish_item(&item, &mut changes);
+        }
+        changes
+    }
+
     fn current(&self, key: &Item) -> Option<&CodexLogicalItem> {
         if !self.coverage.get(&key.0 .0).is_some_and(Coverage::complete) {
             return None;
         }
+        self.observed(key)
+    }
+
+    // Every entry has a complete, exact occurrence proof. A private or missing
+    // earlier prefix prevents complete logical replay, but does not invalidate
+    // these received revisions. Keep the latest verified revision visible while
+    // later records arrive, and honor every removal we have actually received.
+    fn observed(&self, key: &Item) -> Option<&CodexLogicalItem> {
         let (source, item) = self.items.get(key)?.last_key_value()?;
         let removed = self.removals.get(&key.0).and_then(OrderedSet::last);
         (removed.is_none_or(|removed| source > removed)).then_some(item)
@@ -498,7 +540,7 @@ impl LiveProjection {
         if let Some(previous) = self.published.remove(key) {
             retire(previous, output);
         }
-        let Some(item) = self.current(key) else {
+        let Some(item) = self.observed(key) else {
             return;
         };
         let identity = format!(

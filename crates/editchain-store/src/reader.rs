@@ -197,7 +197,11 @@ pub fn read_op_at(chain_dir: &Path, location: OpRecordLocation) -> io::Result<Op
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-pub(crate) fn read_encoded_at(chain_dir: &Path, location: OpRecordLocation) -> io::Result<Vec<u8>> {
+/// Read bounded exact evidence bytes from an indexed immutable record location.
+///
+/// # Errors
+/// Rejects oversized locations and missing, truncated or unreadable segments.
+pub fn read_encoded_at(chain_dir: &Path, location: OpRecordLocation) -> io::Result<Vec<u8>> {
     if location.data_len > MAX_RECORD_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

@@ -2,7 +2,8 @@
 
 use super::{
     super::{
-        files::agent_file_change_index, payloads::projection_ops_with_previews,
+        files::agent_file_change_index,
+        payloads::{prepare_previews, PreviewContent},
         HistoryWindowOptions, Workspace,
     },
     LiveWorkspace, Result,
@@ -10,17 +11,26 @@ use super::{
 use editchain_project::{live::LiveRow, HistoryProjection};
 use editchain_protocol::{LiveBlock, LiveBlockMeta};
 
+pub(super) struct Presentation {
+    pub(super) block: Option<LiveBlock>,
+    pub(super) pending: Vec<editchain_core::BlobRef>,
+}
+
 impl LiveWorkspace {
     pub(super) fn local_workspace(&self, input: &LiveRow) -> Workspace {
+        self.preview_workspace(input).0
+    }
+
+    fn preview_workspace(&self, input: &LiveRow) -> (Workspace, PreviewContent) {
         let resolver = self.blobs.clone();
         let operations: Vec<_> = input
             .operations
             .iter()
             .map(|op| op.as_ref().clone())
             .collect();
-        let (previews, _, incomplete) = projection_ops_with_previews(&operations, &resolver);
+        let preview = prepare_previews(&operations, &resolver);
         let projection =
-            HistoryProjection::from_source_previews(&operations, previews, &incomplete);
+            HistoryProjection::from_source_previews(&operations, preview.ops, &preview.incomplete);
         let mut workspace = Workspace::from_projection(projection);
         workspace.source_ops.clone_from(&operations);
         workspace.source_op_index = input
@@ -51,14 +61,21 @@ impl LiveWorkspace {
                     std::slice::from_ref(meta),
                 ));
         }
-        workspace
+        (workspace, preview.content)
     }
 
-    pub(super) fn present(&self, input: &LiveRow) -> Result<Option<LiveBlock>> {
+    pub(super) fn present(&self, input: &LiveRow) -> Result<Presentation> {
         if super::tasks::Tasks::metadata_only(input, &self.projection) {
-            return Ok(None);
+            return Ok(Presentation {
+                block: None,
+                pending: Vec::new(),
+            });
         }
-        let mut workspace = self.local_workspace(input);
+        let (mut workspace, content) = self.preview_workspace(input);
+        let mut presentation = Presentation {
+            block: None,
+            pending: content.pending,
+        };
         workspace.prepare_live_item_view();
         let mut window = workspace.history_window(HistoryWindowOptions {
             offset: 0,
@@ -66,7 +83,7 @@ impl LiveWorkspace {
             include_layout: false,
         })?;
         if window.rows.is_empty() {
-            return Ok(None);
+            return Ok(presentation);
         }
         let sort_time = self
             .projection
@@ -86,7 +103,7 @@ impl LiveWorkspace {
             row.work_unit = None;
             row.group_end = false;
         }
-        Ok(Some(LiveBlock {
+        presentation.block = Some(LiveBlock {
             meta: LiveBlockMeta {
                 task_group: None,
                 task_summary: None,
@@ -108,6 +125,7 @@ impl LiveWorkspace {
                     .first()
                     .map(|row| row.node_key.clone())
                     .unwrap_or_default(),
+                human_stream: human_stream(input),
                 parents: Vec::new(),
                 chain_state: window
                     .rows
@@ -116,8 +134,20 @@ impl LiveWorkspace {
                     .unwrap_or_default(),
             },
             rows: window.rows,
-        }))
+        });
+        Ok(presentation)
     }
+}
+
+pub(super) fn human_stream(input: &LiveRow) -> Option<String> {
+    input.operations.iter().find_map(|op| {
+        // Legacy captures and provider messages keep their existing source rule.
+        let _identity = editchain_project::human::work_record(op)?.identity?;
+        let editchain_core::ScopeRef::Session(session) = op.scope else {
+            return None;
+        };
+        Some(session.0.to_string())
+    })
 }
 
 /// A completed task may still contain an explicitly unresolved tool/command.

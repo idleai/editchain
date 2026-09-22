@@ -21,6 +21,7 @@ cargo build --release -p editchain-node --bins --locked
 
 cd extensions/vscode-editchain
 npm ci
+npm run build:native
 npm run build:renderer
 npm run compile
 ```
@@ -33,10 +34,109 @@ the project you want to explore, and invoke **EditChain: Open History Explorer**
 The settings are:
 
 - `editchain-history.servicePath`: absolute path to the native service binary.
-  Release and then debug builds under the open workspace are used when empty;
-  set this explicitly when viewing a project outside the EditChain checkout.
+  Release and then debug builds under the open workspace are preferred when
+  empty, followed by the service bundled for the package's platform.
 - `editchain-history.chainDir`: EditChain data directory relative to the open
   workspace, defaulting to `.editchain`.
+
+## Multiplayer history
+
+Each participant opens a separate workspace and keeps a durable local history.
+Sharing exchanges immutable records and their referenced content. Your working
+files stay under your control; a received history row opens its recorded diff.
+
+1. On the joining device, run **EditChain: Create Multiplayer Join Request**.
+   Give the copied public request to the host through your trusted channel.
+2. On the host, run **EditChain: Host Shared History / Invite Device**. Paste the
+   request, choose new records or explicit backfill, and approve the device
+   fingerprint. Sign in to GitHub when prompted.
+3. Give the copied private invitation to that device. It contains a connect-only
+   grant and expires within one hour. Keep it out of issue trackers and logs.
+4. On the joining device, run **EditChain: Join Shared History**, paste the
+   invitation, choose its outgoing history scope, and approve the host identity.
+5. Open **EditChain: Open History Explorer** on both sides. The Sharing status
+   item distinguishes authentication, catch-up, live data and missing content.
+
+The joining device uses the invitation grant; it does not receive the host's
+GitHub credential. Persistent device keys stay in VS Code's private application
+storage. For two replicas on one machine, use separate VS Code user-data
+profiles so they receive distinct device identities.
+
+**EditChain: Remove Shared Device** removes this replica's approval and closes
+that connection. **EditChain: Stop Sharing History** disconnects peers and
+deletes this window's hosted tunnel. Existing records and received copies stay
+on their respective devices. **EditChain: Clean Up Multiplayer Tunnels** retries
+cleanup of inactive resources for the current workspace and account.
+
+Dropped connections retry automatically and catch up from durable history.
+Reloading an enabled workspace resumes its approved connections. Invitations are
+kept in VS Code SecretStorage; reconnect can use an already approved grant until
+the service expires it. **EditChain: Resume / Reconnect Shared History** retries
+after a network or account change. An expired grant needs a new invitation.
+Host reloads retain the same private tunnel resource and device identity, with
+a fresh endpoint. Closing VS Code leaves that resource available for resume
+until its service expiry (up to one day); **Stop Sharing History** deletes it
+and disables automatic resume.
+
+A hard process exit can leave the other peer waiting for its 90-second liveness
+deadline before reconnecting. The packaged restart test observed this delay;
+normal socket disconnects retry sooner. An exited extension host releases its
+local ownership lease immediately; cleanup preserves another live window's
+lease and requires this window to stop sharing first.
+
+**EditChain: Configure Multiplayer Repository Discovery** optionally publishes
+public device certificates, relay endpoints, versions and ten-minute expiry in
+GitHub repository variables. It asks for a repository and GitHub `repo` access;
+you need collaborator access to that repository. Discovery polls once a minute,
+ignores expired or incompatible entries, and refreshes only an approved device's
+existing tunnel grant. Each new pair still exchanges and approves an invitation.
+No account tokens or invitation grants are published. Directory failure does not
+stop synchronization. Disable discovery through the same command to withdraw
+this window's advertisement. If cleanup fails, the stale variable remains but
+its endpoint is ignored after expiry.
+
+`npm run build:native` builds and stages both native binaries for this platform.
+For a custom development build, `editchain-history.peerPath` can select a worker
+explicitly; otherwise it is found beside the service or in the package.
+
+The automated live relay check uses three native processes, synthetic workspaces,
+and the production Host/Join manager. It needs an authenticated GitHub CLI and
+creates and deletes temporary private tunnels. It covers restart catch-up,
+third-party forwarding with the original source offline, and live revocation:
+
+```sh
+cargo build -p editchain-node --bin editchain-vscode-service --locked
+cargo build -p editchain-sync --bin editchain-peer --locked
+cd extensions/vscode-editchain
+npm run compile
+npm run test:multiplayer:relay
+```
+
+This check identifies itself as a same-machine test. A second network remains
+a separate observation. See [implementation checkpoints](../../docs/multiplayer-implementation.md)
+for current validation and remaining work.
+
+For the packaged two-window UI test, build and package from this directory:
+
+```sh
+npm run build:native
+npm run build:renderer
+npm run compile
+npx vsce package --out ../../outputs/editchain-history-multiplayer.vsix
+npm run ui:vscode:multiplayer
+```
+
+The Linux harness needs Xvfb, unzip, Python 3 and a signed-in GitHub CLI. It
+installs that VSIX into two temporary profiles, drives Host/Join approval and
+actual typing, verifies remote History rows and exact native diffs, restarts the
+host, and deletes its temporary tunnels. A test-only authentication provider
+uses the CLI credential inside those isolated profiles. The provider and
+automation bridge are excluded from the VSIX. This tests one account/machine;
+it does not replace the different-account/network check or the built-in GitHub
+sign-in spike. Screenshots and results are under `trace/multiplayer/`. The runner
+checks its logs for credential material and removes its private fixture files.
+Set `EDITCHAIN_MULTIPLAYER_UI_VSIX` or `EDITCHAIN_MULTIPLAYER_UI_VERSION` to test
+another package or VS Code release; the default release is 1.132.0.
 
 ## Human work on AI-generated code
 
@@ -303,6 +403,72 @@ Prepared native opening plus 500 rows took 0.24–0.40 seconds on the local
 2.42-million-operation samples; these timings exclude VS Code startup.
 Initial preparation remains expensive and uses disk space. A cold Codex helper
 still rebuilds its source reducer. See [measurements and recovery](../../docs/native-memory.md).
+
+## Dev Tunnels spike
+
+Run **EditChain: Run Dev Tunnels Spike** from the Command Palette in the built
+extension. VS Code's built-in GitHub provider supplies the session; the first
+run may ask you to sign in or allow this extension to use the account with
+`read:user` and `read:org`. No personal access token, tunnel CLI, or `repo` scope
+is required by the implementation. Service acceptance of this account/token
+flow is part of the live experiment.
+
+The command creates one private tunnel with a generated ID and one logical TCP
+port with the service's `auto` protocol setting. The service rejects the SDK's
+`tcp` value; its supported settings are `auto`, `http`, and `https`
+([port configuration](https://learn.microsoft.com/en-us/azure/developer/dev-tunnels/cli-commands#advanced-manage-dev-tunnel-ports)).
+The service's custom DNS `name` field is omitted because custom names are disabled;
+a random label identifies the tunnel for recovery instead.
+It connects a host and client through Microsoft's relay, requires end-to-end
+encryption and a matching host key, exchanges 16 KiB of
+synthetic data in each direction, then measures 20 echo round trips. Neither
+endpoint opens a local TCP listener. No workspace files or history are sent.
+The SDK can negotiate V1 (an encrypted SSH session directly between peers) or
+V2 (a separate encrypted `SecureStream` for each forwarded connection)
+([SDK client implementation](https://github.com/microsoft/dev-tunnels/blob/main/ts/src/connections/tunnelRelayTunnelClient.ts)).
+For V1, the spike checks authentication, active encryption and message integrity
+in both directions, and identical SSH exchange IDs at the two endpoints. For V2,
+it requires the SDK's `SecureStream` transform on both ends. Unencrypted streams,
+unverified host keys, and mixed relay protocol versions are refused.
+Both endpoints run in the current Node.js extension host, including the remote
+machine in a Remote SSH/container workspace. This first spike measures a
+**same-account relay path**, without testing cross-account admission,
+cross-network latency, durable replication, or reconnect behavior.
+
+Open **Output → EditChain Dev Tunnels Spike** for the account label, stages,
+negotiated relay protocol, payload counts, setup time, and RTT min/p50/p95/max.
+A `PASS` is emitted only after the payload checks and tunnel deletion succeed. The network phase has
+a 90-second deadline; cancellation still attempts cleanup with fresh deadlines.
+The 20 samples are a smoke test, not a representative latency benchmark.
+
+Recognized protocol-validation, custom-name, and service-disabled responses include
+fixed diagnostic hints; raw SDK errors and response bodies remain hidden.
+An HTTP 400 or 403 rejection clears its recovery record once a separate cleanup
+check confirms there is no resource. Uncertain requests and failed cleanup
+checks retain recovery records.
+
+Only pending recovery markers and their account IDs are stored in extension
+global state. Credentials and payloads are not stored or logged. After an
+interrupted run, **EditChain: Clean Up Dev Tunnels Spike** retries deletion for
+that account; starting another spike also performs recovery first. The tunnel
+requests a one-hour inactivity expiry as a fallback for an abrupt process exit.
+Cleanup also recognizes records from the earlier build that used custom names.
+
+The connections/management/contracts packages are pinned to `1.3.56`, with
+SSH/SSH-TCP `3.12.42`. Local tests exercise actual V1 SSH sessions and V2 SDK
+encrypted streams, rejection of mismatched host keys and SSH sessions, HTTP
+authorization construction with a stub service, VS Code authentication through
+a stub provider, integrity failures, downgrade rejection, and cleanup. Run:
+
+```sh
+npm run compile
+node --test test/harness/devTunnels*.test.js
+```
+
+The pinned SDK currently brings a moderate npm advisory through its `uuid` 3
+dependency ([GHSA-w5hq-g745-h8pq](https://github.com/advisories/GHSA-w5hq-g745-h8pq)).
+The advisory concerns buffered v3/v5/v6 calls; the inspected SDK uses v4. No
+dependency override or audit suppression is applied in this spike.
 
 ## Runtime architecture
 

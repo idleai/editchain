@@ -29,6 +29,10 @@ pub(super) struct Changes {
 }
 
 impl Tasks {
+    pub(super) fn has_summary(&self, section: &str) -> bool {
+        self.anchors.contains_key(section)
+    }
+
     pub(super) fn reset_paths(&mut self) {
         self.runs = runs::Runs::default();
         self.registered.clear();

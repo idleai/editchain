@@ -7,7 +7,11 @@ use editchain_protocol::{
 use std::cmp::Reverse;
 
 mod human_edits;
+mod human_streams;
 mod human_visibility;
+mod late_content;
+mod partial_items;
+mod pending_imports;
 mod reconciliation;
 
 fn request(root: &std::path::Path) -> OpenRequest {

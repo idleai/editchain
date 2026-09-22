@@ -1,5 +1,6 @@
 /** Length-prefixed frames, assembled without recopying each received prefix. */
 export class FrameDecoder {
+  constructor(private readonly maxFrameBytes = 0xffffffff) {}
   private header = Buffer.alloc(4);
   private headerBytes = 0;
   private payload: Buffer | null = null;
@@ -14,7 +15,9 @@ export class FrameDecoder {
         this.headerBytes += length;
         offset += length;
         if (this.headerBytes < 4) break;
-        this.payload = Buffer.allocUnsafe(this.header.readUInt32LE(0));
+        const size = this.header.readUInt32LE(0);
+        if (size > this.maxFrameBytes) throw new Error('Frame exceeds the configured limit.');
+        this.payload = Buffer.allocUnsafe(size);
       }
       const length = Math.min(this.payload.length - this.payloadBytes, chunk.length - offset);
       chunk.copy(this.payload, this.payloadBytes, offset, offset + length);

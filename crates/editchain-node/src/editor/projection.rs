@@ -9,7 +9,7 @@ use editchain_store::{
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -23,6 +23,8 @@ pub(super) struct Projection {
     pub(super) tail: IndexedTail,
     normalizer: super::normalize::Normalizer,
     pending: Vec<Op>,
+    #[serde(skip)]
+    root: PathBuf,
 }
 
 impl Projection {
@@ -34,10 +36,9 @@ impl Projection {
     ) -> Result<Op> {
         let mut op = super::event_op(event, raw)?;
         if let Some(identity) = &event.identity {
-            op.parents = self
-                .tail
-                .chain()
-                .get(op.id)
+            let retained = super::remote::retry_source(self.tail.chain(), &self.root, &op)?;
+            op.parents = retained
+                .as_ref()
                 .or_else(|| staged.get(&op.id))
                 .map_or_else(
                     || {
@@ -57,7 +58,10 @@ impl Projection {
 
     pub(super) fn open(chain: &Path, storage: &Rc<Storage>) -> Result<Self> {
         match storage.load::<Self>() {
-            Ok(saved) if saved.tail.resume(chain).is_ok() => return Ok(saved),
+            Ok(mut saved) if saved.tail.resume(chain).is_ok() => {
+                chain.clone_into(&mut saved.root);
+                return Ok(saved);
+            }
             // A moved or repaired source invalidates only this derived index.
             // Rebuild admission from the authoritative records in that case.
             Ok(_) => {}
@@ -77,6 +81,7 @@ impl Projection {
             tail,
             normalizer: super::normalize::Normalizer::default(),
             pending,
+            root: chain.to_owned(),
         };
         // Preserve a completed cold scan even if an external writer is busy.
         projection.checkpoint(storage)?;
@@ -95,7 +100,18 @@ impl Projection {
             .records_decoded
             .saturating_add(delta.work.records_decoded);
         if !delta.removed.is_empty() {
-            return Err("editor history contains newly conflicting source evidence".into());
+            // Any newly quarantined ID can invalidate cached revisions or
+            // frontiers. A received receipt does not prove the recorder never
+            // used those bytes: a peer may have supplied an exact local baseline.
+            self.normalizer = super::normalize::Normalizer::default();
+            self.pending = self
+                .tail
+                .chain()
+                .shared_ops()
+                .filter(|op| op.tags.matches_all(Tags::IMPORT | Tags::HUMAN))
+                .map(|op| op.as_ref().clone())
+                .collect();
+            return Ok(());
         }
         self.pending
             .extend(delta.added.into_values().map(|(op, _)| op.as_ref().clone()));
@@ -112,10 +128,34 @@ impl Projection {
         fresh: &BTreeMap<OpId, &EditorEvent>,
     ) -> Result<()> {
         self.refresh()?;
+        // Replaying after a source conflict can quarantine an old derivation.
+        // Settle that invalidation before using the normalizer's frontier for
+        // the next source admission. Exact duplicate results end the replay.
+        while !self.pending.is_empty() {
+            self.derive(store, blobs, request, fresh)?;
+            self.refresh()?;
+        }
+        Ok(())
+    }
+
+    fn derive(
+        &mut self,
+        store: &mut SegmentStore,
+        blobs: &mut BlobStore,
+        request: &editchain_protocol::editor::RecordEditorEvents,
+        fresh: &BTreeMap<OpId, &EditorEvent>,
+    ) -> Result<()> {
         let chain = Path::new(&request.workspace_path).join(&request.chain_dir);
         let mut sources = std::mem::take(&mut self.pending);
         sources.retain(|op| op.tags.matches_all(Tags::IMPORT | Tags::HUMAN));
-        let sources = super::order::sources(sources)?;
+        let receipts = crate::receipts::Receipts::read(&chain)?;
+        let mut local = Vec::new();
+        for source in sources {
+            if !receipts.foreign(self.tail.chain(), &chain, source.id)? {
+                local.push(source);
+            }
+        }
+        let sources = super::order::sources(local)?;
         let reader = BlobReader::open(&chain)?;
         let mut staged = OpSet::new();
         let mut page = Page::new(0);
@@ -138,14 +178,14 @@ impl Projection {
                     other @ (Admission::Duplicate | Admission::Conflict) => other,
                 };
                 match admission {
-                    Admission::Accepted => {
+                    Admission::Accepted | Admission::Conflict => {
+                        // A peer may have supplied a conflicting derivation,
+                        // or replay may now lack a quarantined source. Retain
+                        // both exact results without blocking unrelated work.
                         page.add_record(0, encoded);
                         count = count.saturating_add(1);
                     }
                     Admission::Duplicate => {}
-                    Admission::Conflict => {
-                        return Err("human work derivation conflicts with retained evidence".into())
-                    }
                 }
                 if count >= 128 {
                     store.append_page(&page)?;
@@ -157,7 +197,7 @@ impl Projection {
         if count > 0 {
             store.append_page(&page)?;
         }
-        self.refresh()
+        Ok(())
     }
 }
 

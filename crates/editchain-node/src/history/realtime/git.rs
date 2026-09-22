@@ -199,6 +199,7 @@ impl LiveWorkspace {
                 row_count: window.total,
                 spans: window.expansion_spans.unwrap_or_default(),
                 node_key: first.node_key.clone(),
+                human_stream: None,
                 parents: commit
                     .parents
                     .iter()

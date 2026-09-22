@@ -18,6 +18,7 @@ async function harness() {
   const configuration = { get: (key, fallback) => settings.has(key) ? settings.get(key) : fallback,
     async update(key, value) { settings.set(key, value); listener({ affectsConfiguration: name => name === 'editchain-history.tracking' }); } };
   const vscode = {
+    authentication: { getSession: async () => undefined, onDidChangeSessions: disposable },
     ConfigurationTarget: { Workspace: 1 }, StatusBarAlignment: { Left: 1 },
     workspace: { isTrusted: true, workspaceFolders: [{ uri, index: 0 }],
       getConfiguration: () => configuration, registerTextDocumentContentProvider: disposable,
@@ -29,7 +30,8 @@ async function harness() {
     commands: { registerCommand: (name, callback) => { commands.set(name, callback); return disposable(); } },
   };
   class Capture {
-    constructor(_folder, _dwell, _bytes, emit, identity) { this.identity = identity; this.emit = emit; captures.push(this); }
+    constructor(_folder, _dwell, _bytes, emit, identity, userName) { this.identity = identity; this.userName = userName; this.emit = emit; captures.push(this); }
+    setUserName(name) { this.userName = name; }
     checkpoint() {} dispose() { this.stopped = true; }
   }
   class Outbox {
@@ -52,6 +54,7 @@ async function harness() {
   }
   const filename = require.resolve('../../out/humanWork');
   delete require.cache[filename];
+  delete require.cache[require.resolve('../../out/humanAccount')];
   const original = Module._load;
   Module._load = function(name, ...args) {
     if (name === 'vscode') return vscode;
@@ -185,4 +188,19 @@ test('stopping the extension terminates the coverage worker without disturbing r
     env.report.release();
     assert.equal(await pending, undefined, 'a disposed extension does not publish the completed report');
   } finally { env.report.release(); await pending; await host.stop(); await env.cleanup(); }
+});
+
+test('sign-in updates active and restarted recorders without changing the local identity', async () => {
+  const env = await harness();
+  const host = env.create();
+  try {
+    await host.lifecycle;
+    const identity = env.captures[0].identity;
+    host.useAccount({ id: 'local-account', label: 'ambientlight' });
+    assert.equal(env.captures[0].userName, 'ambientlight');
+    await env.commands.get('editchain-history.stopTracking')();
+    await env.commands.get('editchain-history.startTracking')();
+    assert.equal(env.captures.at(-1).userName, 'ambientlight');
+    assert.deepEqual(env.captures.at(-1).identity, identity);
+  } finally { await host.stop(); await env.cleanup(); }
 });

@@ -55,6 +55,67 @@ fn encoded(root: &Path) -> Vec<Vec<u8>> {
 }
 
 #[test]
+fn human_reload_keeps_its_lane_in_live_updates_and_retained_checkpoints() {
+    for mode in ["OpenLive", "OpenLivePaged"] {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let capture = |session| {
+            live_request(
+                &mut Server::new(),
+                batch(root, vec![start(session), tab(session, 2, "editor_opened")]),
+            )
+        };
+        let _recorded = capture(FIRST);
+        let query = json!({mode:{"workspace_path":root,"chain_dir":".editchain"}});
+        let mut history = Server::new();
+        let opened = live_request(&mut history, query.clone());
+        let before = window(&mut history, &opened["snapshot_id"]);
+        let previous = before.iter().find(|row| row["author"] == "human").unwrap();
+        let _recorded = capture(SECOND);
+        let update = live_request(
+            &mut history,
+            json!({"SyncLive":{"epoch":opened["live"]["epoch"],"after_revision":0,"codex":null}}),
+        );
+        let snapshot = &update["deltas"].as_array().unwrap().last().unwrap()["snapshot_id"];
+        let after = window(&mut history, snapshot);
+        let next = after
+            .iter()
+            .find(|row| row["node_key"] != previous["node_key"])
+            .unwrap();
+        assert_eq!(next["group"], previous["group"]);
+        assert_eq!(next["parents"], json!([previous["node_key"]]));
+        assert_eq!(
+            next["lane"], previous["lane"],
+            "reload must continue its lane: {mode}"
+        );
+        assert_eq!(next["transitions"], json!([]));
+        drop(history);
+
+        let mut reopened = Server::new();
+        let opened = live_request(&mut reopened, query);
+        assert_eq!(opened["diagnostics"]["open_chain_records"], 0);
+        let rows = window(&mut reopened, &opened["snapshot_id"]);
+        assert!(rows.iter().all(|row| row["lane"] == previous["lane"]));
+        let _recorded = capture(GUID);
+        let update = live_request(
+            &mut reopened,
+            json!({"SyncLive":{"epoch":opened["live"]["epoch"],"after_revision":0,"codex":null}}),
+        );
+        let snapshot = &update["deltas"].as_array().unwrap().last().unwrap()["snapshot_id"];
+        let rows = window(&mut reopened, snapshot);
+        let newest = records(root)
+            .into_iter()
+            .find(|(_, work)| work.session == GUID)
+            .unwrap()
+            .0
+            .id
+            .to_string();
+        assert!(rows.iter().any(|row| row["node_key"] == newest));
+        assert!(rows.iter().all(|row| row["lane"] == previous["lane"]));
+    }
+}
+
+#[test]
 fn unsigned_identity_connects_reloads_and_interleaved_recorders_beside_agents() {
     let temporary = tempfile::tempdir().expect("workspace");
     let root = temporary.path();
@@ -270,4 +331,92 @@ fn unsigned_source_only_recovery_and_missing_payload_repair_preserve_exact_work(
         .expect("missing fixture payload");
     assert_eq!(live_request(&mut Server::new(), request)["replayed"], 4);
     assert_eq!(encoded(root), original);
+}
+
+#[test]
+fn recorded_names_label_cold_and_live_human_sessions_and_survive_replay() {
+    let temporary = tempfile::tempdir().expect("workspace");
+    let root = temporary.path();
+    drop(git(root, &["init", "-q"]));
+    drop(git(root, &["commit", "--allow-empty", "-qm", "baseline"]));
+    let mut server = Server::new();
+    let mut requests = Vec::new();
+    for (session, name) in [
+        (FIRST, Some("alice")),
+        (SECOND, Some("Zoë <bob>")),
+        (GUID, None),
+    ] {
+        let mut events = vec![start(session), tab(session, 2, "editor_opened")];
+        for event in &mut events {
+            event["identity"] = identity(session, "a");
+            if let Some(name) = name {
+                event["user_name"] = json!(name);
+            }
+        }
+        let request = batch(root, events);
+        assert_eq!(live_request(&mut server, request.clone())["accepted"], 2);
+        requests.push(request);
+    }
+    let work = records(root);
+    assert_eq!(work.len(), 3);
+    for mode in ["Open", "OpenLive"] {
+        let mut history = Server::new();
+        let opened = live_request(
+            &mut history,
+            json!({mode:{"workspace_path":root,"chain_dir":".editchain"}}),
+        );
+        let rows = window(&mut history, &opened["snapshot_id"]);
+        for (session, name) in [
+            (FIRST, Some("alice")),
+            (SECOND, Some("Zoë <bob>")),
+            (GUID, None),
+        ] {
+            let (op, record) = work
+                .iter()
+                .find(|(_, record)| record.session == session)
+                .expect("human activity");
+            assert_eq!(record.user_name.as_deref(), name);
+            let row = rows
+                .iter()
+                .find(|row| row["node_key"] == op.id.to_string())
+                .expect("human row");
+            assert_eq!(
+                row["session_meta"]["session_title"],
+                name.unwrap_or("VS Code")
+            );
+        }
+    }
+    let before = encoded(root);
+    for request in requests.into_iter().rev() {
+        assert_eq!(live_request(&mut Server::new(), request)["replayed"], 2);
+    }
+    assert_eq!(
+        encoded(root),
+        before,
+        "retry retains original names and operation IDs"
+    );
+}
+
+#[test]
+fn invalid_display_names_are_rejected_before_capture() {
+    let temporary = tempfile::tempdir().expect("workspace");
+    for name in [
+        String::new(),
+        " padded ".into(),
+        "line\nbreak".into(),
+        "a".repeat(81),
+    ] {
+        let mut first = start(FIRST);
+        first["user_name"] = json!(name);
+        let request = Request {
+            id: 1,
+            body: serde_json::from_value(batch(temporary.path(), vec![first])).expect("request"),
+        };
+        let response = Server::new().handle(&request).expect("validation response");
+        assert!(matches!(
+            response.body,
+            editchain_protocol::ResponseBody::Error(_)
+        ));
+        assert!(!temporary.path().join(".editchain").exists());
+    }
 }

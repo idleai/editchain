@@ -93,7 +93,7 @@ fn legacy_edits(workspace: &mut LiveWorkspace) -> Vec<String> {
     keys
 }
 
-fn canonical(root: &std::path::Path) -> Vec<Vec<u8>> {
+pub(super) fn canonical(root: &std::path::Path) -> Vec<Vec<u8>> {
     editchain_store::CanonicalChain::read(&root.join(".editchain"))
         .unwrap()
         .located_ops()

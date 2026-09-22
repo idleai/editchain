@@ -1,0 +1,310 @@
+'use strict';
+const { test } = require('node:test');
+const assert = require('node:assert/strict');
+const { randomUUID, randomBytes } = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+const { Duplex, PassThrough } = require('node:stream');
+const { MultiplayerManager } = require('../../out/multiplayer/manager');
+const { parseInvitation, savedInvitation } = require('../../out/multiplayer/invitation');
+const { fixture, binaries, until, blobs, diffs } = require('./multiplayerFixture');
+
+// Fault-inject only the byte transport. Managers, TLS, native workers and stores are real.
+function network() {
+  const hosts = new Map(), streams = new Set();
+  let attempts = 0, starts = 0, lastEndpoint, failedStarts = 0;
+  const provider = {
+    host(incoming, failed) {
+      let lease;
+      const owned = new Set();
+      const suspend = async () => {
+        for (const stream of owned) stream.destroy();
+        if (hosts.get(lease?.tunnelId)?.incoming === incoming) hosts.delete(lease.tunnelId);
+      };
+      return {
+        async start(previous) {
+          starts++;
+          if (failedStarts > 0) { failedStarts--; throw new Error('fixture relay unavailable'); }
+          lease = previous ?? { marker: 'editchain-multiplayer-' + randomBytes(12).toString('hex'), tunnelId: randomUUID(), clusterId: 'use' };
+          hosts.set(lease.tunnelId, { incoming, owned, failed });
+        },
+        lease: () => lease,
+        async descriptor() {
+          const expiresAt = Date.now() + 60_000;
+          const connectToken = ['e30', Buffer.from(JSON.stringify({ exp: Math.ceil(expiresAt / 1000) + 3600 })).toString('base64url'), 'signature'].join('.');
+          return { endpoint: { tunnelId: lease.tunnelId, clusterId: lease.clusterId, hostId: 'host', hostPublicKeys: ['YWJj'], clientRelayUri: 'wss://use.rel.tunnels.api.visualstudio.com/test' }, connectToken, expiresAt };
+        },
+        suspend, stop: suspend,
+      };
+    },
+    client() {
+      let stream;
+      return {
+        async connect(invitation) {
+          attempts++;
+          lastEndpoint = invitation.endpoint;
+          const host = hosts.get(invitation.endpoint.tunnelId);
+          if (!host) throw new Error('fixture host offline');
+          const a = new PassThrough({ highWaterMark: 1024 }), b = new PassThrough({ highWaterMark: 1024 });
+          const remote = Duplex.from({ readable: a, writable: b });
+          stream = Duplex.from({ readable: b, writable: a });
+          for (const item of [remote, stream]) {
+            item.on('error', () => {}); streams.add(item); host.owned.add(item);
+            item.once('close', () => { streams.delete(item); host.owned.delete(item); });
+          }
+          host.incoming(remote); return stream;
+        },
+        async stop() { stream?.destroy(); },
+      };
+    },
+    async remove(lease) { hosts.delete(lease.tunnelId); },
+  };
+  return { provider, drop() { for (const stream of streams) stream.destroy(); }, attempts: () => attempts,
+    failHosts: count => { failedStarts = count; },
+    terminateHost() { for (const host of [...hosts.values()]) host.failed('terminal fixture disconnect', true); }, starts: () => starts, endpoint: () => lastEndpoint };
+}
+
+function environment() {
+  const files = fixture(), wire = network(), saved = new Map(), spaces = new Map(), managers = new Set();
+  const create = local => {
+    const manager = new MultiplayerManager({ binary: binaries.peer, chain: local.chain, deviceDirectory: local.device,
+      space: spaces.get(local.root), relay: wire.provider, githubToken: async () => { throw new Error('no real service'); },
+      journal: { remember: async () => {}, forget: async () => {} }, changed: () => {},
+      saveSpace: async space => { spaces.set(local.root, space); }, saveSession: async session => { saved.set(local.root, session); } });
+    managers.add(manager); return manager;
+  };
+  return { files, wire, saved, spaces, create, async stop() { await Promise.all([...managers].map(manager => manager.stop())); files.stop(); } };
+}
+const live = manager => manager.status().peers.filter(peer => peer.state === 'Live').length;
+
+test('durable space and private baseline survive lost workspace metadata and a moved chain', async () => {
+  const env = environment();
+  try {
+    const a = env.files.workspace('a'), b = env.files.workspace('b');
+    await a.start();
+    const host = env.create(a), guest = env.create(b), request = await guest.joinRequest();
+    const first = parseInvitation(await host.hostHistory(request, false));
+    const ledger = fs.readFileSync(path.join(a.chain, 'multiplayer/scope.json'));
+    assert.ok(JSON.parse(ledger).cutoff.first_segment > 0);
+    await host.suspend();
+    env.spaces.delete(a.root);
+    const restored = env.create(a);
+    const second = parseInvitation(await restored.hostHistory(request, 'keep'));
+    assert.equal(second.space, first.space);
+    assert.deepEqual(fs.readFileSync(path.join(a.chain, 'multiplayer/scope.json')), ledger);
+    const saved = env.saved.get(a.root);
+    await restored.suspend();
+    const moved = { ...a, chain: path.join(env.files.directory, 'moved-chain') };
+    fs.renameSync(a.chain, moved.chain);
+    env.spaces.delete(a.root);
+    const resumed = env.create(moved);
+    await resumed.resume(saved);
+    assert.equal(resumed.status().space, first.space);
+    assert.equal(resumed.status().hosting, true);
+    assert.equal((await resumed.devices()).length, 1);
+    assert.deepEqual(fs.readFileSync(path.join(moved.chain, 'multiplayer/scope.json')), ledger);
+  } finally { await env.stop(); }
+});
+
+test('stale workspace metadata cannot replace a durable space binding', async () => {
+  const env = environment();
+  try {
+    const a = env.files.workspace('a'), b = env.files.workspace('b');
+    const host = env.create(a), guest = env.create(b), request = await guest.joinRequest();
+    await host.hostHistory(request, false);
+    await host.suspend();
+    const ledger = fs.readFileSync(path.join(a.chain, 'multiplayer/scope.json'));
+    env.spaces.set(a.root, 'wrong-space');
+    const stale = env.create(a);
+    await assert.rejects(stale.hostHistory(request, false), /different collaboration space/);
+    assert.deepEqual(fs.readFileSync(path.join(a.chain, 'multiplayer/scope.json')), ledger);
+  } finally { await env.stop(); }
+});
+
+test('automatic reconnect repairs a broken stream; restart never reenrolls a removed device', { timeout: 30_000 }, async () => {
+  const env = environment();
+  try {
+    const a = env.files.workspace('a'), b = env.files.workspace('b');
+    await a.start(); await b.start();
+    const host = env.create(a), guest = env.create(b);
+    const invitation = await host.hostHistory(await guest.joinRequest(), true);
+    await guest.joinHistory(invitation, true);
+    await until(() => live(guest) === 1, 'initial authentication');
+    env.wire.drop();
+    await a.edit('offline baseline\n', 'repair after disconnect\n');
+    await until(() => env.wire.attempts() >= 2 && live(guest) === 1 && blobs(a.chain).every(name => blobs(b.chain).includes(name)), 'automatic repair');
+    assert.ok((await diffs(b)).some(diff => diff.after === 'repair after disconnect\n'));
+    env.wire.terminateHost();
+    await a.edit('host retry baseline\n', 'host relay recovered\n');
+    await until(() => env.wire.starts() >= 2 && live(guest) === 1 && blobs(a.chain).every(name => blobs(b.chain).includes(name)), 'host terminal recovery');
+    const snapshot = env.saved.get(b.root);
+    await guest.revoke(parseInvitation(invitation).host.fingerprint);
+    await guest.suspend();
+    const restarted = env.create(b);
+    await restarted.resume(snapshot);
+    assert.deepEqual(await restarted.devices(), []);
+    assert.deepEqual(restarted.status().peers, []);
+  } finally { await env.stop(); }
+});
+
+test('failed hosting cannot block outbound reconnect and automatically recovers', { timeout: 30_000 }, async () => {
+  const env = environment();
+  try {
+    const a = env.files.workspace('a'), b = env.files.workspace('b');
+    await a.start(); await b.start();
+    const host = env.create(a), guest = env.create(b);
+    await guest.joinHistory(await host.hostHistory(await guest.joinRequest(), true), true);
+    await host.joinHistory(await guest.hostHistory(await host.joinRequest(), true), true);
+    await until(() => live(host) === 1 && live(guest) === 1, 'initial bidirectional connection');
+    const saved = env.saved.get(a.root);
+    await host.suspend();
+    env.wire.failHosts(2);
+    const restarted = env.create(a);
+    await restarted.resume(saved);
+    assert.equal(restarted.status().enabled, true);
+    assert.equal(restarted.status().hosting, false);
+    await restarted.reconnect();
+    assert.match(restarted.status().message, /retrying automatically/);
+    assert.equal(restarted.status().hosting, false);
+    await b.edit('before outage\n', 'outbound recovery\n');
+    await until(() => live(restarted) === 1 && blobs(b.chain).every(name => blobs(a.chain).includes(name)), 'outbound recovery did not transfer');
+    await until(() => restarted.status().hosting, 'hosting did not recover automatically');
+    assert.ok((await diffs(a)).some(diff => diff.after === 'outbound recovery\n'));
+  } finally { await env.stop(); }
+});
+
+test('simultaneous opposite invitations settle on one authenticated edge at both ends', { timeout: 30_000 }, async () => {
+  const env = environment();
+  try {
+    const a = env.files.workspace('a'), b = env.files.workspace('b');
+    await a.start(); await b.start();
+    const left = env.create(a), initial = env.create(b);
+    const toB = await left.hostHistory(await initial.joinRequest(), true);
+    env.spaces.set(b.root, parseInvitation(toB).space);
+    await initial.stop();
+    const right = env.create(b);
+    const toA = await right.hostHistory(await left.joinRequest(), true);
+    await Promise.all([left.joinHistory(toA, true), right.joinHistory(toB, true)]);
+    await until(() => live(left) === 1 && live(right) === 1 && left.status().peers.length === 1 && right.status().peers.length === 1, 'duplicates did not settle');
+    await a.edit('mesh before\n', 'mesh after\n');
+    await until(() => blobs(a.chain).every(name => blobs(b.chain).includes(name)), 'settled edge stopped transferring');
+    assert.ok((await diffs(b)).some(diff => diff.after === 'mesh after\n'));
+  } finally { await env.stop(); }
+});
+
+test('saved grants outlive the initial approval window but expired grants cannot reconnect', async () => {
+  const env = environment();
+  try {
+    const a = env.files.workspace('a'), b = env.files.workspace('b');
+    const left = env.create(a), right = env.create(b);
+    const encoded = await left.hostHistory(await right.joinRequest(), true);
+    const invitation = parseInvitation(encoded), later = invitation.expiresAt + 1;
+    assert.throws(() => parseInvitation(encoded, later), /expired/);
+    assert.equal(savedInvitation(invitation, later).guest, invitation.guest);
+    assert.throws(() => savedInvitation(invitation, later + 7200_000), /expired/);
+  } finally { await env.stop(); }
+});
+
+test('discovery refreshes a known endpoint without admitting unknown devices or moving a grant to another tunnel', { timeout: 30_000 }, async () => {
+  const env = environment();
+  try {
+    const a = env.files.workspace('a'), b = env.files.workspace('b'), c = env.files.workspace('c');
+    const host = env.create(a), guest = env.create(b), stranger = env.create(c);
+    await guest.joinHistory(await host.hostHistory(await guest.joinRequest(), true), true);
+    await until(() => live(guest) === 1, 'initial discovery edge');
+    const ad = await host.describe();
+    assert.ok(ad);
+    assert.ok(!('connectToken' in ad));
+    const unknown = (await stranger.inspectRequest(await stranger.joinRequest())).device;
+    await guest.discover([
+      { ...ad, device: unknown },
+      { ...ad, device: { ...ad.device, fingerprint: 'f'.repeat(64) } },
+      { ...ad, space: 'wrong-space' },
+      { ...ad, endpoint: { ...ad.endpoint, tunnelId: 'another-resource' } },
+      { ...ad, expiresAt: 1 },
+    ]);
+    assert.deepEqual(await guest.devices(), [ad.device]);
+    assert.equal(guest.status().peers.length, 1);
+    const refreshed = { ...ad, endpoint: { ...ad.endpoint, hostId: 'fresh-host-instance' } };
+    await guest.discover([refreshed]);
+    await guest.reconnect();
+    await until(() => live(guest) === 1 && env.wire.endpoint().hostId === 'fresh-host-instance', 'known endpoint did not refresh');
+    assert.equal(env.wire.endpoint().tunnelId, ad.endpoint.tunnelId);
+  } finally { await env.stop(); }
+});
+
+test('explicit from-now replaces an all-history scope and changes survive reconnect and restart', { timeout: 60_000 }, async () => {
+  const env = environment();
+  const sees = async (local, text) => {
+    try { return (await diffs(local)).some(diff => diff.after === text); }
+    catch (error) {
+      // A receipt may replace the service snapshot between Open and GetWindow.
+      if (error.message === 'Native history fixture: stale_snapshot') return false;
+      throw error;
+    }
+  };
+  try {
+    const a = env.files.workspace('a'), b = env.files.workspace('b');
+    await a.start(); await b.start();
+    await a.edit('old before\n', 'old private result\n');
+    const host = env.create(a), guest = env.create(b), request = await guest.joinRequest();
+    await host.hostHistory(request, true);
+    assert.equal(host.status().scope.mode, 'all');
+    const invitation = await host.hostHistory(request, false);
+    const firstCutoff = host.status().scope;
+    assert.equal(firstCutoff.mode, 'from_now');
+    assert.equal(firstCutoff.active, true);
+    await guest.joinHistory(invitation, false);
+    await until(() => live(host) === 1 && live(guest) === 1, 'new cutoff did not connect');
+    assert.equal(host.status().peers[0].progress.outgoing.total_records, 0, 'all prior records must be excluded from the inventory total');
+    assert.deepEqual(await diffs(b), [], 'pre-cutoff edits must not arrive');
+    await a.edit('new before\n', 'new shared result\n');
+    await until(() => sees(b, 'new shared result\n'), 'post-cutoff edit did not arrive');
+    await host.changeScope(true);
+    assert.equal(host.status().scope.mode, 'all');
+    await until(() => sees(b, 'old private result\n'), 'including history did not backfill the earlier edit');
+    await host.changeScope(false);
+    const secondCutoff = host.status().scope;
+    assert.ok(secondCutoff.revision > firstCutoff.revision);
+    // Changing during backfill can leave already received old rows missing content.
+    // The host's new outgoing boundary must hold even while the guest still offers
+    // those older receipts in the other direction.
+    await until(() => host.status().peers.some(peer => peer.progress?.accepted && peer.progress.outgoing.complete
+      && peer.progress.outgoing.total_records === 0), 'replacement cutoff did not exclude the old inventory');
+    assert.equal(host.status().peers[0].progress.outgoing.total_records, 0, 'an earlier receipt cannot undo the replacement cutoff');
+    await until(() => sees(b, 'old private result\n'), 'changing scope must not remove previously received copies');
+    await guest.changeScope(false);
+    await until(() => live(host) === 1 && live(guest) === 1, 'both new cutoffs did not finish checking');
+    assert.equal(guest.status().peers[0].progress.outgoing.total_records, 0, 'each device independently limits its outgoing history');
+    const saved = env.saved.get(a.root);
+    await host.suspend();
+    await a.edit('offline before\n', 'offline after cutoff\n');
+    const restored = env.create(a);
+    await restored.resume(saved);
+    assert.deepEqual(restored.status().scope, secondCutoff, 'resume preserves the actual cutoff rather than resetting it to now');
+    assert.equal((await restored.devices()).length, 1, 'approvals persist across scope changes');
+    await until(() => sees(b, 'offline after cutoff\n'), 'offline post-cutoff work was lost on restart');
+  } finally { await env.stop(); }
+});
+
+test('Stop during device verification cannot establish a later history cutoff', async () => {
+  const env = environment();
+  let release;
+  try {
+    const a = env.files.workspace('a'), b = env.files.workspace('b');
+    await a.start();
+    const host = env.create(a), guest = env.create(b);
+    const control = host.control.bind(host);
+    host.control = async request => {
+      if (request.type === 'verify') await new Promise(resolve => { release = resolve; });
+      return control(request);
+    };
+    const stopped = assert.rejects(host.hostHistory(await guest.joinRequest(), false), /Sharing was stopped/);
+    await until(() => !!release, 'device verification did not start');
+    await host.stop();
+    release();
+    await stopped;
+    assert.equal(fs.existsSync(path.join(a.chain, 'multiplayer/scope.json')), false, 'a cancelled command must not silently select a cutoff');
+    assert.equal(host.status().enabled, false);
+  } finally { release?.(); await env.stop(); }
+});

@@ -24,14 +24,15 @@ export function createLiveSync(service: string, synchronize: (provider?: LivePro
   const config = vscode.workspace.getConfiguration('editchain-history');
   const workspace = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (!workspace) throw new Error('Open a workspace folder to follow Codex sessions.');
-  const helper = path.join(workspace, 'tools', 'codex-session-exporter', 'target', 'release', 'codex-session-exporter');
+  const helperName = process.platform === 'win32' ? 'codex-session-exporter.exe' : 'codex-session-exporter';
+  const helper = path.join(workspace, 'tools', 'codex-session-exporter', 'target', 'release', helperName);
   const paths: LivePaths = {
     workspace,
     chain: path.resolve(workspace, config.get<string>('chainDir', '.editchain')),
     sessions: path.resolve(workspace, config.get<string>('live.sessionsPath', '') ||
       path.join(process.env.CODEX_HOME || path.join(homedir(), '.codex'), 'sessions')),
     cli: config.get<string>('live.cliPath', '') || path.join(path.dirname(service), process.platform === 'win32' ? 'editchain.exe' : 'editchain'),
-    helper: config.get<string>('live.codexHelperPath', '') || (existsSync(helper) ? helper : 'codex-session-exporter'),
+    helper: config.get<string>('live.codexHelperPath', '') || (existsSync(helper) ? helper : helperName),
   };
   for (const [name, value] of Object.entries(paths)) log(`${name}: ${value}`);
   return new LiveSync({
@@ -43,8 +44,16 @@ export function createLiveSync(service: string, synchronize: (provider?: LivePro
         if (await belongsToWorkspace(file, paths.workspace)) selected.push(file);
       }
       log(`Syncing ${selected.length} changed Codex rollout(s) through the retained service.`);
-      while (await synchronize({ sessions_root: paths.sessions, helper: paths.helper, paths: selected })) {
-        signal.throwIfAborted();
+      try {
+        while (await synchronize({ sessions_root: paths.sessions, helper: paths.helper, paths: selected })) {
+          signal.throwIfAborted();
+        }
+      } catch (error) {
+        const message = String(error);
+        if (message.includes('codex helper') && message.includes('could not be spawned')) {
+          throw new Error(`${message}. Build codex-session-exporter or set editchain-history.live.codexHelperPath to its executable.`);
+        }
+        throw error;
       }
     }, signal),
     publish: async () => { await synchronize(); }, status, pollNative: true,

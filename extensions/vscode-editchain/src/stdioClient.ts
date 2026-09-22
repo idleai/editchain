@@ -310,17 +310,22 @@ export function resolveServicePath(): string {
     return configured;
   }
   const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '.';
-  return resolveDefaultServicePath(workspacePath);
+  const suffix = process.platform === 'win32' ? '.exe' : '';
+  return resolveDefaultServicePath(workspacePath, existsSync,
+    path.join(__dirname, '..', 'bin', `${process.platform}-${process.arch}`, `editchain-vscode-service${suffix}`));
 }
 
 /** Prefer the optimized service build, retaining debug as a dev fallback. */
 export function resolveDefaultServicePath(
   workspacePath: string,
-  pathExists: (candidate: string) => boolean = existsSync
+  pathExists: (candidate: string) => boolean = existsSync,
+  bundled?: string
 ): string {
   const release = path.join(workspacePath, 'target', 'release', 'editchain-vscode-service');
   if (pathExists(release)) {
     return release;
   }
-  return path.join(workspacePath, 'target', 'debug', 'editchain-vscode-service');
+  const debug = path.join(workspacePath, 'target', 'debug', 'editchain-vscode-service');
+  if (pathExists(debug)) return debug;
+  return bundled && pathExists(bundled) ? bundled : debug;
 }

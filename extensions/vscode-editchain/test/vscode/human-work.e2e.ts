@@ -4,7 +4,7 @@ import path from 'node:path';
 import type { Tab, TabGroup, TabInputText } from 'vscode';
 
 type WorkRow = { author: string; parents: string[]; node_key: string; is_subop: boolean;
-  group: string;
+  group: string; lane: number;
   activity_kind: string; summary: string; timestamp_ms: number; kind: string; is_system: boolean;
   sub_ops?: { kind: string }[]; file_change?: { source: string; path: string; op_id: string };
   task_group?: { task_id: string; expanded: boolean; member_count: number } };
@@ -52,6 +52,17 @@ async function waitForGraph(keys: string[]): Promise<void> {
     return bounds.width > 0 && bounds.left >= frame.left && bounds.right <= frame.right
       && Array.from(cell.querySelectorAll('[data-graph-key]')).every(part => part.getAnimations().every(animation => animation.playState === 'finished'));
   }), keys), { timeout: 10000, timeoutMsg: 'human graph did not finish drawing' });
+}
+
+async function graphDot(key: string): Promise<{ x: string | null; fill: string; stroke: string }> {
+  await waitForGraph([key]);
+  return await browser.execute(key => {
+    const row = Array.from(document.querySelectorAll<HTMLElement>('#rows .row[data-row]')).find(element =>
+      (window as any).__editchainRowAt?.(Number(element.dataset.row))?.node_key === key);
+    const dot = row!.querySelector('circle[data-graph-key]')!;
+    const style = getComputedStyle(dot);
+    return { x: dot.getAttribute('cx'), fill: style.fill, stroke: style.stroke };
+  }, key);
 }
 
 async function toggleEpisode(task: string): Promise<void> {
@@ -347,6 +358,7 @@ describe('production human-work capture', () => {
     await browser.execute(() => { document.getElementById('rows')!.scrollTop = 0; });
     await browser.waitUntil(async () => (await readRows()).some(row => row.kind === 'editor_closed' && row.summary.includes('identity-before.ts')), { timeout: 30000 });
     const previous = (await readRows()).find(row => row.kind === 'editor_closed' && row.summary.includes('identity-before.ts'))!;
+    const previousDot = await graphDot(previous.node_key);
     await webview.close();
     const identityPath = path.join(process.env.EDITCHAIN_WORK_FIXTURE!, 'profile/settings/User/globalStorage/ambientlight.editchain-history/unsigned-human-identity.json');
     const identity = JSON.parse(fs.readFileSync(identityPath, 'utf8'));
@@ -395,11 +407,13 @@ describe('production human-work capture', () => {
     const rows = await readRows();
     fs.writeFileSync(path.join(output, 'human-identity-reload.json'), JSON.stringify({ identity, previous, next, rows }, null, 2));
     assert.equal(next.group, previous.group, 'persistent identity owns the same graph group');
+    assert.equal(next.lane, previous.lane, 'reload keeps the persistent human lane');
     assert.notEqual(incarnation, previous.node_key.split(':')[0], 'restart creates a fresh recorder incarnation');
     const byId = new Map(rows.map(row => [row.node_key, row]));
     let cursor: WorkRow | undefined = next;
     const seen = new Set<string>();
     while (cursor && cursor.node_key !== previous.node_key && !seen.has(cursor.node_key)) {
+      assert.equal(cursor.lane, previous.lane, 'every continuation stays in the same lane');
       seen.add(cursor.node_key);
       cursor = cursor.parents.map(parent => byId.get(parent)).find(parent => parent?.author === 'human');
     }
@@ -407,6 +421,8 @@ describe('production human-work capture', () => {
     assert.ok(rows.every(row => row.kind !== 'exposure'));
     await browser.execute(() => (window as any).__editchainRendererDebug.whenIdle(10000));
     await waitForGraph([next!.node_key, previous.node_key]);
+    assert.deepEqual(await graphDot(next.node_key), previousDot, 'rendered lane position and color survive restart');
+    assert.deepEqual(await graphDot(previous.node_key), previousDot, 'the previous recording keeps its rendered lane and color');
     await browser.saveScreenshot(path.join(output, 'human-identity-reload.png'));
     await webview.close();
   });

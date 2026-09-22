@@ -1,0 +1,281 @@
+use super::*;
+use editchain_node::Server;
+use editchain_protocol::{Request, ResponseBody};
+
+mod fixture {
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/support/codex.rs"
+    ));
+}
+
+fn view(server: &mut Server, body: Value) -> io::Result<Value> {
+    let body = serde_json::from_value(body).map_err(io::Error::other)?;
+    match server
+        .handle(&Request { id: 1, body })
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .body
+    {
+        ResponseBody::Ok(value) => Ok(value),
+        ResponseBody::Error(error) => Err(io::Error::other(format!("view: {error:?}"))),
+    }
+}
+
+fn field<'a>(value: &'a Value, key: &str) -> io::Result<&'a Value> {
+    value
+        .get(key)
+        .ok_or_else(|| io::Error::other(format!("missing {key}")))
+}
+
+fn current_rows(server: &mut Server, snapshot: &Value) -> io::Result<Vec<Value>> {
+    view(
+        server,
+        json!({"GetWindow": {
+            "snapshot_id": snapshot, "offset":0, "limit":100, "include_layout":false
+        }}),
+    )?
+    .get("rows")
+    .and_then(Value::as_array)
+    .cloned()
+    .ok_or_else(|| io::Error::other("rows"))
+}
+
+fn poll(a: &mut Worker, b: &mut Worker) -> io::Result<()> {
+    for _ in 0..2 {
+        let response = b.ok(&json!({"type":"turn", "bytes":"", "tick":true}))?;
+        connect(a, b, opaque(&response)?)?;
+        let response = a.ok(&json!({"type":"turn", "bytes":"", "tick":true}))?;
+        connect(b, a, opaque(&response)?)?;
+    }
+    Ok(())
+}
+
+fn sync_rows(server: &mut Server, opened: &Value, revision: &mut Value) -> io::Result<Vec<Value>> {
+    let update = view(
+        server,
+        json!({"SyncLive": {
+            "epoch":opened.pointer("/live/epoch"), "after_revision":revision, "codex":null
+        }}),
+    )?;
+    *revision = field(&update, "revision")?.clone();
+    let snapshot = field(&update, "deltas")?
+        .as_array()
+        .and_then(|d| d.last())
+        .and_then(|d| d.get("snapshot_id"))
+        .ok_or_else(|| io::Error::other("received data did not update view"))?;
+    current_rows(server, snapshot)
+}
+
+fn pending_rows(rows: &[Value], count: usize, previous: Option<&Value>) -> io::Result<()> {
+    require(
+        rows.len() == count
+            && rows
+                .iter()
+                .all(|row| row.get("kind") == Some(&json!("message"))),
+        "partial receipts must not publish Import placeholders or unfinished items",
+    )?;
+    if let Some(previous) = previous {
+        require(
+            rows.iter()
+                .any(|row| row.get("continuity_key") == Some(previous)),
+            "later incomplete receipts do not retract a verified item",
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn ongoing_codex_session_crosses_cutoff_and_updates_the_peer_view_live() -> io::Result<()> {
+    shared_session(2, false)
+}
+
+#[test]
+fn revised_item_crosses_a_fresh_cutoff_without_its_private_incarnation() -> io::Result<()> {
+    shared_session(1, false)
+}
+
+#[test]
+fn late_content_crosses_native_peers_and_refreshes_the_open_history_view() -> io::Result<()> {
+    shared_session(1, true)
+}
+
+fn deferred_payloads(ops: &mut [Op]) -> io::Result<Vec<Vec<u8>>> {
+    let mut content = Vec::new();
+    let mut externalize = |payload: &mut Payload| -> io::Result<()> {
+        if let Payload::Inline(bytes) = payload {
+            let blob = BlobRef {
+                id: ContentId::Hash256(*blake3::hash(bytes).as_bytes()),
+                len: u32::try_from(bytes.len()).map_err(io::Error::other)?,
+            };
+            content.push(bytes.clone());
+            *payload = Payload::Blob(blob);
+        }
+        Ok(())
+    };
+    for op in ops {
+        if let OpKind::Import(import) = &mut op.kind {
+            externalize(&mut import.raw_ref)?;
+        }
+        if let OpKind::Message(message) = &mut op.kind {
+            externalize(&mut message.content)?;
+        }
+    }
+    Ok(content)
+}
+
+fn shared_session(shared_incarnation: u64, late_content: bool) -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let ar = dir.path().join("sender/.editchain");
+    let workspace = dir.path().join("receiver");
+    let br = workspace.join(".editchain");
+    let ad = dir.path().join("sender-device");
+    let bd = dir.path().join("receiver-device");
+    fixture::append(&ar, &fixture::occurrence(1, 1, "private earlier message")?)?;
+    let mut a = Worker::spawn()?;
+    let mut b = Worker::spawn()?;
+    let ai = a.ok(&json!({"type":"identity", "device_dir":ad}))?;
+    let bi = b.ok(&json!({"type":"identity", "device_dir":bd}))?;
+    for (worker, root, identity) in [(&mut a, &ar, &bi), (&mut b, &br, &ai)] {
+        let _scope = worker.ok(&json!({"type":"set_scope", "chain_dir":root, "space":"process-space", "backfill":false}))?;
+        let _approved = worker.ok(&json!({"type":"approve", "chain_dir":root, "space":"process-space", "certificate":identity.get("certificate")}))?;
+    }
+    // Change an already configured scope without replacing device approvals.
+    if shared_incarnation == 1 {
+        let _scope = a.ok(
+            &json!({"type":"set_scope", "chain_dir":ar, "space":"process-space", "backfill":false}),
+        )?;
+    }
+    let mut server = Server::new();
+    let open_request =
+        json!({"OpenLivePaged":{"workspace_path":workspace, "chain_dir":".editchain"}});
+    let mut opened = view(&mut server, open_request.clone())?;
+    require(
+        current_rows(&mut server, field(&opened, "snapshot_id")?)?.is_empty(),
+        "empty receiver",
+    )?;
+    let _bytes = open(&mut a, &ar, &ad, None)?;
+    let initial = open(
+        &mut b,
+        &br,
+        &bd,
+        ai.get("certificate").and_then(Value::as_str),
+    )?;
+    connect(&mut a, &mut b, initial)?;
+    let mut revision = json!(0);
+    let mut identity = None;
+    for (ordinal, incarnation, text, count) in [
+        (2, shared_incarnation, "shared session is visible", 1usize),
+        (3, 3, "another received item stays visible", 2),
+        (4, shared_incarnation, "shared session updated live", 2),
+    ] {
+        // Raw records, outputs and proofs can arrive in separate rounds.
+        // Keep the previous verified view until this occurrence is complete.
+        let deferred = late_content && ordinal == 2;
+        let value = if deferred {
+            format!("{text} {}", "large message ".repeat(400))
+        } else {
+            text.into()
+        };
+        let mut ops = fixture::occurrence(ordinal, incarnation, &value)?;
+        let blobs = if deferred {
+            deferred_payloads(&mut ops)?
+        } else {
+            Vec::new()
+        };
+        let (preview, materialization) = ops
+            .split_first()
+            .ok_or_else(|| io::Error::other("occurrence fixture"))?;
+        fixture::append(&ar, std::slice::from_ref(preview))?;
+        poll(&mut a, &mut b)?;
+        let preview_rows = sync_rows(&mut server, &opened, &mut revision)?;
+        let before = count
+            .checked_sub(usize::from(ordinal < 4))
+            .ok_or_else(|| io::Error::other("invalid expected row count"))?;
+        pending_rows(&preview_rows, before, identity.as_ref())?;
+        if ordinal == 2 {
+            server = Server::new();
+            opened = view(&mut server, open_request.clone())?;
+            revision = json!(0);
+            pending_rows(
+                &current_rows(&mut server, field(&opened, "snapshot_id")?)?,
+                0,
+                None,
+            )?;
+        }
+        let mut remaining = materialization.to_vec();
+        // Cover both output-before-proof and proof-before-output delivery.
+        if ordinal == 3 {
+            remaining.reverse();
+        }
+        let (partial, last) = remaining
+            .split_first()
+            .ok_or_else(|| io::Error::other("materialization fixture"))?;
+        fixture::append(&ar, std::slice::from_ref(partial))?;
+        poll(&mut a, &mut b)?;
+        pending_rows(
+            &sync_rows(&mut server, &opened, &mut revision)?,
+            before,
+            identity.as_ref(),
+        )?;
+        fixture::append(&ar, last)?;
+        poll(&mut a, &mut b)?;
+        let mut rows = sync_rows(&mut server, &opened, &mut revision)?;
+        if deferred {
+            require(
+                rows.iter().all(|row| {
+                    !row.get("summary")
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| summary.starts_with(text))
+                }),
+                "message content has not arrived",
+            )?;
+            let mut store = BlobStore::new(ar.join("blobs"))?;
+            for bytes in blobs {
+                store.write(&bytes)?;
+            }
+            poll(&mut a, &mut b)?;
+            rows = sync_rows(&mut server, &opened, &mut revision)?;
+        }
+        require(
+            rows.len() == count,
+            "complete receipts publish the item while retaining earlier received items",
+        )?;
+        let row = rows
+            .iter()
+            .find(|row| {
+                row.get("summary")
+                    .and_then(Value::as_str)
+                    .is_some_and(|summary| summary.starts_with(text))
+            })
+            .ok_or_else(|| io::Error::other("received revision is not visible"))?;
+        require(
+            field(row, "group")? == "session:73",
+            "the original session groups received work",
+        )?;
+        if incarnation == shared_incarnation {
+            if let Some(previous) = &identity {
+                require(
+                    previous == field(row, "continuity_key")?,
+                    "revision keeps the same row identity",
+                )?;
+            }
+            identity = Some(field(row, "continuity_key")?.clone());
+        }
+    }
+    require(
+        CanonicalChain::read(&br)?.stats().accepted == 9,
+        "only nine post-cutoff records reached receiver",
+    )?;
+    drop((a, b, server));
+    let mut restarted = Server::new();
+    let opened = view(&mut restarted, open_request)?;
+    let rows = current_rows(&mut restarted, field(&opened, "snapshot_id")?)?;
+    require(
+        rows.len() == 2
+            && rows.iter().any(|row| {
+                row.get("summary").and_then(Value::as_str) == Some("shared session updated live")
+            }),
+        "received session stays visible after reopening",
+    )?;
+    Ok(())
+}

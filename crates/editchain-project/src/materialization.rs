@@ -217,6 +217,19 @@ pub(super) fn selected_codex<'a>(
     }
 }
 
+pub(super) fn complete_derivation<'a>(
+    source: OpId,
+    facts: impl Iterator<Item = &'a Op>,
+    by_id: &impl OpLookup,
+) -> bool {
+    let records: Vec<_> = facts
+        .filter_map(decode_evidence)
+        .filter(|record| record.payload.source == source && valid_source(record, by_id))
+        .collect();
+    let references: Vec<_> = records.iter().collect();
+    select(&references).is_some_and(|meta| complete_outputs(meta, source, by_id))
+}
+
 fn source_key(source: OpId) -> SourceKey {
     (source.node.0, source.boot)
 }
@@ -319,10 +332,14 @@ fn valid_changes(
                 && !item.is_empty()
                 && source_key(*incarnation) == source_key(source)
                 && incarnation.seq > 0
+                && incarnation.seq.trailing_zeros() >= 16
                 && incarnation.seq <= source.seq
+                // The incarnation is a stable identity, not content needed by
+                // this revision. Consent can exclude its original occurrence.
+                // A present contradictory record must still reject the proof.
                 && by_id
                     .get(incarnation)
-                    .is_some_and(|op| matches!(op.kind, OpKind::Import(_)))
+                    .is_none_or(|op| matches!(op.kind, OpKind::Import(_)))
                 && item_outputs.iter().all(|output| outputs.contains(output))
         }
     })

@@ -7,6 +7,7 @@
 pub mod commands;
 mod editor;
 pub mod history;
+mod receipts;
 mod reconcile;
 mod transport;
 

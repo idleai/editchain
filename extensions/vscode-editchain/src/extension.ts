@@ -5,6 +5,9 @@ import { resolveServicePath, StdioClient } from './stdioClient';
 import { createLiveSync, LiveProviderRequest } from './liveHost';
 import { LiveSync } from './liveSync';
 import { LiveQueue } from './liveQueue';
+import { registerDevTunnelsCommands } from './devTunnels/commands';
+import { registerMultiplayerCommands, MultiplayerCommands } from './multiplayer/commands';
+let multiplayer: MultiplayerCommands | undefined;
 
 // The single history panel. Reused across `open` invocations so we never create
 // two webviews of the same type (which races VS Code's service-worker
@@ -101,6 +104,7 @@ type RecordedDiffHunk = Readonly<{
  * messages between the webview and the service, and owns the webview lifecycle.
  */
 export function activate(context: vscode.ExtensionContext): void {
+  registerDevTunnelsCommands(context);
   const client = new StdioClient();
   context.subscriptions.push({ dispose: () => client.stop() });
 
@@ -111,6 +115,7 @@ export function activate(context: vscode.ExtensionContext): void {
   out.appendLine(`[extension] EditChain ${context.extension?.packageJSON.version ?? 'development'} (${context.extensionPath})`);
   client.setLog((line) => out.appendLine(line));
   humanWork = new HumanWorkHost(context, out, () => liveSync?.humanChanged());
+  multiplayer = registerMultiplayerCommands(context, () => liveSync?.humanChanged(), account => humanWork?.useAccount(account));
 
   // Read-only JSON content provider: documents opened under the
   // `editchain-json:` scheme are read-only by default (content providers cannot
@@ -196,6 +201,7 @@ function updateStatusBar(loaded: number, total: number): void {
 function renderStatusBar(): void {
   if (!statusItem) return;
   const label = liveStatus?.startsWith('Live retry:') ? 'Live retry' :
+    liveStatus?.startsWith('Live · Codex import retry:') ? 'Live · Codex retry' :
     liveStatus?.startsWith('Live ·') ? 'Live' : liveStatus;
   statusItem.text = [statusCounts, label].filter(Boolean).join(' · ');
   statusItem.tooltip = liveStatus || 'EditChain History — loaded / total nodes';
@@ -1164,4 +1170,6 @@ function getHtml(context: vscode.ExtensionContext, webview: vscode.Webview): str
 </html>`;
 }
 
-export async function deactivate(): Promise<void> { await humanWork?.stop(); }
+export async function deactivate(): Promise<void> {
+  await Promise.allSettled([humanWork?.stop(), multiplayer?.suspend()]);
+}

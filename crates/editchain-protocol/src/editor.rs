@@ -30,6 +30,9 @@ pub struct EditorEvent {
     /// Persistent local attribution, independent of the recorder incarnation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<editchain_core::human::HumanIdentity>,
+    /// Account display name observed locally; not a verified account binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
     /// Strictly increasing, one-based identity within the incarnation.
     pub sequence: u64,
     /// Observer wall time. Duration measurements use a monotonic clock.
@@ -303,6 +306,13 @@ impl RecordEditorEvents {
             return Err(invalid("editor batch must contain 1..128 events"));
         }
         for event in &self.events {
+            if event
+                .user_name
+                .as_deref()
+                .is_some_and(|name| !editchain_core::human::valid_user_name(name))
+            {
+                return Err(invalid("human user name must contain 1..80 characters without control characters or surrounding whitespace"));
+            }
             if let Some(identity) = &event.identity {
                 let guid = identity.guid.as_bytes();
                 if guid.len() != 36

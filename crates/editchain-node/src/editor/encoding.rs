@@ -15,6 +15,7 @@ impl Encoding {
             schema,
             session,
             identity,
+            user_name,
             sequence,
             time_ms,
             event,
@@ -69,6 +70,14 @@ impl Encoding {
                     .as_object_mut()
                     .ok_or("missing envelope object")?
                     .insert("identity".into(), serde_json::to_value(identity)?),
+            );
+        }
+        if let Some(user_name) = user_name {
+            drop(
+                envelope
+                    .as_object_mut()
+                    .ok_or("missing envelope object")?
+                    .insert("user_name".into(), serde_json::to_value(user_name)?),
             );
         }
         let mut raw = Vec::with_capacity(old.len().saturating_add(new.len()).saturating_add(1024));

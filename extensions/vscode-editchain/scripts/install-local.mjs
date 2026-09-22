@@ -22,7 +22,7 @@ const env = { ...process.env };
 delete env.VSCODE_IPC_HOOK_CLI;
 const run = (command, args, cwd = extension) => execFileSync(command, args, { cwd, env, stdio: 'inherit' });
 
-run('cargo', ['build', '--release', '-p', 'editchain-node', '--bin', 'editchain-vscode-service', '--locked'], repository);
+run(npm, ['run', 'build:native']);
 run(npm, ['run', 'build:renderer']);
 run(npm, ['run', 'compile']);
 fs.mkdirSync(path.dirname(destination), { recursive: true });

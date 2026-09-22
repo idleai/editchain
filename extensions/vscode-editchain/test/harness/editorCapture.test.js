@@ -55,7 +55,7 @@ function harness(dwell = 2000, identity, options = {}) {
   let capture;
   try {
     const { EditorCapture } = require(filename);
-    capture = new EditorCapture({ uri: { fsPath: '/workspace' }, index: 0 }, dwell, options.maxBytes ?? MAX_EDITOR_BUFFER_BYTES, event => { events.push(event); return true; }, identity);
+    capture = new EditorCapture({ uri: { fsPath: '/workspace' }, index: 0 }, dwell, options.maxBytes ?? MAX_EDITOR_BUFFER_BYTES, event => { events.push(event); return true; }, identity, options.userName);
   } finally { Module._load = original; }
   const tick = ms => {
     const until = now + ms;
@@ -676,4 +676,24 @@ test('configured dwell boundaries, early timer callbacks, and orderly shutdown n
     assert.equal(env.events.at(-1).event.type, 'tracking_stopped');
     assert.equal(env.timers.size, 0);
   }
+});
+
+test('changing the display name flushes prior input without replacing session or human identity', () => {
+  const identity = { kind: 'unsigned', guid: '99999999-9999-4999-8999-999999999999', stream: 'a'.repeat(24) };
+  const env = harness(2000, identity, { userName: 'alice' });
+  try {
+    type(env, 'alice edit', true);
+    env.capture.setUserName('bob');
+    assert.ok(receipts(env).length > 0);
+    assert.ok(receipts(env).every(event => event.user_name === 'alice'));
+    type(env, 'bob edit', true);
+    env.capture.checkpoint();
+    assert.equal(receipts(env).at(-1).user_name, 'bob');
+    env.capture.setUserName(undefined);
+    type(env, 'anonymous edit', true);
+    env.capture.checkpoint();
+    assert.equal(Object.hasOwn(receipts(env).at(-1), 'user_name'), false);
+    assert.equal(new Set(env.events.map(event => event.session)).size, 1);
+    assert.ok(env.events.every(event => JSON.stringify(event.identity) === JSON.stringify(identity)));
+  } finally { env.capture.dispose(); }
 });

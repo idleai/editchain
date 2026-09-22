@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, rc::Rc};
 
 // Increment when reducer, routing, task or disk-index semantics change.
-pub(super) const VERSION: u64 = 7;
+pub(super) const VERSION: u64 = 13;
 
 #[derive(Serialize)]
 struct Borrowed<'a> {
@@ -20,6 +20,7 @@ struct Borrowed<'a> {
     workspace: &'a PathBuf,
     tail: &'a IndexedTail,
     projection: &'a LiveProjection,
+    content: &'a super::content::PendingContent,
     blocks: &'a RankTree<Order, StoredBlock>,
     orders: &'a Map<String, Order>,
     inputs: &'a Map<String, LiveRow>,
@@ -38,6 +39,8 @@ pub(super) struct Saved {
     workspace: PathBuf,
     tail: IndexedTail,
     projection: LiveProjection,
+    #[serde(default)]
+    content: super::content::PendingContent,
     blocks: RankTree<Order, StoredBlock>,
     orders: Map<String, Order>,
     inputs: Map<String, LiveRow>,
@@ -57,6 +60,7 @@ impl LiveWorkspace {
             workspace: &self.root,
             tail: &self.tail,
             projection: &self.projection,
+            content: &self.content,
             blocks: &self.blocks,
             orders: &self.orders,
             inputs: &self.inputs,
@@ -81,6 +85,7 @@ impl LiveWorkspace {
         self.disclosure = saved.disclosure;
         self.tail = saved.tail;
         self.projection = saved.projection;
+        self.content = saved.content;
         self.blocks = saved.blocks;
         self.orders = saved.orders;
         self.inputs = saved.inputs;

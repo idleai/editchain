@@ -221,6 +221,18 @@ pub(crate) fn group_label_text(
     label
 }
 
+/// Older prepared rows retain the human prefix in their cached metadata.
+fn session_title(row: &RowInput) -> Option<&str> {
+    let title = row.source.session_meta.as_ref()?.session_title.as_deref()?;
+    Some(
+        if row.source.author == "human" && row.source.kind != "message" {
+            title.strip_prefix("Human work · ").unwrap_or(title)
+        } else {
+            title
+        },
+    )
+}
+
 /// Whether this row's own graph node has an open side.
 ///
 /// `above` and `below` carry same-lane half-segments. Cross-lane bends carry
@@ -846,10 +858,7 @@ impl RowSpec {
         let group_label = if !is_subop && is_graph_endpoint(row) {
             Some(group_label_text(
                 &row.source.group,
-                row.source
-                    .session_meta
-                    .as_ref()
-                    .and_then(|meta| meta.session_title.as_deref()),
+                session_title(row),
                 row.source
                     .session_meta
                     .as_ref()

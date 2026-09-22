@@ -8,6 +8,7 @@ import { StdioClient, resolveServicePath } from './stdioClient';
 import { unsignedIdentity, workspaceIdentity } from './humanIdentity';
 import { EditorHealth } from './editorHealth';
 import { MAX_EDITOR_BUFFER_BYTES } from './editorLimits';
+import { HumanAccount } from './humanAccount';
 
 type Recorder = { capture: EditorCapture; context: { dispose(): void }; contextClient: StdioClient; outbox: EditorOutbox; client: StdioClient; folder: vscode.WorkspaceFolder; chain: string; health: EditorHealth };
 
@@ -22,9 +23,13 @@ export class HumanWorkHost {
   private transportStatus = 'Tracking human work';
   private reporting: Promise<unknown> | undefined;
   private reportClient: StdioClient | undefined;
+  private readonly account: HumanAccount;
 
   constructor(private readonly context: vscode.ExtensionContext, private readonly log: vscode.OutputChannel,
     private readonly delivered: () => void = () => {}) {
+    this.account = new HumanAccount(name => {
+      for (const recorder of this.recorders) recorder.capture.setUserName(name);
+    });
     this.status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
     this.status.command = 'editchain-history.showTrackingStatus';
     context.subscriptions.push(this.status,
@@ -41,10 +46,10 @@ export class HumanWorkHost {
       vscode.workspace.onDidChangeConfiguration(event => {
         if (['tracking', 'chainDir', 'servicePath'].some(key => event.affectsConfiguration(`editchain-history.${key}`))) void this.restart();
       }),
-      { dispose: () => { void this.stop(); } },
+      this.account, { dispose: () => { void this.stop(); } },
     );
     if (vscode.workspace.isTrusted === false) {
-      context.subscriptions.push(vscode.workspace.onDidGrantWorkspaceTrust(() => { void this.restart(); }));
+      context.subscriptions.push(vscode.workspace.onDidGrantWorkspaceTrust(() => { void this.account.refresh(); void this.restart(); }));
     }
     void this.restart();
   }
@@ -100,7 +105,7 @@ export class HumanWorkHost {
           }
           return accepted;
         },
-          workspaceIdentity(guid, folder.uri.toString(), folder.uri.fsPath, chain));
+          workspaceIdentity(guid, folder.uri.toString(), folder.uri.fsPath, chain), this.account.name);
         const context = observeEditorContext(capture, () => {
           contextClient.ensureStarted(resolveServicePath());
           return contextClient.request({ GetEditorContext: { workspace_path: folder.uri.fsPath, chain_dir: chain } }, { timeoutMs: 30000 });
@@ -200,10 +205,13 @@ export class HumanWorkHost {
 
   async stop(): Promise<void> {
     this.disposed = true;
+    this.account.dispose();
     this.reportClient?.stop();
     await this.lifecycle;
     await this.stopRecorders();
   }
+
+  useAccount(account: vscode.AuthenticationSessionAccountInformation): void { this.account.use(account); }
 }
 
 export function formatReport(report: any): string {

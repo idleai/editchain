@@ -177,14 +177,69 @@ pub(super) fn projection_ops_with_previews(
     source_ops: &[Op],
     resolver: &BlobResolver,
 ) -> (Vec<Op>, BlobHydrationStats, std::collections::HashSet<OpId>) {
-    let mut stats = BlobHydrationStats::default();
+    let preview = prepare_previews(source_ops, resolver);
+    (preview.ops, preview.content.stats, preview.incomplete)
+}
+
+/// Inspect references without cloning payloads, opening blobs or presenting rows.
+pub(super) fn uses_blob_preview(kind: &OpKind) -> bool {
+    let blob = |payload: &Payload| matches!(payload, Payload::Blob(_));
+    match kind {
+        OpKind::ChainStart(_) => false,
+        OpKind::Actor(value) => blob(&value.label) || blob(&value.role),
+        OpKind::Message(value) => blob(&value.content) || blob(&value.content_type),
+        OpKind::Tool(value) => {
+            blob(&value.tool_call_id) || blob(&value.tool_name) || blob(&value.content)
+        }
+        OpKind::Command(value) => blob(&value.command_id) || blob(&value.content),
+        OpKind::File(value) => match &value.edit {
+            editchain_core::FileEdit::None => false,
+            editchain_core::FileEdit::ReplaceBytes { bytes, .. }
+            | editchain_core::FileEdit::UnifiedDiff(bytes) => blob(bytes),
+            editchain_core::FileEdit::Blob(_) => true,
+        },
+        OpKind::Reflection(value) => blob(&value.summary) || blob(&value.anchors),
+        OpKind::Import(value) => blob(&value.raw_ref),
+        OpKind::Note(value) => blob(&value.content),
+        OpKind::Error(value) => blob(&value.code) || blob(&value.message),
+        OpKind::GitCommit(value) => {
+            blob(&value.author.name)
+                || blob(&value.author.email)
+                || blob(&value.committer.name)
+                || blob(&value.committer.email)
+                || blob(&value.message)
+                || value.imported_refs.iter().chain(&value.live_refs).any(blob)
+        }
+        OpKind::GitLink(value) => {
+            matches!(&value.kind, editchain_core::GitLinkKind::Custom(payload) if blob(payload))
+        }
+        OpKind::Unknown(value) => blob(&value.raw_bytes),
+    }
+}
+
+pub(super) struct PreviewOps {
+    pub(super) ops: Vec<Op>,
+    pub(super) incomplete: std::collections::HashSet<OpId>,
+    pub(super) content: PreviewContent,
+}
+
+#[derive(Default)]
+pub(super) struct PreviewContent {
+    pub(super) stats: BlobHydrationStats,
+    pub(super) pending: Vec<BlobRef>,
+}
+
+/// Keep the exact unresolved display dependencies so a live row can recover
+/// when content arrives without another operation being appended.
+pub(super) fn prepare_previews(source_ops: &[Op], resolver: &BlobResolver) -> PreviewOps {
+    let mut content = PreviewContent::default();
     let mut incomplete = std::collections::HashSet::new();
     let ops = source_ops
         .iter()
         .map(|source| {
             let mut op = source.clone();
             if editchain_project::human::work_record(source).is_none() {
-                compact_kind_for_projection(&mut op.kind, resolver, &mut stats);
+                compact_kind_for_projection(&mut op.kind, resolver, &mut content);
             }
             if op.kind != source.kind {
                 let _: bool = incomplete.insert(op.id);
@@ -192,14 +247,39 @@ pub(super) fn projection_ops_with_previews(
             op
         })
         .collect();
-    (ops, stats, incomplete)
+    PreviewOps {
+        ops,
+        incomplete,
+        content,
+    }
+}
+
+impl PreviewContent {
+    fn read(&mut self, blob: &BlobRef, resolver: &BlobResolver, limit: usize) -> Option<Vec<u8>> {
+        self.stats.deferred = self.stats.deferred.saturating_add(1);
+        match resolver.preview(blob, limit) {
+            BlobPreviewResolution::Found(bytes) => return Some(bytes),
+            BlobPreviewResolution::Missing => {
+                self.stats.missing = self.stats.missing.saturating_add(1);
+            }
+            BlobPreviewResolution::Corrupt => {
+                self.stats.corrupt = self.stats.corrupt.saturating_add(1);
+            }
+            BlobPreviewResolution::Unresolvable => {
+                self.stats.unresolved = self.stats.unresolved.saturating_add(1);
+                return None;
+            }
+        }
+        self.pending.push(*blob);
+        None
+    }
 }
 
 /// Replace payloads in one projected operation with bounded display previews.
 fn compact_kind_for_projection(
     kind: &mut OpKind,
     resolver: &BlobResolver,
-    stats: &mut BlobHydrationStats,
+    stats: &mut PreviewContent,
 ) {
     match kind {
         OpKind::ChainStart(start) => compact_inline_bytes(&mut start.name),
@@ -266,33 +346,21 @@ fn compact_kind_for_projection(
 fn compact_signature(
     signature: &mut editchain_core::GitSignature,
     resolver: &BlobResolver,
-    stats: &mut BlobHydrationStats,
+    stats: &mut PreviewContent,
 ) {
     compact_payload(&mut signature.name, resolver, stats);
     compact_payload(&mut signature.email, resolver, stats);
 }
 
 /// Materialize at most a prefix of one payload for projection.
-fn compact_payload(payload: &mut Payload, resolver: &BlobResolver, stats: &mut BlobHydrationStats) {
+fn compact_payload(payload: &mut Payload, resolver: &BlobResolver, stats: &mut PreviewContent) {
     match payload {
         Payload::Inline(bytes) => compact_inline_bytes(bytes),
         Payload::Blob(blob_ref) => {
-            stats.deferred = stats.deferred.saturating_add(1);
-            match resolver.preview(blob_ref, DISPLAY_PREVIEW_READ_LIMIT) {
-                BlobPreviewResolution::Found(mut bytes) => {
-                    compact_inline_bytes(&mut bytes);
-                    *payload = Payload::Inline(bytes);
-                    stats.previewed = stats.previewed.saturating_add(1);
-                }
-                BlobPreviewResolution::Missing => {
-                    stats.missing = stats.missing.saturating_add(1);
-                }
-                BlobPreviewResolution::Corrupt => {
-                    stats.corrupt = stats.corrupt.saturating_add(1);
-                }
-                BlobPreviewResolution::Unresolvable => {
-                    stats.unresolved = stats.unresolved.saturating_add(1);
-                }
+            if let Some(mut bytes) = stats.read(blob_ref, resolver, DISPLAY_PREVIEW_READ_LIMIT) {
+                compact_inline_bytes(&mut bytes);
+                *payload = Payload::Inline(bytes);
+                stats.stats.previewed = stats.stats.previewed.saturating_add(1);
             }
         }
         Payload::Empty => {}
@@ -303,30 +371,16 @@ fn compact_payload(payload: &mut Payload, resolver: &BlobResolver, stats: &mut B
 fn compact_import_payload(
     payload: &mut Payload,
     resolver: &BlobResolver,
-    stats: &mut BlobHydrationStats,
+    stats: &mut PreviewContent,
 ) {
     let preview = match payload {
         Payload::Inline(bytes) => Some(bytes.clone()),
         Payload::Blob(blob_ref) => {
-            stats.deferred = stats.deferred.saturating_add(1);
-            match resolver.preview(blob_ref, DISPLAY_PREVIEW_READ_LIMIT) {
-                BlobPreviewResolution::Found(bytes) => {
-                    stats.previewed = stats.previewed.saturating_add(1);
-                    Some(bytes)
-                }
-                BlobPreviewResolution::Missing => {
-                    stats.missing = stats.missing.saturating_add(1);
-                    None
-                }
-                BlobPreviewResolution::Corrupt => {
-                    stats.corrupt = stats.corrupt.saturating_add(1);
-                    None
-                }
-                BlobPreviewResolution::Unresolvable => {
-                    stats.unresolved = stats.unresolved.saturating_add(1);
-                    None
-                }
+            let bytes = stats.read(blob_ref, resolver, DISPLAY_PREVIEW_READ_LIMIT);
+            if bytes.is_some() {
+                stats.stats.previewed = stats.stats.previewed.saturating_add(1);
             }
+            bytes
         }
         Payload::Empty => None,
     };
@@ -341,14 +395,6 @@ fn compact_inline_bytes(bytes: &mut Vec<u8>) {
 }
 
 /// Record a blob-backed field whose operation shape has no inline payload slot.
-fn defer_blob_ref(blob_ref: &BlobRef, resolver: &BlobResolver, stats: &mut BlobHydrationStats) {
-    stats.deferred = stats.deferred.saturating_add(1);
-    match resolver.preview(blob_ref, 0) {
-        BlobPreviewResolution::Found(_) => {}
-        BlobPreviewResolution::Missing => stats.missing = stats.missing.saturating_add(1),
-        BlobPreviewResolution::Corrupt => stats.corrupt = stats.corrupt.saturating_add(1),
-        BlobPreviewResolution::Unresolvable => {
-            stats.unresolved = stats.unresolved.saturating_add(1);
-        }
-    }
+fn defer_blob_ref(blob_ref: &BlobRef, resolver: &BlobResolver, stats: &mut PreviewContent) {
+    drop(stats.read(blob_ref, resolver, 0));
 }

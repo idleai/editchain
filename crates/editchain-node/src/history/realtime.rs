@@ -3,9 +3,11 @@
 mod ancestry;
 mod checkpoint;
 mod collector;
+mod content;
 mod disclosure;
 mod git;
 mod open;
+mod pending;
 mod queries;
 mod reconcile;
 mod regroup;
@@ -49,6 +51,7 @@ pub(crate) struct LiveWorkspace {
     tail: IndexedTail,
     blobs: editchain_store::BlobReader,
     pending: ChainDelta,
+    content: content::PendingContent,
     poisoned: bool,
     projection: LiveProjection,
     catalog: RepositoryCatalog,
@@ -119,6 +122,7 @@ impl LiveWorkspace {
             chain,
             tail,
             pending: ChainDelta::default(),
+            content: content::PendingContent::default(),
             poisoned: false,
             catalog,
             git,
@@ -149,6 +153,12 @@ impl LiveWorkspace {
             let regroup = saved.version == 1;
             let human_visibility = saved.version < 5;
             let edit_rows = saved.version < 7;
+            let human_streams = saved.version < 8;
+            let partial_items = saved.version < 9;
+            let pending_imports = saved.version < 10;
+            let cutoff_items = saved.version < 11;
+            let legacy_imports = saved.version < 12;
+            let content_rows = saved.version < 13;
             workspace.adopt(saved, true)?;
             if regroup {
                 workspace.regroup();
@@ -162,7 +172,35 @@ impl LiveWorkspace {
             if edit_rows {
                 workspace.refresh_edit_rows(human_visibility)?;
             }
-            if disclosure || edit_rows {
+            if human_streams {
+                workspace.restore_human_streams()?;
+            }
+            if partial_items {
+                workspace.restore_partial_items()?;
+            }
+            if pending_imports {
+                workspace.remove_pending_imports()?;
+            }
+            if cutoff_items {
+                workspace.restore_codex_items()?;
+            }
+            if legacy_imports {
+                workspace.restore_legacy_imports()?;
+            }
+            if content_rows {
+                workspace.restore_content_rows()?;
+            }
+            let content_arrived = workspace.refresh_pending_content()?;
+            if disclosure
+                || edit_rows
+                || human_streams
+                || partial_items
+                || pending_imports
+                || cutoff_items
+                || legacy_imports
+                || content_rows
+                || content_arrived
+            {
                 // Publish the new version only after every migration completed.
                 workspace.checkpoint()?;
             }
@@ -273,6 +311,9 @@ impl LiveWorkspace {
 
     fn sync_inner(&mut self, request: &SyncLiveRequest) -> Result<LiveUpdate> {
         self.validate_cursor(request)?;
+        // Peer content can arrive without another operation. In particular, a
+        // live view opened before blobs/ existed must start resolving its files.
+        self.blobs = editchain_store::BlobReader::open(&self.chain)?;
         let capture_start = Instant::now();
         self.queue_tail()?;
         let mut work = LiveWork::default();
@@ -314,7 +355,12 @@ impl LiveWorkspace {
         work.chain_bytes = admitted.work.bytes_read;
         work.chain_records = admitted.work.records_decoded;
         let projection_start = Instant::now();
-        if !admitted.added.is_empty() || !admitted.removed.is_empty() || !commits.is_empty() {
+        let ready_content = self.content.ready(&self.blobs);
+        if !admitted.added.is_empty()
+            || !admitted.removed.is_empty()
+            || !commits.is_empty()
+            || !ready_content.is_empty()
+        {
             self.poisoned = true;
             self.ancestry
                 .invalidate(admitted.added.keys().chain(&admitted.removed).copied());
@@ -326,10 +372,11 @@ impl LiveWorkspace {
                     .collect::<Vec<_>>(),
                 &admitted.removed.iter().copied().collect::<Vec<_>>(),
             );
-            let changes = self.projection.apply_shared(
+            let mut changes = self.projection.apply_shared(
                 admitted.added.into_values().map(|(op, _)| op).collect(),
                 &admitted.removed.into_iter().collect::<Vec<_>>(),
             );
+            content::include_ready(&mut changes, ready_content);
             work.presentation_ops = changes.work.presentation_ops;
             work.items = changes.work.items;
             work.occurrences = changes.work.occurrences;
@@ -373,7 +420,14 @@ impl LiveWorkspace {
         Ok(())
     }
 
-    fn apply_blocks(&mut self, changes: LiveChanges) -> Result<(Vec<String>, Vec<StoredBlock>)> {
+    fn apply_blocks(
+        &mut self,
+        mut changes: LiveChanges,
+    ) -> Result<(Vec<String>, Vec<StoredBlock>)> {
+        for key in self.pending_imports(changes.upserts.iter())? {
+            drop(changes.upserts.remove(&key));
+            let _removed = changes.removed.insert(key);
+        }
         self.blobs = editchain_store::BlobReader::open(&self.chain)?;
         self.tasks.observe(&changes, &self.projection);
         self.ancestry.observe_relationships(changes.relationships);
@@ -387,17 +441,20 @@ impl LiveWorkspace {
         // A failed transaction poisons this epoch. Keep only one item's row
         // payload in memory while bootstrapping, rather than staging all rows.
         for (key, input) in changes.upserts {
-            let block = self.present(&input)?;
+            let presentation = self.present(&input)?;
+            let block = presentation.block;
             let previous = self
                 .orders
                 .get(&key)
                 .and_then(|order| self.blocks.get(order));
             if let (Some(previous), Some(block)) = (previous, &block) {
                 if previous.matches(block)? {
+                    self.content.observe(&input, presentation.pending);
                     continue;
                 }
             }
             let existed = self.remove_block(&key);
+            self.content.observe(&input, presentation.pending);
             if let Some(block) = block {
                 self.ancestry.put(&input, &self.projection);
                 for op in &input.operations {
@@ -455,6 +512,7 @@ impl LiveWorkspace {
     }
 
     fn remove_block(&mut self, key: &str) -> bool {
+        self.content.remove(key);
         let Some(order) = self.orders.remove(key) else {
             return false;
         };
