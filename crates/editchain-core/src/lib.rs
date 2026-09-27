@@ -23,6 +23,8 @@ pub mod parents;
 pub mod payload;
 /// Typed provider identity and immutable source/lifecycle evidence.
 pub mod provider;
+/// Shared record names over the canonical operation envelope and payloads.
+pub mod records;
 /// Scope reference types (chain, session, turn, file).
 pub mod scope;
 /// Tag bitflags for operation filtering.

@@ -24,6 +24,7 @@ macro_rules! check_eq {
 
 mod inventory_tests;
 mod provenance_tests;
+mod record_tests;
 mod scale_tests;
 mod scope_tests;
 mod secure_tests;

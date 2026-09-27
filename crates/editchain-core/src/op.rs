@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::Clock;
 use crate::git::{GitCommitEntity, GitLink};
-use crate::ids::{ActorId, NodeId, OpId, PathId};
+use crate::ids::{ActorId, NodeId, OpId, PathId, SessionId};
 use crate::parents::ParentSet;
 use crate::payload::{BlobRef, ContentId, Payload};
 use crate::scope::ScopeRef;
@@ -113,6 +113,10 @@ pub enum OpKind {
     GitLink(GitLink),
     /// Opaque preserved fact (unrecognized kind).
     Unknown(UnknownOp),
+    /// Session registration or an immutable observation of session metadata.
+    ///
+    /// Appended after the existing variants to preserve their wire discriminants.
+    Session(SessionOp),
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +143,24 @@ pub struct ActorOp {
     pub label: Payload,
     /// Actor role (e.g. "agent", "human", "tool").
     pub role: Payload,
+}
+
+/// A recorded session fact, independent of a runtime, provider, or viewer.
+///
+/// The enclosing [`Op::id`] identifies this observation; [`Self::id`] identifies
+/// the session across observations. Callers retain their assigned identities
+/// across retries and restarts. Metadata is opaque evidence: the engine does
+/// not interpret it or infer parentage from labels, paths, or timestamps.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionOp {
+    /// Stable session identity supplied by the producer.
+    pub id: SessionId,
+    /// Explicitly recorded parent session, when known.
+    pub parent: Option<SessionId>,
+    /// Display label as recorded bytes or a content reference.
+    pub label: Payload,
+    /// Producer-defined metadata, including original provider identities.
+    pub metadata: Payload,
 }
 
 // ---------------------------------------------------------------------------

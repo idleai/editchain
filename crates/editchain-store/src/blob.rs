@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use editchain_core::{BlobRef, ContentId};
 
-use crate::durable::atomic_write;
+use crate::durable::{atomic_write, sync_parent_dir};
 
 /// A filesystem-backed, content-addressed blob sink.
 ///
@@ -148,7 +148,7 @@ impl BlobStore {
     pub fn write(&mut self, data: &[u8]) -> io::Result<()> {
         let hash = hash_raw(data);
         let path = self.path_for(&hash);
-        match File::open(&path) {
+        match fs::OpenOptions::new().read(true).write(true).open(&path) {
             Ok(mut file) => {
                 if !same_blob_bytes(&mut file, data)? {
                     return Err(io::Error::new(
@@ -159,7 +159,10 @@ impl BlobStore {
                         ),
                     ));
                 }
-                return Ok(());
+                // A retry may follow a failed directory sync after publication.
+                // Matching readable bytes alone are not a durable acknowledgement.
+                file.sync_all()?;
+                return sync_parent_dir(&path);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => {

@@ -1,0 +1,22 @@
+[package]
+name = "editchain-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Viewer-independent facade for immutable EditChain records and evidence"
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+editchain-core = { path = "../editchain-core" }
+editchain-store = { path = "../editchain-store" }
+blake3 = "1"
+
+[dev-dependencies]
+tempfile = "3"

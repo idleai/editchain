@@ -38,6 +38,7 @@ pub(super) fn derive_produced_commit_links(
                 Some((link.source, link.target_repo, link.target_oid))
             }
             OpKind::ChainStart(_)
+            | OpKind::Session(_)
             | OpKind::Actor(_)
             | OpKind::Message(_)
             | OpKind::Tool(_)

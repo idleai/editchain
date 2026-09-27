@@ -52,6 +52,10 @@ pub(super) fn hydrate_kind(
 ) {
     match kind {
         OpKind::ChainStart(_) => {}
+        OpKind::Session(session) => {
+            hydrate_payload(&mut session.label, resolver, stats);
+            hydrate_payload(&mut session.metadata, resolver, stats);
+        }
         OpKind::Actor(actor) => {
             hydrate_payload(&mut actor.label, resolver, stats);
             hydrate_payload(&mut actor.role, resolver, stats);
@@ -186,6 +190,7 @@ pub(super) fn uses_blob_preview(kind: &OpKind) -> bool {
     let blob = |payload: &Payload| matches!(payload, Payload::Blob(_));
     match kind {
         OpKind::ChainStart(_) => false,
+        OpKind::Session(value) => blob(&value.label) || blob(&value.metadata),
         OpKind::Actor(value) => blob(&value.label) || blob(&value.role),
         OpKind::Message(value) => blob(&value.content) || blob(&value.content_type),
         OpKind::Tool(value) => {
@@ -283,6 +288,10 @@ fn compact_kind_for_projection(
 ) {
     match kind {
         OpKind::ChainStart(start) => compact_inline_bytes(&mut start.name),
+        OpKind::Session(session) => {
+            compact_payload(&mut session.label, resolver, stats);
+            compact_payload(&mut session.metadata, resolver, stats);
+        }
         OpKind::Actor(actor) => {
             compact_payload(&mut actor.label, resolver, stats);
             compact_payload(&mut actor.role, resolver, stats);

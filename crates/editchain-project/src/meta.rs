@@ -248,9 +248,11 @@ pub(crate) fn for_edit_operation(op: &Op) -> NodeMeta {
         OpKind::File(_) => (RecordRole::Artifact, ActivityKind::Change),
         OpKind::Reflection(_) => (RecordRole::Narrative, ActivityKind::Plan),
         OpKind::Error(_) => (RecordRole::Result, ActivityKind::Diagnose),
-        OpKind::ChainStart(_) | OpKind::Actor(_) | OpKind::Import(_) | OpKind::Note(_) => {
-            (RecordRole::Lifecycle, ActivityKind::System)
-        }
+        OpKind::ChainStart(_)
+        | OpKind::Session(_)
+        | OpKind::Actor(_)
+        | OpKind::Import(_)
+        | OpKind::Note(_) => (RecordRole::Lifecycle, ActivityKind::System),
         OpKind::GitCommit(_) | OpKind::GitLink(_) => {
             (RecordRole::Artifact, ActivityKind::SourceControl)
         }
@@ -473,6 +475,7 @@ fn children_based_meta(
                     break;
                 }
                 OpKind::ChainStart(_)
+                | OpKind::Session(_)
                 | OpKind::Actor(_)
                 | OpKind::Import(_)
                 | OpKind::GitCommit(_)
@@ -801,6 +804,7 @@ fn raw_import_json(op: &Op) -> Option<Value> {
             Payload::Empty | Payload::Blob(_) => return None,
         },
         OpKind::ChainStart(_)
+        | OpKind::Session(_)
         | OpKind::Actor(_)
         | OpKind::Message(_)
         | OpKind::Tool(_)

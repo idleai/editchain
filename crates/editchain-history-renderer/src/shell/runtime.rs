@@ -3,6 +3,12 @@
 //! DOM work finishes under the shell borrow. Sends run after it is released,
 //! with each host post deferred to a microtask so synchronous fixture responses
 //! cannot recursively invoke an active wasm-bindgen callback.
+//!
+//! The canonical VS Code platform bridge is now
+//! `vscode-extension/webview/src/bridge.rs` (f38). This active legacy shell stays
+//! wired until f23/f28/f43 switch its consumers; the domain transitions below
+//! remain outside that extraction. See
+//! `extensions/vscode-editchain/HOST-MIGRATION.md` for cleanup ownership.
 
 use super::diagnostics::{js_value_text, record_error, sync_debug_props_locked};
 use super::{ShellData, SHELL_DATA};

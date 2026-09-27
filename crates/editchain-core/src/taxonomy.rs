@@ -1,16 +1,16 @@
 //! Provider-neutral semantic readability taxonomy for history rows.
 //!
-//! These enums describe what a history row *is* ([`RecordRole`]), what kind of
-//! activity it represents ([`ActivityKind`]), how prominently it should render
-//! ([`Visibility`]), how its underlying activity concluded ([`Outcome`]), and
-//! how its chain should be presented ([`ChainState`]), without referencing any
+//! These enums describe what a history row *is* ([`crate::taxonomy::RecordRole`]), what kind of
+//! activity it represents ([`crate::taxonomy::ActivityKind`]), how prominently it should render
+//! ([`crate::taxonomy::Visibility`]), how its underlying activity concluded ([`crate::taxonomy::Outcome`]), and
+//! how its chain should be presented ([`crate::taxonomy::ChainState`]), without referencing any
 //! provider-specific raw format. The projection derives them deterministically
 //! from raw/normalized structure; the protocol serializes them as stable
 //! lowercase snake_case strings.
 //!
 //! Forward compatibility: classification enums carry an `Unknown` variant that
 //! is both the [`Default`] and the serde catch-all (`#[serde(other)]`).
-//! [`ChainState`] instead treats missing or unrecognized values as `Active`, so
+//! [`crate::taxonomy::ChainState`] instead treats missing or unrecognized values as `Active`, so
 //! presentation remains unchanged across protocol versions.
 
 use serde::{Deserialize, Serialize};

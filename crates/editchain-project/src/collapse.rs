@@ -107,6 +107,7 @@ impl HistoryProjection {
             .filter_map(|op| match &op.kind {
                 editchain_core::OpKind::Import(import) => Some((op.id, import)),
                 editchain_core::OpKind::ChainStart(_)
+                | editchain_core::OpKind::Session(_)
                 | editchain_core::OpKind::Actor(_)
                 | editchain_core::OpKind::Message(_)
                 | editchain_core::OpKind::Tool(_)
@@ -742,6 +743,7 @@ impl HistoryProjection {
             .filter_map(|child| match &child.kind {
                 editchain_core::OpKind::Tool(tool) => Some(tool),
                 editchain_core::OpKind::ChainStart(_)
+                | editchain_core::OpKind::Session(_)
                 | editchain_core::OpKind::Actor(_)
                 | editchain_core::OpKind::Message(_)
                 | editchain_core::OpKind::Command(_)

@@ -126,6 +126,7 @@ fn op_summary(op: &Op) -> String {
         OpKind::Error(e) => payload_text(&e.message),
         OpKind::ChainStart(cs) => String::from_utf8_lossy(&cs.name).to_string(),
         OpKind::Actor(a) => payload_text(&a.label),
+        OpKind::Session(session) => payload_text(&session.label),
         OpKind::Import(i) => payload_text(&i.raw_ref),
         OpKind::GitCommit(c) => payload_text(&c.message),
         OpKind::GitLink(l) => format!("git:{}", l.target_oid),
@@ -144,6 +145,7 @@ fn op_body(op: &Op) -> String {
         OpKind::Note(n) => payload_text(&n.content),
         OpKind::Error(e) => payload_text(&e.message),
         OpKind::ChainStart(_)
+        | OpKind::Session(_)
         | OpKind::Actor(_)
         | OpKind::File(_)
         | OpKind::Import(_)

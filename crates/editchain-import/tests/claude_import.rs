@@ -325,6 +325,7 @@ fn raw_only_append_and_failed_content_backfill_preserve_accepted_coverage() {
             OpKind::Tool(tool) => Some(&tool.content),
             OpKind::Command(command) => Some(&command.content),
             OpKind::ChainStart(_)
+            | OpKind::Session(_)
             | OpKind::Actor(_)
             | OpKind::File(_)
             | OpKind::Reflection(_)

@@ -27,6 +27,7 @@ pub(super) fn op_summary(op: &Op) -> String {
         OpKind::Error(e) => payload_text(&e.message),
         OpKind::ChainStart(cs) => String::from_utf8_lossy(&cs.name).to_string(),
         OpKind::Actor(a) => payload_text(&a.label),
+        OpKind::Session(session) => payload_text(&session.label),
         OpKind::Import(i) => payload_text(&i.raw_ref),
         OpKind::GitCommit(c) => payload_text(&c.message),
         OpKind::GitLink(l) => format!("git:{}", l.target_oid),
@@ -888,6 +889,7 @@ pub(super) fn sub_op_content(op: &Op) -> Option<String> {
         }
         editchain_core::OpKind::Import(_)
         | editchain_core::OpKind::ChainStart(_)
+        | editchain_core::OpKind::Session(_)
         | editchain_core::OpKind::Actor(_)
         | editchain_core::OpKind::Message(_)
         | editchain_core::OpKind::Tool(_)

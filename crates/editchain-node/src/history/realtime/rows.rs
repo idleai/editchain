@@ -167,6 +167,7 @@ fn unresolved(input: &LiveRow) -> bool {
                 Some(file.stage == editchain_core::FileStage::Proposed)
             }
             editchain_core::OpKind::ChainStart(_)
+            | editchain_core::OpKind::Session(_)
             | editchain_core::OpKind::Actor(_)
             | editchain_core::OpKind::Message(_)
             | editchain_core::OpKind::Reflection(_)
