@@ -10,7 +10,7 @@ use editchain_core::{Admission, Op, OpId, OpSet};
 use crate::segment::segment_sequences;
 
 /// Canonicalization and integrity outcomes for a chain read.
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ChainReadStats {
     /// Successfully decoded record occurrences, including exact replays.
     pub records: usize,

@@ -3,6 +3,11 @@
 `editchain-store` durably stores history records and blobs. The CLI, importers,
 and replication services can use it without a viewer.
 
+The [chain index API](../editchain-index/README.md) builds resumable checkpoints,
+secondary lookups, content-availability deltas, and integrity/rebuild operations
+over these records and blobs. Shared page primitives live below both crates in
+`editchain-index-pages`; source records and blobs never depend on a derived checkpoint.
+
 The filesystem implementation remains compatible with existing EC02 segments
 and BLAKE3 blob filenames. It preserves supplied operation identities and bytes.
 

@@ -735,6 +735,18 @@ name = "editchain-index"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "editchain-core",
+ "editchain-index-pages",
+ "editchain-store",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
+name = "editchain-index-pages"
+version = "0.1.0"
+dependencies = [
+ "blake3",
  "ciborium",
  "serde",
  "tempfile",
@@ -789,7 +801,7 @@ dependencies = [
  "blake3",
  "crc",
  "editchain-core",
- "editchain-index",
+ "editchain-index-pages",
  "postcard",
  "proptest",
  "serde",

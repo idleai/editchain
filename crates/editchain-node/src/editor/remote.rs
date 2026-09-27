@@ -20,7 +20,7 @@ pub(super) fn retained_source(
     if let Some(op) = chain.get(id) {
         return Ok(Some(op.clone()));
     }
-    let locations: Vec<_> = chain.evidence_locations(id).collect();
+    let locations: Vec<_> = chain.record_locations(id).collect();
     if locations.is_empty() {
         return Ok(None);
     }
@@ -50,7 +50,7 @@ pub(super) fn retry_source(
     if let Some(local) = retained_source(chain, root, expected.id)? {
         return Ok(Some(local));
     }
-    for location in chain.evidence_locations(expected.id) {
+    for location in chain.record_locations(expected.id) {
         let encoded = read_encoded_at(root, location)?;
         let retained = decode_op(&encoded).map_err(io::Error::other)?;
         let mut retry = expected.clone();
@@ -71,7 +71,7 @@ pub(super) fn predecessor_matches(
     next: &Op,
 ) -> io::Result<bool> {
     let mut found = false;
-    for location in chain.evidence_locations(id) {
+    for location in chain.record_locations(id) {
         found = true;
         let previous = decode_op(&read_encoded_at(root, location)?).map_err(io::Error::other)?;
         if previous.actor != next.actor || previous.scope != next.scope {

@@ -2,7 +2,7 @@
 
 use blake3 as _;
 use crc as _;
-use editchain_index as _;
+use editchain_index_pages as _;
 use postcard as _;
 use proptest as _;
 use serde as _;

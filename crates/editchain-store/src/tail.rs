@@ -90,7 +90,7 @@ pub type IndexedTail = Tail<crate::IndexedChain>;
 /// it does not inventory or decode sealed history on each poll. A caller that
 /// observes an external replacement of sealed history must reopen the reader.
 /// Active-file replacement, truncation and same-size modification are rejected.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Tail<C: TailCorpus> {
     root: PathBuf,
     chain: C,
@@ -98,7 +98,7 @@ pub struct Tail<C: TailCorpus> {
     offset: u64,
     page: Option<u32>,
     observed: Option<FileStamp>,
-    sealed: editchain_index::OrderedMap<u32, FileStamp>,
+    sealed: editchain_index_pages::OrderedMap<u32, FileStamp>,
     incomplete: bool,
 }
 
@@ -131,7 +131,7 @@ impl<C: TailCorpus> Tail<C> {
             offset: 0,
             page: None,
             observed: None,
-            sealed: editchain_index::OrderedMap::new(),
+            sealed: editchain_index_pages::OrderedMap::new(),
             incomplete: false,
         }
     }

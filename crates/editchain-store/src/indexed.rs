@@ -1,24 +1,24 @@
-//! Canonical admission with exact evidence retained in its durable records.
+//! Canonical admission with exact encoded bytes retained in durable records.
 
 use crate::{reader::read_encoded_at, ChainReadStats, OpRecordLocation};
 use editchain_core::{Admission, Op, OpId};
-use editchain_index::Map;
+use editchain_index_pages::Map;
 use std::{
     io,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Entry {
     location: OpRecordLocation,
     accepted: Option<Arc<Op>>,
 }
 
 /// Resident identities and shared decoded operations, backed by immutable
-/// segment records for exact duplicate/conflict evidence. Unlike a standalone
-/// evidence set, this index cannot outlive or be merged without its source files.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+/// segment records for exact duplicate/conflict detection. This index requires
+/// its source files to read the original encoded bytes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexedChain {
     root: PathBuf,
     entries: Map<OpId, Entry>,
@@ -27,8 +27,13 @@ pub struct IndexedChain {
 }
 
 impl IndexedChain {
+    /// Every retained identity, including quarantined identities, in trie order.
+    pub fn identities(&self) -> impl Iterator<Item = OpId> + '_ {
+        self.entries.keys().copied()
+    }
+
     /// Exact durable locations for every retained variant of an identity.
-    pub fn evidence_locations(&self, id: OpId) -> impl Iterator<Item = OpRecordLocation> + '_ {
+    pub fn record_locations(&self, id: OpId) -> impl Iterator<Item = OpRecordLocation> + '_ {
         self.entries
             .get(&id)
             .map(|entry| entry.location)
@@ -39,7 +44,7 @@ impl IndexedChain {
     /// Classify against exact durable bytes, including every quarantined variant.
     ///
     /// # Errors
-    /// Returns IO errors if previously admitted evidence is unavailable.
+    /// Returns IO errors if previously admitted record bytes are unavailable.
     pub fn classify(&self, id: OpId, encoded: &[u8]) -> io::Result<Admission> {
         let Some(entry) = self.entries.get(&id) else {
             return Ok(Admission::Accepted);
