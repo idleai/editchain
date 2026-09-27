@@ -106,8 +106,9 @@ newline normalization, truncation, or metadata interpretation occurs in these
 APIs. Existing bytes that disagree with their content address are left untouched
 and produce an error on a repeated write.
 
-This facade currently uses the existing filesystem store and performs a full
-canonical read per append or snapshot. It does not promise indexed query or
-large-batch throughput. Existing import, query, and replication implementations
-remain in their respective crates; the facade's dependencies contain no viewer,
-node service, protocol, or presentation crate.
+The facade performs a full canonical read per append or snapshot. For indexed
+history, search, content, diff, Git, and provenance access, use `Engine::queries()`
+or `queries::ChainQueries::from_index(index)`. The [query guide](engine-queries.md)
+describes evidence references, pagination, refresh, and explicit content gaps.
+Import and replication implementations remain in their respective crates; the
+facade's dependencies contain no viewer, node service, protocol, or presentation crate.

@@ -4,7 +4,10 @@ use std::io::{self, Write as _};
 
 use blake3 as _;
 use editchain_core as _;
+use editchain_index as _;
 use editchain_store as _;
+use serde as _;
+use serde_json as _;
 use tempfile as _;
 
 use editchain_engine::records::{

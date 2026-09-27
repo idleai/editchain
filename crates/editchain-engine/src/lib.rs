@@ -16,6 +16,13 @@
 //! do not retain stale state after another writer or a failed append. This
 //! facade uses reusable append-log and blob adapters from `editchain-store`.
 //! Admission currently replays the log per append; indexes remain derived.
+//!
+//! [`Engine::queries`] opens the indexed, viewer-independent [`queries`] API.
+//! It returns recorded history, literal search, exact content, byte diffs, and
+//! provenance with portable evidence references. Refresh the query index to
+//! observe new records, conflicts, and late content.
+
+pub mod queries;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -33,7 +40,7 @@ pub use editchain_store::format::{decode_op, encode_op};
 pub use editchain_store::{BlobResolution, ChainReadStats};
 
 #[cfg(test)]
-use blake3 as _;
+use serde_json as _;
 #[cfg(test)]
 use tempfile as _;
 
@@ -72,6 +79,17 @@ impl Engine {
     /// Returns the framing and filesystem errors from [`ChainSnapshot::read`].
     pub fn snapshot(&self) -> io::Result<ChainSnapshot> {
         ChainSnapshot::read(&self.root)
+    }
+
+    /// Open indexed queries for this chain without starting a viewer or service.
+    ///
+    /// The returned handle owns the index checkpoint lock. Reuse that handle,
+    /// or transfer an existing index with [`queries::ChainQueries::from_index`].
+    ///
+    /// # Errors
+    /// Returns source, index, or competing-index-owner errors.
+    pub fn queries(&self) -> io::Result<queries::ChainQueries> {
+        queries::ChainQueries::open(&self.root)
     }
 
     /// Encode and append a newly authored operation using the existing codec.

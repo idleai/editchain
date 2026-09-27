@@ -8,7 +8,10 @@ use editchain_engine::{
     ContentId, Engine, MessageOp, NodeId, Op, OpId, OpKind, ParentSet, Payload, ScopeRef,
     SessionId, Tags,
 };
+use editchain_index as _;
 use editchain_store::{format::Page, SegmentStore};
+use serde as _;
+use serde_json as _;
 
 fn operation(sequence: u64, bytes: &[u8]) -> Op {
     Op {
