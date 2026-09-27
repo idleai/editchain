@@ -739,7 +739,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "editchain-core",
- "editchain-project",
+ "editchain-engine",
  "editchain-store",
  "process-wrap",
  "proptest",
@@ -798,10 +798,16 @@ dependencies = [
 name = "editchain-project"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "editchain-core",
+ "editchain-engine",
+ "editchain-import",
  "editchain-index",
+ "editchain-store",
  "serde",
  "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

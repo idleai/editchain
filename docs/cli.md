@@ -39,6 +39,7 @@ its report to stderr. Only `init` and provider imports create a missing chain.
 | `annotate`, `reflect` | Append complete `Note` or `Reflection` operation envelopes |
 | `store-blob [--input FILE]` | Store raw bytes and return their content reference |
 | `import --provider claude\|codex\|human --input PATH` | Capture provider history |
+| `import-state` | Inspect selected derivations, logical Codex items, exact copies and source gaps |
 | `export`, `append --archive` | Export or replay an evidence archive |
 | `history`, `annotations`, `reflections` | Page accepted records |
 | `operation ID`, `variants ID` | Look up an operation or all its exact variants |

@@ -12,7 +12,7 @@
 use serde as _;
 
 #[cfg(test)]
-use editchain_project as _;
+use editchain_engine as _;
 #[cfg(test)]
 use proptest as _;
 

@@ -42,6 +42,8 @@ impl Page {
 
 #[derive(Debug, clap::Subcommand)]
 pub(super) enum Command {
+    /// Read import derivations, logical items, exact copies and incomplete sources.
+    ImportState,
     /// Page accepted immutable operations with exact record references.
     History(Page),
     /// Literal, case-sensitive search with explicit unavailable content.
@@ -126,6 +128,7 @@ pub(super) fn run(chain: &Path, command: Command, output: &mut Output) -> Result
     let mut queries = ChainQueries::open(chain)?;
     let _changes = queries.refresh()?;
     match command {
+        Command::ImportState => output.emit(&queries.import_state()?),
         Command::History(page) => output.emit(&queries.history(page.key, page.request())?),
         Command::Search { text, page } => {
             let result = queries.search(&text, page.key, page.request())?;

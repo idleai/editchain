@@ -19,22 +19,13 @@
 //! code cannot yet express them the failure is reported precisely.
 #![cfg(unix)]
 
-#[expect(
-    dead_code,
-    reason = "the shared harness module contains helpers used by sibling integration-test crates"
-)]
-mod common;
+use super::common;
 
 use blake3 as _;
 use editchain_store as _;
-use process_wrap as _;
-use proptest as _;
 use serde as _;
-use sha2 as _;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use time as _;
-use tokio as _;
 
 use editchain_core::op::{NoteRelationship, OpKind};
 use editchain_core::parents::ParentSet;

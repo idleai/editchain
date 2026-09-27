@@ -10,7 +10,7 @@ impl LiveProjection {
     #[must_use]
     pub fn import_ready(&self, source: OpId) -> bool {
         self.selected.contains_key(&source)
-            || crate::materialization::complete_derivation(
+            || editchain_engine::imports::complete_derivation(
                 source,
                 self.import_children(source),
                 &self.ops,

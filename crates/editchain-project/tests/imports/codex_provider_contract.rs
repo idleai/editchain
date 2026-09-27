@@ -33,22 +33,12 @@
 
 use blake3 as _;
 use editchain_core as _;
-use editchain_project as _;
 use editchain_store as _;
-use process_wrap as _;
-use proptest as _;
 use serde as _;
 use serde_json as _;
-use sha2 as _;
 use tempfile as _;
-use time as _;
-use tokio as _;
 
-#[expect(
-    dead_code,
-    reason = "shared test harness module also used by sibling integration test binaries"
-)]
-mod common;
+use super::common;
 
 use editchain_core::op::{NoteRelationship, OpKind};
 use editchain_core::payload::Payload;

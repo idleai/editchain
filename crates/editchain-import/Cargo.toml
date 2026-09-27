@@ -26,4 +26,4 @@ editchain-core = { path = "../editchain-core" }
 
 [dev-dependencies]
 proptest = "1"
-editchain-project = { path = "../editchain-project" }
+editchain-engine = { path = "../editchain-engine" }

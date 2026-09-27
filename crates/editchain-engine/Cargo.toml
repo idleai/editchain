@@ -19,7 +19,7 @@ editchain-core = { path = "../editchain-core" }
 editchain-index = { path = "../editchain-index" }
 editchain-store = { path = "../editchain-store" }
 serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile = "3"

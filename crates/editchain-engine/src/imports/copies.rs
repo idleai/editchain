@@ -1,21 +1,21 @@
-//! Collapse proven copied Codex prefixes without discarding conflicting evidence.
+//! Prove copied Codex prefixes without changing any recorded evidence.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use editchain_core::provider::{CodexDerivationEvidence, CodexLogicalChange, CodexThreadId};
-use editchain_core::{Op, OpId, OpKind, ParentSet};
+use crate::provider::{CodexDerivationEvidence, CodexLogicalChange, CodexThreadId};
+use crate::{Op, OpId, OpKind, ParentSet};
 
-use super::{source_key, Materialization, SourceKey};
+use super::{source_key, SourceKey};
 
 type Records<'a> = Vec<(OpId, &'a CodexDerivationEvidence)>;
 
-pub(super) fn coalesce(
+pub(super) fn equivalents(
     selected: &BTreeMap<OpId, &CodexDerivationEvidence>,
     ops: &HashMap<OpId, &Op>,
     blocked: &HashSet<SourceKey>,
     incomplete: &HashSet<OpId>,
-    result: &mut Materialization,
-) {
+) -> BTreeMap<OpId, OpId> {
+    let mut equivalents = BTreeMap::new();
     let mut sources: BTreeMap<SourceKey, Records<'_>> = BTreeMap::new();
     for (id, meta) in selected {
         if !blocked.contains(&source_key(*id)) {
@@ -31,7 +31,7 @@ pub(super) fn coalesce(
     let mut ordered: Vec<_> = sources.into_iter().collect();
     ordered.sort_by_key(|(key, records)| (std::cmp::Reverse(records.len()), *key));
     let mut retained: BTreeMap<&CodexThreadId, Vec<&Records<'_>>> = BTreeMap::new();
-    for (key, records) in &ordered {
+    for (_, records) in &ordered {
         let Some((_, first)) = records.first() else {
             continue;
         };
@@ -40,15 +40,12 @@ pub(super) fn coalesce(
             .iter()
             .find_map(|candidate| equivalent_prefix(records, candidate, ops, incomplete));
         if let Some(mapping) = equivalent {
-            result.items.retain(|item| source_key(item.source) != *key);
-            for (copy, original) in mapping {
-                let _hidden = result.hidden.insert(copy);
-                let _previous = result.representatives.insert(copy, original);
-            }
+            equivalents.extend(mapping);
         } else {
             candidates.push(records);
         }
     }
+    equivalents
 }
 
 fn equivalent_prefix(

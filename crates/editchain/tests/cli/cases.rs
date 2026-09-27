@@ -92,6 +92,7 @@ fn package_help_and_exit_contracts() {
         "init",
         "append",
         "import",
+        "import-state",
         "export",
         "meta",
         "annotations",
@@ -669,6 +670,53 @@ fn shared_codex_import_uses_the_recorded_exporter_contract() {
         0,
     );
     assert_eq!(repeated.get("written"), Some(&json!(0)));
+    let state = result(&chain, &["import-state"], b"", 0);
+    assert_eq!(
+        state.get("codex_items").unwrap().as_array().unwrap().len(),
+        3
+    );
+    let before = Engine::open(&chain)
+        .unwrap()
+        .snapshot()
+        .unwrap()
+        .stats()
+        .accepted;
+    let copied_args: Vec<_> = args
+        .iter()
+        .map(|arg| {
+            if *arg == "rollout-contract.jsonl" {
+                "rollout-copy.jsonl"
+            } else {
+                *arg
+            }
+        })
+        .collect();
+    let _copied = result(
+        &chain,
+        &copied_args,
+        include_bytes!("../../../editchain-import/tests/fixtures/codex/rollout-contract.jsonl"),
+        3,
+    );
+    let copied = result(&chain, &["import-state"], b"", 0);
+    assert_eq!(
+        copied.get("codex_items").unwrap().as_array().unwrap().len(),
+        3,
+        "the CLI exposes shared logical reconciliation without viewer code"
+    );
+    assert!(
+        !copied.get("copies").unwrap().as_array().unwrap().is_empty(),
+        "exact copy equivalences remain inspectable"
+    );
+    assert_eq!(
+        Engine::open(&chain)
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .stats()
+            .accepted,
+        before.saturating_mul(2),
+        "canonical history keeps both source occurrences"
+    );
 }
 
 #[test]
