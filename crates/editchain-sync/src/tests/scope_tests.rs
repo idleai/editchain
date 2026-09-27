@@ -262,3 +262,43 @@ fn a_large_history_cutoff_is_constant_size_and_preserves_legacy_boundaries() -> 
     );
     Ok(())
 }
+
+#[test]
+fn legacy_unmaterialized_cutoff_survives_writes_before_replica_reopen() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let old = record(1, b"private legacy history")?;
+    seed(dir.path(), std::slice::from_ref(&old))?;
+    // Legacy writers had no packing marker and did not materialize a cutoff
+    // until a later transaction wrote the next segment.
+    std::fs::remove_file(dir.path().join(".segment-layout"))?;
+    drop(Replica::open(dir.path(), "space-1", true)?);
+    let mut scope = crate::scope::Scope::read(dir.path())?;
+    scope.select(dir.path(), Some(1))?;
+    atomic_write(
+        &dir.path().join("multiplayer/scope.json"),
+        &serde_json::to_vec(&scope)?,
+    )?;
+    check!(
+        !dir.path().join("000001.eclog").exists(),
+        "legacy cutoff is not materialized"
+    );
+    let original_segment = std::fs::read(dir.path().join("000000.eclog"))?;
+    let later = record(2, b"new history before peer restart")?;
+    seed(dir.path(), std::slice::from_ref(&later))?;
+    let replica = Replica::open(dir.path(), "space-1", false)?;
+    let snapshot = replica.snapshot()?;
+    check!(
+        !snapshot.contains(old.0),
+        "old private history stays withheld"
+    );
+    check!(
+        snapshot.contains(later.0),
+        "new history stays beyond the legacy cutoff"
+    );
+    check_eq!(
+        std::fs::read(dir.path().join("000000.eclog"))?,
+        original_segment,
+        "upgrade never rewrites legacy evidence"
+    );
+    Ok(())
+}

@@ -111,6 +111,9 @@ fn record_inner(
     if accepted > 0 {
         store.append_page(&page)?;
     }
+    if replayed > 0 {
+        store.sync_all()?;
+    }
     let stored_ms = started.elapsed().as_millis();
     // Raw retries repair missing payloads before any derived replay reads them.
     projection.synchronize(&mut store, &mut blobs, request, &fresh)?;

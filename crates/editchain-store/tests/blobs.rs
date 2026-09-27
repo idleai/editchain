@@ -38,7 +38,7 @@ fn reference(bytes: &[u8]) -> Result<BlobRef, Box<dyn Error>> {
 }
 
 #[test]
-fn reopened_readers_share_writer_addresses_and_preserve_missing_open_state() -> TestResult {
+fn readers_observe_late_blobs_without_changing_the_reference() -> TestResult {
     let temp = tempfile::tempdir()?;
     let chain = temp.path().join("chain");
     let blob_dir = chain.join("blobs");
@@ -55,8 +55,11 @@ fn reopened_readers_share_writer_addresses_and_preserve_missing_open_state() -> 
     writer.write(bytes)?;
     writer.write(bytes)?;
     equal(&writer.len()?, &1)?;
-    // Opening before the directory exists preserves that observed availability.
-    equal(&before.resolve(&blob), &BlobResolution::Missing)?;
+    // A long-lived reader sees blobs even if its directory was initially absent.
+    equal(
+        &before.resolve(&blob),
+        &BlobResolution::Found(bytes.to_vec()),
+    )?;
     let reopened = BlobReader::open(&chain)?;
     equal(
         &reopened.resolve(&blob),
@@ -128,6 +131,43 @@ fn unsupported_addresses_and_invalid_blob_directories_stay_distinct() -> TestRes
     check(
         BlobStore::open_read_only(temp.path().join("blobs")).is_err(),
         "reject non-directory store paths",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn concurrent_blob_writers_ignore_interrupted_temporary_files() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let directory = temp.path().join("nested/chain/blobs");
+    let writer = BlobStore::new(&directory)?;
+    let bytes = b"identical writers publish one complete binary blob\0\xff";
+    let blob = reference(bytes)?;
+    let abandoned = directory.join("orphan.tmp.1234");
+    fs::write(&abandoned, bytes.get(..7).ok_or("prefix")?)?;
+    equal(&writer.resolve(&blob), &BlobResolution::Missing)?;
+    equal(&writer.len()?, &0)?;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let workers = (0..8)
+        .map(|_| {
+            let mut writer = writer.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let _wait = barrier.wait();
+                writer.write(bytes)
+            })
+        })
+        .collect::<Vec<_>>();
+    for worker in workers {
+        worker.join().map_err(|_panic| "blob worker panicked")??;
+    }
+    equal(&writer.len()?, &1)?;
+    equal(
+        &writer.resolve(&blob),
+        &BlobResolution::Found(bytes.to_vec()),
+    )?;
+    equal(
+        &fs::read(abandoned)?,
+        &bytes.get(..7).ok_or("prefix")?.to_vec(),
     )?;
     Ok(())
 }

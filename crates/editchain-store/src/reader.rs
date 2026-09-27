@@ -52,6 +52,28 @@ pub struct CanonicalChain {
 }
 
 impl CanonicalChain {
+    /// Replay a portable append-log adapter without re-encoding any evidence.
+    ///
+    /// Locations are adapter-specific and therefore absent in this snapshot.
+    /// Undecodable complete records remain in the log and are counted here.
+    ///
+    /// # Errors
+    /// Returns replay and framing errors from the adapter.
+    pub fn read_log(log: &impl crate::AppendLog) -> io::Result<Self> {
+        let mut chain = Self::default();
+        let stats = log.visit_records(&mut |_flags, bytes| {
+            match decode_op(bytes) {
+                Ok(op) => {
+                    let _: Admission = chain.admit(op, bytes.to_vec(), None);
+                }
+                Err(_) => chain.record_undecodable(),
+            }
+            Ok(())
+        })?;
+        chain.stats.incomplete_tails = stats.incomplete_tails;
+        Ok(chain)
+    }
+
     /// Read all complete records without creating or modifying the chain.
     ///
     /// A missing chain is empty. Incomplete tails and undecodable records are

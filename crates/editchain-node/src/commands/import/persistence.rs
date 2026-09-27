@@ -53,6 +53,9 @@ fn append(store: &mut SegmentStore, operations: &[Op]) -> std::io::Result<Durabl
     if !page.records.is_empty() {
         store.append_page(&page)?;
     }
+    if admission.duplicates > 0 || admission.conflicts > 0 {
+        store.sync_all()?;
+    }
     Ok(admission)
 }
 

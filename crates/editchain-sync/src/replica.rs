@@ -278,9 +278,15 @@ impl Replica {
     /// Returns writer contention or metadata failure. Interrupted selections
     /// fail closed until the user repeats this explicit selection.
     pub fn set_sharing_scope(&self, backfill: bool) -> io::Result<SharingScope> {
-        let writer = crate::writer(&self.root)?;
+        let mut writer = crate::writer(&self.root)?;
         let mut scope = Scope::read(&self.root)?;
         self.check_space(&scope)?;
+        if !backfill {
+            // Routine writer opens reuse a segment. Persist an explicit boundary
+            // so a later reopen cannot append private history below this cutoff.
+            writer.rotate()?;
+            writer.append_page(&Page::new(0))?;
+        }
         scope.select(&self.root, (!backfill).then(|| writer.segment_sequence()))?;
         self.save_scope(&scope)?;
         self.scope_revision.set(scope.revision);
@@ -365,6 +371,11 @@ impl Replica {
         }
         if !page.records.is_empty() {
             writer.append_page(&page)?;
+        }
+        if staged.len() < records.len() {
+            // A retry may observe complete bytes from a failed persistence
+            // attempt. Re-establish durability before acknowledging them.
+            writer.sync_all()?;
         }
         if let Some(snapshot) = snapshot {
             // Only the receipt page changes the receiver's view. The outgoing

@@ -503,23 +503,24 @@ fn commit_journals_the_paired_checkpoint_before_materializing_legacy_files() {
     }
 
     // Stage a rewrite (generation bump + new cursor) and fail the commit in
-    // the between-writes window: blocking the cursor's temp-file path makes
-    // the cursor write fail AFTER generations.json has been durably written,
-    // leaving the old cursor file on disk untouched.
+    // the between-writes window: block the final publication, since temporary
+    // filenames are unique per writer. Keep the old cursor bytes aside and
+    // restore the publication target after the injected filesystem failure.
     {
         let mut store = FsCursorStore::new(&cursor_dir).unwrap();
         store.set_generation(key, 1).unwrap();
         store.set_cursor(key, &new_cursor).unwrap();
-        let blocked = store
-            .cursor_path(key)
-            .with_extension(format!("tmp.{}", std::process::id()));
-        std::fs::create_dir_all(&blocked).unwrap();
+        let blocked = store.cursor_path(key);
+        let retained = blocked.with_extension("retained");
+        std::fs::rename(&blocked, &retained).unwrap();
+        std::fs::create_dir(&blocked).unwrap();
         let err = store.commit().expect_err("cursor write must fail");
         assert!(
             err.to_string().contains("writing"),
             "the failing step must be the cursor write: {err}"
         );
         std::fs::remove_dir(&blocked).unwrap();
+        std::fs::rename(&retained, &blocked).unwrap();
 
         // The legacy cursor file still contains the old value. The durable
         // journal owns the paired checkpoint; opening finishes its recovery.
@@ -749,9 +750,7 @@ fn both_checkpoint_crash_windows_preserve_generation_identity() {
     let proposed = capture(&mut cursors);
     // Failure before the journal is durable: the same source must replay the
     // exact same envelopes, including the proposed generation.
-    let blocked_journal = cursor_dir
-        .join("checkpoint.pending.json")
-        .with_extension(format!("tmp.{}", std::process::id()));
+    let blocked_journal = cursor_dir.join("checkpoint.pending.json");
     std::fs::create_dir(&blocked_journal).unwrap();
     assert!(cursors.commit().is_err());
     std::fs::remove_dir(&blocked_journal).unwrap();
@@ -762,12 +761,13 @@ fn both_checkpoint_crash_windows_preserve_generation_identity() {
     assert_eq!(capture(&mut retry), proposed);
 
     // Failure after journal durability but before the legacy cursor write.
-    let blocked_cursor = retry
-        .cursor_path(&key)
-        .with_extension(format!("tmp.{}", std::process::id()));
+    let blocked_cursor = retry.cursor_path(&key);
+    let retained = blocked_cursor.with_extension("retained");
+    std::fs::rename(&blocked_cursor, &retained).unwrap();
     std::fs::create_dir(&blocked_cursor).unwrap();
     assert!(retry.commit().is_err());
     std::fs::remove_dir(&blocked_cursor).unwrap();
+    std::fs::rename(&retained, &blocked_cursor).unwrap();
     let stored: CursorValue =
         serde_json::from_slice(&std::fs::read(retry.cursor_path(&key)).unwrap()).unwrap();
     assert_eq!(stored, accepted);

@@ -14,14 +14,16 @@
 //! Writes use the existing durable segment and blob stores. Each append takes
 //! the writer lock and reads current admission state before writing, so handles
 //! do not retain stale state after another writer or a failed append. This
-//! initial facade favors a simple full read per append; storage adapters and
-//! incremental query interfaces can build on the same record contract.
+//! facade uses reusable append-log and blob adapters from `editchain-store`.
+//! Admission currently replays the log per append; indexes remain derived.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
-use editchain_store::format::{encoded_op_len, Page, MAX_RECORD_BYTES};
-use editchain_store::{BlobStore, CanonicalChain, SegmentStore};
+use editchain_store::format::{encoded_op_len, MAX_RECORD_BYTES};
+use editchain_store::{
+    BlobSource as _, BlobStorage as _, BlobStore, CanonicalChain, LogStore, SegmentStore,
+};
 
 pub use editchain_core::{
     admission::*, clock::*, git::*, ids::*, op::*, parents::*, payload::*, provider, records,
@@ -30,6 +32,8 @@ pub use editchain_core::{
 pub use editchain_store::format::{decode_op, encode_op};
 pub use editchain_store::{BlobResolution, ChainReadStats};
 
+#[cfg(test)]
+use blake3 as _;
 #[cfg(test)]
 use tempfile as _;
 
@@ -96,21 +100,7 @@ impl Engine {
     /// corrupt existing framing, competing writers, and failed persistence.
     /// A persistence error can leave retained bytes; retry with the same bytes.
     pub fn append_encoded(&self, encoded: &[u8]) -> io::Result<Admission> {
-        validate_length(encoded.len())?;
-        let operation = decode_op(encoded).map_err(invalid_input)?;
-        let mut store = SegmentStore::open(&self.root)?;
-        let chain = CanonicalChain::read(&self.root)?;
-        let admission = chain.evidence().classify(operation.id, encoded);
-        if admission == Admission::Duplicate {
-            // A prior append may have written all bytes but failed at sync.
-            // Re-establish durability before acknowledging a retry.
-            store.sync_all()?;
-        } else {
-            let mut page = Page::new(store.segment_sequence());
-            page.add_record(0, encoded.to_vec());
-            store.append_page(&page)?;
-        }
-        Ok(admission)
+        LogStore::new(SegmentStore::open(&self.root)?).append_encoded(encoded)
     }
 
     /// Persist exact bytes and return their full BLAKE3 content reference.
@@ -122,11 +112,8 @@ impl Engine {
     /// Returns an error for content exceeding the reference's `u32` length,
     /// inconsistent existing content, or failed persistence.
     pub fn store_blob(&self, bytes: &[u8]) -> io::Result<BlobRef> {
-        let len = u32::try_from(bytes.len()).map_err(invalid_input)?;
-        let id = ContentId::Hash256(*blake3::hash(bytes).as_bytes());
         let _writer = SegmentStore::open(&self.root)?;
-        BlobStore::new(self.root.join("blobs"))?.write(bytes)?;
-        Ok(BlobRef { id, len })
+        BlobStore::new(self.root.join("blobs"))?.put(bytes)
     }
 
     /// Resolve a full content ID, distinguishing missing and invalid content.
@@ -138,38 +125,15 @@ impl Engine {
     /// # Errors
     /// Returns filesystem errors reading the blob directory or content.
     pub fn resolve_content(&self, id: ContentId) -> io::Result<BlobResolution> {
-        let ContentId::Hash256(hash) = id else {
-            return Ok(BlobResolution::Unresolvable);
-        };
-        let Some(store) = BlobStore::open_read_only(self.root.join("blobs"))? else {
-            return Ok(BlobResolution::Missing);
-        };
-        let Some(bytes) = store.get(&hash)? else {
-            return Ok(BlobResolution::Missing);
-        };
-        if blake3::hash(&bytes).as_bytes() == &hash {
-            Ok(BlobResolution::Found(bytes))
-        } else {
-            Ok(BlobResolution::Corrupt)
-        }
+        editchain_store::BlobReader::open(&self.root)?.read_content(id)
     }
 
     /// Resolve a blob, verifying both its full content address and length.
     ///
     /// # Errors
-    /// Returns the filesystem errors from [`Self::resolve_content`].
+    /// Returns filesystem errors from the blob adapter.
     pub fn resolve_blob(&self, reference: &BlobRef) -> io::Result<BlobResolution> {
-        match self.resolve_content(reference.id)? {
-            BlobResolution::Found(bytes)
-                if u32::try_from(bytes.len()).ok() != Some(reference.len) =>
-            {
-                Ok(BlobResolution::Corrupt)
-            }
-            resolution @ (BlobResolution::Found(_)
-            | BlobResolution::Missing
-            | BlobResolution::Corrupt
-            | BlobResolution::Unresolvable) => Ok(resolution),
-        }
+        editchain_store::BlobReader::open(&self.root)?.read_blob(reference)
     }
 
     /// Resolve payload bytes without decoding text or changing the record.
