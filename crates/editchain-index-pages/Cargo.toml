@@ -1,5 +1,5 @@
 [package]
-name = "editchain-index"
+name = "editchain-index-pages"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,11 +13,9 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-editchain-core = { path = "../editchain-core" }
-editchain-store = { path = "../editchain-store" }
-editchain-index-pages = { path = "../editchain-index-pages" }
 serde = { workspace = true, features = ["rc"] }
+ciborium = "0.2.2"
+blake3 = "1"
 
 [dev-dependencies]
-blake3 = "1"
 tempfile = "3"

@@ -76,7 +76,7 @@ impl Receipts {
             return Ok(false);
         }
         let mut found = false;
-        for location in chain.evidence_locations(id) {
+        for location in chain.record_locations(id) {
             found = true;
             let digest = *blake3::hash(&read_encoded_at(root, location)?).as_bytes();
             // A locally retained variant, including a baseline a peer later
