@@ -684,7 +684,10 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "editchain-core",
+ "editchain-index",
  "editchain-store",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
