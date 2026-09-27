@@ -33,7 +33,7 @@ pub struct DownloadProgress {
 /// Current check work and durable, connection-local transfer counts.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Progress {
-    /// Space/version negotiation has succeeded over an authenticated channel.
+    /// Namespace/version negotiation has succeeded over an authenticated channel.
     pub accepted: bool,
     /// An incoming reconciliation round is in progress.
     pub synchronizing: bool,

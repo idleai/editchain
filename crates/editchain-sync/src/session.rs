@@ -5,21 +5,22 @@ use std::io;
 
 use crate::transfer::{Download, Object, Source};
 use crate::{
-    invalid, CheckProgress, Message, Progress, RecordKey, Replica, Snapshot, INVENTORY_PAGE,
-    MAX_OBJECT_BYTES, PEER_VERSION,
+    invalid, CheckProgress, Message, Progress, RecordKey, Replica, ReplicationStorage, Snapshot,
+    INVENTORY_PAGE, MAX_OBJECT_BYTES, PEER_VERSION,
 };
 
 const BATCH_BYTES: usize = 4 * 1024 * 1024;
 
 /// Replication state for one already authenticated, authorized peer.
-/// A failed call invalidates the session; reconnect reconstructs from disk.
+/// A failed call invalidates the session; reconnect uses durable storage.
 #[derive(Debug)]
-pub struct Session {
-    replica: Replica,
+pub struct Session<R = Replica> {
+    replica: R,
     source: Source,
     local: Snapshot,
     pull: Pull,
     progress: Progress,
+    failed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -37,16 +38,17 @@ struct Pull {
     download: Option<Download>,
 }
 
-impl Session {
+impl<R: ReplicationStorage> Session<R> {
     /// Construct without reading or exposing inventory before negotiation.
     #[must_use]
-    pub fn new(replica: Replica) -> Self {
+    pub fn new(replica: R) -> Self {
         Self {
             replica,
             source: Source::default(),
             local: Snapshot::default(),
             pull: Pull::default(),
             progress: Progress::default(),
+            failed: false,
         }
     }
 
@@ -56,7 +58,7 @@ impl Session {
         Message::Hello {
             version: PEER_VERSION,
             encoding: 1,
-            space: self.replica.space().to_owned(),
+            space: self.replica.namespace().to_owned(),
         }
     }
 
@@ -66,12 +68,25 @@ impl Session {
         &self.progress
     }
 
+    /// Recover caller-owned storage to reconnect after a transport failure.
+    #[must_use]
+    pub fn into_storage(self) -> R {
+        self.replica
+    }
+
     /// Start another inventory round to repair interrupted or newly appended work.
     /// No-op while an existing round is in flight.
     ///
     /// # Errors
     /// Returns local storage contention or failure; callers reconnect and retry.
     pub fn tick(&mut self) -> io::Result<Vec<Message>> {
+        self.ensure_open()?;
+        let result = self.start_round();
+        self.failed = result.is_err();
+        result
+    }
+
+    fn start_round(&mut self) -> io::Result<Vec<Message>> {
         self.replica.ensure_scope()?;
         if !self.progress.accepted || self.progress.synchronizing {
             return Ok(Vec::new());
@@ -97,6 +112,20 @@ impl Session {
     /// Rejects mismatched negotiation, unsolicited or oversized messages, invalid
     /// object bytes, and any failed durable write. No failed write is acknowledged.
     pub fn receive(&mut self, message: Message) -> io::Result<Vec<Message>> {
+        self.ensure_open()?;
+        let result = self.process(message);
+        self.failed = result.is_err();
+        result
+    }
+
+    fn ensure_open(&self) -> io::Result<()> {
+        if self.failed {
+            return Err(invalid("failed replication session; reconnect"));
+        }
+        Ok(())
+    }
+
+    fn process(&mut self, message: Message) -> io::Result<Vec<Message>> {
         self.replica.ensure_scope()?;
         if !self.progress.accepted {
             if matches!(&message, Message::Hello { version, encoding, .. } if *version != PEER_VERSION || *encoding != 1)
@@ -270,11 +299,16 @@ impl Session {
         if self.pull.staged.is_empty() {
             return Ok(());
         }
-        let acks = self
-            .replica
-            .ingest_into(&self.pull.staged, Some(&mut self.local))?;
-        for record in acks {
-            replies.push(Object { record, blob: None }.ack());
+        self.replica
+            .ingest_records(&self.pull.staged, &mut self.local)?;
+        for (record, _) in &self.pull.staged {
+            replies.push(
+                Object {
+                    record: *record,
+                    blob: None,
+                }
+                .ack(),
+            );
             self.progress.records = self.progress.records.saturating_add(1);
         }
         self.pull.staged.clear();
@@ -322,7 +356,7 @@ impl Session {
                     blob: Some(hash),
                 };
                 if self.pull.tried.insert(object)
-                    && self.replica.read_blob(&self.local, *key, hash)?.is_none()
+                    && !self.replica.confirm_blob(&self.local, *key, hash)?
                 {
                     self.pull.blobs.push_back(object);
                 }
