@@ -31,7 +31,7 @@ export function createLiveSync(service: string, synchronize: (provider?: LivePro
     chain: path.resolve(workspace, config.get<string>('chainDir', '.editchain')),
     sessions: path.resolve(workspace, config.get<string>('live.sessionsPath', '') ||
       path.join(process.env.CODEX_HOME || path.join(homedir(), '.codex'), 'sessions')),
-    cli: config.get<string>('live.cliPath', '') || path.join(path.dirname(service), process.platform === 'win32' ? 'editchain.exe' : 'editchain'),
+    cli: config.get<string>('live.cliPath', '') || path.join(path.dirname(service), process.platform === 'win32' ? 'editchain-legacy.exe' : 'editchain-legacy'),
     helper: config.get<string>('live.codexHelperPath', '') || (existsSync(helper) ? helper : helperName),
   };
   for (const [name, value] of Object.entries(paths)) log(`${name}: ${value}`);

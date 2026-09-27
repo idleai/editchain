@@ -19,7 +19,7 @@ fn inspect(chain: &std::path::Path, revision: OpId) -> std::io::Result<()> {
         field: ContentField::FileAfter,
     })?;
     let _diff = queries.diff(revision)?;
-    let _context = queries.operation_context(revision)?;
+    let _meta = queries.operation_meta(revision)?;
     let _ancestors = queries.ancestors(revision, 100)?;
     Ok(())
 }
@@ -36,10 +36,12 @@ fn inspect(chain: &std::path::Path, revision: OpId) -> std::io::Result<()> {
 | `content(ContentQuery)` | Exact bytes of a selected record field. |
 | `diff(revision)` | A file revision's before/after content, recorded edit, and byte comparison. |
 | `compare(before, after)` | A byte comparison between two selected fields. |
-| `operation_context(id)` | The operation, actor/session records, direct parents, and relationships. |
+| `operation_meta(id)` | The operation and its metadata: actor/session records, direct parents, and relationships. |
 | `ancestors(id, limit)` | A bounded parent walk, including missing/conflicted records and an unvisited frontier. |
 | `relationships(entity, page)` | Recorded causal, annotation, session, and Git relationships. |
 | `git(GitQuery, page)` | Commit observations and links for a repository and optional full OID. |
+
+The CLI exposes `operation_meta(id)` as `editchain meta ID`.
 
 The optional `IndexKey` filters history and search by recorded actor, scope, path,
 parent, or content address. Full types and limits are in the
@@ -75,7 +77,7 @@ of these recorded facts.
 `PageRequest` uses an exclusive `after: OpId` and scans 1–1000 candidate operations
 (default 100) in operation-ID order. Follow `next_after` until it is `None`, even
 when a filtered page is empty. This bounds operations, not content size.
-`operation_context` may scan the whole chain; use paged relationships for bounded reads.
+`operation_meta` may scan the whole chain; use paged relationships for bounded reads.
 
 Call `refresh()` to observe new records, conflicts, and late blobs. Use its change
 IDs to update results: new imports can have IDs older than your page cursor.

@@ -28,6 +28,22 @@ The [history import API](./docs/import-api.md) exposes Claude, Codex and human
 archive capture with resumable cursors, exact raw evidence and native identity
 mappings. Inspect a capture batch, then accept it through durable storage adapters.
 
+## CLI
+
+The `editchain` package in `crates/editchain` builds the `editchain` binary directly
+on the shared engine libraries. It has no dependency on the legacy node, viewer,
+or host protocol crates.
+
+```sh
+cargo install --locked --path crates/editchain
+editchain --chain /path/to/chain init
+editchain --chain /path/to/chain import --provider claude --input /path/to/sessions
+editchain --chain /path/to/chain history --output jsonl
+```
+
+The [CLI guide](docs/cli.md) covers append/import/export, queries, annotations,
+reflections, subscriptions, integrity/rebuild, replication, and shell contracts.
+
 ## VS Code extension
 
 Follow the [build and installation guide](./extensions/vscode-editchain/README.md).
@@ -37,12 +53,15 @@ project, and run **EditChain: Open History Explorer** from the command palette.
 Git history works immediately. Import sessions to add agent activity; the
 extension reads it from the project's `.editchain` directory by default.
 
-## Import sessions
+## Import sessions for the existing viewer
 
+The existing viewer's importer adds host-specific Git reconciliation, human
+editor materialization, and viewer checkpoints. It remains in `editchain-node`
+as `editchain-legacy` until those features move to their destination repositories.
 From the EditChain checkout:
 
 ```sh
-cargo run --release -p editchain-node -- import \
+cargo run --release -p editchain-node --bin editchain-legacy -- import \
   --provider claude \
   --sessions-dir /path/to/claude/project-sessions \
   --workspace /path/to/project \
@@ -82,20 +101,20 @@ the chain directory and replace only the chain.
 
 ```sh
 # 1. Import each provider into a new chain.
-cargo run --release -p editchain-node -- import \
+cargo run --release -p editchain-node --bin editchain-legacy -- import \
   --provider claude \
   --sessions-dir /path/to/claude/project-sessions \
   --workspace /path/to/project \
   --chain /path/to/project/.editchain-new
 
-cargo run --release -p editchain-node -- import \
+cargo run --release -p editchain-node --bin editchain-legacy -- import \
   --provider codex \
   --sessions-dir ~/.codex/sessions \
   --codex-helper /path/to/codex-session-exporter \
   --workspace /path/to/project \
   --chain /path/to/project/.editchain-new
 
-cargo run --release -p editchain-node -- import \
+cargo run --release -p editchain-node --bin editchain-legacy -- import \
   --provider human \
   --sessions-dir /path/to/human-history \
   --workspace /path/to/project \
@@ -111,8 +130,10 @@ the old chain can be removed once the new one is verified.
 ## Development
 
 `editchain-engine` exposes the native library facade; `editchain-core` owns the
-shared immutable schema. `editchain-node` builds the CLI and native service.
-The extension hosts the Rust/WASM view from `editchain-history-renderer`.
+shared immutable schema. `crates/editchain` owns the standalone engine CLI.
+`editchain-node` retains the existing native service and legacy viewer commands;
+it is separate from the CLI's dependency graph. The extension hosts the Rust/WASM
+view from `editchain-history-renderer`.
 
 Run `./scripts/lint.sh` for Rust checks; it requires `cargo-deny`.
 

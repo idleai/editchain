@@ -19,7 +19,7 @@
 //!
 //! [`Engine::queries`] opens the indexed, viewer-independent [`queries`] API.
 //! It returns recorded history, literal search, exact content, byte diffs, and
-//! operation context with portable record references. Refresh the query index to
+//! operation metadata with portable record references. Refresh the query index to
 //! observe new records, conflicts, and late content.
 
 pub mod queries;

@@ -119,10 +119,10 @@ fn paging_refresh_and_conflicts_preserve_encoded_records() {
     );
     assert!(
         matches!(
-            queries.operation_context(id(10)).unwrap(),
+            queries.operation_meta(id(10)).unwrap(),
             Lookup::Conflicted(_)
         ),
-        "operation context cannot silently choose a conflicted record"
+        "operation metadata cannot silently choose a conflicted record"
     );
     assert_eq!(
         queries

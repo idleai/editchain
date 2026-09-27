@@ -10,7 +10,7 @@
         "-p",
         "editchain-node",
         "--bin",
-        "editchain"
+        "editchain-legacy"
       ],
       "options": {
         "cwd": "${workspaceFolder}"

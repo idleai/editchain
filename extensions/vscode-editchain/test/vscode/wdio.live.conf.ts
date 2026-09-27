@@ -41,7 +41,7 @@ export const config: Options.Testrunner = {
       userSettings: {
         'security.workspace.trust.enabled': false,
         'editchain-history.servicePath': path.join(repository, 'target/release/editchain-vscode-service'),
-        'editchain-history.live.cliPath': path.join(repository, 'target/release/editchain'),
+        'editchain-history.live.cliPath': path.join(repository, 'target/release/editchain-legacy'),
         'editchain-history.live.sessionsPath': sessions,
         'editchain-history.live.codexHelperPath': path.join(repository, 'tools/codex-session-exporter/target/release/codex-session-exporter'),
       },

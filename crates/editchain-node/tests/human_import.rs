@@ -130,7 +130,7 @@ fn run_cli(
     if dry_run {
         args.push("--dry-run".into());
     }
-    Command::new(env!("CARGO_BIN_EXE_editchain"))
+    Command::new(env!("CARGO_BIN_EXE_editchain-legacy"))
         .args(args)
         .output()
 }

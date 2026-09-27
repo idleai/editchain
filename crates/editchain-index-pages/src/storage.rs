@@ -59,7 +59,7 @@ impl Storage {
             .truncate(false)
             .write(true)
             .open(root.join("lock"))?;
-        lock.try_lock().map_err(io::Error::other)?;
+        lock.try_lock().map_err(io::Error::from)?;
         let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -102,16 +102,23 @@ impl Storage {
                 .checked_add(address.length)
                 .is_none_or(|end| end > *self.end.borrow())
         {
-            return Err(io::Error::other("invalid index page extent"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid index page extent",
+            ));
         }
         let mut bytes = vec![0; usize::try_from(address.length).map_err(io::Error::other)?];
         let _offset = reader.seek(SeekFrom::Start(address.offset))?;
         reader.read_exact(&mut bytes)?;
         drop(reader);
         if blake3::hash(&bytes).as_bytes() != &address.digest {
-            return Err(io::Error::other("index page checksum mismatch"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "index page checksum mismatch",
+            ));
         }
-        ciborium::from_reader(bytes.as_slice()).map_err(io::Error::other)
+        ciborium::from_reader(bytes.as_slice())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     /// Load the small root; referenced pages remain cold.
@@ -119,7 +126,8 @@ impl Storage {
     /// Returns a missing, corrupt or incompatible root error.
     pub fn load<T: DeserializeOwned>(self: &Rc<Self>) -> io::Result<T> {
         let bytes = std::fs::read(self.root.join("root"))?;
-        let address: Address = ciborium::from_reader(bytes.as_slice()).map_err(io::Error::other)?;
+        let address: Address = ciborium::from_reader(bytes.as_slice())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         with_storage(self, || self.read(address))
     }
 

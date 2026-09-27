@@ -98,7 +98,7 @@ impl LiveWorkspace {
                 // Older graph/disclosure migrations still require preparation.
                 .is_some_and(|saved| saved.version < 4)
         {
-            return Err("history graph checkpoint needs preparation; run editchain prepare-view --workspace <workspace> --chain <chain>".into());
+            return Err("history graph checkpoint needs preparation; run editchain-legacy prepare-view --workspace <workspace> --chain <chain>".into());
         }
 
         let tail = if saved.is_some() {

@@ -1,4 +1,7 @@
-//! Native `EditChain` application: ingestion, history queries, and framed stdio.
+//! Legacy native application: viewer ingestion, history queries, and framed stdio.
+//!
+//! The standalone engine CLI lives in `crates/editchain`. This host backend
+//! remains for its existing consumers until the roadmap's app/extension extraction.
 //!
 //! The two executables share the [`commands`] and [`history`] facades. [`Server`]
 //! adapts protocol requests to that history backend. Persistence belongs to

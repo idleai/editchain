@@ -1,0 +1,28 @@
+[package]
+name = "editchain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Command-line interface to the shared EditChain engine APIs"
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+editchain-engine = { path = "../editchain-engine" }
+editchain-git = { path = "../editchain-git" }
+editchain-import = { path = "../editchain-import" }
+editchain-index = { path = "../editchain-index" }
+editchain-store = { path = "../editchain-store" }
+editchain-sync = { path = "../editchain-sync" }
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+ctrlc = { version = "3.5", features = ["termination"] }
+serde.workspace = true
+serde_json.workspace = true
+tempfile = "3"
