@@ -8,13 +8,13 @@ use crate::{invalid, RecordKey, MAX_FRAME_BYTES};
 /// Peer protocol messages carried only inside an authenticated channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Message {
-    /// Negotiate the space, peer protocol and operation encoding.
+    /// Negotiate the chain/sharing namespace, peer protocol and operation encoding.
     Hello {
         /// Peer protocol version; see [`crate::PEER_VERSION`].
         version: u16,
         /// Exact operation-encoding version, currently one.
         encoding: u16,
-        /// Locally approved collaboration space.
+        /// Caller-selected namespace; the legacy wire field is named `space`.
         space: String,
     },
     /// Begin a stable inventory or continue after an exclusive cursor.

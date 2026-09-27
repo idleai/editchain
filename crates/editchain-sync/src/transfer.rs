@@ -4,8 +4,8 @@ use std::collections::BTreeSet;
 use std::io;
 
 use crate::{
-    invalid, CheckProgress, DownloadProgress, Message, RecordKey, Replica, Snapshot, CHUNK_BYTES,
-    INVENTORY_PAGE, MAX_OBJECT_BYTES,
+    invalid, CheckProgress, DownloadProgress, Message, RecordKey, ReplicationStorage, Snapshot,
+    CHUNK_BYTES, INVENTORY_PAGE, MAX_OBJECT_BYTES,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -103,7 +103,7 @@ pub(crate) struct Source {
 impl Source {
     pub(crate) fn inventory(
         &mut self,
-        replica: &Replica,
+        replica: &impl ReplicationStorage,
         after: Option<RecordKey>,
     ) -> io::Result<Message> {
         if self.active.is_some() || !self.unacked.is_empty() || self.awaiting_check {
@@ -147,7 +147,7 @@ impl Source {
 
     pub(crate) fn need(
         &mut self,
-        replica: &Replica,
+        replica: &impl ReplicationStorage,
         object: Object,
         offset: u32,
     ) -> io::Result<Message> {

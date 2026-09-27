@@ -1,9 +1,14 @@
 //! Bounded, transport-independent replication of exact `EditChain` evidence.
 //!
-//! A replica is bound to one explicitly approved collaboration space. Network
-//! authentication must finish before its replication protocol is exposed.
+//! Callers select peers, transport, storage and sharing policy. [`StoreReplica`]
+//! uses the portable storage adapters; [`Replica`] retains the existing local
+//! multiplayer binding. Authenticate and authorize peers before exposing either.
 
+#![doc = include_str!("../README.md")]
+
+mod adapter;
 mod content;
+mod endpoint;
 mod evidence;
 mod identity;
 mod inventory;
@@ -14,9 +19,12 @@ mod replica;
 mod scope;
 mod secure;
 mod session;
+mod storage;
 mod transfer;
 mod wire;
 
+pub use adapter::{ExportPolicy, ExportScope, StoreReplica};
+pub use endpoint::{PeerConnection, Transport};
 pub use identity::{DeviceIdentity, PublicDevice};
 pub use ipc::{run_worker, MAX_CONTROL_BYTES};
 pub use membership::{Membership, MAX_DEVICES};
@@ -25,6 +33,7 @@ pub use replica::{RecordKey, Replica, Snapshot};
 pub use scope::SharingScope;
 pub use secure::{SecurePeer, MAX_BRIDGE_BYTES, MAX_BRIDGE_OUTPUT};
 pub use session::Session;
+pub use storage::ReplicationStorage;
 pub use wire::{decode_message, encode_message, FrameDecoder, Message};
 
 /// Largest operation or blob accepted by the first replication protocol.

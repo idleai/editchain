@@ -22,6 +22,7 @@ macro_rules! check_eq {
     };
 }
 
+mod adapter_tests;
 mod inventory_tests;
 mod provenance_tests;
 mod record_tests;

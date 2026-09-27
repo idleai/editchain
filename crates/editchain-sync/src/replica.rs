@@ -67,6 +67,20 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Add exact, already durable bytes when implementing a storage adapter.
+    /// Conflicting representations have different keys and are both retained.
+    ///
+    /// # Errors
+    /// Rejects unsupported records or a digest collision with retained bytes.
+    pub fn insert_encoded(&mut self, encoded: Vec<u8>) -> io::Result<RecordKey> {
+        let key = RecordKey::from_encoded(&encoded)?;
+        if self.record(key).is_some_and(|previous| previous != encoded) {
+            return Err(invalid("record digest collision"));
+        }
+        drop(self.records.insert(key, Arc::from(encoded)));
+        Ok(key)
+    }
+
     pub(crate) fn ordered_keys(&self) -> io::Result<Vec<RecordKey>> {
         crate::inventory::parent_first(&self.records)
     }
@@ -236,7 +250,10 @@ impl Replica {
     fn snapshot_for(&self, receiving: bool) -> io::Result<Snapshot> {
         self.ensure_scope()?;
         self.evidence.warm(&self.root)?;
-        let _writer = crate::writer(&self.root)?;
+        let writer = crate::writer(&self.root)?;
+        // A complete prefix can be readable after an earlier failed fsync.
+        // Inventory membership must never turn that into implicit success.
+        writer.sync_all()?;
         let scope = self.load_scope()?;
         let evidence = self.evidence.read(&self.root)?;
         let records = evidence
@@ -322,17 +339,7 @@ impl Replica {
         records: &[(RecordKey, Vec<u8>)],
         snapshot: Option<&mut Snapshot>,
     ) -> io::Result<Vec<RecordKey>> {
-        let total = records
-            .iter()
-            .fold(0usize, |size, (_, bytes)| size.saturating_add(bytes.len()));
-        if records.len() > INVENTORY_PAGE || total > MAX_OBJECT_BYTES {
-            return Err(invalid("record batch exceeds limit"));
-        }
-        for (key, bytes) in records {
-            if RecordKey::from_encoded(bytes)? != *key {
-                return Err(invalid("record identity or digest mismatch"));
-            }
-        }
+        crate::storage::validate_records(records)?;
         self.evidence.warm(&self.root)?;
         let mut writer = crate::writer(&self.root)?;
         let known = self.evidence.read(&self.root)?;
