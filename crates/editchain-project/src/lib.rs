@@ -5,6 +5,17 @@
 //! intentionally free of filesystem and process dependencies so it can later
 //! target WASM.
 
+#[cfg(test)]
+use blake3 as _;
+#[cfg(test)]
+use editchain_import as _;
+#[cfg(test)]
+use editchain_store as _;
+#[cfg(test)]
+use tempfile as _;
+#[cfg(test)]
+use tokio as _;
+
 use serde as _;
 
 pub mod activity;
@@ -27,9 +38,9 @@ mod view;
 mod graph;
 mod materialization;
 mod provider;
+pub use editchain_engine::imports::CodexLogicalItem;
 pub use git::GitProjection;
 pub use graph::{NodeKey, ResolvedGraph, ResolvedRelation};
-pub use materialization::CodexLogicalItem;
 
 mod ancestry;
 mod collapse;

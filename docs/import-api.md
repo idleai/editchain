@@ -62,6 +62,18 @@ stay unmapped. Copied history collapses only when the recorded evidence agrees;
 conflicts and distinct revisions remain. Codex consumers must replay turn
 removals as well as item updates.
 
+Use `editchain_engine::imports::ImportState::from_ops(&accepted_ops)` or
+`ChainQueries::import_state()` for shared derivation selection and logical replay.
+The result includes current Codex items, exact copy equivalences and incomplete
+source coverage. Copies coalesce only when complete source prefixes and their
+derived operations agree after occurrence-ID rebinding. Divergent interpretations
+remain separate. `from_partial_ops` accepts IDs of shortened records, which cannot
+prove copy equivalence. Canonical operations and historical revisions stay intact.
+
+`editchain import-state --output json` exposes the same result. Payload availability
+is resolved through content queries using the returned operation IDs. Viewer row
+hiding, message folding and display continuity remain in the presentation consumer.
+
 Human capture accepts a version-one archive file or JSONL directory.
 `recorded_root` optionally filters the exact recorded `workspace_path`, with
 separate cursors per filter. Unrecognized records are retained and counted as
@@ -82,3 +94,7 @@ bytes and identities. Run the retry, overlap and conflict checks with:
 ```sh
 cargo test -p editchain-import --test import_api --locked
 ```
+
+Import-to-view regression tests live in `editchain-project` and run with
+`cargo test -p editchain-project --test imports --locked`. The importer has no
+viewer dependency, including in its test graph.

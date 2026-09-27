@@ -4,9 +4,10 @@
 //! history remains immutable; the offline Activity view also retains its
 //! historical work-group contractions. These are distinct presentation modes.
 
-use crate::{materialization::selected_codex, provider::decode_evidence, CodexLogicalItem};
+use crate::{provider::decode_evidence, CodexLogicalItem};
 use editchain_core::provider::{CodexDerivationEvidence, CodexLogicalChange, ProviderFact};
 use editchain_core::{Op, OpId, OpKind};
+use editchain_engine::imports::selected_codex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 

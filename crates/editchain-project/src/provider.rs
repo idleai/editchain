@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use editchain_core::provider::{
     CodexLifecycleEvent, CodexLifecycleEvidence, CodexSourceEvidence, CodexSpawnSignal,
-    CodexThreadId, ProviderEvidence, ProviderFact,
+    CodexThreadId, ProviderFact,
 };
-use editchain_core::{NoteRelationship, Op, OpId, OpKind, ParentSet, Payload, ScopeRef, Tags};
+use editchain_core::{NoteRelationship, Op, OpId, OpKind, ParentSet, Payload, ScopeRef};
 
 type SourceKey = (u64, u32);
 
@@ -45,11 +45,7 @@ impl ProviderRelations {
     }
 }
 
-#[derive(Debug)]
-pub(super) struct EvidenceRecord<'a> {
-    pub(super) op: &'a Op,
-    pub(super) payload: ProviderEvidence,
-}
+pub(super) use editchain_engine::imports::{decode_evidence, EvidenceRecord};
 
 #[derive(Debug)]
 struct Source<'a> {
@@ -163,23 +159,6 @@ pub(crate) fn resolve_records(
         .sort_by_key(|note| (note.parents.iter().next().copied(), note.id));
     resolved.notes.dedup();
     resolved
-}
-
-pub(super) fn decode_evidence(op: &Op) -> Option<EvidenceRecord<'_>> {
-    let OpKind::Note(note) = &op.kind else {
-        return None;
-    };
-    if note.relationship != NoteRelationship::ProviderEvidence
-        || !note.target_ids.is_empty()
-        || !op.tags.matches_all(Tags::META | Tags::IMPORT)
-    {
-        return None;
-    }
-    let Payload::Inline(content) = &note.content else {
-        return None;
-    };
-    let payload: ProviderEvidence = serde_json::from_slice(content).ok()?;
-    (op.parents == ParentSet::One(payload.source)).then_some(EvidenceRecord { op, payload })
 }
 
 fn source_key(id: OpId) -> SourceKey {

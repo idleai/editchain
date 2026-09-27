@@ -9,22 +9,16 @@
     reason = "test helpers index/pass-by-value/panic/unwrap on known-length fixture vectors"
 )]
 
-mod common;
+use super::common;
 
 use blake3 as _;
 use editchain_core as _;
-use editchain_project as _;
 use editchain_store as _;
-use process_wrap as _;
-use proptest as _;
 use serde as _;
 use serde_json as _;
-use sha2 as _;
 use std::io::Write;
 use std::path::Path;
 use tempfile as _;
-use time as _;
-use tokio as _;
 
 use editchain_core::clock::Clock;
 use editchain_core::op::{CommandStage, NoteRelationship, OpKind, ToolStage};

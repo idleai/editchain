@@ -8,7 +8,6 @@
 use editchain_store as _;
 use std::io::Write as _;
 use std::path::Path;
-use time as _;
 
 use blake3 as _;
 use editchain_core::{NoteRelationship, Op, OpId, OpKind, ParentSet, Payload, Tags};
@@ -25,11 +24,7 @@ use editchain_import::sink::{
 };
 use editchain_project::HistoryProjection;
 use editchain_store::format::encode_op;
-use process_wrap as _;
-use proptest as _;
 use serde as _;
-use sha2 as _;
-use tokio as _;
 
 fn request(root: &Path) -> DiscoveryRequest {
     DiscoveryRequest {

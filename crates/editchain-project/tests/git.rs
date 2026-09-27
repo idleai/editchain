@@ -1,8 +1,14 @@
 //! Git projection identity, observation order, and stored-link contracts.
 
+use blake3 as _;
+use editchain_engine as _;
+use editchain_import as _;
 use editchain_index as _;
+use editchain_store as _;
 use serde as _;
 use serde_json as _;
+use tempfile as _;
+use tokio as _;
 
 use editchain_core::{
     ActorId, Clock, GitAvailability, GitCommitEntity, GitLink, GitLinkKind, GitOid, GitSignature,

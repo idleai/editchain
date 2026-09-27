@@ -1,75 +1,17 @@
-//! Select complete occurrence materializations and replay their logical changes.
+//! Present shared import reconciliation as row visibility and continuity.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
-use editchain_core::provider::{
-    ClaudeDerivationEvidence, CodexDerivationContract, CodexDerivationEvidence, CodexLogicalChange,
-    CodexThreadId, ProviderFact,
-};
-use editchain_core::{Op, OpId, OpKind, ParentSet};
+use editchain_core::provider::ProviderFact;
+use editchain_core::{Op, OpId, OpKind};
+use editchain_engine::imports::ImportState;
 
-use crate::provider::{decode_evidence, EvidenceRecord};
+use crate::CodexLogicalItem;
 
-mod copies;
 mod message_echoes;
 pub(super) use message_echoes::source_messages;
 
-/// Current state of a Codex logical item, rebuilt from immutable occurrences.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct CodexLogicalItem {
-    /// Full owning provider execution identity.
-    pub thread: CodexThreadId,
-    /// Full provider turn identity within this execution.
-    pub turn: String,
-    /// Full provider item identity within this turn.
-    pub item: String,
-    /// First occurrence since the most recent turn removal.
-    pub incarnation: OpId,
-    /// Physical occurrence that last revised this item.
-    pub source: OpId,
-    /// Complete materialized operations for this revision.
-    pub outputs: Vec<OpId>,
-}
-
 type SourceKey = (u64, u32);
-type LogicalTurns = BTreeMap<String, BTreeMap<String, CodexLogicalItem>>;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Derivation<'a> {
-    Codex(&'a CodexDerivationEvidence),
-    Claude(&'a ClaudeDerivationEvidence),
-}
-
-impl<'a> Derivation<'a> {
-    fn from_fact(fact: &'a ProviderFact) -> Option<Self> {
-        match fact {
-            ProviderFact::CodexDerivation(meta) => Some(Self::Codex(meta)),
-            ProviderFact::ClaudeDerivation(meta) => Some(Self::Claude(meta)),
-            ProviderFact::CodexSource(_) | ProviderFact::CodexLifecycle(_) => None,
-        }
-    }
-
-    fn outputs(self) -> &'a [OpId] {
-        match self {
-            Self::Codex(meta) => &meta.outputs,
-            Self::Claude(meta) => &meta.outputs,
-        }
-    }
-
-    fn includes_thinking(self) -> bool {
-        match self {
-            Self::Codex(meta) => meta.includes_thinking,
-            Self::Claude(meta) => meta.includes_thinking,
-        }
-    }
-
-    fn revision(self) -> u8 {
-        match self {
-            Self::Codex(meta) if meta.contract == CodexDerivationContract::OccurrencesV2 => 2,
-            Self::Codex(_) | Self::Claude(_) => 1,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct Materialization {
@@ -87,45 +29,34 @@ impl Materialization {
         messages: &HashMap<OpId, Op>,
         incomplete: &HashSet<OpId>,
     ) -> Self {
+        let state = ImportState::from_partial_ops(ops, incomplete);
         let by_id: HashMap<OpId, &Op> = ops.iter().map(|op| (op.id, op)).collect();
-        let records: Vec<_> = ops.iter().filter_map(decode_evidence).collect();
-        let mut by_source: BTreeMap<OpId, Vec<&EvidenceRecord<'_>>> = BTreeMap::new();
-        for record in &records {
-            if Derivation::from_fact(&record.payload.fact).is_some() && valid_source(record, &by_id)
-            {
-                by_source
-                    .entry(record.payload.source)
-                    .or_default()
-                    .push(record);
-            }
-        }
+        let blocked = state
+            .incomplete_sources
+            .iter()
+            .map(|source| source_key(*source))
+            .collect();
+        let covered: HashSet<OpId> = state.derivations.iter().map(|entry| entry.source).collect();
         let mut result = Self::default();
-        let mut logical: BTreeMap<SourceKey, LogicalTurns> = BTreeMap::new();
-        let mut blocked = HashSet::new();
         let mut echoes = message_echoes::MessageEchoes::default();
-        let mut selected_codex = BTreeMap::new();
-        for (source, records) in &by_source {
-            result.track_outputs(*source, records, &by_id);
-            let selected = select(records).filter(|meta| complete_outputs(*meta, *source, &by_id));
-            if let Some(meta) = selected {
-                for (index, output) in meta.outputs().iter().enumerate() {
-                    let _: bool = result.hidden.remove(output);
-                    let _: Option<usize> = result.output_order.insert(*output, index);
+        for entry in state.derivations {
+            for output in entry.outputs {
+                let _hidden = result.hidden.insert(output);
+                let _previous = result.representatives.insert(output, entry.source);
+            }
+            let outputs = match &entry.selected {
+                Some(ProviderFact::CodexDerivation(meta)) => {
+                    echoes.observe(entry.source, meta, messages, &by_id);
+                    meta.outputs.as_slice()
                 }
-                if let Derivation::Codex(meta) = meta {
-                    let _previous = selected_codex.insert(*source, meta);
-                    echoes.observe(*source, meta, messages, &by_id);
-                    apply_changes(
-                        logical.entry(source_key(*source)).or_default(),
-                        *source,
-                        meta,
-                    );
-                }
-            } else {
-                let _: bool = blocked.insert(source_key(*source));
+                Some(ProviderFact::ClaudeDerivation(meta)) => meta.outputs.as_slice(),
+                Some(ProviderFact::CodexSource(_) | ProviderFact::CodexLifecycle(_)) | None => &[],
+            };
+            for (index, output) in outputs.iter().enumerate() {
+                let _hidden = result.hidden.remove(output);
+                let _previous = result.output_order.insert(*output, index);
             }
         }
-        blocked.extend(incomplete_sources(&by_source, &by_id));
         result.message_echoes = echoes.finish(&blocked);
         // A covered record's legacy numeric lanes remain stored and
         // addressable, but their cursor-dependent fold no longer supplies
@@ -138,18 +69,18 @@ impl Materialization {
                 seq: op.id.seq & !0xffff,
                 ..op.id
             };
-            if by_source.contains_key(&raw) {
+            if covered.contains(&raw) {
                 let _: bool = result.hidden.insert(op.id);
                 let _: Option<OpId> = result.representatives.insert(op.id, raw);
             }
         }
-        result.items = logical
-            .into_iter()
-            .filter(|(source, _)| !blocked.contains(source))
-            .flat_map(|(_, turns)| turns.into_values())
-            .flat_map(BTreeMap::into_values)
-            .collect();
-        copies::coalesce(&selected_codex, &by_id, &blocked, incomplete, &mut result);
+        result.items = state.codex_items;
+        for copy in state.copies {
+            let _hidden = result.hidden.insert(copy.operation);
+            let _previous = result
+                .representatives
+                .insert(copy.operation, copy.representative);
+        }
         for item in &result.items {
             for (index, output) in item.outputs.iter().enumerate() {
                 // File order can change when a patch adds another path. A
@@ -171,240 +102,8 @@ impl Materialization {
         }
         result
     }
-
-    fn track_outputs(
-        &mut self,
-        source: OpId,
-        records: &[&EvidenceRecord<'_>],
-        by_id: &HashMap<OpId, &Op>,
-    ) {
-        for record in records {
-            if let Some(meta) = Derivation::from_fact(&record.payload.fact) {
-                let outputs = meta.outputs().iter().copied().collect();
-                for output in meta.outputs() {
-                    if !reaches_source(*output, source, &outputs, by_id) {
-                        continue;
-                    }
-                    let _: bool = self.hidden.insert(*output);
-                    let _: Option<OpId> = self.representatives.insert(*output, source);
-                }
-            }
-        }
-    }
-}
-
-pub(super) trait OpLookup {
-    fn get(&self, id: &OpId) -> Option<&Op>;
-}
-
-impl OpLookup for HashMap<OpId, &Op> {
-    fn get(&self, id: &OpId) -> Option<&Op> {
-        Self::get(self, id).copied()
-    }
-}
-
-impl OpLookup for editchain_index::Map<OpId, std::sync::Arc<Op>> {
-    fn get(&self, id: &OpId) -> Option<&Op> {
-        Self::get(self, id).map(AsRef::as_ref)
-    }
-}
-
-pub(super) fn selected_codex<'a>(
-    source: OpId,
-    facts: impl Iterator<Item = &'a Op>,
-    by_id: &impl OpLookup,
-) -> Option<CodexDerivationEvidence> {
-    let records: Vec<_> = facts
-        .filter_map(decode_evidence)
-        .filter(|record| record.payload.source == source && valid_source(record, by_id))
-        .collect();
-    let references: Vec<_> = records.iter().collect();
-    match select(&references).filter(|meta| complete_outputs(*meta, source, by_id))? {
-        Derivation::Codex(meta) => Some(meta.clone()),
-        Derivation::Claude(_) => None,
-    }
-}
-
-pub(super) fn complete_derivation<'a>(
-    source: OpId,
-    facts: impl Iterator<Item = &'a Op>,
-    by_id: &impl OpLookup,
-) -> bool {
-    let records: Vec<_> = facts
-        .filter_map(decode_evidence)
-        .filter(|record| record.payload.source == source && valid_source(record, by_id))
-        .collect();
-    let references: Vec<_> = records.iter().collect();
-    select(&references).is_some_and(|meta| complete_outputs(meta, source, by_id))
 }
 
 fn source_key(source: OpId) -> SourceKey {
     (source.node.0, source.boot)
-}
-
-fn incomplete_sources(
-    records: &BTreeMap<OpId, Vec<&EvidenceRecord<'_>>>,
-    by_id: &HashMap<OpId, &Op>,
-) -> HashSet<SourceKey> {
-    let mut coverage: BTreeMap<SourceKey, (u64, u64)> = BTreeMap::new();
-    let mut blocked = HashSet::new();
-    for op in by_id
-        .values()
-        .filter(|op| matches!(op.kind, OpKind::Import(_)))
-    {
-        let key = source_key(op.id);
-        let (count, last) = coverage.entry(key).or_default();
-        *count = count.saturating_add(1);
-        *last = (*last).max(op.id.seq >> 16);
-        if !records.contains_key(&op.id) {
-            let _: bool = blocked.insert(key);
-        }
-    }
-    for (key, (count, last)) in coverage {
-        if count != last {
-            let _: bool = blocked.insert(key);
-        }
-    }
-    blocked
-}
-
-fn valid_source(record: &EvidenceRecord<'_>, by_id: &impl OpLookup) -> bool {
-    record.payload.source.seq > 0
-        && record.payload.source.seq.trailing_zeros() >= 16
-        && by_id.get(&record.payload.source).is_some_and(|raw| {
-        record.op.scope == raw.scope
-            && matches!(&raw.kind, OpKind::Import(import) if import.raw_hash == Some(record.payload.raw_hash))
-    })
-}
-
-fn select<'a>(records: &[&'a EvidenceRecord<'_>]) -> Option<Derivation<'a>> {
-    let candidates: Vec<_> = records
-        .iter()
-        .filter_map(|record| Derivation::from_fact(&record.payload.fact))
-        .collect();
-    let first = candidates.first()?;
-    if candidates
-        .iter()
-        .any(|candidate| std::mem::discriminant(candidate) != std::mem::discriminant(first))
-    {
-        return None;
-    }
-    // Disabling capture cannot erase already captured reasoning.
-    let includes_thinking = candidates.iter().any(|meta| meta.includes_thinking());
-    let revision = candidates
-        .iter()
-        .filter(|meta| meta.includes_thinking() == includes_thinking)
-        .map(|meta| meta.revision())
-        .max()?;
-    let mut eligible = candidates.into_iter().filter(|meta| {
-        meta.revision() == revision && meta.includes_thinking() == includes_thinking
-    });
-    let first = eligible.next()?;
-    eligible.all(|meta| meta == first).then_some(first)
-}
-
-fn complete_outputs(meta: Derivation<'_>, source: OpId, by_id: &impl OpLookup) -> bool {
-    let outputs: HashSet<OpId> = meta.outputs().iter().copied().collect();
-    if outputs.len() != meta.outputs().len() || outputs.contains(&source) {
-        return false;
-    }
-    if !outputs
-        .iter()
-        .all(|output| reaches_source(*output, source, &outputs, by_id))
-    {
-        return false;
-    }
-    match meta {
-        Derivation::Claude(_) => true,
-        Derivation::Codex(meta) => {
-            !meta.thread.0.is_empty() && valid_changes(meta, source, &outputs, by_id)
-        }
-    }
-}
-
-fn valid_changes(
-    meta: &CodexDerivationEvidence,
-    source: OpId,
-    outputs: &HashSet<OpId>,
-    by_id: &impl OpLookup,
-) -> bool {
-    meta.changes.iter().all(|change| match change {
-        CodexLogicalChange::RemoveTurn { turn } => !turn.is_empty(),
-        CodexLogicalChange::Upsert {
-            turn,
-            item,
-            incarnation,
-            outputs: item_outputs,
-        } => {
-            !turn.is_empty()
-                && !item.is_empty()
-                && source_key(*incarnation) == source_key(source)
-                && incarnation.seq > 0
-                && incarnation.seq.trailing_zeros() >= 16
-                && incarnation.seq <= source.seq
-                // The incarnation is a stable identity, not content needed by
-                // this revision. Consent can exclude its original occurrence.
-                // A present contradictory record must still reject the proof.
-                && by_id
-                    .get(incarnation)
-                    .is_none_or(|op| matches!(op.kind, OpKind::Import(_)))
-                && item_outputs.iter().all(|output| outputs.contains(output))
-        }
-    })
-}
-
-fn reaches_source(
-    mut id: OpId,
-    source: OpId,
-    outputs: &HashSet<OpId>,
-    by_id: &impl OpLookup,
-) -> bool {
-    if id.node == source.node || id.boot != source.boot || id.seq >> 16 != source.seq >> 16 {
-        return false;
-    }
-    let mut seen = HashSet::new();
-    while id != source {
-        if !outputs.contains(&id) || !seen.insert(id) {
-            return false;
-        }
-        let Some(op) = by_id.get(&id) else {
-            return false;
-        };
-        if matches!(op.kind, OpKind::Import(_)) || decode_evidence(op).is_some() {
-            return false;
-        }
-        let ParentSet::One(parent) = op.parents else {
-            return false;
-        };
-        id = parent;
-    }
-    true
-}
-
-fn apply_changes(turns: &mut LogicalTurns, source: OpId, meta: &CodexDerivationEvidence) {
-    for change in &meta.changes {
-        match change {
-            CodexLogicalChange::RemoveTurn { turn } => {
-                drop(turns.remove(turn));
-            }
-            CodexLogicalChange::Upsert {
-                turn,
-                item,
-                incarnation,
-                outputs,
-            } => {
-                drop(turns.entry(turn.clone()).or_default().insert(
-                    item.clone(),
-                    CodexLogicalItem {
-                        thread: meta.thread.clone(),
-                        turn: turn.clone(),
-                        item: item.clone(),
-                        incarnation: *incarnation,
-                        source,
-                        outputs: outputs.clone(),
-                    },
-                ));
-            }
-        }
-    }
 }

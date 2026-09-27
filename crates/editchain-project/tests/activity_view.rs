@@ -5,9 +5,15 @@
     reason = "Tests index into known-length parent vectors"
 )]
 // Crate-level dependency markers (used by Cargo for feature resolution).
+use blake3 as _;
+use editchain_engine as _;
+use editchain_import as _;
 use editchain_index as _;
+use editchain_store as _;
 use serde as _;
 use serde_json as _;
+use tempfile as _;
+use tokio as _;
 
 use editchain_core::{
     ActorId, Clock, GitLink, GitLinkKind, GitOid, ImportOp, MessageOp, NodeId, NoteOp,

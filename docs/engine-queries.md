@@ -30,6 +30,7 @@ fn inspect(chain: &std::path::Path, revision: OpId) -> std::io::Result<()> {
 | Method | Returns |
 | --- | --- |
 | `history(key, page)` | Accepted operations, record references, and content availability. |
+| `import_state()` | Selected import derivations, logical Codex items, proven copies and incomplete source coverage. |
 | `operation(id)` | One operation, or an explicit missing/conflicted result. |
 | `record_variants(id)` | All original encoded variants, including conflicts. |
 | `search(text, key, page)` | Case-sensitive literal matches with byte ranges and content gaps. |
@@ -78,6 +79,7 @@ of these recorded facts.
 (default 100) in operation-ID order. Follow `next_after` until it is `None`, even
 when a filtered page is empty. This bounds operations, not content size.
 `operation_meta` may scan the whole chain; use paged relationships for bounded reads.
+`import_state` scans all accepted records to reconcile complete source streams.
 
 Call `refresh()` to observe new records, conflicts, and late blobs. Use its change
 IDs to update results: new imports can have IDs older than your page cursor.

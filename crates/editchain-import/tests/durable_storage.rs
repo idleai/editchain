@@ -15,7 +15,7 @@ use editchain_store as _;
 use std::path::{Path, PathBuf};
 
 use blake3 as _;
-use editchain_project as _;
+use editchain_engine as _;
 use editchain_store::format::encode_op;
 use process_wrap as _;
 use proptest as _;

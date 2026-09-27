@@ -10,9 +10,15 @@
 )]
 
 // Crate-level dependency markers (used by Cargo for feature resolution).
+use blake3 as _;
+use editchain_engine as _;
+use editchain_import as _;
 use editchain_index as _;
+use editchain_store as _;
 use serde as _;
 use serde_json as _;
+use tempfile as _;
+use tokio as _;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;

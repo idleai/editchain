@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use editchain_core::provider::ProviderEvidence;
 use editchain_core::{NoteRelationship, Op, OpKind, Payload};
+use editchain_engine::imports::ImportState;
 use editchain_import::batch::ImportBatch;
 use editchain_import::codex::{CodexDiscoveryRequest, HelperCommand};
 use editchain_import::human::{human_mapping, native_event_id, HumanImportRequest};
@@ -22,7 +23,6 @@ use editchain_import::{
     canonical_source_key, capture_import, hash_raw, BlobSink, CursorStore, DiscoveryRequest,
     FsBlobSink, FsCursorStore, ImportOptions, ImportSource, MemoryCursorStore,
 };
-use editchain_project::HistoryProjection;
 use editchain_store::{AppendLog, CanonicalChain, LogReadStats, LogStore, SegmentStore};
 
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -575,16 +575,19 @@ fn overlapping_human_archives_preserve_conflicts_without_duplicate_history() -> 
 }
 
 #[test]
-fn recorded_claude_copy_does_not_duplicate_projected_history() -> Result {
+fn recorded_claude_copy_preserves_native_identity_and_source_occurrences() -> Result {
     let temp = tempfile::tempdir()?;
     std::fs::write(temp.path().join("session.jsonl"), CLAUDE)?;
     let mut blobs = FsBlobSink::new(temp.path().join("blobs"))?;
     let mut cursors = MemoryCursorStore::new();
     let first =
         Provider::Claude.capture(temp.path(), &ImportOptions::default(), &mut blobs, &cursors)?;
-    let initial = HistoryProjection::from_ops(first.operations().to_vec())
-        .nodes()
-        .len();
+    let initial: std::collections::BTreeSet<_> =
+        native_mappings(Provider::Claude, first.operations(), &blobs)?
+            .into_iter()
+            .map(|mapping| mapping.identity)
+            .collect();
+    let original_count = first.operations().len();
     let chain = temp.path().join("chain");
     let mut writer = LogStore::new(SegmentStore::open(&chain)?);
     let _result = first.persist(&mut writer, &mut cursors)?;
@@ -592,12 +595,20 @@ fn recorded_claude_copy_does_not_duplicate_projected_history() -> Result {
     let copied =
         Provider::Claude.capture(temp.path(), &ImportOptions::default(), &mut blobs, &cursors)?;
     let _result = copied.persist(&mut writer, &mut cursors)?;
+    let retained = accepted(&writer.snapshot()?);
+    let identities: std::collections::BTreeSet<_> =
+        native_mappings(Provider::Claude, &retained, &blobs)?
+            .into_iter()
+            .map(|mapping| mapping.identity)
+            .collect();
     verify_eq!(
-        HistoryProjection::from_ops(accepted(&writer.snapshot()?))
-            .nodes()
-            .len(),
+        identities,
         initial,
-        "copied Claude occurrences share their provider event history"
+        "copied Claude occurrences retain the same native identities"
+    );
+    verify!(
+        retained.len() > original_count,
+        "both physical sources remain evidence"
     );
     Ok(())
 }
@@ -690,33 +701,73 @@ fn conflicting_variants_survive_retries_for_every_provider() -> Result {
 fn copied_codex_rollout_preserves_revisions_without_duplicating_logical_items() -> Result {
     let temp = tempfile::tempdir()?;
     std::fs::write(temp.path().join("rollout-contract.jsonl"), CODEX)?;
-    let mut blobs = FsBlobSink::new(temp.path().join("blobs"))?;
+    let chain = temp.path().join("chain");
+    let mut blobs = FsBlobSink::new(chain.join("blobs"))?;
     let mut cursors = MemoryCursorStore::new();
     let first =
         Provider::Codex.capture(temp.path(), &ImportOptions::default(), &mut blobs, &cursors)?;
-    let initial = HistoryProjection::from_ops(first.operations().to_vec());
+    let original_operations = first.operations().to_vec();
+    let initial = ImportState::from_ops(&original_operations);
     verify_eq!(
-        initial.codex_logical_items().len(),
+        initial.codex_items.len(),
         3,
         "the fixture has three logical items and two tool revisions"
     );
-    let mut writer = LogStore::new(SegmentStore::open(temp.path().join("chain"))?);
+    let mut writer = LogStore::new(SegmentStore::open(&chain)?);
     let _result = first.persist(&mut writer, &mut cursors)?;
+    let mut queries = editchain_engine::queries::ChainQueries::open(&chain)?;
+    verify_eq!(
+        queries.import_state()?,
+        initial,
+        "indexed queries expose shared import state"
+    );
     std::fs::write(temp.path().join("rollout-copy.jsonl"), CODEX)?;
     let copy =
         Provider::Codex.capture(temp.path(), &ImportOptions::default(), &mut blobs, &cursors)?;
     let copied_operations = copy.operations().to_vec();
     let _result = copy.persist(&mut writer, &mut cursors)?;
-    let projection = HistoryProjection::from_ops(accepted(&writer.snapshot()?));
+    let retained = accepted(&writer.snapshot()?);
+    let projection = ImportState::from_ops(&retained);
+    drop(queries.refresh()?);
     verify_eq!(
-        projection.codex_logical_items().len(),
-        initial.codex_logical_items().len(),
-        "copied source extents retain one logical history"
+        queries.import_state()?,
+        projection,
+        "refresh observes newly imported copies"
+    );
+    let _rebuilt = queries.rebuild()?;
+    verify_eq!(
+        queries.import_state()?,
+        projection,
+        "rebuilding preserves logical reconciliation"
+    );
+    let serialized = serde_json::to_vec(&projection)?;
+    verify_eq!(
+        serde_json::from_slice::<ImportState>(&serialized)?,
+        projection,
+        "reconciliation facts round-trip through machine output"
     );
     verify_eq!(
-        projection.nodes().len(),
-        initial.nodes().len(),
-        "copied revisions do not duplicate visible history"
+        projection.codex_items.len(),
+        initial.codex_items.len(),
+        "copied source extents retain one logical history"
+    );
+    verify!(
+        !projection.copies.is_empty(),
+        "shared reconciliation records exact copy equivalences"
+    );
+    verify_eq!(
+        retained.len(),
+        original_operations
+            .len()
+            .saturating_add(copied_operations.len()),
+        "logical reconciliation preserves every immutable occurrence"
+    );
+    let mut reordered = retained.clone();
+    reordered.reverse();
+    verify_eq!(
+        ImportState::from_ops(&reordered),
+        projection,
+        "replay order cannot choose a different logical history"
     );
     let mut conflicting = copied_operations.clone();
     let output = conflicting
@@ -724,16 +775,30 @@ fn copied_codex_rollout_preserves_revisions_without_duplicating_logical_items() 
         .find(|op| matches!(op.kind, OpKind::Message(_)))
         .ok_or("missing projected message")?;
     output.clock = editchain_core::Clock::None;
-    let mut retained = initial.ops().to_vec();
+    let mut retained = original_operations.clone();
     retained.extend(conflicting);
     verify_eq!(
-        HistoryProjection::from_ops(retained)
-            .codex_logical_items()
-            .len(),
+        ImportState::from_ops(&retained).codex_items.len(),
         6,
         "equal raw prefixes must not hide different derived interpretations"
     );
-    let mut previews = initial.ops().to_vec();
+    let mut missing = original_operations.clone();
+    let missing_id = missing
+        .iter()
+        .find(|op| matches!(op.kind, OpKind::Message(_)))
+        .ok_or("missing derived fixture message")?
+        .id;
+    missing.retain(|op| op.id != missing_id);
+    let incomplete = ImportState::from_ops(&missing);
+    verify!(
+        incomplete.codex_items.is_empty(),
+        "missing derived operations cannot supply logical state"
+    );
+    verify!(
+        !incomplete.incomplete_sources.is_empty(),
+        "incomplete source coverage is explicit"
+    );
+    let mut previews = original_operations;
     let shortened = copied_operations
         .iter()
         .find(|op| matches!(op.kind, OpKind::Message(_)))
@@ -741,12 +806,9 @@ fn copied_codex_rollout_preserves_revisions_without_duplicating_logical_items() 
         .id;
     previews.extend(copied_operations);
     verify_eq!(
-        HistoryProjection::from_preview_ops(
-            previews,
-            &std::collections::HashSet::from([shortened])
-        )
-        .codex_logical_items()
-        .len(),
+        ImportState::from_partial_ops(&previews, &std::collections::HashSet::from([shortened]))
+            .codex_items
+            .len(),
         6,
         "shortened previews cannot prove exact copy equivalence"
     );
@@ -878,5 +940,51 @@ fn human_raw_capture_retains_unknown_records_whitespace_and_spilled_evidence() -
         "line endings, whitespace and opaque payloads stay byte-exact"
     );
     verify_eq!(blobs.len()?, 1, "large raw evidence is content-addressed");
+    Ok(())
+}
+
+#[test]
+fn shorter_codex_copies_reconcile_against_the_longest_complete_source() -> Result {
+    let temp = tempfile::tempdir()?;
+    std::fs::write(temp.path().join("rollout-full.jsonl"), CODEX)?;
+    let prefix: Vec<u8> = CODEX
+        .split_inclusive(|byte| *byte == b'\n')
+        .take(4)
+        .flatten()
+        .copied()
+        .collect();
+    std::fs::write(temp.path().join("rollout-prefix.jsonl"), prefix)?;
+    let mut blobs = FsBlobSink::new(temp.path().join("blobs"))?;
+    let batch = Provider::Codex.capture(
+        temp.path(),
+        &ImportOptions::default(),
+        &mut blobs,
+        &MemoryCursorStore::new(),
+    )?;
+    let state = ImportState::from_ops(batch.operations());
+    verify_eq!(
+        state.codex_items.len(),
+        3,
+        "a shorter source prefix adds no duplicate logical items"
+    );
+    verify!(
+        state.incomplete_sources.is_empty(),
+        "both captured sources have complete derivations"
+    );
+    let copied_raw = state
+        .copies
+        .iter()
+        .filter(|copy| {
+            batch
+                .operations()
+                .iter()
+                .any(|op| op.id == copy.operation && matches!(op.kind, OpKind::Import(_)))
+        })
+        .count();
+    verify_eq!(
+        copied_raw,
+        4,
+        "every raw occurrence in the shorter source maps to the complete source"
+    );
     Ok(())
 }

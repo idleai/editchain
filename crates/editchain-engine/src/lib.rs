@@ -22,6 +22,8 @@
 //! operation metadata with portable record references. Refresh the query index to
 //! observe new records, conflicts, and late content.
 
+/// Provider derivation selection and logical import reconciliation.
+pub mod imports;
 pub mod queries;
 
 use std::io;
@@ -39,8 +41,6 @@ pub use editchain_core::{
 pub use editchain_store::format::{decode_op, encode_op};
 pub use editchain_store::{BlobResolution, ChainReadStats};
 
-#[cfg(test)]
-use serde_json as _;
 #[cfg(test)]
 use tempfile as _;
 

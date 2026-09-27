@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use editchain_core::op::{ImportOp, NoteRelationship, OpKind};
 use editchain_core::payload::{ContentId, Payload};
-use editchain_core::{Op, OpId};
+use editchain_core::Op;
 
 use editchain_import::codex::{import_codex, CodexDiscoveryRequest, HelperCommand};
 use editchain_import::error::ImportError;
@@ -26,27 +26,6 @@ pub(crate) struct Harness {
     pub ops: MemoryOpSink,
     /// Blob storage (content-addressed, retrievable by hash).
     pub blobs: ContentAddressedBlobSink,
-}
-
-/// Exact resolved endpoints, coalescing the annotations for each supporting fact.
-pub(crate) fn relationship_edges(
-    projection: &editchain_project::HistoryProjection,
-    relationship: NoteRelationship,
-) -> std::collections::BTreeSet<(OpId, OpId)> {
-    projection
-        .relationship_notes()
-        .values()
-        .flatten()
-        .filter_map(|op| match &op.kind {
-            OpKind::Note(note) if note.relationship == relationship => Some((op, note)),
-            _ => None,
-        })
-        .flat_map(|(op, note)| {
-            op.parents.iter().flat_map(move |source| {
-                note.target_ids.iter().map(move |target| (*source, *target))
-            })
-        })
-        .collect()
 }
 
 /// Typed persisted evidence and its unchanged source envelope.
