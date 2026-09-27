@@ -24,6 +24,10 @@ cargo run --locked -p editchain-engine --example headless -- /path/to/chain
 Running the example again against the same chain replays the same identities and
 bytes without adding duplicate records.
 
+The [history import API](./docs/import-api.md) exposes Claude, Codex and human
+archive capture with resumable cursors, exact raw evidence and native identity
+mappings. Inspect a capture batch, then accept it through durable storage adapters.
+
 ## VS Code extension
 
 Follow the [build and installation guide](./extensions/vscode-editchain/README.md).

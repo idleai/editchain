@@ -153,7 +153,8 @@ impl HistoryProjection {
     #[must_use]
     pub fn from_preview_ops(ops: Vec<Op>, incomplete: &std::collections::HashSet<OpId>) -> Self {
         let messages = materialization::source_messages(&ops, incomplete);
-        let materialization = materialization::Materialization::from_ops(&ops, &messages);
+        let materialization =
+            materialization::Materialization::from_ops(&ops, &messages, incomplete);
         Self::from_previews(ops, incomplete, materialization)
     }
 
@@ -168,7 +169,11 @@ impl HistoryProjection {
         incomplete: &std::collections::HashSet<OpId>,
     ) -> Self {
         let messages = materialization::source_messages(sources, &std::collections::HashSet::new());
-        let materialization = materialization::Materialization::from_ops(sources, &messages);
+        let materialization = materialization::Materialization::from_ops(
+            sources,
+            &messages,
+            &std::collections::HashSet::new(),
+        );
         Self::from_previews(previews, incomplete, materialization)
     }
 

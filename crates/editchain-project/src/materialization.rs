@@ -10,6 +10,7 @@ use editchain_core::{Op, OpId, OpKind, ParentSet};
 
 use crate::provider::{decode_evidence, EvidenceRecord};
 
+mod copies;
 mod message_echoes;
 pub(super) use message_echoes::source_messages;
 
@@ -81,7 +82,11 @@ pub(super) struct Materialization {
 }
 
 impl Materialization {
-    pub(super) fn from_ops(ops: &[Op], messages: &HashMap<OpId, Op>) -> Self {
+    pub(super) fn from_ops(
+        ops: &[Op],
+        messages: &HashMap<OpId, Op>,
+        incomplete: &HashSet<OpId>,
+    ) -> Self {
         let by_id: HashMap<OpId, &Op> = ops.iter().map(|op| (op.id, op)).collect();
         let records: Vec<_> = ops.iter().filter_map(decode_evidence).collect();
         let mut by_source: BTreeMap<OpId, Vec<&EvidenceRecord<'_>>> = BTreeMap::new();
@@ -98,6 +103,7 @@ impl Materialization {
         let mut logical: BTreeMap<SourceKey, LogicalTurns> = BTreeMap::new();
         let mut blocked = HashSet::new();
         let mut echoes = message_echoes::MessageEchoes::default();
+        let mut selected_codex = BTreeMap::new();
         for (source, records) in &by_source {
             result.track_outputs(*source, records, &by_id);
             let selected = select(records).filter(|meta| complete_outputs(*meta, *source, &by_id));
@@ -107,6 +113,7 @@ impl Materialization {
                     let _: Option<usize> = result.output_order.insert(*output, index);
                 }
                 if let Derivation::Codex(meta) = meta {
+                    let _previous = selected_codex.insert(*source, meta);
                     echoes.observe(*source, meta, messages, &by_id);
                     apply_changes(
                         logical.entry(source_key(*source)).or_default(),
@@ -142,6 +149,7 @@ impl Materialization {
             .flat_map(|(_, turns)| turns.into_values())
             .flat_map(BTreeMap::into_values)
             .collect();
+        copies::coalesce(&selected_codex, &by_id, &blocked, incomplete, &mut result);
         for item in &result.items {
             for (index, output) in item.outputs.iter().enumerate() {
                 // File order can change when a patch adds another path. A
