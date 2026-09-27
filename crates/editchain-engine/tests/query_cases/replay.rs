@@ -19,7 +19,7 @@ fn answers(queries: &ChainQueries) -> std::io::Result<serde_json::Value> {
         "relationships": queries.relationships(None, PageRequest::default())?,
         "git": queries.git(GitQuery { repository: RepositoryId(1), oid: None }, PageRequest::default())?,
         "conflict": queries.operation(id(3))?,
-        "variants": queries.evidence(id(3))?,
+        "variants": queries.record_variants(id(3))?,
     }))
 }
 
@@ -32,7 +32,7 @@ fn rebuild_reopen_and_reverse_replay_preserve_all_query_results_and_bytes() {
     let bytes = b"retained needle\0\xff\r\n";
     let blob = engine.store_blob(bytes).unwrap();
     let canonical = encode_op(&message(1, Payload::Inline(b"needle".to_vec()))).unwrap();
-    // Preserve an accepted overlong varint; evidence must not hash a re-encoding.
+    // Preserve an accepted overlong varint; the record hash uses the original bytes.
     let mut original = vec![0x81, 0];
     original.extend_from_slice(canonical.get(1..).unwrap());
     assert_eq!(
@@ -70,7 +70,7 @@ fn rebuild_reopen_and_reverse_replay_preserve_all_query_results_and_bytes() {
     assert_eq!(
         found(queries.operation(id(1)).unwrap())
             .unwrap()
-            .evidence
+            .record_ref
             .record_hash,
         *blake3::hash(&original).as_bytes()
     );

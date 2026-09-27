@@ -40,7 +40,7 @@ fn missing_late_invalid_and_unrecorded_content_are_distinct() {
         vec![id(1)]
     );
     let available = found(queries.content(query).unwrap()).unwrap();
-    assert_eq!(available.evidence, missing.evidence);
+    assert_eq!(available.record_ref, missing.record_ref);
     assert_eq!(available.value, ContentValue::Available(bytes.to_vec()));
     let search = queries
         .search("needle", None, PageRequest::default())

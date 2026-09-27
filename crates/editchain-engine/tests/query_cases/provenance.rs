@@ -86,7 +86,7 @@ fn provenance_retains_attribution_and_opaque_relationships_without_inference() {
     assert!(
         provenance.relationships.iter().any(|relation| relation.kind
             == RelationshipKind::Annotation(NoteRelationship::Rejects)
-            && relation.evidence.operation == note.id),
+            && relation.record_ref.operation == note.id),
         "annotations remain facts, not controller decisions"
     );
     assert_eq!(
@@ -308,8 +308,8 @@ fn git_refs_and_parentage_are_recorded_and_repository_qualified() {
         relationships
             .items
             .iter()
-            .all(|relation| relation.evidence.operation != id(2)),
-        "same OID in another repository is separate evidence"
+            .all(|relation| relation.record_ref.operation != id(2)),
+        "same OID in another repository is a separate recorded observation"
     );
     assert!(
         relationships

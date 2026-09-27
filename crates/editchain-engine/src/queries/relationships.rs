@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{GitLinkKind, GitOid, NoteRelationship, OpId, OpKind, RepositoryId, SessionId};
 
-use super::{ChainQueries, ContentStatus, EvidenceRef, HistoryEntry, PageRequest, QueryPage};
+use super::{ChainQueries, ContentStatus, HistoryEntry, PageRequest, QueryPage, RecordRef};
 
 /// A recorded operation, session, or repository-qualified Git object identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,7 +52,7 @@ pub struct RecordedRelationship {
     /// Relationship as recorded, without interpretation or edge inversion.
     pub kind: RelationshipKind,
     /// Original operation containing the assertion.
-    pub evidence: EvidenceRef,
+    pub record_ref: RecordRef,
     /// External content availability in the asserting record, including opaque
     /// annotation or custom-relation payloads. Resolve fields through `content`.
     pub content: Vec<ContentStatus>,
@@ -64,7 +64,7 @@ impl ChainQueries {
     /// Optional `entity` selects incident relationships; `page` bounds scanned
     /// operations. Results retain record order and relationship field order,
     /// including repeated assertions. Missing endpoints are never synthesized.
-    /// Use [`Self::operation`] or [`Self::git`] to inspect endpoint evidence.
+    /// Use [`Self::operation`] or [`Self::git`] to inspect endpoint records.
     ///
     /// # Errors
     /// Returns invalid page limits or index/source IO errors.
@@ -97,7 +97,7 @@ pub(super) fn recorded_relationships(entry: &HistoryEntry) -> Vec<RecordedRelati
             source,
             target,
             kind,
-            evidence: entry.evidence,
+            record_ref: entry.record_ref,
             content: entry.content.clone(),
         });
     };

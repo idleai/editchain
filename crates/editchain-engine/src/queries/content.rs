@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{BlobResolution, OpId, Payload};
 
 use super::{
-    fields, ChainQueries, ContentReference, ContentState, EvidenceRef, HistoryEntry, Lookup,
+    fields, ChainQueries, ContentReference, ContentState, HistoryEntry, Lookup, RecordRef,
 };
 
 /// A content-bearing field in the immutable operation schema.
@@ -47,7 +47,7 @@ pub enum ContentField {
     ReflectionSummary,
     /// Opaque reflection anchors.
     ReflectionAnchors,
-    /// Raw imported evidence.
+    /// Raw imported record bytes.
     ImportRaw,
     /// Opaque annotation content.
     NoteContent,
@@ -114,7 +114,7 @@ impl ContentValue {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentResult {
     /// Supporting record representation.
-    pub evidence: EvidenceRef,
+    pub record_ref: RecordRef,
     /// Requested field.
     pub field: ContentField,
     /// Original external reference, if any, including its declared length.
@@ -189,7 +189,7 @@ impl ChainQueries {
             }
         };
         Ok(ContentResult {
-            evidence: entry.evidence,
+            record_ref: entry.record_ref,
             field,
             reference,
             value,

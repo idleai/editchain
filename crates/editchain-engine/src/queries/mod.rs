@@ -1,7 +1,7 @@
 //! Deterministic queries over recorded facts in one caller-selected chain.
 //!
 //! Operations and availability follow the last successful index refresh.
-//! Evidence references hash original encoded bytes, not their reserialization;
+//! Record references hash original encoded bytes, not their reserialization;
 //! they are stable across rebuilds and replay into another chain directory.
 //! Page cursors use operation-ID order, never inferred time or causality. They
 //! are not subscriptions: use index refresh deltas for late, lower-ID arrivals.
@@ -47,35 +47,35 @@ pub use editchain_index::{
     ChainIndex, ContentReference, ContentState, ContentStatus, IndexDelta, IndexKey, IndexWork,
 };
 pub use git::GitQuery;
-pub use provenance::{AncestorGraph, OperationEvidence, Provenance};
+pub use provenance::{AncestorGraph, OperationLookup, Provenance};
 pub use relationships::{EntityRef, RecordedRelationship, RelationshipKind};
 pub use search::{FieldMatch, SearchHit, SearchPage};
 
 /// Portable reference to one exact recorded operation representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EvidenceRef {
+pub struct RecordRef {
     /// Recorded identity, which can have more than one conflicting representation.
     pub operation: OpId,
     /// Full BLAKE3 digest of the original encoded operation bytes.
     pub record_hash: [u8; 32],
 }
 
-/// Original bytes supporting a query result, including quarantined variants.
+/// Original encoded operation bytes and their stable reference, including conflicts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecordedEvidence {
+pub struct EncodedRecord {
     /// Stable reference to these exact bytes.
-    pub reference: EvidenceRef,
+    pub reference: RecordRef,
     /// Retained encoding, without normalization or reconstruction.
     pub encoded: Vec<u8>,
 }
 
-/// One accepted operation with evidence and explicit external-content availability.
+/// One accepted operation with its record reference and external-content availability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryEntry {
     /// Unmodified recorded envelope and payloads.
     pub operation: Op,
     /// Reference to the original encoding.
-    pub evidence: EvidenceRef,
+    pub record_ref: RecordRef,
     /// Referenced content in schema order, deduplicated by address and length.
     pub content: Vec<ContentStatus>,
 }
@@ -86,7 +86,7 @@ pub enum Lookup<T> {
     /// No decodable record with this operation identity was recorded.
     Missing,
     /// Multiple representations quarantine the entire identity.
-    Conflicted(Vec<EvidenceRef>),
+    Conflicted(Vec<RecordRef>),
     /// A result derived from the single accepted representation.
     Found(T),
 }
@@ -95,7 +95,7 @@ impl<T> Lookup<T> {
     fn try_map<U>(self, map: impl FnOnce(T) -> io::Result<U>) -> io::Result<Lookup<U>> {
         match self {
             Self::Missing => Ok(Lookup::Missing),
-            Self::Conflicted(evidence) => Ok(Lookup::Conflicted(evidence)),
+            Self::Conflicted(variants) => Ok(Lookup::Conflicted(variants)),
             Self::Found(value) => map(value).map(Lookup::Found),
         }
     }
@@ -192,13 +192,13 @@ impl ChainQueries {
     ///
     /// # Errors
     /// Returns index or source-record read errors.
-    pub fn evidence(&self, id: OpId) -> io::Result<Vec<RecordedEvidence>> {
+    pub fn record_variants(&self, id: OpId) -> io::Result<Vec<EncodedRecord>> {
         let mut records = self.index.record_variants(id)?;
         records.sort_by(|a, b| a.encoded.cmp(&b.encoded));
         Ok(records
             .into_iter()
-            .map(|record| RecordedEvidence {
-                reference: EvidenceRef {
+            .map(|record| EncodedRecord {
+                reference: RecordRef {
                     operation: id,
                     record_hash: *blake3::hash(&record.encoded).as_bytes(),
                 },
@@ -212,23 +212,23 @@ impl ChainQueries {
     /// # Errors
     /// Returns index or source-record read errors, including inconsistent index state.
     pub fn operation(&self, id: OpId) -> io::Result<Lookup<HistoryEntry>> {
-        let evidence = self.evidence(id)?;
+        let variants = self.record_variants(id)?;
         let Some(operation) = self.index.get(id)? else {
-            return Ok(if evidence.is_empty() {
+            return Ok(if variants.is_empty() {
                 Lookup::Missing
             } else {
                 Lookup::Conflicted(
-                    evidence
+                    variants
                         .into_iter()
                         .map(|record| record.reference)
                         .collect(),
                 )
             });
         };
-        let [record] = evidence.as_slice() else {
+        let [record] = variants.as_slice() else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "accepted operation lacks unique evidence",
+                "accepted operation lacks a unique encoded record",
             ));
         };
         let content = self.index.content(id)?.ok_or_else(|| {
@@ -239,14 +239,14 @@ impl ChainQueries {
         })?;
         Ok(Lookup::Found(HistoryEntry {
             operation,
-            evidence: record.reference,
+            record_ref: record.reference,
             content,
         }))
     }
 
     /// Page through accepted history, optionally selecting one explicit indexed fact.
     ///
-    /// Conflicts are excluded; inspect index statistics and [`Self::evidence`] for
+    /// Conflicts are excluded; inspect index statistics and [`Self::record_variants`] for
     /// quarantine and unsupported/incomplete-record diagnostics. Timestamps, tags,
     /// annotation payloads, and file stages are returned as recorded.
     ///

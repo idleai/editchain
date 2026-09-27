@@ -1,4 +1,4 @@
-//! Attribution and bounded causal traversal from recorded evidence alone.
+//! Attribution and bounded causal traversal from recorded operations.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -16,7 +16,7 @@ use super::{
 
 /// A referenced operation and its explicit lookup outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OperationEvidence {
+pub struct OperationLookup {
     /// Referenced operation, retained even when unavailable or conflicted.
     pub operation: OpId,
     /// Recorded fact or the reason no accepted fact can be supplied.
@@ -34,8 +34,8 @@ pub struct Provenance {
     /// All registrations for its explicit session scope or session record identity.
     /// Empty means no accepted registration; no session is inferred from turn/file scope.
     pub session_records: Vec<HistoryEntry>,
-    /// Direct envelope parents in recorded order, with missing/conflict evidence.
-    pub parents: Vec<OperationEvidence>,
+    /// Direct envelope parents in recorded order, with explicit lookup outcomes.
+    pub parents: Vec<OperationLookup>,
     /// Accepted relationships incident to this operation, plus assertions carried
     /// by this record. Notes and custom relations retain their opaque meaning.
     pub relationships: Vec<RecordedRelationship>,
@@ -47,9 +47,9 @@ pub struct AncestorGraph {
     /// Requested root, included in the inspected operations.
     pub root: OpId,
     /// Inspected identities in operation-ID order, including explicit missing/conflicts.
-    pub operations: Vec<OperationEvidence>,
+    pub operations: Vec<OperationLookup>,
     /// Parent assertions in child-ID and recorded-parent order. Cycles are retained
-    /// as evidence, and visited identities are not followed a second time.
+    /// as recorded, and visited identities are not followed a second time.
     pub relationships: Vec<RecordedRelationship>,
     /// Discovered identities not inspected because of the operation budget, sorted
     /// by ID. A nonempty frontier means traversal is incomplete.
@@ -81,11 +81,11 @@ impl ChainQueries {
                     .filter(|entry| matches!(&entry.operation.kind, OpKind::Session(value) if value.id == session)).collect()
             } else { Vec::new() };
             let parents = record.operation.parents.iter().map(|parent| {
-                Ok(OperationEvidence { operation: *parent, record: self.operation(*parent)? })
+                Ok(OperationLookup { operation: *parent, record: self.operation(*parent)? })
             }).collect::<io::Result<Vec<_>>>()?;
             let target = EntityRef::Operation(id);
             let relationships = self.all_history(None)?.iter().flat_map(recorded_relationships)
-                .filter(|relation| relation.source == target || relation.target == target || relation.evidence.operation == id).collect();
+                .filter(|relation| relation.source == target || relation.target == target || relation.record_ref.operation == id).collect();
             Ok(Provenance { record, actor_records, session_records, parents, relationships })
         })
     }
@@ -116,7 +116,7 @@ impl ChainQueries {
             }
             drop(visited.insert(
                 id,
-                OperationEvidence {
+                OperationLookup {
                     operation: id,
                     record,
                 },

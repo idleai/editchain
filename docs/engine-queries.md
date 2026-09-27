@@ -29,9 +29,9 @@ fn inspect(chain: &std::path::Path, revision: OpId) -> std::io::Result<()> {
 
 | Method | Returns |
 | --- | --- |
-| `history(key, page)` | Accepted operations, evidence references, and content availability. |
+| `history(key, page)` | Accepted operations, record references, and content availability. |
 | `operation(id)` | One operation, or an explicit missing/conflicted result. |
-| `evidence(id)` | All original encoded variants, including conflicts. |
+| `record_variants(id)` | All original encoded variants, including conflicts. |
 | `search(text, key, page)` | Case-sensitive literal matches with byte ranges and content gaps. |
 | `content(ContentQuery)` | Exact bytes of a selected record field. |
 | `diff(revision)` | A file revision's before/after content, recorded edit, and byte comparison. |
@@ -45,14 +45,17 @@ The optional `IndexKey` filters history and search by recorded actor, scope, pat
 parent, or content address. Full types and limits are in the
 [Rust API source](../crates/editchain-engine/src/queries/mod.rs).
 
-## Evidence and missing content
+## Record references and missing content
 
-Recorded facts carry an `EvidenceRef { operation, record_hash }`. The hash is BLAKE3
-of the original encoded record. Match it against `evidence(operation)` to retrieve
-the bytes. References survive rebuilds and replay into another directory.
+Recorded facts carry a `record_ref: RecordRef { operation, record_hash }`. The hash
+is BLAKE3 of the original encoded record. Match it against the `reference` of an
+`EncodedRecord` from `record_variants(operation)` to retrieve the bytes. References
+survive rebuilds and replay into another directory.
 
 Lookups return `Found`, `Missing`, or `Conflicted`. Conflicted identities stay out
-of accepted history; their original variants remain available as evidence.
+of accepted history; their original encoded variants remain available.
+Parent and ancestor entries use `OperationLookup` to keep the requested ID alongside
+its lookup result.
 
 Content returns `Available(bytes)`, `NotRecorded` (no field value), `Missing`
 (blob absent), `Corrupt`, or `Unresolvable`. Empty content is valid. Search reports

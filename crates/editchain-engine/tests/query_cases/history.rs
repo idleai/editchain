@@ -7,7 +7,7 @@ use editchain_engine::{
 use crate::{append, found, id, message};
 
 #[test]
-fn paging_refresh_and_conflicts_preserve_exact_evidence() {
+fn paging_refresh_and_conflicts_preserve_encoded_records() {
     let directory = tempfile::tempdir().unwrap();
     let engine = Engine::open(directory.path()).unwrap();
     let records = [
@@ -61,18 +61,20 @@ fn paging_refresh_and_conflicts_preserve_exact_evidence() {
         "actor filtering uses recorded identities"
     );
 
-    let evidence = queries.evidence(id(10)).unwrap().pop().unwrap();
+    let encoded_record = queries.record_variants(id(10)).unwrap().pop().unwrap();
     assert_eq!(
-        evidence.encoded,
+        encoded_record.encoded,
         encode_op(records.get(1).unwrap()).unwrap()
     );
     assert_eq!(
-        evidence.reference.record_hash,
-        *blake3::hash(&evidence.encoded).as_bytes()
+        encoded_record.reference.record_hash,
+        *blake3::hash(&encoded_record.encoded).as_bytes()
     );
     assert_eq!(
-        found(queries.operation(id(10)).unwrap()).unwrap().evidence,
-        evidence.reference
+        found(queries.operation(id(10)).unwrap())
+            .unwrap()
+            .record_ref,
+        encoded_record.reference
     );
     assert_eq!(
         engine.append(records.first().unwrap()).unwrap(),
@@ -96,8 +98,8 @@ fn paging_refresh_and_conflicts_preserve_exact_evidence() {
     );
     let conflict_lookup = queries.operation(id(10)).unwrap();
     assert!(
-        matches!(conflict_lookup, Lookup::Conflicted(ref variants) if variants.len() == 2 && variants.contains(&evidence.reference)),
-        "all conflicting byte evidence is retained"
+        matches!(conflict_lookup, Lookup::Conflicted(ref variants) if variants.len() == 2 && variants.contains(&encoded_record.reference)),
+        "all conflicting record variants are retained"
     );
     assert!(
         matches!(

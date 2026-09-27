@@ -33,9 +33,9 @@ pub struct ContentDiff {
     pub before_query: ContentQuery,
     /// Requested after-side field.
     pub after_query: ContentQuery,
-    /// Exact before bytes or missing evidence.
+    /// Exact before bytes or an explicit lookup/content gap.
     pub before: Lookup<ContentResult>,
-    /// Exact after bytes or missing evidence.
+    /// Exact after bytes or an explicit lookup/content gap.
     pub after: Lookup<ContentResult>,
     /// Computed only when both sides are completely available.
     pub comparison: ByteComparison,

@@ -20,7 +20,7 @@ pub struct GitQuery {
 impl ChainQueries {
     /// Read Git observations, preserving imported/live ref snapshots separately.
     ///
-    /// Multiple observations of a commit remain separate evidence-bearing records.
+    /// Multiple observations of a commit remain separate records with their own references.
     /// Availability is what the producer recorded, not a claim about today's object
     /// database. `page` bounds scanned operations; continue through empty pages.
     /// Resolve ref payloads using [`Self::content`] and `GitImportedRef`/`GitLiveRef`.

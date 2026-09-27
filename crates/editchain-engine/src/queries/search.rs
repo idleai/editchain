@@ -6,9 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ByteRange, OpId};
 
-use super::{
-    fields, ChainQueries, ContentField, ContentResult, EvidenceRef, IndexKey, PageRequest,
-};
+use super::{fields, ChainQueries, ContentField, ContentResult, IndexKey, PageRequest, RecordRef};
 
 /// First exact occurrence in one content field, using byte offsets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,7 +21,7 @@ pub struct FieldMatch {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchHit {
     /// Original record supporting all of these matches.
-    pub evidence: EvidenceRef,
+    pub record_ref: RecordRef,
     /// First match per field, in schema order; no normalization or relevance score.
     pub fields: Vec<FieldMatch>,
 }
@@ -45,7 +43,7 @@ impl ChainQueries {
     /// Search recorded payloads and referenced snapshots for a case-sensitive literal.
     ///
     /// `text` must contain 1..=16384 UTF-8 bytes. Matching uses exact byte
-    /// sequences, including in binary evidence; it never performs lossy text
+    /// sequences, including in binary content; it never performs lossy text
     /// decoding or joins adjacent fields. Page limits bound candidate operations,
     /// not hits. An empty hit list with gaps is not proof that text is absent.
     ///
@@ -93,7 +91,7 @@ impl ChainQueries {
             }
             if !matches.is_empty() {
                 result.hits.push(SearchHit {
-                    evidence: entry.evidence,
+                    record_ref: entry.record_ref,
                     fields: matches,
                 });
             }

@@ -194,7 +194,7 @@ fn every_content_field_is_resolvable_and_searchable_with_its_original_record() {
     assert_eq!(search.hits.len(), cases.len());
     for ((index, (_, fields)), hit) in cases.iter().enumerate().zip(&search.hits) {
         let operation = id(u64::try_from(index).unwrap());
-        assert_eq!(hit.evidence.operation, operation);
+        assert_eq!(hit.record_ref.operation, operation);
         assert_eq!(
             hit.fields
                 .iter()
@@ -212,7 +212,7 @@ fn every_content_field_is_resolvable_and_searchable_with_its_original_record() {
                     .unwrap(),
             )
             .unwrap();
-            assert_eq!(content.evidence, hit.evidence);
+            assert_eq!(content.record_ref, hit.record_ref);
             assert_eq!(content.value.bytes().unwrap(), bytes);
         }
     }
