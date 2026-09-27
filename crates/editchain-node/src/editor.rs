@@ -19,8 +19,8 @@ use std::io;
 use std::path::PathBuf;
 
 use editchain_core::{
-    ActorId, Admission, BlobRef, Clock, ContentId, NodeId, Op, OpId, OpKind, ParentSet, Payload,
-    ScopeRef, Tags,
+    ActorId, Admission, BlobRef, Clock, ContentId, Op, OpId, OpKind, ParentSet, Payload, ScopeRef,
+    Tags,
 };
 use editchain_protocol::editor::{EditorEvent, EditorEventKind, RecordEditorEvents};
 use editchain_store::{
@@ -129,27 +129,7 @@ fn record_inner(
     )
 }
 fn event_id(event: &EditorEvent) -> io::Result<OpId> {
-    let digest = blake3::derive_key(
-        "editchain.vscode.editor.session.v1",
-        event.session.as_bytes(),
-    );
-    let mut node = [0_u8; 8];
-    node.copy_from_slice(
-        digest
-            .get(..8)
-            .ok_or_else(|| io::Error::other("invalid hash"))?,
-    );
-    let mut boot = [0_u8; 4];
-    boot.copy_from_slice(
-        digest
-            .get(8..12)
-            .ok_or_else(|| io::Error::other("invalid hash"))?,
-    );
-    Ok(OpId {
-        node: NodeId(u64::from_le_bytes(node)),
-        boot: u32::from_le_bytes(boot),
-        seq: event.sequence,
-    })
+    editchain_import::human::native_event_id(&event.session, event.sequence)
 }
 
 fn event_op(event: &EditorEvent, raw: &[u8]) -> io::Result<Op> {

@@ -1,9 +1,13 @@
-//! Editchain import adapters — Claude Code and Codex history importers.
+//! Reusable Claude, Codex and human history import adapters.
 //!
 //! This crate provides deterministic, idempotent import of Claude Code session
-//! files and Codex rollout files into editchain operations. Every physical
+//! files, Codex rollouts and human archives into editchain operations. Every physical
 //! JSONL line is preserved as a raw `ImportOp`; normalized operations
 //! (messages, tools, commands, files) are derived alongside.
+//!
+//! Start with [`capture_import`] and [`ImportSource`]. Inspect the returned
+//! [`batch::ImportBatch`], then persist it through a [`batch::DurableOpSink`].
+//! [`native`] exposes reconciliation inputs without requiring a native runtime.
 
 use serde as _;
 
@@ -16,18 +20,24 @@ use proptest as _;
 pub mod batch;
 /// Cooperative cancellation of source capture and helper execution.
 pub mod cancellation;
+/// Provider-neutral capture entry point with uncommitted resumable cursors.
+pub mod capture;
 /// Cursor-based incremental file reading.
 pub mod cursor;
 /// Import error types.
 pub mod error;
 /// Typed provider observations for host-owned Git reconciliation.
 pub mod git_evidence;
+/// Exact human archive capture and native recorder identity mappings.
+pub mod human;
 /// Deterministic ID derivation for import.
 pub mod ids;
 /// Main import orchestrator.
 pub mod import;
 /// Import data models (request, options, report).
 pub mod model;
+/// Native provider identities bound to their retained raw evidence.
+pub mod native;
 /// Pluggable output sinks (ops, blobs, cursors).
 pub mod sink;
 /// Captured source bytes and shared incremental read plans.
@@ -40,6 +50,7 @@ pub mod claude_code;
 /// Codex (OpenAI) session import pipeline.
 pub mod codex;
 
+pub use capture::{capture_import, ImportSource};
 pub use cursor::*;
 pub use error::*;
 pub use ids::*;

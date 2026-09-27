@@ -31,6 +31,28 @@ pub trait DurableOpSink {
     fn append_durable(&mut self, ops: &[Op]) -> Result<DurableAdmission, ImportError>;
 }
 
+impl<L: editchain_store::AppendLog> DurableOpSink for editchain_store::LogStore<L> {
+    fn append_durable(&mut self, ops: &[Op]) -> Result<DurableAdmission, ImportError> {
+        let mut result = DurableAdmission::default();
+        for op in ops {
+            let bytes = editchain_store::format::encode_op(op).map_err(std::io::Error::other)?;
+            match self.append_encoded(&bytes)? {
+                editchain_core::Admission::Accepted => {
+                    result.written = result.written.saturating_add(1);
+                }
+                editchain_core::Admission::Duplicate => {
+                    result.duplicates = result.duplicates.saturating_add(1);
+                }
+                editchain_core::Admission::Conflict => {
+                    result.written = result.written.saturating_add(1);
+                    result.conflicts = result.conflicts.saturating_add(1);
+                }
+            }
+        }
+        Ok(result)
+    }
+}
+
 /// Successfully persisted operations and their corresponding checkpoints.
 #[derive(Debug)]
 pub struct DurableImport {
@@ -101,6 +123,16 @@ impl ImportBatch {
     #[must_use]
     pub fn operations(&self) -> &[Op] {
         &self.ops.ops
+    }
+
+    /// Proposed resumable source positions, for inspection before acceptance.
+    /// These become accepted only when [`Self::persist`] succeeds; saving them
+    /// earlier can skip evidence after a failed operation or blob write.
+    pub fn proposed_cursors(&self) -> impl Iterator<Item = (&str, &CursorValue)> {
+        self.checkpoints
+            .cursors
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
     }
 
     /// Add exact reconciliation evidence to the same durable batch.
