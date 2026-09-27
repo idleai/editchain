@@ -6,13 +6,13 @@ use std::path::{Path, PathBuf};
 
 use editchain_core::{BlobRef, ContentId};
 
-use crate::durable::{atomic_write, sync_parent_dir};
+use crate::durable::{create_dir_all, publish_new, sync_parent_dir};
 
 /// A filesystem-backed, content-addressed blob sink.
 ///
 /// Blobs are stored under a directory as one file per unique BLAKE3 hash
 /// (`<dir>/<hex-hash>`), deduplicated by content: storing identical bytes
-/// twice writes only one file. Writes are atomic (temp file + rename) so a
+/// twice writes only one file. Writes are atomic (temp file + exclusive publication) so a
 /// crash never leaves a truncated blob readable under its final name, and the
 /// directory survives process restarts, giving durable storage for payloads
 /// that callers choose to retain outside an operation envelope.
@@ -30,7 +30,7 @@ impl BlobStore {
     /// Returns an IO error if the directory cannot be created.
     pub fn new(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
-        fs::create_dir_all(&dir)?;
+        create_dir_all(&dir)?;
         Ok(Self { dir })
     }
 
@@ -116,7 +116,14 @@ impl BlobStore {
     pub fn len(&self) -> io::Result<usize> {
         fs::read_dir(&self.dir)?.try_fold(0usize, |count, entry| {
             let entry = entry?;
-            if entry.file_type()?.is_file() {
+            let name = entry.file_name();
+            let canonical = name.to_str().is_some_and(|name| {
+                name.len() == 64
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+            if canonical && entry.file_type()?.is_file() {
                 Ok(count.saturating_add(1))
             } else {
                 Ok(count)
@@ -146,35 +153,41 @@ impl BlobStore {
     /// Returns an IO error for inconsistent existing bytes or a failed read,
     /// publication, or directory sync.
     pub fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        let hash = hash_raw(data);
-        let path = self.path_for(&hash);
-        match fs::OpenOptions::new().read(true).write(true).open(&path) {
-            Ok(mut file) => {
-                if !same_blob_bytes(&mut file, data)? {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "existing blob {} does not match its content address",
-                            path.display()
-                        ),
-                    ));
-                }
-                // A retry may follow a failed directory sync after publication.
-                // Matching readable bytes alone are not a durable acknowledgement.
-                file.sync_all()?;
-                return sync_parent_dir(&path);
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!("opening blob {}: {error}", path.display()),
-                ))
-            }
+        create_dir_all(&self.dir)?;
+        let path = self.path_for(&hash_raw(data));
+        if verify_existing(&path, data)? {
+            return Ok(());
         }
-        atomic_write(&path, data)
-            .map_err(|e| io::Error::new(e.kind(), format!("storing blob {}: {e}", path.display())))
+        if publish_new(&path, data)? || verify_existing(&path, data)? {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "published blob disappeared",
+            ))
+        }
     }
+}
+
+fn verify_existing(path: &Path, data: &[u8]) -> io::Result<bool> {
+    let mut file = match fs::OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !same_blob_bytes(&mut file, data)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "existing blob {} does not match its content address",
+                path.display()
+            ),
+        ));
+    }
+    // Readability alone is not proof of a durable prior acknowledgement.
+    file.sync_all()?;
+    sync_parent_dir(path)?;
+    Ok(true)
 }
 
 fn same_blob_bytes(file: &mut File, expected: &[u8]) -> io::Result<bool> {
@@ -215,9 +228,8 @@ pub enum BlobResolution {
 /// defer full hashing until content is explicitly requested.
 #[derive(Debug, Clone)]
 pub struct BlobReader {
-    /// The durable store directory; `None` when the chain has no `blobs/`
-    /// directory.
-    store: Option<BlobStore>,
+    /// Retain the path even before any blobs arrive.
+    store: BlobStore,
 }
 
 impl BlobReader {
@@ -227,27 +239,25 @@ impl BlobReader {
     ///
     /// Returns an IO error if `chain_dir/blobs` exists but cannot be read.
     pub fn open(chain_dir: &Path) -> io::Result<Self> {
-        BlobStore::open_read_only(chain_dir.join("blobs")).map(|store| Self { store })
+        let dir = chain_dir.join("blobs");
+        let store = BlobStore::open_read_only(&dir)?.unwrap_or(BlobStore { dir });
+        Ok(Self { store })
     }
 
-    fn path_for(&self, hash: &[u8; 32]) -> Option<PathBuf> {
-        self.store.as_ref().map(|store| store.path_for(hash))
+    pub(crate) const fn store(&self) -> &BlobStore {
+        &self.store
     }
 
     /// Resolve a blob reference, validating declared length and BLAKE3 hash.
     #[must_use]
     pub fn resolve(&self, blob: &BlobRef) -> BlobResolution {
-        match &self.store {
-            Some(store) => store.resolve(blob),
-            None if addressable_hash(blob.id).is_some() => BlobResolution::Missing,
-            None => BlobResolution::Unresolvable,
-        }
+        self.store.resolve(blob)
     }
 
     /// Resolve complete content by its full BLAKE3 identity.
     #[must_use]
     pub fn resolve_content(&self, id: ContentId) -> Option<Vec<u8>> {
-        self.store.as_ref()?.resolve_content(id)
+        self.store.resolve_content(id)
     }
 
     /// Read at most `limit` bytes for a display preview without hydrating or
@@ -261,9 +271,7 @@ impl BlobReader {
         let Some(hash) = addressable_hash(blob.id) else {
             return BlobPreviewResolution::Unresolvable;
         };
-        let Some(path) = self.path_for(&hash) else {
-            return BlobPreviewResolution::Missing;
-        };
+        let path = self.store.path_for(&hash);
         let Ok(metadata) = fs::metadata(&path) else {
             return if path.exists() {
                 BlobPreviewResolution::Corrupt

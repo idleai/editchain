@@ -158,6 +158,9 @@ impl DurableOpSink for Writer<'_> {
         if !page.records.is_empty() {
             self.store.append_page(&page)?;
         }
+        if result.duplicates > 0 || result.conflicts > 0 {
+            self.store.sync_all()?;
+        }
         Ok(result)
     }
 }

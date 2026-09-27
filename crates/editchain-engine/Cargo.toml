@@ -16,7 +16,7 @@ workspace = true
 [dependencies]
 editchain-core = { path = "../editchain-core" }
 editchain-store = { path = "../editchain-store" }
-blake3 = "1"
 
 [dev-dependencies]
+blake3 = "1"
 tempfile = "3"

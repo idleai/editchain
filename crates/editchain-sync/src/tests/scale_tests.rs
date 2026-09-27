@@ -187,6 +187,10 @@ fn retained_evidence_rejects_sealed_replacement_and_active_truncation_before_ack
         let dir = tempfile::tempdir()?;
         let entry = blob_record(1, b"blob", 4)?;
         seed(dir.path(), std::slice::from_ref(&entry))?;
+        let mut writer = SegmentStore::open(dir.path())?;
+        writer.rotate()?;
+        writer.append_page(&Page::new(0))?;
+        drop(writer);
         seed(dir.path(), &[record(2, b"active segment")?])?;
         let replica = Replica::open(dir.path(), "space-1", true)?;
         let _snapshot = replica.snapshot()?;

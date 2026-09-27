@@ -246,10 +246,16 @@ fn partial_records_replays_conflicts_and_new_segments_match_full_replay() -> io:
         "duplicates remain idempotent",
     )?;
     drop(tail.poll()?);
-    std::fs::write(dir.path().join("000001.eclog"), b"EC02")?;
+    // Damage the observed frontier, regardless of how many writer lifetimes
+    // have shared its segment. A newly created incomplete successor is legal.
+    std::fs::write(
+        dir.path()
+            .join(format!("{:06}.eclog", store.segment_sequence())),
+        b"EC02",
+    )?;
     check(
         indexed.poll().is_err(),
-        "indexed corrupt successor is rejected",
+        "indexed truncated frontier is rejected",
     )?;
     check(
         tail.poll().is_err(),
