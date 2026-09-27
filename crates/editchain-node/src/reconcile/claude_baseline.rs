@@ -316,6 +316,7 @@ mod tests {
             .find_map(|op| match &op.kind {
                 OpKind::GitLink(link) => Some((op, link)),
                 OpKind::ChainStart(_)
+                | OpKind::Session(_)
                 | OpKind::Actor(_)
                 | OpKind::Message(_)
                 | OpKind::Tool(_)

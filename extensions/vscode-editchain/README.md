@@ -6,6 +6,11 @@ The UI is a Rust/WASM renderer;
 the TypeScript host starts the native service and handles VS Code integrations
 such as JSON documents and native diff editors.
 
+Host primitives now have a canonical home in the sibling `vscode-extension`
+repository. This extension remains the working compatibility consumer until
+capture, native history actions and shared application assembly switch. See the
+[host extraction handoff](HOST-MIGRATION.md) for source mappings and cleanup owners.
+
 ## Build
 
 Prerequisites:

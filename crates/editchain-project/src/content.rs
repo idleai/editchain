@@ -205,6 +205,7 @@ pub fn operation(op: &Op, source_complete: bool) -> SelectedContent {
         )),
         OpKind::File(_)
         | OpKind::ChainStart(_)
+        | OpKind::Session(_)
         | OpKind::Actor(_)
         | OpKind::Import(_)
         | OpKind::GitLink(_)
@@ -275,6 +276,7 @@ impl ImportParts {
                     .map(|path| format!("file: {path}"));
             }
             OpKind::ChainStart(_)
+            | OpKind::Session(_)
             | OpKind::Actor(_)
             | OpKind::Message(_)
             | OpKind::Tool(_)
@@ -345,6 +347,7 @@ pub(super) fn collapsed_import(
     parts.select().unwrap_or_else(|| match &raw.kind {
         OpKind::Import(import) => SelectedContent::summary(labels::raw_import_label(import)),
         OpKind::ChainStart(_)
+        | OpKind::Session(_)
         | OpKind::Actor(_)
         | OpKind::Message(_)
         | OpKind::Tool(_)

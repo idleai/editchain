@@ -989,13 +989,23 @@ fn hydrate_traverses_every_payload_bearing_field() {
                 edit: editchain_core::op::FileEdit::Blob(file_blob_ref),
             }),
         ),
+        op_envelope(
+            1,
+            15,
+            OpKind::Session(editchain_core::SessionOp {
+                id: SessionId(1),
+                parent: None,
+                label: blob(b"session-label"),
+                metadata: blob(b"session-metadata"),
+            }),
+        ),
     ];
 
     let stats = hydrate_blob_payloads(&mut ops, &resolver);
     // 2 actor + 2 message + 3 tool + 2 command + 1 replace-bytes + 1 diff
     // + 2 reflection + 1 import + 1 note + 2 error + 1 unknown + 7 commit
-    // (message/author/committer/refs) + 1 custom link.
-    assert_eq!(stats.hydrated, 26);
+    // (message/author/committer/refs) + 1 custom link + 2 session.
+    assert_eq!(stats.hydrated, 28);
     // The file edit blob has no inline representation: validated, preserved.
     assert_eq!(stats.verified_refs, 1);
     assert_eq!(stats.missing, 0);

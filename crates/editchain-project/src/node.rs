@@ -628,6 +628,7 @@ impl HistoryNode {
         match self {
             Self::EditOperation { op, .. } => match &op.kind {
                 OpKind::ChainStart(_) => "chainstart".to_string(),
+                OpKind::Session(_) => "session".to_string(),
                 OpKind::Actor(_) => "actor".to_string(),
                 OpKind::Message(_) => "message".to_string(),
                 OpKind::Tool(_) => "tool".to_string(),

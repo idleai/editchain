@@ -1,10 +1,28 @@
 # EditChain
 
-EditChain combines Claude Code and Codex sessions with Git history in one
-read-only VS Code view. Browse agent activity, search recorded text, inspect
-file changes, and open diffs alongside the repository's commits.
+EditChain is a Rust engine for immutable human and agent history. Record chains,
+operations, actors, sessions, file revisions, annotations, and reflections through
+the viewer-independent `editchain-engine` facade and shared `editchain-core`
+types. Callers select a chain directly; the engine has no product workspace model.
+
+The existing VS Code view combines Claude Code and Codex sessions with Git
+history. Browse agent activity, search recorded text, inspect file changes, and
+open diffs alongside the repository's commits.
 
 Experimental; built and run locally.
+
+## Rust engine
+
+See the [engine API guide](./docs/engine-api.md) for the record contract, exact
+evidence and conflict semantics, and dependency setup. A standalone example
+records every shared record family without starting the viewer or a host service:
+
+```sh
+cargo run --locked -p editchain-engine --example headless -- /path/to/chain
+```
+
+Running the example again against the same chain replays the same identities and
+bytes without adding duplicate records.
 
 ## VS Code extension
 
@@ -88,8 +106,9 @@ the old chain can be removed once the new one is verified.
 
 ## Development
 
-`editchain-node` builds the CLI and native service. The extension hosts the
-Rust/WASM view from `editchain-history-renderer`.
+`editchain-engine` exposes the native library facade; `editchain-core` owns the
+shared immutable schema. `editchain-node` builds the CLI and native service.
+The extension hosts the Rust/WASM view from `editchain-history-renderer`.
 
 Run `./scripts/lint.sh` for Rust checks; it requires `cargo-deny`.
 

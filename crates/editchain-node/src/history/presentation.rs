@@ -456,6 +456,7 @@ fn sub_op_meta(op: &Op) -> (RecordRole, ActivityKind) {
         OpKind::Tool(_) => (RecordRole::Action, ActivityKind::Execute),
         OpKind::Import(_) => (RecordRole::Lifecycle, ActivityKind::System),
         OpKind::ChainStart(_)
+        | OpKind::Session(_)
         | OpKind::Actor(_)
         | OpKind::Message(_)
         | OpKind::Command(_)
@@ -903,6 +904,7 @@ pub(super) fn sub_op_label(op: &Op) -> (String, String) {
             Payload::Empty | Payload::Blob(_) => String::new(),
         },
         OpKind::ChainStart(_)
+        | OpKind::Session(_)
         | OpKind::Actor(_)
         | OpKind::Message(_)
         | OpKind::Tool(_)

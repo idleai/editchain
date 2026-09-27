@@ -126,6 +126,25 @@ impl SegmentStore {
         Ok(())
     }
 
+    /// Re-establish durability of retained segments before acknowledging a replay.
+    ///
+    /// An earlier failed append may have written complete bytes but failed to
+    /// sync them or their directory entry. Merely reading matching bytes does
+    /// not prove they are durable. This method holds this store's writer lock
+    /// while syncing all retained segments and their directory.
+    ///
+    /// # Errors
+    /// Returns an error if segment enumeration, opening, or synchronization fails.
+    pub fn sync_all(&self) -> io::Result<()> {
+        for sequence in segment_sequences(&self.chain_dir)? {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(self.segment_path(sequence))?
+                .sync_all()?;
+        }
+        sync_parent_dir(&self.chain_dir)
+    }
+
     /// Read all pages from all segments in order.
     ///
     /// # Errors

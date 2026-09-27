@@ -117,6 +117,7 @@ fn operation_text(
             .map(|changes| file_paths(changes)),
         OpKind::GitLink(link) => Some(format!("git:{} {:?}", link.target_oid, link.kind)),
         OpKind::ChainStart(_)
+        | OpKind::Session(_)
         | OpKind::Actor(_)
         | OpKind::Import(_)
         | OpKind::Note(_)

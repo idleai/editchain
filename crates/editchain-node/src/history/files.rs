@@ -111,6 +111,7 @@ impl Workspace {
             OpKind::File(file) => materialize_file_op_diff(self, file, requested),
             OpKind::Import(import) => materialize_codex_raw_file_diff(self, import, requested),
             OpKind::ChainStart(_)
+            | OpKind::Session(_)
             | OpKind::Actor(_)
             | OpKind::Message(_)
             | OpKind::Command(_)
@@ -283,6 +284,7 @@ pub(super) fn agent_file_change_index(
                 path_notes.get(&op.id).cloned()
             }
             OpKind::ChainStart(_)
+            | OpKind::Session(_)
             | OpKind::Actor(_)
             | OpKind::Message(_)
             | OpKind::Tool(_)
@@ -304,6 +306,7 @@ pub(super) fn agent_file_change_index(
                 FileChangeStatus::Deleted
             }
             OpKind::ChainStart(_)
+            | OpKind::Session(_)
             | OpKind::Actor(_)
             | OpKind::Message(_)
             | OpKind::Tool(_)

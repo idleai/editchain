@@ -25,6 +25,7 @@ pub(crate) fn structured_payload(op: &Op) -> Option<&Payload> {
         OpKind::Import(value) => Some(&value.raw_ref),
         OpKind::Note(value) => Some(&value.content),
         OpKind::ChainStart(_)
+        | OpKind::Session(_)
         | OpKind::Actor(_)
         | OpKind::Message(_)
         | OpKind::Tool(_)
@@ -55,6 +56,7 @@ pub(crate) fn references(op: &Op) -> References {
     let mut payloads = Vec::new();
     match &op.kind {
         OpKind::ChainStart(_) => {}
+        OpKind::Session(value) => payloads.extend([&value.label, &value.metadata]),
         OpKind::Actor(value) => payloads.extend([&value.label, &value.role]),
         OpKind::Message(value) => payloads.extend([&value.content, &value.content_type]),
         OpKind::Tool(value) => {
