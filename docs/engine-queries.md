@@ -19,7 +19,7 @@ fn inspect(chain: &std::path::Path, revision: OpId) -> std::io::Result<()> {
         field: ContentField::FileAfter,
     })?;
     let _diff = queries.diff(revision)?;
-    let _provenance = queries.provenance(revision)?;
+    let _context = queries.operation_context(revision)?;
     let _ancestors = queries.ancestors(revision, 100)?;
     Ok(())
 }
@@ -36,7 +36,7 @@ fn inspect(chain: &std::path::Path, revision: OpId) -> std::io::Result<()> {
 | `content(ContentQuery)` | Exact bytes of a selected record field. |
 | `diff(revision)` | A file revision's before/after content, recorded edit, and byte comparison. |
 | `compare(before, after)` | A byte comparison between two selected fields. |
-| `provenance(id)` | Recorded attribution, actor/session observations, parents, and relationships. |
+| `operation_context(id)` | The operation, actor/session records, direct parents, and relationships. |
 | `ancestors(id, limit)` | A bounded parent walk, including missing/conflicted records and an unvisited frontier. |
 | `relationships(entity, page)` | Recorded causal, annotation, session, and Git relationships. |
 | `git(GitQuery, page)` | Commit observations and links for a repository and optional full OID. |
@@ -67,15 +67,15 @@ replacement range in each side. If either side is unavailable, the comparison is
 
 Causal walks follow only envelope parents. Git queries preserve recorded ref
 snapshots and require a repository identity; they do not read current branches
-or the working tree. Consumers interpret annotations and provenance, including
-task status and authorship scores.
+or the working tree. Task status and authorship scores are consumer interpretations
+of these recorded facts.
 
 ## Paging and refresh
 
 `PageRequest` uses an exclusive `after: OpId` and scans 1–1000 candidate operations
 (default 100) in operation-ID order. Follow `next_after` until it is `None`, even
 when a filtered page is empty. This bounds operations, not content size.
-`provenance` may scan the whole chain; use paged relationships for bounded reads.
+`operation_context` may scan the whole chain; use paged relationships for bounded reads.
 
 Call `refresh()` to observe new records, conflicts, and late blobs. Use its change
 IDs to update results: new imports can have IDs older than your page cursor.

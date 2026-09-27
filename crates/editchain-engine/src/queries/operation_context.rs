@@ -1,4 +1,4 @@
-//! Attribution and bounded causal traversal from recorded operations.
+//! Actor/session records, relationships, and causal parents for an operation.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -23,9 +23,10 @@ pub struct OperationLookup {
     pub record: Lookup<HistoryEntry>,
 }
 
-/// Factual provenance of one operation; no authorship or comprehension is inferred.
+/// An operation with its actor/session registrations, direct parents, and relationships.
+/// No authorship or comprehension is inferred.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Provenance {
+pub struct OperationContext {
     /// Original operation, including raw actor, scope, tags, and source clock.
     pub record: HistoryEntry,
     /// All accepted registrations for its actor, ordered by operation ID. An empty
@@ -57,7 +58,7 @@ pub struct AncestorGraph {
 }
 
 impl ChainQueries {
-    /// Gather recorded attribution, direct causes, and incident relationships.
+    /// Gather an operation's actor/session records, direct parents, and relationships.
     ///
     /// This complete lookup can scan the chain for incoming annotations and Git
     /// links. Use paged [`Self::relationships`] for bounded retrieval. Actor/session
@@ -65,7 +66,7 @@ impl ChainQueries {
     ///
     /// # Errors
     /// Returns index or source IO errors.
-    pub fn provenance(&self, id: OpId) -> io::Result<Lookup<Provenance>> {
+    pub fn operation_context(&self, id: OpId) -> io::Result<Lookup<OperationContext>> {
         self.operation(id)?.try_map(|record| {
             let actor_records = self.all_history(Some(IndexKey::Actor(record.operation.actor)))?
                 .into_iter().filter(|entry| matches!(entry.operation.kind, OpKind::Actor(_))).collect();
@@ -86,7 +87,7 @@ impl ChainQueries {
             let target = EntityRef::Operation(id);
             let relationships = self.all_history(None)?.iter().flat_map(recorded_relationships)
                 .filter(|relation| relation.source == target || relation.target == target || relation.record_ref.operation == id).collect();
-            Ok(Provenance { record, actor_records, session_records, parents, relationships })
+            Ok(OperationContext { record, actor_records, session_records, parents, relationships })
         })
     }
 

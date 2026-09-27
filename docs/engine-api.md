@@ -107,7 +107,7 @@ APIs. Existing bytes that disagree with their content address are left untouched
 and produce an error on a repeated write.
 
 The facade performs a full canonical read per append or snapshot. For indexed
-history, search, content, diff, Git, and provenance access, use `Engine::queries()`
+history, search, content, diff, Git, and operation context, use `Engine::queries()`
 or `queries::ChainQueries::from_index(index)`. The [query guide](engine-queries.md)
 describes record references, pagination, refresh, and explicit content gaps.
 Import and replication implementations remain in their respective crates; the

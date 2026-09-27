@@ -14,7 +14,7 @@ fn answers(queries: &ChainQueries) -> std::io::Result<serde_json::Value> {
         "search": queries.search("needle", None, PageRequest::default())?,
         "content": queries.content(ContentQuery { operation: id(1), field: ContentField::MessageContent })?,
         "diff": queries.diff(id(4))?,
-        "provenance": queries.provenance(id(4))?,
+        "operation_context": queries.operation_context(id(4))?,
         "ancestors": queries.ancestors(id(4), 20)?,
         "relationships": queries.relationships(None, PageRequest::default())?,
         "git": queries.git(GitQuery { repository: RepositoryId(1), oid: None }, PageRequest::default())?,

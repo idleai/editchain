@@ -118,8 +118,11 @@ fn paging_refresh_and_conflicts_preserve_encoded_records() {
         "conflict precedes revision interpretation"
     );
     assert!(
-        matches!(queries.provenance(id(10)).unwrap(), Lookup::Conflicted(_)),
-        "provenance cannot invent accepted authorship"
+        matches!(
+            queries.operation_context(id(10)).unwrap(),
+            Lookup::Conflicted(_)
+        ),
+        "operation context cannot silently choose a conflicted record"
     );
     assert_eq!(
         queries

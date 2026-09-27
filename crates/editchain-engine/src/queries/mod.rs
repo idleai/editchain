@@ -20,7 +20,7 @@
 //!     field: ContentField::FileAfter,
 //! })?;
 //! let _diff = queries.diff(revision)?;
-//! let _provenance = queries.provenance(revision)?;
+//! let _context = queries.operation_context(revision)?;
 //! let _ancestors = queries.ancestors(revision, 100)?;
 //! # Ok(())
 //! # }
@@ -30,7 +30,7 @@ mod content;
 mod diff;
 mod fields;
 mod git;
-mod provenance;
+mod operation_context;
 mod relationships;
 mod search;
 
@@ -47,7 +47,7 @@ pub use editchain_index::{
     ChainIndex, ContentReference, ContentState, ContentStatus, IndexDelta, IndexKey, IndexWork,
 };
 pub use git::GitQuery;
-pub use provenance::{AncestorGraph, OperationLookup, Provenance};
+pub use operation_context::{AncestorGraph, OperationContext, OperationLookup};
 pub use relationships::{EntityRef, RecordedRelationship, RelationshipKind};
 pub use search::{FieldMatch, SearchHit, SearchPage};
 

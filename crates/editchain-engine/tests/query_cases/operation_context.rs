@@ -10,7 +10,7 @@ use super::commit;
 use crate::{append, found, id, message, record};
 
 #[test]
-fn provenance_retains_attribution_and_opaque_relationships_without_inference() {
+fn operation_context_retains_attribution_and_opaque_relationships_without_inference() {
     let directory = tempfile::tempdir().unwrap();
     let engine = Engine::open(directory.path()).unwrap();
     let actor = record(
@@ -60,31 +60,28 @@ fn provenance_retains_attribution_and_opaque_relationships_without_inference() {
     )
     .unwrap();
     let mut queries = engine.queries().unwrap();
-    let provenance = found(queries.provenance(child.id).unwrap()).unwrap();
-    assert_eq!(provenance.record.operation, child);
+    let context = found(queries.operation_context(child.id).unwrap()).unwrap();
+    assert_eq!(context.record.operation, child);
     assert_eq!(
-        provenance
+        context
             .actor_records
             .iter()
             .map(|entry| &entry.operation)
             .collect::<Vec<_>>(),
         vec![&actor, &later_actor]
     );
+    assert_eq!(context.session_records.first().unwrap().operation, session);
     assert_eq!(
-        provenance.session_records.first().unwrap().operation,
-        session
-    );
-    assert_eq!(
-        provenance
+        context
             .parents
             .iter()
             .map(|parent| parent.operation)
             .collect::<Vec<_>>(),
         vec![id(3), id(80)]
     );
-    assert_eq!(provenance.parents.last().unwrap().record, Lookup::Missing);
+    assert_eq!(context.parents.last().unwrap().record, Lookup::Missing);
     assert!(
-        provenance.relationships.iter().any(|relation| relation.kind
+        context.relationships.iter().any(|relation| relation.kind
             == RelationshipKind::Annotation(NoteRelationship::Rejects)
             && relation.record_ref.operation == note.id),
         "annotations remain facts, not controller decisions"
@@ -119,7 +116,7 @@ fn provenance_retains_attribution_and_opaque_relationships_without_inference() {
     drop(queries.refresh().unwrap());
     assert!(
         matches!(
-            found(queries.provenance(id(5)).unwrap())
+            found(queries.operation_context(id(5)).unwrap())
                 .unwrap()
                 .parents
                 .first()
@@ -135,7 +132,7 @@ fn provenance_retains_attribution_and_opaque_relationships_without_inference() {
     append(&engine, &[unscoped]).unwrap();
     drop(queries.refresh().unwrap());
     assert!(
-        found(queries.provenance(id(10)).unwrap())
+        found(queries.operation_context(id(10)).unwrap())
             .unwrap()
             .session_records
             .is_empty(),
