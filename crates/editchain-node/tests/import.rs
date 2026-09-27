@@ -30,7 +30,7 @@ fn interrupt_cancels_helper_and_leaves_no_accepted_source() {
     let script = dir.path().join("helper.sh");
     let child_pid = dir.path().join("child.pid");
     std::fs::write(&script, "sleep 30 &\nprintf '%s' \"$!\" > \"$1\"\nwait\n").unwrap();
-    let mut import = Command::new(env!("CARGO_BIN_EXE_editchain"))
+    let mut import = Command::new(env!("CARGO_BIN_EXE_editchain-legacy"))
         .args(["import", "--provider", "codex", "--sessions-dir"])
         .arg(&sessions)
         .arg("--workspace")

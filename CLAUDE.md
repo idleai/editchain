@@ -25,19 +25,19 @@ cargo build -p editchain-node --bin editchain-vscode-service
 
 # Import Claude Code sessions
 cargo run --bin editchain -- import \
-  --sessions-dir /path/to/sessions \
+  --input /path/to/sessions \
   --workspace /path/to/repo \
   --chain /path/to/repo/.editchain
 
 # Import Codex rollouts through the local exporter bridge
 cargo run --bin editchain -- import --provider codex \
-  --sessions-dir ~/.codex/sessions \
+  --input ~/.codex/sessions \
   --workspace /path/to/repo \
   --chain /path/to/repo/.editchain \
   --codex-helper ./tools/codex-session-exporter/target/debug/codex-session-exporter
 
 # Pregenerate the fixed Activity-view snapshot
-cargo run --bin editchain -- prepare-view \
+cargo run -p editchain-node --bin editchain-legacy -- prepare-view \
   --workspace /path/to/repo --chain .editchain
 
 # Build and test the extension
@@ -50,10 +50,16 @@ npm run test:harness
 
 ## Architecture
 
-EditChain is a read-only VS Code history explorer backed by a native Rust
-service. The Cargo workspace has eight packages. `editchain-node` builds both
-the `editchain` CLI and the `editchain-vscode-service` stdio executable.
+EditChain is an immutable history engine with a standalone CLI and an existing
+VS Code history explorer. The `editchain` package in `crates/editchain` builds
+only the engine CLI, directly on the reusable libraries. `editchain-node` builds
+the legacy `editchain-vscode-service` and `editchain-legacy` executables pending
+the roadmap's host/viewer extraction.
 
+- `editchain`: argument parsing, terminal/pipe I/O, output formats, exit codes,
+  and process lifecycle over shared engine APIs. No node, viewer, or protocol
+  dependencies. See `docs/cli.md`.
+- `editchain-engine`: viewer-independent record facade and factual query API.
 - `editchain-core`: operation schema, identifiers, causal ordering, `OpSet`,
   chain state, and reducers.
 - `editchain-store`: canonical read-only chain access, record locations,
@@ -63,8 +69,12 @@ the `editchain` CLI and the `editchain-vscode-service` stdio executable.
   has no checksum; EC03 is a separate, currently inactive checksummed format.
 - `editchain-import`: deterministic, incremental Claude Code and Codex
   capture, cursors, and import checkpointing over store-owned persistence.
-- `editchain-node`: native coordination through its `commands`, `history`, and
-  `Server` interfaces. The CLI commands are `import` and `prepare-view`;
+- `editchain-index`: rebuildable indexes, refresh and integrity checks over
+  persisted evidence; `editchain-index-pages` owns the paged checkpoint storage.
+- `editchain-sync`: reusable operation/blob replication with caller-owned
+  transport and sharing scope.
+- `editchain-node`: legacy native coordination through its `commands`, `history`, and
+  `Server` interfaces. Its `editchain-legacy` commands are `import` and `prepare-view`;
   history owns fixed Activity windows, details/diffs, and render snapshots.
   Reconciliation, transport, and Tantivy BM25 indexing are internal modules.
 - `editchain-git`: repository catalog with explicit worktree/Git/common paths,

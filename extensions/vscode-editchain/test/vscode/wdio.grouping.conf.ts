@@ -29,7 +29,7 @@ if (!process.env.EDITCHAIN_GROUP_TEST_PREPARED) {
   message('task-live', 'live-prompt', 'Add native task grouping', 'user');
   for (let index = 0; index < 3; index++) message('task-live', `live-${index}`, `Working on task grouping ${index}`);
   fs.writeFileSync(source, records.map(record => JSON.stringify(record) + '\n').join(''));
-  execFileSync(path.join(repository, 'target/release/editchain'), ['import', '--provider', 'codex',
+  execFileSync(path.join(repository, 'target/release/editchain-legacy'), ['import', '--provider', 'codex',
     '--sessions-dir', path.join(workspace, 'sessions'), '--workspace', workspace,
     '--chain', path.join(workspace, '.editchain'),
     '--codex-helper', path.join(repository, 'tools/codex-session-exporter/target/release/codex-session-exporter')],

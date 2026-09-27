@@ -9,7 +9,7 @@ use std::path::PathBuf;
 /// Editchain CLI — subcommands and dispatch.
 #[derive(Parser, Debug)]
 #[command(
-    name = "editchain",
+    name = "editchain-legacy",
     version,
     about = "Editchain CLI — CRDT-based agent edit history"
 )]

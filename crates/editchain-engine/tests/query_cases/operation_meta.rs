@@ -10,7 +10,7 @@ use super::commit;
 use crate::{append, found, id, message, record};
 
 #[test]
-fn operation_context_retains_attribution_and_opaque_relationships_without_inference() {
+fn operation_meta_retains_attribution_and_opaque_relationships_without_inference() {
     let directory = tempfile::tempdir().unwrap();
     let engine = Engine::open(directory.path()).unwrap();
     let actor = record(
@@ -60,28 +60,26 @@ fn operation_context_retains_attribution_and_opaque_relationships_without_infere
     )
     .unwrap();
     let mut queries = engine.queries().unwrap();
-    let context = found(queries.operation_context(child.id).unwrap()).unwrap();
-    assert_eq!(context.record.operation, child);
+    let meta = found(queries.operation_meta(child.id).unwrap()).unwrap();
+    assert_eq!(meta.record.operation, child);
     assert_eq!(
-        context
-            .actor_records
+        meta.actor_records
             .iter()
             .map(|entry| &entry.operation)
             .collect::<Vec<_>>(),
         vec![&actor, &later_actor]
     );
-    assert_eq!(context.session_records.first().unwrap().operation, session);
+    assert_eq!(meta.session_records.first().unwrap().operation, session);
     assert_eq!(
-        context
-            .parents
+        meta.parents
             .iter()
             .map(|parent| parent.operation)
             .collect::<Vec<_>>(),
         vec![id(3), id(80)]
     );
-    assert_eq!(context.parents.last().unwrap().record, Lookup::Missing);
+    assert_eq!(meta.parents.last().unwrap().record, Lookup::Missing);
     assert!(
-        context.relationships.iter().any(|relation| relation.kind
+        meta.relationships.iter().any(|relation| relation.kind
             == RelationshipKind::Annotation(NoteRelationship::Rejects)
             && relation.record_ref.operation == note.id),
         "annotations remain facts, not controller decisions"
@@ -116,7 +114,7 @@ fn operation_context_retains_attribution_and_opaque_relationships_without_infere
     drop(queries.refresh().unwrap());
     assert!(
         matches!(
-            found(queries.operation_context(id(5)).unwrap())
+            found(queries.operation_meta(id(5)).unwrap())
                 .unwrap()
                 .parents
                 .first()
@@ -132,7 +130,7 @@ fn operation_context_retains_attribution_and_opaque_relationships_without_infere
     append(&engine, &[unscoped]).unwrap();
     drop(queries.refresh().unwrap());
     assert!(
-        found(queries.operation_context(id(10)).unwrap())
+        found(queries.operation_meta(id(10)).unwrap())
             .unwrap()
             .session_records
             .is_empty(),

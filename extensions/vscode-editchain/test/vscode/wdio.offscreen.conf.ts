@@ -24,7 +24,7 @@ if (!process.env.EDITCHAIN_OFFSCREEN_PREPARED) {
     if (task < 49) record('event_msg', { type: 'task_complete', turn_id: turn, last_agent_message: null });
   }
   fs.writeFileSync(source, records.map(record => JSON.stringify(record) + '\n').join(''));
-  execFileSync(path.join(repository, 'target/release/editchain'), ['import', '--provider', 'codex',
+  execFileSync(path.join(repository, 'target/release/editchain-legacy'), ['import', '--provider', 'codex',
     '--sessions-dir', path.join(workspace, 'sessions'), '--workspace', workspace,
     '--chain', path.join(workspace, '.editchain'),
     '--codex-helper', path.join(repository, 'tools/codex-session-exporter/target/release/codex-session-exporter')],

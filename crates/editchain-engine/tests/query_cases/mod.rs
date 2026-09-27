@@ -1,7 +1,7 @@
 mod content;
 mod fields;
 mod history;
-mod operation_context;
+mod operation_meta;
 mod replay;
 
 use editchain_engine::{

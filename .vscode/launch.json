@@ -6,7 +6,7 @@
       "type": "vgdb",
       "request": "launch",
 
-      "program": "${workspaceFolder}/target/debug/editchain",
+      "program": "${workspaceFolder}/target/debug/editchain-legacy",
       "cwd": "${workspaceFolder}",
       "debugger": "gdb",
 

@@ -1,6 +1,7 @@
 [package]
 name = "editchain-node"
-default-run = "editchain"
+default-run = "editchain-legacy"
+autobins = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +10,14 @@ repository.workspace = true
 readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
+
+[[bin]]
+name = "editchain-legacy"
+path = "src/bin/editchain.rs"
+
+[[bin]]
+name = "editchain-vscode-service"
+path = "src/bin/editchain-vscode-service.rs"
 
 [lints]
 workspace = true

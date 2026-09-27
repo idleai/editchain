@@ -429,7 +429,7 @@ Rollout `.jsonl.zst` archives are outside the importer's supported live input.
 Run from the repository root before opening a large workspace:
 
 ```sh
-./target/release/editchain prepare-view --workspace /absolute/workspace \
+./target/release/editchain-legacy prepare-view --workspace /absolute/workspace \
   --chain /absolute/workspace/.editchain
 ```
 
