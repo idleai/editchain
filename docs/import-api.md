@@ -102,6 +102,13 @@ remain in the editor adapter and existing human CLI (f39).
 
 ## Compatibility and checks
 
+The default payload cutoff is 16 MiB, with a 512 MiB encoded capture budget and
+32 MiB segment rollover. Existing logs and blobs remain readable. For a complete
+recapture of history imported with the old 4 KiB cutoff, use a fresh destination.
+Inline/blob placement changes encoded operation bytes, so mixing representations
+under the same operation IDs produces conflicts. Existing segments are not
+rewritten automatically.
+
 The existing CLI and `tools/codex-session-exporter` remain usable. f10 owns moving
 the exporter, switching callers and verifying native/import reconciliation.
 

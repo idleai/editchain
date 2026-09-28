@@ -1567,13 +1567,14 @@ fn legacy_cursor_migrates_once_and_survives_sessions_root_relocation() {
 #[test]
 fn full_import_preserves_raw_bytes_and_spills_blobs() {
     let dir = tempfile::tempdir().unwrap();
+    let spill_size = editchain_import::sink::INLINE_LIMIT.saturating_add(1);
     let big1 = format!(
         "{{\"type\":\"event_msg\",\"payload\":{{\"blob\":\"{}\"}}}}",
-        "x".repeat(5000)
+        "x".repeat(spill_size)
     );
     let big2 = format!(
         "{{\"type\":\"event_msg\",\"payload\":{{\"blob\":\"{}\"}}}}",
-        "y".repeat(6000)
+        "y".repeat(spill_size.saturating_add(1000))
     );
     let line1 = session_meta_line("thread-1", "PARENT-session");
     let raw_lines = [line1.clone(), big1.clone(), big2.clone()];

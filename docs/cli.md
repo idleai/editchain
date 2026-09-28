@@ -121,7 +121,7 @@ Provider identity stays explicit, including when a manifest mixes providers.
 
 Bulk runs commit after each file. A failure can leave earlier files committed;
 rerun the same command to resume. Existing source and capture limits apply per
-file (by default 1,000,000 captured operation variants and 256 MiB encoded bytes),
+file (by default 1,000,000 captured operation variants and 512 MiB encoded bytes),
 so an individual oversized file still fails. Memory used for the current capture
 is bounded by those limits; the writer also retains admission state for the chain.
 Bulk `--dry-run` streams one capture record per file followed by a summary, as a
@@ -134,6 +134,10 @@ for malformed evidence and conflicts as durable import. Successful durable runs
 emit one aggregate report with per-source counts and phase timings. `--progress`
 writes completed-file progress to stderr; malformed evidence still returns exit
 3 after processing all selected files, while conflicts return exit 4.
+
+Imports keep payloads up to 16 MiB inline and store larger payloads as blobs.
+Segments roll over at a 32 MiB target. When recapturing history imported with the
+old 4 KiB cutoff, use a fresh destination; see [import compatibility](import-api.md#compatibility-and-checks).
 
 ```sh
 editchain --chain /tmp/history export --output jsonl > evidence.jsonl
