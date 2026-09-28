@@ -50,6 +50,17 @@ pub trait BlobStorage: BlobSource {
     /// Returns size, existing-content mismatch or persistence errors. A failed
     /// publication may have committed; callers can retry the same exact bytes.
     fn put(&mut self, bytes: &[u8]) -> io::Result<BlobRef>;
+
+    /// Durably publish an ordered, caller-bounded batch of exact payloads.
+    ///
+    /// Success covers every returned reference. Failure may have published a
+    /// subset; retry the same bytes. The default retains per-payload fencing.
+    ///
+    /// # Errors
+    /// Returns validation or persistence errors with an unknown commit outcome.
+    fn put_batch(&mut self, payloads: &[&[u8]]) -> io::Result<Vec<BlobRef>> {
+        payloads.iter().map(|bytes| self.put(bytes)).collect()
+    }
 }
 
 impl BlobSource for BlobStore {
@@ -76,6 +87,21 @@ impl BlobStorage for BlobStore {
             id: ContentId::Hash256(*blake3::hash(bytes).as_bytes()),
             len,
         })
+    }
+
+    fn put_batch(&mut self, payloads: &[&[u8]]) -> io::Result<Vec<BlobRef>> {
+        let references = payloads
+            .iter()
+            .map(|bytes| {
+                Ok(BlobRef {
+                    id: ContentId::Hash256(*blake3::hash(bytes).as_bytes()),
+                    len: u32::try_from(bytes.len())
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
+                })
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        self.write_batch(payloads)?;
+        Ok(references)
     }
 }
 

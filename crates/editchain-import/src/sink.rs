@@ -11,6 +11,9 @@ use editchain_store::durable::{atomic_write, sync_parent_dir};
 use crate::error::ImportError;
 use crate::ids::hash_raw;
 
+mod buffered;
+pub use buffered::BufferedBlobSink;
+
 /// A sink for retaining typed operation variants and reporting their admission.
 pub trait OpSink {
     /// Retain a typed operation; admission is relative to this sink's evidence.
@@ -80,9 +83,10 @@ pub trait BlobSink {
     }
 }
 
-/// Inline payload threshold in the current stored representation contract.
-/// Changing this value requires versioning operation materialization.
-pub const INLINE_LIMIT: usize = 4096;
+/// Maximum payload size stored inline by the current import baseline (16 MiB).
+/// Payload placement is part of immutable operation bytes: recapture imports
+/// made with a different cutoff into a fresh chain to avoid representation conflicts.
+pub const INLINE_LIMIT: usize = 16 * 1024 * 1024;
 
 /// Choose between inline and blob storage based on payload size.
 ///
@@ -260,7 +264,7 @@ pub struct CursorValue {
 pub struct BatchLimits {
     /// Maximum distinct operation variants, including conflicting variants.
     pub operations: usize,
-    /// Maximum combined Postcard bytes of the retained variants.
+    /// Maximum combined Postcard bytes of the retained variants (default: 512 MiB).
     pub encoded_bytes: u64,
 }
 
@@ -268,7 +272,7 @@ impl Default for BatchLimits {
     fn default() -> Self {
         Self {
             operations: 1_000_000,
-            encoded_bytes: 256 * 1024 * 1024,
+            encoded_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -766,6 +770,27 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use tempfile as _;
+
+    #[test]
+    fn payloads_stay_inline_through_16_mib_then_spill_without_changing_content() {
+        let mut blobs = ContentAddressedBlobSink::new();
+        let mut bytes = vec![b'x'; 16 * 1024 * 1024];
+        assert_eq!(
+            payload_for(&bytes, &mut blobs).unwrap(),
+            payload::Payload::Inline(bytes.clone())
+        );
+        assert!(blobs.is_empty());
+        bytes.push(b'y');
+        let reference = match payload_for(&bytes, &mut blobs).unwrap() {
+            payload::Payload::Blob(reference) => Some(reference),
+            payload::Payload::Empty | payload::Payload::Inline(_) => None,
+        }
+        .expect("payloads larger than 16 MiB must spill");
+        let hash = hash_raw(&bytes);
+        assert_eq!(reference.id, ContentId::Hash256(hash));
+        assert_eq!(usize::try_from(reference.len).unwrap(), bytes.len());
+        assert_eq!(blobs.get(&hash).unwrap(), bytes);
+    }
 
     fn captured_record(bytes: &[u8]) -> Op {
         Op {

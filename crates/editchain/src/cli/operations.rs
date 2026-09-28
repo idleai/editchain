@@ -60,6 +60,7 @@ pub(super) fn append_kind(
     output.begin_stream()?;
     let mut conflict = false;
     let mut count = 0_usize;
+    let mut writer: Option<editchain_engine::ChainWriter> = None;
     input::records::<Op>(path, |operation| {
         let valid = match kind {
             Kind::Any => true,
@@ -70,7 +71,14 @@ pub(super) fn append_kind(
         if !valid {
             return Err(Failure::input("operation kind does not match this command"));
         }
-        let admission = Engine::open(chain)?.append(&operation)?;
+        let admission = if let Some(writer) = &mut writer {
+            writer.append(&operation)?
+        } else {
+            let mut owned = Engine::open(chain)?.writer()?;
+            let admission = owned.append(&operation)?;
+            writer = Some(owned);
+            admission
+        };
         conflict |= admission == Admission::Conflict;
         count = count.saturating_add(1);
         emit_admission(operation.id, admission, output)

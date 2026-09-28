@@ -34,23 +34,44 @@ pub trait DurableOpSink {
 impl<L: editchain_store::AppendLog> DurableOpSink for editchain_store::LogStore<L> {
     fn append_durable(&mut self, ops: &[Op]) -> Result<DurableAdmission, ImportError> {
         let mut result = DurableAdmission::default();
+        let mut records = Vec::new();
+        let mut bytes = 0_usize;
         for op in ops {
-            let bytes = editchain_store::format::encode_op(op).map_err(std::io::Error::other)?;
-            match self.append_encoded(&bytes)? {
-                editchain_core::Admission::Accepted => {
-                    result.written = result.written.saturating_add(1);
-                }
-                editchain_core::Admission::Duplicate => {
-                    result.duplicates = result.duplicates.saturating_add(1);
-                }
-                editchain_core::Admission::Conflict => {
-                    result.written = result.written.saturating_add(1);
-                    result.conflicts = result.conflicts.saturating_add(1);
-                }
+            let encoded = editchain_store::format::encode_op(op).map_err(std::io::Error::other)?;
+            bytes = bytes.saturating_add(encoded.len());
+            records.push(encoded);
+            if records.len() >= 1024 || bytes >= 4 * 1024 * 1024 {
+                persist_records(self, &records, &mut result)?;
+                records.clear();
+                bytes = 0;
             }
         }
+        persist_records(self, &records, &mut result)?;
         Ok(result)
     }
+}
+
+fn persist_records<L: editchain_store::AppendLog>(
+    writer: &mut editchain_store::LogStore<L>,
+    records: &[Vec<u8>],
+    result: &mut DurableAdmission,
+) -> Result<(), ImportError> {
+    let borrowed: Vec<_> = records.iter().map(Vec::as_slice).collect();
+    for admission in writer.append_encoded_batch(&borrowed)? {
+        match admission {
+            editchain_core::Admission::Accepted => {
+                result.written = result.written.saturating_add(1);
+            }
+            editchain_core::Admission::Duplicate => {
+                result.duplicates = result.duplicates.saturating_add(1);
+            }
+            editchain_core::Admission::Conflict => {
+                result.written = result.written.saturating_add(1);
+                result.conflicts = result.conflicts.saturating_add(1);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Successfully persisted operations and their corresponding checkpoints.

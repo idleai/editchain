@@ -27,7 +27,7 @@ fn retain(chain: &std::path::Path, encoded_operation: &[u8], content: &[u8])
 
 ## Contracts
 
-- `AppendLog` exposes exact record replay, append and a durability fence. The
+- `AppendLog` exposes exact record replay, append, ordered batch append and a durability fence. The
   adapter must own an exclusive writer transaction across replay and append.
   `SegmentStore` implements this with the existing lifetime file lock. Remote
   adapters must provide equivalent transaction ownership themselves.
@@ -41,6 +41,10 @@ fn retain(chain: &std::path::Path, encoded_operation: &[u8], content: &[u8])
   I/O failures return an error. `BlobStorage::put` returns a full BLAKE3 `BlobRef`
   only after durable persistence. Existing `BlobStore`/`BlobReader` convenience
   methods remain available; the adapter methods preserve I/O errors.
+  `put_batch` publishes an ordered batch with the same guarantees, sharing
+  publication fences where supported. The filesystem adapter stages cohorts of
+  at most 64 files before syncing their data and publishing their names. Failure
+  can leave a subset; exact retries verify and fence that retained content.
 
 Successful writes persist contents and publication metadata. Directory creation
 also synchronizes ancestry, so an acknowledged new chain or blob directory does
@@ -64,7 +68,7 @@ and hard links; it returns errors when those guarantees cannot be provided.
 ## Segment packing and recovery
 
 Small writes share a segment across writer reopenings.
-`SegmentOptions::max_segment_bytes` defaults to 16 MiB. Pages stay together, so
+`SegmentOptions::max_segment_bytes` defaults to 32 MiB. Pages stay together, so
 one large page can exceed this target; individual records are limited to 64 MiB.
 
 Older chains start a fresh segment before adopting this layout, recorded in
@@ -79,8 +83,17 @@ locations. Invalid framing and missing segments produce errors. Existing small
 files are not compacted.
 
 EC02 has no checksum or commit marker: recovery handles incomplete writes but
-cannot detect all corruption or make a whole page atomic. Admission still reads
-the log on each call.
+cannot detect all corruption or make a whole page atomic.
+
+Admission reads retained evidence once per exclusive `LogStore` lifetime and
+updates that evidence after successful writes. `append_encoded_batch` validates
+the complete input first and retains exact duplicate/conflict semantics within
+the batch. The filesystem adapter packs records into bounded pages, sharing
+durability fences. A successful return covers every record; a failed batch may
+leave a complete prefix and an incomplete tail. Any uncertain write or failed
+fence discards the admission cache so retry replays actual storage. Reopening a
+writer also establishes fresh evidence. This removes repeated full-log scans
+from a stream without changing immutable storage or acknowledgement semantics.
 
 ## Verification
 

@@ -140,6 +140,7 @@ fn ln(s: &str) -> Vec<u8> {
 
 /// An event line whose payload is large enough to spill to blob storage.
 fn big_event_line(token: char, size: usize) -> String {
+    let size = size.max(editchain_import::sink::INLINE_LIMIT.saturating_add(1));
     format!(
         "{{\"type\":\"event_msg\",\"payload\":{{\"blob\":\"{}\"}}}}",
         token.to_string().repeat(size)

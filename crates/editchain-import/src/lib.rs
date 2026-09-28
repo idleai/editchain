@@ -26,6 +26,8 @@ pub mod capture;
 pub mod cursor;
 /// Import error types.
 pub mod error;
+/// Discover once and capture individual files with stable provider-relative identities.
+pub mod files;
 /// Typed provider observations for host-owned Git reconciliation.
 pub mod git_evidence;
 /// Exact human archive capture and native recorder identity mappings.
@@ -53,6 +55,7 @@ pub mod codex;
 pub use capture::{capture_import, ImportSource};
 pub use cursor::*;
 pub use error::*;
+pub use files::{capture_import_file, discover_import_files, ImportFile};
 pub use ids::*;
 pub use model::*;
 pub use sink::*;

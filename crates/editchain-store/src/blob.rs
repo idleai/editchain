@@ -167,6 +167,22 @@ impl BlobStore {
             ))
         }
     }
+
+    pub(crate) fn write_batch(&mut self, payloads: &[&[u8]]) -> io::Result<()> {
+        if payloads.is_empty() {
+            return Ok(());
+        }
+        create_dir_all(&self.dir)?;
+        // Bound both open file descriptors and staged publication metadata.
+        for cohort in payloads.chunks(64) {
+            let entries: Vec<_> = cohort
+                .iter()
+                .map(|bytes| (self.path_for(&hash_raw(bytes)), *bytes))
+                .collect();
+            crate::durable::publish_batch(&entries, verify_existing)?;
+        }
+        Ok(())
+    }
 }
 
 fn verify_existing(path: &Path, data: &[u8]) -> io::Result<bool> {

@@ -7,7 +7,7 @@ use std::fs;
 
 use crc as _;
 use editchain_core::{BlobRef, ContentId};
-use editchain_store::{BlobPreviewResolution, BlobReader, BlobResolution, BlobStore};
+use editchain_store::{BlobPreviewResolution, BlobReader, BlobResolution, BlobStorage, BlobStore};
 use postcard as _;
 use proptest as _;
 use serde as _;
@@ -168,6 +168,85 @@ fn concurrent_blob_writers_ignore_interrupted_temporary_files() -> TestResult {
     equal(
         &fs::read(abandoned)?,
         &bytes.get(..7).ok_or("prefix")?.to_vec(),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn blob_batches_preserve_order_retries_and_concurrent_publication() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let mut writer = BlobStore::new(temp.path().join("blobs"))?;
+    let values: Vec<_> = (0..150)
+        .map(|n| format!("exact blob {n}\0").into_bytes())
+        .collect();
+    let mut payloads: Vec<_> = values.iter().map(Vec::as_slice).collect();
+    payloads.push(values.first().ok_or("fixture")?);
+    let expected = payloads
+        .iter()
+        .map(|bytes| reference(bytes))
+        .collect::<Result<Vec<_>, _>>()?;
+    equal(&writer.put_batch(&[])?, &Vec::new())?;
+    equal(&writer.put_batch(&payloads)?, &expected)?;
+    equal(&writer.put_batch(&payloads)?, &expected)?;
+    equal(&writer.len()?, &150)?;
+    let reader = BlobReader::open(temp.path())?;
+    for (reference, bytes) in expected.iter().zip(&payloads) {
+        equal(
+            &reader.resolve(reference),
+            &BlobResolution::Found(bytes.to_vec()),
+        )?;
+    }
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let mut writer = writer.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let _wait = barrier.wait();
+                writer.put_batch(&[
+                    b"concurrent batch\xff",
+                    b"concurrent batch\xff",
+                    b"another batch blob",
+                ])
+            })
+        })
+        .collect();
+    for worker in workers {
+        let references = worker.join().map_err(|_panic| "batch worker panicked")??;
+        equal(&references.len(), &3)?;
+    }
+    equal(&writer.len()?, &152)?;
+    Ok(())
+}
+
+#[test]
+fn failed_blob_batch_keeps_conflicting_bytes_and_replays_its_committed_prefix() -> TestResult {
+    let temp = tempfile::tempdir()?;
+    let mut writer = BlobStore::new(temp.path().join("blobs"))?;
+    let values: Vec<_> = (0..80).map(|n| format!("batch {n}").into_bytes()).collect();
+    let payloads: Vec<_> = values.iter().map(Vec::as_slice).collect();
+    let broken = payloads.get(70).ok_or("fixture")?;
+    let path = writer.path_for(blake3::hash(broken).as_bytes());
+    fs::write(&path, b"conflicting bytes")?;
+    check(
+        writer.put_batch(&payloads).is_err(),
+        "a later cohort cannot overwrite conflicting content",
+    )?;
+    equal(&fs::read(&path)?, &b"conflicting bytes".to_vec())?;
+    let first = payloads.first().ok_or("fixture")?;
+    equal(
+        &writer.resolve(&reference(first)?),
+        &BlobResolution::Found(first.to_vec()),
+    )?;
+    fs::remove_file(path)?;
+    let references = writer.put_batch(&payloads)?;
+    equal(&references.len(), &80)?;
+    equal(&writer.len()?, &80)?;
+    check(
+        fs::read_dir(writer.dir())?.all(|entry| {
+            entry.is_ok_and(|entry| !entry.file_name().to_string_lossy().contains(".tmp."))
+        }),
+        "failed and successful cohorts clean their unaddressed temporary files",
     )?;
     Ok(())
 }

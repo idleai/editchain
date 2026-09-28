@@ -29,6 +29,84 @@ pub(crate) fn publish_new(path: &Path, data: &[u8]) -> io::Result<bool> {
     publish_new_with(path, data, sync_directory_tree)
 }
 
+/// Stage a bounded cohort before synchronizing and publishing its immutable files.
+/// Existing destinations and publication races are checked by the caller.
+pub(crate) fn publish_batch(
+    entries: &[(PathBuf, &[u8])],
+    verify: impl Fn(&Path, &[u8]) -> io::Result<bool>,
+) -> io::Result<()> {
+    publish_batch_with(entries, verify, sync_directory_tree)
+}
+
+fn publish_batch_with(
+    entries: &[(PathBuf, &[u8])],
+    verify: impl Fn(&Path, &[u8]) -> io::Result<bool>,
+    sync: impl Fn(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut pending = Vec::new();
+    let mut unique = std::collections::BTreeMap::new();
+    for (path, bytes) in entries {
+        if let Some(previous) = unique.insert(path, *bytes) {
+            if previous != *bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "batch contains different bytes for one immutable destination",
+                ));
+            }
+            continue;
+        }
+        if !verify(path, bytes)? {
+            let (temporary, file) = TemporaryFile::prepare(path, bytes)?;
+            pending.push((temporary, file, path, bytes));
+        }
+    }
+    // Creating the cohort first lets file synchronization share the same
+    // filesystem journal transaction. Nothing has been acknowledged yet.
+    // Bound concurrent data fences so the filesystem can coalesce allocation
+    // and journal work. All workers finish before any final name is published.
+    std::thread::scope(|scope| -> io::Result<()> {
+        let mut workers = Vec::new();
+        for group in pending.chunks(pending.len().div_ceil(8).max(1)) {
+            workers.push(std::thread::Builder::new().spawn_scoped(
+                scope,
+                move || -> io::Result<()> {
+                    for (_, file, _, _) in group {
+                        file.sync_all()?;
+                    }
+                    Ok(())
+                },
+            )?);
+        }
+        for worker in workers {
+            worker.join().map_err(|_panic| {
+                io::Error::other("blob data synchronization worker panicked")
+            })??;
+        }
+        Ok(())
+    })?;
+    let mut directories = std::collections::BTreeSet::new();
+    for (temporary, _, path, bytes) in &pending {
+        match fs::hard_link(&temporary.path, path) {
+            Ok(()) => {
+                let _inserted = directories.insert(parent(path)?);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if !verify(path, bytes)? {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "concurrent blob publication disappeared",
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    for directory in directories {
+        sync(directory)?;
+    }
+    Ok(())
+}
+
 fn publish_new_with(
     path: &Path,
     data: &[u8],
@@ -115,6 +193,12 @@ struct TemporaryFile {
 
 impl TemporaryFile {
     fn write(path: &Path, bytes: &[u8]) -> io::Result<Self> {
+        let (temporary, file) = Self::prepare(path, bytes)?;
+        file.sync_all()?;
+        Ok(temporary)
+    }
+
+    fn prepare(path: &Path, bytes: &[u8]) -> io::Result<(Self, fs::File)> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         loop {
             let sequence = NEXT
@@ -138,8 +222,7 @@ impl TemporaryFile {
                         path: temporary_path,
                     };
                     file.write_all(bytes)?;
-                    file.sync_all()?;
-                    return Ok(temporary);
+                    return Ok((temporary, file));
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error),
@@ -213,5 +296,75 @@ mod tests {
         store.write(bytes).unwrap();
         assert_eq!(fs::read(path).unwrap(), bytes);
         assert_eq!(store.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn blob_cohort_shares_its_publication_fence_and_retries_uncertain_bytes() {
+        use crate::BlobStorage as _;
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = crate::BlobStore::new(directory.path()).unwrap();
+        let values: Vec<_> = (0..32)
+            .map(|n| format!("cohort {n}\0").into_bytes())
+            .collect();
+        let payloads: Vec<_> = values.iter().map(Vec::as_slice).collect();
+        let entries: Vec<_> = payloads
+            .iter()
+            .map(|bytes| (store.path_for(blake3::hash(bytes).as_bytes()), *bytes))
+            .collect();
+        let fences = std::cell::Cell::new(0_usize);
+        let result = publish_batch_with(
+            &entries,
+            |_path, _bytes| Ok(false),
+            |_parent| {
+                fences.set(fences.get().saturating_add(1));
+                Err(io::Error::other("injected cohort directory sync failure"))
+            },
+        );
+        assert!(
+            result.is_err(),
+            "readable bytes cannot acknowledge a failed cohort"
+        );
+        assert_eq!(
+            fences.get(),
+            1,
+            "one publication fence covers the directory cohort"
+        );
+        for (path, bytes) in &entries {
+            assert_eq!(fs::read(path).unwrap(), *bytes);
+        }
+        let references = store.put_batch(&payloads).unwrap();
+        assert_eq!(references.len(), 32);
+        assert_eq!(store.len().unwrap(), 32);
+        for (reference, bytes) in references.iter().zip(&payloads) {
+            assert_eq!(
+                store.resolve(reference),
+                crate::BlobResolution::Found(bytes.to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn cohort_deduplicates_exact_payloads_before_staging_and_rejects_collisions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("one-destination");
+        let entries = vec![(path.clone(), b"same bytes".as_slice()); 32];
+        let visits = std::cell::Cell::new(0_usize);
+        publish_batch(&entries, |_path, _bytes| {
+            visits.set(visits.get().saturating_add(1));
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(
+            visits.get(),
+            1,
+            "duplicates cannot produce extra temporary-file IO"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"same bytes");
+        let collision = vec![
+            (path.clone(), b"first".as_slice()),
+            (path.clone(), b"different".as_slice()),
+        ];
+        assert!(publish_batch(&collision, |_path, _bytes| Ok(true)).is_err());
+        assert_eq!(fs::read(path).unwrap(), b"same bytes");
     }
 }

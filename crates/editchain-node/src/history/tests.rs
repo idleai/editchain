@@ -522,8 +522,8 @@ fn open_previews_blobs_and_hydrates_details_and_search_on_demand() {
     fs::create_dir_all(&workspace_path).unwrap();
     let chain_dir = workspace_path.join(".editchain");
 
-    // Payloads well past INLINE_LIMIT (4096) so the importer would spill
-    // them into durable blobs.
+    // Explicit blob references also cover histories imported with the old
+    // 4 KiB cutoff; hydration is independent of the current import threshold.
     let msg_content = format!("needle-hydrated-message {}", "x".repeat(8192)).into_bytes();
     let tool_content = format!("needle-hydrated-tool {}", "y".repeat(8192)).into_bytes();
     let raw_content = format!("needle-hydrated-raw {}", "z".repeat(8192)).into_bytes();

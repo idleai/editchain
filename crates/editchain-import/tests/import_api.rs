@@ -903,9 +903,10 @@ fn human_raw_capture_retains_unknown_records_whitespace_and_spilled_evidence() -
     let first = *records(HUMAN).first().ok_or("empty fixture")?;
     let line = format!(
         " {}\r\n",
-        std::str::from_utf8(first)?
-            .trim_end()
-            .replace("1.90.0", &"x".repeat(5000))
+        std::str::from_utf8(first)?.trim_end().replace(
+            "1.90.0",
+            &"x".repeat(editchain_import::sink::INLINE_LIMIT.saturating_add(1))
+        )
     );
     let bytes = format!("{line}\r\n{{broken\n");
     std::fs::write(&path, &bytes)?;

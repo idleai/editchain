@@ -1,5 +1,6 @@
 //! Provider-neutral capture through the shared import and persistence APIs.
 
+mod bulk;
 mod repositories;
 
 use std::{
@@ -21,7 +22,10 @@ use super::{
     output::Output,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "lowercase")]
 enum Provider {
     Claude,
     Codex,
@@ -31,8 +35,14 @@ enum Provider {
 #[derive(Debug, clap::Args)]
 pub(super) struct Args {
     /// Native provider JSONL file/directory, or - for stdin. Uses shared capture APIs.
-    #[arg(long)]
-    input: PathBuf,
+    #[arg(
+        long,
+        required_unless_present = "manifest",
+        conflicts_with = "manifest"
+    )]
+    input: Option<PathBuf>,
+    #[command(flatten)]
+    selection: BulkSelection,
     /// Stable JSONL filename for stdin, preserving source identity across retries.
     #[arg(long, required_if_eq("input", "-"), requires = "input")]
     source_name: Option<String>,
@@ -61,6 +71,28 @@ pub(super) struct Args {
     include_thinking: bool,
 }
 
+#[derive(Debug, clap::Args)]
+struct BulkSelection {
+    /// JSON bulk-source manifest; all providers share one durable writer.
+    #[arg(long, conflicts_with_all = ["glob", "bulk", "codex_rollout", "source_name", "recorded_root", "provider"])]
+    manifest: Option<PathBuf>,
+    /// Select discovered files by a quoted glob relative to --input; repeatable.
+    #[arg(long, requires = "input", action = clap::ArgAction::Append)]
+    glob: Vec<String>,
+    /// Capture and commit one file at a time while retaining one writer.
+    #[arg(long, requires = "input")]
+    bulk: bool,
+    /// Print completed bulk files and elapsed time to stderr.
+    #[arg(long)]
+    progress: bool,
+}
+
+impl BulkSelection {
+    fn enabled(&self) -> bool {
+        self.bulk || !self.glob.is_empty() || self.manifest.is_some()
+    }
+}
+
 pub(super) fn run(
     chain: &Path,
     args: &Args,
@@ -71,8 +103,15 @@ pub(super) fn run(
     let mut options = options.clone();
     options.normalize = !args.raw_only;
     options.include_thinking = args.include_thinking;
+    if args.selection.enabled() {
+        return bulk::run(chain, args, &options, output);
+    }
     let report = capture(chain, args, &options)?;
     output.emit(&report)?;
+    finish_report(&report)
+}
+
+fn finish_report(report: &serde_json::Value) -> Result<()> {
     if report
         .get("conflicts")
         .and_then(serde_json::Value::as_u64)
@@ -94,7 +133,13 @@ pub(super) fn run(
 }
 
 fn validate(args: &Args) -> Result<()> {
-    if args.provider != Provider::Codex
+    if args.selection.progress && !args.selection.enabled() {
+        return Err(Failure::input(
+            "--progress requires --bulk, --glob, or --manifest",
+        ));
+    }
+    if args.selection.manifest.is_none()
+        && args.provider != Provider::Codex
         && (args.codex_helper.is_some()
             || !args.codex_helper_arg.is_empty()
             || !args.codex_rollout.is_empty())
@@ -116,10 +161,13 @@ struct Source {
 
 impl Source {
     fn prepare(args: &Args, options: &ImportOptions) -> Result<Self> {
-        let path = &args.input;
+        let path = args
+            .input
+            .as_deref()
+            .ok_or_else(|| Failure::input("import requires --input or --manifest"))?;
         if path != Path::new("-") && !(path.is_file() && args.provider == Provider::Claude) {
             return Ok(Self {
-                path: path.clone(),
+                path: path.to_owned(),
                 _temporary: None,
             });
         }
@@ -180,7 +228,9 @@ fn capture(chain: &Path, args: &Args, options: &ImportOptions) -> Result<serde_j
     }
     // Serialize cursor reservations with capture and durable operation admission.
     let store = editchain_store::SegmentStore::open(chain)?;
-    let mut blobs = editchain_import::FsBlobSink::new(chain.join("blobs"))?;
+    let mut blobs = editchain_import::BufferedBlobSink::new(editchain_import::FsBlobSink::new(
+        chain.join("blobs"),
+    )?);
     let mut cursors = editchain_import::FsCursorStore::new(chain.join("cursors"))?;
     let batch = capture_batch(
         chain,
@@ -190,6 +240,7 @@ fn capture(chain: &Path, args: &Args, options: &ImportOptions) -> Result<serde_j
         &mut (&mut blobs, &cursors),
     )?;
     options.cancellation.check(&source.path)?;
+    blobs.flush()?;
     let outcome = batch.persist(&mut editchain_store::LogStore::new(store), &mut cursors)?;
     let mut result = report_value(&outcome.report);
     drop(result.insert("written".into(), outcome.admission.written.into()));
