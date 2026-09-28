@@ -58,6 +58,9 @@ own stable IDs instead of copying the example's fixed identities.
 | --- | --- |
 | `Engine::append(&Op)` | Encode a newly authored operation and durably retain it |
 | `Engine::append_encoded(&[u8])` | Validate and retain original encoded bytes without re-encoding |
+| `Engine::writer()` | Hold exclusive ownership across repeated appends and blob writes |
+| `ChainWriter::append_encoded_batch(&[&[u8]])` | Durably admit a caller-bounded batch in input order |
+| `ChainWriter::store_blobs(&[&[u8]])` | Durably publish an ordered batch of exact payloads |
 | `Engine::snapshot()` | Read accepted operations, evidence, and integrity counts |
 | `ChainSnapshot::read(path)` | Read without creating files; a missing chain is empty |
 | `snapshot.get(id)` / `operations()` | Accepted operations in deterministic operation-ID order |
@@ -79,7 +82,11 @@ Use `append_encoded` for imported or replicated evidence. Re-encoding accepted
 operations would lose original encodings and omit conflicts; replay the exact
 evidence iterator when copying decodable history.
 
-Each append acquires the existing writer lock and reads current admission state.
+Each standalone engine append acquires the writer lock and reads current admission state.
+For a stream, retain `Engine::writer()` to reuse admission evidence across writes.
+The writer invalidates this evidence after uncertain persistence and releases
+the lock when dropped. Successful batches are durable as a whole, but failures
+may leave a prefix; later conflicting entries can quarantine earlier acceptances.
 Competing writers receive `WouldBlock` and can retry. Success follows storage
 synchronization; duplicate retries resynchronize retained evidence in case an
 earlier write reached the filesystem but failed during sync. An error can leave
@@ -106,7 +113,9 @@ newline normalization, truncation, or metadata interpretation occurs in these
 APIs. Existing bytes that disagree with their content address are left untouched
 and produce an error on a repeated write.
 
-The facade performs a full canonical read per append or snapshot. For indexed
+Standalone appends scan admission evidence, and snapshots read the full chain.
+Streaming writers amortize that scan across their lifetime; see
+[large-history write paths](scaling.md). For indexed
 history, search, content, diff, Git, and operation metadata, use `Engine::queries()`
 or `queries::ChainQueries::from_index(index)`. The [query guide](engine-queries.md)
 describes record references, pagination, refresh, and explicit content gaps.

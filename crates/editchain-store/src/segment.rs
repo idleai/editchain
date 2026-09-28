@@ -14,14 +14,14 @@ const PACKING_VERSION: &[u8] = b"EC02-packed-v1\n";
 #[derive(Debug, Clone, Copy)]
 pub struct SegmentOptions {
     /// Target maximum bytes per segment. Whole pages stay together; one page
-    /// may exceed this limit. Must be nonzero. Defaults to 16 MiB.
+    /// may exceed this limit. Must be nonzero. Defaults to 32 MiB.
     pub max_segment_bytes: u64,
 }
 
 impl Default for SegmentOptions {
     fn default() -> Self {
         Self {
-            max_segment_bytes: 16 * 1024 * 1024,
+            max_segment_bytes: 32 * 1024 * 1024,
         }
     }
 }
@@ -399,9 +399,30 @@ impl AppendLog for SegmentStore {
     }
 
     fn append_record(&mut self, flags: u8, encoded: &[u8]) -> io::Result<()> {
+        self.append_records(&[(flags, encoded)])
+    }
+
+    fn append_records(&mut self, records: &[(u8, &[u8])]) -> io::Result<()> {
         let mut page = Page::new(self.next_seq);
-        page.add_record(flags, encoded.to_vec());
-        self.append_page(&page)
+        let mut length = 8_u64;
+        for (flags, encoded) in records {
+            let added = u64::try_from(encoded.len())
+                .map_err(io::Error::other)?
+                .saturating_add(5);
+            if !page.records.is_empty()
+                && length.saturating_add(added) > self.options.max_segment_bytes
+            {
+                self.append_page(&page)?;
+                page = Page::new(self.next_seq);
+                length = 8;
+            }
+            page.add_record(*flags, encoded.to_vec());
+            length = length.saturating_add(added);
+        }
+        if !page.records.is_empty() {
+            self.append_page(&page)?;
+        }
+        Ok(())
     }
 
     fn sync(&self) -> io::Result<()> {

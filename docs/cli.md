@@ -62,7 +62,7 @@ rewriting records or blobs.
 
 ## Imports and archives
 
-Provider `--input` is required and accepts a file, directory or stdin. Give stdin
+Provider `--input` accepts a file, directory or stdin. Give stdin
 a stable `.jsonl` filename for resumable imports; Codex names start with `rollout-`.
 
 ```sh
@@ -78,6 +78,62 @@ changing storage or cursors, `--raw-only` skips normalization, and
 admission; incomplete final lines wait for the next import. Human capture retains
 raw evidence and identity links; editor replay and viewer checkpoints remain in
 `editchain-legacy`.
+
+For large directories, add a quoted `--glob` (repeatable) or `--bulk` to capture
+and commit one file at a time while keeping one writer open:
+
+```sh
+editchain --chain /tmp/history import --provider codex \
+  --input /archive/codex --glob '**/*.jsonl' \
+  --workspace /original/repository --codex-helper codex-session-exporter --progress
+```
+
+Globs filter the provider's normal discovery results. Relative globs are relative
+to `--input`; absolute globs are also accepted. Overlapping globs select a file
+once. Keep the same input root across retries so provider-relative source IDs
+remain stable. No matches are an input error before storage is opened.
+
+Use `--manifest sources.json` instead of `--input` and `--provider` to import
+multiple providers or recorded workspaces in one process:
+
+```json
+{
+  "schema": 1,
+  "sources": [
+    {"provider": "claude", "input": "cc", "glob": ["**/*.jsonl"]},
+    {"provider": "codex", "input": "codex", "glob": ["**/*.jsonl"],
+     "workspace": "/original/repository"},
+    {"provider": "human", "input": "human", "glob": ["**/*.jsonl"],
+     "recorded_root": "/original/repository"}
+  ]
+}
+```
+
+```sh
+editchain --chain /tmp/history import --manifest sources.json \
+  --codex-helper codex-session-exporter --progress
+```
+
+Manifest inputs are directories, resolved relative to the manifest's directory.
+Each source can additionally specify `paths`, an exact list relative to its input
+root; globs then filter that list. `workspace` defaults to the CLI's `--workspace`.
+Provider identity stays explicit, including when a manifest mixes providers.
+
+Bulk runs commit after each file. A failure can leave earlier files committed;
+rerun the same command to resume. Existing source and capture limits apply per
+file (by default 1,000,000 captured operation variants and 256 MiB encoded bytes),
+so an individual oversized file still fails. Memory used for the current capture
+is bounded by those limits; the writer also retains admission state for the chain.
+Bulk `--dry-run` streams one capture record per file followed by a summary, as a
+JSON array or JSONL, without creating the destination. Capture reports describe
+each file independently; the summary counts exact duplicates and conflicts
+across all captured files and manifest sources, retaining admission evidence in
+memory. Preview uses fresh capture state and does not read destination cursors
+or operations. Its summary reports zero writes and uses the same exit codes
+for malformed evidence and conflicts as durable import. Successful durable runs
+emit one aggregate report with per-source counts and phase timings. `--progress`
+writes completed-file progress to stderr; malformed evidence still returns exit
+3 after processing all selected files, while conflicts return exit 4.
 
 ```sh
 editchain --chain /tmp/history export --output jsonl > evidence.jsonl

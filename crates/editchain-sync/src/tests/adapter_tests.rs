@@ -13,6 +13,7 @@ use crate::{
 
 mod failures;
 mod policy;
+mod scale;
 
 type DiskReplica = StoreReplica<SegmentStore, BlobStore, ExportScope>;
 type DiskPeer = PeerConnection<DiskReplica, Wire>;

@@ -5,6 +5,7 @@ use ctrlc as _;
 use editchain_git as _;
 use editchain_import as _;
 use editchain_index as _;
+use glob as _;
 use serde as _;
 
 use std::{
@@ -21,6 +22,9 @@ use serde_json::{json, Value};
 
 #[path = "streams.rs"]
 mod cli_streams;
+
+#[path = "bulk.rs"]
+mod bulk;
 
 fn message(sequence: u64, content: Payload) -> Op {
     Op {
@@ -623,6 +627,72 @@ fn archive_rejects_blob_tampering_and_reports_truncated_input() {
     );
     drop(writer);
     append(temp.path(), &message(1, Payload::Empty));
+}
+
+#[test]
+fn archive_batches_preserve_reply_order_conflicts_and_exact_replay() {
+    let directory = tempfile::tempdir().unwrap();
+    let chain = directory.path().join("restored");
+    let _engine = Engine::open(&chain).unwrap();
+    let payload = b"\0\xffarchive content\r\n";
+    let reference = BlobRef {
+        id: ContentId::Hash256(*blake3::hash(payload).as_bytes()),
+        len: u32::try_from(payload.len()).unwrap(),
+    };
+    let mut entries = vec![json!({"type":"header","version":1})];
+    for sequence in 0..2050 {
+        let content = if sequence == 1024 {
+            Payload::Blob(reference)
+        } else {
+            Payload::Inline(b"exact record".to_vec())
+        };
+        entries.push(json!({"type":"operation", "encoded":editchain_engine::encode_op(&message(sequence, content)).unwrap()}));
+        if sequence == 1024 {
+            entries.push(json!({"type":"blob","reference":reference,"bytes":payload}));
+        }
+    }
+    entries.push(json!({"type":"operation", "encoded":editchain_engine::encode_op(&message(1, Payload::Inline(b"conflict across batches".to_vec()))).unwrap()}));
+    entries.push(json!({"type":"summary","stats":{"records":2051,"accepted":2049,"duplicates":0,"quarantined":2}}));
+    let path = directory.path().join("archive.jsonl");
+    let mut file = std::fs::File::create(&path).unwrap();
+    for entry in entries {
+        serde_json::to_writer(&mut file, &entry).unwrap();
+        file.write_all(b"\n").unwrap();
+    }
+    drop(file);
+    let args = ["append", "--archive", "--input", path.to_str().unwrap()];
+    let replies = result(&chain, &args, b"", 4);
+    let replies = replies.as_array().unwrap();
+    assert_eq!(replies.len(), 2052);
+    assert_eq!(
+        replies.get(1024).unwrap()["operation"],
+        json!(message(1024, Payload::Empty).id)
+    );
+    assert_eq!(replies.get(1025).unwrap()["blob"], json!(reference));
+    assert_eq!(replies.last().unwrap()["admission"], "conflict");
+    let before = editchain_engine::ChainSnapshot::read(&chain).unwrap();
+    assert_eq!(before.stats().records, 2051);
+    assert_eq!(before.stats().quarantined, 2);
+    let pages = editchain_store::SegmentStore::open(&chain)
+        .unwrap()
+        .read_all()
+        .unwrap();
+    assert_eq!(pages.len(), 3, "restoration uses bounded durable batches");
+    let replay = result(&chain, &args, b"", 0);
+    assert_eq!(replay.as_array().unwrap().len(), 2052);
+    assert_eq!(
+        editchain_engine::ChainSnapshot::read(&chain)
+            .unwrap()
+            .evidence(),
+        before.evidence()
+    );
+    assert_eq!(
+        Engine::open(&chain)
+            .unwrap()
+            .resolve_blob(&reference)
+            .unwrap(),
+        editchain_engine::BlobResolution::Found(payload.to_vec())
+    );
 }
 
 #[cfg(unix)]

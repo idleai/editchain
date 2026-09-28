@@ -258,3 +258,39 @@ fn interrupted_tails_and_unknown_records_survive_subsequent_appends() {
     assert_eq!(std::fs::read(segment).unwrap(), interrupted);
     assert_eq!(snapshot.get(original.id), Some(&original));
 }
+
+#[test]
+fn streaming_writer_owns_admission_and_content_until_drop() {
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Engine::open(directory.path()).unwrap();
+    let mut writer = engine.writer().unwrap();
+    let first = operation(1, b"streamed evidence");
+    assert_eq!(writer.append(&first).unwrap(), Admission::Accepted);
+    assert_eq!(
+        engine.append(&first).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let bytes = b"writer-owned binary\0\xff";
+    let blob = writer.store_blob(bytes).unwrap();
+    assert_eq!(
+        engine.resolve_blob(&blob).unwrap(),
+        BlobResolution::Found(bytes.to_vec())
+    );
+    let original = encode_op(&first).unwrap();
+    let changed = encode_op(&operation(1, b"conflict")).unwrap();
+    let other = encode_op(&operation(2, b"next")).unwrap();
+    assert_eq!(
+        writer
+            .append_encoded_batch(&[&original, &changed, &other])
+            .unwrap(),
+        vec![
+            Admission::Duplicate,
+            Admission::Conflict,
+            Admission::Accepted
+        ]
+    );
+    assert_eq!(engine.snapshot().unwrap().stats().quarantined, 2);
+    drop(writer);
+    assert_eq!(engine.append_encoded(&other).unwrap(), Admission::Duplicate);
+    assert_eq!(engine.snapshot().unwrap().stats().records, 3);
+}

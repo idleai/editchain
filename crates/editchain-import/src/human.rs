@@ -165,6 +165,17 @@ pub fn import_human(
 ) -> Result<ImportReport, ImportError> {
     options.cancellation.check(&request.source)?;
     let files = archives(&request.source, &options.cancellation)?;
+    import_human_files((request, &files), options, ops, blobs, cursors)
+}
+
+pub(crate) fn import_human_files(
+    selection: (&HumanImportRequest, &[PathBuf]),
+    options: &ImportOptions,
+    ops: &mut dyn OpSink,
+    blobs: &mut dyn BlobSink,
+    cursors: &mut dyn CursorStore,
+) -> Result<ImportReport, ImportError> {
+    let (request, files) = selection;
     let root = if request.source.is_file() {
         request.source.parent().unwrap_or_else(|| Path::new(""))
     } else {
@@ -175,16 +186,16 @@ pub fn import_human(
         ..ImportReport::default()
     };
     for path in files {
-        options.cancellation.check(&path)?;
+        options.cancellation.check(path)?;
         // A caller selecting another recorded root must not inherit a cursor
         // that previously skipped those records. Raw identities remain shared.
         let provider = request.recorded_root.as_ref().map_or_else(
             || "human".to_owned(),
             |root| format!("human:root:{}", blake3::hash(root.as_bytes())),
         );
-        let resolved = resolve_source_cursor(cursors, &provider, root, &path, "")?;
+        let resolved = resolve_source_cursor(cursors, &provider, root, path, "")?;
         let plan = SourceReadPlan::capture_controlled(
-            &path,
+            path,
             resolved.cursor.as_ref(),
             cursors.get_generation(&resolved.state_key)?,
             cursors.get_reservation(&resolved.canonical_key)?.as_ref(),
@@ -196,7 +207,7 @@ pub fn import_human(
         report.files_processed = report.files_processed.saturating_add(1);
         let stream = SourceStream::new(resolved.source_node, plan.generation());
         for (index, line) in plan.lines().iter().enumerate() {
-            options.cancellation.check(&path)?;
+            options.cancellation.check(path)?;
             let record = HumanArchiveRecord::parse(&line.data);
             if request.recorded_root.as_ref().is_some_and(|root| {
                 record
@@ -223,7 +234,7 @@ pub fn import_human(
         }
         let mut checkpoint = plan.checkpoint().clone();
         checkpoint.source_node = Some(resolved.source_node);
-        options.cancellation.check(&path)?;
+        options.cancellation.check(path)?;
         cursors.set_generation(&resolved.canonical_key, plan.generation())?;
         cursors.set_cursor(&resolved.canonical_key, &checkpoint)?;
     }
@@ -297,7 +308,7 @@ fn occurrence(
     })
 }
 
-fn archives(
+pub(crate) fn archives(
     source: &Path,
     cancellation: &crate::cancellation::ImportCancellation,
 ) -> Result<Vec<PathBuf>, ImportError> {

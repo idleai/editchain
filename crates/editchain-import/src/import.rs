@@ -28,14 +28,6 @@ const CLAUDE_PROVIDER_TOPOLOGY_VERSION: u32 = 2;
 /// # Errors
 ///
 /// Returns `ImportError` if session discovery, reading, or normalization fails.
-#[expect(
-    clippy::arithmetic_side_effects,
-    reason = "counter increments are bounded by file/op counts"
-)]
-#[expect(
-    clippy::as_conversions,
-    reason = "usize to u64 is safe on all supported platforms"
-)]
 pub fn import_claude_code(
     request: &DiscoveryRequest,
     options: &ImportOptions,
@@ -44,15 +36,35 @@ pub fn import_claude_code(
     cursors: &mut dyn CursorStore,
 ) -> Result<ImportReport, ImportError> {
     options.cancellation.check(&request.sessions_dir)?;
-    let mut report = ImportReport::new();
-
-    // Discover session files.
     let sessions = discover_sessions(&request.sessions_dir).map_err(ImportError::OpSink)?;
+    import_claude_sessions((request, &sessions), options, ops, blobs, cursors)
+}
+
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "counter increments are bounded by file/op counts"
+)]
+#[expect(
+    clippy::as_conversions,
+    reason = "usize to u64 is safe on all supported platforms"
+)]
+pub(crate) fn import_claude_sessions(
+    selection: (
+        &DiscoveryRequest,
+        &[crate::claude_code::discover::SessionFile],
+    ),
+    options: &ImportOptions,
+    ops: &mut dyn OpSink,
+    blobs: &mut dyn BlobSink,
+    cursors: &mut dyn CursorStore,
+) -> Result<ImportReport, ImportError> {
+    let (request, sessions) = selection;
+    let mut report = ImportReport::new();
     report.files_discovered = sessions.len();
 
     let workspace_str = request.workspace_path.to_str().unwrap_or("/workspace");
 
-    for session in &sessions {
+    for session in sessions {
         // Resolve the provider-relative cursor key. If this chain predates that
         // contract, the exact absolute-path cursor is migrated while retaining
         // the node that already owns its immutable operation IDs.

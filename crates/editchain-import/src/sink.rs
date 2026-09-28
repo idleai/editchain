@@ -11,6 +11,9 @@ use editchain_store::durable::{atomic_write, sync_parent_dir};
 use crate::error::ImportError;
 use crate::ids::hash_raw;
 
+mod buffered;
+pub use buffered::BufferedBlobSink;
+
 /// A sink for retaining typed operation variants and reporting their admission.
 pub trait OpSink {
     /// Retain a typed operation; admission is relative to this sink's evidence.

@@ -37,7 +37,24 @@ For Claude, use `ImportSource::Claude(&DiscoveryRequest)`. For Codex, use
 `HelperCommand`. The sinks choose the destination; `DiscoveryRequest::chain_dir`
 is retained for compatibility.
 
+For collections too large for one `ImportBatch`, call `discover_import_files`
+once, optionally filter the returned `ImportFile` values by `path()`, then call
+`capture_import_file` and `persist` for each file using the same `LogStore`.
+Keep the original `ImportSource` root throughout discovery and capture: this
+preserves source identities, nested Claude parents, and spawn sidecar metadata.
+Each file gets its own checkpoint overlay and the ordinary source/batch limits.
+The writer retains admission state across files. Files committed before a later
+failure remain durable; retry the original selection with the same cursors.
+The [CLI's glob and manifest modes](cli.md#imports-and-archives) use these APIs.
+
 ## Cursors and retries
+
+For large captures, `BufferedBlobSink::new(durable_blob_adapter)` groups payload
+publication in bounded cohorts. Call `flush()` successfully before
+`ImportBatch::persist`: capture-time references alone do not acknowledge durable
+content. A failed flush retains pending bytes for retry. The CLI follows this
+ordering automatically; callers using `FsBlobSink` directly retain its immediate
+per-payload durability behavior.
 
 - Capture exposes operations, counts and `proposed_cursors()` without advancing
   accepted cursors. Dropping the batch discards its checkpoints; blobs may already

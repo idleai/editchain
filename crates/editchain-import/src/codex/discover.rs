@@ -68,7 +68,7 @@ fn is_rollout_name(path: &Path) -> bool {
 }
 
 /// Select changed files without changing the provider-relative cursor root.
-pub(super) fn selected_rollouts(
+pub(crate) fn selected_rollouts(
     root: &Path,
     selected: &[PathBuf],
 ) -> Result<Vec<RolloutFile>, String> {

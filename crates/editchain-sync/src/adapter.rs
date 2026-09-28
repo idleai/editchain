@@ -1,5 +1,6 @@
 //! Replication over portable append-log and blob adapters.
 
+use std::cell::{Ref, RefCell};
 use std::collections::BTreeSet;
 use std::io;
 
@@ -115,12 +116,18 @@ pub struct StoreReplica<L, B, P> {
     log: L,
     blobs: B,
     policy: P,
+    retained: RefCell<Option<Snapshot>>,
 }
 
 impl<L: AppendLog, B: BlobStorage, P: ExportPolicy> StoreReplica<L, B, P> {
     /// Bind existing storage to the caller's already approved policy.
     pub const fn new(log: L, blobs: B, policy: P) -> Self {
-        Self { log, blobs, policy }
+        Self {
+            log,
+            blobs,
+            policy,
+            retained: RefCell::new(None),
+        }
     }
 
     /// Return adapters and policy, for local writes or a later connection.
@@ -130,13 +137,31 @@ impl<L: AppendLog, B: BlobStorage, P: ExportPolicy> StoreReplica<L, B, P> {
 
     fn records(&self, exporting: bool) -> io::Result<Snapshot> {
         self.ensure_scope()?;
+        // A new reconciliation round always fences retained evidence, even
+        // when reusing this adapter after an uncertain prior acknowledgement.
+        if let Err(error) = self.log.sync() {
+            *self.retained.borrow_mut() = None;
+            return Err(error);
+        }
+        self.retained()?
+            .filtered(|key, bytes| Ok(!exporting || self.policy.share_record(key, bytes)?))
+    }
+
+    fn retained(&self) -> io::Result<Ref<'_, Snapshot>> {
+        let missing = self.retained.borrow().is_none();
+        if missing {
+            let snapshot = self.read_retained()?;
+            *self.retained.borrow_mut() = Some(snapshot);
+        }
+        Ref::filter_map(self.retained.borrow(), Option::as_ref)
+            .map_err(|_absent| invalid("missing retained replication evidence"))
+    }
+
+    fn read_retained(&self) -> io::Result<Snapshot> {
         self.log.sync()?;
         let mut snapshot = Snapshot::default();
         let _stats = self.log.visit_records(&mut |_flags, bytes| {
-            let key = RecordKey::from_encoded(bytes)?;
-            if !exporting || self.policy.share_record(key, bytes)? {
-                let _key = snapshot.insert_encoded(bytes.to_vec())?;
-            }
+            let _key = snapshot.insert_encoded(bytes.to_vec())?;
             Ok(())
         })?;
         Ok(snapshot)
@@ -226,19 +251,33 @@ impl<L: AppendLog, B: BlobStorage, P: ExportPolicy> ReplicationStorage for Store
         snapshot: &mut Snapshot,
     ) -> io::Result<()> {
         crate::storage::validate_records(records)?;
-        // Re-read after every uncertain write. Never let an optimistic cache
-        // skip publication or suppress a conflicting representation.
-        let mut known = self.receiving_snapshot()?;
+        self.ensure_scope()?;
+        drop(self.retained()?);
+        // Remove cached evidence before fallible writes. A partial commit must
+        // be rediscovered and fenced before a later receipt can acknowledge it.
+        let mut known = self
+            .retained
+            .get_mut()
+            .take()
+            .ok_or_else(|| invalid("missing retained replication evidence"))?;
+        let mut pending = Vec::new();
+        let mut duplicate = false;
         for (key, bytes) in records {
             if let Some(previous) = known.record(*key) {
                 if previous != bytes {
                     return Err(invalid("record digest collision"));
                 }
+                duplicate = true;
             } else {
-                self.log.append_record(0, bytes)?;
+                pending.push((0, bytes.as_slice()));
                 let _key = known.insert_encoded(bytes.clone())?;
             }
         }
+        if duplicate {
+            self.log.sync()?;
+        }
+        self.log.append_records(&pending)?;
+        *self.retained.get_mut() = Some(known);
         for (_, bytes) in records {
             let _key = snapshot.insert_encoded(bytes.clone())?;
         }
@@ -263,8 +302,10 @@ impl<L: AppendLog, B: BlobStorage, P: ExportPolicy> ReplicationStorage for Store
     }
 
     fn ingest_blob(&mut self, key: RecordKey, hash: [u8; 32], bytes: &[u8]) -> io::Result<()> {
-        let snapshot = self.receiving_snapshot()?;
-        let references = self.references(&snapshot, key, false)?;
+        let references = {
+            let retained = self.retained()?;
+            self.references(&retained, key, false)?
+        };
         validate_content(&references, hash, bytes)?;
         self.publish_blob(hash, bytes)
     }

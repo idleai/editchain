@@ -81,6 +81,19 @@ impl Snapshot {
         Ok(key)
     }
 
+    pub(crate) fn filtered(
+        &self,
+        mut permits: impl FnMut(RecordKey, &[u8]) -> io::Result<bool>,
+    ) -> io::Result<Self> {
+        let mut result = Self::default();
+        for (key, bytes) in &self.records {
+            if permits(*key, bytes)? {
+                drop(result.records.insert(*key, Arc::clone(bytes)));
+            }
+        }
+        Ok(result)
+    }
+
     pub(crate) fn ordered_keys(&self) -> io::Result<Vec<RecordKey>> {
         crate::inventory::parent_first(&self.records)
     }

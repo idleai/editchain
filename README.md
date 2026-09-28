@@ -28,6 +28,9 @@ The [history import API](./docs/import-api.md) exposes Claude, Codex and human
 archive capture with resumable cursors, exact raw evidence and native identity
 mappings. Inspect a capture batch, then accept it through durable storage adapters.
 
+See [large-history write paths](docs/scaling.md) for streaming writers, durable
+batches, replication caching, and the costs that remain proportional to history.
+
 ## CLI
 
 The `editchain` package in `crates/editchain` builds the `editchain` binary directly
@@ -38,6 +41,8 @@ or host protocol crates.
 cargo install --locked --path crates/editchain
 editchain --chain /path/to/chain init
 editchain --chain /path/to/chain import --provider claude --input /path/to/sessions
+editchain --chain /path/to/chain import --provider codex --input /path/to/codex \
+  --glob '**/*.jsonl' --workspace /original/repository --progress
 editchain --chain /path/to/chain history --output jsonl
 ```
 

@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeSet, path::Path};
 
-use editchain_engine::{Admission, BlobRef, ChainSnapshot, ContentId, Engine};
+use editchain_engine::{Admission, BlobRef, ChainSnapshot, ChainWriter, ContentId, Engine, OpId};
 use editchain_sync::ReplicationStorage;
 use serde::{Deserialize, Serialize};
 
@@ -96,7 +96,13 @@ pub(super) fn export(chain: &Path, output: &mut Output) -> Result<()> {
 
 pub(super) fn restore(chain: &Path, path: &Path, output: &mut Output) -> Result<()> {
     require_chain(chain)?;
-    let engine = Engine::open(chain)?;
+    let mut batch = RestoreBatch {
+        writer: Engine::open(chain)?.writer()?,
+        records: Vec::new(),
+        blobs: Vec::new(),
+        replies: Vec::new(),
+        bytes: 0,
+    };
     let mut header = false;
     let mut summary = false;
     let mut conflict = false;
@@ -119,10 +125,10 @@ pub(super) fn restore(chain: &Path, path: &Path, output: &mut Output) -> Result<
             Entry::Operation { encoded } => {
                 let operation = editchain_engine::decode_op(&encoded)
                     .map_err(|error| Failure::input(error.to_string()))?;
-                let admission = engine.append_encoded(&encoded)?;
+                batch.bytes = batch.bytes.saturating_add(encoded.len());
+                batch.records.push(encoded);
+                batch.replies.push(Reply::Operation(operation.id));
                 records = records.saturating_add(1);
-                conflict |= admission == Admission::Conflict;
-                operations::emit_admission(operation.id, admission, output)?;
             }
             Entry::Blob { reference, bytes } => {
                 let expected = ContentId::Hash256(*blake3::hash(&bytes).as_bytes());
@@ -131,8 +137,9 @@ pub(super) fn restore(chain: &Path, path: &Path, output: &mut Output) -> Result<
                 {
                     return Err(Failure::input("archive blob address or length mismatch"));
                 }
-                let stored = engine.store_blob(&bytes)?;
-                output.emit(&serde_json::json!({"blob":stored}))?;
+                batch.bytes = batch.bytes.saturating_add(bytes.len());
+                batch.blobs.push(bytes);
+                batch.replies.push(Reply::Blob(reference));
             }
             Entry::MissingBlob { .. } => missing = true,
             Entry::Summary { stats } => {
@@ -147,8 +154,12 @@ pub(super) fn restore(chain: &Path, path: &Path, output: &mut Output) -> Result<
                 }
             }
         }
+        if batch.replies.len() >= 1024 || batch.bytes >= 4 * 1024 * 1024 {
+            conflict |= batch.flush(output)?;
+        }
         Ok(())
     })?;
+    conflict |= batch.flush(output)?;
     if !summary {
         return Err(Failure::input(
             "archive is incomplete (no summary); retained entries can be safely replayed",
@@ -159,5 +170,48 @@ pub(super) fn restore(chain: &Path, path: &Path, output: &mut Output) -> Result<
         Err(Failure::new(3, "archive contains unavailable blobs"))
     } else {
         Ok(())
+    }
+}
+
+enum Reply {
+    Operation(OpId),
+    Blob(BlobRef),
+}
+
+struct RestoreBatch {
+    writer: ChainWriter,
+    records: Vec<Vec<u8>>,
+    blobs: Vec<Vec<u8>>,
+    replies: Vec<Reply>,
+    bytes: usize,
+}
+
+impl RestoreBatch {
+    fn flush(&mut self, output: &mut Output) -> Result<bool> {
+        if !self.blobs.is_empty() {
+            let blobs: Vec<_> = self.blobs.iter().map(Vec::as_slice).collect();
+            let _references = self.writer.store_blobs(&blobs)?;
+        }
+        let records: Vec<_> = self.records.iter().map(Vec::as_slice).collect();
+        let mut admissions = self.writer.append_encoded_batch(&records)?.into_iter();
+        let mut conflict = false;
+        // Blobs were persisted before this fence. Emit results in archive order
+        // only after the entire bounded operation batch is durable.
+        for reply in self.replies.drain(..) {
+            match reply {
+                Reply::Operation(id) => {
+                    let admission = admissions
+                        .next()
+                        .ok_or_else(|| Failure::new(4, "archive admission count mismatch"))?;
+                    conflict |= admission == Admission::Conflict;
+                    operations::emit_admission(id, admission, output)?;
+                }
+                Reply::Blob(reference) => output.emit(&serde_json::json!({"blob":reference}))?,
+            }
+        }
+        self.records.clear();
+        self.blobs.clear();
+        self.bytes = 0;
+        Ok(conflict)
     }
 }

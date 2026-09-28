@@ -15,7 +15,8 @@
 //! the writer lock and reads current admission state before writing, so handles
 //! do not retain stale state after another writer or a failed append. This
 //! facade uses reusable append-log and blob adapters from `editchain-store`.
-//! Admission currently replays the log per append; indexes remain derived.
+//! Use [`Engine::writer`] for streams and batches to reuse admission state
+//! while holding the writer lock. Indexes remain derived.
 //!
 //! [`Engine::queries`] opens the indexed, viewer-independent [`queries`] API.
 //! It returns recorded history, literal search, exact content, byte diffs, and
@@ -25,6 +26,7 @@
 /// Provider derivation selection and logical import reconciliation.
 pub mod imports;
 pub mod queries;
+mod writer;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -40,6 +42,7 @@ pub use editchain_core::{
 };
 pub use editchain_store::format::{decode_op, encode_op};
 pub use editchain_store::{BlobResolution, ChainReadStats};
+pub use writer::ChainWriter;
 
 #[cfg(test)]
 use tempfile as _;
@@ -119,6 +122,17 @@ impl Engine {
     /// A persistence error can leave retained bytes; retry with the same bytes.
     pub fn append_encoded(&self, encoded: &[u8]) -> io::Result<Admission> {
         LogStore::new(SegmentStore::open(&self.root)?).append_encoded(encoded)
+    }
+
+    /// Own an exclusive durable writer for a stream or bounded operation batches.
+    ///
+    /// Reuses admission state across successful calls. Drop the writer before
+    /// using other mutation methods on this engine or another handle.
+    ///
+    /// # Errors
+    /// Returns competing-writer, filesystem or framing errors.
+    pub fn writer(&self) -> io::Result<ChainWriter> {
+        ChainWriter::open(self.root.clone())
     }
 
     /// Persist exact bytes and return their full BLAKE3 content reference.

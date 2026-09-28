@@ -82,6 +82,17 @@ impl ImportReport {
         Self::default()
     }
 
+    /// Accumulate capture counts from another source batch.
+    ///
+    /// Duplicate admission across batches remains the durable writer's concern;
+    /// these counters describe capture within the constituent batches.
+    pub fn merge(&mut self, other: &Self) {
+        self.files_discovered = self.files_discovered.saturating_add(other.files_discovered);
+        self.files_processed = self.files_processed.saturating_add(other.files_processed);
+        self.malformed = self.malformed.saturating_add(other.malformed);
+        self.merge_emissions(other);
+    }
+
     pub(crate) fn merge_emissions(&mut self, other: &Self) {
         self.raw_ops = self.raw_ops.saturating_add(other.raw_ops);
         self.normalized_ops = self.normalized_ops.saturating_add(other.normalized_ops);
