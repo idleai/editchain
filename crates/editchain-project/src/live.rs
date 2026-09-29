@@ -232,6 +232,16 @@ impl LiveProjection {
         self.topology.resolve(&self.ops)
     }
 
+    /// Retained schema-three records for upgrading derived parent and Git indexes.
+    #[must_use]
+    pub fn activity_operations(&self) -> Vec<Arc<Op>> {
+        self.ops
+            .values()
+            .filter(|op| matches!(op.kind, OpKind::Activity(_)))
+            .cloned()
+            .collect()
+    }
+
     /// Accepted immutable source lookup, also used by detail adapters.
     #[must_use]
     pub fn operation(&self, id: OpId) -> Option<&Op> {
@@ -359,7 +369,7 @@ impl LiveProjection {
         if let Some(origin) = op.source {
             let _previous = self.origins.insert(op.id, origin);
         }
-        for parent in &op.parents {
+        for parent in op.parent_ids() {
             let _: bool = self.children.entry(*parent).or_default().insert(op.id);
         }
         if let Some(origin) = op.source.filter(|_| matches!(op.kind, OpKind::Import(_))) {
@@ -428,7 +438,7 @@ impl LiveProjection {
             if let Some(evidence) = decode_evidence(op) {
                 break Some(evidence.payload.source.id());
             }
-            let Some(parent) = op.parents.iter().next() else {
+            let Some(parent) = op.parent_ids().next() else {
                 break None;
             };
             id = *parent;

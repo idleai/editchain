@@ -1,6 +1,6 @@
 //! Lift source order through first appearances; resolve references through revisions.
 
-use editchain_core::{GitCommitKey, GitLink, GitLinkKind, Op, OpId, OpKind};
+use editchain_core::{GitCommitKey, GitLink, GitLinkKind, Op, OpId};
 use editchain_index::Map as HashMap;
 use editchain_project::{live::LiveProjection, live::LiveRow};
 use std::collections::{BTreeSet, HashSet};
@@ -24,6 +24,8 @@ pub(super) struct Ancestry {
     users: HashMap<OpId, HashSet<OpId>>,
     pending: BTreeSet<String>,
     links: HashMap<OpId, GitLink>,
+    #[serde(default)]
+    link_groups: HashMap<OpId, Vec<OpId>>,
     based: HashMap<OpId, HashMap<OpId, String>>,
     produced: HashMap<String, HashMap<OpId, OpId>>,
     references: HashMap<String, BTreeSet<String>>,
@@ -33,14 +35,33 @@ pub(super) struct Ancestry {
 impl Ancestry {
     pub(super) fn observe_links(&mut self, added: &[Op], removed: &[OpId]) {
         for id in removed {
-            if let Some(link) = self.links.remove(id) {
-                self.link(*id, &link, false);
+            let keys = self.link_groups.remove(id).unwrap_or_else(|| vec![*id]);
+            for key in keys {
+                if let Some(link) = self.links.remove(&key) {
+                    self.link(key, &link, false);
+                }
             }
         }
         for op in added {
-            if let OpKind::GitLink(link) = &op.kind {
-                self.link(op.id, link, true);
-                drop(self.links.insert(op.id, link.clone()));
+            let links = editchain_project::GitProjection::operation_links(op);
+            let mut keys = Vec::new();
+            for (index, link) in links.into_iter().enumerate() {
+                // Local edge keys distinguish targets of one immutable Link.
+                // They are never stored as chain operation identities.
+                let key = if index == 0 {
+                    op.id
+                } else {
+                    OpId::from_bytes(blake3::derive_key(
+                        "editchain.live-git-edge.v1",
+                        format!("{}:{index}", op.id).as_bytes(),
+                    ))
+                };
+                self.link(key, &link, true);
+                drop(self.links.insert(key, link));
+                keys.push(key);
+            }
+            if !keys.is_empty() {
+                drop(self.link_groups.insert(op.id, keys));
             }
         }
     }
@@ -153,7 +174,7 @@ impl Ancestry {
         let _: Option<OpId> = self.first.insert(input.key.clone(), input.incarnation);
         let roots: Vec<_> = projection
             .operation(input.incarnation)
-            .map(|op| op.parents.iter().copied().collect())
+            .map(|op| op.parent_ids().copied().collect())
             .unwrap_or_default();
         for root in &roots {
             let _: bool = self
@@ -264,7 +285,7 @@ impl Ancestry {
             let mut dependencies: Vec<_> = if based.is_empty() {
                 projection
                     .operation(id)
-                    .map(|op| op.parents.iter().copied().collect())
+                    .map(|op| op.parent_ids().copied().collect())
                     .unwrap_or_default()
             } else {
                 Vec::new()

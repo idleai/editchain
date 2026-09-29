@@ -25,7 +25,7 @@ impl ProviderRelations {
         if !matches!(
             note.relationship,
             NoteRelationship::SpawnedBy | NoteRelationship::ReconnectsTo
-        ) || !op.parents.iter().chain(&note.target_ids).any(|id| {
+        ) || !op.parent_ids().chain(&note.target_ids).any(|id| {
             self.origins
                 .get(id)
                 .is_some_and(|source| self.covered.contains(&source_key(*source)))
@@ -162,7 +162,7 @@ pub(crate) fn resolve_records(
     resolve_completions(&sources, &lifecycle, &blocked, &mut resolved.notes);
     resolved
         .notes
-        .sort_by_key(|note| (note.parents.iter().next().copied(), note.id));
+        .sort_by_key(|note| (note.parent_ids().next().copied(), note.id));
     resolved.notes.dedup();
     resolved
 }

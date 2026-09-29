@@ -10,8 +10,7 @@ pub(super) fn sources(operations: Vec<Op>) -> super::Result<Vec<Op>> {
     let mut ready = BTreeSet::new();
     for (id, op) in &pending {
         let parents: Vec<_> = op
-            .parents
-            .iter()
+            .parent_ids()
             .filter(|parent| pending.contains_key(parent))
             .copied()
             .collect();

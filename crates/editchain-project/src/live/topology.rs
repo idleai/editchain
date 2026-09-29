@@ -193,8 +193,8 @@ impl Topology {
             );
             let mut edges = BTreeSet::new();
             for op in resolved.notes {
-                if let OpKind::Note(note) = op.kind {
-                    for anchor in &op.parents {
+                if let OpKind::Note(note) = &op.kind {
+                    for anchor in op.parent_ids() {
                         for target in &note.target_ids {
                             let _: bool = edges.insert(RelationEdge {
                                 anchor: *anchor,

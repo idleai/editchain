@@ -79,7 +79,9 @@ pub trait BlobSink {
     /// Returns [`ImportError`] if the blob cannot be stored.
     fn store_blob(&mut self, data: &[u8]) -> Result<(), ImportError>;
 
-    /// Read a blob back when conversion needs source fields. Write-only sinks may return None.
+    /// Read a blob back when conversion needs source fields. Write-only sinks may
+    /// return `None` for legacy capture. Schema-three capture requires readable
+    /// source blobs and fails before accepting cursors when they are unavailable.
     /// # Errors
     /// Returns storage or content validation errors.
     fn read_blob(&self, _reference: &BlobRef) -> Result<Option<Vec<u8>>, ImportError> {

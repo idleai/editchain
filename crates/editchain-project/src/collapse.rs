@@ -71,7 +71,7 @@ impl HistoryProjection {
             ) {
                 continue;
             }
-            let Some(anchor) = op.parents.iter().next().copied() else {
+            let Some(anchor) = op.parent_ids().next().copied() else {
                 continue;
             };
             for target in &note.target_ids {
@@ -189,7 +189,7 @@ impl HistoryProjection {
             {
                 continue;
             }
-            for &parent in &op.parents {
+            for &parent in op.parent_ids() {
                 if import_ids.contains(&parent) {
                     let _: bool = folded.insert(op.id);
                     children_of.entry(parent).or_default().push(op);
@@ -317,7 +317,7 @@ impl HistoryProjection {
             if !is_hidden_relation_fact(op) || representative.contains_key(&op.id) {
                 continue;
             }
-            let endpoint = op.parents.iter().next().copied().or_else(|| {
+            let endpoint = op.parent_ids().next().copied().or_else(|| {
                 if let editchain_core::OpKind::Note(n) = &op.kind {
                     n.target_ids.first().copied()
                 } else {
@@ -454,7 +454,7 @@ impl HistoryProjection {
             let has_provider_parent = has_exact_provider_parent(op.id, notes.map(Vec::as_slice));
             let mut candidates = std::collections::BTreeSet::new();
             if !has_provider_parent {
-                for parent in &op.parents {
+                for parent in op.parent_ids() {
                     if let Some(parent) = canonical_present_op(*parent, representative, &present) {
                         let _: bool = candidates.insert(parent);
                     }

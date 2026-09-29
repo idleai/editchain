@@ -144,6 +144,13 @@ impl ImportBatch {
         };
         for op in self.ops.source_context.values().chain(&self.ops.ops) {
             let stored = crate::activity::resolve_original(op, blobs)?;
+            if stored.is_none()
+                && matches!(&op.kind, editchain_core::OpKind::Import(raw) if matches!(raw.raw_ref, editchain_core::Payload::Blob(_)))
+            {
+                return Err(ImportError::BlobSink(
+                    "schema-three capture requires readable source blobs; source checkpoints were not advanced".into(),
+                ));
+            }
             converter.observe(op, stored.as_deref())?;
         }
         converter.finish_observations();

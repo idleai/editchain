@@ -25,6 +25,9 @@ use editchain_import::{
 };
 use editchain_store::{AppendLog, CanonicalChain, LogReadStats, LogStore, SegmentStore};
 
+#[path = "import_api/schema3_regressions.rs"]
+mod schema3_regressions;
+
 type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 // Fallible assertions keep fixture IO and validation failures in the same

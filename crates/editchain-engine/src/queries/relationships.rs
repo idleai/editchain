@@ -105,7 +105,7 @@ pub(super) fn recorded_relationships(entry: &HistoryEntry) -> Vec<RecordedRelati
             content: entry.content.clone(),
         });
     };
-    for parent in &operation.parents {
+    for parent in operation.parent_ids() {
         add(
             EntityRef::Operation(operation.id),
             EntityRef::Operation(*parent),
@@ -185,13 +185,6 @@ fn modern_relationships(
 ) {
     use editchain_core::activity::{Entity, Kind};
     let operation = EntityRef::Operation(record.id);
-    for parent in record.parents.iter().skip(2) {
-        add(
-            operation,
-            EntityRef::Operation(*parent),
-            RelationshipKind::CausalParent,
-        );
-    }
     let mut field =
         |source, target, name: &str| add(source, target, RelationshipKind::Recorded(name.into()));
     if let Some(session) = record.session {

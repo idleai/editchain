@@ -1,7 +1,7 @@
 //! Bounded blob capture followed by an explicit durability handoff.
 
-use editchain_core::ContentId;
-use editchain_store::BlobStorage;
+use editchain_core::{BlobRef, ContentId};
+use editchain_store::{BlobResolution, BlobStorage};
 
 use super::BlobSink;
 use crate::ImportError;
@@ -61,6 +61,26 @@ impl<B: BlobStorage> BufferedBlobSink<B> {
 }
 
 impl<B: BlobStorage> BlobSink for BufferedBlobSink<B> {
+    fn read_blob(&self, reference: &BlobRef) -> Result<Option<Vec<u8>>, ImportError> {
+        if let Some(bytes) = self
+            .pending
+            .iter()
+            .find(|bytes| ContentId::Hash256(*blake3::hash(bytes).as_bytes()) == reference.id)
+        {
+            if u32::try_from(bytes.len()).ok() != Some(reference.len) {
+                return Err(ImportError::BlobSink("source blob length mismatch".into()));
+            }
+            return Ok(Some(bytes.clone()));
+        }
+        match self.store.read_blob(reference)? {
+            BlobResolution::Found(bytes) => Ok(Some(bytes)),
+            BlobResolution::Missing | BlobResolution::Unresolvable => Ok(None),
+            BlobResolution::Corrupt => Err(ImportError::BlobSink(
+                "source blob does not match its reference".into(),
+            )),
+        }
+    }
+
     fn store_blob(&mut self, data: &[u8]) -> Result<(), ImportError> {
         if self.bytes.saturating_add(data.len()) > MAX_BYTES {
             self.flush()?;
@@ -82,8 +102,7 @@ impl<B: BlobStorage> BlobSink for BufferedBlobSink<B> {
 mod tests {
     use std::{collections::BTreeMap, io};
 
-    use editchain_core::BlobRef;
-    use editchain_store::{BlobResolution, BlobSource};
+    use editchain_store::BlobSource;
 
     use super::*;
 
@@ -178,5 +197,37 @@ mod tests {
         assert!(sink.pending.is_empty());
         assert_eq!(sink.store.values.len(), 3);
         assert_eq!(sink.store.batches, 2);
+    }
+
+    #[test]
+    fn conversion_reads_pending_flushed_and_oversized_blobs() {
+        let mut sink = BufferedBlobSink::new(Blobs::default());
+        let reference = sink.put(b"pending source").unwrap();
+        assert_eq!(
+            sink.read_blob(&reference).unwrap(),
+            Some(b"pending source".to_vec())
+        );
+        assert!(
+            sink.store.values.is_empty(),
+            "read does not force durability"
+        );
+        let mut wrong_length = reference;
+        wrong_length.len = 0;
+        assert!(sink.read_blob(&wrong_length).is_err());
+        sink.flush().unwrap();
+        assert_eq!(
+            sink.read_blob(&reference).unwrap(),
+            Some(b"pending source".to_vec())
+        );
+        assert!(sink.read_blob(&wrong_length).is_err());
+        let oversized = vec![42; MAX_BYTES.saturating_add(1)];
+        let reference = sink.put(&oversized).unwrap();
+        assert!(sink.pending.is_empty());
+        assert_eq!(sink.read_blob(&reference).unwrap(), Some(oversized));
+        let absent = BlobRef {
+            id: ContentId::Hash256([0; 32]),
+            len: 1,
+        };
+        assert_eq!(sink.read_blob(&absent).unwrap(), None);
     }
 }

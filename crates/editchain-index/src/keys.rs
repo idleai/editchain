@@ -42,7 +42,7 @@ pub enum IndexKey {
 
 pub(crate) fn keys(op: &Op, references: &[ContentReference]) -> Vec<IndexKey> {
     let mut keys = vec![IndexKey::Actor(op.actor)];
-    keys.extend(op.parents.iter().copied().map(IndexKey::Parent));
+    keys.extend(op.parent_ids().copied().map(IndexKey::Parent));
     keys.extend(
         references
             .iter()
@@ -74,7 +74,6 @@ pub(crate) fn keys(op: &Op, references: &[ContentReference]) -> Vec<IndexKey> {
                 .iter()
                 .flat_map(|legacy| legacy.folded.iter().copied().map(IndexKey::Alias)),
         );
-        keys.extend(record.parents.iter().copied().map(IndexKey::Parent));
         if let editchain_core::activity::Kind::File(file) = &record.kind {
             keys.push(IndexKey::File(file.path));
         }

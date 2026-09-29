@@ -167,7 +167,8 @@ pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 5;
 /// Revision 58 hides brief exposure and presents editor tab lifecycle.
 /// Revision 59 puts a human edit's file directly on its physical graph row.
 /// Revision 60 presents a single imported file edit as the Change activity.
-const SNAPSHOT_PROJECTION_REVISION: u32 = 60;
+/// Revision 61 retains all schema-three causal parents and Git observations.
+const SNAPSHOT_PROJECTION_REVISION: u32 = 61;
 /// Root directory for render snapshot schema versions.
 const SNAPSHOT_ROOT: &str = "render";
 /// Manifest written last, after every data file is durable.

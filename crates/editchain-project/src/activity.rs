@@ -93,7 +93,7 @@ pub fn inline_context_compaction_checkpoints<S: std::hash::BuildHasher>(
     let mut stored_parents = HashSet::new();
     for (index, node) in nodes.iter().enumerate() {
         if let Some(op) = node_anchor_op(node) {
-            stored_parents.extend(op.parents.iter().copied());
+            stored_parents.extend(op.parent_ids().copied());
         }
         if let Some(facts) = raw_row_facts(node, index) {
             streams
@@ -161,7 +161,7 @@ fn raw_row_facts(node: &HistoryNode, index: usize) -> Option<RawRowFacts> {
     if !matches!(&op.kind, OpKind::Import(_)) {
         return None;
     }
-    let mut parents = op.parents.iter().copied();
+    let mut parents = op.parent_ids().copied();
     let first_parent = parents.next();
     let sole_parent = first_parent.filter(|_| parents.next().is_none());
     Some(RawRowFacts {

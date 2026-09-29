@@ -431,7 +431,7 @@ pub(super) fn has_exact_provider_parent(anchor: OpId, notes: Option<&[Op]>) -> b
                 editchain_core::OpKind::Note(note)
                     if note.relationship == NoteRelationship::ProviderParent
                         && !note.target_ids.is_empty()
-                        && fact.parents.iter().any(|parent| *parent == anchor)
+                        && fact.parent_ids().any(|parent| *parent == anchor)
             )
         })
     })
@@ -451,7 +451,7 @@ pub(super) fn has_exact_spawn_parent(anchor: OpId, notes: Option<&[Op]>) -> bool
                 editchain_core::OpKind::Note(note)
                     if note.relationship == NoteRelationship::SpawnedBy
                         && !note.target_ids.is_empty()
-                        && fact.parents.iter().any(|parent| *parent == anchor)
+                        && fact.parent_ids().any(|parent| *parent == anchor)
             )
         })
     })
@@ -595,7 +595,7 @@ fn canonical_parent_key(
 fn causal_children_by_parent(ops: &[Op]) -> HashMap<OpId, Vec<OpId>> {
     let mut children: HashMap<OpId, Vec<OpId>> = HashMap::new();
     for op in ops.iter().filter(|op| !is_hidden_relation_fact(op)) {
-        for parent in &op.parents {
+        for parent in op.parent_ids() {
             children.entry(*parent).or_default().push(op.id);
         }
     }
