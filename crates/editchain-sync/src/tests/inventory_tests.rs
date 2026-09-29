@@ -51,6 +51,43 @@ fn inventory_orders_merge_parents_and_all_conflicting_variants_before_descendant
 }
 
 #[test]
+fn inventory_orders_every_schema_three_parent_before_its_child() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut records = Vec::new();
+    for (number, text) in [
+        (1, b"child".as_slice()),
+        (2, b"first"),
+        (3, b"second"),
+        (4, b"third"),
+        (4, b"conflict"),
+    ] {
+        let mut record = editchain_core::activity::Operation::upgrade(&operation(
+            number,
+            Payload::Inline(text.to_vec()),
+        ))
+        .ok_or_else(|| io::Error::other("fixture did not upgrade"))?;
+        record.id = OpId::from_bytes([u8::try_from(number).map_err(io::Error::other)?; 32]);
+        if number == 1 {
+            record.parents = [2, 3, 4].map(|n| OpId::from_bytes([n; 32])).to_vec();
+        }
+        let op = record.into_op().map_err(io::Error::other)?;
+        let bytes = encode_op(&op).map_err(io::Error::other)?;
+        records.push((RecordKey::from_encoded(&bytes)?, bytes));
+    }
+    seed(dir.path(), &records)?;
+    let order = Replica::open(dir.path(), "space-1", true)?
+        .snapshot()?
+        .ordered_keys()?;
+    check_eq!(order.len(), 5, "every variant is retained");
+    check_eq!(
+        order.last().map(|key| key.id),
+        Some(OpId::from_bytes([1; 32])),
+        "all parents and their variants precede the lexically first child"
+    );
+    Ok(())
+}
+
+#[test]
 fn inventory_walk_is_iterative_and_preserves_cycles_and_missing_parent_evidence() -> io::Result<()>
 {
     let dir = tempfile::tempdir()?;

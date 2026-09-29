@@ -39,7 +39,7 @@ fn node_details_from_op(op: &Op) -> NodeDetails {
         repository: None,
         summary: op_summary(op),
         body: op_body(op),
-        parents: op.parents.iter().map(ToString::to_string).collect(),
+        parents: op.parent_ids().map(ToString::to_string).collect(),
         git_parents: Vec::new(),
         refs: Vec::new(),
         changed_paths: Vec::new(),

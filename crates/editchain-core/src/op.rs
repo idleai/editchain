@@ -149,11 +149,21 @@ impl Op {
     /// All explicit causal parents, including schema-three records with more than two.
     #[must_use]
     pub fn causal_parents(&self) -> Vec<OpId> {
-        if let OpKind::Activity(record) = &self.kind {
-            record.parents.clone()
+        self.parent_ids().copied().collect()
+    }
+
+    /// Iterate the complete causal frontier without allocating or truncating it
+    /// to the older two-parent compatibility envelope.
+    pub fn parent_ids(&self) -> impl Iterator<Item = &OpId> {
+        let activity = if let OpKind::Activity(record) = &self.kind {
+            Some(&record.parents)
         } else {
-            self.parents.iter().copied().collect()
-        }
+            None
+        };
+        activity
+            .into_iter()
+            .flatten()
+            .chain(self.parents.iter().filter(move |_| activity.is_none()))
     }
 
     /// Create a new operation with the given fields.

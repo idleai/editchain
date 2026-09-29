@@ -93,6 +93,69 @@ fn msg_op(node: u64, seq: u64, session: u64, clock_ms: u64, parent: Option<OpId>
     }
 }
 
+#[test]
+fn schema_three_keeps_all_parents_in_offline_and_incremental_views() {
+    use editchain_core::activity::Operation;
+    use editchain_project::{live::LiveProjection, NodeKey};
+    let parents: Vec<_> = (10..14)
+        .map(|n| {
+            Operation::upgrade(&msg_op(1, n, 0, 100, None))
+                .unwrap()
+                .into_op()
+                .unwrap()
+        })
+        .collect();
+    let mut child = Operation::upgrade(&msg_op(1, 1, 0, 1, None)).unwrap();
+    child.parents = parents.iter().map(|op| op.id).collect();
+    let child = child.into_op().unwrap();
+    assert_eq!(
+        child.parents.iter().count(),
+        2,
+        "compatibility envelope stays bounded"
+    );
+    let mut ops = vec![child.clone()];
+    ops.extend(parents.clone());
+    let projection = HistoryProjection::from_ops(ops);
+    let nodes = projection.nodes();
+    let graph = projection.resolved_graph(&nodes);
+    let actual: std::collections::BTreeSet<_> = graph
+        .parents(NodeKey::Op(child.id))
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(
+        actual,
+        parents.iter().map(|op| NodeKey::Op(op.id)).collect()
+    );
+    let child_position = nodes
+        .iter()
+        .position(|node| node.node_key() == child.id.to_string())
+        .unwrap();
+    for parent in &parents {
+        assert!(
+            nodes
+                .iter()
+                .position(|node| node.node_key() == parent.id.to_string())
+                .unwrap()
+                > child_position
+        );
+    }
+    let mut live = LiveProjection::default();
+    let _initial = live.apply(vec![child.clone()], &[]);
+    for parent in &parents {
+        let delta = live.apply(vec![parent.clone()], &[]);
+        assert!(
+            delta.upserts.contains_key(&format!("op:{}", child.id)),
+            "late parent refreshes child"
+        );
+        let delta = live.apply(Vec::new(), &[parent.id]);
+        assert!(
+            delta.upserts.contains_key(&format!("op:{}", child.id)),
+            "parent removal refreshes child"
+        );
+    }
+}
+
 /// A raw import op (the linear backbone row).
 fn import_op(node: u64, seq: u64, session: u64, clock_ms: u64) -> Op {
     Op {

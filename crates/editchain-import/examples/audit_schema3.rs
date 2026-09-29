@@ -24,6 +24,10 @@ struct Audit {
     kinds: BTreeMap<String, u64>,
     identities: BTreeMap<OpId, [u8; 32]>,
     aliases: BTreeSet<OpId>,
+    mappings: BTreeMap<OpId, OpId>,
+    primary: BTreeMap<OpId, OpId>,
+    parents: BTreeMap<OpId, Vec<OpId>>,
+    parent_links: BTreeMap<String, u64>,
     originals: BTreeMap<OpId, [u8; 32]>,
     references: BTreeSet<OpId>,
     blobs: HashSet<(ContentId, Option<u32>)>,
@@ -47,6 +51,7 @@ fn scan(root: &Path) -> io::Result<Audit> {
     let blobs = BlobReader::open(root)?;
     let stats = editchain_store::visit_records(root, &mut |_flags, encoded| {
         let op = format::decode_op(encoded).map_err(io::Error::other)?;
+        drop(audit.parents.insert(op.id, op.causal_parents()));
         audit.records = audit.records.saturating_add(1);
         audit.bytes = audit
             .bytes
@@ -71,6 +76,13 @@ fn scan(root: &Path) -> io::Result<Audit> {
             if let Some(mapping) = &record.legacy {
                 let _inserted = audit.aliases.insert(mapping.operation);
                 audit.aliases.extend(&mapping.folded);
+                let _previous = audit.primary.insert(mapping.operation, record.id);
+                for old in std::iter::once(&mapping.operation).chain(&mapping.folded) {
+                    let _previous = audit.mappings.insert(*old, record.id);
+                }
+            }
+            if let Kind::Link(link) = &record.kind {
+                count_parent_link(&mut audit.parent_links, &link.relation);
             }
             if let Some(original) = &record.original {
                 let _inserted = audit.references.insert(original.operation);
@@ -100,6 +112,8 @@ fn scan(root: &Path) -> io::Result<Audit> {
                     .originals
                     .insert(op.id, *blake3::hash(&bytes).as_bytes());
             }
+        } else if let OpKind::Note(note) = &op.kind {
+            count_parent_link(&mut audit.parent_links, &format!("{:?}", note.relationship));
         }
         Ok(())
     })?;
@@ -124,6 +138,50 @@ fn scan(root: &Path) -> io::Result<Audit> {
     Ok(audit)
 }
 
+fn count_parent_link(counts: &mut BTreeMap<String, u64>, relation: &str) {
+    if matches!(relation, "ProviderParent" | "LogicalParent") {
+        let count = counts.entry(relation.into()).or_default();
+        *count = count.saturating_add(1);
+    }
+}
+
+fn check_parents(old: &Audit, converted: &Audit) -> io::Result<u64> {
+    let mut checked = 0_u64;
+    for (old_id, parents) in &old.parents {
+        let Some(id) = converted
+            .primary
+            .get(old_id)
+            .copied()
+            .or_else(|| converted.identities.contains_key(old_id).then_some(*old_id))
+        else {
+            continue; // Folded records retain their address, but have no separate parent list.
+        };
+        for parent in parents
+            .iter()
+            .filter(|parent| old.identities.contains_key(parent))
+        {
+            let expected = converted.mappings.get(parent).copied().unwrap_or(*parent);
+            if !converted.identities.contains_key(&expected)
+                || !converted
+                    .parents
+                    .get(&id)
+                    .is_some_and(|parents| parents.contains(&expected))
+            {
+                return Err(io::Error::other(format!(
+                    "lost parent {parent} of {old_id} after conversion to {id}"
+                )));
+            }
+            checked = checked.saturating_add(1);
+        }
+    }
+    if old.parent_links != converted.parent_links {
+        return Err(io::Error::other(
+            "provider or logical parent links were lost",
+        ));
+    }
+    Ok(checked)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let [old, fresh, migrated] = args.as_slice() else {
@@ -132,6 +190,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let old = scan(Path::new(old))?;
     let fresh = scan(Path::new(fresh))?;
     let migrated = scan(Path::new(migrated))?;
+    let fresh_parents = check_parents(&old, &fresh)?;
+    let migrated_parents = check_parents(&old, &migrated)?;
     serde_json::to_writer_pretty(
         io::stderr().lock(),
         &serde_json::json!({
@@ -157,6 +217,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         io::stdout().lock(),
         &serde_json::json!({
             "status": "pass", "old_records": old.records, "originals": old.originals.len(),
+            "fresh_parent_edges_checked": fresh_parents, "migrated_parent_edges_checked": migrated_parents,
+            "parent_links": migrated.parent_links,
             "fresh_records": fresh.records, "migrated_records": migrated.records,
             "fresh_record_bytes": fresh.bytes, "migrated_record_bytes": migrated.bytes,
             "old_address_mappings": migrated.aliases.len(), "resolved_original_references": migrated.references.len(),

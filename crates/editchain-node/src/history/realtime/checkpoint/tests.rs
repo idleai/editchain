@@ -13,6 +13,7 @@ mod late_content;
 mod partial_items;
 mod pending_imports;
 mod reconciliation;
+mod schema3;
 
 fn request(root: &std::path::Path) -> OpenRequest {
     OpenRequest {

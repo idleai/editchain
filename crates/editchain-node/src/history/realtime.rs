@@ -159,6 +159,7 @@ impl LiveWorkspace {
             let cutoff_items = saved.version < 11;
             let legacy_imports = saved.version < 12;
             let content_rows = saved.version < 13;
+            let activity_parents = saved.version < 15;
             workspace.adopt(saved, true)?;
             if regroup {
                 workspace.regroup();
@@ -190,6 +191,9 @@ impl LiveWorkspace {
             if content_rows {
                 workspace.restore_content_rows()?;
             }
+            if activity_parents {
+                workspace.restore_activity_parents()?;
+            }
             let content_arrived = workspace.refresh_pending_content()?;
             if disclosure
                 || edit_rows
@@ -199,6 +203,7 @@ impl LiveWorkspace {
                 || cutoff_items
                 || legacy_imports
                 || content_rows
+                || activity_parents
                 || content_arrived
             {
                 // Publish the new version only after every migration completed.

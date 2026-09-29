@@ -4,7 +4,7 @@ use editchain_core::activity::{
     Completion, ItemId, Kind, MessageKind, NativeId, Operation, Session, SessionAction, Stage,
     Status, Turn, TurnAction,
 };
-use editchain_core::{Op, OpId, OpKind, Payload, ScopeRef, Tags};
+use editchain_core::{NoteRelationship, Op, OpId, OpKind, Payload, ScopeRef, Tags};
 use serde_json::Value;
 
 #[derive(Debug)]
@@ -69,6 +69,42 @@ pub(super) fn scoped(namespace: &str, parent: ItemId, value: &str) -> ItemId {
     let mut bytes = parent.0.as_bytes().to_vec();
     bytes.extend_from_slice(value.as_bytes());
     ItemId::derive(namespace, &bytes)
+}
+
+// Provider parent IDs name logical events, not physical import operations.
+// Keep ordinary and logical parent relations distinct, including absent targets.
+pub(super) fn parent_link(op: &Op, record: &mut Operation) {
+    let (OpKind::Note(note), Kind::Link(link), Some(session)) =
+        (&op.kind, &mut record.kind, record.session)
+    else {
+        return;
+    };
+    if !matches!(
+        note.relationship,
+        NoteRelationship::ProviderParent | NoteRelationship::LogicalParent
+    ) {
+        return;
+    }
+    let Payload::Inline(bytes) = &note.content else {
+        return;
+    };
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return;
+    };
+    let Some(native) = value.get("externalId").and_then(Value::as_str) else {
+        return;
+    };
+    if value.get("provider").and_then(Value::as_str) != Some("claude-code")
+        || value.get("entityKind").and_then(Value::as_str) != Some("event")
+        || note.target_ids.as_slice() != [crate::claude_code::topology::event_entity_id(native)]
+    {
+        return;
+    }
+    link.to = vec![editchain_core::activity::Entity::Item(scoped(
+        "claude.record",
+        session,
+        native,
+    ))];
 }
 
 fn text<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
@@ -374,7 +410,7 @@ pub(super) fn finish(op: &Op, record: &mut Operation, source: Option<&Source>) {
         }
     }
     if let (OpKind::Note(note), ScopeRef::Turn(_)) = (&op.kind, op.scope) {
-        if note.relationship == editchain_core::NoteRelationship::Explains
+        if note.relationship == NoteRelationship::Explains
             && note.target_ids.is_empty()
             && source.is_some_and(|source| source.provider == "codex")
         {

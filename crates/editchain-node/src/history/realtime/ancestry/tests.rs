@@ -1,5 +1,7 @@
 use super::*;
-use editchain_core::{ActorId, Clock, MessageOp, NodeId, ParentSet, Payload, ScopeRef, Tags};
+use editchain_core::{
+    ActorId, Clock, MessageOp, NodeId, OpKind, ParentSet, Payload, ScopeRef, Tags,
+};
 
 fn id(seq: u64) -> OpId {
     OpId::new(NodeId(1), 0, seq)
@@ -67,6 +69,54 @@ fn a_visible_work_occurrence_tracks_late_git_baselines_and_their_removal() {
         .changed(&projection)
         .iter()
         .any(|(key, parents)| key == "first" && parents.is_empty()));
+}
+
+#[test]
+fn schema_three_git_links_support_multiple_targets_and_retraction() {
+    use editchain_core::activity::{Entity, Kind, Link, Operation};
+    let mut projection = LiveProjection::default();
+    let _changes = projection.apply(vec![operation(1, None)], &[]);
+    let mut ancestry = Ancestry::default();
+    ancestry.put(&row("source", 1, 1), &projection);
+    let _changes = ancestry.changed(&projection);
+    let targets: Vec<_> = [1, 2]
+        .map(|n| Entity::Git {
+            repository: editchain_core::RepositoryId(1),
+            oid: editchain_core::GitOid::from_sha1([n; 20]),
+        })
+        .to_vec();
+    let mut record = Operation::upgrade(&operation(10, None)).unwrap();
+    record.kind = Kind::Link(Link {
+        from: Entity::Operation(id(1)),
+        to: targets,
+        relation: "based_on".into(),
+        content: Payload::Empty,
+    });
+    let link = record.into_op().unwrap();
+    ancestry.observe_links(std::slice::from_ref(&link), &[]);
+    let expected: BTreeSet<_> = editchain_project::GitProjection::operation_links(&link)
+        .iter()
+        .map(|link| link.target_key().to_string())
+        .collect();
+    let changes = ancestry.changed(&projection);
+    assert_eq!(
+        changes
+            .iter()
+            .find(|(key, _)| key == "source")
+            .unwrap()
+            .1
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        expected
+    );
+    ancestry.observe_links(&[], &[link.id]);
+    assert!(ancestry
+        .changed(&projection)
+        .iter()
+        .any(|(key, parents)| key == "source" && parents.is_empty()));
+    assert!(ancestry.links.is_empty());
+    assert!(ancestry.link_groups.is_empty());
 }
 
 #[test]

@@ -130,6 +130,12 @@ fn conflicting_delivery_and_cross_item_predecessors_fail() -> Result<(), Box<dyn
         ),
         "one event ID cannot change its content"
     );
+    assert!(matches!(
+        state.content(first.item, ItemId::derive("block", b"one"), None, inline),
+        Err(ReplayError::Conflict(_))
+    ));
+    let mut state = StreamState::default();
+    let _inserted = state.insert(first)?;
     let mut other = message(2, Some(1), UpdateMode::Append, b"suffix");
     other.item = ItemId::derive("message", b"other");
     let other_item = other.item;
@@ -318,5 +324,168 @@ fn absent_payload_is_not_a_known_empty_replacement() {
     assert!(matches!(
         missing.content(item, ItemId::derive("block", b"one"), None, inline),
         Err(ReplayError::Unavailable(_))
+    ));
+}
+
+#[test]
+fn conflicting_streams_quarantine_both_orders_and_never_revive_on_retry() {
+    let first = message(1, None, UpdateMode::Replace, b"first");
+    let changed = message(1, None, UpdateMode::Replace, b"changed");
+    let block = ItemId::derive("block", b"one");
+    for variants in [
+        [first.clone(), changed.clone()],
+        [changed.clone(), first.clone()],
+    ] {
+        let mut state = StreamState::default();
+        assert!(state.insert(variants.first().unwrap().clone()).unwrap());
+        assert_eq!(
+            state.insert(variants.last().unwrap().clone()),
+            Err(ReplayError::Conflict(first.id))
+        );
+        for retry in [&first, &changed] {
+            assert_eq!(
+                state.insert(retry.clone()),
+                Err(ReplayError::Conflict(first.id))
+            );
+            assert_eq!(
+                state.content(first.item, block, None, inline),
+                Err(ReplayError::Conflict(first.id))
+            );
+        }
+        let mut other = message(2, None, UpdateMode::Replace, b"independent");
+        other.item = ItemId::derive("message", b"other");
+        assert!(state.insert(other.clone()).unwrap());
+        assert_eq!(
+            state
+                .content(other.item, block, None, inline)
+                .unwrap()
+                .unwrap()
+                .bytes,
+            b"independent"
+        );
+        other.id = first.id;
+        assert_eq!(
+            state.insert(other.clone()),
+            Err(ReplayError::Conflict(first.id))
+        );
+        assert_eq!(
+            state.content(other.item, block, None, inline),
+            Err(ReplayError::Conflict(first.id))
+        );
+    }
+}
+
+#[test]
+fn replacements_and_appends_validate_late_cross_item_and_cross_block_predecessors() {
+    for mode in [UpdateMode::Replace, UpdateMode::Append] {
+        for cross_item in [false, true] {
+            let mut first = message(1, None, UpdateMode::Replace, b"first");
+            let second = message(2, Some(1), mode, b"second");
+            if cross_item {
+                first.item = ItemId::derive("message", b"other");
+            } else if let Kind::Message(message) = &mut first.kind {
+                message.blocks.first_mut().unwrap().block = ItemId::derive("block", b"other");
+            }
+            let mut state = StreamState::default();
+            assert!(state.insert(second.clone()).unwrap());
+            let block = ItemId::derive("block", b"one");
+            let partial = state
+                .content(second.item, block, None, inline)
+                .unwrap()
+                .unwrap();
+            assert_eq!(partial.complete, mode == UpdateMode::Replace);
+            assert!(state.insert(first.clone()).unwrap());
+            assert_eq!(
+                state.content(second.item, block, None, inline),
+                Err(ReplayError::WrongPredecessor(first.id))
+            );
+        }
+    }
+}
+
+fn tool_update(mut record: Operation, attempt: ItemId) -> Operation {
+    use editchain_core::activity::{OutputChannel, Tool};
+    if let Kind::Message(message) = record.kind {
+        record.kind = Kind::Tool(Tool {
+            native_call: Payload::Empty,
+            name: Payload::Empty,
+            stage: Stage::Updated,
+            attempt,
+            parent_call: None,
+            arguments: Payload::Empty,
+            channel: OutputChannel::Stdout,
+            output: message.blocks.into_iter().next(),
+            terminal: None,
+            outcome: None,
+        });
+    }
+    record
+}
+
+#[test]
+fn tool_predecessors_and_conflicts_are_checked_per_attempt() {
+    let attempt = ItemId::derive("attempt", b"one");
+    let retry = ItemId::derive("attempt", b"retry");
+    let first = tool_update(message(1, None, UpdateMode::Replace, b"first"), attempt);
+    let block = ItemId::derive("block", b"one");
+    for mode in [UpdateMode::Replace, UpdateMode::Append] {
+        let other = tool_update(message(2, Some(1), mode, b"other"), retry);
+        let mut state = StreamState::default();
+        assert!(state.insert(first.clone()).unwrap());
+        assert!(state.insert(other.clone()).unwrap());
+        assert_eq!(
+            state.content(other.item, block, Some(retry), inline),
+            Err(ReplayError::WrongPredecessor(first.id))
+        );
+    }
+    let mut state = StreamState::default();
+    assert!(state.insert(first.clone()).unwrap());
+    let conflict = tool_update(message(1, None, UpdateMode::Replace, b"changed"), attempt);
+    assert_eq!(state.insert(conflict), Err(ReplayError::Conflict(first.id)));
+    let other = tool_update(message(2, None, UpdateMode::Replace, b"retry"), retry);
+    assert!(state.insert(other.clone()).unwrap());
+    assert!(
+        state
+            .content(other.item, block, Some(retry), inline)
+            .unwrap()
+            .unwrap()
+            .complete
+    );
+    assert_eq!(
+        state.content(first.item, block, Some(attempt), inline),
+        Err(ReplayError::Conflict(first.id))
+    );
+}
+
+#[test]
+fn replacements_check_cycles_without_resolving_superseded_payloads() {
+    let mut first = message(1, None, UpdateMode::Replace, b"first");
+    if let Kind::Message(message) = &mut first.kind {
+        message.blocks.first_mut().unwrap().content = Payload::Empty;
+    }
+    let second = message(2, Some(1), UpdateMode::Replace, b"second");
+    let mut state = StreamState::default();
+    assert!(state.insert(first).unwrap());
+    assert!(state.insert(second.clone()).unwrap());
+    let block = ItemId::derive("block", b"one");
+    assert_eq!(
+        state
+            .content(second.item, block, None, inline)
+            .unwrap()
+            .unwrap()
+            .bytes,
+        b"second"
+    );
+    let mut cycle = StreamState::default();
+    for record in [
+        message(1, Some(2), UpdateMode::Replace, b"first"),
+        second.clone(),
+        message(3, Some(1), UpdateMode::Replace, b"head"),
+    ] {
+        assert!(cycle.insert(record).unwrap());
+    }
+    assert!(matches!(
+        cycle.content(second.item, block, None, inline),
+        Err(ReplayError::Cycle(_))
     ));
 }

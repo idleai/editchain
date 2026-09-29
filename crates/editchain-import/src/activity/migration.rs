@@ -25,7 +25,7 @@ pub fn uses_migration_ids(root: &Path) -> io::Result<bool> {
                 serde_json::from_slice(&bytes).map_err(io::Error::other)?;
             if value.get("converter").and_then(serde_json::Value::as_str) != Some(super::CONTRACT) {
                 return Err(io::Error::other(
-                    "unsupported schema-three converter marker",
+                    "older or unsupported schema-three converter; migrate the original pre-schema-three chain or reimport its sources into a new destination",
                 ));
             }
             Ok(true)
@@ -44,12 +44,14 @@ fn infer_namespace(root: &Path) -> io::Result<bool> {
         if let Ok(op) = decode_op(bytes) {
             if let OpKind::Activity(record) = op.kind {
                 if let Some(old) = record.legacy {
-                    answer = Some(
-                        record.id
-                            == super::migration_id(editchain_core::activity::upgrade_id(
-                                old.operation,
-                            )),
-                    );
+                    let upgraded = editchain_core::activity::upgrade_id(old.operation);
+                    answer = Some(if record.id == upgraded {
+                        Ok(false)
+                    } else if record.id == super::migration_id(upgraded) {
+                        Ok(true)
+                    } else {
+                        Err(io::Error::other("older or unsupported schema-three converter; migrate the original pre-schema-three chain or reimport its sources into a new destination"))
+                    });
                     return Err(io::Error::new(
                         io::ErrorKind::Interrupted,
                         "namespace found",
@@ -60,7 +62,7 @@ fn infer_namespace(root: &Path) -> io::Result<bool> {
         Ok(())
     });
     if let Some(answer) = answer {
-        return Ok(answer);
+        return answer;
     }
     result.map(|_stats| false)
 }

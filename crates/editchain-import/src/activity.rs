@@ -18,7 +18,7 @@ use crate::{BlobSink, ImportError};
 use source::{Derived, Source};
 
 /// Version of the deterministic converter, separate from EC03 framing.
-pub const CONTRACT: &str = "activity-schema3-v1";
+pub const CONTRACT: &str = "activity-schema3-v2";
 
 /// Small metadata gathered before a bounded conversion pass.
 #[derive(Debug, Default)]
@@ -30,7 +30,7 @@ pub struct Converter {
     removed: BTreeSet<OpId>,
     redirects: BTreeMap<OpId, OpId>,
     sessions: BTreeMap<u64, ItemId>,
-    causes: BTreeMap<OpId, Vec<ItemId>>,
+    retained: BTreeMap<OpId, OpId>,
     blocked: BTreeSet<OpId>,
     calls: calls::Calls,
     files: BTreeMap<OpId, (editchain_core::PathId, Option<OpId>)>,
@@ -52,6 +52,7 @@ impl Converter {
 
     fn protect_conflicts(&mut self, conflicts: BTreeSet<OpId>) {
         for id in &conflicts {
+            let _old = self.retained.insert(upgrade_id(*id), *id);
             let _removed = self.removed.remove(id);
             let _redirect = self.redirects.remove(&upgrade_id(*id));
             if let Some(folded) = self.folded.remove(id) {
@@ -108,20 +109,8 @@ impl Converter {
                     NoteRelationship::OccurrenceOf
                         | NoteRelationship::Contains
                         | NoteRelationship::ToolResultOf
-                        | NoteRelationship::ProviderParent
-                        | NoteRelationship::LogicalParent
                 ) {
                     if let Some(source) = op.parents.iter().next() {
-                        if matches!(
-                            note.relationship,
-                            NoteRelationship::ProviderParent | NoteRelationship::LogicalParent
-                        ) {
-                            self.causes.entry(*source).or_default().extend(
-                                note.target_ids.iter().copied().map(|id| {
-                                    ItemId::derive("legacy-native-entity", id.as_bytes())
-                                }),
-                            );
-                        }
                         self.fold(op.id, *source);
                     }
                 }
@@ -131,8 +120,10 @@ impl Converter {
                     .files
                     .insert(op.id, (file.path, op.parents.iter().next().copied()));
             }
-            OpKind::ChainStart(_)
-            | OpKind::Actor(_)
+            OpKind::ChainStart(_) => {
+                let _old = self.retained.insert(upgrade_id(op.id), op.id);
+            }
+            OpKind::Actor(_)
             | OpKind::Session(_)
             | OpKind::Message(_)
             | OpKind::Tool(_)
@@ -307,6 +298,7 @@ impl Converter {
             &mut record,
             original.and_then(|id| self.sources.get(&id)),
         );
+        source::parent_link(op, &mut record);
         if let Kind::Tool(tool) = &mut record.kind {
             tool.attempt = self
                 .derived
@@ -320,20 +312,7 @@ impl Converter {
                 file.name.clone_from(path);
             }
         }
-        record.map_operation_ids(|id| self.redirects.get(&id).copied().unwrap_or(id));
-        if self.migration {
-            let blocked: BTreeMap<_, _> = self
-                .blocked
-                .iter()
-                .map(|id| (upgrade_id(*id), *id))
-                .collect();
-            record.map_operation_ids(|id| {
-                blocked
-                    .get(&id)
-                    .copied()
-                    .unwrap_or_else(|| migration_id(id))
-            });
-        }
+        record.map_operation_ids(|id| self.output_id(id));
         let mut output = Vec::new();
         if let Some(info) = self.sources.get(&op.id) {
             if let Some(session) = info.session_record(&record) {
@@ -367,11 +346,22 @@ impl Converter {
         );
         Ok(output)
     }
+
+    fn output_id(&self, id: OpId) -> OpId {
+        let target = self.redirects.get(&id).copied().unwrap_or(id);
+        self.retained.get(&target).copied().unwrap_or_else(|| {
+            if self.migration {
+                migration_id(target)
+            } else {
+                target
+            }
+        })
+    }
 }
 
 fn migration_id(id: OpId) -> OpId {
     OpId::from_bytes(blake3::derive_key(
-        "editchain.schema3-migration.v1",
+        "editchain.schema3-migration.v2",
         id.as_bytes(),
     ))
 }

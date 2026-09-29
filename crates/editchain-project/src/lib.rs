@@ -199,7 +199,7 @@ impl HistoryProjection {
         for op in &ops {
             git.reduce(op);
             if is_projected_relation_fact(op) && !provider_relations.replaces_legacy_note(op) {
-                if let Some(parent) = op.parents.iter().next() {
+                if let Some(parent) = op.parent_ids().next() {
                     relationship_notes
                         .entry(*parent)
                         .or_default()
@@ -208,8 +208,9 @@ impl HistoryProjection {
             }
         }
         for note in provider_relations.notes {
-            if let Some(parent) = note.parents.iter().next() {
-                relationship_notes.entry(*parent).or_default().push(note);
+            let parent = note.parent_ids().next().copied();
+            if let Some(parent) = parent {
+                relationship_notes.entry(parent).or_default().push(note);
             }
         }
         let mut projection = Self {

@@ -48,20 +48,31 @@ impl std::error::Error for ReplayError {}
 pub struct StreamState {
     records: BTreeMap<OpId, Operation>,
     items: BTreeMap<ItemId, BTreeSet<OpId>>,
+    conflicts: BTreeSet<OpId>,
+    quarantined: BTreeMap<(ItemId, Option<ItemId>), BTreeSet<OpId>>,
 }
 
 impl StreamState {
     /// Accept delivery in any order; exact repeats are idempotent.
     /// # Errors
-    /// Rejects invalid records and conflicting event identities.
+    /// Rejects invalid records. Conflicting identities are permanently inert;
+    /// subsequent reads of affected items/attempts also report the conflict.
     pub fn insert(&mut self, operation: Operation) -> Result<bool, ReplayError> {
         operation.validate().map_err(ReplayError::Invalid)?;
+        if self.conflicts.contains(&operation.id) {
+            self.quarantine(&operation);
+            return Err(ReplayError::Conflict(operation.id));
+        }
         if let Some(existing) = self.records.get(&operation.id) {
-            return if existing == &operation {
-                Ok(false)
-            } else {
-                Err(ReplayError::Conflict(operation.id))
-            };
+            if existing == &operation {
+                return Ok(false);
+            }
+            if let Some(existing) = self.records.remove(&operation.id) {
+                self.quarantine(&existing);
+            }
+            self.quarantine(&operation);
+            let _inserted = self.conflicts.insert(operation.id);
+            return Err(ReplayError::Conflict(operation.id));
         }
         let _inserted = self
             .items
@@ -70,6 +81,19 @@ impl StreamState {
             .insert(operation.id);
         let _previous = self.records.insert(operation.id, operation);
         Ok(true)
+    }
+
+    fn quarantine(&mut self, record: &Operation) {
+        let attempt = if let Kind::Tool(tool) = &record.kind {
+            Some(tool.attempt)
+        } else {
+            None
+        };
+        let _inserted = self
+            .quarantined
+            .entry((record.item, attempt))
+            .or_default()
+            .insert(record.id);
     }
 
     /// Reconstruct one logical block. Calls must specify their attempt ID.
@@ -83,6 +107,13 @@ impl StreamState {
         attempt: Option<ItemId>,
         mut resolve: impl FnMut(&Payload) -> Option<Vec<u8>>,
     ) -> Result<Option<ContentState>, ReplayError> {
+        if let Some(id) = self
+            .quarantined
+            .get(&(item, attempt))
+            .and_then(BTreeSet::first)
+        {
+            return Err(ReplayError::Conflict(*id));
+        }
         let updates: BTreeMap<_, _> = self
             .items
             .get(&item)
@@ -93,6 +124,7 @@ impl StreamState {
                 update(record, block, attempt).map(|value| (record.id, (record, value)))
             })
             .collect();
+        self.validate_predecessors(&updates)?;
         let referenced: BTreeSet<_> = updates
             .values()
             .filter_map(|(_, value)| value.previous)
@@ -114,17 +146,10 @@ impl StreamState {
                 .ok_or_else(|| ReplayError::Ambiguous(heads.clone()))?,
         };
         let mut cursor = Some(head);
-        let mut visited = BTreeSet::new();
         let mut parts = Vec::new();
         let mut complete = false;
         while let Some(id) = cursor {
-            if !visited.insert(id) {
-                return Err(ReplayError::Cycle(id));
-            }
             let Some((_, value)) = updates.get(&id) else {
-                if self.records.contains_key(&id) {
-                    return Err(ReplayError::WrongPredecessor(id));
-                }
                 break;
             };
             if value.content == Payload::Empty {
@@ -149,6 +174,39 @@ impl StreamState {
                 .any(|record| finished(record, attempt)),
             head,
         }))
+    }
+
+    // Validate links even behind a replacement. Missing content is unnecessary
+    // for a full snapshot, but a known wrong or cyclic predecessor is still invalid.
+    fn validate_predecessors(
+        &self,
+        updates: &BTreeMap<OpId, (&Operation, &ContentUpdate)>,
+    ) -> Result<(), ReplayError> {
+        let mut done = BTreeSet::new();
+        for start in updates.keys() {
+            let mut path = BTreeSet::new();
+            let mut cursor = Some(*start);
+            while let Some(id) = cursor {
+                if self.conflicts.contains(&id) {
+                    return Err(ReplayError::Conflict(id));
+                }
+                if done.contains(&id) {
+                    break;
+                }
+                let Some((_, value)) = updates.get(&id) else {
+                    if self.records.contains_key(&id) {
+                        return Err(ReplayError::WrongPredecessor(id));
+                    }
+                    break;
+                };
+                if !path.insert(id) {
+                    return Err(ReplayError::Cycle(id));
+                }
+                cursor = value.previous;
+            }
+            done.extend(path);
+        }
+        Ok(())
     }
 }
 

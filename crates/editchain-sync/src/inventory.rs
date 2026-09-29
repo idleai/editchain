@@ -28,7 +28,7 @@ pub(crate) fn parent_first(records: &crate::evidence::Records) -> io::Result<Vec
                     .get(&key)
                     .ok_or_else(|| invalid("missing inventory record"))?;
                 let op = decode_op(bytes).map_err(io::Error::other)?;
-                for parent in &op.parents {
+                for parent in op.parent_ids() {
                     // All conflicting variants precede descendants. Missing or
                     // withheld parents stay missing; ordering grants no export authority.
                     let first = keys.partition_point(|key| key.id < *parent);

@@ -45,6 +45,12 @@ unjoined branches. Whole snapshots can use a recorded sequence from one recorder
 timestamps and hash order do not decide which snapshot wins. Final archive records
 do not manufacture starts, intermediate chunks or successful outcomes.
 
+A conflicting ID permanently quarantines all its versions in replay. Reads of
+affected items or tool attempts fail explicitly. Replacements still validate
+known predecessors, including their item, block, attempt and cycle structure;
+rebuilding a snapshot does not require superseded payload bytes. Consumers use
+`Op::parent_ids()` for the complete causal list, including third and later parents.
+
 ## Imports and migration
 
 ```sh
@@ -64,6 +70,13 @@ Recognized file-path notes move into File.name. Unsupported source structures re
 available through their original bytes. Original records are independently indexed;
 select an activity type to keep raw input out of a study view.
 
+Claude's ordinary and logical parent relationships remain separate Link records.
+Their targets use session-scoped item IDs, so links remain useful when their
+endpoints arrive later. Commit records and operation-to-Git Links feed the same Git
+projection as older records. Buffered import storage supports reading captured
+source blobs before conversion; unreadable source blobs fail the import before
+cursor acceptance.
+
 `--legacy` selects the previous capture schema and cursors. `--raw-only` retains
 Original records only and uses separate cursors, allowing later normalization to
 backfill activities. These options do not rewrite existing chains.
@@ -74,6 +87,7 @@ stored in the converted records. The index can rebuild those mappings. Source
 segments are retained byte-for-byte under `migration-v1/original`. Unknown binary
 records and conflicting old representations retain their exact bytes. Legacy
 ChainStart records remain initialization data outside the new activity enum.
+References to these unchanged records retain their original IDs.
 
 Fresh capture and physical migration use different deterministic ID namespaces,
 because only migration embeds the complete folded-address mapping. A migrated
@@ -84,6 +98,16 @@ refuses chains with configured sharing rules, leaving the source intact, until
 those rules can be translated across folded records.
 Sources that already contain schema-three records are also rejected: use that
 chain directly so a repeated conversion cannot change future import identities.
+
+The corrected converter contract is `activity-schema3-v2`. It uses new conversion
+ID namespaces to avoid assigning changed record bytes to an existing ID. EC03
+framing and the canonical ID format are unchanged. Chains created by the earlier
+converter remain readable, but new imports into them are rejected. To obtain a
+corrected chain, reimport the original sources into a new destination, or migrate
+the original pre-schema-three chain again. A physical migration retains that
+original under `migration-v1/original`. Keep the earlier chain for any activities
+that were authored directly in it; this converter does not rewrite schema-three
+records.
 
 Indexes rebuild under `index-v3`; editor/live caches use `editor-v3` and `live-v3`.
 Peer compatibility is version 5. Older binary operation schemas remain readable.

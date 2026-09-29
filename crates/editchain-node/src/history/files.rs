@@ -215,7 +215,7 @@ pub(super) fn agent_file_change_index(
     let raw_codex_candidates: std::collections::HashSet<OpId> = ops
         .iter()
         .filter(|op| matches!(op.kind, OpKind::File(_)))
-        .flat_map(|op| op.parents.iter())
+        .flat_map(Op::parent_ids)
         .filter(|parent| import_ids.contains(parent))
         .copied()
         .collect();
@@ -270,8 +270,7 @@ pub(super) fn agent_file_change_index(
 
     for op in ops {
         let owner = op
-            .parents
-            .iter()
+            .parent_ids()
             .find(|parent| import_ids.contains(parent))
             .copied()
             .unwrap_or(op.id);

@@ -128,7 +128,7 @@ fn operation_text(
         OpKind::Reflection(reflection) => resolve(&reflection.summary),
         OpKind::File(_) => files
             .get(&op.id)
-            .or_else(|| op.parents.iter().find_map(|parent| files.get(parent)))
+            .or_else(|| op.parent_ids().find_map(|parent| files.get(parent)))
             .map(|changes| file_paths(changes)),
         OpKind::GitLink(link) => Some(format!("git:{} {:?}", link.target_oid, link.kind)),
         OpKind::ChainStart(_)
