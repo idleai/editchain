@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::provider::{CodexThreadId, ProviderFact};
 use crate::{Op, OpId, OpKind};
+use editchain_core::SourceId;
 use serde::{Deserialize, Serialize};
 
 mod copies;
@@ -63,6 +64,9 @@ pub struct ImportCopy {
 /// Derived import state; canonical occurrences, revisions and conflicts are not rewritten.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportState {
+    /// Schema-three logical items and every immutable observation; no latest value is guessed.
+    #[serde(default)]
+    pub activity_items: Vec<ActivityItem>,
     /// Source-ordered derivation selections and validated output ownership.
     pub derivations: Vec<ImportDerivation>,
     /// Current Codex logical items after explicit upserts/removals and proven copies.
@@ -72,6 +76,15 @@ pub struct ImportState {
     /// Present raw occurrences in streams with incomplete or ambiguous derivation coverage.
     /// Raw-only sources can appear here; no logical state is guessed for them.
     pub incomplete_sources: Vec<OpId>,
+}
+
+/// Direct logical item membership retained by schema-three operations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityItem {
+    /// Stable logical item address.
+    pub item: editchain_core::activity::ItemId,
+    /// All recorded observations, ordered by operation ID rather than arrival time.
+    pub observations: Vec<OpId>,
 }
 
 impl ImportState {
@@ -89,7 +102,7 @@ impl ImportState {
     pub fn from_partial_ops(ops: &[Op], incomplete: &HashSet<OpId>) -> Self {
         let by_id: HashMap<OpId, &Op> = ops.iter().map(|op| (op.id, op)).collect();
         let records: Vec<_> = ops.iter().filter_map(decode_evidence).collect();
-        let mut by_source: BTreeMap<OpId, Vec<&EvidenceRecord<'_>>> = BTreeMap::new();
+        let mut by_source: BTreeMap<SourceId, Vec<&EvidenceRecord<'_>>> = BTreeMap::new();
         for record in &records {
             if Derivation::from_fact(&record.payload.fact).is_some() && valid_source(record, &by_id)
             {
@@ -99,12 +112,29 @@ impl ImportState {
                     .push(record);
             }
         }
-        let mut state = Self::default();
+        let mut modern = BTreeMap::<_, Vec<_>>::new();
+        for op in ops {
+            if let OpKind::Activity(record) = &op.kind {
+                modern.entry(record.item).or_default().push(record.id);
+            }
+        }
+        let mut state = Self {
+            activity_items: modern
+                .into_iter()
+                .map(|(item, mut observations)| {
+                    observations.sort_unstable();
+                    observations.dedup();
+                    ActivityItem { item, observations }
+                })
+                .collect(),
+            ..Self::default()
+        };
         let mut logical: BTreeMap<SourceKey, LogicalTurns> = BTreeMap::new();
         let mut blocked = incomplete_sources(&by_source, &by_id);
         let mut selected_codex = BTreeMap::new();
         for (source, records) in &by_source {
-            let selected = select(records).filter(|meta| complete_outputs(*meta, *source, &by_id));
+            let selected =
+                select(records).filter(|meta| complete_outputs(*meta, source.id(), &by_id));
             let fact = match selected {
                 Some(Derivation::Codex(meta)) => {
                     let _previous = selected_codex.insert(*source, meta);
@@ -124,8 +154,8 @@ impl ImportState {
                 }
             };
             state.derivations.push(ImportDerivation {
-                source: *source,
-                outputs: tracked_outputs(*source, records, &by_id),
+                source: source.id(),
+                outputs: tracked_outputs(source.id(), records, &by_id),
                 selected: fact,
             });
         }
@@ -147,7 +177,10 @@ impl ImportState {
         state.incomplete_sources = ops
             .iter()
             .filter(|op| {
-                matches!(op.kind, OpKind::Import(_)) && blocked.contains(&source_key(op.id))
+                matches!(op.kind, OpKind::Import(_))
+                    && op
+                        .source
+                        .is_some_and(|source| blocked.contains(&source_key(source)))
             })
             .map(|op| op.id)
             .collect();
@@ -164,18 +197,18 @@ fn tracked_outputs(
     let mut tracked = std::collections::BTreeSet::new();
     for record in records {
         if let Some(meta) = Derivation::from_fact(&record.payload.fact) {
-            let outputs = meta.outputs().iter().copied().collect();
+            let outputs = meta.outputs().iter().map(|source| source.id()).collect();
             tracked.extend(
                 meta.outputs()
                     .iter()
-                    .filter(|output| reaches_source(**output, source, &outputs, by_id))
-                    .copied(),
+                    .filter(|output| reaches_source(output.id(), source, &outputs, by_id))
+                    .map(|source| source.id()),
             );
         }
     }
     tracked.into_iter().collect()
 }
 
-fn source_key(source: OpId) -> SourceKey {
+fn source_key(source: SourceId) -> SourceKey {
     (source.node.0, source.boot)
 }

@@ -32,6 +32,28 @@ impl ChainQueries {
         let mut history = self.history(None, page)?;
         history.items.retain(|entry| {
             let key = match &entry.operation.kind {
+                OpKind::Activity(record) => match &record.kind {
+                    editchain_core::activity::Kind::Commit(commit) => {
+                        Some((commit.repository, commit.oid))
+                    }
+                    editchain_core::activity::Kind::Link(link) => {
+                        link.to.iter().find_map(|target| match target {
+                            editchain_core::activity::Entity::Git { repository, oid } => {
+                                Some((*repository, *oid))
+                            }
+                            editchain_core::activity::Entity::Operation(_)
+                            | editchain_core::activity::Entity::Item(_) => None,
+                        })
+                    }
+                    editchain_core::activity::Kind::Session(_)
+                    | editchain_core::activity::Kind::Turn(_)
+                    | editchain_core::activity::Kind::Message(_)
+                    | editchain_core::activity::Kind::Tool(_)
+                    | editchain_core::activity::Kind::File(_)
+                    | editchain_core::activity::Kind::Note(_)
+                    | editchain_core::activity::Kind::Author(_)
+                    | editchain_core::activity::Kind::Original(_) => None,
+                },
                 OpKind::GitCommit(commit) => Some((commit.repository, commit.oid)),
                 OpKind::GitLink(link) => Some((link.target_repo, link.target_oid)),
                 OpKind::ChainStart(_)

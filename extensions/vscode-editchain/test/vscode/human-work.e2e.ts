@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import type { Tab, TabGroup, TabInputText } from 'vscode';
 
 type WorkRow = { author: string; parents: string[]; node_key: string; is_subop: boolean;
@@ -34,6 +35,22 @@ function storedReads(): any[] {
     try { source = JSON.parse(text); } catch { return []; } // File-content blobs need not be JSON.
     return source?.source === 'vscode.editor' && source.event?.event?.type === 'code_read' ? [source.event] : [];
   }).sort((left, right) => left.sequence - right.sequence);
+}
+
+const sourceStreams = new Map<string, string>();
+function sourceStream(id: string): string {
+  const cached = sourceStreams.get(id);
+  if (cached) return cached;
+  const cli = process.env.EDITCHAIN_WORK_CLI || path.resolve(__dirname, '../../../../target/debug/editchain');
+  const chain = path.join(process.env.EDITCHAIN_WORK_FIXTURE!, 'workspace', '.editchain');
+  const result = execFileSync(cli, ['--chain', chain, '--output', 'jsonl', 'operation', id], { encoding: 'utf8' });
+  // Read explicit provenance; canonical IDs do not contain recorder fields.
+  // Keep u64 digits in their JSON spelling, without JavaScript Number rounding.
+  const source = /"source":\{"node":(\d+),"boot":(\d+),"seq":\d+\}/.exec(result);
+  assert.ok(source, 'human work retains recorder provenance');
+  const stream = `${source[1]}:${source[2]}`;
+  sourceStreams.set(id, stream);
+  return stream;
 }
 
 async function readRows(): Promise<WorkRow[]> {
@@ -388,13 +405,13 @@ describe('production human-work capture', () => {
       return !!next;
     }, { timeout: 30000 });
     assert.ok(next);
-    // Work IDs remain recorder-qualified even when a short episode has no
-    // task disclosure metadata. The graph group is the persistent identity.
-    const incarnation = next.node_key.split(':')[0];
+    // Explicit source provenance identifies the recorder; the graph group is
+    // the persistent human identity shared across recorder incarnations.
+    const incarnation = sourceStream(next.node_key);
     const expanded = new Set<string>();
     for (let count = 0; count < 8; count++) {
-      const header = (await readRows()).find(row => row.node_key.split(':')[0] === incarnation
-        && row.task_group && !row.task_group.expanded && !expanded.has(row.task_group.task_id));
+      const header = (await readRows()).find(row => row.task_group && !row.task_group.expanded && !expanded.has(row.task_group.task_id)
+        && row.group === next!.group && sourceStream(row.node_key) === incarnation);
       if (!header) break;
       const task = header.task_group!.task_id;
       expanded.add(task);
@@ -408,7 +425,7 @@ describe('production human-work capture', () => {
     fs.writeFileSync(path.join(output, 'human-identity-reload.json'), JSON.stringify({ identity, previous, next, rows }, null, 2));
     assert.equal(next.group, previous.group, 'persistent identity owns the same graph group');
     assert.equal(next.lane, previous.lane, 'reload keeps the persistent human lane');
-    assert.notEqual(incarnation, previous.node_key.split(':')[0], 'restart creates a fresh recorder incarnation');
+    assert.notEqual(incarnation, sourceStream(previous.node_key), 'restart creates a fresh recorder incarnation');
     const byId = new Map(rows.map(row => [row.node_key, row]));
     let cursor: WorkRow | undefined = next;
     const seen = new Set<string>();

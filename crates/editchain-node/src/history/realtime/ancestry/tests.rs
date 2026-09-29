@@ -7,6 +7,7 @@ fn id(seq: u64) -> OpId {
 
 fn operation(seq: u64, parent: Option<u64>) -> Op {
     Op {
+        source: None,
         id: id(seq),
         parents: parent.map_or(ParentSet::None, |parent| ParentSet::One(id(parent))),
         actor: ActorId(1),

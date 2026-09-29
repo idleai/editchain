@@ -138,7 +138,7 @@ mod tests {
         check(
             chain
                 .located_ops()
-                .filter(|(op, _)| op.id.node == foreign.id.node)
+                .filter(|(op, _)| op.source.unwrap().node == foreign.source.unwrap().node)
                 .count()
                 == 1,
             "remote raw evidence remains unchanged",

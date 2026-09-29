@@ -22,6 +22,7 @@ use editchain_engine::{
 
 fn record(sequence: u64, scope: ScopeRef, kind: OpKind) -> OperationRecord {
     OperationRecord {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 0, sequence)),
         id: OpId::new(NodeId(1), 0, sequence),
         parents: sequence.checked_sub(1).map_or(ParentSet::None, |parent| {
             ParentSet::One(OpId::new(NodeId(1), 0, parent))

@@ -99,8 +99,8 @@ impl HumanArchiveRecord {
         }
     }
 
-    fn archive_id(&self) -> Result<OpId, ImportError> {
-        Ok(derive_external_entity_id(
+    fn archive_id(&self) -> Result<editchain_core::SourceId, ImportError> {
+        Ok(crate::ids::derive_external_entity_source(
             "human:archive-record:v1",
             &serde_json::to_string(&self.native_identity())?,
         ))
@@ -114,7 +114,7 @@ impl HumanArchiveRecord {
 ///
 /// # Errors
 /// Returns an encoding error if the hash cannot supply the fixed identity bytes.
-pub fn native_event_id(session: &str, sequence: u64) -> io::Result<OpId> {
+pub fn native_event_source(session: &str, sequence: u64) -> io::Result<editchain_core::SourceId> {
     let hash = blake3::derive_key("editchain.vscode.editor.session.v1", session.as_bytes());
     let mut node = [0_u8; 8];
     node.copy_from_slice(
@@ -126,7 +126,7 @@ pub fn native_event_id(session: &str, sequence: u64) -> io::Result<OpId> {
         hash.get(8..12)
             .ok_or_else(|| io::Error::other("invalid hash"))?,
     );
-    Ok(OpId::new(
+    Ok(editchain_core::SourceId::new(
         NodeId(u64::from_le_bytes(node)),
         u32::from_le_bytes(boot),
         sequence,
@@ -135,7 +135,7 @@ pub fn native_event_id(session: &str, sequence: u64) -> io::Result<OpId> {
 
 /// Recover a native mapping from retained raw archive bytes.
 #[must_use]
-pub fn human_mapping(source: OpId, raw: &[u8]) -> Option<NativeMapping> {
+pub fn human_mapping(source: editchain_core::SourceId, raw: &[u8]) -> Option<NativeMapping> {
     Some(NativeMapping {
         identity: HumanArchiveRecord::parse(raw)?.native_identity(),
         source,
@@ -221,7 +221,7 @@ pub(crate) fn import_human_files(
                 .checked_add(u64::try_from(index).map_err(io::Error::other)?)
                 .and_then(|ordinal| ordinal.checked_add(1))
                 .ok_or_else(|| ImportError::CursorStore("human record ordinal exhausted".into()))?;
-            let fallback = stream.op_from_position(SourcePosition::raw(ordinal))?;
+            let fallback = stream.source_position(SourcePosition::raw(ordinal))?;
             let raw = raw_op(record.as_ref(), line, fallback, blobs)?;
             emit_op(&raw, ops, &mut report, EmissionKind::Raw)?;
             if let Some(record) = record {
@@ -244,11 +244,12 @@ pub(crate) fn import_human_files(
 fn raw_op(
     record: Option<&HumanArchiveRecord>,
     line: &LineWithHash,
-    fallback: OpId,
+    fallback: editchain_core::SourceId,
     blobs: &mut dyn BlobSink,
 ) -> Result<Op, ImportError> {
     let mut raw = Op {
-        id: fallback,
+        source: Some(fallback),
+        id: fallback.id(),
         parents: ParentSet::None,
         actor: ActorId(0),
         clock: Clock::None,
@@ -260,9 +261,11 @@ fn raw_op(
         }),
     };
     if let Some(record) = record {
-        raw.id = record.archive_id()?;
+        let source = record.archive_id()?;
+        raw.id = source.id();
+        raw.source = Some(source);
         raw.clock = Clock::UnixMs(record.event.time_ms);
-        let native = native_event_id(&record.event.session, record.event.sequence)?;
+        let native = native_event_source(&record.event.session, record.event.sequence)?;
         raw.actor = ActorId(native.node.0);
         if let Some(identity) = &record.event.identity {
             raw.actor = ActorId(derive_node_id(&format!("human:unsigned:{}", identity.guid)).0);
@@ -284,13 +287,17 @@ fn occurrence(
 ) -> Result<Op, ImportError> {
     let mapping = NativeMapping {
         identity: record.native_identity(),
-        source: raw.id,
+        source: crate::ids::provenance(raw)?,
         raw_hash,
         outputs: Vec::new(),
         incarnation: None,
     };
     let content = serde_json::to_string(&mapping)?;
     Ok(Op {
+        source: Some(crate::ids::derive_external_entity_source(
+            "human:archive-mapping:v1",
+            &content,
+        )),
         id: derive_external_entity_id("human:archive-mapping:v1", &content),
         parents: ParentSet::One(raw.id),
         actor: raw.actor,
@@ -332,4 +339,11 @@ pub(crate) fn archives(
     }
     files.sort();
     Ok(files)
+}
+
+/// Canonical identity of a native editor event, preserving its producer contract.
+/// # Errors
+/// Returns an error if the producer descriptor cannot be encoded.
+pub fn native_event_id(session: &str, sequence: u64) -> io::Result<OpId> {
+    native_event_source(session, sequence).map(editchain_core::SourceId::id)
 }

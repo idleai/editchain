@@ -1,5 +1,5 @@
 use super::{agent, batch, event, git, live_request, records, window};
-use editchain_core::{human::HumanWorkKind, ContentId, NodeId, OpId, OpKind, ParentSet, Payload};
+use editchain_core::{human::HumanWorkKind, ContentId, NodeId, OpKind, ParentSet, Payload};
 use editchain_node::Server;
 use editchain_protocol::Request;
 use editchain_store::{
@@ -126,7 +126,7 @@ fn unsigned_identity_connects_reloads_and_interleaved_recorders_beside_agents() 
     let context = live_request(&mut first, json!({"GetEditorContext":query}));
     let agent_id = agent(
         root,
-        OpId::new(NodeId(83), 0, 1),
+        editchain_core::SourceId::new(NodeId(83), 0, 1),
         "base",
         "AI",
         &context["repositories"][0],
@@ -171,7 +171,12 @@ fn unsigned_identity_connects_reloads_and_interleaved_recorders_beside_agents() 
         .map(|(session, sequence)| {
             human
                 .iter()
-                .find(|(_, work)| work.session == *session && work.source_event.seq == *sequence)
+                .find(|(_, work)| {
+                    work.session == *session
+                        && work.source_event
+                            == editchain_import::human::native_event_id(&work.session, *sequence)
+                                .expect("valid event")
+                })
                 .expect("work")
         })
         .collect();

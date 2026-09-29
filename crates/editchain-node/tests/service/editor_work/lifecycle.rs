@@ -1,5 +1,5 @@
 use super::{agent, batch, changed, document, event, git, live_request, records, start, window};
-use editchain_core::{human::HumanWorkKind, NodeId, OpId, OpKind, ParentSet, Payload};
+use editchain_core::{human::HumanWorkKind, NodeId, OpKind, ParentSet, Payload};
 use editchain_node::Server;
 use editchain_store::{
     format::{encode_op, Page},
@@ -255,14 +255,14 @@ fn independent_recorders_and_agents_keep_their_series_when_git_changes_outside_c
     let initial = live_request(&mut recorder, json!({"GetEditorContext":open}));
     let first_agent = agent(
         root,
-        OpId::new(NodeId(81), 0, 1),
+        editchain_core::SourceId::new(NodeId(81), 0, 1),
         "base",
         "agent one",
         &initial["repositories"][0],
     );
     let second_agent = agent(
         root,
-        OpId::new(NodeId(82), 0, 1),
+        editchain_core::SourceId::new(NodeId(82), 0, 1),
         "agent one",
         "agent two",
         &initial["repositories"][0],
@@ -421,7 +421,7 @@ fn legacy_raw_capture_backfills_after_payload_repair_without_changing_source_byt
         if let OpKind::Import(import) = &op.kind {
             if let Payload::Blob(blob) = &import.raw_ref {
                 legacy.add_record(0, encode_op(op).expect("raw encoding"));
-                if op.id.seq == 3 {
+                if op.source.unwrap().seq == 3 {
                     let editchain_core::ContentId::Hash256(hash) = blob.id else {
                         panic!("hashed payload")
                     };

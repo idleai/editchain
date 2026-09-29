@@ -254,7 +254,7 @@ pub enum GitAvailability {
 /// A commit may be imported only, live only, or both. When both are present
 /// they are merged into one entity keyed by `(RepositoryId, GitOid)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GitCommitEntity {
+pub struct GitCommitEntity<I = OpId> {
     /// Repository this commit belongs to.
     pub repository: RepositoryId,
     /// Object format of the repository.
@@ -262,7 +262,7 @@ pub struct GitCommitEntity {
     /// Full commit OID.
     pub oid: GitOid,
     /// `EditChain` operation that imported this commit, if any.
-    pub imported_record: Option<OpId>,
+    pub imported_record: Option<I>,
     /// Availability of the underlying object data.
     pub availability: GitAvailability,
     /// Tree OID referenced by this commit.
@@ -287,7 +287,7 @@ pub struct GitCommitEntity {
     pub changed_paths: Vec<PathId>,
 }
 
-impl GitCommitEntity {
+impl<I> GitCommitEntity<I> {
     /// Repository-qualified identity used by graph and view consumers.
     #[must_use]
     pub const fn key(&self) -> GitCommitKey {
@@ -322,9 +322,9 @@ pub enum GitLinkKind {
 
 /// An explicit link from an `EditChain` operation to a Git object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GitLink {
+pub struct GitLink<I = OpId> {
     /// The `EditChain` operation that is the source of the link.
-    pub source: OpId,
+    pub source: I,
     /// Repository containing the target object.
     pub target_repo: RepositoryId,
     /// Target object OID.
@@ -333,7 +333,7 @@ pub struct GitLink {
     pub kind: GitLinkKind,
 }
 
-impl GitLink {
+impl<I> GitLink<I> {
     /// Repository-qualified target, shared by ancestry and display adapters.
     #[must_use]
     pub const fn target_key(&self) -> GitCommitKey {

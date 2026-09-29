@@ -33,8 +33,11 @@ fn rebuild_reopen_and_reverse_replay_preserve_all_query_results_and_bytes() {
     let blob = engine.store_blob(bytes).unwrap();
     let canonical = encode_op(&message(1, Payload::Inline(b"needle".to_vec()))).unwrap();
     // Preserve an accepted overlong varint; the record hash uses the original bytes.
-    let mut original = vec![0x81, 0];
-    original.extend_from_slice(canonical.get(1..).unwrap());
+    // Schema prefix (15), fixed ID (32), absent source (1), then ParentSet::None.
+    assert_eq!(canonical.get(48), Some(&0));
+    let mut original = canonical.get(..48).unwrap().to_vec();
+    original.extend_from_slice(&[0x80, 0]);
+    original.extend_from_slice(canonical.get(49..).unwrap());
     assert_eq!(
         engine.append_encoded(&original).unwrap(),
         Admission::Accepted

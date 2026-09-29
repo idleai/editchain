@@ -56,10 +56,8 @@ pub(super) fn validate_sequence(
     if event.sequence == 1 {
         return Ok(());
     }
-    let previous = OpId {
-        seq: event.sequence.saturating_sub(1),
-        ..op.id
-    };
+    let previous =
+        editchain_import::human::native_event_id(&event.session, event.sequence.saturating_sub(1))?;
     let retained = super::remote::retained_source(chain, root, previous)?;
     if let Some(previous) = staged.get(&previous).or(retained.as_ref()) {
         if previous.actor != op.actor || previous.scope != op.scope {

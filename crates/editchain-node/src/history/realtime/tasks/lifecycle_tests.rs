@@ -15,9 +15,10 @@ fn record(
     status: &str,
     authentic_slot: bool,
 ) -> Vec<Op> {
-    let source = OpId::new(NodeId(1), 0, ordinal << 16);
+    let source = editchain_core::SourceId::new(NodeId(1), 0, ordinal << 16);
     let raw = Op {
-        id: source,
+        source: Some(source),
+        id: source.id(),
         parents: ParentSet::None,
         actor: ActorId(1),
         clock: Clock::UnixMs(ordinal),
@@ -39,8 +40,13 @@ fn record(
         NodeId(3)
     };
     let note = Op {
+        source: Some(editchain_core::SourceId::new(
+            namespace,
+            0,
+            source.seq.saturating_add(1),
+        )),
         id: OpId::new(namespace, 0, source.seq.saturating_add(1)),
-        parents: ParentSet::One(source),
+        parents: ParentSet::One(source.id()),
         scope: ScopeRef::Turn(editchain_import::derive_turn_id("thread:turn")),
         tags: Tags::NOTE | Tags::IMPORT,
         kind: OpKind::Note(NoteOp {
@@ -58,13 +64,14 @@ fn record(
             thread: CodexThreadId("thread".into()),
             contract,
             includes_thinking: false,
-            outputs: vec![note.id],
+            outputs: vec![note.source.unwrap()],
             changes: Vec::new(),
         }),
     };
     let proof = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(2), 0, source.seq)),
         id: OpId::new(NodeId(2), 0, source.seq),
-        parents: ParentSet::One(source),
+        parents: ParentSet::One(source.id()),
         tags: Tags::META | Tags::IMPORT,
         kind: OpKind::Note(NoteOp {
             target_ids: Vec::new(),
@@ -81,7 +88,7 @@ fn task() -> TaskIdentity {
         key: "task".into(),
         thread: "thread".into(),
         turn: "turn".into(),
-        boundary: OpId::new(NodeId(1), 0, 0),
+        boundary: editchain_core::SourceId::new(NodeId(1), 0, 0),
     }
 }
 

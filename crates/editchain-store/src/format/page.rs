@@ -29,7 +29,7 @@ pub struct Page {
 }
 
 /// A single record within a page.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     /// Bit-flag field for record-level metadata.
     pub flags: u8,

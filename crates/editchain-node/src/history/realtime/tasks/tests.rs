@@ -7,7 +7,7 @@ fn task(turn: &str) -> TaskIdentity {
         key: format!("thread:{turn}"),
         thread: "thread".into(),
         turn: turn.into(),
-        boundary: OpId::new(NodeId(1), 0, 0),
+        boundary: editchain_core::SourceId::new(NodeId(1), 0, 0),
     }
 }
 

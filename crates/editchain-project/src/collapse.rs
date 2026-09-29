@@ -42,6 +42,7 @@ impl HistoryProjection {
         // ops. Response_item rows consume one pair slot per matching event_msg
         // row as the main loop reaches them in input order.
         let mut echo_pairs = meta::EchoPairState::from_ops(&self.ops);
+        let origins: HashMap<_, _> = self.ops.iter().map(|op| (op.id, op.source)).collect();
         // Set of raw import op ids (the linear backbone).
         let import_ids: std::collections::HashSet<OpId> = self
             .ops
@@ -118,7 +119,8 @@ impl HistoryProjection {
                 | editchain_core::OpKind::Error(_)
                 | editchain_core::OpKind::GitCommit(_)
                 | editchain_core::OpKind::GitLink(_)
-                | editchain_core::OpKind::Unknown(_) => None,
+                | editchain_core::OpKind::Unknown(_)
+                | editchain_core::OpKind::Activity(_) => None,
             })
             .collect();
         for occurrences in event_occurrences.values() {
@@ -146,7 +148,11 @@ impl HistoryProjection {
                 }
             }
             for equivalent in by_payload.values() {
-                let Some(canonical) = equivalent.iter().copied().min() else {
+                let Some(canonical) = equivalent
+                    .iter()
+                    .copied()
+                    .min_by_key(|id| (origins.get(id).copied().flatten(), *id))
+                else {
                     continue;
                 };
                 for occurrence in equivalent {
@@ -165,6 +171,7 @@ impl HistoryProjection {
             &self.relationship_notes,
             &entity_occurrences,
             &representative,
+            &self.ops,
         );
         // Map raw import op id -> its normalized children (in input order).
         let mut children_of: HashMap<OpId, Vec<&Op>> = HashMap::new();
@@ -754,7 +761,8 @@ impl HistoryProjection {
                 | editchain_core::OpKind::Error(_)
                 | editchain_core::OpKind::GitCommit(_)
                 | editchain_core::OpKind::GitLink(_)
-                | editchain_core::OpKind::Unknown(_) => None,
+                | editchain_core::OpKind::Unknown(_)
+                | editchain_core::OpKind::Activity(_) => None,
             })
             .collect()
     }

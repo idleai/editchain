@@ -22,6 +22,18 @@ pub(crate) fn matches_len(references: &References, hash: [u8; 32], length: u64) 
 
 pub(crate) fn structured_payload(op: &Op) -> Option<&Payload> {
     match &op.kind {
+        OpKind::Activity(record) => match &record.kind {
+            editchain_core::activity::Kind::Original(value) => Some(&value.bytes),
+            editchain_core::activity::Kind::Note(value) => Some(&value.content),
+            editchain_core::activity::Kind::Session(_)
+            | editchain_core::activity::Kind::Turn(_)
+            | editchain_core::activity::Kind::Message(_)
+            | editchain_core::activity::Kind::Tool(_)
+            | editchain_core::activity::Kind::File(_)
+            | editchain_core::activity::Kind::Commit(_)
+            | editchain_core::activity::Kind::Author(_)
+            | editchain_core::activity::Kind::Link(_) => None,
+        },
         OpKind::Import(value) => Some(&value.raw_ref),
         OpKind::Note(value) => Some(&value.content),
         OpKind::ChainStart(_)
@@ -55,6 +67,11 @@ pub(crate) fn references(op: &Op) -> References {
     let mut found = BTreeMap::new();
     let mut payloads = Vec::new();
     match &op.kind {
+        OpKind::Activity(record) => {
+            for (id, len) in record.kind.content_addresses() {
+                insert(&mut found, id, len);
+            }
+        }
         OpKind::ChainStart(_) => {}
         OpKind::Session(value) => payloads.extend([&value.label, &value.metadata]),
         OpKind::Actor(value) => payloads.extend([&value.label, &value.role]),

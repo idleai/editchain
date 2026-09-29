@@ -41,7 +41,7 @@ impl LiveSearch {
             Index::open_in_dir(path)?
         } else {
             if !fresh {
-                return Err("live search checkpoint is missing; close History, remove the derived live-v1 directory and run prepare-view".into());
+                return Err("live search checkpoint is missing; close History, remove the derived live-v3 directory and run prepare-view".into());
             }
             Index::create_in_dir(path, schema.build())?
         };

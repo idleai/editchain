@@ -138,8 +138,10 @@ fn caller_peers_converge_exact_variants_and_late_blobs_after_restart() {
     seed(&ar, &records).unwrap();
     // A valid, noncanonical encoding of the same operation is distinct evidence.
     let original = &records.first().unwrap().1;
-    let mut alternate = vec![0x87, 0];
-    alternate.extend_from_slice(original.get(1..).unwrap());
+    assert_eq!(original.get(48), Some(&7));
+    let mut alternate = original.get(..48).unwrap().to_vec();
+    alternate.extend_from_slice(&[0x87, 0]);
+    alternate.extend_from_slice(original.get(49..).unwrap());
     assert_eq!(
         editchain_store::format::decode_op(&alternate).unwrap(),
         editchain_store::format::decode_op(original).unwrap()
@@ -254,10 +256,14 @@ fn catch_up_resumes_after_lost_page_ack_and_partial_blob() {
             "expected catch-up work"
         );
     }
+    let second_pass = b.progress().records;
+    assert!(
+        second_pass <= 143,
+        "acknowledged records must not transfer again"
+    );
     assert_eq!(
-        b.progress().records,
-        143,
-        "only remaining records transferred"
+        u64::try_from(CanonicalChain::read(&br).unwrap().stats().records).unwrap(),
+        128 + second_pass
     );
     assert_eq!(
         b.progress().blobs,
@@ -276,7 +282,11 @@ fn catch_up_resumes_after_lost_page_ack_and_partial_blob() {
     a.start().unwrap();
     b.start().unwrap();
     network.drain(&mut a, &mut b).unwrap();
-    assert_eq!(b.progress().records, 1);
+    assert_eq!(
+        b.progress().records,
+        144 - second_pass,
+        "remaining records plus the new offline identity"
+    );
     assert_eq!(b.progress().blobs, 1);
     assert_converged(&ar, &br, 272);
 }

@@ -5,6 +5,14 @@ use editchain_core::{FileEdit, GitLinkKind, Op, OpKind, Payload};
 use crate::ContentReference;
 
 pub(crate) fn references(op: &Op) -> Vec<ContentReference> {
+    if let OpKind::Activity(record) = &op.kind {
+        return record
+            .kind
+            .content_addresses()
+            .into_iter()
+            .map(|(id, len)| ContentReference { id, len })
+            .collect();
+    }
     let mut result = Vec::new();
     if let OpKind::File(file) = &op.kind {
         result.extend(file.base.into_iter().map(ContentReference::from));
@@ -25,6 +33,12 @@ pub(crate) fn references(op: &Op) -> Vec<ContentReference> {
 
 fn payloads(kind: &OpKind) -> Vec<&Payload> {
     match kind {
+        OpKind::Activity(record) => record
+            .kind
+            .fields()
+            .into_iter()
+            .map(|(_, payload)| payload)
+            .collect(),
         OpKind::ChainStart(_) => Vec::new(),
         OpKind::Actor(op) => vec![&op.label, &op.role],
         OpKind::Session(op) => vec![&op.label, &op.metadata],

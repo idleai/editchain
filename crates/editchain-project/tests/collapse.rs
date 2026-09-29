@@ -106,6 +106,7 @@ fn git_commit(oid_byte: u8, committed_at: i64) -> GitCommitEntity {
 /// Build a raw import op.
 fn import_op(node: u64, seq: u64) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -122,6 +123,7 @@ fn import_op(node: u64, seq: u64) -> Op {
 /// Build one exact relation fact anchored on a raw occurrence.
 fn relation_fact(seq: u64, anchor: OpId, target: OpId, relationship: NoteRelationship) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(91), 0, seq)),
         id: OpId::new(NodeId(91), 0, seq),
         parents: ParentSet::One(anchor),
         actor: ActorId(0),
@@ -139,6 +141,7 @@ fn relation_fact(seq: u64, anchor: OpId, target: OpId, relationship: NoteRelatio
 /// Build a normalized message op whose parent is `parent`.
 fn message_op(node: u64, seq: u64, parent: OpId, text: &str) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -162,6 +165,7 @@ fn tool_op_with_id(position: (u64, u64, OpId), identity: (&str, &str, ToolStage)
     let (node, seq, parent) = position;
     let (name, call_id, stage) = identity;
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -339,6 +343,7 @@ fn completed_command_summary_uses_stdout_or_formatted_output() {
             raw_import.raw_ref = Payload::Inline(raw.to_string().into_bytes());
         }
         let command = Op {
+            source: Some(editchain_core::SourceId::new(NodeId(node), 0, 2)),
             id: OpId::new(NodeId(node), 0, 2),
             parents: ParentSet::One(import.id),
             actor: ActorId(1),
@@ -606,6 +611,7 @@ fn session_title_bundles_into_its_git_anchored_session_meta_root() {
 
     let commit = git_commit(7, 0);
     let based_on = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(99), 0, 1)),
         id: OpId::new(NodeId(99), 0, 1),
         parents: ParentSet::One(session_meta.id),
         actor: ActorId(0),
@@ -1196,6 +1202,7 @@ fn produced_commit_link_branches_from_folded_source_without_rewriting_agent_chai
     continuation.parents = ParentSet::One(meta.id);
     let commit = git_commit(7, 5);
     let link_record = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(99), 0, 1)),
         id: OpId::new(NodeId(99), 0, 1),
         parents: ParentSet::One(meta.id),
         actor: ActorId(1),
@@ -1440,6 +1447,7 @@ fn exact_spawn_parent_suppresses_only_the_inherited_git_graph_edge() {
     let child = import_op(2, 1);
     let commit = git_commit(8, 0);
     let git_link = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(99), 0, 1)),
         id: OpId::new(NodeId(99), 0, 1),
         parents: ParentSet::One(child.id),
         actor: ActorId(0),
@@ -1495,6 +1503,7 @@ fn exact_spawn_parent_suppresses_only_the_inherited_git_graph_edge() {
 #[test]
 fn projection_does_not_infer_links_from_git_command_text_or_timestamps() {
     let command = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 0, 1)),
         id: OpId::new(NodeId(1), 0, 1),
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -1789,6 +1798,7 @@ fn exact_tool_result_does_not_contract_across_semantic_command() {
     let mut command_import = import_op(1, 3);
     command_import.parents = ParentSet::One(call_import.id);
     let command = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 0, 4)),
         id: OpId::new(NodeId(1), 0, 4),
         parents: ParentSet::One(command_import.id),
         actor: ActorId(1),
@@ -2009,6 +2019,7 @@ fn no_cross_chain_meta_bundling() {
 fn metadata_after_standalone_not_dropped() {
     // A standalone op (a message not tied to an import), then a META op.
     let standalone = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 0, 1)),
         id: OpId::new(NodeId(1), 0, 1),
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -2229,6 +2240,7 @@ fn long_linear_chain_with_meta_breaks_stays_one_chain() {
         let is_meta = seq % 2 == 0;
         let id = OpId::new(NodeId(1), 0, seq);
         let mut record = Op {
+            source: None,
             id,
             parents: prev.map_or(ParentSet::None, ParentSet::One),
             actor: ActorId(1),
@@ -2326,6 +2338,7 @@ fn file_row_summary_uses_annotated_path_note() {
     // `file: <path>` instead of the hashed `PathId` or a raw event label.
     let op1 = import_op(1, 1);
     let file = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 0, 2)),
         id: OpId::new(NodeId(1), 0, 2),
         parents: ParentSet::One(op1.id),
         actor: ActorId(1),
@@ -2341,6 +2354,7 @@ fn file_row_summary_uses_annotated_path_note() {
         }),
     };
     let mut path_note = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 0, 3)),
         id: OpId::new(NodeId(1), 0, 3),
         parents: ParentSet::One(op1.id),
         actor: ActorId(1),

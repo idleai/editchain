@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use editchain_core::provider::ProviderFact;
-use editchain_core::{Op, OpId, OpKind};
+use editchain_core::{Op, OpId, OpKind, SourceId};
 use editchain_engine::imports::ImportState;
 
 use crate::CodexLogicalItem;
@@ -34,7 +34,7 @@ impl Materialization {
         let blocked = state
             .incomplete_sources
             .iter()
-            .map(|source| source_key(*source))
+            .filter_map(|id| by_id.get(id).and_then(|op| op.source).map(source_key))
             .collect();
         let covered: HashSet<OpId> = state.derivations.iter().map(|entry| entry.source).collect();
         let mut result = Self::default();
@@ -53,8 +53,8 @@ impl Materialization {
                 Some(ProviderFact::CodexSource(_) | ProviderFact::CodexLifecycle(_)) | None => &[],
             };
             for (index, output) in outputs.iter().enumerate() {
-                let _hidden = result.hidden.remove(output);
-                let _previous = result.output_order.insert(*output, index);
+                let _hidden = result.hidden.remove(&output.id());
+                let _previous = result.output_order.insert(output.id(), index);
             }
         }
         result.message_echoes = echoes.finish(&blocked);
@@ -62,13 +62,17 @@ impl Materialization {
         // addressable, but their cursor-dependent fold no longer supplies
         // display content. Incomplete replacements do not revive stale data.
         for op in ops {
-            if op.id.seq.trailing_zeros() >= 16 {
+            let Some(source) = op.source else {
+                continue;
+            };
+            if source.seq.trailing_zeros() >= 16 {
                 continue;
             }
-            let raw = OpId {
-                seq: op.id.seq & !0xffff,
-                ..op.id
-            };
+            let raw = SourceId {
+                seq: source.seq & !0xffff,
+                ..source
+            }
+            .id();
             if covered.contains(&raw) {
                 let _: bool = result.hidden.insert(op.id);
                 let _: Option<OpId> = result.representatives.insert(op.id, raw);
@@ -104,6 +108,6 @@ impl Materialization {
     }
 }
 
-fn source_key(source: OpId) -> SourceKey {
+fn source_key(source: SourceId) -> SourceKey {
     (source.node.0, source.boot)
 }

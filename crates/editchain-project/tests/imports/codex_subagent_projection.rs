@@ -822,15 +822,21 @@ fn embedded_parent_session_meta_does_not_hijack_child_identity_or_scope() {
     // Every raw/content op anchored in the child file stays in the child's
     // session scope; the raw lane is never hijacked by the embedded parent
     // meta, and no child op leaks into the parent session.
-    let child_node = child_first.node;
+    let child_node = child.node;
     let child_ops: Vec<&Op> = harness
         .ops
         .ops
         .iter()
         .filter(|o| {
             !is_note(o, NoteRelationship::ProviderEvidence)
-                && (o.id.node == child_node
-                    || o.parents.iter().any(|parent| parent.node == child_node))
+                && (o.source.unwrap().node == child_node
+                    || o.parents.iter().any(|parent| {
+                        harness
+                            .ops
+                            .ops
+                            .iter()
+                            .any(|op| op.id == *parent && op.source.unwrap().node == child_node)
+                    }))
         })
         .collect();
     assert_eq!(child_ops.len(), 4, "3 raw + 1 message");
@@ -873,8 +879,8 @@ fn embedded_parent_session_meta_does_not_hijack_child_identity_or_scope() {
         })
         .expect("child source evidence");
     assert_eq!(op.scope, child_session);
-    assert_eq!(op.parents, ParentSet::One(evidence.source));
+    assert_eq!(op.parents, ParentSet::One(evidence.source.id()));
     assert!(matches!(&evidence.fact, ProviderFact::CodexSource(meta)
-        if meta.first == child_first && meta.first != child_embedded_meta
+        if meta.first.id() == child_first && meta.first.id() != child_embedded_meta
             && meta.forked_from.as_ref().is_some_and(|thread| thread.0 == "parent-emb")));
 }

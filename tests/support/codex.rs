@@ -6,7 +6,7 @@ use editchain_core::provider::{
 };
 use editchain_core::{
     ActorId, Clock, ImportOp, MessageOp, NodeId, NoteOp, NoteRelationship, Op, OpId, OpKind,
-    ParentSet, Payload, ScopeRef, SessionId, Tags,
+    ParentSet, Payload, ScopeRef, SessionId, SourceId, Tags,
 };
 use std::{io, path::Path};
 
@@ -14,8 +14,8 @@ pub(super) fn occurrence(ordinal: u64, incarnation: u64, text: &str) -> io::Resu
     let sequence = ordinal
         .checked_shl(16)
         .ok_or_else(|| io::Error::other("ordinal"))?;
-    let source = OpId::new(NodeId(90), 0, sequence);
-    let message = OpId::new(NodeId(91), 0, sequence.saturating_add(1));
+    let source = SourceId::new(NodeId(90), 0, sequence);
+    let message = SourceId::new(NodeId(91), 0, sequence.saturating_add(1));
     let raw = serde_json::to_vec(&serde_json::json!({
         "type":"response_item", "payload":{"type":"message", "role":"assistant",
         "content":[{"type":"output_text", "text":text}]}
@@ -23,7 +23,8 @@ pub(super) fn occurrence(ordinal: u64, incarnation: u64, text: &str) -> io::Resu
     .map_err(io::Error::other)?;
     let raw_hash = *blake3::hash(&raw).as_bytes();
     let base = Op {
-        id: source,
+        source: Some(source),
+        id: source.id(),
         parents: ordinal
             .checked_sub(1)
             .filter(|value| *value > 0)
@@ -51,7 +52,7 @@ pub(super) fn occurrence(ordinal: u64, incarnation: u64, text: &str) -> io::Resu
             changes: vec![CodexLogicalChange::Upsert {
                 turn: "ongoing-turn".into(),
                 item: format!("message-{incarnation}"),
-                incarnation: OpId::new(NodeId(90), 0, incarnation << 16),
+                incarnation: SourceId::new(NodeId(90), 0, incarnation << 16),
                 outputs: vec![message],
             }],
         }),
@@ -59,8 +60,9 @@ pub(super) fn occurrence(ordinal: u64, incarnation: u64, text: &str) -> io::Resu
     Ok(vec![
         base.clone(),
         Op {
-            id: message,
-            parents: ParentSet::One(source),
+            source: Some(message),
+            id: message.id(),
+            parents: ParentSet::One(source.id()),
             tags: Tags::AGENT | Tags::MESSAGE,
             kind: OpKind::Message(MessageOp {
                 content: Payload::Inline(text.as_bytes().to_vec()),
@@ -69,8 +71,9 @@ pub(super) fn occurrence(ordinal: u64, incarnation: u64, text: &str) -> io::Resu
             ..base.clone()
         },
         Op {
+            source: Some(SourceId::new(NodeId(92), 0, sequence.saturating_add(2))),
             id: OpId::new(NodeId(92), 0, sequence.saturating_add(2)),
-            parents: ParentSet::One(source),
+            parents: ParentSet::One(source.id()),
             tags: Tags::META | Tags::IMPORT,
             kind: OpKind::Note(NoteOp {
                 relationship: NoteRelationship::ProviderEvidence,

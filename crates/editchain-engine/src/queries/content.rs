@@ -13,6 +13,8 @@ use super::{
 /// A content-bearing field in the immutable operation schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContentField {
+    /// Named field in a schema-three operation.
+    Record(editchain_core::activity::Field),
     /// Chain's recorded name bytes.
     ChainName,
     /// Actor label.
@@ -150,9 +152,52 @@ impl ChainQueries {
         entry: &HistoryEntry,
         field: ContentField,
     ) -> io::Result<ContentResult> {
+        let selected = if matches!(entry.operation.kind, crate::OpKind::Activity(_)) {
+            match field {
+                ContentField::ToolName => {
+                    ContentField::Record(editchain_core::activity::Field::ToolName)
+                }
+                ContentField::GitImportedRef(index) => {
+                    ContentField::Record(editchain_core::activity::Field::GitImportedRef(index))
+                }
+                ContentField::GitLiveRef(index) => {
+                    ContentField::Record(editchain_core::activity::Field::GitLiveRef(index))
+                }
+                ContentField::Record(_)
+                | ContentField::ChainName
+                | ContentField::ActorLabel
+                | ContentField::ActorRole
+                | ContentField::SessionLabel
+                | ContentField::SessionMetadata
+                | ContentField::MessageContent
+                | ContentField::MessageContentType
+                | ContentField::ToolCallId
+                | ContentField::ToolContent
+                | ContentField::CommandId
+                | ContentField::CommandContent
+                | ContentField::FileBase
+                | ContentField::FileAfter
+                | ContentField::FileEdit
+                | ContentField::ReflectionSummary
+                | ContentField::ReflectionAnchors
+                | ContentField::ImportRaw
+                | ContentField::NoteContent
+                | ContentField::ErrorCode
+                | ContentField::ErrorMessage
+                | ContentField::UnknownRaw
+                | ContentField::GitAuthorName
+                | ContentField::GitAuthorEmail
+                | ContentField::GitCommitterName
+                | ContentField::GitCommitterEmail
+                | ContentField::GitMessage
+                | ContentField::GitLinkCustom => field,
+            }
+        } else {
+            field
+        };
         let source = fields::fields(&entry.operation.kind)
             .into_iter()
-            .find_map(|(candidate, source)| (candidate == field).then_some(source))
+            .find_map(|(candidate, source)| (candidate == selected).then_some(source))
             .unwrap_or(FieldSource::NotRecorded);
         self.resolve_field(entry, field, source)
     }

@@ -58,8 +58,8 @@ pub(super) fn batch_evidence(
     let Some(last_record) = records.last() else {
         return Ok(Vec::new());
     };
-    let last = stream.op_from_position(SourcePosition::raw(batch.checkpoint.ops_emitted))?;
-    let first = stream.op_from_position(SourcePosition::raw(1))?;
+    let last = stream.source_position(SourcePosition::raw(batch.checkpoint.ops_emitted))?;
+    let first = stream.source_position(SourcePosition::raw(1))?;
     let mut notes = Vec::new();
     for item in &projection.item_occurrences {
         if item.last_seen <= start || item.last_seen > batch.checkpoint.ops_emitted {
@@ -70,7 +70,7 @@ pub(super) fn batch_evidence(
             .ok()
             .and_then(|index| records.get(index))
             .ok_or_else(|| ImportError::OpSink("lifecycle source occurrence missing".into()))?;
-        let source = stream.op_from_position(SourcePosition::raw(item.last_seen))?;
+        let source = stream.source_position(SourcePosition::raw(item.last_seen))?;
         for event in lifecycle_events(item, stream, thread, batch.checkpoint.ops_emitted)? {
             notes.push(evidence_note(
                 thread,
@@ -176,7 +176,7 @@ fn capture_activation(
                 .filter(|child| !child.is_empty())
             {
                 events.push(CodexLifecycleEvent::Spawn {
-                    activation: stream.op_from_position(SourcePosition::raw(item.first_seen))?,
+                    activation: stream.source_position(SourcePosition::raw(item.first_seen))?,
                     child: CodexThreadId(child.to_owned()),
                     agent_path: item
                         .payload
@@ -216,7 +216,7 @@ fn capture_collab_activation(
     else {
         return Ok(());
     };
-    let activation = stream.op_from_position(SourcePosition::raw(item.first_seen))?;
+    let activation = stream.source_position(SourcePosition::raw(item.first_seen))?;
     let children: BTreeSet<&str> = receivers
         .iter()
         .filter_map(Value::as_str)
@@ -239,8 +239,12 @@ pub(super) fn evidence_note(thread: &str, evidence: &ProviderEvidence) -> Result
     let content = serde_json::to_string(&evidence)?;
     let id = derive_external_entity_id("codex:provider-evidence:v1", &content);
     Ok(Op {
+        source: Some(crate::ids::derive_external_entity_source(
+            "codex:provider-evidence:v1",
+            &content,
+        )),
         id,
-        parents: ParentSet::One(evidence.source),
+        parents: ParentSet::One(evidence.source.id()),
         actor: ActorId(0),
         clock: Clock::None,
         scope: ScopeRef::Session(derive_session_id(thread)),

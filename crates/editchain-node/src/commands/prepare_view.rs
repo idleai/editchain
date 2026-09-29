@@ -16,7 +16,7 @@ use std::path::PathBuf;
 pub(super) fn run(workspace: PathBuf, chain: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let report = crate::history::prepare_live_checkpoint(&workspace, &chain)?;
     println!(
-        "Live checkpoint ready: {} visible rows, {} operations at {}/live-v1",
+        "Live checkpoint ready: {} visible rows, {} operations at {}/live-v3",
         report.nodes, report.chain_generation, report.chain
     );
     Ok(())

@@ -8,16 +8,21 @@ use editchain_store as _;
 use serde as _;
 
 use editchain_engine::{
-    queries::Lookup, ActorId, Admission, BlobRef, Clock, ContentId, Engine, MessageOp, NodeId, Op,
-    OpId, OpKind, ParentSet, Payload, ScopeRef, SessionId, Tags,
+    queries::Lookup, ActorId, Admission, BlobRef, Clock, ContentId, Engine, MessageOp, Op, OpId,
+    OpKind, ParentSet, Payload, ScopeRef, SessionId, Tags,
 };
 
 fn id(sequence: u64) -> OpId {
-    OpId::new(NodeId(1), 7, sequence)
+    let mut bytes = [0; 32];
+    if let Some(suffix) = bytes.get_mut(24..) {
+        suffix.copy_from_slice(&sequence.to_be_bytes());
+    }
+    OpId::from_bytes(bytes)
 }
 
 fn record(sequence: u64, kind: OpKind) -> Op {
     Op {
+        source: None,
         id: id(sequence),
         parents: ParentSet::None,
         actor: ActorId(17),

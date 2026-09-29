@@ -144,6 +144,7 @@ impl SelectedContent {
 pub fn operation(op: &Op, source_complete: bool) -> SelectedContent {
     let summary = labels::op_summary(op);
     match &op.kind {
+        OpKind::Activity(record) => operation(&record.display_op(), false),
         OpKind::Message(message) => SelectedContent::authored(ContentText::from_payload(
             summary,
             &message.content,
@@ -225,6 +226,7 @@ impl ImportParts {
     fn add(&mut self, raw: &Op, child: &Op, siblings: &[&Op], incomplete: &HashSet<OpId>) {
         let complete = !incomplete.contains(&child.id);
         match &child.kind {
+            OpKind::Activity(record) => self.add(raw, &record.display_op(), siblings, incomplete),
             OpKind::Message(message) if empty(self.message.as_ref()) => {
                 let text = labels::message_summary(&labels::payload_text(&message.content));
                 self.message = Some(SelectedContent::authored(ContentText::from_payload(
@@ -358,7 +360,8 @@ pub(super) fn collapsed_import(
         | OpKind::Error(_)
         | OpKind::GitCommit(_)
         | OpKind::GitLink(_)
-        | OpKind::Unknown(_) => operation(raw, !incomplete.contains(&raw.id)),
+        | OpKind::Unknown(_)
+        | OpKind::Activity(_) => operation(raw, !incomplete.contains(&raw.id)),
     })
 }
 

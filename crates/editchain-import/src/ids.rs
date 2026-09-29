@@ -1,4 +1,4 @@
-use editchain_core::{ActorId, ChainId, NodeId, OpId, PathId, SessionId, TurnId};
+use editchain_core::{ActorId, ChainId, NodeId, OpId, PathId, SessionId, SourceId, TurnId};
 use sha2::{Digest, Sha256};
 
 /// Error for ID derivation failures.
@@ -165,7 +165,7 @@ pub fn derive_session_id(session_uuid: &str) -> SessionId {
     clippy::expect_used,
     reason = "SHA-256 output is always 32 bytes and all slices are fixed in-bounds ranges"
 )]
-pub fn derive_external_entity_id(namespace: &str, external_id: &str) -> OpId {
+pub fn derive_external_entity_source(namespace: &str, external_id: &str) -> SourceId {
     let hash: [u8; 32] = Sha256::digest(
         format!("editchain:external-entity:v1:{namespace}:{external_id}").as_bytes(),
     )
@@ -173,7 +173,7 @@ pub fn derive_external_entity_id(namespace: &str, external_id: &str) -> OpId {
     let node = u64::from_le_bytes(hash[0..8].try_into().expect("8-byte node digest"));
     let boot = u32::from_le_bytes(hash[8..12].try_into().expect("4-byte boot digest"));
     let seq = u64::from_le_bytes(hash[12..20].try_into().expect("8-byte seq digest"));
-    OpId::new(NodeId(node), boot, seq)
+    SourceId::new(NodeId(node), boot, seq)
 }
 
 /// Derive a `TurnId` from a turn identifier string.
@@ -270,9 +270,22 @@ impl SourceStream {
         Self { node, boot }
     }
 
+    /// Stable producer position, retained separately from the canonical ID.
+    #[must_use]
+    pub const fn source_id(&self, seq: u64) -> SourceId {
+        SourceId::new(self.node, self.boot, seq)
+    }
+
+    /// Checked source provenance for one physical or derived record.
+    /// # Errors
+    /// Rejects source ordinal overflow.
+    pub fn source_position(&self, pos: SourcePosition) -> Result<SourceId, IdError> {
+        Ok(self.source_id(pos.to_seq()?))
+    }
+
     /// Create an `OpId` with the given sequence number.
     #[must_use]
-    pub const fn op_id(&self, seq: u64) -> OpId {
+    pub fn op_id(&self, seq: u64) -> OpId {
         OpId::new(self.node, self.boot, seq)
     }
 
@@ -285,4 +298,22 @@ impl SourceStream {
     pub fn op_from_position(&self, pos: SourcePosition) -> Result<OpId, IdError> {
         Ok(OpId::new(self.node, self.boot, pos.to_seq()?))
     }
+}
+
+/// Canonical handle for an existing, versioned external-entity namespace.
+#[must_use]
+pub fn derive_external_entity_id(namespace: &str, external_id: &str) -> OpId {
+    derive_external_entity_source(namespace, external_id).id()
+}
+
+pub(crate) fn provenance(op: &editchain_core::Op) -> Result<SourceId, crate::ImportError> {
+    op.source.ok_or_else(|| {
+        crate::ImportError::OpSink("import operation has no source provenance".into())
+    })
+}
+
+pub(crate) fn output_sources(
+    ops: &[editchain_core::Op],
+) -> Result<Vec<SourceId>, crate::ImportError> {
+    ops.iter().map(provenance).collect()
 }

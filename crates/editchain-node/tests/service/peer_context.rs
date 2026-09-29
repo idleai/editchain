@@ -10,6 +10,7 @@ use std::path::Path;
 
 fn source(seq: u64) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(90), 0, seq << 16)),
         id: OpId::new(NodeId(90), 0, seq << 16),
         parents: if seq == 1 {
             ParentSet::None
@@ -31,7 +32,16 @@ fn source(seq: u64) -> Op {
 
 fn command(source: &Op, node: u64) -> Op {
     Op {
-        id: OpId::new(NodeId(node), 0, source.id.seq + 1),
+        source: Some(editchain_core::SourceId::new(
+            NodeId(node),
+            0,
+            source.source.expect("source provenance").seq + 1,
+        )),
+        id: OpId::new(
+            NodeId(node),
+            0,
+            source.source.expect("source provenance").seq + 1,
+        ),
         parents: ParentSet::One(source.id),
         scope: ScopeRef::Turn(TurnId(15)),
         tags: Tags::AGENT | Tags::COMMAND,

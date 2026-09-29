@@ -172,7 +172,8 @@ fn same_source(left: &LiveBlockMeta, right: &LiveBlockMeta) -> bool {
     if left.human_stream.is_some() || right.human_stream.is_some() {
         return left.human_stream == right.human_stream;
     }
-    editchain_core::OpId::from_display_str(&left.node_key)
-        .zip(editchain_core::OpId::from_display_str(&right.node_key))
-        .is_none_or(|(left, right)| (left.node, left.boot) == (right.node, right.boot))
+    left.source_stream
+        .as_ref()
+        .zip(right.source_stream.as_ref())
+        .is_none_or(|(left, right)| left == right)
 }

@@ -8,6 +8,7 @@ use editchain_index_pages as _;
 use postcard as _;
 use proptest as _;
 use serde as _;
+use serde_json as _;
 
 use editchain_core::{
     ActorId, Admission, Clock, MessageOp, NodeId, Op, OpId, OpKind, ParentSet, Payload, ScopeRef,
@@ -20,6 +21,7 @@ use editchain_store::{
 
 fn record(sequence: u64, content: &[u8]) -> io::Result<Vec<u8>> {
     encode_op(&Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 0, sequence)),
         id: OpId::new(NodeId(1), 0, sequence),
         parents: ParentSet::None,
         actor: ActorId(7),
@@ -163,8 +165,10 @@ fn failed_duplicate_fence_invalidates_the_cached_admission_state() {
 #[test]
 fn batch_conflicts_keep_alternate_encodings_and_duplicates_inert() {
     let original = record(1, b"\xff\0evidence").unwrap();
-    let mut alternate = vec![0x81, 0];
-    alternate.extend_from_slice(original.get(1..).unwrap());
+    assert_eq!(original.get(48), Some(&1));
+    let mut alternate = original.get(..48).unwrap().to_vec();
+    alternate.extend_from_slice(&[0x81, 0]);
+    alternate.extend_from_slice(original.get(49..).unwrap());
     let records = [
         original.as_slice(),
         original.as_slice(),
@@ -215,7 +219,11 @@ fn filesystem_batches_pack_pages_preserving_record_order_and_flags() {
         .map(|(flags, bytes)| (*flags, bytes.as_slice()))
         .collect();
     writer.append_records(&refs).unwrap();
-    assert_eq!(writer.segment_sequence(), 14);
+    assert_eq!(
+        writer.segment_sequence(),
+        49,
+        "two records fit in each 64-byte EC03 frame"
+    );
     let mut actual = Vec::new();
     let _stats = writer
         .visit_records(&mut |flags, bytes| {

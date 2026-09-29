@@ -56,12 +56,15 @@ pub(super) fn derive_session_base_links(
         let OpKind::Import(import) = &op.kind else {
             continue;
         };
-        let key = (op.id.node.0, op.id.boot);
+        let Some(origin) = op.source else {
+            continue;
+        };
+        let key = (origin.node.0, origin.boot);
         let source = sources.entry(key).or_insert_with(|| SourceEvidence {
             root: op,
             start: None,
         });
-        if op.id.seq < source.root.id.seq {
+        if op.source < source.root.source {
             source.root = op;
         }
         let Some(raw) = payload_bytes(&import.raw_ref, blobs) else {
@@ -104,11 +107,13 @@ pub(super) fn derive_session_base_links(
         };
         let target_repo = repository.discovery.id;
         let target_oid = commit.oid;
-        let id = based_on_link_id(root.id, target_repo, target_oid);
+        let origin = based_on_link_id(root, target_repo, target_oid);
+        let id = origin.id();
         if existing_ids.contains(&id) {
             continue;
         }
         links.push(Op {
+            source: Some(origin),
             id,
             parents: ParentSet::One(root.id),
             actor: ActorId(0),
@@ -154,7 +159,10 @@ fn absolute_path(path: &Path) -> PathBuf {
 }
 
 /// Derive a stable operation identity from the immutable relation endpoints.
-fn based_on_link_id(source: OpId, repository: RepositoryId, oid: GitOid) -> OpId {
+fn based_on_link_id(op: &Op, repository: RepositoryId, oid: GitOid) -> editchain_core::SourceId {
+    let source = op
+        .source
+        .map_or_else(|| op.id.to_string(), |source| source.to_string());
     let digest = editchain_import::hash_raw(
         format!(
             "editchain:git-link:claude-reflog-based-on:v1:{source}:{}:{}",
@@ -175,7 +183,7 @@ fn based_on_link_id(source: OpId, repository: RepositoryId, oid: GitOid) -> OpId
         .get(12..20)
         .and_then(|bytes| bytes.try_into().ok())
         .map_or(0, u64::from_le_bytes);
-    OpId::new(NodeId(node), boot, seq)
+    editchain_core::SourceId::new(NodeId(node), boot, seq)
 }
 
 #[cfg(test)]
@@ -239,6 +247,7 @@ mod tests {
     fn import_op(seq: u64, session: SessionId, value: &Value) -> Op {
         let id = OpId::new(NodeId(7), 0, raw_seq(seq));
         Op {
+            source: Some(editchain_core::SourceId::new(NodeId(7), 0, raw_seq(seq))),
             id,
             parents: if seq == 1 {
                 ParentSet::None
@@ -327,7 +336,8 @@ mod tests {
                 | OpKind::Note(_)
                 | OpKind::Error(_)
                 | OpKind::GitCommit(_)
-                | OpKind::Unknown(_) => None,
+                | OpKind::Unknown(_)
+                | OpKind::Activity(_) => None,
             })
             .expect("expected Git link");
         assert_eq!(link.kind, GitLinkKind::BasedOn);

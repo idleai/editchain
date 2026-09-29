@@ -88,7 +88,7 @@ impl LiveWorkspace {
         };
         std::fs::create_dir_all(&chain)?;
         let chain = std::fs::canonicalize(chain)?;
-        let checkpoint_path = chain.join("live-v1");
+        let checkpoint_path = chain.join("live-v3");
         let checkpoint_store = editchain_index::Storage::open(&checkpoint_path)?;
         let saved = checkpoint::load(&checkpoint_store)?;
         if !prepare

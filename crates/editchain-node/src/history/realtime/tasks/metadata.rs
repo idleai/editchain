@@ -1,7 +1,7 @@
 //! Read the importer's persisted turn records, never task guesses from chat text.
 
 use editchain_core::{
-    provider::CodexDerivationContract, NoteRelationship, OpId, OpKind, Payload, ScopeRef,
+    provider::CodexDerivationContract, NoteRelationship, OpKind, Payload, ScopeRef, SourceId,
 };
 use editchain_import::{derive_node_id, derive_turn_id};
 use editchain_index::Map as HashMap;
@@ -23,11 +23,11 @@ fn turn(task: &TaskIdentity) -> Turn {
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Metadata {
-    records: HashMap<String, Vec<(Turn, OpId)>>,
-    versions: HashMap<Turn, BTreeMap<OpId, TaskStatus>>,
+    records: HashMap<String, Vec<(Turn, SourceId)>>,
+    versions: HashMap<Turn, BTreeMap<SourceId, TaskStatus>>,
     sections: HashMap<Turn, editchain_index::OrderedSet<String>>,
-    prompts: HashMap<Turn, BTreeMap<OpId, String>>,
-    prompt_records: HashMap<String, (Turn, OpId)>,
+    prompts: HashMap<Turn, BTreeMap<SourceId, String>>,
+    prompt_records: HashMap<String, (Turn, SourceId)>,
 }
 
 impl Metadata {
@@ -42,7 +42,13 @@ impl Metadata {
             .map(|(_, title)| title.clone())
     }
 
-    fn prompt(&mut self, row: &LiveRow, dirty: &mut BTreeSet<String>) {
+    fn prompt(&mut self, row: &LiveRow, projection: &LiveProjection, dirty: &mut BTreeSet<String>) {
+        let Some(origin) = projection
+            .provenance(row.incarnation)
+            .or_else(|| projection.provenance(row.anchor))
+        else {
+            return;
+        };
         let Some(task) = &row.task else {
             return;
         };
@@ -81,11 +87,11 @@ impl Metadata {
             self.prompts
                 .entry(turn.clone())
                 .or_default()
-                .insert(row.incarnation, title),
+                .insert(origin, title),
         );
         drop(
             self.prompt_records
-                .insert(row.key.clone(), (turn.clone(), row.incarnation)),
+                .insert(row.key.clone(), (turn.clone(), origin)),
         );
         dirty.extend(self.sections.get(&turn).into_iter().flatten().cloned());
     }
@@ -129,27 +135,25 @@ impl Metadata {
         dirty: &mut BTreeSet<String>,
     ) {
         self.remove(&row.key, dirty);
-        self.prompt(row, dirty);
+        self.prompt(row, projection, dirty);
+        let Some(origin) = projection.provenance(row.anchor) else {
+            return;
+        };
         for (turn_id, status) in observations(row, projection) {
             let Some(proof) = projection.codex_derivation(row.anchor) else {
                 continue;
             };
-            let turn = (
-                row.anchor.node.0,
-                row.anchor.boot,
-                proof.thread.0.clone(),
-                turn_id,
-            );
+            let turn = (origin.node.0, origin.boot, proof.thread.0.clone(), turn_id);
             let versions = self.versions.entry(turn.clone()).or_default();
             let previous = versions.last_key_value().map(|(_, status)| *status);
-            let _: Option<TaskStatus> = versions.insert(row.anchor, status);
+            let _: Option<TaskStatus> = versions.insert(origin, status);
             if previous != versions.last_key_value().map(|(_, status)| *status) {
                 dirty.extend(self.sections.get(&turn).into_iter().flatten().cloned());
             }
             self.records
                 .entry(row.key.clone())
                 .or_default()
-                .push((turn, row.anchor));
+                .push((turn, origin));
         }
     }
 }
@@ -164,6 +168,9 @@ pub(super) fn observations(
     let Some(proof) = projection.codex_derivation(row.anchor) else {
         return Vec::new();
     };
+    let Some(origin) = projection.provenance(row.anchor) else {
+        return Vec::new();
+    };
     let contract = match proof.contract {
         CodexDerivationContract::OccurrencesV1 => "codex-occurrences-v1",
         CodexDerivationContract::OccurrencesV2 => "codex-occurrences-v2",
@@ -176,7 +183,7 @@ pub(super) fn observations(
             };
             if note.relationship != NoteRelationship::Explains
                 || !note.target_ids.is_empty()
-                || !proof.outputs.contains(&op.id)
+                || !proof.outputs.iter().any(|output| output.id() == op.id)
             {
                 return None;
             }
@@ -188,11 +195,12 @@ pub(super) fn observations(
             if op.scope != ScopeRef::Turn(derive_turn_id(&format!("{}:{turn}", proof.thread.0))) {
                 return None;
             }
+            let source = op.source?;
             let exact_slot = (0..proof.outputs.len()).any(|index| {
-                let slot = serde_json::json!([contract, row.anchor.node, {"Turn": [turn, index]}]);
-                op.id.node == derive_node_id(&slot.to_string())
-                    && Some(op.id.seq) == row.anchor.seq.checked_add(1)
-                    && op.id.boot == row.anchor.boot
+                let slot = serde_json::json!([contract, origin.node, {"Turn": [turn, index]}]);
+                source.node == derive_node_id(&slot.to_string())
+                    && Some(source.seq) == origin.seq.checked_add(1)
+                    && source.boot == origin.boot
             });
             if !exact_slot {
                 return None;

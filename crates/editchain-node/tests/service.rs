@@ -728,6 +728,7 @@ fn git_ref_changes_and_object_recovery_invalidate_render_cache_with_unchanged_he
 
 fn msg_op(node: u64, seq: u64, text: &[u8]) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -791,6 +792,7 @@ fn imported_agent_edit_rows_materialize_recorded_snippets_without_fabricating_fi
     let chain_dir = tmp.path().join(".editchain");
     let raw_id = OpId::new(NodeId(71), 0, 1);
     let raw = Op {
+        source: None,
         id: raw_id,
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -803,6 +805,7 @@ fn imported_agent_edit_rows_materialize_recorded_snippets_without_fabricating_fi
         }),
     };
     let edit = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(71), 0, 2)),
         id: OpId::new(NodeId(71), 0, 2),
         parents: ParentSet::One(raw_id),
         actor: ActorId(2),
@@ -897,6 +900,7 @@ fn agent_edit_uses_exact_session_git_baseline_when_available() {
     let commit_hex = git_stdout(&repo, &["rev-parse", "HEAD"]);
     let commit_oid = GitOid::from_hex(&commit_hex).expect("full commit oid");
     let raw = Op {
+        source: None,
         id: raw_id,
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -916,6 +920,7 @@ fn agent_edit_uses_exact_session_git_baseline_when_available() {
         }),
     };
     let edit = Op {
+        source: None,
         id: edit_id,
         parents: ParentSet::One(raw_id),
         actor: ActorId(2),
@@ -933,6 +938,7 @@ fn agent_edit_uses_exact_session_git_baseline_when_available() {
         }),
     };
     let link = Op {
+        source: None,
         id: link_id,
         parents: ParentSet::One(raw_id),
         actor: ActorId(1),
@@ -1045,6 +1051,7 @@ fn legacy_codex_multi_file_record_recovers_every_path_from_raw_evidence() {
     })
     .to_string();
     let raw = Op {
+        source: None,
         id: raw_id,
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -1060,6 +1067,7 @@ fn legacy_codex_multi_file_record_recovers_every_path_from_raw_evidence() {
     // every path's hunks into this one FileOp. The service must suppress that
     // lossy child in favor of the still-exact raw record above.
     let legacy_file = Op {
+        source: None,
         id: legacy_file_id,
         parents: ParentSet::One(raw_id),
         actor: ActorId(2),
@@ -1077,6 +1085,7 @@ fn legacy_codex_multi_file_record_recovers_every_path_from_raw_evidence() {
         }),
     };
     let legacy_path = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(72), 0, 3)),
         id: OpId::new(NodeId(72), 0, 3),
         parents: ParentSet::One(raw_id),
         actor: ActorId(2),
@@ -1340,6 +1349,7 @@ fn open_resolves_exact_session_base_outside_current_head_history() {
     let repository = editchain_git::repository_id_from_path(&repo.join(".git"));
     let session_base = GitOid::from_hex(&session_base_hex).expect("full commit oid");
     let source = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(44), 0, 1)),
         id: OpId::new(NodeId(44), 0, 1),
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -1352,6 +1362,7 @@ fn open_resolves_exact_session_base_outside_current_head_history() {
         }),
     };
     let link_record = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(44), 0, 2)),
         id: OpId::new(NodeId(44), 0, 2),
         parents: ParentSet::One(source.id),
         actor: ActorId(1),
@@ -1708,10 +1719,9 @@ fn history_window_returns_rows() {
 }
 
 #[test]
-fn op_rows_have_uniform_author_and_short_commit_id() {
+fn op_rows_have_uniform_author_and_canonical_commit_id() {
     // A message op (MESSAGE tag only) should render a non-blank author label
-    // ("system" fallback) and an abbreviated commit id (node:seq) rather than a
-    // blank author and full node:boot:seq.
+    // ("system" fallback) and the complete canonical identity in protocol rows.
     let ops = vec![msg_op(7, 42, b"hello")];
     let projection = HistoryProjection::from_ops(ops);
     let mut ws = Workspace::from_projection(projection);
@@ -1724,13 +1734,14 @@ fn op_rows_have_uniform_author_and_short_commit_id() {
         .unwrap();
     let row = &window.rows[0];
     assert_eq!(row.author, "system");
-    assert_eq!(row.commit_id, "7:42");
+    assert_eq!(row.commit_id, OpId::new(NodeId(7), 0, 42).to_string());
 }
 
 #[test]
 fn system_flag_marks_tool_and_import_ops() {
     // A tool op should be flagged is_system; a message op should not.
     let tool = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 0, 1)),
         id: OpId::new(NodeId(1), 0, 1),
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -1776,6 +1787,7 @@ fn sensitive_chain_ops() -> Vec<Op> {
     let a = msg_op(1, 1, b"root A");
     let b = msg_op(2, 1, b"root B");
     let m = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(3), 0, 1)),
         id: OpId::new(NodeId(3), 0, 1),
         parents: ParentSet::Two(a.id, b.id),
         actor: ActorId(1),
@@ -1789,6 +1801,7 @@ fn sensitive_chain_ops() -> Vec<Op> {
     };
     let e1 = msg_op(4, 1, b"e1");
     let e2 = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(4), 0, 2)),
         id: OpId::new(NodeId(4), 0, 2),
         parents: ParentSet::One(e1.id),
         actor: ActorId(1),
@@ -1802,6 +1815,7 @@ fn sensitive_chain_ops() -> Vec<Op> {
     };
     let f1 = msg_op(5, 1, b"f1");
     let f2 = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(5), 0, 2)),
         id: OpId::new(NodeId(5), 0, 2),
         parents: ParentSet::One(f1.id),
         actor: ActorId(1),
@@ -2015,6 +2029,7 @@ fn stdio_refresh_replaces_snapshot_and_rejects_old_coordinates() {
 /// Build a raw import op carrying one raw JSONL line (Codex-style envelope).
 fn raw_import_op(node: u64, seq: u64, clock_ms: u64, parent: Option<OpId>, raw: &str) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: parent.map_or(ParentSet::None, ParentSet::One),
         actor: ActorId(1),
@@ -2031,6 +2046,7 @@ fn raw_import_op(node: u64, seq: u64, clock_ms: u64, parent: Option<OpId>, raw: 
 /// A normalized message child anchored at a raw import op.
 fn raw_message_child(node: u64, seq: u64, parent: OpId, clock_ms: u64, text: &str) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -2087,6 +2103,7 @@ fn turn_chain_ops(rows: &[(&str, Option<&str>)], turn: u64) -> Vec<Op> {
 /// A turn-scoped normalized message child of `parent`.
 fn turn_message_child(node: u64, seq: u64, parent: OpId, turn: u64, text: &str) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -2103,6 +2120,7 @@ fn turn_message_child(node: u64, seq: u64, parent: OpId, turn: u64, text: &str) 
 /// A turn-scoped normalized tool child of `parent`.
 fn turn_tool_child(node: u64, seq: u64, parent: OpId, turn: u64) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -2122,6 +2140,7 @@ fn turn_tool_child(node: u64, seq: u64, parent: OpId, turn: u64) -> Op {
 fn turn_plan_child(node: u64, seq: u64, parent: OpId, turn: u64, summary: &str) -> Op {
     let scope = ScopeRef::Turn(editchain_core::TurnId(turn));
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -2318,6 +2337,7 @@ fn service_path_compaction_preserves_echo_and_outcome_metadata() {
         r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"call_ok","exitCode":0,"status":"completed"}}}"#,
     );
     let success_tool = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(8), 0, 1)),
         id: OpId::new(NodeId(8), 0, 1),
         parents: ParentSet::One(success_item.id),
         actor: ActorId(1),
@@ -2409,6 +2429,7 @@ fn service_path_compaction_preserves_childless_output_rows_and_blob_echoes() {
     );
     let blob_ref = store_blob(&chain_dir, blob_raw.as_bytes());
     let blob_echo = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(2), 0, 1)),
         id: OpId::new(NodeId(2), 0, 1),
         parents: ParentSet::One(output.id),
         actor: ActorId(1),
@@ -2467,6 +2488,7 @@ fn service_path_uses_command_stdout_as_the_output_subtitle() {
         r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"cmd-1","status":"completed","stdout":"actual stdout\nsecond line","formatted_output":"formatted fallback"}}}"#,
     );
     let command = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(10), 0, 2)),
         id: OpId::new(NodeId(10), 0, 2),
         parents: ParentSet::One(command_raw.id),
         actor: ActorId(1),
@@ -2489,6 +2511,7 @@ fn service_path_uses_command_stdout_as_the_output_subtitle() {
         r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"cmd-2","status":"completed","stdout":"","formatted_output":""}}}"#,
     );
     let empty_output_command = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(11), 0, 2)),
         id: OpId::new(NodeId(11), 0, 2),
         parents: ParentSet::One(empty_output_import.id),
         actor: ActorId(1),
@@ -2613,6 +2636,7 @@ fn service_path_keeps_exec_command_separate_from_token_metadata() {
     .to_string();
     let call = raw_import_op(20, 1, 1_000, None, &call_raw);
     let call_child = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(20), 0, 2)),
         id: OpId::new(NodeId(20), 0, 2),
         parents: ParentSet::One(call.id),
         actor: ActorId(1),
@@ -2687,6 +2711,7 @@ fn service_path_compaction_preserves_scalar_and_truncated_tool_payload_carriers(
     );
     let blob_ref = store_blob(&chain_dir, blob_raw.as_bytes());
     let blob_call = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(2), 0, 1)),
         id: OpId::new(NodeId(2), 0, 1),
         parents: ParentSet::One(scalar_call.id),
         actor: ActorId(1),
@@ -3348,7 +3373,14 @@ fn activity_view_bundles_execute_runs_in_source_order() {
         .iter()
         .map(|row| row.op_id.clone().unwrap_or_default())
         .collect();
-    assert_eq!(member_ids, vec!["4:0:4", "3:0:3", "2:0:2"]);
+    assert_eq!(
+        member_ids,
+        vec![
+            "da8e4f019fb69f8af447f6bb4d5b4f5e6447ea1995115f3cabb35b58f12e0b14",
+            "943c2947f048f5fb8ea1706311153d70230aca703ecf459de59856d65376fea2",
+            "f46f47949aa2f0a567ff789a3cefc82af053a0c5838e83ca8de293a2a1e4d7a8"
+        ]
+    );
     // Expansion index ships once for the snapshot window.
     assert_eq!(
         activity_window.sub_op_counts.as_deref(),

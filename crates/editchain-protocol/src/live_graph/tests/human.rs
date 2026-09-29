@@ -2,6 +2,7 @@ use super::*;
 
 fn human(key: &str, time: u64, parents: &[&str], stream: &str) -> LiveBlockMeta {
     LiveBlockMeta {
+        source_stream: None,
         human_stream: Some(stream.into()),
         ..node(key, time, parents)
     }

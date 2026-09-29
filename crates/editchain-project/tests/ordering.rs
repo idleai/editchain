@@ -39,6 +39,7 @@ fn file_observations_and_proposals_retain_their_own_history() {
         (3, 100, FileStage::Proposed),
     ] {
         let op = Op {
+            source: None,
             kind: OpKind::File(FileOp {
                 path,
                 stage,
@@ -78,6 +79,7 @@ fn file_observations_and_proposals_retain_their_own_history() {
 /// A standalone message op (its own row).
 fn msg_op(node: u64, seq: u64, session: u64, clock_ms: u64, parent: Option<OpId>) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: parent.map_or(ParentSet::None, ParentSet::One),
         actor: ActorId(1),
@@ -94,6 +96,7 @@ fn msg_op(node: u64, seq: u64, session: u64, clock_ms: u64, parent: Option<OpId>
 /// A raw import op (the linear backbone row).
 fn import_op(node: u64, seq: u64, session: u64, clock_ms: u64) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -110,6 +113,7 @@ fn import_op(node: u64, seq: u64, session: u64, clock_ms: u64) -> Op {
 /// A normalized message child of a raw import op (folded into the import row).
 fn child_message_op(node: u64, seq: u64, parent: OpId, text: &str) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -126,6 +130,7 @@ fn child_message_op(node: u64, seq: u64, parent: OpId, text: &str) -> Op {
 /// A normalized Tool child of a raw import op (folded into the import row).
 fn child_tool_op(node: u64, seq: u64, parent: OpId, name: &str) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -150,6 +155,7 @@ fn relation_note(
     relationship: NoteRelationship,
 ) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -249,6 +255,7 @@ fn inverted_timestamps_merge_preserves_cross_lane_transitions() {
     let a = msg_op(1, 1, 10, 100_000, None);
     let b = msg_op(2, 1, 10, 90_000, None);
     let m = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(3), 0, 1)),
         id: OpId::new(NodeId(3), 0, 1),
         parents: ParentSet::Two(a.id, b.id),
         actor: ActorId(1),
@@ -488,6 +495,7 @@ fn inverted_timestamps_folded_reconnects_to_endpoint_keeps_edge_downward() {
 #[test]
 fn undated_header_stays_unknown_with_inverted_clocks() {
     let a_header = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 0, 1)),
         id: OpId::new(NodeId(1), 0, 1),
         parents: ParentSet::None,
         actor: ActorId(1),

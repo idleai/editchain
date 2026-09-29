@@ -122,6 +122,7 @@ mod tests {
         };
 
         let candidate = |seq, text: &[u8]| Op {
+            source: Some(editchain_core::SourceId::new(NodeId(1), 0, seq)),
             id: OpId::new(NodeId(1), 0, seq),
             parents: ParentSet::None,
             actor: ActorId(1),

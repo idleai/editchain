@@ -57,7 +57,7 @@ fn version_seven_repairs_human_lanes_using_cached_inputs_and_keeps_other_lanes()
     workspace.rows.flush().unwrap();
     let pages = workspace
         .chain
-        .join("live-v1/rows")
+        .join("live-v3/rows")
         .metadata()
         .unwrap()
         .len();
@@ -108,7 +108,7 @@ fn version_seven_repairs_human_lanes_using_cached_inputs_and_keeps_other_lanes()
         assert!(block.meta.human_stream.is_some());
     }
     assert_eq!(
-        resumed.chain.join("live-v1/rows").metadata().unwrap().len(),
+        resumed.chain.join("live-v3/rows").metadata().unwrap().len(),
         pages
     );
     assert_eq!(human_edits::canonical(root.path()), canonical);

@@ -5,7 +5,9 @@
     reason = "Test file; dependencies used by library macros"
 )]
 
+use blake3 as _;
 use editchain_core::clock::Clock;
+use serde_json as _;
 
 #[test]
 fn clock_ordering() {
@@ -52,6 +54,7 @@ fn explicit_unknown_source_time_overrides_observed_clock() {
         ActorId, NodeId, Op, OpId, OpKind, ParentSet, Payload, ScopeRef, Tags, UnknownOp,
     };
     let mut op = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 0, 1)),
         id: OpId::new(NodeId(1), 0, 1),
         parents: ParentSet::None,
         actor: ActorId(1),

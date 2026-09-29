@@ -10,6 +10,20 @@ use crate::ContentReference;
 /// A recorded fact used to select accepted operation identities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum IndexKey {
+    /// Schema-three logical item identity.
+    Item(editchain_core::activity::ItemId),
+    /// Session membership, including records that also name a turn.
+    SessionItem(editchain_core::activity::ItemId),
+    /// Agent execution membership.
+    TurnItem(editchain_core::activity::ItemId),
+    /// Recorded author identity.
+    AuthorItem(editchain_core::activity::ItemId),
+    /// Capturing integration identity.
+    Recorder(editchain_core::activity::ItemId),
+    /// One of the ten operation categories.
+    Kind(editchain_core::activity::KindName),
+    /// Previous operation ID after an explicit physical conversion.
+    Alias(OpId),
     /// The envelope's author.
     Actor(ActorId),
     /// The envelope's explicit chain scope.
@@ -41,6 +55,33 @@ pub(crate) fn keys(op: &Op, references: &[ContentReference]) -> Vec<IndexKey> {
         ScopeRef::Turn(id) => Some(IndexKey::Turn(id)),
         ScopeRef::File(id) => Some(IndexKey::File(id)),
     });
+    if let OpKind::Activity(record) = &op.kind {
+        keys.push(IndexKey::Item(record.item));
+        keys.push(IndexKey::Kind(record.kind.name()));
+        keys.push(IndexKey::Recorder(record.recorder));
+        keys.extend(record.session.map(IndexKey::SessionItem));
+        keys.extend(record.turn.map(IndexKey::TurnItem));
+        keys.extend(record.author.map(IndexKey::AuthorItem));
+        keys.extend(
+            record
+                .legacy
+                .as_ref()
+                .map(|legacy| IndexKey::Alias(legacy.operation)),
+        );
+        keys.extend(
+            record
+                .legacy
+                .iter()
+                .flat_map(|legacy| legacy.folded.iter().copied().map(IndexKey::Alias)),
+        );
+        keys.extend(record.parents.iter().copied().map(IndexKey::Parent));
+        if let editchain_core::activity::Kind::File(file) = &record.kind {
+            keys.push(IndexKey::File(file.path));
+        }
+        if let editchain_core::activity::Kind::Commit(commit) = &record.kind {
+            keys.extend(commit.changed_paths.iter().copied().map(IndexKey::File));
+        }
+    }
     if let OpKind::File(file) = &op.kind {
         keys.push(IndexKey::File(file.path));
     }

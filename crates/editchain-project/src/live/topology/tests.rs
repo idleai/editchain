@@ -8,6 +8,7 @@ use editchain_core::{
 
 fn raw(stream: u64, ordinal: u64) -> Arc<Op> {
     Arc::new(Op {
+        source: Some(SourceId::new(NodeId(stream), 0, ordinal << 16)),
         id: OpId::new(NodeId(stream), 0, ordinal << 16),
         parents: if ordinal > 1 {
             ParentSet::One(OpId::new(
@@ -32,12 +33,13 @@ fn raw(stream: u64, ordinal: u64) -> Arc<Op> {
 fn fact(source: &Op, slot: u64, fact: ProviderFact) -> Arc<Op> {
     let evidence = ProviderEvidence {
         schema: ProviderEvidenceSchema::V1,
-        source: source.id,
+        source: source.source.unwrap(),
         raw_hash: [1; 32],
         fact,
     };
     let mut op = source.clone();
-    op.id.seq = op.id.seq.saturating_add(slot);
+    op.source.as_mut().unwrap().seq = op.source.unwrap().seq.saturating_add(slot);
+    op.id = op.source.unwrap().id();
     op.parents = ParentSet::One(source.id);
     op.tags = Tags::META | Tags::IMPORT;
     op.kind = OpKind::Note(NoteOp {
@@ -53,15 +55,15 @@ fn prefix(last: &Op, parent: Option<&str>) -> Arc<Op> {
         last,
         1,
         ProviderFact::CodexSource(Box::new(CodexSourceEvidence {
-            thread: CodexThreadId(last.id.node.0.to_string()),
+            thread: CodexThreadId(last.source.unwrap().node.0.to_string()),
             parent: parent.map(|parent| CodexThreadId(parent.into())),
             forked_from: None,
             agent_path: None,
-            first: OpId {
+            first: SourceId {
                 seq: 1 << 16,
-                ..last.id
+                ..last.source.unwrap()
             },
-            last: last.id,
+            last: last.source.unwrap(),
             prefix_hash: [2; 32],
         })),
     )
@@ -73,12 +75,12 @@ fn lifecycle(at: &Op, child: u64, spawn: bool) -> Arc<Op> {
         at,
         2,
         ProviderFact::CodexLifecycle(CodexLifecycleEvidence {
-            thread: CodexThreadId(at.id.node.0.to_string()),
+            thread: CodexThreadId(at.source.unwrap().node.0.to_string()),
             item_id: format!("event-{}", at.id),
             turn_id: "turn".into(),
             event: if spawn {
                 CodexLifecycleEvent::Spawn {
-                    activation: at.id,
+                    activation: at.source.unwrap(),
                     child,
                     agent_path: None,
                     signal: CodexSpawnSignal::CollabTool,
@@ -265,8 +267,8 @@ fn invalid_prefix_identity_cannot_unblock_an_ambiguous_child() {
         parent: Some(CodexThreadId("1".into())),
         forked_from: None,
         agent_path: None,
-        first: alternate.id,
-        last: alternate.id,
+        first: alternate.source.unwrap(),
+        last: alternate.source.unwrap(),
         prefix_hash: [2; 32],
     };
     apply(
@@ -292,8 +294,8 @@ fn invalid_prefix_identity_cannot_unblock_an_ambiguous_child() {
         parent: Some(CodexThreadId("1".into())),
         forked_from: None,
         agent_path: None,
-        first: raw(2, 1).id,
-        last: broken.id,
+        first: raw(2, 1).source.unwrap(),
+        last: broken.source.unwrap(),
         prefix_hash: [2; 32],
     };
     let evidence = fact(&broken, 1, ProviderFact::CodexSource(Box::new(meta)));

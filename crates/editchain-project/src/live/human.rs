@@ -1,34 +1,41 @@
 //! Successive immutable receipts update one live edit without copying its history.
 
 use super::{put, retire, LiveChanges, LiveProjection};
-use editchain_core::{Op, OpId};
+use editchain_core::{Op, OpId, SourceId};
 use editchain_index::{Map, OrderedSet};
 use std::collections::BTreeSet;
 
+type SourceOrder = (Option<SourceId>, OpId);
+
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct HumanEdits {
-    sources: Map<OpId, OpId>,
-    groups: Map<OpId, OrderedSet<OpId>>,
+    sources: Map<OpId, (OpId, Option<SourceId>)>,
+    groups: Map<OpId, OrderedSet<SourceOrder>>,
 }
 
 impl HumanEdits {
     pub(super) fn observe(&mut self, source: OpId, op: Option<&Op>) -> BTreeSet<OpId> {
         let mut changed = BTreeSet::new();
-        if let Some(group) = self.sources.remove(&source) {
+        if let Some((group, origin)) = self.sources.remove(&source) {
             if let Some(sources) = self.groups.get_mut(&group) {
-                let _removed = sources.remove(&source);
+                let _removed = sources.remove(&(origin, source));
             }
             let _new = changed.insert(group);
         }
         if let Some(work) = op.and_then(crate::human::work_record) {
             if let Some(group) = work.edit_group {
-                let _old = self.sources.insert(source, group);
+                let origin = op.and_then(|op| op.source);
+                let _old = self.sources.insert(source, (group, origin));
                 if matches!(
                     work.kind,
                     editchain_core::human::HumanWorkKind::Edit
                         | editchain_core::human::HumanWorkKind::ObservedEdit
                 ) {
-                    let _new = self.groups.entry(group).or_default().insert(source);
+                    let _new = self
+                        .groups
+                        .entry(group)
+                        .or_default()
+                        .insert((origin, source));
                 }
                 let _new = changed.insert(group);
             }
@@ -37,7 +44,7 @@ impl HumanEdits {
     }
 
     pub(super) fn group(&self, source: OpId) -> Option<OpId> {
-        self.sources.get(&source).copied()
+        self.sources.get(&source).map(|(group, _)| *group)
     }
 }
 
@@ -48,7 +55,7 @@ impl LiveProjection {
         let Some(sources) = self.human.groups.get(&group) else {
             return;
         };
-        let Some((&first, &last)) = sources.first().zip(sources.last()) else {
+        let Some((&(_, first), &(_, last))) = sources.first().zip(sources.last()) else {
             return;
         };
         let mut children: Vec<_> = self

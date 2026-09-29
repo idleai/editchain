@@ -43,6 +43,7 @@ fn batch(root: &Path, events: Vec<Value>) -> Value {
 fn seed_ai(root: &Path, content: &str) {
     let raw_id = OpId::new(NodeId(73), 0, 1);
     let raw = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(73), 0, 1)),
         id: raw_id,
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -61,6 +62,7 @@ fn seed_ai(root: &Path, content: &str) {
         }),
     };
     let file = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(73), 0, 2)),
         id: OpId::new(NodeId(73), 0, 2),
         parents: ParentSet::One(raw_id),
         actor: ActorId(1),
@@ -153,7 +155,7 @@ fn late_ai_imports_join_prior_exposure_and_hunks_do_not_claim_untouched_lines() 
     let mut page = editchain_store::format::Page::new(0);
     for (op, _) in chain.located_ops() {
         let mut op = op.clone();
-        if op.id.node == NodeId(73) {
+        if op.source.is_some_and(|source| source.node == NodeId(73)) {
             if let OpKind::Import(import) = &mut op.kind {
                 let Payload::Inline(bytes) = &import.raw_ref else {
                     panic!("inline test evidence")

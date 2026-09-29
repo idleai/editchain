@@ -191,6 +191,7 @@ impl LiveWorkspace {
                 continue;
             };
             let meta = LiveBlockMeta {
+                source_stream: None,
                 task_group: None,
                 task_summary: None,
                 task_protected: true,

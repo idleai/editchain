@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use super::{hash_raw, hex_string, OpRecordLocation, OpenDiagnostics, SnapshotOpLocator};
 
 /// On-disk schema for the immutable render snapshot.
-pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 3;
+pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 5;
 /// Revision of projection/default-view semantics represented by this schema.
 ///
 /// Bumped when the fixed default view's semantics change so stale snapshots
@@ -183,7 +183,7 @@ const EXPANSION_SPANS_FILE: &str = "expansion-spans.bin";
 /// Fixed-width operation id to segment-record location index.
 const OP_LOCATORS_FILE: &str = "op-locators.bin";
 /// Bytes in one encoded operation locator record.
-const OP_LOCATOR_BYTES: usize = 36;
+const OP_LOCATOR_BYTES: usize = 53;
 
 /// A successful render-snapshot preparation result.
 #[derive(Debug, Clone, Serialize)]
@@ -911,12 +911,12 @@ fn write_op_locators(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut file = BufWriter::new(File::create(path)?);
     for entry in locators {
-        file.write_all(&entry.id.node.0.to_le_bytes())?;
-        file.write_all(&entry.id.boot.to_le_bytes())?;
-        file.write_all(&entry.id.seq.to_le_bytes())?;
+        file.write_all(entry.id.as_bytes())?;
         file.write_all(&entry.location.segment_seq.to_le_bytes())?;
         file.write_all(&entry.location.data_offset.to_le_bytes())?;
         file.write_all(&entry.location.data_len.to_le_bytes())?;
+        file.write_all(&[u8::from(entry.location.checksum.is_some())])?;
+        file.write_all(&entry.location.checksum.unwrap_or_default().to_le_bytes())?;
     }
     file.flush()?;
     file.get_ref().sync_all()?;
@@ -937,19 +937,19 @@ fn read_op_locators(path: &Path) -> io::Result<Vec<SnapshotOpLocator>> {
 
 /// Decode one fixed-width operation locator entry.
 fn decode_op_locator(chunk: &[u8]) -> io::Result<SnapshotOpLocator> {
-    let node = read_array::<8>(chunk, 0)?;
-    let boot = read_array::<4>(chunk, 8)?;
-    let seq = read_array::<8>(chunk, 12)?;
-    let segment_seq = read_array::<4>(chunk, 20)?;
-    let data_offset = read_array::<8>(chunk, 24)?;
-    let data_len = read_array::<4>(chunk, 32)?;
+    let id = read_array::<32>(chunk, 0)?;
+    let segment_seq = read_array::<4>(chunk, 32)?;
+    let data_offset = read_array::<8>(chunk, 36)?;
+    let data_len = read_array::<4>(chunk, 44)?;
+    let checksum = match chunk.get(48) {
+        Some(0) => None,
+        Some(1) => Some(u32::from_le_bytes(read_array::<4>(chunk, 49)?)),
+        _ => return Err(invalid_data("invalid record checksum marker")),
+    };
     Ok(SnapshotOpLocator {
-        id: OpId::new(
-            editchain_core::NodeId(u64::from_le_bytes(node)),
-            u32::from_le_bytes(boot),
-            u64::from_le_bytes(seq),
-        ),
+        id: OpId::from_bytes(id),
         location: OpRecordLocation {
+            checksum,
             segment_seq: u32::from_le_bytes(segment_seq),
             data_offset: u64::from_le_bytes(data_offset),
             data_len: u32::from_le_bytes(data_len),

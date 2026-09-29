@@ -37,6 +37,9 @@ pub struct OpRecordLocation {
     pub data_offset: u64,
     /// Encoded operation length in bytes.
     pub data_len: u32,
+    /// Independent record checksum in EC03; absent for legacy locations.
+    #[serde(default)]
+    pub checksum: Option<u32>,
 }
 
 /// Retained evidence and decoded accepted operations from one read.
@@ -101,6 +104,7 @@ impl CanonicalChain {
                         segment_seq,
                         data_offset: u64::try_from(record.data_offset).map_err(io::Error::other)?,
                         data_len: u32::try_from(record.data.len()).map_err(io::Error::other)?,
+                        checksum: record.checksum,
                     };
                     match decode_op(record.data) {
                         Ok(op) => {
@@ -235,5 +239,14 @@ pub fn read_encoded_at(chain_dir: &Path, location: OpRecordLocation) -> io::Resu
     let _: u64 = file.seek(SeekFrom::Start(location.data_offset))?;
     let mut encoded = vec![0u8; usize::try_from(location.data_len).map_err(io::Error::other)?];
     file.read_exact(&mut encoded)?;
+    if location
+        .checksum
+        .is_some_and(|stored| crate::format::ec03::checksum(&encoded) != stored)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "record checksum mismatch",
+        ));
+    }
     Ok(encoded)
 }

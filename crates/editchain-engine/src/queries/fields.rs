@@ -6,6 +6,48 @@ use super::{content::FieldSource, ContentField};
 
 pub(super) fn fields(kind: &OpKind) -> Vec<(ContentField, FieldSource<'_>)> {
     match kind {
+        OpKind::Activity(record) => {
+            let mut fields: Vec<_> = record
+                .kind
+                .fields()
+                .into_iter()
+                .map(|(field, payload)| {
+                    (
+                        ContentField::Record(field),
+                        if matches!(payload, Payload::Empty) {
+                            FieldSource::NotRecorded
+                        } else {
+                            FieldSource::Payload(payload)
+                        },
+                    )
+                })
+                .collect();
+            if let editchain_core::activity::Kind::File(file) = &record.kind {
+                fields.push((
+                    ContentField::FileBase,
+                    file.before.map_or(FieldSource::NotRecorded, |id| {
+                        FieldSource::Reference(id.into())
+                    }),
+                ));
+                fields.push((
+                    ContentField::FileAfter,
+                    file.after.map_or(FieldSource::NotRecorded, |id| {
+                        FieldSource::Reference(id.into())
+                    }),
+                ));
+                fields.push((
+                    ContentField::FileEdit,
+                    match &file.edit {
+                        FileEdit::None => FieldSource::NotRecorded,
+                        FileEdit::Blob(reference) => FieldSource::Reference((*reference).into()),
+                        FileEdit::ReplaceBytes { bytes, .. } | FileEdit::UnifiedDiff(bytes) => {
+                            FieldSource::Payload(bytes)
+                        }
+                    },
+                ));
+            }
+            fields
+        }
         OpKind::ChainStart(op) => vec![(ContentField::ChainName, FieldSource::Bytes(&op.name))],
         OpKind::Actor(op) => payloads(&[
             (ContentField::ActorLabel, &op.label),
