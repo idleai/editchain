@@ -11,6 +11,7 @@ use editchain_store::{BlobPreviewResolution, BlobReader, BlobResolution, BlobSto
 use postcard as _;
 use proptest as _;
 use serde as _;
+use serde_json as _;
 
 type TestResult = Result<(), Box<dyn Error>>;
 

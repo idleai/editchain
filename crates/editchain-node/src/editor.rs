@@ -45,7 +45,7 @@ fn record_inner(
     let root = PathBuf::from(&request.workspace_path).join(&request.chain_dir);
     // Capture processes share a durable, incrementally paged index. Release
     // its ownership after every batch so another editor window can record.
-    let checkpoint = editchain_index::Storage::open(&root.join("editor-v1"))?;
+    let checkpoint = editchain_index::Storage::open(&root.join("editor-v3"))?;
     let mut projection = projection::Projection::open(&root, &checkpoint)?;
     // Serialize with live imports. Re-read the tail *after* taking the lock.
     // Cold indexing happens before this lock; contention never destroys it.
@@ -133,22 +133,24 @@ fn event_id(event: &EditorEvent) -> io::Result<OpId> {
 }
 
 fn event_op(event: &EditorEvent, raw: &[u8]) -> io::Result<Op> {
-    let id = event_id(event)?;
+    let source = editchain_import::human::native_event_source(&event.session, event.sequence)?;
+    let id = source.id();
     let hash = *blake3::hash(raw).as_bytes();
     Ok(Op {
+        source: Some(source),
         id,
         parents: if event.sequence == 1 {
             ParentSet::None
         } else {
-            ParentSet::One(OpId {
-                seq: event.sequence.saturating_sub(1),
-                ..id
-            })
+            ParentSet::One(editchain_import::human::native_event_id(
+                &event.session,
+                event.sequence.saturating_sub(1),
+            )?)
         },
         actor: event
             .identity
             .as_ref()
-            .map_or(ActorId(id.node.0), identity::actor),
+            .map_or(ActorId(source.node.0), identity::actor),
         clock: Clock::UnixMs(event.time_ms),
         scope: event
             .identity

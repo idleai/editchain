@@ -81,10 +81,11 @@ fn inventory_walk_is_iterative_and_preserves_cycles_and_missing_parent_evidence(
         records.iter().map(|(key, _)| *key).collect::<BTreeSet<_>>(),
         "missing parents do not create invented records"
     );
+    let sequences: std::collections::BTreeMap<_, _> =
+        (10..=4106).map(|seq| (id(seq), seq)).collect();
     let seqs: Vec<_> = order
         .iter()
-        .filter(|key| key.id.seq >= 10)
-        .map(|key| key.id.seq)
+        .filter_map(|key| sequences.get(&key.id).copied())
         .collect();
     check!(
         seqs.windows(2).all(|pair| pair.first() > pair.last()),

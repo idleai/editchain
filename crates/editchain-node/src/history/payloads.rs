@@ -51,6 +51,16 @@ pub(super) fn hydrate_kind(
     stats: &mut BlobHydrationStats,
 ) {
     match kind {
+        OpKind::Activity(record) => {
+            for (_, payload) in record.kind.fields_mut() {
+                hydrate_payload(payload, resolver, stats);
+            }
+            if let editchain_core::activity::Kind::File(file) = &record.kind {
+                if let editchain_core::FileEdit::Blob(reference) = &file.edit {
+                    count_blob_ref(reference, resolver, stats);
+                }
+            }
+        }
         OpKind::ChainStart(_) => {}
         OpKind::Session(session) => {
             hydrate_payload(&mut session.label, resolver, stats);
@@ -189,6 +199,7 @@ pub(super) fn projection_ops_with_previews(
 pub(super) fn uses_blob_preview(kind: &OpKind) -> bool {
     let blob = |payload: &Payload| matches!(payload, Payload::Blob(_));
     match kind {
+        OpKind::Activity(record) => !record.kind.content_addresses().is_empty(),
         OpKind::ChainStart(_) => false,
         OpKind::Session(value) => blob(&value.label) || blob(&value.metadata),
         OpKind::Actor(value) => blob(&value.label) || blob(&value.role),
@@ -287,6 +298,16 @@ fn compact_kind_for_projection(
     stats: &mut PreviewContent,
 ) {
     match kind {
+        OpKind::Activity(record) => {
+            for (_, payload) in record.kind.fields_mut() {
+                compact_payload(payload, resolver, stats);
+            }
+            if let editchain_core::activity::Kind::File(file) = &record.kind {
+                if let editchain_core::FileEdit::Blob(reference) = &file.edit {
+                    defer_blob_ref(reference, resolver, stats);
+                }
+            }
+        }
         OpKind::ChainStart(start) => compact_inline_bytes(&mut start.name),
         OpKind::Session(session) => {
             compact_payload(&mut session.label, resolver, stats);

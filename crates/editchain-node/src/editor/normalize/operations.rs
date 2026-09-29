@@ -7,9 +7,9 @@ use editchain_core::{
 };
 use editchain_protocol::editor::EditorEvent;
 
-fn identity(event: &EditorEvent, lane: u32) -> OpId {
+fn identity(event: &EditorEvent, lane: u32) -> editchain_core::SourceId {
     let name = format!("vscode.work.v1:{}", event.session);
-    OpId::new(
+    editchain_core::SourceId::new(
         editchain_import::derive_node_id(&name),
         lane,
         event.sequence,
@@ -18,7 +18,8 @@ fn identity(event: &EditorEvent, lane: u32) -> OpId {
 
 fn operation(event: &EditorEvent, lane: u32, parent: Option<OpId>, kind: OpKind, tags: Tags) -> Op {
     Op {
-        id: identity(event, lane),
+        source: Some(identity(event, lane)),
+        id: identity(event, lane).id(),
         parents: parent.map_or(ParentSet::None, ParentSet::One),
         actor: event.identity.as_ref().map_or_else(
             || ActorId(editchain_import::derive_node_id(&event.session).0),
@@ -55,7 +56,7 @@ pub(in crate::editor) fn observation(event: &EditorEvent, source: OpId) -> Op {
 
 pub(super) fn work(
     event: &EditorEvent,
-    record: &HumanWorkRecord,
+    record: &HumanWorkRecord<editchain_core::SourceId>,
     previous: Option<OpId>,
     link: bool,
 ) -> super::Result<Vec<Op>> {

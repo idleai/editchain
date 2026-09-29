@@ -189,6 +189,7 @@ pub fn build_raw_op(
         None => ParentSet::None,
     };
     Ok(Op {
+        source: Some(stream.source_position(SourcePosition::raw(seq))?),
         id: op_id,
         parents,
         actor,
@@ -333,6 +334,10 @@ pub fn normalized_ops_for_item(
         ProjectionKind::Message => {
             let lane = take_lane(&mut ctx.lanes, anchor_ordinal)?;
             ops.push(Op {
+                source: Some(
+                    ctx.stream
+                        .source_position(SourcePosition::derived(anchor_ordinal, lane))?,
+                ),
                 id: ctx
                     .stream
                     .op_from_position(SourcePosition::derived(anchor_ordinal, lane))?,
@@ -372,6 +377,12 @@ pub fn normalized_ops_for_item(
                     .stream
                     .op_from_position(SourcePosition::raw(item.last_seen))?;
                 ops.push(Op {
+                    source: Some(
+                        ctx.stream.source_position(SourcePosition::derived(
+                            item.first_seen,
+                            start_lane,
+                        ))?,
+                    ),
                     id: ctx
                         .stream
                         .op_from_position(SourcePosition::derived(item.first_seen, start_lane))?,
@@ -388,6 +399,12 @@ pub fn normalized_ops_for_item(
                     }),
                 });
                 ops.push(Op {
+                    source: Some(
+                        ctx.stream.source_position(SourcePosition::derived(
+                            item.last_seen,
+                            finish_lane,
+                        ))?,
+                    ),
                     id: ctx
                         .stream
                         .op_from_position(SourcePosition::derived(item.last_seen, finish_lane))?,
@@ -410,6 +427,10 @@ pub fn normalized_ops_for_item(
             } else {
                 let lane = take_lane(&mut ctx.lanes, anchor_ordinal)?;
                 ops.push(Op {
+                    source: Some(
+                        ctx.stream
+                            .source_position(SourcePosition::derived(anchor_ordinal, lane))?,
+                    ),
                     id: ctx
                         .stream
                         .op_from_position(SourcePosition::derived(anchor_ordinal, lane))?,
@@ -458,6 +479,12 @@ pub fn normalized_ops_for_item(
                     .stream
                     .op_from_position(SourcePosition::raw(item.last_seen))?;
                 ops.push(Op {
+                    source: Some(
+                        ctx.stream.source_position(SourcePosition::derived(
+                            item.first_seen,
+                            start_lane,
+                        ))?,
+                    ),
                     id: ctx
                         .stream
                         .op_from_position(SourcePosition::derived(item.first_seen, start_lane))?,
@@ -473,6 +500,12 @@ pub fn normalized_ops_for_item(
                     }),
                 });
                 ops.push(Op {
+                    source: Some(
+                        ctx.stream.source_position(SourcePosition::derived(
+                            item.last_seen,
+                            finish_lane,
+                        ))?,
+                    ),
                     id: ctx
                         .stream
                         .op_from_position(SourcePosition::derived(item.last_seen, finish_lane))?,
@@ -493,6 +526,10 @@ pub fn normalized_ops_for_item(
             } else {
                 let lane = take_lane(&mut ctx.lanes, anchor_ordinal)?;
                 ops.push(Op {
+                    source: Some(
+                        ctx.stream
+                            .source_position(SourcePosition::derived(anchor_ordinal, lane))?,
+                    ),
                     id: ctx
                         .stream
                         .op_from_position(SourcePosition::derived(anchor_ordinal, lane))?,
@@ -517,6 +554,10 @@ pub fn normalized_ops_for_item(
                     .stream
                     .op_from_position(SourcePosition::derived(anchor_ordinal, lane))?;
                 ops.push(Op {
+                    source: Some(
+                        ctx.stream
+                            .source_position(SourcePosition::derived(anchor_ordinal, lane))?,
+                    ),
                     id: file_op_id,
                     parents: ParentSet::One(raw_op_id),
                     actor: actor_id,
@@ -540,6 +581,10 @@ pub fn normalized_ops_for_item(
                 // while one Codex fileChange item can contain several paths.
                 let note_lane = take_lane(&mut ctx.lanes, anchor_ordinal)?;
                 ops.push(Op {
+                    source: Some(
+                        ctx.stream
+                            .source_position(SourcePosition::derived(anchor_ordinal, note_lane))?,
+                    ),
                     id: ctx
                         .stream
                         .op_from_position(SourcePosition::derived(anchor_ordinal, note_lane))?,
@@ -570,6 +615,10 @@ pub fn normalized_ops_for_item(
                 Payload::Empty
             };
             ops.push(Op {
+                source: Some(
+                    ctx.stream
+                        .source_position(SourcePosition::derived(anchor_ordinal, lane))?,
+                ),
                 id: ctx
                     .stream
                     .op_from_position(SourcePosition::derived(anchor_ordinal, lane))?,
@@ -602,6 +651,10 @@ pub fn normalized_ops_for_item(
                 None => Payload::Empty,
             };
             ops.push(Op {
+                source: Some(
+                    ctx.stream
+                        .source_position(SourcePosition::derived(anchor_ordinal, lane))?,
+                ),
                 id: ctx
                     .stream
                     .op_from_position(SourcePosition::derived(anchor_ordinal, lane))?,
@@ -651,6 +704,10 @@ pub fn normalized_ops_for_inter_agent(
         &line.content,
     );
     Ok(vec![Op {
+        source: Some(
+            ctx.stream
+                .source_position(SourcePosition::derived(line.source_ordinal, derived_lane))?,
+        ),
         id: ctx
             .stream
             .op_from_position(SourcePosition::derived(line.source_ordinal, derived_lane))?,
@@ -693,6 +750,10 @@ pub fn normalized_ops_for_turn(
     let actor_id = derive_actor_id(&format!("system:{}", ctx.thread));
     let summary = turn_summary(turn, item_count);
     Ok(vec![Op {
+        source: Some(
+            ctx.stream
+                .source_position(SourcePosition::derived(first_ordinal, derived_lane))?,
+        ),
         id: ctx
             .stream
             .op_from_position(SourcePosition::derived(first_ordinal, derived_lane))?,
@@ -732,6 +793,10 @@ pub fn normalized_ops_for_compaction(
         .op_from_position(SourcePosition::raw(line.source_ordinal))?;
     let actor_id = derive_actor_id(&format!("system:{}", ctx.thread));
     Ok(vec![Op {
+        source: Some(
+            ctx.stream
+                .source_position(SourcePosition::derived(line.source_ordinal, derived_lane))?,
+        ),
         id: ctx
             .stream
             .op_from_position(SourcePosition::derived(line.source_ordinal, derived_lane))?,

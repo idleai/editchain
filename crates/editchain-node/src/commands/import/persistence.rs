@@ -68,6 +68,7 @@ mod tests {
 
     fn message(sequence: u64, bytes: Vec<u8>) -> Op {
         Op {
+            source: Some(editchain_core::SourceId::new(NodeId(1), 0, sequence)),
             id: OpId::new(NodeId(1), 0, sequence),
             parents: ParentSet::None,
             actor: ActorId(0),
@@ -139,13 +140,14 @@ mod tests {
     fn page_batches_preserve_every_operation() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = SegmentStore::open(dir.path()).unwrap();
-        let operations: Vec<_> = (1..=3)
+        let mut operations: Vec<_> = (1..=3)
             .map(|seq| message(seq, vec![b'x'; PAGE_BYTES / 2]))
             .collect();
         let result = append(&mut store, &operations).unwrap();
         assert_eq!(result.written, 3);
         let pages = store.read_all().unwrap();
         assert_eq!(pages.len(), 3);
+        operations.sort_by_key(|op| op.id);
         assert_eq!(
             CanonicalChain::read(dir.path())
                 .unwrap()

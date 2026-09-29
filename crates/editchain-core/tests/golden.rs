@@ -11,6 +11,7 @@
     reason = "Test file; dependencies used by library macros"
 )]
 
+use blake3 as _;
 use editchain_core::*;
 
 fn encode(op: &Op) -> Vec<u8> {
@@ -31,6 +32,7 @@ fn decode(bytes: &[u8]) -> Op {
 
 fn msg_op(node: u64, boot: u32, seq: u64, ms: u64, text: &[u8]) -> Op {
     Op {
+        source: Some(SourceId::new(NodeId(node), boot, seq)),
         id: OpId::new(NodeId(node), boot, seq),
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -48,15 +50,9 @@ fn msg_op(node: u64, boot: u32, seq: u64, ms: u64, text: &[u8]) -> Op {
     clippy::too_many_arguments,
     reason = "Test helper constructing a full Op; all fields are needed"
 )]
-const fn file_op(
-    node: u64,
-    boot: u32,
-    seq: u64,
-    ms: u64,
-    path: PathId,
-    after: Option<ContentId>,
-) -> Op {
+fn file_op(node: u64, boot: u32, seq: u64, ms: u64, path: PathId, after: Option<ContentId>) -> Op {
     Op {
+        source: Some(SourceId::new(NodeId(node), boot, seq)),
         id: OpId::new(NodeId(node), boot, seq),
         parents: ParentSet::None,
         actor: ActorId(0),
@@ -83,6 +79,7 @@ fn golden_round_trip_all_kinds() {
         (
             "ChainStart",
             Op {
+                source: Some(SourceId::new(NodeId(0), 0, 0)),
                 id: OpId::new(NodeId(0), 0, 0),
                 parents: ParentSet::None,
                 actor: ActorId(0),
@@ -98,6 +95,7 @@ fn golden_round_trip_all_kinds() {
         (
             "Actor",
             Op {
+                source: Some(SourceId::new(NodeId(1), 0, 1)),
                 id: OpId::new(NodeId(1), 0, 1),
                 parents: ParentSet::None,
                 actor: ActorId(1),
@@ -114,6 +112,7 @@ fn golden_round_trip_all_kinds() {
         (
             "Tool",
             Op {
+                source: Some(SourceId::new(NodeId(1), 0, 3)),
                 id: OpId::new(NodeId(1), 0, 3),
                 parents: ParentSet::None,
                 actor: ActorId(0),
@@ -131,6 +130,7 @@ fn golden_round_trip_all_kinds() {
         (
             "Command",
             Op {
+                source: Some(SourceId::new(NodeId(1), 0, 4)),
                 id: OpId::new(NodeId(1), 0, 4),
                 parents: ParentSet::None,
                 actor: ActorId(0),
@@ -147,6 +147,7 @@ fn golden_round_trip_all_kinds() {
         (
             "File",
             Op {
+                source: Some(SourceId::new(NodeId(1), 0, 5)),
                 id: OpId::new(NodeId(1), 0, 5),
                 parents: ParentSet::None,
                 actor: ActorId(0),
@@ -228,6 +229,7 @@ fn golden_file_facts_retain_each_stage_and_revision() {
         originals.push(op);
     }
     let decoded: Vec<_> = accepted.iter().map(|(_, bytes)| decode(bytes)).collect();
+    originals.sort_by_key(|op| op.id);
     assert_eq!(decoded, originals);
 }
 
@@ -244,4 +246,54 @@ fn golden_duplicate_detection() {
     assert_eq!(opset.insert(id, vec![1, 2, 3]), Admission::Duplicate);
     assert_eq!(opset.insert(id, vec![4, 5, 6]), Admission::Conflict);
     assert_eq!(opset.conflicts().count(), 1);
+}
+
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "test assertions report mismatches while fixture I/O errors propagate"
+)]
+fn canonical_identity_has_a_frozen_derivation_and_fixed_width(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = SourceId::new(NodeId(1), 0, 42);
+    let id = source.id();
+    let full = "14721180b5564d64c8b55873b00e440aa49105bd3d1350fa3412e285beba758c";
+    assert_eq!(id.to_string(), full);
+    assert_eq!(OpId::from_display_str("1:0:42"), Some(id));
+    assert_eq!(OpId::from_display_str(&full.to_uppercase()), Some(id));
+    assert_eq!(OpId::from_display_str("14721180"), None);
+    assert_eq!(postcard::to_stdvec(&id)?.len(), 32);
+    assert_eq!(
+        serde_json::to_value(id)?,
+        serde_json::Value::String(full.into())
+    );
+    let op = msg_op(1, 0, 42, 0, b"unchanged");
+    let mut legacy_json = serde_json::to_value(&op)?;
+    let object = legacy_json.as_object_mut().ok_or("operation object")?;
+    let _old = object.insert("id".into(), serde_json::to_value(source)?);
+    let _old = object.remove("source");
+    assert_eq!(serde_json::from_value::<Op>(legacy_json)?, op);
+    assert_eq!(decode(&encode(&op)), op);
+    let prefixes: std::collections::BTreeSet<_> = (0..1000)
+        .map(|seq| {
+            OpId::new(NodeId(1), 0, seq)
+                .to_string()
+                .chars()
+                .take(8)
+                .collect::<String>()
+        })
+        .collect();
+    assert_eq!(
+        prefixes.len(),
+        1000,
+        "one producer must not share a display prefix"
+    );
+    for invalid in ["", "123", "xyzxyz", "1:2:3:4", &"0".repeat(65)] {
+        assert!(IdQuery::parse(invalid).is_none());
+    }
+    assert_eq!(
+        IdQuery::parse("1:0:42").and_then(|query| query.full()),
+        Some(id)
+    );
+    Ok(())
 }

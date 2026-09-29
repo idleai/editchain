@@ -342,7 +342,7 @@ pub fn import_codex(
             if let (Some(title), Some(first_raw)) = (
                 session_title,
                 (new_cursor.ops_emitted > 0)
-                    .then(|| stream.op_from_position(SourcePosition::raw(1)))
+                    .then(|| stream.source_position(SourcePosition::raw(1)))
                     .transpose()?,
             ) {
                 let title_op =

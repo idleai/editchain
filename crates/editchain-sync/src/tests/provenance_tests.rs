@@ -72,7 +72,11 @@ fn work(root: &Path, sequence: u64) -> io::Result<HumanWorkRecord> {
         if let OpKind::Import(import) = &op.kind {
             if let Payload::Inline(bytes) = &import.raw_ref {
                 if let Ok(work) = serde_json::from_slice::<HumanWorkRecord>(bytes) {
-                    if work.source_event.seq == sequence {
+                    if CanonicalChain::read(root)?
+                        .get(work.source_event)
+                        .and_then(|source| source.source)
+                        .is_some_and(|source| source.seq == sequence)
+                    {
                         return Ok(work);
                     }
                 }
@@ -126,6 +130,7 @@ fn foreign_source() -> io::Result<(RecordKey, Vec<u8>)> {
     .map_err(io::Error::other)?;
     let hash = *blake3::hash(&raw).as_bytes();
     let op = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(7), 1, 99)),
         id: OpId::new(NodeId(7), 1, 99),
         parents: ParentSet::None,
         actor: ActorId(7),
@@ -215,7 +220,7 @@ fn echoed_local_baseline_keeps_capture_across_a_cold_rebuild() -> io::Result<()>
 
     // Simulate loss of the derived cache, retaining every authoritative record.
     // The foreign source has no local bytes; capture must skip it, not fail.
-    std::fs::remove_dir_all(root.join("editor-v1"))?;
+    std::fs::remove_dir_all(root.join("editor-v3"))?;
     check_eq!(
         accepted(&mut server, &request(&workspace, vec![read_event(4)?]),)?,
         1,

@@ -7,7 +7,6 @@ use serde as _;
 
 use crate::format::{
     decode_ec03, decode_op, detect_format, encode_ec03, encode_op, Ec03Frame, FrameFormat,
-    EC03_FORMAT_VERSION,
 };
 use editchain_core::*;
 
@@ -58,6 +57,7 @@ fn operation_decode_requires_complete_schema_consumption() {
 #[expect(clippy::panic, reason = "test assertion")]
 fn round_trip_message_op() {
     let op = Op {
+        source: Some(SourceId::new(NodeId(1), 0, 42)),
         id: OpId::new(NodeId(1), 0, 42),
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -71,7 +71,9 @@ fn round_trip_message_op() {
     };
 
     let encoded = encode_op(&op).unwrap();
-    assert_eq!(encoded, MESSAGE_V1);
+    let legacy: legacy::LegacyOp = postcard::from_bytes(MESSAGE_V1).unwrap();
+    assert_eq!(postcard::to_stdvec(&legacy).unwrap(), MESSAGE_V1);
+    assert_eq!(encoded, include_bytes!("fixtures/operation-v1-message.bin"));
     assert_eq!(decode_op(MESSAGE_V1).unwrap(), op);
     let decoded: Op = decode_op(&encoded).unwrap();
 
@@ -92,6 +94,7 @@ fn round_trip_message_op() {
 #[expect(clippy::panic, reason = "test assertion")]
 fn round_trip_file_op() {
     let op = Op {
+        source: Some(SourceId::new(NodeId(2), 1, 7)),
         id: OpId::new(NodeId(2), 1, 7),
         parents: ParentSet::None,
         actor: ActorId(0),
@@ -151,6 +154,7 @@ fn round_trip_git_commit_op() {
     };
 
     let op = Op {
+        source: Some(SourceId::new(NodeId(2), 0, 10)),
         id: OpId::new(NodeId(2), 0, 10),
         parents: ParentSet::None,
         actor: ActorId(3),
@@ -184,6 +188,7 @@ fn round_trip_git_link_op() {
     };
 
     let op = Op {
+        source: Some(SourceId::new(NodeId(2), 0, 11)),
         id: OpId::new(NodeId(2), 0, 11),
         parents: ParentSet::None,
         actor: ActorId(3),
@@ -209,15 +214,12 @@ fn round_trip_git_link_op() {
 
 #[test]
 fn ec03_round_trip_empty() {
-    let frame = Ec03Frame::new(0, 0);
-    let encoded = encode_ec03(&frame);
+    let frame = Ec03Frame::new(0);
+    let encoded = encode_ec03(&frame).unwrap();
     let decoded = decode_ec03(&encoded).unwrap();
 
-    assert_eq!(decoded.format_version, EC03_FORMAT_VERSION);
     assert_eq!(decoded.page_sequence, 0);
-    assert_eq!(decoded.commit_generation, 0);
     assert_eq!(decoded.records.len(), 0);
-    assert_eq!(decoded.record_count, 0);
 }
 
 #[test]
@@ -226,28 +228,26 @@ fn ec03_round_trip_empty() {
     reason = "test assertions on known-length vec"
 )]
 fn ec03_round_trip_with_records() {
-    let mut frame = Ec03Frame::new(42, 7);
-    frame.add_record(vec![1, 2, 3]);
-    frame.add_record(vec![4, 5, 6, 7]);
-    frame.add_record(vec![8]);
+    let mut frame = Ec03Frame::new(42);
+    frame.add_record(0, vec![1, 2, 3]);
+    frame.add_record(0, vec![4, 5, 6, 7]);
+    frame.add_record(0, vec![8]);
 
-    let encoded = encode_ec03(&frame);
+    let encoded = encode_ec03(&frame).unwrap();
     let decoded = decode_ec03(&encoded).unwrap();
 
     assert_eq!(decoded.page_sequence, 42);
-    assert_eq!(decoded.commit_generation, 7);
     assert_eq!(decoded.records.len(), 3);
-    assert_eq!(decoded.records[0], vec![1, 2, 3]);
-    assert_eq!(decoded.records[1], vec![4, 5, 6, 7]);
-    assert_eq!(decoded.records[2], vec![8]);
-    assert_eq!(decoded.record_count, 3);
+    assert_eq!(decoded.records[0].data, vec![1, 2, 3]);
+    assert_eq!(decoded.records[1].data, vec![4, 5, 6, 7]);
+    assert_eq!(decoded.records[2].data, vec![8]);
 }
 
 #[test]
 fn ec03_detect_format() {
-    let mut frame = Ec03Frame::new(0, 0);
-    frame.add_record(vec![1]);
-    let encoded = encode_ec03(&frame);
+    let mut frame = Ec03Frame::new(0);
+    frame.add_record(0, vec![1]);
+    let encoded = encode_ec03(&frame).unwrap();
 
     assert_eq!(detect_format(&encoded), Some(FrameFormat::Ec03));
     assert_eq!(detect_format(b"EC02"), Some(FrameFormat::Ec02));
@@ -257,12 +257,12 @@ fn ec03_detect_format() {
 
 #[test]
 fn ec03_power_loss_partial_frame() {
-    let mut frame = Ec03Frame::new(0, 0);
-    frame.add_record(vec![1, 2, 3]);
-    let mut encoded = encode_ec03(&frame);
+    let mut frame = Ec03Frame::new(0);
+    frame.add_record(0, vec![1, 2, 3]);
+    let mut encoded = encode_ec03(&frame).unwrap();
 
     // Truncate in the middle of the payload.
     encoded.truncate(encoded.len() - 6);
 
-    assert!(decode_ec03(&encoded).is_none());
+    assert!(decode_ec03(&encoded).is_err());
 }

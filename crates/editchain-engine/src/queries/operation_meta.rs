@@ -82,7 +82,16 @@ impl ChainQueries {
                 self.all_history(Some(IndexKey::Session(session)))?.into_iter()
                     .filter(|entry| matches!(&entry.operation.kind, OpKind::Session(value) if value.id == session)).collect()
             } else { Vec::new() };
-            let parents = record.operation.parents.iter().map(|parent| {
+            let (actor_records, session_records) = if let OpKind::Activity(activity) = &record.operation.kind {
+                let author = if let Some(author) = activity.author {
+                    self.all_history(Some(IndexKey::Item(author)))?.into_iter().filter(|entry| matches!(&entry.operation.kind, OpKind::Activity(record) if matches!(record.kind, editchain_core::activity::Kind::Author(_)))).collect()
+                } else { Vec::new() };
+                let sessions = if let Some(session) = activity.session {
+                    self.all_history(Some(IndexKey::Item(session)))?.into_iter().filter(|entry| matches!(&entry.operation.kind, OpKind::Activity(record) if matches!(record.kind, editchain_core::activity::Kind::Session(_)))).collect()
+                } else { Vec::new() };
+                (author, sessions)
+            } else { (actor_records, session_records) };
+            let parents = record.operation.causal_parents().iter().map(|parent| {
                 Ok(OperationLookup { operation: *parent, record: self.operation(*parent)? })
             }).collect::<io::Result<Vec<_>>>()?;
             let target = EntityRef::Operation(id);
@@ -110,7 +119,7 @@ impl ChainQueries {
             };
             let record = self.operation(id)?;
             if let Lookup::Found(entry) = &record {
-                for parent in &entry.operation.parents {
+                for parent in &entry.operation.causal_parents() {
                     if *parent != id && !visited.contains_key(parent) {
                         let _inserted = pending.insert(*parent);
                     }

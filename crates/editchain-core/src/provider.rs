@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::OpId;
+use crate::SourceId;
 
 /// A full Codex execution identity, separate from physical operation IDs.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -24,7 +24,7 @@ pub struct ProviderEvidence {
     /// Payload schema; unsupported schemas remain opaque metadata.
     pub schema: ProviderEvidenceSchema,
     /// Physical raw operation carrying this observation.
-    pub source: OpId,
+    pub source: SourceId,
     /// Hash of the complete physical record, including its newline.
     pub raw_hash: [u8; 32],
     /// Typed provider observation.
@@ -61,7 +61,7 @@ pub struct ClaudeDerivationEvidence {
     /// Whether requested private reasoning is included.
     pub includes_thinking: bool,
     /// Complete operation set in provider content order.
-    pub outputs: Vec<OpId>,
+    pub outputs: Vec<SourceId>,
 }
 
 /// Named semantic derivation contract, independent of metadata migrations.
@@ -86,7 +86,7 @@ pub struct CodexDerivationEvidence {
     /// Whether this materialization includes requested private reasoning.
     pub includes_thinking: bool,
     /// Complete operation set produced for this occurrence.
-    pub outputs: Vec<OpId>,
+    pub outputs: Vec<SourceId>,
     /// Provider logical changes, in the order reported on this occurrence.
     pub changes: Vec<CodexLogicalChange>,
 }
@@ -106,9 +106,9 @@ pub enum CodexLogicalChange {
         /// Full provider item identity within the turn.
         item: String,
         /// First occurrence since the most recent removal of this turn.
-        incarnation: OpId,
+        incarnation: SourceId,
         /// Materialized operations belonging to this revision of the item.
-        outputs: Vec<OpId>,
+        outputs: Vec<SourceId>,
     },
 }
 
@@ -125,9 +125,9 @@ pub struct CodexSourceEvidence {
     /// Provider path, used only for exact legacy lifecycle correlation.
     pub agent_path: Option<String>,
     /// First physical occurrence in this source generation.
-    pub first: OpId,
+    pub first: SourceId,
     /// Last complete physical occurrence covered by this prefix.
-    pub last: OpId,
+    pub last: SourceId,
     /// Hash of the complete source prefix through `last`.
     pub prefix_hash: [u8; 32],
 }
@@ -152,7 +152,7 @@ pub enum CodexLifecycleEvent {
     /// An explicit activation of a named child execution.
     Spawn {
         /// First occurrence of the logical activation item.
-        activation: OpId,
+        activation: SourceId,
         /// Full child execution identity.
         child: CodexThreadId,
         /// Exact legacy path for a later `list_agents` correlation.

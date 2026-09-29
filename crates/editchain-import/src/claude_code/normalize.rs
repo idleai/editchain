@@ -211,6 +211,7 @@ pub fn normalize_envelope(
         RecordClass::Content | RecordClass::Unknown => {}
     }
     let raw_op = Op {
+        source: Some(stream.source_position(SourcePosition::raw(seq))?),
         id: op_id,
         parents: ParentSet::None,
         actor,

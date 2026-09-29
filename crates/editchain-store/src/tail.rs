@@ -9,7 +9,7 @@ use std::sync::Arc;
 use editchain_core::{Admission, Op, OpId};
 
 use crate::format::decode_op;
-use crate::format::scan::{PageScanner, ScanErrorKind, ScanItem, MAX_RECORD_BYTES};
+use crate::format::scan::{PageScanner, ScanErrorKind, ScanItem};
 use crate::segment::segment_sequences;
 use crate::{CanonicalChain, OpRecordLocation};
 
@@ -197,7 +197,7 @@ impl<C: TailCorpus> Tail<C> {
             self.validate_frontier(&metadata)?;
             let _: u64 = file.seek(SeekFrom::Start(self.offset))?;
             let mut bytes = Vec::new();
-            let limit = u64::from(MAX_RECORD_BYTES).saturating_add(13);
+            let limit = u64::from(crate::format::MAX_FRAME_BYTES);
             let _read = file.take(limit).read_to_end(&mut bytes)?;
             delta.work.bytes_read = delta
                 .work
@@ -297,6 +297,7 @@ impl<C: TailCorpus> Tail<C> {
                     .checked_add(u64::try_from(record.data_offset).map_err(io::Error::other)?)
                     .ok_or_else(|| invalid("record offset exhausted"))?,
                 data_len: u32::try_from(record.data.len()).map_err(io::Error::other)?,
+                checksum: record.checksum,
             };
             let op = Arc::new(op);
             match self

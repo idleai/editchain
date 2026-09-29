@@ -15,6 +15,7 @@ use serde_json as _;
 
 fn operation(sequence: u64, bytes: &[u8]) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 7, sequence)),
         id: OpId::new(NodeId(1), 7, sequence),
         parents: ParentSet::One(OpId::new(NodeId(9), 3, 2)),
         actor: ActorId(u64::MAX),
@@ -83,11 +84,11 @@ fn equal_decoded_values_with_different_encodings_are_conflicts() {
     let engine = Engine::open(directory.path()).unwrap();
     let original = operation(1, b"bytes are authoritative");
     let canonical = encode_op(&original).unwrap();
-    assert_eq!(canonical.first(), Some(&1));
-    // Postcard accepts an overlong varint for the first NodeId. These bytes
-    // decode identically, but normalization would erase conflict evidence.
-    let mut alternate = vec![0x81, 0];
-    alternate.extend_from_slice(canonical.get(1..).unwrap());
+    // Schema prefix (15), fixed ID (32), source presence (1), then source NodeId.
+    assert_eq!(canonical.get(48), Some(&1));
+    let mut alternate = canonical.get(..48).unwrap().to_vec();
+    alternate.extend_from_slice(&[0x81, 0]);
+    alternate.extend_from_slice(canonical.get(49..).unwrap());
     assert_eq!(decode_op(&alternate).unwrap(), original);
     assert_eq!(
         engine.append_encoded(&alternate).unwrap(),
@@ -239,7 +240,7 @@ fn interrupted_tails_and_unknown_records_survive_subsequent_appends() {
     assert_eq!(engine.append(&original).unwrap(), Admission::Accepted);
     let segment = directory.path().join("000000.eclog");
     let mut interrupted = std::fs::read(&segment).unwrap();
-    interrupted.extend_from_slice(&[100, 0, 0, 0, 0, 42]);
+    interrupted.extend_from_slice(b"EC03\x02\x00");
     std::fs::write(&segment, &interrupted).unwrap();
     let mut store = SegmentStore::open(directory.path()).unwrap();
     let mut future = Page::new(store.segment_sequence());

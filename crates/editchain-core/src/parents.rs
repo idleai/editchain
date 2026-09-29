@@ -6,20 +6,20 @@ use crate::ids::OpId;
 ///
 /// Operations reference their causal parents to establish a DAG.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum ParentSet {
+pub enum ParentSet<I = OpId> {
     /// No parents (root operation).
     #[default]
     None,
     /// Single parent.
-    One(OpId),
+    One(I),
     /// Two parents (e.g. merge of two branches).
-    Two(OpId, OpId),
+    Two(I, I),
 }
 
-impl ParentSet {
+impl<I> ParentSet<I> {
     /// Returns an iterator over all referenced `OpId`s.
     #[must_use]
-    pub const fn iter(&self) -> ParentIter<'_> {
+    pub const fn iter(&self) -> ParentIter<'_, I> {
         ParentIter {
             set: self,
             index: 0,
@@ -27,9 +27,9 @@ impl ParentSet {
     }
 }
 
-impl<'a> IntoIterator for &'a ParentSet {
-    type Item = &'a OpId;
-    type IntoIter = ParentIter<'a>;
+impl<'a, I> IntoIterator for &'a ParentSet<I> {
+    type Item = &'a I;
+    type IntoIter = ParentIter<'a, I>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -38,13 +38,13 @@ impl<'a> IntoIterator for &'a ParentSet {
 
 /// Iterator over parent `OpId`s.
 #[derive(Debug)]
-pub struct ParentIter<'a> {
-    set: &'a ParentSet,
+pub struct ParentIter<'a, I = OpId> {
+    set: &'a ParentSet<I>,
     index: usize,
 }
 
-impl<'a> Iterator for ParentIter<'a> {
-    type Item = &'a OpId;
+impl<'a, I> Iterator for ParentIter<'a, I> {
+    type Item = &'a I;
 
     fn next(&mut self) -> Option<Self::Item> {
         match (self.set, self.index) {

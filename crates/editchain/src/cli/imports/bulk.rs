@@ -102,13 +102,13 @@ pub(super) fn run(
     let sources = selection::prepare(chain, args, options)?;
     let selection_seconds = started.elapsed().as_secs_f64();
     if args.dry_run {
-        return preview(&sources, args, options, output);
+        return preview(chain, &sources, args, options, output);
     }
     let helper = selection::helper(args);
     let opened = Instant::now();
     let mut writer = LogStore::new(SegmentStore::open(chain)?);
     let mut blobs = BufferedBlobSink::new(FsBlobSink::new(chain.join("blobs"))?);
-    let mut cursors = FsCursorStore::new(chain.join("cursors"))?;
+    let mut cursors = FsCursorStore::new(chain.join(super::cursor_directory(args)))?;
     let writer_open_seconds = opened.elapsed().as_secs_f64();
     let mut totals = Totals::default();
     let selected = sources
@@ -122,6 +122,7 @@ pub(super) fn run(
             for file in &source.files {
                 let capture = Instant::now();
                 let batch = capture_import_file(request, file, options, &mut blobs, &cursors)?;
+                let batch = super::converted(chain, batch, args, &mut blobs)?;
                 options.cancellation.check(file.path())?;
                 blobs.flush()?;
                 source_totals.capture = source_totals.capture.saturating_add(capture.elapsed());
@@ -164,6 +165,7 @@ pub(super) fn run(
 }
 
 fn preview(
+    chain: &Path,
     sources: &[selection::Prepared],
     args: &Args,
     options: &ImportOptions,
@@ -179,6 +181,7 @@ fn preview(
         source.with_source(&helper, |request| {
             for file in &source.files {
                 let batch = capture_import_file(request, file, options, &mut blobs, &cursors)?;
+                let batch = super::converted(chain, batch, args, &mut blobs)?;
                 totals.add_preview(&batch, &mut evidence)?;
                 output.emit(&Preview {
                     r#type: "capture",

@@ -56,9 +56,9 @@ fn linear_history_single_lane() {
     // A -> B -> C (newest-first: C, B, A)
     let nodes = vec![op(1, 3), op(1, 2), op(1, 1)];
     let parents = |id: &OpId| {
-        if id.seq == 3 {
+        if *id == op(1, 3) {
             vec![op(1, 2)]
-        } else if id.seq == 2 {
+        } else if *id == op(1, 2) {
             vec![op(1, 1)]
         } else {
             Vec::new()
@@ -75,7 +75,7 @@ fn branch_uses_two_lanes() {
     // C (merge of A and B) -> A, B (newest-first: C, B, A)
     let nodes = vec![op(1, 3), op(1, 2), op(1, 1)];
     let parents = |id: &OpId| {
-        if id.seq == 3 {
+        if *id == op(1, 3) {
             vec![op(1, 2), op(1, 1)]
         } else {
             Vec::new()
@@ -232,6 +232,7 @@ fn git_commit(oid_byte: u8, parent_bytes: &[u8]) -> editchain_core::GitCommitEnt
 /// directly (the path `merge_git_commits` is designed to skip).
 fn git_commit_op(node: u64, seq: u64, commit: editchain_core::GitCommitEntity) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::None,
         actor: ActorId(0),
@@ -1883,6 +1884,7 @@ use editchain_core::{
 /// separate rows where the lane divergence is observable.
 fn msg(node: u64, seq: u64, release: u64, parent: Option<OpId>) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: parent.map_or(ParentSet::None, ParentSet::One),
         actor: ActorId(1),
@@ -1901,6 +1903,7 @@ fn msg(node: u64, seq: u64, release: u64, parent: Option<OpId>) -> Op {
 /// shared root).
 fn fork_note(parent_id: OpId, target_id: OpId) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(7), 0, 0xFF0)),
         id: OpId::new(NodeId(7), 0, 0xFF0),
         parents: ParentSet::One(parent_id),
         actor: ActorId(0),
@@ -2012,6 +2015,7 @@ fn fork_note_never_suppresses_rows_without_occurrence_evidence() {
 fn undated_header_keeps_unknown_source_time() {
     // Old session A: an undated header + dated ops at Jul-10 (ts 1000..1003).
     let a_header = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 0, 1)),
         id: OpId::new(NodeId(1), 0, 1),
         parents: ParentSet::None,
         actor: ActorId(1),

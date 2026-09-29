@@ -51,6 +51,17 @@ pub use operation_meta::{AncestorGraph, OperationLookup, OperationMeta};
 pub use relationships::{EntityRef, RecordedRelationship, RelationshipKind};
 pub use search::{FieldMatch, SearchHit, SearchPage};
 
+/// Resolution of a repository-local operation-ID prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IdResolution {
+    /// No retained identity has this prefix.
+    Missing,
+    /// Two matching identities prove ambiguity; the list is bounded.
+    Ambiguous(Vec<OpId>),
+    /// One complete canonical identity.
+    Found(OpId),
+}
+
 /// Portable reference to one exact recorded operation representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordRef {
@@ -149,6 +160,48 @@ pub struct ChainQueries {
 }
 
 impl ChainQueries {
+    /// Resolve full IDs, legacy addresses, and unique hexadecimal prefixes.
+    /// Full IDs remain usable for missing-reference queries. Prefix ambiguity
+    /// includes quarantined identities and never silently chooses an operation.
+    /// # Errors
+    /// Returns index read errors.
+    pub fn resolve_id(&self, query: &editchain_core::IdQuery) -> io::Result<IdResolution> {
+        if let Some(id) = query.full() {
+            return self.resolve_alias(id);
+        }
+        let candidates = self.index.id_candidates(query)?;
+        Ok(match candidates.as_slice() {
+            [] => IdResolution::Missing,
+            [id] => return self.resolve_alias(*id),
+            _ => IdResolution::Ambiguous(candidates),
+        })
+    }
+
+    fn resolve_alias(&self, id: OpId) -> io::Result<IdResolution> {
+        if self.index.retains_id(id)? {
+            return Ok(IdResolution::Found(id));
+        }
+        Ok(match self.index.alias_candidates(id)?.as_slice() {
+            [] => IdResolution::Found(id),
+            [mapped] => IdResolution::Found(*mapped),
+            multiple => IdResolution::Ambiguous(multiple.to_vec()),
+        })
+    }
+
+    /// Resolve logical IDs separately from immutable event addresses.
+    /// # Errors
+    /// Returns derived-index read errors.
+    pub fn resolve_item(&self, query: &editchain_core::IdQuery) -> io::Result<IdResolution> {
+        if let Some(id) = query.full() {
+            return Ok(IdResolution::Found(id));
+        }
+        Ok(match self.index.item_candidates(query)?.as_slice() {
+            [] => IdResolution::Missing,
+            [id] => IdResolution::Found(*id),
+            multiple => IdResolution::Ambiguous(multiple.to_vec()),
+        })
+    }
+
     /// Reconcile provider derivations, Codex items, exact copies and source gaps.
     /// This scans accepted records at the last refresh; canonical history is unchanged.
     /// Resolve the returned operation IDs through content queries for payload availability.

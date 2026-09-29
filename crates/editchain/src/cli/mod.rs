@@ -62,6 +62,15 @@ enum Command {
     Append(operations::Append),
     /// Import provider history through reusable capture APIs.
     Import(imports::Args),
+    /// Migrate old storage into a new EC03 chain; interrupted work is resumable.
+    Migrate {
+        /// New chain directory, outside the source chain.
+        #[arg(long)]
+        destination: PathBuf,
+        /// Convert operations to the ten-type schema, preserving the source chain.
+        #[arg(long)]
+        schema3: bool,
+    },
     /// Export all exact record variants and their referenced blobs.
     Export,
     /// Append caller-authored Note operation envelopes.
@@ -69,7 +78,7 @@ enum Command {
     /// Append caller-authored Reflection operation envelopes.
     Reflect(input::Input),
     #[command(flatten)]
-    Query(query::Command),
+    Query(Box<query::Command>),
     /// Store raw bytes, including bytes piped on stdin.
     StoreBlob(input::Input),
     /// Resolve a content ID (JSON), optionally writing exact bytes.
@@ -116,7 +125,7 @@ pub(crate) fn run() -> ExitCode {
     let options = ImportOptions::default();
     if matches!(
         &cli.command,
-        Command::Import(_) | Command::Follow(_) | Command::Replicate(_)
+        Command::Import(_) | Command::Follow(_) | Command::Replicate(_) | Command::Migrate { .. }
     ) {
         let cancellation = options.cancellation.clone();
         if let Err(error) = ctrlc::set_handler(move || cancellation.cancel()) {
@@ -159,13 +168,27 @@ fn execute(cli: Cli, output: &mut Output, options: &ImportOptions) -> Result<()>
         Command::Append(args) => operations::append(chain, &args, output),
         Command::Import(args) => imports::run(chain, &args, options, output),
         Command::Export => archive::export(chain, output),
+        Command::Migrate {
+            destination,
+            schema3,
+        } => {
+            require_chain(chain)?;
+            let migrate = if schema3 {
+                editchain_import::activity::migrate
+            } else {
+                editchain_store::migration::migrate
+            };
+            output.emit(&migrate(chain, &destination, || {
+                options.cancellation.is_cancelled()
+            })?)
+        }
         Command::Annotate(args) => {
             operations::append_kind(chain, &args.input, operations::Kind::Note, output)
         }
         Command::Reflect(args) => {
             operations::append_kind(chain, &args.input, operations::Kind::Reflection, output)
         }
-        Command::Query(command) => query::run(chain, command, output),
+        Command::Query(command) => query::run(chain, *command, output),
         Command::StoreBlob(args) => {
             require_chain(chain)?;
             let bytes = input::bytes(&args.input)?;

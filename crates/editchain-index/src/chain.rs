@@ -71,7 +71,7 @@ pub struct ChainIndex {
 }
 
 impl ChainIndex {
-    /// Open an existing chain, creating its `index-v1` checkpoint if absent.
+    /// Open an existing chain, creating its `index-v3` checkpoint if absent.
     ///
     /// A valid checkpoint resumes its append frontier and unresolved content.
     /// Incompatible or damaged checkpoints require [`Self::rebuild_at`]. Opening
@@ -97,7 +97,7 @@ impl ChainIndex {
 
     fn open_inner(chain_dir: &Path, resume: bool) -> io::Result<Self> {
         let root = std::fs::canonicalize(chain_dir)?;
-        let storage = Storage::open(&root.join("index-v1"))?;
+        let storage = Storage::open(&root.join("index-v3"))?;
         let blobs = BlobReader::open(&root)?;
         let saved = if resume {
             match storage.load::<State>() {
@@ -146,6 +146,85 @@ impl ChainIndex {
     /// Returns errors for damaged derived pages instead of treating them as absent.
     pub fn get(&self, id: OpId) -> io::Result<Option<Op>> {
         boundary(|| self.state.tail.chain().get(id).cloned())
+    }
+
+    /// Resolve an ID prefix against every retained identity, including conflicts.
+    /// At most two candidates are read: two means ambiguous, never an arbitrary choice.
+    /// # Errors
+    /// Returns derived-page read errors.
+    pub fn id_candidates(&self, query: &editchain_core::IdQuery) -> io::Result<Vec<OpId>> {
+        let (lower, upper) = query.bounds();
+        boundary(|| {
+            let mut candidates: BTreeSet<_> = self
+                .state
+                .identities
+                .range(lower..=upper)
+                .take(2)
+                .copied()
+                .collect();
+            candidates.extend(
+                self.state
+                    .aliases
+                    .range(lower..=upper)
+                    .take(2)
+                    .map(|(id, _)| *id),
+            );
+            candidates.into_iter().take(2).collect()
+        })
+    }
+
+    /// Resolve an old address without hiding multiple conversion targets.
+    /// # Errors
+    /// Returns derived-index read errors.
+    pub fn alias_candidates(&self, id: OpId) -> io::Result<Vec<OpId>> {
+        boundary(|| {
+            self.state
+                .aliases
+                .get(&id)
+                .map_or_else(Vec::new, |ids| ids.iter().take(2).copied().collect())
+        })
+    }
+
+    /// Whether an accepted or quarantined physical identity is retained.
+    /// # Errors
+    /// Returns derived-index read errors.
+    pub fn retains_id(&self, id: OpId) -> io::Result<bool> {
+        boundary(|| self.state.identities.contains(&id))
+    }
+
+    /// Resolve a logical-item prefix independently of operation identities.
+    /// # Errors
+    /// Returns derived-index read errors.
+    pub fn item_candidates(&self, query: &editchain_core::IdQuery) -> io::Result<Vec<OpId>> {
+        let (lower, upper) = query.bounds();
+        boundary(|| {
+            self.state
+                .items
+                .range(lower..=upper)
+                .take(2)
+                .copied()
+                .collect()
+        })
+    }
+
+    /// Shortest unique display prefix of at least twelve digits in this chain.
+    /// Missing IDs retain their full spelling.
+    /// # Errors
+    /// Returns derived-page read errors.
+    pub fn short_id(&self, id: OpId) -> io::Result<String> {
+        let full = id.to_string();
+        for length in 12..64 {
+            let Some(prefix) = full.get(..length) else {
+                break;
+            };
+            let Some(query) = editchain_core::IdQuery::parse(prefix) else {
+                break;
+            };
+            if self.id_candidates(&query)? == [id] {
+                return Ok(prefix.to_owned());
+            }
+        }
+        Ok(full)
     }
 
     /// Page through accepted IDs in deterministic identity order.

@@ -10,6 +10,7 @@ use crate::provider::{
     ProviderFact,
 };
 use crate::{Op, OpId, OpKind, ParentSet};
+use editchain_core::SourceId;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Derivation<'a> {
@@ -26,7 +27,7 @@ impl<'a> Derivation<'a> {
         }
     }
 
-    pub(super) fn outputs(self) -> &'a [OpId] {
+    pub(super) fn outputs(self) -> &'a [SourceId] {
         match self {
             Self::Codex(meta) => &meta.outputs,
             Self::Claude(meta) => &meta.outputs,
@@ -75,7 +76,7 @@ pub fn selected_codex<'a>(
 ) -> Option<CodexDerivationEvidence> {
     let records: Vec<_> = facts
         .filter_map(decode_evidence)
-        .filter(|record| record.payload.source == source && valid_source(record, by_id))
+        .filter(|record| record.payload.source.id() == source && valid_source(record, by_id))
         .collect();
     let references: Vec<_> = records.iter().collect();
     match select(&references).filter(|meta| complete_outputs(*meta, source, by_id))? {
@@ -93,14 +94,14 @@ pub fn complete_derivation<'a>(
 ) -> bool {
     let records: Vec<_> = facts
         .filter_map(decode_evidence)
-        .filter(|record| record.payload.source == source && valid_source(record, by_id))
+        .filter(|record| record.payload.source.id() == source && valid_source(record, by_id))
         .collect();
     let references: Vec<_> = records.iter().collect();
     select(&references).is_some_and(|meta| complete_outputs(meta, source, by_id))
 }
 
 pub(super) fn incomplete_sources(
-    records: &BTreeMap<OpId, Vec<&EvidenceRecord<'_>>>,
+    records: &BTreeMap<SourceId, Vec<&EvidenceRecord<'_>>>,
     by_id: &HashMap<OpId, &Op>,
 ) -> HashSet<SourceKey> {
     let mut coverage: BTreeMap<SourceKey, (u64, u64)> = BTreeMap::new();
@@ -109,11 +110,14 @@ pub(super) fn incomplete_sources(
         .values()
         .filter(|op| matches!(op.kind, OpKind::Import(_)))
     {
-        let key = source_key(op.id);
+        let Some(source) = op.source else {
+            continue;
+        };
+        let key = source_key(source);
         let (count, last) = coverage.entry(key).or_default();
         *count = count.saturating_add(1);
-        *last = (*last).max(op.id.seq >> 16);
-        if !records.contains_key(&op.id) {
+        *last = (*last).max(source.seq >> 16);
+        if !records.contains_key(&source) {
             let _: bool = blocked.insert(key);
         }
     }
@@ -128,7 +132,7 @@ pub(super) fn incomplete_sources(
 pub(super) fn valid_source(record: &EvidenceRecord<'_>, by_id: &impl OpLookup) -> bool {
     record.payload.source.seq > 0
         && record.payload.source.seq.trailing_zeros() >= 16
-        && by_id.get(&record.payload.source).is_some_and(|raw| {
+        && by_id.get(&record.payload.source.id()).is_some_and(|raw| {
         record.op.scope == raw.scope
             && matches!(&raw.kind, OpKind::Import(import) if import.raw_hash == Some(record.payload.raw_hash))
     })
@@ -161,7 +165,7 @@ pub(super) fn select<'a>(records: &[&'a EvidenceRecord<'_>]) -> Option<Derivatio
 }
 
 pub(super) fn complete_outputs(meta: Derivation<'_>, source: OpId, by_id: &impl OpLookup) -> bool {
-    let outputs: HashSet<OpId> = meta.outputs().iter().copied().collect();
+    let outputs: HashSet<OpId> = meta.outputs().iter().map(|source| source.id()).collect();
     if outputs.len() != meta.outputs().len() || outputs.contains(&source) {
         return false;
     }
@@ -185,6 +189,9 @@ fn valid_changes(
     outputs: &HashSet<OpId>,
     by_id: &impl OpLookup,
 ) -> bool {
+    let Some(source) = by_id.get(&source).and_then(|op| op.source) else {
+        return false;
+    };
     meta.changes.iter().all(|change| match change {
         CodexLogicalChange::RemoveTurn { turn } => !turn.is_empty(),
         CodexLogicalChange::Upsert {
@@ -203,9 +210,9 @@ fn valid_changes(
                 // this revision. Consent can exclude its original occurrence.
                 // A present contradictory record must still reject the proof.
                 && by_id
-                    .get(incarnation)
+                    .get(&incarnation.id())
                     .is_none_or(|op| matches!(op.kind, OpKind::Import(_)))
-                && item_outputs.iter().all(|output| outputs.contains(output))
+                && item_outputs.iter().all(|output| outputs.contains(&output.id()))
         }
     })
 }
@@ -216,7 +223,13 @@ pub(super) fn reaches_source(
     outputs: &HashSet<OpId>,
     by_id: &impl OpLookup,
 ) -> bool {
-    if id.node == source.node || id.boot != source.boot || id.seq >> 16 != source.seq >> 16 {
+    let Some(origin) = by_id.get(&id).and_then(|op| op.source) else {
+        return false;
+    };
+    let Some(raw) = by_id.get(&source).and_then(|op| op.source) else {
+        return false;
+    };
+    if origin.node == raw.node || origin.boot != raw.boot || origin.seq >> 16 != raw.seq >> 16 {
         return false;
     }
     let mut seen = HashSet::new();
@@ -240,7 +253,7 @@ pub(super) fn reaches_source(
 
 pub(super) fn apply_changes(
     turns: &mut LogicalTurns,
-    source: OpId,
+    source: SourceId,
     meta: &CodexDerivationEvidence,
 ) {
     for change in &meta.changes {
@@ -260,9 +273,9 @@ pub(super) fn apply_changes(
                         thread: meta.thread.clone(),
                         turn: turn.clone(),
                         item: item.clone(),
-                        incarnation: *incarnation,
-                        source,
-                        outputs: outputs.clone(),
+                        incarnation: incarnation.id(),
+                        source: source.id(),
+                        outputs: outputs.iter().map(|source| source.id()).collect(),
                     },
                 ));
             }

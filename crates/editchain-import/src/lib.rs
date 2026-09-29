@@ -16,6 +16,8 @@ use editchain_engine as _;
 #[cfg(test)]
 use proptest as _;
 
+/// Schema-three conversion shared by imports, migration, and live capture.
+pub mod activity;
 /// Capture batches and ordered operation/checkpoint persistence.
 pub mod batch;
 /// Cooperative cancellation of source capture and helper execution.

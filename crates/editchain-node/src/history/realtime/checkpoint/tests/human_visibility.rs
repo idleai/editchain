@@ -28,6 +28,7 @@ fn version_four_opens_with_cached_exposure_removed_and_other_rows_retained() {
         summary: "Brief exposure · a.rs · 500 ms".into(),
     };
     let op = Arc::new(Op {
+        source: None,
         id,
         parents: ParentSet::One(OpId::new(NodeId(1), 0, 3)),
         actor: ActorId(1),

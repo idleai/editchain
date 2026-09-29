@@ -45,7 +45,7 @@ pub const MAX_FRAME_BYTES: usize = 128 * 1024;
 /// Maximum record identities in one inventory page.
 pub const INVENTORY_PAGE: usize = 128;
 /// Parent-ordered inventories with stable totals and confirmed page checks.
-pub const PEER_VERSION: u16 = 3;
+pub const PEER_VERSION: u16 = 5;
 
 fn invalid(message: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)

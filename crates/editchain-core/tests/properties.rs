@@ -10,8 +10,10 @@
     reason = "Test file; dependencies used by library macros"
 )]
 
+use blake3 as _;
 use editchain_core::{Admission, NodeId, OpId, OpSet};
 use proptest::prelude::*;
+use serde_json as _;
 
 /// Generate an arbitrary `OpId`.
 fn arb_opid() -> impl Strategy<Value = OpId> {

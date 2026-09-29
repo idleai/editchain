@@ -246,7 +246,7 @@ fn real_subagent_activity_schema_pins_link_geometry_and_summary() {
     );
     let facts = provider_facts(&harness.ops.ops);
     assert!(facts.iter().any(|(op, evidence)| matches!(&evidence.fact,
-        ProviderFact::CodexSource(meta) if meta.first == sub_stream(&dir)
+        ProviderFact::CodexSource(meta) if meta.first.id() == sub_stream(&dir)
             && meta.forked_from.as_ref().is_some_and(|thread| thread.0 == "parent-1")
             && op.scope == ScopeRef::Session(derive_session_id("sub-1")))));
     assert!(facts.iter().any(|(op, evidence)| matches!(&evidence.fact,
@@ -312,7 +312,7 @@ fn structured_agent_states_drive_reconnect_but_old_payloads_do_not() {
     assert!(provider_facts(&harness.ops.ops)
         .iter()
         .any(|(op, evidence)| matches!(&evidence.fact,
-        ProviderFact::CodexLifecycle(meta) if evidence.source == completion
+        ProviderFact::CodexLifecycle(meta) if evidence.source.id() == completion
             && !matches!(meta.event, CodexLifecycleEvent::Spawn { .. })
             && op.scope == ScopeRef::Session(derive_session_id("parent-1")))));
 }
@@ -362,7 +362,7 @@ fn legacy_list_agents_completion_maps_agent_path_to_started_marker() {
     assert!(provider_facts(&harness.ops.ops)
         .iter()
         .any(|(op, evidence)| matches!(&evidence.fact,
-        ProviderFact::CodexLifecycle(meta) if evidence.source == completion
+        ProviderFact::CodexLifecycle(meta) if evidence.source.id() == completion
             && !matches!(meta.event, CodexLifecycleEvent::Spawn { .. })
             && op.scope == ScopeRef::Session(derive_session_id("parent-1")))));
 }

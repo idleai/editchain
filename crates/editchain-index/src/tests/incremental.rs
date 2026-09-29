@@ -21,11 +21,13 @@ fn new_operations_read_only_the_frontier_at_different_history_sizes() {
             .collect();
         append(root, &history);
         let mut index = ChainIndex::open(root).unwrap();
-        let before = std::fs::metadata(root.join("index-v1/pages"))
+        let before = std::fs::metadata(root.join("index-v3/pages"))
             .unwrap()
             .len();
         // Imports can arrive with both an older identity and older event time.
-        let late = message(1, Payload::Inline(b"late".to_vec()));
+        let mut late = message(1, Payload::Inline(b"late".to_vec()));
+        late.id = editchain_core::OpId::from_bytes([0; 32]);
+        late.source = None;
         append(root, std::slice::from_ref(&late));
         let delta = index.refresh().unwrap();
         assert_eq!(delta.added.into_iter().collect::<Vec<_>>(), vec![late.id]);
@@ -33,7 +35,7 @@ fn new_operations_read_only_the_frontier_at_different_history_sizes() {
         assert_eq!(delta.work.content_reads, 0);
         assert_eq!(index.operations(None, 1).unwrap(), vec![late.id]);
         assert_eq!(index.get(late.id).unwrap(), Some(late));
-        let growth = std::fs::metadata(root.join("index-v1/pages"))
+        let growth = std::fs::metadata(root.join("index-v3/pages"))
             .unwrap()
             .len()
             .saturating_sub(before);
@@ -253,16 +255,16 @@ fn failed_checkpoint_publication_retains_reads_and_recovers_after_reopening() {
     let old = message(1, Payload::Empty);
     append(root, std::slice::from_ref(&old));
     let mut index = ChainIndex::open(root).unwrap();
-    let published = std::fs::read(root.join("index-v1/root")).unwrap();
+    let published = std::fs::read(root.join("index-v3/root")).unwrap();
     let new = message(2, Payload::Empty);
     append(root, std::slice::from_ref(&new));
-    let blocked = root.join("index-v1/root.next");
+    let blocked = root.join("index-v3/root.next");
     std::fs::create_dir(&blocked).unwrap();
     assert!(index.refresh().is_err(), "publication failure propagates");
     assert_eq!(index.get(old.id).unwrap(), Some(old));
     assert_eq!(index.get(new.id).unwrap(), None);
     assert_eq!(
-        std::fs::read(root.join("index-v1/root")).unwrap(),
+        std::fs::read(root.join("index-v3/root")).unwrap(),
         published
     );
     std::fs::remove_dir(blocked).unwrap();

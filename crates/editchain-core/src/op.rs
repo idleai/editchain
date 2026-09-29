@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::Clock;
 use crate::git::{GitCommitEntity, GitLink};
-use crate::ids::{ActorId, NodeId, OpId, PathId, SessionId};
+use crate::ids::{ActorId, NodeId, OpId, PathId, SessionId, SourceId};
 use crate::parents::ParentSet;
 use crate::payload::{BlobRef, ContentId, Payload};
 use crate::scope::ScopeRef;
@@ -17,10 +17,12 @@ use crate::tags::Tags;
 /// Operations are immutable records. The envelope carries identity,
 /// causal parents, actor, clock, scope, and tags. The `kind` field
 /// holds the domain-specific payload.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Op {
     /// Globally unique operation identifier.
     pub id: OpId,
+    /// Stable source provenance; never used as the canonical index key.
+    pub source: Option<SourceId>,
     /// Causal parent references for DAG ordering.
     pub parents: ParentSet,
     /// Actor that created this operation.
@@ -35,6 +37,97 @@ pub struct Op {
     pub kind: OpKind,
 }
 
+impl Serialize for Op {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct as _;
+        if serializer.is_human_readable() {
+            if let OpKind::Activity(record) = &self.kind {
+                return record.serialize(serializer);
+            }
+        }
+        let mut state = serializer.serialize_struct("Op", 8)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("source", &self.source)?;
+        state.serialize_field("parents", &self.parents)?;
+        state.serialize_field("actor", &self.actor)?;
+        state.serialize_field("clock", &self.clock)?;
+        state.serialize_field("scope", &self.scope)?;
+        state.serialize_field("tags", &self.tags)?;
+        state.serialize_field("kind", &self.kind)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Op {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Input {
+            Classic(Box<ReadOp>),
+            Current(Box<crate::activity::Operation>),
+        }
+        if !deserializer.is_human_readable() {
+            return ReadOp::deserialize(deserializer).map(Self::from);
+        }
+        match Input::deserialize(deserializer)? {
+            Input::Classic(op) => Ok(Self::from(*op)),
+            Input::Current(record) => (*record).into_op().map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ReadOp {
+    id: ReadId,
+    #[serde(default)]
+    source: Option<SourceId>,
+    parents: ParentSet,
+    actor: ActorId,
+    clock: Clock,
+    scope: ScopeRef,
+    tags: Tags,
+    kind: OpKind,
+}
+
+struct ReadId(OpId, Option<SourceId>);
+
+impl<'de> Deserialize<'de> for ReadId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Input {
+            Canonical(String),
+            Legacy(SourceId),
+        }
+        if !deserializer.is_human_readable() {
+            return OpId::deserialize(deserializer).map(|id| Self(id, None));
+        }
+        match Input::deserialize(deserializer)? {
+            Input::Legacy(source) => Ok(Self(source.id(), Some(source))),
+            Input::Canonical(text) => {
+                let id = OpId::from_display_str(&text)
+                    .ok_or_else(|| serde::de::Error::custom("expected full operation ID"))?;
+                Ok(Self(id, SourceId::from_display_str(&text)))
+            }
+        }
+    }
+}
+
+impl From<ReadOp> for Op {
+    fn from(value: ReadOp) -> Self {
+        Self {
+            id: value.id.0,
+            source: value.source.or(value.id.1),
+            parents: value.parents,
+            actor: value.actor,
+            clock: value.clock,
+            scope: value.scope,
+            tags: value.tags,
+            kind: value.kind,
+        }
+    }
+}
+
 impl Op {
     /// Observed source time, respecting explicit unknown-time provenance.
     ///
@@ -43,10 +136,23 @@ impl Op {
     /// this adapter never rewrites the immutable clock or tags.
     #[must_use]
     pub const fn observed_unix_ms(&self) -> Option<u64> {
+        if let OpKind::Activity(record) = &self.kind {
+            return record.time_ms;
+        }
         if self.tags.matches_any(Tags::SOURCE_TIME_UNKNOWN) {
             None
         } else {
             self.clock.observed_unix_ms()
+        }
+    }
+
+    /// All explicit causal parents, including schema-three records with more than two.
+    #[must_use]
+    pub fn causal_parents(&self) -> Vec<OpId> {
+        if let OpKind::Activity(record) = &self.kind {
+            record.parents.clone()
+        } else {
+            self.parents.iter().copied().collect()
         }
     }
 
@@ -66,6 +172,7 @@ impl Op {
         kind: OpKind,
     ) -> Self {
         Self {
+            source: None,
             id,
             parents,
             actor,
@@ -83,7 +190,7 @@ impl Op {
 
 /// All supported operation kinds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OpKind {
+pub enum OpKind<I = OpId> {
     /// Chain initialization operation.
     ChainStart(ChainStart),
     /// Actor registration or metadata update.
@@ -101,22 +208,24 @@ pub enum OpKind {
     /// Imported external record.
     Import(ImportOp),
     /// Relationship note between operations.
-    Note(NoteOp),
+    Note(NoteOp<I>),
     /// Diagnostic error fact.
     Error(ErrorOp),
     /// A Git commit entity (imported or live).
     ///
     /// Boxed to keep the `OpKind` enum small — a commit entity carries several
     /// variable-length vectors and is much larger than the other variants.
-    GitCommit(Box<GitCommitEntity>),
+    GitCommit(Box<GitCommitEntity<I>>),
     /// An explicit link from an operation to a Git object.
-    GitLink(GitLink),
+    GitLink(GitLink<I>),
     /// Opaque preserved fact (unrecognized kind).
     Unknown(UnknownOp),
     /// Session registration or an immutable observation of session metadata.
     ///
     /// Appended after the existing variants to preserve their wire discriminants.
     Session(SessionOp),
+    /// Schema-three record. The store encodes its envelope directly as schema 3.
+    Activity(Box<crate::activity::Operation>),
 }
 
 // ---------------------------------------------------------------------------
@@ -368,9 +477,9 @@ pub struct ImportOp {
 
 /// A relationship note between operations — corrects/supersedes/rejects/redacts/explains.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NoteOp {
+pub struct NoteOp<I = OpId> {
     /// The target operation(s) this note applies to.
-    pub target_ids: Vec<OpId>,
+    pub target_ids: Vec<I>,
     /// The relationship kind.
     pub relationship: NoteRelationship,
     /// Note content / explanation.

@@ -155,7 +155,7 @@ pub(crate) fn import_claude_sessions(
             let raw = raw_record(
                 envelope.as_ref(),
                 line,
-                stream.op_from_position(SourcePosition::raw(seq))?,
+                stream.source_position(SourcePosition::raw(seq))?,
                 &session.session_id,
                 blobs,
             )?;
@@ -175,6 +175,9 @@ pub(crate) fn import_claude_sessions(
                 report.malformed = report
                     .malformed
                     .saturating_add(usize::from(envelope.is_none()));
+            }
+            if seq <= start_seq && options.normalize {
+                ops.observe_source(&raw)?;
             }
             for op in &derived {
                 emit_op(op, ops, &mut report, EmissionKind::Derived)?;
@@ -252,7 +255,7 @@ pub(crate) fn import_claude_sessions(
                     session.tool_use_id.as_deref(),
                     session.parent_session_id.as_deref(),
                 ) {
-                    let first_raw = stream.op_from_position(SourcePosition::raw(1))?;
+                    let first_raw = stream.source_position(SourcePosition::raw(1))?;
                     let fact = spawn_fact(
                         first_raw,
                         editchain_core::ScopeRef::Session(derive_session_id(parent_session_id)),

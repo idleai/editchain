@@ -36,7 +36,7 @@ pub struct HumanGitContext {
 
 /// A buffer occurrence; equal contents do not collapse distinct revisions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HumanRevision {
+pub struct HumanRevision<I = OpId> {
     /// Recorder-local document incarnation.
     pub document: String,
     /// Exact VS Code buffer version.
@@ -44,7 +44,7 @@ pub struct HumanRevision {
     /// Retained content, independent of occurrence identity.
     pub content: ContentId,
     /// Observation establishing this occurrence, when continuity is known.
-    pub occurrence: Option<OpId>,
+    pub occurrence: Option<I>,
 }
 
 /// What the person contributed, without claiming comprehension.
@@ -69,7 +69,8 @@ pub enum HumanWorkKind {
 
 /// One immutable work fragment. Turns group fragments without rewriting them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HumanWorkRecord {
+#[serde(bound(deserialize = "I: Deserialize<'de>"))]
+pub struct HumanWorkRecord<I = OpId> {
     /// Discriminator, always `vscode.work`.
     pub source: String,
     /// Derivation contract version, currently one.
@@ -86,17 +87,17 @@ pub struct HumanWorkRecord {
     pub turn: u64,
     /// Stable first raw change of a continuously published edit, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub edit_group: Option<OpId>,
+    pub edit_group: Option<I>,
     /// Raw event supporting this work fragment.
-    pub source_event: OpId,
+    pub source_event: I,
     /// Activity classification.
     pub kind: HumanWorkKind,
     /// Workspace-relative path; absent for untitled buffers and gaps.
     pub path: Option<String>,
     /// Actual observed application input, including intermediate unsaved edits.
-    pub before: Option<HumanRevision>,
+    pub before: Option<HumanRevision<I>>,
     /// Actual observed output or exposed revision.
-    pub after: Option<HumanRevision>,
+    pub after: Option<HumanRevision<I>>,
     /// Last captured Git context for this path; never a query-time substitute.
     pub git: Option<HumanGitContext>,
     /// Time at which this Git context was observed.

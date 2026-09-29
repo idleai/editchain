@@ -19,6 +19,7 @@ crc = "3"
 blake3 = "1"
 editchain-core = { path = "../editchain-core" }
 serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 proptest = "1"

@@ -5,7 +5,7 @@
 //! and turn; revisions and post-removal incarnations remain separate evidence.
 
 use editchain_core::provider::{CodexLogicalChange, ProviderEvidence, ProviderFact};
-use editchain_core::OpId;
+use editchain_core::SourceId;
 use serde::{Deserialize, Serialize};
 
 /// A full native identifier, never a timestamp or a content-based guess.
@@ -43,13 +43,13 @@ pub struct NativeMapping {
     /// Unabridged provider identifier.
     pub identity: NativeIdentity,
     /// Raw imported operation, whose bytes remain authoritative.
-    pub source: OpId,
+    pub source: SourceId,
     /// BLAKE3 of the exact complete raw record, including its newline.
     pub raw_hash: [u8; 32],
     /// Materialized operations for this revision, when the provider supplies them.
-    pub outputs: Vec<OpId>,
+    pub outputs: Vec<SourceId>,
     /// First occurrence of this Codex item since its turn's last removal.
-    pub incarnation: Option<OpId>,
+    pub incarnation: Option<SourceId>,
 }
 
 /// Read an exact Claude mapping from a captured record.
@@ -58,7 +58,7 @@ pub struct NativeMapping {
 /// not substituted for native identity. Copied occurrences may share the UUID
 /// while retaining distinct source evidence and recorded session context.
 #[must_use]
-pub fn claude_mapping(source: OpId, raw: &[u8]) -> Option<NativeMapping> {
+pub fn claude_mapping(source: SourceId, raw: &[u8]) -> Option<NativeMapping> {
     let envelope = crate::claude_code::envelope::parse_envelope(raw)?;
     if envelope.session_id.is_empty() || envelope.uuid.is_empty() {
         return None;

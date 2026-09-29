@@ -76,11 +76,11 @@ fn integrity_reports_all_record_and_content_gaps_including_conflict_variants() {
             .map(|issue| (issue.operation, issue.state))
             .collect::<Vec<_>>(),
         vec![
-            (missing.id, ContentState::Missing),
-            (corrupt.id, ContentState::Corrupt),
             (unsupported.id, ContentState::Unresolvable),
+            (missing.id, ContentState::Missing),
             (conflict_missing.id, ContentState::Missing),
             (wrong_length.id, ContentState::Corrupt),
+            (corrupt.id, ContentState::Corrupt),
         ]
     );
     assert_eq!(
@@ -218,7 +218,7 @@ fn corrupt_lazy_pages_and_roots_can_be_rebuilt_without_touching_sources() {
     let mut index = ChainIndex::open(root).unwrap();
     std::fs::OpenOptions::new()
         .write(true)
-        .open(root.join("index-v1/pages"))
+        .open(root.join("index-v3/pages"))
         .unwrap()
         .write_all(&[0xff])
         .unwrap();
@@ -239,7 +239,7 @@ fn corrupt_lazy_pages_and_roots_can_be_rebuilt_without_touching_sources() {
         "fresh pages restore integrity"
     );
     drop(index);
-    std::fs::write(root.join("index-v1/root"), b"bad root").unwrap();
+    std::fs::write(root.join("index-v3/root"), b"bad root").unwrap();
     assert!(
         ChainIndex::open(root).is_err(),
         "invalid root requires explicit rebuild"
@@ -260,7 +260,7 @@ fn failed_rebuild_keeps_the_last_query_state_and_checkpoint() {
     let op = message(1, Payload::Empty);
     append(root, std::slice::from_ref(&op));
     let mut index = ChainIndex::open(root).unwrap();
-    let checkpoint = std::fs::read(root.join("index-v1/root")).unwrap();
+    let checkpoint = std::fs::read(root.join("index-v3/root")).unwrap();
     let path = root.join("000000.eclog");
     let original = std::fs::read(&path).unwrap();
     std::fs::write(&path, b"bad framing that is not an EC02 header").unwrap();
@@ -274,7 +274,7 @@ fn failed_rebuild_keeps_the_last_query_state_and_checkpoint() {
     );
     assert_eq!(index.get(op.id).unwrap(), Some(op.clone()));
     assert_eq!(
-        std::fs::read(root.join("index-v1/root")).unwrap(),
+        std::fs::read(root.join("index-v3/root")).unwrap(),
         checkpoint
     );
     std::fs::write(path, original).unwrap();
@@ -296,7 +296,7 @@ fn warm_query_pages_do_not_hide_persisted_page_or_root_damage_from_the_audit() {
     assert_eq!(index.get(op.id).unwrap(), Some(op.clone()));
     std::fs::OpenOptions::new()
         .write(true)
-        .open(root.join("index-v1/pages"))
+        .open(root.join("index-v3/pages"))
         .unwrap()
         .write_all(&[0xff])
         .unwrap();
@@ -310,7 +310,7 @@ fn warm_query_pages_do_not_hide_persisted_page_or_root_damage_from_the_audit() {
         "audit uses cold published pages"
     );
     let _stats = index.rebuild().unwrap();
-    std::fs::write(root.join("index-v1/root"), b"damaged root").unwrap();
+    std::fs::write(root.join("index-v3/root"), b"damaged root").unwrap();
     assert!(
         index.verify_integrity().unwrap().index_error.is_some(),
         "audit also reloads the root"

@@ -316,6 +316,21 @@ fn raw_only_append_and_failed_content_backfill_preserve_accepted_coverage() {
         .ops
         .iter()
         .filter_map(|op| match &op.kind {
+            OpKind::Activity(record) => {
+                record
+                    .kind
+                    .fields()
+                    .into_iter()
+                    .find_map(|(field, payload)| {
+                        matches!(
+                            field,
+                            editchain_core::activity::Field::MessageBlock(_)
+                                | editchain_core::activity::Field::Output
+                                | editchain_core::activity::Field::Arguments
+                        )
+                        .then_some(payload)
+                    })
+            }
             OpKind::Message(message) => Some(&message.content),
             OpKind::Tool(tool) => Some(&tool.content),
             OpKind::Command(command) => Some(&command.content),
@@ -443,7 +458,7 @@ fn legacy_content_remains_stored_and_complete_manifests_control_replacement() {
         .find(|op| op.id != legacy_id && matches!(op.kind, OpKind::Message(_)))
         .unwrap();
     let modern_id = modern.id;
-    assert_ne!(modern.id.node, stream.node);
+    assert_ne!(modern.source.unwrap().node, stream.node);
     assert_eq!(
         encode_op(ops.ops.iter().find(|op| op.id == legacy_id).unwrap()).unwrap(),
         legacy_bytes
@@ -516,7 +531,7 @@ fn content_blocks_beyond_legacy_lane_capacity_keep_unique_occurrence_ids() {
         .ops
         .iter()
         .filter(|op| matches!(op.kind, OpKind::Message(_)))
-        .all(|op| op.id.node != stream.node));
+        .all(|op| op.source.unwrap().node != stream.node));
 }
 
 #[test]

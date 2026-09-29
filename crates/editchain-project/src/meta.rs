@@ -168,7 +168,7 @@ fn echo_pair_signature(op: &Op, side: EchoPairSide) -> Option<EchoPairSignature>
         ScopeRef::None | ScopeRef::Chain(_) | ScopeRef::Turn(_) | ScopeRef::File(_) => None,
     };
     Some(EchoPairSignature {
-        chain: (op.id.node.0, op.id.boot),
+        chain: (op.source?.node.0, op.source?.boot),
         session,
         clock_ms,
         text,
@@ -228,6 +228,7 @@ pub(crate) fn for_edit_operation(op: &Op) -> NodeMeta {
     }
     let turn_id = turn_id_of_scope(op.scope);
     let (record_role, activity_kind) = match &op.kind {
+        OpKind::Activity(record) => return for_activity(record),
         OpKind::Message(_) => (RecordRole::Narrative, ActivityKind::Conversation),
         OpKind::Tool(t) => {
             let role = if matches!(t.stage, ToolStage::Finish) {
@@ -271,6 +272,57 @@ pub(crate) fn for_edit_operation(op: &Op) -> NodeMeta {
         chain_state: ChainState::Active,
         turn_id,
     }
+}
+
+fn for_activity(record: &editchain_core::activity::Operation) -> NodeMeta {
+    use editchain_core::activity::{FileAction, Kind, MessageKind, Status};
+    let mut meta = for_edit_operation(&record.display_op());
+    let completion = match &record.kind {
+        Kind::Original(_) => {
+            meta.visibility = Visibility::Trace;
+            None
+        }
+        Kind::Session(_) | Kind::Author(_) | Kind::Link(_) => {
+            meta.visibility = Visibility::Supporting;
+            None
+        }
+        Kind::Turn(turn) => turn.outcome.as_ref(),
+        Kind::Message(message) => {
+            meta.activity_kind = match message.category {
+                MessageKind::Text => ActivityKind::Conversation,
+                MessageKind::Reasoning | MessageKind::Plan | MessageKind::Summary => {
+                    ActivityKind::Plan
+                }
+            };
+            message.outcome.as_ref()
+        }
+        Kind::Tool(tool) => tool.outcome.as_ref(),
+        Kind::File(file) => {
+            meta.activity_kind = match file.action {
+                FileAction::Open
+                | FileAction::Close
+                | FileAction::Read
+                | FileAction::View
+                | FileAction::Snapshot => ActivityKind::Explore,
+                FileAction::Create
+                | FileAction::Change
+                | FileAction::Save
+                | FileAction::Rename
+                | FileAction::Delete => ActivityKind::Change,
+            };
+            None
+        }
+        Kind::Commit(_) | Kind::Note(_) => None,
+    };
+    if let Some(result) = completion {
+        meta.outcome = match result.status {
+            Status::Success => Outcome::Success,
+            Status::Failure => Outcome::Failure,
+            Status::Cancelled => Outcome::Cancelled,
+            Status::Unknown => Outcome::Unknown,
+        };
+    }
+    meta
 }
 
 /// Metadata for a `GitCommit` row.
@@ -429,6 +481,14 @@ fn children_based_meta(
         let mut tool_or_command = false;
         for child in children {
             match &child.kind {
+                OpKind::Activity(record) => {
+                    let meta = for_activity(record);
+                    record_role = meta.record_role;
+                    activity_kind = meta.activity_kind;
+                    tool_or_command =
+                        matches!(record.kind, editchain_core::activity::Kind::Tool(_));
+                    break;
+                }
                 OpKind::Message(_) => {
                     record_role = RecordRole::Narrative;
                     activity_kind = ActivityKind::Conversation;
@@ -799,6 +859,7 @@ pub(crate) fn claude_assistant_message_id(op: &Op) -> Option<String> {
 #[must_use]
 fn raw_import_json(op: &Op) -> Option<Value> {
     let raw = match &op.kind {
+        OpKind::Activity(record) => return raw_import_json(&record.display_op()),
         OpKind::Import(ImportOp { raw_ref, .. }) => match raw_ref {
             Payload::Inline(bytes) => bytes,
             Payload::Empty | Payload::Blob(_) => return None,

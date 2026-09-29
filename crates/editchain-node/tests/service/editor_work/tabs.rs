@@ -1,5 +1,5 @@
 use super::{agent, batch, changed, document, event, git, live_request, records, start, window};
-use editchain_core::{human::HumanWorkKind, NodeId, OpId, ParentSet, Tags};
+use editchain_core::{human::HumanWorkKind, NodeId, ParentSet, Tags};
 use editchain_node::Server;
 use editchain_store::{format::encode_op, CanonicalChain};
 use serde_json::{json, Value};
@@ -32,7 +32,7 @@ fn tabs_reads_and_edits_share_a_connected_human_series_beside_agent_work() {
     let context = live_request(&mut recorder, json!({"GetEditorContext":open}));
     let agent_id = agent(
         root,
-        OpId::new(NodeId(73), 0, 1),
+        editchain_core::SourceId::new(NodeId(73), 0, 1),
         "base\n",
         "base\nAI\n",
         &context["repositories"][0],

@@ -4,13 +4,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::provider::{CodexDerivationEvidence, CodexLogicalChange, CodexThreadId};
 use crate::{Op, OpId, OpKind, ParentSet};
+use editchain_core::SourceId;
 
 use super::{source_key, SourceKey};
 
-type Records<'a> = Vec<(OpId, &'a CodexDerivationEvidence)>;
+type Records<'a> = Vec<(SourceId, &'a CodexDerivationEvidence)>;
 
 pub(super) fn equivalents(
-    selected: &BTreeMap<OpId, &CodexDerivationEvidence>,
+    selected: &BTreeMap<SourceId, &CodexDerivationEvidence>,
     ops: &HashMap<OpId, &Op>,
     blocked: &HashSet<SourceKey>,
     incomplete: &HashSet<OpId>,
@@ -40,7 +41,7 @@ pub(super) fn equivalents(
             .iter()
             .find_map(|candidate| equivalent_prefix(records, candidate, ops, incomplete));
         if let Some(mapping) = equivalent {
-            equivalents.extend(mapping);
+            equivalents.extend(mapping.into_iter().map(|(a, b)| (a.id(), b.id())));
         } else {
             candidates.push(records);
         }
@@ -53,7 +54,7 @@ fn equivalent_prefix(
     original: &Records<'_>,
     ops: &HashMap<OpId, &Op>,
     incomplete: &HashSet<OpId>,
-) -> Option<BTreeMap<OpId, OpId>> {
+) -> Option<BTreeMap<SourceId, SourceId>> {
     if copy.len() > original.len() {
         return None;
     }
@@ -74,9 +75,9 @@ fn equivalent_prefix(
     // Exact operations, including payload references, clocks, scopes and all
     // known edges, must match after rebinding only the proven occurrence IDs.
     for (copy, original) in &mapping {
-        if incomplete.contains(copy)
-            || incomplete.contains(original)
-            || rebound_op(ops.get(copy)?, &mapping) != **ops.get(original)?
+        if incomplete.contains(&copy.id())
+            || incomplete.contains(&original.id())
+            || rebound_op(ops.get(&copy.id())?, &mapping) != **ops.get(&original.id())?
         {
             return None;
         }
@@ -102,28 +103,31 @@ fn equivalent_prefix(
     Some(mapping)
 }
 
-fn mapped(id: OpId, mapping: &BTreeMap<OpId, OpId>) -> OpId {
+fn mapped(id: SourceId, mapping: &BTreeMap<SourceId, SourceId>) -> SourceId {
     mapping.get(&id).copied().unwrap_or(id)
 }
 
-fn remap_ids(ids: &mut [OpId], mapping: &BTreeMap<OpId, OpId>) {
+fn remap_ids(ids: &mut [SourceId], mapping: &BTreeMap<SourceId, SourceId>) {
     for id in ids {
         *id = mapped(*id, mapping);
     }
 }
 
-fn rebound_op(op: &Op, mapping: &BTreeMap<OpId, OpId>) -> Op {
+fn rebound_op(op: &Op, mapping: &BTreeMap<SourceId, SourceId>) -> Op {
+    let ids: BTreeMap<OpId, OpId> = mapping.iter().map(|(a, b)| (a.id(), b.id())).collect();
+    let mapped_id = |id: OpId| ids.get(&id).copied().unwrap_or(id);
     let mut rebound = op.clone();
-    rebound.id = mapped(op.id, mapping);
+    rebound.source = op.source.map(|source| mapped(source, mapping));
+    rebound.id = mapped_id(op.id);
     rebound.parents = match op.parents {
         ParentSet::None => ParentSet::None,
-        ParentSet::One(parent) => ParentSet::One(mapped(parent, mapping)),
-        ParentSet::Two(left, right) => {
-            ParentSet::Two(mapped(left, mapping), mapped(right, mapping))
-        }
+        ParentSet::One(parent) => ParentSet::One(mapped_id(parent)),
+        ParentSet::Two(left, right) => ParentSet::Two(mapped_id(left), mapped_id(right)),
     };
     if let OpKind::Note(note) = &mut rebound.kind {
-        remap_ids(&mut note.target_ids, mapping);
+        for target in &mut note.target_ids {
+            *target = mapped_id(*target);
+        }
     }
     rebound
 }

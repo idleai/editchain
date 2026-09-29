@@ -272,12 +272,15 @@ fn native_mappings(
         match provider {
             Provider::Claude => {
                 if let Some(bytes) = raw_bytes(op, blobs)? {
-                    mappings.extend(claude_mapping(op.id, &bytes));
+                    mappings.extend(claude_mapping(
+                        op.source.ok_or("source provenance")?,
+                        &bytes,
+                    ));
                 }
             }
             Provider::Human => {
                 if let Some(bytes) = raw_bytes(op, blobs)? {
-                    mappings.extend(human_mapping(op.id, &bytes));
+                    mappings.extend(human_mapping(op.source.ok_or("source provenance")?, &bytes));
                 }
             }
             Provider::Codex => {
@@ -321,7 +324,7 @@ fn assert_native_mappings(provider: Provider, operations: &[Op], blobs: &FsBlobS
     for mapping in &mappings {
         let raw = operations
             .iter()
-            .find(|op| op.id == mapping.source)
+            .find(|op| op.id == mapping.source.id())
             .ok_or("missing mapping source")?;
         verify_eq!(
             mapping.raw_hash,
@@ -332,7 +335,7 @@ fn assert_native_mappings(provider: Provider, operations: &[Op], blobs: &FsBlobS
             mapping
                 .outputs
                 .iter()
-                .all(|id| operations.iter().any(|op| &op.id == id)),
+                .all(|id| operations.iter().any(|op| op.id == id.id())),
             "mapped outputs must exist"
         );
     }
@@ -549,7 +552,7 @@ fn overlapping_human_archives_preserve_conflicts_without_duplicate_history() -> 
         .ok_or("missing disputed fixture record")?;
     let snapshot = writer.snapshot()?;
     verify!(
-        snapshot.get(disputed.source).is_none(),
+        snapshot.get(disputed.source.id()).is_none(),
         "conflicting identity is excluded from accepted history"
     );
     verify_eq!(
@@ -616,7 +619,12 @@ fn recorded_claude_copy_preserves_native_identity_and_source_occurrences() -> Re
 #[test]
 fn human_native_id_matches_the_existing_recorder_hash_contract() -> Result {
     let session = "11111111-1111-4111-8111-111111111111";
-    let id = native_event_id(session, 3)?;
+    let id = editchain_import::human::native_event_source(session, 3)?;
+    verify_eq!(
+        id.id(),
+        native_event_id(session, 3)?,
+        "canonical recorder mapping"
+    );
     // Pin the public 160-bit identity once, separately from archive IDs.
     verify_eq!(
         id.node.0,
@@ -634,7 +642,7 @@ fn human_native_id_matches_the_existing_recorder_hash_contract() -> Result {
         "native sequence is not the physical JSONL ordinal"
     );
     verify_ne!(
-        id,
+        id.id(),
         native_event_id("22222222-2222-4222-8222-222222222222", 3)?,
         "recorder incarnations remain distinct"
     );
@@ -987,5 +995,271 @@ fn shorter_codex_copies_reconcile_against_the_longest_complete_source() -> Resul
         4,
         "every raw occurrence in the shorter source maps to the complete source"
     );
+    Ok(())
+}
+
+#[test]
+fn schema_three_all_sources_retry_and_raw_backfill_are_stable() -> Result {
+    use editchain_core::activity::Kind;
+    for provider in [Provider::Claude, Provider::Codex, Provider::Human] {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source)?;
+        std::fs::write(source.join(provider.filename()), provider.bytes())?;
+        let mut blobs = FsBlobSink::new(temp.path().join("blobs"))?;
+        let cursors = MemoryCursorStore::new();
+        let options = ImportOptions {
+            include_thinking: true,
+            ..ImportOptions::default()
+        };
+        let legacy = provider.capture(&source, &options, &mut blobs, &cursors)?;
+        let first = editchain_import::activity::convert(legacy.operations(), &mut blobs)?;
+        let second = editchain_import::activity::convert(legacy.operations(), &mut blobs)?;
+        verify_eq!(
+            first,
+            second,
+            "identical capture has identical schema-three bytes"
+        );
+        let raw = provider
+            .capture(
+                &source,
+                &ImportOptions {
+                    normalize: false,
+                    ..options
+                },
+                &mut blobs,
+                &cursors,
+            )?
+            .into_schema3(&mut blobs)?;
+        for op in raw.operations() {
+            if matches!(&op.kind, OpKind::Activity(record) if matches!(record.kind, Kind::Original(_)))
+            {
+                verify!(
+                    first.contains(op),
+                    "normalization cannot change an Original under the same ID"
+                );
+            }
+        }
+        let mut originals = 0;
+        let mut activities = 0;
+        for op in &first {
+            let OpKind::Activity(record) = &op.kind else {
+                return Err("new captures must use schema three".into());
+            };
+            record.validate()?;
+            verify_eq!(
+                editchain_store::format::decode_op(&editchain_store::format::encode_op(op)?)?,
+                *op,
+                "binary roundtrip retains every field"
+            );
+            verify_eq!(
+                serde_json::from_value::<Op>(serde_json::to_value(op)?)?,
+                *op,
+                "JSON roundtrip retains every field"
+            );
+            if matches!(record.kind, Kind::Original(_)) {
+                originals += 1;
+            } else {
+                activities += 1;
+            }
+            if let Some(original) = &record.original {
+                verify!(
+                    first.iter().any(|op| op.id == original.operation),
+                    "direct Original reference resolves"
+                );
+            }
+        }
+        verify!(
+            originals > 0 && activities > 0,
+            "each source supplies originals and typed activities"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn schema_three_migration_retains_old_lookup_and_retries_after_marker_loss() -> Result {
+    let temp = tempfile::tempdir()?;
+    let source = temp.path().join("source");
+    std::fs::create_dir(&source)?;
+    std::fs::write(source.join(Provider::Claude.filename()), CLAUDE)?;
+    let old = temp.path().join("old");
+    let new = temp.path().join("new");
+    let mut blobs = FsBlobSink::new(old.join("blobs"))?;
+    let mut cursors = FsCursorStore::new(old.join("cursors"))?;
+    let batch =
+        Provider::Claude.capture(&source, &ImportOptions::default(), &mut blobs, &cursors)?;
+    let previous = batch.operations().to_vec();
+    let mut log = LogStore::new(SegmentStore::open(&old)?);
+    let _report = batch.persist(&mut log, &mut cursors)?;
+    drop(log);
+    let report = editchain_import::activity::migrate(&old, &new, || false)?;
+    verify_eq!(
+        usize::try_from(report.records)?,
+        previous.len(),
+        "migration sees every source record"
+    );
+    verify!(
+        report.output_records < report.records,
+        "direct fields remove bookkeeping operations"
+    );
+    let queries = editchain_engine::queries::ChainQueries::open(&new)?;
+    for op in &previous {
+        verify!(
+            matches!(
+                queries.resolve_id(&op.id.to_string().parse()?)?,
+                editchain_engine::queries::IdResolution::Found(_)
+            ),
+            "every old address resolves, including folded notes"
+        );
+    }
+    drop(queries);
+    let repeated = temp.path().join("repeated");
+    let error = editchain_import::activity::migrate(&new, &repeated, || false)
+        .err()
+        .ok_or("reconverting schema three must preserve the import namespace")?;
+    verify_eq!(
+        error.kind(),
+        io::ErrorKind::InvalidInput,
+        "explicit schema guard"
+    );
+    verify!(
+        !repeated.exists(),
+        "a second conversion cannot be published"
+    );
+    std::fs::remove_file(new.join("schema3-migration.json"))?;
+    verify!(
+        editchain_import::activity::uses_migration_ids(&new)?,
+        "namespace is recoverable from persisted records"
+    );
+    let mut new_blobs = FsBlobSink::new(new.join("blobs"))?;
+    let new_cursors = FsCursorStore::new(new.join("cursors-v3"))?;
+    let retry = Provider::Claude
+        .capture(
+            &source,
+            &ImportOptions::default(),
+            &mut new_blobs,
+            &new_cursors,
+        )?
+        .into_migrated_schema3(&mut new_blobs)?;
+    verify!(
+        retry.operations().is_empty(),
+        "migration retains accepted source offsets"
+    );
+    Ok(())
+}
+
+#[test]
+fn schema_three_normalization_backfill_preserves_already_accepted_records() -> Result {
+    for provider in [Provider::Claude, Provider::Codex] {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source)?;
+        std::fs::write(source.join(provider.filename()), provider.bytes())?;
+        let chain = temp.path().join("chain");
+        let mut blobs = FsBlobSink::new(chain.join("blobs"))?;
+        let mut cursors = MemoryCursorStore::new();
+        let batch = provider
+            .capture(&source, &ImportOptions::default(), &mut blobs, &cursors)?
+            .into_schema3(&mut blobs)?;
+        let previous = batch.operations().to_vec();
+        let mut writer = LogStore::new(SegmentStore::open(&chain)?);
+        let _report = batch.persist(&mut writer, &mut cursors)?;
+        let batch = provider
+            .capture(
+                &source,
+                &ImportOptions {
+                    include_thinking: true,
+                    ..ImportOptions::default()
+                },
+                &mut blobs,
+                &cursors,
+            )?
+            .into_schema3(&mut blobs)?;
+        for candidate in batch.operations() {
+            if let Some(existing) = previous.iter().find(|op| op.id == candidate.id) {
+                if existing != candidate {
+                    let before = serde_json::to_value(existing)?;
+                    let after = serde_json::to_value(candidate)?;
+                    let differences: Vec<_> = before.as_object().ok_or("expected envelope")?.iter().filter(|(key, value)| after.get(*key) != Some(*value)).map(|(key, value)| serde_json::json!({"field": key, "before": value, "after": after.get(key)})).collect();
+                    return Err(format!(
+                        "{} backfill changed {}: {}",
+                        provider.name(),
+                        candidate.id,
+                        serde_json::to_string(&differences)?
+                    )
+                    .into());
+                }
+            }
+        }
+        let report = batch.persist(&mut writer, &mut cursors)?;
+        verify_eq!(
+            report.admission.conflicts,
+            0,
+            "adding recorded reasoning must not change existing events"
+        );
+        let snapshot = writer.snapshot()?;
+        for op in previous {
+            verify_eq!(
+                snapshot.get(op.id),
+                Some(&op),
+                "earlier event stays accepted and unchanged"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn schema_three_old_aliases_keep_conflicts_visible_after_index_rebuild() -> Result {
+    use editchain_engine::queries::{ChainQueries, IdResolution, Lookup};
+    let temp = tempfile::tempdir()?;
+    let source = temp.path().join("source");
+    std::fs::create_dir(&source)?;
+    std::fs::write(source.join(Provider::Claude.filename()), CLAUDE)?;
+    let old = temp.path().join("old");
+    let new = temp.path().join("new");
+    let mut blobs = FsBlobSink::new(old.join("blobs"))?;
+    let mut cursors = MemoryCursorStore::new();
+    let batch =
+        Provider::Claude.capture(&source, &ImportOptions::default(), &mut blobs, &cursors)?;
+    let old_id = batch.operations().first().ok_or("missing source")?.id;
+    let mut writer = LogStore::new(SegmentStore::open(&old)?);
+    let _report = batch.persist(&mut writer, &mut cursors)?;
+    drop(writer);
+    let _migration = editchain_import::activity::migrate(&old, &new, || false)?;
+    let queries = ChainQueries::open(&new)?;
+    let IdResolution::Found(converted) = queries.resolve_id(&old_id.to_string().parse()?)? else {
+        return Err("old alias missing".into());
+    };
+    let Lookup::Found(entry) = queries.operation(converted)? else {
+        return Err("converted record missing".into());
+    };
+    let OpKind::Activity(mut changed) = entry.operation.kind else {
+        return Err("expected schema three".into());
+    };
+    changed.time_ms = Some(changed.time_ms.unwrap_or_default().saturating_add(1));
+    drop(queries);
+    let result = editchain_engine::Engine::open(&new)?.append(&changed.into_op()?)?;
+    verify_eq!(
+        result,
+        editchain_core::Admission::Conflict,
+        "a mapped ID still rejects changed bytes"
+    );
+    for rebuild in [false, true] {
+        if rebuild {
+            std::fs::remove_dir_all(new.join("index-v3"))?;
+        }
+        let queries = ChainQueries::open(&new)?;
+        verify_eq!(
+            queries.resolve_id(&old_id.to_string().parse()?)?,
+            IdResolution::Found(converted),
+            "old alias still selects the quarantined identity"
+        );
+        verify!(
+            matches!(queries.operation(converted)?, Lookup::Conflicted(_)),
+            "rebuilding cannot resurrect the converted record"
+        );
+    }
     Ok(())
 }

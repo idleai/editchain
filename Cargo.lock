@@ -692,9 +692,11 @@ dependencies = [
 name = "editchain-core"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "postcard",
  "proptest",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -760,6 +762,7 @@ dependencies = [
  "editchain-core",
  "editchain-index-pages",
  "editchain-store",
+ "postcard",
  "serde",
  "tempfile",
 ]
@@ -833,6 +836,7 @@ dependencies = [
  "postcard",
  "proptest",
  "serde",
+ "serde_json",
  "tempfile",
 ]
 

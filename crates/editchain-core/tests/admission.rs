@@ -1,9 +1,11 @@
 //! Canonical admission, conflict retention, and merge tests.
 
 // Referenced by library derive macros; suppress unused-crate-dependencies lint.
+use blake3 as _;
 use postcard as _;
 use proptest as _;
 use serde as _;
+use serde_json as _;
 
 use editchain_core::{Admission, NodeId, OpId, OpSet};
 

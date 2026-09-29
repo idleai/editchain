@@ -1,12 +1,12 @@
 //! Resolve provider endpoints from the complete admitted operation corpus.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use editchain_core::provider::{
     CodexLifecycleEvent, CodexLifecycleEvidence, CodexSourceEvidence, CodexSpawnSignal,
     CodexThreadId, ProviderFact,
 };
-use editchain_core::{NoteRelationship, Op, OpId, OpKind, ParentSet, Payload, ScopeRef};
+use editchain_core::{NoteRelationship, Op, OpId, OpKind, ParentSet, Payload, ScopeRef, SourceId};
 
 type SourceKey = (u64, u32);
 
@@ -14,6 +14,7 @@ type SourceKey = (u64, u32);
 pub(super) struct ProviderRelations {
     pub(super) notes: Vec<Op>,
     covered: HashSet<SourceKey>,
+    origins: HashMap<OpId, SourceId>,
 }
 
 impl ProviderRelations {
@@ -24,12 +25,11 @@ impl ProviderRelations {
         if !matches!(
             note.relationship,
             NoteRelationship::SpawnedBy | NoteRelationship::ReconnectsTo
-        ) || !op
-            .parents
-            .iter()
-            .chain(&note.target_ids)
-            .any(|id| self.covered.contains(&source_key(*id)))
-        {
+        ) || !op.parents.iter().chain(&note.target_ids).any(|id| {
+            self.origins
+                .get(id)
+                .is_some_and(|source| self.covered.contains(&source_key(*source)))
+        }) {
             return false;
         }
         let Payload::Inline(content) = &note.content else {
@@ -56,29 +56,34 @@ struct Source<'a> {
 #[derive(Debug)]
 struct Lifecycle<'a> {
     meta: &'a CodexLifecycleEvidence,
-    source: OpId,
+    source: SourceId,
     proof: &'a Op,
 }
 
 pub(super) fn resolve(ops: &[Op]) -> ProviderRelations {
-    let raw: BTreeMap<OpId, &Op> = ops
+    let raw: BTreeMap<SourceId, &Op> = ops
         .iter()
         .filter(|op| matches!(op.kind, OpKind::Import(_)))
-        .map(|op| (op.id, op))
+        .filter_map(|op| op.source.map(|source| (source, op)))
         .collect();
     let records: Vec<_> = ops.iter().filter_map(decode_evidence).collect();
-    resolve_records(&records, &raw)
+    let mut resolved = resolve_records(&records, &raw);
+    resolved.origins = ops
+        .iter()
+        .filter_map(|op| op.source.map(|source| (op.id, source)))
+        .collect();
+    resolved
 }
 
 /// Both offline and incremental resolution use the same endpoint rules. The
 /// latter supplies indexed prefix coverage instead of scanning historical raw ops.
 pub(crate) trait RawCorpus {
-    fn matches(&self, source: OpId, hash: [u8; 32]) -> bool;
+    fn matches(&self, source: SourceId, hash: [u8; 32]) -> bool;
     fn complete(&self, meta: &CodexSourceEvidence, scope: ScopeRef) -> bool;
 }
 
-impl RawCorpus for BTreeMap<OpId, &Op> {
-    fn matches(&self, source: OpId, hash: [u8; 32]) -> bool {
+impl RawCorpus for BTreeMap<SourceId, &Op> {
+    fn matches(&self, source: SourceId, hash: [u8; 32]) -> bool {
         self.get(&source).is_some_and(
             |op| matches!(&op.kind, OpKind::Import(import) if import.raw_hash == Some(hash)),
         )
@@ -87,7 +92,7 @@ impl RawCorpus for BTreeMap<OpId, &Op> {
     fn complete(&self, meta: &CodexSourceEvidence, scope: ScopeRef) -> bool {
         let present: Vec<_> = self
             .range(
-                meta.first..=OpId {
+                meta.first..=SourceId {
                     seq: u64::MAX,
                     ..meta.last
                 },
@@ -117,6 +122,7 @@ pub(crate) fn resolve_records(
     }
     let mut resolved = ProviderRelations {
         covered: prefixes.keys().copied().collect(),
+        origins: HashMap::new(),
         notes: Vec::new(),
     };
     let mut blocked = BTreeSet::new();
@@ -161,7 +167,7 @@ pub(crate) fn resolve_records(
     resolved
 }
 
-fn source_key(id: OpId) -> SourceKey {
+fn source_key(id: SourceId) -> SourceKey {
     (id.node.0, id.boot)
 }
 
@@ -251,7 +257,7 @@ fn resolve_spawns(
                 }
             )
         });
-        let mut activations: BTreeMap<OpId, Vec<&Op>> = BTreeMap::new();
+        let mut activations: BTreeMap<SourceId, Vec<&Op>> = BTreeMap::new();
         for candidate in candidates {
             if let CodexLifecycleEvent::Spawn {
                 activation, signal, ..
@@ -344,8 +350,8 @@ fn legacy_child<'a>(
 
 fn add_relation<'a>(
     notes: &mut Vec<Op>,
-    anchor: OpId,
-    target: OpId,
+    anchor: SourceId,
+    target: SourceId,
     relationship: NoteRelationship,
     evidence: impl IntoIterator<Item = &'a Op>,
 ) {
@@ -353,10 +359,10 @@ fn add_relation<'a>(
         // These clones are projection annotations. The admitted operation and
         // its ID still retain their original source, payload, and envelope.
         let mut annotation = proof.clone();
-        annotation.parents = ParentSet::One(anchor);
+        annotation.parents = ParentSet::One(anchor.id());
         if let OpKind::Note(note) = &mut annotation.kind {
             note.relationship = relationship;
-            note.target_ids = vec![target];
+            note.target_ids = vec![target.id()];
         }
         notes.push(annotation);
     }

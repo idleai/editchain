@@ -52,9 +52,11 @@ impl LiveWorkspace {
         workspace
             .session_metadata
             .extend(super::super::sessions::session_metadata_index(&operations));
-        let first =
-            editchain_core::OpId::new(input.incarnation.node, input.incarnation.boot, 1 << 16);
-        if let Some(meta) = self.projection.operation(first) {
+        let first = self
+            .projection
+            .provenance(input.incarnation)
+            .map(|source| editchain_core::OpId::new(source.node, source.boot, 1 << 16));
+        if let Some(meta) = first.and_then(|id| self.projection.operation(id)) {
             workspace
                 .session_metadata
                 .extend(super::super::sessions::session_metadata_index(
@@ -105,6 +107,12 @@ impl LiveWorkspace {
         }
         presentation.block = Some(LiveBlock {
             meta: LiveBlockMeta {
+                source_stream: input
+                    .operations
+                    .iter()
+                    .find(|op| op.id == input.anchor)
+                    .and_then(|op| op.source)
+                    .map(|source| (source.node.0.to_string(), source.boot)),
                 task_group: None,
                 task_summary: None,
                 task_protected: unresolved(input)
@@ -157,6 +165,15 @@ fn unresolved(input: &LiveRow) -> bool {
         .iter()
         .rev()
         .find_map(|op| match &op.kind {
+            editchain_core::OpKind::Activity(record) => {
+                if let editchain_core::activity::Kind::Tool(tool) = &record.kind {
+                    Some(tool.stage != editchain_core::activity::Stage::Finished)
+                } else if let editchain_core::activity::Kind::File(file) = &record.kind {
+                    Some(file.change == Some(editchain_core::activity::ChangeState::Proposed))
+                } else {
+                    None
+                }
+            }
             editchain_core::OpKind::Tool(tool) => {
                 Some(tool.stage != editchain_core::ToolStage::Finish)
             }

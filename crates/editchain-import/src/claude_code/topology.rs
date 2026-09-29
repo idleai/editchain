@@ -229,7 +229,7 @@ pub fn occurrence_fingerprint_fact(
     } else {
         envelope.session_id.as_str()
     };
-    let id = stream.op_from_position(SourcePosition::derived(
+    let id = stream.source_position(SourcePosition::derived(
         source_ordinal,
         OCCURRENCE_FINGERPRINT_NOTE_DISC,
     ))?;
@@ -277,17 +277,17 @@ fn event_payload_fingerprint(raw_bytes: &[u8]) -> Result<Option<String>, serde_j
 /// Returns an error if the note source position overflows or evidence JSON
 /// cannot be encoded.
 pub fn spawn_fact(
-    child_first_raw: OpId,
+    child_first_raw: editchain_core::SourceId,
     child_scope: ScopeRef,
     tool_use_id: &str,
 ) -> Result<Op, ImportError> {
     let stream = SourceStream::new(child_first_raw.node, child_first_raw.boot);
     let source_ordinal = child_first_raw.seq >> 16;
-    let id = stream.op_from_position(SourcePosition::derived(source_ordinal, SPAWN_NOTE_DISC))?;
+    let id = stream.source_position(SourcePosition::derived(source_ordinal, SPAWN_NOTE_DISC))?;
     Ok(build_fact(
         id,
         FactSpec {
-            anchor: child_first_raw,
+            anchor: child_first_raw.id(),
             target: tool_entity_id(tool_use_id),
             scope: child_scope,
             relationship: NoteRelationship::SpawnedBy,
@@ -323,13 +323,13 @@ fn push_fact(
     payload_fingerprint: Option<&str>,
 ) -> Result<(), ImportError> {
     let derived_ordinal = TOPOLOGY_NOTE_BASE + facts.len() as u16;
-    let id = stream.op_from_position(SourcePosition::derived(source_ordinal, derived_ordinal))?;
+    let id = stream.source_position(SourcePosition::derived(source_ordinal, derived_ordinal))?;
     facts.push(build_fact(id, spec, payload_fingerprint)?);
     Ok(())
 }
 
 fn build_fact(
-    id: OpId,
+    id: editchain_core::SourceId,
     spec: FactSpec<'_>,
     payload_fingerprint: Option<&str>,
 ) -> Result<Op, serde_json::Error> {
@@ -350,7 +350,8 @@ fn build_fact(
     }
     let evidence = serde_json::to_vec(&evidence)?;
     Ok(Op {
-        id,
+        source: Some(id),
+        id: id.id(),
         parents: ParentSet::One(spec.anchor),
         actor: ActorId(0),
         clock: Clock::None,

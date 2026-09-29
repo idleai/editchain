@@ -64,12 +64,13 @@ pub(super) fn session_git_link_op(
     };
 
     let source = stream.op_from_position(SourcePosition::raw(source_ordinal))?;
-    let id = stream.op_from_position(SourcePosition::derived(
+    let id = stream.source_position(SourcePosition::derived(
         source_ordinal,
         SESSION_GIT_LINK_LANE,
     ))?;
     Ok(Some(Op {
-        id,
+        source: Some(id),
+        id: id.id(),
         parents: ParentSet::One(source),
         actor: ActorId(0),
         clock: Clock::None,

@@ -1,62 +1,54 @@
 # Scaling large histories
 
-Large imports reuse one writer and batch disk writes. This avoids rescanning
-the accumulated history for every operation while preserving original bytes,
-stable identities, and duplicate/conflict rules.
-
 Use `import --glob '**/*.jsonl'` for a directory or `import --manifest sources.json`
-for multiple Claude, Codex, and human sources. Both capture and commit one file at
-a time through the same writer. See the [CLI guide](cli.md#imports-and-archives)
-for examples, limits, progress, and timing reports.
+for mixed Claude, Codex, and human history. Both capture and commit one file at a
+time through one writer, avoiding a full history scan for each file. For repeated
+library writes, retain an [Engine::writer()](engine-api.md).
 
-For repeated library writes, keep an [Engine::writer()](engine-api.md) open.
-CLI append streams, archive restore, and `StoreReplica` also reuse writer state.
-Operation and blob writes share synchronization work across batches.
+The defaults are **32 MiB segments, 16 MiB inline payloads**, and a **512 MiB
+per-file capture budget**. The capture budget does not bound total writer memory.
+See the [CLI guide](cli.md#imports-and-archives) for inputs, limits, and progress.
 
-## Durability and retries
+## Measured corpus
 
-Imports persist blobs before their referencing operations. They reserve source
-identities before appending operations and advance source cursors only after
-those operations are durable. Indexes remain rebuildable from stored evidence.
+The corpus contains **507 files and 1,451,212 operations**. Both runs below use
+the current 32/16 MiB settings; the older run uses EC02 storage.
 
-A failed batch may leave a committed prefix. Retry the same import: exact repeats
-add no history, while conflicting variants remain stored. Failed writes discard
-uncertain cached state so retries check storage again. Batching preserves the
-existing storage format and replication access rules. See the
-[import API](import-api.md#cursors-and-retries) for the persistence contract.
+| Measurement | EC02, 2026-09-28 | EC03, 2026-09-29 |
+| --- | --- | --- |
+| Full import command | 104.5 s | 174.4 s |
+| Capture, normalization, helpers, blob handling | 62.1 s | 85.7 s |
+| Admission, log writes, cursor commits | 40.4 s | 79.7 s |
+| Stored logs | 109 segments, 3.44 GB | 108 segments, 3.55 GB |
+| Blob files | 0 | 0 |
 
-## Accepted evaluation baseline
+These are separate verification runs under competing host load, not a controlled
+speed comparison. Phase counters exclude process startup and teardown.
 
-The 2026-09-28 run used **32 MiB segments, 16 MiB inline payloads**, and a
-**512 MiB per-file capture budget**. It imported **1,451,212 operations from
-507 files** in one CLI process.
+EC02-to-EC03 migration took **179.4 seconds**, including complete verification.
+Every migrated operation matched the fresh EC03 import byte for byte, including
+IDs, flags, payloads, and references. Migration retains another 3.44 GB of original
+segments; derived indexes are also outside the log totals. See [EC03](ec03.md)
+for the migration contract.
 
-| Measurement | Result |
-| --- | --- |
-| Full import | 104.5 s |
-| Capture, normalization, helpers, and blob handling | 62.1 s |
-| Operation admission, log writes, and cursor commits | 40.4 s |
-| Setup and other overhead | 2.0 s |
-| Unchanged re-import | 5.4 s; zero new operations |
-| Stored chain | 109 segments, 3.44 GB, 0 blob files |
+The sibling `editchain-sessions-raw/evals/EC03-MIGRATION.md` links the current
+validation artifacts. `evals/FINAL-IMPORT.md` and `evals/baseline.json` retain the
+original EC02 measurements, including its 5.4-second unchanged-source retry.
 
-Validation passed **18 cases with 2,207 assertions**, including full-chain
-integrity, index rebuild, import state, and unchanged-source retry. Operation
-identities and resolved payload content matched the prior baseline. Index
-construction and validation are outside the import time; full-chain archive
-restore and replication were not repeated in this run.
+## Durability and remaining costs
 
-These settings are now the runtime defaults. Existing logs remain readable;
-recapture history from the old 4 KiB cutoff into a fresh chain to avoid
-[representation conflicts](import-api.md#compatibility-and-checks). The sibling
-repository's `editchain-sessions-raw/evals/FINAL-IMPORT.md` and `evals/baseline.json`
-record the measured configuration, exact executables, and detailed results.
+Imports persist blobs before referencing operations, reserve source identities
+before appending, and advance cursors only after durable writes. A failed batch
+may leave a committed prefix. Retry the same import: exact repeats add nothing;
+conflicting variants remain stored. Indexes rebuild from retained evidence.
 
-## Remaining costs
+Opening a writer still scans retained operations, and its memory use grows with
+history. Integrity, rebuild, export, replication inventories, and complete
+operation metadata also scan substantial history. Full integrity took 19m 04s
+in one concurrent EC03 verification with heavy paging; this is outside import
+and migration time.
 
-Opening a writer still scans existing operations, and its memory use grows with
-the retained evidence. Per-file capture limits do not bound total writer memory.
-Integrity checks, rebuilds, exports, and full replication inventories still visit
-the selected history. Complete operation metadata also scans incoming
-relationships. Parsing, hashing, encoding, helper execution, and disk
-synchronization still contribute to import time.
+EC02 chains remain readable but require migration before new writes. Format
+migration preserves existing payload storage choices. To change old 4 KiB
+captures to the current inline cutoff, recapture into a fresh chain to avoid
+[representation conflicts](import-api.md#compatibility-and-checks).

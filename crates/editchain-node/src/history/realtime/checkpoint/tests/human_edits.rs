@@ -214,6 +214,7 @@ fn capture_agent(root: &std::path::Path) {
         ScopeRef, SessionId, Tags,
     };
     let raw = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(73), 0, 1)),
         id: OpId::new(NodeId(73), 0, 1),
         parents: ParentSet::None,
         actor: ActorId(73),
@@ -233,6 +234,7 @@ fn capture_agent(root: &std::path::Path) {
         }),
     };
     let file = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(73), 0, 2)),
         id: OpId::new(NodeId(73), 0, 2),
         parents: ParentSet::One(raw.id),
         tags: Tags::AGENT | Tags::FILE,

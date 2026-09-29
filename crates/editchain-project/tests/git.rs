@@ -47,6 +47,7 @@ fn commit_op(id: OpId, repo: RepositoryId, oid: GitOid) -> Op {
         changed_paths: Vec::new(),
     };
     Op {
+        source: None,
         id,
         parents: ParentSet::None,
         actor: ActorId(3),
@@ -120,6 +121,7 @@ fn projection_groups_links_by_source() {
         kind: GitLinkKind::BasedOn,
     };
     let op_a = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(2), 0, 10)),
         id: OpId::new(NodeId(2), 0, 10),
         parents: ParentSet::None,
         actor: ActorId(3),
@@ -129,6 +131,7 @@ fn projection_groups_links_by_source() {
         kind: OpKind::GitLink(link_a),
     };
     let op_b = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(2), 0, 11)),
         id: OpId::new(NodeId(2), 0, 11),
         parents: ParentSet::None,
         actor: ActorId(3),
@@ -147,6 +150,7 @@ fn projection_link_is_not_a_causal_parent() {
     // A git link op must not appear as a causal parent of the commit it links.
     let source = OpId::new(NodeId(1), 0, 5);
     let link_op = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(2), 0, 10)),
         id: OpId::new(NodeId(2), 0, 10),
         parents: ParentSet::None,
         actor: ActorId(3),

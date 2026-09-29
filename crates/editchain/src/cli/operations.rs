@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use editchain_engine::{Admission, BlobResolution, ContentId, Engine, Op, OpKind};
+use editchain_store::BlobSource as _;
 use serde_json::json;
 
 use super::{
@@ -65,8 +66,14 @@ pub(super) fn append_kind(
         let valid = match kind {
             Kind::Any => true,
             Kind::Chain => matches!(operation.kind, OpKind::ChainStart(_)),
-            Kind::Note => matches!(operation.kind, OpKind::Note(_)),
-            Kind::Reflection => matches!(operation.kind, OpKind::Reflection(_)),
+            Kind::Note => {
+                matches!(&operation.kind, OpKind::Note(_))
+                    || matches!(&operation.kind, OpKind::Activity(record) if matches!(record.kind, editchain_engine::activity::Kind::Note(_)))
+            }
+            Kind::Reflection => {
+                matches!(&operation.kind, OpKind::Reflection(_))
+                    || matches!(&operation.kind, OpKind::Activity(record) if matches!(&record.kind, editchain_engine::activity::Kind::Message(message) if message.category == editchain_engine::activity::MessageKind::Summary))
+            }
         };
         if !valid {
             return Err(Failure::input("operation kind does not match this command"));
@@ -115,7 +122,7 @@ pub(super) fn conflict_result(conflict: bool) -> Result<()> {
 
 pub(super) fn blob(chain: &Path, id: ContentId, raw: bool, output: &mut Output) -> Result<()> {
     require_chain(chain)?;
-    let resolved = Engine::open(chain)?.resolve_content(id)?;
+    let resolved = editchain_store::BlobReader::open(chain)?.read_content(id)?;
     match resolved {
         BlobResolution::Found(bytes) => {
             if raw {

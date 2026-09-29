@@ -85,6 +85,7 @@ fn dry_run_retains_conflicts_and_duplicates_within_and_across_files() {
         }
         let args = [
             "import",
+            "--legacy",
             "--provider",
             "human",
             "--input",
@@ -129,7 +130,12 @@ fn manifest_dry_run_admits_all_sources_together() {
         serde_json::to_vec(&json!({"schema":1,"sources":sources})).unwrap(),
     )
     .unwrap();
-    let args = ["import", "--manifest", manifest.to_str().unwrap()];
+    let args = [
+        "import",
+        "--legacy",
+        "--manifest",
+        manifest.to_str().unwrap(),
+    ];
     let durable = result(&temp.path().join("durable"), &args, b"", 4);
     assert_eq!(durable.get("conflicts"), Some(&json!(1)));
     assert_eq!(durable.get("duplicates"), Some(&json!(18)));

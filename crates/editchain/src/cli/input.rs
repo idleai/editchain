@@ -58,11 +58,6 @@ pub(super) fn records<T: DeserializeOwned>(
     Ok(())
 }
 
-pub(super) fn op_id(value: &str) -> std::result::Result<editchain_engine::OpId, String> {
-    editchain_engine::OpId::from_display_str(value)
-        .ok_or_else(|| "expected operation ID node:boot:seq (decimal integers)".to_owned())
-}
-
 pub(super) fn json<T: DeserializeOwned>(value: &str) -> std::result::Result<T, String> {
     serde_json::from_str(value).map_err(|error| error.to_string())
 }

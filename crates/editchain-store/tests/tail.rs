@@ -6,13 +6,14 @@ use editchain_index_pages as _;
 use postcard as _;
 use proptest as _;
 use serde as _;
+use serde_json as _;
 
 use std::io::{self, Write as _};
 
 use editchain_core::{
     ActorId, Clock, MessageOp, NodeId, Op, OpId, OpKind, ParentSet, Payload, ScopeRef, Tags,
 };
-use editchain_store::format::{encode_op, encode_page, Page};
+use editchain_store::format::{encode_op, Page};
 use editchain_store::{CanonicalChain, CanonicalTail, IndexedTail, SegmentStore};
 
 fn check(condition: bool, message: &str) -> io::Result<()> {
@@ -39,6 +40,7 @@ fn equal<T: std::fmt::Debug + PartialEq + Copy>(
 
 fn message(seq: u64, text: &str) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 0, seq)),
         id: OpId::new(NodeId(1), 0, seq),
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -103,7 +105,9 @@ fn one_append_reads_only_one_record_at_different_history_sizes() -> io::Result<(
 fn partial_records_replays_conflicts_and_new_segments_match_full_replay() -> io::Result<()> {
     let dir = tempfile::tempdir()?;
     let one = message(1, "first");
-    let bytes = encode_page(&page(std::slice::from_ref(&one))?).map_err(io::Error::other)?;
+    let mut frame = editchain_store::format::Ec03Frame::new(0);
+    frame.add_record(0, encode_op(&one).map_err(io::Error::other)?);
+    let bytes = editchain_store::format::encode_ec03(&frame).map_err(io::Error::other)?;
     let boundary = bytes.len().saturating_sub(1);
     let path = dir.path().join("000000.eclog");
     std::fs::write(
