@@ -134,6 +134,23 @@ pub(super) enum FieldSource<'a> {
 }
 
 impl ChainQueries {
+    /// Resolve every recorded content field in schema order for evidence readers.
+    ///
+    /// Uses the same exhaustive inventory as search, including legacy fields,
+    /// binary Original records and file snapshots. Missing and conflicted
+    /// observations remain distinct from unavailable field content.
+    ///
+    /// # Errors
+    /// Returns storage/index errors while resolving the operation or its fields.
+    pub fn contents(&self, operation: OpId) -> io::Result<Lookup<Vec<ContentResult>>> {
+        self.operation(operation)?.try_map(|entry| {
+            fields::fields(&entry.operation.kind)
+                .into_iter()
+                .map(|(field, source)| self.resolve_field(&entry, field, source))
+                .collect()
+        })
+    }
+
     /// Resolve a field without decoding text, applying patches, or consulting live files.
     ///
     /// Missing/corrupt/unresolvable indexed content requires a successful index

@@ -4,6 +4,8 @@
 //! extension host and the native Rust service.
 
 mod content;
+/// Compatibility previews for the legacy node viewer, owned by app-core.
+pub use idle_history::legacy as legacy_view;
 pub mod editor;
 pub use content::{ContentTextDto, RowContentDto, MAX_ROW_TEXT_BYTES, MAX_TOOL_LABEL_BYTES};
 
