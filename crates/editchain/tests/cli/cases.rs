@@ -26,6 +26,9 @@ mod cli_streams;
 #[path = "bulk.rs"]
 mod bulk;
 
+#[path = "scan.rs"]
+mod scan;
+
 fn message(sequence: u64, content: Payload) -> Op {
     Op {
         source: Some(editchain_engine::SourceId::new(NodeId(7), 0, sequence)),
@@ -99,6 +102,7 @@ fn package_help_and_exit_contracts() {
         "import",
         "import-state",
         "export",
+        "scan",
         "meta",
         "annotations",
         "reflections",
