@@ -11,6 +11,7 @@ mod operations;
 pub(crate) mod output;
 mod query;
 mod replication;
+mod scan;
 
 use std::{
     path::{Path, PathBuf},
@@ -73,6 +74,8 @@ enum Command {
     },
     /// Export all exact record variants and their referenced blobs.
     Export,
+    /// Scan schema-three records with bounded payload previews and exact byte counts.
+    Scan(scan::Args),
     /// Append caller-authored Note operation envelopes.
     Annotate(input::Input),
     /// Append caller-authored Reflection operation envelopes.
@@ -118,6 +121,7 @@ pub(crate) fn run() -> ExitCode {
         &cli.command,
         Command::Query(_)
             | Command::Export
+            | Command::Scan(_)
             | Command::Blob { .. }
             | Command::Follow(_)
             | Command::Integrity
@@ -125,7 +129,11 @@ pub(crate) fn run() -> ExitCode {
     let options = ImportOptions::default();
     if matches!(
         &cli.command,
-        Command::Import(_) | Command::Follow(_) | Command::Replicate(_) | Command::Migrate { .. }
+        Command::Import(_)
+            | Command::Follow(_)
+            | Command::Scan(_)
+            | Command::Replicate(_)
+            | Command::Migrate { .. }
     ) {
         let cancellation = options.cancellation.clone();
         if let Err(error) = ctrlc::set_handler(move || cancellation.cancel()) {
@@ -168,6 +176,7 @@ fn execute(cli: Cli, output: &mut Output, options: &ImportOptions) -> Result<()>
         Command::Append(args) => operations::append(chain, &args, output),
         Command::Import(args) => imports::run(chain, &args, options, output),
         Command::Export => archive::export(chain, output),
+        Command::Scan(args) => scan::run(chain, &args, &options.cancellation, output),
         Command::Migrate {
             destination,
             schema3,

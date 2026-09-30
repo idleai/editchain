@@ -44,6 +44,7 @@ its report to stderr. Only `init` and provider imports create a missing chain.
 | `import --provider claude\|codex\|human --input PATH` | Capture provider history |
 | `import-state` | Inspect selected derivations, logical Codex items, exact copies and source gaps |
 | `export`, `append --archive` | Export or replay an chain archive |
+| `scan [--preview-bytes N] [--original-preview-bytes N]` | Stream schema-three records with bounded payload previews and exact sizes |
 | `history`, `annotations`, `reflections` | Page accepted records |
 | `operation ID`, `variants ID` | Look up an operation or all its exact variants |
 | `search TEXT` | Search literal, case-sensitive text |
@@ -63,6 +64,25 @@ accept `--key '{"Actor":9}'` or `--key '{"Session":12}'`. Content fields include
 `MessageContent`, `FileAfter` and `ImportRaw`. See the [query guide](engine-queries.md)
 for schemas and result semantics. `rebuild` recovers damaged checkpoints without
 rewriting records or blobs.
+
+## Compact statistics scans
+
+`editchain --chain PATH --output jsonl scan` reads schema-three operations in
+physical log order without building the query index. It emits one `record` event
+per distinct operation and a final `ready` event with counts. Each entry contains
+the recorded envelope, original record hash, encoded byte length, and a
+`payload_summary` of field name, storage type, and exact original byte length.
+Inline payloads are previews: at most 16,000 bytes per field by default, and zero
+bytes for Original source payloads. `payloads_truncated` marks shortened entries.
+Use `--preview-bytes` and `--original-preview-bytes` to choose limits from zero to
+1 MiB. These preview records are for analysis; use `export` for exact replay.
+
+Duplicates are counted once. Conflicting identities, unsupported operations,
+corrupt frames, or incomplete tails fail the command without a `ready` event.
+Consumers must require both the final summary and successful exit before using
+the scan as complete. Frames and record encodings are validated, but referenced
+blobs are not loaded or audited. Run against a fixed capture and check that the
+source did not change during the scan; `scan` does not lock out appenders.
 
 ## Migrating existing chains
 
