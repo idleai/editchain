@@ -6,7 +6,7 @@
 
 use crate::{provider::decode_evidence, CodexLogicalItem};
 use editchain_core::provider::{CodexDerivationEvidence, CodexLogicalChange, ProviderFact};
-use editchain_core::{Op, OpId, OpKind};
+use editchain_core::{Op, OpId, OpKind, SourceId};
 use editchain_engine::imports::selected_codex;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -63,7 +63,7 @@ pub struct TaskIdentity {
     /// Full native task/turn identity.
     pub turn: String,
     /// Most recent removal boundary, or sequence zero for the original task.
-    pub boundary: OpId,
+    pub boundary: SourceId,
 }
 
 /// Work counters used to detect accidental global rebuilds.
@@ -100,20 +100,27 @@ pub struct LiveProjection {
     #[serde(default)]
     topology: topology::Topology,
     ops: Map<OpId, Arc<Op>>,
+    origins: Map<OpId, SourceId>,
     owners: Map<OpId, Option<OpId>>,
     children: Map<OpId, Neighbors>,
     facts: Map<OpId, Neighbors>,
     dependents: Map<OpId, Neighbors>,
     selected: Map<OpId, CodexDerivationEvidence>,
     coverage: Map<Stream, Coverage>,
-    items: Map<Item, OrderedMap<OpId, CodexLogicalItem>>,
+    items: Map<Item, OrderedMap<SourceId, CodexLogicalItem>>,
     turns: Map<Turn, OrderedSet<Item>>,
     source_items: Map<Stream, OrderedSet<Item>>,
-    removals: Map<Turn, OrderedSet<OpId>>,
+    removals: Map<Turn, OrderedSet<SourceId>>,
     published: Map<Item, String>,
 }
 
 impl LiveProjection {
+    /// Recorded source position for a retained operation or a typed provider reference.
+    #[must_use]
+    pub fn provenance(&self, id: OpId) -> Option<SourceId> {
+        self.origins.get(&id).copied()
+    }
+
     /// Apply admitted additions/retractions. Exact duplicates are filtered by
     /// canonical admission before this API. Only dependency closures are read.
     pub fn apply(&mut self, added: Vec<Op>, removed: &[OpId]) -> LiveChanges {
@@ -143,8 +150,8 @@ impl LiveProjection {
             sources.extend(self.dependents.get(id).into_iter().flatten().copied());
             sources.extend(self.raw_owner(*id));
             if let Some(op) = self.ops.get(id) {
-                if matches!(op.kind, OpKind::Import(_)) {
-                    let key = stream(*id);
+                if let Some(origin) = op.source.filter(|_| matches!(op.kind, OpKind::Import(_))) {
+                    let key = stream(origin);
                     let _: &mut bool = streams
                         .entry(key)
                         .or_insert_with(|| self.coverage.get(&key).is_none_or(Coverage::complete));
@@ -174,10 +181,12 @@ impl LiveProjection {
                 self.human
                     .observe(*source, self.ops.get(source).map(AsRef::as_ref)),
             );
-            let key = stream(*source);
-            let _: &mut bool = streams
-                .entry(key)
-                .or_insert_with(|| self.coverage.get(&key).is_none_or(Coverage::complete));
+            if let Some(origin) = self.origins.get(source) {
+                let key = stream(*origin);
+                let _: &mut bool = streams
+                    .entry(key)
+                    .or_insert_with(|| self.coverage.get(&key).is_none_or(Coverage::complete));
+            }
             self.reduce_occurrence(*source, &mut items);
         }
         for (source, before) in streams {
@@ -223,6 +232,16 @@ impl LiveProjection {
         self.topology.resolve(&self.ops)
     }
 
+    /// Retained schema-three records for upgrading derived parent and Git indexes.
+    #[must_use]
+    pub fn activity_operations(&self) -> Vec<Arc<Op>> {
+        self.ops
+            .values()
+            .filter(|op| matches!(op.kind, OpKind::Activity(_)))
+            .cloned()
+            .collect()
+    }
+
     /// Accepted immutable source lookup, also used by detail adapters.
     #[must_use]
     pub fn operation(&self, id: OpId) -> Option<&Op> {
@@ -258,11 +277,14 @@ impl LiveProjection {
                 else {
                     return None;
                 };
-                if id != source && !outputs.contains(&id) {
+                if id != source && !outputs.iter().any(|output| output.id() == id) {
                     return None;
                 }
-                let key = ((stream(source), turn.clone()), item.clone());
-                (self.observed(&key)?.incarnation == *incarnation)
+                let key = (
+                    (stream(*self.origins.get(&source)?), turn.clone()),
+                    item.clone(),
+                );
+                (self.observed(&key)?.incarnation == incarnation.id())
                     .then(|| self.published.get(&key).cloned())
                     .flatten()
             })
@@ -330,9 +352,9 @@ impl LiveProjection {
 
     fn remove_op(&mut self, id: OpId) {
         if let Some(op) = self.ops.remove(&id) {
-            if matches!(op.kind, OpKind::Import(_)) {
-                if let Some(coverage) = self.coverage.get_mut(&stream(id)) {
-                    let _: bool = coverage.raw.remove(&(id.seq >> 16));
+            if let Some(origin) = op.source.filter(|_| matches!(op.kind, OpKind::Import(_))) {
+                if let Some(coverage) = self.coverage.get_mut(&stream(origin)) {
+                    let _: bool = coverage.raw.remove(&(origin.seq >> 16));
                 }
             }
         }
@@ -344,11 +366,14 @@ impl LiveProjection {
         sources: &mut HashSet<OpId>,
         streams: &mut HashMap<Stream, bool>,
     ) {
-        let key = stream(op.id);
-        for parent in &op.parents {
+        if let Some(origin) = op.source {
+            let _previous = self.origins.insert(op.id, origin);
+        }
+        for parent in op.parent_ids() {
             let _: bool = self.children.entry(*parent).or_default().insert(op.id);
         }
-        if matches!(op.kind, OpKind::Import(_)) {
+        if let Some(origin) = op.source.filter(|_| matches!(op.kind, OpKind::Import(_))) {
+            let key = stream(origin);
             let _: &mut bool = streams
                 .entry(key)
                 .or_insert_with(|| self.coverage.get(&key).is_none_or(Coverage::complete));
@@ -357,18 +382,25 @@ impl LiveProjection {
                 .entry(key)
                 .or_default()
                 .raw
-                .insert(op.id.seq >> 16);
+                .insert(origin.seq >> 16);
             let _: bool = sources.insert(op.id);
         }
         if let Some(record) = decode_evidence(&op) {
             if let ProviderFact::CodexDerivation(meta) = record.payload.fact {
-                let source = record.payload.source;
+                let origin = record.payload.source;
+                let source = origin.id();
+                let _previous = self.origins.insert(source, origin);
                 let _: bool = self.facts.entry(source).or_default().insert(op.id);
-                let mut dependencies = meta.outputs;
+                for output in &meta.outputs {
+                    let _previous = self.origins.insert(output.id(), *output);
+                }
+                let mut dependencies: Vec<OpId> =
+                    meta.outputs.iter().map(|output| output.id()).collect();
                 dependencies.extend([source, op.id]);
                 for change in meta.changes {
                     if let CodexLogicalChange::Upsert { incarnation, .. } = change {
-                        dependencies.push(incarnation);
+                        let _previous = self.origins.insert(incarnation.id(), incarnation);
+                        dependencies.push(incarnation.id());
                     }
                 }
                 for dependency in dependencies {
@@ -404,9 +436,9 @@ impl LiveProjection {
                 break Some(id);
             }
             if let Some(evidence) = decode_evidence(op) {
-                break Some(evidence.payload.source);
+                break Some(evidence.payload.source.id());
             }
-            let Some(parent) = op.parents.iter().next() else {
+            let Some(parent) = op.parent_ids().next() else {
                 break None;
             };
             id = *parent;
@@ -437,6 +469,9 @@ impl LiveProjection {
     }
 
     fn reduce_occurrence(&mut self, source: OpId, affected: &mut HashSet<Item>) {
+        let Some(origin) = self.origins.get(&source).copied() else {
+            return;
+        };
         let next = selected_codex(
             source,
             self.facts
@@ -450,20 +485,20 @@ impl LiveProjection {
             return;
         }
         if let Some(previous) = self.selected.remove(&source) {
-            self.unapply(source, &previous, affected);
+            self.unapply(origin, &previous, affected);
         }
-        let coverage = self.coverage.entry(stream(source)).or_default();
-        let _: bool = coverage.ready.remove(&(source.seq >> 16));
+        let coverage = self.coverage.entry(stream(origin)).or_default();
+        let _: bool = coverage.ready.remove(&(origin.seq >> 16));
         if let Some(meta) = next {
-            let _: bool = coverage.ready.insert(source.seq >> 16);
-            self.apply_changes(source, &meta, affected);
+            let _: bool = coverage.ready.insert(origin.seq >> 16);
+            self.apply_changes(origin, &meta, affected);
             drop(self.selected.insert(source, meta));
         }
     }
 
     fn unapply(
         &mut self,
-        source: OpId,
+        source: SourceId,
         meta: &CodexDerivationEvidence,
         affected: &mut HashSet<Item>,
     ) {
@@ -489,7 +524,7 @@ impl LiveProjection {
 
     fn apply_changes(
         &mut self,
-        source: OpId,
+        source: SourceId,
         meta: &CodexDerivationEvidence,
         affected: &mut HashSet<Item>,
     ) {
@@ -506,9 +541,9 @@ impl LiveProjection {
                         thread: meta.thread.clone(),
                         turn: turn.clone(),
                         item: item.clone(),
-                        incarnation: *incarnation,
-                        source,
-                        outputs: outputs.clone(),
+                        incarnation: incarnation.id(),
+                        source: source.id(),
+                        outputs: outputs.iter().map(|output| output.id()).collect(),
                     };
                     drop(
                         self.items
@@ -558,15 +593,15 @@ impl LiveProjection {
             item.incarnation,
             &item.outputs,
         );
+        let Some(origin) = self.origins.get(&item.source).copied() else {
+            return;
+        };
         let boundary = self
             .removals
             .get(&key.0)
             .and_then(OrderedSet::last)
             .copied()
-            .unwrap_or(OpId {
-                seq: 0,
-                ..item.source
-            });
+            .unwrap_or(SourceId { seq: 0, ..origin });
         row.task = Some(TaskIdentity {
             key: format!(
                 "codex:{boundary}:{}:{}:{}:{}",
@@ -592,14 +627,16 @@ impl LiveProjection {
             .ops
             .get(&anchor)
             .and_then(|op| crate::human::work_record(op))
-            .map(|record| TaskIdentity {
-                key: format!("human:{}:{}", record.session, record.turn),
-                thread: record.session,
-                turn: record.turn.to_string(),
-                boundary: OpId {
-                    seq: 0,
-                    ..incarnation
-                },
+            .and_then(|record| {
+                Some(TaskIdentity {
+                    key: format!("human:{}:{}", record.session, record.turn),
+                    thread: record.session,
+                    turn: record.turn.to_string(),
+                    boundary: SourceId {
+                        seq: 0,
+                        ..*self.origins.get(&anchor)?
+                    },
+                })
             });
         LiveRow {
             key,
@@ -637,7 +674,7 @@ impl LiveProjection {
                 .outputs
                 .iter()
                 .filter(|id| !owned.contains(id))
-                .copied()
+                .map(|source| source.id())
                 .collect();
             if !extra.is_empty() {
                 put(self.row(key, source, source, &extra), output);
@@ -680,7 +717,7 @@ impl LiveProjection {
     }
 }
 
-fn stream(id: OpId) -> Stream {
+fn stream(id: SourceId) -> Stream {
     (id.node.0, id.boot)
 }
 

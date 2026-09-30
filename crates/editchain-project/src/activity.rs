@@ -51,7 +51,7 @@
 use std::collections::{HashMap, HashSet};
 
 use editchain_core::{
-    Clock, NodeId, Op, OpId, OpKind, ParentSet, ScopeRef, Tags, TurnId, UnknownOp,
+    Clock, NodeId, Op, OpId, OpKind, ParentSet, ScopeRef, SourceId, Tags, TurnId, UnknownOp,
 };
 
 use crate::meta::{
@@ -84,15 +84,20 @@ pub fn inline_context_compaction_checkpoints<S: std::hash::BuildHasher>(
     mut nodes: Vec<HistoryNode>,
     structural_keys: &HashSet<NodeKey, S>,
 ) -> Vec<HistoryNode> {
+    let origins: HashMap<OpId, SourceId> = nodes
+        .iter()
+        .filter_map(node_anchor_op)
+        .filter_map(|op| op.source.map(|source| (op.id, source)))
+        .collect();
     let mut streams: HashMap<(u64, u32), Vec<RawRowFacts>> = HashMap::new();
     let mut stored_parents = HashSet::new();
     for (index, node) in nodes.iter().enumerate() {
         if let Some(op) = node_anchor_op(node) {
-            stored_parents.extend(op.parents.iter().copied());
+            stored_parents.extend(op.parent_ids().copied());
         }
         if let Some(facts) = raw_row_facts(node, index) {
             streams
-                .entry((facts.id.node.0, facts.id.boot))
+                .entry((facts.source.node.0, facts.source.boot))
                 .or_default()
                 .push(facts);
         }
@@ -100,7 +105,7 @@ pub fn inline_context_compaction_checkpoints<S: std::hash::BuildHasher>(
 
     let mut rewrites = Vec::new();
     for stream in streams.values_mut() {
-        stream.sort_unstable_by_key(|facts| facts.id.seq);
+        stream.sort_unstable_by_key(|facts| facts.source.seq);
         for pair in stream.windows(2) {
             let [checkpoint, continuation] = pair else {
                 continue;
@@ -118,7 +123,9 @@ pub fn inline_context_compaction_checkpoints<S: std::hash::BuildHasher>(
             let Some(parent) = checkpoint.sole_parent else {
                 continue;
             };
-            if parent.node != checkpoint.id.node || parent.boot != checkpoint.id.boot {
+            if !origins.get(&parent).is_some_and(|source| {
+                source.node == checkpoint.source.node && source.boot == checkpoint.source.boot
+            }) {
                 continue;
             }
             rewrites.push((continuation.index, checkpoint.id));
@@ -138,6 +145,7 @@ pub fn inline_context_compaction_checkpoints<S: std::hash::BuildHasher>(
 struct RawRowFacts {
     index: usize,
     id: OpId,
+    source: SourceId,
     scope: ScopeRef,
     sole_parent: Option<OpId>,
     is_compaction: bool,
@@ -153,12 +161,13 @@ fn raw_row_facts(node: &HistoryNode, index: usize) -> Option<RawRowFacts> {
     if !matches!(&op.kind, OpKind::Import(_)) {
         return None;
     }
-    let mut parents = op.parents.iter().copied();
+    let mut parents = op.parent_ids().copied();
     let first_parent = parents.next();
     let sole_parent = first_parent.filter(|_| parents.next().is_none());
     Some(RawRowFacts {
         index,
         id: op.id,
+        source: op.source?,
         scope: op.scope,
         sole_parent,
         is_compaction: is_context_compaction_import(op.as_ref()),
@@ -1413,6 +1422,7 @@ fn normalized_plan_heading(summary: &str) -> Option<String> {
 #[must_use]
 fn empty_anchor_op() -> Op {
     Op {
+        source: Some(SourceId::new(NodeId(0), 0, 0)),
         id: OpId::new(NodeId(0), 0, 0),
         parents: ParentSet::None,
         actor: editchain_core::ActorId(0),

@@ -91,6 +91,7 @@ fn unified_diff_hunks_preserve_headers_and_disconnected_sides() {
 /// Wrap `kind` in a standalone operation envelope.
 fn op_envelope(node: u64, seq: u64, kind: OpKind) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -109,6 +110,7 @@ fn import_op(node: u64, seq: u64, meta: bool) -> Op {
     }
     let record_type = if meta { "last-prompt" } else { "user" };
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -127,6 +129,7 @@ fn import_op(node: u64, seq: u64, meta: bool) -> Op {
 /// Build a normalized message op whose parent is `parent`.
 fn message_op(node: u64, seq: u64, parent: OpId) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -151,6 +154,7 @@ fn structural_note(
     session: u64,
 ) -> Op {
     Op {
+        source: None,
         id,
         parents: ParentSet::One(parent),
         actor: ActorId(0),
@@ -314,6 +318,7 @@ fn history_window_bundles_meta_subops() {
     let turn = import_op(1, 1, false);
     let msg = message_op(1, 2, turn.id);
     let meta = Op {
+        source: None,
         parents: ParentSet::One(turn.id),
         ..import_op(1, 3, true)
     };
@@ -379,11 +384,13 @@ fn sub_op_rows_draw_pass_through_lanes() {
     let parent = message_op(5, 4, OpId::new(NodeId(5), 0, 3));
     let turn = import_op(5, 5, false);
     let turn_with_parent = Op {
+        source: None,
         parents: ParentSet::One(parent.id),
         ..turn.clone()
     };
     let msg = message_op(5, 6, turn.id); // child of turn
     let meta = Op {
+        source: None,
         parents: ParentSet::One(turn.id),
         ..import_op(5, 7, true)
     }; // bundled under turn
@@ -497,6 +504,7 @@ fn sub_op_label_preserves_folded_claude_tool_fragment() {
 fn sub_op_label_renders_tool_result_preview() {
     // A tool-result sub-op (Tool, Finish) should render a content preview.
     let op = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 0, 1)),
         id: OpId::new(NodeId(1), 0, 1),
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -792,6 +800,7 @@ fn open_canonicalizes_replays_and_quarantines_conflicts() {
     );
     let replayed = first.clone();
     let conflicting = Op {
+        source: None,
         kind: OpKind::Message(MessageOp {
             content: Payload::Inline(b"conflicting-payload".to_vec()),
             content_type: Payload::Empty,
@@ -1015,14 +1024,17 @@ fn hydrate_traverses_every_payload_bearing_field() {
     // Spot-check nested hydration: message content inline, and the blob
     // edit variant preserved (validated, never rewritten into a synthetic
     // ReplaceBytes range).
-    let message_op = ops.iter().find(|op| op.id.seq == 2).unwrap();
+    let message_op = ops
+        .iter()
+        .find(|op| matches!(&op.kind, OpKind::Message(_)))
+        .unwrap();
     let message_hydrated = matches!(
         &message_op.kind,
         OpKind::Message(MessageOp { content, .. })
             if content == &Payload::Inline(b"msg-content".to_vec())
     );
     assert!(message_hydrated, "message content not hydrated inline");
-    let blob_edit_op = ops.iter().find(|op| op.id.seq == 14).unwrap();
+    let blob_edit_op = ops.iter().find(|op| matches!(&op.kind, OpKind::File(file) if matches!(file.edit, editchain_core::FileEdit::Blob(_)))).unwrap();
     let blob_edit_preserved = matches!(
         &blob_edit_op.kind,
         OpKind::File(file_op)
@@ -2049,6 +2061,7 @@ fn find_in_history_resolves_top_level_and_folded_children_and_dedupes() {
     let turn = import_op(1, 1, false);
     let msg = message_op(1, 2, turn.id);
     let meta = Op {
+        source: None,
         parents: ParentSet::One(turn.id),
         ..import_op(1, 3, true)
     };
@@ -2091,6 +2104,7 @@ fn find_in_history_maps_bundle_members_and_subops_to_containing_parent() {
         });
     }
     let tool_child = |seq, parent| Op {
+        source: None,
         parents: ParentSet::One(parent),
         tags: Tags::AGENT | Tags::TOOL,
         ..op_envelope(
@@ -2105,6 +2119,7 @@ fn find_in_history_maps_bundle_members_and_subops_to_containing_parent() {
         )
     };
     let meta_of_b = Op {
+        source: None,
         parents: ParentSet::One(member_b.id),
         ..import_op(1, 3, true)
     };
@@ -2244,6 +2259,7 @@ fn find_in_history_excludes_nested_repository_git_hits() {
 #[test]
 fn op_identifiers_above_2_53_round_trip_exactly_through_window_details_and_find() {
     let big_op = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(OVER_2_53), 0, 42)),
         id: OpId::new(NodeId(OVER_2_53), 0, 42),
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -2273,13 +2289,19 @@ fn op_identifiers_above_2_53_round_trip_exactly_through_window_details_and_find(
         .find(|r| r.op_id.is_some())
         .expect("op row");
     assert_eq!(row.op_id.as_deref(), Some(big_op.id.to_string().as_str()));
-    assert_eq!(row.op_id.as_deref(), Some("9007199254740993:0:42"));
+    assert_eq!(
+        row.op_id.as_deref(),
+        Some("9d28e2275910b27cf80690812f140eb88de80bec720a3d01b35981a0bba1a874")
+    );
 
     // Node details resolve from the exact string and echo it back exactly.
     let details = ws
         .node_details(Some(big_op.id.to_string()), None)
         .expect("details");
-    assert_eq!(details.op_id.as_deref(), Some("9007199254740993:0:42"));
+    assert_eq!(
+        details.op_id.as_deref(),
+        Some("9d28e2275910b27cf80690812f140eb88de80bec720a3d01b35981a0bba1a874")
+    );
     assert_eq!(
         details.parents,
         big_op
@@ -2335,5 +2357,8 @@ fn op_identifiers_above_2_53_round_trip_exactly_through_window_details_and_find(
         ResponseBody::Error(_) => None,
     }
     .expect("expected Ok find response");
-    assert_eq!(value["matches"][0]["node_key"], "9007199254740993:0:42");
+    assert_eq!(
+        value["matches"][0]["node_key"],
+        "9d28e2275910b27cf80690812f140eb88de80bec720a3d01b35981a0bba1a874"
+    );
 }

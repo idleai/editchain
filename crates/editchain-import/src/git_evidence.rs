@@ -82,11 +82,14 @@ pub fn collect_commit_evidence<'a>(
                 prefixes,
             });
         }
+        let Some(source) = op.source else {
+            continue;
+        };
         for (call_id, command) in claude_shell_calls(&value) {
             claude_calls
                 .entry(ClaudeCallKey {
-                    node: op.id.node,
-                    boot: op.id.boot,
+                    node: source.node,
+                    boot: source.boot,
                     call_id,
                 })
                 .or_default()
@@ -96,8 +99,8 @@ pub fn collect_commit_evidence<'a>(
             claude_results.push(ClaudeResult {
                 source: op,
                 key: ClaudeCallKey {
-                    node: op.id.node,
-                    boot: op.id.boot,
+                    node: source.node,
+                    boot: source.boot,
                     call_id,
                 },
                 prefixes,
@@ -497,7 +500,7 @@ pub fn claude_start_evidence(op: &Op, raw: &[u8]) -> Option<ClaudeStartEvidence>
         return None;
     }
     Some(ClaudeStartEvidence {
-        source_seq: op.id.seq,
+        source_seq: op.source?.seq,
         session,
         cwd: PathBuf::from(cwd),
         branch: branch.to_owned(),

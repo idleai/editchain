@@ -447,7 +447,7 @@ impl HistoryNode {
                 let has_provider_parent =
                     has_exact_provider_parent(op.id, anchored_notes.map(Vec::as_slice));
                 if !has_provider_parent {
-                    for parent in &op.parents {
+                    for parent in op.parent_ids() {
                         let key = NodeKey::Op(*parent);
                         if seen.insert(key) {
                             keys.push(key);
@@ -627,6 +627,7 @@ impl HistoryNode {
         use editchain_core::OpKind;
         match self {
             Self::EditOperation { op, .. } => match &op.kind {
+                OpKind::Activity(record) => format!("{:?}", record.kind.name()).to_lowercase(),
                 OpKind::ChainStart(_) => "chainstart".to_string(),
                 OpKind::Session(_) => "session".to_string(),
                 OpKind::Actor(_) => "actor".to_string(),

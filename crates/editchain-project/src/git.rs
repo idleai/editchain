@@ -2,7 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use editchain_core::{GitCommitEntity, GitLink, GitOid, Op, OpId, OpKind, RepositoryId};
+use editchain_core::activity::{Entity, Kind};
+use editchain_core::{
+    GitCommitEntity, GitLink, GitLinkKind, GitOid, Op, OpId, OpKind, RepositoryId,
+};
 
 /// Git observations and explicit links for an ordered history projection.
 ///
@@ -29,18 +32,61 @@ impl GitProjection {
 
     /// Reduce a single operation into this projection.
     ///
-    /// Handles `OpKind::GitCommit` and `OpKind::GitLink`; all other kinds are
-    /// ignored. A later commit with the same `(RepositoryId, GitOid)` replaces
+    /// Handles legacy Git records and schema-three commits and Git links.
+    /// A later commit with the same `(RepositoryId, GitOid)` replaces
     /// an earlier one (last-writer-wins by iteration order).
     pub fn reduce(&mut self, op: &Op) {
         if let OpKind::GitCommit(commit) = &op.kind {
             self.observe_commit((**commit).clone());
-        } else if let OpKind::GitLink(link) = &op.kind {
-            self.links
-                .entry(link.source)
-                .or_default()
-                .push(link.clone());
+        } else if let OpKind::Activity(record) = &op.kind {
+            if let Kind::Commit(commit) = &record.kind {
+                self.observe_commit((**commit).clone());
+            }
         }
+        for link in Self::operation_links(op) {
+            self.links.entry(link.source).or_default().push(link);
+        }
+    }
+
+    /// Decode explicit Git links in either operation schema, retaining all targets.
+    #[must_use]
+    pub fn operation_links(op: &Op) -> Vec<GitLink> {
+        if let OpKind::GitLink(link) = &op.kind {
+            return vec![link.clone()];
+        }
+        let OpKind::Activity(record) = &op.kind else {
+            return Vec::new();
+        };
+        let Kind::Link(link) = &record.kind else {
+            return Vec::new();
+        };
+        let Entity::Operation(source) = link.from else {
+            return Vec::new();
+        };
+        let kind = match link.relation.as_str() {
+            "based_on" => GitLinkKind::BasedOn,
+            "checkpoint" => GitLinkKind::Checkpoint,
+            "committed_as" => GitLinkKind::CommittedAs,
+            "produced_by" => GitLinkKind::ProducedBy,
+            "mentions" => GitLinkKind::Mentions,
+            "custom" => GitLinkKind::Custom(link.content.clone()),
+            _ => return Vec::new(),
+        };
+        link.to
+            .iter()
+            .filter_map(|target| {
+                if let Entity::Git { repository, oid } = target {
+                    Some(GitLink {
+                        source,
+                        target_repo: *repository,
+                        target_oid: *oid,
+                        kind: kind.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Replace one commit observation, preserving the supplied repository key.

@@ -55,11 +55,19 @@ fn assert_generation(ops: &[Op], generation: u32) {
         {
             assert_eq!(op.parents.iter().count(), 1, "evidence has one source");
             assert!(
-                op.parents.iter().all(|source| source.boot == generation),
+                editchain_engine::imports::decode_evidence(op).is_some_and(|record| record
+                    .payload
+                    .source
+                    .boot
+                    == generation),
                 "evidence must reference the captured generation"
             );
         } else {
-            assert_eq!(op.id.boot, generation, "physical generation must match");
+            assert_eq!(
+                op.source.unwrap().boot,
+                generation,
+                "physical generation must match"
+            );
         }
     }
 }
@@ -704,7 +712,8 @@ fn batch_limit_failure_discards_completed_files_and_retry_preserves_bytes() {
     assert_eq!(retry.operations().len(), 12);
     assert_eq!(retry.report().duplicates, 1);
     let mut extra = extra;
-    extra.id.seq = u64::MAX;
+    extra.source.as_mut().unwrap().seq = u64::MAX;
+    extra.id = extra.source.unwrap().id();
     assert!(retry.extend_operations([extra]).is_err());
     assert!(!base.has_pending());
     assert!(base.get_cursor(&first_key).unwrap().is_none());
@@ -788,8 +797,8 @@ fn both_checkpoint_crash_windows_preserve_generation_identity() {
     let third = capture(&mut recovered);
     assert!(third
         .iter()
-        .filter(|op| op.id.seq == 1 << 16)
-        .all(|op| op.id.boot == 2));
+        .filter(|op| op.source.unwrap().seq == 1 << 16)
+        .all(|op| op.source.unwrap().boot == 2));
     assert!(third
         .iter()
         .all(|new| proposed.iter().all(|old| old.id != new.id)));

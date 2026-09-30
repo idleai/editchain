@@ -26,8 +26,65 @@ mod cli_streams;
 #[path = "bulk.rs"]
 mod bulk;
 
+#[path = "scan.rs"]
+mod scan;
+
+#[test]
+fn json_content_decodes_utf8_and_accepts_legacy_arrays_without_changing_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let chain = temp.path().join("chain");
+    let _init = run(&chain, &["init"], b"", 0);
+    for (index, bytes) in ["é🦀\n".as_bytes(), b"\xff\x00"].into_iter().enumerate() {
+        let sequence = u64::try_from(index).unwrap().saturating_add(1);
+        let operation = message(sequence, Payload::Inline(bytes.to_vec()));
+        let mut input = serde_json::to_value(&operation).unwrap();
+        *input.pointer_mut("/kind/Message/content/Inline").unwrap() = json!(bytes);
+        let _append = run(&chain, &["append"], &serde_json::to_vec(&input).unwrap(), 0);
+        let expected = std::str::from_utf8(bytes).map_or_else(|_| json!(bytes), |text| json!(text));
+        let id = operation.id.to_string();
+        let found = result(&chain, &["operation", &id], b"", 0);
+        assert_eq!(
+            found.pointer("/Found/operation/kind/Message/content/Inline"),
+            Some(&expected)
+        );
+        let content = result(
+            &chain,
+            &["content", &id, "--field", "MessageContent"],
+            b"",
+            0,
+        );
+        assert_eq!(content.pointer("/Found/value/Available"), Some(&expected));
+        let blob: BlobRef =
+            serde_json::from_value(result(&chain, &["store-blob"], bytes, 0)).unwrap();
+        let blob_id = serde_json::to_string(&blob.id).unwrap();
+        assert_eq!(
+            result(&chain, &["blob", &blob_id], b"", 0).get("bytes"),
+            Some(&expected)
+        );
+        assert_eq!(
+            run(
+                &chain,
+                &["content", &id, "--field", "MessageContent", "--raw"],
+                b"",
+                0
+            )
+            .stdout,
+            bytes
+        );
+        assert_eq!(
+            Engine::open(&chain)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .get(operation.id),
+            Some(&operation)
+        );
+    }
+}
+
 fn message(sequence: u64, content: Payload) -> Op {
     Op {
+        source: Some(editchain_engine::SourceId::new(NodeId(7), 0, sequence)),
         id: OpId::new(NodeId(7), 0, sequence),
         parents: ParentSet::None,
         actor: ActorId(9),
@@ -98,6 +155,7 @@ fn package_help_and_exit_contracts() {
         "import",
         "import-state",
         "export",
+        "scan",
         "meta",
         "annotations",
         "reflections",
@@ -215,6 +273,7 @@ fn annotations_reflections_and_queries_use_recorded_facts() {
         &message(1, Payload::Inline(b"hello evidence".to_vec())),
     );
     let note = Op {
+        source: None,
         kind: OpKind::Note(NoteOp {
             target_ids: vec![OpId::new(NodeId(7), 0, 1)],
             relationship: NoteRelationship::Explains,
@@ -229,6 +288,7 @@ fn annotations_reflections_and_queries_use_recorded_facts() {
         0,
     );
     let reflection = Op {
+        source: None,
         kind: OpKind::Reflection(ReflectionOp {
             scope: ScopeRef::None,
             covers: FrontierSet(vec![]),
@@ -303,6 +363,7 @@ fn annotations_reflections_and_queries_use_recorded_facts() {
     let base = engine.store_blob(b"before").unwrap();
     let after = engine.store_blob(b"after").unwrap();
     let file = Op {
+        source: None,
         kind: OpKind::File(FileOp {
             path: PathId(1),
             stage: FileStage::Applied,
@@ -551,6 +612,7 @@ fn initialization_git_evidence_and_corrupt_index_rebuild() {
     let temp = tempfile::tempdir().unwrap();
     let chain = temp.path().join("chain");
     let start = Op {
+        source: None,
         scope: ScopeRef::Chain(ChainId(42)),
         kind: OpKind::ChainStart(ChainStart {
             name: b"chain".to_vec(),
@@ -566,6 +628,7 @@ fn initialization_git_evidence_and_corrupt_index_rebuild() {
     );
     let oid = GitOid::from_hex("0123456789abcdef0123456789abcdef01234567").unwrap();
     let link = Op {
+        source: None,
         kind: OpKind::GitLink(GitLink {
             source: start.id,
             target_repo: RepositoryId(5),
@@ -582,7 +645,7 @@ fn initialization_git_evidence_and_corrupt_index_rebuild() {
     let relations = result(&chain, &["relationships", "--entity", &entity], b"", 0);
     assert_eq!(relations.get("items").unwrap().as_array().unwrap().len(), 1);
     let before = result(&chain, &["history"], b"", 0);
-    std::fs::write(chain.join("index-v1/root"), b"damaged checkpoint").unwrap();
+    std::fs::write(chain.join("index-v3/root"), b"damaged checkpoint").unwrap();
     let failed = run(&chain, &["integrity"], b"", 4);
     assert!(
         !failed.status.success(),
@@ -710,6 +773,7 @@ fn shared_codex_import_uses_the_recorded_exporter_contract() {
     std::fs::write(&helper, "cat \"$1\"\n").unwrap();
     let args = [
         "import",
+        "--legacy",
         "--provider",
         "codex",
         "--input",

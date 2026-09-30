@@ -5,8 +5,8 @@ use editchain_core::provider::{
     ProviderFact,
 };
 use editchain_core::{
-    ActorId, Clock, ImportOp, NoteOp, NoteRelationship, Op, OpId, OpKind, ParentSet, Payload,
-    ScopeRef, Tags,
+    ActorId, Clock, ImportOp, NoteOp, NoteRelationship, Op, OpKind, ParentSet, Payload, ScopeRef,
+    SourceId, Tags,
 };
 
 use super::content::{normalize_content, Contract};
@@ -22,7 +22,7 @@ pub(crate) const CONTRACT: &str = "claude-blocks-v1";
 pub(crate) fn raw_record(
     envelope: Option<&CcEnvelope>,
     line: &LineWithHash,
-    source: OpId,
+    source: SourceId,
     fallback_session: &str,
     blobs: &mut dyn BlobSink,
 ) -> Result<Op, ImportError> {
@@ -48,6 +48,7 @@ pub(crate) fn raw_record(
         // representation under their physical IDs; source and sink bounds
         // still reject oversized records without accepting a checkpoint.
         Op {
+            source: Some(stream.source_position(SourcePosition::raw(ordinal))?),
             id: stream.op_from_position(SourcePosition::raw(ordinal))?,
             parents: ParentSet::None,
             actor: ActorId(0),
@@ -81,16 +82,20 @@ pub(crate) fn record_outputs(
     };
     let evidence = ProviderEvidence {
         schema: ProviderEvidenceSchema::V1,
-        source: raw.id,
+        source: crate::ids::provenance(raw)?,
         raw_hash,
         fact: ProviderFact::ClaudeDerivation(ClaudeDerivationEvidence {
             contract: ClaudeDerivationContract::BlocksV1,
             includes_thinking: include_thinking,
-            outputs: ops.iter().map(|op| op.id).collect(),
+            outputs: crate::ids::output_sources(&ops)?,
         }),
     };
     let content = serde_json::to_string(&evidence)?;
     ops.push(Op {
+        source: Some(crate::ids::derive_external_entity_source(
+            "claude:provider-evidence:v1",
+            &content,
+        )),
         id: derive_external_entity_id("claude:provider-evidence:v1", &content),
         parents: ParentSet::One(raw.id),
         actor: ActorId(0),

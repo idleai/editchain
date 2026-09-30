@@ -1,9 +1,11 @@
 //! Git identity, commit, and explicit-link tests.
 
 // Referenced by library derive macros; suppress unused-crate-dependencies lint.
+use blake3 as _;
 use postcard as _;
 use proptest as _;
 use serde as _;
+use serde_json as _;
 
 use editchain_core::{
     ActorId, Clock, GitAvailability, GitCommitEntity, GitLink, GitLinkKind, GitObjectFormat,
@@ -119,6 +121,7 @@ fn git_commit_op_round_trips() {
     };
 
     let op = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(2), 0, 10)),
         id: OpId::new(NodeId(2), 0, 10),
         parents: ParentSet::None,
         actor: ActorId(3),
@@ -154,6 +157,7 @@ fn git_link_op_round_trips() {
     };
 
     let op = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(2), 0, 11)),
         id: OpId::new(NodeId(2), 0, 11),
         parents: ParentSet::None,
         actor: ActorId(3),

@@ -89,7 +89,8 @@ impl ChainQueries {
     /// Returns `InvalidInput` for accepted non-file operations, or storage/index errors.
     pub fn diff(&self, revision: OpId) -> io::Result<Lookup<RevisionDiff>> {
         self.operation(revision)?.try_map(|record| {
-            if !matches!(record.operation.kind, OpKind::File(_)) {
+            let is_file = matches!(record.operation.kind, OpKind::File(_)) || matches!(&record.operation.kind, OpKind::Activity(value) if matches!(value.kind, editchain_core::activity::Kind::File(_)));
+            if !is_file {
                 return Err(crate::invalid_input(
                     "diff requires a recorded file revision",
                 ));

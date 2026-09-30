@@ -58,9 +58,7 @@ impl LiveProjection {
             if decode_evidence(child).is_some() {
                 return false;
             }
-            if import.raw_hash.is_some()
-                && (!legacy_lane(source, child) || child.scope != raw.scope)
-            {
+            if import.raw_hash.is_some() && (!legacy_lane(raw, child) || child.scope != raw.scope) {
                 return false;
             }
             normalized = true;
@@ -69,12 +67,15 @@ impl LiveProjection {
     }
 }
 
-fn legacy_lane(source: OpId, child: &Op) -> bool {
-    matches!(child.parents, editchain_core::ParentSet::One(parent) if parent == source)
-        && child.id.node == source.node
-        && child.id.boot == source.boot
+fn legacy_lane(raw: &Op, child: &Op) -> bool {
+    let (Some(source), Some(origin)) = (raw.source, child.source) else {
+        return false;
+    };
+    matches!(child.parents, editchain_core::ParentSet::One(parent) if parent == source.id())
+        && origin.node == source.node
+        && origin.boot == source.boot
         && source.seq > 0
         && source.seq.trailing_zeros() >= 16
-        && child.id.seq > source.seq
-        && child.id.seq & !0xffff == source.seq
+        && origin.seq > source.seq
+        && origin.seq & !0xffff == source.seq
 }

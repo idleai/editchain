@@ -43,6 +43,22 @@ use editchain_import::source_time::parse_source_time;
 
 use common::*;
 
+fn occurrence_source(op: &editchain_core::Op) -> editchain_core::SourceId {
+    if is_provider_evidence(op) {
+        let OpKind::Note(note) = &op.kind else {
+            panic!("expected inline provider evidence")
+        };
+        let Payload::Inline(bytes) = &note.content else {
+            panic!("expected inline provider evidence")
+        };
+        serde_json::from_slice::<editchain_core::provider::ProviderEvidence>(bytes)
+            .unwrap()
+            .source
+    } else {
+        op.source.unwrap()
+    }
+}
+
 fn helper_in(dir: &tempfile::TempDir, awk: &str) -> HelperCommand {
     let script = write_fake_helper(dir.path(), "fake-helper.sh", awk);
     sh_helper(&script, &[])
@@ -80,16 +96,18 @@ fn assert_occurrence_anchor(op: &editchain_core::Op, stream: &SourceStream, ordi
         "revision references its witnessing raw occurrence"
     );
     assert_eq!(
-        op.id.seq >> 16,
+        op.source.unwrap().seq >> 16,
         ordinal,
         "revision keeps the physical ordinal"
     );
     assert_eq!(
-        op.id.boot, stream.boot,
+        op.source.unwrap().boot,
+        stream.boot,
         "revision keeps the physical generation"
     );
     assert_ne!(
-        op.id.node, stream.node,
+        op.source.unwrap().node,
+        stream.node,
         "new revisions cannot reuse legacy numeric lanes"
     );
 }
@@ -262,7 +280,13 @@ fn occurrence_revisions_and_logical_removals_are_independent_of_append_boundarie
     let item = expected_view.codex_logical_items().first().unwrap();
     assert_eq!(expected_view.codex_logical_items().len(), 1);
     assert_eq!(
-        item.incarnation.seq,
+        expected
+            .iter()
+            .find(|op| op.id == item.incarnation)
+            .unwrap()
+            .source
+            .unwrap()
+            .seq,
         5 << 16,
         "reusing an item after removal starts a new incarnation"
     );
@@ -407,9 +431,9 @@ fn shared_session_suffix_shows_verified_revisions_without_its_private_prefix() {
     let mut first_key = None;
     let source_ordinal = |op: &editchain_core::Op| {
         if is_provider_evidence(op) {
-            op.parents.iter().next().unwrap().seq >> 16
+            occurrence_source(op).seq >> 16
         } else {
-            op.id.seq >> 16
+            op.source.unwrap().seq >> 16
         }
     };
     // The source's first occurrence was retained before the sharing cutoff.
@@ -445,7 +469,7 @@ fn shared_session_suffix_shows_verified_revisions_without_its_private_prefix() {
         } else {
             assert_ne!(Some(&item.key), first_key.as_ref(), "new incarnation");
         }
-        assert_eq!(item.anchor.seq >> 16, ordinal);
+        assert_eq!(live.provenance(item.anchor).unwrap().seq >> 16, ordinal);
         assert_eq!(live.item_owners(item.anchor), vec![item.key.clone()]);
     }
     let before: Vec<_> = visible.keys().cloned().collect();
@@ -484,14 +508,7 @@ fn shared_session_items_still_require_complete_unambiguous_occurrence_proofs() {
     let ops = canonical_revisions(&imported.ops.ops);
     let suffix: Vec<_> = ops
         .into_iter()
-        .filter(|op| {
-            let id = if is_provider_evidence(op) {
-                *op.parents.iter().next().unwrap()
-            } else {
-                op.id
-            };
-            id.seq >> 16 == 5
-        })
+        .filter(|op| occurrence_source(op).seq >> 16 == 5)
         .collect();
     let message = suffix
         .iter()
@@ -526,7 +543,8 @@ fn shared_session_items_still_require_complete_unambiguous_occurrence_proofs() {
         .unwrap()
         .clone();
 
-    conflict.id.node = editchain_core::NodeId(991);
+    conflict.source.as_mut().unwrap().node = editchain_core::NodeId(991);
+    conflict.id = conflict.source.unwrap().id();
     let OpKind::Note(note) = &mut conflict.kind else {
         panic!("evidence fixture");
     };
@@ -768,11 +786,11 @@ fn bounded_evidence_previews_do_not_break_user_echo_identity() {
 
 fn legacy_user_derivation(ops: &[editchain_core::Op]) -> Vec<editchain_core::Op> {
     use editchain_core::provider::{CodexDerivationContract, CodexLogicalChange, ProviderEvidence};
-    let shifted = |mut id: editchain_core::OpId| {
+    let shifted = |mut id: editchain_core::SourceId| {
         id.node.0 ^= 1 << 63;
         id
     };
-    let mut outputs = std::collections::HashSet::new();
+    let mut outputs = std::collections::HashMap::new();
     let mut legacy = ops.to_vec();
     for op in &mut legacy {
         let OpKind::Note(note) = &mut op.kind else {
@@ -789,7 +807,7 @@ fn legacy_user_derivation(ops: &[editchain_core::Op]) -> Vec<editchain_core::Op>
         };
         meta.contract = CodexDerivationContract::OccurrencesV1;
         for output in &mut meta.outputs {
-            let _: bool = outputs.insert(*output);
+            let _: Option<editchain_core::SourceId> = outputs.insert(output.id(), shifted(*output));
             *output = shifted(*output);
         }
         for change in &mut meta.changes {
@@ -808,14 +826,17 @@ fn legacy_user_derivation(ops: &[editchain_core::Op]) -> Vec<editchain_core::Op>
             }
         }
         *bytes = serde_json::to_vec(&evidence).unwrap();
-        op.id = shifted(op.id);
+        let source = shifted(op.source.unwrap());
+        op.source = Some(source);
+        op.id = source.id();
     }
     for op in &mut legacy {
-        if outputs.contains(&op.id) {
-            op.id = shifted(op.id);
+        if let Some(source) = outputs.get(&op.id).copied() {
+            op.source = Some(source);
+            op.id = source.id();
             if let ParentSet::One(parent) = &mut op.parents {
-                if outputs.contains(parent) {
-                    *parent = shifted(*parent);
+                if let Some(source) = outputs.get(parent) {
+                    *parent = source.id();
                 }
             }
         }
@@ -979,11 +1000,19 @@ fn occurrence_materialization_replaces_legacy_content_and_rejects_incomplete_rev
         .find(|op| matches!(op.kind, OpKind::Message(_)))
         .unwrap()
         .clone();
-    let source = *legacy.parents.iter().next().unwrap();
-    legacy.id = editchain_core::OpId {
+    let parent = *legacy.parents.iter().next().unwrap();
+    let source = ops
+        .iter()
+        .find(|op| op.id == parent)
+        .unwrap()
+        .source
+        .unwrap();
+    let legacy_source = editchain_core::SourceId {
         seq: source.seq | 1,
         ..source
     };
+    legacy.source = Some(legacy_source);
+    legacy.id = legacy_source.id();
     if let OpKind::Message(message) = &mut legacy.kind {
         message.content = Payload::Inline(b"stale legacy fold".to_vec());
     }
@@ -1000,7 +1029,7 @@ fn occurrence_materialization_replaces_legacy_content_and_rejects_incomplete_rev
     let latest = view.codex_logical_items().first().unwrap().outputs[0];
     let missing_header: Vec<_> = ops
         .iter()
-        .filter(|op| !(matches!(op.kind, OpKind::Import(_)) && op.id.seq == 1 << 16))
+        .filter(|op| !(matches!(op.kind, OpKind::Import(_)) && op.source.unwrap().seq == 1 << 16))
         .cloned()
         .collect();
     assert!(
@@ -1561,7 +1590,7 @@ fn legacy_cursor_migrates_once_and_survives_sessions_root_relocation() {
         .op_from_position(SourcePosition::raw(2))
         .unwrap();
     assert_eq!(appended.ops.ops[0].parents, ParentSet::One(expected_parent));
-    assert_eq!(appended.ops.ops[0].id.node, legacy_stream.node);
+    assert_eq!(appended.ops.ops[0].source.unwrap().node, legacy_stream.node);
 }
 
 #[test]
@@ -1925,7 +1954,18 @@ fn repeated_upserts_preserve_revisions_and_fold_current_logical_items() {
     let latest: Vec<_> = view
         .codex_logical_items()
         .iter()
-        .map(|item| item.source.seq >> 16)
+        .map(|item| {
+            harness
+                .ops
+                .ops
+                .iter()
+                .find(|op| op.id == item.source)
+                .unwrap()
+                .source
+                .unwrap()
+                .seq
+                >> 16
+        })
         .collect();
     assert_eq!(latest, [3, 6]);
     // A live reader must identify the same logical message across different
@@ -3358,16 +3398,16 @@ fn current_collab_spawn_links_exact_child_and_reconnects_to() {
     assert!(facts.iter().any(|(op, evidence)| matches!(&evidence.fact,
         ProviderFact::CodexLifecycle(meta)
             if matches!(&meta.event, CodexLifecycleEvent::Spawn { activation: id, signal: CodexSpawnSignal::CollabTool, child, .. }
-                if *id == activation && child.0 == "sub-1")
+                if id.id() == activation && child.0 == "sub-1")
                 && op.scope == ScopeRef::Session(derive_session_id("parent-1")))));
     assert!(facts.iter().any(|(op, evidence)| matches!(&evidence.fact,
         ProviderFact::CodexLifecycle(meta)
             if matches!(&meta.event, CodexLifecycleEvent::Completed { child } if child.0 == "sub-1")
-                && evidence.source == completion
+                && evidence.source.id() == completion
                 && op.scope == ScopeRef::Session(derive_session_id("parent-1")))));
     assert!(facts.iter().any(|(op, evidence)| matches!(&evidence.fact,
         ProviderFact::CodexSource(meta)
-            if meta.first == first && meta.thread.0 == "sub-1"
+            if meta.first.id() == first && meta.thread.0 == "sub-1"
                 && meta.forked_from.as_ref().is_some_and(|thread| thread.0 == "parent-1")
                 && op.scope == ScopeRef::Session(derive_session_id("sub-1")))));
     assert!(relationship_edges(&projection, NoteRelationship::ForkOf).is_empty());
@@ -3440,7 +3480,7 @@ fn fork_metadata_emits_exact_execution_fact_without_clock_boundary() {
         })
         .expect("branch source evidence");
     assert!(matches!(&evidence.fact, ProviderFact::CodexSource(meta)
-        if meta.first == first && meta.last == last
+        if meta.first.id() == first && meta.last.id() == last
             && meta.forked_from.as_ref().is_some_and(|thread| thread.0 == "trunk-1")));
     assert_eq!(op.parents, ParentSet::One(last));
     assert_eq!(op.scope, ScopeRef::Session(derive_session_id("branch-1")));
@@ -3572,7 +3612,7 @@ fn legacy_list_agents_completion_links_via_started_marker_agent_path() {
     );
     assert!(provider_facts(&harness.ops.ops).iter().any(|(_, evidence)| matches!(&evidence.fact,
         ProviderFact::CodexLifecycle(meta)
-            if evidence.source == completion
+            if evidence.source.id() == completion
                 && matches!(&meta.event, CodexLifecycleEvent::LegacyCompleted { agent_path } if agent_path == "/root/sub"))));
 }
 
@@ -3906,9 +3946,9 @@ fn rewritten_rollout_reimports_at_new_generation_and_is_idempotent() {
     assert!(
         first.ops.ops.iter().all(|op| {
             if is_provider_evidence(op) {
-                op.parents.iter().all(|source| source.boot == 0)
+                occurrence_source(op).boot == 0
             } else {
-                op.id.boot == 0
+                op.source.unwrap().boot == 0
             }
         }),
         "original import uses generation 0"
@@ -3932,15 +3972,18 @@ fn rewritten_rollout_reimports_at_new_generation_and_is_idempotent() {
     assert!(
         second.ops.ops.iter().all(|op| {
             if is_provider_evidence(op) {
-                op.parents.iter().all(|source| source.boot == 1)
+                occurrence_source(op).boot == 1
             } else {
-                op.id.boot == 1
+                op.source.unwrap().boot == 1
             }
         }),
         "rewritten file re-imports under a new deterministic boot generation"
     );
     // New generation op ids never collide with the old generation's ids.
-    assert_ne!(second.ops.ops[0].id.boot, first.ops.ops[0].id.boot);
+    assert_ne!(
+        second.ops.ops[0].source.unwrap().boot,
+        first.ops.ops[0].source.unwrap().boot
+    );
 
     // Deterministic ids: the new generation's op ids are a pure function of
     // the path, the persisted generation counter, and the file content, so a
@@ -4016,18 +4059,20 @@ fn rewritten_rollout_does_not_block_unrelated_rollouts() {
         .ops
         .ops
         .iter()
-        .filter(|op| op.id.node.0 == source_stream(dir.path(), &rewrite_path, 1).node.0)
+        .filter(|op| {
+            op.source.unwrap().node.0 == source_stream(dir.path(), &rewrite_path, 1).node.0
+        })
         .collect();
     assert!(!rewritten.is_empty());
-    assert!(rewritten.iter().all(|op| op.id.boot == 1));
+    assert!(rewritten.iter().all(|op| op.source.unwrap().boot == 1));
     let appended: Vec<_> = second
         .ops
         .ops
         .iter()
-        .filter(|op| op.id.node.0 == source_stream(dir.path(), &append_path, 0).node.0)
+        .filter(|op| op.source.unwrap().node.0 == source_stream(dir.path(), &append_path, 0).node.0)
         .collect();
     assert!(!appended.is_empty());
-    assert!(appended.iter().all(|op| op.id.boot == 0));
+    assert!(appended.iter().all(|op| op.source.unwrap().boot == 0));
 }
 
 #[test]
@@ -4055,7 +4100,7 @@ fn append_after_rewrite_continues_the_new_generation_chain() {
     let rewritten =
         import_with_options_into(dir.path(), &helper, &ImportOptions::default(), &mut cursors);
     assert_eq!(rewritten.report.raw_ops, 1);
-    assert_eq!(rewritten.ops.ops[0].id.boot, 1);
+    assert_eq!(rewritten.ops.ops[0].source.unwrap().boot, 1);
 
     let mut file = std::fs::OpenOptions::new()
         .append(true)
@@ -4071,7 +4116,7 @@ fn append_after_rewrite_continues_the_new_generation_chain() {
     // The append continues the boot-1 stream: same node, same boot, next seq.
     let stream = source_stream(dir.path(), &path, 1);
     let expected_prev = stream.op_from_position(SourcePosition::raw(1)).unwrap();
-    assert_eq!(appended.ops.ops[0].id.boot, 1);
+    assert_eq!(appended.ops.ops[0].source.unwrap().boot, 1);
     assert_eq!(appended.ops.ops[0].parents, ParentSet::One(expected_prev));
 
     // Idempotent afterwards.
@@ -4122,7 +4167,7 @@ fn helper_projects_captured_bytes_when_the_original_is_rewritten_during_executio
         .ops
         .ops
         .iter()
-        .find(|op| op.id.seq == 1 << 16)
+        .find(|op| op.source.unwrap().seq == 1 << 16)
         .unwrap();
     assert_eq!(raw_bytes(raw, &first.blobs), ln(&before));
     let key = source_key(dir.path(), &path);
@@ -4326,6 +4371,7 @@ fn legacy_lifecycle_notes(root: &Path) -> Vec<editchain_core::Op> {
         (6002, parent.op_from_position(SourcePosition::raw(3)).unwrap(),
             child.op_from_position(SourcePosition::raw(2)).unwrap(), NoteRelationship::ReconnectsTo, "parent"),
     ].into_iter().map(|(node, anchor, target, relationship, thread)| editchain_core::Op {
+        source: Some(editchain_core::SourceId::new(editchain_core::NodeId(node), 0, 1)),
         id: editchain_core::OpId::new(editchain_core::NodeId(node), 0, 1),
         parents: ParentSet::One(anchor),
         actor: editchain_core::ActorId(0),
@@ -4645,14 +4691,7 @@ fn post_cutoff_revision_of_an_existing_item_is_visible() {
     );
     let post_cutoff: Vec<_> = ops
         .into_iter()
-        .filter(|op| {
-            let source = if is_provider_evidence(op) {
-                *op.parents.iter().next().unwrap()
-            } else {
-                op.id
-            };
-            source.seq >> 16 == 3
-        })
+        .filter(|op| occurrence_source(op).seq >> 16 == 3)
         .collect();
     assert_eq!(
         post_cutoff

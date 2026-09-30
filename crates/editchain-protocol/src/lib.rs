@@ -208,10 +208,9 @@ pub struct GetNodeDetailsRequest {
     /// Snapshot that advertised this operation identity.
     #[serde(default)]
     pub snapshot_id: SnapshotId,
-    /// The operation ID to inspect, in display form `"node:boot:seq"`.
+    /// The operation ID to inspect, as a full 64-digit hexadecimal string.
     ///
-    /// Stored as a string so it round-trips through JavaScript without precision
-    /// loss on u64 node values that exceed 2^53.
+    /// Full strings preserve the canonical identity across JSON and JavaScript.
     pub op_id: String,
 }
 
@@ -410,7 +409,7 @@ pub struct FileDiffDto {
 ///
 /// - `repository` is an exact decimal `RepositoryId` string;
 /// - `oid`, `tree`, and `parents` are lowercase hex `GitOid` strings;
-/// - `imported_record` is the `"node:boot:seq"` display form, when present;
+/// - `imported_record` is a full 64-digit hexadecimal string, when present;
 /// - `changed_paths` are exact decimal `PathId` strings.
 ///
 /// Safe enums (`object_format`, `availability`), timestamps, signatures, and
@@ -424,7 +423,7 @@ pub struct ResolvedObject {
     /// Full commit OID as lowercase hex.
     pub oid: String,
     /// `EditChain` operation that imported this commit, if any, in display
-    /// form `"node:boot:seq"`.
+    /// form as a full 64-digit hexadecimal string.
     pub imported_record: Option<String>,
     /// Availability of the underlying object data.
     pub availability: GitAvailability,
@@ -457,7 +456,7 @@ pub struct ResolvedObject {
     reason = "flat versioned wire DTO: each boolean is an independent backward-compatible serde-defaulted flag the viewer toggles (group boundary/submodule/system/subop/promoted); refactoring to enums would churn the wire contract"
 )]
 pub struct HistoryRow {
-    /// The operation ID (for `EditChain` ops) in display form `"node:boot:seq"`,
+    /// The operation ID (for `EditChain` ops) in display form a full 64-digit hexadecimal string,
     /// or `None` for git commits. Stored as a string to avoid JS precision loss.
     pub op_id: Option<String>,
     /// The git commit OID (for git commits) as lowercase hex — a string so it
@@ -815,7 +814,7 @@ pub enum ParentRelationKind {
 /// reveals them on click, like git-graph commit detail expansion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubOpSummary {
-    /// The operation ID (display form `"node:boot:seq"`).
+    /// The operation ID (display form a full 64-digit hexadecimal string).
     pub op_id: String,
     /// Display summary (e.g. the record type or a short label).
     #[serde(default)]
@@ -875,7 +874,7 @@ pub struct ExpansionSpanDto {
 /// Details for a single history node (for the inspector).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeDetails {
-    /// The operation ID (display form `"node:boot:seq"`), if this is an
+    /// The operation ID (display form a full 64-digit hexadecimal string), if this is an
     /// `EditChain` op. Stored as a string to avoid JS precision loss.
     pub op_id: Option<String>,
     /// The git commit OID (for git commits) as lowercase hex — a string so it
@@ -888,7 +887,7 @@ pub struct NodeDetails {
     pub summary: String,
     /// Full payload text (message/content), if available.
     pub body: String,
-    /// Parent operation IDs (for `EditChain` ops) as exact `"node:boot:seq"`
+    /// Parent operation IDs (for `EditChain` ops) as exact a full 64-digit hexadecimal string
     /// strings.
     pub parents: Vec<String>,
     /// Parent commit OIDs (for git commits) as lowercase hex strings.
@@ -911,7 +910,7 @@ pub struct NodeDetails {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindInHistoryMatch {
     /// The stable real node key of the visible top-level row that renders this
-    /// hit (`"node:boot:seq"` for `EditChain`, `"git:<repository>:<oid>"` for Git).
+    /// hit (a full canonical ID for `EditChain`, `"git:<repository>:<oid>"` for Git).
     pub node_key: String,
     /// Absolute expanded-history parent-row offset (0 = newest) of the
     /// containing top-level row, compatible with `GetWindow` offsets and
@@ -1058,13 +1057,19 @@ mod tests {
             file_change: None,
         };
         let json = serde_json::to_value(&row).expect("serialize");
-        assert_eq!(json["op_id"], "9007199254740993:7:42");
+        assert_eq!(
+            json["op_id"],
+            "4e2c7154cbab189ed24f4015d92e60e033c18246c965b028602ed812552b5ded"
+        );
         assert_eq!(json["git_oid"], big_oid_hex());
         assert_eq!(json["repository"], "9007199254740993");
-        assert_eq!(json["parents"][0], "9007199254740993:7:42");
+        assert_eq!(
+            json["parents"][0],
+            "4e2c7154cbab189ed24f4015d92e60e033c18246c965b028602ed812552b5ded"
+        );
         assert_eq!(
             json["parent_relations"][0]["parent"],
-            "9007199254740993:7:42"
+            "4e2c7154cbab189ed24f4015d92e60e033c18246c965b028602ed812552b5ded"
         );
         assert_eq!(json["parent_relations"][0]["kind"], "subagent");
         assert_eq!(json["timestamp_ms"], 1_700_000_000_000u64);
@@ -1104,8 +1109,8 @@ mod tests {
             "summary": "row",
             "timestamp_ms": 0,
             "group": "session:1",
-            "node_key": "1:0:1",
-            "parents": ["1:0:0"],
+            "node_key": "93899d1d2c80d5e61ae6992d9d794e2051331e167b76674ab7ec28478559d638",
+            "parents": ["b59343bdcf39b2537b542f5b9fe0d6be67351afa10892a392e5863fa0c25e74c"],
             "is_submodule": false,
         }))
         .expect("sparse HistoryRow without parent_relations");
@@ -1136,7 +1141,7 @@ mod tests {
         // Unknown variant (and re-serialize as a string), so a newer service
         // never breaks an older viewer.
         let unknown: ParentRelationDto = serde_json::from_value(serde_json::json!({
-            "parent": "1:0:1",
+            "parent": "93899d1d2c80d5e61ae6992d9d794e2051331e167b76674ab7ec28478559d638",
             "kind": "supercedes",
         }))
         .expect("unknown kind tolerated");
@@ -1148,7 +1153,7 @@ mod tests {
     #[test]
     fn produced_commit_relation_has_a_stable_protocol_name() {
         let relation = ParentRelationDto {
-            parent: "1:0:2".to_string(),
+            parent: "ee949ef930e85033ddd2f63205075ba92fef1982ff8d78727e1f56bfdb3a2d3e".to_string(),
             kind: ParentRelationKind::ProducedCommit,
         };
         let json = serde_json::to_value(&relation).expect("serialize produced-commit relation");
@@ -1174,7 +1179,10 @@ mod tests {
         let json = serde_json::to_value(&details).expect("serialize");
         assert_eq!(json["git_oid"], big_oid_hex());
         assert_eq!(json["repository"], "9007199254740993");
-        assert_eq!(json["parents"][0], "9007199254740993:7:42");
+        assert_eq!(
+            json["parents"][0],
+            "4e2c7154cbab189ed24f4015d92e60e033c18246c965b028602ed812552b5ded"
+        );
         assert_eq!(json["git_parents"][0], big_oid_hex());
     }
 
@@ -1222,7 +1230,10 @@ mod tests {
         assert_eq!(json["oid"], big_oid_hex());
         assert_eq!(json["tree"], big_oid_hex());
         assert_eq!(json["parents"][0], big_oid_hex());
-        assert_eq!(json["imported_record"], "9007199254740993:7:42");
+        assert_eq!(
+            json["imported_record"],
+            "4e2c7154cbab189ed24f4015d92e60e033c18246c965b028602ed812552b5ded"
+        );
         assert_eq!(json["changed_paths"][0], "9007199254740993");
         assert_eq!(json["object_format"], "Sha1");
         assert_eq!(json["availability"], "Resolved");
@@ -1249,7 +1260,7 @@ mod tests {
         assert_eq!(back.repository, OVER_2_53.to_string());
         assert_eq!(
             back.imported_record.as_deref(),
-            Some("9007199254740993:7:42")
+            Some("4e2c7154cbab189ed24f4015d92e60e033c18246c965b028602ed812552b5ded")
         );
         assert_eq!(back.changed_paths, vec![OVER_2_53.to_string()]);
         assert_eq!(back.parents, vec![big_oid_hex()]);
@@ -1366,7 +1377,7 @@ mod tests {
             "summary": "row",
             "timestamp_ms": 0,
             "group": "session:1",
-            "node_key": "1:0:1",
+            "node_key": "93899d1d2c80d5e61ae6992d9d794e2051331e167b76674ab7ec28478559d638",
             "parents": [],
             "is_submodule": false,
             "record_role": "curated_note",
@@ -1414,7 +1425,7 @@ mod tests {
             "summary": "row",
             "timestamp_ms": 1,
             "group": "session:1",
-            "node_key": "1:0:1",
+            "node_key": "93899d1d2c80d5e61ae6992d9d794e2051331e167b76674ab7ec28478559d638",
             "parents": [],
             "is_submodule": false,
         }))
@@ -1431,14 +1442,17 @@ mod tests {
         let row = HistoryRow {
             native_expanded: None,
             content: None,
-            op_id: Some("1:0:1".to_string()),
+            op_id: Some(
+                "93899d1d2c80d5e61ae6992d9d794e2051331e167b76674ab7ec28478559d638".to_string(),
+            ),
             git_oid: None,
             repository: None,
             summary: "row".to_string(),
             timestamp_ms: 1,
             group: "session:1".to_string(),
             group_end: true,
-            node_key: "1:0:1".to_string(),
+            node_key: "93899d1d2c80d5e61ae6992d9d794e2051331e167b76674ab7ec28478559d638"
+                .to_string(),
             continuity_key: String::new(),
             parents: Vec::new(),
             parent_relations: Vec::new(),
@@ -1566,7 +1580,7 @@ mod tests {
             "summary": "row",
             "timestamp_ms": 1,
             "group": "session:1",
-            "node_key": "1:0:1",
+            "node_key": "93899d1d2c80d5e61ae6992d9d794e2051331e167b76674ab7ec28478559d638",
             "parents": [],
             "is_submodule": false,
             "work_unit": { "id": "ops" }
@@ -1597,7 +1611,7 @@ mod tests {
             "summary": "row",
             "timestamp_ms": 1,
             "group": "ops",
-            "node_key": "1:0:1",
+            "node_key": "93899d1d2c80d5e61ae6992d9d794e2051331e167b76674ab7ec28478559d638",
             "parents": [],
             "is_submodule": false,
             "work_unit": { "id": "ops" }

@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::NodeId;
 
+pub mod text_bytes;
+
 /// Content-addressed or locally-addressed blob identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ContentId {
@@ -33,8 +35,8 @@ pub enum Payload {
     /// Empty payload (no content).
     #[default]
     Empty,
-    /// Small inline byte slice.
-    Inline(Vec<u8>),
+    /// Small inline byte slice. Human-readable formats use UTF-8 strings when valid.
+    Inline(#[serde(with = "text_bytes")] Vec<u8>),
     /// Reference to an external blob.
     Blob(BlobRef),
 }

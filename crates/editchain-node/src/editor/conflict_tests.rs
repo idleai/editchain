@@ -70,7 +70,9 @@ fn work(root: &Path, sequence: u64) -> Result<HumanWorkRecord> {
         if let OpKind::Import(import) = &op.kind {
             if let Payload::Inline(bytes) = &import.raw_ref {
                 if let Ok(work) = serde_json::from_slice::<HumanWorkRecord>(bytes) {
-                    if work.source_event.seq == sequence {
+                    if work.source_event
+                        == editchain_import::human::native_event_id(&work.session, sequence)?
+                    {
                         return Ok(work);
                     }
                 }
@@ -155,7 +157,7 @@ fn recover_snapshot(received_baseline: bool) -> Result<()> {
         "conflict evidence remains quarantined",
     )?;
     // Simulate loss of the derived cache, retaining every authoritative record.
-    std::fs::remove_dir_all(root.join("editor-v1"))?;
+    std::fs::remove_dir_all(root.join("editor-v3"))?;
     let continued = request(temporary.path(), vec![read(5)?]);
     check(
         record(&continued, &mut Encoding::default())?.get("accepted") == Some(&json!(1)),

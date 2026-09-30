@@ -6,6 +6,24 @@ use super::{LiveWorkspace, Result};
 use editchain_protocol::rank::Measure;
 
 impl LiveWorkspace {
+    pub(super) fn restore_activity_parents(&mut self) -> Result<()> {
+        self.poisoned = true;
+        let ops = self.projection.activity_operations();
+        let ids: Vec<_> = ops.iter().map(|op| op.id).collect();
+        for chunk in ops.chunks(1024) {
+            let values: Vec<_> = chunk.iter().map(|op| op.as_ref().clone()).collect();
+            self.ancestry.observe_links(&values, &[]);
+            self.git.follow_links(&values);
+        }
+        self.ancestry.invalidate(ids);
+        let changes = self.projection.apply_shared(ops, &[]);
+        let (removed, mut blocks) = self.apply_blocks(changes)?;
+        let commits = self.git.poll()?;
+        blocks.extend(self.apply_git(commits)?);
+        drop(self.connect(&removed, blocks)?);
+        Ok(())
+    }
+
     pub(super) fn restore_legacy_imports(&mut self) -> Result<()> {
         self.poisoned = true;
         let changes = self.projection.refresh_legacy_imports();

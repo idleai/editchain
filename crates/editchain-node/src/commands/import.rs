@@ -194,7 +194,7 @@ pub(super) fn run(
             crate::history::prepare_live_checkpoint(&workspace_path, &snapshot_chain_path);
         match snapshot {
             Ok(snapshot) => println!(
-                "Live checkpoint ready: {} visible rows at {}/live-v1",
+                "Live checkpoint ready: {} visible rows at {}/live-v3",
                 snapshot.nodes,
                 snapshot.chain
             ),
@@ -641,12 +641,23 @@ mod tests {
         let sessions_str = sessions.to_string_lossy().into_owned();
         let chain_str = chain.to_string_lossy().into_owned();
         let captured_generation = |op: &Op| {
-            if matches!(&op.kind, editchain_core::OpKind::Note(note) if note.relationship == editchain_core::NoteRelationship::ProviderEvidence)
-            {
-                op.parents.iter().next().unwrap().boot
-            } else {
-                op.id.boot
+            if let editchain_core::OpKind::Note(note) = &op.kind {
+                if note.relationship == editchain_core::NoteRelationship::ProviderEvidence {
+                    let bytes = if let editchain_core::Payload::Inline(bytes) = &note.content {
+                        Some(bytes)
+                    } else {
+                        None
+                    }
+                    .unwrap();
+                    return serde_json::from_slice::<editchain_core::provider::ProviderEvidence>(
+                        bytes,
+                    )
+                    .unwrap()
+                    .source
+                    .boot;
+                }
             }
+            op.source.unwrap().boot
         };
 
         // Nonempty source: boot-0 ops land in the chain and the cursor is

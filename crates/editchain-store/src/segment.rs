@@ -1,14 +1,16 @@
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read as _, Write};
 use std::path::{Path, PathBuf};
 
 use crate::durable::{atomic_write, create_dir_all, sync_dir};
+use crate::format::ec03::{encode_records, FRAME_OVERHEAD, RECORD_OVERHEAD};
 use crate::format::scan::{PageScanner, ScanErrorKind, ScanItem};
-use crate::format::{encode_page, Page};
+use crate::format::Page;
 use crate::{AppendLog, LogReadStats, RecordVisitor};
 
 const PACKING_MARKER: &str = ".segment-layout";
-const PACKING_VERSION: &[u8] = b"EC02-packed-v1\n";
+const PACKING_VERSION: &[u8] = b"EC03-packed-v2\n";
+const FRAME_TARGET_BYTES: u64 = 1024 * 1024;
 
 /// Segment packing policy. Existing EC02 files remain readable unchanged.
 #[derive(Debug, Clone, Copy)]
@@ -83,13 +85,29 @@ impl SegmentStore {
         chain_dir: impl Into<PathBuf>,
         options: SegmentOptions,
     ) -> io::Result<Self> {
+        Self::open_inner(chain_dir.into(), options, false)
+    }
+
+    pub(crate) fn open_migration(chain_dir: PathBuf) -> io::Result<Self> {
+        Self::open_inner(chain_dir, SegmentOptions::default(), true)
+    }
+
+    fn open_inner(
+        chain_dir: PathBuf,
+        options: SegmentOptions,
+        migration: bool,
+    ) -> io::Result<Self> {
+        if !migration && chain_dir.join(".migration.json").try_exists()? {
+            return Err(io::Error::other(
+                "migration staging chain is not yet published",
+            ));
+        }
         if options.max_segment_bytes == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "zero segment size",
             ));
         }
-        let chain_dir = chain_dir.into();
         create_dir_all(&chain_dir)?;
         let writer_lock = fs::OpenOptions::new()
             .create(true)
@@ -98,6 +116,7 @@ impl SegmentStore {
             .write(true)
             .open(chain_dir.join(".writer.lock"))?;
         writer_lock.try_lock().map_err(io::Error::from)?;
+        require_current_format(&chain_dir)?;
         let initialize_layout = packing_marker_missing(&chain_dir)?;
         let next_seq = segment_sequences(&chain_dir)?.last().copied().unwrap_or(0);
         let mut store = Self {
@@ -135,7 +154,8 @@ impl SegmentStore {
         let chain_dir = chain_dir.into();
         let started = std::time::Instant::now();
         loop {
-            match Self::open(&chain_dir) {
+            let opened = Self::open(&chain_dir);
+            match opened {
                 Err(error)
                     if error.kind() == io::ErrorKind::WouldBlock && started.elapsed() < timeout =>
                 {
@@ -173,8 +193,11 @@ impl SegmentStore {
         page: &Page,
         persist: impl FnOnce(&mut fs::File, &[u8], &Path) -> io::Result<()>,
     ) -> io::Result<()> {
-        let encoded = encode_page(page)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let encoded = encode_records(
+            page.page_seq,
+            page.records.iter().map(|r| (r.flags, r.data.as_slice())),
+        )
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
         if self.needs_recovery {
             self.recover_frontier()?;
         }
@@ -366,9 +389,34 @@ fn sequence_exhausted() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "segment sequence exhausted")
 }
 
+fn migration_required() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "EC02 chain is read-only; run editchain --chain SOURCE migrate --destination NEW_CHAIN before writing",
+    )
+}
+
+fn require_current_format(root: &Path) -> io::Result<()> {
+    // An interrupted first append can leave an empty segment before an EC02
+    // segment. Check every retained segment so no legacy suffix is overlooked.
+    for sequence in segment_sequences(root)? {
+        let mut file = fs::File::open(root.join(format!("{sequence:06}.eclog")))?;
+        let mut magic = [0; 4];
+        let read = file.read_exact(&mut magic);
+        match read {
+            Ok(()) if &magic == b"EC02" => return Err(migration_required()),
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 fn packing_marker_missing(root: &Path) -> io::Result<bool> {
     match fs::read(root.join(PACKING_MARKER)) {
         Ok(bytes) if bytes == PACKING_VERSION => Ok(false),
+        Ok(bytes) if bytes == b"EC02-packed-v1\n" => Err(migration_required()),
         Ok(_) => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "unsupported segment layout marker",
@@ -404,17 +452,18 @@ impl AppendLog for SegmentStore {
 
     fn append_records(&mut self, records: &[(u8, &[u8])]) -> io::Result<()> {
         let mut page = Page::new(self.next_seq);
-        let mut length = 8_u64;
+        let mut length = u64::try_from(FRAME_OVERHEAD).map_err(io::Error::other)?;
         for (flags, encoded) in records {
             let added = u64::try_from(encoded.len())
                 .map_err(io::Error::other)?
-                .saturating_add(5);
+                .saturating_add(u64::try_from(RECORD_OVERHEAD).map_err(io::Error::other)?);
             if !page.records.is_empty()
-                && length.saturating_add(added) > self.options.max_segment_bytes
+                && length.saturating_add(added)
+                    > FRAME_TARGET_BYTES.min(self.options.max_segment_bytes)
             {
                 self.append_page(&page)?;
                 page = Page::new(self.next_seq);
-                length = 8;
+                length = u64::try_from(FRAME_OVERHEAD).map_err(io::Error::other)?;
             }
             page.add_record(*flags, encoded.to_vec());
             length = length.saturating_add(added);

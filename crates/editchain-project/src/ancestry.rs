@@ -3,7 +3,7 @@
 use crate::node::HistoryNode;
 use crate::{HistoryProjection, NodeKey, ResolvedRelation};
 use editchain_core::op::NoteRelationship;
-use editchain_core::{GitLinkKind, Op, OpId, Payload};
+use editchain_core::{GitLinkKind, Op, OpId, Payload, SourceId};
 use std::collections::HashMap;
 
 impl HistoryProjection {
@@ -88,7 +88,7 @@ impl HistoryProjection {
         // Deterministic order per anchor (HashMap iteration order is
         // process-random; parent_keys emits virtual targets in list order).
         for notes in out.values_mut() {
-            notes.sort_unstable_by_key(|n| (n.id.node.0, n.id.boot, n.id.seq));
+            notes.sort_unstable_by_key(|n| (n.source, n.id));
         }
         out
     }
@@ -326,7 +326,12 @@ pub(super) fn resolve_relationship_note_targets(
     relationship_notes: &HashMap<OpId, Vec<Op>>,
     entity_occurrences: &HashMap<OpId, Vec<OpId>>,
     representative: &HashMap<OpId, OpId>,
+    ops: &[Op],
 ) -> HashMap<OpId, Vec<Op>> {
+    let origins: HashMap<OpId, SourceId> = ops
+        .iter()
+        .filter_map(|op| op.source.map(|source| (op.id, source)))
+        .collect();
     let mut resolved = HashMap::with_capacity(relationship_notes.len());
     for (anchor, notes) in relationship_notes {
         let mut resolved_notes = Vec::with_capacity(notes.len());
@@ -339,7 +344,12 @@ pub(super) fn resolve_relationship_note_targets(
                         entity_occurrences
                             .get(target)
                             .map_or(Some(*target), |occurrences| {
-                                resolve_entity_occurrence(*anchor, occurrences, representative)
+                                resolve_entity_occurrence(
+                                    *anchor,
+                                    occurrences,
+                                    representative,
+                                    &origins,
+                                )
                             });
                     if let Some(endpoint) = endpoint {
                         let _: bool = targets.insert(endpoint);
@@ -360,10 +370,16 @@ fn resolve_entity_occurrence(
     anchor: OpId,
     occurrences: &[OpId],
     representative: &HashMap<OpId, OpId>,
+    origins: &HashMap<OpId, SourceId>,
 ) -> Option<OpId> {
     let same_source: std::collections::BTreeSet<OpId> = occurrences
         .iter()
-        .filter(|occurrence| occurrence.node == anchor.node && occurrence.boot == anchor.boot)
+        .filter(|occurrence| {
+            origins
+                .get(occurrence)
+                .zip(origins.get(&anchor))
+                .is_some_and(|(a, b)| a.node == b.node && a.boot == b.boot)
+        })
         .filter_map(|occurrence| occurrence_representative(*occurrence, representative))
         .collect();
     if same_source.len() == 1 {
@@ -415,7 +431,7 @@ pub(super) fn has_exact_provider_parent(anchor: OpId, notes: Option<&[Op]>) -> b
                 editchain_core::OpKind::Note(note)
                     if note.relationship == NoteRelationship::ProviderParent
                         && !note.target_ids.is_empty()
-                        && fact.parents.iter().any(|parent| *parent == anchor)
+                        && fact.parent_ids().any(|parent| *parent == anchor)
             )
         })
     })
@@ -435,7 +451,7 @@ pub(super) fn has_exact_spawn_parent(anchor: OpId, notes: Option<&[Op]>) -> bool
                 editchain_core::OpKind::Note(note)
                     if note.relationship == NoteRelationship::SpawnedBy
                         && !note.target_ids.is_empty()
-                        && fact.parents.iter().any(|parent| *parent == anchor)
+                        && fact.parent_ids().any(|parent| *parent == anchor)
             )
         })
     })
@@ -579,7 +595,7 @@ fn canonical_parent_key(
 fn causal_children_by_parent(ops: &[Op]) -> HashMap<OpId, Vec<OpId>> {
     let mut children: HashMap<OpId, Vec<OpId>> = HashMap::new();
     for op in ops.iter().filter(|op| !is_hidden_relation_fact(op)) {
-        for parent in &op.parents {
+        for parent in op.parent_ids() {
             children.entry(*parent).or_default().push(op.id);
         }
     }

@@ -16,7 +16,7 @@ fn index(documents: &[SearchDocument<'_>]) -> Result<LexicalIndex, Box<dyn std::
     builder.publish()
 }
 
-const fn operation(seq: u64) -> DocumentId {
+fn operation(seq: u64) -> DocumentId {
     DocumentId::Operation(OpId::new(NodeId(1), 0, seq))
 }
 

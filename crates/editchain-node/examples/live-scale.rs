@@ -25,6 +25,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn operation(seq: u64) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 0, seq)),
         id: OpId::new(NodeId(1), 0, seq),
         parents: if seq > 1 {
             ParentSet::One(OpId::new(NodeId(1), 0, seq.saturating_sub(1)))

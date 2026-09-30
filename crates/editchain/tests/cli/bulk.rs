@@ -4,6 +4,65 @@ use super::{result, run};
 use serde_json::json;
 
 #[test]
+fn oversized_originals_have_the_same_preview_and_durable_activities() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    let fixture = include_str!("../../../editchain-import/tests/fixtures/human/session.jsonl");
+    let mut snapshot: serde_json::Value =
+        serde_json::from_str(fixture.lines().nth(1).unwrap()).unwrap();
+    drop(
+        snapshot
+            .as_object_mut()
+            .unwrap()
+            .insert("padding".into(), json!("x".repeat(16 * 1024 * 1024))),
+    );
+    std::fs::write(source.join("session.jsonl"), format!("{snapshot}\n")).unwrap();
+    for bulk in [false, true] {
+        let chain = temp.path().join(if bulk { "bulk" } else { "single" });
+        let mut args = vec![
+            "import",
+            "--provider",
+            "human",
+            "--input",
+            source.to_str().unwrap(),
+        ];
+        if bulk {
+            args.extend(["--glob", "*.jsonl"]);
+        }
+        let report = result(&chain, &args, b"", 0);
+        assert_eq!(report.get("raw_ops"), Some(&json!(1)));
+        assert_eq!(report.get("normalized_ops"), Some(&json!(2)));
+        let files = result(&chain, &["history", "--kind", "File"], b"", 0);
+        assert_eq!(files.get("items").unwrap().as_array().unwrap().len(), 1);
+        let links = result(&chain, &["history", "--kind", "Link"], b"", 0);
+        assert_eq!(links.get("items").unwrap().as_array().unwrap().len(), 1);
+        assert_eq!(
+            links.pointer("/items/0/operation/kind/Link/relation"),
+            Some(&json!("OccurrenceOf"))
+        );
+        let dry = temp
+            .path()
+            .join(if bulk { "dry-bulk" } else { "dry-single" });
+        args.push("--dry-run");
+        let preview = result(&dry, &args, b"", 0);
+        let summary = if bulk {
+            preview.as_array().unwrap().last().unwrap()
+        } else {
+            &preview
+        };
+        assert_eq!(summary.get("raw_ops"), report.get("raw_ops"));
+        assert_eq!(summary.get("normalized_ops"), report.get("normalized_ops"));
+        assert!(!dry.exists());
+        let _dry_run = args.pop();
+        assert_eq!(
+            result(&chain, &args, b"", 0).get("written"),
+            Some(&json!(0))
+        );
+    }
+}
+
+#[test]
 fn overlapping_globs_keep_nested_source_ids_and_deduplicate_files() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("human");
@@ -85,6 +144,7 @@ fn dry_run_retains_conflicts_and_duplicates_within_and_across_files() {
         }
         let args = [
             "import",
+            "--legacy",
             "--provider",
             "human",
             "--input",
@@ -129,7 +189,12 @@ fn manifest_dry_run_admits_all_sources_together() {
         serde_json::to_vec(&json!({"schema":1,"sources":sources})).unwrap(),
     )
     .unwrap();
-    let args = ["import", "--manifest", manifest.to_str().unwrap()];
+    let args = [
+        "import",
+        "--legacy",
+        "--manifest",
+        manifest.to_str().unwrap(),
+    ];
     let durable = result(&temp.path().join("durable"), &args, b"", 4);
     assert_eq!(durable.get("conflicts"), Some(&json!(1)));
     assert_eq!(durable.get("duplicates"), Some(&json!(18)));

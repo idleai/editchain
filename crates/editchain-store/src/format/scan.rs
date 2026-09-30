@@ -1,8 +1,9 @@
-//! Borrowed EC02 page and record scanning shared by all segment readers.
+//! Borrowed EC02/EC03 scanning shared by all segment readers.
 
+use super::ec03::{self, FrameError};
 use super::page::PAGE_MAGIC;
 
-/// Largest record written or accepted by the current EC02 implementation.
+/// Largest record written or accepted by the EC02/EC03 readers and writer.
 ///
 /// Large source payloads belong in the blob store. This bound also keeps a
 /// record length distinct from the reserved `EC02` page marker.
@@ -35,6 +36,8 @@ pub(crate) struct RecordRef<'a> {
     pub(crate) flags: u8,
     /// Complete encoded operation bytes.
     pub(crate) data: &'a [u8],
+    /// Independent EC03 record checksum, absent in legacy EC02.
+    pub(crate) checksum: Option<u32>,
 }
 
 /// Why a scanner stopped before clean EOF.
@@ -48,6 +51,8 @@ pub(crate) enum ScanErrorKind {
     UnsupportedFormat([u8; 4]),
     /// A record's declared length exceeds the supported bound.
     RecordTooLarge(u32),
+    /// A complete EC03 frame failed validation.
+    Frame(FrameError),
 }
 
 /// The first unread item and the reason it could not be consumed.
@@ -61,13 +66,13 @@ pub(crate) struct ScanError {
 
 impl std::fmt::Display for ScanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "EC02 scan at byte {}: {:?}", self.offset, self.kind)
+        write!(f, "segment scan at byte {}: {:?}", self.offset, self.kind)
     }
 }
 
 impl std::error::Error for ScanError {}
 
-/// Scan concatenated EC02 pages, yielding borrowed records and their offsets.
+/// Scan EC02 pages or EC03 frames, yielding borrowed records and their offsets.
 ///
 /// Clean EOF ends iteration. An incomplete tail, invalid header, unsupported
 /// format, or oversized record yields one error and then ends iteration.
@@ -78,6 +83,7 @@ pub(crate) struct PageScanner<'a> {
     bytes: &'a [u8],
     offset: usize,
     page_sequence: Option<u32>,
+    frame_end: Option<usize>,
     finished: bool,
 }
 
@@ -89,6 +95,7 @@ impl<'a> PageScanner<'a> {
             bytes,
             offset: 0,
             page_sequence: None,
+            frame_end: None,
             finished: false,
         }
     }
@@ -105,6 +112,7 @@ impl<'a> PageScanner<'a> {
             bytes,
             offset: 0,
             page_sequence,
+            frame_end: None,
             finished: false,
         }
     }
@@ -122,10 +130,52 @@ impl<'a> PageScanner<'a> {
 
     fn next_item(&mut self) -> Result<ScanItem<'a>, ScanError> {
         let remaining = self.bytes.get(self.offset..).unwrap_or_default();
+        if let Some(end) = self.frame_end {
+            let record = ec03::scan_record(remaining)
+                .map_err(|error| self.error(ScanErrorKind::Frame(error)))?;
+            let item = RecordRef {
+                page_sequence: self.page_sequence.unwrap_or_default(),
+                offset: self.offset,
+                data_offset: self.offset.saturating_add(5),
+                flags: record.flags,
+                data: record.data,
+                checksum: Some(record.checksum),
+            };
+            self.offset = self.offset.saturating_add(record.length);
+            if self.offset == end.saturating_sub(4) {
+                self.offset = end;
+                self.frame_end = None;
+                self.page_sequence = None;
+            }
+            return Ok(ScanItem::Record(item));
+        }
         let prefix: [u8; 4] = remaining
             .get(..4)
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or_else(|| self.error(ScanErrorKind::IncompleteTail))?;
+        if prefix == ec03::MAGIC {
+            let frame = ec03::scan_frame(remaining).map_err(|error| {
+                self.error(if error == FrameError::Incomplete {
+                    ScanErrorKind::IncompleteTail
+                } else {
+                    ScanErrorKind::Frame(error)
+                })
+            })?;
+            let offset = self.offset;
+            let end = offset.saturating_add(frame.length);
+            if frame.records.is_empty() {
+                self.offset = end;
+                self.page_sequence = None;
+            } else {
+                self.offset = offset.saturating_add(ec03::HEADER_BYTES);
+                self.page_sequence = Some(frame.sequence);
+                self.frame_end = Some(end);
+            }
+            return Ok(ScanItem::Page {
+                sequence: frame.sequence,
+                offset,
+            });
+        }
         if prefix == PAGE_MAGIC {
             let sequence = remaining
                 .get(4..8)
@@ -163,6 +213,7 @@ impl<'a> PageScanner<'a> {
             data_offset: self.offset.saturating_add(5),
             flags,
             data,
+            checksum: None,
         };
         self.offset = self.offset.saturating_add(end);
         Ok(ScanItem::Record(record))

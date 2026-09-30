@@ -22,14 +22,7 @@ fn child_continuity_key(
     parent: &str,
     ordinal: usize,
 ) -> String {
-    let mut parts = child.op_id.split(':');
-    let id = (|| {
-        Some(OpId {
-            node: editchain_core::NodeId(parts.next()?.parse().ok()?),
-            boot: parts.next()?.parse().ok()?,
-            seq: parts.next()?.parse().ok()?,
-        })
-    })();
+    let id = OpId::from_display_str(&child.op_id);
     let logical = id.and_then(|id| projection.continuity_key(id));
     let owner = logical.unwrap_or_else(|| {
         if child.op_id.is_empty() {
@@ -450,6 +443,7 @@ fn node_author(node: &editchain_project::HistoryNode) -> String {
 #[must_use]
 fn sub_op_meta(op: &Op) -> (RecordRole, ActivityKind) {
     match &op.kind {
+        OpKind::Activity(record) => sub_op_meta(&record.display_op()),
         OpKind::Tool(t) if matches!(t.stage, editchain_core::op::ToolStage::Finish) => {
             (RecordRole::Result, ActivityKind::Execute)
         }
@@ -899,6 +893,7 @@ pub(super) fn sub_op_label(op: &Op) -> (String, String) {
         }
     }
     let raw = match &op.kind {
+        OpKind::Activity(record) => return sub_op_label(&record.display_op()),
         OpKind::Import(i) => match &i.raw_ref {
             Payload::Inline(b) => String::from_utf8_lossy(b).to_string(),
             Payload::Empty | Payload::Blob(_) => String::new(),
@@ -1096,13 +1091,13 @@ fn node_commit_id(node: &editchain_project::HistoryNode) -> String {
     }
 }
 
-/// Abbreviate an op id (`node:boot:seq`) to a short `node:seq` form.
+/// Render the full canonical ID; query-aware CLI displays abbreviate uniquely.
 ///
 /// The boot counter is almost always 0 and adds noise; dropping it keeps the
 /// column compact while preserving the distinguishing sequence number.
 #[must_use]
 fn abbreviate_op_id(id: &OpId) -> String {
-    format!("{}:{}", id.node.0, id.seq)
+    id.to_string()
 }
 
 /// Abbreviate a git OID to its first 7 hex characters.

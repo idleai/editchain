@@ -39,7 +39,7 @@ fn node_details_from_op(op: &Op) -> NodeDetails {
         repository: None,
         summary: op_summary(op),
         body: op_body(op),
-        parents: op.parents.iter().map(ToString::to_string).collect(),
+        parents: op.parent_ids().map(ToString::to_string).collect(),
         git_parents: Vec::new(),
         refs: Vec::new(),
         changed_paths: Vec::new(),
@@ -83,7 +83,7 @@ fn node_details_from_commit(commit: &editchain_core::GitCommitEntity) -> NodeDet
 /// Build the JSON-safe resolved-object DTO from a git commit entity.
 ///
 /// Every identity is carried as an exact string (decimal `RepositoryId` /
-/// `PathId`, lowercase-hex `GitOid`, `"node:boot:seq"` `OpId`) so u64 values
+/// `PathId`, lowercase-hex `GitOid`, full hexadecimal `OpId`) so u64 values
 /// above 2^53 round-trip through JavaScript without precision loss. Safe
 /// enums, timestamps, signatures, and payloads are preserved as-is.
 #[must_use]
@@ -117,6 +117,7 @@ pub(crate) fn resolved_object_from_commit(
 #[must_use]
 fn op_summary(op: &Op) -> String {
     match &op.kind {
+        OpKind::Activity(record) => op_summary(&record.display_op()),
         OpKind::Message(m) => payload_text(&m.content),
         OpKind::Tool(t) => payload_text(&t.tool_name),
         OpKind::Command(c) => payload_text(&c.content),
@@ -138,6 +139,13 @@ fn op_summary(op: &Op) -> String {
 #[must_use]
 fn op_body(op: &Op) -> String {
     match &op.kind {
+        OpKind::Activity(record) => record
+            .kind
+            .fields()
+            .iter()
+            .map(|(_, payload)| payload_text(payload))
+            .collect::<Vec<_>>()
+            .join("\n"),
         OpKind::Message(m) => payload_text(&m.content),
         OpKind::Tool(t) => payload_text(&t.content),
         OpKind::Command(c) => payload_text(&c.content),

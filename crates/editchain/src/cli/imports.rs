@@ -63,12 +63,24 @@ pub(super) struct Args {
     /// Preview without creating or modifying the chain or cursors.
     #[arg(long)]
     dry_run: bool,
-    /// Retain exact evidence without normalized operations.
+    /// Retain original records without derived activities.
     #[arg(long)]
     raw_only: bool,
     /// Include recorded private reasoning in normalization.
     #[arg(long)]
     include_thinking: bool,
+    /// Use the legacy operation schema and its existing cursor namespace.
+    #[command(flatten)]
+    schema: Schema,
+}
+
+#[derive(Debug, clap::Args)]
+struct Schema {
+    #[arg(skip)]
+    namespace: std::sync::OnceLock<bool>,
+    /// Use the legacy operation schema and its existing cursor namespace.
+    #[arg(long)]
+    legacy: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -109,6 +121,45 @@ pub(super) fn run(
     let report = capture(chain, args, &options)?;
     output.emit(&report)?;
     finish_report(&report)
+}
+
+fn converted(
+    chain: &Path,
+    batch: ImportBatch,
+    args: &Args,
+    blobs: &mut dyn BlobSink,
+) -> Result<ImportBatch> {
+    if args.schema.legacy {
+        Ok(batch)
+    } else {
+        let migration = if let Some(mode) = args.schema.namespace.get() {
+            *mode
+        } else {
+            let mode = editchain_import::activity::uses_migration_ids(chain)?;
+            let _set = args.schema.namespace.set(mode);
+            mode
+        };
+        let batch = if migration {
+            batch.into_migrated_schema3(blobs)?
+        } else {
+            batch.into_schema3(blobs)?
+        };
+        Ok(if args.raw_only {
+            batch.originals_only()?
+        } else {
+            batch
+        })
+    }
+}
+
+fn cursor_directory(args: &Args) -> &'static str {
+    if args.schema.legacy {
+        "cursors"
+    } else if args.raw_only {
+        "cursors-v3-raw"
+    } else {
+        "cursors-v3"
+    }
 }
 
 fn finish_report(report: &serde_json::Value) -> Result<()> {
@@ -218,6 +269,7 @@ fn capture(chain: &Path, args: &Args, options: &ImportOptions) -> Result<serde_j
             options,
             &mut (&mut blobs, &cursors),
         )?;
+        let batch = converted(chain, batch, args, &mut blobs)?;
         let mut result = report_value(batch.report());
         drop(result.insert("dry_run".into(), true.into()));
         drop(result.insert(
@@ -231,7 +283,7 @@ fn capture(chain: &Path, args: &Args, options: &ImportOptions) -> Result<serde_j
     let mut blobs = editchain_import::BufferedBlobSink::new(editchain_import::FsBlobSink::new(
         chain.join("blobs"),
     )?);
-    let mut cursors = editchain_import::FsCursorStore::new(chain.join("cursors"))?;
+    let mut cursors = editchain_import::FsCursorStore::new(chain.join(cursor_directory(args)))?;
     let batch = capture_batch(
         chain,
         args,
@@ -239,6 +291,7 @@ fn capture(chain: &Path, args: &Args, options: &ImportOptions) -> Result<serde_j
         options,
         &mut (&mut blobs, &cursors),
     )?;
+    let batch = converted(chain, batch, args, &mut blobs)?;
     options.cancellation.check(&source.path)?;
     blobs.flush()?;
     let outcome = batch.persist(&mut editchain_store::LogStore::new(store), &mut cursors)?;

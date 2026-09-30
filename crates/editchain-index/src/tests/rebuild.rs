@@ -73,8 +73,21 @@ fn rebuild_reopen_and_deleted_checkpoints_preserve_queries_and_exact_record_byte
         Payload::Inline(b"same decoded record, different encoding".to_vec()),
     );
     let encoded = encode_op(&conflicted).unwrap();
+    let legacy = editchain_core::legacy::LegacyOp {
+        id: conflicted.source.unwrap(),
+        parents: ParentSet::None,
+        actor: conflicted.actor,
+        clock: conflicted.clock,
+        scope: conflicted.scope,
+        tags: conflicted.tags,
+        kind: OpKind::Message(editchain_core::MessageOp {
+            content: Payload::Inline(b"same decoded record, different encoding".to_vec()),
+            content_type: Payload::Empty,
+        }),
+    };
+    let legacy_bytes = postcard::to_stdvec(&legacy).unwrap();
     let mut alternate = vec![0x81, 0];
-    alternate.extend_from_slice(encoded.get(1..).unwrap());
+    alternate.extend_from_slice(legacy_bytes.get(1..).unwrap());
     assert_eq!(decode_op(&alternate).unwrap(), conflicted);
     let mut page = Page::new(1);
     page.add_record(7, encoded.clone());
@@ -96,7 +109,7 @@ fn rebuild_reopen_and_deleted_checkpoints_preserve_queries_and_exact_record_byte
     let expected = results(&index, &keys);
     assert_eq!(
         expected.operations,
-        vec![file.clone(), session.clone(), first.clone()]
+        vec![first.clone(), file.clone(), session.clone()]
     );
     assert_eq!(expected.postings.get(2), Some(&vec![file.id]));
     assert_eq!(
@@ -105,9 +118,9 @@ fn rebuild_reopen_and_deleted_checkpoints_preserve_queries_and_exact_record_byte
     );
     assert_eq!(
         index
-            .lookup(keys.first().copied().unwrap(), Some(session.id), 1)
+            .lookup(keys.first().copied().unwrap(), Some(first.id), 1)
             .unwrap(),
-        vec![first.id]
+        vec![file.id]
     );
     assert!(
         index.operations(None, 0).unwrap().is_empty(),
@@ -143,7 +156,7 @@ fn rebuild_reopen_and_deleted_checkpoints_preserve_queries_and_exact_record_byte
     let index = ChainIndex::open(root).unwrap();
     assert_eq!(results(&index, &keys), expected);
     drop(index);
-    std::fs::remove_dir_all(root.join("index-v1")).unwrap();
+    std::fs::remove_dir_all(root.join("index-v3")).unwrap();
     let index = ChainIndex::open(root).unwrap();
     assert_eq!(results(&index, &keys), expected);
     assert_eq!(index.record_variants(conflicted.id).unwrap(), variants);

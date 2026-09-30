@@ -28,6 +28,7 @@ const OVER_2_53: u64 = 9_007_199_254_740_993;
 /// Build a raw import op carrying one raw JSONL line.
 fn raw_import(node: u64, seq: u64, clock_ms: u64, parent: Option<OpId>, raw: &str) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: parent.map_or(ParentSet::None, ParentSet::One),
         actor: ActorId(1),
@@ -49,6 +50,7 @@ fn child(node: u64, seq: u64, parent: OpId, kind: OpKind) -> Op {
 /// Build a turn-scoped normalized child op anchored at a raw import op.
 fn turn_child(node: u64, seq: u64, parent: OpId, kind: OpKind) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -62,6 +64,7 @@ fn turn_child(node: u64, seq: u64, parent: OpId, kind: OpKind) -> Op {
 /// Build a normalized child op anchored at a raw import op.
 fn child_with_clock(node: u64, seq: u64, parent: OpId, clock_ms: u64, kind: OpKind) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -895,7 +898,9 @@ fn normal_duplicate_pair_hides_response_item_keeps_event_msg() {
 
     let response_node = nodes
         .iter()
-        .find(|n| n.node_key() == "1:0:1")
+        .find(|n| {
+            n.node_key() == "93899d1d2c80d5e61ae6992d9d794e2051331e167b76674ab7ec28478559d638"
+        })
         .expect("response_item row");
     let response_meta = response_node.record_meta();
     assert_eq!(response_meta.visibility, Visibility::Trace);
@@ -904,7 +909,9 @@ fn normal_duplicate_pair_hides_response_item_keeps_event_msg() {
 
     let event_node = nodes
         .iter()
-        .find(|n| n.node_key() == "1:0:2")
+        .find(|n| {
+            n.node_key() == "ee949ef930e85033ddd2f63205075ba92fef1982ff8d78727e1f56bfdb3a2d3e"
+        })
         .expect("event_msg row");
     let event_meta = event_node.record_meta();
     assert_eq!(event_meta.visibility, Visibility::Primary);
@@ -953,12 +960,16 @@ fn duplicate_pairing_is_order_independent_and_one_to_one() {
     let nodes = projection.nodes();
     let response_node = nodes
         .iter()
-        .find(|n| n.node_key() == "1:0:1")
+        .find(|n| {
+            n.node_key() == "93899d1d2c80d5e61ae6992d9d794e2051331e167b76674ab7ec28478559d638"
+        })
         .expect("response_item row");
     assert_eq!(response_node.record_meta().visibility, Visibility::Trace);
     let event_node = nodes
         .iter()
-        .find(|n| n.node_key() == "1:0:2")
+        .find(|n| {
+            n.node_key() == "ee949ef930e85033ddd2f63205075ba92fef1982ff8d78727e1f56bfdb3a2d3e"
+        })
         .expect("event_msg row");
     assert_eq!(event_node.record_meta().visibility, Visibility::Primary);
 
@@ -1205,6 +1216,7 @@ fn activity_view_preserves_structural_trace_anchor_rows() {
     let mspawn = child(4, 1, spawn.id, message_op("spawned"));
     let msub = child(5, 1, sub.id, message_op("sub work"));
     let note = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(9), 0, 2)),
         id: OpId::new(NodeId(9), 0, 2),
         parents: ParentSet::One(trace.id),
         actor: ActorId(1),
@@ -1258,6 +1270,7 @@ fn activity_view_preserves_structural_trace_anchor_rows() {
 #[test]
 fn standalone_turn_scoped_op_exposes_turn_id() {
     let op = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 0, 1)),
         id: OpId::new(NodeId(1), 0, 1),
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -1420,7 +1433,9 @@ fn truncated_long_texts_with_shared_prefix_never_pair_after_compaction() {
     let nodes = projection.nodes();
     let response_node = nodes
         .iter()
-        .find(|n| n.node_key() == "2:0:1")
+        .find(|n| {
+            n.node_key() == "6fc56f6d55b1817e7505c349137e8c97a721b5e3654a0294de507f43b2dcdfe4"
+        })
         .expect("exact long pair response row");
     assert_eq!(
         response_node.record_meta().visibility,
@@ -1429,7 +1444,9 @@ fn truncated_long_texts_with_shared_prefix_never_pair_after_compaction() {
     );
     let event_node = nodes
         .iter()
-        .find(|n| n.node_key() == "2:0:2")
+        .find(|n| {
+            n.node_key() == "f46f47949aa2f0a567ff789a3cefc82af053a0c5838e83ca8de293a2a1e4d7a8"
+        })
         .expect("exact long pair event row");
     assert_eq!(event_node.record_meta().visibility, Visibility::Primary);
 }
@@ -1460,7 +1477,9 @@ fn duplicate_pair_demotion_keeps_response_visible_with_unique_tool_child() {
 
     let response_node = nodes
         .iter()
-        .find(|n| n.node_key() == "1:0:1")
+        .find(|n| {
+            n.node_key() == "93899d1d2c80d5e61ae6992d9d794e2051331e167b76674ab7ec28478559d638"
+        })
         .expect("response_item row");
     let response_meta = response_node.record_meta();
     assert_eq!(
@@ -1473,7 +1492,9 @@ fn duplicate_pair_demotion_keeps_response_visible_with_unique_tool_child() {
 
     let event_node = nodes
         .iter()
-        .find(|n| n.node_key() == "1:0:2")
+        .find(|n| {
+            n.node_key() == "ee949ef930e85033ddd2f63205075ba92fef1982ff8d78727e1f56bfdb3a2d3e"
+        })
         .expect("event_msg row");
     let event_meta = event_node.record_meta();
     assert_eq!(event_meta.visibility, Visibility::Primary);

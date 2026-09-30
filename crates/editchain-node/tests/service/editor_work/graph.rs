@@ -73,7 +73,12 @@ fn records(root: &Path) -> Vec<(Op, HumanWorkRecord)> {
         .located_ops()
         .filter_map(|(op, _)| work_record(op).map(|record| (op.clone(), record)))
         .collect();
-    records.sort_by_key(|(_, record)| (record.session.clone(), record.source_event.seq));
+    records.sort_by_key(|(op, record)| {
+        (
+            record.session.clone(),
+            op.source.expect("source provenance").seq,
+        )
+    });
     records
 }
 
@@ -87,27 +92,39 @@ fn window(server: &mut Server, snapshot: &Value) -> Vec<Value> {
         .clone()
 }
 
-fn agent(root: &Path, raw_id: OpId, before: &str, after: &str, context: &Value) -> OpId {
-    let actor = raw_id.node.0;
-    let seq = raw_id.seq;
-    let file_id = OpId {
+fn agent(
+    root: &Path,
+    raw_source: editchain_core::SourceId,
+    before: &str,
+    after: &str,
+    context: &Value,
+) -> OpId {
+    let raw_id = raw_source.id();
+    let actor = raw_source.node.0;
+    let seq = raw_source.seq;
+    let file_source = editchain_core::SourceId {
         seq: seq + 1,
-        ..raw_id
+        ..raw_source
     };
+    let file_id = file_source.id();
     let mut blobs = BlobStore::new(root.join(".editchain/blobs")).expect("valid graph fixture");
     blobs.write(before.as_bytes()).expect("valid graph fixture");
     blobs.write(after.as_bytes()).expect("valid graph fixture");
     let base = ContentId::Hash256(*blake3::hash(before.as_bytes()).as_bytes());
     let after_id = ContentId::Hash256(*blake3::hash(after.as_bytes()).as_bytes());
     let raw = Op {
+        source: Some(raw_source),
         id: raw_id,
         parents: if seq == 1 {
             ParentSet::None
         } else {
-            ParentSet::One(OpId {
-                seq: seq - 4,
-                ..raw_id
-            })
+            ParentSet::One(
+                editchain_core::SourceId {
+                    seq: seq - 4,
+                    ..raw_source
+                }
+                .id(),
+            )
         },
         actor: ActorId(actor),
         clock: Clock::UnixMs(if seq == 1 { 1001 } else { 2001 + seq }),
@@ -119,6 +136,7 @@ fn agent(root: &Path, raw_id: OpId, before: &str, after: &str, context: &Value) 
         }),
     };
     let file = Op {
+        source: Some(file_source),
         id: file_id,
         parents: ParentSet::One(raw_id),
         tags: Tags::FILE | Tags::AGENT,
@@ -132,10 +150,15 @@ fn agent(root: &Path, raw_id: OpId, before: &str, after: &str, context: &Value) 
         ..raw.clone()
     };
     let note = Op {
-        id: OpId {
+        source: Some(editchain_core::SourceId {
             seq: seq + 2,
-            ..raw_id
-        },
+            ..raw_source
+        }),
+        id: editchain_core::SourceId {
+            seq: seq + 2,
+            ..raw_source
+        }
+        .id(),
         parents: ParentSet::One(raw_id),
         tags: Tags::NOTE,
         kind: OpKind::Note(NoteOp {
@@ -148,10 +171,15 @@ fn agent(root: &Path, raw_id: OpId, before: &str, after: &str, context: &Value) 
     let mut ops = vec![raw.clone(), file, note];
     if seq == 1 {
         ops.push(Op {
-            id: OpId {
+            source: Some(editchain_core::SourceId {
                 seq: seq + 3,
-                ..raw_id
-            },
+                ..raw_source
+            }),
+            id: editchain_core::SourceId {
+                seq: seq + 3,
+                ..raw_source
+            }
+            .id(),
             parents: ParentSet::One(raw_id),
             tags: Tags::META,
             kind: OpKind::GitLink(GitLink {
@@ -200,7 +228,7 @@ fn human_and_agent_series_share_git_but_keep_exact_intermediate_edits() {
     let repo = &context["repositories"][0];
     let first_agent = agent(
         root,
-        OpId::new(NodeId(73), 0, 1),
+        editchain_core::SourceId::new(NodeId(73), 0, 1),
         "base\n",
         "base\nai\n",
         repo,
@@ -230,7 +258,7 @@ fn human_and_agent_series_share_git_but_keep_exact_intermediate_edits() {
     let opened = live_request(&mut history, json!({"OpenLive":open}));
     let second_agent = agent(
         root,
-        OpId::new(NodeId(73), 0, 5),
+        editchain_core::SourceId::new(NodeId(73), 0, 5),
         "base\nhuman\n",
         "base\nhuman\nai two\n",
         repo,

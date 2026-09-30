@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::PathBuf, rc::Rc};
 
 // Increment when reducer, routing, task or disk-index semantics change.
-pub(super) const VERSION: u64 = 13;
+pub(super) const VERSION: u64 = 15;
 
 #[derive(Serialize)]
 struct Borrowed<'a> {
@@ -75,7 +75,7 @@ impl LiveWorkspace {
 
     pub(super) fn adopt(&mut self, saved: Saved, validate: bool) -> Result<()> {
         if !(1..=VERSION).contains(&saved.version) || saved.workspace != self.root {
-            return Err("live checkpoint schema/workspace changed; close History, remove the derived live-v1 directory and run prepare-view".into());
+            return Err("live checkpoint schema/workspace changed; close History, remove the derived live-v3 directory and run prepare-view".into());
         }
         if validate {
             saved.tail.resume(&self.chain)?;

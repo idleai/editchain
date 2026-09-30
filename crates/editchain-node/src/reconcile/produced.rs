@@ -34,6 +34,22 @@ pub(super) fn derive_produced_commit_links(
     let existing: HashSet<(OpId, RepositoryId, GitOid)> = ops
         .iter()
         .filter_map(|op| match &op.kind {
+            OpKind::Activity(record) => {
+                if let editchain_core::activity::Kind::Link(link) = &record.kind {
+                    if link.relation == "produced_by" {
+                        if let editchain_core::activity::Entity::Operation(source) = link.from {
+                            return link.to.iter().find_map(|target| match target {
+                                editchain_core::activity::Entity::Git { repository, oid } => {
+                                    Some((source, *repository, *oid))
+                                }
+                                editchain_core::activity::Entity::Operation(_)
+                                | editchain_core::activity::Entity::Item(_) => None,
+                            });
+                        }
+                    }
+                }
+                None
+            }
             OpKind::GitLink(link) if link.kind == GitLinkKind::ProducedBy => {
                 Some((link.source, link.target_repo, link.target_oid))
             }
@@ -73,11 +89,13 @@ pub(super) fn derive_produced_commit_links(
 
     let mut links = Vec::with_capacity(relations.len());
     for ((source, target_repo, target_oid), source_op) in relations {
-        let id = produced_link_id(source, target_repo, target_oid);
+        let origin = produced_link_id(source_op, target_repo, target_oid);
+        let id = origin.id();
         if existing_ids.contains(&id) {
             continue;
         }
         links.push(Op {
+            source: Some(origin),
             id,
             parents: ParentSet::One(source),
             actor: source_op.actor,
@@ -116,7 +134,10 @@ fn unique_commit(
 }
 
 /// Derive a stable operation ID from the immutable relation endpoints.
-fn produced_link_id(source: OpId, repository: RepositoryId, oid: GitOid) -> OpId {
+fn produced_link_id(op: &Op, repository: RepositoryId, oid: GitOid) -> editchain_core::SourceId {
+    let source = op
+        .source
+        .map_or_else(|| op.id.to_string(), |source| source.to_string());
     let digest = editchain_import::hash_raw(
         format!(
             "editchain:git-link:produced-by:v1:{source}:{}:{}",
@@ -137,7 +158,7 @@ fn produced_link_id(source: OpId, repository: RepositoryId, oid: GitOid) -> OpId
         .get(12..20)
         .and_then(|bytes| bytes.try_into().ok())
         .map_or(0, u64::from_le_bytes);
-    OpId::new(NodeId(node), boot, seq)
+    editchain_core::SourceId::new(NodeId(node), boot, seq)
 }
 
 #[cfg(test)]
@@ -166,6 +187,7 @@ mod tests {
 
     fn import_op(seq: u64, value: &Value) -> Op {
         Op {
+            source: Some(editchain_core::SourceId::new(NodeId(1), 0, seq)),
             id: OpId::new(NodeId(1), 0, seq),
             parents: if seq == 1 {
                 ParentSet::None

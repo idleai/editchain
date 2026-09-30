@@ -9,6 +9,7 @@ use std::sync::Arc;
 pub(super) fn op_summary(op: &Op) -> String {
     use editchain_core::OpKind;
     match &op.kind {
+        OpKind::Activity(record) => op_summary(&record.display_op()),
         OpKind::Message(m) => message_summary(&payload_text(&m.content)),
         // A tool_result (stage Finish, empty tool_name) carries its result in
         // `content`; show a pretty-printed, truncated preview of it rather than
@@ -877,6 +878,7 @@ fn tool_summary_has_invocation_detail(summary: &str) -> bool {
 #[must_use]
 pub(super) fn sub_op_content(op: &Op) -> Option<String> {
     match &op.kind {
+        editchain_core::OpKind::Activity(record) => sub_op_content(&record.display_op()),
         editchain_core::OpKind::Tool(t)
             if matches!(t.stage, editchain_core::op::ToolStage::Finish) =>
         {

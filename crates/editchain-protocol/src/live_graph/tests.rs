@@ -6,6 +6,8 @@ mod human;
 
 fn node(key: &str, time: u64, parents: &[&str]) -> LiveBlockMeta {
     LiveBlockMeta {
+        source_stream: editchain_core::SourceId::from_display_str(key)
+            .map(|source| (source.node.0.to_string(), source.boot)),
         task_group: None,
         task_summary: None,
         task_protected: false,
@@ -98,18 +100,22 @@ fn a_child_arriving_first_cannot_take_the_parent_execution_lane() {
     let mut graph = LiveGraph::default();
     let mut spawn = node("spawn", 1, &[]);
     spawn.node_key = "1:0:1".into();
+    spawn.source_stream = Some(("1".into(), 0));
     graph.edit(&[], &[spawn]);
     let main_lane = row(&graph, "spawn", 0).lane;
     let mut child = node("child", 2, &["spawn"]);
     child.node_key = "2:0:1".into();
+    child.source_stream = Some(("2".into(), 0));
     graph.edit(&[], &[child]);
     assert_ne!(row(&graph, "child", 0).lane, main_lane);
     let mut next = node("next", 3, &["spawn"]);
     next.node_key = "1:0:2".into();
+    next.source_stream = Some(("1".into(), 0));
     graph.edit(&[], &[next]);
     assert_eq!(row(&graph, "next", 0).lane, main_lane);
     let mut merge = node("merge", 4, &["child", "next"]);
     merge.node_key = "1:0:3".into();
+    merge.source_stream = Some(("1".into(), 0));
     graph.edit(&[], &[merge]);
     assert_eq!(row(&graph, "merge", 0).lane, main_lane);
 }
@@ -371,4 +377,25 @@ fn new_overlapping_git_anchors_have_separate_spines_and_retractions_remove_their
     assert!(!graph.spines.contains_key("git:old"));
     assert!(!row(&graph, "git:old", 0).above.contains(&old_lane));
     assert_eq!(graph.paths.len(), 4);
+}
+
+#[test]
+fn source_provenance_keeps_exact_u64_digits_on_the_json_wire() {
+    let mut meta = node("opaque-canonical-id", 0, &[]);
+    meta.source_stream = Some((u64::MAX.to_string(), u32::MAX));
+    let value = serde_json::to_value(&meta).unwrap();
+    assert_eq!(
+        value
+            .pointer("/source_stream/0")
+            .and_then(serde_json::Value::as_str),
+        Some("18446744073709551615")
+    );
+    assert_eq!(
+        value
+            .pointer("/source_stream/1")
+            .and_then(serde_json::Value::as_u64),
+        Some(u64::from(u32::MAX))
+    );
+    let decoded: LiveBlockMeta = serde_json::from_value(value).unwrap();
+    assert_eq!(decoded.source_stream, meta.source_stream);
 }

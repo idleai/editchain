@@ -24,6 +24,7 @@ use editchain_project::HistoryProjection;
 /// A raw import op (the linear backbone row) scoped to a session.
 fn import_op(node: u64, seq: u64, session: u64, clock_ms: u64) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -40,6 +41,7 @@ fn import_op(node: u64, seq: u64, session: u64, clock_ms: u64) -> Op {
 /// A normalized message child of a raw import op (folded into the import row).
 fn child_message_op(node: u64, seq: u64, parent: OpId, text: &str) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -56,6 +58,7 @@ fn child_message_op(node: u64, seq: u64, parent: OpId, text: &str) -> Op {
 /// A normalized Tool child of a raw import op (folded into the import row).
 fn child_tool_op(node: u64, seq: u64, parent: OpId, name: &str) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -80,6 +83,7 @@ fn relation_note(
     relationship: NoteRelationship,
 ) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -103,6 +107,7 @@ fn fingerprinted_occurrence_note(
     fingerprint: &str,
 ) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -123,6 +128,7 @@ fn fingerprinted_occurrence_note(
 /// A standalone message op (its own row; used for fork-prologue scenarios).
 fn msg_op(node: u64, seq: u64, session: u64, clock_ms: u64, parent: Option<OpId>) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: parent.map_or(ParentSet::None, ParentSet::One),
         actor: ActorId(1),

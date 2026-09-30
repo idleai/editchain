@@ -2,8 +2,8 @@
 
 use editchain_core::{
     CommandOp, CommandStage, FileEdit, FileOp, FileStage, FrontierSet, MessageOp, NoteOp,
-    NoteRelationship, Op, OpId, OpKind, ParentSet, Payload, ReflectionOp, Tags, ToolOp, ToolStage,
-    WindowRef,
+    NoteRelationship, Op, OpKind, ParentSet, Payload, ReflectionOp, SourceId, Tags, ToolOp,
+    ToolStage, WindowRef,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -43,7 +43,8 @@ impl Builder<'_> {
     }
 
     fn push(&mut self, slot: Slot, tags: Tags, kind: OpKind) -> Result<(), ImportError> {
-        let id = match self.contract {
+        let raw_source = crate::ids::provenance(self.raw)?;
+        let source = match self.contract {
             Contract::Legacy => {
                 let lane = self
                     .ops
@@ -53,20 +54,21 @@ impl Builder<'_> {
                     .ok_or_else(|| {
                         ImportError::OpSink("legacy Claude content lanes exhausted".into())
                     })?;
-                SourceStream::new(self.raw.id.node, self.raw.id.boot)
-                    .op_from_position(SourcePosition::derived(self.raw.id.seq >> 16, lane))?
+                SourceStream::new(raw_source.node, raw_source.boot)
+                    .source_position(SourcePosition::derived(raw_source.seq >> 16, lane))?
             }
-            Contract::BlocksV1 => OpId {
+            Contract::BlocksV1 => SourceId {
                 node: derive_node_id(&serde_json::to_string(&(
                     super::materialize::CONTRACT,
-                    self.raw.id.node,
+                    raw_source.node,
                     slot,
                 ))?),
-                ..self.raw.id
+                ..raw_source
             },
         };
         self.ops.push(Op {
-            id,
+            source: Some(source),
+            id: source.id(),
             parents: ParentSet::One(self.raw.id),
             actor: self.raw.actor,
             clock: self.raw.clock,

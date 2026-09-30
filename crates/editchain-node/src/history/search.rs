@@ -107,13 +107,28 @@ fn operation_text(
         return None;
     }
     match &op.kind {
+        OpKind::Activity(record) => {
+            if matches!(record.kind, editchain_core::activity::Kind::Original(_)) {
+                None
+            } else {
+                Some(
+                    record
+                        .kind
+                        .fields()
+                        .into_iter()
+                        .filter_map(|(_, payload)| resolve(payload))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            }
+        }
         OpKind::Message(message) => resolve(&message.content),
         OpKind::Tool(tool) => resolve(&tool.content),
         OpKind::Command(command) => resolve(&command.content),
         OpKind::Reflection(reflection) => resolve(&reflection.summary),
         OpKind::File(_) => files
             .get(&op.id)
-            .or_else(|| op.parents.iter().find_map(|parent| files.get(parent)))
+            .or_else(|| op.parent_ids().find_map(|parent| files.get(parent)))
             .map(|changes| file_paths(changes)),
         OpKind::GitLink(link) => Some(format!("git:{} {:?}", link.target_oid, link.kind)),
         OpKind::ChainStart(_)
@@ -320,6 +335,7 @@ mod tests {
 
     fn operation(seq: u64, kind: OpKind) -> Op {
         Op {
+            source: Some(editchain_core::SourceId::new(NodeId(1), 0, seq)),
             id: OpId::new(NodeId(1), 0, seq),
             parents: ParentSet::None,
             actor: ActorId(1),

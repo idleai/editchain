@@ -66,6 +66,7 @@ fn scans_frozen_concatenated_pages_with_exact_offsets_and_flags() {
                 offset: 0
             },
             ScanItem::Record(crate::format::scan::RecordRef {
+                checksum: None,
                 page_sequence: 7,
                 offset: 8,
                 data_offset: 13,
@@ -77,6 +78,7 @@ fn scans_frozen_concatenated_pages_with_exact_offsets_and_flags() {
                 offset: 17
             },
             ScanItem::Record(crate::format::scan::RecordRef {
+                checksum: None,
                 page_sequence: 8,
                 offset: 25,
                 data_offset: 30,
@@ -123,8 +125,8 @@ fn every_truncation_preserves_only_complete_records() {
 fn distinguishes_invalid_unsupported_and_oversized_input() {
     let invalid = PageScanner::new(b"bad!").next().unwrap().unwrap_err();
     assert_eq!(invalid.kind, ScanErrorKind::InvalidMagic);
-    let unsupported = PageScanner::new(b"EC03").next().unwrap().unwrap_err();
-    assert_eq!(unsupported.kind, ScanErrorKind::UnsupportedFormat(*b"EC03"));
+    let unsupported = PageScanner::new(b"EC99").next().unwrap().unwrap_err();
+    assert_eq!(unsupported.kind, ScanErrorKind::UnsupportedFormat(*b"EC99"));
     let mut bytes = b"EC02\x00\x00\x00\x00".to_vec();
     let declared = MAX_RECORD_BYTES.saturating_add(1);
     bytes.extend_from_slice(&declared.to_le_bytes());

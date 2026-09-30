@@ -31,7 +31,7 @@ pub(super) struct GitTracker {
 impl GitTracker {
     pub(super) fn follow_links(&mut self, ops: &[editchain_core::Op]) {
         for op in ops {
-            if let editchain_core::OpKind::GitLink(link) = &op.kind {
+            for link in editchain_project::GitProjection::operation_links(op) {
                 if self
                     .commits
                     .contains_key(&(link.target_repo, link.target_oid))
@@ -191,6 +191,7 @@ impl LiveWorkspace {
                 continue;
             };
             let meta = LiveBlockMeta {
+                source_stream: None,
                 task_group: None,
                 task_summary: None,
                 task_protected: true,

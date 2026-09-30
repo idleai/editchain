@@ -48,6 +48,7 @@ use crate::{
 
 fn operation(seq: u64, payload: Payload) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(7), 1, seq)),
         id: OpId::new(NodeId(7), 1, seq),
         parents: ParentSet::None,
         actor: ActorId(17),

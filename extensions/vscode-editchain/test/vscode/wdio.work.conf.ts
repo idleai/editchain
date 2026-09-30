@@ -5,6 +5,10 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 const repository = path.resolve(__dirname, '../../../..');
+if (!process.env.EDITCHAIN_WORK_CLI) {
+  execFileSync('cargo', ['build', '--locked', '-p', 'editchain'], { cwd: repository, stdio: 'inherit' });
+  process.env.EDITCHAIN_WORK_CLI = path.join(repository, 'target/debug/editchain');
+}
 const owner = !process.env.EDITCHAIN_WORK_FIXTURE;
 const fixture = process.env.EDITCHAIN_WORK_FIXTURE || fs.mkdtempSync(path.join(os.tmpdir(), 'editchain-work-'));
 process.env.EDITCHAIN_WORK_FIXTURE = fixture;

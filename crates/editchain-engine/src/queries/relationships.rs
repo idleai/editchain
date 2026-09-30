@@ -11,6 +11,8 @@ use super::{ChainQueries, ContentStatus, HistoryEntry, PageRequest, QueryPage, R
 /// A recorded operation, session, or repository-qualified Git object identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntityRef {
+    /// Schema-three logical identity.
+    Item(editchain_core::activity::ItemId),
     /// Operation identity; the target can be missing or quarantined.
     Operation(OpId),
     /// Producer-assigned session identity.
@@ -27,6 +29,8 @@ pub enum EntityRef {
 /// Exact asserted relationship kind, with no controller or rendering semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RelationshipKind {
+    /// Named direct schema-three field or explicit link relation.
+    Recorded(String),
     /// The source operation's envelope names the target causal parent.
     CausalParent,
     /// An annotation names a target. The source is the note itself; its causal
@@ -101,7 +105,7 @@ pub(super) fn recorded_relationships(entry: &HistoryEntry) -> Vec<RecordedRelati
             content: entry.content.clone(),
         });
     };
-    for parent in &operation.parents {
+    for parent in operation.parent_ids() {
         add(
             EntityRef::Operation(operation.id),
             EntityRef::Operation(*parent),
@@ -109,6 +113,9 @@ pub(super) fn recorded_relationships(entry: &HistoryEntry) -> Vec<RecordedRelati
         );
     }
     match &operation.kind {
+        OpKind::Activity(record) => {
+            modern_relationships(record, &mut add);
+        }
         OpKind::Note(note) => {
             for target in &note.target_ids {
                 add(
@@ -170,4 +177,115 @@ pub(super) fn recorded_relationships(entry: &HistoryEntry) -> Vec<RecordedRelati
         | OpKind::Unknown(_) => {}
     }
     relations
+}
+
+fn modern_relationships(
+    record: &editchain_core::activity::Operation,
+    add: &mut impl FnMut(EntityRef, EntityRef, RelationshipKind),
+) {
+    use editchain_core::activity::{Entity, Kind};
+    let operation = EntityRef::Operation(record.id);
+    let mut field =
+        |source, target, name: &str| add(source, target, RelationshipKind::Recorded(name.into()));
+    if let Some(session) = record.session {
+        field(operation, EntityRef::Item(session), "session");
+    }
+    if let Some(turn) = record.turn {
+        field(operation, EntityRef::Item(turn), "turn");
+    }
+    for cause in &record.causes {
+        field(operation, EntityRef::Item(*cause), "cause");
+    }
+    if let Some(original) = &record.original {
+        field(
+            operation,
+            EntityRef::Operation(original.operation),
+            "original",
+        );
+    }
+    let entity = |value: &Entity| match value {
+        Entity::Operation(id) => EntityRef::Operation(*id),
+        Entity::Item(id) => EntityRef::Item(*id),
+        Entity::Git { repository, oid } => EntityRef::Git {
+            repository: *repository,
+            oid: *oid,
+        },
+    };
+    match &record.kind {
+        Kind::Session(session) => {
+            if let Some(parent) = session.parent {
+                field(
+                    EntityRef::Item(record.item),
+                    EntityRef::Item(parent),
+                    "parent_session",
+                );
+            }
+            if let Some(cause) = session.initiated_by {
+                field(
+                    EntityRef::Item(record.item),
+                    EntityRef::Operation(cause),
+                    "initiated_by",
+                );
+            }
+        }
+        Kind::Turn(turn) => {
+            for trigger in &turn.triggers {
+                field(operation, EntityRef::Operation(*trigger), "trigger");
+            }
+        }
+        Kind::Message(message) => {
+            if let Some(coverage) = &message.coverage {
+                for covered in &coverage.operations {
+                    field(operation, EntityRef::Operation(*covered), "summarizes");
+                }
+            }
+        }
+        Kind::Tool(tool) => {
+            if let Some(parent) = tool.parent_call {
+                field(
+                    EntityRef::Item(record.item),
+                    EntityRef::Item(parent),
+                    "parent_call",
+                );
+            }
+        }
+        Kind::File(file) => {
+            if let Some(cause) = file.caused_by {
+                field(operation, EntityRef::Item(cause), "caused_by");
+            }
+        }
+        Kind::Note(note) => {
+            for item in &note.items {
+                field(operation, EntityRef::Item(*item), "annotates");
+            }
+            for target in &note.targets {
+                field(operation, EntityRef::Operation(*target), "annotates");
+            }
+        }
+        Kind::Link(link) => {
+            for target in &link.to {
+                field(entity(&link.from), entity(target), &link.relation);
+            }
+        }
+        Kind::Commit(commit) => {
+            let source = EntityRef::Git {
+                repository: commit.repository,
+                oid: commit.oid,
+            };
+            for parent in &commit.parents {
+                field(
+                    source,
+                    EntityRef::Git {
+                        repository: commit.repository,
+                        oid: *parent,
+                    },
+                    "git_parent",
+                );
+            }
+            if let Some(original) = commit.imported_record {
+                field(source, EntityRef::Operation(original), "original");
+            }
+        }
+        Kind::Author(_) | Kind::Original(_) => {}
+    }
 }

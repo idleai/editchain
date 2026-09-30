@@ -42,6 +42,7 @@ impl HistoryProjection {
         // ops. Response_item rows consume one pair slot per matching event_msg
         // row as the main loop reaches them in input order.
         let mut echo_pairs = meta::EchoPairState::from_ops(&self.ops);
+        let origins: HashMap<_, _> = self.ops.iter().map(|op| (op.id, op.source)).collect();
         // Set of raw import op ids (the linear backbone).
         let import_ids: std::collections::HashSet<OpId> = self
             .ops
@@ -70,7 +71,7 @@ impl HistoryProjection {
             ) {
                 continue;
             }
-            let Some(anchor) = op.parents.iter().next().copied() else {
+            let Some(anchor) = op.parent_ids().next().copied() else {
                 continue;
             };
             for target in &note.target_ids {
@@ -118,7 +119,8 @@ impl HistoryProjection {
                 | editchain_core::OpKind::Error(_)
                 | editchain_core::OpKind::GitCommit(_)
                 | editchain_core::OpKind::GitLink(_)
-                | editchain_core::OpKind::Unknown(_) => None,
+                | editchain_core::OpKind::Unknown(_)
+                | editchain_core::OpKind::Activity(_) => None,
             })
             .collect();
         for occurrences in event_occurrences.values() {
@@ -146,7 +148,11 @@ impl HistoryProjection {
                 }
             }
             for equivalent in by_payload.values() {
-                let Some(canonical) = equivalent.iter().copied().min() else {
+                let Some(canonical) = equivalent
+                    .iter()
+                    .copied()
+                    .min_by_key(|id| (origins.get(id).copied().flatten(), *id))
+                else {
                     continue;
                 };
                 for occurrence in equivalent {
@@ -165,6 +171,7 @@ impl HistoryProjection {
             &self.relationship_notes,
             &entity_occurrences,
             &representative,
+            &self.ops,
         );
         // Map raw import op id -> its normalized children (in input order).
         let mut children_of: HashMap<OpId, Vec<&Op>> = HashMap::new();
@@ -182,7 +189,7 @@ impl HistoryProjection {
             {
                 continue;
             }
-            for &parent in &op.parents {
+            for &parent in op.parent_ids() {
                 if import_ids.contains(&parent) {
                     let _: bool = folded.insert(op.id);
                     children_of.entry(parent).or_default().push(op);
@@ -310,7 +317,7 @@ impl HistoryProjection {
             if !is_hidden_relation_fact(op) || representative.contains_key(&op.id) {
                 continue;
             }
-            let endpoint = op.parents.iter().next().copied().or_else(|| {
+            let endpoint = op.parent_ids().next().copied().or_else(|| {
                 if let editchain_core::OpKind::Note(n) = &op.kind {
                     n.target_ids.first().copied()
                 } else {
@@ -447,7 +454,7 @@ impl HistoryProjection {
             let has_provider_parent = has_exact_provider_parent(op.id, notes.map(Vec::as_slice));
             let mut candidates = std::collections::BTreeSet::new();
             if !has_provider_parent {
-                for parent in &op.parents {
+                for parent in op.parent_ids() {
                     if let Some(parent) = canonical_present_op(*parent, representative, &present) {
                         let _: bool = candidates.insert(parent);
                     }
@@ -754,7 +761,8 @@ impl HistoryProjection {
                 | editchain_core::OpKind::Error(_)
                 | editchain_core::OpKind::GitCommit(_)
                 | editchain_core::OpKind::GitLink(_)
-                | editchain_core::OpKind::Unknown(_) => None,
+                | editchain_core::OpKind::Unknown(_)
+                | editchain_core::OpKind::Activity(_) => None,
             })
             .collect()
     }

@@ -437,7 +437,7 @@ pub(super) fn run(
 fn report_checkpoint(workspace: &str, chain_root: &Path) {
     match crate::history::prepare_live_checkpoint(Path::new(workspace), chain_root) {
         Ok(snapshot) => println!(
-            "Live checkpoint ready: {} visible rows at {}/live-v1",
+            "Live checkpoint ready: {} visible rows at {}/live-v3",
             snapshot.nodes,
             snapshot.chain
         ),

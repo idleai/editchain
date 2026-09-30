@@ -3,7 +3,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use editchain_core::payload;
-use editchain_core::{Admission, BlobRef, ContentId, NodeId, NoteRelationship, Op, OpKind, OpSet};
+use editchain_core::{
+    Admission, BlobRef, ContentId, NodeId, NoteRelationship, Op, OpId, OpKind, OpSet,
+};
 use editchain_store::format::{encode_op, encoded_op_len};
 
 use editchain_store::durable::{atomic_write, sync_parent_dir};
@@ -23,6 +25,18 @@ pub trait OpSink {
     ///
     /// Returns [`ImportError`] if the operation cannot be stored.
     fn accept_op(&mut self, op: &Op) -> Result<Admission, ImportError>;
+
+    /// Whether a private conversion batch needs an already accepted source record.
+    fn needs_source_context(&self, _id: OpId) -> bool {
+        false
+    }
+
+    /// Retain context for conversion without emitting or counting another operation.
+    /// # Errors
+    /// Returns capture resource-limit errors.
+    fn observe_source(&mut self, _op: &Op) -> Result<(), ImportError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -64,6 +78,15 @@ pub trait BlobSink {
     ///
     /// Returns [`ImportError`] if the blob cannot be stored.
     fn store_blob(&mut self, data: &[u8]) -> Result<(), ImportError>;
+
+    /// Read a blob back when conversion needs source fields. Write-only sinks may
+    /// return `None` for legacy capture. Schema-three capture requires readable
+    /// source blobs and fails before accepting cursors when they are unavailable.
+    /// # Errors
+    /// Returns storage or content validation errors.
+    fn read_blob(&self, _reference: &BlobRef) -> Result<Option<Vec<u8>>, ImportError> {
+        Ok(None)
+    }
 
     /// Store a blob and return a `BlobRef` referencing it.
     ///
@@ -284,6 +307,7 @@ impl Default for BatchLimits {
 pub struct MemoryOpSink {
     /// Distinct retained operations in emission order.
     pub ops: Vec<Op>,
+    pub(crate) source_context: std::collections::BTreeMap<OpId, Op>,
     evidence: OpSet,
     retained_variants: usize,
     encoded_bytes: u64,
@@ -291,6 +315,9 @@ pub struct MemoryOpSink {
 }
 
 impl MemoryOpSink {
+    pub(crate) const fn limits(&self) -> BatchLimits {
+        self.limits
+    }
     /// Create a new empty memory op sink.
     #[must_use]
     pub fn new() -> Self {
@@ -314,6 +341,33 @@ impl MemoryOpSink {
 }
 
 impl OpSink for MemoryOpSink {
+    fn needs_source_context(&self, id: OpId) -> bool {
+        !self.evidence.contains(&id) && !self.source_context.contains_key(&id)
+    }
+
+    fn observe_source(&mut self, op: &Op) -> Result<(), ImportError> {
+        if !self.needs_source_context(op.id) {
+            return Ok(());
+        }
+        let bytes = u64::try_from(
+            encoded_op_len(op).map_err(|error| ImportError::OpSink(error.to_string()))?,
+        )
+        .map_err(io::Error::other)?;
+        let total = self
+            .encoded_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| ImportError::OpSink("context byte count exhausted".into()))?;
+        if total > self.limits.encoded_bytes || self.source_context.len() >= self.limits.operations
+        {
+            return Err(ImportError::OpSink(
+                "source context exceeds capture bounds".into(),
+            ));
+        }
+        let _old = self.source_context.insert(op.id, op.clone());
+        self.encoded_bytes = total;
+        Ok(())
+    }
+
     fn accept_op(&mut self, op: &Op) -> Result<Admission, ImportError> {
         let length = encoded_op_len(op).map_err(|error| ImportError::OpSink(error.to_string()))?;
         let bytes = u64::try_from(length).map_err(io::Error::other)?;
@@ -361,6 +415,13 @@ impl MemoryBlobSink {
 }
 
 impl BlobSink for MemoryBlobSink {
+    fn read_blob(&self, reference: &BlobRef) -> Result<Option<Vec<u8>>, ImportError> {
+        Ok(self
+            .blobs
+            .iter()
+            .find(|bytes| ContentId::Hash256(hash_raw(bytes)) == reference.id)
+            .cloned())
+    }
     fn store_blob(&mut self, data: &[u8]) -> Result<(), ImportError> {
         self.blobs.push(data.to_vec());
         Ok(())
@@ -403,6 +464,12 @@ impl ContentAddressedBlobSink {
 }
 
 impl BlobSink for ContentAddressedBlobSink {
+    fn read_blob(&self, reference: &BlobRef) -> Result<Option<Vec<u8>>, ImportError> {
+        let ContentId::Hash256(hash) = reference.id else {
+            return Ok(None);
+        };
+        Ok(self.get(&hash).map(<[u8]>::to_vec))
+    }
     fn store_blob(&mut self, data: &[u8]) -> Result<(), ImportError> {
         let hash = hash_raw(data);
         let _: &mut Vec<u8> = self.blobs.entry(hash).or_insert_with(|| data.to_vec());
@@ -466,6 +533,22 @@ impl CursorStore for MemoryCursorStore {
 pub use editchain_store::BlobStore as FsBlobSink;
 
 impl BlobSink for FsBlobSink {
+    fn read_blob(&self, reference: &BlobRef) -> Result<Option<Vec<u8>>, ImportError> {
+        let ContentId::Hash256(hash) = reference.id else {
+            return Ok(None);
+        };
+        let bytes = self
+            .get(&hash)
+            .map_err(|error| ImportError::BlobSink(error.to_string()))?;
+        if bytes.as_ref().is_some_and(|bytes| {
+            u32::try_from(bytes.len()).ok() != Some(reference.len) || hash_raw(bytes) != hash
+        }) {
+            return Err(ImportError::BlobSink(
+                "source blob does not match its reference".into(),
+            ));
+        }
+        Ok(bytes)
+    }
     fn store_blob(&mut self, data: &[u8]) -> Result<(), ImportError> {
         self.write(data)
             .map_err(|error| ImportError::BlobSink(error.to_string()))
@@ -794,7 +877,8 @@ mod tests {
 
     fn captured_record(bytes: &[u8]) -> Op {
         Op {
-            id: editchain_core::OpId::new(NodeId(1), 0, 1),
+            source: Some(editchain_core::SourceId::new(NodeId(1), 0, 1)),
+            id: OpId::new(NodeId(1), 0, 1),
             parents: editchain_core::ParentSet::None,
             actor: editchain_core::ActorId(0),
             clock: editchain_core::Clock::None,
@@ -832,7 +916,8 @@ mod tests {
             "both conflicting variants remain inert"
         );
         let mut extra = second.clone();
-        extra.id.seq = 2;
+        extra.source.as_mut().unwrap().seq = 2;
+        extra.id = extra.source.unwrap().id();
         assert!(emit_op(&extra, &mut sink, &mut report, EmissionKind::Raw).is_err());
         assert_eq!(report.raw_ops, 2, "failed admission does not change counts");
         assert_eq!(

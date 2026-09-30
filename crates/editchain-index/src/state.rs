@@ -11,13 +11,16 @@ use crate::{
     OrderedSet,
 };
 
-pub(crate) const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct State {
     pub(crate) version: u32,
     pub(crate) tail: IndexedTail,
     pub(crate) records: OrderedMap<OpId, OpRecordLocation>,
+    pub(crate) identities: OrderedSet<OpId>,
+    pub(crate) aliases: OrderedMap<OpId, OrderedSet<OpId>>,
+    pub(crate) items: OrderedSet<OpId>,
     pub(crate) postings: Map<IndexKey, OrderedSet<OpId>>,
     pub(crate) content: ContentIndex,
 }
@@ -29,9 +32,13 @@ impl State {
             version: VERSION,
             tail,
             records: OrderedMap::new(),
+            identities: OrderedSet::new(),
+            aliases: OrderedMap::new(),
+            items: OrderedSet::new(),
             postings: Map::new(),
             content: ContentIndex::default(),
         };
+        state.identities.extend(state.tail.chain().identities());
         let mut reads = 0;
         let operations: Vec<_> = state.tail.chain().shared_ops().collect();
         for op in operations {
@@ -43,6 +50,15 @@ impl State {
                 .ok_or_else(|| invalid("accepted operation has no record location"))?;
             state.add(&op, location, blobs, &mut reads)?;
         }
+        state.remember_conflicts(
+            root,
+            &state
+                .tail
+                .chain()
+                .identities()
+                .filter(|id| state.tail.chain().get(*id).is_none())
+                .collect::<Vec<_>>(),
+        )?;
         Ok(state)
     }
 
@@ -53,11 +69,14 @@ impl State {
         blobs: &impl BlobSource,
         reads: &mut u64,
     ) -> io::Result<BTreeSet<OpId>> {
+        self.identities.extend(delta.removed.iter().copied());
+        self.identities.extend(delta.added.keys().copied());
         for id in &delta.removed {
             if let Some(location) = self.records.remove(id) {
                 self.remove(&read_op_at(root, location)?);
             }
         }
+        self.remember_conflicts(root, &delta.removed.iter().copied().collect::<Vec<_>>())?;
         let changed = self.content.refresh(blobs, reads)?;
         for (op, location) in delta.added.values() {
             self.add(op, *location, blobs, reads)?;
@@ -72,6 +91,7 @@ impl State {
         blobs: &impl BlobSource,
         reads: &mut u64,
     ) -> io::Result<()> {
+        self.remember(op);
         let references = references(op);
         for reference in &references {
             self.content.add(*reference, op.id, blobs, reads)?;
@@ -81,6 +101,40 @@ impl State {
         }
         let _previous = self.records.insert(op.id, location);
         Ok(())
+    }
+
+    fn remember_conflicts(&mut self, root: &Path, ids: &[OpId]) -> io::Result<()> {
+        for id in ids {
+            let locations: Vec<_> = self.tail.chain().record_locations(*id).collect();
+            for location in locations {
+                self.remember(&read_op_at(root, location)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn remember(&mut self, op: &Op) {
+        if let editchain_core::OpKind::Activity(record) = &op.kind {
+            let _inserted = self.items.insert(record.item.0);
+            self.items.extend(
+                record
+                    .session
+                    .into_iter()
+                    .chain(record.turn)
+                    .chain(record.author)
+                    .map(|id| id.0),
+            );
+            if let Some(legacy) = &record.legacy {
+                let _inserted = self
+                    .aliases
+                    .entry(legacy.operation)
+                    .or_default()
+                    .insert(op.id);
+                for id in &legacy.folded {
+                    let _inserted = self.aliases.entry(*id).or_default().insert(op.id);
+                }
+            }
+        }
     }
 
     fn remove(&mut self, op: &Op) {
@@ -100,6 +154,15 @@ impl State {
 
     pub(crate) fn matches(&self, expected: &Self) -> bool {
         self.version == expected.version
+            && self.items.iter().eq(expected.items.iter())
+            && self.aliases.len() == expected.aliases.len()
+            && self.aliases.iter().all(|(key, ids)| {
+                expected
+                    .aliases
+                    .get(key)
+                    .is_some_and(|other| ids.iter().eq(other.iter()))
+            })
+            && self.identities.iter().eq(expected.identities.iter())
             && self.records.len() == expected.records.len()
             && self.records.iter().eq(expected.records.iter())
             && self.postings.len() == expected.postings.len()

@@ -37,8 +37,8 @@ use editchain_store::{
 };
 
 pub use editchain_core::{
-    admission::*, clock::*, git::*, ids::*, op::*, parents::*, payload::*, provider, records,
-    scope::*, tags::*,
+    activity, admission::*, clock::*, git::*, ids::*, op::*, parents::*, payload::*, provider,
+    records, scope::*, tags::*, IdQuery,
 };
 pub use editchain_store::format::{decode_op, encode_op};
 pub use editchain_store::{BlobResolution, ChainReadStats};

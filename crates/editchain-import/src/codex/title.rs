@@ -14,7 +14,7 @@ use editchain_core::op::{ImportOp, OpKind};
 use editchain_core::parents::ParentSet;
 use editchain_core::scope::ScopeRef;
 use editchain_core::tags::Tags;
-use editchain_core::{Op, OpId, SessionId};
+use editchain_core::{Op, SessionId};
 use serde_json::Value;
 
 use crate::error::ImportError;
@@ -130,7 +130,7 @@ pub(crate) fn session_title_op(
     title: &CodexSessionTitle,
     owning_thread: &str,
     session_id: SessionId,
-    first_raw: OpId,
+    first_raw: editchain_core::SourceId,
     blobs: &mut dyn BlobSink,
 ) -> Result<Op, ImportError> {
     let hash = blake3::Hash::from_bytes(title.source_hash).to_hex();
@@ -143,8 +143,12 @@ pub(crate) fn session_title_op(
     });
     let encoded = serde_json::to_vec(&value).map_err(ImportError::Json)?;
     Ok(Op {
+        source: Some(crate::ids::derive_external_entity_source(
+            "codex:session-title:v1",
+            &identity,
+        )),
         id: derive_external_entity_id("codex:session-title:v1", &identity),
-        parents: ParentSet::One(first_raw),
+        parents: ParentSet::One(first_raw.id()),
         actor: derive_actor_id(&format!("system:{owning_thread}")),
         clock: Clock::UnixMs(
             title

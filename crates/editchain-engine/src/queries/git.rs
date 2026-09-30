@@ -17,6 +17,12 @@ pub struct GitQuery {
     pub oid: Option<GitOid>,
 }
 
+impl GitQuery {
+    fn matches(self, repository: RepositoryId, oid: GitOid) -> bool {
+        repository == self.repository && self.oid.is_none_or(|target| target == oid)
+    }
+}
+
 impl ChainQueries {
     /// Read Git observations, preserving imported/live ref snapshots separately.
     ///
@@ -32,6 +38,28 @@ impl ChainQueries {
         let mut history = self.history(None, page)?;
         history.items.retain(|entry| {
             let key = match &entry.operation.kind {
+                OpKind::Activity(record) => match &record.kind {
+                    editchain_core::activity::Kind::Commit(commit) => {
+                        Some((commit.repository, commit.oid))
+                    }
+                    editchain_core::activity::Kind::Link(link) => {
+                        return link.to.iter().any(|target| match target {
+                            editchain_core::activity::Entity::Git { repository, oid } => {
+                                query.matches(*repository, *oid)
+                            }
+                            editchain_core::activity::Entity::Operation(_)
+                            | editchain_core::activity::Entity::Item(_) => false,
+                        });
+                    }
+                    editchain_core::activity::Kind::Session(_)
+                    | editchain_core::activity::Kind::Turn(_)
+                    | editchain_core::activity::Kind::Message(_)
+                    | editchain_core::activity::Kind::Tool(_)
+                    | editchain_core::activity::Kind::File(_)
+                    | editchain_core::activity::Kind::Note(_)
+                    | editchain_core::activity::Kind::Author(_)
+                    | editchain_core::activity::Kind::Original(_) => None,
+                },
                 OpKind::GitCommit(commit) => Some((commit.repository, commit.oid)),
                 OpKind::GitLink(link) => Some((link.target_repo, link.target_oid)),
                 OpKind::ChainStart(_)
@@ -47,9 +75,7 @@ impl ChainQueries {
                 | OpKind::Error(_)
                 | OpKind::Unknown(_) => None,
             };
-            key.is_some_and(|(repository, oid)| {
-                repository == query.repository && query.oid.is_none_or(|target| target == oid)
-            })
+            key.is_some_and(|(repository, oid)| query.matches(repository, oid))
         });
         Ok(history)
     }

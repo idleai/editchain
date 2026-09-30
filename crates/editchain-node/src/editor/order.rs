@@ -10,21 +10,20 @@ pub(super) fn sources(operations: Vec<Op>) -> super::Result<Vec<Op>> {
     let mut ready = BTreeSet::new();
     for (id, op) in &pending {
         let parents: Vec<_> = op
-            .parents
-            .iter()
+            .parent_ids()
             .filter(|parent| pending.contains_key(parent))
             .copied()
             .collect();
         let _previous = remaining.insert(*id, parents.len());
         if parents.is_empty() {
-            let _inserted = ready.insert(*id);
+            let _inserted = ready.insert((op.source, *id));
         }
         for parent in parents {
             children.entry(parent).or_default().push(*id);
         }
     }
     let mut ordered = Vec::with_capacity(pending.len());
-    while let Some(id) = ready.pop_first() {
+    while let Some((_, id)) = ready.pop_first() {
         if let Some(op) = pending.remove(&id) {
             ordered.push(op);
         }
@@ -34,7 +33,7 @@ pub(super) fn sources(operations: Vec<Op>) -> super::Result<Vec<Op>> {
                 .ok_or("missing editor replay dependency")?;
             *count = count.saturating_sub(1);
             if *count == 0 {
-                let _inserted = ready.insert(child);
+                let _inserted = ready.insert((pending.get(&child).and_then(|op| op.source), child));
             }
         }
     }

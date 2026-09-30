@@ -13,6 +13,7 @@ mod late_content;
 mod partial_items;
 mod pending_imports;
 mod reconciliation;
+mod schema3;
 
 fn request(root: &std::path::Path) -> OpenRequest {
     OpenRequest {
@@ -38,7 +39,7 @@ fn stage(
             key: "native-task".into(),
             thread: "thread".into(),
             turn: "turn".into(),
-            boundary: OpId::new(NodeId(1), 0, 0),
+            boundary: editchain_core::SourceId::new(NodeId(1), 0, 0),
         }),
     };
     drop(workspace.inputs.insert(key.clone(), input));

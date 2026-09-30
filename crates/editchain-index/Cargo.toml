@@ -19,5 +19,6 @@ editchain-index-pages = { path = "../editchain-index-pages" }
 serde = { workspace = true, features = ["rc"] }
 
 [dev-dependencies]
+postcard.workspace = true
 blake3 = "1"
 tempfile = "3"

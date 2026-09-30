@@ -6,7 +6,7 @@ use crate::provider::{decode_evidence, resolve_records, RawCorpus};
 use editchain_core::provider::{
     CodexLifecycleEvent, CodexSourceEvidence, CodexThreadId, ProviderFact,
 };
-use editchain_core::{NoteRelationship, Op, OpId, OpKind, ScopeRef};
+use editchain_core::{NoteRelationship, Op, OpId, OpKind, ScopeRef, SourceId};
 use editchain_index::{Map, OrderedSet};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -44,8 +44,11 @@ struct Prefix {
 
 impl Prefix {
     fn edit(&mut self, op: &Op, added: bool) {
+        let Some(source) = op.source else {
+            return;
+        };
         if added {
-            let _: bool = self.sequences.insert(op.id.seq);
+            let _: bool = self.sequences.insert(source.seq);
             if let Some((_, count)) = self.scopes.iter_mut().find(|(scope, _)| *scope == op.scope) {
                 *count = count.saturating_add(1);
             } else {
@@ -53,16 +56,16 @@ impl Prefix {
             }
             self.irregular = self
                 .irregular
-                .saturating_add(usize::from(op.id.seq.trailing_zeros() < 16));
+                .saturating_add(usize::from(source.seq.trailing_zeros() < 16));
         } else {
-            let _: bool = self.sequences.remove(&op.id.seq);
+            let _: bool = self.sequences.remove(&source.seq);
             if let Some((_, count)) = self.scopes.iter_mut().find(|(scope, _)| *scope == op.scope) {
                 *count = count.saturating_sub(1);
             }
             self.scopes.retain(|(_, count)| *count > 0);
             self.irregular = self
                 .irregular
-                .saturating_sub(usize::from(op.id.seq.trailing_zeros() < 16));
+                .saturating_sub(usize::from(source.seq.trailing_zeros() < 16));
         }
     }
 }
@@ -84,9 +87,11 @@ pub(super) struct Topology {
 
 impl Topology {
     pub(super) fn observe(&mut self, op: &Arc<Op>, added: bool) {
-        let stream = super::stream(op.id);
+        let stream = op.source.map(super::stream);
         if matches!(op.kind, OpKind::Import(_)) {
-            self.raw.entry(stream).or_default().edit(op, added);
+            if let Some(stream) = stream {
+                self.raw.entry(stream).or_default().edit(op, added);
+            }
         }
         if let Some(record) = decode_evidence(op) {
             match record.payload.fact {
@@ -133,9 +138,8 @@ impl Topology {
                 ProviderFact::CodexDerivation(_) | ProviderFact::ClaudeDerivation(_) => {}
             }
         }
-        let threads = self
-            .source_threads
-            .get(&stream)
+        let threads = stream
+            .and_then(|stream| self.source_threads.get(&stream))
             .cloned()
             .unwrap_or_default();
         for thread in threads {
@@ -189,8 +193,8 @@ impl Topology {
             );
             let mut edges = BTreeSet::new();
             for op in resolved.notes {
-                if let OpKind::Note(note) = op.kind {
-                    for anchor in &op.parents {
+                if let OpKind::Note(note) = &op.kind {
+                    for anchor in op.parent_ids() {
                         for target in &note.target_ids {
                             let _: bool = edges.insert(RelationEdge {
                                 anchor: *anchor,
@@ -248,9 +252,9 @@ struct Corpus<'a> {
 }
 
 impl RawCorpus for Corpus<'_> {
-    fn matches(&self, source: OpId, hash: [u8; 32]) -> bool {
+    fn matches(&self, source: SourceId, hash: [u8; 32]) -> bool {
         self.ops
-            .get(&source)
+            .get(&source.id())
             .is_some_and(|op| matches!(&op.kind, OpKind::Import(raw) if raw.raw_hash == Some(hash)))
     }
     fn complete(&self, meta: &CodexSourceEvidence, scope: ScopeRef) -> bool {

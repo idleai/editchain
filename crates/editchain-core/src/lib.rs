@@ -4,7 +4,11 @@
 use postcard as _;
 #[cfg(test)]
 use proptest as _;
+#[cfg(test)]
+use serde_json as _;
 
+/// Schema-three operations for imported and streaming activity.
+pub mod activity;
 /// Canonical admission and retained conflict evidence.
 pub mod admission;
 /// Clock types for causal ordering.
@@ -13,8 +17,13 @@ pub mod clock;
 pub mod git;
 /// Human work episodes and exact observed buffer revisions.
 pub mod human;
+/// Query prefixes over canonical operation identities.
+pub mod id_query;
 /// Identifier types (`NodeId`, `ActorId`, `OpId`, etc.).
 pub mod ids;
+pub use id_query::IdQuery;
+/// Frozen legacy wire types for explicit migration.
+pub mod legacy;
 /// Operation envelope and all operation kinds.
 pub mod op;
 /// Parent reference types for causal DAG ordering.

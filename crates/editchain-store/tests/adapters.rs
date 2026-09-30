@@ -7,6 +7,7 @@ use editchain_index_pages as _;
 use postcard as _;
 use proptest as _;
 use serde as _;
+use serde_json as _;
 
 use editchain_core::{
     ActorId, Admission, Clock, MessageOp, NodeId, Op, OpId, OpKind, ParentSet, Payload, ScopeRef,
@@ -20,6 +21,7 @@ use editchain_store::{
 
 fn operation(sequence: u64, bytes: &[u8]) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 99, sequence)),
         id: OpId::new(NodeId(1), 99, sequence),
         parents: ParentSet::None,
         actor: ActorId(u64::MAX),
@@ -38,8 +40,21 @@ fn every_interrupted_page_prefix_preserves_original_evidence_and_locations() {
     let original = operation(7, b"\xff\0original\r\n");
     let encoded = encode_op(&original).unwrap();
     // Same decoded identity, distinct byte evidence. Never normalize on recovery.
+    let legacy = editchain_core::legacy::LegacyOp {
+        id: original.source.unwrap(),
+        parents: ParentSet::None,
+        actor: original.actor,
+        clock: original.clock,
+        scope: original.scope,
+        tags: original.tags,
+        kind: OpKind::Message(MessageOp {
+            content: Payload::Inline(b"\xff\0original\r\n".to_vec()),
+            content_type: Payload::Empty,
+        }),
+    };
+    let legacy_bytes = postcard::to_stdvec(&legacy).unwrap();
     let mut alternate = vec![0x81, 0];
-    alternate.extend_from_slice(encoded.get(1..).unwrap());
+    alternate.extend_from_slice(legacy_bytes.get(1..).unwrap());
     assert_eq!(decode_op(&alternate).unwrap(), original);
     let later = encode_op(&operation(8, b"after interrupted write")).unwrap();
     let mut page = Page::new(73);
@@ -95,7 +110,7 @@ fn every_interrupted_page_prefix_preserves_original_evidence_and_locations() {
 fn repeated_writer_lifetimes_pack_records_and_size_rotation_preserves_flags() {
     let directory = tempfile::tempdir().unwrap();
     let options = SegmentOptions {
-        max_segment_bytes: 64,
+        max_segment_bytes: 192,
     };
     for value in 0u8..100 {
         let mut store = SegmentStore::open_with_options(directory.path(), options).unwrap();
@@ -114,7 +129,7 @@ fn repeated_writer_lifetimes_pack_records_and_size_rotation_preserves_flags() {
     assert!(
         files
             .iter()
-            .all(|path| std::fs::metadata(path).unwrap().len() == 64),
+            .all(|path| std::fs::metadata(path).unwrap().len() == 192),
         "four framed records share each segment"
     );
     let mut observed = Vec::new();

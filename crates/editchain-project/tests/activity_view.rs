@@ -72,6 +72,7 @@ fn complete_view_retains_explicit_dispositions_for_every_accepted_source() {
     let visible = msg_op(70, 1, 1_000, None, "visible");
     let undated = msg_op(70, 2, 0, Some(visible.id), "undated");
     let trace = Op {
+        source: None,
         kind: OpKind::Import(ImportOp {
             raw_ref: Payload::Inline(br#"{"type":"response_item","payload":{}}"#.to_vec()),
             raw_hash: None,
@@ -144,6 +145,7 @@ fn complete_view_repository_selection_preserves_qualified_identity_and_graph() {
     };
     let source = msg_op(80, 1, 2_000, None, "based on a hidden repository");
     let link = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(80), 0, 2)),
         id: OpId::new(NodeId(80), 0, 2),
         clock: Clock::None,
         kind: OpKind::GitLink(GitLink {
@@ -182,6 +184,7 @@ fn complete_view_repository_selection_preserves_qualified_identity_and_graph() {
 /// Build a message op with a given clock and parent.
 fn msg_op(node: u64, seq: u64, clock_ms: u64, parent: Option<OpId>, text: &str) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: parent.map_or(ParentSet::None, ParentSet::One),
         actor: ActorId(1),
@@ -200,6 +203,7 @@ fn msg_op(node: u64, seq: u64, clock_ms: u64, parent: Option<OpId>, text: &str) 
 /// mirroring the Codex importer's virtual-edge shape.
 fn subagent_note(parent_id: OpId, target_id: OpId) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(9), 0, 2)),
         id: OpId::new(NodeId(9), 0, 2),
         parents: ParentSet::One(parent_id),
         actor: ActorId(1),
@@ -300,6 +304,7 @@ fn activity_splices_a_long_hidden_chain_without_recursive_stack_growth() {
 #[test]
 fn activity_view_keeps_undated_metadata_bundled_as_sub_ops() {
     let turn = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 0, 1)),
         id: OpId::new(NodeId(1), 0, 1),
         parents: ParentSet::None,
         actor: ActorId(1),
@@ -312,6 +317,7 @@ fn activity_view_keeps_undated_metadata_bundled_as_sub_ops() {
         }),
     };
     let metadata = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(1), 0, 2)),
         id: OpId::new(NodeId(1), 0, 2),
         parents: ParentSet::One(turn.id),
         actor: ActorId(1),
@@ -397,6 +403,7 @@ fn activity_view_splices_through_undated_structural_endpoints() {
 fn activity_view_preserves_dated_produced_by_sources_without_resolved_targets() {
     for (timestamp, expected_visible) in [(1_000, true), (0, false)] {
         let source = Op {
+            source: Some(editchain_core::SourceId::new(NodeId(7), 0, 1)),
             id: OpId::new(NodeId(7), 0, 1),
             parents: ParentSet::None,
             actor: ActorId(1),
@@ -409,6 +416,7 @@ fn activity_view_preserves_dated_produced_by_sources_without_resolved_targets() 
             }),
         };
         let link = Op {
+            source: Some(editchain_core::SourceId::new(NodeId(7), 0, 2)),
             id: OpId::new(NodeId(7), 0, 2),
             parents: ParentSet::None,
             kind: OpKind::GitLink(GitLink {

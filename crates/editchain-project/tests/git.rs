@@ -2,12 +2,10 @@
 
 use blake3 as _;
 use editchain_engine as _;
-use editchain_import as _;
 use editchain_index as _;
 use editchain_store as _;
 use serde as _;
 use serde_json as _;
-use tempfile as _;
 use tokio as _;
 
 use editchain_core::{
@@ -47,6 +45,7 @@ fn commit_op(id: OpId, repo: RepositoryId, oid: GitOid) -> Op {
         changed_paths: Vec::new(),
     };
     Op {
+        source: None,
         id,
         parents: ParentSet::None,
         actor: ActorId(3),
@@ -120,6 +119,7 @@ fn projection_groups_links_by_source() {
         kind: GitLinkKind::BasedOn,
     };
     let op_a = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(2), 0, 10)),
         id: OpId::new(NodeId(2), 0, 10),
         parents: ParentSet::None,
         actor: ActorId(3),
@@ -129,6 +129,7 @@ fn projection_groups_links_by_source() {
         kind: OpKind::GitLink(link_a),
     };
     let op_b = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(2), 0, 11)),
         id: OpId::new(NodeId(2), 0, 11),
         parents: ParentSet::None,
         actor: ActorId(3),
@@ -147,6 +148,7 @@ fn projection_link_is_not_a_causal_parent() {
     // A git link op must not appear as a causal parent of the commit it links.
     let source = OpId::new(NodeId(1), 0, 5);
     let link_op = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(2), 0, 10)),
         id: OpId::new(NodeId(2), 0, 10),
         parents: ParentSet::None,
         actor: ActorId(3),
@@ -166,4 +168,115 @@ fn projection_link_is_not_a_causal_parent() {
     assert!(matches!(link_op.parents, ParentSet::None));
     let proj = GitProjection::from_ops(&[link_op]);
     assert!(proj.commits().is_empty());
+}
+
+#[test]
+fn migrated_commits_and_all_link_kinds_reach_the_editor_projection() {
+    use editchain_import::batch::DurableOpSink as _;
+    let temp = tempfile::tempdir().unwrap();
+    let old = temp.path().join("old");
+    let new = temp.path().join("new");
+    let source = OpId::new(NodeId(1), 0, 5);
+    let oid = sha1([1; 20]);
+    let repo = RepositoryId(7);
+    let mut ops = vec![
+        commit_op(source, repo, oid),
+        commit_op(OpId::new(NodeId(1), 0, 6), RepositoryId(8), oid),
+    ];
+    let kinds = [
+        GitLinkKind::BasedOn,
+        GitLinkKind::Checkpoint,
+        GitLinkKind::CommittedAs,
+        GitLinkKind::ProducedBy,
+        GitLinkKind::Mentions,
+        GitLinkKind::Custom(Payload::Inline(b"custom relation".to_vec())),
+    ];
+    for (index, kind) in kinds.iter().enumerate() {
+        ops.push(Op {
+            id: OpId::new(NodeId(2), 0, u64::try_from(index).unwrap()),
+            kind: OpKind::GitLink(GitLink {
+                source,
+                target_repo: repo,
+                target_oid: oid,
+                kind: kind.clone(),
+            }),
+            ..ops.first().unwrap().clone()
+        });
+    }
+    let mut log =
+        editchain_store::LogStore::new(editchain_store::SegmentStore::open(&old).unwrap());
+    let _admission = log.append_durable(&ops).unwrap();
+    drop(log);
+    let _report = editchain_import::activity::migrate(&old, &new, || false).unwrap();
+    let mut converted = Vec::new();
+    let _stats = editchain_store::visit_records(&new, &mut |_flags, bytes| {
+        converted.push(editchain_store::format::decode_op(bytes).map_err(std::io::Error::other)?);
+        Ok(())
+    })
+    .unwrap();
+    let modern_source = converted
+        .iter()
+        .find_map(|op| {
+            if let OpKind::Activity(record) = &op.kind {
+                if record
+                    .legacy
+                    .as_ref()
+                    .is_some_and(|old| old.operation == source)
+                {
+                    return Some(op.id);
+                }
+            }
+            None
+        })
+        .unwrap();
+    let projection = editchain_project::HistoryProjection::from_ops(converted);
+    assert_eq!(projection.git().commits().len(), 2);
+    assert_eq!(
+        projection.git().commit(repo, &oid).unwrap().imported_record,
+        Some(modern_source)
+    );
+    assert_eq!(
+        projection
+            .git()
+            .links_from(&modern_source)
+            .iter()
+            .map(|link| &link.kind)
+            .collect::<Vec<_>>(),
+        kinds.iter().collect::<Vec<_>>()
+    );
+    assert!(projection
+        .nodes()
+        .iter()
+        .any(|node| node.node_key() == editchain_core::GitCommitKey::new(repo, oid).to_string()));
+}
+
+#[test]
+fn activity_git_links_keep_multiple_targets_and_ignore_unrelated_relations() {
+    use editchain_core::activity::{Entity, Kind, Link, Operation};
+    let source = OpId::new(NodeId(1), 0, 5);
+    let repo = RepositoryId(7);
+    let first = sha1([1; 20]);
+    let second = sha1([2; 20]);
+    let mut record = Operation::upgrade(&commit_op(source, repo, first)).unwrap();
+    record.kind = Kind::Link(Link {
+        from: Entity::Operation(source),
+        to: vec![
+            Entity::Git {
+                repository: repo,
+                oid: first,
+            },
+            Entity::Git {
+                repository: repo,
+                oid: second,
+            },
+        ],
+        relation: "based_on".into(),
+        content: Payload::Empty,
+    });
+    let op = record.clone().into_op().unwrap();
+    assert_eq!(GitProjection::operation_links(&op).len(), 2);
+    if let Kind::Link(link) = &mut record.kind {
+        link.relation = "ProviderParent".into();
+    }
+    assert!(GitProjection::operation_links(&record.into_op().unwrap()).is_empty());
 }

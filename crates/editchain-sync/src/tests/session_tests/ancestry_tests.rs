@@ -17,15 +17,17 @@ fn fixture(count: u64) -> io::Result<Vec<EncodedRecord>> {
     let mut records = Vec::new();
     for seq in 1..=count {
         let mut raw = operation(seq << 16, Payload::Empty);
-        raw.id.node = NodeId(9000);
+        raw.source.as_mut().unwrap().node = NodeId(9000);
+        raw.id = raw.source.unwrap().id();
         raw.scope = ScopeRef::Session(SessionId(73));
         raw.parents = if seq == 1 {
             ParentSet::None
         } else {
-            ParentSet::One(OpId {
-                seq: seq.saturating_sub(1) << 16,
-                ..raw.id
-            })
+            ParentSet::One(OpId::new(
+                NodeId(9000),
+                raw.source.unwrap().boot,
+                seq.saturating_sub(1) << 16,
+            ))
         };
         raw.kind = OpKind::Import(ImportOp {
             raw_ref: Payload::Inline(br#"{"type":"assistant"}"#.to_vec()),
@@ -33,11 +35,16 @@ fn fixture(count: u64) -> io::Result<Vec<EncodedRecord>> {
         });
         raw.tags = Tags::IMPORT;
         let result = Op {
-            id: OpId {
-                node: NodeId(1),
-                seq: raw.id.seq.saturating_add(1),
-                ..raw.id
-            },
+            source: Some(editchain_core::SourceId::new(
+                NodeId(1),
+                raw.source.unwrap().boot,
+                raw.source.unwrap().seq.saturating_add(1),
+            )),
+            id: OpId::new(
+                NodeId(1),
+                raw.source.unwrap().boot,
+                raw.source.unwrap().seq.saturating_add(1),
+            ),
             parents: ParentSet::One(raw.id),
             scope: ScopeRef::Turn(TurnId(15)),
             tags: Tags::AGENT | Tags::COMMAND,

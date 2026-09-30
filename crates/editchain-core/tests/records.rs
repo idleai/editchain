@@ -1,7 +1,9 @@
 //! Frozen wire fixtures for the shared record vocabulary.
 
+use blake3 as _;
 use proptest as _;
 use serde as _;
+use serde_json as _;
 
 use editchain_core::records::{
     ActorRecord, AnnotationRecord, ChainRecord, OperationRecord, ReflectionRecord, RevisionRecord,
@@ -87,6 +89,7 @@ fn shared_names_preserve_existing_envelope_and_kind_wire_bytes() {
     ];
     for (kind, body) in fixtures {
         let operation = OperationRecord {
+            source: Some(editchain_core::SourceId::new(NodeId(1), 2, 3)),
             id: OpId::new(NodeId(1), 2, 3),
             parents: ParentSet::None,
             actor: ActorId(4),
@@ -98,9 +101,12 @@ fn shared_names_preserve_existing_envelope_and_kind_wire_bytes() {
         // Existing envelope: node, boot, sequence, parents, actor, clock, scope, tags.
         let mut expected = vec![1, 2, 3, 0, 4, 0, 0, 0];
         expected.extend(body);
-        assert_eq!(postcard::to_stdvec(&operation).unwrap(), expected);
+        let legacy: editchain_core::legacy::LegacyOp = postcard::from_bytes(&expected).unwrap();
+        assert_eq!(postcard::to_stdvec(&legacy).unwrap(), expected);
+        assert_eq!(legacy.into_canonical(), operation);
+        let canonical = postcard::to_stdvec(&operation).unwrap();
         assert_eq!(
-            postcard::from_bytes::<OperationRecord>(&expected).unwrap(),
+            postcard::from_bytes::<OperationRecord>(&canonical).unwrap(),
             operation
         );
     }

@@ -8,11 +8,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use editchain_core::{
-    human::{HumanGitContext, HumanIdentity, HumanRevision, HumanWorkKind, HumanWorkRecord},
-    ContentId, Op, OpId,
+    human::{
+        HumanGitContext, HumanIdentity, HumanRevision as CoreHumanRevision, HumanWorkKind,
+        HumanWorkRecord,
+    },
+    ContentId, Op, OpId, SourceId,
 };
 use editchain_protocol::editor::{EditorDocument, EditorEvent, EditorEventKind};
 use editchain_store::BlobStore;
+
+// Schema-one human work payloads retain the original source-address JSON.
+type HumanRevision = CoreHumanRevision<SourceId>;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -103,7 +109,8 @@ impl Normalizer {
             stream.source = Some(source);
         }
         let mut result = vec![observation(event, source)];
-        let work = session.observe(event, source, blobs)?;
+        let origin = editchain_import::human::native_event_source(&event.session, event.sequence)?;
+        let work = session.observe(event, origin, blobs)?;
         if let Some(Work {
             kind,
             path,
@@ -128,11 +135,13 @@ impl Normalizer {
                 identity: event.identity.clone(),
                 user_name: event.user_name.clone(),
                 turn: session.turn,
-                edit_group: session.group(event, kind).map(|group| OpId {
-                    seq: group,
-                    ..source
-                }),
-                source_event: source,
+                edit_group: session
+                    .group(event, kind)
+                    .map(|group| {
+                        editchain_import::human::native_event_source(&event.session, group)
+                    })
+                    .transpose()?,
+                source_event: origin,
                 kind,
                 path,
                 before,
@@ -197,7 +206,7 @@ impl Session {
     fn observe(
         &mut self,
         event: &EditorEvent,
-        source: OpId,
+        source: SourceId,
         blobs: &mut BlobStore,
     ) -> Result<Option<Work>> {
         if matches!(
@@ -425,7 +434,7 @@ fn revision(
     document: &EditorDocument,
     version: u64,
     text: &str,
-    occurrence: Option<OpId>,
+    occurrence: Option<SourceId>,
     blobs: &mut BlobStore,
 ) -> Result<HumanRevision> {
     blobs.write(text.as_bytes())?;

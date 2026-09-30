@@ -212,29 +212,29 @@ fn partial_revisions_keep_validating_item_identity_and_complete_outputs() {
         Payload,
     };
     let valid = codex::occurrence(3, 1, "new revision of an excluded item").unwrap();
-    let source = valid.first().unwrap().id;
-    let incarnation = OpId {
+    let source = valid.first().unwrap().source.unwrap();
+    let incarnation = editchain_core::SourceId {
         seq: 1 << 16,
         ..source
     };
     for invalid in [
-        OpId {
+        editchain_core::SourceId {
             seq: 0,
             ..incarnation
         },
-        OpId {
+        editchain_core::SourceId {
             seq: (1 << 16) + 1,
             ..incarnation
         },
-        OpId {
+        editchain_core::SourceId {
             seq: 4 << 16,
             ..incarnation
         },
-        OpId {
+        editchain_core::SourceId {
             node: NodeId(999),
             ..incarnation
         },
-        OpId {
+        editchain_core::SourceId {
             boot: 1,
             ..incarnation
         },
@@ -256,14 +256,14 @@ fn partial_revisions_keep_validating_item_identity_and_complete_outputs() {
         let mut live = LiveProjection::default();
         drop(live.apply(ops, &[]));
         assert!(
-            !live.import_ready(source),
+            !live.import_ready(source.id()),
             "reject malformed incarnation {invalid}"
         );
     }
     let mut live = LiveProjection::default();
     drop(live.apply(valid.clone(), &[]));
     assert!(
-        live.import_ready(source),
+        live.import_ready(source.id()),
         "a missing earlier raw record is allowed"
     );
     let output = valid
@@ -271,18 +271,19 @@ fn partial_revisions_keep_validating_item_identity_and_complete_outputs() {
         .find(|op| matches!(op.kind, OpKind::Message(_)))
         .unwrap();
     let mut contradictory = output.clone();
-    contradictory.id = incarnation;
+    contradictory.id = incarnation.id();
+    contradictory.source = Some(incarnation);
     contradictory.parents = editchain_core::ParentSet::None;
     drop(live.apply(vec![contradictory], &[]));
     assert!(
-        !live.import_ready(source),
+        !live.import_ready(source.id()),
         "an existing non-Import incarnation is invalid"
     );
-    drop(live.apply(Vec::new(), &[incarnation]));
-    assert!(live.import_ready(source));
+    drop(live.apply(Vec::new(), &[incarnation.id()]));
+    assert!(live.import_ready(source.id()));
     drop(live.apply(Vec::new(), &[output.id]));
     assert!(
-        !live.import_ready(source),
+        !live.import_ready(source.id()),
         "missing current output still blocks the revision"
     );
 }
@@ -401,10 +402,12 @@ fn legacy_children_cannot_bypass_incomplete_current_derivations() {
     let (raw, remaining) = ops.split_first().unwrap();
     let (output, proof) = remaining.split_first().unwrap();
     let mut legacy = output.clone();
-    legacy.id = OpId {
-        seq: raw.id.seq + 1,
-        ..raw.id
+    let source = editchain_core::SourceId {
+        seq: raw.source.unwrap().seq + 1,
+        ..raw.source.unwrap()
     };
+    legacy.id = source.id();
+    legacy.source = Some(source);
     for last in [std::slice::from_ref(output), proof] {
         let mut live = LiveProjection::default();
         drop(live.apply(vec![raw.clone(), legacy.clone()], &[]));

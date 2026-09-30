@@ -65,7 +65,16 @@ fn explicit_input_and_interleaved_unknown_changes_replay_without_reassigning_aut
         .located_ops()
         .filter_map(|(op, _)| work_record(op))
         .collect();
-    work.sort_by_key(|item| item.source_event.seq);
+    work.sort_by_key(|item| {
+        chain
+            .located_ops()
+            .find(|(op, _)| op.id == item.source_event)
+            .unwrap()
+            .0
+            .source
+            .unwrap()
+            .seq
+    });
     assert_eq!(
         work.len(),
         2,
@@ -74,7 +83,14 @@ fn explicit_input_and_interleaved_unknown_changes_replay_without_reassigning_aut
     assert!(work.iter().all(|item| item.kind == HumanWorkKind::Edit));
     assert_eq!(
         work.iter()
-            .map(|item| item.source_event.seq)
+            .map(|item| chain
+                .located_ops()
+                .find(|(op, _)| op.id == item.source_event)
+                .unwrap()
+                .0
+                .source
+                .unwrap()
+                .seq)
             .collect::<Vec<_>>(),
         [4, 8]
     );

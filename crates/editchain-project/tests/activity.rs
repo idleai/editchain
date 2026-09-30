@@ -171,6 +171,7 @@ fn raw_line(status: Option<&str>) -> String {
 /// A raw import op (session-scoped, IMPORT tag) with optional parent/status.
 fn import_op(node: u64, seq: u64, parent: Option<OpId>, status: Option<&str>) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: parent.map_or(ParentSet::None, ParentSet::One),
         actor: ActorId(1),
@@ -205,6 +206,7 @@ fn claude_assistant_import(node: u64, seq: u64, parent: OpId, message_id: &str) 
 /// on the same source chain so the projection bundles it onto an anchor row.
 fn world_state_import_op(node: u64, seq: u64, parent: OpId) -> Op {
     let mut op = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -223,6 +225,7 @@ fn world_state_import_op(node: u64, seq: u64, parent: OpId) -> Op {
 /// A turn-scoped normalized tool child of `parent`.
 fn tool_child(node: u64, seq: u64, parent: OpId, name: &str, turn: u64) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -241,6 +244,7 @@ fn tool_child(node: u64, seq: u64, parent: OpId, name: &str, turn: u64) -> Op {
 /// A turn-scoped normalized message child of `parent`.
 fn message_child(node: u64, seq: u64, parent: OpId, text: &str, turn: u64) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -257,6 +261,7 @@ fn message_child(node: u64, seq: u64, parent: OpId, text: &str, turn: u64) -> Op
 /// A turn-scoped normalized file child of `parent` (Change activity evidence).
 fn file_child(node: u64, seq: u64, parent: OpId, turn: u64) -> Op {
     Op {
+        source: Some(editchain_core::SourceId::new(NodeId(node), 0, seq)),
         id: OpId::new(NodeId(node), 0, seq),
         parents: ParentSet::One(parent),
         actor: ActorId(1),
@@ -940,7 +945,14 @@ fn bundles_maximal_run_of_three_tool_rows_into_one_expandable_node() {
         .iter()
         .map(|op| op.id.to_string())
         .collect();
-    assert_eq!(member_keys, vec!["4:0:40", "3:0:30", "2:0:20"]);
+    assert_eq!(
+        member_keys,
+        vec![
+            "599d42f1299bba68f2631f2c6c13fc76eb973ebd4ee09692992061b412f0d63f",
+            "44ca6a7a045439e4094e2b131b3517839d43a94a6e83f3d4e8b0bdbcc04e404d",
+            "0de619efd468a082d5a8b07bd412ba41f1af36779d63102ffa313ccd1b1668dc"
+        ]
+    );
     assert_eq!(member_keys[0], bundle_node.node_key());
 }
 
@@ -1766,7 +1778,10 @@ fn failure_rows_stay_visible_and_split_runs_into_clean_sides() {
         .iter()
         .find(|node| node.outcome() == Outcome::Failure)
         .unwrap_or_else(|| panic!("failure row must remain visible"));
-    assert_eq!(failure.node_key(), "4:0:40");
+    assert_eq!(
+        failure.node_key(),
+        "599d42f1299bba68f2631f2c6c13fc76eb973ebd4ee09692992061b412f0d63f"
+    );
     let clean_bundles: Vec<&HistoryNode> = bundled
         .iter()
         .filter(|node| matches!(node, HistoryNode::ExecuteBundle { .. }))
@@ -1843,7 +1858,10 @@ fn change_adjacency_blocks_bundling() {
         .iter()
         .find(|node| node.activity_kind() == ActivityKind::Change)
         .unwrap_or_else(|| panic!("change row must remain visible"));
-    assert_eq!(change_row.node_key(), "4:0:40");
+    assert_eq!(
+        change_row.node_key(),
+        "599d42f1299bba68f2631f2c6c13fc76eb973ebd4ee09692992061b412f0d63f"
+    );
     assert!(
         bundled
             .iter()
@@ -1980,11 +1998,14 @@ fn bundle_inherits_the_runs_external_parent_edges() {
     let external_parents = bundle_node.parent_keys(&empty_links, &empty_notes);
     assert_eq!(
         external_parents,
-        vec!["1:0:1"],
+        vec!["93899d1d2c80d5e61ae6992d9d794e2051331e167b76674ab7ec28478559d638"],
         "run inherits the incoming edge"
     );
     let kept_answer = &bundled[0];
-    assert_eq!(kept_answer.node_key(), "5:0:50");
+    assert_eq!(
+        kept_answer.node_key(),
+        "76e63b7d280dc56c0b65daf986fc500edc650aeafff1ee95aae981ef3d4f4c97"
+    );
     let HistoryNode::CollapsedImport { op, .. } = kept_answer else {
         panic!("expected kept agent answer row");
     };
@@ -2016,7 +2037,10 @@ fn promotion_prevents_bundling() {
     let bundled = bundle_activity_execute_runs(nodes, &annotations, &HashSet::new());
     assert_eq!(bundled.len(), 3);
     let promoted_row = &bundled[0];
-    assert_eq!(promoted_row.node_key(), "4:0:40");
+    assert_eq!(
+        promoted_row.node_key(),
+        "599d42f1299bba68f2631f2c6c13fc76eb973ebd4ee09692992061b412f0d63f"
+    );
     let clean_bundle = unwrap_bundle(&bundled);
     assert_eq!(clean_bundle.sub_ops().len(), 2);
 }
@@ -2259,7 +2283,14 @@ fn work_unit_markers_are_view_wide_for_interleaved_units() {
     let keys: Vec<String> = nodes.iter().map(HistoryNode::node_key).collect();
     assert_eq!(
         keys,
-        vec!["11:0:11", "12:0:12", "13:0:13", "14:0:14", "15:0:15", "16:0:16"]
+        vec![
+            "028feb7289d69c60975c804e75a8c9674e4747d0cad0e6dedf1f302ebb54fd7c",
+            "23e23fe8303cbc516b63276041b223bc89a9fdd371e675ae9b7af6ebdcab9b81",
+            "fb08716b4a8f8ec75cbfa78c25504f048701006743a1a893fd1ab8bfcb8139ba",
+            "4eae521b005b0353edeb4e22c8570f8e1962139cc8613fa123baad18029ca7e9",
+            "c18a1994274abf1bfd70931a436680489ac35f7fab91577ede536df0dd800298",
+            "938b03aaee73e2d3dfec18d6388652065cdebbe836dd724b5dadfaad2e477bcf"
+        ]
     );
 }
 

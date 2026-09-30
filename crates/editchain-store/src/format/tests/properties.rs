@@ -85,6 +85,7 @@ fn arb_op() -> impl Strategy<Value = Op> {
             )
         })
         .prop_map(|(id, parents, actor, clock, scope, tags, kind)| Op {
+            source: None,
             id,
             parents,
             actor,
@@ -164,27 +165,23 @@ proptest! {
     // -----------------------------------------------------------------------
     #[test]
     fn ec03_roundtrip(
-        page_sequence in any::<u64>(),
-        commit_generation in any::<u64>(),
+        page_sequence in any::<u32>(),
         records in proptest::collection::vec(
             proptest::collection::vec(any::<u8>(), 0..64),
             0..10,
         ),
     ) {
-        let mut frame = Ec03Frame::new(page_sequence, commit_generation);
+        let mut frame = Ec03Frame::new(page_sequence);
         for data in &records {
-            frame.add_record(data.clone());
+            frame.add_record(0, data.clone());
         }
 
-        let encoded = encode_ec03(&frame);
+        let encoded = encode_ec03(&frame).unwrap();
         let decoded = decode_ec03(&encoded);
 
-        prop_assert!(decoded.is_some(), "decode should succeed");
+        prop_assert!(decoded.is_ok(), "decode should succeed");
         let decoded = decoded.unwrap();
-        prop_assert_eq!(frame.format_version, decoded.format_version);
-        prop_assert_eq!(frame.record_count, decoded.record_count);
         prop_assert_eq!(frame.page_sequence, decoded.page_sequence);
-        prop_assert_eq!(frame.commit_generation, decoded.commit_generation);
         prop_assert_eq!(frame.records.len(), decoded.records.len());
         for (a, b) in frame.records.iter().zip(decoded.records.iter()) {
             prop_assert_eq!(a, b);

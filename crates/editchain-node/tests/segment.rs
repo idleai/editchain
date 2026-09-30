@@ -119,7 +119,7 @@ fn incomplete_tail_is_tolerated_but_unsupported_format_is_an_error() {
     std::fs::write(&path, &bytes).unwrap();
     assert_eq!(store.read_all().unwrap().len(), 1);
 
-    std::fs::write(path, b"EC03").unwrap();
+    std::fs::write(path, b"EC99").unwrap();
     assert_eq!(
         store.read_all().unwrap_err().kind(),
         std::io::ErrorKind::InvalidData

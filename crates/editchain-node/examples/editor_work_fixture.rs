@@ -42,6 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     blobs.write(text.as_bytes())?;
     let id = OpId::new(NodeId(83), 0, 1);
     let anchor = Op {
+        source: None,
         id,
         parents: ParentSet::None,
         actor: ActorId(83),
@@ -55,6 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let file_id = OpId::new(NodeId(83), 0, 2);
     let file = Op {
+        source: None,
         id: file_id,
         parents: ParentSet::One(id),
         actor: ActorId(83),
@@ -72,6 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     };
     let note = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(83), 0, 3)),
         id: OpId::new(NodeId(83), 0, 3),
         parents: ParentSet::One(id),
         actor: ActorId(83),
@@ -85,6 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     };
     let link = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(83), 0, 4)),
         id: OpId::new(NodeId(83), 0, 4),
         parents: ParentSet::One(id),
         tags: Tags::META,

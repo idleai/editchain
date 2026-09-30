@@ -1,4 +1,4 @@
-//! Durable EC02 segments, content-addressed blobs, and canonical read contracts.
+//! Durable EC03 segments with EC02 read compatibility, content-addressed blobs, and canonical read contracts.
 
 mod blob;
 mod blob_adapter;
@@ -11,6 +11,7 @@ mod log;
 mod reader;
 mod segment;
 mod tail;
+mod visit;
 
 pub use blob::{BlobPreviewResolution, BlobReader, BlobResolution, BlobStore};
 pub use blob_adapter::{BlobSource, BlobStorage};
@@ -19,6 +20,10 @@ pub use log::{AppendLog, LogReadStats, LogStore, RecordVisitor};
 pub use reader::{read_encoded_at, read_op_at, CanonicalChain, ChainReadStats, OpRecordLocation};
 pub use segment::{SegmentOptions, SegmentStore};
 pub use tail::{CanonicalTail, ChainDelta, IndexedTail, Tail, TailCorpus, TailWork};
+pub use visit::visit_records;
 
 #[cfg(test)]
 use tempfile as _;
+
+/// Resumable migration into a new EC03 chain with original evidence retained.
+pub mod migration;

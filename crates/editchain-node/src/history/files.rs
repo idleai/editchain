@@ -107,6 +107,16 @@ impl Workspace {
             .source_op(op_id)
             .ok_or_else(|| "agent edit operation not found".to_string())?;
         match &op.kind {
+            OpKind::Activity(record) => {
+                let display = record.display_op();
+                if let OpKind::File(file) = &display.kind {
+                    materialize_file_op_diff(self, file, requested)
+                } else if let OpKind::Tool(tool) = &display.kind {
+                    materialize_tool_diff(self, tool, requested)
+                } else {
+                    Err("operation is not a retained file edit".to_string())
+                }
+            }
             OpKind::Tool(tool) => materialize_tool_diff(self, tool, requested),
             OpKind::File(file) => materialize_file_op_diff(self, file, requested),
             OpKind::Import(import) => materialize_codex_raw_file_diff(self, import, requested),
@@ -205,7 +215,7 @@ pub(super) fn agent_file_change_index(
     let raw_codex_candidates: std::collections::HashSet<OpId> = ops
         .iter()
         .filter(|op| matches!(op.kind, OpKind::File(_)))
-        .flat_map(|op| op.parents.iter())
+        .flat_map(Op::parent_ids)
         .filter(|parent| import_ids.contains(parent))
         .copied()
         .collect();
@@ -260,8 +270,7 @@ pub(super) fn agent_file_change_index(
 
     for op in ops {
         let owner = op
-            .parents
-            .iter()
+            .parent_ids()
             .find(|parent| import_ids.contains(parent))
             .copied()
             .unwrap_or(op.id);
@@ -269,6 +278,20 @@ pub(super) fn agent_file_change_index(
             continue;
         }
         let path = match &op.kind {
+            OpKind::Activity(record) => {
+                if let editchain_core::activity::Kind::File(file) = &record.kind {
+                    matches!(
+                        file.action,
+                        editchain_core::activity::FileAction::Create
+                            | editchain_core::activity::FileAction::Change
+                            | editchain_core::activity::FileAction::Rename
+                            | editchain_core::activity::FileAction::Delete
+                    )
+                    .then(|| payload_preview_text(&file.name, resolver))
+                } else {
+                    None
+                }
+            }
             OpKind::Tool(tool)
                 if matches!(tool.stage, editchain_core::op::ToolStage::Start)
                     && is_file_edit_tool(&payload_text(&tool.tool_name)) =>
@@ -302,6 +325,14 @@ pub(super) fn agent_file_change_index(
             continue;
         };
         let status = match &op.kind {
+            OpKind::Activity(record) => {
+                if matches!(&record.kind, editchain_core::activity::Kind::File(file) if file.action == editchain_core::activity::FileAction::Delete)
+                {
+                    FileChangeStatus::Deleted
+                } else {
+                    FileChangeStatus::Modified
+                }
+            }
             OpKind::File(file) if matches!(file.stage, editchain_core::op::FileStage::Deleted) => {
                 FileChangeStatus::Deleted
             }

@@ -6,7 +6,7 @@ use editchain_core::provider::{
     CodexDerivationContract, CodexDerivationEvidence, CodexLogicalChange, CodexThreadId,
     ProviderEvidence, ProviderEvidenceSchema, ProviderFact,
 };
-use editchain_core::{Clock, Op, OpId, OpKind, ParentSet};
+use editchain_core::{Clock, Op, OpId, OpKind, ParentSet, SourceId};
 use serde::Serialize;
 
 use super::evidence::evidence_note;
@@ -122,7 +122,29 @@ pub(super) fn emit_batch(
             .ok_or_else(|| ImportError::CursorStore("derivation ordinal exhausted".into()))?;
         let source = context
             .stream
-            .op_from_position(SourcePosition::raw(ordinal))?;
+            .source_position(SourcePosition::raw(ordinal))?;
+        if sink.needs_source_context(source.id()) {
+            let previous = ordinal
+                .checked_sub(1)
+                .filter(|ordinal| *ordinal > 0)
+                .map(|ordinal| {
+                    context
+                        .stream
+                        .op_from_position(SourcePosition::raw(ordinal))
+                })
+                .transpose()?;
+            let raw = super::normalize::build_raw_op(
+                &line.data,
+                line.hash,
+                context.stream,
+                ordinal,
+                context.thread,
+                context.session_id,
+                previous,
+                context.blobs,
+            )?;
+            sink.observe_source(&raw)?;
+        }
         let clock = raw_clock(parse_raw_line_meta(&line.data).timestamp.as_deref()).0;
         let record = records.remove(&ordinal).unwrap_or_default();
         context.include_thinking = requested_thinking || ordinal <= retained_thinking;
@@ -137,7 +159,7 @@ pub(super) fn emit_batch(
                     thread: CodexThreadId(context.thread.to_owned()),
                     contract: CodexDerivationContract::OccurrencesV2,
                     includes_thinking: context.include_thinking,
-                    outputs: output.ops.iter().map(|op| op.id).collect(),
+                    outputs: crate::ids::output_sources(&output.ops)?,
                     changes: output.changes,
                 }),
             },
@@ -193,8 +215,8 @@ fn materialize_record(
             item: item.item_id.clone(),
             incarnation: context
                 .stream
-                .op_from_position(SourcePosition::raw(item.first_seen))?,
-            outputs: ops.iter().map(|op| op.id).collect(),
+                .source_position(SourcePosition::raw(item.first_seen))?,
+            outputs: crate::ids::output_sources(&ops)?,
         });
         output.ops.extend(ops);
     }
@@ -237,11 +259,18 @@ fn remap(mut ops: Vec<Op>, slot: Slot<'_>, stream: &SourceStream) -> Result<Vec<
     let node = derive_node_id(&serde_json::to_string(&(CONTRACT, stream.node, slot))?);
     let ids: BTreeMap<OpId, OpId> = ops
         .iter()
-        .map(|op| (op.id, OpId { node, ..op.id }))
-        .collect();
+        .map(|op| {
+            let source = crate::ids::provenance(op)?;
+            Ok((op.id, SourceId { node, ..source }.id()))
+        })
+        .collect::<Result<_, ImportError>>()?;
     let mapped = |id: OpId| ids.get(&id).copied().unwrap_or(id);
     for op in &mut ops {
         op.id = mapped(op.id);
+        op.source = Some(SourceId {
+            node,
+            ..crate::ids::provenance(op)?
+        });
         op.parents = match op.parents {
             ParentSet::None => ParentSet::None,
             ParentSet::One(parent) => ParentSet::One(mapped(parent)),

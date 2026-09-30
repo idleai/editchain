@@ -101,6 +101,7 @@ fn seed(root: &Path, seq: u64, content: &[u8]) -> io::Result<()> {
     let mut store = SegmentStore::open(root)?;
     BlobStore::new(root.join("blobs"))?.write(content)?;
     let op = Op {
+        source: Some(editchain_core::SourceId::new(NodeId(42), 1, seq)),
         id: OpId::new(NodeId(42), 1, seq),
         parents: ParentSet::None,
         actor: ActorId(123),

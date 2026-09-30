@@ -96,6 +96,88 @@ pub struct ImportBatch {
 }
 
 impl ImportBatch {
+    /// Convert this private capture to schema three before durable acceptance.
+    /// Checkpoints stay private until the converted records have been synced.
+    /// # Errors
+    /// Returns conversion, validation, or batch-limit errors.
+    pub fn into_schema3(mut self, blobs: &mut dyn crate::BlobSink) -> Result<Self, ImportError> {
+        self = self.convert_schema3(blobs, false)?;
+        Ok(self)
+    }
+
+    /// Convert new input for a previously migrated chain, using its fixed ID namespace.
+    /// # Errors
+    /// Returns conversion, validation, or batch-limit errors.
+    pub fn into_migrated_schema3(
+        self,
+        blobs: &mut dyn crate::BlobSink,
+    ) -> Result<Self, ImportError> {
+        self.convert_schema3(blobs, true)
+    }
+
+    /// Retain only exact source records from an already converted private batch.
+    /// Use an independent cursor namespace so later normalization can backfill.
+    /// # Errors
+    /// Returns admission or size-limit errors.
+    pub fn originals_only(mut self) -> Result<Self, ImportError> {
+        let mut originals = MemoryOpSink::with_limits(self.ops.limits());
+        for op in self.ops.ops {
+            if matches!(&op.kind, editchain_core::OpKind::Activity(record) if matches!(record.kind, editchain_core::activity::Kind::Original(_)))
+            {
+                let _admission = originals.accept_op(&op)?;
+            }
+        }
+        self.ops = originals;
+        self.report.normalized_ops = 0;
+        Ok(self)
+    }
+
+    fn convert_schema3(
+        mut self,
+        blobs: &mut dyn crate::BlobSink,
+        migration: bool,
+    ) -> Result<Self, ImportError> {
+        let mut converter = if migration {
+            crate::activity::Converter::for_migration()
+        } else {
+            crate::activity::Converter::default()
+        };
+        converter.protect_conflicts(crate::activity::conflicts(
+            self.ops.source_context.values().chain(&self.ops.ops),
+        )?);
+        for op in self.ops.source_context.values().chain(&self.ops.ops) {
+            let stored = crate::activity::resolve_original(op, blobs)?;
+            if stored.is_none()
+                && matches!(&op.kind, editchain_core::OpKind::Import(raw) if matches!(raw.raw_ref, editchain_core::Payload::Blob(_)))
+            {
+                return Err(ImportError::BlobSink(
+                    "schema-three capture requires readable source blobs; source checkpoints were not advanced".into(),
+                ));
+            }
+            converter.observe(op, stored.as_deref())?;
+        }
+        converter.finish_observations();
+        let mut records = Vec::new();
+        for op in &self.ops.ops {
+            records.extend(converter.convert(op, blobs)?);
+        }
+        let mut ops = MemoryOpSink::with_limits(self.ops.limits());
+        self.report.raw_ops = 0;
+        self.report.normalized_ops = 0;
+        self.report.evidence_ops = 0;
+        for op in records {
+            let _admission = ops.accept_op(&op)?;
+            if matches!(&op.kind, editchain_core::OpKind::Activity(record) if matches!(record.kind, editchain_core::activity::Kind::Original(_)))
+            {
+                self.report.raw_ops = self.report.raw_ops.saturating_add(1);
+            } else {
+                self.report.normalized_ops = self.report.normalized_ops.saturating_add(1);
+            }
+        }
+        self.ops = ops;
+        Ok(self)
+    }
+
     /// Run a provider capture with a private cursor overlay. Any capture error
     /// discards all proposed cursor and generation changes for the invocation.
     ///

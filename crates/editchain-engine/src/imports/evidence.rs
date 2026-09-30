@@ -29,5 +29,5 @@ pub fn decode_evidence(op: &Op) -> Option<EvidenceRecord<'_>> {
         return None;
     };
     let payload: ProviderEvidence = serde_json::from_slice(content).ok()?;
-    (op.parents == ParentSet::One(payload.source)).then_some(EvidenceRecord { op, payload })
+    (op.parents == ParentSet::One(payload.source.id())).then_some(EvidenceRecord { op, payload })
 }

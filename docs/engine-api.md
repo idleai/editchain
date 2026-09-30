@@ -21,7 +21,7 @@ Both crates expose `records`, which names the canonical envelope and its payload
 
 | Shared name | Canonical type / operation kind | Identity |
 | --- | --- | --- |
-| `OperationRecord` | `Op` | `OpId { node, boot, seq }` |
+| `OperationRecord` | `Op` | `OpId([u8; 32])`; optional `SourceId` provenance |
 | `ChainRecord` | `ChainStart` / `OpKind::ChainStart` | Recorded `ChainId` scope; operation ID identifies the initialization fact |
 | `ActorRecord` | `ActorOp` / `OpKind::Actor` | Envelope `ActorId`; operation ID identifies each registration or metadata fact |
 | `SessionRecord` | `SessionOp` / `OpKind::Session` | Explicit `SessionId`, independent of observation identity |
@@ -39,7 +39,10 @@ so producers can retain complete native/provider IDs and original evidence.
 Existing operation variants retain their field order and binary discriminants.
 The session kind is appended after them. Readers built before this addition
 cannot decode a session operation; existing storage readers count unsupported
-records and retain their segment bytes. Existing records need no migration.
+records and retain their segment bytes. EC03 adds an independently versioned
+operation envelope with canonical IDs and optional source provenance. Readers
+translate legacy IDs deterministically; writers require an explicit migration of
+EC02 chains. See [EC03 and IDs](ec03.md) for the wire and migration contracts.
 
 ## Append and inspect
 
@@ -66,7 +69,7 @@ own stable IDs instead of copying the example's fixed identities.
 | `snapshot.get(id)` / `operations()` | Accepted operations in deterministic operation-ID order |
 | `snapshot.evidence().evidence()` | All distinct decodable byte representations, including conflicts |
 | `snapshot.evidence().conflicts()` | Quarantined identities and every retained variant |
-| `encode_op` / `decode_op` | The existing operation codec, re-exported for consumers |
+| `encode_op` / `decode_op` | The versioned operation codec, with legacy read compatibility |
 
 An append returns one of three outcomes:
 

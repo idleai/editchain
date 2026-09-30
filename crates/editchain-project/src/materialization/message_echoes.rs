@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use editchain_core::provider::{CodexDerivationEvidence, CodexLogicalChange};
-use editchain_core::{Op, OpId, OpKind, Tags};
+use editchain_core::{Op, OpId, OpKind, SourceId, Tags};
 
 use super::{source_key, SourceKey};
 
@@ -29,8 +29,8 @@ struct ItemKey {
 
 #[derive(Default)]
 pub(super) struct MessageEchoes {
-    last: HashMap<ItemKey, (OpId, OpId)>,
-    echoes: HashMap<OpId, OpId>,
+    last: HashMap<ItemKey, (SourceId, OpId)>,
+    echoes: HashMap<SourceId, SourceId>,
 }
 
 impl MessageEchoes {
@@ -41,6 +41,9 @@ impl MessageEchoes {
         messages: &HashMap<OpId, Op>,
         ops: &HashMap<OpId, &Op>,
     ) {
+        let Some(source) = ops.get(&source).and_then(|op| op.source) else {
+            return;
+        };
         if meta.changes.is_empty() {
             return;
         }
@@ -59,14 +62,14 @@ impl MessageEchoes {
             thread: meta.thread.0.clone(),
             turn: turn.clone(),
             item: item.clone(),
-            incarnation: *incarnation,
+            incarnation: incarnation.id(),
         };
         let [output] = outputs.as_slice() else {
-            let _: Option<(OpId, OpId)> = self.last.remove(&key);
+            let _: Option<(SourceId, OpId)> = self.last.remove(&key);
             return;
         };
-        let Some(message) = messages.get(output) else {
-            let _: Option<(OpId, OpId)> = self.last.remove(&key);
+        let Some(message) = messages.get(&output.id()) else {
+            let _: Option<(SourceId, OpId)> = self.last.remove(&key);
             return;
         };
         // Never hide a source occurrence carrying another item or non-metadata
@@ -74,10 +77,10 @@ impl MessageEchoes {
         if !meta.outputs.iter().all(|id| {
             id == output
                 || ops
-                    .get(id)
+                    .get(&id.id())
                     .is_some_and(|op| op.tags.matches_all(Tags::META))
         }) {
-            let _: Option<(OpId, OpId)> = self.last.remove(&key);
+            let _: Option<(SourceId, OpId)> = self.last.remove(&key);
             return;
         }
         if let Some((previous_source, previous_output)) = self.last.get(&key) {
@@ -87,17 +90,18 @@ impl MessageEchoes {
                     && previous.scope == message.scope
                     && previous.tags == message.tags
             }) {
-                let _: Option<OpId> = self.echoes.insert(source, *previous_source);
+                let _: Option<SourceId> = self.echoes.insert(source, *previous_source);
                 return;
             }
         }
-        let _: Option<(OpId, OpId)> = self.last.insert(key, (source, *output));
+        let _: Option<(SourceId, OpId)> = self.last.insert(key, (source, output.id()));
     }
 
     pub(super) fn finish(self, blocked: &HashSet<SourceKey>) -> HashMap<OpId, OpId> {
         self.echoes
             .into_iter()
             .filter(|(source, _)| !blocked.contains(&source_key(*source)))
+            .map(|(source, target)| (source.id(), target.id()))
             .collect()
     }
 }

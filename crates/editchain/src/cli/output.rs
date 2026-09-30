@@ -63,6 +63,19 @@ impl Output {
         Ok(())
     }
 
+    pub(crate) fn emit_query(
+        &mut self,
+        queries: &editchain_engine::queries::ChainQueries,
+        value: &impl Serialize,
+    ) -> Result<()> {
+        if self.format != Format::Human {
+            return self.emit(value);
+        }
+        let mut value = serde_json::to_value(value)?;
+        abbreviate(&mut value, "", queries)?;
+        self.emit(&value)
+    }
+
     pub(crate) fn raw(&mut self, bytes: &[u8]) -> Result<()> {
         self.writer.write_all(bytes).map_err(output_error)?;
         self.writer.flush().map_err(output_error)?;
@@ -142,4 +155,48 @@ fn json_error(error: serde_json::Error) -> Failure {
     } else {
         error.into()
     }
+}
+
+fn abbreviate(
+    value: &mut Value,
+    field: &str,
+    queries: &editchain_engine::queries::ChainQueries,
+) -> Result<()> {
+    match value {
+        Value::Object(fields) => {
+            for (name, value) in fields {
+                abbreviate(value, name, queries)?;
+            }
+        }
+        Value::Array(items) => {
+            for value in items {
+                abbreviate(value, field, queries)?;
+            }
+        }
+        Value::String(text)
+            if matches!(
+                field,
+                "id" | "operation"
+                    | "Operation"
+                    | "root"
+                    | "frontier"
+                    | "source"
+                    | "imported_record"
+                    | "next_after"
+                    | "One"
+                    | "Two"
+                    | "target_ids"
+                    | "incarnation"
+                    | "outputs"
+                    | "representative"
+                    | "incomplete_sources"
+            ) =>
+        {
+            if let Some(id) = editchain_engine::OpId::from_display_str(text) {
+                *text = queries.index().short_id(id)?;
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+    Ok(())
 }
