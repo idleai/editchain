@@ -142,6 +142,9 @@ impl ImportBatch {
         } else {
             crate::activity::Converter::default()
         };
+        converter.protect_conflicts(crate::activity::conflicts(
+            self.ops.source_context.values().chain(&self.ops.ops),
+        )?);
         for op in self.ops.source_context.values().chain(&self.ops.ops) {
             let stored = crate::activity::resolve_original(op, blobs)?;
             if stored.is_none()

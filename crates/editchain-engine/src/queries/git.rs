@@ -17,6 +17,12 @@ pub struct GitQuery {
     pub oid: Option<GitOid>,
 }
 
+impl GitQuery {
+    fn matches(self, repository: RepositoryId, oid: GitOid) -> bool {
+        repository == self.repository && self.oid.is_none_or(|target| target == oid)
+    }
+}
+
 impl ChainQueries {
     /// Read Git observations, preserving imported/live ref snapshots separately.
     ///
@@ -37,13 +43,13 @@ impl ChainQueries {
                         Some((commit.repository, commit.oid))
                     }
                     editchain_core::activity::Kind::Link(link) => {
-                        link.to.iter().find_map(|target| match target {
+                        return link.to.iter().any(|target| match target {
                             editchain_core::activity::Entity::Git { repository, oid } => {
-                                Some((*repository, *oid))
+                                query.matches(*repository, *oid)
                             }
                             editchain_core::activity::Entity::Operation(_)
-                            | editchain_core::activity::Entity::Item(_) => None,
-                        })
+                            | editchain_core::activity::Entity::Item(_) => false,
+                        });
                     }
                     editchain_core::activity::Kind::Session(_)
                     | editchain_core::activity::Kind::Turn(_)
@@ -69,9 +75,7 @@ impl ChainQueries {
                 | OpKind::Error(_)
                 | OpKind::Unknown(_) => None,
             };
-            key.is_some_and(|(repository, oid)| {
-                repository == query.repository && query.oid.is_none_or(|target| target == oid)
-            })
+            key.is_some_and(|(repository, oid)| query.matches(repository, oid))
         });
         Ok(history)
     }

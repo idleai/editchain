@@ -4,14 +4,14 @@ use editchain_core::{ChainStart, OpId, ParentSet};
 use editchain_import::activity::{migrate, uses_migration_ids};
 use editchain_import::{BufferedBlobSink, MemoryBlobSink};
 
-fn saved(root: &Path, ops: &[Op]) -> Result {
+pub(super) fn saved(root: &Path, ops: &[Op]) -> Result {
     use editchain_import::batch::DurableOpSink as _;
     let mut log = LogStore::new(SegmentStore::open(root)?);
     let _admission = log.append_durable(ops)?;
     Ok(())
 }
 
-fn loaded(root: &Path) -> Result<Vec<Op>> {
+pub(super) fn loaded(root: &Path) -> Result<Vec<Op>> {
     let mut ops = Vec::new();
     let _stats = editchain_store::visit_records(root, &mut |_flags, bytes| {
         ops.push(editchain_store::format::decode_op(bytes).map_err(io::Error::other)?);
@@ -206,26 +206,32 @@ fn converter_version_is_checked_with_and_without_a_migration_marker() {
         .iter()
         .find(|op| matches!(op.kind, OpKind::Message(_)))
         .unwrap();
-    let mut record = Operation::upgrade(old).unwrap();
+    let record = Operation::upgrade(old).unwrap();
     let current = temp.path().join("current");
     saved(&current, &[record.clone().into_op().unwrap()]).unwrap();
     assert!(!uses_migration_ids(&current).unwrap());
-    record.id = OpId::from_bytes(blake3::derive_key(
-        "editchain.operation-schema3.v1",
-        old.id.as_bytes(),
-    ));
-    let previous = temp.path().join("previous");
-    saved(&previous, &[record.into_op().unwrap()]).unwrap();
-    assert!(uses_migration_ids(&previous).is_err());
-    std::fs::write(
-        previous.join("schema3-migration.json"),
-        br#"{"converter":"activity-schema3-v1"}"#,
-    )
-    .unwrap();
-    assert!(uses_migration_ids(&previous).is_err());
-    assert_eq!(
-        loaded(&previous).unwrap().len(),
-        1,
-        "old chains remain readable"
-    );
+    for version in ["v1", "v2"] {
+        let mut earlier = record.clone();
+        earlier.id = OpId::from_bytes(blake3::derive_key(
+            &format!("editchain.operation-schema3.{version}"),
+            old.id.as_bytes(),
+        ));
+        let previous = temp.path().join(version);
+        saved(&previous, &[earlier.into_op().unwrap()]).unwrap();
+        assert!(uses_migration_ids(&previous).is_err());
+        std::fs::write(
+            previous.join("schema3-migration.json"),
+            serde_json::to_vec(
+                &serde_json::json!({"converter":format!("activity-schema3-{version}")}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(uses_migration_ids(&previous).is_err());
+        assert_eq!(
+            loaded(&previous).unwrap().len(),
+            1,
+            "old chains remain readable"
+        );
+    }
 }

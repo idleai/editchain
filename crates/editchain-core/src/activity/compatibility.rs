@@ -35,7 +35,7 @@ pub struct LegacyMapping {
 #[must_use]
 pub fn upgrade_id(id: OpId) -> OpId {
     OpId::from_bytes(blake3::derive_key(
-        "editchain.operation-schema3.v2",
+        "editchain.operation-schema3.v3",
         id.as_bytes(),
     ))
 }
@@ -136,7 +136,7 @@ impl Operation {
         if op.tags.matches_any(Tags::IMPORT) && !matches!(op.kind, OpKind::Import(_)) {
             record.original = op.parents.iter().next().map(|id| OriginalRef {
                 operation: upgrade_id(*id),
-                converter: "legacy-to-schema3-v2".into(),
+                converter: "legacy-to-schema3-v3".into(),
             });
         }
         match &mut record.kind {

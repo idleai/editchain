@@ -108,6 +108,7 @@ impl RecordTransform for Transform {
             return Err(io::Error::other("schema-three migration of a chain with sharing rules requires an explicit policy conversion; the source is unchanged"));
         }
         self.converter = Converter::for_migration();
+        self.conflicts.clear();
         self.blobs = Some(crate::FsBlobSink::new(destination.join("blobs"))?);
         let blobs = BlobReader::open(source)?;
         let mut seen = HashMap::new();
@@ -134,6 +135,22 @@ impl RecordTransform for Transform {
             {
                 let _inserted = self.conflicts.insert(op.id);
             }
+            Ok(())
+        })?;
+        self.converter.protect_conflicts(self.conflicts.clone());
+        let _stats = editchain_store::visit_records(source, &mut |_flags, bytes| {
+            if cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "schema conversion interrupted",
+                ));
+            }
+            let Ok(op) = decode_op(bytes) else {
+                return Ok(());
+            };
+            if self.conflicts.contains(&op.id) {
+                return Ok(());
+            }
             let resolved = if let OpKind::Import(raw) = &op.kind {
                 if let Payload::Blob(reference) = raw.raw_ref {
                     match blobs.read_blob(&reference)? {
@@ -154,7 +171,6 @@ impl RecordTransform for Transform {
         })?;
         self.originals = Some(blobs);
         self.converter.finish_observations();
-        self.converter.protect_conflicts(self.conflicts.clone());
         Ok(())
     }
 

@@ -24,6 +24,7 @@ pub(super) struct Source {
     recorder: Option<ItemId>,
     sequence: Option<u64>,
     slots: std::collections::BTreeMap<u64, String>,
+    tool_outcomes: std::collections::BTreeMap<String, Status>,
 }
 
 impl Default for Source {
@@ -44,6 +45,7 @@ impl Default for Source {
             recorder: None,
             sequence: None,
             slots: std::collections::BTreeMap::new(),
+            tool_outcomes: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -146,6 +148,7 @@ impl Source {
             }
         } else if native_session.is_some() || value.get("uuid").is_some() {
             info.provider = "claude";
+            info.tool_outcomes = claude_tool_outcomes(&value);
             if let Some(raw) = op.source {
                 let count = value
                     .pointer("/message/content")
@@ -347,13 +350,51 @@ impl Source {
         }
         if let Kind::Tool(tool) = &mut record.kind {
             if let Some(result) = &mut tool.outcome {
-                result.status = self.status.unwrap_or(Status::Unknown);
+                result.status = self
+                    .tool_status(&tool.native_call)
+                    .unwrap_or(Status::Unknown);
             }
             if let Some(terminal) = &mut tool.terminal {
                 terminal.exit_code = self.exit_code;
             }
         }
     }
+
+    fn tool_status(&self, native: &Payload) -> Option<Status> {
+        let call = match native {
+            Payload::Inline(bytes) => std::str::from_utf8(bytes).ok(),
+            Payload::Empty | Payload::Blob(_) => None,
+        };
+        call.and_then(|call| {
+            let native = serde_json::from_str::<String>(call).unwrap_or_else(|_| call.into());
+            self.tool_outcomes.get(&native).copied()
+        })
+        .or(self.status)
+    }
+}
+
+fn claude_tool_outcomes(value: &Value) -> std::collections::BTreeMap<String, Status> {
+    value
+        .pointer("/message/content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|block| {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                return None;
+            }
+            let call = block.get("tool_use_id")?.as_str()?;
+            let failed = block.get("is_error")?.as_bool()?;
+            Some((
+                call.into(),
+                if failed {
+                    Status::Failure
+                } else {
+                    Status::Success
+                },
+            ))
+        })
+        .collect()
 }
 
 impl Derived {
@@ -402,7 +443,11 @@ pub(super) fn finish(op: &Op, record: &mut Operation, source: Option<&Source>) {
         }
     }
     if let Kind::Message(message) = &mut record.kind {
-        if op.tags.matches_any(Tags::PRIVATE) && matches!(op.kind, OpKind::Reflection(_)) {
+        if op.tags.matches_any(Tags::PRIVATE)
+            && (matches!(op.kind, OpKind::Reflection(_))
+                || (matches!(op.kind, OpKind::Message(_))
+                    && source.is_some_and(|source| source.provider == "claude")))
+        {
             message.category = MessageKind::Reasoning;
         }
         for (index, block) in message.blocks.iter_mut().enumerate() {

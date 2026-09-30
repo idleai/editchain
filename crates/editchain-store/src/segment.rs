@@ -154,7 +154,8 @@ impl SegmentStore {
         let chain_dir = chain_dir.into();
         let started = std::time::Instant::now();
         loop {
-            match Self::open(&chain_dir) {
+            let opened = Self::open(&chain_dir);
+            match opened {
                 Err(error)
                     if error.kind() == io::ErrorKind::WouldBlock && started.elapsed() < timeout =>
                 {
@@ -401,7 +402,8 @@ fn require_current_format(root: &Path) -> io::Result<()> {
     for sequence in segment_sequences(root)? {
         let mut file = fs::File::open(root.join(format!("{sequence:06}.eclog")))?;
         let mut magic = [0; 4];
-        match file.read_exact(&mut magic) {
+        let read = file.read_exact(&mut magic);
+        match read {
             Ok(()) if &magic == b"EC02" => return Err(migration_required()),
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {}

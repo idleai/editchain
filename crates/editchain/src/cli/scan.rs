@@ -84,40 +84,30 @@ impl Scan {
             self.duplicates = self.duplicates.saturating_add(1);
             return Ok(());
         }
-        let OpKind::Activity(record) = &mut operation.kind else {
-            return Err(Failure::input(
-                "Scan requires a schema-three chain; use migrate --schema3",
-            ));
-        };
-        let kind = format!("{:?}", record.kind.name());
-        let fields: Vec<_> = record
-            .kind
-            .fields()
-            .into_iter()
-            .map(|(field, payload)| {
-                let (storage, length) = match payload {
-                    Payload::Inline(bytes) => {
-                        ("Inline", u64::try_from(bytes.len()).unwrap_or(u64::MAX))
-                    }
-                    Payload::Blob(reference) => ("Blob", u64::from(reference.len)),
-                    Payload::Empty => ("Empty", 0),
-                };
-                (format!("{kind}.{field:?}"), storage, length)
-            })
-            .collect();
-        let limit = usize::try_from(if kind == "Original" {
-            args.original_preview_bytes
-        } else {
-            args.preview_bytes
-        })
-        .map_err(|error| Failure::input(error.to_string()))?;
-        let mut truncated = false;
-        for (_, payload) in record.kind.fields_mut() {
-            if let Payload::Inline(bytes) = payload {
-                truncated |= bytes.len() > limit;
-                bytes.truncate(limit);
+        let (fields, truncated) = match &mut operation.kind {
+            OpKind::Activity(record) => preview(record, args)?,
+            OpKind::ChainStart(start) => {
+                let fields = vec![("ChainStart.Name".into(), "Inline", byte_length(&start.name))];
+                let limit = usize::try_from(args.preview_bytes)
+                    .map_err(|error| Failure::input(error.to_string()))?;
+                (fields, truncate(&mut start.name, limit))
             }
-        }
+            OpKind::Actor(_)
+            | OpKind::Session(_)
+            | OpKind::Message(_)
+            | OpKind::Tool(_)
+            | OpKind::Command(_)
+            | OpKind::File(_)
+            | OpKind::Reflection(_)
+            | OpKind::Import(_)
+            | OpKind::Note(_)
+            | OpKind::Error(_)
+            | OpKind::GitCommit(_)
+            | OpKind::GitLink(_)
+            | OpKind::Unknown(_) => return Err(Failure::input(
+                "Scan requires schema-three activities (ChainStart is supported); use migrate --schema3",
+            )),
+        };
         self.binary_bytes = self
             .binary_bytes
             .saturating_add(u64::try_from(encoded.len()).unwrap_or(u64::MAX));
@@ -130,4 +120,55 @@ impl Scan {
             }
         }))
     }
+}
+
+type PayloadSummary = Vec<(String, &'static str, u64)>;
+
+fn byte_length(bytes: &[u8]) -> u64 {
+    u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+}
+
+fn truncate(bytes: &mut Vec<u8>, limit: usize) -> bool {
+    let mut length = limit.min(bytes.len());
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        while !text.is_char_boundary(length) {
+            length = length.saturating_sub(1);
+        }
+    }
+    let truncated = bytes.len() > length;
+    bytes.truncate(length);
+    truncated
+}
+
+fn preview(
+    record: &mut editchain_engine::activity::Operation,
+    args: &Args,
+) -> Result<(PayloadSummary, bool)> {
+    let kind = format!("{:?}", record.kind.name());
+    let fields = record
+        .kind
+        .fields()
+        .into_iter()
+        .map(|(field, payload)| {
+            let (storage, length) = match payload {
+                Payload::Inline(bytes) => ("Inline", byte_length(bytes)),
+                Payload::Blob(reference) => ("Blob", u64::from(reference.len)),
+                Payload::Empty => ("Empty", 0),
+            };
+            (format!("{kind}.{field:?}"), storage, length)
+        })
+        .collect();
+    let limit = usize::try_from(if kind == "Original" {
+        args.original_preview_bytes
+    } else {
+        args.preview_bytes
+    })
+    .map_err(|error| Failure::input(error.to_string()))?;
+    let mut truncated = false;
+    for (_, payload) in record.kind.fields_mut() {
+        if let Payload::Inline(bytes) = payload {
+            truncated |= truncate(bytes, limit);
+        }
+    }
+    Ok((fields, truncated))
 }

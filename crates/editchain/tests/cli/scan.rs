@@ -70,13 +70,13 @@ fn compact_scan_preserves_exact_lengths_hashes_and_recorded_bytes() {
     assert_eq!(at(&events, "/1/entry/payload_summary/0/2"), &json!(30_000));
     assert_eq!(
         at(&events, "/0/entry/operation/kind/Note/content/Inline")
-            .as_array()
+            .as_str()
             .unwrap()
             .len(),
         16_000
     );
     assert!(at(&events, "/1/entry/operation/kind/Original/bytes/Inline")
-        .as_array()
+        .as_str()
         .unwrap()
         .is_empty());
     assert_eq!(at(&events, "/2/type"), "ready");
@@ -103,11 +103,11 @@ fn compact_scan_preserves_exact_lengths_hashes_and_recorded_bytes() {
     let configured = Value::Array(configured);
     assert_eq!(
         at(&configured, "/0/entry/operation/kind/Note/content/Inline"),
-        &json!([65, 65, 65])
+        &json!("AAA")
     );
     assert_eq!(
         at(&configured, "/1/entry/operation/kind/Original/bytes/Inline"),
-        &json!([42, 42])
+        &json!("**")
     );
     let snapshot = engine.snapshot().unwrap();
     for value in &values {
@@ -159,4 +159,49 @@ fn failed_scans_never_emit_a_complete_summary() {
         .unwrap();
     let _legacy = run(&legacy, &["scan"], b"", 2);
     let _invalid = run(&chain, &["scan", "--preview-bytes", "1048577"], b"", 2);
+}
+
+#[test]
+fn scan_accepts_migrated_initialization_and_keeps_utf8_previews_valid() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("converted");
+    let engine = Engine::open(&source).unwrap();
+    let mut root = message(1, Payload::Empty);
+    root.kind = OpKind::ChainStart(editchain_engine::ChainStart {
+        name: "aé🦀".as_bytes().to_vec(),
+        version: 3,
+    });
+    let mut child = message(2, Payload::Inline("aé🦀".as_bytes().to_vec()));
+    child.parents = ParentSet::One(root.id);
+    let _root = engine.append(&root).unwrap();
+    let _child = engine.append(&child).unwrap();
+    let _report = editchain_import::activity::migrate(&source, &destination, || false).unwrap();
+    let events = result(&destination, &["scan", "--preview-bytes", "2"], b"", 0);
+    assert_eq!(at(&events, "/0/entry/operation/kind/ChainStart/name"), "a");
+    assert_eq!(at(&events, "/0/entry/payload_summary/0/2"), 7);
+    assert_eq!(at(&events, "/0/entry/payloads_truncated"), true);
+    assert_eq!(
+        at(
+            &events,
+            "/1/entry/operation/kind/Message/blocks/0/content/Inline"
+        ),
+        "a"
+    );
+    assert_eq!(at(&events, "/2/stats/accepted"), 2);
+    let encoded = editchain_engine::encode_op(&root).unwrap();
+    assert_eq!(
+        at(&events, "/0/entry/record_ref/record_hash"),
+        &json!(blake3::hash(&encoded).as_bytes())
+    );
+    let binary = temp.path().join("binary");
+    let _append = Engine::open(&binary)
+        .unwrap()
+        .append(&note(vec![255, 254, 0]))
+        .unwrap();
+    let events = result(&binary, &["scan", "--preview-bytes", "2"], b"", 0);
+    assert_eq!(
+        at(&events, "/0/entry/operation/kind/Note/content/Inline"),
+        &json!([255, 254])
+    );
 }

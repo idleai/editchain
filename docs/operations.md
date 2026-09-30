@@ -99,11 +99,14 @@ those rules can be translated across folded records.
 Sources that already contain schema-three records are also rejected: use that
 chain directly so a repeated conversion cannot change future import identities.
 
-The corrected converter contract is `activity-schema3-v2`. It uses new conversion
-ID namespaces to avoid assigning changed record bytes to an existing ID. EC03
+The corrected converter contract is `activity-schema3-v3`. It isolates conflicted
+identities before collecting metadata, preserves explicit occurrence, containment,
+and tool-result links, and retains Claude reasoning categories and per-call
+recorded error/success flags. It uses new conversion ID namespaces to avoid
+assigning changed record bytes to an existing ID. EC03
 framing and the canonical ID format are unchanged. Chains created by the earlier
-converter remain readable, but new imports into them are rejected. To obtain a
-corrected chain, reimport the original sources into a new destination, or migrate
+v1 or v2 converters remain readable, but new imports into them are rejected.
+To obtain a corrected chain, reimport the original sources into a new destination, or migrate
 the original pre-schema-three chain again. A physical migration retains that
 original under `migration-v1/original`. Keep the earlier chain for any activities
 that were authored directly in it; this converter does not rewrite schema-three

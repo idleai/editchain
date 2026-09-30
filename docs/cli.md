@@ -65,15 +65,24 @@ accept `--key '{"Actor":9}'` or `--key '{"Session":12}'`. Content fields include
 for schemas and result semantics. `rebuild` recovers damaged checkpoints without
 rewriting records or blobs.
 
+JSON content uses UTF-8 strings when the recorded bytes are valid UTF-8:
+``{"Inline":"Now fix the `from_str_radix` in loader.rs:"}``. Non-UTF-8 content
+remains a byte array so every byte is preserved. Input accepts both strings and
+the previous byte-array representation. This applies to inline payloads,
+resolved `Available` content, blob response bytes, and chain names. Binary
+records, hashes, content IDs, archive encodings, and `--raw` output are unchanged.
+
 ## Compact statistics scans
 
 `editchain --chain PATH --output jsonl scan` reads schema-three operations in
-physical log order without building the query index. It emits one `record` event
+physical log order without building the query index. Retained `ChainStart`
+initialization records are included and counted alongside activities. It emits one `record` event
 per distinct operation and a final `ready` event with counts. Each entry contains
 the recorded envelope, original record hash, encoded byte length, and a
 `payload_summary` of field name, storage type, and exact original byte length.
 Inline payloads are previews: at most 16,000 bytes per field by default, and zero
 bytes for Original source payloads. `payloads_truncated` marks shortened entries.
+UTF-8 previews stop at a character boundary within the byte limit.
 Use `--preview-bytes` and `--original-preview-bytes` to choose limits from zero to
 1 MiB. These preview records are for analysis; use `export` for exact replay.
 

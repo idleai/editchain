@@ -86,7 +86,8 @@ fn publish_batch_with(
     })?;
     let mut directories = std::collections::BTreeSet::new();
     for (temporary, _, path, bytes) in &pending {
-        match fs::hard_link(&temporary.path, path) {
+        let published = fs::hard_link(&temporary.path, path);
+        match published {
             Ok(()) => {
                 let _inserted = directories.insert(parent(path)?);
             }
@@ -113,7 +114,8 @@ fn publish_new_with(
     sync: impl FnOnce(&Path) -> io::Result<()>,
 ) -> io::Result<bool> {
     let temporary = TemporaryFile::write(path, data)?;
-    match fs::hard_link(&temporary.path, path) {
+    let published = fs::hard_link(&temporary.path, path);
+    match published {
         Ok(()) => {
             sync(parent(path)?)?;
             Ok(true)

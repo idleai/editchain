@@ -11,6 +11,38 @@ use editchain_core::activity::{
 };
 use editchain_core::{OpId, Payload};
 
+#[test]
+fn json_content_is_text_with_lossless_binary_and_legacy_input() {
+    for bytes in [
+        b"Now fix the `from_str_radix` in loader.rs:".as_slice(),
+        "é🦀\n\"\\\0".as_bytes(),
+        b"",
+        b"\xff\0\xfe",
+    ] {
+        let payload = Payload::Inline(bytes.to_vec());
+        let json = serde_json::to_value(&payload).unwrap();
+        match std::str::from_utf8(bytes) {
+            Ok(text) => assert_eq!(json, serde_json::json!({"Inline": text})),
+            Err(_) => assert_eq!(json, serde_json::json!({"Inline": bytes})),
+        }
+        assert_eq!(serde_json::from_value::<Payload>(json).unwrap(), payload);
+        assert_eq!(
+            serde_json::from_value::<Payload>(serde_json::json!({"Inline": bytes})).unwrap(),
+            payload
+        );
+        let mut original_encoding = vec![1, u8::try_from(bytes.len()).unwrap()];
+        original_encoding.extend_from_slice(bytes);
+        assert_eq!(postcard::to_allocvec(&payload).unwrap(), original_encoding);
+        assert_eq!(
+            postcard::from_bytes::<Payload>(&original_encoding).unwrap(),
+            payload
+        );
+    }
+    assert_eq!(serde_json::to_value(Payload::Empty).unwrap(), "Empty");
+    assert!(serde_json::from_value::<Payload>(serde_json::json!({"Inline": [256]})).is_err());
+    assert!(serde_json::from_value::<Payload>(serde_json::json!({"Inline": [-1]})).is_err());
+}
+
 fn message(id: u8, previous: Option<u8>, mode: UpdateMode, text: &[u8]) -> Operation {
     Operation::new(
         OpId::from_bytes([id; 32]),

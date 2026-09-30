@@ -246,6 +246,7 @@ pub enum OpKind<I = OpId> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainStart {
     /// Human-readable chain name.
+    #[serde(with = "crate::payload::text_bytes")]
     pub name: Vec<u8>,
     /// Protocol version.
     pub version: u16,

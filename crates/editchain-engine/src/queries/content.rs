@@ -90,7 +90,7 @@ pub struct ContentQuery {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContentValue {
     /// Exact bytes, including valid empty content and non-UTF-8 content.
-    Available(Vec<u8>),
+    Available(#[serde(with = "editchain_core::payload::text_bytes")] Vec<u8>),
     /// No value was recorded for this field, or the field is inapplicable.
     NotRecorded,
     /// A referenced blob has not arrived.

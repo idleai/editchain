@@ -56,6 +56,9 @@ macro_rules! verify_ne {
     }};
 }
 
+#[path = "import_api/schema3_review.rs"]
+mod schema3_review;
+
 const HUMAN: &[u8] = include_bytes!("fixtures/human/session.jsonl");
 const CLAUDE: &[u8] = include_bytes!("fixtures/claude/session.jsonl");
 const CODEX: &[u8] = include_bytes!("fixtures/codex/rollout-contract.jsonl");

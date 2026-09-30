@@ -18,7 +18,7 @@ use crate::{BlobSink, ImportError};
 use source::{Derived, Source};
 
 /// Version of the deterministic converter, separate from EC03 framing.
-pub const CONTRACT: &str = "activity-schema3-v2";
+pub const CONTRACT: &str = "activity-schema3-v3";
 
 /// Small metadata gathered before a bounded conversion pass.
 #[derive(Debug, Default)]
@@ -50,17 +50,9 @@ impl Converter {
         }
     }
 
-    fn protect_conflicts(&mut self, conflicts: BTreeSet<OpId>) {
+    pub(crate) fn protect_conflicts(&mut self, conflicts: BTreeSet<OpId>) {
         for id in &conflicts {
             let _old = self.retained.insert(upgrade_id(*id), *id);
-            let _removed = self.removed.remove(id);
-            let _redirect = self.redirects.remove(&upgrade_id(*id));
-            if let Some(folded) = self.folded.remove(id) {
-                for note in folded {
-                    let _removed = self.removed.remove(&note);
-                    let _redirect = self.redirects.remove(&upgrade_id(note));
-                }
-            }
         }
         self.blocked = conflicts;
     }
@@ -69,7 +61,12 @@ impl Converter {
     /// # Errors
     /// Reports malformed recognized conversion metadata.
     pub fn observe(&mut self, op: &Op, resolved: Option<&[u8]>) -> Result<(), ImportError> {
-        self.calls.observe(op);
+        if self.blocked.contains(&op.id) {
+            return Ok(());
+        }
+        if !op.parents.iter().any(|id| self.blocked.contains(id)) {
+            self.calls.observe(op);
+        }
         match &op.kind {
             OpKind::Import(raw) => {
                 let bytes = match &raw.raw_ref {
@@ -103,15 +100,6 @@ impl Converter {
                 if note.relationship == NoteRelationship::ProviderEvidence {
                     if let Ok(contract) = serde_json::from_slice::<ProviderEvidence>(bytes) {
                         self.contract(op.id, contract);
-                    }
-                } else if matches!(
-                    note.relationship,
-                    NoteRelationship::OccurrenceOf
-                        | NoteRelationship::Contains
-                        | NoteRelationship::ToolResultOf
-                ) {
-                    if let Some(source) = op.parents.iter().next() {
-                        self.fold(op.id, *source);
                     }
                 }
             }
@@ -161,6 +149,9 @@ impl Converter {
     }
 
     fn fold(&mut self, old: OpId, target: OpId) {
+        if self.blocked.contains(&old) || self.blocked.contains(&target) {
+            return;
+        }
         let _inserted = self.removed.insert(old);
         self.folded.entry(target).or_default().push(old);
         let _previous = self.redirects.insert(upgrade_id(old), upgrade_id(target));
@@ -168,6 +159,9 @@ impl Converter {
 
     fn contract(&mut self, id: OpId, contract: ProviderEvidence) {
         let source = contract.source.id();
+        if self.blocked.contains(&source) {
+            return;
+        }
         match contract.fact {
             ProviderFact::CodexDerivation(meta) => {
                 let session = source::legacy_session(&meta.thread.0);
@@ -361,7 +355,7 @@ impl Converter {
 
 fn migration_id(id: OpId) -> OpId {
     OpId::from_bytes(blake3::derive_key(
-        "editchain.schema3-migration.v2",
+        "editchain.schema3-migration.v3",
         id.as_bytes(),
     ))
 }
@@ -371,6 +365,7 @@ fn migration_id(id: OpId) -> OpId {
 /// Returns record validation or blob-storage errors without advancing cursors.
 pub fn convert(operations: &[Op], blobs: &mut dyn BlobSink) -> Result<Vec<Op>, ImportError> {
     let mut converter = Converter::default();
+    converter.protect_conflicts(conflicts(operations)?);
     for op in operations {
         let stored = resolve_original(op, blobs)?;
         converter.observe(op, stored.as_deref())?;
@@ -381,6 +376,22 @@ pub fn convert(operations: &[Op], blobs: &mut dyn BlobSink) -> Result<Vec<Op>, I
         output.extend(converter.convert(op, blobs)?);
     }
     Ok(output)
+}
+
+pub(crate) fn conflicts<'a>(
+    operations: impl IntoIterator<Item = &'a Op>,
+) -> Result<BTreeSet<OpId>, ImportError> {
+    let mut seen = BTreeMap::new();
+    let mut conflicts = BTreeSet::new();
+    for op in operations {
+        let bytes = editchain_store::format::encode_op(op)
+            .map_err(|error| ImportError::OpSink(error.to_string()))?;
+        let hash = blake3::hash(&bytes);
+        if seen.insert(op.id, hash).is_some_and(|old| old != hash) {
+            let _inserted = conflicts.insert(op.id);
+        }
+    }
+    Ok(conflicts)
 }
 
 /// Resolve source bytes needed by conversion; absent bytes stay absent.

@@ -10,6 +10,64 @@ use super::commit;
 use crate::{append, found, id, message, record};
 
 #[test]
+fn git_links_match_every_target_in_its_recorded_repository() {
+    use editchain_engine::activity::{Entity, ItemId, Kind, Link, Operation};
+    let directory = tempfile::tempdir().unwrap();
+    let engine = Engine::open(directory.path()).unwrap();
+    let first = GitOid::from_sha1([1; 20]);
+    let second = GitOid::from_sha1([2; 20]);
+    let link = Operation::new(
+        id(1),
+        ItemId::legacy("link", 1),
+        ItemId::legacy("recorder", 1),
+        Kind::Link(Link {
+            relation: "based_on".into(),
+            from: Entity::Operation(id(99)),
+            to: vec![
+                Entity::Item(ItemId::legacy("item", 1)),
+                Entity::Git {
+                    repository: RepositoryId(1),
+                    oid: first,
+                },
+                Entity::Git {
+                    repository: RepositoryId(1),
+                    oid: second,
+                },
+                Entity::Git {
+                    repository: RepositoryId(2),
+                    oid: second,
+                },
+            ],
+            content: Payload::Empty,
+        }),
+    )
+    .into_op()
+    .unwrap();
+    append(&engine, std::slice::from_ref(&link)).unwrap();
+    let queries = engine.queries().unwrap();
+    for (repository, oid, expected) in [
+        (1, Some(first), 1),
+        (1, Some(second), 1),
+        (2, Some(second), 1),
+        (2, Some(first), 0),
+        (2, None, 1),
+        (3, None, 0),
+    ] {
+        let result = queries
+            .git(
+                GitQuery {
+                    repository: RepositoryId(repository),
+                    oid,
+                },
+                PageRequest::default(),
+            )
+            .unwrap();
+        assert_eq!(result.items.len(), expected);
+        assert!(result.items.iter().all(|entry| entry.operation == link));
+    }
+}
+
+#[test]
 fn operation_meta_retains_attribution_and_opaque_relationships_without_inference() {
     let directory = tempfile::tempdir().unwrap();
     let engine = Engine::open(directory.path()).unwrap();

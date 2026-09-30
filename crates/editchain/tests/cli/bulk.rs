@@ -32,9 +32,15 @@ fn oversized_originals_have_the_same_preview_and_durable_activities() {
         }
         let report = result(&chain, &args, b"", 0);
         assert_eq!(report.get("raw_ops"), Some(&json!(1)));
-        assert_eq!(report.get("normalized_ops"), Some(&json!(1)));
+        assert_eq!(report.get("normalized_ops"), Some(&json!(2)));
         let files = result(&chain, &["history", "--kind", "File"], b"", 0);
         assert_eq!(files.get("items").unwrap().as_array().unwrap().len(), 1);
+        let links = result(&chain, &["history", "--kind", "Link"], b"", 0);
+        assert_eq!(links.get("items").unwrap().as_array().unwrap().len(), 1);
+        assert_eq!(
+            links.pointer("/items/0/operation/kind/Link/relation"),
+            Some(&json!("OccurrenceOf"))
+        );
         let dry = temp
             .path()
             .join(if bulk { "dry-bulk" } else { "dry-single" });

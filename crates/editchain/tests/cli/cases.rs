@@ -29,6 +29,59 @@ mod bulk;
 #[path = "scan.rs"]
 mod scan;
 
+#[test]
+fn json_content_decodes_utf8_and_accepts_legacy_arrays_without_changing_records() {
+    let temp = tempfile::tempdir().unwrap();
+    let chain = temp.path().join("chain");
+    let _init = run(&chain, &["init"], b"", 0);
+    for (index, bytes) in ["é🦀\n".as_bytes(), b"\xff\x00"].into_iter().enumerate() {
+        let sequence = u64::try_from(index).unwrap().saturating_add(1);
+        let operation = message(sequence, Payload::Inline(bytes.to_vec()));
+        let mut input = serde_json::to_value(&operation).unwrap();
+        *input.pointer_mut("/kind/Message/content/Inline").unwrap() = json!(bytes);
+        let _append = run(&chain, &["append"], &serde_json::to_vec(&input).unwrap(), 0);
+        let expected = std::str::from_utf8(bytes).map_or_else(|_| json!(bytes), |text| json!(text));
+        let id = operation.id.to_string();
+        let found = result(&chain, &["operation", &id], b"", 0);
+        assert_eq!(
+            found.pointer("/Found/operation/kind/Message/content/Inline"),
+            Some(&expected)
+        );
+        let content = result(
+            &chain,
+            &["content", &id, "--field", "MessageContent"],
+            b"",
+            0,
+        );
+        assert_eq!(content.pointer("/Found/value/Available"), Some(&expected));
+        let blob: BlobRef =
+            serde_json::from_value(result(&chain, &["store-blob"], bytes, 0)).unwrap();
+        let blob_id = serde_json::to_string(&blob.id).unwrap();
+        assert_eq!(
+            result(&chain, &["blob", &blob_id], b"", 0).get("bytes"),
+            Some(&expected)
+        );
+        assert_eq!(
+            run(
+                &chain,
+                &["content", &id, "--field", "MessageContent", "--raw"],
+                b"",
+                0
+            )
+            .stdout,
+            bytes
+        );
+        assert_eq!(
+            Engine::open(&chain)
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .get(operation.id),
+            Some(&operation)
+        );
+    }
+}
+
 fn message(sequence: u64, content: Payload) -> Op {
     Op {
         source: Some(editchain_engine::SourceId::new(NodeId(7), 0, sequence)),
