@@ -6,12 +6,12 @@ EXTENSION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPOSITORY_DIR="$(cd "$EXTENSION_DIR/../.." && pwd)"
 WASM_FILE="$REPOSITORY_DIR/target/wasm32-unknown-unknown/release/editchain_history_renderer.wasm"
 
-# The wasm-bindgen artifact feeds exactly ONE deterministic consumer tree:
-# media/rust-history/pkg — PRODUCTION. The Rust-owned history webview loads
+# The web bindings feed media/rust-history/pkg. The Rust-owned history webview loads
 # media/rust-history/loader.js (and NOTHING else): the loader imports this
 # generated wasm-bindgen module and calls the Rust shell's startHistoryView(),
 # which owns the DOM, accessibility, and the renderer. This tree is what the
-# shipped panel and the rustSmoke harness/e2e exercise.
+# shipped panel and the rustSmoke harness/e2e exercise. The Node bindings expose
+# app-core's portable connection state to the legacy multiplayer host adapter.
 if ! command -v wasm-bindgen >/dev/null 2>&1; then
   echo "wasm-bindgen-cli 0.2.127 is required (cargo install wasm-bindgen-cli --version 0.2.127 --locked)" >&2
   exit 1
@@ -33,8 +33,8 @@ cargo build \
   --release \
   --locked
 
-# Deterministic single output: the regeneration check in
-# .github/workflows/history-renderer.yml verifies this tree reproduces the
+# Deterministic web and Node outputs: the regeneration check in
+# .github/workflows/history-renderer.yml verifies both trees reproduce the
 # committed artifacts exactly.
 mkdir -p "$EXTENSION_DIR/media/rust-history/pkg"
 wasm-bindgen "$WASM_FILE" \
@@ -43,4 +43,11 @@ wasm-bindgen "$WASM_FILE" \
   --out-name editchain_history_renderer \
   --no-typescript
 
-echo "History renderer assets written to $EXTENSION_DIR/media/rust-history/pkg (production)"
+mkdir -p "$EXTENSION_DIR/media/client-state/pkg"
+wasm-bindgen "$WASM_FILE" \
+  --target nodejs \
+  --out-dir "$EXTENSION_DIR/media/client-state/pkg" \
+  --out-name editchain_client_state \
+  --no-typescript
+
+echo "History and client-state assets written to media/rust-history/pkg and media/client-state/pkg"

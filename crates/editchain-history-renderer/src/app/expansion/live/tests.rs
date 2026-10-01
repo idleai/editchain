@@ -78,9 +78,9 @@ fn delta(index: &mut LiveIndex, metas: &[LiveBlockMeta]) {
         .apply(
             &LiveDelta {
                 visible_total: None,
-                base_revision: index.revision,
-                revision: index.revision.saturating_add(1),
-                snapshot_id: index.epoch.clone(),
+                base_revision: index.revisions.revision(),
+                revision: index.revisions.revision().saturating_add(1),
+                snapshot_id: index.revisions.epoch().clone(),
                 removed: Vec::new(),
                 total: index
                     .total()

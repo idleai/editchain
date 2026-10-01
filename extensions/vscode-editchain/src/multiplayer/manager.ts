@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { Duplex } from 'node:stream';
 import { NativeWorker, PeerBridge, PeerOptions, PeerProgress, PublicDevice, PEER_PROTOCOL } from './native';
-import { checking, missingContent } from './progress';
+import { connectionState, ConnectionState, joinState } from './clientState';
 import { ScopeChoice, SharingScope, validScope } from './scope';
 import { encodeInvitation, Invitation, JoinRequest, parseInvitation, parseRequest, savedInvitation } from './invitation';
 import { ClientTransport, HostLease, HostTransport, managementClient, RelayClient, RelayHost, RelayJournal, removeSavedRelay, validateLease } from './relay';
@@ -24,8 +24,8 @@ export type ManagerOptions = {
   changed(status: SharingStatus, durableChange: boolean): void;
   relay?: RelayProvider;
 };
-type Edge = { bridge: PeerBridge; outbound: boolean; clientKey?: string; device?: PublicDevice; progress?: PeerProgress };
-type Peer = { invitation: Invitation; attempts: number; state: string; timer?: NodeJS.Timeout };
+type Edge = { lifecycle: ConnectionState; bridge: PeerBridge; outbound: boolean; clientKey?: string; device?: PublicDevice; progress?: PeerProgress };
+type Peer = { invitation: Invitation; lifecycle: ConnectionState; timer?: NodeJS.Timeout };
 
 /** Workspace owner of authenticated history replication and transport recovery. */
 export class MultiplayerManager {
@@ -35,15 +35,16 @@ export class MultiplayerManager {
   private host?: HostTransport;
   private lease?: HostLease;
   private hostTimer?: NodeJS.Timeout;
-  private hostAttempts = 0;
+  private readonly hostLifecycle = connectionState();
   private pendingCleanup = new Set<HostTransport>();
   private starting?: HostTransport;
   private readonly relay: RelayProvider;
   private clients = new Map<string, ClientTransport>();
   private edges = new Map<string, Edge>();
   private peers = new Map<string, Peer>();
-  private generation = 0;
-  private enabled = false;
+  private readonly session = joinState();
+  private get generation(): number { return this.session.generation; }
+  private get enabled(): boolean { return this.session.enabled; }
   private message?: string;
   private saved = Promise.resolve();
   private scope?: SharingScope;
@@ -83,7 +84,7 @@ export class MultiplayerManager {
     this.requireGeneration(generation);
     await this.approve(guest);
     this.requireGeneration(generation);
-    this.enabled = true;
+    this.session.enable(generation);
     await this.startHost(generation);
     const descriptor = await this.host!.descriptor();
     this.requireGeneration(generation);
@@ -101,11 +102,11 @@ export class MultiplayerManager {
     this.requireGeneration(generation);
     await this.approve(invitation.host);
     this.requireGeneration(generation);
-    this.enabled = true;
+    this.session.enable(generation);
     const key = invitation.host.fingerprint;
     const previous = this.peers.get(key);
     clearTimeout(previous?.timer);
-    this.peers.set(key, { invitation, attempts: 0, state: 'Connecting' });
+    this.peers.set(key, { invitation, lifecycle: connectionState() });
     await this.persist();
     await this.connect(key, generation);
   }
@@ -130,8 +131,8 @@ export class MultiplayerManager {
     }
     this.lease = input.host ? validateLease(input.host) : undefined;
     this.requireGeneration(generation);
-    this.enabled = true;
-    for (const invitation of peers) this.peers.set(invitation.host.fingerprint, { invitation, attempts: 0, state: 'Reconnecting' });
+    this.session.enable(generation);
+    for (const invitation of peers) this.peers.set(invitation.host.fingerprint, { invitation, lifecycle: connectionState() });
     if (this.lease) {
       try { await this.startHost(generation); }
       catch { if (generation === this.generation) this.message = 'Hosting is unavailable; retrying automatically.'; }
@@ -229,20 +230,20 @@ export class MultiplayerManager {
     const edges = [...this.edges.entries()];
     return { space: this.space, scope: this.scope, enabled: this.enabled, hosting: !!this.host, message: this.message,
       peers: [ ...edges.map(([connection, edge]) => ({ connection, fingerprint: edge.device?.fingerprint ?? edge.clientKey,
-        state: !edge.progress?.accepted ? 'Authenticating' : checking(edge.progress) ? 'Catching up'
-          : missingContent(edge.progress) ? 'Waiting for content' : 'Live', progress: edge.progress })),
+        state: edge.lifecycle.status, progress: edge.progress })),
       ...[...this.peers.entries()].filter(([key]) => !edges.some(([, edge]) => edge.device?.fingerprint === key || edge.clientKey === key))
-        .map(([fingerprint, peer]) => ({ fingerprint, state: peer.state })) ] };
+        .map(([fingerprint, peer]) => ({ fingerprint, state: peer.lifecycle.status })) ] };
   }
 
   private async startHost(generation: number): Promise<void> {
     if (this.host) return;
     clearTimeout(this.hostTimer); this.hostTimer = undefined;
+    const attempt = this.hostLifecycle.begin();
     const host = this.relay.host(stream => {
       if (!this.enabled || generation !== this.generation) { stream.destroy(); return; }
       this.attach(stream, false);
     }, (message, disconnected) => {
-      if (generation !== this.generation) return;
+      if (generation !== this.generation || attempt !== this.hostLifecycle.generation) return;
       this.message = message; this.publish();
       if (disconnected && this.host === host) {
         this.host = undefined;
@@ -258,7 +259,7 @@ export class MultiplayerManager {
       await host.start(this.lease);
       if (generation !== this.generation) { await (this.lease ? host.suspend() : host.stop()); throw new ProbeError('Sharing was stopped.'); }
       this.lease = host.lease();
-      this.hostAttempts = 0;
+      this.hostLifecycle.ready(attempt);
       if (this.starting === host) this.starting = undefined;
       await this.persist();
     } catch (error) {
@@ -281,7 +282,8 @@ export class MultiplayerManager {
 
   private scheduleHost(generation: number): void {
     if (!this.enabled || generation !== this.generation || !this.lease || this.host || this.hostTimer) return;
-    const delay = Math.min(30_000, 1000 * 2 ** Math.min(this.hostAttempts++, 5));
+    this.hostLifecycle.waiting(this.hostLifecycle.generation);
+    const delay = this.hostLifecycle.retry_delay_ms;
     this.hostTimer = setTimeout(() => {
       this.hostTimer = undefined;
       if (this.enabled && generation === this.generation) void this.startHost(generation).catch(() => {});
@@ -295,7 +297,7 @@ export class MultiplayerManager {
     clearTimeout(peer.timer); peer.timer = undefined;
     const client = this.relay.client();
     this.clients.set(key, client);
-    peer.state = 'Connecting'; this.publish();
+    const attempt = peer.lifecycle.begin(); this.publish();
     try {
       const invitation = savedInvitation(peer.invitation);
       const approved = await this.devices();
@@ -309,10 +311,9 @@ export class MultiplayerManager {
       if (generation !== this.generation || this.peers.get(key) !== peer) { stream.destroy(); return; }
       this.attach(stream, true, invitation.host.certificate, key, client);
     } catch {
-      peer.attempts++;
-      peer.state = 'Waiting to reconnect';
+      peer.lifecycle.waiting(attempt);
       try { savedInvitation(peer.invitation); }
-      catch { peer.state = 'Invitation expired'; }
+      catch { peer.lifecycle.expired(attempt); }
     } finally {
       if (!this.hasEdge(key)) {
         if (this.clients.get(key) === client) this.clients.delete(key);
@@ -325,10 +326,11 @@ export class MultiplayerManager {
 
   private schedule(key: string, delay?: number): void {
     const peer = this.peers.get(key);
-    if (!this.enabled || this.changingScope !== undefined || !peer || peer.timer || this.hasEdge(key) || this.clients.has(key) || peer.state === 'Invitation expired') return;
-    peer.state = 'Waiting to reconnect';
+    if (!this.enabled || this.changingScope !== undefined || !peer || peer.timer || this.hasEdge(key) || this.clients.has(key) || peer.lifecycle.status === 'Invitation expired') return;
+    if (!peer.lifecycle.generation) peer.lifecycle.begin();
+    peer.lifecycle.waiting(peer.lifecycle.generation);
     const generation = this.generation;
-    const backoff = Math.min(30_000, 1000 * 2 ** Math.min(peer.attempts, 5));
+    const backoff = peer.lifecycle.retry_delay_ms;
     peer.timer = setTimeout(() => {
       peer.timer = undefined;
       void this.connect(key, generation).catch(() => {});
@@ -342,7 +344,9 @@ export class MultiplayerManager {
   }
 
   private async close(remove: boolean): Promise<void> {
-    this.generation++; this.enabled = false;
+    this.session.retire();
+    this.hostLifecycle.stop();
+    for (const peer of this.peers.values()) peer.lifecycle.stop();
     clearTimeout(this.hostTimer); this.hostTimer = undefined;
     for (const peer of this.peers.values()) clearTimeout(peer.timer);
     const host = this.host, lease = this.lease;
@@ -457,21 +461,26 @@ export class MultiplayerManager {
   }
 
   private requireGeneration(generation: number): void {
-    if (generation !== this.generation) throw new ProbeError('Sharing was stopped.');
+    if (!this.session.is_current(generation)) throw new ProbeError('Sharing was stopped.');
   }
 
   private attach(stream: Duplex, outbound: boolean, remote?: string, clientKey?: string, client?: ClientTransport): void {
     if (this.changingScope !== undefined || this.edges.size >= 8) { stream.destroy(); return; }
+    const generation = this.generation;
     const key = randomUUID();
+    const lifecycle = connectionState();
+    const attempt = lifecycle.begin();
+    lifecycle.authenticating(attempt);
     const options: PeerOptions = { chain_dir: this.options.chain, device_dir: this.options.deviceDirectory, space: this.requiredSpace(), remote };
     const bridge = new PeerBridge(this.options.binary, stream, options, (progress, device, durableChange) => {
       const edge = this.edges.get(key);
-      if (!edge) return;
+      if (!edge || !this.session.is_current(generation)) return;
       edge.device = device ?? undefined; edge.progress = progress;
+      edge.lifecycle.progress(attempt, JSON.stringify(progress));
       if (device) {
         const peer = this.peers.get(device.fingerprint);
         if (peer) {
-          if (progress.accepted && progress.rounds > 0) peer.attempts = 0;
+          peer.lifecycle.progress(peer.lifecycle.generation, JSON.stringify(progress));
           clearTimeout(peer.timer); peer.timer = undefined;
         }
         const duplicate = [...this.edges.entries()].find(([id, other]) => id !== key && other.device?.fingerprint === device.fingerprint);
@@ -486,20 +495,22 @@ export class MultiplayerManager {
       this.message = undefined; this.publish(durableChange);
     }, error => {
       const device = this.edges.get(key)?.device;
+      lifecycle.stop();
       this.edges.delete(key);
       if (clientKey && this.clients.get(clientKey) === client) {
         this.clients.delete(clientKey); void client?.stop().catch(() => {});
       }
+      if (!this.session.is_current(generation)) return;
       if (error) this.message = error.message;
       const remoteKey = clientKey ?? device?.fingerprint;
       if (remoteKey) {
         const peer = this.peers.get(remoteKey);
-        if (error && peer) peer.attempts++;
+        if (peer) peer.lifecycle.waiting(peer.lifecycle.generation);
         this.schedule(remoteKey);
       }
       this.publish();
     });
-    this.edges.set(key, { bridge, outbound, clientKey });
+    this.edges.set(key, { bridge, outbound, clientKey, lifecycle });
     void bridge.start().catch(() => {});
     this.publish();
   }

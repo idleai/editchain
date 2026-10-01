@@ -1,14 +1,11 @@
 //! Request ownership and bounded diagnostics for the pure renderer reducer.
 
-use std::collections::BTreeMap;
-
 use editchain_protocol::{ErrorCode, RequestBody, ServiceError};
+use idle_history::requests::{RequestError, RequestTracker};
 use serde_json::json;
 
 use super::host::{LoggedRequest, Send};
 
-// Numeric request IDs cross the JavaScript bridge without a string adapter.
-const MAX_REQUEST_ID: u64 = 9_007_199_254_740_991;
 const MAX_RETAINED_REQUESTS: usize = 128;
 const MAX_LOGGED_REQUESTS: usize = 128;
 
@@ -24,18 +21,14 @@ pub(super) struct InFlight {
 /// the latest request and the pending window are never evicted by that bound.
 #[derive(Debug, Clone)]
 pub(crate) struct RequestRegistry {
-    next_id: Option<u64>,
-    in_flight: BTreeMap<u64, InFlight>,
-    window: Option<u64>,
+    in_flight: RequestTracker<InFlight>,
     log: Vec<LoggedRequest>,
 }
 
 impl Default for RequestRegistry {
     fn default() -> Self {
         Self {
-            next_id: Some(1),
-            in_flight: BTreeMap::new(),
-            window: None,
+            in_flight: RequestTracker::bounded(MAX_RETAINED_REQUESTS),
             log: Vec::new(),
         }
     }
@@ -43,7 +36,7 @@ impl Default for RequestRegistry {
 
 impl RequestRegistry {
     pub(super) fn contains(&self, id: u64) -> bool {
-        self.in_flight.contains_key(&id)
+        self.in_flight.contains(id)
     }
     pub(super) fn register(
         &mut self,
@@ -56,36 +49,22 @@ impl RequestRegistry {
             body,
             RequestBody::GetWindow(_) | RequestBody::ReconcileRows(_)
         );
-        if is_window && self.window.is_some() {
-            return Err(invalid("A history window is already in flight."));
-        }
         let id = self
-            .next_id
-            .ok_or_else(|| invalid("History request IDs are exhausted. Reopen the webview."))?;
-        self.next_id = id.checked_add(1).filter(|next| *next <= MAX_REQUEST_ID);
-        // At most one window and the most recent search matter to the reducer.
-        // Retire the oldest remaining non-window envelope at the diagnostic cap.
-        if self.in_flight.len() >= MAX_RETAINED_REQUESTS {
-            if let Some(oldest) = self
-                .in_flight
-                .keys()
-                .copied()
-                .find(|old| Some(*old) != self.window)
-            {
-                drop(self.in_flight.remove(&oldest));
-            }
-        }
-        drop(self.in_flight.insert(
-            id,
-            InFlight {
-                body: body.clone(),
-                gen_tag: generation,
-                search_epoch,
-            },
-        ));
-        if is_window {
-            self.window = Some(id);
-        }
+            .in_flight
+            .register(
+                InFlight {
+                    body: body.clone(),
+                    gen_tag: generation,
+                    search_epoch,
+                },
+                is_window,
+            )
+            .map_err(|error| match error {
+                RequestError::WindowBusy => invalid("A history window is already in flight."),
+                RequestError::Exhausted => {
+                    invalid("History request IDs are exhausted. Reopen the webview.")
+                }
+            })?;
         let body = json!(body);
         if self.log.len() == MAX_LOGGED_REQUESTS {
             drop(self.log.remove(0));
@@ -100,21 +79,15 @@ impl RequestRegistry {
     }
 
     pub(super) fn take(&mut self, id: u64) -> Option<(InFlight, bool)> {
-        let request = self.in_flight.remove(&id)?;
-        let was_window = self.window == Some(id);
-        if was_window {
-            self.window = None;
-        }
-        Some((request, was_window))
+        self.in_flight.take(id)
     }
 
     pub(super) fn clear(&mut self) {
         self.in_flight.clear();
-        self.window = None;
     }
 
     pub(super) const fn pending_window(&self) -> Option<u64> {
-        self.window
+        self.in_flight.pending_window()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -128,7 +101,7 @@ impl RequestRegistry {
 
     #[cfg(test)]
     pub(super) fn get(&self, id: u64) -> Option<&InFlight> {
-        self.in_flight.get(&id)
+        self.in_flight.get(id)
     }
 
     #[cfg(test)]
@@ -181,12 +154,9 @@ mod tests {
     }
 
     #[test]
-    fn invalid_requests_and_exhaustion_do_not_overwrite_pending_requests() {
+    fn invalid_requests_do_not_overwrite_pending_requests() {
         let snapshot = SnapshotId::new("fixture");
-        let mut requests = RequestRegistry {
-            next_id: Some(MAX_REQUEST_ID),
-            ..RequestRegistry::default()
-        };
+        let mut requests = RequestRegistry::default();
         assert!(requests
             .register(&get_window(&snapshot, 0, 0, false), 0, None)
             .is_err());
@@ -194,12 +164,9 @@ mod tests {
         let (id, _) = requests
             .register(&get_window(&snapshot, 0, 1, false), 0, None)
             .unwrap();
-        assert_eq!(id, MAX_REQUEST_ID);
+        assert_eq!(id, 1);
         assert!(requests
             .register(&get_window(&snapshot, 0, 1, true), 0, None)
-            .is_err());
-        assert!(requests
-            .register(&find_in_history(&snapshot, "x", 1), 0, Some(1))
             .is_err());
         assert_eq!(requests.len(), 1);
         assert_eq!(requests.pending_window(), Some(id));

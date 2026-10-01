@@ -97,18 +97,29 @@ impl HistoryAppState {
             .as_ref()
             .and_then(|index| index.live.as_ref())
             .ok_or_else(|| invalid("Live baseline is missing."))?;
-        if index.epoch != update.epoch {
-            return Err(invalid("Live epoch changed; bootstrap required."));
-        }
+        let _latest = index
+            .revisions
+            .plan(
+                &update.epoch,
+                update.revision,
+                update
+                    .deltas
+                    .iter()
+                    .map(|delta| (delta.base_revision, delta.revision)),
+            )
+            .map_err(|error| match error {
+                idle_history::reconciliation::ReconcileError::EpochChanged => {
+                    invalid("Live epoch changed; bootstrap required.")
+                }
+                idle_history::reconciliation::ReconcileError::Gap
+                | idle_history::reconciliation::ReconcileError::Incomplete => {
+                    invalid("Live replay has a revision gap.")
+                }
+            })?;
+        let previous_revision = index.revisions.revision();
         let mut effective = *viewport;
-        let previous_revision = index.revision;
         for delta in &update.deltas {
-            let revision = self
-                .expansion
-                .as_ref()
-                .and_then(|index| index.live.as_ref())
-                .map_or(0, |index| index.revision);
-            if delta.revision <= revision {
+            if delta.revision <= previous_revision {
                 continue;
             }
             effective = self.apply_delta(delta, &effective)?;
@@ -117,10 +128,7 @@ impl HistoryAppState {
             .expansion
             .as_ref()
             .and_then(|index| index.live.as_ref())
-            .map_or(0, |index| index.revision);
-        if revision != update.revision {
-            return Err(invalid("Live replay has a revision gap."));
-        }
+            .map_or(0, |index| index.revisions.revision());
         if previous_revision == revision {
             step.sends.push(Send::LiveSettled {
                 snapshot_id: self.snapshot_id.as_str().to_owned(),

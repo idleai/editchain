@@ -37,7 +37,11 @@ function fixture() {
     let sequence = 0;
     const call = async body => {
       const response = await client.request(body, { timeoutMs: 30_000 });
-      if (!response?.Ok) throw new Error(`Native history fixture: ${response?.Error?.code || 'invalid_response'}`);
+      if (!response?.Ok) {
+        const error = new Error(`Native history fixture: ${response?.Error?.code || 'invalid_response'}`);
+        error.code = response?.Error?.code;
+        throw error;
+      }
       return response.Ok;
     };
     const send = events => call({ RecordEditorEvents: { workspace_path: root, chain_dir: '.editchain', events:
@@ -71,20 +75,33 @@ function blobs(chain) {
   return fs.readdirSync(root).filter(name => /^[a-f0-9]{64}$/.test(name)).sort();
 }
 
+async function snapshot(workspace, read) {
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    try {
+      const opened = await workspace.call({ Open: { workspace_path: workspace.root, chain_dir: '.editchain' } });
+      const window = await workspace.call({ GetWindow: { snapshot_id: opened.snapshot_id, offset: 0, limit: 200, include_layout: false } });
+      return await read(opened.snapshot_id, window.rows);
+    } catch (error) {
+      // Replication can replace the native snapshot between any two reads.
+      // Restart the whole read so rows and details always share one snapshot.
+      if (error.code !== 'stale_snapshot' || Date.now() >= deadline) throw error;
+    }
+  }
+}
+
 async function rows(workspace) {
-  const opened = await workspace.call({ Open: { workspace_path: workspace.root, chain_dir: '.editchain' } });
-  const window = await workspace.call({ GetWindow: { snapshot_id: opened.snapshot_id, offset: 0, limit: 200, include_layout: false } });
-  return window.rows;
+  return snapshot(workspace, (_id, values) => values);
 }
 
 async function diffs(workspace) {
-  const opened = await workspace.call({ Open: { workspace_path: workspace.root, chain_dir: '.editchain' } });
-  const window = await workspace.call({ GetWindow: { snapshot_id: opened.snapshot_id, offset: 0, limit: 200, include_layout: false } });
-  const values = [];
-  for (const row of window.rows) {
-    if (row.file_change) values.push(await workspace.call({ GetFileDiff: { snapshot_id: opened.snapshot_id, change: row.file_change } }));
-  }
-  return values;
+  return snapshot(workspace, async (snapshot_id, rows) => {
+    const values = [];
+    for (const row of rows) {
+      if (row.file_change) values.push(await workspace.call({ GetFileDiff: { snapshot_id, change: row.file_change } }));
+    }
+    return values;
+  });
 }
 
 module.exports = { fixture, binaries, until, blobs, rows, diffs };

@@ -54,8 +54,7 @@ impl Block {
 
 #[derive(Debug, Clone)]
 pub(in crate::app) struct LiveIndex {
-    pub(in crate::app) epoch: SnapshotId,
-    pub(in crate::app) revision: u64,
+    pub(in crate::app) revisions: idle_history::reconciliation::Revisions<SnapshotId>,
     tree: RankTree<Order, Block>,
     orders: HashMap<String, Order>,
     groups: HashMap<String, tasks::Group>,
@@ -65,8 +64,10 @@ pub(in crate::app) struct LiveIndex {
 impl LiveIndex {
     pub(in crate::app) fn new(baseline: &LiveBaseline) -> Result<Self, ServiceError> {
         let mut index = Self {
-            epoch: baseline.epoch.clone(),
-            revision: baseline.revision,
+            revisions: idle_history::reconciliation::Revisions::new(
+                baseline.epoch.clone(),
+                baseline.revision,
+            ),
             tree: RankTree::default(),
             orders: HashMap::new(),
             groups: HashMap::new(),
@@ -252,10 +253,9 @@ impl LiveIndex {
         delta: &LiveDelta,
         expanded: &BTreeSet<String>,
     ) -> Result<(), ServiceError> {
-        if delta.base_revision != self.revision || delta.revision != self.revision.saturating_add(1)
-        {
-            return Err(invalid("Missing live revision; request replay."));
-        }
+        self.revisions
+            .next(delta.base_revision, delta.revision)
+            .map_err(|_gap| invalid("Missing live revision; request replay."))?;
         let mut touched: HashSet<_> = delta.removed.iter().cloned().collect();
         let mut prepared = Vec::new();
         for incoming in &delta.upserts {
@@ -310,7 +310,7 @@ impl LiveIndex {
         for key in touched {
             self.remeasure(&key);
         }
-        self.revision = delta.revision;
+        self.revisions.commit(delta.revision);
         Ok(())
     }
 

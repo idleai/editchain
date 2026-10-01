@@ -1,6 +1,6 @@
 import type { DiscoveryStatus } from './discovery';
 import type { SharingStatus } from './manager';
-import { checking, describeCheck, describeDownload, missingContent, workSignature } from './progress';
+import { describeCheck, describeDownload, workSignature } from './progress';
 import { describeScope } from './scope';
 
 type Status = SharingStatus & { discovery?: DiscoveryStatus };
@@ -109,8 +109,8 @@ function label(peer: Peer): string { return peer.fingerprint ? `Peer ${peer.fing
 function describe(observation: Observation): string {
   const { peer, since, savedAt, sentAt } = observation, progress = peer.progress;
   if (!progress?.accepted) return `${label(peer)}: ${peer.state}.`;
-  const phase = checking(progress) ? (progress.rounds ? 'checking shared history' : 'checking shared history (first pass)')
-    : missingContent(progress) ? 'waiting for content' : 'caught up at last check';
+  const phase = peer.state === 'Catching up' ? (progress.rounds ? 'checking shared history' : 'checking shared history (first pass)')
+    : peer.state === 'Waiting for content' ? 'waiting for content' : 'caught up at last check';
   const seconds = Math.max(0, Math.floor((Date.now() - (savedAt ?? since)) / 1000));
   const activity = savedAt === undefined ? `No new saved-data update observed in ${seconds}s.` : `Last saved-data update observed ${seconds}s ago.`;
   const sent = progress.sent_records === undefined || progress.sent_blobs === undefined ? 'Send progress unavailable.'

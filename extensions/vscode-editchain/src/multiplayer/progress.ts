@@ -17,14 +17,6 @@ export function validWorkProgress(value: WorkProgress): boolean {
       && (download.total_bytes === null ? download.received_bytes === 0 : count(download.total_bytes) && download.received_bytes <= download.total_bytes));
 }
 
-export function checking(value: WorkProgress & { synchronizing: boolean }): boolean {
-  return value.synchronizing || !!value.outgoing?.pass && !value.outgoing.complete;
-}
-
-export function missingContent(value: WorkProgress & { unavailable: number }): boolean {
-  return !!value.unavailable || !!value.outgoing?.unavailable;
-}
-
 /** Truncate so an unfinished check never rounds up to 100%. */
 export function checkPercent(value?: CheckProgress): string | undefined {
   if (!value || value.total_records === null) return undefined;

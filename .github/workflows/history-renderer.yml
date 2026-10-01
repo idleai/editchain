@@ -82,25 +82,23 @@ jobs:
             --workspace "$GITHUB_WORKSPACE/editchain" \
             --chain "$GITHUB_WORKSPACE/editchain/.editchain"
 
-      - name: Build history renderer assets (deterministic single output)
+      - name: Build history renderer and client-state assets
         working-directory: editchain/extensions/vscode-editchain
         timeout-minutes: 25
         run: npm run build:renderer
 
-      - name: Verify committed renderer pkg tree regenerates without diff
+      - name: Verify committed web and Node pkg trees regenerate without diff
         working-directory: editchain/extensions/vscode-editchain
         run: |
-          pkg=media/rust-history/pkg
-          if git ls-files --error-unmatch "$pkg" >/dev/null 2>&1; then
+          for pkg in media/rust-history/pkg media/client-state/pkg; do
+            git ls-files --error-unmatch "$pkg" >/dev/null
             if [ -n "$(git status --porcelain -- "$pkg")" ]; then
               echo "::error::Regenerating $pkg produced a diff; the committed wasm-bindgen artifacts are out of sync with the crate."
               git status --porcelain -- "$pkg"
               exit 1
             fi
             echo "$pkg regeneration matches the committed artifacts"
-          else
-            echo "$pkg is not tracked in git — skipping the regeneration diff check"
-          fi
+          done
 
       - name: wasm32 cargo check (editchain-history-renderer)
         run: cargo check -p editchain-history-renderer --target wasm32-unknown-unknown --locked

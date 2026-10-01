@@ -2,12 +2,12 @@
 
 use super::{ExpansionIndex, HistoryAppState, Send, SnapshotPhase, Step, Viewport};
 use editchain_protocol::{ErrorCode, LiveBaseline, LiveUpdate, ServiceError, SnapshotId};
+use idle_history::reconciliation::{ReconcileError, Revisions};
 
 #[derive(Debug, Clone)]
 pub(in crate::app) struct Remote {
     pub(super) reconcile_rows: bool,
-    epoch: SnapshotId,
-    revision: u64,
+    revisions: Revisions<SnapshotId>,
     pending_find: Option<editchain_protocol::FindInHistoryResponse>,
     last_viewport: Option<editchain_protocol::ViewportLiveRequest>,
 }
@@ -58,8 +58,7 @@ impl HistoryAppState {
         self.expansion = Some(ExpansionIndex::from_metadata(total, None, Some(&[]))?);
         self.remote = Some(Remote {
             reconcile_rows: baseline.reconcile_rows,
-            epoch: baseline.epoch.clone(),
-            revision: baseline.revision,
+            revisions: Revisions::new(baseline.epoch.clone(), baseline.revision),
             pending_find: None,
             last_viewport: None,
         });
@@ -122,24 +121,22 @@ impl HistoryAppState {
             .remote
             .as_ref()
             .ok_or_else(|| invalid("Native baseline is missing."))?;
-        if remote.epoch != update.epoch {
-            return Err(invalid("Native live epoch changed."));
-        }
-        let mut revision = remote.revision;
-        let mut latest = None;
-        for delta in &update.deltas {
-            if delta.revision <= revision {
-                continue;
-            }
-            if delta.base_revision != revision || delta.revision != revision.saturating_add(1) {
-                return Err(invalid("Native live revision gap."));
-            }
-            revision = delta.revision;
-            latest = Some(delta);
-        }
-        if revision != update.revision {
-            return Err(invalid("Native live replay is incomplete."));
-        }
+        let latest = remote
+            .revisions
+            .plan(
+                &update.epoch,
+                update.revision,
+                update
+                    .deltas
+                    .iter()
+                    .map(|delta| (delta.base_revision, delta.revision)),
+            )
+            .map_err(|error| match error {
+                ReconcileError::EpochChanged => invalid("Native live epoch changed."),
+                ReconcileError::Gap => invalid("Native live revision gap."),
+                ReconcileError::Incomplete => invalid("Native live replay is incomplete."),
+            })?;
+        let latest = latest.and_then(|index| update.deltas.get(index));
         let Some(delta) = latest else {
             if self.live.is_some() {
                 return Ok(());
@@ -155,10 +152,12 @@ impl HistoryAppState {
             .and_then(|total| i64::try_from(total).ok())
             .ok_or_else(|| invalid("Missing native visible total."))?;
         let index = ExpansionIndex::from_metadata(total, None, Some(&[]))?;
+        let max_lane =
+            u32::try_from(delta.max_lane).map_err(|_overflow| invalid("Live lane overflow."))?;
         // Preserve the keyed DOM until the replacement viewport has arrived.
         self.pause_live(viewport, step);
         if let Some(remote) = &mut self.remote {
-            remote.revision = revision;
+            remote.revisions.commit(update.revision);
             remote.pending_find = None;
         }
         self.snapshot_id.clone_from(&delta.snapshot_id);
@@ -172,12 +171,11 @@ impl HistoryAppState {
         self.total = Some(total);
         self.expansion = Some(index);
         self.phase = SnapshotPhase::Opening;
-        self.max_lane =
-            u32::try_from(delta.max_lane).map_err(|_overflow| invalid("Live lane overflow."))?;
+        self.max_lane = max_lane;
         self.locate_remote_anchors(step);
         step.sends.push(Send::Log(format!(
-            "live delta: revision {revision}, {} blocks, {} chain records",
-            update.work.blocks, update.work.chain_records
+            "live delta: revision {}, {} blocks, {} chain records",
+            update.revision, update.work.blocks, update.work.chain_records
         )));
         Ok(())
     }
