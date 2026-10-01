@@ -142,5 +142,11 @@ view from `editchain-history-renderer`.
 
 Run `./scripts/lint.sh` for Rust checks; it requires `cargo-deny`.
 
+The legacy viewer shares portable semantic contracts with `idleai/app-core`.
+Check that repository out beside this one as `../app-core` when building this
+workspace. Engine crates remain independent of the client-state runtime. The
+[history-state migration note](crates/editchain-history-renderer/HISTORY-STATE-MIGRATION.md)
+describes the current adapters and their replacement owners.
+
 [Extension tests](./extensions/vscode-editchain/README.md#tests) ·
 [Model provenance](./MODELS.md)

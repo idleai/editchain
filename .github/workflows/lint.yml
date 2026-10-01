@@ -13,8 +13,19 @@ env:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editchain
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: editchain
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: idleai/app-core
+          path: app-core
+          persist-credentials: false
 
       - name: Install Rust toolchain
         run: |
@@ -27,8 +38,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+            editchain/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('editchain/Cargo.lock') }}
 
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
