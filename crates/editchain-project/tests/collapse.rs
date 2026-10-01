@@ -14,6 +14,7 @@ use editchain_engine as _;
 use editchain_import as _;
 use editchain_index as _;
 use editchain_store as _;
+use history_geometry as _;
 use serde as _;
 use serde_json as _;
 use tempfile as _;

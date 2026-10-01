@@ -27,6 +27,13 @@ jobs:
           path: app-core
           persist-credentials: false
 
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: idleai/web-ui
+          ref: main
+          path: web-ui
+          persist-credentials: false
+
       - name: Install Rust toolchain
         run: |
           rustup show

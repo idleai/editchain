@@ -38,6 +38,7 @@ use super::ChainState;
 
 #[cfg(any(target_arch = "wasm32", test))]
 #[path = "graph_growth.rs"]
+#[cfg(target_arch = "wasm32")]
 mod graph_growth;
 #[cfg(target_arch = "wasm32")]
 #[path = "graph_motion.rs"]

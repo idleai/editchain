@@ -1,6 +1,7 @@
 //! Import-to-view contracts owned by the presentation consumer.
 use editchain_engine as _;
 use editchain_index as _;
+use history_geometry as _;
 use serde as _;
 use tokio as _;
 

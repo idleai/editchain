@@ -4,6 +4,7 @@ use blake3 as _;
 use editchain_engine as _;
 use editchain_index as _;
 use editchain_store as _;
+use history_geometry as _;
 use serde as _;
 use serde_json as _;
 use tokio as _;

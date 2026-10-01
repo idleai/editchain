@@ -24,7 +24,8 @@ fi
 # generated pkg tree is byte-identical everywhere.
 CARGO_HOME_BASE="${CARGO_HOME:-$HOME/.cargo}"
 RUSTUP_HOME_BASE="${RUSTUP_HOME:-$HOME/.rustup}"
-export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${CARGO_HOME_BASE}=/cargo --remap-path-prefix=${RUSTUP_HOME_BASE}=/rustup"
+GRAPH_SIBLING_ROOT="$(cd "$REPOSITORY_DIR/.." && pwd)"
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${CARGO_HOME_BASE}=/cargo --remap-path-prefix=${RUSTUP_HOME_BASE}=/rustup --remap-path-prefix=${GRAPH_SIBLING_ROOT}=/workspace"
 
 cargo build \
   --manifest-path "$REPOSITORY_DIR/Cargo.toml" \

@@ -734,6 +734,7 @@ name = "editchain-history-renderer"
 version = "0.1.0"
 dependencies = [
  "editchain-protocol",
+ "history-geometry",
  "idle-history",
  "js-sys",
  "serde",
@@ -815,6 +816,7 @@ dependencies = [
  "editchain-import",
  "editchain-index",
  "editchain-store",
+ "history-geometry",
  "serde",
  "serde_json",
  "tempfile",
@@ -827,7 +829,7 @@ version = "0.1.0"
 dependencies = [
  "editchain-core",
  "editchain-index",
- "editchain-project",
+ "history-geometry",
  "idle-history",
  "serde",
  "serde_json",
@@ -2001,6 +2003,15 @@ name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+
+[[package]]
+name = "history-geometry"
+version = "0.1.0"
+dependencies = [
+ "editchain-core",
+ "editchain-index",
+ "serde",
+]
 
 [[package]]
 name = "htmlescape"
