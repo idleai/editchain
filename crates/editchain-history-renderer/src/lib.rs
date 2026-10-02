@@ -9,12 +9,6 @@ mod app;
 #[cfg(target_arch = "wasm32")]
 mod shell;
 
-#[cfg(target_arch = "wasm32")]
-mod client_state;
-
-#[cfg(target_arch = "wasm32")]
-pub use client_state::{SharedConnection, SharedJoin};
-
 /// Re-export the wasm shell entry points so the `#[wasm_bindgen]` exports stay
 /// reachable (and importable by the generated JS bindings).
 #[cfg(target_arch = "wasm32")]

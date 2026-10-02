@@ -28,6 +28,13 @@ extension mount and removes the remaining viewer and geometry adapters. f60 owns
 the browser's live host connection. These consumers must switch before removing
 their old endpoints.
 
+The f43 Idle composition now runs through app-core and web-ui without loading
+this renderer. Its native history queries use the engine facade directly. The
+legacy Node peer adapter now builds from `editchain-client-state`, so it carries
+no viewer code. The old extension's live importer and standalone peer flows still
+run until their f10/f18 switches; the [assembly handoff](../../extensions/vscode-editchain/ASSEMBLY-MIGRATION.md)
+records the remaining source retirement conditions.
+
 Check out `idleai/web-ui` beside `editchain` and `app-core`. Land the web-ui package
 before the paired source imports. Both EditChain workflows now include this sibling
 checkout. The viewer build remaps the sibling root so generated WASM assets do not

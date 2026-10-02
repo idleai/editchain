@@ -138,7 +138,11 @@ the old chain can be removed once the new one is verified.
 shared immutable schema. `crates/editchain` owns the standalone engine CLI.
 `editchain-node` retains the existing native service and legacy viewer commands;
 it is separate from the CLI's dependency graph. The extension hosts the Rust/WASM
-view from `editchain-history-renderer`.
+view from `editchain-history-renderer`. New Idle sidebar/detail views live in
+`idleai/vscode-extension` over app-core and web-ui. The temporary
+`editchain-client-state` crate builds the legacy peer consumer's small Node/WASM
+adapter independently of this renderer. See the
+[assembly handoff](extensions/vscode-editchain/ASSEMBLY-MIGRATION.md) for removal conditions.
 
 Run `./scripts/lint.sh` for Rust checks; it requires `cargo-deny`.
 

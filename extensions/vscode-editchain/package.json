@@ -166,6 +166,7 @@
     "ui:vscode:renderer": "xvfb-run -a npx wdio run ./test/vscode/wdio.renderer.conf.ts",
     "ui:vscode:visual": "xvfb-run -a npx wdio run ./test/vscode/wdio.visual.conf.ts",
     "build:renderer": "bash scripts/build-history-renderer.sh",
+    "build:client-state": "bash scripts/build-client-state.sh",
     "build:gpu": "npm run build:renderer",
     "test:harness": "node --test test/harness/*.test.js",
     "test:rust-smoke": "node --test --test-reporter=tap test/harness/rustSmoke.test.js",

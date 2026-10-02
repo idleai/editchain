@@ -1,192 +1,4 @@
 /**
- * Shared reconnect policy, usable by the Node extension and browser hosts.
- */
-export class SharedConnection {
-    __destroy_into_raw() {
-        const ptr = this.__wbg_ptr;
-        this.__wbg_ptr = 0;
-        SharedConnectionFinalization.unregister(this);
-        return ptr;
-    }
-    free() {
-        const ptr = this.__destroy_into_raw();
-        wasm.__wbg_sharedconnection_free(ptr, 0);
-    }
-    /**
-     * A transport is open but its peer has not been authenticated.
-     * @param {number} generation
-     */
-    authenticating(generation) {
-        wasm.sharedconnection_authenticating(this.__wbg_ptr, generation);
-    }
-    /**
-     * Start an attempt and return its callback token.
-     *
-     * # Errors
-     * Fails when callback identities cannot be allocated without reuse.
-     * @returns {number}
-     */
-    begin() {
-        const ret = wasm.sharedconnection_begin(this.__wbg_ptr);
-        if (ret[2]) {
-            throw takeFromExternrefTable0(ret[1]);
-        }
-        return ret[0] >>> 0;
-    }
-    /**
-     * A new invitation is required before retrying.
-     * @param {number} generation
-     */
-    expired(generation) {
-        wasm.sharedconnection_expired(this.__wbg_ptr, generation);
-    }
-    /**
-     * Current callback token.
-     * @returns {number}
-     */
-    get generation() {
-        const ret = wasm.sharedconnection_generation(this.__wbg_ptr);
-        return ret >>> 0;
-    }
-    /**
-     * Create a stopped connection.
-     */
-    constructor() {
-        const ret = wasm.sharedconnection_new();
-        this.__wbg_ptr = ret;
-        SharedConnectionFinalization.register(this, this.__wbg_ptr, this);
-        return this;
-    }
-    /**
-     * Project validated native inventory progress into shared status.
-     *
-     * # Errors
-     * Rejects malformed progress without changing the current connection state.
-     * @param {number} generation
-     * @param {string} json
-     */
-    progress(generation, json) {
-        const ptr0 = passStringToWasm0(json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.sharedconnection_progress(this.__wbg_ptr, generation, ptr0, len0);
-        if (ret[1]) {
-            throw takeFromExternrefTable0(ret[0]);
-        }
-    }
-    /**
-     * Hosting is ready, or a peer inventory has been reconciled.
-     * @param {number} generation
-     */
-    ready(generation) {
-        wasm.sharedconnection_ready(this.__wbg_ptr, generation);
-    }
-    /**
-     * Bounded retry delay; the host supplies its timer and optional jitter.
-     * @returns {number}
-     */
-    get retry_delay_ms() {
-        const ret = wasm.sharedconnection_retry_delay_ms(this.__wbg_ptr);
-        return ret >>> 0;
-    }
-    /**
-     * Shared presentable status.
-     * @returns {string}
-     */
-    get status() {
-        let deferred1_0;
-        let deferred1_1;
-        try {
-            const ret = wasm.sharedconnection_status(this.__wbg_ptr);
-            deferred1_0 = ret[0];
-            deferred1_1 = ret[1];
-            return getStringFromWasm0(ret[0], ret[1]);
-        } finally {
-            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
-        }
-    }
-    /**
-     * Retire callbacks from a stopped transport.
-     */
-    stop() {
-        wasm.sharedconnection_stop(this.__wbg_ptr);
-    }
-    /**
-     * Record a retryable failure for its owning attempt.
-     * @param {number} generation
-     */
-    waiting(generation) {
-        wasm.sharedconnection_waiting(this.__wbg_ptr, generation);
-    }
-}
-if (Symbol.dispose) SharedConnection.prototype[Symbol.dispose] = SharedConnection.prototype.free;
-
-/**
- * Join lifetime shared with app-core; the host retains credentials and transports.
- */
-export class SharedJoin {
-    __destroy_into_raw() {
-        const ptr = this.__wbg_ptr;
-        this.__wbg_ptr = 0;
-        SharedJoinFinalization.unregister(this);
-        return ptr;
-    }
-    free() {
-        const ptr = this.__destroy_into_raw();
-        wasm.__wbg_sharedjoin_free(ptr, 0);
-    }
-    /**
-     * Accept a completed join only in its original context.
-     * @param {number} generation
-     * @returns {boolean}
-     */
-    enable(generation) {
-        const ret = wasm.sharedjoin_enable(this.__wbg_ptr, generation);
-        return ret !== 0;
-    }
-    /**
-     * Whether sharing has been enabled by a current approval.
-     * @returns {boolean}
-     */
-    get enabled() {
-        const ret = wasm.sharedjoin_enabled(this.__wbg_ptr);
-        return ret !== 0;
-    }
-    /**
-     * Current token for asynchronous host work.
-     * @returns {number}
-     */
-    get generation() {
-        const ret = wasm.sharedjoin_generation(this.__wbg_ptr);
-        return ret >>> 0;
-    }
-    /**
-     * Check that pending host work still owns the join lifetime.
-     * @param {number} generation
-     * @returns {boolean}
-     */
-    is_current(generation) {
-        const ret = wasm.sharedjoin_is_current(this.__wbg_ptr, generation);
-        return ret !== 0;
-    }
-    /**
-     * Create a stopped sharing session.
-     */
-    constructor() {
-        const ret = wasm.sharedjoin_new();
-        this.__wbg_ptr = ret;
-        SharedJoinFinalization.register(this, this.__wbg_ptr, this);
-        return this;
-    }
-    /**
-     * Stop/suspend and retire all previous host callbacks.
-     */
-    retire() {
-        wasm.sharedjoin_retire(this.__wbg_ptr);
-    }
-}
-if (Symbol.dispose) SharedJoin.prototype[Symbol.dispose] = SharedJoin.prototype.free;
-
-/**
  * The active graph renderer: the per-row SVG cells (`svg`).
  * @returns {string}
  */
@@ -922,38 +734,38 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 224, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 216, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_f921d47441fcafba___convert__closures_____invoke___wasm_bindgen_f921d47441fcafba___JsValue__core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_f921d47441fcafba___JsError___true_);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [F64], shim_idx: 173, ret: Externref, inner_ret: Some(Externref) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [F64], shim_idx: 123, ret: Externref, inner_ret: Some(Externref) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_f921d47441fcafba___convert__closures_____invoke___f64__wasm_bindgen_f921d47441fcafba___JsValue__true_);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 168, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("Event")], shim_idx: 120, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_f921d47441fcafba___convert__closures_____invoke___web_sys_88611ab1fd80de6f___features__gen_KeyboardEvent__KeyboardEvent______true_);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("KeyboardEvent")], shim_idx: 168, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("KeyboardEvent")], shim_idx: 120, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_f921d47441fcafba___convert__closures_____invoke___web_sys_88611ab1fd80de6f___features__gen_KeyboardEvent__KeyboardEvent______true__3);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Vector(NamedExternref("ResizeObserverEntry")), NamedExternref("ResizeObserver")], shim_idx: 166, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Vector(NamedExternref("ResizeObserverEntry")), NamedExternref("ResizeObserver")], shim_idx: 118, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen_f921d47441fcafba___convert__closures_____invoke___alloc_46d95d5090e9754d___vec__Vec_web_sys_88611ab1fd80de6f___features__gen_ResizeObserverEntry__ResizeObserverEntry___web_sys_88611ab1fd80de6f___features__gen_ResizeObserver__ResizeObserver______true_);
             return ret;
         },
         __wbindgen_cast_0000000000000006: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 171, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen_f921d47441fcafba___convert__closures_____invoke_______true_);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 125, ret: F64, inner_ret: Some(F64) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen_f921d47441fcafba___convert__closures_____invoke___f64__true_);
             return ret;
         },
         __wbindgen_cast_0000000000000007: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 175, ret: F64, inner_ret: Some(F64) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen_f921d47441fcafba___convert__closures_____invoke___f64__true_);
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 127, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen_f921d47441fcafba___convert__closures_____invoke_______true_);
             return ret;
         },
         __wbindgen_cast_0000000000000008: function(arg0) {
@@ -1020,13 +832,6 @@ function wasm_bindgen_f921d47441fcafba___convert__closures_____invoke___f64__was
     const ret = wasm.wasm_bindgen_f921d47441fcafba___convert__closures_____invoke___f64__wasm_bindgen_f921d47441fcafba___JsValue__true_(arg0, arg1, arg2);
     return ret;
 }
-
-const SharedConnectionFinalization = (typeof FinalizationRegistry === 'undefined')
-    ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg_sharedconnection_free(ptr, 1));
-const SharedJoinFinalization = (typeof FinalizationRegistry === 'undefined')
-    ? { register: () => {}, unregister: () => {} }
-    : new FinalizationRegistry(ptr => wasm.__wbg_sharedjoin_free(ptr, 1));
 
 function addToExternrefTable0(obj) {
     const idx = wasm.__externref_table_alloc();

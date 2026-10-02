@@ -32,7 +32,11 @@ npm run compile
 ```
 
 `build:renderer` builds `crates/editchain-history-renderer` for wasm32 and writes
-the single generated bundle under `media/rust-history/pkg/`.
+the generated bundle under `media/rust-history/pkg/`. It also runs
+`build:client-state`, which builds the independent `editchain-client-state`
+Node/WASM adapter under `media/client-state/pkg/`. The peer adapter no longer
+bundles the renderer, DOM bindings or graph assets. Both committed asset trees
+remain subject to reproducibility checks. See [the assembly handoff](ASSEMBLY-MIGRATION.md).
 
 Follow the [packaging instructions](#packaging) to install the extension, open
 the project you want to explore, and invoke **EditChain: Open History Explorer**.
