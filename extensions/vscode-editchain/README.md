@@ -17,6 +17,7 @@ Prerequisites:
 
 - the repository Rust toolchain and `wasm32-unknown-unknown` target;
 - `wasm-bindgen-cli` 0.2.127;
+- Python 3.11 or newer;
 - Node.js 20 or newer.
 
 From the repository root:
@@ -37,6 +38,12 @@ the generated bundle under `media/rust-history/pkg/`. It also runs
 Node/WASM adapter under `media/client-state/pkg/`. The peer adapter no longer
 bundles the renderer, DOM bindings or graph assets. Both committed asset trees
 remain subject to reproducibility checks. See [the assembly handoff](ASSEMBLY-MIGRATION.md).
+
+The asset scripts snapshot local crates into a generated Cargo workspace under
+`target/wasm-workspace`. This keeps compiler identities independent of sibling
+checkout paths, which Cargo otherwise includes for external path dependencies.
+The snapshot retains package lint settings and verifies that every locked package
+version and checksum is unchanged before building.
 
 Follow the [packaging instructions](#packaging) to install the extension, open
 the project you want to explore, and invoke **EditChain: Open History Explorer**.

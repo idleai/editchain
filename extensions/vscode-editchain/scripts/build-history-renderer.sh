@@ -4,7 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 EXTENSION_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPOSITORY_DIR="$(cd "$EXTENSION_DIR/../.." && pwd)"
-WASM_FILE="$REPOSITORY_DIR/target/wasm32-unknown-unknown/release/editchain_history_renderer.wasm"
+WASM_WORKSPACE="$(python3 "$SCRIPT_DIR/stage-rust-workspace.py" "$REPOSITORY_DIR")"
+WASM_FILE="$WASM_WORKSPACE/target/wasm32-unknown-unknown/release/editchain_history_renderer.wasm"
 
 # The web bindings feed media/rust-history/pkg. The Rust-owned history webview loads
 # media/rust-history/loader.js (and NOTHING else): the loader imports this
@@ -26,10 +27,11 @@ CARGO_HOME_BASE="${CARGO_HOME:-$HOME/.cargo}"
 RUSTUP_HOME_BASE="${RUSTUP_HOME:-$HOME/.rustup}"
 GRAPH_SIBLING_ROOT="$(cd "$REPOSITORY_DIR/.." && pwd)"
 ORIGINAL_RUSTFLAGS="${RUSTFLAGS:-}"
-export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${CARGO_HOME_BASE}=/cargo --remap-path-prefix=${RUSTUP_HOME_BASE}=/rustup --remap-path-prefix=${GRAPH_SIBLING_ROOT}=/workspace"
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${CARGO_HOME_BASE}=/cargo --remap-path-prefix=${RUSTUP_HOME_BASE}=/rustup --remap-path-prefix=${GRAPH_SIBLING_ROOT}=/workspace --remap-path-prefix=${WASM_WORKSPACE}=/workspace"
 
 cargo build \
-  --manifest-path "$REPOSITORY_DIR/Cargo.toml" \
+  --manifest-path "$WASM_WORKSPACE/Cargo.toml" \
+  --target-dir "$WASM_WORKSPACE/target" \
   --package editchain-history-renderer \
   --target wasm32-unknown-unknown \
   --release \
