@@ -107,11 +107,11 @@ jobs:
             echo "$pkg regeneration matches the committed artifacts"
           done
 
-      - name: wasm32 cargo check (editchain-history-renderer)
-        run: cargo check -p editchain-history-renderer --target wasm32-unknown-unknown --locked
+      - name: wasm32 cargo check (history and peer adapters)
+        run: cargo check -p editchain-history-renderer -p editchain-client-state --target wasm32-unknown-unknown --locked
 
-      - name: wasm32 clippy (editchain-history-renderer, -D warnings)
-        run: cargo clippy -p editchain-history-renderer --target wasm32-unknown-unknown --locked -- -D warnings
+      - name: wasm32 clippy (history and peer adapters, -D warnings)
+        run: cargo clippy -p editchain-history-renderer -p editchain-client-state --target wasm32-unknown-unknown --locked -- -D warnings
 
       - name: Compile extension
         working-directory: editchain/extensions/vscode-editchain

@@ -695,6 +695,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "editchain-client-state"
+version = "0.1.0"
+dependencies = [
+ "idle-history",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "editchain-core"
 version = "0.1.0"
 dependencies = [

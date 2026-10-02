@@ -15,7 +15,7 @@ The existing viewer remains runnable while its graph/detail consumers migrate:
 | `editchain-node::history::details` | Calls `idle-history` legacy preview functions through protocol compatibility exports. Exact new evidence uses engine queries. Retire with f31/f40. |
 | `app/find.rs`, `cache.rs`, `expansion.rs`, `state.rs` | Legacy coordinate/viewport adapters needed by this renderer. New semantic behavior is in Crux. Replace consumers with f30/f31, then remove these adapters. |
 | `app/requests.rs`, `remote.rs`, `delta.rs`, `expansion/live.rs` | Thin adapters over app-core's `idle-history` request tracker and revision validator. Row coordinates, conditional-window validation and DOM plans stay here until f30/f31. |
-| `client_state.rs` | Temporary WASM bridge to app-core's join/connection state for the Node multiplayer host. Retire with the old host in f18/f43. |
+| `../editchain-client-state/src/lib.rs` | f43 moved the temporary Node/WASM bridge out of this renderer. The existing peer host loads its independent bundle over app-core's join/connection state. Retire when f18 switches that consumer. |
 | Node live disclosure/search/window endpoints | Existing coordinate-based viewer protocol remains available until f30/f31 switch its consumers. |
 
 Graph layout, pixel virtualization, scrolling, focus and DOM/SVG rendering are not

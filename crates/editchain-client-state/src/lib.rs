@@ -1,4 +1,5 @@
-//! Thin WASM bindings for app-core's shared extension connection state.
+//! Temporary Node/WASM adapter for the legacy peer consumer until f18.
+//! Shared join, retry and status policy remains in app-core's idle-history crate.
 
 use idle_history::connection::{
     peer_status, Connection, ConnectionStatus, JoinState, PeerProgress,

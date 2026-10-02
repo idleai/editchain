@@ -10,8 +10,8 @@ WASM_FILE="$REPOSITORY_DIR/target/wasm32-unknown-unknown/release/editchain_histo
 # media/rust-history/loader.js (and NOTHING else): the loader imports this
 # generated wasm-bindgen module and calls the Rust shell's startHistoryView(),
 # which owns the DOM, accessibility, and the renderer. This tree is what the
-# shipped panel and the rustSmoke harness/e2e exercise. The Node bindings expose
-# app-core's portable connection state to the legacy multiplayer host adapter.
+# shipped panel and the rustSmoke harness/e2e exercise. The independent Node
+# adapter exposes app-core's portable connection state to the legacy peer host.
 if ! command -v wasm-bindgen >/dev/null 2>&1; then
   echo "wasm-bindgen-cli 0.2.127 is required (cargo install wasm-bindgen-cli --version 0.2.127 --locked)" >&2
   exit 1
@@ -25,6 +25,7 @@ fi
 CARGO_HOME_BASE="${CARGO_HOME:-$HOME/.cargo}"
 RUSTUP_HOME_BASE="${RUSTUP_HOME:-$HOME/.rustup}"
 GRAPH_SIBLING_ROOT="$(cd "$REPOSITORY_DIR/.." && pwd)"
+ORIGINAL_RUSTFLAGS="${RUSTFLAGS:-}"
 export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=${CARGO_HOME_BASE}=/cargo --remap-path-prefix=${RUSTUP_HOME_BASE}=/rustup --remap-path-prefix=${GRAPH_SIBLING_ROOT}=/workspace"
 
 cargo build \
@@ -44,11 +45,6 @@ wasm-bindgen "$WASM_FILE" \
   --out-name editchain_history_renderer \
   --no-typescript
 
-mkdir -p "$EXTENSION_DIR/media/client-state/pkg"
-wasm-bindgen "$WASM_FILE" \
-  --target nodejs \
-  --out-dir "$EXTENSION_DIR/media/client-state/pkg" \
-  --out-name editchain_client_state \
-  --no-typescript
+RUSTFLAGS="$ORIGINAL_RUSTFLAGS" bash "$SCRIPT_DIR/build-client-state.sh"
 
 echo "History and client-state assets written to media/rust-history/pkg and media/client-state/pkg"
