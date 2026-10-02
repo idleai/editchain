@@ -194,7 +194,10 @@ impl<C: TailCorpus> Tail<C> {
                 Err(error) => return Err(error),
             };
             let metadata = file.metadata()?;
-            self.validate_frontier(&metadata)?;
+            match self.validate_frontier(&metadata) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(delta),
+                result => result?,
+            }
             let _: u64 = file.seek(SeekFrom::Start(self.offset))?;
             let mut bytes = Vec::new();
             let limit = u64::from(crate::format::MAX_FRAME_BYTES);
@@ -259,14 +262,26 @@ impl<C: TailCorpus> Tail<C> {
     fn validate_frontier(&self, metadata: &Metadata) -> io::Result<()> {
         if let Some(previous) = &self.observed {
             let current = FileStamp::read(metadata)?;
-            if current.identity != previous.identity
-                || current.length < previous.length
-                || (current.length == previous.length && current.modified != previous.modified)
+            if current.identity == previous.identity
+                && current.length == previous.length
+                && current.modified != previous.modified
             {
-                return Err(invalid(
-                    "chain frontier changed non-monotonically; reload required",
-                ));
+                // An append can update mtime before its new length is visible.
+                // Keep the last accepted stamp until the writer has finished;
+                // a stable same-size edit must still require an explicit reload.
+                let lock = match File::open(self.root.join(".writer.lock")) {
+                    Ok(lock) => lock,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        return previous.validate_successor(&current);
+                    }
+                    Err(error) => return Err(error),
+                };
+                lock.try_lock_shared().map_err(io::Error::from)?;
+                let settled =
+                    std::fs::metadata(self.root.join(format!("{:06}.eclog", self.segment)))?;
+                return previous.validate_successor(&FileStamp::read(&settled)?);
             }
+            previous.validate_successor(&current)?;
         }
         Ok(())
     }
@@ -334,6 +349,18 @@ struct FileStamp {
     modified: std::time::SystemTime,
 }
 impl FileStamp {
+    fn validate_successor(&self, current: &Self) -> io::Result<()> {
+        if current.identity != self.identity
+            || current.length < self.length
+            || (current.length == self.length && current.modified != self.modified)
+        {
+            return Err(invalid(
+                "chain frontier changed non-monotonically; reload required",
+            ));
+        }
+        Ok(())
+    }
+
     fn read(metadata: &Metadata) -> io::Result<Self> {
         #[cfg(unix)]
         let identity = {

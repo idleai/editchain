@@ -63,6 +63,53 @@ fn page(ops: &[Op]) -> io::Result<Page> {
 }
 
 #[test]
+fn an_in_progress_append_timestamp_waits_for_length_publication() -> io::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut store = SegmentStore::open(dir.path())?;
+    store.append_page(&page(&[message(1, "first")])?)?;
+    let mut tail = CanonicalTail::open(dir.path())?;
+    let mut indexed = IndexedTail::open(dir.path())?;
+    let file = std::fs::File::open(
+        dir.path()
+            .join(format!("{:06}.eclog", store.segment_sequence())),
+    )?;
+    let modified = file.metadata()?.modified()? + std::time::Duration::from_secs(1);
+    // Model the interval inside an append syscall after mtime changes but
+    // before the new file length becomes visible to a concurrent reader.
+    file.set_modified(modified)?;
+    equal(
+        tail.poll()?.work.bytes_read,
+        0,
+        "pending append is deferred",
+    )?;
+    equal(
+        indexed.poll()?.work.bytes_read,
+        0,
+        "indexed append is deferred",
+    )?;
+    equal(
+        tail.resume(dir.path()).err().map(|error| error.kind()),
+        Some(io::ErrorKind::WouldBlock),
+        "a checkpoint cannot resume against an unsettled writer",
+    )?;
+    store.append_page(&page(&[message(2, "next")])?)?;
+    equal(tail.poll()?.added.len(), 1, "published append is read once")?;
+    equal(
+        indexed.poll()?.added.len(),
+        1,
+        "indexed append is read once",
+    )?;
+    drop(store);
+    file.set_modified(file.metadata()?.modified()? + std::time::Duration::from_secs(1))?;
+    check(tail.poll().is_err(), "a settled same-size edit is rejected")?;
+    check(
+        indexed.poll().is_err(),
+        "indexed same-size edit is rejected",
+    )?;
+    Ok(())
+}
+
+#[test]
 fn one_append_reads_only_one_record_at_different_history_sizes() -> io::Result<()> {
     let mut work = Vec::new();
     for size in [1, 10_000] {
