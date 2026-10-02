@@ -14,10 +14,6 @@ use serde_json as _;
 #[cfg(test)]
 use tempfile as _;
 // The editor recorder is a dev-only dependency of this crate's tests.
-#[cfg(test)]
-use editchain_node as _;
-#[cfg(test)]
-use editchain_protocol as _;
 
 fn main() -> std::io::Result<()> {
     editchain_sync::run_worker(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())

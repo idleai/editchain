@@ -109,7 +109,8 @@ Inline/blob placement changes encoded operation bytes, so mixing representations
 under the same operation IDs produces conflicts. Existing segments are not
 rewritten automatically.
 
-The existing CLI and `tools/codex-session-exporter` remain usable. f10 owns moving
+The CLI invokes the exporter in the Codex repository at
+`tools/codex-session-exporter`. f10 owns completing
 the exporter, switching callers and verifying native/import reconciliation.
 
 [Recorded fixtures](../crates/editchain-import/tests/fixtures/README.md) pin raw
@@ -119,6 +120,7 @@ bytes and identities. Run the retry, overlap and conflict checks with:
 cargo test -p editchain-import --test import_api --locked
 ```
 
-Import-to-view regression tests live in `editchain-project` and run with
-`cargo test -p editchain-project --test imports --locked`. The importer has no
+Import-to-view regression tests live in web-ui's `history-geometry` package and
+run from that repository with
+`cargo test -p history-geometry --test legacy_imports --locked`. The importer has no
 viewer dependency, including in its test graph.

@@ -4,13 +4,13 @@ These small deterministic inputs are committed so CI does not require private
 session directories or a sibling Codex checkout. They are test recordings, not
 transcripts of a real person's work.
 
-- `claude/session.jsonl` is copied unchanged from the repository's existing
+- `claude/session.jsonl` is copied unchanged from the vscode-extension repository's
   `extensions/vscode-editchain/test/fixtures/claude/r10-renderer-session.jsonl`.
   It records native event and tool IDs, parent relations and a file write/result.
 - `human/session.jsonl` freezes the version-one archive format exercised by the
   node's human import tests: an attributed recorder, initial buffer, unsaved edit,
   input receipt and stop. Display attribution and complete envelope bytes remain
-  in raw evidence.
+  in raw records.
 - `codex/rollout-contract.jsonl` is a deterministic protocol fixture based on the
   exporter's existing session, response-item and tool lifecycle test records.
   It distinguishes the owning thread from its parent, carries a tool's two
@@ -26,7 +26,7 @@ transcripts of a real person's work.
 From the repository root, verify the exporter recording with:
 
 ```sh
-cargo run --manifest-path tools/codex-session-exporter/Cargo.toml --locked -- \
+cargo run --manifest-path ../codex/tools/codex-session-exporter/Cargo.toml --locked -- \
   crates/editchain-import/tests/fixtures/codex/rollout-contract.jsonl > /tmp/editchain-f5-projection.ndjson
 cmp crates/editchain-import/tests/fixtures/codex/projection.ndjson /tmp/editchain-f5-projection.ndjson
 ```

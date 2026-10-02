@@ -1,7 +1,7 @@
 //! Codex (OpenAI) session import — capture, bridge, and materialize occurrences.
 //!
 //! The importer never parses Codex conversation semantics itself. A
-//! configurable helper process (`tools/codex-session-exporter` today, or a
+//! configurable helper process (`codex-session-exporter` from the Codex repository, or a
 //! future `codex rollout-export --format editchain-v1` command) reads each raw
 //! rollout JSONL file and writes a versioned `editchain-v1` NDJSON projection
 //! to stdout. This crate validates and consumes only that projection; the raw

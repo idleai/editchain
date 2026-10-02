@@ -19,12 +19,6 @@ use postcard as _;
 use rcgen as _;
 use rustls as _;
 use serde as _;
-// Dev-only dependencies of the crate's tests; unused in this target.
-use editchain_node as _;
-use editchain_protocol as _;
-
-#[path = "processes/shared_session.rs"]
-mod shared_session;
 
 fn require(condition: bool, message: &'static str) -> io::Result<()> {
     if condition {

@@ -18,8 +18,23 @@ impl Drop for Running {
     }
 }
 
-fn event(receiver: &mpsc::Receiver<Value>) -> Value {
-    receiver.recv_timeout(Duration::from_secs(10)).unwrap()
+fn event(receiver: &mpsc::Receiver<Value>, child: &mut Running, phase: &str) -> Value {
+    receiver
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|error| {
+            let _killed = child.0.kill();
+            let status = child.0.wait().unwrap();
+            let mut diagnostic = String::new();
+            let _read = child
+                .0
+                .stderr
+                .take()
+                .unwrap()
+                .read_to_string(&mut diagnostic)
+                .unwrap();
+            format!("waiting for {phase}: {error}; child {status}: {diagnostic}")
+        })
+        .unwrap()
 }
 
 #[test]
@@ -60,16 +75,19 @@ fn subscription_observes_lower_ids_conflict_retractions_and_late_content() {
             }
         }
     });
-    assert_eq!(event(&receiver).get("type"), Some(&json!("ready")));
+    assert_eq!(
+        event(&receiver, &mut child, "ready").get("type"),
+        Some(&json!("ready"))
+    );
     let _busy = run(temp.path(), &["history"], b"", 5);
     append(
         temp.path(),
         &message(1, Payload::Inline(b"older id".to_vec())),
     );
-    let added = event(&receiver);
+    let added = event(&receiver, &mut child, "added record");
     assert_eq!(added.get("added").unwrap().as_array().unwrap().len(), 1);
     let _blob = engine.store_blob(bytes).unwrap();
-    let content = event(&receiver);
+    let content = event(&receiver, &mut child, "late content");
     assert_eq!(
         content
             .get("content_changed")
@@ -85,7 +103,7 @@ fn subscription_observes_lower_ids_conflict_retractions_and_late_content() {
         &serde_json::to_vec(&message(1, Payload::Inline(b"conflict".to_vec()))).unwrap(),
         4,
     );
-    let removed = event(&receiver);
+    let removed = event(&receiver, &mut child, "conflict retraction");
     assert_eq!(removed.get("removed").unwrap().as_array().unwrap().len(), 1);
     assert!(
         child.0.wait().unwrap().success(),
