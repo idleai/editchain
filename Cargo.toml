@@ -8,7 +8,6 @@ members = [
     "crates/editchain-core",
     "crates/editchain-store",
     "crates/editchain-sync",
-    "crates/editchain-import",
     "crates/editchain-git",
 ]
 
@@ -17,10 +16,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.97"
-description = "CRDT-based edit chain for agent edit history"
+description = "Immutable operation storage, queries and replication"
 repository = "https://github.com/ambientlight/editchain"
 readme = "README.md"
-keywords = ["crdt", "edit-chain", "agent"]
+keywords = ["crdt", "edit-chain", "history"]
 categories = ["data-structures", "database-implementations"]
 
 [workspace.lints.rust]

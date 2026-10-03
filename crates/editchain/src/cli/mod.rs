@@ -3,9 +3,9 @@
 //! See `docs/cli.md` for inputs, output framing, evidence archives and exit codes.
 
 mod archive;
+mod cancellation;
 mod error;
 mod follow;
-mod imports;
 mod input;
 mod operations;
 pub(crate) mod output;
@@ -20,9 +20,9 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use editchain_engine::Engine;
-use editchain_import::ImportOptions;
 use serde_json::json;
 
+use cancellation::Cancellation;
 use error::{Failure, Result};
 use output::{Format, Output};
 
@@ -31,7 +31,7 @@ use output::{Format, Output};
     name = "editchain",
     args_override_self = true,
     version,
-    about = "Immutable human and agent history",
+    about = "Immutable EditChain operations and content",
     after_help = "Exit codes: 0 success, 1 failure, 2 invalid input, 3 missing/incomplete, 4 conflict/integrity, 5 busy, 130 interrupted. See docs/cli.md."
 )]
 struct Cli {
@@ -61,16 +61,11 @@ enum Command {
     },
     /// Append operation envelopes or replay an exact evidence archive.
     Append(operations::Append),
-    /// Import provider history through reusable capture APIs.
-    Import(imports::Args),
     /// Migrate old storage into a new EC03 chain; interrupted work is resumable.
     Migrate {
         /// New chain directory, outside the source chain.
         #[arg(long)]
         destination: PathBuf,
-        /// Convert operations to the ten-type schema, preserving the source chain.
-        #[arg(long)]
-        schema3: bool,
     },
     /// Export all exact record variants and their referenced blobs.
     Export,
@@ -126,22 +121,18 @@ pub(crate) fn run() -> ExitCode {
             | Command::Follow(_)
             | Command::Integrity
     );
-    let options = ImportOptions::default();
+    let cancellation = Cancellation::default();
     if matches!(
         &cli.command,
-        Command::Import(_)
-            | Command::Follow(_)
-            | Command::Scan(_)
-            | Command::Replicate(_)
-            | Command::Migrate { .. }
+        Command::Follow(_) | Command::Scan(_) | Command::Replicate(_) | Command::Migrate { .. }
     ) {
-        let cancellation = options.cancellation.clone();
+        let cancellation = cancellation.clone();
         if let Err(error) = ctrlc::set_handler(move || cancellation.cancel()) {
             return report(&Failure::new(1, error.to_string()));
         }
     }
     let mut output = Output::new(cli.output);
-    let result = execute(cli, &mut output, &options);
+    let result = execute(cli, &mut output, &cancellation);
     let finished = output.finish();
     match result.and(finished) {
         Ok(()) => ExitCode::SUCCESS,
@@ -161,7 +152,7 @@ fn report(error: &Failure) -> ExitCode {
     ExitCode::from(error.code)
 }
 
-fn execute(cli: Cli, output: &mut Output, options: &ImportOptions) -> Result<()> {
+fn execute(cli: Cli, output: &mut Output, cancellation: &Cancellation) -> Result<()> {
     let chain = &cli.chain;
     match cli.command {
         Command::Init { input } => {
@@ -174,22 +165,15 @@ fn execute(cli: Cli, output: &mut Output, options: &ImportOptions) -> Result<()>
             Ok(())
         }
         Command::Append(args) => operations::append(chain, &args, output),
-        Command::Import(args) => imports::run(chain, &args, options, output),
         Command::Export => archive::export(chain, output),
-        Command::Scan(args) => scan::run(chain, &args, &options.cancellation, output),
-        Command::Migrate {
-            destination,
-            schema3,
-        } => {
+        Command::Scan(args) => scan::run(chain, &args, cancellation, output),
+        Command::Migrate { destination } => {
             require_chain(chain)?;
-            let migrate = if schema3 {
-                editchain_import::activity::migrate
-            } else {
-                editchain_store::migration::migrate
-            };
-            output.emit(&migrate(chain, &destination, || {
-                options.cancellation.is_cancelled()
-            })?)
+            output.emit(&editchain_store::migration::migrate(
+                chain,
+                &destination,
+                || cancellation.is_cancelled(),
+            )?)
         }
         Command::Annotate(args) => {
             operations::append_kind(chain, &args.input, operations::Kind::Note, output)
@@ -204,13 +188,13 @@ fn execute(cli: Cli, output: &mut Output, options: &ImportOptions) -> Result<()>
             output.emit(&Engine::open(chain)?.store_blob(&bytes)?)
         }
         Command::Blob { id, raw } => operations::blob(chain, id, raw, output),
-        Command::Follow(args) => follow::run(chain, &args, &options.cancellation, output),
+        Command::Follow(args) => follow::run(chain, &args, cancellation, output),
         Command::Integrity => operations::integrity(chain, output),
         Command::Rebuild => {
             require_chain(chain)?;
             output.emit(&editchain_index::ChainIndex::rebuild_at(chain)?.stats())
         }
-        Command::Replicate(args) => replication::run(chain, &args, &options.cancellation, output),
+        Command::Replicate(args) => replication::run(chain, &args, cancellation, output),
     }
 }
 

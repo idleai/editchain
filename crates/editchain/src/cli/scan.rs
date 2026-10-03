@@ -2,8 +2,8 @@
 
 use std::{collections::HashMap, io, path::Path};
 
+use super::cancellation::Cancellation;
 use editchain_engine::{OpId, OpKind, Payload};
-use editchain_import::cancellation::ImportCancellation;
 use editchain_store::format;
 use serde_json::json;
 
@@ -33,7 +33,7 @@ struct Scan {
 pub(super) fn run(
     chain: &Path,
     args: &Args,
-    cancellation: &ImportCancellation,
+    cancellation: &Cancellation,
     output: &mut Output,
 ) -> Result<()> {
     require_chain(chain)?;

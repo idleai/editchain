@@ -47,32 +47,9 @@ fn drain(a: &mut Session, b: &mut Session, queue: &mut Queue) -> io::Result<()> 
     Err(io::Error::other("peer round did not terminate"))
 }
 
-fn work(seq: u64, hash: [u8; 32], external: bool) -> io::Result<(EncodedRecord, Vec<u8>)> {
-    use editchain_core::human::{HumanRevision, HumanWorkKind, HumanWorkRecord};
-    let work = HumanWorkRecord {
-        source: "vscode.work".into(),
-        schema: 1,
-        session: "portable-session".into(),
-        identity: None,
-        user_name: None,
-        turn: 1,
-        edit_group: None,
-        source_event: OpId::new(NodeId(7), 1, 1),
-        kind: HumanWorkKind::Read,
-        path: Some("src/shared.rs".into()),
-        before: None,
-        after: Some(HumanRevision {
-            document: "buffer".into(),
-            version: 1,
-            content: ContentId::Hash256(hash),
-            occurrence: None,
-        }),
-        git: None,
-        context_observed_ms: None,
-        summary: "Read shared source".into(),
-    };
-    let content = serde_json::to_vec(&work).map_err(io::Error::other)?;
-    let raw_ref = if external {
+fn file_record(seq: u64, hash: [u8; 32], external: bool) -> io::Result<(EncodedRecord, Vec<u8>)> {
+    let content = b"retained file edit".to_vec();
+    let patch = if external {
         Payload::Blob(BlobRef {
             id: ContentId::Hash256(*blake3::hash(&content).as_bytes()),
             len: u32::try_from(content.len()).map_err(io::Error::other)?,
@@ -81,22 +58,26 @@ fn work(seq: u64, hash: [u8; 32], external: bool) -> io::Result<(EncodedRecord, 
         Payload::Inline(content.clone())
     };
     let mut op = operation(seq, Payload::Empty);
-    op.kind = OpKind::Import(editchain_core::ImportOp {
-        raw_ref,
-        raw_hash: None,
+    op.kind = OpKind::File(editchain_core::FileOp {
+        path: editchain_core::PathId(1),
+        stage: editchain_core::FileStage::Applied,
+        base: None,
+        after: Some(ContentId::Hash256(hash)),
+        edit: editchain_core::FileEdit::UnifiedDiff(patch),
     });
     let bytes = encode_op(&op).map_err(io::Error::other)?;
     Ok(((RecordKey::from_encoded(&bytes)?, bytes), content))
 }
 
 #[test]
-fn complete_peers_converge_pages_conflicts_large_records_and_nested_content() -> io::Result<()> {
+fn complete_peers_converge_pages_conflicts_large_records_and_referenced_content() -> io::Result<()>
+{
     let dir = tempfile::tempdir()?;
     let ar = dir.path().join("a");
     let br = dir.path().join("b");
     let content = vec![71; 190_000];
     let hash = *blake3::hash(&content).as_bytes();
-    let (work, metadata) = work(300, hash, true)?;
+    let (work, metadata) = file_record(300, hash, true)?;
     let mut records = (1..=270)
         .map(|seq| record(seq, b"alice"))
         .collect::<io::Result<Vec<_>>>()?;
@@ -115,7 +96,7 @@ fn complete_peers_converge_pages_conflicts_large_records_and_nested_content() ->
     check_eq!(
         b.progress().blobs,
         2,
-        "structured metadata and nested revision hydrated"
+        "declared file edit and revision hydrated"
     );
     check_eq!(b.progress().unavailable, 0, "complete content available");
     check_eq!(
@@ -167,7 +148,7 @@ fn complete_peers_converge_pages_conflicts_large_records_and_nested_content() ->
     check_eq!(
         c.progress().blobs,
         2,
-        "third-party nested content forwarding"
+        "third-party referenced content forwarding"
     );
     Ok(())
 }
@@ -372,49 +353,53 @@ fn independent_receipt_of_a_private_baseline_does_not_authorize_its_blob() -> io
 }
 
 #[test]
-fn structured_content_requires_the_known_schema_and_verified_parent() -> io::Result<()> {
+fn opaque_json_never_grants_content_access() -> io::Result<()> {
     let dir = tempfile::tempdir()?;
-    let bytes = b"private nested revision";
+    let bytes = b"private revision";
     let hash = *blake3::hash(bytes).as_bytes();
-    let (entry, metadata) = work(1, hash, true)?;
+    let metadata = serde_json::to_vec(&serde_json::json!({
+        "source": "consumer.record", "schema": 1,
+        "after": { "content": ContentId::Hash256(hash) },
+    }))
+    .map_err(io::Error::other)?;
+    let raw_hash = *blake3::hash(&metadata).as_bytes();
     let replica = Replica::open(dir.path(), "space-1", true)?;
     let mut store = BlobStore::new(dir.path().join("blobs"))?;
     store.write(&metadata)?;
     store.write(bytes)?;
-    let _acks = replica.ingest_records(std::slice::from_ref(&entry))?;
-    check!(
-        !replica
-            .blob_hashes(&replica.snapshot()?, entry.0)?
-            .contains(&hash),
-        "unsupplied private parent cannot grant child authority"
-    );
-    replica.ingest_blob(entry.0, *blake3::hash(&metadata).as_bytes(), &metadata)?;
-    check!(
-        replica
-            .blob_hashes(&replica.snapshot()?, entry.0)?
-            .contains(&hash),
-        "verified known schema grants a reference"
-    );
-    check!(
-        replica
-            .read_blob(&replica.snapshot()?, entry.0, hash)?
-            .is_none(),
-        "reference alone never exposes private child bytes"
-    );
-    let mut future: serde_json::Value =
-        serde_json::from_slice(&metadata).map_err(io::Error::other)?;
-    *future
-        .get_mut("schema")
-        .ok_or_else(|| io::Error::other("missing schema"))? = 2.into();
-    let mut op = operation(2, Payload::Empty);
-    op.kind = OpKind::Import(editchain_core::ImportOp {
-        raw_ref: Payload::Inline(serde_json::to_vec(&future).map_err(io::Error::other)?),
-        raw_hash: None,
-    });
-    check!(
-        crate::content::hashes(&op).is_empty(),
-        "future schema never grants unknown references"
-    );
+    for external in [false, true] {
+        let mut op = operation(if external { 2 } else { 1 }, Payload::Empty);
+        op.kind = OpKind::Import(editchain_core::ImportOp {
+            raw_ref: if external {
+                Payload::Blob(BlobRef {
+                    id: ContentId::Hash256(raw_hash),
+                    len: u32::try_from(metadata.len()).map_err(io::Error::other)?,
+                })
+            } else {
+                Payload::Inline(metadata.clone())
+            },
+            raw_hash: None,
+        });
+        let encoded = encode_op(&op).map_err(io::Error::other)?;
+        let key = RecordKey::from_encoded(&encoded)?;
+        let _acks = replica.ingest_records(&[(key, encoded)])?;
+        if external {
+            replica.ingest_blob(key, raw_hash, &metadata)?;
+        }
+        let snapshot = replica.snapshot()?;
+        check!(
+            !replica.blob_hashes(&snapshot, key)?.contains(&hash),
+            "consumer JSON never grants a content reference"
+        );
+        check!(
+            replica.read_blob(&snapshot, key, hash)?.is_none(),
+            "private content stays unavailable"
+        );
+        check!(
+            replica.ingest_blob(key, hash, bytes).is_err(),
+            "unreferenced content cannot be admitted"
+        );
+    }
     Ok(())
 }
 

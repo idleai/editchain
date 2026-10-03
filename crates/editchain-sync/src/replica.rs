@@ -8,7 +8,7 @@ use std::ops::Bound::{Excluded, Unbounded};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use editchain_core::{ContentId, OpId, Payload};
+use editchain_core::OpId;
 use editchain_store::durable::{atomic_write, sync_parent_dir};
 use editchain_store::format::{decode_op, Page};
 use editchain_store::BlobStore;
@@ -454,7 +454,7 @@ impl Replica {
         self.read_content(&references, hash)
     }
 
-    /// Resolve typed content references, including retained human-work revisions.
+    /// Resolve typed content references, including explicit file revisions.
     /// Missing structured payloads are hydrated before their child references.
     ///
     /// # Errors
@@ -472,26 +472,12 @@ impl Replica {
         let encoded = snapshot
             .record(key)
             .ok_or_else(|| invalid("record outside scope"))?;
-        self.record_references(encoded, |hash| snapshot.permits_blob(key, hash))
+        Self::record_references(encoded)
     }
 
-    fn record_references(
-        &self,
-        encoded: &[u8],
-        permits_blob: impl Fn([u8; 32]) -> bool,
-    ) -> io::Result<content::References> {
+    fn record_references(encoded: &[u8]) -> io::Result<content::References> {
         let op = decode_op(encoded).map_err(io::Error::other)?;
-        let mut references = content::references(&op);
-        if let Some(Payload::Blob(reference)) = content::structured_payload(&op) {
-            if let ContentId::Hash256(hash) = reference.id {
-                if permits_blob(hash) {
-                    if let Some(bytes) = self.read_content(&references, hash)? {
-                        content::nested(&mut references, &bytes);
-                    }
-                }
-            }
-        }
-        Ok(references)
+        Ok(content::references(&op))
     }
 
     fn read_content(
@@ -546,9 +532,7 @@ impl Replica {
             .get(&key)
             .filter(|record| !scope.excludes(key, record.segment) || scope.received.contains(&key))
             .ok_or_else(|| invalid("record outside scope"))?;
-        let references = self.record_references(&encoded.bytes, |hash| {
-            !scope.received.contains(&key) || scope.received_blobs.contains(&hash)
-        })?;
+        let references = Self::record_references(&encoded.bytes)?;
         if !content::matches_len(
             &references,
             hash,

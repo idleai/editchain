@@ -115,8 +115,6 @@ fn resolve_item(
 
 #[derive(Debug, clap::Subcommand)]
 pub(super) enum Command {
-    /// Read import derivations, logical items, exact copies and incomplete sources.
-    ImportState,
     /// Page accepted immutable operations with exact record references.
     History(Page),
     /// Literal, case-sensitive search with explicit unavailable content.
@@ -192,7 +190,6 @@ pub(super) fn run(chain: &Path, command: Command, output: &mut Output) -> Result
     let mut queries = ChainQueries::open(chain)?;
     let _changes = queries.refresh()?;
     match command {
-        Command::ImportState => output.emit_query(&queries, &queries.import_state()?),
         Command::History(page) => {
             let mut result =
                 queries.history(page.selected_key(&queries)?, page.request(&queries)?)?;

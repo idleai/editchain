@@ -23,8 +23,6 @@
 //! operation metadata with portable record references. Refresh the query index to
 //! observe new records, conflicts, and late content.
 
-/// Provider derivation selection and logical import reconciliation.
-pub mod imports;
 pub mod queries;
 mod writer;
 
@@ -37,15 +35,15 @@ use editchain_store::{
 };
 
 pub use editchain_core::{
-    activity, admission::*, clock::*, git::*, ids::*, op::*, parents::*, payload::*, provider,
-    records, scope::*, tags::*, IdQuery,
+    activity, admission::*, clock::*, git::*, ids::*, op::*, parents::*, payload::*, records,
+    scope::*, tags::*, IdQuery,
 };
 pub use editchain_store::format::{decode_op, encode_op};
 pub use editchain_store::{BlobResolution, ChainReadStats};
 pub use writer::ChainWriter;
 
 #[cfg(test)]
-use tempfile as _;
+use {serde_json as _, tempfile as _};
 
 /// Filesystem engine handle for one caller-selected chain.
 ///

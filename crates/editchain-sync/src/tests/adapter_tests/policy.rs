@@ -167,26 +167,24 @@ fn wrong_peer_mismatched_namespace_and_truncated_streams_fail_closed() {
 }
 
 #[test]
-fn structured_metadata_and_nested_revision_can_arrive_in_separate_rounds() {
+fn declared_file_contents_can_arrive_in_separate_rounds() {
     let directory = tempfile::tempdir().unwrap();
     let ar = directory.path().join("a");
     let br = directory.path().join("b");
     let content = b"historical revision\0\xff";
     let hash = *blake3::hash(content).as_bytes();
-    let metadata = serde_json::to_vec(&serde_json::json!({
-        "source": "vscode.work", "schema": 1, "session": "retained", "turn": 1,
-        "source_event": OpId::new(NodeId(7), 1, 1), "kind": "read", "summary": "read source",
-        "after": { "document": "buffer", "version": 1, "content": ContentId::Hash256(hash) }
-    }))
-    .unwrap();
+    let metadata = b"retained patch".to_vec();
     let metadata_hash = *blake3::hash(&metadata).as_bytes();
     let mut op = operation(1, Payload::Empty);
-    op.kind = OpKind::Import(editchain_core::ImportOp {
-        raw_ref: Payload::Blob(BlobRef {
+    op.kind = OpKind::File(editchain_core::FileOp {
+        path: editchain_core::PathId(1),
+        stage: editchain_core::FileStage::Applied,
+        base: None,
+        after: Some(ContentId::Hash256(hash)),
+        edit: editchain_core::FileEdit::Blob(BlobRef {
             id: ContentId::Hash256(metadata_hash),
             len: u32::try_from(metadata.len()).unwrap(),
         }),
-        raw_hash: None,
     });
     let bytes = encode_op(&op).unwrap();
     let key = RecordKey::from_encoded(&bytes).unwrap();
@@ -196,7 +194,7 @@ fn structured_metadata_and_nested_revision_can_arrive_in_separate_rounds() {
     a.start().unwrap();
     b.start().unwrap();
     network.drain(&mut a, &mut b).unwrap();
-    assert_eq!(b.progress().unavailable, 1);
+    assert_eq!(b.progress().unavailable, 2);
     BlobStore::new(ar.join("blobs"))
         .unwrap()
         .write(&metadata)
@@ -207,7 +205,7 @@ fn structured_metadata_and_nested_revision_can_arrive_in_separate_rounds() {
     assert_eq!(
         b.progress().unavailable,
         1,
-        "nested content is explicitly missing"
+        "referenced revision is explicitly missing"
     );
     BlobStore::new(ar.join("blobs"))
         .unwrap()
