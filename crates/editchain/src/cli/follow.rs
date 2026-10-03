@@ -5,8 +5,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::cancellation::Cancellation;
 use editchain_engine::queries::{ChainQueries, PageRequest};
-use editchain_import::cancellation::ImportCancellation;
 use serde_json::json;
 
 use super::{
@@ -37,7 +37,7 @@ pub(super) struct Args {
 pub(super) fn run(
     chain: &Path,
     args: &Args,
-    cancellation: &ImportCancellation,
+    cancellation: &Cancellation,
     output: &mut Output,
 ) -> Result<()> {
     require_chain(chain)?;
@@ -115,7 +115,7 @@ fn initial(queries: &ChainQueries, output: &mut Output) -> Result<()> {
     Ok(())
 }
 
-fn wait(duration: Duration, cancellation: &ImportCancellation) -> Result<()> {
+fn wait(duration: Duration, cancellation: &Cancellation) -> Result<()> {
     let start = Instant::now();
     while let Some(remaining) = duration.checked_sub(start.elapsed()) {
         if cancellation.is_cancelled() {

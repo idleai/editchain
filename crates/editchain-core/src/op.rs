@@ -473,7 +473,7 @@ pub struct WindowRef {
 // Import
 // ---------------------------------------------------------------------------
 
-/// Imported external record (e.g. from Claude Code history).
+/// Imported external record with an opaque payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportOp {
     /// Reference to the raw external record.
@@ -534,7 +534,7 @@ pub enum NoteRelationship {
     /// The target is a deterministic external-entity handle. The full provider
     /// identifier and resolver provenance remain in the note content and the raw
     /// import payload. Several occurrences may name the same entity (for example,
-    /// copied Claude Code fork prefixes) without losing occurrence identity.
+    /// copied source prefixes) without losing occurrence identity.
     OccurrenceOf,
     /// This provider event declares the target provider event as its parent.
     ///
@@ -575,7 +575,7 @@ pub enum NoteRelationship {
     /// [`Self::ProviderParent`].
     ToolResultOf,
     /// Versioned provider source or lifecycle evidence. The note's parent is
-    /// its physical raw occurrence; content follows [`crate::provider`]. These
+    /// its physical raw occurrence; callers define the content contract. These
     /// observations do not themselves assert a resolved graph edge.
     ProviderEvidence,
 }

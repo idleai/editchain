@@ -174,9 +174,10 @@ fn scan_accepts_migrated_initialization_and_keeps_utf8_previews_valid() {
     });
     let mut child = message(2, Payload::Inline("aé🦀".as_bytes().to_vec()));
     child.parents = ParentSet::One(root.id);
+    let child = Operation::view(&child).unwrap().into_op().unwrap();
     let _root = engine.append(&root).unwrap();
     let _child = engine.append(&child).unwrap();
-    let _report = editchain_import::activity::migrate(&source, &destination, || false).unwrap();
+    let _report = editchain_store::migration::migrate(&source, &destination, || false).unwrap();
     let events = result(&destination, &["scan", "--preview-bytes", "2"], b"", 0);
     assert_eq!(at(&events, "/0/entry/operation/kind/ChainStart/name"), "a");
     assert_eq!(at(&events, "/0/entry/payload_summary/0/2"), 7);

@@ -202,21 +202,6 @@ impl ChainQueries {
         })
     }
 
-    /// Reconcile provider derivations, Codex items, exact copies and source gaps.
-    /// This scans accepted records at the last refresh; canonical history is unchanged.
-    /// Resolve the returned operation IDs through content queries for payload availability.
-    ///
-    /// # Errors
-    /// Returns index or source-record read errors.
-    pub fn import_state(&self) -> io::Result<crate::imports::ImportState> {
-        let operations = self
-            .all_history(None)?
-            .into_iter()
-            .map(|entry| entry.operation)
-            .collect::<Vec<_>>();
-        Ok(crate::imports::ImportState::from_ops(&operations))
-    }
-
     /// Open an existing chain and exclusively own its rebuildable index checkpoint.
     ///
     /// # Errors

@@ -15,8 +15,6 @@ pub mod admission;
 pub mod clock;
 /// Git identity, commit, and explicit-link types.
 pub mod git;
-/// Human work episodes and exact observed buffer revisions.
-pub mod human;
 /// Query prefixes over canonical operation identities.
 pub mod id_query;
 /// Identifier types (`NodeId`, `ActorId`, `OpId`, etc.).
@@ -30,16 +28,12 @@ pub mod op;
 pub mod parents;
 /// Payload types (`ContentId`, `BlobRef`, Payload).
 pub mod payload;
-/// Typed provider identity and immutable source/lifecycle evidence.
-pub mod provider;
 /// Shared record names over the canonical operation envelope and payloads.
 pub mod records;
 /// Scope reference types (chain, session, turn, file).
 pub mod scope;
 /// Tag bitflags for operation filtering.
 pub mod tags;
-/// Shared provider-neutral history classifications; no projection algorithms.
-pub mod taxonomy;
 
 // Re-exports for convenience.
 pub use admission::*;

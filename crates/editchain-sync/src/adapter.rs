@@ -4,7 +4,7 @@ use std::cell::{Ref, RefCell};
 use std::collections::BTreeSet;
 use std::io;
 
-use editchain_core::{BlobRef, ContentId, Payload};
+use editchain_core::{BlobRef, ContentId};
 use editchain_store::format::decode_op;
 use editchain_store::{AppendLog, BlobResolution, BlobStorage};
 
@@ -181,16 +181,7 @@ impl<L: AppendLog, B: BlobStorage, P: ExportPolicy> StoreReplica<L, B, P> {
             return Err(invalid("record outside export scope"));
         }
         let op = decode_op(encoded).map_err(io::Error::other)?;
-        let mut references = content::references(&op);
-        if let Some(Payload::Blob(reference)) = content::structured_payload(&op) {
-            if let ContentId::Hash256(hash) = reference.id {
-                if !exporting || self.policy.share_blob(key, hash)? {
-                    if let Some(bytes) = self.content(&references, hash)? {
-                        content::nested(&mut references, &bytes);
-                    }
-                }
-            }
-        }
+        let references = content::references(&op);
         Ok(references)
     }
 

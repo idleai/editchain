@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use editchain_import::cancellation::ImportCancellation;
+use super::cancellation::Cancellation;
 use editchain_store::{BlobStore, SegmentStore};
 use editchain_sync::{
     ExportScope, PeerConnection, Progress, RecordKey, Session, StoreReplica, Transport,
@@ -66,7 +66,7 @@ pub(super) fn storage(chain: &Path, scope: ExportScope) -> Result<Storage> {
 pub(super) fn run(
     chain: &Path,
     args: &Args,
-    cancellation: &ImportCancellation,
+    cancellation: &Cancellation,
     output: &mut Output,
 ) -> Result<()> {
     require_chain(chain)?;
@@ -109,7 +109,7 @@ fn local(
     peer: &Path,
     scope: ExportScope,
     args: &Args,
-    cancellation: &ImportCancellation,
+    cancellation: &Cancellation,
 ) -> Result<(Progress, Progress)> {
     let mut left = Session::new(storage(chain, scope.clone())?);
     let mut right = Session::new(storage(peer, scope)?);
@@ -149,7 +149,7 @@ fn stdio(
     chain: &Path,
     scope: ExportScope,
     args: &Args,
-    cancellation: &ImportCancellation,
+    cancellation: &Cancellation,
 ) -> Result<Progress> {
     let mut connection = PeerConnection::new(
         "stdio",
@@ -182,7 +182,7 @@ fn stdio(
     }
 }
 
-fn check_deadline(start: Instant, args: &Args, cancellation: &ImportCancellation) -> Result<()> {
+fn check_deadline(start: Instant, args: &Args, cancellation: &Cancellation) -> Result<()> {
     if cancellation.is_cancelled() {
         return Err(Failure::new(
             130,

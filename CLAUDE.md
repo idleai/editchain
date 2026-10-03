@@ -12,11 +12,10 @@ in `AGENTS.md` applies. Keep the checks, thresholds, and tests intact.
 ```sh
 cargo build --workspace --locked
 cargo test --workspace --locked
-cargo run --locked -p editchain -- --chain /path/to/chain import \
-  --provider claude --input /path/to/sessions
-cargo run --locked -p editchain -- --chain /path/to/chain import \
-  --provider codex --input ~/.codex/sessions --workspace /path/to/repo \
-  --codex-helper /path/to/codex-session-exporter
+cargo run --locked -p editchain -- --chain /path/to/chain init
+cargo run --locked -p editchain -- --chain /path/to/chain append \
+  --input operations.jsonl
+cargo run --locked -p editchain -- --chain /path/to/chain history --output jsonl
 ```
 
 ## Architecture
@@ -32,8 +31,6 @@ without sibling application checkouts.
 - `editchain-store`: canonical read-only chain access, record locations,
   integrity diagnostics, content-addressed blobs, and exclusive segment writers.
   Its `format` API owns postcard operation frames and EC02/EC03 encoding.
-- `editchain-import`: deterministic, incremental Claude, Codex and human archive
-  capture, cursors, and store-owned persistence adapters.
 - `editchain-index`: rebuildable indexes, refresh and integrity checks;
   `editchain-index-pages` owns paged checkpoint storage.
 - `editchain-sync`: operation/blob replication and a generic peer worker with
@@ -41,15 +38,14 @@ without sibling application checkouts.
 - `editchain-git`: repository discovery, history walking, commit/blob resolution,
   and file-change extraction.
 
-Semantic application projections and shared host contracts are in app-core.
-Graph geometry and rendering are in web-ui. Native history services, editor
-capture, extensions and their debug configurations are in vscode-extension.
-The session exporter and portable peer coordination are in Codex. See the
-repository links in `README.md`.
+Consumers supply records and opaque payloads through the engine APIs. The engine
+does not discover application sources, parse provider formats or interpret
+application payloads. Replication resolves only schema-declared content fields.
 
 ## Storage and compatibility
 
 The segment log and blob store are authoritative. Derived indexes can be rebuilt.
-Keep the EC02 operation/page format compatible unless a task explicitly
-authorizes a format migration. EC02 uses fixed u32 record lengths without a
-checksum; EC03 is a separate, currently inactive checksummed format.
+EC03 wire version 2 and operation schema 3 are the current write format. Preserve
+read compatibility for older encodings. Wire migration and semantic conversion
+are separate operations; see `docs/ec03.md` and `docs/operations.md` for the exact
+contracts. Never infer content grants by interpreting opaque payload bytes.
