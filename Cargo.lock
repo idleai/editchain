@@ -584,6 +584,7 @@ dependencies = [
  "blake3",
  "clap",
  "ctrlc",
+ "editchain-cli-support",
  "editchain-engine",
  "editchain-index",
  "editchain-store",
@@ -591,6 +592,15 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "editchain-cli-support"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
