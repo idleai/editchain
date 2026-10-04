@@ -1,9 +1,11 @@
 version: 2
 registries:
+  # Dependabot requires a secret reference; its value is the public marker "anonymous".
   idle-editchain:
     type: cargo-registry
     registry: idle-editchain
     url: https://raw.githubusercontent.com/idleai/editchain/cargo-index/
+    token: ${{secrets.PUBLIC_CARGO_REGISTRY_TOKEN}}
 updates:
   - package-ecosystem: cargo
     registries: "*"

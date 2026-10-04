@@ -68,6 +68,11 @@ that PR creates package tags and runs `scripts/release-crates.py` to verify and
 publish the archives and update the index. Releases can batch several feature
 PRs. Dependabot groups compatible Rust dependency updates for review.
 
+Dependabot requires a secret reference for custom Cargo registries, including
+public ones. Set the repository's Dependabot secret `PUBLIC_CARGO_REGISTRY_TOKEN`
+to the literal value `anonymous`. This is a public marker, not an access token;
+the GitHub indexes remain anonymously readable.
+
 The native release workflow builds Linux x64, macOS x64/arm64 and Windows x64
 bundles when releasing the native tools. It publishes the draft only after all
 platform builds complete. `native-release.json` defines the binaries and test
