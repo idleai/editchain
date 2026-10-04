@@ -1,0 +1,6 @@
+{
+  "repository": "idleai/editchain",
+  "tag_prefix": "editchain-v",
+  "build_args": ["-p", "editchain", "-p", "editchain-sync", "--bins"],
+  "binaries": ["editchain", "editchain-peer"]
+}

@@ -1,0 +1,89 @@
+name: Release
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-pr:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    concurrency:
+      group: release-pr-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+      - uses: release-plz/action@26c577bbc3f9ecc178fc9e9afc34ee43e6f4a080 # v0.5
+        id: release
+        with:
+          command: release-pr
+          version: 0.3.169
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run CI for the generated release PR
+        if: steps.release.outputs.prs_created == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_PR: ${{ steps.release.outputs.pr }}
+        run: |
+          BRANCH="$(jq -r '.head_branch' <<< "$RELEASE_PR")"
+          gh workflow run lint.yml --ref "$BRANCH"
+
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: read
+    concurrency:
+      group: publish-${{ github.repository }}
+      cancel-in-progress: false
+    outputs:
+      artifact_tag: ${{ steps.artifact.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+      - uses: release-plz/action@26c577bbc3f9ecc178fc9e9afc34ee43e6f4a080 # v0.5
+        id: release
+        with:
+          command: release
+          version: 0.3.169
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish Cargo archives and index
+        if: steps.release.outputs.releases_created == 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/release-crates.py --publish
+      - name: Select the artifact release
+        id: artifact
+        env:
+          RELEASES: ${{ steps.release.outputs.releases }}
+        run: |
+          TAG="$(jq -r '.[] | select(.package_name == "editchain") | .tag' <<< "${RELEASES:-[]}")"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  artifacts:
+    needs: release
+    if: needs.release.outputs.artifact_tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/native-release.yml
+    with:
+      tag: ${{ needs.release.outputs.artifact_tag }}
