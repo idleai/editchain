@@ -84,7 +84,10 @@ def publish(root, repository, parent, index, packages, output):
     for package in packages:
         name, version = package["name"], package["version"]
         tag = f"{name}-v{version}"
-        release = api(root, repository, f"releases/tags/{tag}")
+        # The tag endpoint omits draft releases; the CLI resolves their numeric IDs.
+        details = json.loads(command(root, "gh", "release", "view", tag, "--repo", repository, "--json", "apiUrl"))
+        release_id = details["apiUrl"].rsplit("/", 1)[1]
+        release = api(root, repository, f"releases/{release_id}")
         archive = output / f"{name}-{version}.crate"
         assets = {asset["name"]: asset for asset in release["assets"]}
         for path in (archive, archive.with_name(archive.name + ".sha256")):
