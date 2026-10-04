@@ -18,14 +18,14 @@ jobs:
       group: release-pr-${{ github.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.0
-      - uses: release-plz/action@26c577bbc3f9ecc178fc9e9afc34ee43e6f4a080 # v0.5
+      - uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5
         id: release
         with:
           command: release-pr
@@ -52,14 +52,14 @@ jobs:
     outputs:
       artifact_tag: ${{ steps.artifact.outputs.tag }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.0
-      - uses: release-plz/action@26c577bbc3f9ecc178fc9e9afc34ee43e6f4a080 # v0.5
+      - uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5
         id: release
         with:
           command: release
