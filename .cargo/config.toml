@@ -1,0 +1,2 @@
+[registries.idle-editchain]
+index = "sparse+https://raw.githubusercontent.com/idleai/editchain/cargo-index/"

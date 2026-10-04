@@ -32,3 +32,6 @@ Thumbs.db
 .editchain/
 tree.md
 SPEC.md
+
+/releases/
+__pycache__/

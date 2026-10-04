@@ -1,4 +1,5 @@
 [package]
+publish = ["idle-editchain"]
 name = "editchain-cli-support"
 version.workspace = true
 edition.workspace = true

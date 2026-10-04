@@ -1,0 +1,24 @@
+version: 2
+registries:
+  idle-editchain:
+    type: cargo-registry
+    registry: idle-editchain
+    url: https://raw.githubusercontent.com/idleai/editchain/cargo-index/
+updates:
+  - package-ecosystem: cargo
+    registries: "*"
+    directory: /
+    schedule:
+      interval: daily
+    groups:
+      idle-packages:
+        patterns: ["editchain*", "idle-*", "history-geometry", "app-core", "web-ui"]
+    commit-message:
+      prefix: "build(deps)"
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

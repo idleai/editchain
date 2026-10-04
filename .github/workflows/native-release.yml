@@ -1,0 +1,86 @@
+name: Native release
+on:
+  push:
+    tags: ["editchain-v*"]
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            platform: linux-x64
+          - runner: macos-15-intel
+            platform: darwin-x64
+          - runner: macos-15
+            platform: darwin-arm64
+          - runner: windows-2022
+            platform: win32-x64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag || github.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Build the native release bundle
+        env:
+          RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) }}
+        run: |
+          ARGS=()
+          if [[ -n "$RELEASE_TAG" ]]; then ARGS+=(--tag "$RELEASE_TAG"); fi
+          python3 scripts/package-native.py --output releases "${ARGS[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.platform }}
+          path: releases/*
+          if-no-files-found: error
+
+  publish:
+    if: inputs.tag != '' || github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: releases
+      - name: Complete the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) }}
+        run: |
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          (cd releases && sha256sum --check ./*.sha256)
+          gh release upload "$RELEASE_TAG" releases/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false
