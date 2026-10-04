@@ -1,4 +1,5 @@
 [package]
+publish = ["idle-editchain"]
 name = "editchain-store"
 version.workspace = true
 edition.workspace = true
@@ -13,11 +14,11 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-editchain-index-pages = { path = "../editchain-index-pages" }
+editchain-index-pages = { registry = "idle-editchain", version = "0.1.0", path = "../editchain-index-pages" }
 postcard.workspace = true
 crc = "3"
 blake3 = "1"
-editchain-core = { path = "../editchain-core" }
+editchain-core = { registry = "idle-editchain", version = "0.1.0", path = "../editchain-core" }
 serde.workspace = true
 serde_json.workspace = true
 
