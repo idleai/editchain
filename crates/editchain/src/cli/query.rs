@@ -200,7 +200,7 @@ pub(super) fn run(chain: &Path, command: Command, output: &mut Output) -> Result
                 }
             }
             result.items = retained;
-            output.emit_query(&queries, &result)
+            super::output::emit_query(output, &queries, &result)
         }
         Command::Search { text, page } => {
             let mut result =
@@ -223,7 +223,7 @@ pub(super) fn run(chain: &Path, command: Command, output: &mut Output) -> Result
                 }
             }
             result.unavailable = unavailable;
-            output.emit_query(&queries, &result)?;
+            super::output::emit_query(output, &queries, &result)?;
             if result.unavailable.is_empty() {
                 Ok(())
             } else {
@@ -240,7 +240,7 @@ pub(super) fn run(chain: &Path, command: Command, output: &mut Output) -> Result
         ),
         Command::Variants { id } => {
             let variants = queries.record_variants(resolve(&queries, &id)?)?;
-            output.emit_query(&queries, &variants)?;
+            super::output::emit_query(output, &queries, &variants)?;
             if variants.is_empty() {
                 Err(Failure::new(3, "operation not recorded"))
             } else {
@@ -260,7 +260,7 @@ pub(super) fn run(chain: &Path, command: Command, output: &mut Output) -> Result
                     }
                 }
             } else {
-                output.emit_query(&queries, &result)?;
+                super::output::emit_query(output, &queries, &result)?;
             }
             content_status(&result)
         }
@@ -275,7 +275,7 @@ pub(super) fn run(chain: &Path, command: Command, output: &mut Output) -> Result
         }
         Command::Compare { before, after } => {
             let result = queries.compare(before, after)?;
-            output.emit_query(&queries, &result)?;
+            super::output::emit_query(output, &queries, &result)?;
             content_status(&result.before)?;
             content_status(&result.after)
         }
@@ -284,20 +284,26 @@ pub(super) fn run(chain: &Path, command: Command, output: &mut Output) -> Result
             output,
             &queries,
         ),
-        Command::Ancestors { id, limit } => output.emit_query(
+        Command::Ancestors { id, limit } => super::output::emit_query(
+            output,
             &queries,
             &queries.ancestors(resolve(&queries, &id)?, limit)?,
         ),
         Command::Relationships { entity, page } => {
             reject_key(&page)?;
-            output.emit_query(
+            super::output::emit_query(
+                output,
                 &queries,
                 &queries.relationships(entity, page.request(&queries)?)?,
             )
         }
         Command::Git { query, page } => {
             reject_key(&page)?;
-            output.emit_query(&queries, &queries.git(query, page.request(&queries)?)?)
+            super::output::emit_query(
+                output,
+                &queries,
+                &queries.git(query, page.request(&queries)?)?,
+            )
         }
         Command::Annotations(page) => filtered(
             &queries,
@@ -334,7 +340,7 @@ fn filtered(
         }
     }
     result.items = items;
-    output.emit_query(queries, &result)
+    super::output::emit_query(output, queries, &result)
 }
 
 fn reject_key(page: &Page) -> Result<()> {
@@ -357,7 +363,7 @@ fn emit_lookup<T: Serialize>(
     output: &mut Output,
     queries: &ChainQueries,
 ) -> Result<()> {
-    output.emit_query(queries, result)?;
+    super::output::emit_query(output, queries, result)?;
     lookup_status(result)
 }
 

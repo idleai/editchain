@@ -36,9 +36,11 @@ reflections, subscriptions, integrity/rebuild, replication and shell contracts.
 
 ## Packages
 
-This workspace contains eight engine packages: `editchain`, `editchain-engine`,
+This workspace contains nine packages: `editchain`, `editchain-engine`,
 `editchain-core`, `editchain-store`, `editchain-index`, `editchain-index-pages`,
-`editchain-git` and `editchain-sync`. The peer worker in `editchain-sync` accepts
+`editchain-git`, `editchain-sync` and `editchain-cli-support`. The CLI support
+package shares bounded input, output formatting and exit codes with native
+application tools. The peer worker in `editchain-sync` accepts
 caller-supplied transport and sharing scope. Replication follows declared engine
 content references; it does not interpret opaque payloads as additional grants.
 
