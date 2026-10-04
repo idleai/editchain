@@ -35,8 +35,6 @@ jobs:
     defaults:
       run:
         shell: bash
-    env:
-      OPENSSL_STATIC: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -51,23 +49,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-      - name: Configure static OpenSSL on Linux
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
-          echo "OPENSSL_LIB_DIR=/usr/lib/$(gcc -dumpmachine)" >> "$GITHUB_ENV"
-          echo "OPENSSL_INCLUDE_DIR=/usr/include" >> "$GITHUB_ENV"
-      - name: Configure static OpenSSL on macOS
-        if: runner.os == 'macOS'
-        run: |
-          brew install openssl@3
-          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
-      - name: Configure static OpenSSL on Windows
-        if: runner.os == 'Windows'
-        run: |
-          vcpkg install openssl:x64-windows-static-md
-          echo "OPENSSL_DIR=$VCPKG_INSTALLATION_ROOT/installed/x64-windows-static-md" >> "$GITHUB_ENV"
       - name: Build the native release bundle
         env:
           RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) }}
