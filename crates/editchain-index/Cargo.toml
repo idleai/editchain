@@ -14,9 +14,9 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-editchain-core = { registry = "idle-editchain", version = "0.1.1", path = "../editchain-core" }
-editchain-store = { registry = "idle-editchain", version = "0.1.1", path = "../editchain-store" }
-editchain-index-pages = { registry = "idle-editchain", version = "0.1.1", path = "../editchain-index-pages" }
+editchain-core = { registry = "idle-editchain", version = "0.1.2", path = "../editchain-core" }
+editchain-store = { registry = "idle-editchain", version = "0.1.2", path = "../editchain-store" }
+editchain-index-pages = { registry = "idle-editchain", version = "0.1.2", path = "../editchain-index-pages" }
 serde = { workspace = true, features = ["rc"] }
 
 [dev-dependencies]

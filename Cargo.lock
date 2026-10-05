@@ -576,7 +576,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "editchain"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "clap",
@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "editchain-cli-support"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "serde",
@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "editchain-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "postcard",
@@ -613,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "editchain-engine"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "editchain-core",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "editchain-git"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "editchain-core",
  "gix",
@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "editchain-index"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "editchain-core",
@@ -650,7 +650,7 @@ dependencies = [
 
 [[package]]
 name = "editchain-index-pages"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "ciborium",
@@ -660,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "editchain-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "blake3",
  "crc",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "editchain-sync"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "blake3",
