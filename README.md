@@ -71,9 +71,11 @@ there is no separate release PR. Concurrent changes to `main` are never overwrit
 
 Declare breaking changes in the feature PR, including the required minimum
 versions in consumers. Release-plz uses commit messages and Rust API checks to
-calculate the next version. To recover a failed publication, rerun **Release**
-on `main`; existing versions and public archives remain immutable, and unfinished
-drafts can resume. A documentation-only change that does not alter packaged
+calculate the next version. To recover a failed publication, use **Re-run failed
+jobs** on that Release run, retaining its verified commit even if `main` has
+advanced. Dispatch **Release** on `main` to prepare current changes or resume a
+current version commit. Existing versions and public archives remain immutable;
+retries can complete unfinished drafts. A documentation-only change that does not alter packaged
 contents does not create another package version.
 
 Dependabot requires a secret reference for custom Cargo registries, including

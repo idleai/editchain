@@ -2,6 +2,7 @@
 
 import contextlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -105,6 +106,36 @@ class ReleasePreparationTests(unittest.TestCase):
         source = self.run_git(self.checkout, "rev-parse", "HEAD")
         self.release_command("pass\n")
         self.assertEqual(self.prepare(source, version="0.2.0"), source)
+
+    def test_artifact_retry_selects_draft_and_leaves_public_release_unchanged(self):
+        self.prepare()
+        self.run_git(self.checkout, "tag", "fixture-v0.1.1")
+        original = AUTOMATION.command
+        for draft in (True, False):
+            def command(*arguments):
+                if arguments[:3] == ("gh", "release", "view"):
+                    return json.dumps({"isDraft": draft})
+                return original(*arguments)
+            with contextlib.chdir(self.checkout), \
+                    patch.object(AUTOMATION, "packages", return_value=[{"name": "fixture", "version": "0.1.1"}]), \
+                    patch.object(AUTOMATION, "command", side_effect=command), patch.object(AUTOMATION, "output") as output:
+                AUTOMATION.artifact("fixture")
+                output.assert_called_once_with("tag", "fixture-v0.1.1" if draft else "")
+
+    def test_missing_artifact_tag_fails_instead_of_reporting_publication_success(self):
+        with contextlib.chdir(self.checkout), \
+                patch.object(AUTOMATION, "packages", return_value=[{"name": "fixture", "version": "0.1.1"}]):
+            with self.assertRaisesRegex(ValueError, "did not create the artifact tag"):
+                AUTOMATION.artifact("fixture")
+
+    def test_unchanged_artifact_from_an_older_commit_is_not_rebuilt(self):
+        (self.checkout / "source.rs").write_text("another package changed\n")
+        self.commit("another package")
+        with contextlib.chdir(self.checkout), \
+                patch.object(AUTOMATION, "packages", return_value=[{"name": "fixture", "version": "0.1.0"}]), \
+                patch.object(AUTOMATION, "output") as output:
+            AUTOMATION.artifact("fixture")
+            output.assert_called_once_with("tag", "")
 
 
 if __name__ == "__main__":

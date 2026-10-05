@@ -86,7 +86,10 @@ def artifact(package_name):
     package = next(package for package in packages() if package["name"] == package_name)
     tag = f"{package_name}-v{package['version']}"
     # Existing public artifacts are immutable. A retry resumes only a draft at this commit.
-    if tag_commit(tag) != command("git", "rev-parse", "HEAD"):
+    revision = tag_commit(tag)
+    if revision is None:
+        raise ValueError(f"release-plz did not create the artifact tag: {tag}")
+    if revision != command("git", "rev-parse", "HEAD"):
         output("tag", "")
         return
     release = json.loads(command("gh", "release", "view", tag, "--json", "isDraft"))
