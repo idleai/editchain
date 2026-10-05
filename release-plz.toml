@@ -1,7 +1,7 @@
 [workspace]
 git_only = true
 git_release_draft = true
-release_always = false
+release_always = true
 publish_all_features = true
 git_tag_name = "{{ package }}-v{{ version }}"
 git_release_name = "{{ package }} v{{ version }}"

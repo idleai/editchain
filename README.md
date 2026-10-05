@@ -63,10 +63,18 @@ Releases. The `cargo-index` branch contains the Cargo sparse index; its entries
 include immutable archive checksums. `.cargo/config.toml` registers the indexes.
 Normal checks use the committed lockfile and need only this repository's source.
 
-Release-plz accumulates version and changelog changes in a release PR. Merging
-that PR creates package tags and runs `scripts/release-crates.py` to verify and
-publish the archives and update the index. Releases can batch several feature
-PRs. Dependabot groups compatible Rust dependency updates for review.
+A successful `main` CI run starts the Release workflow. Release-plz calculates
+versions and changelogs, and automation commits that metadata to `main`. The
+entire CI workflow checks the version commit before any package is published.
+Package archives, indexes and native bundles then publish from that exact commit;
+there is no separate release PR. Concurrent changes to `main` are never overwritten.
+
+Declare breaking changes in the feature PR, including the required minimum
+versions in consumers. Release-plz uses commit messages and Rust API checks to
+calculate the next version. To recover a failed publication, rerun **Release**
+on `main`; existing versions and public archives remain immutable, and unfinished
+drafts can resume. A documentation-only change that does not alter packaged
+contents does not create another package version.
 
 Dependabot requires a secret reference for custom Cargo registries, including
 public ones. Set the repository's Dependabot secret `PUBLIC_CARGO_REGISTRY_TOKEN`

@@ -1,89 +1,99 @@
 name: Release
 on:
-  push:
+  workflow_run:
+    workflows: [Lint]
     branches: [main]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
 jobs:
-  release-pr:
+  prepare:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository &&
+       (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch'))
     runs-on: ubuntu-24.04
     permissions:
       contents: write
-      pull-requests: write
-      actions: write
-    concurrency:
-      group: release-pr-${{ github.ref }}
-      cancel-in-progress: false
+    outputs:
+      revision: ${{ steps.prepare.outputs.revision }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.0
-      - uses: release-plz/action@26c577bbc3f9ecc178fc9e9afc34ee43e6f4a080 # v0.5
-        id: release
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
-          command: release-pr
-          version: 0.3.169
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Run CI for the generated release PR
-        if: steps.release.outputs.prs_created == 'true'
+          tool: release-plz@0.3.169,cargo-semver-checks@0.50.0
+      - name: Prepare or resume the version commit
+        id: prepare
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_PR: ${{ steps.release.outputs.pr }}
+          SOURCE_COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}
         run: |
-          BRANCH="$(jq -r '.head_branch' <<< "$RELEASE_PR")"
-          gh workflow run lint.yml --ref "$BRANCH"
+          gh auth setup-git
+          python3 scripts/release-automation.py prepare --source "$SOURCE_COMMIT"
 
-  release:
+  verify:
+    needs: prepare
+    if: needs.prepare.outputs.revision != ''
+    uses: ./.github/workflows/lint.yml
+    with:
+      revision: ${{ needs.prepare.outputs.revision }}
+
+  publish:
+    needs: [prepare, verify]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
       pull-requests: read
-    concurrency:
-      group: publish-${{ github.repository }}
-      cancel-in-progress: false
     outputs:
       artifact_tag: ${{ steps.artifact.outputs.tag }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.prepare.outputs.revision }}
           fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.0
-      - uses: release-plz/action@26c577bbc3f9ecc178fc9e9afc34ee43e6f4a080 # v0.5
-        id: release
+      - uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5
         with:
           command: release
           version: 0.3.169
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Publish Cargo archives and index
-        if: steps.release.outputs.releases_created == 'true' || github.event_name == 'workflow_dispatch'
+      - name: Publish or resume Cargo archives and index
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 scripts/release-crates.py --publish
-      - name: Select the artifact release
+      - name: Select unfinished artifact release
         id: artifact
         env:
-          RELEASES: ${{ steps.release.outputs.releases }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="$(jq -r '.[] | select(.package_name == "editchain") | .tag' <<< "${RELEASES:-[]}")"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          gh auth setup-git
+          git fetch origin --tags
+          python3 scripts/release-automation.py artifact --package editchain
 
   artifacts:
-    needs: release
-    if: needs.release.outputs.artifact_tag != ''
+    needs: publish
+    if: needs.publish.outputs.artifact_tag != ''
     permissions:
       contents: write
     uses: ./.github/workflows/native-release.yml
     with:
-      tag: ${{ needs.release.outputs.artifact_tag }}
+      tag: ${{ needs.publish.outputs.artifact_tag }}
