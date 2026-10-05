@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/idleai/editchain/compare/editchain-git-v0.1.2...editchain-git-v0.1.3) - 2026-10-05
+
+### Other
+
+- *(f43)* update gix with compatible object types ([#45](https://github.com/idleai/editchain/pull/45))
+
 ## [0.1.1](https://github.com/idleai/editchain/compare/editchain-git-v0.1.0...editchain-git-v0.1.1) - 2026-10-05
 
 ### Other
