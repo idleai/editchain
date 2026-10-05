@@ -8,7 +8,6 @@
 
 use std::process::Command;
 
-use gix_object as _;
 use sha2 as _;
 
 use editchain_core::GitOid;

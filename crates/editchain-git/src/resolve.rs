@@ -73,20 +73,19 @@ pub fn resolve_commit_with_refs(
     refs: &RefSnapshot,
 ) -> Result<GitCommitEntity, ResolutionError> {
     let gix_oid = git_oid_from(oid)?;
-    let id = handle.repo.find_object(gix_oid).map_err(|e| match e {
-        gix_object::find::existing::Error::NotFound { .. } => {
-            ResolutionError::NotFound(e.to_string())
-        }
-        gix_object::find::existing::Error::Find(_) => ResolutionError::Decode(e.to_string()),
-    })?;
+    let id = handle
+        .repo
+        .try_find_object(gix_oid)
+        .map_err(|error| ResolutionError::Decode(error.to_string()))?
+        .ok_or_else(|| ResolutionError::NotFound(gix_oid.to_string()))?;
 
-    if id.kind != gix_object::Kind::Commit {
+    if id.kind != gix::objs::Kind::Commit {
         return Err(ResolutionError::WrongKind {
             expected: "commit",
             actual: id.kind.to_string(),
         });
     }
-    let parsed = gix_object::CommitRef::from_bytes(&id.data, gix_oid.kind())
+    let parsed = gix::objs::CommitRef::from_bytes(&id.data, gix_oid.kind())
         .map_err(|e| ResolutionError::Decode(e.to_string()))?;
 
     let author = parsed

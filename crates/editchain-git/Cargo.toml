@@ -21,7 +21,6 @@ gix = { version = "0.88", default-features = false, features = [
     "sha1",
     "sha256",
 ] }
-gix-object = "0.64"
 sha2 = "0.10"
 editchain-core = { registry = "idle-editchain", version = "0.1.2", path = "../editchain-core" }
 
