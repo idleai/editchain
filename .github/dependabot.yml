@@ -6,8 +6,10 @@ registries:
     registry: idle-editchain
     url: https://raw.githubusercontent.com/idleai/editchain/cargo-index/
     token: ${{secrets.PUBLIC_CARGO_REGISTRY_TOKEN}}
+# Version update PRs are paused; remove the zero limits below to resume.
 updates:
   - package-ecosystem: cargo
+    open-pull-requests-limit: 0
     registries: "*"
     directory: /
     schedule:
@@ -18,6 +20,7 @@ updates:
     commit-message:
       prefix: "build(deps)"
   - package-ecosystem: github-actions
+    open-pull-requests-limit: 0
     directory: /
     schedule:
       interval: weekly
