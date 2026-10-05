@@ -22,7 +22,7 @@ gix = { version = "0.88", default-features = false, features = [
     "sha256",
 ] }
 sha2 = "0.10"
-editchain-core = { registry = "idle-editchain", version = "0.1.3", path = "../editchain-core" }
+editchain-core = { registry = "idle-editchain", version = "0.1.4", path = "../editchain-core" }
 
 [dev-dependencies]
 tempfile = "3"

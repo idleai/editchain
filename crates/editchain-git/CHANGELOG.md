@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/idleai/editchain/compare/editchain-git-v0.1.3...editchain-git-v0.1.4) - 2026-10-05
+
+### Other
+
+- move packaging details out of the main README ([#46](https://github.com/idleai/editchain/pull/46))
+
 ## [0.1.3](https://github.com/idleai/editchain/compare/editchain-git-v0.1.2...editchain-git-v0.1.3) - 2026-10-05
 
 ### Other
