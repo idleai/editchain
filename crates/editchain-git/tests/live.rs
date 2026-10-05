@@ -11,7 +11,6 @@
 use std::process::Command;
 
 // Crate-level dependency markers (used by Cargo for feature resolution).
-use gix_object as _;
 use sha2 as _;
 
 use editchain_core::{GitAvailability, GitObjectFormat, GitOid, Payload};
@@ -128,7 +127,7 @@ fn resolve_missing_object_reports_not_found() {
     // A non-existent OID (all zeros).
     let missing = GitOid::from_sha1([0u8; 20]);
     let result = resolve_commit(&handle, &missing);
-    assert!(result.is_err(), "missing object should error");
+    assert!(matches!(result, Err(ResolutionError::NotFound(_))));
 }
 
 #[test]
@@ -370,6 +369,10 @@ fn prefix_lookup_distinguishes_absence_ambiguity_and_corruption() {
     let handle = editchain_git::open_repository(&descriptor).unwrap();
     assert!(matches!(
         resolve_commit_prefix(&handle, oid.get(..7).unwrap()),
+        Err(ResolutionError::Decode(_))
+    ));
+    assert!(matches!(
+        resolve_commit(&handle, &head_oid(&repo)),
         Err(ResolutionError::Decode(_))
     ));
 }

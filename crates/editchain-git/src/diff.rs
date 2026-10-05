@@ -130,7 +130,7 @@ pub fn resolve_blob(handle: &RepositoryHandle, oid: &GitOid) -> Result<GitBlob, 
         .repo
         .find_object(object_id)
         .map_err(|error| ResolutionError::NotFound(error.to_string()))?;
-    if object.kind != gix_object::Kind::Blob {
+    if object.kind != gix::objs::Kind::Blob {
         return Err(ResolutionError::Decode(format!(
             "expected blob object, found {}",
             object.kind
@@ -295,7 +295,7 @@ fn path_text(bytes: &[u8]) -> String {
 fn object_is_binary(
     handle: &RepositoryHandle,
     id: gix::hash::ObjectId,
-    mode: gix_object::tree::EntryMode,
+    mode: gix::objs::tree::EntryMode,
 ) -> bool {
     if mode.is_commit() {
         return false;
