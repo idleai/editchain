@@ -15,7 +15,7 @@ use crate::{
     boundary,
     references::references,
     state::{invalid, State, VERSION},
-    ContentStatus, IndexKey, Storage,
+    ContentStatus, IndexChangeKind, IndexChanges, IndexKey, IndexRevision, Storage,
 };
 
 /// IO performed by an incremental refresh, independent of accepted history size.
@@ -108,12 +108,16 @@ impl ChainIndex {
         } else {
             None
         };
-        let state = if let Some(state) = saved {
+        let state = if let Some(mut state) = saved {
             if state.version != VERSION {
                 return Err(invalid("unsupported chain index schema; rebuild required"));
             }
             state.tail.resume(&root)?;
-            state
+            if state.changes.initialize()? {
+                storage.commit(&state)?
+            } else {
+                state
+            }
         } else {
             storage.commit(&State::build(&root, &blobs)?)?
         };
@@ -138,6 +142,24 @@ impl ChainIndex {
     #[must_use]
     pub fn stats(&self) -> ChainReadStats {
         self.state.tail.chain().stats()
+    }
+
+    /// Accepted-state revision, retained across closing and reopening this index.
+    #[must_use]
+    pub fn revision(&self) -> IndexRevision {
+        self.state.changes.revision.clone()
+    }
+
+    /// Read durable changes since a previous revision. `None` requires a rebuild
+    /// because the generation changed or the bounded journal no longer covers it.
+    /// # Errors
+    /// Returns invalid limits or derived-page read failures.
+    pub fn changes_since(
+        &self,
+        after: &IndexRevision,
+        limit: usize,
+    ) -> io::Result<Option<IndexChanges>> {
+        self.state.changes.since(after, limit)
     }
 
     /// Read one accepted operation, retaining the exact recorded fields.
@@ -337,6 +359,15 @@ impl ChainIndex {
             let mut content_changed = next.apply(&self.root, &records, &self.blobs, &mut reads)?;
             content_changed
                 .retain(|id| !records.added.contains_key(id) && !records.removed.contains(id));
+            for operation in records.added.keys() {
+                next.changes.append(*operation, IndexChangeKind::Added)?;
+            }
+            for operation in &records.removed {
+                next.changes.append(*operation, IndexChangeKind::Removed)?;
+            }
+            for operation in &content_changed {
+                next.changes.append(*operation, IndexChangeKind::Content)?;
+            }
             if records.work.bytes_read > 0 || !content_changed.is_empty() {
                 self.publish(&next)?;
             }

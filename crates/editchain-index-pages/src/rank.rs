@@ -75,6 +75,34 @@ impl<K, V> Default for RankTree<K, V> {
     }
 }
 
+fn prefix_batch<K: Ord, V>(
+    tree: &Link<K, V>,
+    queries: &[(&K, usize)],
+    sum: Measure,
+    output: &mut [Measure],
+) {
+    if queries.is_empty() {
+        return;
+    }
+    let Some(node) = tree.as_deref() else {
+        for (_, index) in queries {
+            if let Some(value) = output.get_mut(*index) {
+                *value = sum;
+            }
+        }
+        return;
+    };
+    let split = queries.partition_point(|(key, _)| *key <= &node.key);
+    let (left, right) = queries.split_at(split);
+    prefix_batch(&node.left, left, sum, output);
+    prefix_batch(
+        &node.right,
+        right,
+        sum.plus(measure(&node.left)).plus(node.weight),
+        output,
+    );
+}
+
 impl<K: Ord, V> RankTree<K, V> {
     /// Aggregate row counts, available without walking the sequence.
     #[must_use]
@@ -199,6 +227,21 @@ impl<K: Ord, V> RankTree<K, V> {
             }
         }
         sum
+    }
+
+    /// Prefix weights for a bounded batch, preserving the supplied key order.
+    /// Shared search paths are visited once, including for repeated boundaries.
+    #[must_use]
+    pub fn prefixes(&self, keys: &[K]) -> Vec<Measure> {
+        let mut queries: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key, index))
+            .collect();
+        queries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+        let mut output = vec![Measure::default(); keys.len()];
+        prefix_batch(&self.root, &queries, Measure::default(), &mut output);
+        output
     }
 
     /// The block containing an offset and its prefix weights in both spaces.
@@ -407,6 +450,16 @@ mod tests {
                 prefix = prefix.plus(*weight);
             }
             assert_eq!(tree.measure(), prefix);
+            let queries = [113, 0, 53, 12, 53, 112, 54];
+            let expected: Vec<_> = queries
+                .iter()
+                .map(|key| {
+                    oracle
+                        .range(..*key)
+                        .fold(Measure::default(), |sum, (_, weight)| sum.plus(*weight))
+                })
+                .collect();
+            assert_eq!(tree.prefixes(&queries), expected);
             assert_eq!(tree.select(prefix.expanded, Axis::Expanded), None);
             assert_eq!(
                 tree.iter().map(|(key, _)| *key).collect::<Vec<_>>(),

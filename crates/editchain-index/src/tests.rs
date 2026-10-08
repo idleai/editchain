@@ -1,3 +1,4 @@
+mod changes;
 mod incremental;
 mod integrity;
 mod rebuild;

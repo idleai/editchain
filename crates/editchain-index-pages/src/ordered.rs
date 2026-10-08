@@ -34,6 +34,11 @@ impl<K: Ord + Clone, V> OrderedMap<K, V> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// Number of keys strictly below a boundary, with a logarithmic rank seek.
+    #[must_use]
+    pub fn count_before(&self, key: &K) -> u64 {
+        self.0.prefix(key).expanded
+    }
     /// Read one value.
     pub fn get<Q: Ord + ?Sized>(&self, key: &Q) -> Option<&V>
     where

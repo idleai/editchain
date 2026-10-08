@@ -16,6 +16,8 @@ pub(crate) const VERSION: u32 = 3;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct State {
     pub(crate) version: u32,
+    #[serde(default)]
+    pub(crate) changes: crate::changes::ChangeLog,
     pub(crate) tail: IndexedTail,
     pub(crate) records: OrderedMap<OpId, OpRecordLocation>,
     pub(crate) identities: OrderedSet<OpId>,
@@ -30,6 +32,7 @@ impl State {
         let tail = IndexedTail::open(root)?;
         let mut state = Self {
             version: VERSION,
+            changes: crate::changes::ChangeLog::default(),
             tail,
             records: OrderedMap::new(),
             identities: OrderedSet::new(),
@@ -39,6 +42,7 @@ impl State {
             content: ContentIndex::default(),
         };
         state.identities.extend(state.tail.chain().identities());
+        let _initialized = state.changes.initialize()?;
         let mut reads = 0;
         let operations: Vec<_> = state.tail.chain().shared_ops().collect();
         for op in operations {

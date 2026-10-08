@@ -44,7 +44,8 @@ use crate::{Op, OpId};
 pub use content::{ContentField, ContentQuery, ContentResult, ContentValue};
 pub use diff::{ByteComparison, ContentDiff, RevisionDiff};
 pub use editchain_index::{
-    ChainIndex, ContentReference, ContentState, ContentStatus, IndexDelta, IndexKey, IndexWork,
+    ChainIndex, ContentReference, ContentState, ContentStatus, IndexChange, IndexChangeKind,
+    IndexChanges, IndexDelta, IndexKey, IndexRevision, IndexWork,
 };
 pub use git::GitQuery;
 pub use operation_meta::{AncestorGraph, OperationLookup, OperationMeta};

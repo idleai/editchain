@@ -15,11 +15,11 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-editchain-cli-support = { registry = "idle-editchain", version = "0.1.4", path = "../editchain-cli-support" }
-editchain-engine = { registry = "idle-editchain", version = "0.1.4", path = "../editchain-engine" }
-editchain-index = { registry = "idle-editchain", version = "0.1.4", path = "../editchain-index" }
-editchain-store = { registry = "idle-editchain", version = "0.1.4", path = "../editchain-store" }
-editchain-sync = { registry = "idle-editchain", version = "0.1.4", path = "../editchain-sync" }
+editchain-cli-support = { registry = "idle-editchain", version = "0.1.6", path = "../editchain-cli-support" }
+editchain-engine = { registry = "idle-editchain", version = "0.1.6", path = "../editchain-engine" }
+editchain-index = { registry = "idle-editchain", version = "0.1.6", path = "../editchain-index" }
+editchain-store = { registry = "idle-editchain", version = "0.1.6", path = "../editchain-store" }
+editchain-sync = { registry = "idle-editchain", version = "0.1.6", path = "../editchain-sync" }
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3.5", features = ["termination"] }
