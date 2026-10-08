@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/idleai/editchain/compare/editchain-v0.1.4...editchain-v0.1.6) - 2026-10-08
+
+### Other
+
+- *(f43/activity-editor)* index accepted changes for incremental Activity queries ([#47](https://github.com/idleai/editchain/pull/47))
+
 ## [0.1.4](https://github.com/idleai/editchain/compare/editchain-v0.1.3...editchain-v0.1.4) - 2026-10-05
 
 ### Other
