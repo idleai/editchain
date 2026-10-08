@@ -74,6 +74,12 @@ impl Operation {
             legacy: None,
             kind: kind(op)?,
         };
+        if op.tags.matches_any(Tags::IMPORT) && !matches!(op.kind, OpKind::Import(_)) {
+            record.original = op.parents.iter().next().map(|id| OriginalRef {
+                operation: *id,
+                converter: "legacy-to-schema3-v3".into(),
+            });
+        }
         if let (OpKind::Reflection(reflection), Kind::Message(message)) =
             (&op.kind, &mut record.kind)
         {
@@ -133,11 +139,8 @@ impl Operation {
             scope: op.scope,
             tags: op.tags,
         });
-        if op.tags.matches_any(Tags::IMPORT) && !matches!(op.kind, OpKind::Import(_)) {
-            record.original = op.parents.iter().next().map(|id| OriginalRef {
-                operation: upgrade_id(*id),
-                converter: "legacy-to-schema3-v3".into(),
-            });
+        if let Some(original) = &mut record.original {
+            original.operation = upgrade_id(original.operation);
         }
         match &mut record.kind {
             Kind::Note(note) => {

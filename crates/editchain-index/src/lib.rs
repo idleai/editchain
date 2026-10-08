@@ -24,6 +24,7 @@
 //! ```
 
 mod chain;
+mod changes;
 mod content;
 mod integrity;
 mod keys;
@@ -31,6 +32,7 @@ mod references;
 mod state;
 
 pub use chain::{ChainIndex, IndexDelta, IndexWork, RecordVariant};
+pub use changes::{IndexChange, IndexChangeKind, IndexChanges, IndexRevision};
 pub use content::{ContentReference, ContentState, ContentStatus};
 pub use integrity::{ContentIssue, IntegrityReport};
 pub use keys::IndexKey;

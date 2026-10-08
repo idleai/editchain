@@ -272,6 +272,37 @@ fn applied_file_with_unavailable_patch_remains_an_explicit_observation() {
 }
 
 #[test]
+fn legacy_read_view_keeps_the_original_record_address() {
+    use editchain_core::{
+        ActorId, Clock, NoteOp, NoteRelationship, Op, OpKind, ParentSet, ScopeRef, Tags,
+    };
+    let source = OpId::from_bytes([41; 32]);
+    let old = Op {
+        id: OpId::from_bytes([42; 32]),
+        source: None,
+        parents: ParentSet::One(source),
+        actor: ActorId(1),
+        clock: Clock::None,
+        scope: ScopeRef::None,
+        tags: Tags::IMPORT,
+        kind: OpKind::Note(NoteOp {
+            target_ids: vec![source],
+            relationship: NoteRelationship::Explains,
+            content: Payload::Inline(b"derived description".to_vec()),
+        }),
+    };
+    let viewed = Operation::view(&old).unwrap();
+    assert_eq!(viewed.id, old.id);
+    assert_eq!(viewed.parents, vec![source]);
+    assert_eq!(viewed.original.unwrap().operation, source);
+    let upgraded = Operation::upgrade(&old).unwrap();
+    assert_eq!(
+        upgraded.original.unwrap().operation,
+        editchain_core::activity::upgrade_id(source)
+    );
+}
+
+#[test]
 fn outputless_completion_and_retries_keep_attempts_separate() {
     use editchain_core::activity::{Completion, OutputChannel, Status, Tool};
     let first = message(1, None, UpdateMode::Replace, b"output");
