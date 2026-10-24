@@ -12,6 +12,12 @@ on:
         required: true
         type: string
 
+concurrency:
+  # Keep complete checks for the newest PR or feature-branch revision.
+  # Default-branch, manual and release validations have separate groups.
+  group: ci-checks::${{ github.workflow }}::${{ github.event_name }}::${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.event_name == 'push' && github.ref_type == 'branch' && github.ref_name != github.event.repository.default_branch && format('branch-{0}', github.ref_name) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_type == 'branch' && github.ref_name != github.event.repository.default_branch) }}
+
 permissions:
   contents: read
 
@@ -53,7 +59,10 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('editchain/Cargo.lock') }}
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
 
       - name: Format check
         run: cargo fmt --all -- --check
