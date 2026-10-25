@@ -47,6 +47,9 @@ jobs:
           python3 scripts/release-automation.py prepare --source "$SOURCE_COMMIT"
 
   verify:
+    permissions:
+      contents: read
+      actions: read
     needs: prepare
     if: needs.prepare.outputs.revision != ''
     uses: ./.github/workflows/lint.yml
