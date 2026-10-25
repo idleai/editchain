@@ -1,0 +1,22 @@
+name: Build desktop product
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - ".github/workflows/product.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  checks: read
+  actions: read
+
+jobs:
+  product:
+    uses: idleai/vscode-extension/.github/workflows/product-build.yml@main
+    with:
+      source_repository: ${{ github.repository }}
+      source_revision: ${{ github.sha }}
+      publish: ${{ github.event_name == 'push' }}
