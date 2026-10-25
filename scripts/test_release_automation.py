@@ -57,13 +57,70 @@ class ReleasePreparationTests(unittest.TestCase):
             AUTOMATION.prepare(source or self.source)
             return output.call_args.args[1]
 
-    def test_version_commit_is_pushed_once_and_retry_reuses_it(self):
+    def promote(self, revision, *, verified=True):
+        checks = []
+        original = subprocess.run
+
+        def run(arguments, **options):
+            if arguments[:2] == ["gh", "api"]:
+                checks.append(json.loads(options["input"]))
+                return subprocess.CompletedProcess(arguments, 0)
+            return original(arguments, **options)
+
+        environment = {"VERIFIED_RELEASE_REVISION": revision if verified else "",
+                       "GITHUB_REPOSITORY": "fixture/repo", "GITHUB_RUN_ID": "123"}
+        with contextlib.chdir(self.checkout), patch.dict(os.environ, environment), \
+                patch.object(AUTOMATION.subprocess, "run", side_effect=run):
+            AUTOMATION.promote(self.source, revision)
+        return checks
+
+    def test_verified_release_is_promoted_with_its_own_check_result(self):
+        revision = self.prepare()
+        self.assertEqual(self.run_git(self.remote, "rev-parse", "main"), self.source)
+        checks = self.promote(revision)
+        self.assertEqual(self.run_git(self.remote, "rev-parse", "main"), revision)
+        self.assertEqual(len(checks), 1)
+        self.assertEqual(checks[0]["head_sha"], revision)
+        self.assertEqual(checks[0]["name"], "CI required")
+        self.assertEqual(checks[0]["conclusion"], "success")
+        self.promote(revision)
+        self.assertEqual(self.run_git(self.remote, "rev-parse", "main"), revision)
+
+    def test_unverified_release_does_not_advance_main(self):
+        revision = self.prepare()
+        with self.assertRaisesRegex(ValueError, "successful CI result"):
+            self.promote(revision, verified=False)
+        self.assertEqual(self.run_git(self.remote, "rev-parse", "main"), self.source)
+
+    def test_new_main_commit_prevents_release_promotion(self):
+        revision = self.prepare()
+        self.run_git(self.checkout, "checkout", "--detach", self.source)
+        (self.checkout / "source.rs").write_text("concurrent main\n")
+        self.commit("newer main")
+        current = self.run_git(self.checkout, "rev-parse", "HEAD")
+        self.run_git(self.checkout, "push", "origin", "HEAD:main")
+        self.run_git(self.checkout, "checkout", "--detach", revision)
+        with self.assertRaisesRegex(ValueError, "superseded"):
+            self.promote(revision)
+        self.assertEqual(self.run_git(self.remote, "rev-parse", "main"), current)
+
+    def test_application_change_cannot_use_release_promotion(self):
+        (self.checkout / "source.rs").write_text("unexpected application change\n")
+        self.commit("unrelated code")
+        revision = self.run_git(self.checkout, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(ValueError, "prepared version commit"):
+            self.promote(revision)
+        self.assertEqual(self.run_git(self.remote, "rev-parse", "main"), self.source)
+
+    def test_version_commit_is_staged_once_and_retry_reuses_it(self):
         revision = self.prepare()
         self.assertNotEqual(revision, self.source)
-        self.assertEqual(self.run_git(self.remote, "rev-parse", "main"), revision)
+        self.assertEqual(self.run_git(self.remote, "rev-parse", "main"), self.source)
+        self.assertEqual(self.run_git(self.remote, "rev-parse", AUTOMATION.candidate_ref(self.source)), revision)
         self.assertEqual(self.run_git(self.checkout, "rev-parse", "HEAD^"), self.source)
         self.assertEqual(self.prepare(), revision)
-        self.assertEqual(self.run_git(self.remote, "rev-parse", "main"), revision)
+        self.assertEqual(self.run_git(self.remote, "rev-parse", "main"), self.source)
+        self.assertEqual(self.run_git(self.remote, "rev-parse", AUTOMATION.candidate_ref(self.source)), revision)
 
     def test_superseded_source_cannot_publish(self):
         (self.checkout / "source.rs").write_text("a newer change\n")
@@ -87,8 +144,7 @@ class ReleasePreparationTests(unittest.TestCase):
         self.run_git(other, "commit", "-am", "concurrent change")
         concurrent = self.run_git(other, "rev-parse", "HEAD")
         self.release_command(f"import subprocess\nfrom pathlib import Path\nsubprocess.run(['git', '-C', {str(other)!r}, 'push', 'origin', 'main'], check=True)\np = Path('Cargo.toml')\np.write_text(p.read_text().replace('0.1.0', '0.1.1'))\n")
-        with self.assertRaises(subprocess.CalledProcessError):
-            self.prepare()
+        self.prepare()
         self.assertEqual(self.run_git(self.remote, "rev-parse", "main"), concurrent)
 
     def test_docs_only_commit_does_not_need_another_release(self):

@@ -12,6 +12,10 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: ci-checks::${{ github.workflow }}::${{ inputs.revision || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ inputs.revision == '' && github.ref_type != 'tag' }}
+
 permissions:
   contents: read
 
@@ -20,8 +24,10 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: editchain
@@ -31,6 +37,32 @@ jobs:
           path: editchain
           ref: ${{ inputs.revision || github.sha }}
           persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+      - run: python3 -m unittest discover -s scripts -p 'test_release_automation.py'
+
+  lint:
+    needs: preflight
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.IDLE_LINUX_RUNNER || github.event_name != 'pull_request' && vars.IDLE_BACKGROUND_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: editchain
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: editchain
+          ref: ${{ inputs.revision || github.sha }}
+          persist-credentials: false
+
+      - name: Install rustup on the local runner
+        if: runner.environment == 'self-hosted'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.0
 
       - name: Install Rust toolchain
         run: |
@@ -47,24 +79,30 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('editchain/Cargo.lock') }}
 
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
 
-      - name: Format check
-        run: cargo fmt --all -- --check
+      - name: Rust quality checks
+        run: bash scripts/lint.sh
 
-      - name: Build check
-        run: cargo check --workspace --all-targets --all-features --locked
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-
-      - name: Tests
-        run: cargo test --workspace --all-features --locked
-
-      - name: Doc tests
-        run: cargo test --workspace --all-features --doc --locked
-
-      - name: Dependency policy
-        run: cargo deny check
-      - name: Release automation checks
-        run: python3 -m unittest discover -s scripts -p "test*release*.py"
+  required:
+    name: CI required
+    if: always()
+    needs: [preflight, lint]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require the Linux checks
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ["NEEDS"])
+          failed = {name: job["result"] for name, job in results.items() if job["result"] != "success"}
+          if failed:
+              raise SystemExit(f"Required CI jobs did not succeed: {failed}")
+          print("All checks passed.")
+          PY

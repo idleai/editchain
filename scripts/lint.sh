@@ -48,12 +48,7 @@ check "release automation" python3 -m unittest discover -s scripts -p "test*rele
 check "cargo fmt" cargo fmt --all -- --check
 
 # ---------------------------------------------------------------------------
-# Build check (all targets, all features, locked)
-# ---------------------------------------------------------------------------
-check "cargo check" cargo check --workspace --all-targets --all-features --locked
-
-# ---------------------------------------------------------------------------
-# Clippy (deny warnings)
+# Clippy also checks all targets; cargo test below includes doctests.
 # ---------------------------------------------------------------------------
 check "cargo clippy" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
@@ -61,11 +56,6 @@ check "cargo clippy" cargo clippy --workspace --all-targets --all-features --loc
 # Tests
 # ---------------------------------------------------------------------------
 check "cargo test" cargo test --workspace --all-features --locked
-
-# ---------------------------------------------------------------------------
-# Doc tests
-# ---------------------------------------------------------------------------
-check "cargo test (doc)" cargo test --workspace --all-features --doc --locked
 
 # ---------------------------------------------------------------------------
 # Dependency policy
