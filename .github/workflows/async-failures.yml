@@ -1,0 +1,25 @@
+name: Report asynchronous failures
+
+on:
+  workflow_run:
+    workflows: ["Lint", "Native release", "Build desktop product", "Release"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+concurrency:
+  group: async-failure-${{ github.event.workflow_run.workflow_id }}-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    if: >-
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.event != 'pull_request' &&
+      contains(fromJSON('["failure","timed_out","startup_failure","action_required"]'), github.event.workflow_run.conclusion)
+    uses: idleai/codex-evo/.github/workflows/report-async-failure.yml@idle-base
+    with:
+      run_id: ${{ github.event.workflow_run.id }}

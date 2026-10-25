@@ -14,7 +14,7 @@ on:
 
 concurrency:
   group: ci-checks::${{ github.workflow }}::${{ inputs.revision || github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ inputs.revision == '' && github.ref_type != 'tag' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -27,7 +27,7 @@ jobs:
   preflight:
     name: Preflight
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 2 || 15 }}
     defaults:
       run:
         working-directory: editchain
@@ -47,7 +47,7 @@ jobs:
   lint:
     needs: preflight
     runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.IDLE_LINUX_RUNNER || github.event_name != 'pull_request' && vars.IDLE_BACKGROUND_RUNNER || 'ubuntu-24.04' }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ github.event_name == 'pull_request' && 7 || 45 }}
     defaults:
       run:
         working-directory: editchain
@@ -92,7 +92,10 @@ jobs:
     if: always()
     needs: [preflight, lint]
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 1
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Require the Linux checks
         env:
@@ -106,3 +109,7 @@ jobs:
               raise SystemExit(f"Required CI jobs did not succeed: {failed}")
           print("All checks passed.")
           PY
+      - uses: idleai/codex-evo/.github/actions/check-pr-budget@idle-base
+        if: always() && github.event_name == 'pull_request'
+        with:
+          token: ${{ github.token }}
