@@ -1,4 +1,4 @@
-//! A reusable entry point for immutable chains, operations, and exact evidence.
+//! A reusable entry point for immutable chains, operations, and exact recorded bytes.
 //!
 //! [`Engine`] takes an explicit chain directory. Producers supply operation,
 //! actor, session, and chain identities; opening a directory never derives or
@@ -8,7 +8,7 @@
 //! Use [`Engine::append`] for newly authored operations and
 //! [`Engine::append_encoded`] to preserve imported or replicated bytes. Exact
 //! replays return [`Admission::Duplicate`]. Different bytes under one operation
-//! ID return [`Admission::Conflict`]; all variants remain available as evidence
+//! ID return [`Admission::Conflict`]; all variants remain available for inspection
 //! and that ID is excluded from accepted history, including after reopen.
 //!
 //! Writes use the existing durable segment and blob stores. Each append takes
@@ -74,7 +74,7 @@ impl Engine {
         &self.root
     }
 
-    /// Read accepted history and all decodable conflict evidence.
+    /// Read accepted history and all decodable conflicting records.
     ///
     /// # Errors
     /// Returns the framing and filesystem errors from [`ChainSnapshot::read`].
@@ -96,8 +96,8 @@ impl Engine {
     /// Encode and append a newly authored operation using the existing codec.
     ///
     /// Use [`Self::append_encoded`] when original bytes already exist. Success
-    /// acknowledges durable evidence, not necessarily an accepted operation:
-    /// [`Admission::Conflict`] retains evidence while quarantining the identity.
+    /// acknowledges durable storage, not necessarily an accepted operation:
+    /// [`Admission::Conflict`] retains every variant while quarantining the identity.
     ///
     /// # Errors
     /// Returns encoding, size-limit, framing, lock, or persistence errors.
