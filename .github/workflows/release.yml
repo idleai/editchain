@@ -59,6 +59,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: read
+      checks: write
     outputs:
       artifact_tag: ${{ steps.artifact.outputs.tag }}
     steps:
@@ -70,6 +71,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.97.0
+      - name: Promote the verified version commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}
+          VERIFIED_RELEASE_REVISION: ${{ needs.prepare.outputs.revision }}
+        run: |
+          gh auth setup-git
+          python3 scripts/release-automation.py promote --source "$SOURCE_COMMIT" --revision "$VERIFIED_RELEASE_REVISION"
       - uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5
         with:
           command: release
