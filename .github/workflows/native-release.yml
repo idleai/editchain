@@ -4,13 +4,31 @@ on:
     tags: ["editchain-v*"]
   workflow_call:
     inputs:
+      publish:
+        description: Attach the built bundles to the release
+        type: boolean
+        required: false
+        default: true
+      all_platforms:
+        description: Add the other platforms only during a manual run
+        type: boolean
+        required: false
+        default: false
       tag:
         type: string
         required: true
   workflow_dispatch:
     inputs:
+      publish:
+        description: Attach the built bundles; disable to validate without changing the release
+        type: boolean
+        default: true
+      all_platforms:
+        description: Build all platforms and attach missing assets to the existing release
+        type: boolean
+        default: true
       tag:
-        description: Existing draft release tag
+        description: Existing release tag
         type: string
         required: true
 
@@ -22,20 +40,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: ubuntu-22.04
-            platform: linux-x64
-          - runner: macos-15-intel
-            platform: darwin-x64
-          - runner: macos-15
-            platform: darwin-arm64
-          - runner: windows-2022
-            platform: win32-x64
-    runs-on: ${{ matrix.runner }}
+        platform: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.all_platforms && '["linux-x64","darwin-x64","darwin-arm64","win32-x64"]' || '["linux-x64"]') }}
+    runs-on: ${{ matrix.platform == 'linux-x64' && (vars.IDLE_BACKGROUND_RUNNER || 'idle-background-linux-x64') || matrix.platform == 'darwin-x64' && 'macos-15-intel' || matrix.platform == 'darwin-arm64' && 'macos-15' || 'windows-2022' }}
+    container: ${{ matrix.platform == 'linux-x64' && 'ubuntu:22.04' || '' }}
     defaults:
       run:
         shell: bash
     steps:
+      - name: Prepare Ubuntu 22.04 for Linux release builds
+        if: runner.os == 'Linux'
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git libbz2-1.0 libffi8 libgdbm6 \
+            liblzma5 libncursesw6 libreadline8 libsqlite3-0 libssl-dev pkg-config \
+            sudo tk8.6 uuid-dev xz-utils zstd
+          # Do not reuse the host's Ubuntu 24.04 Python or sccache binary.
+          echo "AGENT_TOOLSDIRECTORY=/opt/idle-ubuntu2204-tools" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+          echo "IDLE_WORKSPACE_OWNER=$(stat -c '%u:%g' "$GITHUB_WORKSPACE")" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag || github.sha }}
@@ -61,26 +84,38 @@ jobs:
           name: native-${{ matrix.platform }}
           path: releases/*
           if-no-files-found: error
+      - name: Restore workspace ownership for the local runner
+        if: always() && runner.os == 'Linux' && env.IDLE_WORKSPACE_OWNER != ''
+        run: chown -R "$IDLE_WORKSPACE_OWNER" "$GITHUB_WORKSPACE"
 
   publish:
-    if: inputs.tag != '' || github.ref_type == 'tag'
+    if: (inputs.publish || github.event_name == 'push') && (inputs.tag != '' || github.ref_type == 'tag')
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.IDLE_BACKGROUND_RUNNER || 'idle-background-linux-x64' }}
     permissions:
       contents: write
+    defaults:
+      run:
+        shell: bash
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: release-tools
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           pattern: native-*
           merge-multiple: true
           path: releases
-      - name: Complete the draft release
+      - name: Publish Linux or attach the manually built platforms
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) }}
+          ALL_PLATFORMS: ${{ github.event_name == 'workflow_dispatch' && inputs.all_platforms }}
         run: |
-          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
-          (cd releases && sha256sum --check ./*.sha256)
-          gh release upload "$RELEASE_TAG" releases/* --clobber
-          gh release edit "$RELEASE_TAG" --draft=false
+          ARGS=()
+          if [[ "$ALL_PLATFORMS" == true ]]; then ARGS+=(--all-platforms); fi
+          python3 release-tools/scripts/publish-native.py --repository "$GH_REPO" \
+            --tag "$RELEASE_TAG" --directory releases "${ARGS[@]}"
