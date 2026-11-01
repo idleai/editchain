@@ -69,6 +69,9 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
+      - name: Trust the mounted checkout inside the Linux container
+        if: runner.os == 'Linux'
+        run: git config --global --add safe.directory "$(pwd -P)"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
