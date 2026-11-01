@@ -68,6 +68,23 @@ def staged_candidate(source):
     return head
 
 
+def promotion_status(source, revision):
+    subprocess.run(["git", "fetch", "origin", "main"], check=True)
+    current = command("git", "rev-parse", "origin/main")
+    if current == revision:
+        return "promoted"
+    if current == source:
+        return "pending"
+    if revision != source:
+        ancestor = subprocess.run(["git", "merge-base", "--is-ancestor", revision, current], check=False)
+        if ancestor.returncode == 0:
+            # Publication may resume after this version commit reached main.
+            return "promoted"
+        if ancestor.returncode != 1:
+            ancestor.check_returncode()
+    return "superseded"
+
+
 def promote(source, revision):
     """Advance main only after the reusable CI workflow verifies this commit."""
     if not all(re.fullmatch(r"[0-9a-f]{40}", value) for value in (source, revision)):
@@ -76,12 +93,13 @@ def promote(source, revision):
         raise ValueError("release promotion requires a successful CI result for this revision")
     if command("git", "rev-parse", "HEAD") != revision or command("git", "status", "--porcelain"):
         raise ValueError("release promotion requires a clean checkout of the verified revision")
-    subprocess.run(["git", "fetch", "origin", "main"], check=True)
-    current = command("git", "rev-parse", "origin/main")
-    if current not in (source, revision):
-        raise ValueError("a newer main commit superseded this release")
     if revision != source and not prepared_from(revision, source):
         raise ValueError("release promotion is limited to the prepared version commit")
+    status = promotion_status(source, revision)
+    if status == "superseded":
+        print("A newer main commit superseded this release; publication is skipped")
+        output("publish", "false")
+        return
     repository = os.environ["GITHUB_REPOSITORY"]
     run_id = os.environ["GITHUB_RUN_ID"]
     check = {"name": "CI required", "head_sha": revision,
@@ -91,9 +109,19 @@ def promote(source, revision):
                         "summary": "The reusable CI workflow validated this exact release commit before promotion."}}
     subprocess.run(["gh", "api", "--method", "POST", f"repos/{repository}/check-runs", "--input", "-"],
                    input=json.dumps(check), text=True, check=True, stdout=subprocess.DEVNULL)
-    if current != revision:
+    if status == "pending":
         # A concurrent main update rejects this normal push. Never rewrite main.
-        subprocess.run(["git", "push", "origin", f"{revision}:refs/heads/main"], check=True)
+        try:
+            subprocess.run(["git", "push", "origin", f"{revision}:refs/heads/main"], check=True)
+        except subprocess.CalledProcessError:
+            status = promotion_status(source, revision)
+            if status == "pending":
+                raise
+            if status == "superseded":
+                print("Main advanced during promotion; publication is skipped")
+                output("publish", "false")
+                return
+    output("publish", "true")
 
 
 def prepare(source):
