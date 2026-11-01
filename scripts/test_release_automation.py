@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -57,21 +58,31 @@ class ReleasePreparationTests(unittest.TestCase):
             AUTOMATION.prepare(source or self.source)
             return output.call_args.args[1]
 
-    def promote(self, revision, *, verified=True):
+    def promote(self, revision, *, verified=True, before_push=None, reject_push=False):
         checks = []
         original = subprocess.run
+        injected = False
 
         def run(arguments, **options):
+            nonlocal injected
             if arguments[:2] == ["gh", "api"]:
                 checks.append(json.loads(options["input"]))
                 return subprocess.CompletedProcess(arguments, 0)
+            if arguments[:3] == ["git", "push", "origin"] and not injected:
+                injected = True
+                if before_push:
+                    before_push()
+                if reject_push:
+                    raise subprocess.CalledProcessError(1, arguments)
             return original(arguments, **options)
 
         environment = {"VERIFIED_RELEASE_REVISION": revision if verified else "",
                        "GITHUB_REPOSITORY": "fixture/repo", "GITHUB_RUN_ID": "123"}
         with contextlib.chdir(self.checkout), patch.dict(os.environ, environment), \
-                patch.object(AUTOMATION.subprocess, "run", side_effect=run):
+                patch.object(AUTOMATION.subprocess, "run", side_effect=run), \
+                patch.object(AUTOMATION, "output") as output:
             AUTOMATION.promote(self.source, revision)
+            self.publish = dict(call.args for call in output.call_args_list).get("publish")
         return checks
 
     def test_verified_release_is_promoted_with_its_own_check_result(self):
@@ -83,6 +94,7 @@ class ReleasePreparationTests(unittest.TestCase):
         self.assertEqual(checks[0]["head_sha"], revision)
         self.assertEqual(checks[0]["name"], "CI required")
         self.assertEqual(checks[0]["conclusion"], "success")
+        self.assertEqual(self.publish, "true")
         self.promote(revision)
         self.assertEqual(self.run_git(self.remote, "rev-parse", "main"), revision)
 
@@ -100,8 +112,39 @@ class ReleasePreparationTests(unittest.TestCase):
         current = self.run_git(self.checkout, "rev-parse", "HEAD")
         self.run_git(self.checkout, "push", "origin", "HEAD:main")
         self.run_git(self.checkout, "checkout", "--detach", revision)
-        with self.assertRaisesRegex(ValueError, "superseded"):
-            self.promote(revision)
+        self.assertEqual(self.promote(revision), [])
+        self.assertEqual(self.publish, "false")
+        self.assertEqual(self.run_git(self.remote, "rev-parse", "main"), current)
+
+    def test_main_change_between_fetch_and_push_skips_publication(self):
+        revision = self.prepare()
+        self.run_git(self.checkout, "checkout", "--detach", self.source)
+        (self.checkout / "source.rs").write_text("concurrent main\n")
+        self.commit("newer main")
+        current = self.run_git(self.checkout, "rev-parse", "HEAD")
+        self.run_git(self.checkout, "push", "origin", "HEAD:refs/heads/concurrent")
+        self.run_git(self.checkout, "checkout", "--detach", revision)
+        self.promote(revision, before_push=lambda: self.run_git(
+            self.remote, "update-ref", "refs/heads/main", current))
+        self.assertEqual(self.publish, "false")
+        self.assertEqual(self.run_git(self.remote, "rev-parse", "main"), current)
+
+    def test_rejected_push_without_a_main_change_remains_a_failure(self):
+        revision = self.prepare()
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.promote(revision, reject_push=True)
+        self.assertEqual(self.run_git(self.remote, "rev-parse", "main"), self.source)
+
+    def test_promoted_version_can_finish_publication_after_main_advances(self):
+        revision = self.prepare()
+        self.promote(revision)
+        (self.checkout / "source.rs").write_text("a later application change\n")
+        self.commit("newer main")
+        current = self.run_git(self.checkout, "rev-parse", "HEAD")
+        self.run_git(self.checkout, "push", "origin", "HEAD:main")
+        self.run_git(self.checkout, "checkout", "--detach", revision)
+        self.promote(revision)
+        self.assertEqual(self.publish, "true")
         self.assertEqual(self.run_git(self.remote, "rev-parse", "main"), current)
 
     def test_application_change_cannot_use_release_promotion(self):
@@ -192,6 +235,20 @@ class ReleasePreparationTests(unittest.TestCase):
                 patch.object(AUTOMATION, "output") as output:
             AUTOMATION.artifact("fixture")
             output.assert_called_once_with("tag", "")
+
+
+class ReleaseWorkflowTests(unittest.TestCase):
+    def test_every_publication_step_requires_successful_promotion(self):
+        workflow = (Path(__file__).resolve().parent.parent / ".github/workflows/release.yml").read_text()
+        publish = workflow.split("\n  publish:\n", 1)[1].split("\n  artifacts:\n", 1)[0]
+        steps = re.split(r"(?m)^      - ", publish)
+        promotion = next(index for index, step in enumerate(steps)
+                         if step.startswith("name: Promote the verified version commit"))
+        self.assertIn("\n        id: promote\n", steps[promotion])
+        self.assertGreater(len(steps[promotion + 1:]), 0)
+        for step in steps[promotion + 1:]:
+            with self.subTest(step=step.splitlines()[0]):
+                self.assertIn("\n        if: steps.promote.outputs.publish == 'true'\n", step)
 
 
 if __name__ == "__main__":

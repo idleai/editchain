@@ -75,6 +75,7 @@ jobs:
         with:
           toolchain: 1.97.0
       - name: Promote the verified version commit
+        id: promote
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}
@@ -83,16 +84,19 @@ jobs:
           gh auth setup-git
           python3 scripts/release-automation.py promote --source "$SOURCE_COMMIT" --revision "$VERIFIED_RELEASE_REVISION"
       - uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.5
+        if: steps.promote.outputs.publish == 'true'
         with:
           command: release
           version: 0.3.169
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish or resume Cargo archives and index
+        if: steps.promote.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 scripts/release-crates.py --publish
       - name: Select unfinished artifact release
+        if: steps.promote.outputs.publish == 'true'
         id: artifact
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
