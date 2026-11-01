@@ -1,0 +1,38 @@
+name: Full platform CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Attach missing platform assets; disable to validate without changing the release
+        type: boolean
+        default: true
+      tag:
+        description: Existing release tag to validate; native bundles are attached to this release
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: full-platform-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    uses: ./.github/workflows/lint.yml
+    with:
+      revision: ${{ inputs.tag }}
+
+  artifacts:
+    needs: verify
+    permissions:
+      contents: write
+      actions: read
+    uses: ./.github/workflows/native-release.yml
+    with:
+      publish: ${{ inputs.publish }}
+      tag: ${{ inputs.tag }}
+      all_platforms: true

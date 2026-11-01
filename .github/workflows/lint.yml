@@ -26,7 +26,7 @@ env:
 jobs:
   preflight:
     name: Preflight
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.IDLE_LINUX_RUNNER || github.event_name != 'pull_request' && (vars.IDLE_BACKGROUND_RUNNER || 'idle-background-linux-x64') || 'ubuntu-24.04' }}
     defaults:
       run:
         working-directory: editchain
@@ -45,7 +45,7 @@ jobs:
 
   lint:
     needs: preflight
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.IDLE_LINUX_RUNNER || github.event_name != 'pull_request' && vars.IDLE_BACKGROUND_RUNNER || 'ubuntu-24.04' }}
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.IDLE_LINUX_RUNNER || github.event_name != 'pull_request' && (vars.IDLE_BACKGROUND_RUNNER || 'idle-background-linux-x64') || 'ubuntu-24.04' }}
     defaults:
       run:
         working-directory: editchain
@@ -89,7 +89,7 @@ jobs:
     name: CI required
     if: always()
     needs: [preflight, lint]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.IDLE_LINUX_RUNNER || github.event_name != 'pull_request' && (vars.IDLE_BACKGROUND_RUNNER || 'idle-background-linux-x64') || 'ubuntu-24.04' }}
     permissions:
       contents: read
       actions: read

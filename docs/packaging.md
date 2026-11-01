@@ -13,7 +13,7 @@ The [Release workflow](../.github/workflows/release.yml) starts after successful
 
 1. Release-plz calculates versions and changelogs from commit messages and Rust
    API checks, then commits the release metadata to `main`.
-2. The full CI workflow checks that version commit.
+2. The Linux CI workflow checks that version commit.
 3. Crate archives, Cargo index entries and native bundles publish from that
    verified commit.
 
@@ -27,10 +27,33 @@ publication with its verified commit, even if `main` has advanced. Dispatch
 **Release** on `main` to prepare current changes or resume its version commit.
 Retries can finish draft releases; published versions and archives are immutable.
 
-The [native release workflow](../.github/workflows/native-release.yml) builds
-Linux x64, macOS x64/arm64 and Windows x64 bundles. It publishes the native draft
-after all platform builds complete. [native-release.json](../native-release.json)
-defines the producer's binaries and test support.
+The [native release workflow](../.github/workflows/native-release.yml) automatically
+builds Linux x64 in an Ubuntu 22.04 container on the local runner pool, then
+publishes the native draft. [native-release.json](../native-release.json) defines
+the producer's binaries and test support. macOS and Windows bundles are added
+through the manual workflow below.
+
+## CI platforms and manual builds
+
+Automatic pull-request, main, scheduled, and release runs select Linux only.
+Trusted PR jobs use the local PR pool; other Linux release work uses
+`IDLE_BACKGROUND_RUNNER` (default `idle-background-linux-x64`). Fork PRs use
+GitHub-hosted Ubuntu. macOS and Windows native builds run only from the manual entrypoint.
+
+Run [Full platform CI](../.github/workflows/full-platform.yml) from Actions with an
+existing release tag, or use:
+
+```sh
+gh workflow run full-platform.yml --repo idleai/editchain --ref main -f tag=EXISTING_RELEASE_TAG
+```
+
+The run checks out that tag and uses its committed Cargo lockfile. It does not
+prepare a new version commit. Complete this producer run before manually building
+`host-tools` or other consumers that depend on its native bundles.
+
+The manual run builds Linux x64, macOS x64/arm64, and Windows x64 bundles, then
+attaches missing archives and checksums to the same release. Existing assets are
+never overwritten. Set `publish` to `false` for validation with CI artifacts only.
 
 ## Unpublished integration
 
